@@ -10,6 +10,7 @@ const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
 const token_mask_mod = @import("token_mask.zig");
 const responses_mod = @import("responses.zig");
+const pld_index = @import("pld_index.zig");
 const stb = @cImport({ @cInclude("stb_image.h"); });
 const webp = @cImport({ @cInclude("webp/decode.h"); });
 const metrics = @import("status.zig");
@@ -226,6 +227,19 @@ var default_enable_mtp: bool = false;
 /// with native MTP weights gets the higher-quality draft).
 var default_enable_pld: bool = false;
 var default_pld_draft_len: u32 = 5;
+/// Adaptive spec-decode gate threshold. Per-request, we score the prompt's
+/// 3-gram repetition density; if `score < spec_gate_threshold` AND the user
+/// did not explicitly set the flag, PLD/drafter are disabled for this request.
+///
+/// Empirically tuned (Qwen3.5 BPE, 24-300 token prompts):
+///   - "creative story" / "write an essay" prompts:                    0.000
+///   - 82-token echo-heavy code rename:                                0.013
+///   - 155-token JS-translation w/ many `add/sub/mul/div` repetitions: 0.128
+/// The plan started from 0.15 but BPE tokenization fragments echo-heavy
+/// content enough that even strong echo cases land in the 0.01–0.10 range.
+/// 0.01 cleanly separates "any repetition at all" (PLD likely helps) from
+/// "pure novel" (PLD overhead-only). Tune via bench_spec.sh --gated.
+const spec_gate_threshold: f32 = 0.01;
 var default_pld_key_len: u32 = 3;
 
 /// Loaded Gemma 4 assistant drafter (null when `--drafter` flag wasn't supplied
@@ -1660,6 +1674,13 @@ fn handleChatCompletions(
     // AND MTP was selected for this request — MTP's drafts are higher-quality
     // for that one model). Also disabled when tools/logprobs/streaming would
     // be incompatible with multi-token verify (mirrors MTP's gates).
+    //
+    // `pld_explicit_in_json` records whether the request body had `enable_pld`
+    // as an explicit field (vs falling back to the server default). The
+    // adaptive gate (later, after prompt is tokenized) only disables flags
+    // that came from the default — explicit user overrides are honored even
+    // on novel content.
+    const pld_explicit_in_json: bool = root.get("enable_pld") != null;
     var enable_pld: bool = if (root.get("enable_pld")) |v|
         (v == .bool and v.bool)
     else
@@ -1689,6 +1710,7 @@ fn handleChatCompletions(
     //     hit it on the verify forward).
     // Priority: drafter > MTP > PLD > regular. When drafter wins, force MTP
     // and PLD off so logs / state stay consistent.
+    const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
     var enable_drafter: bool = if (root.get("enable_drafter")) |v|
         (v == .bool and v.bool)
     else
@@ -1783,6 +1805,34 @@ fn handleChatCompletions(
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
+
+    // ── Adaptive spec-decode gating ──
+    //
+    // PLD and drafter both pay a per-step overhead (lookup + verify forward
+    // for PLD; drafter forwards + verify forward for drafter) that only pays
+    // off on echo-heavy content. On novel content, the verify forward is wasted
+    // work — the bench shows drafter at 0.55× on creative content and PLD at
+    // 0.91× on LFM2.5-350M heavy-echo. To make the default-on flip safe we
+    // gate per-request on the prompt's n-gram repetition score.
+    //
+    // Rule: if the score (= ratio of distinct 3-grams that recur in the prompt)
+    // is below `spec_gate_threshold` AND the user did not explicitly set the
+    // flag in the JSON, disable PLD/drafter for this request. Explicit user
+    // overrides are honored — if you `enable_pld:true` on novel content, you
+    // get PLD even though it's likely a perf loss; user knows best.
+    if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
+        const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0; // on error, don't gate
+        if (score < spec_gate_threshold) {
+            if (enable_pld and !pld_explicit_in_json) {
+                log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
+                enable_pld = false;
+            }
+            if (enable_drafter and !drafter_explicit_in_json) {
+                log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
+                enable_drafter = false;
+            }
+        }
+    }
 
     // Prompt caching: reuse KV cache for shared prefix.
     // Force invalidation when images are present — image tokens have identical IDs
@@ -2450,8 +2500,9 @@ fn handleNonStreamingGeneration(
 /// 2- or N-token batch the EOS lands.
 ///
 /// `pld_drop_buf` is a heap-owned pending buffer (PLD can yield up to
-/// `1+max_draft_len`=16 tokens per step). Caller must `deinit`.
-const StreamMode = enum { regular, mtp, pld };
+/// `1+max_draft_len`=16 tokens per step; drafter yields up to `block_size`).
+/// Caller must `deinit`.
+const StreamMode = enum { regular, mtp, pld, drafter };
 const StreamingTokenStream = struct {
     gen: *Generator,
     mode: StreamMode,
@@ -2459,7 +2510,7 @@ const StreamingTokenStream = struct {
     pld_key_len: u32 = 0,
     eos_token_ids: []const u32,
     /// Pending tokens from a multi-token speculative step. Drained one at a
-    /// time before the next call to nextMtp/nextPld.
+    /// time before the next call to nextMtp/nextPld/nextDrafter.
     pending_buf: std.ArrayList(u32) = .empty,
     pending_idx: usize = 0,
     finished: bool = false,
@@ -2481,9 +2532,13 @@ const StreamingTokenStream = struct {
     /// Yield the next decoded token id, or null if generation is complete.
     /// Mirrors the contract of `Generator.next` for the regular path.
     fn next(self: *StreamingTokenStream, allocator: std.mem.Allocator) !?u32 {
-        if (self.finished) return null;
-
-        // Drain any pending tokens from a previous speculative step first.
+        // Drain any pending tokens from a previous speculative step FIRST,
+        // before honoring `self.finished`. The PLD/drafter branches set
+        // `self.finished = true` mid-batch when an EOS lands at index > 0;
+        // tokens *before* that EOS were pushed to pending_buf and must still
+        // flush before we terminate. Skipping the drain here would silently
+        // truncate the last few output tokens (observed on Gemma 4 drafter
+        // with `print(sum_two(10, 20))` losing its trailing `))`).
         if (self.pending_idx < self.pending_buf.items.len) {
             const tok = self.pending_buf.items[self.pending_idx];
             self.pending_idx += 1;
@@ -2495,6 +2550,8 @@ const StreamingTokenStream = struct {
             self.pending_buf.clearRetainingCapacity();
             self.pending_idx = 0;
         }
+
+        if (self.finished) return null;
 
         switch (self.mode) {
             .regular => return self.gen.next(allocator),
@@ -2550,6 +2607,38 @@ const StreamingTokenStream = struct {
                 }
                 return first_tok;
             },
+            .drafter => {
+                // Mirror the PLD branch — `nextDrafter` returns the same
+                // `{tokens, accepted_tokens}` shape (full accept yields
+                // `block_size` tokens, partial accept yields `1+j`). Walk the
+                // batch, stop at the first EOS, push the rest into pending.
+                const r = (try self.gen.nextDrafter(allocator)) orelse return null;
+                defer allocator.free(r.tokens);
+                if (r.tokens.len == 0) {
+                    self.finished = true;
+                    return null;
+                }
+                var first_idx: usize = 0;
+                while (first_idx < r.tokens.len and generate_mod.isEosId(r.tokens[first_idx], self.eos_token_ids)) : (first_idx += 1) {}
+                if (first_idx >= r.tokens.len) {
+                    self.gen.done = true;
+                    self.gen.finish_reason = "stop";
+                    self.finished = true;
+                    return null;
+                }
+                const first_tok = r.tokens[first_idx];
+                var i: usize = first_idx + 1;
+                while (i < r.tokens.len) : (i += 1) {
+                    if (generate_mod.isEosId(r.tokens[i], self.eos_token_ids)) {
+                        self.gen.done = true;
+                        self.gen.finish_reason = "stop";
+                        self.finished = true;
+                        break;
+                    }
+                    try self.pending_buf.append(allocator, r.tokens[i]);
+                }
+                return first_tok;
+            },
         }
     }
 };
@@ -2558,14 +2647,24 @@ const StreamingTokenStream = struct {
 /// the request flags and the model capabilities. Mirrors the dispatch in
 /// `handleNonStreamingGeneration` so streaming and non-streaming pick the
 /// same path for the same inputs.
+///
+/// Priority: drafter > MTP > PLD > regular (matches the non-streaming
+/// dispatch in `handleNonStreamingGeneration`). The same per-mode disable
+/// rules (no logprobs, no grammar constraint, no hybrid SSM for PLD/drafter)
+/// apply at the request-entry parse site; `pickStreamMode` re-enforces them
+/// defensively here so a missed gate at the parse site doesn't crash the
+/// dispatch.
 fn pickStreamMode(
     enable_mtp: bool,
     enable_pld: bool,
+    enable_drafter: bool,
+    drafter_loaded: bool,
     has_mtp_weights: bool,
     has_hybrid_layers: bool,
     has_constraint: bool,
     logprobs_n: u32,
 ) StreamMode {
+    if (enable_drafter and drafter_loaded and logprobs_n == 0 and !has_constraint and !has_hybrid_layers) return .drafter;
     if (enable_mtp and logprobs_n == 0 and has_mtp_weights) return .mtp;
     if (enable_pld and logprobs_n == 0 and !has_constraint and !has_hybrid_layers) return .pld;
     return .regular;
@@ -2595,31 +2694,27 @@ fn handleStreamingGeneration(
     const chat_id = nowMs(stream.io);
     var timer = startStopwatch(stream.io);
 
-    // Pick the speculative-decoding mode (regular / MTP / PLD). Streaming
-    // requests previously fell back to the regular path with a "disabled
-    // (streaming)" log line; the per-token state machine below is now driven
-    // by `StreamingTokenStream`, which feeds either `next` (regular),
-    // `nextMtp` (1-2 tokens/step) or `nextPld` (1..1+draft_len tokens/step)
-    // through the same one-token-at-a-time interface, so MTP and PLD work
-    // for `stream:true` requests too.
-    //
-    // Drafter streaming is not yet wired through StreamingTokenStream — drafter
-    // requests with `stream:true` log a disable line and fall back to regular
-    // streaming. TODO: extend StreamMode + StreamingTokenStream to include
-    // .drafter and route nextDrafter through the same adapter.
-    if (enable_drafter) {
-        log.info("  drafter=disabled (streaming; non-stream supports it)\n", .{});
-    }
-    const stream_mode = pickStreamMode(enable_mtp, enable_pld, xfm.mtp_layers != null, xfm.config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
+    // Pick the speculative-decoding mode (regular / MTP / PLD / drafter).
+    // The per-token state machine below is driven by `StreamingTokenStream`,
+    // which feeds `next` (regular), `nextMtp` (1-2 tokens/step), `nextPld`
+    // (1..1+draft_len tokens/step), or `nextDrafter` (1..block_size
+    // tokens/step) through the same one-token-at-a-time interface.
+    const stream_mode = pickStreamMode(enable_mtp, enable_pld, enable_drafter, default_drafter != null, xfm.mtp_layers != null, xfm.config.has_hybrid_layers, sampling.constraint != null, logprobs_n);
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming)\n", .{});
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ default_pld_draft_len, default_pld_key_len });
+    if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{default_draft_block_size});
 
-    // Prefill + init generator. MTP/PLD need `initWithOptions` so they get
-    // the right post-prefill cache state (and, for MTP, the captured hidden
-    // state for the first draft).
+    // Prefill + init generator. MTP/PLD/drafter need `initWithOptions` so
+    // they get the right post-prefill cache state (and, for MTP+drafter,
+    // the captured hidden state for the first draft).
     var gen = switch (stream_mode) {
         .mtp => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .mtp_enabled = true }),
         .pld => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .pld_enabled = true }),
+        .drafter => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
+            .drafter_enabled = true,
+            .drafter = default_drafter,
+            .drafter_block_size = default_draft_block_size,
+        }),
         .regular => try Generator.init(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids),
     };
     gen.timeout_ns = getTimeoutNs();
@@ -4271,6 +4366,7 @@ fn handleAnthropicMessages(
     if (enable_mtp and !xfm.config.has_mtp) enable_mtp = false;
     if (enable_mtp and has_tools) enable_mtp = false;
 
+    const pld_explicit_in_json: bool = root.get("enable_pld") != null;
     var enable_pld: bool = if (root.get("enable_pld")) |v|
         (v == .bool and v.bool)
     else
@@ -4278,6 +4374,16 @@ fn handleAnthropicMessages(
     if (enable_pld and enable_mtp) enable_pld = false;
     if (enable_pld and has_tools) enable_pld = false;
     if (enable_pld and xfm.config.has_hybrid_layers) enable_pld = false;
+
+    // Drafter: same disable rules as chat-completions parse site.
+    const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
+    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
+        (v == .bool and v.bool)
+    else
+        default_enable_drafter;
+    if (enable_drafter and default_drafter == null) enable_drafter = false;
+    if (enable_drafter and has_tools) enable_drafter = false;
+    if (enable_drafter and xfm.config.has_hybrid_layers) enable_drafter = false;
 
     // Log request
     const last_msg = messages.items[messages.items.len - 1];
@@ -4316,6 +4422,21 @@ fn handleAnthropicMessages(
         xfm.vision_embeddings = null;
     }
 
+    // Adaptive spec-decode gate (Anthropic path; mirrors chat-completions).
+    if ((enable_pld and !pld_explicit_in_json) or (enable_drafter and !drafter_explicit_in_json)) {
+        const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0;
+        if (score < spec_gate_threshold) {
+            if (enable_pld and !pld_explicit_in_json) {
+                log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
+                enable_pld = false;
+            }
+            if (enable_drafter and !drafter_explicit_in_json) {
+                log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
+                enable_drafter = false;
+            }
+        }
+    }
+
     // Context size enforcement
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
@@ -4343,7 +4464,7 @@ fn handleAnthropicMessages(
     };
 
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_mtp, enable_pld) catch |err| {
+        handleAnthropicStreaming(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_mtp, enable_pld, enable_drafter) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -4559,19 +4680,26 @@ fn handleAnthropicStreaming(
     prompt_token_count: u32,
     enable_mtp: bool,
     enable_pld: bool,
+    enable_drafter: bool,
 ) !void {
     var timer = startStopwatch(stream.io);
 
-    // Pick speculative-decoding mode (regular / MTP / PLD). The token-stream
-    // adapter below feeds the per-token Anthropic state machine the same way
-    // for all three modes.
-    const stream_mode = pickStreamMode(enable_mtp, enable_pld, xfm.mtp_layers != null, xfm.config.has_hybrid_layers, sampling.constraint != null, 0);
+    // Pick speculative-decoding mode (regular / MTP / PLD / drafter). The
+    // token-stream adapter below feeds the per-token Anthropic state machine
+    // the same way for all four modes.
+    const stream_mode = pickStreamMode(enable_mtp, enable_pld, enable_drafter, default_drafter != null, xfm.mtp_layers != null, xfm.config.has_hybrid_layers, sampling.constraint != null, 0);
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming)\n", .{});
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ default_pld_draft_len, default_pld_key_len });
+    if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{default_draft_block_size});
 
     var gen = switch (stream_mode) {
         .mtp => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .mtp_enabled = true }),
         .pld => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .pld_enabled = true }),
+        .drafter => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
+            .drafter_enabled = true,
+            .drafter = default_drafter,
+            .drafter_block_size = default_draft_block_size,
+        }),
         .regular => try Generator.init(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids),
     };
     gen.timeout_ns = getTimeoutNs();
@@ -5625,6 +5753,7 @@ fn handleResponses(
     if (enable_mtp_resp and !xfm.config.has_mtp) enable_mtp_resp = false;
     if (enable_mtp_resp and active_has_tools) enable_mtp_resp = false;
 
+    const pld_explicit_in_json: bool = root.get("enable_pld") != null;
     var enable_pld_resp: bool = if (root.get("enable_pld")) |v|
         (v == .bool and v.bool)
     else
@@ -5633,16 +5762,50 @@ fn handleResponses(
     if (enable_pld_resp and active_has_tools) enable_pld_resp = false;
     if (enable_pld_resp and xfm.config.has_hybrid_layers) enable_pld_resp = false;
 
+    // Drafter (Responses-side parsing). Same disable rules as the chat
+    // and Anthropic parse sites.
+    const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
+    var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
+        (v == .bool and v.bool)
+    else
+        default_enable_drafter;
+    if (enable_drafter_resp and default_drafter == null) enable_drafter_resp = false;
+    if (enable_drafter_resp and active_has_tools) enable_drafter_resp = false;
+    if (enable_drafter_resp and xfm.config.has_hybrid_layers) enable_drafter_resp = false;
+
+    // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
+    // Anthropic). Score the full prompt's 3-gram repetition; novel content
+    // (low score) skips PLD/drafter unless the user explicitly opted in.
+    if ((enable_pld_resp and !pld_explicit_in_json) or (enable_drafter_resp and !drafter_explicit_in_json)) {
+        const score = pld_index.ngramRepeatScore(allocator, prompt_ids, 3) catch 1.0;
+        if (score < spec_gate_threshold) {
+            if (enable_pld_resp and !pld_explicit_in_json) {
+                log.info("  pld=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
+                enable_pld_resp = false;
+            }
+            if (enable_drafter_resp and !drafter_explicit_in_json) {
+                log.info("  drafter=disabled (ngram-score={d:.3} < gate threshold {d:.3})\n", .{ score, spec_gate_threshold });
+                enable_drafter_resp = false;
+            }
+        }
+    }
+
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_mtp_resp, enable_pld_resp, xfm.mtp_layers != null, xfm.config.has_hybrid_layers, sampling.constraint != null, 0);
+        const stream_mode = pickStreamMode(enable_mtp_resp, enable_pld_resp, enable_drafter_resp, default_drafter != null, xfm.mtp_layers != null, xfm.config.has_hybrid_layers, sampling.constraint != null, 0);
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses)\n", .{});
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ default_pld_draft_len, default_pld_key_len });
+        if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{default_draft_block_size});
 
         var gen = switch (stream_mode) {
             .mtp => try generate_mod.Generator.initWithOptions(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, .{ .mtp_enabled = true }),
             .pld => try generate_mod.Generator.initWithOptions(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, .{ .pld_enabled = true }),
+            .drafter => try generate_mod.Generator.initWithOptions(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, .{
+                .drafter_enabled = true,
+                .drafter = default_drafter,
+                .drafter_block_size = default_draft_block_size,
+            }),
             .regular => try generate_mod.Generator.init(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice),
         };
         gen.timeout_ns = getTimeoutNs();

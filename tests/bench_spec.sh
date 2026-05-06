@@ -3,12 +3,23 @@
 # (heavy-echo / creative-novel) on the models we ship support for. Drives the
 # default-on flip decision for `--pld` and `--drafter`.
 #
-# Usage: ./tests/bench_spec.sh [runs]   (default 5 runs per cell, run 1 is warmup)
+# Usage:
+#   ./tests/bench_spec.sh [runs]            # ungated (explicit enable_*:true in body — bypasses adaptive gate)
+#   ./tests/bench_spec.sh [runs] --gated    # gated (no explicit override — adaptive gate decides per-prompt)
+#
+# The two modes together quantify the gate's effect: gated should match
+# ungated on heavy-echo (gate keeps spec on) and match `none` on creative
+# (gate disables spec). Run 1 is warmup, dropped from stats.
 #
 # Output: pipe-separated rows to stdout; per-run debug to stderr.
 set -uo pipefail
 
 RUNS="${1:-5}"
+GATED=0
+for arg in "$@"; do
+    if [ "$arg" = "--gated" ]; then GATED=1; fi
+done
+
 BIN="./zig-out/bin/mlx-serve"
 PORT=8091
 MODELS_DIR="$HOME/.mlx-serve/models"
@@ -48,7 +59,19 @@ run_cell() {
     local toks_per_s_vals=()
     for r in $(seq 1 $RUNS); do
         : > /tmp/bench-srv.log
-        local body=$(jq -nc --arg p "$prompt" '{model:"x",messages:[{role:"user",content:$p}],max_tokens:120,temperature:0,stream:false}')
+        # Build the request body. Default mode injects explicit `enable_pld:true`
+        # / `enable_drafter:true` to bypass the adaptive gate (= measure raw
+        # spec-decode speedup). `--gated` mode omits the explicit override so
+        # the gate's per-prompt decision is what's measured.
+        local body
+        if [ "$GATED" = "1" ] || [[ "$label" == */none ]]; then
+            body=$(jq -nc --arg p "$prompt" '{model:"x",messages:[{role:"user",content:$p}],max_tokens:120,temperature:0,stream:false}')
+        else
+            local opt='{}'
+            if [[ "$label" == */pld ]]; then opt='{"enable_pld":true}'; fi
+            if [[ "$label" == */drafter ]]; then opt='{"enable_drafter":true}'; fi
+            body=$(jq -nc --arg p "$prompt" --argjson opt "$opt" '{model:"x",messages:[{role:"user",content:$p}],max_tokens:120,temperature:0,stream:false} + $opt')
+        fi
         curl -sf -m 90 "http://127.0.0.1:$PORT/v1/chat/completions" -H "Content-Type: application/json" -d "$body" -o /dev/null
         # Server log line:  "<- N+M tokens (Xms) [prefill: P tok/s, decode: D tok/s] [stop]"
         local tps=$(LC_ALL=C grep -aoE 'decode: [0-9.]+ tok/s' /tmp/bench-srv.log | tail -1 | LC_ALL=C grep -aoE '[0-9]+\.[0-9]+' | head -1)
@@ -64,6 +87,11 @@ run_cell() {
     echo "$label|$prompt_label|$stats"
 }
 
+if [ "$GATED" = "1" ]; then
+    echo "# bench mode: GATED (no explicit enable_*; adaptive gate decides per-prompt)"
+else
+    echo "# bench mode: ungated (explicit enable_*=true; adaptive gate bypassed)"
+fi
 echo "label|prompt|mean_tps|min_tps|max_tps"
 
 QWEN="$MODELS_DIR/Qwen3.5-4B-MLX-4bit"

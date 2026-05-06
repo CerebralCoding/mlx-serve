@@ -326,11 +326,17 @@ pub fn main(init: std.process.Init) !void {
             log.info("Loading drafter from {s}...\n", .{dir});
             const dgpu_stream = mlx.gpuStream();
             var d = drafter_mod.loadDrafter(io, allocator, dgpu_stream, dir) catch |err| {
-                log.err("Failed to load drafter: {s}\n", .{@errorName(err)});
+                log.err("Failed to load drafter at {s}: {s}\n", .{ dir, @errorName(err) });
                 std.process.exit(1);
             };
             d.bind(&xfm) catch |err| {
-                log.err("Drafter+target pair validation failed: {s}\n", .{@errorName(err)});
+                log.err(
+                    "Drafter checkpoint at {s} is incompatible with target: {s}\n" ++
+                        "  (drafter+target must share backbone_hidden_size, vocab_size, and have\n" ++
+                        "  matching layer types in the target's non-shared K/V layers — see\n" ++
+                        "  preceding [drafter] log lines for the specific mismatch)\n",
+                    .{ dir, @errorName(err) },
+                );
                 d.deinit();
                 std.process.exit(1);
             };

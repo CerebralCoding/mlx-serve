@@ -52,6 +52,62 @@ pub const PldLookup = struct {
     }
 };
 
+/// Adaptive gating helper.
+///
+/// Given the current request's tokenized prompt, estimate the proportion of
+/// `ngram_len`-grams that recur. The score is the ratio of distinct n-grams
+/// that appear at least twice to the total distinct n-grams. Range [0, 1].
+///
+/// Why this metric (and not raw n-gram count): repeated n-grams are exactly
+/// the ones PLD's lookup will hit, and the **distinct-count** form normalizes
+/// for prompt length so the threshold doesn't drift with input size. A long
+/// novel-content prompt and a short novel-content prompt should both score
+/// near 0.
+///
+/// Use case: at request entry, score the prompt + recent assistant turns. If
+/// score < threshold (~0.15), disable PLD/drafter for this request — they
+/// will only add overhead on novel content.
+///
+/// O(N * ngram_len) time, O(N) memory; called once per request, so the cost
+/// is negligible. Returns 0 on inputs shorter than `ngram_len`.
+pub fn ngramRepeatScore(allocator: std.mem.Allocator, tokens: []const u32, ngram_len: u32) !f32 {
+    if (tokens.len < ngram_len or ngram_len == 0) return 0.0;
+    if (ngram_len > 8) return error.NgramLenTooLarge; // hash uses 8 u32 max
+
+    const N: usize = tokens.len - ngram_len + 1;
+    if (N == 0) return 0.0;
+
+    // Pack each n-gram into a u64 hash by FNV-1a — cheap, low-collision for
+    // small token id alphabets and small N. We don't need cryptographic
+    // strength, just enough to avoid spurious double-counting.
+    const Counts = std.AutoHashMap(u64, u32);
+    var counts = Counts.init(allocator);
+    defer counts.deinit();
+    try counts.ensureTotalCapacity(@intCast(N));
+
+    var i: usize = 0;
+    while (i < N) : (i += 1) {
+        var h: u64 = 14695981039346656037;
+        var j: u32 = 0;
+        while (j < ngram_len) : (j += 1) {
+            h ^= @as(u64, tokens[i + j]);
+            h = h *% 1099511628211;
+        }
+        const gop = try counts.getOrPut(h);
+        if (gop.found_existing) gop.value_ptr.* += 1 else gop.value_ptr.* = 1;
+    }
+
+    var distinct: u32 = 0;
+    var repeated: u32 = 0;
+    var it = counts.iterator();
+    while (it.next()) |e| {
+        distinct += 1;
+        if (e.value_ptr.* >= 2) repeated += 1;
+    }
+    if (distinct == 0) return 0.0;
+    return @as(f32, @floatFromInt(repeated)) / @as(f32, @floatFromInt(distinct));
+}
+
 // ── tests ──
 
 test "PldLookup.findMatch returns slice at latest match site" {
@@ -120,4 +176,43 @@ test "PldLookup.findMatch key length mismatch returns null" {
     // self.key_len=3 but key.len=2 → caller bug; reject defensively.
     const lookup = PldLookup{ .committed = &committed, .key_len = 3 };
     try std.testing.expect(lookup.findMatch(&key, 3) == null);
+}
+
+test "ngramRepeatScore: highly repetitive tokens score high" {
+    // 6 copies of [1,2,3]. Distinct 3-grams (sliding): {1,2,3}, {2,3,1}, {3,1,2}.
+    // All 3 appear multiple times → score should be 1.0.
+    const tokens = [_]u32{ 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3, 1, 2, 3 };
+    const score = try ngramRepeatScore(std.testing.allocator, &tokens, 3);
+    try std.testing.expectEqual(@as(f32, 1.0), score);
+}
+
+test "ngramRepeatScore: novel content scores low" {
+    // 30 distinct tokens, every 3-gram unique → score = 0.0.
+    var tokens: [30]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 1000);
+    const score = try ngramRepeatScore(std.testing.allocator, &tokens, 3);
+    try std.testing.expect(score < 0.05);
+}
+
+test "ngramRepeatScore: half-and-half scores in the middle" {
+    // 10 tokens of [1,2,3,1,2,3,...] (high repeat) + 10 distinct novel tokens
+    // (no repeat in the novel half). Roughly half the distinct n-grams should
+    // recur → score in the [0.20, 0.55] range (some 3-grams span the boundary).
+    var tokens: [20]u32 = undefined;
+    for (tokens[0..10], 0..) |*t, i| t.* = @intCast((i % 3) + 1);
+    for (tokens[10..], 0..) |*t, i| t.* = @intCast(i + 5000);
+    const score = try ngramRepeatScore(std.testing.allocator, &tokens, 3);
+    try std.testing.expect(score > 0.10);
+    try std.testing.expect(score < 0.55);
+}
+
+test "ngramRepeatScore: returns 0 on inputs shorter than ngram_len" {
+    const tokens = [_]u32{ 1, 2 };
+    const score = try ngramRepeatScore(std.testing.allocator, &tokens, 3);
+    try std.testing.expectEqual(@as(f32, 0.0), score);
+}
+
+test "ngramRepeatScore: rejects oversized ngram_len" {
+    const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    try std.testing.expectError(error.NgramLenTooLarge, ngramRepeatScore(std.testing.allocator, &tokens, 9));
 }

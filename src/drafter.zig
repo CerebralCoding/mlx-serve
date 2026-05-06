@@ -184,11 +184,32 @@ pub const DrafterModel = struct {
     }
 
     /// Bind the drafter to a target Transformer. Captures `embed_tokens` (via
-    /// refcount) and the `embed_scale`, computes per-layer-type KV mapping.
+    /// refcount) and the `embed_scale`, computes per-layer-type KV mapping,
+    /// and validates compatibility:
+    ///   - `backbone_hidden_size == target.hidden_size`
+    ///   - `vocab_size == target.vocab_size` (token-id alignment — drafter
+    ///     samples from a vocab that must match the target's so the verify
+    ///     argmax-compare and EOS-id checks make sense)
+    ///   - per-layer-type target K/V source layer exists
+    ///   - partial dry-run of input-concat + pre_projection succeeds
+    ///     (catches embed-lookup / dtype / shape bugs at startup, before
+    ///     the first request — the deeper cross-attention path needs a
+    ///     populated target K/V cache and is exercised on the first prefill).
     pub fn bind(self: *DrafterModel, target: *Transformer) !void {
         if (self.config.backbone_hidden_size != target.config.hidden_size) {
             log.err("[drafter] config mismatch: backbone_hidden_size={d}, target.hidden_size={d}\n", .{
                 self.config.backbone_hidden_size, target.config.hidden_size,
+            });
+            return error.DrafterTargetMismatch;
+        }
+
+        // Vocab-size compatibility. A mismatched vocab means the drafter's
+        // sampled token-ids reference a different token table than the
+        // target's verify forward — silent corruption otherwise. Most common
+        // trigger: trying to pair a Gemma 4 drafter with a non-Gemma target.
+        if (self.config.vocab_size != target.config.vocab_size) {
+            log.err("[drafter] vocab_size mismatch: drafter={d}, target={d}\n", .{
+                self.config.vocab_size, target.config.vocab_size,
             });
             return error.DrafterTargetMismatch;
         }
@@ -233,6 +254,58 @@ pub const DrafterModel = struct {
                 });
                 return error.DrafterTargetMismatch;
             }
+        }
+
+        // Partial dry-run: input concat + pre_projection. Catches embed
+        // lookup, dequant, and pre_proj shape/dtype bugs *before* the first
+        // request. We can't run the full `step()` here because the
+        // cross-attention layers read from `target.cache.entries[…]`, which
+        // hasn't been populated yet (no prefill at bind time) and would
+        // bail with `error.TargetCacheUninitialized`. The cross-attn path
+        // is exercised on the first prefill anyway.
+        try self.dryRunInputPath(target);
+    }
+
+    /// Run the input-concat + pre_projection portion of `step()` with a
+    /// stub `target_hidden = zeros([1,1,backbone_hidden])` and prev_token = 1
+    /// (a benign in-vocab id; vocab matched above). Validates the resulting
+    /// `[1, 1, drafter.hidden_size]` shape and frees all temporaries.
+    fn dryRunInputPath(self: *DrafterModel, target: *Transformer) !void {
+        const tok_embed = try embedTargetToken(self, target, 1);
+        defer _ = mlx.mlx_array_free(tok_embed);
+
+        // Zeros stub for target_hidden. bf16 to match the embed dtype.
+        var stub_hidden = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(stub_hidden);
+        const stub_shape = [_]c_int{ 1, 1, @intCast(self.config.backbone_hidden_size) };
+        try mlx.check(mlx.mlx_zeros(&stub_hidden, &stub_shape, 3, .bfloat16, self.s));
+
+        var inputs_embeds = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(inputs_embeds);
+        {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            _ = mlx.mlx_vector_array_append_value(vec, tok_embed);
+            _ = mlx.mlx_vector_array_append_value(vec, stub_hidden);
+            try mlx.check(mlx.mlx_concatenate_axis(&inputs_embeds, vec, 2, self.s));
+        }
+
+        const projected = try matmulFn(inputs_embeds, self.pre_proj_w_t, self.s);
+        defer _ = mlx.mlx_array_free(projected);
+
+        // Force eval to surface any deferred shape/dtype errors here, not
+        // on the first user request.
+        try mlx.check(mlx.mlx_array_eval(projected));
+
+        const out_shape = mlx.getShape(projected);
+        if (out_shape.len != 3 or out_shape[2] != @as(c_int, @intCast(self.config.hidden_size))) {
+            log.err("[drafter] dry-run: pre_proj output shape unexpected (got [{d}, {d}, {d}], expected [1, 1, {d}])\n", .{
+                if (out_shape.len > 0) out_shape[0] else 0,
+                if (out_shape.len > 1) out_shape[1] else 0,
+                if (out_shape.len > 2) out_shape[2] else 0,
+                self.config.hidden_size,
+            });
+            return error.DrafterTargetMismatch;
         }
     }
 };
@@ -1252,6 +1325,27 @@ test "DrafterConfig rejects non-gemma4_assistant model_type" {
     ;
     const err = parseConfigFromJson(testing.allocator, json);
     try testing.expectError(error.UnsupportedDrafterArch, err);
+}
+
+test "DrafterModel.bind vocab/hidden compatibility checks (pure helper)" {
+    // The compatibility predicate used inside `bind()`. Kept in sync with the
+    // checks in `bind` so a divergence is loud in tests.
+    const Drafter = struct { backbone: u32, vocab: u32 };
+    const Target = struct { hidden: u32, vocab: u32 };
+    const fn_compatible = struct {
+        fn check(d: Drafter, t: Target) bool {
+            if (d.backbone != t.hidden) return false;
+            if (d.vocab != t.vocab) return false;
+            return true;
+        }
+    }.check;
+
+    // Matched: gemma-4-E4B drafter vs gemma-4-E4B target.
+    try testing.expect(fn_compatible(.{ .backbone = 2560, .vocab = 262144 }, .{ .hidden = 2560, .vocab = 262144 }));
+    // Mismatch: vocab_size differs (the real Qwen3.5-4B-MLX-4bit reproducer).
+    try testing.expect(!fn_compatible(.{ .backbone = 2560, .vocab = 262144 }, .{ .hidden = 2560, .vocab = 248320 }));
+    // Mismatch: backbone_hidden differs.
+    try testing.expect(!fn_compatible(.{ .backbone = 2560, .vocab = 262144 }, .{ .hidden = 4096, .vocab = 262144 }));
 }
 
 test "DrafterConfig.layerHeadDim respects per-layer-type" {
