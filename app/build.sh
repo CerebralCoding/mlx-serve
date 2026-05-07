@@ -25,8 +25,16 @@ echo "=== Building MLX Core v$CALVER ==="
 
 # ── Phase 1: Build Swift app ──
 echo "→ Compiling Swift..."
-swift build -c release 2>&1 | tail -5
-SWIFT_BIN="$(swift build -c release --show-bin-path)/MLXCore"
+# `-Xswiftc -swift-version -Xswiftc 5` forces Swift 5 language mode globally
+# across the build graph. The `swift-sdk` 0.10.x pin (kept for Swift 6.1 / macos-14
+# CI compat) declares `swift-tools-version:6.1`; under Swift 6.3 (current Xcode 26)
+# its NetworkTransport.swift hits `[#SendingRisksDataRace]` errors that didn't
+# exist in 6.1. Swift 5 mode downgrades those to warnings. Until the swift-sdk
+# pin can move past 0.11 (or CI moves to a Swift 6.3 runner), this flag keeps
+# the build green on both old and new toolchains.
+SWIFT_BUILD_FLAGS=(-c release -Xswiftc -swift-version -Xswiftc 5)
+swift build "${SWIFT_BUILD_FLAGS[@]}" 2>&1 | tail -5
+SWIFT_BIN="$(swift build "${SWIFT_BUILD_FLAGS[@]}" --show-bin-path)/MLXCore"
 if [ ! -f "$SWIFT_BIN" ]; then
     echo "ERROR: Swift build failed"
     exit 1

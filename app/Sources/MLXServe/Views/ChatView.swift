@@ -1,6 +1,7 @@
 import SwiftUI
 import PDFKit
 import UniformTypeIdentifiers
+import AppKit
 
 private struct ContentBottomKey: PreferenceKey {
     static var defaultValue: CGFloat = 0
@@ -155,6 +156,7 @@ struct ChatDetailView: View {
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var toolExecutor: ToolExecutor
     @EnvironmentObject var mcpManager: MCPManager
+    @Environment(\.openWindow) private var openWindow
     @State private var inputText = ""
     @State private var isGenerating = false
     @State private var enableThinking = false
@@ -412,6 +414,15 @@ struct ChatDetailView: View {
                     }
                     .help("Agent Skills Folder")
                 }
+            }
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    openWindow(id: "settings")
+                } label: {
+                    Image(systemName: "gear")
+                        .font(.system(size: 12))
+                }
+                .help("Settings")
             }
             ToolbarItem(placement: .automatic) {
                 Button { enableThinking.toggle() } label: {
@@ -712,7 +723,15 @@ struct ChatDetailView: View {
         } else {
             lastUserDict["content"] = text
         }
-        let messagesArray = Array(messages) + [lastUserDict]
+        // Tiny formatting nudge for plain chat (agent mode has its own system
+        // prompt). Without this, smaller models emit "tables" as whitespace-
+        // aligned plain text which the markdown renderer can't structure into
+        // a real grid. Phrased gently so it doesn't override user intent.
+        let formatNudge: [String: Any] = [
+            "role": "system",
+            "content": "When you display tabular data, use GitHub-flavored markdown table syntax (e.g. `| col1 | col2 |` with a `|---|---|` separator row). Use fenced ```code``` blocks for code, and `**bold**`/`*italic*` for emphasis."
+        ]
+        let messagesArray = [formatNudge] + Array(messages) + [lastUserDict]
 
         generationTask = Task {
             do {
@@ -720,7 +739,9 @@ struct ChatDetailView: View {
                     port: server.port,
                     messages: messagesArray,
                     maxTokens: appState.maxTokens,
-                    enableThinking: enableThinking
+                    temperature: appState.serverOptions.defaultTemperature,
+                    enableThinking: enableThinking || appState.serverOptions.defaultEnableThinking,
+                    defaults: APIClient.RequestDefaults.from(appState.serverOptions)
                 )
                 for try await event in stream {
                     try Task.checkCancellation()
@@ -893,7 +914,8 @@ struct ChatDetailView: View {
                 maxTokens: appState.maxTokens,
                 temperature: 0.7,
                 enableThinking: enableThinking,
-                toolsJSON: combinedToolsJSON
+                toolsJSON: combinedToolsJSON,
+                defaults: APIClient.RequestDefaults.from(appState.serverOptions)
             )
 
             // Watchdog: cancel the stream if no SSE event arrives within 90s.
@@ -1461,7 +1483,14 @@ struct MessageBubble: View {
 }
 
 // MARK: - Markdown Rendering
-
+//
+// Rendering goes through a single NSTextView (via SelectableMarkdownNSText) so the
+// user can drag-select across the *entire* assistant message — paragraphs, lists,
+// code blocks, tables, the lot. Stacking individual SwiftUI Text views inside a
+// VStack used to break selection at every block boundary because each Text is its
+// own NSTextStorage island; a single NSTextView is the only reliable way to get
+// macOS-native cross-block selection. Block parsing still happens here in Swift —
+// each Block becomes a styled fragment of the assembled NSAttributedString.
 struct MarkdownText: View {
     let source: String
 
@@ -1485,28 +1514,27 @@ struct MarkdownText: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            ForEach(Array(parseBlocks().enumerated()), id: \.offset) { _, block in
-                blockView(block)
+        SelectableMarkdownNSText(attributed: Self.attributedString(for: source))
+            .contextMenu {
+                Button("Copy All") {
+                    NSPasteboard.general.clearContents()
+                    NSPasteboard.general.setString(source, forType: .string)
+                }
             }
-        }
-        .contextMenu {
-            Button("Copy All") {
-                NSPasteboard.general.clearContents()
-                NSPasteboard.general.setString(source, forType: .string)
-            }
-        }
     }
 
-    private enum Block {
+    enum TableAlignment { case left, right, center }
+
+    fileprivate enum Block {
         case paragraph(String)
-        case heading(Int, String)      // level, text
-        case code(String, String)      // language, content
+        case heading(Int, String)              // level, text
+        case code(String, String)              // language, content
         case listItem(String)
-        case xmlBlock(String)          // raw XML/tag content
+        case xmlBlock(String)                  // raw XML/tag content
+        case table([String], [[String]], [TableAlignment])  // headers, rows, alignments
     }
 
-    private func parseBlocks() -> [Block] {
+    fileprivate static func parseBlocks(source: String) -> [Block] {
         var blocks: [Block] = []
         let lines = source.components(separatedBy: "\n")
         var i = 0
@@ -1580,6 +1608,17 @@ struct MarkdownText: View {
                 continue
             }
 
+            // Markdown table: a `|`-leading row immediately followed by a separator
+            // row (`|---|---|`, optionally with `:` for alignment). We accept the
+            // looser "must have at least one `|`" form too — many models drop the
+            // leading pipe — but require the separator line to confirm intent so
+            // we don't misinterpret a stray pipe as a table header.
+            if let table = Self.tryParseTable(lines: lines, start: i) {
+                blocks.append(.table(table.headers, table.rows, table.alignments))
+                i = table.end
+                continue
+            }
+
             // Heading
             if line.hasPrefix("#") {
                 let level = line.prefix(while: { $0 == "#" }).count
@@ -1623,7 +1662,8 @@ struct MarkdownText: View {
                 if next.trimmingCharacters(in: .whitespaces).isEmpty ||
                    next.hasPrefix("#") || next.hasPrefix("```") ||
                    next.starts(with: "- ") || next.starts(with: "* ") ||
-                   next.hasPrefix("<") {
+                   next.hasPrefix("<") ||
+                   next.trimmingCharacters(in: .whitespaces).hasPrefix("|") {
                     break
                 }
                 para.append(next)
@@ -1635,57 +1675,418 @@ struct MarkdownText: View {
         return blocks
     }
 
-    @ViewBuilder
-    private func blockView(_ block: Block) -> some View {
-        switch block {
-        case .paragraph(let text):
-            inlineMarkdown(text)
+    // MARK: Table parsing
 
-        case .heading(let level, let text):
-            Text(text)
-                .font(level == 1 ? .title2.bold() : level == 2 ? .title3.bold() : .headline)
-                .padding(.top, level == 1 ? 4 : 2)
+    private struct ParsedTable {
+        let headers: [String]
+        let rows: [[String]]
+        let alignments: [TableAlignment]
+        let end: Int  // index of the line *after* the table
+    }
 
-        case .code(_, let content):
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(content)
-                    .font(.system(size: 12, design: .monospaced))
-                    .textSelection(.enabled)
+    /// Detect a GFM-style markdown table starting at `lines[start]`. Requires a
+    /// header row, a separator row of dashes (with optional colons for alignment),
+    /// and zero-or-more data rows. Returns nil if any structural check fails so
+    /// the caller falls through to paragraph handling.
+    private static func tryParseTable(lines: [String], start: Int) -> ParsedTable? {
+        guard start + 1 < lines.count else { return nil }
+        let headerLine = lines[start].trimmingCharacters(in: .whitespaces)
+        let sepLine = lines[start + 1].trimmingCharacters(in: .whitespaces)
+        // First try the strict GFM form (pipes + dashed separator).
+        if headerLine.contains("|"), isTableSeparator(sepLine) {
+            let headers = parseTableRow(headerLine)
+            let alignments = parseTableAlignments(sepLine)
+            guard !headers.isEmpty else { return nil }
+            var rows: [[String]] = []
+            var i = start + 2
+            while i < lines.count {
+                let r = lines[i].trimmingCharacters(in: .whitespaces)
+                guard r.contains("|") else { break }
+                if isTableSeparator(r) { break }
+                rows.append(parseTableRow(r))
+                i += 1
             }
-            .padding(10)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color(nsColor: NSColor(white: 0.08, alpha: 1)))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
+            return ParsedTable(headers: headers, rows: rows, alignments: alignments, end: i)
+        }
+        // Fallback: ASCII pseudo-table — many smaller models emit
+        //   Header1   Header2   Header3
+        //   ---------------------------
+        //   value1    value2    value3
+        // i.e. multi-space column separators + a single row of dashes. Detect
+        // it by looking for a header line with at least two 2+-space gaps,
+        // followed by a row that's mostly dashes, followed by data rows that
+        // also have multi-space gaps. We split each row on `\s{2,}` to recover
+        // cells.
+        return tryParseAsciiPseudoTable(lines: lines, start: start)
+    }
 
-        case .listItem(let text):
-            HStack(alignment: .top, spacing: 6) {
-                Text("\u{2022}")
-                    .foregroundStyle(.secondary)
-                inlineMarkdown(text)
+    /// Recognise the whitespace-aligned "table" shape smaller models emit when
+    /// asked for tabular data without using GFM pipe syntax. We require a
+    /// dashed-rule line within the next two lines and at least 3 columns in the
+    /// header so we don't false-positive a paragraph that happens to contain a
+    /// double space.
+    private static func tryParseAsciiPseudoTable(lines: [String], start: Int) -> ParsedTable? {
+        let header = lines[start]
+        let headerCells = splitOnDoubleSpace(header)
+        guard headerCells.count >= 2 else { return nil }
+        // Find the separator line — typically immediately next, sometimes after
+        // a blank line. Don't search far so paragraphs don't accidentally match.
+        var sepIdx = start + 1
+        while sepIdx < min(start + 3, lines.count) {
+            let candidate = lines[sepIdx].trimmingCharacters(in: .whitespaces)
+            if isAsciiRule(candidate) { break }
+            if !candidate.isEmpty { return nil }
+            sepIdx += 1
+        }
+        guard sepIdx < lines.count else { return nil }
+        guard isAsciiRule(lines[sepIdx].trimmingCharacters(in: .whitespaces)) else { return nil }
+        // Collect data rows: non-blank, with at least one 2+-space gap, and not
+        // another rule line.
+        var rows: [[String]] = []
+        var i = sepIdx + 1
+        while i < lines.count {
+            let raw = lines[i]
+            let t = raw.trimmingCharacters(in: .whitespaces)
+            if t.isEmpty { i += 1; break }
+            if isAsciiRule(t) { i += 1; break }
+            let cells = splitOnDoubleSpace(raw)
+            // Tolerate single-cell continuation lines (model wrapping a long
+            // cell to the next line) by appending to the previous row's last
+            // cell rather than starting a new row.
+            if cells.count == 1, !rows.isEmpty {
+                rows[rows.count - 1][rows[rows.count - 1].count - 1] += " " + cells[0]
+            } else {
+                rows.append(cells)
             }
+            i += 1
+        }
+        guard !rows.isEmpty else { return nil }
+        // All-left alignment (we have no `:---:` markers in this format).
+        let alignments = [TableAlignment](repeating: .left, count: headerCells.count)
+        return ParsedTable(headers: headerCells, rows: rows, alignments: alignments, end: i)
+    }
 
-        case .xmlBlock(let content):
-            ScrollView(.horizontal, showsIndicators: false) {
-                Text(content)
-                    .font(.system(size: 11, design: .monospaced))
-                    .foregroundStyle(.secondary)
-                    .textSelection(.enabled)
-            }
-            .padding(8)
-            .frame(maxWidth: .infinity, alignment: .leading)
-            .background(Color.purple.opacity(0.1))
-            .clipShape(RoundedRectangle(cornerRadius: 8))
-            .overlay(
-                RoundedRectangle(cornerRadius: 8)
-                    .stroke(Color.purple.opacity(0.3), lineWidth: 0.5)
-            )
+    /// Split on runs of two-or-more whitespace. Trims each cell. Drops the
+    /// empty leading element if the line was indented.
+    private static func splitOnDoubleSpace(_ line: String) -> [String] {
+        let parts = line.components(separatedBy: "  ")
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+            .filter { !$0.isEmpty }
+        return parts
+    }
+
+    /// True if the (already-trimmed) line consists entirely of dashes / box-
+    /// drawing chars / spaces and is at least 3 chars long. Catches the
+    /// "----------" rule under header rows in pseudo-tables.
+    private static func isAsciiRule(_ line: String) -> Bool {
+        guard line.count >= 3 else { return false }
+        let allowed: Set<Character> = ["-", "─", "=", " ", "|"]
+        let allAllowed = line.allSatisfy { allowed.contains($0) }
+        let hasDash = line.contains("-") || line.contains("─") || line.contains("=")
+        return allAllowed && hasDash
+    }
+
+    private static func parseTableRow(_ line: String) -> [String] {
+        var t = line.trimmingCharacters(in: .whitespaces)
+        if t.hasPrefix("|") { t.removeFirst() }
+        if t.hasSuffix("|") { t.removeLast() }
+        return t.split(separator: "|", omittingEmptySubsequences: false)
+            .map { $0.trimmingCharacters(in: .whitespaces) }
+    }
+
+    private static func isTableSeparator(_ line: String) -> Bool {
+        let cells = parseTableRow(line)
+        guard !cells.isEmpty else { return false }
+        return cells.allSatisfy { cell in
+            let c = cell.replacingOccurrences(of: " ", with: "")
+            return c.range(of: "^:?-{3,}:?$", options: .regularExpression) != nil
         }
     }
 
-    private func inlineMarkdown(_ text: String) -> Text {
-        if let attributed = try? AttributedString(markdown: text, options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)) {
-            return Text(attributed)
+    private static func parseTableAlignments(_ line: String) -> [TableAlignment] {
+        return parseTableRow(line).map { cell in
+            let c = cell.replacingOccurrences(of: " ", with: "")
+            let leftColon = c.hasPrefix(":")
+            let rightColon = c.hasSuffix(":")
+            if leftColon && rightColon { return .center }
+            if rightColon { return .right }
+            return .left
         }
-        return Text(text)
+    }
+
+    // MARK: NSAttributedString assembly
+
+    /// Build the NSAttributedString fed to NSTextView. Public-static so the
+    /// rendering path can be exercised by tests later if needed.
+    static func attributedString(for source: String) -> NSAttributedString {
+        let result = NSMutableAttributedString()
+        let blocks = parseBlocks(source: source)
+        for (idx, block) in blocks.enumerated() {
+            if idx > 0 { result.append(blockSpacer()) }
+            switch block {
+            case .paragraph(let text):
+                result.append(renderInline(text))
+
+            case .heading(let level, let text):
+                let size: CGFloat = level == 1 ? 18 : level == 2 ? 16 : 14
+                let p = NSMutableParagraphStyle()
+                p.paragraphSpacingBefore = 4
+                p.paragraphSpacing = 2
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.systemFont(ofSize: size, weight: .bold),
+                    .foregroundColor: NSColor.labelColor,
+                    .paragraphStyle: p,
+                ]
+                result.append(NSAttributedString(string: text, attributes: attrs))
+
+            case .code(_, let content):
+                let p = NSMutableParagraphStyle()
+                p.paragraphSpacingBefore = 4
+                p.paragraphSpacing = 4
+                p.firstLineHeadIndent = 8
+                p.headIndent = 8
+                p.tailIndent = -8
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.monospacedSystemFont(ofSize: 12, weight: .regular),
+                    .backgroundColor: NSColor.textBackgroundColor.blended(withFraction: 0.85, of: .black) ?? NSColor.darkGray,
+                    .foregroundColor: NSColor(white: 0.92, alpha: 1.0),
+                    .paragraphStyle: p,
+                ]
+                result.append(NSAttributedString(string: content, attributes: attrs))
+
+            case .listItem(let text):
+                let bullet = NSAttributedString(string: "• ", attributes: [
+                    .font: NSFont.systemFont(ofSize: 13),
+                    .foregroundColor: NSColor.secondaryLabelColor,
+                ])
+                let p = NSMutableParagraphStyle()
+                p.headIndent = 14
+                let inline = renderInline(text)
+                let combined = NSMutableAttributedString()
+                combined.append(bullet)
+                combined.append(inline)
+                combined.addAttribute(.paragraphStyle, value: p, range: NSRange(location: 0, length: combined.length))
+                result.append(combined)
+
+            case .xmlBlock(let content):
+                let p = NSMutableParagraphStyle()
+                p.firstLineHeadIndent = 8
+                p.headIndent = 8
+                let attrs: [NSAttributedString.Key: Any] = [
+                    .font: NSFont.monospacedSystemFont(ofSize: 11, weight: .regular),
+                    .foregroundColor: NSColor.systemPurple,
+                    .backgroundColor: NSColor.systemPurple.withAlphaComponent(0.10),
+                    .paragraphStyle: p,
+                ]
+                result.append(NSAttributedString(string: content, attributes: attrs))
+
+            case .table(let headers, let rows, let alignments):
+                result.append(renderTable(headers: headers, rows: rows, alignments: alignments))
+            }
+        }
+        return result
+    }
+
+    /// One-and-a-half blank lines between blocks. Encoded as a `\n` with extra
+    /// paragraph spacing so tall blocks don't collapse.
+    private static func blockSpacer() -> NSAttributedString {
+        let p = NSMutableParagraphStyle()
+        p.paragraphSpacing = 6
+        return NSAttributedString(string: "\n", attributes: [
+            .font: NSFont.systemFont(ofSize: 6),
+            .paragraphStyle: p,
+        ])
+    }
+
+    /// Render an inline span by delegating to AttributedString's markdown parser
+    /// (handles `**bold**`, `_italic_`, `` `code` ``, `[link](url)`). Falls back
+    /// to a plain-text NSAttributedString if the parse fails. Returned string
+    /// carries the body font and a dynamic foreground color so the rendering
+    /// flips correctly between light and dark modes — Foundation's converter
+    /// can leave `**bold**` and link spans with a baked-in `NSColor` that
+    /// doesn't adapt, so we overwrite missing-or-static colors with
+    /// `.labelColor` (links keep their dynamic `linkColor`).
+    private static func renderInline(_ text: String) -> NSAttributedString {
+        let bodyFont = NSFont.systemFont(ofSize: 13)
+        let result: NSMutableAttributedString
+        if let attr = try? AttributedString(
+            markdown: text,
+            options: .init(interpretedSyntax: .inlineOnlyPreservingWhitespace)
+        ) {
+            result = NSMutableAttributedString(attr)
+        } else {
+            result = NSMutableAttributedString(string: text)
+        }
+        let full = NSRange(location: 0, length: result.length)
+        // Default font for any character that didn't pick up an explicit font
+        // from the markdown parser.
+        result.enumerateAttribute(.font, in: full, options: []) { value, range, _ in
+            if value == nil {
+                result.addAttribute(.font, value: bodyFont, range: range)
+            }
+        }
+        // Force a dynamic foreground for every non-link span. AttributedString's
+        // markdown→NSAttributedString bridge sometimes inserts `NSColor.black`
+        // for bold/italic — that reads fine in light mode but is invisible on
+        // a dark bubble background. Walk the whole string and replace any
+        // foreground that's NOT explicitly the dynamic linkColor with
+        // labelColor (which adapts).
+        result.enumerateAttribute(.foregroundColor, in: full, options: []) { value, range, _ in
+            // Spans inside a link keep linkColor; everything else gets labelColor.
+            let isLink = result.attribute(.link, at: range.location, effectiveRange: nil) != nil
+            if isLink {
+                result.addAttribute(.foregroundColor, value: NSColor.linkColor, range: range)
+                return
+            }
+            // If the existing color is already dynamic-equal-to-labelColor we
+            // can leave it; checking via `==` handles both the missing case
+            // (value nil) and the static-black case Foundation often picks.
+            if let existing = value as? NSColor,
+               existing.isEqual(NSColor.labelColor) {
+                return
+            }
+            result.addAttribute(.foregroundColor, value: NSColor.labelColor, range: range)
+        }
+        return result
+    }
+
+    /// Render a markdown table as monospaced columns padded to the widest cell
+    /// per column. Header row gets a bold font; a horizontal rule separates the
+    /// header from the data rows. Looks great in a chat bubble and stays
+    /// selectable as part of the surrounding text.
+    private static func renderTable(
+        headers: [String],
+        rows: [[String]],
+        alignments: [TableAlignment]
+    ) -> NSAttributedString {
+        let cols = headers.count
+        var widths = [Int](repeating: 0, count: cols)
+        let allRows = [headers] + rows
+        for row in allRows {
+            for (j, cell) in row.prefix(cols).enumerated() {
+                widths[j] = max(widths[j], cell.count)
+            }
+        }
+        // Pad cells with at least 1 space so columns don't visually merge.
+        for j in 0..<cols { widths[j] = max(widths[j], 1) }
+
+        func pad(_ cell: String, width: Int, align: TableAlignment) -> String {
+            let gap = width - cell.count
+            if gap <= 0 { return cell }
+            switch align {
+            case .left:   return cell + String(repeating: " ", count: gap)
+            case .right:  return String(repeating: " ", count: gap) + cell
+            case .center:
+                let l = gap / 2
+                return String(repeating: " ", count: l) + cell + String(repeating: " ", count: gap - l)
+            }
+        }
+
+        func formatRow(_ cells: [String]) -> String {
+            var padded = cells
+            while padded.count < cols { padded.append("") }
+            return padded.prefix(cols).enumerated().map { idx, cell in
+                let a = idx < alignments.count ? alignments[idx] : .left
+                return pad(cell, width: widths[idx], align: a)
+            }.joined(separator: "  ")
+        }
+
+        let mono = NSFont.monospacedSystemFont(ofSize: 12, weight: .regular)
+        let monoBold = NSFont.monospacedSystemFont(ofSize: 12, weight: .semibold)
+        let result = NSMutableAttributedString()
+
+        // Header row (bold) + horizontal rule using box-drawing chars. Explicit
+        // `.foregroundColor: .labelColor` so the table flips light/dark with
+        // the system mode — without it some macOS versions render the cells
+        // in the captured static color from the AttributedString bridge.
+        let headerLine = formatRow(headers) + "\n"
+        result.append(NSAttributedString(string: headerLine, attributes: [
+            .font: monoBold,
+            .foregroundColor: NSColor.labelColor,
+        ]))
+        let rule = widths.map { String(repeating: "─", count: $0) }.joined(separator: "  ") + "\n"
+        result.append(NSAttributedString(string: rule, attributes: [
+            .font: mono,
+            .foregroundColor: NSColor.secondaryLabelColor,
+        ]))
+        // Data rows.
+        for (idx, row) in rows.enumerated() {
+            let line = formatRow(row) + (idx == rows.count - 1 ? "" : "\n")
+            result.append(NSAttributedString(string: line, attributes: [
+                .font: mono,
+                .foregroundColor: NSColor.labelColor,
+            ]))
+        }
+        return result
+    }
+}
+
+// MARK: - SelectableMarkdownNSText (NSTextView wrapper)
+
+/// NSViewRepresentable around an NSTextView. NSTextView is the only AppKit text
+/// surface that natively supports drag-selection across an arbitrarily styled
+/// attributed string, which is what we need so users can highlight an entire
+/// assistant message — paragraphs, list items, code blocks, tables — in one
+/// motion and copy the lot. The view reports its intrinsic content size to
+/// SwiftUI so layout in a VStack works without forcing a fixed height.
+fileprivate struct SelectableMarkdownNSText: NSViewRepresentable {
+    let attributed: NSAttributedString
+
+    func makeNSView(context: Context) -> IntrinsicTextView {
+        let tv = IntrinsicTextView()
+        tv.isEditable = false
+        tv.isSelectable = true
+        tv.drawsBackground = false
+        tv.textContainerInset = .zero
+        tv.textContainer?.lineFragmentPadding = 0
+        tv.textContainer?.widthTracksTextView = true
+        tv.isVerticallyResizable = true
+        tv.isHorizontallyResizable = false
+        tv.autoresizingMask = [.width]
+        // Match the surrounding bubble's text color when no explicit foreground
+        // is set on a span (e.g. plain paragraphs).
+        tv.textColor = .labelColor
+        tv.linkTextAttributes = [
+            .foregroundColor: NSColor.linkColor,
+            .underlineStyle: NSUnderlineStyle.single.rawValue,
+            .cursor: NSCursor.pointingHand,
+        ]
+        tv.textStorage?.setAttributedString(attributed)
+        return tv
+    }
+
+    func updateNSView(_ nsView: IntrinsicTextView, context: Context) {
+        // Only mutate the storage if the assistant's content actually changed.
+        // Streaming chunks call updateNSView many times per second; an unconditional
+        // replace would interrupt an active selection on every frame.
+        if nsView.textStorage?.isEqual(to: attributed) == false {
+            nsView.textStorage?.setAttributedString(attributed)
+            nsView.invalidateIntrinsicContentSize()
+        }
+    }
+}
+
+/// NSTextView that reports its laid-out height as its intrinsic content size,
+/// so embedding it in SwiftUI's layout system "just works" — no manual height
+/// binding required.
+fileprivate final class IntrinsicTextView: NSTextView {
+    override var intrinsicContentSize: NSSize {
+        guard let lm = layoutManager, let tc = textContainer else {
+            return super.intrinsicContentSize
+        }
+        lm.ensureLayout(for: tc)
+        let used = lm.usedRect(for: tc)
+        return NSSize(width: NSView.noIntrinsicMetric, height: ceil(used.height))
+    }
+
+    override func didChangeText() {
+        super.didChangeText()
+        invalidateIntrinsicContentSize()
+    }
+
+    override func setFrameSize(_ newSize: NSSize) {
+        super.setFrameSize(newSize)
+        // Width changes (parent re-flow) require a layout-driven height re-check.
+        invalidateIntrinsicContentSize()
     }
 }

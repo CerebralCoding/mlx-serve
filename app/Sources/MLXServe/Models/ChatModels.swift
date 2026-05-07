@@ -140,7 +140,19 @@ struct ModelInfo {
     var layers: Int
     var hiddenSize: Int
     var vocabSize: Int
+    /// Effective context length the running server is using right now —
+    /// `max_context_size` if --ctx-size was passed, else the memory-bounded
+    /// safe ceiling. Shifts when the user changes Settings → restarts.
     var contextLength: Int
+    /// The model's own `max_position_embeddings` from config.json, capped
+    /// only by what the architecture supports. Stable across server restarts;
+    /// use this for UI like the "Model max" pill in Settings.
+    var modelMaxTokens: Int
+    /// True when the loaded model declares MTP layers in its config (Qwen3.5+,
+    /// Qwen3-Next). Used by Settings to grey out the "Enable MTP" toggle on
+    /// models that can't use it. Note: even with this true, the safetensors
+    /// may have stripped MTP weights — `--mtp` will then silently fall back.
+    var supportsMTP: Bool
 }
 
 struct MemoryInfo {

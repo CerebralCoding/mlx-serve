@@ -53,6 +53,7 @@ struct MLXCoreApp: App {
             case "modelBrowser": title = "Model Browser"
             case "imageGen": title = "Image Generation"
             case "videoGen": title = "Video Generation"
+            case "settings": title = "Settings"
             default: title = "Browser"
             }
             NSApplication.shared.windows
@@ -68,7 +69,8 @@ struct MLXCoreApp: App {
                 openBrowser: { openAndFocus("browser") },
                 openModelBrowser: { openAndFocus("modelBrowser") },
                 openImageGen: { openAndFocus("imageGen") },
-                openVideoGen: { openAndFocus("videoGen") }
+                openVideoGen: { openAndFocus("videoGen") },
+                openSettings: { openAndFocus("settings") }
             )
                 .environmentObject(appState)
                 .environmentObject(appState.server)
@@ -122,8 +124,19 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.server)
         }
         .defaultSize(width: 960, height: 700)
+
+        Window("Settings", id: "settings") {
+            SettingsView()
+                .environmentObject(appState)
+                .environmentObject(appState.server)
+                .frame(minWidth: 720, minHeight: 560)
+        }
+        .defaultSize(width: 820, height: 700)
         .commands {
             CommandMenu("Agent") {
+                Button("Settings…") { openAndFocus("settings") }
+                    .keyboardShortcut(",", modifiers: [.command])
+
                 Button("Edit System Prompt") {
                     AgentPrompt.openSystemPromptInEditor()
                 }

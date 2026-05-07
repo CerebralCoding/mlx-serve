@@ -8,9 +8,16 @@ const json_grammar = @import("json_grammar.zig");
 const json_schema = @import("json_schema.zig");
 const token_mask = @import("token_mask.zig");
 const io_util = @import("io_util.zig");
+const pld_index = @import("pld_index.zig");
+const drafter_mod = @import("drafter.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
+const SSMCacheEntrySnapshot = transformer_mod.SSMCacheEntrySnapshot;
+const ssmSnapshot = transformer_mod.ssmSnapshot;
+const ssmSnapshotDeinit = transformer_mod.ssmSnapshotDeinit;
+const ssmRestore = transformer_mod.ssmRestore;
+const DrafterModel = drafter_mod.DrafterModel;
 
 /// Grammar-constrained sampling state. The caller owns `grammar`, `token_bytes`,
 /// and `mask_buf`; the generator only reads them. `mask_buf.len` must equal
@@ -134,7 +141,114 @@ pub const Generator = struct {
     pending_token: mlx.mlx_array = .{},
     has_pending_token: bool = false,
 
+    // ── MTP (Multi-Token Prediction) state ──
+    // Set by handler when `enable_mtp` is true on the request and the model
+    // has an MTP head. When set, callers use `nextMtp` instead of `next`.
+    mtp_enabled: bool = false,
+    // Pre-final-norm hidden state at the last produced token's position. Owned
+    // by the Generator (freed in `deinit`). Captured by `forwardCaptureHidden`
+    // during prefill final-token forward + every nextMtp verify forward.
+    mtp_last_hidden: mlx.mlx_array = .{},
+    has_mtp_last_hidden: bool = false,
+    // Statistics for benchmarking / debug logs.
+    mtp_attempted: u64 = 0,
+    mtp_accepted: u64 = 0,
+    /// PRNG for the MTP / PLD stochastic-verify accept test (probability-ratio
+    /// requires a uniform draw per draft step). Seeded from `sampling.seed`
+    /// when set, otherwise from system time at init.
+    prng: std.Random.DefaultPrng = std.Random.DefaultPrng.init(0),
+
+    // ── PLD (Prompt Lookup Decoding) state ──
+    // Owned copy of the input prompt ids — needed because PLD's n-gram lookup
+    // table is `prompt + generated_ids`, and the caller-supplied `prompt_ids`
+    // slice is freed after `init` returns. `generated_ids` (above) tracks
+    // post-prefill tokens; `prompt_ids_owned` is the immutable prefix.
+    prompt_ids_owned: []u32 = &.{},
+    /// Allocator that owns `prompt_ids_owned`. Stored so `deinit` can free it
+    /// without requiring callers to thread the allocator a second time. (Other
+    /// owned slices are freed via the `allocator` argument to `deinit` for
+    /// historical reasons; this one is set during `initWithOptions`.)
+    prompt_ids_alloc: ?std.mem.Allocator = null,
+    /// Stats for PLD benchmark logging. `pld_attempted` counts every step
+    /// where lookup found a candidate (so a verify forward ran);
+    /// `pld_accepted_tokens` is the cumulative number of *drafted* tokens
+    /// (not including the always-accepted t1) that were successfully verified.
+    pld_attempted: u64 = 0,
+    pld_accepted_tokens: u64 = 0,
+
+    // ── Gemma 4 assistant drafter state ──
+    // External drafter model (cross-attends into target's KV). When
+    // `drafter != null`, callers use `nextDrafter` instead of `next`. The
+    // drafter is owned by the server (loaded once at startup); the Generator
+    // only holds a non-owning pointer.
+    drafter: ?*DrafterModel = null,
+    /// Number of tokens proposed per round (= drafter forwards + 1 verify token).
+    /// Defaults to 4 (3 drafter steps + 1 t1 prepend → length-4 verify).
+    drafter_block_size: u32 = 4,
+    /// Stats: count of nextDrafter calls that ran a verify forward.
+    drafter_attempted: u64 = 0,
+    /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
+    drafter_accepted_tokens: u64 = 0,
+
+    // ── Runtime acceptance gate ──
+    // Set to true mid-request when the per-request acceptance rate
+    // (`*_accepted_tokens / *_attempted`) falls below
+    // `RUNTIME_GATE_MIN_RATE` after `RUNTIME_GATE_WARMUP` attempts. When set,
+    // both `nextPld` and `nextDrafter` short-circuit to `next()` for the
+    // remainder of the request — the prompt-time gate could not foresee that
+    // the workload's *runtime* draft acceptance rate wasn't paying for the
+    // per-step verify overhead. The flag is sticky for the rest of the
+    // generation; we never re-enable speculation within a single request.
+    spec_disabled_runtime: bool = false,
+    /// Number of attempts before the runtime gate considers disabling.
+    /// Below this we trust the prompt-time gate.
+    pub const RUNTIME_GATE_WARMUP: u64 = 5;
+    /// Minimum (accepted / attempted) ratio. Below this after warmup, speculation
+    /// is disabled for the rest of the request.
+    pub const RUNTIME_GATE_MIN_RATE: f32 = 0.30;
+
+    // MTP-specific runtime gate. PLD/drafter accept multi-token rounds (range
+    // [0, m]); MTP accepts a single binary outcome per attempt (range [0, 1]).
+    // Empirical break-even is p ≈ 0.775 (cost model: tokens/cost = (1+p)/(2.55−p)).
+    // Threshold 0.65 sits 12.5% below break-even — wide enough to absorb
+    // burstiness, tight enough to catch the 60% losers.
+    //
+    // Warmup 8 + threshold 0.70: short-output workloads (heavy-echo at 53
+    // tokens) need an early gate or the per-attempt MTP overhead dominates
+    // before fall-back can recover. Lowering warmup from 20 → 8 was the
+    // primary lever; bumping the threshold from 0.65 → 0.70 catches the
+    // borderline-accept case (long-code lands at p ≈ 0.65, which scrapes
+    // through the 0.65 gate but still costs 6% — 0.70 trips it cleanly).
+    // 0.70 is still 7.5% below the 0.775 empirical break-even, so memorized
+    // text at p ≈ 0.77 stays above and keeps its 1.07×+ speedup.
+    pub const RUNTIME_GATE_MTP_WARMUP: u64 = 8;
+    pub const RUNTIME_GATE_MTP_MIN_RATE: f32 = 0.70;
+
+    /// Pure helper: should the runtime gate disable speculation given the
+    /// observed per-request stats? Extracted so we can unit-test the
+    /// threshold logic without spinning up a real Generator (which needs a
+    /// loaded model). Returns true iff `attempted >= warmup` AND
+    /// `accepted/attempted < min_rate`.
+    pub fn runtimeGateShouldDisable(attempted: u64, accepted: u64) bool {
+        if (attempted < RUNTIME_GATE_WARMUP) return false;
+        const rate = @as(f32, @floatFromInt(accepted)) /
+            @as(f32, @floatFromInt(attempted));
+        return rate < RUNTIME_GATE_MIN_RATE;
+    }
+
+    /// MTP-specific runtime gate sibling. Separate constants because MTP
+    /// accept is a binary per-attempt outcome — the PLD/drafter threshold
+    /// (0.30 over multi-token rounds) is not interchangeable with MTP's
+    /// pay-per-attempt model.
+    pub fn runtimeGateShouldDisableMtp(attempted: u64, accepted: u64) bool {
+        if (attempted < RUNTIME_GATE_MTP_WARMUP) return false;
+        const rate = @as(f32, @floatFromInt(accepted)) /
+            @as(f32, @floatFromInt(attempted));
+        return rate < RUNTIME_GATE_MTP_MIN_RATE;
+    }
+
     /// Prefill the prompt and prepare for token-by-token generation.
+    /// Backwards-compatible — prefer `initWithOptions` for new callers.
     pub fn init(
         io: std.Io,
         allocator: std.mem.Allocator,
@@ -145,6 +259,52 @@ pub const Generator = struct {
         sampling: SamplingParams,
         eos_token_ids: []const u32,
     ) !Generator {
+        return initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{});
+    }
+
+    pub const InitOptions = struct {
+        /// Enable MTP draft+verify in the decode loop. Requires `xfm.mtp_layers != null`.
+        /// When true, init's final-token prefill forward captures the pre-final-norm
+        /// hidden state into `Generator.mtp_last_hidden` so the first `nextMtp` call
+        /// has a starting point.
+        mtp_enabled: bool = false,
+        /// Skip the lazy pre-forward of the first sampled token. When set,
+        /// init samples t1 synchronously and leaves `pending_logits/pending_token`
+        /// empty — the cache lands at exactly `prompt_len` with t1 NOT in cache.
+        /// `nextPld` v2 (mirroring `nextDrafter`) drives every step from that
+        /// invariant: verify input is `[t1, draft[0..m-1]]` length `1+m`; full
+        /// accept commits `1+m` tokens with cache landing at `prompt_len + TE_new`
+        /// and NO post-step forward. Saves one decode-step forward per accepted
+        /// PLD step at the cost of losing the lazy-pipeline overlap on cold
+        /// (no-match) steps. The prompt-time gate disables PLD on novel content
+        /// where cold-path dominates.
+        pld_enabled: bool = false,
+        /// Enable Gemma 4 assistant drafter. When set, `drafter` must be
+        /// non-null and already `bind()`-ed to `xfm`. Init's prefill final-token
+        /// forward captures the post-final-norm hidden state into
+        /// `Generator.mtp_last_hidden` (reused for the drafter's first-step
+        /// h_prev — same buffer, different semantics — see comment in
+        /// `nextDrafter`). Same lazy-pre-forward skip semantics as MTP/PLD.
+        drafter_enabled: bool = false,
+        /// Non-owning pointer to the loaded drafter (must be non-null when
+        /// `drafter_enabled` is true).
+        drafter: ?*DrafterModel = null,
+        /// Number of tokens per draft round. Default 4 (3 drafter steps +
+        /// 1 t1 prepend → length-4 verify forward).
+        drafter_block_size: u32 = 4,
+    };
+
+    pub fn initWithOptions(
+        io: std.Io,
+        allocator: std.mem.Allocator,
+        xfm: *Transformer,
+        tok: *const Tokenizer,
+        prompt_ids: []const u32,
+        max_tokens: u32,
+        sampling: SamplingParams,
+        eos_token_ids: []const u32,
+        options: InitOptions,
+    ) !Generator {
         const s = xfm.s;
 
         const ids_i32 = try allocator.alloc(i32, prompt_ids.len);
@@ -152,6 +312,13 @@ pub const Generator = struct {
         for (prompt_ids, 0..) |id, i| {
             ids_i32[i] = @intCast(id);
         }
+
+        // Clone the prompt for the lifetime of the Generator. PLD's n-gram
+        // lookup needs `prompt + generated`, and `prompt_ids` (caller-owned)
+        // can be freed before `nextPld` runs. Allocated up front so init's
+        // errdefer paths don't have to track partial state.
+        const prompt_owned = try allocator.dupe(u32, prompt_ids);
+        errdefer allocator.free(prompt_owned);
 
         // Split prefill: process first N-1 tokens (cache-only, skip lm_head eval),
         // then the last token (produces logits for sampling). This mirrors mlx-lm's
@@ -207,7 +374,30 @@ pub const Generator = struct {
         const last_input = mlx.mlx_array_new_data(&ids_i32[last_idx], &last_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(last_input);
 
-        const logits = try xfm.forward(last_input);
+        // MTP enabled at init: capture the pre-final-norm hidden state from
+        // this prefill forward so the first `nextMtp` call has h_N to draft
+        // from. Also disables the lazy pre-forward of the first sampled token
+        // below — MTP semantics require the cache to be at exactly `prompt_len`
+        // (last prompt token forwarded, first sampled token NOT yet forwarded)
+        // before nextMtp's verify forward runs over `[first_sample, draft]`.
+        //
+        // The drafter (Gemma 4 assistant) uses the same captured hidden as its
+        // first-step h_prev — same buffer, same `forwardCaptureHidden` path,
+        // different downstream semantics. Reuse the existing `mtp_last_hidden`
+        // slot rather than introducing a parallel field.
+        const mtp_active = options.mtp_enabled and xfm.mtp_layers != null;
+        const drafter_active = options.drafter_enabled and options.drafter != null;
+        const pld_active = options.pld_enabled;
+        const need_capture = mtp_active or drafter_active;
+        var captured_hidden: mlx.mlx_array = mlx.mlx_array_new();
+        var has_captured_hidden = false;
+        const logits = if (need_capture) blk: {
+            has_captured_hidden = true;
+            break :blk try xfm.forwardCaptureHidden(last_input, &captured_hidden);
+        } else try xfm.forward(last_input);
+        errdefer if (has_captured_hidden) {
+            _ = mlx.mlx_array_free(captured_hidden);
+        };
 
         // Constrained generation skips the lazy first-sample fast path: we cannot
         // sample the first token until we have applied the grammar mask, and we
@@ -228,13 +418,67 @@ pub const Generator = struct {
                 .generated_ids = std.ArrayList(u32).empty,
                 .timeout_ns = 0,
                 .timer = io_util.Stopwatch.init(io),
+                .mtp_enabled = false, // grammar-constrained + MTP is not supported in v1
+                .mtp_last_hidden = if (has_captured_hidden) captured_hidden else mlx.mlx_array_new(),
+                .has_mtp_last_hidden = has_captured_hidden,
+                .prompt_ids_owned = prompt_owned,
+                .prompt_ids_alloc = allocator,
             };
             gen.pending_logits = logits;
             gen.has_pending_logits = true;
             return gen;
         }
 
-        // Sample first token lazily, then build the next forward pass
+        // MTP / drafter / PLD-v2 path: sample synchronously and DO NOT
+        // pre-forward the sampled token. The first nextMtp / nextDrafter /
+        // nextPld call needs the cache at exactly prompt_len (last prompt
+        // token forwarded; first sampled token deferred). The lazy pre-forward
+        // path below would over-advance the cache and corrupt every verify
+        // forward.
+        //
+        // PLD-v2 mirrors nextDrafter's invariant: verify input includes t1
+        // (length 1+m) and full accept commits without a post-step forward.
+        // This eliminates one forward per accepted PLD step relative to v1,
+        // at the cost of losing the lazy-pipeline overlap on cold steps.
+        if (mtp_active or drafter_active or pld_active) {
+            const sample_lazy = sampleTokenLazy(logits, sampling, s);
+            _ = mlx.mlx_array_free(logits);
+            try mlx.check(mlx.mlx_array_eval(sample_lazy));
+            var first_val: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&first_val, sample_lazy));
+            _ = mlx.mlx_array_free(sample_lazy);
+
+            const gen = Generator{
+                .xfm = xfm,
+                .tok = tok,
+                .next_token_id = @intCast(first_val),
+                .step = 0,
+                .max_tokens = max_tokens,
+                .sampling = sampling,
+                .prompt_tokens = @intCast(prompt_ids.len),
+                .completion_tokens = 0,
+                .finish_reason = "length",
+                .done = false,
+                .eos_token_ids = eos_token_ids,
+                .generated_ids = std.ArrayList(u32).empty,
+                .timeout_ns = 0,
+                .timer = io_util.Stopwatch.init(io),
+                .mtp_enabled = mtp_active,
+                .mtp_last_hidden = if (need_capture) captured_hidden else mlx.mlx_array_new(),
+                .has_mtp_last_hidden = need_capture,
+                .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
+                .prompt_ids_owned = prompt_owned,
+                .prompt_ids_alloc = allocator,
+                .drafter = if (drafter_active) options.drafter else null,
+                .drafter_block_size = options.drafter_block_size,
+            };
+            // pending_logits/pending_token left empty — the lazy pipeline is
+            // skipped under MTP / PLD / drafter. The speculative `next*` paths
+            // drive every subsequent step with predictable cache offset.
+            return gen;
+        }
+
+        // Non-MTP: sample first token lazily, then build the next forward pass
         const lazy_token = sampleTokenLazy(logits, sampling, s);
         _ = mlx.mlx_array_free(logits);
 
@@ -270,6 +514,12 @@ pub const Generator = struct {
             .generated_ids = std.ArrayList(u32).empty,
             .timeout_ns = 0,
             .timer = io_util.Stopwatch.init(io),
+            .mtp_enabled = false,
+            .mtp_last_hidden = if (has_captured_hidden) captured_hidden else mlx.mlx_array_new(),
+            .has_mtp_last_hidden = has_captured_hidden,
+            .prng = std.Random.DefaultPrng.init(sampling.seed orelse @intCast(std.Io.Timestamp.now(io, .real).toMilliseconds())),
+            .prompt_ids_owned = prompt_owned,
+            .prompt_ids_alloc = allocator,
         };
 
         gen.pending_logits = next_logits;
@@ -290,6 +540,15 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(self.pending_token);
             self.has_pending_token = false;
         }
+        if (self.has_mtp_last_hidden) {
+            _ = mlx.mlx_array_free(self.mtp_last_hidden);
+            self.has_mtp_last_hidden = false;
+        }
+        if (self.prompt_ids_alloc) |a| {
+            a.free(self.prompt_ids_owned);
+            self.prompt_ids_owned = &.{};
+            self.prompt_ids_alloc = null;
+        }
         self.generated_ids.deinit(allocator);
     }
 
@@ -304,6 +563,908 @@ pub const Generator = struct {
         _ = mlx.mlx_array_free(self.pending_token);
         self.has_pending_token = false;
         self.next_token_id = @intCast(val);
+    }
+
+    /// Result of one `nextMtp` step. Yields up to 2 token IDs (1 if the draft
+    /// was rejected, 2 on accept). `accepted_draft` lets the caller account for
+    /// acceptance-rate stats.
+    pub const MtpStepResult = struct {
+        first: u32,
+        second: ?u32 = null,
+        accepted_draft: bool,
+    };
+
+    /// Runtime acceptance gate for MTP: after the MTP-specific warmup, if
+    /// the per-request acceptance rate falls below the MTP threshold, disable
+    /// speculation for the rest of this request. Sticky for the rest of the
+    /// generation. Separate from `checkDrafterRuntimeGate` because MTP's
+    /// per-attempt accept is binary (range [0, 1]) — a different threshold and
+    /// warmup are required (see `RUNTIME_GATE_MTP_*`).
+    fn checkMtpRuntimeGate(self: *Generator) void {
+        if (self.spec_disabled_runtime) return;
+        if (!runtimeGateShouldDisableMtp(self.mtp_attempted, self.mtp_accepted)) return;
+        const rate = @as(f32, @floatFromInt(self.mtp_accepted)) /
+            @as(f32, @floatFromInt(self.mtp_attempted));
+        log.info(
+            "  mtp=disabled (runtime accept rate {d:.2} < {d:.2} after {d} attempts)\n",
+            .{ rate, RUNTIME_GATE_MTP_MIN_RATE, self.mtp_attempted },
+        );
+        self.spec_disabled_runtime = true;
+    }
+
+    /// MTP draft+verify decode step. Returns 1 or 2 tokens per call.
+    /// Algorithm:
+    ///   1. Draft: `mtpForward(mtp_last_hidden, next_token_id)` → sample `draft_id`.
+    ///   2. Snapshot KV (and SSM for hybrid models) at offset N+1.
+    ///   3. Verify: main `forward([next_token_id, draft_id])` (length-2) →
+    ///      logits at both positions + new pre-final-norm hidden state at pos 1.
+    ///   4. Accept iff `argmax(verify_logits[..,1,..]) == draft_id` (greedy verify).
+    ///   5. Reject path: restore snapshot, re-forward `[next_token_id]` alone
+    ///      with hidden capture, sample fallback from those logits.
+    ///
+    /// Caller must check `self.done` and stop conditions BETWEEN tokens (the
+    /// pair returned here may include an EOS as the second; the caller is
+    /// expected to honor it).
+    pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?MtpStepResult {
+        if (self.done) return null;
+        std.debug.assert(self.mtp_enabled);
+        std.debug.assert(self.has_mtp_last_hidden);
+        std.debug.assert(self.xfm.mtp_layers != null);
+
+        // Runtime gate fall-back. When the per-request MTP accept rate has
+        // fallen below the threshold, future MTP attempts cost more than they
+        // save — short-circuit to plain `next()` for the rest of the request.
+        // MTP's exit invariant matches drafter's (next_token_id set, pending_*
+        // unset), which the v4 transition shim in `next()` handles, so no new
+        // bridging is needed here.
+        if (self.spec_disabled_runtime) {
+            const tok_opt = try self.next(allocator);
+            if (tok_opt == null) return null;
+            return MtpStepResult{ .first = tok_opt.?, .second = null, .accepted_draft = false };
+        }
+
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const t1: u32 = self.next_token_id; // already-decided token at position N+1
+
+        // ── Phase 1: Draft ──
+        try xfm.resetMtpCache();
+        const t1_i32: i32 = @intCast(t1);
+        const t1_shape = [_]c_int{ 1, 1 };
+        const t1_input = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(t1_input);
+
+        const draft_logits = try xfm.mtpForward(self.mtp_last_hidden, t1_input, 0);
+        defer _ = mlx.mlx_array_free(draft_logits);
+
+        // Sample draft via the existing lazy sampler, then realize.
+        const draft_lazy = sampleTokenLazy(draft_logits, self.sampling, s);
+        try mlx.check(mlx.mlx_array_eval(draft_lazy));
+        var draft_val: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&draft_val, draft_lazy));
+        _ = mlx.mlx_array_free(draft_lazy);
+        const t2_draft: u32 = @intCast(draft_val);
+
+        // ── Phase 2: Snapshot KV + SSM ──
+        var kv_snap = try xfm.cache.snapshot();
+        defer kv_snap.deinit();
+        var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
+        defer if (ssm_snaps) |snaps| {
+            for (snaps) |*sn| ssmSnapshotDeinit(sn);
+            xfm.allocator.free(snaps);
+        };
+        if (xfm.ssm_entries) |entries| {
+            const out = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
+            for (entries, 0..) |*entry, i| out[i] = ssmSnapshot(entry);
+            ssm_snaps = out;
+        }
+        const moe_seq_offset_snap = xfm.moe_seq_offset;
+
+        // ── Phase 3: Verify (length-2 forward) ──
+        const pair_i32 = [_]i32{ t1_i32, draft_val };
+        const pair_shape = [_]c_int{ 1, 2 };
+        const pair_input = mlx.mlx_array_new_data(&pair_i32, &pair_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(pair_input);
+
+        var new_hidden = mlx.mlx_array_new();
+        // Lifetime: on the success path, `new_hidden` is either moved into
+        // `self.mtp_last_hidden` (accept) or explicitly freed (reject). The
+        // `errdefer` plugs the case where `forwardCaptureHidden` errors —
+        // `new_hidden` is already an allocated mlx_array_new at that point.
+        var new_hidden_owned = true;
+        errdefer if (new_hidden_owned) {
+            _ = mlx.mlx_array_free(new_hidden);
+        };
+        // `forwardCaptureHidden` captures the hidden state at the LAST position
+        // of the input — i.e., at position 1 (= prediction site for t̂_{N+2}).
+        const verify_logits = try xfm.forwardCaptureHidden(pair_input, &new_hidden);
+
+        self.mtp_attempted += 1;
+
+        // ── Phase 4: Decide accept/reject ──
+        // Two paths: greedy (temp ≤ 0.01) compares argmax of verify_logits[0]
+        // with the drafted token; stochastic (temp > 0.01) uses the
+        // probability-ratio test from Leviathan et al. speculative decoding —
+        // accept_prob = min(1, p[draft] / q[draft]) where p is the main
+        // model's distribution and q is the draft distribution. On reject,
+        // sample a corrected token from `max(p - q, 0)` (residual
+        // distribution) so the marginal output distribution stays p.
+        //
+        // Stochastic verify ALWAYS yields > greedy acceptance for the same
+        // model: drafts with high p/q ratio accept reliably even when the
+        // argmax differs.
+        const vl_shape = mlx.getShape(verify_logits);
+        const slice_strides = [_]c_int{ 1, 1, 1 };
+        const slice0_start = [_]c_int{ 0, 0, 0 };
+        const slice0_stop = [_]c_int{ vl_shape[0], 1, vl_shape[2] };
+        var pos0_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pos0_logits);
+        try mlx.check(mlx.mlx_slice(&pos0_logits, verify_logits, &slice0_start, 3, &slice0_stop, 3, &slice_strides, 3, s));
+
+        const slice1_start = [_]c_int{ 0, 1, 0 };
+        const slice1_stop = [_]c_int{ vl_shape[0], 2, vl_shape[2] };
+        var pos1_logits = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pos1_logits);
+        try mlx.check(mlx.mlx_slice(&pos1_logits, verify_logits, &slice1_start, 3, &slice1_stop, 3, &slice_strides, 3, s));
+        _ = mlx.mlx_array_free(verify_logits);
+
+        const stochastic = self.sampling.temperature > 0.01;
+        var accept: bool = false;
+        var t2_fallback: u32 = 0; // populated on reject
+
+        if (stochastic) {
+            // Build target/draft probability distributions over the vocab.
+            const target_probs = try mtpProbsAtLastPos(pos0_logits, self.sampling, s);
+            defer _ = mlx.mlx_array_free(target_probs);
+            const draft_probs_for_verify = try mtpProbsAtLastPos(draft_logits, self.sampling, s);
+            defer _ = mlx.mlx_array_free(draft_probs_for_verify);
+
+            const p_draft = try mtpProbAt(target_probs, t2_draft, s);
+            const q_draft = try mtpProbAt(draft_probs_for_verify, t2_draft, s);
+            const accept_prob: f32 = if (q_draft > 0) @min(1.0, p_draft / q_draft) else 0.0;
+            const u: f32 = self.prng.random().float(f32);
+            accept = (u < accept_prob);
+
+            if (!accept) {
+                t2_fallback = try mtpSampleResidual(target_probs, draft_probs_for_verify, s);
+            }
+        } else {
+            // Greedy verify: compare argmax of pos0_logits with draft.
+            var argmax_arr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(argmax_arr);
+            try mlx.check(mlx.mlx_argmax_axis(&argmax_arr, pos0_logits, 2, false, s));
+            try mlx.check(mlx.mlx_array_eval(argmax_arr));
+            var argmax_val: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&argmax_val, argmax_arr));
+            accept = (argmax_val == draft_val);
+            if (!accept) {
+                const fallback_lazy = sampleTokenLazy(pos0_logits, self.sampling, s);
+                try mlx.check(mlx.mlx_array_eval(fallback_lazy));
+                var fallback_val: i32 = 0;
+                try mlx.check(mlx.mlx_array_item_int32(&fallback_val, fallback_lazy));
+                _ = mlx.mlx_array_free(fallback_lazy);
+                t2_fallback = @intCast(fallback_val);
+            }
+        }
+
+        if (accept) {
+            // ── Accept path: cache already advanced to N+2 ──
+            // Sample t_{N+3} from pos1_logits (becomes next iteration's t1).
+            const next_lazy = sampleTokenLazy(pos1_logits, self.sampling, s);
+            try mlx.check(mlx.mlx_array_eval(next_lazy));
+            var next_val: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&next_val, next_lazy));
+            _ = mlx.mlx_array_free(next_lazy);
+            const t3_next: u32 = @intCast(next_val);
+
+            // Replace mtp_last_hidden with new (position-1 hidden = h_{N+2}).
+            if (self.has_mtp_last_hidden) _ = mlx.mlx_array_free(self.mtp_last_hidden);
+            self.mtp_last_hidden = new_hidden;
+            new_hidden_owned = false; // ownership transferred
+            self.has_mtp_last_hidden = true;
+            self.mtp_accepted += 1;
+            self.next_token_id = t3_next;
+            self.step += 2;
+            self.completion_tokens += 2;
+            self.checkMtpRuntimeGate();
+            return MtpStepResult{ .first = t1, .second = t2_draft, .accepted_draft = true };
+        }
+
+        // ── Reject path ──
+        _ = mlx.mlx_array_free(new_hidden);
+        new_hidden_owned = false; // freed
+
+        // Roll back the cache to pre-verify state.
+        try xfm.cache.restore(&kv_snap);
+        if (ssm_snaps) |snaps| {
+            for (xfm.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
+        }
+        xfm.moe_seq_offset = moe_seq_offset_snap;
+
+        // Re-forward [t1] alone to advance cache by 1 AND capture hidden_state at N+1
+        // for the next nextMtp call.
+        var new_hidden_after_t1 = mlx.mlx_array_new();
+        var new_hidden_after_t1_owned = true;
+        errdefer if (new_hidden_after_t1_owned) {
+            _ = mlx.mlx_array_free(new_hidden_after_t1);
+        };
+        const t1_logits = try xfm.forwardCaptureHidden(t1_input, &new_hidden_after_t1);
+        _ = mlx.mlx_array_free(t1_logits);
+
+        if (self.has_mtp_last_hidden) _ = mlx.mlx_array_free(self.mtp_last_hidden);
+        self.mtp_last_hidden = new_hidden_after_t1;
+        new_hidden_after_t1_owned = false; // ownership transferred
+        self.has_mtp_last_hidden = true;
+        self.next_token_id = t2_fallback;
+        self.step += 1;
+        self.completion_tokens += 1;
+        self.checkMtpRuntimeGate();
+        return MtpStepResult{ .first = t1, .second = null, .accepted_draft = false };
+    }
+
+    /// Result of one `nextPld` step. Yields 1..=(1+max_draft_len) tokens.
+    /// Caller owns `tokens` (must `allocator.free` it).
+    pub const PldStepResult = struct {
+        /// Tokens to emit this step (always at least the already-decided t1).
+        /// On a full-accept, contains [t1, ...all_drafts]. On partial accept j,
+        /// contains [t1, draft[0..j]] (the corrected fallback is stored as the
+        /// generator's pending `next_token_id`, NOT included here — same
+        /// "pending becomes next-step's first" convention as `nextMtp`).
+        tokens: []const u32,
+        /// Number of *drafted* tokens accepted (not counting t1). 0..=draft_len.
+        accepted_tokens: u32,
+        /// Whether n-gram lookup found a candidate this step. False means PLD
+        /// degraded to a single regular forward (no speculative work done).
+        used_lookup: bool,
+    };
+
+    /// PLD draft+verify decode step. The draft comes from an n-gram lookup
+    /// over `prompt_ids_owned ++ generated_ids`, NOT a model call — that's
+    /// what makes PLD model-agnostic and cheap.
+    ///
+    /// `key_len` is the n-gram size used for matching (default 3). `draft_len`
+    /// is the maximum number of speculative tokens to verify per step (default
+    /// 5). Both are clamped to safe upper bounds internally.
+    ///
+    /// Returns `null` only when generation is already done. When no n-gram
+    /// match exists (cold start, novel output), falls back to the regular
+    /// `next()` path and returns a single-token result with `used_lookup=false`.
+    pub fn nextPld(
+        self: *Generator,
+        allocator: std.mem.Allocator,
+        draft_len: u32,
+        key_len: u32,
+    ) !?PldStepResult {
+        if (self.done) return null;
+        std.debug.assert(self.sampling.constraint == null); // PLD + grammar not supported
+        std.debug.assert(self.logprobs_n == 0); // PLD + logprobs not supported
+
+        // Runtime acceptance gate: if a prior step set the flag, fall back
+        // to the regular `next()` path. Under v2, PLD's exit invariant has
+        // `t1 NOT in cache` (matches `nextDrafter`) — `next()`'s transition
+        // shim seeds `pending_logits` synchronously via `forward([t1])` when
+        // it sees `!has_pending_logits and !has_pending_token`. So the
+        // hand-off works even though pending state is empty.
+        if (self.spec_disabled_runtime) {
+            const tok_opt = try self.next(allocator);
+            if (tok_opt == null) return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok_opt.?;
+            return PldStepResult{
+                .tokens = tokens,
+                .accepted_tokens = 0,
+                .used_lookup = false,
+            };
+        }
+
+        const xfm = self.xfm;
+        const s = xfm.s;
+
+        // ── INVARIANT going INTO this call (mirrors `nextDrafter`) ──
+        //   cache.step = prompt_len + tokens_emitted   (NOT + 1)
+        //   t1 = next_token_id (= "this step's first emit"); NOT in cache yet.
+        //   pending_logits / pending_token are empty (init's PLD branch and
+        //   every nextPld exit leave them empty under v2).
+        //
+        // Cold path (no n-gram match): forward([t1]) length 1 advances cache
+        // by 1, produces logits at position +1 → sample lookahead → emit t1,
+        // set next_token_id = lookahead. Loses A's lazy pipeline overlap on
+        // cold steps; the prompt-time n-gram gate disables PLD on novel
+        // content where cold-path dominates.
+        //
+        // Verify path: input = `[t1, draft[0..m-1]]` length 1+m. Walk
+        // verify_logits[i] vs draft[i] for i=0..m-1; full accept commits 1+m
+        // tokens and exits with cache at prompt_len + TE_new (no post-step
+        // forward — that is the per-step saving over v1).
+        const t1: u32 = self.next_token_id;
+
+        // Cap draft_len so the verify forward stays a small fixed cost.
+        const max_draft: u32 = @min(draft_len, 15);
+        const klen: u32 = @max(@as(u32, 1), key_len);
+
+        // ── Phase 1: Lookup ──
+        // committed = prompt + generated_ids + [t1]. Key = trailing klen tokens
+        // (ends at t1). The lookup returns candidates for "what comes after t1".
+        const prompt = self.prompt_ids_owned;
+        const generated = self.generated_ids.items;
+        const total_len = prompt.len + generated.len + 1;
+
+        var committed = try allocator.alloc(u32, total_len);
+        defer allocator.free(committed);
+        @memcpy(committed[0..prompt.len], prompt);
+        @memcpy(committed[prompt.len .. prompt.len + generated.len], generated);
+        committed[total_len - 1] = t1;
+
+        var draft_slice: ?[]const u32 = null;
+        if (klen <= total_len - 1) {
+            const key_start = total_len - klen;
+            const key = committed[key_start..total_len];
+            const lookup = pld_index.PldLookup{ .committed = committed, .key_len = klen };
+            draft_slice = lookup.findMatch(key, max_draft);
+        }
+        if (draft_slice) |d| {
+            if (d.len == 0) draft_slice = null;
+        }
+
+        const stochastic = self.sampling.temperature > 0.01;
+
+        // ── Phase 2: Cold path (no n-gram match) ──
+        // Forward([t1]) length 1: cache.step += 1, produces logits at that
+        // position. Sample the lookahead, emit t1, set next_token_id =
+        // lookahead. Cache exits at prompt_len + TE_new where TE_new = TE + 1.
+        if (draft_slice == null) {
+            const t1_i32: i32 = @intCast(t1);
+            const t1_shape = [_]c_int{ 1, 1 };
+            const t1_input = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(t1_input);
+
+            const cold_logits = try xfm.forward(t1_input); // cache.step += 1
+            defer _ = mlx.mlx_array_free(cold_logits);
+
+            const lazy = sampleTokenLazy(cold_logits, self.sampling, s);
+            try mlx.check(mlx.mlx_array_eval(lazy));
+            var lv: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&lv, lazy));
+            _ = mlx.mlx_array_free(lazy);
+            const new_t1: u32 = @intCast(lv);
+
+            try self.generated_ids.append(allocator, t1);
+            self.completion_tokens += 1;
+            self.step += 1;
+            if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
+            self.next_token_id = new_t1;
+
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = t1;
+            return PldStepResult{
+                .tokens = tokens,
+                .accepted_tokens = 0,
+                .used_lookup = false,
+            };
+        }
+
+        const draft = draft_slice.?;
+        const m: u32 = @intCast(draft.len);
+
+        // ── Phase 3: Snapshot KV + per-layer SSM + moe_seq_offset ──
+        // Cache enters at cache.step = prompt_len + TE.
+        var kv_snap = try xfm.cache.snapshot();
+        defer kv_snap.deinit();
+        var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
+        defer if (ssm_snaps) |snaps| {
+            for (snaps) |*sn| ssmSnapshotDeinit(sn);
+            xfm.allocator.free(snaps);
+        };
+        if (xfm.ssm_entries) |entries| {
+            const out = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
+            for (entries, 0..) |*entry, i| out[i] = ssmSnapshot(entry);
+            ssm_snaps = out;
+        }
+        const moe_seq_offset_snap = xfm.moe_seq_offset;
+
+        // ── Phase 4: Verify forward `[t1, draft[0..m-1]]` length 1+m ──
+        // cache.step at start = prompt_len + TE; after = prompt_len + TE + 1 + m.
+        //   verify_logits[0]   predicts the slot AFTER t1     → candidate for draft[0]
+        //   verify_logits[i]   predicts the slot AFTER draft[i-1] (i = 1..m-1)
+        //                                                     → candidate for draft[i]
+        //   verify_logits[m]   predicts the slot AFTER draft[m-1]
+        //                                                     → "bonus" position (full-accept new_t1)
+        const seq_len: c_int = @intCast(1 + m);
+        const verify_input_buf = try allocator.alloc(i32, 1 + m);
+        defer allocator.free(verify_input_buf);
+        verify_input_buf[0] = @intCast(t1);
+        for (draft, 0..) |d, i| verify_input_buf[1 + i] = @intCast(d);
+        const verify_shape = [_]c_int{ 1, seq_len };
+        const verify_input = mlx.mlx_array_new_data(verify_input_buf.ptr, &verify_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(verify_input);
+
+        const verify_logits = try xfm.forward(verify_input);
+        // verify_logits shape [1, 1+m, V]. Sliced and freed below.
+        self.pld_attempted += 1;
+
+        const vl_shape = mlx.getShape(verify_logits);
+        const slice_strides = [_]c_int{ 1, 1, 1 };
+
+        // Slice all 1+m per-position logits up front so we can sample the
+        // correction from the original verify forward (cache state aligned)
+        // without re-running forward, and re-use them for both stochastic
+        // accept tests and the correction sample.
+        const per_pos_logits = try allocator.alloc(mlx.mlx_array, 1 + m);
+        defer {
+            for (per_pos_logits) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(per_pos_logits);
+        }
+        for (per_pos_logits, 0..) |*slot, idx| {
+            slot.* = mlx.mlx_array_new();
+            const start = [_]c_int{ 0, @intCast(idx), 0 };
+            const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
+            try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
+        }
+        _ = mlx.mlx_array_free(verify_logits);
+
+        // ── Phase 5: Walk drafts. accepted ∈ [0, m]. Full accept = m. ──
+        // verify_logits[i] is the prediction for draft[i] (i = 0..m-1).
+        // No separate "first-position" test under v2 — the verify forward
+        // covers it.
+        var accepted: u32 = 0;
+        if (stochastic) {
+            var i: u32 = 0;
+            while (i < m) : (i += 1) {
+                const target_p = try mtpProbsAtLastPos(per_pos_logits[i], self.sampling, s);
+                defer _ = mlx.mlx_array_free(target_p);
+                const p_draft = try mtpProbAt(target_p, draft[i], s);
+                const accept_prob: f32 = @min(1.0, p_draft);
+                const u: f32 = self.prng.random().float(f32);
+                if (u >= accept_prob) break;
+                accepted += 1;
+            }
+        } else {
+            var i: u32 = 0;
+            while (i < m) : (i += 1) {
+                var argmax_arr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(argmax_arr);
+                try mlx.check(mlx.mlx_argmax_axis(&argmax_arr, per_pos_logits[i], 2, false, s));
+                try mlx.check(mlx.mlx_array_eval(argmax_arr));
+                var argmax_val: i32 = 0;
+                try mlx.check(mlx.mlx_array_item_int32(&argmax_val, argmax_arr));
+                if (@as(u32, @intCast(argmax_val)) != draft[i]) break;
+                accepted += 1;
+            }
+        }
+        const full_accept = accepted == m;
+
+        // ── Phase 6: Sample new_t1 from per_pos_logits[accepted] ──
+        //   - full accept (accepted == m): per_pos_logits[m] predicts the slot
+        //     after the last accepted draft (= "bonus" token).
+        //   - partial (accepted < m):  per_pos_logits[accepted] is the model's
+        //     prediction at the rejected slot. Stochastic samples from the
+        //     residual `max(target_p − one_hot(draft[accepted]), 0)` to preserve
+        //     the marginal distribution conditional on "not draft[accepted]"
+        //     (Leviathan et al). Greedy: argmax of the rejected slot's logits.
+        //
+        // This indexing differs from v1: v1 sampled from `verify_logits[accepted-1]`
+        // because t1 occupied no input slot; v2 has t1 at index 0 of the verify
+        // input, so the "prediction one past the last accepted" lives at
+        // index `accepted`. Off-by-one here would silently corrupt output.
+        const correction_logits = per_pos_logits[accepted];
+        const new_t1: u32 = blk: {
+            if (stochastic) {
+                const probs = try mtpProbsAtLastPos(correction_logits, self.sampling, s);
+                defer _ = mlx.mlx_array_free(probs);
+                if (!full_accept) {
+                    const onehot = try pldOneHotRow(draft[accepted], vl_shape[2], s);
+                    defer _ = mlx.mlx_array_free(onehot);
+                    break :blk try mtpSampleResidual(probs, onehot, s);
+                } else {
+                    break :blk try mtpSampleFromProbs(probs, s);
+                }
+            } else {
+                const lazy = sampleTokenLazy(correction_logits, self.sampling, s);
+                try mlx.check(mlx.mlx_array_eval(lazy));
+                var v: i32 = 0;
+                try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
+                _ = mlx.mlx_array_free(lazy);
+                break :blk @intCast(v);
+            }
+        };
+
+        // ── Phase 7: Cache rollback on partial accept ──
+        // After verify (length 1+m), cache.step = prompt_len + TE + 1 + m.
+        // Full accept: TE_new = TE + 1 + m → no rollback.
+        // Partial: must land at prompt_len + TE + 1 + accepted = prompt_len + TE_new
+        // (TE_new = TE + 1 + accepted). Rollback then re-forward
+        // `[t1, draft[0..accepted-1]]` length 1+accepted (with hidden capture
+        // not needed here — just the cache advance).
+        //
+        // The accepted=0 case (= first draft rejected) MUST still re-forward
+        // [t1] length 1: in v1 the t1 forward had been done eagerly before
+        // verify; v2 includes t1 IN the verify forward, so rollback rolls
+        // both t1 AND the drafts. Skipping the re-forward here would leave
+        // the cache at prompt_len + TE — one short of the post-emit invariant.
+        if (!full_accept) {
+            try xfm.cache.restore(&kv_snap);
+            if (ssm_snaps) |snaps| {
+                for (xfm.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
+            }
+            xfm.moe_seq_offset = moe_seq_offset_snap;
+
+            const re_seq_len: c_int = @intCast(1 + accepted);
+            const re_input_buf = try allocator.alloc(i32, 1 + accepted);
+            defer allocator.free(re_input_buf);
+            re_input_buf[0] = @intCast(t1);
+            for (draft[0..accepted], 0..) |d, i| re_input_buf[1 + i] = @intCast(d);
+            const re_shape = [_]c_int{ 1, re_seq_len };
+            const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(re_input);
+            const re_logits = try xfm.forward(re_input);
+            _ = mlx.mlx_array_free(re_logits);
+        }
+
+        // ── Phase 8: Commit emitted tokens ──
+        // Tokens emitted: [t1, draft[0..accepted]] = 1 + accepted.
+        const num_emit: u32 = 1 + accepted;
+        const tokens = try allocator.alloc(u32, num_emit);
+        tokens[0] = t1;
+        for (draft[0..accepted], 0..) |d, i| tokens[1 + i] = d;
+
+        try self.generated_ids.append(allocator, t1);
+        for (draft[0..accepted]) |d| try self.generated_ids.append(allocator, d);
+
+        self.pld_accepted_tokens += accepted;
+        self.completion_tokens += num_emit;
+        self.step += num_emit;
+        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
+
+        // No post-step forward — `next_token_id = new_t1` and exit. The next
+        // nextPld call sees t1 NOT in cache (new invariant).
+        self.next_token_id = new_t1;
+
+        // Runtime acceptance gate: after warmup, if the average drafts accepted
+        // per verify is below the threshold, disable speculation for the rest
+        // of this request. Sticky for the rest of the generation.
+        if (runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens)) {
+            const rate = @as(f32, @floatFromInt(self.pld_accepted_tokens)) /
+                @as(f32, @floatFromInt(self.pld_attempted));
+            log.info(
+                "  pld=disabled (runtime accept rate {d:.2} < {d:.2} after {d} attempts)\n",
+                .{ rate, RUNTIME_GATE_MIN_RATE, self.pld_attempted },
+            );
+            self.spec_disabled_runtime = true;
+        }
+
+        return PldStepResult{
+            .tokens = tokens,
+            .accepted_tokens = accepted,
+            .used_lookup = true,
+        };
+    }
+
+    /// Result of one `nextDrafter` step. Same shape as PLD's result so the
+    /// outer wrapper can share token-emit / EOS-check logic.
+    pub const DrafterStepResult = struct {
+        /// Tokens to emit this step. On a full accept this is
+        /// `[t1, ...all_drafts]` (length `block_size`); on partial accept j
+        /// it is `[t1, draft[0..j]]` (length `1+j`). The corrected fallback
+        /// becomes `next_token_id` for the next call.
+        tokens: []const u32,
+        /// Number of *drafted* tokens accepted (excludes always-accepted t1).
+        accepted_tokens: u32,
+    };
+
+    /// Drafter-assisted decode step. Mirrors `nextPld` but the draft comes
+    /// from `block_size - 1` autoregressive forwards through the Gemma 4
+    /// assistant drafter (cross-attending into target's KV) instead of an
+    /// n-gram lookup. Verify is identical: target forward over
+    /// `[t1, draft0..draft_{m-1}]` with greedy / stochastic accept.
+    ///
+    /// Algorithm:
+    ///   1. Run `block_size - 1` drafter steps. Each step's input is
+    ///      `concat(target.embed(prev_tok)*scale, h_prev)`. `prev_tok` starts
+    ///      at `next_token_id` (= t1); after step i it's the just-sampled
+    ///      `draft[i]`. `h_prev` starts at `mtp_last_hidden` (captured at
+    ///      prefill or the previous accept's verify-forward); after step i
+    ///      it's the drafter's own `post_proj` output.
+    ///      All drafter forwards in one round share `rope_offset =
+    ///      target.cache.step` (per upstream `set_shared_kv`).
+    ///   2. Snapshot KV + SSM, run target verify forward over
+    ///      `[t1, draft0..draft_{m-1}]` length `block_size` with
+    ///      `forwardCaptureHidden` so we get the new `h_prev` at position m.
+    ///   3. Walk argmax(verify_logits[i]) vs draft[i] for i in 0..m-1.
+    ///      Greedy: equal → accept. Stochastic: standard speculative-decoding
+    ///      ratio test using `mtpProbAt(target_p, draft[i])` (the drafter's
+    ///      masked-LM-head produces probabilistic logits, so we treat its
+    ///      sampled draft as a one-hot proposal — same simplification PLD
+    ///      uses).
+    ///   4. Full accept (j == m): emit drafts, sample new pending from
+    ///      verify_logits[m-1] (the target's prediction one position past the
+    ///      last accepted draft — already computed during verify), update
+    ///      `mtp_last_hidden` to the captured post-final-norm hidden.
+    ///   5. Partial accept (j < m): roll back KV+SSM, re-forward
+    ///      `[t1, draft[0..j-1]]` length `j+1` (with hidden capture) so
+    ///      cache lands at exactly `+j+1`. Sample correction from the
+    ///      *original* verify_logits[j] (the model's prediction at the
+    ///      rejected position).
+    pub fn nextDrafter(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
+        if (self.done) return null;
+        std.debug.assert(self.drafter != null);
+        std.debug.assert(self.has_mtp_last_hidden); // captured at init or last accept
+        std.debug.assert(self.sampling.constraint == null); // grammar + drafter unsupported
+        std.debug.assert(self.logprobs_n == 0); // logprobs + drafter unsupported
+
+        // Runtime acceptance gate: if a prior step set the flag, fall back
+        // to the regular `next()` path. Drafter's exit invariant is "t1 NOT
+        // in cache" (different from `next()`'s expected entry), so `next()`
+        // contains a transition shim that synchronously seeds pending_logits
+        // when has_pending_logits is false. The shim makes this hand-off safe.
+        if (self.spec_disabled_runtime) {
+            const tok_opt = try self.next(allocator);
+            if (tok_opt == null) return null;
+            const tokens = try allocator.alloc(u32, 1);
+            tokens[0] = tok_opt.?;
+            return DrafterStepResult{
+                .tokens = tokens,
+                .accepted_tokens = 0,
+            };
+        }
+
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const drafter = self.drafter.?;
+        const m: u32 = @max(@as(u32, 1), self.drafter_block_size - 1);
+        const t1: u32 = self.next_token_id; // already-decided token at position cache.step
+
+        // RoPE offset: position the drafter's queries rotate by. Per upstream
+        // `set_shared_kv`, this is `target.cache.step` and stays constant
+        // across all `m` drafter steps in this round.
+        const rope_offset: c_int = @intCast(xfm.cache.step);
+
+        // ── Phase 1: draft `m` tokens autoregressively ──
+        var drafts = try allocator.alloc(u32, m);
+        errdefer allocator.free(drafts);
+
+        var prev_tok = t1;
+        // h_prev rolls forward through the drafter. Starts at the captured
+        // target hidden; subsequent steps use the drafter's post_proj output.
+        // We do NOT free `mtp_last_hidden` during drafting — it stays valid
+        // until the verify path either replaces it (accept) or restores via
+        // re-forward (reject). Drafter step's h_prev_next is owned per step.
+        var h_prev_owner: ?mlx.mlx_array = null;
+        defer if (h_prev_owner) |h| {
+            _ = mlx.mlx_array_free(h);
+        };
+
+        var i: u32 = 0;
+        while (i < m) : (i += 1) {
+            const h_prev_arg: mlx.mlx_array = if (h_prev_owner) |h| h else self.mtp_last_hidden;
+            const step_out = try drafter_mod.step(drafter, xfm, prev_tok, h_prev_arg, rope_offset);
+            // Sample the drafted token.
+            const draft_lazy = sampleTokenLazy(step_out.logits, self.sampling, s);
+            _ = mlx.mlx_array_free(step_out.logits);
+            try mlx.check(mlx.mlx_array_eval(draft_lazy));
+            var draft_val: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&draft_val, draft_lazy));
+            _ = mlx.mlx_array_free(draft_lazy);
+            drafts[i] = @intCast(draft_val);
+
+            // Roll h_prev forward: free previous owner, take ownership of new.
+            if (h_prev_owner) |h_old| {
+                _ = mlx.mlx_array_free(h_old);
+            }
+            h_prev_owner = step_out.h_prev_next;
+            prev_tok = drafts[i];
+        }
+
+        // ── Phase 2: snapshot KV + SSM ──
+        var kv_snap = try xfm.cache.snapshot();
+        defer kv_snap.deinit();
+        var ssm_snaps: ?[]SSMCacheEntrySnapshot = null;
+        defer if (ssm_snaps) |snaps| {
+            for (snaps) |*sn| ssmSnapshotDeinit(sn);
+            xfm.allocator.free(snaps);
+        };
+        if (xfm.ssm_entries) |entries| {
+            const out = try xfm.allocator.alloc(SSMCacheEntrySnapshot, entries.len);
+            for (entries, 0..) |*entry, idx| out[idx] = ssmSnapshot(entry);
+            ssm_snaps = out;
+        }
+        const moe_seq_offset_snap = xfm.moe_seq_offset;
+
+        // ── Phase 3: verify forward [t1, draft0..draft_{m-1}] length 1+m ──
+        const seq_len: c_int = @intCast(1 + m);
+        const verify_input_buf = try allocator.alloc(i32, 1 + m);
+        defer allocator.free(verify_input_buf);
+        verify_input_buf[0] = @intCast(t1);
+        for (drafts, 0..) |d, idx| verify_input_buf[1 + idx] = @intCast(d);
+        const verify_shape = [_]c_int{ 1, seq_len };
+        const verify_input = mlx.mlx_array_new_data(verify_input_buf.ptr, &verify_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(verify_input);
+
+        var new_hidden = mlx.mlx_array_new();
+        // Captures the post-final-norm hidden at the LAST input position
+        // (= position m, predicting the bonus token if all drafts accept).
+        const verify_logits = try xfm.forwardCaptureHidden(verify_input, &new_hidden);
+        // verify_logits shape: [1, 1+m, V]
+        self.drafter_attempted += 1;
+
+        // Slice per-position logits up front so we can reuse them for the
+        // partial-accept correction sample below without re-forwarding.
+        const vl_shape = mlx.getShape(verify_logits);
+        const slice_strides = [_]c_int{ 1, 1, 1 };
+        const per_pos_logits = try allocator.alloc(mlx.mlx_array, 1 + m);
+        defer {
+            for (per_pos_logits) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(per_pos_logits);
+        }
+        for (per_pos_logits, 0..) |*slot, idx| {
+            slot.* = mlx.mlx_array_new();
+            const start = [_]c_int{ 0, @intCast(idx), 0 };
+            const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
+            try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
+        }
+        _ = mlx.mlx_array_free(verify_logits);
+
+        // ── Phase 4: decide longest accepted prefix ──
+        const stochastic = self.sampling.temperature > 0.01;
+        var accepted: u32 = 0;
+        if (stochastic) {
+            // Same simplification as PLD: treat the drafted token as a
+            // one-hot proposal (q[draft[i]] = 1), so the speculative-decoding
+            // accept ratio reduces to `min(1, target_p[draft[i]])`. The
+            // drafter's actual probability for draft[i] is unavailable here
+            // without re-running the masked LM head softmax, and the
+            // simplification preserves the marginal output distribution.
+            var k: u32 = 0;
+            while (k < m) : (k += 1) {
+                const target_p = try mtpProbsAtLastPos(per_pos_logits[k], self.sampling, s);
+                defer _ = mlx.mlx_array_free(target_p);
+                const p_draft = try mtpProbAt(target_p, drafts[k], s);
+                const accept_prob: f32 = @min(1.0, p_draft);
+                const u: f32 = self.prng.random().float(f32);
+                if (u >= accept_prob) break;
+                accepted += 1;
+            }
+        } else {
+            var k: u32 = 0;
+            while (k < m) : (k += 1) {
+                var argmax_arr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(argmax_arr);
+                try mlx.check(mlx.mlx_argmax_axis(&argmax_arr, per_pos_logits[k], 2, false, s));
+                try mlx.check(mlx.mlx_array_eval(argmax_arr));
+                var argmax_val: i32 = 0;
+                try mlx.check(mlx.mlx_array_item_int32(&argmax_val, argmax_arr));
+                if (@as(u32, @intCast(argmax_val)) != drafts[k]) break;
+                accepted += 1;
+            }
+        }
+
+        // Sample the next pending token from per_pos_logits[accepted]:
+        //   - full accept (accepted == m): logits[m] is the target's prediction
+        //     one past the last draft (the bonus token). Sample directly.
+        //   - partial accept: logits[accepted] is the target's prediction at
+        //     the rejected position. For stochastic, sample from the residual
+        //     `max(p − one_hot(draft[accepted]), 0)` to preserve the marginal
+        //     distribution conditional on "not draft[accepted]" (Leviathan
+        //     et al). Greedy: just argmax (the rejected position's argmax is
+        //     the model's true next token).
+        const correction_logits = per_pos_logits[accepted];
+        const next_pending: u32 = blk: {
+            if (stochastic) {
+                const probs = try mtpProbsAtLastPos(correction_logits, self.sampling, s);
+                defer _ = mlx.mlx_array_free(probs);
+                if (accepted < m) {
+                    const onehot = try pldOneHotRow(drafts[accepted], vl_shape[2], s);
+                    defer _ = mlx.mlx_array_free(onehot);
+                    break :blk try mtpSampleResidual(probs, onehot, s);
+                } else {
+                    break :blk try mtpSampleFromProbs(probs, s);
+                }
+            } else {
+                const lazy = sampleTokenLazy(correction_logits, self.sampling, s);
+                try mlx.check(mlx.mlx_array_eval(lazy));
+                var v: i32 = 0;
+                try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
+                _ = mlx.mlx_array_free(lazy);
+                break :blk @intCast(v);
+            }
+        };
+
+        // ── Phase 5: commit / rollback ──
+        if (accepted == m) {
+            // Full accept: cache at +1+m. Emit [t1, ...drafts]. Pending = next_pending.
+            // The captured `new_hidden` is the post-final-norm hidden at
+            // position m — the last accepted draft's position. That's the
+            // h_prev for the NEXT round (drafting from t = next_pending; the
+            // hidden corresponds to draft[m-1], which is what next_pending
+            // follows). This matches the convention `nextMtp` uses.
+            const tokens = try allocator.alloc(u32, 1 + m);
+            tokens[0] = t1;
+            for (drafts, 0..) |d, idx| tokens[1 + idx] = d;
+
+            try self.generated_ids.append(allocator, t1);
+            for (drafts) |d| try self.generated_ids.append(allocator, d);
+
+            if (self.has_mtp_last_hidden) _ = mlx.mlx_array_free(self.mtp_last_hidden);
+            self.mtp_last_hidden = new_hidden;
+            self.has_mtp_last_hidden = true;
+
+            self.drafter_accepted_tokens += m;
+            self.next_token_id = next_pending;
+            self.step += 1 + m;
+            self.completion_tokens += 1 + m;
+
+            // drafts buffer transferred into tokens copy; free original.
+            allocator.free(drafts);
+            self.checkDrafterRuntimeGate();
+            return DrafterStepResult{
+                .tokens = tokens,
+                .accepted_tokens = m,
+            };
+        }
+
+        // Partial accept (accepted < m). Cache over-advanced by (m - accepted).
+        // The captured new_hidden is for position m (which we're rolling back
+        // past) — discard it. Roll back KV+SSM, then re-forward
+        // [t1, drafts[0..accepted]] length 1+accepted with hidden capture so
+        // mtp_last_hidden lands at the position immediately past the last
+        // accepted draft (where next_pending will live).
+        _ = mlx.mlx_array_free(new_hidden);
+
+        try xfm.cache.restore(&kv_snap);
+        if (ssm_snaps) |snaps| {
+            for (xfm.ssm_entries.?, snaps) |*entry, *sn| try ssmRestore(entry, sn);
+        }
+        xfm.moe_seq_offset = moe_seq_offset_snap;
+
+        const re_seq_len: c_int = @intCast(1 + accepted);
+        const re_input_buf = try allocator.alloc(i32, 1 + accepted);
+        defer allocator.free(re_input_buf);
+        re_input_buf[0] = @intCast(t1);
+        for (drafts[0..accepted], 0..) |d, idx| re_input_buf[1 + idx] = @intCast(d);
+        const re_shape = [_]c_int{ 1, re_seq_len };
+        const re_input = mlx.mlx_array_new_data(re_input_buf.ptr, &re_shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(re_input);
+
+        var re_new_hidden = mlx.mlx_array_new();
+        const re_logits = try xfm.forwardCaptureHidden(re_input, &re_new_hidden);
+        _ = mlx.mlx_array_free(re_logits);
+
+        const tokens = try allocator.alloc(u32, 1 + accepted);
+        tokens[0] = t1;
+        for (drafts[0..accepted], 0..) |d, idx| tokens[1 + idx] = d;
+
+        try self.generated_ids.append(allocator, t1);
+        for (drafts[0..accepted]) |d| try self.generated_ids.append(allocator, d);
+
+        if (self.has_mtp_last_hidden) _ = mlx.mlx_array_free(self.mtp_last_hidden);
+        self.mtp_last_hidden = re_new_hidden;
+        self.has_mtp_last_hidden = true;
+
+        self.drafter_accepted_tokens += accepted;
+        self.next_token_id = next_pending;
+        self.step += 1 + accepted;
+        self.completion_tokens += 1 + accepted;
+
+        allocator.free(drafts);
+        self.checkDrafterRuntimeGate();
+        return DrafterStepResult{
+            .tokens = tokens,
+            .accepted_tokens = accepted,
+        };
+    }
+
+    /// Runtime acceptance gate for the drafter: after warmup, if the average
+    /// drafts accepted per round is below the threshold, disable speculation
+    /// for the rest of this request. Sticky for the rest of the generation.
+    fn checkDrafterRuntimeGate(self: *Generator) void {
+        if (self.spec_disabled_runtime) return;
+        if (!runtimeGateShouldDisable(self.drafter_attempted, self.drafter_accepted_tokens)) return;
+        const rate = @as(f32, @floatFromInt(self.drafter_accepted_tokens)) /
+            @as(f32, @floatFromInt(self.drafter_attempted));
+        log.info(
+            "  drafter=disabled (runtime accept rate {d:.2} < {d:.2} after {d} attempts)\n",
+            .{ rate, RUNTIME_GATE_MIN_RATE, self.drafter_attempted },
+        );
+        self.spec_disabled_runtime = true;
     }
 
     /// Returns the next token ID, or null when generation is finished.
@@ -322,6 +1483,26 @@ pub const Generator = struct {
     pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         if (self.done) return null;
         if (self.sampling.constraint != null) return self.nextConstrained(allocator);
+
+        // Transition shim: speculative-decode paths may exit with
+        // `next_token_id` set but `pending_logits` unset (drafter's exit
+        // invariant is "t1 NOT in cache" — its hand-off to `next()` would
+        // otherwise crash on the slow path which assumes pending_logits is
+        // always lazily seeded). When we observe that state, synchronously
+        // forward `[next_token_id]` to seed `pending_logits` so the fast
+        // path picks up cleanly. PLD's exit state already matches `next()`'s
+        // invariant, so this only fires for drafter→next runtime-gate
+        // fallbacks (and any future spec methods that share drafter's shape).
+        if (!self.has_pending_logits and !self.has_pending_token and
+            self.step < self.max_tokens and self.logprobs_n == 0)
+        {
+            const tok_i32: i32 = @intCast(self.next_token_id);
+            const tok_shape = [_]c_int{ 1, 1 };
+            const tok_input = mlx.mlx_array_new_data(&tok_i32, &tok_shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(tok_input);
+            self.pending_logits = try self.xfm.forward(tok_input);
+            self.has_pending_logits = true;
+        }
 
         // ── Phase 1: Build and submit the NEXT step FIRST ──
         // This forces the GPU to compute the pending token as a dependency,
@@ -618,6 +1799,146 @@ fn lazyForward(xfm: *Transformer, lazy_token: mlx.mlx_array) !mlx.mlx_array {
 /// Handles temperature scaling, top-k, and top-p, but defers materialization.
 /// The returned array has shape [1] with the sampled token ID.
 /// Caller must free the returned array.
+/// Compute the probability distribution over the vocabulary at the LAST
+/// position of `logits_3d` (shape `[B, S, V]`), with the SAME temperature +
+/// top-k + top-p masking the sampler would apply. Both `target_p` and `draft_q`
+/// in the stochastic-verify accept test must be computed via this function so
+/// the ratio `p[draft] / q[draft]` is well-defined over the kept support.
+/// Caller owns the returned array; shape `[B, V]`.
+fn mtpProbsAtLastPos(logits_3d: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) !mlx.mlx_array {
+    const shape = mlx.getShape(logits_3d);
+    const seq_len = shape[1];
+    var current = mlx.mlx_array_new();
+    if (seq_len == 1) {
+        const sq_shape = [_]c_int{ shape[0], shape[2] };
+        try mlx.check(mlx.mlx_reshape(&current, logits_3d, &sq_shape, 2, s));
+    } else {
+        const start = [_]c_int{ 0, seq_len - 1, 0 };
+        const stop = [_]c_int{ shape[0], seq_len, shape[2] };
+        const strides = [_]c_int{ 1, 1, 1 };
+        var sliced = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sliced);
+        try mlx.check(mlx.mlx_slice(&sliced, logits_3d, &start, 3, &stop, 3, &strides, 3, s));
+        const sq_shape = [_]c_int{ shape[0], shape[2] };
+        try mlx.check(mlx.mlx_reshape(&current, sliced, &sq_shape, 2, s));
+    }
+
+    // Apply temperature → top-k → top-p (same order as `sampleTokenLazy`).
+    if (sampling.temperature != 1.0) {
+        const t = mlx.mlx_array_new_float(sampling.temperature);
+        defer _ = mlx.mlx_array_free(t);
+        var scaled = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_divide(&scaled, current, t, s));
+        _ = mlx.mlx_array_free(current);
+        current = scaled;
+    }
+    if (sampling.top_k > 0) {
+        var masked = mlx.mlx_array_new();
+        applyTopK(&masked, current, sampling.top_k, s) catch {};
+        _ = mlx.mlx_array_free(current);
+        current = masked;
+    }
+    if (sampling.top_p < 1.0) {
+        var masked = mlx.mlx_array_new();
+        applyTopP(&masked, current, sampling.top_p, s) catch {};
+        _ = mlx.mlx_array_free(current);
+        current = masked;
+    }
+
+    // Softmax: tokens at -inf become 0, kept tokens renormalize to sum=1.
+    var probs = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_softmax_axis(&probs, current, -1, true, s));
+    _ = mlx.mlx_array_free(current);
+    return probs;
+}
+
+/// Read `probs[0, token_id]` as f32. Forces realization with a single eval.
+fn mtpProbAt(probs: mlx.mlx_array, token_id: u32, s: mlx.mlx_stream) !f32 {
+    const idx_val: i32 = @intCast(token_id);
+    const idx_shape = [_]c_int{1};
+    const idx_arr = mlx.mlx_array_new_data(&idx_val, &idx_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(idx_arr);
+
+    var taken = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(taken);
+    try mlx.check(mlx.mlx_take_axis(&taken, probs, idx_arr, -1, s));
+
+    // Cast to f32 so item_float32 is exact regardless of source dtype (bf16 etc.).
+    var as_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(as_f32);
+    try mlx.check(mlx.mlx_astype(&as_f32, taken, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(as_f32));
+    var v: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&v, as_f32));
+    return v;
+}
+
+/// Sample one token from probability distribution `probs` (shape `[B, V]`).
+/// Returns a u32 token id (caller can append directly).
+fn mtpSampleFromProbs(probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
+    // mlx_random_categorical takes logits and applies softmax. Feed log(probs)
+    // so the categorical's softmax recovers the original distribution.
+    var log_probs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(log_probs);
+    try mlx.check(mlx.mlx_log(&log_probs, probs, s));
+
+    const null_key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(null_key);
+    var sampled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sampled);
+    try mlx.check(mlx.mlx_random_categorical(&sampled, log_probs, -1, null_key, s));
+    try mlx.check(mlx.mlx_array_eval(sampled));
+    var v: i32 = 0;
+    try mlx.check(mlx.mlx_array_item_int32(&v, sampled));
+    return @intCast(v);
+}
+
+/// Build a one-hot float32 row vector of shape `[1, vocab]` with 1.0 at
+/// `index` and 0.0 elsewhere. Used by PLD's stochastic-verify reject path,
+/// which models the draft (an n-gram lookup, not a probabilistic model) as a
+/// degenerate one-hot distribution. Caller owns the returned array.
+fn pldOneHotRow(index: u32, vocab: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    var indices = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(indices);
+    try mlx.check(mlx.mlx_arange(&indices, 0, @as(f64, @floatFromInt(vocab)), 1, .int32, s));
+
+    const target_val: i32 = @intCast(index);
+    const tgt_shape = [_]c_int{1};
+    const target_idx = mlx.mlx_array_new_data(&target_val, &tgt_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(target_idx);
+
+    var mask_bool = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask_bool);
+    try mlx.check(mlx.mlx_equal(&mask_bool, indices, target_idx, s));
+
+    var mask_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask_f32);
+    try mlx.check(mlx.mlx_astype(&mask_f32, mask_bool, .float32, s));
+
+    const out_shape = [_]c_int{ 1, vocab };
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&out, mask_f32, &out_shape, 2, s));
+    return out;
+}
+
+/// Sample from the residual distribution `residual = max(target - draft, 0)`,
+/// renormalized. Used on stochastic-verify reject so the corrected token
+/// preserves the target distribution (per Leviathan et al. speculative
+/// decoding paper).
+fn mtpSampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: mlx.mlx_stream) !u32 {
+    var diff = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(diff);
+    try mlx.check(mlx.mlx_subtract(&diff, target_probs, draft_probs, s));
+
+    const zero = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(zero);
+    var residual = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(residual);
+    try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
+
+    return mtpSampleFromProbs(residual, s);
+}
+
 fn sampleTokenLazy(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) mlx.mlx_array {
     const shape = mlx.getShape(logits);
     const seq_len = shape[1];
@@ -762,6 +2083,371 @@ pub fn generate(
         .prefill_tps = prefill_tps,
         .decode_tps = decode_tps,
         .logprobs = if (logprobs_n > 0) try logprob_results.toOwnedSlice(allocator) else null,
+    };
+}
+
+/// MTP-enabled non-streaming variant of `generate`. Returns the same
+/// `GenerationResult` shape so callers can dispatch on `enable_mtp` without
+/// code-path forking. Logprobs are unsupported under MTP in v1.
+pub fn generateMtp(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    tok: *const Tokenizer,
+    prompt_ids: []const u32,
+    max_tokens: u32,
+    sampling: SamplingParams,
+    eos_token_ids: []const u32,
+    timeout_ns: u64,
+) !GenerationResult {
+    var timer = io_util.Stopwatch.init(io);
+    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .mtp_enabled = true });
+    gen.timeout_ns = timeout_ns;
+    defer gen.deinit(allocator);
+
+    const prefill_ns = timer.read();
+    const prefill_tps: f64 = if (prefill_ns > 0)
+        @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
+    else
+        0.0;
+    log.debug("Prefill (MTP): {d}ms ({d} tokens, {d:.3} tok/s)\n", .{
+        prefill_ns / std.time.ns_per_ms,
+        prompt_ids.len,
+        prefill_tps,
+    });
+
+    var output_ids = std.ArrayList(u32).empty;
+    defer output_ids.deinit(allocator);
+
+    timer.reset();
+
+    // initWithOptions(.{ .mtp_enabled = true }) seeded `next_token_id` with the
+    // prefill's first sampled token but skipped the lazy pre-forward. Each
+    // nextMtp call consumes `next_token_id` as t1, runs draft+verify, and emits
+    // 1 or 2 tokens via MtpStepResult. We loop until done / EOS / max_tokens.
+    while (!gen.done and gen.completion_tokens < gen.max_tokens) {
+        const result = (try gen.nextMtp(allocator)) orelse break;
+        // Match `generate`'s convention: stop tokens are NOT included in
+        // output_ids. `gen.next` enforces this by returning null on EOS
+        // before any append; the speculative path has to check explicitly.
+        if (isEosId(result.first, eos_token_ids)) {
+            gen.done = true;
+            gen.finish_reason = "stop";
+            break;
+        }
+        try output_ids.append(allocator, result.first);
+        // Honor max_tokens between the pair: a full-accept advances
+        // gen.completion_tokens by 2 internally, but we must not emit the
+        // second token if doing so would exceed max_tokens. Mirror the PLD
+        // pattern (output_ids.items.len bound) for consistency.
+        if (output_ids.items.len >= max_tokens) {
+            gen.done = true;
+            gen.finish_reason = "length";
+            break;
+        }
+        if (result.second) |second| {
+            if (isEosId(second, eos_token_ids)) {
+                gen.done = true;
+                gen.finish_reason = "stop";
+                break;
+            }
+            try output_ids.append(allocator, second);
+            if (output_ids.items.len >= max_tokens) {
+                gen.done = true;
+                gen.finish_reason = "length";
+                break;
+            }
+        }
+    }
+
+    return finishMtpResult(&gen, &output_ids, allocator, prompt_ids.len, prefill_tps, timer, tok);
+}
+
+/// PLD-enabled non-streaming variant of `generate`. Model-agnostic — works on
+/// every supported architecture, no MTP weights required. Logprobs and
+/// constrained sampling are unsupported (asserted out by `nextPld`).
+///
+/// `draft_len` and `key_len` come from server config (`--pld-draft-len` /
+/// `--pld-key-len`); typical values are 5 and 3 respectively.
+pub fn generatePld(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    tok: *const Tokenizer,
+    prompt_ids: []const u32,
+    max_tokens: u32,
+    sampling: SamplingParams,
+    eos_token_ids: []const u32,
+    timeout_ns: u64,
+    draft_len: u32,
+    key_len: u32,
+) !GenerationResult {
+    var timer = io_util.Stopwatch.init(io);
+    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .pld_enabled = true });
+    gen.timeout_ns = timeout_ns;
+    defer gen.deinit(allocator);
+
+    const prefill_ns = timer.read();
+    const prefill_tps: f64 = if (prefill_ns > 0)
+        @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
+    else
+        0.0;
+    log.debug("Prefill (PLD): {d}ms ({d} tokens, {d:.3} tok/s)\n", .{
+        prefill_ns / std.time.ns_per_ms,
+        prompt_ids.len,
+        prefill_tps,
+    });
+
+    var output_ids = std.ArrayList(u32).empty;
+    defer output_ids.deinit(allocator);
+
+    timer.reset();
+
+    // Decode loop. Each `nextPld` returns 1..=(1+draft_len) tokens. Stop on
+    // EOS / max_tokens / timeout. We check stop conditions on every emitted
+    // token (drafts can include EOS just like regular sampling) so the early
+    // exit is correct.
+    decode: while (!gen.done and gen.completion_tokens < max_tokens) {
+        const result = (try gen.nextPld(allocator, draft_len, key_len)) orelse break;
+        defer allocator.free(result.tokens);
+        // Match `generate`'s convention: stop tokens are NOT included in
+        // output_ids. Check before appending — the speculative path has to do
+        // this explicitly because `nextPld` emits multiple tokens at once and
+        // can't return-null mid-batch like the single-token `next` does.
+        for (result.tokens) |tok_id| {
+            if (isEosId(tok_id, eos_token_ids)) {
+                gen.done = true;
+                gen.finish_reason = "stop";
+                break :decode;
+            }
+            try output_ids.append(allocator, tok_id);
+            if (output_ids.items.len >= max_tokens) {
+                gen.done = true;
+                gen.finish_reason = "length";
+                break :decode;
+            }
+        }
+        if (timeout_ns > 0 and timer.read() >= timeout_ns) {
+            gen.done = true;
+            gen.finish_reason = "length";
+            break;
+        }
+    }
+
+    return finishPldResult(&gen, &output_ids, allocator, prefill_tps, timer, tok);
+}
+
+/// Drafter-enabled non-streaming variant of `generate`. Mirrors
+/// `generatePld` (multi-token-per-step emit pattern) but the draft comes from
+/// a Gemma 4 assistant drafter cross-attending into the target's KV cache
+/// instead of an n-gram lookup.
+///
+/// `drafter` must already be `bind()`-ed to `xfm`. `block_size` is the
+/// per-round token budget (drafter forwards = block_size - 1; verify forward
+/// length = block_size).
+pub fn generateDrafter(
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    xfm: *Transformer,
+    drafter: *DrafterModel,
+    tok: *const Tokenizer,
+    prompt_ids: []const u32,
+    max_tokens: u32,
+    sampling: SamplingParams,
+    eos_token_ids: []const u32,
+    timeout_ns: u64,
+    block_size: u32,
+) !GenerationResult {
+    var timer = io_util.Stopwatch.init(io);
+    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
+        .drafter_enabled = true,
+        .drafter = drafter,
+        .drafter_block_size = block_size,
+    });
+    gen.timeout_ns = timeout_ns;
+    defer gen.deinit(allocator);
+
+    const prefill_ns = timer.read();
+    const prefill_tps: f64 = if (prefill_ns > 0)
+        @as(f64, @floatFromInt(prompt_ids.len)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(prefill_ns))
+    else
+        0.0;
+    log.debug("Prefill (drafter): {d}ms ({d} tokens, {d:.3} tok/s)\n", .{
+        prefill_ns / std.time.ns_per_ms,
+        prompt_ids.len,
+        prefill_tps,
+    });
+
+    var output_ids = std.ArrayList(u32).empty;
+    defer output_ids.deinit(allocator);
+
+    timer.reset();
+
+    decode: while (!gen.done and gen.completion_tokens < max_tokens) {
+        const result = (try gen.nextDrafter(allocator)) orelse break;
+        defer allocator.free(result.tokens);
+        for (result.tokens) |tok_id| {
+            if (isEosId(tok_id, eos_token_ids)) {
+                gen.done = true;
+                gen.finish_reason = "stop";
+                break :decode;
+            }
+            try output_ids.append(allocator, tok_id);
+            if (output_ids.items.len >= max_tokens) {
+                gen.done = true;
+                gen.finish_reason = "length";
+                break :decode;
+            }
+        }
+        if (timeout_ns > 0 and timer.read() >= timeout_ns) {
+            gen.done = true;
+            gen.finish_reason = "length";
+            break;
+        }
+    }
+
+    return finishDrafterResult(&gen, &output_ids, allocator, prefill_tps, timer, tok);
+}
+
+fn finishDrafterResult(
+    gen: *Generator,
+    output_ids: *std.ArrayList(u32),
+    allocator: std.mem.Allocator,
+    prefill_tps: f64,
+    timer: io_util.Stopwatch,
+    tok: *const Tokenizer,
+) !GenerationResult {
+    const decode_ns = timer.read();
+    const num_decoded = output_ids.items.len;
+    const decode_tps: f64 = if (decode_ns > 0)
+        @as(f64, @floatFromInt(num_decoded)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
+    else
+        0.0;
+    if (gen.drafter_attempted > 0) {
+        const avg_acc: f64 = @as(f64, @floatFromInt(gen.drafter_accepted_tokens)) / @as(f64, @floatFromInt(gen.drafter_attempted));
+        log.info("Decode (drafter): {d}ms ({d} tokens, {d:.3} tok/s; drafter accept={d}/{d} attempts, avg {d:.2} tokens/attempt)\n", .{
+            decode_ns / std.time.ns_per_ms,
+            num_decoded,
+            decode_tps,
+            gen.drafter_accepted_tokens,
+            gen.drafter_attempted,
+            avg_acc,
+        });
+    } else {
+        log.debug("Decode (drafter): {d}ms ({d} tokens, {d:.3} tok/s; no draft attempts)\n", .{
+            decode_ns / std.time.ns_per_ms,
+            num_decoded,
+            decode_tps,
+        });
+    }
+    const strip_leading = tok.tok_type == .sentencepiece_bpe;
+    const text = try tok.decode(allocator, output_ids.items, strip_leading);
+    const token_ids = try output_ids.toOwnedSlice(allocator);
+    return .{
+        .text = text,
+        .token_ids = token_ids,
+        .prompt_tokens = gen.prompt_tokens,
+        .completion_tokens = gen.completion_tokens,
+        .finish_reason = gen.finish_reason,
+        .prefill_tps = prefill_tps,
+        .decode_tps = decode_tps,
+        .logprobs = null,
+    };
+}
+
+fn finishPldResult(
+    gen: *Generator,
+    output_ids: *std.ArrayList(u32),
+    allocator: std.mem.Allocator,
+    prefill_tps: f64,
+    timer: io_util.Stopwatch,
+    tok: *const Tokenizer,
+) !GenerationResult {
+    const decode_ns = timer.read();
+    const num_decoded = output_ids.items.len;
+    const decode_tps: f64 = if (decode_ns > 0)
+        @as(f64, @floatFromInt(num_decoded)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
+    else
+        0.0;
+    if (gen.pld_attempted > 0) {
+        // "Tokens saved" = accepted_tokens (drafts that landed) + 0 from
+        // verify forwards that ran. Acceptance ratio is per-position, so we
+        // compute average tokens accepted per attempt for visibility.
+        const avg_acc: f64 = @as(f64, @floatFromInt(gen.pld_accepted_tokens)) / @as(f64, @floatFromInt(gen.pld_attempted));
+        log.info("Decode (PLD): {d}ms ({d} tokens, {d:.3} tok/s; pld accept={d}/{d} attempts, avg {d:.2} tokens/attempt)\n", .{
+            decode_ns / std.time.ns_per_ms,
+            num_decoded,
+            decode_tps,
+            gen.pld_accepted_tokens,
+            gen.pld_attempted,
+            avg_acc,
+        });
+    } else {
+        log.debug("Decode (PLD): {d}ms ({d} tokens, {d:.3} tok/s; no n-gram matches found)\n", .{
+            decode_ns / std.time.ns_per_ms,
+            num_decoded,
+            decode_tps,
+        });
+    }
+    const strip_leading = tok.tok_type == .sentencepiece_bpe;
+    const text = try tok.decode(allocator, output_ids.items, strip_leading);
+    const token_ids = try output_ids.toOwnedSlice(allocator);
+    return .{
+        .text = text,
+        .token_ids = token_ids,
+        .prompt_tokens = gen.prompt_tokens,
+        .completion_tokens = gen.completion_tokens,
+        .finish_reason = gen.finish_reason,
+        .prefill_tps = prefill_tps,
+        .decode_tps = decode_tps,
+        .logprobs = null,
+    };
+}
+
+pub fn isEosId(id: u32, eos: []const u32) bool {
+    for (eos) |e| if (id == e) return true;
+    return false;
+}
+
+fn finishMtpResult(
+    gen: *Generator,
+    output_ids: *std.ArrayList(u32),
+    allocator: std.mem.Allocator,
+    prompt_len: usize,
+    prefill_tps: f64,
+    timer: io_util.Stopwatch,
+    tok: *const Tokenizer,
+) !GenerationResult {
+    const decode_ns = timer.read();
+    const num_decoded = output_ids.items.len;
+    const decode_tps: f64 = if (decode_ns > 0)
+        @as(f64, @floatFromInt(num_decoded)) * @as(f64, @floatFromInt(std.time.ns_per_s)) / @as(f64, @floatFromInt(decode_ns))
+    else
+        0.0;
+    if (gen.mtp_attempted > 0) {
+        const acc_pct = @as(f64, @floatFromInt(gen.mtp_accepted)) * 100.0 / @as(f64, @floatFromInt(gen.mtp_attempted));
+        log.info("Decode (MTP): {d}ms ({d} tokens, {d:.3} tok/s; mtp accept={d}/{d} = {d:.1}%)\n", .{
+            decode_ns / std.time.ns_per_ms,
+            num_decoded,
+            decode_tps,
+            gen.mtp_accepted,
+            gen.mtp_attempted,
+            acc_pct,
+        });
+    }
+    const strip_leading = tok.tok_type == .sentencepiece_bpe;
+    const text = try tok.decode(allocator, output_ids.items, strip_leading);
+    const token_ids = try output_ids.toOwnedSlice(allocator);
+    _ = prompt_len;
+    return .{
+        .text = text,
+        .token_ids = token_ids,
+        .prompt_tokens = gen.prompt_tokens,
+        .completion_tokens = gen.completion_tokens,
+        .finish_reason = gen.finish_reason,
+        .prefill_tps = prefill_tps,
+        .decode_tps = decode_tps,
+        .logprobs = null,
     };
 }
 
@@ -1535,4 +3221,85 @@ test "sampleToken from prefill logits (seq_len > 1)" {
     const params = SamplingParams{ .temperature = 0.0 };
     const result = try sampleToken(allocator, logits, params, null, 0, s);
     try testing.expectEqual(@as(u32, 0), result.token_id); // pos 2, index 0 = 9.0
+}
+
+test "Generator.runtimeGateShouldDisable below warmup never trips" {
+    // Even with zero accepts, before the warmup count we trust the prompt-time
+    // gate and never disable speculation mid-decode.
+    try testing.expect(!Generator.runtimeGateShouldDisable(0, 0));
+    try testing.expect(!Generator.runtimeGateShouldDisable(1, 0));
+    try testing.expect(!Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP - 1, 0));
+}
+
+test "Generator.runtimeGateShouldDisable trips at warmup with low accept" {
+    // Synthetic low-accept scenario: 5 verify attempts, 1 draft accepted total.
+    // rate = 0.20, threshold = 0.30 → disable.
+    try testing.expect(Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 0));
+    try testing.expect(Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 1));
+    // 5 attempts × 0.30 threshold = 1.5 — so 1 accept trips, 2 accepts (rate 0.40) doesn't.
+    try testing.expect(!Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 2));
+}
+
+test "Generator.runtimeGateShouldDisable does not trip with high accept rate" {
+    // Echo workloads on Gemma drafter: ~3 drafts accepted per round (out of 3).
+    // After 10 attempts that's 30 accepted — rate = 3.0, far above threshold.
+    try testing.expect(!Generator.runtimeGateShouldDisable(10, 30));
+    // PLD on heavy-echo: ~4 of 5 drafts accepted; rate ≈ 4.0.
+    try testing.expect(!Generator.runtimeGateShouldDisable(20, 80));
+    // Edge case at exactly the threshold (rate == 0.30) — strict less-than, so
+    // does NOT trip (matches the inline check `rate < RUNTIME_GATE_MIN_RATE`).
+    try testing.expect(!Generator.runtimeGateShouldDisable(10, 3));
+}
+
+test "Generator.runtimeGateShouldDisable LFM-like regression scenario" {
+    // LFM2.5-350M heavy-echo: empirically PLD overhead exceeds benefit.
+    // The actual accept rate depends on n-gram match quality. If it's e.g.
+    // 0.25 drafts/attempt, the gate trips and falls back to plain next().
+    try testing.expect(Generator.runtimeGateShouldDisable(20, 5)); // rate 0.25
+    try testing.expect(Generator.runtimeGateShouldDisable(100, 25)); // rate 0.25
+    // If LFM ever runs above 0.30 the gate stays off — that's the intended
+    // safety net behavior.
+    try testing.expect(!Generator.runtimeGateShouldDisable(100, 35)); // rate 0.35
+}
+
+test "Generator.runtimeGateShouldDisableMtp below warmup never trips" {
+    // Mirrors the PLD/drafter test but with the MTP-specific warmup. Below
+    // RUNTIME_GATE_MTP_WARMUP attempts the gate trusts the prompt-time gate
+    // and never trips, regardless of accept rate.
+    try testing.expect(!Generator.runtimeGateShouldDisableMtp(0, 0));
+    try testing.expect(!Generator.runtimeGateShouldDisableMtp(1, 0));
+    try testing.expect(!Generator.runtimeGateShouldDisableMtp(Generator.RUNTIME_GATE_MTP_WARMUP - 1, 0));
+}
+
+test "Generator.runtimeGateShouldDisableMtp trips at warmup with low accept" {
+    // At warmup with 0 accepts, rate is 0 < threshold → trips.
+    try testing.expect(Generator.runtimeGateShouldDisableMtp(Generator.RUNTIME_GATE_MTP_WARMUP, 0));
+    // Empirically-observed regressors land at p ≈ 0.40-0.65 (heavy-echo,
+    // creative, enum, long-code on Qwen3.5-4B in early-burst). The gate must
+    // catch these.
+    try testing.expect(Generator.runtimeGateShouldDisableMtp(20, 12)); // rate 0.60
+    try testing.expect(Generator.runtimeGateShouldDisableMtp(100, 60)); // rate 0.60
+    try testing.expect(Generator.runtimeGateShouldDisableMtp(8, 3)); // rate 0.375
+    // Long-code lands right at p ≈ 0.65 — must trip on threshold = 0.70.
+    try testing.expect(Generator.runtimeGateShouldDisableMtp(100, 65)); // rate 0.65
+}
+
+test "Generator.runtimeGateShouldDisableMtp does not trip with high accept rate" {
+    // Memorized-text path on Qwen3.5-4B-MTPLX-Speed runs at p ≈ 0.77 — the gate
+    // must stay off so the 1.09× speedup is preserved (0.77 > 0.70).
+    try testing.expect(!Generator.runtimeGateShouldDisableMtp(20, 16)); // rate 0.80
+    try testing.expect(!Generator.runtimeGateShouldDisableMtp(100, 77)); // rate 0.77
+    try testing.expect(!Generator.runtimeGateShouldDisableMtp(20, 20)); // rate 1.00
+}
+
+test "Generator.runtimeGateShouldDisableMtp boundary at exact threshold" {
+    // Exact-threshold check: rate == 0.70 should NOT trip per `<` semantics
+    // (the helper's contract: `accepted/attempted < min_rate`). 14/20 = 0.70.
+    try testing.expect(!Generator.runtimeGateShouldDisableMtp(20, 14));
+    // One below — 13/20 = 0.65 → trips.
+    try testing.expect(Generator.runtimeGateShouldDisableMtp(20, 13));
+    // 100-attempt tie-breakers at 70% boundary, matching the exact-threshold
+    // semantics for larger samples.
+    try testing.expect(!Generator.runtimeGateShouldDisableMtp(100, 70));
+    try testing.expect(Generator.runtimeGateShouldDisableMtp(100, 69));
 }

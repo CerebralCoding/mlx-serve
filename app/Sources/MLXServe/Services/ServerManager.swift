@@ -17,15 +17,28 @@ class ServerManager: ObservableObject {
     private var pollSource: DispatchSourceTimer?
     private let api = APIClient()
     @Published var serverLog = ""
+    /// Snapshot of the ServerOptions used the last time `start()` was called.
+    /// Settings UI compares this against the current options to decide whether
+    /// the restart banner should appear.
+    @Published var lastLaunchedOptions: ServerOptions?
 
     var baseURL: String { "http://localhost:\(port)" }
 
-    func start(modelPath: String, contextSize: Int = 16384) {
+    /// True when the user has edited any server-launch field since the running
+    /// process was started. Per-request defaults never trigger this — they
+    /// apply on the next chat request.
+    func needsRestartFor(_ current: ServerOptions) -> Bool {
+        guard let last = lastLaunchedOptions else { return false }
+        return !last.serverLaunchEquals(current)
+    }
+
+    func start(modelPath: String, options: ServerOptions) {
         guard status != .running, status != .starting else { return }
 
         // Resolve symlinks for the model path
         let resolvedModel = (modelPath as NSString).resolvingSymlinksInPath
         currentModelPath = resolvedModel
+        port = options.port
         status = .starting
         lastError = ""
         serverLog = ""
@@ -45,16 +58,10 @@ class ServerManager: ObservableObject {
 
         let proc = Process()
         proc.executableURL = URL(fileURLWithPath: binaryPath)
-        var args = [
-            "--model", resolvedModel,
-            "--serve",
-            "--port", "\(port)",
-            "--log-level", "info"
-        ]
-        if contextSize > 0 {
-            args += ["--ctx-size", "\(contextSize)"]
-        }
+        var args = ["--model", resolvedModel]
+        args += options.toCLIArgs()
         proc.arguments = args
+        lastLaunchedOptions = options
 
         // Inherit environment + add framework paths for dylib loading
         var env = ProcessInfo.processInfo.environment
@@ -126,11 +133,11 @@ class ServerManager: ObservableObject {
         memoryInfo = nil
     }
 
-    func toggle(modelPath: String, contextSize: Int = 16384) {
+    func toggle(modelPath: String, options: ServerOptions) {
         if status == .running || status == .starting {
             stop()
         } else {
-            start(modelPath: modelPath, contextSize: contextSize)
+            start(modelPath: modelPath, options: options)
         }
     }
 

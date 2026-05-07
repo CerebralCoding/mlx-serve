@@ -15,7 +15,7 @@ class AppState: ObservableObject {
             // If the server is up with a different model, restart it with the new one.
             if server.status == .running || server.status == .starting {
                 server.stop()
-                server.start(modelPath: selectedModelPath, contextSize: contextSize)
+                server.start(modelPath: selectedModelPath, options: serverOptions)
             }
         }
     }
@@ -33,11 +33,24 @@ class AppState: ObservableObject {
     @Published var autoStartServer: Bool {
         didSet { UserDefaults.standard.set(autoStartServer, forKey: "autoStartServer") }
     }
-    @Published var maxTokens: Int {
-        didSet { UserDefaults.standard.set(maxTokens, forKey: "maxTokens") }
+    /// All server-launch flags + per-request defaults, mirrored to UserDefaults.
+    /// Auto-saves on every mutation. Prefer this over the legacy single-key
+    /// `maxTokens`/`contextSize` defaults — those forward into here.
+    @Published var serverOptions: ServerOptions {
+        didSet { serverOptions.save() }
     }
-    @Published var contextSize: Int {
-        didSet { UserDefaults.standard.set(contextSize, forKey: "contextSize") }
+    /// Legacy bridge: `maxTokens` is now stored in `serverOptions.defaultMaxTokens`.
+    /// Existing call sites (StatusMenuView max-tokens slider, TestServer agent
+    /// loops) keep the old name — both reads and writes route through the new
+    /// canonical field so changes show up in Settings instantly.
+    var maxTokens: Int {
+        get { serverOptions.defaultMaxTokens }
+        set { serverOptions.defaultMaxTokens = newValue }
+    }
+    /// Legacy bridge: `contextSize` is now `serverOptions.ctxSize`.
+    var contextSize: Int {
+        get { serverOptions.ctxSize }
+        set { serverOptions.ctxSize = newValue }
     }
     @Published var mcpMode: Bool {
         didSet { UserDefaults.standard.set(mcpMode, forKey: "mcpMode") }
@@ -54,9 +67,19 @@ class AppState: ObservableObject {
         self.hasSeenWelcome = UserDefaults.standard.bool(forKey: "hasSeenWelcome")
         self.autoStartServer = UserDefaults.standard.bool(forKey: "autoStartServer")
         self.selectedModelPath = UserDefaults.standard.string(forKey: "selectedModelPath") ?? ""
-        let stored = UserDefaults.standard.integer(forKey: "maxTokens")
-        self.maxTokens = stored > 0 ? stored : 32768
-        self.contextSize = UserDefaults.standard.integer(forKey: "contextSize") // 0 = auto
+        // Load ServerOptions, then migrate legacy single-key defaults
+        // (`maxTokens`, `contextSize`) into it on first run if the dedicated
+        // ServerOptions blob hasn't been written yet. After that the bridges
+        // above (var maxTokens / var contextSize) keep them in sync.
+        var opts = ServerOptions.load()
+        if UserDefaults.standard.object(forKey: "serverOptions") == nil {
+            let storedMax = UserDefaults.standard.integer(forKey: "maxTokens")
+            if storedMax > 0 { opts.defaultMaxTokens = storedMax }
+            let storedCtx = UserDefaults.standard.integer(forKey: "contextSize")
+            if storedCtx > 0 { opts.ctxSize = storedCtx }
+            opts.save()
+        }
+        self.serverOptions = opts
         self.mcpMode = UserDefaults.standard.bool(forKey: "mcpMode")
         server.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
@@ -80,7 +103,7 @@ class AppState: ObservableObject {
 
         // Auto-start server if enabled and a model is available
         if autoStartServer, !selectedModelPath.isEmpty {
-            server.start(modelPath: selectedModelPath, contextSize: contextSize)
+            server.start(modelPath: selectedModelPath, options: serverOptions)
         }
 
         // Fallback health detection — runs detached to avoid blocking MainActor

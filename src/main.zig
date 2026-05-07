@@ -5,6 +5,7 @@ const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
+const drafter_mod = @import("drafter.zig");
 const chat_mod = @import("chat.zig");
 const server_mod = @import("server.zig");
 const vision_mod = @import("vision.zig");
@@ -35,6 +36,26 @@ fn printUsage(io: std.Io) void {
         \\  --timeout <n>       Request timeout in seconds (default: 300, 0=none)
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
+        \\  --mtp               Enable MTP (Multi-Token Prediction) speculative decoding
+        \\                        Requires a model with `num_nextn_predict_layers > 0`
+        \\                        in config.json (Qwen3.5+, Qwen3-Next).
+        \\  --pld               Enable Prompt Lookup Decoding (default: ON).
+        \\                        Model-agnostic speculative decoding via n-gram
+        \\                        matches in the prompt + generated tokens. Big
+        \\                        wins on echo-heavy workloads (code editing, RAG,
+        \\                        agentic loops). Adaptive prompt-time gate
+        \\                        auto-disables it on novel content. Pass
+        \\                        --no-pld to force-disable.
+        \\  --no-pld            Force-disable Prompt Lookup Decoding.
+        \\  --pld-draft-len <n> Max draft tokens per PLD step (default: 5).
+        \\  --pld-key-len <n>   N-gram match key length for PLD (default: 3).
+        \\  --drafter <dir>     Path to a Gemma 4 assistant drafter checkpoint.
+        \\                        When set, the drafter is loaded at startup,
+        \\                        bound to the target model, and used as the
+        \\                        default draft source for new requests
+        \\                        (priority: drafter > MTP > PLD > regular).
+        \\  --draft-block-size <n>  Tokens per drafter round (default: 4 = 3
+        \\                        drafter steps + 1 verify token).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --version           Print version and exit
         \\  --help              Show this help
@@ -77,6 +98,12 @@ pub fn main(init: std.process.Init) !void {
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
     var no_vision = false;
+    var enable_mtp = false; // MTP self-speculative decoding (off by default)
+    var enable_pld = true; // Prompt Lookup Decoding (on by default; --no-pld to disable)
+    var pld_draft_len: u32 = 5;
+    var pld_key_len: u32 = 3;
+    var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
+    var draft_block_size: u32 = 4;
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -118,6 +145,26 @@ pub fn main(init: std.process.Init) !void {
             timeout = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--no-vision")) {
             no_vision = true;
+        } else if (std.mem.eql(u8, args[i], "--mtp")) {
+            enable_mtp = true;
+        } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
+            enable_mtp = false;
+        } else if (std.mem.eql(u8, args[i], "--pld")) {
+            enable_pld = true;
+        } else if (std.mem.eql(u8, args[i], "--no-pld")) {
+            enable_pld = false;
+        } else if (std.mem.eql(u8, args[i], "--pld-draft-len") and i + 1 < args.len) {
+            i += 1;
+            pld_draft_len = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--pld-key-len") and i + 1 < args.len) {
+            i += 1;
+            pld_key_len = try std.fmt.parseInt(u32, args[i], 10);
+        } else if (std.mem.eql(u8, args[i], "--drafter") and i + 1 < args.len) {
+            i += 1;
+            drafter_dir = args[i];
+        } else if (std.mem.eql(u8, args[i], "--draft-block-size") and i + 1 < args.len) {
+            i += 1;
+            draft_block_size = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
             reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
@@ -266,7 +313,43 @@ pub fn main(init: std.process.Init) !void {
 
     if (serve_mode) {
         // Start HTTP server
-        try server_mod.serve(io, allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget);
+        // MTP guardrail: --mtp on a model without an MTP head silently downgrades.
+        const mtp_active = enable_mtp and config.has_mtp;
+        if (enable_mtp and !config.has_mtp) {
+            log.warn("--mtp requested but model has no MTP head (num_nextn_predict_layers=0); running without speculative decoding.\n", .{});
+        }
+
+        // Optional Gemma 4 assistant drafter. Loaded once at startup; held for
+        // the lifetime of the server. `bind` validates the drafter+target
+        // pair (backbone hidden size, layer-type compatibility); failure
+        // surfaces a clear error and we fall back to non-drafter mode.
+        var drafter_storage: ?drafter_mod.DrafterModel = null;
+        defer if (drafter_storage) |*d| d.deinit();
+        var drafter_ptr: ?*drafter_mod.DrafterModel = null;
+        if (drafter_dir) |dir| {
+            log.info("Loading drafter from {s}...\n", .{dir});
+            const dgpu_stream = mlx.gpuStream();
+            var d = drafter_mod.loadDrafter(io, allocator, dgpu_stream, dir) catch |err| {
+                log.err("Failed to load drafter at {s}: {s}\n", .{ dir, @errorName(err) });
+                std.process.exit(1);
+            };
+            d.bind(&xfm) catch |err| {
+                log.err(
+                    "Drafter checkpoint at {s} is incompatible with target: {s}\n" ++
+                        "  (drafter+target must share backbone_hidden_size, vocab_size, and have\n" ++
+                        "  matching layer types in the target's non-shared K/V layers — see\n" ++
+                        "  preceding [drafter] log lines for the specific mismatch)\n",
+                    .{ dir, @errorName(err) },
+                );
+                d.deinit();
+                std.process.exit(1);
+            };
+            drafter_storage = d;
+            drafter_ptr = &drafter_storage.?;
+            log.info("Drafter ready (block_size={d}).\n", .{draft_block_size});
+        }
+
+        try server_mod.serve(io, allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget, mtp_active, enable_pld, pld_draft_len, pld_key_len, drafter_ptr, draft_block_size);
     } else {
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{

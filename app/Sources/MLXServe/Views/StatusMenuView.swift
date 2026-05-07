@@ -101,6 +101,7 @@ struct StatusMenuView: View {
     let openModelBrowser: () -> Void
     let openImageGen: () -> Void
     let openVideoGen: () -> Void
+    let openSettings: () -> Void
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -137,32 +138,41 @@ struct StatusMenuView: View {
                         .font(.caption)
                         .foregroundStyle(.tertiary)
                 } else {
-                    Picker("Model", selection: $appState.selectedModelPath) {
-                        let mlxServe = appState.localModels.filter { $0.source == .mlxServe }
-                        let lmStudio = appState.localModels.filter { $0.source == .lmStudio }
-                        if !mlxServe.isEmpty {
-                            Section("MLX-Serve Models") {
-                                ForEach(mlxServe) { model in
-                                    Text(model.name).tag(model.path)
+                    // Model picker + Settings shortcut on the same row so the
+                    // gear lives where the user picks what to load. Tuning
+                    // anything else lives in the Settings window the gear opens.
+                    HStack(spacing: 6) {
+                        Picker("Model", selection: $appState.selectedModelPath) {
+                            let mlxServe = appState.localModels.filter { $0.source == .mlxServe }
+                            let lmStudio = appState.localModels.filter { $0.source == .lmStudio }
+                            if !mlxServe.isEmpty {
+                                Section("MLX-Serve Models") {
+                                    ForEach(mlxServe) { model in
+                                        Text(model.name).tag(model.path)
+                                    }
+                                }
+                            }
+                            if !lmStudio.isEmpty {
+                                Section("Other Discovered Models") {
+                                    ForEach(lmStudio) { model in
+                                        Text(model.name).tag(model.path)
+                                    }
                                 }
                             }
                         }
-                        if !lmStudio.isEmpty {
-                            Section("Other Discovered Models") {
-                                ForEach(lmStudio) { model in
-                                    Text(model.name).tag(model.path)
-                                }
-                            }
-                        }
-                    }
-                    .labelsHidden()
-                    .pickerStyle(.menu)
+                        .labelsHidden()
+                        .pickerStyle(.menu)
 
-                    ContextSizeSection(contextSize: $appState.contextSize, isRunning: server.status == .running || server.status == .starting, maxSafeContext: server.memoryInfo?.maxSafeContext ?? 0)
+                        Button { openSettings() } label: {
+                            Image(systemName: "gear")
+                        }
+                        .buttonStyle(.bordered)
+                        .help("Settings")
+                    }
 
                     HStack(spacing: 6) {
                         Button {
-                            server.toggle(modelPath: appState.selectedModelPath, contextSize: appState.contextSize)
+                            server.toggle(modelPath: appState.selectedModelPath, options: appState.serverOptions)
                         } label: {
                             HStack {
                                 Image(systemName: server.status == .running || server.status == .starting ? "stop.fill" : "play.fill")
@@ -253,12 +263,6 @@ struct StatusMenuView: View {
                 }
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
-
-                // Max Tokens
-                Divider().padding(.horizontal, 12)
-                MaxTokensSection(maxTokens: $appState.maxTokens)
-                    .padding(.horizontal, 16)
-                    .padding(.vertical, 10)
 
                 // Endpoints
                 Divider().padding(.horizontal, 12)
@@ -490,108 +494,6 @@ struct EndpointsSection: View {
                 }
             }
         }
-    }
-}
-
-struct MaxTokensSection: View {
-    @Binding var maxTokens: Int
-
-    private let presets: [(String, Int)] = [
-        ("2K", 2048),
-        ("4K", 4096),
-        ("8K", 8192),
-        ("16K", 16384),
-        ("32K", 32768),
-    ]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Max Tokens")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text(formatted)
-                    .font(.caption.monospaced())
-            }
-            HStack(spacing: 4) {
-                ForEach(presets, id: \.1) { label, value in
-                    Button(label) {
-                        maxTokens = value
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(maxTokens == value ? .accentColor : nil)
-                    .controlSize(.mini)
-                }
-            }
-        }
-    }
-
-    private var formatted: String {
-        if maxTokens >= 1024 {
-            return "\(maxTokens / 1024)K"
-        }
-        return "\(maxTokens)"
-    }
-}
-
-struct ContextSizeSection: View {
-    @Binding var contextSize: Int
-    var isRunning: Bool
-    var maxSafeContext: Int
-
-    private let presets: [(String, Int)] = [
-        ("Auto", 0),
-        ("16K", 16384),
-        ("32K", 32768),
-        ("64K", 65536),
-        ("128K", 131072),
-    ]
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 6) {
-            HStack {
-                Text("Context Size")
-                    .font(.subheadline.weight(.medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Text(formatted)
-                    .font(.caption.monospaced())
-            }
-            HStack(spacing: 4) {
-                ForEach(presets, id: \.1) { label, value in
-                    Button(label) {
-                        contextSize = value
-                    }
-                    .buttonStyle(.bordered)
-                    .tint(contextSize == value ? .accentColor : nil)
-                    .controlSize(.mini)
-                    .disabled(isRunning)
-                }
-            }
-            if maxSafeContext > 0 {
-                Text("GPU safe max: \(Self.formatTokens(maxSafeContext))")
-                    .font(.caption2)
-                    .foregroundColor(contextSize > 0 && contextSize > maxSafeContext ? .orange : .secondary)
-            }
-            if isRunning {
-                Text("Restart server to apply")
-                    .font(.caption2)
-                    .foregroundStyle(.tertiary)
-            }
-        }
-    }
-
-    private var formatted: String {
-        if contextSize == 0 {
-            return maxSafeContext > 0 ? "Auto (\(Self.formatTokens(maxSafeContext)))" : "Auto"
-        }
-        return Self.formatTokens(contextSize)
-    }
-
-    static func formatTokens(_ tokens: Int) -> String {
-        if tokens >= 1024 { return "\(tokens / 1024)K" }
-        return "\(tokens)"
     }
 }
 

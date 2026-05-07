@@ -15,7 +15,7 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 
 | Path | Role |
 |------|------|
-| `src/main.zig` | Entry, CLI (`--model`, `--serve`, `--host`, `--port`, `--prompt`, `--max-tokens`, `--temp`, `--ctx-size`, `--timeout`, `--reasoning-budget`, `--no-vision`, `--log-level`, `--version`, `--help`) |
+| `src/main.zig` | Entry, CLI (`--model`, `--serve`, `--host`, `--port`, `--prompt`, `--max-tokens`, `--temp`, `--ctx-size`, `--timeout`, `--reasoning-budget`, `--no-vision`, `--mtp`, `--pld`, `--pld-draft-len`, `--pld-key-len`, `--drafter`, `--draft-block-size`, `--log-level`, `--version`, `--help`) |
 | `src/mlx.zig` | mlx-c FFI |
 | `src/model.zig` | Config + safetensors loading; see **Supported Architectures** below |
 | `src/tokenizer.zig` | BPE tokenizer |
@@ -26,6 +26,8 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 | `src/server.zig` | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`, `/v1/responses/compact`, plus a WebSocket transport on `/v1/responses` (OpenAI Chat + Responses + Anthropic Messages, stream + non-stream, tool calling, KV cache, vision) |
 | `src/responses.zig` | OpenAI Responses API: input-item parser (incl. `compaction` items), tool-shape translation, output-item builders, in-memory `ResponseStore`, `encodeCompactionBlob` (HTTP/streaming live in `server.zig`) |
 | `src/ws.zig` | RFC 6455 WebSocket framing + handshake (server-side only). Generic over a `Conn`-shaped type so it stays test-friendly without depending on `server.zig`. |
+| `src/pld_index.zig` | Prompt Lookup Decoding (PLD) n-gram index. Pure-data `PldLookup.findMatch` — given a key (last `key_len` tokens) and committed stream, returns up to `max_draft` tokens from the latest prior occurrence. Tests at the bottom of the file. |
+| `src/drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode). `DrafterModel.step` runs one drafter forward; `bind(target)` resolves the layer-type → target K/V mapping; `MaskedEmbedding` is the centroid-routed sparse LM head. Loaded with `--drafter <dir>`. |
 | `src/status.zig` | TUI status bar (CPU, memory, GPU metrics) |
 | `src/log.zig` | Leveled logging (error, warn, info, debug) |
 | `build.zig` | Zig build; links mlx-c, libjinja.a, libwebp, stb_image |
@@ -64,6 +66,13 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 - `./tests/test_tool_response.sh [port]` — tool calling round-trip tests (needs running server)
 - `./tests/test_kv_cache_poison.sh [port]` — KV cache poisoning regression test (needs running server)
 - `./tests/test_anthropic_api.sh [port]` — Anthropic Messages API integration tests (needs running server)
+- `MTP_TEST_MODEL=<dir> ./tests/test_mtp_equivalence.sh [port]` — MTP byte-equivalence test (auto-skips when env var unset OR safetensors lack `*.mtp.*` weights — common for MLX-converted Qwen3.5)
+- `PLD_TEST_MODEL=<dir> ./tests/test_pld_equivalence.sh [port]` — PLD byte-equivalence test (defaults to `~/.mlx-serve/models/Qwen3.5-4B-MLX-4bit`; PLD is model-agnostic, any MLX checkpoint works). Verified on Qwen3.5-4B, Gemma-4-E4B, LFM2.5-350M (hybrid SSM).
+- `./tests/test_streaming_pld.sh [port]` — verifies streaming PLD output is byte-identical to non-streaming PLD AND to regular streaming (B's contribution)
+- `./tests/test_streaming_mtp.sh [port]` — same for MTP, against Qwen3.5-4B-MTPLX-Speed (auto-skips if MTP weights absent)
+- `./tests/test_drafter_equivalence.sh [port]` — Gemma 4 drafter byte-equivalence test (paired `--drafter`/no-drafter on `gemma-4-e4b-it-4bit` + `gemma-4-E4B-it-assistant-bf16`)
+- `./tests/bench_spec.sh [runs]` — focused spec-decode benchmark (none vs PLD vs drafter × heavy-echo + creative × Qwen/Gemma/LFM). Run 1 is warmup. Drives default-on flip decisions.
+- `./tests/bench_spec.sh --corpus` — threshold-tuning corpus: 9 prompts (echo, code-rename, JSON, RAG, agent, plain-Q&A, code-translate, summarize, creative) × PLD on/off on Gemma 4 E4B. Reports per-prompt n-gram score, gate decision, baseline_tps, pld_tps, ratio, and a "correct-decisions" rollup. Use when adjusting `spec_gate_threshold`.
 - Always run `zig build test` and `swift test` before submitting changes
 - Add tests for new pure logic functions in the same source file (Zig convention)
 - Shell integration tests go in `tests/` and need a running server with a loaded model
@@ -72,9 +81,11 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 
 - **Full app bundle**: `cd app && SKIP_NOTARIZE=1 bash build.sh` — builds Zig + Swift, assembles `.app`, signs (requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` env vars). Bundles libwebp + libsharpyuv for vision support.
 - Zig server only: `zig build -Doptimize=ReleaseFast` (requires `brew install webp` for vision pipeline)
-- Swift app only: `cd app && swift build -c release`
-- For tests: `zig build test` (Zig) and `cd app && swift test` (Swift)
+- Swift app only: `cd app && swift build -c release -Xswiftc -swift-version -Xswiftc 5`
+- For tests: `zig build test` (Zig) and `cd app && swift test -Xswiftc -swift-version -Xswiftc 5` (Swift)
 - **Rebuild Jinja library** (after changing `lib/jinja_cpp/*.cpp`): `cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o`
+
+The `-Xswiftc -swift-version -Xswiftc 5` flag forces Swift 5 language mode globally and is required when building under Swift 6.3 (Xcode 26+). Without it, the pinned `swift-sdk` 0.10.x dep emits `[#SendingRisksDataRace]` errors in `NetworkTransport.swift` (lines 581 / 812) — task-isolated continuation flags captured by `@MainActor` closures. The pin is held at 0.10.x for macos-14 / Swift 6.1 CI compat (0.11+ uses Swift 6.2-only `withThrowingTaskGroup` syntax). On Swift 6.1 the flag is a no-op, so it's safe to leave on. `app/build.sh` already passes the flag — only direct `swift build` / `swift test` invocations need it.
 
 ## Versioning & Releases
 
@@ -288,6 +299,78 @@ mlx-c requires a non-empty weight array for `mlx_fast_rms_norm`. Passing a null/
 
 ### Nemotron-H time_step_limit
 Python's `ModelArgs.__post_init__` defaults `time_step_limit` to `(0.0, inf)` — effectively no dt clipping. The config.json fields `time_step_min`/`time_step_max` exist but are NOT used for SSM clipping by Python. Our defaults match Python: `(0.0, inf)`. Only the `time_step_limit` JSON array (if present) overrides these.
+
+### MTP (Multi-Token Prediction) speculative decoding
+Qwen3.5/3.6/Qwen3-Next ship a native MTP head — a single transformer block trained to predict token N+2 from `(hidden_state_N, embed(token_N+1))`. Enabled per-server via `--mtp` and per-request via the `enable_mtp` JSON field. Only active when `config.has_mtp` is true (parsed from `mtp_num_hidden_layers` or `num_nextn_predict_layers`).
+
+**Streaming support**: MTP works under `stream: true` via `StreamingTokenStream` (server.zig:2455) — the adapter wraps `Generator` and yields one token per `next()` call regardless of whether the underlying step is regular (`gen.next`), MTP (`gen.nextMtp`, 1–2 tokens/step) or PLD (`gen.nextPld`, up to `1+draft_len` tokens/step). Each per-token state machine in `handleStreamingGeneration` / `handleAnthropicStreaming` stays untouched; only the loop's `gen.next(allocator)` call site changed to `ts.next(allocator)`. Dispatch via `pickStreamMode` (server.zig:2561), priority `mtp > pld > regular`. EOS-in-batch behavior matches the non-streaming `generateMtp`/`generatePld`: EOS tokens are not yielded, the adapter just terminates. Auto-disabled when `tools` are present (tool-call buffering is incompatible with multi-token verify) and when `logprobs` is requested.
+
+Algorithm (in `Generator.nextMtp`): draft via `mtpForward(last_hidden, last_token)` → sample → snapshot KV+SSM → verify via main `forwardCaptureHidden([last_token, draft_id])` length-2 → greedy compare argmax at position 1 → accept (advance step+=2, save new hidden) or reject (restore caches, re-forward `[last_token]` alone, sample fallback from position 0). Snapshot/restore via `KVCache.snapshot/restore` and `ssmSnapshot/Restore` ensures hybrid (GatedDeltaNet) models roll back correctly.
+
+**Critical**: most MLX-converted Qwen3.5/3.6 checkpoints declare `mtp_num_hidden_layers: 1` in their config but **strip the MTP weights** during conversion (no `*.mtp.*` tensors in safetensors). Without those weights, `--mtp` requests will fail at first `mtpForward` with `MISSING WEIGHT: ...mtp.0.eh_proj.weight`. Verify with `safe_open` before benchmarking. The `tests/test_mtp_equivalence.sh` script auto-detects this and skips.
+
+**MTP runtime acceptance gate (v5)**: `Generator.spec_disabled_runtime` flips to true mid-decode if the per-request MTP accept rate falls below `RUNTIME_GATE_MTP_MIN_RATE = 0.70` after `RUNTIME_GATE_MTP_WARMUP = 8` attempts. Sticky for the rest of the generation. Once set, `nextMtp` short-circuits to `Generator.next` for every subsequent step (the v4 transition shim in `next()` handles the cache-state hand-off — same shape as drafter's exit). Separate constants from the PLD/drafter gate (`RUNTIME_GATE_MIN_RATE = 0.30`, `RUNTIME_GATE_WARMUP = 5`) because MTP's per-attempt accept is binary `[0, 1]`, not the multi-token `[0, m]` range PLD/drafter see — same threshold would either be too aggressive or too lax. Empirical break-even is `p ≈ 0.775` (cost model `(1+p)/(2.55-p)`), so 0.70 sits 7.5% below — wide enough that memorized text at p ≈ 0.77 keeps its 1.07×+ speedup, tight enough to catch the empirically-observed 60-65% losers (heavy-echo, creative, enum, long-code on Qwen3.5-4B-MTPLX-Speed). Helper is `Generator.runtimeGateShouldDisableMtp(attempted, accepted)`; gate-check at start of `nextMtp` plus rate-check via `checkMtpRuntimeGate` at both accept and reject return sites.
+
+### PLD (Prompt Lookup Decoding) speculative decoding
+Model-agnostic speculative decoding via n-gram match in `prompt + generated_tokens`. No model weights required — works on every supported architecture. Enabled per-server via `--pld` (with `--pld-draft-len <n>` default 5 and `--pld-key-len <n>` default 3) and per-request via the `enable_pld` JSON field. The pure n-gram lookup lives in `src/pld_index.zig` (`PldLookup.findMatch`); the draft+verify orchestration is in `Generator.nextPld` / `generatePld` in `src/generate.zig`.
+
+**Verify-fusion (v2 invariant, post-v4 rewrite)**: `nextPld` mirrors `nextDrafter`'s invariant: `cache.step = prompt_len + tokens_emitted`, t1 NOT in cache, no pending state on entry. Verify input is `[t1, draft[0..m-1]]` length `1+m` (t1 is part of the input, NOT pre-forwarded). Walk `verify_logits[i]` vs `draft[i]` for `i = 0..m-1`. On full accept: `cache.step = prompt_len + TE_new`, sample `new_t1` from `verify_logits[m]` (= "bonus" prediction one past the last accepted draft), set `next_token_id = new_t1`, NO post-step forward. Saves 1 forward per accept step relative to v1.
+
+**Cold path** (no n-gram match): `forward([t1])` length 1 sync → sample lookahead → emit t1. v2 LOSES v1's lazy-pipeline overlap on cold steps; the prompt-time gate (see "Adaptive spec-decode gate") MUST disable PLD on novel content under default operation, otherwise the per-cold-step cost re-introduces A's ~10% novel-output regression. Explicit `enable_pld: true` in the request body bypasses the gate and re-exposes the regression.
+
+**Auto-disable rules** (mirror MTP): off when `tools` are present, off when `logprobs > 0`, off when grammar-constrained sampling is active. **Streaming is now supported** via `StreamingTokenStream` (same adapter as MTP — see MTP section). PLD works on hybrid SSM architectures (LFM2.5, Nemotron-H) — see "PLD on hybrid SSM models" below for the snapshot/restore null-state caveat. **Drafter+MTP+PLD priority**: drafter > MTP > PLD > regular. When multiple are enabled, the highest-priority active mode wins; the others' enable flags are silently zeroed before dispatch to prevent log spam.
+
+**Default-on caveat**: PLD is **not** flipped on by default at the CLI level — users still pass `--pld`. After v2 verify-fusion: Gemma-4-E4B heavy-echo gains 1.82× (up from v1's 1.51×), Qwen3.5-4B heavy-echo at 0.96× (~unchanged from v1's 0.97×), LFM2.5-350M heavy-echo regresses to 0.78× (DEEPER than v1's 0.92× — the lost lazy overlap costs more than the saved post-step forward on a 350M model). Creative content under explicit override: ~0.91-0.94× (A-style regression returns; ungated). The prompt-time gate is now **mandatory** rather than advisory: under default operation it filters novel content to 1.00×; users who explicitly `enable_pld:true` on novel content will see the regression. Once `--pld` is set on the server, the **adaptive gate** (see below) decides per-request whether PLD actually runs.
+
+**`prompt_ids_owned`**: `Generator.initWithOptions` clones the input `prompt_ids` into `prompt_ids_owned` (freed in `deinit`) so PLD's lookup table sees the full context. The caller-supplied slice is freed before `nextPld` runs, so we cannot reference it. The owned copy is also visible to non-PLD generators but unused there.
+
+**Partial-accept re-forward**: when verify accepts `accepted < m` drafts, the cache is over-advanced by `m - accepted`. `nextPld` rolls back via `KVCache.snapshot/restore` + `ssmSnapshot/Restore`, then re-forwards `[t1, draft[0..accepted-1]]` length `1+accepted` to land the cache at exactly `+1+accepted` (= `prompt_len + TE_new`). The `accepted=0` case (= first draft rejected) MUST still re-forward `[t1]` length 1 — under v2 t1 is part of the rolled-back verify input, so skipping the re-forward would leave the cache one short. The pending correction is sampled from the *original* `verify_logits[accepted]` (not the re-forward) — that's the model's choice for the rejected position. The sampling index is `accepted`, NOT `accepted-1`: t1 occupies index 0 of the verify input under v2, so the prediction for "what comes after the last accepted draft" sits at index `accepted`. Off-by-one here would silently corrupt output — guarded by `tests/test_pld_equivalence.sh`.
+
+**Runtime acceptance gate** (v4 Phase 1): `Generator.spec_disabled_runtime` is set to `true` mid-decode if the per-request average draft acceptance falls below `RUNTIME_GATE_MIN_RATE = 0.30` after `RUNTIME_GATE_WARMUP = 5` attempts. Once set, every subsequent `nextPld` / `nextDrafter` call short-circuits to `Generator.next` for the rest of the request (sticky for that generation; never re-enables). The `next()` slow path has a transition shim: when `!has_pending_logits and !has_pending_token`, it synchronously `forward([next_token_id])`s to seed pending_logits — required because v2 PLD and drafter both exit with t1 NOT in cache, while `next()`'s fast path expects pending_logits to be populated. The gate is a defense-in-depth for any future workload where draft acceptance collapses mid-decode; it does NOT fire on the LFM/Qwen heavy-echo regressions (those have HIGH acceptance rates, well above the 0.30 threshold — the regression there is per-step overhead vs. small-model forward cost, not low acceptance).
+
+**Stochastic verify** treats the draft as a one-hot distribution (since it came from n-gram lookup, not a probabilistic model): `accept_prob = min(1, target_p[draft[i]])`. On reject, sample from residual `max(target_p − one_hot(draft[i]), 0)` renormalized — equivalent to "sample from target distribution conditional on not draft[i]" which preserves the marginal distribution per Leviathan et al. The one-hot is built via `pldOneHotRow` (arange + equal + cast) — no scatter required.
+
+**Equivalence test**: `./tests/test_pld_equivalence.sh [port]` (defaults to `~/.mlx-serve/models/Qwen3.5-4B-MLX-4bit`; override with `PLD_TEST_MODEL=<dir>`). Greedy temp=0 output must be byte-identical with vs without `--pld`. Skips cleanly when no model is available. Verified on Qwen3.5-4B, Gemma-4-E4B, and LFM2.5-350M.
+
+### Gemma 4 assistant drafter speculative decoding
+Google ships small 4-layer drafter checkpoints alongside Gemma 4 (`gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant-bf16`). Hidden size 256, 4 attention heads, **no K/V projections** — the drafter cross-attends into the **target's** K/V cache via a layer-type mapping (drafter sliding layer reads target's last sliding layer's K/V; drafter full layer reads target's last full layer's K/V). Loaded explicitly via `--drafter <dir>` (and `--draft-block-size <n>` default 4); per-request `enable_drafter` JSON field defaults true when a drafter is loaded.
+
+Drafter input per step: `concat([target.embed(prev_tok) * sqrt(target.hidden), h_prev], -1)` projected from `[1,1,2*backbone_hidden]` → drafter hidden 256. The drafter is autoregressive within the round (`block_size − 1` forwards = 3 drafts per round at default), each step's hidden feeding the next; position is constant across all drafts in a round (RoPE offset = `target.cache.step + 1`). Verify mirrors MTP/PLD: target forwards `[t1, draft[0..K-1]]` length `1+K`, argmax compare per position, partial-accept rollback via `KVCache.snapshot/restore`. Sparse `MaskedEmbedding` LM head: ~2048 centroids, top-32 → ~4096 token logits materialized of 262144 total.
+
+Validation at load: pair-check rejects mismatched drafter+target (`error.UnsupportedDrafterArch` if `model_type != "gemma4_assistant"`, `error.DrafterTargetMismatch` if `backbone_hidden_size != target.hidden_size` or any drafter `layer_type` is absent from target's `layer_types[:N - num_kv_shared_layers]`). All drafter linear weights are pre-transposed at load (matches MTPLX's `eh_proj_w_t` pattern) so `step()` uses plain `mlx_matmul` — no per-step transpose cost.
+
+**Critical fix**: `forwardCaptureHidden` previously left the captured array empty for any model going through `forwardStandard` (= all non-MoE Gemma 3/4 + Llama + Mistral + Qwen 3 etc.). Workstream C added an explicit `mtp_capture_hidden` slice-and-set block at `transformer.zig:2841-2856` that fixes both the drafter's first-step h_prev and MTP on non-MoE checkpoints.
+
+**Streaming**: drafter dispatch is **non-streaming-only** in v1 (TODO: extend `StreamMode` enum + `StreamingTokenStream` adapter to include `.drafter`). Streaming requests with `enable_drafter:true` log `drafter=disabled (streaming; non-stream supports it)` and fall through to regular streaming. Auto-disabled with `tools`, `logprobs > 0`, grammar-constrained sampling, and on hybrid SSM architectures (the multi-token verify forward isn't yet wired through the SSM/conv recurrence path; same restriction MTP has on hybrid Qwen3-Next).
+
+**Equivalence test**: `tests/test_drafter_equivalence.sh` — byte-identical greedy temp=0 output with `--drafter` vs without on `~/.mlx-serve/models/gemma-4-e4b-it-4bit` paired with `~/.mlx-serve/models/gemma-4-E4B-it-assistant-bf16`. Verified at PASS with 36/12 attempts (3.0/3 max acceptance rate) on echo-heavy prompt, 67 tok/s decode (vs 33.5 baseline = 2.0×).
+
+**Default-on caveat**: drafter is **not** flipped on by default. Bench shows extreme bimodal behavior — Gemma-4-E4B heavy-echo gets 1.98× speedup, but creative/novel content runs at **0.555× (45% slowdown)** because draft acceptance collapses on out-of-distribution content and verify-then-fallback overhead dominates. The agent harness mixes echo + novel content per-turn, so a default-on flip would slow down half of all turns. Stays opt-in via `--drafter` until a runtime heuristic (e.g., n-gram match score on the prefix) gates per-request enablement.
+
+### Adaptive spec-decode gate
+
+PLD and drafter both pay per-step overhead that only pays off on echo-heavy content. To make `--pld` / `--drafter` safe to enable by default, every request goes through an n-gram repetition score on the tokenized prompt (`pld_index.ngramRepeatScore`, 3-grams, ratio of distinct n-grams that recur). If `score < spec_gate_threshold` (= 0.01 in `server.zig`) AND the user did not put `enable_pld: true` / `enable_drafter: true` explicitly in the JSON body, the flag is silently disabled for this request and a `pld=disabled (ngram-score=X.XXX < gate threshold Y.YYY)` line is logged.
+
+- The gate runs in all three request paths: `/v1/chat/completions`, `/v1/messages` (Anthropic), `/v1/responses`. The chat-completions path also logs `spec-gate: ngram-score=X.XXX (threshold=Y.YYY)` once per request when the score is computed, regardless of the decision — useful for `bench_spec.sh --corpus`.
+- Bench results (gated, runs=3): Gemma drafter on heavy-echo stays at 2.07×; Gemma drafter on creative is 1.00× (gate killed the prior 0.55× regression); Qwen/LFM PLD heavy-echo stays at 0.99×/0.91× (gate keeps PLD on because the prompt has BPE n-gram repeats above threshold — same as ungated, the gate cannot distinguish "heavy-echo with model regression" from "heavy-echo with model speedup").
+- Threshold validation: v4 Phase 3 ran a 9-prompt corpus through `bench_spec.sh --corpus` and got 9/9 correct decisions. Confirms 0.01 is well-calibrated. The corpus also showed RAG-style retrieval-grounded answers (score=0.022) gaining 1.16× — even non-echo workloads with structural repetition benefit from PLD.
+- Threshold tuning: 0.01 cleanly separates "any 3-gram repeats" from "pure novel" prompts (creative/essay prompts score 0.000). Plan started at 0.15; in practice BPE tokenization fragments echo content enough that even strong echo cases land in the 0.01–0.13 range.
+- `tests/bench_spec.sh --gated` measures the gated path; default mode injects `enable_pld:true` to bypass the gate and measure raw spec-decode performance.
+
+### MTP/PLD/drafter long-greedy byte-divergence at INT4
+Spec-decode paths run two different MLX matmul kernels: AR (regular `next`) forwards `[1,1,d]` (length-1 qmv), while verify forwards `[1,K+1,d]` (length-K+1 qmm). At INT4 quantization those kernels do their float reductions in slightly different orders, so a near-tie argmax token (two top-2 logits within ~ulp) can flip between them. Once a single token flips the prefix changes and divergence cascades.
+
+In practice:
+- For the **first ~30–80 generated tokens at temp=0**, MTP/PLD/drafter output is byte-identical to AR. The short-prompt redline equivalence tests live in this zone, so a real logic bug — wrong argmax from token 0, off-by-one in partial-accept rollback, etc. — surfaces immediately.
+- Beyond that point at INT4 with greedy decode, MTP/PLD/drafter may diverge from AR character-by-character even though both are deterministic and both are mathematically valid greedy outputs of the model. The equivalence tests assert byte-equivalence on the first 30 tokens of long-prompt completions specifically to tolerate this float-noise tail.
+- At **temp ≥ 0.01**, the Leviathan probability-ratio + residual-correction sampler preserves the target distribution, so spec-decode is *mathematically exact* even past the first ~30 tokens.
+
+**Recommendation**: for byte-stable long-greedy at temp=0 on INT4 models, run with `--no-pld --no-mtp` (and don't pass `--drafter`). For chat / agent workloads (temp > 0) the spec-decode paths are exact and the speedup is free.
+
+This is the same kernel-shape concern that motivated the MTPLX team to fork MLX (`mlx-mtplx-0.31.2-qmm`) with retuned small-M qmv kernels. Future work could mirror that fork to make AR and verify paths byte-stable end-to-end at INT4.
+
+### PLD on hybrid SSM models (snapshot null-state guard)
+PLD requires snapshotting the per-layer SSM cache before the multi-token verify forward, so partial-accept can roll back. On hybrid models the `SSMCacheEntry` has two independent slots (`conv_state`, `ssm_state`) populated by *different* layer types: LFM2's `gated_conv` writes only `conv_state` (sets `initialized=true` for cache reuse) and never touches `ssm_state`. Calling `mlx_array_set` with a null source aborts the process via mlx-c's default error handler (`printf("MLX error: expected a non-empty mlx_array") + exit(-1)`), so the snapshot/restore code in `transformer.zig` (`ssmSnapshot`, `ssmRestore`, plus the parallel `PrefillCache` save/restore paths) checks each field's `.ctx != null` independently — the `initialized` flag alone is not sufficient. This was the previous "off on hybrid SSM" auto-disable; lifted once the per-field guard landed.
 
 ### mlx-c API changes
 mlx-c 0.6.0 added a `global_scale` parameter (may be null) to `mlx_dequantize` between `mode` and `dtype`. The FFI declaration in `mlx.zig` must match the installed header. When upgrading mlx-c, diff the headers in `/opt/homebrew/include/mlx/c/ops.h` against the `extern "c"` declarations in `src/mlx.zig`.

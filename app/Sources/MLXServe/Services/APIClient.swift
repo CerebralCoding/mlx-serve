@@ -103,7 +103,9 @@ class APIClient {
             layers: meta["num_layers"] as? Int ?? 0,
             hiddenSize: meta["hidden_size"] as? Int ?? 0,
             vocabSize: meta["vocab_size"] as? Int ?? 0,
-            contextLength: meta["context_length"] as? Int ?? 0
+            contextLength: meta["context_length"] as? Int ?? 0,
+            modelMaxTokens: meta["model_max_tokens"] as? Int ?? 0,
+            supportsMTP: meta["supports_mtp"] as? Bool ?? false
         )
     }
 
@@ -128,6 +130,41 @@ class APIClient {
         let rawArguments: String
     }
 
+    /// Per-request overrides that come from the user's saved ServerOptions.
+    /// Each field is optional — `nil` = leave it out of the request body and
+    /// let the server's default win. Pre-built once at the call site (usually
+    /// from `ServerOptions`) and passed through unchanged.
+    struct RequestDefaults {
+        var topP: Double? = nil
+        var topK: Int? = nil
+        var repeatPenalty: Double? = nil
+        var presencePenalty: Double? = nil
+        var reasoningBudget: Int? = nil
+        var enableMTP: Bool? = nil
+        var enablePLD: Bool? = nil
+        var enableDrafter: Bool? = nil
+
+        static let none = RequestDefaults()
+
+        /// Build from the user's saved settings: per-request TriState overrides
+        /// translate to optional booleans; numeric defaults are forwarded only
+        /// when they differ from the canonical "off" value (e.g. topK=0 stays
+        /// nil — the server already treats 0 as disabled and we want to avoid
+        /// gratuitously bloating every request body).
+        static func from(_ opts: ServerOptions) -> RequestDefaults {
+            var r = RequestDefaults()
+            r.topP = opts.defaultTopP
+            r.topK = opts.defaultTopK > 0 ? opts.defaultTopK : nil
+            r.repeatPenalty = opts.defaultRepeatPenalty != 1.0 ? opts.defaultRepeatPenalty : nil
+            r.presencePenalty = opts.defaultPresencePenalty != 0.0 ? opts.defaultPresencePenalty : nil
+            r.reasoningBudget = opts.defaultReasoningBudget >= 0 ? opts.defaultReasoningBudget : nil
+            r.enableMTP = opts.perRequestEnableMTP.asOptionalBool
+            r.enablePLD = opts.perRequestEnablePLD.asOptionalBool
+            r.enableDrafter = opts.perRequestEnableDrafter.asOptionalBool
+            return r
+        }
+    }
+
     func streamChat(
         port: UInt16,
         messages: [[String: Any]],
@@ -136,6 +173,7 @@ class APIClient {
         enableThinking: Bool = false,
         tools: [[String: Any]]? = nil,
         toolsJSON: String? = nil,
+        defaults: RequestDefaults = .none,
         retryPolicy: RetryPolicy = .default
     ) -> AsyncThrowingStream<SSEEvent, Error> {
         AsyncThrowingStream { continuation in
@@ -148,6 +186,7 @@ class APIClient {
                             maxTokens: maxTokens, temperature: temperature,
                             enableThinking: enableThinking, tools: tools,
                             toolsJSON: toolsJSON,
+                            defaults: defaults,
                             continuation: continuation
                         )
                         return  // success
@@ -186,6 +225,7 @@ class APIClient {
         enableThinking: Bool,
         tools: [[String: Any]]? = nil,
         toolsJSON: String? = nil,
+        defaults: RequestDefaults = .none,
         continuation: AsyncThrowingStream<SSEEvent, Error>.Continuation
     ) async throws {
         let url = URL(string: "http://127.0.0.1:\(port)/v1/chat/completions")!
@@ -194,6 +234,11 @@ class APIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         request.setValue("close", forHTTPHeaderField: "Connection")
         request.timeoutInterval = 300
+
+        // Effective top_p: use the user's saved default when set, else 0.95.
+        // (`top_p` is special — it has a sane non-disabled default we want to
+        // keep on every request.)
+        let effectiveTopP = defaults.topP ?? 0.95
 
         if let toolsJSON {
             // Splice pre-serialized tools JSON to preserve property key order
@@ -207,11 +252,18 @@ class APIClient {
                 "\"messages\":\(messagesStr)",
                 "\"max_tokens\":\(maxTokens)",
                 "\"temperature\":\(temperature)",
-                "\"top_p\":0.95",
+                "\"top_p\":\(effectiveTopP)",
                 "\"stream\":true",
                 "\"stream_options\":{\"include_usage\":true}",
             ]
             if enableThinking { parts.append("\"enable_thinking\":true") }
+            if let v = defaults.topK { parts.append("\"top_k\":\(v)") }
+            if let v = defaults.repeatPenalty { parts.append("\"repeat_penalty\":\(v)") }
+            if let v = defaults.presencePenalty { parts.append("\"presence_penalty\":\(v)") }
+            if let v = defaults.reasoningBudget { parts.append("\"reasoning_budget\":\(v)") }
+            if let v = defaults.enableMTP { parts.append("\"enable_mtp\":\(v)") }
+            if let v = defaults.enablePLD { parts.append("\"enable_pld\":\(v)") }
+            if let v = defaults.enableDrafter { parts.append("\"enable_drafter\":\(v)") }
             parts.append("\"tools\":\(toolsJSON)")
             request.httpBody = "{\(parts.joined(separator: ","))}".data(using: .utf8)
         } else {
@@ -220,11 +272,18 @@ class APIClient {
                 "messages": messages,
                 "max_tokens": maxTokens,
                 "temperature": temperature,
-                "top_p": 0.95,
+                "top_p": effectiveTopP,
                 "stream": true,
                 "stream_options": ["include_usage": true],
             ]
             if enableThinking { body["enable_thinking"] = true }
+            if let v = defaults.topK { body["top_k"] = v }
+            if let v = defaults.repeatPenalty { body["repeat_penalty"] = v }
+            if let v = defaults.presencePenalty { body["presence_penalty"] = v }
+            if let v = defaults.reasoningBudget { body["reasoning_budget"] = v }
+            if let v = defaults.enableMTP { body["enable_mtp"] = v }
+            if let v = defaults.enablePLD { body["enable_pld"] = v }
+            if let v = defaults.enableDrafter { body["enable_drafter"] = v }
             if let tools { body["tools"] = tools }
             request.httpBody = try JSONSerialization.data(withJSONObject: body)
         }

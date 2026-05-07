@@ -189,7 +189,7 @@ class TestServer {
             return jsonError("No model selected and none provided")
         }
 
-        appState.server.start(modelPath: modelPath)
+        appState.server.start(modelPath: modelPath, options: appState.serverOptions)
 
         // Wait for server to become healthy (up to 120s for large models)
         for _ in 0..<240 {
