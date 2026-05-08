@@ -40,6 +40,50 @@ class DownloadManager: ObservableObject {
         return path
     }()
 
+    // MARK: - Path resolution
+    //
+    // New downloads land under `<modelsDir>/<author>/<name>/` (same shape as
+    // LM Studio). Pre-existing flat dirs (`<modelsDir>/<name>/`) keep working
+    // through the discoverer's fallback scan and `existingModelDir(for:)` —
+    // no automatic migration; users can move dirs manually if they want.
+
+    /// Where a fresh download of `repoId` should be written. New 2-level layout.
+    /// `repoId` should be `author/name`; bare names land at the legacy top level.
+    nonisolated static func newLayoutDir(rootDir: String, repoId: String) -> String {
+        let parts = repoId.split(separator: "/").map(String.init)
+        guard parts.count >= 2 else {
+            return (rootDir as NSString).appendingPathComponent(parts.last ?? repoId)
+        }
+        let author = parts[parts.count - 2]
+        let name = parts[parts.count - 1]
+        return ((rootDir as NSString).appendingPathComponent(author) as NSString)
+            .appendingPathComponent(name)
+    }
+
+    /// Path of an existing model on disk. Prefers the new 2-level layout; falls
+    /// back to the legacy flat layout. Returns nil when neither has a `config.json`.
+    nonisolated static func existingModelDir(rootDir: String, repoId: String) -> String? {
+        let fm = FileManager.default
+        let new = newLayoutDir(rootDir: rootDir, repoId: repoId)
+        if fm.fileExists(atPath: (new as NSString).appendingPathComponent("config.json")) {
+            return new
+        }
+        let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
+        let legacy = (rootDir as NSString).appendingPathComponent(name)
+        if fm.fileExists(atPath: (legacy as NSString).appendingPathComponent("config.json")) {
+            return legacy
+        }
+        return nil
+    }
+
+    func newLayoutDir(for repoId: String) -> String {
+        Self.newLayoutDir(rootDir: modelsDir, repoId: repoId)
+    }
+
+    func existingModelDir(for repoId: String) -> String? {
+        Self.existingModelDir(rootDir: modelsDir, repoId: repoId)
+    }
+
     /// LM Studio's downloads root, resolved once at app launch.
     /// Reads `~/.lmstudio/settings.json`'s `downloadsFolder` field; falls back to
     /// `~/.lmstudio/models`. nil if LM Studio isn't installed or the folder is unreachable.
@@ -62,8 +106,7 @@ class DownloadManager: ObservableObject {
     /// Check if a model has all required files for loading.
     /// Verifies: config.json, tokenizer files, chat template, and ALL safetensors shards.
     func isReady(_ repoId: String) -> Bool {
-        let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
-        let modelDir = (modelsDir as NSString).appendingPathComponent(name)
+        guard let modelDir = existingModelDir(for: repoId) else { return false }
         let fm = FileManager.default
 
         // Must have config.json
@@ -107,13 +150,11 @@ class DownloadManager: ObservableObject {
     }
 
     func modelPath(for repoId: String) -> String {
-        let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
-        return (modelsDir as NSString).appendingPathComponent(name)
+        existingModelDir(for: repoId) ?? newLayoutDir(for: repoId)
     }
 
     func download(repoId: String) async {
-        let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
-        let destDir = (modelsDir as NSString).appendingPathComponent(name)
+        let destDir = newLayoutDir(for: repoId)
 
         downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching file list...")
 
@@ -314,10 +355,16 @@ class DownloadManager: ObservableObject {
 
     /// Check whether a model has .partial files from an interrupted download.
     func hasPartialDownload(_ repoId: String) -> Bool {
-        let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
-        let modelDir = (modelsDir as NSString).appendingPathComponent(name)
-        guard let entries = try? FileManager.default.contentsOfDirectory(atPath: modelDir) else { return false }
-        return entries.contains { $0.hasSuffix(".partial") }
+        // Look in the new layout first (where in-progress downloads live), then
+        // legacy as a fallback.
+        let candidates = [newLayoutDir(for: repoId), existingModelDir(for: repoId)].compactMap { $0 }
+        for dir in candidates {
+            if let entries = try? FileManager.default.contentsOfDirectory(atPath: dir),
+               entries.contains(where: { $0.hasSuffix(".partial") }) {
+                return true
+            }
+        }
+        return false
     }
 
     private func makeLocalModel(at dirPath: String, displayName: String, idKey: String, source: LocalModelSource) -> LocalModel? {
@@ -348,13 +395,30 @@ class DownloadManager: ObservableObject {
 
     func discoverLocalModels() -> [LocalModel] {
         var out: [LocalModel] = []
+        let fm = FileManager.default
 
-        // ~/.mlx-serve/models — one level deep
-        if let entries = try? FileManager.default.contentsOfDirectory(atPath: modelsDir) {
-            for name in entries where !name.hasPrefix(".") {
-                let p = (modelsDir as NSString).appendingPathComponent(name)
-                if let m = makeLocalModel(at: p, displayName: name, idKey: name, source: .mlxServe) {
-                    out.append(m)
+        // ~/.mlx-serve/models — scan both layouts.
+        // New: <root>/<author>/<name>/config.json (matches LM Studio).
+        // Legacy: <root>/<name>/config.json — kept working for users who had
+        // models predating the migration that the auto-migrator couldn't classify.
+        if let entries = try? fm.contentsOfDirectory(atPath: modelsDir) {
+            for entry in entries where !entry.hasPrefix(".") {
+                let entryPath = (modelsDir as NSString).appendingPathComponent(entry)
+                let directConfig = (entryPath as NSString).appendingPathComponent("config.json")
+                if fm.fileExists(atPath: directConfig) {
+                    // Legacy flat layout: entry IS the model dir.
+                    if let m = makeLocalModel(at: entryPath, displayName: entry, idKey: entry, source: .mlxServe) {
+                        out.append(m)
+                    }
+                } else if let children = try? fm.contentsOfDirectory(atPath: entryPath) {
+                    // New layout: entry is an author dir, scan one level deeper.
+                    for child in children where !child.hasPrefix(".") {
+                        let childPath = (entryPath as NSString).appendingPathComponent(child)
+                        let display = "\(entry)/\(child)"
+                        if let m = makeLocalModel(at: childPath, displayName: display, idKey: display, source: .mlxServe) {
+                            out.append(m)
+                        }
+                    }
                 }
             }
         }
@@ -387,9 +451,27 @@ class DownloadManager: ObservableObject {
     }
 
     private func removeFromDisk(repoId: String) {
-        let name = repoId.split(separator: "/").last.map(String.init) ?? repoId
-        let destDir = (modelsDir as NSString).appendingPathComponent(name)
-        try? FileManager.default.removeItem(atPath: destDir)
+        let fm = FileManager.default
+        // Delete both layouts if present so we don't orphan a legacy copy after
+        // a partial migration. Empty author dir is also pruned.
+        if let existing = existingModelDir(for: repoId) {
+            try? fm.removeItem(atPath: existing)
+        }
+        // If the new-layout target also exists separately (e.g. interrupted
+        // download), remove it too.
+        let newPath = newLayoutDir(for: repoId)
+        if newPath != existingModelDir(for: repoId), fm.fileExists(atPath: newPath) {
+            try? fm.removeItem(atPath: newPath)
+        }
+        // Prune now-empty author dir.
+        let parts = repoId.split(separator: "/").map(String.init)
+        if parts.count >= 2 {
+            let authorDir = (modelsDir as NSString).appendingPathComponent(parts[parts.count - 2])
+            if let kids = try? fm.contentsOfDirectory(atPath: authorDir),
+               kids.filter({ !$0.hasPrefix(".") }).isEmpty {
+                try? fm.removeItem(atPath: authorDir)
+            }
+        }
         downloads.removeValue(forKey: repoId)
     }
 

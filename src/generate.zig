@@ -292,7 +292,20 @@ pub const Generator = struct {
         /// Number of tokens per draft round. Default 4 (3 drafter steps +
         /// 1 t1 prepend → length-4 verify forward).
         drafter_block_size: u32 = 4,
+        /// When set, this slice (rather than `prompt_ids`) becomes the
+        /// `prompt_ids_owned` source for PLD's n-gram lookup. Used by the
+        /// server's KV-cache-reuse path to forward only the trailing tokens
+        /// while still giving PLD the full prompt for matching.
+        lookup_prompt: ?[]const u32 = null,
     };
+
+    /// Selects the source slice that `initWithOptions` will dupe into
+    /// `prompt_ids_owned`. When `lookup_prompt` is non-null it wins (server
+    /// cache-reuse path: full original prompt for PLD lookup); otherwise the
+    /// caller's `prompt_ids` is used (back-compat path).
+    pub fn pickLookupPromptSource(prompt_ids: []const u32, lookup_prompt: ?[]const u32) []const u32 {
+        return lookup_prompt orelse prompt_ids;
+    }
 
     pub fn initWithOptions(
         io: std.Io,
@@ -313,11 +326,16 @@ pub const Generator = struct {
             ids_i32[i] = @intCast(id);
         }
 
-        // Clone the prompt for the lifetime of the Generator. PLD's n-gram
-        // lookup needs `prompt + generated`, and `prompt_ids` (caller-owned)
-        // can be freed before `nextPld` runs. Allocated up front so init's
-        // errdefer paths don't have to track partial state.
-        const prompt_owned = try allocator.dupe(u32, prompt_ids);
+        // Clone the lookup prompt for the lifetime of the Generator. PLD's
+        // n-gram lookup needs `prompt + generated`, and the caller-owned
+        // slice can be freed before `nextPld` runs. When `options.lookup_prompt`
+        // is set (server cache-reuse path), it carries the full original prompt
+        // so PLD's match coverage isn't gutted when only a trailing tail was
+        // forwarded into the KV cache. Defaults to `prompt_ids` otherwise.
+        // Allocated up front so init's errdefer paths don't have to track
+        // partial state.
+        const owned_src = pickLookupPromptSource(prompt_ids, options.lookup_prompt);
+        const prompt_owned = try allocator.dupe(u32, owned_src);
         errdefer allocator.free(prompt_owned);
 
         // Split prefill: process first N-1 tokens (cache-only, skip lm_head eval),
@@ -2099,9 +2117,10 @@ pub fn generateMtp(
     sampling: SamplingParams,
     eos_token_ids: []const u32,
     timeout_ns: u64,
+    lookup_prompt: ?[]const u32,
 ) !GenerationResult {
     var timer = io_util.Stopwatch.init(io);
-    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .mtp_enabled = true });
+    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .mtp_enabled = true, .lookup_prompt = lookup_prompt });
     gen.timeout_ns = timeout_ns;
     defer gen.deinit(allocator);
 
@@ -2181,9 +2200,10 @@ pub fn generatePld(
     timeout_ns: u64,
     draft_len: u32,
     key_len: u32,
+    lookup_prompt: ?[]const u32,
 ) !GenerationResult {
     var timer = io_util.Stopwatch.init(io);
-    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .pld_enabled = true });
+    var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .pld_enabled = true, .lookup_prompt = lookup_prompt });
     gen.timeout_ns = timeout_ns;
     defer gen.deinit(allocator);
 
@@ -2257,12 +2277,14 @@ pub fn generateDrafter(
     eos_token_ids: []const u32,
     timeout_ns: u64,
     block_size: u32,
+    lookup_prompt: ?[]const u32,
 ) !GenerationResult {
     var timer = io_util.Stopwatch.init(io);
     var gen = try Generator.initWithOptions(io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
         .drafter_enabled = true,
         .drafter = drafter,
         .drafter_block_size = block_size,
+        .lookup_prompt = lookup_prompt,
     });
     gen.timeout_ns = timeout_ns;
     defer gen.deinit(allocator);
@@ -3302,4 +3324,27 @@ test "Generator.runtimeGateShouldDisableMtp boundary at exact threshold" {
     // semantics for larger samples.
     try testing.expect(!Generator.runtimeGateShouldDisableMtp(100, 70));
     try testing.expect(Generator.runtimeGateShouldDisableMtp(100, 69));
+}
+
+test "InitOptions.lookup_prompt overrides prompt_ids_owned source" {
+    // When the server's cache-reuse path forwards only a trailing-tail
+    // prompt slice but supplies the full original prompt via
+    // `InitOptions.lookup_prompt`, PLD's n-gram buffer must be cloned from
+    // the full slice — not the truncated tail.
+    const tail = [_]u32{99};
+    const full = [_]u32{ 10, 20, 30, 99 };
+    const src = Generator.pickLookupPromptSource(&tail, &full);
+    try testing.expectEqual(@as(usize, 4), src.len);
+    try testing.expectEqualSlices(u32, &full, src);
+}
+
+test "InitOptions.lookup_prompt = null preserves existing behavior" {
+    // Back-compat path: when callers don't set `lookup_prompt`, the source
+    // is the unmodified `prompt_ids` slice — same buffer the Generator
+    // received pre-fix.
+    const prompt = [_]u32{ 1, 2, 3, 4, 5 };
+    const src = Generator.pickLookupPromptSource(&prompt, null);
+    try testing.expectEqual(prompt.len, src.len);
+    try testing.expectEqualSlices(u32, &prompt, src);
+    try testing.expectEqual(@as([*]const u32, prompt[0..].ptr), src.ptr);
 }

@@ -800,24 +800,52 @@ const HybridLayerWeights = struct {
     mlp: ?DenseMlpWeights, // optional MLP after mixer (LFM2: always; Nemotron-H: null)
 };
 
-// ── Quantization bit cache ──
-// A tiny lock-free pointer→bits cache. Quantized weights are loaded once at init and
-// reused for every forward pass; we detect bits on first touch and serve hits thereafter.
-// Uses open addressing with linear probing on a fixed-size array — this fits in L1
-// and keeps the cost of a lookup to ~5ns, matching the perf commit's intent of
-// "eliminate per-call detectQuantBits overhead" while still supporting mixed-precision
-// quantization (Gemma-4 MoE, etc.).
+// ── Quantization params cache ──
+// A tiny lock-free pointer → (bits, group_size) cache. Quantized weights are loaded
+// once at init and reused for every forward pass; we detect (or pre-bind) params on
+// first touch and serve hits thereafter. Uses open addressing with linear probing on
+// a fixed-size array — this fits in L1 and keeps the cost of a lookup to ~5ns,
+// matching the perf commit's intent of "eliminate per-call detect overhead" while
+// supporting mixed-precision quantization (Gemma-4 MoE per-layer bits, MTPLX
+// per-MTP-block group_size, etc.).
 const BITS_CACHE_CAP: usize = 1024; // plenty for 60 layers × ~10 quant weights × factor
-const BitsCache = struct {
+const QuantParams = struct { bits: u32, group_size: u32 };
+const QuantParamsCache = struct {
     keys: [BITS_CACHE_CAP]?*anyopaque = [_]?*anyopaque{null} ** BITS_CACHE_CAP,
-    vals: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
+    vals_bits: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
+    // group_size is always a small power of two in MLX (32, 64, 128). Store as
+    // group_size/8 to fit u8 with headroom up to 2040.
+    vals_gs_div8: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
 
     inline fn slot(key: *anyopaque) usize {
         const h: usize = @intFromPtr(key);
         // Golden-ratio multiplier for quick hash on pointer values (high bits).
         return (h *% 0x9E3779B97F4A7C15) >> @as(u6, @intCast(@bitSizeOf(usize) - 10));
     }
+
+    /// Insert (bits, group_size) for `key`. Used at MTP bind time to pin
+    /// per-weight quant params before the first qmatmul touches them.
+    /// Returns false if the probe window saturated (caller should treat as
+    /// "fall through to detection" — but realistically never fires given
+    /// BITS_CACHE_CAP is 1024 vs ~2k weights max).
+    fn put(self: *QuantParamsCache, key: *anyopaque, bits: u32, group_size: u32) bool {
+        const start = slot(key);
+        var i: usize = 0;
+        while (i < 4) : (i += 1) {
+            const idx = (start + i) & (BITS_CACHE_CAP - 1);
+            if (self.keys[idx] == null or self.keys[idx] == key) {
+                self.keys[idx] = key;
+                self.vals_bits[idx] = @intCast(bits);
+                self.vals_gs_div8[idx] = @intCast(group_size / 8);
+                return true;
+            }
+        }
+        return false;
+    }
 };
+
+// Backwards-compatibility alias — keeps existing field names readable.
+const BitsCache = QuantParamsCache;
 
 // ── Transformer ──
 
@@ -880,6 +908,9 @@ pub const Transformer = struct {
     moe_layers: ?[]MoeLayerWeights,
     ssm_entries: ?[]SSMCacheEntry,
     moe_seq_offset: usize,
+    // Pre-transposed plain-bf16 linear_attn weights owned by the Transformer
+    // (Unsloth Dynamic checkpoints — null for the common all-quantized case).
+    moe_owned_bf16: ?[]mlx.mlx_array = null,
 
     // MTP self-speculative head (null when config.has_mtp is false).
     // Bound during init from `{prefix}.mtp.{idx}.*` safetensors keys.
@@ -1011,6 +1042,7 @@ pub const Transformer = struct {
         var moe_layers: ?[]MoeLayerWeights = null;
         var ssm_entries: ?[]SSMCacheEntry = null;
         var hybrid_layers: ?[]HybridLayerWeights = null;
+        var moe_owned_bf16: ?[]mlx.mlx_array = null;
 
         if (config.has_hybrid_layers) {
             const hl = try initHybridLayers(allocator, config, weights, &name_buf, s);
@@ -1020,6 +1052,7 @@ pub const Transformer = struct {
             const ml = try initMoeLayers(allocator, config, weights, &name_buf, s);
             moe_layers = ml.moe_layers;
             ssm_entries = ml.ssm_entries;
+            moe_owned_bf16 = ml.owned_bf16;
         } else {
             layers = try initStandardLayers(allocator, config, weights, &name_buf, s);
         }
@@ -1029,10 +1062,23 @@ pub const Transformer = struct {
         // the config declares MTP but conversion stripped the weights.
         var mtp_layers: ?[]MtpLayerWeights = null;
         var mtp_cache: ?KVCache = null;
+        var bits_cache: BitsCache = .{};
         if (config.has_mtp) {
             mtp_layers = try initMtpLayers(allocator, config, weights, &name_buf, s, lm_head_w, lm_head_s, lm_head_b);
             if (mtp_layers != null) {
                 mtp_cache = try KVCache.init(allocator, config.num_mtp_predict_layers);
+                // Pin per-MTP quantization params in the cache. Some MTPLX
+                // checkpoints (e.g. Qwen3.6-27B) ship MTP linears with a
+                // group_size that differs from the main trunk's; without
+                // pinning, the lazy detector reads the global group_size,
+                // computes a wrong bits value, and quantized_matmul crashes
+                // on the first MTP forward. When the override matches the
+                // main config we still pin (it's a no-op cost-wise but keeps
+                // the cache populated, avoiding redundant first-touch detect
+                // work on the hot draft path).
+                if (mtp_layers) |layers_slice| {
+                    prepopulateMtpQuantParams(&bits_cache, layers_slice, config.mtp_quant_bits, config.mtp_quant_group_size);
+                }
             }
         }
 
@@ -1297,11 +1343,13 @@ pub const Transformer = struct {
             .moe_layers = moe_layers,
             .ssm_entries = ssm_entries,
             .moe_seq_offset = 0,
+            .moe_owned_bf16 = moe_owned_bf16,
             .mtp_layers = mtp_layers,
             .mtp_cache = mtp_cache,
             .hybrid_layers = hybrid_layers,
             .embedding_norm = embedding_norm_w,
             .prompt_cache = null,
+            .bits_cache = bits_cache,
         };
     }
 
@@ -1760,6 +1808,10 @@ pub const Transformer = struct {
             self.allocator.free(entries);
         }
         if (self.moe_layers) |ml| self.allocator.free(ml);
+        if (self.moe_owned_bf16) |arrs| {
+            for (arrs) |a| _ = mlx.mlx_array_free(a);
+            self.allocator.free(arrs);
+        }
         // MTP layers: pre-baked norms are owned (addOne); rest of the arrays
         // are shared refs into `Weights.map` (and `lm_head_*` for tied head).
         if (self.mtp_layers) |ml| freeMtpLayers(self.allocator, ml);
@@ -1780,36 +1832,51 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
-        // Detect bits per weight to support mixed-precision models (e.g. Gemma-4 MoE
-        // where MLP/router are 8-bit while default is 4-bit). Cost is ~4 shape reads;
-        // the cache on Transformer avoids even that after the first call per weight.
-        const gs = self.config.quant_group_size;
-        const bits = self.bitsFor(w, sc, gs);
-        return qmatmulBits(x, w, sc, bi, bits, gs, self.s);
+        // Resolve (bits, group_size) per weight. Most weights inherit the global
+        // config; MTPLX checkpoints with `mtplx_mtp_quantization` override land
+        // in the cache at bind time so MTP qmatmul calls see the correct params
+        // without changing the call sites.
+        const qp = self.quantParamsFor(w, sc);
+        return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, self.s);
     }
 
-    /// Resolve per-weight quant bits with a lazy cache keyed by the scales array pointer.
-    /// First touch computes from shapes (~4 FFI calls); subsequent calls are a single
-    /// pointer compare. Thread-safety: generation is single-threaded so no locks needed.
+    /// Resolve per-weight quant bits — convenience for callers that only need
+    /// bits (e.g. embedding gather) and use `config.quant_group_size` directly.
     inline fn bitsFor(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
-        const key_raw = sc.ctx orelse return self.config.quant_bits;
+        _ = group_size; // accepted for API compatibility; we always use the cached value
+        return self.quantParamsFor(w, sc).bits;
+    }
+
+    /// Resolve per-weight (bits, group_size) with a lazy cache keyed by the
+    /// scales array pointer. First touch computes bits from shapes against the
+    /// global config's group_size (~4 FFI calls); subsequent calls are a single
+    /// pointer compare. Pre-populated entries (MTPLX) take precedence over the
+    /// global default. Thread-safety: generation is single-threaded.
+    inline fn quantParamsFor(self: *const Transformer, w: mlx.mlx_array, sc: mlx.mlx_array) QuantParams {
+        const default_gs = self.config.quant_group_size;
+        const key_raw = sc.ctx orelse return .{ .bits = self.config.quant_bits, .group_size = default_gs };
         const cache = @constCast(&self.bits_cache);
         const start = BitsCache.slot(key_raw);
-        // Linear probe, 4 slots max — cache is sized generously so miss probing is rare.
         var i: usize = 0;
         while (i < 4) : (i += 1) {
-            const slot = (start + i) & (BITS_CACHE_CAP - 1);
-            const entry = cache.keys[slot];
-            if (entry == key_raw) return cache.vals[slot];
+            const idx = (start + i) & (BITS_CACHE_CAP - 1);
+            const entry = cache.keys[idx];
+            if (entry == key_raw) {
+                return .{
+                    .bits = cache.vals_bits[idx],
+                    .group_size = @as(u32, cache.vals_gs_div8[idx]) * 8,
+                };
+            }
             if (entry == null) {
-                const detected = detectQuantBits(w, sc, group_size);
-                cache.keys[slot] = key_raw;
-                cache.vals[slot] = @intCast(detected);
-                return detected;
+                const detected = detectQuantBits(w, sc, default_gs);
+                cache.keys[idx] = key_raw;
+                cache.vals_bits[idx] = @intCast(detected);
+                cache.vals_gs_div8[idx] = @intCast(default_gs / 8);
+                return .{ .bits = detected, .group_size = default_gs };
             }
         }
-        // Probe window saturated (should essentially never happen) — fall through to direct detect.
-        return detectQuantBits(w, sc, group_size);
+        // Probe window saturated — fall through to direct detect, no cache write.
+        return .{ .bits = detectQuantBits(w, sc, default_gs), .group_size = default_gs };
     }
 
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
@@ -1854,14 +1921,14 @@ pub const Transformer = struct {
 
         var emb = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(emb);
-        const emb_bits = self.bitsFor(self.emb_w, self.emb_s, self.config.quant_group_size);
+        const emb_qp = self.quantParamsFor(self.emb_w, self.emb_s);
         try mlx.check(mlx.mlx_dequantize(
             &emb,
             taken_w,
             taken_s,
             taken_b,
-            mlx.mlx_optional_int.some(@intCast(self.config.quant_group_size)),
-            mlx.mlx_optional_int.some(@intCast(emb_bits)),
+            mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
+            mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
             "affine",
             .{}, // global_scale (null)
             .{ .value = .bfloat16, .has_value = true },
@@ -2295,14 +2362,14 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(tb);
         try mlx.check(mlx.mlx_take_axis(&tb, bi, ids, 0, self.s));
         var result = mlx.mlx_array_new();
-        const bits = self.bitsFor(w, sc, self.config.quant_group_size);
+        const qp = self.quantParamsFor(w, sc);
         try mlx.check(mlx.mlx_dequantize(
             &result,
             tw,
             ts,
             tb,
-            mlx.mlx_optional_int.some(@intCast(self.config.quant_group_size)),
-            mlx.mlx_optional_int.some(@intCast(bits)),
+            mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+            mlx.mlx_optional_int.some(@intCast(qp.bits)),
             "affine",
             .{}, // global_scale (null)
             .{ .value = .bfloat16, .has_value = true },
@@ -4662,11 +4729,43 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
     return layers;
 }
 
-fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, _: mlx.mlx_stream) !struct { moe_layers: []MoeLayerWeights, ssm_entries: []SSMCacheEntry } {
+/// Pre-transpose a plain-BF16 weight stored as `[out, in]` to `[in, out]` so
+/// `mlx_matmul(x, w_t)` lands the contraction over the input axis. Used by
+/// Unsloth Dynamic checkpoints that leave linear-attention projections
+/// unquantized while quantizing the rest. Caller owns the returned array.
+fn transposeBf16Weight(w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var w_t = mlx.mlx_array_new();
+    const perm = [_]c_int{ 1, 0 };
+    try mlx.check(mlx.mlx_transpose_axes(&w_t, w, &perm, 2, s));
+    return w_t;
+}
+
+/// In-place: if `*sc` is null-ctx, we treat the matching `*w` as plain bf16.
+/// Replace `*w` with its pre-transposed `[in, out]` form and record the new
+/// array in `owned` so we can free it on Transformer.deinit.
+fn maybeTransposeForBf16(
+    w: *mlx.mlx_array,
+    sc: mlx.mlx_array,
+    owned: *std.ArrayList(mlx.mlx_array),
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+) !void {
+    if (sc.ctx != null) return;
+    const transposed = try transposeBf16Weight(w.*, s);
+    w.* = transposed;
+    try owned.append(allocator, transposed);
+}
+
+fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !struct { moe_layers: []MoeLayerWeights, ssm_entries: []SSMCacheEntry, owned_bf16: []mlx.mlx_array } {
     log.info("Precomputing MoE layer weights...\n", .{});
     const prefix = config.weight_prefix;
     const moe_layers = try allocator.alloc(MoeLayerWeights, config.num_hidden_layers);
     const ssm_entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
+    var owned_bf16: std.ArrayList(mlx.mlx_array) = .empty;
+    errdefer {
+        for (owned_bf16.items) |a| _ = mlx.mlx_array_free(a);
+        owned_bf16.deinit(allocator);
+    }
     const is_gemma4 = std.mem.eql(u8, config.model_type, "gemma4");
 
     for (0..config.num_hidden_layers) |i| {
@@ -4712,14 +4811,19 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         }
 
         if (is_linear) {
-            // Detect combined (qkvz+ba) vs separate (qkv+z+a+b) projections
+            // Detect combined (qkvz+ba) vs separate (qkv+z+a+b) projections.
+            // Each projection's `*_s`/`*_b` are loaded optionally — Unsloth Dynamic
+            // checkpoints (e.g. Qwen3.6 UD) leave linear_attn projections as plain
+            // bf16 with no scales/biases tensors, even though the rest of the model
+            // is quantized. Null-ctx scales triggers a transpose-on-load so that
+            // `qmatmulBits` can dispatch to plain `mlx_matmul`.
             const combined = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_qkvz.weight") != null;
             if (combined) {
                 lw.attn = .{ .linear = .{
                     .combined_proj = true,
                     .qkv_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkvz.weight"),
-                    .qkv_s = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkvz.scales"),
-                    .qkv_b = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkvz.biases"),
+                    .qkv_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_qkvz.scales") orelse mlx.mlx_array_new(),
+                    .qkv_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_qkvz.biases") orelse mlx.mlx_array_new(),
                     .z_w = mlx.mlx_array_new(),
                     .z_s = mlx.mlx_array_new(),
                     .z_b = mlx.mlx_array_new(),
@@ -4727,38 +4831,48 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                     .a_s = mlx.mlx_array_new(),
                     .a_b = mlx.mlx_array_new(),
                     .b_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_ba.weight"),
-                    .b_s = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_ba.scales"),
-                    .b_b = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_ba.biases"),
+                    .b_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_ba.scales") orelse mlx.mlx_array_new(),
+                    .b_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_ba.biases") orelse mlx.mlx_array_new(),
                     .conv1d_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.conv1d.weight"),
                     .A_log = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.A_log"),
                     .dt_bias = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.dt_bias"),
                     .norm_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.norm.weight"),
                     .out_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.out_proj.weight"),
-                    .out_s = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.out_proj.scales"),
-                    .out_b = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.out_proj.biases"),
+                    .out_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.out_proj.scales") orelse mlx.mlx_array_new(),
+                    .out_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.out_proj.biases") orelse mlx.mlx_array_new(),
                 } };
+                const la = &lw.attn.linear;
+                try maybeTransposeForBf16(&la.qkv_w, la.qkv_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&la.b_w, la.b_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
             } else {
                 lw.attn = .{ .linear = .{
                     .qkv_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkv.weight"),
-                    .qkv_s = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkv.scales"),
-                    .qkv_b = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_qkv.biases"),
+                    .qkv_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_qkv.scales") orelse mlx.mlx_array_new(),
+                    .qkv_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_qkv.biases") orelse mlx.mlx_array_new(),
                     .z_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_z.weight"),
-                    .z_s = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_z.scales"),
-                    .z_b = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_z.biases"),
+                    .z_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_z.scales") orelse mlx.mlx_array_new(),
+                    .z_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_z.biases") orelse mlx.mlx_array_new(),
                     .a_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_a.weight"),
-                    .a_s = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_a.scales"),
-                    .a_b = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_a.biases"),
+                    .a_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_a.scales") orelse mlx.mlx_array_new(),
+                    .a_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_a.biases") orelse mlx.mlx_array_new(),
                     .b_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_b.weight"),
-                    .b_s = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_b.scales"),
-                    .b_b = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.in_proj_b.biases"),
+                    .b_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_b.scales") orelse mlx.mlx_array_new(),
+                    .b_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.in_proj_b.biases") orelse mlx.mlx_array_new(),
                     .conv1d_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.conv1d.weight"),
                     .A_log = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.A_log"),
                     .dt_bias = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.dt_bias"),
                     .norm_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.norm.weight"),
                     .out_w = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.out_proj.weight"),
-                    .out_s = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.out_proj.scales"),
-                    .out_b = getLayerWeight(weights, name_buf, prefix, li, "linear_attn.out_proj.biases"),
+                    .out_s = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.out_proj.scales") orelse mlx.mlx_array_new(),
+                    .out_b = getLayerWeightOpt(weights, name_buf, prefix, li, "linear_attn.out_proj.biases") orelse mlx.mlx_array_new(),
                 } };
+                const la = &lw.attn.linear;
+                try maybeTransposeForBf16(&la.qkv_w, la.qkv_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&la.z_w, la.z_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&la.a_w, la.a_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&la.b_w, la.b_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
             }
         } else {
             const k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
@@ -4863,7 +4977,82 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         };
     }
 
-    return .{ .moe_layers = moe_layers, .ssm_entries = ssm_entries };
+    return .{
+        .moe_layers = moe_layers,
+        .ssm_entries = ssm_entries,
+        .owned_bf16 = try owned_bf16.toOwnedSlice(allocator),
+    };
+}
+
+/// Pin (bits, group_size) into the per-weight quant-params cache for every
+/// quantized scales array in the MTP block. This is the load-bearing fix for
+/// MTPLX checkpoints whose MTP linears use a different `group_size` from the
+/// main trunk (e.g. Qwen3.6-27B: main 4-bit/64, MTP 4-bit/32) — the lazy
+/// detector in `quantParamsFor` reads the global `quant_group_size` and would
+/// otherwise compute a wrong `bits` value, blowing up `quantized_matmul` on
+/// the first MTP forward.
+///
+/// Skips weights tied to the main trunk (shared_head when `shared_head_tied`)
+/// — those scales arrays belong to `lm_head_s` and must keep main's params.
+fn prepopulateMtpQuantParams(cache: *BitsCache, layers: []const MtpLayerWeights, bits: u32, group_size: u32) void {
+    const pin = struct {
+        fn f(c: *BitsCache, sc: mlx.mlx_array, b: u32, gs: u32) void {
+            const ptr = sc.ctx orelse return;
+            _ = c.put(ptr, b, gs);
+        }
+    }.f;
+
+    for (layers) |lw| {
+        // eh_proj is only quantized in the spec layout; MTPLX keeps mtp.fc
+        // dense BF16 and `eh_proj_s` is an empty array (ctx == null), which
+        // `pin` filters out.
+        if (lw.eh_proj_quantized) pin(cache, lw.eh_proj_s, bits, group_size);
+
+        // Inner attention block.
+        switch (lw.inner.attn) {
+            .full => |fa| {
+                pin(cache, fa.q_s, bits, group_size);
+                pin(cache, fa.k_s, bits, group_size);
+                pin(cache, fa.v_s, bits, group_size);
+                pin(cache, fa.o_s, bits, group_size);
+            },
+            .linear => |la| {
+                pin(cache, la.qkv_s, bits, group_size);
+                pin(cache, la.z_s, bits, group_size);
+                pin(cache, la.a_s, bits, group_size);
+                pin(cache, la.b_s, bits, group_size);
+                pin(cache, la.out_s, bits, group_size);
+            },
+        }
+
+        // Inner MLP — dense (Qwen3.5/3.6 MTPLX) or MoE (hypothetical, no
+        // shipped checkpoint uses MoE inside MTP today but we cover it for
+        // future-proofing).
+        switch (lw.inner.mlp) {
+            .dense => |dw| {
+                pin(cache, dw.gate_s, bits, group_size);
+                pin(cache, dw.up_s, bits, group_size);
+                pin(cache, dw.down_s, bits, group_size);
+            },
+            .moe => |mw| {
+                pin(cache, mw.router_s, bits, group_size);
+                pin(cache, mw.switch_gate_s, bits, group_size);
+                pin(cache, mw.switch_up_s, bits, group_size);
+                pin(cache, mw.switch_down_s, bits, group_size);
+                pin(cache, mw.shared_gate_s, bits, group_size);
+                pin(cache, mw.shared_up_s, bits, group_size);
+                pin(cache, mw.shared_down_s, bits, group_size);
+            },
+        }
+
+        // shared_head: skip when tied to the main lm_head — that scales array
+        // is also used by the main forward at the global quant params, and
+        // overwriting them with MTP's would corrupt main's lm_head matmul.
+        // For untied shared_head the MTP params apply.
+        if (!lw.shared_head_tied) {
+            pin(cache, lw.shared_head_s, bits, group_size);
+        }
+    }
 }
 
 /// Free MTP layers allocated by `initMtpLayers`. Each owned-norm flag gates
@@ -4893,19 +5082,31 @@ fn freeMtpLayers(allocator: std.mem.Allocator, layers: []MtpLayerWeights) void {
 
 /// MTP weight layout detected by probing key names in `Weights.map`.
 const MtpLayout = enum {
-    /// MTPLX project layout (the actual real-world layout used by published
-    /// MTP-bearing MLX checkpoints). Weights live at root prefix `mtp.*`:
+    /// MTPLX project layout (the unsanitized real-world layout shipped by
+    /// MTPLX speed builds). Weights live at root prefix `mtp.*` and the
+    /// inner-block / pre-fc norms are stored *un-shifted* (HF delta
+    /// convention) — the binder bakes a `+1` at load time.
     ///   `mtp.fc.weight`                 — concat fusion projection (BF16, dense)
-    ///   `mtp.norm.weight`               — final norm before vocab head
-    ///   `mtp.pre_fc_norm_hidden.weight` — applied to hidden_state before concat
-    ///   `mtp.pre_fc_norm_embedding.weight` — applied to next_token embed before concat
-    ///   `mtp.layers.0.input_layernorm.weight`
-    ///   `mtp.layers.0.post_attention_layernorm.weight`
+    ///   `mtp.norm.weight`               — final norm (already shifted, no +1)
+    ///   `mtp.pre_fc_norm_hidden.weight` — un-shifted, +1 applied at load
+    ///   `mtp.pre_fc_norm_embedding.weight` — un-shifted, +1 applied at load
+    ///   `mtp.layers.0.input_layernorm.weight` — un-shifted, +1 at load
+    ///   `mtp.layers.0.post_attention_layernorm.weight` — un-shifted, +1 at load
     ///   `mtp.layers.0.self_attn.{q,k,v,o}_proj.{weight,scales,biases}`
     ///   `mtp.layers.0.self_attn.{q,k}_norm.weight`
     ///   `mtp.layers.0.mlp.{gate,up,down}_proj.{weight,scales,biases}`
     /// Source: Youssofal/Qwen3.5-4B-MTPLX-Optimized-Speed (and similar).
     mtplx,
+    /// mlx-lm-sanitized layout — what `mlx_lm.convert` produces if you patch
+    /// out the MTP-stripping line in `Qwen3_5Model.sanitize`. Same key shape
+    /// as MTPLX but nested under the model's standard prefix (e.g.
+    /// `language_model.mtp.fc.weight`) and ALL norm weights are pre-shifted
+    /// to MLX-style (centered around 1) — sanitize applies a +1 to anything
+    /// matching `.input_layernorm.weight` / `.post_attention_layernorm.weight`
+    /// / etc. Binder skips the load-time `+1` when this layout is detected.
+    /// Source: our `tools/convert_with_mtp.py` and conversions like
+    /// mlx-community-style `Qwen3.6-27B-mtp` (8-bit).
+    mtplx_sanitized,
     /// Spec layout per the original llama.cpp port description — weights nested
     /// under the model's standard prefix and named after the spec:
     /// `{prefix}.mtp.{idx}.{eh_proj,enorm,hnorm,shared_head.norm,shared_head.head,
@@ -4919,10 +5120,22 @@ const MtpLayout = enum {
 };
 
 /// Detect MTP layout from the keys present in `weights`. Probes the most
-/// distinctive root-key for each known layout; doesn't validate every weight.
+/// distinctive root-key for each known layout in priority order:
+/// sanitized (most specific — has a non-empty prefix) → raw MTPLX → spec.
+///
+/// `prefix` is the model's `weight_prefix` from config (e.g.
+/// `language_model.model` for VL/MoE, `model` for plain LMs). The sanitized
+/// MTP keys live one level above that — `language_model.mtp.fc.weight` —
+/// because mlx-lm's sanitize lifts the trailing `.model` segment when
+/// re-rooting MTP weights.
 fn detectMtpLayout(weights: *const Weights, prefix: []const u8) MtpLayout {
-    if (weights.get("mtp.fc.weight") != null) return .mtplx;
     var name_buf: [256]u8 = undefined;
+    const trimmed = trimSuffix(prefix, ".model");
+    if (trimmed.len > 0) {
+        const sanitized_probe = std.fmt.bufPrint(&name_buf, "{s}.mtp.fc.weight", .{trimmed}) catch unreachable;
+        if (weights.get(sanitized_probe) != null) return .mtplx_sanitized;
+    }
+    if (weights.get("mtp.fc.weight") != null) return .mtplx;
     const spec_probe = std.fmt.bufPrint(&name_buf, "{s}.mtp.0.eh_proj.weight", .{prefix}) catch unreachable;
     if (weights.get(spec_probe) != null) return .spec;
     return .none;
@@ -4944,7 +5157,25 @@ fn initMtpLayers(
 ) !?[]MtpLayerWeights {
     const layout = detectMtpLayout(weights, config.weight_prefix);
     return switch (layout) {
-        .mtplx => try initMtpLayersMtpLx(allocator, config, weights, name_buf, s, lm_head_w, lm_head_s, lm_head_b),
+        // MTPLX builds the keys without any model-prefix dot infix, so we pass
+        // an empty prefix; pre_shifted=false because the inner & pre-fc norms
+        // are stored in HF delta form and the binder bakes +1 at load.
+        .mtplx => try initMtpLayersMtpLx(allocator, config, weights, name_buf, s, lm_head_w, lm_head_s, lm_head_b, "", false),
+        // mlx-lm-sanitized builds key the standard model prefix
+        // (e.g. `language_model.`) and the sanitize step has already
+        // pre-shifted all norms — skip the load-time +1.
+        .mtplx_sanitized => blk: {
+            // `weight_prefix` is something like "language_model.model"; the
+            // mtp keys live at `{prefix-without-trailing-.model}.mtp.*` —
+            // i.e. immediately under `language_model`, not under `model`.
+            // The trailing dot is appended so the binder can build
+            // `{prefix}mtp.fc.weight` directly. `pbuf` lives on this stack
+            // frame, which is alive for the entire `initMtpLayersMtpLx` call.
+            var pbuf: [256]u8 = undefined;
+            const trimmed = trimSuffix(config.weight_prefix, ".model");
+            const with_dot = std.fmt.bufPrint(&pbuf, "{s}.", .{trimmed}) catch unreachable;
+            break :blk try initMtpLayersMtpLx(allocator, config, weights, name_buf, s, lm_head_w, lm_head_s, lm_head_b, with_dot, true);
+        },
         .spec => try initMtpLayersSpec(allocator, config, weights, name_buf, s, lm_head_w, lm_head_s, lm_head_b),
         .none => {
             log.warn("MTP head metadata present (num_mtp_predict_layers={d}) but no MTP weights found in safetensors — MLX conversion may have stripped them. MTP will be disabled.\n", .{config.num_mtp_predict_layers});
@@ -4953,7 +5184,18 @@ fn initMtpLayers(
     };
 }
 
-/// MTPLX-layout binder. Real-world checkpoint format.
+/// Strip a suffix from `s` if present; otherwise return `s` unchanged.
+fn trimSuffix(s: []const u8, suffix: []const u8) []const u8 {
+    if (s.len >= suffix.len and std.mem.eql(u8, s[s.len - suffix.len ..], suffix)) {
+        return s[0 .. s.len - suffix.len];
+    }
+    return s;
+}
+
+/// MTPLX-layout binder. Handles both the raw MTPLX layout (key_prefix="",
+/// pre_shifted=false) and the mlx-lm-sanitized layout (key_prefix="language_model.",
+/// pre_shifted=true). The two layouts share the same key shape under the prefix;
+/// only the storage convention for inner & pre-fc norms differs.
 fn initMtpLayersMtpLx(
     allocator: std.mem.Allocator,
     config: ModelConfig,
@@ -4963,28 +5205,41 @@ fn initMtpLayersMtpLx(
     lm_head_w: mlx.mlx_array,
     lm_head_s: mlx.mlx_array,
     lm_head_b: mlx.mlx_array,
+    key_prefix: []const u8,
+    pre_shifted: bool,
 ) ![]MtpLayerWeights {
-    log.info("MTP layout: MTPLX (mtp.fc + mtp.layers.0.*); binding {d} layer(s)\n", .{config.num_mtp_predict_layers});
+    if (pre_shifted) {
+        log.info("MTP layout: mlx-lm-sanitized ({s}mtp.fc + {s}mtp.layers.0.*; norms pre-shifted); binding {d} layer(s)\n", .{ key_prefix, key_prefix, config.num_mtp_predict_layers });
+    } else {
+        log.info("MTP layout: MTPLX (mtp.fc + mtp.layers.0.*; norms +1 at load); binding {d} layer(s)\n", .{config.num_mtp_predict_layers});
+    }
     const out = try allocator.alloc(MtpLayerWeights, config.num_mtp_predict_layers);
+
+    // Helper: shifted = take the raw weight as-is; unshifted = bake +1 at load.
+    // The eval batching at the bottom of the loop only needs to evaluate weights
+    // we created via `addOne`, so we track that separately.
+    const maybeAddOne = struct {
+        fn f(raw: mlx.mlx_array, stream: mlx.mlx_stream, do_shift: bool) !mlx.mlx_array {
+            if (!do_shift) return raw;
+            return addOne(raw, stream);
+        }
+    }.f;
 
     for (0..config.num_mtp_predict_layers) |i| {
         const idx: u32 = @intCast(i);
         const lw = &out[i];
 
-        // Inner block weights at `mtp.layers.{idx}.*`. Always full attention
-        // (the MTP block's self-attention shape; observed across published
-        // MTPLX checkpoints) and dense MLP for non-MoE base models.
+        // Inner block weights at `{key_prefix}mtp.layers.{idx}.*`.
         //
-        // CRITICAL: MTPLX bakes a +1 offset into the inner block's
-        // input_layernorm and post_attention_layernorm weights at load time
-        // (despite the main model's norms being direct). Verified against the
-        // live MTPLX runtime — see /tmp/mtp_handwritten.py diagnostic.
-        // Without this offset, the MTP draft is essentially noise (0% accept).
+        // Norm convention: MTPLX stores HF delta-style (centered ~0); we bake
+        // +1 at load. mlx-lm-sanitized has already applied +1 during convert,
+        // so we pass the weight through directly. Without correct shifting,
+        // the MTP draft is near-random noise (~0% accept).
         var inner: MoeLayerWeights = undefined;
-        const inner_input_norm_raw = getMtpLxLayerWeight(weights, name_buf, idx, "input_layernorm.weight");
-        const inner_post_attn_norm_raw = getMtpLxLayerWeight(weights, name_buf, idx, "post_attention_layernorm.weight");
-        inner.input_norm = try addOne(inner_input_norm_raw, s);
-        inner.post_attn_norm = try addOne(inner_post_attn_norm_raw, s);
+        const inner_input_norm_raw = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "input_layernorm.weight");
+        const inner_post_attn_norm_raw = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "post_attention_layernorm.weight");
+        inner.input_norm = try maybeAddOne(inner_input_norm_raw, s, !pre_shifted);
+        inner.post_attn_norm = try maybeAddOne(inner_post_attn_norm_raw, s, !pre_shifted);
         // Eval is batched after enorm/hnorm/eh_proj_w_t below — single sync
         // instead of four separate stream syncs at startup.
         inner.pre_ff_norm = null;
@@ -4997,40 +5252,77 @@ fn initMtpLayersMtpLx(
         inner.is_linear = false;
 
         inner.attn = .{ .full = .{
-            .q_w = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.q_proj.weight"),
-            .q_s = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.q_proj.scales"),
-            .q_b = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.q_proj.biases"),
-            .k_w = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.k_proj.weight"),
-            .k_s = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.k_proj.scales"),
-            .k_b = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.k_proj.biases"),
-            .v_w = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.v_proj.weight"),
-            .v_s = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.v_proj.scales"),
-            .v_b = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.v_proj.biases"),
-            .o_w = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.o_proj.weight"),
-            .o_s = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.o_proj.scales"),
-            .o_b = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.o_proj.biases"),
-            .q_norm = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.q_norm.weight"),
-            .k_norm = getMtpLxLayerWeight(weights, name_buf, idx, "self_attn.k_norm.weight"),
+            .q_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.q_proj.weight"),
+            .q_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.q_proj.scales"),
+            .q_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.q_proj.biases"),
+            .k_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.k_proj.weight"),
+            .k_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.k_proj.scales"),
+            .k_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.k_proj.biases"),
+            .v_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.v_proj.weight"),
+            .v_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.v_proj.scales"),
+            .v_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.v_proj.biases"),
+            .o_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.o_proj.weight"),
+            .o_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.o_proj.scales"),
+            .o_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.o_proj.biases"),
+            .q_norm = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.q_norm.weight"),
+            .k_norm = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "self_attn.k_norm.weight"),
         } };
 
-        inner.mlp = .{ .dense = .{
-            .gate_w = getMtpLxLayerWeight(weights, name_buf, idx, "mlp.gate_proj.weight"),
-            .gate_s = getMtpLxLayerWeight(weights, name_buf, idx, "mlp.gate_proj.scales"),
-            .gate_b = getMtpLxLayerWeight(weights, name_buf, idx, "mlp.gate_proj.biases"),
-            .up_w = getMtpLxLayerWeight(weights, name_buf, idx, "mlp.up_proj.weight"),
-            .up_s = getMtpLxLayerWeight(weights, name_buf, idx, "mlp.up_proj.scales"),
-            .up_b = getMtpLxLayerWeight(weights, name_buf, idx, "mlp.up_proj.biases"),
-            .down_w = getMtpLxLayerWeight(weights, name_buf, idx, "mlp.down_proj.weight"),
-            .down_s = getMtpLxLayerWeight(weights, name_buf, idx, "mlp.down_proj.scales"),
-            .down_b = getMtpLxLayerWeight(weights, name_buf, idx, "mlp.down_proj.biases"),
-        } };
+        // MLP shape: dense for non-MoE bases (Qwen3.5-4B), MoE for MoE bases
+        // (Qwen3.6-35B-A3B). Probe `mlp.gate.weight` (the router) to decide;
+        // dense layers don't have it, MoE always does. Note: `mlp.gate.weight`
+        // is unambiguously the router — dense MLPs use `mlp.gate_proj.weight`
+        // (the GLU gate, with `_proj` suffix).
+        const router_probe_key = std.fmt.bufPrint(name_buf, "{s}mtp.layers.{d}.mlp.gate.weight", .{ key_prefix, idx }) catch unreachable;
+        const is_moe_mlp = weights.get(router_probe_key) != null;
+        if (is_moe_mlp) {
+            inner.mlp = .{ .moe = .{
+                .router_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.gate.weight"),
+                .router_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.gate.scales"),
+                .router_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.gate.biases"),
+                .switch_gate_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.switch_mlp.gate_proj.weight"),
+                .switch_gate_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.switch_mlp.gate_proj.scales"),
+                .switch_gate_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.switch_mlp.gate_proj.biases"),
+                .switch_up_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.switch_mlp.up_proj.weight"),
+                .switch_up_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.switch_mlp.up_proj.scales"),
+                .switch_up_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.switch_mlp.up_proj.biases"),
+                .switch_down_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.switch_mlp.down_proj.weight"),
+                .switch_down_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.switch_mlp.down_proj.scales"),
+                .switch_down_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.switch_mlp.down_proj.biases"),
+                .shared_gate_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert.gate_proj.weight"),
+                .shared_gate_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert.gate_proj.scales"),
+                .shared_gate_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert.gate_proj.biases"),
+                .shared_up_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert.up_proj.weight"),
+                .shared_up_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert.up_proj.scales"),
+                .shared_up_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert.up_proj.biases"),
+                .shared_down_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert.down_proj.weight"),
+                .shared_down_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert.down_proj.scales"),
+                .shared_down_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert.down_proj.biases"),
+                .shared_expert_gate_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert_gate.weight"),
+                .shared_expert_gate_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert_gate.scales"),
+                .shared_expert_gate_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.shared_expert_gate.biases"),
+            } };
+        } else {
+            inner.mlp = .{ .dense = .{
+                .gate_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.gate_proj.weight"),
+                .gate_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.gate_proj.scales"),
+                .gate_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.gate_proj.biases"),
+                .up_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.up_proj.weight"),
+                .up_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.up_proj.scales"),
+                .up_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.up_proj.biases"),
+                .down_w = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.down_proj.weight"),
+                .down_s = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.down_proj.scales"),
+                .down_b = getMtpLxLayerWeight(weights, name_buf, key_prefix, idx, "mlp.down_proj.biases"),
+            } };
+        }
 
         lw.inner = inner;
 
         // mtp.fc is a single dense BF16 projection [hidden, 2*hidden].
         // No scales/biases (not quantized) — mtpForward branches on `eh_proj_quantized`.
-        lw.eh_proj_w = weights.get("mtp.fc.weight") orelse {
-            log.err("MISSING WEIGHT: mtp.fc.weight\n", .{});
+        const fc_key = std.fmt.bufPrint(name_buf, "{s}mtp.fc.weight", .{key_prefix}) catch unreachable;
+        lw.eh_proj_w = weights.get(fc_key) orelse {
+            log.err("MISSING WEIGHT: {s}\n", .{fc_key});
             return error.MissingWeight;
         };
         lw.eh_proj_s = mlx.mlx_array_new();
@@ -5048,45 +5340,51 @@ fn initMtpLayersMtpLx(
         lw.eh_proj_w_t = w_t;
         lw.eh_proj_w_t_owned = true;
 
-        // MTPLX norms: pre_fc_norm_embedding and pre_fc_norm_hidden ALWAYS
-        // get the +1 offset baked at load time (matching MTPLX's runtime
-        // load_mtp_weights pass), regardless of the main model's
-        // `norm_has_offset` convention. mtp.norm itself is loaded direct.
-        // Skipping the +1 makes the MTP draft essentially random noise; we
-        // confirmed via diagnostic against the live mtplx Python runtime.
-        const enorm_raw = weights.get("mtp.pre_fc_norm_embedding.weight") orelse return error.MissingWeight;
-        const hnorm_raw = weights.get("mtp.pre_fc_norm_hidden.weight") orelse return error.MissingWeight;
-        const shead_norm_raw = weights.get("mtp.norm.weight") orelse return error.MissingWeight;
+        // pre_fc_norm_{embedding,hidden}: stored un-shifted in MTPLX → +1 at load;
+        // pre-shifted by mlx-lm sanitize → pass through.
+        // mtp.norm (= shared_head_norm): pre-shifted in BOTH layouts (mlx-lm's
+        // sanitize doesn't match this key path; MTPLX bakes +1 at convert).
+        const enorm_key = std.fmt.bufPrint(name_buf, "{s}mtp.pre_fc_norm_embedding.weight", .{key_prefix}) catch unreachable;
+        const enorm_raw = weights.get(enorm_key) orelse return error.MissingWeight;
+        const hnorm_key = std.fmt.bufPrint(name_buf, "{s}mtp.pre_fc_norm_hidden.weight", .{key_prefix}) catch unreachable;
+        const hnorm_raw = weights.get(hnorm_key) orelse return error.MissingWeight;
+        const shead_norm_key = std.fmt.bufPrint(name_buf, "{s}mtp.norm.weight", .{key_prefix}) catch unreachable;
+        const shead_norm_raw = weights.get(shead_norm_key) orelse return error.MissingWeight;
 
-        lw.enorm = try addOne(enorm_raw, s);
-        lw.hnorm = try addOne(hnorm_raw, s);
-        lw.eh_norms_owned = true;
+        lw.enorm = try maybeAddOne(enorm_raw, s, !pre_shifted);
+        lw.hnorm = try maybeAddOne(hnorm_raw, s, !pre_shifted);
+        // Owned only when we created new arrays via addOne. Sanitized layout
+        // shares refs with weights.map and must not free them.
+        lw.eh_norms_owned = !pre_shifted;
+        lw.inner_norms_owned = !pre_shifted;
 
-        // Single batched eval for all four addOne'd norms + the transposed
-        // eh_proj weight. Saves three stream syncs at startup vs the previous
-        // per-array eval pattern. Order in the vector doesn't matter — they
-        // share no dependencies.
+        // Batched eval. With pre-shifted norms there's nothing freshly allocated
+        // to evaluate except the eh_proj transpose; with the +1-baked path we
+        // also need to materialize the four addOne'd norms in a single sync.
         const all_norms = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(all_norms);
-        _ = mlx.mlx_vector_array_append_value(all_norms, inner.input_norm);
-        _ = mlx.mlx_vector_array_append_value(all_norms, inner.post_attn_norm);
-        _ = mlx.mlx_vector_array_append_value(all_norms, lw.enorm);
-        _ = mlx.mlx_vector_array_append_value(all_norms, lw.hnorm);
+        if (!pre_shifted) {
+            _ = mlx.mlx_vector_array_append_value(all_norms, inner.input_norm);
+            _ = mlx.mlx_vector_array_append_value(all_norms, inner.post_attn_norm);
+            _ = mlx.mlx_vector_array_append_value(all_norms, lw.enorm);
+            _ = mlx.mlx_vector_array_append_value(all_norms, lw.hnorm);
+        }
         _ = mlx.mlx_vector_array_append_value(all_norms, w_t);
         try mlx.check(mlx.mlx_eval(all_norms));
-        // shared_head_norm = mtp.norm — passes through direct (no +1).
+        // shared_head_norm = mtp.norm — passes through direct in BOTH layouts.
         lw.shared_head_norm = shead_norm_raw;
         lw.shared_head_norm_owned = false;
-        // inner-block norms were addOne'd above (MTPLX convention).
-        lw.inner_norms_owned = true;
 
-        // shared_head: MTPLX format ties to model's lm_head when no separate
-        // `mtp.head.*` weight is present (the case for Qwen3.5 base where
-        // `tie_word_embeddings = true` makes lm_head an alias of embed_tokens).
-        if (weights.get("mtp.head.weight")) |w| {
+        // shared_head: ties to model's lm_head when no separate `mtp.head.*`
+        // weight is present (Qwen3.5 base with `tie_word_embeddings = true`).
+        // Each `weights.get(...)` resolves before the next bufPrint overwrites.
+        const head_w_key = std.fmt.bufPrint(name_buf, "{s}mtp.head.weight", .{key_prefix}) catch unreachable;
+        if (weights.get(head_w_key)) |w| {
             lw.shared_head_w = w;
-            lw.shared_head_s = weights.get("mtp.head.scales") orelse mlx.mlx_array_new();
-            lw.shared_head_b = weights.get("mtp.head.biases") orelse mlx.mlx_array_new();
+            const head_s_key = std.fmt.bufPrint(name_buf, "{s}mtp.head.scales", .{key_prefix}) catch unreachable;
+            lw.shared_head_s = weights.get(head_s_key) orelse mlx.mlx_array_new();
+            const head_b_key = std.fmt.bufPrint(name_buf, "{s}mtp.head.biases", .{key_prefix}) catch unreachable;
+            lw.shared_head_b = weights.get(head_b_key) orelse mlx.mlx_array_new();
             lw.shared_head_tied = false;
         } else {
             lw.shared_head_w = lm_head_w;
@@ -5098,8 +5396,8 @@ fn initMtpLayersMtpLx(
     return out;
 }
 
-fn getMtpLxLayerWeight(weights: *const Weights, buf: *[256]u8, idx: u32, suffix: []const u8) mlx.mlx_array {
-    const name = std.fmt.bufPrint(buf, "mtp.layers.{d}.{s}", .{ idx, suffix }) catch unreachable;
+fn getMtpLxLayerWeight(weights: *const Weights, buf: *[256]u8, key_prefix: []const u8, idx: u32, suffix: []const u8) mlx.mlx_array {
+    const name = std.fmt.bufPrint(buf, "{s}mtp.layers.{d}.{s}", .{ key_prefix, idx, suffix }) catch unreachable;
     return weights.get(name) orelse {
         log.err("MISSING WEIGHT: {s}\n", .{name});
         unreachable;
@@ -5447,12 +5745,15 @@ fn appendFullAttnWeights(vec: mlx.mlx_vector_array, fa: *const FullAttnWeights) 
 
 fn appendLinearAttnWeights(vec: mlx.mlx_vector_array, la: *const LinearAttnWeights) void {
     inline for (std.meta.fields(LinearAttnWeights)) |field| {
-        if (field.type != mlx.mlx_array) continue;
-        if (comptime std.mem.startsWith(u8, field.name, "z_") or std.mem.startsWith(u8, field.name, "a_")) {
-            if (!la.combined_proj)
-                _ = mlx.mlx_vector_array_append_value(vec, @field(la, field.name));
-        } else {
-            _ = mlx.mlx_vector_array_append_value(vec, @field(la, field.name));
+        if (comptime field.type != mlx.mlx_array) continue;
+        const za_field = comptime std.mem.startsWith(u8, field.name, "z_") or std.mem.startsWith(u8, field.name, "a_");
+        const skip_za = za_field and la.combined_proj;
+        if (!skip_za) {
+            const arr = @field(la, field.name);
+            // Plain-bf16 layers (Unsloth Dynamic) carry null scales/biases — skip those.
+            if (arr.ctx != null) {
+                _ = mlx.mlx_vector_array_append_value(vec, arr);
+            }
         }
     }
 }
@@ -5490,6 +5791,16 @@ fn detectQuantBits(w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
 }
 
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    // Plain BF16 weight: scales array is unset. Used by mixed-precision Unsloth
+    // Dynamic checkpoints that leave a subset of layers (e.g. linear_attn
+    // projections in Qwen3.6 UD) unquantized. The weight is pre-transposed at
+    // load to [in, out] so a single mlx_matmul does the contraction.
+    if (sc.ctx == null) {
+        var fp_result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_matmul(&fp_result, x, w, s));
+        return fp_result;
+    }
+
     // Detect mxfp8 mode: biases array has null ctx (created with mlx_array_new())
     const is_mxfp = bi.ctx == null;
 
@@ -6293,6 +6604,175 @@ test "initMtpLayers detects tied shared_head when shared_head.head.weight is abs
     try testing.expectEqual(lm_head_b.ctx, mtp_layers[0].shared_head_b.ctx);
 }
 
+test "QuantParamsCache put/lookup round-trip" {
+    var cache: BitsCache = .{};
+    const s = mlx.gpuStream();
+
+    // Three real arrays with distinct ctx pointers — the cache keys.
+    var a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a);
+    var b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b);
+    var c = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(c);
+    const shape = [_]c_int{8};
+    try mlx.check(mlx.mlx_zeros(&a, &shape, 1, .bfloat16, s));
+    try mlx.check(mlx.mlx_zeros(&b, &shape, 1, .bfloat16, s));
+    try mlx.check(mlx.mlx_zeros(&c, &shape, 1, .bfloat16, s));
+
+    try testing.expect(cache.put(a.ctx.?, 4, 32));
+    try testing.expect(cache.put(b.ctx.?, 4, 64));
+    try testing.expect(cache.put(c.ctx.?, 8, 128));
+
+    // Build a Transformer-like view over the cache via quantParamsFor — we
+    // need a real Transformer to call the method, so verify by direct slot
+    // lookup instead. (The forward path goes through quantParamsFor, which is
+    // exercised by integration tests; this test pins the data structure.)
+    {
+        const idx = BitsCache.slot(a.ctx.?);
+        var found = false;
+        for (0..4) |i| {
+            const j = (idx + i) & (BITS_CACHE_CAP - 1);
+            if (cache.keys[j] == a.ctx) {
+                try testing.expectEqual(@as(u8, 4), cache.vals_bits[j]);
+                try testing.expectEqual(@as(u8, 32 / 8), cache.vals_gs_div8[j]);
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+    {
+        const idx = BitsCache.slot(c.ctx.?);
+        var found = false;
+        for (0..4) |i| {
+            const j = (idx + i) & (BITS_CACHE_CAP - 1);
+            if (cache.keys[j] == c.ctx) {
+                try testing.expectEqual(@as(u8, 8), cache.vals_bits[j]);
+                try testing.expectEqual(@as(u8, 128 / 8), cache.vals_gs_div8[j]);
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+}
+
+test "prepopulateMtpQuantParams pins MTP scales but skips tied shared_head" {
+    // Models with tied shared_head (Qwen3-Next, Qwen3.5/3.6 MTPLX) ship the
+    // MTP head sharing lm_head's scales array. Pinning MTP-specific quant
+    // params there would corrupt the main forward's lm_head matmul. Verify
+    // that the pin skips it when shared_head_tied=true.
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    var weights = model_mod.Weights.init(allocator);
+    defer weights.deinit();
+
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen3_next";
+    config.weight_prefix = "model";
+    config.has_mtp = true;
+    config.num_mtp_predict_layers = 1;
+    config.num_hidden_layers = 4;
+    config.full_attention_interval = 0;
+    config.has_qk_norm = true;
+    config.num_experts = 0;
+    config.norm_has_offset = false;
+
+    // Populate without `shared_head.head.*` keys → triggers tied-head path.
+    const std_layer_keys = [_][]const u8{
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_proj.weight",     "self_attn.q_proj.scales",     "self_attn.q_proj.biases",
+        "self_attn.k_proj.weight",     "self_attn.k_proj.scales",     "self_attn.k_proj.biases",
+        "self_attn.v_proj.weight",     "self_attn.v_proj.scales",     "self_attn.v_proj.biases",
+        "self_attn.o_proj.weight",     "self_attn.o_proj.scales",     "self_attn.o_proj.biases",
+        "self_attn.q_norm.weight",     "self_attn.k_norm.weight",
+        "mlp.gate_proj.weight",        "mlp.gate_proj.scales",        "mlp.gate_proj.biases",
+        "mlp.up_proj.weight",          "mlp.up_proj.scales",          "mlp.up_proj.biases",
+        "mlp.down_proj.weight",        "mlp.down_proj.scales",        "mlp.down_proj.biases",
+    };
+    const small_shape = [_]c_int{8};
+    for (std_layer_keys) |suffix| {
+        const key = try std.fmt.allocPrint(allocator, "model.mtp.0.{s}", .{suffix});
+        defer allocator.free(key);
+        // Use real arrays for scales (so they have non-null ctx); zeros for the rest.
+        try putRealWeightZeros(&weights, allocator, key, &small_shape, s);
+    }
+    const norm_keys = [_][]const u8{ "enorm.weight", "hnorm.weight", "shared_head.norm.weight", "eh_proj.weight", "eh_proj.scales", "eh_proj.biases" };
+    for (norm_keys) |suffix| {
+        const key = try std.fmt.allocPrint(allocator, "model.mtp.0.{s}", .{suffix});
+        defer allocator.free(key);
+        try putRealWeightZeros(&weights, allocator, key, &small_shape, s);
+    }
+
+    // Real lm_head scales array (untied target). prepopulate must NOT touch it.
+    var lm_head_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lm_head_w);
+    var lm_head_s = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lm_head_s);
+    var lm_head_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lm_head_b);
+    try mlx.check(mlx.mlx_zeros(&lm_head_w, &small_shape, 1, .bfloat16, s));
+    try mlx.check(mlx.mlx_zeros(&lm_head_s, &small_shape, 1, .bfloat16, s));
+    try mlx.check(mlx.mlx_zeros(&lm_head_b, &small_shape, 1, .bfloat16, s));
+
+    var name_buf: [256]u8 = undefined;
+    const mtp_layers_opt = try initMtpLayers(allocator, config, &weights, &name_buf, s, lm_head_w, lm_head_s, lm_head_b);
+    const mtp_layers = mtp_layers_opt orelse return error.TestExpectedNonNull;
+    defer freeMtpLayers(allocator, mtp_layers);
+
+    // Tied: the binder aliased shared_head_s to lm_head_s.
+    try testing.expect(mtp_layers[0].shared_head_tied);
+    try testing.expectEqual(lm_head_s.ctx, mtp_layers[0].shared_head_s.ctx);
+
+    var cache: BitsCache = .{};
+    prepopulateMtpQuantParams(&cache, mtp_layers, 4, 32);
+
+    // The MTP q/k/v/o + MLP scales should all be pinned at (4, 32).
+    const expect_pinned = [_]mlx.mlx_array{
+        mtp_layers[0].inner.attn.full.q_s,
+        mtp_layers[0].inner.attn.full.k_s,
+        mtp_layers[0].inner.attn.full.v_s,
+        mtp_layers[0].inner.attn.full.o_s,
+        mtp_layers[0].inner.mlp.dense.gate_s,
+        mtp_layers[0].inner.mlp.dense.up_s,
+        mtp_layers[0].inner.mlp.dense.down_s,
+    };
+    for (expect_pinned) |sc| {
+        const key = sc.ctx orelse return error.TestExpectedNonNullCtx;
+        const idx = BitsCache.slot(key);
+        var found = false;
+        for (0..4) |i| {
+            const j = (idx + i) & (BITS_CACHE_CAP - 1);
+            if (cache.keys[j] == key) {
+                try testing.expectEqual(@as(u8, 4), cache.vals_bits[j]);
+                try testing.expectEqual(@as(u8, 32 / 8), cache.vals_gs_div8[j]);
+                found = true;
+                break;
+            }
+        }
+        try testing.expect(found);
+    }
+
+    // The lm_head_s pointer (which is also shared_head_s here, due to tied)
+    // must NOT be in the cache — that would corrupt main lm_head with MTP params.
+    {
+        const key = lm_head_s.ctx orelse return error.TestExpectedNonNullCtx;
+        const idx = BitsCache.slot(key);
+        var poisoned = false;
+        for (0..4) |i| {
+            const j = (idx + i) & (BITS_CACHE_CAP - 1);
+            if (cache.keys[j] == key) {
+                poisoned = true;
+                break;
+            }
+        }
+        try testing.expect(!poisoned);
+    }
+}
+
 test "initMtpLayers bakes +1 offset into hnorm, enorm, shared_head_norm only when norm_has_offset" {
     // For models that need the +1 convention (`norm_has_offset=true`), the
     // binder pre-bakes addOne so the runtime path is a single rmsNorm. For
@@ -6370,4 +6850,374 @@ test "initMtpLayers bakes +1 offset into hnorm, enorm, shared_head_norm only whe
         try testing.expect(!mtp_layers[0].eh_norms_owned);
         try testing.expectEqual(src_hnorm_ctx, mtp_layers[0].hnorm.ctx);
     }
+}
+
+test "trimSuffix strips matching trailing component" {
+    try testing.expectEqualStrings("language_model", trimSuffix("language_model.model", ".model"));
+    try testing.expectEqualStrings("model", trimSuffix("model", ".model")); // no leading dot match → unchanged
+    try testing.expectEqualStrings("foo", trimSuffix("foo", ".model"));
+    try testing.expectEqualStrings("", trimSuffix(".model", ".model"));
+}
+
+test "detectMtpLayout distinguishes mtplx, mtplx_sanitized, spec, none" {
+    const allocator = testing.allocator;
+
+    // ── none ──
+    {
+        var weights = model_mod.Weights.init(allocator);
+        defer weights.deinit();
+        try testing.expectEqual(MtpLayout.none, detectMtpLayout(&weights, "language_model.model"));
+    }
+
+    // ── mtplx (raw, no prefix) ──
+    {
+        var weights = model_mod.Weights.init(allocator);
+        defer weights.deinit();
+        try putStubWeight(&weights, allocator, "mtp.fc.weight");
+        try testing.expectEqual(MtpLayout.mtplx, detectMtpLayout(&weights, "language_model.model"));
+    }
+
+    // ── mtplx_sanitized (prefix.mtp.fc.weight) ──
+    // NB: takes priority over raw MTPLX when both keys exist (we probe the
+    // more-specific one first).
+    {
+        var weights = model_mod.Weights.init(allocator);
+        defer weights.deinit();
+        try putStubWeight(&weights, allocator, "language_model.mtp.fc.weight");
+        try testing.expectEqual(MtpLayout.mtplx_sanitized, detectMtpLayout(&weights, "language_model.model"));
+    }
+
+    // ── spec (`{prefix}.mtp.0.eh_proj.weight`) ──
+    {
+        var weights = model_mod.Weights.init(allocator);
+        defer weights.deinit();
+        try putStubWeight(&weights, allocator, "model.mtp.0.eh_proj.weight");
+        try testing.expectEqual(MtpLayout.spec, detectMtpLayout(&weights, "model"));
+    }
+
+    // ── empty prefix doesn't accidentally probe `mtp.fc.weight` as sanitized ──
+    {
+        var weights = model_mod.Weights.init(allocator);
+        defer weights.deinit();
+        try putStubWeight(&weights, allocator, "mtp.fc.weight");
+        try testing.expectEqual(MtpLayout.mtplx, detectMtpLayout(&weights, ""));
+    }
+}
+
+/// Mock builder for the mlx-lm-sanitized MTP layout. Same shape as
+/// `populateMockMtpFullDenseUntied` but uses `language_model.mtp.*` prefix
+/// (no `language_model.model.mtp.*` — sanitize lifts the `.model.` segment).
+fn populateMockMtpSanitizedFullDenseUntied(
+    weights: *model_mod.Weights,
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+) !void {
+    const small = [_]c_int{8};
+    const std_layer_keys = [_][]const u8{
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_proj.weight",     "self_attn.q_proj.scales",     "self_attn.q_proj.biases",
+        "self_attn.k_proj.weight",     "self_attn.k_proj.scales",     "self_attn.k_proj.biases",
+        "self_attn.v_proj.weight",     "self_attn.v_proj.scales",     "self_attn.v_proj.biases",
+        "self_attn.o_proj.weight",     "self_attn.o_proj.scales",     "self_attn.o_proj.biases",
+        "self_attn.q_norm.weight",     "self_attn.k_norm.weight",
+        "mlp.gate_proj.weight",        "mlp.gate_proj.scales",        "mlp.gate_proj.biases",
+        "mlp.up_proj.weight",          "mlp.up_proj.scales",          "mlp.up_proj.biases",
+        "mlp.down_proj.weight",        "mlp.down_proj.scales",        "mlp.down_proj.biases",
+    };
+    for (std_layer_keys) |suffix| {
+        const key = try std.fmt.allocPrint(allocator, "language_model.mtp.layers.0.{s}", .{suffix});
+        defer allocator.free(key);
+        // Real arrays so the binder's pass-through (no addOne) preserves a valid ctx.
+        try putRealWeightZeros(weights, allocator, key, &small, s);
+    }
+    const mtp_norms = [_][]const u8{
+        "language_model.mtp.pre_fc_norm_embedding.weight",
+        "language_model.mtp.pre_fc_norm_hidden.weight",
+        "language_model.mtp.norm.weight",
+    };
+    for (mtp_norms) |k| try putRealWeightZeros(weights, allocator, k, &small, s);
+    // mtp.fc.weight is 2D [hidden, 2*hidden] — the binder transposes it at load.
+    const fc_shape = [_]c_int{ 8, 16 };
+    try putRealWeightZeros(weights, allocator, "language_model.mtp.fc.weight", &fc_shape, s);
+}
+
+test "initMtpLayers binds mtplx_sanitized layout without addOne (norms are pre-shifted)" {
+    // When `mtplx_sanitized` is detected, the binder must NOT bake +1 into the
+    // inner-block / pre-fc norms — they're already shifted by mlx-lm's
+    // sanitize pass. Verify both ownership flags and ctx-equality (binder
+    // returns the raw weights.map ref, not a freshly-allocated addOne array).
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    var weights = model_mod.Weights.init(allocator);
+    defer weights.deinit();
+
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen3_5_moe";
+    config.weight_prefix = "language_model.model"; // VL/MoE models nest under language_model
+    config.has_mtp = true;
+    config.num_mtp_predict_layers = 1;
+    config.num_hidden_layers = 4;
+    config.full_attention_interval = 0;
+    config.has_qk_norm = true;
+    config.num_experts = 0;
+    // norm_has_offset doesn't gate MTPLX/sanitized binder behavior — the
+    // pre_shifted flag does.
+    config.norm_has_offset = false;
+
+    try populateMockMtpSanitizedFullDenseUntied(&weights, allocator, s);
+    const src_input_norm_ctx = weights.get("language_model.mtp.layers.0.input_layernorm.weight").?.ctx;
+    const src_enorm_ctx = weights.get("language_model.mtp.pre_fc_norm_embedding.weight").?.ctx;
+    const src_hnorm_ctx = weights.get("language_model.mtp.pre_fc_norm_hidden.weight").?.ctx;
+
+    const lm_head_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lm_head_w);
+    const lm_head_s = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lm_head_s);
+    const lm_head_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lm_head_b);
+
+    var name_buf: [256]u8 = undefined;
+    const mtp_layers_opt = try initMtpLayers(allocator, config, &weights, &name_buf, s, lm_head_w, lm_head_s, lm_head_b);
+    const mtp_layers = mtp_layers_opt orelse return error.TestExpectedNonNull;
+    defer freeMtpLayers(allocator, mtp_layers);
+
+    // Binder must pass through, not bake +1 → ctx pointers identical to
+    // weights.map and ownership flags false (no double-free risk).
+    try testing.expect(!mtp_layers[0].eh_norms_owned);
+    try testing.expect(!mtp_layers[0].inner_norms_owned);
+    try testing.expectEqual(src_input_norm_ctx, mtp_layers[0].inner.input_norm.ctx);
+    try testing.expectEqual(src_enorm_ctx, mtp_layers[0].enorm.ctx);
+    try testing.expectEqual(src_hnorm_ctx, mtp_layers[0].hnorm.ctx);
+    // shared_head ties to lm_head when no `language_model.mtp.head.*` keys exist.
+    try testing.expect(mtp_layers[0].shared_head_tied);
+    try testing.expectEqual(lm_head_s.ctx, mtp_layers[0].shared_head_s.ctx);
+    // Dense MLP path (no router) — Qwen3.5-4B / 27B-mtp shape.
+    try testing.expect(mtp_layers[0].inner.mlp == .dense);
+}
+
+/// Mock builder for the mlx-lm-sanitized MTP layout WITH MoE inner MLP —
+/// matches Qwen3.6-35B-A3B's MTP shape after our convert_with_mtp.py runs.
+fn populateMockMtpSanitizedMoe(
+    weights: *model_mod.Weights,
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+) !void {
+    const small = [_]c_int{8};
+    const fc_shape = [_]c_int{ 8, 16 };
+
+    const attn_keys = [_][]const u8{
+        "input_layernorm.weight",
+        "post_attention_layernorm.weight",
+        "self_attn.q_proj.weight",     "self_attn.q_proj.scales",     "self_attn.q_proj.biases",
+        "self_attn.k_proj.weight",     "self_attn.k_proj.scales",     "self_attn.k_proj.biases",
+        "self_attn.v_proj.weight",     "self_attn.v_proj.scales",     "self_attn.v_proj.biases",
+        "self_attn.o_proj.weight",     "self_attn.o_proj.scales",     "self_attn.o_proj.biases",
+        "self_attn.q_norm.weight",     "self_attn.k_norm.weight",
+    };
+    for (attn_keys) |suffix| {
+        const key = try std.fmt.allocPrint(allocator, "language_model.mtp.layers.0.{s}", .{suffix});
+        defer allocator.free(key);
+        try putRealWeightZeros(weights, allocator, key, &small, s);
+    }
+
+    // MoE-MTP: router + switch_mlp.* + shared_expert.* + shared_expert_gate.*
+    const moe_keys = [_][]const u8{
+        "mlp.gate.weight",                          "mlp.gate.scales",                          "mlp.gate.biases",
+        "mlp.switch_mlp.gate_proj.weight",          "mlp.switch_mlp.gate_proj.scales",          "mlp.switch_mlp.gate_proj.biases",
+        "mlp.switch_mlp.up_proj.weight",            "mlp.switch_mlp.up_proj.scales",            "mlp.switch_mlp.up_proj.biases",
+        "mlp.switch_mlp.down_proj.weight",          "mlp.switch_mlp.down_proj.scales",          "mlp.switch_mlp.down_proj.biases",
+        "mlp.shared_expert.gate_proj.weight",       "mlp.shared_expert.gate_proj.scales",       "mlp.shared_expert.gate_proj.biases",
+        "mlp.shared_expert.up_proj.weight",         "mlp.shared_expert.up_proj.scales",         "mlp.shared_expert.up_proj.biases",
+        "mlp.shared_expert.down_proj.weight",       "mlp.shared_expert.down_proj.scales",       "mlp.shared_expert.down_proj.biases",
+        "mlp.shared_expert_gate.weight",            "mlp.shared_expert_gate.scales",            "mlp.shared_expert_gate.biases",
+    };
+    for (moe_keys) |suffix| {
+        const key = try std.fmt.allocPrint(allocator, "language_model.mtp.layers.0.{s}", .{suffix});
+        defer allocator.free(key);
+        try putRealWeightZeros(weights, allocator, key, &small, s);
+    }
+
+    const top_norms = [_][]const u8{
+        "language_model.mtp.pre_fc_norm_embedding.weight",
+        "language_model.mtp.pre_fc_norm_hidden.weight",
+        "language_model.mtp.norm.weight",
+    };
+    for (top_norms) |k| try putRealWeightZeros(weights, allocator, k, &small, s);
+    try putRealWeightZeros(weights, allocator, "language_model.mtp.fc.weight", &fc_shape, s);
+}
+
+test "initMtpLayers binds MoE-shaped MTP MLP when router weight is present" {
+    // Qwen3.6-35B-A3B (and similar MoE bases) ship MTP layers with MoE inside —
+    // a router gate + switch_mlp expert tensors + shared_expert + shared_expert_gate.
+    // The binder must detect the router via `mlp.gate.weight` and use the .moe
+    // branch so `mtpForward` dispatches to `moeMLP` not `denseMLP`.
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    var weights = model_mod.Weights.init(allocator);
+    defer weights.deinit();
+
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen3_5_moe";
+    config.weight_prefix = "language_model.model";
+    config.has_mtp = true;
+    config.num_mtp_predict_layers = 1;
+    config.num_hidden_layers = 4;
+    config.full_attention_interval = 0;
+    config.has_qk_norm = true;
+    // num_experts > 0 just for config self-consistency; the binder probes
+    // weights for the actual MoE detection.
+    config.num_experts = 128;
+    config.norm_has_offset = false;
+
+    try populateMockMtpSanitizedMoe(&weights, allocator, s);
+
+    const lm_head_w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lm_head_w);
+    const lm_head_s = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lm_head_s);
+    const lm_head_b = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lm_head_b);
+
+    var name_buf: [256]u8 = undefined;
+    const mtp_layers_opt = try initMtpLayers(allocator, config, &weights, &name_buf, s, lm_head_w, lm_head_s, lm_head_b);
+    const mtp_layers = mtp_layers_opt orelse return error.TestExpectedNonNull;
+    defer freeMtpLayers(allocator, mtp_layers);
+
+    try testing.expect(mtp_layers[0].inner.mlp == .moe);
+
+    // Verify the router and shared_expert_gate scales got bound (not nulls).
+    const moe = mtp_layers[0].inner.mlp.moe;
+    try testing.expect(moe.router_w.ctx != null);
+    try testing.expect(moe.switch_gate_w.ctx != null);
+    try testing.expect(moe.switch_down_w.ctx != null);
+    try testing.expect(moe.shared_gate_w.ctx != null);
+    try testing.expect(moe.shared_expert_gate_w != null);
+    try testing.expect(moe.shared_expert_gate_w.?.ctx != null);
+
+    // prepopulateMtpQuantParams must walk MoE scales too — verify by pinning
+    // and checking one of them shows up in the cache at our chosen params.
+    var cache: BitsCache = .{};
+    prepopulateMtpQuantParams(&cache, mtp_layers, 4, 32);
+    const sw_gate_key = moe.switch_gate_s.ctx.?;
+    const idx = BitsCache.slot(sw_gate_key);
+    var found = false;
+    for (0..4) |i| {
+        const j = (idx + i) & (BITS_CACHE_CAP - 1);
+        if (cache.keys[j] == sw_gate_key) {
+            try testing.expectEqual(@as(u8, 4), cache.vals_bits[j]);
+            try testing.expectEqual(@as(u8, 32 / 8), cache.vals_gs_div8[j]);
+            found = true;
+            break;
+        }
+    }
+    try testing.expect(found);
+}
+
+test "qmatmulBits dispatches to plain matmul when scales has null ctx (Unsloth Dynamic bf16)" {
+    const s = mlx.gpuStream();
+
+    // x: [1, 1, in=4], w: [out=2, in=4] (PyTorch convention).
+    // Expected: x @ w.T = [1, 1, 2]
+    var x_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x_flat);
+    try mlx.check(mlx.mlx_arange(&x_flat, 0.0, 4.0, 1.0, .float32, s));
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    {
+        const sh = [_]c_int{ 1, 1, 4 };
+        try mlx.check(mlx.mlx_reshape(&x, x_flat, &sh, 3, s));
+    }
+
+    var w_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_flat);
+    try mlx.check(mlx.mlx_arange(&w_flat, 0.0, 8.0, 1.0, .float32, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    {
+        const sh = [_]c_int{ 2, 4 };
+        try mlx.check(mlx.mlx_reshape(&w, w_flat, &sh, 2, s));
+    }
+
+    // Pre-transpose like initMoeLayers does for null-scales weights: [out, in] → [in, out]
+    const w_t = try transposeBf16Weight(w, s);
+    defer _ = mlx.mlx_array_free(w_t);
+
+    // qmatmulBits with null sc/bi must plain-matmul x @ w_t.
+    const null_sc = mlx.mlx_array{ .ctx = null };
+    const null_bi = mlx.mlx_array{ .ctx = null };
+    const got = try qmatmulBits(x, w_t, null_sc, null_bi, 4, 64, s);
+    defer _ = mlx.mlx_array_free(got);
+
+    // Reduce to host floats for comparison.
+    var got_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got_f32);
+    try mlx.check(mlx.mlx_astype(&got_f32, got, .float32, s));
+    var got_flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(got_flat);
+    {
+        const sh = [_]c_int{2};
+        try mlx.check(mlx.mlx_reshape(&got_flat, got_f32, &sh, 1, s));
+    }
+    {
+        const ev = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ev);
+        _ = mlx.mlx_vector_array_append_value(ev, got_flat);
+        try mlx.check(mlx.mlx_eval(ev));
+    }
+    const data = mlx.mlx_array_data_float32(got_flat) orelse return error.TestUnexpectedNullData;
+    // [0,1,2,3] @ [[0,4],[1,5],[2,6],[3,7]] = [0+1*1+2*2+3*3, 0+1*5+2*6+3*7] = [14, 38]
+    // (w transposed from [[0,1,2,3],[4,5,6,7]] gives w_t = [[0,4],[1,5],[2,6],[3,7]])
+    try testing.expectApproxEqAbs(@as(f32, 14.0), data[0], 1e-3);
+    try testing.expectApproxEqAbs(@as(f32, 38.0), data[1], 1e-3);
+}
+
+test "appendLinearAttnWeights skips fields with null ctx (plain bf16 layers)" {
+    const s = mlx.gpuStream();
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+
+    // Real arrays for the 9 non-scale/bias fields so they have non-null ctx.
+    const sh = [_]c_int{1};
+    var arrs: [9]mlx.mlx_array = undefined;
+    for (&arrs) |*a| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(a, &sh, 1, .bfloat16, s));
+    }
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+
+    // Simulate the UD layout: weights set, scales/biases null.
+    const la: LinearAttnWeights = .{
+        .combined_proj = false,
+        .qkv_w = arrs[0],
+        .qkv_s = mlx.mlx_array{ .ctx = null },
+        .qkv_b = mlx.mlx_array{ .ctx = null },
+        .z_w = arrs[1],
+        .z_s = mlx.mlx_array{ .ctx = null },
+        .z_b = mlx.mlx_array{ .ctx = null },
+        .a_w = arrs[2],
+        .a_s = mlx.mlx_array{ .ctx = null },
+        .a_b = mlx.mlx_array{ .ctx = null },
+        .b_w = arrs[3],
+        .b_s = mlx.mlx_array{ .ctx = null },
+        .b_b = mlx.mlx_array{ .ctx = null },
+        .conv1d_w = arrs[4],
+        .A_log = arrs[5],
+        .dt_bias = arrs[6],
+        .norm_w = arrs[7],
+        .out_w = arrs[8],
+        .out_s = mlx.mlx_array{ .ctx = null },
+        .out_b = mlx.mlx_array{ .ctx = null },
+    };
+
+    appendLinearAttnWeights(vec, &la);
+
+    // Of 19 mlx_array fields: 5 weights (qkv/z/a/b/out) + 4 SSM bits
+    // (conv1d/A_log/dt_bias/norm_w) = 9 expected. The 10 null-ctx scales/biases
+    // are skipped — confirms the optional-bf16 path doesn't poison the eval batch.
+    try testing.expectEqual(@as(usize, 9), mlx.mlx_vector_array_size(vec));
 }

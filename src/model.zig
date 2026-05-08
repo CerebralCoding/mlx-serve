@@ -147,6 +147,14 @@ pub const ModelConfig = struct {
     num_mtp_predict_layers: u32 = 0,
     has_mtp: bool = false,
 
+    // MTP-specific quantization params, parsed from `mtplx_mtp_quantization` in
+    // config.json. Some MTPLX checkpoints (e.g. Qwen3.6-27B) quantize the MTP
+    // block linears with a different group_size than the main trunk; without
+    // these overrides, qmatmul mis-interprets the bit-packing and crashes.
+    has_mtp_quant_override: bool = false,
+    mtp_quant_bits: u32 = 4,
+    mtp_quant_group_size: u32 = 64,
+
     pub fn isGlobalLayer(self: ModelConfig, layer_idx: u32) bool {
         if (!self.has_sliding_window) return true;
         if (self.has_explicit_layer_types and layer_idx < 128) {
@@ -450,6 +458,22 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         const q = q_val.object;
         if (q.get("bits")) |v| config.quant_bits = @intCast(v.integer);
         if (q.get("group_size")) |v| config.quant_group_size = @intCast(v.integer);
+    }
+
+    // Per-MTP-block quantization override (MTPLX checkpoints). Defaults to the
+    // main trunk's params; only flagged as an "override" if the values actually
+    // differ — that's what the bind path uses to decide whether to prepopulate
+    // the per-weight quant-params cache for MTP weights.
+    config.mtp_quant_bits = config.quant_bits;
+    config.mtp_quant_group_size = config.quant_group_size;
+    if (root.get("mtplx_mtp_quantization")) |mq_val| {
+        if (mq_val == .object) {
+            const mq = mq_val.object;
+            if (mq.get("bits")) |v| config.mtp_quant_bits = @intCast(v.integer);
+            if (mq.get("group_size")) |v| config.mtp_quant_group_size = @intCast(v.integer);
+            config.has_mtp_quant_override = (config.mtp_quant_bits != config.quant_bits) or
+                (config.mtp_quant_group_size != config.quant_group_size);
+        }
     }
 
     // EOS tokens
@@ -1205,6 +1229,79 @@ test "parseConfigFromJson defaults num_nextn_predict_layers to 0 when absent" {
     const config = try parseConfigFromJson(testing.allocator, json);
     try testing.expectEqual(@as(u32, 0), config.num_mtp_predict_layers);
     try testing.expect(!config.has_mtp);
+}
+
+test "parseConfigFromJson reads mtplx_mtp_quantization override (different group_size)" {
+    // Qwen3.6-27B-MTPLX-Optimized-Speed: main is bits=4 group=64, MTP block is
+    // bits=4 group=32. Without this override the qmatmul detector misreads
+    // bit-packing on MTP weights and crashes with a shape mismatch.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5_moe",
+        \\  "vocab_size": 151936,
+        \\  "hidden_size": 2048,
+        \\  "intermediate_size": 6144,
+        \\  "num_hidden_layers": 48,
+        \\  "num_attention_heads": 16,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "num_nextn_predict_layers": 1,
+        \\  "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
+        \\  "mtplx_mtp_quantization": {"bits": 4, "group_size": 32, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.has_mtp);
+    try testing.expect(config.has_mtp_quant_override);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.quant_group_size);
+    try testing.expectEqual(@as(u32, 4), config.mtp_quant_bits);
+    try testing.expectEqual(@as(u32, 32), config.mtp_quant_group_size);
+}
+
+test "parseConfigFromJson mtplx override matching trunk does not flag has_mtp_quant_override" {
+    // Qwen3.5-4B-MTPLX-Optimized-Speed: MTP block uses the SAME bits/group as
+    // the main trunk (4/64). The override field is present but identical, so
+    // we shouldn't flag it as needing per-weight cache prepopulation.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5_moe",
+        \\  "vocab_size": 151936,
+        \\  "hidden_size": 2048,
+        \\  "intermediate_size": 6144,
+        \\  "num_hidden_layers": 48,
+        \\  "num_attention_heads": 16,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "num_nextn_predict_layers": 1,
+        \\  "quantization": {"bits": 4, "group_size": 64, "mode": "affine"},
+        \\  "mtplx_mtp_quantization": {"bits": 4, "group_size": 64, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(!config.has_mtp_quant_override);
+    try testing.expectEqual(@as(u32, 4), config.mtp_quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.mtp_quant_group_size);
+}
+
+test "parseConfigFromJson mtp_quant_* defaults to main quant when override absent" {
+    const json =
+        \\{
+        \\  "model_type": "qwen3_5_moe",
+        \\  "vocab_size": 151936,
+        \\  "hidden_size": 2048,
+        \\  "intermediate_size": 6144,
+        \\  "num_hidden_layers": 48,
+        \\  "num_attention_heads": 16,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "quantization": {"bits": 4, "group_size": 64, "mode": "affine"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(!config.has_mtp_quant_override);
+    try testing.expectEqual(@as(u32, 4), config.mtp_quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.mtp_quant_group_size);
 }
 
 test "parseConfigFromJson does not enable MTP for non-Qwen architectures" {

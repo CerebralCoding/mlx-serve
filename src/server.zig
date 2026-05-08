@@ -1897,7 +1897,7 @@ fn handleChatCompletions(
     }
 
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget, enable_mtp, enable_pld, enable_drafter) catch |err| {
+        handleStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget, enable_mtp, enable_pld, enable_drafter, cache_result.full_prompt) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -1908,7 +1908,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget, enable_mtp, enable_pld, enable_drafter) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, logprobs_n, enable_thinking, reasoning_budget, enable_mtp, enable_pld, enable_drafter, cache_result.full_prompt) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -2061,7 +2061,7 @@ fn handleCompletions(
     // Clamp max_tokens to stay within context window
     const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
 
-    // Prompt caching: reuse KV cache for shared prefix (completions never have tools)
+    // Prompt caching: reuse KV cache for shared prefix (completions never have tools).
     const has_tools = false;
     const cache_result = try reuseKVCache(allocator, xfm, prompt_ids, has_tools);
 
@@ -2302,6 +2302,7 @@ fn handleNonStreamingGeneration(
     enable_mtp: bool,
     enable_pld: bool,
     enable_drafter: bool,
+    full_prompt: []const u32,
 ) !void {
     var timer = startStopwatch(stream.io);
 
@@ -2316,11 +2317,11 @@ fn handleNonStreamingGeneration(
     const use_mtp = !use_drafter and enable_mtp and logprobs_n == 0 and sampling.constraint == null and xfm.mtp_layers != null;
     const use_pld = !use_drafter and !use_mtp and enable_pld and logprobs_n == 0 and sampling.constraint == null;
     var result = if (use_drafter)
-        try generate_mod.generateDrafter(stream.io, allocator, xfm, default_drafter.?, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), default_draft_block_size)
+        try generate_mod.generateDrafter(stream.io, allocator, xfm, default_drafter.?, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), default_draft_block_size, full_prompt)
     else if (use_mtp)
-        try generate_mod.generateMtp(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs())
+        try generate_mod.generateMtp(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), full_prompt)
     else if (use_pld)
-        try generate_mod.generatePld(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), default_pld_draft_len, default_pld_key_len)
+        try generate_mod.generatePld(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), default_pld_draft_len, default_pld_key_len, full_prompt)
     else
         try generate_mod.generate(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), logprobs_n);
     result.prompt_tokens += cached_tokens; // Include cached tokens in total prompt count
@@ -2713,6 +2714,7 @@ fn handleStreamingGeneration(
     enable_mtp: bool,
     enable_pld: bool,
     enable_drafter: bool,
+    full_prompt: []const u32,
 ) !void {
     const chat_id = nowMs(stream.io);
     var timer = startStopwatch(stream.io);
@@ -2731,12 +2733,13 @@ fn handleStreamingGeneration(
     // they get the right post-prefill cache state (and, for MTP+drafter,
     // the captured hidden state for the first draft).
     var gen = switch (stream_mode) {
-        .mtp => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .mtp_enabled = true }),
-        .pld => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .pld_enabled = true }),
+        .mtp => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .mtp_enabled = true, .lookup_prompt = full_prompt }),
+        .pld => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .pld_enabled = true, .lookup_prompt = full_prompt }),
         .drafter => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
             .drafter_enabled = true,
             .drafter = default_drafter,
             .drafter_block_size = default_draft_block_size,
+            .lookup_prompt = full_prompt,
         }),
         .regular => try Generator.init(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids),
     };
@@ -3267,6 +3270,11 @@ fn sendSSEChunk(
 const CacheResult = struct {
     new_tokens: []const u32,
     cached_tokens: u32, // how many tokens were reused from cache
+    /// The full original prompt (before any cache-reuse trimming). PLD's
+    /// n-gram lookup needs this even when only the trailing tail was
+    /// forwarded into the KV cache. Lifetime is tied to the caller's
+    /// `prompt_ids` slice, which already outlives the Generator.
+    full_prompt: []const u32,
 };
 
 fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []const u32, has_tools: bool) !CacheResult {
@@ -3299,18 +3307,35 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
             allocator.free(cached);
             cached_prompt_ids = null;
             try xfm.resetCache();
-            return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
+            return .{ .new_tokens = prompt_ids, .cached_tokens = 0, .full_prompt = prompt_ids };
         }
 
         // shared == cached.len at this point. Identical re-issue (shared == prompt_ids.len)
-        // still resets: KV buffer holds stale post-gen tokens that truncate() can't scrub
-        // on every architecture.
+        // can still reuse the cache on pure-attention architectures: step back by one
+        // and re-forward the last prompt token to produce next-token logits, skipping
+        // the (potentially expensive) prefill of the rest. The KV view at [0:shared-1]
+        // points into a buffer slot that's safe to reuse — generation will overwrite
+        // positions ≥ shared-1 in order. Hybrid SSM/conv architectures (Qwen 3.5/3.6
+        // GatedDeltaNet, LFM2, Nemotron-H) carry recurrent state that's been advanced
+        // past the prompt by the previous request's generation and can't be rolled back
+        // — those still get a clean reset.
         if (shared == prompt_ids.len) {
+            const has_recurrent_state = xfm.config.has_hybrid_layers or xfm.config.full_attention_interval > 0;
+            if (!has_recurrent_state and shared > 1) {
+                try xfm.cache.truncate(shared - 1, xfm.s);
+                xfm.moe_seq_offset = shared - 1;
+                log.info("  [cache] reusing {d}/{d} tokens, re-forwarding last token (identical re-issue)\n", .{ shared - 1, prompt_ids.len });
+                return .{
+                    .new_tokens = prompt_ids[shared - 1 ..],
+                    .cached_tokens = @intCast(shared - 1),
+                    .full_prompt = prompt_ids,
+                };
+            }
             log.info("  [cache] reset — identical prompt re-issued (stale generation residue)\n", .{});
             allocator.free(cached);
             cached_prompt_ids = null;
             try xfm.resetCache();
-            return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
+            return .{ .new_tokens = prompt_ids, .cached_tokens = 0, .full_prompt = prompt_ids };
         }
 
         // Sliding window models (e.g. Gemma 4) interleave global and local attention layers.
@@ -3327,6 +3352,7 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
             return .{
                 .new_tokens = prompt_ids[shared..],
                 .cached_tokens = @intCast(shared),
+                .full_prompt = prompt_ids,
             };
         }
     }
@@ -3336,7 +3362,7 @@ fn reuseKVCache(allocator: std.mem.Allocator, xfm: *Transformer, prompt_ids: []c
         log.info("  [cache] reset — no shared prefix\n", .{});
     }
     try xfm.resetCache();
-    return .{ .new_tokens = prompt_ids, .cached_tokens = 0 };
+    return .{ .new_tokens = prompt_ids, .cached_tokens = 0, .full_prompt = prompt_ids };
 }
 
 fn updateCachedPrompt(allocator: std.mem.Allocator, prompt_ids: []const u32, has_tools: bool) void {
@@ -4487,7 +4513,7 @@ fn handleAnthropicMessages(
     };
 
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_mtp, enable_pld, enable_drafter) catch |err| {
+        handleAnthropicStreaming(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_mtp, enable_pld, enable_drafter, cache_result.full_prompt) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -4496,7 +4522,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_mtp, enable_pld) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, cache_result.cached_tokens, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_mtp, enable_pld, cache_result.full_prompt) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -4533,6 +4559,7 @@ fn handleAnthropicNonStreaming(
     prompt_token_count: u32,
     enable_mtp: bool,
     enable_pld: bool,
+    full_prompt: []const u32,
 ) !void {
     var timer = startStopwatch(stream.io);
 
@@ -4540,9 +4567,9 @@ fn handleAnthropicNonStreaming(
     const use_mtp = enable_mtp and sampling.constraint == null and xfm.mtp_layers != null;
     const use_pld = !use_mtp and enable_pld and sampling.constraint == null and !xfm.config.has_hybrid_layers;
     var result = if (use_mtp)
-        try generate_mod.generateMtp(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs())
+        try generate_mod.generateMtp(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), full_prompt)
     else if (use_pld)
-        try generate_mod.generatePld(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), default_pld_draft_len, default_pld_key_len)
+        try generate_mod.generatePld(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), default_pld_draft_len, default_pld_key_len, full_prompt)
     else
         try generate_mod.generate(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, getTimeoutNs(), 0);
     result.prompt_tokens += cached_tokens;
@@ -4704,6 +4731,7 @@ fn handleAnthropicStreaming(
     enable_mtp: bool,
     enable_pld: bool,
     enable_drafter: bool,
+    full_prompt: []const u32,
 ) !void {
     var timer = startStopwatch(stream.io);
 
@@ -4716,12 +4744,13 @@ fn handleAnthropicStreaming(
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{default_draft_block_size});
 
     var gen = switch (stream_mode) {
-        .mtp => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .mtp_enabled = true }),
-        .pld => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .pld_enabled = true }),
+        .mtp => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .mtp_enabled = true, .lookup_prompt = full_prompt }),
+        .pld => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{ .pld_enabled = true, .lookup_prompt = full_prompt }),
         .drafter => try Generator.initWithOptions(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids, .{
             .drafter_enabled = true,
             .drafter = default_drafter,
             .drafter_block_size = default_draft_block_size,
+            .lookup_prompt = full_prompt,
         }),
         .regular => try Generator.init(stream.io, allocator, xfm, tok, prompt_ids, max_tokens, sampling, eos_token_ids),
     };
@@ -5822,12 +5851,13 @@ fn handleResponses(
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{default_draft_block_size});
 
         var gen = switch (stream_mode) {
-            .mtp => try generate_mod.Generator.initWithOptions(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, .{ .mtp_enabled = true }),
-            .pld => try generate_mod.Generator.initWithOptions(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, .{ .pld_enabled = true }),
+            .mtp => try generate_mod.Generator.initWithOptions(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, .{ .mtp_enabled = true, .lookup_prompt = cache_result.full_prompt }),
+            .pld => try generate_mod.Generator.initWithOptions(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, .{ .pld_enabled = true, .lookup_prompt = cache_result.full_prompt }),
             .drafter => try generate_mod.Generator.initWithOptions(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, .{
                 .drafter_enabled = true,
                 .drafter = default_drafter,
                 .drafter_block_size = default_draft_block_size,
+                .lookup_prompt = cache_result.full_prompt,
             }),
             .regular => try generate_mod.Generator.init(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice),
         };
@@ -6028,9 +6058,9 @@ fn handleResponses(
         const use_mtp = enable_mtp_resp and sampling.constraint == null and xfm.mtp_layers != null;
         const use_pld = !use_mtp and enable_pld_resp and sampling.constraint == null and !xfm.config.has_hybrid_layers;
         result = if (use_mtp)
-            try generate_mod.generateMtp(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs())
+            try generate_mod.generateMtp(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs(), cache_result.full_prompt)
         else if (use_pld)
-            try generate_mod.generatePld(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs(), default_pld_draft_len, default_pld_key_len)
+            try generate_mod.generatePld(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs(), default_pld_draft_len, default_pld_key_len, cache_result.full_prompt)
         else
             try generate_mod.generate(stream.io, allocator, xfm, tok, cache_result.new_tokens, effective_max_tokens, sampling, eos_slice, getTimeoutNs(), 0);
         result.prompt_tokens += cache_result.cached_tokens;
