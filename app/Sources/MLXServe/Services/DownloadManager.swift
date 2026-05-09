@@ -383,13 +383,19 @@ class DownloadManager: ObservableObject {
         }
 
         let size = directorySize(resolved)
+        // `gemma4_assistant` config dirs aren't loadable as a target — they
+        // pair with a base Gemma 4 model via the `--drafter` flag. Tagging
+        // them lets the Model Browser group them separately and the model
+        // picker filter them out.
+        let kind: ModelKind = (modelType == "gemma4_assistant") ? .drafter : .base
         return LocalModel(
             id: "\(source.rawValue):\(idKey)",
             name: displayName,
             path: resolved,
             sizeFormatted: MemoryInfo.format(Int64(size)),
             modelType: modelType,
-            source: source
+            source: source,
+            kind: kind
         )
     }
 
@@ -440,6 +446,81 @@ class DownloadManager: ObservableObject {
         }
 
         return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
+    }
+
+    /// Walk the given scan roots for `gemma-4-*-it-assistant-bf16` directories
+    /// that declare `model_type: "gemma4_assistant"`. Result is one entry per
+    /// distinct (variant) — first hit wins so the earlier root in the list
+    /// takes priority. `nonisolated` so tests can call it with a temp dir.
+    nonisolated static func discoverDrafters(in roots: [String]) -> [LocalDrafter] {
+        // Drafter is published only under mlx-community on HF. Each scan
+        // root places it at `<root>/mlx-community/<dirName>/`.
+        var seenVariants = Set<GemmaVariant>()
+        var out: [LocalDrafter] = []
+        let fm = FileManager.default
+
+        for root in roots {
+            let mlxCommunity = (root as NSString).appendingPathComponent("mlx-community")
+            guard let entries = try? fm.contentsOfDirectory(atPath: mlxCommunity) else { continue }
+            for entry in entries where !entry.hasPrefix(".") {
+                guard let variant = GemmaVariant.allCases.first(where: { $0.drafterDirName == entry }) else { continue }
+                if seenVariants.contains(variant) { continue }
+                let dirPath = (mlxCommunity as NSString).appendingPathComponent(entry)
+                let configPath = (dirPath as NSString).appendingPathComponent("config.json")
+                guard let cfgData = fm.contents(atPath: configPath),
+                      let cfg = try? JSONSerialization.jsonObject(with: cfgData) as? [String: Any],
+                      cfg["model_type"] as? String == "gemma4_assistant" else { continue }
+                out.append(LocalDrafter(url: URL(fileURLWithPath: dirPath), variant: variant))
+                seenVariants.insert(variant)
+            }
+        }
+        return out
+    }
+
+    /// Mirrors `discoverLocalModels()` — scans `~/.mlx-serve/models/` first,
+    /// then LM Studio's root when present. Used by Settings to pick the right
+    /// drafter for the loaded base model and by the Model Browser to badge
+    /// already-downloaded drafter rows.
+    func discoverDrafters() -> [LocalDrafter] {
+        var roots = [modelsDir]
+        if let lms = lmStudioRoot { roots.append(lms) }
+        return Self.discoverDrafters(in: roots)
+    }
+
+    /// Pick the drafter that pairs with the loaded base model. Returns nil
+    /// when the loaded model isn't Gemma 4, or when no matching drafter is on
+    /// disk. Only the directory basename is parsed — the same convention used
+    /// in `tests/bench_vs_lmstudio.sh` (`gemma-4-e4b-it-4bit` → E4B).
+    func recommendedDrafterFor(modelPath: String, architecture: String, isMoE: Bool) -> LocalDrafter? {
+        guard architecture == "gemma4" || architecture == "gemma4_text" else { return nil }
+        guard let variant = gemmaVariantFor(modelPath: modelPath, isMoE: isMoE) else { return nil }
+        return discoverDrafters().first { $0.variant == variant }
+    }
+
+    /// Path-only variant — used before the server has reported `architecture`
+    /// (e.g. when AppState auto-syncs `drafterPath` on a model swap). Falls
+    /// through to the same parser; non-Gemma paths return nil.
+    func recommendedDrafterFromPath(_ modelPath: String) -> LocalDrafter? {
+        guard let variant = Self.gemmaVariantFor(modelPath: modelPath, isMoE: false) else { return nil }
+        return discoverDrafters().first { $0.variant == variant }
+    }
+
+    /// Same parser the recommendation uses, exposed so Model Browser can
+    /// label a base-model row with its target drafter ("for E4B").
+    nonisolated static func gemmaVariantFor(modelPath: String, isMoE: Bool) -> GemmaVariant? {
+        let basename = (modelPath as NSString).lastPathComponent.lowercased()
+        // 26B-A4B is the only Gemma 4 MoE today. Match it before the bare
+        // "26b" check so the substring scan can't promote a future dense 26B
+        // checkpoint into the wrong drafter.
+        if isMoE || basename.contains("26b-a4b") { return .moe26B }
+        if basename.contains("e4b") { return .E4B }
+        if basename.contains("e2b") { return .E2B }
+        if basename.contains("31b") { return .gemma31B }
+        return nil
+    }
+
+    func gemmaVariantFor(modelPath: String, isMoE: Bool) -> GemmaVariant? {
+        Self.gemmaVariantFor(modelPath: modelPath, isMoE: isMoE)
     }
 
     func removeIncomplete(repoId: String) {

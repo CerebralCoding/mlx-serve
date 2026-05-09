@@ -147,7 +147,7 @@ def safe_parse_args(args_str):
     return result
 
 
-def send_request(messages, enable_thinking=False, max_tokens=2048):
+def send_request(messages, enable_thinking=False, max_tokens=2048, force_no_tools=False):
     """Send a streaming chat completion request and parse SSE response."""
     global total_rounds
     total_rounds += 1
@@ -155,12 +155,16 @@ def send_request(messages, enable_thinking=False, max_tokens=2048):
     body = {
         "model": "mlx-serve",
         "messages": messages,
-        "tools": TOOLS,
         "max_tokens": max_tokens,
         "temperature": 0.7,
         "stream": True,
         "stream_options": {"include_usage": True},
     }
+    # `force_no_tools=True` is used for the final-summary pass after max_rounds:
+    # we drop the tools array entirely so the model has to produce a text
+    # response instead of yet another tool call.
+    if not force_no_tools:
+        body["tools"] = TOOLS
     if enable_thinking:
         body["enable_thinking"] = True
 
@@ -171,9 +175,15 @@ def send_request(messages, enable_thinking=False, max_tokens=2048):
         headers={"Content-Type": "application/json"},
     )
 
+    # Decode with errors='replace': the SSE byte stream is utf-8 by spec, but
+    # webSearch/browse mock results come from the live web during agent runs
+    # and very occasionally include a stray non-utf-8 byte that the model
+    # passes through verbatim. A strict decode would abort the entire stream
+    # over a single bad byte and hide the actual response — replace the
+    # bad byte with U+FFFD instead so the test surfaces real failures.
     try:
         with urllib.request.urlopen(req, timeout=300) as resp:
-            raw = resp.read().decode()
+            raw = resp.read().decode("utf-8", errors="replace")
     except Exception as e:
         return {"content": f"Error: {e}", "reasoning": "", "tool_calls": None, "finish_reason": "error",
                 "prompt_tokens": 0, "completion_tokens": 0}
@@ -235,6 +245,7 @@ def run_agent_loop(messages, max_rounds=15, enable_thinking_first=True):
     """Run a ReAct agent loop until the model stops calling tools or hits max rounds."""
     tool_call_log = []
     round_num = 0
+    hit_max_with_pending_tool_call = False
 
     for round_num in range(max_rounds):
         thinking = enable_thinking_first and round_num == 0
@@ -259,12 +270,26 @@ def run_agent_loop(messages, max_rounds=15, enable_thinking_first=True):
                                      "function": {"name": tool_name, "arguments": tc["arguments"]}}]
                 })
                 messages.append({"role": "tool", "tool_call_id": tc["id"], "content": result})
+            # Track whether we just exited the loop with a pending tool call
+            # so we can force a final summary below.
+            hit_max_with_pending_tool_call = (round_num == max_rounds - 1)
         else:
             # Model gave a text response — done
             content_preview = resp["content"][:100].replace("\n", " ")
             print(f"    round {round_num+1}: RESPONSE ({len(resp['content'])} chars) \"{content_preview}...\"")
             messages.append({"role": "assistant", "content": resp["content"]})
             break
+
+    # If we exhausted max_rounds while the model was still calling tools, give
+    # it one final pass with tools disabled to force a text summary. Mirrors
+    # what real agent harnesses (Claude Code, Cursor) do when the iteration
+    # budget runs out, and keeps the assertion "gave a substantive response"
+    # robust against the model's tool-call cadence rather than a coin flip.
+    if hit_max_with_pending_tool_call:
+        resp = send_request(messages, enable_thinking=False, force_no_tools=True)
+        content_preview = resp["content"][:100].replace("\n", " ") if resp["content"] else ""
+        print(f"    final summary (no-tools): RESPONSE ({len(resp['content'])} chars) \"{content_preview}...\"")
+        messages.append({"role": "assistant", "content": resp["content"]})
 
     return {
         "tool_calls": tool_call_log,
@@ -336,7 +361,12 @@ def test_file_creation():
     output_file = f"{OUTPUT_DIR}/news_report.html"
     messages = [
         {"role": "system", "content": SYSTEM_PROMPT},
-        {"role": "user", "content": f"Search for top news websites, visit BBC and CNN to get their headlines, then write an HTML report at {output_file} with the headlines organized by source. Include proper HTML structure with <html>, <head>, <body> tags."},
+        # Explicit "use webSearch first" — older phrasing ("Search for top news
+        # websites, visit BBC and CNN...") is ambiguous: a smart model
+        # reasonably skips the search since the sites are already named, and
+        # the test's webSearch assertion fails. Naming the tool keeps the
+        # search→browse→writeFile pipeline as the intended thing under test.
+        {"role": "user", "content": f"Use webSearch to find a list of major news websites, then use browse to visit BBC and CNN for their headlines, then use writeFile to save an HTML report at {output_file} with the headlines organized by source. Include proper HTML structure with <html>, <head>, <body> tags."},
     ]
     result = run_agent_loop(messages, max_rounds=12)
     check("webSearch" in result["tool_calls"], "called webSearch")

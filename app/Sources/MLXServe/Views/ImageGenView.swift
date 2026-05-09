@@ -29,7 +29,7 @@ struct ImageGenView: View {
             switch python.status {
             case .unknown:
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .missingPython, .needsVenv, .needsPackages:
+            case .missingPython, .needsGit, .needsVenv, .needsPackages:
                 GenInstallPane(feature: "Image Generation (FLUX.2)")
             case .needsFFmpeg, .ready:
                 // mflux doesn't need ffmpeg — image gen works even when only
@@ -57,7 +57,7 @@ struct ImageGenView: View {
 
             VStack(spacing: 12) {
                 previewArea
-                historyShelf
+                outputFolderLink
             }
             .padding(16)
             .frame(minWidth: 460)
@@ -277,32 +277,18 @@ struct ImageGenView: View {
         .padding(8)
     }
 
-    private var historyShelf: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(service.recent, id: \.self) { path in
-                    Button {
-                        NSWorkspace.shared.open(URL(fileURLWithPath: path))
-                    } label: {
-                        if let img = NSImage(contentsOfFile: path) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .scaledToFill()
-                                .frame(width: 72, height: 72)
-                                .clipShape(RoundedRectangle(cornerRadius: 6))
-                        } else {
-                            RoundedRectangle(cornerRadius: 6)
-                                .fill(Color.secondary.opacity(0.2))
-                                .frame(width: 72, height: 72)
-                        }
-                    }
-                    .buttonStyle(.plain)
-                    .help(URL(fileURLWithPath: path).lastPathComponent)
-                }
-            }
-            .padding(.horizontal, 4)
+    private var outputFolderLink: some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting(
+                [URL(fileURLWithPath: PythonManager.imagesRoot)]
+            )
+        } label: {
+            Label("Open output folder in Finder", systemImage: "folder")
+                .font(.caption)
         }
-        .frame(height: 80)
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .help(PythonManager.imagesRoot)
     }
 
     // MARK: - Actions

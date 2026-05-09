@@ -4,373 +4,295 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 
 ## Stack
 
-- **Zig** 0.15+
-- **mlx-c** (Apple) via Homebrew; FFI in `src/mlx.zig`.
-- **Jinja engine** (lib/jinja_cpp): llama.cpp's C++17 Jinja2 implementation with nlohmann/json. Pre-compiled as `libjinja.a` (rebuild: see comment in `build.zig`).
-- **stb_image** (lib/stb_image.h): JPEG/PNG decoding for vision pipeline
-- **libwebp** via Homebrew: WebP image decoding for vision pipeline
-- **safetensors** for weights; BPE tokenizers (SentencePiece / byte-level)
+- **Zig** 0.15+; **mlx-c** (Apple) via Homebrew, FFI in `src/mlx.zig`
+- **Jinja engine** (`lib/jinja_cpp`): llama.cpp's C++17 Jinja2 + nlohmann/json, pre-compiled as `libjinja.a`
+- **stb_image** (JPEG/PNG) + **libwebp** (WebP) for vision; **safetensors** weights; BPE tokenizers
 
 ## Layout
 
-| Path | Role |
-|------|------|
-| `src/main.zig` | Entry, CLI (`--model`, `--serve`, `--host`, `--port`, `--prompt`, `--max-tokens`, `--temp`, `--ctx-size`, `--timeout`, `--reasoning-budget`, `--no-vision`, `--pld`, `--pld-draft-len`, `--pld-key-len`, `--drafter`, `--draft-block-size`, `--log-level`, `--version`, `--help`) |
-| `src/mlx.zig` | mlx-c FFI |
-| `src/model.zig` | Config + safetensors loading; see **Supported Architectures** below |
-| `src/tokenizer.zig` | BPE tokenizer |
-| `src/transformer.zig` | Forward pass (embedding, attention, MLP, MoE, GatedDeltaNet); architecture dispatch |
-| `src/generate.zig` | Autoregressive generation, sampling (temperature, top-k, top-p, repeat penalty, presence penalty, logprobs) |
-| `src/chat.zig` | Chat template formatting (ChatML, Gemma turns, Llama-3, Jinja2 via llama.cpp engine); thinking/reasoning tags; tool call parsing |
-| `src/vision.zig` | Vision encoder (Gemma 4 SigLIP): patch embedding, 2D RoPE, clipped linears, position pooling, embedding projection |
-| `src/server.zig` | HTTP server: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`, `/v1/responses/compact`, plus a WebSocket transport on `/v1/responses` (OpenAI Chat + Responses + Anthropic Messages, stream + non-stream, tool calling, KV cache, vision) |
-| `src/responses.zig` | OpenAI Responses API: input-item parser (incl. `compaction` items), tool-shape translation, output-item builders, in-memory `ResponseStore`, `encodeCompactionBlob` (HTTP/streaming live in `server.zig`) |
-| `src/ws.zig` | RFC 6455 WebSocket framing + handshake (server-side only). Generic over a `Conn`-shaped type so it stays test-friendly without depending on `server.zig`. |
-| `src/pld_index.zig` | Prompt Lookup Decoding (PLD) n-gram index. Pure-data `PldLookup.findMatch` — given a key (last `key_len` tokens) and committed stream, returns up to `max_draft` tokens from the latest prior occurrence. Tests at the bottom of the file. |
-| `src/drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode). `DrafterModel.step` runs one drafter forward; `bind(target)` resolves the layer-type → target K/V mapping; `MaskedEmbedding` is the centroid-routed sparse LM head. Loaded with `--drafter <dir>`. |
-| `src/status.zig` | TUI status bar (CPU, memory, GPU metrics) |
-| `src/log.zig` | Leveled logging (error, warn, info, debug) |
-| `build.zig` | Zig build; links mlx-c, libjinja.a, libwebp, stb_image |
-
-### MLX Core (Swift macOS app)
+### Zig server (`src/`)
 
 | Path | Role |
 |------|------|
-| `app/Package.swift` | Swift package; `MLXCore` executable + `MLXCoreTests` test target |
-| `app/Sources/MLXServe/MLXServeApp.swift` | App entry, menu bar + Chat/Browser windows |
-| `app/Sources/MLXServe/AppState.swift` | Global state, chat session management, persistence |
-| `app/Sources/MLXServe/Models/ChatModels.swift` | `ChatMessage`, `ChatImage`, `SerializedToolCall`, `ChatSession` |
-| `app/Sources/MLXServe/Models/AgentModels.swift` | `AgentToolKind`, `AgentPlan`, `StepResult` |
-| `app/Sources/MLXServe/Services/APIClient.swift` | HTTP + SSE streaming client for mlx-serve |
-| `app/Sources/MLXServe/Services/AgentPrompt.swift` | System prompt, tool definitions (10 tools), `SkillManager` (prompt-based skills from `~/.mlx-serve/skills/`) |
-| `app/Sources/MLXServe/Services/AgentEngine.swift` | Shared agent logic: history building, tool execution, repetition tracking, token estimation, overflow management |
-| `app/Sources/MLXServe/Services/ToolExecutor.swift` | Tool handlers: shell, cwd, readFile, writeFile, editFile, searchFiles, listFiles, browse, webSearch, saveMemory |
-| `app/Sources/MLXServe/Services/ImagePreprocessor.swift` | Image preprocessing for vision encoder (resize, float32 CHW conversion) |
-| `app/Sources/MLXServe/Services/BrowserManager.swift` | WKWebView (headless, created eagerly for background browsing) |
-| `app/Sources/MLXServe/Services/ServerManager.swift` | mlx-serve process lifecycle, stderr capture (`serverLog`), auto-start |
-| `app/Sources/MLXServe/Services/TestServer.swift` | Embedded HTTP server (port 8090) for test automation — uses AgentEngine for shared logic |
-| `app/Sources/MLXServe/Services/AgentMemory.swift` | Agent context memory (recent dirs, commands) |
-| `app/Sources/MLXServe/Views/ChatView.swift` | Chat UI + `runAgentLoop()` + image attachment + context monitor |
-| `app/Sources/MLXServe/Views/StatusMenuView.swift` | Menu bar UI, server log viewer, Claude Code launcher |
-| `app/Sources/MLXServe/Views/BrowserView.swift` | Browser window (uses shared WKWebView) |
+| `main.zig` | Entry, CLI flags |
+| `mlx.zig` | mlx-c FFI |
+| `model.zig` | Config + safetensors loading |
+| `tokenizer.zig` | BPE tokenizer |
+| `transformer.zig` | Forward pass; arch dispatch (attention, MLP, MoE, GatedDeltaNet) |
+| `generate.zig` | Autoregressive generation, sampling, PLD/drafter orchestration |
+| `chat.zig` | Chat templates (ChatML, Gemma, Llama-3, Jinja2); thinking tags; tool call parsing |
+| `vision.zig` | Gemma 4 SigLIP vision encoder |
+| `server.zig` | HTTP: `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions`, `/v1/messages`, `/v1/responses`, WebSocket on `/v1/responses` |
+| `responses.zig` | OpenAI Responses API: parser, envelope, in-memory `ResponseStore`, compaction blob |
+| `ws.zig` | RFC 6455 WebSocket framing (server-side, generic over `Conn`) |
+| `pld_index.zig` | PLD n-gram index (`PldLookup.findMatch`, `ngramRepeatScore`) |
+| `drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
+| `status.zig` | TUI status bar |
+| `log.zig` | Leveled logging |
+| `build.zig` | Links mlx-c, libjinja, libwebp, stb_image |
 
-## Testing
+CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --ctx-size --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --log-level --version --help`
 
-- Always add tests, for anything you do, and update them as needed
-- Unit tests are fine, but also add integration tests with real models, these are the real tests
-- Make sure tests account for all the suported model architecture types, not just one.
-- After a big feature, always test by building mlx-serve and mlx core.app, then run the .app bundle with TestServer.swift enable and test agentic harness
-- `zig build test` — unit tests (chat, server, generate, model, log, tokenizer)
-- `cd app && swift test` — Swift unit tests (agent harness, SSE parsing, serialization, history)
-- `./tests/integration_test.sh [model_dir] [port]` — 36 end-to-end API tests (needs a model)
-- `./tests/test_tool_response.sh [port]` — tool calling round-trip tests (needs running server)
-- `./tests/test_kv_cache_poison.sh [port]` — KV cache poisoning regression test (needs running server)
-- `./tests/test_anthropic_api.sh [port]` — Anthropic Messages API integration tests (needs running server)
-- `PLD_TEST_MODEL=<dir> ./tests/test_pld_equivalence.sh [port]` — PLD byte-equivalence test (defaults to `~/.mlx-serve/models/Qwen3.5-4B-MLX-4bit`; PLD is model-agnostic, any MLX checkpoint works). Verified on Qwen3.5-4B, Gemma-4-E4B, LFM2.5-350M (hybrid SSM).
-- `./tests/test_streaming_pld.sh [port]` — verifies streaming PLD output is byte-identical to non-streaming PLD AND to regular streaming (B's contribution)
-- `./tests/test_drafter_equivalence.sh [port]` — Gemma 4 drafter byte-equivalence test (paired `--drafter`/no-drafter on `gemma-4-e4b-it-4bit` + `gemma-4-E4B-it-assistant-bf16`)
-- `./tests/bench_spec.sh [runs]` — focused spec-decode benchmark (none vs PLD vs drafter × heavy-echo + creative × Qwen/Gemma/LFM). Run 1 is warmup. Drives default-on flip decisions.
-- `./tests/bench_spec.sh --corpus` — threshold-tuning corpus: 9 prompts (echo, code-rename, JSON, RAG, agent, plain-Q&A, code-translate, summarize, creative) × PLD on/off on Gemma 4 E4B. Reports per-prompt n-gram score, gate decision, baseline_tps, pld_tps, ratio, and a "correct-decisions" rollup. Use when adjusting `spec_gate_threshold`.
-- Always run `zig build test` and `swift test` before submitting changes
-- Add tests for new pure logic functions in the same source file (Zig convention)
-- Shell integration tests go in `tests/` and need a running server with a loaded model
+### Swift macOS app (`app/Sources/MLXServe/`)
+
+| Path | Role |
+|------|------|
+| `MLXServeApp.swift` | App entry, menu bar + Chat/Browser windows |
+| `AppState.swift` | Global state, chat session persistence |
+| `Models/{ChatModels,AgentModels}.swift` | `ChatMessage`, `ChatImage`, `SerializedToolCall`, `AgentPlan` |
+| `Services/APIClient.swift` | HTTP + SSE streaming client |
+| `Services/AgentPrompt.swift` | System prompt, 10 tools, `SkillManager` |
+| `Services/AgentEngine.swift` | Shared agent logic: history, tool exec, repetition tracking, overflow |
+| `Services/ToolExecutor.swift` | Tool handlers (shell, file, search, browse, webSearch, saveMemory) |
+| `Services/{ImagePreprocessor,BrowserManager,ServerManager,TestServer,AgentMemory}.swift` | Image prep, WKWebView, server lifecycle, embedded test server (port 8090), agent context |
+| `Views/{ChatView,StatusMenuView,BrowserView}.swift` | Chat UI + `runAgentLoop()`, menu bar, browser |
 
 ## Building
 
-- **Full app bundle**: `cd app && SKIP_NOTARIZE=1 bash build.sh` — builds Zig + Swift, assembles `.app`, signs (requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` env vars). Bundles libwebp + libsharpyuv for vision support.
-- Zig server only: `zig build -Doptimize=ReleaseFast` (requires `brew install webp` for vision pipeline)
-- Swift app only: `cd app && swift build -c release -Xswiftc -swift-version -Xswiftc 5`
-- For tests: `zig build test` (Zig) and `cd app && swift test -Xswiftc -swift-version -Xswiftc 5` (Swift)
-- **Rebuild Jinja library** (after changing `lib/jinja_cpp/*.cpp`): `cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o`
+- **Always use `./app/build.sh` for the Swift app, not direct `swift build`** — the script knows the right Swift-version flags, links Zig artifacts, signs the bundle, and keeps `MLXCore` + `mlx-serve` in lockstep. Skip notarization in dev with `SKIP_NOTARIZE=1 bash app/build.sh`.
+- Zig only: `zig build -Doptimize=ReleaseFast` (needs `brew install webp`)
+- Direct `swift build` (escape hatch only — fast iteration on a Swift-only change): `cd app && swift build -c release -Xswiftc -swift-version -Xswiftc 5`. Don't ship a build that didn't go through `build.sh`.
+- **Rebuild Jinja** (after `lib/jinja_cpp/*.cpp` changes): `cd lib/jinja_cpp && for f in jinja_wrapper caps lexer parser runtime jinja_string value; do clang++ -std=c++17 -O2 -DNDEBUG -I . -c $f.cpp -o obj/$f.o; done && ar rcs libjinja.a obj/*.o`
 
-The `-Xswiftc -swift-version -Xswiftc 5` flag forces Swift 5 language mode globally and is required when building under Swift 6.3 (Xcode 26+). Without it, the pinned `swift-sdk` 0.10.x dep emits `[#SendingRisksDataRace]` errors in `NetworkTransport.swift` (lines 581 / 812) — task-isolated continuation flags captured by `@MainActor` closures. The pin is held at 0.10.x for macos-14 / Swift 6.1 CI compat (0.11+ uses Swift 6.2-only `withThrowingTaskGroup` syntax). On Swift 6.1 the flag is a no-op, so it's safe to leave on. `app/build.sh` already passes the flag — only direct `swift build` / `swift test` invocations need it.
+The `-Xswiftc -swift-version -Xswiftc 5` flag forces Swift 5 mode under Swift 6.3 (Xcode 26+) — required because the pinned `swift-sdk` 0.10.x emits `[#SendingRisksDataRace]` errors otherwise. Pin held at 0.10.x for macos-14 / Swift 6.1 CI compat. `app/build.sh` already passes the flag; only direct `swift build`/`swift test` need it.
+
+## Testing
+
+- Always add tests for changes; unit tests OK but integration tests with real models are the real tests
+- Do things in a TDD style, write failing test first, then implement it.
+- Cover all supported architectures, not just one
+- After big features: build mlx-serve + app bundle, run `.app` with TestServer.swift enabled, test agentic harness
+- Always run `zig build test` and `swift test` before submitting
+
+| Command | Purpose |
+|---|---|
+| `zig build test` | Zig unit tests |
+| `cd app && swift test` | Swift unit tests |
+| `./tests/integration_test.sh [model_dir] [port]` | 36 end-to-end API tests |
+| `./tests/test_tool_response.sh [port]` | Tool calling round-trip |
+| `./tests/test_kv_cache_poison.sh [port]` | KV cache poisoning regression |
+| `./tests/test_anthropic_api.sh [port]` | Anthropic Messages API |
+| `PLD_TEST_MODEL=<dir> ./tests/test_pld_equivalence.sh` | PLD byte-equivalence (default gemma-4-e4b-it-8bit) |
+| `./tests/test_streaming_pld.sh [port]` | Streaming PLD byte-identical to non-streaming |
+| `./tests/test_drafter_equivalence.sh [port]` | Gemma 4 drafter byte-equivalence |
+| `UD_MOE_MODEL=<dir> ./tests/test_ud_moe.sh` | Unsloth UD MoE load + generate (default Qwen3.6-27B-UD-MLX-4bit) |
+| `./tests/test_long_agent_memory.sh [port]` | 10-turn Claude-Code-style agent: plants 3 facts in turn 1, recalls them across mode transitions (tools on/off, thinking on/off). Catches "model acts like first-time-seen" regressions. |
+| `./tests/bench_spec.sh [runs]` / `--corpus` | Spec-decode benchmark + threshold-tuning corpus |
 
 ## Versioning & Releases
 
-**Scheme**: CalVer `YY.M.N` — e.g., `v26.4.25` means 2026, April, 25th release that month.
-- `YY.M` comes from the build date
-- `N` is auto-incremented from the last GitHub release for that `YY.M` prefix
-- `build.sh` computes the version automatically via `gh release list`
+CalVer `YY.M.N` (e.g., `v26.4.25` = 2026, April, 25th release). `N` auto-increments from the last GitHub release for that `YY.M` prefix; `build.sh` computes via `gh release list`.
 
-**Version sources** (all set by `build.sh`):
-- `app/Info.plist` → `CFBundleVersion` + `CFBundleShortVersionString`
-- Zig binary → passed via `-Dversion` build option (consumed as `build_options.version` in `main.zig`)
-- Git tag → created manually with `gh release create v{version}`
+**Version sources**: `app/Info.plist` (`CFBundleVersion`/`CFBundleShortVersionString`), Zig `-Dversion` build option (`build_options.version`), git tag (`gh release create v{version}`).
 
-**Release process**:
-1. Update `CHANGELOG.md` with a new entry — use the NEXT version, not the current latest release. Run `gh release list --limit 1` to check what's already released.
-2. Commit and push changes
-3. Run `cd app && SKIP_NOTARIZE=1 bash build.sh` — this computes the version, builds everything, and prints the `gh release create` command at the end
-4. Run the printed `gh release create` command
+**Release**:
+1. Update `CHANGELOG.md` with NEXT version (check `gh release list --limit 1` first — never reuse an existing tag)
+2. Commit + push
+3. `cd app && SKIP_NOTARIZE=1 bash build.sh` — prints the `gh release create` command
+4. Run that command
 
-**Important**: Never write a CHANGELOG entry using a version that already exists as a GitHub release. Always check `gh release list` first.
+### CHANGELOG style
+
+**One entry per shipped release. No new entries for unshipped work — fold it into the next pending entry.** Always run `gh release list --limit 1` first; if the topmost CHANGELOG entry is newer than the latest GitHub release, that entry is unshipped and any new bullets get merged into it. Never bump version numbers ahead of an actual release.
+
+Tone: high-level executive bullets, marketing-style. The audience is users/integrators, not contributors reading the diff.
+
+- Lead each bullet with **what changed for the user** (capability, speed, model support), not the implementation.
+- Quantify where impressive — concrete tok/s percentages, model names, the workload it applies to.
+- Avoid: file paths, function names, internal symbol renames, line-count diffs, "we discovered that…", PR/issue numbers.
+- 4–7 bullets per release. If you need more, the release is too big and should ship sooner.
+
+Template:
+
+```markdown
+## vYY.M.N — Two-to-five-word headline
+
+- **<User-visible thing>**: one or two sentences on the impact. Numbers if you have them.
+- **<New model / API / behavior>**: what unlocks, when it kicks in, what stays the same.
+- **<Speed or reliability win>**: workload + measured gain.
+- **<Removed / deprecated thing, if any>**: why, and what users should do instead.
+
+---
+```
+
+When in doubt, look at the existing entries (v26.5.4 and earlier) — keep the same density and tone.
 
 ## Benchmarking
 
-Run `./bench.sh` after every major feature or optimization change. Results go in `BenchmarkLog.md`.
-- `./bench.sh` — full suite: mlx-serve + mlx-lm reference, all models
-- `./bench.sh --model gemma` — single model
-- `./bench.sh --no-mlx-lm` — skip Python reference
-- `./bench.sh --runs 5` — more runs for tighter averages
+Run `./bench.sh` after major features/optimizations; results go in `BenchmarkLog.md`. Flags: `--model gemma`, `--no-mlx-lm`, `--runs 5`.
 
 ## Conventions
 
-- Prefer minimal, DRY Zig; avoid unnecessary abstraction.
-- Chat templates live in model dirs; llama.cpp's Jinja engine renders them (with fallback formatting).
-- Server supports concurrent health checks via threaded connections, single-slot generation.
-- KV cache reuse across requests via prompt prefix matching; invalidated after tool-calling requests and pad-only generations.
-- Tests go at the bottom of each source file (Zig convention).
-- Jinja static library must be rebuilt with system clang++ after changing `lib/jinja_cpp/*.cpp` (see build command in `build.zig`).
+- Minimal, DRY Zig; avoid unnecessary abstraction
+- Tests at the bottom of each source file (Zig convention)
+- Shell integration tests in `tests/`, need a running server
+- Chat templates live in model dirs; Jinja renders them with fallback formatting
+- Concurrent health checks via threaded connections; single-slot generation
+- KV cache reuse via prompt-prefix matching; invalidated after tool calls and pad-only generations
 
 ## Supported Architectures
 
-Model support is determined by `model_type` in the model's `config.json`. The server dispatches to architecture-specific code paths in `model.zig` (config parsing, weight prefix) and `transformer.zig` (forward pass).
-
-### Working
+Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and `transformer.zig` (forward).
 
 | `model_type` | Family | Weight prefix | Vision | MoE | Notes |
 |---|---|---|---|---|---|
-| `gemma4`, `gemma4_text` | Gemma 4 | `language_model.model` | SigLIP | -- | Full support incl. vision, clipped linears, PLE |
+| `gemma4`, `gemma4_text` | Gemma 4 | `language_model.model` | SigLIP | -- | Full vision, clipped linears, PLE |
 | `gemma3` | Gemma 3 | `language_model.model` | -- | -- | |
-| `qwen3` | Qwen 3 | `model` | -- | -- | QK norm enabled |
-| `qwen3_5`, `qwen3_5_moe`, `qwen3_5_moe_text` | Qwen 3.5 / 3.6 | `language_model.model` | -- | Optional | GatedDeltaNet + MoE/dense MLP, shared expert routing |
-| `qwen3_next` | Qwen 3-next | `model` | -- | Optional | DeltaNet (GatedDeltaNet layers) |
-| `nemotron_h` | NVIDIA Nemotron-H | `backbone` | -- | -- | Hybrid transformer + Mamba2 SSM, per-timestep recurrence |
-| `lfm2` | Liquid LFM2.5 | `model` | -- | -- | Hybrid gated conv + full attention, state-space recurrence |
-| `llama` | Llama | `model` | -- | -- | |
-| `mistral` | Mistral | `model` | -- | -- | |
+| `qwen3` | Qwen 3 | `model` | -- | -- | QK norm |
+| `qwen3_5`, `qwen3_5_moe(_text)` | Qwen 3.5/3.6 | `language_model.model` | -- | Optional | GatedDeltaNet + MoE/dense, shared expert routing |
+| `qwen3_next` | Qwen 3-next | `model` | -- | Optional | DeltaNet |
+| `nemotron_h` | Nemotron-H | `backbone` | -- | -- | Hybrid transformer + Mamba2 SSM |
+| `lfm2` | Liquid LFM2.5 | `model` | -- | -- | Hybrid gated conv + full attention |
+| `llama`, `mistral` | Llama/Mistral | `model` | -- | -- | |
 
-### Not Yet Supported (TODO)
+**TODO**: `lfm2-vl` (vision encoder), `phi`/`phi3` (different layout), `command-r` (different arch).
 
-| `model_type` | Family | Blocked by | Effort |
-|---|---|---|---|
-| `lfm2-vl` | Liquid LFM2.5-VL | Needs vision encoder integration | Medium |
-| `phi`, `phi3` | Microsoft Phi | Different attention/MLP layout, different weight names | Medium |
-| `command-r` | Cohere Command R | Different architecture | Medium |
+Models with `vision_config` but no vision weights (e.g., text-only quantized Qwen 3.5) gracefully disable vision at init. Swift app flags unsupported archs via `supportedModelTypes` in `HFModels.swift`.
 
-Models with `vision_config` in config.json but no vision weights (e.g., text-only quantized Qwen 3.5) are handled gracefully — the vision encoder init detects missing weights early and disables vision. The Swift app flags unsupported architectures in the Model Browser via `supportedModelTypes` in `HFModels.swift`.
+## OpenAI Responses API (`/v1/responses`)
 
-## OpenAI Responses API
+Pure data in `responses.zig`; HTTP/orchestration in `server.zig`. Supports `POST`/`GET`/`DELETE /{id}`.
 
-The server exposes `POST /v1/responses` (plus `GET`/`DELETE /v1/responses/{id}`) — OpenAI's stateful Responses API. Pure data handling (input parsing, output-item builders, in-memory store) lives in `src/responses.zig`; HTTP and generation orchestration in `src/server.zig`.
+- **Envelope** (`buildResponsesEnvelope` + `ResponseEcho`): echoes `tools`, `tool_choice`, `text`, `reasoning`, `usage` (with `cached_tokens` + `reasoning_tokens`), `truncation`, `parallel_tool_calls`, sampling params, `metadata`, etc. Renderers reshape into the strict ResponseResource schema (flat tool form, not nested chat-completions).
+- **Streaming SSE**: `response.created`, `response.in_progress`, `response.output_item.added`, per-type deltas/`.done`, `response.completed`. **Every event needs `sequence_number`** — `sendResponsesEvent` injects it; the POST handler threads a per-request `seq_num`.
+- **Stateful chains**: `ResponseStore` keyed by id. `previous_response_id` replays history; missing → 404. `inputContainsFunctionCallOutput` triggers final-answer mode (tools disabled).
+- **Compliance**: `experiments/openresponses` validates strict schema; currently 17/17. `top_level response_format` accepted as alias for `text.format`.
+- **Compaction (`POST /v1/responses/compact`)**: pure data, no LLM call. Synthesizes opaque base64 `encrypted_content` over `{"v":1,"msgs":[...]}`. `appendCompactionInputItem` reconstitutes on round-trip. `model` required (422 on missing). Drops tool calls + images.
+- **WebSocket transport (`ws[s]://host/v1/responses`)**: same endpoint, opt-in via `Upgrade: websocket`. Each text frame is a `response.create`-shaped JSON; SSE events become single WS text frames via `WsBridge` on `Conn.ws_mode`. **No `[DONE]` on success** (`response.completed`/`.failed`/`.incomplete` is the terminator). Sequence numbers reset per response. `WsLocalCache` holds `store: false` responses for the connection lifetime; failed continuations evict the chain root.
 
-### Envelope shape (`buildResponsesEnvelope` + `ResponseEcho`)
-The response body must echo most request configuration to satisfy OpenAI's strict ResponseResource schema. Every response includes: `tools`, `tool_choice`, `text`, `reasoning`, `usage` (with `input_tokens_details.cached_tokens` + `output_tokens_details.reasoning_tokens`), `truncation`, `parallel_tool_calls`, `temperature`, `top_p`, `presence_penalty`, `frequency_penalty`, `top_logprobs`, `max_output_tokens`, `max_tool_calls`, `background`, `service_tier`, `metadata`, `safety_identifier`, `prompt_cache_key`, `instructions`, `error`, `completed_at`. Renderers `renderResponsesToolsEcho`/`renderResponsesToolChoiceEcho`/`renderResponsesTextEcho`/`renderResponsesReasoningEcho`/`renderResponsesMetadataEcho` reshape the request JSON into the exact schema-conformant form (e.g., flat `{type, name, description, parameters, strict}` for tools — not the nested chat-completions form).
+## Anthropic Messages API (`/v1/messages`)
 
-### Streaming SSE
-Events are: `response.created`, `response.in_progress`, `response.output_item.added` (per item), per-type deltas (`response.reasoning_summary_text.delta`, `response.output_text.delta`, `response.function_call_arguments.delta`), per-type `.done`, `response.output_item.done`, `response.completed`. **Every event must carry a `sequence_number` field** (incrementing integer). `sendResponsesEvent` injects it before send; the POST handler keeps a per-request `seq_num` counter that's threaded through every emit helper (`emitResponses*`).
+For Claude Code and Anthropic SDK clients with local models.
 
-### Stateful chains
-`ResponseStore` (capacity `RESPONSE_STORE_CAP`) keeps prior responses keyed by id. When a request supplies `previous_response_id`, history is replayed; if the id is missing → 404. `parseInput` accepts both string and content-block array shapes, and `inputContainsFunctionCallOutput` triggers final-answer mode (tools disabled) when the user is supplying tool outputs for a structured-output turn.
+- `system` (top-level) → internal system message
+- Typed content blocks (`text`, `tool_use`, `tool_result`, `thinking`) → internal `Message` structs
+- `input_schema` → OpenAI `parameters` for chat templates
+- `tool_result` in user messages → internal `role: "tool"`
+- `thinking` → `enable_thinking` + `reasoning_budget`; thinking blocks emit fake `signature`
+- Stop reasons: `stop`→`end_turn`, `length`→`max_tokens`, `tool_calls`→`tool_use`
+- SSE events: `message_start`, `content_block_{start,delta,stop}` (with `text_delta`/`thinking_delta`/`signature_delta`/`input_json_delta`), `message_{delta,stop}` — explicit start/stop lifecycle per indexed block
 
-### Compatibility quirks
-- The compliance suite at `experiments/openresponses` (run via `bun run test:compliance --base-url http://host:port/v1 --api-key X --model mlx-serve`) validates against the strict ResponseResource schema and the per-event streaming union — currently passes 17/17.
-- `top_level response_format` is accepted as an alias for `text.format` (some clients reuse their chat-completions adapter).
+**Claude Code launcher**: app sets `ANTHROPIC_BASE_URL`, dummy `ANTHROPIC_API_KEY`/`ANTHROPIC_AUTH_TOKEN`, `ANTHROPIC_DEFAULT_*_MODEL=mlx-serve`, `CLAUDE_CODE_SUBAGENT_MODEL=mlx-serve`.
 
-### Compaction (`POST /v1/responses/compact`)
+## Tool Calling
 
-Pure data transformation — no LLM call, no inference slot. The server reuses `responses_mod.parseInput` to materialize the resolved message history (including any `previous_response_id` lookup) and synthesizes an opaque `encrypted_content` blob: base64 over `{"v":1,"msgs":[{"role":..., "content":...}, ...]}`. Feeding the returned `compaction` item back into `response.create` as an `input` element (handled by `appendCompactionInputItem` in `responses.zig`) reconstitutes the messages — exercising the round-trip without an LLM call. `model` is required (422 on missing). Tool calls and images are dropped when encoding (the blob is text-only).
+### Server (Zig)
+- **Detection**: when `tools` present, server buffers tokens, checks `<tool_call>`, Hermes XML, Gemma 4 `<|tool_call>`, raw JSON. Gemma 4 double-brace args (`{{...}}`) unwrapped before parse. Thinking tokens buffered separately if enabled.
+- **Serialization** (`chat.serializeMessagesJson`): `role: "tool"` passed natively (Gemma 4 templates render `<|turn>tool` directly). Tool call `arguments` serialized as JSON strings, not objects.
+- **Streaming**: full args sent in one SSE delta (avoids client accumulation bugs). Thinking buffered until close tag, emitted as `reasoning_content`.
+- **Fallback** (`chat.fallbackFormatChat`): ChatML, Llama (`ipython` role), Gemma (`Tool result:` in user turn).
+- **KV cache**: `reuseKVCache()` token-by-token prefix compare; auto-invalidated after tool calls and pad-only gens. Sliding-window layers keep full buffer; views slice to last `sw` during decode.
 
-### WebSocket transport (`ws[s]://host/v1/responses`)
-
-Same endpoint, opt-in via the standard `Upgrade: websocket` handshake. Each text frame is a `response.create`-shaped JSON message; the server bridges the per-frame turn through `handleResponses` and emits each SSE event as a single WS text frame.
-
-- **No `[DONE]` on success.** `response.completed` (or `.failed`/`.incomplete`) is the per-response terminator, and the compliance suite advances turns the moment it sees one. A trailing `[DONE]` would land in the next turn's bucket and break chained sessions. `[DONE]` is reserved for error fallbacks where no terminal event is sent.
-- **Sequence numbers reset per response**, not per connection. `seq_num` lives inside `handleResponses`, fresh each call.
-- **Per-connection store-false cache.** `WsLocalCache` holds responses requested with `store: false` for the lifetime of the WS connection. After each turn, if the user requested `store: false`, the freshly-stored response is moved from the global `ResponseStore` into the connection-local cache; on connection close, all entries are freed. Cross-connection lookups of those ids correctly return `previous_response_not_found`.
-- **Cache eviction on failed continuation.** A failed continuation (status != "completed", or invalid `function_call_output`) evicts the chain root from the local cache.
-- **Bridge mechanism.** A `WsBridge` value (function pointer + opaque impl) is attached to `Conn.ws_mode` for the duration of a turn. `sendResponse` and `sendAnthropicEvent` branch on `ws_mode` so SSE bytes never hit the wire when bridging — instead the JSON payload becomes a single WS text frame. The SSE-headers write at the top of `handleResponses` is similarly guarded.
-
-## Anthropic Messages API
-
-The server exposes `POST /v1/messages` for Anthropic API compatibility, enabling Claude Code and other Anthropic SDK clients to use local models.
-
-### Request/Response mapping
-- **System prompt**: Anthropic puts `system` at top level → converted to internal system message
-- **Content blocks**: Anthropic messages use typed content blocks (`text`, `tool_use`, `tool_result`, `thinking`) → converted to internal `Message` structs
-- **Tools**: Anthropic `input_schema` → converted to OpenAI `parameters` format for chat template compatibility
-- **Tool results**: Anthropic `tool_result` in user messages → internal `role: "tool"` messages
-- **Thinking**: `thinking` config parsed → maps to `enable_thinking` + `reasoning_budget`; thinking blocks emitted with fake `signature` field
-- **Stop reasons**: `stop` → `end_turn`, `length` → `max_tokens`, `tool_calls` → `tool_use`
-
-### Streaming format
-Anthropic SSE uses named events: `message_start`, `content_block_start`, `content_block_delta` (with `text_delta`, `thinking_delta`, `signature_delta`, `input_json_delta`), `content_block_stop`, `message_delta`, `message_stop`. Each content block has an explicit start/stop lifecycle with an index.
-
-### Claude Code integration
-The MLX Core app has a "Launch Claude Code" button (visible when server is running) that opens Terminal with the `claude` CLI configured to use the local server:
-- `ANTHROPIC_BASE_URL` → local server URL
-- `ANTHROPIC_API_KEY` / `ANTHROPIC_AUTH_TOKEN` → dummy values (local server, no auth)
-- `ANTHROPIC_DEFAULT_*_MODEL` → `mlx-serve` (routes all model tiers through local)
-- `CLAUDE_CODE_SUBAGENT_MODEL` → `mlx-serve`
-
-## Tool Calling Architecture
-
-### Server side (Zig)
-- **Tool call detection**: When `tools` param is present, server buffers tokens and checks for tool call patterns. If thinking is enabled, thinking tokens are buffered separately and not flushed as content. After generation, `chat.parseToolCalls()` checks for patterns (`<tool_call>`, Hermes XML, Gemma 4 `<|tool_call>`, raw JSON). Gemma 4 double-brace args (`{{"key":"value"}}`) are unwrapped before JSON parsing.
-- **Message serialization** (`chat.serializeMessagesJson`): Converts `Message` structs to JSON for Jinja templates. `role: "tool"` messages are passed natively (no transformation) — Gemma 4 templates handle them directly as `<|turn>tool`. Tool call `arguments` are serialized as JSON strings (not objects) so templates render them correctly.
-- **Streaming SSE**: Tool call arguments are sent in a single delta (name + id + full args) to prevent client-side accumulation bugs. Thinking content (`<|channel>thought`) is detected during streaming and buffered until the closing tag, then emitted as `reasoning_content`.
-- **Fallback formatter** (`chat.fallbackFormatChat`): Used when Jinja fails. Handles ChatML (`<tool_call>/<tool_response>`), Llama (`ipython` role), Gemma (`Tool result:` in user turn).
-- **KV cache**: `reuseKVCache()` compares token-by-token prefix. Cache is automatically invalidated after tool-calling requests (generated tool-call tokens corrupt the cache for the next request) and after pad-only generations. Sliding window layers keep full buffers (no trimming) — views return the last `sw` entries during decode, all entries during prefill.
-
-### Client side (Swift)
-- **Agent loop** (`ChatView.runAgentLoop`): Up to 150 iterations. Calls model with tools → parses tool calls → executes locally → feeds results back → repeats until model responds without tool calls. Adds synthetic user nudge after tool results for models that need it.
-- **History builder** (`ChatView.buildAgentHistory`): Converts `ChatMessage` array to OpenAI API format. Filters out error messages, pad-only content, and agent summaries. Truncates assistant messages at 500 chars. Budget-aware: walks backward from newest message, fitting history within available context tokens (context_length - max_tokens - system_prompt). Pins first user message + first assistant response. Auto-compacts tool results when context is tight.
-- **SSE parsing** (`APIClient.performStream`): Accumulates streamed tool call deltas. Server sends full arguments in one delta. Emits `.toolCalls` event on `finish_reason: "tool_calls"`. Fallback emission if stream drops without finish_reason.
-- **Tool call storage**: `SerializedToolCall` (id, name, arguments as JSON string) stored on `ChatMessage.toolCalls`. Persisted via Codable for history replay. Backwards-compatible with old history files (field is optional).
-- **Error recovery**: Tool execution errors include what args were sent and ask the model to retry, enabling self-correction in the agent loop.
+### Client (Swift)
+- **Agent loop** (`ChatView.runAgentLoop`): up to 150 iters; tools → parse → exec → feed back → repeat. Synthetic user nudge after tool results for some models.
+- **History builder**: filters errors/pad-only/summaries, truncates assistant at 500 chars, budget-aware (walks backward, fits within `context_length - max_tokens - system_prompt`), pins first user + first assistant, auto-compacts tool results when tight.
+- **SSE parsing**: accumulates tool-call deltas; emits `.toolCalls` on `finish_reason: "tool_calls"`; fallback if stream drops without `finish_reason`.
+- **Storage**: `SerializedToolCall` (id, name, args as JSON string) on `ChatMessage.toolCalls`; Codable-persisted; backwards-compat (optional field).
+- **Error recovery**: tool errors include sent args + retry hint → enables self-correction.
 
 ## Prompt-based Skills
 
-Users can teach the agent new capabilities by dropping `.md` files in `~/.mlx-serve/skills/`. Each file has YAML frontmatter:
-
+`.md` files in `~/.mlx-serve/skills/` with YAML frontmatter:
 ```markdown
 ---
 name: deploy
-description: Deploy the project to production
-trigger: deploy, release, push to prod, ship it
+description: Deploy to production
+trigger: deploy, release, ship it
 ---
-When asked to deploy:
-1. Run `git push origin main`
-2. Check CI with `gh run list --limit 1`
+Steps...
 ```
-
-- `trigger` — comma-separated keywords; if the user's message contains ANY keyword (case-insensitive substring), the skill body is injected into the system prompt
-- A short skill index (name + description) is always included so the model knows what's available
-- `SkillManager` in `AgentPrompt.swift` scans the directory on each agent loop iteration (re-scans when dir modification date changes)
-- Skills are injected in `ChatView.runAgentLoop()` between the base system prompt and agent memory context
-- UI: folder icon button in menu bar and chat toolbar opens `~/.mlx-serve/` in Finder
+- `trigger`: comma-separated, case-insensitive substring match in user message → body injected into system prompt
+- Skill index (name + description) always included
+- `SkillManager` re-scans on dir mtime change
+- UI: folder icon opens `~/.mlx-serve/` in Finder
 
 ## Resumable Downloads
 
-Large model downloads (e.g., 26B at ~15 GB) use streaming writes to `.partial` files:
-
-- `DownloadManager` uses `URLSessionDataTask` with `StreamingDelegate` — bytes are written to `<file>.partial` as they arrive
-- If a download is interrupted (network drop, app crash), the `.partial` file survives on disk
-- On retry/resume, sends `Range: bytes=<existingSize>-` header; if server returns 206, only the remainder is downloaded; if 200, truncates and restarts
-- Automatic retry: 3 attempts per file with 2s/4s backoff; status text shows "Connection lost, retrying..."
-- Cancellation preserves `.partial` files for future resume
-- UI shows "Resume" instead of "Download"/"Retry" when `.partial` files exist (`hasPartialDownload()`)
-- Already-completed files are skipped (size check against HuggingFace metadata)
+`DownloadManager` streams to `<file>.partial` via `URLSessionDataTask`. Resume sends `Range: bytes=<existing>-`; 206 → continue, 200 → truncate+restart. 3 retries with 2s/4s backoff. Cancel preserves `.partial`. UI shows "Resume" when `hasPartialDownload()`. Already-complete files (size matches HF metadata) are skipped.
 
 ## Debugging
 
 ### Server logs
-- Start server with `--log-level debug` for verbose output (Jinja errors, cache hits, token counts)
-- The MLX Core app starts the server as a subprocess; stderr is captured in `ServerManager.serverLog` (64KB rolling buffer). View it via the log button (text-align icon) next to Start/Stop in the menu bar.
-- To see logs from a manually-started server: `./zig-out/bin/mlx-serve --model <path> --serve --port 8080 --log-level debug 2>&1`
-- Key log patterns:
-  - `jinja error: ..., using fallback` — Jinja template failed, check template compatibility
-  - `[cache] reusing N/M tokens` — KV cache hit; if N is close to M, most of prompt is cached
-  - `[cache] invalidated` — cache was reset (tools config changed, etc.)
-  - `<- N+M tokens (Xms) [reason]` — N prompt tokens, M completion tokens, finish reason
-  - `tool_msgs=N` — count of `role: "tool"` messages in the request
+- `--log-level debug` for verbose output
+- App captures stderr in `ServerManager.serverLog` (64KB rolling buffer); view via log button in menu bar
+- Manual: `./zig-out/bin/mlx-serve --model <path> --serve --port 8080 --log-level debug 2>&1`
+- Patterns: `jinja error:`, `[cache] reusing N/M tokens`, `[cache] invalidated`, `<- N+M tokens (Xms) [reason]`, `tool_msgs=N`, `[spec-stats] mode=...`, `spec-gate: ngram-score=...`
 
-### Swift app logs
-- `print()` in the Swift app goes to stdout, not visible when launched via `open`. To see it: run the binary directly from terminal, or write to a file.
-- The app dumps every agent loop request to `~/.mlx-serve/last-agent-request.json` (debug aid). Replay with: `curl -sf http://127.0.0.1:8080/v1/chat/completions -H "Content-Type: application/json" -d @~/.mlx-serve/last-agent-request.json`
-- Chat history is persisted at `~/.mlx-serve/chat-history.json`
+### Swift logs
+- `print()` invisible when launched via `open` — run binary directly or write to file
+- Every agent request dumped to `~/.mlx-serve/last-agent-request.json`; replay via curl
+- Chat history at `~/.mlx-serve/chat-history.json`
 
-### Reproducing issues
-- To test tool calling without the app: use `curl` with `stream: false` first (simpler to inspect), then `stream: true` (matches app behavior).
-- To test the Jinja template offline: `pip3 install jinja2`, then render with Python using the model's `chat_template.jinja` file and the dumped request JSON.
-- To test KV cache effects: restart the server fresh between tests (`pkill -f mlx-serve`). A single bad request can poison the cache for all subsequent requests.
+### Reproducing
+- Tool calling: curl with `stream: false` first, then `stream: true`
+- Jinja offline: `pip3 install jinja2`, render `chat_template.jinja` with dumped request
+- KV cache: `pkill -f mlx-serve` between tests — one bad request can poison the cache
 
 ## Gotchas
 
 ### KV cache after tool calls
-After a tool-calling request, the KV cache is automatically invalidated. The generated tool-call tokens are in the cache but not in `cached_prompt_ids`, so reusing the cache for the next request (which includes tool results) would corrupt attention. Similarly, pad-only generations trigger cache invalidation.
+Generated tool-call tokens are in the cache but not in `cached_prompt_ids` → reusing for the next request (with tool results) corrupts attention. Auto-invalidated. Pad-only generations also trigger invalidation.
 
 ### Sliding window KV cache
-Models with sliding window attention (e.g., Gemma 4 E4B with 512-token window) keep the full KV buffer — no trimming. During prefill, all entries are returned so Q and K dimensions match. During decode, views return only the last `sw` entries. The sliding window mask handles attention scope. This matches mlx-lm's `RotatingKVCache` behavior.
+Gemma 4 E4B (512-token window) keeps full buffer — no trimming. Prefill returns all entries (Q/K dim match); decode views return last `sw`. Mask handles attention scope. Matches mlx-lm `RotatingKVCache`.
 
-### Gemma 4 tool calling format
-Gemma 4 templates handle `role: "tool"` natively (producing `<|turn>tool`). No transformation is needed — the server passes tool messages through as-is. The `tool_responses` field is NOT added (it causes duplicate content in rendered prompts). Tool call arguments are serialized as JSON strings so the template renders them verbatim.
+### Gemma 4 tool calling
+Templates render `role: "tool"` natively as `<|turn>tool` — no transformation. Don't add `tool_responses` field (causes duplicate content). Args serialized as JSON strings.
 
-### Streaming with tools and thinking
-When `tools` are present, the server buffers tokens to detect tool call patterns. If thinking is also enabled, `<|channel>thought` tokens are detected and kept buffered (not flushed as content) until the closing `<channel|>` tag. After generation, thinking content is split from visible content and emitted as `reasoning_content`. Channel tags (`<|channel>`, `<channel|>`) are stripped from visible content.
+### Streaming with tools + thinking
+Server buffers tokens to detect tool patterns. With thinking enabled, `<|channel>thought` is buffered (not flushed) until closing `<channel|>`. After generation, thinking is split into `reasoning_content`; channel tags stripped from visible content.
 
-### SSM/GatedDeltaNet state initialization
-`conv1dWithCache` sets `ssm.initialized = true` after updating the conv state, but BEFORE the SSM recurrence state is created. Code that initializes SSM state must check `ssm.ssm_state.ctx == null` (not `!ssm.initialized`). Both `mamba2Mixer` and `gatedDeltaNet` use this pattern.
+### SSM/GatedDeltaNet state init
+`conv1dWithCache` sets `ssm.initialized = true` after conv update but BEFORE SSM recurrence state exists. Init code must check `ssm.ssm_state.ctx == null`, NOT `!ssm.initialized`. Used by both `mamba2Mixer` and `gatedDeltaNet`.
 
-### Parameter-free RMS norm (mlx-c)
-mlx-c requires a non-empty weight array for `mlx_fast_rms_norm`. Passing a null/empty array (`.{ .ctx = null }`) crashes. For parameter-free normalization, pass `ones([dim], bfloat16)` as the weight. This affects GatedDeltaNet Q/K normalization and Mamba2 group norm.
+### Parameter-free RMS norm
+mlx-c crashes on null/empty weight for `mlx_fast_rms_norm`. Pass `ones([dim], bfloat16)` for parameter-free norm. Affects GatedDeltaNet Q/K norm and Mamba2 group norm.
 
 ### Nemotron-H time_step_limit
-Python's `ModelArgs.__post_init__` defaults `time_step_limit` to `(0.0, inf)` — effectively no dt clipping. The config.json fields `time_step_min`/`time_step_max` exist but are NOT used for SSM clipping by Python. Our defaults match Python: `(0.0, inf)`. Only the `time_step_limit` JSON array (if present) overrides these.
+Python defaults to `(0.0, inf)` (no dt clipping). `time_step_min`/`time_step_max` in config.json are NOT used by Python for SSM clipping. Only `time_step_limit` JSON array overrides.
 
-### PLD (Prompt Lookup Decoding) speculative decoding
-Model-agnostic speculative decoding via n-gram match in `prompt + generated_tokens`. No model weights required — works on every supported architecture. Enabled per-server via `--pld` (with `--pld-draft-len <n>` default 5 and `--pld-key-len <n>` default 3) and per-request via the `enable_pld` JSON field. The pure n-gram lookup lives in `src/pld_index.zig` (`PldLookup.findMatch`); the draft+verify orchestration is in `Generator.nextPld` / `generatePld` in `src/generate.zig`.
+### Speculative decoding (PLD + drafter) — overview
 
-**Verify-fusion (v2 invariant, post-v4 rewrite)**: `nextPld` mirrors `nextDrafter`'s invariant: `cache.step = prompt_len + tokens_emitted`, t1 NOT in cache, no pending state on entry. Verify input is `[t1, draft[0..m-1]]` length `1+m` (t1 is part of the input, NOT pre-forwarded). Walk `verify_logits[i]` vs `draft[i]` for `i = 0..m-1`. On full accept: `cache.step = prompt_len + TE_new`, sample `new_t1` from `verify_logits[m]` (= "bonus" prediction one past the last accepted draft), set `next_token_id = new_t1`, NO post-step forward. Saves 1 forward per accept step relative to v1.
+Two paths share a verify invariant: `cache.step = prompt_len + tokens_emitted`, t1 NOT in cache on entry, no pending state. Verify input is `[t1, draft[0..m-1]]` length `1+m`; full accept samples `new_t1` from `verify_logits[m]` (bonus prediction); partial accept rolls back via `KVCache.snapshot/restore` + `ssmSnapshot/Restore` and re-forwards `[t1, draft[0..accepted-1]]`. `accepted=0` still re-forwards `[t1]`. Pending correction sampled from *original* `verify_logits[accepted]` (NOT re-forward); index is `accepted` not `accepted-1` — off-by-one silently corrupts output, guarded by `tests/test_pld_equivalence.sh`.
 
-**Cold path** (no n-gram match): `forward([t1])` length 1 sync → sample lookahead → emit t1. v2 LOSES v1's lazy-pipeline overlap on cold steps; the prompt-time gate (see "Adaptive spec-decode gate") MUST disable PLD on novel content under default operation, otherwise the per-cold-step cost re-introduces A's ~10% novel-output regression. Explicit `enable_pld: true` in the request body bypasses the gate and re-exposes the regression.
+**PLD** (`src/pld_index.zig`, `Generator.nextPld`): model-agnostic n-gram match in `prompt + generated`. CLI `--pld --pld-draft-len 5 --pld-key-len 3`; per-request `enable_pld`. `Generator.initWithOptions` clones prompt to `prompt_ids_owned` (caller-supplied freed before `nextPld`). Stochastic verify: draft as one-hot; `accept_prob = min(1, target_p[draft[i]])`, residual `max(target_p − one_hot, 0)` renormalized — preserves marginal per Leviathan. One-hot built via `pldOneHotRow` (no scatter).
 
-**Auto-disable rules**: off when `tools` are present, off when `logprobs > 0`, off when grammar-constrained sampling is active. **Streaming is supported** via `StreamingTokenStream` — the per-token state machines in `handleStreamingGeneration` / `handleAnthropicStreaming` are oblivious to multi-token batches. PLD works on hybrid SSM architectures (LFM2.5, Nemotron-H) — see "PLD on hybrid SSM models" below for the snapshot/restore null-state caveat. **Drafter+PLD priority**: drafter > PLD > regular. When both are enabled, the higher-priority mode wins; the other's enable flag is silently zeroed before dispatch to prevent log spam.
+**Drafter** (`src/drafter.zig`, `Generator.nextDrafter`): Gemma 4 only. 4-layer, hidden 256, no K/V projections — cross-attends into target's K/V via layer-type mapping (drafter sliding → target last sliding; drafter full → target last full). Loaded via `--drafter <dir>`. `block_size` auto-detected per target (E2B=2, E4B=4, 26B-A4B=4, 31B=8 — matches vLLM PR #41745) via `recommendedBlockSize`; override with `--draft-block-size`. Input: `concat([target.embed(prev) * sqrt(target.hidden), h_prev], -1)` → drafter hidden 256. Autoregressive within round (`block_size − 1` drafts), constant RoPE offset. Sparse `MaskedEmbedding` LM head (~2048 centroids, top-32 → ~4096 token logits of 262144). Linear weights pre-transposed at load.
 
-**Default-on caveat**: PLD is **not** flipped on by default at the CLI level — users still pass `--pld`. After v2 verify-fusion: Gemma-4-E4B heavy-echo gains 1.82× (up from v1's 1.51×), Qwen3.5-4B heavy-echo at 0.96× (~unchanged from v1's 0.97×), LFM2.5-350M heavy-echo regresses to 0.78× (DEEPER than v1's 0.92× — the lost lazy overlap costs more than the saved post-step forward on a 350M model). Creative content under explicit override: ~0.91-0.94× (A-style regression returns; ungated). The prompt-time gate is now **mandatory** rather than advisory: under default operation it filters novel content to 1.00×; users who explicitly `enable_pld:true` on novel content will see the regression. Once `--pld` is set on the server, the **adaptive gate** (see below) decides per-request whether PLD actually runs.
+**Validation**: `error.UnsupportedDrafterArch` (model_type mismatch), `error.DrafterTargetMismatch` (hidden_size or layer_types incompatible).
 
-**`prompt_ids_owned`**: `Generator.initWithOptions` clones the input `prompt_ids` into `prompt_ids_owned` (freed in `deinit`) so PLD's lookup table sees the full context. The caller-supplied slice is freed before `nextPld` runs, so we cannot reference it. The owned copy is also visible to non-PLD generators but unused there.
+**`forwardCaptureHidden`**: `forwardStandard` and `forwardMoe` honor `capture_hidden`, slicing post-final-norm hidden at LAST position. Drafter seeds first `h_prev`; PLD uses during partial-accept rollback. Other forward paths (BERT, hybrid) leave it empty — drafter/PLD not wired there.
 
-**Partial-accept re-forward**: when verify accepts `accepted < m` drafts, the cache is over-advanced by `m - accepted`. `nextPld` rolls back via `KVCache.snapshot/restore` + `ssmSnapshot/Restore`, then re-forwards `[t1, draft[0..accepted-1]]` length `1+accepted` to land the cache at exactly `+1+accepted` (= `prompt_len + TE_new`). The `accepted=0` case (= first draft rejected) MUST still re-forward `[t1]` length 1 — under v2 t1 is part of the rolled-back verify input, so skipping the re-forward would leave the cache one short. The pending correction is sampled from the *original* `verify_logits[accepted]` (not the re-forward) — that's the model's choice for the rejected position. The sampling index is `accepted`, NOT `accepted-1`: t1 occupies index 0 of the verify input under v2, so the prediction for "what comes after the last accepted draft" sits at index `accepted`. Off-by-one here would silently corrupt output — guarded by `tests/test_pld_equivalence.sh`.
+**Auto-disable**: tools, `logprobs > 0`, grammar-constrained sampling. PLD works on hybrid SSM (LFM2.5, Nemotron-H) — see snapshot null-state guard below. Drafter is non-streaming-only in v1; streaming drafter requests fall through to regular streaming with a log line. Drafter > PLD > regular priority when both enabled.
 
-**Runtime acceptance gate** (v4 Phase 1): `Generator.spec_disabled_runtime` is set to `true` mid-decode if the per-request average draft acceptance falls below `RUNTIME_GATE_MIN_RATE = 0.30` after `RUNTIME_GATE_WARMUP = 5` attempts. Once set, every subsequent `nextPld` / `nextDrafter` call short-circuits to `Generator.next` for the rest of the request (sticky for that generation; never re-enables). The `next()` slow path has a transition shim: when `!has_pending_logits and !has_pending_token`, it synchronously `forward([next_token_id])`s to seed pending_logits — required because v2 PLD and drafter both exit with t1 NOT in cache, while `next()`'s fast path expects pending_logits to be populated. The gate is a defense-in-depth for any future workload where draft acceptance collapses mid-decode; it does NOT fire on the LFM/Qwen heavy-echo regressions (those have HIGH acceptance rates, well above the 0.30 threshold — the regression there is per-step overhead vs. small-model forward cost, not low acceptance).
+**Adaptive prompt-time gate** (`spec_gate_threshold = 0.01` in `server.zig`): n-gram repetition score on tokenized prompt (`pld_index.ngramRepeatScore`, 3-grams). If `score < threshold` AND user didn't set `enable_pld:true`/`enable_drafter:true`, the flag is silently disabled. Runs in all three request paths; chat-completions logs `spec-gate: ngram-score=X.XXX` once per request. v4 corpus validation: 9/9 correct decisions; threshold 0.01 cleanly separates "any 3-gram repeats" from pure-novel prompts.
 
-**Stochastic verify** treats the draft as a one-hot distribution (since it came from n-gram lookup, not a probabilistic model): `accept_prob = min(1, target_p[draft[i]])`. On reject, sample from residual `max(target_p − one_hot(draft[i]), 0)` renormalized — equivalent to "sample from target distribution conditional on not draft[i]" which preserves the marginal distribution per Leviathan et al. The one-hot is built via `pldOneHotRow` (arange + equal + cast) — no scatter required.
+**Runtime acceptance gate** (`RUNTIME_GATE_MIN_PER_DRAFT_RATE = 0.50`, warmup 5): when per-draft acceptance falls below 50% mid-decode, `Generator.spec_disabled_runtime` flips on (sticky). Subsequent calls short-circuit to `Generator.next`, which has a transition shim: when no pending logits/token, sync `forward([next_token_id])` to seed pending_logits. Pre-v26.5.6 the gate compared per-round against 0.30 → almost never fired; 0.50 cleanly cuts creative-content tail (22-47%) while leaving heavy-echo (84-97%) untouched. Does NOT save MoE+drafter regressions where per-draft is high but verify cost dominates — handled by MoE default-off in `serve()`.
 
-**Equivalence test**: `./tests/test_pld_equivalence.sh [port]` (defaults to `~/.mlx-serve/models/Qwen3.5-4B-MLX-4bit`; override with `PLD_TEST_MODEL=<dir>`). Greedy temp=0 output must be byte-identical with vs without `--pld`. Skips cleanly when no model is available. Verified on Qwen3.5-4B, Gemma-4-E4B, and LFM2.5-350M.
-
-### Gemma 4 assistant drafter speculative decoding
-Google ships small 4-layer drafter checkpoints alongside Gemma 4 (`gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant-bf16`). Hidden size 256, 4 attention heads, **no K/V projections** — the drafter cross-attends into the **target's** K/V cache via a layer-type mapping (drafter sliding layer reads target's last sliding layer's K/V; drafter full layer reads target's last full layer's K/V). Loaded explicitly via `--drafter <dir>` (and `--draft-block-size <n>` default 4); per-request `enable_drafter` JSON field defaults true when a drafter is loaded.
-
-Drafter input per step: `concat([target.embed(prev_tok) * sqrt(target.hidden), h_prev], -1)` projected from `[1,1,2*backbone_hidden]` → drafter hidden 256. The drafter is autoregressive within the round (`block_size − 1` forwards = 3 drafts per round at default), each step's hidden feeding the next; position is constant across all drafts in a round (RoPE offset = `target.cache.step + 1`). Verify mirrors PLD: target forwards `[t1, draft[0..K-1]]` length `1+K`, argmax compare per position, partial-accept rollback via `KVCache.snapshot/restore`. Sparse `MaskedEmbedding` LM head: ~2048 centroids, top-32 → ~4096 token logits materialized of 262144 total.
-
-Validation at load: pair-check rejects mismatched drafter+target (`error.UnsupportedDrafterArch` if `model_type != "gemma4_assistant"`, `error.DrafterTargetMismatch` if `backbone_hidden_size != target.hidden_size` or any drafter `layer_type` is absent from target's `layer_types[:N - num_kv_shared_layers]`). All drafter linear weights are pre-transposed at load so `step()` uses plain `mlx_matmul` — no per-step transpose cost.
-
-**`forwardCaptureHidden`**: both `forwardStandard` and `forwardMoe` honor the `capture_hidden` slot, slicing the post-final-norm hidden at the LAST position before the lm_head qmatmul. Drafter uses it to seed `h_prev` for the first step; PLD uses it during partial-accept rollback. Other forward paths (BERT, hybrid) leave it as a default empty array — drafter/PLD aren't wired for those architectures.
-
-**Streaming**: drafter dispatch is **non-streaming-only** in v1 (TODO: extend `StreamMode` enum + `StreamingTokenStream` adapter to include `.drafter`). Streaming requests with `enable_drafter:true` log `drafter=disabled (streaming; non-stream supports it)` and fall through to regular streaming. Auto-disabled with `tools`, `logprobs > 0`, grammar-constrained sampling, and on hybrid SSM architectures (the multi-token verify forward isn't yet wired through the SSM/conv recurrence path).
-
-**Equivalence test**: `tests/test_drafter_equivalence.sh` — byte-identical greedy temp=0 output with `--drafter` vs without on `~/.mlx-serve/models/gemma-4-e4b-it-4bit` paired with `~/.mlx-serve/models/gemma-4-E4B-it-assistant-bf16`. Verified at PASS with 36/12 attempts (3.0/3 max acceptance rate) on echo-heavy prompt, 67 tok/s decode (vs 33.5 baseline = 2.0×).
-
-**Default-on caveat**: drafter is **not** flipped on by default. Bench shows extreme bimodal behavior — Gemma-4-E4B heavy-echo gets 1.98× speedup, but creative/novel content runs at **0.555× (45% slowdown)** because draft acceptance collapses on out-of-distribution content and verify-then-fallback overhead dominates. The agent harness mixes echo + novel content per-turn, so a default-on flip would slow down half of all turns. Stays opt-in via `--drafter`; the adaptive prompt-time gate (n-gram repetition score) handles per-request enablement once `--drafter` is set.
-
-### Adaptive spec-decode gate
-
-PLD and drafter both pay per-step overhead that only pays off on echo-heavy content. To make `--pld` / `--drafter` safe to enable by default, every request goes through an n-gram repetition score on the tokenized prompt (`pld_index.ngramRepeatScore`, 3-grams, ratio of distinct n-grams that recur). If `score < spec_gate_threshold` (= 0.01 in `server.zig`) AND the user did not put `enable_pld: true` / `enable_drafter: true` explicitly in the JSON body, the flag is silently disabled for this request and a `pld=disabled (ngram-score=X.XXX < gate threshold Y.YYY)` line is logged.
-
-- The gate runs in all three request paths: `/v1/chat/completions`, `/v1/messages` (Anthropic), `/v1/responses`. The chat-completions path also logs `spec-gate: ngram-score=X.XXX (threshold=Y.YYY)` once per request when the score is computed, regardless of the decision — useful for `bench_spec.sh --corpus`.
-- Bench results (gated, runs=3): Gemma drafter on heavy-echo stays at 2.07×; Gemma drafter on creative is 1.00× (gate killed the prior 0.55× regression); Qwen/LFM PLD heavy-echo stays at 0.99×/0.91× (gate keeps PLD on because the prompt has BPE n-gram repeats above threshold — same as ungated, the gate cannot distinguish "heavy-echo with model regression" from "heavy-echo with model speedup").
-- Threshold validation: v4 Phase 3 ran a 9-prompt corpus through `bench_spec.sh --corpus` and got 9/9 correct decisions. Confirms 0.01 is well-calibrated. The corpus also showed RAG-style retrieval-grounded answers (score=0.022) gaining 1.16× — even non-echo workloads with structural repetition benefit from PLD.
-- Threshold tuning: 0.01 cleanly separates "any 3-gram repeats" from "pure novel" prompts (creative/essay prompts score 0.000). Plan started at 0.15; in practice BPE tokenization fragments echo content enough that even strong echo cases land in the 0.01–0.13 range.
-- `tests/bench_spec.sh --gated` measures the gated path; default mode injects `enable_pld:true` to bypass the gate and measure raw spec-decode performance.
+**Default-on policy**: PLD/drafter not flipped on at CLI; users still pass `--pld`/`--drafter`. While loaded:
+- Dense Gemma 4 (E2B/E4B/31B) drafter: `enable_drafter` defaults TRUE per-request; gates handle creative content
+- MoE Gemma 4 (26B-A4B) drafter: `enable_drafter` defaults FALSE — verify forward MoE expert-routing penalty makes drafter regress at batch=1 even at 97.8% per-draft (every block_size tested). PLD remains default-on (1.43× echo). Per-request override still works.
 
 ### PLD/drafter long-greedy byte-divergence at INT4
-Spec-decode paths run two different MLX matmul kernels: AR (regular `next`) forwards `[1,1,d]` (length-1 qmv), while verify forwards `[1,K+1,d]` (length-K+1 qmm). At INT4 quantization those kernels do their float reductions in slightly different orders, so a near-tie argmax token (two top-2 logits within ~ulp) can flip between them. Once a single token flips the prefix changes and divergence cascades.
+AR (`next`) forwards `[1,1,d]` qmv; verify forwards `[1,K+1,d]` qmm. INT4 float reductions in slightly different orders → near-tie argmax can flip → divergence cascades. First ~30–80 generated tokens at temp=0 are byte-identical (equivalence tests live here); beyond that, paths may diverge char-by-char while both being mathematically valid greedy outputs. At temp ≥ 0.01 the Leviathan sampler preserves the target distribution → exact past 30 tokens. **For byte-stable long-greedy at temp=0 on INT4: `--no-pld`, no `--drafter`.** For chat/agent (temp>0) spec-decode is exact and free.
 
-In practice:
-- For the **first ~30–80 generated tokens at temp=0**, PLD/drafter output is byte-identical to AR. The short-prompt redline equivalence tests live in this zone, so a real logic bug — wrong argmax from token 0, off-by-one in partial-accept rollback, etc. — surfaces immediately.
-- Beyond that point at INT4 with greedy decode, PLD/drafter may diverge from AR character-by-character even though both are deterministic and both are mathematically valid greedy outputs of the model. The equivalence tests assert byte-equivalence on the first 30 tokens of long-prompt completions specifically to tolerate this float-noise tail.
-- At **temp ≥ 0.01**, the Leviathan probability-ratio + residual-correction sampler preserves the target distribution, so spec-decode is *mathematically exact* even past the first ~30 tokens.
-
-**Recommendation**: for byte-stable long-greedy at temp=0 on INT4 models, run with `--no-pld` (and don't pass `--drafter`). For chat / agent workloads (temp > 0) the spec-decode paths are exact and the speedup is free.
-
-### PLD on hybrid SSM models (snapshot null-state guard)
-PLD requires snapshotting the per-layer SSM cache before the multi-token verify forward, so partial-accept can roll back. On hybrid models the `SSMCacheEntry` has two independent slots (`conv_state`, `ssm_state`) populated by *different* layer types: LFM2's `gated_conv` writes only `conv_state` (sets `initialized=true` for cache reuse) and never touches `ssm_state`. Calling `mlx_array_set` with a null source aborts the process via mlx-c's default error handler (`printf("MLX error: expected a non-empty mlx_array") + exit(-1)`), so the snapshot/restore code in `transformer.zig` (`ssmSnapshot`, `ssmRestore`, plus the parallel `PrefillCache` save/restore paths) checks each field's `.ctx != null` independently — the `initialized` flag alone is not sufficient. This was the previous "off on hybrid SSM" auto-disable; lifted once the per-field guard landed.
+### PLD on hybrid SSM (snapshot null-state guard)
+`SSMCacheEntry` has two slots (`conv_state`, `ssm_state`) populated by different layer types: LFM2's `gated_conv` writes only `conv_state` (sets `initialized=true`) and never touches `ssm_state`. `mlx_array_set` with null source aborts via mlx-c's default handler (`exit(-1)`). `ssmSnapshot`/`ssmRestore` and `PrefillCache` save/restore must check each field's `.ctx != null` independently — `initialized` alone insufficient. This was the previous "off on hybrid SSM" auto-disable; lifted once per-field guard landed.
 
 ### mlx-c API changes
-mlx-c 0.6.0 added a `global_scale` parameter (may be null) to `mlx_dequantize` between `mode` and `dtype`. The FFI declaration in `mlx.zig` must match the installed header. When upgrading mlx-c, diff the headers in `/opt/homebrew/include/mlx/c/ops.h` against the `extern "c"` declarations in `src/mlx.zig`.
+mlx-c 0.6.0 added a `global_scale` param (may be null) to `mlx_dequantize` between `mode` and `dtype`. FFI in `mlx.zig` must match installed header. When upgrading, diff `/opt/homebrew/include/mlx/c/ops.h` against `extern "c"` decls.
 
 ### Two binaries in the app bundle
-The MLX Core `.app` bundle contains TWO binaries: `MLXCore` (Swift UI) and `mlx-serve` (Zig server). Both must be updated when making changes. The Swift app starts the Zig server as a child process. Forgetting to copy one binary after a rebuild is a common source of "it still doesn't work."
+`.app` contains `MLXCore` (Swift UI) AND `mlx-serve` (Zig server). Both must be updated together. Forgetting one after rebuild is a common "still doesn't work" cause.
 
-### WebSearch and Browse
-The `webSearch` tool navigates to DuckDuckGo HTML search and extracts structured results (titles, URLs, snippets) via JavaScript. The `browse` tool's `readText` action navigates to the URL first, then extracts text — this ensures each browse returns the correct page content (not the previous page's).
+### WebSearch + Browse
+`webSearch` navigates DuckDuckGo HTML, extracts results via JS. `browse.readText` navigates first then extracts — ensures correct page (not previous).
 
-### WKWebView requires main thread
-`BrowserManager` is `@MainActor`. All WKWebView operations (navigate, readText, evaluateJS) must happen on the main thread. The WKWebView is created eagerly at app launch so tools work without the Browser window being open.
+### WKWebView main thread
+`BrowserManager` is `@MainActor`. All WKWebView ops (navigate, readText, evaluateJS) on main thread. Created eagerly at app launch so tools work without Browser window open.
 
 ### Swift JSONSerialization quirks
-- `[String: Any]` dictionaries serialize with non-deterministic key order
-- Empty string `""` stays as `""` in JSON (not `null`); the server treats both as empty
-- `Double` values like `0.7` serialize as `0.69999999999999996` (floating point); this is fine
-- `arguments` in tool_calls must be a JSON String (e.g., `"{\"command\":\"ls\"}"`) not a nested dict; the server checks `if (v == .string)` to extract it
+- `[String: Any]` non-deterministic key order
+- `""` stays `""` in JSON (not `null`); server treats both as empty
+- `Double` like `0.7` → `0.69999999999999996` — fine
+- `arguments` in tool_calls must be a JSON String (e.g., `"{\"command\":\"ls\"}"`), not nested dict; server checks `if (v == .string)`

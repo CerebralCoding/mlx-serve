@@ -1135,7 +1135,8 @@ pub const Transformer = struct {
                     appendHybridMlpWeights(all_vec, &lw.mlp);
                     if (lw.shared_mlp) |smlp| {
                         inline for (std.meta.fields(DenseMlpWeights)) |field| {
-                            _ = mlx.mlx_vector_array_append_value(all_vec, @field(smlp, field.name));
+                            const arr = @field(smlp, field.name);
+                            if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, arr);
                         }
                     }
                     switch (lw.attn) {
@@ -4222,17 +4223,20 @@ pub const Transformer = struct {
 
         // Expert computation. Two paths:
         //
-        //   Decode / small prefill (B*S*K < 64): per-expert gather_qmm with
-        //   `rhs_indices=inds` shape [B,S,K]. Output is [B,S,K,1,inter]; works
-        //   but each token's K experts can be any subset, so HBM reads of the
-        //   quantized expert blocks are scattered.
+        //   Decode (S=1): per-expert gather_qmm with `rhs_indices=inds` shape
+        //   [B,S,K]. Output is [B,S,K,1,inter]; each token reads K expert
+        //   blocks from random offsets, but at S=1 there are at most K unique
+        //   experts so HBM scatter is bounded.
         //
-        //   Large prefill (B*S*K >= 64): mlx-lm's `_gather_sort` flow. Flatten
-        //   inds → argsort globally → `lhs_indices = order // K` selects which
-        //   token row to feed each sorted slot; `rhs_indices = inds[order]`
-        //   selects the expert (now sorted, so consecutive slots hit the same
-        //   expert block → one HBM stream). After down_proj, an inverse
-        //   permutation restores the original [B,S,K] layout.
+        //   Multi-position (S>1): mlx-lm's `_gather_sort` flow. Flatten inds →
+        //   argsort globally → `lhs_indices = order // K` selects which token
+        //   row to feed each sorted slot; `rhs_indices = inds[order]` selects
+        //   the expert (now sorted, so consecutive slots hit the same expert
+        //   block → one HBM stream). After down_proj, an inverse permutation
+        //   restores the original [B,S,K] layout. Critical for drafter verify
+        //   on MoE: at block_size=4 + top_k=8 the old `total_inds >= 64`
+        //   threshold left verify (32 inds) on the slow scatter path while the
+        //   sorted path's argsort overhead is negligible at that size.
         const x_shape = mlx.getShape(expert_x);
         const B = x_shape[0];
         const S = x_shape[1];
@@ -4240,7 +4244,7 @@ pub const Transformer = struct {
         const inds_shape = mlx.getShape(inds);
         const K = inds_shape[inds_shape.len - 1];
         const total_inds: c_int = B * S * K;
-        const do_sort = total_inds >= 64;
+        const do_sort = S > 1 or total_inds >= 64;
         const no_idx = mlx.mlx_array{ .ctx = null };
 
         var down_out = mlx.mlx_array_new();
@@ -4660,15 +4664,19 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             lw.layer_scalar = getLayerWeightOpt(weights, name_buf, prefix, li, "layer_scalar");
             lw.shared_mlp = .{
                 .gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
-                .gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.scales"),
-                .gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.biases"),
+                .gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+                .gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
                 .up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
-                .up_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.scales"),
-                .up_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.biases"),
+                .up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+                .up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.biases") orelse mlx.mlx_array_new(),
                 .down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
-                .down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.scales"),
-                .down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.biases"),
+                .down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+                .down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.biases") orelse mlx.mlx_array_new(),
             };
+            const sm = &lw.shared_mlp.?;
+            try maybeTransposeForBf16(&sm.gate_w, sm.gate_s, &owned_bf16, allocator, s);
+            try maybeTransposeForBf16(&sm.up_w, sm.up_s, &owned_bf16, allocator, s);
+            try maybeTransposeForBf16(&sm.down_w, sm.down_s, &owned_bf16, allocator, s);
         }
 
         if (is_linear) {
@@ -4762,33 +4770,46 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
         }
 
         if (config.isMoe() and is_gemma4) {
-            // Gemma 4 MoE: different weight naming, Sigma-MoE routing, no shared expert gate
+            // Gemma 4 MoE: different weight naming, Sigma-MoE routing, no shared expert gate.
+            // Each `*_s`/`*_b` is loaded optionally for Unsloth Dynamic compatibility —
+            // bf16 layers carry only the weight, no scales/biases. The post-construction
+            // `maybeTransposeForBf16` calls are no-ops for already-quantized weights.
             lw.mlp = .{ .moe = .{
                 .router_w = getLayerWeight(weights, name_buf, prefix, li, "router.proj.weight"),
-                .router_s = getLayerWeight(weights, name_buf, prefix, li, "router.proj.scales"),
-                .router_b = getLayerWeight(weights, name_buf, prefix, li, "router.proj.biases"),
+                .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "router.proj.scales") orelse mlx.mlx_array_new(),
+                .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "router.proj.biases") orelse mlx.mlx_array_new(),
                 .router_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.scale"),
                 .per_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.per_expert_scale"),
                 .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.weight"),
-                .switch_gate_s = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.scales"),
-                .switch_gate_b = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.biases"),
+                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.gate_proj.biases") orelse mlx.mlx_array_new(),
                 .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.weight"),
-                .switch_up_s = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.scales"),
-                .switch_up_b = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.biases"),
+                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.up_proj.biases") orelse mlx.mlx_array_new(),
                 .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.weight"),
-                .switch_down_s = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.scales"),
-                .switch_down_b = getLayerWeight(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.biases"),
+                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.biases") orelse mlx.mlx_array_new(),
                 // Shared expert handled via lw.shared_mlp for Gemma 4 (separate branch in forward)
                 .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
-                .shared_gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.scales"),
-                .shared_gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.biases"),
+                .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
                 .shared_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
-                .shared_up_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.scales"),
-                .shared_up_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.biases"),
+                .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.biases") orelse mlx.mlx_array_new(),
                 .shared_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
-                .shared_down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.scales"),
-                .shared_down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.biases"),
+                .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.biases") orelse mlx.mlx_array_new(),
             } };
+            {
+                const mw = &lw.mlp.moe;
+                try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_gate_w, mw.switch_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_up_w, mw.switch_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_down_w, mw.switch_down_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
+            }
             // Pre-fold the sigma-MoE router norm scale: at runtime the router does
             // `rms_norm(x, router_scale * hidden_size^-0.5, eps)`. Multiplying once
             // at load time saves the per-layer multiply (3 ops × num_layers).
@@ -4802,45 +4823,69 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 lw.mlp.moe.router_scale = folded;
             }
         } else if (config.isMoe()) {
-            // Qwen3.5 MoE
+            // Qwen3.5 MoE. Each `*_s`/`*_b` is loaded optionally — Unsloth Dynamic
+            // checkpoints (e.g. Qwen3.6-A3B UD) leave the router (`mlp.gate`) and the
+            // shared-expert gate (`mlp.shared_expert_gate`) as plain bf16, with no
+            // scales/biases. The `maybeTransposeForBf16` calls below pre-transpose
+            // bf16 weights from `[out, in]` → `[in, out]` so `qmatmulBits` can
+            // dispatch to plain `mlx_matmul`. They no-op on already-quantized weights.
             lw.mlp = .{ .moe = .{
                 .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
-                .router_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.scales"),
-                .router_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.biases"),
+                .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
+                .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
                 .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
-                .switch_gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.scales"),
-                .switch_gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.biases"),
+                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
                 .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
-                .switch_up_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.scales"),
-                .switch_up_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.biases"),
+                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
                 .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
-                .switch_down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales"),
-                .switch_down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases"),
+                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
                 .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight"),
-                .shared_gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.scales"),
-                .shared_gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.biases"),
+                .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.biases") orelse mlx.mlx_array_new(),
                 .shared_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.weight"),
-                .shared_up_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.scales"),
-                .shared_up_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.biases"),
+                .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.biases") orelse mlx.mlx_array_new(),
                 .shared_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.weight"),
-                .shared_down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.scales"),
-                .shared_down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.biases"),
+                .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.biases") orelse mlx.mlx_array_new(),
                 .shared_expert_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert_gate.weight"),
-                .shared_expert_gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert_gate.scales"),
-                .shared_expert_gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_expert_gate.biases"),
+                .shared_expert_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.scales") orelse mlx.mlx_array_new(),
+                .shared_expert_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert_gate.biases") orelse mlx.mlx_array_new(),
             } };
+            {
+                const mw = &lw.mlp.moe;
+                try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_gate_w, mw.switch_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_up_w, mw.switch_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_down_w, mw.switch_down_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
+                if (mw.shared_expert_gate_w) |*seg_w_ptr| {
+                    try maybeTransposeForBf16(seg_w_ptr, mw.shared_expert_gate_s.?, &owned_bf16, allocator, s);
+                }
+            }
         } else {
             lw.mlp = .{ .dense = .{
                 .gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
-                .gate_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.scales"),
-                .gate_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.biases"),
+                .gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+                .gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
                 .up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
-                .up_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.scales"),
-                .up_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.biases"),
+                .up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+                .up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.biases") orelse mlx.mlx_array_new(),
                 .down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
-                .down_s = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.scales"),
-                .down_b = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.biases"),
+                .down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+                .down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.biases") orelse mlx.mlx_array_new(),
             } };
+            {
+                const dw = &lw.mlp.dense;
+                try maybeTransposeForBf16(&dw.gate_w, dw.gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&dw.up_w, dw.up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&dw.down_w, dw.down_s, &owned_bf16, allocator, s);
+            }
         }
 
         ssm_entries[i] = .{
@@ -5020,19 +5065,25 @@ fn appendLinearAttnWeights(vec: mlx.mlx_vector_array, la: *const LinearAttnWeigh
 }
 
 fn appendHybridMlpWeights(vec: mlx.mlx_vector_array, hw: *const HybridMlpWeights) void {
+    // Plain-bf16 layers (Unsloth Dynamic) carry null-ctx scales/biases — skip those
+    // so they don't pollute the eval batch. Mirrors `appendLinearAttnWeights`.
     switch (hw.*) {
         .moe => |*mw| {
             inline for (std.meta.fields(MoeMlpWeights)) |field| {
                 if (field.type == ?mlx.mlx_array) {
-                    if (@field(mw, field.name)) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
-                } else {
-                    _ = mlx.mlx_vector_array_append_value(vec, @field(mw, field.name));
+                    if (@field(mw, field.name)) |arr| {
+                        if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
+                    }
+                } else if (field.type == mlx.mlx_array) {
+                    const arr = @field(mw, field.name);
+                    if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
                 }
             }
         },
         .dense => |*dw| {
             inline for (std.meta.fields(DenseMlpWeights)) |field| {
-                _ = mlx.mlx_vector_array_append_value(vec, @field(dw, field.name));
+                const arr = @field(dw, field.name);
+                if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
             }
         },
     }
@@ -5880,6 +5931,101 @@ test "appendLinearAttnWeights skips fields with null ctx (plain bf16 layers)" {
     // (conv1d/A_log/dt_bias/norm_w) = 9 expected. The 10 null-ctx scales/biases
     // are skipped — confirms the optional-bf16 path doesn't poison the eval batch.
     try testing.expectEqual(@as(usize, 9), mlx.mlx_vector_array_size(vec));
+}
+
+test "appendHybridMlpWeights skips MoE fields with null ctx (UD MoE bf16 router/SEG)" {
+    const s = mlx.gpuStream();
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+
+    // Real arrays for every weight (`*_w`) — non-null ctx. Quantized projections
+    // also have real scales/biases. UD bf16 layers (router, shared_expert_gate)
+    // get null-ctx scales/biases.
+    const sh = [_]c_int{1};
+    var arrs: [16]mlx.mlx_array = undefined;
+    for (&arrs) |*a| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(a, &sh, 1, .bfloat16, s));
+    }
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+
+    // UD MoE Qwen3.5 layout: router + shared_expert_gate are bf16 (null s/b);
+    // routed experts (switch_*) and shared_expert (shared_*) stay quantized.
+    const mw: MoeMlpWeights = .{
+        .router_w = arrs[0],
+        .router_s = mlx.mlx_array{ .ctx = null }, // UD bf16
+        .router_b = mlx.mlx_array{ .ctx = null }, // UD bf16
+        .switch_gate_w = arrs[1],
+        .switch_gate_s = arrs[2],
+        .switch_gate_b = arrs[3],
+        .switch_up_w = arrs[4],
+        .switch_up_s = arrs[5],
+        .switch_up_b = arrs[6],
+        .switch_down_w = arrs[7],
+        .switch_down_s = arrs[8],
+        .switch_down_b = arrs[9],
+        .shared_gate_w = arrs[10],
+        .shared_gate_s = arrs[11],
+        .shared_gate_b = arrs[12],
+        .shared_up_w = arrs[13],
+        .shared_up_s = arrs[14],
+        .shared_up_b = arrs[15],
+        .shared_down_w = arrs[0], // reuse — only ctx-null check matters here
+        .shared_down_s = arrs[1],
+        .shared_down_b = arrs[2],
+        .shared_expert_gate_w = arrs[3],
+        .shared_expert_gate_s = mlx.mlx_array{ .ctx = null }, // UD bf16
+        .shared_expert_gate_b = mlx.mlx_array{ .ctx = null }, // UD bf16
+        .router_scale = null, // None — Qwen3.5 doesn't use sigma-MoE
+        .per_expert_scale = null,
+    };
+    const hw: HybridMlpWeights = .{ .moe = mw };
+
+    appendHybridMlpWeights(vec, &hw);
+
+    // Counted by hand: 21 non-optional `mlx.mlx_array` fields, of which 2 are
+    // null-ctx (router_s, router_b) → 19 appended. Plus the 5 optional
+    // `?mlx.mlx_array` fields: shared_expert_gate_w is Some(real) → +1; SEG
+    // scales/biases are Some(null-ctx) → +0 each; router_scale and
+    // per_expert_scale are None → +0 each. Total: 19 + 1 = 20.
+    try testing.expectEqual(@as(usize, 20), mlx.mlx_vector_array_size(vec));
+}
+
+test "appendHybridMlpWeights skips dense fields with null ctx (UD dense bf16)" {
+    const s = mlx.gpuStream();
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+
+    const sh = [_]c_int{1};
+    var arrs: [3]mlx.mlx_array = undefined;
+    for (&arrs) |*a| {
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(a, &sh, 1, .bfloat16, s));
+    }
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+
+    // All-bf16 dense MLP: weights set, scales/biases null.
+    const dw: DenseMlpWeights = .{
+        .gate_w = arrs[0],
+        .gate_s = mlx.mlx_array{ .ctx = null },
+        .gate_b = mlx.mlx_array{ .ctx = null },
+        .up_w = arrs[1],
+        .up_s = mlx.mlx_array{ .ctx = null },
+        .up_b = mlx.mlx_array{ .ctx = null },
+        .down_w = arrs[2],
+        .down_s = mlx.mlx_array{ .ctx = null },
+        .down_b = mlx.mlx_array{ .ctx = null },
+    };
+    const hw: HybridMlpWeights = .{ .dense = dw };
+
+    appendHybridMlpWeights(vec, &hw);
+
+    // 9 fields, 3 weights non-null + 6 null-ctx scales/biases skipped → 3.
+    try testing.expectEqual(@as(usize, 3), mlx.mlx_vector_array_size(vec));
 }
 
 test "moeRoutingChain produces top-K indices and renormalized softmax weights" {

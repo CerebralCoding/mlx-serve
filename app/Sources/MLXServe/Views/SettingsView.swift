@@ -348,29 +348,40 @@ private struct ContextSizeRow: View {
 private struct SpecDecodeSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @EnvironmentObject var downloads: DownloadManager
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
         ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
     }
 
-    /// Drafter rows are intentionally hidden from Settings for now — PLD gives
-    /// almost the same throughput on echo-heavy workloads without the drafter
-    /// pairing constraints (Gemma-4-only, must match target architecture). The
-    /// `drafterPath` / `draftBlockSize` fields stay in `ServerOptions` so users
-    /// who set them via CLI keep working; we just don't surface them here.
+    /// `draftBlockSize` stays CLI-only — `recommendedBlockSize` in drafter.zig
+    /// auto-picks per target (E2B=2, E4B=4, 31B=8, 26B-A4B=4); the field is
+    /// kept in ServerOptions so power users who set it via CLI keep working.
 
     var body: some View {
         let opts = $appState.serverOptions
+        // Drafter and PLD are mutually exclusive at the request level
+        // (`drafter > PLD > regular` in src/server.zig). When drafter is on
+        // we lock the PLD toggles down so users can't accidentally enable a
+        // setting that would never apply.
+        let drafterActive = !appState.serverOptions.drafterPath.isEmpty
+        let pldUsable = appState.serverOptions.enablePLD && !drafterActive
+
+        DrafterRow()
         if let m = meta["enablePLD"] {
+            let suffix = drafterActive
+                ? " Locked off while Drafter is on (Drafter takes priority)."
+                : ""
             SettingsRow(
                 title: m.title,
-                explainer: m.explainer,
+                explainer: m.explainer + suffix,
                 isDirty: dirty.dirty(\.enablePLD)
             ) {
                 Toggle("", isOn: opts.enablePLD)
                     .labelsHidden()
                     .toggleStyle(.switch)
+                    .disabled(drafterActive)
             }
         }
         if let m = meta["pldDraftLen"] {
@@ -383,7 +394,7 @@ private struct SpecDecodeSectionContent: View {
                     Text("\(appState.serverOptions.pldDraftLen)")
                         .font(.body.monospacedDigit())
                 }
-                .disabled(!appState.serverOptions.enablePLD)
+                .disabled(!pldUsable)
             }
         }
         if let m = meta["pldKeyLen"] {
@@ -396,9 +407,164 @@ private struct SpecDecodeSectionContent: View {
                     Text("\(appState.serverOptions.pldKeyLen)")
                         .font(.body.monospacedDigit())
                 }
-                .disabled(!appState.serverOptions.enablePLD)
+                .disabled(!pldUsable)
             }
         }
+    }
+}
+
+// MARK: - Drafter row
+
+/// Three-state speculative-decoding toggle for the Gemma 4 assistant drafter.
+///
+/// State is derived from (loaded model architecture, isMoE, drafter on disk):
+///   - **Available, dense Gemma 4** → toggle on/off; status pill shows the
+///     auto-discovered checkpoint name in green.
+///   - **Available, MoE Gemma 4** → toggle stays usable but flipping on shows
+///     a yellow caution pill: drafter regresses on MoE at single-stream
+///     batch=1 (verify expert-routing penalty), so PLD is the recommended
+///     path. Per-request `enable_drafter:true` still works.
+///   - **Unavailable** → disabled toggle, with a one-line explainer naming
+///     the reason (non-Gemma-4 target, or no matching drafter on disk). When
+///     it's a missing checkpoint, a "Browse" button jumps to the Model
+///     Browser.
+private struct DrafterRow: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+    @EnvironmentObject var downloads: DownloadManager
+    @Environment(\.openWindow) private var openWindow
+
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+    }
+
+    /// Drafter the loaded model would pair with — nil for non-Gemma-4 or
+    /// when no matching checkpoint is on disk.
+    private var recommended: LocalDrafter? {
+        guard let info = server.modelInfo else { return nil }
+        return downloads.recommendedDrafterFor(
+            modelPath: appState.selectedModelPath,
+            architecture: info.architecture,
+            isMoE: info.isMoE
+        )
+    }
+
+    /// True when the loaded target is a Gemma 4 model (any size). Tells us
+    /// whether to surface "drafter not found" (worth fixing) vs "drafter is
+    /// Gemma 4 only" (architectural).
+    private var targetIsGemma4: Bool {
+        let arch = server.modelInfo?.architecture ?? ""
+        return arch == "gemma4" || arch == "gemma4_text"
+    }
+
+    private var isMoeTarget: Bool { server.modelInfo?.isMoE ?? false }
+
+    private var explainer: String {
+        if let r = recommended {
+            return "Pairs with the small assistant drafter for +27–40% on code & agents (dense Gemma 4 only). Auto-discovered: \(r.url.lastPathComponent)."
+        }
+        // Server hasn't reported a model yet — either it's not started or
+        // we're mid-handshake. Don't claim the architecture is wrong.
+        if server.modelInfo == nil {
+            if appState.selectedModelPath.isEmpty {
+                return "Select a model to check drafter compatibility."
+            }
+            return "Start the server to check drafter compatibility."
+        }
+        // Server reported a model but didn't include `architecture` in its
+        // /v1/models meta — that field landed in the same release that
+        // unhid this row, so an older bundled binary will leave it empty.
+        if (server.modelInfo?.architecture ?? "").isEmpty {
+            return "Drafter status unavailable (server build pre-dates this UI). Use --drafter via CLI."
+        }
+        if !targetIsGemma4 {
+            return "Drafter is Gemma 4 only."
+        }
+        return "Drafter checkpoint not found. Download from the Model Browser."
+    }
+
+    private var toggleEnabled: Bool { recommended != nil }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 4) {
+            HStack(alignment: .firstTextBaseline) {
+                HStack(spacing: 6) {
+                    Text("Enable Assistant MTP Drafter model")
+                        .font(.body)
+                    if dirty.dirty(\.drafterPath) {
+                        Image(systemName: "arrow.clockwise.circle.fill")
+                            .font(.caption)
+                            .foregroundStyle(.orange)
+                            .help("Restart the server to apply this change")
+                    }
+                }
+                Spacer(minLength: 12)
+                control
+                    .frame(maxWidth: 280, alignment: .trailing)
+            }
+            Text(explainer)
+                .font(.caption2)
+                .foregroundStyle(.secondary)
+                .fixedSize(horizontal: false, vertical: true)
+
+            // Status pill — green for "ready", yellow for the MoE caution.
+            if let r = recommended {
+                HStack(spacing: 8) {
+                    statusPill(
+                        text: "✓ \(r.url.lastPathComponent)",
+                        warn: false
+                    )
+                    if isMoeTarget && !appState.serverOptions.drafterPath.isEmpty {
+                        statusPill(
+                            text: "⚠ Drafter regresses ~30% on MoE — PLD is recommended",
+                            warn: true
+                        )
+                    }
+                }
+                .padding(.top, 2)
+            } else if server.modelInfo != nil && targetIsGemma4 {
+                // Server has a Gemma 4 target loaded but the matching drafter
+                // isn't on disk. Jump straight to the Model Browser so the
+                // user can pick the right `*-it-assistant-bf16` repo.
+                Button("Browse") {
+                    openWindow(id: "modelBrowser")
+                }
+                .controlSize(.small)
+                .padding(.top, 2)
+            }
+        }
+    }
+
+    @ViewBuilder
+    private var control: some View {
+        let isOn = Binding<Bool>(
+            get: { !appState.serverOptions.drafterPath.isEmpty },
+            set: { newValue in
+                if newValue {
+                    if let r = recommended {
+                        appState.serverOptions.drafterPath = r.url.path
+                    }
+                } else {
+                    appState.serverOptions.drafterPath = ""
+                }
+            }
+        )
+        Toggle("", isOn: isOn)
+            .labelsHidden()
+            .toggleStyle(.switch)
+            .disabled(!toggleEnabled)
+    }
+
+    @ViewBuilder
+    private func statusPill(text: String, warn: Bool) -> some View {
+        let fg: Color = warn ? .orange : .green
+        Text(text)
+            .font(.caption2.monospacedDigit())
+            .foregroundStyle(fg)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(fg.opacity(0.10))
+            .clipShape(Capsule())
     }
 }
 

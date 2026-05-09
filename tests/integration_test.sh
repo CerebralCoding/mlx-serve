@@ -2,12 +2,12 @@
 # Integration tests for mlx-serve API endpoints.
 # Usage: ./tests/integration_test.sh [model_dir] [port]
 #
-# Requires a model to be available. Defaults to qwen3-4b.
+# Requires a model to be available. Defaults to gemma-4-e4b-it-8bit.
 # Builds a debug binary, starts the server, runs tests, then kills it.
 
 set -euo pipefail
 
-MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/qwen3-4b}}"
+MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}}"
 PORT="${2:-8095}"
 BASE="http://localhost:$PORT"
 BINARY="./zig-out/bin/mlx-serve"

@@ -276,6 +276,24 @@ On creative / novel-content prompts both features stay at parity (≈1.0×) than
 
 Reproduce with **`./tests/bench_spec_matrix.sh`** (release-comparison matrix vs. the shipped binary) or **`./tests/bench_spec.sh --corpus`** (9-prompt threshold-tuning corpus across echo, code-rename, JSON, RAG, agent, plain Q&A, code-translate, summarize, creative).
 
+### vs. LM Studio (HTTP-vs-HTTP)
+
+**+39% faster overall** (geomean across 18 cells, best mlx-serve vs best LMS, identical 4-bit weights, ctx=4096, temp=0).
+
+| Model | Echo | Code | Free-form |
+|---|---:|---:|---:|
+| Gemma 4 E2B | **+122%** | **+47%** | +20% |
+| Gemma 4 E4B | **+97%** | **+53%** | **+35%** |
+| Gemma 4 31B | +20% | +4% | -1% |
+| Gemma 4 26B-A4B-MoE | **+66%** | +23% | +31% |
+| Qwen 3.6 27B | **+60%** | +24% | +32% |
+| Qwen 3.6 35B-A3B-MoE | **+88%** | +20% | +25% |
+
+![Gemma 4](docs/perf-vs-lmstudio-gemma-26.5.5.png)
+![Qwen 3.6](docs/perf-vs-lmstudio-qwen36-26.5.5.png)
+
+Reproduce: `./tests/bench_vs_lmstudio.sh --family gemma` (or `qwen36`). Requires `lms`, `jq`, `python3`, `matplotlib`.
+
 ## License
 
 MIT

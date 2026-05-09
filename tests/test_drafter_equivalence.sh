@@ -7,8 +7,8 @@
 # a Gemma 4 checkpoint paired with the matching assistant drafter.
 #
 # Default pair (Apple Silicon, ~3.3 GB peak RSS):
-#   target  = ~/.mlx-serve/models/gemma-4-e4b-it-4bit
-#   drafter = ~/.mlx-serve/models/gemma-4-E4B-it-assistant-bf16
+#   target  = ~/.mlx-serve/models/gemma-4-e4b-it-8bit
+#   drafter = ~/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16
 #
 # Override with env vars:
 #   DRAFTER_TEST_TARGET=/path/to/gemma-4-target
@@ -28,14 +28,14 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-TARGET="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit}"
-DRAFTER="${DRAFTER_TEST_DRAFTER:-$HOME/.mlx-serve/models/gemma-4-E4B-it-assistant-bf16}"
+TARGET="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}"
+DRAFTER="${DRAFTER_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
 
 if [ ! -d "$TARGET" ]; then
     echo -e "${YELLOW}SKIP${NC} test_drafter_equivalence: target directory not found ($TARGET)."
     echo
     echo "  Set DRAFTER_TEST_TARGET to a Gemma 4 checkpoint, or download"
-    echo "  ~/.mlx-serve/models/gemma-4-e4b-it-4bit."
+    echo "  ~/.mlx-serve/models/gemma-4-e4b-it-8bit."
     exit 0
 fi
 
@@ -43,7 +43,7 @@ if [ ! -d "$DRAFTER" ]; then
     echo -e "${YELLOW}SKIP${NC} test_drafter_equivalence: drafter directory not found ($DRAFTER)."
     echo
     echo "  Set DRAFTER_TEST_DRAFTER to a gemma4_assistant drafter checkpoint, or"
-    echo "  download ~/.mlx-serve/models/gemma-4-E4B-it-assistant-bf16."
+    echo "  download ~/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16."
     exit 0
 fi
 

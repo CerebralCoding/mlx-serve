@@ -69,7 +69,9 @@ final class PythonManager: ObservableObject {
     enum Status: Equatable {
         case unknown              // haven't checked yet
         case missingPython        // no system python3 found at all
-        case needsVenv            // python3 found but venv not created
+        case needsGit             // python3 found, but git missing — install would fail
+                                  // mid-pip on the git+https ltx-2-mlx URLs
+        case needsVenv            // python3 + git found, venv not created
         case needsPackages        // venv exists but missing modules
         case needsFFmpeg          // venv ready, but system ffmpeg missing (video muxing)
         case ready                // venv + packages + ffmpeg present
@@ -112,12 +114,23 @@ final class PythonManager: ObservableObject {
             return
         }
         let fm = FileManager.default
-        guard fm.fileExists(atPath: Self.venvPython) else {
+        // git is only needed when we actually have to install — pip shells out
+        // to git for the `git+https://github.com/...` URLs in requiredPackages.
+        // Once the venv exists and packages import cleanly, we don't care.
+        let venvExists = fm.fileExists(atPath: Self.venvPython)
+        if !venvExists {
+            guard Self.checkGit() else { status = .needsGit; return }
             status = .needsVenv
             return
         }
         let ok = await Self.checkPackages()
-        guard ok else { status = .needsPackages; return }
+        if !ok {
+            // Venv exists but imports failed — almost always means we need to
+            // re-run pip install (which needs git for the ltx URLs).
+            guard Self.checkGit() else { status = .needsGit; return }
+            status = .needsPackages
+            return
+        }
         status = Self.checkFFmpeg() ? .ready : .needsFFmpeg
     }
 
@@ -126,13 +139,27 @@ final class PythonManager: ObservableObject {
     /// `shutil.which`), so a missing binary surfaces as an opaque runtime
     /// error deep inside generation — we gate on it up front instead.
     nonisolated static func checkFFmpeg() -> Bool {
-        let candidates = [
-            "/opt/homebrew/bin/ffmpeg",
-            "/usr/local/bin/ffmpeg",
-            "/usr/bin/ffmpeg",
+        probeBinary("ffmpeg")
+    }
+
+    /// Probe both Homebrew (Apple Silicon + Intel) and Apple-supplied system
+    /// paths for `git`. pip's editable VCS installs (`git+https://...`) shell
+    /// out to git; without it, the install hangs partway through.
+    nonisolated static func checkGit() -> Bool {
+        probeBinary("git")
+    }
+
+    /// Generic "is `name` on disk in any of the locations a Mac normally has
+    /// CLI binaries". Doesn't shell out — just `isExecutableFile` checks.
+    private nonisolated static func probeBinary(_ name: String) -> Bool {
+        let prefixes = [
+            "/opt/homebrew/bin",   // Homebrew on Apple Silicon
+            "/usr/local/bin",      // Homebrew on Intel (and old user installs)
+            "/usr/bin",            // Apple-supplied (Xcode CLT for git)
         ]
-        for path in candidates where FileManager.default.isExecutableFile(atPath: path) {
-            return true
+        for prefix in prefixes {
+            let path = (prefix as NSString).appendingPathComponent(name)
+            if FileManager.default.isExecutableFile(atPath: path) { return true }
         }
         return false
     }
@@ -202,7 +229,15 @@ final class PythonManager: ObservableObject {
 
         guard let python = systemPython else {
             appendLog("ERROR: system python3 not found.")
-            lastError = "System python3 not found. Install Python 3 from python.org or via Homebrew."
+            lastError = "System python3 not found. Install Python 3 via Homebrew (brew install python) or Xcode Command Line Tools (xcode-select --install)."
+            return
+        }
+        // Two of the required packages are installed from a GitHub URL via pip's
+        // git+https://… support, which shells out to git. Without git, the
+        // install dies mid-way with a confusing error — fail fast instead.
+        guard Self.checkGit() else {
+            appendLog("ERROR: git not found on PATH.")
+            lastError = "git is required to install the ltx-2-mlx packages. Install via Homebrew (brew install git) or Xcode Command Line Tools (xcode-select --install)."
             return
         }
 

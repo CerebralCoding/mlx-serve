@@ -9,8 +9,8 @@
 # (echo-heavy code rename) so the drafter's verify path is well exercised.
 #
 # Default pair (Apple Silicon, ~3.3 GB peak RSS):
-#   target  = ~/.mlx-serve/models/gemma-4-e4b-it-4bit
-#   drafter = ~/.mlx-serve/models/gemma-4-E4B-it-assistant-bf16
+#   target  = ~/.mlx-serve/models/gemma-4-e4b-it-8bit
+#   drafter = ~/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16
 #
 # Override with env vars:
 #   DRAFTER_TEST_TARGET=/path/to/gemma-4-target
@@ -30,8 +30,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-TARGET="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit}"
-DRAFTER="${DRAFTER_TEST_DRAFTER:-$HOME/.mlx-serve/models/gemma-4-E4B-it-assistant-bf16}"
+TARGET="${DRAFTER_TEST_TARGET:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}"
+DRAFTER="${DRAFTER_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
 
 if [ ! -d "$TARGET" ]; then
     echo -e "${YELLOW}SKIP${NC} test_streaming_drafter: target directory not found ($TARGET)."

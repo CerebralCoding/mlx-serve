@@ -6,7 +6,7 @@
 # Usage: ./tests/test_thinking_tools.sh [model_dir] [port]
 # Starts its own server, runs tests, kills it.
 
-MODEL_DIR=${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-4bit}}
+MODEL_DIR=${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}}
 PORT=${2:-8099}
 BASE="http://127.0.0.1:$PORT"
 BINARY="./zig-out/bin/mlx-serve"
@@ -161,7 +161,12 @@ echo -e "${YELLOW}Test 8: Thinking + tools, streaming (THE FIX)${NC}"
 STREAM=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
   -d "{\"model\":\"mlx-serve\",\"messages\":[{\"role\":\"user\",\"content\":\"What is 15 times 17? Think step by step then use shell to verify with: echo \$((15*17))\"}],\"tools\":$TOOLS_JSON,\"max_tokens\":500,\"temperature\":0.1,\"stream\":true,\"enable_thinking\":true}")
 HAS_RC=$(echo "$STREAM" | grep -c '"reasoning_content"' ; true)
-HAS_CONTENT=$(echo "$STREAM" | grep '"content"' | grep -v '""' | grep -vc 'null' ; true)
+# Count delta lines whose `"content"` value is non-empty. The earlier filter
+# (`grep '"content"' | grep -v '""' | grep -vc 'null'`) accidentally dropped
+# any chunk containing "null" — and every SSE delta line carries
+# `"finish_reason":null,"usage":null`, so a real content chunk got filtered
+# out and the test reported HAS_CONTENT=0 even when the stream had content.
+HAS_CONTENT=$(echo "$STREAM" | grep -cE '"content":"[^"]' ; true)
 HAS_TC=$(echo "$STREAM" | grep -c '"tool_calls"' ; true)
 NO_TAGS_CONTENT=$(echo "$STREAM" | grep '"content"' | grep -cE '<think>|<\|channel>thought' ; true)
 NO_TAGS_RC=$(echo "$STREAM" | grep '"reasoning_content"' | grep -cE '<think>|<\|channel>thought' ; true)
@@ -185,7 +190,12 @@ echo -e "${YELLOW}Test 9: Thinking + tools, streaming, model may text or tool-ca
 STREAM=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
   -d "{\"model\":\"mlx-serve\",\"messages\":[{\"role\":\"user\",\"content\":\"Say hello in French. Do not use any tools.\"}],\"tools\":$TOOLS_JSON,\"max_tokens\":500,\"temperature\":0.1,\"stream\":true,\"enable_thinking\":true}")
 HAS_RC=$(echo "$STREAM" | grep -c '"reasoning_content"' ; true)
-HAS_CONTENT=$(echo "$STREAM" | grep '"content"' | grep -v '""' | grep -vc 'null' ; true)
+# Count delta lines whose `"content"` value is non-empty. The earlier filter
+# (`grep '"content"' | grep -v '""' | grep -vc 'null'`) accidentally dropped
+# any chunk containing "null" — and every SSE delta line carries
+# `"finish_reason":null,"usage":null`, so a real content chunk got filtered
+# out and the test reported HAS_CONTENT=0 even when the stream had content.
+HAS_CONTENT=$(echo "$STREAM" | grep -cE '"content":"[^"]' ; true)
 HAS_TC=$(echo "$STREAM" | grep -c '"tool_calls"' ; true)
 NO_TAGS=$(echo "$STREAM" | grep '"content"' | grep -cE '<think>|<\|channel>' ; true)
 HAS_ANY=$(echo "$STREAM" | grep -c 'data:' ; true)

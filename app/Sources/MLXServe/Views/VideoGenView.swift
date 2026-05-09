@@ -35,7 +35,7 @@ struct VideoGenView: View {
             switch python.status {
             case .unknown:
                 ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
-            case .missingPython, .needsVenv, .needsPackages, .needsFFmpeg:
+            case .missingPython, .needsGit, .needsVenv, .needsPackages, .needsFFmpeg:
                 GenInstallPane(feature: "Video Generation (LTX-Video 2.3)")
             case .ready:
                 readyView
@@ -70,7 +70,7 @@ struct VideoGenView: View {
 
             VStack(spacing: 12) {
                 previewArea
-                historyShelf
+                outputFolderLink
             }
             .padding(16)
             .frame(minWidth: 460)
@@ -467,30 +467,18 @@ struct VideoGenView: View {
         .padding(8)
     }
 
-    private var historyShelf: some View {
-        ScrollView(.horizontal, showsIndicators: false) {
-            HStack(spacing: 8) {
-                ForEach(service.recent, id: \.self) { path in
-                    Button {
-                        player = AVPlayer(url: URL(fileURLWithPath: path))
-                        player?.play()
-                    } label: {
-                        RoundedRectangle(cornerRadius: 6)
-                            .fill(Color.secondary.opacity(0.2))
-                            .frame(width: 96, height: 72)
-                            .overlay(
-                                Image(systemName: "play.rectangle.fill")
-                                    .font(.title2)
-                                    .foregroundStyle(.secondary)
-                            )
-                    }
-                    .buttonStyle(.plain)
-                    .help(URL(fileURLWithPath: path).lastPathComponent)
-                }
-            }
-            .padding(.horizontal, 4)
+    private var outputFolderLink: some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting(
+                [URL(fileURLWithPath: PythonManager.videosRoot)]
+            )
+        } label: {
+            Label("Open output folder in Finder", systemImage: "folder")
+                .font(.caption)
         }
-        .frame(height: 80)
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .help(PythonManager.videosRoot)
     }
 
     // MARK: - Actions
@@ -612,24 +600,29 @@ struct GenInstallPane: View {
 
             switch python.status {
             case .missingPython:
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Install Python 3 first:").font(.callout.weight(.semibold))
-                    Text("brew install python")
-                        .font(.system(.callout, design: .monospaced))
-                        .padding(.horizontal, 10).padding(.vertical, 4)
-                        .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
-                    Text("Then quit and reopen MLX Core.").font(.caption).foregroundStyle(.secondary)
-                }
+                DependencyInstructions(
+                    title: "Install Python 3",
+                    brewCommand: "brew install python",
+                    xcodeApplies: true,
+                    xcodeNote: "Apple's Command Line Tools include a usable python3, though the version is older than Homebrew's.",
+                    afterNote: "Then reopen this pane."
+                )
+            case .needsGit:
+                DependencyInstructions(
+                    title: "Install git",
+                    brewCommand: "brew install git",
+                    xcodeApplies: true,
+                    xcodeNote: "Xcode Command Line Tools ship git out of the box and is the lightest install if you don't already use Homebrew.",
+                    afterNote: "Then reopen this pane — pip uses git to fetch the ltx-2-mlx packages."
+                )
             case .needsFFmpeg:
-                VStack(alignment: .leading, spacing: 6) {
-                    Text("Install ffmpeg:").font(.callout.weight(.semibold))
-                    Text("brew install ffmpeg")
-                        .font(.system(.callout, design: .monospaced))
-                        .padding(.horizontal, 10).padding(.vertical, 4)
-                        .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
-                    Text("Then reopen this pane — ltx-2-mlx shells out to ffmpeg for audio/video muxing.")
-                        .font(.caption).foregroundStyle(.secondary)
-                }
+                DependencyInstructions(
+                    title: "Install ffmpeg",
+                    brewCommand: "brew install ffmpeg",
+                    xcodeApplies: false,
+                    xcodeNote: nil,
+                    afterNote: "Then reopen this pane — ltx-2-mlx shells out to ffmpeg for audio/video muxing."
+                )
             default:
                 Button {
                     Task { await python.install() }
@@ -664,6 +657,8 @@ struct GenInstallPane: View {
         switch python.status {
         case .missingPython:
             return "Python 3 isn't installed on this Mac. Image and video generation need Python to host the mflux / ltx-2-mlx pipelines."
+        case .needsGit:
+            return "git isn't on PATH. The video pipeline (ltx-2-mlx) is fetched from GitHub by pip, which shells out to git during install."
         case .needsVenv:
             return "A dedicated Python environment at ~/.mlx-serve/venv needs to be created. Click Install to set it up — no effect on your system Python."
         case .needsPackages:
@@ -672,6 +667,79 @@ struct GenInstallPane: View {
             return "Python packages are installed, but the system ffmpeg binary is missing. ltx-2-mlx muxes audio into the mp4 via system ffmpeg."
         default:
             return ""
+        }
+    }
+
+    /// Single dependency-install card shared by all `needs*` external states.
+    /// Always shows the Homebrew option (we treat it as the recommended
+    /// path). Optionally includes the Xcode Command Line Tools alternative
+    /// for deps that ship with the CLT (python3, git) — not for ffmpeg, which
+    /// CLT doesn't bundle.
+    private struct DependencyInstructions: View {
+        let title: String
+        let brewCommand: String
+        let xcodeApplies: Bool
+        let xcodeNote: String?
+        let afterNote: String
+
+        var body: some View {
+            VStack(alignment: .leading, spacing: 10) {
+                Text(title).font(.callout.weight(.semibold))
+
+                option(
+                    badge: "Homebrew",
+                    badgeColor: .orange,
+                    command: brewCommand,
+                    note: "If you don't have Homebrew, install it from brew.sh first."
+                )
+
+                if xcodeApplies {
+                    option(
+                        badge: "Xcode CLT",
+                        badgeColor: .blue,
+                        command: "xcode-select --install",
+                        note: xcodeNote ?? ""
+                    )
+                }
+
+                Text(afterNote)
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                    .padding(.top, 2)
+            }
+            .frame(maxWidth: 480, alignment: .leading)
+        }
+
+        @ViewBuilder
+        private func option(badge: String, badgeColor: Color, command: String, note: String) -> some View {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(spacing: 6) {
+                    Text(badge)
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(badgeColor)
+                        .padding(.horizontal, 6).padding(.vertical, 2)
+                        .background(badgeColor.opacity(0.15), in: Capsule())
+                    Spacer()
+                    Button {
+                        let pb = NSPasteboard.general
+                        pb.clearContents()
+                        pb.setString(command, forType: .string)
+                    } label: {
+                        Image(systemName: "doc.on.doc")
+                    }
+                    .buttonStyle(.borderless)
+                    .help("Copy command")
+                }
+                Text(command)
+                    .font(.system(.callout, design: .monospaced))
+                    .textSelection(.enabled)
+                    .padding(.horizontal, 10).padding(.vertical, 4)
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                    .background(Color.secondary.opacity(0.15), in: RoundedRectangle(cornerRadius: 4))
+                if !note.isEmpty {
+                    Text(note).font(.caption2).foregroundStyle(.secondary)
+                }
+            }
         }
     }
 

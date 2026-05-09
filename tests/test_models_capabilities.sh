@@ -27,8 +27,8 @@ if [ ! -d "$MODEL_DIR" ]; then
     exit 0
 fi
 
-if [ ! -x "/Volumes/Sandisk_1TB/HOME_FOLDER/code/mlx-serve/zig-out/bin/mlx-serve" ]; then
-    echo "FAIL: mlx-serve not built"
+if [ ! -x "./zig-out/bin/mlx-serve" ]; then
+    echo "FAIL: mlx-serve not built — run 'zig build -Doptimize=ReleaseFast' first"
     exit 1
 fi
 
@@ -37,7 +37,7 @@ echo "Model: $MODEL_DIR"
 echo ""
 
 echo "Starting server..."
-/Volumes/Sandisk_1TB/HOME_FOLDER/code/mlx-serve/zig-out/bin/mlx-serve \
+./zig-out/bin/mlx-serve \
     --model "$MODEL_DIR" --serve --port $PORT --log-level info \
     >/tmp/mlx-serve-models-test.log 2>&1 &
 SERVER_PID=$!

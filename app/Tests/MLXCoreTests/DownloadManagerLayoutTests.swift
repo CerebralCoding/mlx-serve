@@ -60,6 +60,62 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertNil(DownloadManager.existingModelDir(rootDir: tempRoot, repoId: "nobody/missing"))
     }
 
+    // MARK: - Drafter discovery
+
+    func testDiscoverDraftersFindsAllFourVariants() throws {
+        for variant in GemmaVariant.allCases {
+            let dir = ((tempRoot as NSString).appendingPathComponent("mlx-community") as NSString)
+                .appendingPathComponent(variant.drafterDirName)
+            try makeDrafterDir(at: dir)
+        }
+        let found = DownloadManager.discoverDrafters(in: [tempRoot])
+        XCTAssertEqual(Set(found.map { $0.variant }), Set(GemmaVariant.allCases))
+    }
+
+    func testDiscoverDraftersSkipsDirsWithWrongModelType() throws {
+        // Wrong dirname: looks Gemma-shaped but isn't on the list.
+        let bogus = ((tempRoot as NSString).appendingPathComponent("mlx-community") as NSString)
+            .appendingPathComponent("gemma-4-other-it-assistant-bf16")
+        try makeDrafterDir(at: bogus)
+        // Right dirname but wrong model_type — NOT a drafter.
+        let lookalike = ((tempRoot as NSString).appendingPathComponent("mlx-community") as NSString)
+            .appendingPathComponent(GemmaVariant.E2B.drafterDirName)
+        try FileManager.default.createDirectory(atPath: lookalike, withIntermediateDirectories: true)
+        let cfg = (lookalike as NSString).appendingPathComponent("config.json")
+        try "{\"model_type\":\"gemma4\"}".write(toFile: cfg, atomically: true, encoding: .utf8)
+
+        XCTAssertTrue(DownloadManager.discoverDrafters(in: [tempRoot]).isEmpty)
+    }
+
+    func testDiscoverDraftersFirstRootWins() throws {
+        // Same variant in two roots — earlier root takes precedence so a
+        // user copy in ~/.mlx-serve/ wins over a leftover LM Studio copy.
+        let alt = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("mlx-serve-tests-alt-\(UUID().uuidString)")
+        defer { try? FileManager.default.removeItem(atPath: alt) }
+        let primary = ((tempRoot as NSString).appendingPathComponent("mlx-community") as NSString)
+            .appendingPathComponent(GemmaVariant.E4B.drafterDirName)
+        let secondary = ((alt as NSString).appendingPathComponent("mlx-community") as NSString)
+            .appendingPathComponent(GemmaVariant.E4B.drafterDirName)
+        try makeDrafterDir(at: primary)
+        try makeDrafterDir(at: secondary)
+
+        let found = DownloadManager.discoverDrafters(in: [tempRoot, alt])
+        XCTAssertEqual(found.count, 1)
+        XCTAssertEqual(found.first?.url.path, primary)
+    }
+
+    func testGemmaVariantParsing() {
+        XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-e4b-it-4bit", isMoE: false), .E4B)
+        XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-e2b-it-8bit", isMoE: false), .E2B)
+        XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-31b-it-4bit", isMoE: false), .gemma31B)
+        XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-26b-a4b-it-4bit", isMoE: true), .moe26B)
+        // isMoE alone should also pick MoE so we route correctly even if the
+        // path doesn't include the size designator.
+        XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/something-weird", isMoE: true), .moe26B)
+        XCTAssertNil(DownloadManager.gemmaVariantFor(modelPath: "/m/qwen3-7b-4bit", isMoE: false))
+    }
+
     // MARK: - Helpers
 
     /// Minimal model dir layout: just `config.json`. The path-resolution and
@@ -68,5 +124,12 @@ final class DownloadManagerLayoutTests: XCTestCase {
         try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
         let cfg = (path as NSString).appendingPathComponent("config.json")
         try "{}".write(toFile: cfg, atomically: true, encoding: .utf8)
+    }
+
+    /// Drafter dir: config.json with `model_type: "gemma4_assistant"`.
+    private func makeDrafterDir(at path: String) throws {
+        try FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
+        let cfg = (path as NSString).appendingPathComponent("config.json")
+        try "{\"model_type\":\"gemma4_assistant\"}".write(toFile: cfg, atomically: true, encoding: .utf8)
     }
 }

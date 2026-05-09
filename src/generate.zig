@@ -199,20 +199,94 @@ pub const Generator = struct {
     /// Number of attempts before the runtime gate considers disabling.
     /// Below this we trust the prompt-time gate.
     pub const RUNTIME_GATE_WARMUP: u64 = 5;
-    /// Minimum (accepted / attempted) ratio. Below this after warmup, speculation
-    /// is disabled for the rest of the request.
-    pub const RUNTIME_GATE_MIN_RATE: f32 = 0.30;
+    /// Minimum per-draft acceptance probability. Below this after warmup,
+    /// speculation is disabled for the rest of the request.
+    ///
+    /// History: pre-v5 this gate compared `accepted/attempted` (per-round
+    /// average) against 0.30 — but with `block_size=4` the max value of that
+    /// ratio is 3.0, so the 0.30 threshold corresponded to ~10% per-draft
+    /// probability, well below where verify+draft overhead actually breaks
+    /// even. The Phase 1 bench (`tests/bench_drafter_accept.sh`) showed
+    /// creative-content workloads regressing at 22-47% per-draft acceptance
+    /// while the gate stayed off (per-round avg 0.66-1.58, all above 0.30).
+    /// Switching to a per-draft probability with threshold 0.50 cleanly cuts
+    /// off the regressing tail while leaving heavy-echo workloads (84-97%
+    /// per-draft) running unmolested.
+    pub const RUNTIME_GATE_MIN_PER_DRAFT_RATE: f32 = 0.50;
 
     /// Pure helper: should the runtime gate disable speculation given the
-    /// observed per-request stats? Extracted so we can unit-test the
-    /// threshold logic without spinning up a real Generator (which needs a
-    /// loaded model). Returns true iff `attempted >= warmup` AND
-    /// `accepted/attempted < min_rate`.
-    pub fn runtimeGateShouldDisable(attempted: u64, accepted: u64) bool {
+    /// observed per-request stats? `drafts_per_round` is the number of
+    /// drafted tokens proposed in each verify (= `block_size - 1` for the
+    /// drafter, or `pld_draft_len` for PLD); we divide accepts by attempts ×
+    /// drafts_per_round to get the per-draft acceptance probability.
+    /// Returns true iff `attempted >= warmup` AND per-draft probability is
+    /// below `RUNTIME_GATE_MIN_PER_DRAFT_RATE`.
+    ///
+    /// `drafts_per_round == 0` is treated as "no speculative work happens
+    /// per round" → never trip (defensive — current callers always pass
+    /// >= 1).
+    pub fn runtimeGateShouldDisable(attempted: u64, accepted: u64, drafts_per_round: u32) bool {
         if (attempted < RUNTIME_GATE_WARMUP) return false;
+        if (drafts_per_round == 0) return false;
+        const drafts_proposed = attempted * @as(u64, drafts_per_round);
         const rate = @as(f32, @floatFromInt(accepted)) /
-            @as(f32, @floatFromInt(attempted));
-        return rate < RUNTIME_GATE_MIN_RATE;
+            @as(f32, @floatFromInt(drafts_proposed));
+        return rate < RUNTIME_GATE_MIN_PER_DRAFT_RATE;
+    }
+
+    /// Emit a stable, easy-to-grep one-line summary of spec-decode acceptance
+    /// for this request. Bench scripts (`tests/bench_drafter_accept.sh`)
+    /// parse the `[spec-stats]` prefix; keep the format stable.
+    ///
+    /// No-op when this Generator never ran a speculative path. Drafter and
+    /// PLD are mutually exclusive within a single request (drafter > PLD per
+    /// dispatch), so the branching here is unambiguous.
+    ///
+    /// Field semantics:
+    /// - `attempts` = number of speculative rounds (one verify forward each).
+    /// - `accepts` = total drafted tokens accepted across all rounds (excludes
+    ///   the always-committed t1 token at the start of each round).
+    /// - `avg_per_round` = accepts/attempts. Bounded by `(block_size - 1)` for
+    ///   drafter and `pld_draft_len` for PLD. Equals the metric the runtime
+    ///   gate compares against `RUNTIME_GATE_MIN_RATE`.
+    /// - `per_draft_pct` (drafter only) = accepts / (attempts × (block_size-1)),
+    ///   the per-draft acceptance probability comparable to vLLM's reported
+    ///   "62% acceptance rate" metric.
+    pub fn logSpecStats(self: *const Generator) void {
+        if (self.drafter != null and self.drafter_attempted > 0) {
+            const avg_per_round: f64 = @as(f64, @floatFromInt(self.drafter_accepted_tokens)) /
+                @as(f64, @floatFromInt(self.drafter_attempted));
+            const drafts_per_round: u32 = if (self.drafter_block_size >= 1) self.drafter_block_size - 1 else 0;
+            const drafts_proposed: u64 = self.drafter_attempted * @as(u64, drafts_per_round);
+            const per_draft_pct: f64 = if (drafts_proposed > 0)
+                100.0 * @as(f64, @floatFromInt(self.drafter_accepted_tokens)) /
+                    @as(f64, @floatFromInt(drafts_proposed))
+            else
+                0.0;
+            log.info(
+                "  [spec-stats] mode=drafter attempts={d} accepts={d} avg_per_round={d:.2} per_draft_pct={d:.1}% block_size={d} runtime_disabled={s}\n",
+                .{
+                    self.drafter_attempted,
+                    self.drafter_accepted_tokens,
+                    avg_per_round,
+                    per_draft_pct,
+                    self.drafter_block_size,
+                    if (self.spec_disabled_runtime) "true" else "false",
+                },
+            );
+        } else if (self.pld_attempted > 0) {
+            const avg_per_round: f64 = @as(f64, @floatFromInt(self.pld_accepted_tokens)) /
+                @as(f64, @floatFromInt(self.pld_attempted));
+            log.info(
+                "  [spec-stats] mode=pld attempts={d} accepts={d} avg_per_round={d:.2} runtime_disabled={s}\n",
+                .{
+                    self.pld_attempted,
+                    self.pld_accepted_tokens,
+                    avg_per_round,
+                    if (self.spec_disabled_runtime) "true" else "false",
+                },
+            );
+        }
     }
 
     /// Prefill the prompt and prepare for token-by-token generation.
@@ -851,15 +925,22 @@ pub const Generator = struct {
         // nextPld call sees t1 NOT in cache (new invariant).
         self.next_token_id = new_t1;
 
-        // Runtime acceptance gate: after warmup, if the average drafts accepted
-        // per verify is below the threshold, disable speculation for the rest
-        // of this request. Sticky for the rest of the generation.
-        if (runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens)) {
-            const rate = @as(f32, @floatFromInt(self.pld_accepted_tokens)) /
-                @as(f32, @floatFromInt(self.pld_attempted));
+        // Runtime acceptance gate: after warmup, if the per-draft acceptance
+        // probability is below the threshold, disable speculation for the rest
+        // of this request. Sticky for the rest of the generation. PLD's
+        // `drafts_per_round` is the upper-bound draft length (`max_draft`);
+        // matches with shorter accepts still divide by this max so a workload
+        // with consistently-short n-gram matches DOES get throttled.
+        if (runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens, max_draft)) {
+            const drafts_proposed: u64 = self.pld_attempted * @as(u64, max_draft);
+            const rate: f32 = if (drafts_proposed > 0)
+                @as(f32, @floatFromInt(self.pld_accepted_tokens)) /
+                    @as(f32, @floatFromInt(drafts_proposed))
+            else
+                0.0;
             log.info(
-                "  pld=disabled (runtime accept rate {d:.2} < {d:.2} after {d} attempts)\n",
-                .{ rate, RUNTIME_GATE_MIN_RATE, self.pld_attempted },
+                "  pld=disabled (runtime per-draft rate {d:.2} < {d:.2} after {d} attempts)\n",
+                .{ rate, RUNTIME_GATE_MIN_PER_DRAFT_RATE, self.pld_attempted },
             );
             self.spec_disabled_runtime = true;
         }
@@ -950,40 +1031,63 @@ pub const Generator = struct {
         // across all `m` drafter steps in this round.
         const rope_offset: c_int = @intCast(xfm.cache.step);
 
-        // ── Phase 1: draft `m` tokens autoregressively ──
+        // ── Phase 1: draft `m` tokens lazily, no per-step CPU sync ──
+        //
+        // The drafter loop builds a chained lazy graph: each step's sampled
+        // token is a [1]-shaped mlx_array fed directly to the next step's
+        // `embedTargetTokenArr` as the indexer, and forward as the next step's
+        // `prev_token`. No `mlx_array_eval` / `mlx_array_item_int32` calls
+        // here — the entire m-step chain plus the verify forward (built
+        // below) materialize as a single async graph and evaluate together.
+        // For block_size=8 (31B), this collapses 7 GPU→CPU syncs into 0,
+        // saving ~70-100ms of Metal command-buffer sync latency per round.
         var drafts = try allocator.alloc(u32, m);
         errdefer allocator.free(drafts);
 
-        var prev_tok = t1;
-        // h_prev rolls forward through the drafter. Starts at the captured
-        // target hidden; subsequent steps use the drafter's post_proj output.
-        // We do NOT free `last_hidden` during drafting — it stays valid
-        // until the verify path either replaces it (accept) or restores via
-        // re-forward (reject). Drafter step's h_prev_next is owned per step.
+        // `draft_arrs[i]` is the lazy [1] argmax output of drafter step i.
+        // Owned here; freed at end of nextDrafter (after verify uses them).
+        const draft_arrs = try allocator.alloc(mlx.mlx_array, m);
+        defer {
+            for (draft_arrs) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(draft_arrs);
+        }
+
+        // Wrap t1 as a [1] mlx_array so the FIRST drafter step can use the
+        // same lazy-chain helper as subsequent steps. This array is also
+        // reshaped + reused as the leading element of the verify input below.
+        const t1_i32: i32 = @intCast(t1);
+        const t1_shape = [_]c_int{1};
+        const t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(t1_arr);
+
+        // `h_prev_owner` rolls forward through the drafter. Starts at the
+        // captured target hidden; subsequent steps use the drafter's
+        // post_proj output. The output is itself a lazy mlx_array, so the
+        // chain stays lazy across all m steps.
         var h_prev_owner: ?mlx.mlx_array = null;
         defer if (h_prev_owner) |h| {
             _ = mlx.mlx_array_free(h);
         };
 
-        var i: u32 = 0;
-        while (i < m) : (i += 1) {
-            const h_prev_arg: mlx.mlx_array = if (h_prev_owner) |h| h else self.last_hidden;
-            const step_out = try drafter_mod.step(drafter, xfm, prev_tok, h_prev_arg, rope_offset);
-            // Sample the drafted token.
-            const draft_lazy = sampleTokenLazy(step_out.logits, self.sampling, s);
-            _ = mlx.mlx_array_free(step_out.logits);
-            try mlx.check(mlx.mlx_array_eval(draft_lazy));
-            var draft_val: i32 = 0;
-            try mlx.check(mlx.mlx_array_item_int32(&draft_val, draft_lazy));
-            _ = mlx.mlx_array_free(draft_lazy);
-            drafts[i] = @intCast(draft_val);
+        {
+            var prev_tok_arr: mlx.mlx_array = t1_arr;
+            var i: u32 = 0;
+            while (i < m) : (i += 1) {
+                const h_prev_arg: mlx.mlx_array = if (h_prev_owner) |h| h else self.last_hidden;
+                const step_out = try drafter_mod.stepArr(drafter, xfm, prev_tok_arr, h_prev_arg, rope_offset);
+                // Sample lazily — `sampleTokenLazy` for greedy returns the
+                // argmax as a [1]-shaped lazy array. NO eval here.
+                draft_arrs[i] = sampleTokenLazy(step_out.logits, self.sampling, s);
+                _ = mlx.mlx_array_free(step_out.logits);
 
-            // Roll h_prev forward: free previous owner, take ownership of new.
-            if (h_prev_owner) |h_old| {
-                _ = mlx.mlx_array_free(h_old);
+                // Roll h_prev forward.
+                if (h_prev_owner) |h_old| {
+                    _ = mlx.mlx_array_free(h_old);
+                }
+                h_prev_owner = step_out.h_prev_next;
+                // The next step's prev_token is THIS step's lazy sample.
+                prev_tok_arr = draft_arrs[i];
             }
-            h_prev_owner = step_out.h_prev_next;
-            prev_tok = drafts[i];
         }
 
         // ── Phase 2: snapshot KV + SSM ──
@@ -1001,15 +1105,38 @@ pub const Generator = struct {
         }
         const moe_seq_offset_snap = xfm.moe_seq_offset;
 
-        // ── Phase 3: verify forward [t1, draft0..draft_{m-1}] length 1+m ──
-        const seq_len: c_int = @intCast(1 + m);
-        const verify_input_buf = try allocator.alloc(i32, 1 + m);
-        defer allocator.free(verify_input_buf);
-        verify_input_buf[0] = @intCast(t1);
-        for (drafts, 0..) |d, idx| verify_input_buf[1 + idx] = @intCast(d);
-        const verify_shape = [_]c_int{ 1, seq_len };
-        const verify_input = mlx.mlx_array_new_data(verify_input_buf.ptr, &verify_shape, 2, .int32);
+        // ── Phase 3: build verify input by concatenating [t1, drafts...] ──
+        //
+        // Build verify_input as a [1, 1+m] tensor without any CPU sync. The
+        // m draft tokens are still lazy mlx_arrays at this point; we reshape
+        // each [1] → [1,1] and stack along axis=1 with t1 reshaped the same
+        // way. The forward pass that consumes verify_input is then chained
+        // onto the drafter's lazy graph.
+        const reshape_2d = [_]c_int{ 1, 1 };
+        var t1_2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(t1_2d);
+        try mlx.check(mlx.mlx_reshape(&t1_2d, t1_arr, &reshape_2d, 2, s));
+
+        // Stack: each draft_arr[i] is shape [1]; reshape each to [1,1] and
+        // collect into a vector_array along with t1_2d, then concat axis=1.
+        var verify_input = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(verify_input);
+        {
+            const drafts_2d = try allocator.alloc(mlx.mlx_array, m);
+            defer {
+                for (drafts_2d) |arr| _ = mlx.mlx_array_free(arr);
+                allocator.free(drafts_2d);
+            }
+            for (draft_arrs, drafts_2d) |dlazy, *out| {
+                out.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_reshape(out, dlazy, &reshape_2d, 2, s));
+            }
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            _ = mlx.mlx_vector_array_append_value(vec, t1_2d);
+            for (drafts_2d) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+            try mlx.check(mlx.mlx_concatenate_axis(&verify_input, vec, 1, s));
+        }
 
         var new_hidden = mlx.mlx_array_new();
         // Captures the post-final-norm hidden at the LAST input position
@@ -1018,36 +1145,100 @@ pub const Generator = struct {
         // verify_logits shape: [1, 1+m, V]
         self.drafter_attempted += 1;
 
-        // Slice per-position logits up front so we can reuse them for the
-        // partial-accept correction sample below without re-forwarding.
+        // ── Phase 4: decide longest accepted prefix ──
+        //
+        // Greedy mode: argmax over the entire [1, 1+m, V] verify_logits in
+        // one op (yields [1, 1+m] indices). Stochastic mode: sample-residual
+        // / accept-prob path needs per-position logits, so it slices below.
+        // Either way, we collapse all per-step syncs into ONE eval at the
+        // end of this round.
+        const stochastic = self.sampling.temperature > 0.01;
         const vl_shape = mlx.getShape(verify_logits);
-        const slice_strides = [_]c_int{ 1, 1, 1 };
-        const per_pos_logits = try allocator.alloc(mlx.mlx_array, 1 + m);
-        defer {
-            for (per_pos_logits) |arr| _ = mlx.mlx_array_free(arr);
-            allocator.free(per_pos_logits);
+
+        // Stochastic path needs per-position logits to compute target probs
+        // and (on partial accept) build the residual. Greedy path skips
+        // slicing entirely. `per_pos_logits` is null in greedy mode.
+        var per_pos_logits: ?[]mlx.mlx_array = null;
+        defer if (per_pos_logits) |slots| {
+            for (slots) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(slots);
+        };
+        if (stochastic) {
+            const slots = try allocator.alloc(mlx.mlx_array, 1 + m);
+            const slice_strides = [_]c_int{ 1, 1, 1 };
+            for (slots, 0..) |*slot, idx| {
+                slot.* = mlx.mlx_array_new();
+                const start = [_]c_int{ 0, @intCast(idx), 0 };
+                const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
+                try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
+            }
+            per_pos_logits = slots;
         }
-        for (per_pos_logits, 0..) |*slot, idx| {
-            slot.* = mlx.mlx_array_new();
-            const start = [_]c_int{ 0, @intCast(idx), 0 };
-            const stop = [_]c_int{ vl_shape[0], @as(c_int, @intCast(idx)) + 1, vl_shape[2] };
-            try mlx.check(mlx.mlx_slice(slot, verify_logits, &start, 3, &stop, 3, &slice_strides, 3, s));
+
+        // Build the greedy argmax tensor lazily; it'll be eval'd alongside
+        // the rest of the round below.
+        var verify_argmax = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(verify_argmax);
+        if (!stochastic) {
+            try mlx.check(mlx.mlx_argmax_axis(&verify_argmax, verify_logits, 2, false, s));
         }
         _ = mlx.mlx_array_free(verify_logits);
 
-        // ── Phase 4: decide longest accepted prefix ──
-        const stochastic = self.sampling.temperature > 0.01;
+        // ── Phase 4b: batched eval — drafts + verify_argmax + new_hidden ──
+        //
+        // Submit the entire round (drafter chain + verify forward + argmax)
+        // to the GPU in a single async dispatch. Then sync ONCE per array we
+        // need on the CPU. For block_size=8, this collapses ~14 individual
+        // sync points (7 drafter samples + 7 per-position argmaxes in the
+        // old code) into approximately 2: one effective sync to wait for
+        // GPU completion (the first `mlx_array_eval`), and zero-cost evals
+        // afterward since the work is already done.
+        //
+        // CORRECTNESS: `mlx_array_data_int32` only returns valid data once
+        // the array is eval'd. We explicitly eval each array we will read.
+        // `verify_input` is NOT eval'd separately because MLX may fuse it
+        // into the forward pass without materializing a CPU-readable buffer
+        // — instead we read drafts via per-array `mlx_array_item_int32` on
+        // each `draft_arrs[i]` (cheap after the first sync).
+        {
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            for (draft_arrs) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
+            if (!stochastic) {
+                _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
+            }
+            _ = mlx.mlx_vector_array_append_value(eval_vec, new_hidden);
+            try mlx.check(mlx.mlx_async_eval(eval_vec));
+        }
+        // Extract drafts. First eval sync waits for the GPU; subsequent
+        // evals are no-ops since they were queued together.
+        for (draft_arrs, 0..) |arr, idx| {
+            try mlx.check(mlx.mlx_array_eval(arr));
+            var v: i32 = 0;
+            try mlx.check(mlx.mlx_array_item_int32(&v, arr));
+            drafts[idx] = @intCast(v);
+        }
+        if (!stochastic) {
+            // Force verify_argmax to materialize before bulk-reading. It's a
+            // separate branch from the drafter chain (drafts → concat →
+            // verify → argmax), so eval'ing the drafts above doesn't pull
+            // verify_argmax along with them. This was the v26.5.6 bug that
+            // produced 0% acceptance on 26B/31B (verify ran longer than the
+            // drafter chain, so the data buffer was read while the GPU was
+            // still writing it).
+            try mlx.check(mlx.mlx_array_eval(verify_argmax));
+        }
+
         var accepted: u32 = 0;
         if (stochastic) {
-            // Same simplification as PLD: treat the drafted token as a
-            // one-hot proposal (q[draft[i]] = 1), so the speculative-decoding
-            // accept ratio reduces to `min(1, target_p[draft[i]])`. The
-            // drafter's actual probability for draft[i] is unavailable here
-            // without re-running the masked LM head softmax, and the
-            // simplification preserves the marginal output distribution.
+            // Stochastic verify (Leviathan et al. probability-ratio test).
+            // The drafted token came from argmax of the drafter's masked LM
+            // head, so we treat it as a one-hot proposal: accept with
+            // probability `min(1, target_p[draft[i]])`, otherwise stop and
+            // sample from the residual at the rejected position.
             var k: u32 = 0;
             while (k < m) : (k += 1) {
-                const target_p = try probsAtLastPos(per_pos_logits[k], self.sampling, s);
+                const target_p = try probsAtLastPos(per_pos_logits.?[k], self.sampling, s);
                 defer _ = mlx.mlx_array_free(target_p);
                 const p_draft = try probAt(target_p, drafts[k], s);
                 const accept_prob: f32 = @min(1.0, p_draft);
@@ -1056,31 +1247,33 @@ pub const Generator = struct {
                 accepted += 1;
             }
         } else {
+            // Bulk-read the [1, 1+m] argmax indices and scan for first
+            // mismatch in CPU. No more GPU syncs in this branch.
+            const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
+                return error.MlxArrayDataNull;
+            };
             var k: u32 = 0;
             while (k < m) : (k += 1) {
-                var argmax_arr = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(argmax_arr);
-                try mlx.check(mlx.mlx_argmax_axis(&argmax_arr, per_pos_logits[k], 2, false, s));
-                try mlx.check(mlx.mlx_array_eval(argmax_arr));
-                var argmax_val: i32 = 0;
-                try mlx.check(mlx.mlx_array_item_int32(&argmax_val, argmax_arr));
-                if (@as(u32, @intCast(argmax_val)) != drafts[k]) break;
+                const target_argmax: u32 = @intCast(argmax_data[k]);
+                if (target_argmax != drafts[k]) break;
                 accepted += 1;
             }
         }
 
-        // Sample the next pending token from per_pos_logits[accepted]:
-        //   - full accept (accepted == m): logits[m] is the target's prediction
-        //     one past the last draft (the bonus token). Sample directly.
-        //   - partial accept: logits[accepted] is the target's prediction at
-        //     the rejected position. For stochastic, sample from the residual
-        //     `max(p − one_hot(draft[accepted]), 0)` to preserve the marginal
-        //     distribution conditional on "not draft[accepted]" (Leviathan
-        //     et al). Greedy: just argmax (the rejected position's argmax is
-        //     the model's true next token).
-        const correction_logits = per_pos_logits[accepted];
+        // Sample the next pending token from the verify output at position
+        // `accepted`:
+        //   - full accept (accepted == m): position m predicts the bonus
+        //     token one past the last draft.
+        //   - partial accept: position `accepted` predicts the model's
+        //     replacement for the rejected draft.
+        // For greedy, position `accepted`'s argmax is already in
+        // `argmax_data[accepted]` — no extra GPU work. For stochastic, we
+        // need the actual probability distribution at that position, so we
+        // sample from `per_pos_logits[accepted]` (with residual correction
+        // on partial accept per Leviathan et al).
         const next_pending: u32 = blk: {
             if (stochastic) {
+                const correction_logits = per_pos_logits.?[accepted];
                 const probs = try probsAtLastPos(correction_logits, self.sampling, s);
                 defer _ = mlx.mlx_array_free(probs);
                 if (accepted < m) {
@@ -1091,12 +1284,12 @@ pub const Generator = struct {
                     break :blk try sampleFromProbs(probs, s);
                 }
             } else {
-                const lazy = sampleTokenLazy(correction_logits, self.sampling, s);
-                try mlx.check(mlx.mlx_array_eval(lazy));
-                var v: i32 = 0;
-                try mlx.check(mlx.mlx_array_item_int32(&v, lazy));
-                _ = mlx.mlx_array_free(lazy);
-                break :blk @intCast(v);
+                // Greedy: reuse the bulk-read argmax row. Already eval'd in
+                // the single async eval above; no GPU sync here.
+                const argmax_data = mlx.mlx_array_data_int32(verify_argmax) orelse {
+                    return error.MlxArrayDataNull;
+                };
+                break :blk @intCast(argmax_data[accepted]);
             }
         };
 
@@ -1184,17 +1377,23 @@ pub const Generator = struct {
         };
     }
 
-    /// Runtime acceptance gate for the drafter: after warmup, if the average
-    /// drafts accepted per round is below the threshold, disable speculation
-    /// for the rest of this request. Sticky for the rest of the generation.
+    /// Runtime acceptance gate for the drafter: after warmup, if the per-draft
+    /// acceptance probability is below `RUNTIME_GATE_MIN_PER_DRAFT_RATE`,
+    /// disable speculation for the rest of this request. Sticky for the rest
+    /// of the generation.
     fn checkDrafterRuntimeGate(self: *Generator) void {
         if (self.spec_disabled_runtime) return;
-        if (!runtimeGateShouldDisable(self.drafter_attempted, self.drafter_accepted_tokens)) return;
-        const rate = @as(f32, @floatFromInt(self.drafter_accepted_tokens)) /
-            @as(f32, @floatFromInt(self.drafter_attempted));
+        const drafts_per_round: u32 = if (self.drafter_block_size >= 1) self.drafter_block_size - 1 else 0;
+        if (!runtimeGateShouldDisable(self.drafter_attempted, self.drafter_accepted_tokens, drafts_per_round)) return;
+        const drafts_proposed: u64 = self.drafter_attempted * @as(u64, drafts_per_round);
+        const rate: f32 = if (drafts_proposed > 0)
+            @as(f32, @floatFromInt(self.drafter_accepted_tokens)) /
+                @as(f32, @floatFromInt(drafts_proposed))
+        else
+            0.0;
         log.info(
-            "  drafter=disabled (runtime accept rate {d:.2} < {d:.2} after {d} attempts)\n",
-            .{ rate, RUNTIME_GATE_MIN_RATE, self.drafter_attempted },
+            "  drafter=disabled (runtime per-draft rate {d:.2} < {d:.2} after {d} attempts)\n",
+            .{ rate, RUNTIME_GATE_MIN_PER_DRAFT_RATE, self.drafter_attempted },
         );
         self.spec_disabled_runtime = true;
     }
@@ -1998,6 +2197,7 @@ fn finishDrafterResult(
             decode_tps,
         });
     }
+    gen.logSpecStats();
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try tok.decode(allocator, output_ids.items, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);
@@ -2047,6 +2247,7 @@ fn finishPldResult(
             decode_tps,
         });
     }
+    gen.logSpecStats();
     const strip_leading = tok.tok_type == .sentencepiece_bpe;
     const text = try tok.decode(allocator, output_ids.items, strip_leading);
     const token_ids = try output_ids.toOwnedSlice(allocator);
@@ -2841,41 +3042,54 @@ test "sampleToken from prefill logits (seq_len > 1)" {
 
 test "Generator.runtimeGateShouldDisable below warmup never trips" {
     // Even with zero accepts, before the warmup count we trust the prompt-time
-    // gate and never disable speculation mid-decode.
-    try testing.expect(!Generator.runtimeGateShouldDisable(0, 0));
-    try testing.expect(!Generator.runtimeGateShouldDisable(1, 0));
-    try testing.expect(!Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP - 1, 0));
+    // gate and never disable speculation mid-decode. drafts_per_round is the
+    // typical drafter setting (block_size=4 → 3 drafts per round).
+    try testing.expect(!Generator.runtimeGateShouldDisable(0, 0, 3));
+    try testing.expect(!Generator.runtimeGateShouldDisable(1, 0, 3));
+    try testing.expect(!Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP - 1, 0, 3));
 }
 
-test "Generator.runtimeGateShouldDisable trips at warmup with low accept" {
-    // Synthetic low-accept scenario: 5 verify attempts, 1 draft accepted total.
-    // rate = 0.20, threshold = 0.30 → disable.
-    try testing.expect(Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 0));
-    try testing.expect(Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 1));
-    // 5 attempts × 0.30 threshold = 1.5 — so 1 accept trips, 2 accepts (rate 0.40) doesn't.
-    try testing.expect(!Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 2));
+test "Generator.runtimeGateShouldDisable trips at warmup with low per-draft rate" {
+    // Synthetic low-accept scenario: 5 verify attempts, drafts_per_round=3
+    // (drafter at block_size=4). 5 attempts × 3 = 15 drafts proposed.
+    // 0 accepted → 0.00 < 0.50 → trip. Same with 1 accepted (0.067).
+    try testing.expect(Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 0, 3));
+    try testing.expect(Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 1, 3));
+    // 7 accepted out of 15 = 0.467 — still below 0.50 → trip.
+    try testing.expect(Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 7, 3));
+    // 8 accepted out of 15 = 0.533 → keeps running.
+    try testing.expect(!Generator.runtimeGateShouldDisable(Generator.RUNTIME_GATE_WARMUP, 8, 3));
 }
 
-test "Generator.runtimeGateShouldDisable does not trip with high accept rate" {
-    // Echo workloads on Gemma drafter: ~3 drafts accepted per round (out of 3).
-    // After 10 attempts that's 30 accepted — rate = 3.0, far above threshold.
-    try testing.expect(!Generator.runtimeGateShouldDisable(10, 30));
-    // PLD on heavy-echo: ~4 of 5 drafts accepted; rate ≈ 4.0.
-    try testing.expect(!Generator.runtimeGateShouldDisable(20, 80));
-    // Edge case at exactly the threshold (rate == 0.30) — strict less-than, so
-    // does NOT trip (matches the inline check `rate < RUNTIME_GATE_MIN_RATE`).
-    try testing.expect(!Generator.runtimeGateShouldDisable(10, 3));
+test "Generator.runtimeGateShouldDisable does not trip with high per-draft rate" {
+    // Echo workloads on Gemma drafter: ~93% per-draft acceptance (E4B from
+    // bench: 67/(24*3) = 93.1%). Well above threshold → keeps running.
+    try testing.expect(!Generator.runtimeGateShouldDisable(24, 67, 3));
+    // PLD heavy-echo: ~4 of 5 drafts accepted per attempt = 0.80 per-draft.
+    try testing.expect(!Generator.runtimeGateShouldDisable(20, 80, 5));
+    // Edge case at exactly the threshold (rate == 0.50) — strict less-than,
+    // so does NOT trip.
+    try testing.expect(!Generator.runtimeGateShouldDisable(10, 15, 3)); // 15/30 = 0.50
 }
 
-test "Generator.runtimeGateShouldDisable LFM-like regression scenario" {
-    // LFM2.5-350M heavy-echo: empirically PLD overhead exceeds benefit.
-    // The actual accept rate depends on n-gram match quality. If it's e.g.
-    // 0.25 drafts/attempt, the gate trips and falls back to plain next().
-    try testing.expect(Generator.runtimeGateShouldDisable(20, 5)); // rate 0.25
-    try testing.expect(Generator.runtimeGateShouldDisable(100, 25)); // rate 0.25
-    // If LFM ever runs above 0.30 the gate stays off — that's the intended
-    // safety net behavior.
-    try testing.expect(!Generator.runtimeGateShouldDisable(100, 35)); // rate 0.35
+test "Generator.runtimeGateShouldDisable creative-content regression scenario" {
+    // The Phase 1 bench's exact regression cases on creative prompts:
+    //   E4B drafter (bs=4 → drafts_per_round=3): 39/59 attempts → 22.0% per-draft → trip
+    //   E2B drafter (bs=2 → drafts_per_round=1): 31/66 attempts → 47.0% per-draft → trip
+    //   31B drafter (bs=8 → drafts_per_round=7): 60/(38*7) → 22.6% per-draft → trip
+    try testing.expect(Generator.runtimeGateShouldDisable(59, 39, 3)); // E4B creative
+    try testing.expect(Generator.runtimeGateShouldDisable(66, 31, 1)); // E2B creative
+    try testing.expect(Generator.runtimeGateShouldDisable(38, 60, 7)); // 31B creative
+    // The 26B-A4B@bs=2 creative case: 37/(60*1) = 61.7% → above threshold,
+    // so the runtime gate alone does NOT save it. MoE regressions need the
+    // separate `default_enable_drafter` opt-out at startup.
+    try testing.expect(!Generator.runtimeGateShouldDisable(60, 37, 1));
+}
+
+test "Generator.runtimeGateShouldDisable handles drafts_per_round=0" {
+    // Defensive: if a caller somehow passes a degenerate config (block_size=1
+    // → drafts_per_round=0), don't divide by zero. We return false (no trip).
+    try testing.expect(!Generator.runtimeGateShouldDisable(100, 0, 0));
 }
 
 test "InitOptions.lookup_prompt overrides prompt_ids_owned source" {

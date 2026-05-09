@@ -12,6 +12,20 @@ class AppState: ObservableObject {
         didSet {
             UserDefaults.standard.set(selectedModelPath, forKey: "selectedModelPath")
             guard oldValue != selectedModelPath, !selectedModelPath.isEmpty else { return }
+            // Drafter auto-sync: a drafter is paired to a specific Gemma 4
+            // size (E2B / E4B / 31B / 26B-A4B). Switching the base model
+            // without swapping the drafter to match crashes the server with
+            // `DrafterTargetMismatch`. If the user already had a drafter on,
+            // try to find the matching one for the new model — fall back to
+            // clearing it (auto-disable) when no match is on disk or the new
+            // model isn't Gemma 4.
+            if !serverOptions.drafterPath.isEmpty {
+                if let match = downloads.recommendedDrafterFromPath(selectedModelPath) {
+                    serverOptions.drafterPath = match.url.path
+                } else {
+                    serverOptions.drafterPath = ""
+                }
+            }
             // If the server is up with a different model, restart it with the new one.
             if server.status == .running || server.status == .starting {
                 server.stop()
@@ -125,9 +139,12 @@ class AppState: ObservableObject {
 
     func refreshModels() {
         localModels = downloads.discoverLocalModels()
-        // Auto-select a model if none selected or current selection is invalid
-        if localModels.first(where: { $0.path == selectedModelPath }) == nil,
-           let first = localModels.first {
+        // Auto-select a base model if none selected or the current selection is
+        // invalid. Drafters never get auto-picked — they aren't loadable as a
+        // target on their own.
+        let baseModels = localModels.filter { $0.kind == .base }
+        if baseModels.first(where: { $0.path == selectedModelPath }) == nil,
+           let first = baseModels.first {
             selectedModelPath = first.path
         }
     }

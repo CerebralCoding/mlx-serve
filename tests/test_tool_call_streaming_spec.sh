@@ -23,8 +23,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${TOOL_STREAM_TEST_MODEL:-$HOME/.mlx-serve/models/Qwen3.5-4B-MLX-4bit}"
-DRAFTER="${TOOL_STREAM_TEST_DRAFTER:-$HOME/.mlx-serve/models/gemma-4-E4B-it-assistant-bf16}"
+MODEL="${TOOL_STREAM_TEST_MODEL:-$HOME/.mlx-serve/models/gemma-4-e4b-it-8bit}"
+DRAFTER="${TOOL_STREAM_TEST_DRAFTER:-$HOME/.mlx-serve/models/mlx-community/gemma-4-E4B-it-assistant-bf16}"
 
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_tool_call_streaming_spec: model directory not found ($MODEL)."

@@ -143,19 +143,23 @@ struct StatusMenuView: View {
                     // anything else lives in the Settings window the gear opens.
                     HStack(spacing: 6) {
                         Picker("Model", selection: $appState.selectedModelPath) {
-                            let mlxServe = appState.localModels.filter { $0.source == .mlxServe }
-                            let lmStudio = appState.localModels.filter { $0.source == .lmStudio }
+                            // Hide drafter checkpoints — they pair with a base
+                            // model via the Drafter toggle in Settings, not
+                            // loadable as a target on their own.
+                            let pickable = appState.localModels.filter { $0.kind == .base }
+                            let mlxServe = pickable.filter { $0.source == .mlxServe }
+                            let lmStudio = pickable.filter { $0.source == .lmStudio }
                             if !mlxServe.isEmpty {
                                 Section("MLX-Serve Models") {
                                     ForEach(mlxServe) { model in
-                                        Text(model.name).tag(model.path)
+                                        Text(modelPickerLabel(model)).tag(model.path)
                                     }
                                 }
                             }
                             if !lmStudio.isEmpty {
                                 Section("Other Discovered Models") {
                                     ForEach(lmStudio) { model in
-                                        Text(model.name).tag(model.path)
+                                        Text(modelPickerLabel(model)).tag(model.path)
                                     }
                                 }
                             }
@@ -400,6 +404,20 @@ struct StatusMenuView: View {
             .padding(.bottom, 14)
         }
         .frame(width: 320)
+    }
+
+    /// Append a "+ assist" suffix to every model row that *could* use the
+    /// assistant drafter — i.e. drafter is currently enabled overall AND a
+    /// matching `gemma-4-*-it-assistant-bf16` checkpoint is on disk for this
+    /// row. Lets the user see at a glance which models keep the speedup if
+    /// they switch (auto-sync swaps `drafterPath` to the matching one on
+    /// model change). When drafter is off, no badges anywhere.
+    private func modelPickerLabel(_ model: LocalModel) -> String {
+        guard !appState.serverOptions.drafterPath.isEmpty,
+              downloads.recommendedDrafterFromPath(model.path) != nil else {
+            return model.name
+        }
+        return "\(model.name) + assist"
     }
 }
 

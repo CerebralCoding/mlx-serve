@@ -13,20 +13,6 @@ private struct ScrollViewHeightKey: PreferenceKey {
     static func reduce(value: inout CGFloat, nextValue: () -> CGFloat) { value = nextValue() }
 }
 
-/// Thread-safe timestamp used by the agent-loop stream watchdog to decide if the
-/// current iteration has stalled (no SSE events for too long).
-final class StreamProgressClock: @unchecked Sendable {
-    private let lock = NSLock()
-    private var last: Date = Date()
-    func bump() {
-        lock.lock(); last = Date(); lock.unlock()
-    }
-    func idleSeconds() -> Double {
-        lock.lock(); defer { lock.unlock() }
-        return Date().timeIntervalSince(last)
-    }
-}
-
 struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -918,19 +904,16 @@ struct ChatDetailView: View {
                 defaults: APIClient.RequestDefaults.from(appState.serverOptions)
             )
 
-            // Watchdog: cancel the stream if no SSE event arrives within 90s.
-            // Server-side thinking buffering for tool-enabled requests can block the
-            // client for many seconds; a genuine stall (KV cache poison, sampling
-            // loop, network hang) would otherwise hang forever until the user hits Stop.
-            let watchdogSeconds: Double = 90
-            let lastEventAt = StreamProgressClock()
-            var streamStalled = false
+            // No client-side stream watchdog: long generations (large
+            // contexts, big batches, slow sampling on big MoE) can legitimately
+            // sit silent for minutes between events. The user keeps the Stop
+            // button as the manual cancel; URLSession's own resource timeout
+            // (set in APIClient) handles a truly broken socket.
             let streamTask = Task<(tcs: [APIClient.ToolCall], maxHit: Bool), Error> {
                 var tcs: [APIClient.ToolCall] = []
                 var maxHit = false
                 for try await event in stream {
                     try Task.checkCancellation()
-                    lastEventAt.bump()
                     switch event {
                     case .content(let text):
                         appState.updateLastMessage(in: sessionId, content: text)
@@ -949,53 +932,19 @@ struct ChatDetailView: View {
                 }
                 return (tcs, maxHit)
             }
-            let watchdog = Task {
-                while !streamTask.isCancelled {
-                    try? await Task.sleep(nanoseconds: 5 * 1_000_000_000)
-                    if Task.isCancelled { return }
-                    if lastEventAt.idleSeconds() > watchdogSeconds {
-                        streamStalled = true
-                        streamTask.cancel()
-                        return
-                    }
-                }
-            }
-            // Unstructured child tasks don't inherit cancellation from the outer
-            // agent-loop task, so wire the Stop button through explicitly.
+            // Wire the user's Stop button through to the inner stream task.
             do {
                 let result = try await withTaskCancellationHandler {
                     try await streamTask.value
                 } onCancel: {
                     streamTask.cancel()
-                    watchdog.cancel()
                 }
                 receivedToolCalls = result.tcs
                 maxTokensHit = result.maxHit
             } catch is CancellationError {
-                watchdog.cancel()
-                if !streamStalled { throw CancellationError() }
-            } catch {
-                watchdog.cancel()
-                throw error
+                throw CancellationError()
             }
-            watchdog.cancel()
             appState.updateLastMessage(in: sessionId, streaming: false)
-
-            // Watchdog-triggered stall: surface a clear error and stop the loop.
-            // The user can simply resend their question — server state is preserved.
-            if streamStalled {
-                if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
-                   !appState.chatSessions[sIdx].messages.isEmpty {
-                    let mIdx = appState.chatSessions[sIdx].messages.count - 1
-                    appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
-                }
-                let errorMsg = ChatMessage(
-                    role: .assistant,
-                    content: "⚠️ The model didn't produce a response within \(Int(watchdogSeconds))s. Try resending your message, simplifying the request, or restarting the server."
-                )
-                appState.appendMessage(to: sessionId, message: errorMsg)
-                return
-            }
 
             // Truncation recovery: if max_tokens was hit AND tool calls were received,
             // the tool call args are likely truncated (incomplete JSON). Don't execute them —
@@ -1287,6 +1236,11 @@ struct GeneratingIndicator: View {
                 Text(whimsy)
                     .foregroundStyle(.secondary)
                     .transition(.opacity)
+                Text("·")
+                    .foregroundStyle(.tertiary)
+                Text(Self.formatElapsed(elapsed))
+                    .foregroundStyle(.secondary)
+                    .monospacedDigit()
             }
             .font(.system(size: 10, weight: .medium, design: .monospaced))
         }
@@ -1340,6 +1294,20 @@ struct GeneratingIndicator: View {
 
     private static func randomWhimsy() -> String {
         whimsies.randomElement() ?? "thinking"
+    }
+
+    /// Compact elapsed-time format: "0s", "9s", "59s", "1m04s", "12m08s",
+    /// "1h02m". Designed to read at 10pt monospaced without ever changing
+    /// width by more than one glyph as the timer ticks.
+    private static func formatElapsed(_ seconds: Double) -> String {
+        let total = max(0, Int(seconds))
+        if total < 60 { return "\(total)s" }
+        if total < 3600 {
+            let m = total / 60, s = total % 60
+            return String(format: "%dm%02ds", m, s)
+        }
+        let h = total / 3600, m = (total % 3600) / 60
+        return String(format: "%dh%02dm", h, m)
     }
 }
 

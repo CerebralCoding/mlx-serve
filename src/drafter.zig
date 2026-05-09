@@ -22,8 +22,62 @@ const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 
 const Weights = model_mod.Weights;
+const ModelConfig = model_mod.ModelConfig;
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
+
+/// Default block_size used when neither `--draft-block-size` nor the per-target
+/// auto-detect table picks a value. 4 = 3 drafter forwards + 1 verify token,
+/// matches vLLM PR #41745's default for E4B/26B-A4B.
+pub const DEFAULT_BLOCK_SIZE: u32 = 4;
+
+/// Per-target block_size recommendation. Mirrors vLLM PR #41745
+/// (Google's reference Gemma 4 assistant-drafter implementation):
+///
+///   E2B    (dense, ~30 layers):    2
+///   E4B    (dense, ~42 layers):    4
+///   26B-A4B (MoE,   ~30 layers):   4
+///   31B    (dense, ~60 layers):    8   ← bigger model amortizes verify cost
+///   default Gemma 4:                4
+///   non-Gemma 4:                    4   (drafter rejects non-Gemma4 anyway)
+///
+/// Heuristic: dense models with deep stacks benefit from bigger blocks because
+/// the verify forward's cost is dominated by per-token weight reads (~linear in
+/// layer count) and the drafter's per-step cost is fixed; the larger the verify
+/// budget the more we amortize that fixed cost. MoE keeps the conservative
+/// 4 because expert-routing variance lowers per-draft acceptance.
+///
+/// We tested block_size=2 on 26B-A4B-MoE to halve the verify-forward expert-
+/// load penalty (S=2 → up to 16 experts vs 32 at S=4). Echo did improve
+/// (~+19%), but creative decode regressed ~-27% because the runtime
+/// acceptance gate trips on per-draft probability — at block_size=2 the
+/// single draft per round has high enough acceptance (~50%) to stay above
+/// the 0.50 threshold even on creative content, so the gate never fires and
+/// drafter overhead bleeds into every round. bs=4's averaging across 3
+/// drafts pulls the per-draft below 0.50 on creative and lets the gate
+/// disable drafter cleanly.
+///
+/// `target_config.num_hidden_layers` is the actual decoder depth; the
+/// model-size proxy is more reliable than parsing nominal parameter counts
+/// out of the model dir name.
+pub fn recommendedBlockSize(target_config: *const ModelConfig) u32 {
+    const is_gemma4 = std.mem.eql(u8, target_config.model_type, "gemma4");
+    if (!is_gemma4) return DEFAULT_BLOCK_SIZE;
+
+    if (target_config.isMoe()) {
+        // 26B-A4B (the only Gemma 4 MoE today). Conservative 4 — bigger blocks
+        // do not pay off when expert routing fragments the draft path; smaller
+        // blocks defeat the runtime acceptance gate (see doc-comment above).
+        return 4;
+    }
+
+    // Dense Gemma 4: pick based on depth. E2B has ~30 layers, E4B ~42, 31B ~60.
+    // Cutoffs chosen to match vLLM PR #41745's per-model table.
+    const layers = target_config.num_hidden_layers;
+    if (layers >= 56) return 8;     // 31B class
+    if (layers >= 36) return 4;     // E4B class
+    return 2;                       // E2B class (and smaller)
+}
 
 pub const LayerType = enum {
     sliding_attention,
@@ -718,7 +772,19 @@ fn embedTargetToken(
     const id_shape = [_]c_int{1};
     const id_arr = mlx.mlx_array_new_data(&id_i32, &id_shape, 1, .int32);
     defer _ = mlx.mlx_array_free(id_arr);
+    return embedTargetTokenArr(self, target, id_arr);
+}
 
+/// Like `embedTargetToken` but accepts the indexer as a caller-owned mlx_array
+/// of shape [1] (int32). Used by the lazy drafter sample chain in
+/// `nextDrafter`: each sample step's output (a 1-element argmax) is fed
+/// directly to the next step without a CPU sync. The shape and dtype of
+/// `id_arr` must match what `mlx_take_axis` expects on `target.emb_w`.
+fn embedTargetTokenArr(
+    self: *const DrafterModel,
+    target: *Transformer,
+    id_arr: mlx.mlx_array,
+) !mlx.mlx_array {
     var tw = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(tw);
     try mlx.check(mlx.mlx_take_axis(&tw, target.emb_w, id_arr, 0, self.s));
@@ -1212,10 +1278,31 @@ pub fn step(
     target_hidden: mlx.mlx_array,
     rope_offset: c_int,
 ) !DrafterStepOut {
+    const id_i32: i32 = @intCast(prev_token_id);
+    const id_shape = [_]c_int{1};
+    const id_arr = mlx.mlx_array_new_data(&id_i32, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(id_arr);
+    return stepArr(self, target, id_arr, target_hidden, rope_offset);
+}
+
+/// Like `step` but accepts `prev_token_arr` as a caller-owned 1-element int32
+/// `mlx_array` (NOT a u32). Used by `nextDrafter`'s lazy sample chain: each
+/// step's sampled token (a [1]-shaped argmax output) is passed directly to
+/// the next step without a CPU sync. With `block_size=N`, this collapses
+/// `N - 1` GPU→CPU sync points (one per drafter step) into zero — drafter,
+/// verify, and any lazy postprocessing run as a single async graph that
+/// evaluates once at the end of the round.
+pub fn stepArr(
+    self: *DrafterModel,
+    target: *Transformer,
+    prev_token_arr: mlx.mlx_array,
+    target_hidden: mlx.mlx_array,
+    rope_offset: c_int,
+) !DrafterStepOut {
     const s = self.s;
 
     // ── Build input: concat([target.embed(prev_tok)*scale, target_hidden], -1) ──
-    const tok_embed = try embedTargetToken(self, target, prev_token_id);
+    const tok_embed = try embedTargetTokenArr(self, target, prev_token_arr);
     defer _ = mlx.mlx_array_free(tok_embed);
 
     // Concat along axis=-1 → [1, 1, 2*backbone]
@@ -1377,4 +1464,52 @@ test "LayerType.fromString" {
     try testing.expectEqual(LayerType.sliding_attention, try LayerType.fromString("sliding_attention"));
     try testing.expectEqual(LayerType.full_attention, try LayerType.fromString("full_attention"));
     try testing.expectError(error.UnknownLayerType, LayerType.fromString("bogus"));
+}
+
+test "recommendedBlockSize per-target table (Gemma 4 family)" {
+    // E2B class — small, ~30 layers in the Gemma 4 family.
+    var c_e2b = ModelConfig{};
+    c_e2b.model_type = "gemma4";
+    c_e2b.num_hidden_layers = 30;
+    c_e2b.num_experts = 0;
+    try testing.expectEqual(@as(u32, 2), recommendedBlockSize(&c_e2b));
+
+    // E4B class — middle weight, ~42 layers.
+    var c_e4b = ModelConfig{};
+    c_e4b.model_type = "gemma4";
+    c_e4b.num_hidden_layers = 42;
+    c_e4b.num_experts = 0;
+    try testing.expectEqual(@as(u32, 4), recommendedBlockSize(&c_e4b));
+
+    // 31B class — deep stack, ~60 layers; vLLM uses 8.
+    var c_31b = ModelConfig{};
+    c_31b.model_type = "gemma4";
+    c_31b.num_hidden_layers = 60;
+    c_31b.num_experts = 0;
+    try testing.expectEqual(@as(u32, 8), recommendedBlockSize(&c_31b));
+
+    // 26B-A4B MoE — depth would map to "8" by layer count alone, but MoE
+    // pins to 4 (expert routing fragments draft acceptance).
+    var c_26b_moe = ModelConfig{};
+    c_26b_moe.model_type = "gemma4";
+    c_26b_moe.num_hidden_layers = 30;
+    c_26b_moe.num_experts = 128;
+    try testing.expectEqual(@as(u32, 4), recommendedBlockSize(&c_26b_moe));
+
+    // Edge: cutoff boundaries.
+    var c_55 = ModelConfig{};
+    c_55.model_type = "gemma4";
+    c_55.num_hidden_layers = 55;
+    try testing.expectEqual(@as(u32, 4), recommendedBlockSize(&c_55));
+    var c_56 = ModelConfig{};
+    c_56.model_type = "gemma4";
+    c_56.num_hidden_layers = 56;
+    try testing.expectEqual(@as(u32, 8), recommendedBlockSize(&c_56));
+
+    // Non-Gemma4: drafter rejects these at load time, but the helper
+    // still returns a sane default (4) rather than crashing.
+    var c_other = ModelConfig{};
+    c_other.model_type = "qwen3";
+    c_other.num_hidden_layers = 60;
+    try testing.expectEqual(DEFAULT_BLOCK_SIZE, recommendedBlockSize(&c_other));
 }

@@ -90,6 +90,18 @@ struct HFModel: Identifiable, Codable {
         return toolFamilies.contains { lower.contains($0) }
     }
 
+    /// Whether this repo is a Gemma 4 assistant drafter checkpoint. Drafters
+    /// pair with a base Gemma 4 model via `--drafter <dir>`; loading one as a
+    /// target on its own would fail. Case-sensitive on the size designator
+    /// since that's how `mlx-community` publishes them today (`E2B`, `E4B`,
+    /// `26B-A4B`, `31B`).
+    var isDrafter: Bool { Self.drafterRepoRegex.firstMatch(in: id, range: NSRange(id.startIndex..., in: id)) != nil }
+
+    private static let drafterRepoRegex: NSRegularExpression = {
+        let pattern = #"^mlx-community/gemma-4-(E2B|E4B|26B-A4B|31B)-it-assistant-bf16$"#
+        return try! NSRegularExpression(pattern: pattern)
+    }()
+
     var author: String {
         id.split(separator: "/").first.map(String.init) ?? ""
     }

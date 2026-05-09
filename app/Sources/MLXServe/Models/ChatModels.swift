@@ -148,6 +148,19 @@ struct ModelInfo {
     /// only by what the architecture supports. Stable across server restarts;
     /// use this for UI like the "Model max" pill in Settings.
     var modelMaxTokens: Int
+    /// `model_type` from config.json — "gemma4", "qwen3_5_moe", "llama", etc.
+    /// Empty string when talking to a pre-drafter-UX server build.
+    var architecture: String = ""
+    /// True when the model has any MoE (sparse expert) layers. Drives the
+    /// soft-warning pill in Settings → Drafter, since drafter regresses on
+    /// MoE targets at single-stream batch=1.
+    var isMoE: Bool = false
+    /// True when the running server was launched with `--drafter <dir>` and
+    /// the drafter+target pair validated. Drives the green status pill.
+    var drafterLoaded: Bool = false
+    /// Absolute path passed to `--drafter` at startup. nil when the server
+    /// has no drafter loaded.
+    var drafterPath: String? = nil
 }
 
 struct MemoryInfo {
@@ -196,6 +209,16 @@ enum LocalModelSource: String, Codable, Hashable {
     case lmStudio
 }
 
+/// Distinguishes a base model from a paired drafter checkpoint. Drafters are
+/// `gemma-4-*-it-assistant-bf16` directories whose `config.json` declares
+/// `model_type: "gemma4_assistant"` — they aren't loadable as a target on
+/// their own, so the Model Browser groups them separately and Settings hides
+/// them from the model picker.
+enum ModelKind: String, Codable, Hashable {
+    case base
+    case drafter
+}
+
 struct LocalModel: Identifiable, Hashable {
     let id: String
     let name: String
@@ -203,10 +226,33 @@ struct LocalModel: Identifiable, Hashable {
     let sizeFormatted: String
     let modelType: String
     let source: LocalModelSource
+    let kind: ModelKind
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType)
     }
+}
+
+/// Gemma 4 size designators that have a published assistant drafter today.
+/// Naming intentionally matches the segment in `gemma-4-{E2B,...}-it-...`.
+enum GemmaVariant: String, CaseIterable, Hashable {
+    case E2B
+    case E4B
+    case gemma31B = "31B"
+    case moe26B = "26B-A4B"
+
+    /// Repo basename (no author prefix) of the assistant drafter.
+    var drafterDirName: String {
+        "gemma-4-\(rawValue)-it-assistant-bf16"
+    }
+
+    /// Human-readable target label for the pairing banner ("for E4B").
+    var label: String { rawValue }
+}
+
+struct LocalDrafter: Hashable {
+    let url: URL
+    let variant: GemmaVariant
 }
 
 struct GemmaModelOption: Identifiable {

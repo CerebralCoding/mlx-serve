@@ -117,10 +117,21 @@ struct ModelBrowserView: View {
 
                 Divider()
 
-                // HuggingFace model list
+                // HuggingFace model list, with the curated Drafters section
+                // pinned at the top so users land on it before scrolling
+                // through generic search results.
+                //
+                // Already-downloaded models are filtered out here — they live
+                // in the Downloaded tab, and surfacing them again as
+                // "Download" rows is noise. Their counts still match in the
+                // footer total.
+                let visibleModels = searchService.models.filter { !downloads.isReady($0.id) }
+                let hiddenCount = searchService.models.count - visibleModels.count
+
                 ScrollView {
                     LazyVStack(spacing: 0) {
-                        ForEach(searchService.models) { model in
+                        DraftersSection()
+                        ForEach(visibleModels) { model in
                             ModelBrowserRow(
                                 model: model,
                                 fitness: searchService.ramFitness(for: model)
@@ -136,7 +147,7 @@ struct ModelBrowserView: View {
                                 .foregroundStyle(.red)
                                 .font(.caption)
                                 .padding(20)
-                        } else if searchService.models.isEmpty {
+                        } else if visibleModels.isEmpty && hiddenCount == 0 {
                             Text("No models found")
                                 .foregroundStyle(.secondary)
                                 .padding(40)
@@ -156,9 +167,14 @@ struct ModelBrowserView: View {
                 Divider()
 
                 HStack {
-                    Text("Showing \(searchService.models.count) models")
+                    Text("Showing \(visibleModels.count) models")
                         .font(.caption)
                         .foregroundStyle(.secondary)
+                    if hiddenCount > 0 {
+                        Text("· \(hiddenCount) already downloaded")
+                            .font(.caption)
+                            .foregroundStyle(.tertiary)
+                    }
                     Spacer()
                     Text("System RAM: \(MemoryInfo.format(Int64(searchService.systemRAM)))")
                         .font(.caption)
@@ -260,6 +276,18 @@ private struct ModelBrowserRow: View {
     private var state: DownloadManager.DownloadState? { downloads.downloads[model.id] }
     private var disabled: Bool { !model.isCompatible }
 
+    /// For Gemma 4 dense/MoE base rows, the variant whose drafter pairs with
+    /// this checkpoint — drives the inline "+drafter" / "✓ paired" chip. nil
+    /// for non-Gemma-4 rows (most everything).
+    private var pairableVariant: GemmaVariant? {
+        guard !model.isDrafter else { return nil }
+        let lower = model.id.lowercased()
+        guard lower.contains("gemma-4") else { return nil }
+        // Note: HFModel doesn't tell us isMoE directly, but the size token
+        // does — 26b-a4b is the only MoE today.
+        return DownloadManager.gemmaVariantFor(modelPath: lower, isMoE: lower.contains("26b-a4b"))
+    }
+
     var body: some View {
         HStack(spacing: 8) {
             // Model name — takes all remaining space
@@ -267,7 +295,7 @@ private struct ModelBrowserRow: View {
                 Text(model.modelName)
                     .font(.callout.weight(.medium))
                     .lineLimit(1)
-                HStack(spacing: 4) {
+                HStack(spacing: 6) {
                     Text(model.author)
                         .font(.caption)
                         .foregroundStyle(.tertiary)
@@ -277,6 +305,9 @@ private struct ModelBrowserRow: View {
                             .font(.system(size: 10))
                             .foregroundStyle(.red.opacity(0.8))
                             .lineLimit(1)
+                    }
+                    if let v = pairableVariant {
+                        DrafterPairChip(variant: v)
                     }
                 }
             }
@@ -449,10 +480,28 @@ private struct LocalModelRow: View {
     var body: some View {
         HStack(spacing: 8) {
             VStack(alignment: .leading, spacing: 1) {
-                Text(model.name)
-                    .font(.callout.weight(.medium))
-                    .lineLimit(1)
-                if !model.isSupportedArchitecture {
+                HStack(spacing: 6) {
+                    Text(model.name)
+                        .font(.callout.weight(.medium))
+                        .lineLimit(1)
+                    // Drafter checkpoints are real, supported models — they
+                    // just aren't loadable as a target on their own. Show a
+                    // distinct badge instead of the red "unsupported" warning
+                    // that the generic check would otherwise render.
+                    if model.kind == .drafter {
+                        Text("Drafter")
+                            .font(.system(size: 10).weight(.medium))
+                            .foregroundStyle(.purple)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.purple.opacity(0.15), in: Capsule())
+                            .help("Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.")
+                    }
+                }
+                // Only flag genuinely unsupported architectures. Drafters
+                // declare `gemma4_assistant` (not in supportedModelTypes) but
+                // are intentionally so — the badge above already tells the
+                // user what they're for.
+                if model.kind != .drafter, !model.isSupportedArchitecture {
                     Text("Unsupported architecture (\(model.modelType))")
                         .font(.system(size: 10))
                         .foregroundStyle(.red.opacity(0.8))
@@ -548,5 +597,233 @@ private struct ActiveDownloadRow: View {
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
+    }
+}
+
+// MARK: - Drafter Pair Chip
+
+/// Small inline indicator on Gemma 4 base-model rows that surfaces the
+/// matching drafter. Two states:
+///   - **On disk**: green "✓ Drafter" chip — silently confirms the pairing
+///     is ready, hides the download CTA.
+///   - **Not on disk**: clickable "Pair with drafter (+30-40%)" chip that
+///     kicks off `DownloadManager.download(repoId:)` for the matching
+///     `*-it-assistant-bf16` repo.
+private struct DrafterPairChip: View {
+    let variant: GemmaVariant
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+
+    private var repoId: String { "mlx-community/\(variant.drafterDirName)" }
+    private var isReady: Bool { downloads.isReady(repoId) }
+    private var inFlight: Bool { downloads.downloads[repoId]?.status == .downloading }
+
+    var body: some View {
+        if isReady {
+            Text("✓ Drafter")
+                .font(.system(size: 10).weight(.medium))
+                .foregroundStyle(.green)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Color.green.opacity(0.10))
+                .clipShape(Capsule())
+                .help("\(variant.drafterDirName) is downloaded and ready to pair.")
+        } else if inFlight {
+            Text("Drafter…")
+                .font(.system(size: 10).weight(.medium))
+                .foregroundStyle(.purple)
+                .padding(.horizontal, 5)
+                .padding(.vertical, 1)
+                .background(Color.purple.opacity(0.10))
+                .clipShape(Capsule())
+        } else {
+            Button {
+                Task {
+                    await downloads.download(repoId: repoId)
+                    appState.refreshModels()
+                }
+            } label: {
+                Text("Pair with drafter +30-40%")
+                    .font(.system(size: 10).weight(.medium))
+                    .foregroundStyle(.purple)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.purple.opacity(0.10))
+                    .clipShape(Capsule())
+            }
+            .buttonStyle(.plain)
+            .help("Download \(variant.drafterDirName) for +30-40% on code & agents (Gemma 4 only).")
+        }
+    }
+}
+
+// MARK: - Curated Drafters Section
+
+/// Top-of-browser block listing the four published Gemma 4 assistant drafter
+/// checkpoints. Surfaced here so users find them without manually searching
+/// "assistant-bf16". Each row reuses the underlying `DownloadManager` state
+/// machine — same Resume / Download / Delete affordances as the main list.
+private struct DraftersSection: View {
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+    /// Collapsed by default — pairing a drafter is a one-time setup step, so
+    /// we don't want this taking up vertical space above the search results
+    /// after the user's already done it once.
+    @State private var expanded = false
+
+    private var rows: [DrafterCatalogRow] {
+        GemmaVariant.allCases.map { v in
+            DrafterCatalogRow(
+                variant: v,
+                repoId: "mlx-community/\(v.drafterDirName)",
+                pairsWith: "for \(v.label)",
+                sizeEstimate: Self.sizeEstimate(for: v)
+            )
+        }
+    }
+
+    private static func sizeEstimate(for v: GemmaVariant) -> String {
+        switch v {
+        case .E2B:        return "~80 MB"
+        case .E4B:        return "~120 MB"
+        case .gemma31B:   return "~150 MB"
+        case .moe26B:     return "~120 MB"
+        }
+    }
+
+    /// Count of drafters already on disk — drives the "X of 4 ready" hint
+    /// in the collapsed header so users see at a glance whether they need
+    /// to expand it.
+    private var readyCount: Int {
+        rows.filter { downloads.isReady($0.repoId) }.count
+    }
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            Button {
+                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
+            } label: {
+                HStack(spacing: 6) {
+                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
+                        .font(.caption2.weight(.semibold))
+                        .foregroundStyle(.secondary)
+                        .frame(width: 10)
+                    Image(systemName: "sparkles")
+                        .foregroundStyle(.purple)
+                    Text("Drafters")
+                        .font(.callout.weight(.semibold))
+                    Text("Pair with a Gemma 4 base model for +27–40% on code & agents")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                        .lineLimit(1)
+                    Spacer()
+                    Text("\(readyCount) of \(rows.count) downloaded")
+                        .font(.caption2.monospacedDigit())
+                        .foregroundStyle(.secondary)
+                }
+                .contentShape(Rectangle())
+                .padding(.horizontal, 12)
+                .padding(.vertical, 8)
+            }
+            .buttonStyle(.plain)
+
+            if expanded {
+                ForEach(rows) { row in
+                    DrafterCatalogRowView(row: row)
+                    Divider().padding(.horizontal, 12)
+                }
+            }
+        }
+        .background(Color.purple.opacity(0.04))
+    }
+}
+
+private struct DrafterCatalogRow: Identifiable {
+    let variant: GemmaVariant
+    let repoId: String
+    let pairsWith: String
+    let sizeEstimate: String
+    var id: String { repoId }
+}
+
+private struct DrafterCatalogRowView: View {
+    let row: DrafterCatalogRow
+    @EnvironmentObject var downloads: DownloadManager
+    @EnvironmentObject var appState: AppState
+    @State private var confirmDelete = false
+
+    private var isReady: Bool { downloads.isReady(row.repoId) }
+    private var state: DownloadManager.DownloadState? { downloads.downloads[row.repoId] }
+
+    var body: some View {
+        HStack(spacing: 8) {
+            VStack(alignment: .leading, spacing: 1) {
+                Text(row.variant.drafterDirName)
+                    .font(.callout.weight(.medium))
+                    .lineLimit(1)
+                HStack(spacing: 6) {
+                    Text(row.pairsWith)
+                        .font(.caption)
+                        .foregroundStyle(.purple)
+                    Text("·")
+                        .foregroundStyle(.tertiary)
+                    Text(row.sizeEstimate)
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+            }
+            .frame(maxWidth: .infinity, alignment: .leading)
+
+            actionControl
+                .frame(width: 110, alignment: .trailing)
+        }
+        .padding(.horizontal, 12)
+        .padding(.vertical, 6)
+    }
+
+    @ViewBuilder
+    private var actionControl: some View {
+        if isReady {
+            HStack(spacing: 6) {
+                Text("✓ Available")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.green)
+                Button {
+                    confirmDelete = true
+                } label: {
+                    Image(systemName: "trash")
+                        .foregroundStyle(.red.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .font(.callout)
+                .help("Delete drafter")
+                .alert("Delete Drafter", isPresented: $confirmDelete) {
+                    Button("Cancel", role: .cancel) {}
+                    Button("Delete", role: .destructive) {
+                        downloads.deleteModel(repoId: row.repoId)
+                        appState.refreshModels()
+                    }
+                } message: {
+                    Text("Delete \(row.variant.drafterDirName)?")
+                }
+            }
+        } else if let s = state, s.status == .downloading {
+            VStack(spacing: 1) {
+                ProgressView(value: s.fileProgress)
+                    .frame(width: 80)
+                Text(s.percentFormatted)
+                    .font(.system(size: 9).monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+        } else {
+            Button(downloads.hasPartialDownload(row.repoId) ? "Resume" : "Download") {
+                Task {
+                    await downloads.download(repoId: row.repoId)
+                    appState.refreshModels()
+                }
+            }
+            .font(.callout)
+            .controlSize(.small)
+        }
     }
 }

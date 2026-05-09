@@ -97,6 +97,10 @@ class APIClient {
 
         let name = first["id"] as? String ?? "unknown"
         let meta = first["meta"] as? [String: Any] ?? [:]
+        // `architecture` / `is_moe` / `drafter_loaded` / `drafter_path` are
+        // only emitted by mlx-serve binaries built after the drafter UX
+        // landed. Old binaries omit them; default to safe values so the app
+        // doesn't crash and the drafter row falls back to the disabled state.
         return ModelInfo(
             name: name,
             quantBits: meta["quantization_bits"] as? Int ?? 0,
@@ -104,7 +108,11 @@ class APIClient {
             hiddenSize: meta["hidden_size"] as? Int ?? 0,
             vocabSize: meta["vocab_size"] as? Int ?? 0,
             contextLength: meta["context_length"] as? Int ?? 0,
-            modelMaxTokens: meta["model_max_tokens"] as? Int ?? 0
+            modelMaxTokens: meta["model_max_tokens"] as? Int ?? 0,
+            architecture: meta["architecture"] as? String ?? "",
+            isMoE: meta["is_moe"] as? Bool ?? false,
+            drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
+            drafterPath: meta["drafter_path"] as? String
         )
     }
 

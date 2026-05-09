@@ -152,15 +152,64 @@ class ServerManager: ObservableObject {
 
         let errSnippet = serverLog.trimmingCharacters(in: .whitespacesAndNewlines)
         let shortErr = errSnippet.isEmpty ? "exit code \(exitCode)" : String(errSnippet.suffix(200))
+        let fullLog = errSnippet.isEmpty ? "(no stderr captured — exit code \(exitCode))" : errSnippet
 
         if case .running = status {
             status = .error("Exited unexpectedly")
             lastError = shortErr
+            presentCrashAlert(title: "mlx-serve exited unexpectedly", log: fullLog, exitCode: exitCode)
         } else if case .starting = status {
             status = .error("Failed to start")
             lastError = shortErr
+            presentCrashAlert(title: "mlx-serve failed to start", log: fullLog, exitCode: exitCode)
         } else {
             status = .stopped
+        }
+    }
+
+    /// Modal alert for server crashes — surfaces the full stderr log in a
+    /// scrollable, selectable text view so the user can copy/paste it into
+    /// a bug report instead of digging through the menu-bar log icon.
+    private func presentCrashAlert(title: String, log: String, exitCode: Int32) {
+        let alert = NSAlert()
+        alert.messageText = title
+        alert.informativeText = "Exit code \(exitCode). Full server log below — select & copy, or use the Copy Log button."
+        alert.alertStyle = .warning
+
+        // Scrollable, selectable, monospaced log view as the accessory.
+        let scroll = NSScrollView(frame: NSRect(x: 0, y: 0, width: 640, height: 280))
+        scroll.hasVerticalScroller = true
+        scroll.hasHorizontalScroller = true
+        scroll.borderType = .bezelBorder
+        scroll.autohidesScrollers = false
+
+        let textView = NSTextView(frame: scroll.bounds)
+        textView.isEditable = false
+        textView.isSelectable = true
+        textView.font = NSFont.monospacedSystemFont(ofSize: 11, weight: .regular)
+        textView.string = log
+        textView.textContainer?.widthTracksTextView = false
+        textView.textContainer?.containerSize = NSSize(
+            width: CGFloat.greatestFiniteMagnitude,
+            height: CGFloat.greatestFiniteMagnitude
+        )
+        textView.isHorizontallyResizable = true
+        textView.autoresizingMask = [.width]
+        textView.scrollToEndOfDocument(nil)
+
+        scroll.documentView = textView
+        alert.accessoryView = scroll
+
+        alert.addButton(withTitle: "Copy Log")
+        alert.addButton(withTitle: "OK")
+
+        // LSUIElement app: surface the alert above any focused app.
+        NSApp.activate(ignoringOtherApps: true)
+        let response = alert.runModal()
+        if response == .alertFirstButtonReturn {
+            let pb = NSPasteboard.general
+            pb.clearContents()
+            pb.setString(log, forType: .string)
         }
     }
 

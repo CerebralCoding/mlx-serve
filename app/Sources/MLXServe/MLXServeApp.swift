@@ -129,6 +129,7 @@ struct MLXCoreApp: App {
             SettingsView()
                 .environmentObject(appState)
                 .environmentObject(appState.server)
+                .environmentObject(appState.downloads)
                 .frame(minWidth: 720, minHeight: 560)
         }
         .defaultSize(width: 820, height: 700)

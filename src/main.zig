@@ -51,8 +51,9 @@ fn printUsage(io: std.Io) void {
         \\                        bound to the target model, and used as the
         \\                        default draft source for new requests
         \\                        (priority: drafter > PLD > regular).
-        \\  --draft-block-size <n>  Tokens per drafter round (default: 4 = 3
-        \\                        drafter steps + 1 verify token).
+        \\  --draft-block-size <n>  Tokens per drafter round. Default is
+        \\                        auto-detected per Gemma 4 target (E2B=2,
+        \\                        E4B=4, 26B-A4B=4, 31B=8); pass to override.
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --version           Print version and exit
         \\  --help              Show this help
@@ -99,7 +100,8 @@ pub fn main(init: std.process.Init) !void {
     var pld_draft_len: u32 = 5;
     var pld_key_len: u32 = 3;
     var drafter_dir: ?[]const u8 = null; // Path to Gemma 4 assistant drafter checkpoint
-    var draft_block_size: u32 = 4;
+    var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
+    var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var i: usize = 1;
     while (i < args.len) : (i += 1) {
         if (std.mem.eql(u8, args[i], "--version")) {
@@ -157,6 +159,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--draft-block-size") and i + 1 < args.len) {
             i += 1;
             draft_block_size = try std.fmt.parseInt(u32, args[i], 10);
+            draft_block_size_explicit = true;
         } else if (std.mem.eql(u8, args[i], "--reasoning-budget") and i + 1 < args.len) {
             i += 1;
             reasoning_budget = try std.fmt.parseInt(i32, args[i], 10);
@@ -183,6 +186,29 @@ pub fn main(init: std.process.Init) !void {
     defer _ = mlx.mlx_string_free(ver);
     try mlx.check(mlx.mlx_version(&ver));
     log.info("mlx-serve {s} (MLX {s})\n", .{ VERSION, mlx.mlx_string_data(ver) });
+
+    // Echo the resolved arguments — makes drafter/target mismatches obvious
+    // from the log without having to scroll through the whole launch line in
+    // the parent's process listing.
+    log.info("[args] model: {s}\n", .{model_dir});
+    if (drafter_dir) |dir| {
+        log.info("[args] drafter: {s} (block_size={d}{s})\n", .{
+            dir,
+            draft_block_size,
+            if (draft_block_size_explicit) "" else ", auto",
+        });
+    } else {
+        log.info("[args] drafter: <none>\n", .{});
+    }
+    if (serve_mode) {
+        log.info("[args] serve: {s}:{d}, ctx-size={d}, pld={s}, no-vision={}\n", .{
+            host,
+            port,
+            ctx_size,
+            if (enable_pld) "on" else "off",
+            no_vision,
+        });
+    }
 
     // Set GPU as default
     var metal_avail: bool = false;
@@ -338,10 +364,53 @@ pub fn main(init: std.process.Init) !void {
             };
             drafter_storage = d;
             drafter_ptr = &drafter_storage.?;
-            log.info("Drafter ready (block_size={d}).\n", .{draft_block_size});
+
+            // Auto-detect block_size from the target's config when the user
+            // didn't pin it via --draft-block-size. The per-target table
+            // (vLLM PR #41745) gives 31B a bigger budget so its slower verify
+            // forwards are amortized, and keeps MoE / smaller models at safe
+            // defaults. Explicit --draft-block-size always wins.
+            if (!draft_block_size_explicit) {
+                const auto_bs = drafter_mod.recommendedBlockSize(&config);
+                if (auto_bs != draft_block_size) {
+                    log.info(
+                        "Drafter ready (block_size={d}, auto-detected for {s}/{d}-layer{s}).\n",
+                        .{
+                            auto_bs,
+                            config.model_type,
+                            config.num_hidden_layers,
+                            if (config.isMoe()) ",moe" else "",
+                        },
+                    );
+                    draft_block_size = auto_bs;
+                } else {
+                    log.info("Drafter ready (block_size={d}, default).\n", .{draft_block_size});
+                }
+            } else {
+                log.info("Drafter ready (block_size={d}, user override).\n", .{draft_block_size});
+            }
+
+            // MoE caveat: even at very high per-draft acceptance (97.8% on
+            // 26B-A4B echo, bench 2026-05-08), the verify forward's expert-
+            // routing penalty makes drafter a net regression at single-stream
+            // batch=1 — every block_size we tried (2, 4) shows worse decode
+            // tps than no speculation. Load the drafter so per-request
+            // `enable_drafter:true` still works, but flip the server default
+            // off. When the user passes `--no-pld --drafter <dir>` on MoE,
+            // PLD remains the recommended default-on path (1.43× echo on
+            // 26B-A4B per the prior bench).
+            if (config.isMoe()) {
+                log.warn(
+                    "Drafter loaded but target is MoE ({s}); per-request " ++
+                        "enable_drafter defaults to OFF — drafter+MoE regresses " ++
+                        "at single-stream batch=1 (verify forward expert-routing " ++
+                        "penalty). Pass enable_drafter:true per request to opt-in.\n",
+                    .{config.model_type},
+                );
+            }
         }
 
-        try server_mod.serve(io, allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget, enable_pld, pld_draft_len, pld_key_len, drafter_ptr, draft_block_size);
+        try server_mod.serve(io, allocator, &xfm, &tok, &chat_config, &config, if (vision_enc) |*ve| ve else null, model_dir, host, port, ctx_size, timeout, reasoning_budget, enable_pld, pld_draft_len, pld_key_len, drafter_ptr, draft_block_size, drafter_dir orelse "");
     } else {
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";
         const messages = [_]chat_mod.Message{
