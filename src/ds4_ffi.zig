@@ -45,6 +45,33 @@ pub const TokenScore = extern struct {
     logprob: f32,
 };
 
+pub const DistributedRole = enum(c_int) {
+    none = 0,
+    coordinator = 1,
+    worker = 2,
+};
+
+pub const DistributedLayers = extern struct {
+    start: u32 = 0,
+    end: u32 = 0,
+    has_output: bool = false,
+    set: bool = false,
+};
+
+pub const DistributedOptions = extern struct {
+    role: DistributedRole = .none,
+    layers: DistributedLayers = .{},
+    listen_host: ?[*:0]const u8 = null,
+    listen_port: c_int = 0,
+    coordinator_host: ?[*:0]const u8 = null,
+    coordinator_port: c_int = 0,
+    prefill_chunk: u32 = 0,
+    prefill_window: u32 = 0,
+    activation_bits: u32 = 0,
+    replay_check: bool = false,
+    debug: bool = false,
+};
+
 pub const EngineOptions = extern struct {
     model_path: ?[*:0]const u8 = null,
     mtp_path: ?[*:0]const u8 = null,
@@ -55,8 +82,15 @@ pub const EngineOptions = extern struct {
     directional_steering_file: ?[*:0]const u8 = null,
     directional_steering_attn: f32 = 0,
     directional_steering_ffn: f32 = 0,
+    power_percent: c_int = 0,
     warm_weights: bool = false,
     quality: bool = false,
+    inspect_only: bool = false,
+    load_slice: bool = false,
+    load_layer_start: u32 = 0,
+    load_layer_end: u32 = 0,
+    load_output: bool = false,
+    distributed: DistributedOptions = .{},
 };
 
 pub const ContextMemory = extern struct {

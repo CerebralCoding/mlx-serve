@@ -1,6 +1,6 @@
 # TODO
 
-Ordered by **expected speed gain per unit of work**, highest first. Cross-arch parity audit (2026-05-16) put mlx-serve at or above mlx-lm on every remaining benchmarked architecture except Qwen 3.6 27B hybrid (-4.4% after `mlx_split`). DSV4 is now served by the embedded **ds4** engine (antirez/ds4 @ `613e9b2`) under `lib/ds4/` — the legacy Zig forward and its tuning items below are retired.
+Ordered by **expected speed gain per unit of work**, highest first. Cross-arch parity audit (2026-05-16) put mlx-serve at or above mlx-lm on every remaining benchmarked architecture except Qwen 3.6 27B hybrid (-4.4% after `mlx_split`). DSV4 is now served by the embedded **ds4** engine (antirez/ds4 @ `477c0e8`) under `lib/ds4/` — the legacy Zig forward and its tuning items below are retired.
 
 | Model                              | mlx-serve | mlx-lm | Δ      |
 |---|---|---|---|
@@ -64,4 +64,4 @@ Multi-slot batching shipped: Gemma 4 E4B `--max-concurrent 2` → **1.50× throu
 
 ## Recent landings (compact)
 
-- **DSV4 moves to embedded ds4 engine.** Legacy Zig DSV4 forward (~7K LOC) retired; `lib/ds4/` submodule pinned at `613e9b2` carries antirez's hand-tuned Metal kernels. Bridge at `src/arch/ds4.zig` extracts the 19 Metal kernel sources via `@embedFile` at first launch (no patches to upstream). MLX-format DSV4 returns `error.UnsupportedDsv4MlxFormat`; the GGUF artifact is the supported path. `--mtp` / `--mtp-block-size` CLI flags removed.
+- **DSV4 moves to embedded ds4 engine.** Legacy Zig DSV4 forward (~7K LOC) retired; `lib/ds4/` submodule pinned at `477c0e8` carries antirez's hand-tuned Metal kernels. Bridge at `src/arch/ds4.zig` extracts the 19 Metal kernel sources via `@embedFile` at first launch (no patches to upstream). MLX-format DSV4 returns `error.UnsupportedDsv4MlxFormat`; the GGUF artifact is the supported path. `--mtp` / `--mtp-block-size` CLI flags removed.

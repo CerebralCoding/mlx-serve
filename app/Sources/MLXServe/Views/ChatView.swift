@@ -1068,6 +1068,10 @@ struct ChatDetailView: View {
         var padRetries = 0
         let padRetryPolicy = RetryPolicy.aggressive
         let repetition = AgentEngine.RepetitionTracker()
+        // Bail out if the model spends several rounds where every tool call
+        // fails/blocks (e.g. an unresolvable tool name) instead of grinding to
+        // `maxIterations` achieving nothing.
+        var stuck = AgentEngine.StuckDetector()
         var truncationRetries = 0
         // One retry when the model exits with a malformed/ghost tool-call tag
         // in its content instead of a proper finish — re-prompt for a clean
@@ -1307,6 +1311,7 @@ struct ChatDetailView: View {
             // they've flipped "Always allow this session". Deny short-circuits
             // to a fabricated error result so the agent loop can react and
             // the user's intent is visible in the transcript.
+            var roundOutputs: [String] = []
             for tc in receivedToolCalls {
                 try Task.checkCancellation()
 
@@ -1317,6 +1322,8 @@ struct ChatDetailView: View {
                         name: tc.name,
                         output: "Error: user denied this tool call. Do not retry this command; ask the user how to proceed or try a different approach."
                     )
+                    // A user denial is a deliberate stop, not a stuck loop — don't
+                    // count it toward the no-progress tally.
                     var deniedMsg = ChatMessage(role: .assistant, content: "**\(tc.name)** → denied by user")
                     deniedMsg.isAgentSummary = true
                     appState.appendMessage(to: sessionId, message: deniedMsg)
@@ -1340,6 +1347,7 @@ struct ChatDetailView: View {
                         agentMemory: appState.agentMemory
                     )
                 }
+                roundOutputs.append(result.output)
 
                 // Show result in chat (display-only)
                 var resultMsg = ChatMessage(role: .assistant, content: "**\(result.name)** → \(String(result.output.prefix(500)))")
@@ -1371,6 +1379,15 @@ struct ChatDetailView: View {
                     toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
                 }
                 appState.appendMessage(to: sessionId, message: toolMsg)
+            }
+
+            // Stop if the model made no progress for several consecutive rounds
+            // (every tool call failed/blocked) rather than grinding to the cap.
+            stuck.record(outputs: roundOutputs)
+            if stuck.isStuck {
+                let msg = ChatMessage(role: .assistant, content: "Stopped: the last \(AgentEngine.StuckDetector.limit) tool-call rounds all failed without making progress (often an unrecognized tool name). Tell me how you'd like to proceed.")
+                appState.appendMessage(to: sessionId, message: msg)
+                return
             }
         }
 

@@ -26,6 +26,17 @@ const ModelConfig = model_mod.ModelConfig;
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
 
+/// `model_type` strings that identify a Gemma 4 assistant drafter
+/// checkpoint. `gemma4_assistant` is the original per-target flavor
+/// (E2B/E4B/26B-A4B/31B). `gemma4_unified_assistant` ships with the 12B
+/// drafter and is a unified architecture spanning dense + MoE targets.
+/// Mirrors the Swift-side `DownloadManager.drafterModelTypes` set — keep
+/// both in lockstep when adding a new drafter family.
+const supported_drafter_model_types = [_][]const u8{
+    "gemma4_assistant",
+    "gemma4_unified_assistant",
+};
+
 /// Default block_size used when neither `--draft-block-size` nor the per-target
 /// auto-detect table picks a value. 4 = 3 drafter forwards + 1 verify token,
 /// matches vLLM PR #41745's default for E4B/26B-A4B.
@@ -387,8 +398,14 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !D
     const root = parsed.value.object;
 
     const model_type = if (root.get("model_type")) |v| v.string else "";
-    if (!std.mem.eql(u8, model_type, "gemma4_assistant")) {
-        log.err("[drafter] unsupported drafter model_type='{s}' (expected 'gemma4_assistant')\n", .{model_type});
+    const is_supported_drafter = blk: {
+        for (supported_drafter_model_types) |t| {
+            if (std.mem.eql(u8, model_type, t)) break :blk true;
+        }
+        break :blk false;
+    };
+    if (!is_supported_drafter) {
+        log.err("[drafter] unsupported drafter model_type='{s}' (expected one of: gemma4_assistant, gemma4_unified_assistant)\n", .{model_type});
         return error.UnsupportedDrafterArch;
     }
 
@@ -1420,7 +1437,46 @@ test "DrafterConfig parses gemma-4-E4B drafter config.json shape" {
     try testing.expectEqual(@as(f32, 0.25), cfg.rope_full.partial_rotary_factor);
 }
 
-test "DrafterConfig rejects non-gemma4_assistant model_type" {
+test "DrafterConfig accepts gemma4_unified_assistant model_type" {
+    // Unified-architecture drafter (shipped with Gemma 4 12B) — same config
+    // shape as the per-target gemma4_assistant; only the model_type string
+    // differs. Backbone/vocab/layer-type compatibility is still enforced
+    // structurally at bind time.
+    const json =
+        \\{
+        \\  "model_type": "gemma4_unified_assistant",
+        \\  "backbone_hidden_size": 3840,
+        \\  "num_centroids": 2048,
+        \\  "centroid_intermediate_top_k": 32,
+        \\  "use_ordered_embeddings": true,
+        \\  "tie_word_embeddings": true,
+        \\  "text_config": {
+        \\    "hidden_size": 256,
+        \\    "intermediate_size": 2048,
+        \\    "num_hidden_layers": 4,
+        \\    "num_attention_heads": 4,
+        \\    "head_dim": 256,
+        \\    "global_head_dim": 512,
+        \\    "sliding_window": 512,
+        \\    "vocab_size": 262144,
+        \\    "rms_norm_eps": 1e-6,
+        \\    "layer_types": ["sliding_attention","sliding_attention","sliding_attention","full_attention"],
+        \\    "rope_parameters": {
+        \\      "sliding_attention": {"rope_theta": 10000.0},
+        \\      "full_attention": {"rope_theta": 1000000.0, "rope_type": "proportional", "partial_rotary_factor": 0.25}
+        \\    }
+        \\  }
+        \\}
+    ;
+    var cfg = try parseConfigFromJson(testing.allocator, json);
+    defer cfg.deinit(testing.allocator);
+    try testing.expectEqual(@as(u32, 3840), cfg.backbone_hidden_size);
+    try testing.expectEqual(@as(u32, 262144), cfg.vocab_size);
+}
+
+test "DrafterConfig rejects unknown drafter model_type" {
+    // Truly unsupported types still 400 at parse time. Kept as a tripwire
+    // for typos in the supported_drafter_model_types set.
     const json =
         \\{"model_type": "qwen3_5_moe", "backbone_hidden_size": 2560, "text_config": {}}
     ;

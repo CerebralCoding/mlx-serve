@@ -25,58 +25,94 @@ protocol ToolHandler: Sendable {
 // MARK: - Shell
 
 struct ShellHandler: ToolHandler {
+    /// Max wall-clock before the command is killed. Long enough for real
+    /// installs/builds (`npm install`), bounded so a hang can't stall the agent.
+    /// Injectable so tests can use a short bound.
+    var timeoutSeconds: Double = 120
+
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         guard let command = parameters["command"] else {
             throw ToolError.missingParameter("command")
         }
+        let timeout = timeoutSeconds
 
         return try await withCheckedThrowingContinuation { continuation in
             DispatchQueue.global(qos: .userInitiated).async {
+                let process = Process()
+                process.executableURL = URL(fileURLWithPath: "/bin/zsh")
+                process.arguments = ["-l", "-c", command]
+                if let wd = workingDirectory {
+                    process.currentDirectoryURL = URL(fileURLWithPath: wd)
+                }
+
+                let outPipe = Pipe()
+                let errPipe = Pipe()
+                process.standardOutput = outPipe
+                process.standardError = errPipe
+                // Close stdin: an interactive prompt (e.g. `npx sv create`) then
+                // hits EOF and fails fast instead of hanging the agent forever.
+                process.standardInput = FileHandle.nullDevice
+
+                // Read both pipes incrementally so a kill never blocks on
+                // `readDataToEndOfFile` waiting for orphaned grandchildren
+                // (e.g. node spawned by npx) to release the write end.
+                let lock = NSLock()
+                var outData = Data()
+                var errData = Data()
+                outPipe.fileHandleForReading.readabilityHandler = { h in
+                    let d = h.availableData
+                    if !d.isEmpty { lock.lock(); outData.append(d); lock.unlock() }
+                }
+                errPipe.fileHandleForReading.readabilityHandler = { h in
+                    let d = h.availableData
+                    if !d.isEmpty { lock.lock(); errData.append(d); lock.unlock() }
+                }
+
                 do {
-                    let process = Process()
-                    process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-                    process.arguments = ["-l", "-c", command]
-                    if let wd = workingDirectory {
-                        process.currentDirectoryURL = URL(fileURLWithPath: wd)
-                    }
-
-                    let stdout = Pipe()
-                    let stderr = Pipe()
-                    process.standardOutput = stdout
-                    process.standardError = stderr
-
                     try process.run()
-
-                    // 30s soft timeout (SIGTERM), 35s hard timeout (SIGKILL)
-                    let pid = process.processIdentifier
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 30) {
-                        if process.isRunning { process.terminate() }
-                    }
-                    DispatchQueue.global().asyncAfter(deadline: .now() + 35) {
-                        if process.isRunning { kill(pid, SIGKILL) }
-                    }
-
-                    process.waitUntilExit()
-
-                    let outData = stdout.fileHandleForReading.readDataToEndOfFile()
-                    let errData = stderr.fileHandleForReading.readDataToEndOfFile()
-                    var result = String(data: outData, encoding: .utf8) ?? ""
-                    let errStr = String(data: errData, encoding: .utf8) ?? ""
-
-                    if !errStr.isEmpty { result += "\n[stderr]: \(errStr)" }
-                    if process.terminationStatus != 0 {
-                        result += "\n[exit code: \(process.terminationStatus)]"
-                    } else if result.isEmpty {
-                        result = "OK"
-                    }
-                    // Prepend cwd so the model knows where the command ran
-                    let cwd = process.currentDirectoryURL?.path ?? FileManager.default.currentDirectoryPath
-                    result = "[cwd: \(cwd)]\n\(result)"
-
-                    continuation.resume(returning: result)
                 } catch {
                     continuation.resume(throwing: error)
+                    return
                 }
+
+                let pid = process.processIdentifier
+                var didTimeout = false
+                let timeoutWork = DispatchWorkItem {
+                    if process.isRunning {
+                        didTimeout = true
+                        process.terminate()
+                        kill(pid, SIGKILL)
+                    }
+                }
+                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
+
+                process.waitUntilExit()
+                timeoutWork.cancel()
+                outPipe.fileHandleForReading.readabilityHandler = nil
+                errPipe.fileHandleForReading.readabilityHandler = nil
+                // On a clean exit the pipe EOFs promptly, so drain any final
+                // chunk the handler hadn't delivered yet. Skip this on timeout —
+                // orphaned children may hold the write end open and block it.
+                if !didTimeout {
+                    if let d = try? outPipe.fileHandleForReading.readToEnd() { lock.lock(); outData.append(d); lock.unlock() }
+                    if let d = try? errPipe.fileHandleForReading.readToEnd() { lock.lock(); errData.append(d); lock.unlock() }
+                }
+
+                lock.lock(); let o = outData; let e = errData; lock.unlock()
+                var result = String(data: o, encoding: .utf8) ?? ""
+                let errStr = String(data: e, encoding: .utf8) ?? ""
+
+                if !errStr.isEmpty { result += "\n[stderr]: \(errStr)" }
+                if didTimeout {
+                    result += "\n[timed out after \(Int(timeout))s and was killed. If this command waits for input, re-run it with non-interactive flags — it cannot read stdin. If it is a long-running server (e.g. a dev server), don't start it from the agent.]"
+                } else if process.terminationStatus != 0 {
+                    result += "\n[exit code: \(process.terminationStatus)]"
+                } else if result.isEmpty {
+                    result = "OK"
+                }
+                // Prepend cwd so the model knows where the command ran
+                let cwd = process.currentDirectoryURL?.path ?? FileManager.default.currentDirectoryPath
+                continuation.resume(returning: "[cwd: \(cwd)]\n\(result)")
             }
         }
     }

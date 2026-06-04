@@ -306,12 +306,25 @@ struct LocalModel: Identifiable, Hashable {
 enum GemmaVariant: String, CaseIterable, Hashable {
     case E2B
     case E4B
+    case gemma12B = "12B"
     case gemma31B = "31B"
     case moe26B = "26B-A4B"
 
-    /// Repo basename (no author prefix) of the assistant drafter.
+    /// Full HF repo path of the assistant drafter. All variants use the
+    /// `mlx-community/...-it-assistant-bf16` uniform path. bf16 is the only
+    /// quant mlx-community publishes for the older variants (E2B/E4B/26B-A4B/
+    /// 31B as of 2026-06 — HF 401s on the 8bit suffix for those), so we keep
+    /// the new 12B unified drafter on the same suffix even though an 8bit
+    /// build exists. Adding a new variant? Verify with
+    /// `curl -sI https://huggingface.co/api/models/<repo>` first.
+    var drafterRepoId: String {
+        "mlx-community/gemma-4-\(rawValue)-it-assistant-bf16"
+    }
+
+    /// Last path component of the drafter repo — also the on-disk dir name
+    /// the discoverer matches against.
     var drafterDirName: String {
-        "gemma-4-\(rawValue)-it-assistant-bf16"
+        (drafterRepoId as NSString).lastPathComponent
     }
 
     /// Human-readable target label for the pairing banner ("for E4B").
@@ -352,6 +365,9 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // E4B: 8B params, 4.5B active — fits 16 GB+ Macs
     GemmaModelOption(id: "e4b-4bit", displayName: "Gemma 4 E4B (4-bit)", repoId: "mlx-community/gemma-4-e4b-it-4bit", sizeEstimate: "~5.2 GB"),
     GemmaModelOption(id: "e4b-8bit", displayName: "Gemma 4 E4B (8-bit)", repoId: "mlx-community/gemma-4-e4b-it-8bit", sizeEstimate: "~8.5 GB"),
+    // 12B: dense — fits 16 GB+ Macs (4-bit) or 24 GB+ (8-bit).
+    GemmaModelOption(id: "12b-4bit", displayName: "Gemma 4 12B (4-bit)", repoId: "mlx-community/gemma-4-12b-it-4bit", sizeEstimate: "~7.1 GB, needs 16 GB+ RAM"),
+    GemmaModelOption(id: "12b-8bit", displayName: "Gemma 4 12B (8-bit)", repoId: "mlx-community/gemma-4-12b-it-8bit", sizeEstimate: "~12.8 GB, needs 24 GB+ RAM"),
     // 26B-A4B: 25.2B MoE, only 3.8B active per token — fits 24 GB+ Macs (4-bit) or 36 GB+ (8-bit)
     GemmaModelOption(id: "26b-a4b-4bit", displayName: "Gemma 4 26B-A4B (4-bit)", repoId: "mlx-community/gemma-4-26b-a4b-it-4bit", sizeEstimate: "~15.6 GB, needs 24 GB+ RAM"),
     GemmaModelOption(id: "26b-a4b-8bit", displayName: "Gemma 4 26B-A4B (8-bit)", repoId: "mlx-community/gemma-4-26b-a4b-it-8bit", sizeEstimate: "~28 GB, needs 36 GB+ RAM"),
@@ -370,7 +386,12 @@ let gemmaModelOptions: [GemmaModelOption] = [
     ),
 ]
 
-let gemmaModelOptions8BitOnly = gemmaModelOptions.filter { $0.id.contains("8bit") || $0.id.contains("dsv4") }
+/// Subset of `gemmaModelOptions` surfaced in the menu-bar Download Models
+/// popover. 4-bit quants are the default tray choice — they fit the widest
+/// range of Macs (the 4-bit 31B is ~18 GB vs 33 GB at 8-bit) so most users
+/// can install something useful without bouncing into the full Model Browser.
+/// DSV4 has only the one GGUF, so it rides along unconditionally.
+let gemmaModelOptionsTrayMenu = gemmaModelOptions.filter { $0.id.contains("4bit") || $0.id.contains("dsv4") }
 
 /// Subset of `gemmaModelOptions` visible on the current host. Hides entries
 /// whose `minHostRamBytes` exceeds the system RAM.

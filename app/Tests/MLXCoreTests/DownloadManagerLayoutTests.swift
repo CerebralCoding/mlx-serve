@@ -62,10 +62,14 @@ final class DownloadManagerLayoutTests: XCTestCase {
 
     // MARK: - Drafter discovery
 
-    func testDiscoverDraftersFindsAllFourVariants() throws {
+    func testDiscoverDraftersFindsAllPublishedVariants() throws {
+        // Drafters live under different authors today (mlx-community for the
+        // older bf16 quants, google for the 12B official upload). The discoverer
+        // must surface every variant regardless of its author prefix.
         for variant in GemmaVariant.allCases {
-            let dir = ((tempRoot as NSString).appendingPathComponent("mlx-community") as NSString)
-                .appendingPathComponent(variant.drafterDirName)
+            let parts = variant.drafterRepoId.split(separator: "/")
+            let dir = ((tempRoot as NSString).appendingPathComponent(String(parts[0])) as NSString)
+                .appendingPathComponent(String(parts[1]))
             try makeDrafterDir(at: dir)
         }
         let found = DownloadManager.discoverDrafters(in: [tempRoot])
@@ -108,12 +112,43 @@ final class DownloadManagerLayoutTests: XCTestCase {
     func testGemmaVariantParsing() {
         XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-e4b-it-4bit", isMoE: false), .E4B)
         XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-e2b-it-8bit", isMoE: false), .E2B)
+        XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-12b-it-4bit", isMoE: false), .gemma12B)
         XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-31b-it-4bit", isMoE: false), .gemma31B)
         XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/gemma-4-26b-a4b-it-4bit", isMoE: true), .moe26B)
         // isMoE alone should also pick MoE so we route correctly even if the
         // path doesn't include the size designator.
         XCTAssertEqual(DownloadManager.gemmaVariantFor(modelPath: "/m/something-weird", isMoE: true), .moe26B)
         XCTAssertNil(DownloadManager.gemmaVariantFor(modelPath: "/m/qwen3-7b-4bit", isMoE: false))
+    }
+
+    // MARK: - Per-variant drafter repo paths
+
+    /// All Gemma 4 drafters use the uniform mlx-community bf16 path —
+    /// pinned because mlx-community only publishes 8bit for the new 12B
+    /// drafter, and an earlier wholesale switch to 8bit was reverted after
+    /// HF 401'd on the four older variants. Keep one suffix for consistency.
+    func testDrafterRepoIdMatchesPublishedConvention() {
+        XCTAssertEqual(GemmaVariant.E2B.drafterRepoId,      "mlx-community/gemma-4-E2B-it-assistant-bf16")
+        XCTAssertEqual(GemmaVariant.E4B.drafterRepoId,      "mlx-community/gemma-4-E4B-it-assistant-bf16")
+        XCTAssertEqual(GemmaVariant.gemma12B.drafterRepoId, "mlx-community/gemma-4-12B-it-assistant-bf16")
+        XCTAssertEqual(GemmaVariant.moe26B.drafterRepoId,   "mlx-community/gemma-4-26B-A4B-it-assistant-bf16")
+        XCTAssertEqual(GemmaVariant.gemma31B.drafterRepoId, "mlx-community/gemma-4-31B-it-assistant-bf16")
+    }
+
+    /// The 12B drafter declares `model_type: "gemma4_unified_assistant"` —
+    /// a newer "unified" architecture spanning dense + MoE targets, distinct
+    /// from the original `gemma4_assistant`. Both must classify as drafters
+    /// so the dir doesn't surface as a base model in the tray-menu picker
+    /// and doesn't trip the red "Unsupported architecture" label.
+    func testDiscoverDraftersAcceptsUnifiedAssistantModelType() throws {
+        let dir = ((tempRoot as NSString).appendingPathComponent("mlx-community") as NSString)
+            .appendingPathComponent(GemmaVariant.gemma12B.drafterDirName)
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let cfg = (dir as NSString).appendingPathComponent("config.json")
+        try "{\"model_type\":\"gemma4_unified_assistant\"}".write(toFile: cfg, atomically: true, encoding: .utf8)
+
+        let found = DownloadManager.discoverDrafters(in: [tempRoot])
+        XCTAssertEqual(found.first?.variant, .gemma12B)
     }
 
     // MARK: - GGUF classification & discovery
@@ -176,6 +211,52 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(DownloadManager.isSupportedGguf("mmproj-Qwen3.6-27B-VL-BF16.gguf"))
         // Non-.gguf: not a GGUF at all.
         XCTAssertFalse(DownloadManager.isSupportedGguf("config.json"))
+    }
+
+    // MARK: - Cancellation cleanup
+
+    /// User-cancel must leave `.partial` files gone (no Resume path) and final
+    /// files untouched. Pinned because the cancel button promises this exact
+    /// behavior; a regression would silently leave half-files on disk and the
+    /// "Resume" button would reappear on the next launch.
+    func testCleanupPartialsRemovesPartialsKeepsFinalFiles() throws {
+        let repoId = "acme/demo"
+        let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let finalCfg = (dir as NSString).appendingPathComponent("config.json")
+        let topPartial = (dir as NSString).appendingPathComponent("model.safetensors.partial")
+        let subdir = (dir as NSString).appendingPathComponent("nested")
+        try FileManager.default.createDirectory(atPath: subdir, withIntermediateDirectories: true)
+        let nestedPartial = (subdir as NSString).appendingPathComponent("shard-1.safetensors.partial")
+        try "{}".write(toFile: finalCfg, atomically: true, encoding: .utf8)
+        FileManager.default.createFile(atPath: topPartial, contents: Data())
+        FileManager.default.createFile(atPath: nestedPartial, contents: Data())
+
+        DownloadManager.cleanupPartials(rootDir: tempRoot, repoId: repoId)
+
+        let fm = FileManager.default
+        XCTAssertTrue(fm.fileExists(atPath: finalCfg), "completed files must stay on disk")
+        XCTAssertFalse(fm.fileExists(atPath: topPartial), "top-level .partial must be removed")
+        XCTAssertFalse(fm.fileExists(atPath: nestedPartial), "nested .partial must be removed")
+        XCTAssertTrue(fm.fileExists(atPath: dir), "dest dir must remain when other files survive")
+    }
+
+    func testCleanupPartialsRemovesEmptyDestDir() throws {
+        let repoId = "acme/empty"
+        let dir = DownloadManager.newLayoutDir(rootDir: tempRoot, repoId: repoId)
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        let onlyPartial = (dir as NSString).appendingPathComponent("only.partial")
+        FileManager.default.createFile(atPath: onlyPartial, contents: Data())
+
+        DownloadManager.cleanupPartials(rootDir: tempRoot, repoId: repoId)
+
+        XCTAssertFalse(FileManager.default.fileExists(atPath: dir),
+                       "dest dir should be removed when it's empty after partials are deleted")
+    }
+
+    func testCleanupPartialsNoOpWhenDirMissing() {
+        // Cancelling a fresh download that bailed before mkdir must not crash.
+        DownloadManager.cleanupPartials(rootDir: tempRoot, repoId: "ghost/never-created")
     }
 
     // MARK: - Helpers

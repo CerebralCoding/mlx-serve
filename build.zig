@@ -182,6 +182,10 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
         "-Wno-deprecated-declarations",
     };
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4.c"), .flags = c_flags });
+    // ds4.c #includes ds4_distributed.h; the engine/session path links its impl.
+    // ds4_gpu.h is implemented in ds4_metal.m; ds4_kvstore/web/help/agent.c are
+    // CLI/server-only and not part of the library path mlx-serve embeds.
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_distributed.c"), .flags = c_flags });
 
     const objc_flags = &[_][]const u8{
         "-O3",

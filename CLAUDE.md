@@ -353,7 +353,7 @@ mlx-c 0.6.0 added a `global_scale` param (may be null) to `mlx_dequantize` betwe
 
 ### Embedded engines (`lib/<engine>/`)
 
-DSV4-Flash is served by the embedded **ds4** engine (antirez/ds4), pinned at `lib/ds4/@613e9b2`. The Zig MLX path no longer carries a DSV4 forward — `model_type=deepseek_v4` on a `.safetensors` checkpoint returns `error.UnsupportedDsv4MlxFormat`; users load the GGUF artifact through ds4 instead.
+DSV4-Flash is served by the embedded **ds4** engine (antirez/ds4, since renamed "DwarfStar" upstream), pinned at `lib/ds4/@477c0e8`. `build.zig` compiles `ds4.c` + `ds4_distributed.c` + `ds4_metal.m` (the library path; `ds4_kvstore/web/help/agent.c` are CLI/server-only and not embedded). The Zig MLX path no longer carries a DSV4 forward — `model_type=deepseek_v4` on a `.safetensors` checkpoint returns `error.UnsupportedDsv4MlxFormat`; users load the GGUF artifact through ds4 instead.
 
 - C library API: `lib/ds4/ds4.h` (~200 lines, engine + session model).
 - FFI: `src/ds4_ffi.zig` (mechanical mirror of the header).
@@ -363,7 +363,7 @@ DSV4-Flash is served by the embedded **ds4** engine (antirez/ds4), pinned at `li
 
 Generic GGUF models (everything except DSV4-Flash) are served by the embedded **llama.cpp** engine via `libllama`.
 
-- Staging: `scripts/fetch-llama.sh` downloads the pinned llama.cpp XCFramework (`LLAMA_TAG`, currently `b9318`), thins the macOS slice to a single self-contained arm64 `lib/llama/lib/libllama.dylib` (llama + ggml + ggml-metal merged, Metal shaders embedded), rewrites its install-name to `@rpath/libllama.dylib`, and copies headers to `lib/llama/include`. **Not vendored** — `lib/llama/` is git-ignored and re-fetched by CI / `app/build.sh`. Bump `LLAMA_TAG` to upgrade.
+- Staging: `scripts/fetch-llama.sh` downloads the pinned llama.cpp XCFramework (`LLAMA_TAG`, currently `b9496`), thins the macOS slice to a single self-contained arm64 `lib/llama/lib/libllama.dylib` (llama + ggml + ggml-metal merged, Metal shaders embedded), rewrites its install-name to `@rpath/libllama.dylib`, and copies headers to `lib/llama/include`. **Not vendored** — `lib/llama/` is git-ignored and re-fetched by CI / `app/build.sh`. Bump `LLAMA_TAG` to upgrade.
 - C shim: `lib/llama_shim/llama_shim.{h,c}` — a small, stable C API over the ABI-fragile `llama.h` structs (compiled by clang against the real header, so the ABI is always correct). Mirrors the ds4.h discipline.
 - FFI: `src/llama_ffi.zig` (mechanical mirror of the shim header).
 - Bridge: `src/arch/llama.zig` (`LlamaEngine` + `LlamaSession` — model load, tokenize/detokenize, chat-template string, prefill `sync`, `eval`, `argmax`/`sample`). Tests gate on `LLAMA_TEST_MODEL`.

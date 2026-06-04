@@ -700,7 +700,7 @@ private struct DrafterPairChip: View {
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
 
-    private var repoId: String { "mlx-community/\(variant.drafterDirName)" }
+    private var repoId: String { variant.drafterRepoId }
     private var isReady: Bool { downloads.isReady(repoId) }
     private var inFlight: Bool { downloads.downloads[repoId]?.status == .downloading }
 
@@ -761,7 +761,7 @@ private struct DraftersSection: View {
         GemmaVariant.allCases.map { v in
             DrafterCatalogRow(
                 variant: v,
-                repoId: "mlx-community/\(v.drafterDirName)",
+                repoId: v.drafterRepoId,
                 pairsWith: "for \(v.label)",
                 sizeEstimate: Self.sizeEstimate(for: v)
             )
@@ -769,9 +769,11 @@ private struct DraftersSection: View {
     }
 
     private static func sizeEstimate(for v: GemmaVariant) -> String {
+        // bf16 sizes (the uniform suffix used by drafterRepoId).
         switch v {
         case .E2B:        return "~80 MB"
         case .E4B:        return "~120 MB"
+        case .gemma12B:   return "~850 MB"
         case .gemma31B:   return "~150 MB"
         case .moe26B:     return "~120 MB"
         }

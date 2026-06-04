@@ -6,7 +6,7 @@ struct ModelDownloadView: View {
 
     var body: some View {
         VStack(alignment: .leading, spacing: 6) {
-            ForEach(gemmaModelOptions8BitOnly) { option in
+            ForEach(gemmaModelOptionsTrayMenu) { option in
                 ModelDownloadRow(option: option)
             }
         }
@@ -43,13 +43,23 @@ struct ModelDownloadRow: View {
                         .foregroundStyle(.green)
                         .font(.caption)
                 } else if let state, state.status == .downloading {
-                    // File progress bar
-                    VStack(alignment: .trailing, spacing: 1) {
-                        ProgressView(value: state.fileProgress)
-                            .frame(width: 60)
-                        Text("\(state.percentFormatted) \(state.speedFormatted)")
-                            .font(.system(size: 8).monospacedDigit())
-                            .foregroundStyle(.secondary)
+                    HStack(spacing: 6) {
+                        VStack(alignment: .trailing, spacing: 1) {
+                            ProgressView(value: state.fileProgress)
+                                .frame(width: 60)
+                            Text("\(state.percentFormatted) \(state.speedFormatted)")
+                                .font(.system(size: 8).monospacedDigit())
+                                .foregroundStyle(.secondary)
+                        }
+                        Button {
+                            downloads.cancel(option.repoId)
+                        } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                                .font(.caption)
+                        }
+                        .buttonStyle(.plain)
+                        .help("Cancel download")
                     }
                 } else if let state, state.status == .completed {
                     Image(systemName: "checkmark.circle.fill")
@@ -90,14 +100,14 @@ struct ModelDownloadRow: View {
 
     /// Kick off a download, picking the GGUF single-file path for ds4-backed
     /// entries and the standard safetensors-tree path for everything else.
+    /// The tracked-task wrappers handle cancellation; `refreshModels` runs
+    /// after completion, failure, or cancel so the picker stays in sync.
     private func startDownload() {
-        Task {
-            if let gguf = option.ggufFilename {
-                await downloads.downloadGguf(repoId: option.repoId, ggufFilename: gguf)
-            } else {
-                await downloads.download(repoId: option.repoId)
-            }
-            appState.refreshModels()
+        let refresh: @MainActor () -> Void = { appState.refreshModels() }
+        if let gguf = option.ggufFilename {
+            downloads.startGguf(repoId: option.repoId, ggufFilename: gguf, onFinish: refresh)
+        } else {
+            downloads.start(repoId: option.repoId, onFinish: refresh)
         }
     }
 }

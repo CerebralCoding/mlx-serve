@@ -2,7 +2,7 @@
 # Fetch llama.cpp's prebuilt libllama (the inference library, NOT llama-server)
 # and stage it for linking into the mlx-serve Zig binary.
 #
-# The b9318 XCFramework ships libllama as a single self-contained dylib
+# The XCFramework ships libllama as a single self-contained dylib
 # (llama + ggml + ggml-metal merged, Metal shaders embedded) that depends only
 # on system frameworks. We thin it to arm64 (the app is Apple-Silicon only),
 # rewrite its install-name to @rpath/libllama.dylib, and drop the headers next
@@ -13,7 +13,7 @@
 # Bump LLAMA_TAG to upgrade; CI and local builds re-fetch automatically.
 set -euo pipefail
 
-LLAMA_TAG="${LLAMA_TAG:-b9318}"
+LLAMA_TAG="${LLAMA_TAG:-b9496}"
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"

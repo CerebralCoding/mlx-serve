@@ -509,7 +509,18 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.addEosToken(1);
             config.addEosToken(106);
         }
-    } else if (std.mem.eql(u8, model_type, "gemma4") or std.mem.eql(u8, model_type, "gemma4_text")) {
+    } else if (std.mem.eql(u8, model_type, "gemma4") or
+        std.mem.eql(u8, model_type, "gemma4_text") or
+        std.mem.eql(u8, model_type, "gemma4_unified") or
+        std.mem.eql(u8, model_type, "gemma4_unified_text"))
+    {
+        // Per the Gemma 4 12B developer guide, `gemma4_unified` "contains the
+        // same advanced decoder structure as the Gemma 4 31B Dense model" —
+        // the unified-ness lives in a tiny vision/audio embedder we don't
+        // wire here. So we collapse the internal tag onto plain "gemma4" so
+        // every downstream model_type comparison in transformer.zig/drafter.zig
+        // (attn_scale gate, recommendedBlockSize, etc.) treats it identically
+        // to 31B Dense without per-arch fan-out.
         config.model_type = "gemma4";
         config.weight_prefix = "language_model.model";
         config.hidden_act = .gelu_approx;
@@ -522,6 +533,13 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (config.num_eos_tokens == 0) {
             config.addEosToken(1); // eos_token_id
         }
+        // Note on `attention_k_eq_v` for the 12B unified checkpoint: the
+        // weights ship separate v_proj for SLIDING layers and omit them for
+        // FULL_ATTENTION layers — i.e. K==V alias is a per-layer choice
+        // keyed on global-layer-ness. The existing bindModelWeights logic
+        // (transformer.zig:5677) already encodes that:
+        //   `k_eq_v = config.attention_k_eq_v and isGlobalLayer(li)`.
+        // So we leave the parsed flag intact.
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
@@ -857,9 +875,16 @@ fn loadSafetensorsFile(
 pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
         std.mem.startsWith(u8, key, "embed_vision.") or
+        std.mem.startsWith(u8, key, "vision_embedder.") or
         std.mem.startsWith(u8, key, "multi_modal_projector.") or
         std.mem.startsWith(u8, key, "language_model.multi_modal_projector.");
+    // Gemma 4 12B `gemma4_unified` ships a unified embedder
+    // (`vision_embedder.*`, `embed_audio.*`) in place of the SigLIP vision
+    // tower and conformer audio tower of earlier Gemma 4 variants. The
+    // existing forward path doesn't wire them; treat them as vision/audio
+    // sidecar weights so they're dropped under the same flag.
     const is_audio = std.mem.startsWith(u8, key, "audio_tower.") or
+        std.mem.startsWith(u8, key, "embed_audio.") or
         std.mem.startsWith(u8, key, "language_model.audio_multi_modal_projector.");
     if (is_audio) return false;
     if (is_vision and !load_vision) return false;
@@ -1105,4 +1130,75 @@ test "shouldKeepWeightKey filters audio and gated vision weights" {
     try testing.expect(!shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", false));
     try testing.expect(shouldKeepWeightKey("vision_tower.encoder.layer.0.weight", true));
     try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.self_attn.q_proj.weight", false));
+}
+
+test "shouldKeepWeightKey filters Gemma 4 12B unified embedder weights" {
+    // gemma4_unified replaces the SigLIP vision tower and conformer audio
+    // tower with a single matmul (vision_embedder.*) and a linear projection
+    // (embed_audio.*). The text forward path doesn't wire these; treat them
+    // as vision/audio sidecars under the same filter.
+    try testing.expect(!shouldKeepWeightKey("embed_audio.weight", true));
+    try testing.expect(!shouldKeepWeightKey("vision_embedder.proj.weight", false));
+    try testing.expect(shouldKeepWeightKey("vision_embedder.proj.weight", true));
+}
+
+test "ModelConfig parses gemma4_unified text_config" {
+    // Gemma 4 12B base ships `model_type: gemma4_unified` with text_config
+    // carrying the language tower. The dispatch arm must:
+    //   - tag as gemma4_unified
+    //   - inherit the gemma4 weight prefix + norm/scale flags
+    //   - pass attention_k_eq_v through unchanged so the per-layer binder
+    //     (transformer.zig:5677) aliases V to K on global layers but uses
+    //     the shipped v_proj on sliding layers
+    //   - pass through gemma4 fields like global_head_dim, final_logit_softcapping.
+    const json =
+        \\{
+        \\  "model_type": "gemma4_unified",
+        \\  "text_config": {
+        \\    "model_type": "gemma4_unified_text",
+        \\    "hidden_size": 3840,
+        \\    "intermediate_size": 15360,
+        \\    "num_hidden_layers": 48,
+        \\    "num_attention_heads": 16,
+        \\    "num_key_value_heads": 8,
+        \\    "head_dim": 256,
+        \\    "global_head_dim": 512,
+        \\    "num_global_key_value_heads": 8,
+        \\    "num_kv_shared_layers": 0,
+        \\    "hidden_size_per_layer_input": 0,
+        \\    "layer_types": ["sliding_attention", "sliding_attention", "full_attention", "sliding_attention"],
+        \\    "rope_parameters": {
+        \\      "full_attention": {"rope_theta": 1000000.0, "rope_type": "proportional", "factor": 1.0},
+        \\      "sliding_attention": {"rope_theta": 10000.0}
+        \\    },
+        \\    "attention_k_eq_v": true,
+        \\    "final_logit_softcapping": 30.0,
+        \\    "hidden_activation": "gelu_pytorch_tanh",
+        \\    "rms_norm_eps": 1e-06,
+        \\    "max_position_embeddings": 8192,
+        \\    "sliding_window": 1024
+        \\  },
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    // Collapsed onto "gemma4" so downstream code paths (attn_scale gate,
+    // recommendedBlockSize) match the 31B Dense decoder it inherits.
+    try testing.expectEqualStrings("gemma4", config.model_type);
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    try testing.expect(config.has_v_norm);
+    try testing.expect(config.has_pre_ff_norm);
+    try testing.expect(config.has_qk_norm);
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(config.scale_embeddings);
+    // 12B's k_proj/v_proj layout is mixed: full_attention layers omit v_proj
+    // (K=V alias), sliding layers ship it. The existing per-layer binder
+    // (transformer.zig:5677) keys the alias on isGlobalLayer; we must keep
+    // the config flag intact so that AND-clause fires on global layers only.
+    try testing.expect(config.attention_k_eq_v);
+    try testing.expectEqual(@as(u32, 512), config.global_head_dim);
+    try testing.expectEqual(@as(u32, 0), config.hidden_size_per_layer_input);
+    try testing.expectApproxEqAbs(@as(f32, 30.0), config.final_logit_softcapping, 0.001);
+    try testing.expectEqual(@as(u32, 3840), config.hidden_size);
+    try testing.expectEqual(@as(u32, 48), config.num_hidden_layers);
 }

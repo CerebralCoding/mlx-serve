@@ -401,6 +401,60 @@ enum AgentEngine {
         var output: String
     }
 
+    /// Resolve a model-emitted tool name to a known tool, tolerating the common
+    /// quirks that otherwise dead-loop the agent on "Unknown tool": surrounding
+    /// whitespace, a trailing ':' (Gemma 4 12B leaks one via its `call:NAME:`
+    /// format), a `functions.`/`tool.` namespace prefix, and case differences.
+    /// Returns the canonical `AgentToolKind.rawValue` when a known tool matches,
+    /// otherwise the cleaned name (so genuinely-unknown tools still surface).
+    static func canonicalToolName(_ raw: String) -> String {
+        var name = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+        for prefix in ["functions.", "function.", "tools.", "tool."] {
+            if name.lowercased().hasPrefix(prefix) {
+                name = String(name.dropFirst(prefix.count)).trimmingCharacters(in: .whitespacesAndNewlines)
+                break
+            }
+        }
+        while name.hasSuffix(":") {
+            name = String(name.dropLast()).trimmingCharacters(in: .whitespacesAndNewlines)
+        }
+        if AgentToolKind(rawValue: name) != nil { return name }
+        if let match = AgentToolKind.allCases.first(where: {
+            $0.rawValue.caseInsensitiveCompare(name) == .orderedSame
+        }) {
+            return match.rawValue
+        }
+        return name
+    }
+
+    /// Detects when the agent loop is making no progress — consecutive rounds in
+    /// which every tool call failed or was blocked — so the loop can stop with a
+    /// summary instead of grinding to the iteration cap on an unrecoverable name.
+    struct StuckDetector {
+        /// Consecutive no-progress rounds that trip the bail-out.
+        static let limit = 5
+        private(set) var consecutiveNoProgress = 0
+
+        /// Record a round's tool outputs. A round counts as "no progress" when it
+        /// ran at least one tool and *every* output was a failure or block.
+        mutating func record(outputs: [String]) {
+            guard !outputs.isEmpty else { return } // no tools ran → not a signal
+            let allFailed = outputs.allSatisfy { StuckDetector.isFailure($0) }
+            consecutiveNoProgress = allFailed ? consecutiveNoProgress + 1 : 0
+        }
+
+        var isStuck: Bool { consecutiveNoProgress >= StuckDetector.limit }
+
+        /// An output that represents an unrecoverable or blocked tool call. Uses
+        /// `contains` (not `hasPrefix`) because `applyWarning` prepends a
+        /// "WARNING:" banner ahead of the underlying error.
+        static func isFailure(_ output: String) -> Bool {
+            output.contains("Error: Unknown tool")
+                || output.contains("BLOCKED:")
+                || output.hasPrefix("Error:")
+        }
+    }
+
     /// Shared tool handler instances. Handlers are stateless — safe to reuse.
     private static var toolHandlers: [AgentToolKind: any ToolHandler] {
         [
@@ -432,7 +486,11 @@ enum AgentEngine {
         iteration: Int,
         agentMemory: AgentMemory
     ) async -> ToolResult {
-        let tool = AgentToolKind(rawValue: tc.name)
+        // Normalize the model-emitted name (strip a leaked trailing ':' etc.)
+        // before resolving the tool. Repetition tracking below stays on the raw
+        // `tc.name` to match the caller's `RepetitionTracker.track(toolCalls:)`.
+        let name = canonicalToolName(tc.name)
+        let tool = AgentToolKind(rawValue: name)
 
         // Smart fallback: editFile with content but no find → writeFile
         let effectiveTool: AgentToolKind?
@@ -470,12 +528,12 @@ enum AgentEngine {
             output = toolBlockMessage(for: tc.name)
         } else {
             // Validate required parameters
-            let missing = missingRequiredParams(for: tc.name, arguments: tc.arguments)
+            let missing = missingRequiredParams(for: name, arguments: tc.arguments)
             if !missing.isEmpty {
-                if (tc.name == "writeFile" || tc.name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
-                    output = "Error: \(tc.name) content was truncated — your output was too long and got cut off before the content was complete. The file was NOT written. To fix this, use shell with a heredoc instead: {\"command\": \"cat << 'FILEEOF' > \(tc.arguments["path"] ?? "path")\\nfile content here\\nFILEEOF\"}"
+                if (name == "writeFile" || name == "editFile") && missing.contains("content") && tc.arguments["path"] != nil {
+                    output = "Error: \(name) content was truncated — your output was too long and got cut off before the content was complete. The file was NOT written. To fix this, use shell with a heredoc instead: {\"command\": \"cat << 'FILEEOF' > \(tc.arguments["path"] ?? "path")\\nfile content here\\nFILEEOF\"}"
                 } else {
-                    output = "Error: \(tc.name) missing required params: \(missing.joined(separator: ", ")). Example: \(toolExample(for: tc.name))"
+                    output = "Error: \(name) missing required params: \(missing.joined(separator: ", ")). Example: \(toolExample(for: name))"
                 }
             } else if let effectiveTool, let handler = toolHandlers[effectiveTool] {
                 do {
@@ -485,17 +543,17 @@ enum AgentEngine {
                     }
                 } catch {
                     let argsDesc = tc.arguments.isEmpty ? "none" : tc.arguments.map { "\($0.key)=\($0.value.prefix(30))" }.joined(separator: ", ")
-                    output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(toolExample(for: tc.name))"
+                    output = "Error: \(error.localizedDescription). You sent args: [\(argsDesc)]. Example: \(toolExample(for: name))"
                 }
             } else {
-                output = "Error: Unknown tool '\(tc.name)'"
+                output = "Error: Unknown tool '\(name)'"
             }
         }
 
-        // Apply warning if near repetition threshold
+        // Apply warning if near repetition threshold (raw name — see above).
         output = repetition.applyWarning(name: tc.name, arguments: tc.arguments, output: output)
 
-        return ToolResult(id: tc.id, name: tc.name, output: output)
+        return ToolResult(id: tc.id, name: name, output: output)
     }
 
     // MARK: - Tool Result Overflow

@@ -5,6 +5,10 @@ import AppKit
 class DownloadManager: ObservableObject {
     @Published var downloads: [String: DownloadState] = [:]
 
+    /// In-flight `download`/`downloadGguf` tasks keyed by repoId, so the
+    /// Cancel button can interrupt them. Removed in the wrapper's `defer`.
+    private var activeTasks: [String: Task<Void, Never>] = [:]
+
     struct DownloadState {
         var progress: Double = 0
         var status: Status = .idle
@@ -389,6 +393,9 @@ class DownloadManager: ObservableObject {
             downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete",
                                                fileIndex: neededFiles.count, fileCount: neededFiles.count)
         } catch {
+            // User-cancelled? Skip the .failed row + alert — `start()`'s
+            // wrapper will drop the entry and remove partials.
+            if Task.isCancelled { return }
             let message = error.localizedDescription
             downloads[repoId] = DownloadState(status: .failed, error: message)
             if !(error is CancellationError) {
@@ -409,6 +416,73 @@ class DownloadManager: ObservableObject {
             .compactMap { $0["path"] as? String }
             .filter { $0.lowercased().hasSuffix(".gguf") && !$0.contains("/") }
             .sorted()
+    }
+
+    /// Kick off `download(repoId:)` as a tracked, cancellable task. `onFinish`
+    /// runs after the inner work returns (whether completion, failure, or
+    /// cancellation) so the caller can refresh model lists exactly once.
+    func start(repoId: String, onFinish: @escaping @MainActor () -> Void) {
+        activeTasks[repoId]?.cancel()
+        let task = Task { @MainActor [weak self] in
+            await self?.download(repoId: repoId)
+            self?.finalizeIfCancelled(repoId: repoId)
+            self?.activeTasks.removeValue(forKey: repoId)
+            onFinish()
+        }
+        activeTasks[repoId] = task
+    }
+
+    /// GGUF analogue of `start(repoId:onFinish:)`.
+    func startGguf(repoId: String, ggufFilename: String, onFinish: @escaping @MainActor () -> Void) {
+        activeTasks[repoId]?.cancel()
+        let task = Task { @MainActor [weak self] in
+            await self?.downloadGguf(repoId: repoId, ggufFilename: ggufFilename)
+            self?.finalizeIfCancelled(repoId: repoId)
+            self?.activeTasks.removeValue(forKey: repoId)
+            onFinish()
+        }
+        activeTasks[repoId] = task
+    }
+
+    /// Cancel an in-flight download. The state row disappears from the UI and
+    /// any `.partial` files are removed so no Resume path remains. No-op if
+    /// nothing is in flight for `repoId`.
+    func cancel(_ repoId: String) {
+        activeTasks[repoId]?.cancel()
+        // Defensive: if there's no live task (already finished, or cancel
+        // fired before start), still clear the row and partials so the UI
+        // returns to a clean "Download" state.
+        if activeTasks[repoId] == nil {
+            downloads.removeValue(forKey: repoId)
+            Self.cleanupPartials(rootDir: modelsDir, repoId: repoId)
+        }
+    }
+
+    /// Post-await cleanup for the start() wrappers. When the task was
+    /// cancelled mid-flight, drop the (possibly `.failed`) row and wipe
+    /// `.partial` files. On normal completion this is a no-op.
+    private func finalizeIfCancelled(repoId: String) {
+        guard Task.isCancelled else { return }
+        downloads.removeValue(forKey: repoId)
+        Self.cleanupPartials(rootDir: modelsDir, repoId: repoId)
+    }
+
+    /// Recursively remove every `.partial` file under the model's dest dir.
+    /// If the dir is empty afterward, remove it too — so the next click
+    /// starts from a truly clean slate (no orphan empty `<author>/<name>/`).
+    /// Nonisolated + static so tests can hit it without a `DownloadManager`
+    /// instance (which is tied to the real `~/.mlx-serve/models`).
+    nonisolated static func cleanupPartials(rootDir: String, repoId: String) {
+        let dir = newLayoutDir(rootDir: rootDir, repoId: repoId)
+        let fm = FileManager.default
+        guard let enumerator = fm.enumerator(atPath: dir) else { return }
+        while let rel = enumerator.nextObject() as? String {
+            guard rel.hasSuffix(".partial") else { continue }
+            try? fm.removeItem(atPath: (dir as NSString).appendingPathComponent(rel))
+        }
+        if let entries = try? fm.contentsOfDirectory(atPath: dir), entries.isEmpty {
+            try? fm.removeItem(atPath: dir)
+        }
     }
 
     /// Download a single GGUF artifact from a HuggingFace repo. Used by the
@@ -517,6 +591,7 @@ class DownloadManager: ObservableObject {
 
             downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete", fileIndex: 1, fileCount: 1)
         } catch {
+            if Task.isCancelled { return }
             let message = error.localizedDescription
             downloads[repoId] = DownloadState(status: .failed, error: message)
             if !(error is CancellationError) {
@@ -636,11 +711,13 @@ class DownloadManager: ObservableObject {
         }
 
         let size = directorySize(resolved)
-        // `gemma4_assistant` config dirs aren't loadable as a target — they
-        // pair with a base Gemma 4 model via the `--drafter` flag. Tagging
-        // them lets the Model Browser group them separately and the model
-        // picker filter them out.
-        let kind: ModelKind = (modelType == "gemma4_assistant") ? .drafter : .base
+        // Drafter config dirs aren't loadable as a target — they pair with a
+        // base Gemma 4 model via the `--drafter` flag. Tagging them lets the
+        // Model Browser group them separately and the model picker filter
+        // them out. `gemma4_unified_assistant` is the newer "unified"
+        // architecture (spans dense + MoE targets) shipped with the 12B
+        // drafter — same UI treatment as `gemma4_assistant`.
+        let kind: ModelKind = Self.drafterModelTypes.contains(modelType) ? .drafter : .base
         return LocalModel(
             id: "\(source.rawValue):\(idKey)",
             name: displayName,
@@ -726,28 +803,40 @@ class DownloadManager: ObservableObject {
         return out.sorted { $0.name.localizedCaseInsensitiveCompare($1.name) == .orderedAscending }
     }
 
-    /// Walk the given scan roots for `gemma-4-*-it-assistant-bf16` directories
-    /// that declare `model_type: "gemma4_assistant"`. Result is one entry per
-    /// distinct (variant) — first hit wins so the earlier root in the list
-    /// takes priority. `nonisolated` so tests can call it with a temp dir.
+    /// `model_type` values that identify a Gemma 4 assistant drafter
+    /// checkpoint. `gemma4_assistant` is the original (per-target) flavor;
+    /// `gemma4_unified_assistant` ships with the 12B drafter and is a
+    /// "unified" architecture spanning dense + MoE targets. Both are
+    /// drafters as far as the UI is concerned — server-side support for the
+    /// unified variant is a separate Zig change.
+    nonisolated static let drafterModelTypes: Set<String> = [
+        "gemma4_assistant",
+        "gemma4_unified_assistant",
+    ]
+
+    /// Walk the given scan roots for published Gemma 4 assistant drafter
+    /// directories that declare a drafter `model_type`. Drafters
+    /// live under different authors (mlx-community for the `-bf16` quants,
+    /// google for the official 12B upload), so we iterate variants and
+    /// resolve each repo's `<root>/<author>/<dirname>/` path directly rather
+    /// than listing a single author dir. One entry per variant — first root
+    /// wins. `nonisolated` so tests can call it with a temp dir.
     nonisolated static func discoverDrafters(in roots: [String]) -> [LocalDrafter] {
-        // Drafter is published only under mlx-community on HF. Each scan
-        // root places it at `<root>/mlx-community/<dirName>/`.
         var seenVariants = Set<GemmaVariant>()
         var out: [LocalDrafter] = []
         let fm = FileManager.default
 
         for root in roots {
-            let mlxCommunity = (root as NSString).appendingPathComponent("mlx-community")
-            guard let entries = try? fm.contentsOfDirectory(atPath: mlxCommunity) else { continue }
-            for entry in entries where !entry.hasPrefix(".") {
-                guard let variant = GemmaVariant.allCases.first(where: { $0.drafterDirName == entry }) else { continue }
-                if seenVariants.contains(variant) { continue }
-                let dirPath = (mlxCommunity as NSString).appendingPathComponent(entry)
+            for variant in GemmaVariant.allCases where !seenVariants.contains(variant) {
+                let parts = variant.drafterRepoId.split(separator: "/")
+                guard parts.count == 2 else { continue }
+                let dirPath = ((root as NSString).appendingPathComponent(String(parts[0])) as NSString)
+                    .appendingPathComponent(String(parts[1]))
                 let configPath = (dirPath as NSString).appendingPathComponent("config.json")
                 guard let cfgData = fm.contents(atPath: configPath),
                       let cfg = try? JSONSerialization.jsonObject(with: cfgData) as? [String: Any],
-                      cfg["model_type"] as? String == "gemma4_assistant" else { continue }
+                      let mt = cfg["model_type"] as? String,
+                      drafterModelTypes.contains(mt) else { continue }
                 out.append(LocalDrafter(url: URL(fileURLWithPath: dirPath), variant: variant))
                 seenVariants.insert(variant)
             }
@@ -792,6 +881,7 @@ class DownloadManager: ObservableObject {
         if isMoE || basename.contains("26b-a4b") { return .moe26B }
         if basename.contains("e4b") { return .E4B }
         if basename.contains("e2b") { return .E2B }
+        if basename.contains("12b") { return .gemma12B }
         if basename.contains("31b") { return .gemma31B }
         return nil
     }

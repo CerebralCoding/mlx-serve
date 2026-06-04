@@ -1547,6 +1547,18 @@ fn unwrapDoubleBraces(s: []const u8) []const u8 {
     return s;
 }
 
+/// Strip artifacts models sometimes append to a tool name — surrounding
+/// whitespace and a trailing ':' (Gemma 4 12B leaks one via its `call:NAME:`
+/// format). A valid OpenAI tool name matches `^[A-Za-z0-9_-]{1,64}$`, so a
+/// trailing colon is never legitimate and is always safe to drop.
+fn sanitizeToolName(raw: []const u8) []const u8 {
+    var name = std.mem.trim(u8, raw, " \t\n\r");
+    while (name.len > 0 and name[name.len - 1] == ':') {
+        name = std.mem.trim(u8, name[0 .. name.len - 1], " \t\n\r");
+    }
+    return name;
+}
+
 /// Parse Gemma 4 tool call format: "call:function_name{json_args}"
 fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?ParsedToolCall {
     const prefix = "call:";
@@ -1555,7 +1567,7 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?Parse
 
     // Find the opening brace
     const brace_pos = std.mem.indexOf(u8, after_prefix, "{") orelse return null;
-    const name = std.mem.trim(u8, after_prefix[0..brace_pos], " \t\n\r");
+    const name = sanitizeToolName(after_prefix[0..brace_pos]);
     if (name.len == 0) return null;
 
     var args_str = after_prefix[brace_pos..];
@@ -1588,34 +1600,75 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?Parse
 }
 
 /// Convert Gemma 4's custom key-value format to JSON.
-/// Input:  {key:<|"|>value<|"|>,key2:<|"|>value2<|"|>}
-/// Output: {"key":"value","key2":"value2"}
+/// Input:  {key:<|"|>value<|"|>,nested:{k:<|"|>v<|"|>},arr:[<|"|>a<|"|>]}
+/// Output: {"key":"value","nested":{"k":"v"},"arr":["a"]}
+///
+/// Gemma 4 emits its own object/array/string syntax (bare keys, `<|"|>…<|"|>`
+/// string delimiters) that can nest arbitrarily, so every value is converted
+/// recursively — see `convertGemma4Value`. Nested structures that already use
+/// valid JSON (regular `"…"` strings, numbers, bools, null) pass through
+/// unchanged. The args are always an object, with or without a literal `{…}`.
 fn convertGemma4ArgsToJson(allocator: std.mem.Allocator, input: []const u8) ?[]const u8 {
-    const str_delim = "<|\"|>";
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
+    _ = convertGemma4Object(allocator, &result, input, 0, 0) orelse return null;
+    return result.toOwnedSlice(allocator) catch return null;
+}
+
+const gemma4_str_delim = "<|\"|>";
+/// Recursion-depth guard against adversarial deeply-nested model output.
+const gemma4_max_depth = 64;
+
+fn gemma4SkipWs(body: []const u8, start: usize) usize {
+    var pos = start;
+    while (pos < body.len) : (pos += 1) {
+        switch (body[pos]) {
+            ' ', '\t', '\n', '\r' => {},
+            else => break,
+        }
+    }
+    return pos;
+}
+
+fn gemma4SkipWsCommas(body: []const u8, start: usize) usize {
+    var pos = start;
+    while (pos < body.len) : (pos += 1) {
+        switch (body[pos]) {
+            ' ', '\t', '\n', '\r', ',' => {},
+            else => break,
+        }
+    }
+    return pos;
+}
+
+/// Parse a Gemma 4 object beginning at `start` (an optional leading `{` is
+/// consumed; absent braces are tolerated so a brace-less body still parses).
+/// Appends the JSON object to `result`; returns the index just past it.
+fn convertGemma4Object(
+    allocator: std.mem.Allocator,
+    result: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+) ?usize {
+    if (depth >= gemma4_max_depth) return null;
+    var pos = gemma4SkipWs(body, start);
+    if (pos < body.len and body[pos] == '{') pos += 1;
     result.append(allocator, '{') catch return null;
 
-    // Strip outer braces
-    var body = input;
-    if (body.len >= 2 and body[0] == '{') {
-        body = body[1..];
-        if (body[body.len - 1] == '}') body = body[0 .. body.len - 1];
-    }
-
     var first = true;
-    var pos: usize = 0;
     while (pos < body.len) {
-        // Skip whitespace and commas
-        while (pos < body.len and (body[pos] == ' ' or body[pos] == ',' or body[pos] == '\n' or body[pos] == '\t')) : ({
-            pos += 1;
-        }) {}
+        pos = gemma4SkipWsCommas(body, pos);
         if (pos >= body.len) break;
+        if (body[pos] == '}') {
+            pos += 1;
+            break;
+        }
 
-        // Find key (everything before ':')
-        const colon = std.mem.indexOf(u8, body[pos..], ":") orelse break;
+        // Key: everything up to the first ':'.
+        const colon = std.mem.indexOfScalar(u8, body[pos..], ':') orelse break;
         const key_raw = std.mem.trim(u8, body[pos .. pos + colon], " \t\n\r");
-        // Strip surrounding quotes if present (model sometimes quotes keys in custom format)
+        // Strip surrounding quotes if present (model sometimes quotes keys).
         const key = if (key_raw.len >= 2 and key_raw[0] == '"' and key_raw[key_raw.len - 1] == '"')
             key_raw[1 .. key_raw.len - 1]
         else
@@ -1625,72 +1678,109 @@ fn convertGemma4ArgsToJson(allocator: std.mem.Allocator, input: []const u8) ?[]c
         if (!first) result.append(allocator, ',') catch return null;
         first = false;
 
-        // Output key
         result.append(allocator, '"') catch return null;
         result.appendSlice(allocator, key) catch return null;
         result.appendSlice(allocator, "\":") catch return null;
 
-        // Check if value starts with <|"|> delimiter
-        if (pos + str_delim.len <= body.len and std.mem.eql(u8, body[pos .. pos + str_delim.len], str_delim)) {
-            pos += str_delim.len;
-            // Find closing delimiter (may be missing if model output was truncated)
-            const end = std.mem.indexOf(u8, body[pos..], str_delim) orelse (body.len - pos);
-            const value = body[pos .. pos + end];
-            pos = if (pos + end + str_delim.len <= body.len)
-                pos + end + str_delim.len
-            else
-                body.len;
-
-            // JSON-escape the value
-            result.append(allocator, '"') catch return null;
-            for (value) |c| {
-                switch (c) {
-                    '"' => result.appendSlice(allocator, "\\\"") catch return null,
-                    '\\' => result.appendSlice(allocator, "\\\\") catch return null,
-                    '\n' => result.appendSlice(allocator, "\\n") catch return null,
-                    '\r' => result.appendSlice(allocator, "\\r") catch return null,
-                    '\t' => result.appendSlice(allocator, "\\t") catch return null,
-                    else => result.append(allocator, c) catch return null,
-                }
-            }
-            result.append(allocator, '"') catch return null;
-        } else if (pos < body.len and (body[pos] == '{' or body[pos] == '[')) {
-            // Nested object or array — match braces to find the full value
-            const open = body[pos];
-            const close: u8 = if (open == '{') '}' else ']';
-            var depth: usize = 0;
-            var end: usize = pos;
-            var in_str = false;
-            while (end < body.len) : (end += 1) {
-                if (body[end] == '"' and (end == 0 or body[end - 1] != '\\')) {
-                    in_str = !in_str;
-                } else if (!in_str) {
-                    if (body[end] == open) depth += 1
-                    else if (body[end] == close) {
-                        depth -= 1;
-                        if (depth == 0) { end += 1; break; }
-                    }
-                }
-            }
-            const value = body[pos..end];
-            // Pass through as-is (already JSON-like structure)
-            result.appendSlice(allocator, value) catch return null;
-            pos = end;
-        } else {
-            // Bare value (number, boolean, or unquoted string) — terminates at , or }
-            const val_end = std.mem.indexOfAny(u8, body[pos..], ",}") orelse body.len - pos;
-            const value = std.mem.trim(u8, body[pos .. pos + val_end], " \t\n\r");
-            if (isJsonLiteral(value)) {
-                result.appendSlice(allocator, value) catch return null;
-            } else {
-                appendJsonString(allocator, &result, value) catch return null;
-            }
-            pos = pos + val_end;
-        }
+        pos = convertGemma4Value(allocator, result, body, pos, depth) orelse return null;
     }
 
     result.append(allocator, '}') catch return null;
-    return result.toOwnedSlice(allocator) catch return null;
+    return pos;
+}
+
+/// Parse a Gemma 4 array beginning at `start` (`body[start] == '['`). Appends
+/// the JSON array to `result`; returns the index just past it.
+fn convertGemma4Array(
+    allocator: std.mem.Allocator,
+    result: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+) ?usize {
+    if (depth >= gemma4_max_depth) return null;
+    var pos = start + 1; // consume '['
+    result.append(allocator, '[') catch return null;
+
+    var first = true;
+    while (pos < body.len) {
+        pos = gemma4SkipWsCommas(body, pos);
+        if (pos >= body.len) break;
+        if (body[pos] == ']') {
+            pos += 1;
+            break;
+        }
+        if (!first) result.append(allocator, ',') catch return null;
+        first = false;
+        pos = convertGemma4Value(allocator, result, body, pos, depth) orelse return null;
+    }
+
+    result.append(allocator, ']') catch return null;
+    return pos;
+}
+
+/// Convert one Gemma 4 value (custom string / JSON string / object / array /
+/// bare literal) beginning at `start`. String branches are checked first so
+/// braces inside a string stay string content. Returns the index past it.
+fn convertGemma4Value(
+    allocator: std.mem.Allocator,
+    result: *std.ArrayList(u8),
+    body: []const u8,
+    start: usize,
+    depth: usize,
+) ?usize {
+    var pos = gemma4SkipWs(body, start);
+    if (pos >= body.len) {
+        result.appendSlice(allocator, "\"\"") catch return null;
+        return pos;
+    }
+
+    // Gemma custom string: <|"|>…<|"|> (closing delimiter may be missing if
+    // the model output was truncated).
+    if (pos + gemma4_str_delim.len <= body.len and
+        std.mem.eql(u8, body[pos .. pos + gemma4_str_delim.len], gemma4_str_delim))
+    {
+        pos += gemma4_str_delim.len;
+        const end = std.mem.indexOf(u8, body[pos..], gemma4_str_delim) orelse (body.len - pos);
+        const value = body[pos .. pos + end];
+        pos = if (pos + end + gemma4_str_delim.len <= body.len)
+            pos + end + gemma4_str_delim.len
+        else
+            body.len;
+        appendJsonString(allocator, result, value) catch return null;
+        return pos;
+    }
+
+    // Regular JSON string: already valid, copy verbatim (respecting \" escapes).
+    if (body[pos] == '"') {
+        var end = pos + 1;
+        while (end < body.len) : (end += 1) {
+            if (body[end] == '\\' and end + 1 < body.len) {
+                end += 1;
+                continue;
+            }
+            if (body[end] == '"') {
+                end += 1;
+                break;
+            }
+        }
+        result.appendSlice(allocator, body[pos..end]) catch return null;
+        return end;
+    }
+
+    if (body[pos] == '{') return convertGemma4Object(allocator, result, body, pos, depth + 1);
+    if (body[pos] == '[') return convertGemma4Array(allocator, result, body, pos, depth + 1);
+
+    // Bare value (number, boolean, null, or unquoted string) — terminates at
+    // the enclosing separator/closer.
+    const val_end = std.mem.indexOfAny(u8, body[pos..], ",}]") orelse (body.len - pos);
+    const value = std.mem.trim(u8, body[pos .. pos + val_end], " \t\n\r");
+    if (isJsonLiteral(value)) {
+        result.appendSlice(allocator, value) catch return null;
+    } else {
+        appendJsonString(allocator, result, value) catch return null;
+    }
+    return pos + val_end;
 }
 
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
@@ -2584,6 +2674,128 @@ test "convertGemma4ArgsToJson bare nested object value" {
     defer parsed.deinit();
     const config = parsed.value.object.get("config").?.object;
     try testing.expectEqual(@as(i64, 3000), config.get("port").?.integer);
+}
+
+// Issue #16: nested objects/arrays that themselves use Gemma 4's custom
+// `<|"|>`-delimited string format (or bare keys) must be converted recursively,
+// not passed through verbatim.
+test "convertGemma4ArgsToJson issue#16 nested array of custom strings" {
+    const allocator = testing.allocator;
+    const input =
+        \\{nested_array:[<|"|>foo<|"|>,<|"|>bar<|"|>]}
+    ;
+    const expected =
+        \\{"nested_array":["foo","bar"]}
+    ;
+    const result = convertGemma4ArgsToJson(allocator, input).?;
+    defer allocator.free(result);
+    try testing.expectEqualStrings(expected, result);
+}
+
+test "convertGemma4ArgsToJson issue#16 nested object custom format" {
+    const allocator = testing.allocator;
+    const input =
+        \\{nested_object:{foo:<|"|>bar<|"|>}}
+    ;
+    const expected =
+        \\{"nested_object":{"foo":"bar"}}
+    ;
+    const result = convertGemma4ArgsToJson(allocator, input).?;
+    defer allocator.free(result);
+    try testing.expectEqualStrings(expected, result);
+}
+
+test "convertGemma4ArgsToJson issue#16 nested object inside array" {
+    const allocator = testing.allocator;
+    const input =
+        \\{nested_object_in_array:[{foo:<|"|>bar<|"|>}]}
+    ;
+    const expected =
+        \\{"nested_object_in_array":[{"foo":"bar"}]}
+    ;
+    const result = convertGemma4ArgsToJson(allocator, input).?;
+    defer allocator.free(result);
+    try testing.expectEqualStrings(expected, result);
+}
+
+test "convertGemma4ArgsToJson issue#16 nested array inside object" {
+    const allocator = testing.allocator;
+    const input =
+        \\{nested_array_in_object:{foo:[<|"|>bar<|"|>]}}
+    ;
+    const expected =
+        \\{"nested_array_in_object":{"foo":["bar"]}}
+    ;
+    const result = convertGemma4ArgsToJson(allocator, input).?;
+    defer allocator.free(result);
+    try testing.expectEqualStrings(expected, result);
+}
+
+// Issue #16, real capture: this is the verbatim output of gemma-4-e4b-it-8bit
+// for a tool with nested-object + nested-array params. The model nests its
+// custom `<|"|>`/bare-key format, so the client must still receive valid,
+// fully-converted JSON arguments (no surviving <|"|> delimiters / bare keys).
+test "parseToolCalls Gemma 4 nested object + array args (issue#16 real capture)" {
+    const allocator = testing.allocator;
+    const text =
+        \\<|tool_call>call:send_notification{message:<|"|>Deploy complete<|"|>,metadata:{priority:<|"|>high<|"|>,tags:[<|"|>ci<|"|>,<|"|>release<|"|>]},recipients:[<|"|>alice<|"|>,<|"|>bob<|"|>]}<tool_call|>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("send_notification", calls[0].name);
+    // The arguments must be valid JSON (would fail to parse with raw <|"|> in them).
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("Deploy complete", parsed.value.object.get("message").?.string);
+    const metadata = parsed.value.object.get("metadata").?.object;
+    try testing.expectEqualStrings("high", metadata.get("priority").?.string);
+    const tags = metadata.get("tags").?.array;
+    try testing.expectEqual(@as(usize, 2), tags.items.len);
+    try testing.expectEqualStrings("ci", tags.items[0].string);
+    try testing.expectEqualStrings("release", tags.items[1].string);
+    const recipients = parsed.value.object.get("recipients").?.array;
+    try testing.expectEqual(@as(usize, 2), recipients.items.len);
+    try testing.expectEqualStrings("alice", recipients.items[0].string);
+    try testing.expectEqualStrings("bob", recipients.items[1].string);
+}
+
+// Gemma 4 12B leaks a trailing ':' into the function name (`call:shell:{…}`),
+// producing an unresolvable tool name `shell:`. The parser must strip it so the
+// client resolves a real tool instead of looping on "Unknown tool 'shell:'".
+test "parseToolCalls Gemma 4 strips trailing colon from tool name" {
+    const allocator = testing.allocator;
+    const text =
+        \\<|tool_call>call:shell:{"command":<|"|>ls<|"|>}<tool_call|>
+    ;
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("shell", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls", parsed.value.object.get("command").?.string);
+}
+
+test "sanitizeToolName strips trailing colons and whitespace" {
+    try testing.expectEqualStrings("shell", sanitizeToolName("shell:"));
+    try testing.expectEqualStrings("shell", sanitizeToolName("  shell  "));
+    try testing.expectEqualStrings("shell", sanitizeToolName("shell : "));
+    try testing.expectEqualStrings("shell", sanitizeToolName("shell::"));
+    try testing.expectEqualStrings("cwd", sanitizeToolName("cwd"));
+    try testing.expectEqualStrings("", sanitizeToolName(":"));
 }
 
 test "isJsonLiteral" {
