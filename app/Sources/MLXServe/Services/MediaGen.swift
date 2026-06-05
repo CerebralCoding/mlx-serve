@@ -207,9 +207,9 @@ struct ImageModelPreset: Identifiable, Hashable {
 /// uses dev transformer + distilled LoRA for ~10× the quality at ~10× the
 /// runtime. Two-stage HQ uses a higher-quality stage 1.
 enum VideoPipelineMode: String, Hashable, Codable {
-    case oneStage      // TextToVideoPipeline, num_steps configurable
-    case twoStage      // TwoStagePipeline,  stage1_steps configurable
-    case twoStageHQ    // TwoStageHQPipeline, stage1_steps configurable
+    case oneStage      // TI2VidOneStagePipeline,    num_steps configurable
+    case twoStage      // TI2VidTwoStagesPipeline,   stage1_steps configurable
+    case twoStageHQ    // TI2VidTwoStagesHQPipeline, stage1_steps configurable
 }
 
 struct VideoQualitySettings: Hashable {
@@ -294,6 +294,70 @@ struct VideoModelPreset: Identifiable, Hashable {
     static let all: [VideoModelPreset] = [.ltx23Q4]
 }
 
+// MARK: - Audio presets (TTS / voice cloning)
+
+/// A neural text-to-speech model served through the embedded `mlx-audio`
+/// library. Every preset here does **zero-shot voice cloning** — given a few
+/// seconds of reference audio (plus an optional transcript), it speaks the
+/// prompt text in that voice. The model is identified solely by its open
+/// `mlx-community` HuggingFace repo, which `mlx_audio.tts.generate_audio`
+/// downloads and loads on first use (no separate snapshot step).
+///
+/// We deliberately don't surface the macOS system voices here — those live in
+/// Voice mode. This panel is neural-only.
+struct AudioModelPreset: Identifiable, Hashable {
+    let id: String
+    let name: String
+    /// Open `mlx-community` repo passed straight to `generate_audio(model:)`.
+    let repo: String
+    /// Rough on-disk weight size, GB (first-run download). Shown in the picker.
+    let approxDownloadGB: Double
+    /// Peak unified-memory footprint, GB — drives the soft RAM gate.
+    let approxRAMGB: Int
+    /// Suggested reference-clip length for good cloning, in seconds. Surfaced
+    /// as a hint next to the record button.
+    let recommendedRefSeconds: Int
+
+    static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
+    func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    /// MOSS-TTS Nano — 100M params, the lightest cloning model in the catalog.
+    /// ~0.6 GB peak memory, real-time-plus on any Apple Silicon. Default.
+    static let mossNano = AudioModelPreset(
+        id: "mlx-audio/moss-tts-nano-100m",
+        name: "MOSS-TTS Nano 100M (fast, ~0.5 GB)",
+        repo: "mlx-community/MOSS-TTS-Nano-100M",
+        approxDownloadGB: 0.5,
+        approxRAMGB: 2,
+        recommendedRefSeconds: 6
+    )
+
+    /// Qwen3-TTS 0.6B (Base) — zero-shot cloning, a clear quality step up from
+    /// Nano while still light. Balanced default-plus.
+    static let qwen3TTS06B = AudioModelPreset(
+        id: "mlx-audio/qwen3-tts-0.6b-base",
+        name: "Qwen3-TTS 0.6B (balanced, ~1.5 GB)",
+        repo: "mlx-community/Qwen3-TTS-12Hz-0.6B-Base-bf16",
+        approxDownloadGB: 1.5,
+        approxRAMGB: 4,
+        recommendedRefSeconds: 8
+    )
+
+    /// Qwen3-TTS 1.7B (Base) — highest fidelity here; best for expressive,
+    /// long-form cloning when the Mac has the headroom.
+    static let qwen3TTS17B = AudioModelPreset(
+        id: "mlx-audio/qwen3-tts-1.7b-base",
+        name: "Qwen3-TTS 1.7B (quality, ~3.5 GB)",
+        repo: "mlx-community/Qwen3-TTS-12Hz-1.7B-Base-bf16",
+        approxDownloadGB: 3.5,
+        approxRAMGB: 8,
+        recommendedRefSeconds: 8
+    )
+
+    /// Catalog ordered lightest → heaviest. Default (`first`) is MOSS-TTS Nano.
+    static let all: [AudioModelPreset] = [.mossNano, .qwen3TTS06B, .qwen3TTS17B]
+}
+
 // MARK: - Requests
 
 struct ImageGenRequest {
@@ -322,6 +386,23 @@ struct VideoGenRequest {
     /// Optional first-frame image for image-to-video conditioning (2-stage
     /// pipelines only — the distilled 1-stage pipeline doesn't accept it).
     var firstFrameImagePath: String? = nil
+}
+
+struct AudioGenRequest {
+    var model: AudioModelPreset
+    /// The text to speak.
+    var text: String
+    /// Path to a normalized 24 kHz mono WAV of the voice to clone. `nil` falls
+    /// back to the model's default voice (no cloning).
+    var refAudioPath: String? = nil
+    /// Transcript of the reference clip. Optional — when empty, mlx-audio
+    /// auto-transcribes the reference with Whisper (an extra one-time download).
+    /// Supplying it makes cloning more stable and skips the STT model.
+    var refText: String = ""
+    /// Playback speed multiplier.
+    var speed: Double = 1.0
+    /// Sampling temperature — higher is more expressive/varied.
+    var temperature: Double = 0.7
 }
 
 // MARK: - RAM checks

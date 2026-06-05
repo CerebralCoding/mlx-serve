@@ -67,6 +67,25 @@ struct ChatImage: Identifiable, Codable, Equatable {
     }
 }
 
+/// An audio clip attached to a message. `pcm` holds raw little-endian float32
+/// mono samples at 16 kHz — the format the Gemma 4 12B unified audio embedder
+/// frames into 640-sample tokens. Decoded client-side by `AudioPreprocessor`.
+struct ChatAudio: Identifiable, Codable, Equatable {
+    let id: UUID
+    let name: String   // original filename, for the attachment chip
+    let pcm: Data       // float32-LE 16 kHz mono samples
+
+    init(name: String, pcm: Data) {
+        self.id = UUID()
+        self.name = name
+        self.pcm = pcm
+    }
+
+    /// Number of decoded samples (4 bytes each) and the clip's duration.
+    var sampleCount: Int { pcm.count / 4 }
+    var durationSeconds: Double { Double(sampleCount) / 16_000.0 }
+}
+
 struct ChatMessage: Identifiable, Codable {
     let id: UUID
     var role: Role
@@ -84,6 +103,7 @@ struct ChatMessage: Identifiable, Codable {
     var toolName: String?     // For tool response messages
     var toolCalls: [SerializedToolCall]? // Tool calls made BY this assistant message
     var images: [ChatImage]?  // Images attached to this message
+    var audio: [ChatAudio]?   // Audio clips attached to this message
     // When true, the message is kept visible in the UI (e.g. preserved reasoning
     // from a cut-off or pad-only retry) but excluded from API history so it
     // can't confuse subsequent iterations of the agent loop.
@@ -109,7 +129,7 @@ struct ChatMessage: Identifiable, Codable {
         case id, role, content, reasoningContent, isStreaming, timestamp
         case agentPlan, toolResults, isAgentSummary
         case promptTokens, completionTokens, tokensPerSecond
-        case toolCallId, toolName, toolCalls, images, failedRetry
+        case toolCallId, toolName, toolCalls, images, audio, failedRetry
     }
 
     init(from decoder: Decoder) throws {
@@ -130,6 +150,7 @@ struct ChatMessage: Identifiable, Codable {
         toolName = try c.decodeIfPresent(String.self, forKey: .toolName)
         toolCalls = try c.decodeIfPresent([SerializedToolCall].self, forKey: .toolCalls)
         images = try c.decodeIfPresent([ChatImage].self, forKey: .images)
+        audio = try c.decodeIfPresent([ChatAudio].self, forKey: .audio)
         failedRetry = try c.decodeIfPresent(Bool.self, forKey: .failedRetry) ?? false
     }
 }
@@ -155,6 +176,10 @@ struct ModelInfo {
     /// soft-warning pill in Settings → Drafter, since drafter regresses on
     /// MoE targets at single-stream batch=1.
     var isMoE: Bool = false
+    /// True when the model advertises the `audio` capability (Gemma 4 12B
+    /// unified). Gates the mic button + audio-file attachment in chat — other
+    /// models silently ignore audio, so we only surface it where it works.
+    var supportsAudio: Bool = false
     /// True when the running server was launched with `--drafter <dir>` and
     /// the drafter+target pair validated. Drives the green status pill.
     var drafterLoaded: Bool = false

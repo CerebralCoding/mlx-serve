@@ -1,0 +1,379 @@
+import SwiftUI
+import AppKit
+import AVKit
+import UniformTypeIdentifiers
+
+/// Audio generation window — neural TTS with zero-shot voice cloning via the
+/// shared Python venv (`mlx-audio`). Same shell as ImageGen/VideoGen: a model
+/// picker, the text to speak, a reference-voice section (record or pick a file)
+/// with an optional transcript, and a player for the result.
+struct AudioGenView: View {
+    @EnvironmentObject var python: PythonManager
+    @EnvironmentObject var service: AudioGenService
+    @EnvironmentObject var server: ServerManager
+
+    @StateObject private var recorder = AudioRecorder()
+
+    @State private var text: String = ""
+    @State private var model: AudioModelPreset = .mossNano
+    @State private var refAudioURL: URL? = nil
+    @State private var refText: String = ""
+    @State private var speed: Double = 1.0
+    @State private var temperature: Double = 0.7
+    @State private var showAdvanced: Bool = false
+
+    @State private var refError: String? = nil
+    @State private var showRAMWarning: Bool = false
+    @State private var ramWarningMessage: String = ""
+    @State private var pendingRequest: AudioGenRequest? = nil
+    @State private var player: AVPlayer?
+
+    var body: some View {
+        Group {
+            switch python.status {
+            case .unknown:
+                ProgressView().frame(maxWidth: .infinity, maxHeight: .infinity)
+            case .missingPython, .needsGit, .needsVenv, .needsPackages:
+                GenInstallPane(feature: "Audio Generation (voice cloning)")
+            case .needsFFmpeg, .ready:
+                // mlx-audio doesn't shell out to ffmpeg — works without it.
+                readyView
+            }
+        }
+        .frame(minWidth: 820, minHeight: 600)
+        .onChange(of: service.phase) { _, phase in
+            if case .completed(let path) = phase {
+                player = AVPlayer(url: URL(fileURLWithPath: path))
+                player?.play()
+            }
+        }
+    }
+
+    private var readyView: some View {
+        HSplitView {
+            ScrollView {
+                VStack(alignment: .leading, spacing: 14) {
+                    textSection
+                    modelSection
+                    referenceSection
+                    if showAdvanced { advancedSection } else { advancedToggle }
+                    actionRow
+                }
+                .padding(16)
+            }
+            .frame(minWidth: 340, idealWidth: 380)
+
+            VStack(spacing: 12) {
+                previewArea
+                outputFolderLink
+            }
+            .padding(16)
+            .frame(minWidth: 420)
+        }
+        .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
+            Button("Cancel", role: .cancel) { pendingRequest = nil }
+            Button("Generate Anyway", role: .destructive) {
+                if let req = pendingRequest { service.generate(req) }
+                pendingRequest = nil
+            }
+        } message: {
+            Text(ramWarningMessage)
+        }
+    }
+
+    // MARK: - Sections
+
+    private var textSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Text to speak").font(.subheadline.weight(.semibold))
+            TextEditor(text: $text)
+                .font(.body)
+                .frame(height: 120)
+                .overlay(
+                    RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
+                )
+        }
+    }
+
+    private var modelSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Model").font(.subheadline.weight(.semibold))
+            Picker("", selection: $model) {
+                ForEach(AudioModelPreset.all) { preset in
+                    Text(preset.name).tag(preset)
+                }
+            }
+            .labelsHidden()
+            .pickerStyle(.menu)
+            Text("~\(model.approxRAMGB) GB RAM • zero-shot voice cloning")
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+    }
+
+    private var referenceSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Reference voice").font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("~\(model.recommendedRefSeconds)s recommended")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+
+            if let url = refAudioURL {
+                HStack(spacing: 8) {
+                    Image(systemName: "waveform.circle.fill").foregroundStyle(.green)
+                    Text(url.lastPathComponent)
+                        .font(.caption).lineLimit(1).truncationMode(.middle)
+                    Spacer()
+                    Button { playReference(url) } label: { Image(systemName: "play.circle") }
+                        .buttonStyle(.borderless).help("Preview reference")
+                    Button { clearReference() } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
+                }
+            } else if recorder.isRecording {
+                HStack(spacing: 10) {
+                    Image(systemName: "mic.fill").foregroundStyle(.red)
+                    ProgressView(value: Double(recorder.level)).frame(width: 120)
+                    Text(String(format: "%.1fs", recorder.duration))
+                        .font(.caption.monospacedDigit()).foregroundStyle(.secondary)
+                    Spacer()
+                    Button { stopRecording() } label: {
+                        Label("Stop", systemImage: "stop.circle.fill")
+                    }
+                    .buttonStyle(.bordered)
+                }
+            } else {
+                HStack(spacing: 8) {
+                    Button { chooseReferenceFile() } label: {
+                        Label("Choose file…", systemImage: "folder")
+                            .font(.caption).frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    Button { startRecording() } label: {
+                        Label("Record", systemImage: "mic")
+                            .font(.caption).frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                }
+            }
+
+            if refAudioURL != nil {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text("Transcript of reference (optional)").font(.caption)
+                    TextField("", text: $refText,
+                              prompt: Text("Leave empty to auto-transcribe (slower, downloads Whisper)"))
+                        .textFieldStyle(.roundedBorder)
+                        .font(.caption)
+                }
+            } else {
+                Text("Pick or record ~\(model.recommendedRefSeconds) seconds of the voice to clone. Without a reference, the model's default voice is used.")
+                    .font(.caption2).foregroundStyle(.secondary)
+            }
+
+            if let err = refError {
+                Text(err).font(.caption2).foregroundStyle(.orange)
+            }
+        }
+    }
+
+    private var advancedToggle: some View {
+        Button {
+            withAnimation { showAdvanced = true }
+        } label: {
+            Label("Advanced options", systemImage: "chevron.right").font(.caption)
+        }
+        .buttonStyle(.plain)
+        .foregroundStyle(.secondary)
+    }
+
+    private var advancedSection: some View {
+        VStack(alignment: .leading, spacing: 10) {
+            HStack {
+                Text("Advanced").font(.caption.weight(.semibold))
+                Spacer()
+                Button { withAnimation { showAdvanced = false } } label: { Image(systemName: "chevron.down") }
+                    .buttonStyle(.plain).foregroundStyle(.secondary)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Speed (\(String(format: "%.2fx", speed)))").font(.caption)
+                Slider(value: $speed, in: 0.5...2.0, step: 0.05)
+            }
+            VStack(alignment: .leading, spacing: 2) {
+                Text("Temperature (\(String(format: "%.2f", temperature)))").font(.caption)
+                Slider(value: $temperature, in: 0.1...1.5, step: 0.05)
+                Text("Higher = more expressive and varied.").font(.caption2).foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    private var actionRow: some View {
+        HStack {
+            if service.isRunning {
+                Button(role: .destructive) { service.cancel() } label: {
+                    Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.bordered)
+            } else {
+                Button { tryGenerate() } label: {
+                    Label("Generate", systemImage: "waveform").frame(maxWidth: .infinity)
+                }
+                .buttonStyle(.borderedProminent)
+                .keyboardShortcut(.return, modifiers: [.command])
+                .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+            }
+        }
+    }
+
+    private var previewArea: some View {
+        ZStack {
+            RoundedRectangle(cornerRadius: 8).fill(Color.black.opacity(0.15))
+            Group {
+                switch service.phase {
+                case .idle:
+                    ContentUnavailableView("No audio yet", systemImage: "waveform",
+                                           description: Text("Enter text, add a reference voice, and press Generate."))
+                case .running(let step, let total, let message):
+                    VStack(spacing: 12) {
+                        ProgressView(value: Double(step), total: max(1, Double(total)))
+                            .progressViewStyle(.linear).frame(width: 240)
+                        Text(message).font(.footnote).foregroundStyle(.secondary)
+                    }
+                case .completed(let path):
+                    completedPreview(path: path)
+                case .failed(let msg):
+                    ContentUnavailableView {
+                        Label("Failed", systemImage: "exclamationmark.triangle")
+                    } description: {
+                        Text(msg)
+                    } actions: {
+                        Button("Show log") { showLogWindow() }
+                    }
+                }
+            }
+        }
+        .frame(maxWidth: .infinity, maxHeight: .infinity)
+    }
+
+    private func completedPreview(path: String) -> some View {
+        VStack(spacing: 12) {
+            Image(systemName: "waveform.circle.fill")
+                .font(.system(size: 64)).foregroundStyle(.tint)
+            HStack(spacing: 10) {
+                Button { player?.seek(to: .zero); player?.play() } label: {
+                    Label("Play", systemImage: "play.fill")
+                }
+                .buttonStyle(.bordered)
+                Button { player?.pause() } label: {
+                    Label("Pause", systemImage: "pause.fill")
+                }
+                .buttonStyle(.bordered)
+            }
+            HStack(spacing: 8) {
+                Text(URL(fileURLWithPath: path).lastPathComponent)
+                    .font(.caption).foregroundStyle(.secondary)
+                    .lineLimit(1).truncationMode(.middle)
+                Spacer()
+                Button {
+                    NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: path)])
+                } label: { Image(systemName: "folder") }
+                .buttonStyle(.borderless).help("Reveal in Finder")
+            }
+        }
+        .padding(16)
+    }
+
+    private var outputFolderLink: some View {
+        Button {
+            NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: PythonManager.audiosRoot)])
+        } label: {
+            Label("Open output folder in Finder", systemImage: "folder").font(.caption)
+        }
+        .buttonStyle(.borderless)
+        .foregroundStyle(.secondary)
+        .help(PythonManager.audiosRoot)
+    }
+
+    // MARK: - Reference actions
+
+    private func chooseReferenceFile() {
+        refError = nil
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio, .aiff]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        guard panel.runModal() == .OK, let url = panel.url else { return }
+        do {
+            refAudioURL = try AudioReference.normalizedReferenceWav(fromFile: url)
+        } catch {
+            refError = error.localizedDescription
+        }
+    }
+
+    private func startRecording() {
+        refError = nil
+        Task {
+            guard await AudioRecorder.requestPermission() else {
+                refError = "Microphone access denied. Enable it in System Settings ▸ Privacy ▸ Microphone."
+                return
+            }
+            do { try recorder.start() }
+            catch { refError = error.localizedDescription }
+        }
+    }
+
+    private func stopRecording() {
+        guard let data = recorder.stop() else {
+            refError = "Nothing was recorded."
+            return
+        }
+        do {
+            refAudioURL = try AudioReference.normalizedReferenceWav(fromRecordedPCM: data)
+        } catch {
+            refError = error.localizedDescription
+        }
+    }
+
+    private func clearReference() {
+        if let url = refAudioURL { try? FileManager.default.removeItem(at: url) }
+        refAudioURL = nil
+        refText = ""
+    }
+
+    private func playReference(_ url: URL) {
+        let p = AVPlayer(url: url)
+        p.play()
+        player = p
+    }
+
+    // MARK: - Generate
+
+    private func tryGenerate() {
+        let req = AudioGenRequest(
+            model: model,
+            text: text,
+            refAudioPath: refAudioURL?.path,
+            refText: refText,
+            speed: speed,
+            temperature: temperature
+        )
+        let total = RAMChecker.totalGB
+        let needed = model.approxRAMGB
+        if total < needed {
+            ramWarningMessage = "This model needs about \(needed) GB of RAM, but your Mac has \(total) GB total. It may run very slowly or fail. Continue?"
+            pendingRequest = req
+            showRAMWarning = true
+            return
+        }
+        service.generate(req)
+    }
+
+    private func showLogWindow() {
+        let logText = service.log.joined(separator: "\n")
+        let alert = NSAlert()
+        alert.messageText = "Audio generation log"
+        alert.informativeText = logText.isEmpty ? "(no output)" : logText
+        alert.runModal()
+    }
+}

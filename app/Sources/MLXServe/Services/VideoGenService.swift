@@ -78,6 +78,13 @@ final class VideoGenService: ObservableObject {
                 let actionable = log.last(where: { $0.hasPrefix("ERROR: ") })
                     .map { String($0.dropFirst("ERROR: ".count)) }
                 phase = .failed(actionable ?? error.localizedDescription)
+                // If generation died because the ltx package drifted out from
+                // under a stale `.ready` status (module present, symbols gone),
+                // re-run dependency detection so the pane flips back to the
+                // installer instead of only showing red text.
+                if let msg = actionable, Self.indicatesVenvNeedsReinstall(msg) {
+                    await python.refresh()
+                }
             }
         }
     }
@@ -85,6 +92,15 @@ final class VideoGenService: ObservableObject {
     func cancel() {
         task?.cancel()
         task = nil
+    }
+
+    /// True when a generation error indicates the venv itself is broken (a
+    /// required import failed) rather than a per-request problem — in which
+    /// case the caller should re-run detection so the UI re-offers the
+    /// installer. Matches the message the embedded scripts emit on a failed
+    /// `from ltx_pipelines_mlx import …` (or `import mflux`).
+    static func indicatesVenvNeedsReinstall(_ message: String) -> Bool {
+        message.localizedCaseInsensitiveContains("import failed")
     }
 
     // MARK: - Private
@@ -142,6 +158,7 @@ final class VideoGenService: ObservableObject {
             "--width", String(r.width),
             "--height", String(r.height),
             "--frames", String(r.numFrames),
+            "--fps", String(r.fps),
             "--steps", String(r.steps),
             "--cfg", String(r.cfgScale),
             "--stg", String(r.stgScale),
@@ -157,8 +174,8 @@ final class VideoGenService: ObservableObject {
     /// Python script for LTX-Video 2.3 generation via `ltx-2-mlx`. Single
     /// pipeline path — no fallbacks — mirrors the shape of the mflux image
     /// script. Progress is coarse 4-phase (Download → Load → Generate →
-    /// Encode); the TextToVideoPipeline does not expose a per-step callback,
-    /// so finer granularity would need monkey-patching `mlx_arsenal.scheduler`.
+    /// Encode); the TI2Vid* pipelines don't expose a per-step callback, so
+    /// finer granularity would need monkey-patching `mlx_arsenal.scheduler`.
     static let script: String = #"""
 import sys, json, argparse, traceback, os, shutil
 
@@ -181,7 +198,10 @@ def main():
     p.add_argument("--stg", type=float, default=0.0,
                    help="Spatial-temporal guidance; ignored by oneStage.")
     p.add_argument("--image", default=None,
-                   help="Optional first-frame image path (2-stage modes only).")
+                   help="Optional first-frame image path (I2V via image=...).")
+    p.add_argument("--fps", type=int, default=24,
+                   help="Output frame rate. LTX-2.3 was trained at 24; far-off "
+                        "values drift out of distribution. Mandatory on every pipeline.")
     p.add_argument("--output", required=True)
     args = p.parse_args()
 
@@ -192,7 +212,11 @@ def main():
         sys.exit(1)
 
     try:
-        from ltx_pipelines_mlx import TextToVideoPipeline, TwoStagePipeline, TwoStageHQPipeline
+        from ltx_pipelines_mlx import (
+            TI2VidOneStagePipeline,
+            TI2VidTwoStagesPipeline,
+            TI2VidTwoStagesHQPipeline,
+        )
         from huggingface_hub import snapshot_download
     except Exception as e:
         emit({"type":"error","message":f"ltx-2-mlx import failed: {e}. Re-run the installer."})
@@ -211,9 +235,9 @@ def main():
     emit({"type":"progress","step":1,"total":4,
           "message":"Loading Gemma text encoder + LTX transformer..."})
     PIPELINES = {
-        "oneStage":   TextToVideoPipeline,
-        "twoStage":   TwoStagePipeline,
-        "twoStageHQ": TwoStageHQPipeline,
+        "oneStage":   TI2VidOneStagePipeline,
+        "twoStage":   TI2VidTwoStagesPipeline,
+        "twoStageHQ": TI2VidTwoStagesHQPipeline,
     }
     try:
         pipe = PIPELINES[args.mode](
@@ -230,13 +254,19 @@ def main():
           "message":f"Generating {args.frames} frames @ {args.width}x{args.height} ({args.mode})..."})
     try:
         if args.mode == "oneStage":
-            # Distilled 1-stage pipeline doesn't accept stg_scale or image.
+            # Dev one-stage: num_steps drives the single denoise pass; CFG/STG
+            # apply (1.0/0.0 = guidance off for the fast presets). frame_rate is
+            # mandatory on every ltx-2-mlx pipeline.
             pipe.generate_and_save(
                 prompt=args.prompt,
                 output_path=args.output,
                 height=args.height, width=args.width,
                 num_frames=args.frames, seed=args.seed,
+                frame_rate=args.fps,
                 num_steps=args.steps,
+                cfg_scale=args.cfg,
+                stg_scale=args.stg,
+                image=args.image,
             )
         else:
             pipe.generate_and_save(
@@ -244,6 +274,7 @@ def main():
                 output_path=args.output,
                 height=args.height, width=args.width,
                 num_frames=args.frames, seed=args.seed,
+                frame_rate=args.fps,
                 stage1_steps=args.steps, cfg_scale=args.cfg,
                 stg_scale=args.stg,
                 image=args.image,

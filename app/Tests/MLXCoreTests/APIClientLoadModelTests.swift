@@ -42,6 +42,30 @@ final class APIClientLoadModelTests: XCTestCase {
         XCTAssertEqual((json["meta"] as? [String: Any])? ["num_layers"] as? Int, 30)
     }
 
+    func testParseModelInfoReadsAudioCapability() {
+        // Gemma 4 12B advertises "audio" in capabilities + input_modalities.
+        let audioModel: [String: Any] = [
+            "id": "gemma-4-12b-it-4bit",
+            "capabilities": ["chat", "vision", "audio", "streaming"],
+            "input_modalities": ["text", "image", "audio"],
+            "meta": ["architecture": "gemma4"],
+        ]
+        XCTAssertTrue(APIClient.parseModelInfo(audioModel).supportsAudio)
+
+        // A vision-only model (E4B/31B SigLIP) must NOT advertise audio.
+        let visionOnly: [String: Any] = [
+            "id": "gemma-4-e4b-it-4bit",
+            "capabilities": ["chat", "vision", "streaming"],
+            "input_modalities": ["text", "image"],
+            "meta": ["architecture": "gemma4"],
+        ]
+        XCTAssertFalse(APIClient.parseModelInfo(visionOnly).supportsAudio)
+
+        // A text-only / pre-capability server defaults to no audio.
+        let textOnly: [String: Any] = ["id": "llama", "meta": ["architecture": "llama"]]
+        XCTAssertFalse(APIClient.parseModelInfo(textOnly).supportsAudio)
+    }
+
     func testParseModelInfoFromUnloadedEntry() {
         // Phase E stub form: state present, bytes_resident=0, bytes_on_disk
         // either top-level or under meta (we accept both).

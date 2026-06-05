@@ -17,9 +17,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleShortVersionString</key>
-	<string>26.6.1</string>
+	<string>26.6.2</string>
 	<key>CFBundleVersion</key>
-	<string>26.6.1</string>
+	<string>26.6.2</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>LSUIElement</key>
@@ -33,5 +33,9 @@
 	<string>MLX Core uses AppleScript to control Safari and other apps in agent mode.</string>
 	<key>NSHumanReadableCopyright</key>
 	<string>Copyright 2026 David Dalcu. All rights reserved.</string>
+	<key>NSMicrophoneUsageDescription</key>
+	<string>MLX Core records audio from your microphone so multimodal models (like Gemma 4 12B) can listen to and respond to your voice.</string>
+	<key>NSSpeechRecognitionUsageDescription</key>
+	<string>MLX Core uses Apple's on-device speech recognition in Voice mode so you can talk to the model hands-free, even with no internet. Your audio is transcribed locally on your Mac; this app forces on-device recognition and never sends your speech to Apple's servers. (The wording above is Apple's standard text for this permission.)</string>
 </dict>
 </plist>

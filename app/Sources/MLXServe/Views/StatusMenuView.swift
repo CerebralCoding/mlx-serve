@@ -91,6 +91,53 @@ private struct ClaudeShape: Shape {
     }
 }
 
+/// The optional Python-backed media tools shown under the collapsible
+/// "Experiments" section of the menu popover. Pure data (no SwiftUI, no
+/// `PythonManager`) so the section's membership, ordering, readiness wiring,
+/// and help text stay unit-testable. Kept in sync with `GenExperimentTests`.
+enum GenExperiment: String, CaseIterable, Identifiable {
+    case image, video, audio
+
+    var id: String { rawValue }
+
+    var icon: String {
+        switch self {
+        case .image: "photo.on.rectangle.angled"
+        case .video: "film.stack"
+        case .audio: "waveform"
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .image: "ImageGen"
+        case .video: "VideoGen"
+        case .audio: "AudioGen"
+        }
+    }
+
+    /// Tooltip — depends on whether the backing venv is installed.
+    func help(ready: Bool) -> String {
+        switch self {
+        case .image: ready ? "Image Generation (FLUX.2)"
+                           : "Image Generation — click to install dependencies"
+        case .video: ready ? "Video Generation (LTX-Video 2.3)"
+                           : "Video Generation — click to install dependencies"
+        case .audio: ready ? "Audio Generation — neural TTS & voice cloning"
+                           : "Audio Generation — click to install dependencies"
+        }
+    }
+
+    /// Which `PythonManager.status` flag gates this feature: ImageGen/AudioGen
+    /// only need the image stack; VideoGen needs the full (LTX) install.
+    func ready(imagesReady: Bool, fullyReady: Bool) -> Bool {
+        switch self {
+        case .image, .audio: imagesReady
+        case .video: fullyReady
+        }
+    }
+}
+
 struct StatusMenuView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -98,11 +145,15 @@ struct StatusMenuView: View {
     @EnvironmentObject var python: PythonManager
     @State private var showDownloads = false
     @State private var showLog = false
+    /// Persisted so the accordion stays where the user left it across popover
+    /// open/close and app restarts. Collapsed by default — these are extras.
+    @AppStorage("experimentsExpanded") private var experimentsExpanded = false
     let openChat: () -> Void
     let openBrowser: () -> Void
     let openModelBrowser: () -> Void
     let openImageGen: () -> Void
     let openVideoGen: () -> Void
+    let openAudioGen: () -> Void
     let openSettings: () -> Void
     let openServerLog: () -> Void
 
@@ -354,6 +405,56 @@ struct StatusMenuView: View {
 
             Divider().padding(.horizontal, 12)
 
+            // Experiments — optional Python-backed media tools. Same
+            // click-to-toggle accordion as Downloads above; collapsed by
+            // default so the popover stays compact, and the state persists.
+            VStack(alignment: .leading, spacing: 6) {
+                Button {
+                    withAnimation(.easeInOut(duration: 0.2)) {
+                        experimentsExpanded.toggle()
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Image(systemName: "chevron.right")
+                            .font(.caption2)
+                            .rotationEffect(.degrees(experimentsExpanded ? 90 : 0))
+                        Text("Experiments")
+                            .font(.subheadline.weight(.medium))
+                        Spacer()
+                    }
+                    .foregroundStyle(.secondary)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+
+                if experimentsExpanded {
+                    HStack(spacing: 6) {
+                        ForEach(GenExperiment.allCases) { exp in
+                            genFeatureButton(
+                                icon: exp.icon,
+                                title: exp.title,
+                                help: exp.help(ready: exp.ready(
+                                    imagesReady: python.status.imagesReady,
+                                    fullyReady: python.status.isReady)),
+                                action: { open(exp) })
+                        }
+                    }
+                    .padding(.top, 4)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+
+            Divider().padding(.horizontal, 12)
+
+            // Persistent, window-independent voice assistant — its own row, not
+            // a button. Toggle it on and talk hands-free with no chat window.
+            VoiceTrayPanel(voice: appState.voice)
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+            Divider().padding(.horizontal, 12)
+
             // Chat, Browser, Claude Code & Quit
             HStack(spacing: 8) {
                 Button {
@@ -401,38 +502,6 @@ struct StatusMenuView: View {
             }
             .padding(.horizontal, 16)
             .padding(.top, 6)
-
-            // Secondary row: optional Python-backed features. Split out so the
-            // primary row above stays at its original width, and users can
-            // tell at a glance these are additional tools (not server
-            // controls).
-            HStack(spacing: 8) {
-                Button {
-                    openImageGen()
-                } label: {
-                    HStack {
-                        Image(systemName: "photo.on.rectangle.angled")
-                        Text("ImageGen")
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .help(python.status.imagesReady ? "Image Generation (FLUX.2)" : "Image Generation — click to install dependencies")
-
-                Button {
-                    openVideoGen()
-                } label: {
-                    HStack {
-                        Image(systemName: "film.stack")
-                        Text("VideoGen")
-                    }
-                    .frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .help(python.status.isReady ? "Video Generation (LTX-Video 2.3)" : "Video Generation — click to install dependencies")
-            }
-            .padding(.horizontal, 16)
-            .padding(.top, 6)
             .padding(.bottom, 14)
         }
         .frame(width: 320)
@@ -443,6 +512,38 @@ struct StatusMenuView: View {
         // looking at the GPU-memory bar".
         .onAppear { server.setMenuVisible(true) }
         .onDisappear { server.setMenuVisible(false) }
+    }
+
+    /// One button in the secondary "optional Python features" row. Three of
+    /// these share a 320pt-wide popover, so the label is compact: caption font
+    /// (which also shrinks the SF Symbol), tight spacing, small control size,
+    /// and `minimumScaleFactor` as a safety net so a long title scales down
+    /// instead of truncating to "AudioG…".
+    /// Route an experiment tile to its window opener.
+    private func open(_ exp: GenExperiment) {
+        switch exp {
+        case .image: openImageGen()
+        case .video: openVideoGen()
+        case .audio: openAudioGen()
+        }
+    }
+
+    private func genFeatureButton(
+        icon: String, title: String, help: String, action: @escaping () -> Void
+    ) -> some View {
+        Button(action: action) {
+            HStack(spacing: 4) {
+                Image(systemName: icon)
+                Text(title)
+                    .lineLimit(1)
+                    .minimumScaleFactor(0.7)
+            }
+            .font(.caption)
+            .frame(maxWidth: .infinity)
+        }
+        .buttonStyle(.bordered)
+        .controlSize(.small)
+        .help(help)
     }
 
     /// Append a "+ assist" suffix to every model row that *could* use the

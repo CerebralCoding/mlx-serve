@@ -585,9 +585,18 @@ pub const VisionEncodeRequest = struct {
     model: *model_registry_mod.LoadedModel,
     /// Per-image float32 CHW pixel buffers. Borrowed; must outlive the call.
     images: []const VisionImagePixels,
-    /// Output: encoded embedding tensor on success. Ownership transfers to
-    /// the caller.
+    /// Gemma 4 12B unified audio: per-clip raw float32-LE 16 kHz mono sample
+    /// buffers. Borrowed; must outlive the call. The inference thread frames
+    /// each into 640-sample tokens and projects them through the audio embedder.
+    audio: []const []const u8 = &.{},
+    /// Output: encoded embedding tensor on success — vision soft tokens followed
+    /// by audio soft tokens, concatenated along the token axis. Ownership
+    /// transfers to the caller.
     result: ?mlx.mlx_array = null,
+    /// Output: number of vision / audio soft tokens in `result` (in that order).
+    /// The caller inserts exactly this many image / audio placeholders.
+    n_vision_tokens: usize = 0,
+    n_audio_tokens: usize = 0,
     /// Output: error name on failure. Owned by `allocator`; caller frees.
     error_name: ?[]const u8 = null,
     /// Done flag (under done_mu). Caller's wait-loop drains the cond when
@@ -2072,15 +2081,24 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         finishVisionRequest(sch, req, "VisionEncoderNotLoaded");
         return;
     };
-    if (req.images.len == 0) {
+    if (req.images.len == 0 and req.audio.len == 0) {
         finishVisionRequest(sch, req, "EmptyImages");
         return;
     }
 
-    // Encode each image, accumulate embeddings, free intermediate arrays.
+    // Encode all soft tokens into `emb_parts`: vision first, then audio, so the
+    // single splice channel scatters them in the same order as the placeholder
+    // blocks the conn thread injected (image block before audio block).
     var emb_parts = std.ArrayList(mlx.mlx_array).empty;
     defer emb_parts.deinit(req.allocator);
+    const failParts = struct {
+        fn f(s: *Scheduler, r: *VisionEncodeRequest, parts: []mlx.mlx_array, name: []const u8) void {
+            for (parts) |e| _ = mlx.mlx_array_free(e);
+            finishVisionRequest(s, r, name);
+        }
+    }.f;
 
+    var n_vision: usize = 0;
     for (req.images) |img| {
         const h: c_int = @intCast(img.height);
         const w: c_int = @intCast(img.width);
@@ -2088,20 +2106,59 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
         defer _ = mlx.mlx_array_free(pixel_arr);
         const emb = vision_enc.forward(pixel_arr) catch |err| {
-            // Free anything already encoded.
-            for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
-            finishVisionRequest(sch, req, @errorName(err));
+            failParts(sch, req, emb_parts.items, @errorName(err));
             return;
         };
+        const es = mlx.getShape(emb);
+        n_vision += @intCast(es[1]);
         emb_parts.append(req.allocator, emb) catch |err| {
             _ = mlx.mlx_array_free(emb);
-            for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
-            finishVisionRequest(sch, req, @errorName(err));
+            failParts(sch, req, emb_parts.items, @errorName(err));
             return;
         };
     }
 
-    // Single image: pass through. Multiple: concatenate along token dim.
+    // Audio: frame each clip into 640-sample tokens, project through the
+    // unified audio embedder → [1, n_frames, hidden].
+    var n_audio: usize = 0;
+    for (req.audio) |clip| {
+        const n_samples = clip.len / 4;
+        if (n_samples == 0) continue;
+        const cfg = req.model.config orelse {
+            failParts(sch, req, emb_parts.items, "NoConfig");
+            return;
+        };
+        const samples_per_token: usize = if (cfg.audio_samples_per_token > 0) cfg.audio_samples_per_token else 640;
+        const n_frames = (n_samples + samples_per_token - 1) / samples_per_token;
+        const padded_len = n_frames * samples_per_token;
+        const buf = req.allocator.alloc(f32, padded_len) catch |err| {
+            failParts(sch, req, emb_parts.items, @errorName(err));
+            return;
+        };
+        @memset(buf, 0);
+        @memcpy(std.mem.sliceAsBytes(buf)[0..clip.len], clip);
+        const shape = [_]c_int{ 1, @intCast(n_frames), @intCast(samples_per_token) };
+        const frames_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
+        req.allocator.free(buf); // mlx_array_new_data copies into an array-owned buffer
+        defer _ = mlx.mlx_array_free(frames_arr);
+        const emb = vision_enc.forwardAudio(frames_arr) catch |err| {
+            failParts(sch, req, emb_parts.items, @errorName(err));
+            return;
+        };
+        n_audio += n_frames;
+        emb_parts.append(req.allocator, emb) catch |err| {
+            _ = mlx.mlx_array_free(emb);
+            failParts(sch, req, emb_parts.items, @errorName(err));
+            return;
+        };
+    }
+
+    if (emb_parts.items.len == 0) {
+        finishVisionRequest(sch, req, "EmptyImages");
+        return;
+    }
+
+    // Single modality/clip: pass through. Multiple: concatenate along token dim.
     var combined: mlx.mlx_array = undefined;
     if (emb_parts.items.len == 1) {
         combined = emb_parts.items[0];
@@ -2112,18 +2169,17 @@ fn runVisionEncode(sch: *Scheduler, req: *VisionEncodeRequest) void {
         combined = mlx.mlx_array_new();
         if (mlx.mlx_concatenate_axis(&combined, cat_vec, 1, vision_enc.s) != 0) {
             _ = mlx.mlx_array_free(combined);
-            for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
-            finishVisionRequest(sch, req, "ConcatenateFailed");
+            failParts(sch, req, emb_parts.items, "ConcatenateFailed");
             return;
         }
     }
-    // emb_parts items are now either the sentinels (single-image case) or
-    // freeable copies (multi-image case post-concat). Free remaining.
     for (emb_parts.items) |e| _ = mlx.mlx_array_free(e);
 
     req.done_mu.lockUncancelable(sch.io);
     defer req.done_mu.unlock(sch.io);
     req.result = combined;
+    req.n_vision_tokens = n_vision;
+    req.n_audio_tokens = n_audio;
     req.done = true;
     req.done_cond.broadcast(sch.io);
 }

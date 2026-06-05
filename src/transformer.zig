@@ -2338,15 +2338,30 @@ pub const Transformer = struct {
     /// Returns new h with vision embeddings replacing image token positions.
     /// masked_scatter: replaces image token positions with vision features.
     /// Matches Python reference: cumsum-based indexing into flattened source.
-    fn spliceVisionEmbeddings(self: *Transformer, h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32) !mlx.mlx_array {
+    fn spliceVisionEmbeddings(self: *Transformer, h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: mlx.mlx_array, image_token_id: u32, audio_token_id: u32) !mlx.mlx_array {
         const h_shape = mlx.getShape(h);
 
-        // mask = (token_ids == image_token_id): [B, seq_len] bool
+        // mask = (token_ids == image_token_id) [| (token_ids == audio_token_id)].
+        // Gemma 4 12B unified splices both modalities through this one channel:
+        // the embedding tensor concatenates [vision rows ; audio rows] in the
+        // same order the placeholder blocks were injected into the prompt, so a
+        // single sequence-order scatter lands each row in its slot.
         const img_id_arr = mlx.mlx_array_new_int(@intCast(image_token_id));
         defer _ = mlx.mlx_array_free(img_id_arr);
         var mask_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(mask_2d);
         try mlx.check(mlx.mlx_equal(&mask_2d, token_ids, img_id_arr, self.s));
+        if (audio_token_id > 0) {
+            const aud_id_arr = mlx.mlx_array_new_int(@intCast(audio_token_id));
+            defer _ = mlx.mlx_array_free(aud_id_arr);
+            var aud_mask = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(aud_mask);
+            try mlx.check(mlx.mlx_equal(&aud_mask, token_ids, aud_id_arr, self.s));
+            var combined = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_logical_or(&combined, mask_2d, aud_mask, self.s));
+            _ = mlx.mlx_array_free(mask_2d);
+            mask_2d = combined;
+        }
 
         // Expand mask to [B, seq_len, hidden] via broadcast
         const expand_shape = [_]c_int{ h_shape[0], h_shape[1], 1 };
@@ -2444,7 +2459,7 @@ pub const Transformer = struct {
         // mlx-vlm does NOT re-scale them by sqrt(hidden) the way text embeddings are scaled
         // at LM embedding time. Splice directly — scaling here corrupts the MoE router's
         // magnitude assumptions (visible as "please provide an image" responses on 26B MoE).
-        return self.spliceVisionEmbeddings(h, token_ids, ve, cfg.image_token_id);
+        return self.spliceVisionEmbeddings(h, token_ids, ve, cfg.image_token_id, cfg.audio_token_id);
     }
 
     // ── Activation functions ──

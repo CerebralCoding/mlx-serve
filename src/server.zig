@@ -1143,6 +1143,7 @@ fn renderModelEntry(
         var n_caps: usize = 0;
         const has_chat = !config.is_encoder_only and chat_config.chat_template.len > 0;
         const has_vision = entry.vision_encoder != null;
+        const has_audio = if (entry.vision_encoder) |ve| ve.supportsAudio() else false;
         const has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template);
         const append_cap = struct {
             fn call(a: std.mem.Allocator, b: *std.ArrayList(u8), n: *usize, name: []const u8) !void {
@@ -1157,6 +1158,7 @@ fn renderModelEntry(
         if (has_chat) try append_cap(allocator, &caps, &n_caps, "tool_use");
         if (has_chat) try append_cap(allocator, &caps, &n_caps, "streaming");
         if (has_vision) try append_cap(allocator, &caps, &n_caps, "vision");
+        if (has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
         if (has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
         if (has_chat) try append_cap(allocator, &caps, &n_caps, "json_schema");
         if (config.is_encoder_only) try append_cap(allocator, &caps, &n_caps, "embeddings");
@@ -1166,6 +1168,7 @@ fn renderModelEntry(
         defer mods.deinit(allocator);
         try mods.appendSlice(allocator, "[\"text\"");
         if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
+        if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
@@ -1913,11 +1916,13 @@ fn handleChatCompletions(
         // Content can be null for assistant messages with tool_calls
         const content_val = obj.get("content");
         var msg_images: ?[]const chat_mod.ImageData = null;
+        var msg_audio: ?[]const chat_mod.AudioData = null;
         const content: []const u8 = if (content_val) |cv| switch (cv) {
             .string => |s| s,
             .array => |arr| blk: {
                 var text_content: []const u8 = "";
                 var image_list = std.ArrayList(chat_mod.ImageData).empty;
+                var audio_list = std.ArrayList(chat_mod.AudioData).empty;
                 for (arr.items) |part| {
                     if (part != .object) continue;
                     const ptype = part.object.get("type") orelse continue;
@@ -1937,12 +1942,31 @@ fn handleChatCompletions(
                                 continue;
                             };
                         }
+                    } else if (std.mem.eql(u8, ptype.string, "input_audio")) {
+                        // OpenAI-style audio block. For the Gemma 4 12B unified
+                        // engine the client sends raw 16 kHz mono float32-LE PCM
+                        // (format "mlx_pcm_f32") base64-encoded in `data`.
+                        const a_obj = part.object.get("input_audio") orelse continue;
+                        if (a_obj != .object) continue;
+                        const data_val = a_obj.object.get("data") orelse continue;
+                        if (data_val != .string) continue;
+                        if (parseAudioContent(allocator, data_val.string)) |aud| {
+                            audio_list.append(allocator, aud) catch {
+                                allocator.free(aud.samples);
+                                continue;
+                            };
+                        }
                     }
                 }
                 if (image_list.items.len > 0) {
                     msg_images = image_list.toOwnedSlice(allocator) catch null;
                 } else {
                     image_list.deinit(allocator);
+                }
+                if (audio_list.items.len > 0) {
+                    msg_audio = audio_list.toOwnedSlice(allocator) catch null;
+                } else {
+                    audio_list.deinit(allocator);
                 }
                 break :blk text_content;
             },
@@ -1982,8 +2006,8 @@ fn handleChatCompletions(
         else
             null;
 
-        // Skip messages with no content, no tool_calls, and no images
-        if (content.len == 0 and msg_tool_calls == null and msg_images == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
+        // Skip messages with no content, no tool_calls, and no images/audio
+        if (content.len == 0 and msg_tool_calls == null and msg_images == null and msg_audio == null and !std.mem.eql(u8, role_val.string, "tool")) continue;
 
         try messages.append(allocator, .{
             .role = role_val.string,
@@ -1991,6 +2015,7 @@ fn handleChatCompletions(
             .tool_calls = msg_tool_calls,
             .tool_call_id = tool_call_id,
             .images = msg_images,
+            .audio = msg_audio,
         });
     }
 
@@ -2322,14 +2347,14 @@ fn handleChatCompletions(
     var local_ve: ?mlx.mlx_array = null;
     defer { if (local_ve) |arr| _ = mlx.mlx_array_free(arr); }
     if (lm.vision_encoder) |ve| {
-        local_ve = processVisionImages(allocator, lm, ve, messages.items) catch |err| blk: {
+        var n_vis: usize = 0;
+        var n_aud: usize = 0;
+        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_aud) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
-        if (local_ve) |arr| {
-            const ve_shape = mlx.getShape(arr);
-            const n_img_tokens: usize = @intCast(ve_shape[1]);
-            const new_ids = try insertImageTokens(allocator, prompt_ids_raw, config.image_token_id, n_img_tokens, config);
+        if (local_ve != null) {
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -4432,30 +4457,36 @@ fn processVisionImages(
     lm: *LoadedModel,
     vision_enc: *VisionEncoder,
     msgs: []const chat_mod.Message,
+    out_n_vision: *usize,
+    out_n_audio: *usize,
 ) !?mlx.mlx_array {
-    // Only process images from the LAST user message.
-    // Previous turns' images were already processed in their original request;
-    // re-processing them wastes context and causes stale feature confusion.
+    out_n_vision.* = 0;
+    out_n_audio.* = 0;
+    // Only process media from the LAST user message. Previous turns' images /
+    // audio were already processed in their original request; re-processing
+    // wastes context and causes stale feature confusion.
     var last_user_images: ?[]const chat_mod.ImageData = null;
+    var last_user_audio: ?[]const chat_mod.AudioData = null;
     var i = msgs.len;
     while (i > 0) {
         i -= 1;
         if (std.mem.eql(u8, msgs[i].role, "user")) {
             last_user_images = msgs[i].images;
+            last_user_audio = msgs[i].audio;
             break;
         }
     }
 
-    const images = last_user_images orelse return null;
-    if (images.len == 0) return null;
+    const images: []const chat_mod.ImageData = last_user_images orelse &.{};
+    const audio: []const chat_mod.AudioData = last_user_audio orelse &.{};
+    if (images.len == 0 and audio.len == 0) return null;
 
-    log.info("Vision: processing {d} image(s)\n", .{images.len});
+    log.info("Multimodal: processing {d} image(s), {d} audio clip(s)\n", .{ images.len, audio.len });
 
-    // Phase A4: route vision encoding to the scheduler's inference thread
-    // when available. Conn thread only decodes pixels (already done by the
-    // upstream chat-template parser); the mlx ops (array construction,
-    // VisionEncoder.forward, concatenation) run on the inference thread so
-    // we don't disturb the JIT-compiled stream binding.
+    // Phase A4: route encoding to the scheduler's inference thread when
+    // available. Conn thread only decodes pixels/PCM (CPU); the mlx ops
+    // (array construction, encoder forward, concatenation) run on the
+    // inference thread so we don't disturb the JIT-compiled stream binding.
     if (global_scheduler) |sch| {
         var pix_list = std.ArrayList(scheduler_mod.VisionImagePixels).empty;
         defer pix_list.deinit(allocator);
@@ -4467,9 +4498,14 @@ fn processVisionImages(
                 .height = @intCast(img.height),
             });
         }
+        var aud_list = std.ArrayList([]const u8).empty;
+        defer aud_list.deinit(allocator);
+        try aud_list.ensureTotalCapacity(allocator, audio.len);
+        for (audio) |a| aud_list.appendAssumeCapacity(a.samples);
         var req = scheduler_mod.VisionEncodeRequest{
             .model = lm,
             .images = pix_list.items,
+            .audio = aud_list.items,
             .allocator = allocator,
         };
         const arr = sch.encodeVision(&req) catch |err| {
@@ -4479,9 +4515,11 @@ fn processVisionImages(
             }
             return err;
         };
+        out_n_vision.* = req.n_vision_tokens;
+        out_n_audio.* = req.n_audio_tokens;
         const ve_shape = mlx.getShape(arr);
         if (ve_shape.len >= 3) {
-            log.info("  Vision: {d} image(s) → [{d},{d},{d}] tokens\n", .{ images.len, ve_shape[0], ve_shape[1], ve_shape[2] });
+            log.info("  Multimodal: → [{d},{d},{d}] tokens ({d} vision + {d} audio)\n", .{ ve_shape[0], ve_shape[1], ve_shape[2], req.n_vision_tokens, req.n_audio_tokens });
         }
         return arr;
     }
@@ -4502,26 +4540,42 @@ fn processVisionImages(
         const pixel_arr = mlx.mlx_array_new_data(img.pixels.ptr, &shape, 4, .float32);
         defer _ = mlx.mlx_array_free(pixel_arr);
         const emb = try vision_enc.forward(pixel_arr);
+        const es = mlx.getShape(emb);
+        out_n_vision.* += @intCast(es[1]);
         try emb_parts.append(allocator, emb);
     }
 
+    for (audio) |clip| {
+        const n_samples = clip.samples.len / 4;
+        if (n_samples == 0) continue;
+        const spt: usize = if (lm.config.?.audio_samples_per_token > 0) lm.config.?.audio_samples_per_token else 640;
+        const n_frames = (n_samples + spt - 1) / spt;
+        const padded = n_frames * spt;
+        const buf = try allocator.alloc(f32, padded);
+        @memset(buf, 0);
+        @memcpy(std.mem.sliceAsBytes(buf)[0..clip.samples.len], clip.samples);
+        const shape = [_]c_int{ 1, @intCast(n_frames), @intCast(spt) };
+        const frames_arr = mlx.mlx_array_new_data(buf.ptr, &shape, 3, .float32);
+        allocator.free(buf);
+        defer _ = mlx.mlx_array_free(frames_arr);
+        const emb = try vision_enc.forwardAudio(frames_arr);
+        out_n_audio.* += n_frames;
+        try emb_parts.append(allocator, emb);
+    }
+
+    if (emb_parts.items.len == 0) return null;
     if (emb_parts.items.len == 1) {
-        // Single image — return directly. Detach from emb_parts so the
-        // defer-free above doesn't claim it.
+        // Single part — return directly. Detach so the defer-free skips it.
         const out = emb_parts.items[0];
-        const ve_shape = mlx.getShape(out);
-        log.debug("  Vision: [{d},{d},{d}] tokens\n", .{ ve_shape[0], ve_shape[1], ve_shape[2] });
         emb_parts.items[0] = mlx.mlx_array_new();
         return out;
     }
 
-    // Multiple images — concatenate along token dim (axis=1)
+    // Multiple parts (vision + audio, or multiple clips) — concat along tokens.
     const cat_vec = mlx.mlx_vector_array_new_data(emb_parts.items.ptr, emb_parts.items.len);
     defer _ = mlx.mlx_vector_array_free(cat_vec);
     var combined = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_concatenate_axis(&combined, cat_vec, 1, vision_enc.s));
-    const ve_shape = mlx.getShape(combined);
-    log.info("  Vision: {d} images → [{d},{d},{d}] tokens\n", .{ emb_parts.items.len, ve_shape[0], ve_shape[1], ve_shape[2] });
     return combined;
 }
 
@@ -4581,6 +4635,86 @@ fn insertImageTokens(allocator: std.mem.Allocator, prompt_ids: []const u32, imag
         if (has_boi) "BOI + " else "", n_tokens, if (has_eoi) " + EOI" else "", insert_pos, prompt_ids.len, new_len,
     });
     return result;
+}
+
+/// Locate the byte offset just after the last user-turn marker in `prompt_ids`.
+/// Mirrors insertImageTokens' search; shared by the multimodal inserter.
+fn userTurnInsertPos(prompt_ids: []const u32, config: *const model_mod.ModelConfig) usize {
+    const marker = config.userTurnMarkerSlice();
+    if (marker.len > 0 and prompt_ids.len >= marker.len) {
+        var i = prompt_ids.len - marker.len;
+        while (true) {
+            if (std.mem.eql(u32, prompt_ids[i .. i + marker.len], marker)) return i + marker.len;
+            if (i == 0) break;
+            i -= 1;
+        }
+    }
+    return if (prompt_ids.len > 5) prompt_ids.len - 5 else 0;
+}
+
+/// Insert an image block (BOI + n_image × image_token + EOI) followed by an
+/// audio block (BOA + n_audio × audio_token + EOA) at the last user turn. The
+/// block order MUST match the [vision ; audio] concatenation order of the
+/// soft-token embedding so the splice scatters each row into its slot.
+/// Gemma 4 12B unified routes both modalities through one splice channel.
+fn insertMultimodalTokens(
+    allocator: std.mem.Allocator,
+    prompt_ids: []const u32,
+    image_token_id: u32,
+    n_image: usize,
+    audio_token_id: u32,
+    n_audio: usize,
+    config: *const model_mod.ModelConfig,
+) ![]u32 {
+    const want_image = image_token_id != 0 and n_image > 0;
+    const want_audio = audio_token_id != 0 and n_audio > 0;
+    if (!want_image and !want_audio) return try allocator.dupe(u32, prompt_ids);
+
+    const insert_pos = userTurnInsertPos(prompt_ids, config);
+
+    const boi = config.boi_token_id;
+    const eoi = config.eoi_token_id;
+    const boa = config.boa_token_id;
+    const eoa = config.eoa_token_id;
+
+    var seg = std.ArrayList(u32).empty;
+    defer seg.deinit(allocator);
+    if (want_image) {
+        if (boi > 0) try seg.append(allocator, boi);
+        try seg.appendNTimes(allocator, image_token_id, n_image);
+        if (eoi > 0) try seg.append(allocator, eoi);
+    }
+    if (want_audio) {
+        if (boa > 0) try seg.append(allocator, boa);
+        try seg.appendNTimes(allocator, audio_token_id, n_audio);
+        if (eoa > 0) try seg.append(allocator, eoa);
+    }
+
+    const new_len = prompt_ids.len + seg.items.len;
+    const result = try allocator.alloc(u32, new_len);
+    @memcpy(result[0..insert_pos], prompt_ids[0..insert_pos]);
+    @memcpy(result[insert_pos .. insert_pos + seg.items.len], seg.items);
+    @memcpy(result[insert_pos + seg.items.len ..], prompt_ids[insert_pos..]);
+
+    log.info("  Inserted {d} image + {d} audio soft tokens at position {d} (prompt: {d} -> {d} tokens)\n", .{ n_image, n_audio, insert_pos, prompt_ids.len, new_len });
+    return result;
+}
+
+/// Decode an `input_audio.data` payload into raw float32-LE PCM samples for the
+/// Gemma 4 12B unified audio embedder. Accepts a bare base64 string or a
+/// `data:audio/...;base64,...` URL. The decoded bytes are interpreted as
+/// little-endian float32 mono samples at 16 kHz (the client resamples). Returns
+/// null on decode failure or a non-multiple-of-4 byte length.
+fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.AudioData {
+    const b64 = if (std.mem.indexOf(u8, data, ";base64,")) |sep| data[sep + 8 ..] else data;
+    const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64) catch return null;
+    if (decoded_size == 0 or decoded_size % 4 != 0) return null;
+    const raw_buf = allocator.alloc(u8, decoded_size) catch return null;
+    std.base64.standard.Decoder.decode(raw_buf, b64) catch {
+        allocator.free(raw_buf);
+        return null;
+    };
+    return .{ .samples = raw_buf };
 }
 
 /// Decode a JPEG/PNG image buffer to float32 CHW pixels, resized to target_size.
@@ -5250,14 +5384,14 @@ fn handleAnthropicMessages(
     var local_ve: ?mlx.mlx_array = null;
     defer { if (local_ve) |arr| _ = mlx.mlx_array_free(arr); }
     if (lm.vision_encoder) |ve| {
-        local_ve = processVisionImages(allocator, lm, ve, messages.items) catch |err| blk: {
+        var n_vis: usize = 0;
+        var n_aud: usize = 0;
+        local_ve = processVisionImages(allocator, lm, ve, messages.items, &n_vis, &n_aud) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
-        if (local_ve) |arr| {
-            const ve_shape = mlx.getShape(arr);
-            const n_img_tokens: usize = @intCast(ve_shape[1]);
-            const new_ids = try insertImageTokens(allocator, prompt_ids_raw, config.image_token_id, n_img_tokens, config);
+        if (local_ve != null) {
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -6470,14 +6604,14 @@ fn handleResponses(
     var local_ve: ?mlx.mlx_array = null;
     defer { if (local_ve) |arr| _ = mlx.mlx_array_free(arr); }
     if (lm.vision_encoder) |ve| {
-        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items) catch |err| blk: {
+        var n_vis: usize = 0;
+        var n_aud: usize = 0;
+        local_ve = processVisionImages(allocator, lm, ve, pi.messages.items, &n_vis, &n_aud) catch |err| blk: {
             log.warn("Vision encoding failed: {}\n", .{err});
             break :blk null;
         };
-        if (local_ve) |arr| {
-            const ve_shape = mlx.getShape(arr);
-            const n_img_tokens: usize = @intCast(ve_shape[1]);
-            const new_ids = try insertImageTokens(allocator, prompt_ids_raw, config.image_token_id, n_img_tokens, config);
+        if (local_ve != null) {
+            const new_ids = try insertMultimodalTokens(allocator, prompt_ids_raw, config.image_token_id, n_vis, config.audio_token_id, n_aud, config);
             allocator.free(prompt_ids_raw);
             prompt_ids_raw = new_ids;
         }
@@ -8543,6 +8677,77 @@ test "insertImageTokens is a no-op when image_token_id or n_tokens is zero" {
     const out_zero_n = try insertImageTokens(testing.allocator, &prompt, 999, 0, &config);
     defer testing.allocator.free(out_zero_n);
     try testing.expectEqualSlices(u32, &prompt, out_zero_n);
+}
+
+test "insertMultimodalTokens lays out image block then audio block at the user turn" {
+    // Gemma 4 12B unified: the image placeholder block MUST precede the audio
+    // block so a single splice scatters the [vision ; audio] embedding in order.
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_ids[1] = 2364;
+    config.user_turn_marker_ids[2] = 107;
+    config.user_turn_marker_len = 3;
+    config.boi_token_id = 200; // BOI
+    config.eoi_token_id = 201; // EOI
+    config.boa_token_id = 300; // BOA
+    config.eoa_token_id = 301; // EOA
+
+    const prompt = [_]u32{ 2, 500, 105, 2364, 107, 900, 901 };
+    // image_token=999 ×2, audio_token=888 ×3.
+    const out = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 888, 3, &config);
+    defer testing.allocator.free(out);
+
+    // Inserted after marker (position 5): [BOI 999 999 EOI][BOA 888 888 888 EOA].
+    const expected = [_]u32{
+        2,   500, 105, 2364, 107,
+        200, 999, 999, 201, // image block
+        300, 888, 888, 888, 301, // audio block
+        900, 901,
+    };
+    try testing.expectEqualSlices(u32, &expected, out);
+}
+
+test "insertMultimodalTokens handles audio-only and image-only" {
+    var config = model_mod.ModelConfig{};
+    config.user_turn_marker_ids[0] = 105;
+    config.user_turn_marker_len = 1;
+    config.boi_token_id = 200;
+    config.eoi_token_id = 201;
+    config.boa_token_id = 300;
+    config.eoa_token_id = 301;
+    const prompt = [_]u32{ 1, 105, 7 };
+
+    // Audio only (n_image=0) → just the audio block.
+    const ao = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 888, 2, &config);
+    defer testing.allocator.free(ao);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 300, 888, 888, 301, 7 }, ao);
+
+    // Image only (n_audio=0) → just the image block.
+    const io = try insertMultimodalTokens(testing.allocator, &prompt, 999, 2, 888, 0, &config);
+    defer testing.allocator.free(io);
+    try testing.expectEqualSlices(u32, &[_]u32{ 1, 105, 200, 999, 999, 201, 7 }, io);
+
+    // Neither → unchanged.
+    const none = try insertMultimodalTokens(testing.allocator, &prompt, 999, 0, 888, 0, &config);
+    defer testing.allocator.free(none);
+    try testing.expectEqualSlices(u32, &prompt, none);
+}
+
+test "parseAudioContent decodes base64 float32 PCM and rejects bad lengths" {
+    // 2 float32 samples = 8 bytes. base64 of 8 zero bytes = "AAAAAAAAAAA=".
+    const eight_zeros = "AAAAAAAAAAA=";
+    const aud = parseAudioContent(testing.allocator, eight_zeros) orelse return error.TestUnexpectedNull;
+    defer testing.allocator.free(aud.samples);
+    try testing.expectEqual(@as(usize, 8), aud.samples.len);
+
+    // A data-URL prefix is tolerated.
+    const with_prefix = "data:audio/x-mlx-pcm;base64," ++ eight_zeros;
+    const aud2 = parseAudioContent(testing.allocator, with_prefix) orelse return error.TestUnexpectedNull;
+    defer testing.allocator.free(aud2.samples);
+    try testing.expectEqual(@as(usize, 8), aud2.samples.len);
+
+    // 6 decoded bytes is not a whole number of float32s → rejected.
+    try testing.expect(parseAudioContent(testing.allocator, "AAAAAAAA") == null);
 }
 
 // --- /props payload regression ------------------------------------------------

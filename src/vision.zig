@@ -43,6 +43,40 @@ const VisionLayerWeights = struct {
     down_proj: LinearWeight,
 };
 
+// ── Gemma 4 12B "unified" (encoder-free) embedder ──
+// Vision and audio inputs are projected straight into language-model space —
+// there is no SigLIP transformer tower and no conformer. Vision: raw 48×48 RGB
+// patches → LayerNorm → Dense → LayerNorm → +factorized 2D posemb → LayerNorm →
+// RMSNorm → Linear. Audio: raw 640-sample frames → RMSNorm → Linear. Reference:
+// transformers Gemma4UnifiedVisionEmbedder / Gemma4UnifiedMultimodalEmbedder.
+const UnifiedWeights = struct {
+    // Patch embedder (nn.LayerNorm has weight+bias; eps 1e-5).
+    patch_ln1_w: mlx.mlx_array, // [6912]
+    patch_ln1_b: mlx.mlx_array,
+    patch_dense_w: mlx.mlx_array, // quant linear 6912 → mm_embed_dim
+    patch_dense_s: mlx.mlx_array,
+    patch_dense_b: mlx.mlx_array,
+    patch_dense_bias: mlx.mlx_array, // [mm_embed_dim] additive bias
+    patch_dense_bits: u32,
+    patch_ln2_w: mlx.mlx_array, // [mm_embed_dim]
+    patch_ln2_b: mlx.mlx_array,
+    pos_embedding: mlx.mlx_array, // [posemb_size, 2, mm_embed_dim]
+    pos_norm_w: mlx.mlx_array, // [mm_embed_dim]
+    pos_norm_b: mlx.mlx_array,
+    // embed_vision projection (RMSNorm-noscale → Linear, no bias).
+    ev_w: mlx.mlx_array,
+    ev_s: mlx.mlx_array,
+    ev_b: mlx.mlx_array,
+    ev_bits: u32,
+    // embed_audio projection (RMSNorm-noscale → Linear, no bias). Optional —
+    // present only when the checkpoint ships audio weights and --no-vision off.
+    ea_w: ?mlx.mlx_array,
+    ea_s: mlx.mlx_array,
+    ea_b: mlx.mlx_array,
+    ea_bits: u32,
+    model_patch_size: c_int, // 48
+};
+
 // ── Vision Encoder ──
 // Matches mlx-vlm's Gemma4 VisionModel: SigLIP encoder with 2D RoPE,
 // clipped linears, V-norm, position-based pooling, post-projection norm.
@@ -76,7 +110,12 @@ pub const VisionEncoder = struct {
     half: mlx.mlx_array,
     one: mlx.mlx_array,
 
+    // Gemma 4 12B encoder-free path. When set, `forward`/`forwardAudio` use the
+    // unified embedder and all SigLIP fields above are unused sentinels.
+    unified: ?UnifiedWeights = null,
+
     pub fn init(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        if (config.is_gemma4_unified) return initUnified(allocator, config, weights);
         const s = mlx.mlx_default_gpu_stream_new();
 
         var name_buf: [256]u8 = undefined;
@@ -200,10 +239,264 @@ pub const VisionEncoder = struct {
         _ = mlx.mlx_stream_free(self.s);
     }
 
+    /// True when this encoder can embed audio — i.e. the Gemma 4 12B unified
+    /// checkpoint shipped `embed_audio.*` weights. Drives the `audio` capability
+    /// reported by /v1/models so the app only offers the mic on audio models.
+    pub fn supportsAudio(self: *const VisionEncoder) bool {
+        return if (self.unified) |u| u.ea_w != null else false;
+    }
+
+    // ── Gemma 4 12B unified (encoder-free) ──
+
+    /// Build a VisionEncoder that holds only the unified patch/audio embedders.
+    /// SigLIP fields are sentinels; `unified` drives forward().
+    fn initUnified(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !VisionEncoder {
+        const s = mlx.mlx_default_gpu_stream_new();
+        var nb: [256]u8 = undefined;
+
+        const dense_w = getWeight(weights, &nb, "vision_embedder.patch_dense.weight") orelse {
+            log.err("MISSING WEIGHT: vision_embedder.patch_dense.weight\n", .{});
+            return error.MissingVisionWeights;
+        };
+        const dense_s = getWeight(weights, &nb, "vision_embedder.patch_dense.scales") orelse mlx.mlx_array_new();
+        const dense_b = getWeight(weights, &nb, "vision_embedder.patch_dense.biases") orelse mlx.mlx_array_new();
+        const ev_w = getWeight(weights, &nb, "embed_vision.embedding_projection.weight") orelse {
+            log.err("MISSING WEIGHT: embed_vision.embedding_projection.weight\n", .{});
+            return error.MissingVisionWeights;
+        };
+        const ev_s = getWeight(weights, &nb, "embed_vision.embedding_projection.scales") orelse mlx.mlx_array_new();
+        const ev_b = getWeight(weights, &nb, "embed_vision.embedding_projection.biases") orelse mlx.mlx_array_new();
+        const ea_w = getWeight(weights, &nb, "embed_audio.embedding_projection.weight");
+        const ea_s = getWeight(weights, &nb, "embed_audio.embedding_projection.scales") orelse mlx.mlx_array_new();
+        const ea_b = getWeight(weights, &nb, "embed_audio.embedding_projection.biases") orelse mlx.mlx_array_new();
+
+        const gs = config.quant_group_size;
+        const unified = UnifiedWeights{
+            .patch_ln1_w = getWeight(weights, &nb, "vision_embedder.patch_ln1.weight").?,
+            .patch_ln1_b = getWeight(weights, &nb, "vision_embedder.patch_ln1.bias").?,
+            .patch_dense_w = dense_w,
+            .patch_dense_s = dense_s,
+            .patch_dense_b = dense_b,
+            .patch_dense_bias = getWeight(weights, &nb, "vision_embedder.patch_dense.bias").?,
+            .patch_dense_bits = detectProjBits(dense_w, dense_s, gs),
+            .patch_ln2_w = getWeight(weights, &nb, "vision_embedder.patch_ln2.weight").?,
+            .patch_ln2_b = getWeight(weights, &nb, "vision_embedder.patch_ln2.bias").?,
+            .pos_embedding = getWeight(weights, &nb, "vision_embedder.pos_embedding").?,
+            .pos_norm_w = getWeight(weights, &nb, "vision_embedder.pos_norm.weight").?,
+            .pos_norm_b = getWeight(weights, &nb, "vision_embedder.pos_norm.bias").?,
+            .ev_w = ev_w,
+            .ev_s = ev_s,
+            .ev_b = ev_b,
+            .ev_bits = detectProjBits(ev_w, ev_s, gs),
+            .ea_w = ea_w,
+            .ea_s = ea_s,
+            .ea_b = ea_b,
+            .ea_bits = if (ea_w) |w| detectProjBits(w, ea_s, gs) else 4,
+            .model_patch_size = @intCast(if (config.vision_model_patch_size > 0) config.vision_model_patch_size else 48),
+        };
+
+        log.info("Vision encoder: Gemma 4 12B unified (encoder-free), patch={d}px, mm_embed_dim={d}, posemb={d}{s}\n", .{
+            unified.model_patch_size, config.vision_mm_embed_dim, config.vision_mm_posemb_size,
+            if (ea_w != null) ", +audio" else "",
+        });
+
+        return .{
+            .config = config,
+            .s = s,
+            .allocator = allocator,
+            .patch_proj_w = mlx.mlx_array_new(),
+            .position_embedding = mlx.mlx_array_new(),
+            .layers = &.{},
+            .proj_w = mlx.mlx_array_new(),
+            .proj_s = mlx.mlx_array_new(),
+            .proj_b = mlx.mlx_array_new(),
+            .proj_quant_bits = 4,
+            .proj_quant_group_size = gs,
+            .std_scale = null,
+            .std_bias = null,
+            .rms_eps = 1e-6, // embed_{vision,audio} pre-projection RMSNorm eps
+            .half = bf16Scalar(0.5, s),
+            .one = bf16Scalar(1.0, s),
+            .unified = unified,
+        };
+    }
+
+    /// Apply a quantized (or dense) Linear y = x · Wᵀ (+ optional bias). `sc`
+    /// non-empty (ndim>0) selects the quantized path; otherwise a plain matmul.
+    fn quantLinear(self: *VisionEncoder, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, qb: mlx.mlx_array, bits: u32, bias: ?mlx.mlx_array) !mlx.mlx_array {
+        var out = mlx.mlx_array_new();
+        if (mlx.mlx_array_ndim(sc) > 0) {
+            try mlx.check(mlx.mlx_quantized_matmul(
+                &out, x, w, sc, qb, true,
+                mlx.mlx_optional_int.some(@intCast(self.proj_quant_group_size)),
+                mlx.mlx_optional_int.some(@intCast(bits)), "affine", self.s,
+            ));
+        } else {
+            var wt = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wt);
+            try mlx.check(mlx.mlx_transpose(&wt, w, self.s));
+            try mlx.check(mlx.mlx_matmul(&out, x, wt, self.s));
+        }
+        if (bias) |bvec| {
+            var biased = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&biased, out, bvec, self.s));
+            _ = mlx.mlx_array_free(out);
+            out = biased;
+        }
+        return out;
+    }
+
+    /// nn.LayerNorm (weight + bias) over the last dim, eps 1e-5.
+    fn layerNorm(self: *VisionEncoder, x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array) !mlx.mlx_array {
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_fast_layer_norm(&out, x, w, b, 1e-5, self.s));
+        return out;
+    }
+
+    /// Gemma 4 12B unified vision forward: pixels [1,3,H,W] (H,W multiples of
+    /// model_patch_size, rescaled to ~[0,1]) → soft tokens [1, L, mm_embed_dim],
+    /// L = (H/P)·(W/P). Caller inserts exactly L image placeholder tokens.
+    fn forwardUnified(self: *VisionEncoder, u: *const UnifiedWeights, pixels: mlx.mlx_array) !mlx.mlx_array {
+        const P = u.model_patch_size;
+        const pix_shape = mlx.getShape(pixels);
+        const batch = pix_shape[0];
+        const height = pix_shape[2];
+        const width = pix_shape[3];
+        const grid_h = @divExact(height, P);
+        const grid_w = @divExact(width, P);
+        const L = grid_h * grid_w;
+
+        // 1. Patchify into 48×48 (H,W,C)-ordered patches: [1, L, 3*P*P].
+        const patches = try self.patchify(pixels, batch, grid_h, grid_w, P);
+        defer _ = mlx.mlx_array_free(patches);
+        var h = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&h, patches, .bfloat16, self.s));
+
+        // 2. Patch embed: LN1 → Dense(+bias) → LN2.
+        {
+            const t = try self.layerNorm(h, u.patch_ln1_w, u.patch_ln1_b);
+            _ = mlx.mlx_array_free(h);
+            h = t;
+        }
+        {
+            const t = try self.quantLinear(h, u.patch_dense_w, u.patch_dense_s, u.patch_dense_b, u.patch_dense_bits, u.patch_dense_bias);
+            _ = mlx.mlx_array_free(h);
+            h = t;
+        }
+
+        {
+            const t = try self.layerNorm(h, u.patch_ln2_w, u.patch_ln2_b);
+            _ = mlx.mlx_array_free(h);
+            h = t;
+        }
+
+        // 3. Add factorized 2D position embeddings, then LN.
+        {
+            const pos = try self.factorizedPosEmb(u, grid_h, grid_w, batch);
+            defer _ = mlx.mlx_array_free(pos);
+            var hp = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&hp, h, pos, self.s));
+            _ = mlx.mlx_array_free(h);
+            h = hp;
+        }
+        {
+            const t = try self.layerNorm(h, u.pos_norm_w, u.pos_norm_b);
+            _ = mlx.mlx_array_free(h);
+            h = t;
+        }
+
+        // 4. embed_vision: parameter-free RMSNorm → Linear (no bias).
+        {
+            const normed = try self.rmsNormNoScale(h);
+            _ = mlx.mlx_array_free(h);
+            defer _ = mlx.mlx_array_free(normed);
+            h = try self.quantLinear(normed, u.ev_w, u.ev_s, u.ev_b, u.ev_bits, null);
+        }
+        _ = L;
+        return h;
+    }
+
+    /// Build factorized 2D position embeddings for an L=grid_h·grid_w patch grid.
+    /// pos[i] = pos_embedding[x_i, 0, :] + pos_embedding[y_i, 1, :], where
+    /// i = row·grid_w + col, x=col, y=row. Returns [batch, L, mm_embed_dim].
+    fn factorizedPosEmb(self: *VisionEncoder, u: *const UnifiedWeights, grid_h: c_int, grid_w: c_int, batch: c_int) !mlx.mlx_array {
+        const L: usize = @intCast(grid_h * grid_w);
+        const gw: usize = @intCast(grid_w);
+        // Host-build x (col) and y (row) index arrays.
+        var xs = try self.allocator.alloc(i32, L);
+        defer self.allocator.free(xs);
+        var ys = try self.allocator.alloc(i32, L);
+        defer self.allocator.free(ys);
+        for (0..L) |i| {
+            xs[i] = @intCast(i % gw);
+            ys[i] = @intCast(i / gw);
+        }
+        const idx_shape = [_]c_int{@intCast(L)};
+        const x_idx = mlx.mlx_array_new_data(xs.ptr, &idx_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(x_idx);
+        const y_idx = mlx.mlx_array_new_data(ys.ptr, &idx_shape, 1, .int32);
+        defer _ = mlx.mlx_array_free(y_idx);
+
+        // pos_embedding: [posemb_size, 2, mm_embed_dim]. Split axis-1 into the
+        // x-table (index 0) and y-table (index 1), each [posemb_size, mm_embed_dim].
+        const pe_shape = mlx.getShape(u.pos_embedding);
+        const pos_size = pe_shape[0];
+        const dim = pe_shape[2];
+        const table_x = try sliceAxis1(self, u.pos_embedding, 0, pos_size, dim);
+        defer _ = mlx.mlx_array_free(table_x);
+        const table_y = try sliceAxis1(self, u.pos_embedding, 1, pos_size, dim);
+        defer _ = mlx.mlx_array_free(table_y);
+
+        var px = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(px);
+        try mlx.check(mlx.mlx_take_axis(&px, table_x, x_idx, 0, self.s)); // [L, dim]
+        var py = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(py);
+        try mlx.check(mlx.mlx_take_axis(&py, table_y, y_idx, 0, self.s)); // [L, dim]
+        var pos = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(pos);
+        try mlx.check(mlx.mlx_add(&pos, px, py, self.s)); // [L, dim]
+
+        // Reshape to [batch, L, dim] (batch is 1 for the per-image call).
+        const out_shape = [_]c_int{ batch, @intCast(L), dim };
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&out, pos, &out_shape, 3, self.s));
+        return out;
+    }
+
+    /// Slice `[N, 2, D]` at axis-1 index `i` → `[N, D]`.
+    fn sliceAxis1(self: *VisionEncoder, a: mlx.mlx_array, i: c_int, n: c_int, d: c_int) !mlx.mlx_array {
+        const start = [_]c_int{ 0, i, 0 };
+        const stop = [_]c_int{ n, i + 1, d };
+        const strides = [_]c_int{ 1, 1, 1 };
+        var sl = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sl);
+        try mlx.check(mlx.mlx_slice(&sl, a, &start, 3, &stop, 3, &strides, 3, self.s));
+        const flat = [_]c_int{ n, d };
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&out, sl, &flat, 2, self.s));
+        return out;
+    }
+
+    /// Gemma 4 12B unified audio forward: frames [1, N, 640] (raw 16 kHz samples,
+    /// 640/token) → soft tokens [1, N, mm_embed_dim] via RMSNorm → Linear.
+    /// Returns error.AudioNotSupported if the checkpoint shipped no audio weights.
+    pub fn forwardAudio(self: *VisionEncoder, frames: mlx.mlx_array) !mlx.mlx_array {
+        const u = self.unified orelse return error.AudioNotSupported;
+        const ea_w = u.ea_w orelse return error.AudioNotSupported;
+        var h = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&h, frames, .bfloat16, self.s));
+        const normed = try self.rmsNormNoScale(h);
+        _ = mlx.mlx_array_free(h);
+        defer _ = mlx.mlx_array_free(normed);
+        return self.quantLinear(normed, ea_w, u.ea_s, u.ea_b, u.ea_bits, null);
+    }
+
     /// Forward pass: pixel data [B, 3, H, W] float32 → vision embeddings [B, N_out, text_hidden_size].
     /// N_out is the number of valid pooled tokens (e.g. 25 for 224x224 with kernel=3).
     /// The caller must cycle these to fill the expected image_seq_length (280) token positions.
     pub fn forward(self: *VisionEncoder, pixels: mlx.mlx_array) !mlx.mlx_array {
+        if (self.unified) |u| return self.forwardUnified(&u, pixels);
         const cfg = &self.config;
         const ps: c_int = @intCast(cfg.vision_patch_size);
         const hidden: c_int = @intCast(cfg.vision_hidden_size);
@@ -1190,4 +1483,28 @@ test "patch normalization" {
     try testing.expectEqual(@as(f32, -1.0), 2.0 * (0.0 - 0.5));
     try testing.expectEqual(@as(f32, 0.0), 2.0 * (0.5 - 0.5));
     try testing.expectEqual(@as(f32, 1.0), 2.0 * (1.0 - 0.5));
+}
+
+test "unified patchify produces [1, gh*gw, 3*P*P] model patches" {
+    // Gemma 4 12B patchifies directly at the 48px model-patch size. Verify the
+    // reshape arithmetic: a 96×48 image at P=48 → gh=2, gw=1 → 2 patches of
+    // 3*48*48 = 6912 dims each. (Byte-level ordering vs the reference 16px+merge
+    // pipeline is proven by the Python equivalence harness.)
+    var enc: VisionEncoder = undefined;
+    enc.s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(enc.s);
+
+    const P: c_int = 48;
+    const pix_shape = [_]c_int{ 1, 3, 96, 48 };
+    var pixels = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(pixels);
+    try mlx.check(mlx.mlx_zeros(&pixels, &pix_shape, 4, .float32, enc.s));
+
+    const out = try enc.patchify(pixels, 1, 2, 1, P);
+    defer _ = mlx.mlx_array_free(out);
+    const shape = mlx.getShape(out);
+    try testing.expectEqual(@as(usize, 3), shape.len);
+    try testing.expectEqual(@as(c_int, 1), shape[0]);
+    try testing.expectEqual(@as(c_int, 2), shape[1]); // gh*gw
+    try testing.expectEqual(@as(c_int, 3 * 48 * 48), shape[2]); // 6912
 }

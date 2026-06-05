@@ -42,6 +42,20 @@ struct MLXCoreApp: App {
         return tinted
     }
 
+    /// Accent-tinted variant of the tray icon, shown while the voice assistant
+    /// is running so the menu bar reflects the active session at a glance.
+    private static let activeMenuBarIcon: NSImage = {
+        let base = menuBarIcon
+        let tinted = NSImage(size: base.size, flipped: false) { rect in
+            base.draw(in: rect)
+            NSColor.controlAccentColor.set()
+            rect.fill(using: .sourceAtop)
+            return true
+        }
+        tinted.isTemplate = false
+        return tinted
+    }()
+
     private func openAndFocus(_ id: String) {
         openWindow(id: id)
         NSApplication.shared.activate(ignoringOtherApps: true)
@@ -53,6 +67,7 @@ struct MLXCoreApp: App {
             case "modelBrowser": title = "Model Browser"
             case "imageGen": title = "Image Generation"
             case "videoGen": title = "Video Generation"
+            case "audioGen": title = "Audio Generation"
             case "settings": title = "Settings"
             case "serverLog": title = "Server Log"
             default: title = "Browser"
@@ -71,6 +86,7 @@ struct MLXCoreApp: App {
                 openModelBrowser: { openAndFocus("modelBrowser") },
                 openImageGen: { openAndFocus("imageGen") },
                 openVideoGen: { openAndFocus("videoGen") },
+                openAudioGen: { openAndFocus("audioGen") },
                 openSettings: { openAndFocus("settings") },
                 openServerLog: { openAndFocus("serverLog") }
             )
@@ -78,8 +94,13 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.server)
                 .environmentObject(appState.downloads)
                 .environmentObject(appState.python)
+                .environmentObject(appState.voice)
         } label: {
-            Image(nsImage: menuBarIcon(for: appState.server.status))
+            // Observe the voice controller so the tray icon picks up the accent
+            // tint the instant a hands-free session starts or stops.
+            MenuBarLabel(idleIcon: menuBarIcon(for: appState.server.status),
+                         activeIcon: Self.activeMenuBarIcon,
+                         voice: appState.voice)
         }
         .menuBarExtraStyle(.window)
 
@@ -90,6 +111,8 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.toolExecutor)
                 .environmentObject(appState.agentMemory)
                 .environmentObject(appState.mcpManager)
+                .environmentObject(appState.chatEngine)
+                .environmentObject(appState.voice)
                 .frame(minWidth: 700, minHeight: 500)
                 .onDisappear {
                     Task { await appState.mcpManager.stopAll() }
@@ -126,6 +149,14 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.server)
         }
         .defaultSize(width: 960, height: 700)
+
+        Window("Audio Generation", id: "audioGen") {
+            AudioGenView()
+                .environmentObject(appState.python)
+                .environmentObject(appState.audioGen)
+                .environmentObject(appState.server)
+        }
+        .defaultSize(width: 900, height: 660)
 
         Window("Settings", id: "settings") {
             SettingsView()
@@ -169,5 +200,18 @@ struct MLXCoreApp: App {
                 }
             }
         }
+    }
+}
+
+/// Menu-bar label that swaps to an accent-tinted icon while the voice assistant
+/// is running. A tiny view so it can `@ObservedObject` the controller — the App
+/// scene's `label:` closure can't otherwise react to voice state changes.
+private struct MenuBarLabel: View {
+    let idleIcon: NSImage
+    let activeIcon: NSImage
+    @ObservedObject var voice: VoiceModeController
+
+    var body: some View {
+        Image(nsImage: voice.isActive ? activeIcon : idleIcon)
     }
 }

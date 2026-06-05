@@ -36,7 +36,7 @@ enum ToolApprovalChoice {
 /// three buttons. Allow / Deny resume the continuation with that choice;
 /// Always Allow flips a per-session flag (in the parent view) and resumes
 /// with `.allow`.
-private struct ToolApprovalSheet: View {
+struct ToolApprovalSheet: View {
     let request: ToolApprovalRequest
     let onAllow: () -> Void
     let onDeny: () -> Void
@@ -153,6 +153,129 @@ private struct ToolApprovalSheet: View {
         }
         .padding(20)
         .frame(width: 520)
+    }
+}
+
+/// Horizontal strip of pending attachment chips (images, PDFs, audio) shown
+/// above the message input. Extracted from `ChatDetailView` so its body stays
+/// within the Swift type-checker's complexity budget.
+private struct AttachmentPreviewRow: View {
+    @Binding var images: [NSImage]
+    @Binding var pdfs: [(name: String, text: String)]
+    @Binding var audio: [ChatAudio]
+
+    var body: some View {
+        ScrollView(.horizontal, showsIndicators: false) {
+            HStack(spacing: 6) {
+                ForEach(Array(images.enumerated()), id: \.offset) { idx, img in
+                    imageChip(idx: idx, img: img)
+                }
+                ForEach(Array(pdfs.enumerated()), id: \.offset) { idx, pdf in
+                    fileChip(idx: idx, name: pdf.name, detail: "PDF · \(pdf.text.count) chars",
+                             icon: "doc.text.fill", tint: .red) { pdfs.remove(at: idx) }
+                }
+                ForEach(Array(audio.enumerated()), id: \.offset) { idx, clip in
+                    fileChip(idx: idx, name: clip.name, detail: String(format: "Audio · %.1fs", clip.durationSeconds),
+                             icon: "waveform", tint: .purple) { audio.remove(at: idx) }
+                }
+            }
+            .padding(.horizontal, 4)
+        }
+        .frame(height: 64)
+    }
+
+    @ViewBuilder
+    private func removeButton(_ action: @escaping () -> Void) -> some View {
+        Button(action: action) {
+            Image(systemName: "xmark.circle.fill")
+                .font(.system(size: 14))
+                .foregroundStyle(.white)
+                .background(Circle().fill(.black.opacity(0.5)))
+        }
+        .buttonStyle(.plain)
+        .offset(x: 4, y: -4)
+    }
+
+    @ViewBuilder
+    private func imageChip(idx: Int, img: NSImage) -> some View {
+        ZStack(alignment: .topTrailing) {
+            Image(nsImage: img)
+                .resizable()
+                .aspectRatio(contentMode: .fill)
+                .frame(width: 56, height: 56)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+            removeButton { images.remove(at: idx) }
+        }
+    }
+
+    @ViewBuilder
+    private func fileChip(idx: Int, name: String, detail: String, icon: String, tint: Color, remove: @escaping () -> Void) -> some View {
+        ZStack(alignment: .topTrailing) {
+            HStack(spacing: 6) {
+                Image(systemName: icon)
+                    .font(.system(size: 18))
+                    .foregroundStyle(.white)
+                    .frame(width: 32, height: 32)
+                    .background(tint.opacity(0.85))
+                    .clipShape(RoundedRectangle(cornerRadius: 6))
+                VStack(alignment: .leading, spacing: 1) {
+                    Text(name)
+                        .font(.caption.weight(.medium))
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                    Text(detail)
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 8)
+            .padding(.vertical, 4)
+            .frame(maxWidth: 200, minHeight: 56, maxHeight: 56)
+            .background(Color.secondary.opacity(0.15))
+            .clipShape(RoundedRectangle(cornerRadius: 10))
+            removeButton(remove)
+        }
+    }
+}
+
+/// Record-audio button shown next to the paperclip on audio-capable models.
+/// Tap to start (mic icon), tap again to stop (red pill with elapsed time).
+private struct MicButton: View {
+    @ObservedObject var recorder: AudioRecorder
+    let toggle: () -> Void
+
+    var body: some View {
+        Button(action: toggle) {
+            HStack(spacing: 4) {
+                Image(systemName: recorder.isRecording ? "stop.fill" : "mic.fill")
+                    .font(.system(size: 12, weight: .medium))
+                if recorder.isRecording {
+                    Text(timeString(recorder.duration))
+                        .font(.caption2.monospacedDigit().weight(.medium))
+                }
+            }
+            .foregroundStyle(recorder.isRecording ? Color.white : Color.secondary)
+            .frame(minWidth: 28, minHeight: 28, maxHeight: 28)
+            .padding(.horizontal, recorder.isRecording ? 8 : 0)
+            .background(recorder.isRecording ? Color.red : Color.secondary.opacity(0.15))
+            .clipShape(Capsule())
+            .overlay(alignment: .leading) {
+                if recorder.isRecording {
+                    Circle().fill(Color.white.opacity(0.9))
+                        .frame(width: 5, height: 5)
+                        .scaleEffect(0.6 + 0.4 * CGFloat(recorder.level))
+                        .padding(.leading, 3)
+                        .allowsHitTesting(false)
+                }
+            }
+        }
+        .buttonStyle(.plain)
+        .help(recorder.isRecording ? "Stop recording and attach" : "Record audio for the model to hear")
+    }
+
+    private func timeString(_ t: TimeInterval) -> String {
+        let s = Int(t)
+        return String(format: "%d:%02d", s / 60, s % 60)
     }
 }
 
@@ -285,21 +408,23 @@ struct ChatDetailView: View {
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var toolExecutor: ToolExecutor
     @EnvironmentObject var mcpManager: MCPManager
+    @EnvironmentObject var chatEngine: ChatTurnEngine
     @Environment(\.openWindow) private var openWindow
     @State private var inputText = ""
-    @State private var isGenerating = false
     @State private var enableThinking = false
     @State private var isAgentMode = false
     @State private var showMCPMarketplace = false
+    @State private var showVoiceMode = false
     @State private var showThinkingInAgentConfirm = false
     @State private var executingPlanMessageId: UUID?
-    @State private var generationTask: Task<Void, Never>?
     @State private var isNearBottom = true
     @State private var scrollViewHeight: CGFloat = 0
     @State private var contentBottom: CGFloat = 0
     @State private var scrollMonitor: Any?
     @State private var pendingImages: [NSImage] = []
     @State private var pendingPDFs: [(name: String, text: String)] = []
+    @State private var pendingAudio: [ChatAudio] = []
+    @StateObject private var recorder = AudioRecorder()
     // Tool-approval gate state. `pendingApproval` is set right before each
     // tool call when Agent mode is on; the sheet at the bottom of `body`
     // observes it and resumes `approvalContinuation` with the user's choice.
@@ -385,69 +510,9 @@ struct ChatDetailView: View {
 
             // Input area — iMessage style
             VStack(spacing: 4) {
-                // Pending attachment thumbnails (images + PDFs)
-                if !pendingImages.isEmpty || !pendingPDFs.isEmpty {
-                    ScrollView(.horizontal, showsIndicators: false) {
-                        HStack(spacing: 6) {
-                            ForEach(Array(pendingImages.enumerated()), id: \.offset) { idx, img in
-                                ZStack(alignment: .topTrailing) {
-                                    Image(nsImage: img)
-                                        .resizable()
-                                        .aspectRatio(contentMode: .fill)
-                                        .frame(width: 56, height: 56)
-                                        .clipShape(RoundedRectangle(cornerRadius: 8))
-                                    Button {
-                                        pendingImages.remove(at: idx)
-                                    } label: {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .font(.system(size: 14))
-                                            .foregroundStyle(.white)
-                                            .background(Circle().fill(.black.opacity(0.5)))
-                                    }
-                                    .buttonStyle(.plain)
-                                    .offset(x: 4, y: -4)
-                                }
-                            }
-                            ForEach(Array(pendingPDFs.enumerated()), id: \.offset) { idx, pdf in
-                                ZStack(alignment: .topTrailing) {
-                                    HStack(spacing: 6) {
-                                        Image(systemName: "doc.text.fill")
-                                            .font(.system(size: 18))
-                                            .foregroundStyle(.white)
-                                            .frame(width: 32, height: 32)
-                                            .background(Color.red.opacity(0.85))
-                                            .clipShape(RoundedRectangle(cornerRadius: 6))
-                                        VStack(alignment: .leading, spacing: 1) {
-                                            Text(pdf.name)
-                                                .font(.caption.weight(.medium))
-                                                .lineLimit(1)
-                                                .truncationMode(.middle)
-                                            Text("PDF · \(pdf.text.count) chars")
-                                                .font(.caption2)
-                                                .foregroundStyle(.secondary)
-                                        }
-                                    }
-                                    .padding(.horizontal, 8)
-                                    .padding(.vertical, 4)
-                                    .frame(maxWidth: 200, minHeight: 56, maxHeight: 56)
-                                    .background(Color.secondary.opacity(0.15))
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                    Button {
-                                        pendingPDFs.remove(at: idx)
-                                    } label: {
-                                        Image(systemName: "xmark.circle.fill")
-                                            .font(.system(size: 14))
-                                            .foregroundStyle(.white)
-                                            .background(Circle().fill(.black.opacity(0.5)))
-                                    }
-                                    .buttonStyle(.plain)
-                                    .offset(x: 4, y: -4)
-                                }
-                            }
-                        }
-                        .padding(.horizontal, 4)
-                    }
-                    .frame(height: 64)
+                // Pending attachment thumbnails (images + PDFs + audio)
+                if !pendingImages.isEmpty || !pendingPDFs.isEmpty || !pendingAudio.isEmpty {
+                    AttachmentPreviewRow(images: $pendingImages, pdfs: $pendingPDFs, audio: $pendingAudio)
                 }
 
                 HStack(alignment: .bottom, spacing: 8) {
@@ -461,7 +526,14 @@ struct ChatDetailView: View {
                             .clipShape(Circle())
                     }
                     .buttonStyle(.plain)
-                    .help("Attach image or PDF")
+                    .help(audioSupported ? "Attach image, PDF, or audio" : "Attach image or PDF")
+
+                    // Mic — only on models that actually understand audio
+                    // (Gemma 4 12B). Tap to record, tap again to attach.
+                    if audioSupported {
+                        MicButton(recorder: recorder) { toggleRecording() }
+                            .disabled(server.status != .running || chatEngine.isGenerating)
+                    }
 
                     // Dark pill input
                     TextField("Message", text: $inputText, axis: .vertical)
@@ -477,7 +549,7 @@ struct ChatDetailView: View {
                                 inputText += "\n"
                                 return .handled
                             }
-                            if !isGenerating {
+                            if !chatEngine.isGenerating {
                                 sendMessage()
                             }
                             return .handled
@@ -495,24 +567,24 @@ struct ChatDetailView: View {
                         )
 
                     Button {
-                        if isGenerating {
-                            stopGenerating()
+                        if chatEngine.isGenerating {
+                            chatEngine.stop()
                         } else {
                             sendMessage()
                         }
                     } label: {
-                        Image(systemName: isGenerating ? "stop.circle.fill" : "arrow.up.circle.fill")
+                        Image(systemName: chatEngine.isGenerating ? "stop.circle.fill" : "arrow.up.circle.fill")
                             .font(.system(size: 28))
-                            .foregroundStyle(isGenerating ? .red : .accentColor)
+                            .foregroundStyle(chatEngine.isGenerating ? .red : .accentColor)
                     }
                     .buttonStyle(.plain)
-                    .disabled(server.status != .running || (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingImages.isEmpty && pendingPDFs.isEmpty && !isGenerating))
+                    .disabled(server.status != .running || (inputText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty && pendingImages.isEmpty && pendingPDFs.isEmpty && pendingAudio.isEmpty && !chatEngine.isGenerating))
                 }
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 8)
         }
-        .onDrop(of: [.image, .pdf], isTargeted: nil) { providers in
+        .onDrop(of: [.image, .pdf, .audio], isTargeted: nil) { providers in
             for provider in providers {
                 if provider.hasItemConformingToTypeIdentifier(UTType.pdf.identifier) {
                     provider.loadFileRepresentation(forTypeIdentifier: UTType.pdf.identifier) { url, _ in
@@ -524,6 +596,20 @@ struct ChatDetailView: View {
                             }
                         } else {
                             DispatchQueue.main.async { showPDFError(name) }
+                        }
+                    }
+                } else if audioSupported, provider.hasItemConformingToTypeIdentifier(UTType.audio.identifier) {
+                    // Decode inside the closure — the temp URL is only valid here.
+                    provider.loadFileRepresentation(forTypeIdentifier: UTType.audio.identifier) { url, _ in
+                        guard let url = url else { return }
+                        let name = url.lastPathComponent
+                        let pcm = AudioPreprocessor.preprocess(url: url)
+                        DispatchQueue.main.async {
+                            if let pcm, pcm.count >= 4 {
+                                pendingAudio.append(ChatAudio(name: name, pcm: pcm))
+                            } else {
+                                showAudioError(name)
+                            }
                         }
                     }
                 } else {
@@ -553,6 +639,16 @@ struct ChatDetailView: View {
                     }
                     .help("Open ~/.mlx-serve in Finder — your skills/, system-prompt.md, memory.md, chat-history.json, and downloaded models live here.")
                 }
+            }
+            ToolbarItem(placement: .automatic) {
+                Button {
+                    startVoiceMode()
+                } label: {
+                    Image(systemName: "waveform")
+                        .font(.system(size: 12))
+                }
+                .disabled(server.status != .running)
+                .help("Voice mode — talk to the model hands-free. Speech-to-text and text-to-speech run locally on your Mac; the model only handles text (and tools/thinking if enabled).")
             }
             ToolbarItem(placement: .automatic) {
                 Button {
@@ -667,18 +763,30 @@ struct ChatDetailView: View {
             MCPMarketplaceView()
                 .environmentObject(mcpManager)
         }
+        // The in-window orb is just another view of the app-level voice
+        // controller. Closing the sheet (Escape) leaves voice running so it
+        // persists in the tray; the orb's red ✕ (onClose) explicitly ends it.
+        .sheet(isPresented: $showVoiceMode) {
+            VoiceModeView(controller: appState.voice,
+                          onClose: { showVoiceMode = false; appState.voice.end() },
+                          onNewSession: { newVoiceSession() })
+                .environmentObject(appState)
+        }
         .alert("Enable thinking in Agent mode?", isPresented: $showThinkingInAgentConfirm) {
             Button("Cancel", role: .cancel) { }
             Button("Enable anyway") { enableThinking = true }
         } message: {
             Text("Thinking is not recommended with Agent mode — most local models tool-call more reliably without it. Do you still want to enable it?")
         }
-        .sheet(item: $pendingApproval) { req in
+        // Suppressed while Voice mode is open — two sheets can't co-present on
+        // macOS, so the approval would never appear and the agent loop would hang.
+        // Voice mode renders the approval as an overlay inside its own sheet instead.
+        .sheet(item: Binding(get: { showVoiceMode ? nil : pendingApproval },
+                             set: { pendingApproval = $0 })) { req in
             ToolApprovalSheet(request: req,
-                              onAllow: { req.continuation.resume(returning: .allow) ; pendingApproval = nil },
-                              onDeny: { req.continuation.resume(returning: .deny) ; pendingApproval = nil },
-                              onAllowAll: { sessionAllowAll = true
-                                            req.continuation.resume(returning: .allow) ; pendingApproval = nil })
+                              onAllow: { resolveApproval(.allow) },
+                              onDeny: { resolveApproval(.deny) },
+                              onAllowAll: { resolveApproval(.allow, allowAll: true) })
         }
         .onAppear {
             inputFocused = true
@@ -699,8 +807,10 @@ struct ChatDetailView: View {
             }
         }
         .onDisappear {
-            generationTask?.cancel()
-            generationTask = nil
+            // Generation lives on the app-level engine now — closing the chat
+            // window must NOT cancel an in-flight turn (the voice assistant may
+            // be driving it with no window open). Only tear down this view's
+            // scroll monitor.
             if let monitor = scrollMonitor {
                 NSEvent.removeMonitor(monitor)
                 scrollMonitor = nil
@@ -711,7 +821,7 @@ struct ChatDetailView: View {
                 appState.chatSessions[idx].mode = newValue ? .agent : .chat
             }
         }
-        .onChange(of: isGenerating) { _, generating in
+        .onChange(of: chatEngine.isGenerating) { _, generating in
             if !generating { inputFocused = true }
         }
         .onChange(of: sessionId) { _, _ in
@@ -727,7 +837,8 @@ struct ChatDetailView: View {
 
     private func pickAttachment() {
         let panel = NSOpenPanel()
-        panel.allowedContentTypes = [.image, .pdf]
+        // Only offer audio on models that can use it.
+        panel.allowedContentTypes = audioSupported ? [.image, .pdf, .audio] : [.image, .pdf]
         panel.allowsMultipleSelection = true
         panel.canChooseDirectories = false
         panel.begin { response in
@@ -739,11 +850,79 @@ struct ChatDetailView: View {
                     } else {
                         showPDFError(url.lastPathComponent)
                     }
+                } else if let utType = UTType(filenameExtension: url.pathExtension), utType.conforms(to: .audio) {
+                    addAudioAttachment(url)
                 } else if let image = NSImage(contentsOf: url) {
                     pendingImages.append(image)
                 }
             }
         }
+    }
+
+    /// Decode an audio file to 16 kHz mono float32 PCM (off the main thread —
+    /// AVFoundation decode can be slow) and add it as a pending attachment.
+    private func addAudioAttachment(_ url: URL) {
+        let name = url.lastPathComponent
+        DispatchQueue.global(qos: .userInitiated).async {
+            let pcm = AudioPreprocessor.preprocess(url: url)
+            DispatchQueue.main.async {
+                if let pcm, pcm.count >= 4 {
+                    pendingAudio.append(ChatAudio(name: name, pcm: pcm))
+                } else {
+                    showAudioError(name)
+                }
+            }
+        }
+    }
+
+    private func showAudioError(_ name: String) {
+        let alert = NSAlert()
+        alert.messageText = "Couldn't read audio"
+        alert.informativeText = "\(name) couldn't be decoded. Supported: wav, mp3, m4a, aiff, caf, flac."
+        alert.alertStyle = .warning
+        alert.runModal()
+    }
+
+    /// Convert pending audio clips to a ChatAudio array, clearing the list.
+    private func consumePendingAudio() -> [ChatAudio]? {
+        guard !pendingAudio.isEmpty else { return nil }
+        let clips = pendingAudio
+        pendingAudio = []
+        return clips
+    }
+
+    /// Whether the active model understands audio (Gemma 4 12B unified). Gates
+    /// the mic button and audio-file attachment so they only appear where audio
+    /// actually does something.
+    private var audioSupported: Bool { server.modelInfo?.supportsAudio ?? false }
+
+    /// Mic tap handler: start recording (after a permission check), or stop and
+    /// turn the captured PCM into a pending audio attachment.
+    private func toggleRecording() {
+        if recorder.isRecording {
+            if let pcm = recorder.stop(), pcm.count >= 4 {
+                let secs = Double(pcm.count / 4) / AudioRecorder.targetSampleRate
+                pendingAudio.append(ChatAudio(name: String(format: "Recording · %.0fs", secs.rounded()), pcm: pcm))
+            }
+            return
+        }
+        Task {
+            let granted = await AudioRecorder.requestPermission()
+            guard granted else { showMicPermissionError(); return }
+            do {
+                try recorder.start()
+            } catch {
+                showAudioError("the microphone")
+            }
+        }
+    }
+
+    private func showMicPermissionError() {
+        let alert = NSAlert()
+        alert.messageText = "Microphone access needed"
+        alert.informativeText = "Enable microphone access for MLX Core in System Settings → Privacy & Security → Microphone, then try again."
+        alert.alertStyle = .warning
+        alert.runModal()
     }
 
     /// Returns nil if the PDF is unreadable, encrypted, or contains no extractable text
@@ -795,31 +974,6 @@ struct ChatDetailView: View {
         return chatImages.isEmpty ? nil : chatImages
     }
 
-    /// Build OpenAI-style content blocks for a message with images.
-    /// Images are preprocessed to raw float32 pixel data for the vision encoder.
-    private static func buildMultimodalContent(text: String, images: [ChatImage]) -> Any {
-        var blocks: [[String: Any]] = images.compactMap { img in
-            // Preprocess image for vision encoder (768x768 float32 CHW)
-            if let pixelData = ImagePreprocessor.preprocess(img.data) {
-                return [
-                    "type": "image_url",
-                    "image_url": [
-                        "url": "data:image/x-mlx-pixels;base64,\(pixelData.base64EncodedString())"
-                    ] as [String: Any]
-                ]
-            }
-            // Fallback: send JPEG if preprocessing fails
-            return [
-                "type": "image_url",
-                "image_url": ["url": img.base64URL] as [String: Any]
-            ]
-        }
-        if !text.isEmpty {
-            blocks.append(["type": "text", "text": text])
-        }
-        return blocks
-    }
-
     // MARK: - Helpers
 
     private func scrollToBottom(_ proxy: ScrollViewProxy) {
@@ -856,191 +1010,72 @@ struct ChatDetailView: View {
         )
     }
 
-    // MARK: - Stop Generation
+    // MARK: - Voice Mode
 
-    private func stopGenerating() {
-        generationTask?.cancel()
-        generationTask = nil
-        appState.updateLastMessage(in: sessionId, streaming: false)
-        appState.saveChatHistory()
-        isGenerating = false
+    /// Resume the pending tool-approval continuation with the user's choice.
+    /// Drives the text-chat approval sheet (the in-window orb and tray panel
+    /// resolve their own approvals through the controller).
+    private func resolveApproval(_ choice: ToolApprovalChoice, allowAll: Bool = false) {
+        guard let req = pendingApproval else { return }
+        if allowAll { sessionAllowAll = true }
+        req.continuation.resume(returning: choice)
+        pendingApproval = nil
+    }
+
+    /// Present the in-window voice orb. The controller is app-level and may
+    /// already be running (started from the tray) — only begin a session if it
+    /// isn't active yet, ensuring a chat session exists first.
+    private func startVoiceMode() {
+        guard !showVoiceMode else { return }
+        showVoiceMode = true
+        guard !appState.voice.isActive else { return }
+        if appState.activeChatId == nil { _ = appState.newChatSession() }
+        Task { _ = await appState.voice.begin() }   // on permission failure the orb shows the error
+    }
+
+    /// "New session" from the voice screen: stop the current answer, cut off any
+    /// in-progress speech, and switch the active chat to a fresh session. The
+    /// app-level voice controller stays live across the sessionId change.
+    private func newVoiceSession() {
+        chatEngine.stop()
+        appState.voice.bargeIn()        // cut off any in-progress speech, return to listening
+        _ = appState.newChatSession()   // sets activeChatId → voice's turnContext picks it up
     }
 
     // MARK: - Send Message
 
+    /// Thin wrapper: build the turn config from the toolbar @State, consume the
+    /// input draft + attachments (View-owned UI state), and hand the turn to the
+    /// shared `ChatTurnEngine`. The engine routes to plain chat or the agent loop
+    /// based on `config.agentMode || config.mcpMode` — there is no separate
+    /// agent send path here anymore. Voice turns go straight through the
+    /// controller and never touch this method.
     private func sendMessage() {
         isNearBottom = true // snap to bottom on send
-        if isAgentMode || appState.mcpMode {
-            sendAgentMessage()
-            return
-        }
 
         var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
         let attachedImages = consumePendingImages()
+        let attachedAudio = consumePendingAudio()
         let pdfText = consumePendingPDFsAsText()
-        guard !text.isEmpty || attachedImages != nil || !pdfText.isEmpty, !isGenerating, server.status == .running else { return }
+        guard !text.isEmpty || attachedImages != nil || attachedAudio != nil || !pdfText.isEmpty,
+              !chatEngine.isGenerating, server.status == .running else { return }
         inputText = ""
         if !pdfText.isEmpty {
             text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
         }
 
-        var userMsg = ChatMessage(role: .user, content: text)
-        userMsg.images = attachedImages
-        appState.appendMessage(to: sessionId, message: userMsg)
-
-        isGenerating = true
-        let api = APIClient()
-
-        // Build the request from the session (its source of truth). We append
-        // the streaming placeholder AFTER this so it never lands in the
-        // request — same pattern the agent loop uses. Image handling: only
-        // the latest user message's images are sent (older turns' images are
-        // stripped for bandwidth).
-        let sessionMsgs = session?.messages ?? []
-        let lastUserIdx = sessionMsgs.lastIndex { $0.role == .user }
-        let history: [[String: Any]] = sessionMsgs.enumerated().map { i, msg in
-            if i == lastUserIdx, msg.role == .user, let imgs = msg.images, !imgs.isEmpty {
-                return ["role": "user", "content": Self.buildMultimodalContent(text: msg.content, images: imgs)]
-            }
-            var d: [String: Any] = ["role": msg.role.rawValue, "content": msg.content]
-            if msg.role == .assistant && msg.content.isEmpty { d.removeValue(forKey: "content") }
-            return d
-        }
-        // Plain chat: no synthesized system message. Earlier versions
-        // prepended a "formatNudge" system message asking the model to use
-        // Markdown tables / fenced code / bold. That nudge had no persona
-        // and was routinely interpreted by the model AS the user's input —
-        // first-turn replies came back as meta-commentary like "It seems
-        // like you're providing a formatting reminder, but it looks like
-        // you may have intended to ask a question". Removing the nudge
-        // entirely; smaller models will occasionally emit whitespace-
-        // aligned tables instead of Markdown grids, which is a far better
-        // failure mode than the model addressing the system instruction
-        // instead of the user. Agent mode still has its own system prompt
-        // (AgentPrompt.swift) which DOES carry a full persona.
-        let messagesArray = history
-
-        // Streaming placeholder for the UI — appended AFTER the request body
-        // is built so it doesn't show up in the prompt. If we added it
-        // before building, the session would have a trailing empty assistant
-        // turn that we'd have to drop back out (and the user message we just
-        // appended would be on the line above it — easy to double-add by
-        // mistake, which on small / 2-bit-quant models like DSV4-Flash
-        // produces a repeating-token collapse at temp > 0).
-        var assistantMsg = ChatMessage(role: .assistant, content: "")
-        assistantMsg.isStreaming = true
-        appState.appendMessage(to: sessionId, message: assistantMsg)
-
-        generationTask = Task {
-            do {
-                // Plan 05 Phase G — pin the request to the active model
-                // (server-resolved default if nil) so hot-switch can finish
-                // in-flight requests on the old model before the new one
-                // takes over.
-                let stream = api.streamChat(
-                    port: server.port,
-                    messages: messagesArray,
-                    maxTokens: appState.maxTokens,
-                    temperature: appState.serverOptions.defaultTemperature,
-                    enableThinking: enableThinking || appState.serverOptions.defaultEnableThinking,
-                    defaults: APIClient.RequestDefaults.from(appState.serverOptions),
-                    modelId: appState.server.modelInfo?.name
-                )
-                for try await event in stream {
-                    try Task.checkCancellation()
-                    switch event {
-                    case .content(let text):
-                        appState.updateLastMessage(in: sessionId, content: text)
-                    case .reasoning(let text):
-                        appState.updateLastMessage(in: sessionId, reasoning: text)
-                    case .usage(let usage):
-                        appState.updateLastMessage(in: sessionId, usage: usage)
-                    case .toolCalls:
-                        break
-                    case .maxTokensReached:
-                        appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens (\(appState.maxTokens)) reached.*")
-                    case .done:
-                        break
-                    }
-                }
-            } catch is CancellationError {
-                // Stopped by user
-            } catch {
-                print("[ChatView] Chat error: \(error)")
-                try? "Chat error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
-                appState.updateLastMessage(in: sessionId, content: "\n\n[Error: \(error.localizedDescription)]")
-            }
-            appState.updateLastMessage(in: sessionId, streaming: false)
-            appState.saveChatHistory()
-            isGenerating = false
-            generationTask = nil
-        }
+        let config = ChatTurnEngine.TurnConfig(
+            agentMode: isAgentMode,
+            mcpMode: appState.mcpMode,
+            enableThinking: enableThinking,
+            voiceStyle: false,
+            workingDirectory: session?.workingDirectory
+        )
+        chatEngine.runTurn(sessionId: sessionId, userText: text,
+                           images: attachedImages, audio: attachedAudio,
+                           config: config,
+                           approval: { await requestToolApproval($0) })
     }
-
-    // MARK: - Agent Mode (Native Tool Calling)
-
-    private func sendAgentMessage() {
-        var text = inputText.trimmingCharacters(in: .whitespacesAndNewlines)
-        let attachedImages = consumePendingImages()
-        let pdfText = consumePendingPDFsAsText()
-        guard !text.isEmpty || attachedImages != nil || !pdfText.isEmpty, !isGenerating, server.status == .running else { return }
-        inputText = ""
-        if !pdfText.isEmpty {
-            text = text.isEmpty ? pdfText : pdfText + "\n\n" + text
-        }
-
-        var userMsg = ChatMessage(role: .user, content: text)
-        userMsg.images = attachedImages
-        appState.appendMessage(to: sessionId, message: userMsg)
-
-        isGenerating = true
-        let api = APIClient()
-        let workDir = session?.workingDirectory
-
-        generationTask = Task {
-            // Lazy-spawn MCP servers if MCP mode is on. Idempotent — already-connected servers are skipped.
-            if appState.mcpMode {
-                // Inherit the chat's working directory so filesystem/shell MCP servers anchor at the
-                // same dir the agent's built-in tools use. Per-entry `cwd` in mcp.json still wins.
-                mcpManager.defaultCwd = session?.workingDirectory
-                await mcpManager.startEnabled()
-                // Surface startup failures inline in chat — otherwise they're hidden behind the
-                // marketplace gear icon and the user just sees "MCP doesn't seem to do anything".
-                if !mcpManager.startErrors.isEmpty {
-                    let lines = mcpManager.startErrors
-                        .sorted(by: { $0.key < $1.key })
-                        .map { "• **\($0.key)**: \($0.value)" }
-                        .joined(separator: "\n")
-                    let hint = mcpManager.sessions.isEmpty
-                        ? "No MCP servers are connected — the model has no MCP tools available for this turn. Open the gear icon on the MCP pill to fix or disable broken servers."
-                        : "Some MCP servers couldn't start. The model will only see tools from the ones that did connect."
-                    let warning = ChatMessage(
-                        role: .assistant,
-                        content: "⚠️ MCP startup issues:\n\n\(lines)\n\n\(hint)"
-                    )
-                    appState.appendMessage(to: sessionId, message: warning)
-                }
-            }
-            do {
-                try await runAgentLoop(api: api, workingDirectory: workDir)
-            } catch is CancellationError {
-                // Stopped by user — stopGenerating() already cleared the streaming flag.
-            } catch {
-                print("[ChatView] Agent error: \(error)")
-                try? "Agent error: \(error)\n".write(toFile: NSString(string: "~/.mlx-serve/debug.log").expandingTildeInPath, atomically: true, encoding: .utf8)
-                // Clear the spinner on the in-flight assistant message before appending the error;
-                // otherwise GeneratingIndicator stays visible on the orphaned streaming bubble.
-                appState.updateLastMessage(in: sessionId, streaming: false)
-                var errorMsg = ChatMessage(role: .assistant, content: "[Error: \(error.localizedDescription)]")
-                errorMsg.isStreaming = false
-                appState.appendMessage(to: sessionId, message: errorMsg)
-            }
-            appState.saveChatHistory()
-            isGenerating = false
-            generationTask = nil
-        }
-    }
-
 
     /// Ask the user to approve a single tool call. Returns true on Allow /
     /// Always Allow, false on Deny. Bypassed entirely when `sessionAllowAll`
@@ -1060,363 +1095,6 @@ struct ChatDetailView: View {
         return choice == .allow
     }
 
-    /// Agent loop: call model with tools (streaming), execute tool calls, feed results back, repeat.
-    /// Stops when the model responds with content (no tool calls) or after 150 iterations.
-    private func runAgentLoop(api: APIClient, workingDirectory initialWorkDir: String?) async throws {
-        var workingDirectory = initialWorkDir
-        let maxIterations = 150
-        var padRetries = 0
-        let padRetryPolicy = RetryPolicy.aggressive
-        let repetition = AgentEngine.RepetitionTracker()
-        // Bail out if the model spends several rounds where every tool call
-        // fails/blocks (e.g. an unresolvable tool name) instead of grinding to
-        // `maxIterations` achieving nothing.
-        var stuck = AgentEngine.StuckDetector()
-        var truncationRetries = 0
-        // One retry when the model exits with a malformed/ghost tool-call tag
-        // in its content instead of a proper finish — re-prompt for a clean
-        // plain-text summary so the user isn't left staring at `<|tool_call>…`.
-        var completionRetries = 0
-
-        for iteration in 0..<maxIterations {
-            try Task.checkCancellation()
-
-            // Build message history for API
-            let contextLength = AgentEngine.effectiveContextLength(
-                appContextSize: appState.contextSize,
-                modelContextLength: server.modelInfo?.contextLength
-            )
-            var history = AgentEngine.buildAgentHistory(
-                messages: session?.messages ?? [],
-                contextLength: contextLength,
-                maxTokens: appState.maxTokens,
-                buildMultimodalContent: Self.buildMultimodalContent
-            )
-            let userMsg = history.last { ($0["role"] as? String) == "user" }?["content"] as? String ?? ""
-            let mcpToolsJSON = appState.mcpMode ? mcpManager.toolDefinitionsJSON() : nil
-            let mcpListing = appState.mcpMode ? mcpManager.toolListingForPrompt() : ""
-            var systemPrompt: String
-            if isAgentMode {
-                let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
-                systemPrompt = AgentPrompt.systemPrompt + skills + AgentPrompt.memory + appState.agentMemory.contextSnippet()
-                if let wd = workingDirectory {
-                    systemPrompt += AgentEngine.workingDirectoryContext(wd)
-                }
-                if !mcpListing.isEmpty {
-                    systemPrompt += "\n\n# MCP Tools\nIn addition to the built-in tools above, the user has connected these MCP servers. Their tools are namespaced as `<server>__<tool>`:\n\n\(mcpListing)"
-                }
-            } else {
-                // MCP-only mode: minimal system prompt focused on MCP tool use, no shell/file rules.
-                systemPrompt = AgentPrompt.mcpOnlySystemPrompt(toolListing: mcpListing)
-            }
-            var messages: [[String: Any]] = [["role": "system", "content": systemPrompt]]
-            // Some models (e.g. Gemma 4 E4B) can't generate after tool results without
-            // a user message. Add a nudge so the model knows to synthesize a response —
-            // asks explicitly for a short plain-text summary when finished so the user
-            // never sees a conversation that ends on a bare tool-call echo.
-            if let lastRole = history.last?["role"] as? String, lastRole == "tool" {
-                history.append(["role": "user", "content": "Continue. If the task is complete, reply with a short plain-text summary for the user (what got done, where it lives, any caveats) — no tool calls, no JSON. If more work is needed, make the next tool call."])
-            }
-            messages.append(contentsOf: history)
-
-            AgentEngine.dumpDebugRequest(messages: messages, maxTokens: appState.maxTokens)
-
-            // Add streaming assistant message
-            var streamMsg = ChatMessage(role: .assistant, content: "")
-            streamMsg.isStreaming = true
-            appState.appendMessage(to: sessionId, message: streamMsg)
-
-            // Stream model response with tools
-            var receivedToolCalls: [APIClient.ToolCall] = []
-            var maxTokensHit = false
-            let combinedToolsJSON = Self.combinedToolsJSON(
-                agentMode: isAgentMode,
-                mcpToolsJSON: mcpToolsJSON
-            )
-            let stream = api.streamChat(
-                port: server.port,
-                messages: messages,
-                maxTokens: appState.maxTokens,
-                temperature: 0.7,
-                enableThinking: enableThinking,
-                toolsJSON: combinedToolsJSON,
-                defaults: APIClient.RequestDefaults.from(appState.serverOptions),
-                modelId: appState.server.modelInfo?.name
-            )
-
-            // No client-side stream watchdog: long generations (large
-            // contexts, big batches, slow sampling on big MoE) can legitimately
-            // sit silent for minutes between events. The user keeps the Stop
-            // button as the manual cancel; URLSession's own resource timeout
-            // (set in APIClient) handles a truly broken socket.
-            let streamTask = Task<(tcs: [APIClient.ToolCall], maxHit: Bool), Error> {
-                var tcs: [APIClient.ToolCall] = []
-                var maxHit = false
-                for try await event in stream {
-                    try Task.checkCancellation()
-                    switch event {
-                    case .content(let text):
-                        appState.updateLastMessage(in: sessionId, content: text)
-                    case .reasoning(let text):
-                        appState.updateLastMessage(in: sessionId, reasoning: text)
-                    case .usage(let usage):
-                        appState.updateLastMessage(in: sessionId, usage: usage)
-                    case .toolCalls(let calls):
-                        tcs = calls
-                    case .maxTokensReached:
-                        maxHit = true
-                        appState.updateLastMessage(in: sessionId, content: "\n\n⚠️ *Output truncated — max tokens (\(appState.maxTokens)) reached. Try breaking the task into smaller steps.*")
-                    case .done:
-                        break
-                    }
-                }
-                return (tcs, maxHit)
-            }
-            // Wire the user's Stop button through to the inner stream task.
-            do {
-                let result = try await withTaskCancellationHandler {
-                    try await streamTask.value
-                } onCancel: {
-                    streamTask.cancel()
-                }
-                receivedToolCalls = result.tcs
-                maxTokensHit = result.maxHit
-            } catch is CancellationError {
-                throw CancellationError()
-            }
-            appState.updateLastMessage(in: sessionId, streaming: false)
-
-            // Truncation recovery: if max_tokens was hit AND tool calls were received,
-            // the tool call args are likely truncated (incomplete JSON). Don't execute them —
-            // mark the broken message as non-replayable (preserves reasoning in the UI)
-            // and nudge the model to try again more concisely.
-            if maxTokensHit && !receivedToolCalls.isEmpty && truncationRetries < 2 {
-                truncationRetries += 1
-                if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
-                   !appState.chatSessions[sIdx].messages.isEmpty {
-                    let mIdx = appState.chatSessions[sIdx].messages.count - 1
-                    appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
-                    appState.chatSessions[sIdx].messages[mIdx].toolCalls = nil
-                }
-                let nudge = ChatMessage(role: .user, content: "[System: Your last response was cut off because the output was too long. The tool call was NOT executed. To avoid this, write shorter responses: use shell with heredoc (cat << 'EOF' > file) for file content instead of writeFile, or break large files into smaller pieces.]")
-                appState.appendMessage(to: sessionId, message: nudge)
-                continue
-            }
-
-            // Check for pad-only or empty responses — retry limited times.
-            // Mark the empty message as failedRetry so it's hidden from API history
-            // but its reasoning (if any) stays visible in the UI.
-            if receivedToolCalls.isEmpty {
-                let lastContent = appState.chatSessions
-                    .first(where: { $0.id == sessionId })?.messages.last?.content ?? ""
-                let cleaned = lastContent
-                    .replacingOccurrences(of: "<pad>", with: "")
-                    .trimmingCharacters(in: .whitespacesAndNewlines)
-                if cleaned.isEmpty {
-                    if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
-                       !appState.chatSessions[sIdx].messages.isEmpty {
-                        let mIdx = appState.chatSessions[sIdx].messages.count - 1
-                        appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
-                    }
-                    padRetries += 1
-                    if padRetries <= padRetryPolicy.maxRetries {
-                        let delay = padRetryPolicy.delay(for: padRetries)
-                        try? await Task.sleep(nanoseconds: delay)
-                        continue
-                    }
-                    let errorMsg = ChatMessage(role: .assistant, content: "The model couldn't generate a response. Try rephrasing or starting a new chat.")
-                    appState.appendMessage(to: sessionId, message: errorMsg)
-                    return
-                }
-            }
-
-            // If no tool calls, we're done — but make sure the user sees a
-            // clean completion text. The model sometimes exits with a ghost
-            // tool call (malformed <|tool_call>...<tool_call|> or <tool_call>
-            // with bad args that didn't parse) as its final content; that's
-            // ugly and uninformative. When we detect one, mark the garbled
-            // turn as failedRetry (hidden from API history) and ask the model
-            // for a plain-text summary before returning control to the user.
-            if receivedToolCalls.isEmpty {
-                let lastContent = appState.chatSessions
-                    .first(where: { $0.id == sessionId })?.messages.last?.content ?? ""
-                // Match the full `<tool…` family — `<tool_call>`, `<tool_call name=…>`,
-                // `<tool_calls>` wrapper, `<tool name=… arguments=…/>` self-closing,
-                // Gemma 4 `<|tool_call>`/`<tool_call|>`, and `<function=` legacy. The
-                // server-side `parseToolCalls` already handles all of these; this
-                // check is the defense-in-depth that fires the retry nudge when
-                // a new model variant slips through the parser before we recognize
-                // it (the symptom: hundreds of completion_tokens but the assistant
-                // turn ends with markup-as-content and no parsed tool_calls).
-                let looksLikeGhostToolCall = lastContent.contains("<|tool_call>") ||
-                    lastContent.contains("<tool_call>") ||
-                    lastContent.contains("<tool_call ") ||
-                    lastContent.contains("<tool_calls>") ||
-                    lastContent.contains("<tool_calls ") ||
-                    lastContent.contains("<tool_call|>") ||
-                    lastContent.contains("<tool name=") ||
-                    lastContent.contains("<function=")
-                if looksLikeGhostToolCall && completionRetries < 1 {
-                    completionRetries += 1
-                    if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
-                       !appState.chatSessions[sIdx].messages.isEmpty {
-                        let mIdx = appState.chatSessions[sIdx].messages.count - 1
-                        appState.chatSessions[sIdx].messages[mIdx].failedRetry = true
-                    }
-                    let nudge = ChatMessage(role: .user, content: "[System: your last response contained a malformed tool-call tag. If you meant to call a tool, call it with proper JSON. If the task is complete, respond with a short plain-text summary of what you did — no tool tags, no JSON — just a sentence or two for the user.]")
-                    appState.appendMessage(to: sessionId, message: nudge)
-                    continue
-                }
-                return
-            }
-
-            // Track repetition for this round
-            repetition.track(toolCalls: receivedToolCalls)
-
-            // Store tool calls on the assistant message for history replay
-            if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
-               !appState.chatSessions[sIdx].messages.isEmpty {
-                let mIdx = appState.chatSessions[sIdx].messages.count - 1
-                appState.chatSessions[sIdx].messages[mIdx].toolCalls = receivedToolCalls.map { tc in
-                    let argsJson = (try? JSONSerialization.data(withJSONObject: tc.arguments))
-                        .flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
-                    return SerializedToolCall(id: tc.id, name: tc.name, arguments: argsJson)
-                }
-            }
-
-            // Show tool call summary as display-only message. Mark streaming so the GeneratingIndicator
-            // keeps rendering underneath while tools execute — otherwise a slow / hung MCP tool looks
-            // like the chat just froze with no feedback.
-            let callSummary = receivedToolCalls.map { tc in
-                let args = tc.arguments.map { "\($0.key): \($0.value.prefix(80))" }.joined(separator: ", ")
-                let display = args.isEmpty ? tc.rawArguments.prefix(200) : args[...]
-                return "**\(tc.name)**(\(display))"
-            }.joined(separator: "\n")
-            var summaryMsg = ChatMessage(role: .assistant, content: callSummary)
-            summaryMsg.isAgentSummary = true
-            summaryMsg.isStreaming = true
-            let summaryId = summaryMsg.id
-            appState.appendMessage(to: sessionId, message: summaryMsg)
-            // Stop the spinner on the summary regardless of how we leave the loop (success, throw, cancel).
-            defer {
-                if let sIdx = appState.chatSessions.firstIndex(where: { $0.id == sessionId }),
-                   let mIdx = appState.chatSessions[sIdx].messages.firstIndex(where: { $0.id == summaryId }) {
-                    appState.chatSessions[sIdx].messages[mIdx].isStreaming = false
-                }
-            }
-
-            // Execute each tool call. MCP-namespaced names (`<server>__<tool>`) route to MCPManager;
-            // everything else flows through the existing AgentEngine dispatch.
-            // Tool-approval gate: before every dispatch, ask the user unless
-            // they've flipped "Always allow this session". Deny short-circuits
-            // to a fabricated error result so the agent loop can react and
-            // the user's intent is visible in the transcript.
-            var roundOutputs: [String] = []
-            for tc in receivedToolCalls {
-                try Task.checkCancellation()
-
-                let approved = await requestToolApproval(tc)
-                guard approved else {
-                    let denied = AgentEngine.ToolResult(
-                        id: tc.id,
-                        name: tc.name,
-                        output: "Error: user denied this tool call. Do not retry this command; ask the user how to proceed or try a different approach."
-                    )
-                    // A user denial is a deliberate stop, not a stuck loop — don't
-                    // count it toward the no-progress tally.
-                    var deniedMsg = ChatMessage(role: .assistant, content: "**\(tc.name)** → denied by user")
-                    deniedMsg.isAgentSummary = true
-                    appState.appendMessage(to: sessionId, message: deniedMsg)
-                    var toolMsg = ChatMessage(role: .system, content: denied.output)
-                    toolMsg.toolCallId = denied.id
-                    toolMsg.toolName = denied.name
-                    appState.appendMessage(to: sessionId, message: toolMsg)
-                    continue
-                }
-
-                let result: AgentEngine.ToolResult
-                if mcpManager.owns(toolName: tc.name) {
-                    let output = await mcpManager.executeToolCall(
-                        name: tc.name, arguments: tc.arguments, rawArguments: tc.rawArguments
-                    )
-                    result = AgentEngine.ToolResult(id: tc.id, name: tc.name, output: output)
-                } else {
-                    result = await AgentEngine.executeToolCall(
-                        tc, workingDirectory: &workingDirectory,
-                        repetition: repetition, iteration: iteration,
-                        agentMemory: appState.agentMemory
-                    )
-                }
-                roundOutputs.append(result.output)
-
-                // Show result in chat (display-only)
-                var resultMsg = ChatMessage(role: .assistant, content: "**\(result.name)** → \(String(result.output.prefix(500)))")
-                resultMsg.isAgentSummary = true
-                appState.appendMessage(to: sessionId, message: resultMsg)
-
-                // Store tool result as tool role message
-                var toolMsg = ChatMessage(role: .system, content: "")
-                toolMsg.toolCallId = result.id
-                toolMsg.toolName = result.name
-
-                // Extract screenshot image data and attach as vision input
-                if result.name == "browse" && result.output.contains("data:image/jpeg;base64,") {
-                    if let range = result.output.range(of: "data:image/jpeg;base64,") {
-                        let remainder = result.output[range.upperBound...]
-                        let b64End = remainder.firstIndex(of: "\n") ?? remainder.endIndex
-                        let b64 = String(remainder[..<b64End])
-                        if let jpegData = Data(base64Encoded: b64),
-                           let chatImage = ChatImage(data: jpegData) as ChatImage? {
-                            toolMsg.images = [chatImage]
-                            toolMsg.content = "[screenshot captured]"
-                        } else {
-                            toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
-                        }
-                    } else {
-                        toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
-                    }
-                } else {
-                    toolMsg.content = AgentEngine.truncateWithOverflow(result.output, toolCallId: result.id, toolName: result.name)
-                }
-                appState.appendMessage(to: sessionId, message: toolMsg)
-            }
-
-            // Stop if the model made no progress for several consecutive rounds
-            // (every tool call failed/blocked) rather than grinding to the cap.
-            stuck.record(outputs: roundOutputs)
-            if stuck.isStuck {
-                let msg = ChatMessage(role: .assistant, content: "Stopped: the last \(AgentEngine.StuckDetector.limit) tool-call rounds all failed without making progress (often an unrecognized tool name). Tell me how you'd like to proceed.")
-                appState.appendMessage(to: sessionId, message: msg)
-                return
-            }
-        }
-
-        // Max iterations reached
-        let msg = ChatMessage(role: .assistant, content: "(Agent stopped after \(maxIterations) tool call rounds)")
-        appState.appendMessage(to: sessionId, message: msg)
-    }
-
-    /// Build the JSON tools array sent to the model. Concatenates agent tools (when agent mode is on) and
-    /// MCP tools (when MCP mode is on). Returns nil when no tools should be advertised.
-    static func combinedToolsJSON(agentMode: Bool, mcpToolsJSON: String?) -> String? {
-        let agent = agentMode ? AgentPrompt.toolDefinitionsJSON : nil
-        switch (agent, mcpToolsJSON) {
-        case (nil, nil): return nil
-        case (let a?, nil): return a
-        case (nil, let m?): return m
-        case (let a?, let m?):
-            // Strip outer brackets and re-wrap. Both inputs are guaranteed to be JSON arrays.
-            let aInner = a.trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            let mInner = m.trimmingCharacters(in: .whitespacesAndNewlines)
-                .trimmingCharacters(in: CharacterSet(charactersIn: "[]"))
-            let aTrimmed = aInner.trimmingCharacters(in: .whitespacesAndNewlines)
-            let mTrimmed = mInner.trimmingCharacters(in: .whitespacesAndNewlines)
-            if aTrimmed.isEmpty { return "[\(mTrimmed)]" }
-            if mTrimmed.isEmpty { return "[\(aTrimmed)]" }
-            return "[\(aTrimmed),\(mTrimmed)]"
-        }
-    }
 }
 
 // MARK: - Context Monitor
@@ -1683,6 +1361,18 @@ struct MessageBubble: View {
                                     .clipShape(RoundedRectangle(cornerRadius: 10))
                             }
                         }
+                    }
+                }
+
+                // Attached audio clips
+                if let clips = message.audio, !clips.isEmpty {
+                    ForEach(clips) { clip in
+                        Label(String(format: "%@ · %.1fs", clip.name, clip.durationSeconds), systemImage: "waveform")
+                            .font(.caption.weight(.medium))
+                            .padding(.horizontal, 10)
+                            .padding(.vertical, 6)
+                            .background(Color.purple.opacity(0.18))
+                            .clipShape(Capsule())
                     }
                 }
 

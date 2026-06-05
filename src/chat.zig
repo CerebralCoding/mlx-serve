@@ -23,12 +23,20 @@ pub const ImageData = struct {
     height: u32,
 };
 
+/// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.
+/// Bytes are little-endian float32 PCM; the encoder frames them into 640-sample
+/// tokens (40 ms @ 16 kHz) and projects each straight into language-model space.
+pub const AudioData = struct {
+    samples: []const u8, // Raw float32-LE bytes (n_samples * 4)
+};
+
 pub const Message = struct {
     role: []const u8,
     content: []const u8,
     tool_calls: ?[]const ToolCall = null,
     tool_call_id: ?[]const u8 = null,
     images: ?[]const ImageData = null, // Preprocessed image data for vision
+    audio: ?[]const AudioData = null, // Raw PCM for the unified audio embedder
 };
 
 /// Chat template configuration loaded from tokenizer_config.json.

@@ -106,7 +106,9 @@ class APIClient {
         return dataArr.map { Self.parseModelInfo($0) }
     }
 
-    private static func parseModelInfo(_ first: [String: Any]) -> ModelInfo {
+    // Internal (not private) so unit tests can exercise the capability/meta
+    // parsing directly via `@testable import`.
+    static func parseModelInfo(_ first: [String: Any]) -> ModelInfo {
         let name = first["id"] as? String ?? "unknown"
         let meta = first["meta"] as? [String: Any] ?? [:]
         // Pre-Phase-G servers omit `state`/`loaded`/`bytes_resident` at the
@@ -120,6 +122,11 @@ class APIClient {
             if let v = meta["bytes_on_disk"] as? UInt64 { return v }
             return nil
         }()
+        // Audio support is advertised at the top level of the model object
+        // (capabilities / input_modalities), not under `meta`.
+        let caps = first["capabilities"] as? [String] ?? []
+        let mods = first["input_modalities"] as? [String] ?? []
+        let supportsAudio = caps.contains("audio") || mods.contains("audio")
         return ModelInfo(
             name: name,
             quantBits: meta["quantization_bits"] as? Int ?? 0,
@@ -130,6 +137,7 @@ class APIClient {
             modelMaxTokens: meta["model_max_tokens"] as? Int ?? 0,
             architecture: meta["architecture"] as? String ?? "",
             isMoE: meta["is_moe"] as? Bool ?? false,
+            supportsAudio: supportsAudio,
             drafterLoaded: meta["drafter_loaded"] as? Bool ?? false,
             drafterPath: meta["drafter_path"] as? String,
             loaded: topLoaded,

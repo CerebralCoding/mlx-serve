@@ -33,3 +33,4 @@ server_err.log
 .mtp-progress.md
 .spec-progress.md
 docs/perf/
+docs/tmp

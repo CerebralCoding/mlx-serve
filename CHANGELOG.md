@@ -1,5 +1,18 @@
 # Changelog
 
+## v26.6.2 — Hey Loki ! Voice Mode
+
+- **Hands-free Voice Mode.** Say "Hey Loki" and just talk to your local model — no typing, no buttons. Speech is transcribed **entirely on-device**, so your audio never leaves the Mac and it works with no internet and runs straight from the menu-bar tray with no window open — a chime confirms it heard you, a soft cue plays while it's thinking — or as a full-screen animated orb over the chat. Agent tools, thinking, and MCP all work in voice exactly as they do in text, because both now run through one shared engine.
+
+- **Gemma 4 12B now sees and hears.** The 12B "unified" checkpoint (`gemma-4-12b-it-4bit`) understands **both images and spoken audio** with no separate vision or audio tower — send a photo or raw microphone audio and it reasons over them directly. Voice mode and the chat window can hand the model what you say and show, not just what you type.
+
+- **Neural text-to-speech with voice cloning.** A new Audio generation window speaks any text aloud — and can **clone a voice** from a few seconds of reference audio you record in-app or drop in as a file. Three on-device models from lightest to highest fidelity: MOSS-TTS Nano (100M, ~0.5 GB), Qwen3-TTS 0.6B (~1.5 GB), and Qwen3-TTS 1.7B (~3.5 GB) — all MLX-native, no PyTorch. Reference clips are normalized in-app, so there's nothing extra to install.
+
+- **Video generation & setup fix.** A breaking rename in the upstream `ltx-2-mlx` pipelines — plus a newly mandatory frame-rate setting — had been leaving on-device video generation broken even after a clean install. MLX Core now drives the current pipeline API across all three quality tiers (one-stage, two-stage, two-stage HQ), and the fast one-stage path picked up first-frame image-to-video support along the way.
+
+
+---
+
 ## v26.6.1 — Gemma 4 12b Support
 - **Gemma 4 12B.** Run `gemma-4-12b-it-4bit` — the dense 12B slots between E4B and the 26B-A4B MoE for a quality-vs-speed middle ground.
 - **Agent mode that actually codes.** The built-in agent now completes real multi-step coding tasks instead of stalling. Tool calls whose name carries a stray trailing colon (some Gemma 4 builds emit `shell:`) resolve correctly instead of dead-looping on "unknown tool"; the shell tool closes stdin so interactive scaffolders like `npm create svelte` / `npx sv create` fail fast instead of freezing the agent, backed by a timeout that can't hang on a runaway command; and the agent is steered toward non-interactive setup (`npm install` + writing files directly) over interactive wizards. A local model can now `npm install`, initialize Prisma, and create a SQLite database end-to-end.

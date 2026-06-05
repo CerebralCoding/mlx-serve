@@ -100,6 +100,22 @@ pub const ModelConfig = struct {
     boi_token_id: u32 = 0, // beginning of image
     eoi_token_id: u32 = 0, // end of image
 
+    // Gemma 4 12B "unified" (encoder-free) multimodal. Instead of the SigLIP
+    // transformer tower, vision is a single patch embedder
+    // (LN → Dense → LN → +factorized 2D posemb → LN → RMSNorm → Linear) and
+    // audio is raw 640-sample frames projected straight to text space. Set
+    // when model_type is gemma4_unified*. See src/vision.zig (UnifiedEmbedder).
+    is_gemma4_unified: bool = false,
+    vision_mm_embed_dim: u32 = 0, // unified: mm_embed_dim (3840 for 12B = text hidden)
+    vision_model_patch_size: u32 = 0, // unified: 48px merged "model patch" (16px teacher × 3 pool)
+    vision_mm_posemb_size: u32 = 0, // unified: factorized position table size per axis (1120)
+    // Audio (gemma4_unified). embed_audio projects audio_embed_dim → text hidden.
+    audio_token_id: u32 = 0, // 0 = no audio token
+    boa_token_id: u32 = 0, // beginning of audio
+    eoa_token_id: u32 = 0, // end of audio
+    audio_embed_dim: u32 = 0, // unified: raw samples per token (640)
+    audio_samples_per_token: u32 = 640, // 40ms @ 16kHz
+
     // Token IDs that mark the start of a user turn in the rendered prompt.
     // Populated at startup by encoding a chat-template-specific prefix string
     // (e.g. "<|turn>user\n" for Gemma 4, "<|im_start|>user\n" for Qwen ChatML).
@@ -467,7 +483,39 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             // vision_config.standardize is presence-only — the actual `std_scale`/`std_bias`
             // safetensors presence drives behavior in `VisionEncoder.init`, so the config
             // flag needs no field.
+
+            // Gemma 4 12B unified (encoder-free) vision fields. Distinct names
+            // from the SigLIP tower: mm_embed_dim (vs hidden_size),
+            // model_patch_size (48px merged patch vs 16px teacher patch_size),
+            // num_soft_tokens (vs default_output_length), mm_posemb_size.
+            if (vc.get("mm_embed_dim")) |v| { if (v == .integer) config.vision_mm_embed_dim = @intCast(v.integer); }
+            if (vc.get("model_patch_size")) |v| { if (v == .integer) config.vision_model_patch_size = @intCast(v.integer); }
+            if (vc.get("num_soft_tokens")) |v| { if (v == .integer) config.vision_soft_tokens = @intCast(v.integer); }
+            if (vc.get("mm_posemb_size")) |v| { if (v == .integer) config.vision_mm_posemb_size = @intCast(v.integer); }
         }
+    }
+    // Audio config (Gemma 4 12B unified — raw-waveform projection, no conformer)
+    if (root.get("audio_config")) |ac_val| {
+        if (ac_val == .object) {
+            const ac = ac_val.object;
+            if (ac.get("audio_embed_dim")) |v| { if (v == .integer) config.audio_embed_dim = @intCast(v.integer); }
+            // audio_samples_per_token lives in processor_config, not config.json;
+            // default 640 (40ms @ 16kHz) matches the only shipped unified checkpoint.
+            if (ac.get("audio_samples_per_token")) |v| { if (v == .integer) config.audio_samples_per_token = @intCast(v.integer); }
+        }
+    }
+    if (root.get("audio_token_id")) |v| {
+        if (v == .integer) config.audio_token_id = @intCast(v.integer);
+    }
+    if (root.get("boa_token_id")) |v| {
+        if (v == .integer) config.boa_token_id = @intCast(v.integer);
+    }
+    // eoa lives under `eoa_token_index` in the unified config.json.
+    if (root.get("eoa_token_index")) |v| {
+        if (v == .integer) config.eoa_token_id = @intCast(v.integer);
+    }
+    if (root.get("eoa_token_id")) |v| {
+        if (v == .integer and config.eoa_token_id == 0) config.eoa_token_id = @intCast(v.integer);
     }
     // Image token ID (top-level or in mm_tokens_per_image config)
     if (root.get("image_token_id")) |v| {
@@ -521,6 +569,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // every downstream model_type comparison in transformer.zig/drafter.zig
         // (attn_scale gate, recommendedBlockSize, etc.) treats it identically
         // to 31B Dense without per-arch fan-out.
+        // Detect the unified (12B encoder-free multimodal) variant before we
+        // collapse the tag — drives vision_embedder/embed_audio weight loading
+        // and the encoder-free forward in src/vision.zig.
+        config.is_gemma4_unified = std.mem.indexOf(u8, model_type, "unified") != null;
         config.model_type = "gemma4";
         config.weight_prefix = "language_model.model";
         config.hidden_act = .gelu_approx;
@@ -873,20 +925,22 @@ fn loadSafetensorsFile(
 /// checkpoints are kept (the binder ignores them, but the loader doesn't
 /// need to know that).
 pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
+    // Gemma 4 12B `gemma4_unified` is encoder-free: it ships a tiny vision
+    // patch embedder (`vision_embedder.*` + `embed_vision.*`) and a raw-waveform
+    // audio projection (`embed_audio.*`) instead of the SigLIP vision tower and
+    // conformer audio tower of earlier Gemma 4 variants. Those embedders are
+    // wired in src/vision.zig (UnifiedEmbedder), so keep them under the same
+    // `load_vision` gate as the SigLIP weights (`--no-vision` → text only).
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
         std.mem.startsWith(u8, key, "embed_vision.") or
         std.mem.startsWith(u8, key, "vision_embedder.") or
+        std.mem.startsWith(u8, key, "embed_audio.") or
         std.mem.startsWith(u8, key, "multi_modal_projector.") or
         std.mem.startsWith(u8, key, "language_model.multi_modal_projector.");
-    // Gemma 4 12B `gemma4_unified` ships a unified embedder
-    // (`vision_embedder.*`, `embed_audio.*`) in place of the SigLIP vision
-    // tower and conformer audio tower of earlier Gemma 4 variants. The
-    // existing forward path doesn't wire them; treat them as vision/audio
-    // sidecar weights so they're dropped under the same flag.
-    const is_audio = std.mem.startsWith(u8, key, "audio_tower.") or
-        std.mem.startsWith(u8, key, "embed_audio.") or
+    // The heavy SigLIP-era conformer audio tower is still not wired — drop it.
+    const is_audio_tower = std.mem.startsWith(u8, key, "audio_tower.") or
         std.mem.startsWith(u8, key, "language_model.audio_multi_modal_projector.");
-    if (is_audio) return false;
+    if (is_audio_tower) return false;
     if (is_vision and !load_vision) return false;
     return true;
 }
@@ -1132,14 +1186,19 @@ test "shouldKeepWeightKey filters audio and gated vision weights" {
     try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.self_attn.q_proj.weight", false));
 }
 
-test "shouldKeepWeightKey filters Gemma 4 12B unified embedder weights" {
-    // gemma4_unified replaces the SigLIP vision tower and conformer audio
-    // tower with a single matmul (vision_embedder.*) and a linear projection
-    // (embed_audio.*). The text forward path doesn't wire these; treat them
-    // as vision/audio sidecars under the same filter.
-    try testing.expect(!shouldKeepWeightKey("embed_audio.weight", true));
-    try testing.expect(!shouldKeepWeightKey("vision_embedder.proj.weight", false));
-    try testing.expect(shouldKeepWeightKey("vision_embedder.proj.weight", true));
+test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision enabled" {
+    // gemma4_unified is encoder-free: vision_embedder.* (patch embedder),
+    // embed_vision.* and embed_audio.* (raw projections) ARE wired in
+    // src/vision.zig (UnifiedEmbedder), so they must be kept under load_vision.
+    // The heavy SigLIP-era conformer audio_tower.* stays dropped.
+    try testing.expect(shouldKeepWeightKey("vision_embedder.patch_dense.weight", true));
+    try testing.expect(shouldKeepWeightKey("embed_vision.embedding_projection.weight", true));
+    try testing.expect(shouldKeepWeightKey("embed_audio.embedding_projection.weight", true));
+    // Gated off by --no-vision.
+    try testing.expect(!shouldKeepWeightKey("vision_embedder.patch_dense.weight", false));
+    try testing.expect(!shouldKeepWeightKey("embed_audio.embedding_projection.weight", false));
+    // The conformer audio tower is never wired — always dropped.
+    try testing.expect(!shouldKeepWeightKey("audio_tower.encoder.layer.0.weight", true));
 }
 
 test "ModelConfig parses gemma4_unified text_config" {
@@ -1201,4 +1260,64 @@ test "ModelConfig parses gemma4_unified text_config" {
     try testing.expectApproxEqAbs(@as(f32, 30.0), config.final_logit_softcapping, 0.001);
     try testing.expectEqual(@as(u32, 3840), config.hidden_size);
     try testing.expectEqual(@as(u32, 48), config.num_hidden_layers);
+    // Unified flag drives the encoder-free vision/audio embedder path.
+    try testing.expect(config.is_gemma4_unified);
+}
+
+test "ModelConfig parses gemma4_unified vision + audio multimodal fields" {
+    // The 12B unified config.json carries top-level vision_config/audio_config
+    // with encoder-free dims plus image/audio/boi/boa/eoi/eoa token ids. These
+    // drive the UnifiedEmbedder forward and placeholder insertion.
+    const json =
+        \\{
+        \\  "model_type": "gemma4_unified",
+        \\  "image_token_id": 258880,
+        \\  "audio_token_id": 258881,
+        \\  "boi_token_id": 255999,
+        \\  "eoi_token_id": 258882,
+        \\  "boa_token_id": 256000,
+        \\  "eoa_token_index": 258883,
+        \\  "vision_config": {
+        \\    "model_type": "gemma4_unified_vision",
+        \\    "mm_embed_dim": 3840,
+        \\    "mm_posemb_size": 1120,
+        \\    "model_patch_size": 48,
+        \\    "patch_size": 16,
+        \\    "pooling_kernel_size": 3,
+        \\    "num_soft_tokens": 280,
+        \\    "output_proj_dims": 3840,
+        \\    "rms_norm_eps": 1e-06
+        \\  },
+        \\  "audio_config": {
+        \\    "model_type": "gemma4_unified_audio",
+        \\    "audio_embed_dim": 640,
+        \\    "output_proj_dims": 640,
+        \\    "rms_norm_eps": 1e-06
+        \\  },
+        \\  "text_config": {
+        \\    "hidden_size": 3840,
+        \\    "num_hidden_layers": 48,
+        \\    "head_dim": 256
+        \\  },
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.is_gemma4_unified);
+    try testing.expect(config.has_vision);
+    // Vision (encoder-free) dims.
+    try testing.expectEqual(@as(u32, 3840), config.vision_mm_embed_dim);
+    try testing.expectEqual(@as(u32, 48), config.vision_model_patch_size);
+    try testing.expectEqual(@as(u32, 1120), config.vision_mm_posemb_size);
+    try testing.expectEqual(@as(u32, 280), config.vision_soft_tokens);
+    try testing.expectEqual(@as(u32, 3), config.vision_pooling_kernel);
+    // Audio.
+    try testing.expectEqual(@as(u32, 640), config.audio_embed_dim);
+    // Multimodal token ids.
+    try testing.expectEqual(@as(u32, 258880), config.image_token_id);
+    try testing.expectEqual(@as(u32, 258881), config.audio_token_id);
+    try testing.expectEqual(@as(u32, 255999), config.boi_token_id);
+    try testing.expectEqual(@as(u32, 258882), config.eoi_token_id);
+    try testing.expectEqual(@as(u32, 256000), config.boa_token_id);
+    try testing.expectEqual(@as(u32, 258883), config.eoa_token_id);
 }

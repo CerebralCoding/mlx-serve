@@ -66,12 +66,16 @@ class AppState: ObservableObject {
     }
     @Published var chatSessions: [ChatSession] = []
     @Published var activeChatId: UUID?
+    /// Set by the menu bar's Voice action; the chat detail view consumes it to
+    /// auto-start Voice mode (whether the window was already open or just opened).
+    @Published var pendingVoiceLaunch = false
     @Published var agentMemory = AgentMemory()
     @Published var toolExecutor = ToolExecutor()
     let testServer = TestServer()
     @Published var python = PythonManager()
     lazy var imageGen = ImageGenService(python: python)
     lazy var videoGen = VideoGenService(python: python)
+    lazy var audioGen = AudioGenService(python: python)
     @Published var hasSeenWelcome: Bool {
         didSet { UserDefaults.standard.set(hasSeenWelcome, forKey: "hasSeenWelcome") }
     }
@@ -101,6 +105,20 @@ class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(mcpMode, forKey: "mcpMode") }
     }
     let mcpManager = MCPManager()
+
+    /// The single generation engine shared by the text chat window and the voice
+    /// assistant — one code path, no behavioural drift. App-level so generation
+    /// is independent of any window.
+    lazy var chatEngine = ChatTurnEngine(appState: self)
+
+    /// The persistent, window-independent voice assistant. Owned here (not in a
+    /// view) so it survives chat-window open/close and runs from the menu-bar
+    /// tray. `bind` wires it to `chatEngine` and the active session once.
+    lazy var voice: VoiceModeController = {
+        let controller = VoiceModeController()
+        controller.bind(appState: self)
+        return controller
+    }()
 
     private let historyPath: String = {
         let dir = NSString(string: "~/.mlx-serve").expandingTildeInPath

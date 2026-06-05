@@ -32,6 +32,12 @@ final class PythonManager: ObservableObject {
         return dir
     }()
 
+    nonisolated static let audiosRoot: String = {
+        let dir = NSString(string: "~/.mlx-serve/generations/audio").expandingTildeInPath
+        try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        return dir
+    }()
+
     /// Python path to use when invoking scripts — the venv's `bin/python`.
     nonisolated static var venvPython: String { (venvDir as NSString).appendingPathComponent("bin/python") }
     nonisolated static var venvPip: String { (venvDir as NSString).appendingPathComponent("bin/pip") }
@@ -54,17 +60,48 @@ final class PythonManager: ObservableObject {
         // so we install each one explicitly. Order matters: core first.
         "ltx-core-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git#subdirectory=packages/ltx-core-mlx",
         "ltx-pipelines-mlx @ git+https://github.com/dgrauet/ltx-2-mlx.git#subdirectory=packages/ltx-pipelines-mlx",
+        // Neural TTS + zero-shot voice cloning (AudioGen). MLX-native, no torch.
+        "mlx-audio",
         "huggingface_hub",
         "safetensors",
         "pillow",
     ]
 
-    /// Module names we probe to tell whether the venv is usable. Must match
-    /// the import names, not the pip distribution names.
-    nonisolated static let requiredImports: [String] = [
-        "mflux", "ltx_pipelines_mlx", "ltx_core_mlx",
-        "PIL", "safetensors", "huggingface_hub",
+    /// Pipeline symbols the video generation script (`VideoGenService.script`)
+    /// imports from `ltx_pipelines_mlx`. The git-pinned ltx-2-mlx workspace
+    /// drifts across reinstalls, so a bare `import ltx_pipelines_mlx` isn't
+    /// enough to tell whether the venv is actually usable — it succeeds even
+    /// after these symbols are renamed/removed, which made the app report the
+    /// venv ready while generation died at runtime with
+    /// "cannot import name 'TextToVideoPipeline'". Keep in sync with the
+    /// `from ltx_pipelines_mlx import …` line in VideoGenService.script.
+    /// (ltx-2-mlx ≥0.14 renamed these from the old TextToVideoPipeline /
+    /// TwoStagePipeline / TwoStageHQPipeline to the TI2Vid* names below.)
+    nonisolated static let ltxPipelineSymbols: [String] = [
+        "TI2VidOneStagePipeline", "TI2VidTwoStagesPipeline", "TI2VidTwoStagesHQPipeline",
     ]
+
+    /// Import probes that tell whether the venv is usable, as full Python
+    /// statements run together as one `python -c` program. Bare modules use
+    /// `import X` (import name, not the pip distribution name); ltx is probed
+    /// at the symbol level so upstream drift surfaces as `.needsPackages` and
+    /// the UI re-offers the installer instead of failing mid-generation.
+    nonisolated static let requiredImports: [String] = [
+        "import mflux",
+        "import ltx_core_mlx",
+        "from ltx_pipelines_mlx import " + ltxPipelineSymbols.joined(separator: ", "),
+        "from mlx_audio.tts.generate import generate_audio",
+        "import PIL",
+        "import safetensors",
+        "import huggingface_hub",
+    ]
+
+    /// The `python -c` program that verifies every required import resolves —
+    /// modules *and* the specific symbols generation depends on. Pure string
+    /// builder so it stays unit-testable.
+    nonisolated static func importProbeScript() -> String {
+        requiredImports.joined(separator: "\n")
+    }
 
     enum Status: Equatable {
         case unknown              // haven't checked yet
@@ -194,11 +231,13 @@ final class PythonManager: ObservableObject {
         }.value
     }
 
-    /// Probe the venv by importing every module in `requiredImports`. Using one
-    /// `python -c` call keeps latency low (single interpreter startup).
+    /// Probe the venv by running every statement in `requiredImports` (modules
+    /// + the ltx pipeline symbols). Using one `python -c` call keeps latency low
+    /// (single interpreter startup); a nonzero exit means a missing module *or*
+    /// a drifted/removed symbol, both of which require a reinstall.
     nonisolated static func checkPackages() async -> Bool {
         guard FileManager.default.isExecutableFile(atPath: venvPython) else { return false }
-        let script = "import " + requiredImports.joined(separator: ", ")
+        let script = importProbeScript()
         return await Task.detached { () -> Bool in
             let proc = Process()
             proc.executableURL = URL(fileURLWithPath: venvPython)

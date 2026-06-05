@@ -71,6 +71,48 @@ private func safeFrameCap(modelRAMGB: Int, modelMaxFrames: Int, width: Int, heig
     return min(modelMaxFrames, max(9, framesByRAM))
 }
 
+// =============================================================================
+// MARK: - Replica of PythonManager's venv import-probe
+//
+// `checkPackages()` builds one `python -c` program from `requiredImports` and
+// treats a nonzero exit as "venv not ready → show the install pane". The bug:
+// a bare `import ltx_pipelines_mlx` succeeds even after the git-pinned package
+// drifts and stops exporting `TextToVideoPipeline`, so the app reported
+// `.ready` and let the user click Generate — which then died at runtime with
+// "cannot import name 'TextToVideoPipeline'". The probe must verify the exact
+// symbols the generation script imports, not just that the module loads.
+// Kept verbatim-in-sync with PythonManager.requiredImports / importProbeScript().
+// =============================================================================
+
+/// Pipeline symbols `VideoGenService.script` imports from `ltx_pipelines_mlx`
+/// (ltx-2-mlx ≥0.14 names).
+private let ltxPipelineSymbolsReplica = ["TI2VidOneStagePipeline", "TI2VidTwoStagesPipeline", "TI2VidTwoStagesHQPipeline"]
+
+private let requiredImportsReplica: [String] = [
+    "import mflux",
+    "import ltx_core_mlx",
+    "from ltx_pipelines_mlx import " + ltxPipelineSymbolsReplica.joined(separator: ", "),
+    "from mlx_audio.tts.generate import generate_audio",
+    "import PIL",
+    "import safetensors",
+    "import huggingface_hub",
+]
+
+private func importProbeScriptReplica() -> String {
+    requiredImportsReplica.joined(separator: "\n")
+}
+
+/// The single import statement that probes `ltx_pipelines_mlx`, isolated so a
+/// test can run it against a throwaway package without needing mflux/PIL/etc.
+private func ltxProbeStatementReplica() -> String {
+    requiredImportsReplica.first { $0.contains("ltx_pipelines_mlx") }!
+}
+
+/// Replica of `VideoGenService.indicatesVenvNeedsReinstall`.
+private func indicatesVenvNeedsReinstallReplica(_ message: String) -> Bool {
+    message.localizedCaseInsensitiveContains("import failed")
+}
+
 final class MediaGenTests: XCTestCase {
 
     // MARK: - Quality preset
@@ -185,5 +227,128 @@ final class MediaGenTests: XCTestCase {
         XCTAssertNil(GenEventReplica.parse("{}"))
         XCTAssertNil(GenEventReplica.parse(#"{"type":"unknown"}"#))
         XCTAssertNil(GenEventReplica.parse(#"{"type":"complete"}"#))
+    }
+
+    // MARK: - frame_rate / fps plumbing
+
+    /// Replica of the arg vector `VideoGenService.buildArgs` produces (fps
+    /// portion). ltx-2-mlx's `generate_and_save` makes `frame_rate` a required
+    /// keyword arg, so the CLI args MUST carry an fps the script forwards —
+    /// dropping it is a hard TypeError the moment generation starts.
+    private func videoBuildArgsReplica(fps: Int, numFrames: Int, steps: Int) -> [String] {
+        [
+            "--frames", String(numFrames),
+            "--fps", String(fps),
+            "--steps", String(steps),
+        ]
+    }
+
+    func testBuildArgsForwardsFps() {
+        let args = videoBuildArgsReplica(fps: 24, numFrames: 97, steps: 8)
+        guard let i = args.firstIndex(of: "--fps") else {
+            return XCTFail("video args must include --fps so the script can pass the mandatory frame_rate")
+        }
+        XCTAssertEqual(args[args.index(after: i)], "24",
+            "fps value must follow the --fps flag")
+    }
+
+    // MARK: - venv import-probe (ltx symbol drift)
+
+    /// Regression for the bug report: a venv whose `ltx_pipelines_mlx` module
+    /// imports fine but no longer exports `TextToVideoPipeline` (upstream
+    /// drift) must be detected as NOT ready, so the UI re-offers the installer
+    /// instead of letting generation fail at runtime. Runs the real probe
+    /// statement against a throwaway package with the symbol missing.
+    func testProbeDetectsMissingPipelineSymbol() throws {
+        guard let py = Self.findPython3() else { throw XCTSkip("python3 not available") }
+        let dir = try Self.makeFakeLtxPackage(symbols: [])
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let status = Self.runPythonProbe(py, script: ltxProbeStatementReplica(), pythonPath: dir)
+        XCTAssertNotEqual(status, 0,
+            "A venv whose ltx_pipelines_mlx lacks TextToVideoPipeline must probe as NOT ready")
+    }
+
+    /// The positive case: when every pipeline symbol is exported, the probe
+    /// passes and the venv counts as ready.
+    func testProbePassesWhenPipelineSymbolsPresent() throws {
+        guard let py = Self.findPython3() else { throw XCTSkip("python3 not available") }
+        let dir = try Self.makeFakeLtxPackage(symbols: ltxPipelineSymbolsReplica)
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let status = Self.runPythonProbe(py, script: ltxProbeStatementReplica(), pythonPath: dir)
+        XCTAssertEqual(status, 0, "A venv exporting all pipeline symbols must probe as ready")
+    }
+
+    /// The full probe must check ltx at the symbol level, as a newline-joined
+    /// multi-statement program — not the old single comma `import` that masked
+    /// the drift.
+    func testImportProbeIsSymbolLevelForLtx() {
+        let script = importProbeScriptReplica()
+        XCTAssertTrue(script.contains("from ltx_pipelines_mlx import \(ltxPipelineSymbolsReplica.first!)"),
+            "Probe must verify the pipeline symbols, not just that the module loads:\n\(script)")
+        XCTAssertTrue(script.contains("\n"),
+            "Probe must be a newline-joined multi-statement program")
+        XCTAssertFalse(script.contains("import mflux, "),
+            "Probe should not collapse modules into a single comma import")
+    }
+
+    /// The runtime-recovery predicate: a failed required import (the bug's
+    /// "ltx-2-mlx import failed: … Re-run the installer." message) must trigger
+    /// re-detection; an ordinary per-request error must not.
+    func testReinstallPredicateMatchesImportFailures() {
+        XCTAssertTrue(indicatesVenvNeedsReinstallReplica(
+            "ltx-2-mlx import failed: cannot import name 'TextToVideoPipeline'. Re-run the installer."))
+        XCTAssertTrue(indicatesVenvNeedsReinstallReplica("mflux import failed: No module named 'mflux'"))
+        XCTAssertFalse(indicatesVenvNeedsReinstallReplica("Model download failed: 404"))
+        XCTAssertFalse(indicatesVenvNeedsReinstallReplica("ffmpeg not found on PATH."))
+    }
+
+    /// End-to-end against the real venv (skipped where none exists, e.g. CI):
+    /// the symbols the app probes must actually be exported by the installed
+    /// `ltx_pipelines_mlx`. This is what caught the 0.14.9 rename
+    /// (TextToVideoPipeline → TI2VidOneStagePipeline) that made a freshly
+    /// installed venv still fail the import check.
+    func testRealVenvPassesFullImportProbe() throws {
+        let venvPython = NSString(string: "~/.mlx-serve/venv/bin/python").expandingTildeInPath
+        guard FileManager.default.isExecutableFile(atPath: venvPython) else {
+            throw XCTSkip("no venv at ~/.mlx-serve/venv")
+        }
+        let status = Self.runPythonProbe(venvPython, script: importProbeScriptReplica(), pythonPath: "")
+        XCTAssertEqual(status, 0,
+            "The installed venv must pass the same import probe the app runs:\n\(importProbeScriptReplica())")
+    }
+
+    // MARK: - Probe test helpers
+
+    private static func findPython3() -> String? {
+        for p in ["/opt/homebrew/bin/python3", "/usr/local/bin/python3", "/usr/bin/python3"]
+        where FileManager.default.isExecutableFile(atPath: p) { return p }
+        return nil
+    }
+
+    /// Create a throwaway `ltx_pipelines_mlx` package exporting `symbols`;
+    /// returns the directory to place on PYTHONPATH.
+    private static func makeFakeLtxPackage(symbols: [String]) throws -> String {
+        let root = (NSTemporaryDirectory() as NSString)
+            .appendingPathComponent("ltxprobe-" + UUID().uuidString)
+        let pkg = (root as NSString).appendingPathComponent("ltx_pipelines_mlx")
+        try FileManager.default.createDirectory(atPath: pkg, withIntermediateDirectories: true)
+        let body = symbols.map { "\($0) = object" }.joined(separator: "\n") + "\n"
+        try body.write(toFile: (pkg as NSString).appendingPathComponent("__init__.py"),
+                       atomically: true, encoding: .utf8)
+        return root
+    }
+
+    private static func runPythonProbe(_ python: String, script: String, pythonPath: String) -> Int32 {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: python)
+        proc.arguments = ["-c", script]
+        var env = ProcessInfo.processInfo.environment
+        env["PYTHONPATH"] = pythonPath
+        proc.environment = env
+        proc.standardOutput = Pipe()
+        proc.standardError = Pipe()
+        do { try proc.run() } catch { return -1 }
+        proc.waitUntilExit()
+        return proc.terminationStatus
     }
 }
