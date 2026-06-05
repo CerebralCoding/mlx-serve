@@ -188,21 +188,31 @@ chmod -R u+w "$APP"
 
 # Hardened runtime requires a real Team ID — skip it for ad-hoc ("-") signing,
 # otherwise dyld rejects framework loads with "different Team IDs".
+ENTITLEMENTS="$SCRIPT_DIR/MLXCore.entitlements"
 if [ "$IDENTITY" = "-" ]; then
     SIGN_OPTS=(--force --sign -)
+    # Ad-hoc dev builds run without hardened runtime, so the mic prompt works
+    # without entitlements — sign the app process the same way as everything else.
+    APP_SIGN_OPTS=("${SIGN_OPTS[@]}")
 else
     SIGN_OPTS=(--force --options runtime --sign "$IDENTITY")
+    # Under hardened runtime the mic-using process (MLXCore) and the .app need
+    # the com.apple.security.device.audio-input entitlement, or macOS denies
+    # microphone access in Voice mode without ever prompting. Frameworks/dylibs
+    # and the headless mlx-serve binary must NOT carry it (over-broad
+    # entitlements can fail notarization).
+    APP_SIGN_OPTS=("${SIGN_OPTS[@]}" --entitlements "$ENTITLEMENTS")
 fi
 
-# Sign frameworks first (inside-out)
+# Sign frameworks first (inside-out) — no entitlements.
 for fw in "$CONTENTS/Frameworks/"*.metallib "$CONTENTS/Frameworks/"*.dylib; do
     [ -f "$fw" ] && codesign "${SIGN_OPTS[@]}" "$fw" && echo "  Signed: $(basename "$fw")"
 done
 
-# Sign executables
+# Sign executables — the mic-using app process and bundle get the entitlement.
 codesign "${SIGN_OPTS[@]}" "$CONTENTS/MacOS/mlx-serve" && echo "  Signed: mlx-serve"
-codesign "${SIGN_OPTS[@]}" "$CONTENTS/MacOS/MLXCore" && echo "  Signed: MLXCore"
-codesign "${SIGN_OPTS[@]}" "$APP" && echo "  Signed: $APP_NAME.app"
+codesign "${APP_SIGN_OPTS[@]}" "$CONTENTS/MacOS/MLXCore" && echo "  Signed: MLXCore"
+codesign "${APP_SIGN_OPTS[@]}" "$APP" && echo "  Signed: $APP_NAME.app"
 
 # Verify
 codesign -vv "$APP" 2>&1 | head -3
