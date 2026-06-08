@@ -144,9 +144,15 @@ final class MCPTests: XCTestCase {
         XCTAssertNil(config.mcpServers["github"]?.disabled)
 
         // Re-encode and decode again — should be lossless for fields we model.
+        // NB: bare Codable does NOT preserve key order (Foundation's JSONDecoder shuffles object keys
+        // via an internal hash; order is only recovered through MCPConfigStore.load's text scan — see
+        // testMCPConfigPreservesKeyOrderThroughSaveAndLoad). OrderedDictionary's `==` is order-sensitive,
+        // so compare as a plain Dictionary here to assert value-losslessness without depending on hash order.
         let encoded = try JSONEncoder().encode(config)
         let decoded = try JSONDecoder().decode(MCPConfig.self, from: encoded)
-        XCTAssertEqual(decoded, config)
+        XCTAssertEqual(
+            Dictionary(uniqueKeysWithValues: decoded.mcpServers.map { ($0, $1) }),
+            Dictionary(uniqueKeysWithValues: config.mcpServers.map { ($0, $1) }))
     }
 
     /// HTTP-transport entries have only a `url` field — no command/args. Must decode without dropping
