@@ -201,27 +201,32 @@ struct StatusMenuView: View {
                             // model via the Drafter toggle in Settings, not
                             // loadable as a target on their own.
                             let pickable = appState.localModels.filter { $0.kind == .base }
+                            // macOS .menu Pickers key the checkmark by item
+                            // TITLE — two same-named rows (one GGUF, one MLX)
+                            // both rendered selected. Suffix duplicated names
+                            // with the engine tag so titles stay unique.
+                            let dupNames = LocalModel.duplicateNames(in: pickable)
                             let mlxServe = pickable.filter { $0.source == .mlxServe }
                             let lmStudio = pickable.filter { $0.source == .lmStudio }
                             let custom = pickable.filter { $0.source == .custom }
                             if !mlxServe.isEmpty {
                                 Section("MLX-Serve Models") {
                                     ForEach(mlxServe) { model in
-                                        Text(modelPickerLabel(model)).tag(model.path)
+                                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
                                     }
                                 }
                             }
                             if !lmStudio.isEmpty {
                                 Section("Other Discovered Models") {
                                     ForEach(lmStudio) { model in
-                                        Text(modelPickerLabel(model)).tag(model.path)
+                                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
                                     }
                                 }
                             }
                             if !custom.isEmpty {
                                 Section("Custom Folder") {
                                     ForEach(custom) { model in
-                                        Text(modelPickerLabel(model)).tag(model.path)
+                                        Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
                                     }
                                 }
                             }
@@ -277,11 +282,22 @@ struct StatusMenuView: View {
                         .help("Open Server Log in a separate window (easier copy/paste)")
                     }
 
-                    Toggle("Auto-start on launch", isOn: $appState.autoStartServer)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .toggleStyle(.switch)
-                        .controlSize(.mini)
+                    HStack {
+                        Toggle("Auto-start on launch", isOn: $appState.autoStartServer)
+                            .toggleStyle(.switch)
+                            .controlSize(.mini)
+                        Spacer()
+                        // Which embedded engine the selected model routes to
+                        // (MLX safetensors, llama.cpp GGUF, or ds4 GGUF).
+                        if let engine = appState.localModels
+                            .first(where: { $0.path == appState.selectedModelPath })?.engine
+                        {
+                            Text(engine.displayName)
+                                .help("Engine the selected model runs on")
+                        }
+                    }
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
 
                     if showLog {
                         // Each `ServerLogView` instance owns a tiny poller —
@@ -547,12 +563,16 @@ struct StatusMenuView: View {
     /// row. Lets the user see at a glance which models keep the speedup if
     /// they switch (auto-sync swaps `drafterPath` to the matching one on
     /// model change). When drafter is off, no badges anywhere.
-    private func modelPickerLabel(_ model: LocalModel) -> String {
+    private func modelPickerLabel(_ model: LocalModel, dupNames: Set<String>) -> String {
+        var label = model.name
+        if dupNames.contains(model.name) {
+            label += " · \(model.engine.shortLabel)"
+        }
         guard !appState.serverOptions.drafterPath.isEmpty,
               downloads.recommendedDrafterFromPath(model.path) != nil else {
-            return model.name
+            return label
         }
-        return "\(model.name) + assist"
+        return "\(label) + assist"
     }
 }
 

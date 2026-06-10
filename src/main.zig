@@ -84,7 +84,7 @@ fn printUsage(io: std.Io) void {
         \\                        0 disables.
         \\  --llama-cache-entries <n>
         \\                      For GGUF models served via llama.cpp, the max
-        \\                        number of resident KV sessions (default: 1).
+        \\                        number of resident KV sessions (default: 4).
         \\                        N > 1 keeps the N most-recently-used prompts
         \\                        hot so alternating multi-doc workloads don't
         \\                        cold-prefill on every flip.
@@ -283,7 +283,7 @@ pub fn main(init: std.process.Init) !void {
             // (every prefill fights for the one slot). > 1 enables the
             // best-prefix-match LRU.
             i += 1;
-            server_mod.llama_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 1;
+            server_mod.llama_cache_entries = std.fmt.parseInt(u32, args[i], 10) catch 4;
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-stride") and i + 1 < args.len) {
             // Phase 1 (perf-plan): per-position SSM/conv state snapshots during
             // chunked prefill enable multi-turn warm reuse on hybrid SSM
@@ -725,6 +725,9 @@ pub fn main(init: std.process.Init) !void {
         }
         if (xfm.moe_layers != null) {
             xfm.compileMoeRouting();
+        }
+        if (config.linear_num_key_heads > 0) {
+            xfm.compileGdnGate();
         }
         log.info("Model ready.\n", .{});
         const user_prompt = prompt orelse "What is 2+2? Answer in one sentence.";

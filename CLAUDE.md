@@ -85,6 +85,9 @@ Existing tools:
 | Command | Purpose |
 |---|---|
 | `zig build test` | Zig unit tests |
+| `zig build test -Dtest-filter="format corpus"` | Hermetic format-correctness corpus (`src/format_corpus_test.zig`): real captured model outputs across families through splitThinkBlock/stripThinkBlock/parseToolCalls, plus universal no-tag-leak + valid-JSON-args invariants. No weights; harvest workflow in the file header. |
+| `FORMAT_MODELS=<csv> ./tests/test_format_matrix.sh` | Live format matrix: 7 format-family representatives (Qwen think-tags, Gemma 4 channel-tags + custom tool args, Qwen MoE raw-JSON, Gemma 3 fallback/fenced-JSON, GGUF/llama.cpp, DSV4-Flash/ds4) × 8 checks: thinking split, stream+tools content routing, tool-arg byte-fidelity (chat + /v1/messages tool_use), omitted max_tokens. One model at a time on port 11297 with `--log-level debug`; FAILs echo raw-output dumps for corpus harvesting. `FORMAT_MODELS=gemma4-e4b` ≈ 3 min smoke; missing paths skip cleanly. |
+| `VALIDATOR_MODELS=<csv> ./tests/test_validator_matrix.sh` | API-compliance + agentic matrix: per architecture (gemma4, gemma3, qwen3_5 dense, qwen3_5_moe, qwen3_moe, llama-engine GGUF, ds4 GGUF) boots a server, runs llmprobe (`~/projects/agents/responses-chat-messages-validator`, 112 checks across /v1/responses + /v1/chat/completions + /v1/messages), then the pi 2-turn html agentic case (multi-turn tool calls) via pi_integration_run.sh. `SKIP_PI=1`/`SKIP_PROBE=1` run one layer; pkills ALL serving mlx-serve instances (81GB ds4 coexistence). Logs in tests/validator-results/. |
 | `cd app && swift test` | Swift unit tests |
 | `./tests/integration_test.sh [model_dir] [port]` | 36 end-to-end API tests |
 | `./tests/test_tool_response.sh [port]` | Tool calling round-trip |

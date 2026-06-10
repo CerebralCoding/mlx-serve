@@ -467,3 +467,156 @@ contended); a clean single-server run gives **50.0** — mlx-serve GGUF is compe
 with LM Studio GGUF, not 25% behind. (3) No apples-to-apples uniform-4-bit QAT MLX
 exists to download (mlx-community ships only the mixed `qat-4bit` and an `qat-mxfp8`);
 it has to be built.
+
+---
+
+## 2026-06-10 — Session baseline (mlx-serve vs fresh mlx-lm 0.31.3) + lost bench helper restored
+
+`tests/_decode_stream.py` (the SSE-stream decode-rate measurer bench.sh depends on) was
+never committed and had been deleted from the working tree — every decode row came back 0.
+Reconstructed from the bench.sh contract (force `stream:true`, count content+reasoning
+delta pieces, rate = (n−1)/(t_last−t_first), output `rate|n|reasoning_n`). It now lives in
+the tree and should be committed with this session's work.
+
+Baseline, current main @ 0188c14, ReleaseFast, temp=0, 128 tok, ctx 4096, M4 Max 128 GB.
+mlx-lm = fresh venv, mlx-lm 0.31.3 / mlx 0.31.2, same checkpoints, strict=False load
+(mlx-community gemma-4 multimodal checkpoints carry redundant KV weights on the
+KV-sharing layers that mlx-lm/mlx-vlm strict loaders reject — worth an upstream issue).
+
+| Model | mlx-serve decode | mlx-lm decode | Δ | weight-GB × tok/s = GB/s (of ~546 peak) |
+|---|---|---|---|---|
+| Gemma 4 E2B 4-bit | **192.5** | 187.8 | +2.5% | 3.3×192.5 ≈ 635¹ |
+| Gemma 4 E4B 4-bit | **116.1** | 115.1 | +0.9% | 4.9×116.1 ≈ 569¹ |
+| Gemma 4 12B 4-bit (stock mixed) | 39.5 | unsupported (`gemma4_unified`) | — | 10.2×39.5 ≈ 403 (74%) |
+| Gemma 4 26B-A4B MoE 4-bit | 113.0 | **114.5** | −1.3% | n/a (sparse activation) |
+| Gemma 4 31B 4-bit | 25.3 | 25.2 | tied | 17.1×25.3 ≈ 433 (79% — at ceiling) |
+| Qwen 3.6 27B hybrid 4-bit | 28.9 | **29.5** | −1.9% | 15.0×28.9 ≈ 434 (79% — at ceiling) |
+| Qwen 3.6 35B-A3B MoE 4-bit | **129.2** | 125.5 | +2.9% | n/a (sparse activation) |
+
+¹ E-series file-size math overestimates per-token traffic (PLE selective load, KV-sharing,
+vision tower excluded at decode) — not evidence of >100% bandwidth.
+
+Readings:
+- Raw decode is at or above the June 6 numbers everywhere; dense-large models sit at the
+  bandwidth ceiling (~79% of theoretical peak ≈ ~90% of realistic peak) — remaining raw
+  upside is in the two engine-level gaps: **26B-A4B MoE −1.3%** and **Qwen 27B hybrid −1.9%**
+  (was −4.4% in May; mlx-lm has improved too, gap persists).
+- 12B (`gemma4_unified`) remains mlx-serve-exclusive on the MLX side; mlx-lm 0.31.3 still
+  has no implementation.
+- Spec-decode flags from this run (CSV `docs/perf-csvs/baseline-26.6.10-all.csv`):
+  PLD/drafter forced on (bench bypasses the prompt gate) cost −9…−15% on the creative
+  decode prompt across the lineup — runtime acceptance gate not saving as much as expected.
+  Drafter loses to raw on 31B code (23.4 vs 24.3) and is far below PLD on every echo cell.
+  12B drafter is below raw everywhere. To investigate in the spec-decode pass.
+- mlx-serve GGUF 31B decode measured 15.5 vs 21.0 on June 6 — needs a clean re-run before
+  trusting (possible llama.cpp-path regression or thermal contamination late in the row).
+
+### Raw-perf pass (same session): GDN gate fused; TODO #1/#3 closed by measurement
+
+- **TODO #1 (whole-forward `mlx_compile`) is a measured no-op**: `MLX_SERVE_COMPILE_FORWARD=1`
+  on Gemma E4B prefill = 2425 vs 2429 tok/s (noise). mlx-lm doesn't compile its full forward
+  either; the activation/routing closures already cover its `@mx.compile` usage. Item retired.
+- **TODO #3 (eval-boundary audit)**: decode loop is already `mlx_async_eval`-pipelined; every
+  dense model sits at/above mlx-lm and the big ones at the bandwidth ceiling — no leak signal.
+- **Qwen 3.6 GDN gate fusion** (the real find): mlx-lm computes the decay gate with a single
+  `@mx.compile`d kernel; we issued ~10 separate dispatches per GDN layer per token, plus
+  rebuilding the parameter-free rms_norm `ones[dk]` weight and two scale scalars EVERY call.
+  Now: `compiled_gdn_gate` closure (shapeless) + cached `gdn_ones_w`/`gdn_q_scale`/`gdn_k_scale`
+  (`transformer.zig`), unit-pinned by `gdnGateChain` fixture test.
+  - Qwen 3.6 27B hybrid: 28.74 → **29.12** tok/s server-internal (gap to mlx-lm 29.46 halved,
+    −2.4% → −1.2%)
+  - Qwen 3.6 35B-A3B MoE: 129.2 → **130.4** stream-measured (+3.9% over mlx-lm)
+- **Gemma 26B-A4B "gap" was noise**: clean re-run 115.8 vs mlx-lm 114.5 → mlx-serve +1.1%
+  ahead (the baseline 113.0 was measured mid-bench-row under thermal load).
+
+Post-pass standings vs mlx-lm 0.31.3: ahead on E2B/E4B/26B/35B, tied at 31B ceiling,
+−1.2% on 27B hybrid (remaining suspect: conv1d-step/dispatch composition), 12B exclusive.
+
+### PLD yield gate + mid-request re-enable (same session)
+
+The baseline exposed a hole in the runtime gate: it only counted verify ROUNDS, so a
+workload where the n-gram lookup rarely matches never tripped it — yet every no-match
+step pays PLD's unpipelined cold forward (the async `next()` pipeline is lost). Forced-on
+PLD cost −14% on creative content (E2B 165 vs 192.5 raw).
+
+Three changes in `generate.zig` (+ `pld_index.tailMatchFraction`):
+1. **Yield gate**: counts EVERY enabled-mode `nextPld` step; under 0.25 accepted drafted
+   tokens/step after 32 steps → fall back to pipelined `next()`.
+2. **Mid-request re-enable**: every 32 disabled steps, score the committed sequence with
+   `tailMatchFraction` (fraction of recent generated positions whose 3-gram appears
+   earlier — i.e. "would a PLD lookup hit"). ≥0.25 → drain the pipeline back to the spec
+   entry invariant (resolve pending token + sample successor from pending_logits — one
+   sync, no KV rollback) and resume speculation. Self-repetition scoring does NOT work
+   here: an echoed file repeats the PROMPT, not itself.
+3. **Scheduler fix**: `runSingleDecodeTick` short-circuited `nextPld` once
+   `spec_disabled_runtime` flipped, which would have pinned PLD off for the rest of the
+   request; now the generator's internal fallback (where the re-enable check lives) runs.
+
+E2B 4-bit, PLD forced on (`enable_pld:true`), stream-measured:
+
+| Workload | before | after | raw (no PLD) |
+|---|---|---|---|
+| creative essay | 165 | **183** | 192.5 |
+| echo paragraph | 352 | **355** | 187 |
+| novel preamble → prompt echo | 178 | **222.5** | ~190 |
+
+The preamble+echo row is the agent-shaped case (think first, then edit a file): gate trips
+during the preamble, re-enables when the echo starts (`tail_match=0.44` at the second
+check), and PLD accelerates the rest. All byte-equivalence pins stay green
+(test_pld_equivalence, test_streaming_pld, test_pld_tools).
+
+**Drafter follow-ups (documented, not yet done)**: 12B drafter is below raw on every cell
+(echo 35.9 vs 39.0) — needs block-size/acceptance investigation, possibly default-off like
+MoE; 31B drafter loses the code cell (23.4 vs 24.3, block_size=8 suspect); drafter echo is
+far below PLD echo everywhere — a PLD-first hybrid (use the n-gram draft when a match
+exists, drafter otherwise) would take the best of both on agent traffic. Drafter disabled
+mode stays sticky (no re-enable) — resuming needs an h_prev re-seed via
+forwardCaptureHidden, not just a pipeline drain.
+
+### Agentic pass: pi coding agent end-to-end (same session)
+
+pi 0.79.1 (provider `mlx` in `~/.pi/agent/models.json`, openai-completions API) against
+mlx-serve on :9999. Initially EVERY task failed silently (pi printed nothing, no files).
+Two server bugs, both fixed with regression tests:
+
+1. **Omitted `max_tokens` defaulted to 256.** pi doesn't send the field; with thinking on,
+   every turn hit `length` mid-reasoning — no tool call or answer ever came back. Now
+   omitted → context-bound via `omittedMaxTokensDefault()` + `clampMaxTokens` (OpenAI
+   semantics; 4096 fallback when ctx unknown). Unit-pinned.
+2. **tools+thinking stream misfiled the final answer as reasoning.** With tools, the
+   stream takes the tool-buffer path; after the think block was split mid-stream the
+   handler never recorded it (`think_closed`), so the visible answer was held as
+   "incomplete thinking" and flushed as `reasoning_content` at end-of-stream — pi
+   rendered an empty reply. Pinned by test_thinking_split.sh checks 15–17 (now 17/17).
+
+Post-fix runs (all green, results independently verified by re-running pytest):
+- Qwen 3.6 35B-A3B: fizzbuzz + 4 pytest tests, multi-iteration, KV cache reuse ~98%
+  warm-turn (5038/5039 cached), final answer rendered.
+- Gemma 4 26B-A4B: wordcount + 3 tests; then a 5-iteration todo-CLI task with
+  iterate-until-green (7 tests passing).
+
+Full regression sweep after all of today's changes: zig unit tests, integration_test.sh
+37/37, test_anthropic_api.sh 42/42, test_tool_response.sh, test_long_agent_memory.sh
+15/15, test_thinking_split.sh 17/17, PLD equivalence ×3 suites, swift build + swift test.
+
+### Gemma 12B pi follow-up (user-reported, same day): two more bugs fixed
+
+David's live pi session on the 12B surfaced what my Qwen/26B testing missed:
+
+1. **Trailing `<|channel>thought` leak.** The 12B ends prose turns by opening a NEW
+   thought channel; split/strip only handled LEADING blocks, so the raw opener (and any
+   dangling thought) reached visible content — pi rendered the literal tag. Fixed via
+   `chat.lastUnclosedThinkOpen` wired into `splitThinkBlock` + `stripThinkBlock`
+   (+6 unit tests). The doubled HTML in the transcript was the model's known repetition
+   loop (degenerate-tail guard then stopped it) — model behavior, not a server bug.
+2. **Unterminated `<|"|>` string swallowed the args closing brace.** When the 12B forgot
+   the closing delimiter on the LAST argument, `convertGemma4Value` scanned to end of
+   body — a real write call created a file literally named ``mlx_pi1.html`}`` on disk.
+   The unterminated branch now trims the enclosing `}` + backtick/whitespace junk;
+   the legit truncated-mid-URL behavior is preserved (existing tests still pass).
+
+Also added a permanent debug aid: `--log-level debug` now dumps the raw generated text
+before tool parsing on the streaming paths (this is how the `<|"|>` malformation was
+caught). Verified end-to-end: 3/3 pi runs of the exact failing task ("make a new html
+design for @mlx_info.html called mlx_pi1.html") on the 12B create exactly `mlx_pi1.html`,
+no tag leaks, proper final summaries.

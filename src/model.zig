@@ -163,7 +163,9 @@ pub const ModelConfig = struct {
         if (self.has_explicit_layer_types and layer_idx < 128) {
             return self.layer_is_global[layer_idx];
         }
-        return (layer_idx % self.sliding_window_pattern) == 0;
+        // HF/mlx-lm convention (Gemma 3): the GLOBAL layer closes each group —
+        // global when `(idx + 1) % pattern == 0` (layers 5, 11, … for pattern 6).
+        return (layer_idx % self.sliding_window_pattern) == self.sliding_window_pattern - 1;
     }
 
     /// For Gemma 4 KV sharing: get the source layer index for a shared layer.
@@ -1062,17 +1064,23 @@ test "ModelConfig userTurnMarkerSlice respects length" {
 }
 
 test "ModelConfig isGlobalLayer with sliding window" {
+    // Gemma 3 convention (HF + mlx-lm): every Nth layer is global, with the
+    // pattern anchored at the END of each group — global when
+    // `(idx + 1) % pattern == 0`, i.e. layers 5, 11, 17… for pattern 6.
+    // The old `% pattern == 0` phase made layer 0 global and layer 5 local —
+    // every layer got the wrong RoPE base/scale and attention scope, which
+    // surfaced as fluent-but-wrong output (spaced digits, broken arithmetic)
+    // on gemma-3-12b. Gemma 4 ships explicit layer_types and never hits this
+    // fallback.
     var config = ModelConfig{};
     config.has_sliding_window = true;
     config.sliding_window_pattern = 6;
-    // Layer 0: 0 % 6 == 0 → global
-    try testing.expect(config.isGlobalLayer(0));
-    // Layer 1: 1 % 6 != 0 → local
+    try testing.expect(!config.isGlobalLayer(0));
     try testing.expect(!config.isGlobalLayer(1));
-    // Layer 6: 6 % 6 == 0 → global
-    try testing.expect(config.isGlobalLayer(6));
-    // Layer 12: 12 % 6 == 0 → global
-    try testing.expect(config.isGlobalLayer(12));
+    try testing.expect(config.isGlobalLayer(5));
+    try testing.expect(!config.isGlobalLayer(6));
+    try testing.expect(config.isGlobalLayer(11));
+    try testing.expect(!config.isGlobalLayer(12));
 }
 
 test "ModelConfig isGlobalLayer without sliding window" {

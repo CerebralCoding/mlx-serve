@@ -1,0 +1,478 @@
+//! Format corpus — hermetic, cross-family format-correctness tests.
+//!
+//! A table of REAL captured model outputs (plus a few minimal synthetic
+//! variants of real failures) run through the pure post-processing layer:
+//! `chat.splitThinkBlock` / `chat.stripThinkBlock` / `chat.parseToolCalls`.
+//! No model weights, no server — runs in CI on every `zig build test`.
+//!
+//! Run just this corpus:
+//!     zig build test -Dtest-filter="format corpus"
+//!
+//! ## Harvesting new entries
+//!
+//! 1. Start the server with `--log-level debug`. Every tools-enabled request
+//!    dumps the model's raw output before tool parsing:
+//!        raw generated text before tool parse (NNNb): <text>
+//!    (two sites in src/server.zig — streaming and non-streaming).
+//! 2. Grep the server log for that line (or for the misbehaving output).
+//! 3. Paste the raw text into a new `Expect` entry below with the family it
+//!    came from and what SHOULD happen. The universal invariants (no control
+//!    tags in visible content, tool args must be valid JSON) apply
+//!    automatically; add per-entry expectations for the specific behavior.
+//!
+//! Origin: the 2026-06-10 live pi-agent session caught five format bugs unit
+//! tests missed. Three are pure-function bugs pinned here (truncated
+//! template-opened thinking leaking into content; a trailing raw
+//! `<|channel>thought` tag leaking into visible output; an unterminated
+//! `<|"|>` string swallowing the args' closing brace — a file literally named
+//! "mlx_pi1.html`}" reached disk). The other two (final answer misfiled as
+//! reasoning_content in tools+thinking streams; omitted max_tokens defaulting
+//! to 256) live in server.zig request handling and are pinned by
+//! tests/test_format_matrix.sh checks 4 and 7 plus tests/test_thinking_split.sh.
+
+const std = @import("std");
+const testing = std.testing;
+const chat = @import("chat.zig");
+
+const Expect = struct {
+    family: []const u8,
+    name: []const u8,
+    raw: []const u8,
+    /// Request had thinking enabled (selects splitThinkBlock vs stripThinkBlock).
+    thinking: bool = false,
+    /// Generation prompt ended with a template-injected think opener
+    /// (Qwen 3.5/3.6 render `…assistant\n<think>\n`).
+    opened_by_template: bool = false,
+    content_contains: ?[]const u8 = null,
+    content_exact: ?[]const u8 = null,
+    reasoning_contains: ?[]const u8 = null,
+    /// Expected name of the FIRST parsed tool call.
+    tool_name: ?[]const u8 = null,
+    /// Expected key/value (string-typed) in the first call's arguments.
+    tool_arg_key: ?[]const u8 = null,
+    tool_arg_value: ?[]const u8 = null,
+    /// Assert parseToolCalls returns null (prose that merely looks tag-ish).
+    no_tool_calls: bool = false,
+    /// Expected number of parsed tool calls (parallel-call outputs).
+    tool_count: ?usize = null,
+    /// Expected value of `tool_arg_key` in the LAST parsed call (asserts
+    /// parallel calls each kept their own arguments).
+    last_tool_arg_value: ?[]const u8 = null,
+};
+
+const corpus = [_]Expect{
+    // ── Qwen 3.5/3.6 (<think> family, template-injected opener) ─────────────
+    .{
+        .family = "qwen",
+        .name = "full think round, template-opened (close tag only in output)",
+        .raw = "The user wants 17*23. 17*20=340, 17*3=51, total 391.</think>\n\n17 × 23 = **391**.",
+        .thinking = true,
+        .opened_by_template = true,
+        .content_contains = "391",
+        .reasoning_contains = "17*20=340",
+    },
+    .{
+        // BUG 1 (2026-06-10 pi session): generation hit max_tokens before
+        // `</think>`, so the output has NO think tags at all. Pre-fix the
+        // truncated reasoning was dumped into visible content.
+        .family = "qwen",
+        .name = "template-opened truncated thinking stays out of content",
+        .raw = "The user asks for 17*23. Let me compute: 17*20 = 340, then 17*3 =",
+        .thinking = true,
+        .opened_by_template = true,
+        .content_exact = "",
+        .reasoning_contains = "17*20 = 340",
+    },
+    .{
+        // Prose answer that ENDS by opening a new, unclosed think block.
+        .family = "qwen",
+        .name = "trailing <think> opener truncated out of content",
+        .raw = "The answer is 391.\n<think>wait, should I double-check the carry",
+        .thinking = true,
+        .content_exact = "The answer is 391.",
+        .reasoning_contains = "double-check",
+    },
+    .{
+        .family = "qwen",
+        .name = "thinking-off prose passes through verbatim",
+        .raw = "17 × 23 = 391.",
+        .content_exact = "17 × 23 = 391.",
+    },
+    .{
+        // Raw JSON tool call with no wrapper tags (Qwen emits this when the
+        // template's <tool_call> markers get sampled away).
+        .family = "qwen",
+        .name = "raw JSON tool call, no wrapper tags",
+        .raw = "{\"name\": \"get_time\", \"arguments\": {\"timezone\": \"UTC\"}}",
+        .tool_name = "get_time",
+        .tool_arg_key = "timezone",
+        .tool_arg_value = "UTC",
+    },
+    // ── Qwen 3.6 MoE (broken-JSON repair paths) ─────────────────────────────
+    .{
+        // Real broken output from Qwen3.6-35B-A3B-6bit: `, {` instead of
+        // `, "arguments": {` — repairFlatBraceToolCallJson path.
+        .family = "qwen-moe",
+        .name = "flat-brace missing-arguments-key repair",
+        .raw = "<tool_call>\n{\"name\":  \"shell\",     {\"command\":\"ls -la\"}}\n</tool_call>",
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "ls -la",
+    },
+    .{
+        // Real broken output from Qwen3.6-35B-A3B-6bit: missing the OPENING
+        // quote on the `arguments` key.
+        .family = "qwen-moe",
+        .name = "missing-opening-quote on arguments key repair",
+        .raw = "<tool_call>\n{\"name\": \"shell\", arguments\": {\"command\": \"mkdir -p src/app\"}}\n</tool_call>",
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "mkdir -p src/app",
+    },
+    // ── Gemma 4 (<|channel> family, call:name{...} tools) ───────────────────
+    .{
+        .family = "gemma4",
+        .name = "full channel round: thought + content channel",
+        .raw = "<|channel>thought\nCompute 17*23: 340+51=391.<channel|>\n<|channel>\n17 × 23 = 391.",
+        .thinking = true,
+        .content_contains = "391",
+        .reasoning_contains = "340+51",
+    },
+    .{
+        // BUG 3 (2026-06-10 pi session): Gemma 4 12B answers in prose, then
+        // opens a NEW thought channel right before the turn ends. The raw
+        // opener tag leaked into visible output; pi rendered it to the user.
+        .family = "gemma4",
+        .name = "trailing <|channel>thought opener never leaks (thinking on)",
+        .raw = "The page is saved and ready to view.\n\n<|channel>thought\nThe user might also want",
+        .thinking = true,
+        .content_exact = "The page is saved and ready to view.",
+        .reasoning_contains = "might also want",
+    },
+    .{
+        // Same tail behavior with thinking OFF → stripThinkBlock path.
+        .family = "gemma4",
+        .name = "trailing <|channel>thought opener never leaks (thinking off)",
+        .raw = "Here is the design.\n<|channel>thought\nI should now write the file",
+        .content_exact = "Here is the design.",
+    },
+    .{
+        // Truncation right after the bare CONTENT channel opener.
+        .family = "gemma4",
+        .name = "bare content-channel opener stripped on truncation",
+        .raw = "<|channel>\nThe answer is 42.",
+        .thinking = true,
+        .content_exact = "The answer is 42.",
+    },
+    .{
+        // BUG 4 (2026-06-10 pi session, verbatim capture): the LAST string
+        // value lost its closing <|"|> delimiter and carried a stray markdown
+        // backtick. The unterminated-string scan used to run to end of body,
+        // so the parsed path was literally "mlx_pi1.html`}" — and pi created
+        // a file with that name on disk. Path must round-trip byte-exact.
+        .family = "gemma4",
+        .name = "unterminated <|\"|> string must not swallow the closing brace",
+        .raw = "<|tool_call>call:write{content:<|\"|><!DOCTYPE html><html></html><|\"|>,path:<|\"|>mlx_pi1.html`}<tool_call|>",
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "mlx_pi1.html",
+    },
+    .{
+        .family = "gemma4",
+        .name = "tool call after closed thought channel",
+        .raw = "<|channel>thought\nLet me check the weather<channel|>\n<|tool_call>call:get_weather{\"city\": \"Paris\"}<tool_call|>",
+        .thinking = true,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+    },
+    .{
+        // Model mixes JSON-style quoted keys with Gemma's <|"|> delimiters.
+        .family = "gemma4",
+        .name = "quoted keys with custom string delimiters",
+        .raw = "<|tool_call>call:shell{\"command\":<|\"|>ls -la<|\"|>}<tool_call|>",
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "ls -la",
+    },
+    .{
+        // Jinja literal-brace artifact: args wrapped in {{ }}.
+        .family = "gemma4",
+        .name = "double-brace wrapped args unwrap",
+        .raw = "<|tool_call>call:shell{{\"command\": \"pwd\"}}<tool_call|>",
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "pwd",
+    },
+    // ── DSV4-Flash (self-closing XML-attribute tool form) ───────────────────
+    .{
+        // Verbatim capture: opened arguments with `"`, closed with `'`,
+        // unescaped `"` inside the JSON, finished with `'/>`.
+        .family = "dsv4",
+        .name = "broken-quote self-closing tool tag",
+        .raw = "\n\n<tool_calls>\n<tool name=\"shell\" arguments=\"{\"command\": \"echo hello\"}'/>\n</tool_calls>",
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "echo hello",
+    },
+    // ── Hermes XML (canonical <tool_call>JSON</tool_call>) ──────────────────
+    .{
+        .family = "hermes",
+        .name = "canonical tool_call JSON body",
+        .raw = "<tool_call>{\"name\": \"get_weather\", \"arguments\": {\"city\": \"Paris\"}}</tool_call>",
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
+    },
+    .{
+        // Double-brace Jinja artifact on the Hermes body.
+        .family = "hermes",
+        .name = "double-brace wrapped tool_call body",
+        .raw = "<tool_call>{{\"name\": \"shell\", \"arguments\": {\"command\": \"ls\"}}}</tool_call>",
+        .tool_name = "shell",
+        .tool_arg_key = "command",
+        .tool_arg_value = "ls",
+    },
+    .{
+        // Claude Code capture (2026-06-10, gemma-4-12b via /v1/messages): the
+        // model closed its thought, emitted content, then RE-OPENED an empty
+        // thought channel mid-text and closed it immediately. The raw
+        // `<|channel>thought\n<channel|>` pair leaked verbatim into the text
+        // block Claude Code displayed. Both halves of the surrounding content
+        // must stay visible; the pair must vanish.
+        .family = "gemma4",
+        .name = "mid-text re-opened thought channel pair never leaks",
+        .raw = "<|channel>thought\nThe user wants an HTML file.<channel|>Here is the file.```<|channel>thought\n<channel|>I've created a minimal HTML file for you.",
+        .thinking = true,
+        .content_contains = "I've created a minimal HTML file",
+        .reasoning_contains = "user wants an HTML file",
+    },
+    .{
+        // Same shape with a NON-empty second thought: its text is reasoning,
+        // never content.
+        .family = "gemma4",
+        .name = "mid-text thought pair with text routes to reasoning",
+        .raw = "<|channel>thought\nPlan the answer.<channel|>The answer is 391.<|channel>thought\nShould I add more detail? No.<channel|>Let me know if you need more.",
+        .thinking = true,
+        .content_contains = "Let me know if you need more",
+        .reasoning_contains = "Should I add more detail",
+    },
+    .{
+        // pi capture (2026-06-10, gemma-4-26B-A4B GGUF via llama engine, same
+        // shared split code): the model emits its answer, then opens TWO
+        // thought channels in a row, neither ever closed. The cut must happen
+        // at the FIRST unclosed opener — cutting at the last one leaks the
+        // earlier raw tag into visible content (seen live in pi).
+        .family = "gemma4",
+        .name = "multiple unclosed thought openers cut at the FIRST one",
+        .raw = "I'll start by listing the files in the current directory to see what the project is about.\n<|channel>thought\nI need to understand what system I'm supposed to create specs for.\n<|channel>thought\nWait, I should check the directory once more.",
+        .thinking = true,
+        .content_exact = "I'll start by listing the files in the current directory to see what the project is about.",
+        .reasoning_contains = "check the directory once more",
+    },
+    .{
+        // Same shape, thinking OFF → stripThinkBlock path must also cut at
+        // the first unclosed opener.
+        .family = "gemma4",
+        .name = "multiple unclosed thought openers stripped (thinking off)",
+        .raw = "Here is the summary.\n<|channel>thought\nMore ideas\n<|channel>thought\nEven more",
+        .content_exact = "Here is the summary.",
+    },
+    // ── Gemma 3 (no native tool syntax — markdown-fenced JSON) ──────────────
+    .{
+        // Verbatim capture from gemma-3-12b-it-qat-4bit on the live matrix
+        // (2026-06-10): models without a trained tool format emit the call as
+        // a ```json fence. The raw-JSON fallback must tolerate the fence.
+        .family = "gemma3",
+        .name = "markdown-fenced raw JSON tool call",
+        .raw = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"report_v2.html\", \"content\": \"<h1>Report</h1>\"}}\n```",
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "report_v2.html",
+    },
+    .{
+        // Verbatim capture from gemma-3-12b-it-qat-4bit (2026-06-10 llmprobe
+        // tool-parallel): asked for parallel calls, the model emits a fenced
+        // JSON ARRAY of {name, arguments} objects. Pre-fix only the first
+        // object parsed — the second call was silently dropped on all three
+        // API surfaces.
+        .family = "gemma3",
+        .name = "fenced JSON array of parallel tool calls parses ALL calls",
+        .raw = "```json\n[\n  {\n    \"name\": \"get_weather\",\n    \"arguments\": {\n      \"location\": \"Paris, France\"\n    }\n  },\n  {\n    \"name\": \"get_weather\",\n    \"arguments\": {\n      \"location\": \"Tokyo, Japan\"\n    }\n  }\n]\n```",
+        .tool_name = "get_weather",
+        .tool_count = 2,
+        .tool_arg_key = "location",
+        .tool_arg_value = "Paris, France",
+        .last_tool_arg_value = "Tokyo, Japan",
+    },
+    .{
+        // Unfenced variant of the same shape.
+        .family = "gemma3",
+        .name = "bare JSON array of parallel tool calls parses ALL calls",
+        .raw = "[{\"name\": \"get_weather\", \"arguments\": {\"location\": \"Paris, France\"}}, {\"name\": \"get_weather\", \"arguments\": {\"location\": \"Tokyo, Japan\"}}]",
+        .tool_name = "get_weather",
+        .tool_count = 2,
+        .tool_arg_key = "location",
+        .tool_arg_value = "Paris, France",
+        .last_tool_arg_value = "Tokyo, Japan",
+    },
+    .{
+        // Verbatim capture from DeepSeek-V4-Flash via the ds4 engine
+        // (2026-06-10, MLX Core agent chat): tool name and each argument as
+        // XML child elements, no JSON anywhere. Pre-fix this leaked as
+        // visible text and the app's ghost-tool-call nudge fired
+        // ("your last response contained a malformed tool-call tag").
+        .family = "dsv4",
+        .name = "XML-element tool form (<tool_name>/<command> children)",
+        .raw = "Let me check the available disk space on this device.\n\n<tool_calls>\n<tool_name>shell</tool_name>\n<command>df -h / | grep -v \"Filesystem\"</command>\n</tool_calls>",
+        .tool_name = "shell",
+        .tool_count = 1,
+        .tool_arg_key = "command",
+        .tool_arg_value = "df -h / | grep -v \"Filesystem\"",
+    },
+    .{
+        // Verbatim capture from DeepSeek-V4-Flash via the ds4 engine
+        // (2026-06-10 pi html-ds4 turn 2): opened with <tool_call>, closed
+        // with the hallucinated </tool_action>. The edit call must parse;
+        // pre-fix it leaked as visible text and pi executed nothing.
+        .family = "dsv4",
+        .name = "mismatched </tool_action> close still parses",
+        .raw = "<tool_call>\n{\"name\": \"edit\", \"arguments\": {\"path\":\"mlx.html\", \"edits\":[{\"oldText\": \"  </ul>\\n</body>\", \"newText\": \"  </ul>\\n  <button onclick=\\\"alert('Hello from MLX')\\\">Click me</button>\\n</body>\"}]}\n</tool_action>",
+        .tool_name = "edit",
+        .tool_count = 1,
+        .tool_arg_key = "path",
+        .tool_arg_value = "mlx.html",
+    },
+    // ── Negatives ────────────────────────────────────────────────────────────
+    .{
+        // Prose containing a `<tool…>`-ish tag that is NOT a tool call.
+        .family = "prose",
+        .name = "prose with <toolbar> markup is not a tool call",
+        .raw = "Click the <toolbar> icon, then choose Settings from the menu.",
+        .content_contains = "Settings",
+        .no_tool_calls = true,
+    },
+};
+
+/// Control tags that must never appear in visible content, regardless of
+/// family. `<|"|>` is Gemma 4's string delimiter; the rest are think/tool
+/// markers from every supported template family.
+const leak_tags = [_][]const u8{
+    "<think>", "</think>", "<|channel>", "<channel|>", "<|tool_call", "<tool_call", "<|\"|>",
+};
+
+fn fail(entry: Expect, comptime what: []const u8, got: []const u8) !void {
+    std.debug.print("\n[{s}] {s}: " ++ what ++ "\n  got: {s}\n", .{ entry.family, entry.name, got });
+    return error.FormatCorpusExpectFailed;
+}
+
+test "format corpus: recorded model outputs across families" {
+    const allocator = testing.allocator;
+
+    for (corpus) |entry| {
+        // ── Normalize first (mirrors the server: re-opened mid-text thought
+        // channels merge into one leading block before any parse/split). ──
+        const normalized = try chat.normalizeEmbeddedThinkBlocks(allocator, entry.raw);
+        defer if (normalized) |n| allocator.free(n);
+        const raw: []const u8 = normalized orelse entry.raw;
+
+        // ── Tool calls (when calls parse, content is suppressed and only
+        // tool deltas + reasoning are emitted). ──
+        const calls = try chat.parseToolCalls(allocator, raw);
+        defer if (calls) |cs| {
+            for (cs) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(cs);
+        };
+
+        if (entry.no_tool_calls and calls != null) {
+            try fail(entry, "expected NO tool calls but got some", calls.?[0].name);
+        }
+        if (entry.tool_name) |want_name| {
+            const cs = calls orelse return fail(entry, "expected a tool call, got none", entry.raw);
+            if (!std.mem.eql(u8, cs[0].name, want_name)) {
+                try fail(entry, "tool name mismatch", cs[0].name);
+            }
+        }
+        if (entry.tool_count) |want_count| {
+            const cs = calls orelse return fail(entry, "expected tool calls, got none", entry.raw);
+            if (cs.len != want_count) {
+                var buf: [32]u8 = undefined;
+                try fail(entry, "tool call count mismatch", std.fmt.bufPrint(&buf, "{d}", .{cs.len}) catch "?");
+            }
+        }
+
+        // Valid-JSON invariant: EVERY parsed call's arguments must round-trip.
+        if (calls) |cs| {
+            for (cs) |tc| {
+                const parsed = std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{}) catch {
+                    try fail(entry, "tool arguments are not valid JSON", tc.arguments);
+                    unreachable;
+                };
+                defer parsed.deinit();
+                if (parsed.value != .object) try fail(entry, "tool arguments are not a JSON object", tc.arguments);
+            }
+            if (entry.tool_arg_key) |key| {
+                const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});
+                defer parsed.deinit();
+                const val = parsed.value.object.get(key) orelse {
+                    try fail(entry, "expected arg key missing", cs[0].arguments);
+                    unreachable;
+                };
+                if (entry.tool_arg_value) |want| {
+                    if (val != .string or !std.mem.eql(u8, val.string, want)) {
+                        try fail(entry, "arg value mismatch (must be byte-exact)", cs[0].arguments);
+                    }
+                }
+                if (entry.last_tool_arg_value) |want| {
+                    const last_parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[cs.len - 1].arguments, .{});
+                    defer last_parsed.deinit();
+                    const last_val = last_parsed.value.object.get(key) orelse {
+                        try fail(entry, "expected arg key missing in LAST call", cs[cs.len - 1].arguments);
+                        unreachable;
+                    };
+                    if (last_val != .string or !std.mem.eql(u8, last_val.string, want)) {
+                        try fail(entry, "LAST call arg value mismatch", cs[cs.len - 1].arguments);
+                    }
+                }
+            }
+        }
+
+        // ── Visible content / reasoning split (server's no-tool-call path). ──
+        const split: chat.ThinkSplit = if (entry.thinking)
+            chat.splitThinkBlock(raw, true, entry.opened_by_template)
+        else
+            .{ .reasoning_content = null, .content = chat.stripThinkBlock(raw) };
+        // When tool calls parsed, the server emits NO content from this text.
+        const content: []const u8 = if (calls != null) "" else split.content;
+
+        // Universal leak invariant: visible content never carries control tags.
+        for (leak_tags) |tag| {
+            if (std.mem.indexOf(u8, content, tag) != null) {
+                try fail(entry, "control tag leaked into visible content", content);
+            }
+        }
+
+        if (entry.content_exact) |want| {
+            if (!std.mem.eql(u8, content, want)) {
+                try fail(entry, "content not byte-exact", content);
+            }
+        }
+        if (entry.content_contains) |want| {
+            if (std.mem.indexOf(u8, content, want) == null) {
+                try fail(entry, "content missing expected substring", content);
+            }
+        }
+        if (entry.reasoning_contains) |want| {
+            const reasoning = split.reasoning_content orelse {
+                try fail(entry, "expected reasoning_content, got null", content);
+                unreachable;
+            };
+            if (std.mem.indexOf(u8, reasoning, want) == null) {
+                try fail(entry, "reasoning missing expected substring", reasoning);
+            }
+        }
+    }
+}

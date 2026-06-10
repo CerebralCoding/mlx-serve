@@ -358,6 +358,15 @@ pub const Generator = struct {
     // per-step verify overhead. The flag is sticky for the rest of the
     // generation; we never re-enable speculation within a single request.
     spec_disabled_runtime: bool = false,
+    /// Yield-gate counters: enabled-mode `nextPld` steps and drafted tokens
+    /// accepted since the last (re-)enable. Reset on mid-request re-enable so
+    /// a fresh workload region (e.g. file echo after a novel preamble) gets a
+    /// fresh economic evaluation instead of inheriting the bad early yield.
+    yield_steps: u64 = 0,
+    yield_accepted: u64 = 0,
+    /// Steps spent in disabled mode since the gate tripped (drives the
+    /// periodic `specShouldReenable` re-check).
+    disabled_steps: u64 = 0,
     /// Number of attempts before the runtime gate considers disabling.
     /// Below this we trust the prompt-time gate.
     ///
@@ -407,6 +416,50 @@ pub const Generator = struct {
         const rate = @as(f32, @floatFromInt(accepted)) /
             @as(f32, @floatFromInt(drafts_proposed));
         return rate < RUNTIME_GATE_MIN_PER_DRAFT_RATE;
+    }
+
+    // ── PLD yield gate (cold-path economics) ──
+    // The per-draft gate above only counts verify ROUNDS, so a workload where
+    // the n-gram lookup rarely matches never accumulates enough "attempts" to
+    // trip it — yet every no-match step pays PLD's unpipelined cold forward
+    // (measured −14% vs the async-pipelined `next()` on creative content).
+    // The yield gate instead counts EVERY enabled-mode nextPld step: if the
+    // speculation is yielding fewer than YIELD_GATE_MIN_YIELD extra (drafted,
+    // accepted) tokens per step after YIELD_GATE_WARMUP steps, the cold-path
+    // tax outweighs the wins → disable. Paired with `specShouldReenable`,
+    // which flips PLD back on when the generated tail turns repetitive.
+    // Warmup 32 (not higher): the re-enable check bounds the cost of a
+    // premature trip to ≤SPEC_REENABLE_INTERVAL pipelined-fallback steps,
+    // so we can gate early and recover the pipeline sooner on novel content.
+    pub const YIELD_GATE_WARMUP: u64 = 32;
+    pub const YIELD_GATE_MIN_YIELD: f32 = 0.25;
+
+    pub fn yieldGateShouldDisable(steps_total: u64, accepted: u64) bool {
+        if (steps_total < YIELD_GATE_WARMUP) return false;
+        const yield_rate = @as(f32, @floatFromInt(accepted)) /
+            @as(f32, @floatFromInt(steps_total));
+        return yield_rate < YIELD_GATE_MIN_YIELD;
+    }
+
+    // ── Mid-request spec re-enable ──
+    // While the yield gate has PLD disabled, the COMMITTED sequence (prompt +
+    // generated) is re-scored every SPEC_REENABLE_INTERVAL steps: what
+    // fraction of the recent generated positions would have had a PLD lookup
+    // hit (their key-gram appears earlier in committed)? This catches the
+    // echo workload where the model repeats PROMPT content (file edits, tool
+    // results) — self-repetition scoring misses it because the echoed tail
+    // never repeats itself. Above the threshold, PLD is worth re-engaging at
+    // the cost of one pipeline drain.
+    pub const SPEC_REENABLE_INTERVAL: u64 = 32;
+    pub const SPEC_REENABLE_WINDOW: usize = 32;
+    pub const SPEC_REENABLE_MIN_FRACTION: f32 = 0.25;
+    pub const SPEC_REENABLE_MIN_TOKENS: usize = 16;
+
+    pub fn specShouldReenable(committed: []const u32, generated_len: usize) bool {
+        if (generated_len < SPEC_REENABLE_MIN_TOKENS) return false;
+        const window = @min(SPEC_REENABLE_WINDOW, generated_len);
+        const frac = pld_index.tailMatchFraction(committed, window, 3);
+        return frac >= SPEC_REENABLE_MIN_FRACTION;
     }
 
     /// Emit a stable, easy-to-grep one-line summary of spec-decode acceptance
@@ -642,8 +695,13 @@ pub const Generator = struct {
             ctx.ssm_entries.?.len > 0;
         // Coarsen the checkpoint stride for MoE so memory-bound expert-weight
         // re-streaming doesn't tax cold prefill (see effectiveSsmCheckpointStride).
+        // The predicate is config.isMoe() (real experts), NOT moe_layers != null:
+        // dense qwen3_5 (GDN hybrid) rides the MoE forward path structurally, and
+        // coarsening it to PREFILL_CHUNK silently disabled every prefix-cache hit
+        // under 8K-token prompts (caught live by llmprobe cache-hit-reported on
+        // Qwen3.6-27B dense, 2026-06-10).
         const ssm_cp_stride: usize = if (want_ssm_cp)
-            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), xfm.moe_layers != null, PREFILL_CHUNK)
+            effectiveSsmCheckpointStride(@intCast(options.ssm_checkpoint_stride), xfm.config.isMoe(), PREFILL_CHUNK)
         else
             0;
         // Absolute KV position of `prompt_ids[0]`. Warm-path callers (the
@@ -1132,6 +1190,51 @@ pub const Generator = struct {
         self.next_token_id = @intCast(val);
     }
 
+    const DrainResult = union(enum) {
+        /// No pending pipeline state — the spec entry invariant already holds.
+        already_clean,
+        /// One token was emitted while draining; caller returns it this step.
+        drained: u32,
+        /// The drained token hit a stop condition — generation is over.
+        stopped,
+        /// Unexpected half-state; do not re-enable speculation.
+        stay_disabled,
+    };
+
+    /// Transition from the pipelined `next()` state back to the spec-decode
+    /// entry invariant (next_token_id known but NOT in cache, no pending
+    /// state). The pipeline holds `pending_token` (lazy, its forward already
+    /// in the cache) and `pending_logits` (logits for the position after it):
+    /// resolving the token, emitting it, and sampling its successor from
+    /// `pending_logits` WITHOUT forwarding lands exactly on the invariant.
+    /// One sync. Also handles the shim-seeded state (`pending_logits` only).
+    fn drainPipelineForSpec(self: *Generator, allocator: std.mem.Allocator) !DrainResult {
+        if (!self.has_pending_logits) {
+            if (!self.has_pending_token) return .already_clean;
+            // pending_token without pending_logits never occurs in the
+            // pipelined state machine; bail rather than risk the invariant.
+            return .stay_disabled;
+        }
+        try self.resolvePendingToken();
+        if (try self.checkStop()) return .stopped;
+        const token = self.next_token_id;
+        self.completion_tokens += 1;
+        self.step += 1;
+        try self.generated_ids.append(allocator, token);
+        if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
+
+        const step_logits = self.pending_logits;
+        self.has_pending_logits = false;
+        const lazy = sampleTokenLazy(step_logits, self.sampling, self.xfm.s);
+        _ = mlx.mlx_array_free(step_logits);
+        try mlx.check(mlx.mlx_array_eval(lazy));
+        var val: i32 = 0;
+        try mlx.check(mlx.mlx_array_item_int32(&val, lazy));
+        _ = mlx.mlx_array_free(lazy);
+        self.next_token_id = @intCast(val);
+        return .{ .drained = token };
+    }
+
 
     /// Result of one `nextPld` step. Yields 1..=(1+max_draft_len) tokens.
     /// Caller owns `tokens` (must `allocator.free` it).
@@ -1177,15 +1280,63 @@ pub const Generator = struct {
         // it sees `!has_pending_logits and !has_pending_token`. So the
         // hand-off works even though pending state is empty.
         if (self.spec_disabled_runtime) {
-            const tok_opt = try self.next(allocator);
-            if (tok_opt == null) return null;
-            const tokens = try allocator.alloc(u32, 1);
-            tokens[0] = tok_opt.?;
-            return PldStepResult{
-                .tokens = tokens,
-                .accepted_tokens = 0,
-                .used_lookup = false,
-            };
+            self.disabled_steps += 1;
+            // Periodic re-enable check: when the generated tail turns
+            // repetitive (file/tool echo after a novel preamble), PLD pays
+            // again. Drain the `next()` pipeline back to the spec entry
+            // invariant; the drained token (if any) is this step's emit and
+            // speculation resumes on the following call.
+            if (self.disabled_steps % SPEC_REENABLE_INTERVAL == 0) reenable: {
+                const gen = self.generated_ids.items;
+                const prompt_toks = self.prompt_ids_owned;
+                const committed_check = try allocator.alloc(u32, prompt_toks.len + gen.len);
+                defer allocator.free(committed_check);
+                @memcpy(committed_check[0..prompt_toks.len], prompt_toks);
+                @memcpy(committed_check[prompt_toks.len..], gen);
+                if (log.isDebug()) {
+                    const dbg_frac = pld_index.tailMatchFraction(committed_check, @min(SPEC_REENABLE_WINDOW, gen.len), 3);
+                    log.debug("  pld re-enable check: disabled_steps={d} gen={d} tail_match={d:.2}\n", .{ self.disabled_steps, gen.len, dbg_frac });
+                }
+                if (!specShouldReenable(committed_check, gen.len)) break :reenable;
+                switch (try self.drainPipelineForSpec(allocator)) {
+                    .stay_disabled => break :reenable,
+                    .stopped => return null,
+                    .already_clean => {
+                        log.info("  pld=re-enabled (generated tail turned repetitive after {d} disabled steps)\n", .{self.disabled_steps});
+                        self.spec_disabled_runtime = false;
+                        self.disabled_steps = 0;
+                        self.yield_steps = 0;
+                        self.yield_accepted = 0;
+                        // Invariant already holds — fall through to the
+                        // enabled flow below in this same call.
+                    },
+                    .drained => |drained_tok| {
+                        log.info("  pld=re-enabled (generated tail turned repetitive after {d} disabled steps)\n", .{self.disabled_steps});
+                        self.spec_disabled_runtime = false;
+                        self.disabled_steps = 0;
+                        self.yield_steps = 0;
+                        self.yield_accepted = 0;
+                        const tokens = try allocator.alloc(u32, 1);
+                        tokens[0] = drained_tok;
+                        return PldStepResult{
+                            .tokens = tokens,
+                            .accepted_tokens = 0,
+                            .used_lookup = false,
+                        };
+                    },
+                }
+            }
+            if (self.spec_disabled_runtime) {
+                const tok_opt = try self.next(allocator);
+                if (tok_opt == null) return null;
+                const tokens = try allocator.alloc(u32, 1);
+                tokens[0] = tok_opt.?;
+                return PldStepResult{
+                    .tokens = tokens,
+                    .accepted_tokens = 0,
+                    .used_lookup = false,
+                };
+            }
         }
 
         const xfm = self.xfm;
@@ -1264,6 +1415,20 @@ pub const Generator = struct {
             self.step += 1;
             if (self.step % 256 == 0) _ = mlx.mlx_clear_cache();
             self.next_token_id = new_t1;
+
+            // Yield gate: cold steps pay the unpipelined forward; if the
+            // workload isn't yielding accepted drafts to pay for it, fall
+            // back to the pipelined `next()` (re-enable check above can
+            // bring PLD back when the tail turns repetitive).
+            self.yield_steps += 1;
+            if (yieldGateShouldDisable(self.yield_steps, self.yield_accepted)) {
+                log.info(
+                    "  pld=disabled (yield gate: {d} drafted tokens over {d} steps < {d:.2}/step)\n",
+                    .{ self.yield_accepted, self.yield_steps, YIELD_GATE_MIN_YIELD },
+                );
+                self.spec_disabled_runtime = true;
+                self.disabled_steps = 0;
+            }
 
             const tokens = try allocator.alloc(u32, 1);
             tokens[0] = t1;
@@ -1450,12 +1615,18 @@ pub const Generator = struct {
         // nextPld call sees t1 NOT in cache (new invariant).
         self.next_token_id = new_t1;
 
+        // Yield-gate accounting for verify steps (cold steps update in their
+        // own branch above).
+        self.yield_steps += 1;
+        self.yield_accepted += accepted;
+
         // Runtime acceptance gate: after warmup, if the per-draft acceptance
         // probability is below the threshold, disable speculation for the rest
-        // of this request. Sticky for the rest of the generation. PLD's
-        // `drafts_per_round` is the upper-bound draft length (`max_draft`);
-        // matches with shorter accepts still divide by this max so a workload
-        // with consistently-short n-gram matches DOES get throttled.
+        // of this request (the re-enable check can bring it back when the
+        // generated tail turns repetitive). PLD's `drafts_per_round` is the
+        // upper-bound draft length (`max_draft`); matches with shorter accepts
+        // still divide by this max so a workload with consistently-short
+        // n-gram matches DOES get throttled.
         if (runtimeGateShouldDisable(self.pld_attempted, self.pld_accepted_tokens, max_draft)) {
             const drafts_proposed: u64 = self.pld_attempted * @as(u64, max_draft);
             const rate: f32 = if (drafts_proposed > 0)
@@ -1468,6 +1639,7 @@ pub const Generator = struct {
                 .{ rate, RUNTIME_GATE_MIN_PER_DRAFT_RATE, self.pld_attempted },
             );
             self.spec_disabled_runtime = true;
+            self.disabled_steps = 0;
         }
 
         return PldStepResult{
@@ -3696,6 +3868,45 @@ test "Generator.runtimeGateShouldDisable handles drafts_per_round=0" {
     // Defensive: if a caller somehow passes a degenerate config (block_size=1
     // → drafts_per_round=0), don't divide by zero. We return false (no trip).
     try testing.expect(!Generator.runtimeGateShouldDisable(100, 0, 0));
+}
+
+test "Generator.yieldGateShouldDisable trips on cold-path-dominated workloads" {
+    // The 2026-06-10 baseline regression: PLD forced on for a creative essay
+    // prompt where the n-gram lookup almost never matches. The per-draft gate
+    // never trips (it only counts verify ROUNDS, and there are few), but every
+    // step pays the unpipelined cold forward → −14% measured on E2B. The
+    // yield gate counts ALL enabled-mode steps: accepted-drafted-tokens per
+    // step below the threshold after warmup → disable.
+    // Creative: 128 steps, ~6 drafted tokens accepted → yield 0.047 → trip.
+    try testing.expect(Generator.yieldGateShouldDisable(128, 6));
+    // Heavy echo: 40 steps, 80 accepted (2.0/step) → stay on.
+    try testing.expect(!Generator.yieldGateShouldDisable(40, 80));
+    // Inside warmup: never trip, even at zero yield.
+    try testing.expect(!Generator.yieldGateShouldDisable(Generator.YIELD_GATE_WARMUP - 1, 0));
+    // Exactly at warmup with healthy yield: stay on.
+    try testing.expect(!Generator.yieldGateShouldDisable(Generator.YIELD_GATE_WARMUP, Generator.YIELD_GATE_WARMUP));
+}
+
+test "Generator.specShouldReenable gates mid-request PLD re-activation" {
+    // Disabled-mode periodic check on the COMMITTED sequence (prompt +
+    // generated). The decisive case: the model echoes PROMPT content (file
+    // edit / tool result) after a novel preamble tripped the yield gate. The
+    // echoed tail never repeats ITSELF, so self-repetition scoring misses it;
+    // tailMatchFraction sees the prompt occurrence.
+    var committed: [96]u32 = undefined;
+    // prompt = 48-token "file", generated = 16 novel preamble + 32 echo of the file
+    for (committed[0..48], 0..) |*t, i| t.* = @intCast(i + 100);
+    for (committed[48..64], 0..) |*t, i| t.* = @intCast(i + 9000);
+    for (committed[64..96], 0..) |*t, i| t.* = @intCast(i + 100);
+    try testing.expect(Generator.specShouldReenable(&committed, 48));
+
+    // Fully novel committed sequence → stay disabled.
+    var novel: [96]u32 = undefined;
+    for (&novel, 0..) |*t, i| t.* = @intCast(i * 7 + 1);
+    try testing.expect(!Generator.specShouldReenable(&novel, 48));
+
+    // Too little generated yet → not enough signal, stay disabled.
+    try testing.expect(!Generator.specShouldReenable(&committed, 8));
 }
 
 test "InitOptions.lookup_prompt overrides prompt_ids_owned source" {

@@ -319,6 +319,35 @@ enum ModelKind: String, Codable, Hashable {
     case drafter
 }
 
+/// Which embedded engine serves a model. Mirrors the server's auto-routing:
+/// safetensors dirs run on the native MLX path; `.gguf` files route to the
+/// embedded llama.cpp engine, except DeepSeek-V4-Flash which routes to ds4
+/// (`model_discovery.isDs4GgufBasename`, surfaced client-side as
+/// `DownloadManager.ggufModelType` → `deepseek_v4`).
+enum ModelEngine: String, Hashable {
+    case mlx
+    case llamaCpp
+    case ds4
+
+    /// Compact tag for picker-row disambiguation.
+    var shortLabel: String {
+        switch self {
+        case .mlx: "MLX-Serve"
+        case .llamaCpp: "GGUF"
+        case .ds4: "DS4"
+        }
+    }
+
+    /// Human-readable engine name for the status menu.
+    var displayName: String {
+        switch self {
+        case .mlx: "MLX-Serve"
+        case .llamaCpp: "GGUF · llama.cpp"
+        case .ds4: "GGUF · DS4"
+        }
+    }
+}
+
 struct LocalModel: Identifiable, Hashable {
     let id: String
     let name: String
@@ -330,6 +359,28 @@ struct LocalModel: Identifiable, Hashable {
 
     var isSupportedArchitecture: Bool {
         supportedModelTypes.contains(modelType)
+    }
+
+    /// Defaults to `.mlx` (MLX-Serve) whenever the engine can't be
+    /// positively determined — only a `.gguf` path routes elsewhere.
+    var engine: ModelEngine {
+        guard path.lowercased().hasSuffix(".gguf") else { return .mlx }
+        return modelType == "deepseek_v4" ? .ds4 : .llamaCpp
+    }
+
+    /// Display names shared by more than one model. macOS `.menu` Pickers key
+    /// the checkmark state by item TITLE, so two same-named rows (one GGUF,
+    /// one MLX) both render selected — rows whose name is in this set need an
+    /// engine suffix to keep titles unique.
+    static func duplicateNames(in models: [LocalModel]) -> Set<String> {
+        var seen = Set<String>()
+        var dups = Set<String>()
+        for m in models {
+            if !seen.insert(m.name).inserted {
+                dups.insert(m.name)
+            }
+        }
+        return dups
     }
 }
 

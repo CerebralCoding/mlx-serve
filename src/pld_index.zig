@@ -108,6 +108,43 @@ pub fn ngramRepeatScore(allocator: std.mem.Allocator, tokens: []const u32, ngram
     return @as(f32, @floatFromInt(repeated)) / @as(f32, @floatFromInt(distinct));
 }
 
+/// Fraction of the last `window` positions of `committed` whose trailing
+/// `key_len`-gram ALSO appears earlier in `committed` — i.e. the fraction of
+/// positions where a PLD lookup would have found a candidate. Unlike
+/// `ngramRepeatScore` (self-repetition within one window), this catches the
+/// echo workload where generated text repeats the PROMPT: the n-grams of the
+/// echoed tail match the prompt occurrence, not each other. Used by the
+/// mid-request spec re-enable check. Returns 0 when the sequence is shorter
+/// than key_len+1 or window is 0.
+pub fn tailMatchFraction(committed: []const u32, window: usize, key_len: u32) f32 {
+    const kl: usize = @intCast(key_len);
+    if (kl == 0 or committed.len <= kl or window == 0) return 0.0;
+    // Tail positions i (the position AFTER each key): the key for position i
+    // is committed[i-kl..i]. Earliest scorable i is kl.
+    const last: usize = committed.len;
+    const first: usize = if (last -| window > kl) last - window else kl;
+    if (first >= last) return 0.0;
+
+    var matched: usize = 0;
+    var total: usize = 0;
+    var i: usize = first;
+    while (i < last) : (i += 1) {
+        const key = committed[i - kl .. i];
+        total += 1;
+        // Does this key occur anywhere strictly before its own site?
+        var j: usize = 0;
+        const scan_end = i - kl; // last start where the match is strictly earlier
+        while (j < scan_end) : (j += 1) {
+            if (std.mem.eql(u32, committed[j .. j + kl], key)) {
+                matched += 1;
+                break;
+            }
+        }
+    }
+    if (total == 0) return 0.0;
+    return @as(f32, @floatFromInt(matched)) / @as(f32, @floatFromInt(total));
+}
+
 // ── tests ──
 
 test "PldLookup.findMatch returns slice at latest match site" {
@@ -215,4 +252,32 @@ test "ngramRepeatScore: returns 0 on inputs shorter than ngram_len" {
 test "ngramRepeatScore: rejects oversized ngram_len" {
     const tokens = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
     try std.testing.expectError(error.NgramLenTooLarge, ngramRepeatScore(std.testing.allocator, &tokens, 9));
+}
+
+test "tailMatchFraction: tail echoing the PROMPT scores high" {
+    // The re-enable regression: a prompt paragraph echoed verbatim in the
+    // generated tail. The tail has no INTERNAL repeats (ngramRepeatScore ≈ 0)
+    // but every tail 3-gram appears earlier — in the prompt occurrence.
+    var committed: [64]u32 = undefined;
+    // prompt: tokens 100..131 (a 32-token "paragraph"), then 16 novel
+    // "preamble" tokens, then the paragraph echoed for the last 16 positions.
+    for (committed[0..32], 0..) |*t, i| t.* = @intCast(i + 100);
+    for (committed[32..48], 0..) |*t, i| t.* = @intCast(i + 9000);
+    for (committed[48..64], 0..) |*t, i| t.* = @intCast(i + 100);
+    const frac = tailMatchFraction(&committed, 16, 3);
+    try std.testing.expect(frac > 0.7);
+}
+
+test "tailMatchFraction: novel tail scores zero" {
+    var committed: [64]u32 = undefined;
+    for (&committed, 0..) |*t, i| t.* = @intCast(i * 13 + 7);
+    try std.testing.expectEqual(@as(f32, 0.0), tailMatchFraction(&committed, 16, 3));
+}
+
+test "tailMatchFraction: degenerate inputs return 0" {
+    const short = [_]u32{ 1, 2 };
+    try std.testing.expectEqual(@as(f32, 0.0), tailMatchFraction(&short, 16, 3));
+    const ok = [_]u32{ 1, 2, 3, 4, 5 };
+    try std.testing.expectEqual(@as(f32, 0.0), tailMatchFraction(&ok, 0, 3));
+    try std.testing.expectEqual(@as(f32, 0.0), tailMatchFraction(&ok, 16, 0));
 }

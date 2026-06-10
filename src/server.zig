@@ -372,12 +372,13 @@ pub var ssm_checkpoint_max: u32 = 32;
 pub var tokenize_cache_entries: u32 = 4;
 
 /// Iteration 3-5 (perf-plan Phase 5 #1): cap on resident llama.cpp KV
-/// sessions per loaded GGUF model. 1 keeps the legacy single-session
+/// sessions per loaded GGUF model. 1 is the legacy single-session
 /// behavior (a flip between two long-doc prompts evicts the other on
-/// every turn). N > 1 enables the best-prefix-match LRU so alternating
-/// multi-doc workloads stay warm. Default 1 = backwards-compat; tests
-/// and bench harnesses pass --llama-cache-entries N to exercise it.
-pub var llama_cache_entries: u32 = 1;
+/// every turn — and even sequential shared-prefix requests reported
+/// cached_tokens=0). N > 1 enables the best-prefix-match LRU so
+/// alternating multi-doc / agent workloads stay warm. Sessions are
+/// created lazily, so unused slots cost nothing.
+pub var llama_cache_entries: u32 = 4;
 
 /// Phase 5 (performance-plan) #2: KV-cache quantization for the embedded
 /// llama.cpp engine. `off` = F16 (libllama default); `q8` halves the KV
@@ -448,13 +449,43 @@ fn decodeTokens(
     return tok.decode(allocator, ids, strip_leading_space);
 }
 
+/// True when the rendered generation prompt ends inside a template-opened
+/// think block (Qwen 3.5/3.6 render `…assistant\n<think>\n` when thinking is
+/// on). Decodes the last few prompt tokens — cheap, engine-agnostic, and
+/// independent of the tokenize cache. Drives the unclosed-think split policy
+/// in `chat.splitThinkBlock` so a length-truncated thought never leaks into
+/// visible content.
+fn promptOpensThink(
+    allocator: std.mem.Allocator,
+    lm: *LoadedModel,
+    tok: *const Tokenizer,
+    prompt_ids: []const u32,
+) bool {
+    if (prompt_ids.len == 0) return false;
+    const n = @min(prompt_ids.len, 8);
+    const tail = decodeTokens(allocator, lm, tok, prompt_ids[prompt_ids.len - n ..], false) catch return false;
+    defer allocator.free(tail);
+    return chat_mod.promptTailOpensThink(tail);
+}
+
 /// In-memory store for OpenAI Responses API state (`store: true` requests).
 /// Bounded LRU; lost on restart.
 var global_response_store: ?responses_mod.ResponseStore = null;
 var global_response_store_gpa: ?std.mem.Allocator = null;
 const RESPONSE_STORE_CAP: usize = 256;
-const DEFAULT_API_MAX_TOKENS: u32 = 256;
 const DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS: u32 = 2048;
+
+/// Default when an OpenAI-style client omits `max_tokens` /
+/// `max_completion_tokens` / `max_output_tokens`. OpenAI semantics: omitted
+/// means "generate until EOS, bounded by the context window" — NOT a small
+/// fixed cap. (The old 256 default silently broke agent clients like pi:
+/// every thinking-enabled turn hit `length` mid-reasoning, so no tool call or
+/// answer ever came back.) The sentinel is huge so the downstream
+/// `clampMaxTokens` resolves it to the remaining context; when the context
+/// size is unknown (0) no clamp will apply, so fall back to a finite 4096.
+fn omittedMaxTokensDefault() u32 {
+    return if (server_config.max_context_size > 0) std.math.maxInt(u32) / 4 else 4096;
+}
 
 fn getOrInitResponseStore(io: std.Io, gpa: std.mem.Allocator) *responses_mod.ResponseStore {
     if (global_response_store == null) {
@@ -2044,10 +2075,10 @@ fn handleChatCompletions(
         break :blk if (v) |val|
             switch (val) {
                 .integer => |i| @intCast(i),
-                else => DEFAULT_API_MAX_TOKENS,
+                else => omittedMaxTokensDefault(),
             }
         else
-            DEFAULT_API_MAX_TOKENS;
+            omittedMaxTokensDefault();
     };
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
@@ -2459,7 +2490,7 @@ fn handleChatCompletions(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -2470,7 +2501,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -2510,8 +2541,8 @@ fn handleCompletions(
         const v = root.get("max_tokens") orelse root.get("max_completion_tokens");
         break :blk if (v) |val| switch (val) {
             .integer => |i| @intCast(i),
-            else => DEFAULT_API_MAX_TOKENS,
-        } else DEFAULT_API_MAX_TOKENS;
+            else => omittedMaxTokensDefault(),
+        } else omittedMaxTokensDefault();
     };
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
@@ -3027,6 +3058,9 @@ fn handleNonStreamingGeneration(
     stop_sequences: []const []const u8,
     model_name: []const u8,
     has_tools: bool,
+    /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
+    /// the request defined no tools.
+    tools_json: ?[]const u8,
     logprobs_n: u32,
     enable_thinking: bool,
     reasoning_budget: i32,
@@ -3087,6 +3121,15 @@ fn handleNonStreamingGeneration(
         }
     }
 
+    // Merge re-opened mid-text thought channels into the leading block so the
+    // split/parse below never leaks raw tags (Gemma 12B re-opens channels mid-turn).
+    const normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
+    defer if (normalized_text) |n| allocator.free(n);
+    if (normalized_text) |n| final_text = n;
+
+    // Template-opened think block (Qwen 3.5/3.6): unclosed output is reasoning.
+    const opens_think = enable_thinking and promptOpensThink(allocator, lm, tok, prompt_ids);
+
     // Apply reasoning budget: truncate reasoning by token count
     // For non-streaming, we truncate after generation since we can't interrupt mid-generation
     var budget_truncated_reasoning: ?[]const u8 = null;
@@ -3094,7 +3137,7 @@ fn handleNonStreamingGeneration(
     defer if (budget_reasoning_allocated) allocator.free(budget_truncated_reasoning.?);
 
     if (enable_thinking and reasoning_budget >= 0) {
-        const think_split = chat_mod.splitThinkBlock(final_text, true);
+        const think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
         if (think_split.reasoning_content) |reasoning| {
             // Count tokens in reasoning by encoding it
             const reasoning_ids = try tok.encode(allocator, reasoning);
@@ -3116,7 +3159,9 @@ fn handleNonStreamingGeneration(
     // Check for tool calls in the output
     if (has_tools) {
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
-        if (try chat_mod.parseToolCalls(allocator, final_text)) |tool_calls| {
+        const found_calls = (try chat_mod.parseToolCalls(allocator, final_text)) orelse
+            (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, final_text, tj) else null);
+        if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
                     allocator.free(tc.name);
@@ -3155,7 +3200,7 @@ fn handleNonStreamingGeneration(
             var tc_reasoning_json: []const u8 = "";
             var tc_reasoning_allocated = false;
             if (enable_thinking) {
-                const tc_think_split = chat_mod.splitThinkBlock(final_text, true);
+                const tc_think_split = chat_mod.splitThinkBlock(final_text, true, opens_think);
                 if (tc_think_split.reasoning_content) |reasoning| {
                     const escaped_reasoning = try jsonEscape(allocator, reasoning);
                     tc_reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
@@ -3199,7 +3244,7 @@ fn handleNonStreamingGeneration(
     });
 
     // Split thinking content from response
-    const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking);
+    const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking, opens_think);
     const content_text = if (enable_thinking) think_split.content else chat_mod.stripThinkBlock(final_text);
 
     const escaped_text = jsonEscape(allocator, content_text) catch "\"\"";
@@ -3217,6 +3262,8 @@ fn handleNonStreamingGeneration(
     // Build reasoning_content field if thinking is enabled and reasoning exists
     var reasoning_json: []const u8 = "";
     var reasoning_allocated = false;
+    var usage_details_json: []const u8 = "";
+    var usage_details_allocated = false;
     if (enable_thinking) {
         // Use budget-truncated reasoning if available, otherwise use full reasoning
         const reasoning_text = if (budget_truncated_reasoning) |tr| tr else think_split.reasoning_content;
@@ -3225,9 +3272,17 @@ fn handleNonStreamingGeneration(
             reasoning_json = try std.fmt.allocPrint(allocator, ",\"reasoning_content\":{s}", .{escaped_reasoning});
             allocator.free(escaped_reasoning);
             reasoning_allocated = true;
+            // usage.completion_tokens_details.reasoning_tokens (OpenAI/LM Studio
+            // parity) so clients can budget visible content separately.
+            if (tok.encode(allocator, reasoning)) |rids| {
+                defer allocator.free(rids);
+                usage_details_json = try std.fmt.allocPrint(allocator, ",\"completion_tokens_details\":{{\"reasoning_tokens\":{d}}}", .{rids.len});
+                usage_details_allocated = true;
+            } else |_| {}
         }
     }
     defer if (reasoning_allocated) allocator.free(reasoning_json);
+    defer if (usage_details_allocated) allocator.free(usage_details_json);
 
     const timings_obj = try formatTimingsObject(allocator, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns, tokenize_ns);
     defer allocator.free(timings_obj);
@@ -3238,7 +3293,7 @@ fn handleNonStreamingGeneration(
     defer allocator.free(timings_field);
 
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}{s}}}{s}}}
     , .{
         nowMs(stream.io),
         nowSecs(stream.io),
@@ -3250,6 +3305,7 @@ fn handleNonStreamingGeneration(
         result.prompt_tokens,
         result.completion_tokens,
         result.prompt_tokens + result.completion_tokens,
+        usage_details_json,
         timings_field,
     });
     defer allocator.free(response);
@@ -3495,6 +3551,9 @@ fn handleStreamingGeneration(
     model_name: []const u8,
     include_usage: bool,
     has_tools: bool,
+    /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
+    /// the request defined no tools.
+    tools_json: ?[]const u8,
     logprobs_n: u32,
     enable_thinking: bool,
     reasoning_budget: i32,
@@ -3517,6 +3576,10 @@ fn handleStreamingGeneration(
 
     const config = lm.config.?;
     const chat_id = nowMs(stream.io);
+
+    // Template-opened think block (Qwen 3.5/3.6): unclosed buffered output is
+    // reasoning, never content (mirrors the non-streaming split policy).
+    const opens_think = enable_thinking and promptOpensThink(allocator, lm, tok, prompt_ids);
 
     // Pick the speculative-decoding mode (regular / PLD / drafter). The
     // per-token state machine below is driven by `StreamingTokenStream`,
@@ -3597,6 +3660,7 @@ fn handleStreamingGeneration(
     // Thinking state for real-time streaming of reasoning_content vs content
     // Supports both <think>...</think> and Gemma 4's <|channel>thought\n...<channel|>
     var in_think_block = enable_thinking; // starts true when thinking enabled (model outputs <think> first)
+    var think_closed = false; // a complete think block was already split+emitted this stream
     var think_buf = std.ArrayList(u8).empty; // buffer to detect close tag across token boundaries
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>"; // will be updated if Gemma 4 format detected
@@ -3694,11 +3758,21 @@ fn handleStreamingGeneration(
                 // into the prompt, so the model's tokens are already inside the
                 // thinking block — we won't see a literal opener in the buffer.
                 // Also detect literal openers for templates that don't pre-inject.
-                const has_thinking = enable_thinking or
+                // `think_closed` guards the enable_thinking term: once a
+                // complete think block was split+emitted, later buffered
+                // content (the visible answer) must NOT be held as
+                // "incomplete thinking" — it used to sit in the buffer until
+                // end-of-stream and get flushed as reasoning_content,
+                // hiding the final answer from agent clients (pi).
+                const has_thinking = (enable_thinking and !think_closed) or
                     std.mem.indexOf(u8, buf, "<|channel>thought") != null or
                     std.mem.indexOf(u8, buf, "<think>") != null or
                     (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
-                    (std.mem.startsWith(u8, buf, "<think") and buf.len < 7);
+                    (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
+                    // A partial opener at the buffer TAIL (mid-text re-opened
+                    // channel arriving token by token) must hold the flush —
+                    // flushing leaks tag fragments like a glued "thought".
+                    chat_mod.endsWithPartialThinkOpen(buf);
                 if (has_thinking) {
                     // Check if the thinking block is complete (has closing tag)
                     const has_close = std.mem.indexOf(u8, buf, "<channel|>") != null or
@@ -3707,10 +3781,11 @@ fn handleStreamingGeneration(
                         // Incomplete thinking block — keep buffering until closed
                     } else {
                         // Complete thinking block — split into reasoning + content
-                        const split = chat_mod.splitThinkBlock(buf, enable_thinking);
+                        const split = chat_mod.splitThinkBlock(buf, enable_thinking, opens_think);
                         for (token_texts.items) |tt| allocator.free(tt);
                         token_texts.clearRetainingCapacity();
                         text_buf.clearRetainingCapacity();
+                        think_closed = true;
                         if (enable_thinking) {
                             if (split.reasoning_content) |rc| {
                                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = rc }, null, null, null);
@@ -3866,7 +3941,17 @@ fn handleStreamingGeneration(
     var finish_reason: []const u8 = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;
     if (has_tools and !client_gone) {
         log.debug("  checking {d} bytes of streamed text for tool calls\n", .{text_buf.items.len});
-        if (try chat_mod.parseToolCalls(allocator, text_buf.items)) |tool_calls| {
+        if (log.isDebug() and text_buf.items.len > 0) {
+            log.debug("  raw generated text before tool parse ({d}b): {s}\n", .{ text_buf.items.len, text_buf.items[0..@min(text_buf.items.len, 4000)] });
+        }
+        // Merge re-opened mid-text thought channels into the leading block so
+        // the split/parse below never leaks raw tags (Gemma 12B tail behavior).
+        const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
+        defer if (norm_owned) |n| allocator.free(n);
+        const gen_text: []const u8 = norm_owned orelse text_buf.items;
+        const found_calls = (try chat_mod.parseToolCalls(allocator, gen_text)) orelse
+            (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, gen_text, tj) else null);
+        if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
                     allocator.free(tc.name);
@@ -3877,7 +3962,7 @@ fn handleStreamingGeneration(
 
             // Emit reasoning_content before tool calls if thinking is enabled
             if (enable_thinking) {
-                const think_split = chat_mod.splitThinkBlock(text_buf.items, true);
+                const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
                 if (think_split.reasoning_content) |reasoning| {
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
@@ -3929,7 +4014,10 @@ fn handleStreamingGeneration(
                 for (token_texts.items) |t| {
                     try full_text.appendSlice(allocator, t);
                 }
-                const think_split = chat_mod.splitThinkBlock(full_text.items, true);
+                const flush_norm = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, full_text.items);
+                defer if (flush_norm) |n| allocator.free(n);
+                const flush_text: []const u8 = flush_norm orelse full_text.items;
+                const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
                 if (think_split.reasoning_content) |reasoning| {
                     // Apply reasoning budget truncation if set
                     const final_reasoning = if (reasoning_budget >= 0) blk: {
@@ -5511,7 +5599,7 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -5520,7 +5608,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -5539,6 +5627,9 @@ fn handleAnthropicNonStreaming(
     stop_sequences: []const []const u8,
     model_name: []const u8,
     has_tools: bool,
+    /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
+    /// the request defined no tools.
+    tools_json: ?[]const u8,
     enable_thinking: bool,
     reasoning_budget: i32,
     prompt_token_count: u32,
@@ -5591,6 +5682,12 @@ fn handleAnthropicNonStreaming(
         }
     }
 
+    // Merge re-opened mid-text thought channels into the leading block so the
+    // split/parse below never leaks raw tags (Gemma 12B re-opens channels mid-turn).
+    const normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
+    defer if (normalized_text) |n| allocator.free(n);
+    if (normalized_text) |n| final_text = n;
+
     const elapsed_ms = timer.read() / std.time.ns_per_ms;
 
     // Build content blocks array
@@ -5602,7 +5699,7 @@ fn handleAnthropicNonStreaming(
 
     // Thinking block
     if (enable_thinking) {
-        const think_split = chat_mod.splitThinkBlock(final_text, true);
+        const think_split = chat_mod.splitThinkBlock(final_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
         if (think_split.reasoning_content) |reasoning| {
             // Apply budget truncation
             var truncated_reasoning = reasoning;
@@ -5635,7 +5732,9 @@ fn handleAnthropicNonStreaming(
 
     // Check for tool calls
     if (has_tools) {
-        if (try chat_mod.parseToolCalls(allocator, final_text)) |tool_calls| {
+        const found_calls = (try chat_mod.parseToolCalls(allocator, final_text)) orelse
+            (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, final_text, tj) else null);
+        if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
                     allocator.free(tc.name);
@@ -5737,6 +5836,9 @@ fn handleAnthropicStreaming(
     stop_sequences: []const []const u8,
     model_name: []const u8,
     has_tools: bool,
+    /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
+    /// the request defined no tools.
+    tools_json: ?[]const u8,
     enable_thinking: bool,
     reasoning_budget: i32,
     prompt_token_count: u32,
@@ -5905,7 +6007,10 @@ fn handleAnthropicStreaming(
                     std.mem.indexOf(u8, buf, "<|channel>thought") != null or
                     std.mem.indexOf(u8, buf, "<think>") != null or
                     (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
-                    (std.mem.startsWith(u8, buf, "<think") and buf.len < 7));
+                    (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
+                    // Partial opener at the buffer tail — hold the flush so
+                    // tag fragments never leak as visible content.
+                    chat_mod.endsWithPartialThinkOpen(buf));
                 if (!maybe_thinking) {
                     // Flush buffered tokens as text
                     for (token_texts.items) |tt| {
@@ -6083,7 +6188,18 @@ fn handleAnthropicStreaming(
     var finish_reason: []const u8 = if (client_gone) "client_disconnect" else if (stopped) "stop" else ts.finish_reason;
 
     if (has_tools and !client_gone) {
-        if (try chat_mod.parseToolCalls(allocator, text_buf.items)) |tool_calls| {
+        if (log.isDebug() and text_buf.items.len > 0) {
+            log.debug("  raw generated text before tool parse ({d}b): {s}\n", .{ text_buf.items.len, text_buf.items[0..@min(text_buf.items.len, 4000)] });
+        }
+        // Merge re-opened mid-text thought channels into the leading block so
+        // the split/parse below never leaks raw tags (Gemma 12B re-opens
+        // channels mid-turn — observed live via Claude Code on this surface).
+        const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
+        defer if (norm_owned) |n| allocator.free(n);
+        const gen_text: []const u8 = norm_owned orelse text_buf.items;
+        const found_calls = (try chat_mod.parseToolCalls(allocator, gen_text)) orelse
+            (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, gen_text, tj) else null);
+        if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| { allocator.free(tc.name); allocator.free(tc.arguments); }
                 allocator.free(tool_calls);
@@ -6091,7 +6207,7 @@ fn handleAnthropicStreaming(
 
             // Emit thinking from buffered text if needed
             if (enable_thinking) {
-                const think_split = chat_mod.splitThinkBlock(text_buf.items, true);
+                const think_split = chat_mod.splitThinkBlock(gen_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
                 if (think_split.reasoning_content) |reasoning| {
                     const sd = try std.fmt.allocPrint(allocator,
                         \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
@@ -6148,7 +6264,10 @@ fn handleAnthropicStreaming(
                 var full_text = std.ArrayList(u8).empty;
                 defer full_text.deinit(allocator);
                 for (token_texts.items) |t| try full_text.appendSlice(allocator, t);
-                const think_split = chat_mod.splitThinkBlock(full_text.items, true);
+                const flush_norm = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, full_text.items);
+                defer if (flush_norm) |n| allocator.free(n);
+                const flush_text: []const u8 = flush_norm orelse full_text.items;
+                const think_split = chat_mod.splitThinkBlock(flush_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
                 if (think_split.reasoning_content) |reasoning| {
                     const sd = try std.fmt.allocPrint(allocator,
                         \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
@@ -6493,8 +6612,21 @@ fn handleResponses(
             log.debug("[responses] using top-level response_format as text.format alias\n", .{});
         }
     }
-    const grammar_schema_val: ?std.json.Value = text_format.schema_value;
     const wants_json = std.mem.eql(u8, text_format.kind, "json_schema") or std.mem.eql(u8, text_format.kind, "json_object");
+    // Belt + braces, mirroring the chat-completions path: bare `json_object`
+    // carries no schema, so without a synthesized permissive one there is no
+    // grammar constraint at all and prompt-ignoring models (Gemma 3 wraps the
+    // object in a ```json fence — caught live by llmprobe
+    // structured-json-mode-valid, 2026-06-10) emit invalid JSON.
+    var json_object_schema_holder: ?std.json.Parsed(std.json.Value) = null;
+    defer if (json_object_schema_holder) |*p| p.deinit();
+    if (text_format.schema_value == null and std.mem.eql(u8, text_format.kind, "json_object")) {
+        json_object_schema_holder = std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"object\",\"additionalProperties\":true}", .{}) catch null;
+    }
+    const grammar_schema_val: ?std.json.Value = if (json_object_schema_holder) |*p|
+        p.value
+    else
+        text_format.schema_value;
     const has_current_tool_output = responses_mod.inputContainsFunctionCallOutput(input_val);
 
     // ── sampling params ──
@@ -6508,7 +6640,7 @@ fn handleResponses(
         } else null;
     };
     const max_tokens: u32 = req_max_output_tokens orelse
-        (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else DEFAULT_API_MAX_TOKENS);
+        (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault());
     const temperature = parseJsonFloat(root, "temperature", 1.0, 0.0, 2.0);
     const top_p = parseJsonFloat(root, "top_p", 1.0, 0.0, 1.0);
     const top_k: u32 = if (root.get("top_k")) |v| switch (v) {
@@ -7139,14 +7271,23 @@ fn handleResponses(
 
     const status_str: []const u8 = if (std.mem.eql(u8, finish_reason, "length")) "incomplete" else "completed";
 
+    // Merge re-opened mid-text thought channels into the leading block so the
+    // split/parse below never leaks raw tags (Gemma 12B re-opens channels mid-turn).
+    const normalized_text = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, final_text);
+    defer if (normalized_text) |n| allocator.free(n);
+    if (normalized_text) |n| final_text = n;
+
     // ── split thinking & tool calls ──
-    const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking);
+    const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking, enable_thinking and promptOpensThink(allocator, lm, tok, prompt_ids));
     const reasoning_text: ?[]const u8 = if (enable_thinking) think_split.reasoning_content else null;
     const visible_text: []const u8 = if (enable_thinking) think_split.content else chat_mod.stripThinkBlock(final_text);
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
     if (active_has_tools) {
         tool_calls = try chat_mod.parseToolCalls(allocator, final_text);
+        if (tool_calls == null) {
+            if (active_tools_json) |tj| tool_calls = try chat_mod.inferBareJsonToolCalls(allocator, final_text, tj);
+        }
     }
     defer if (tool_calls) |tcs| {
         for (tcs) |tc| {
@@ -7240,6 +7381,14 @@ fn handleResponses(
     // ── envelope ──
     const is_incomplete = std.mem.eql(u8, status_str, "incomplete");
     const is_completed_status = std.mem.eql(u8, status_str, "completed") or is_incomplete;
+    // reasoning token count for usage.output_tokens_details (re-encode of the
+    // split reasoning text — exact modulo merge boundaries).
+    const reasoning_tok_count: u32 = blk: {
+        const rt = reasoning_text orelse break :blk 0;
+        const rids = tok.encode(allocator, rt) catch break :blk 0;
+        defer allocator.free(rids);
+        break :blk @intCast(rids.len);
+    };
     const envelope = try buildResponsesEnvelope(
         stream.io,
         allocator,
@@ -7250,7 +7399,7 @@ fn handleResponses(
         result.prompt_tokens,
         result.completion_tokens,
         result.cached_tokens,
-        0, // reasoning_tokens — not tracked separately yet
+        reasoning_tok_count,
         should_store,
         prev_id,
         is_incomplete,
@@ -8545,6 +8694,26 @@ test "getEffectiveContextLength computes safe default from GPU memory" {
     try testing.expectEqual(@as(u32, 32768), getEffectiveContextLength(&config));
 }
 
+test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback otherwise" {
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+
+    // OpenAI semantics: omitted max_tokens = generate until EOS bounded by the
+    // context window. The old fixed 256 default broke agent clients (pi) whose
+    // thinking-enabled turns hit `length` mid-reasoning on EVERY request.
+    server_config.max_context_size = 32768;
+    const sentinel = omittedMaxTokensDefault();
+    // Big enough that clampMaxTokens (the downstream bound) always wins…
+    try testing.expect(sentinel > 32768);
+    // …and the composition resolves to exactly the remaining context.
+    try testing.expectEqual(@as(u32, 32768 - 1500), clampMaxTokens(sentinel, 1500));
+
+    // ctx unknown (max_context_size=0): clampMaxTokens won't bound anything,
+    // so the default itself must stay finite.
+    server_config.max_context_size = 0;
+    try testing.expectEqual(@as(u32, 4096), omittedMaxTokensDefault());
+}
+
 test "clampMaxTokens no limit when ctx_size=0" {
     const original = server_config.max_context_size;
     defer server_config.max_context_size = original;
@@ -8878,6 +9047,16 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     try testing.expect(std.mem.indexOf(u8, body, "\"max_safe_context\":16384") != null); // Swift fetchProps
 }
 
+
+test "llama cache default keeps shared prefixes warm" {
+    // With the legacy default of 1, every llama.cpp request evicted the
+    // single KV session — even two SEQUENTIAL requests sharing an 8 KB
+    // prefix reported cached_tokens=0 (caught live by llmprobe
+    // cache-hit-reported on the E4B GGUF, 2026-06-10). 4 sessions keep
+    // interleaved agent roots warm; sessions are created lazily so idle
+    // slots cost nothing.
+    try testing.expect(llama_cache_entries >= 4);
+}
 
 test "prefix cache default capacity covers interleaved agent flows" {
     // Claude Code-style clients interleave several conversation roots (main

@@ -1405,6 +1405,14 @@ pub const Transformer = struct {
     compiled_geglu: ?mlx.mlx_closure = null, // gelu(gate) * up → 1 kernel
     compiled_softcap: ?mlx.mlx_closure = null, // tanh(x/cap) * cap → 1 kernel
     compiled_moe_routing: ?mlx.mlx_closure = null, // negate→argpartition→slice→softmax→take→sum→expand→divide → 1 kernel
+    compiled_gdn_gate: ?mlx.mlx_closure = null, // exp(-exp(A_log)·softplus(a+dt_bias)) → 1 kernel (mirrors mlx-lm compute_g)
+
+    // GatedDeltaNet per-token decode used to rebuild these on EVERY layer/step
+    // (measured dispatch overhead on Qwen 3.6 hybrid). Built lazily on first
+    // use, freed in deinit.
+    gdn_ones_w: ?mlx.mlx_array = null, // ones([dk]) for parameter-free rms_norm
+    gdn_q_scale: ?mlx.mlx_array = null, // bf16 scalar 1/dk
+    gdn_k_scale: ?mlx.mlx_array = null, // bf16 scalar 1/sqrt(dk)
 
     // Per-weight quantization bit cache (see bitsFor). Populated lazily on first use.
     // Keyed by the scales array's ctx pointer (stable for the lifetime of a weight).
@@ -1523,8 +1531,23 @@ pub const Transformer = struct {
         } else if (config.isMoe() or config.full_attention_interval > 0) {
             const ml = try initMoeLayers(allocator, config, weights, &name_buf, s);
             moe_layers = ml.moe_layers;
-            ssm_entries = ml.ssm_entries;
             moe_owned_bf16 = ml.owned_bf16;
+            // ssm_entries are only meaningful when the family actually has
+            // linear-attention (GDN) layers — full_attention_interval > 0.
+            // A pure-attention MoE (qwen3_moe, Gemma 4 MoE) carrying non-null
+            // ssm_entries makes the hot prefix cache classify the model as
+            // hybrid and force a cold prefill on EVERY request: no checkpoint
+            // can ever exist, so every lookup is a "hybrid miss" (caught live
+            // by llmprobe cache-hit-reported on Qwen3-Coder, 2026-06-10).
+            if (config.full_attention_interval > 0) {
+                ssm_entries = ml.ssm_entries;
+            } else {
+                for (ml.ssm_entries) |*e| {
+                    _ = mlx.mlx_array_free(e.conv_state);
+                    _ = mlx.mlx_array_free(e.ssm_state);
+                }
+                allocator.free(ml.ssm_entries);
+            }
         } else {
             const sl = try initStandardLayers(allocator, config, weights, &name_buf, s);
             layers = sl.layers;
@@ -2069,6 +2092,62 @@ pub const Transformer = struct {
         return 0;
     }
 
+    /// Compile the GatedDeltaNet gating chain (astype→exp→add→astype→exp→log1p→
+    /// multiply→negative→exp→astype, ~10 dispatches) into one fused kernel.
+    /// shapeless=true: pure elementwise chain, same trace for any [B,S,Hv].
+    pub fn compileGdnGate(self: *Transformer) void {
+        const raw_closure = mlx.mlx_closure_new_func_payload(
+            &gdnGateClosureCallback,
+            @ptrCast(self),
+            null,
+        );
+        var compiled = mlx.mlx_closure{ .ctx = null };
+        const rc = mlx.mlx_compile(&compiled, raw_closure, true);
+        _ = mlx.mlx_closure_free(raw_closure);
+        if (rc == 0 and compiled.ctx != null) {
+            self.compiled_gdn_gate = compiled;
+            log.info("GDN gate compiled (kernel fusion enabled)\n", .{});
+        }
+    }
+
+    fn gdnGateClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+        const self: *Transformer = @ptrCast(@alignCast(payload.?));
+        var A_log = mlx.mlx_array_new();
+        if (mlx.mlx_vector_array_get(&A_log, input, 0) != 0) return -1;
+        defer _ = mlx.mlx_array_free(A_log);
+        var a = mlx.mlx_array_new();
+        if (mlx.mlx_vector_array_get(&a, input, 1) != 0) return -1;
+        defer _ = mlx.mlx_array_free(a);
+        var dt_bias = mlx.mlx_array_new();
+        if (mlx.mlx_vector_array_get(&dt_bias, input, 2) != 0) return -1;
+        defer _ = mlx.mlx_array_free(dt_bias);
+
+        const g = gdnGateChain(A_log, a, dt_bias, self.s) catch return -1;
+        const out_arr = [_]mlx.mlx_array{g};
+        res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
+        _ = mlx.mlx_array_free(g);
+        return 0;
+    }
+
+    /// Apply the compiled GDN gate closure if available, else the raw chain.
+    /// Returns owned g (bf16, shape of `a`).
+    fn computeGdnGate(self: *const Transformer, A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array) !mlx.mlx_array {
+        if (self.compiled_gdn_gate) |compiled| {
+            const in_arr = [_]mlx.mlx_array{ A_log, a, dt_bias };
+            const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 3);
+            defer _ = mlx.mlx_vector_array_free(in_vec);
+            var out_vec = mlx.mlx_vector_array{ .ctx = null };
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
+            defer _ = mlx.mlx_vector_array_free(out_vec);
+            if (mlx.mlx_vector_array_size(out_vec) == 1) {
+                var g = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_vector_array_get(&g, out_vec, 0));
+                return g;
+            }
+        }
+        return gdnGateChain(A_log, a, dt_bias, self.s);
+    }
+
     /// Compile MoE routing (negate→argpartition→slice→softmax→take_along_axis→sum→expand→divide)
     /// into a single fused kernel. Input: router_logits. Outputs: inds, norm_scores.
     /// shapeless=false: slice bounds derive from input ndim, so the closure must
@@ -2188,6 +2267,10 @@ pub const Transformer = struct {
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_softcap) |cs| _ = mlx.mlx_closure_free(cs);
         if (self.compiled_moe_routing) |cmr| _ = mlx.mlx_closure_free(cmr);
+        if (self.compiled_gdn_gate) |cgg| _ = mlx.mlx_closure_free(cgg);
+        if (self.gdn_ones_w) |w| _ = mlx.mlx_array_free(w);
+        if (self.gdn_q_scale) |q| _ = mlx.mlx_array_free(q);
+        if (self.gdn_k_scale) |k| _ = mlx.mlx_array_free(k);
         if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
         if (self.emb_scale) |es| _ = mlx.mlx_array_free(es);
@@ -2768,6 +2851,10 @@ pub const Transformer = struct {
         if (self.compiled_moe_routing) |c| {
             _ = mlx.mlx_closure_free(c);
             self.compiled_moe_routing = null;
+        }
+        if (self.compiled_gdn_gate) |c| {
+            _ = mlx.mlx_closure_free(c);
+            self.compiled_gdn_gate = null;
         }
     }
 
@@ -5201,18 +5288,23 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_reshape(&v_heads, v_flat, &v_shape, 4, self.s));
 
         // Q/K normalization: q = (1/dk) * rms_norm(q, null), k = (1/sqrt(dk)) * rms_norm(k, null)
-        const inv_scale = 1.0 / @as(f32, @floatFromInt(cfg.linear_key_head_dim));
-        const inv_sqrt_scale = @sqrt(inv_scale);
-        const inv_scale_sq = bf16Scalar(inv_scale, self.s);
-        defer _ = mlx.mlx_array_free(inv_scale_sq);
-        const inv_sqrt_sc = bf16Scalar(inv_sqrt_scale, self.s);
-        defer _ = mlx.mlx_array_free(inv_sqrt_sc);
-
-        // Parameter-free RMS norm: use ones weight (mlx-c requires non-empty array)
-        const ones_shape = [_]c_int{dk};
-        var ones_w = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ones_w);
-        try mlx.check(mlx.mlx_ones(&ones_w, &ones_shape, 1, .bfloat16, self.s));
+        // Scale scalars + the parameter-free rms_norm ones-weight (mlx-c
+        // requires a non-empty weight) are cached on the Transformer — they
+        // used to be rebuilt every layer every decode step.
+        if (self.gdn_q_scale == null) {
+            const inv_scale = 1.0 / @as(f32, @floatFromInt(cfg.linear_key_head_dim));
+            self.gdn_q_scale = bf16Scalar(inv_scale, self.s);
+            self.gdn_k_scale = bf16Scalar(@sqrt(inv_scale), self.s);
+        }
+        const inv_scale_sq = self.gdn_q_scale.?;
+        const inv_sqrt_sc = self.gdn_k_scale.?;
+        if (self.gdn_ones_w == null) {
+            const ones_shape = [_]c_int{dk};
+            var w = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_ones(&w, &ones_shape, 1, .bfloat16, self.s));
+            self.gdn_ones_w = w;
+        }
+        const ones_w = self.gdn_ones_w.?;
 
         var q_norm = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_norm);
@@ -5228,42 +5320,11 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(k_scaled);
         try mlx.check(mlx.mlx_multiply(&k_scaled, k_norm, inv_sqrt_sc, self.s));
 
-        // Compute gating: g = exp(-exp(A_log) * softplus(a + dt_bias))
-        // Cast A_log to float32 for stability
-        var A_log_f32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(A_log_f32);
-        try mlx.check(mlx.mlx_astype(&A_log_f32, la.A_log, .float32, self.s));
-        var exp_A = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(exp_A);
-        try mlx.check(mlx.mlx_exp(&exp_A, A_log_f32, self.s));
-
-        // softplus(a + dt_bias) = log(1 + exp(a + dt_bias))
-        var a_plus_dt = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(a_plus_dt);
-        try mlx.check(mlx.mlx_add(&a_plus_dt, a_proj, la.dt_bias, self.s));
-        var a_f32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(a_f32);
-        try mlx.check(mlx.mlx_astype(&a_f32, a_plus_dt, .float32, self.s));
-        var exp_a = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(exp_a);
-        try mlx.check(mlx.mlx_exp(&exp_a, a_f32, self.s));
-        var sp_inner = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sp_inner);
-        try mlx.check(mlx.mlx_log1p(&sp_inner, exp_a, self.s));
-
-        // -exp(A_log) * softplus(...)
-        var neg_decay = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(neg_decay);
-        try mlx.check(mlx.mlx_multiply(&neg_decay, exp_A, sp_inner, self.s));
-        var neg_neg = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(neg_neg);
-        try mlx.check(mlx.mlx_negative(&neg_neg, neg_decay, self.s));
-        var g_f32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(g_f32);
-        try mlx.check(mlx.mlx_exp(&g_f32, neg_neg, self.s)); // [B, S, Hv]
-        var g = mlx.mlx_array_new();
+        // Gating: g = exp(-exp(A_log) * softplus(a + dt_bias)) — one fused
+        // kernel via compiled closure (mirrors mlx-lm's compute_g), raw chain
+        // as fallback. [B, S, Hv]
+        const g = try self.computeGdnGate(la.A_log, a_proj, la.dt_bias);
         defer _ = mlx.mlx_array_free(g);
-        try mlx.check(mlx.mlx_astype(&g, g_f32, .bfloat16, self.s));
 
         // beta = sigmoid(b)
         var beta = mlx.mlx_array_new();
@@ -6385,6 +6446,47 @@ fn detectQuantBits(w: mlx.mlx_array, sc: mlx.mlx_array, group_size: u32) u32 {
 /// exercise the pure subgraph without constructing a full Transformer. Returns
 /// owned `inds` (int32, [..., k]) and `norm_scores` (bf16, [..., k]) — caller
 /// must free both.
+/// GatedDeltaNet gating chain: g = exp(-exp(A_log) * softplus(a + dt_bias)),
+/// computed in float32 for stability and returned as bfloat16. Mirrors
+/// mlx-lm's `compute_g` (which is `@mx.compile`d). Pure — serves as both the
+/// compiled-closure body and the uncompiled fallback. Returns owned array.
+fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var A_log_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(A_log_f32);
+    try mlx.check(mlx.mlx_astype(&A_log_f32, A_log, .float32, s));
+    var exp_A = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(exp_A);
+    try mlx.check(mlx.mlx_exp(&exp_A, A_log_f32, s));
+
+    // softplus(a + dt_bias) = log1p(exp(a + dt_bias))
+    var a_plus_dt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a_plus_dt);
+    try mlx.check(mlx.mlx_add(&a_plus_dt, a, dt_bias, s));
+    var a_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a_f32);
+    try mlx.check(mlx.mlx_astype(&a_f32, a_plus_dt, .float32, s));
+    var exp_a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(exp_a);
+    try mlx.check(mlx.mlx_exp(&exp_a, a_f32, s));
+    var sp_inner = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sp_inner);
+    try mlx.check(mlx.mlx_log1p(&sp_inner, exp_a, s));
+
+    var neg_decay = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg_decay);
+    try mlx.check(mlx.mlx_multiply(&neg_decay, exp_A, sp_inner, s));
+    var neg_neg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg_neg);
+    try mlx.check(mlx.mlx_negative(&neg_neg, neg_decay, s));
+    var g_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_f32);
+    try mlx.check(mlx.mlx_exp(&g_f32, neg_neg, s));
+    var g = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(g);
+    try mlx.check(mlx.mlx_astype(&g, g_f32, .bfloat16, s));
+    return g;
+}
+
 fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !Transformer.MoeRouting {
     var neg_logits = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(neg_logits);
@@ -7628,4 +7730,39 @@ test "moeRoutingChain produces top-K indices and renormalized softmax weights" {
     try testing.expect(@abs(gs[1] - 15.0) < tol);
     try testing.expect(@abs(ss[0] - 1.0) < tol);
     try testing.expect(@abs(ss[1] - 1.0) < tol);
+}
+
+test "gdnGateChain matches g = exp(-exp(A_log) * softplus(a + dt_bias))" {
+    const s = mlx.gpuStream();
+
+    // Hv = 2 heads, B=1, S=1. Hand-computable fixtures:
+    //   head 0: A_log=0, a=0, dt_bias=0 → g = exp(-1 * softplus(0)) = exp(-ln2) = 0.5
+    //   head 1: A_log=ln2, a=0, dt_bias=0 → g = exp(-2 * ln2) = 0.25
+    const a_log_data = [_]f32{ 0.0, @log(2.0) };
+    const hv_shape = [_]c_int{2};
+    const A_log = mlx.mlx_array_new_data(&a_log_data, &hv_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(A_log);
+
+    const a_data = [_]f32{ 0.0, 0.0 };
+    const a_shape = [_]c_int{ 1, 1, 2 };
+    const a = mlx.mlx_array_new_data(&a_data, &a_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(a);
+
+    const dt_data = [_]f32{ 0.0, 0.0 };
+    const dt_bias = mlx.mlx_array_new_data(&dt_data, &hv_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(dt_bias);
+
+    const g = try gdnGateChain(A_log, a, dt_bias, s);
+    defer _ = mlx.mlx_array_free(g);
+
+    var g_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g_f32);
+    try mlx.check(mlx.mlx_astype(&g_f32, g, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(g_f32));
+
+    const gd = mlx.mlx_array_data_float32(g_f32) orelse return error.InvalidDtype;
+    // bf16 round-trip tolerance
+    const tol: f32 = 5e-3;
+    try testing.expect(@abs(gd[0] - 0.5) < tol);
+    try testing.expect(@abs(gd[1] - 0.25) < tol);
 }

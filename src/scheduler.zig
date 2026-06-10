@@ -141,7 +141,7 @@ pub const LoadParams = struct {
     /// llama prefill fights one KV slot). > 1 keeps the N
     /// most-recently-used prompts hot in independent contexts so
     /// alternating multi-doc agent loads don't cold-prefill every flip.
-    llama_cache_entries: u32 = 1,
+    llama_cache_entries: u32 = 4,
     /// Phase 5 #2: ggml types for the embedded llama.cpp KV cache.
     /// 0 = libllama default (F16); other values match `ggml_type` enum
     /// (Q8_0=8, Q4_0=2). Wired through `Scheduler.doLoadOnInferenceThread`
@@ -359,13 +359,16 @@ pub const Slot = struct {
 
         // Per-slot SSM cache. Mirror the same predicate `Transformer.init`
         // uses to allocate `xfm.ssm_entries` (transformer.zig: `has_hybrid_layers`
-        // OR `isMoe() || full_attention_interval > 0`). Without this branch the
+        // OR `full_attention_interval > 0`). Without this branch the
         // slot's `ctx.ssm_entries` is null and `forwardMoeWith`'s
         // linear-attention layers crash on `ctx.ssm_entries.?` for Qwen 3.5/3.6
         // MoE (which carries GatedDeltaNet inside its MoE structure but does
-        // NOT set `has_hybrid_layers`).
+        // NOT set `has_hybrid_layers`). Pure-attention MoE (qwen3_moe, Gemma 4
+        // MoE — isMoe() but interval == 0) must NOT get entries: a non-null
+        // slice makes the hot prefix cache treat the model as hybrid and
+        // cold-prefill every request.
         var ssm_entries: ?[]SSMCacheEntry = null;
-        if (!is_embedded and (config.has_hybrid_layers or config.isMoe() or config.full_attention_interval > 0)) {
+        if (!is_embedded and (config.has_hybrid_layers or config.full_attention_interval > 0)) {
             const entries = try allocator.alloc(SSMCacheEntry, config.num_hidden_layers);
             for (entries) |*e| {
                 e.* = .{
@@ -682,7 +685,7 @@ pub const LoadRequest = struct {
     tokenize_cache_entries: u32 = 4,
     /// Iteration 3-5: llama.cpp multi-session cap. Mirrors
     /// `LoadParams.llama_cache_entries`.
-    llama_cache_entries: u32 = 1,
+    llama_cache_entries: u32 = 4,
     /// Phase 5 #2: ggml types for the embedded llama.cpp KV cache. 0 keeps
     /// libllama default (F16); Q8_0=8, Q4_0=2. Threaded onto the LoadedModel
     /// at load time.
@@ -1709,6 +1712,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     }
     if (xfm_ptr.moe_layers != null) {
         xfm_ptr.compileMoeRouting();
+    }
+    if (params.config.linear_num_key_heads > 0) {
+        xfm_ptr.compileGdnGate();
     }
 
     // Phase 2 experiment: opt-in full-forward Metal fusion via
@@ -2772,7 +2778,12 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
 
-    if (slot.enable_drafter and gen.drafter != null and !gen.spec_disabled_runtime) {
+    // NOTE: no `!gen.spec_disabled_runtime` short-circuit here — the
+    // generators handle the disabled fallback internally, and `nextPld`'s
+    // disabled branch is also where the mid-request RE-ENABLE check lives
+    // (bypassing it pinned PLD off for the rest of the request even when the
+    // generated tail turned echo-heavy).
+    if (slot.enable_drafter and gen.drafter != null) {
         const result = try gen.nextDrafter(slot.allocator);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);
@@ -2796,7 +2807,7 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
         return;
     }
 
-    if (slot.enable_pld and !gen.spec_disabled_runtime) {
+    if (slot.enable_pld) {
         const result = try gen.nextPld(slot.allocator, slot.pld_draft_len, slot.pld_key_len);
         if (result == null) {
             finishSlot(sch, slot, gen.finish_reason);

@@ -34,3 +34,5 @@ server_err.log
 .spec-progress.md
 docs/perf/
 docs/tmp
+tests/pi-results
+tests/validator-results
