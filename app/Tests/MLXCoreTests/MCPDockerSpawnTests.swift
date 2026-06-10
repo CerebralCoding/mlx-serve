@@ -2,10 +2,9 @@ import XCTest
 import Foundation
 @testable import MLXCore
 
-/// Verifies the spawn-time fast-fail path: when an MCP server's underlying upstream is unreachable
-/// and the server itself dies during init (docker-mcp does this in ~0.6s when the Docker daemon is
-/// down), `startEnabled` must return promptly with a clear error — not hang for 30s+ waiting for an
-/// `initialize` reply that will never arrive.
+/// Verifies the spawn-time fast-fail path: when an MCP server dies during init (as docker-mcp does
+/// when the Docker daemon is down), `startEnabled` must return promptly with a clear error — not
+/// hang for 30s+ waiting for an `initialize` reply that will never arrive.
 @MainActor
 final class MCPDockerSpawnTests: XCTestCase {
 
@@ -28,24 +27,32 @@ final class MCPDockerSpawnTests: XCTestCase {
         unsetenv("MCP_CONFIG_PATH")
     }
 
-    func testStartEnabledFailsFastWhenDockerDaemonIsDown() async throws {
-        guard await MCPManager.commandExists("npx") else {
-            throw XCTSkip("npx not on PATH; can't test docker-mcp spawn")
-        }
-        if Self.dockerDaemonReachable() {
-            throw XCTSkip("Docker daemon is running; this test only exercises the daemon-down crash path")
-        }
+    func testStartEnabledFailsFastWhenServerDiesDuringInit() async throws {
+        // Hermetic stand-in for docker-mcp's daemon-down behavior: print the failure to stderr and
+        // exit non-zero before ever speaking MCP. The real `npx -y docker-mcp` proved too
+        // environment-dependent for CI (cold npx cache or a hung child outlives the 30s connect
+        // timeout); the code path under test — connectOrFailFast's terminationHandler race — is
+        // identical for any stdio server that dies during init.
+        let dir = (sandboxPath as NSString).deletingLastPathComponent
+        let script = (dir as NSString).appendingPathComponent("dying-mcp-server.sh")
+        try """
+        #!/bin/sh
+        sleep 0.5
+        echo 'Error: Docker daemon is not accessible' >&2
+        exit 1
+        """.write(toFile: script, atomically: true, encoding: .utf8)
+        try FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: script)
 
         let manager = MCPManager()
         var config = MCPConfig()
         config.mcpServers["docker"] = MCPServerEntry(
-            command: "npx", args: ["-y", "docker-mcp"], env: nil, disabled: false
+            command: script, args: [], env: nil, disabled: false
         )
         try manager.saveConfig(config)
 
-        // The whole startEnabled call should complete well under 10s.
-        // docker-mcp dies in ~0.6s, plus npx startup overhead ~1-3s on cached package.
-        let cap: TimeInterval = 30  // generous slack for cold npx cache (first-run package fetch)
+        // Child dies in ~0.5s; anything approaching the 30s connect timeout means the
+        // terminationHandler fast-fail path didn't fire.
+        let cap: TimeInterval = 10
         let started = Date()
         await manager.startEnabled()
         let elapsed = Date().timeIntervalSince(started)
@@ -141,14 +148,5 @@ final class MCPDockerSpawnTests: XCTestCase {
         await manager.startEnabled()
         XCTAssertNil(manager.startErrors["nopkg"],
                      "Disabled entries shouldn't keep showing stale errors; got: \(manager.startErrors)")
-    }
-
-    nonisolated private static func dockerDaemonReachable() -> Bool {
-        let candidates = [
-            "/var/run/docker.sock",
-            (NSString(string: "~/.docker/run/docker.sock").expandingTildeInPath),
-            (NSString(string: "~/.docker/desktop/docker.sock").expandingTildeInPath),
-        ]
-        return candidates.contains { FileManager.default.fileExists(atPath: $0) }
     }
 }
