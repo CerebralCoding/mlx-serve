@@ -175,6 +175,12 @@ pub const Conn = struct {
     /// `POLLIN`-with-FIN (peer closed, `recv` returns 0). Stray bytes from a
     /// pipelined client are not expected on an SSE response stream — if we
     /// see them, we conservatively treat the connection as live.
+    /// Idle interval (ms) between keepalive probes while a streaming
+    /// request waits on its first tokens (prefill). Short enough that an
+    /// abandoned prefill is noticed and cancelled quickly and that clients
+    /// never hit stream-idle timeouts; tiny traffic cost.
+    pub const STREAM_KEEPALIVE_MS: i64 = 5000;
+
     pub fn peerClosed(c: *Conn) bool {
         const fd = c.stream.socket.handle;
         var fds = [_]std.posix.pollfd{.{
@@ -246,7 +252,48 @@ pub const ServerConfig = struct {
     /// field overrides. Only takes effect at `--kv-quant 4|8` (.affine
     /// cache scheme); other schemes ignore it.
     default_kv_attn_fused: bool = false,
+    /// Defaults for sampling fields the request OMITS, set by `--temp` /
+    /// `--top-p` / `--top-k` in serve mode (the macOS app passes its Settings
+    /// values so external clients like Claude Code — which send no sampling
+    /// params at all — inherit them). null = flag not given; resolution falls
+    /// through to the model's generation_config.json recommendation, then the
+    /// hardcoded fallback. Explicit request body fields always win. See
+    /// `resolveSamplingDefault`.
+    default_temperature: ?f32 = null,
+    default_top_p: ?f32 = null,
+    default_top_k: ?u32 = null,
 };
+
+/// Sampling-default resolution chain: request body > CLI launch flag >
+/// model generation_config.json > hardcoded fallback. An explicit request
+/// value of 0 (greedy / disabled) is a value, not an omission.
+fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T, fallback: T) T {
+    return request orelse cli orelse gen_config orelse fallback;
+}
+
+/// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
+/// from an explicit value, for fields whose default comes from the
+/// resolution chain above.
+fn parseJsonFloatOpt(root: std.json.ObjectMap, key: []const u8, min: f32, max: f32) ?f32 {
+    const v = root.get(key) orelse return null;
+    const raw: f32 = switch (v) {
+        .float => |f| @floatCast(f),
+        .integer => |i| @floatFromInt(i),
+        else => return null,
+    };
+    return std.math.clamp(raw, min, max);
+}
+
+/// Optional top_k body-field parse (positive integer, capped at 1000).
+/// null = omitted or unusable; explicit 0 means "disable top-k".
+fn parseJsonTopKOpt(root: std.json.ObjectMap, key: []const u8) ?u32 {
+    const v = root.get(key) orelse return null;
+    return switch (v) {
+        .integer => |i| if (i > 0) @intCast(@min(i, 1000)) else 0,
+        .float => |f| if (f > 0) @intFromFloat(@min(f, 1000)) else 0,
+        else => null,
+    };
+}
 
 /// Live process-wide config. Mutated by `serve()` at startup from its
 /// parameters; never written from a handler after that. Public so main.zig
@@ -1160,6 +1207,16 @@ fn chatTemplateSupportsThinking(tmpl: []const u8) bool {
         std.mem.indexOf(u8, tmpl, "<|channel>") != null;
 }
 
+/// Render an optional model-author sampling recommendation (from the model's
+/// generation_config.json) as a JSON scalar: the number when present, the
+/// literal `null` when the model ships no value. Caller owns the slice.
+/// Used for the `gen_temperature`/`gen_top_p`/`gen_top_k` meta fields the
+/// Swift Settings UI reads to show "model recommends" guidance pills.
+fn optSamplingRecJson(allocator: std.mem.Allocator, comptime T: type, v: ?T) ![]u8 {
+    if (v) |val| return std.fmt.allocPrint(allocator, "{d}", .{val});
+    return allocator.dupe(u8, "null");
+}
+
 /// Render the JSON metadata fragment for one entry. For `.ready` entries
 /// pulls full capabilities/dimensions off the resident config/chat_config;
 /// for non-ready entries renders a lightweight stub with state +
@@ -1228,8 +1285,19 @@ fn renderModelEntry(
             try allocator.dupe(u8, "null");
         defer allocator.free(bytes_on_disk_str);
 
+        // Model-author sampling recommendations from generation_config.json,
+        // surfaced so the Swift Settings UI can show "model recommends" pills
+        // next to the per-request sampling sliders. `null` when the model
+        // ships no value for that field.
+        const gen_temp_str = try optSamplingRecJson(allocator, f32, config.gen_temperature);
+        defer allocator.free(gen_temp_str);
+        const gen_top_p_str = try optSamplingRecJson(allocator, f32, config.gen_top_p);
+        defer allocator.free(gen_top_p_str);
+        const gen_top_k_str = try optSamplingRecJson(allocator, u32, config.gen_top_k);
+        defer allocator.free(gen_top_k_str);
+
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -1247,6 +1315,9 @@ fn renderModelEntry(
             if (config.isMoe()) "true" else "false",
             if (drafter_loaded) "true" else "false",
             drafter_path_json,
+            gen_temp_str,
+            gen_top_p_str,
+            gen_top_k_str,
         });
     }
 
@@ -2083,13 +2154,9 @@ fn handleChatCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature = parseJsonFloat(root, "temperature", 1.0, 0.0, 2.0);
-    const top_p = parseJsonFloat(root, "top_p", 1.0, 0.0, 1.0);
-    const top_k: u32 = if (root.get("top_k")) |v| switch (v) {
-        .integer => |i| if (i > 0) @intCast(@min(i, 1000)) else 0,
-        .float => |f| if (f > 0) @intFromFloat(@min(f, 1000)) else 0,
-        else => 0,
-    } else 0;
+    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
+    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
+    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
     const repeat_penalty: f32 = blk: {
         const rp = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
@@ -2367,7 +2434,7 @@ fn handleChatCompletions(
     }
     const tools_len = if (tools_json) |tj| tj.len else 0;
 
-    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, max_tokens, temperature, top_p, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
+    log.info("POST /v1/chat/completions ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, sys={d}b, user={d}b, tools={d}b, tool_msgs={d}) \n", .{ messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, system_chars, user_chars, tools_len, tool_msg_count });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
     // Format chat template. ds4-backed models render through the engine's
@@ -2547,23 +2614,9 @@ fn handleCompletions(
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
 
-    const temperature: f32 = if (root.get("temperature")) |v| switch (v) {
-        .float => |f| @floatCast(f),
-        .integer => |i| @floatFromInt(i),
-        else => 1.0,
-    } else 1.0;
-
-    const top_p: f32 = if (root.get("top_p")) |v| switch (v) {
-        .float => |f| @floatCast(f),
-        .integer => |i| @floatFromInt(i),
-        else => 1.0,
-    } else 1.0;
-
-    const top_k: u32 = if (root.get("top_k")) |v| switch (v) {
-        .integer => |i| if (i > 0) @intCast(@min(i, 1000)) else 0,
-        .float => |f| if (f > 0) @intFromFloat(@min(f, 1000)) else 0,
-        else => 0,
-    } else 0;
+    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
+    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
+    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
     const repeat_penalty: f32 = if (root.get("repeat_penalty")) |v| switch (v) {
         .float => |f| @floatCast(f),
@@ -2637,7 +2690,7 @@ fn handleCompletions(
 
     // Log the request
     const preview_len = @min(prompt_text.?.len, 80);
-    log.info("POST /v1/completions (max_tokens={d}, temp={d:.2}, top_p={d:.2}, stream={}) \n", .{ max_tokens, temperature, top_p, is_stream });
+    log.info("POST /v1/completions (max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}) \n", .{ max_tokens, temperature, top_p, top_k, is_stream });
     log.info("  > \"{s}{s}\"\n", .{ prompt_text.?[0..preview_len], if (prompt_text.?.len > 80) "..." else "" });
 
     // Tokenize prompt directly (no chat template). ds4-backed models
@@ -2731,7 +2784,7 @@ fn handleNonStreamingCompletion(
     const use_drafter = enable_drafter and lm.drafter != null and sampling.constraint == null;
     const use_pld = !use_drafter and enable_pld and sampling.constraint == null;
 
-    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, getTimeoutNs(), null, 0, null) catch |err| switch (err) {
+    var result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, false, use_pld, use_drafter, getTimeoutNs(), null, 0, null, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
         else => return err,
     };
@@ -2854,7 +2907,30 @@ fn handleStreamingCompletion(
     var utf8_carry_c_len: u8 = 0;
     var client_gone = false;
 
-    while (try ts.next(allocator)) |token_id| {
+    while (true) {
+        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+            .token => |t| t,
+            .done => break,
+            .idle => {
+                // No tokens yet (long prefill). Probe the peer: an abandoned
+                // request must cancel instead of grinding a ghost prefill
+                // (Claude Code retries pile up serially otherwise), and the
+                // keepalive stops clients timing out on stream silence.
+                if (stream.peerClosed()) {
+                    log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
+                    slot_handle.?.cancel();
+                    client_gone = true;
+                    break;
+                }
+                sendStreamKeepalive(stream) catch {
+                    log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                    slot_handle.?.cancel();
+                    client_gone = true;
+                    break;
+                };
+                continue;
+            },
+        };
         if (stream.peerClosed()) {
             slot_handle.?.cancel();
             client_gone = true;
@@ -2978,6 +3054,10 @@ fn nonStreamingViaScheduler(
     logprobs_n: u32,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
     kv_quant_override: ?transformer_mod.KVQuantConfig,
+    /// When non-null, the peer socket is probed on idle wakeups during the
+    /// wait — a vanished client cancels the slot (aborting its prefill)
+    /// instead of grinding out a ghost generation nobody will read.
+    conn: ?*Conn,
 ) !generate_mod.GenerationResult {
     var slot = try sch.submit(.{
         .model = lm,
@@ -3005,10 +3085,23 @@ fn nonStreamingViaScheduler(
     var output_ids = std.ArrayList(u32).empty;
     defer output_ids.deinit(allocator);
 
-    while (true) {
-        switch (slot.waitNext()) {
+    wait: while (true) {
+        const nr = slot.waitNextTimeout(Conn.STREAM_KEEPALIVE_MS) orelse {
+            // Idle (long prefill). If the client is gone, cancel and serve
+            // whatever accumulated — the response write will fail upstream,
+            // which is fine; the win is freeing the GPU.
+            if (conn) |c| {
+                if (c.peerClosed()) {
+                    log.info("  [cancel] client disconnected while waiting (non-stream) — cancelling slot\n", .{});
+                    slot.cancel();
+                    break :wait;
+                }
+            }
+            continue :wait;
+        };
+        switch (nr) {
             .token => |t| try output_ids.append(allocator, t),
-            .done => break,
+            .done => break :wait,
             .err => return error.GenerationFailed,
         }
     }
@@ -3096,7 +3189,7 @@ fn handleNonStreamingGeneration(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve, logprobs_n, kv_quant_override) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve, logprobs_n, kv_quant_override, stream) catch |err| switch (err) {
         error.GenerationFailed => {
             try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null);
             return;
@@ -3406,6 +3499,29 @@ const StreamingTokenStream = struct {
         }
     }
 
+    const NextOrIdle = union(enum) { token: u32, done, idle };
+
+    /// `next` with an idle timeout (scheduler path only): returns `.idle`
+    /// after `timeout_ms` with no progress so the caller can poll the peer
+    /// socket and emit SSE keepalives during long prefills. The local-
+    /// generator path computes synchronously and never idles.
+    fn nextOrIdle(self: *StreamingTokenStream, allocator: std.mem.Allocator, timeout_ms: i64) !NextOrIdle {
+        if (self.slot) |s| {
+            if (self.finished) return .done;
+            const nr = s.waitNextTimeout(timeout_ms) orelse return .idle;
+            switch (nr) {
+                .token => |t| return .{ .token = t },
+                .done => {
+                    self.finished = true;
+                    return .done;
+                },
+                .err => return error.GenerationFailed,
+            }
+        }
+        if (try self.next(allocator)) |t| return .{ .token = t };
+        return .done;
+    }
+
     /// Yield the next decoded token id, or null if generation is complete.
     /// Mirrors the contract of `Generator.next` for the regular path.
     fn next(self: *StreamingTokenStream, allocator: std.mem.Allocator) !?u32 {
@@ -3670,7 +3786,30 @@ fn handleStreamingGeneration(
 
     // Generate tokens via the adapter — yields one decoded token id per call
     // regardless of whether the underlying decode is regular, PLD, or drafter.
-    while (try ts.next(allocator)) |token_id| {
+    while (true) {
+        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+            .token => |t| t,
+            .done => break,
+            .idle => {
+                // No tokens yet (long prefill). Probe the peer: an abandoned
+                // request must cancel instead of grinding a ghost prefill
+                // (Claude Code retries pile up serially otherwise), and the
+                // keepalive stops clients timing out on stream silence.
+                if (stream.peerClosed()) {
+                    log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
+                    slot_handle.?.cancel();
+                    client_gone = true;
+                    break;
+                }
+                sendStreamKeepalive(stream) catch {
+                    log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                    slot_handle.?.cancel();
+                    client_gone = true;
+                    break;
+                };
+                continue;
+            },
+        };
         if (stream.peerClosed()) {
             slot_handle.?.cancel();
             client_gone = true;
@@ -3752,34 +3891,16 @@ fn handleStreamingGeneration(
             const maybe_tool = chat_mod.streamShouldBufferForTools(buf);
 
             if (!maybe_tool) {
-                // No tool call pattern — flush buffered tokens as streamed content.
-                // But if thinking is enabled, keep buffering until the close tag arrives.
-                // Many templates (Qwen 3.5/3.6) pre-inject the opener (`<think>\n`)
-                // into the prompt, so the model's tokens are already inside the
-                // thinking block — we won't see a literal opener in the buffer.
-                // Also detect literal openers for templates that don't pre-inject.
-                // `think_closed` guards the enable_thinking term: once a
-                // complete think block was split+emitted, later buffered
-                // content (the visible answer) must NOT be held as
-                // "incomplete thinking" — it used to sit in the buffer until
-                // end-of-stream and get flushed as reasoning_content,
-                // hiding the final answer from agent clients (pi).
-                const has_thinking = (enable_thinking and !think_closed) or
-                    std.mem.indexOf(u8, buf, "<|channel>thought") != null or
-                    std.mem.indexOf(u8, buf, "<think>") != null or
-                    (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
-                    (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
-                    // A partial opener at the buffer TAIL (mid-text re-opened
-                    // channel arriving token by token) must hold the flush —
-                    // flushing leaks tag fragments like a glued "thought".
-                    chat_mod.endsWithPartialThinkOpen(buf);
-                if (has_thinking) {
-                    // Check if the thinking block is complete (has closing tag)
-                    const has_close = std.mem.indexOf(u8, buf, "<channel|>") != null or
-                        std.mem.indexOf(u8, buf, "</think>") != null;
-                    if (!has_close) {
+                // No tool call pattern — ask the shared gate (chat.streamThinkGate,
+                // also used by /v1/messages) whether the buffer is thinking that
+                // must be held, a completed think block to split, or visible
+                // prose to flush. Hermetically pinned per recorded model family
+                // by the format corpus streaming-gate test.
+                switch (chat_mod.streamThinkGate(buf, enable_thinking, think_closed)) {
+                    .hold_thinking => {
                         // Incomplete thinking block — keep buffering until closed
-                    } else {
+                    },
+                    .split_think => {
                         // Complete thinking block — split into reasoning + content
                         const split = chat_mod.splitThinkBlock(buf, enable_thinking, opens_think);
                         for (token_texts.items) |tt| allocator.free(tt);
@@ -3794,19 +3915,20 @@ fn handleStreamingGeneration(
                         if (split.content.len > 0) {
                             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = split.content }, null, null, null);
                         }
-                    }
-                } else {
-                    for (token_texts.items) |tt| {
-                        defer allocator.free(tt);
-                        // Skip bare channel/think tags that leak without a full block
-                        if (std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
-                            std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>"))
-                        {
-                            continue;
+                    },
+                    .flush_text => {
+                        for (token_texts.items) |tt| {
+                            defer allocator.free(tt);
+                            // Skip bare channel/think tags that leak without a full block
+                            if (std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
+                                std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>"))
+                            {
+                                continue;
+                            }
+                            try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = tt }, null, null, null);
                         }
-                        try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = tt }, null, null, null);
-                    }
-                    token_texts.clearRetainingCapacity();
+                        token_texts.clearRetainingCapacity();
+                    },
                 }
             }
             // Otherwise keep buffering — tool call may be in progress
@@ -5019,6 +5141,15 @@ fn sendAnthropicError(allocator: std.mem.Allocator, stream: *Conn, err_type: []c
     try sendResponse(stream, status, "application/json", body);
 }
 
+/// SSE comment keepalive for the OpenAI-style streaming surfaces. Comments
+/// are SSE-spec-legal and skipped by every SSE parser. No-op on the
+/// WebSocket transport — a raw comment line would corrupt WS framing, and
+/// WS has protocol-level liveness of its own.
+fn sendStreamKeepalive(stream: *Conn) !void {
+    if (stream.ws_mode != null) return;
+    try stream.writeAll(": keepalive\n\n");
+}
+
 fn sendAnthropicEvent(stream: *Conn, event_name: []const u8, data: []const u8) !void {
     if (stream.ws_mode) |bridge| {
         // WS transport: emit only the JSON payload as a text frame; the
@@ -5411,13 +5542,13 @@ fn handleAnthropicMessages(
         return;
     }
 
-    // Sampling parameters
-    const temperature = parseJsonFloat(root, "temperature", 1.0, 0.0, 2.0);
-    const top_p = parseJsonFloat(root, "top_p", 1.0, 0.0, 1.0);
-    const top_k: u32 = if (root.get("top_k")) |v| switch (v) {
-        .integer => |i| if (i > 0) @intCast(@min(i, 1000)) else 0,
-        else => 0,
-    } else 0;
+    // Sampling parameters. Omitted fields resolve through CLI flags and the
+    // model's generation_config.json — Claude Code omits ALL of them, and the
+    // bare temp=1.0/top_p=1.0/no-top_k fallback sampled far outside Qwen's
+    // intended envelope (model card wants top_k=20, top_p=0.95).
+    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
+    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
+    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
     const seed: ?u64 = if (root.get("seed")) |v| switch (v) {
         .integer => |i| @intCast(i),
         else => null,
@@ -5522,8 +5653,8 @@ fn handleAnthropicMessages(
         if (std.mem.eql(u8, msg.role, "tool")) tool_msg_count += 1;
     }
     const tools_len = if (tools_json) |tj| tj.len else 0;
-    log.info("POST /v1/messages ({d} msgs, max_tokens={d}, temp={d:.2}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
-        messages.items.len, max_tokens, temperature, is_stream, enable_thinking, tools_len, tool_msg_count,
+    log.info("POST /v1/messages ({d} msgs, max_tokens={d}, temp={d:.2}, top_p={d:.2}, top_k={d}, stream={}, thinking={}, tools={d}b, tool_msgs={d})\n", .{
+        messages.items.len, max_tokens, temperature, top_p, top_k, is_stream, enable_thinking, tools_len, tool_msg_count,
     });
     log.info("  > \"{s}{s}\"\n", .{ last_msg.content[0..preview_len], if (last_msg.content.len > 80) "..." else "" });
 
@@ -5664,7 +5795,7 @@ fn handleAnthropicNonStreaming(
         ve_local = null;
         break :blk v;
     };
-    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve, 0, kv_quant_override) catch |err| switch (err) {
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, sampling, eos_token_ids, 0, has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve, 0, kv_quant_override, stream) catch |err| switch (err) {
         error.GenerationFailed => return sendAnthropicError(allocator, stream, "api_error", "generation failed", 500),
         else => return err,
     };
@@ -5926,6 +6057,15 @@ fn handleAnthropicStreaming(
     var text_block_open = false;
     var thinking_block_open = false;
     var in_think_block = enable_thinking;
+    // Template-opened think (Qwen 3.5/3.6 render `…assistant\n<think>\n` into
+    // the generation prompt): the output's thinking carries NO opener tag.
+    // Needed up front by the tools branch — by the time the close tag is the
+    // only evidence, visible-text flushing has already leaked the thoughts.
+    const opens_think = enable_thinking and promptOpensThink(allocator, lm, tok, prompt_ids);
+    // Set once the buffered think block has been split + emitted (tools
+    // branch). Releases the buffer hold AND tells the end-of-stream split
+    // that the remaining text has no template-opened semantics.
+    var think_closed = false;
     var think_buf = std.ArrayList(u8).empty;
     defer think_buf.deinit(allocator);
     var think_close_tag: []const u8 = "</think>";
@@ -5945,7 +6085,30 @@ fn handleAnthropicStreaming(
     var utf8_carry: [3]u8 = undefined;
     var utf8_carry_len: u8 = 0;
 
-    while (try ts.next(allocator)) |token_id| {
+    while (true) {
+        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+            .token => |t| t,
+            .done => break,
+            .idle => {
+                // No tokens yet (long prefill). Probe the peer: an abandoned
+                // request must cancel instead of grinding a ghost prefill
+                // (Claude Code retries pile up serially otherwise), and the
+                // keepalive stops clients timing out on stream silence.
+                if (stream.peerClosed()) {
+                    log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
+                    slot_handle.?.cancel();
+                    client_gone = true;
+                    break;
+                }
+                sendAnthropicEvent(stream, "ping", "{\"type\":\"ping\"}") catch {
+                    log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                    slot_handle.?.cancel();
+                    client_gone = true;
+                    break;
+                };
+                continue;
+            },
+        };
         if (stream.peerClosed()) {
             slot_handle.?.cancel();
             client_gone = true;
@@ -6003,29 +6166,69 @@ fn handleAnthropicStreaming(
                 (buf.len >= 1 and buf[buf.len - 1] == '<');
 
             if (!maybe_tool) {
-                const maybe_thinking = enable_thinking and (
-                    std.mem.indexOf(u8, buf, "<|channel>thought") != null or
-                    std.mem.indexOf(u8, buf, "<think>") != null or
-                    (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
-                    (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
-                    // Partial opener at the buffer tail — hold the flush so
-                    // tag fragments never leak as visible content.
-                    chat_mod.endsWithPartialThinkOpen(buf));
-                if (!maybe_thinking) {
-                    // Flush buffered tokens as text
-                    for (token_texts.items) |tt| {
-                        if (!text_block_open) {
-                            const sd = try std.fmt.allocPrint(allocator,
-                                \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
-                            , .{block_index});
-                            defer allocator.free(sd);
-                            try sendAnthropicEvent(stream, "content_block_start", sd);
-                            text_block_open = true;
+                // Shared gate with the chat-completions stream (the two paths
+                // drifted once: this one only recognized think openers present
+                // in the OUTPUT, so Qwen-family template-opened thinking
+                // streamed as visible text_deltas and a raw `</think>` leaked
+                // into Claude Code transcripts). Hermetically pinned per
+                // recorded model family by the corpus streaming-gate test.
+                switch (chat_mod.streamThinkGate(buf, enable_thinking, think_closed)) {
+                    .hold_thinking => {
+                        // Incomplete thinking — keep buffering until closed
+                    },
+                    .split_think => {
+                        // Complete think block — split once: thinking block
+                        // first, then the visible remainder as text.
+                        const split = chat_mod.splitThinkBlock(buf, enable_thinking, opens_think);
+                        if (enable_thinking) {
+                            if (split.reasoning_content) |rc| {
+                                const sd = try std.fmt.allocPrint(allocator,
+                                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
+                                , .{block_index});
+                                defer allocator.free(sd);
+                                try sendAnthropicEvent(stream, "content_block_start", sd);
+                                try emitAnthropicThinkingDelta(allocator, stream, block_index, rc);
+                                try closeAnthropicThinkingBlock(allocator, stream, block_index);
+                                block_index += 1;
+                            }
                         }
-                        try emitAnthropicTextDelta(allocator, stream, block_index, tt);
-                        allocator.free(tt);
-                    }
-                    token_texts.clearRetainingCapacity();
+                        if (split.content.len > 0) {
+                            if (!text_block_open) {
+                                const sd = try std.fmt.allocPrint(allocator,
+                                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
+                                , .{block_index});
+                                defer allocator.free(sd);
+                                try sendAnthropicEvent(stream, "content_block_start", sd);
+                                text_block_open = true;
+                            }
+                            try emitAnthropicTextDelta(allocator, stream, block_index, split.content);
+                        }
+                        for (token_texts.items) |tt| allocator.free(tt);
+                        token_texts.clearRetainingCapacity();
+                        text_buf.clearRetainingCapacity();
+                        think_closed = true;
+                    },
+                    .flush_text => {
+                        for (token_texts.items) |tt| {
+                            defer allocator.free(tt);
+                            // Skip bare think/channel tags that leak without a block
+                            if (std.mem.eql(u8, tt, "<|channel>") or std.mem.eql(u8, tt, "<channel|>") or
+                                std.mem.eql(u8, tt, "<think>") or std.mem.eql(u8, tt, "</think>"))
+                            {
+                                continue;
+                            }
+                            if (!text_block_open) {
+                                const sd = try std.fmt.allocPrint(allocator,
+                                    \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"text","text":""}}}}
+                                , .{block_index});
+                                defer allocator.free(sd);
+                                try sendAnthropicEvent(stream, "content_block_start", sd);
+                                text_block_open = true;
+                            }
+                            try emitAnthropicTextDelta(allocator, stream, block_index, tt);
+                        }
+                        token_texts.clearRetainingCapacity();
+                    },
                 }
             }
         } else if (enable_thinking and in_think_block) {
@@ -6205,9 +6408,25 @@ fn handleAnthropicStreaming(
                 allocator.free(tool_calls);
             }
 
-            // Emit thinking from buffered text if needed
+            // Close any open text block FIRST, at its own index. The old
+            // order emitted the thinking block's start while the text block
+            // still held this index, then stopped the text block at a
+            // never-started index — Claude Code aborted the turn with
+            // "API Error: Content block not found".
+            if (text_block_open) {
+                const sd = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{block_index});
+                defer allocator.free(sd);
+                try sendAnthropicEvent(stream, "content_block_stop", sd);
+                block_index += 1;
+                text_block_open = false;
+            }
+
+            // Emit thinking from buffered text if needed. Once the in-loop
+            // split already emitted it, the remaining buffer has no
+            // template-opened semantics — passing `opens_think` unguarded
+            // would misfile the visible tail as reasoning.
             if (enable_thinking) {
-                const think_split = chat_mod.splitThinkBlock(gen_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
+                const think_split = chat_mod.splitThinkBlock(gen_text, true, opens_think and !think_closed);
                 if (think_split.reasoning_content) |reasoning| {
                     const sd = try std.fmt.allocPrint(allocator,
                         \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
@@ -6218,14 +6437,6 @@ fn handleAnthropicStreaming(
                     try closeAnthropicThinkingBlock(allocator, stream, block_index);
                     block_index += 1;
                 }
-            }
-
-            if (text_block_open) {
-                const sd = try std.fmt.allocPrint(allocator, "{{\"type\":\"content_block_stop\",\"index\":{d}}}", .{block_index});
-                defer allocator.free(sd);
-                try sendAnthropicEvent(stream, "content_block_stop", sd);
-                block_index += 1;
-                text_block_open = false;
             }
 
             for (tool_calls, 0..) |tc, i| {
@@ -6267,7 +6478,7 @@ fn handleAnthropicStreaming(
                 const flush_norm = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, full_text.items);
                 defer if (flush_norm) |n| allocator.free(n);
                 const flush_text: []const u8 = flush_norm orelse full_text.items;
-                const think_split = chat_mod.splitThinkBlock(flush_text, true, promptOpensThink(allocator, lm, tok, prompt_ids));
+                const think_split = chat_mod.splitThinkBlock(flush_text, true, opens_think and !think_closed);
                 if (think_split.reasoning_content) |reasoning| {
                     const sd = try std.fmt.allocPrint(allocator,
                         \\{{"type":"content_block_start","index":{d},"content_block":{{"type":"thinking","thinking":"","signature":""}}}}
@@ -6641,12 +6852,9 @@ fn handleResponses(
     };
     const max_tokens: u32 = req_max_output_tokens orelse
         (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault());
-    const temperature = parseJsonFloat(root, "temperature", 1.0, 0.0, 2.0);
-    const top_p = parseJsonFloat(root, "top_p", 1.0, 0.0, 1.0);
-    const top_k: u32 = if (root.get("top_k")) |v| switch (v) {
-        .integer => |i| if (i > 0) @intCast(@min(i, 1000)) else 0,
-        else => 0,
-    } else 0;
+    const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
+    const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
+    const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
     const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
     const repeat_penalty: f32 = if (frequency_penalty > 0.0) 1.0 + frequency_penalty else 1.0;
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
@@ -7053,7 +7261,30 @@ fn handleResponses(
         var skipped_think_open = false;
         var live_output_index: u32 = 0;
 
-        while (try ts.next(allocator)) |token_id| {
+        while (true) {
+            const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+                .token => |t| t,
+                .done => break,
+                .idle => {
+                    // No tokens yet (long prefill). Probe the peer: an abandoned
+                    // request must cancel instead of grinding a ghost prefill
+                    // (Claude Code retries pile up serially otherwise), and the
+                    // keepalive stops clients timing out on stream silence.
+                    if (stream.peerClosed()) {
+                        log.info("  [cancel] client disconnected while waiting for tokens — cancelling slot\n", .{});
+                        slot_handle.?.cancel();
+                        client_gone = true;
+                        break;
+                    }
+                    sendStreamKeepalive(stream) catch {
+                        log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                        slot_handle.?.cancel();
+                        client_gone = true;
+                        break;
+                    };
+                    continue;
+                },
+            };
             if (stream.peerClosed()) {
                 slot_handle.?.cancel();
                 client_gone = true;
@@ -7250,7 +7481,7 @@ fn handleResponses(
             local_ve = null;
             break :blk v;
         };
-        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve_ns, 0, kv_quant_override) catch |err| switch (err) {
+        result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, effective_max_tokens, sampling, eos_slice, 0, active_has_tools, use_pld, use_drafter, getTimeoutNs(), slot_ve_ns, 0, kv_quant_override, stream) catch |err| switch (err) {
             error.GenerationFailed => return sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "generation failed", null),
             else => return err,
         };
@@ -9066,4 +9297,37 @@ test "prefix cache default capacity covers interleaved agent flows" {
     // still bounds memory.
     try testing.expect(prefix_cache_capacity >= 4);
     try testing.expect(prefix_cache_mem_bytes > 0);
+}
+
+test "resolveSamplingDefault: request > CLI > generation_config > fallback" {
+    // Request value always wins.
+    try std.testing.expectEqual(@as(f32, 0.2), resolveSamplingDefault(f32, 0.2, 0.7, 1.0, 1.0));
+    // Omitted in request -> CLI launch flag (the app passes Settings here).
+    try std.testing.expectEqual(@as(f32, 0.7), resolveSamplingDefault(f32, null, 0.7, 1.0, 1.0));
+    // No CLI flag -> the model's generation_config.json recommendation.
+    try std.testing.expectEqual(@as(u32, 20), resolveSamplingDefault(u32, null, null, 20, 0));
+    // Nothing anywhere -> hardcoded fallback (pre-existing behavior).
+    try std.testing.expectEqual(@as(f32, 1.0), resolveSamplingDefault(f32, null, null, null, 1.0));
+    // Explicit request 0 (greedy) must not be treated as omitted.
+    try std.testing.expectEqual(@as(f32, 0.0), resolveSamplingDefault(f32, 0.0, 0.7, 1.0, 1.0));
+}
+
+test "optSamplingRecJson emits number when present, null when absent" {
+    const a = std.testing.allocator;
+
+    // Present -> bare JSON number (no quotes), so the Swift side decodes it
+    // straight to Double/Int.
+    const top_k = try optSamplingRecJson(a, u32, 20);
+    defer a.free(top_k);
+    try std.testing.expectEqualStrings("20", top_k);
+
+    const top_p = try optSamplingRecJson(a, f32, 0.95);
+    defer a.free(top_p);
+    try std.testing.expectEqualStrings("0.95", top_p);
+
+    // Absent -> JSON null literal so the model-author recommendation reads as
+    // "no opinion" rather than a spurious 0.
+    const none = try optSamplingRecJson(a, u32, null);
+    defer a.free(none);
+    try std.testing.expectEqualStrings("null", none);
 }

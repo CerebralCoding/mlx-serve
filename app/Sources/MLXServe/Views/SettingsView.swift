@@ -989,6 +989,7 @@ private struct DrafterRow: View {
 
 private struct RequestDefaultsSectionContent: View {
     @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
 
     private var meta: [String: ServerOptionField] { ServerOptions.requestDefaultFields }
 
@@ -1027,31 +1028,48 @@ private struct RequestDefaultsSectionContent: View {
         }
         if let m = meta["defaultTemperature"] {
             SettingsRow(title: m.title, explainer: m.explainer) {
-                HStack(spacing: 8) {
-                    Slider(value: opts.defaultTemperature, in: 0...2, step: 0.05)
-                    Text(String(format: "%.2f", appState.serverOptions.defaultTemperature))
-                        .font(.body.monospacedDigit())
-                        .frame(minWidth: 36, alignment: .trailing)
+                VStack(alignment: .trailing, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Slider(value: opts.defaultTemperature, in: 0...2, step: 0.05)
+                        Text(String(format: "%.2f", appState.serverOptions.defaultTemperature))
+                            .font(.body.monospacedDigit())
+                            .frame(minWidth: 36, alignment: .trailing)
+                    }
+                    recPill(server.modelInfo?.recTemperature.map { String(format: "%.2f", $0) })
                 }
             }
         }
         if let m = meta["defaultTopP"] {
             SettingsRow(title: m.title, explainer: m.explainer) {
-                HStack(spacing: 8) {
-                    Slider(value: opts.defaultTopP, in: 0.1...1.0, step: 0.01)
-                    Text(String(format: "%.2f", appState.serverOptions.defaultTopP))
-                        .font(.body.monospacedDigit())
-                        .frame(minWidth: 36, alignment: .trailing)
+                VStack(alignment: .trailing, spacing: 4) {
+                    HStack(spacing: 8) {
+                        Slider(value: opts.defaultTopP, in: 0.1...1.0, step: 0.01)
+                        Text(String(format: "%.2f", appState.serverOptions.defaultTopP))
+                            .font(.body.monospacedDigit())
+                            .frame(minWidth: 36, alignment: .trailing)
+                    }
+                    recPill(server.modelInfo?.recTopP.map { String(format: "%.2f", $0) })
                 }
             }
         }
         if let m = meta["defaultTopK"] {
             SettingsRow(title: m.title, explainer: m.explainer) {
-                Stepper(value: opts.defaultTopK, in: 0...1000) {
-                    Text(appState.serverOptions.defaultTopK == 0
-                         ? "Disabled"
-                         : "\(appState.serverOptions.defaultTopK)")
-                        .font(.body.monospacedDigit())
+                VStack(alignment: .trailing, spacing: 4) {
+                    Stepper(value: opts.defaultTopK, in: 0...1000) {
+                        Text(appState.serverOptions.defaultTopK == 0
+                             ? "Disabled"
+                             : "\(appState.serverOptions.defaultTopK)")
+                            .font(.body.monospacedDigit())
+                    }
+                    // Top-k is the one sampling field that actually falls
+                    // through to the model's recommendation: when the slider
+                    // reads "Disabled" (0) no `--top-k` flag is sent, so the
+                    // model's own value takes effect. Say so when it's live.
+                    recPill(
+                        server.modelInfo?.recTopK.map { "\($0)" },
+                        active: server.modelInfo?.recTopK != nil
+                            && appState.serverOptions.defaultTopK == 0
+                    )
                 }
             }
         }
@@ -1088,6 +1106,30 @@ private struct RequestDefaultsSectionContent: View {
                         : Self.formatTokens(appState.serverOptions.defaultReasoningBudget)
                 )
             }
+        }
+    }
+
+    /// Small "model recommends" hint pill shown under a sampling slider. The
+    /// value comes from the loaded model's `generation_config.json` (surfaced
+    /// over `/v1/models`); nil → nothing rendered (no model loaded, or the
+    /// model ships no recommendation). `active=true` switches the styling to
+    /// green + "(in effect)" for the top-k case, where a Disabled slider
+    /// actually lets the model's value win.
+    @ViewBuilder
+    private func recPill(_ value: String?, active: Bool = false) -> some View {
+        if let value {
+            let color: Color = active ? .green : .secondary
+            HStack(spacing: 4) {
+                Text(active ? "Model default (in effect):" : "Model recommends:")
+                    .font(.caption2)
+                Text(value)
+                    .font(.caption2.monospacedDigit().weight(.medium))
+            }
+            .foregroundStyle(color)
+            .padding(.horizontal, 6)
+            .padding(.vertical, 2)
+            .background(color.opacity(0.12))
+            .clipShape(Capsule())
         }
     }
 

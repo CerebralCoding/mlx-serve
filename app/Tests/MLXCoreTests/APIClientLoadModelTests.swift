@@ -42,6 +42,45 @@ final class APIClientLoadModelTests: XCTestCase {
         XCTAssertEqual((json["meta"] as? [String: Any])? ["num_layers"] as? Int, 30)
     }
 
+    func testParseModelInfoReadsSamplingRecommendations() {
+        // `renderModelEntry` surfaces the model author's generation_config.json
+        // sampling recommendations under meta so Settings can show them as
+        // guidance pills. Qwen 3.6 ships top_k 20 / top_p 0.95.
+        let qwen: [String: Any] = [
+            "id": "Qwen3.6-4B-MLX-4bit",
+            "meta": [
+                "architecture": "qwen3_5",
+                "gen_temperature": 0.7,
+                "gen_top_p": 0.95,
+                "gen_top_k": 20,
+            ],
+        ]
+        let info = APIClient.parseModelInfo(qwen)
+        XCTAssertEqual(info.recTemperature, 0.7)
+        XCTAssertEqual(info.recTopP, 0.95)
+        XCTAssertEqual(info.recTopK, 20)
+
+        // A model with no generation_config.json (or a pre-this-feature server)
+        // emits `null` / omits the keys — recommendations decode to nil.
+        let none: [String: Any] = [
+            "id": "llama",
+            "meta": [
+                "architecture": "llama",
+                "gen_temperature": NSNull(),
+                "gen_top_p": NSNull(),
+                "gen_top_k": NSNull(),
+            ],
+        ]
+        let noneInfo = APIClient.parseModelInfo(none)
+        XCTAssertNil(noneInfo.recTemperature)
+        XCTAssertNil(noneInfo.recTopP)
+        XCTAssertNil(noneInfo.recTopK)
+
+        // Pre-feature server: keys entirely absent → still nil, no crash.
+        let legacy = APIClient.parseModelInfo(["id": "x", "meta": ["architecture": "gemma4"]])
+        XCTAssertNil(legacy.recTopK)
+    }
+
     func testParseModelInfoReadsAudioCapability() {
         // Gemma 4 12B advertises "audio" in capabilities + input_modalities.
         let audioModel: [String: Any] = [

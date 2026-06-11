@@ -601,6 +601,12 @@ pub const Generator = struct {
         /// absolute positions usable by future warm-path lookups against
         /// the full prompt.
         ssm_checkpoint_pos_offset: usize = 0,
+        /// Cooperative abort for abandoned requests: checked between prefill
+        /// chunks. The scheduler passes `&slot.cancelled`, set by the conn
+        /// thread when the client disconnects mid-prefill. When it flips,
+        /// `initWithOptions` returns `error.Cancelled` instead of grinding
+        /// out the rest of a multi-minute ghost prefill.
+        cancel_flag: ?*const std.atomic.Value(bool) = null,
     };
 
     /// Selects the source slice that `initWithOptions` will dupe into
@@ -717,6 +723,12 @@ pub const Generator = struct {
 
             var pos: usize = 0;
             while (pos < prefix_len) {
+                // Abandoned-request abort: the client disconnected and the
+                // conn thread flagged the slot. Bail before the next chunk —
+                // the KV built so far is freed with the slot.
+                if (options.cancel_flag) |cf| {
+                    if (cf.load(.acquire)) return error.Cancelled;
+                }
                 // Pick this chunk's end. Normal path: hit the configured chunk
                 // size. Phase 1 path: if a checkpoint stride boundary lands
                 // inside the would-be chunk, shrink the chunk so it ends

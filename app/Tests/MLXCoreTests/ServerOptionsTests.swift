@@ -135,9 +135,13 @@ final class ServerOptionsTests: XCTestCase {
     func testServerLaunchEqualsIgnoresPerRequestFields() {
         var a = ServerOptions()
         var b = ServerOptions()
-        b.defaultTemperature = 0.9
+        // Still purely per-request: max tokens, penalties, spec-decode
+        // TriStates. (Sampling defaults — temperature/top-p/top-k — became
+        // launch flags in 2026-06 so external clients like Claude Code
+        // inherit them; covered by testSamplingDefaultsAffectRestartDetection.)
         b.defaultMaxTokens = 8192
         b.perRequestEnablePLD = .off
+        b.defaultRepeatPenalty = 1.1
         XCTAssertTrue(a.serverLaunchEquals(b),
                      "Per-request defaults must NOT trigger restart")
 
@@ -296,5 +300,45 @@ final class ServerOptionsTests: XCTestCase {
         guard let value else { return true }
         let next = i + 1
         return next < args.count && args[next] == value
+    }
+}
+
+extension ServerOptionsTests {
+    /// The Settings temperature must reach third-party clients (Claude Code
+    /// omits sampling params entirely, so the server-launch default is the
+    /// only channel). Top-p rides along; top-k 0 means "no opinion" and must
+    /// be OMITTED so the model's generation_config.json recommendation
+    /// (Qwen 3.6: top_k=20, Gemma 4: 64) stays in effect.
+    func testSamplingDefaultsReachLaunchArgs() {
+        var opts = ServerOptions()
+        opts.defaultTemperature = 0.7
+        opts.defaultTopP = 0.95
+        opts.defaultTopK = 0
+        let args = opts.toCLIArgs()
+        XCTAssertTrue(contains(args, flag: "--temp", value: "0.7"))
+        XCTAssertTrue(contains(args, flag: "--top-p", value: "0.95"))
+        XCTAssertFalse(args.contains("--top-k"))
+
+        opts.defaultTopK = 40
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--top-k", value: "40"))
+    }
+
+    /// Changing a sampling default must trip the restart detector — these now
+    /// affect the launched process, not just the app's own request bodies.
+    func testSamplingDefaultsAffectRestartDetection() {
+        let base = ServerOptions()
+        var changed = base
+        changed.defaultTemperature = 0.42
+        XCTAssertFalse(base.serverLaunchEquals(changed))
+    }
+}
+
+extension ServerOptionsTests {
+    /// Slider arithmetic leaves float dirt (0.8 − 0.1 = 0.7000000000000001);
+    /// argv must carry the clean decimal (seen verbatim in `ps` output live).
+    func testSamplingFlagFormattingIsClean() {
+        var opts = ServerOptions()
+        opts.defaultTemperature = 0.8 - 0.1
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--temp", value: "0.7"))
     }
 }

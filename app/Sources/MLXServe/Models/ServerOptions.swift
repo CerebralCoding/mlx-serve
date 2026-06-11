@@ -180,7 +180,14 @@ struct ServerOptions: Codable, Equatable {
         prefixCacheMem == other.prefixCacheMem &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
-        tokenizeCacheEntries == other.tokenizeCacheEntries
+        tokenizeCacheEntries == other.tokenizeCacheEntries &&
+        // Sampling defaults are ALSO launch flags (server-side defaults for
+        // clients that omit sampling, e.g. Claude Code) — changing them must
+        // trip the restart detector. The app's own chats still pick them up
+        // immediately via request bodies.
+        defaultTemperature == other.defaultTemperature &&
+        defaultTopP == other.defaultTopP &&
+        defaultTopK == other.defaultTopK
     }
 
     // MARK: CLI args builder
@@ -252,6 +259,19 @@ struct ServerOptions: Codable, Equatable {
         // All-engines knob — applies to MLX, llama, and ds4 alike.
         if tokenizeCacheEntries != 4 {
             args += ["--tokenize-cache-entries", "\(tokenizeCacheEntries)"]
+        }
+        // Sampling defaults double as server-launch flags so third-party
+        // clients that omit sampling params (Claude Code sends none at all)
+        // inherit the Settings values. Per-request body fields always win.
+        // Top-k 0 = "no opinion": OMIT the flag so the model's own
+        // generation_config.json recommendation (Qwen 3.6: 20, Gemma 4: 64)
+        // stays in effect rather than being force-disabled.
+        // %g: slider arithmetic leaves float dirt (0.8 - 0.1 stepped to
+        // 0.7000000000000001) that "\(Double)" would print verbatim into argv.
+        args += ["--temp", String(format: "%g", defaultTemperature)]
+        args += ["--top-p", String(format: "%g", defaultTopP)]
+        if defaultTopK > 0 {
+            args += ["--top-k", "\(defaultTopK)"]
         }
         return args
     }
@@ -385,16 +405,16 @@ extension ServerOptions {
             needsRestart: false),
         "defaultTemperature": .init(
             title: "Temperature",
-            explainer: "0 = deterministic greedy. 0.6–1.0 typical chat. Above 1.0 gets erratic.",
-            needsRestart: false),
+            explainer: "0 = deterministic greedy. 0.6–1.0 typical chat. Above 1.0 gets erratic. Applies to the app's chats immediately; also becomes the server default for external clients that omit temperature (Claude Code) after a restart.",
+            needsRestart: true),
         "defaultTopP": .init(
             title: "Top-p",
-            explainer: "Nucleus sampling threshold. 0.95 keeps all but the long tail. 1.0 disables top-p filtering.",
-            needsRestart: false),
+            explainer: "Nucleus sampling threshold. 0.95 keeps all but the long tail. 1.0 disables top-p filtering. Also the server default for external clients that omit top_p (restart needed for that part).",
+            needsRestart: true),
         "defaultTopK": .init(
             title: "Top-k",
-            explainer: "Cap on candidate tokens per step. 0 = disabled (use top-p only).",
-            needsRestart: false),
+            explainer: "Cap on candidate tokens per step. 0 = follow the model's own recommendation from generation_config.json (Qwen 3.6: 20, Gemma 4: 64); explicit values override it server-wide after a restart.",
+            needsRestart: true),
         "defaultRepeatPenalty": .init(
             title: "Repetition penalty",
             explainer: "Penalty multiplier for tokens already in the context. 1.0 = none. 1.1 is a typical anti-repeat setting.",

@@ -297,6 +297,11 @@ pub const Slot = struct {
 
     out_mu: std.Io.Mutex,
     out_cond: std.Io.Condition,
+    /// Wake signal for `waitNextTimeout` — set alongside every `out_cond`
+    /// broadcast. Events support timed waits (Io.Condition does not), which
+    /// is what lets the conn thread poll the peer socket during long
+    /// prefills instead of blocking until the first token.
+    out_event: std.Io.Event,
     out_buf: std.ArrayList(u32),
     out_idx: usize,
     finished: bool,
@@ -429,6 +434,7 @@ pub const Slot = struct {
             .state = .pending_prefill,
             .out_mu = .init,
             .out_cond = .init,
+            .out_event = .unset,
             .out_buf = std.ArrayList(u32).empty,
             .out_idx = 0,
             .finished = false,
@@ -510,6 +516,7 @@ pub const Slot = struct {
             self.state = .errored;
         };
         self.out_cond.broadcast(self.io);
+        self.out_event.set(self.io);
     }
 
     /// Inference thread: signal normal completion. Safe to call multiple
@@ -522,6 +529,7 @@ pub const Slot = struct {
         self.state = .finished;
         self.finish_reason = reason;
         self.out_cond.broadcast(self.io);
+        self.out_event.set(self.io);
     }
 
     /// Inference thread: signal error. `name` is borrowed; we dupe so the
@@ -533,6 +541,7 @@ pub const Slot = struct {
         self.error_code = self.allocator.dupe(u8, name) catch null;
         self.state = .errored;
         self.out_cond.broadcast(self.io);
+        self.out_event.set(self.io);
     }
 
     /// Connection thread: block until the next token, completion, or error.
@@ -553,6 +562,45 @@ pub const Slot = struct {
         }
     }
 
+    /// Connection thread: like `waitNext`, but wakes with `null` (idle)
+    /// after `timeout_ms` with no token or terminator. Lets the caller poll
+    /// the peer socket and emit SSE keepalives during long prefills —
+    /// Claude Code disconnects after ~60s of stream silence, and pre-2026-06
+    /// the handler sat blocked in `waitNext` for the whole multi-minute
+    /// prefill, never noticed the disconnect, and abandoned giant prefills
+    /// piled up serially behind every client retry (the server looked dead
+    /// while the GPU ground ghosts; observed live with Claude Code + a
+    /// 40K-token MCP prompt on gemma-4-12b).
+    pub fn waitNextTimeout(self: *Slot, timeout_ms: i64) ?NextResult {
+        while (true) {
+            self.out_mu.lockUncancelable(self.io);
+            if (self.out_idx < self.out_buf.items.len) {
+                const t = self.out_buf.items[self.out_idx];
+                self.out_idx += 1;
+                self.out_mu.unlock(self.io);
+                return .{ .token = t };
+            }
+            if (self.error_code != null) {
+                self.out_mu.unlock(self.io);
+                return .{ .err = {} };
+            }
+            if (self.finished) {
+                self.out_mu.unlock(self.io);
+                return .{ .done = {} };
+            }
+            // Arm the event under the lock: producers mutate under this lock
+            // and set() before releasing it, so a set racing our reset leaves
+            // the event set and the wait below returns immediately — no lost
+            // wakeups. A spurious wake just reads as an early idle (benign).
+            self.out_event.reset();
+            self.out_mu.unlock(self.io);
+            self.out_event.waitTimeout(self.io, .{ .duration = .{
+                .raw = .fromMilliseconds(timeout_ms),
+                .clock = .awake,
+            } }) catch return null;
+        }
+    }
+
     /// Connection thread: signal cancellation. The inference thread will
     /// drop this slot at the next tick boundary.
     pub fn cancel(self: *Slot) void {
@@ -560,6 +608,7 @@ pub const Slot = struct {
         self.out_mu.lockUncancelable(self.io);
         defer self.out_mu.unlock(self.io);
         self.out_cond.broadcast(self.io);
+        self.out_event.set(self.io);
     }
 };
 
@@ -2016,6 +2065,14 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                 }
                 var prefill_sw = io_util.Stopwatch.init(sch.io);
                 runPrefill(sch, slot) catch |err| {
+                    if (err == error.Cancelled) {
+                        // Client vanished mid-prefill (conn thread noticed on
+                        // an idle keepalive probe and set slot.cancelled);
+                        // the chunk loop aborted. A clean finish, not an error.
+                        log.info("[scheduler] prefill aborted: client disconnected\n", .{});
+                        slot.markFinished("cancelled");
+                        continue;
+                    }
                     log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
                     slot.markError(@errorName(err));
                     continue;
@@ -2666,6 +2723,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .ssm_checkpoint_stride = cp_stride,
             .ssm_checkpoint_max = cp_max,
             .ssm_checkpoint_pos_offset = hot_matched,
+            // Abandoned-prefill abort: the conn thread sets slot.cancelled
+            // when the client disconnects; the chunk loop checks it between
+            // chunks so a ghost 40K prefill stops within one chunk.
+            .cancel_flag = &slot.cancelled,
         },
     );
     gen.timeout_ns = slot.timeout_ns;

@@ -206,6 +206,17 @@ struct ModelInfo {
     /// pre-Phase-E server.
     var bytesOnDisk: UInt64? = nil
 
+    /// Model-author sampling recommendations from the model's
+    /// `generation_config.json` (Qwen 3.6: top_k 20 / top_p 0.95; Gemma 4:
+    /// top_k 64 / top_p 0.95). nil when the model ships no recommendation or
+    /// the server pre-dates this field. Settings shows these as guidance pills
+    /// next to the per-request sampling sliders — the model behaves best near
+    /// these values. Note the running server already falls back to them when a
+    /// request omits the param AND no launch flag overrides (top_k=0 case).
+    var recTemperature: Double? = nil
+    var recTopP: Double? = nil
+    var recTopK: Int? = nil
+
     /// Which backend serves this model — derived from `architecture`
     /// (`model_type` in config.json / the GGUF stub). Drives the engine-
     /// aware Settings UI so toggles that don't apply (e.g. MLX `--kv-quant`

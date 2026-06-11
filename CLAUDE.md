@@ -31,7 +31,9 @@ Native Zig server that runs MLX-format LMs on Apple Silicon and exposes OpenAI-c
 | `log.zig` | Leveled logging |
 | `build.zig` | Links mlx-c, libjinja, libwebp, stb_image |
 
-CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --ctx-size --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --kv-quant --prefix-cache-entries --prefix-cache-mem --max-concurrent --model-dir --log-level --version --help`
+CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --kv-quant --prefix-cache-entries --prefix-cache-mem --max-concurrent --model-dir --log-level --version --help`
+
+Sampling defaults for request fields the client OMITS resolve as: request body > `--temp`/`--top-p`/`--top-k` launch flags (the app passes its Settings values) > the model's `generation_config.json` (Qwen 3.6: top_k 20 / top_p 0.95; Gemma 4: top_k 64 / top_p 0.95) > hardcoded (1.0/1.0/off). Claude Code omits all sampling params, so pre-2026-06 it sampled the full untruncated distribution at temp 1.0.
 
 ### Swift macOS app (`app/Sources/MLXServe/`)
 
@@ -103,6 +105,8 @@ Existing tools:
 | `./tests/test_drafter_equivalence.sh [port]` | Gemma 4 drafter byte-equivalence |
 | `UD_MOE_MODEL=<dir> ./tests/test_ud_moe.sh` | Unsloth UD MoE load + generate (default Qwen3.6-27B-UD-MLX-4bit) |
 | `./tests/test_long_agent_memory.sh [port]` | 10-turn Claude-Code-style agent: plants 3 facts in turn 1, recalls them across mode transitions (tools on/off, thinking on/off). Catches "model acts like first-time-seen" regressions. |
+| `./tests/test_disconnect_cancel.sh [model_dir] [port]` | Client-disconnect handling during long prefills: SSE keepalives flow every 5s while a request waits on first tokens (Anthropic `ping` events / OpenAI `: keepalive` comments), and a vanished client cancels its slot within one probe interval — the chunk loop aborts the ghost prefill (`error.Cancelled`) instead of grinding minutes of abandoned work that piles up behind Claude Code retries. Starts its own server. |
+| `./tests/test_messages_stream_thinking_tools.sh [model_dir] [port]` | /v1/messages STREAMING with thinking + tools together (Claude Code's exact shape) on a template-opened-think model: no think-tag leak in text deltas, SSE content-block lifecycle validity (every delta/stop references an open block), thinking_delta + tool_use emission. Starts its own server. Hermetic counterpart: `chat.streamThinkGate` unit tests + the corpus streaming-gate replay. |
 | `./tests/test_kv_quant_equivalence.sh [model_dir] [port]` | Off-vs-4-bit-vs-8-bit KV cache equivalence (per-arch first-N-token thresholds, env-overridable). |
 | `./tests/test_kv_quant_per_request.sh [model_dir] [port]` | Per-request `kv_quant` body field plumbing — confirms parse + scheduler routing for each scheme. |
 | `./tests/test_prefix_cache_mem.sh [model_dir] [port]` | `--prefix-cache-mem` budget — long-prompt traffic must stay within the byte cap and produce eviction log lines. |

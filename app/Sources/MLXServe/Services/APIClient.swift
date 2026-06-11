@@ -143,7 +143,13 @@ class APIClient {
             loaded: topLoaded,
             state: topState,
             bytesResident: topBytesResident,
-            bytesOnDisk: topBytesOnDisk
+            bytesOnDisk: topBytesOnDisk,
+            // Model-author sampling recommendations from generation_config.json.
+            // Emitted as JSON `null` (→ NSNull → nil) when absent, or the keys
+            // are missing entirely on a pre-this-feature server.
+            recTemperature: meta["gen_temperature"] as? Double,
+            recTopP: meta["gen_top_p"] as? Double,
+            recTopK: meta["gen_top_k"] as? Int
         )
     }
 

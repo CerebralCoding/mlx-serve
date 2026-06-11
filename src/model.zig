@@ -80,6 +80,16 @@ pub const ModelConfig = struct {
     eos_token_ids: [8]u32 = .{0} ** 8,
     num_eos_tokens: u32 = 0,
 
+    // Model-author sampling recommendations from generation_config.json
+    // (e.g. Qwen 3.6: temp 1.0 / top_p 0.95 / top_k 20; Gemma 4: top_k 64).
+    // null = the file or key is absent. Used as defaults for request fields
+    // the client OMITTED — Claude Code sends no sampling params at all, and
+    // pre-2026-06 it sampled the full untruncated distribution at temp 1.0,
+    // well outside the model card's intended envelope.
+    gen_temperature: ?f32 = null,
+    gen_top_p: ?f32 = null,
+    gen_top_k: ?u32 = null,
+
     // Gemma 4: explicit layer type map (bit = 1 means full/global attention)
     has_explicit_layer_types: bool = false,
     layer_is_global: [128]bool = .{false} ** 128,
@@ -289,7 +299,78 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     const content = try reader_state.interface.allocRemaining(allocator, .limited(10 * 1024 * 1024));
     defer allocator.free(content);
 
-    return parseConfigFromJson(allocator, content);
+    var config = try parseConfigFromJson(allocator, content);
+
+    // Model-author sampling recommendations ride in a sibling file. Optional —
+    // any failure (missing file, bad JSON) leaves the fields null.
+    const gen_path = try std.fmt.allocPrint(allocator, "{s}/generation_config.json", .{model_dir});
+    defer allocator.free(gen_path);
+    if (std.Io.Dir.openFileAbsolute(io, gen_path, .{})) |gen_file| {
+        defer gen_file.close(io);
+        var gen_buf: [4096]u8 = undefined;
+        var gen_reader = gen_file.reader(io, &gen_buf);
+        if (gen_reader.interface.allocRemaining(allocator, .limited(1024 * 1024))) |gen_content| {
+            defer allocator.free(gen_content);
+            const gd = parseGenerationDefaultsFromJson(gen_content);
+            config.gen_temperature = gd.temperature;
+            config.gen_top_p = gd.top_p;
+            config.gen_top_k = gd.top_k;
+        } else |_| {}
+    } else |_| {}
+
+    return config;
+}
+
+/// Sampling recommendations parsed out of a model's generation_config.json.
+pub const GenerationDefaults = struct {
+    temperature: ?f32 = null,
+    top_p: ?f32 = null,
+    top_k: ?u32 = null,
+};
+
+/// Pure parser for generation_config.json content. Total: malformed JSON or
+/// out-of-range values yield nulls — a corrupt config must never pin
+/// sampling to an extreme. (`do_sample` is deliberately ignored: HF uses it
+/// for greedy-vs-sample mode selection, which the request's own temperature
+/// already expresses.)
+pub fn parseGenerationDefaultsFromJson(content: []const u8) GenerationDefaults {
+    var buf: [16 * 1024]u8 = undefined;
+    var fba = std.heap.FixedBufferAllocator.init(&buf);
+    const parsed = std.json.parseFromSlice(std.json.Value, fba.allocator(), content, .{}) catch return .{};
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{};
+    const root = parsed.value.object;
+
+    var gd = GenerationDefaults{};
+    if (root.get("temperature")) |v| {
+        const t: ?f32 = switch (v) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => null,
+        };
+        if (t) |tv| {
+            if (tv >= 0.0 and tv <= 2.0) gd.temperature = tv;
+        }
+    }
+    if (root.get("top_p")) |v| {
+        const p: ?f32 = switch (v) {
+            .float => |f| @floatCast(f),
+            .integer => |i| @floatFromInt(i),
+            else => null,
+        };
+        if (p) |pv| {
+            if (pv > 0.0 and pv <= 1.0) gd.top_p = pv;
+        }
+    }
+    if (root.get("top_k")) |v| {
+        switch (v) {
+            .integer => |i| if (i > 0 and i <= 1000) {
+                gd.top_k = @intCast(i);
+            },
+            else => {},
+        }
+    }
+    return gd;
 }
 
 /// I/O-free variant for unit tests and for callers that already have the
@@ -1447,4 +1528,32 @@ test "parseConfigFromJson qwen3_moe (Qwen3-30B-A3B) → MoE, no shared expert, n
     try testing.expect(!config.has_hybrid_layers);
     try testing.expect(!config.has_sliding_window);
     try testing.expectEqual(@as(u32, 8), config.quant_bits);
+}
+
+test "parseGenerationDefaultsFromJson: reads model sampling recommendations" {
+    // Verbatim shape of Qwen3.6 / Gemma 4 checkpoints' generation_config.json.
+    const json =
+        \\{"bos_token_id": 248044, "do_sample": true, "temperature": 1.0, "top_k": 20, "top_p": 0.95}
+    ;
+    const gd = parseGenerationDefaultsFromJson(json);
+    try testing.expectEqual(@as(?f32, 1.0), gd.temperature);
+    try testing.expectEqual(@as(?f32, 0.95), gd.top_p);
+    try testing.expectEqual(@as(?u32, 20), gd.top_k);
+}
+
+test "parseGenerationDefaultsFromJson: missing keys and malformed input give nulls" {
+    const partial = parseGenerationDefaultsFromJson("{\"eos_token_id\": [1, 2]}");
+    try testing.expectEqual(@as(?f32, null), partial.temperature);
+    try testing.expectEqual(@as(?f32, null), partial.top_p);
+    try testing.expectEqual(@as(?u32, null), partial.top_k);
+
+    const broken = parseGenerationDefaultsFromJson("not json at all");
+    try testing.expectEqual(@as(?f32, null), broken.temperature);
+
+    // Out-of-range values are dropped, not clamped — a corrupt config must
+    // not silently pin sampling to an extreme.
+    const insane = parseGenerationDefaultsFromJson("{\"temperature\": 99.0, \"top_p\": 7.0, \"top_k\": -5}");
+    try testing.expectEqual(@as(?f32, null), insane.temperature);
+    try testing.expectEqual(@as(?f32, null), insane.top_p);
+    try testing.expectEqual(@as(?u32, null), insane.top_k);
 }

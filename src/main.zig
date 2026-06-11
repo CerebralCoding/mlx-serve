@@ -39,7 +39,13 @@ fn printUsage(io: std.Io) void {
         \\  --prompt <text>     Run single prompt (interactive mode)
         \\  --stream            Stream tokens as they are generated (with --prompt)
         \\  --max-tokens <n>    Max tokens to generate (default: 100)
-        \\  --temp <f>          Temperature (default: 0.0)
+        \\  --temp <f>          Temperature. Offline: sampling temp (default 0.0).
+        \\                      Serve: default for requests that omit `temperature`
+        \\                      (otherwise the model's generation_config.json, then 1.0)
+        \\  --top-p <f>         Serve-mode default top_p for requests that omit it
+        \\                      (otherwise generation_config.json, then 1.0 = off)
+        \\  --top-k <n>         Serve-mode default top_k for requests that omit it
+        \\                      (otherwise generation_config.json, then 0 = off)
         \\  --timeout <n>       Request timeout in seconds (default: 300, 0=none)
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
@@ -152,6 +158,13 @@ pub fn main(init: std.process.Init) !void {
     var prompt: ?[]const u8 = null;
     var max_tokens: u32 = 100;
     var temperature: f32 = 0.0;
+    // Serve-mode sampling defaults for requests that omit the field
+    // (request > flag > model generation_config.json > hardcoded). `--temp`
+    // doubles as the offline --prompt sampling temp, so track whether it was
+    // explicitly given — only then does it become the serve default.
+    var temp_explicit = false;
+    var top_p_flag: ?f32 = null;
+    var top_k_flag: ?u32 = null;
     var ctx_size: u32 = 0; // 0 = use model default
     var timeout: u32 = 300; // seconds, 0 = no timeout
     var reasoning_budget: i32 = -1; // -1 = unlimited
@@ -215,6 +228,13 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--temp") and i + 1 < args.len) {
             i += 1;
             temperature = try std.fmt.parseFloat(f32, args[i]);
+            temp_explicit = true;
+        } else if (std.mem.eql(u8, args[i], "--top-p") and i + 1 < args.len) {
+            i += 1;
+            top_p_flag = try std.fmt.parseFloat(f32, args[i]);
+        } else if (std.mem.eql(u8, args[i], "--top-k") and i + 1 < args.len) {
+            i += 1;
+            top_k_flag = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--ctx-size") and i + 1 < args.len) {
             i += 1;
             ctx_size = try std.fmt.parseInt(u32, args[i], 10);
@@ -435,8 +455,14 @@ pub fn main(init: std.process.Init) !void {
         const chosen = chooseGgufEngine(io, allocator, model_dir, engine_override);
         if (serve_mode) {
             switch (chosen) {
-                .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
-                .llama => try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
+                .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget,
+            if (temp_explicit) temperature else null,
+            top_p_flag,
+            top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
+                .llama => try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget,
+            if (temp_explicit) temperature else null,
+            top_p_flag,
+            top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
             }
             return;
         }
@@ -675,6 +701,9 @@ pub fn main(init: std.process.Init) !void {
             .max_context_size = ctx_size,
             .request_timeout_sec = timeout,
             .default_reasoning_budget = reasoning_budget,
+            .default_temperature = if (temp_explicit) temperature else null,
+            .default_top_p = top_p_flag,
+            .default_top_k = top_k_flag,
             .default_enable_pld = enable_pld,
             .default_pld_draft_len = pld_draft_len,
             .default_pld_key_len = pld_key_len,
@@ -1046,6 +1075,9 @@ fn runDs4Serve(
     ctx_size: u32,
     timeout: u32,
     reasoning_budget: i32,
+    default_temperature: ?f32,
+    default_top_p: ?f32,
+    default_top_k: ?u32,
     max_resident_models: u32,
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
@@ -1215,6 +1247,9 @@ fn runDs4Serve(
         .max_context_size = ctx_size,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_temperature = default_temperature,
+        .default_top_p = default_top_p,
+        .default_top_k = default_top_k,
         .default_enable_pld = false,
         .default_pld_draft_len = 5,
         .default_pld_key_len = 3,
@@ -1314,6 +1349,9 @@ fn runLlamaServe(
     ctx_size: u32,
     timeout: u32,
     reasoning_budget: i32,
+    default_temperature: ?f32,
+    default_top_p: ?f32,
+    default_top_k: ?u32,
     max_resident_models: u32,
     max_resident_mem: u64,
     max_resident_mem_explicit: bool,
@@ -1476,6 +1514,9 @@ fn runLlamaServe(
         .max_context_size = effective_ctx,
         .request_timeout_sec = timeout,
         .default_reasoning_budget = reasoning_budget,
+        .default_temperature = default_temperature,
+        .default_top_p = default_top_p,
+        .default_top_k = default_top_k,
         .default_enable_pld = false,
         .default_pld_draft_len = 5,
         .default_pld_key_len = 3,

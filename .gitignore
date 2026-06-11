@@ -36,3 +36,4 @@ docs/perf/
 docs/tmp
 tests/pi-results
 tests/validator-results
+tests/pi_integration_run.summary.tsv

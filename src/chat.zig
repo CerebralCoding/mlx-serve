@@ -1194,6 +1194,41 @@ pub fn streamShouldBufferForTools(buf: []const u8) bool {
     return false;
 }
 
+/// Streaming-only: what should a tools-enabled SSE path do with the buffered
+/// text so far, with respect to thinking? Shared by the chat-completions and
+/// Anthropic /v1/messages stream handlers — the two paths drifted apart once
+/// already: /v1/messages only recognized think OPENERS present in the output,
+/// so Qwen-family template-opened thinking (opener injected into the PROMPT)
+/// streamed as visible text and a raw `</think>` leaked into Claude Code
+/// transcripts (2026-06-10 live).
+///
+///   .hold_thinking — inside an unclosed think block; buffer, emit nothing
+///   .split_think   — close tag arrived; splitThinkBlock once, emit
+///                    reasoning + visible remainder, clear the buffer, and
+///                    set think_closed for the rest of the turn
+///   .flush_text    — plain visible prose; stream it
+///
+/// `think_closed` releases the enable_thinking hold after the one split —
+/// without it the visible answer sits in the buffer until end-of-stream and
+/// gets misfiled as reasoning (the pi hidden-answer bug).
+pub const StreamThinkGate = enum { flush_text, hold_thinking, split_think };
+
+pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: bool) StreamThinkGate {
+    const has_thinking = (enable_thinking and !think_closed) or
+        std.mem.indexOf(u8, buf, "<|channel>thought") != null or
+        std.mem.indexOf(u8, buf, "<think>") != null or
+        (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
+        (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
+        // A partial opener at the buffer TAIL (mid-text re-opened channel
+        // arriving token by token) must hold the flush — flushing leaks tag
+        // fragments like a glued "thought".
+        endsWithPartialThinkOpen(buf);
+    if (!has_thinking) return .flush_text;
+    const has_close = std.mem.indexOf(u8, buf, "<channel|>") != null or
+        std.mem.indexOf(u8, buf, "</think>") != null;
+    return if (has_close) .split_think else .hold_thinking;
+}
+
 /// Parse tool calls from model output text.
 pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]ParsedToolCall {
     // Strip thinking blocks if present
@@ -1260,8 +1295,16 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             continue;
         }
         // If suffix is `_`, the only accepted continuations are
-        // `_call`, `_calls`, `_request`, `_requests`. Reject other tags
-        // like `<tool_undefined>` to avoid false positives.
+        // `_call`, `_calls`, `_request`, `_requests`. Any OTHER suffix gets
+        // one more chance as the XML-element-TAG form before being rejected:
+        // DSV4 embeds the tool name in the tag itself —
+        //   `<tool_read>\n<path>mlx.html</path>\n</tool_read>`
+        // (2026-06-10 pi html-ds4 capture; both calls leaked as text and pi
+        // scored 0/4). Conditions kept tight: tag must close with `>` right
+        // after the name (no attributes), an EXACT `</tool_NAME>` close must
+        // exist, the name must not be a result-ish marker (`<tool_output>`
+        // is DSV4 hallucinating a result, not calling a tool named
+        // "output"), and the body must be entirely `<key>value</key>` args.
         if (next == '_') {
             const accepted = [_][]const u8{ "_call", "_calls", "_request", "_requests" };
             var matched = false;
@@ -1279,6 +1322,12 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
                 }
             }
             if (!matched) {
+                const origin = after_tool - "<tool".len;
+                if (try parseXmlElementTagToolCall(allocator, effective_text[origin..])) |etc| {
+                    try calls.append(allocator, .{ .name = etc.call.name, .arguments = etc.call.arguments });
+                    search_pos = origin + etc.consumed;
+                    continue;
+                }
                 search_pos = after_tool;
                 continue;
             }
@@ -1806,6 +1855,100 @@ fn balancedJsonObject(content: []const u8) ?[]const u8 {
 /// non-whitespace between elements, an unclosed element, a duplicate name
 /// element, or a missing name returns null so prose-ish markup can't
 /// half-execute.
+/// Tag suffixes after `tool_` that mark tool RESULTS or metadata, never tool
+/// names. `<tool_output>…</tool_output>` is DSV4 hallucinating the result of
+/// a call it never made — mapping it onto a tool named "output" would
+/// fabricate a call out of thin air. `name` guards the bare XML-element-form
+/// child (`<tool_name>shell</tool_name>`) appearing outside its wrapper.
+const xml_tag_reserved_names = [_][]const u8{
+    "output", "outputs", "result", "results", "response", "responses", "error", "errors", "name",
+};
+
+/// XML-element-TAG tool form: `<tool_NAME><key>value</key>…</tool_NAME>`,
+/// the tool name embedded in the tag itself (DSV4 training-bias family;
+/// captured live 2026-06-10: `<tool_read>` / `<tool_edit>`). `slice` starts
+/// at `<tool`. Returns the parsed call plus bytes consumed through the close
+/// tag, or null when the shape doesn't hold (no attributes allowed, exact
+/// close required, reserved names rejected, body must be all elements).
+fn parseXmlElementTagToolCall(
+    allocator: std.mem.Allocator,
+    slice: []const u8,
+) !?struct { call: ParsedToolCall, consumed: usize } {
+    std.debug.assert(std.mem.startsWith(u8, slice, "<tool"));
+    const name_start = "<tool_".len;
+    if (slice.len <= name_start) return null;
+    var name_end = name_start;
+    while (name_end < slice.len and
+        (std.ascii.isAlphanumeric(slice[name_end]) or slice[name_end] == '_')) : (name_end += 1)
+    {}
+    if (name_end == name_start) return null; // bare `<tool_>`
+    if (name_end >= slice.len or slice[name_end] != '>') return null; // attributes → not this form
+    const tool_name = slice[name_start..name_end];
+    for (xml_tag_reserved_names) |reserved| {
+        if (std.ascii.eqlIgnoreCase(tool_name, reserved)) return null;
+    }
+    var close_buf: [72]u8 = undefined;
+    if (tool_name.len + "</tool_>".len > close_buf.len) return null;
+    const close_tag = std.fmt.bufPrint(&close_buf, "</tool_{s}>", .{tool_name}) catch return null;
+    const body_start = name_end + 1;
+    const close_rel = std.mem.indexOf(u8, slice[body_start..], close_tag) orelse return null;
+    const body = slice[body_start .. body_start + close_rel];
+    const args = parseXmlElementArgsJson(allocator, body) orelse blk: {
+        // JSON-args body variant of the same form, also captured live:
+        // `<tool_write>\n{"path": …, "content": …}\n</tool_write>`. The whole
+        // object IS the args. The trimmed body must START with `{` so prose
+        // that merely contains braces never produces arguments.
+        const trimmed = std.mem.trim(u8, body, " \t\n\r");
+        if (trimmed.len == 0 or trimmed[0] != '{') return null;
+        const json_body = balancedJsonObject(trimmed) orelse return null;
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, json_body, .{}) catch return null;
+        defer parsed.deinit();
+        if (parsed.value != .object) return null;
+        break :blk allocator.dupe(u8, json_body) catch return null;
+    };
+    const name_owned = allocator.dupe(u8, tool_name) catch {
+        allocator.free(args);
+        return null;
+    };
+    return .{
+        .call = .{ .name = name_owned, .arguments = args },
+        .consumed = body_start + close_rel + close_tag.len,
+    };
+}
+
+/// Parse a body consisting ENTIRELY of `<key>value</key>` child elements into
+/// a JSON args string. Values are kept verbatim, so nested markup (DSV4's
+/// `<edits><oldText>…</oldText>…</edits>`) survives as the arg's string
+/// value. Returns null unless every non-whitespace byte belongs to an element
+/// and at least one element is present — a plain-text body must never
+/// produce arguments.
+fn parseXmlElementArgsJson(allocator: std.mem.Allocator, body: []const u8) ?[]u8 {
+    var args_map: std.json.ObjectMap = .empty;
+    defer args_map.deinit(allocator);
+    var count: usize = 0;
+    var i: usize = 0;
+    while (i < body.len) {
+        while (i < body.len and std.ascii.isWhitespace(body[i])) i += 1;
+        if (i >= body.len) break;
+        if (body[i] != '<') return null;
+        const key_start = i + 1;
+        var j = key_start;
+        while (j < body.len and (std.ascii.isAlphanumeric(body[j]) or body[j] == '_')) j += 1;
+        if (j == key_start or j >= body.len or body[j] != '>') return null;
+        const key = body[key_start..j];
+        const val_start = j + 1;
+        var close_buf: [64]u8 = undefined;
+        if (key.len + 3 > close_buf.len) return null;
+        const close_tag = std.fmt.bufPrint(&close_buf, "</{s}>", .{key}) catch return null;
+        const rel = std.mem.indexOf(u8, body[val_start..], close_tag) orelse return null;
+        args_map.put(allocator, key, .{ .string = body[val_start .. val_start + rel] }) catch return null;
+        count += 1;
+        i = val_start + rel + close_tag.len;
+    }
+    if (count == 0) return null;
+    return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{}) catch null;
+}
+
 fn parseXmlElementToolCall(allocator: std.mem.Allocator, body: []const u8) ?ParsedToolCall {
     var name: ?[]const u8 = null;
     var args_map: std.json.ObjectMap = .empty;
@@ -4500,6 +4643,34 @@ test "streamShouldBufferForTools: raw JSON shape" {
     try testing.expect(!streamShouldBufferForTools("{\"foo\":1}"));
 }
 
+test "streamThinkGate: template-opened thinking holds tag-free prose" {
+    // The Claude Code leak class: with thinking on and the opener injected by
+    // the template, the model's prose has NO tags — it must still be held,
+    // never flushed as visible text.
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("The user is asking about their system specs.", true, false));
+    // …and split exactly when the close tag arrives.
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("The user is asking.\n</think>\n\nI don't have direct access.", true, false));
+}
+
+test "streamThinkGate: after the split, prose flushes (hidden-answer guard)" {
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("The visible answer streams normally.", true, true));
+}
+
+test "streamThinkGate: explicit openers hold even with thinking off or closed" {
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("Sure.<|channel>thought\nlet me reconsider", true, true));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("<think>hmm", false, false));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("<|channel>thought\nplan<channel|>done", false, false));
+}
+
+test "streamThinkGate: partial opener at the buffer tail holds" {
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("The answer is 391.\n<|channel>", false, false));
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("Done. <thi", false, false));
+}
+
+test "streamThinkGate: plain prose with thinking off flushes" {
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("17 × 23 = 391.", false, false));
+}
+
 test "parseToolCalls: self-closing <tool name=... arguments=... />" {
     const allocator = testing.allocator;
     // Clean form. We use the literal byte sequence the model actually emits —
@@ -4690,6 +4861,86 @@ test "parseToolCalls: XML-element tool form (tool_name + arg children)" {
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqualStrings("shell", calls[0].name);
     try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "df -h / | grep -v \\\"Filesystem\\\"") != null);
+}
+
+test "parseToolCalls: XML-element-TAG form (<tool_NAME> with arg children)" {
+    // Verbatim DSV4-Flash capture (2026-06-10 pi html-ds4 turn 2): the tool
+    // name rides in the tag itself — <tool_read>, <tool_edit> — with each
+    // argument as an XML child element. Nested elements (the <edits> body)
+    // stay verbatim as the arg's string value, matching what working models
+    // send pi for the same tool.
+    const allocator = testing.allocator;
+    const text = "Let me read the current file first.\n\n<tool_read>\n<path>mlx.html</path>\n</tool_read>Now I'll add a button:\n\n<tool_edit>\n<path>mlx.html</path>\n<edits>\n  <oldText>    <h1>MLX</h1></oldText>\n  <newText>    <h1>MLX</h1>\n    <button onclick=\"alert('hi')\">Say Hello</button></newText>\n</edits>\n</tool_edit>";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("read", calls[0].name);
+    try testing.expect(std.mem.indexOf(u8, calls[0].arguments, "mlx.html") != null);
+    try testing.expectEqualStrings("edit", calls[1].name);
+    // Args must be valid JSON with the nested XML preserved as a string value.
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[1].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("mlx.html", parsed.value.object.get("path").?.string);
+    const edits = parsed.value.object.get("edits").?.string;
+    try testing.expect(std.mem.indexOf(u8, edits, "<oldText>") != null);
+    try testing.expect(std.mem.indexOf(u8, edits, "Say Hello") != null);
+}
+
+test "parseToolCalls: XML-element-TAG form with JSON args body" {
+    // Verbatim-shape DSV4-Flash capture (2026-06-10 pi html-ds4, second
+    // sampling): same name-in-tag form but the body is a bare JSON args
+    // object instead of XML elements — `<tool_write>\n{…}\n</tool_write>`.
+    const allocator = testing.allocator;
+    const text = "Here's the HTML page:\n\n<tool_write>\n{\"path\": \"/tmp/ws/mlx.html\", \"content\": \"<!DOCTYPE html>\\n<html lang=\\\"en\\\">\\n<body>\\n</body>\\n</html>\"}\n</tool_write>\n\npage ready";
+    const calls = (try parseToolCalls(allocator, text)) orelse return error.NoCalls;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("/tmp/ws/mlx.html", parsed.value.object.get("path").?.string);
+    try testing.expect(std.mem.indexOf(u8, parsed.value.object.get("content").?.string, "<!DOCTYPE html>") != null);
+}
+
+test "parseToolCalls: <tool_NAME> with prose body containing braces is NOT a tool call" {
+    // Prose with incidental {braces} inside an unknown tool-ish tag must not
+    // produce arguments — the JSON-body variant requires the body to BE the
+    // args object, not merely contain one.
+    const allocator = testing.allocator;
+    const text = "<tool_summary>The config {a: 1} was applied.</tool_summary>";
+    const calls = try parseToolCalls(allocator, text);
+    try testing.expect(calls == null);
+}
+
+test "parseToolCalls: hallucinated <tool_output> result tag is NOT a tool call" {
+    // Verbatim DSV4-Flash capture (same session, turn 1): the model invented
+    // a tool RESULT without calling anything. A plain-text body must never
+    // produce a call to a tool named "output".
+    const allocator = testing.allocator;
+    const text = "Here's the page I created for you:\n\n<tool_output>Page ready: mlx.html</tool_output>";
+    const calls = try parseToolCalls(allocator, text);
+    try testing.expect(calls == null);
+}
+
+test "parseToolCalls: <tool_output> with element children is still NOT a tool call" {
+    // A hallucinated result tag can carry element-shaped content (e.g. an
+    // echoed HTML fragment). Result-ish names are denylisted outright.
+    const allocator = testing.allocator;
+    const text = "<tool_output>\n<status>ok</status>\n</tool_output>";
+    const calls = try parseToolCalls(allocator, text);
+    try testing.expect(calls == null);
 }
 
 test "parseToolCalls: XML-element form without a tool_name is NOT a tool call" {
