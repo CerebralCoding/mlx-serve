@@ -1604,10 +1604,15 @@ fn renderPropsBody(
     ctx_str: []const u8,
     active_mem: usize,
     peak_mem: usize,
+    available_mem: u64,
     safe_ctx: u32,
 ) ![]u8 {
+    // `available_bytes` is free SYSTEM RAM, computed with the SAME formula the
+    // model-load pre-flight uses (`metrics.getAvailableMemBytes`), so the tray's
+    // "Free RAM" line can never drift from the number that gates a load. Distinct
+    // axis from `active_bytes` (the MLX GPU-allocator footprint).
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"max_safe_context":{d}}}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d}}}}}
     , .{
         config.model_type,        ctx_str,
         config.vocab_size,        config.hidden_size,
@@ -1616,7 +1621,7 @@ fn renderPropsBody(
         config.quant_bits,        config.quant_group_size,
         config.max_position_embeddings,
         active_mem,               peak_mem,
-        safe_ctx,
+        available_mem,            safe_ctx,
     });
 }
 
@@ -1660,7 +1665,11 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
         _ = mlx.mlx_get_peak_memory(&peak_mem);
     }
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, safe_ctx);
+    // Free system RAM — same calc as the model-load pre-flight, so the app's
+    // "Free RAM" line stays in lockstep with what gates a load.
+    const available_mem = metrics.getAvailableMemBytes();
+
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -9464,7 +9473,7 @@ test "renderPropsBody omits chat_template" {
     config.max_position_embeddings = 8192;
     config.model_type = "gemma4";
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 16384);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384);
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
@@ -9483,7 +9492,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 16384);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384);
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.
@@ -9493,6 +9502,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     try testing.expect(std.mem.indexOf(u8, body, "\"memory\"") != null);
     try testing.expect(std.mem.indexOf(u8, body, "\"active_bytes\":1234") != null);   // Swift fetchProps
     try testing.expect(std.mem.indexOf(u8, body, "\"peak_bytes\":5678") != null);     // Swift fetchProps
+    try testing.expect(std.mem.indexOf(u8, body, "\"available_bytes\":9000000000") != null); // Swift fetchProps (Free RAM line)
     try testing.expect(std.mem.indexOf(u8, body, "\"max_safe_context\":16384") != null); // Swift fetchProps
 }
 

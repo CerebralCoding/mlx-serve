@@ -103,6 +103,9 @@ class ServerManager: ObservableObject {
             env["DYLD_LIBRARY_PATH"] = existing.isEmpty ? frameworksPath : "\(frameworksPath):\(existing)"
             env["MLX_METAL_PATH"] = frameworksPath
         }
+        // Env-var-driven launch overrides (memory pre-flight). Resolves the key
+        // in both directions, so an inherited value can't leak past the toggle.
+        options.applyLaunchEnv(&env)
         proc.environment = env
 
         // Capture stderr to show errors in the UI

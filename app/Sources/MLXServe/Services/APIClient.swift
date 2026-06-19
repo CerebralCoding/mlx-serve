@@ -220,11 +220,7 @@ class APIClient {
         let (data, _) = try await session.data(from: url)
         guard let json = try JSONSerialization.jsonObject(with: data) as? [String: Any],
               let mem = json["memory"] as? [String: Any] else { return nil }
-        return MemoryInfo(
-            activeBytes: mem["active_bytes"] as? Int64 ?? 0,
-            peakBytes: mem["peak_bytes"] as? Int64 ?? 0,
-            maxSafeContext: mem["max_safe_context"] as? Int ?? 0
-        )
+        return MemoryInfo.parse(mem)
     }
 
     // MARK: - Agent Tool Calling

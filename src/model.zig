@@ -288,6 +288,20 @@ pub const ModelConfig = struct {
         }
     }
 
+    /// Gemma's chat template always ends turns with `<end_of_turn>` (id 106)
+    /// and emits `<eos>` (id 1) at sequence end, so both must be stop tokens
+    /// for EVERY Gemma family (gemma3 / gemma4 / diffusion_gemma). Some
+    /// checkpoints declare only a SCALAR `eos_token_id: 1` (e.g. the
+    /// abliterated text-only `-lm-` builds) — gating the 106 add on
+    /// `num_eos_tokens == 0` then leaves it out and it leaks into output as
+    /// repeated `<end_of_turn>`. Merge both ADDITIVELY + dedup-guarded (never
+    /// removes a config-declared stop). Same leak class as the Qwen2.5-Coder
+    /// `<|im_end|>` merge performed at load time (main.zig / scheduler doLoad).
+    pub fn ensureGemmaTerminators(self: *ModelConfig) void {
+        if (!self.isEosToken(1)) self.addEosToken(1);
+        if (!self.isEosToken(106)) self.addEosToken(106);
+    }
+
     pub fn isEosToken(self: *const ModelConfig, id: u32) bool {
         for (self.eos_token_ids[0..self.num_eos_tokens]) |eos| {
             if (id == eos) return true;
@@ -686,7 +700,14 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     }
 
     // Set model-family defaults based on model_type
-    if (std.mem.eql(u8, model_type, "gemma3")) {
+    if (std.mem.eql(u8, model_type, "gemma3") or
+        std.mem.eql(u8, model_type, "gemma3_text"))
+    {
+        // "gemma3_text" is the FLAT text-only checkpoint (Gemma3ForCausalLM,
+        // e.g. the abliterated -lm- builds): no vision tower, weights under
+        // "model.*". The multimodal "gemma3" nests them under
+        // "language_model.model.*" and carries a text_config. Collapse both
+        // onto "gemma3" so every downstream gemma3 comparison fires.
         config.model_type = "gemma3";
         // gemma-3-4b-it's text_config omits num_attention_heads / num_key_value_heads
         // / head_dim and leans on the HF Gemma3TextConfig defaults (8 q-heads,
@@ -698,7 +719,14 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("num_attention_heads") == null) config.num_attention_heads = 8;
         if (cfg_obj.get("num_key_value_heads") == null) config.num_key_value_heads = 4;
         if (cfg_obj.get("head_dim") == null) config.head_dim = 256;
-        config.weight_prefix = "language_model.model";
+        // Multimodal checkpoint → "language_model.model"; flat text-only
+        // (gemma3_text, no text_config) → "model" (mirrors the LFM2 VL split).
+        config.weight_prefix = if (root.get("text_config") != null) "language_model.model" else "model";
+        // Gemma always ties word embeddings; the abliterated text-only build
+        // omits the flag (would default false) and ships no lm_head tensor, so
+        // force it on. An explicit lm_head tensor, if present, still wins in
+        // transformer.zig's resolution.
+        config.tie_word_embeddings = true;
         config.hidden_act = .gelu_approx;
         config.norm_has_offset = true;
         config.scale_embeddings = true;
@@ -717,10 +745,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 config.rope_scaling_factor = 8.0;
             }
         }
-        if (config.num_eos_tokens == 0) {
-            config.addEosToken(1);
-            config.addEosToken(106);
-        }
+        config.ensureGemmaTerminators();
     } else if (std.mem.eql(u8, model_type, "gemma4") or
         std.mem.eql(u8, model_type, "gemma4_text") or
         std.mem.eql(u8, model_type, "gemma4_unified") or
@@ -746,9 +771,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.has_qk_norm = true;
         config.has_v_norm = true; // Parameter-free RMS norm on values
         config.rope_scaling_factor = 1.0; // No scaling, uses proportional RoPE via theta
-        if (config.num_eos_tokens == 0) {
-            config.addEosToken(1); // eos_token_id
-        }
+        // [1, 106, 50] from the config array (when present) plus an additive
+        // guarantee of <eos>(1) + <end_of_turn>(106) for checkpoints that
+        // declare only a scalar eos_token_id.
+        config.ensureGemmaTerminators();
         // Note on `attention_k_eq_v` for the 12B unified checkpoint: the
         // weights ship separate v_proj for SLIDING layers and omit them for
         // FULL_ATTENTION layers — i.e. K==V alias is a per-layer choice
@@ -813,10 +839,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // The model.encoder.vision_tower is not wired yet (dropped at load by
         // shouldKeepWeightKey) — never advertise vision for this arch.
         config.has_vision = false;
-        if (config.num_eos_tokens == 0) {
-            config.addEosToken(1);
-            config.addEosToken(106);
-        }
+        config.ensureGemmaTerminators();
     } else if (std.mem.eql(u8, model_type, "qwen3_5_moe") or
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
@@ -1627,6 +1650,102 @@ test "ModelConfig keeps explicit gemma3 head counts (12b)" {
     try testing.expectEqual(@as(u32, 16), config.num_attention_heads);
     try testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
     try testing.expectEqual(@as(u32, 256), config.head_dim);
+}
+
+test "ModelConfig routes flat gemma3_text (Gemma3ForCausalLM) onto gemma3, model prefix, tied" {
+    // mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit ships a FLAT config
+    // (no text_config) with top-level model_type "gemma3_text", architectures
+    // ["Gemma3ForCausalLM"], weights under "model.*", tied embeddings (no
+    // lm_head tensor, tie_word_embeddings omitted). Before the fix the
+    // top-level "gemma3_text" matched no arm and fell through to the
+    // llama-family else branch → model_type "unknown", tie=false, no QK-norm —
+    // and crashed at load with "MISSING WEIGHT: lm_head.weight".
+    const json =
+        \\{
+        \\  "model_type": "gemma3_text",
+        \\  "architectures": ["Gemma3ForCausalLM"],
+        \\  "hidden_size": 3840,
+        \\  "intermediate_size": 15360,
+        \\  "num_hidden_layers": 48,
+        \\  "num_attention_heads": 16,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 256,
+        \\  "sliding_window": 1024,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    // Collapsed onto "gemma3" so transformer.zig's gemma3 forward/binding fire.
+    try testing.expectEqualStrings("gemma3", config.model_type);
+    // Flat checkpoint → "model.*" prefix (NOT "language_model.model").
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    // Gemma always ties; the abliterated checkpoint omits the flag, so default
+    // it on — lm_head then resolves to the embedding table instead of crashing.
+    try testing.expect(config.tie_word_embeddings);
+    // Full gemma3 numeric arm, not the llama-family fallback.
+    try testing.expect(config.has_qk_norm);
+    try testing.expect(config.scale_embeddings);
+    try testing.expect(config.has_pre_ff_norm);
+    try testing.expect(config.norm_has_offset);
+    // Explicit head counts preserved.
+    try testing.expectEqual(@as(u32, 16), config.num_attention_heads);
+    try testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 256), config.head_dim);
+}
+
+test "ModelConfig gemma3 merges <end_of_turn> (106) even with scalar eos_token_id: 1" {
+    // The abliterated text-only checkpoint declares a SCALAR eos_token_id: 1
+    // (and tokenizer_config eos_token <eos>=1), but its chat template ends
+    // turns with <end_of_turn> (106). Gating the 106 add on num_eos_tokens==0
+    // (defeated by the scalar 1) left 106 out of the stop set, so generation
+    // leaked repeated "<end_of_turn>" into the visible content. The gemma3 arm
+    // must merge 106 additively (Qwen2.5-Coder <|im_end|> leak class).
+    const json =
+        \\{
+        \\  "model_type": "gemma3_text",
+        \\  "hidden_size": 3840,
+        \\  "num_hidden_layers": 48,
+        \\  "num_attention_heads": 16,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 256,
+        \\  "eos_token_id": 1,
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.isEosToken(1));   // config-declared eos preserved
+    try testing.expect(config.isEosToken(106)); // <end_of_turn> merged in
+}
+
+test "ensureGemmaTerminators is additive and dedup-guarded" {
+    var c = ModelConfig{};
+    c.addEosToken(1); // config-provided scalar eos
+    c.ensureGemmaTerminators();
+    try testing.expect(c.isEosToken(1));
+    try testing.expect(c.isEosToken(106));
+    try testing.expectEqual(@as(u32, 2), c.num_eos_tokens);
+    // Idempotent: re-running adds nothing.
+    c.ensureGemmaTerminators();
+    try testing.expectEqual(@as(u32, 2), c.num_eos_tokens);
+}
+
+test "ModelConfig multimodal gemma3 keeps language_model.model prefix" {
+    // The gemma3 weight prefix is now conditional on text_config presence;
+    // guard that a multimodal checkpoint (vision_config + nested text_config)
+    // still nests its weights under "language_model.model".
+    const json =
+        \\{
+        \\  "model_type": "gemma3",
+        \\  "text_config": {"model_type": "gemma3_text", "hidden_size": 3840, "num_hidden_layers": 48, "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 256, "sliding_window": 1024},
+        \\  "vision_config": {"hidden_size": 1152},
+        \\  "quantization": {"bits": 4, "group_size": 32}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("gemma3", config.model_type);
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    try testing.expect(config.tie_word_embeddings);
 }
 
 test "ModelConfig parses gemma4_unified vision + audio multimodal fields" {

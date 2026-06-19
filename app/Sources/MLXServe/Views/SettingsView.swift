@@ -434,6 +434,17 @@ private struct ServerSectionContent: View {
                 .frame(minWidth: 180)
             }
         }
+        if let m = meta["skipMemPreflight"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.skipMemPreflight)
+            ) {
+                Toggle("", isOn: $appState.serverOptions.skipMemPreflight)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
     }
 }
 

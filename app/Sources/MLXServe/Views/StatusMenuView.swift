@@ -352,6 +352,11 @@ struct StatusMenuView: View {
                     }
 
                     if let mem = server.memoryInfo {
+                        // Both bars share total physical RAM as the denominator,
+                        // so they're directly comparable and never stuck (the old
+                        // GPU bar used peak×2 → pinned at 50% once active≈peak).
+                        let totalRAM = Int64(ProcessInfo.processInfo.physicalMemory)
+
                         HStack {
                             Text("GPU Memory")
                                 .font(.caption)
@@ -360,8 +365,32 @@ struct StatusMenuView: View {
                             Text(mem.activeFormatted)
                                 .font(.caption.monospaced())
                         }
-                        ProgressView(value: Double(mem.activeBytes), total: Double(max(mem.peakBytes, mem.activeBytes) * 2))
+                        ProgressView(value: mem.gpuFraction(ofTotal: totalRAM))
                             .tint(.blue)
+
+                        // Available RAM — same calc the model-load pre-flight
+                        // uses (total − wired − compressor), so this can't drift
+                        // from what gates a load. It's reclaimable-available
+                        // (includes evictable file cache), not unused memory.
+                        // Hidden when 0 (older server build that omits the field).
+                        if mem.availableBytes > 0 {
+                            HStack {
+                                Text("Available RAM")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Spacer()
+                                Text(mem.availableFormatted)
+                                    .font(.caption.monospaced())
+                            }
+                            ProgressView(value: mem.availableFraction(ofTotal: totalRAM))
+                                .tint(.green)
+                        }
+
+                        if totalRAM > 0 {
+                            Text("\(MemoryInfo.format(totalRAM)) total")
+                                .font(.caption2)
+                                .foregroundStyle(.tertiary)
+                        }
                     }
                 }
                 .padding(.horizontal, 16)
@@ -662,6 +691,15 @@ struct EndpointsSection: View {
         ("POST", "/v1/embeddings"),
     ]
 
+    /// The server root (`/`) — the human-friendly status page. Pure so the
+    /// "open in browser" wiring is testable without rendering the view, and so
+    /// it normalizes to exactly one trailing slash regardless of how `baseURL`
+    /// is formatted.
+    static func rootURL(_ baseURL: String) -> URL? {
+        let trimmed = baseURL.hasSuffix("/") ? String(baseURL.dropLast()) : baseURL
+        return URL(string: trimmed + "/")
+    }
+
     var body: some View {
         VStack(alignment: .leading, spacing: 4) {
             Button {
@@ -683,6 +721,34 @@ struct EndpointsSection: View {
             .buttonStyle(.plain)
 
             if isExpanded {
+                // Root status page — click anywhere on the row to open it in the
+                // default browser (not a copy target like the API endpoints below).
+                Button {
+                    if let url = Self.rootURL(baseURL) {
+                        NSWorkspace.shared.open(url)
+                    }
+                } label: {
+                    HStack(spacing: 4) {
+                        Text("GET")
+                            .font(.system(size: 9, weight: .bold, design: .monospaced))
+                            .foregroundStyle(.green)
+                            .frame(width: 30, alignment: .leading)
+                        Text(baseURL + "/")
+                            .font(.system(size: 10, design: .monospaced))
+                            .foregroundStyle(.blue)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                        Spacer()
+                        Image(systemName: "arrow.up.right.square")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .help("Open the server status page in your browser")
+                .padding(.vertical, 1)
+
                 ForEach(endpoints, id: \.path) { ep in
                     HStack(spacing: 4) {
                         Text(ep.method)

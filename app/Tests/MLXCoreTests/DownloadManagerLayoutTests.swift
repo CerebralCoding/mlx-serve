@@ -190,6 +190,20 @@ final class DownloadManagerLayoutTests: XCTestCase {
         }
     }
 
+    func testGemma3TextIsSupportedArchitecture() {
+        // Text-only Gemma 3 (Gemma3ForCausalLM) ships model_type "gemma3_text"
+        // — e.g. mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit. A locally
+        // discovered checkpoint must NOT be flagged "Unsupported architecture"
+        // in the model manager (mirrors the gemma4_text / qwen3_moe_text tags).
+        for mt in ["gemma3", "gemma3_text"] {
+            let m = LocalModel(
+                id: "test:\(mt)", name: mt, path: "/tmp/gemma-3-12b-it-qat-abliterated-lm-4bit",
+                sizeFormatted: "7 GB", modelType: mt, source: .custom, kind: .base
+            )
+            XCTAssertTrue(m.isSupportedArchitecture, "\"\(mt)\" must be in supportedModelTypes")
+        }
+    }
+
     // MARK: - mmproj sidecar filtering
 
     /// `mmproj-*.gguf` files are CLIP / audio encoders, not language models —

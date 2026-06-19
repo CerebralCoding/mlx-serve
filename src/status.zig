@@ -83,6 +83,23 @@ pub fn getAppRssMb() u32 {
 /// swapping: total minus the resident-and-non-reclaimable set (active + wired +
 /// compressed). Free/inactive/speculative/purgeable pages count as available.
 /// Returns 0 if the query fails (callers treat 0 as "unknown — don't block").
+/// Pure: bytes available for a new large allocation given the live page counts.
+///
+/// Credits ALL pageable memory (active + inactive, file cache + anonymous) as
+/// available, because macOS evicts file cache / compresses / swaps it the moment
+/// a large MLX allocation lands — so it is NOT a barrier to the load. Only
+/// `wired` (pinned, non-pageable) and `compressor` (already-compressed app data,
+/// can't shrink without swap) are treated as genuinely unavailable. This is why
+/// a 12B that needs ~7.7 GB loads fine on a 16 GB Mac whose *instantaneous* free
+/// reads ~7.8 GB: ~12 GB is reclaimable. The gross OOM case (#45) — a prior
+/// model still resident — shows up as high `wired`, which DOES shrink this.
+/// Returns 0 when total is 0 or used ≥ total (a failed query must never block).
+fn computeAvailableBytes(total_mem: u64, wire_pages: u64, compressor_pages: u64, page: u64) u64 {
+    const used: u64 = (wire_pages + compressor_pages) * page;
+    if (total_mem == 0 or used >= total_mem) return 0;
+    return total_mem - used;
+}
+
 pub fn getAvailableMemBytes() u64 {
     var total_mem: u64 = 0;
     var len: usize = @sizeOf(u64);
@@ -95,9 +112,29 @@ pub fn getAvailableMemBytes() u64 {
     var count: u32 = @sizeOf(VmStats64) / @sizeOf(i32);
     if (host_statistics64(mach_host_self(), 4, @ptrCast(&vm), &count) != 0) return 0;
 
-    const used: u64 = (@as(u64, vm.active_count) + vm.wire_count + vm.compressor_page_count) * page;
-    if (total_mem == 0 or used >= total_mem) return 0;
-    return total_mem - used;
+    return computeAvailableBytes(total_mem, vm.wire_count, vm.compressor_page_count, page);
+}
+
+test "computeAvailableBytes credits reclaimable cache, not just instantaneous free" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    const page: u64 = 16384;
+    const ppg: u64 = GB / page; // pages per GB
+
+    // Live 16 GB Mac before a big load: ~3 GB wired, ~1 GB compressed, and the
+    // rest is free + active/inactive cache + app pages. The cache must NOT count
+    // against availability (macOS evicts it under pressure), so available is the
+    // full 12 GB regardless of how much sits on the active list. The old
+    // `active`-subtracting formula wrongly reported ~7-8 GB here and refused the
+    // 12B that in fact fits.
+    try std.testing.expectEqual(@as(u64, 12 * GB), computeAvailableBytes(16 * GB, 3 * ppg, 1 * ppg, page));
+
+    // Gross OOM case (#45): a prior model still wired (40 GB) on a 64 GB box →
+    // only 23 GB reclaimable, not enough for a second 42 GB load → caught.
+    try std.testing.expectEqual(@as(u64, 23 * GB), computeAvailableBytes(64 * GB, 40 * ppg, 1 * ppg, page));
+
+    // Degenerate guards: failed query (total 0) and used ≥ total → 0, never block.
+    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(0, 1, 1, page));
+    try std.testing.expectEqual(@as(u64, 0), computeAvailableBytes(8 * GB, 8 * ppg, 0, page));
 }
 
 pub fn getSysMemPct() u32 {

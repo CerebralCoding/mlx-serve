@@ -43,6 +43,14 @@ struct ServerOptions: Codable, Equatable {
     /// Hot prefix cache memory budget. `2GB`, `512MB`, etc. `0` or `off`
     /// disables the byte cap (count cap still applies). Empty = server default.
     var prefixCacheMem: String = "2GB"
+    /// When true, launch the server with `MLX_SERVE_SKIP_MEM_PREFLIGHT=1` so the
+    /// MLX loader skips the free-RAM pre-flight that would otherwise refuse a
+    /// model whose weights + warmup headroom look too big for current free
+    /// memory. The check is deliberately conservative (macOS reclaims file cache
+    /// as MLX allocates), so a load it refuses often still fits — but a genuine
+    /// over-commit can hard-crash the server, so this is opt-in. Plumbed as an
+    /// environment variable (see `applyLaunchEnv`), not a CLI flag.
+    var skipMemPreflight: Bool = false
 
     // MARK: GGUF-only (llama.cpp engine)
     /// KV-cache quantization for the embedded llama.cpp engine. MLX's
@@ -178,6 +186,7 @@ struct ServerOptions: Codable, Equatable {
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
         prefixCacheMem == other.prefixCacheMem &&
+        skipMemPreflight == other.skipMemPreflight &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
         tokenizeCacheEntries == other.tokenizeCacheEntries &&
@@ -274,6 +283,26 @@ struct ServerOptions: Codable, Equatable {
             args += ["--top-k", "\(defaultTopK)"]
         }
         return args
+    }
+
+    // MARK: Launch environment
+
+    /// Name of the env var the server reads to skip the model-load memory
+    /// pre-flight. The server treats *any* value (even empty) as "skip", so
+    /// presence is what matters — we set it to "1" and remove it otherwise.
+    static let skipMemPreflightEnvKey = "MLX_SERVE_SKIP_MEM_PREFLIGHT"
+
+    /// Apply env-var overrides to the launched server's environment. Unlike the
+    /// CLI flags in `toCLIArgs`, the memory pre-flight is toggled by an
+    /// environment variable. `env` is seeded from the app's own environment, so
+    /// we resolve the key in BOTH directions — set it when on, strip it when off
+    /// — so an inherited value can never leak the override either way.
+    func applyLaunchEnv(_ env: inout [String: String]) {
+        if skipMemPreflight {
+            env[Self.skipMemPreflightEnvKey] = "1"
+        } else {
+            env.removeValue(forKey: Self.skipMemPreflightEnvKey)
+        }
     }
 
     // MARK: Settings-field validation helpers
@@ -382,6 +411,10 @@ extension ServerOptions {
         "prefixCacheMem": .init(
             title: "Prefix cache memory cap",
             explainer: "Maximum RAM for the prefix cache. Accepts '2GB', '512MB', '0' (disable byte cap). Default 2GB.",
+            needsRestart: true),
+        "skipMemPreflight": .init(
+            title: "Skip memory pre-flight check",
+            explainer: "Bypass the safety check that refuses to load an MLX model when free RAM looks too low for its weights plus warmup headroom. The check is conservative — macOS reclaims file cache as the model loads — so turn this on if a load you know fits is being refused. A genuine over-commit can hard-crash the server. Sets MLX_SERVE_SKIP_MEM_PREFLIGHT.",
             needsRestart: true),
         "llamaKvQuant": .init(
             title: "KV cache quantization",

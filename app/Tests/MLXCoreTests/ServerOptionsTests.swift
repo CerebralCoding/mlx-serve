@@ -342,3 +342,55 @@ extension ServerOptionsTests {
         XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--temp", value: "0.7"))
     }
 }
+
+extension ServerOptionsTests {
+    // MARK: - Skip-memory-preflight env override
+    //
+    // The MLX loader's free-RAM pre-flight is toggled by the
+    // MLX_SERVE_SKIP_MEM_PREFLIGHT environment variable, NOT a CLI flag, so the
+    // Settings toggle plumbs through `applyLaunchEnv` rather than `toCLIArgs`.
+
+    func testSkipMemPreflightDefaultsOff() {
+        XCTAssertFalse(ServerOptions().skipMemPreflight,
+                       "the safety check must stay on by default")
+    }
+
+    func testSkipMemPreflightSetsEnvVarWhenOn() {
+        var opts = ServerOptions()
+        opts.skipMemPreflight = true
+        var env: [String: String] = [:]
+        opts.applyLaunchEnv(&env)
+        XCTAssertEqual(env["MLX_SERVE_SKIP_MEM_PREFLIGHT"], "1")
+    }
+
+    /// Off must strip an inherited value — `env` starts as the app's own
+    /// environment, so a var the app was launched with can't leak the override
+    /// into the server when the toggle is off.
+    func testSkipMemPreflightStripsInheritedEnvVarWhenOff() {
+        let opts = ServerOptions()  // skipMemPreflight = false
+        var env = ["MLX_SERVE_SKIP_MEM_PREFLIGHT": "1", "PATH": "/usr/bin"]
+        opts.applyLaunchEnv(&env)
+        XCTAssertNil(env["MLX_SERVE_SKIP_MEM_PREFLIGHT"],
+                     "off must remove the var so the pre-flight runs")
+        XCTAssertEqual(env["PATH"], "/usr/bin", "must not disturb other env vars")
+    }
+
+    /// It's an env var, not argv — it must never appear among the CLI flags.
+    func testSkipMemPreflightIsNotACLIFlag() {
+        var opts = ServerOptions()
+        opts.skipMemPreflight = true
+        let args = opts.toCLIArgs()
+        XCTAssertFalse(args.contains { $0.localizedCaseInsensitiveContains("preflight") },
+                       "the memory override is an env var, never a CLI flag")
+    }
+
+    func testSkipMemPreflightChangeTriggersRestart() {
+        var a = ServerOptions()
+        var b = ServerOptions()
+        b.skipMemPreflight = true
+        XCTAssertFalse(a.serverLaunchEquals(b),
+                       "toggling the memory pre-flight must require a server restart")
+        a.skipMemPreflight = true
+        XCTAssertTrue(a.serverLaunchEquals(b))
+    }
+}

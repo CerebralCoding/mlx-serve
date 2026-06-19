@@ -28,7 +28,7 @@ const log = @import("log.zig");
 /// drafters can't decode on their own, and users shouldn't see them in
 /// `/v1/models`.
 const supported_model_types = [_][]const u8{
-    "gemma3",
+    "gemma3",       "gemma3_text",
     "gemma4",       "gemma4_text",
     "gemma4_unified", "gemma4_unified_text",
     "qwen2",
@@ -496,6 +496,15 @@ test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
     try testing.expect(isSupportedModelType("qwen3"));
     // A genuinely unknown arch is still rejected.
     try testing.expect(!isSupportedModelType("totally_made_up_arch"));
+}
+
+test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {
+    // Regression for "[discovery] skip ...: unsupported model_type
+    // 'gemma3_text'": text-only Gemma 3 abliterated checkpoints
+    // (mlx-community/gemma-3-12b-it-qat-abliterated-lm-4bit) ship a flat
+    // top-level model_type "gemma3_text" and must be discoverable, not skipped.
+    try testing.expect(isSupportedModelType("gemma3_text"));
+    try testing.expect(isSupportedModelType("gemma3"));
 }
 
 test "isSupportedQuantMode accepts nvfp4 (issue #24), rejects unknown" {

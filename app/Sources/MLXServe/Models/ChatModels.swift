@@ -262,10 +262,50 @@ enum ServerEngine: String, CaseIterable {
 struct MemoryInfo {
     var activeBytes: Int64
     var peakBytes: Int64
+    /// RAM available for a new allocation, computed server-side with the SAME
+    /// formula as the model-load pre-flight (`status.getAvailableMemBytes` =
+    /// total − wired − compressor). This is reclaimable-available, not unused:
+    /// it counts file cache and pageable memory that macOS evicts under
+    /// allocation pressure, so it's typically much larger than "free". 0 when the
+    /// server build predates the field — the tray hides the line then. Distinct
+    /// axis from `activeBytes` (the MLX GPU-allocator footprint).
+    var availableBytes: Int64
     var maxSafeContext: Int
 
     var activeFormatted: String { Self.format(activeBytes) }
     var peakFormatted: String { Self.format(peakBytes) }
+    var availableFormatted: String { Self.format(availableBytes) }
+
+    /// Fraction (0...1) of `totalBytes` physical RAM occupied by the model's GPU
+    /// (MLX) footprint. The bar's denominator is total RAM — NOT `peak×2`, which
+    /// pinned the old bar at exactly 0.5 whenever `active == peak` (the steady
+    /// state after load). Returns 0 for a non-positive total.
+    func gpuFraction(ofTotal totalBytes: Int64) -> Double {
+        Self.fraction(activeBytes, of: totalBytes)
+    }
+
+    /// Fraction (0...1) of `totalBytes` physical RAM currently available
+    /// (reclaimable). Same denominator as `gpuFraction` so the two bars are
+    /// directly comparable.
+    func availableFraction(ofTotal totalBytes: Int64) -> Double {
+        Self.fraction(availableBytes, of: totalBytes)
+    }
+
+    private static func fraction(_ part: Int64, of total: Int64) -> Double {
+        guard total > 0 else { return 0 }
+        return min(1.0, max(0.0, Double(part) / Double(total)))
+    }
+
+    /// Decode the `memory` object from the server's `/props` response. Pure and
+    /// testable; `APIClient.fetchProps` calls this after pulling `json["memory"]`.
+    static func parse(_ mem: [String: Any]) -> MemoryInfo {
+        MemoryInfo(
+            activeBytes: mem["active_bytes"] as? Int64 ?? 0,
+            peakBytes: mem["peak_bytes"] as? Int64 ?? 0,
+            availableBytes: mem["available_bytes"] as? Int64 ?? 0,
+            maxSafeContext: mem["max_safe_context"] as? Int ?? 0
+        )
+    }
 
     static func format(_ bytes: Int64) -> String {
         let gb = Double(bytes) / (1024 * 1024 * 1024)
@@ -552,6 +592,10 @@ let gemmaModelOptions: [GemmaModelOption] = [
     // 31B: 31B dense — fits 36 GB+ Macs (4-bit) or 48 GB+ (8-bit)
     GemmaModelOption(id: "31b-4bit", displayName: "Gemma 4 31B (4-bit)", repoId: "mlx-community/gemma-4-31b-it-4bit", sizeEstimate: "~18.4 GB, needs 36 GB+ RAM"),
     GemmaModelOption(id: "31b-8bit", displayName: "Gemma 4 31B (8-bit)", repoId: "mlx-community/gemma-4-31b-it-8bit", sizeEstimate: "~33.8 GB, needs 48 GB+ RAM"),
+    // Qwen 3.6 27B dense (4-bit) with a native MTP head — fits 24 GB+ Macs. Ships
+    // an mtp/weights.safetensors sidecar; the server auto-loads it for multi-token
+    // speculative decode (~1.1–1.4× decode on agent/code workloads).
+    GemmaModelOption(id: "qwen36-27b-4bit-mtp", displayName: "Qwen 3.6 27B (4-bit, MTP)", repoId: "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", sizeEstimate: "~16.6 GB, needs 24 GB+ RAM"),
     // DeepSeek-V4-Flash via ds4 GGUF — 96 GB+ Macs only. Served by the embedded
     // ds4 engine (antirez/ds4) rather than the MLX/safetensors path.
     GemmaModelOption(

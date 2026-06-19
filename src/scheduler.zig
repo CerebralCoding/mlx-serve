@@ -1708,18 +1708,29 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
 }
 
 /// Pure: would loading `weights_bytes` of model with `avail_bytes` free RAM risk
-/// a Metal OOM? Requires the weights plus ~1/7 (≈15%) + 1 GB headroom for the
-/// warmup KV cache + compute buffers. Returns false (allow the load) when either
-/// figure is 0 — a failed memory query must never block a load.
+/// a Metal OOM? Requires the weights plus ~1/12 (≈8%) + 0.25 GB headroom for the
+/// warmup KV cache + compute buffers. Deliberately lean: `avail_bytes` (active +
+/// wired + compressed subtracted) under-counts what macOS reclaims from file
+/// cache the moment MLX allocates, so a fat headroom wrongly refuses loads that
+/// fit. The guard's real job is the gross case (restart a 42 GB model into 44 GB
+/// free → hard process-killing OOM), which this still catches. Returns false
+/// (allow the load) when either figure is 0 — a failed memory query must never
+/// block a load.
 fn memInsufficientForLoad(weights_bytes: u64, avail_bytes: u64) bool {
     if (weights_bytes == 0 or avail_bytes == 0) return false;
-    const headroom: u64 = weights_bytes / 7 + 1024 * 1024 * 1024;
+    const headroom: u64 = weights_bytes / 12 + 256 * 1024 * 1024;
     return avail_bytes < weights_bytes + headroom;
 }
 
 test "memInsufficientForLoad: headroom + unknown-query guards" {
     const GB: u64 = 1024 * 1024 * 1024;
-    // Restart-into-pressure: 42 GB weights, only 44 GB free → needs ~49, refuse.
+    const MB: u64 = 1024 * 1024;
+    // Regression: a 6.9 GB 4-bit model into 8.3 GB free on a 16 GB Mac. The
+    // original weights/7 + 1 GB headroom demanded 8.9 GB and wrongly refused a
+    // load that macOS reclaims file cache to satisfy; weights/12 + 0.25 GB needs
+    // ~7.7 GB → loads. macOS reclaims the small gap from inactive/file-cache pages.
+    try std.testing.expect(!memInsufficientForLoad(6900 * MB, 8300 * MB));
+    // Restart-into-pressure: 42 GB weights, only 44 GB free → needs ~46, refuse.
     try std.testing.expect(memInsufficientForLoad(42 * GB, 44 * GB));
     // Plenty of headroom → allow.
     try std.testing.expect(!memInsufficientForLoad(42 * GB, 86 * GB));

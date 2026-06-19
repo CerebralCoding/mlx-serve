@@ -16,6 +16,7 @@ app/*.zip
 
 # macOS
 .DS_Store
+*.dmg
 
 # Python
 scripts/__pycache__/
