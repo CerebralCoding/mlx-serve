@@ -37,7 +37,7 @@
     "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
     "codeRepository": "https://github.com/ddalcu/mlx-serve",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "v26.6.10",
+    "softwareVersion": "v26.6.11",
     "author": { "@type": "Person", "name": "David Dalcu" },
     "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio. No Python. MIT licensed.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -50,7 +50,13 @@
       "KV-cache quantization (4-bit, 8-bit, TurboQuant)",
       "Continuous batching",
       "Built-in agent mode with MCP tool calling",
-      "DeepSeek V4 Flash via embedded ds4 engine"
+      "DeepSeek V4 Flash via embedded ds4 engine",
+      "Local image generation (FLUX.2 / FLUX.1)",
+      "Local video generation (LTX-Video, image-to-video)",
+      "Zero-shot voice cloning and local text-to-speech",
+      "Hands-free voice mode with on-device speech recognition",
+      "Scheduled agent tasks (recurring, unattended)",
+      "Telegram bot bridge for chatting from your phone"
     ]
   }
   </script>
@@ -1049,7 +1055,7 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.6.10</span>
+      <span class="nav-ver">v26.6.11</span>
     </a>
     <ul class="nav-links">
       <li><a href="#performance" class="hide-mobile">Performance</a></li>
@@ -1068,9 +1074,9 @@
   <!-- HERO -->
   <section class="hero">
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
-    <a href="https://github.com/ddalcu/mlx-serve/releases/tag/v26.6.10" class="hero-badge">
-      <span class="new-pill">v26.6.10</span>
-      DiffusionGemma · Qwen MTP · NVFP4 · Document RAG — now shipping
+    <a href="https://github.com/ddalcu/mlx-serve/releases/tag/v26.6.11" class="hero-badge">
+      <span class="new-pill">v26.6.11</span>
+      Voice cloning · Gemma 4 · Qwen 3.6 MTP · DeepSeek V4 — now shipping
       <span class="arrow">→</span>
     </a>
     <h1>Run any LLM<br>on your <span class="grad">Mac</span></h1>
@@ -1280,6 +1286,55 @@
         <h3>Document folder RAG</h3>
         <p>Attach a folder of mixed files — notes, PDFs, JSON exports — and ask questions in plain language. GPU-batched embedding (~5× faster indexing) via the server's <code>/v1/embeddings</code> API. Nothing leaves your Mac, nothing written to disk.</p>
       </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #2aabee, #229ed9);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/></svg>
+        </div>
+        <h3>Telegram bot — model in your pocket</h3>
+        <p>Make a bot, paste its token, flip a switch — and message your local model from your phone, anywhere. No public URL, port-forwarding, or cloud relay; it long-polls over your normal connection, even behind home Wi-Fi. Turn on Agent mode to run tools and edit files from your phone; the bot locks to the first chat that messages it.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #5ac8fa, #0a84ff);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 2a3 3 0 0 0-3 3v7a3 3 0 0 0 6 0V5a3 3 0 0 0-3-3Z"/><path d="M19 10v2a7 7 0 0 1-14 0v-2"/><line x1="12" y1="19" x2="12" y2="22"/></svg>
+        </div>
+        <h3>Hands-free voice mode</h3>
+        <p>Say <b>“Hey Loki”</b> and just talk. Speech is transcribed on-device with Apple's recognizer — audio never leaves your Mac — and the reply is spoken back in a system voice, with barge-in to interrupt mid-answer. Works from the menu bar with no window open; flip on Agent mode to run tools by voice.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #bf5af2, #5e5ce6);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M2 10v4"/><path d="M6 6v12"/><path d="M10 3v18"/><path d="M14 8v8"/><path d="M18 5v14"/><path d="M22 10v4"/></svg>
+        </div>
+        <h3>Voice cloning &amp; TTS</h3>
+        <p>Give it 6–8 seconds of any voice and it speaks your text in that voice — zero-shot, no training. Runs fully local on MOSS-TTS or Qwen3-TTS with adjustable speed and expressiveness, and auto-transcribes the reference with Whisper if you skip it.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #ff9f0a, #ff375f);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2" ry="2"/><circle cx="9" cy="9" r="2"/><path d="m21 15-3.1-3.1a2 2 0 0 0-2.8 0L6 21"/></svg>
+        </div>
+        <h3>Image generation</h3>
+        <p>FLUX.2 and FLUX.1 (schnell / dev) run locally through MLX — text-to-image across eight aspect ratios up to 1536 px, with negative prompts and Fast → Super-Quality presets. Outputs straight to PNG; nothing leaves your Mac.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #ff453a, #ff9f0a);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="m22 8-6 4 6 4V8Z"/><rect x="2" y="6" width="14" height="12" rx="2" ry="2"/></svg>
+        </div>
+        <h3>Video generation</h3>
+        <p>LTX-Video 2.3 turns a prompt — or a first frame — into a ~4-second 24 fps clip with synced audio, all on-device. Image-to-video conditioning, and one- or two-stage pipelines that trade speed for quality. Outputs MP4.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #30d158, #0a84ff);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="4" width="18" height="18" rx="2"/><line x1="16" y1="2" x2="16" y2="6"/><line x1="8" y1="2" x2="8" y2="6"/><line x1="3" y1="10" x2="21" y2="10"/><path d="m9 16 2 2 4-4"/></svg>
+        </div>
+        <h3>Agents on a schedule</h3>
+        <p>Define a task once and let it run unattended — once, on an interval, daily, or weekly — even with no window open. Each run is a full agent with tool access (auto-approve or approve per call) and a saved transcript you can read back.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #1d1d1f, #5e5ce6);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
+        </div>
+        <h3>One-click coding agents</h3>
+        <p>Point Claude Code, pi, or OpenCode at your local model from a folder picker — the app wires up the environment and routes every request to mlx-serve. Real coding agents, your code and prompts never leaving your machine.</p>
+      </div>
     </div>
   </section>
 
@@ -1476,7 +1531,7 @@
       <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/stargazers" target="_blank" rel="noopener">★ Star</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.6.10</span> · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.6.11</span> · built for Apple Silicon</p>
   </footer>
 
   <script>
