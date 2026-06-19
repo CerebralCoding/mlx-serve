@@ -349,6 +349,24 @@ private struct MicButton: View {
     }
 }
 
+/// What a pasted/dropped file URL should become, by extension + directory flag.
+/// A top-level (non-`@MainActor`) type so the routing is unit-testable without
+/// the rendered view — it mirrors the attach button's dispatch (see ChatPasteTests).
+enum PasteFileKind: String, Equatable {
+    case folder, pdf, audio, image, unhandled
+
+    static func classify(ext: String, isDirectory: Bool, audioSupported: Bool) -> PasteFileKind {
+        if isDirectory { return .folder }
+        let e = ext.lowercased()
+        if e == "pdf" { return .pdf }
+        if let ut = UTType(filenameExtension: e) {
+            if ut.conforms(to: .audio) { return audioSupported ? .audio : .unhandled }
+            if ut.conforms(to: .image) { return .image }
+        }
+        return .unhandled
+    }
+}
+
 struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
@@ -491,6 +509,7 @@ struct ChatDetailView: View {
     @State private var scrollViewHeight: CGFloat = 0
     @State private var contentBottom: CGFloat = 0
     @State private var scrollMonitor: Any?
+    @State private var pasteMonitor: Any?
     @State private var pendingImages: [NSImage] = []
     @State private var pendingPDFs: [(name: String, text: String)] = []
     @State private var pendingAudio: [ChatAudio] = []
@@ -905,6 +924,16 @@ struct ChatDetailView: View {
                 }
                 return event
             }
+            // Cmd+V into the focused chat input: if the clipboard holds an image,
+            // PDF, or folder, attach it (same as the attach button / drag-drop)
+            // and swallow the paste; plain text still pastes into the field.
+            pasteMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { event in
+                guard inputFocused,
+                      event.modifierFlags.intersection(.deviceIndependentFlagsMask) == .command,
+                      event.charactersIgnoringModifiers == "v"
+                else { return event }
+                return pasteAttachmentsFromClipboard() ? nil : event
+            }
         }
         .onDisappear {
             // Generation lives on the app-level engine now — closing the chat
@@ -914,6 +943,10 @@ struct ChatDetailView: View {
             if let monitor = scrollMonitor {
                 NSEvent.removeMonitor(monitor)
                 scrollMonitor = nil
+            }
+            if let monitor = pasteMonitor {
+                NSEvent.removeMonitor(monitor)
+                pasteMonitor = nil
             }
         }
         .onChange(of: isAgentMode) { _, newValue in
@@ -945,17 +978,70 @@ struct ChatDetailView: View {
         panel.prompt = "Attach"
         panel.begin { response in
             guard response == .OK, let url = panel.url else { return }
-            DispatchQueue.main.async {
-                appState.documentIndexes[sessionId]?.cancel()
-                // Embeds on the local server's GPU; auto-downloads the
-                // default encoder model (35 MB, one-time) when none is
-                // available. Server down → lexical-only retrieval.
-                let index = DocumentIndex(folderURL: url,
-                                          embedderProvider: ServerEmbedding.autoProvider(port: server.port))
-                appState.documentIndexes[sessionId] = index
-                index.startIndexing()
-            }
+            DispatchQueue.main.async { attachDocumentFolder(url) }
         }
+    }
+
+    /// Index a folder for mini-RAG. Shared by the folder picker and paste/drop so
+    /// every entry point behaves identically. Embeds on the local server's GPU;
+    /// auto-downloads the default encoder model (35 MB, one-time) when none is
+    /// available. Server down → lexical-only retrieval. Must run on the main actor.
+    private func attachDocumentFolder(_ url: URL) {
+        appState.documentIndexes[sessionId]?.cancel()
+        let index = DocumentIndex(folderURL: url,
+                                  embedderProvider: ServerEmbedding.autoProvider(port: server.port))
+        appState.documentIndexes[sessionId] = index
+        index.startIndexing()
+    }
+
+    // MARK: - Paste-to-attach
+
+    /// Route the current clipboard to the same pending-attachment lists as the
+    /// attach button (image / PDF / audio) and the folder picker (mini-RAG).
+    /// Returns true when something was attached, so the caller can swallow the
+    /// Cmd+V instead of letting it fall through to the text field.
+    private func pasteAttachmentsFromClipboard() -> Bool {
+        let pb = NSPasteboard.general
+        var handled = false
+        // Finder copies (folder / PDF / image file / audio file) arrive as real
+        // file URLs — read them directly (NOT loadFileRepresentation) so a pasted
+        // folder is indexed in place rather than as a sandboxed temp copy.
+        if let urls = pb.readObjects(forClasses: [NSURL.self],
+                                     options: [.urlReadingFileURLsOnly: true]) as? [URL] {
+            for url in urls where attachFileURL(url) { handled = true }
+        }
+        if handled { return true }
+        // Raw image data (screenshots, copy-image-from-a-browser) — no file URL.
+        if let image = NSImage(pasteboard: pb) {
+            pendingImages.append(image)
+            return true
+        }
+        return false
+    }
+
+    /// Dispatch one file URL to the matching attachment path. Returns false for
+    /// unsupported types so the caller leaves the paste alone.
+    private func attachFileURL(_ url: URL) -> Bool {
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: url.path, isDirectory: &isDir) else { return false }
+        switch PasteFileKind.classify(ext: url.pathExtension, isDirectory: isDir.boolValue, audioSupported: audioSupported) {
+        case .folder:
+            attachDocumentFolder(url)
+        case .pdf:
+            if let text = Self.extractPDFText(from: url) {
+                pendingPDFs.append((name: url.lastPathComponent, text: text))
+            } else {
+                showPDFError(url.lastPathComponent)
+            }
+        case .audio:
+            addAudioAttachment(url)
+        case .image:
+            guard let image = NSImage(contentsOf: url) else { return false }
+            pendingImages.append(image)
+        case .unhandled:
+            return false
+        }
+        return true
     }
 
     // MARK: - Image Helpers
