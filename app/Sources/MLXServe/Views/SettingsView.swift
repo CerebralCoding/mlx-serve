@@ -168,7 +168,7 @@ private struct RestartBanner: View {
 /// Renders the engine-specific section set for the active model:
 ///   - MLX target:   Common Performance + MLX Performance + MLX Spec Decode
 ///   - GGUF target:  Common Performance + GGUF Performance
-///   - DSV4 target:  Common Performance only
+///   - DSV4 target:  Common Performance + DeepSeek-V4 (ds4) section
 ///   - No model yet: All sections shown (so users can pre-tune before
 ///                   loading); a banner clarifies that some controls only
 ///                   apply once a matching engine is loaded.
@@ -199,6 +199,7 @@ private struct EngineAwareSections: View {
         // the user can pre-tune; otherwise show only the matching set.
         let showMLX = (engine == nil || engine == .mlx)
         let showLlama = (engine == nil || engine == .llama)
+        let showDs4 = (engine == nil || engine == .dsv4)
 
         if showMLX {
             SettingsSection(
@@ -221,6 +222,15 @@ private struct EngineAwareSections: View {
                 subtitle: "Knobs that apply when an embedded llama.cpp engine is serving a `.gguf` model. Distinct from the MLX Performance section — different kernels, different KV layout."
             ) {
                 LlamaPerformanceSectionContent()
+            }
+        }
+
+        if showDs4 {
+            SettingsSection(
+                title: "DeepSeek-V4 (ds4 engine)",
+                subtitle: "Knobs for the embedded ds4 engine serving DeepSeek-V4-Flash. Ignored by the MLX and llama.cpp engines."
+            ) {
+                Ds4PerformanceSectionContent()
             }
         }
 
@@ -851,6 +861,37 @@ private struct LlamaPerformanceSectionContent: View {
                     Text("\(appState.serverOptions.llamaCacheEntries)")
                         .font(.body.monospacedDigit())
                 }
+            }
+        }
+    }
+}
+
+// MARK: - ds4 (DeepSeek-V4-Flash) performance section
+
+/// Knobs specific to the embedded ds4 engine — surfaced only when the active
+/// model loaded through that path (DeepSeek-V4-Flash GGUF), or pre-load when
+/// no engine has been chosen yet. Today this is just SSD weight streaming:
+/// the lever that lets a model larger than RAM load by streaming experts off
+/// disk instead of OOMing at warmup (issue #39).
+private struct Ds4PerformanceSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+    }
+
+    var body: some View {
+        if let m = meta["ssdStreaming"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.ssdStreaming)
+            ) {
+                Toggle("", isOn: $appState.serverOptions.ssdStreaming)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
             }
         }
     }

@@ -73,6 +73,15 @@ struct ServerOptions: Codable, Equatable {
     /// "ServerOptions defaults must mirror the Zig server" gotcha in CLAUDE.md).
     var llamaCacheEntries: Int = 4
 
+    // MARK: ds4-only (DeepSeek-V4-Flash engine)
+    /// When true, launch with `--ssd-streaming` so the embedded ds4 engine
+    /// streams expert weights from SSD instead of holding the whole model
+    /// resident (skips full residency + Metal warmup). Lets DeepSeek-V4-Flash
+    /// run on a Mac whose RAM can't hold the full model. ds4-only — the MLX and
+    /// llama.cpp engines ignore the flag. Default off mirrors main.zig
+    /// `ds4_ssd_streaming = false`.
+    var ssdStreaming: Bool = false
+
     // MARK: All engines
     /// Per-LoadedModel LRU cache of chat-template render + tokenize
     /// results. Applies to MLX, llama.cpp, and ds4 — same handler
@@ -254,6 +263,7 @@ struct ServerOptions: Codable, Equatable {
         skipMemPreflight == other.skipMemPreflight &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
+        ssdStreaming == other.ssdStreaming &&
         tokenizeCacheEntries == other.tokenizeCacheEntries &&
         // Sampling defaults are ALSO launch flags (server-side defaults for
         // clients that omit sampling, e.g. Claude Code) — changing them must
@@ -372,6 +382,12 @@ struct ServerOptions: Codable, Equatable {
         if skipMemPreflight {
             args += ["--skip-mem-preflight"]
         }
+        // ds4-only opt-in: stream DeepSeek-V4-Flash experts from SSD. The MLX
+        // and llama.cpp engines ignore the flag, so it's safe to leave in argv
+        // across engine switches; omitted by default to keep full residency.
+        if ssdStreaming {
+            args += ["--ssd-streaming"]
+        }
         return args
     }
 
@@ -446,6 +462,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .ssdStreaming) { ssdStreaming = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .tokenizeCacheEntries) { tokenizeCacheEntries = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .defaultMaxTokens) { defaultMaxTokens = v }
         if let v = try c.decodeIfPresent(Double.self, forKey: .defaultTemperature) { defaultTemperature = v }
@@ -563,6 +580,10 @@ extension ServerOptions {
         "llamaCacheEntries": .init(
             title: "Session cache entries",
             explainer: "How many independent llama.cpp KV contexts to keep resident. 1 = legacy single-session (every flip between long prompts evicts the other). >1 keeps the N most-recently-used prompts hot — alternating multi-doc workloads stop cold-prefilling on every flip.",
+            needsRestart: true),
+        "ssdStreaming": .init(
+            title: "SSD weight streaming",
+            explainer: "Stream DeepSeek-V4-Flash expert weights from SSD instead of holding the whole model in RAM (skips full residency + warmup). Turn on when the model is larger than available memory — it loads instead of OOMing, trading some decode speed for the disk reads. ds4 / DeepSeek-V4-Flash only; ignored by the MLX and llama.cpp engines. Passes --ssd-streaming.",
             needsRestart: true),
         "tokenizeCacheEntries": .init(
             title: "Tokenize cache entries",

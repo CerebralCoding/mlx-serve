@@ -57,6 +57,7 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.llamaKvQuant, .off)          // server.zig llama_kv_quant
         XCTAssertEqual(d.llamaCacheEntries, 4)        // server.zig llama_cache_entries
         XCTAssertEqual(d.skipMemPreflight, false)     // scheduler.zig skip_mem_preflight
+        XCTAssertEqual(d.ssdStreaming, false)         // main.zig ds4_ssd_streaming
 
         // Corollary: with defaults matching the server, a fresh launch omits
         // every match-default flag (each guard fires only on a real change).
@@ -64,7 +65,7 @@ final class ServerOptionsTests: XCTestCase {
         for flag in ["--ctx-size", "--timeout", "--no-vision", "--max-concurrent",
                      "--kv-quant", "--prefix-cache-mem", "--tokenize-cache-entries",
                      "--llama-kv-quant", "--llama-cache-entries", "--skip-mem-preflight",
-                     "--top-k", "--drafter"] {
+                     "--ssd-streaming", "--top-k", "--drafter"] {
             XCTAssertFalse(args.contains(flag),
                 "\(flag) appeared at default — its Swift default or emit-guard drifted from the server")
         }
@@ -454,6 +455,7 @@ extension ServerOptionsTests {
         o.prefixCacheEntries = 3   // off the default (8) so the round-trip moves it
         o.prefixCacheMem = "4GB"
         o.skipMemPreflight = true
+        o.ssdStreaming = true
         o.llamaKvQuant = .q8
         o.llamaCacheEntries = 2   // off the default (4) so the round-trip moves it
         o.tokenizeCacheEntries = 16
@@ -532,5 +534,71 @@ extension ServerOptionsTests {
                        "toggling the memory pre-flight must require a server restart")
         a.skipMemPreflight = true
         XCTAssertTrue(a.serverLaunchEquals(b))
+    }
+}
+
+extension ServerOptionsTests {
+    // MARK: - ds4 SSD weight-streaming CLI flag (--ssd-streaming, issue #39)
+    //
+    // DeepSeek-V4-Flash can be larger than RAM; --ssd-streaming makes the
+    // embedded ds4 engine stream expert weights from SSD instead of holding the
+    // full model resident (skips warmup + residency). ds4-only — the MLX and
+    // llama.cpp engines ignore it. Same bare-boolean shape as --skip-mem-preflight,
+    // so it shows in --help, in `ps`, and in the launch-command echo.
+
+    func testSsdStreamingDefaultsOff() {
+        // Mirrors main.zig `var ds4_ssd_streaming: bool = false` — the Swift
+        // default must equal the server default (see the defaults-mirror gotcha).
+        XCTAssertFalse(ServerOptions().ssdStreaming,
+                       "ds4 SSD streaming must be opt-in")
+    }
+
+    func testSsdStreamingOmittedByDefault() {
+        XCTAssertFalse(ServerOptions().toCLIArgs().contains("--ssd-streaming"),
+                       "default (off) must not emit the flag")
+    }
+
+    func testSsdStreamingEmitsFlagWhenOn() {
+        var opts = ServerOptions()
+        opts.ssdStreaming = true
+        XCTAssertTrue(opts.toCLIArgs().contains("--ssd-streaming"))
+    }
+
+    func testSsdStreamingTakesNoValueArg() {
+        var opts = ServerOptions()
+        opts.ssdStreaming = true
+        let args = opts.toCLIArgs()
+        guard let i = args.firstIndex(of: "--ssd-streaming") else {
+            return XCTFail("flag missing")
+        }
+        // Bare boolean flag — the next token must be another flag (or end),
+        // never a value the server would mis-parse.
+        if i + 1 < args.count {
+            XCTAssertTrue(args[i + 1].hasPrefix("--"),
+                          "boolean flag must not be followed by a value token")
+        }
+    }
+
+    func testSsdStreamingChangeTriggersRestart() {
+        var a = ServerOptions()
+        var b = ServerOptions()
+        b.ssdStreaming = true
+        XCTAssertFalse(a.serverLaunchEquals(b),
+                       "toggling ds4 SSD streaming must require a server restart")
+        a.ssdStreaming = true
+        XCTAssertTrue(a.serverLaunchEquals(b))
+    }
+
+    /// The ds4 Settings section renders via `if let m = serverFlagFields["ssdStreaming"]`
+    /// — a missing key would silently drop the toggle from the UI with no error.
+    /// Pin the metadata's presence + restart flag (the testable slice of the
+    /// otherwise-untestable SwiftUI wiring).
+    func testSsdStreamingHasSettingsMetadata() {
+        guard let field = ServerOptions.serverFlagFields["ssdStreaming"] else {
+            return XCTFail("ssdStreaming metadata missing — the Settings toggle would silently disappear")
+        }
+        XCTAssertFalse(field.title.isEmpty)
+        XCTAssertFalse(field.explainer.isEmpty)
+        XCTAssertTrue(field.needsRestart, "ssd-streaming is a launch flag — must flag a restart")
     }
 }
