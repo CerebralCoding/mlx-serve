@@ -119,6 +119,7 @@ struct MLXCoreApp: App {
                 .environmentObject(appState.mcpManager)
                 .environmentObject(appState.chatEngine)
                 .environmentObject(appState.voice)
+                .environmentObject(appState.processRegistry)
                 .frame(minWidth: 700, minHeight: 500)
                 .onDisappear {
                     Task { await appState.mcpManager.stopAll() }
@@ -205,11 +206,26 @@ struct MLXCoreApp: App {
                 }
                 .keyboardShortcut("p", modifiers: [.command, .shift])
 
+                // Pull in the latest built-in default when ours has moved ahead of
+                // the on-disk copy. Backs up the user's current prompt first.
+                Button("Update System Prompt to Latest…") {
+                    AgentPrompt.runSystemPromptUpdateFlow()
+                }
+                .disabled(!AgentPrompt.isSystemPromptOutdated())
+
                 Button("Open Memory File") {
                     let path = NSString(string: "~/.mlx-serve/memory.md").expandingTildeInPath
                     if !FileManager.default.fileExists(atPath: path) {
                         try? "".write(toFile: path, atomically: true, encoding: .utf8)
                     }
+                    NSWorkspace.shared.open(URL(fileURLWithPath: path))
+                }
+
+                Button("Open Skills Folder") {
+                    // Accessing the shared manager seeds the example skill on
+                    // first run; the create is a no-op if it already exists.
+                    let path = AgentPrompt.skillManager.skillsDirectory
+                    try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
                     NSWorkspace.shared.open(URL(fileURLWithPath: path))
                 }
 

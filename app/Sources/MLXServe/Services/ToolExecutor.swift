@@ -25,48 +25,122 @@ protocol ToolHandler: Sendable {
 // MARK: - Shell
 
 struct ShellHandler: ToolHandler {
-    /// Max wall-clock before the command is killed. Long enough for real
-    /// installs/builds (`npm install`), bounded so a hang can't stall the agent.
-    /// Injectable so tests can use a short bound.
+    /// Max wall-clock before a FOREGROUND command is dealt with. Long enough for
+    /// real installs/builds (`npm install`), bounded so a hang can't stall the
+    /// agent. Injectable so tests can use a short bound.
     var timeoutSeconds: Double = 120
+
+    /// When present, `run_in_background:"true"` registers a managed process and
+    /// returns instantly, and a foreground command still alive at the timeout is
+    /// ADOPTED (never killed) instead of being terminated. Absent (e.g. older
+    /// call sites / unit tests that don't inject one) → today's behavior:
+    /// foreground only, killed at the timeout.
+    var registry: ProcessRegistry? = nil
+    /// The chat session the spawned process belongs to (for scoped cleanup).
+    var sessionId: UUID? = nil
+    /// Out-parameter for the handle of any process started/adopted by this call,
+    /// so the caller can surface it on `ToolResult.backgroundHandle`.
+    var handleBox: ProcessHandleBox? = nil
 
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         guard let command = parameters["command"] else {
             throw ToolError.missingParameter("command")
         }
+        let cwd = workingDirectory ?? FileManager.default.currentDirectoryPath
+
+        // Background detection is model-agnostic: either the explicit flag OR a
+        // trailing `&` in the command. Small models won't set the flag — they
+        // just write `python3 -m http.server &` — so we treat that identically.
+        // The flag itself is read leniently because models send `true`, `"true"`,
+        // `1`, `"1"`, `yes`, … (all stringify into arguments) — accepting only
+        // the literal `"true"` silently dropped capable models into the 120s
+        // foreground/adopt path. No prompt-following required; handled in code.
+        let wantsBackground = Self.isTruthyFlag(parameters["run_in_background"])
+        let hasTrailingAmp = Self.hasTrailingBackgroundOperator(command)
+        if registry != nil, wantsBackground || hasTrailingAmp {
+            return await startInBackground(command: command, cwd: cwd, workingDirectory: workingDirectory)
+        }
+        // Explicit flag but no registry wired → graceful error (preserves the
+        // old contract). A bare `&` with no registry just runs foreground as
+        // before — nothing to manage it, but no worse than today.
+        if wantsBackground {
+            return ShellMessages.backgroundUnavailable(cwd: cwd, seconds: Int(timeoutSeconds))
+        }
+        return try await runForeground(command: command, cwd: cwd, workingDirectory: workingDirectory)
+    }
+
+    /// Register a long-lived command with the process registry and return at once
+    /// so the assistant keeps talking while it runs.
+    private func startInBackground(command: String, cwd: String, workingDirectory: String?) async -> String {
+        guard let registry else {
+            return ShellMessages.backgroundUnavailable(cwd: cwd, seconds: Int(timeoutSeconds))
+        }
+        // Strip a trailing `&`: backgrounding INSIDE the login shell makes the
+        // shell exit immediately, so the tracked pid becomes a dead shell while
+        // the real server is orphaned beyond the registry's reach (killProcess /
+        // kill X / session+quit cleanup all silently miss it). Stripping it lets
+        // the shell exec-replace into the process so the tracked pid IS the
+        // server (and child cleanup walks the live subtree — see ProcessRegistry).
+        let cleaned = Self.stripTrailingBackgroundOperator(command)
+        let info: (handle: String, pid: Int32) = await MainActor.run {
+            let managed = registry.start(command: cleaned, workingDirectory: workingDirectory, sessionId: sessionId)
+            return (managed.handle, managed.pid)
+        }
+        handleBox?.set(info.handle)
+        return ShellMessages.started(cwd: cwd, handle: info.handle, pid: info.pid)
+    }
+
+    /// Lenient truthy read for a string-typed boolean tool flag. Tool arguments
+    /// are stringified, and models emit `true`/`1`/`yes`/`on` (any casing) — so
+    /// the flag must accept all of them, not just the literal `"true"`.
+    static func isTruthyFlag(_ value: String?) -> Bool {
+        guard let v = value?.trimmingCharacters(in: .whitespaces).lowercased() else { return false }
+        return v == "true" || v == "1" || v == "yes" || v == "y" || v == "on"
+    }
+
+    /// True when the command ends with a single shell background operator (`… &`)
+    /// — the model's "run this in the background" signal, with or without the
+    /// `run_in_background` flag. `&&` (logical-AND) is not a background operator.
+    static func hasTrailingBackgroundOperator(_ command: String) -> Bool {
+        let trimmed = command.trimmingCharacters(in: .whitespaces)
+        return trimmed.hasSuffix("&") && !trimmed.hasSuffix("&&")
+    }
+
+    /// Drop a single trailing shell background operator (`… &`). Leaves `&&` and
+    /// inner `&` untouched. Pure + testable.
+    static func stripTrailingBackgroundOperator(_ command: String) -> String {
+        guard hasTrailingBackgroundOperator(command) else { return command }
+        let trimmed = command.trimmingCharacters(in: .whitespaces)
+        return String(trimmed.dropLast()).trimmingCharacters(in: .whitespaces)
+    }
+
+    /// Foreground execution with the timeout backstop. A command still alive at
+    /// the timeout is adopted by the registry (never killed) when one is present;
+    /// with no registry it's killed and reported — today's behavior.
+    private func runForeground(command: String, cwd: String, workingDirectory: String?) async throws -> String {
         let timeout = timeoutSeconds
+        let registry = self.registry
+        let sessionId = self.sessionId
+        let handleBox = self.handleBox
 
-        return try await withCheckedThrowingContinuation { continuation in
+        return try await withCheckedThrowingContinuation { (continuation: CheckedContinuation<String, Error>) in
             DispatchQueue.global(qos: .userInitiated).async {
-                let process = Process()
-                process.executableURL = URL(fileURLWithPath: "/bin/zsh")
-                process.arguments = ["-l", "-c", command]
-                if let wd = workingDirectory {
-                    process.currentDirectoryURL = URL(fileURLWithPath: wd)
-                }
-
-                let outPipe = Pipe()
-                let errPipe = Pipe()
-                process.standardOutput = outPipe
-                process.standardError = errPipe
-                // Close stdin: an interactive prompt (e.g. `npx sv create`) then
-                // hits EOF and fails fast instead of hanging the agent forever.
-                process.standardInput = FileHandle.nullDevice
+                let process = ProcessRegistry.makeProcess(command: command, workingDirectory: workingDirectory)
+                let outPipe = process.standardOutput as! Pipe
+                let errPipe = process.standardError as! Pipe
 
                 // Read both pipes incrementally so a kill never blocks on
                 // `readDataToEndOfFile` waiting for orphaned grandchildren
                 // (e.g. node spawned by npx) to release the write end.
-                let lock = NSLock()
-                var outData = Data()
-                var errData = Data()
-                outPipe.fileHandleForReading.readabilityHandler = { h in
-                    let d = h.availableData
-                    if !d.isEmpty { lock.lock(); outData.append(d); lock.unlock() }
-                }
-                errPipe.fileHandleForReading.readabilityHandler = { h in
-                    let d = h.availableData
-                    if !d.isEmpty { lock.lock(); errData.append(d); lock.unlock() }
-                }
+                let cap = ShellCapture()
+                outPipe.fileHandleForReading.readabilityHandler = { h in cap.appendOut(h.availableData) }
+                errPipe.fileHandleForReading.readabilityHandler = { h in cap.appendErr(h.availableData) }
+
+                // Signal exit via terminationHandler + a bounded semaphore wait
+                // (NOT waitUntilExit) so a never-exiting server releases this
+                // worker thread at the timeout instead of leaking it forever.
+                let exitSem = DispatchSemaphore(value: 0)
+                process.terminationHandler = { _ in exitSem.signal() }
 
                 do {
                     try process.run()
@@ -74,47 +148,132 @@ struct ShellHandler: ToolHandler {
                     continuation.resume(throwing: error)
                     return
                 }
-
                 let pid = process.processIdentifier
-                var didTimeout = false
-                let timeoutWork = DispatchWorkItem {
-                    if process.isRunning {
-                        didTimeout = true
+
+                // Single-resume guard: the adopt branch resumes from a hopped
+                // MainActor task, so a near-simultaneous real exit must not
+                // double-resume the continuation.
+                let resumed = ManagedAtomicFlag()
+                let finish: (String) -> Void = { s in
+                    if resumed.testAndSet() { continuation.resume(returning: s) }
+                }
+
+                let timedOut = exitSem.wait(timeout: .now() + timeout) == .timedOut
+
+                // Raced exit: the wait timed out but the process actually
+                // finished right at the deadline → fall through to clean completion.
+                if timedOut && process.isRunning {
+                    outPipe.fileHandleForReading.readabilityHandler = nil
+                    errPipe.fileHandleForReading.readabilityHandler = nil
+                    if let registry {
+                        let prior = cap.combined()
+                        Task { @MainActor in
+                            let managed = registry.adopt(process: process, command: command,
+                                                         workingDirectory: workingDirectory,
+                                                         sessionId: sessionId, priorOutput: prior)
+                            handleBox?.set(managed.handle)
+                            finish(ShellMessages.adopted(cwd: cwd, handle: managed.handle,
+                                                         pid: managed.pid, seconds: Int(timeout)))
+                        }
+                    } else {
                         process.terminate()
                         kill(pid, SIGKILL)
+                        finish(ShellMessages.timedOutKilled(cwd: cwd, seconds: Int(timeout),
+                                                            body: cap.foregroundBody()))
                     }
+                    return
                 }
-                DispatchQueue.global().asyncAfter(deadline: .now() + timeout, execute: timeoutWork)
 
-                process.waitUntilExit()
-                timeoutWork.cancel()
+                // Clean exit (or raced exit at the deadline).
+                process.terminationHandler = nil
                 outPipe.fileHandleForReading.readabilityHandler = nil
                 errPipe.fileHandleForReading.readabilityHandler = nil
                 // On a clean exit the pipe EOFs promptly, so drain any final
-                // chunk the handler hadn't delivered yet. Skip this on timeout —
-                // orphaned children may hold the write end open and block it.
-                if !didTimeout {
-                    if let d = try? outPipe.fileHandleForReading.readToEnd() { lock.lock(); outData.append(d); lock.unlock() }
-                    if let d = try? errPipe.fileHandleForReading.readToEnd() { lock.lock(); errData.append(d); lock.unlock() }
-                }
+                // chunk the handler hadn't delivered yet.
+                cap.appendOut(try? outPipe.fileHandleForReading.readToEnd())
+                cap.appendErr(try? errPipe.fileHandleForReading.readToEnd())
 
-                lock.lock(); let o = outData; let e = errData; lock.unlock()
-                var result = String(data: o, encoding: .utf8) ?? ""
-                let errStr = String(data: e, encoding: .utf8) ?? ""
-
-                if !errStr.isEmpty { result += "\n[stderr]: \(errStr)" }
-                if didTimeout {
-                    result += "\n[timed out after \(Int(timeout))s and was killed. If this command waits for input, re-run it with non-interactive flags — it cannot read stdin. If it is a long-running server (e.g. a dev server), don't start it from the agent.]"
-                } else if process.terminationStatus != 0 {
-                    result += "\n[exit code: \(process.terminationStatus)]"
-                } else if result.isEmpty {
-                    result = "OK"
-                }
-                // Prepend cwd so the model knows where the command ran
-                let cwd = process.currentDirectoryURL?.path ?? FileManager.default.currentDirectoryPath
-                continuation.resume(returning: "[cwd: \(cwd)]\n\(result)")
+                finish(ShellMessages.completed(cwd: cwd, body: cap.foregroundBody(),
+                                               exitCode: process.terminationStatus))
             }
         }
+    }
+}
+
+/// Thread-safe stdout/stderr accumulator for the foreground shell path. Keeps the
+/// readability-handler closures trivial and the message-shaping logic out of the
+/// large `runForeground` body the type-checker has to chew through.
+final class ShellCapture: @unchecked Sendable {
+    private let lock = NSLock()
+    private var out = Data()
+    private var err = Data()
+
+    func appendOut(_ d: Data?) { guard let d, !d.isEmpty else { return }; lock.lock(); out.append(d); lock.unlock() }
+    func appendErr(_ d: Data?) { guard let d, !d.isEmpty else { return }; lock.lock(); err.append(d); lock.unlock() }
+
+    private func snapshot() -> (String, String) {
+        lock.lock(); defer { lock.unlock() }
+        return (String(data: out, encoding: .utf8) ?? "", String(data: err, encoding: .utf8) ?? "")
+    }
+
+    /// stdout followed by stderr — what the registry seeds an adopted process with.
+    func combined() -> String {
+        let (o, e) = snapshot()
+        return e.isEmpty ? o : o + e
+    }
+
+    /// stdout with a trailing `[stderr]: …` section — the foreground result shape.
+    func foregroundBody() -> String {
+        let (o, e) = snapshot()
+        return e.isEmpty ? o : o + "\n[stderr]: \(e)"
+    }
+}
+
+/// Shell tool result strings. Pulled out of the handler so each long interpolated
+/// message is type-checked as an isolated, trivial `String` return instead of
+/// inside the nested closures of `runForeground` — the latter caused a
+/// pathological (multi-minute) type-check of `ShellHandler.execute`.
+enum ShellMessages {
+    static func started(cwd: String, handle: String, pid: Int32) -> String {
+        "[cwd: \(cwd)]\nStarted in background as \(handle) (pid \(pid)). It keeps running — poll it with readProcessOutput {\"handle\": \"\(handle)\"}, stop it with killProcess {\"handle\": \"\(handle)\"}."
+    }
+
+    static func backgroundUnavailable(cwd: String, seconds: Int) -> String {
+        "[cwd: \(cwd)]\nError: background execution isn't available in this context. Run the command in the foreground, or it will be stopped at the \(seconds)s timeout."
+    }
+
+    static func adopted(cwd: String, handle: String, pid: Int32, seconds: Int) -> String {
+        "[cwd: \(cwd)]\nStill running after \(seconds)s — now managed in the background as \(handle) (pid \(pid)), NOT killed. Poll it with readProcessOutput {\"handle\": \"\(handle)\"}, stop it with killProcess {\"handle\": \"\(handle)\"}."
+    }
+
+    static func timedOutKilled(cwd: String, seconds: Int, body: String) -> String {
+        let note = "[timed out after \(seconds)s and was killed. If this command waits for input, re-run it with non-interactive flags — it cannot read stdin. If it is a long-running server, start it with run_in_background:\"true\".]"
+        return "[cwd: \(cwd)]\n\(body)\n\(note)"
+    }
+
+    static func completed(cwd: String, body: String, exitCode: Int32) -> String {
+        var result = body
+        if exitCode != 0 {
+            result += "\n[exit code: \(exitCode)]"
+        } else if result.isEmpty {
+            result = "OK"
+        }
+        return "[cwd: \(cwd)]\n\(result)"
+    }
+}
+
+/// Minimal thread-safe test-and-set flag — guards the shell continuation against
+/// a double resume when the adopt branch and a near-simultaneous real exit race.
+final class ManagedAtomicFlag: @unchecked Sendable {
+    private let lock = NSLock()
+    private var set = false
+    /// Returns true exactly once (the first caller); false thereafter.
+    func testAndSet() -> Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        if set { return false }
+        set = true
+        return true
     }
 }
 
@@ -166,16 +325,46 @@ struct ReadFileHandler: ToolHandler {
 // MARK: - Write File
 
 struct WriteFileHandler: ToolHandler {
+    /// Tolerant boolean for the `append` flag. Models emit it dirty — `"true"`,
+    /// `"true,"` (gemma-4-12b adds a trailing comma), `"True"`, even a leftover
+    /// `"true,\n…"` before normalization peels the body off. Treat any value
+    /// whose first token is `true` (or `1`/`yes`) as append; an exact `== "true"`
+    /// match silently OVERWROTE the file when the model sent `"true,"`.
+    static func appendFlagIsTrue(_ raw: String?) -> Bool {
+        guard let raw else { return false }
+        let v = raw.trimmingCharacters(in: .whitespacesAndNewlines).lowercased()
+        if v == "true" || v == "1" || v == "yes" { return true }
+        // "true" followed immediately by a non-letter (comma/space/newline) →
+        // still append; "truely"/"truthy" (next char a letter) → not append.
+        if v.hasPrefix("true"), let after = v.dropFirst(4).first, !after.isLetter { return true }
+        return false
+    }
+
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
         guard let path = parameters["path"], let content = parameters["content"] else {
             throw ToolError.missingParameter("path and content")
         }
+        // append:true grows a file incrementally — the safe way to write a large
+        // file across multiple tool calls without any one call overrunning the
+        // token budget and getting truncated mid-write (see the writeFile tool
+        // description). Default is overwrite, matching prior behavior. Parsed
+        // tolerantly (see appendFlagIsTrue) — models dirty the flag value.
+        let append = Self.appendFlagIsTrue(parameters["append"])
 
         let fullPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
         let dir = (fullPath as NSString).deletingLastPathComponent
         try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+
+        if append, FileManager.default.fileExists(atPath: fullPath) {
+            let handle = try FileHandle(forWritingTo: URL(fileURLWithPath: fullPath))
+            defer { try? handle.close() }
+            try handle.seekToEnd()
+            try handle.write(contentsOf: Data(content.utf8))
+            return "Appended \(content.count) characters to \(path)"
+        }
+        // Overwrite, or create the file when appending to one that doesn't exist yet.
         try content.write(toFile: fullPath, atomically: true, encoding: .utf8)
-        return "Wrote \(content.count) characters to \(path)"
+        return "Wrote \(content.count) characters to \(path)\(append ? " (new file)" : "")"
     }
 }
 

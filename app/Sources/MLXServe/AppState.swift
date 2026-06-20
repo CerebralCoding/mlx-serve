@@ -74,6 +74,11 @@ class AppState: ObservableObject {
     @Published var pendingVoiceLaunch = false
     @Published var agentMemory = AgentMemory()
     @Published var toolExecutor = ToolExecutor()
+    /// Owns every agent-spawned background process (started via shell
+    /// run_in_background, or adopted by the foreground timeout backstop).
+    /// In-memory only — all processes die with the app (and are reaped on quit
+    /// by the registry's own willTerminate observer).
+    @Published var processRegistry = ProcessRegistry()
     /// Per-session attached document folders (mini RAG). In-memory only — an
     /// index dies with the app and is rebuilt by re-attaching the folder.
     @Published var documentIndexes: [UUID: DocumentIndex] = [:]
@@ -238,7 +243,11 @@ class AppState: ObservableObject {
     var visibleChatSessions: [ChatSession] { Self.sidebarSessions(from: chatSessions) }
 
     func newChatSession() -> UUID {
-        let session = ChatSession()
+        var session = ChatSession()
+        // Seed the new tab's MCP toggle from the global default so a user who
+        // generally runs with MCP on keeps it; Think/Agent start off. Each tab
+        // then remembers its own choice (ChatSession.useMCP/enableThinking).
+        session.useMCP = mcpMode
         chatSessions.insert(session, at: 0)
         activeChatId = session.id
         saveChatHistory()
@@ -246,6 +255,9 @@ class AppState: ObservableObject {
     }
 
     func deleteSession(_ id: UUID) {
+        // Kill any background processes this session started before dropping it —
+        // otherwise they'd survive untracked for the rest of the app's life.
+        processRegistry.killSession(id)
         documentIndexes[id]?.cancel()
         documentIndexes.removeValue(forKey: id)
         chatSessions.removeAll { $0.id == id }
