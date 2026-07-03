@@ -57,16 +57,95 @@ struct ShellHandler: ToolHandler {
         // foreground/adopt path. No prompt-following required; handled in code.
         let wantsBackground = Self.isTruthyFlag(parameters["run_in_background"])
         let hasTrailingAmp = Self.hasTrailingBackgroundOperator(command)
-        if registry != nil, wantsBackground || hasTrailingAmp {
+
+        switch Self.route(sandboxEnabled: AgentSandbox.shared.isEnabled,
+                          wantsBackground: wantsBackground,
+                          hasTrailingAmp: hasTrailingAmp,
+                          hasRegistry: registry != nil) {
+        case .hostBackground:
             return await startInBackground(command: command, cwd: cwd, workingDirectory: workingDirectory)
-        }
-        // Explicit flag but no registry wired → graceful error (preserves the
-        // old contract). A bare `&` with no registry just runs foreground as
-        // before — nothing to manage it, but no worse than today.
-        if wantsBackground {
+        case .hostBackgroundUnavailable:
+            // Explicit flag but no registry wired → graceful error (preserves
+            // the old contract). A bare `&` with no registry just runs
+            // foreground as before — nothing to manage it, but no worse than today.
             return ShellMessages.backgroundUnavailable(cwd: cwd, seconds: Int(timeoutSeconds))
+        case .sandboxBackground:
+            // Sandbox ON + explicit background flag: the command must NOT reach
+            // the host ProcessRegistry (that executes on the host, defeating the
+            // isolation the user opted into). Background it INSIDE the guest —
+            // detached from the shell channel, output appended to a
+            // per-invocation log — then register it as a GUEST-backed managed
+            // process so the chat card shows the SAME running badge + kill X and
+            // readProcessOutput/killProcess work exactly like a host bg process.
+            let logPath = Self.sandboxBackgroundLogPath()
+            let stripped = Self.stripTrailingBackgroundOperator(command)
+            let wrapped = Self.sandboxBackgroundCommand(stripped, logPath: logPath)
+            let execOut = try await AgentSandbox.shared.runForeground(
+                command: wrapped, workingDirectory: workingDirectory, timeout: timeoutSeconds)
+            let pid = Self.parseSandboxBackgroundPID(execOut) ?? 0
+            return await registerSandboxBackground(command: stripped, guestPID: pid,
+                                                    logPath: logPath, cwd: cwd)
+        case .sandboxForeground:
+            // Sandbox ON: run inside the isolated Linux guest. A trailing `&`
+            // rides through unchanged — the guest shell backgrounds it itself.
+            // We do NOT fall back to the host on a sandbox error — the user
+            // opted into isolation.
+            return try await AgentSandbox.shared.runForeground(
+                command: command, workingDirectory: workingDirectory, timeout: timeoutSeconds)
+        case .hostForeground:
+            return try await runForeground(command: command, cwd: cwd, workingDirectory: workingDirectory)
         }
-        return try await runForeground(command: command, cwd: cwd, workingDirectory: workingDirectory)
+    }
+
+    /// Where a shell command executes. Pure decision (unit-tested) so the
+    /// sandbox-vs-host-vs-background routing can't silently regress — the live
+    /// bug was the host-background branch running BEFORE the sandbox check, so
+    /// `run_in_background:"true"` escaped the guest onto the host.
+    enum ShellRoute: Equatable {
+        case hostBackground            // ProcessRegistry-managed host process
+        case hostBackgroundUnavailable // explicit flag, no registry → graceful error
+        case sandboxBackground         // backgrounded INSIDE the guest, log file
+        case sandboxForeground         // normal guest path (guest shell owns any `&`)
+        case hostForeground
+    }
+
+    static func route(sandboxEnabled: Bool, wantsBackground: Bool,
+                      hasTrailingAmp: Bool, hasRegistry: Bool) -> ShellRoute {
+        if sandboxEnabled {
+            // NEVER the host registry while sandboxed — regardless of registry.
+            return wantsBackground ? .sandboxBackground : .sandboxForeground
+        }
+        if hasRegistry, wantsBackground || hasTrailingAmp { return .hostBackground }
+        if wantsBackground { return .hostBackgroundUnavailable }
+        return .hostForeground
+    }
+
+    /// Wrap a command so the GUEST shell backgrounds it: detached from stdin
+    /// (the shell channel) with all output appended to `logPath` inside the
+    /// guest, so the foreground exec returns immediately and the sentinel
+    /// framing stays clean. Echoes the backgrounded job's guest pid on a marker
+    /// line (`__CTN_BGPID=$!`) so the tool can track + kill it like a host bg
+    /// process (parsed back out by `parseSandboxBackgroundPID`).
+    static func sandboxBackgroundCommand(_ command: String, logPath: String) -> String {
+        "(\(command)) </dev/null >>\(logPath) 2>&1 & echo __CTN_BGPID=$!"
+    }
+
+    /// Marker prefix the background wrapper echoes the guest pid on.
+    static let sandboxBGPIDMarker = "__CTN_BGPID="
+
+    /// Pull the guest pid out of the background-launch exec output (the
+    /// `__CTN_BGPID=<pid>` marker line). nil when absent or unparsable — the
+    /// process is still tracked, just without a pid for a guest `kill`.
+    static func parseSandboxBackgroundPID(_ output: String) -> Int32? {
+        guard let range = output.range(of: sandboxBGPIDMarker) else { return nil }
+        let digits = output[range.upperBound...].prefix { $0.isNumber }
+        return Int32(digits)
+    }
+
+    /// Per-invocation guest log path (millisecond timestamp) so concurrent /
+    /// repeated background commands never interleave into one file.
+    static func sandboxBackgroundLogPath(now: Date = Date()) -> String {
+        "/tmp/mlx-bg-\(UInt64(now.timeIntervalSince1970 * 1000)).log"
     }
 
     /// Register a long-lived command with the process registry and return at once
@@ -88,6 +167,27 @@ struct ShellHandler: ToolHandler {
         }
         handleBox?.set(info.handle)
         return ShellMessages.started(cwd: cwd, handle: info.handle, pid: info.pid)
+    }
+
+    /// Register a guest-backed background process with the registry, surface its
+    /// handle on `handleBox` (so the card renders the running badge + kill X), and
+    /// shape the start message. Split out of the `.sandboxBackground` branch so it
+    /// is testable without a live guest: given the parsed guest pid it does the
+    /// registration + messaging. No registry (older call sites / unit tests) →
+    /// today's log-only message, no handle.
+    func registerSandboxBackground(command: String, guestPID: Int32,
+                                   logPath: String, cwd: String) async -> String {
+        guard let registry else {
+            return ShellMessages.sandboxBackgroundStarted(cwd: cwd, handle: nil,
+                                                          logPath: logPath, pid: guestPID)
+        }
+        let handle = await MainActor.run {
+            registry.registerSandboxed(command: command, guestPID: guestPID,
+                                       logPath: logPath, sessionId: sessionId).handle
+        }
+        handleBox?.set(handle)
+        return ShellMessages.sandboxBackgroundStarted(cwd: cwd, handle: handle,
+                                                      logPath: logPath, pid: guestPID)
     }
 
     /// Lenient truthy read for a string-typed boolean tool flag. Tool arguments
@@ -238,6 +338,21 @@ enum ShellMessages {
         "[cwd: \(cwd)]\nStarted in background as \(handle) (pid \(pid)). It keeps running — poll it with readProcessOutput {\"handle\": \"\(handle)\"}, stop it with killProcess {\"handle\": \"\(handle)\"}."
     }
 
+    /// The trailing URL steer is load-bearing: the model composes its "server
+    /// is up at <url>" reply straight from this result. Live 2026-07-02 an
+    /// agent handed the user the Mac's LAN IP (which the loopback-only port
+    /// map can never serve) — the base prompt's `http://<local-ip>:<port>`
+    /// directive won over the env section's localhost hint. That prompt
+    /// conflict is fixed in AgentPrompt; this steer is the belt-and-braces
+    /// layer closest to where the model writes the URL.
+    static func sandboxBackgroundStarted(cwd: String, handle: String?, logPath: String, pid: Int32) -> String {
+        let urlSteer = "If this is a server, every TCP port it listens on inside the sandbox is auto-mapped to the host — the user reaches it at http://localhost:<port> in their browser. When sharing a URL, ALWAYS use http://localhost:<port>, never a LAN or guest IP address."
+        if let handle {
+            return "[cwd: \(cwd)]\nStarted in the SANDBOX background (isolated Linux guest) as \(handle) (guest pid \(pid)). It keeps running — poll it with readProcessOutput {\"handle\": \"\(handle)\"}, stop it with killProcess {\"handle\": \"\(handle)\"}. Its output is also appended to \(logPath) inside the guest. \(urlSteer)"
+        }
+        return "[cwd: \(cwd)]\nStarted in the SANDBOX background (isolated Linux guest). Output is appended to \(logPath) inside the guest — check on it with the shell tool, e.g. {\"command\": \"tail -n 50 \(logPath)\"}. \(urlSteer)"
+    }
+
     static func backgroundUnavailable(cwd: String, seconds: Int) -> String {
         "[cwd: \(cwd)]\nError: background execution isn't available in this context. Run the command in the foreground, or it will be stopped at the \(seconds)s timeout."
     }
@@ -383,12 +498,12 @@ struct EditFileHandler: ToolHandler {
         }
 
         // Line-number-based editing: startLine/endLine + replace
-        if let startStr = parameters["startLine"], let startLine = Int(startStr) {
+        if let startStr = parameters["startLine"], let startLine = Self.parseLineNumber(startStr) {
             guard let replace = parameters["replace"] else {
                 throw ToolError.executionFailed("editFile with startLine/endLine requires 'replace' parameter. You sent startLine=\(startStr) but no replace content. Example: {\"path\": \"file.js\", \"startLine\": \"5\", \"endLine\": \"8\", \"replace\": \"new code\"}")
             }
             let lines = content.components(separatedBy: "\n")
-            let endLine = Int(parameters["endLine"] ?? startStr) ?? startLine
+            let endLine = Self.parseLineNumber(parameters["endLine"]) ?? startLine
             let actualStart = max(1, startLine)
             let actualEnd = min(lines.count, endLine)
 
@@ -408,7 +523,13 @@ struct EditFileHandler: ToolHandler {
 
         // Text-based editing: find + replace
         guard let find = parameters["find"], !find.isEmpty else {
-            throw ToolError.missingParameter("Either 'find' or 'startLine' is required")
+            // Name the gap relative to what WAS sent: a model that dropped only
+            // startLine (live: 12 identical retries) needs "add startLine to the
+            // call you just made", not a restatement of the two modes.
+            if let endStr = parameters["endLine"], !endStr.isEmpty {
+                throw ToolError.executionFailed("editFile line-based mode needs BOTH startLine and endLine. You sent endLine=\(endStr) but no startLine — resend the same call with startLine added (the first line to replace, from readFile). Example: {\"path\": \"\(path)\", \"startLine\": \"45\", \"endLine\": \"\(endStr)\", \"replace\": \"new code\"}")
+            }
+            throw ToolError.missingParameter("Either 'find' (exact text to replace) or 'startLine'+'endLine' (line numbers from readFile) is required")
         }
         let replace = parameters["replace"] ?? ""
 
@@ -425,6 +546,16 @@ struct EditFileHandler: ToolHandler {
         content = content.replacingOccurrences(of: find, with: replace)
         try content.write(toFile: fullPath, atomically: true, encoding: .utf8)
         return "Edited \(path)"
+    }
+
+    /// Tolerant line-number parse: "45", "45,", " 45 " all read as 45. A weak
+    /// model's dirty value must not demote a line-based edit into the find
+    /// branch (startLine) or silently collapse the range (endLine) — the same
+    /// class as WriteFileHandler.appendFlagIsTrue's tolerant flag parse.
+    static func parseLineNumber(_ value: String?) -> Int? {
+        guard let value else { return nil }
+        let digits = value.drop(while: { !$0.isNumber }).prefix(while: { $0.isNumber })
+        return digits.isEmpty ? nil : Int(digits)
     }
 }
 

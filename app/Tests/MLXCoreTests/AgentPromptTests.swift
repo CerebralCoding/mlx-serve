@@ -106,6 +106,65 @@ final class AgentPromptTests: XCTestCase {
         XCTAssertNotEqual(a, b, "different stamps must not collide")
     }
 
+    // MARK: - Execution environment (sandbox-aware)
+
+    // The BASE prompt file is user-editable and serves both environments, so it
+    // must be OS-neutral; the per-request Execution environment section is what
+    // tells the model where shell commands actually run. Without this split, a
+    // macOS-flavored prompt sends `brew`/`open` into the Linux guest (and a
+    // Linux-flavored one sends `apt-get` at the host).
+    func testDefaultPromptIsEnvironmentNeutral() {
+        let p = AgentPrompt.defaultPromptFile
+        XCTAssertFalse(p.contains("macOS"),
+                       "base prompt must be OS-neutral — environment specifics ride the per-request section")
+        XCTAssertFalse(p.contains("brew"),
+                       "macOS-specific tooling must not be baked into the neutral base prompt")
+    }
+
+    func testExecutionEnvironmentSectionLinuxVariant() {
+        let s = AgentPrompt.executionEnvironmentSection(sandboxed: true)
+        XCTAssertTrue(s.contains("# Execution environment"))
+        XCTAssertTrue(s.contains("Linux"))
+        XCTAssertTrue(s.contains("/workspace"), "must explain the workspace mount point")
+        XCTAssertTrue(s.contains("brew") && s.contains("NOT"),
+                      "must warn off macOS-only tooling inside the guest")
+        XCTAssertTrue(s.lowercased().contains("network"),
+                      "must state the guest's network posture so failed downloads aren't retried forever")
+        XCTAssertTrue(s.contains("run_in_background") && s.lowercased().contains("log"),
+                      "must explain sandboxed background commands: a bg handle (readProcessOutput/killProcess) plus a guest log")
+        XCTAssertTrue(s.contains("readProcessOutput") && s.contains("killProcess"),
+                      "sandboxed background handles now poll/kill exactly like the host")
+        XCTAssertFalse(s.contains("zsh"))
+    }
+
+    func testExecutionEnvironmentSectionMacVariant() {
+        let s = AgentPrompt.executionEnvironmentSection(sandboxed: false)
+        XCTAssertTrue(s.contains("# Execution environment"))
+        XCTAssertTrue(s.contains("Mac"))
+        XCTAssertTrue(s.contains("brew"), "host variant restores the macOS tooling hint")
+        XCTAssertFalse(s.contains("Linux"))
+        XCTAssertFalse(s.contains("/workspace"))
+    }
+
+    // The URL a served app is handed back on is ENVIRONMENT-specific: on the
+    // host a 0.0.0.0 bind is LAN-reachable at http://<local-ip>:<port>, but in
+    // the sandbox only the loopback port map answers — a LAN or guest IP URL
+    // is dead. Live 2026-07-02: the base prompt's <local-ip> directive made
+    // the agent hand the user the Mac's LAN IP for a sandboxed server. So the
+    // base prompt must not hardcode a URL form; each env section states its own.
+    func testServedUrlFormRidesTheEnvironmentSectionNotTheBasePrompt() {
+        XCTAssertFalse(AgentPrompt.defaultPromptFile.contains("<local-ip>"),
+                       "URL form is environment-specific — the base prompt must defer to the env section")
+        let sandbox = AgentPrompt.executionEnvironmentSection(sandboxed: true)
+        XCTAssertTrue(sandbox.contains("http://localhost:"),
+                      "sandbox section must state the mapped localhost URL form")
+        XCTAssertTrue(sandbox.contains("NEVER") || sandbox.contains("never"),
+                      "sandbox section must explicitly countermand LAN/local-ip URLs")
+        let host = AgentPrompt.executionEnvironmentSection(sandboxed: false)
+        XCTAssertTrue(host.contains("<local-ip>"),
+                      "host section carries the LAN-reachable URL directive (IP from the grounding line)")
+    }
+
     // MARK: - Skill seeding
 
     private func tempSkillsDir() -> String {

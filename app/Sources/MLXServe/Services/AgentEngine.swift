@@ -312,14 +312,18 @@ enum AgentEngine {
         return []
     }
 
-    /// Get the example JSON format from a tool's description.
+    /// Get the example JSON format from a tool's description. Slices from the
+    /// first `{` after the first "Example" marker, so wording variants like
+    /// "Example line-based: {…}" still yield a real example — an exact
+    /// "Example: " match silently degraded editFile's error steer to `{}`.
     static func toolExample(for toolName: String) -> String {
         for def in AgentPrompt.toolDefinitions {
             guard let fn = def["function"] as? [String: Any],
                   fn["name"] as? String == toolName,
                   let desc = fn["description"] as? String,
-                  let range = desc.range(of: "Example: ") else { continue }
-            return String(desc[range.upperBound...])
+                  let marker = desc.range(of: "Example") else { continue }
+            guard let brace = desc.range(of: "{", range: marker.upperBound..<desc.endIndex) else { continue }
+            return String(desc[brace.lowerBound...])
         }
         return "{}"
     }
@@ -728,8 +732,8 @@ enum AgentEngine {
         // Background-process management — registry-backed, so dispatched inline
         // (like cwd/searchDocuments) rather than through the stateless handlers.
         if effectiveTool == .listProcesses || effectiveTool == .readProcessOutput || effectiveTool == .killProcess {
-            return processToolOutput(effectiveTool!, arguments: tc.arguments,
-                                     registry: processRegistry, sessionId: sessionId)
+            return await processToolOutput(effectiveTool!, arguments: tc.arguments,
+                                           registry: processRegistry, sessionId: sessionId)
         }
 
         // Shell gets a fresh handler with the registry injected (the static
@@ -743,8 +747,8 @@ enum AgentEngine {
             if let cmd = tc.arguments["command"],
                let reroute = processToolFromShellCommand(cmd) {
                 let args = reroute.handle.map { ["handle": $0] } ?? [:]
-                return processToolOutput(reroute.tool, arguments: args,
-                                         registry: processRegistry, sessionId: sessionId)
+                return await processToolOutput(reroute.tool, arguments: args,
+                                               registry: processRegistry, sessionId: sessionId)
             }
             let handler = ShellHandler(registry: processRegistry, sessionId: sessionId, handleBox: handleBox)
             do {
@@ -778,7 +782,7 @@ enum AgentEngine {
     /// `handle` is already validated present by `missingRequiredParams` for the
     /// two tools that require it.
     static func processToolOutput(_ tool: AgentToolKind, arguments: [String: String],
-                                  registry: ProcessRegistry?, sessionId: UUID?) -> String {
+                                  registry: ProcessRegistry?, sessionId: UUID?) async -> String {
         guard let registry else {
             return "Error: background process management isn't available in this context."
         }
@@ -790,6 +794,15 @@ enum AgentEngine {
                 .joined(separator: "\n")
         case .readProcessOutput:
             let handle = arguments["handle"] ?? ""
+            // Sandbox (guest-backed) handle: no host capture buffer — tail the
+            // guest log the background command appends to (via a guest `cat`).
+            if let logPath = registry.sandboxLogPath(handle: handle) {
+                let status = registry.isAlive(handle: handle) ? "still running" : "exited"
+                let log = await AgentSandbox.shared.tailGuestLog(logPath: logPath) ?? ""
+                return log.isEmpty
+                    ? "(\(handle) \(status) in the sandbox; no output in the guest log yet — \(logPath))"
+                    : "[\(handle) \(status) in the sandbox]\n\(log)"
+            }
             guard let out = registry.readOutput(handle: handle) else {
                 return unknownHandleError(handle, registry: registry, sessionId: sessionId)
             }

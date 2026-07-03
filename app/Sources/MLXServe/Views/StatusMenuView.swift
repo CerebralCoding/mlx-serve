@@ -131,7 +131,9 @@ struct StatusMenuView: View {
     @EnvironmentObject var server: ServerManager
     @EnvironmentObject var downloads: DownloadManager
     @State private var showDownloads = false
-    @State private var showLog = false
+    /// Slot ids with an unload in flight (the eject button becomes a spinner —
+    /// an unload can take seconds while the server drains a running request).
+    @State private var unloadingIds: Set<String> = []
     let openChat: () -> Void
     let openModelBrowser: () -> Void
     let openImageGen: () -> Void
@@ -140,6 +142,14 @@ struct StatusMenuView: View {
     let openSettings: () -> Void
     let openServerLog: () -> Void
     let openTasks: () -> Void
+    var openSandboxTerminal: () -> Void = {}
+
+    /// Observes the shared sandbox so the tray badge appears/updates live when
+    /// the Agent Sandbox is turned on and when its guest boots. Safe to observe
+    /// from the tray: the per-command transcript lives in the separate
+    /// `AgentSandbox.transcriptStore` (observed only by the Sandbox Terminal),
+    /// so command churn never re-renders this menu.
+    @ObservedObject private var sandbox = AgentSandbox.shared
 
     var body: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -248,15 +258,6 @@ struct StatusMenuView: View {
                         .help(control.help)
 
                         Button {
-                            showLog.toggle()
-                        } label: {
-                            Image(systemName: "text.alignleft")
-                        }
-                        .buttonStyle(.bordered)
-                        .controlSize(.regular)
-                        .help("Toggle inline Server Log")
-
-                        Button {
                             openServerLog()
                         } label: {
                             Image(systemName: "macwindow.on.rectangle")
@@ -283,15 +284,6 @@ struct StatusMenuView: View {
                     .font(.caption)
                     .foregroundStyle(.secondary)
 
-                    if showLog {
-                        // Each `ServerLogView` instance owns a tiny poller —
-                        // toggling the inline log on starts a 2 Hz pull;
-                        // toggling off stops it. No `@Published` on the
-                        // server means the menu popover header doesn't
-                        // re-render every time stderr ticks.
-                        ServerLogView(server: server)
-                    }
-
                     // Show error details
                     if case .error = server.status, !server.lastError.isEmpty {
                         Text(server.lastError)
@@ -310,42 +302,23 @@ struct StatusMenuView: View {
                 Divider().padding(.horizontal, 12)
 
                 VStack(alignment: .leading, spacing: 6) {
-                    if let info = server.modelInfo {
-                        HStack {
-                            Text("Model")
-                                .font(.subheadline.weight(.medium))
-                                .foregroundStyle(.secondary)
-                            Spacer()
-                        }
-                        HStack(spacing: 6) {
-                            Text(info.name)
-                                .font(.caption.monospaced())
-                                .lineLimit(1)
-                            if info.quantBits > 0 {
-                                Text("\(info.quantBits)-bit")
-                                    .font(.caption2.weight(.semibold))
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(.quaternary)
-                                    .clipShape(Capsule())
-                            }
-                            // Speculative-decoding speedup badge (MTP / drafter).
-                            if let badge = info.specDecodeBadge {
-                                Text(badge)
-                                    .font(.caption2.weight(.semibold))
-                                    .foregroundStyle(.green)
-                                    .padding(.horizontal, 5)
-                                    .padding(.vertical, 1)
-                                    .background(Color.green.opacity(0.15))
-                                    .clipShape(Capsule())
-                                    .help(info.mtpLoaded
-                                          ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
-                                          : "Assistant drafter loaded — faster decode via speculative decoding")
-                            }
-                        }
-                        Text("\(info.layers) layers, \(info.hiddenSize)-dim")
+                    // Model slots — one row per RESIDENT registry entry (chat,
+                    // image/video/audio gen, embeddings), each with an eject
+                    // button that frees its memory. Unloaded stubs are hidden.
+                    let loadedModels = server.allModels.filter(\.loaded)
+                    HStack {
+                        Text(loadedModels.count > 1 ? "Models" : "Model")
+                            .font(.subheadline.weight(.medium))
+                            .foregroundStyle(.secondary)
+                        Spacer()
+                    }
+                    if loadedModels.isEmpty {
+                        Text("None loaded — models load on demand")
                             .font(.caption)
                             .foregroundStyle(.tertiary)
+                    }
+                    ForEach(loadedModels, id: \.name) { info in
+                        modelSlotRow(info)
                     }
 
                     if let mem = server.memoryInfo {
@@ -482,6 +455,46 @@ struct StatusMenuView: View {
 
             Divider().padding(.horizontal, 12)
 
+            // Quick launcher — Spotlight-style ⌃Space prompt panel, summonable
+            // from any app while MLX Core runs in the tray.
+            QuickLauncherTrayRow()
+                .padding(.horizontal, 16)
+                .padding(.vertical, 8)
+
+            Divider().padding(.horizontal, 12)
+
+            // Agent-sandbox badge — visible only while the sandbox is enabled.
+            // Green box = a guest is live; click to open the Sandbox Terminal and
+            // run commands / watch the agent in the isolated Linux VM.
+            if sandbox.isEnabled {
+                Button {
+                    openSandboxTerminal()
+                } label: {
+                    HStack(spacing: 8) {
+                        Image(systemName: "shippingbox.fill")
+                            .foregroundStyle(sandbox.guestRunning ? Color.green : Color.orange)
+                        VStack(alignment: .leading, spacing: 1) {
+                            Text("Agent Sandbox is on").font(.callout.weight(.medium))
+                            // guestMemoryText is quantized + published only on
+                            // change, so this row doesn't re-render per second.
+                            Text(sandbox.guestRunning
+                                 ? "Guest running" + (sandbox.guestMemoryText.map { " · \($0)" } ?? "")
+                                 : "Idle — boots on the first command")
+                                .font(.caption2).foregroundStyle(.secondary)
+                        }
+                        Spacer()
+                        Image(systemName: "terminal").foregroundStyle(.secondary)
+                    }
+                    .frame(maxWidth: .infinity)
+                    .contentShape(Rectangle())
+                }
+                .buttonStyle(.plain)
+                .padding(.horizontal, 16).padding(.vertical, 8)
+                .help("Open the Sandbox Terminal")
+
+                Divider().padding(.horizontal, 12)
+            }
+
             // Chat, Tasks, Claude Code & Quit
             HStack(spacing: 8) {
                 Button {
@@ -584,6 +597,79 @@ struct StatusMenuView: View {
             return label
         }
         return "\(label) + assist"
+    }
+
+    /// One resident-model slot: modality icon, name, badges (chat quant /
+    /// spec-decode), resident size, and an eject button that unloads it.
+    @ViewBuilder
+    private func modelSlotRow(_ info: ModelInfo) -> some View {
+        HStack(spacing: 6) {
+            Image(systemName: info.slotKind.icon)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+                .frame(width: 16)
+                .help(info.slotKind.label)
+            Text(info.name)
+                .font(.caption.monospaced())
+                .lineLimit(1)
+                .truncationMode(.middle)
+                .help(info.slotKind == .chat
+                      ? "\(info.slotKind.label) — \(info.layers) layers, \(info.hiddenSize)-dim"
+                      : info.slotKind.label)
+            if info.quantBits > 0 {
+                Text("\(info.quantBits)-bit")
+                    .font(.caption2.weight(.semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.quaternary)
+                    .clipShape(Capsule())
+            }
+            // Speculative-decoding speedup badge (MTP / drafter).
+            if let badge = info.specDecodeBadge {
+                Text(badge)
+                    .font(.caption2.weight(.semibold))
+                    .foregroundStyle(.green)
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(Color.green.opacity(0.15))
+                    .clipShape(Capsule())
+                    .help(info.mtpLoaded
+                          ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
+                          : "Assistant drafter loaded — faster decode via speculative decoding")
+            }
+            Spacer()
+            if info.bytesResident > 0 {
+                Text(MemoryInfo.format(Int64(clamping: info.bytesResident)))
+                    .font(.caption2.monospaced())
+                    .foregroundStyle(.tertiary)
+            }
+            if unloadingIds.contains(info.name) {
+                ProgressView()
+                    .controlSize(.mini)
+                    .help("Unloading — waits for any running request to finish")
+            } else {
+                Button {
+                    unloadSlot(info.name)
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                        .font(.caption)
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Unload from memory (the model reloads on its next use)")
+            }
+        }
+    }
+
+    /// Eject a resident model. The server marks the entry evicting, waits for
+    /// in-flight requests to drain, frees it on the inference thread, and the
+    /// registry keeps the stub — the next request that targets it reloads.
+    private func unloadSlot(_ id: String) {
+        unloadingIds.insert(id)
+        Task {
+            try? await server.unloadModel(id: id)
+            unloadingIds.remove(id)
+        }
     }
 }
 
@@ -801,56 +887,6 @@ func launchClaudeCode(baseURL: String, workingDirectory: String? = nil) {
     try? scriptContent.write(toFile: path, atomically: true, encoding: .utf8)
     try? FileManager.default.setAttributes([.posixPermissions: 0o755], ofItemAtPath: path)
     NSWorkspace.shared.open(URL(fileURLWithPath: path))
-}
-
-struct ServerLogView: View {
-    let server: ServerManager
-    @StateObject private var poller: LogPoller
-
-    init(server: ServerManager) {
-        self.server = server
-        // 2 Hz is a good default for the inline peek: smooth-enough that
-        // it doesn't look frozen, cheap enough to not compete with chat.
-        _poller = StateObject(wrappedValue: LogPoller(interval: 0.5) {
-            [weak server] in server?.currentServerLogSnapshot() ?? ""
-        })
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack {
-                Text("Server Log")
-                    .font(.caption.weight(.medium))
-                    .foregroundStyle(.secondary)
-                Spacer()
-                Button {
-                    // Always read the live buffer for copy — the poller
-                    // mirror can be up to one interval (~500 ms) stale.
-                    NSPasteboard.general.clearContents()
-                    NSPasteboard.general.setString(server.currentServerLogSnapshot(), forType: .string)
-                } label: {
-                    Image(systemName: "doc.on.doc")
-                        .font(.caption2)
-                }
-                .buttonStyle(.plain)
-                .foregroundStyle(.secondary)
-                .help("Copy Log")
-            }
-
-            ScrollView {
-                Text(poller.text.isEmpty ? "(no output yet)" : poller.text)
-                    .font(.system(size: 10, design: .monospaced))
-                    .foregroundStyle(poller.text.isEmpty ? .tertiary : .primary)
-                    .frame(maxWidth: .infinity, alignment: .leading)
-                    .textSelection(.enabled)
-            }
-            .frame(height: 180)
-            .background(.black.opacity(0.3))
-            .clipShape(RoundedRectangle(cornerRadius: 6))
-        }
-        .onAppear { poller.start() }
-        .onDisappear { poller.stop() }
-    }
 }
 
 /// Full-window terminal-style view of the live server stderr buffer.

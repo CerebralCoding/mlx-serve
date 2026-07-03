@@ -101,6 +101,11 @@ class AppState: ObservableObject {
             // Reconcile the Telegram bridge whenever options change (cheap no-op
             // unless the bot token / enabled flag actually moved).
             telegramBridge.reconcile()
+            // Push the agent-sandbox setting to the shared manager so the next
+            // shell command routes to the guest (or the host) accordingly.
+            AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
+                                          baseImage: serverOptions.sandbox.baseImage,
+                                          network: serverOptions.sandbox.network)
         }
     }
     /// Legacy bridge: `maxTokens` is now stored in `serverOptions.defaultMaxTokens`.
@@ -120,6 +125,25 @@ class AppState: ObservableObject {
         didSet { UserDefaults.standard.set(mcpMode, forKey: "mcpMode") }
     }
     let mcpManager = MCPManager()
+
+    /// ⌃Space Spotlight-style prompt panel (tray toggle under Voice).
+    /// Registration follows the toggle live; also applied once at launch
+    /// (didSet doesn't fire for the init assignment).
+    @Published var quickLauncherEnabled: Bool {
+        didSet {
+            UserDefaults.standard.set(quickLauncherEnabled, forKey: "quickLauncherEnabled")
+            quickLauncher.setEnabled(quickLauncherEnabled)
+        }
+    }
+    /// Bumped by the quick launcher's "Open in chat" action. The menu-bar
+    /// label observes it (the label is always installed, so this works with no
+    /// window open — same bridge as the task-notification deep-link) and opens
+    /// the chat window. An Int tick so every bump fires onChange, no reset dance.
+    @Published var quickLauncherChatOpenTick = 0
+
+    /// Owns the global hotkey + floating panel. App-level like the voice
+    /// controller so it works with every window closed.
+    lazy var quickLauncher = QuickLauncherController(appState: self)
 
     /// The single generation engine shared by the text chat window and the voice
     /// assistant — one code path, no behavioural drift. App-level so generation
@@ -168,6 +192,7 @@ class AppState: ObservableObject {
         }
         self.serverOptions = opts
         self.mcpMode = UserDefaults.standard.bool(forKey: "mcpMode")
+        self.quickLauncherEnabled = UserDefaults.standard.bool(forKey: "quickLauncherEnabled")
         server.objectWillChange
             .sink { [weak self] _ in self?.objectWillChange.send() }
             .store(in: &cancellables)
@@ -186,6 +211,14 @@ class AppState: ObservableObject {
         // Start the Telegram bridge if the user left it enabled (didSet doesn't
         // fire for the initial serverOptions assignment in init).
         telegramBridge.reconcile()
+
+        // Same for the agent sandbox: apply the persisted setting once at launch.
+        AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
+                                      baseImage: serverOptions.sandbox.baseImage,
+                                      network: serverOptions.sandbox.network)
+
+        // And the quick launcher's global ⌃Space hotkey.
+        if quickLauncherEnabled { quickLauncher.setEnabled(true) }
 
         // Show welcome window on first launch
         if !hasSeenWelcome {

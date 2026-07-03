@@ -1,6 +1,7 @@
 import SwiftUI
 import AppKit
 import AVKit
+import AVFoundation
 import UniformTypeIdentifiers
 
 /// Video generation window — LTX-Video 2.3, run natively by the mlx-serve server.
@@ -24,7 +25,28 @@ struct VideoGenView: View {
     @State private var cfgScale: Double = 1.0
     @State private var stgScale: Double = 0.0
     @State private var seed: Int = 42
+    /// Style LoRA (Advanced): .safetensors adapter path ("" = none).
+    @State private var loraPath: String = ""
     @State private var firstFrameImageURL: URL? = nil
+    // ── Speech & sound (audio-to-video) ──
+    /// Where the conditioning clip comes from. `.none` → the model invents a
+    /// soundtrack from the prompt; `.file`/`.speech` freeze a real clip.
+    enum A2VSource: String, CaseIterable, Identifiable {
+        case none = "None"
+        case file = "Audio file"
+        case speech = "Speak text"
+        var id: String { rawValue }
+    }
+    @State private var audioSource: A2VSource = .none
+    /// The attached clip (picked file or TTS output). Transient, like the
+    /// first-frame image.
+    @State private var audioURL: URL? = nil
+    @State private var audioDuration: Double? = nil
+    @State private var speechText: String = ""
+    @State private var audioPlayer: AVAudioPlayer? = nil
+    /// Local TTS runner — chains Qwen3-TTS (load → speak → unload) on the same
+    /// server, then attaches the WAV as the a2vid clip.
+    @StateObject private var tts = AudioGenService()
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: VideoGenRequest? = nil
@@ -60,6 +82,24 @@ struct VideoGenView: View {
                 player = AVPlayer(url: URL(fileURLWithPath: path))
                 player?.play()
             }
+            // Load/unload just happened (or a cancel left the model resident)
+            // — reflect it in the residency row right away.
+            let repo = model.repo
+            Task { await service.refreshResidency(repo: repo, server: server) }
+        }
+        // Slow residency poll while the window is open: is the model loaded,
+        // and how much GPU memory the server holds. Never starts the server.
+        .task {
+            while !Task.isCancelled {
+                await service.refreshResidency(repo: model.repo, server: server)
+                try? await Task.sleep(nanoseconds: 3_000_000_000)
+            }
+        }
+        // TTS finished → attach the spoken line as the a2vid clip.
+        .onChange(of: tts.phase) { _, phase in
+            if case .completed(let path) = phase, audioSource == .speech {
+                attachAudio(URL(fileURLWithPath: path))
+            }
         }
     }
 
@@ -73,6 +113,7 @@ struct VideoGenView: View {
                     resolutionSection
                     framesSection
                     firstFrameSection
+                    speechSection
                     if showAdvanced { advancedSection } else { advancedToggle }
                     actionRow
                 }
@@ -126,7 +167,7 @@ struct VideoGenView: View {
                         RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                     )
                 if prompt.isEmpty {
-                    Text("Describe your shot like a cinematographer — subject, action, camera movement, lighting, setting. 4–8 sentences. Click Examples above for a starting point.")
+                    Text("Describe your shot like a cinematographer — subject, action, camera movement, lighting, setting. 4–8 sentences. Put spoken dialogue in quotes to make characters talk. Click Examples above for a starting point.")
                         .font(.body)
                         .foregroundStyle(.secondary.opacity(0.6))
                         .padding(.horizontal, 5)
@@ -150,8 +191,14 @@ struct VideoGenView: View {
     }
 
     /// Canonical LTX-style example prompts seeded into the Examples menu.
-    /// Dense, cinematographer-style, covering three common shot types.
+    /// Dense, cinematographer-style, covering four common shot types. The
+    /// dialogue example matters most: LTX only generates speech when the
+    /// spoken words appear in quotes (short phrases, acting directions
+    /// between them, per the official prompting guide) — without it the
+    /// soundtrack is ambient noise only.
     private static let examplePrompts: [(title: String, body: String)] = [
+        ("Talking character (dialogue)",
+         "Medium close-up of a woman in her thirties with short auburn hair, seated at a kitchen table in warm morning light. She looks into the camera and says warmly, \"Good morning. I made coffee — it's still hot.\" She pauses, glancing toward the window, then adds with a small smile, \"Come sit with me for a minute.\" Her voice is clear and natural, speaking English. Soft room tone with a faint clink of a cup. The camera holds steady at eye level."),
         ("Cinematic character",
          "Medium shot of a young woman with dark curly hair and freckles, wearing a beige wool coat, walking slowly down a rain-slicked cobblestone street at dusk. She holds a folded paper map in one hand and glances up at the glowing shop windows. The camera tracks her from the side at eye level, then slowly dollies in as she stops. Warm amber light spills from the windows onto the wet stones, contrasting with the deep blue-grey sky. Light rain falls continuously, catching the light."),
         ("Nature aerial",
@@ -197,7 +244,10 @@ struct VideoGenView: View {
     private var qualityHint: String {
         let s = model.settings(quality)
         let durationSec = Double(s.numFrames) / Double(model.fps)
-        return "\(modeLabel(s.mode)), \(s.steps) steps, \(s.numFrames) frames (~\(String(format: "%.1f", durationSec))s)"
+        // With a clip attached, a one-stage preset runs two-stage on the wire
+        // (audio-to-video requires it) — say so instead of lying "1-stage".
+        let label = (audioURL != nil && s.mode == .oneStage) ? "2-stage (audio-to-video)" : modeLabel(s.mode)
+        return "\(label), \(s.steps) steps, \(s.numFrames) frames (~\(String(format: "%.1f", durationSec))s)"
     }
 
     private func modeLabel(_ m: VideoPipelineMode) -> String {
@@ -227,21 +277,40 @@ struct VideoGenView: View {
             HStack {
                 Text("Frames").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text("~\(String(format: "%.1f", Double(numFrames) / Double(fps)))s")
-                    .font(.caption)
+                Text("\(numFrames) frames · ~\(String(format: "%.1f", Double(numFrames) / Double(fps)))s")
+                    .font(.caption.monospacedDigit())
                     .foregroundStyle(.secondary)
             }
-            Picker("", selection: $numFrames) {
-                ForEach(availableFrameOptions, id: \.self) { n in
-                    Text("\(n) frames").tag(n)
-                }
-            }
-            .labelsHidden()
-            .pickerStyle(.menu)
+            // Snap through LTX's valid `8N+1` frame ladder by index, so the
+            // slider can only land on generatable lengths (9, 17, 25, … maxFrames).
+            frameSlider
             if let warn = frameRAMWarning {
                 Text(warn).font(.caption2).foregroundStyle(.orange)
             }
         }
+    }
+
+    private var frameSlider: some View {
+        let opts = availableFrameOptions
+        let maxIdx = max(1, opts.count - 1)
+        return Slider(
+            value: Binding(
+                get: {
+                    // Live index of the current frame count on the ladder.
+                    let i = opts.firstIndex(of: numFrames)
+                        ?? opts.lastIndex(where: { $0 <= numFrames })
+                        ?? 0
+                    return Double(i)
+                },
+                set: { newVal in
+                    let idx = min(opts.count - 1, max(0, Int(newVal.rounded())))
+                    numFrames = opts[idx]
+                }
+            ),
+            in: 0...Double(maxIdx),
+            step: 1
+        )
+        .help("Clip length. LTX only generates \(opts.first ?? 9)–\(opts.last ?? 193) frames on its 8N+1 ladder; the slider snaps to valid counts.")
     }
 
     /// Always show every option up to the model's hard cap. The user can
@@ -267,25 +336,17 @@ struct VideoGenView: View {
         return nil
     }
 
-    /// Image-to-video is only supported by the 2-stage pipelines — the
-    /// distilled 1-stage pipeline was trained text-only and its
-    /// `generate_and_save()` signature doesn't accept `image=`. We keep the
-    /// First frame row visible but disabled on 1-stage so the feature is
-    /// discoverable, with a tooltip explaining what to do.
-    private var supportsI2V: Bool {
-        mode == .twoStage || mode == .twoStageHQ
-    }
-
-    private var i2vDisabledHelp: String {
-        "Image-to-video requires the Quality or Super Quality preset — the Fast / Good pipeline is text-only."
-    }
-
+    // Image-to-video is always available: the native mlx-serve engine supports
+    // first-frame conditioning in every pipeline mode (the server VAE-encodes
+    // the image and pins it as the clean first latent frame), and gracefully
+    // falls back to text-to-video if the VAE encoder isn't downloaded — so the
+    // picker is never disabled.
     private var firstFrameSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
                 Text("First frame").font(.subheadline.weight(.semibold))
                 Spacer()
-                Text(supportsI2V ? "optional — I2V" : "needs Quality preset")
+                Text("optional — I2V")
                     .font(.caption)
                     .foregroundStyle(.secondary)
             }
@@ -297,13 +358,11 @@ struct VideoGenView: View {
                             .aspectRatio(contentMode: .fill)
                             .frame(width: 64, height: 48)
                             .clipShape(RoundedRectangle(cornerRadius: 4))
-                            .opacity(supportsI2V ? 1.0 : 0.45)
                     }
                     Text(url.lastPathComponent)
                         .font(.caption)
                         .lineLimit(1)
                         .truncationMode(.middle)
-                        .foregroundStyle(supportsI2V ? .primary : .secondary)
                     Spacer()
                     Button {
                         firstFrameImageURL = nil
@@ -314,7 +373,6 @@ struct VideoGenView: View {
                     .foregroundStyle(.secondary)
                     .help("Clear first frame")
                 }
-                .help(supportsI2V ? "" : i2vDisabledHelp)
             } else {
                 Button {
                     chooseFirstFrameImage()
@@ -324,12 +382,195 @@ struct VideoGenView: View {
                         .frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
-                .disabled(!supportsI2V)
-                .help(supportsI2V
-                      ? "Select an image to use as the first frame of the video."
-                      : i2vDisabledHelp)
+                .help("Select an image to use as the first frame of the video.")
             }
         }
+    }
+
+    // ── Speech & sound (audio-to-video) ──
+    // Attach real speech/audio and the model generates the video AGAINST it:
+    // voices, lip sync and performance follow the clip, and the clip itself
+    // becomes the mp4's soundtrack (guaranteed words — no hoping the joint
+    // model nails quoted dialogue). Two sources: any audio file, or a line
+    // synthesized by the local Qwen3-TTS voice right from this pane.
+    private var speechSection: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            HStack {
+                Text("Speech & sound").font(.subheadline.weight(.semibold))
+                Spacer()
+                Text("optional — audio-to-video")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            Picker("", selection: $audioSource) {
+                ForEach(A2VSource.allCases) { s in Text(s.rawValue).tag(s) }
+            }
+            .pickerStyle(.segmented)
+            .labelsHidden()
+            .onChange(of: audioSource) { _, s in
+                if s == .none { clearAudio() }
+            }
+
+            switch audioSource {
+            case .none:
+                Text("The model invents a soundtrack from your prompt. Attach speech to make characters say exact words.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            case .file:
+                if audioURL == nil {
+                    Button {
+                        chooseAudioFile()
+                    } label: {
+                        Label("Choose audio…", systemImage: "waveform.badge.plus")
+                            .font(.caption)
+                            .frame(maxWidth: .infinity)
+                    }
+                    .buttonStyle(.bordered)
+                    .help("WAV, MP3, M4A or AAC. The clip drives the performance and becomes the video's soundtrack.")
+                }
+            case .speech:
+                speechComposer
+            }
+
+            if audioURL != nil {
+                attachedAudioChip
+                Text("Voices, lip sync and timing follow this clip — it becomes the video's soundtrack. Runs on the 2-stage pipeline.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            }
+        }
+    }
+
+    /// The "Speak text" composer: a line + Create speech via local Qwen3-TTS.
+    @ViewBuilder
+    private var speechComposer: some View {
+        let ttsPreset = AudioModelPreset.all.first { ServerManager.resolveModelDir(repo: $0.repo) != nil }
+        TextField("Line to speak — e.g. Good morning. Coffee's ready.", text: $speechText, axis: .vertical)
+            .textFieldStyle(.roundedBorder)
+            .lineLimit(2...4)
+            .font(.body)
+        if let preset = ttsPreset {
+            HStack(spacing: 8) {
+                if tts.isRunning {
+                    ProgressView().controlSize(.small)
+                    if case .running(_, _, let msg) = tts.phase {
+                        Text(msg).font(.caption).foregroundStyle(.secondary)
+                    }
+                    Spacer()
+                    Button("Cancel") { tts.cancel() }
+                        .font(.caption)
+                } else {
+                    Button {
+                        tts.generate(AudioGenRequest(model: preset, text: speechText), server: server)
+                    } label: {
+                        Label(audioURL == nil ? "Create speech" : "Recreate speech", systemImage: "waveform")
+                            .font(.caption)
+                    }
+                    .buttonStyle(.bordered)
+                    .disabled(speechText.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty)
+                    Text(preset.name).font(.caption2).foregroundStyle(.secondary)
+                    Spacer()
+                }
+            }
+            if case .failed(let msg) = tts.phase {
+                Text(msg).font(.caption2).foregroundStyle(.orange)
+            }
+        } else {
+            Text("Download a voice first — open the Audio window and grab Qwen3-TTS, then come back.")
+                .font(.caption2)
+                .foregroundStyle(.orange)
+        }
+    }
+
+    /// Attached-clip chip: name, duration, preview play/stop, clear.
+    private var attachedAudioChip: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "waveform")
+                .foregroundStyle(.tint)
+            VStack(alignment: .leading, spacing: 1) {
+                Text(audioURL?.lastPathComponent ?? "")
+                    .font(.caption)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                if let d = audioDuration {
+                    Text(String(format: "%.1fs%@", d, clipOutlastsVideo ? " — trimmed to the video length" : ""))
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            Spacer()
+            Button {
+                togglePreview()
+            } label: {
+                Image(systemName: audioPlayer?.isPlaying == true ? "stop.fill" : "play.fill")
+            }
+            .buttonStyle(.borderless)
+            .help("Preview the clip")
+            Button {
+                clearAudio()
+            } label: {
+                Image(systemName: "xmark.circle.fill")
+            }
+            .buttonStyle(.borderless)
+            .foregroundStyle(.secondary)
+            .help("Remove the clip")
+        }
+        .padding(6)
+        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+    }
+
+    /// Whether the attached clip is longer than the selected video length.
+    private var clipOutlastsVideo: Bool {
+        guard let d = audioDuration else { return false }
+        return d > Double(numFrames) / Double(fps) + 0.05
+    }
+
+    private func chooseAudioFile() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.audio, .wav, .mp3, .mpeg4Audio]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            attachAudio(url)
+        }
+    }
+
+    /// Attach a clip and snap the frame count up to cover it (capped at the
+    /// model max; the server trims a longer clip to the video).
+    private func attachAudio(_ url: URL) {
+        audioPlayer?.stop()
+        audioPlayer = nil
+        audioURL = url
+        audioDuration = Self.audioDuration(of: url)
+        if let d = audioDuration, let f = model.framesCovering(durationSeconds: d) {
+            numFrames = f
+        }
+    }
+
+    private func clearAudio() {
+        audioPlayer?.stop()
+        audioPlayer = nil
+        audioURL = nil
+        audioDuration = nil
+    }
+
+    private func togglePreview() {
+        if audioPlayer?.isPlaying == true {
+            audioPlayer?.stop()
+            audioPlayer = nil
+            return
+        }
+        guard let url = audioURL, let p = try? AVAudioPlayer(contentsOf: url) else { return }
+        audioPlayer = p
+        p.play()
+    }
+
+    static func audioDuration(of url: URL) -> Double? {
+        guard let f = try? AVAudioFile(forReading: url) else { return nil }
+        let sr = f.processingFormat.sampleRate
+        guard sr > 0 else { return nil }
+        return Double(f.length) / sr
     }
 
     private var advancedToggle: some View {
@@ -354,26 +595,19 @@ struct VideoGenView: View {
                 .buttonStyle(.plain)
                 .foregroundStyle(.secondary)
             }
-            HStack {
-                numberField("Steps", value: $steps, step: 1)
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("CFG scale").font(.caption)
-                    Stepper(value: $cfgScale, in: 0...20, step: 0.5) {
-                        Text(String(format: "%.1f", cfgScale))
-                    }
-                    .disabled(mode == .oneStage)
-                    .help(mode == .oneStage ? "The distilled 1-stage pipeline ignores CFG." : "LTX-2 default: 3.0")
-                }
-            }
-            if mode != .oneStage {
-                VStack(alignment: .leading, spacing: 2) {
-                    Text("STG scale (spatial-temporal guidance)").font(.caption)
-                    Stepper(value: $stgScale, in: 0...5, step: 0.5) {
-                        Text(String(format: "%.1f", stgScale))
-                    }
-                    .help("LTX-2 default: 1.0 for two-stage, 0.0 for two-stage HQ.")
-                }
-            }
+            // Steps — more steps = more detail/smoother motion, but slower.
+            intSliderRow("Steps", value: $steps, range: 4...50,
+                         help: "Denoising steps. More = more detail and smoother motion, but slower. LTX runs well from ~8 (fast) to ~30 (reference quality).")
+            Text("More steps refine the video further at the cost of speed. ~8 is fast, ~30 is the reference default.")
+                .font(.caption2).foregroundStyle(.secondary)
+
+            // CFG scale — always adjustable; the native engine honors it in
+            // every pipeline mode (one-stage and both two-stage variants).
+            sliderRow("CFG scale", value: $cfgScale, range: 1...10, step: 0.5,
+                      help: "Classifier-free guidance strength. LTX-2 default: 3.0; 1.0 = off (fastest).")
+            Text("Guidance strength — how closely the video follows your prompt. 1.0 = off: fastest and most natural-looking. Higher sticks to the prompt more strictly but is slower and can look over-saturated. LTX default is 3.0.")
+                .font(.caption2).foregroundStyle(.secondary)
+
             HStack {
                 numberField("Seed", value: $seed, step: 1)
                 Spacer()
@@ -381,6 +615,87 @@ struct VideoGenView: View {
             Toggle("Keep model loaded after generating", isOn: $keepResident)
                 .font(.caption)
                 .help("On: the model stays resident so the next generation is instant. Off (default): it's unloaded to free GPU memory.")
+            residencyRow
+
+            Divider()
+            Text("Style LoRA").font(.caption.weight(.semibold))
+            if loraPath.isEmpty {
+                Button {
+                    chooseLora()
+                } label: {
+                    Label("Choose .safetensors…", systemImage: "paintpalette")
+                        .font(.caption)
+                }
+                Text("Apply a LoRA adapter to the video model for a custom style.")
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+            } else {
+                HStack(spacing: 8) {
+                    Image(systemName: "paintpalette")
+                        .foregroundStyle(.secondary)
+                    Text(URL(fileURLWithPath: loraPath).lastPathComponent)
+                        .font(.caption)
+                        .lineLimit(1)
+                        .truncationMode(.middle)
+                        .help(loraPath)
+                    Spacer()
+                    Button {
+                        loraPath = ""
+                        persist()
+                    } label: {
+                        Image(systemName: "xmark.circle.fill")
+                    }
+                    .buttonStyle(.borderless)
+                    .foregroundStyle(.secondary)
+                    .help("Remove the LoRA")
+                }
+                .padding(6)
+                .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+            }
+        }
+    }
+
+    /// Live "is the model resident, and what does the GPU hold" line under the
+    /// keep-loaded toggle — fed by the slow `/v1/models` poll.
+    private var residencyRow: some View {
+        HStack(spacing: 6) {
+            Circle()
+                .fill(service.residency?.loaded == true ? Color.green : Color.secondary.opacity(0.4))
+                .frame(width: 7, height: 7)
+            Text(residencyText)
+                .font(.caption)
+                .foregroundStyle(.secondary)
+        }
+        .help("Live server state: whether this model is loaded, and the total memory held by all loaded models.")
+    }
+
+    private var residencyText: String {
+        guard server.status == .running, let r = service.residency else {
+            return "Model not loaded"
+        }
+        let gpu = MemoryInfo.format(r.gpuResidentBytes)
+        if r.loaded {
+            return "Model loaded · GPU memory \(gpu)"
+        }
+        // Other models resident without this one → say who holds the GPU
+        // (a chat model, or another pane's model).
+        if r.gpuResidentBytes > (1 << 29) {
+            return "Model not loaded · GPU memory \(gpu) in use"
+        }
+        return "Model not loaded"
+    }
+
+    private func chooseLora() {
+        let panel = NSOpenPanel()
+        if let st = UTType(filenameExtension: "safetensors") {
+            panel.allowedContentTypes = [st]
+        }
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url {
+            loraPath = url.path
+            persist()
         }
     }
 
@@ -402,6 +717,44 @@ struct VideoGenView: View {
                 Text(String(value.wrappedValue))
             }
         }
+    }
+
+    /// Labeled slider for a `Double` setting, with a live value readout on the
+    /// right and an optional hover tooltip.
+    private func sliderRow(_ label: String, value: Binding<Double>, range: ClosedRange<Double>, step: Double, help: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(label).font(.caption)
+                Spacer()
+                Text(String(format: "%.1f", value.wrappedValue))
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Slider(value: value, in: range, step: step)
+        }
+        .help(help ?? "")
+    }
+
+    /// Labeled slider for an `Int` setting (bridges to a `Double` slider).
+    private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>, help: String? = nil) -> some View {
+        VStack(alignment: .leading, spacing: 2) {
+            HStack {
+                Text(label).font(.caption)
+                Spacer()
+                Text("\(value.wrappedValue)")
+                    .font(.caption.monospacedDigit())
+                    .foregroundStyle(.secondary)
+            }
+            Slider(
+                value: Binding(
+                    get: { Double(value.wrappedValue) },
+                    set: { value.wrappedValue = Int($0.rounded()) }
+                ),
+                in: Double(range.lowerBound)...Double(range.upperBound),
+                step: 1
+            )
+        }
+        .help(help ?? "")
     }
 
     private var actionRow: some View {
@@ -450,6 +803,8 @@ struct VideoGenView: View {
                     }
                 case .completed(let path):
                     completedPreview(path: path)
+                case .cancelled:
+                    ContentUnavailableView("Cancelled", systemImage: "stop.circle", description: Text("Generation was cancelled."))
                 case .failed(let msg):
                     ContentUnavailableView {
                         Label("Failed", systemImage: "exclamationmark.triangle")
@@ -511,11 +866,18 @@ struct VideoGenView: View {
         numFrames = s.numFrames
         fps = s.fps
         mode = s.mode
-        steps = s.steps
-        cfgScale = s.cfgScale
+        // Clamp into the slider ranges — a value persisted by the old wider
+        // steppers (Steps unbounded, CFG 0…20) would otherwise sit off-scale.
+        steps = min(50, max(4, s.steps))
+        cfgScale = min(10, max(1, s.cfgScale))
         stgScale = s.stgScale
         seed = s.seed
         keepResident = s.keepResident
+        loraPath = s.loraPath
+        // The LoRA file may have moved since last session — drop a stale path.
+        if !loraPath.isEmpty && !FileManager.default.fileExists(atPath: loraPath) {
+            loraPath = ""
+        }
         clampFramesToRAM()
     }
 
@@ -532,6 +894,7 @@ struct VideoGenView: View {
         s.stgScale = stgScale
         s.seed = seed
         s.keepResident = keepResident
+        s.loraPath = loraPath
         s.save()
     }
 
@@ -553,8 +916,8 @@ struct VideoGenView: View {
         numFrames = s.numFrames
         clampFramesToRAM()
         // Keep firstFrameImageURL across preset changes so users can swap
-        // Quality tiers without losing their attached image. The First frame
-        // row dims itself on 1-stage and tryGenerate() nil's the path.
+        // Quality tiers without losing their attached image — every pipeline
+        // mode supports first-frame conditioning.
     }
 
     /// Resolution change still snaps frame count down to the model's hard
@@ -584,8 +947,10 @@ struct VideoGenView: View {
             steps: steps,
             cfgScale: cfgScale,
             stgScale: stgScale,
-            firstFrameImagePath: supportsI2V ? firstFrameImageURL?.path : nil,
-            keepResident: keepResident
+            firstFrameImagePath: firstFrameImageURL?.path,
+            audioPath: audioURL?.path,
+            keepResident: keepResident,
+            loraPath: loraPath.isEmpty ? nil : loraPath
         )
         persist()
 
