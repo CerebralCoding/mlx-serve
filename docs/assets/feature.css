@@ -28,7 +28,7 @@
 
 * { margin: 0; padding: 0; box-sizing: border-box; }
 
-html { scroll-behavior: smooth; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; }
+html { scroll-behavior: smooth; -webkit-font-smoothing: antialiased; -moz-osx-font-smoothing: grayscale; overflow-x: hidden; }
 
 body {
   font-family: -apple-system, BlinkMacSystemFont, 'SF Pro Display', 'SF Pro Text', 'Helvetica Neue', Helvetica, Arial, sans-serif;
@@ -36,6 +36,7 @@ body {
   background: var(--white);
   line-height: 1.5;
   overflow-x: hidden;
+  width: 100%;
 }
 
 ::selection { background: color-mix(in srgb, var(--accent) 22%, transparent); }
@@ -161,6 +162,10 @@ nav {
 .split + .split { margin-top: 84px; }
 .split.flip .split-copy { order: 2; }
 .split.flip .split-visual { order: 1; }
+/* grid items default to min-width: auto, so an unbreakable child (e.g. a
+   `white-space: pre` code block) can force the track — and the whole page —
+   wider than the viewport on mobile, bypassing .code-body's own overflow-x:auto. */
+.split-copy, .split-visual { min-width: 0; }
 
 .split-kicker {
   display: inline-block; font-family: var(--mono); font-size: 11px; font-weight: 600;
