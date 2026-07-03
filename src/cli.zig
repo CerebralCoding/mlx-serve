@@ -275,18 +275,49 @@ fn fileSizeAt(io: std.Io, dir_path: []const u8, rel: []const u8) ?u64 {
     return st.size;
 }
 
-/// True when the model directory already holds a loadable checkpoint
-/// (config.json for MLX/safetensors, or any .gguf).
+/// True when the model directory already holds a COMPLETE, loadable
+/// checkpoint. "config.json exists" is NOT enough: an interrupted `pull`
+/// (Ctrl-C mid-weights) leaves config.json + *.partial, and treating that
+/// as present skipped the resume and fed a weightless dir to the loader
+/// (live SIGSEGV — see tests/test_partial_download.sh). Complete means: no
+/// .partial leftovers anywhere (top level or one subdir deep, e.g.
+/// mtp/weights.safetensors.partial), plus config.json AND at least one
+/// .safetensors for MLX dirs — or any .gguf, which is self-contained.
 pub fn modelPresent(io: std.Io, dir_path: []const u8) bool {
-    if (fileSizeAt(io, dir_path, "config.json") != null) return true;
     if (dir_path.len == 0 or !std.fs.path.isAbsolute(dir_path)) return false;
     var dir = std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true }) catch return false;
     defer dir.close(io);
+    return modelPresentInDir(io, dir);
+}
+
+fn modelPresentInDir(io: std.Io, dir: std.Io.Dir) bool {
+    var has_config = false;
+    var has_safetensors = false;
+    var has_gguf = false;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
-        if (entry.kind == .file and std.mem.endsWith(u8, entry.name, ".gguf")) return true;
+        switch (entry.kind) {
+            .file => {
+                if (std.mem.endsWith(u8, entry.name, ".partial")) return false;
+                if (std.mem.eql(u8, entry.name, "config.json")) has_config = true;
+                if (std.mem.endsWith(u8, entry.name, ".safetensors")) has_safetensors = true;
+                if (std.mem.endsWith(u8, entry.name, ".gguf")) has_gguf = true;
+            },
+            .directory => {
+                // One level deep is enough for the pull layouts (mtp/ is the
+                // only subdir the chat-default selection downloads into).
+                var sub = dir.openDir(io, entry.name, .{ .iterate = true }) catch continue;
+                defer sub.close(io);
+                var sit = sub.iterate();
+                while (sit.next(io) catch null) |se| {
+                    if (se.kind == .file and std.mem.endsWith(u8, se.name, ".partial")) return false;
+                }
+            },
+            else => {},
+        }
     }
-    return false;
+    if (has_gguf) return true;
+    return has_config and has_safetensors;
 }
 
 /// Download `resolved.repo` into `dest_dir`. Skips files already complete
@@ -718,6 +749,84 @@ test "cli: shouldDownload chat-default selection" {
     try testing.expect(!shouldDownload("assets/demo.png"));
     try testing.expect(!shouldDownload("banner.png"));
     try testing.expect(!shouldDownload("vae/weights.safetensors")); // media subdirs are app-bundle territory
+}
+
+test "cli: modelPresentInDir requires a COMPLETE checkpoint" {
+    // Regression: an interrupted `pull` (Ctrl-C mid-weights) leaves
+    // config.json + model.safetensors.partial. modelPresent used to return
+    // true on config.json alone, so the rerun skipped the resume and fed a
+    // weightless dir to the loader (SIGSEGV). Present now means: no .partial
+    // leftovers anywhere (top level or one subdir deep), and config.json +
+    // >=1 .safetensors (MLX) or any .gguf.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // config.json alone (weights never started): not present.
+    try tmp.dir.createDirPath(io, "a");
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/config.json", .data = "{}" });
+    {
+        var d = try tmp.dir.openDir(io, "a", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+
+    // config.json + interrupted weights: not present (the user's live repro).
+    try tmp.dir.writeFile(io, .{ .sub_path = "a/model.safetensors.partial", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "a", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+
+    // Complete single-file checkpoint: present.
+    try tmp.dir.createDirPath(io, "b");
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/model.safetensors", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "b", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(modelPresentInDir(io, d));
+    }
+
+    // Complete weights but another file still partial (e.g. tokenizer.json):
+    // not present — resume must finish the pull.
+    try tmp.dir.writeFile(io, .{ .sub_path = "b/tokenizer.json.partial", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "b", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+
+    // Interrupted sidecar one subdir deep (mtp/weights.safetensors.partial):
+    // not present.
+    try tmp.dir.createDirPath(io, "c/mtp");
+    try tmp.dir.writeFile(io, .{ .sub_path = "c/config.json", .data = "{}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c/model.safetensors", .data = "x" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "c/mtp/weights.safetensors.partial", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "c", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
+
+    // GGUF: the file itself is the checkpoint (no config.json needed)…
+    try tmp.dir.createDirPath(io, "g");
+    try tmp.dir.writeFile(io, .{ .sub_path = "g/model-Q4_K_M.gguf", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "g", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(modelPresentInDir(io, d));
+    }
+
+    // …but a partial GGUF is not.
+    try tmp.dir.createDirPath(io, "h");
+    try tmp.dir.writeFile(io, .{ .sub_path = "h/model-Q4_K_M.gguf.partial", .data = "x" });
+    {
+        var d = try tmp.dir.openDir(io, "h", .{ .iterate = true });
+        defer d.close(io);
+        try testing.expect(!modelPresentInDir(io, d));
+    }
 }
 
 test "cli: parseTreeJson uses lfs size and skips directories" {

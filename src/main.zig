@@ -74,7 +74,9 @@ fn printUsage(io: std.Io) void {
         \\                      (otherwise generation_config.json, then 1.0 = off)
         \\  --top-k <n>         Serve-mode default top_k for requests that omit it
         \\                      (otherwise generation_config.json, then 0 = off)
-        \\  --timeout <n>       Request timeout in seconds (default: 300, 0=none)
+        \\  --timeout <n>       Stall timeout in seconds: abort a request after n seconds
+        \\                      WITHOUT producing a token (default: 300, 0=none). A request
+        \\                      that keeps generating never times out, however long it runs.
         \\  --reasoning-budget <n>  Max thinking tokens per request (default: unlimited)
         \\  --no-vision         Disable vision encoder (saves memory)
         \\  --no-safety         Disable the image-gen NSFW content filter (on by
@@ -522,6 +524,11 @@ pub fn main(init: std.process.Init) !void {
         }
     }
 
+    // `mlx-serve run` on a TTY quiets logs to warn (unless --log-level was
+    // given) BEFORE the models-root scan below — discovery's per-directory
+    // `[discovery] skip …` info lines would otherwise spam the chat REPL.
+    if (repl_after_serve and !log_level_explicit) log.setLevel(.warn);
+
     // Plan 05 Phase 1: model discovery. When --model-dir is passed, scan
     // the directory for subdirectories containing config.json. The
     // discovered list is published via /v1/models. v1: routing still goes
@@ -562,11 +569,10 @@ pub fn main(init: std.process.Init) !void {
 
     // `mlx-serve run` on a TTY: chat REPL on a side thread. It polls
     // /health until the model is up, then drives the server's own /api/chat
-    // (Ollama NDJSON) endpoint. Quiet the request logs so streamed tokens
-    // aren't interleaved with [info] lines — unless the user asked for a
-    // level explicitly.
+    // (Ollama NDJSON) endpoint. (Logs were already quieted to warn above,
+    // before discovery, so streamed tokens aren't interleaved with [info]
+    // lines.)
     if (repl_after_serve and serve_mode) {
-        if (!log_level_explicit) log.setLevel(.warn);
         const t = std.Thread.spawn(.{}, replThreadMain, .{ allocator, io, port }) catch |err| blk: {
             log.warn("could not start chat REPL: {s}\n", .{@errorName(err)});
             break :blk null;
@@ -711,17 +717,30 @@ pub fn main(init: std.process.Init) !void {
     log.info("Loading tokenizer...\n", .{});
     const tok = try allocator.create(tokenizer_mod.Tokenizer);
     var tok_owned_by_registry = false;
+    tok.* = tokenizer_mod.loadTokenizer(io, allocator, model_dir) catch |err| {
+        // Raw memory only — nothing initialized to deinit. The cleanup defer
+        // below must NOT be registered yet: deinit on the undefined pointee
+        // was a live SIGSEGV on a partially-downloaded model dir (the
+        // preloadCpuState errdefer-after-init pattern applies here too).
+        allocator.destroy(tok);
+        log.err("failed to load tokenizer from {s}: {s} (incomplete download? `mlx-serve pull` the model again to resume, or delete the dir)\n", .{ model_dir, @errorName(err) });
+        return err;
+    };
     // defer-only (see config note above): errdefer + defer with the same body
     // double-frees on the error-return path.
     defer if (!tok_owned_by_registry) {
         tok.deinit();
         allocator.destroy(tok);
     };
-    tok.* = try tokenizer_mod.loadTokenizer(io, allocator, model_dir);
 
     // Load chat config — heap-allocated, ownership transfers to registry on serve_mode.
     const chat_config = try allocator.create(chat_mod.ChatConfig);
     var chat_config_owned_by_registry = false;
+    chat_config.* = chat_mod.loadChatConfig(io, allocator, model_dir) catch |err| {
+        // Raw memory only — see the tokenizer catch above.
+        allocator.destroy(chat_config);
+        return err;
+    };
     // defer-only (see config note above): errdefer + defer with the same body
     // double-frees on the error-return path — this is the one that crashed in
     // the #45 GPU-OOM pre-flight refusal (ChatConfig.deinit ran twice).
@@ -729,7 +748,6 @@ pub fn main(init: std.process.Init) !void {
         chat_config.deinit();
         allocator.destroy(chat_config);
     };
-    chat_config.* = try chat_mod.loadChatConfig(io, allocator, model_dir);
 
     // Merge the tokenizer's chat-terminator EOS into the stop set — ALWAYS,
     // even when config.json already specified an eos_token_id. Some checkpoints

@@ -1,5 +1,14 @@
 # Changelog
 
+## v26.7.2 — The app updates itself
+
+- **Automatic updates**: MLX Core now checks the project's GitHub releases page once a day and shows an update banner in the menu-bar tray when a new version ships. One click downloads the notarized installer, swaps the app in place, and relaunches — your models, chats, and settings are untouched. A manual "Check Now" button and an opt-out toggle live in Settings → Updates.
+- **Fixed: deleting a chat now stops its generation.** Previously, deleting a chat while it was still answering left that generation running invisibly — the model stayed busy, every other chat reported "answering another chat", and even restarting the server couldn't clear it. Deleting the chat now cancels its turn on the spot.
+- **Long answers no longer get cut off at 5 minutes.** The request timeout now measures stalls (no new tokens), not total time — a model that's actively writing can run as long as it needs, while a genuinely hung request still gets reaped. Previously a big agent file-write on a large model was silently guillotined mid-tool-call at 300 seconds, then retried from scratch: verified live, a 7¾-minute 50KB write now completes in one shot.
+- **Agents recover from truncated tool calls instead of looping.** When a generation is cut off mid-tool-call (token cap), the truncation is now reported honestly to the client and the agent immediately switches to writing the file in chunks — before, the model was blamed for "forgetting" content it had actually written, and retried the same failing call for 15+ wasted minutes. The system prompt also stops advertising six-figure output budgets on big-memory machines — the very invitation that pushed models into those five-minute one-shot writes; the budget warning now appears only when the budget is actually tight.
+
+---
+
 ## v26.7.1 — Edit photos, animate them, sandbox your agent, drop in for Ollama
 
 - **Agent Sandbox, built on Apple's own virtualization** The isolated Linux VM that runs the agent's shell commands is now powered directly by Apple's Virtualization framework: it boots in under a second, and the same design is Mac App Store-compatible. The agent is also told which environment it's in — Linux sandbox or your Mac — so it stops reaching for `brew` inside the VM (and vice versa), a green shield in the chat toolbar shows when commands run isolated, and the `/workspace` mount follows your working-folder switch automatically. The working-folder chip now shows just the folder's name (full path in the tooltip).

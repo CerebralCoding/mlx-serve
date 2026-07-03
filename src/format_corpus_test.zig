@@ -15,7 +15,11 @@
 //! 1. Start the server with `--log-level debug`. Every tools-enabled request
 //!    dumps the model's raw output before tool parsing:
 //!        raw generated text before tool parse (NNNb): <text>
-//!    (two sites in src/server.zig — streaming and non-streaming).
+//!    (two sites in src/server.zig — streaming and non-streaming). The inline
+//!    dump caps at 4KB; for mega-tool-calls also set
+//!    MLX_SERVE_RAW_DUMP_FILE=<abs path> to write the FULL pre-parse buffer
+//!    of the last streamed tools request (how the 2026-07-03 timeout-guillotine
+//!    class was captured).
 //! 2. Grep the server log for that line (or for the misbehaving output).
 //! 3. Paste the raw text into a new `Expect` entry below with the family it
 //!    came from and what SHOULD happen. The universal invariants (no control

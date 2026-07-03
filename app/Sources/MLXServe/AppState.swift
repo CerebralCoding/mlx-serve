@@ -126,6 +126,12 @@ class AppState: ObservableObject {
     }
     let mcpManager = MCPManager()
 
+    /// In-app updater against the GitHub releases page. App-level (not a view)
+    /// so the daily background check runs with every window closed; views
+    /// observe it directly (`UpdateTrayRow(updates:)`), same pattern as
+    /// `telegramBridge`.
+    let updates = UpdateChecker()
+
     /// ⌃Space Spotlight-style prompt panel (tray toggle under Voice).
     /// Registration follows the toggle live; also applied once at launch
     /// (didSet doesn't fire for the init assignment).
@@ -220,6 +226,12 @@ class AppState: ObservableObject {
         // And the quick launcher's global ⌃Space hotkey.
         if quickLauncherEnabled { quickLauncher.setEnabled(true) }
 
+        // Auto-update: stop the server child before the installer relaunches
+        // the app (the old process's willTerminate doesn't stop it), then
+        // start the once-a-day releases/latest check.
+        updates.willRelaunch = { [weak self] in self?.server.stop() }
+        updates.startAutoCheck()
+
         // Show welcome window on first launch
         if !hasSeenWelcome {
             DispatchQueue.main.asyncAfter(deadline: .now() + 0.5) { [weak self] in
@@ -254,9 +266,10 @@ class AppState: ObservableObject {
     func refreshModels() {
         localModels = downloads.discoverLocalModels()
         // Auto-select a base model if none selected or the current selection is
-        // invalid. Drafters never get auto-picked — they aren't loadable as a
-        // target on their own.
-        let baseModels = localModels.filter { $0.kind == .base }
+        // invalid. Drafters and media / non-chat models never get auto-picked —
+        // they aren't loadable as the primary chat model (must match the tray
+        // picker's filter, or the selection points at a hidden row).
+        let baseModels = localModels.filter { $0.isChatPickable }
         if baseModels.first(where: { $0.path == selectedModelPath }) == nil,
            let first = baseModels.first {
             selectedModelPath = first.path
@@ -293,6 +306,11 @@ class AppState: ObservableObject {
         documentIndexes[id]?.cancel()
         documentIndexes.removeValue(forKey: id)
         chatSessions.removeAll { $0.id == id }
+        // Stop the in-flight turn if it belonged to this session — otherwise
+        // it ghost-runs invisibly, holds the shared engine (every other chat
+        // reports "answering another chat" with no Stop control), and no
+        // server restart can clear it. See ChatTurnEngine.turnOrphaned.
+        chatEngine.stopIfOrphaned()
         if activeChatId == id {
             activeChatId = chatSessions.first?.id
         }

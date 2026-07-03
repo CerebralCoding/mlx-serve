@@ -13,7 +13,7 @@
   <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/">
   <meta property="og:title" content="Run any LLM on your Mac Locally — faster than LM Studio or Ollama">
   <meta property="og:description" content="Native Zig inference server for Apple Silicon. MLX + GGUF. OpenAI- and Anthropic-compatible APIs. No Python. Drop-in alternative to LM Studio and Ollama on macOS.">
-  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/demo-diffusion.gif">
+  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/mlxcore-screenshot-1.png">
   <meta property="og:image:width" content="1200">
   <meta property="og:image:height" content="630">
   <meta property="og:site_name" content="mlx-serve">
@@ -21,7 +21,7 @@
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="Run any LLM on your Mac Locally — faster than LM Studio or Ollama">
   <meta name="twitter:description" content="Native Zig server for Apple Silicon. MLX + GGUF. OpenAI + Anthropic compatible. No Python. Drop-in alternative to LM Studio and Ollama.">
-  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/demo-diffusion.gif">
+  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/mlxcore-screenshot-1.png">
   <!-- JSON-LD structured data (AEO) -->
   <script type="application/ld+json">
   {
@@ -37,7 +37,7 @@
     "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
     "codeRepository": "https://github.com/ddalcu/mlx-serve",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "v26.6.13",
+    "softwareVersion": "v26.7.1",
     "author": { "@type": "Person", "name": "David Dalcu" },
     "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio. No Python. MIT licensed.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -112,7 +112,7 @@
         "name": "What models does mlx-serve support?",
         "acceptedAnswer": {
           "@type": "Answer",
-          "text": "Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3-Next, Llama 3.x, Mistral, Nemotron-H, LFM2.5, and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more available on HuggingFace."
+          "text": "Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3-Next, Llama 3.x, Mistral, Nemotron-H, LFM2.5, and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more available on HuggingFace. Media models run natively too: FLUX.2 and Krea-2-Turbo for images, LTX-Video 2.3 for video, and Qwen3-TTS for speech and voice cloning."
         }
       },
       {
@@ -438,6 +438,33 @@
     @keyframes scroll {
       from { transform: translateX(0); }
       to { transform: translateX(-50%); }
+    }
+
+    /* ─── EXPLORE: deep-dive launcher ─── */
+    .explore { padding: 30px 24px 14px; }
+    .explore-header { text-align: center; max-width: 640px; margin: 0 auto 28px; }
+    .explore-title { font-size: clamp(24px, 3.2vw, 34px); font-weight: 700; letter-spacing: -0.025em; line-height: 1.1; }
+    .explore-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 12px; max-width: 1060px; margin: 0 auto; }
+    .explore-card {
+      --ec: var(--blue);
+      display: flex; flex-direction: column; gap: 7px;
+      padding: 18px;
+      background: var(--white);
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      box-shadow: var(--shadow-card);
+      text-decoration: none;
+      color: var(--text-primary);
+      transition: transform 0.2s ease, box-shadow 0.2s ease, border-color 0.2s ease;
+    }
+    .explore-card:hover { transform: translateY(-3px); box-shadow: var(--shadow-elevated); border-color: color-mix(in srgb, var(--ec) 45%, transparent); }
+    .explore-kicker { font-family: var(--mono); font-size: 10px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--ec); }
+    .explore-card h3 { font-size: 14.5px; font-weight: 600; letter-spacing: -0.01em; line-height: 1.25; }
+    .explore-card p { font-size: 12px; color: var(--text-secondary); line-height: 1.45; }
+    .explore-card .go { margin-top: 2px; font-size: 12px; font-weight: 600; color: var(--ec); }
+    @media (max-width: 520px) {
+      .explore-grid { grid-template-columns: 1fr 1fr; }
+      .explore-card p { display: none; }
     }
 
     /* ─── SECTION SHARED ─── */
@@ -800,6 +827,30 @@
       border-radius: 5px;
     }
 
+    .card-more {
+      display: inline-block;
+      margin-top: 12px;
+      font-size: 13px;
+      font-weight: 500;
+      color: var(--blue);
+      text-decoration: none;
+    }
+    .card-more:hover { text-decoration: underline; }
+
+    .footer-dives {
+      display: flex;
+      justify-content: center;
+      gap: 8px 20px;
+      margin-bottom: 18px;
+      list-style: none;
+      flex-wrap: wrap;
+      max-width: 720px;
+      margin-left: auto;
+      margin-right: auto;
+    }
+    .footer-dives a { font-size: 12px; color: var(--text-tertiary); text-decoration: none; transition: color 0.2s; }
+    .footer-dives a:hover { color: var(--blue); }
+
     /* ─── QUICK START ─── */
     .quickstart-wrap { max-width: 680px; margin: 0 auto; }
 
@@ -942,6 +993,34 @@
       border-radius: 5px;
     }
 
+    .model-flag.f-img { background: linear-gradient(135deg, #d6336c, #ff9f0a); }
+    .model-flag.f-vid { background: linear-gradient(135deg, #d9480f, #ffb31a); }
+    .model-flag.f-voice { background: linear-gradient(135deg, #7048e8, #da77f2); }
+
+    .ml-flux { background: linear-gradient(135deg, #d6336c, #ff9f0a); color: white; }
+    .ml-krea { background: linear-gradient(135deg, #ff375f, #bf5af2); color: white; }
+    .ml-ltx { background: linear-gradient(135deg, #d9480f, #ffd60a); color: white; }
+    .ml-tts { background: linear-gradient(135deg, #7048e8, #da77f2); color: white; }
+
+    .models-group + .models-group { margin-top: 38px; }
+    .models-group-label {
+      display: flex;
+      align-items: center;
+      gap: 16px;
+      max-width: 920px;
+      margin: 0 auto 14px;
+      font-family: var(--mono);
+      font-size: 11px;
+      font-weight: 600;
+      letter-spacing: 0.07em;
+      text-transform: uppercase;
+      color: var(--text-tertiary);
+    }
+    .models-group-label::before, .models-group-label::after { content: ''; flex: 1; height: 1px; background: var(--border); }
+
+    a.model-card { text-decoration: none; color: inherit; }
+    a.model-card:hover { box-shadow: var(--shadow-elevated); }
+
     /* ─── FAQ ─── */
     .faq-wrap { max-width: 760px; margin: 0 auto; display: flex; flex-direction: column; gap: 10px; }
 
@@ -1065,9 +1144,10 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.6.13</span>
+      <span class="nav-ver">v26.7.1</span>
     </a>
     <ul class="nav-links">
+      <li><a href="#explore" class="hide-mobile">Deep dives</a></li>
       <li><a href="#performance" class="hide-mobile">Performance</a></li>
       <li><a href="#deepseek" class="hide-mobile">DeepSeek V4</a></li>
       <li><a href="#features" class="hide-mobile">Features</a></li>
@@ -1086,13 +1166,13 @@
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
     <a href="https://github.com/ddalcu/mlx-serve/releases/latest" class="hero-badge">
       <span class="new-pill">v26.7.1</span>
-      Edit photos with words · talking-character video · ⌃Space launcher · drop-in Ollama API
+      Edit photos with words · talking-character video · ⌃Space launcher · your Ollama apps just work
       <span class="arrow">→</span>
     </a>
     <h1>Run any LLM<br>on your <span class="grad">Mac</span></h1>
-    <p class="hero-sub">A native Zig inference server with a macOS menu-bar app. <strong>MLX + GGUF, faster than LM Studio on the same&nbsp;file.</strong> OpenAI- and Anthropic-compatible. No Python. No Electron.</p>
+    <p class="hero-sub">Your own private AI — chat, coding agents, images, video, and voice — <strong>running entirely on your&nbsp;Mac</strong>. Free and open source, faster than LM Studio, and your data never leaves the machine.</p>
     <div class="hero-ctas">
-      <a href="https://github.com/ddalcu/mlx-serve/releases" class="btn btn-primary">
+      <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
         <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
         Download for Mac
       </a>
@@ -1103,8 +1183,78 @@
     <div class="hero-meta">
       <div class="hero-meta-item"><strong>macOS 26+</strong></div>
       <div class="hero-meta-item"><strong>M1 – M4</strong></div>
-      <div class="hero-meta-item"><strong>MIT License</strong></div>
+      <div class="hero-meta-item"><strong>Free &amp; open source</strong></div>
       <a href="https://github.com/ddalcu/mlx-serve/stargazers" class="hero-meta-item" style="text-decoration:none;color:var(--text-tertiary);" target="_blank" rel="noopener">★ <strong>Star on GitHub</strong></a>
+    </div>
+  </section>
+
+  <!-- EXPLORE: deep-dive launcher -->
+  <section class="explore" id="explore">
+    <div class="explore-header reveal">
+      <div class="section-label">Deep dives</div>
+      <h2 class="explore-title">What will you do first?</h2>
+    </div>
+    <div class="explore-grid reveal">
+      <a class="explore-card" href="image-generation/" style="--ec:#d6336c;">
+        <span class="explore-kicker">Create</span>
+        <h3>Edit photos with words</h3>
+        <p>“Make the hair blue” — subject, pose &amp; scene survive.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="video-generation/" style="--ec:#d9480f;">
+        <span class="explore-kicker">Animate</span>
+        <h3>Turn photos into video</h3>
+        <p>Clips with synced sound — even talking characters.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="voice-cloning/" style="--ec:#7048e8;">
+        <span class="explore-kicker">Speak</span>
+        <h3>Clone any voice</h3>
+        <p>Six seconds of audio, no transcript, all local.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="claude-code-local/" style="--ec:#c9634a;">
+        <span class="explore-kicker">Code</span>
+        <h3>Run Claude Code — free</h3>
+        <p>Your coding agent, offline, no API key.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="local-ai-assistant/" style="--ec:#5e5ce6;">
+        <span class="explore-kicker">Ask</span>
+        <h3>Summon AI over any app</h3>
+        <p>⌃Space launcher, voice, phone &amp; schedules.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="agent-sandbox/" style="--ec:#0e8a4f;">
+        <span class="explore-kicker">Unleash</span>
+        <h3>Sandbox your agent</h3>
+        <p>Shell commands hit a Linux VM, not your Mac.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="lm-studio-alternative/" style="--ec:#0071e3;">
+        <span class="explore-kicker">Compare</span>
+        <h3>Faster than LM Studio</h3>
+        <p>+35% on identical models — keeps your library.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="ollama-alternative/" style="--ec:#0d8a45;">
+        <span class="explore-kicker">Swap</span>
+        <h3>Replace Ollama in one line</h3>
+        <p>Your Ollama apps connect unchanged.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="speculative-decoding/" style="--ec:#d97706;">
+        <span class="explore-kicker">Accelerate</span>
+        <h3>Same answers, 2× faster</h3>
+        <p>Speculative decoding, verified exact.</p>
+        <span class="go">Deep dive →</span>
+      </a>
+      <a class="explore-card" href="tool-calling/" style="--ec:#0f9960;">
+        <span class="explore-kicker">Trust</span>
+        <h3>Tool calls that don't break</h3>
+        <p>Small-model mistakes repaired mid-flight.</p>
+        <span class="go">Deep dive →</span>
+      </a>
     </div>
   </section>
 
@@ -1118,8 +1268,8 @@
   <!-- MARQUEE -->
   <div class="marquee" aria-hidden="true">
     <div class="marquee-track">
-      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">Ollama API</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
-      <span class="marquee-item">MLX + GGUF</span><span class="marquee-item">Ollama API</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6 MTP</span><span class="marquee-item">Llama 3</span><span class="marquee-item">NVFP4 / MXFP4</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
     </div>
   </div>
 
@@ -1128,7 +1278,7 @@
     <div class="section-header reveal">
       <div class="section-label">Performance</div>
       <h2 class="section-title">Faster than LM Studio.<br>Every model.</h2>
-      <p class="section-desc">Identical 4-bit MLX weights, same machine, same prompts. mlx-serve wins every cell — and speculative decoding pushes the lead further on the workloads where it counts.</p>
+      <p class="section-desc">Identical 4-bit MLX weights, same machine, same prompts. mlx-serve wins every cell — and speculative decoding pushes the lead further on the workloads where it counts. <a href="lm-studio-alternative/" style="color:var(--blue);text-decoration:none;">Full LM Studio comparison →</a></p>
     </div>
 
     <div class="perf-stats reveal">
@@ -1146,7 +1296,7 @@
       </div>
       <div class="perf-stat">
         <div class="perf-number" data-target="0">0</div>
-        <div class="perf-label">Python dependencies</div>
+        <div class="perf-label">accounts, subscriptions, or cloud calls</div>
       </div>
     </div>
 
@@ -1159,7 +1309,7 @@
       <div class="chart-legend" id="chartLegend"></div>
       <p class="chart-caption">
         <b>Decode</b> = free-form generation · <b>Echo</b> = high-repetition (where PLD shines) · <b>Code</b> = code completion (where the drafter shines).
-        Tokens/sec, higher is better. Apple M4 Max (128 GB) · identical 4-bit MLX weights · ctx 4096 · temp 0 · LM Studio (MLX runtime) as baseline.
+        Tokens per second — how fast the AI writes; higher is better. Apple M4 Max (128 GB) · identical 4-bit MLX weights · ctx 4096 · temp 0 · LM Studio (MLX runtime) as baseline.
       </p>
     </div>
   </section>
@@ -1177,11 +1327,11 @@
           <p>The 284-billion-parameter flagship — running on your own machine, no cloud, no API key. If you have a 96&nbsp;GB+ Apple Silicon Mac, it's one click away in the Model Browser.</p>
           <ul class="deepseek-bullets">
             <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>Built on Salvatore Sanfilippo's <a href="https://github.com/antirez/ds4" target="_blank" rel="noopener"><b>antirez/ds4</b></a> engine — native Metal kernels, byte-validated against the reference forward.</span></li>
-            <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>One-click download</b> of the GGUF, served from the same picker as every MLX model.</span></li>
+            <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>One-click download</b>, served from the same model picker as everything else.</span></li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span><b>Agent mode and MCP tool calling</b> work on DSV4 too — the full toolset is inlined into the prompt.</span></li>
             <li><svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="20 6 9 17 4 12"/></svg><span>A <b>single self-contained binary</b> — kernel sources are embedded and staged at first launch.</span></li>
           </ul>
-          <a href="https://github.com/ddalcu/mlx-serve/releases" class="deepseek-cta">
+          <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="deepseek-cta">
             <svg width="18" height="18" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
             Get MLX Core
           </a>
@@ -1228,7 +1378,7 @@
       </div>
     </div>
     <p class="spec-note reveal">
-      <b>Qwen 3.6 native MTP.</b> Models with a trained MTP sidecar (like <a href="https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve" target="_blank" rel="noopener" style="color:var(--blue)">ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve</a>) auto-load it and speculate from the model's own head — up to <b>1.8×</b> on agent-style edit loops (29 → 51.6 tok/s on Qwen3.6-27B 4-bit, M4 Max), 1.43× on code. The controller watches its own acceptance rate per request and adapts draft depth on the fly. Zero setup — drop in the model and it's on.
+      <b>Qwen 3.6 native MTP.</b> Models with a trained MTP sidecar (like <a href="https://huggingface.co/ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve" target="_blank" rel="noopener" style="color:var(--blue)">ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve</a>) auto-load it and speculate from the model's own head — up to <b>1.8×</b> on agent-style edit loops (29 → 51.6 tok/s on Qwen3.6-27B 4-bit, M4 Max), 1.43× on code. The controller watches its own acceptance rate per request and adapts draft depth on the fly. Zero setup — drop in the model and it's on. <a href="speculative-decoding/" style="color:var(--blue);text-decoration:none;">Speculative decoding, in depth →</a>
     </p>
   </section>
 
@@ -1237,43 +1387,45 @@
     <div class="section-header reveal">
       <div class="section-label">Features</div>
       <h2 class="section-title">A complete local-AI stack</h2>
-      <p class="section-desc">From server to UI, built from scratch in Zig and Swift — with the production features you actually run into.</p>
+      <p class="section-desc">Everything a private AI setup needs in one Mac app — plus the deep dives above when you want the full story on any of it.</p>
     </div>
     <div class="features-grid">
       <div class="feature-card reveal">
         <div class="feature-icon fi-perf">
           <svg viewBox="0 0 24 24" fill="white" xmlns="http://www.w3.org/2000/svg"><path d="m23.53 1.02-7.686 3.45h-7.06l-2.98 3.452h7.173L.47 22.98l7.681-3.607h7.065v-.002l2.978-3.45-7.148-.001 12.482-14.9zM0 4.47v14.901h1.883l2.98-3.45H3.451v-8h.942l2.824-3.45H0zm22.117 0-2.98 3.608h1.412v7.844h-.942l-2.98 3.45H24V4.47h-1.883z"/></svg>
         </div>
-        <h3>Native, no Python</h3>
-        <p>Written in Zig with direct MLX-C bindings. Eager warmup makes the first request 3.5× faster; a rewritten BPE tokenizer chews a 30 KB agent system prompt in 8 ms (was 3.9 s); the prefix cache keeps up to 32 conversation roots warm, so agent turns round-trip in ~0.1 s.</p>
+        <h3>Nothing to install, nothing to configure</h3>
+        <p>One lightweight native app — no dependencies, no setup scripts, no gigabyte runtime. The first answer after launch comes 3.5× faster thanks to eager warmup, and warm conversation turns round-trip in about 0.1 s.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-api">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71"/><path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71"/></svg>
         </div>
-        <h3>OpenAI + Anthropic APIs</h3>
-        <p>Drop-in chat completions, streaming, tool calling, embeddings, the Responses API and WebSockets — plus a native Anthropic Messages endpoint, so you can point Claude Code at a local model.</p>
+        <h3>Works with the apps you already use</h3>
+        <p>Claude Code, Cursor, Continue, Raycast, Open WebUI — anything built for OpenAI or Anthropic can talk to your Mac instead of the cloud. Streaming, tool calling, embeddings, and WebSockets included.</p>
+        <a class="card-more" href="claude-code-local/">Run Claude Code locally →</a>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #0071e3, #30d158);">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="17 1 21 5 17 9"/><path d="M3 11V9a4 4 0 0 1 4-4h14"/><polyline points="7 23 3 19 7 15"/><path d="M21 13v2a4 4 0 0 1-4 4H3"/></svg>
         </div>
-        <h3>Drop-in Ollama API</h3>
-        <p>mlx-serve speaks the Ollama wire natively — <code>/api/chat</code>, <code>/api/generate</code>, <code>/api/tags</code>, <code>/api/embed</code>, <code>/api/pull</code>. Point Raycast, Obsidian, Enchanted, Open WebUI, or ollama-python/js at your mlx-serve port and they just work — same models, faster engine. And <code>mlx-serve run gemma4</code> pulls, serves, and chats from one command.</p>
+        <h3>Your Ollama apps just work</h3>
+        <p>mlx-serve speaks Ollama's language natively, so tools built for it — Raycast, Obsidian, Enchanted, Open WebUI — connect unchanged: same models, faster engine. And <code>mlx-serve run gemma4</code> downloads, serves, and chats from one command.</p>
+        <a class="card-more" href="ollama-alternative/">The Ollama swap, in depth →</a>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-batch">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><line x1="8" y1="6" x2="21" y2="6"/><line x1="8" y1="12" x2="21" y2="12"/><line x1="8" y1="18" x2="21" y2="18"/><line x1="3" y1="6" x2="3.01" y2="6"/><line x1="3" y1="12" x2="3.01" y2="12"/><line x1="3" y1="18" x2="3.01" y2="18"/></svg>
         </div>
-        <h3>Continuous batching</h3>
-        <p><code>--max-concurrent</code> batches multiple decode requests through one forward pass — about 1.6× throughput at 4-way parallel on dense models. Concurrent streams stay byte-identical to solo runs, and a 24-hour soak holds memory drift under 5%.</p>
+        <h3>Several chats at once</h3>
+        <p>Multiple conversations decode together through one model — about 1.6× total throughput at 4-way parallel — and every stream stays byte-accurate under load, verified by a 24-hour stress test.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-kv">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M3 5v14a9 3 0 0 0 18 0V5"/><path d="M3 12a9 3 0 0 0 18 0"/></svg>
         </div>
-        <h3>KV-cache quantization</h3>
-        <p><code>--kv-quant</code> shrinks KV memory ~4× at 4-bit and ~2× at 8-bit — fit 16K contexts that didn't fit dense, or double your parallel-request budget. TurboQuant variants handle heavy-tailed activations.</p>
+        <h3>Longer documents, less memory</h3>
+        <p>The working memory a long conversation needs can be compressed up to ~4×, so 16K-token contexts fit on Macs that couldn't hold them before — or you serve more chats in parallel at the same length.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-agent">
@@ -1288,6 +1440,7 @@
         </div>
         <h3>Agent Sandbox — a VM, not your Mac</h3>
         <p>One toggle routes every agent shell command into an isolated Linux VM built on Apple's own Virtualization framework. It boots in under a second, servers the agent starts mirror live to <code>localhost</code>, and a green shield shows when commands run isolated. Let the agent go wild — your files stay untouched.</p>
+        <a class="card-more" href="agent-sandbox/">How the sandbox works →</a>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #ff9f0a, #bf5af2);">
@@ -1295,27 +1448,28 @@
         </div>
         <h3>⌃Space Quick Launcher</h3>
         <p>A Spotlight-style panel that summons over any app: hit <b>⌃Space</b>, type, and the answer streams in from your local model — no window shuffling. Follow-ups keep their context, <b>⌘↩</b> hands the thread to the chat window, and Esc dismisses while the reply finishes in your sidebar.</p>
+        <a class="card-more" href="local-ai-assistant/">The always-on assistant →</a>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon fi-app">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 4v4"/><path d="M2 8h20"/><path d="M6 4v4"/></svg>
         </div>
         <h3>One server, every model</h3>
-        <p>The MLX Core menu-bar app downloads models from HuggingFace with resumable transfers and hot-switches in place. <code>--model-dir</code> serves a whole folder. NVFP4, MXFP4, and MXFP8 quantized checkpoints load and serve out of the box.</p>
+        <p>The MLX Core menu-bar app downloads models from HuggingFace with resumable transfers and hot-switches them in place — no restart, no chat interruption. New compressed model formats load out of the box.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #5e5ce6, #9fe6ff);">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="3" width="18" height="18" rx="2"/><path d="M3 9h18"/><path d="M9 21V9"/></svg>
         </div>
-        <h3>Block diffusion</h3>
-        <p>DiffusionGemma runs natively — Google's block-diffusion model writes 256-token canvases in parallel instead of one token at a time. Up to 25 tokens per forward pass, ~30% faster than the mlx-vlm reference. Works on every API surface including streaming.</p>
+        <h3>Writes whole paragraphs at once</h3>
+        <p>Google's DiffusionGemma composes 256-token blocks in parallel instead of word by word — up to 25 tokens per pass, ~30% faster than the reference implementation — and streams block-by-block into any chat app.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #30d158, #0071e3);">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/><polyline points="10 9 9 9 8 9"/></svg>
         </div>
-        <h3>Document folder RAG</h3>
-        <p>Attach a folder of mixed files — notes, PDFs, JSON exports — and ask questions in plain language. GPU-batched embedding (~5× faster indexing) via the server's <code>/v1/embeddings</code> API. Nothing leaves your Mac, nothing written to disk.</p>
+        <h3>Ask questions about your files</h3>
+        <p>Attach a folder of mixed files — notes, PDFs, exports — and ask in plain language. About 500 files index in ~7 seconds, everything stays in memory, and nothing leaves your Mac.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #2aabee, #229ed9);">
@@ -1337,6 +1491,7 @@
         </div>
         <h3>Voice cloning &amp; TTS</h3>
         <p>Give it 6–8 seconds of any voice and it speaks your text in that voice — zero-shot, no training. Runs fully local on Qwen3-TTS with adjustable speed and expressiveness; the reference audio alone clones the voice, no transcript needed — validated bit-for-bit against the reference.</p>
+        <a class="card-more" href="voice-cloning/">Voice cloning, in depth →</a>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #ff9f0a, #ff375f);">
@@ -1344,6 +1499,7 @@
         </div>
         <h3>Image generation &amp; photo editing</h3>
         <p><b>Krea-2-Turbo</b> (12.9B, photorealistic) and <b>FLUX.2</b> run entirely on your Mac — validated pixel-faithful to the reference, any size 256²–2048². And it edits, not just generates: attach a photo, type <i>"make the hair blue"</i>, and the subject, pose, and scene survive. Image-to-image variations with a strength slider, runtime style LoRAs, inline generation from chat. Nothing leaves your Mac.</p>
+        <a class="card-more" href="image-generation/">Editing &amp; LoRAs, in depth →</a>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #ff453a, #ff9f0a);">
@@ -1351,6 +1507,7 @@
         </div>
         <h3>Video generation — with a voice</h3>
         <p>LTX-Video 2.3 turns a prompt, a photo, or a soundtrack into a 24 fps clip with synced audio, all on-device. Put spoken lines in quotes and your characters <b>talk</b>; attach a real voice clip — or a line spoken by local TTS — and the performance follows it, original audio muxed into the MP4. Animate a photo from the First-frame slot; two-stage presets when you want maximum quality, ~2× faster this release.</p>
+        <a class="card-more" href="video-generation/">Video generation, in depth →</a>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #30d158, #0a84ff);">
@@ -1365,6 +1522,7 @@
         </div>
         <h3>One-click coding agents</h3>
         <p>Point Claude Code, pi, or OpenCode at your local model from a folder picker — the app wires up the environment and routes every request to mlx-serve. Real coding agents, your code and prompts never leaving your machine.</p>
+        <a class="card-more" href="claude-code-local/">Claude Code, fully local →</a>
       </div>
     </div>
   </section>
@@ -1374,11 +1532,21 @@
     <div class="section-header reveal">
       <div class="section-label">Quick Start</div>
       <h2 class="section-title">Up and running in seconds</h2>
+      <p class="section-desc">Download the app, pick a model, go. Prefer a terminal? Two commands.</p>
     </div>
     <div class="quickstart-wrap reveal">
+      <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="app-download-card" style="margin: 0 auto 28px;">
+        <img src="appiconb.png" alt="MLX Core" class="app-download-icon">
+        <div class="app-download-info">
+          <div class="app-download-name">MLX Core</div>
+          <div class="app-download-desc">The Mac app — chat, agents, images, video &amp; voice</div>
+        </div>
+        <div class="app-download-btn">Get</div>
+      </a>
+
       <div class="code-block">
         <div class="code-header">
-          <span>Terminal</span>
+          <span>For developers — Terminal</span>
           <button class="copy-btn" onclick="copyCode(this)" aria-label="Copy code">
             <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
           </button>
@@ -1398,7 +1566,7 @@
 
       <div class="code-block">
         <div class="code-header">
-          <span>Use the API — OpenAI or Anthropic</span>
+          <span>For developers — use the API</span>
           <button class="copy-btn" onclick="copyCode(this)" aria-label="Copy code">
             <svg viewBox="0 0 24 24"><rect x="9" y="9" width="13" height="13" rx="2" ry="2"/><path d="M5 15H4a2 2 0 01-2-2V4a2 2 0 012-2h9a2 2 0 012 2v1"/></svg>
           </button>
@@ -1416,14 +1584,6 @@
         </div>
       </div>
 
-      <a href="https://github.com/ddalcu/mlx-serve/releases" class="app-download-card">
-        <img src="appiconb.png" alt="MLX Core" class="app-download-icon">
-        <div class="app-download-info">
-          <div class="app-download-name">MLX Core</div>
-          <div class="app-download-desc">Desktop app for macOS — chat, agent &amp; model browser</div>
-        </div>
-        <div class="app-download-btn">Get</div>
-      </a>
     </div>
   </section>
 
@@ -1431,58 +1591,96 @@
   <section class="section" id="models">
     <div class="section-header reveal">
       <div class="section-label">Models</div>
-      <h2 class="section-title">Run the latest open models</h2>
-      <p class="section-desc">Quantized MLX-format models plus DeepSeek V4 Flash via the embedded ds4 engine. Download directly from HuggingFace in the app.</p>
+      <h2 class="section-title">The latest open models,<br>one click each</h2>
+      <p class="section-desc">Chat models, image models, video, and voice — downloaded right inside the app, all running on your Mac. If it's open and it matters, it runs here.</p>
     </div>
-    <div class="models-grid reveal">
-      <div class="model-card featured">
-        <div class="model-logo ml-deepseek">DS</div>
-        <div class="model-info">
-          <h3>DeepSeek V4 Flash <span class="model-flag">96GB+</span></h3>
-          <p>284B · via antirez/ds4 engine</p>
+
+    <div class="models-group reveal">
+      <div class="models-group-label">Chat &amp; agents</div>
+      <div class="models-grid">
+        <div class="model-card featured">
+          <div class="model-logo ml-deepseek">DS</div>
+          <div class="model-info">
+            <h3>DeepSeek V4 Flash <span class="model-flag">96GB+</span></h3>
+            <p>284B · the flagship, on your desk</p>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-logo ml-gemma">G</div>
+          <div class="model-info">
+            <h3>Gemma 4</h3>
+            <p>Google · E2B / E4B / 31B / 26B-A4B MoE · vision</p>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-logo ml-qwen">Q</div>
+          <div class="model-info">
+            <h3>Qwen 3.6</h3>
+            <p>Alibaba · 27B &amp; 35B-A3B · vision · extra-fast MTP builds</p>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-logo ml-gemma" style="font-size:13px;">DG</div>
+          <div class="model-info">
+            <h3>DiffusionGemma</h3>
+            <p>Google · writes whole blocks at once · 26B-A4B</p>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-logo ml-llama">L</div>
+          <div class="model-info">
+            <h3>Llama 3</h3>
+            <p>Meta · 8B · 70B</p>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-logo ml-mistral">M</div>
+          <div class="model-info">
+            <h3>Mistral</h3>
+            <p>Mistral AI · 7B · 8x7B</p>
+          </div>
+        </div>
+        <div class="model-card">
+          <div class="model-logo ml-more">+</div>
+          <div class="model-info">
+            <h3>And thousands more</h3>
+            <p>Nemotron-H · LFM2.5 · Qwen 3-Next · Gemma 3 · any GGUF</p>
+          </div>
         </div>
       </div>
-      <div class="model-card featured">
-        <div class="model-logo ml-gemma" style="font-size:13px;">DG</div>
-        <div class="model-info">
-          <h3>DiffusionGemma <span class="model-flag">NEW</span></h3>
-          <p>Google · 26B-A4B block diffusion · ~30% faster than mlx-vlm</p>
-        </div>
-      </div>
-      <div class="model-card">
-        <div class="model-logo ml-gemma">G</div>
-        <div class="model-info">
-          <h3>Gemma 4</h3>
-          <p>Google · E2B / E4B / 31B / 26B-A4B MoE · vision</p>
-        </div>
-      </div>
-      <div class="model-card">
-        <div class="model-logo ml-qwen">Q</div>
-        <div class="model-info">
-          <h3>Qwen 3.6</h3>
-          <p>Alibaba · 27B · 35B-A3B MoE · GatedDeltaNet · vision</p>
-        </div>
-      </div>
-      <div class="model-card">
-        <div class="model-logo ml-llama">L</div>
-        <div class="model-info">
-          <h3>Llama 3</h3>
-          <p>Meta · 8B · 70B</p>
-        </div>
-      </div>
-      <div class="model-card">
-        <div class="model-logo ml-mistral">M</div>
-        <div class="model-info">
-          <h3>Mistral</h3>
-          <p>Mistral AI · 7B · 8x7B</p>
-        </div>
-      </div>
-      <div class="model-card">
-        <div class="model-logo ml-more">+</div>
-        <div class="model-info">
-          <h3>And more</h3>
-          <p>Nemotron-H · LFM2.5 · Qwen 3-Next · Gemma 3</p>
-        </div>
+    </div>
+
+    <div class="models-group reveal">
+      <div class="models-group-label">Create — image, video &amp; voice</div>
+      <div class="models-grid">
+        <a class="model-card" href="image-generation/">
+          <div class="model-logo ml-flux" style="font-size:13px;">FX</div>
+          <div class="model-info">
+            <h3>FLUX.2 <span class="model-flag f-img">Image</span></h3>
+            <p>Black Forest Labs · edits photos from instructions</p>
+          </div>
+        </a>
+        <a class="model-card" href="image-generation/">
+          <div class="model-logo ml-krea" style="font-size:13px;">K2</div>
+          <div class="model-info">
+            <h3>Krea-2-Turbo <span class="model-flag f-img">Image</span></h3>
+            <p>Krea · 12.9B photorealistic generation</p>
+          </div>
+        </a>
+        <a class="model-card" href="video-generation/">
+          <div class="model-logo ml-ltx" style="font-size:11px;">LTX</div>
+          <div class="model-info">
+            <h3>LTX-Video 2.3 <span class="model-flag f-vid">Video</span></h3>
+            <p>Lightricks · clips with synced sound · photo &amp; audio input</p>
+          </div>
+        </a>
+        <a class="model-card" href="voice-cloning/">
+          <div class="model-logo ml-tts" style="font-size:11px;">TTS</div>
+          <div class="model-info">
+            <h3>Qwen3-TTS <span class="model-flag f-voice">Voice</span></h3>
+            <p>Alibaba · speech + zero-shot voice cloning</p>
+          </div>
+        </a>
       </div>
     </div>
   </section>
@@ -1525,11 +1723,11 @@
       </details>
       <details class="faq-item">
         <summary>What models are supported?</summary>
-        <p>Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3-Next, Llama 3.x, Mistral, Nemotron-H, LFM2.5, and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more from HuggingFace.</p>
+        <p>Native MLX dispatch for Gemma 3/4, Qwen 3 / 3.5 / 3.6 / 3-Next, Llama 3.x, Mistral, Nemotron-H, LFM2.5, and DeepSeek V4 Flash. Anything else as GGUF via embedded llama.cpp — Qwen, Llama, Mistral, Gemma, DeepSeek, Phi, Yi, and thousands more from HuggingFace. On the media side: <b>FLUX.2</b> and <b>Krea-2-Turbo</b> for images, <b>LTX-Video 2.3</b> for video, and <b>Qwen3-TTS</b> for speech and voice cloning — all running natively on-device.</p>
       </details>
       <details class="faq-item">
         <summary>Does it support tools / function calling?</summary>
-        <p>Yes, on both API surfaces. The server detects tool-call patterns across architectures (Hermes XML, Gemma 4 <code>&lt;|tool_call&gt;</code>, raw JSON, ChatML), repairs common Qwen 3.5/3.6 escape quirks, and emits OpenAI-style <code>tool_calls</code> deltas in the SSE stream. The MLX Core app ships <b>10 built-in tools</b> (shell, file I/O, search, browse, web search, memory) and connects to MCP servers from a curated marketplace.</p>
+        <p>Yes, on both API surfaces. The server detects tool-call patterns across architectures (Hermes XML, Gemma 4 <code>&lt;|tool_call&gt;</code>, raw JSON, ChatML), repairs common Qwen 3.5/3.6 escape quirks, and emits OpenAI-style <code>tool_calls</code> deltas in the SSE stream. The MLX Core app ships <b>10 built-in tools</b> (shell, file I/O, search, browse, web search, memory) and connects to MCP servers from a curated marketplace. Malformed tool-call JSON from small models is <a href="tool-calling/">repaired at the API layer</a>.</p>
       </details>
       <details class="faq-item">
         <summary>How does it stay this small / fast?</summary>
@@ -1565,6 +1763,18 @@
       <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/stargazers" target="_blank" rel="noopener">★ Star</a></li>
+    </ul>
+    <ul class="footer-dives">
+      <li><a href="claude-code-local/">Claude Code, local</a></li>
+      <li><a href="lm-studio-alternative/">LM Studio alternative</a></li>
+      <li><a href="ollama-alternative/">Ollama alternative</a></li>
+      <li><a href="image-generation/">Image generation</a></li>
+      <li><a href="video-generation/">Video generation</a></li>
+      <li><a href="voice-cloning/">Voice cloning</a></li>
+      <li><a href="tool-calling/">Tool calling</a></li>
+      <li><a href="agent-sandbox/">Agent Sandbox</a></li>
+      <li><a href="speculative-decoding/">Speculative decoding</a></li>
+      <li><a href="local-ai-assistant/">Always-on assistant</a></li>
     </ul>
     <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.1</span> · built for Apple Silicon</p>
   </footer>

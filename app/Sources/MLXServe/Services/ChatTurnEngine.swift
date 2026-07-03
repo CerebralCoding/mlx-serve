@@ -96,6 +96,34 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                            for: sessionId)
     }
 
+    /// A turn whose session no longer exists is a GHOST: every append/update
+    /// no-ops, the empty-response check reads "" from the missing session and
+    /// pad-retries with full generations, and the engine stays busy — blocking
+    /// every chat surface ("The model is answering another chat") with no
+    /// visible Stop anywhere, and no server restart can clear it (the turn is
+    /// app-side). Live capture 2026-07-03: a deleted agent chat kept a 27B
+    /// model generating for 10+ minutes across a server restart. Idle engines
+    /// are never orphaned — `activeTurnSessionId` deliberately keeps its last
+    /// value after a turn ends.
+    nonisolated static func turnOrphaned(isGenerating: Bool,
+                                         activeTurnSessionId: UUID?,
+                                         sessionIds: Set<UUID>) -> Bool {
+        guard isGenerating, let sid = activeTurnSessionId else { return false }
+        return !sessionIds.contains(sid)
+    }
+
+    /// Stop the in-flight turn if its session was removed. Called by
+    /// `AppState.deleteSession` right after removal (the only runtime
+    /// session-removal site); the agent loop also re-checks per iteration as
+    /// defense in depth for any future removal path.
+    func stopIfOrphaned() {
+        if Self.turnOrphaned(isGenerating: isGenerating,
+                             activeTurnSessionId: activeTurnSessionId,
+                             sessionIds: Set(appState.chatSessions.map(\.id))) {
+            stop()
+        }
+    }
+
     init(appState: AppState) {
         self.appState = appState
     }
@@ -389,6 +417,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
         for iteration in 0..<maxIterations {
             try Task.checkCancellation()
+
+            // Session deleted mid-turn → the turn is orphaned. Bail before
+            // issuing another request: with the session gone every append
+            // no-ops and the pad-retry path would burn full generations
+            // against an empty history (see `turnOrphaned`).
+            guard session(sessionId) != nil else { return }
 
             // Build message history for API
             let contextLength = AgentEngine.effectiveContextLength(

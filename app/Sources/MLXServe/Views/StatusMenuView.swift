@@ -169,6 +169,11 @@ struct StatusMenuView: View {
 
             Divider().padding(.horizontal, 12)
 
+            // "Update available" banner — hidden until the daily GitHub
+            // releases check finds a newer version. Self-observing subview so
+            // updater phase changes re-render only this row.
+            UpdateTrayRow(updates: appState.updates)
+
             // Server Control
             VStack(alignment: .leading, spacing: 8) {
                 HStack {
@@ -191,10 +196,12 @@ struct StatusMenuView: View {
                     // anything else lives in the Settings window the gear opens.
                     HStack(spacing: 6) {
                         Picker("Model", selection: $appState.selectedModelPath) {
-                            // Hide drafter checkpoints — they pair with a base
-                            // model via the Drafter toggle in Settings, not
-                            // loadable as a target on their own.
-                            let pickable = appState.localModels.filter { $0.kind == .base }
+                            // Hide drafter checkpoints (they pair with a base
+                            // model via the Drafter toggle in Settings) and
+                            // media / non-chat models (LTX, Falconsai NSFW
+                            // classifier, bert encoders) — not loadable as the
+                            // server's primary chat model.
+                            let pickable = appState.localModels.filter { $0.isChatPickable }
                             // macOS .menu Pickers key the checkmark by item
                             // TITLE — two same-named rows (one GGUF, one MLX)
                             // both rendered selected. Suffix duplicated names
@@ -669,6 +676,65 @@ struct StatusMenuView: View {
         Task {
             try? await server.unloadModel(id: id)
             unloadingIds.remove(id)
+        }
+    }
+}
+
+/// One-click in-app update banner for the tray menu. Visible only when the
+/// daily `UpdateChecker` run found a newer GitHub release; the button
+/// downloads the notarized DMG, swaps the installed bundle, and relaunches.
+/// Failures render inline with the releases page as the manual escape hatch.
+struct UpdateTrayRow: View {
+    @ObservedObject var updates: UpdateChecker
+
+    var body: some View {
+        if let update = updates.available {
+            VStack(alignment: .leading, spacing: 6) {
+                HStack(spacing: 8) {
+                    Image(systemName: "sparkles")
+                        .foregroundStyle(.blue)
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("MLX Core v\(update.version) is available")
+                            .font(.callout.weight(.medium))
+                        if case .failed(let message) = updates.phase {
+                            Text(message)
+                                .font(.caption2)
+                                .foregroundStyle(.red)
+                                .lineLimit(3)
+                                .textSelection(.enabled)
+                        } else if let page = update.releasePageURL {
+                            Link("Release notes", destination: page)
+                                .font(.caption2)
+                        }
+                    }
+                    Spacer()
+                    switch updates.phase {
+                    case .downloading, .installing:
+                        ProgressView()
+                            .controlSize(.small)
+                    default:
+                        Button("Update") {
+                            Task { await updates.downloadAndInstall() }
+                        }
+                        .buttonStyle(.borderedProminent)
+                        .controlSize(.small)
+                        .help("Download v\(update.version), install, and relaunch")
+                    }
+                }
+                if case .downloading(let fraction) = updates.phase {
+                    ProgressView(value: max(0, min(1, fraction)))
+                        .progressViewStyle(.linear)
+                }
+                if case .installing = updates.phase {
+                    Text("Installing — the app will relaunch")
+                        .font(.caption2)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(.horizontal, 16)
+            .padding(.vertical, 8)
+
+            Divider().padding(.horizontal, 12)
         }
     }
 }

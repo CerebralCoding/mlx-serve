@@ -606,7 +606,13 @@ class APIClient {
             if let fr = choices.first?["finish_reason"] as? String, fr == "length" {
                 continuation.yield(.maxTokensReached)
             }
-            if let fr = choices.first?["finish_reason"] as? String, fr == "tool_calls" {
+            // "length" + accumulated calls = a TRUNCATED tool call (max_tokens or
+            // server stall-timeout cut it mid-args). Deliver the salvaged calls so
+            // the agent loop's truncation branch (maxTokensHit && !calls.isEmpty)
+            // fires the chunk-and-retry nudge — before this, the server hid the
+            // cut behind finish_reason "tool_calls" and the model got blamed for
+            // "omitting" content it actually generated.
+            if let fr = choices.first?["finish_reason"] as? String, fr == "tool_calls" || fr == "length" {
                 var calls: [ToolCall] = []
                 for (_, tc) in pendingToolCalls.sorted(by: { $0.key < $1.key }) {
                     Self.appendToolLog("EMIT: name=\(tc.name) rawArgs=\(tc.args.prefix(500))")

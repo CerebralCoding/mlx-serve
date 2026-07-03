@@ -59,6 +59,13 @@ struct SettingsView: View {
                         MessagingSectionContent(bridge: appState.telegramBridge)
                     }
 
+                    SettingsSection(
+                        title: "Updates",
+                        subtitle: "New versions ship on the project's GitHub releases page. Installing downloads the notarized app, swaps it in place, and relaunches — chats, models, and settings are untouched."
+                    ) {
+                        UpdatesSectionContent(updates: appState.updates)
+                    }
+
                     ResetDefaultsFooter()
                 }
                 .padding(.horizontal, 24)
@@ -1437,5 +1444,86 @@ private struct MessagingSectionContent: View {
             .clipShape(Capsule())
             .lineLimit(2)
             .frame(maxWidth: 280, alignment: .trailing)
+    }
+}
+
+// MARK: - Updates section
+
+/// Auto-update controls: the daily-check toggle, a manual check button with
+/// inline status, and — once a newer release is known — an install row that
+/// mirrors the tray banner's one-click update.
+private struct UpdatesSectionContent: View {
+    @ObservedObject var updates: UpdateChecker
+
+    var body: some View {
+        SettingsRow(
+            title: "Check for updates automatically",
+            explainer: "Checks the GitHub releases page once a day and shows an update banner in the menu bar tray when a newer version ships. No data beyond the version request leaves this Mac."
+        ) {
+            Toggle("", isOn: Binding(
+                get: { updates.autoCheckEnabled },
+                set: { updates.autoCheckEnabled = $0 }))
+                .toggleStyle(.switch)
+                .labelsHidden()
+        }
+
+        SettingsRow(
+            title: "Installed version — v\(updates.currentVersion)",
+            explainer: statusText
+        ) {
+            Button {
+                Task { await updates.check(userInitiated: true) }
+            } label: {
+                if case .checking = updates.phase {
+                    ProgressView().controlSize(.small)
+                } else {
+                    Text("Check Now")
+                }
+            }
+            .disabled(busy)
+        }
+
+        if let update = updates.available {
+            SettingsRow(
+                title: "MLX Core v\(update.version) is available",
+                explainer: "Downloads MLXCore.dmg from the release, replaces the app, and relaunches."
+            ) {
+                switch updates.phase {
+                case .downloading(let fraction):
+                    ProgressView(value: max(0, min(1, fraction)))
+                        .progressViewStyle(.linear)
+                        .frame(width: 160)
+                case .installing:
+                    ProgressView().controlSize(.small)
+                default:
+                    Button("Download & Install") {
+                        Task { await updates.downloadAndInstall() }
+                    }
+                    .buttonStyle(.borderedProminent)
+                }
+            }
+        }
+    }
+
+    private var busy: Bool {
+        switch updates.phase {
+        case .checking, .downloading, .installing: return true
+        default: return false
+        }
+    }
+
+    private var statusText: String {
+        switch updates.phase {
+        case .upToDate:
+            return "You're on the latest release."
+        case .failed(let message):
+            return "Update failed: \(message)"
+        case .installing:
+            return "Installing — the app will relaunch."
+        case .downloading:
+            return "Downloading the update…"
+        default:
+            return "Releases are published at github.com/\(UpdateChecker.repo)/releases."
+        }
     }
 }

@@ -594,6 +594,18 @@ fn resolveRequestMaxTokens(v: ?std.json.Value, auto_default: u32) u32 {
     };
 }
 
+/// Finish reason for a response whose generated text yielded tool calls.
+/// A TRUNCATED generation ("length": max_tokens or the request timeout) must
+/// keep reporting "length" even when the cut-off text salvaged a partial tool
+/// call (the truncated-opener recovery in chat.parseToolCalls) — clients key
+/// their truncation recovery on it (the app's chunk-and-retry nudge fires on
+/// finish_reason "length" + tool calls present). Overriding to "tool_calls"
+/// hides the cut: the client executes a half-argument call, blames the model
+/// ("you sent no content"), and the model re-emits the same doomed mega-call.
+fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
+    return if (std.mem.eql(u8, pre_parse, "length")) "length" else "tool_calls";
+}
+
 fn getOrInitResponseStore(io: std.Io, gpa: std.mem.Allocator) *responses_mod.ResponseStore {
     if (global_response_store == null) {
         global_response_store = responses_mod.ResponseStore.init(io, gpa, RESPONSE_STORE_CAP);
@@ -4244,13 +4256,14 @@ fn handleNonStreamingGeneration(
             defer allocator.free(tc_timings_field);
 
             const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"tool_calls"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
+                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
             , .{
                 nowMs(stream.io),
                 nowSecs(stream.io),
                 model_name,
                 tc_reasoning_json,
                 tc_buf.items,
+                toolCallFinishReason(finish_reason),
                 result.prompt_tokens,
                 result.completion_tokens,
                 result.prompt_tokens + result.completion_tokens,
@@ -5042,6 +5055,17 @@ fn handleStreamingGeneration(
         log.debug("  checking {d} bytes of streamed text for tool calls\n", .{text_buf.items.len});
         if (log.isDebug() and text_buf.items.len > 0) {
             log.debug("  raw generated text before tool parse ({d}b): {s}\n", .{ text_buf.items.len, text_buf.items[0..@min(text_buf.items.len, 4000)] });
+            // Corpus-harvest aid: the inline dump caps at 4KB, useless for
+            // >30KB mega-tool-calls. Set MLX_SERVE_RAW_DUMP_FILE=<abs path> to
+            // write the FULL pre-parse buffer (overwritten per request).
+            if (std.c.getenv("MLX_SERVE_RAW_DUMP_FILE")) |dump_path| dump: {
+                const f = std.Io.Dir.createFileAbsolute(stream.io, std.mem.span(dump_path), .{}) catch break :dump;
+                defer f.close(stream.io);
+                var wb: [4096]u8 = undefined;
+                var fw = f.writer(stream.io, &wb);
+                fw.interface.writeAll(text_buf.items) catch {};
+                fw.interface.flush() catch {};
+            }
         }
         // Merge re-opened mid-text thought channels into the leading block so
         // the split/parse below never leaks raw tags (Gemma 12B tail behavior).
@@ -5103,7 +5127,7 @@ fn handleStreamingGeneration(
                 defer allocator.free(first_delta);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null);
             }
-            finish_reason = "tool_calls";
+            finish_reason = toolCallFinishReason(finish_reason);
         } else {
             // No tool calls found — flush buffered tokens as content
             if (enable_thinking) {
@@ -6992,7 +7016,7 @@ fn handleAnthropicNonStreaming(
                 try content.appendSlice(allocator, tc_block);
                 block_count += 1;
             }
-            finish_reason = "tool_calls";
+            finish_reason = toolCallFinishReason(finish_reason);
         } else {
             // No tool calls — emit text block
             if (block_count > 0) try content.append(allocator, ',');
@@ -7571,7 +7595,7 @@ fn handleAnthropicStreaming(
                 try sendAnthropicEvent(stream, "content_block_stop", stop);
                 block_index += 1;
             }
-            finish_reason = "tool_calls";
+            finish_reason = toolCallFinishReason(finish_reason);
         } else {
             // No tool calls — flush buffered tokens
             if (enable_thinking) {
@@ -10468,6 +10492,21 @@ test "prefix cache default capacity covers interleaved agent flows" {
     // still bounds memory.
     try testing.expect(prefix_cache_capacity >= 4);
     try testing.expect(prefix_cache_mem_bytes > 0);
+}
+
+test "toolCallFinishReason preserves truncation over parsed tool calls" {
+    // A truncated generation ("length": max_tokens OR request timeout) whose
+    // cut-off text still salvaged a partial tool call must KEEP reporting
+    // "length" — clients key their truncation recovery (chunk-and-retry
+    // nudges) on it. Reporting "tool_calls" hides the cut: the client
+    // executes a half-argument call and tells the model IT made a mistake.
+    // Live capture 2026-07-03: Qwen3.6-27B 33KB writeFile guillotined by the
+    // 300s default timeout arrived as {"path":...} with finish "tool_calls".
+    try std.testing.expectEqualStrings("length", toolCallFinishReason("length"));
+    // Everything else stays the normal tool-call finish.
+    try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("stop"));
+    try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("tool_calls"));
+    try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("client_disconnect"));
 }
 
 test "resolveSamplingDefault: request > CLI > generation_config > fallback" {

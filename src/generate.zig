@@ -278,7 +278,8 @@ pub const Generator = struct {
     eos_token_ids: []const u32,
     generated_ids: std.ArrayList(u32),
     consecutive_pad: u32 = 0, // count of consecutive token-0 (pad) generations
-    timeout_ns: u64, // 0 = no timeout
+    timeout_ns: u64, // 0 = no timeout; measures SILENCE, not total time (see StallClock)
+    stall: StallClock = .{},
     timer: io_util.Stopwatch,
     logprobs_n: u32 = 0, // 0 = disabled, >0 = number of top_logprobs to return
     last_logprob: ?LogprobResult = null, // logprob result for the most recently returned token
@@ -2855,7 +2856,7 @@ pub const Generator = struct {
             self.done = true;
             return null;
         }
-        if (self.timeout_ns > 0 and self.timer.read() >= self.timeout_ns) {
+        if (self.stall.expired(self.timer.read(), self.generated_ids.items.len, self.timeout_ns)) {
             self.done = true;
             self.finish_reason = "length";
             return null;
@@ -2966,7 +2967,7 @@ pub const Generator = struct {
             self.finish_reason = "length";
             return true;
         }
-        if (self.timeout_ns > 0 and self.timer.read() >= self.timeout_ns) {
+        if (self.stall.expired(self.timer.read(), self.generated_ids.items.len, self.timeout_ns)) {
             self.done = true;
             self.finish_reason = "length";
             return true;
@@ -3685,6 +3686,30 @@ pub fn isEosId(id: u32, eos: []const u32) bool {
 /// few dozen tokens instead of running all the way to `max_tokens`.
 pub const degenerate_loop_max_period: usize = 8;
 pub const degenerate_loop_reps: usize = 16;
+
+/// Stall clock for the request timeout: the deadline measures time since the
+/// last PRODUCED token, not since the request started. A wall-clock request
+/// timeout kills legitimate long generations — live capture 2026-07-03:
+/// Qwen3.6-27B writing a 33KB file in one tool call decodes for >300s at
+/// ~30 tok/s and was guillotined mid-call by the 300s default, which then
+/// surfaced as a "butchered" path-only tool call. Progress is detected from
+/// the generated-token COUNT at each check, so every decode path (regular,
+/// PLD, drafter, MTP — which don't all share an emit site) resets the clock
+/// without instrumentation; a request that stops producing (hung forward,
+/// deadlock) still times out after `timeout_ns` of silence.
+pub const StallClock = struct {
+    last_progress_ns: u64 = 0,
+    last_progress_count: usize = 0,
+
+    pub fn expired(self: *StallClock, now_ns: u64, generated_count: usize, timeout_ns: u64) bool {
+        if (generated_count != self.last_progress_count) {
+            self.last_progress_count = generated_count;
+            self.last_progress_ns = now_ns;
+        }
+        if (timeout_ns == 0) return false;
+        return now_ns -| self.last_progress_ns >= timeout_ns;
+    }
+};
 
 /// Detect a degenerate tail loop: the model is stuck emitting the same short
 /// token cycle over and over. Returns true when the last `reps` repetitions of
@@ -4753,6 +4778,24 @@ test "InitOptions.lookup_prompt = null preserves existing behavior" {
     try testing.expectEqual(prompt.len, src.len);
     try testing.expectEqualSlices(u32, &prompt, src);
     try testing.expectEqual(@as([*]const u32, prompt[0..].ptr), src.ptr);
+}
+
+test "StallClock: progress resets the deadline, silence expires it, 0 disables" {
+    var clock = StallClock{};
+    const s = std.time.ns_per_s;
+    // Producing tokens keeps resetting the deadline — a healthy generation
+    // can run arbitrarily long (the live bug: a 33KB tool call at 30 tok/s
+    // takes >300s and was guillotined mid-call by the wall-clock timeout).
+    try std.testing.expect(!clock.expired(0 * s, 0, 300 * s));
+    try std.testing.expect(!clock.expired(299 * s, 1000, 300 * s)); // progress at 299s
+    try std.testing.expect(!clock.expired(598 * s, 2000, 300 * s)); // progress again
+    // No new tokens for the full window -> stalled.
+    try std.testing.expect(!clock.expired(700 * s, 2000, 300 * s));
+    try std.testing.expect(clock.expired(898 * s, 2000, 300 * s));
+    // 0 = disabled, even after silence.
+    var off = StallClock{};
+    try std.testing.expect(!off.expired(0, 0, 0));
+    try std.testing.expect(!off.expired(10_000 * s, 0, 0));
 }
 
 test "isDegenerateTailLoop catches a repeated channel-opener cycle" {

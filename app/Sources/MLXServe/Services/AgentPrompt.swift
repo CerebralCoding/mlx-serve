@@ -17,12 +17,24 @@ enum AgentPrompt {
     /// this dynamically: a flat 16384 would lie to the model about its real room.
     /// Stable within a session, so it rides in the volatile tail without
     /// disturbing the KV prefix.
+    /// Below this effective budget the warning is emitted; at or above it the
+    /// section is omitted entirely. A single one-shot file write measured
+    /// live runs 8–10.7K tokens, so under ~12K a routine write genuinely
+    /// risks being cut mid-call; above it the warning has no job to do — and
+    /// an honest "you have ~419430 tokens per response" on a roomy machine
+    /// reads as an invitation to one-shot a whole website in one multi-minute
+    /// tool call (live 2026-07-03, Qwen3.6-27B). The chunking convention
+    /// itself lives in the writeFile tool description, which no longer has a
+    /// giant budget number contradicting it.
+    static let outputBudgetGuidanceThreshold = 12288
+
     static func outputBudgetGuidance(maxTokens: Int, contextLength: Int) -> String {
         let contextBudget = contextLength > 0 ? max(256, contextLength * 2 / 5) : 8192
         let cap = maxTokens > 0 ? maxTokens : Int.max
         let effective = min(cap, contextBudget)
-        let safeTokens = max(256, effective / 2)
-        let safeLines = max(20, safeTokens / 10)
+        guard effective < Self.outputBudgetGuidanceThreshold else { return "" }
+        let safeTokens = max(256, min(effective / 2, 2048))
+        let safeLines = max(20, min(safeTokens / 10, 200))
         return "\n\n# Output budget\n"
             + "This machine gives you about \(effective) tokens per response. Exceed it and the response is cut off mid-write: a tool call in progress is LOST (the file is NOT written) and the turn can end unfinished. Keep any single writeFile/editFile content under ~\(safeLines) lines (~\(safeTokens) tokens). For a larger file, write the first chunk, then call writeFile again with append:\"true\" for each remaining chunk — a shell heredoc has the same cap, so chunking is the only fix."
     }
@@ -44,7 +56,7 @@ enum AgentPrompt {
 
         - File tools are confined to the working directory: use relative paths; paths outside it are rejected.
         - ALWAYS readFile before editFile (you need the line numbers it shows). editFile is line-based (startLine/endLine/replace — preferred) or text-based (find/replace — must match exactly); writeFile overwrites the whole file.
-        - A whole file must fit in one response (it's part of your output), so a very large writeFile can get cut off mid-write — for a big file, write it in chunks: a first writeFile, then writeFile with append:"true" for each remaining chunk. Keep each call within your output budget (stated at the end of this prompt).
+        - A whole file must fit in one response (it's part of your output), so a very large writeFile can get cut off mid-write — for a big file, write it in chunks: a first writeFile, then writeFile with append:"true" for each remaining chunk. If an output budget is stated at the end of this prompt, keep each call within it.
 
         # Shell
 

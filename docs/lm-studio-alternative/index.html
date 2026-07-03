@@ -1,0 +1,236 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>LM Studio Alternative for Mac — Faster on the Same File · mlx-serve</title>
+  <meta name="description" content="mlx-serve is a native, MIT-licensed LM Studio alternative for Apple Silicon: +35% faster on identical MLX weights, +12–15% faster on the very same GGUF file, no Electron, no Python. It even auto-discovers your existing LM Studio model folder — switch without re-downloading anything.">
+  <meta name="keywords" content="LM Studio alternative, LM Studio alternative Mac, faster than LM Studio, LM Studio vs mlx-serve, local LLM server Mac, MLX inference server, GGUF server Mac, open source LM Studio replacement, native Mac LLM app no Electron">
+  <meta name="author" content="David Dalcu">
+  <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/lm-studio-alternative/">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/lm-studio-alternative/">
+  <meta property="og:title" content="The LM Studio alternative that wins on the same file">
+  <meta property="og:description" content="+35% faster on identical MLX weights, +12–15% on the same GGUF. Native menu-bar app, MIT license, and it reuses your existing LM Studio model folder.">
+  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/perf-vs-lmstudio-gemma-26.5.6.png">
+  <meta property="og:site_name" content="mlx-serve">
+  <meta name="twitter:card" content="summary_large_image">
+  <meta name="twitter:title" content="The LM Studio alternative that wins on the same file">
+  <meta name="twitter:description" content="+35% faster on identical MLX weights, +12–15% on the same GGUF. Native app, MIT license, reuses your LM Studio models.">
+  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/perf-vs-lmstudio-gemma-26.5.6.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      { "@type": "ListItem", "position": 1, "name": "mlx-serve", "item": "https://ddalcu.github.io/mlx-serve/" },
+      { "@type": "ListItem", "position": 2, "name": "LM Studio alternative", "item": "https://ddalcu.github.io/mlx-serve/lm-studio-alternative/" }
+    ]
+  }
+  </script>
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "FAQPage",
+    "mainEntity": [
+      {
+        "@type": "Question",
+        "name": "Is mlx-serve faster than LM Studio?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes — every cell, every model benchmarked. On identical 4-bit MLX weights mlx-serve wins by +35% geomean across 18 workloads (Gemma 4 and Qwen 3.6 families, best-vs-best). On the same .gguf file, mlx-serve's embedded llama.cpp beats LM Studio's wrapper by +12–15% on decode and +5% on prefill. Speculative decoding pushes echo-heavy workloads up to 2.65×." }
+      },
+      {
+        "@type": "Question",
+        "name": "Can I switch from LM Studio without re-downloading my models?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes. MLX Core auto-discovers LM Studio's existing model folder via ~/.lmstudio/settings.json, so everything already on disk shows up in the model picker immediately — MLX and GGUF alike." }
+      },
+      {
+        "@type": "Question",
+        "name": "What does mlx-serve have that LM Studio doesn't?",
+        "acceptedAnswer": { "@type": "Answer", "text": "A native Anthropic Messages API (Claude Code works out of the box), the OpenAI Responses API with WebSockets, a drop-in Ollama API, agent mode with 10 built-in tools and MCP, an isolated Linux VM sandbox for agent shell commands, speculative decoding, KV-cache quantization, continuous batching, DeepSeek V4 Flash via the embedded ds4 engine, and fully local image, video, and voice generation. It's also MIT-licensed and a native menu-bar app rather than Electron." }
+      },
+      {
+        "@type": "Question",
+        "name": "Does mlx-serve run GGUF models like LM Studio does?",
+        "acceptedAnswer": { "@type": "Answer", "text": "Yes — llama.cpp's inference library is embedded inside the same signed, notarized binary, so any .gguf on HuggingFace runs. The server auto-detects the format and routes to the right engine; no separate llama-server, no Python." }
+      }
+    ]
+  }
+  </script>
+  <link rel="icon" href="../appiconb.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/feature.css">
+  <style>:root { --accent: #0071e3; --accent2: #00c6fb; }</style>
+</head>
+<body>
+
+  <nav>
+    <a href="../" class="nav-logo">
+      <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
+      <span>mlx-serve</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="../" class="hide-mobile">Overview</a></li>
+      <li><a href="#benchmarks" class="hide-mobile">Benchmarks</a></li>
+      <li><a href="#faq" class="hide-mobile">FAQ</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl">Download</a></li>
+    </ul>
+  </nav>
+
+  <section class="hero-f">
+    <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
+    <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">Comparison · LM Studio</span></div>
+    <h1>The LM Studio alternative<br>that wins <span class="grad">on the same file.</span></h1>
+    <p class="hero-f-sub">Identical weights, identical Mac, identical prompts — mlx-serve decodes <b>+35% faster (geomean)</b> on MLX models and <b>+12–15%</b> on the very same <code style="font-family:var(--mono);font-size:0.85em;">.gguf</code>. Native menu-bar app, MIT license, no Electron, no Python.</p>
+    <div class="hero-ctas">
+      <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M21 15v4a2 2 0 01-2 2H5a2 2 0 01-2-2v-4"/><polyline points="7 10 12 15 17 10"/><line x1="12" y1="15" x2="12" y2="3"/></svg>
+        Try it — keeps your models
+      </a>
+      <a href="#benchmarks" class="btn btn-secondary">See the benchmarks</a>
+    </div>
+    <div class="hero-f-meta">
+      <span><b>Finds your LM Studio models</b> — no re-download</span>
+      <span><b>MIT</b> licensed</span>
+      <span><b>~4.5 MB</b> server binary</span>
+    </div>
+  </section>
+
+  <section class="section" id="benchmarks">
+    <div class="section-header reveal">
+      <div class="section-label">Benchmarks</div>
+      <h2 class="section-title">Every cell, every model</h2>
+      <p class="section-desc">Best mlx-serve vs best LM Studio, identical 4-bit MLX weights, ctx 4096, temp 0. Reproduce with <code>tests/bench.sh --family gemma --lmstudio</code> — the harness ships in the repo.</p>
+    </div>
+    <div class="stat-band reveal" style="margin-bottom: 56px;">
+      <div class="stat"><div class="n">+35%</div><div class="l">geomean across 18 workloads, MLX vs MLX</div></div>
+      <div class="stat"><div class="n">+15%</div><div class="l">decode on the identical .gguf file</div></div>
+      <div class="stat"><div class="n">2.65×</div><div class="l">Gemma 4 E4B echo with speculative decoding</div></div>
+      <div class="stat"><div class="n">7.7×</div><div class="l">faster warm time-to-first-token</div></div>
+    </div>
+    <figure class="shot reveal">
+      <div class="shot-frame"><img src="../perf-vs-lmstudio-gemma-26.5.6.png" alt="Benchmark chart: mlx-serve vs LM Studio on Gemma 4 models, identical MLX weights" loading="lazy"></div>
+      <figcaption>Gemma 4 family, identical 4-bit MLX weights — echo +60–122%, code +47–53%, free-form +20–35%.</figcaption>
+    </figure>
+    <figure class="shot reveal" style="margin-top: 28px;">
+      <div class="shot-frame"><img src="../perf-vs-lmstudio-qwen36-26.5.6.png" alt="Benchmark chart: mlx-serve vs LM Studio on Qwen 3.6 models, identical MLX weights" loading="lazy"></div>
+      <figcaption>Qwen 3.6 family — including the 35B-A3B MoE at +88% on echo.</figcaption>
+    </figure>
+  </section>
+
+  <section class="section section-alt">
+    <div class="section-header reveal">
+      <div class="section-label">Head to head</div>
+      <h2 class="section-title">What you gain by switching</h2>
+    </div>
+    <div class="tbl-wrap reveal">
+      <table class="tbl">
+        <thead><tr><th>Capability</th><th class="hl">mlx-serve</th><th>LM Studio</th></tr></thead>
+        <tbody>
+          <tr><td>MLX + GGUF models</td><td class="hl"><span class="yes">✓</span></td><td><span class="yes">✓</span></td></tr>
+          <tr><td>Decode speed, identical weights</td><td class="hl">+35% geomean</td><td>baseline</td></tr>
+          <tr><td>OpenAI-compatible API</td><td class="hl"><span class="yes">✓</span></td><td><span class="yes">✓</span></td></tr>
+          <tr><td>Anthropic Messages API (Claude Code)</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
+          <tr><td>OpenAI Responses API + WebSockets</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
+          <tr><td>Ollama API (drop-in for Ollama clients)</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
+          <tr><td>Speculative decoding (PLD + drafter + MTP)</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
+          <tr><td>KV-cache quantization</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
+          <tr><td>Continuous batching</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
+          <tr><td>Agent mode + MCP client</td><td class="hl"><span class="yes">✓</span> 10 tools</td><td><span class="no">✗</span></td></tr>
+          <tr><td>Sandboxed agent shell (Linux VM)</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
+          <tr><td>DeepSeek V4 Flash (284B)</td><td class="hl"><span class="yes">✓</span> via ds4</td><td><span class="no">✗</span></td></tr>
+          <tr><td>Image / video / voice generation, local</td><td class="hl"><span class="yes">✓</span></td><td><span class="no">✗</span></td></tr>
+          <tr><td>App runtime</td><td class="hl">Native Swift</td><td>Electron</td></tr>
+          <tr><td>License</td><td class="hl">MIT</td><td>Proprietary</td></tr>
+        </tbody>
+      </table>
+    </div>
+    <p class="tbl-note">Feature set as of v26.7.1. Benchmark details, CSVs, and the reproduction harness live in the <a class="prose-link" href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">repo</a>.</p>
+  </section>
+
+  <section class="section">
+    <div class="split">
+      <div class="split-copy reveal">
+        <span class="split-kicker">Migration</span>
+        <h3>Switching takes one download — yours is the only one you skip</h3>
+        <p>MLX Core reads LM Studio's own <code>~/.lmstudio/settings.json</code> and auto-discovers your existing model folder, so <b>everything you've already downloaded shows up in the picker immediately</b> — MLX and GGUF alike. Your OpenAI-compatible clients keep working too: same wire protocol, just a different port.</p>
+        <p>And on the same <code>.gguf</code> you were already running, the embedded llama.cpp engine decodes 12–15% faster than LM Studio's wrapper — before any of the MLX-side wins.</p>
+      </div>
+      <div class="split-visual reveal">
+        <ul class="ticks">
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Zero re-downloads</b> — your LM Studio model folder is auto-discovered.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Same API shape</b> — point Continue, Cursor, Open WebUI at the new port.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Plus Claude Code</b> — a real Anthropic endpoint LM Studio never had.</span></li>
+          <li><svg viewBox="0 0 24 24" fill="none"><polyline points="20 6 9 17 4 12"/></svg><span><b>Signed &amp; notarized</b> — no "unidentified developer" dialogs.</span></li>
+        </ul>
+      </div>
+    </div>
+  </section>
+
+  <section class="section section-alt" id="faq">
+    <div class="section-header reveal">
+      <div class="section-label">FAQ</div>
+      <h2 class="section-title">Switching questions, answered</h2>
+    </div>
+    <div class="faq-wrap reveal">
+      <details class="faq-item">
+        <summary>Is mlx-serve really faster than LM Studio?</summary>
+        <p>Yes — every cell, every model we've benchmarked. <b>+35% geomean across 18 workloads</b> on identical 4-bit MLX weights (Gemma 4 E2B/E4B/31B/26B-A4B-MoE, Qwen 3.6 27B/35B-A3B-MoE), and <b>+12–15% decode</b> on the very same <code>.gguf</code> file. The benchmark harness ships in the repo so you can reproduce it on your own machine.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Do I have to re-download my models?</summary>
+        <p>No. MLX Core auto-discovers LM Studio's model folder via <code>~/.lmstudio/settings.json</code> — everything on disk appears in the picker. A custom-folder picker covers models stored anywhere else.</p>
+      </details>
+      <details class="faq-item">
+        <summary>What does it add beyond speed?</summary>
+        <p>An Anthropic Messages API (<a href="../claude-code-local/">Claude Code works natively</a>), the OpenAI Responses API + WebSockets, a <a href="../ollama-alternative/">drop-in Ollama API</a>, agent mode with MCP, an <a href="../agent-sandbox/">isolated Linux VM for agent shell commands</a>, <a href="../speculative-decoding/">speculative decoding</a>, KV-cache quantization, continuous batching, DeepSeek V4 Flash, and fully local <a href="../image-generation/">image</a>, <a href="../video-generation/">video</a>, and <a href="../voice-cloning/">voice</a> generation.</p>
+      </details>
+      <details class="faq-item">
+        <summary>Is it open source?</summary>
+        <p>Yes — MIT license, server and app both. LM Studio is proprietary freeware; mlx-serve you can read, fork, and ship.</p>
+      </details>
+    </div>
+  </section>
+
+  <section class="section">
+    <div class="section-header reveal">
+      <div class="section-label">Go deeper</div>
+      <h2 class="section-title">More deep dives</h2>
+    </div>
+    <div class="related-grid reveal">
+      <a class="related-card" href="../ollama-alternative/"><span class="related-kicker">Comparison</span><h4>Ollama alternative <span class="go">→</span></h4><p>Drop-in /api compatibility with native MLX speed.</p></a>
+      <a class="related-card" href="../claude-code-local/"><span class="related-kicker">Coding agents</span><h4>Claude Code, fully local <span class="go">→</span></h4><p>Free, offline, private — point it at your own Mac.</p></a>
+      <a class="related-card" href="../speculative-decoding/"><span class="related-kicker">Performance</span><h4>Speculative decoding <span class="go">→</span></h4><p>PLD, drafters, native MTP — exact output, faster.</p></a>
+      <a class="related-card" href="../image-generation/"><span class="related-kicker">Media</span><h4>Image generation &amp; editing <span class="go">→</span></h4><p>FLUX.2 + Krea-2, instruction edits, style LoRAs.</p></a>
+      <a class="related-card" href="../video-generation/"><span class="related-kicker">Media</span><h4>Video generation <span class="go">→</span></h4><p>Text, photo, or soundtrack to video — on device.</p></a>
+      <a class="related-card" href="../agent-sandbox/"><span class="related-kicker">Safety</span><h4>Agent Sandbox <span class="go">→</span></h4><p>Agent shell commands in an isolated Linux VM.</p></a>
+    </div>
+  </section>
+
+  <section class="section" style="padding-top: 0;">
+    <div class="cta-band reveal">
+      <h2>Same models. Faster engine.</h2>
+      <p>Download MLX Core — it finds your LM Studio models on first launch, so the switch costs you nothing but the download.</p>
+      <div class="hero-ctas">
+        <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">Download for Mac</a>
+        <a href="https://github.com/ddalcu/mlx-serve" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <ul class="footer-links">
+      <li><a href="../">Home</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">GitHub</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
+    </ul>
+    <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
+  </footer>
+
+  <script src="../assets/feature.js"></script>
+</body>
+</html>

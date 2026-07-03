@@ -31,7 +31,7 @@ struct NewTaskSheet: View {
     }
 
     private var baseModels: [LocalModel] {
-        appState.localModels.filter { $0.kind == .base }
+        appState.localModels.filter { $0.isChatPickable }
     }
 
     private var isEditing: Bool { existing != nil }

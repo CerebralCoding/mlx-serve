@@ -2,25 +2,34 @@ import XCTest
 @testable import MLXCore
 
 final class AgentPromptTests: XCTestCase {
-    // The output-budget note must reflect the EFFECTIVE per-response budget —
-    // min(max_tokens, ~2/5 of context) — not a flat cap, so a small-RAM /
-    // small-context machine gets an honest (smaller) number.
-    func testOutputBudgetGuidanceIsContextAware() {
-        // Small context caps below a high max_tokens cap: 4096 * 2/5 = 1638.
+    // The output-budget section is a SCARCITY warning — it exists to stop
+    // work being lost past a tight cap. It must appear ONLY when the
+    // effective budget (min(max_tokens, ~2/5 of context)) is genuinely tight
+    // (< ~12K tokens: a single one-shot file write measured live runs
+    // 8–10.7K). Roomy machines get NO section at all — an honest "you have
+    // ~419430 tokens per response" reads as an invitation to one-shot a
+    // whole website in one 5-minute tool call (live 2026-07-03, Qwen3.6-27B);
+    // the chunking convention lives in the writeFile tool description.
+    func testOutputBudgetGuidanceOnlyAppearsWhenBudgetIsTight() {
+        // Roomy: huge ctx slider, default 16K cap, or Auto on a 131K model.
+        XCTAssertEqual(AgentPrompt.outputBudgetGuidance(maxTokens: 0, contextLength: 1_048_576), "")
+        XCTAssertEqual(AgentPrompt.outputBudgetGuidance(maxTokens: 16384, contextLength: 131_072), "")
+        XCTAssertEqual(AgentPrompt.outputBudgetGuidance(maxTokens: 0, contextLength: 131_072), "")
+
+        // Tight via small context: 4096 * 2/5 = 1638 — warning appears,
+        // with the honest context-derived numbers, never the 16384 cap.
         let smallCtx = AgentPrompt.outputBudgetGuidance(maxTokens: 16384, contextLength: 4096)
         XCTAssertTrue(smallCtx.contains("1638"), "small context must cap the budget: \(smallCtx)")
         XCTAssertFalse(smallCtx.contains("16384"),
                        "must not advertise the unreachable 16384 cap: \(smallCtx)")
+        XCTAssertTrue(smallCtx.contains("~81 lines (~819 tokens)"),
+                      "chunk advice must stay context-derived: \(smallCtx)")
 
-        // Auto (max_tokens <= 0) pegs purely to context: 131072 * 2/5 = 52428.
-        let auto = AgentPrompt.outputBudgetGuidance(maxTokens: 0, contextLength: 131072)
-        XCTAssertTrue(auto.contains("52428"), "Auto must peg to context: \(auto)")
+        // Tight via a user-lowered max_tokens on a roomy model.
+        let capped = AgentPrompt.outputBudgetGuidance(maxTokens: 4096, contextLength: 131_072)
+        XCTAssertTrue(capped.contains("4096"), "explicit low cap must warn: \(capped)")
 
-        // An explicit cap below the context budget still wins.
-        let capped = AgentPrompt.outputBudgetGuidance(maxTokens: 4096, contextLength: 131072)
-        XCTAssertTrue(capped.contains("4096"), "explicit cap below context budget must win: \(capped)")
-
-        // Always points at append-chunk recovery and warns the work is lost.
+        // The warning always points at append-chunk recovery and the loss risk.
         XCTAssertTrue(smallCtx.lowercased().contains("append"), "must point at append chunking")
         XCTAssertTrue(smallCtx.contains("LOST") || smallCtx.lowercased().contains("cut off"),
                       "must warn the work is lost on overflow")
