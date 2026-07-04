@@ -472,6 +472,16 @@ mlx-serve stands on a lot of open-source shoulders. Huge thanks to all of these 
 
 If we missed you, please open a PR — happy to add anyone who landed code, fixtures, or a fix here.
 
+## Star History
+
+<a href="https://www.star-history.com/?repos=ddalcu%2Fmlx-serve&type=date&legend=top-left">
+ <picture>
+   <source media="(prefers-color-scheme: dark)" srcset="https://api.star-history.com/chart?repos=ddalcu/mlx-serve&type=date&theme=dark&legend=top-left" />
+   <source media="(prefers-color-scheme: light)" srcset="https://api.star-history.com/chart?repos=ddalcu/mlx-serve&type=date&legend=top-left" />
+   <img alt="Star History Chart" src="https://api.star-history.com/chart?repos=ddalcu/mlx-serve&type=date&legend=top-left" />
+ </picture>
+</a>
+
 ## License
 
 MIT — see [LICENSE](LICENSE).
