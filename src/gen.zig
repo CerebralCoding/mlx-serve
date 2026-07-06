@@ -20,14 +20,19 @@ const krea = @import("krea.zig");
 const lora_mod = @import("lora.zig");
 const nsfw = @import("nsfw.zig");
 const tts = @import("tts.zig");
+const acestep = @import("acestep.zig");
 const ltx = @import("ltx_video.zig");
 const ltx_audio = @import("ltx_audio.zig");
+const hy3d = @import("hunyuan3d.zig");
+const hy3d_paint = @import("hunyuan3d_paint.zig");
+const glb_mod = @import("glb.zig");
 const wav_mod = @import("wav.zig");
 const png_mod = @import("png.zig");
 const tok_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const chat_mod = @import("chat.zig");
 const log = @import("log.zig");
+const metrics = @import("status.zig");
 const sse = @import("gen_sse.zig");
 const server_mod = @import("server.zig");
 const stb = @cImport({
@@ -43,12 +48,14 @@ pub const Modality = enum {
     image,
     audio,
     video,
+    mesh,
 
     pub fn capability(self: Modality) []const u8 {
         return switch (self) {
             .image => "image",
             .audio => "audio",
             .video => "video",
+            .mesh => "3d",
         };
     }
 
@@ -60,6 +67,7 @@ pub const Modality = enum {
             .image => "flux2",
             .audio => "qwen3_tts",
             .video => "AudioVideo",
+            .mesh => "hunyuan3d_2_1",
         };
     }
 };
@@ -73,8 +81,36 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.startsWith(u8, model_type, "flux2")) return .image;
     if (std.mem.startsWith(u8, model_type, "krea")) return .image;
     if (std.mem.eql(u8, model_type, "qwen3_tts")) return .audio;
+    if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
+    if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     return null;
+}
+
+/// Endpoint-level media route. `.speech` and `.music` share the `.audio`
+/// modality/engine slot — the loaded `AudioBackend` arm decides which endpoint
+/// is valid (wrong pairing → explicit 400, never a silent misinterpretation).
+pub const GenRoute = enum {
+    image,
+    speech,
+    music,
+    video,
+    mesh,
+
+    pub fn modality(self: GenRoute) Modality {
+        return switch (self) {
+            .image => .image,
+            .speech, .music => .audio,
+            .video => .video,
+            .mesh => .mesh,
+        };
+    }
+};
+
+/// Which audio backend a `model_type` selects (pure; pins the dispatch the
+/// `AudioEngine.load` re-peek performs).
+pub fn audioBackendKindForType(model_type: []const u8) enum { tts, music } {
+    return if (std.mem.eql(u8, model_type, "acestep")) .music else .tts;
 }
 
 /// Peek `model_dir/config.json` for its `model_type` string (owned dupe, caller
@@ -130,17 +166,53 @@ const FLUX_SEQ_LEN: usize = 512; // mflux Qwen3 tokenizer max_length
 /// Holds the three sub-models + tokenizer; owned by the `ImageBackend` union.
 const FluxImpl = struct {
     s: mlx.mlx_stream,
-    te: flux.TextEncoder,
+    /// Text encoder — nullable because LOW-MEM mode (iPhone) loads it lazily
+    /// per request and frees it right after the prompt encode: it's ~half the
+    /// pipeline's resident bytes but runs exactly one forward per generation.
+    te: ?flux.TextEncoder,
     dit: flux.Dit,
     vae: flux.Vae,
     vae_enc: ?flux.VaeEncoder,
     tok: tok_mod.Tokenizer,
+    io: std.Io,
+    allocator: std.mem.Allocator,
+    model_dir: []u8,
+    low_mem: bool,
+
+    /// Low-mem policy, pure for testing: iOS always (jetsam ceilings);
+    /// MLXSERVE_LOWMEM=1/0 forces either way; otherwise AUTO on machines with
+    /// ≤ 16 GB of RAM — measured cost is ~0.1–0.3 s per image (the encoder
+    /// mmap-reloads from page cache) vs ~1.8 GB lower peak, a clear win when
+    /// the Metal working-set ceiling is ~12 GB (16 GB mini class).
+    fn lowMemFromInputs(is_ios: bool, env: ?[]const u8, total_ram_bytes: u64) bool {
+        if (is_ios) return true;
+        if (env) |e| {
+            if (std.mem.eql(u8, e, "1")) return true;
+            if (std.mem.eql(u8, e, "0")) return false;
+        }
+        return total_ram_bytes > 0 and total_ram_bytes <= 17 * 1024 * 1024 * 1024;
+    }
+
+    fn lowMemDefault() bool {
+        const env: ?[]const u8 = if (std.c.getenv("MLXSERVE_LOWMEM")) |v| std.mem.sliceTo(v, 0) else null;
+        return lowMemFromInputs(@import("build_options").ios, env, metrics.getTotalMemBytes());
+    }
 
     fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !FluxImpl {
         var self: FluxImpl = undefined;
+        self.io = io;
+        self.allocator = allocator;
+        self.low_mem = lowMemDefault();
+        self.model_dir = try allocator.dupe(u8, model_dir);
+        errdefer allocator.free(self.model_dir);
         self.s = mlx.mlx_default_gpu_stream_new();
-        self.te = try flux.loadTextEncoder(io, allocator, self.s, model_dir);
-        errdefer self.te.deinit();
+        if (self.low_mem) {
+            self.te = null;
+            log.info("[image] FLUX low-mem mode: text encoder loads per request\n", .{});
+        } else {
+            self.te = try flux.loadTextEncoder(io, allocator, self.s, model_dir);
+        }
+        errdefer if (self.te) |*t| t.deinit();
         self.dit = try flux.loadDit(io, allocator, self.s, model_dir);
         errdefer self.dit.deinit();
         self.vae = try flux.loadVae(io, allocator, self.s, model_dir);
@@ -159,11 +231,12 @@ const FluxImpl = struct {
     }
 
     fn deinit(self: *FluxImpl) void {
-        self.te.deinit();
+        if (self.te) |*t| t.deinit();
         self.dit.deinit();
         self.vae.deinit();
         if (self.vae_enc) |*e| e.deinit();
         self.tok.deinit();
+        self.allocator.free(self.model_dir);
     }
 
     /// Tokenize the prompt (Qwen3 chat template) and run the FLUX pipeline →
@@ -206,7 +279,23 @@ const FluxImpl = struct {
             fopts.init_latents = init_lat;
             fopts.start_step = img2imgStartStep(steps, opts.strength);
         }
-        return flux.generateWithOpts(&self.te, &self.dit, &self.vae, ids, mask, seed, steps, height, width, fopts, progress);
+        // Phased text encoder: encode the prompt (materialized inside
+        // encodePrompt — mlx laziness would otherwise pin the weights), then
+        // in low-mem mode free the encoder + its cache before the denoise
+        // loop. Same math either way: the conditioning tensor is already
+        // computed, so outputs are byte-identical to the resident-TE path
+        // (pinned by tests/test_flux_lowmem.sh).
+        if (self.te == null) {
+            self.te = try flux.loadTextEncoder(self.io, self.allocator, self.s, self.model_dir);
+        }
+        const cond = try flux.encodePrompt(&self.te.?, ids, mask, fopts);
+        if (self.low_mem) {
+            self.te.?.deinit();
+            self.te = null;
+            _ = mlx.mlx_clear_cache();
+            log.info("[image] low-mem: text encoder freed after encode\n", .{});
+        }
+        return flux.generateFromCondWithOpts(&self.dit, &self.vae, cond, ids.len, seed, steps, height, width, fopts, progress);
     }
 
     fn generatePng(self: *FluxImpl, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, opts: ImageGenOpts, progress: ?sse.Progress) ![]u8 {
@@ -384,15 +473,27 @@ pub const ImageEngine = struct {
         return krea.imageToPng(allocator, img, self.stream());
     }
 
-    /// Resolve a requested WxH per backend. FLUX has a fixed 1024² latent grid;
+    /// Resolve a requested WxH per backend. FLUX (klein) honors any multiple
+    /// of 32 in [256, 1536] — its patchify/VAE are shape-derived (pinned by
+    /// the non-square edit round-trip test), and smaller grids are the
+    /// activation-memory lever that lets 8 GB iPhones generate at all.
     /// Krea accepts any multiple of 16 in [256, 2048].
     pub fn normalizeSize(self: *const ImageEngine, req_w: u32, req_h: u32) struct { w: u32, h: u32 } {
         return switch (self.backend) {
-            .flux => .{ .w = 1024, .h = 1024 },
+            .flux => .{ .w = clampFluxDim(req_w), .h = clampFluxDim(req_h) },
             .krea => .{ .w = clampKreaDim(req_w), .h = clampKreaDim(req_h) },
         };
     }
 };
+
+/// Round a requested dimension to a multiple of 32 in [256, 1536] (klein's
+/// crop granularity — the same /32 rule fitRefDims uses; ~1MP trained scale,
+/// 1536 covers the widest preset edge). 0/omitted → the 1024 default.
+pub fn clampFluxDim(v: u32) u32 {
+    if (v == 0) return 1024;
+    const rounded = ((v + 31) / 32) * 32;
+    return std.math.clamp(rounded, 256, 1536);
+}
 
 /// Round a requested dimension to a multiple of 16 in [256, 2048] (Krea's
 /// VAE ×8 + DiT patch ×2 alignment).
@@ -472,27 +573,124 @@ fn bodyDisablesSafety(body: []const u8) bool {
     return std.mem.startsWith(u8, body[i..], "false");
 }
 
-/// Audio backend (currently Qwen3-TTS). The `tts.Synthesizer` already bundles
-/// talker + codec + tokenizer, so this is a thin owner.
+/// The audio modality hosts MULTIPLE architectures (the `ImageBackend`
+/// convention): Qwen3-TTS speech synthesis and ACE-Step music generation.
+pub const AudioBackend = union(enum) {
+    tts: tts.Synthesizer,
+    music: *acestep.Engine,
+};
+
+/// Audio engine — a tagged-union owner, dispatched on `config.json`'s
+/// `model_type` at load (`qwen3_tts` → TTS, `acestep` → music). The
+/// `LoadedModel.audio_engine` slot stays single + modality-named.
 pub const AudioEngine = struct {
     allocator: std.mem.Allocator,
-    synth: tts.Synthesizer,
+    backend: AudioBackend,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*AudioEngine {
         const self = try allocator.create(AudioEngine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
+        const mt = peekModelType(io, allocator, model_dir);
+        defer if (mt) |m| allocator.free(m);
+        if (mt != null and audioBackendKindForType(mt.?) == .music) {
+            self.backend = .{ .music = try acestep.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] ACE-Step music engine ready\n", .{});
+            return self;
+        }
         const s = mlx.mlx_default_gpu_stream_new();
-        self.synth = try tts.Synthesizer.load(io, allocator, s, model_dir);
-        log.info("[audio] TTS synthesizer ready (sample_rate={d})\n", .{self.synth.model.cfg.sample_rate});
+        self.backend = .{ .tts = try tts.Synthesizer.load(io, allocator, s, model_dir) };
+        log.info("[audio] TTS synthesizer ready (sample_rate={d})\n", .{self.backend.tts.model.cfg.sample_rate});
         return self;
     }
 
     pub fn deinit(self: *AudioEngine) void {
-        self.synth.deinit();
+        switch (self.backend) {
+            .tts => |*synth| synth.deinit(),
+            .music => |e| e.deinit(),
+        }
         self.allocator.destroy(self);
     }
 };
+
+/// Mesh backend (currently Hunyuan3D-2.1 shape). Thin owner of the hunyuan3d
+/// engine — the DINO conditioner, DiT, and ShapeVAE decoder live in
+/// `src/hunyuan3d.zig` (mirrors `AudioEngine` over `tts.Synthesizer`). When a
+/// second 3D arch arrives this becomes an `ImageBackend`-style tagged union.
+pub const MeshEngine = struct {
+    allocator: std.mem.Allocator,
+    engine: *hy3d.Engine,
+    /// P2 paint (texture) stage dir, discovered lazily beside the shape model
+    /// (SIBLING dir `<models root>/local/hunyuan3d-2-1-paint-8bit` or the
+    /// `HY3D_PAINT_DIR` override). Null → `"texture": true` requests get a 400.
+    /// The paint engine itself loads per-request and frees after (memory
+    /// staging: shape 3.5 GB + paint ~4.6 GB never both need residency —
+    /// the shape stage completes before the paint stage starts).
+    paint_dir: ?[]u8 = null,
+
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*MeshEngine {
+        const self = try allocator.create(MeshEngine);
+        errdefer allocator.destroy(self);
+        self.allocator = allocator;
+        self.paint_dir = null;
+        self.engine = try hy3d.Engine.load(io, allocator, model_dir);
+        self.paint_dir = findPaintDir(allocator, model_dir);
+        if (self.paint_dir) |p| log.info("[mesh] paint (texture) weights available: {s}\n", .{p});
+        log.info("[mesh] Hunyuan3D shape engine ready\n", .{});
+        return self;
+    }
+
+    pub fn deinit(self: *MeshEngine) void {
+        if (self.paint_dir) |p| self.allocator.free(p);
+        self.engine.deinit();
+        self.allocator.destroy(self);
+    }
+};
+
+/// Locate the paint-stage model dir: `HY3D_PAINT_DIR` env override, else the
+/// combined single-HF-repo layout `<shape_dir>/paint`, else the converted
+/// sibling `<parent-of-shape-dir>/hunyuan3d-2-1-paint-8bit` (the local
+/// convert script writes next to the shape dir). Returns null (graceful)
+/// when absent.
+fn findPaintDir(allocator: std.mem.Allocator, shape_dir: []const u8) ?[]u8 {
+    return findStageModelDir(allocator, shape_dir, "paint", "hunyuan3d-2-1-paint-8bit", "HY3D_PAINT_DIR");
+}
+
+/// Shared stage-model discovery, in priority order:
+///   1. `env_var` override (absolute + has a config.json) — debugging seam;
+///      when set, it is the ONLY candidate (no silent fallback).
+///   2. `<shape_dir>/<subdir_name>` — the combined single-HF-repo layout
+///      (shape at the root, stage weights in subdirs; ONE download).
+///   3. `<parent-of-shape-dir>/<sibling_name>` — the local convert-script
+///      layout (three sibling dirs under `.../local/`).
+fn findStageModelDir(allocator: std.mem.Allocator, shape_dir: []const u8, subdir_name: []const u8, sibling_name: []const u8, env_var: [*:0]const u8) ?[]u8 {
+    if (std.c.getenv(env_var)) |v| {
+        const p = std.mem.span(v);
+        if (p.len > 0 and std.fs.path.isAbsolute(p) and dirHasConfig(p)) {
+            return allocator.dupe(u8, p) catch null;
+        }
+        return null;
+    }
+    if (std.fs.path.join(allocator, &.{ shape_dir, subdir_name })) |sub| {
+        if (dirHasConfig(sub)) return sub;
+        allocator.free(sub);
+    } else |_| {}
+    const parent = std.fs.path.dirname(shape_dir) orelse return null;
+    const sib = std.fs.path.join(allocator, &.{ parent, sibling_name }) catch return null;
+    if (dirHasConfig(sib)) return sib;
+    allocator.free(sib);
+    return null;
+}
+
+fn dirHasConfig(dir: []const u8) bool {
+    if (dir.len == 0 or !std.fs.path.isAbsolute(dir)) return false; // openDirAbsolute UB guard
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cfg = std.fmt.bufPrint(&buf, "{s}/config.json", .{dir}) catch return false;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const f = std.Io.Dir.openFileAbsolute(io, cfg, .{}) catch return false;
+    f.close(io);
+    return true;
+}
 
 const LTX_PAD_LEN: usize = 256; // gemma left-pad length
 const LTX_PAD_ID: i32 = 0; // gemma <pad>
@@ -1195,6 +1393,10 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
 
 /// POST /v1/audio/speech — WAV bytes (or SSE progress + base64-WAV complete).
 pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
+    const synth = switch (engine.backend) {
+        .tts => |*t| t,
+        .music => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
+    };
     const input = extractJsonString(body, "input") orelse extractJsonString(body, "text") orelse return sendError(conn, 400, "missing 'input'");
     const text = try jsonUnescape(allocator, input);
     defer allocator.free(text);
@@ -1212,7 +1414,7 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
             if (base64DecodeAlloc(allocator, b64)) |wav_bytes| {
                 defer allocator.free(wav_bytes);
                 if (decodeWavToF32(allocator, wav_bytes)) |samples| {
-                    if (engine.synth.supportsCloning()) {
+                    if (synth.supportsCloning()) {
                         ref_samples = samples;
                         log.info("[audio] reference voice: {d} samples → cloning\n", .{samples.len});
                     } else {
@@ -1230,7 +1432,7 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
     if (want_stream) try conn.writeAll(sse.headers);
 
-    const wav = engine.synth.synthesizeWav(text, 2048, prog, ref_samples) catch |err| {
+    const wav = synth.synthesizeWav(text, 2048, prog, ref_samples) catch |err| {
         log.err("[audio] synthesis failed: {}\n", .{err});
         if (want_stream) {
             sse.sendError(conn, "synthesis failed");
@@ -1240,6 +1442,89 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     };
     defer allocator.free(wav);
     log.info("[audio] -> {d} WAV bytes\n", .{wav.len});
+    if (want_stream) {
+        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
+        const b64 = try allocator.alloc(u8, b64_len);
+        defer allocator.free(b64);
+        _ = std.base64.standard.Encoder.encode(b64, wav);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+        try out.appendSlice(allocator, b64);
+        try out.appendSlice(allocator, "\"}\n\n");
+        try conn.writeAll(out.items);
+        return;
+    }
+    return sendBytes(conn, allocator, "audio/wav", wav);
+}
+
+/// `POST /v1/audio/music-generations` — ACE-Step text2music.
+/// `{"model", "prompt" (style/genre/mood, REQUIRED), "lyrics" ("" →
+/// "[Instrumental]"), "vocal_language" ("en"), "bpm", "keyscale",
+/// "timesignature", "duration_seconds" (default 60, valid 10–600), "seed",
+/// "stream"}`. Response mirrors `/v1/audio/speech`: raw `audio/wav` bytes
+/// non-stream; SSE `progress` per stage/step + a base64 `complete` event when
+/// streaming. Targeting a TTS voice model here is an explicit 400.
+pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
+    const music = switch (engine.backend) {
+        .music => |m| m,
+        .tts => return sendError(conn, 400, "loaded audio model is a TTS voice; POST /v1/audio/speech"),
+    };
+    const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (style/genre/mood description)");
+    const prompt = try jsonUnescape(allocator, raw_prompt);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+
+    var lyrics: []u8 = try allocator.dupe(u8, "");
+    defer allocator.free(lyrics);
+    if (extractJsonString(body, "lyrics")) |raw| {
+        allocator.free(lyrics);
+        lyrics = try jsonUnescape(allocator, raw);
+    }
+    var language: []u8 = try allocator.dupe(u8, "en");
+    defer allocator.free(language);
+    if (extractJsonString(body, "vocal_language")) |raw| {
+        allocator.free(language);
+        language = try jsonUnescape(allocator, raw);
+    }
+    const keyscale = extractJsonString(body, "keyscale") orelse "";
+    const timesignature = extractJsonString(body, "timesignature") orelse "";
+    var bpm: ?u32 = null;
+    if (extractJsonInt(body, "bpm")) |b| {
+        if (b < 30 or b > 300) return sendError(conn, 400, "'bpm' must be in [30,300]");
+        bpm = @intCast(b);
+    }
+    const duration: u32 = @intCast(extractJsonInt(body, "duration_seconds") orelse 60);
+    if (duration < acestep.MIN_DURATION_S or duration > acestep.MAX_DURATION_S)
+        return sendError(conn, 400, "'duration_seconds' must be in [10,600]");
+    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[music] generating {d}s seed={d} lyrics={d}ch stream={}\n", .{ duration, seed, lyrics.len, want_stream });
+    var sctx = sse.StreamCtx{ .conn = conn };
+    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const req = acestep.MusicRequest{
+        .caption = prompt,
+        .lyrics = lyrics,
+        .language = language,
+        .bpm = bpm,
+        .keyscale = keyscale,
+        .timesignature = timesignature,
+        .duration_s = duration,
+        .seed = seed,
+    };
+    const wav = music.generateWav(allocator, req, prog) catch |err| {
+        log.err("[music] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "music generation failed");
+            return;
+        }
+        return sendError(conn, 500, "music generation failed");
+    };
+    defer allocator.free(wav);
+    log.info("[music] -> {d} WAV bytes\n", .{wav.len});
     if (want_stream) {
         const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
         const b64 = try allocator.alloc(u8, b64_len);
@@ -1614,6 +1899,121 @@ pub fn handleVideo(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     return sendBytesJson(conn, allocator, out.items);
 }
 
+/// Shape → raw mesh → paint (texture) stage → textured GLB. The paint engine
+/// loads lazily per request and frees before returning.
+fn paintedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u8, w: u32, h: u32, shape_opts: hy3d.MeshOpts, body: []const u8, prog: ?sse.Progress) ![]u8 {
+    const paint_dir = engine.paint_dir orelse return error.PaintUnavailable; // guarded at parse
+    var mesh = try engine.engine.generateMeshRaw(allocator, rgba, w, h, shape_opts, prog);
+    defer mesh.deinit(allocator);
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const paint = try hy3d_paint.PaintEngine.load(io, allocator, paint_dir);
+    defer paint.deinit();
+
+    var popts = hy3d_paint.PaintOpts{ .seed = shape_opts.seed };
+    if (extractJsonInt(body, "texture_steps")) |ts| {
+        if (ts >= 1 and ts <= 100) popts.steps = @intCast(ts);
+    }
+    return paint.paintMeshToGlb(allocator, &mesh, rgba, w, h, popts, prog);
+}
+
+/// POST /v1/3d/generations — base64 GLB (or SSE progress + complete).
+/// The engine takes straight-alpha RGBA8 (its preprocess recenters the subject
+/// via the alpha bbox and composites on white — so an app-side cutout with real
+/// alpha conditions best, and an opaque photo still works as a fallback).
+pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *MeshEngine) !void {
+    const raw_img = extractJsonString(body, "image") orelse return sendError(conn, 400, "missing 'image' (base64 PNG/JPEG of the subject)");
+    const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
+    defer allocator.free(b64);
+    if (b64.len == 0) return sendError(conn, 400, "empty 'image'");
+    const img_bytes = base64DecodeAlloc(allocator, b64) catch
+        return sendError(conn, 400, "invalid base64 in 'image'");
+    defer allocator.free(img_bytes);
+    const img = decodeImageRgba(allocator, img_bytes) orelse
+        return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
+    defer allocator.free(img.pix);
+
+    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse 30);
+    const res: u32 = @intCast(extractJsonInt(body, "octree_resolution") orelse 256);
+    if (res < 64 or res > 512) return sendError(conn, 400, "'octree_resolution' must be in [64,512]");
+    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
+    var guidance: f32 = 5.0;
+    if (extractJsonFloat(body, "guidance_scale")) |g| {
+        if (!(g >= 0.0 and g <= 20.0)) return sendError(conn, 400, "'guidance_scale' must be in [0,20]");
+        guidance = @floatCast(g);
+    }
+
+    // P2 texture stage (opt-in): requires the converted paint weights. The
+    // 400 here is explicit — never a silent untextured downgrade (the a2vid
+    // precedent: the user asked for THIS output).
+    const want_texture = sse.bodyWantsTrue(body, "texture");
+    if (want_texture and engine.paint_dir == null)
+        return sendError(conn, 400, "texture requested but the paint weights are not installed (run tests/convert_hunyuan3d_paint_weights.py, or set HY3D_PAINT_DIR)");
+
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    log.info("[mesh] generating steps={d} res={d} guidance={d:.1} seed={d} texture={} stream={} from {d}x{d} image\n", .{ steps, res, guidance, seed, want_texture, want_stream, img.w, img.h });
+    var sctx = sse.StreamCtx{ .conn = conn };
+    const prog: ?sse.Progress = if (want_stream) sctx.progress() else null;
+    if (want_stream) try conn.writeAll(sse.headers);
+
+    const opts = hy3d.MeshOpts{ .steps = steps, .guidance = guidance, .seed = seed, .octree_resolution = res };
+    const glb_bytes = blk: {
+        if (!want_texture) {
+            break :blk engine.engine.generateGlb(allocator, img.pix, img.w, img.h, opts, prog);
+        }
+        // Texture path: shape → raw mesh → paint stage (loaded per request,
+        // freed after — the paint UNet+DINO+VAE ride ~4.6 GB beside the
+        // 3.5 GB shape engine only for the duration of this request).
+        break :blk paintedGlb(allocator, engine, img.pix, img.w, img.h, opts, body, prog);
+    } catch |err| {
+        if (err == error.Cancelled) {
+            // Client hung up mid-generation (progress write failed) — nothing
+            // to write, the socket is dead.
+            log.info("[mesh] generation cancelled — client disconnected\n", .{});
+            return;
+        }
+        log.err("[mesh] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "generation failed");
+            return;
+        }
+        return sendError(conn, 500, "generation failed");
+    };
+    defer allocator.free(glb_bytes);
+    log.info("[mesh] -> {d} GLB bytes\n", .{glb_bytes.len});
+
+    const b64_len = std.base64.standard.Encoder.calcSize(glb_bytes.len);
+    const ob64 = try allocator.alloc(u8, b64_len);
+    defer allocator.free(ob64);
+    _ = std.base64.standard.Encoder.encode(ob64, glb_bytes);
+
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(allocator);
+    try out.appendSlice(allocator, if (want_stream) "data: {\"type\":\"complete\",\"format\":\"glb\",\"data\":\"" else "{\"created\":0,\"format\":\"glb\",\"data\":\"");
+    try out.appendSlice(allocator, ob64);
+    try out.appendSlice(allocator, if (want_stream) "\"}\n\n" else "\"}");
+    if (want_stream) {
+        try conn.writeAll(out.items);
+        return;
+    }
+    return sendBytesJson(conn, allocator, out.items);
+}
+
+/// Decode a PNG/JPEG image (raw file bytes) → owned straight-alpha RGBA8
+/// pixels + dims (stb forces 4 channels; 3-channel sources get opaque alpha).
+fn decodeImageRgba(allocator: std.mem.Allocator, encoded: []const u8) ?struct { pix: []u8, w: u32, h: u32 } {
+    var w: c_int = 0;
+    var h: c_int = 0;
+    var ch: c_int = 0;
+    const src_ptr = stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &ch, 4) orelse return null;
+    defer stb.stbi_image_free(src_ptr);
+    if (w <= 0 or h <= 0) return null;
+    const n: usize = @as(usize, @intCast(w)) * @as(usize, @intCast(h)) * 4;
+    const out = allocator.alloc(u8, n) catch return null;
+    @memcpy(out, src_ptr[0..n]);
+    return .{ .pix = out, .w = @intCast(w), .h = @intCast(h) };
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Stub CPU state for a media model. The gen path bypasses the transformer, so
 // `config`/`tokenizer`/`chat_config` on the LoadedModel are minimal stubs that
@@ -1927,15 +2327,35 @@ fn jsonUnescape(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 
 const testing = std.testing;
 
-test "modalityFromType classifies the media archs + markers (incl. krea)" {
+test "modalityFromType classifies the media archs + markers (incl. krea + hunyuan3d)" {
     try testing.expectEqual(Modality.image, modalityFromType("flux2-klein-4b").?);
     try testing.expectEqual(Modality.image, modalityFromType("flux2").?);
     try testing.expectEqual(Modality.image, modalityFromType("krea2_turbo").?);
     try testing.expectEqual(Modality.image, modalityFromType("krea").?);
     try testing.expectEqual(Modality.audio, modalityFromType("qwen3_tts").?);
+    try testing.expectEqual(Modality.audio, modalityFromType("acestep").?);
     try testing.expectEqual(Modality.video, modalityFromType("AudioVideo").?);
+    try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d_2_1").?);
+    try testing.expectEqual(Modality.mesh, modalityFromType("hunyuan3d").?);
     try testing.expectEqual(@as(?Modality, null), modalityFromType("gemma4"));
     try testing.expectEqual(@as(?Modality, null), modalityFromType("qwen3_5_moe"));
+}
+
+test "Modality.mesh advertises the 3d capability" {
+    try testing.expectEqualStrings("3d", Modality.mesh.capability());
+}
+
+test "GenRoute: speech + music share the audio modality slot" {
+    try testing.expectEqual(Modality.audio, GenRoute.speech.modality());
+    try testing.expectEqual(Modality.audio, GenRoute.music.modality());
+    try testing.expectEqual(Modality.image, GenRoute.image.modality());
+    try testing.expectEqual(Modality.mesh, GenRoute.mesh.modality());
+}
+
+test "audioBackendKindForType routes acestep to music, everything else to tts" {
+    try testing.expect(audioBackendKindForType("acestep") == .music);
+    try testing.expect(audioBackendKindForType("qwen3_tts") == .tts);
+    try testing.expect(audioBackendKindForType("gemma4") == .tts);
 }
 
 test "bodyDisablesSafety detects per-request opt-out" {
@@ -1986,7 +2406,7 @@ test "ImageEngine FLUX generatePng produces a PNG (characterization)" {
 }
 
 test "Modality.modelType round-trips through modalityFromType" {
-    for ([_]Modality{ .image, .audio, .video }) |m| {
+    for ([_]Modality{ .image, .audio, .video, .mesh }) |m| {
         try testing.expectEqual(m, modalityFromType(m.modelType()).?);
     }
 }
@@ -2199,6 +2619,28 @@ test "img2imgStartStep maps strength onto the schedule (diffusers convention)" {
     try testing.expectEqual(@as(u32, 0), img2imgStartStep(1, 0.3));
 }
 
+test "flux low-mem policy: iOS always, env forces both ways, small-RAM Macs auto-enable" {
+    const GB = 1024 * 1024 * 1024;
+    const f = FluxImpl.lowMemFromInputs;
+    try testing.expect(f(true, null, 128 * GB)); // iOS: always, RAM irrelevant
+    try testing.expect(f(false, "1", 128 * GB)); // env force-on
+    try testing.expect(!f(false, "0", 8 * GB)); // env force-off beats auto
+    try testing.expect(f(false, null, 16 * GB)); // 16 GB mini: auto ON
+    try testing.expect(f(false, null, 8 * GB)); // 8 GB: auto ON
+    try testing.expect(!f(false, null, 24 * GB)); // 24 GB+: off (reload is pure loss)
+    try testing.expect(!f(false, null, 0)); // unknown RAM: don't guess
+}
+
+test "clampFluxDim honors requested sizes on the /32 grid (512/768 are the 8GB-iPhone levers)" {
+    try testing.expectEqual(@as(u32, 512), clampFluxDim(512));
+    try testing.expectEqual(@as(u32, 768), clampFluxDim(768));
+    try testing.expectEqual(@as(u32, 1024), clampFluxDim(1024));
+    try testing.expectEqual(@as(u32, 1024), clampFluxDim(0)); // omitted → default
+    try testing.expectEqual(@as(u32, 512), clampFluxDim(500)); // round up to /32
+    try testing.expectEqual(@as(u32, 256), clampFluxDim(100)); // floor
+    try testing.expectEqual(@as(u32, 1536), clampFluxDim(4096)); // cap
+}
+
 test "fitRefDims preserves aspect, caps at ~1MP, rounds to multiples of 32, never upscales" {
     // 2:1 landscape above the cap → scaled down, aspect kept (±32-rounding).
     const a = fitRefDims(2000, 1000);
@@ -2259,4 +2701,51 @@ test "extractCondWeights accepts a JSON array or a separated string" {
     try testing.expectEqual(@as(usize, 4), b.len);
     try testing.expect(extractCondWeights("{}", &buf) == null);
     try testing.expect(extractCondWeights("{\"cond_weights\":[1,bad]}", &buf) == null);
+}
+
+test "paint stage dir resolves from the combined single-repo layout (subdir first, sibling fallback)" {
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    const io_tmp = std.Io.Threaded.global_single_threaded.io();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io_tmp, &root_buf);
+    const root = root_buf[0..root_len];
+
+    const mkModelDir = struct {
+        fn call(a: std.mem.Allocator, tmp_dir: std.Io.Dir, base: []const u8, rel: []const u8) ![]u8 {
+            const io = std.Io.Threaded.global_single_threaded.io();
+            try tmp_dir.createDirPath(io, rel);
+            const cfg_rel = try std.fs.path.join(a, &.{ rel, "config.json" });
+            defer a.free(cfg_rel);
+            const f = try tmp_dir.createFile(io, cfg_rel, .{});
+            f.close(io);
+            return std.fs.path.join(a, &.{ base, rel });
+        }
+    }.call;
+
+    // Combined single-HF-repo layout: shape at the root, paint/ inside.
+    const shape = try mkModelDir(allocator, tmp.dir, root, "combined");
+    defer allocator.free(shape);
+    const paint_sub = try mkModelDir(allocator, tmp.dir, root, "combined/paint");
+    defer allocator.free(paint_sub);
+
+    const paint = findPaintDir(allocator, shape) orelse return error.TestExpectedResult;
+    defer allocator.free(paint);
+    try testing.expectEqualStrings(paint_sub, paint);
+
+    // Legacy local-convert layout (sibling dirs) still resolves.
+    const shape2 = try mkModelDir(allocator, tmp.dir, root, "local/hunyuan3d-2-1-8bit");
+    defer allocator.free(shape2);
+    const paint_sib = try mkModelDir(allocator, tmp.dir, root, "local/hunyuan3d-2-1-paint-8bit");
+    defer allocator.free(paint_sib);
+
+    const paint2 = findPaintDir(allocator, shape2) orelse return error.TestExpectedResult;
+    defer allocator.free(paint2);
+    try testing.expectEqualStrings(paint_sib, paint2);
+
+    // Nothing anywhere -> graceful null (texture requests 400).
+    const bare = try mkModelDir(allocator, tmp.dir, root, "bare/shape-only");
+    defer allocator.free(bare);
+    try testing.expect(findPaintDir(allocator, bare) == null);
 }

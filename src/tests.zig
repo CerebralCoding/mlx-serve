@@ -42,6 +42,16 @@ test {
     _ = @import("ltx_video.zig");
     _ = @import("ltx_audio.zig");
     _ = @import("png.zig");
+    _ = @import("marching_cubes.zig");
+    _ = @import("glb.zig");
+    _ = @import("hunyuan3d.zig");
+    _ = @import("acestep.zig");
+    _ = @import("uvwrap.zig");
+    _ = @import("hunyuan3d_paint.zig");
+    _ = @import("hunyuan3d_paint_unet.zig");
+    _ = @import("rasterize.zig");
+    _ = @import("texinpaint.zig");
+    _ = @import("bake.zig");
     _ = @import("gen.zig");
     _ = @import("ollama.zig");
     _ = @import("cli.zig");

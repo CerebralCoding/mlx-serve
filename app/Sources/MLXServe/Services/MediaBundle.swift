@@ -154,6 +154,72 @@ extension MediaBundle {
         )
     }
 
+    /// Hunyuan3D (shape stage): a flat model dir — `config.json` + the three
+    /// engine safetensors (`dit`, `conditioner`, `vae`). Non-recursive with a
+    /// safetensors allowlist so a future published HF repo pulls ONLY those
+    /// three. Ready when all four markers are present. For a `local/`
+    /// (convert-on-device) repo there's no download — readiness checks disk
+    /// presence either way, so local and published repos share this factory.
+    static func model3d(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "model3d:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    // Recursive: the combined repo ships the paint (texture)
+                    // stage in `paint/` and the UniRig auto-rig stage in
+                    // `unirig/` beside the root shape weights — one pull
+                    // lights up all three. Allowlist = exactly the seven
+                    // engine weights (extras in the repo never download).
+                    selection: FileSelection(recursive: true, keepSafetensors: [
+                        "dit.safetensors", "conditioner.safetensors", "vae.safetensors",
+                        "unet.safetensors", "unet_dual.safetensors", "dino.safetensors",
+                        "skeleton.safetensors",
+                    ]),
+                    // All three stages must be present — a partial pull that
+                    // reads "ready" would 400 on texture/rig requests.
+                    readyMarkers: [
+                        "config.json", "dit.safetensors",
+                        "conditioner.safetensors", "vae.safetensors",
+                        "paint/config.json", "paint/unet.safetensors",
+                        "paint/unet_dual.safetensors", "paint/dino.safetensors",
+                        "paint/vae.safetensors",
+                        "unirig/config.json", "unirig/skeleton.safetensors",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
+    /// ACE-Step music (text2music): a flat converted dir — `config.json` +
+    /// `model.safetensors` (DiT + condition encoder) + `vae.safetensors`
+    /// (Oobleck) + the `text_encoder/` Qwen3-Embedding subdir. Single
+    /// self-contained repo, no external-component dependencies (the simplest
+    /// bundle yet). Local-convert repos share this factory with any future
+    /// published one (readiness checks disk presence either way).
+    static func music(repo: String, displayName: String, sizeGB: Double) -> MediaBundle {
+        MediaBundle(
+            id: "music:\(repo)",
+            displayName: displayName,
+            components: [
+                MediaComponent(
+                    repo: repo,
+                    selection: FileSelection(recursive: true, keepSafetensors: [
+                        "model.safetensors", "vae.safetensors",
+                    ]),
+                    readyMarkers: [
+                        "config.json", "model.safetensors", "vae.safetensors",
+                        "text_encoder/config.json", "text_encoder/model.safetensors",
+                        "text_encoder/tokenizer.json",
+                    ]
+                ),
+            ],
+            sizeEstimateGB: sizeGB
+        )
+    }
+
     /// The Gemma-3-12B text encoder LTX needs — also a standalone chat model.
     /// Standard MLX layout (config + tokenizer + sharded safetensors).
     static let ltxGemmaRepo = "mlx-community/gemma-3-12b-it-4bit"
@@ -186,5 +252,17 @@ extension AudioModelPreset {
 extension VideoModelPreset {
     var bundle: MediaBundle {
         .ltx(repo: repo, displayName: name)
+    }
+}
+
+extension Model3DModelPreset {
+    var bundle: MediaBundle {
+        .model3d(repo: repo, displayName: name, sizeGB: approxDownloadGB)
+    }
+}
+
+extension MusicModelPreset {
+    var bundle: MediaBundle {
+        .music(repo: repo, displayName: name, sizeGB: approxDownloadGB)
     }
 }

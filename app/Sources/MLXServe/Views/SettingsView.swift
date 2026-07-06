@@ -46,6 +46,13 @@ struct SettingsView: View {
                     }
 
                     SettingsSection(
+                        title: "Voice",
+                        subtitle: "Clone your voice once — hands-free voice mode answers in it via the local TTS model. No clip set: answers use the macOS system voice. Applies to the next spoken sentence — no restart needed."
+                    ) {
+                        VoiceCloneSectionContent()
+                    }
+
+                    SettingsSection(
                         title: "Agent Sandbox",
                         subtitle: "Run the agent's shell commands inside an isolated Linux sandbox instead of directly on this Mac. Off by default; applies to the next command — no restart needed."
                     ) {
@@ -1259,6 +1266,100 @@ private struct RequestDefaultsSectionContent: View {
             best = i
         }
         return best
+    }
+}
+
+// MARK: - Voice (clone clip) section
+
+/// The global voice-clone clip: pick an audio file or record a few seconds,
+/// normalized via `AudioReference` (24 kHz mono WAV — what Qwen3-TTS
+/// `ref_audio` expects) and copied to `~/.mlx-serve/voice-clips/` so it
+/// survives relaunch. An app-side setting like the sandbox — binds straight
+/// through `appState.serverOptions.voiceClonePath`, no restart banner, no CLI
+/// flag. Voice mode's `ClonedVoiceSynthesizer` re-reads the path per sentence.
+private struct VoiceCloneSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @StateObject private var recorder = AudioRecorder()
+    @State private var voiceError: String?
+
+    var body: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text("Voice clone clip").font(.subheadline.weight(.semibold))
+            HStack(spacing: 8) {
+                if !appState.serverOptions.voiceClonePath.isEmpty {
+                    Image(systemName: "waveform").foregroundStyle(.secondary)
+                    // Prefer the display label — the stored file is always the
+                    // normalized "voice-clone.wav", which says nothing.
+                    Text(appState.serverOptions.voiceCloneLabel.isEmpty
+                         ? (appState.serverOptions.voiceClonePath as NSString).lastPathComponent
+                         : appState.serverOptions.voiceCloneLabel)
+                        .font(.caption).lineLimit(1).truncationMode(.middle)
+                    Button { clearVoice() } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.borderless).foregroundStyle(.secondary)
+                        .help("Remove the clip — voice mode falls back to the system voice")
+                } else {
+                    Text("None — voice mode uses the system voice.")
+                        .font(.caption).foregroundStyle(.secondary)
+                }
+            }
+            HStack(spacing: 8) {
+                Button { chooseVoiceFile() } label: { Label("Choose file…", systemImage: "folder") }
+                if recorder.isRecording {
+                    Button(role: .destructive) { stopRecording() } label: {
+                        Label(String(format: "Stop (%.1fs)", recorder.duration), systemImage: "stop.circle")
+                    }
+                } else {
+                    Button { startRecording() } label: { Label("Record", systemImage: "mic") }
+                }
+            }
+            .font(.caption)
+            Text("A few seconds of clean speech works best. Answers are synthesized locally by the Audio pane's TTS model (downloaded on first use).")
+                .font(.caption2).foregroundStyle(.secondary)
+            if let voiceError {
+                Text(voiceError).font(.caption).foregroundStyle(.red)
+            }
+        }
+    }
+
+    private func chooseVoiceFile() {
+        voiceError = nil
+        do {
+            guard let picked = try VoiceCloneMenuModel.pickAndPersistClip() else { return }
+            appState.serverOptions.voiceClonePath = picked.path
+            appState.serverOptions.voiceCloneLabel = picked.label
+            appState.serverOptions.voiceCloneEnabled = true
+        } catch {
+            voiceError = error.localizedDescription
+        }
+    }
+
+    private func startRecording() {
+        voiceError = nil
+        Task {
+            guard await AudioRecorder.requestPermission() else {
+                voiceError = "Microphone access denied. Enable it in System Settings ▸ Privacy ▸ Microphone."
+                return
+            }
+            do { try recorder.start() }
+            catch { voiceError = error.localizedDescription }
+        }
+    }
+
+    private func stopRecording() {
+        guard let data = recorder.stop() else { voiceError = "Nothing was recorded."; return }
+        do {
+            let normalized = try AudioReference.normalizedReferenceWav(fromRecordedPCM: data)
+            appState.serverOptions.voiceClonePath = VoiceCloneClipStore.persist(normalized)
+            appState.serverOptions.voiceCloneLabel = "Recorded clip"
+            appState.serverOptions.voiceCloneEnabled = true
+        } catch {
+            voiceError = error.localizedDescription
+        }
+    }
+
+    private func clearVoice() {
+        appState.serverOptions.voiceClonePath = ""
+        appState.serverOptions.voiceCloneLabel = ""
     }
 }
 

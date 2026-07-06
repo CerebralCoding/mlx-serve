@@ -36,6 +36,7 @@ struct MLXCoreApp: App {
         return NSImage(systemSymbolName: "brain.head.profile", accessibilityDescription: "MLX Core")!
     }()
 
+    @NSApplicationDelegateAdaptor(MLXCoreAppDelegate.self) private var appDelegate
     @StateObject private var appState = AppState()
     @StateObject private var hfSearch = HFSearchService()
     @Environment(\.openWindow) private var openWindow
@@ -85,6 +86,7 @@ struct MLXCoreApp: App {
             case "imageGen": title = "Image Generation"
             case "videoGen": title = "Video Generation"
             case "audioGen": title = "Audio Generation"
+            case "model3dGen": title = "3D Generation"
             case "settings": title = "Settings"
             case "serverLog": title = "Server Log"
             case "tasks": title = "Tasks"
@@ -104,6 +106,7 @@ struct MLXCoreApp: App {
                 openImageGen: { openAndFocus("imageGen") },
                 openVideoGen: { openAndFocus("videoGen") },
                 openAudioGen: { openAndFocus("audioGen") },
+                openModel3DGen: { openAndFocus("model3dGen") },
                 openSettings: { openAndFocus("settings") },
                 openServerLog: { openAndFocus("serverLog") },
                 openTasks: { openAndFocus("tasks") },
@@ -184,11 +187,21 @@ struct MLXCoreApp: App {
         Window("Audio Generation", id: "audioGen") {
             AudioGenView()
                 .environmentObject(appState.audioGen)
+                .environmentObject(appState.musicGen)
                 .environmentObject(appState.server)
                 .environmentObject(appState.downloads)
                 .environmentObject(appState)
         }
         .defaultSize(width: 900, height: 660)
+
+        Window("3D Generation", id: "model3dGen") {
+            Model3DGenView()
+                .environmentObject(appState.model3dGen)
+                .environmentObject(appState.server)
+                .environmentObject(appState.downloads)
+                .environmentObject(appState)
+        }
+        .defaultSize(width: 960, height: 700)
 
         Window("Settings", id: "settings") {
             SettingsView()
