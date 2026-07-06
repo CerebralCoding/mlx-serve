@@ -24,12 +24,13 @@ acestep/models/mlx/{dit_convert,vae_convert}.py). Structural transforms:
   (c) Snake alpha/beta         PT [1, C, 1] -> [C], kept FLOAT32 (exp() headroom).
   (d) silence_latent.pt        [1, 64, 15000] -> transpose -> `silence_latent` [1, 15000, 64].
   (e) FSQ tokenizer/detokenizer/attention-pooler DROPPED (cover-mode only, not text2music).
-  (f) fp32 source -> bf16 dense; --bits 8 quantizes eligible 2-D linears with mlx
-      affine group_size 64 (packed uint32 .weight + bf16 .scales/.biases).
+  (f) fp32 source -> bf16 dense; --bits 8/4 quantizes eligible 2-D linears with mlx
+      affine group_size 64 (packed uint32 .weight + bf16 .scales/.biases). At
+      --bits 4 the timestep-embedding family stays 8-bit (adaLN sensitivity).
 
 Usage:
     python3 tests/convert_acestep_weights.py --src-xl <acestep-v15-xl-turbo dir> \
-        --src-main <Ace-Step1.5 dir> [--out DIR] [--bits {8,16}]
+        --src-main <Ace-Step1.5 dir> [--out DIR] [--bits {4,8,16}]
     python3 tests/convert_acestep_weights.py --self-test   # no ckpt/torch/mlx needed
 """
 
@@ -106,7 +107,7 @@ def should_quantize(name, shape, bits):
     """A linear .weight is quantized iff 2-D, in-features % GROUP_SIZE == 0, and
     min(out, in) >= 512. Norms, tables (3-D), convs (3-D), biases, silence latent,
     and small projections (time_embed.linear_1 has in=256) stay bf16."""
-    if bits != 8:
+    if bits not in (4, 8):
         return False
     if not name.endswith(".weight"):
         return False
@@ -116,6 +117,27 @@ def should_quantize(name, shape, bits):
     if in_f % GROUP_SIZE != 0:
         return False
     return min(out_f, in_f) >= 512
+
+
+# The timestep-embedding family stays 8-bit in a 4-bit build: its outputs are
+# the adaLN scale/shift tables that modulate EVERY layer, and turbo runs so few
+# denoise steps that modulation error compounds. Costs ~40 MB of the ~2.3 GB won
+# back by 4-bit. The Zig loader infers (bits, group) per tensor from geometry,
+# so mixed-precision checkpoints load through the same path.
+SENSITIVE_8BIT_PREFIXES = ("decoder.time_embed.", "decoder.time_embed_r.")
+
+
+def quant_bits_for(name, shape, bits):
+    """Effective quantization for one tensor: None = dense bf16, else 4 or 8."""
+    if not should_quantize(name, shape, bits):
+        return None
+    if bits == 4 and name.startswith(SENSITIVE_8BIT_PREFIXES):
+        return 8
+    return bits
+
+
+def quant_label(bits):
+    return {4: "4bit", 8: "8bit"}.get(bits, "bf16")
 
 
 # ── source accounting (pop/leftover discipline) ───────────────────────────────
@@ -311,8 +333,9 @@ def save_model_safetensors(out_np, path, bits):
     n_quant = 0
     for name, arr in out_np.items():
         arr = np.ascontiguousarray(arr, dtype=np.float32)
-        if should_quantize(name, arr.shape, bits):
-            wq, scales, biases = mx.quantize(mx.array(arr), group_size=GROUP_SIZE, bits=bits)
+        eff_bits = quant_bits_for(name, arr.shape, bits)
+        if eff_bits is not None:
+            wq, scales, biases = mx.quantize(mx.array(arr), group_size=GROUP_SIZE, bits=eff_bits)
             base = name[: -len(".weight")]
             packed[f"{base}.weight"] = wq
             packed[f"{base}.scales"] = scales.astype(mx.bfloat16)
@@ -407,7 +430,7 @@ def write_config(out, bits):
     cfg = {
         "model_type": "acestep",
         "model_version": "turbo",
-        "quant": "8bit" if bits == 8 else "bf16",
+        "quant": quant_label(bits),
         "hidden_size": HIDDEN, "num_hidden_layers": NUM_LAYERS,
         "num_attention_heads": NUM_HEADS, "num_key_value_heads": NUM_KV_HEADS,
         "head_dim": HEAD_DIM, "intermediate_size": INTERMEDIATE,
@@ -508,6 +531,26 @@ def self_test():
     assert not should_quantize("decoder.proj_in.weight", (2560, 2, 192), 8), \
         "convs are 3-D and must stay dense"
     assert not should_quantize("decoder.layers.0.self_attn.q_proj.weight", (4096, 2560), 16)
+
+    # 4-bit: same structural eligibility as 8-bit
+    assert should_quantize("decoder.layers.0.self_attn.q_proj.weight", (4096, 2560), 4)
+    assert not should_quantize("decoder.time_embed.linear_1.weight", (2560, 256), 4), \
+        "time linear_1 (in=256) must stay dense at 4-bit too"
+    assert not should_quantize("decoder.proj_in.weight", (2560, 2, 192), 4)
+
+    # effective bits: the timestep-embedding family is pinned to 8-bit in a
+    # 4-bit build (adaLN modulation feeds every layer's scale/shift; with only
+    # a few turbo denoise steps that error compounds — ~40 MB insurance).
+    assert quant_bits_for("decoder.layers.0.self_attn.q_proj.weight", (4096, 2560), 4) == 4
+    assert quant_bits_for("decoder.time_embed.time_proj.weight", (15360, 2560), 4) == 8
+    assert quant_bits_for("decoder.time_embed_r.linear_2.weight", (2560, 2560), 4) == 8
+    assert quant_bits_for("decoder.time_embed.linear_1.weight", (2560, 256), 4) is None
+    assert quant_bits_for("decoder.norm_out.weight", (2560,), 4) is None
+    assert quant_bits_for("decoder.time_embed.time_proj.weight", (15360, 2560), 8) == 8
+    assert quant_bits_for("decoder.layers.0.self_attn.q_proj.weight", (4096, 2560), 16) is None
+
+    # config label
+    assert quant_label(4) == "4bit" and quant_label(8) == "8bit" and quant_label(16) == "bf16"
     print("[self-test] quantization predicate OK")
 
     # build_model mapping on a synthetic mini checkpoint: verify pop/rename/transform
@@ -635,9 +678,10 @@ def main():
     ap.add_argument("--src-xl", help="dir of ACE-Step/acestep-v15-xl-turbo snapshot")
     ap.add_argument("--src-main", help="dir of ACE-Step/Ace-Step1.5 snapshot (vae/ + Qwen3-Embedding-0.6B/)")
     ap.add_argument("--out", default=None,
-                    help="output dir (default ~/.mlx-serve/models/local/acestep-v15-xl-turbo-{8bit,bf16})")
-    ap.add_argument("--bits", type=int, default=8, choices=(8, 16),
-                    help="8 = quantize big linears (default), 16 = dense bf16 parity build")
+                    help="output dir (default ~/.mlx-serve/models/local/acestep-v15-xl-turbo-{4bit,8bit,bf16})")
+    ap.add_argument("--bits", type=int, default=8, choices=(4, 8, 16),
+                    help="4/8 = quantize big linears (4-bit keeps time embeds at 8), "
+                         "16 = dense bf16 parity build")
     ap.add_argument("--self-test", action="store_true", help="run synthetic unit tests and exit")
     args = ap.parse_args()
 
@@ -651,8 +695,8 @@ def main():
 
     out = args.out
     if out is None:
-        suffix = "8bit" if args.bits == 8 else "bf16"
-        out = os.path.expanduser(f"~/.mlx-serve/models/local/acestep-v15-xl-turbo-{suffix}")
+        out = os.path.expanduser(
+            f"~/.mlx-serve/models/local/acestep-v15-xl-turbo-{quant_label(args.bits)}")
     convert(args.src_xl, args.src_main, out, args.bits)
 
 

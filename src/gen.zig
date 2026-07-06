@@ -594,7 +594,7 @@ pub const AudioEngine = struct {
         const mt = peekModelType(io, allocator, model_dir);
         defer if (mt) |m| allocator.free(m);
         if (mt != null and audioBackendKindForType(mt.?) == .music) {
-            self.backend = .{ .music = try acestep.Engine.load(io, allocator, model_dir) };
+            self.backend = .{ .music = try acestep.Engine.load(io, allocator, model_dir, FluxImpl.lowMemDefault()) };
             log.info("[audio] ACE-Step music engine ready\n", .{});
             return self;
         }

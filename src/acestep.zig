@@ -80,13 +80,30 @@ const NORMALIZE_DB: f32 = -1.0; // peak-normalize target
 pub const MIN_DURATION_S: u32 = 10;
 pub const MAX_DURATION_S: u32 = 600;
 const VAE_CHUNK_FRAMES: usize = 512; // latent frames per decode window (~20 s)
+const VAE_CHUNK_FRAMES_LOWMEM: usize = 128; // ~5 s — decode is the pipeline's peak
 const VAE_OVERLAP_FRAMES: usize = 64; // reference tiled-decode overlap
+
+/// Decode window for the memory budget. Low-mem (iOS jetsam ceilings, small
+/// Macs) trades a few extra overlap re-decodes for a ~4× smaller working set
+/// in the upsampling stack — identical audio in the cores either way.
+fn vaeChunkFrames(low_mem: bool) usize {
+    return if (low_mem) VAE_CHUNK_FRAMES_LOWMEM else VAE_CHUNK_FRAMES;
+}
 const MAX_PROMPT_TOKENS: usize = 256; // reference truncation limits
 const MAX_LYRIC_TOKENS: usize = 2048;
 
 // ════════════════════════════════════════════════════════════════════════
 // Pure helpers (schedule, prompt formatting, normalization) — hermetic tests.
 // ════════════════════════════════════════════════════════════════════════
+
+test "low-mem shrinks the VAE decode window but never below the overlap" {
+    try std.testing.expectEqual(VAE_CHUNK_FRAMES, vaeChunkFrames(false));
+    try std.testing.expectEqual(VAE_CHUNK_FRAMES_LOWMEM, vaeChunkFrames(true));
+    // Redundant halo (≤ overlap each side) must not dominate the useful core;
+    // core ≥ overlap keeps the re-decode factor ≤ 3× worst case.
+    try std.testing.expect(vaeChunkFrames(true) >= VAE_OVERLAP_FRAMES);
+    try std.testing.expect(vaeChunkFrames(false) >= VAE_OVERLAP_FRAMES);
+}
 
 /// Flow-match timestep schedule: t_i = 1 − i/N through the shift transform
 /// t ← shift·t / (1 + (shift−1)·t). N=8, shift=3 reproduces the torch model's
@@ -1112,15 +1129,16 @@ fn vaeDecodeChunked(e: *const Engine, allocator: std.mem.Allocator, latents: mlx
     errdefer allocator.free(out);
     var write_frame: usize = 0;
 
-    const n_chunks = std.math.divCeil(usize, total, VAE_CHUNK_FRAMES) catch unreachable;
+    const chunk_frames = vaeChunkFrames(e.low_mem);
+    const n_chunks = std.math.divCeil(usize, total, chunk_frames) catch unreachable;
     var ci: usize = 0;
     while (ci < n_chunks) : (ci += 1) {
         if (progress) |p| {
             if (p.cancelled()) return error.Cancelled;
             p.emit("decode", @intCast(ci), @intCast(n_chunks));
         }
-        const core_start = ci * VAE_CHUNK_FRAMES;
-        const core_end = @min(core_start + VAE_CHUNK_FRAMES, total);
+        const core_start = ci * chunk_frames;
+        const core_end = @min(core_start + chunk_frames, total);
         const win_start = core_start -| VAE_OVERLAP_FRAMES;
         const win_end = @min(core_end + VAE_OVERLAP_FRAMES, total);
 
@@ -1142,6 +1160,8 @@ fn vaeDecodeChunked(e: *const Engine, allocator: std.mem.Allocator, latents: mlx
         const src = data[trim_start * 2 .. (trim_start + core_frames) * 2];
         @memcpy(out[write_frame * 2 .. (write_frame + core_frames / hop * hop) * 2], src);
         write_frame += core_frames;
+        // Return each window's upsampling buffers before decoding the next.
+        if (e.low_mem) _ = mlx.mlx_clear_cache();
     }
     if (progress) |p| p.emit("decode", @intCast(n_chunks), @intCast(n_chunks));
     std.debug.assert(write_frame == total * hop);
@@ -1209,19 +1229,28 @@ pub const MusicRequest = struct {
 
 pub const Engine = struct {
     allocator: std.mem.Allocator,
+    io: std.Io,
     s: S,
     cfg: Cfg,
     w: Weights, // model.safetensors (DiT + condition encoder + silence_latent)
     vae_w: Weights, // vae.safetensors
-    te_w: Weights, // text_encoder/ (Qwen3-Embedding-0.6B)
+    te_w: ?Weights, // text_encoder/ (Qwen3-Embedding-0.6B); null while phased out (low_mem)
+    te_dir: []u8, // for per-request text-encoder reloads in low_mem
     tok: tok_mod.Tokenizer,
+    /// Phone jetsam ceilings: load the 1.2 GB bf16 text encoder per request
+    /// (freed after conditioning) and decode the VAE in small windows. The
+    /// 4-bit model + resident TE + decode peak got the app SIGKILLed on an
+    /// 8 GB iPhone 16 Pro (2026-07-06).
+    low_mem: bool,
 
-    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Engine {
+    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, low_mem: bool) !*Engine {
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
+        self.io = io;
         self.s = mlx.mlx_default_gpu_stream_new();
         self.cfg = Cfg{}; // single-member family; converted config mirrors these
+        self.low_mem = low_mem;
 
         self.w = try loadFileWeights(allocator, model_dir, "model.safetensors");
         errdefer self.w.deinit();
@@ -1229,21 +1258,48 @@ pub const Engine = struct {
         self.vae_w = try loadFileWeights(allocator, model_dir, "vae.safetensors");
         errdefer self.vae_w.deinit();
 
-        const te_dir = try std.fmt.allocPrint(allocator, "{s}/text_encoder", .{model_dir});
-        defer allocator.free(te_dir);
-        self.te_w = try model_mod.loadWeights(io, allocator, te_dir);
-        errdefer self.te_w.deinit();
-        self.tok = try tok_mod.loadTokenizerAny(io, allocator, te_dir);
-        log.info("[acestep] engine ready (model {d} + vae {d} + text_encoder {d} tensors)\n", .{ self.w.count(), self.vae_w.count(), self.te_w.count() });
+        self.te_dir = try std.fmt.allocPrint(allocator, "{s}/text_encoder", .{model_dir});
+        errdefer allocator.free(self.te_dir);
+        if (low_mem) {
+            self.te_w = null;
+            log.info("[acestep] low-mem mode: text encoder loads per request\n", .{});
+        } else {
+            self.te_w = try model_mod.loadWeights(io, allocator, self.te_dir);
+        }
+        errdefer if (self.te_w) |*t| t.deinit();
+        self.tok = try tok_mod.loadTokenizerAny(io, allocator, self.te_dir);
+        log.info("[acestep] engine ready (model {d} + vae {d} + text_encoder {d} tensors)\n", .{ self.w.count(), self.vae_w.count(), if (self.te_w) |t| t.count() else 0 });
         return self;
     }
 
     pub fn deinit(self: *Engine) void {
         self.w.deinit();
         self.vae_w.deinit();
-        self.te_w.deinit();
+        if (self.te_w) |*t| t.deinit();
+        self.allocator.free(self.te_dir);
         self.tok.deinit();
         self.allocator.destroy(self);
+    }
+
+    /// Text-encoder weights, loading them on demand in low_mem mode.
+    fn ensureTextEncoder(self: *Engine) !*const Weights {
+        if (self.te_w == null) {
+            log.info("[acestep] low-mem: loading text encoder for this request\n", .{});
+            self.te_w = try model_mod.loadWeights(self.io, self.allocator, self.te_dir);
+        }
+        return &self.te_w.?;
+    }
+
+    /// Drop the text-encoder weights + MLX buffer cache. Callers must have
+    /// EVALUATED everything that depends on them first — MLX laziness would
+    /// otherwise pin the weight buffers through the graph anyway.
+    fn releaseTextEncoder(self: *Engine) void {
+        if (self.te_w) |*t| {
+            t.deinit();
+            self.te_w = null;
+        }
+        _ = mlx.mlx_clear_cache();
+        log.info("[acestep] low-mem: text encoder freed after encode\n", .{});
     }
 
     /// silence_latent slice [1,frames,64] (bf16). Tiles when frames exceed the
@@ -1308,9 +1364,10 @@ pub const Engine = struct {
         defer allocator.free(lyric_ids);
 
         // ── text encoder (full forward) + lyric embeds (table lookup) ──
-        const text_hidden = try qwenForward(&self.te_w, allocator, text_ids, s);
+        const te = try self.ensureTextEncoder();
+        const text_hidden = try qwenForward(te, allocator, text_ids, s);
         defer _ = mlx.mlx_array_free(text_hidden);
-        const lyric_embeds = try qwenEmbedLookup(&self.te_w, lyric_ids, s);
+        const lyric_embeds = try qwenEmbedLookup(te, lyric_ids, s);
         defer _ = mlx.mlx_array_free(lyric_embeds);
         if (progress) |p| {
             if (p.cancelled()) return error.Cancelled;
@@ -1321,6 +1378,13 @@ pub const Engine = struct {
         defer _ = mlx.mlx_array_free(timbre);
         const cond2048 = try buildConditioning(self, allocator, text_hidden, lyric_embeds, timbre, s);
         defer _ = mlx.mlx_array_free(cond2048);
+        // Phased text encoder (the FLUX low-mem pattern): materialize the
+        // conditioning NOW — laziness would pin the TE weights through the
+        // graph — then return its 1.2 GB before the denoise loop.
+        if (self.low_mem) {
+            _ = mlx.mlx_array_eval(cond2048);
+            self.releaseTextEncoder();
+        }
         // Project once, build the per-layer cross K/V once.
         var arena_inst = std.heap.ArenaAllocator.init(allocator);
         defer arena_inst.deinit();
@@ -1385,6 +1449,8 @@ pub const Engine = struct {
         if (progress) |p| p.emit("diffuse", NUM_STEPS, NUM_STEPS);
 
         // ── VAE decode → normalize → WAV ──
+        // Decode is the pipeline's memory peak; start it from a drained cache.
+        if (self.low_mem) _ = mlx.mlx_clear_cache();
         const samples = try vaeDecodeChunked(self, allocator, xt, progress, s);
         defer allocator.free(samples);
         peakNormalize(samples, NORMALIZE_DB);
@@ -1620,7 +1686,7 @@ fn arrayCosine(arr: mlx.mlx_array, ref: []const f32, s: S) !f64 {
 
 fn testEngine(io: std.Io, a: std.mem.Allocator) !*Engine {
     const model_dir = std.mem.span(std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest);
-    return Engine.load(io, a, model_dir);
+    return Engine.load(io, a, model_dir, false);
 }
 
 // Oracle 1a: tokenizer + prompt formatting. The dump script writes the token
@@ -1658,7 +1724,7 @@ test "acestep oracle: text encoder hidden states match reference" {
     defer a.free(ref);
     var e = try testEngine(io, a);
     defer e.deinit();
-    const hidden = try qwenForward(&e.te_w, a, ids, e.s);
+    const hidden = try qwenForward(&e.te_w.?, a, ids, e.s);
     defer _ = mlx.mlx_array_free(hidden);
     const corr = try arrayCosine(hidden, ref, e.s);
     std.debug.print("[acestep-text] corr={d:.6}\n", .{corr});
