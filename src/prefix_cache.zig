@@ -19,6 +19,8 @@ const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const model_mod = @import("model.zig");
 const kv_quant = @import("kv_quant.zig");
+const kv_disk_cache = @import("kv_disk_cache.zig");
+const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 
 const KVCache = transformer_mod.KVCache;
@@ -99,6 +101,14 @@ pub const HotPrefixCache = struct {
     /// init. The first commit on a fresh cache must seed an empty entry so
     /// future restores have something to land on.
     initialized: bool = false,
+    /// SSD tier (kv_disk_cache.zig). Attached by the scheduler at model load
+    /// when `--prefix-cache-disk` is non-zero and the arch is pure-attention.
+    /// Lookup falls back to it when it beats the RAM match; commits mark
+    /// `disk_dirty` and the scheduler flushes AFTER the response finishes so
+    /// the client never waits on the SSD write.
+    disk: ?kv_disk_cache.DiskTier = null,
+    /// A commit landed since the last `flushPendingDisk`.
+    disk_dirty: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -119,6 +129,8 @@ pub const HotPrefixCache = struct {
             freeEntryOwnedState(self.allocator, e);
         }
         self.entries.deinit(self.allocator);
+        if (self.disk) |*d| d.deinit();
+        self.disk = null;
     }
 
     /// Free everything an Entry owns: token buffer, KV snapshot, SSM
@@ -228,6 +240,37 @@ pub const HotPrefixCache = struct {
         has_tools: bool,
     ) !LookupResult {
         const match = self.findBestMatch(prompt_ids, has_tools, target_cache.config);
+
+        // ── SSD tier: consult when it can beat the RAM match meaningfully
+        // (fresh boot, post-eviction). Never on hybrid targets — the disk
+        // tier carries no SSM state in v1 (the scheduler doesn't attach one
+        // for those archs; the guard here is belt-and-braces).
+        if (self.disk) |*d| disk: {
+            if (target_ssm_entries != null) break :disk;
+            const ram_len: usize = if (match) |m| m.shared else 0;
+            const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config) orelse break :disk;
+            if (dm.usable <= ram_len) break :disk;
+            if (dm.usable - ram_len < kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
+            const sw = io_util.Stopwatch.init(d.io);
+            const kv_len = d.restoreInto(target_cache, dm.idx, s) catch |err| {
+                log.warn("  [disk-cache] restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                // A failed restore can leave a half-rebuilt cache; reset it.
+                target_cache.truncate(0, s) catch {};
+                break :disk;
+            };
+            const effective: usize = @min(@as(usize, dm.usable), @as(usize, kv_len));
+            if (effective == 0) {
+                try target_cache.truncate(0, s);
+                break :disk;
+            }
+            const full_match = effective == prompt_ids.len;
+            const final_len: usize = if (full_match and effective > 1) effective - 1 else effective;
+            if (final_len < kv_len) try target_cache.truncate(final_len, s);
+            target_moe_seq_offset.* = final_len;
+            const ms = sw.read() / std.time.ns_per_ms;
+            log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms\n", .{ final_len, prompt_ids.len, ms });
+            return .{ .matched = final_len, .full_match = full_match };
+        }
 
         if (match == null) {
             try target_cache.truncate(0, s);
@@ -462,6 +505,7 @@ pub const HotPrefixCache = struct {
             e.ssm_bytes = merged_ssm_bytes;
             e.last_used = self.bumpCounter();
             self.current_kv_bytes += e.kv_bytes;
+            if (self.disk != null) self.disk_dirty = true;
             self.logResident();
             return;
         }
@@ -495,7 +539,40 @@ pub const HotPrefixCache = struct {
             return err;
         };
         self.current_kv_bytes += new_bytes;
+        if (self.disk != null) self.disk_dirty = true;
         self.logResident();
+    }
+
+    /// Flush the most recent commit to the SSD tier. Called by the scheduler
+    /// AFTER `markFinished` (the client already has its response) — the
+    /// chunk-append is bounded (partial tail + new chunks) but synchronous on
+    /// the inference thread. Snapshot arrays are refcount-shared with the RAM
+    /// entry, so slicing them here reads the same buffers the commit captured.
+    pub fn flushPendingDisk(self: *HotPrefixCache, s: mlx.mlx_stream) void {
+        if (!self.disk_dirty) return;
+        self.disk_dirty = false;
+        const d = if (self.disk) |*dd| dd else return;
+        if (self.entries.items.len == 0) return;
+        var newest: *Entry = &self.entries.items[0];
+        for (self.entries.items[1..]) |*e| {
+            if (e.last_used > newest.last_used) newest = e;
+        }
+        // v1: hybrid entries (SSM checkpoints) stay RAM-only.
+        if (newest.ssm_checkpoints != null) return;
+        const complete = d.appendCommit(
+            newest.snapshot.entries,
+            newest.snapshot.step,
+            newest.snapshot.config,
+            newest.tokens,
+            newest.has_tools,
+            s,
+        ) catch |err| {
+            log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        // Byte-capped flush: a large entry persists incrementally — keep the
+        // dirty flag set so the next finished request continues the write.
+        if (!complete) self.disk_dirty = true;
     }
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8) void {
@@ -539,6 +616,10 @@ pub const HotPrefixCache = struct {
     /// when the cache is suspect (pad-only generation, image-bearing prompt,
     /// tools toggle change).
     pub fn invalidateAll(self: *HotPrefixCache, reason: []const u8) void {
+        // Suspect state must die on BOTH tiers — a poisoned prefix that
+        // survives on disk would be immortal across restarts.
+        if (self.disk) |*d| d.invalidateAll();
+        self.disk_dirty = false;
         if (self.entries.items.len == 0) return;
         log.info("  [hot-cache] invalidating all {d} entries: {s}\n", .{ self.entries.items.len, reason });
         for (self.entries.items) |*e| {
@@ -553,6 +634,8 @@ pub const HotPrefixCache = struct {
     /// generation in tail positions. Other entries from prior healthy
     /// requests remain untouched (improvement over the legacy nuke-everything).
     pub fn invalidateLatest(self: *HotPrefixCache, reason: []const u8) void {
+        if (self.disk) |*d| d.invalidateNewest();
+        self.disk_dirty = false;
         if (self.entries.items.len == 0) return;
         var newest_idx: usize = 0;
         var newest_used: u64 = 0;
@@ -646,6 +729,157 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
     // Scheme mismatch returns null — entries are dense, a query for affine
     // 4-bit cannot match (Wave 1.A: cross-scheme cache hits never happen).
     try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.affine(4)));
+}
+
+fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32) !void {
+    var written: u32 = 0;
+    while (written < tokens) {
+        const step: u32 = @min(64, tokens - written);
+        var li: u32 = 0;
+        while (li < n_layers) : (li += 1) {
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            const count: f64 = @floatFromInt(step * 8);
+            const base: f64 = @floatFromInt(written * 8 + li * 1_000_000);
+            try mlx.check(mlx.mlx_arange(&flat, base, base + count, 1.0, .float32, s));
+            var k = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k);
+            const shape = [_]c_int{ 1, 1, @intCast(step), 8 };
+            try mlx.check(mlx.mlx_reshape(&k, flat, &shape, 4, s));
+            var view = try cache.update(li, k, k, s, 0);
+            view.deinit();
+        }
+        written += step;
+    }
+}
+
+test "HotPrefixCache: disk tier restores across a fresh cache instance (restart shape)" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Session 1: commit through the NORMAL RAM path, then flush to disk
+    // (the post-markFinished call the scheduler makes).
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hc", 0, 128);
+        defer hc.deinit();
+
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        try hc.commit(&cache, &tokens, false);
+        try testing.expect(hc.disk_dirty);
+        hc.flushPendingDisk(s);
+        try testing.expect(!hc.disk_dirty);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+
+    // Session 2 ("server restart"): fresh RAM cache, fresh tier over the same
+    // root. The lookup must land on the SSD tier and restore the prefix.
+    {
+        var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hc", 0, 128);
+        defer hc2.deinit();
+        try testing.expectEqual(@as(usize, 0), hc2.entryCount()); // RAM empty
+        try testing.expectEqual(@as(usize, 1), hc2.disk.?.entryCount());
+
+        var cache2 = try KVCache.init(testing.allocator, 2);
+        defer cache2.deinit();
+        var moe_off: usize = 0;
+        const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false);
+        // Full match: identical re-issue semantics — truncate to len-1 and
+        // re-forward the last token, exactly like a RAM full-match hit.
+        try testing.expect(res.full_match);
+        try testing.expectEqual(@as(usize, 599), res.matched);
+        try testing.expectEqual(@as(usize, 599), cache2.step);
+        try testing.expectEqual(@as(usize, 599), moe_off);
+        for (cache2.entries) |*e| {
+            try testing.expect(e.initialized);
+            try testing.expectEqual(@as(usize, 599), e.offset);
+        }
+
+        // Diverged-tail shape: shares the first 400 tokens, then differs.
+        // Restore must land at 400 and leave the tail to prefill.
+        var tokens_div: [700]u32 = undefined;
+        for (&tokens_div, 0..) |*t, i| t.* = if (i < 400) tokens[i] else @intCast(i + 500_000);
+        var cache3 = try KVCache.init(testing.allocator, 2);
+        defer cache3.deinit();
+        var moe_off3: usize = 0;
+        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, null, s, &tokens_div, false);
+        try testing.expect(!res3.full_match);
+        try testing.expectEqual(@as(usize, 400), res3.matched);
+        try testing.expectEqual(@as(usize, 400), cache3.step);
+    }
+}
+
+test "HotPrefixCache: RAM match at least as long as disk skips the SSD read" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-skip", 0, 128);
+    defer hc.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+    try hc.commit(&cache, &tokens, false);
+    hc.flushPendingDisk(s);
+    const disk_uses_before = hc.disk.?.counter;
+
+    // Same prompt again: the RAM entry covers it fully, so the disk tier's
+    // LRU counter must not move (no restore happened).
+    var cache2 = try KVCache.init(testing.allocator, 1);
+    defer cache2.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false);
+    try testing.expect(res.full_match);
+    try testing.expectEqual(disk_uses_before, hc.disk.?.counter);
+}
+
+test "HotPrefixCache: invalidation propagates to the disk tier" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-inv", 0, 128);
+    defer hc.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+    try hc.commit(&cache, &tokens, false);
+    hc.flushPendingDisk(s);
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+
+    hc.invalidateAll("test poison");
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+    try testing.expect(!hc.disk_dirty);
 }
 
 test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {

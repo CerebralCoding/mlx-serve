@@ -44,6 +44,7 @@ const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const kv_disk_cache = @import("kv_disk_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -130,6 +131,10 @@ pub const LoadParams = struct {
     prefix_cache_capacity: u32 = 1,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
     prefix_cache_mem_bytes: u64 = 0,
+    /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
+    /// 0 disables persistence. Attached per model at load for pure-attention
+    /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
+    prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
     /// 0 = disabled (hybrid models bypass the hot prefix cache). Non-zero
     /// enables hybrid in `HotPrefixCache.shouldUse` and triggers per-stride
@@ -810,6 +815,8 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
+    /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
+    prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
     /// Zero disables (hybrid models bypass the hot prefix cache, as before).
     /// Non-zero enables multi-turn warm reuse on hybrid SSM archs. Plumbed
@@ -922,6 +929,17 @@ pub const Scheduler = struct {
     /// `LoadParams.ctx_size` — the --ctx-size launch flag, kept for sizing
     /// GGUF stub configs on cold loads (see preloadGgufCpuState).
     gguf_ctx_size: u32,
+    /// Launch-flag prefix-cache settings, retained so COLD-LOADED models
+    /// (`ensureLoaded` → /v1/load-model, model switches) get the same
+    /// prefix-cache behavior as the `--model` primary. Pre-plumbing these
+    /// were hardcoded to (1, 0, stride 0) on the cold path, which silently
+    /// crippled warm reuse — and disabled it entirely on hybrids — after
+    /// every model switch.
+    prefix_cache_capacity: u32,
+    prefix_cache_mem_bytes: u64,
+    prefix_cache_disk_bytes: u64,
+    ssm_checkpoint_stride: u32,
+    ssm_checkpoint_max: u32,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     config: *const ModelConfig,
@@ -1045,6 +1063,11 @@ pub const Scheduler = struct {
             .drafter_block_size = params.draft_block_size,
             .kv_quant_config = params.kv_quant_config,
             .gguf_ctx_size = params.ctx_size,
+            .prefix_cache_capacity = params.prefix_cache_capacity,
+            .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
+            .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
+            .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
+            .ssm_checkpoint_max = params.ssm_checkpoint_max,
             // Initial borrowed-view refs point at the (heap-allocated) CPU
             // state carried on LoadParams; once the inference thread
             // installs them on `entry`, the views still resolve to the
@@ -1465,8 +1488,14 @@ pub const Scheduler = struct {
             .draft_block_size = drafter_mod.DEFAULT_BLOCK_SIZE,
             .draft_block_size_explicit = false,
             .kv_quant_config = self.kv_quant_config,
-            .prefix_cache_capacity = 1,
-            .prefix_cache_mem_bytes = 0,
+            // Cold loads get the SAME prefix-cache configuration as the
+            // startup model — pre-plumbing these were (1, 0, stride 0),
+            // which silently degraded warm reuse after every model switch.
+            .prefix_cache_capacity = self.prefix_cache_capacity,
+            .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
+            .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
+            .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
+            .ssm_checkpoint_max = self.ssm_checkpoint_max,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
@@ -2514,6 +2543,31 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.prefix_cache_capacity,
             params.prefix_cache_mem_bytes,
         );
+        // SSD tier (`--prefix-cache-disk`). v1 scope is pure-attention archs
+        // — hybrid recurrent state isn't persisted yet. Every failure mode is
+        // caught: persistence silently stays off, the RAM cache is unaffected.
+        const has_ssm_layers = params.config.has_hybrid_layers or
+            params.config.full_attention_interval > 0;
+        if (params.prefix_cache_disk_bytes > 0 and !has_ssm_layers) attach: {
+            const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
+                log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
+                break :attach;
+            };
+            defer sch.allocator.free(fp);
+            const base = kv_disk_cache.defaultBaseDir(sch.allocator) catch break :attach;
+            defer sch.allocator.free(base);
+            entry.prefix_cache.?.disk = kv_disk_cache.DiskTier.init(
+                sch.allocator,
+                sch.io,
+                base,
+                fp,
+                params.prefix_cache_disk_bytes,
+                kv_disk_cache.DEFAULT_CHUNK_TOKENS,
+            ) catch |err| {
+                log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
+                break :attach;
+            };
+        }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
     }
@@ -3124,7 +3178,19 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // finalize here instead.
     if (slot.legacy_gen) |*g| g.logSpecStats();
     commitSlotIfApplicable(sch, slot);
+    // SSD flush runs AFTER markFinished so the client never waits on the
+    // chunk-append — but everything it needs must be captured BEFORE the
+    // broadcast: the conn thread may complete()+free the slot immediately.
+    // The prefix cache and stream live on the registry-owned LoadedModel,
+    // which outlives the slot (unload also runs on this thread).
+    const hc_opt: ?*prefix_cache_mod.HotPrefixCache =
+        if (slot.model.prefix_cache) |*p| p else null;
+    const stream_opt: ?mlx.mlx_stream =
+        if (slot.model.transformer) |x| x.s else null;
     slot.markFinished(reason);
+    if (hc_opt) |hc| {
+        if (stream_opt) |s| hc.flushPendingDisk(s);
+    }
 }
 
 /// ds4 prefill: create a session sized to the configured ctx and sync it to

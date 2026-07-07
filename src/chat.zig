@@ -661,53 +661,16 @@ fn encodeWithSpecialTokens(
     text: []const u8,
     ids: *std.ArrayList(u32),
 ) !void {
-    var specials = std.ArrayList(SpecialEntry).empty;
-    defer specials.deinit(allocator);
-
-    var sit = tok.special_tokens.iterator();
-    while (sit.next()) |entry| {
-        try specials.append(allocator, .{ .text = entry.key_ptr.*, .id = entry.value_ptr.* });
-    }
-
-    std.mem.sort(SpecialEntry, specials.items, {}, struct {
-        fn lessThan(_: void, a: SpecialEntry, b: SpecialEntry) bool {
-            return a.text.len > b.text.len;
-        }
-    }.lessThan);
-
-    var pos: usize = 0;
-    while (pos < text.len) {
-        var matched = false;
-        for (specials.items) |special| {
-            if (pos + special.text.len <= text.len and
-                std.mem.eql(u8, text[pos .. pos + special.text.len], special.text))
-            {
-                try ids.append(allocator, special.id);
-                pos += special.text.len;
-                matched = true;
-                break;
-            }
-        }
-        if (matched) continue;
-
-        var next_special_pos: usize = text.len;
-        for (specials.items) |special| {
-            if (std.mem.indexOf(u8, text[pos..], special.text)) |offset| {
-                const abs_pos = pos + offset;
-                if (abs_pos < next_special_pos) {
-                    next_special_pos = abs_pos;
-                }
-            }
-        }
-
-        if (next_special_pos > pos) {
-            const segment = text[pos..next_special_pos];
-            const segment_ids = try tok.encode(allocator, segment);
-            defer allocator.free(segment_ids);
-            try ids.appendSlice(allocator, segment_ids);
-        }
-        pos = next_special_pos;
-    }
+    // `Tokenizer.encode` already splits around special tokens (earliest
+    // occurrence, longest at a position) with an O(text) first-byte-bucketed
+    // scan. This wrapper used to duplicate that split with its own
+    // O(specials x text) re-search per segment — ~11 s per 66 KB rendered
+    // prompt on gemma-3's 6415-special vocabulary (the tokenizer-side twin
+    // of the same class was fixed in tokenizer.zig; keep both on the shared
+    // fast path so they can't drift apart again).
+    const segment_ids = try tok.encode(allocator, text);
+    defer allocator.free(segment_ids);
+    try ids.appendSlice(allocator, segment_ids);
 }
 
 const SpecialEntry = struct {

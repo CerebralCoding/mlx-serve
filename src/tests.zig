@@ -25,6 +25,7 @@ test {
     _ = @import("diffusion.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
+    _ = @import("kv_disk_cache.zig");
     _ = @import("model_discovery.zig");
     _ = @import("gguf_meta.zig");
     _ = @import("model_registry.zig");

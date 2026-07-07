@@ -305,6 +305,14 @@ fn newEmptyKVEntry() KVCacheEntry {
     };
 }
 
+/// Reset a cache entry to the empty state, freeing all storage + view
+/// handles. Mirror of the per-entry reset in `KVCache.restore`; used by the
+/// disk tier (kv_disk_cache.zig) when installing restored buffers.
+pub fn resetKVEntry(e: *KVCacheEntry) void {
+    freeKVEntry(e);
+    e.* = newEmptyKVEntry();
+}
+
 fn freeKVEntry(e: *KVCacheEntry) void {
     _ = mlx.mlx_array_free(e.keys);
     _ = mlx.mlx_array_free(e.values);
@@ -1102,12 +1110,22 @@ pub const SSMCheckpoint = struct {
 };
 
 /// Snapshot of every entry in `ssm_entries` at the current point. Caller owns
-/// the resulting buffer (free via `SSMCheckpoint.deinit`). Cheap — each layer
-/// is a refcount-share, not a copy.
+/// the resulting buffer (free via `SSMCheckpoint.deinit`).
+///
+/// Unlike the per-decode-step `ssmSnapshot` (PLD rollback — transient, so a
+/// cheap refcount-share is right), checkpoints OUTLIVE the request inside the
+/// hot prefix cache. The live conv/ssm states are routinely shared-buffer
+/// SLICES of much larger parents (the prefill chunk's conv input
+/// [B,(k-1)+T,C], the GDN capture sequence), so sharing the handle silently
+/// retained the whole parent — the ~3.4x "[hot-cache] resident" under-count
+/// on hybrid archs. `materializedOwnedCopy` forces a fresh buffer; the copies
+/// are evaluated here, in one batch, so the parents' lifetimes end with the
+/// chunk's activation graph instead of with the cache entry.
 pub fn captureSsmCheckpoint(
     allocator: std.mem.Allocator,
     ssm_entries: []const SSMCacheEntry,
     pos: usize,
+    s: mlx.mlx_stream,
 ) !SSMCheckpoint {
     const layers = try allocator.alloc(SSMCacheEntrySnapshot, ssm_entries.len);
     var built: usize = 0;
@@ -1116,10 +1134,64 @@ pub fn captureSsmCheckpoint(
         allocator.free(layers);
     }
     for (ssm_entries, 0..) |*src, i| {
-        layers[i] = ssmSnapshot(src);
+        var out: SSMCacheEntrySnapshot = .{
+            .conv_state = mlx.mlx_array_new(),
+            .ssm_state = mlx.mlx_array_new(),
+            .initialized = src.initialized,
+        };
+        // Per-field null guards mirror `ssmSnapshot` — either state may
+        // legitimately be null (LFM2 gated_conv never sets ssm_state).
+        if (src.conv_state.ctx != null) {
+            const c = try materializedOwnedCopy(s, src.conv_state);
+            _ = mlx.mlx_array_free(out.conv_state);
+            out.conv_state = c;
+        }
+        if (src.ssm_state.ctx != null) {
+            const c = try materializedOwnedCopy(s, src.ssm_state);
+            _ = mlx.mlx_array_free(out.ssm_state);
+            out.ssm_state = c;
+        }
+        layers[i] = out;
         built = i + 1;
     }
+    // Materialize all copies in one batch so the parent buffers can be
+    // released with the prefill chunk's graph. Without this eval the lazy
+    // copy node itself keeps the parent alive.
+    {
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var count: usize = 0;
+        for (layers) |*l| {
+            if (l.conv_state.ctx != null) {
+                _ = mlx.mlx_vector_array_append_value(vec, l.conv_state);
+                count += 1;
+            }
+            if (l.ssm_state.ctx != null) {
+                _ = mlx.mlx_vector_array_append_value(vec, l.ssm_state);
+                count += 1;
+            }
+        }
+        if (count > 0) _ = mlx.mlx_eval(vec);
+    }
     return .{ .pos = pos, .layers = layers };
+}
+
+/// Force a REAL copy of `x` into a freshly allocated buffer. `mlx_copy` and
+/// `mlx_contiguous` both take shared-buffer fast paths (Copy is a view op;
+/// contiguous no-ops when the view's strides read as row-contiguous, which a
+/// size-1-leading-dim slice does), so neither breaks the alias to a slice's
+/// parent buffer. Adding a same-dtype scalar zero always runs a kernel with a
+/// newly allocated output. Buffer donation can't alias either: the caller
+/// still holds `x`, so its buffer is never donated.
+pub fn materializedOwnedCopy(s: mlx.mlx_stream, x: mlx.mlx_array) !mlx.mlx_array {
+    var zero = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(zero);
+    const scalar_shape = [_]c_int{1};
+    try mlx.check(mlx.mlx_zeros(&zero, &scalar_shape, 0, mlx.mlx_array_dtype(x), s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_add(&out, x, zero, s));
+    return out;
 }
 
 /// Restore every layer of `ssm_entries` from `cp`. Mirrors the per-layer
@@ -8311,6 +8383,73 @@ test "SSMCacheEntry snapshot/restore handles null ssm_state (LFM2 gated_conv)" {
     try testing.expectEqual(@as(c_int, 1), restored[0]);
     try testing.expectEqual(@as(c_int, 3), restored[1]);
     try testing.expectEqual(@as(c_int, 4), restored[2]);
+}
+
+test "captureSsmCheckpoint materializes state copies (parent-buffer retention class)" {
+    // Hot-cache SSM checkpoints used to refcount-share the live conv/ssm
+    // state handles. Those are routinely SLICES of much larger parent buffers
+    // (e.g. the prefill chunk's conv input [B,(k-1)+T,C]), so a committed
+    // entry silently retained the whole parent — the measured ~3.4x
+    // "[hot-cache] resident" under-count on hybrid archs. Capture must
+    // materialize an OWNED copy: the checkpoint's data pointer may not alias
+    // the parent's buffer, and ssmCheckpointBytes must equal true retention.
+    const s = mlx.gpuStream();
+
+    // Parent buffer: [1, 1024, 8] f32, 32 KB.
+    var parent = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(parent);
+    {
+        var flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(flat);
+        try mlx.check(mlx.mlx_arange(&flat, 0.0, 8192.0, 1.0, .float32, s));
+        const shape = [_]c_int{ 1, 1024, 8 };
+        try mlx.check(mlx.mlx_reshape(&parent, flat, &shape, 3, s));
+        _ = mlx.mlx_array_eval(parent);
+    }
+
+    // conv_state := parent[:, 1021:1024, :] — after eval this is a
+    // shared-buffer view into `parent` (MLX slice keeps the parent alive).
+    var entry: SSMCacheEntry = .{
+        .conv_state = mlx.mlx_array_new(),
+        .ssm_state = mlx.mlx_array_new(),
+        .initialized = true,
+    };
+    defer {
+        _ = mlx.mlx_array_free(entry.conv_state);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+    }
+    {
+        const st = [_]c_int{ 0, 1021, 0 };
+        const sp = [_]c_int{ 1, 1024, 8 };
+        const sd = [_]c_int{ 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&entry.conv_state, parent, &st, 3, &sp, 3, &sd, 3, s));
+        _ = mlx.mlx_array_eval(entry.conv_state);
+    }
+
+    var entries = [_]SSMCacheEntry{entry};
+    var cp = try captureSsmCheckpoint(testing.allocator, &entries, 3, s);
+    defer cp.deinit(testing.allocator);
+
+    // The checkpoint's conv_state must live in its own buffer, outside the
+    // parent's data range.
+    _ = mlx.mlx_array_eval(cp.layers[0].conv_state);
+    const parent_ptr = mlx.mlx_array_data_float32(parent).?;
+    const parent_bytes = @as(u64, mlx.mlx_array_size(parent)) * @as(u64, mlx.mlx_array_itemsize(parent));
+    const cp_ptr = mlx.mlx_array_data_float32(cp.layers[0].conv_state).?;
+    const p0 = @intFromPtr(parent_ptr);
+    const p1 = p0 + parent_bytes;
+    const c0 = @intFromPtr(cp_ptr);
+    try testing.expect(c0 < p0 or c0 >= p1);
+
+    // Values must survive the copy: parent row 1021 starts at 1021*8.
+    try testing.expectEqual(@as(f32, 1021.0 * 8.0), cp_ptr[0]);
+    try testing.expectEqual(@as(f32, 1021.0 * 8.0 + 23.0), cp_ptr[23]);
+
+    // Accounting matches true retention: 3*8 f32 elements, nothing more.
+    try testing.expectEqual(@as(u64, 3 * 8 * 4), ssmCheckpointBytes(&cp));
+
+    // Null ssm_state stays null (LFM2 gated_conv shape).
+    try testing.expect(cp.layers[0].ssm_state.ctx == null);
 }
 
 test "computeQuantParams resolves mixed nvfp4 + affine-override weights" {

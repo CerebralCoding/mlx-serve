@@ -128,6 +128,11 @@ fn printUsage(io: std.Io) void {
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
         \\                      Pass 0/off to disable the byte budget.
+        \\  --prefix-cache-disk <n>{{KB,MB,GB}}
+        \\                      SSD tier for the prefix cache (default: 10GB).
+        \\                      Seen prefixes persist under ~/.mlx-serve/kv-cache
+        \\                        and are restored across restarts and RAM
+        \\                        evictions instead of recomputed. 0/off disables.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
@@ -409,6 +414,16 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             server_mod.prefix_cache_mem_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
+            // SSD tier for the hot prefix cache: previously-seen prefixes are
+            // persisted as chunked safetensors and restored across restarts
+            // and RAM evictions instead of recomputed. Byte budget with the
+            // same size grammar as --prefix-cache-mem; `0`/`off` disables.
+            i += 1;
+            server_mod.prefix_cache_disk_bytes = parseSizeArg(args[i]) catch {
+                log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--tokenize-cache-entries") and i + 1 < args.len) {
@@ -902,6 +917,7 @@ pub fn main(init: std.process.Init) !void {
             .kv_quant_config = kv_quant_config,
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
+            .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,

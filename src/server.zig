@@ -420,6 +420,14 @@ pub var prefix_cache_capacity: u32 = 32;
 /// from `--prefix-cache-entries` still applies).
 pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
 
+/// SSD tier for the hot prefix cache (`--prefix-cache-disk`, default 10 GB;
+/// `0`/`off` disables). Committed KV prefixes persist as chunked safetensors
+/// under `~/.mlx-serve/kv-cache/<model-fingerprint>` and are restored across
+/// RAM evictions AND server restarts instead of recomputed — a cold 30-50 s
+/// long-context TTFT becomes a bounded SSD read. LRU-evicted to this byte
+/// budget. v1 covers pure-attention archs; hybrid SSM state stays RAM-only.
+pub var prefix_cache_disk_bytes: u64 = 10 * 1024 * 1024 * 1024;
+
 /// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
 /// in tokens. Non-zero values enable multi-turn warm reuse on hybrid SSM
 /// architectures (Qwen3.5/3.6 GatedDeltaNet, Nemotron-H Mamba2, LFM2.5
