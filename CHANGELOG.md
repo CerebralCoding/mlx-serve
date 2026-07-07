@@ -1,5 +1,11 @@
 # Changelog
 
+## v26.7.3 — Edit with reference images
+
+- **Multi-reference image editing**: instruction edits on FLUX.2 Klein can now see extra reference pictures. Add up to 3 reference images beside the source in the Image pane's edit mode and refer to them by number — "replace the face of the man in image 1 with the face from image 2" — for face swaps, product placement, and style transplants that a text-only edit can't do. API users: `ref_images` (base64 array) beside `image` with `mode:"edit"` on `/v1/images/generations`.
+
+---
+
 ## v26.7.2 — Type a vibe, get a song. Turn a photo into a 3D model. And the app updates itself
 
 - **Type a vibe, get a song — music generation lands.** The Audio pane grows a second tab: describe a style ("upbeat synthwave with driving bass"), optionally paste lyrics, pick a length from 10 seconds to 10 minutes, and ACE-Step 1.5 XL Turbo — a 4-billion-parameter music diffusion model ported natively to Apple Silicon — composes an original 48 kHz stereo track in just 8 diffusion steps, entirely on-device inside the same no-Python binary. BPM, key, and time signature are steerable; instrumental or vocal. The existing text-to-speech pane lives on as the Voice tab, and both tabs gain a persistent history list — every track and voice clip you've ever generated stays one click away (play, stop, reveal in Finder), and starting a new generation stops whatever is still playing. The Music tab ships genre style-prompt starters and original lyric templates, and you can save your own style prompts and lyrics to reuse from the Examples menus. Every generation drops a matching `.txt` next to the audio with the exact prompt, lyrics, and settings used, so any track is reproducible. `POST /v1/audio/music-generations` for API users.

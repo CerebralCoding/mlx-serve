@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Native FLUX.2 image endpoint smoke test: text-to-image (JSON + SSE),
 # image-to-image (structure retention at low strength + engagement log),
+# instruction edit incl. multi-reference (ref_images engagement + 400s),
 # conditioning rebalance (cond_gain/cond_weights + count validation), and
 # runtime LoRA (synthetic zero-B adapter attaches; non-matching adapter 400s).
 # Usage: FLUX_MODEL=<dir> ./tests/test_image_gen.sh [port]
@@ -224,3 +225,71 @@ code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Conten
   -d '{"prompt":"x","mode":"edit"}' -o /dev/null -w "%{http_code}")
 [ "$code" = "400" ] || { echo "FAIL: imageless edit returned $code (want 400)"; exit 1; }
 echo "PASS: mode=edit without image -> 400"
+
+# ── multi-reference edit (ref_images): same request as the single-ref edit
+# plus ONE extra reference at a different size (own latent grid, t=20 ids).
+# The output must differ from the single-ref edit — same seed/prompt/steps, so
+# only the extra reference can be the cause.
+REF2=/tmp/test_edit_ref2.png
+python3 - "$REF2" <<'PY'
+import sys, struct, zlib
+W = H = 512  # different grid than the 1024² source
+rows = b""
+for y in range(H):
+    row = bytearray([0])
+    v = 235 if y < H // 2 else 20  # horizontal split (source is vertical)
+    row += bytes([v, v, v]) * W
+    rows += bytes(row)
+def chunk(t, d):
+    return struct.pack(">I", len(d)) + t + d + struct.pack(">I", zlib.crc32(t + d))
+png = (b"\x89PNG\r\n\x1a\n"
+       + chunk(b"IHDR", struct.pack(">IIBBBBB", W, H, 8, 2, 0, 0, 0))
+       + chunk(b"IDAT", zlib.compress(rows))
+       + chunk(b"IEND", b""))
+open(sys.argv[1], "wb").write(png)
+PY
+MREQ=/tmp/test_multiref_req.json
+python3 - "$SRC" "$REF2" "$MREQ" <<'PY'
+import sys, json, base64
+b64 = base64.b64encode(open(sys.argv[1], "rb").read()).decode()
+ref = base64.b64encode(open(sys.argv[2], "rb").read()).decode()
+json.dump({"prompt": "the same image, unchanged", "size": "1024x1024", "steps": 4,
+           "mode": "edit", "image": b64, "ref_images": [ref], "seed": 7}, open(sys.argv[3], "w"))
+PY
+MOUT=/tmp/test_multiref_out.json
+code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d @"$MREQ" -o "$MOUT" -w "%{http_code}")
+[ "$code" = "200" ] || { echo "FAIL: multi-ref edit http $code"; head -c 300 "$MOUT"; exit 1; }
+grep -q "\[image\] edit ref 2:" /tmp/test_image_server.log || { echo "FAIL: no second-reference engagement log line"; exit 1; }
+python3 - "$MOUT" <<'PY'
+import sys, json, base64, struct
+d = json.load(open(sys.argv[1]))
+png = base64.b64decode(d["data"][0]["b64_json"])
+assert png[:8] == bytes([0x89,0x50,0x4E,0x47,0x0D,0x0A,0x1A,0x0A]), "not a PNG"
+w, h = struct.unpack(">II", png[16:24])
+assert w == 1024 and h == 1024, f"bad dims {w}x{h}"
+print(f"PASS: multi-reference edit -> {len(png)} byte PNG {w}x{h}")
+PY
+[ $? -eq 0 ] || exit 1
+cmp -s "$EOUT" "$MOUT" && { echo "FAIL: extra reference did not change the output"; exit 1; }
+echo "PASS: ref_images engaged (edit ref 2 log, output differs from single-ref edit)"
+
+# ── ref_images outside edit mode → 400
+code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d '{"prompt":"x","image":"aGk=","ref_images":["aGk="]}' -o /dev/null -w "%{http_code}")
+[ "$code" = "400" ] || { echo "FAIL: variation-mode ref_images returned $code (want 400)"; exit 1; }
+echo "PASS: ref_images without mode=edit -> 400"
+
+# ── ref_images must be an array → 400
+code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d @<(python3 -c 'import json,base64,sys; b=base64.b64encode(open("/tmp/test_img2img_src.png","rb").read()).decode(); print(json.dumps({"prompt":"x","mode":"edit","image":b,"ref_images":"aGk="}))') \
+  -o /dev/null -w "%{http_code}")
+[ "$code" = "400" ] || { echo "FAIL: non-array ref_images returned $code (want 400)"; exit 1; }
+echo "PASS: non-array ref_images -> 400"
+
+# ── more than 3 extra references → 400 (cap: 4 total edit images)
+code=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/images/generations" -H 'Content-Type: application/json' \
+  -d @<(python3 -c 'import json,base64; b=base64.b64encode(open("/tmp/test_img2img_src.png","rb").read()).decode(); r=base64.b64encode(open("/tmp/test_edit_ref2.png","rb").read()).decode(); print(json.dumps({"prompt":"x","mode":"edit","image":b,"ref_images":[r,r,r,r]}))') \
+  -o /dev/null -w "%{http_code}")
+[ "$code" = "400" ] || { echo "FAIL: 4 ref_images returned $code (want 400)"; exit 1; }
+echo "PASS: 4 ref_images -> 400 (cap is 3 beside the source)"

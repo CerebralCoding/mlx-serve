@@ -535,6 +535,48 @@ final class MediaGenServiceTests: XCTestCase {
         XCTAssertNotNil(json["strength"])
     }
 
+    func testImageRequestJsonEditModeIncludesRefImages() throws {
+        let tmpDir = FileManager.default.temporaryDirectory
+        let src = tmpDir.appendingPathComponent("edit-src-\(UUID().uuidString).png")
+        try Data([1, 2, 3]).write(to: src)
+        defer { try? FileManager.default.removeItem(at: src) }
+        let refBytes = Data([9, 8, 7, 6])
+        let ref = tmpDir.appendingPathComponent("edit-ref-\(UUID().uuidString).png")
+        try refBytes.write(to: ref)
+        defer { try? FileManager.default.removeItem(at: ref) }
+
+        var req = ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "replace the face in image 1 with the face from image 2", width: 1024, height: 1024, steps: 8, guidance: 0.5)
+        req.initImagePath = src.path
+        req.editMode = true
+        req.refImagePaths = [ref.path, "/definitely/not/a/real/ref.png"] // missing file skipped
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["mode"] as? String, "edit")
+        XCTAssertEqual(json["ref_images"] as? [String], [refBytes.base64EncodedString()])
+    }
+
+    func testImageRequestJsonRefImagesOmittedInVariationAndTextToImage() throws {
+        let tmpDir = FileManager.default.temporaryDirectory
+        let ref = tmpDir.appendingPathComponent("var-ref-\(UUID().uuidString).png")
+        try Data([1]).write(to: ref)
+        defer { try? FileManager.default.removeItem(at: ref) }
+
+        // Variation mode: extra references have no meaning (the server 400s).
+        let src = tmpDir.appendingPathComponent("var-src-\(UUID().uuidString).png")
+        try Data([2]).write(to: src)
+        defer { try? FileManager.default.removeItem(at: src) }
+        var vreq = ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "x", width: 1024, height: 1024, steps: 8, guidance: 0.5)
+        vreq.initImagePath = src.path
+        vreq.editMode = false
+        vreq.refImagePaths = [ref.path]
+        XCTAssertNil(ImageGenService.requestJson(for: vreq, modelName: "m", seed: 1)["ref_images"])
+
+        // Text-to-image (no source at all): refs are meaningless too.
+        var treq = ImageGenRequest(model: .flux2Klein4B_Q4, prompt: "x", width: 1024, height: 1024, steps: 8, guidance: 0.5)
+        treq.editMode = true
+        treq.refImagePaths = [ref.path]
+        XCTAssertNil(ImageGenService.requestJson(for: treq, modelName: "m", seed: 1)["ref_images"])
+    }
+
     func testSupportsReferenceEditFollowsVariant() {
         // Editing is a trained FLUX.2 capability; FLUX.1 and Krea don't have it.
         XCTAssertTrue(ImageModelPreset.flux2Klein4B_Q4.supportsReferenceEdit)

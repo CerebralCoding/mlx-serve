@@ -34,6 +34,10 @@ struct ImageGenView: View {
     @State private var safeMode: Bool = true
     /// Image-to-image source (transient — not persisted, like video's first frame).
     @State private var initImageURL: URL? = nil
+    /// Extra in-context references for edit mode (FLUX.2 multi-reference):
+    /// "replace the face in image 1 with the face from image 2". Transient,
+    /// like the source. The server takes at most 3 beside the source.
+    @State private var refImageURLs: [URL] = []
     /// img2img renoise strength: low = stay close to the source, high = mostly prompt.
     @State private var strength: Double = 0.6
     /// Source-image mode: true = instruction edit (FLUX.2 in-context reference,
@@ -145,6 +149,7 @@ struct ImageGenView: View {
                     Spacer()
                     Button {
                         initImageURL = nil
+                        refImageURLs = []
                     } label: {
                         Image(systemName: "xmark.circle.fill")
                     }
@@ -164,9 +169,49 @@ struct ImageGenView: View {
                     .onChange(of: editMode) { _, _ in guard !hydrating else { return }; persist() }
                 }
                 if effectiveEditMode {
-                    Text("Describe the change in the prompt — “make the hair blue”, “remove the monitor”. The model sees the original and keeps the rest.")
-                        .font(.caption2)
-                        .foregroundStyle(.secondary)
+                    ForEach(refImageURLs, id: \.self) { ref in
+                        HStack(spacing: 8) {
+                            if let img = NSImage(contentsOf: ref) {
+                                Image(nsImage: img)
+                                    .resizable()
+                                    .scaledToFill()
+                                    .frame(width: 40, height: 40)
+                                    .clipShape(RoundedRectangle(cornerRadius: 4))
+                            }
+                            Text(ref.lastPathComponent)
+                                .font(.caption)
+                                .lineLimit(1)
+                                .truncationMode(.middle)
+                            Spacer()
+                            Button {
+                                refImageURLs.removeAll { $0 == ref }
+                            } label: {
+                                Image(systemName: "xmark.circle.fill")
+                            }
+                            .buttonStyle(.borderless)
+                            .foregroundStyle(.secondary)
+                            .help("Remove this reference image")
+                        }
+                        .padding(6)
+                        .background(RoundedRectangle(cornerRadius: 6).fill(Color.secondary.opacity(0.08)))
+                    }
+                    if refImageURLs.count < 3 {
+                        Button {
+                            chooseRefImage()
+                        } label: {
+                            Label("Add reference image…", systemImage: "photo.badge.plus")
+                                .font(.caption)
+                        }
+                    }
+                    if refImageURLs.isEmpty {
+                        Text("Describe the change in the prompt — “make the hair blue”, “remove the monitor”. The model sees the original and keeps the rest.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    } else {
+                        Text("Refer to the pictures by number — the source is image 1, references follow in order: “replace the face of the man in image 1 with the face from image 2”.")
+                            .font(.caption2)
+                            .foregroundStyle(.secondary)
+                    }
                 } else {
                     VStack(alignment: .leading, spacing: 2) {
                         HStack {
@@ -389,6 +434,17 @@ struct ImageGenView: View {
         }
     }
 
+    private func chooseRefImage() {
+        let panel = NSOpenPanel()
+        panel.allowedContentTypes = [.image, .png, .jpeg, .heic]
+        panel.canChooseFiles = true
+        panel.canChooseDirectories = false
+        panel.allowsMultipleSelection = false
+        if panel.runModal() == .OK, let url = panel.url, refImageURLs.count < 3 {
+            refImageURLs.append(url)
+        }
+    }
+
     private func chooseLora() {
         let panel = NSOpenPanel()
         if let st = UTType(filenameExtension: "safetensors") {
@@ -601,6 +657,7 @@ struct ImageGenView: View {
             initImagePath: initImageURL?.path,
             strength: strength,
             editMode: effectiveEditMode,
+            refImagePaths: effectiveEditMode ? refImageURLs.map(\.path) : [],
             condGain: condGain,
             condWeightsText: condWeightsText,
             loraPath: loraPath.isEmpty ? nil : loraPath

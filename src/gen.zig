@@ -268,11 +268,20 @@ const FluxImpl = struct {
         defer if (init_lat) |l| {
             _ = mlx.mlx_array_free(l);
         };
-        if (opts.edit_image) |pix| {
-            // Instruction edit: clean in-context reference, full noise start.
+        var ref_lats: [MAX_EDIT_IMAGES]mlx.mlx_array = undefined;
+        var ref_lat_n: usize = 0;
+        defer for (ref_lats[0..ref_lat_n]) |l| {
+            _ = mlx.mlx_array_free(l);
+        };
+        if (opts.edit_images.len > 0) {
+            // Instruction edit: clean in-context references, full noise start.
             const ve = if (self.vae_enc) |*e| e else return error.NoVaeEncoder;
-            init_lat = try ve.encode(pix);
-            fopts.ref_latents = init_lat;
+            if (opts.edit_images.len > MAX_EDIT_IMAGES) return error.TooManyEditImages;
+            for (opts.edit_images) |pix| {
+                ref_lats[ref_lat_n] = try ve.encode(pix);
+                ref_lat_n += 1;
+            }
+            fopts.ref_latents = ref_lats[0..ref_lat_n];
         } else if (opts.init_image) |pix| {
             const ve = if (self.vae_enc) |*e| e else return error.NoVaeEncoder;
             init_lat = try ve.encode(pix);
@@ -314,6 +323,11 @@ const ImageBackend = union(enum) {
     krea: *krea.Engine,
 };
 
+/// Most reference images an edit request may carry (the primary 'image' plus
+/// extra 'ref_images'). Each ~1MP reference adds ~4096 DiT tokens, so the cap
+/// bounds attention memory; the official sampler tops out around 10.
+pub const MAX_EDIT_IMAGES = 4;
+
 /// Per-request image-generation options shared by both backends.
 pub const ImageGenOpts = struct {
     /// img2img source pixels [1,3,H,W] f32 [0,1], pre-resized to the target
@@ -325,7 +339,10 @@ pub const ImageGenOpts = struct {
     /// Instruction editing (FLUX.2 only): source pixels [1,3,H,W] f32 [0,1]
     /// conditioned as CLEAN in-context reference tokens — generation starts
     /// from pure noise and attends to them (`strength` does not apply).
-    edit_image: ?mlx.mlx_array = null,
+    /// Multiple entries (the edited source first, then extra references) each
+    /// ride at their own t offset: "replace the face in image 1 with the face
+    /// from image 2". Empty = not an edit.
+    edit_images: []const mlx.mlx_array = &.{},
     /// Conditioning rebalance: global gain × per-tapped-layer weights
     /// (FLUX: 3 taps, Krea: 12 taps).
     cond_gain: f32 = 1.0,
@@ -456,7 +473,7 @@ pub const ImageEngine = struct {
         return switch (self.backend) {
             .flux => |*f| f.generateImage(allocator, prompt, width, height, seed, steps, opts, progress),
             .krea => |k| blk: {
-                if (opts.edit_image != null) break :blk error.EditUnsupported;
+                if (opts.edit_images.len != 0) break :blk error.EditUnsupported;
                 const kopts = krea.GenOpts{
                     .init_image = opts.init_image,
                     .start_step = if (opts.init_image != null) img2imgStartStep(steps, opts.strength) else 0,
@@ -1244,9 +1261,17 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     // "edit"). Variation = SDEdit renoise at `strength` (both backends);
     // edit = FLUX.2 in-context reference conditioning (instruction edits —
     // "make the hair blue" — with the source attended to clean; no strength).
+    // Edit mode also takes `ref_images` (a JSON array of base64 PNG/JPEG):
+    // extra in-context references beside the edited source — "replace the
+    // face in image 1 with the face from image 2".
     var init_img: ?mlx.mlx_array = null;
     defer if (init_img) |ii| {
         _ = mlx.mlx_array_free(ii);
+    };
+    var edit_imgs: [MAX_EDIT_IMAGES]mlx.mlx_array = undefined;
+    var edit_imgs_n: usize = 0;
+    defer for (edit_imgs[0..edit_imgs_n]) |ei| {
+        _ = mlx.mlx_array_free(ei);
     };
     var strength: f32 = 0.6;
     var edit_mode = false;
@@ -1276,8 +1301,9 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
             const nat = imageNativeSize(img_bytes) orelse
                 return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
             const rd = fitRefDims(nat.w, nat.h);
-            init_img = decodeImageToBCHW(allocator, img_bytes, rd.h, rd.w) orelse
+            edit_imgs[0] = decodeImageToBCHW(allocator, img_bytes, rd.h, rd.w) orelse
                 return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
+            edit_imgs_n = 1;
             log.info("[image] edit: reference {d}x{d} -> {d}x{d} (in-context conditioning)\n", .{ nat.w, nat.h, rd.w, rd.h });
         } else {
             // Variation shares the output's latent grid — cover + center-crop
@@ -1288,6 +1314,29 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
         }
     } else if (edit_mode) {
         return sendError(conn, 400, "mode:\"edit\" needs an 'image' to edit");
+    }
+
+    // Extra in-context references (edit mode only): each keeps its own aspect
+    // ratio like the primary and rides at its own t offset in the DiT.
+    if (std.mem.indexOf(u8, body, "\"ref_images\"") != null) {
+        if (!edit_mode) return sendError(conn, 400, "'ref_images' requires mode:\"edit\"");
+        var it = iterJsonStringArray(body, "ref_images") orelse
+            return sendError(conn, 400, "invalid 'ref_images' (must be a JSON array of base64 strings)");
+        while (it.next()) |raw_ref| {
+            if (edit_imgs_n >= MAX_EDIT_IMAGES)
+                return sendError(conn, 400, "too many reference images ('ref_images' takes at most 3 beside 'image')");
+            const ref_bytes = base64DecodeAlloc(allocator, raw_ref) catch
+                return sendError(conn, 400, "invalid base64 in 'ref_images'");
+            defer allocator.free(ref_bytes);
+            const rnat = imageNativeSize(ref_bytes) orelse
+                return sendError(conn, 400, "could not decode a 'ref_images' entry (PNG/JPEG supported)");
+            const rrd = fitRefDims(rnat.w, rnat.h);
+            edit_imgs[edit_imgs_n] = decodeImageToBCHW(allocator, ref_bytes, rrd.h, rrd.w) orelse
+                return sendError(conn, 400, "could not decode a 'ref_images' entry (PNG/JPEG supported)");
+            edit_imgs_n += 1;
+            log.info("[image] edit ref {d}: {d}x{d} -> {d}x{d}\n", .{ edit_imgs_n, rnat.w, rnat.h, rrd.w, rrd.h });
+        }
+        if (it.bad) return sendError(conn, 400, "invalid 'ref_images' (must be a JSON array of base64 strings)");
     }
 
     // Conditioning rebalance: global gain + per-tapped-layer weights.
@@ -1334,9 +1383,9 @@ pub fn handleImage(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: 
     if (want_stream) try conn.writeAll(sse.headers);
 
     const gen_opts = ImageGenOpts{
-        .init_image = if (edit_mode) null else init_img,
+        .init_image = init_img, // null in edit mode
         .strength = strength,
-        .edit_image = if (edit_mode) init_img else null,
+        .edit_images = edit_imgs[0..edit_imgs_n],
         .cond_gain = cond_gain,
         .cond_weights = cond_weights,
     };
@@ -2255,6 +2304,61 @@ fn extractCondWeights(body: []const u8, buf: []f32) ?[]f32 {
     return null;
 }
 
+/// Iterate the string elements of a JSON array field (`"key": ["a", "b"]`).
+/// Scanner-grade like the other extract helpers — values must not contain
+/// escaped quotes, which holds for base64 payloads. A non-string element sets
+/// `bad` so the caller can 400 instead of silently ignoring it.
+const JsonStringArrayIter = struct {
+    rest: []const u8,
+    bad: bool = false,
+
+    fn next(self: *JsonStringArrayIter) ?[]const u8 {
+        var i: usize = 0;
+        while (i < self.rest.len) : (i += 1) {
+            switch (self.rest[i]) {
+                '"' => break,
+                ']' => return null,
+                ',', ' ', '\t', '\n', '\r' => continue,
+                else => {
+                    self.bad = true;
+                    return null;
+                },
+            }
+        }
+        if (i >= self.rest.len) {
+            self.bad = true; // ran out before the closing ']'
+            return null;
+        }
+        i += 1;
+        const start = i;
+        while (i < self.rest.len) : (i += 1) {
+            if (self.rest[i] == '\\') {
+                i += 1;
+                continue;
+            }
+            if (self.rest[i] == '"') {
+                const v = self.rest[start..i];
+                self.rest = self.rest[i + 1 ..];
+                return v;
+            }
+        }
+        self.bad = true; // unterminated string
+        return null;
+    }
+};
+
+/// Position an iterator at the first element of the `key` JSON string array.
+/// Null when the key is absent or its value is not an array.
+fn iterJsonStringArray(body: []const u8, key: []const u8) ?JsonStringArrayIter {
+    var key_pat_buf: [64]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, body, key_pat) orelse return null;
+    var i = ki + key_pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
+    if (i >= body.len or body[i] != '[') return null;
+    return .{ .rest = body[i + 1 ..] };
+}
+
 /// Base64-decode (standard alphabet) into an owned buffer.
 fn base64DecodeAlloc(allocator: std.mem.Allocator, b64: []const u8) ![]u8 {
     const dec = std.base64.standard.Decoder;
@@ -2690,6 +2794,26 @@ test "decodeImageToBCHW covers with a center crop instead of stretching" {
     for (0..n) |i| mean += d[i];
     mean /= @floatFromInt(n);
     try testing.expect(mean > 0.9); // stretch gives ~0.5 here
+}
+
+test "iterJsonStringArray walks ref_images entries" {
+    // Two entries, whitespace tolerated, trailing fields ignored.
+    var it = iterJsonStringArray("{\"ref_images\": [ \"QUJD\", \"REVG\" ], \"seed\":1}", "ref_images").?;
+    try testing.expectEqualStrings("QUJD", it.next().?);
+    try testing.expectEqualStrings("REVG", it.next().?);
+    try testing.expect(it.next() == null);
+    try testing.expect(!it.bad);
+    // Empty array: no entries, not malformed.
+    var e = iterJsonStringArray("{\"ref_images\":[]}", "ref_images").?;
+    try testing.expect(e.next() == null);
+    try testing.expect(!e.bad);
+    // Absent key / non-array value → null (feature off vs 400 at the caller).
+    try testing.expect(iterJsonStringArray("{\"seed\":1}", "ref_images") == null);
+    try testing.expect(iterJsonStringArray("{\"ref_images\":\"QUJD\"}", "ref_images") == null);
+    // Non-string element flags bad so the handler can 400 instead of ignoring.
+    var b = iterJsonStringArray("{\"ref_images\":[1,2]}", "ref_images").?;
+    try testing.expect(b.next() == null);
+    try testing.expect(b.bad);
 }
 
 test "extractCondWeights accepts a JSON array or a separated string" {

@@ -730,6 +730,11 @@ struct ImageGenRequest {
     /// in-context reference — "make the hair blue" keeps the same person.
     /// false = variation (renoise) mode.
     var editMode: Bool = false
+    /// Extra in-context reference images for edit mode (FLUX.2
+    /// multi-reference): "replace the face in image 1 with the face from
+    /// image 2". Sent as `ref_images` beside the primary source; the server
+    /// takes at most 3.
+    var refImagePaths: [String] = []
     /// Conditioning rebalance (Advanced): global multiplier on the prompt
     /// embeddings. 1.0 = off.
     var condGain: Double = 1.0

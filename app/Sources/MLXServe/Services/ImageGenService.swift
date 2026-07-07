@@ -171,7 +171,8 @@ final class ImageGenService: ObservableObject {
 
     /// Build the `/v1/images/generations` body for a request. Pure + static so
     /// the contract is unit-testable: plain text-to-image bodies carry ONLY the
-    /// classic fields; img2img (`image`+`strength`), conditioning rebalance
+    /// classic fields; img2img (`image`+`strength`), edit references
+    /// (`mode`+`ref_images`), conditioning rebalance
     /// (`cond_gain`+`cond_weights`), and LoRA (`lora_path`+`lora_scale`) are
     /// added only when set, so the server sees no behavior change otherwise.
     static func requestJson(for request: ImageGenRequest, modelName: String, seed: Int) -> [String: Any] {
@@ -188,6 +189,12 @@ final class ImageGenService: ObservableObject {
             json["image"] = data.base64EncodedString()
             if request.editMode {
                 json["mode"] = "edit" // clean in-context reference; strength n/a
+                // Extra references (multi-reference edit) — missing files are
+                // skipped like a missing primary source.
+                let refs = request.refImagePaths.compactMap {
+                    FileManager.default.contents(atPath: $0)?.base64EncodedString()
+                }
+                if !refs.isEmpty { json["ref_images"] = refs }
             } else {
                 json["strength"] = request.strength
             }

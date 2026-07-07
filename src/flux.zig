@@ -1700,6 +1700,40 @@ test "buildLatentIdsT stamps the reference time coordinate (FLUX.2 edit conventi
     try testing.expectEqualSlices(i32, gen_ids, legacy);
 }
 
+test "buildEditIds stacks each reference grid at t=10·(i+1) (multi-reference edit)" {
+    const a = testing.allocator;
+    // Generated 2x2 grid + two references of different grids.
+    const dims = [_][2]u32{ .{ 2, 3 }, .{ 1, 2 } };
+    const ids = try buildEditIds(a, 2, 2, &dims);
+    defer a.free(ids);
+    try testing.expectEqual(@as(usize, (4 + 6 + 2) * 4), ids.len);
+    // Generated tokens: t=0.
+    try testing.expectEqual(@as(i32, 0), ids[0]);
+    try testing.expectEqual(@as(i32, 0), ids[(4 - 1) * 4]);
+    // First reference: t=10, its OWN 0-based h/w grid.
+    const r0 = 4 * 4;
+    try testing.expectEqual(@as(i32, 10), ids[r0 + 0]);
+    try testing.expectEqual(@as(i32, 0), ids[r0 + 1]);
+    try testing.expectEqual(@as(i32, 0), ids[r0 + 2]);
+    const r0_last = (4 + 6 - 1) * 4;
+    try testing.expectEqual(@as(i32, 10), ids[r0_last + 0]);
+    try testing.expectEqual(@as(i32, 1), ids[r0_last + 1]); // h max of 2x3
+    try testing.expectEqual(@as(i32, 2), ids[r0_last + 2]); // w max of 2x3
+    // Second reference: t=20 (the official multi-reference convention).
+    const r1 = (4 + 6) * 4;
+    try testing.expectEqual(@as(i32, 20), ids[r1 + 0]);
+    try testing.expectEqual(@as(i32, 0), ids[r1 + 1]);
+    // Single reference reproduces the legacy gen-ids + t=10 concat exactly.
+    const single = try buildEditIds(a, 2, 3, &[_][2]u32{.{ 2, 3 }});
+    defer a.free(single);
+    const gen_ids = try buildLatentIdsT(a, 2, 3, 0);
+    defer a.free(gen_ids);
+    const ref_ids = try buildLatentIdsT(a, 2, 3, 10);
+    defer a.free(ref_ids);
+    try testing.expectEqualSlices(i32, gen_ids, single[0..gen_ids.len]);
+    try testing.expectEqualSlices(i32, ref_ids, single[gen_ids.len..]);
+}
+
 // Reference-image editing: conditioning the DiT on clean reference tokens must
 // change the output vs the same seed without a reference (and produce a valid
 // full-size image).  FLUX_TEST_MODEL (steps=2 keeps it quick)
@@ -1741,7 +1775,7 @@ test "flux reference-image conditioning engages and changes the output" {
 
     const base = try generateWithOpts(&te, &dit, &vae, &ids, &mask, 42, 2, 1024, 1024, .{}, null);
     defer _ = mlx.mlx_array_free(base);
-    const edited = try generateWithOpts(&te, &dit, &vae, &ids, &mask, 42, 2, 1024, 1024, .{ .ref_latents = ref_lat }, null);
+    const edited = try generateWithOpts(&te, &dit, &vae, &ids, &mask, 42, 2, 1024, 1024, .{ .ref_latents = &.{ref_lat} }, null);
     defer _ = mlx.mlx_array_free(edited);
     const esh = mlx.getShape(edited);
     try testing.expectEqual(@as(c_int, 1024), esh[2]);
@@ -1825,6 +1859,28 @@ fn buildLatentIds(allocator: std.mem.Allocator, lh: u32, lw: u32) ![]i32 {
     return buildLatentIdsT(allocator, lh, lw, 0);
 }
 
+/// Position ids for an edit forward: the generated lh×lw grid at t=0
+/// followed by each reference grid (`ref_dims[i] = {rh, rw}`) at
+/// t=10·(i+1) — the official FLUX.2 multi-reference convention — each with
+/// its own 0-based h/w grid.
+fn buildEditIds(allocator: std.mem.Allocator, lh: u32, lw: u32, ref_dims: []const [2]u32) ![]i32 {
+    var total: usize = lh * lw;
+    for (ref_dims) |d| total += d[0] * d[1];
+    const out = try allocator.alloc(i32, total * 4);
+    errdefer allocator.free(out);
+    const gen_ids = try buildLatentIdsT(allocator, lh, lw, 0);
+    defer allocator.free(gen_ids);
+    @memcpy(out[0..gen_ids.len], gen_ids);
+    var off = gen_ids.len;
+    for (ref_dims, 1..) |d, i| {
+        const rids = try buildLatentIdsT(allocator, d[0], d[1], @intCast(10 * i));
+        defer allocator.free(rids);
+        @memcpy(out[off .. off + rids.len], rids);
+        off += rids.len;
+    }
+    return out;
+}
+
 /// Latent position ids (t,h,w,l) with an explicit time coordinate. Generated
 /// tokens use t=0; reference-image tokens use the official FLUX.2 edit
 /// convention t=10·(ref_index+1) with their own 0-based h/w grid.
@@ -1862,9 +1918,11 @@ pub const GenOpts = struct {
     start_step: u32 = 0,
     /// Reference-image editing (FLUX.2 in-context conditioning): CLEAN
     /// bn-normalized packed latents [1,128,rh,rw] from `VaeEncoder.encode`,
-    /// concatenated on the token sequence with t=10 position ids. Never
-    /// noised; generation starts from pure noise and attends to them.
-    ref_latents: ?mlx.mlx_array = null,
+    /// concatenated on the token sequence with t=10·(i+1) position ids
+    /// (official multi-reference convention — "replace the face in image 1
+    /// with the face from image 2"). Never noised; generation starts from
+    /// pure noise and attends to them. Empty = no references.
+    ref_latents: []const mlx.mlx_array = &.{},
     /// Conditioning rebalance: global gain + per-tap weights (len 3).
     cond_gain: f32 = 1.0,
     cond_weights: ?[]const f32 = null,
@@ -1924,32 +1982,41 @@ pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, 
     const txt_ids = try buildTextIds(a, @intCast(prompt_len)); defer a.free(txt_ids);
 
     // Reference-image editing: pack the CLEAN reference latents into tokens
-    // with t=10 position ids (official FLUX.2 convention). They ride along in
-    // every forward; only the generated span is Euler-stepped.
+    // with t=10·(i+1) position ids (official FLUX.2 multi-reference
+    // convention). They ride along in every forward; only the generated span
+    // is Euler-stepped.
     var ref_tokens: mlx.mlx_array = .{ .ctx = null };
     defer if (ref_tokens.ctx != null) {
         _ = mlx.mlx_array_free(ref_tokens);
     };
     var all_ids: ?[]i32 = null;
     defer if (all_ids) |ai| a.free(ai);
-    if (opts.ref_latents) |rl| {
-        const rsh = mlx.getShape(rl); // [1,128,rh,rw]
-        const rlh: u32 = @intCast(rsh[2]);
-        const rlw: u32 = @intCast(rsh[3]);
-        const rr = try reshape(rl, &[_]c_int{ 1, 128, @intCast(rlh * rlw) }, s);
-        defer _ = mlx.mlx_array_free(rr);
-        const rt = try transpose(rr, &[_]c_int{ 0, 2, 1 }, s);
-        defer _ = mlx.mlx_array_free(rt);
-        var rtc = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(rtc);
-        try mlx.check(mlx.mlx_contiguous(&rtc, rt, false, s));
-        ref_tokens = try astype(rtc, .bfloat16, s);
-        const rids = try buildLatentIdsT(a, rlh, rlw, 10);
-        defer a.free(rids);
-        const ai = try a.alloc(i32, img_ids.len + rids.len);
-        @memcpy(ai[0..img_ids.len], img_ids);
-        @memcpy(ai[img_ids.len..], rids);
-        all_ids = ai;
+    if (opts.ref_latents.len > 0) {
+        const ref_dims = try a.alloc([2]u32, opts.ref_latents.len);
+        defer a.free(ref_dims);
+        for (opts.ref_latents, 0..) |rl, ri| {
+            const rsh = mlx.getShape(rl); // [1,128,rh,rw]
+            const rlh: u32 = @intCast(rsh[2]);
+            const rlw: u32 = @intCast(rsh[3]);
+            ref_dims[ri] = .{ rlh, rlw };
+            const rr = try reshape(rl, &[_]c_int{ 1, 128, @intCast(rlh * rlw) }, s);
+            defer _ = mlx.mlx_array_free(rr);
+            const rt = try transpose(rr, &[_]c_int{ 0, 2, 1 }, s);
+            defer _ = mlx.mlx_array_free(rt);
+            var rtc = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(rtc);
+            try mlx.check(mlx.mlx_contiguous(&rtc, rt, false, s));
+            const rtok = try astype(rtc, .bfloat16, s);
+            if (ref_tokens.ctx == null) {
+                ref_tokens = rtok;
+            } else {
+                const merged = try concat(&[_]mlx.mlx_array{ ref_tokens, rtok }, 1, s);
+                _ = mlx.mlx_array_free(ref_tokens);
+                _ = mlx.mlx_array_free(rtok);
+                ref_tokens = merged;
+            }
+        }
+        all_ids = try buildEditIds(a, lh, lw, ref_dims);
     }
 
     // 3. denoise loop
