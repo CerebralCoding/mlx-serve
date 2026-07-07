@@ -29,12 +29,23 @@
 //! claims (crash between chunk write and meta rename) is sliced down at
 //! restore, never trusted.
 //!
-//! v1 scope: pure-attention archs (the scheduler attaches no disk tier when
-//! the model has SSM/GDN layers — their recurrent state isn't persisted yet),
-//! schemes off/affine (TurboQuant's rotation state doesn't survive a restore
-//! into a fresh cache), B==1 slot caches. All mlx work runs on the inference
-//! thread; safetensors loads use a private CPU stream (`Load::eval_gpu` is
-//! Not Implemented — the lora.zig/model.zig precedent).
+//! Phase 3 — hybrid SSM archs (qwen3_5/3_6 GatedDeltaNet, lfm2, nemotron_h):
+//! the RAM tier's per-position `SSMCheckpoint`s persist beside the chunks as
+//!   <base>/<fingerprint>/e<id>/s0002048.safetensors   SSM state at pos 2048
+//! keyed "l{i}.conv"/"l{i}.ssm" (absent key = null state — LFM2 gated-conv
+//! layers have no ssm_state, plain-attention layers in the hybrid have
+//! neither), with the per-layer `initialized` flags in the safetensors
+//! metadata map ("init"). Checkpoint files are immutable once written (keyed
+//! by position); extend commits append only NEW positions, bounded per entry
+//! by `SSM_DISK_MAX_PER_ENTRY` (evict-lowest — the newest positions are where
+//! multi-turn warm requests match). A hybrid restore rebuilds the KV prefix
+//! [0, cp_pos) AND the SSM state at cp_pos (`restoreIntoHybrid`) — mirroring
+//! the RAM tier's rewind-both semantics.
+//!
+//! Scope: schemes off/affine (TurboQuant's rotation state doesn't survive a
+//! restore into a fresh cache), B==1 slot caches. All mlx work runs on the
+//! inference thread; safetensors loads use a private CPU stream
+//! (`Load::eval_gpu` is Not Implemented — the lora.zig/model.zig precedent).
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
@@ -56,6 +67,13 @@ pub const MIN_PERSIST_TOKENS: u32 = 512;
 
 pub const DEFAULT_CHUNK_TOKENS: u32 = 1024;
 
+/// Max persisted SSM checkpoint positions per entry. Every turn adds an
+/// end-of-prompt checkpoint (~400 MB each on Qwen3.6-27B); unbounded, one
+/// long session would accumulate GBs in a single entry. Thinning drops the
+/// LOWEST positions first (mirrors the RAM capture's front-drop) — the
+/// newest positions are where multi-turn warm requests match.
+pub const SSM_DISK_MAX_PER_ENTRY: usize = 8;
+
 pub const IndexEntry = struct {
     /// Directory id — the `e<id>` component.
     id: u64,
@@ -73,6 +91,12 @@ pub const IndexEntry = struct {
     /// to the last contiguous valid chunk — a kill -9 mid-flush truncates a
     /// chunk, and restoring it would poison the cache. Owned.
     chunk_bytes: []u64,
+    /// Phase 3: persisted SSM checkpoint positions (sorted ascending; empty
+    /// for pure-attention entries) and per-file byte sizes (parallel array —
+    /// the same kill -9 salvage role as `chunk_bytes`: the scan drops
+    /// individual positions whose file size mismatches). Owned.
+    ssm_positions: []u32,
+    ssm_bytes: []u64,
     /// In-process LRU stamp; seeded from meta.json mtime order at scan.
     last_used: u64,
 };
@@ -137,11 +161,20 @@ pub const DiskTier = struct {
 
     pub fn deinit(self: *DiskTier) void {
         for (self.entries.items) |*e| {
-            self.allocator.free(e.tokens);
-            self.allocator.free(e.chunk_bytes);
+            self.freeIndexEntryOwned(e);
         }
         self.entries.deinit(self.allocator);
         self.allocator.free(self.root);
+    }
+
+    /// Free everything an IndexEntry owns. Every removal path (deinit,
+    /// eviction, invalidation, scan-append failure, extend-replace) must go
+    /// through this so a new owned field can't leak on one of them.
+    fn freeIndexEntryOwned(self: *DiskTier, e: *IndexEntry) void {
+        self.allocator.free(e.tokens);
+        self.allocator.free(e.chunk_bytes);
+        self.allocator.free(e.ssm_positions);
+        self.allocator.free(e.ssm_bytes);
     }
 
     pub fn entryCount(self: *const DiskTier) usize {
@@ -184,9 +217,63 @@ pub const DiskTier = struct {
     /// next `update`/`truncate` rebuilds them). Returns kv_len.
     pub fn restoreInto(self: *DiskTier, cache: *KVCache, idx: usize, s: mlx.mlx_stream) !u32 {
         const e = &self.entries.items[idx];
+        try self.restoreKvInto(cache, e, e.kv_len, s);
+        e.last_used = self.bump();
+        // Bump meta.json mtime so cross-restart LRU sees the use.
+        self.writeMeta(e.*) catch {};
+        return e.kv_len;
+    }
+
+    /// Phase 3 hybrid variant: rebuild the KV prefix covering [0, cp_pos)
+    /// AND install the SSM state persisted at `cp_pos` into `ssm_entries`.
+    /// Mirrors the RAM tier's hybrid-restore semantics — KV and SSM state
+    /// land at the SAME position, the caller continues prefill from cp_pos.
+    /// `cp_pos` must be one of the entry's persisted checkpoint positions
+    /// (pick via `highestSsmPosAtOrBelow`). On error the cache/entries may be
+    /// half-rebuilt — the caller resets both and falls back to cold prefill.
+    pub fn restoreIntoHybrid(
+        self: *DiskTier,
+        cache: *KVCache,
+        ssm_entries: []transformer_mod.SSMCacheEntry,
+        idx: usize,
+        cp_pos: u32,
+        s: mlx.mlx_stream,
+    ) !u32 {
+        const e = &self.entries.items[idx];
+        if (cp_pos == 0 or cp_pos > e.kv_len) return error.DiskCacheNoCheckpoint;
+        if (std.mem.indexOfScalar(u32, e.ssm_positions, cp_pos) == null) return error.DiskCacheNoCheckpoint;
+        // Load the checkpoint FIRST (transient, no side effects on the live
+        // state) so a corrupt/missing file fails before the cache is touched.
+        var cp = try self.loadSsmFile(e.id, cp_pos, ssm_entries.len);
+        defer cp.deinit(self.allocator);
+        try self.restoreKvInto(cache, e, cp_pos, s);
+        try transformer_mod.restoreSsmCheckpoint(ssm_entries, &cp);
+        e.last_used = self.bump();
+        self.writeMeta(e.*) catch {};
+        return cp_pos;
+    }
+
+    /// Largest persisted SSM checkpoint position ≤ `limit` for entry `idx`;
+    /// null when none qualifies (hybrid KV without SSM state is unusable, so
+    /// the caller must skip the entry entirely).
+    pub fn highestSsmPosAtOrBelow(self: *const DiskTier, idx: usize, limit: u32) ?u32 {
+        var best: ?u32 = null;
+        for (self.entries.items[idx].ssm_positions) |p| {
+            if (p > limit) break; // sorted ascending
+            best = p;
+        }
+        return best;
+    }
+
+    /// Shared chunk-loading body: rebuild positions [0, limit) of entry `e`
+    /// into `cache` (limit == e.kv_len for the plain-attention path; a
+    /// checkpoint position for the hybrid path — the final chunk is sliced
+    /// down so KV lands exactly at the checkpoint).
+    fn restoreKvInto(self: *DiskTier, cache: *KVCache, e: *const IndexEntry, limit: u32, s: mlx.mlx_stream) !void {
         const quant = e.quant;
         if (!std.meta.eql(cache.config, quant)) return error.DiskCacheConfigMismatch;
-        const n_chunks: u32 = @intCast((@as(u64, e.kv_len) + self.chunk_tokens - 1) / self.chunk_tokens);
+        if (limit == 0 or limit > e.kv_len) return error.DiskCacheEmptyEntry;
+        const n_chunks: u32 = @intCast((@as(u64, limit) + self.chunk_tokens - 1) / self.chunk_tokens);
         if (n_chunks == 0) return error.DiskCacheEmptyEntry;
 
         const cpu = mlx.mlx_default_cpu_stream_new();
@@ -198,7 +285,9 @@ pub const DiskTier = struct {
             &.{ "k", "v", "ks", "kb", "vs", "vb" };
 
         // Per-layer per-kind accumulation vectors. Layers absent from chunk 0
-        // stay uninitialized (hybrid layers never reach v1, but be robust).
+        // stay uninitialized — the GatedDeltaNet layers of a hybrid arch have
+        // no KV (their state rides the SSM checkpoints), so only the
+        // full-attention layers appear in the chunks.
         const n_layers = cache.entries.len;
         const vecs = try self.allocator.alloc(mlx.mlx_vector_array, n_layers * kinds.len);
         for (vecs) |*v| v.* = mlx.mlx_vector_array_new();
@@ -213,7 +302,7 @@ pub const DiskTier = struct {
         var chunk_i: u32 = 0;
         while (chunk_i < n_chunks) : (chunk_i += 1) {
             const c0: u64 = @as(u64, chunk_i) * self.chunk_tokens;
-            const need: u64 = @min(@as(u64, self.chunk_tokens), e.kv_len - c0);
+            const need: u64 = @min(@as(u64, self.chunk_tokens), limit - c0);
 
             const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/c{d:0>6}.safetensors\x00", .{ self.root, e.id, chunk_i });
             defer self.allocator.free(path);
@@ -278,10 +367,10 @@ pub const DiskTier = struct {
                 try concatInto(&dst.values_scales, vecs[base + 4], s);
                 try concatInto(&dst.values_biases, vecs[base + 5], s);
             }
-            dst.offset = e.kv_len;
+            dst.offset = limit;
             dst.initialized = true;
         }
-        cache.step = e.kv_len;
+        cache.step = limit;
         // Materialize with a CHECKED eval: a corrupt chunk surfaces its MLX
         // error HERE (lazy Load reads data at eval), so the caller's catch
         // resets the cache and falls back to cold prefill instead of running
@@ -302,11 +391,90 @@ pub const DiskTier = struct {
             }
             try mlx.check(mlx.mlx_eval(vec));
         }
+    }
 
-        e.last_used = self.bump();
-        // Bump meta.json mtime so cross-restart LRU sees the use.
-        self.writeMeta(e.*) catch {};
-        return e.kv_len;
+    /// Load a persisted SSM checkpoint file into a transient `SSMCheckpoint`
+    /// (caller frees via `deinit`). The recorded layer count must match the
+    /// target model's `ssm_entries` — a mismatch inside a fingerprint dir
+    /// means corruption, never a different model.
+    fn loadSsmFile(self: *DiskTier, id: u64, pos: u32, n_layers: usize) !transformer_mod.SSMCheckpoint {
+        const cpu = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(cpu);
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors\x00", .{ self.root, id, pos });
+        defer self.allocator.free(path);
+        var tensor_map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        var meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+        try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, @ptrCast(path.ptr), cpu));
+
+        var layers_c: [*:0]const u8 = undefined;
+        if (mlx.mlx_map_string_to_string_get(&layers_c, meta_map, "layers") != 0) return error.DiskCacheCorruptSsm;
+        const recorded = std.fmt.parseInt(usize, std.mem.span(layers_c), 10) catch return error.DiskCacheCorruptSsm;
+        if (recorded != n_layers) return error.DiskCacheSsmLayerMismatch;
+        var init_c: [*:0]const u8 = undefined;
+        if (mlx.mlx_map_string_to_string_get(&init_c, meta_map, "init") != 0) return error.DiskCacheCorruptSsm;
+        const init_str = std.mem.span(init_c);
+
+        const layers = try self.allocator.alloc(transformer_mod.SSMCacheEntrySnapshot, n_layers);
+        for (layers) |*l| l.* = .{
+            .conv_state = mlx.mlx_array_new(),
+            .ssm_state = mlx.mlx_array_new(),
+            .initialized = false,
+        };
+        var cp: transformer_mod.SSMCheckpoint = .{ .pos = pos, .layers = layers };
+        errdefer cp.deinit(self.allocator);
+
+        // Absent key = null state (LFM2 gated-conv layers have no ssm_state;
+        // plain-attention layers in the hybrid have neither) — that's a valid
+        // shape, not corruption.
+        for (layers, 0..) |*l, li| {
+            const ckey = try std.fmt.allocPrint(self.allocator, "l{d}.conv\x00", .{li});
+            defer self.allocator.free(ckey);
+            var conv = mlx.mlx_array_new();
+            if (mlx.mlx_map_string_to_array_get(&conv, tensor_map, @ptrCast(ckey.ptr)) == 0) {
+                l.conv_state = conv; // transfer the +1 handed by _get
+            } else {
+                _ = mlx.mlx_array_free(conv);
+            }
+            const skey = try std.fmt.allocPrint(self.allocator, "l{d}.ssm\x00", .{li});
+            defer self.allocator.free(skey);
+            var ssm = mlx.mlx_array_new();
+            if (mlx.mlx_map_string_to_array_get(&ssm, tensor_map, @ptrCast(skey.ptr)) == 0) {
+                l.ssm_state = ssm;
+            } else {
+                _ = mlx.mlx_array_free(ssm);
+            }
+        }
+
+        // `initialized=true` with both states null is a valid shape, so the
+        // flags can't derive from tensor presence — they ride the metadata.
+        var it = std.mem.tokenizeScalar(u8, init_str, ',');
+        while (it.next()) |tok| {
+            const li = std.fmt.parseInt(usize, tok, 10) catch return error.DiskCacheCorruptSsm;
+            if (li >= n_layers) return error.DiskCacheCorruptSsm;
+            layers[li].initialized = true;
+        }
+
+        // Materialize with a CHECKED eval so a corrupt file surfaces HERE
+        // (lazy Load reads data at eval), not mid-forward after install.
+        {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var count: usize = 0;
+            for (layers) |*l| {
+                if (l.conv_state.ctx != null) {
+                    _ = mlx.mlx_vector_array_append_value(vec, l.conv_state);
+                    count += 1;
+                }
+                if (l.ssm_state.ctx != null) {
+                    _ = mlx.mlx_vector_array_append_value(vec, l.ssm_state);
+                    count += 1;
+                }
+            }
+            if (count > 0) try mlx.check(mlx.mlx_eval(vec));
+        }
+        return cp;
     }
 
     fn concatInto(dst: *mlx.mlx_array, vec: mlx.mlx_vector_array, s: mlx.mlx_stream) !void {
@@ -332,13 +500,24 @@ pub const DiskTier = struct {
         config: kv_quant.KVQuantConfig,
         tokens: []const u32,
         has_tools: bool,
+        ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         s: mlx.mlx_stream,
     ) !bool {
         // On EOS-terminated turns the cache runs 1-2 positions AHEAD of the
         // committed token record (forwarded terminator tokens that never
         // land in `tokens`). Persist the prefix covered by the record —
         // positions beyond it are unusable for matching anyway.
-        const kv_target_u: usize = @min(step, tokens.len);
+        // The KV extent is the initialized layers' offset, NOT `step`: on
+        // hybrid archs (qwen3_5/3_6 GDN) `cache.step` only bumps on layer 0,
+        // which is a GatedDeltaNet layer that never writes KV, so it stays 0
+        // while the full-attention layers carry offset == prompt position.
+        // `max(step, max initialized offset)` is correct for both — equal on
+        // pure attention, and the layer offset on hybrid.
+        var max_off: usize = 0;
+        for (kv_entries) |*entry| {
+            if (entry.initialized and entry.offset > max_off) max_off = entry.offset;
+        }
+        const kv_target_u: usize = @min(@max(step, max_off), tokens.len);
         if (kv_target_u < MIN_PERSIST_TOKENS) return true;
         const kv_target: u32 = @intCast(kv_target_u);
         switch (config.scheme) {
@@ -363,16 +542,24 @@ pub const DiskTier = struct {
 
         // Superseded check: an existing entry that already covers `tokens`
         // (same key, tokens is a prefix of its tokens, kv already >= ours)
-        // makes this commit a no-op.
+        // makes this commit a no-op — UNLESS the entry is hybrid and still has
+        // pending SSM checkpoints (byte-capped across turns), which take a
+        // dedicated SSM-only append path (the KV chunks are all present, so
+        // the extend machinery would pointlessly rewrite the tail chunk).
         var extend_idx: ?usize = null;
+        var ssm_only_idx: ?usize = null;
         for (self.entries.items, 0..) |*e, i| {
             if (e.has_tools != has_tools) continue;
             if (!std.meta.eql(e.quant, config)) continue;
             if (e.tokens.len >= tokens.len) {
                 if (std.mem.eql(u32, e.tokens[0..tokens.len], tokens)) {
                     if (e.kv_len >= kv_target) {
-                        e.last_used = self.bump();
-                        return true;
+                        if (!self.ssmWorkPending(e, ssm_checkpoints, e.kv_len)) {
+                            e.last_used = self.bump();
+                            return true;
+                        }
+                        ssm_only_idx = i;
+                        break;
                     }
                     // Same token record, SHORTER persisted KV — a byte-capped
                     // incremental flush in progress. Resume into its dir.
@@ -383,6 +570,7 @@ pub const DiskTier = struct {
                 extend_idx = i;
             }
         }
+        if (ssm_only_idx) |i| return self.appendSsmOnly(i, ssm_checkpoints, s);
 
         const sw = io_util.Stopwatch.init(self.io);
 
@@ -425,13 +613,26 @@ pub const DiskTier = struct {
             try chunk_sizes.append(self.allocator, csize);
         }
         const chunks_done: u32 = chunk_i;
-        const complete = chunks_done == n_chunks;
-        const kv_len: u32 = if (complete) kv_target else chunks_done * self.chunk_tokens;
+        const chunk_complete = chunks_done == n_chunks;
+        const kv_len: u32 = if (chunk_complete) kv_target else chunks_done * self.chunk_tokens;
         if (kv_len <= old_kv) {
             // Cap so tight nothing new landed — nothing to commit.
             chunk_sizes.deinit(self.allocator);
-            return complete;
+            return chunk_complete;
         }
+
+        // Phase 3: persist any SSM checkpoints whose position is within the KV
+        // now on disk (a hybrid restore needs KV covering [0, cp_pos), so a
+        // checkpoint beyond the partially-flushed KV waits for a later turn).
+        // Shares the per-flush byte budget with the chunk writes above.
+        const old_ssm_pos: []const u32 = if (extend_idx) |i| self.entries.items[i].ssm_positions else &[_]u32{};
+        const old_ssm_bytes: []const u64 = if (extend_idx) |i| self.entries.items[i].ssm_bytes else &[_]u64{};
+        var ssm_res = self.persistSsmCheckpoints(id, dir_rel, kv_len, old_ssm_pos, old_ssm_bytes, ssm_checkpoints, &written_bytes) catch |err| {
+            chunk_sizes.deinit(self.allocator);
+            return err;
+        };
+        errdefer ssm_res.deinit(self.allocator);
+        const complete = chunk_complete and ssm_res.complete;
 
         // Token record — the LONGER of the existing record and this commit's
         // tokens (a resumed incremental flush must not shrink the record its
@@ -454,6 +655,7 @@ pub const DiskTier = struct {
 
         var bytes: u64 = 0;
         for (chunk_sizes.items) |b| bytes += b;
+        for (ssm_res.bytes) |b| bytes += b;
         bytes += @as(u64, record.len) * 4;
 
         const new_entry: IndexEntry = .{
@@ -464,6 +666,8 @@ pub const DiskTier = struct {
             .quant = config,
             .bytes = bytes,
             .chunk_bytes = try chunk_sizes.toOwnedSlice(self.allocator),
+            .ssm_positions = ssm_res.positions,
+            .ssm_bytes = ssm_res.bytes,
             .last_used = self.bump(),
         };
         errdefer {
@@ -476,8 +680,12 @@ pub const DiskTier = struct {
         if (extend_idx) |i| {
             const e = &self.entries.items[i];
             self.total_bytes -|= e.bytes;
+            // ssm_positions/ssm_bytes ownership moved into new_entry.ssm_res —
+            // free only the fields NOT carried forward.
             self.allocator.free(e.tokens);
             self.allocator.free(e.chunk_bytes);
+            self.allocator.free(e.ssm_positions);
+            self.allocator.free(e.ssm_bytes);
             e.* = new_entry;
             self.total_bytes += new_entry.bytes;
         } else {
@@ -488,12 +696,45 @@ pub const DiskTier = struct {
 
         const wrote_mb = @as(f64, @floatFromInt(written_bytes)) / (1024.0 * 1024.0);
         const ms: u64 = sw.read() / std.time.ns_per_ms;
-        log.info("  [disk-cache] persisted {d}/{d} tokens (+{d} chunks, {d:.1} MB, {d}ms); resident={d:.1} MB ({d} entries)\n", .{
-            kv_len,               kv_target, chunks_done - keep, wrote_mb, ms,
+        log.info("  [disk-cache] persisted {d}/{d} tokens (+{d} chunks, {d} ssm-cp, {d:.1} MB, {d}ms); resident={d:.1} MB ({d} entries)\n", .{
+            kv_len,               kv_target,          chunks_done - keep, new_entry.ssm_positions.len, wrote_mb, ms,
             @as(f64, @floatFromInt(self.total_bytes)) / (1024.0 * 1024.0),
             self.entries.items.len,
         });
         return complete;
+    }
+
+    /// SSM-only append: KV chunks are already fully on disk (superseded on KV)
+    /// but the entry has pending SSM checkpoints (byte-capped across turns).
+    /// Writes the missing ones into the existing dir + rewrites meta. Never
+    /// touches the KV chunks or the token record.
+    fn appendSsmOnly(self: *DiskTier, idx: usize, ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint, s: mlx.mlx_stream) !bool {
+        _ = s;
+        const dir_rel = try std.fmt.allocPrint(self.allocator, "{s}/e{d}", .{ self.root, self.entries.items[idx].id });
+        defer self.allocator.free(dir_rel);
+        const e = &self.entries.items[idx];
+        var written_bytes: u64 = 0;
+        var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, e.kv_len, e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes);
+        errdefer ssm_res.deinit(self.allocator);
+
+        // Recompute total bytes: chunks + token record are unchanged; only the
+        // ssm contribution changed.
+        var kv_and_tokens: u64 = @as(u64, e.tokens.len) * 4;
+        for (e.chunk_bytes) |b| kv_and_tokens += b;
+        var new_bytes: u64 = kv_and_tokens;
+        for (ssm_res.bytes) |b| new_bytes += b;
+
+        self.allocator.free(e.ssm_positions);
+        self.allocator.free(e.ssm_bytes);
+        e.ssm_positions = ssm_res.positions;
+        e.ssm_bytes = ssm_res.bytes;
+        self.total_bytes -|= e.bytes;
+        e.bytes = new_bytes;
+        self.total_bytes += new_bytes;
+        e.last_used = self.bump();
+        try self.writeMeta(e.*);
+        self.gcToBudget();
+        return ssm_res.complete;
     }
 
     fn writeChunkFile(
@@ -552,13 +793,199 @@ pub const DiskTier = struct {
         try mlx.check(mlx.mlx_map_string_to_array_insert(map, @ptrCast(key.ptr), sliced));
     }
 
+    // ── SSM checkpoint persistence (Phase 3, hybrid archs) ──
+
+    const SsmPersistResult = struct {
+        /// Persisted checkpoint positions, sorted ascending. Owned.
+        positions: []u32,
+        /// Per-file byte sizes, parallel to `positions`. Owned.
+        bytes: []u64,
+        /// All target checkpoints made it to disk this flush (false → the
+        /// per-flush byte cap deferred some; the caller keeps the entry dirty).
+        complete: bool,
+
+        fn deinit(self: *SsmPersistResult, allocator: std.mem.Allocator) void {
+            allocator.free(self.positions);
+            allocator.free(self.bytes);
+        }
+    };
+
+    fn findCp(cps: []const transformer_mod.SSMCheckpoint, pos: u32) ?*const transformer_mod.SSMCheckpoint {
+        for (cps) |*cp| if (cp.pos == pos) return cp;
+        return null;
+    }
+
+    /// The set of checkpoint positions that SHOULD be on disk after this
+    /// flush: the highest `SSM_DISK_MAX_PER_ENTRY` of (already-persisted ∪
+    /// newly-eligible). Eligible = a RAM checkpoint at a position within the
+    /// KV now on disk (a hybrid restore needs KV covering [0, cp_pos)).
+    /// Sorted ascending; caller frees.
+    fn ssmTargetPositions(self: *DiskTier, old_positions: []const u32, cps: []const transformer_mod.SSMCheckpoint, kv_len: u32) ![]u32 {
+        var set = std.ArrayList(u32).empty;
+        errdefer set.deinit(self.allocator);
+        try set.appendSlice(self.allocator, old_positions);
+        for (cps) |*cp| {
+            if (cp.pos == 0 or cp.pos > kv_len) continue;
+            const p: u32 = @intCast(cp.pos);
+            if (std.mem.indexOfScalar(u32, set.items, p) == null) try set.append(self.allocator, p);
+        }
+        std.mem.sort(u32, set.items, {}, std.sort.asc(u32));
+        if (set.items.len > SSM_DISK_MAX_PER_ENTRY) {
+            const drop = set.items.len - SSM_DISK_MAX_PER_ENTRY;
+            std.mem.copyForwards(u32, set.items[0 .. set.items.len - drop], set.items[drop..]);
+            set.shrinkRetainingCapacity(set.items.len - drop);
+        }
+        return set.toOwnedSlice(self.allocator);
+    }
+
+    /// Would persisting `cps` add or drop any file for entry `e`? Drives the
+    /// superseded no-op vs SSM-only-append decision. Conservative on alloc
+    /// failure (returns false → the commit is a harmless no-op; the RAM tier
+    /// still holds the checkpoints).
+    fn ssmWorkPending(self: *DiskTier, e: *const IndexEntry, cps_opt: ?[]const transformer_mod.SSMCheckpoint, kv_limit: u32) bool {
+        const cps = cps_opt orelse return false;
+        if (cps.len == 0) return false;
+        const target = self.ssmTargetPositions(e.ssm_positions, cps, kv_limit) catch return false;
+        defer self.allocator.free(target);
+        // A target position missing from disk, OR an on-disk position no
+        // longer in target (retention would drop it), is pending work.
+        if (target.len != e.ssm_positions.len) return true;
+        for (target) |p| {
+            if (std.mem.indexOfScalar(u32, e.ssm_positions, p) == null) return true;
+        }
+        return false;
+    }
+
+    /// Persist the eligible SSM checkpoints for one entry: write target
+    /// positions not yet on disk (highest-first — the end-of-prompt checkpoint
+    /// is the most valuable, so it survives a tight per-flush cap), delete
+    /// retention-dropped positions, and return the resulting on-disk set.
+    /// `written_bytes` accumulates across the chunk writes so checkpoint bytes
+    /// count toward the same per-flush budget.
+    fn persistSsmCheckpoints(
+        self: *DiskTier,
+        id: u64,
+        dir_rel: []const u8,
+        kv_len: u32,
+        old_positions: []const u32,
+        old_bytes: []const u64,
+        cps_opt: ?[]const transformer_mod.SSMCheckpoint,
+        written_bytes: *u64,
+    ) !SsmPersistResult {
+        const cps: []const transformer_mod.SSMCheckpoint = cps_opt orelse &[_]transformer_mod.SSMCheckpoint{};
+        if (cps.len == 0 and old_positions.len == 0) {
+            return .{
+                .positions = try self.allocator.alloc(u32, 0),
+                .bytes = try self.allocator.alloc(u64, 0),
+                .complete = true,
+            };
+        }
+        const target = try self.ssmTargetPositions(old_positions, cps, kv_len);
+        defer self.allocator.free(target);
+
+        // Delete positions retention drops (present on disk, absent from target).
+        for (old_positions) |p| {
+            if (std.mem.indexOfScalar(u32, target, p) == null) self.deleteSsmFile(id, p);
+        }
+
+        const Pair = struct { pos: u32, bytes: u64 };
+        var pairs = std.ArrayList(Pair).empty;
+        defer pairs.deinit(self.allocator);
+        var complete = true;
+
+        // Carry over old positions kept by retention (already on disk).
+        for (target) |p| {
+            if (std.mem.indexOfScalar(u32, old_positions, p)) |oi| {
+                try pairs.append(self.allocator, .{ .pos = p, .bytes = old_bytes[oi] });
+            }
+        }
+        // Write new target positions, highest-first.
+        var ti = target.len;
+        while (ti > 0) : (ti -= 1) {
+            const p = target[ti - 1];
+            if (std.mem.indexOfScalar(u32, old_positions, p) != null) continue; // already on disk
+            const cp = findCp(cps, p) orelse continue;
+            if (written_bytes.* >= self.max_flush_bytes) {
+                complete = false;
+                continue; // budget exhausted — persist on a later flush
+            }
+            const sz = try self.writeSsmFile(dir_rel, cp);
+            written_bytes.* += sz;
+            try pairs.append(self.allocator, .{ .pos = p, .bytes = sz });
+        }
+
+        std.mem.sort(Pair, pairs.items, {}, struct {
+            fn lt(_: void, a: Pair, b: Pair) bool {
+                return a.pos < b.pos;
+            }
+        }.lt);
+        const positions = try self.allocator.alloc(u32, pairs.items.len);
+        errdefer self.allocator.free(positions);
+        const bytes = try self.allocator.alloc(u64, pairs.items.len);
+        for (pairs.items, 0..) |pr, i| {
+            positions[i] = pr.pos;
+            bytes[i] = pr.bytes;
+        }
+        return .{ .positions = positions, .bytes = bytes, .complete = complete };
+    }
+
+    /// Write one SSM checkpoint as `s{pos:0>7}.safetensors`. Per-layer tensors
+    /// keyed "l{i}.conv"/"l{i}.ssm" (absent = null state); the `initialized`
+    /// bitmap rides the safetensors metadata map because `initialized=true`
+    /// with both states null is a valid shape. Returns the file size.
+    fn writeSsmFile(self: *DiskTier, dir_rel: []const u8, cp: *const transformer_mod.SSMCheckpoint) !u64 {
+        const tensor_map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
+        const meta_map = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta_map);
+
+        var lc_buf: [24]u8 = undefined;
+        const lc = try std.fmt.bufPrint(&lc_buf, "{d}\x00", .{cp.layers.len});
+        try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, "layers", @ptrCast(lc.ptr)));
+
+        var init_buf = std.ArrayList(u8).empty;
+        defer init_buf.deinit(self.allocator);
+        var num_buf: [16]u8 = undefined;
+        for (cp.layers, 0..) |l, li| {
+            if (!l.initialized) continue;
+            if (init_buf.items.len > 0) try init_buf.append(self.allocator, ',');
+            const ns = std.fmt.bufPrint(&num_buf, "{d}", .{li}) catch unreachable;
+            try init_buf.appendSlice(self.allocator, ns);
+        }
+        try init_buf.append(self.allocator, 0); // NUL-terminate for the C API
+        try mlx.check(mlx.mlx_map_string_to_string_insert(meta_map, "init", @ptrCast(init_buf.items.ptr)));
+
+        for (cp.layers, 0..) |l, li| {
+            if (l.conv_state.ctx != null) {
+                const key = try std.fmt.allocPrint(self.allocator, "l{d}.conv\x00", .{li});
+                defer self.allocator.free(key);
+                try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(key.ptr), l.conv_state));
+            }
+            if (l.ssm_state.ctx != null) {
+                const key = try std.fmt.allocPrint(self.allocator, "l{d}.ssm\x00", .{li});
+                defer self.allocator.free(key);
+                try mlx.check(mlx.mlx_map_string_to_array_insert(tensor_map, @ptrCast(key.ptr), l.ssm_state));
+            }
+        }
+
+        const path = try std.fmt.allocPrint(self.allocator, "{s}/s{d:0>7}.safetensors\x00", .{ dir_rel, cp.pos });
+        defer self.allocator.free(path);
+        try mlx.check(mlx.mlx_save_safetensors(@ptrCast(path.ptr), tensor_map, meta_map));
+        return fileSize(self.io, path[0 .. path.len - 1]) orelse 0;
+    }
+
+    fn deleteSsmFile(self: *DiskTier, id: u64, pos: u32) void {
+        const path = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch return;
+        defer self.allocator.free(path);
+        std.Io.Dir.deleteFileAbsolute(self.io, path) catch {};
+    }
+
     // ── Invalidation (mirrors the RAM cache API) ──
 
     pub fn invalidateAll(self: *DiskTier) void {
         for (self.entries.items) |*e| {
             self.deleteEntryDir(e.id);
-            self.allocator.free(e.tokens);
-            self.allocator.free(e.chunk_bytes);
+            self.freeIndexEntryOwned(e);
         }
         self.entries.clearRetainingCapacity();
         self.total_bytes = 0;
@@ -585,11 +1012,10 @@ pub const DiskTier = struct {
     }
 
     fn removeAt(self: *DiskTier, idx: usize) void {
-        const e = self.entries.swapRemove(idx);
+        var e = self.entries.swapRemove(idx);
         self.total_bytes -|= e.bytes;
         self.deleteEntryDir(e.id);
-        self.allocator.free(e.tokens);
-        self.allocator.free(e.chunk_bytes);
+        self.freeIndexEntryOwned(&e);
     }
 
     fn deleteEntryDir(self: *DiskTier, id: u64) void {
@@ -628,7 +1054,7 @@ pub const DiskTier = struct {
             var wb: [1024]u8 = undefined;
             var fw = f.writer(self.io, &wb);
             try fw.interface.print(
-                "{{\"v\":2,\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"bytes\":{d},\"chunk_bytes\":[",
+                "{{\"v\":3,\"kv_len\":{d},\"tokens\":{d},\"has_tools\":{},\"scheme\":\"{s}\",\"bits\":{d},\"group_size\":{d},\"chunk_tokens\":{d},\"bytes\":{d},\"chunk_bytes\":[",
                 .{
                     e.kv_len,
                     e.tokens.len,
@@ -643,6 +1069,13 @@ pub const DiskTier = struct {
             for (e.chunk_bytes, 0..) |cb, i| {
                 if (i > 0) try fw.interface.writeAll(",");
                 try fw.interface.print("{d}", .{cb});
+            }
+            // v3: SSM checkpoints as [{pos,bytes},...] (sorted ascending). Each
+            // file's byte size drives the same kill -9 salvage as chunk_bytes.
+            try fw.interface.writeAll("],\"ssm\":[");
+            for (e.ssm_positions, e.ssm_bytes, 0..) |pos, sz, i| {
+                if (i > 0) try fw.interface.writeAll(",");
+                try fw.interface.print("{{\"pos\":{d},\"bytes\":{d}}}", .{ pos, sz });
             }
             try fw.interface.writeAll("]}");
             try fw.interface.flush();
@@ -669,8 +1102,8 @@ pub const DiskTier = struct {
             if (id >= self.next_id) self.next_id = id + 1;
             if (self.loadEntry(id)) |loaded| {
                 pending.append(self.allocator, .{ .e = loaded.e, .mtime = loaded.mtime }) catch {
-                    self.allocator.free(loaded.e.tokens);
-                    self.allocator.free(loaded.e.chunk_bytes);
+                    var le = loaded.e;
+                    self.freeIndexEntryOwned(&le);
                     continue;
                 };
             } else {
@@ -689,8 +1122,7 @@ pub const DiskTier = struct {
         for (pending.items) |*p| {
             p.e.last_used = self.bump();
             self.entries.append(self.allocator, p.e) catch {
-                self.allocator.free(p.e.tokens);
-                self.allocator.free(p.e.chunk_bytes);
+                self.freeIndexEntryOwned(&p.e);
                 continue;
             };
             self.total_bytes += p.e.bytes;
@@ -718,7 +1150,11 @@ pub const DiskTier = struct {
         const obj = parsed.value.object;
 
         const version = jsonU64(obj, "v") orelse return null;
-        if (version != 2) return null; // older layouts are dropped, not migrated
+        // v2 = pure-attention (no ssm field); v3 adds SSM checkpoints. Both
+        // restore — a v2 entry is treated as an empty-SSM v3 entry, so an
+        // upgrade doesn't nuke existing pure-attention disk caches. Older
+        // layouts are dropped, not migrated.
+        if (version != 2 and version != 3) return null;
         var kv_len = jsonU64(obj, "kv_len") orelse return null;
         const n_tokens = jsonU64(obj, "tokens") orelse return null;
         const chunk_tokens = jsonU64(obj, "chunk_tokens") orelse return null;
@@ -801,6 +1237,84 @@ pub const DiskTier = struct {
         var total: u64 = @as(u64, tokens.len) * 4;
         for (chunk_bytes) |cb| total += cb;
 
+        // v3 SSM checkpoints (v2 entries have no "ssm" field → pure-attention,
+        // stays empty). Each file's size is validated against the recorded one
+        // — the same kill -9 salvage as chunks: a position whose file mismatches
+        // (or now sits beyond a salvaged-down kv_len) is dropped individually.
+        var ssm_positions: []u32 = &[_]u32{};
+        var ssm_bytes: []u64 = &[_]u64{};
+        var had_ssm_listed = false;
+        if (obj.get("ssm")) |ssm_v| {
+            if (ssm_v == .array) {
+                had_ssm_listed = ssm_v.array.items.len > 0;
+                var pos_list = std.ArrayList(u32).empty;
+                defer pos_list.deinit(self.allocator);
+                var byte_list = std.ArrayList(u64).empty;
+                defer byte_list.deinit(self.allocator);
+                for (ssm_v.array.items) |it_v| {
+                    if (it_v != .object) continue;
+                    const o = it_v.object;
+                    const pos = jsonU64(o, "pos") orelse continue;
+                    const szrec = jsonU64(o, "bytes") orelse continue;
+                    if (pos == 0 or pos > kv_len) continue; // beyond the salvaged KV → unusable
+                    const sp = std.fmt.allocPrint(self.allocator, "{s}/e{d}/s{d:0>7}.safetensors", .{ self.root, id, pos }) catch continue;
+                    defer self.allocator.free(sp);
+                    const have = fileSize(self.io, sp) orelse continue;
+                    if (have != szrec) continue; // truncated mid-flush — drop this position
+                    pos_list.append(self.allocator, @intCast(pos)) catch continue;
+                    byte_list.append(self.allocator, szrec) catch {
+                        _ = pos_list.pop();
+                        continue;
+                    };
+                }
+                if (pos_list.items.len > 0) {
+                    // meta lists positions ascending, but re-sort defensively so
+                    // highestSsmPosAtOrBelow / retention can trust the order.
+                    const Pair = struct { pos: u32, bytes: u64 };
+                    const pairs = self.allocator.alloc(Pair, pos_list.items.len) catch {
+                        self.allocator.free(tokens);
+                        self.allocator.free(chunk_bytes);
+                        return null;
+                    };
+                    defer self.allocator.free(pairs);
+                    for (pairs, 0..) |*pr, i| pr.* = .{ .pos = pos_list.items[i], .bytes = byte_list.items[i] };
+                    std.mem.sort(Pair, pairs, {}, struct {
+                        fn lt(_: void, a: Pair, b: Pair) bool {
+                            return a.pos < b.pos;
+                        }
+                    }.lt);
+                    const sp_arr = self.allocator.alloc(u32, pairs.len) catch {
+                        self.allocator.free(tokens);
+                        self.allocator.free(chunk_bytes);
+                        return null;
+                    };
+                    const sb_arr = self.allocator.alloc(u64, pairs.len) catch {
+                        self.allocator.free(sp_arr);
+                        self.allocator.free(tokens);
+                        self.allocator.free(chunk_bytes);
+                        return null;
+                    };
+                    for (pairs, 0..) |pr, i| {
+                        sp_arr[i] = pr.pos;
+                        sb_arr[i] = pr.bytes;
+                        total += pr.bytes;
+                    }
+                    ssm_positions = sp_arr;
+                    ssm_bytes = sb_arr;
+                }
+            }
+        }
+        // A hybrid entry (SSM listed in meta) whose checkpoints ALL failed
+        // validation is unusable — KV without any SSM state can't restore a
+        // recurrent arch (the RAM path resets to cold in that case too). Drop
+        // it wholesale.
+        if (had_ssm_listed and ssm_positions.len == 0) {
+            log.info("  [disk-cache] e{d}: all SSM checkpoints invalid — dropping hybrid entry\n", .{id});
+            self.allocator.free(tokens);
+            self.allocator.free(chunk_bytes);
+            return null;
+        }
+
         return .{
             .e = .{
                 .id = id,
@@ -810,6 +1324,8 @@ pub const DiskTier = struct {
                 .quant = quant,
                 .bytes = total,
                 .chunk_bytes = chunk_bytes,
+                .ssm_positions = ssm_positions,
+                .ssm_bytes = ssm_bytes,
                 .last_used = 0,
             },
             .mtime = stat.mtime.nanoseconds,
@@ -956,7 +1472,7 @@ test "DiskTier: chunked commit + restore round-trips exact KV, step, offsets" {
 
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
 
     // Restore into a fresh cache (fresh tier too — proves the restart path).
@@ -1013,7 +1529,7 @@ test "DiskTier: extend commit appends only new chunks (full chunks untouched)" {
     try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
     var tokens: [900]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, tokens[0..600], false, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, tokens[0..600], false, null, s);
 
     // Tamper-mark chunk 0 (a FULL chunk): record its mtime, then extend the
     // entry and assert chunk 0 was not rewritten while chunk 4 (the old
@@ -1034,7 +1550,7 @@ test "DiskTier: extend commit appends only new chunks (full chunks untouched)" {
     // Same prefix, 300 more tokens.
     try fillCache(&cache, s, 1, 300, 8, 4800.0, .float32);
     try testing.expectEqual(@as(usize, 900), cache.step);
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 900), tier.entries.items[0].kv_len);
 
@@ -1068,7 +1584,7 @@ test "DiskTier: identical re-commit is a no-op; shorter prefix is superseded" {
     try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
     var tokens: [600]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     const c0_path = try std.fmt.allocPrint(testing.allocator, "{s}/fp-noop/e1/c000000.safetensors", .{base});
     defer testing.allocator.free(c0_path);
     const before = statFile(io, c0_path).?.mtime.nanoseconds;
@@ -1076,7 +1592,7 @@ test "DiskTier: identical re-commit is a no-op; shorter prefix is superseded" {
     std.Io.sleep(io, .fromMilliseconds(20), .real) catch {};
 
     // Identical commit — nothing rewritten, no second entry.
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(before, statFile(io, c0_path).?.mtime.nanoseconds);
 
@@ -1085,7 +1601,7 @@ test "DiskTier: identical re-commit is a no-op; shorter prefix is superseded" {
     var short_cache = try KVCache.init(testing.allocator, 1);
     defer short_cache.deinit();
     try fillCache(&short_cache, s, 1, 512, 8, 0.0, .float32);
-    _ = try tier.appendCommit(short_cache.entries, short_cache.step, short_cache.config, tokens[0..512], false, s);
+    _ = try tier.appendCommit(short_cache.entries, short_cache.step, short_cache.config, tokens[0..512], false, null, s);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
 }
 
@@ -1110,8 +1626,8 @@ test "DiskTier: byte budget evicts LRU entries, keeps newest" {
     var tokens_b: [520]u32 = undefined;
     for (&tokens_b, 0..) |*t, i| t.* = @intCast(i + 900_000);
 
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_a, false, s);
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_b, false, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_a, false, null, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens_b, false, null, s);
     // Both entries exceed 4 KB each — only the newest survives.
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expect(std.mem.eql(u32, tier.entries.items[0].tokens, &tokens_b));
@@ -1138,7 +1654,7 @@ test "DiskTier: scan drops crash leftovers (no meta.json)" {
         try fillCache(&cache, s, 1, 600, 8, 0.0, .float32);
         var tokens: [600]u32 = undefined;
         for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
         // Simulate a crash mid-write of a SECOND entry: chunks, no meta.
         try tmp.dir.createDirPath(io, "fp-crash/e9");
         try tmp.dir.writeFile(io, .{ .sub_path = "fp-crash/e9/c000000.safetensors", .data = "junk" });
@@ -1175,7 +1691,7 @@ test "DiskTier: affine-quant cache round-trips all six buffers" {
 
     var tokens: [520]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
 
     var cache2 = try KVCache.initWithConfig(testing.allocator, 2, qcfg);
     defer cache2.deinit();
@@ -1240,7 +1756,7 @@ test "DiskTier: truncated chunk file salvages the valid prefix at scan (kill -9 
         try fillCache(&cache, s, 1, 700, 8, 0.0, .float32);
         var tokens: [700]u32 = undefined;
         for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     }
 
     // Truncate chunk 4 (positions [512, 640)) — chunks 0-3 stay valid.
@@ -1283,17 +1799,17 @@ test "DiskTier: flush byte cap persists incrementally across commits" {
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
 
     // First flush: 1 chunk (128 tokens), incomplete.
-    const c1 = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+    const c1 = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     try testing.expect(!c1);
     try testing.expectEqual(@as(u32, 128), tier.entries.items[0].kv_len);
     // Second flush continues from where it left off.
-    const c2 = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+    const c2 = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     try testing.expect(!c2);
     try testing.expectEqual(@as(u32, 256), tier.entries.items[0].kv_len);
     // Keep flushing until complete; entry must land at the full 600.
     var guard: u32 = 0;
     while (guard < 10) : (guard += 1) {
-        if (try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s)) break;
+        if (try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s)) break;
     }
     try testing.expectEqual(@as(u32, 600), tier.entries.items[0].kv_len);
 
@@ -1328,7 +1844,7 @@ test "DiskTier: cache ahead of the token record persists the clamped prefix (EOS
     try fillCache(&cache, s, 1, 604, 8, 0.0, .float32); // 2 positions past the record
     var tokens: [602]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     try testing.expectEqual(@as(usize, 1), tier.entryCount());
     try testing.expectEqual(@as(u32, 602), tier.entries.items[0].kv_len);
 
@@ -1339,6 +1855,327 @@ test "DiskTier: cache ahead of the token record persists the clamped prefix (EOS
     const want = try cacheValueAt(&cache, 0, 601, 3, s);
     const got = try cacheValueAt(&cache2, 0, 601, 3, s);
     try testing.expectEqual(want, got);
+}
+
+// ── Phase 3: hybrid SSM checkpoint persistence ──
+
+const SSMCacheEntry = transformer_mod.SSMCacheEntry;
+const conv_shape = [_]c_int{ 1, 3, 8 }; // [B, kernel-1, conv_dim]
+const ssm_shape = [_]c_int{ 1, 2, 4, 4 }; // [B, Hv, Dv, Dk]
+
+fn makeArange(s: mlx.mlx_stream, shape: []const c_int, base: f64) mlx.mlx_array {
+    var count: f64 = 1;
+    for (shape) |d| count *= @floatFromInt(d);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    _ = mlx.mlx_arange(&flat, base, base + count, 1.0, .float32, s);
+    var out = mlx.mlx_array_new();
+    _ = mlx.mlx_reshape(&out, flat, shape.ptr, @intCast(shape.len), s);
+    _ = mlx.mlx_array_eval(out);
+    return out;
+}
+
+fn ssmArrVal(arr: mlx.mlx_array, idx: usize, s: mlx.mlx_stream) f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    _ = mlx.mlx_astype(&f, arr, .float32, s);
+    _ = mlx.mlx_array_eval(f);
+    return mlx.mlx_array_data_float32(f).?[idx];
+}
+
+/// Three-layer synthetic hybrid SSM state, covering the full null-state
+/// matrix: (0) a GatedDeltaNet layer with both conv+ssm, (1) an LFM2
+/// gated-conv layer with conv only (null ssm_state), (2) a plain-attention
+/// layer in the hybrid (uninitialized, both null). `conv_base`/`ssm_base`
+/// make each capture position's values distinguishable, so a restore-side
+/// conv/ssm KEY SWAP fails the value checks (the K/V-swap lesson).
+fn buildHybridEntries(s: mlx.mlx_stream, conv_base: f64, ssm_base: f64) [3]SSMCacheEntry {
+    return .{
+        .{
+            .conv_state = makeArange(s, &conv_shape, conv_base),
+            .ssm_state = makeArange(s, &ssm_shape, ssm_base),
+            .initialized = true,
+        },
+        .{
+            .conv_state = makeArange(s, &conv_shape, conv_base + 10_000),
+            .ssm_state = mlx.mlx_array_new(),
+            .initialized = true,
+        },
+        .{
+            .conv_state = mlx.mlx_array_new(),
+            .ssm_state = mlx.mlx_array_new(),
+            .initialized = false,
+        },
+    };
+}
+
+fn freeHybridEntries(e: *[3]SSMCacheEntry) void {
+    for (e) |*x| {
+        _ = mlx.mlx_array_free(x.conv_state);
+        _ = mlx.mlx_array_free(x.ssm_state);
+    }
+}
+
+test "DiskTier: hybrid entry round-trips SSM checkpoints (Phase 3)" {
+    // qwen3_5/3_6 GatedDeltaNet + lfm2 gated-conv (null ssm_state) + plain
+    // attention (uninitialized) in one entry. No local hybrid checkpoint of
+    // lfm2/nemotron_h exists, so those archs are covered here purely by the
+    // null-state layer shapes (same SSMCacheEntrySnapshot contract).
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-hybrid", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32); // >= MIN_PERSIST_TOKENS
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Two checkpoints at 128 / 256 with distinguishable state (base 100/500
+    // vs 200/600), captured through the real production capture path.
+    var src128 = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src128);
+    var src256 = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src256);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    try testing.expectEqual(@as(usize, 1), tier.entryCount());
+
+    // Fresh tier (restart): both checkpoint positions survive the scan.
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-hybrid", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expectEqual(@as(?u32, 256), tier2.highestSsmPosAtOrBelow(0, 300));
+    try testing.expectEqual(@as(?u32, 128), tier2.highestSsmPosAtOrBelow(0, 200));
+    try testing.expectEqual(@as(?u32, null), tier2.highestSsmPosAtOrBelow(0, 100));
+
+    // Restore at 256 into a fresh KVCache + ssm_entries.
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    const restored = try tier2.restoreIntoHybrid(&cache2, &dst, 0, 256, s);
+    try testing.expectEqual(@as(u32, 256), restored);
+    try testing.expectEqual(@as(usize, 256), cache2.step);
+
+    // Layer 0: conv (base 200) + ssm (base 600) — a KEY SWAP would flip these.
+    try testing.expect(dst[0].initialized);
+    try testing.expectEqual(@as(f32, 200.0), ssmArrVal(dst[0].conv_state, 0, s));
+    try testing.expectEqual(@as(f32, 200.0 + 23.0), ssmArrVal(dst[0].conv_state, 23, s));
+    try testing.expectEqual(@as(f32, 600.0), ssmArrVal(dst[0].ssm_state, 0, s));
+    try testing.expectEqual(@as(f32, 600.0 + 31.0), ssmArrVal(dst[0].ssm_state, 31, s));
+    // Layer 1: LFM2 gated-conv — conv present (base 10200), ssm stays null.
+    try testing.expect(dst[1].initialized);
+    try testing.expectEqual(@as(f32, 10_200.0), ssmArrVal(dst[1].conv_state, 0, s));
+    try testing.expect(dst[1].ssm_state.ctx == null);
+    // Layer 2: uninitialized plain-attention layer — both null.
+    try testing.expect(!dst[2].initialized);
+    try testing.expect(dst[2].conv_state.ctx == null);
+    try testing.expect(dst[2].ssm_state.ctx == null);
+
+    // KV rewound to 256 in lockstep, values byte-exact against the original.
+    for (cache2.entries) |*ce| {
+        try testing.expect(ce.initialized);
+        try testing.expectEqual(@as(usize, 256), ce.offset);
+    }
+    try testing.expectEqual(
+        try cacheValueAt(&cache, 1, 200, 3, s),
+        try cacheValueAt(&cache2, 1, 200, 3, s),
+    );
+
+    // Restore at the lower checkpoint installs THAT position's state.
+    var cache3 = try KVCache.init(testing.allocator, 3);
+    defer cache3.deinit();
+    var dst2: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst2);
+    const restored128 = try tier2.restoreIntoHybrid(&cache3, &dst2, 0, 128, s);
+    try testing.expectEqual(@as(u32, 128), restored128);
+    try testing.expectEqual(@as(usize, 128), cache3.step);
+    try testing.expectEqual(@as(f32, 100.0), ssmArrVal(dst2[0].conv_state, 0, s));
+    try testing.expectEqual(@as(f32, 500.0), ssmArrVal(dst2[0].ssm_state, 0, s));
+
+    // A position that was never checkpointed is rejected, not silently served.
+    try testing.expectError(error.DiskCacheNoCheckpoint, tier2.restoreIntoHybrid(&cache3, &dst2, 0, 200, s));
+}
+
+test "DiskTier: SSM retention keeps the newest positions, drops the oldest" {
+    // Every turn adds an end-of-prompt checkpoint; unbounded, one entry grows
+    // without limit. Retention keeps at most SSM_DISK_MAX_PER_ENTRY, thinning
+    // from the FRONT (lowest positions first — the newest are where warm
+    // requests match).
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-retain", 0, 128);
+    defer tier.deinit();
+
+    // KV covering 0..(N*100) so every checkpoint position is ≤ kv_len.
+    const N = SSM_DISK_MAX_PER_ENTRY + 1; // 9 positions, one over the cap
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, N * 100 + 50, 8, 0.0, .float32);
+    var tokens: [SSM_DISK_MAX_PER_ENTRY * 100 + 150]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var srcs: [N][3]SSMCacheEntry = undefined;
+    for (&srcs, 0..) |*src, i| src.* = buildHybridEntries(s, @floatFromInt((i + 1) * 1000), @floatFromInt((i + 1) * 2000));
+    defer for (&srcs) |*src| freeHybridEntries(src);
+    var cps: [N]transformer_mod.SSMCheckpoint = undefined;
+    for (&cps, 0..) |*cp, i| cp.* = try transformer_mod.captureSsmCheckpoint(testing.allocator, &srcs[i], (i + 1) * 100, s);
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+
+    // Exactly MAX positions on disk; the LOWEST (100) dropped, newest kept.
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(usize, SSM_DISK_MAX_PER_ENTRY), e.ssm_positions.len);
+    try testing.expectEqual(@as(u32, 200), e.ssm_positions[0]);
+    try testing.expectEqual(@as(u32, @intCast(N * 100)), e.ssm_positions[e.ssm_positions.len - 1]);
+    // The dropped position's file is gone.
+    const dropped = try std.fmt.allocPrint(testing.allocator, "{s}/fp-retain/e1/s0000100.safetensors", .{base});
+    defer testing.allocator.free(dropped);
+    try testing.expect(statFile(io, dropped) == null);
+    // A kept position's file exists.
+    const kept = try std.fmt.allocPrint(testing.allocator, "{s}/fp-retain/e1/s0000200.safetensors", .{base});
+    defer testing.allocator.free(kept);
+    try testing.expect(statFile(io, kept) != null);
+}
+
+test "DiskTier: SSM salvage — one bad file drops that position, all bad drops the entry" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    {
+        var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssmsalv", 0, 128);
+        defer tier.deinit();
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+        var tokens: [600]u32 = undefined;
+        for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+        var src128 = buildHybridEntries(s, 100.0, 500.0);
+        defer freeHybridEntries(&src128);
+        var src256 = buildHybridEntries(s, 200.0, 600.0);
+        defer freeHybridEntries(&src256);
+        var cps = [_]transformer_mod.SSMCheckpoint{
+            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+            try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s),
+        };
+        defer for (&cps) |*cp| cp.deinit(testing.allocator);
+        _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+    }
+
+    // Truncate the pos-256 checkpoint file → that position drops, 128 survives.
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-ssmsalv/e1/s0000256.safetensors", .data = "trunc" });
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-ssmsalv", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expectEqual(@as(usize, 1), tier2.entries.items[0].ssm_positions.len);
+    try testing.expectEqual(@as(u32, 128), tier2.entries.items[0].ssm_positions[0]);
+    // The salvaged KV + surviving checkpoint still restore.
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 128), try tier2.restoreIntoHybrid(&cache2, &dst, 0, 128, s));
+
+    // Truncate the LAST surviving checkpoint too → hybrid entry dropped whole
+    // (KV without any SSM state is unusable).
+    try tmp.dir.writeFile(io, .{ .sub_path = "fp-ssmsalv/e1/s0000128.safetensors", .data = "trunc" });
+    var tier3 = try DiskTier.init(testing.allocator, io, base, "fp-ssmsalv", 0, 128);
+    defer tier3.deinit();
+    try testing.expectEqual(@as(usize, 0), tier3.entryCount());
+}
+
+test "DiskTier: SSM checkpoints persist incrementally under the flush byte cap" {
+    // The per-flush byte cap covers BOTH chunks and checkpoints so a big 27B
+    // turn never stalls the next request. Under a 1-byte cap the entry
+    // persists one unit at a time and reports incomplete until KV + every
+    // eligible checkpoint have landed.
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-ssmcap", 0, 128);
+    defer tier.deinit();
+    tier.max_flush_bytes = 1; // one chunk/checkpoint per flush
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    var src128 = buildHybridEntries(s, 100.0, 500.0);
+    defer freeHybridEntries(&src128);
+    var src512 = buildHybridEntries(s, 300.0, 700.0);
+    defer freeHybridEntries(&src512);
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src128, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+
+    // Drive to completion; it must take multiple flushes and only report
+    // complete once BOTH checkpoints are on disk.
+    var complete = false;
+    var guard: u32 = 0;
+    while (guard < 40) : (guard += 1) {
+        complete = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, &cps, s);
+        if (complete) break;
+    }
+    try testing.expect(complete);
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(u32, 600), e.kv_len);
+    try testing.expectEqual(@as(usize, 2), e.ssm_positions.len);
+    try testing.expectEqual(@as(u32, 128), e.ssm_positions[0]);
+    try testing.expectEqual(@as(u32, 512), e.ssm_positions[1]);
+
+    // The incrementally-persisted checkpoints restore correctly.
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var dst: [3]SSMCacheEntry = .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+    defer freeHybridEntries(&dst);
+    try testing.expectEqual(@as(u32, 512), try tier.restoreIntoHybrid(&cache2, &dst, 0, 512, s));
+    try testing.expectEqual(@as(f32, 300.0), ssmArrVal(dst[0].conv_state, 0, s));
+    try testing.expectEqual(@as(f32, 700.0), ssmArrVal(dst[0].ssm_state, 0, s));
 }
 
 test "DiskTier: short caches and TurboQuant schemes are never persisted" {
@@ -1358,7 +2195,7 @@ test "DiskTier: short caches and TurboQuant schemes are never persisted" {
     try fillCache(&cache, s, 1, 128, 8, 0.0, .float32);
     var tokens: [128]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i);
-    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, s);
+    _ = try tier.appendCommit(cache.entries, cache.step, cache.config, &tokens, false, null, s);
     try testing.expectEqual(@as(usize, 0), tier.entryCount());
 }
 

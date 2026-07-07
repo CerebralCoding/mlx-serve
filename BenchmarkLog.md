@@ -651,13 +651,23 @@ request). Raw prefill/decode tok/s unchanged across the board (no hot-path regre
 | gemma3-12b-4bit          | 40.6s → 2.7s (15×)  | 12.5s → 325ms (38×) |
 | gemma4-12b-4bit          | 30.8s → 16.5s (1.9×)| 317ms → 690ms |
 | gemma4-26B-A4B-moe-4bit  | 10.5s → 2.3s (4.6×) | 190ms → 555ms |
-| qwen35-0.8b (hybrid)     | unchanged (disk tier v1 = pure-attention only) | 80→87ms |
-| qwen36-27b (hybrid)      | unchanged (50s — the phase-3 target) | ~1.4s |
+| qwen35-0.8b (hybrid)     | 0.40s → 0.06s (6.5×, ~2.5K prompt) | 80→87ms |
+| qwen36-27b (hybrid)      | 47.8s → 0.55s (87×) | ~1.4s |
+
+Phase 3 (this session) extended the SSD tier to hybrid recurrent archs (Qwen 3.5/3.6
+GatedDeltaNet, lfm2, nemotron_h). The two hybrid rows above were "unchanged" before —
+their per-position SSM/conv state couldn't be persisted, so every restart cold-re-read.
+Now the RAM tier's `SSMCheckpoint`s persist beside the KV chunks (immutable
+`s{pos}.safetensors`, `SSM_DISK_MAX_PER_ENTRY=8`); a restart restores KV + SSM state at
+the highest checkpoint ≤ the token match. qwen36-27b's ~48s cold re-read of an 11K-token
+context now returns in 0.55s (restore `ssm@10830` in 30ms), output byte-identical at
+temp 0. The 27B entry is ~1.2 GB on disk (3 KV chunks + 5 SSM checkpoints) and fully
+converges within a few turns under the 512 MB/turn flush cap.
 
 Notes:
 - Restart wins come from the SSD tier (src/kv_disk_cache.zig) restoring persisted
-  KV chunks instead of re-prefilling; outputs byte-identical (guard:
-  tests/test_prefix_cache_disk.sh).
+  KV chunks (and, on hybrid archs, SSM checkpoints) instead of re-prefilling; outputs
+  byte-identical (guard: tests/test_prefix_cache_disk.sh, incl. a hybrid section).
 - gemma-3's 38× extend win is the O(specials × text) tokenize-scan fix
   (6,415 special tokens; render+tokenize 11.4s → 3.3ms on a 32KB prompt).
 - gemma4-12b restart is partial: its dense-bf16 KV is ~385MB/1024-token chunk, and

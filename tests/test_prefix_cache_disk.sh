@@ -47,12 +47,13 @@ sleep 1
 
 # Isolated HOME so the test never touches the user's real kv-cache.
 SCRATCH_HOME=$(mktemp -d)
+HYBRID_HOME=$(mktemp -d)
 LOGFILE=$(mktemp)
 SERVER_PID=""
 cleanup() {
     [ -n "$SERVER_PID" ] && kill "$SERVER_PID" 2>/dev/null || true
     wait 2>/dev/null || true
-    rm -rf "$SCRATCH_HOME" "$LOGFILE"
+    rm -rf "$SCRATCH_HOME" "$HYBRID_HOME" "$LOGFILE"
 }
 trap cleanup EXIT
 
@@ -196,6 +197,65 @@ else
     echo -e "${GREEN}PASS${NC} off switch respected"
 fi
 stop_server
+
+echo
+echo "== 6. hybrid SSM arch (Qwen 3.5 GatedDeltaNet) persists + restores SSM state =="
+# Phase 3: hybrid recurrent archs persist their per-position SSM checkpoints
+# beside the KV chunks and restore both across a restart. Gated on a local
+# Qwen3.5-0.8B; SKIPs cleanly otherwise (the attention sections above cover the
+# non-hybrid path either way).
+HYBRID_MODEL="$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
+[ -d "$HYBRID_MODEL" ] || HYBRID_MODEL="$HOME/.mlx-serve/models/Qwen3.5-0.8B-MLX-4bit"
+if [ ! -d "$HYBRID_MODEL" ]; then
+    echo -e "${YELLOW}SKIP${NC} hybrid section: Qwen3.5-0.8B-MLX-4bit not found."
+else
+    # Repoint the server helpers at the hybrid model + a fresh isolated HOME.
+    MODEL="$HYBRID_MODEL"
+    SCRATCH_HOME="$HYBRID_HOME"
+    KV_DIR="$SCRATCH_HOME/.mlx-serve/kv-cache"
+
+    echo "  -- cold boot + long request (persist) --"
+    start_server --no-mtp || { echo -e "${RED}FAIL${NC} hybrid server failed to start"; exit 1; }
+    HOUT1=$(fire_long)
+    HCOLD_MS="${HOUT1%%|*}"
+    HCONTENT1="${HOUT1#*|}"
+    echo "  cold total=${HCOLD_MS}ms content='${HCONTENT1:0:60}'"
+    sleep 1
+    if grep -q '\[disk-cache\] persisted' "$LOGFILE"; then
+        # A hybrid persist reports SSM checkpoints in the count.
+        echo -e "${GREEN}PASS${NC} hybrid persist fired: $(grep -o '\[disk-cache\] persisted[^;]*' "$LOGFILE" | tail -1)"
+    else
+        echo -e "${RED}FAIL${NC} hybrid: no [disk-cache] persisted line"
+        tail -20 "$LOGFILE"; FAIL=1
+    fi
+    stop_server
+
+    echo "  -- restart + identical request (restore SSM@pos) --"
+    start_server --no-mtp || { echo -e "${RED}FAIL${NC} hybrid server 2 failed to start"; exit 1; }
+    HOUT2=$(fire_long)
+    HRESTART_MS="${HOUT2%%|*}"
+    HCONTENT2="${HOUT2#*|}"
+    echo "  restart total=${HRESTART_MS}ms (cold was ${HCOLD_MS}ms) content='${HCONTENT2:0:60}'"
+    if grep -qE '\[disk-cache\] restored .* from SSD .*\(ssm@[0-9]+\)' "$LOGFILE"; then
+        echo -e "${GREEN}PASS${NC} hybrid SSD restore engaged: $(grep -oE '\[disk-cache\] restored [^(]*\(ssm@[0-9]+\)' "$LOGFILE" | head -1)"
+    else
+        echo -e "${RED}FAIL${NC} hybrid: no '[disk-cache] restored … (ssm@…)' line after restart"
+        tail -30 "$LOGFILE"; FAIL=1
+    fi
+    if [ "$HCONTENT1" = "$HCONTENT2" ]; then
+        echo -e "${GREEN}PASS${NC} hybrid output byte-identical across restart restore"
+    else
+        echo -e "${RED}FAIL${NC} hybrid output diverged: '$HCONTENT1' vs '$HCONTENT2'"
+        FAIL=1
+    fi
+    HSPEEDUP_OK=$(python3 -c "print(1 if $HRESTART_MS * 2 <= $HCOLD_MS else 0)")
+    if [ "$HSPEEDUP_OK" = "1" ]; then
+        echo -e "${GREEN}PASS${NC} hybrid restart request >=2x faster than cold (${HRESTART_MS}ms vs ${HCOLD_MS}ms)"
+    else
+        echo -e "${YELLOW}WARN${NC} hybrid restart not >=2x faster (${HRESTART_MS}ms vs ${HCOLD_MS}ms) — small model, TTFT dominated by fixed costs"
+    fi
+    stop_server
+fi
 
 echo
 if [ "$FAIL" = "0" ]; then

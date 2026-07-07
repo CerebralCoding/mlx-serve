@@ -2543,12 +2543,16 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.prefix_cache_capacity,
             params.prefix_cache_mem_bytes,
         );
-        // SSD tier (`--prefix-cache-disk`). v1 scope is pure-attention archs
-        // — hybrid recurrent state isn't persisted yet. Every failure mode is
-        // caught: persistence silently stays off, the RAM cache is unaffected.
+        // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
+        // state too: the disk tier is allowed whenever the RAM tier accepted
+        // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints
+        // are enabled (`enable_ssm_cps`, the same gate `shouldUse` applied).
+        // Every failure mode is caught: persistence silently stays off, the
+        // RAM cache is unaffected.
         const has_ssm_layers = params.config.has_hybrid_layers or
             params.config.full_attention_interval > 0;
-        if (params.prefix_cache_disk_bytes > 0 and !has_ssm_layers) attach: {
+        const disk_ok = !has_ssm_layers or enable_ssm_cps;
+        if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
             const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
                 log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
                 break :attach;
