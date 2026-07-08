@@ -916,7 +916,7 @@ pub const Generator = struct {
                 // already-resident state.
                 const abs_end_for_cp2 = end + ssm_cp_offset;
                 if (want_ssm_cp and ssm_cp_stride > 0 and abs_end_for_cp2 % ssm_cp_stride == 0) {
-                    const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2);
+                    const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, abs_end_for_cp2, xfm.s);
                     try ssm_checkpoints.append(allocator, cp);
                     // Keep the buffer bounded — drop the oldest if we've
                     // accumulated more than the configured max. Front-removal
@@ -960,7 +960,7 @@ pub const Generator = struct {
                     // may have been a stride-aligned one (already evaluated)
                     // or a partial tail (also evaluated). The snapshot is a
                     // cheap refcount-share.
-                    const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, final_abs);
+                    const cp = try captureSsmCheckpoint(allocator, ctx.ssm_entries.?, final_abs, xfm.s);
                     try ssm_checkpoints.append(allocator, cp);
                     if (options.ssm_checkpoint_max > 0 and
                         ssm_checkpoints.items.len > options.ssm_checkpoint_max)

@@ -44,6 +44,8 @@ const model_mod = @import("model.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
+const metrics_mod = @import("metrics.zig");
+const kv_disk_cache = @import("kv_disk_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
@@ -130,6 +132,10 @@ pub const LoadParams = struct {
     prefix_cache_capacity: u32 = 1,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
     prefix_cache_mem_bytes: u64 = 0,
+    /// SSD tier byte budget for the hot prefix cache (`--prefix-cache-disk`).
+    /// 0 disables persistence. Attached per model at load for pure-attention
+    /// archs; entries live under `~/.mlx-serve/kv-cache/<fingerprint>`.
+    prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
     /// 0 = disabled (hybrid models bypass the hot prefix cache). Non-zero
     /// enables hybrid in `HotPrefixCache.shouldUse` and triggers per-stride
@@ -182,6 +188,9 @@ pub const LoadParams = struct {
     /// `config`/`tok`/`chat_config` are still required (they seed the
     /// scheduler's borrowed-view fields) but are never installed on an entry.
     no_initial_load: bool = false,
+    /// Optional metrics sink. Null when --metrics is off (the default).
+    /// Stored on the Scheduler and read by the `finishSlot` per-request funnel.
+    metrics: ?*metrics_mod.Metrics = null,
     /// The --ctx-size launch flag (0 = unset). Cold-loaded GGUF entries have
     /// no config.json to size their context from, so `preloadCpuState` sizes
     /// the stub config with this — same rule as the startup GGUF paths
@@ -361,6 +370,15 @@ pub const Slot = struct {
     completion_tokens: u32,
     prefill_tps: f64,
     decode_tps: f64,
+    /// Monotonic timestamp captured in `Slot.init`, BEFORE the queue wait.
+    /// Anchors the exact time-to-first-token measurement.
+    request_start_ts: std.Io.Timestamp,
+    /// Wall-clock nanoseconds from `request_start_ts` (request arrival) to
+    /// prefill completion = queue_wait + prefill = real time-to-first-token.
+    /// Captured directly when prefill finishes (never derived by subtracting
+    /// decode time), so it stays exact even if a slot finishes mid-tick. Used
+    /// as `real_ttft_ns` for the metrics histogram; e2e = first_token_ns + decode_ns.
+    first_token_ns: u64,
     /// Wall-clock nanoseconds spent in `runPrefill` for this slot. Includes
     /// hot-prefix-cache lookup/restore and the model forward over the
     /// uncached tail. Populated by the scheduler main loop.
@@ -503,6 +521,8 @@ pub const Slot = struct {
             .completion_tokens = 0,
             .prefill_tps = 0.0,
             .decode_tps = 0.0,
+            .request_start_ts = std.Io.Timestamp.now(io, .boot),
+            .first_token_ns = 0,
             .prefill_ns = 0,
             .decode_ns = 0,
             .generated_ids = null,
@@ -810,6 +830,8 @@ pub const LoadRequest = struct {
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_mem_bytes: u64 = 0,
+    /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
+    prefix_cache_disk_bytes: u64 = 0,
     /// Phase 1 (perf-plan): SSM/conv state snapshot stride during prefill.
     /// Zero disables (hybrid models bypass the hot prefix cache, as before).
     /// Non-zero enables multi-turn warm reuse on hybrid SSM archs. Plumbed
@@ -922,6 +944,17 @@ pub const Scheduler = struct {
     /// `LoadParams.ctx_size` — the --ctx-size launch flag, kept for sizing
     /// GGUF stub configs on cold loads (see preloadGgufCpuState).
     gguf_ctx_size: u32,
+    /// Launch-flag prefix-cache settings, retained so COLD-LOADED models
+    /// (`ensureLoaded` → /v1/load-model, model switches) get the same
+    /// prefix-cache behavior as the `--model` primary. Pre-plumbing these
+    /// were hardcoded to (1, 0, stride 0) on the cold path, which silently
+    /// crippled warm reuse — and disabled it entirely on hybrids — after
+    /// every model switch.
+    prefix_cache_capacity: u32,
+    prefix_cache_mem_bytes: u64,
+    prefix_cache_disk_bytes: u64,
+    ssm_checkpoint_stride: u32,
+    ssm_checkpoint_max: u32,
 
     // ── Borrowed refs (CPU-only state owned by the LoadedModel). ──
     config: *const ModelConfig,
@@ -981,6 +1014,15 @@ pub const Scheduler = struct {
     /// inference thread drains this queue between ticks where it owns the
     /// stream binding, so all mlx ops stay on one thread.
     cleanup_queue: std.ArrayList(*Slot),
+    /// Metrics sink. Null when --metrics is off. Populated from LoadParams.
+    /// Read once per REQUEST in `finishSlot` — never on the per-token path.
+    metrics: ?*metrics_mod.Metrics,
+    /// In-flight generated-token aggregate: the sum of `completion_tokens`
+    /// over the slots still decoding, republished by the inference thread once
+    /// per decode tick (O(1) at the tick boundary, NOT per token). The gauge
+    /// sampler reads this race-free to derive a live tok/s — it never touches
+    /// per-slot fields off-thread. Zero when nothing is decoding.
+    inflight_generated_tokens: std.atomic.Value(u64),
     /// Counts `pending.len + decoding.len` for back-pressure.
     in_flight: u32,
     /// Capacity for back-pressure. `submit` waits when in_flight >= cap.
@@ -1045,6 +1087,11 @@ pub const Scheduler = struct {
             .drafter_block_size = params.draft_block_size,
             .kv_quant_config = params.kv_quant_config,
             .gguf_ctx_size = params.ctx_size,
+            .prefix_cache_capacity = params.prefix_cache_capacity,
+            .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
+            .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
+            .ssm_checkpoint_stride = params.ssm_checkpoint_stride,
+            .ssm_checkpoint_max = params.ssm_checkpoint_max,
             // Initial borrowed-view refs point at the (heap-allocated) CPU
             // state carried on LoadParams; once the inference thread
             // installs them on `entry`, the views still resolve to the
@@ -1066,6 +1113,8 @@ pub const Scheduler = struct {
             .gen_queue = std.ArrayList(*GenRequest).empty,
             .unload_queue = std.ArrayList(*UnloadRequest).empty,
             .cleanup_queue = std.ArrayList(*Slot).empty,
+            .metrics = params.metrics,
+            .inflight_generated_tokens = std.atomic.Value(u64).init(0),
             .in_flight = 0,
             .queue_cap = cap + 32,
             .submit_cond = .init,
@@ -1465,8 +1514,14 @@ pub const Scheduler = struct {
             .draft_block_size = drafter_mod.DEFAULT_BLOCK_SIZE,
             .draft_block_size_explicit = false,
             .kv_quant_config = self.kv_quant_config,
-            .prefix_cache_capacity = 1,
-            .prefix_cache_mem_bytes = 0,
+            // Cold loads get the SAME prefix-cache configuration as the
+            // startup model — pre-plumbing these were (1, 0, stride 0),
+            // which silently degraded warm reuse after every model switch.
+            .prefix_cache_capacity = self.prefix_cache_capacity,
+            .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
+            .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
+            .ssm_checkpoint_stride = self.ssm_checkpoint_stride,
+            .ssm_checkpoint_max = self.ssm_checkpoint_max,
             .evict_entries = victims_buf[0..n_victims],
             .allocator = self.allocator,
         };
@@ -2514,6 +2569,35 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             params.prefix_cache_capacity,
             params.prefix_cache_mem_bytes,
         );
+        // SSD tier (`--prefix-cache-disk`). Phase 3 persists hybrid recurrent
+        // state too: the disk tier is allowed whenever the RAM tier accepted
+        // the arch — i.e. pure-attention always, hybrid iff SSM checkpoints
+        // are enabled (`enable_ssm_cps`, the same gate `shouldUse` applied).
+        // Every failure mode is caught: persistence silently stays off, the
+        // RAM cache is unaffected.
+        const has_ssm_layers = params.config.has_hybrid_layers or
+            params.config.full_attention_interval > 0;
+        const disk_ok = !has_ssm_layers or enable_ssm_cps;
+        if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
+            const fp = kv_disk_cache.modelFingerprint(sch.allocator, sch.io, entry.path) catch |err| {
+                log.warn("[disk-cache] fingerprint failed: {s} — persistence off for this model\n", .{@errorName(err)});
+                break :attach;
+            };
+            defer sch.allocator.free(fp);
+            const base = kv_disk_cache.defaultBaseDir(sch.allocator) catch break :attach;
+            defer sch.allocator.free(base);
+            entry.prefix_cache.?.disk = kv_disk_cache.DiskTier.init(
+                sch.allocator,
+                sch.io,
+                base,
+                fp,
+                params.prefix_cache_disk_bytes,
+                kv_disk_cache.DEFAULT_CHUNK_TOKENS,
+            ) catch |err| {
+                log.warn("[disk-cache] init failed: {s} — persistence off for this model\n", .{@errorName(err)});
+                break :attach;
+            };
+        }
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
     }
@@ -2684,7 +2768,10 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (n_prefill > 0) {
             for (to_prefill[0..n_prefill]) |slot| {
                 if (slot.cancelled.load(.acquire)) {
-                    slot.markFinished("cancelled");
+                    // finishSlot (not raw markFinished) so the metrics sink
+                    // counts the cancellation; safe pre-prefill — commit
+                    // no-ops with legacy_gen==null.
+                    finishSlot(sch, slot, "cancelled");
                     continue;
                 }
                 var prefill_sw = io_util.Stopwatch.init(sch.io);
@@ -2694,7 +2781,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                         // an idle keepalive probe and set slot.cancelled);
                         // the chunk loop aborted. A clean finish, not an error.
                         log.info("[scheduler] prefill aborted: client disconnected\n", .{});
-                        slot.markFinished("cancelled");
+                        finishSlot(sch, slot, "cancelled");
                         continue;
                     }
                     log.err("[scheduler] prefill failed for slot: {s}\n", .{@errorName(err)});
@@ -2702,6 +2789,11 @@ fn inferenceLoop(ctx: ThreadCtx) void {
                     continue;
                 };
                 slot.prefill_ns = prefill_sw.read();
+                // Exact time-to-first-token: elapsed from request arrival
+                // (Slot.init, pre-queue-wait) to prefill completion. Captured
+                // here rather than derived by subtraction in finishSlot, so a
+                // slot that finishes mid-tick can't skew it (metrics TTFT fix).
+                slot.first_token_ns = @intCast(slot.request_start_ts.untilNow(sch.io, .boot).nanoseconds);
                 sch.queue_mu.lockUncancelable(sch.io);
                 sch.decoding.append(sch.allocator, slot) catch |err| {
                     sch.queue_mu.unlock(sch.io);
@@ -3124,7 +3216,36 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // finalize here instead.
     if (slot.legacy_gen) |*g| g.logSpecStats();
     commitSlotIfApplicable(sch, slot);
+    // SSD flush runs AFTER markFinished so the client never waits on the
+    // chunk-append — but everything it needs must be captured BEFORE the
+    // broadcast: the conn thread may complete()+free the slot immediately.
+    // The prefix cache and stream live on the registry-owned LoadedModel,
+    // which outlives the slot (unload also runs on this thread).
+    const hc_opt: ?*prefix_cache_mod.HotPrefixCache =
+        if (slot.model.prefix_cache) |*p| p else null;
+    const stream_opt: ?mlx.mlx_stream =
+        if (slot.model.transformer) |x| x.s else null;
+    // Record per-request metrics while slot fields are still live (before
+    // markFinished broadcasts — the conn thread may complete()+free the slot
+    // immediately after). Off the per-token path; a null sink (metrics off) is
+    // a single per-request branch. real_ttft = first_token_ns (queue+prefill,
+    // captured exactly at prefill completion); recordRequest derives
+    // e2e = first_token_ns + decode_ns.
+    if (sch.metrics) |m| {
+        m.recordRequest(
+            reason,
+            slot.first_token_ns,
+            slot.prefill_ns,
+            slot.decode_ns,
+            slot.prompt_tokens,
+            slot.completion_tokens,
+            slot.cached_tokens,
+        );
+    }
     slot.markFinished(reason);
+    if (hc_opt) |hc| {
+        if (stream_opt) |s| hc.flushPendingDisk(s);
+    }
 }
 
 /// ds4 prefill: create a session sized to the configured ctx and sync it to
@@ -3551,8 +3672,31 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     slot.state = .decoding;
 }
 
+/// Sum the in-flight generated tokens over the active slots for the live-tok/s
+/// gauge, EXCLUDING any slot that already finished/cancelled/errored this tick
+/// (its tokens were counted into `generation_tokens_total` by `finishSlot`, so
+/// including them here would double-count — and would leave a stale non-zero
+/// aggregate once the last slot finishes, breaking the "at rest ⇒ live == total"
+/// invariant). Generic over the slot type so the exact filter is unit-testable
+/// with a lightweight stub; the real caller passes `[]*Slot`.
+fn sumInflightGeneratedTokens(active: anytype) u64 {
+    var inflight: u64 = 0;
+    for (active) |s| {
+        if (s.finished or s.error_code != null or s.cancelled.load(.acquire)) continue;
+        inflight += @as(u64, s.completion_tokens);
+    }
+    return inflight;
+}
+
 fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
     if (active.len == 0) return;
+
+    // Publish the in-flight generated-token aggregate for the gauge sampler.
+    // Runs after the whole tick (all decode work + any finishSlot calls) on
+    // every return path — race-free (inference thread owns these slots' fields)
+    // and O(active), never per token. Finished slots are excluded, so the last
+    // slot's completion drives this to 0 (live == total at rest).
+    defer sch.inflight_generated_tokens.store(sumInflightGeneratedTokens(active), .monotonic);
 
     // Phase 3 gate: at len==1, route to legacy single-slot path. Bit-identical
     // to pre-Phase-2 behavior including PLD/drafter speculative decoding.
@@ -3952,4 +4096,37 @@ test "buildGgufStubCpuState: ds4 stub carries deepseek_v4 + clamped ctx" {
     defer freeCpuState(a, &s);
     try testing.expectEqualStrings("deepseek_v4", s.config.model_type);
     try testing.expectEqual(arch_ds4.clampSessionCtx(512), s.config.max_position_embeddings);
+}
+
+test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/errored" {
+    // Lightweight stub carrying exactly the fields the aggregate reads — proves
+    // the live-gauge filter without constructing a real (mlx-backed) Slot.
+    const StubSlot = struct {
+        completion_tokens: u32,
+        finished: bool,
+        error_code: ?[]const u8,
+        cancelled: std.atomic.Value(bool),
+        fn make(tok: u32) @This() {
+            return .{ .completion_tokens = tok, .finished = false, .error_code = null, .cancelled = std.atomic.Value(bool).init(false) };
+        }
+    };
+    var a = StubSlot.make(10);
+    var b = StubSlot.make(20);
+    var done = StubSlot.make(99);
+    done.finished = true; // already counted in generation_tokens_total
+    var errd = StubSlot.make(50);
+    errd.error_code = "OutOfMemory";
+    var cxl = StubSlot.make(7);
+    cxl.cancelled.store(true, .release);
+
+    // Two still-decoding slots (10 + 20); the finished/errored/cancelled ones
+    // are excluded, so the aggregate is 30 — never double-counting the tail.
+    const active = [_]*StubSlot{ &a, &b, &done, &errd, &cxl };
+    try testing.expectEqual(@as(u64, 30), sumInflightGeneratedTokens(active[0..]));
+
+    // At rest: the last decoding slot finishes ⇒ aggregate collapses to 0,
+    // pinning the "live == total at rest" invariant test_metrics.sh checks.
+    a.finished = true;
+    b.finished = true;
+    try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
 }

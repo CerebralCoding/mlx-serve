@@ -58,6 +58,9 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.llamaCacheEntries, 4)        // server.zig llama_cache_entries
         XCTAssertEqual(d.skipMemPreflight, false)     // scheduler.zig skip_mem_preflight
         XCTAssertEqual(d.ssdStreaming, false)         // main.zig ds4_ssd_streaming
+        XCTAssertEqual(d.enableMetrics, false)        // main.zig metrics_enabled
+        XCTAssertEqual(d.apiKey, "")                  // server.zig g_api_key (null = open)
+        XCTAssertEqual(d.enablePrefixCacheDisk, false) // server.zig prefix_cache_disk_bytes (0 = off)
 
         // Corollary: with defaults matching the server, a fresh launch omits
         // every match-default flag (each guard fires only on a real change).
@@ -71,6 +74,12 @@ final class ServerOptionsTests: XCTestCase {
         }
         // ALWAYS-emitted flags (authoritative from the app) MUST be present.
         XCTAssertTrue(args.contains("--prefix-cache-entries"))
+        // The SSD tier is always emitted so it can't be silently on via a
+        // server default; a fresh (toggle-off) launch emits `off`.
+        XCTAssertTrue(contains(args, flag: "--prefix-cache-disk", value: "off"))
+        // --metrics + --api-key are emit-only-when-set and absent by default.
+        XCTAssertFalse(args.contains("--metrics"))
+        XCTAssertFalse(args.contains("--api-key"))
     }
 
     /// 4096 was too low: a single thinking trace + agentic answer routinely
@@ -171,6 +180,87 @@ final class ServerOptionsTests: XCTestCase {
         var opts = ServerOptions()
         opts.noVision = true
         XCTAssertTrue(opts.toCLIArgs().contains("--no-vision"))
+    }
+
+    // MARK: - Observability (--metrics)
+
+    func testMetricsFlagOmittedByDefault() {
+        let opts = ServerOptions()
+        XCTAssertFalse(opts.toCLIArgs().contains("--metrics"))
+    }
+
+    func testMetricsFlagEmittedWhenEnabled() {
+        var opts = ServerOptions()
+        opts.enableMetrics = true
+        XCTAssertTrue(opts.toCLIArgs().contains("--metrics"))
+    }
+
+    func testMetricsHasNoAdminKeyFlag() {
+        // The simplified observability layer has no admin/auth surface: even
+        // with metrics on, no `--admin-key` (or any admin flag) is ever emitted.
+        var opts = ServerOptions()
+        opts.enableMetrics = true
+        XCTAssertFalse(opts.toCLIArgs().contains("--admin-key"))
+    }
+
+    func testApiKeyOmittedByDefault() {
+        let opts = ServerOptions()
+        XCTAssertEqual(opts.apiKey, "")
+        XCTAssertFalse(opts.toCLIArgs().contains("--api-key"))
+    }
+
+    func testApiKeyEmittedWhenSet() {
+        var opts = ServerOptions()
+        opts.apiKey = "s3cret"
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--api-key", value: "s3cret"))
+    }
+
+    func testApiKeyWhitespaceOnlyIsOmitted() {
+        var opts = ServerOptions()
+        opts.apiKey = "   "
+        XCTAssertFalse(opts.toCLIArgs().contains("--api-key"))
+    }
+
+    func testApiKeyChangeTriggersRestart() {
+        let a = ServerOptions()
+        var b = ServerOptions()
+        b.apiKey = "s3cret"
+        XCTAssertFalse(a.serverLaunchEquals(b),
+                      "Setting/changing the API key must trigger a server restart")
+    }
+
+    func testEnableMetricsChangeTriggersRestart() {
+        let a = ServerOptions()
+        var b = ServerOptions()
+        b.enableMetrics = true
+        XCTAssertFalse(a.serverLaunchEquals(b),
+                      "Toggling --metrics must trigger a server restart")
+    }
+
+    // MARK: - SSD prefix cache (default off + toggle)
+
+    func testPrefixCacheDiskDefaultsOff() {
+        // OFF by default: the app is authoritative and always emits the flag as
+        // `off` so the SSD tier can't be silently on via a server default.
+        let opts = ServerOptions()
+        XCTAssertFalse(opts.enablePrefixCacheDisk)
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--prefix-cache-disk", value: "off"))
+    }
+
+    func testPrefixCacheDiskEmitsSizeWhenEnabled() {
+        var opts = ServerOptions()
+        opts.enablePrefixCacheDisk = true
+        opts.prefixCacheDisk = "10GB"
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--prefix-cache-disk", value: "10GB"))
+        XCTAssertFalse(contains(opts.toCLIArgs(), flag: "--prefix-cache-disk", value: "off"))
+    }
+
+    func testPrefixCacheDiskToggleTriggersRestart() {
+        let a = ServerOptions()
+        var b = ServerOptions()
+        b.enablePrefixCacheDisk = true
+        XCTAssertFalse(a.serverLaunchEquals(b),
+                      "Toggling the SSD prefix cache must trigger a server restart")
     }
 
     func testServerLaunchEqualsIgnoresPerRequestFields() {

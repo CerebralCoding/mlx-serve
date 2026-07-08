@@ -21,6 +21,17 @@ struct ServerOptions: Codable, Equatable {
     var logLevel: LogLevel = .info
     var requestTimeout: Int = 300       // seconds; 0 = unlimited
 
+    // Observability (server-launch flag). When true, launches with `--metrics`,
+    // exposing the Prometheus `/metrics` scrape endpoint AND a live throughput/
+    // latency/GPU/memory panel on the server's index page (GET /).
+    var enableMetrics: Bool = false
+    /// Optional API key (`--api-key`). When non-empty, remote (non-loopback)
+    /// requests to the OpenAI/Anthropic/Ollama APIs AND the index page + metrics
+    /// panel require it (Authorization: Bearer / x-api-key / HTTP Basic / query
+    /// param). Loopback is trusted, so this app (127.0.0.1) never needs to send
+    /// it — the key protects the server when bound to the network (0.0.0.0).
+    var apiKey: String = ""
+
     // Speculative decoding (server-launch flags)
     var enablePLD: Bool = true          // --pld is default-on now (CLI flips with --no-pld)
     var pldDraftLen: Int = 5
@@ -48,6 +59,15 @@ struct ServerOptions: Codable, Equatable {
     /// Hot prefix cache memory budget. `2GB`, `512MB`, etc. `0` or `off`
     /// disables the byte cap (count cap still applies). Empty = server default.
     var prefixCacheMem: String = "2GB"
+    /// SSD tier for the prefix cache. OFF by default because it can persist
+    /// gigabytes of KV under ~/.mlx-serve/kv-cache. When on, seen prefixes
+    /// survive restarts + RAM evictions (turns a cold 30-50 s long-context
+    /// TTFT into a bounded SSD read). Always emitted (`--prefix-cache-disk
+    /// <size>` on, `off` off) so the process matches the UI regardless of the
+    /// server default. See "SSD prefix cache" in CLAUDE.md.
+    var enablePrefixCacheDisk: Bool = false
+    /// Disk budget when `enablePrefixCacheDisk` is on. `10GB`, `2GB`, etc.
+    var prefixCacheDisk: String = "10GB"
     /// When true, launch with `--skip-mem-preflight` so the MLX loader skips the
     /// free-RAM pre-flight that would otherwise refuse a model whose weights +
     /// warmup headroom look too big for current free memory. The check is
@@ -308,6 +328,8 @@ struct ServerOptions: Codable, Equatable {
         noVision == other.noVision &&
         logLevel == other.logLevel &&
         requestTimeout == other.requestTimeout &&
+        enableMetrics == other.enableMetrics &&
+        apiKey == other.apiKey &&
         enablePLD == other.enablePLD &&
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&
@@ -317,6 +339,8 @@ struct ServerOptions: Codable, Equatable {
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
         prefixCacheMem == other.prefixCacheMem &&
+        enablePrefixCacheDisk == other.enablePrefixCacheDisk &&
+        prefixCacheDisk == other.prefixCacheDisk &&
         skipMemPreflight == other.skipMemPreflight &&
         llamaKvQuant == other.llamaKvQuant &&
         llamaCacheEntries == other.llamaCacheEntries &&
@@ -381,6 +405,13 @@ struct ServerOptions: Codable, Equatable {
         if requestTimeout != 300 {
             args += ["--timeout", "\(requestTimeout)"]
         }
+        if enableMetrics {
+            args += ["--metrics"]
+        }
+        let trimmedApiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        if !trimmedApiKey.isEmpty {
+            args += ["--api-key", trimmedApiKey]
+        }
         // Spec-decode: explicit flags either way so the server's CLI defaults
         // can't drift out from under the UI.
         args += [enablePLD ? "--pld" : "--no-pld"]
@@ -406,6 +437,16 @@ struct ServerOptions: Codable, Equatable {
         let trimmedPrefixMem = prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedPrefixMem.isEmpty && trimmedPrefixMem != "2GB" {
             args += ["--prefix-cache-mem", trimmedPrefixMem]
+        }
+        // ALWAYS emit — the SSD tier can persist gigabytes of KV, so the app is
+        // authoritative: `off` when the toggle is off (regardless of any server
+        // default), the chosen size when on. Mirrors the prefix-cache-entries
+        // always-emit discipline.
+        let trimmedPrefixDisk = prefixCacheDisk.trimmingCharacters(in: .whitespacesAndNewlines)
+        if enablePrefixCacheDisk && !trimmedPrefixDisk.isEmpty {
+            args += ["--prefix-cache-disk", trimmedPrefixDisk]
+        } else {
+            args += ["--prefix-cache-disk", "off"]
         }
         // GGUF-only performance knobs. Emitted unconditionally when not
         // the default — the server silently ignores them on the MLX path
@@ -507,6 +548,8 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .noVision) { noVision = v }
         if let v = try c.decodeIfPresent(LogLevel.self, forKey: .logLevel) { logLevel = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .requestTimeout) { requestTimeout = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMetrics) { enableMetrics = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .apiKey) { apiKey = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePLD) { enablePLD = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldDraftLen) { pldDraftLen = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
@@ -516,6 +559,8 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheMem) { prefixCacheMem = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePrefixCacheDisk) { enablePrefixCacheDisk = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .skipMemPreflight) { skipMemPreflight = v }
         if let v = try c.decodeIfPresent(LlamaKVQuant.self, forKey: .llamaKvQuant) { llamaKvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .llamaCacheEntries) { llamaCacheEntries = v }
@@ -607,6 +652,14 @@ extension ServerOptions {
             title: "Request timeout (s)",
             explainer: "Max seconds a single HTTP request is allowed to take. 0 = unlimited. Long agent loops may need 600+.",
             needsRestart: true),
+        "enableMetrics": .init(
+            title: "Metrics panel",
+            explainer: "Expose Prometheus metrics at /metrics and a live throughput/latency/GPU/memory panel on the server index page. Zero cost when off.",
+            needsRestart: true),
+        "apiKey": .init(
+            title: "API key",
+            explainer: "Require this key for requests from OTHER machines (the OpenAI/Anthropic/Ollama APIs + index page + metrics). Sent as Authorization: Bearer, x-api-key, HTTP Basic, or ?api_key=. Localhost is trusted, so this app never needs it — it protects the server when exposed on the network. Blank = no auth.",
+            needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",
             explainer: "Prompt Lookup Decoding. Big wins on echo-heavy workloads (code editing, RAG, agent loops). The adaptive prompt-time gate auto-disables it on novel content.",
@@ -642,6 +695,14 @@ extension ServerOptions {
         "prefixCacheMem": .init(
             title: "Prefix cache memory cap",
             explainer: "Maximum RAM for the prefix cache. Accepts '2GB', '512MB', '0' (disable byte cap). Default 2GB.",
+            needsRestart: true),
+        "enablePrefixCacheDisk": .init(
+            title: "SSD prefix cache",
+            explainer: "Persist seen KV prefixes to disk (~/.mlx-serve/kv-cache) so they survive restarts + RAM evictions — turns a cold 30-50s long-context first-token wait into a fast SSD read. OFF by default because it can use many gigabytes of disk.",
+            needsRestart: true),
+        "prefixCacheDisk": .init(
+            title: "SSD cache size",
+            explainer: "Disk budget for the SSD prefix cache when enabled. Accepts '10GB', '2GB', etc. LRU-evicted to this cap. Only used when 'SSD prefix cache' is on.",
             needsRestart: true),
         "skipMemPreflight": .init(
             title: "Skip memory pre-flight check",

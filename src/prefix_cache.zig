@@ -19,6 +19,8 @@ const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
 const model_mod = @import("model.zig");
 const kv_quant = @import("kv_quant.zig");
+const kv_disk_cache = @import("kv_disk_cache.zig");
+const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 
 const KVCache = transformer_mod.KVCache;
@@ -99,6 +101,14 @@ pub const HotPrefixCache = struct {
     /// init. The first commit on a fresh cache must seed an empty entry so
     /// future restores have something to land on.
     initialized: bool = false,
+    /// SSD tier (kv_disk_cache.zig). Attached by the scheduler at model load
+    /// when `--prefix-cache-disk` is non-zero and the arch is pure-attention.
+    /// Lookup falls back to it when it beats the RAM match; commits mark
+    /// `disk_dirty` and the scheduler flushes AFTER the response finishes so
+    /// the client never waits on the SSD write.
+    disk: ?kv_disk_cache.DiskTier = null,
+    /// A commit landed since the last `flushPendingDisk`.
+    disk_dirty: bool = false,
 
     pub fn init(allocator: std.mem.Allocator, max_entries: u32) HotPrefixCache {
         return initWithMem(allocator, max_entries, 0);
@@ -119,6 +129,8 @@ pub const HotPrefixCache = struct {
             freeEntryOwnedState(self.allocator, e);
         }
         self.entries.deinit(self.allocator);
+        if (self.disk) |*d| d.deinit();
+        self.disk = null;
     }
 
     /// Free everything an Entry owns: token buffer, KV snapshot, SSM
@@ -131,6 +143,33 @@ pub const HotPrefixCache = struct {
             for (cps) |*cp| cp.deinit(allocator);
             allocator.free(cps);
             e.ssm_checkpoints = null;
+        }
+    }
+
+    /// The largest checkpoint whose `pos ≤ limit` (checkpoints are sorted
+    /// ascending). Shared by the RAM restore and the RAM-vs-disk fairness
+    /// comparison — both need the effective restorable length of a hybrid
+    /// entry, which is the highest snapshotted position ≤ the token match, NOT
+    /// the raw match length (SSM state only exists at snapshotted positions).
+    fn highestCheckpointAtOrBelow(cps: []const SSMCheckpoint, limit: usize) ?*const SSMCheckpoint {
+        var picked: ?*const SSMCheckpoint = null;
+        for (cps) |*cp| {
+            if (cp.pos > limit) break;
+            picked = cp;
+        }
+        return picked;
+    }
+
+    /// Reset every SSM entry to the uninitialized (cold) state. Used on every
+    /// miss / failed-restore path so a subsequent prefill starts from a clean
+    /// recurrent state instead of stale conv/ssm buffers.
+    fn resetSsmEntries(entries: []SSMCacheEntry) void {
+        for (entries) |*ssm| {
+            _ = mlx.mlx_array_free(ssm.conv_state);
+            _ = mlx.mlx_array_free(ssm.ssm_state);
+            ssm.conv_state = mlx.mlx_array_new();
+            ssm.ssm_state = mlx.mlx_array_new();
+            ssm.initialized = false;
         }
     }
 
@@ -229,17 +268,70 @@ pub const HotPrefixCache = struct {
     ) !LookupResult {
         const match = self.findBestMatch(prompt_ids, has_tools, target_cache.config);
 
+        // ── SSD tier: consult when it can beat the RAM match meaningfully
+        // (fresh boot, post-eviction). Phase 3 handles hybrid targets too —
+        // the tier persists per-position SSM checkpoints beside the KV chunks
+        // and restores both.
+        if (self.disk) |*d| disk: {
+            const dm = d.bestMatch(prompt_ids, has_tools, target_cache.config) orelse break :disk;
+
+            if (target_ssm_entries) |ssm_entries| {
+                // Hybrid: compare EFFECTIVE restorable positions — the largest
+                // SSM checkpoint ≤ the match on each tier, not the raw prefix
+                // length (KV alone is useless without matching SSM state).
+                const ram_eff: usize = if (match) |m| blk: {
+                    const e = &self.entries.items[m.idx];
+                    const cps = e.ssm_checkpoints orelse break :blk 0;
+                    const cp = highestCheckpointAtOrBelow(cps, m.shared) orelse break :blk 0;
+                    break :blk cp.pos;
+                } else 0;
+                const disk_cp = d.highestSsmPosAtOrBelow(dm.idx, dm.usable) orelse break :disk;
+                if (@as(usize, disk_cp) < ram_eff + kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
+                const sw = io_util.Stopwatch.init(d.io);
+                const restored = d.restoreIntoHybrid(target_cache, ssm_entries, dm.idx, disk_cp, s) catch |err| {
+                    log.warn("  [disk-cache] hybrid restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                    // A failed restore can leave the cache AND ssm entries
+                    // half-rebuilt; reset both before the fall-through.
+                    target_cache.truncate(0, s) catch {};
+                    resetSsmEntries(ssm_entries);
+                    break :disk;
+                };
+                // A checkpoint is always ≤ prompt_len−1, so a hybrid restore
+                // never takes the full-match branch (same as the RAM path).
+                target_moe_seq_offset.* = restored;
+                const ms = sw.read() / std.time.ns_per_ms;
+                log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms (ssm@{d})\n", .{ restored, prompt_ids.len, ms, disk_cp });
+                return .{ .matched = restored, .full_match = false };
+            }
+
+            const ram_len: usize = if (match) |m| m.shared else 0;
+            if (dm.usable <= ram_len) break :disk;
+            if (dm.usable - ram_len < kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
+            // `dm.usable` is already clamped to the entry's kv_len (see
+            // DiskTier.bestMatch), so it IS the restorable length — restore
+            // only the chunks covering it. Loading the whole entry
+            // (restoreInto) would read a long stored prefix in full to serve a
+            // short shared prefix, making a diverged-prefix "hit" slower than a
+            // cold miss.
+            const effective: usize = dm.usable;
+            const full_match = effective == prompt_ids.len;
+            const final_len: usize = if (full_match and effective > 1) effective - 1 else effective;
+            const sw = io_util.Stopwatch.init(d.io);
+            d.restorePrefixInto(target_cache, dm.idx, @intCast(final_len), s) catch |err| {
+                log.warn("  [disk-cache] restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
+                // A failed restore can leave a half-rebuilt cache; reset it.
+                target_cache.truncate(0, s) catch {};
+                break :disk;
+            };
+            target_moe_seq_offset.* = final_len;
+            const ms = sw.read() / std.time.ns_per_ms;
+            log.info("  [disk-cache] restored {d}/{d} tokens from SSD ({d} chunks) in {d}ms\n", .{ final_len, prompt_ids.len, d.chunks_loaded_last, ms });
+            return .{ .matched = final_len, .full_match = full_match };
+        }
+
         if (match == null) {
             try target_cache.truncate(0, s);
-            if (target_ssm_entries) |entries| {
-                for (entries) |*ssm| {
-                    _ = mlx.mlx_array_free(ssm.conv_state);
-                    _ = mlx.mlx_array_free(ssm.ssm_state);
-                    ssm.conv_state = mlx.mlx_array_new();
-                    ssm.ssm_state = mlx.mlx_array_new();
-                    ssm.initialized = false;
-                }
-            }
+            if (target_ssm_entries) |entries| resetSsmEntries(entries);
             target_moe_seq_offset.* = 0;
             return .{ .matched = 0, .full_match = false };
         }
@@ -257,38 +349,20 @@ pub const HotPrefixCache = struct {
         var effective_matched: usize = m.shared;
         if (target_ssm_entries) |entries| {
             if (e.ssm_checkpoints) |cps| {
-                // findHighestCheckpoint: cps is sorted ascending by pos.
-                var picked: ?*SSMCheckpoint = null;
-                for (cps) |*cp| {
-                    if (cp.pos > m.shared) break;
-                    picked = cp;
-                }
-                if (picked) |cp| {
+                if (highestCheckpointAtOrBelow(cps, m.shared)) |cp| {
                     try restoreSsmCheckpoint(entries, cp);
                     effective_matched = cp.pos;
                 } else {
                     // No checkpoint at or before this prefix length — reset
                     // SSM and treat the match as zero-effective (we have to
                     // cold-prefill anyway because SSM state would be wrong).
-                    for (entries) |*ssm| {
-                        _ = mlx.mlx_array_free(ssm.conv_state);
-                        _ = mlx.mlx_array_free(ssm.ssm_state);
-                        ssm.conv_state = mlx.mlx_array_new();
-                        ssm.ssm_state = mlx.mlx_array_new();
-                        ssm.initialized = false;
-                    }
+                    resetSsmEntries(entries);
                     effective_matched = 0;
                 }
             } else {
                 // Hybrid model without checkpoints (e.g., committed pre-Phase-1).
                 // Reset and treat as cold prefill — we can't safely reuse.
-                for (entries) |*ssm| {
-                    _ = mlx.mlx_array_free(ssm.conv_state);
-                    _ = mlx.mlx_array_free(ssm.ssm_state);
-                    ssm.conv_state = mlx.mlx_array_new();
-                    ssm.ssm_state = mlx.mlx_array_new();
-                    ssm.initialized = false;
-                }
+                resetSsmEntries(entries);
                 effective_matched = 0;
             }
         }
@@ -462,6 +536,7 @@ pub const HotPrefixCache = struct {
             e.ssm_bytes = merged_ssm_bytes;
             e.last_used = self.bumpCounter();
             self.current_kv_bytes += e.kv_bytes;
+            if (self.disk != null) self.disk_dirty = true;
             self.logResident();
             return;
         }
@@ -495,7 +570,43 @@ pub const HotPrefixCache = struct {
             return err;
         };
         self.current_kv_bytes += new_bytes;
+        if (self.disk != null) self.disk_dirty = true;
         self.logResident();
+    }
+
+    /// Flush the most recent commit to the SSD tier. Called by the scheduler
+    /// AFTER `markFinished` (the client already has its response) — the
+    /// chunk-append is bounded (partial tail + new chunks) but synchronous on
+    /// the inference thread. Snapshot arrays are refcount-shared with the RAM
+    /// entry, so slicing them here reads the same buffers the commit captured.
+    pub fn flushPendingDisk(self: *HotPrefixCache, s: mlx.mlx_stream) void {
+        if (!self.disk_dirty) return;
+        self.disk_dirty = false;
+        const d = if (self.disk) |*dd| dd else return;
+        if (self.entries.items.len == 0) return;
+        var newest: *Entry = &self.entries.items[0];
+        for (self.entries.items[1..]) |*e| {
+            if (e.last_used > newest.last_used) newest = e;
+        }
+        // Phase 3: hybrid entries persist their SSM checkpoints alongside the
+        // KV chunks (immutable per-position s*.safetensors). The snapshot
+        // arrays are refcount-shared with the RAM entry, so `appendCommit`
+        // reads the same buffers the commit captured.
+        const complete = d.appendCommit(
+            newest.snapshot.entries,
+            newest.snapshot.step,
+            newest.snapshot.config,
+            newest.tokens,
+            newest.has_tools,
+            newest.ssm_checkpoints,
+            s,
+        ) catch |err| {
+            log.warn("  [disk-cache] persist failed: {s}\n", .{@errorName(err)});
+            return;
+        };
+        // Byte-capped flush: a large entry persists incrementally — keep the
+        // dirty flag set so the next finished request continues the write.
+        if (!complete) self.disk_dirty = true;
     }
 
     fn evictOneLru(self: *HotPrefixCache, reason: []const u8) void {
@@ -539,6 +650,10 @@ pub const HotPrefixCache = struct {
     /// when the cache is suspect (pad-only generation, image-bearing prompt,
     /// tools toggle change).
     pub fn invalidateAll(self: *HotPrefixCache, reason: []const u8) void {
+        // Suspect state must die on BOTH tiers — a poisoned prefix that
+        // survives on disk would be immortal across restarts.
+        if (self.disk) |*d| d.invalidateAll();
+        self.disk_dirty = false;
         if (self.entries.items.len == 0) return;
         log.info("  [hot-cache] invalidating all {d} entries: {s}\n", .{ self.entries.items.len, reason });
         for (self.entries.items) |*e| {
@@ -553,6 +668,8 @@ pub const HotPrefixCache = struct {
     /// generation in tail positions. Other entries from prior healthy
     /// requests remain untouched (improvement over the legacy nuke-everything).
     pub fn invalidateLatest(self: *HotPrefixCache, reason: []const u8) void {
+        if (self.disk) |*d| d.invalidateNewest();
+        self.disk_dirty = false;
         if (self.entries.items.len == 0) return;
         var newest_idx: usize = 0;
         var newest_used: u64 = 0;
@@ -648,6 +765,162 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
     try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.affine(4)));
 }
 
+fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32) !void {
+    var written: u32 = 0;
+    while (written < tokens) {
+        const step: u32 = @min(64, tokens - written);
+        var li: u32 = 0;
+        while (li < n_layers) : (li += 1) {
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            const count: f64 = @floatFromInt(step * 8);
+            const base: f64 = @floatFromInt(written * 8 + li * 1_000_000);
+            try mlx.check(mlx.mlx_arange(&flat, base, base + count, 1.0, .float32, s));
+            var k = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k);
+            const shape = [_]c_int{ 1, 1, @intCast(step), 8 };
+            try mlx.check(mlx.mlx_reshape(&k, flat, &shape, 4, s));
+            var view = try cache.update(li, k, k, s, 0);
+            view.deinit();
+        }
+        written += step;
+    }
+}
+
+test "HotPrefixCache: disk tier restores across a fresh cache instance (restart shape)" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Session 1: commit through the NORMAL RAM path, then flush to disk
+    // (the post-markFinished call the scheduler makes).
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hc", 0, 128);
+        defer hc.deinit();
+
+        var cache = try KVCache.init(testing.allocator, 2);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 2, 600);
+        try hc.commit(&cache, &tokens, false);
+        try testing.expect(hc.disk_dirty);
+        hc.flushPendingDisk(s);
+        try testing.expect(!hc.disk_dirty);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+
+    // Session 2 ("server restart"): fresh RAM cache, fresh tier over the same
+    // root. The lookup must land on the SSD tier and restore the prefix.
+    {
+        var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hc", 0, 128);
+        defer hc2.deinit();
+        try testing.expectEqual(@as(usize, 0), hc2.entryCount()); // RAM empty
+        try testing.expectEqual(@as(usize, 1), hc2.disk.?.entryCount());
+
+        var cache2 = try KVCache.init(testing.allocator, 2);
+        defer cache2.deinit();
+        var moe_off: usize = 0;
+        const res = try hc2.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false);
+        // Full match: identical re-issue semantics — truncate to len-1 and
+        // re-forward the last token, exactly like a RAM full-match hit.
+        try testing.expect(res.full_match);
+        try testing.expectEqual(@as(usize, 599), res.matched);
+        try testing.expectEqual(@as(usize, 599), cache2.step);
+        try testing.expectEqual(@as(usize, 599), moe_off);
+        for (cache2.entries) |*e| {
+            try testing.expect(e.initialized);
+            try testing.expectEqual(@as(usize, 599), e.offset);
+        }
+
+        // Diverged-tail shape: shares the first 400 tokens, then differs.
+        // Restore must land at 400 and leave the tail to prefill.
+        var tokens_div: [700]u32 = undefined;
+        for (&tokens_div, 0..) |*t, i| t.* = if (i < 400) tokens[i] else @intCast(i + 500_000);
+        var cache3 = try KVCache.init(testing.allocator, 2);
+        defer cache3.deinit();
+        var moe_off3: usize = 0;
+        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, null, s, &tokens_div, false);
+        try testing.expect(!res3.full_match);
+        try testing.expectEqual(@as(usize, 400), res3.matched);
+        try testing.expectEqual(@as(usize, 400), cache3.step);
+        // A diverged short prefix must read ONLY the chunks covering the
+        // usable 400 positions (ceil(400/128) = 4), NOT the whole 600-token
+        // stored entry (5 chunks). Loading the full entry to serve a short
+        // shared prefix makes a diverged "hit" slower than a cold prefill.
+        try testing.expectEqual(@as(u32, 4), hc2.disk.?.chunks_loaded_last);
+    }
+}
+
+test "HotPrefixCache: RAM match at least as long as disk skips the SSD read" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-skip", 0, 128);
+    defer hc.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+    try hc.commit(&cache, &tokens, false);
+    hc.flushPendingDisk(s);
+    const disk_uses_before = hc.disk.?.counter;
+
+    // Same prompt again: the RAM entry covers it fully, so the disk tier's
+    // LRU counter must not move (no restore happened).
+    var cache2 = try KVCache.init(testing.allocator, 1);
+    defer cache2.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestore(&cache2, &moe_off, null, s, &tokens, false);
+    try testing.expect(res.full_match);
+    try testing.expectEqual(disk_uses_before, hc.disk.?.counter);
+}
+
+test "HotPrefixCache: invalidation propagates to the disk tier" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-inv", 0, 128);
+    defer hc.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 1);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 1, 600);
+    try hc.commit(&cache, &tokens, false);
+    hc.flushPendingDisk(s);
+    try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+
+    hc.invalidateAll("test poison");
+    try testing.expectEqual(@as(usize, 0), hc.entryCount());
+    try testing.expectEqual(@as(usize, 0), hc.disk.?.entryCount());
+    try testing.expect(!hc.disk_dirty);
+}
+
 test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
     // Regression for the cross-bit-width hit that crashed SDPA in
     // tests/test_kv_quant_per_request.sh. With Entry.scheme tracking only
@@ -681,4 +954,178 @@ test "HotPrefixCache: findBestMatch isolates affine 4-bit from affine 8-bit" {
     try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.affine(8)));
     // Dense query against an affine entry: also null (existing guarantee).
     try testing.expectEqual(@as(?@TypeOf(hit), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.dense));
+}
+
+// ── Phase 3: two-tier hybrid restore (Qwen 3.5/3.6 GatedDeltaNet) ──
+
+const conv_shape_pc = [_]c_int{ 1, 3, 8 };
+const ssm_shape_pc = [_]c_int{ 1, 2, 4, 4 };
+
+fn pcArange(s: mlx.mlx_stream, shape: []const c_int, base: f64) mlx.mlx_array {
+    var count: f64 = 1;
+    for (shape) |d| count *= @floatFromInt(d);
+    var flat = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat);
+    _ = mlx.mlx_arange(&flat, base, base + count, 1.0, .float32, s);
+    var out = mlx.mlx_array_new();
+    _ = mlx.mlx_reshape(&out, flat, shape.ptr, @intCast(shape.len), s);
+    _ = mlx.mlx_array_eval(out);
+    return out;
+}
+
+fn pcSsmVal(arr: mlx.mlx_array, idx: usize, s: mlx.mlx_stream) f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    _ = mlx.mlx_astype(&f, arr, .float32, s);
+    _ = mlx.mlx_array_eval(f);
+    return mlx.mlx_array_data_float32(f).?[idx];
+}
+
+fn pcBuildHybrid(s: mlx.mlx_stream, conv_base: f64, ssm_base: f64) [3]SSMCacheEntry {
+    return .{
+        .{ .conv_state = pcArange(s, &conv_shape_pc, conv_base), .ssm_state = pcArange(s, &ssm_shape_pc, ssm_base), .initialized = true },
+        .{ .conv_state = pcArange(s, &conv_shape_pc, conv_base + 10_000), .ssm_state = mlx.mlx_array_new(), .initialized = true },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+}
+
+fn pcFreeHybrid(e: *[3]SSMCacheEntry) void {
+    for (e) |*x| {
+        _ = mlx.mlx_array_free(x.conv_state);
+        _ = mlx.mlx_array_free(x.ssm_state);
+    }
+}
+
+fn pcEmptySsm() [3]SSMCacheEntry {
+    return .{
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+        .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false },
+    };
+}
+
+test "HotPrefixCache: hybrid SSM state restores from the SSD tier across a restart" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    // Session 1: hybrid commit (KV + two SSM checkpoints) through the RAM
+    // path, then the post-markFinished flush the scheduler makes.
+    {
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb", 0, 128);
+        defer hc.deinit();
+
+        var cache = try KVCache.init(testing.allocator, 3);
+        defer cache.deinit();
+        try testFillCache(&cache, s, 3, 600);
+
+        var src256 = pcBuildHybrid(s, 100.0, 500.0);
+        defer pcFreeHybrid(&src256);
+        var src512 = pcBuildHybrid(s, 300.0, 700.0);
+        defer pcFreeHybrid(&src512);
+        const cps = try testing.allocator.alloc(SSMCheckpoint, 2);
+        cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src256, 256, s);
+        cps[1] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+        // commitWithSsm takes ownership of `cps`.
+        try hc.commitWithSsm(&cache, &tokens, false, cps);
+        try testing.expect(hc.disk_dirty);
+        hc.flushPendingDisk(s);
+        try testing.expect(!hc.disk_dirty);
+        try testing.expectEqual(@as(usize, 1), hc.disk.?.entryCount());
+    }
+
+    // Session 2 ("restart"): fresh RAM cache + fresh tier over the same root.
+    // A hybrid lookup must restore BOTH KV and SSM state from disk at the
+    // highest checkpoint ≤ the match.
+    {
+        var hc2 = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+        hc2.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hyb", 0, 128);
+        defer hc2.deinit();
+        try testing.expectEqual(@as(usize, 0), hc2.entryCount());
+        try testing.expectEqual(@as(usize, 1), hc2.disk.?.entryCount());
+
+        var cache2 = try KVCache.init(testing.allocator, 3);
+        defer cache2.deinit();
+        var ssm2 = pcEmptySsm();
+        defer pcFreeHybrid(&ssm2);
+        var moe_off: usize = 0;
+        const res = try hc2.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false);
+        // Highest checkpoint ≤ 600 is 512 — never a full match on hybrid.
+        try testing.expect(!res.full_match);
+        try testing.expectEqual(@as(usize, 512), res.matched);
+        try testing.expectEqual(@as(usize, 512), cache2.step);
+        try testing.expectEqual(@as(usize, 512), moe_off);
+        // SSM state at pos 512 installed (conv base 300 / ssm base 700).
+        try testing.expect(ssm2[0].initialized);
+        try testing.expectEqual(@as(f32, 300.0), pcSsmVal(ssm2[0].conv_state, 0, s));
+        try testing.expectEqual(@as(f32, 700.0), pcSsmVal(ssm2[0].ssm_state, 0, s));
+        try testing.expect(ssm2[1].ssm_state.ctx == null);
+        try testing.expect(!ssm2[2].initialized);
+
+        // Diverged tail: shares the first 400 tokens → clamps to the largest
+        // checkpoint ≤ 400, which is 256.
+        var tokens_div: [700]u32 = undefined;
+        for (&tokens_div, 0..) |*t, i| t.* = if (i < 400) tokens[i] else @intCast(i + 500_000);
+        var cache3 = try KVCache.init(testing.allocator, 3);
+        defer cache3.deinit();
+        var ssm3 = pcEmptySsm();
+        defer pcFreeHybrid(&ssm3);
+        var moe_off3: usize = 0;
+        const res3 = try hc2.lookupAndRestore(&cache3, &moe_off3, &ssm3, s, &tokens_div, false);
+        try testing.expect(!res3.full_match);
+        try testing.expectEqual(@as(usize, 256), res3.matched);
+        try testing.expectEqual(@as(usize, 256), cache3.step);
+        try testing.expectEqual(@as(f32, 100.0), pcSsmVal(ssm3[0].conv_state, 0, s));
+        try testing.expectEqual(@as(f32, 500.0), pcSsmVal(ssm3[0].ssm_state, 0, s));
+    }
+}
+
+test "HotPrefixCache: hybrid RAM match at least as good as disk skips the SSD read" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &buf);
+    const base = buf[0..root_len];
+
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-hybskip", 0, 128);
+    defer hc.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try testFillCache(&cache, s, 3, 600);
+    var src512 = pcBuildHybrid(s, 300.0, 700.0);
+    defer pcFreeHybrid(&src512);
+    const cps = try testing.allocator.alloc(SSMCheckpoint, 1);
+    cps[0] = try transformer_mod.captureSsmCheckpoint(testing.allocator, &src512, 512, s);
+    try hc.commitWithSsm(&cache, &tokens, false, cps);
+    hc.flushPendingDisk(s);
+    const disk_uses_before = hc.disk.?.counter;
+
+    // Same prompt again: the RAM entry's checkpoint at 512 ties the disk's, so
+    // the disk advantage gate fails and the SSD read is skipped (counter
+    // unchanged) — the RAM path serves the restore.
+    var cache2 = try KVCache.init(testing.allocator, 3);
+    defer cache2.deinit();
+    var ssm2 = pcEmptySsm();
+    defer pcFreeHybrid(&ssm2);
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestore(&cache2, &moe_off, &ssm2, s, &tokens, false);
+    try testing.expectEqual(@as(usize, 512), res.matched);
+    try testing.expectEqual(disk_uses_before, hc.disk.?.counter);
+    // RAM restore installed the SSM state just the same.
+    try testing.expectEqual(@as(f32, 300.0), pcSsmVal(ssm2[0].conv_state, 0, s));
 }

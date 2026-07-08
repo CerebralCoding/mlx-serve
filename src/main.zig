@@ -20,6 +20,7 @@ const ds4_ffi = @import("ds4_ffi.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
 const log = @import("log.zig");
+const metrics_mod = @import("metrics.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 
@@ -128,6 +129,13 @@ fn printUsage(io: std.Io) void {
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
         \\                      Pass 0/off to disable the byte budget.
+        \\  --prefix-cache-disk <n>{{KB,MB,GB}}
+        \\                      SSD tier for the prefix cache (default: off).
+        \\                      Seen prefixes persist under ~/.mlx-serve/kv-cache
+        \\                        and are restored across restarts and RAM
+        \\                        evictions instead of recomputed. Can use many
+        \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
+        \\                        disables.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
@@ -169,6 +177,14 @@ fn printUsage(io: std.Io) void {
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
+        \\  --metrics           Enable Prometheus metrics at GET /metrics and a
+        \\                        live metrics panel on the index page (opt-in;
+        \\                        zero cost when off). Also GET /metrics.json.
+        \\  --api-key <token>   Require this key on every request (OpenAI/
+        \\                        Anthropic/Ollama APIs + index page + metrics).
+        \\                        Accepts Authorization: Bearer, x-api-key, HTTP
+        \\                        Basic (key = password), or ?api_key=. /health
+        \\                        stays open. Unset = no auth (default).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --version           Print version and exit
         \\  --help              Show this help
@@ -298,6 +314,7 @@ pub fn main(init: std.process.Init) !void {
     var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
+    var metrics_enabled = false;
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
@@ -374,6 +391,12 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             draft_block_size = try std.fmt.parseInt(u32, args[i], 10);
             draft_block_size_explicit = true;
+        } else if (std.mem.eql(u8, args[i], "--metrics")) {
+            metrics_enabled = true;
+        } else if (std.mem.eql(u8, args[i], "--api-key") and i + 1 < args.len) {
+            i += 1;
+            // Borrowed from argv (lives for the process). Empty ⇒ leave open.
+            if (args[i].len > 0) server_mod.g_api_key = args[i];
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
@@ -409,6 +432,16 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             server_mod.prefix_cache_mem_bytes = parseSizeArg(args[i]) catch {
                 log.err("--prefix-cache-mem: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--prefix-cache-disk") and i + 1 < args.len) {
+            // SSD tier for the hot prefix cache: previously-seen prefixes are
+            // persisted as chunked safetensors and restored across restarts
+            // and RAM evictions instead of recomputed. Byte budget with the
+            // same size grammar as --prefix-cache-mem; `0`/`off` disables.
+            i += 1;
+            server_mod.prefix_cache_disk_bytes = parseSizeArg(args[i]) catch {
+                log.err("--prefix-cache-disk: expected '<n>{{MB,GB,KB}}' or '0'/'off'; got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--tokenize-cache-entries") and i + 1 < args.len) {
@@ -598,6 +631,19 @@ pub fn main(init: std.process.Init) !void {
         };
         if (t) |thread| thread.detach();
     }
+
+    // Observability: allocate the metrics core once (when --metrics is on) and
+    // publish it via the server-global `g_metrics`. Declared here — above every
+    // serve-dispatch path (GGUF/ds4/llama, headless, media, and the primary MLX
+    // path) — so `server_mod.serve()` spawns the gauge sampler + routes /metrics
+    // regardless of engine, and each LoadParams builder reads it back into the
+    // scheduler's per-request sink via `.metrics = server_mod.g_metrics`. The
+    // instance lives on this stack frame for the whole process lifetime; the
+    // defer clears the global so an early serve() failure can't leave it
+    // dangling. Off (the default) → null: a single per-request branch, no cost.
+    var metrics_instance: ?metrics_mod.Metrics = if (metrics_enabled) metrics_mod.Metrics.init() else null;
+    if (metrics_instance) |*m| server_mod.g_metrics = m;
+    defer server_mod.g_metrics = null;
 
     // ── GGUF early-branch: route to an embedded engine ──
     //
@@ -902,12 +948,14 @@ pub fn main(init: std.process.Init) !void {
             .kv_quant_config = kv_quant_config,
             .prefix_cache_capacity = server_mod.prefix_cache_capacity,
             .prefix_cache_mem_bytes = server_mod.prefix_cache_mem_bytes,
+            .prefix_cache_disk_bytes = server_mod.prefix_cache_disk_bytes,
             .ssm_checkpoint_stride = server_mod.ssm_checkpoint_stride,
             .ssm_checkpoint_max = server_mod.ssm_checkpoint_max,
             .tokenize_cache_entries = server_mod.tokenize_cache_entries,
             .llama_cache_entries = server_mod.llama_cache_entries,
             .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
             .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
+            .metrics = server_mod.g_metrics,
         };
         try server_mod.serve(io, allocator, params, config, host, port, .{
             .max_context_size = ctx_size,
@@ -1295,6 +1343,7 @@ fn runGenServe(
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = 0,
+        .metrics = server_mod.g_metrics,
     };
 
     try server_mod.serve(io, allocator, params, stub.config, host, port, .{
@@ -1398,6 +1447,7 @@ fn runHeadlessServe(
         .prefix_cache_capacity = 0,
         .prefix_cache_mem_bytes = 0,
         .tokenize_cache_entries = 0,
+        .metrics = server_mod.g_metrics,
     };
 
     try server_mod.serve(io, allocator, params, stub.config, host, port, .{
@@ -1599,6 +1649,7 @@ fn runDs4Serve(
         .tokenize_cache_entries = server_mod.tokenize_cache_entries,
         .ds4_path = gguf_path_owned,
         .ds4_ssd_streaming = ds4_ssd_streaming,
+        .metrics = server_mod.g_metrics,
     };
 
     try server_mod.serve(io, allocator, params, config_storage, host, port, .{
@@ -1867,6 +1918,7 @@ fn runLlamaServe(
         .llama_kv_type_k = server_mod.llama_kv_quant.ggmlType(),
         .llama_kv_type_v = server_mod.llama_kv_quant.ggmlType(),
         .llama_path = gguf_path_owned,
+        .metrics = server_mod.g_metrics,
     };
 
     try server_mod.serve(io, allocator, params, config_storage, host, port, .{

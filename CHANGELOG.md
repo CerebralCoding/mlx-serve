@@ -1,8 +1,13 @@
 # Changelog
 
-## v26.7.3 — Edit with reference images
+## v26.7.3 — Edit with reference images, metrics, auth, and restart-survivable chats
 
-- **Multi-reference image editing**: instruction edits on FLUX.2 Klein can now see extra reference pictures. Add up to 3 reference images beside the source in the Image pane's edit mode and refer to them by number — "replace the face of the man in image 1 with the face from image 2" — for face swaps, product placement, and style transplants that a text-only edit can't do. API users: `ref_images` (base64 array) beside `image` with `mode:"edit"` on `/v1/images/generations`.
+- **Multi-reference image editing**: instruction edits on FLUX.2 Klein can now see extra reference pictures. Add up to 3 reference images beside the source in the Image pane's edit mode and refer to them by number — "replace the face of the man in image 1 with the face from image 2" — . API users: `ref_images` (base64 array) beside `image` with `mode:"edit"` on `/v1/images/generations`.
+- **Long conversations survive server restarts — no more re-reading from scratch.** The prefix cache gains an SSD tier: long prompts the server has already processed are persisted to disk in chunks and restored instead of recomputed, across model switches, app relaunches, and reboots. Re-opening a long chat that used to sit through a 40-second re-read of the whole history now answers in under 3 seconds.
+- **Fixed: some models froze for 10+ seconds before answering long prompts.** Tokenizers that ship thousands of special tokens hit a quadratic scan on every uncached prompt — ~12 seconds of pure CPU before the GPU even started on a 30 KB prompt, and again on every follow-up turn.
+- **Switching models no longer silently degrades the response cache.** Models loaded on demand (model switches, `/v1/load-model`) used to get a minimal single-slot prefix cache regardless of your settings; they now inherit the full configured cache — including warm multi-turn reuse on Qwen 3.5/3.6-class hybrid models.
+- **Watch your server live, right on its homepage.** Start with `--metrics` (or flip *Metrics panel* on in Settings) and the server's index page grows a real-time dashboard: decode and prefill tokens/sec with hover-readable sparklines, requests in flight, time-to-first-token, prefix-cache hit rate, GPU utilization and memory — updating as you generate. The same figures are exported at a standard Prometheus `/metrics` endpoint under vLLM-compatible names, so existing Grafana dashboards work with zero configuration. Fully opt-in, with no measurable effect on tokens/sec.
+- **Optional API key for network deployments.** Exposing the server on your network? Set `--api-key <key>` (or the field in Settings) and every request from another machine — the OpenAI, Anthropic, and Ollama APIs plus the metrics page — must present it (Authorization Bearer, `x-api-key`, HTTP Basic, or `?api_key=`). Your own Mac stays trusted and key-free, so the app and local tools are unaffected; the key guards only what's reachable off the box.
 
 ---
 

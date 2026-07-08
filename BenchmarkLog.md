@@ -637,3 +637,43 @@ falls back to the dense path, res 384 takes the hierarchical path; steps 8, seed
 Mesh is byte-identical (hermetic guards: hierarchical == dense on analytic SDFs;
 live: 72,128 verts at res 128, exactly the P1 dense-run count; oracle 5 unchanged
 at cos 0.999896). Default pane resolution raised 256 → 384 on the back of this.
+
+## 2026-07-07 — SSD prefix-cache persistence + quadratic-tokenize fix (M4 Max 128GB)
+
+Custom TTFT battery (docs/perf-csvs/ttft-ssd-kv-cache-{baseline-20260706,final-20260707}.csv):
+~11.2K-token deterministic prompt, temp 0, --no-pld, cells = cold / warm (identical
+re-issue) / extend (multi-turn tail) / restart (server killed + rebooted, identical
+request). Raw prefill/decode tok/s unchanged across the board (no hot-path regression).
+
+| model | restart TTFT before → after | extend TTFT before → after |
+|---|---|---|
+| gemma4-e4b-4bit          | 5.9s → 0.66s (9×)   | 109ms → 91ms |
+| gemma3-12b-4bit          | 40.6s → 2.7s (15×)  | 12.5s → 325ms (38×) |
+| gemma4-12b-4bit          | 30.8s → 16.5s (1.9×)| 317ms → 690ms |
+| gemma4-26B-A4B-moe-4bit  | 10.5s → 2.3s (4.6×) | 190ms → 555ms |
+| qwen35-0.8b (hybrid)     | 0.40s → 0.06s (6.5×, ~2.5K prompt) | 80→87ms |
+| qwen36-27b (hybrid)      | 47.8s → 0.55s (87×) | ~1.4s |
+
+Phase 3 (this session) extended the SSD tier to hybrid recurrent archs (Qwen 3.5/3.6
+GatedDeltaNet, lfm2, nemotron_h). The two hybrid rows above were "unchanged" before —
+their per-position SSM/conv state couldn't be persisted, so every restart cold-re-read.
+Now the RAM tier's `SSMCheckpoint`s persist beside the KV chunks (immutable
+`s{pos}.safetensors`, `SSM_DISK_MAX_PER_ENTRY=8`); a restart restores KV + SSM state at
+the highest checkpoint ≤ the token match. qwen36-27b's ~48s cold re-read of an 11K-token
+context now returns in 0.55s (restore `ssm@10830` in 30ms), output byte-identical at
+temp 0. The 27B entry is ~1.2 GB on disk (3 KV chunks + 5 SSM checkpoints) and fully
+converges within a few turns under the 512 MB/turn flush cap.
+
+Notes:
+- Restart wins come from the SSD tier (src/kv_disk_cache.zig) restoring persisted
+  KV chunks (and, on hybrid archs, SSM checkpoints) instead of re-prefilling; outputs
+  byte-identical (guard: tests/test_prefix_cache_disk.sh, incl. a hybrid section).
+- gemma-3's 38× extend win is the O(specials × text) tokenize-scan fix
+  (6,415 special tokens; render+tokenize 11.4s → 3.3ms on a 32KB prompt).
+- gemma4-12b restart is partial: its dense-bf16 KV is ~385MB/1024-token chunk, and
+  the 512MB/turn flush cap had only persisted ~6K of 11K tokens by kill time —
+  converges over more turns. kv-quant entries are 4–14× smaller on disk.
+- warm/extend cells on disk-enabled models carry +200–450ms when a request lands
+  DURING the previous turn's post-response flush (byte-capped, bounded); invisible
+  with real think-time between turns.
+- Baseline CSV's gemma3 cold/extend also include the tokenize bug (fixed same day).

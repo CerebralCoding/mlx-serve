@@ -456,6 +456,35 @@ private struct ServerSectionContent: View {
                     .toggleStyle(.switch)
             }
         }
+        if let m = meta["enableMetrics"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.enableMetrics)
+            ) {
+                Toggle("", isOn: $appState.serverOptions.enableMetrics)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
+        if let m = meta["apiKey"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.apiKey)
+            ) {
+                SecureField(
+                    "",
+                    text: Binding(
+                        get: { appState.serverOptions.apiKey },
+                        set: { appState.serverOptions.apiKey = $0.trimmingCharacters(in: .whitespaces) }
+                    ),
+                    prompt: Text("none")
+                )
+                .textFieldStyle(.roundedBorder)
+                .frame(width: 180)
+            }
+        }
         if let m = meta["logLevel"] {
             SettingsRow(
                 title: m.title,
@@ -798,6 +827,28 @@ private struct PerformanceSectionContent: View {
                 isDirty: dirty.dirty(\.prefixCacheMem)
             ) {
                 TextField("", text: opts.prefixCacheMem, prompt: Text("2GB"))
+                    .textFieldStyle(.roundedBorder)
+                    .frame(width: 110)
+            }
+        }
+        if let m = meta["enablePrefixCacheDisk"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.enablePrefixCacheDisk)
+            ) {
+                Toggle("", isOn: opts.enablePrefixCacheDisk)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
+        if let m = meta["prefixCacheDisk"], appState.serverOptions.enablePrefixCacheDisk {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.prefixCacheDisk)
+            ) {
+                TextField("", text: opts.prefixCacheDisk, prompt: Text("10GB"))
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 110)
             }
