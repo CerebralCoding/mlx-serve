@@ -1,0 +1,111 @@
+<!doctype html>
+<html lang=en>
+<head>
+<meta charset=utf-8>
+<meta name=viewport content="width=device-width,initial-scale=1">
+<title>mlx-serve — {s}</title>
+<style>
+*{{box-sizing:border-box}}
+body{{margin:0;font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"SF Pro Text",Inter,sans-serif;background:#0b0d10;color:#e6e9ee}}
+.wrap{{max-width:880px;margin:0 auto;padding:32px 20px 64px}}
+h1{{margin:0 0 4px;font-size:22px;font-weight:600;letter-spacing:-.01em}}
+h1 .ver{{color:#7d8794;font-weight:400;font-size:14px;margin-left:8px}}
+.sub{{color:#7d8794;margin-bottom:28px}}
+.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;margin-right:6px;vertical-align:middle;box-shadow:0 0 0 4px rgba(16,185,129,.15)}}
+h2{{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#9aa4b2;margin:24px 0 10px}}
+.card{{background:#13161b;border:1px solid #1f242c;border-radius:10px;padding:14px 16px;margin-bottom:10px}}
+.row{{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid #1a1e25}}
+.row:last-child{{border-bottom:0}}
+.row .k{{color:#9aa4b2}}
+.row .v{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee}}
+.caps{{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}}
+.cap{{background:#1a2330;color:#86b8ff;border:1px solid #1f3a5f;border-radius:999px;padding:2px 10px;font-size:12px}}
+.ep{{display:grid;grid-template-columns:60px 1fr;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid #1a1e25}}
+.ep:last-child{{border-bottom:0}}
+.ep .m{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;letter-spacing:.04em;text-align:center;border-radius:4px;padding:2px 0}}
+.m.get{{background:#173d33;color:#7ee2b8}}
+.m.post{{background:#1c2e57;color:#86b8ff}}
+.m.del{{background:#3d1d23;color:#ff95a8}}
+.m.ws{{background:#3a2a4d;color:#caa6ff}}
+.ep .p{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee}}
+.ep .d{{color:#7d8794;font-size:13px;margin-top:2px}}
+code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#1a1e25;color:#86b8ff;padding:1px 6px;border-radius:4px;font-size:12px}}
+pre{{background:#13161b;border:1px solid #1f242c;border-radius:8px;padding:12px;overflow-x:auto;font-size:12px;color:#cfd6df}}
+a{{color:#86b8ff;text-decoration:none}}
+a:hover{{text-decoration:underline}}
+footer{{margin-top:36px;color:#5b6470;font-size:12px;text-align:center}}
+</style></head><body>
+<div class=wrap>
+<h1><span class=dot></span>mlx-serve<span class=ver>v{s}</span></h1>
+<div class=sub>Native MLX inference for Apple Silicon</div>
+
+<h2>Loaded model</h2>
+<div class=card>
+<div class=row><span class=k>id</span><span class=v>{s}</span></div>
+<div class=row><span class=k>architecture</span><span class=v>{s}</span></div>
+<div class=row><span class=k>quantization</span><span class=v>{d}-bit (group {d})</span></div>
+<div class=row><span class=k>layers · hidden · heads</span><span class=v>{d} · {d} · {d}/{d}kv</span></div>
+<div class=row><span class=k>head dim · vocab</span><span class=v>{d} · {d}</span></div>
+<div class=row><span class=k>context length</span><span class=v>{d} tokens (model max {d})</span></div>
+<div class=row><span class=k>GPU memory</span><span class=v>{d} MB active · {d} MB peak</span></div>
+<div class=caps>{s}</div>
+</div>
+{s}
+<h2>OpenAI Chat Completions</h2>
+<div class=card>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/chat/completions</div><div class=d>Streaming and non-streaming · tool calling · JSON mode · vision (when supported)</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/completions</div><div class=d>Legacy text completions</div></div></div>
+</div>
+
+<h2>OpenAI Responses</h2>
+<div class=card>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/responses</div><div class=d>Stateful responses with tool calling · stream/non-stream · vision</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/responses/compact</div><div class=d>Compact a conversation into a round-trippable opaque blob</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p>/v1/responses/&#123;id&#125;</div><div class=d>Retrieve a stored response envelope</div></div></div>
+<div class=ep><span class="m del">DEL</span><div><div class=p>/v1/responses/&#123;id&#125;</div><div class=d>Delete a stored response</div></div></div>
+<div class=ep><span class="m ws">WS</span><div><div class=p>/v1/responses</div><div class=d>WebSocket transport · per-connection store-false cache · sequential turns</div></div></div>
+</div>
+
+<h2>Anthropic Messages</h2>
+<div class=card>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/messages</div><div class=d>Claude SDK / Claude Code compatible · stream &amp; non-stream · tool use · thinking blocks</div></div></div>
+</div>
+
+<h2>Embeddings &amp; utilities</h2>
+<div class=card>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/embeddings</div><div class=d>Vector embeddings (encoder-only models)</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/tokenize</div><div class=d>Tokenize a string</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/detokenize</div><div class=d>Detokenize an id sequence</div></div></div>
+</div>
+
+<h2>Media generation</h2>
+<div class=card>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/images/generations</div><div class=d>FLUX.2 &amp; Krea text-to-image · img2img + instruction edit · runtime LoRA · base64 PNG</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/audio/speech</div><div class=d>Qwen3-TTS text-to-speech + zero-shot voice cloning · WAV</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/audio/music-generations</div><div class=d>ACE-Step text-to-music · 48 kHz stereo WAV</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/video/generations</div><div class=d>LTX-Video · text / image / audio → video with synced sound · MP4</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/3d/generations</div><div class=d>Hunyuan3D-2.1 · one photo → GLB mesh · optional PBR texturing</div></div></div>
+</div>
+
+<h2>Model management</h2>
+<div class=card>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/load-model</div><div class=d>Load a discovered model, or register + load one by absolute path</div></div></div>
+<div class=ep><span class="m post">POST</span><div><div class=p>/v1/unload-model</div><div class=d>Free a model's memory now</div></div></div>
+</div>
+
+<h2>Discovery</h2>
+<div class=card>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/v1/models>/v1/models</a></div><div class=d>OpenAI models list (id, capabilities, context length)</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/props>/props</a></div><div class=d>llama.cpp-style server props (chat template, memory)</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/health>/health</a></div><div class=d>Liveness probe</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/metrics>/metrics</a></div><div class=d>Prometheus metrics, text exposition format (enable with <code>--metrics</code>)</div></div></div>
+<div class=ep><span class="m get">GET</span><div><div class=p><a href=/metrics.json>/metrics.json</a></div><div class=d>Metrics as JSON — drives the live panel above (enable with <code>--metrics</code>)</div></div></div>
+</div>
+
+<h2>Quick start</h2>
+<pre>curl http://localhost:{d}/v1/chat/completions \
+  -H 'Content-Type: application/json' \
+  -d '&#123;"model":"{s}","messages":[&#123;"role":"user","content":"hello"&#125;]&#125;'</pre>
+
+<footer>mlx-serve · serving <code>{s}</code></footer>
+</div></body></html>

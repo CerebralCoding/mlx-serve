@@ -377,12 +377,31 @@ struct StatusMenuView: View {
                 .padding(.horizontal, 16)
                 .padding(.vertical, 10)
 
+                // Live metrics panel — only shown when the server was launched
+                // with --metrics (opt-in; see ServerOptions.enableMetrics). The
+                // panel is hosted on the index page now, so this opens root `/`.
+                if appState.serverOptions.enableMetrics {
+                    Divider().padding(.horizontal, 12)
+                    Button {
+                        if let root = EndpointsSection.rootURL(server.baseURL) {
+                            NSWorkspace.shared.open(root)
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chart.bar.xaxis")
+                            Text("Open Metrics Panel")
+                        }
+                    }
+                    .buttonStyle(.plain)
+                    .padding(.horizontal, 16)
+                    .padding(.vertical, 6)
+                }
+
                 // Endpoints
                 Divider().padding(.horizontal, 12)
                 EndpointsSection(baseURL: server.baseURL)
                     .padding(.horizontal, 16)
                     .padding(.vertical, 10)
-
             }
 
             Divider().padding(.horizontal, 12)

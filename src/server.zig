@@ -24,6 +24,7 @@ const media_mod = @import("gen.zig");
 const stb = @cImport({ @cInclude("stb_image.h"); });
 const webp = @cImport({ @cInclude("webp/decode.h"); });
 const metrics = @import("status.zig");
+const instr = @import("metrics.zig");
 
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
@@ -39,6 +40,20 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 /// detached conn thread still in `Scheduler.complete` would otherwise race
 /// deinit's teardown of the slot queues into a use-after-free (SIGSEGV).
 var active_conn_threads = std.atomic.Value(u32).init(0);
+/// Set from main.zig before serve() is called when --metrics is on; null
+/// otherwise. Gates the gauge-sampler thread and the /metrics + /metrics.json
+/// routes. When null, `/metrics*` return 503 and the index page shows no panel.
+pub var g_metrics: ?*instr.Metrics = null;
+/// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
+/// (i.e. from another machine over the network) except the `/health` probe and
+/// CORS preflight requires the key — the OpenAI/Anthropic/Ollama APIs AND the
+/// index page + metrics panel/feed. Loopback (127.0.0.0/8, ::1) is TRUSTED and
+/// exempt, so the local app + a local browser keep working with no credentials;
+/// the key protects the surface that actually matters — network exposure
+/// (`--host 0.0.0.0`). Accepted as `Authorization: Bearer <key>`, `x-api-key:
+/// <key>` (Anthropic), HTTP Basic (browser pages — the key is the password), or
+/// an `?api_key=` / `?key=` query param. null ⇒ fully open (default, unchanged).
+pub var g_api_key: ?[]const u8 = null;
 
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
@@ -420,13 +435,17 @@ pub var prefix_cache_capacity: u32 = 32;
 /// from `--prefix-cache-entries` still applies).
 pub var prefix_cache_mem_bytes: u64 = 2 * 1024 * 1024 * 1024;
 
-/// SSD tier for the hot prefix cache (`--prefix-cache-disk`, default 10 GB;
-/// `0`/`off` disables). Committed KV prefixes persist as chunked safetensors
-/// under `~/.mlx-serve/kv-cache/<model-fingerprint>` and are restored across
-/// RAM evictions AND server restarts instead of recomputed — a cold 30-50 s
+/// SSD tier for the hot prefix cache (`--prefix-cache-disk`). Committed KV
+/// prefixes persist as chunked safetensors under
+/// `~/.mlx-serve/kv-cache/<model-fingerprint>` and are restored across RAM
+/// evictions AND server restarts instead of recomputed — a cold 30-50 s
 /// long-context TTFT becomes a bounded SSD read. LRU-evicted to this byte
 /// budget. v1 covers pure-attention archs; hybrid SSM state stays RAM-only.
-pub var prefix_cache_disk_bytes: u64 = 10 * 1024 * 1024 * 1024;
+///
+/// DEFAULT OFF (`0`): the tier can hold gigabytes of KV on disk, so it's opt-in
+/// — pass `--prefix-cache-disk <n>{KB,MB,GB}` to enable (10 GB is a sensible
+/// value). The Swift app exposes this as a Settings toggle, default off.
+pub var prefix_cache_disk_bytes: u64 = 0;
 
 /// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
 /// in tokens. Non-zero values enable multi-turn warm reuse on hybrid SSM
@@ -663,6 +682,31 @@ pub fn serve(
     defer scheduler.deinit();
     global_scheduler = scheduler;
     defer global_scheduler = null;
+
+    // Gauge sampler: samples instantaneous system + queue state every 2 s and
+    // writes the metrics gauges. Only runs when --metrics is on. Trivial cost
+    // (a few non-blocking syscalls + one brief queue_mu lock per 2 s); never on
+    // the per-token decode path.
+    // LIFO defer ordering: `stop` is registered AFTER `join` so it runs FIRST
+    // (setting the flag), letting the thread exit before join() blocks. Do NOT
+    // gate on scheduler.shutdown here — deinit() (which sets that flag) is the
+    // earliest defer and runs LAST, after the join, so the loop would never see
+    // it; the dedicated `sampler_stop` flag avoids that LIFO deadlock.
+    var sampler_thread: ?std.Thread = null;
+    var sampler_stop = std.atomic.Value(bool).init(false);
+    if (g_metrics) |m| {
+        const ctx = GaugeSamplerCtx{
+            .metrics = m,
+            .scheduler = scheduler,
+            .stop = &sampler_stop,
+        };
+        sampler_thread = try std.Thread.spawn(.{}, gaugeSamplerLoop, .{ctx});
+        log.info("Prometheus metrics: ENABLED — GET http://{s}:{d}/metrics (live panel at GET /)\n", .{ host, port });
+    }
+    // LIFO: join deferred first → runs second. stop deferred second → runs first.
+    defer if (sampler_thread) |t| t.join();
+    defer sampler_stop.store(true, .monotonic);
+
     global_registry = scheduler.registry;
     defer global_registry = null;
 
@@ -766,6 +810,9 @@ pub fn serve(
         log.info("Drafter speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
+    if (g_api_key != null) {
+        log.info("API key auth: ENABLED for non-loopback requests (localhost is trusted; /health stays open)\n", .{});
+    }
     log.info("  GET  /\n", .{});
     log.info("  GET  /health\n", .{});
     log.info("  GET  /props\n", .{});
@@ -984,6 +1031,26 @@ fn handleConnection(
     const request_body = if (total_read > header_end_pos) request[header_end_pos..total_read] else "";
     logHttpRequest(method, raw_path, request_body);
 
+    // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
+    //    requires the key (the OpenAI/Anthropic/Ollama APIs AND the index page
+    //    + metrics panel/feed) — EXCEPT `/health` and CORS preflight, which
+    //    load balancers and browsers must reach unauthenticated. Loopback is
+    //    trusted (the local app connects via 127.0.0.1), so it's exempt: the app
+    //    + a local browser never need credentials, and the key protects network
+    //    exposure. Browser-facing pages get a `WWW-Authenticate: Basic`
+    //    challenge so the index + metrics panel prompt for the key; API clients
+    //    pass Bearer / x-api-key. null key ⇒ fully open. See `apiKeyAuthorized`.
+    if (g_api_key != null and
+        !peerIsLoopback(stream) and
+        !std.mem.eql(u8, method, "OPTIONS") and
+        !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) and
+        !apiKeyAuthorized(request[0..header_end_pos], raw_path))
+    {
+        log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
+        try sendUnauthorized(stream);
+        return;
+    }
+
     // ── Plan 05: routes that don't depend on a loaded model (connectivity
     //    probes + CORS preflight + listing endpoints). Handle these BEFORE
     //    `scheduler.ensureLoaded` so they don't trigger a cold load of the
@@ -998,6 +1065,35 @@ fn handleConnection(
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        return;
+    }
+    // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
+    // API-key gate above when --api-key is set (auth already enforced here).
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
+        if (g_metrics) |m| {
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            try instr.renderPrometheus(m, &out.writer);
+            // Quiet: don't dump the ~3 KB scrape body every 2 s at debug level.
+            try sendResponseQuiet(stream, "200 OK", "text/plain; version=0.0.4; charset=utf-8", out.written());
+        } else {
+            try sendResponse(stream, "503 Service Unavailable", "text/plain", "metrics not enabled (start with --metrics)");
+        }
+        return;
+    }
+    // JSON feed — drives the live metrics panel on the index page. Behind the
+    // global API-key gate above when --api-key is set (same-origin browser
+    // fetch inherits the page's Basic credentials).
+    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics.json")) {
+        if (g_metrics) |m| {
+            var out: std.Io.Writer.Allocating = .init(allocator);
+            defer out.deinit();
+            try instr.renderJson(m, &out.writer);
+            // Quiet: the index panel polls this ~1 Hz — don't log the body.
+            try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
+        } else {
+            try sendResponse(stream, "503 Service Unavailable", "application/json", "{\"error\":\"metrics not enabled — start with --metrics\"}");
+        }
         return;
     }
     if (std.mem.eql(u8, method, "OPTIONS")) {
@@ -2690,102 +2786,22 @@ fn handleStatusPage(
     const mem_mb: usize = active_mem / (1024 * 1024);
     const peak_mb: usize = peak_mem / (1024 * 1024);
 
-    const body = try std.fmt.allocPrint(allocator,
-        \\<!doctype html>
-        \\<html lang=en>
-        \\<head>
-        \\<meta charset=utf-8>
-        \\<meta name=viewport content="width=device-width,initial-scale=1">
-        \\<title>mlx-serve — {s}</title>
-        \\<style>
-        \\*{{box-sizing:border-box}}
-        \\body{{margin:0;font:14px/1.5 ui-sans-serif,system-ui,-apple-system,"SF Pro Text",Inter,sans-serif;background:#0b0d10;color:#e6e9ee}}
-        \\.wrap{{max-width:880px;margin:0 auto;padding:32px 20px 64px}}
-        \\h1{{margin:0 0 4px;font-size:22px;font-weight:600;letter-spacing:-.01em}}
-        \\h1 .ver{{color:#7d8794;font-weight:400;font-size:14px;margin-left:8px}}
-        \\.sub{{color:#7d8794;margin-bottom:28px}}
-        \\.dot{{display:inline-block;width:8px;height:8px;border-radius:50%;background:#10b981;margin-right:6px;vertical-align:middle;box-shadow:0 0 0 4px rgba(16,185,129,.15)}}
-        \\h2{{font-size:12px;font-weight:600;letter-spacing:.08em;text-transform:uppercase;color:#9aa4b2;margin:24px 0 10px}}
-        \\.card{{background:#13161b;border:1px solid #1f242c;border-radius:10px;padding:14px 16px;margin-bottom:10px}}
-        \\.row{{display:flex;justify-content:space-between;gap:12px;padding:6px 0;border-bottom:1px solid #1a1e25}}
-        \\.row:last-child{{border-bottom:0}}
-        \\.row .k{{color:#9aa4b2}}
-        \\.row .v{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee}}
-        \\.caps{{display:flex;flex-wrap:wrap;gap:6px;margin-top:6px}}
-        \\.cap{{background:#1a2330;color:#86b8ff;border:1px solid #1f3a5f;border-radius:999px;padding:2px 10px;font-size:12px}}
-        \\.ep{{display:grid;grid-template-columns:60px 1fr;gap:12px;align-items:center;padding:8px 0;border-bottom:1px solid #1a1e25}}
-        \\.ep:last-child{{border-bottom:0}}
-        \\.ep .m{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:11px;font-weight:600;letter-spacing:.04em;text-align:center;border-radius:4px;padding:2px 0}}
-        \\.m.get{{background:#173d33;color:#7ee2b8}}
-        \\.m.post{{background:#1c2e57;color:#86b8ff}}
-        \\.m.del{{background:#3d1d23;color:#ff95a8}}
-        \\.m.ws{{background:#3a2a4d;color:#caa6ff}}
-        \\.ep .p{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee}}
-        \\.ep .d{{color:#7d8794;font-size:13px;margin-top:2px}}
-        \\code{{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;background:#1a1e25;color:#86b8ff;padding:1px 6px;border-radius:4px;font-size:12px}}
-        \\pre{{background:#13161b;border:1px solid #1f242c;border-radius:8px;padding:12px;overflow-x:auto;font-size:12px;color:#cfd6df}}
-        \\a{{color:#86b8ff;text-decoration:none}}
-        \\a:hover{{text-decoration:underline}}
-        \\footer{{margin-top:36px;color:#5b6470;font-size:12px;text-align:center}}
-        \\</style></head><body>
-        \\<div class=wrap>
-        \\<h1><span class=dot></span>mlx-serve<span class=ver>v{s}</span></h1>
-        \\<div class=sub>Native MLX inference for Apple Silicon · No Python · OpenAI &amp; Anthropic compatible</div>
-        \\
-        \\<h2>Loaded model</h2>
-        \\<div class=card>
-        \\<div class=row><span class=k>id</span><span class=v>{s}</span></div>
-        \\<div class=row><span class=k>architecture</span><span class=v>{s}</span></div>
-        \\<div class=row><span class=k>quantization</span><span class=v>{d}-bit (group {d})</span></div>
-        \\<div class=row><span class=k>layers · hidden · heads</span><span class=v>{d} · {d} · {d}/{d}kv</span></div>
-        \\<div class=row><span class=k>head dim · vocab</span><span class=v>{d} · {d}</span></div>
-        \\<div class=row><span class=k>context length</span><span class=v>{d} tokens (model max {d})</span></div>
-        \\<div class=row><span class=k>GPU memory</span><span class=v>{d} MB active · {d} MB peak</span></div>
-        \\<div class=caps>{s}</div>
-        \\</div>
-        \\
-        \\<h2>OpenAI Chat Completions</h2>
-        \\<div class=card>
-        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/chat/completions</div><div class=d>Streaming and non-streaming · tool calling · JSON mode · vision (when supported)</div></div></div>
-        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/completions</div><div class=d>Legacy text completions</div></div></div>
-        \\</div>
-        \\
-        \\<h2>OpenAI Responses</h2>
-        \\<div class=card>
-        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/responses</div><div class=d>Stateful responses with tool calling · stream/non-stream · vision</div></div></div>
-        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/responses/compact</div><div class=d>Compact a conversation into a round-trippable opaque blob</div></div></div>
-        \\<div class=ep><span class="m get">GET</span><div><div class=p>/v1/responses/&#123;id&#125;</div><div class=d>Retrieve a stored response envelope</div></div></div>
-        \\<div class=ep><span class="m del">DEL</span><div><div class=p>/v1/responses/&#123;id&#125;</div><div class=d>Delete a stored response</div></div></div>
-        \\<div class=ep><span class="m ws">WS</span><div><div class=p>/v1/responses</div><div class=d>WebSocket transport · per-connection store-false cache · sequential turns</div></div></div>
-        \\</div>
-        \\
-        \\<h2>Anthropic Messages</h2>
-        \\<div class=card>
-        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/messages</div><div class=d>Claude SDK / Claude Code compatible · stream &amp; non-stream · tool use · thinking blocks</div></div></div>
-        \\</div>
-        \\
-        \\<h2>Embeddings &amp; utilities</h2>
-        \\<div class=card>
-        \\<div class=ep><span class="m post">POST</span><div><div class=p>/v1/embeddings</div><div class=d>Vector embeddings (encoder-only models)</div></div></div>
-        \\<div class=ep><span class="m post">POST</span><div><div class=p>/tokenize</div><div class=d>Tokenize a string</div></div></div>
-        \\<div class=ep><span class="m post">POST</span><div><div class=p>/detokenize</div><div class=d>Detokenize an id sequence</div></div></div>
-        \\</div>
-        \\
-        \\<h2>Discovery</h2>
-        \\<div class=card>
-        \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/v1/models>/v1/models</a></div><div class=d>OpenAI models list (id, capabilities, context length)</div></div></div>
-        \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/props>/props</a></div><div class=d>llama.cpp-style server props (chat template, memory)</div></div></div>
-        \\<div class=ep><span class="m get">GET</span><div><div class=p><a href=/health>/health</a></div><div class=d>Liveness probe</div></div></div>
-        \\</div>
-        \\
-        \\<h2>Quick start</h2>
-        \\<pre>curl http://localhost:{d}/v1/chat/completions \
-        \\  -H 'Content-Type: application/json' \
-        \\  -d '&#123;"model":"{s}","messages":[&#123;"role":"user","content":"hello"&#125;]&#125;'</pre>
-        \\
-        \\<footer>mlx-serve · serving <code>{s}</code></footer>
-        \\</div></body></html>
-    , .{
+    // Optional live-metrics panel: a mount div + the polling script (which also
+    // carries the panel markup and injects it into the mount). Rendered into the
+    // `{s}` slot right after the "Loaded model" card — but ONLY when --metrics is
+    // on. Off ⇒ empty string, so the page is byte-identical to before. This is a
+    // runtime `{s}` arg, so the JS may contain raw `{`/`}` — std.fmt does not
+    // re-parse it (which is exactly why the panel/JS can't live inline in the
+    // std.fmt-formatted index.html).
+    const METRICS_SECTION = "\n<div id=mlx-metrics></div>\n<script>\n" ++ @embedFile("html/metrics.js") ++ "\n</script>\n";
+    const metrics_section: []const u8 = if (g_metrics != null) METRICS_SECTION else "";
+
+    // The page template lives in src/html/index.html (@embedFile resolves
+    // relative to this source file, so no build.zig change). It is a std.fmt
+    // format string: `{{`/`}}` are literal braces in the <style> block; the
+    // `{s}`/`{d}` slots below fill in model fields, the metrics section, the
+    // curl port + model, and the footer — in this exact order.
+    const body = try std.fmt.allocPrint(allocator, @embedFile("html/index.html"), .{
         // <title>
         model_id_esc,
         // version
@@ -2806,6 +2822,8 @@ fn handleStatusPage(
         mem_mb,
         peak_mb,
         caps_buf.items,
+        // optional live-metrics panel (empty when --metrics is off)
+        metrics_section,
         // curl example
         global_port,
         model_id_esc,
@@ -5506,7 +5524,19 @@ fn sendSSEChunk(
 
 fn sendResponse(stream: *Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
     logHttpResponse(status, content_type, body);
+    try sendResponseFramed(stream, status, content_type, body);
+}
 
+/// Like `sendResponse` but does NOT dump the response body to the debug log —
+/// only a one-line status summary. For high-frequency, self-describing bodies
+/// where the full dump is pure noise: the Prometheus scrape (`/metrics`, hit
+/// every couple seconds) and the panel's JSON feed (`/metrics.json`, ~1 Hz).
+fn sendResponseQuiet(stream: *Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
+    if (log.isDebug()) log.debug("[http] <- {s} {s} body={d}b (scrape; body not logged)\n", .{ status, content_type, body.len });
+    try sendResponseFramed(stream, status, content_type, body);
+}
+
+fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []const u8, body: []const u8) !void {
     if (stream.ws_mode) |bridge| {
         // WS transport: skip HTTP framing, send body as a single text frame.
         // Compliance suite expects errors as `{"type":"error", ...}` text frames.
@@ -5562,6 +5592,63 @@ fn logHttpBody(label: []const u8, body: []const u8) void {
     });
 }
 
+const GaugeSamplerCtx = struct {
+    metrics: *instr.Metrics,
+    scheduler: *scheduler_mod.Scheduler,
+    /// Dedicated stop flag — set before joining the thread (LIFO defers ensure
+    /// this is written before join() blocks). A separate flag (not
+    /// scheduler.shutdown) avoids a LIFO deadlock: scheduler.deinit() (which
+    /// sets shutdown) is the FIRST-registered defer and runs LAST, after join.
+    stop: *std.atomic.Value(bool),
+};
+
+/// Sample instantaneous system/queue state into the gauges. Non-blocking
+/// syscalls plus a brief scheduler-counter lock. Called by the sampler thread.
+/// The live-token gauge reads the scheduler's `inflight_generated_tokens`
+/// aggregate (published once per decode tick) — it NEVER touches per-slot
+/// fields off-thread, so the inference path stays lock-free per token.
+fn sampleGauges(ctx: GaugeSamplerCtx) void {
+    // System gauges (non-blocking syscalls).
+    ctx.metrics.gpu_utilization_pct.set(@as(u64, metrics.getGpuPct()));
+    ctx.metrics.memory_mb.set(@as(u64, metrics.getAppMemFootprintMb()));
+
+    // Request queue depth — brief lock to read two scheduler counters only.
+    ctx.scheduler.queue_mu.lockUncancelable(ctx.scheduler.io);
+    const running = @as(u64, ctx.scheduler.in_flight);
+    const waiting = @as(u64, ctx.scheduler.pending.items.len);
+    ctx.scheduler.queue_mu.unlock(ctx.scheduler.io);
+    ctx.metrics.requests_running.set(running);
+    ctx.metrics.requests_waiting.set(waiting);
+
+    // Real-time throughput source: completed generation tokens plus the tokens
+    // generated so far by still-decoding slots (the scheduler publishes that
+    // aggregate atomically once per decode tick — race-free, no per-token
+    // write). Non-zero even mid-request, unlike the completion-only counter.
+    const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic);
+    ctx.metrics.generation_tokens_live.set(instr.liveGenerationTokens(ctx.metrics, inflight));
+}
+
+fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
+    // Wake every 500 ms to check the stop flag; sample system state once per
+    // 2-second interval. The 2 s cadence is what makes generation_tokens_live a
+    // real-time tok/s source — the panel windows over a few of these samples.
+    // Uses std.c.nanosleep (POSIX) because std.time.sleep was removed in Zig
+    // 0.16 — this thread has no Io handle.
+    const SAMPLE_INTERVAL_TICKS: u64 = 4; // 4 × 500 ms = 2 s
+    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    // Sample once immediately so the panel / Grafana show real values from the
+    // first scrape instead of zeros for the first interval.
+    sampleGauges(ctx);
+    var tick: u64 = 0;
+    while (!ctx.stop.load(.monotonic)) {
+        _ = std.c.nanosleep(&poll_ts, null);
+        tick += 1;
+        if (tick < SAMPLE_INTERVAL_TICKS) continue;
+        tick = 0;
+        sampleGauges(ctx);
+    }
+}
+
 fn findContentLength(headers: []const u8) ?usize {
     var lines = std.mem.splitSequence(u8, headers, "\r\n");
     while (lines.next()) |line| {
@@ -5580,6 +5667,160 @@ fn findContentLength(headers: []const u8) ?usize {
         }
     }
     return null;
+}
+
+// ── API-key auth helpers (used only when --api-key / g_api_key is set) ──
+
+/// True if the connection's peer is a loopback address (127.0.0.0/8, ::1, or an
+/// IPv4-mapped-IPv6 loopback). Loopback is the local machine → trusted and
+/// exempt from the API key, so the same-host app never needs credentials.
+fn ipIsLoopback(addr: std.Io.net.IpAddress) bool {
+    return switch (addr) {
+        .ip4 => |a4| a4.bytes[0] == 127, // 127.0.0.0/8
+        .ip6 => |a6| blk: {
+            const b = a6.bytes; // big-endian 16 bytes
+            const zeros10 = [_]u8{0} ** 10;
+            // ::1
+            if (std.mem.eql(u8, b[0..15], &([_]u8{0} ** 15)) and b[15] == 1) break :blk true;
+            // ::ffff:127.x.x.x  (IPv4-mapped loopback)
+            if (std.mem.eql(u8, b[0..10], &zeros10) and b[10] == 0xff and b[11] == 0xff and b[12] == 127) break :blk true;
+            break :blk false;
+        },
+    };
+}
+
+fn peerIsLoopback(conn: *const Conn) bool {
+    return ipIsLoopback(conn.stream.socket.address);
+}
+
+/// Case-insensitive HTTP header lookup in the raw header block. `name_lower`
+/// must be lowercase (e.g. "authorization"). Returns the trimmed value, or null.
+fn findHeaderValueCI(headers: []const u8, name_lower: []const u8) ?[]const u8 {
+    var lines = std.mem.splitSequence(u8, headers, "\r\n");
+    while (lines.next()) |line| {
+        if (line.len <= name_lower.len + 1) continue;
+        var match = true;
+        for (0..name_lower.len) |j| {
+            if (std.ascii.toLower(line[j]) != name_lower[j]) {
+                match = false;
+                break;
+            }
+        }
+        if (!match) continue;
+        if (line[name_lower.len] != ':') continue;
+        return std.mem.trim(u8, line[name_lower.len + 1 ..], " \t");
+    }
+    return null;
+}
+
+/// Constant-time equality — avoids a timing oracle on the API key.
+fn constTimeEql(a: []const u8, b: []const u8) bool {
+    if (a.len != b.len) return false;
+    var diff: u8 = 0;
+    for (a, b) |x, y| diff |= x ^ y;
+    return diff == 0;
+}
+
+/// Extract a query-string parameter from the RAW (un-stripped) request path,
+/// e.g. `queryParamValue("/metrics?api_key=abc", "api_key") == "abc"`.
+fn queryParamValue(raw_path: []const u8, name: []const u8) ?[]const u8 {
+    const qpos = std.mem.indexOfScalar(u8, raw_path, '?') orelse return null;
+    var it = std.mem.splitScalar(u8, raw_path[qpos + 1 ..], '&');
+    while (it.next()) |pair| {
+        const eq = std.mem.indexOfScalar(u8, pair, '=') orelse continue;
+        if (std.mem.eql(u8, pair[0..eq], name)) return pair[eq + 1 ..];
+    }
+    return null;
+}
+
+/// True if an `Authorization: Basic base64(user:pass)` value carries the key as
+/// its password (browser index/metrics pages send this after the Basic prompt).
+/// A user-only entry (no colon) matching the key is also accepted.
+fn basicAuthMatches(enc: []const u8, key: []const u8) bool {
+    var dbuf: [1024]u8 = undefined;
+    const dec_len = std.base64.standard.Decoder.calcSizeForSlice(enc) catch return false;
+    if (dec_len > dbuf.len) return false;
+    std.base64.standard.Decoder.decode(dbuf[0..dec_len], enc) catch return false;
+    const creds = dbuf[0..dec_len];
+    const pass = if (std.mem.indexOfScalar(u8, creds, ':')) |c| creds[c + 1 ..] else creds;
+    return constTimeEql(pass, key);
+}
+
+/// True if the request is authorized for the configured `g_api_key` (or no key
+/// is set). Accepts, in order: `Authorization: Bearer <key>`, HTTP Basic (key as
+/// the password), `x-api-key: <key>` (Anthropic), and `?api_key=` / `?key=`.
+fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
+    const key = g_api_key orelse return true;
+    if (findHeaderValueCI(raw_headers, "authorization")) |auth| {
+        if (std.mem.startsWith(u8, auth, "Bearer ")) {
+            if (constTimeEql(std.mem.trim(u8, auth["Bearer ".len..], " \t"), key)) return true;
+        } else if (std.mem.startsWith(u8, auth, "Basic ")) {
+            if (basicAuthMatches(std.mem.trim(u8, auth["Basic ".len..], " \t"), key)) return true;
+        }
+    }
+    if (findHeaderValueCI(raw_headers, "x-api-key")) |xk| {
+        if (constTimeEql(xk, key)) return true;
+    }
+    if (queryParamValue(raw_path, "api_key")) |q| {
+        if (constTimeEql(q, key)) return true;
+    }
+    if (queryParamValue(raw_path, "key")) |q| {
+        if (constTimeEql(q, key)) return true;
+    }
+    return false;
+}
+
+/// Send a 401 with a Basic-auth challenge so browsers prompt for the key on the
+/// index + metrics pages; API clients read the JSON error body.
+fn sendUnauthorized(stream: *Conn) !void {
+    const body = "{\"error\":{\"message\":\"missing or invalid API key\",\"type\":\"authentication_error\"}}";
+    logHttpResponse("401 Unauthorized", "application/json", body);
+    if (stream.ws_mode) |bridge| {
+        if (body.len > 0) try bridge.sendText(body);
+        return;
+    }
+    var hdr_buf: [512]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nWWW-Authenticate: Basic realm=\"mlx-serve\"\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, x-api-key\r\n\r\n", .{body.len}) catch return error.Overflow;
+    try stream.writeAll(hdr);
+    try stream.writeAll(body);
+}
+
+test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
+    const prev = g_api_key;
+    defer g_api_key = prev;
+    g_api_key = "s3cret";
+
+    // Bearer
+    try std.testing.expect(apiKeyAuthorized("Authorization: Bearer s3cret\r\n", "/v1/chat/completions"));
+    // x-api-key (Anthropic)
+    try std.testing.expect(apiKeyAuthorized("x-api-key: s3cret\r\n", "/v1/messages"));
+    // Basic — base64("user:s3cret") = "dXNlcjpzM2NyZXQ="
+    try std.testing.expect(apiKeyAuthorized("Authorization: Basic dXNlcjpzM2NyZXQ=\r\n", "/"));
+    // Query param (browser fallback)
+    try std.testing.expect(apiKeyAuthorized("", "/metrics.json?api_key=s3cret"));
+    try std.testing.expect(apiKeyAuthorized("", "/metrics?key=s3cret"));
+
+    // Wrong / missing key is rejected
+    try std.testing.expect(!apiKeyAuthorized("Authorization: Bearer wrong\r\n", "/"));
+    try std.testing.expect(!apiKeyAuthorized("x-api-key: nope\r\n", "/"));
+    try std.testing.expect(!apiKeyAuthorized("", "/v1/models"));
+
+    // No key configured ⇒ always authorized (open mode)
+    g_api_key = null;
+    try std.testing.expect(apiKeyAuthorized("", "/v1/chat/completions"));
+}
+
+test "ipIsLoopback exempts local addresses only" {
+    // IPv4 loopback (whole 127.0.0.0/8) is exempt; a LAN address is not.
+    try std.testing.expect(ipIsLoopback(.{ .ip4 = .{ .bytes = .{ 127, 0, 0, 1 }, .port = 0 } }));
+    try std.testing.expect(ipIsLoopback(.{ .ip4 = .{ .bytes = .{ 127, 3, 2, 1 }, .port = 0 } }));
+    try std.testing.expect(!ipIsLoopback(.{ .ip4 = .{ .bytes = .{ 192, 168, 1, 42 }, .port = 0 } }));
+    try std.testing.expect(!ipIsLoopback(.{ .ip4 = .{ .bytes = .{ 10, 0, 0, 5 }, .port = 0 } }));
+    // IPv6 ::1 is exempt; a routable v6 address is not.
+    try std.testing.expect(ipIsLoopback(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 0 } }));
+    // IPv4-mapped loopback ::ffff:127.0.0.1
+    try std.testing.expect(ipIsLoopback(.{ .ip6 = .{ .bytes = .{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff, 127, 0, 0, 1 }, .port = 0 } }));
+    try std.testing.expect(!ipIsLoopback(.{ .ip6 = .{ .bytes = .{ 0x20, 0x01, 0x0d, 0xb8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1 }, .port = 0 } }));
 }
 
 /// Extract a JSON field's raw value from a JSON body string.
