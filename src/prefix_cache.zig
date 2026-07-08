@@ -307,24 +307,25 @@ pub const HotPrefixCache = struct {
             const ram_len: usize = if (match) |m| m.shared else 0;
             if (dm.usable <= ram_len) break :disk;
             if (dm.usable - ram_len < kv_disk_cache.MIN_DISK_ADVANTAGE_TOKENS) break :disk;
+            // `dm.usable` is already clamped to the entry's kv_len (see
+            // DiskTier.bestMatch), so it IS the restorable length — restore
+            // only the chunks covering it. Loading the whole entry
+            // (restoreInto) would read a long stored prefix in full to serve a
+            // short shared prefix, making a diverged-prefix "hit" slower than a
+            // cold miss.
+            const effective: usize = dm.usable;
+            const full_match = effective == prompt_ids.len;
+            const final_len: usize = if (full_match and effective > 1) effective - 1 else effective;
             const sw = io_util.Stopwatch.init(d.io);
-            const kv_len = d.restoreInto(target_cache, dm.idx, s) catch |err| {
+            d.restorePrefixInto(target_cache, dm.idx, @intCast(final_len), s) catch |err| {
                 log.warn("  [disk-cache] restore failed: {s} — falling back to RAM/cold path\n", .{@errorName(err)});
                 // A failed restore can leave a half-rebuilt cache; reset it.
                 target_cache.truncate(0, s) catch {};
                 break :disk;
             };
-            const effective: usize = @min(@as(usize, dm.usable), @as(usize, kv_len));
-            if (effective == 0) {
-                try target_cache.truncate(0, s);
-                break :disk;
-            }
-            const full_match = effective == prompt_ids.len;
-            const final_len: usize = if (full_match and effective > 1) effective - 1 else effective;
-            if (final_len < kv_len) try target_cache.truncate(final_len, s);
             target_moe_seq_offset.* = final_len;
             const ms = sw.read() / std.time.ns_per_ms;
-            log.info("  [disk-cache] restored {d}/{d} tokens from SSD in {d}ms\n", .{ final_len, prompt_ids.len, ms });
+            log.info("  [disk-cache] restored {d}/{d} tokens from SSD ({d} chunks) in {d}ms\n", .{ final_len, prompt_ids.len, d.chunks_loaded_last, ms });
             return .{ .matched = final_len, .full_match = full_match };
         }
 
@@ -850,6 +851,11 @@ test "HotPrefixCache: disk tier restores across a fresh cache instance (restart 
         try testing.expect(!res3.full_match);
         try testing.expectEqual(@as(usize, 400), res3.matched);
         try testing.expectEqual(@as(usize, 400), cache3.step);
+        // A diverged short prefix must read ONLY the chunks covering the
+        // usable 400 positions (ceil(400/128) = 4), NOT the whole 600-token
+        // stored entry (5 chunks). Loading the full entry to serve a short
+        // shared prefix makes a diverged "hit" slower than a cold prefill.
+        try testing.expectEqual(@as(u32, 4), hc2.disk.?.chunks_loaded_last);
     }
 }
 

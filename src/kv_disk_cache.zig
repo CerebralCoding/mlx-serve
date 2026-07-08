@@ -126,6 +126,10 @@ pub const DiskTier = struct {
     next_id: u64,
     total_bytes: u64,
     counter: u64,
+    /// Chunk count read by the most recent restore. Diagnostics + a
+    /// red-on-revert guard that a short-prefix restore reads only the chunks
+    /// covering the usable prefix, not the whole stored entry. Not persisted.
+    chunks_loaded_last: u32 = 0,
 
     /// Create the tier rooted at `<base>/<fingerprint>` and scan whatever
     /// already exists there. Crash leftovers (no meta.json) are deleted.
@@ -216,12 +220,22 @@ pub const DiskTier = struct {
     /// Views are left empty — identical contract to `KVCache.restore` (the
     /// next `update`/`truncate` rebuilds them). Returns kv_len.
     pub fn restoreInto(self: *DiskTier, cache: *KVCache, idx: usize, s: mlx.mlx_stream) !u32 {
+        const kv_len = self.entries.items[idx].kv_len;
+        try self.restorePrefixInto(cache, idx, kv_len, s);
+        return kv_len;
+    }
+
+    /// Rebuild ONLY positions [0, limit) of `entries[idx]` — `limit` must be
+    /// ≤ its kv_len. A short shared prefix against a long stored entry then
+    /// reads just the chunks covering `limit` instead of the whole entry (a
+    /// diverged-prefix "hit" that would otherwise read every stored chunk to
+    /// serve a few hundred tokens — slower than a cold prefill).
+    pub fn restorePrefixInto(self: *DiskTier, cache: *KVCache, idx: usize, limit: u32, s: mlx.mlx_stream) !void {
         const e = &self.entries.items[idx];
-        try self.restoreKvInto(cache, e, e.kv_len, s);
+        try self.restoreKvInto(cache, e, limit, s);
         e.last_used = self.bump();
         // Bump meta.json mtime so cross-restart LRU sees the use.
         self.writeMeta(e.*) catch {};
-        return e.kv_len;
     }
 
     /// Phase 3 hybrid variant: rebuild the KV prefix covering [0, cp_pos)
@@ -275,6 +289,7 @@ pub const DiskTier = struct {
         if (limit == 0 or limit > e.kv_len) return error.DiskCacheEmptyEntry;
         const n_chunks: u32 = @intCast((@as(u64, limit) + self.chunk_tokens - 1) / self.chunk_tokens);
         if (n_chunks == 0) return error.DiskCacheEmptyEntry;
+        self.chunks_loaded_last = n_chunks;
 
         const cpu = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(cpu);
