@@ -1708,6 +1708,43 @@ fn getGpuWorkingSetLimit() u64 {
     return getMetalBufferLimit();
 }
 
+/// PURE (unit-testable): the real ceiling a NEW MLX allocation must fit under.
+///
+/// `working_set_limit` (Metal's `max_recommended_working_set_size`) is a STATIC
+/// device maximum — it assumes the whole GPU working set is MLX's to claim and
+/// is BLIND to memory held by anything else on the machine. `mlx_footprint`
+/// (MLX active + reclaimable cache) + `free_system` (physically free RAM) is
+/// what MLX can actually reach RIGHT NOW; when another process holds a big
+/// chunk of unified memory the second term binds and the ceiling collapses.
+///
+/// #64 (2026-07): a Claude Code session on a 128 GB Mac ran a docker-compose
+/// stack (firecrawl/rabbitmq/postgres/playwright) holding tens of GB. The guard
+/// budgeted against the static 115 GB max, admitted a 90 K-token MoE prefill,
+/// and Metal threw `Insufficient Memory` from the command-buffer completion
+/// handler — an UNCATCHABLE async C++ throw that terminates the process (the
+/// libllama frames in the backtrace are just its global std::terminate handler;
+/// the throw is MLX's). Capping by real free RAM makes the two prefill guards
+/// reject/clamp before that allocation is ever submitted.
+fn physicalMemoryCeiling(working_set_limit: u64, mlx_footprint: u64, free_system: u64) u64 {
+    return @min(working_set_limit, mlx_footprint +| free_system);
+}
+
+/// Impure wrapper: current GPU allocation ceiling from live MLX + system
+/// counters. `mlx_footprint` = active (in-use) + cache (reclaimable) so an
+/// idle machine's ceiling stays ≈ the static device max (no auto-context
+/// regression), while external pressure — reflected in `getAvailableMemBytes`
+/// (total − wired − compressed − internal-anon) — tightens it. See
+/// `physicalMemoryCeiling`.
+fn currentGpuMemoryCeiling(active_mem: u64) u64 {
+    var cache_mem: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&cache_mem);
+    return physicalMemoryCeiling(
+        getGpuWorkingSetLimit(),
+        active_mem +| @as(u64, cache_mem),
+        metrics.getAvailableMemBytes(),
+    );
+}
+
 /// PURE budget math (no MLX/Metal calls — unit-testable): the largest context
 /// length whose KV cache + per-token working set fits under the GPU
 /// working-set ceiling, after subtracting what's already resident
@@ -1768,7 +1805,10 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
     _ = mlx.mlx_get_active_memory(&active_mem);
 
     return safeContextForBudget(
-        getGpuWorkingSetLimit(),
+        // Real reachable ceiling, not the static device max — so auto-context
+        // shrinks when another process (e.g. a docker stack) holds unified
+        // memory, instead of oversubscribing into an uncatchable Metal OOM (#64).
+        currentGpuMemoryCeiling(active_mem),
         active_mem,
         // The hot prefix cache fills to this cap over a session — reserve it so
         // auto-context doesn't oversubscribe once the cache is full.
@@ -1808,13 +1848,15 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     // Total estimate with 25% safety margin
     const needed: u64 = (kv_bytes + working_bytes) * 5 / 4;
 
-    // Available = GPU working-set ceiling minus current usage (model weights,
-    // resident hot-cache KV, etc.). Uses the same real Metal limit as the
-    // auto-context budget (getGpuWorkingSetLimit) so the two prefill guards
-    // agree — not hw.memsize×0.75, which over-estimates on small-RAM Macs.
-    const total_limit: u64 = getGpuWorkingSetLimit();
+    // Available = GPU allocation ceiling minus current usage (model weights,
+    // resident hot-cache KV, etc.). The ceiling is the LESSER of Metal's static
+    // working-set max and what's physically reachable now (currentGpuMemoryCeiling)
+    // so the two prefill guards agree AND both see external memory pressure — a
+    // docker stack holding tens of GB otherwise leaves this guard admitting a
+    // prefill that OOMs the command buffer (#64).
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
+    const total_limit: u64 = currentGpuMemoryCeiling(active_mem);
     const available = if (total_limit > active_mem) total_limit - active_mem else 0;
 
     if (needed > available) {
@@ -10258,6 +10300,52 @@ test "safeContextForBudget reserves the hot-cache budget (2026-06-19 OOM regress
     try testing.expect(with_reserve < without_reserve);
     // Still usable, never floored to nothing.
     try testing.expect(with_reserve > 1024);
+}
+
+test "physicalMemoryCeiling caps the static GPU max by real free RAM (#64 docker OOM)" {
+    const GB: u64 = 1 << 30;
+    const static_max: u64 = 115 * GB; // Metal max_recommended_working_set_size, 128 GB Mac
+
+    // Idle: MLX holds 26 GB (active) + 5 GB (reclaimable cache), ~84 GB free.
+    // 31 + 84 = 115 ⇒ the static device max still binds — NO regression when the
+    // machine is uncontended (auto-context stays generous).
+    try testing.expectEqual(static_max, physicalMemoryCeiling(static_max, 31 * GB, 84 * GB));
+
+    // #64: a docker-compose stack (firecrawl/rabbitmq/postgres/playwright) holds
+    // ~45 GB. MLX holds 26 GB, only ~35 GB is physically free. The static max is
+    // BLIND to docker, but the ceiling must collapse to 26 + 35 = 61 GB — otherwise
+    // a large MoE prefill is admitted and Metal throws an uncatchable OOM.
+    try testing.expectEqual(@as(u64, 61 * GB), physicalMemoryCeiling(static_max, 26 * GB, 35 * GB));
+
+    // Saturating add: a bogus/huge footprint reading can never wrap to a tiny ceiling.
+    try testing.expectEqual(static_max, physicalMemoryCeiling(static_max, std.math.maxInt(u64), GB));
+}
+
+test "auto-context tightens under external memory pressure vs the pre-fix static ceiling (#64)" {
+    const GB: u64 = 1 << 30;
+    // qwen3_5_moe 35B-A3B footprint (per-token KV + working envelope).
+    const per_tok: u64 = 328 * 1024;
+    const static_max: u64 = 115 * GB;
+    const active: u64 = 26 * GB;
+    const mlx_cache: u64 = 4 * GB;
+    const hot_cache_reserve: u64 = 2 * GB;
+    const max_pos: u32 = 262144;
+
+    // Pre-fix behaviour: budget straight against the static device max, blind to
+    // free RAM — the exact code path that OOM'd #64.
+    const prefix_ctx = safeContextForBudget(static_max, active, hot_cache_reserve, per_tok, max_pos);
+
+    // Post-fix, idle (~84 GB free): ceiling ≈ static max ⇒ context essentially unchanged.
+    const idle_ceiling = physicalMemoryCeiling(static_max, active + mlx_cache, 84 * GB);
+    const idle_ctx = safeContextForBudget(idle_ceiling, active, hot_cache_reserve, per_tok, max_pos);
+    try testing.expect(idle_ctx >= prefix_ctx * 9 / 10); // within 10% of the old generous value
+
+    // Post-fix, docker holds ~45 GB (~35 GB free): ceiling collapses, so the safe
+    // context is far smaller than the pre-fix static-max computation would allow.
+    const busy_ceiling = physicalMemoryCeiling(static_max, active + mlx_cache, 35 * GB);
+    const busy_ctx = safeContextForBudget(busy_ceiling, active, hot_cache_reserve, per_tok, max_pos);
+    try testing.expect(busy_ctx < prefix_ctx / 2);
+    try testing.expect(busy_ctx > 1024); // still usable, never floored to nothing
 }
 
 test "safeContextForBudget floors when memory is exhausted and caps at max_pos" {
