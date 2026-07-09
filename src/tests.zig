@@ -5,6 +5,7 @@ test {
     _ = @import("log.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
+    _ = @import("tool_traffic_replay_test.zig");
     _ = @import("server.zig");
     _ = @import("model.zig");
     _ = @import("generate.zig");

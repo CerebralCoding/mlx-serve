@@ -708,6 +708,64 @@ extension ServerOptionsTests {
         XCTAssertFalse(field.explainer.isEmpty)
         XCTAssertTrue(field.needsRestart, "ssd-streaming is a launch flag — must flag a restart")
     }
+
+    // ── Tool-call auto-correct (--no-tool-autocorrect) ──
+    func testToolAutocorrectDefaultsOn() {
+        // Mirrors the server's `g_tool_autocorrect: bool = true` (defaults-mirror gotcha).
+        XCTAssertTrue(ServerOptions().toolAutocorrect,
+                      "tool-call auto-correct must default ON, matching the server")
+    }
+
+    func testToolAutocorrectOmittedByDefault() {
+        XCTAssertFalse(ServerOptions().toCLIArgs().contains("--no-tool-autocorrect"),
+                       "default (on) must not emit the disable flag")
+    }
+
+    func testToolAutocorrectEmitsFlagWhenOff() {
+        var opts = ServerOptions()
+        opts.toolAutocorrect = false
+        let args = opts.toCLIArgs()
+        XCTAssertTrue(args.contains("--no-tool-autocorrect"),
+                      "disabling must emit --no-tool-autocorrect")
+        // Bare boolean flag — nothing a value token could be mis-parsed from.
+        if let i = args.firstIndex(of: "--no-tool-autocorrect"), i + 1 < args.count {
+            XCTAssertTrue(args[i + 1].hasPrefix("--"),
+                          "boolean flag must not be followed by a value token")
+        }
+    }
+
+    func testToolAutocorrectChangeTriggersRestart() {
+        var a = ServerOptions()
+        var b = ServerOptions()
+        b.toolAutocorrect = false
+        XCTAssertFalse(a.serverLaunchEquals(b),
+                       "toggling tool-call auto-correct must require a server restart")
+        a.toolAutocorrect = false
+        XCTAssertTrue(a.serverLaunchEquals(b))
+    }
+
+    func testToolAutocorrectHasSettingsMetadata() {
+        guard let field = ServerOptions.serverFlagFields["toolAutocorrect"] else {
+            return XCTFail("toolAutocorrect metadata missing — the Settings toggle would silently disappear")
+        }
+        XCTAssertFalse(field.title.isEmpty)
+        XCTAssertFalse(field.explainer.isEmpty)
+        XCTAssertTrue(field.needsRestart, "--no-tool-autocorrect is a launch flag — must flag a restart")
+    }
+
+    func testToolAutocorrectRoundTripsLegacyDecodesOn() throws {
+        // A blob saved before this field must decode with auto-correct ON (the
+        // decodeIfPresent + default-seed migration), never silently OFF.
+        let legacy = "{\"host\":\"127.0.0.1\",\"port\":11234}"
+        let opts = try JSONDecoder().decode(ServerOptions.self, from: Data(legacy.utf8))
+        XCTAssertTrue(opts.toolAutocorrect, "legacy blob must decode auto-correct ON")
+        // Round-trip preserves an explicit off.
+        var off = ServerOptions()
+        off.toolAutocorrect = false
+        let data = try JSONEncoder().encode(off)
+        let back = try JSONDecoder().decode(ServerOptions.self, from: data)
+        XCTAssertFalse(back.toolAutocorrect)
+    }
 }
 
 extension ServerOptionsTests {

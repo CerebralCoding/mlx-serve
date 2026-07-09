@@ -31,6 +31,15 @@ struct ServerOptions: Codable, Equatable {
     /// param). Loopback is trusted, so this app (127.0.0.1) never needs to send
     /// it — the key protects the server when bound to the network (0.0.0.0).
     var apiKey: String = ""
+    /// Tool-call argument auto-correct (`--no-tool-autocorrect` disables). When
+    /// true (default, mirrors the server's `g_tool_autocorrect`), parsed
+    /// tool-call arguments are coerced to the types the tool schema declares
+    /// (e.g. Python `False` → JSON `false`, an `edits` array shipped as a string
+    /// → a real array), fixing the class of "expected boolean, provided string"
+    /// rejections weak models cause. Off = args pass through verbatim (still valid
+    /// JSON; only the schema-type coercion is skipped). `toCLIArgs` emits the flag
+    /// ONLY when false, so a default launch stays flag-free.
+    var toolAutocorrect: Bool = true
 
     // Speculative decoding (server-launch flags)
     var enablePLD: Bool = true          // --pld is default-on now (CLI flips with --no-pld)
@@ -330,6 +339,7 @@ struct ServerOptions: Codable, Equatable {
         requestTimeout == other.requestTimeout &&
         enableMetrics == other.enableMetrics &&
         apiKey == other.apiKey &&
+        toolAutocorrect == other.toolAutocorrect &&
         enablePLD == other.enablePLD &&
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&
@@ -411,6 +421,11 @@ struct ServerOptions: Codable, Equatable {
         let trimmedApiKey = apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedApiKey.isEmpty {
             args += ["--api-key", trimmedApiKey]
+        }
+        // Emit ONLY when disabled — the server default is on, so a default launch
+        // stays flag-free (guarded by testDefaultLaunchOmitsAllMatchDefaultFlags).
+        if !toolAutocorrect {
+            args += ["--no-tool-autocorrect"]
         }
         // Spec-decode: explicit flags either way so the server's CLI defaults
         // can't drift out from under the UI.
@@ -550,6 +565,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .requestTimeout) { requestTimeout = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMetrics) { enableMetrics = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .apiKey) { apiKey = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .toolAutocorrect) { toolAutocorrect = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePLD) { enablePLD = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldDraftLen) { pldDraftLen = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
@@ -679,6 +695,10 @@ extension ServerOptions {
         "apiKey": .init(
             title: "API key",
             explainer: "Require this key for requests from OTHER machines (the OpenAI/Anthropic/Ollama APIs + index page + metrics). Sent as Authorization: Bearer, x-api-key, HTTP Basic, or ?api_key=. Localhost is trusted, so this app never needs it — it protects the server when exposed on the network. Blank = no auth.",
+            needsRestart: true),
+        "toolAutocorrect": .init(
+            title: "Tool-call auto-correct",
+            explainer: "Coerce tool-call arguments to the types the tool schema declares (e.g. a model sending Python's \"False\" or a list-as-string) so strict clients like Claude Code stop rejecting them with \"expected boolean, provided string\". Recommended on. Turn off to pass the model's arguments through exactly as written.",
             needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",

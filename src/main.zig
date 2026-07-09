@@ -180,6 +180,12 @@ fn printUsage(io: std.Io) void {
         \\  --metrics           Enable Prometheus metrics at GET /metrics and a
         \\                        live metrics panel on the index page (opt-in;
         \\                        zero cost when off). Also GET /metrics.json.
+        \\  --no-tool-autocorrect
+        \\                      Disable tool-call ARGUMENT auto-correct — the
+        \\                        coercion of parsed args to the tool schema's
+        \\                        declared types (e.g. Python `False` -> JSON
+        \\                        `false`). Args then pass through as the model
+        \\                        emitted them (still valid JSON). Default: on.
         \\  --api-key <token>   Require this key on every request (OpenAI/
         \\                        Anthropic/Ollama APIs + index page + metrics).
         \\                        Accepts Authorization: Bearer, x-api-key, HTTP
@@ -380,6 +386,8 @@ pub fn main(init: std.process.Init) !void {
             server_mod.image_safety_filter = false;
         } else if (std.mem.eql(u8, args[i], "--pld")) {
             enable_pld = true;
+        } else if (std.mem.eql(u8, args[i], "--no-tool-autocorrect")) {
+            server_mod.g_tool_autocorrect = false;
         } else if (std.mem.eql(u8, args[i], "--no-pld")) {
             enable_pld = false;
         } else if (std.mem.eql(u8, args[i], "--pld-draft-len") and i + 1 < args.len) {

@@ -1,5 +1,15 @@
 # Changelog
 
+## v26.7.5 — Tool calls that don't fight your agent
+
+- **Local agents stop looping on tool calls they already got right.** Point a coding agent (Claude Code, pi, opencode) at a local model and weaker or reasoning-distilled models routinely mistype a tool argument — sending Python's `False` where JSON wants `false`, or a list of edits as a quoted string — so strict clients reject the call with "expected boolean, provided string." The model can't see its own serialized request, so it "fixes" a value that was already correct and burns turn after turn (one captured session failed six times in a row, then gave up on editing and rewrote whole files). The server now reads the tool's own schema and corrects the argument's type before the client ever sees it, so the call goes through the first time.
+- **Malformed tool calls from small models are recovered instead of dropped.** A 1–4B model writing a large file in one shot mangles its own JSON a dozen ways — a dropped opening tag, a repeated parameter, an invalid escape in a Windows path. Any of these used to drop the entire call (the file leaked into the chat as text) or ship broken JSON the client couldn't parse at all. The server now repairs these at the source and guarantees every tool call it emits is well-formed JSON — recovering the call where it can, never handing a client garbage.
+- **No more stray thinking markers in replies.** Large reasoning models under load occasionally spray their internal channel markers into the answer; those could surface in the visible reply. They're now stripped before anything reaches you.
+- **An off switch, if you want the model's raw output.** A new *Tool-call auto-correct* toggle in Settings (and `--no-tool-autocorrect` on the command line) disables the type coercion and passes arguments through exactly as the model wrote them — for debugging a model, or if you'd rather see the unaltered call. On by default; the safety net that keeps output well-formed stays on regardless.
+- **Shaken out by an eight-hour soak.** All of the above was found by driving Claude Code, pi, and opencode through heavy tool-call variations — with thinking on and off — against every supported model family (Qwen 3.5/3.6, Gemma 3/4, the GGUF and DeepSeek-V4 engines, and block-diffusion), replaying a growing corpus of real captured traffic on every build. Ten distinct issues fixed, zero regressions.
+
+---
+
 ## v26.7.4 — Agent sessions that survive, and a Model Browser that makes sense
 
 - **Long agent turns no longer die at five minutes.** When a model spends minutes writing a large file into one tool call, the server buffers every token and sends nothing — so Node-based agents (pi, opencode, anything on `fetch`) hit their 300-second idle timeout, killed the connection, and threw the work away. Every streaming surface now keeps the socket alive while it thinks. Measured: a ten-minute generation that previously died after 301 seconds having delivered a single chunk now streams to completion, with a five-second worst-case gap between bytes.

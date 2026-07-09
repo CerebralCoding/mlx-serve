@@ -64,7 +64,29 @@ const Expect = struct {
     /// Expected value of `tool_arg_key` in the LAST parsed call (asserts
     /// parallel calls each kept their own arguments).
     last_tool_arg_value: ?[]const u8 = null,
+    /// The tools the request declared (OpenAI shape, exactly what server.zig
+    /// threads to the parse sites as `tools_json`). When set, the corpus runs
+    /// `chat.coerceToolArgsToSchema` and enforces the universal
+    /// declared-type invariant below.
+    tools_json: ?[]const u8 = null,
+    /// Expected BOOLEAN-typed argument in the first call (schema entries only).
+    tool_bool_key: ?[]const u8 = null,
+    tool_bool_value: ?bool = null,
 };
+
+/// Claude Code's Edit tool, post `server.buildOpenAIToolsJson`. `replace_all`
+/// is the boolean; everything else is a string. Shared by the entries below so
+/// the string-vs-boolean confusion is exercised in BOTH directions.
+const edit_tool_schema =
+    \\[{"type":"function","function":{"name":"Edit","description":"Edit a file","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean","default":false}},"required":["file_path","old_string","new_string"]}}}]
+;
+
+/// pi's `edit` tool: `edits` is an ARRAY of {oldText,newText} objects. Captured
+/// live — the tag formats carry no type information, so the whole array arrived
+/// as a string on every call.
+const pi_edit_tool_schema =
+    \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object"}},"dry_run":{"type":"boolean"}},"required":["path","edits"]}}}]
+;
 
 const corpus = [_]Expect{
     // ── Qwen 3.5/3.6 (<think> family, template-injected opener) ─────────────
@@ -318,6 +340,29 @@ const corpus = [_]Expect{
         .content_exact = "The file is ready.",
         .reasoning_contains = "Plan it.",
     },
+    .{
+        // Live soak capture (2026-07-09, record 2151, a Gemma reasoning variant):
+        // the model emitted reasoning, one close, a content scrap, then SPAMMED
+        // 16 more bare `<channel|>` close markers. The leading strip cut the FIRST
+        // close; the trailing-strip only handled unclosed OPENERS — so the stray
+        // CLOSE markers leaked. A close marker is never valid at the tail of
+        // content; the universal no-tag-leak invariant pins this.
+        .family = "gemma4",
+        .name = "trailing <channel|> close-marker spam never leaks (thinking on)",
+        .raw = "<|channel>thought\nFind the file.<channel|>\nrunning glob\n\n" ++
+            "<channel|><channel|><channel|><channel|><channel|><channel|>",
+        .thinking = true,
+        .content_contains = "running glob",
+        .reasoning_contains = "Find the file.",
+    },
+    .{
+        // Same shape, thinking OFF → stripThinkBlock path.
+        .family = "gemma4",
+        .name = "trailing <channel|> close-marker spam never leaks (thinking off)",
+        .raw = "Reasoning about the file.\n<channel|>running glob\n\n" ++
+            "<channel|><channel|><channel|><channel|><channel|>",
+        .content_contains = "running glob",
+    },
     // ── Gemma 3 (no native tool syntax — markdown-fenced JSON) ──────────────
     .{
         // Verbatim capture from gemma-3-12b-it-qat-4bit on the live matrix
@@ -507,6 +552,81 @@ const corpus = [_]Expect{
         .tool_arg_key = "command",
         .tool_arg_value = "ls -la",
     },
+    // ── Schema-declared argument types (value-spelling inference class) ──────
+    // Class: the tag formats carry NO type information, so the parser infers it
+    // from the value's SPELLING (`isJsonLiteral`) — and guesses wrong in both
+    // directions. Only the tool schema disambiguates, so every entry with a
+    // `tools_json` is coerced (chat.coerceToolArgsToSchema) and then checked by
+    // the universal declared-type invariant below. Reverting the coercion turns
+    // both entries red.
+    .{
+        // VERBATIM capture, 2026-07-09 (~/.mlx-serve/logs/mlx-serve-11234.log:109471):
+        // Qwen3.6-35B-A3B-Claude-4.7-Opus-Reasoning-Distilled via Claude Code.
+        // The model writes Python's `False` for a boolean param. isJsonLiteral
+        // only knows lowercase `false`, so the arg shipped as the STRING
+        // "False" and Claude Code rejected every Edit with
+        //   "The parameter `replace_all` type is expected as `boolean` but provided as `string`"
+        // The model cannot see its own serialized request, so it "fixed" a
+        // value that was already correct — six dead rounds, then it gave up on
+        // Edit and rewrote whole files.
+        .family = "qwen",
+        .name = "Python-style False on a boolean param is coerced to JSON false",
+        .raw = "\n<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n" ++
+            "<parameter=file_path>\n/Users/david/doom/index.html\n</parameter>\n" ++
+            "<parameter=old_string>\n<script src=\"game.js\"></script>\n</parameter>\n" ++
+            "<parameter=new_string>\n<script src=\"game.js\" type=\"module\"></script>\n</parameter>\n" ++
+            "</function>\n</tool_call>",
+        .tool_name = "Edit",
+        .tool_arg_key = "file_path",
+        .tool_arg_value = "/Users/david/doom/index.html",
+        .tools_json = edit_tool_schema,
+        .tool_bool_key = "replace_all",
+        .tool_bool_value = false,
+    },
+    .{
+        // The INVERSE half of the class: a string-typed param whose content
+        // happens to spell a JSON literal. isJsonLiteral promoted it to a real
+        // boolean/number, so a code edit touching the token `false` (or a bare
+        // `42`) shipped as `"old_string": false` — "expected string, provided
+        // boolean". The schema is the only thing that can tell these apart.
+        .family = "qwen",
+        .name = "string param whose content spells `false` stays a string",
+        .raw = "<tool_call>\n<function=Edit>\n<parameter=file_path>\na.js\n</parameter>\n" ++
+            "<parameter=old_string>\nfalse\n</parameter>\n" ++
+            "<parameter=new_string>\n42\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "Edit",
+        .tool_arg_key = "old_string",
+        .tool_arg_value = "false",
+        .tools_json = edit_tool_schema,
+    },
+    .{
+        // The CONTAINER half of the class, and the most frequent one in live
+        // traffic (15 hits in one pi session): a `<parameter=edits>` holding a
+        // JSON array. isJsonLiteral only knows scalars, so the whole array
+        // shipped as a STRING — "edits: want array, got str".
+        .family = "qwen",
+        .name = "array-typed param through Hermes XML is not left a string",
+        .raw = "<tool_call>\n<function=edit>\n<parameter=path>\n/tmp/a.js\n</parameter>\n" ++
+            "<parameter=edits>\n[{\"oldText\": \"const a = 1;\", \"newText\": \"const a = 2;\"}]\n</parameter>\n" ++
+            "</function>\n</tool_call>",
+        .tool_name = "edit",
+        .tool_arg_key = "path",
+        .tool_arg_value = "/tmp/a.js",
+        .tools_json = pi_edit_tool_schema,
+    },
+    .{
+        // Same class, different producer: well-formed JSON that merely QUOTES
+        // the boolean. Strict parse succeeds, so no repair path ever runs and
+        // only the schema pass catches it.
+        .family = "qwen",
+        .name = "quoted boolean in a JSON tool body is coerced",
+        .raw = "<tool_call>{\"name\":\"Edit\",\"arguments\":{\"file_path\":\"a.js\",\"old_string\":\"a\"," ++
+            "\"new_string\":\"b\",\"replace_all\":\"true\"}}</tool_call>",
+        .tool_name = "Edit",
+        .tools_json = edit_tool_schema,
+        .tool_bool_key = "replace_all",
+        .tool_bool_value = true,
+    },
     // ── Negatives ────────────────────────────────────────────────────────────
     .{
         // Prose containing a `<tool…>`-ish tag that is NOT a tool call.
@@ -551,6 +671,13 @@ test "format corpus: recorded model outputs across families" {
             allocator.free(cs);
         };
 
+        // Mirror the server: when the request declared tools, the parsed
+        // arguments are coerced to the schema's types before any client sees
+        // them (server.parseToolCallsForRequest).
+        if (entry.tools_json) |tj| {
+            if (calls) |cs| try chat.coerceToolArgsToSchema(allocator, cs, tj);
+        }
+
         if (entry.no_tool_calls and calls != null) {
             try fail(entry, "expected NO tool calls but got some", calls.?[0].name);
         }
@@ -577,6 +704,28 @@ test "format corpus: recorded model outputs across families" {
                 };
                 defer parsed.deinit();
                 if (parsed.value != .object) try fail(entry, "tool arguments are not a JSON object", tc.arguments);
+
+                // Universal declared-type invariant: every argument whose type
+                // the tool declares must actually carry that JSON type. This is
+                // what strict clients validate and reject on. Any future entry
+                // that supplies a `tools_json` is covered automatically.
+                if (entry.tools_json) |tj| {
+                    if (!chat.toolCallConformsToSchema(allocator, tc, tj)) {
+                        try fail(entry, "tool argument type contradicts the declared schema", tc.arguments);
+                    }
+                }
+            }
+
+            if (entry.tool_bool_key) |key| {
+                const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});
+                defer parsed.deinit();
+                const val = parsed.value.object.get(key) orelse {
+                    try fail(entry, "expected boolean arg key missing", cs[0].arguments);
+                    unreachable;
+                };
+                if (val != .bool or val.bool != entry.tool_bool_value.?) {
+                    try fail(entry, "boolean arg is not the expected JSON boolean", cs[0].arguments);
+                }
             }
             if (entry.tool_arg_key) |key| {
                 const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});

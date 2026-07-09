@@ -55,6 +55,16 @@ pub var g_metrics: ?*instr.Metrics = null;
 /// an `?api_key=` / `?key=` query param. null ⇒ fully open (default, unchanged).
 pub var g_api_key: ?[]const u8 = null;
 
+/// Tool-call ARGUMENT auto-correct. When true (default), parsed tool-call
+/// arguments are coerced to the types the request's tool schema declares
+/// (`chat.coerceToolArgsToSchema` — e.g. Python's `False` → JSON `false`, an
+/// `edits` array shipped as a string → a real array). `--no-tool-autocorrect`
+/// turns it OFF: arguments pass through exactly as the model emitted them (still
+/// valid JSON — the parse-repair + safety net always run; this gates ONLY the
+/// schema-type coercion, the opinionated layer). Off means a weak model's
+/// mistyped value reaches the client verbatim, which strict clients reject.
+pub var g_tool_autocorrect: bool = true;
+
 const io_util = @import("io_util.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
@@ -681,6 +691,55 @@ fn resolveRequestMaxTokens(v: ?std.json.Value, auto_default: u32) u32 {
 /// ("you sent no content"), and the model re-emits the same doomed mega-call.
 fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
     return if (std.mem.eql(u8, pre_parse, "length")) "length" else "tool_calls";
+}
+
+/// Debug-only corpus-harvest aid (`MLX_SERVE_RAW_DUMP_FILE`). Appends ONE framed
+/// record per tools request: the DECLARED TOOLS SCHEMA and the raw pre-parse text
+/// together, written at the one site where both are in scope. Correlating them
+/// any other way is unsound — the debug log truncates lines at 16 KB (so a large
+/// request body never re-parses, and a harvester silently pairs a model output
+/// with some EARLIER request's schema), and concurrent requests interleave.
+///
+/// Framing is by byte COUNT, never a delimiter: both payloads are arbitrary bytes
+/// and any sentinel can occur inside them. libc `write(2)` like log.zig's sink
+/// (callers here carry no `Io`); O_APPEND keeps conn threads from interleaving.
+fn appendRawToolDump(path: []const u8, tools_json: ?[]const u8, text: []const u8) void {
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    if (path.len == 0 or path.len >= path_buf.len) return;
+    @memcpy(path_buf[0..path.len], path);
+    path_buf[path.len] = 0;
+    const path_z: [*:0]const u8 = @ptrCast(&path_buf);
+
+    const fd = std.c.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+    if (fd < 0) return;
+    defer _ = std.c.close(fd);
+
+    const tools = tools_json orelse "";
+    var hdr: [96]u8 = undefined;
+    const h = std.fmt.bufPrint(&hdr, "\n===MLX_RAW_DUMP tools={d} raw={d}===\n", .{ tools.len, text.len }) catch return;
+    _ = std.c.write(fd, h.ptr, h.len);
+    if (tools.len > 0) _ = std.c.write(fd, tools.ptr, tools.len);
+    if (text.len > 0) _ = std.c.write(fd, text.ptr, text.len);
+}
+
+/// The ONE tool-call extraction path for every HTTP surface: parse, fall back to
+/// bare-JSON inference, then coerce the arguments to the schema the request
+/// declared. Every surface must go through this — a site that calls
+/// `chat_mod.parseToolCalls` directly silently reintroduces the value-spelling
+/// type-inference bug (a boolean param arriving as the string "False") on that
+/// surface alone, which no output-equality test can see.
+fn parseToolCallsForRequest(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    tools_json: ?[]const u8,
+) !?[]chat_mod.ParsedToolCall {
+    const calls = (try chat_mod.parseToolCalls(allocator, text)) orelse
+        (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
+        return null;
+    if (g_tool_autocorrect) {
+        if (tools_json) |tj| try chat_mod.coerceToolArgsToSchema(allocator, calls, tj);
+    }
+    return calls;
 }
 
 fn getOrInitResponseStore(io: std.Io, gpa: std.mem.Allocator) *responses_mod.ResponseStore {
@@ -4565,8 +4624,7 @@ fn handleNonStreamingGeneration(
     // Check for tool calls in the output
     if (has_tools) {
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
-        const found_calls = (try chat_mod.parseToolCalls(allocator, final_text)) orelse
-            (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, final_text, tj) else null);
+        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -5438,14 +5496,11 @@ fn handleStreamingGeneration(
             log.debug("  raw generated text before tool parse ({d}b): {s}\n", .{ text_buf.items.len, text_buf.items[0..@min(text_buf.items.len, 4000)] });
             // Corpus-harvest aid: the inline dump caps at 4KB, useless for
             // >30KB mega-tool-calls. Set MLX_SERVE_RAW_DUMP_FILE=<abs path> to
-            // write the FULL pre-parse buffer (overwritten per request).
-            if (std.c.getenv("MLX_SERVE_RAW_DUMP_FILE")) |dump_path| dump: {
-                const f = std.Io.Dir.createFileAbsolute(stream.io, std.mem.span(dump_path), .{}) catch break :dump;
-                defer f.close(stream.io);
-                var wb: [4096]u8 = undefined;
-                var fw = f.writer(stream.io, &wb);
-                fw.interface.writeAll(text_buf.items) catch {};
-                fw.interface.flush() catch {};
+            // APPEND the FULL pre-parse buffer of every tools request, framed so
+            // a harvester can slice each record exactly (the text is arbitrary
+            // bytes, so the byte count — not a delimiter — defines the record).
+            if (std.c.getenv("MLX_SERVE_RAW_DUMP_FILE")) |dump_path| {
+                appendRawToolDump(std.mem.span(dump_path), tools_json, text_buf.items);
             }
         }
         // Merge re-opened mid-text thought channels into the leading block so
@@ -5453,8 +5508,7 @@ fn handleStreamingGeneration(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = (try chat_mod.parseToolCalls(allocator, gen_text)) orelse
-            (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, gen_text, tj) else null);
+        const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -7619,8 +7673,7 @@ fn handleAnthropicNonStreaming(
 
     // Check for tool calls
     if (has_tools) {
-        const found_calls = (try chat_mod.parseToolCalls(allocator, final_text)) orelse
-            (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, final_text, tj) else null);
+        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -8164,6 +8217,9 @@ fn handleAnthropicStreaming(
     if (has_tools and !client_gone) {
         if (log.isDebug() and text_buf.items.len > 0) {
             log.debug("  raw generated text before tool parse ({d}b): {s}\n", .{ text_buf.items.len, text_buf.items[0..@min(text_buf.items.len, 4000)] });
+            if (std.c.getenv("MLX_SERVE_RAW_DUMP_FILE")) |dump_path| {
+                appendRawToolDump(std.mem.span(dump_path), tools_json, text_buf.items);
+            }
         }
         // Merge re-opened mid-text thought channels into the leading block so
         // the split/parse below never leaks raw tags (Gemma 12B re-opens
@@ -8171,8 +8227,7 @@ fn handleAnthropicStreaming(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = (try chat_mod.parseToolCalls(allocator, gen_text)) orelse
-            (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, gen_text, tj) else null);
+        const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| { allocator.free(tc.name); allocator.free(tc.arguments); }
@@ -9314,10 +9369,7 @@ fn handleResponses(
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
     if (active_has_tools) {
-        tool_calls = try chat_mod.parseToolCalls(allocator, final_text);
-        if (tool_calls == null) {
-            if (active_tools_json) |tj| tool_calls = try chat_mod.inferBareJsonToolCalls(allocator, final_text, tj);
-        }
+        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json);
     }
     defer if (tool_calls) |tcs| {
         for (tcs) |tc| {
@@ -11334,6 +11386,124 @@ test "prefix cache default capacity covers interleaved agent flows" {
     // still bounds memory.
     try testing.expect(prefix_cache_capacity >= 4);
     try testing.expect(prefix_cache_mem_bytes > 0);
+}
+
+test "parseToolCallsForRequest coerces args to the schema (server-side chokepoint wiring)" {
+    // The chokepoint every HTTP surface routes through must actually invoke the
+    // schema coercion — not just parse. This pins the WIRING (a mis-wire that
+    // parsed but skipped coerce would reintroduce the string-"False" bug on every
+    // surface at once). Uses the exact Hermes-XML `replace_all=False` shape from
+    // the live Claude Code failure.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"Edit","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["file_path"]}}}]
+    ;
+    const text = "<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n" ++
+        "<parameter=file_path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const ra = parsed.value.object.get("replace_all").?;
+    try std.testing.expect(ra == .bool); // coerced from the STRING "False"
+    try std.testing.expectEqual(false, ra.bool);
+    // Null tools_json path must still parse (no coercion, no crash).
+    const calls2 = try parseToolCallsForRequest(allocator, text, null);
+    defer if (calls2) |cs| {
+        for (cs) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(cs);
+    };
+    try std.testing.expect(calls2 != null);
+}
+
+test "parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim" {
+    // The escape hatch: with g_tool_autocorrect off, the schema coercion is
+    // skipped and the model's value passes through EXACTLY (here the STRING
+    // "False", which is what a strict client would then reject — the user's
+    // choice). Parse-repair + valid-JSON safety net still run, so args stay
+    // well-formed JSON regardless.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"Edit","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["file_path"]}}}]
+    ;
+    const text = "<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n" ++
+        "<parameter=file_path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
+
+    g_tool_autocorrect = false;
+    defer g_tool_autocorrect = true; // restore the default for other tests
+    const calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const ra = parsed.value.object.get("replace_all").?;
+    try std.testing.expect(ra == .string); // NOT coerced — verbatim
+    try std.testing.expectEqualStrings("False", ra.string);
+}
+
+test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma" {
+    // The tool-call parse strips the leading think block BEFORE parsing args, and
+    // the two families strip DIFFERENTLY (Qwen `<think>…</think>`, Gemma
+    // `<|channel>thought…<channel|>`). Pin that a preceding reasoning block never
+    // blocks the schema coercion, for BOTH families, WITH and WITHOUT thinking.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"Edit","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["file_path"]}}}]
+    ;
+    const gtools =
+        \\[{"type":"function","function":{"name":"Edit","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"replace_all":{"type":"boolean"}},"required":["file_path"]}}}]
+    ;
+
+    const Case = struct { name: []const u8, text: []const u8, tools: []const u8 };
+    const cases = [_]Case{
+        // Qwen3.6-MoE thinking OFF — Hermes XML, no reasoning block.
+        .{ .name = "qwen think-off", .tools = tools, .text = "<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n<parameter=file_path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>" },
+        // Qwen3.6-MoE thinking ON — a `<think>…</think>` block precedes the call.
+        .{ .name = "qwen think-on", .tools = tools, .text = "<think>\nThe user wants replace_all disabled, so I'll pass it false.\n</think>\n<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n<parameter=file_path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>" },
+        // Gemma thinking OFF — custom `call:` form, no channel block.
+        .{ .name = "gemma think-off", .tools = gtools, .text = "<|tool_call>call:Edit{file_path:<|\"|>/tmp/x<|\"|>,replace_all:False}<tool_call|>" },
+        // Gemma thinking ON — a `<|channel>thought…<channel|>` block precedes.
+        .{ .name = "gemma think-on", .tools = gtools, .text = "<|channel>thought\nI should disable replace_all for a single edit.<channel|>\n<|tool_call>call:Edit{file_path:<|\"|>/tmp/x<|\"|>,replace_all:False}<tool_call|>" },
+    };
+
+    for (cases) |c| {
+        const calls = (try parseToolCallsForRequest(allocator, c.text, c.tools)) orelse {
+            std.debug.print("\n[{s}] no tool call parsed\n", .{c.name});
+            return error.NoToolCall;
+        };
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try std.testing.expectEqualStrings("Edit", calls[0].name);
+        var parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        const ra = parsed.value.object.get("replace_all") orelse {
+            std.debug.print("\n[{s}] replace_all missing in {s}\n", .{ c.name, calls[0].arguments });
+            return error.ArgMissing;
+        };
+        if (ra != .bool or ra.bool != false) {
+            std.debug.print("\n[{s}] replace_all NOT coerced to bool false: {s}\n", .{ c.name, calls[0].arguments });
+            return error.NotCoerced;
+        }
+    }
 }
 
 test "toolCallFinishReason preserves truncation over parsed tool calls" {

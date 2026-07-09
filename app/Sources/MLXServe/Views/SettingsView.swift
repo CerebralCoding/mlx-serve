@@ -635,6 +635,17 @@ private struct ServerSectionContent: View {
                 .frame(width: 180)
             }
         }
+        if let m = meta["toolAutocorrect"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.toolAutocorrect)
+            ) {
+                Toggle("", isOn: $appState.serverOptions.toolAutocorrect)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
         if let m = meta["logLevel"] {
             SettingsRow(
                 title: m.title,
