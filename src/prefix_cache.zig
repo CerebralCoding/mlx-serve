@@ -378,9 +378,20 @@ pub const HotPrefixCache = struct {
         const full_match = effective_matched == prompt_ids.len;
         const final_len: usize = if (full_match and effective_matched > 1) effective_matched - 1 else effective_matched;
 
-        if (final_len < e.tokens.len) {
-            try target_cache.truncate(final_len, s);
-        }
+        // ALWAYS clamp the restored cache to the matched length. The old guard
+        // (`final_len < e.tokens.len`) skipped this on a WHOLE-entry match — but a
+        // snapshot can be committed with a KV buffer LONGER than its logical token
+        // count: PLD/speculative decode leaves stale draft positions in the buffer
+        // past the committed step, and `commit` snapshots them. Restoring that
+        // (then skipping the truncate) left `cache.offset` AHEAD of the matched
+        // length that generation tracks (`moe_seq_offset`) — a silent drift that
+        // corrupts RoPE positions and CRASHES the Gemma sliding-window prefill mask
+        // (`broadcast_shapes` mask-vs-KV mismatch; live 2026-07-09 on
+        // gemma-4-26B-A4B at ~16K ctx). truncate is a no-op when the buffer is
+        // already `final_len`, so unconditional clamping is safe and restores the
+        // invariant cache.offset == matched. The stale KV tail has no matching
+        // token id, so the match can never reach into it — discarding it is correct.
+        try target_cache.truncate(final_len, s);
 
         if (full_match and effective_matched > 1) {
             target_moe_seq_offset.* = effective_matched - 1;
@@ -763,6 +774,53 @@ test "HotPrefixCache: findBestMatch returns longest shared prefix" {
     // Scheme mismatch returns null — entries are dense, a query for affine
     // 4-bit cannot match (Wave 1.A: cross-scheme cache hits never happen).
     try testing.expectEqual(@as(?@TypeOf(m), null), cache.findBestMatch(&lookup_ids, false, kv_quant.KVQuantConfig.affine(4)));
+}
+
+test "HotPrefixCache: restore clamps an inflated snapshot to the matched length (gemma mask crash)" {
+    // Root cause of the live gemma-4-26B-A4B crash (2026-07-09, broadcast_shapes
+    // mask 16890 vs KV 16892 at ~16K ctx): a snapshot committed with a KV buffer
+    // LONGER than its logical token count — PLD/speculative decode leaves stale
+    // draft positions in the buffer past the committed step. When the NEXT prompt
+    // matches the entry's ENTIRE token sequence but is longer (a partial hit,
+    // effective_matched == e.tokens.len < prompt_ids.len), the old truncate guard
+    // `final_len < e.tokens.len` was FALSE, so the restored cache offset kept the
+    // inflated snapshot length — drifting ahead of the matched length generation
+    // tracks. That drift corrupts RoPE and crashes the sliding-window prefill mask.
+    const s = mlx.gpuStream();
+
+    var toks: [67]u32 = undefined;
+    for (&toks, 0..) |*t, i| t.* = @intCast(i + 11);
+    const logical_len: usize = 64;
+
+    // Source cache: 64 logical tokens, then 2 STALE tokens (offset 66) — the
+    // shape a PLD round leaves behind before commit.
+    var src = try KVCache.init(testing.allocator, 2);
+    defer src.deinit();
+    try testFillCache(&src, s, 2, @intCast(logical_len));
+    try testFillCache(&src, s, 2, 2); // stale draft tail → offset 66
+    try testing.expectEqual(@as(usize, 66), src.step);
+
+    var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
+    defer hc.deinit();
+    // Commit with the LOGICAL token count (64) — but the snapshot carries 66.
+    try hc.commit(&src, toks[0..logical_len], false);
+
+    // Reuse with a prompt that matches all 64 entry tokens but is LONGER (67):
+    // effective_matched == e.tokens.len == 64 < prompt_ids.len — the crash path.
+    var dst = try KVCache.init(testing.allocator, 2);
+    defer dst.deinit();
+    var moe_off: usize = 0;
+    const res = try hc.lookupAndRestore(&dst, &moe_off, null, s, &toks, false);
+
+    try testing.expect(!res.full_match);
+    try testing.expectEqual(@as(usize, 64), res.matched);
+    // The invariant: restored cache offset == matched length, NOT the inflated 66.
+    try testing.expectEqual(@as(usize, 64), moe_off);
+    try testing.expectEqual(@as(usize, 64), dst.step);
+    for (dst.entries) |*e| {
+        try testing.expect(e.initialized);
+        try testing.expectEqual(@as(usize, 64), e.offset); // clamped, not 66
+    }
 }
 
 fn testFillCache(cache: *KVCache, s: mlx.mlx_stream, n_layers: u32, tokens: u32) !void {
