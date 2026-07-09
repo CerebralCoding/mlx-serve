@@ -1023,6 +1023,19 @@ pub const Scheduler = struct {
     /// sampler reads this race-free to derive a live tok/s — it never touches
     /// per-slot fields off-thread. Zero when nothing is decoding.
     inflight_generated_tokens: std.atomic.Value(u64),
+    /// Tokens forwarded so far by the prefill currently running on the
+    /// inference thread; 0 when no prefill is in flight. Mirror of
+    /// `inflight_generated_tokens` for the OTHER phase — without it the metrics
+    /// panel shows nothing while a multi-minute prefill pins the GPU, because
+    /// prompt-token counters and prefill-time histograms only advance when the
+    /// request finishes. Written per prefill CHUNK, read by the gauge sampler.
+    inflight_prefill_tokens: std.atomic.Value(u64),
+    /// Number of slots currently inside `runPrefill`. Set on entry, cleared on
+    /// every exit — so the panel can say "prefilling" IMMEDIATELY, rather than
+    /// waiting for the first 8192-token chunk to land (~40 s on a 27B). Also
+    /// covers the ds4/llama engines, whose prefill never reaches the MLX chunk
+    /// loop and therefore never moves `inflight_prefill_tokens`.
+    requests_prefilling: std.atomic.Value(u64),
     /// Counts `pending.len + decoding.len` for back-pressure.
     in_flight: u32,
     /// Capacity for back-pressure. `submit` waits when in_flight >= cap.
@@ -1115,6 +1128,8 @@ pub const Scheduler = struct {
             .cleanup_queue = std.ArrayList(*Slot).empty,
             .metrics = params.metrics,
             .inflight_generated_tokens = std.atomic.Value(u64).init(0),
+            .inflight_prefill_tokens = std.atomic.Value(u64).init(0),
+            .requests_prefilling = std.atomic.Value(u64).init(0),
             .in_flight = 0,
             .queue_cap = cap + 32,
             .submit_cond = .init,
@@ -3544,6 +3559,21 @@ fn runDiffusionDecodeTick(sch: *Scheduler, slot: *Slot, runner: *diffusion_mod.R
 /// .skip_lazy_preforward = true_for_regular, ... })`, and store it on the
 /// slot. After return, the slot is ready for decode ticks.
 fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
+    // Mark the phase for the whole of prefill, and clear both signals on EVERY
+    // exit path (success, cancel, error). `requests_prefilling` flips at entry
+    // so the panel isn't blind until the first chunk lands; the chunk loop in
+    // generate.zig stores absolute progress into `inflight_prefill_tokens`.
+    //
+    // Gated on `--metrics`, per the observability contract: when it's off the
+    // prefill path executes NO extra instruction at all (the chunk loop's hook
+    // is null too — see the `prefill_progress` option below).
+    const observe = sch.metrics != null;
+    if (observe) _ = sch.requests_prefilling.fetchAdd(1, .monotonic);
+    defer if (observe) {
+        _ = sch.requests_prefilling.fetchSub(1, .monotonic);
+        sch.inflight_prefill_tokens.store(0, .monotonic);
+    };
+
     // ds4-backed model: bypass the MLX prefill path entirely. The ds4
     // engine owns the chat/tokenizer/KV stack — we just create a session,
     // sync it to the slot's full prompt (ds4 reuses common prefix against
@@ -3654,6 +3684,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // when the client disconnects; the chunk loop checks it between
             // chunks so a ghost 40K prefill stops within one chunk.
             .cancel_flag = &slot.cancelled,
+            .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
         },
     );
     gen.timeout_ns = slot.timeout_ns;

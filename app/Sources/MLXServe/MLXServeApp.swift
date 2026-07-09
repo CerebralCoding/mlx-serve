@@ -162,6 +162,9 @@ struct MLXCoreApp: App {
                 .environmentObject(hfSearch)
                 .environmentObject(appState)
                 .environmentObject(appState.downloads)
+                // Lets model rows tell "selected" from "actually loaded" — the
+                // In-use badge reads `server.status`.
+                .environmentObject(appState.server)
                 .frame(minWidth: 700, minHeight: 400)
         }
         .defaultSize(width: 900, height: 600)

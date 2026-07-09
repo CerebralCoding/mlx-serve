@@ -62,6 +62,7 @@ const cli_mod = @import("cli.zig");
 const build_options = @import("build_options");
 const nowSecs = io_util.nowSecs;
 const nowMs = io_util.nowMs;
+const nowMsMonotonic = io_util.nowMsMonotonic;
 const Stopwatch = io_util.Stopwatch;
 
 /// Bridge that lets a Conn route OpenAI-Responses output through a WebSocket
@@ -132,6 +133,33 @@ fn extractCompletedStatus(allocator: std.mem.Allocator, data: []const u8) ?[]u8 
     return allocator.dupe(u8, data[v_start..v_end]) catch null;
 }
 
+/// Tracks how long a streaming connection has been SILENT so the token loops
+/// can emit a protocol-level keepalive before a client's idle-body timeout
+/// fires. The mirror image of `generate.StallClock`: that one protects the
+/// server from a wedged model, this one protects the client from a wedged-
+/// looking socket.
+///
+/// It exists because every streaming surface buffers tokens while it might be
+/// looking at a tool call or an unclosed thinking block — during a large
+/// tool call (an agent one-shotting a whole file into `write_file`) the
+/// handler produces no SSE output at all, sometimes for minutes. Node's
+/// `fetch`/undici drops such a body after 300 s (`TypeError: terminated`).
+pub const StreamHeartbeat = struct {
+    /// MONOTONIC milliseconds (`io_util.nowMsMonotonic`) — an NTP step must not
+    /// be able to stall the keepalive, nor spam one per token.
+    last_write_ms: i64 = 0,
+    interval_ms: i64 = Conn.STREAM_KEEPALIVE_MS,
+
+    pub fn noteWrite(self: *StreamHeartbeat, now_ms: i64) void {
+        self.last_write_ms = now_ms;
+    }
+
+    /// True once `interval_ms` has elapsed with no bytes handed to the socket.
+    pub fn due(self: *const StreamHeartbeat, now_ms: i64) bool {
+        return now_ms - self.last_write_ms >= self.interval_ms;
+    }
+};
+
 /// Connection wrapper bundling a TCP stream with its `Io` and per-connection
 /// reader/writer buffers. Replaces `std.net.Stream` in 0.16 — methods that took
 /// a bare stream now take `*Conn` so the IO interface and buffers travel together.
@@ -142,6 +170,13 @@ pub const Conn = struct {
     read_buf: [16 * 1024]u8,
     write_state: std.Io.net.Stream.Writer,
     read_state: std.Io.net.Stream.Reader,
+    /// Silence tracker for the streaming keepalive. Stamped by every write
+    /// path below, so it measures client-visible silence rather than "time
+    /// since the last token" — a buffered tool call keeps producing tokens
+    /// while emitting nothing. (`writeAllNoFlush` stamps too: every SSE emit
+    /// path flushes before returning, so a stamp can't outrun the socket by
+    /// more than one event.)
+    heartbeat: StreamHeartbeat = .{},
     /// Non-null when this connection is bridged onto a WebSocket. Output that
     /// would otherwise be HTTP/SSE is reshaped into WS text frames at the
     /// `sendResponse` / `sendAnthropicEvent` chokepoints.
@@ -160,6 +195,13 @@ pub const Conn = struct {
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
         c.ollama_sink = null;
+        c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
+    }
+
+    /// True when the connection has been silent long enough that a streaming
+    /// keepalive is due.
+    pub fn keepaliveDue(c: *Conn) bool {
+        return c.heartbeat.due(nowMsMonotonic(c.io));
     }
 
     pub fn writer(c: *Conn) *std.Io.Writer {
@@ -171,17 +213,20 @@ pub const Conn = struct {
     }
 
     pub fn writeAll(c: *Conn, data: []const u8) !void {
+        c.heartbeat.noteWrite(nowMsMonotonic(c.io));
         if (c.ollama_sink) |s| return s.feed(data);
         try c.writer().writeAll(data);
         try c.writer().flush();
     }
 
     pub fn writeAllNoFlush(c: *Conn, data: []const u8) !void {
+        c.heartbeat.noteWrite(nowMsMonotonic(c.io));
         if (c.ollama_sink) |s| return s.feed(data);
         try c.writer().writeAll(data);
     }
 
     pub fn flush(c: *Conn) !void {
+        c.heartbeat.noteWrite(nowMsMonotonic(c.io));
         if (c.ollama_sink != null) return;
         try c.writer().flush();
     }
@@ -601,10 +646,15 @@ const DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS: u32 = 2048;
 /// fixed cap. (The old 256 default silently broke agent clients like pi:
 /// every thinking-enabled turn hit `length` mid-reasoning, so no tool call or
 /// answer ever came back.) The sentinel is huge so the downstream
-/// `clampMaxTokens` resolves it to the remaining context; when the context
-/// size is unknown (0) no clamp will apply, so fall back to a finite 4096.
-fn omittedMaxTokensDefault() u32 {
-    return if (server_config.max_context_size > 0) std.math.maxInt(u32) / 4 else 4096;
+/// `clampMaxTokens` resolves it to the remaining context; only when the context
+/// is genuinely unknown (0) do we fall back to a finite 4096.
+///
+/// Takes the EFFECTIVE context, not `server_config.max_context_size`: that
+/// global is set only by `--ctx-size`, so under auto-context this used to
+/// return 4096 — an omitted-max_tokens client silently capped at 4096 tokens,
+/// truncating any large tool call. Same class as the 256 default it replaced.
+fn omittedMaxTokensDefault(effective_ctx: u32) u32 {
+    return if (effective_ctx > 0) std.math.maxInt(u32) / 4 else 4096;
 }
 
 /// Resolve a request's `max_tokens` (or its aliases) to an effective cap.
@@ -783,12 +833,22 @@ pub fn serve(
     var server = try ip_addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
-    // Log context size (auto-computed or explicit)
-    const safe_ctx = computeMaxSafeContext(config);
+    // Freeze the auto-context NOW, at startup, while the model is freshly
+    // loaded and nothing else has taken RAM. Clients read this number once
+    // (pi/opencode bake it into a config file) and budget against it for the
+    // whole session, so it must not drift with system load. `--ctx-size` wins.
+    const pinned = pinAutoContext(@constCast(config));
     if (server_config.max_context_size > 0) {
         log.info("Context size: {d} tokens (manual)\n", .{server_config.max_context_size});
     } else {
-        log.info("Context size: {d} tokens (auto, from GPU memory)\n", .{safe_ctx});
+        const memory_ctx = computeMemoryContext(config);
+        const memory_allows = safeAutoContext(memory_ctx);
+        if (config.max_position_embeddings > 0 and pinned >= config.max_position_embeddings) {
+            // The checkpoint's own maximum binds; memory had room to spare.
+            log.info("Context size: {d} tokens (auto: the model's maximum; memory would allow {d}) [pinned]\n", .{ pinned, memory_allows });
+        } else {
+            log.info("Context size: {d} tokens (auto: {d}% of the {d}-token memory ceiling, reserving headroom) [pinned]\n", .{ pinned, auto_ctx_safety_pct, memory_ctx });
+        }
     }
 
     if (server_config.request_timeout_sec > 0) {
@@ -1250,6 +1310,12 @@ fn handleConnection(
         },
     };
     defer scheduler.release(lm);
+
+    // A model loaded on demand freezes its own auto-context here, for the same
+    // reason the `--model` primary does at startup: the number we advertise is
+    // what clients budget against, and each model has its own dims. Idempotent,
+    // and a no-op under `--ctx-size`.
+    if (lm.config) |c| _ = pinAutoContext(c);
 
     // ── Phase C: handlers take `lm` directly and extract their own
     //    locals. handleConnection only needs one decision for every
@@ -1775,10 +1841,61 @@ fn handleOllamaEmbed(allocator: std.mem.Allocator, stream: *Conn, body: []const 
     try sink.finishEmbed(legacy);
 }
 
+/// Percentage of the memory-derived ceiling we actually admit as context when
+/// `--ctx-size` is absent.
+///
+/// `computeMaxSafeContext` returns the largest context that FITS right now.
+/// Serving at exactly that leaves nothing for the prefix cache to grow into, a
+/// second model to load beside this one, or another app to take RAM — and the
+/// Metal OOM it would eventually hit is uncatchable (see the auto-context
+/// gotcha). Reserve headroom instead.
+const auto_ctx_safety_pct: u32 = 85;
+
+/// PURE: apply the safety margin and round down to a 1024 boundary so the
+/// number reads sanely in logs and client configs. Never returns 0.
+///
+/// Takes the MEMORY-derived ceiling only. The model's own `max_position_embeddings`
+/// is applied afterwards, un-margined: when the checkpoint's max is the binding
+/// constraint there is nothing to reserve memory headroom against, and shaving
+/// 15% off a 131,072-token model that comfortably fits in RAM just throws
+/// context away.
+fn safeAutoContext(raw: u32) u32 {
+    const scaled: u64 = (@as(u64, raw) * auto_ctx_safety_pct) / 100;
+    const rounded: u64 = (scaled / 1024) * 1024;
+    if (rounded == 0) return @intCast(@max(scaled, 1));
+    return @intCast(rounded);
+}
+
+/// This model's auto-context: memory ceiling with headroom, then capped by what
+/// the checkpoint actually supports.
+fn autoContextFor(config: *const model_mod.ModelConfig) u32 {
+    const with_headroom = safeAutoContext(computeMemoryContext(config));
+    const max_pos = config.max_position_embeddings;
+    return if (max_pos > 0) @min(with_headroom, max_pos) else with_headroom;
+}
+
+/// Freeze this model's auto-context at load time. Idempotent; a no-op (and
+/// never a write) when `--ctx-size` pinned it explicitly. Returns the value
+/// `getEffectiveContextLength` will report from now on.
+///
+/// Called once per model, at startup for the `--model` primary and right after
+/// an on-demand load. The advertised context must not drift: agent CLIs read it
+/// once (pi/opencode never re-read `/v1/models`) and budget their own
+/// `max_tokens` against it for the rest of the session.
+fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
+    if (server_config.max_context_size > 0) return server_config.max_context_size;
+    if (config.pinned_context == 0) {
+        config.pinned_context = autoContextFor(config);
+    }
+    return config.pinned_context;
+}
+
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
     if (server_config.max_context_size > 0) return server_config.max_context_size;
-    // Compute safe default from available GPU memory instead of a fixed 16K cap.
-    return computeMaxSafeContext(config);
+    if (config.pinned_context > 0) return config.pinned_context;
+    // Not pinned yet (a discovery stub that was never loaded): compute from
+    // current GPU memory rather than a fixed 16K cap.
+    return autoContextFor(config);
 }
 
 /// Metal's recommended max working-set size for the default device — the real
@@ -1880,7 +1997,19 @@ fn safeContextForBudget(
 /// Linear in seq (per_tok × seq ≤ budget) — no seq² term, MLX's fused SDPA
 /// tiles over seq and never materializes [heads, seq, seq]. See
 /// `safeContextForBudget` for the steady-state reservation rationale.
+/// `computeMemoryContext` capped by the checkpoint's `max_position_embeddings`.
+/// This is the raw "largest context that fits" figure — reported in logs and
+/// `/props` for diagnostics. The context we actually SERVE is `autoContextFor`,
+/// which reserves headroom below it.
 fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
+    const memory_ctx = computeMemoryContext(config);
+    const max_pos = config.max_position_embeddings;
+    return if (max_pos > 0) @min(memory_ctx, max_pos) else memory_ctx;
+}
+
+/// The largest context this model's per-token footprint fits into RAM right
+/// now, IGNORING the checkpoint's own maximum. Reads live memory.
+fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     const heads: u64 = config.num_attention_heads;
     if (heads == 0) return 16384;
 
@@ -1910,7 +2039,10 @@ fn computeMaxSafeContext(config: *const model_mod.ModelConfig) u32 {
         // auto-context doesn't oversubscribe once the cache is full.
         prefix_cache_mem_bytes,
         per_tok,
-        config.max_position_embeddings,
+        // 0 = do NOT clamp to the checkpoint's max here. The caller applies that
+        // cap AFTER the safety margin, so a model whose own max is the binding
+        // constraint keeps every token of it (see `autoContextFor`).
+        0,
     );
 }
 
@@ -1984,16 +2116,25 @@ fn getMetalBufferLimit() u64 {
 }
 
 /// Clamp max_tokens so prompt + completion doesn't exceed context length.
-fn clampMaxTokens(max_tokens: u32, prompt_len: usize) u32 {
-    if (server_config.max_context_size == 0) return max_tokens;
-    const prompt: u32 = @intCast(@min(prompt_len, server_config.max_context_size));
-    if (prompt >= server_config.max_context_size) return 1; // at least 1 token
-    const remaining = server_config.max_context_size - prompt;
+/// Clamp a request's `max_tokens` so `prompt + generation` stays inside
+/// `effective_ctx`. `effective_ctx == 0` means "unknown" and imposes no limit.
+///
+/// Takes the context explicitly rather than reading `server_config.max_context_size`:
+/// that global is only set by `--ctx-size`, so under AUTO context this function
+/// used to return `max_tokens` untouched — the server never trimmed a client's
+/// budget, never emitted the "budget squeezed" warning, and generation could run
+/// past the memory-safe window. Callers pass `getEffectiveContextLength(config)`,
+/// which is the same number the prompt-length guard and `/v1/models` report.
+fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
+    if (effective_ctx == 0) return max_tokens;
+    const prompt: u32 = @intCast(@min(prompt_len, effective_ctx));
+    if (prompt >= effective_ctx) return 1; // at least 1 token
+    const remaining = effective_ctx - prompt;
     if (remaining < max_tokens / 4) {
-        log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}) — tool call arguments may be truncated\n", .{ remaining, max_tokens, prompt, server_config.max_context_size });
+        log.warn("  generation budget squeezed: {d}/{d} tokens remaining (prompt={d}, ctx={d}) — tool call arguments may be truncated\n", .{ remaining, max_tokens, prompt, effective_ctx });
     }
     if (max_tokens > remaining) {
-        log.debug("  max_tokens clamped: {d} -> {d} (ctx_size={d}, prompt={d})\n", .{ max_tokens, remaining, server_config.max_context_size, prompt });
+        log.debug("  max_tokens clamped: {d} -> {d} (ctx={d}, prompt={d})\n", .{ max_tokens, remaining, effective_ctx, prompt });
         return remaining;
     }
     return max_tokens;
@@ -3265,7 +3406,7 @@ fn handleChatCompletions(
     // or <= 0 → auto (peg to remaining context).
     const max_tokens: u32 = resolveRequestMaxTokens(
         root.get("max_tokens") orelse root.get("max_completion_tokens"),
-        omittedMaxTokensDefault(),
+        omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
@@ -3622,7 +3763,7 @@ fn handleChatCompletions(
     if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
 
     // Clamp max_tokens to stay within context window
-    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
+    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     // ── Adaptive spec-decode gating ──
@@ -3753,7 +3894,7 @@ fn handleCompletions(
 
     const max_tokens: u32 = resolveRequestMaxTokens(
         root.get("max_tokens") orelse root.get("max_completion_tokens"),
-        omittedMaxTokensDefault(),
+        omittedMaxTokensDefault(getEffectiveContextLength(config)),
     );
 
     const is_stream = if (root.get("stream")) |v| v == .bool and v.bool else false;
@@ -3872,7 +4013,7 @@ fn handleCompletions(
     if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
 
     // Clamp max_tokens to stay within context window
-    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
+    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // Adaptive spec-decode gate (mirrors chat-completions): novel prompts
     // (low 3-gram repetition) skip PLD/drafter unless explicitly requested.
@@ -5261,6 +5402,18 @@ fn handleStreamingGeneration(
             }
             try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = token_text }, null, null, null);
         }
+
+        // Every branch above may have written NOTHING (tool-call detection and
+        // unclosed thinking blocks buffer silently, sometimes for minutes on a
+        // one-shot whole-file `write_file`). Tokens flowing is not bytes
+        // flowing — without this the client's idle-body timeout kills the
+        // stream mid-generation.
+        beatStreamKeepalive(stream, .sse_comment) catch {
+            log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+            slot_handle.?.cancel();
+            client_gone = true;
+            break;
+        };
     }
 
     // Flush any remaining think buffer
@@ -5626,6 +5779,13 @@ fn sampleGauges(ctx: GaugeSamplerCtx) void {
     // write). Non-zero even mid-request, unlike the completion-only counter.
     const inflight = ctx.scheduler.inflight_generated_tokens.load(.monotonic);
     ctx.metrics.generation_tokens_live.set(instr.liveGenerationTokens(ctx.metrics, inflight));
+
+    // The other phase. Prompt-token counters and the prefill-time histogram
+    // only advance at request COMPLETION, so a long prefill was invisible: GPU
+    // pinned, decode reading 0, prefill reading "—". This gauge moves per
+    // prefill chunk and returns to 0 the moment the prefill ends.
+    ctx.metrics.prefill_tokens_live.set(ctx.scheduler.inflight_prefill_tokens.load(.monotonic));
+    ctx.metrics.requests_prefilling.set(ctx.scheduler.requests_prefilling.load(.monotonic));
 }
 
 fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
@@ -6708,6 +6868,29 @@ fn sendStreamKeepalive(stream: *Conn) !void {
     try stream.writeAll(": keepalive\n\n");
 }
 
+/// Which no-op event a surface uses to prove liveness.
+const KeepaliveStyle = enum { sse_comment, anthropic_ping };
+
+/// Emit a keepalive iff the socket has been SILENT for `STREAM_KEEPALIVE_MS`.
+///
+/// Every streaming token loop calls this once per iteration — not just on the
+/// `.idle` (waiting-for-first-token) path. Those two are different facts: a
+/// surface buffering tokens for tool-call or thinking detection is receiving
+/// tokens steadily while writing nothing, and only bytes on the wire hold off
+/// a client's idle-body timeout (Node's `fetch`/undici: 300 s, then
+/// `TypeError: terminated`). A one-shot `write_file` of a whole source file
+/// buffers for exactly that long.
+fn beatStreamKeepalive(stream: *Conn, style: KeepaliveStyle) !void {
+    if (!stream.keepaliveDue()) return;
+    switch (style) {
+        .sse_comment => try sendStreamKeepalive(stream),
+        .anthropic_ping => try sendAnthropicEvent(stream, "ping", "{\"type\":\"ping\"}"),
+    }
+    // The WS transport no-ops both senders; stamp regardless so a bridged
+    // connection doesn't re-evaluate the deadline on every token.
+    stream.heartbeat.noteWrite(nowMsMonotonic(stream.io));
+}
+
 fn sendAnthropicEvent(stream: *Conn, event_name: []const u8, data: []const u8) !void {
     if (stream.ws_mode) |bridge| {
         // WS transport: emit only the JSON payload as a text frame; the
@@ -7281,7 +7464,7 @@ fn handleAnthropicMessages(
     // Check if attention computation would exceed GPU memory
     if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, true)) return;
 
-    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
+    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
     log.info("  prompt={d} tokens, max_gen={d}, ctx={d}\n", .{ prompt_ids.len, effective_max_tokens, effective_ctx });
 
     const eos_slice = config.eosTokenSlice();
@@ -7951,6 +8134,16 @@ fn handleAnthropicStreaming(
             }
             try emitAnthropicTextDelta(allocator, stream, block_index, token_text);
         }
+
+        // See the chat-completions loop: a buffered tool call / thinking block
+        // emits no events at all, so liveness must be driven off socket
+        // silence, not off token arrival.
+        beatStreamKeepalive(stream, .anthropic_ping) catch {
+            log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+            slot_handle.?.cancel();
+            client_gone = true;
+            break;
+        };
     }
 
     // Flush remaining think buffer
@@ -8431,7 +8624,7 @@ fn handleResponses(
         } else null;
     };
     const max_tokens: u32 = req_max_output_tokens orelse
-        (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault());
+        (if (wants_json) DEFAULT_STRUCTURED_OUTPUT_MAX_TOKENS else omittedMaxTokensDefault(getEffectiveContextLength(config)));
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
@@ -8622,7 +8815,7 @@ fn handleResponses(
         return;
     }
     if (!try checkAttentionMemory(allocator, stream, prompt_ids.len, config, false)) return;
-    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len);
+    const effective_max_tokens = clampMaxTokens(max_tokens, prompt_ids.len, effective_ctx);
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{
@@ -8926,6 +9119,17 @@ fn handleResponses(
                 }
                 if (stopped) break;
             }
+
+            // Beat BEFORE the tool early-continue below: a tool-active request
+            // emits nothing for its whole generation, and the thinking branch
+            // holds until its close tag. Both look identical to a dead server
+            // from the client's socket.
+            beatStreamKeepalive(stream, .sse_comment) catch {
+                log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
+                slot_handle.?.cancel();
+                client_gone = true;
+                break;
+            };
 
             // Tool-active requests buffer entirely — we cannot emit text deltas
             // before knowing whether the output is a tool call.
@@ -10489,6 +10693,117 @@ test "parseJsonFloat handles integer value" {
     try testing.expectApproxEqAbs(@as(f32, 1.0), result, 0.001);
 }
 
+test "safeAutoContext leaves headroom below the memory ceiling and rounds to 1024" {
+    // The raw ceiling is the largest context that FITS. Running at exactly that
+    // leaves nothing for the prefix cache to grow into, a second model, or
+    // another app — so admit only `auto_ctx_safety_pct` of it.
+    try testing.expectEqual(@as(u32, 79872), safeAutoContext(94729)); // 85% = 80519 -> 1024-floor
+    try testing.expectEqual(@as(u32, 27648), safeAutoContext(32768)); // 85% = 27852 -> 1024-floor
+    // Never rounds down to zero on a tiny ceiling.
+    try testing.expect(safeAutoContext(1000) > 0);
+    try testing.expect(safeAutoContext(1) > 0);
+    // Monotonic, and always strictly inside the ceiling for real-sized contexts.
+    var prev: u32 = 0;
+    for ([_]u32{ 4096, 8192, 16384, 32768, 65536, 94729, 262144 }) |raw| {
+        const got = safeAutoContext(raw);
+        try testing.expect(got <= raw);
+        try testing.expect(got >= prev);
+        prev = got;
+    }
+}
+
+test "autoContextFor: the safety margin applies to MEMORY, never to the model's own max" {
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+    server_config.max_context_size = 0;
+
+    // A tiny model whose `max_position_embeddings` is far below anything memory
+    // could constrain: it must get its FULL declared context, un-margined.
+    // (Regression: applying 85% AFTER the model-max clamp shaved 15% off a
+    // 131,072-token checkpoint that fits in RAM with room to spare.)
+    var small = model_mod.ModelConfig{};
+    small.max_position_embeddings = 4096;
+    small.num_attention_heads = 8;
+    small.num_hidden_layers = 4;
+    small.num_key_value_heads = 2;
+    small.head_dim = 64;
+    small.hidden_size = 512;
+    small.intermediate_size = 1024;
+    try testing.expectEqual(@as(u32, 4096), autoContextFor(&small));
+
+    // No declared max: fall back to the margined memory ceiling.
+    var unbounded = small;
+    unbounded.max_position_embeddings = 0;
+    const got = autoContextFor(&unbounded);
+    try testing.expect(got > 0);
+    try testing.expectEqual(safeAutoContext(computeMemoryContext(&unbounded)), got);
+}
+
+test "getEffectiveContextLength returns the PINNED value, not a fresh memory reading" {
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+    server_config.max_context_size = 0; // auto
+
+    var config = model_mod.ModelConfig{};
+    config.max_position_embeddings = 131072;
+    config.num_attention_heads = 8;
+    config.num_hidden_layers = 42;
+    config.num_key_value_heads = 2;
+    config.head_dim = 256;
+
+    // Once pinned, the advertised context must NOT move — clients budget
+    // against it, and a fresh memory reading drifts with system load.
+    config.pinned_context = 12345;
+    try testing.expectEqual(@as(u32, 12345), getEffectiveContextLength(&config));
+    try testing.expectEqual(@as(u32, 12345), getEffectiveContextLength(&config));
+
+    // ...but an explicit --ctx-size still wins.
+    server_config.max_context_size = 4096;
+    try testing.expectEqual(@as(u32, 4096), getEffectiveContextLength(&config));
+}
+
+test "pinAutoContext is idempotent and a no-op under --ctx-size" {
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+
+    var config = model_mod.ModelConfig{};
+    config.max_position_embeddings = 131072;
+    config.num_attention_heads = 8;
+    config.num_hidden_layers = 42;
+    config.num_key_value_heads = 2;
+    config.head_dim = 256;
+
+    server_config.max_context_size = 0;
+    const first = pinAutoContext(&config);
+    try testing.expect(first > 0);
+    try testing.expectEqual(first, config.pinned_context);
+    // Second call must not re-read memory and shift the value.
+    try testing.expectEqual(first, pinAutoContext(&config));
+
+    // Explicit --ctx-size: never overwrite, always report the override.
+    var manual = model_mod.ModelConfig{};
+    manual.max_position_embeddings = 131072;
+    server_config.max_context_size = 8192;
+    try testing.expectEqual(@as(u32, 8192), pinAutoContext(&manual));
+    try testing.expectEqual(@as(u32, 0), manual.pinned_context);
+}
+
+test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-size)" {
+    const original = server_config.max_context_size;
+    defer server_config.max_context_size = original;
+    server_config.max_context_size = 0; // auto: the old code never clamped here
+
+    // 4096-token window, 4000-token prompt -> only 96 tokens of generation left.
+    try testing.expectEqual(@as(u32, 96), clampMaxTokens(8192, 4000, 4096));
+    // Comfortable budget is passed through untouched.
+    try testing.expectEqual(@as(u32, 8192), clampMaxTokens(8192, 100, 65536));
+    // Prompt at/over the window still yields at least one token.
+    try testing.expectEqual(@as(u32, 1), clampMaxTokens(8192, 4096, 4096));
+    try testing.expectEqual(@as(u32, 1), clampMaxTokens(8192, 9000, 4096));
+    // ctx 0 (unknown) = no limit.
+    try testing.expectEqual(@as(u32, 8192), clampMaxTokens(8192, 4000, 0));
+}
+
 test "getEffectiveContextLength uses ctx_size override" {
     const original = server_config.max_context_size;
     defer server_config.max_context_size = original;
@@ -10610,16 +10925,16 @@ test "omittedMaxTokensDefault: context-bound when ctx is known, finite fallback 
     // context window. The old fixed 256 default broke agent clients (pi) whose
     // thinking-enabled turns hit `length` mid-reasoning on EVERY request.
     server_config.max_context_size = 32768;
-    const sentinel = omittedMaxTokensDefault();
+    const sentinel = omittedMaxTokensDefault(32768);
     // Big enough that clampMaxTokens (the downstream bound) always wins…
     try testing.expect(sentinel > 32768);
     // …and the composition resolves to exactly the remaining context.
-    try testing.expectEqual(@as(u32, 32768 - 1500), clampMaxTokens(sentinel, 1500));
+    try testing.expectEqual(@as(u32, 32768 - 1500), clampMaxTokens(sentinel, 1500, 32768));
 
     // ctx unknown (max_context_size=0): clampMaxTokens won't bound anything,
     // so the default itself must stay finite.
     server_config.max_context_size = 0;
-    try testing.expectEqual(@as(u32, 4096), omittedMaxTokensDefault());
+    try testing.expectEqual(@as(u32, 4096), omittedMaxTokensDefault(0));
 }
 
 test "resolveRequestMaxTokens: absent / 0 / negative / non-int → auto; positive → value" {
@@ -10636,12 +10951,42 @@ test "resolveRequestMaxTokens: absent / 0 / negative / non-int → auto; positiv
     try testing.expectEqual(@as(u32, 4096), resolveRequestMaxTokens(.{ .integer = 4096 }, auto));
 }
 
+test "StreamHeartbeat: a write resets the deadline, silence expires it" {
+    var hb = StreamHeartbeat{ .last_write_ms = 1_000, .interval_ms = 5_000 };
+
+    // Silent, but not yet for a full interval.
+    try testing.expect(!hb.due(1_000));
+    try testing.expect(!hb.due(5_999));
+    // Exactly the interval is due (the client's clock is not ours to trust).
+    try testing.expect(hb.due(6_000));
+    try testing.expect(hb.due(60_000));
+
+    // Any byte written to the socket pushes the deadline out.
+    hb.noteWrite(60_000);
+    try testing.expect(!hb.due(60_001));
+    try testing.expect(hb.due(65_000));
+}
+
+test "StreamHeartbeat: buffered tokens do NOT reset the deadline" {
+    // The regression this guards: the old code beat only when NO token was
+    // available (`.idle`). A tool call buffers tokens continuously while
+    // writing nothing, so token arrival must not be mistaken for liveness —
+    // only `noteWrite` (bytes on the socket) counts.
+    var hb = StreamHeartbeat{ .last_write_ms = 0, .interval_ms = 5_000 };
+    var now: i64 = 0;
+    // 300 tokens arrive over 30s. Not one is written out (buffered tool call).
+    var i: usize = 0;
+    while (i < 300) : (i += 1) now += 100;
+    try testing.expectEqual(@as(i64, 30_000), now);
+    try testing.expect(hb.due(now));
+}
+
 test "clampMaxTokens no limit when ctx_size=0" {
     const original = server_config.max_context_size;
     defer server_config.max_context_size = original;
     server_config.max_context_size = 0;
 
-    try testing.expectEqual(@as(u32, 1000), clampMaxTokens(1000, 500));
+    try testing.expectEqual(@as(u32, 1000), clampMaxTokens(1000, 500, 0));
 }
 
 test "clampMaxTokens clamps when would exceed" {
@@ -10650,7 +10995,7 @@ test "clampMaxTokens clamps when would exceed" {
     server_config.max_context_size = 4096;
 
     // prompt=3000, max_tokens=2000 → clamp to 1096
-    try testing.expectEqual(@as(u32, 1096), clampMaxTokens(2000, 3000));
+    try testing.expectEqual(@as(u32, 1096), clampMaxTokens(2000, 3000, 4096));
 }
 
 test "clampMaxTokens no clamp when fits" {
@@ -10659,7 +11004,7 @@ test "clampMaxTokens no clamp when fits" {
     server_config.max_context_size = 4096;
 
     // prompt=100, max_tokens=200 → fits, no clamp
-    try testing.expectEqual(@as(u32, 200), clampMaxTokens(200, 100));
+    try testing.expectEqual(@as(u32, 200), clampMaxTokens(200, 100, 4096));
 }
 
 test "clampMaxTokens at boundary" {
@@ -10668,9 +11013,9 @@ test "clampMaxTokens at boundary" {
     server_config.max_context_size = 4096;
 
     // prompt=4096 → only 1 token allowed
-    try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, 4096));
+    try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, 4096, 4096));
     // prompt=4095 → only 1 token remaining
-    try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, 4095));
+    try testing.expectEqual(@as(u32, 1), clampMaxTokens(100, 4095, 4096));
 }
 
 test "getTimeoutNs computes correctly" {

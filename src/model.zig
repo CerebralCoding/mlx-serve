@@ -108,6 +108,17 @@ pub const ModelConfig = struct {
     // Context length from config.json (0 = unknown)
     max_position_embeddings: u32 = 0,
 
+    /// Auto-context, FROZEN at model-load time (`server.pinAutoContext`).
+    /// 0 = not pinned yet.
+    ///
+    /// Without `--ctx-size` the effective context used to be recomputed from
+    /// LIVE memory on every request, so the number the server advertised drifted
+    /// as other processes took RAM (measured: 92,387–94,883 across one session).
+    /// Agent CLIs budget their own `max_tokens` against that advertised value,
+    /// so it has to hold still for the model's whole residency. Explicit
+    /// `--ctx-size` still wins over this.
+    pinned_context: u32 = 0,
+
     // Stop tokens (populated from config.json)
     eos_token_ids: [8]u32 = .{0} ** 8,
     num_eos_tokens: u32 = 0,

@@ -88,7 +88,8 @@ final class CLILauncher: ObservableObject {
     }
 
     /// Launch a CLI with a folder picker for its working directory.
-    func launchWithPicker(_ cli: LauncherCLI, baseURL: String, servedModelId: String) {
+    func launchWithPicker(_ cli: LauncherCLI, baseURL: String, servedModelId: String,
+                          budget: AgentBudget.Budget) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -100,17 +101,21 @@ final class CLILauncher: ObservableObject {
         try? FileManager.default.createDirectory(atPath: defaultWS, withIntermediateDirectories: true)
         panel.directoryURL = URL(fileURLWithPath: defaultWS)
         guard panel.runModal() == .OK, let url = panel.url else { return }
-        launch(cli, baseURL: baseURL, servedModelId: servedModelId, workingDirectory: url.path)
+        launch(cli, baseURL: baseURL, servedModelId: servedModelId,
+               budget: budget, workingDirectory: url.path)
     }
 
     /// Write a shell script that sets the right env vars / config for the given
     /// CLI, then hand it to Terminal.app via NSWorkspace.
-    func launch(_ cli: LauncherCLI, baseURL: String, servedModelId: String, workingDirectory: String?) {
+    func launch(_ cli: LauncherCLI, baseURL: String, servedModelId: String,
+                budget: AgentBudget.Budget, workingDirectory: String?) {
         // pi and opencode both need their config files written before launch.
-        cli.prepareConfig?(baseURL, servedModelId)
+        // The budget travels with them: neither CLI reads `/v1/models`, so the
+        // number we write here IS the context they believe the model has.
+        cli.prepareConfig?(baseURL, servedModelId, budget)
 
         let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
-        let script = cli.scriptBody(baseURL, servedModelId, cdLine)
+        let script = cli.scriptBody(baseURL, servedModelId, cdLine, budget)
         let fullScript = "#!/bin/zsh -l\n\(script)\n"
 
         let filename = "mlx-launch-\(cli.id).command"
@@ -130,9 +135,11 @@ struct LauncherCLI: Identifiable, Equatable {
     let useClaudeIcon: Bool
     /// Optional side-effect invoked before the terminal script runs (e.g. write
     /// `~/.pi/agent/models.json`).
-    let prepareConfig: (@Sendable (_ baseURL: String, _ servedModelId: String) -> Void)?
+    let prepareConfig: (@Sendable (_ baseURL: String, _ servedModelId: String,
+                                  _ budget: AgentBudget.Budget) -> Void)?
     /// Shell body that sets env vars and execs the CLI. Does NOT include the shebang.
-    let scriptBody: (_ baseURL: String, _ servedModelId: String, _ cdLine: String) -> String
+    let scriptBody: (_ baseURL: String, _ servedModelId: String, _ cdLine: String,
+                     _ budget: AgentBudget.Budget) -> String
     var resolvedPath: String = ""
 
     static func == (lhs: LauncherCLI, rhs: LauncherCLI) -> Bool { lhs.id == rhs.id }
@@ -149,16 +156,9 @@ extension LauncherCLI {
         iconSystemName: nil,
         useClaudeIcon: true,
         prepareConfig: nil,
-        scriptBody: { baseURL, model, cdLine in
+        scriptBody: { baseURL, model, cdLine, budget in
             """
-            export ANTHROPIC_BASE_URL='\(baseURL)'
-            export ANTHROPIC_API_KEY=
-            export ANTHROPIC_AUTH_TOKEN=mlx-serve
-            export CLAUDE_CODE_ATTRIBUTION_HEADER=0
-            export ANTHROPIC_DEFAULT_OPUS_MODEL=\(model)
-            export ANTHROPIC_DEFAULT_SONNET_MODEL=\(model)
-            export ANTHROPIC_DEFAULT_HAIKU_MODEL=\(model)
-            export CLAUDE_CODE_SUBAGENT_MODEL=\(model)
+            \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))
             \(cdLine)
             claude --model \(model)
             """
@@ -173,34 +173,14 @@ extension LauncherCLI {
         binaryName: "pi",
         iconSystemName: "terminal",
         useClaudeIcon: false,
-        prepareConfig: { baseURL, model in
+        prepareConfig: { baseURL, model, budget in
             let dir = NSString(string: "~/.pi/agent").expandingTildeInPath
             try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
-            let config = """
-            {
-              "providers": {
-                "mlx": {
-                  "baseUrl": "\(baseURL)/v1",
-                  "api": "openai-completions",
-                  "apiKey": "mlx-serve",
-                  "compat": {
-                    "supportsDeveloperRole": false,
-                    "supportsReasoningEffort": false,
-                    "maxTokensField": "max_tokens",
-                    "thinkingFormat": "qwen"
-                  },
-                  "models": [
-                    {"id": "\(model)", "name": "mlx-\(model)", "input": ["text"],
-                     "contextWindow": 32768, "maxTokens": 8192, "reasoning": true}
-                  ]
-                }
-              }
-            }
-            """
+            let config = AgentConfigs.piModelsJSON(baseURL: baseURL, model: model, budget: budget)
             let path = (dir as NSString).appendingPathComponent("models.json")
             try? config.write(toFile: path, atomically: true, encoding: .utf8)
         },
-        scriptBody: { _, model, cdLine in
+        scriptBody: { _, model, cdLine, _ in
             """
             \(cdLine)
             pi --provider mlx --model \(model)
@@ -217,26 +197,12 @@ extension LauncherCLI {
         binaryName: "opencode",
         iconSystemName: "chevron.left.forwardslash.chevron.right",
         useClaudeIcon: false,
-        prepareConfig: { baseURL, model in
-            let config = """
-            {
-              "$schema": "https://opencode.ai/config.json",
-              "provider": {
-                "mlx": {
-                  "npm": "@ai-sdk/openai-compatible",
-                  "name": "MLX Serve (local)",
-                  "options": { "baseURL": "\(baseURL)/v1" },
-                  "models": {
-                    "\(model)": { "name": "\(model) (mlx-serve)" }
-                  }
-                }
-              }
-            }
-            """
+        prepareConfig: { baseURL, model, budget in
+            let config = AgentConfigs.opencodeJSON(baseURL: baseURL, model: model, budget: budget)
             let path = NSTemporaryDirectory() + "mlx-opencode-config.json"
             try? config.write(toFile: path, atomically: true, encoding: String.Encoding.utf8)
         },
-        scriptBody: { _, model, cdLine in
+        scriptBody: { _, model, cdLine, _ in
             let configPath = NSTemporaryDirectory() + "mlx-opencode-config.json"
             return """
             export OPENCODE_CONFIG='\(configPath)'
@@ -258,7 +224,14 @@ extension LauncherCLI {
 struct CLILauncherButton: View {
     let baseURL: String
     let servedModelId: String
+    /// The running server's EFFECTIVE context (`/v1/models` meta.context_length).
+    /// pi and opencode budget their own `max_tokens` against the number we write
+    /// into their config, so passing nil here silently caps every agent session
+    /// at the conservative fallback. See `AgentBudget`.
+    let serverContextLength: Int?
     let isEnabled: Bool
+
+    private var budget: AgentBudget.Budget { AgentBudget.forServerContext(serverContextLength) }
 
     @StateObject private var detector = CLILauncher()
 
@@ -273,7 +246,7 @@ struct CLILauncherButton: View {
                 EmptyView()
             } else if detector.available.count == 1, let only = detector.available.first {
                 Button {
-                    detector.launchWithPicker(only, baseURL: baseURL, servedModelId: servedModelId)
+                    detector.launchWithPicker(only, baseURL: baseURL, servedModelId: servedModelId, budget: budget)
                 } label: {
                     label(for: only).frame(maxWidth: .infinity)
                 }
@@ -284,7 +257,7 @@ struct CLILauncherButton: View {
                 Menu {
                     ForEach(detector.available) { cli in
                         Button {
-                            detector.launchWithPicker(cli, baseURL: baseURL, servedModelId: servedModelId)
+                            detector.launchWithPicker(cli, baseURL: baseURL, servedModelId: servedModelId, budget: budget)
                         } label: {
                             Label(cli.displayName, systemImage: cli.iconSystemName ?? "terminal")
                         }

@@ -59,6 +59,18 @@ pub const Metrics = struct {
 
     // Counters
     prompt_tokens_total: Counter,
+    /// Prompt tokens actually FORWARDED through the model during prefill, i.e.
+    /// `prompt_tokens - cached_tokens`. Divide the prefill-time histogram by
+    /// THIS, never by `prompt_tokens_total`: with the hot prefix cache warm, most
+    /// billed prompt tokens are restored, not computed, and the ratio inflates
+    /// prefill tok/s by `prompt/(prompt-cached)` (measured 10.6x on a warm
+    /// multi-turn 35B MoE session). `vllm:prompt_tokens_total` keeps the vLLM
+    /// meaning (all billed prompt tokens) for dashboard compatibility.
+    prefill_tokens_total: Counter,
+    /// Prompt tokens served straight from the hot prefix cache. Token-level
+    /// companion to `prefix_cache_hits_total`, which counts REQUESTS that hit.
+    /// Invariant: prefill_tokens_total + prefix_cache_tokens_total == prompt_tokens_total.
+    prefix_cache_tokens_total: Counter,
     generation_tokens_total: Counter,
     requests_success_total: Counter,
     requests_cancelled_total: Counter,
@@ -78,6 +90,16 @@ pub const Metrics = struct {
     // waiting for requests to complete. See server.zig sampleGauges +
     // liveGenerationTokens below.
     generation_tokens_live: Gauge,
+    // Tokens forwarded so far by the prefill currently running, 0 when none is.
+    // The OTHER half of the live picture: `generation_tokens_live` only moves
+    // during decode, and the prompt-token counter / prefill-time histogram only
+    // move when a request completes — so a long prefill was invisible. Set by
+    // the sampler from `Scheduler.inflight_prefill_tokens` (published once per
+    // prefill CHUNK, never per token).
+    prefill_tokens_live: Gauge,
+    // Slots currently in prefill. Flips as soon as prefill starts, so the panel
+    // can name the phase without waiting for the first chunk's token count.
+    requests_prefilling: Gauge,
 
     pub fn init() Metrics {
         return .{
@@ -88,6 +110,8 @@ pub const Metrics = struct {
             .prompt_tokens_hist = Histogram(8).init(TOKEN_BOUNDS),
             .output_tokens_hist = Histogram(8).init(TOKEN_BOUNDS),
             .prompt_tokens_total = Counter.init(),
+            .prefill_tokens_total = Counter.init(),
+            .prefix_cache_tokens_total = Counter.init(),
             .generation_tokens_total = Counter.init(),
             .requests_success_total = Counter.init(),
             .requests_cancelled_total = Counter.init(),
@@ -98,6 +122,8 @@ pub const Metrics = struct {
             .gpu_utilization_pct = Gauge.init(),
             .memory_mb = Gauge.init(),
             .generation_tokens_live = Gauge.init(),
+            .prefill_tokens_live = Gauge.init(),
+            .requests_prefilling = Gauge.init(),
         };
     }
 
@@ -151,6 +177,11 @@ pub const Metrics = struct {
         // Success path — record all instrumented metrics.
         self.requests_success_total.inc();
         self.prompt_tokens_total.add(prompt_tokens);
+        // Saturating: a restored prefix can never exceed the prompt, but never
+        // let a bad accounting wrap the counter.
+        const restored = @min(cached_tokens, prompt_tokens);
+        self.prefill_tokens_total.add(prompt_tokens - restored);
+        self.prefix_cache_tokens_total.add(restored);
         self.generation_tokens_total.add(completion_tokens);
 
         self.ttft_ns.observe(real_ttft_ns);
@@ -185,6 +216,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
 
     // --- Counters ---
     try writeCounter(w, "vllm:prompt_tokens_total", "Total prompt tokens processed", m.prompt_tokens_total.load());
+    try writeCounter(w, "mlx_serve:prefill_tokens_total", "Prompt tokens actually forwarded through prefill (excludes prefix-cache restores) — the correct numerator for prefill tok/s", m.prefill_tokens_total.load());
+    try writeCounter(w, "mlx_serve:prefix_cache_tokens_total", "Prompt tokens restored from the hot prefix cache instead of being computed", m.prefix_cache_tokens_total.load());
     try writeCounter(w, "vllm:generation_tokens_total", "Total generated tokens", m.generation_tokens_total.load());
     try writeCounter(w, "vllm:request_success_total", "Completed requests", m.requests_success_total.load());
     try writeCounter(w, "vllm:request_cancelled_total", "Requests cancelled by client disconnect", m.requests_cancelled_total.load());
@@ -197,6 +230,8 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
     try writeGauge(w, "mlx_serve:gpu_utilization_pct", "GPU utilization percentage (IOKit AGXAccelerator)", m.gpu_utilization_pct.load());
     try writeGauge(w, "mlx_serve:memory_mb", "Server physical memory footprint in megabytes (phys_footprint)", m.memory_mb.load());
     try writeGauge(w, "mlx_serve:generation_tokens_live", "Generation tokens completed plus generated-so-far by in-flight slots (real-time tok/s source)", m.generation_tokens_live.load());
+    try writeGauge(w, "mlx_serve:prefill_tokens_live", "Prompt tokens forwarded so far by the in-flight prefill (0 when idle; real-time prefill tok/s source)", m.prefill_tokens_live.load());
+    try writeGauge(w, "mlx_serve:requests_prefilling", "Requests currently in the prefill phase", m.requests_prefilling.load());
 
     // --- Latency histograms (nanoseconds → seconds) ---
     try writeHistogram(w, "vllm:time_to_first_token_seconds", "Time to first token in seconds", &m.ttft_ns, ns_to_s);
@@ -221,6 +256,8 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
     try w.print(
         "{{\"counters\":{{" ++
             "\"prompt_tokens_total\":{d}," ++
+            "\"prefill_tokens_total\":{d}," ++
+            "\"prefix_cache_tokens_total\":{d}," ++
             "\"generation_tokens_total\":{d}," ++
             "\"requests_success_total\":{d}," ++
             "\"requests_cancelled_total\":{d}," ++
@@ -231,10 +268,14 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             "\"requests_waiting\":{d}," ++
             "\"gpu_utilization_pct\":{d}," ++
             "\"memory_mb\":{d}," ++
-            "\"generation_tokens_live\":{d}" ++
+            "\"generation_tokens_live\":{d}," ++
+            "\"prefill_tokens_live\":{d}," ++
+            "\"requests_prefilling\":{d}" ++
             "}},\"histograms\":{{",
         .{
             m.prompt_tokens_total.load(),
+            m.prefill_tokens_total.load(),
+            m.prefix_cache_tokens_total.load(),
             m.generation_tokens_total.load(),
             m.requests_success_total.load(),
             m.requests_cancelled_total.load(),
@@ -245,6 +286,8 @@ pub fn renderJson(m: *const Metrics, w: *std.Io.Writer) !void {
             m.gpu_utilization_pct.load(),
             m.memory_mb.load(),
             m.generation_tokens_live.load(),
+            m.prefill_tokens_live.load(),
+            m.requests_prefilling.load(),
         },
     );
 
@@ -438,6 +481,101 @@ test "liveGenerationTokens = total + inflight aggregate" {
     // At rest (nothing decoding ⇒ inflight aggregate 0) the live gauge must
     // equal the completion counter — the invariant test_metrics.sh checks.
     try testing.expectEqual(@as(u64, 100), liveGenerationTokens(&m, 0));
+}
+
+test "prefill throughput must exclude cache-restored tokens" {
+    const testing = std.testing;
+    // `prompt_tokens_total` counts the FULL prompt, including tokens the hot
+    // prefix cache restored without forwarding them. Dividing that by
+    // `prefill_time_seconds` (which only ticks for work actually done) inflates
+    // prefill tok/s by prompt/(prompt-cached). Live 2026-07-09: a 35B MoE with
+    // a 91% token-level cache hit rate reported 9.8K tok/s where the server's
+    // own log line said ~220-1100. The panel needs the FORWARDED token count.
+    var m = Metrics.init();
+    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 1000, 50, 900);
+
+    // vLLM semantics preserved: every prompt token is billed.
+    try testing.expectEqual(@as(u64, 1000), m.prompt_tokens_total.load());
+    // ...but only 100 tokens were actually pushed through the model.
+    try testing.expectEqual(@as(u64, 100), m.prefill_tokens_total.load());
+    try testing.expectEqual(@as(u64, 900), m.prefix_cache_tokens_total.load());
+
+    // Universal invariant: forwarded + restored == billed.
+    try testing.expectEqual(
+        m.prompt_tokens_total.load(),
+        m.prefill_tokens_total.load() + m.prefix_cache_tokens_total.load(),
+    );
+
+    // A cold request (no cache hit) forwards everything.
+    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 400, 10, 0);
+    try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
+    try testing.expectEqual(@as(u64, 900), m.prefix_cache_tokens_total.load());
+
+    // Degenerate: cached >= prompt must saturate (restore 10, not 99) and never wrap.
+    m.recordRequest("stop", 1_000_000, 100_000_000, 500_000_000, 10, 1, 99);
+    try testing.expectEqual(@as(u64, 500), m.prefill_tokens_total.load());
+    try testing.expectEqual(@as(u64, 910), m.prefix_cache_tokens_total.load());
+    // Invariant survives the saturation.
+    try testing.expectEqual(
+        m.prompt_tokens_total.load(),
+        m.prefill_tokens_total.load() + m.prefix_cache_tokens_total.load(),
+    );
+
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderPrometheus(&m, &w);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "mlx_serve:prefill_tokens_total 500") != null);
+    try testing.expect(std.mem.indexOf(u8, w.buffered(), "mlx_serve:prefix_cache_tokens_total 910") != null);
+
+    // The index panel polls /metrics.json and divides by `prefill_tokens_total`.
+    var jbuf: [8192]u8 = undefined;
+    var jw = std.Io.Writer.fixed(&jbuf);
+    try renderJson(&m, &jw);
+    const j = jw.buffered();
+    try testing.expect(std.mem.indexOf(u8, j, "\"prefill_tokens_total\":500") != null);
+    try testing.expect(std.mem.indexOf(u8, j, "\"prefix_cache_tokens_total\":910") != null);
+}
+
+test "prefill progress is exposed live, not only at request completion" {
+    const testing = std.testing;
+    // `prompt_tokens_total` and the prefill_time histogram only advance when a
+    // request FINISHES, and generated tokens only accrue during decode. So a
+    // multi-minute prefill pinned the GPU while the panel showed 0 / "—".
+    // `prefill_tokens_live` is the missing signal: tokens forwarded so far by
+    // the in-flight prefill, 0 when none is running.
+    var m = Metrics.init();
+    m.prefill_tokens_live.set(16384);
+
+    var buf: [8192]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try renderPrometheus(&m, &w);
+    const out = w.buffered();
+    try testing.expect(std.mem.indexOf(u8, out, "# TYPE mlx_serve:prefill_tokens_live gauge") != null);
+    try testing.expect(std.mem.indexOf(u8, out, "mlx_serve:prefill_tokens_live 16384") != null);
+
+    var jbuf: [8192]u8 = undefined;
+    var jw = std.Io.Writer.fixed(&jbuf);
+    try renderJson(&m, &jw);
+    try testing.expect(std.mem.indexOf(u8, jw.buffered(), "\"prefill_tokens_live\":16384") != null);
+
+    // At rest it is zero — "prefilling" must mean exactly that.
+    m.prefill_tokens_live.set(0);
+    try testing.expectEqual(@as(u64, 0), m.prefill_tokens_live.load());
+
+    // The phase flag is separate from the token count: it flips at prefill
+    // START, so the panel isn't blind for the ~40 s a 27B takes to finish its
+    // first 8192-token chunk (and it also covers ds4/llama, whose prefill never
+    // reaches the MLX chunk loop and so never moves the token gauge).
+    m.requests_prefilling.set(1);
+    var b2: [8192]u8 = undefined;
+    var w2 = std.Io.Writer.fixed(&b2);
+    try renderPrometheus(&m, &w2);
+    try testing.expect(std.mem.indexOf(u8, w2.buffered(), "mlx_serve:requests_prefilling 1") != null);
+
+    var j2: [8192]u8 = undefined;
+    var jw2 = std.Io.Writer.fixed(&j2);
+    try renderJson(&m, &jw2);
+    try testing.expect(std.mem.indexOf(u8, jw2.buffered(), "\"requests_prefilling\":1") != null);
 }
 
 test "renderPrometheus emits well-formed Prometheus text" {

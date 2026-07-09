@@ -14,13 +14,26 @@ struct SettingsView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
 
+    /// Live filter text. Pushed down the tree via `\.settingsSearchQuery`;
+    /// every row decides for itself whether to stay on screen (see
+    /// `SearchableRow`), and every section collapses when nothing inside it
+    /// survived. The matching rule is pure and tested — `SettingsSearch`.
+    @State private var searchQuery = ""
+
+    /// Rows still visible under the current filter, summed up the tree from
+    /// `SettingsVisibleRowCountKey`. Drives the "no matches" placeholder.
+    @State private var visibleRows = 0
+
+    private var filtering: Bool { !SettingsSearch.tokens(searchQuery).isEmpty }
+
     var body: some View {
         VStack(spacing: 0) {
             if server.needsRestartFor(appState.serverOptions) {
                 RestartBanner()
             }
+            SettingsSearchField(text: $searchQuery)
             ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
+                VStack(alignment: .leading, spacing: 0) {
                     SettingsSection(
                         title: "Model Folders",
                         subtitle: "Always scans ~/.mlx-serve/models and ~/.lmstudio/models. Add one more folder here if your models live elsewhere — no restart needed."
@@ -73,8 +86,14 @@ struct SettingsView: View {
                         UpdatesSectionContent(updates: appState.updates)
                     }
 
+                    if filtering && visibleRows == 0 {
+                        NoSearchResults(query: searchQuery) { searchQuery = "" }
+                    }
+
                     ResetDefaultsFooter()
                 }
+                .environment(\.settingsSearchQuery, searchQuery)
+                .onPreferenceChange(SettingsVisibleRowCountKey.self) { visibleRows = $0 }
                 .padding(.horizontal, 24)
                 .padding(.vertical, 20)
                 .frame(maxWidth: .infinity, alignment: .leading)
@@ -84,40 +103,142 @@ struct SettingsView: View {
     }
 }
 
+// MARK: - Search plumbing
+
+/// The active filter text, pushed down to every row. A section whose *header*
+/// matches re-publishes a blank query to its children so the whole section
+/// shows (searching "telegram" should reveal the bot token, not just the rows
+/// whose own text happens to contain the word).
+private struct SettingsSearchQueryKey: EnvironmentKey {
+    static let defaultValue: String = ""
+}
+
+extension EnvironmentValues {
+    fileprivate var settingsSearchQuery: String {
+        get { self[SettingsSearchQueryKey.self] }
+        set { self[SettingsSearchQueryKey.self] = newValue }
+    }
+}
+
+/// Number of rows that survived the filter, summed up the view tree. Sections
+/// read it to decide whether to collapse; the root reads it to decide whether
+/// to show the "no matches" placeholder.
+private struct SettingsVisibleRowCountKey: PreferenceKey {
+    static let defaultValue: Int = 0
+    static func reduce(value: inout Int, nextValue: () -> Int) { value += nextValue() }
+}
+
+/// Wraps one row so the filter can hide it, and reports it as visible when it
+/// survives. `searchText` is conventionally `[label, description]` — the same
+/// text the row renders, so what you read is what you can search for.
+///
+/// Rows that don't match render nothing, which is what keeps a filtered screen
+/// short. Note they must not be dropped from the *section's* tree wholesale —
+/// see `SettingsSection.collapsed`.
+private struct SearchableRow<Content: View>: View {
+    let searchText: [String]
+    @ViewBuilder var content: Content
+
+    @Environment(\.settingsSearchQuery) private var query
+
+    var body: some View {
+        if SettingsSearch.matches(query: query, in: searchText) {
+            content.preference(key: SettingsVisibleRowCountKey.self, value: 1)
+        }
+    }
+}
+
+/// Filter field pinned above the scrolling form.
+private struct SettingsSearchField: View {
+    @Binding var text: String
+
+    var body: some View {
+        HStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .foregroundStyle(.secondary)
+            TextField("Filter settings", text: $text)
+                .textFieldStyle(.plain)
+            if !text.isEmpty {
+                Button {
+                    text = ""
+                } label: {
+                    Image(systemName: "xmark.circle.fill")
+                }
+                .buttonStyle(.borderless)
+                .foregroundStyle(.secondary)
+                .help("Clear the filter")
+            }
+        }
+        .padding(.horizontal, 10)
+        .padding(.vertical, 6)
+        .background(Color(NSColor.controlBackgroundColor))
+        .clipShape(RoundedRectangle(cornerRadius: 8))
+        .padding(.horizontal, 24)
+        .padding(.top, 14)
+    }
+}
+
+/// Shown when the filter matches nothing at all.
+private struct NoSearchResults: View {
+    let query: String
+    let clear: () -> Void
+
+    var body: some View {
+        VStack(spacing: 8) {
+            Image(systemName: "magnifyingglass")
+                .font(.title2)
+                .foregroundStyle(.secondary)
+            Text("No settings match “\(query)”")
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
+            Button("Clear filter", action: clear)
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+        }
+        .frame(maxWidth: .infinity)
+        .padding(.vertical, 48)
+    }
+}
+
 // MARK: - Reset to Defaults footer
 
-/// Single button that restores every field on the Settings screen to the
-/// values in `ServerOptions()` (the struct's default initializer). Confirms
-/// before discarding the user's tuning because some fields (drafter path,
-/// custom temperature, etc.) take meaningful effort to set up.
+/// Single button that restores the Settings screen to the values in
+/// `ServerOptions()`, keeping the Telegram bot token (see
+/// `ServerOptions.resetToDefaults(preserving:)` for why). Confirms before
+/// discarding the user's tuning because some fields (drafter path, custom
+/// temperature, etc.) take meaningful effort to set up.
 private struct ResetDefaultsFooter: View {
     @EnvironmentObject var appState: AppState
     @State private var showConfirm = false
 
+    private static let helpText = "Restores every Server / Speculative Decoding / Performance / Per-Request field to its built-in default. Your Telegram bot token is kept. Server-launch fields still need a restart to take effect."
+
     var body: some View {
-        HStack {
-            Spacer()
-            Button(role: .destructive) {
-                showConfirm = true
-            } label: {
-                Label("Reset to Defaults", systemImage: "arrow.uturn.backward.circle")
+        SearchableRow(searchText: ["Reset to Defaults", Self.helpText]) {
+            HStack {
+                Spacer()
+                Button(role: .destructive) {
+                    showConfirm = true
+                } label: {
+                    Label("Reset to Defaults", systemImage: "arrow.uturn.backward.circle")
+                }
+                .buttonStyle(.bordered)
+                .controlSize(.small)
+                .help(Self.helpText)
             }
-            .buttonStyle(.bordered)
-            .controlSize(.small)
-            .help("Restores every Server / Speculative Decoding / Performance / Per-Request field to its built-in default. Server-launch fields still need a restart to take effect.")
-        }
-        .padding(.top, 4)
-        .confirmationDialog(
-            "Reset all settings to defaults?",
-            isPresented: $showConfirm,
-            titleVisibility: .visible
-        ) {
-            Button("Reset", role: .destructive) {
-                appState.serverOptions = ServerOptions()
+            .padding(.top, 4)
+            .confirmationDialog(
+                "Reset all settings to defaults?",
+                isPresented: $showConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("Reset", role: .destructive) {
+                    appState.serverOptions = ServerOptions.resetToDefaults(preserving: appState.serverOptions)
+                }
+                Button("Cancel", role: .cancel) { }
+            } message: {
+                Text("This restores every field on this screen — server flags, speculative decoding, performance (continuous batching / KV-quant / prefix cache), and per-request defaults — to the values that ship with the app. Your Telegram bot token is kept, since only @BotFather can reissue it. The change is local; the running server keeps its current flags until you hit Restart Now.")
             }
-            Button("Cancel", role: .cancel) { }
-        } message: {
-            Text("This restores every field on this screen — server flags, speculative decoding, performance (continuous batching / KV-quant / prefix cache), and per-request defaults — to the values that ship with the app. The change is local; the running server keeps its current flags until you hit Restart Now.")
         }
     }
 }
@@ -201,6 +322,7 @@ private struct RestartBanner: View {
 /// fallback so power users know what's going on.
 private struct EngineAwareSections: View {
     @EnvironmentObject var server: ServerManager
+    @Environment(\.settingsSearchQuery) private var query
 
     /// Resolved engine for routing UI decisions. Nil when no model has
     /// loaded yet (server stopped or first start in progress) — that
@@ -255,7 +377,7 @@ private struct EngineAwareSections: View {
             }
         }
 
-        if engine == nil {
+        if engine == nil && SettingsSearch.tokens(query).isEmpty {
             HStack(spacing: 8) {
                 Image(systemName: "info.circle")
                     .foregroundStyle(.secondary)
@@ -265,6 +387,7 @@ private struct EngineAwareSections: View {
                     .fixedSize(horizontal: false, vertical: true)
             }
             .padding(.horizontal, 4)
+            .padding(.bottom, 24)
         }
     }
 }
@@ -276,22 +399,43 @@ private struct SettingsSection<Content: View>: View {
     let subtitle: String
     @ViewBuilder var content: Content
 
+    @Environment(\.settingsSearchQuery) private var query
+    @State private var visibleRows = 0
+
+    /// Both filter decisions (what query the rows see, whether to hide the
+    /// chrome) live in the pure, tested `SettingsSearch.SectionFilter`.
+    private var filter: SettingsSearch.SectionFilter {
+        SettingsSearch.section(query: query, title: title)
+    }
+
     var body: some View {
-        VStack(alignment: .leading, spacing: 12) {
-            VStack(alignment: .leading, spacing: 2) {
-                Text(title)
-                    .font(.title3.weight(.semibold))
-                Text(subtitle)
-                    .font(.caption)
-                    .foregroundStyle(.secondary)
+        // `content` keeps rendering even when collapsed (as a stack of empty
+        // rows), because it is the only thing that publishes
+        // `SettingsVisibleRowCountKey`. Dropping it from the tree would pin
+        // `visibleRows` at 0 and the section could never come back when the
+        // query changes. So we hide the *chrome* — header, padding, card —
+        // never the subtree.
+        let collapsed = filter.collapsed(visibleRows: visibleRows)
+        VStack(alignment: .leading, spacing: collapsed ? 0 : 12) {
+            if !collapsed {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(title)
+                        .font(.title3.weight(.semibold))
+                    Text(subtitle)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
             }
-            VStack(alignment: .leading, spacing: 18) {
+            VStack(alignment: .leading, spacing: collapsed ? 0 : 18) {
                 content
             }
-            .padding(16)
-            .background(Color(NSColor.controlBackgroundColor))
+            .environment(\.settingsSearchQuery, filter.childQuery)
+            .padding(collapsed ? 0 : 16)
+            .background(collapsed ? Color.clear : Color(NSColor.controlBackgroundColor))
             .clipShape(RoundedRectangle(cornerRadius: 10))
         }
+        .onPreferenceChange(SettingsVisibleRowCountKey.self) { visibleRows = $0 }
+        .padding(.bottom, collapsed ? 0 : 24)
     }
 }
 
@@ -310,26 +454,28 @@ private struct SettingsRow<Control: View>: View {
     @ViewBuilder var control: Control
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                HStack(spacing: 6) {
-                    Text(title)
-                        .font(.body)
-                    if isDirty {
-                        Image(systemName: "arrow.clockwise.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                            .help("Restart the server to apply this change")
+        SearchableRow(searchText: [title, explainer]) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    HStack(spacing: 6) {
+                        Text(title)
+                            .font(.body)
+                        if isDirty {
+                            Image(systemName: "arrow.clockwise.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .help("Restart the server to apply this change")
+                        }
                     }
+                    Spacer(minLength: 12)
+                    control
+                        .frame(maxWidth: 280, alignment: .trailing)
                 }
-                Spacer(minLength: 12)
-                control
-                    .frame(maxWidth: 280, alignment: .trailing)
+                Text(explainer)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Text(explainer)
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 }
@@ -358,6 +504,8 @@ private struct ModelFoldersSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var downloads: DownloadManager
 
+    private static let explainer = "Accepts both flat layout (<name>/config.json) and 2-level layout (<author>/<name>/config.json)."
+
     var body: some View {
         let pathText: String = {
             let raw = downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines) ?? ""
@@ -365,32 +513,34 @@ private struct ModelFoldersSectionContent: View {
         }()
         let hasPath = !(downloads.customRoot?.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty ?? true)
 
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("Custom folder")
-                    .font(.body)
-                Spacer(minLength: 12)
-                HStack(spacing: 8) {
-                    Text(pathText)
-                        .font(.caption.monospaced())
-                        .foregroundStyle(hasPath ? .primary : .secondary)
-                        .lineLimit(1)
-                        .truncationMode(.middle)
-                        .frame(maxWidth: 220, alignment: .trailing)
-                    Button("Choose…") { choose() }
+        SearchableRow(searchText: ["Custom folder", Self.explainer]) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Custom folder")
+                        .font(.body)
+                    Spacer(minLength: 12)
+                    HStack(spacing: 8) {
+                        Text(pathText)
+                            .font(.caption.monospaced())
+                            .foregroundStyle(hasPath ? .primary : .secondary)
+                            .lineLimit(1)
+                            .truncationMode(.middle)
+                            .frame(maxWidth: 220, alignment: .trailing)
+                        Button("Choose…") { choose() }
+                            .buttonStyle(.bordered)
+                        Button("Clear") {
+                            downloads.customRoot = nil
+                            appState.refreshModels()
+                        }
                         .buttonStyle(.bordered)
-                    Button("Clear") {
-                        downloads.customRoot = nil
-                        appState.refreshModels()
+                        .disabled(!hasPath)
                     }
-                    .buttonStyle(.bordered)
-                    .disabled(!hasPath)
                 }
+                Text(Self.explainer)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Text("Accepts both flat layout (<name>/config.json) and 2-level layout (<author>/<name>/config.json).")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
     }
 
@@ -596,11 +746,10 @@ private struct ContextSizeRow: View {
         return best
     }
 
+    /// Shared with `ContextSizeDisplayTests` — the row shows three different
+    /// token counts, so the formatting and the copy live in one tested place.
     private static func formatTokens(_ n: Int) -> String {
-        if n == 0 { return "Auto" }
-        if n >= 1_048_576 { return "\(n / 1_048_576)M" }
-        if n >= 1024 { return "\(n / 1024)K" }
-        return "\(n)"
+        ContextSizeDisplay.formatTokens(n)
     }
 
     private var isDirty: Bool {
@@ -609,61 +758,75 @@ private struct ContextSizeRow: View {
     }
 
     var body: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                HStack(spacing: 6) {
-                    Text("Context size")
-                        .font(.body)
-                    if isDirty {
-                        Image(systemName: "arrow.clockwise.circle.fill")
-                            .font(.caption)
-                            .foregroundStyle(.orange)
-                            .help("Restart the server to apply this change")
+        // The three cap pills carry their own vocabulary ("GPU-safe max"), so
+        // they belong in the haystack alongside the label and help text.
+        SearchableRow(searchText: [
+            "Context size", ContextSizeDisplay.helpText,
+            "Model max", "GPU-safe max", "In use",
+        ]) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    HStack(spacing: 6) {
+                        Text("Context size")
+                            .font(.body)
+                        if isDirty {
+                            Image(systemName: "arrow.clockwise.circle.fill")
+                                .font(.caption)
+                                .foregroundStyle(.orange)
+                                .help("Restart the server to apply this change")
+                        }
+                    }
+                    Spacer(minLength: 12)
+                    HStack(spacing: 8) {
+                        Slider(
+                            value: Binding(
+                                get: { Double(currentIndex) },
+                                set: { raw in
+                                    let i = Int(raw.rounded())
+                                    let clamped = max(0, min(i, presets.count - 1))
+                                    appState.serverOptions.ctxSize = presets[clamped]
+                                }
+                            ),
+                            in: 0...Double(max(1, presets.count - 1)),
+                            step: 1
+                        )
+                        .frame(width: 200)
+                        Text(Self.formatTokens(appState.serverOptions.ctxSize))
+                            .font(.body.monospacedDigit())
+                            .frame(minWidth: 56, alignment: .trailing)
                     }
                 }
-                Spacer(minLength: 12)
-                HStack(spacing: 8) {
-                    Slider(
-                        value: Binding(
-                            get: { Double(currentIndex) },
-                            set: { raw in
-                                let i = Int(raw.rounded())
-                                let clamped = max(0, min(i, presets.count - 1))
-                                appState.serverOptions.ctxSize = presets[clamped]
-                            }
-                        ),
-                        in: 0...Double(max(1, presets.count - 1)),
-                        step: 1
-                    )
-                    .frame(width: 200)
-                    Text(Self.formatTokens(appState.serverOptions.ctxSize))
-                        .font(.body.monospacedDigit())
-                        .frame(minWidth: 56, alignment: .trailing)
-                }
-            }
-            Text("Maximum prompt + completion tokens. \"Auto\" uses the model's declared maximum at load time. Higher values use more memory.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
+                Text(ContextSizeDisplay.helpText)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
 
-            // Cap info: model max + GPU-safe max for this Mac. Visible only
-            // when the server has reported them (after first model load).
-            HStack(spacing: 12) {
-                if let modelMax = server.modelInfo?.modelMaxTokens, modelMax > 0 {
-                    capPill(
-                        label: "Model max",
-                        value: Self.formatTokens(modelMax),
-                        warn: false
-                    )
-                }
-                if let safeMax = server.memoryInfo?.maxSafeContext, safeMax > 0 {
-                    let chosen = appState.serverOptions.ctxSize
-                    let exceeds = chosen > 0 && chosen > safeMax
-                    capPill(
-                        label: "GPU-safe max",
-                        value: Self.formatTokens(safeMax),
-                        warn: exceeds
-                    )
+                // Cap info: model max + GPU-safe max for this Mac. Visible only
+                // when the server has reported them (after first model load).
+                HStack(spacing: 12) {
+                    if let modelMax = server.modelInfo?.modelMaxTokens, modelMax > 0 {
+                        capPill(
+                            label: "Model max",
+                            value: Self.formatTokens(modelMax),
+                            warn: false
+                        )
+                    }
+                    if let safeMax = server.memoryInfo?.maxSafeContext, safeMax > 0 {
+                        let chosen = appState.serverOptions.ctxSize
+                        let exceeds = chosen > 0 && chosen > safeMax
+                        capPill(
+                            label: "GPU-safe max",
+                            value: Self.formatTokens(safeMax),
+                            warn: exceeds
+                        )
+                    }
+                    // What the running server actually pinned and enforces. This is
+                    // the number agent CLIs (pi / opencode / Claude Code) are handed,
+                    // so "Auto" must not look like a mystery.
+                    if let inUse = ContextSizeDisplay.inUseValue(
+                        contextLength: server.modelInfo?.contextLength) {
+                        capPill(label: "In use", value: inUse, warn: false)
+                    }
                 }
             }
         }
@@ -1042,6 +1205,15 @@ private struct DrafterRow: View {
     private var toggleEnabled: Bool { recommended != nil }
 
     var body: some View {
+        // `explainer` is state-dependent (names the discovered checkpoint, or
+        // why there isn't one), so the searchable text follows the UI.
+        SearchableRow(searchText: ["Enable Assistant MTP Drafter model", explainer]) {
+            rowBody
+        }
+    }
+
+    @ViewBuilder
+    private var rowBody: some View {
         VStack(alignment: .leading, spacing: 4) {
             HStack(alignment: .firstTextBaseline) {
                 HStack(spacing: 6) {
@@ -1333,7 +1505,16 @@ private struct VoiceCloneSectionContent: View {
     @StateObject private var recorder = AudioRecorder()
     @State private var voiceError: String?
 
+    private static let explainer = "A few seconds of clean speech works best. Answers are synthesized locally by the Audio pane's TTS model (downloaded on first use)."
+
     var body: some View {
+        SearchableRow(searchText: ["Voice clone clip", Self.explainer, "Record", "Choose file"]) {
+            clipBody
+        }
+    }
+
+    @ViewBuilder
+    private var clipBody: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Voice clone clip").font(.subheadline.weight(.semibold))
             HStack(spacing: 8) {
@@ -1364,7 +1545,7 @@ private struct VoiceCloneSectionContent: View {
                 }
             }
             .font(.caption)
-            Text("A few seconds of clean speech works best. Answers are synthesized locally by the Audio pane's TTS model (downloaded on first use).")
+            Text(Self.explainer)
                 .font(.caption2).foregroundStyle(.secondary)
             if let voiceError {
                 Text(voiceError).font(.caption).foregroundStyle(.red)
@@ -1470,11 +1651,13 @@ private struct MessagingSectionContent: View {
     var body: some View {
         // Live status pill (only meaningful once enabled).
         if telegram.enabled {
-            HStack(spacing: 8) {
-                Text("Status")
-                    .font(.body)
-                Spacer(minLength: 12)
-                statusPill
+            SearchableRow(searchText: ["Status", "Telegram bot bridge connection status"]) {
+                HStack(spacing: 8) {
+                    Text("Status")
+                        .font(.body)
+                    Spacer(minLength: 12)
+                    statusPill
+                }
             }
         }
 
@@ -1526,47 +1709,54 @@ private struct MessagingSectionContent: View {
         }
 
         // Allow-list / lock control.
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                Text("Locked to")
-                    .font(.body)
-                Spacer(minLength: 12)
-                HStack(spacing: 8) {
-                    Text(lockLabel)
-                        .font(.caption.monospacedDigit())
-                        .foregroundStyle(telegram.allowedChatIds.isEmpty ? .secondary : .primary)
-                    Button("Reset lock") {
-                        appState.serverOptions.telegram.allowedChatIds = []
+        SearchableRow(searchText: ["Locked to", "Reset lock", Self.lockExplainer]) {
+            VStack(alignment: .leading, spacing: 4) {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("Locked to")
+                        .font(.body)
+                    Spacer(minLength: 12)
+                    HStack(spacing: 8) {
+                        Text(lockLabel)
+                            .font(.caption.monospacedDigit())
+                            .foregroundStyle(telegram.allowedChatIds.isEmpty ? .secondary : .primary)
+                        Button("Reset lock") {
+                            appState.serverOptions.telegram.allowedChatIds = []
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.small)
+                        .disabled(telegram.allowedChatIds.isEmpty)
                     }
-                    .buttonStyle(.bordered)
-                    .controlSize(.small)
-                    .disabled(telegram.allowedChatIds.isEmpty)
                 }
+                Text(Self.lockExplainer)
+                    .font(.caption2)
+                    .foregroundStyle(.secondary)
+                    .fixedSize(horizontal: false, vertical: true)
             }
-            Text("The first chat that messages the bot is adopted as the owner; everyone else is refused. Reset to hand the bot to a different chat.")
-                .font(.caption2)
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
         }
 
-        Divider()
-
-        // Setup steps.
-        VStack(alignment: .leading, spacing: 6) {
-            Text("Setup")
-                .font(.caption.weight(.semibold))
-            Text("1. In Telegram, open @BotFather and send /newbot.")
-                .font(.caption2).foregroundStyle(.secondary)
-            Text("2. Copy the token it gives you and paste it above.")
-                .font(.caption2).foregroundStyle(.secondary)
-            Text("3. Turn on “Enable Telegram bot”, then message your bot once to lock it to your chat.")
-                .font(.caption2).foregroundStyle(.secondary)
-            Link("Open @BotFather ↗", destination: URL(string: "https://t.me/botfather")!)
-                .font(.caption2)
+        // Setup steps. The divider rides inside the searchable row so a
+        // filtered view never leaves a dangling separator behind.
+        SearchableRow(searchText: ["Setup", "BotFather", "newbot", "token", "lock it to your chat"]) {
+            VStack(alignment: .leading, spacing: 6) {
+                Divider()
+                    .padding(.bottom, 6)
+                Text("Setup")
+                    .font(.caption.weight(.semibold))
+                Text("1. In Telegram, open @BotFather and send /newbot.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text("2. Copy the token it gives you and paste it above.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Text("3. Turn on “Enable Telegram bot”, then message your bot once to lock it to your chat.")
+                    .font(.caption2).foregroundStyle(.secondary)
+                Link("Open @BotFather ↗", destination: URL(string: "https://t.me/botfather")!)
+                    .font(.caption2)
+            }
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 2)
         }
-        .fixedSize(horizontal: false, vertical: true)
-        .padding(.top, 2)
     }
+
+    private static let lockExplainer = "The first chat that messages the bot is adopted as the owner; everyone else is refused. Reset to hand the bot to a different chat."
 
     private var lockLabel: String {
         let ids = telegram.allowedChatIds

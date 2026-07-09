@@ -1,20 +1,24 @@
 import SwiftUI
 
+/// Model Browser: a sidebar over four destinations (`ModelBrowserSection`).
+///
+/// It used to be one pane with a `Toggle("Downloaded")` push-button that swapped
+/// the data source underneath you, and it deleted on-disk models from the search
+/// results — so the model you just finished downloading vanished at 100%. Now
+/// Discover marks what you own instead of hiding it, Downloads is a first-class
+/// queue rather than rows stapled to the top of a list, and My Models shows
+/// everything the tray picker offers rather than only what we fetched ourselves.
 struct ModelBrowserView: View {
     @EnvironmentObject var searchService: HFSearchService
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
-    @State private var showDownloadedOnly = false
+
+    @State private var selection: ModelBrowserSection? = .discover
     @State private var localFilter = ""
 
-    private var filteredLocalModels: [LocalModel] {
-        // The "Downloaded" tab represents what mlx-serve itself fetched.
-        // Externally-discovered models (LM Studio) live in the dropdown but not here.
-        let mlxServeOnly = appState.localModels.filter { $0.source == .mlxServe }
-        if localFilter.isEmpty { return mlxServeOnly }
-        return mlxServeOnly.filter { $0.name.localizedCaseInsensitiveContains(localFilter) }
-    }
+    private var section: ModelBrowserSection { selection ?? .discover }
 
+    /// Downloading *or* failed — both belong in the queue and both earn a badge.
     private var activeDownloads: [(repoId: String, state: DownloadManager.DownloadState)] {
         downloads.downloads
             .filter { $0.value.status == .downloading || $0.value.status == .failed }
@@ -22,198 +26,61 @@ struct ModelBrowserView: View {
             .map { (repoId: $0.key, state: $0.value) }
     }
 
+    private var badges: ModelBrowserBadgeCounts {
+        ModelBrowserBadgeCounts(
+            myModels: appState.localModels.count,
+            activeDownloads: activeDownloads.count,
+            draftersReady: GemmaVariant.allCases.filter { downloads.isReady($0.drafterRepoId) }.count
+        )
+    }
+
     var body: some View {
-        VStack(spacing: 0) {
-            // Search bar
-            HStack(spacing: 8) {
-                HStack(spacing: 6) {
-                    Image(systemName: "magnifyingglass")
-                        .foregroundStyle(.secondary)
-                    if showDownloadedOnly {
-                        TextField("Filter local models...", text: $localFilter)
-                            .textFieldStyle(.plain)
-                    } else {
-                        TextField("Search models...", text: $searchService.searchQuery)
-                            .textFieldStyle(.plain)
-                            .onSubmit { Task { await searchService.search() } }
-                    }
-                }
-                .padding(8)
-                .background(.quaternary.opacity(0.5))
-                .cornerRadius(8)
-
-                if !showDownloadedOnly {
-                    // Weight-format filter: MLX (safetensors), GGUF (llama.cpp /
-                    // ds4), or Both. Re-runs the search on change.
-                    Picker("Format", selection: $searchService.format) {
-                        ForEach(ModelFormat.allCases) { f in
-                            Text(f.label).tag(f)
-                        }
-                    }
-                    .pickerStyle(.segmented)
-                    .labelsHidden()
-                    .fixedSize()
-                    .onChange(of: searchService.format) { _, _ in
-                        Task { await searchService.search() }
-                    }
-
-                    Button("Search") {
-                        Task { await searchService.search() }
-                    }
-                    .controlSize(.regular)
-                }
-
-                Toggle(isOn: $showDownloadedOnly) {
-                    Label("Downloaded", systemImage: "internaldrive")
-                }
-                .toggleStyle(.button)
-                .controlSize(.regular)
-            }
-            .padding(12)
-
-            Divider()
-
-            if showDownloadedOnly {
-                // Local models header
-                HStack(spacing: 8) {
-                    Text("Model")
-                        .frame(maxWidth: .infinity, alignment: .leading)
-                    Text("Size on Disk")
-                        .frame(width: 90, alignment: .trailing)
-                    Text("")
-                        .frame(width: 64)
-                }
-                .font(.callout.weight(.semibold))
-                .foregroundStyle(.secondary)
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-                .background(.quaternary.opacity(0.3))
-
-                Divider()
-
-                // Local model list + active downloads
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        ForEach(activeDownloads, id: \.repoId) { item in
-                            ActiveDownloadRow(repoId: item.repoId, state: item.state)
-                            Divider().padding(.horizontal, 12)
-                        }
-
-                        ForEach(filteredLocalModels) { model in
-                            LocalModelRow(model: model)
-                            Divider().padding(.horizontal, 12)
-                        }
-
-                        if activeDownloads.isEmpty && filteredLocalModels.isEmpty {
-                            Text("No downloaded models")
-                                .foregroundStyle(.secondary)
-                                .padding(40)
-                        }
-                    }
-                }
-
-                Divider()
-
-                HStack {
-                    Text("\(filteredLocalModels.count) downloaded\(activeDownloads.isEmpty ? "" : ", \(activeDownloads.count) in progress")")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    Spacer()
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
-            } else {
-                // Column headers
-                ColumnHeaderRow(searchService: searchService)
-                    .padding(.horizontal, 12)
-                    .padding(.vertical, 6)
-                    .background(.quaternary.opacity(0.3))
-
-                Divider()
-
-                // HuggingFace model list, with the curated Drafters section
-                // pinned at the top so users land on it before scrolling
-                // through generic search results.
-                //
-                // Already-downloaded models are filtered out here — they live
-                // in the Downloaded tab, and surfacing them again as
-                // "Download" rows is noise. Their counts still match in the
-                // footer total.
-                let visibleModels = searchService.models.filter { !downloads.isReady($0.id) }
-                let hiddenCount = searchService.models.count - visibleModels.count
-
-                ScrollView {
-                    LazyVStack(spacing: 0) {
-                        DraftersSection()
-                        ForEach(visibleModels) { model in
-                            ModelBrowserRow(
-                                model: model,
-                                fitness: searchService.ramFitness(for: model)
-                            )
-                            Divider().padding(.horizontal, 12)
-                        }
-
-                        if searchService.isLoading {
-                            ProgressView()
-                                .padding(20)
-                        } else if let error = searchService.error {
-                            Text(error)
-                                .foregroundStyle(.red)
-                                .font(.caption)
-                                .padding(20)
-                        } else if visibleModels.isEmpty && hiddenCount == 0 {
-                            Text("No models found")
-                                .foregroundStyle(.secondary)
-                                .padding(40)
-                        }
-
-                        if searchService.hasMore && !searchService.models.isEmpty && !searchService.isLoading {
-                            Button("Load More") {
-                                Task { await searchService.loadMore() }
+        NavigationSplitView {
+            List(ModelBrowserSection.allCases, selection: $selection) { item in
+                NavigationLink(value: item) {
+                    Label {
+                        HStack(spacing: 6) {
+                            Text(item.title)
+                            Spacer(minLength: 4)
+                            if item == .downloads, !activeDownloads.isEmpty {
+                                ProgressView()
+                                    .controlSize(.small)
+                                    .scaleEffect(0.6)
                             }
-                            .buttonStyle(.bordered)
-                            .controlSize(.regular)
-                            .padding(16)
+                            if let badge = badges.badge(for: item) {
+                                Text(badge)
+                                    .font(.caption2.monospacedDigit())
+                                    .foregroundStyle(.secondary)
+                                    .padding(.horizontal, 6)
+                                    .padding(.vertical, 1)
+                                    .background(.quaternary, in: Capsule())
+                            }
                         }
+                    } icon: {
+                        Image(systemName: item.systemImage)
                     }
                 }
-
-                Divider()
-
-                HStack {
-                    Text("Showing \(visibleModels.count) models")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                    if hiddenCount > 0 {
-                        Text("· \(hiddenCount) already downloaded")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                    Spacer()
-                    Text("System RAM: \(MemoryInfo.format(Int64(searchService.systemRAM)))")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
-                .padding(.horizontal, 12)
-                .padding(.vertical, 6)
             }
+            .navigationSplitViewColumnWidth(min: 190, ideal: 205, max: 260)
+        } detail: {
+            detail
+                .frame(minWidth: 720)
         }
         .task {
             if searchService.models.isEmpty {
                 await searchService.search()
             }
         }
-        .onChange(of: showDownloadedOnly) { _, isLocal in
-            if isLocal { appState.refreshModels() }
-        }
-        // Live-refresh on-disk sizes while the Downloaded tab is open and a
+        .onChange(of: selection) { _, _ in appState.refreshModels() }
+        // Live-refresh on-disk sizes while a disk-state pane is showing and a
         // download is in flight, so completion + growing size show up without
-        // the user toggling the button. The task id flips when the tab closes
-        // or the active-download set changes, which cancels + re-evaluates the
-        // guard — so it self-terminates once everything finishes.
-        .task(id: "\(showDownloadedOnly)-\(activeDownloads.count)") {
-            guard Self.shouldLivePoll(downloadedTab: showDownloadedOnly,
-                                      hasActiveDownloads: !activeDownloads.isEmpty) else { return }
+        // the user navigating away and back. The task id flips when the section
+        // changes or the active-download set changes, which cancels +
+        // re-evaluates the guard — so it self-terminates once everything
+        // finishes.
+        .task(id: "\(section.rawValue)-\(activeDownloads.count)") {
+            guard ModelBrowserSection.shouldLivePoll(section: section,
+                                                     hasActiveDownloads: !activeDownloads.isEmpty) else { return }
             while !Task.isCancelled {
                 try? await Task.sleep(nanoseconds: 1_000_000_000)
                 if Task.isCancelled { break }
@@ -222,11 +89,348 @@ struct ModelBrowserView: View {
         }
     }
 
-    /// Whether the Downloaded tab should live-refresh on-disk sizes: only when
-    /// the tab is showing AND a download is in flight. Pulled out so the polling
-    /// trigger is unit-testable without driving SwiftUI.
-    static func shouldLivePoll(downloadedTab: Bool, hasActiveDownloads: Bool) -> Bool {
-        downloadedTab && hasActiveDownloads
+    @ViewBuilder
+    private var detail: some View {
+        switch section {
+        case .discover:  DiscoverPane()
+        case .myModels:  MyModelsPane(filter: $localFilter)
+        case .downloads: DownloadsPane(items: activeDownloads)
+        case .drafters:  DraftersPane()
+        }
+    }
+}
+
+// MARK: - Discover
+
+/// HuggingFace search. On-disk models stay in the list, marked `✓ On disk` with
+/// a Use action — never filtered out.
+private struct DiscoverPane: View {
+    @EnvironmentObject var searchService: HFSearchService
+    @EnvironmentObject var downloads: DownloadManager
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                HStack(spacing: 6) {
+                    Image(systemName: "magnifyingglass")
+                        .foregroundStyle(.secondary)
+                    TextField("Search models...", text: $searchService.searchQuery)
+                        .textFieldStyle(.plain)
+                        .onSubmit { Task { await searchService.search() } }
+                }
+                .padding(8)
+                .background(.quaternary.opacity(0.5))
+                .cornerRadius(8)
+
+                // Weight-format filter: MLX (safetensors), GGUF (llama.cpp /
+                // ds4), or Both. Re-runs the search on change.
+                Picker("Format", selection: $searchService.format) {
+                    ForEach(ModelFormat.allCases) { f in
+                        Text(f.label).tag(f)
+                    }
+                }
+                .pickerStyle(.segmented)
+                .labelsHidden()
+                .fixedSize()
+                .onChange(of: searchService.format) { _, _ in
+                    Task { await searchService.search() }
+                }
+
+                Button("Search") {
+                    Task { await searchService.search() }
+                }
+                .controlSize(.regular)
+            }
+            .padding(12)
+
+            Divider()
+
+            ColumnHeaderRow(searchService: searchService)
+                .padding(.horizontal, 12)
+                .padding(.vertical, 6)
+                .background(.quaternary.opacity(0.3))
+
+            Divider()
+
+            let onDiskCount = searchService.models.filter { downloads.isReady($0.id) }.count
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(searchService.models) { model in
+                        ModelBrowserRow(
+                            model: model,
+                            fitness: searchService.ramFitness(for: model)
+                        )
+                        Divider().padding(.horizontal, 12)
+                    }
+
+                    if searchService.isLoading {
+                        ProgressView()
+                            .padding(20)
+                    } else if let error = searchService.error {
+                        Text(error)
+                            .foregroundStyle(.red)
+                            .font(.caption)
+                            .padding(20)
+                    } else if searchService.models.isEmpty {
+                        Text("No models found")
+                            .foregroundStyle(.secondary)
+                            .padding(40)
+                    }
+
+                    if searchService.hasMore && !searchService.models.isEmpty && !searchService.isLoading {
+                        Button("Load More") {
+                            Task { await searchService.loadMore() }
+                        }
+                        .buttonStyle(.bordered)
+                        .controlSize(.regular)
+                        .padding(16)
+                    }
+                }
+            }
+
+            Divider()
+
+            HStack {
+                Text("Showing \(searchService.models.count) models")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                if onDiskCount > 0 {
+                    Text("· \(onDiskCount) on disk")
+                        .font(.caption)
+                        .foregroundStyle(.green)
+                }
+                Spacer()
+                Text("System RAM: \(MemoryInfo.format(Int64(searchService.systemRAM)))")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+        .navigationTitle("Discover")
+    }
+}
+
+// MARK: - My Models
+
+/// Everything on this Mac the tray picker can offer, grouped by where it came
+/// from. The old "Downloaded" tab listed only `source == .mlxServe`, so it was a
+/// strict subset of what you could actually load.
+private struct MyModelsPane: View {
+    @Binding var filter: String
+    @EnvironmentObject var appState: AppState
+
+    private var groups: [LocalModelGroup] {
+        ModelBrowserUse.groupedBySource(appState.localModels, filter: filter)
+    }
+
+    private var total: Int { groups.reduce(0) { $0 + $1.models.count } }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 6) {
+                Image(systemName: "magnifyingglass")
+                    .foregroundStyle(.secondary)
+                TextField("Filter your models...", text: $filter)
+                    .textFieldStyle(.plain)
+                if !filter.isEmpty {
+                    Button { filter = "" } label: { Image(systemName: "xmark.circle.fill") }
+                        .buttonStyle(.plain)
+                        .foregroundStyle(.secondary)
+                }
+            }
+            .padding(8)
+            .background(.quaternary.opacity(0.5))
+            .cornerRadius(8)
+            .padding(12)
+
+            Divider()
+
+            HStack(spacing: 8) {
+                Text("Model")
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                Text("Size on Disk")
+                    .frame(width: 90, alignment: .trailing)
+                Text("")
+                    .frame(width: 120)
+            }
+            .font(.callout.weight(.semibold))
+            .foregroundStyle(.secondary)
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+            .background(.quaternary.opacity(0.3))
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 0, pinnedViews: [.sectionHeaders]) {
+                    ForEach(groups) { group in
+                        Section {
+                            ForEach(group.models) { model in
+                                LocalModelRow(model: model)
+                                Divider().padding(.horizontal, 12)
+                            }
+                        } header: {
+                            Text(ModelBrowserUse.groupTitle(group.source))
+                                .font(.caption.weight(.semibold))
+                                .foregroundStyle(.secondary)
+                                .frame(maxWidth: .infinity, alignment: .leading)
+                                .padding(.horizontal, 12)
+                                .padding(.vertical, 4)
+                                .background(.bar)
+                        }
+                    }
+
+                    if groups.isEmpty {
+                        Text(filter.isEmpty ? "No models on this Mac yet" : "No models match “\(filter)”")
+                            .foregroundStyle(.secondary)
+                            .padding(40)
+                    }
+                }
+            }
+
+            Divider()
+
+            HStack {
+                Text("\(total) model\(total == 1 ? "" : "s") on disk")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(.horizontal, 12)
+            .padding(.vertical, 6)
+        }
+        .navigationTitle("My Models")
+    }
+}
+
+// MARK: - Downloads
+
+/// The transfer queue. Promoted out of the old Downloaded tab so an in-flight
+/// download is reachable (and badged) from anywhere in the browser.
+private struct DownloadsPane: View {
+    let items: [(repoId: String, state: DownloadManager.DownloadState)]
+
+    var body: some View {
+        VStack(spacing: 0) {
+            if items.isEmpty {
+                Spacer()
+                VStack(spacing: 8) {
+                    Image(systemName: "arrow.down.circle")
+                        .font(.largeTitle)
+                        .foregroundStyle(.secondary)
+                    Text("No downloads in progress")
+                        .foregroundStyle(.secondary)
+                    Text("Start one from Discover or Drafters.")
+                        .font(.caption)
+                        .foregroundStyle(.tertiary)
+                }
+                Spacer()
+            } else {
+                ScrollView {
+                    LazyVStack(spacing: 0) {
+                        ForEach(items, id: \.repoId) { item in
+                            ActiveDownloadRow(repoId: item.repoId, state: item.state)
+                            Divider().padding(.horizontal, 12)
+                        }
+                    }
+                }
+            }
+        }
+        .navigationTitle("Downloads")
+    }
+}
+
+// MARK: - Drafters pane
+
+/// The curated drafter catalog, previously a collapsed disclosure pinned above
+/// the search results. As its own destination it's discoverable without
+/// competing for vertical space with the model list.
+private struct DraftersPane: View {
+    @EnvironmentObject var downloads: DownloadManager
+
+    private var rows: [DrafterCatalogRow] {
+        GemmaVariant.allCases.map { v in
+            DrafterCatalogRow(
+                variant: v,
+                repoId: v.drafterRepoId,
+                pairsWith: "for \(v.label)",
+                sizeEstimate: DrafterCatalogRow.sizeEstimate(for: v)
+            )
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 8) {
+                Image(systemName: "sparkles")
+                    .foregroundStyle(.purple)
+                Text("Pair a drafter with a Gemma 4 base model for +27–40% on code & agents.")
+                    .font(.caption)
+                    .foregroundStyle(.secondary)
+                Spacer()
+            }
+            .padding(12)
+            .background(Color.purple.opacity(0.06))
+
+            Divider()
+
+            ScrollView {
+                LazyVStack(spacing: 0) {
+                    ForEach(rows) { row in
+                        DrafterCatalogRowView(row: row)
+                        Divider().padding(.horizontal, 12)
+                    }
+                }
+            }
+        }
+        .navigationTitle("Drafters")
+    }
+}
+
+// MARK: - In-use badge
+
+/// Replaces the "Use" button on the model the server is pointed at, so clicking
+/// Use produces immediate, visible feedback instead of just greying the button
+/// out. Distinguishes "loaded and serving" from "selected, still loading" and
+/// "selected, server stopped" — see `ModelUseState`.
+private struct ModelUseBadge: View {
+    let state: ModelUseState
+
+    private var tint: Color {
+        switch state {
+        case .inUse:    return .green
+        case .loading:  return .orange
+        case .selected: return .secondary
+        case .idle:     return .clear
+        }
+    }
+
+    var body: some View {
+        HStack(spacing: 4) {
+            switch state {
+            case .loading:
+                ProgressView()
+                    .controlSize(.small)
+                    .scaleEffect(0.5)
+                    .frame(width: 8, height: 8)
+            case .inUse:
+                Circle()
+                    .fill(tint)
+                    .frame(width: 6, height: 6)
+            default:
+                EmptyView()
+            }
+            Text(state.label)
+                .font(.caption.weight(.medium))
+                .foregroundStyle(tint)
+                .lineLimit(1)
+        }
+        .padding(.horizontal, 6)
+        .padding(.vertical, 2)
+        .background(tint.opacity(0.12), in: Capsule())
+        .help(state.help)
     }
 }
 
@@ -245,11 +449,14 @@ private struct ColumnHeaderRow: View {
                 .frame(width: 54, alignment: .leading)
             SortableHeader("Size", field: nil, searchService: searchService)
                 .frame(width: 54, alignment: .trailing)
-            // Downloads column: 88 wide so "Downloads" + the sort chevron
-            // fit on one line. Was 72, which forced "Down-loads" wrapping
-            // (visible in the screenshot bug report).
-            SortableHeader("Downloads", field: .downloads, searchService: searchService)
-                .frame(width: 88, alignment: .trailing)
+            // HuggingFace pull count. Called "Pulls", NOT "Downloads": the
+            // sidebar has a Downloads destination meaning "transferring right
+            // now", and having both words in one window is what made users read
+            // the old "Downloaded" toggle as a filter on this column. 64 wide
+            // fits "Pulls" + the sort chevron.
+            SortableHeader("Pulls", field: .downloads, searchService: searchService)
+                .frame(width: 64, alignment: .trailing)
+                .help("How many times this repo has been pulled from HuggingFace")
             SortableHeader("Likes", field: .likes, searchService: searchService)
                 .frame(width: 50, alignment: .trailing)
             // RAM Est. column: 120 wide so GGUF range strings produced by
@@ -263,12 +470,11 @@ private struct ColumnHeaderRow: View {
                 .frame(width: 120, alignment: .trailing)
             SortableHeader("Updated", field: .lastModified, searchService: searchService)
                 .frame(width: 64, alignment: .trailing)
-            // Action column: 92 wide so the Download button + menu chevron
-            // render without truncation (was 64). The cell content is
-            // either a "Download ▾" menu, a trash icon, a Resume/Retry
-            // button, or a progress bar — 92 fits the widest.
+            // Action column: 120 wide (was 92) — the widest content is now the
+            // on-disk cell, "✓ Use" plus a trash icon. Also fits the
+            // "Download ▾" GGUF menu, Resume/Retry, and the progress bar.
             Text("")
-                .frame(width: 92)
+                .frame(width: 120)
         }
         .font(.callout.weight(.semibold))
         .foregroundStyle(.secondary)
@@ -320,6 +526,7 @@ private struct ModelBrowserRow: View {
     let fitness: RAMFitness
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
 
     private var isReady: Bool { downloads.isReady(model.id) }
     private var state: DownloadManager.DownloadState? { downloads.downloads[model.id] }
@@ -399,11 +606,10 @@ private struct ModelBrowserRow: View {
                 .font(.callout.monospacedDigit())
                 .frame(width: 54, alignment: .trailing)
 
-            // Downloads — width matched to ColumnHeaderRow (88) so the
-            // "Downloads" header doesn't have to wrap.
+            // HF pull count — width matched to ColumnHeaderRow's "Pulls" (64).
             Text(formatCount(model.downloads ?? 0))
                 .font(.callout.monospacedDigit())
-                .frame(width: 88, alignment: .trailing)
+                .frame(width: 64, alignment: .trailing)
 
             // Likes
             Text(formatCount(model.likes ?? 0))
@@ -431,11 +637,9 @@ private struct ModelBrowserRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 64, alignment: .trailing)
 
-            // Download button — width matched to ColumnHeaderRow (92) so
-            // the "Download ▾" GGUF menu, "Resume"/"Retry" buttons, and
-            // the trash icon all render without truncation.
-            downloadButton
-                .frame(width: 92, alignment: .center)
+            // Action cell — width matched to ColumnHeaderRow (120).
+            actionCell
+                .frame(width: 120, alignment: .center)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -453,37 +657,67 @@ private struct ModelBrowserRow: View {
 
     @State private var confirmDelete = false
 
+    /// Resolved by the pure state machine so the branch ladder is unit-tested
+    /// (`ModelBrowserSectionTests`). The key change: a ready model resolves to
+    /// `.onDisk` and stays in the list, where it used to be filtered out of the
+    /// search results entirely — vanishing at the exact moment it finished.
+    private var action: ModelRowAction {
+        ModelRowAction.resolve(
+            isCompatible: model.isCompatible,
+            isReady: isReady,
+            status: state?.status,
+            hasPartial: downloads.hasPartialDownload(model.id),
+            progress: state?.fileProgress ?? 0
+        )
+    }
+
+    /// The on-disk model this row's repo resolves to, when it's loadable as the
+    /// server's chat model. nil for drafters, encoders, and media checkpoints —
+    /// they're on disk and deletable, but "Use" would load something that can't
+    /// serve a completion.
+    private var usableModel: LocalModel? {
+        ModelBrowserUse.pickableModel(
+            atPath: downloads.existingModelDir(for: model.id),
+            in: appState.localModels
+        )
+    }
+
     @ViewBuilder
-    private var downloadButton: some View {
-        if disabled {
+    private var actionCell: some View {
+        switch action {
+        case .unsupported:
             Image(systemName: "nosign")
                 .foregroundStyle(.secondary)
                 .font(.caption)
-        } else if isReady {
-            Button {
-                confirmDelete = true
-            } label: {
-                Image(systemName: "trash")
-                    .foregroundStyle(.red.opacity(0.7))
-            }
-            .buttonStyle(.plain)
-            .font(.callout)
-            .help("Delete model")
-            .alert("Delete Model", isPresented: $confirmDelete) {
-                Button("Cancel", role: .cancel) {}
-                Button("Delete", role: .destructive) {
-                    downloads.deleteModel(repoId: model.id)
-                    appState.refreshModels()
+
+        case .onDisk:
+            HStack(spacing: 6) {
+                if let usable = usableModel {
+                    let use = ModelUseState.resolve(
+                        selected: appState.selectedModelPath == usable.path,
+                        serverStatus: server.status
+                    )
+                    if use == .idle {
+                        Button("Use") { appState.selectedModelPath = usable.path }
+                            .controlSize(.small)
+                            .help("Load \(usable.name) as the server's model")
+                    } else {
+                        ModelUseBadge(state: use)
+                    }
+                } else {
+                    Text("✓ On disk")
+                        .font(.caption.weight(.medium))
+                        .foregroundStyle(.green)
                 }
-            } message: {
-                Text("Delete \(model.modelName)? This will remove all downloaded files.")
+                deleteButton
             }
-        } else if let state, state.status == .downloading {
+
+        case .downloading(let progress):
             HStack(spacing: 4) {
                 VStack(spacing: 1) {
-                    ProgressView(value: state.fileProgress)
+                    ProgressView(value: progress)
                         .frame(width: 50)
-                    Text(state.percentFormatted)
+                    Text(state?.percentFormatted ?? "")
                         .font(.system(size: 9).monospacedDigit())
                         .foregroundStyle(.secondary)
                 }
@@ -497,46 +731,50 @@ private struct ModelBrowserRow: View {
                 .buttonStyle(.plain)
                 .help("Cancel download")
             }
-        } else if let state, state.status == .completed {
-            Button {
-                confirmDelete = true
-            } label: {
-                Image(systemName: "trash")
-                    .foregroundStyle(.red.opacity(0.7))
-            }
-            .buttonStyle(.plain)
-            .font(.callout)
-            .help("Delete model")
-            .alert("Delete Model", isPresented: $confirmDelete) {
-                Button("Cancel", role: .cancel) {}
-                Button("Delete", role: .destructive) {
-                    downloads.deleteModel(repoId: model.id)
-                    appState.refreshModels()
-                }
-            } message: {
-                Text("Delete \(model.modelName)? This will remove all downloaded files.")
-            }
-        } else if let state, state.status == .failed {
+
+        case .failed(let resumable):
             if model.isGgufRepo {
                 GgufDownloadMenu(repoId: model.id, label: "Retry")
             } else {
-                Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Retry") {
+                Button(resumable ? "Resume" : "Retry") {
                     downloads.start(repoId: model.id) { appState.refreshModels() }
                 }
                 .font(.callout)
                 .controlSize(.small)
             }
-        } else {
+
+        case .notDownloaded(let resumable):
             if model.isGgufRepo {
                 // GGUF repos ship many quants — pick one from a menu.
-                GgufDownloadMenu(repoId: model.id, label: "Download")
+                GgufDownloadMenu(repoId: model.id, label: resumable ? "Resume" : "Download")
             } else {
-                Button(downloads.hasPartialDownload(model.id) ? "Resume" : "Download") {
+                Button(resumable ? "Resume" : "Download") {
                     downloads.start(repoId: model.id) { appState.refreshModels() }
                 }
                 .font(.callout)
                 .controlSize(.small)
             }
+        }
+    }
+
+    private var deleteButton: some View {
+        Button {
+            confirmDelete = true
+        } label: {
+            Image(systemName: "trash")
+                .foregroundStyle(.red.opacity(0.7))
+        }
+        .buttonStyle(.plain)
+        .font(.callout)
+        .help("Delete model")
+        .alert("Delete Model", isPresented: $confirmDelete) {
+            Button("Cancel", role: .cancel) {}
+            Button("Delete", role: .destructive) {
+                downloads.deleteModel(repoId: model.id)
+                appState.refreshModels()
+            }
+        } message: {
+            Text("Delete \(model.modelName)? This will remove all downloaded files.")
         }
     }
 }
@@ -586,7 +824,15 @@ private struct LocalModelRow: View {
     let model: LocalModel
     @EnvironmentObject var downloads: DownloadManager
     @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
     @State private var confirmDelete = false
+
+    private var useState: ModelUseState {
+        ModelUseState.resolve(
+            selected: appState.selectedModelPath == model.path,
+            serverStatus: server.status
+        )
+    }
 
     var body: some View {
         HStack(spacing: 8) {
@@ -649,25 +895,41 @@ private struct LocalModelRow: View {
                 .foregroundStyle(.secondary)
                 .frame(width: 90, alignment: .trailing)
 
-            Button {
-                confirmDelete = true
-            } label: {
-                Image(systemName: "trash")
-                    .foregroundStyle(.red.opacity(0.7))
-            }
-            .buttonStyle(.plain)
-            .font(.callout)
-            .help("Delete model")
-            .frame(width: 64, alignment: .center)
-            .alert("Delete Model", isPresented: $confirmDelete) {
-                Button("Cancel", role: .cancel) {}
-                Button("Delete", role: .destructive) {
-                    downloads.deleteModel(model)
-                    appState.refreshModels()
+            // Use + Delete. "Use" is the missing terminal action the browser
+            // never had — before this, the only thing you could do with a model
+            // you'd downloaded was throw it away. Once picked, the button is
+            // replaced by an In-use badge rather than merely greyed out, so the
+            // click produces visible feedback.
+            HStack(spacing: 6) {
+                if model.isChatPickable {
+                    if useState == .idle {
+                        Button("Use") { appState.selectedModelPath = model.path }
+                            .controlSize(.small)
+                            .help("Load \(model.name) as the server's model")
+                    } else {
+                        ModelUseBadge(state: useState)
+                    }
                 }
-            } message: {
-                Text("Delete \(model.name)? This will remove all downloaded files.")
+                Button {
+                    confirmDelete = true
+                } label: {
+                    Image(systemName: "trash")
+                        .foregroundStyle(.red.opacity(0.7))
+                }
+                .buttonStyle(.plain)
+                .font(.callout)
+                .help("Delete model")
+                .alert("Delete Model", isPresented: $confirmDelete) {
+                    Button("Cancel", role: .cancel) {}
+                    Button("Delete", role: .destructive) {
+                        downloads.deleteModel(model)
+                        appState.refreshModels()
+                    }
+                } message: {
+                    Text("Delete \(model.name)? This will remove all downloaded files.")
+                }
             }
+            .frame(width: 120, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -799,33 +1061,17 @@ private struct DrafterPairChip: View {
     }
 }
 
-// MARK: - Curated Drafters Section
+// MARK: - Curated Drafters catalog
 
-/// Top-of-browser block listing the four published Gemma 4 assistant drafter
-/// checkpoints. Surfaced here so users find them without manually searching
-/// "assistant-bf16". Each row reuses the underlying `DownloadManager` state
-/// machine — same Resume / Download / Delete affordances as the main list.
-private struct DraftersSection: View {
-    @EnvironmentObject var downloads: DownloadManager
-    @EnvironmentObject var appState: AppState
-    /// Collapsed by default — pairing a drafter is a one-time setup step, so
-    /// we don't want this taking up vertical space above the search results
-    /// after the user's already done it once.
-    @State private var expanded = false
+private struct DrafterCatalogRow: Identifiable {
+    let variant: GemmaVariant
+    let repoId: String
+    let pairsWith: String
+    let sizeEstimate: String
+    var id: String { repoId }
 
-    private var rows: [DrafterCatalogRow] {
-        GemmaVariant.allCases.map { v in
-            DrafterCatalogRow(
-                variant: v,
-                repoId: v.drafterRepoId,
-                pairsWith: "for \(v.label)",
-                sizeEstimate: Self.sizeEstimate(for: v)
-            )
-        }
-    }
-
-    private static func sizeEstimate(for v: GemmaVariant) -> String {
-        // bf16 sizes (the uniform suffix used by drafterRepoId).
+    /// bf16 sizes (the uniform suffix used by `drafterRepoId`).
+    static func sizeEstimate(for v: GemmaVariant) -> String {
         switch v {
         case .E2B:        return "~80 MB"
         case .E4B:        return "~120 MB"
@@ -834,60 +1080,6 @@ private struct DraftersSection: View {
         case .moe26B:     return "~120 MB"
         }
     }
-
-    /// Count of drafters already on disk — drives the "X of 4 ready" hint
-    /// in the collapsed header so users see at a glance whether they need
-    /// to expand it.
-    private var readyCount: Int {
-        rows.filter { downloads.isReady($0.repoId) }.count
-    }
-
-    var body: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            Button {
-                withAnimation(.easeInOut(duration: 0.15)) { expanded.toggle() }
-            } label: {
-                HStack(spacing: 6) {
-                    Image(systemName: expanded ? "chevron.down" : "chevron.right")
-                        .font(.caption2.weight(.semibold))
-                        .foregroundStyle(.secondary)
-                        .frame(width: 10)
-                    Image(systemName: "sparkles")
-                        .foregroundStyle(.purple)
-                    Text("Drafters")
-                        .font(.callout.weight(.semibold))
-                    Text("Pair with a Gemma 4 base model for +27–40% on code & agents")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                        .lineLimit(1)
-                    Spacer()
-                    Text("\(readyCount) of \(rows.count) downloaded")
-                        .font(.caption2.monospacedDigit())
-                        .foregroundStyle(.secondary)
-                }
-                .contentShape(Rectangle())
-                .padding(.horizontal, 12)
-                .padding(.vertical, 8)
-            }
-            .buttonStyle(.plain)
-
-            if expanded {
-                ForEach(rows) { row in
-                    DrafterCatalogRowView(row: row)
-                    Divider().padding(.horizontal, 12)
-                }
-            }
-        }
-        .background(Color.purple.opacity(0.04))
-    }
-}
-
-private struct DrafterCatalogRow: Identifiable {
-    let variant: GemmaVariant
-    let repoId: String
-    let pairsWith: String
-    let sizeEstimate: String
-    var id: String { repoId }
 }
 
 private struct DrafterCatalogRowView: View {

@@ -37,7 +37,7 @@
     "downloadUrl": "https://github.com/ddalcu/mlx-serve/releases/latest",
     "codeRepository": "https://github.com/ddalcu/mlx-serve",
     "license": "https://opensource.org/licenses/MIT",
-    "softwareVersion": "v26.7.2",
+    "softwareVersion": "v26.7.4",
     "author": { "@type": "Person", "name": "David Dalcu" },
     "description": "Native Zig inference server for Apple Silicon that runs any LLM — MLX and GGUF — with OpenAI- and Anthropic-compatible APIs. Faster than LM Studio. No Python. MIT licensed.",
     "offers": { "@type": "Offer", "price": "0", "priceCurrency": "USD" },
@@ -60,7 +60,10 @@
       "Zero-shot voice cloning and local text-to-speech",
       "Hands-free voice mode with on-device speech recognition",
       "Scheduled agent tasks (recurring, unattended)",
-      "Telegram bot bridge for chatting from your phone"
+      "Telegram bot bridge for chatting from your phone",
+      "Prefix cache persisted to SSD — long chats resume across restarts",
+      "Live metrics dashboard and Prometheus endpoint (vLLM-compatible names)",
+      "Optional API key for servers exposed on a network"
     ]
   }
   </script>
@@ -1148,7 +1151,7 @@
     <a href="#" class="nav-logo">
       <img src="appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
-      <span class="nav-ver">v26.7.2</span>
+      <span class="nav-ver">v26.7.4</span>
     </a>
     <ul class="nav-links">
       <li><a href="#explore" class="hide-mobile">Deep dives</a></li>
@@ -1169,8 +1172,8 @@
   <section class="hero">
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
     <a href="https://github.com/ddalcu/mlx-serve/releases/latest" class="hero-badge">
-      <span class="new-pill">v26.7.2</span>
-      Type a vibe, get a song · photo → 3D model · your voice everywhere · the app updates itself
+      <span class="new-pill">v26.7.4</span>
+      Long chats resume instantly · watch your server live · agent sessions that don't time out
       <span class="arrow">→</span>
     </a>
     <h1>Run any LLM<br>on your <span class="grad">Mac</span></h1>
@@ -1284,8 +1287,8 @@
   <!-- MARQUEE -->
   <div class="marquee" aria-hidden="true">
     <div class="marquee-track">
-      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
-      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">Live Metrics</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
+      <span class="marquee-item">Any Open Model</span><span class="marquee-item">Text-to-Music</span><span class="marquee-item">Photo → 3D</span><span class="marquee-item">Ollama Compatible</span><span class="marquee-item">Photo Editing</span><span class="marquee-item">Image-to-Video</span><span class="marquee-item">Talking Characters</span><span class="marquee-item">Style LoRAs</span><span class="marquee-item">Agent Sandbox</span><span class="marquee-item">⌃Space Launcher</span><span class="marquee-item">Krea-2 Image Gen</span><span class="marquee-item">Voice Cloning</span><span class="marquee-item">DiffusionGemma</span><span class="marquee-item">DeepSeek V4 Flash</span><span class="marquee-item">Gemma 4</span><span class="marquee-item">Qwen 3.6</span><span class="marquee-item">Llama 3</span><span class="marquee-item">Private by Design</span><span class="marquee-item">Document RAG</span><span class="marquee-item">Live Metrics</span><span class="marquee-item">OpenAI API</span><span class="marquee-item">Anthropic API</span><span class="marquee-item">Claude Code</span><span class="marquee-item">MCP</span>
     </div>
   </div>
 
@@ -1444,6 +1447,27 @@
         <p>The working memory a long conversation needs can be compressed up to ~4×, so 16K-token contexts fit on Macs that couldn't hold them before — or you serve more chats in parallel at the same length.</p>
       </div>
       <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #5e5ce6, #0071e3);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M19 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h11l5 5v11a2 2 0 0 1-2 2z"/><polyline points="17 21 17 13 7 13 7 21"/><polyline points="7 3 7 8 15 8"/></svg>
+        </div>
+        <h3>Long chats resume instantly</h3>
+        <p>Re-opening a long conversation used to mean sitting through a full re-read of its history. The prefix cache now persists to SSD, so work the server already did is restored instead of recomputed — across model switches, app relaunches, and reboots. A chat that took <b>40 seconds</b> to warm up answers in under <b>3</b>, with byte-identical output. Opt-in from Settings, since it can hold gigabytes.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #30d158, #5ac8fa);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/></svg>
+        </div>
+        <h3>Watch your server work</h3>
+        <p>Flip on <i>Metrics panel</i> and the server's own homepage grows a live dashboard: decode and prefill tokens/sec with sparklines, requests in flight, time-to-first-token, cache hit rate, GPU load and memory — moving as you generate, including through a long prompt. The same numbers export at a Prometheus <code>/metrics</code> endpoint under vLLM-compatible names, so existing Grafana dashboards work unchanged. Opt-in, with no measurable cost to tokens/sec.</p>
+      </div>
+      <div class="feature-card reveal">
+        <div class="feature-icon" style="background: linear-gradient(135deg, #1d1d1f, #0071e3);">
+          <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="3" y="11" width="18" height="11" rx="2" ry="2"/><path d="M7 11V7a5 5 0 0 1 10 0v4"/></svg>
+        </div>
+        <h3>Share it on your network, safely</h3>
+        <p>Serving to other machines? Set an API key and every off-box request — OpenAI, Anthropic, and Ollama APIs, plus the metrics page — has to present it, as a Bearer token, <code>x-api-key</code>, HTTP Basic, or a query parameter. Your own Mac stays trusted and key-free, so local apps and tools carry on untouched.</p>
+      </div>
+      <div class="feature-card reveal">
         <div class="feature-icon fi-agent">
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 8V4H8"/><rect width="16" height="12" x="4" y="8" rx="2"/><path d="M2 14h2"/><path d="M20 14h2"/><path d="M15 13v2"/><path d="M9 13v2"/></svg>
         </div>
@@ -1471,7 +1495,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><rect x="2" y="4" width="20" height="16" rx="2"/><path d="M10 4v4"/><path d="M2 8h20"/><path d="M6 4v4"/></svg>
         </div>
         <h3>One server, every model</h3>
-        <p>The MLX Core menu-bar app downloads models from HuggingFace with resumable transfers and hot-switches them in place — no restart, no chat interruption. New compressed model formats load out of the box.</p>
+        <p>A Model Browser built around what you already have: <b>Discover</b> to find new models, <b>My Models</b> for everything this Mac can load — including what LM Studio downloaded and your own folders — and <b>Downloads</b> with a live badge. Finished models stay listed with a one-click <b>Use</b>, and a badge marks whichever one the server is actually serving. Resumable HuggingFace transfers, hot-switching in place, no restart.</p>
       </div>
       <div class="feature-card reveal">
         <div class="feature-icon" style="background: linear-gradient(135deg, #5e5ce6, #9fe6ff);">
@@ -1561,7 +1585,7 @@
           <svg viewBox="0 0 24 24" fill="none" stroke="white" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><polyline points="4 17 10 11 4 5"/><line x1="12" y1="19" x2="20" y2="19"/></svg>
         </div>
         <h3>One-click coding agents</h3>
-        <p>Point Claude Code, pi, or OpenCode at your local model from a folder picker — the app wires up the environment and routes every request to mlx-serve. Real coding agents, your code and prompts never leaving your machine.</p>
+        <p>Point Claude Code, pi, or OpenCode at your local model from a folder picker — the app wires up the environment and routes every request to mlx-serve. Each agent is handed the context window your model <i>actually</i> serves, not a hardcoded guess, and a turn that spends ten minutes writing one big file streams to completion instead of dying at its client's five-minute timeout. Real coding agents, your code and prompts never leaving your machine.</p>
         <a class="card-more" href="claude-code-local/">Claude Code, fully local →</a>
       </div>
     </div>
@@ -1820,7 +1844,7 @@
       <li><a href="speculative-decoding/">Speculative decoding</a></li>
       <li><a href="local-ai-assistant/">Always-on assistant</a></li>
     </ul>
-    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.2</span> · built for Apple Silicon</p>
+    <p class="footer-copy">MIT License · mlx-serve <span style="opacity:0.7;">v26.7.4</span> · built for Apple Silicon</p>
   </footer>
 
   <script>

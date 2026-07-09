@@ -406,30 +406,30 @@ struct StatusMenuView: View {
 
             Divider().padding(.horizontal, 12)
 
-            // Downloads
+            // Downloads. "Browse More Models" sits on the header row, NOT inside
+            // the disclosure: reaching the Model Browser shouldn't require first
+            // expanding a curated quick-download list you may not care about.
+            // It's a sibling of the disclosure button, not nested in its label,
+            // so the two tap targets stay distinct.
             VStack(alignment: .leading, spacing: 6) {
-                Button {
-                    withAnimation(.easeInOut(duration: 0.2)) {
-                        showDownloads.toggle()
+                HStack(spacing: 6) {
+                    Button {
+                        withAnimation(.easeInOut(duration: 0.2)) {
+                            showDownloads.toggle()
+                        }
+                    } label: {
+                        HStack(spacing: 4) {
+                            Image(systemName: "chevron.right")
+                                .font(.caption2)
+                                .rotationEffect(.degrees(showDownloads ? 90 : 0))
+                            Text("Download Models")
+                                .font(.subheadline.weight(.medium))
+                            Spacer(minLength: 0)
+                        }
+                        .foregroundStyle(.secondary)
+                        .contentShape(Rectangle())
                     }
-                } label: {
-                    HStack(spacing: 4) {
-                        Image(systemName: "chevron.right")
-                            .font(.caption2)
-                            .rotationEffect(.degrees(showDownloads ? 90 : 0))
-                        Text("Download Models")
-                            .font(.subheadline.weight(.medium))
-                        Spacer()
-                    }
-                    .foregroundStyle(.secondary)
-                    .contentShape(Rectangle())
-                }
-                .buttonStyle(.plain)
-
-                if showDownloads {
-                    ModelDownloadView()
-                        .environmentObject(downloads)
-                        .environmentObject(appState)
+                    .buttonStyle(.plain)
 
                     Button {
                         openModelBrowser()
@@ -438,11 +438,16 @@ struct StatusMenuView: View {
                             Image(systemName: "magnifyingglass")
                             Text("Browse More Models")
                         }
-                        .frame(maxWidth: .infinity)
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
-                    .padding(.top, 4)
+                    .help("Open the Model Browser")
+                }
+
+                if showDownloads {
+                    ModelDownloadView()
+                        .environmentObject(downloads)
+                        .environmentObject(appState)
                 }
             }
             .padding(.horizontal, 16)
@@ -554,6 +559,7 @@ struct StatusMenuView: View {
                 CLILauncherButton(
                     baseURL: server.baseURL,
                     servedModelId: server.modelInfo?.name ?? "mlx-serve",
+                    serverContextLength: server.modelInfo?.contextLength,
                     isEnabled: server.status == .running
                 )
 
@@ -940,7 +946,7 @@ struct EndpointsSection: View {
 }
 
 /// Show folder picker and launch Claude Code in the selected directory.
-func launchClaudeCodeWithPicker(baseURL: String) {
+func launchClaudeCodeWithPicker(baseURL: String, serverContextLength: Int? = nil) {
     let panel = NSOpenPanel()
     panel.canChooseDirectories = true
     panel.canChooseFiles = false
@@ -952,23 +958,21 @@ func launchClaudeCodeWithPicker(baseURL: String) {
     try? FileManager.default.createDirectory(atPath: defaultWS, withIntermediateDirectories: true)
     panel.directoryURL = URL(fileURLWithPath: defaultWS)
     guard panel.runModal() == .OK, let url = panel.url else { return }
-    launchClaudeCode(baseURL: baseURL, workingDirectory: url.path)
+    launchClaudeCode(baseURL: baseURL, workingDirectory: url.path,
+                     serverContextLength: serverContextLength)
 }
 
 /// Launch Claude Code CLI configured to use the local mlx-serve server.
-func launchClaudeCode(baseURL: String, workingDirectory: String? = nil) {
+/// Shares `AgentConfigs.claudeCodeExports` with the CLI-launcher dropdown — the
+/// env block must not drift between the two entry points.
+func launchClaudeCode(baseURL: String, workingDirectory: String? = nil,
+                      serverContextLength: Int? = nil) {
     let model = "mlx-serve"
     let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
+    let budget = AgentBudget.forServerContext(serverContextLength)
     let scriptContent = """
     #!/bin/zsh -l
-    export ANTHROPIC_BASE_URL='\(baseURL)'
-    export ANTHROPIC_API_KEY=
-    export ANTHROPIC_AUTH_TOKEN=mlx-serve
-    export CLAUDE_CODE_ATTRIBUTION_HEADER=0
-    export ANTHROPIC_DEFAULT_OPUS_MODEL=\(model)
-    export ANTHROPIC_DEFAULT_SONNET_MODEL=\(model)
-    export ANTHROPIC_DEFAULT_HAIKU_MODEL=\(model)
-    export CLAUDE_CODE_SUBAGENT_MODEL=\(model)
+    \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))
     \(cdLine)
     claude --model \(model)
     """
@@ -1037,7 +1041,7 @@ struct ServerLogWindowView: View {
             // Byte counter from the poller mirror — same data the body
             // shows, so the number matches what's on screen rather than
             // racing with the live buffer.
-            Text("\(poller.text.count) bytes")
+            Text("\(poller.characterCount) bytes")
                 .font(.caption.monospacedDigit())
                 .foregroundStyle(.secondary)
 

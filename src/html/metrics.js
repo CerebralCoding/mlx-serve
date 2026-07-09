@@ -11,7 +11,78 @@
 // seconds) and token counters only advance when a request COMPLETES, so this is
 // the true generation/prefill speed of recently-finished requests — NOT the
 // idle-averaged counter rate (which reads ~0 between requests).
-(function () {
+// ── Pure rate math (no DOM, no module state) ─────────────────────────────────
+//
+// Every displayed rate is derived FROM THE CURRENT DATA on every tick. Nothing
+// is carried between ticks. A value stashed in a module-level `let` outlives the
+// condition that produced it: the Prefill tile used to keep showing the last
+// prefill speed for the whole of a long decode, and only a page refresh cleared
+// it — which is exactly the signature of state that isn't derived from the feed.
+// Exported for `tests/metrics_panel_test.mjs`.
+
+// Newest sample that is at least winMs old (tightest window >= winMs); the
+// oldest retained sample while still warming up.
+function panelAt(now, samples, winMs) {
+  let s = samples[0];
+  for (const x of samples) { if (now - x.t >= winMs) s = x; else break; }
+  return s;
+}
+
+function computeRates(now, samples, c, g, psum) {
+  const liveTok = (g.generation_tokens_live != null) ? g.generation_tokens_live : c.generation_tokens_total;
+  const livePre = (g.prefill_tokens_live != null) ? g.prefill_tokens_live : 0;
+  const prefilling = (g.requests_prefilling || 0) > 0;
+
+  // Decode tok/s — LIVE decode speed while a request runs, 0 when idle. Tokens
+  // only accrue during decode, so this is flat through prefill.
+  let decodeTps = 0;
+  if (g.requests_running > 0) {
+    const wl = panelAt(now, samples, 4000);
+    if (wl) {
+      const dt = (now - wl.t) / 1000;
+      if (dt > 0) decodeTps = Math.max(0, (liveTok - wl.live) / dt);
+    }
+  }
+
+  // Prefill tok/s — LIVE prefill speed, 0 when no prefill is running. Same
+  // no-carry-forward rule as decode: the big number answers "what is happening
+  // NOW". Progress is published once per prefill CHUNK (8192 tokens), so the
+  // window is wide enough to span one chunk even on a slow model.
+  let prefillTps = 0;
+  if (livePre > 0) {
+    const wl = panelAt(now, samples, 30000);
+    if (wl) {
+      const dt = (now - wl.t) / 1000;
+      if (dt > 0) prefillTps = Math.max(0, (livePre - wl.pre) / dt);
+    }
+  }
+
+  // "How fast does this machine prefill?" — the stable answer, shown in the
+  // sub-line where it can't be mistaken for a live rate. Cumulative, so it never
+  // goes stale. Numerator is FORWARDED tokens (`prefill_tokens_total`), never
+  // `prompt_tokens_total`: with the prefix cache warm most billed tokens are
+  // restored, not computed, and dividing them by prefill time overstates
+  // throughput by prompt/(prompt-cached) — measured 10.6x on a 35B MoE.
+  const avgPrefillTps = (psum > 1e-6 && c.prefill_tokens_total > 0)
+    ? c.prefill_tokens_total / psum
+    : null;
+
+  // Requests per second over a ~60s window.
+  let reqRate = null;
+  const wp = panelAt(now, samples, 60000);
+  if (wp) {
+    const dt = (now - wp.t) / 1000;
+    if (dt > 0) reqRate = Math.max(0, (c.requests_success_total - wp.req) / dt);
+  }
+
+  return { decodeTps, prefillTps, avgPrefillTps, reqRate, prefilling, liveTok, livePre };
+}
+
+// Node (tests) sees no `document`; the browser sees no `globalThis.__mlxPanel`
+// consumer. Either way the IIFE below only runs in a real page.
+if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = { computeRates, panelAt };
+
+if (typeof document !== 'undefined') (function () {
   // Panel markup, injected into the page. A template literal, so the CSS/HTML
   // braces need no escaping — the reason this lives here and not inline in the
   // std.fmt-formatted index.html.
@@ -65,7 +136,6 @@
   const RETAIN_MS = 120000;        // keep 2 min of samples for the 60s window
   const SPARK_N = 60;              // sparkline points (≈60s at 1 Hz)
   const decodeHist = [], prefillHist = [];
-  let lastDecodeTps = null, lastPrefillTps = null;
   const hover = { decode: null, prefill: null };  // hovered point index per chart
 
   function fmt(v, d) {
@@ -80,13 +150,6 @@
     if (e) { e.className = cls; e.textContent = txt; }
   }
 
-  // Newest sample that is at least winMs old (tightest window ≥ winMs); the
-  // oldest retained sample while still warming up.
-  function at(now, winMs) {
-    let s = samples[0];
-    for (const x of samples) { if (now - x.t >= winMs) s = x; else break; }
-    return s;
-  }
 
   // Draw a sparkline (auto-scaled) into an <svg>, set its value label, and — when
   // the mouse is over that chart (hover[key] set) — draw a marker at the hovered
@@ -161,43 +224,19 @@
     const now = Date.now();
 
     const psum = histSum(h.prefill_time_seconds);
-    // Live token count = completed generation tokens + tokens generated so far by
-    // the in-flight slot(s), sampled server-side every 2s. It MOVES during a
-    // running request (tokens only accrue during DECODE, so it's flat through
-    // prefill) — unlike the completion histograms, which don't advance until a
-    // request finishes.
     const liveTok = (g.generation_tokens_live != null) ? g.generation_tokens_live : c.generation_tokens_total;
-    samples.push({ t: now, live: liveTok, prompt: c.prompt_tokens_total, psum: psum, req: c.requests_success_total });
+    const livePre = (g.prefill_tokens_live != null) ? g.prefill_tokens_live : 0;
+    samples.push({ t: now, live: liveTok, pre: livePre, pretok: c.prefill_tokens_total, psum: psum, req: c.requests_success_total });
     while (samples.length > 2 && now - samples[0].t > RETAIN_MS) samples.shift();
 
-    // Decode tok/s — LIVE decode speed while a request runs, 0 when idle. Δ(live
-    // token gauge) over a short window (tokens only accrue during DECODE). NO
-    // carry-forward: when nothing is running it reads 0, so it drops back to 0
-    // the moment decoding stops instead of staying elevated at the last speed.
-    let decodeTps = 0;
-    if (g.requests_running > 0) {
-      const wl = at(now, 4000);
-      if (wl) {
-        const dt = (now - wl.t) / 1000;
-        if (dt > 0) decodeTps = Math.max(0, (liveTok - wl.live) / dt);
-      }
-    }
-    lastDecodeTps = decodeTps;
-    // Prefill tok/s + req/s — completion-based (Δ over ~60s window); prefill is a
-    // one-shot burst that's only recorded when the request finishes, so this
-    // populates after the first completion.
-    let reqRate = null;
-    const wp = at(now, 60000);
-    if (wp) {
-      const dPre = psum - wp.psum, dPrompt = c.prompt_tokens_total - wp.prompt;
-      if (dPre > 1e-6 && dPrompt > 0) lastPrefillTps = dPrompt / dPre;
-      const dt2 = (now - wp.t) / 1000;
-      if (dt2 > 0) reqRate = Math.max(0, (c.requests_success_total - wp.req) / dt2);
-    }
+    // Everything displayed is derived here, from THIS tick's data. Nothing is
+    // remembered between ticks — see the note above `computeRates`.
+    const r = computeRates(now, samples, c, g, psum);
+    const { decodeTps, prefillTps, avgPrefillTps, reqRate, prefilling } = r;
 
-    // Sparkline history (carry-forward once we have a first value).
-    if (lastDecodeTps !== null) { decodeHist.push(lastDecodeTps); if (decodeHist.length > SPARK_N) decodeHist.shift(); }
-    if (lastPrefillTps !== null) { prefillHist.push(lastPrefillTps); if (prefillHist.length > SPARK_N) prefillHist.shift(); }
+    // Sparkline history: both series dip to 0 when their phase is idle.
+    decodeHist.push(decodeTps); if (decodeHist.length > SPARK_N) decodeHist.shift();
+    prefillHist.push(prefillTps); if (prefillHist.length > SPARK_N) prefillHist.shift();
 
     // Average latency from each histogram's sum/count (seconds → ms).
     const avgMs = (hist) => (hist && hist.count > 0) ? (hist.sum / hist.count) * 1000 : null;
@@ -208,17 +247,31 @@
 
     const cq = c.prefix_cache_queries_total, ch = c.prefix_cache_hits_total;
     const cachePct = cq > 0 ? Math.round((ch / cq) * 100) : null;
+    // Token-level reuse: what fraction of billed prompt tokens never reached the
+    // GPU. This is the number that explains a low prefill tok/s on warm turns.
+    const tokTotal = c.prompt_tokens_total;
+    const tokPct = tokTotal > 0 ? Math.round((c.prefix_cache_tokens_total / tokTotal) * 100) : null;
 
-    $('m-decode-tps').textContent = lastDecodeTps !== null ? fmt(lastDecodeTps, 1) : '—';
+    $('m-decode-tps').textContent = fmt(decodeTps, 1);
     $('m-decode-ms').textContent = (decodeMs !== null ? fmt(decodeMs, 0) : '—') + ' ms avg';
-    $('m-prefill-tps').textContent = lastPrefillTps !== null ? fmt(lastPrefillTps, 0) : '—';
-    $('m-prefill-ms').textContent = (prefillMs !== null ? fmt(prefillMs, 0) : '—') + ' ms avg';
+    // Big number = live prefill speed, 0 when not prefilling (mirrors Decode).
+    $('m-prefill-tps').textContent = fmt(prefillTps, 0);
+    // Sub-line doubles as the phase indicator AND carries the stable average, so
+    // "0 tok/s while decoding" never means "I don't know how fast prefill is".
+    // The phase flag flips at prefill START; the token count appears once the
+    // first chunk lands (and never for ds4/llama, which prefill elsewhere).
+    $('m-prefill-ms').textContent = prefilling
+      ? ('prefilling' + (r.livePre > 0 ? ' · ' + fmt(r.livePre, 0) + ' tok' : ''))
+      : (avgPrefillTps !== null
+          ? (fmt(avgPrefillTps, 0) + ' tok/s avg · ' + (prefillMs !== null ? fmt(prefillMs, 0) : '—') + ' ms')
+          : '— ms avg');
     $('m-running').textContent = g.requests_running;
     $('m-waiting').textContent = g.requests_waiting + ' waiting · ' + (reqRate !== null ? fmt(reqRate, 2) : '—') + ' req/s';
     $('m-ttft').textContent = ttft !== null ? fmt(ttft, 0) : '—';
     $('m-e2e').textContent = (e2e !== null ? fmt(e2e, 0) : '—') + ' ms e2e';
     $('m-cache').textContent = cachePct !== null ? cachePct : '—';
-    $('m-cachedetail').textContent = ch + ' / ' + cq + ' queries';
+    $('m-cachedetail').textContent = ch + ' / ' + cq + ' queries'
+      + (tokPct !== null ? ' · ' + tokPct + '% tokens reused' : '');
 
     const gp = g.gpu_utilization_pct;
     $('m-gpu').textContent = gp;

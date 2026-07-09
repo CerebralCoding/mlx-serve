@@ -186,6 +186,8 @@ fn printUsage(io: std.Io) void {
         \\                        Basic (key = password), or ?api_key=. /health
         \\                        stays open. Unset = no auth (default).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
+        \\  --log-file <path>   Persist the server log ("off" disables).
+        \\                      Default: ~/.mlx-serve/logs/mlx-serve-<port>.log
         \\  --version           Print version and exit
         \\  --help              Show this help
         \\
@@ -273,6 +275,8 @@ pub fn main(init: std.process.Init) !void {
     var models_root: ?[]const u8 = null; // --model-dir for plan 05 discovery
     var port: u16 = 11234;
     var host: []const u8 = "0.0.0.0";
+    // `--log-file <path|off>`. null = default (`~/.mlx-serve/logs/mlx-serve-<port>.log`).
+    var log_file_arg: ?[]const u8 = null;
     var serve_mode = false;
     var stream_mode = false;
     var prompt: ?[]const u8 = null;
@@ -411,6 +415,9 @@ pub fn main(init: std.process.Init) !void {
                 log.setLevel(level);
                 log_level_explicit = true;
             }
+        } else if (std.mem.eql(u8, args[i], "--log-file") and i + 1 < args.len) {
+            i += 1;
+            log_file_arg = args[i];
         } else if (std.mem.eql(u8, args[i], "--warmup-eager")) {
             warmup_eager = true;
         } else if (std.mem.eql(u8, args[i], "--no-warmup-eager")) {
@@ -580,6 +587,32 @@ pub fn main(init: std.process.Init) !void {
     // given) BEFORE the models-root scan below — discovery's per-directory
     // `[discovery] skip …` info lines would otherwise spam the chat REPL.
     if (repl_after_serve and !log_level_explicit) log.setLevel(.warn);
+
+    // Persist the server log. The macOS app only keeps stderr in a 64 KB
+    // in-memory ring, so a server that crashed or was restarted takes its
+    // history with it — exactly when you need it (see the 2026-07-08 pi
+    // session post-mortem). Serving paths only; `pull`/`list` stay quiet.
+    //
+    // NOTE: opened AFTER `--log-level` is parsed (so the level gates what
+    // reaches disk) and BEFORE model discovery/loading (so weight-load and
+    // auto-context lines land in the file).
+    if (serve_mode or repl_after_serve) {
+        var log_path_buf: [1024]u8 = undefined;
+        const chosen: ?[]const u8 = if (log_file_arg) |a|
+            (if (std.mem.eql(u8, a, "off") or std.mem.eql(u8, a, "none")) null else a)
+        else if (std.c.getenv("HOME")) |h|
+            log.defaultLogPath(&log_path_buf, std.mem.span(h), port) catch null
+        else
+            null;
+        if (chosen) |p| {
+            if (log.openFile(p, log.default_max_bytes)) |_| {
+                log.info("Logging to {s} (rotates at {d} MB)\n", .{ p, log.default_max_bytes / (1024 * 1024) });
+            } else |e| {
+                log.warn("could not open log file {s}: {s} (stderr only)\n", .{ p, @errorName(e) });
+            }
+        }
+    }
+    defer log.closeFile();
 
     // Plan 05 Phase 1: model discovery. When --model-dir is passed, scan
     // the directory for subdirectories containing config.json. The

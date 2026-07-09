@@ -44,7 +44,15 @@ class ServerManager: ObservableObject {
     /// (ChatView, Settings, the menu popover header) is fully insulated
     /// from stderr volume.
     let logBuffer = ThrottledLogBuffer(maxBytes: serverLogMaxBytes)
-    nonisolated static let serverLogMaxBytes = 65_536              // hard cap on retained tail
+    /// Hard cap on the retained stderr tail shown in the Server Log window.
+    /// Was 64 KB (~800 lines) — a single chunked-prefill trace or a model-load
+    /// dump scrolled everything else away. The FULL history now lives on disk
+    /// at `~/.mlx-serve/logs/mlx-serve-<port>.log` (32 MB, rotating); this is
+    /// just the live tail, so it only needs to be big enough to read back a
+    /// long agent session. `ThrottledLogBuffer` trims with hysteresis, so the
+    /// raised cap costs one amortized copy per 256 KB appended, not one scan
+    /// per write.
+    nonisolated static let serverLogMaxBytes = 1_048_576           // 1 MB retained tail
 
     /// Snapshot of the ServerOptions used the last time `start()` was called.
     /// Settings UI compares this against the current options to decide whether
@@ -690,7 +698,21 @@ class ServerManager: ObservableObject {
 final class ThrottledLogBuffer: @unchecked Sendable {
     private let lock = NSLock()
     private var content = ""
+    /// Kept incrementally. `String.count` walks grapheme clusters — O(n) — and
+    /// at a 1 MB tail that is far too expensive to pay on every stderr chunk.
+    private var length = 0
     private let maxBytes: Int
+
+    /// Only re-trim once the buffer exceeds the cap by 25%, then cut back to
+    /// the cap. That amortizes the O(n) `suffix` copy over `maxBytes / 4`
+    /// appended characters instead of paying it on every append.
+    ///
+    /// CONTRACT: the buffer always retains AT LEAST the last `maxBytes`
+    /// characters and never exceeds `maxRetained`. Trimming down to a
+    /// low-water mark instead would keep a strict `maxBytes` ceiling but throw
+    /// away a quarter of the tail every cycle — worse for a log.
+    var maxRetained: Int { maxBytes + maxBytes / 4 }
+    private var highWater: Int { maxRetained }
 
     init(maxBytes: Int) {
         self.maxBytes = maxBytes
@@ -700,7 +722,10 @@ final class ThrottledLogBuffer: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         content.append(str)
+        length += str.count
+        guard length > highWater else { return }
         ServerManager.trimLogTail(&content, toAtMost: maxBytes)
+        length = content.count
     }
 
     func snapshot() -> String {
@@ -709,10 +734,19 @@ final class ThrottledLogBuffer: @unchecked Sendable {
         return content
     }
 
+    /// Retained character count, O(1). The log window renders this as a byte
+    /// readout every tick — recomputing it from the string would re-walk 1 MB.
+    var count: Int {
+        lock.lock()
+        defer { lock.unlock() }
+        return length
+    }
+
     func clear() {
         lock.lock()
         defer { lock.unlock() }
         content = ""
+        length = 0
     }
 }
 
@@ -730,6 +764,11 @@ final class LogPoller: ObservableObject {
     /// Latest snapshot fetched from the source. Only assigned when
     /// changed, so no-op ticks don't trigger view re-renders.
     @Published private(set) var text: String = ""
+
+    /// `text.count`, computed once per change. `String.count` walks grapheme
+    /// clusters (O(n)); reading it straight from the view body would re-walk
+    /// the whole 1 MB tail on every render, twice a second.
+    @Published private(set) var characterCount: Int = 0
 
     private var timer: DispatchSourceTimer?
     private let interval: TimeInterval
@@ -779,7 +818,9 @@ final class LogPoller: ObservableObject {
     /// string compare — no SwiftUI work.
     func refresh() {
         let new = snapshot()
-        if new != text { text = new }
+        guard new != text else { return }
+        text = new
+        characterCount = new.count
     }
 
     deinit {

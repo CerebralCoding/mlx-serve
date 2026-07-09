@@ -81,10 +81,10 @@
     <div class="hero-f-glow"><span class="g1"></span><span class="g2"></span></div>
     <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">API documentation</span></div>
     <h1>One local server.<br><span class="grad">Three APIs your tools already speak.</span></h1>
-    <p class="hero-f-sub">Everything below is served by <b>one process on one port</b> — chat, embeddings, and image / video / music / voice / 3D generation. OpenAI-compatible, Anthropic-compatible, and Ollama-compatible, so existing SDKs and apps connect unchanged. <b>No API key</b> — it's your machine.</p>
+    <p class="hero-f-sub">Everything below is served by <b>one process on one port</b> — chat, embeddings, and image / video / music / voice / 3D generation. OpenAI-compatible, Anthropic-compatible, and Ollama-compatible, so existing SDKs and apps connect unchanged. <b>No API key on localhost</b> — it's your machine — and <a class="prose-link" href="#observability">one optional key</a> the moment you expose it to the network.</p>
     <div class="hero-f-meta">
       <span>Base URL <b>http://localhost:11234</b></span>
-      <span><b>No auth</b> — any key accepted</span>
+      <span><b>No auth</b> on localhost</span>
       <span><b>SSE streaming</b> everywhere</span>
     </div>
   </section>
@@ -99,6 +99,7 @@
       <a href="#ollama">Ollama API</a>
       <a href="#media">Media generation</a>
       <a href="#management">Model management</a>
+      <a href="#observability">Metrics &amp; auth</a>
     </div>
 
     <h2 id="start">Getting started</h2>
@@ -178,6 +179,7 @@ claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
       <tr><td><code>prompt</code></td><td>Required.</td></tr>
       <tr><td><code>size</code></td><td><code>"WxH"</code>. Krea: any multiple of 16 in 256–2048; FLUX: 1024×1024.</td></tr>
       <tr><td><code>image</code> + <code>mode</code></td><td>Base64 source image with <code>"variation"</code> (img2img, plus <code>strength</code> 0–1) or <code>"edit"</code> (FLUX.2 instruction edit — "make the hair blue" keeps subject and scene).</td></tr>
+      <tr><td><code>ref_images</code></td><td>Up to 3 extra base64 reference images beside <code>image</code> in <code>"edit"</code> mode — refer to them by number in the prompt: <i>"replace the face of the man in image 1 with the face from image 2"</i>. Each keeps its own aspect ratio.</td></tr>
       <tr><td><code>lora_path</code> / <code>lora_scale</code></td><td>Runtime style LoRA (<code>.safetensors</code>, diffusers layout) — no re-quantization, applied unfused.</td></tr>
       <tr><td><code>cond_gain</code> / <code>cond_weights</code></td><td>Text-conditioning rebalance knobs.</td></tr>
       <tr><td><code>steps</code>, <code>seed</code>, <code>safety</code></td><td>Sampler steps, reproducibility, NSFW filter (<code>false</code> to disable per request).</td></tr>
@@ -232,6 +234,20 @@ claude   <span class="c"># Claude Code now talks to your Mac</span></pre></div>
       <tr><td><span class="method m-post">POST</span><code>/v1/unload-model</code></td><td><code>{"model": "&lt;id&gt;"}</code> — free a model's memory now.</td></tr>
     </table>
     <p class="note">Requests are queued per model and batch-decode together where the architecture allows; a media generation runs on the same GPU and briefly pauses chat decode — one machine, one memory budget, no surprises.</p>
+
+    <h2 id="observability">Metrics &amp; auth</h2>
+    <p>Both are opt-in and independent. Start the server with <code>--metrics</code>, <code>--api-key</code>, or neither — the app exposes the same two switches in Settings.</p>
+    <table class="ep-table">
+      <tr><th>Endpoint</th><th>What it does</th></tr>
+      <tr><td><span class="method m-get">GET</span><code>/metrics</code></td><td>Prometheus text format. Standard <code>vllm:</code> names (throughput, time-to-first-token, tokens in and out) sit beside Apple-specific <code>mlx_serve:</code> ones (GPU utilization, memory, prefix-cache reuse), so an off-the-shelf vLLM Grafana dashboard works with no configuration. <code>503</code> unless <code>--metrics</code> is on.</td></tr>
+      <tr><td><span class="method m-get">GET</span><code>/metrics.json</code></td><td>The same figures as JSON — what the server's own live index-page panel polls.</td></tr>
+    </table>
+    <p>Recording happens once per request, never per token, so the metrics have no measurable effect on tokens/sec.</p>
+    <p>With <code>--api-key &lt;token&gt;</code> set, every request arriving from <b>another machine</b> must present the key — the OpenAI, Anthropic, and Ollama APIs, the index page, and the endpoints above. Any of these work:</p>
+    <div class="code-doc"><pre>curl http://mac.local:11234/v1/models -H "Authorization: Bearer &lt;key&gt;"
+curl http://mac.local:11234/v1/models -H "x-api-key: &lt;key&gt;"
+curl "http://mac.local:11234/v1/models?api_key=&lt;key&gt;"</pre></div>
+    <p class="note">Requests from the machine itself are trusted and need no key, so the app, your editor, and local scripts are unaffected — the key guards only what is reachable off the box. <code>/health</code> stays open either way. Because localhost is exempt, <code>curl localhost</code> will never show you a <code>401</code>; test from another machine.</p>
   </section>
 
   <section class="section" style="padding-top: 0;">

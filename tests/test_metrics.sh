@@ -58,6 +58,24 @@ wait_health() {
 }
 
 # ════════════════════════════════════════════════════════════════════════════
+# Phase 0: index-panel rate math (pure, no server, no GPU)
+# ════════════════════════════════════════════════════════════════════════════
+echo ""
+echo "── Phase 0: panel rate math (src/html/metrics.js) ──"
+NODE_BIN="$(command -v node || true)"
+if [ -z "$NODE_BIN" ]; then
+    echo "  SKIP: node not on PATH"
+else
+    if "$NODE_BIN" "$(dirname "$0")/metrics_panel_test.mjs" > /tmp/metrics_panel.out 2>&1; then
+        sed 's/^/  /' /tmp/metrics_panel.out | grep -E "PASS|ALL PASS"
+        check "panel rate math (no carry-forward; prefill 0 while decoding)" 1
+    else
+        sed 's/^/  /' /tmp/metrics_panel.out
+        check "panel rate math (no carry-forward; prefill 0 while decoding)" 0
+    fi
+fi
+
+# ════════════════════════════════════════════════════════════════════════════
 # Phase 1: Without --metrics, /metrics* return 503 and the index page has no panel
 # ════════════════════════════════════════════════════════════════════════════
 echo ""
@@ -207,6 +225,102 @@ check "generation_tokens_live > 0 after one request (sampler ticked)" \
     "$([ -n "$LIVE" ] && [ "$LIVE" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
 check "generation_tokens_live == generation_tokens_total at rest (no slots decoding)" \
     "$([ -n "$LIVE" ] && [ -n "$GEN" ] && [ "$LIVE" = "$GEN" ] && echo 1 || echo 0)"
+
+# ── Phase 4: prefill is visible WHILE it runs, not only when the request ends ──
+#
+# Regression: `prompt_tokens_total` and the prefill_time histogram only advance
+# at request completion, and generated tokens only accrue during decode. So a
+# multi-minute prefill pinned the GPU while the panel showed 0 tok/s decode and
+# "—" prefill — the user could not tell a long prefill from a hung server.
+# `mlx_serve:prefill_tokens_live` is the missing signal.
+echo ""
+echo "── Phase 4: live prefill gauge ──"
+
+# At rest, no prefill is in flight.
+sleep 3
+IDLE_PRE=$(curl -s "$BASE/metrics" | grep "^mlx_serve:prefill_tokens_live " | awk '{print $2}')
+check "prefill_tokens_live == 0 at rest" \
+    "$([ "$IDLE_PRE" = "0" ] && echo 1 || echo 0)"
+
+# Build a prompt big enough that prefill spans several chunks (chunk = 8192
+# tokens), then poll the gauge WHILE the request is still in flight.
+BIG=$(python3 -c "print(('The quick brown fox jumps over the lazy dog. ' * 2600).strip())")
+REQ=$(python3 -c "
+import json,sys
+print(json.dumps({'model':'mlx-serve','stream':False,'max_tokens':1,'temperature':0,
+                  'messages':[{'role':'user','content':sys.stdin.read()}]}))" <<< "$BIG")
+
+curl -s -m 300 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$REQ" >/dev/null &
+CURL_PID=$!
+
+SAW_LIVE=0
+SAW_PHASE=0
+MAX_SEEN=0
+for _ in $(seq 1 200); do
+    kill -0 $CURL_PID 2>/dev/null || break     # request finished
+    read -r V P <<< "$(curl -s -m 2 "$BASE/metrics.json" | python3 -c "
+import json,sys
+try:
+    g = json.load(sys.stdin)['gauges']
+    print(g.get('prefill_tokens_live', 0), g.get('requests_prefilling', 0))
+except Exception: print(0, 0)" 2>/dev/null)"
+    [ -n "$P" ] && [ "$P" -gt 0 ] 2>/dev/null && SAW_PHASE=1
+    [ -n "$V" ] && [ "$V" -gt "$MAX_SEEN" ] 2>/dev/null && MAX_SEEN=$V
+    [ -n "$V" ] && [ "$V" -gt 0 ] 2>/dev/null && SAW_LIVE=1 && break
+    sleep 0.5
+done
+wait $CURL_PID 2>/dev/null
+
+check "prefill_tokens_live > 0 DURING a long prefill (saw $MAX_SEEN tokens in flight)" "$SAW_LIVE"
+check "requests_prefilling was 1 during the prefill (phase visible before the first chunk)" "$SAW_PHASE"
+
+# ...and it returns to 0 once the prefill is done.
+sleep 3
+DONE_PRE=$(curl -s "$BASE/metrics" | grep "^mlx_serve:prefill_tokens_live " | awk '{print $2}')
+DONE_PHASE=$(curl -s "$BASE/metrics" | grep "^mlx_serve:requests_prefilling " | awk '{print $2}')
+check "prefill_tokens_live back to 0 after the request completes" \
+    "$([ "$DONE_PRE" = "0" ] && echo 1 || echo 0)"
+check "requests_prefilling back to 0 after the request completes" \
+    "$([ "$DONE_PHASE" = "0" ] && echo 1 || echo 0)"
+
+# ── Phase 5: prefill throughput must exclude prefix-cache restores ──
+#
+# `prompt_tokens_total` bills every prompt token; `prefill_time_seconds` only
+# ticks for tokens actually forwarded. Dividing the first by the second inflated
+# the panel's prefill tok/s by prompt/(prompt-cached) — 10.6x on a warm
+# multi-turn 35B MoE session (9.8K tok/s reported, ~220 real).
+echo ""
+echo "── Phase 5: prefill tok/s excludes cached tokens ──"
+
+read_counter() { curl -s "$BASE/metrics" | grep "^$1 " | awk '{print $2}'; }
+
+# Same prompt twice: the second request must hit the hot prefix cache.
+WARM='{"model":"mlx-serve","max_tokens":1,"temperature":0,"messages":[{"role":"user","content":"Count slowly and describe each number in one clause: one two three four five six seven eight nine ten eleven twelve."}]}'
+curl -s -m 120 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$WARM" >/dev/null
+P1=$(read_counter "vllm:prompt_tokens_total")
+F1=$(read_counter "mlx_serve:prefill_tokens_total")
+
+curl -s -m 120 "$BASE/v1/chat/completions" -H 'Content-Type: application/json' -d "$WARM" >/dev/null
+P2=$(read_counter "vllm:prompt_tokens_total")
+F2=$(read_counter "mlx_serve:prefill_tokens_total")
+C2=$(read_counter "mlx_serve:prefix_cache_tokens_total")
+
+DP=$((P2 - P1))   # billed prompt tokens of the warm request
+DF=$((F2 - F1))   # tokens it actually forwarded
+
+check "warm request still bills its full prompt (prompt_tokens_total +$DP)" \
+    "$([ "$DP" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
+check "warm request forwards FEWER tokens than it bills ($DF < $DP)" \
+    "$([ "$DF" -lt "$DP" ] 2>/dev/null && echo 1 || echo 0)"
+check "prefix_cache_tokens_total > 0 after a cache hit" \
+    "$([ -n "$C2" ] && [ "$C2" -gt 0 ] 2>/dev/null && echo 1 || echo 0)"
+# The invariant that makes prefill tok/s trustworthy.
+check "forwarded + restored == billed ($F2 + $C2 == $P2)" \
+    "$([ $((F2 + C2)) -eq "$P2" ] 2>/dev/null && echo 1 || echo 0)"
+
+# The panel divides by this counter; it must never exceed the billed total.
+check "prefill_tokens_total <= prompt_tokens_total" \
+    "$([ "$F2" -le "$P2" ] 2>/dev/null && echo 1 || echo 0)"
 
 # ── Summary ─────────────────────────────────────────────────────────────────
 echo ""

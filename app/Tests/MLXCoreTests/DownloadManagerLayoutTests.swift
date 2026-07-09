@@ -439,20 +439,21 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertFalse(DownloadManager.isCancellation(URLError(.notConnectedToInternet)))
     }
 
-    // MARK: - Downloaded tab live-refresh trigger
+    // MARK: - Live-refresh trigger
     //
-    // The Downloaded tab's "Size on Disk" comes from a disk re-scan
-    // (`refreshModels`), which previously only fired on tab entry — so sizes
-    // froze mid-download until the user toggled the button. The tab now
-    // live-polls, but only while it's showing AND a download is in flight.
+    // "Size on Disk" comes from a disk re-scan (`refreshModels`), which
+    // originally only fired on tab entry — so sizes froze mid-download until the
+    // user toggled the button. The panes that show on-disk state now live-poll,
+    // but only while one of them is showing AND a download is in flight.
+    // Full coverage of the section matrix lives in `ModelBrowserSectionTests`.
 
-    func testShouldLivePollOnlyWhenTabOpenAndDownloading() {
-        XCTAssertTrue(ModelBrowserView.shouldLivePoll(downloadedTab: true, hasActiveDownloads: true))
+    func testShouldLivePollOnlyOnDiskPanesAndOnlyWhileDownloading() {
+        XCTAssertTrue(ModelBrowserSection.shouldLivePoll(section: .myModels, hasActiveDownloads: true))
         // No active downloads → nothing to refresh, don't spin.
-        XCTAssertFalse(ModelBrowserView.shouldLivePoll(downloadedTab: true, hasActiveDownloads: false))
-        // Not in the Downloaded tab → the sizes aren't even visible.
-        XCTAssertFalse(ModelBrowserView.shouldLivePoll(downloadedTab: false, hasActiveDownloads: true))
-        XCTAssertFalse(ModelBrowserView.shouldLivePoll(downloadedTab: false, hasActiveDownloads: false))
+        XCTAssertFalse(ModelBrowserSection.shouldLivePoll(section: .myModels, hasActiveDownloads: false))
+        // Discover reads published DownloadManager state, not the disk.
+        XCTAssertFalse(ModelBrowserSection.shouldLivePoll(section: .discover, hasActiveDownloads: true))
+        XCTAssertFalse(ModelBrowserSection.shouldLivePoll(section: .discover, hasActiveDownloads: false))
     }
 
     // MARK: - LocalModel metadata caption

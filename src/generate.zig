@@ -669,6 +669,16 @@ pub const Generator = struct {
         /// `initWithOptions` returns `error.Cancelled` instead of grinding
         /// out the rest of a multi-minute ghost prefill.
         cancel_flag: ?*const std.atomic.Value(bool) = null,
+        /// LIVE prefill progress, in tokens actually forwarded so far by THIS
+        /// prefill. Bumped once per chunk (not per token), read off-thread by
+        /// the metrics gauge sampler.
+        ///
+        /// Without it the panel is blind during prefill: `prompt_tokens_total`
+        /// and `prefill_time_seconds` only advance at request COMPLETION, and
+        /// generated tokens only accrue during decode — so a multi-minute
+        /// prefill saturates the GPU while both tiles read 0 / "—". The
+        /// scheduler resets it to 0 when the prefill ends.
+        prefill_progress: ?*std.atomic.Value(u64) = null,
     };
 
     /// Selects the source slice that `initWithOptions` will dupe into
@@ -934,6 +944,9 @@ pub const Generator = struct {
 
                 pos = end;
                 n_chunks += 1;
+                // Publish progress once per chunk — same cadence discipline as
+                // `inflight_generated_tokens` (once per decode tick), never per token.
+                if (options.prefill_progress) |p| p.store(@intCast(pos), .monotonic);
             }
 
             // Phase 1: always-on snapshot at the post-prefill position

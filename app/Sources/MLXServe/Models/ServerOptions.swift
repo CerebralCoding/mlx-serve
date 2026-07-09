@@ -614,6 +614,26 @@ extension ServerOptions.SandboxConfig {
     }
 }
 
+// MARK: - Reset to defaults
+
+extension ServerOptions {
+    /// The value the Settings screen's "Reset to Defaults" button installs.
+    ///
+    /// Everything returns to `ServerOptions()` except the Telegram bot token,
+    /// which is a credential the user obtained from @BotFather and cannot
+    /// re-derive from anything on this machine — wiping it turns a stray reset
+    /// into a trip back to Telegram. Every other field (including the rest of
+    /// the Telegram block: the enable toggle, agent mode, and the adopted chat
+    /// ids, which re-adopt on the next message) is re-derivable and is
+    /// deliberately restored. Pure so `SettingsResetTests` can pin the scope of
+    /// the carve-out against future fields.
+    static func resetToDefaults(preserving current: ServerOptions) -> ServerOptions {
+        var fresh = ServerOptions()
+        fresh.telegram.botToken = current.telegram.botToken
+        return fresh
+    }
+}
+
 // MARK: - UI introspection metadata
 
 /// Describes a single tunable for the Settings UI: a label, an explainer,
@@ -638,7 +658,7 @@ extension ServerOptions {
             needsRestart: true),
         "ctxSize": .init(
             title: "Context size",
-            explainer: "Maximum prompt + completion tokens. 0 means use the model's declared maximum. Higher values use more memory.",
+            explainer: ContextSizeDisplay.helpText,
             needsRestart: true),
         "noVision": .init(
             title: "Disable vision",

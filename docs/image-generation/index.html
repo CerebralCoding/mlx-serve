@@ -139,6 +139,7 @@
         <h3>"Add an Instagram model in this boat."</h3>
         <p>Attach a photo, type what should change, and FLUX.2-klein edits it while keeping the <b>subject, pose, and scene intact</b>. This isn't a noisy remix — your photo rides through the model as a clean in-context reference, the exact mechanism the model was trained on. Measured live: a "make the fox blue" edit kept <b>97% structural correlation</b> with the original.</p>
         <p>Your photo keeps its proportions, too: a portrait or landscape source is recomposed into the output size — never stretched, never squished.</p>
+        <p><b>New in v26.7.3:</b> an edit can see more than one picture. Add up to three extra references beside the source and point at them by number — <i>"replace the face of the man in image 1 with the face from image 2"</i> — and each reference is fit on its own terms, at its own aspect ratio.</p>
       </div>
       <div class="split-visual reveal">
         <figure class="shot">
@@ -186,6 +187,7 @@
   "size":   "1024x1024",
   "image":  "&lt;base64 source photo&gt;",   // optional
   "mode":   "edit",                     // or "variation" + strength
+  "ref_images": ["&lt;base64 image 2&gt;"],   // edit mode, up to 3
   "lora_path":  "/path/to/watercolor.safetensors",
   "lora_scale": 0.9
 }'</span></pre>

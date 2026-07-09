@@ -105,7 +105,12 @@ final class ServerLogBufferTests: XCTestCase {
             }
         }
         group.wait()
-        XCTAssertLessThanOrEqual(buf.snapshot().count, 8_192)
+        // Bounded by the high-water mark, not the trim target: `append` only
+        // re-trims once the buffer overshoots `maxBytes` by 25%, so the tail
+        // sits somewhere in [maxBytes, maxRetained]. That hysteresis is what
+        // keeps `append` amortized O(1) at the 1 MB cap.
+        XCTAssertLessThanOrEqual(buf.snapshot().count, buf.maxRetained)
+        XCTAssertGreaterThanOrEqual(buf.snapshot().count, 8_192)
     }
 
     // MARK: - LogPoller
@@ -294,5 +299,52 @@ final class ServerLogBufferTests: XCTestCase {
         XCTAssertTrue(textView.isSelectable, "User must be able to select & copy the log")
         XCTAssertFalse(textView.isEditable)
         XCTAssertEqual(textView.string, log, "Full log must be present for copy")
+    }
+
+    // MARK: - ThrottledLogBuffer (raised cap -> append must stay amortized O(1))
+
+    /// The retained tail was 64 KB; at that size an O(n) `count` + `suffix`
+    /// on EVERY append was invisible. With a 1 MB tail and `--log-level debug`
+    /// (hundreds of writes/sec) that becomes a real main-thread cost, so the
+    /// buffer must only re-trim once it crosses a high-water mark, and must
+    /// never re-scan the whole string just to know its length.
+    func testAppendStaysBoundedAndCheapAtTheRaisedCap() {
+        let cap = 100_000
+        let buf = ThrottledLogBuffer(maxBytes: cap)
+        let line = String(repeating: "a", count: 1000) + "\n"
+
+        // Ingest 10x the cap in 1 KB chunks.
+        let started = Date()
+        for _ in 0..<1000 { buf.append(line) }
+        let elapsed = Date().timeIntervalSince(started)
+
+        // Never grows past the high-water mark, and always retains >= cap.
+        let snap = buf.snapshot()
+        XCTAssertGreaterThanOrEqual(snap.count, cap)
+        XCTAssertLessThanOrEqual(snap.count, cap + cap / 4 + line.count)
+        // The tail is what's kept.
+        XCTAssertTrue(snap.hasSuffix(line))
+
+        // A quadratic implementation (trim scan on every append) takes seconds
+        // here; the amortized one is milliseconds. Generous bound so a loaded
+        // CI box doesn't flake.
+        XCTAssertLessThan(elapsed, 1.0, "append is not amortized: \(elapsed)s for 1000 appends")
+    }
+
+    func testBufferReportsItsOwnLengthWithoutRescanning() {
+        let buf = ThrottledLogBuffer(maxBytes: 1000)
+        buf.append("hello")
+        XCTAssertEqual(buf.count, 5)
+        buf.append(" world")
+        XCTAssertEqual(buf.count, 11)
+        XCTAssertEqual(buf.count, buf.snapshot().count)
+        buf.clear()
+        XCTAssertEqual(buf.count, 0)
+    }
+
+    func testRetainedTailIsAtLeastOneMegabyte() {
+        // The log window is the only place a user can see server stderr live.
+        // 64 KB was ~800 lines — a single big prefill trace scrolled it away.
+        XCTAssertGreaterThanOrEqual(ServerManager.serverLogMaxBytes, 1_048_576)
     }
 }
