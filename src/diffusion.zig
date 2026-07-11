@@ -257,6 +257,21 @@ pub const Runner = struct {
     pending_encode: ?[]u32 = null,
     /// Cooperative cancellation — checked once per denoising step.
     cancel_flag: ?*const std.atomic.Value(bool) = null,
+    /// MLX allocator-cache releases performed by this runner. The CADENCE is
+    /// the invariant that bounds peak memory — once per prefill chunk and once
+    /// per committed canvas, never once per request. Pinned by the
+    /// `releases the allocator cache once per CHUNK` test.
+    cache_releases: u32 = 0,
+
+    /// `mlx_array_free` only returns a buffer to MLX's allocator cache, which
+    /// can serve a later allocation of the SAME size. The encoder and the
+    /// canvas loop allocate at sizes keyed to the KV offset and the prompt
+    /// length, so freed buffers are almost never reused and must be released
+    /// explicitly (mirrors `generate.zig`'s AR loops).
+    fn releaseCache(self: *Runner) void {
+        _ = mlx.mlx_clear_cache();
+        self.cache_releases += 1;
+    }
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -307,12 +322,20 @@ pub const Runner = struct {
             const hidden = try self.xfm.forwardWith(self.ctx, chunk_input);
             try mlx.check(mlx.mlx_array_eval(hidden));
             _ = mlx.mlx_array_free(hidden);
+            // Once per CHUNK, exactly where the AR prefill loop clears
+            // (generate.zig, after the per-chunk eval). A chunk's transients
+            // are sized by the KV offset, which grows every chunk, so holding
+            // them until the end of the loop makes PEAK memory scale with the
+            // prompt: a 36 K-token turn peaked at 96.5 GB for a 14 GB model.
+            self.releaseCache();
             pos += chunk_len;
         }
     }
 
     /// Prompt prefill (encoder). Call once before the first nextCanvas.
     pub fn prefill(self: *Runner, prompt_ids: []const u32) !void {
+        // `encodeTokens` releases the allocator cache once per chunk, so the
+        // prompt's transients never accumulate past a single chunk.
         try self.encodeTokens(prompt_ids);
     }
 
@@ -322,6 +345,17 @@ pub const Runner = struct {
     pub fn nextCanvas(self: *Runner, allocator: std.mem.Allocator) !?CanvasResult {
         if (self.committed >= self.max_tokens) return null;
         const cfg = &self.xfm.config;
+
+        // Release the MLX allocator cache once per committed canvas — the
+        // same cadence the AR decode paths use (`generate.zig`, every 256
+        // tokens), since a canvas commits at most `canvas_length` (≤ 256).
+        // Declared first so it runs LAST, after every transient below has
+        // been freed into the cache. Without it the cache grows without
+        // bound: a step's buffers are sized by canvas_length AND the current
+        // KV length, which advances one canvas per commit and restarts at a
+        // fresh prompt length on every request, so a freed buffer is almost
+        // never the size the next allocation wants.
+        defer self.releaseCache();
 
         if (self.pending_encode) |ids| {
             try self.encodeTokens(ids);
@@ -720,6 +754,128 @@ test "diffusion: live converged-canvas self-consistency vs mlx-vlm (DIFFUSION_TE
         std.debug.print("self-consistency (sc): {d}/64\n", .{match});
         try testing.expect(match >= 62);
     }
+}
+
+test "diffusion: each committed canvas releases the MLX allocator cache (DIFFUSION_TEST_MODEL)" {
+    // Every AR decode path in generate.zig releases the MLX allocator cache
+    // every 256 tokens (`if (self.step % 256 == 0) mlx_clear_cache()`). A
+    // diffusion canvas commits up to canvas_length (≤ 256) tokens per call,
+    // so it owes the same release — and it is far hungrier than AR: each of
+    // up to 48 denoising steps frees a [1, canvas, vocab] f32 logits array
+    // (~67–268 MB), its scaled copy, soft embeddings, and attention scores
+    // over a KV that GROWS by one canvas per commit. Those buffers land in
+    // MLX's allocator cache at sizes that never repeat once the prompt
+    // length varies, so the cache accumulates without bound.
+    //
+    // Live 2026-07-09 (soak): diffusiongemma-26B-A4B reached a 92 GB
+    // phys_footprint for a 14 GB model. `active_bytes` stayed FLAT the whole
+    // time — the signature of allocator-cache growth, NOT leaked handles
+    // (see the phantom-ref gotcha in CLAUDE.md). Ten growing-prompt requests
+    // reproduced it: phys 27.6 → 35.8 GB, active pinned at 22.32 GB.
+    //
+    // Gated on DIFFUSION_TEST_MODEL; skips when unset so CI stays green.
+    const raw = std.c.getenv("DIFFUSION_TEST_MODEL") orelse return error.SkipZigTest;
+    const dir = std.mem.sliceTo(raw, 0);
+    if (dir.len == 0) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const config = try model_mod.parseConfig(io, alloc, dir);
+    try testing.expect(config.isDiffusion());
+    var weights = try model_mod.loadWeights(io, alloc, dir);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, alloc, config, &weights);
+    defer xfm.deinit();
+
+    var ctx = xfm.defaultCtx();
+    // "<bos><|turn>user\nSay hello in exactly five words.<turn|>\n<|turn>model\n<|channel>thought\n<channel|>\n"
+    const prompt = [_]u32{ 2, 105, 2364, 107, 37889, 29104, 528, 7121, 3493, 4171, 236761, 106, 107, 105, 4368, 107, 100, 45518, 107, 101, 107 };
+
+    const canvas_len = xfm.config.canvas_length;
+    var runner = try Runner.init(alloc, &xfm, &ctx, 0.0, canvas_len * 2);
+    defer runner.deinit();
+    try runner.prefill(&prompt);
+
+    // A single canvas' transients run to hundreds of MB, and the second
+    // canvas attends over a KV one canvas longer than the first (fresh
+    // buffer sizes, no reuse). Once `nextCanvas` releases the cache the
+    // residue is near-zero; without the release this is GBs by canvas 2.
+    const CACHE_BOUND: usize = 256 * 1024 * 1024;
+    var canvases: u32 = 0;
+    while (try runner.nextCanvas(alloc)) |r| {
+        alloc.free(r.tokens);
+        canvases += 1;
+        var cached: usize = 0;
+        _ = mlx.mlx_get_cache_memory(&cached);
+        std.debug.print(
+            "canvas {d}: mlx allocator cache = {d:.1} MB\n",
+            .{ canvases, @as(f64, @floatFromInt(cached)) / (1024.0 * 1024.0) },
+        );
+        try testing.expect(cached <= CACHE_BOUND);
+    }
+    // max_tokens = 2 canvases, so the loop commits exactly two and stops.
+    try testing.expectEqual(@as(u32, 2), canvases);
+}
+
+test "diffusion: prefill releases the allocator cache once per CHUNK, not once per prompt (DIFFUSION_TEST_MODEL)" {
+    // Releasing the cache only after the WHOLE chunk loop bounds the STEADY
+    // STATE across requests but not the PEAK inside one: each chunk's
+    // transients are sized by the KV offset, which grows every chunk, so a
+    // freed buffer never fits the next chunk's request and they pile up for
+    // the length of the prompt. The AR prefill loop already clears once per
+    // chunk (generate.zig, right after the per-chunk eval); the encoder owes
+    // the same cadence.
+    //
+    // Live 2026-07-09: with the per-canvas release in place, a 12,022-token
+    // prompt still grew phys_footprint 24.5 → 34.4 GB DURING its 20 s prefill
+    // (active_bytes moved only 22.9 → 24.6 GB, so ~8.4 GB was cache), and an
+    // agent turn at 36,560 tokens peaked at 96.5 GB for a 14 GB model. It
+    // recovered afterwards — a transient peak, not a leak — which is exactly
+    // why measuring the footprint only AFTER a request missed it.
+    //
+    // The cadence, not the post-prefill residue, is the invariant: a trailing
+    // clear leaves the cache empty at the end either way, so this pins the
+    // per-chunk release count.
+    const raw = std.c.getenv("DIFFUSION_TEST_MODEL") orelse return error.SkipZigTest;
+    const dir = std.mem.sliceTo(raw, 0);
+    if (dir.len == 0) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    const config = try model_mod.parseConfig(io, alloc, dir);
+    try testing.expect(config.isDiffusion());
+    var weights = try model_mod.loadWeights(io, alloc, dir);
+    defer weights.deinit();
+    var xfm = try Transformer.init(io, alloc, config, &weights);
+    defer xfm.deinit();
+
+    var ctx = xfm.defaultCtx();
+
+    // A prompt spanning three full chunks plus a partial one.
+    const prompt_len = PREFILL_CHUNK * 3 + 7;
+    const expected_chunks = (prompt_len + PREFILL_CHUNK - 1) / PREFILL_CHUNK; // 4
+    const ids = try alloc.alloc(u32, prompt_len);
+    defer alloc.free(ids);
+    ids[0] = 2; // <bos>
+    for (ids[1..], 1..) |*t, i| t.* = @intCast(1000 + (i % 5000));
+
+    var runner = try Runner.init(alloc, &xfm, &ctx, 0.0, 64);
+    defer runner.deinit();
+
+    _ = mlx.mlx_clear_cache();
+    try runner.prefill(ids);
+
+    std.debug.print(
+        "prefill: {d} tokens, {d} chunks, {d} cache releases\n",
+        .{ prompt_len, expected_chunks, runner.cache_releases },
+    );
+    // Red-on-revert: a clear placed after the loop releases exactly once.
+    try testing.expect(runner.cache_releases >= expected_chunks);
+
+    var cached: usize = 0;
+    _ = mlx.mlx_get_cache_memory(&cached);
+    std.debug.print("post-prefill mlx cache = {d:.1} MB\n", .{@as(f64, @floatFromInt(cached)) / (1024.0 * 1024.0)});
+    try testing.expect(cached <= 256 * 1024 * 1024);
 }
 
 test "diffusion meanScalar" {
