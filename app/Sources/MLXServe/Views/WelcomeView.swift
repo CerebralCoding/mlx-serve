@@ -30,6 +30,10 @@ struct WelcomeView: View {
 
     private static let appIcon: NSImage? = loadBundledImage("appiconb.png")
 
+    /// Derived from `UpdateChecker.repo` (the app's single source of truth
+    /// for the GitHub repo) so the star link can never drift from it.
+    static let gitHubStarURL = URL(string: "https://github.com/\(UpdateChecker.repo)")!
+
     private static let trayIcon: NSImage? = {
         guard let img = loadBundledImage("tray.png") else { return nil }
         img.isTemplate = true  // adapts to light/dark mode
@@ -115,6 +119,27 @@ struct WelcomeView: View {
                     .padding(.horizontal, 28)
                     .padding(.bottom, 14)
             }
+
+            // GitHub star nudge
+            Button {
+                NSWorkspace.shared.open(Self.gitHubStarURL)
+            } label: {
+                HStack(spacing: 5) {
+                    Image(systemName: "star.fill")
+                        .font(.system(size: 10))
+                        .foregroundStyle(.yellow)
+                    Text("Enjoying MLX Core? ")
+                        .foregroundStyle(.secondary)
+                    + Text("Star us on GitHub")
+                        .foregroundStyle(Color.accentColor)
+                        .underline()
+                    + Text(" — it really helps!")
+                        .foregroundStyle(.secondary)
+                }
+                .font(.caption)
+            }
+            .buttonStyle(.plain)
+            .padding(.bottom, 14)
 
             // Dismiss button
             Button {
