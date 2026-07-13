@@ -531,6 +531,22 @@ pub var ssm_checkpoint_stride: u32 = 256;
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
 pub var ssm_checkpoint_max: u32 = 32;
 
+/// SSM prefill checkpoints exist ONLY to feed the hot prefix cache (RAM +
+/// disk tiers key their hybrid restores off them). With the cache disabled
+/// (`--prefix-cache-entries 0`) every capture is a 48-layer materialize +
+/// eval thrown straight away — measured ~2-4% of short-prompt prefill on
+/// Qwen3.6-27B. Single chokepoint for every LoadParams builder.
+pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32) u32 {
+    if (cache_capacity == 0) return 0;
+    return stride;
+}
+
+test "effectiveSsmCheckpointStride: disabled prefix cache disables checkpoint capture" {
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0));
+    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32));
+}
+
 /// Iteration 2 (perf-plan Phase 4 #3): LRU capacity of the per-LoadedModel
 /// chat-template tokenize cache. 0 disables (every request re-renders +
 /// re-tokenizes, restoring pre-Iteration-2 behavior). Default 4 is small
@@ -2119,9 +2135,11 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 ///     (+0.5 bit/elem group scale/bias overhead when quantized), not a
 ///     hardcoded fp16.
 ///   - scores: the composed-SDPA scratch [heads, chunk, seq] — materialized
-///     only for head_dim > 128, which misses MLX's fused kernel (every
-///     Gemma-4 / Qwen3.5-3.6 checkpoint ships head_dim 256). Bounded to ~one
-///     layer by the adaptive eval cadence (transformer.prefillEvalCadence).
+///     only for head_dims no fused kernel covers (transformer.
+///     prefillHeadDimFused: <= 128 via MLX, 256 via msv_attn_p256 — unfused
+///     only under the MLX_SERVE_FUSED_256=0 kill switch or an exotic dim).
+///     Bounded to ~one layer by the adaptive eval cadence
+///     (transformer.prefillEvalCadence).
 ///   - dequant: dense-fp16 rebuild of the FULL quantized cache each layer
 ///     (KVCache.denseView under --kv-quant).
 ///   - mlp: QKV/MLP transient envelope; ~3 layers coexist between eval
@@ -2133,7 +2151,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, layers: u64, hdi
         layers * 2 * seq * kv_heads * hdim * 2
     else
         layers * 2 * seq * kv_heads * hdim * (2 * kv_bits + 1) / 16;
-    const scores: u64 = if (hdim > 128) heads * chunk * seq * 2 else 0;
+    const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(hdim))) heads * chunk * seq * 2 else 0;
     const dequant: u64 = if (kv_bits < 16) 2 * seq * kv_heads * hdim * 2 else 0;
     const mlp: u64 = 8 * chunk * @max(hidden, ffn) * 2;
     return (kv_bytes + scores + dequant + 3 * mlp) * 5 / 4;
@@ -2163,7 +2181,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_len:
     const kv_cfg: transformer_mod.KVQuantConfig = kv_override orelse
         (if (global_scheduler) |sch| sch.kv_quant_config else transformer_mod.KVQuantConfig.dense);
     const kv_bits: u64 = if (kv_cfg.scheme == .off) 16 else kv_cfg.bits;
-    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(config.head_dim, config.num_attention_heads, prompt_len));
+    const chunk: u64 = @intCast(generate_mod.effectivePrefillChunk(config.head_dim, config.num_attention_heads, prompt_len, config.has_sliding_window));
     const needed: u64 = prefillMemoryNeeded(seq, heads, kv_heads, layers, hdim, hidden, ffn, kv_bits, chunk);
 
     // Available = GPU allocation ceiling minus current usage (model weights,
@@ -11673,6 +11691,8 @@ test "readyCapsJson: every resident media engine surfaces its capability (mesh -
 
 test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
     const t = std.testing;
+    transformer_mod.fused256_override = false;
+    defer transformer_mod.fused256_override = null;
     // 26B-A4B shape at 100K ctx, chunk 512 (what the bounded chunk picks there).
     // fp16: kv 30x2x100000x8x256x2 = 24.576 GB; scores 16x512x100000x2 = 1.6384 GB;
     //       mlp 3x8x512x2816x2 = 69.2 MB; x1.25 margin.
@@ -11693,6 +11713,8 @@ test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
 
 test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt is admittable" {
     const t = std.testing;
+    transformer_mod.fused256_override = false;
+    defer transformer_mod.fused256_override = null;
     // The PR-#69 failure case: Qwen3.6-35B-A3B shape (whose checkpoint OMITS
     // intermediate_size, so the struct default 15360 leaks into ffn) at 262144
     // tokens with 4-bit KV. kv 6.04 GB + scores 4.29 GB + dequant 0.54 GB +
@@ -11708,6 +11730,8 @@ test "prefillMemoryNeeded: working set is chunk-bounded — the 255K MoE prompt 
 
 test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch" {
     const t = std.testing;
+    transformer_mod.fused256_override = false;
+    defer transformer_mod.fused256_override = null;
     // Same shape, head_dim 128 vs 256 (kv scaled by hdim too, so compare the
     // full bills computed by hand): hd=128 fp16 -> kv 12.288 GB + 0 scores +
     // mlp 69.2 MB, x1.25.
@@ -11721,4 +11745,24 @@ test "prefillMemoryNeeded: unfused head dims bill the materialized score scratch
     // score tensor (16x512x100000x2 = 1.6384 GB x1.25).
     const with_scores = prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512);
     try t.expectEqual(@as(u64, 15_446_507_520 + 15_360_000_000 + 2_048_000_000), with_scores);
+}
+
+test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + dequant" {
+    const t = std.testing;
+    // Default (msv_attn_p256 active): the composed score scratch never exists,
+    // so hd 256 bills exactly the hd-256 KV + mlp — the unfused bill minus the
+    // 1.6384 GB x1.25 score term from the test above.
+    transformer_mod.fused256_override = true;
+    defer transformer_mod.fused256_override = null;
+    try t.expectEqual(
+        @as(u64, 32_854_507_520 - 2_048_000_000),
+        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 16, 512),
+    );
+    // The quantized-KV dequant transient is a denseView property, NOT a score
+    // property — it must survive the fused kernel (fires on every kv-quant
+    // request regardless of head_dim).
+    try t.expectEqual(
+        @as(u64, 11_798_507_520 - 2_048_000_000),
+        prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 4, 512),
+    );
 }
