@@ -1686,7 +1686,10 @@ pub const ParsedToolCall = struct {
 
 /// Locate a tool's `properties` map in an OpenAI-shaped tools array. Accepts
 /// both the wrapped (`{"type":"function","function":{…}}`) and flat forms.
-fn toolPropertiesFor(tools: std.json.Value, name: []const u8) ?std.json.ObjectMap {
+/// The tool's JSON-Schema `parameters` object (Anthropic `input_schema` too).
+/// Callers that need only the property map use `toolPropertiesFor`; the hoist
+/// also needs `required`, which lives beside `properties` here.
+fn toolParametersFor(tools: std.json.Value, name: []const u8) ?std.json.ObjectMap {
     if (tools != .array) return null;
     for (tools.array.items) |tool_val| {
         if (tool_val != .object) continue;
@@ -1700,11 +1703,23 @@ fn toolPropertiesFor(tools: std.json.Value, name: []const u8) ?std.json.ObjectMa
         if (nv != .string or !std.mem.eql(u8, nv.string, name)) continue;
         const params = func.get("parameters") orelse func.get("input_schema") orelse return null;
         if (params != .object) return null;
-        const props = params.object.get("properties") orelse return null;
-        if (props != .object) return null;
-        return props.object;
+        return params.object;
     }
     return null;
+}
+
+fn toolPropertiesFor(tools: std.json.Value, name: []const u8) ?std.json.ObjectMap {
+    const params = toolParametersFor(tools, name) orelse return null;
+    const props = params.get("properties") orelse return null;
+    if (props != .object) return null;
+    return props.object;
+}
+
+/// The types a misplaced value may be hoisted on. A required OBJECT/ARRAY param
+/// found inside another container is too speculative to move — only scalars.
+fn isScalarJsonType(want: []const u8) bool {
+    return std.mem.eql(u8, want, "string") or std.mem.eql(u8, want, "integer") or
+        std.mem.eql(u8, want, "number") or std.mem.eql(u8, want, "boolean");
 }
 
 /// The JSON type a property declares. `"type"` may be a union array
@@ -1883,6 +1898,46 @@ pub fn toolCallConformsToSchema(
     return true;
 }
 
+/// True when a REQUIRED scalar param is MISSING at the top level while sitting
+/// buried inside one of the tool's declared container args — exactly the shape
+/// `hoistMisplacedRequiredParams` exists to repair, and exactly what a strict
+/// client rejects with "must have required properties X". The format corpus
+/// asserts this is FALSE for every entry that declares tools, so a future family
+/// that produces the buried shape is covered without a bespoke assertion.
+pub fn requiredParamIsBuried(
+    allocator: std.mem.Allocator,
+    call: ParsedToolCall,
+    tools_json: []const u8,
+) bool {
+    var tools = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return false;
+    defer tools.deinit();
+    const params = toolParametersFor(tools.value, call.name) orelse return false;
+    const props_v = params.get("properties") orelse return false;
+    const required_v = params.get("required") orelse return false;
+    if (props_v != .object or required_v != .array) return false;
+    const props = props_v.object;
+
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch return false;
+    defer parsed.deinit();
+    if (parsed.value != .object) return false;
+
+    for (required_v.array.items) |req_v| {
+        if (req_v != .string) continue;
+        const name = req_v.string;
+        if (parsed.value.object.get(name) != null) continue;
+        const want = declaredJsonType(props.get(name) orelse continue) orelse continue;
+        if (!isScalarJsonType(want)) continue;
+
+        var it = parsed.value.object.iterator();
+        while (it.next()) |e| {
+            const prop = props.get(e.key_ptr.*) orelse continue;
+            if (containerItemDeclares(prop, name)) continue;
+            if (buriedParamIn(e.value_ptr, name, want, false) != null) return true;
+        }
+    }
+    return false;
+}
+
 /// Coerce every parsed call's `arguments` to the types its tool DECLARES.
 ///
 /// Class: **type inference from value spelling.** Neither the tag formats
@@ -1943,6 +1998,164 @@ pub fn coerceToolArgsToSchema(
 
         const rewritten = std.json.Stringify.valueAlloc(allocator, parsed.value, .{}) catch continue;
         log.info("  [tool-parse] coerced {s} arguments to the declared schema types\n", .{call.name});
+        allocator.free(call.arguments);
+        call.arguments = rewritten;
+    }
+}
+
+/// Does this container's ITEM schema declare `name` as one of its own
+/// properties? If it does, a `name` sitting inside it BELONGS there and must
+/// never be lifted out — a multi-file edit tool would lose its per-item paths.
+/// This is the whole safety argument for the hoist below, so it is deliberately
+/// conservative: no declared item `properties` map ⇒ nothing is proven ⇒ false.
+fn containerItemDeclares(prop: std.json.Value, name: []const u8) bool {
+    if (prop != .object) return false;
+    // Array property → the item schema. Object property → the schema itself.
+    const inner = if (prop.object.get("items")) |items| items else prop;
+    if (inner != .object) return false;
+    const props = inner.object.get("properties") orelse return false;
+    if (props != .object) return false;
+    return props.object.get(name) != null;
+}
+
+/// Scalar equality — the only shapes we ever hoist on. A container value is
+/// never a candidate, so a structural compare is not needed.
+fn jsonScalarEql(a: std.json.Value, b: std.json.Value) bool {
+    return switch (a) {
+        .string => |s| b == .string and std.mem.eql(u8, s, b.string),
+        .integer => |i| b == .integer and i == b.integer,
+        .bool => |x| b == .bool and x == b.bool,
+        else => false,
+    };
+}
+
+/// Find `name` buried one level down inside `container`, requiring UNANIMITY:
+/// every object in the container carries `name`, all with the same scalar value,
+/// and that value matches the type the schema declares for the top-level param.
+/// Anything less is ambiguous → null. With `remove`, also deletes it from each
+/// object (the returned value keeps pointing into the parse arena, which
+/// outlives the removal).
+fn buriedParamIn(
+    container: *std.json.Value,
+    name: []const u8,
+    want: []const u8,
+    remove: bool,
+) ?std.json.Value {
+    switch (container.*) {
+        .array => |*arr| {
+            if (arr.items.len == 0) return null;
+            var found: ?std.json.Value = null;
+            for (arr.items) |*item| {
+                if (item.* != .object) return null;
+                const v = item.object.get(name) orelse return null; // must be in EVERY item
+                if (v == .null or !jsonTypeMatches(v, want)) return null;
+                if (found) |f| {
+                    if (!jsonScalarEql(f, v)) return null; // items disagree → ambiguous
+                } else found = v;
+            }
+            if (remove) for (arr.items) |*item| {
+                _ = item.object.orderedRemove(name);
+            };
+            return found;
+        },
+        .object => |*obj| {
+            const v = obj.get(name) orelse return null;
+            if (v == .null or !jsonTypeMatches(v, want)) return null;
+            if (remove) _ = obj.orderedRemove(name);
+            return v;
+        },
+        else => return null,
+    }
+}
+
+/// Lift a REQUIRED top-level parameter the model BURIED inside a container arg.
+///
+/// Class: **misplaced required param.** A weak model that has internalized "the
+/// edit object holds everything about the edit" writes the file path INSIDE each
+/// `edits[]` item and never emits it at the top level:
+///
+///     {"edits":[{"newText":"…","oldText":"…","path":"us_presidents/generate_site.sh"}]}
+///
+/// The call is valid JSON and correctly escaped, so no repair path fires and no
+/// type is wrong — it is purely in the wrong PLACE, which only the schema can
+/// know. Strict clients reject it ("path: must have required properties path"),
+/// and the model, which cannot see its own serialized request, re-emits the same
+/// call until it gives up and falls back to rewriting the whole file with
+/// `write` — three dead multi-thousand-token rounds in the live 2026-07-13 pi
+/// session (gemma-4-26B-A4B). Same shape as the Claude Code replace_all loop.
+///
+/// Contract — every condition is read off the SCHEMA, never guessed:
+///   • the param is declared REQUIRED at the top level and is ABSENT there;
+///   • it is declared a SCALAR (hoisting a container is too speculative);
+///   • it sits inside a DECLARED container arg whose item schema does NOT
+///     declare it (`containerItemDeclares` — otherwise it belongs where it is);
+///   • every object in that container carries it with the SAME value and the
+///     declared type.
+/// Ambiguity of any kind (items disagreeing, two containers offering different
+/// values, a wrong-typed value) leaves the call untouched so the client's
+/// validation error stays honest. A compliant call never re-serializes.
+pub fn hoistMisplacedRequiredParams(
+    allocator: std.mem.Allocator,
+    calls: []ParsedToolCall,
+    tools_json: []const u8,
+) !void {
+    var tools = std.json.parseFromSlice(std.json.Value, allocator, tools_json, .{}) catch return;
+    defer tools.deinit();
+    if (tools.value != .array) return;
+
+    for (calls) |*call| {
+        const params = toolParametersFor(tools.value, call.name) orelse continue;
+        const props_v = params.get("properties") orelse continue;
+        const required_v = params.get("required") orelse continue;
+        if (props_v != .object or required_v != .array) continue;
+        const props = props_v.object;
+
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, call.arguments, .{}) catch continue;
+        defer parsed.deinit();
+        if (parsed.value != .object) continue;
+
+        var changed = false;
+        for (required_v.array.items) |req_v| {
+            if (req_v != .string) continue;
+            const name = req_v.string; // borrows from `tools`, which outlives the Stringify
+            if (parsed.value.object.get(name) != null) continue; // present — nothing misplaced
+
+            const want = declaredJsonType(props.get(name) orelse continue) orelse continue;
+            if (!isScalarJsonType(want)) continue;
+
+            // Probe every declared container WITHOUT mutating: a value found in
+            // two containers that disagree is ambiguous, and we must not have
+            // already gutted the first one by then.
+            var found: ?std.json.Value = null;
+            var ambiguous = false;
+            var it = parsed.value.object.iterator();
+            while (it.next()) |e| {
+                const prop = props.get(e.key_ptr.*) orelse continue;
+                if (containerItemDeclares(prop, name)) continue;
+                const v = buriedParamIn(e.value_ptr, name, want, false) orelse continue;
+                if (found) |f| {
+                    if (!jsonScalarEql(f, v)) {
+                        ambiguous = true;
+                        break;
+                    }
+                } else found = v;
+            }
+            if (ambiguous or found == null) continue;
+
+            // Commit: strip it from the containers, install it at the top level.
+            it = parsed.value.object.iterator();
+            while (it.next()) |e| {
+                const prop = props.get(e.key_ptr.*) orelse continue;
+                if (containerItemDeclares(prop, name)) continue;
+                _ = buriedParamIn(e.value_ptr, name, want, true);
+            }
+            try parsed.value.object.put(parsed.arena.allocator(), name, found.?);
+            log.info("  [tool-parse] hoisted misplaced required arg '{s}' to the top level for {s}\n", .{ name, call.name });
+            changed = true;
+        }
+        if (!changed) continue;
+
+        const rewritten = std.json.Stringify.valueAlloc(allocator, parsed.value, .{}) catch continue;
         allocator.free(call.arguments);
         call.arguments = rewritten;
     }
@@ -6484,11 +6697,14 @@ test "coerceToolArgsToSchema: unknown tool / unknown key / undecidable value pas
     }
 }
 
-/// pi's `edit` tool: `edits` is an ARRAY of objects. Captured live from
-/// ~/.mlx-serve/logs/mlx-serve-11234.log — the model passes it through the
-/// Hermes XML parameter form, where nothing carries type information.
+/// pi's `edit` tool, verbatim from its own schema
+/// (@earendil-works/pi-coding-agent dist/core/tools/edit.js — typebox
+/// `editSchema`). Two facts the tests below lean on: `path` is REQUIRED at the
+/// TOP level, and the array's item schema declares ONLY oldText/newText — it
+/// never declares `path`. That asymmetry is what makes a buried `path`
+/// provably misplaced rather than a judgment call.
 const pi_edit_tools_json_test =
-    \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object"}},"dry_run":{"type":"boolean"}},"required":["path","edits"]}}}]
+    \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"]},"description":"One or more targeted replacements."}},"required":["path","edits"]}}}]
 ;
 
 const edit_array_tools_json_test =
@@ -6735,6 +6951,192 @@ test "coerceToolArgsToSchema: a MANGLED array-typed param is tolerantly repaired
     try testing.expect(edits == .array);
     try testing.expectEqual(@as(usize, 1), edits.array.items.len);
     try testing.expectEqualStrings("  speed: 8,", edits.array.items[0].object.get("oldText").?.string);
+}
+
+// ── Misplaced required param (buried-`path` class) ──────────────────────────
+//
+// VERBATIM captured arguments, 2026-07-13 pi session (gemma-4-26B-A4B-it-qat-4bit,
+// ~/.mlx-serve/logs/mlx-serve-11234.log around the us_presidents run). The model
+// put `path` INSIDE each edits[] item and emitted no top-level `path`, so pi
+// answered
+//     Validation failed for tool "edit":
+//       - path: must have required properties path
+// three times in a row. Each rejection was a full multi-thousand-token
+// generation; the model then abandoned `edit` and rewrote the whole file with
+// `write` — the same "give up on the cheap tool, re-emit the expensive one"
+// degradation as the Claude Code replace_all loop.
+//
+// The parse layer is NOT at fault (verified: convertGemma4Object/Array are a
+// structural walk that preserves the model's own nesting and key order, and
+// coerceToolArgsToSchema only rewrites values in place) — the model genuinely
+// emitted it this way. The schema is what makes it provably fixable: `path` is
+// required at the TOP level and the item schema declares only oldText/newText.
+//
+// The script bodies are the real ones, excerpted for readability — their LENGTH
+// is not load-bearing (the JSON was already valid and correctly escaped; that is
+// exactly why no repair path fired). The nesting and the escaping are verbatim.
+const pi_buried_path_args_captured =
+    \\{"edits":[{"newText":"#!/bin/bash\n\n# Get the directory where the script is located\nSCRIPT_DIR=\"$( cd \"$( dirname \"${BASH_SOURCE[0]}\" )\" && pwd )\"\ncd \"$SCRIPT_DIR\"\n","oldText":"#!/bin/bash\n\n# Data for the presidents\n# Format: \"Name|Term|Bio\"\n","path":"us_presidents/generate_site.sh"}]}
+;
+
+test "hoistMisplacedRequiredParams: pi's buried `path` is lifted out of the edits items" {
+    const allocator = testing.allocator;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, pi_buried_path_args_captured),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+
+    try hoistMisplacedRequiredParams(allocator, &calls, pi_edit_tools_json_test);
+
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+
+    // The required param now satisfies the schema at the top level…
+    const path = parsed.value.object.get("path") orelse return error.PathNotHoisted;
+    try testing.expect(path == .string);
+    try testing.expectEqualStrings("us_presidents/generate_site.sh", path.string);
+
+    // …and is gone from the item, whose schema never declared it.
+    const edits = parsed.value.object.get("edits").?;
+    try testing.expect(edits == .array);
+    try testing.expectEqual(@as(usize, 1), edits.array.items.len);
+    const item = edits.array.items[0].object;
+    try testing.expect(item.get("path") == null);
+
+    // The payload the model worked for survives byte-exact, escaping intact.
+    try testing.expectEqualStrings(
+        "#!/bin/bash\n\n# Data for the presidents\n# Format: \"Name|Term|Bio\"\n",
+        item.get("oldText").?.string,
+    );
+    try testing.expect(std.mem.startsWith(u8, item.get("newText").?.string, "#!/bin/bash\n"));
+    try testing.expect(std.mem.indexOf(u8, item.get("newText").?.string, "${BASH_SOURCE[0]}") != null);
+
+    // The whole call now conforms — which is the point: pi accepts it.
+    try testing.expect(toolCallConformsToSchema(allocator, calls[0], pi_edit_tools_json_test));
+}
+
+test "hoistMisplacedRequiredParams: a buried `path` survives the Gemma 4 parse path end to end" {
+    // The same class through the REAL parse chain (Gemma's call:name{...} form —
+    // this session's model). The raw pre-parse bytes were not dumped (the server
+    // was not at --log-level debug), so the tag wrapper here is reconstructed;
+    // the ARGUMENT SHAPE it produces is the verbatim captured one asserted above,
+    // which is what the hoist actually operates on.
+    const allocator = testing.allocator;
+    const raw = "<|tool_call>call:edit{edits:[{oldText:<|\"|>old line<|\"|>,newText:<|\"|>new line<|\"|>," ++
+        "path:<|\"|>us_presidents/generate_site.sh<|\"|>}]}<tool_call|>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try hoistMisplacedRequiredParams(allocator, calls, pi_edit_tools_json_test);
+    try coerceToolArgsToSchema(allocator, calls, pi_edit_tools_json_test);
+
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const path = parsed.value.object.get("path") orelse return error.PathNotHoisted;
+    try testing.expectEqualStrings("us_presidents/generate_site.sh", path.string);
+    const edits = parsed.value.object.get("edits").?;
+    try testing.expect(edits.array.items[0].object.get("path") == null);
+    try testing.expectEqualStrings("old line", edits.array.items[0].object.get("oldText").?.string);
+}
+
+test "hoistMisplacedRequiredParams: a compliant call is byte-identical" {
+    // The strong-model path: nothing may re-serialize when nothing was misplaced.
+    const allocator = testing.allocator;
+    const args =
+        \\{"path":"a.js","edits":[{"oldText":"a","newText":"b"}]}
+    ;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, args),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    try hoistMisplacedRequiredParams(allocator, &calls, pi_edit_tools_json_test);
+    try testing.expectEqualStrings(args, calls[0].arguments);
+}
+
+test "hoistMisplacedRequiredParams: never touches a key the item schema DECLARES" {
+    // Safety gate. A tool whose items legitimately carry their own `path` (a
+    // multi-file edit) must never have it stripped out from under them — hoisting
+    // there would DESTROY data, not repair it. The item schema declaring the key
+    // is the proof that it belongs where it is.
+    const allocator = testing.allocator;
+    const multifile_schema =
+        \\[{"type":"function","function":{"name":"edit","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"path":{"type":"string"},"oldText":{"type":"string"}},"required":["path","oldText"]}}},"required":["path","edits"]}}}]
+    ;
+    const args =
+        \\{"edits":[{"path":"a.js","oldText":"a"},{"path":"b.js","oldText":"b"}]}
+    ;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, args),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    try hoistMisplacedRequiredParams(allocator, &calls, multifile_schema);
+    try testing.expectEqualStrings(args, calls[0].arguments);
+}
+
+test "hoistMisplacedRequiredParams: items that DISAGREE on the value stay honest" {
+    // Two items, two different paths, and the tool edits ONE file. There is no
+    // correct hoist here — picking either would silently write the wrong file.
+    // Leave it broken so the client's validation error reaches the model.
+    const allocator = testing.allocator;
+    const args =
+        \\{"edits":[{"oldText":"a","newText":"b","path":"a.js"},{"oldText":"c","newText":"d","path":"b.js"}]}
+    ;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, args),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    try hoistMisplacedRequiredParams(allocator, &calls, pi_edit_tools_json_test);
+    try testing.expectEqualStrings(args, calls[0].arguments);
+}
+
+test "hoistMisplacedRequiredParams: a wrong-typed buried value is never hoisted" {
+    // `path` is declared a string; an object spelled `path` inside the item is
+    // not the missing param. Hoisting it would just move the schema violation.
+    const allocator = testing.allocator;
+    const args =
+        \\{"edits":[{"oldText":"a","newText":"b","path":{"nested":"x"}}]}
+    ;
+    var calls = [_]ParsedToolCall{.{
+        .name = try allocator.dupe(u8, "edit"),
+        .arguments = try allocator.dupe(u8, args),
+    }};
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+    }
+    try hoistMisplacedRequiredParams(allocator, &calls, pi_edit_tools_json_test);
+    try testing.expectEqualStrings(args, calls[0].arguments);
 }
 
 test "coerceToolArgsToSchema: quoted integer/number strings coerce to numeric" {

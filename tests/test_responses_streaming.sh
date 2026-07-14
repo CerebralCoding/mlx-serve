@@ -160,5 +160,133 @@ else
 fi
 echo ""
 
+# ── Test C: HTTP SSE terminates with the `data: [DONE]` sentinel ──
+# OpenAI ends every Responses HTTP SSE stream with the same terminal
+# `data: [DONE]` sentinel as chat completions, after `response.completed`.
+# Generic SSE middleware (LiteLLM-class proxies) keys stream end off it.
+# The WebSocket transport must NOT get one (its terminator is the
+# response.completed event itself) — this test covers HTTP only.
+echo "--- Test C: terminal data: [DONE] sentinel (HTTP SSE) ---"
+BODY='{"model":"mlx-serve","input":"Say hi.","max_output_tokens":16,"temperature":0,"stream":true}'
+SSE=$(sse_with_timestamps "$BODY")
+
+LAST_DATA=$(echo "$SSE" | grep $'\tdata: ' | tail -1 | cut -f2-)
+COMPLETED_COUNT=$(echo "$SSE" | grep -c $'\tdata: {"type":"response.completed"' || true)
+echo "  last data frame: ${LAST_DATA:0:60}"
+if [ "$LAST_DATA" = "data: [DONE]" ]; then
+    run_test "stream terminates with data: [DONE]" "PASS" ""
+else
+    run_test "stream terminates with data: [DONE]" "FAIL" "last data frame was: ${LAST_DATA:0:80}"
+fi
+if [ "$COMPLETED_COUNT" -ge 1 ]; then
+    run_test "response.completed precedes [DONE]" "PASS" ""
+else
+    run_test "response.completed precedes [DONE]" "FAIL" "no response.completed event seen"
+fi
+echo ""
+
+# ── Test D: background mode is honestly rejected ──
+# The server has no queue/poll machinery. Accepting `background:true` and
+# running synchronously returns status "completed" on a request the caller
+# expects to poll — a silent lie flagged by llmprobe. A clean 400 is the
+# honest answer (probes report it as "unsupported", not failed).
+echo "--- Test D: background:true returns 400 ---"
+BG_BODY='{"model":"mlx-serve","input":"Say hi.","max_output_tokens":16,"background":true}'
+BG_CODE=$(curl -s -o /tmp/responses_bg_test.out -w '%{http_code}' \
+    -X POST "$BASE/v1/responses" -H 'Content-Type: application/json' -d "$BG_BODY")
+BG_BODY_OUT=$(cat /tmp/responses_bg_test.out)
+echo "  status: $BG_CODE"
+if [ "$BG_CODE" = "400" ] && echo "$BG_BODY_OUT" | grep -q "background"; then
+    run_test "background:true rejected with 400 naming background" "PASS" ""
+else
+    run_test "background:true rejected with 400 naming background" "FAIL" "status=$BG_CODE body=${BG_BODY_OUT:0:120}"
+fi
+echo ""
+
+# ── Test E: the WS transport NEVER gets a [DONE] frame; chaining survives ──
+# The mirror of Test C. Over WebSocket the per-response terminator is the
+# `response.completed` event; the compliance suite advances turns on it, so a
+# trailing [DONE] frame would be misread as the NEXT turn's marker and kill
+# chained sessions. Two chained turns on one socket must complete with zero
+# [DONE] frames.
+echo "--- Test E: WS transport — chained turns, zero [DONE] frames ---"
+WS_OUT=$(python3 - "$PORT" <<'PY'
+import base64, json, os, socket, sys
+
+sock = socket.create_connection(("127.0.0.1", int(sys.argv[1])), timeout=120)
+key = base64.b64encode(os.urandom(16)).decode()
+sock.sendall((
+    f"GET /v1/responses HTTP/1.1\r\nHost: 127.0.0.1:{sys.argv[1]}\r\n"
+    "Upgrade: websocket\r\nConnection: Upgrade\r\n"
+    f"Sec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+).encode())
+hdr = b""
+while b"\r\n\r\n" not in hdr:
+    hdr += sock.recv(1024)
+assert b"101" in hdr.split(b"\r\n")[0], hdr
+
+def send_frame(payload: bytes):
+    mask = os.urandom(4)
+    header = bytearray([0x81])
+    n = len(payload)
+    if n < 126:
+        header.append(0x80 | n)
+    else:
+        header.append(0x80 | 126)
+        header += n.to_bytes(2, "big")
+    sock.sendall(bytes(header) + mask + bytes(b ^ mask[i % 4] for i, b in enumerate(payload)))
+
+def read_exact(n):
+    buf = b""
+    while len(buf) < n:
+        chunk = sock.recv(n - len(buf))
+        if not chunk:
+            raise ConnectionError("socket closed")
+        buf += chunk
+    return buf
+
+def run_turn(body):
+    send_frame(json.dumps(body).encode())
+    saw_done = False
+    while True:
+        b0, b1 = read_exact(2)
+        n = b1 & 0x7F
+        if n == 126:
+            n = int.from_bytes(read_exact(2), "big")
+        elif n == 127:
+            n = int.from_bytes(read_exact(8), "big")
+        payload = read_exact(n) if n else b""
+        if (b0 & 0x0F) == 0x8:
+            raise ConnectionError("server closed mid-turn")
+        if (b0 & 0x0F) != 0x1:
+            continue
+        text = payload.decode("utf-8", errors="replace")
+        if "[DONE]" in text:
+            saw_done = True
+        try:
+            ev = json.loads(text)
+        except ValueError:
+            continue
+        if ev.get("type") == "response.completed":
+            return ev["response"]["id"], saw_done
+        if ev.get("type") in ("response.failed", "response.incomplete"):
+            raise RuntimeError(ev.get("type"))
+
+turn = {"type": "response.create", "model": "mlx-serve", "input": "Say hi.",
+        "max_output_tokens": 16, "temperature": 0}
+id1, done1 = run_turn(turn)
+turn2 = dict(turn, input="Say bye.", previous_response_id=id1)
+id2, done2 = run_turn(turn2)
+print(f"ws {0 if (done1 or done2) else 1} chained={bool(id1 and id2)} done_frames={done1 or done2}")
+PY
+) || WS_OUT="ws 0 exception"
+echo "  $WS_OUT"
+if [ "$(echo "$WS_OUT" | awk '/^ws/{print $2}')" = "1" ]; then
+    run_test "WS: two chained turns complete, zero [DONE] frames" "PASS" ""
+else
+    run_test "WS: two chained turns complete, zero [DONE] frames" "FAIL" "$WS_OUT"
+fi
+echo ""
+
 echo "=== Result: $PASS/$TOTAL passed ==="
 [ "$FAIL" -eq 0 ]

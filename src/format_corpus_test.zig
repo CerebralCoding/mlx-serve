@@ -81,11 +81,13 @@ const edit_tool_schema =
     \\[{"type":"function","function":{"name":"Edit","description":"Edit a file","parameters":{"type":"object","properties":{"file_path":{"type":"string"},"old_string":{"type":"string"},"new_string":{"type":"string"},"replace_all":{"type":"boolean","default":false}},"required":["file_path","old_string","new_string"]}}}]
 ;
 
-/// pi's `edit` tool: `edits` is an ARRAY of {oldText,newText} objects. Captured
-/// live — the tag formats carry no type information, so the whole array arrived
-/// as a string on every call.
+/// pi's `edit` tool, verbatim from its own schema (@earendil-works/pi-coding-agent
+/// dist/core/tools/edit.js). Two facts the entries below lean on: the tag formats
+/// carry no type information, so the whole `edits` array arrives as a STRING; and
+/// `path` is required at the TOP level while the item schema declares only
+/// oldText/newText — which is what makes a buried `path` provably misplaced.
 const pi_edit_tool_schema =
-    \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object"}},"dry_run":{"type":"boolean"}},"required":["path","edits"]}}}]
+    \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"]},"description":"One or more targeted replacements."}},"required":["path","edits"]}}}]
 ;
 
 /// pi-style write/read pair — used by the hallucinated-raw-JSON (George
@@ -633,6 +635,31 @@ const corpus = [_]Expect{
         .tool_bool_key = "replace_all",
         .tool_bool_value = true,
     },
+    // ── Misplaced required param (buried-`path` class) ──────────────────────
+    // Class: a weak model that has internalized "the edit object holds everything
+    // about the edit" writes the required top-level `path` INSIDE each edits[]
+    // item. The args are valid JSON with correctly-typed values — nothing to
+    // repair, nothing to coerce — they are simply in the wrong PLACE, which only
+    // the schema knows. Strict clients answer "must have required properties
+    // path" and the model, blind to its own serialized request, re-emits the same
+    // call. The universal buried-param invariant below pins the whole class.
+    .{
+        // Live pi session 2026-07-13 (gemma-4-26B-A4B-it-qat-4bit, us_presidents):
+        // three consecutive rejections, each a full multi-thousand-token
+        // generation, then the model abandoned `edit` and rewrote the entire file
+        // with `write`. The raw pre-parse bytes were not dumped (the server was
+        // not at --log-level debug), so the tag wrapper here is reconstructed; the
+        // ARGUMENT SHAPE it produces is the verbatim captured one (pinned
+        // byte-for-byte by the hoistMisplacedRequiredParams tests in chat.zig).
+        .family = "gemma4",
+        .name = "required `path` buried in the edits items is hoisted to the top level",
+        .raw = "<|tool_call>call:edit{edits:[{oldText:<|\"|>old line<|\"|>,newText:<|\"|>new line<|\"|>," ++
+            "path:<|\"|>us_presidents/generate_site.sh<|\"|>}]}<tool_call|>",
+        .tools_json = pi_edit_tool_schema,
+        .tool_name = "edit",
+        .tool_arg_key = "path",
+        .tool_arg_value = "us_presidents/generate_site.sh",
+    },
     // ── Negatives ────────────────────────────────────────────────────────────
     .{
         // Prose containing a `<tool…>`-ish tag that is NOT a tool call.
@@ -714,10 +741,12 @@ test "format corpus: recorded model outputs across families" {
         // the request declared tools, (1) heuristically-inferred raw-JSON calls
         // must name a DECLARED tool — a truncated data object is never a call
         // (George Washington class; every entry with a tools_json is covered
-        // automatically) — then (2) arguments are coerced to the schema's types
-        // before any client sees them.
+        // automatically) — then (2) a required param the model BURIED inside a
+        // container arg is hoisted back to the top level, and (3) arguments are
+        // coerced to the schema's types before any client sees them.
         if (entry.tools_json) |tj| {
             if (calls) |cs| calls = try chat.filterInferredBySchema(allocator, cs, tj);
+            if (calls) |cs| try chat.hoistMisplacedRequiredParams(allocator, cs, tj);
             if (calls) |cs| try chat.coerceToolArgsToSchema(allocator, cs, tj);
         }
 
@@ -755,6 +784,16 @@ test "format corpus: recorded model outputs across families" {
                 if (entry.tools_json) |tj| {
                     if (!chat.toolCallConformsToSchema(allocator, tc, tj)) {
                         try fail(entry, "tool argument type contradicts the declared schema", tc.arguments);
+                    }
+
+                    // Universal buried-param invariant: a REQUIRED scalar the
+                    // model stuffed inside a container arg (while omitting it at
+                    // the top level) is what strict clients reject with "must
+                    // have required properties X". The chokepoint hoists it, so
+                    // nothing may still be buried here. Any future entry with a
+                    // tools_json is covered automatically.
+                    if (chat.requiredParamIsBuried(allocator, tc, tj)) {
+                        try fail(entry, "a required param is still buried inside a container arg", tc.arguments);
                     }
                 }
             }

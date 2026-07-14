@@ -760,7 +760,13 @@ fn parseToolCallsForRequest(
         (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
         return null;
     if (g_tool_autocorrect) {
-        if (tools_json) |tj| try chat_mod.coerceToolArgsToSchema(allocator, calls, tj);
+        if (tools_json) |tj| {
+            // Order matters: put a buried required param back where the schema
+            // says it lives BEFORE coercing types, so the hoisted value is
+            // type-checked like any other top-level arg.
+            try chat_mod.hoistMisplacedRequiredParams(allocator, calls, tj);
+            try chat_mod.coerceToolArgsToSchema(allocator, calls, tj);
+        }
     }
     return calls;
 }
@@ -3138,6 +3144,19 @@ fn handleEmbeddings(
 
     const model_name = if (root.get("model")) |m| (if (m == .string) m.string else config.model_type) else config.model_type;
 
+    // OpenAI `dimensions` (text-embedding-3 semantics): keep the first N
+    // components, L2-renormalize. Anything not a positive integer is a 400 —
+    // accepting the field and ignoring it would hand callers wrong-width
+    // vectors they only discover at retrieval time. Over-native is checked
+    // after the forward, when the model's width is known.
+    const req_dims: ?usize = if (root.get("dimensions")) |v| blk: {
+        if (v != .integer or v.integer < 1) {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'dimensions' must be a positive integer", null);
+            return;
+        }
+        break :blk @intCast(v.integer);
+    } else null;
+
     // Collect input texts
     var texts = std.ArrayList([]const u8).empty;
     defer texts.deinit(allocator);
@@ -3225,7 +3244,18 @@ fn handleEmbeddings(
         allocator.free(embeddings);
     }
 
-    for (embeddings, 0..) |embedding, idx| {
+    if (req_dims) |d| {
+        const native = if (embeddings.len > 0) embeddings[0].len else 0;
+        if (d > native) {
+            const msg = try std.fmt.allocPrint(allocator, "'dimensions' must be between 1 and {d} for this model", .{native});
+            defer allocator.free(msg);
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, null);
+            return;
+        }
+    }
+
+    for (embeddings, 0..) |full_embedding, idx| {
+        const embedding = if (req_dims) |d| truncateEmbeddingDims(full_embedding, d) else full_embedding;
         if (idx > 0) try resp_buf.appendSlice(allocator, ",");
 
         // Format: {"object":"embedding","embedding":[...floats...],"index":N}
@@ -3260,6 +3290,21 @@ fn handleEmbeddings(
 
     try sendResponse(stream, "200 OK", "application/json", resp_buf.items);
     log.info("  <- {d} embeddings ({d} tokens)\n", .{ texts.items.len, total_tokens });
+}
+
+/// OpenAI `dimensions` semantics (text-embedding-3 class): keep the first
+/// `dims` components and L2-renormalize, in place. `dims >= len` returns the
+/// vector untouched so the default (no `dimensions`) path stays byte-identical.
+/// A zero prefix is returned unnormalized rather than divided by zero.
+fn truncateEmbeddingDims(embedding: []f32, dims: usize) []f32 {
+    if (dims == 0 or dims >= embedding.len) return embedding;
+    const out = embedding[0..dims];
+    var sumsq: f64 = 0;
+    for (out) |v| sumsq += @as(f64, v) * @as(f64, v);
+    if (sumsq <= 0) return out;
+    const inv = 1.0 / @sqrt(sumsq);
+    for (out) |*v| v.* = @floatCast(@as(f64, v.*) * inv);
+    return out;
 }
 
 fn handleTokenize(
@@ -8809,6 +8854,14 @@ fn handleResponses(
         (if (v == .bool) v.bool else false)
     else
         false;
+    // Honest rejection: there is no queue/poll machinery behind `background`.
+    // Accepting it and running synchronously returns status "completed" on a
+    // request the caller expects to come back "queued" — a silent lie strict
+    // clients flag. The WS transport already rejects it at body-build time.
+    if (background_echo) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "background mode is not supported; remove \"background\": true and run the request synchronously", 400);
+        return;
+    }
     const service_tier_echo: []const u8 = if (root.get("service_tier")) |v|
         (if (v == .string) v.string else "default")
     else
@@ -9603,6 +9656,16 @@ fn handleResponses(
         const completed_payload = try std.fmt.allocPrint(allocator, "{{\"type\":\"response.completed\",\"response\":{s}}}", .{envelope});
         defer allocator.free(completed_payload);
         try sendResponsesEvent(allocator, stream, &seq_num, "response.completed", completed_payload);
+        // OpenAI terminates the Responses HTTP SSE stream with the same
+        // `data: [DONE]` sentinel as chat completions; generic SSE middleware
+        // keys stream end off it. The WS transport must NOT get one — its
+        // per-response terminator is the `response.completed` event, and a
+        // trailing [DONE] frame would be misread as the NEXT turn's marker
+        // on a chained session (see the WS turn loop below).
+        if (stream.ws_mode == null) {
+            logHttpSseData("[DONE]");
+            try stream.writeAll("data: [DONE]\n\n");
+        }
     } else {
         try sendResponse(stream, "200 OK", "application/json", envelope);
     }
@@ -9909,14 +9972,15 @@ fn handleResponsesWebSocket(
             }
         }
 
-        // No `[DONE]` on the success path: the OpenAI Responses streaming
-        // schema treats `response.completed` (or .failed/.incomplete) as
-        // the per-response terminator, and the compliance suite advances to
-        // the next turn the moment it sees one. A trailing `[DONE]` would
-        // arrive *after* that advance and be misread as the next turn's
-        // marker, killing chained sessions. We still emit `[DONE]` for
-        // error fallbacks (see `wsSendErrorTurn`) where no terminal event
-        // is sent.
+        // No `[DONE]` on the WS success path: over WebSocket the per-response
+        // terminator is `response.completed` (or .failed/.incomplete), and the
+        // compliance suite advances to the next turn the moment it sees one. A
+        // trailing `[DONE]` would arrive *after* that advance and be misread
+        // as the next turn's marker, killing chained sessions. HTTP SSE is the
+        // opposite: one response per stream, and OpenAI ends it with
+        // `data: [DONE]` (emitted in handleResponses, gated on ws_mode). We
+        // still emit `[DONE]` for error fallbacks (see `wsSendErrorTurn`)
+        // where no terminal event is sent.
     }
 }
 
@@ -11522,6 +11586,53 @@ test "parseToolCallsForRequest coerces args to the schema (server-side chokepoin
     try std.testing.expect(calls2 != null);
 }
 
+test "parseToolCallsForRequest hoists a misplaced required param (server-side chokepoint wiring)" {
+    // Live 2026-07-13 pi session, gemma-4-26B-A4B: the model buried `path` inside
+    // each edits[] item and emitted none at the top level, so pi rejected three
+    // consecutive multi-thousand-token generations with
+    //   Validation failed for tool "edit": - path: must have required properties path
+    // This pins the WIRING — every HTTP surface reaches the hoist through this one
+    // function, and the hoist must run BEFORE coercion so the lifted value is
+    // type-checked like any other top-level arg.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"edit","parameters":{"type":"object","properties":{"path":{"type":"string"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"]}}},"required":["path","edits"]}}}]
+    ;
+    const text = "<tool_call>{\"name\":\"edit\",\"arguments\":{\"edits\":[{\"newText\":\"new\",\"oldText\":\"old\"," ++
+        "\"path\":\"us_presidents/generate_site.sh\"}]}}</tool_call>";
+
+    const calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    const path = parsed.value.object.get("path") orelse return error.PathNotHoisted;
+    try std.testing.expectEqualStrings("us_presidents/generate_site.sh", path.string);
+    try std.testing.expect(parsed.value.object.get("edits").?.array.items[0].object.get("path") == null);
+    try std.testing.expect(chat_mod.toolCallConformsToSchema(allocator, calls[0], tools));
+
+    // The escape hatch covers this correction too: it repairs the MODEL's output
+    // (unlike the inferred-name filter, which corrects our own heuristic).
+    g_tool_autocorrect = false;
+    defer g_tool_autocorrect = true;
+    const raw_calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    defer {
+        for (raw_calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(raw_calls);
+    }
+    const raw_parsed = try std.json.parseFromSlice(std.json.Value, allocator, raw_calls[0].arguments, .{});
+    defer raw_parsed.deinit();
+    try std.testing.expect(raw_parsed.value.object.get("path") == null); // verbatim: still buried
+}
+
 test "parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim" {
     // The escape hatch: with g_tool_autocorrect off, the schema coercion is
     // skipped and the model's value passes through EXACTLY (here the STRING
@@ -11886,4 +11997,33 @@ test "prefillMemoryNeeded: fused hd-256 kernel drops the score bill, keeps KV + 
         @as(u64, 11_798_507_520 - 2_048_000_000),
         prefillMemoryNeeded(100_000, 16, 8, 30, 256, 2816, 2112, 4, 512),
     );
+}
+
+test "truncateEmbeddingDims: OpenAI dimensions semantics (truncate + L2-renormalize)" {
+    const t = std.testing;
+
+    // Truncate to 2 of 4: keeps the first components, renormalizes to unit L2.
+    var v = [_]f32{ 3.0, 4.0, 100.0, 100.0 };
+    const out = truncateEmbeddingDims(&v, 2);
+    try t.expectEqual(@as(usize, 2), out.len);
+    try t.expectApproxEqAbs(@as(f32, 0.6), out[0], 1e-6); // 3/5
+    try t.expectApproxEqAbs(@as(f32, 0.8), out[1], 1e-6); // 4/5
+    var norm: f64 = 0;
+    for (out) |x| norm += @as(f64, x) * @as(f64, x);
+    try t.expectApproxEqAbs(@as(f64, 1.0), norm, 1e-6);
+
+    // dims == native width: byte-identical pass-through, no renorm — the
+    // default (no `dimensions`) path must never change.
+    var w = [_]f32{ 0.5, -0.25, 0.125 };
+    const same = truncateEmbeddingDims(&w, 3);
+    try t.expectEqual(@as(usize, 3), same.len);
+    try t.expectEqual(@as(f32, 0.5), same[0]);
+    try t.expectEqual(@as(f32, -0.25), same[1]);
+    try t.expectEqual(@as(f32, 0.125), same[2]);
+
+    // Zero prefix: truncation must not divide by zero or emit NaN.
+    var z = [_]f32{ 0.0, 0.0, 1.0 };
+    const zt = truncateEmbeddingDims(&z, 2);
+    try t.expectEqual(@as(usize, 2), zt.len);
+    for (zt) |x| try t.expect(!std.math.isNan(x));
 }

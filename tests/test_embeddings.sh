@@ -139,6 +139,53 @@ check "80-input batch (> EMBED_MAX_BATCH) returns all rows in order" \
     "$(awk '/^bigbatch/{print $2}' /tmp/test_embeddings_batch.out)" \
     "$(grep '^bigbatch' /tmp/test_embeddings_batch.out)"
 
+# --- 3b. OpenAI `dimensions`: truncate + L2-renormalize, honest 400s ---
+# Accepting the parameter and ignoring it silently misleads callers into
+# storing wrong-width vectors (llmprobe: "embeddings: dimensions honored").
+# Semantics are text-embedding-3's: keep the first N components, renormalize.
+python3 - "$BASE" > /tmp/test_embeddings_dims.out <<'EOF'
+import json, math, sys, urllib.request, urllib.error
+
+base = sys.argv[1]
+def post(body):
+    req = urllib.request.Request(base + "/v1/embeddings",
+        data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json"})
+    try:
+        return 200, json.load(urllib.request.urlopen(req))
+    except urllib.error.HTTPError as e:
+        return e.code, json.loads(e.read() or b"{}")
+
+text = "The quick brown fox jumps over the lazy dog."
+_, full = post({"model": "mlx-serve", "input": text})
+fv = full["data"][0]["embedding"]
+
+code, r = post({"model": "mlx-serve", "input": text, "dimensions": 64})
+v = r["data"][0]["embedding"] if code == 200 else []
+norm = math.sqrt(sum(x*x for x in v)) if v else 0.0
+# Expected: the full vector's first 64 components, L2-renormalized.
+tn = math.sqrt(sum(x*x for x in fv[:64]))
+exp = [x / tn for x in fv[:64]]
+close = v and max(abs(a-b) for a, b in zip(v, exp)) < 1e-4
+print(f"dims64 {1 if code == 200 and len(v) == 64 and abs(norm-1.0) < 1e-3 and close else 0} "
+      f"code={code} len={len(v)} norm={norm:.6f}")
+
+code_big, _ = post({"model": "mlx-serve", "input": text, "dimensions": 100000})
+print(f"dimsbig {1 if code_big == 400 else 0} code={code_big}")
+
+code_zero, _ = post({"model": "mlx-serve", "input": text, "dimensions": 0})
+print(f"dimszero {1 if code_zero == 400 else 0} code={code_zero}")
+EOF
+check "dimensions=64: truncated + L2-renormalized first-64 of the full vector" \
+    "$(awk '/^dims64/{print $2}' /tmp/test_embeddings_dims.out)" \
+    "$(grep '^dims64' /tmp/test_embeddings_dims.out)"
+check "dimensions beyond the model's width returns 400" \
+    "$(awk '/^dimsbig/{print $2}' /tmp/test_embeddings_dims.out)" \
+    "$(grep '^dimsbig' /tmp/test_embeddings_dims.out)"
+check "dimensions=0 returns 400" \
+    "$(awk '/^dimszero/{print $2}' /tmp/test_embeddings_dims.out)" \
+    "$(grep '^dimszero' /tmp/test_embeddings_dims.out)"
+
 # --- 4. generation rejected on encoder-only ---
 GEN_CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 30 "$BASE/v1/chat/completions" \
     -H 'Content-Type: application/json' \

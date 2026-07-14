@@ -157,6 +157,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         const conformed_before = try arena.alloc(bool, cs.len);
         for (cs, 0..) |tc, i| conformed_before[i] = chat.toolCallConformsToSchema(testing.allocator, tc, tools_json);
 
+        try chat.hoistMisplacedRequiredParams(testing.allocator, cs, tools_json);
         try chat.coerceToolArgsToSchema(testing.allocator, cs, tools_json);
 
         for (cs, 0..) |tc, i| {
@@ -195,6 +196,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
         // R3: coercion is idempotent.
         const once = try arena.alloc([]const u8, cs.len);
         for (cs, 0..) |tc, i| once[i] = try arena.dupe(u8, tc.arguments);
+        try chat.hoistMisplacedRequiredParams(testing.allocator, cs, tools_json);
         try chat.coerceToolArgsToSchema(testing.allocator, cs, tools_json);
         for (cs, 0..) |tc, i| {
             if (!std.mem.eql(u8, once[i], tc.arguments)) {
