@@ -328,7 +328,6 @@ const spec_gate_threshold: f32 = 0.01;
 /// The score is computed on the PROMPT and can't see which way the GENERATION
 /// will go, so anything below a clearly-dominant-echo score routes to the robust
 /// head (40-42 tok/s, reliable). User `enable_mtp` in the body overrides.
-const mtp_pld_echo_threshold: f32 = 0.13;
 
 // Plan 05: drafter state moved to `LoadedModel` (per-model `drafter`,
 // `drafter_block_size`, `drafter_path`). The previous module-level
@@ -749,7 +748,15 @@ fn parseToolCallsForRequest(
     text: []const u8,
     tools_json: ?[]const u8,
 ) !?[]chat_mod.ParsedToolCall {
-    const calls = (try chat_mod.parseToolCalls(allocator, text)) orelse
+    var parsed_calls = try chat_mod.parseToolCalls(allocator, text);
+    // Heuristically-inferred raw-JSON calls must name a DECLARED tool — a
+    // truncated data object ({"name": "George Washington", …}) is not a call.
+    // Deliberately NOT gated on g_tool_autocorrect: this corrects our own
+    // heuristic's false positive, not the model's output.
+    if (parsed_calls) |c| {
+        if (tools_json) |tj| parsed_calls = try chat_mod.filterInferredBySchema(allocator, c, tj);
+    }
+    const calls = parsed_calls orelse
         (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
         return null;
     if (g_tool_autocorrect) {
@@ -3117,6 +3124,10 @@ fn handleEmbeddings(
         return;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", null);
+        return;
+    }
     const root = parsed.value.object;
 
     // Parse input — can be a string or array of strings
@@ -3263,6 +3274,10 @@ fn handleTokenize(
         return;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     const content = if (root.get("content")) |v| (if (v == .string) v.string else null) else null;
@@ -3313,6 +3328,10 @@ fn handleDetokenize(
         return;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     const tokens_val = root.get("tokens") orelse {
@@ -3374,6 +3393,14 @@ fn handleChatCompletions(
     };
     defer parsed.deinit();
 
+    // A valid-JSON body that isn't an object (e.g. `42` or `[1,2]`) would panic
+    // on the `.object` field access below and take the whole server down, so
+    // reject it as a 400 like any other malformed request.
+    if (parsed.value != .object) {
+        log.warn("POST /v1/chat/completions -> 400 (body is not a JSON object)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     // Extract messages
@@ -3382,6 +3409,14 @@ fn handleChatCompletions(
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'messages' is a required field", 400);
         return;
     };
+
+    // `messages` present but not an array (e.g. a string) would panic on the
+    // `.array` access below. Reject rather than crash.
+    if (messages_val != .array) {
+        log.warn("POST /v1/chat/completions -> 400 (messages is not an array)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "'messages' must be an array", 400);
+        return;
+    }
 
     var messages = std.ArrayList(chat_mod.Message).empty;
     defer messages.deinit(allocator);
@@ -3394,6 +3429,10 @@ fn handleChatCompletions(
     }
 
     for (messages_val.array.items) |msg_val| {
+        // A non-object array element (e.g. `messages:[1,2,3]`) would panic on
+        // `.object`. Skip it rather than crash — consistent with how malformed
+        // inner fields are already tolerated below.
+        if (msg_val != .object) continue;
         const obj = msg_val.object;
         const role_val = obj.get("role") orelse continue;
         if (role_val != .string) continue;
@@ -3901,13 +3940,15 @@ fn handleChatCompletions(
                 enable_drafter = false;
             }
         }
-        // MTP/PLD coexistence: on heavy-echo prompts PLD's long n-gram drafts
-        // beat the depth-1 MTP head, so route this request to PLD; novel and
-        // light-echo content stays on the robust MTP head. User enable_mtp wins.
-        if (enable_mtp and enable_pld and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
-            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
-            enable_mtp = false;
-        }
+        // NOTE (2026-07-13): the old heavy-echo MTP->PLD routing (score >=
+        // 0.13 disabled MTP) was RETIRED with the verify-qmm kernels + EV
+        // depth. The prompt-time n-gram score cannot separate "output will
+        // echo verbatim" (PLD excels: 83 vs 75 tok/s live) from
+        // "repetitive-looking agent context" (PLD flaps at ~45% per-draft,
+        // runtime-disables, and lands on plain AR at 28 tok/s with the MTP
+        // head idle) — live captures scored 0.334 vs 0.365, inseparable.
+        // MTP now wins whenever loaded (generator priority); force PLD with
+        // enable_pld:true + enable_mtp:false.
     }
 
     // Prompt caching: reuse KV cache for shared prefix.
@@ -3986,6 +4027,11 @@ fn handleCompletions(
     };
     defer parsed.deinit();
 
+    if (parsed.value != .object) {
+        log.warn("POST /v1/completions -> 400 (body is not a JSON object)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     // Extract prompt (required)
@@ -4139,11 +4185,8 @@ fn handleCompletions(
                 enable_drafter = false;
             }
         }
-        // MTP/PLD coexistence: heavy-echo -> PLD, novel/light-echo -> MTP.
-        if (enable_mtp and enable_pld and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
-            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
-            enable_mtp = false;
-        }
+        // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
+        // chat-completions site): MTP wins whenever loaded.
     }
 
     const eos_slice = config.eosTokenSlice();
@@ -7150,6 +7193,11 @@ fn handleAnthropicMessages(
         return;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) {
+        log.warn("POST /v1/messages -> 400 (body is not a JSON object)\n", .{});
+        try sendAnthropicError(allocator, stream, "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     // max_tokens is required in Anthropic API
@@ -7550,11 +7598,8 @@ fn handleAnthropicMessages(
                 enable_drafter = false;
             }
         }
-        // MTP/PLD coexistence: heavy-echo -> PLD, novel/light-echo -> MTP.
-        if (enable_mtp and enable_pld and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
-            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
-            enable_mtp = false;
-        }
+        // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
+        // chat-completions site): MTP wins whenever loaded.
     }
 
     // Context size enforcement
@@ -8663,6 +8708,11 @@ fn handleResponses(
         return;
     };
     defer parsed.deinit();
+    if (parsed.value != .object) {
+        log.warn("POST /v1/responses -> 400 (body is not a JSON object)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request body must be a JSON object", 400);
+        return;
+    }
     const root = parsed.value.object;
 
     // ── input (required) ──
@@ -9089,11 +9139,8 @@ fn handleResponses(
                 enable_drafter_resp = false;
             }
         }
-        // MTP/PLD coexistence: heavy-echo -> PLD, novel/light-echo -> MTP.
-        if (enable_mtp_resp and enable_pld_resp and score >= mtp_pld_echo_threshold and root.get("enable_mtp") == null) {
-            log.info("  mtp=disabled (heavy echo ngram-score={d:.3} >= {d:.3}; PLD wins)\n", .{ score, mtp_pld_echo_threshold });
-            enable_mtp_resp = false;
-        }
+        // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
+        // chat-completions site): MTP wins whenever loaded.
     }
 
     var result: generate_mod.GenerationResult = undefined;
@@ -11503,6 +11550,80 @@ test "parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim" {
     const ra = parsed.value.object.get("replace_all").?;
     try std.testing.expect(ra == .string); // NOT coerced — verbatim
     try std.testing.expectEqualStrings("False", ra.string);
+}
+
+test "parseToolCallsForRequest: truncated DATA object is not promoted to a tool call (George Washington class)" {
+    // Live pi capture 2026-07-13 (Qwen3.6-35B-A3B distilled): generation hit
+    // max_tokens midway through a presidents data script. The raw-JSON fallback
+    // found the first balanced object — {"name": "George Washington", "num": 1,
+    // …} — and the flat-shape synthesis promoted it to a TOOL CALL named
+    // "George Washington" (args = every key but "name"). pi answered "Tool
+    // George Washington not found", the model retried the identical mega-write,
+    // and the session burned two full 16K-token turns making zero progress.
+    // A HEURISTICALLY inferred call (no tag syntax — the model never said
+    // "tool call") must carry a name the request actually declared; otherwise
+    // the text stays visible and finish_reason="length" reaches the client
+    // untouched, so its truncation recovery fires instead of a bogus tool loop.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}},{"type":"function","function":{"name":"read","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
+    ;
+    const text = "Now let me build a generator script that creates all 46 president pages with real historical data:\n\n" ++
+        "presidents = [\n" ++
+        "  {\"name\": \"George Washington\", \"num\": 1, \"party\": \"None (Federalist-leaning)\", \"term\": \"1789\u{2013}1797\", \"vice\": \"John Adams\"},\n" ++
+        "  {\"name\": \"John Adams\", \"num\": 2, \"party\": \"Federalist\",";
+    const calls = try parseToolCallsForRequest(allocator, text, tools);
+    defer if (calls) |cs| {
+        for (cs) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(cs);
+    };
+    try std.testing.expect(calls == null);
+}
+
+test "parseToolCallsForRequest: raw-JSON call with a DECLARED name still parses" {
+    // The counterweight to the George Washington guard: models without a
+    // trained tool format (Gemma 3) emit fenced raw-JSON calls, and those must
+    // keep working when the name matches a declared tool.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
+    ;
+    const text = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n```";
+    const calls = (try parseToolCallsForRequest(allocator, text, tools)) orelse
+        return error.ExpectedToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqualStrings("write", calls[0].name);
+}
+
+test "parseToolCallsForRequest: tag-format call with an UNDECLARED name is kept" {
+    // An EXPLICIT tag-format call (<tool_call>…) to a name the request never
+    // declared still goes to the client — "tool not found" is model-visible
+    // feedback the model can correct from. Only HEURISTIC raw-JSON inference
+    // gets schema-name validation; this pins the filter against over-reach.
+    const allocator = std.testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
+    ;
+    const text = "<tool_call>{\"name\":\"searchWeb\",\"arguments\":{\"q\":\"zig\"}}</tool_call>";
+    const calls = (try parseToolCallsForRequest(allocator, text, tools)) orelse
+        return error.ExpectedToolCall;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqualStrings("searchWeb", calls[0].name);
 }
 
 test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma" {
