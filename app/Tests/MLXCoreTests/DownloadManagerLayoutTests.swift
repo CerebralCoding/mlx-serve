@@ -97,6 +97,31 @@ final class DownloadManagerLayoutTests: XCTestCase {
         XCTAssertEqual(sidecar?.1, 524_000_000)
     }
 
+    /// oMLX OptiQ repos ship the MTP head as `optiq/mtp.safetensors` (a sibling
+    /// of mlx-serve's `mtp/` layout) alongside `optiq/optiq_vision.safetensors`.
+    /// The head must be pulled (server auto-loads it, delta-norms folded at load)
+    /// but the relocated vision tower must NOT (the server can't use it and it's
+    /// GBs). Mirrors mtp.sidecar_rel_paths.
+    func testSelectNeededFilesIncludesOptiQMtpHeadSkipsOptiQVision() {
+        let entries: [[String: Any]] = [
+            ["path": "config.json", "type": "file", "size": 108_000],
+            ["path": "model-00001-of-00004.safetensors", "type": "file", "size": 5_300_000_000],
+            ["path": "tokenizer.json", "type": "file", "size": 19_000_000],
+            ["path": "optiq", "type": "directory", "size": 0],
+            ["path": "optiq/mtp.safetensors", "type": "file", "size": 314_000_000],
+            ["path": "optiq/optiq_vision.safetensors", "type": "file", "size": 1_200_000_000],
+        ]
+        let picked = DownloadManager.selectNeededFiles(from: entries)
+        let paths = Set(picked.map { $0.0 })
+
+        XCTAssertTrue(paths.contains("optiq/mtp.safetensors"), "OptiQ MTP head must be downloaded")
+        XCTAssertTrue(paths.contains("config.json"))
+        XCTAssertTrue(paths.contains("model-00001-of-00004.safetensors"))
+        XCTAssertFalse(paths.contains("optiq/optiq_vision.safetensors"),
+                       "relocated vision tower is unusable by the server — must not be pulled")
+        XCTAssertEqual(picked.first { $0.0 == "optiq/mtp.safetensors" }?.1, 314_000_000)
+    }
+
     // MARK: - Drafter discovery
 
     func testDiscoverDraftersFindsAllPublishedVariants() throws {

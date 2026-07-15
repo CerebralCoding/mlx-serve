@@ -110,6 +110,11 @@ fn printUsage(io: std.Io) void {
         \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
         \\                        when the model dir ships mtp/weights.safetensors;
         \\                        priority: MTP > drafter > PLD).
+        \\  --mtp               Force the MTP head ON for MoE targets too.
+        \\                        Requests default to MTP only on DENSE models;
+        \\                        a MoE checkpoint that ships a sidecar is
+        \\                        otherwise reachable only via `enable_mtp:true`
+        \\                        in the request body.
         \\  --mtp-depth <n>     Max tokens drafted per MTP round (default:
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 7; MLX_SERVE_MTP_ADAPTIVE=0
@@ -313,6 +318,11 @@ pub fn main(init: std.process.Init) !void {
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
+    // --mtp: force the head ON for MoE targets too. Requests default to MTP
+    // only on DENSE targets (server.defaultEnableMtp); a MoE checkpoint that
+    // ships a sidecar is otherwise unreachable from clients that never send
+    // `enable_mtp:true` (llmprobe, Claude Code, curl).
+    var force_mtp = false;
     var mtp_depth: u32 = 0; // 0 = auto (resolveMtpDepthCap: EV cap 7 / fixed cap 3); explicit flag wins
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
@@ -418,6 +428,8 @@ pub fn main(init: std.process.Init) !void {
             if (args[i].len > 0) server_mod.g_api_key = args[i];
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
+        } else if (std.mem.eql(u8, args[i], "--mtp")) {
+            force_mtp = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-depth") and i + 1 < args.len) {
             i += 1;
             mtp_depth = @min(mtp_mod.MAX_DEPTH, @max(1, try std.fmt.parseInt(u32, args[i], 10)));
@@ -792,7 +804,7 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config);
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, force_mtp);
             return;
         }
 
@@ -1022,6 +1034,7 @@ pub fn main(init: std.process.Init) !void {
             .default_pld_draft_len = pld_draft_len,
             .default_pld_key_len = pld_key_len,
             .default_kv_attn_fused = kv_attn_fused_default,
+            .default_force_mtp = force_mtp,
         });
     } else {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
@@ -1439,6 +1452,7 @@ fn runHeadlessServe(
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
     kv_quant_config: transformer_mod.KVQuantConfig,
+    force_mtp: bool,
 ) !void {
     log.info("mlx-serve {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
@@ -1532,6 +1546,9 @@ fn runHeadlessServe(
         .default_pld_draft_len = 5,
         .default_pld_key_len = 3,
         .default_kv_attn_fused = false,
+        // On-demand MLX loads auto-attach an MTP sidecar (LoadParams.mtp_enabled
+        // defaults true), so the MoE force flag has to reach this path too.
+        .default_force_mtp = force_mtp,
     });
 }
 

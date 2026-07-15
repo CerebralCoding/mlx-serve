@@ -4,7 +4,7 @@
 # ds4-engine GGUF.
 #
 # Per model, two layers:
-#   1. llmprobe (~/projects/agents/responses-chat-messages-validator) in auto
+#   1. llmprobe (~/projects/agents/llmprobe) in auto
 #      mode — compliance suites for /v1/responses, /v1/chat/completions and
 #      /v1/messages against a server this script boots and tears down.
 #   2. The pi 2-turn agentic html case (multi-turn tool calls: create
@@ -31,7 +31,7 @@ cd "$(dirname "$0")/.."
 REPO="$(pwd)"
 BINARY="${BINARY:-$REPO/zig-out/bin/mlx-serve}"
 PORT="${PORT:-11298}"
-LLMPROBE_DIR="${LLMPROBE_DIR:-$HOME/projects/agents/responses-chat-messages-validator}"
+LLMPROBE_DIR="${LLMPROBE_DIR:-$HOME/projects/agents/llmprobe}"
 LLMPROBE_MJS="$LLMPROBE_DIR/bin/dist/llmprobe.mjs"
 RESULTS="$REPO/tests/validator-results"
 SUMMARY="$RESULTS/summary.tsv"

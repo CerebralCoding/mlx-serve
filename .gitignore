@@ -49,3 +49,4 @@ tests/fixtures/ltx/
 
 # XcodeGen output — regenerate with `cd app && xcodegen generate` (spec: app/project.yml)
 /app/MLXCore.xcodeproj/
+tests/llmprobe-smoke-results/

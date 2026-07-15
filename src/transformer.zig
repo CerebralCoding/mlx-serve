@@ -2332,6 +2332,14 @@ pub const MoeMlpWeights = struct {
     // Sigma-MoE routing (Gemma 4; null for Qwen3.5)
     router_scale: ?mlx.mlx_array = null,
     per_expert_scale: ?mlx.mlx_array = null,
+    // Hy3 (hy_v3) sigmoid routing: f32 [num_experts] bias added to the sigmoid
+    // scores for top-k SELECTION only (weights come from the unbiased scores).
+    // Non-null expert_bias routes moeMLP2 through hy3RoutingChain.
+    expert_bias: ?mlx.mlx_array = null,
+    route_norm: bool = true,
+    route_scale: f32 = 1.0,
+    // Hy3 shared expert is ALWAYS added, with no shared_expert_gate.
+    shared_ungated: bool = false,
 };
 
 const HybridMlpWeights = union(enum) {
@@ -2615,6 +2623,7 @@ pub const Transformer = struct {
     compiled_geglu: ?mlx.mlx_closure = null, // gelu(gate) * up → 1 kernel
     compiled_softcap: ?mlx.mlx_closure = null, // tanh(x/cap) * cap → 1 kernel
     compiled_moe_routing: ?mlx.mlx_closure = null, // negate→argpartition→slice→softmax→take→sum→expand→divide → 1 kernel
+    compiled_hy3_routing: ?mlx.mlx_closure = null, // hy_v3 sigmoid+bias variant (2 inputs: logits, expert_bias)
     compiled_gdn_gate: ?mlx.mlx_closure = null, // exp(-exp(A_log)·softplus(a+dt_bias)) → 1 kernel (mirrors mlx-lm compute_g)
 
     // GatedDeltaNet per-token decode used to rebuild these on EVERY layer/step
@@ -2665,14 +2674,20 @@ pub const Transformer = struct {
         // OPTIONAL — absent on fp8 tensors, present on affine-override tensors
         // in mixed QAT checkpoints. A mandatory fetch would be a spurious
         // MISSING WEIGHT crash (issue #24).
+        // Mixed checkpoints can also leave the WHOLE embedding table dense
+        // beside quantized layers (hy_v3 2-bit ships a bf16 embed_tokens) —
+        // scales-presence is decided by the TABLE's dtype (float ⇒ dense),
+        // never by the config's global bits. A packed (uint32) table missing
+        // its scales still crashes honestly.
         const bias_mandatory = config.quant_bits > 0 and config.quant_mode.hasBiases();
-        const emb_s_arr = if (config.quant_bits == 0)
+        const emb_dense = floatDtypeTable(mlx.mlx_array_dtype(emb_w));
+        const emb_s_arr = if (config.quant_bits == 0 or emb_dense)
             mlx.mlx_array_new()
         else if (is_nemotron)
             getWeightFmt(weights, &name_buf, "{s}.embeddings.scales", prefix)
         else
             getWeightFmt(weights, &name_buf, "{s}.embed_tokens.scales", prefix);
-        const emb_b_arr = if (config.quant_bits == 0)
+        const emb_b_arr = if (config.quant_bits == 0 or emb_dense)
             mlx.mlx_array_new()
         else if (is_nemotron)
             (if (bias_mandatory) getWeightFmt(weights, &name_buf, "{s}.embeddings.biases", prefix) else getWeightFmtOpt(weights, &name_buf, "{s}.embeddings.biases", prefix) orelse mlx.mlx_array_new())
@@ -2712,8 +2727,11 @@ pub const Transformer = struct {
                 lm_head_w = w;
                 // Dense bf16: no scales/biases → null-ctx; lmHeadProject() then
                 // projects via a transposed view of the [vocab, hidden] weight.
-                lm_head_s = if (config.quant_bits == 0) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
-                lm_head_b = if (config.quant_bits == 0)
+                // Per-TENSOR dense detection (float dtype), same as embed_tokens
+                // above — mixed checkpoints may quantize layers but not the head.
+                const head_dense = config.quant_bits == 0 or floatDtypeTable(mlx.mlx_array_dtype(w));
+                lm_head_s = if (head_dense) mlx.mlx_array_new() else getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
+                lm_head_b = if (head_dense)
                     mlx.mlx_array_new()
                 else if (bias_mandatory)
                     getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix)
@@ -3420,6 +3438,23 @@ pub const Transformer = struct {
     /// (decode seq_len=1, prefill seq_len=N), so the trace cost amortizes after
     /// the first prefill + first decode.
     pub fn compileMoeRouting(self: *Transformer) void {
+        if (self.config.moe_sigmoid_router) {
+            // hy_v3: the sigmoid+bias chain takes a second input (the per-layer
+            // expert_bias weight), so it compiles as its own closure.
+            const raw_closure = mlx.mlx_closure_new_func_payload(
+                &hy3RoutingClosureCallback,
+                @ptrCast(self),
+                null,
+            );
+            var compiled = mlx.mlx_closure{ .ctx = null };
+            const rc = mlx.mlx_compile(&compiled, raw_closure, false);
+            _ = mlx.mlx_closure_free(raw_closure);
+            if (rc == 0 and compiled.ctx != null) {
+                self.compiled_hy3_routing = compiled;
+                log.info("MoE routing compiled (hy3 sigmoid variant)\n", .{});
+            }
+            return;
+        }
         const raw_closure = mlx.mlx_closure_new_func_payload(
             &moeRoutingClosureCallback,
             @ptrCast(self),
@@ -3468,6 +3503,67 @@ pub const Transformer = struct {
     /// `norm_scores` arrays — caller must free both.
     fn moeRoutingUncompiled(self: *const Transformer, router_logits: mlx.mlx_array, k: c_int) !MoeRouting {
         return moeRoutingChain(router_logits, k, self.s);
+    }
+
+    /// Hy3 sigmoid routing closure body. Inputs:
+    ///   [0] router_logits — [..., num_experts]
+    ///   [1] expert_bias   — f32 [num_experts]
+    /// route_norm / route_scale / k are model-constant (from config), so they
+    /// bake into the trace.
+    fn hy3RoutingClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
+        const self: *Transformer = @ptrCast(@alignCast(payload.?));
+        const k: c_int = @intCast(self.config.num_experts_per_tok);
+
+        var router_logits = mlx.mlx_array_new();
+        if (mlx.mlx_vector_array_get(&router_logits, input, 0) != 0) return -1;
+        defer _ = mlx.mlx_array_free(router_logits);
+        var expert_bias = mlx.mlx_array_new();
+        if (mlx.mlx_vector_array_get(&expert_bias, input, 1) != 0) return -1;
+        defer _ = mlx.mlx_array_free(expert_bias);
+
+        const routed = hy3RoutingChain(
+            router_logits,
+            expert_bias,
+            k,
+            self.config.moe_route_norm,
+            self.config.router_scaling_factor,
+            self.s,
+        ) catch return -1;
+        defer _ = mlx.mlx_array_free(routed.inds);
+        defer _ = mlx.mlx_array_free(routed.norm_scores);
+
+        const out_arr = [_]mlx.mlx_array{ routed.inds, routed.norm_scores };
+        res.* = mlx.mlx_vector_array_new_data(&out_arr, 2);
+        return 0;
+    }
+
+    /// Hy3 sigmoid+bias routing — compiled closure when available, else the
+    /// direct chain. Returns owned `inds` + `norm_scores`.
+    fn computeHy3Routing(self: *const Transformer, router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array) !MoeRouting {
+        if (self.compiled_hy3_routing) |compiled| {
+            const in_arr = [_]mlx.mlx_array{ router_logits, expert_bias };
+            const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 2);
+            defer _ = mlx.mlx_vector_array_free(in_vec);
+            var out_vec = mlx.mlx_vector_array{ .ctx = null };
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
+            defer _ = mlx.mlx_vector_array_free(out_vec);
+
+            var inds = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(inds);
+            try mlx.check(mlx.mlx_vector_array_get(&inds, out_vec, 0));
+            var norm_scores = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(norm_scores);
+            try mlx.check(mlx.mlx_vector_array_get(&norm_scores, out_vec, 1));
+            return .{ .inds = inds, .norm_scores = norm_scores };
+        }
+        return hy3RoutingChain(
+            router_logits,
+            expert_bias,
+            @intCast(self.config.num_experts_per_tok),
+            self.config.moe_route_norm,
+            self.config.router_scaling_factor,
+            self.s,
+        );
     }
 
     /// Apply the compiled MoE routing closure if available, else fall back.
@@ -3532,6 +3628,7 @@ pub const Transformer = struct {
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_softcap) |cs| _ = mlx.mlx_closure_free(cs);
         if (self.compiled_moe_routing) |cmr| _ = mlx.mlx_closure_free(cmr);
+        if (self.compiled_hy3_routing) |chr| _ = mlx.mlx_closure_free(chr);
         if (self.compiled_gdn_gate) |cgg| _ = mlx.mlx_closure_free(cgg);
         if (self.gdn_ones_w) |w| _ = mlx.mlx_array_free(w);
         if (self.gdn_q_scale) |q| _ = mlx.mlx_array_free(q);
@@ -4229,6 +4326,10 @@ pub const Transformer = struct {
         if (self.compiled_moe_routing) |c| {
             _ = mlx.mlx_closure_free(c);
             self.compiled_moe_routing = null;
+        }
+        if (self.compiled_hy3_routing) |c| {
+            _ = mlx.mlx_closure_free(c);
+            self.compiled_hy3_routing = null;
         }
         if (self.compiled_gdn_gate) |c| {
             _ = mlx.mlx_closure_free(c);
@@ -7488,7 +7589,11 @@ pub const Transformer = struct {
         }
 
         // Top-K + softmax/renormalize as a single fused kernel (when compiled).
-        const routed = try self.computeMoeRouting(router_logits);
+        // Hy3 (expert_bias bound): sigmoid+bias selection instead of softmax.
+        const routed = if (mw.expert_bias) |bias|
+            try self.computeHy3Routing(router_logits, bias)
+        else
+            try self.computeMoeRouting(router_logits);
         const inds = routed.inds;
         defer _ = mlx.mlx_array_free(inds);
         var norm_scores = routed.norm_scores;
@@ -7665,6 +7770,25 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_multiply(&weighted, down_out, scores_exp, self.s));
         var expert_sum = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_sum_axis(&expert_sum, weighted, -2, false, self.s)); // [B, S, hidden]
+
+        // Hy3: shared expert ALWAYS added, no gate (reference MoE.__call__:
+        // `y = y + self.shared_mlp(x)`). shared_gate_w carries a real handle
+        // only when the checkpoint shipped mlp.shared_mlp.* weights.
+        if (mw.shared_ungated) {
+            if (mw.shared_gate_w.ctx == null) return expert_sum;
+            defer _ = mlx.mlx_array_free(expert_sum);
+            const sh_gate = try self.qmatmul(expert_x, mw.shared_gate_w, mw.shared_gate_s, mw.shared_gate_b);
+            defer _ = mlx.mlx_array_free(sh_gate);
+            const sh_up = try self.qmatmul(expert_x, mw.shared_up_w, mw.shared_up_s, mw.shared_up_b);
+            defer _ = mlx.mlx_array_free(sh_up);
+            const sh_act = try self.computeGeglu(sh_gate, sh_up);
+            defer _ = mlx.mlx_array_free(sh_act);
+            const sh_down = try self.qmatmul(sh_act, mw.shared_down_w, mw.shared_down_s, mw.shared_down_b);
+            defer _ = mlx.mlx_array_free(sh_down);
+            var result = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&result, expert_sum, sh_down, self.s));
+            return result;
+        }
 
         // Gemma 4: shared expert is handled separately in forwardMoe, just return expert_sum
         if (mw.shared_expert_gate_w == null) return expert_sum;
@@ -7985,6 +8109,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     // DiffusionGemma reuses the Gemma 4 26B-A4B layer structure verbatim —
     // both take the gemma4 binding/forward arms here.
     const is_gemma4 = config.isGemma4Layers();
+    const is_hy3 = std.mem.eql(u8, config.model_type, "hy_v3");
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -8147,7 +8272,11 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             }
         }
 
-        if (config.isMoe() and is_gemma4) {
+        // hy_v3: layers [0, first_k_dense_replace) are DENSE (layer 0 on the
+        // 295B) — they take the dense binding arm below. Every established
+        // arch has first_k_dense_replace == 0, so layer_is_moe == isMoe() there.
+        const layer_is_moe = config.isMoe() and li >= config.first_k_dense_replace;
+        if (layer_is_moe and is_gemma4) {
             // Gemma 4 MoE: different weight naming, Sigma-MoE routing, no shared expert gate.
             // Each `*_s`/`*_b` is loaded optionally for Unsloth Dynamic compatibility —
             // bf16 layers carry only the weight, no scales/biases. The post-construction
@@ -8257,7 +8386,64 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 try owned_bf16.append(allocator, folded);
                 lw.mlp.moe.router_scale = folded;
             }
-        } else if (config.isMoe()) {
+        } else if (layer_is_moe and is_hy3) {
+            // Hy3 (hy_v3): stacked experts under mlp.experts.* (already
+            // [E, out, packed] in MLX conversions — never per-expert), the
+            // QUANTIZED router under mlp.router.gate.* (8-bit on shipped
+            // checkpoints; scales optional for a bf16 parity build), the
+            // f32 selection bias mlp.expert_bias, and an UNGATED shared
+            // expert under mlp.shared_mlp.* (absent on 0-shared configs —
+            // binds empty and moeMLP skips the branch). route_norm and
+            // router_scaling_factor ride on the weights struct so moeMLP2
+            // needs no config re-derivation per call.
+            lw.mlp = .{ .moe = .{
+                .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.router.gate.weight"),
+                .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.gate.scales") orelse mlx.mlx_array_new(),
+                .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.gate.biases") orelse mlx.mlx_array_new(),
+                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.gate_proj.weight"),
+                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.gate_proj.biases") orelse mlx.mlx_array_new(),
+                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.up_proj.weight"),
+                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.up_proj.biases") orelse mlx.mlx_array_new(),
+                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.experts.down_proj.weight"),
+                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.experts.down_proj.biases") orelse mlx.mlx_array_new(),
+                .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.weight") orelse mlx.mlx_array_new(),
+                .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
+                .shared_up_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.up_proj.weight") orelse mlx.mlx_array_new(),
+                .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
+                .shared_down_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.down_proj.weight") orelse mlx.mlx_array_new(),
+                .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
+                .expert_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.expert_bias") orelse blk: {
+                    // moe_router_enable_expert_bias=false checkpoints ship no
+                    // bias tensor; the reference keeps zeros — selection
+                    // reduces to plain sigmoid top-k. Non-null keeps moeMLP2
+                    // on the sigmoid chain (null would fall back to softmax).
+                    var zeros = mlx.mlx_array_new();
+                    const zshape = [_]c_int{@intCast(config.num_experts)};
+                    try mlx.check(mlx.mlx_zeros(&zeros, &zshape, 1, .float32, s));
+                    try owned_bf16.append(allocator, zeros);
+                    break :blk zeros;
+                },
+                .route_norm = config.moe_route_norm,
+                .route_scale = config.router_scaling_factor,
+                .shared_ungated = true,
+            } };
+            {
+                const mw = &lw.mlp.moe;
+                try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_gate_w, mw.switch_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_up_w, mw.switch_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_down_w, mw.switch_down_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
+            }
+        } else if (layer_is_moe) {
             // Qwen3.5 MoE — also serves Qwen3-30B-A3B (`qwen3_moe`), which shares
             // this exact router/switch_mlp layout. Each `*_s`/`*_b` is loaded
             // optionally — Unsloth Dynamic checkpoints (e.g. Qwen3.6-A3B UD) leave
@@ -8579,6 +8765,25 @@ inline fn lastDim(x: mlx.mlx_array) ?u32 {
 /// This is what lets a sidecar (e.g. an MTP head quantized 5-bit/gs-128 over
 /// a 4-bit/gs-64 trunk) resolve per-weight instead of inheriting the trunk's
 /// group size.
+/// True when an embedding/lm_head TABLE is stored dense (float dtype) even
+/// though the config declares global quantization. Mixed checkpoints quantize
+/// per-tensor — hy_v3 2-bit ships a bf16 embed_tokens beside 2-bit experts —
+/// so scales-presence must be decided by the WEIGHT's dtype, never the
+/// config's bits (a packed uint32 table missing scales still crashes
+/// honestly at the mandatory fetch).
+pub fn floatDtypeTable(dtype: mlx.mlx_dtype) bool {
+    return dtype == .bfloat16 or dtype == .float16 or dtype == .float32;
+}
+
+test "floatDtypeTable: float tables are dense, packed/quantized ones are not" {
+    try std.testing.expect(floatDtypeTable(.bfloat16));
+    try std.testing.expect(floatDtypeTable(.float16));
+    try std.testing.expect(floatDtypeTable(.float32));
+    try std.testing.expect(!floatDtypeTable(.uint32)); // packed affine quant
+    try std.testing.expect(!floatDtypeTable(.uint8)); // fp8-encoded scales/modes
+    try std.testing.expect(!floatDtypeTable(.int32));
+}
+
 pub fn affineParamsFromGeometry(w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: u32) ?QuantParams {
     if (sc.ctx == null or in_dim == 0) return null;
     const w_shape = mlx.getShape(w);
@@ -8601,7 +8806,7 @@ pub fn affineParamsFromGeometry(w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: u32
     return .{ .bits = bits, .group_size = gs, .mode = .affine };
 }
 
-fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
+pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: ?u32) QuantParams {
     const w_shape = mlx.getShape(w);
     const s_shape = mlx.getShape(sc);
     const w_cols: u32 = if (w_shape.len >= 2) @intCast(w_shape[w_shape.len - 1]) else 0;
@@ -8729,6 +8934,87 @@ fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !T
     var norm_scores = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(norm_scores);
     try mlx.check(mlx.mlx_divide(&norm_scores, top_weights, weight_sum, s));
+
+    return .{ .inds = inds, .norm_scores = norm_scores };
+}
+
+/// Hy3 (hy_v3 / DeepSeek-V3-style) sigmoid routing chain — mirrors the
+/// reference `expert_select` (hy_v3.py):
+///   scores = sigmoid(logits) in FLOAT32 (the fp32-router class: a bf16
+///   sigmoid+bias flips near-tie expert picks on real checkpoints);
+///   top-k SELECTED on scores + expert_bias, WEIGHTED by the unbiased scores;
+///   if route_norm and k > 1: weights /= (sum + 1e-20);
+///   weights *= route_scale; cast bf16 for the expert-combine multiply
+///   (shipped checkpoints run enable_moe_fp32_combine = false).
+/// Returns owned `inds` + `norm_scores` — caller must free both.
+fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: c_int, route_norm: bool, route_scale: f32, s: mlx.mlx_stream) !Transformer.MoeRouting {
+    var logits_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits_f32);
+    try mlx.check(mlx.mlx_astype(&logits_f32, router_logits, .float32, s));
+    var scores = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scores);
+    try mlx.check(mlx.mlx_sigmoid(&scores, logits_f32, s));
+
+    var biased = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(biased);
+    try mlx.check(mlx.mlx_add(&biased, scores, expert_bias, s));
+
+    var neg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg);
+    try mlx.check(mlx.mlx_negative(&neg, biased, s));
+    var partitioned = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(partitioned);
+    try mlx.check(mlx.mlx_argpartition_axis(&partitioned, neg, k - 1, -1, s));
+
+    const p_shape = mlx.getShape(partitioned);
+    var inds = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(inds);
+    {
+        var start_arr: [4]c_int = undefined;
+        var stop_arr: [4]c_int = undefined;
+        var strides_arr: [4]c_int = undefined;
+        for (0..p_shape.len) |d| {
+            start_arr[d] = 0;
+            stop_arr[d] = if (d == p_shape.len - 1) k else p_shape[d];
+            strides_arr[d] = 1;
+        }
+        try mlx.check(mlx.mlx_slice(&inds, partitioned, &start_arr, p_shape.len, &stop_arr, p_shape.len, &strides_arr, p_shape.len, s));
+    }
+
+    // Weights = ORIGINAL (unbiased) sigmoid scores at the selected indices.
+    var top = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(top);
+    try mlx.check(mlx.mlx_take_along_axis(&top, scores, inds, -1, s));
+
+    var weights_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(weights_f32);
+    if (route_norm and k > 1) {
+        var sum_raw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sum_raw);
+        try mlx.check(mlx.mlx_sum_axis(&sum_raw, top, -1, true, s));
+        const eps = mlx.mlx_array_new_float(1e-20);
+        defer _ = mlx.mlx_array_free(eps);
+        var sum_eps = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sum_eps);
+        try mlx.check(mlx.mlx_add(&sum_eps, sum_raw, eps, s));
+        try mlx.check(mlx.mlx_divide(&weights_f32, top, sum_eps, s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&weights_f32, top));
+    }
+
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    if (route_scale != 1.0) {
+        const scale_arr = mlx.mlx_array_new_float(route_scale);
+        defer _ = mlx.mlx_array_free(scale_arr);
+        try mlx.check(mlx.mlx_multiply(&scaled, weights_f32, scale_arr, s));
+    } else {
+        try mlx.check(mlx.mlx_array_set(&scaled, weights_f32));
+    }
+
+    var norm_scores = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(norm_scores);
+    try mlx.check(mlx.mlx_astype(&norm_scores, scaled, .bfloat16, s));
 
     return .{ .inds = inds, .norm_scores = norm_scores };
 }
@@ -10628,6 +10914,108 @@ test "moeRoutingChain produces top-K indices and renormalized softmax weights" {
     try testing.expect(@abs(gs[1] - 15.0) < tol);
     try testing.expect(@abs(ss[0] - 1.0) < tol);
     try testing.expect(@abs(ss[1] - 1.0) < tol);
+}
+
+test "hy3RoutingChain selects on biased scores but weights by original sigmoid scores" {
+    const s = mlx.gpuStream();
+
+    // 1 row over 6 experts, k=2. sigmoid(logits):
+    //   [0.8808, 0.5, 0.1192, 0.7311, 0.2689, 0.6225]
+    // With NO bias the top-2 would be {0 (0.8808), 3 (0.7311)}. The expert bias
+    // +0.5 on expert 1 lifts it to 1.0, so selection must pick {1, 0} — but the
+    // WEIGHTS must come from the ORIGINAL sigmoid scores {0.5, 0.8808}
+    // (sum 1.3808), renormalized to 1 then scaled by router_scaling_factor.
+    const logits_data = [_]f32{ 2.0, 0.0, -2.0, 1.0, -1.0, 0.5 };
+    const shape = [_]c_int{ 1, 6 };
+    const logits = mlx.mlx_array_new_data(&logits_data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    const bias_data = [_]f32{ 0.0, 0.5, 0.0, 0.0, 0.0, 0.0 };
+    const bias_shape = [_]c_int{6};
+    const bias = mlx.mlx_array_new_data(&bias_data, &bias_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(bias);
+
+    const scale: f32 = 2.0;
+    const routed = try hy3RoutingChain(logits, bias, 2, true, scale, s);
+    defer _ = mlx.mlx_array_free(routed.inds);
+    defer _ = mlx.mlx_array_free(routed.norm_scores);
+
+    // Gather the ORIGINAL sigmoid scores at the selected indices. If selection
+    // ignored the bias the gathered sum would be 0.8808+0.7311 = 1.6119; with
+    // bias-driven selection it must be 0.5+0.8808 = 1.3808.
+    var sig = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sig);
+    try mlx.check(mlx.mlx_sigmoid(&sig, logits, s));
+    var gathered = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gathered);
+    try mlx.check(mlx.mlx_take_along_axis(&gathered, sig, routed.inds, -1, s));
+    var gathered_sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gathered_sum);
+    try mlx.check(mlx.mlx_sum_axis(&gathered_sum, gathered, -1, false, s));
+
+    // Renorm + scale: scores sum to exactly router_scaling_factor.
+    var scores_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scores_f32);
+    try mlx.check(mlx.mlx_astype(&scores_f32, routed.norm_scores, .float32, s));
+    var scores_sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scores_sum);
+    try mlx.check(mlx.mlx_sum_axis(&scores_sum, scores_f32, -1, false, s));
+
+    {
+        const ev = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ev);
+        _ = mlx.mlx_vector_array_append_value(ev, gathered_sum);
+        _ = mlx.mlx_vector_array_append_value(ev, scores_sum);
+        try mlx.check(mlx.mlx_eval(ev));
+    }
+
+    const gs = mlx.mlx_array_data_float32(gathered_sum) orelse return error.InvalidDtype;
+    const ss = mlx.mlx_array_data_float32(scores_sum) orelse return error.InvalidDtype;
+    // norm_scores are bf16 (cast for the expert-combine multiply) → ~0.4% rel.
+    try testing.expect(@abs(gs[0] - 1.3808) < 1e-3);
+    try testing.expect(@abs(ss[0] - scale) < 0.02);
+
+    // Per-element weights pin "weighted by ORIGINAL scores": {0.5, 0.8808}
+    // renormed ×2 → {0.7242, 1.2758} (any order). Had the chain weighted by
+    // the BIASED scores {1.0, 0.8808} the pair would be {1.0634, 0.9366} —
+    // same sum, different elements, so the sum check alone can't see it.
+    try mlx.check(mlx.mlx_array_eval(scores_f32));
+    const sv = mlx.mlx_array_data_float32(scores_f32) orelse return error.InvalidDtype;
+    const lo = @min(sv[0], sv[1]);
+    const hi = @max(sv[0], sv[1]);
+    try testing.expect(@abs(lo - 0.7242) < 0.02);
+    try testing.expect(@abs(hi - 1.2758) < 0.02);
+}
+
+test "hy3RoutingChain route_norm=false keeps raw sigmoid weights (scaled only)" {
+    const s = mlx.gpuStream();
+
+    const logits_data = [_]f32{ 2.0, 0.0, -2.0, 1.0, -1.0, 0.5 };
+    const shape = [_]c_int{ 1, 6 };
+    const logits = mlx.mlx_array_new_data(&logits_data, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+
+    // Zero bias: selection = top-2 of raw sigmoid = {0.8808, 0.7311}.
+    const bias_data = [_]f32{0.0} ** 6;
+    const bias_shape = [_]c_int{6};
+    const bias = mlx.mlx_array_new_data(&bias_data, &bias_shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(bias);
+
+    const routed = try hy3RoutingChain(logits, bias, 2, false, 2.0, s);
+    defer _ = mlx.mlx_array_free(routed.inds);
+    defer _ = mlx.mlx_array_free(routed.norm_scores);
+
+    var scores_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scores_f32);
+    try mlx.check(mlx.mlx_astype(&scores_f32, routed.norm_scores, .float32, s));
+    var scores_sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scores_sum);
+    try mlx.check(mlx.mlx_sum_axis(&scores_sum, scores_f32, -1, false, s));
+    try mlx.check(mlx.mlx_array_eval(scores_sum));
+
+    const ss = mlx.mlx_array_data_float32(scores_sum) orelse return error.InvalidDtype;
+    // (0.880797 + 0.731059) × 2.0 = 3.2237 — un-normalized, scaled.
+    try testing.expect(@abs(ss[0] - 3.2237) < 0.02);
 }
 
 test "gdnGateChain matches g = exp(-exp(A_log) * softplus(a + dt_bias))" {

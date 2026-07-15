@@ -21,11 +21,33 @@ final class MTPSettingsTests: XCTestCase {
         let a = args { _ in }
         XCTAssertFalse(a.contains("--no-mtp"))
         XCTAssertFalse(a.contains("--mtp-depth"))
+        XCTAssertFalse(a.contains("--mtp"))
     }
 
     func testTurningMtpOffEmitsNoMtp() {
         let a = args { $0.enableMTP = false }
         XCTAssertTrue(a.contains("--no-mtp"))
+    }
+
+    /// A MoE checkpoint that ships an MTP head keeps it OFF for every request
+    /// that omits `enable_mtp` (the server's `defaultEnableMtp` — the same
+    /// verify-forward routing caution the drafter has). `--mtp` overrides that,
+    /// and it is the ONLY way a client which sends no sampling/spec fields at
+    /// all (Claude Code, llmprobe, curl) can reach a MoE head.
+    func testForcingMtpOnMoeEmitsTheMtpFlag() {
+        let a = args { $0.forceMTPOnMoE = true }
+        XCTAssertTrue(a.contains("--mtp"))
+    }
+
+    /// Turning MTP off wins: `--mtp --no-mtp` would be an incoherent pair, and
+    /// the head isn't even loaded, so forcing it on for MoE is meaningless.
+    func testMtpOffSuppressesTheForceFlag() {
+        let a = args {
+            $0.enableMTP = false
+            $0.forceMTPOnMoE = true
+        }
+        XCTAssertTrue(a.contains("--no-mtp"))
+        XCTAssertFalse(a.contains("--mtp"))
     }
 
     /// Depth 0 is the server's "auto" sentinel (its adaptive controller tunes
@@ -54,6 +76,10 @@ final class MTPSettingsTests: XCTestCase {
         var deeper = base
         deeper.mtpDepth = 4
         XCTAssertFalse(base.serverLaunchEquals(deeper))
+
+        var forced = base
+        forced.forceMTPOnMoE = true
+        XCTAssertFalse(base.serverLaunchEquals(forced))
     }
 
     /// A config written before these fields existed must decode with MTP ON and
@@ -64,6 +90,7 @@ final class MTPSettingsTests: XCTestCase {
         let decoded = try JSONDecoder().decode(ServerOptions.self, from: legacy)
         XCTAssertTrue(decoded.enableMTP)
         XCTAssertEqual(decoded.mtpDepth, 0)
+        XCTAssertFalse(decoded.forceMTPOnMoE)
     }
 
     /// The rows are rendered from this metadata — a missing entry means a
@@ -71,6 +98,8 @@ final class MTPSettingsTests: XCTestCase {
     func testTheUIHasCopyForBothControls() {
         XCTAssertNotNil(ServerOptions.serverFlagFields["enableMTP"])
         XCTAssertNotNil(ServerOptions.serverFlagFields["mtpDepth"])
+        XCTAssertNotNil(ServerOptions.serverFlagFields["forceMTPOnMoE"])
         XCTAssertTrue(ServerOptions.serverFlagFields["enableMTP"]?.needsRestart ?? false)
+        XCTAssertTrue(ServerOptions.serverFlagFields["forceMTPOnMoE"]?.needsRestart ?? false)
     }
 }

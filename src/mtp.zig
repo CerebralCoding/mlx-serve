@@ -116,6 +116,7 @@ const MtpMlp = union(enum) {
                 if (m.shared_expert_gate_w) |a| _ = mlx.mlx_array_free(a);
                 if (m.shared_expert_gate_s) |a| _ = mlx.mlx_array_free(a);
                 if (m.shared_expert_gate_b) |a| _ = mlx.mlx_array_free(a);
+                if (m.expert_bias) |a| _ = mlx.mlx_array_free(a);
             },
         }
     }
@@ -131,9 +132,15 @@ pub const MtpModel = struct {
     quant_bits: u32,
     quant_group_size: u32,
 
-    fc_w_t: mlx.mlx_array, // [2H, H] bf16, pre-transposed
-    pre_fc_norm_emb: mlx.mlx_array,
-    pre_fc_norm_hidden: mlx.mlx_array,
+    fc_w_t: mlx.mlx_array, // [2H, H] bf16, pre-transposed (Qwen heads; empty for Hy3)
+    /// Hy3 (hy_v3) heads: the concat projection ships QUANTIZED as
+    /// `mtp.eh_proj` instead of Qwen's bf16 `mtp.fc`. Non-null selects the
+    /// Hy3 layer shape everywhere it differs: eh_proj replaces the fc matmul
+    /// and the attention has NO output gate (FrontOut.gate stays a null-ctx
+    /// handle; backChain skips the sigmoid multiply).
+    eh_proj: ?QLinear = null,
+    pre_fc_norm_emb: mlx.mlx_array, // Qwen pre_fc_norm_embedding / Hy3 enorm
+    pre_fc_norm_hidden: mlx.mlx_array, // Qwen pre_fc_norm_hidden / Hy3 hnorm
     final_norm: mlx.mlx_array, // mtp.norm
     input_norm: mlx.mlx_array,
     post_attn_norm: mlx.mlx_array,
@@ -166,6 +173,7 @@ pub const MtpModel = struct {
 
     pub fn deinit(self: *MtpModel) void {
         if (self.draft_head) |*dh| dh.deinit();
+        if (self.eh_proj) |*ep| ep.deinit();
         _ = mlx.mlx_array_free(self.fc_w_t);
         _ = mlx.mlx_array_free(self.pre_fc_norm_emb);
         _ = mlx.mlx_array_free(self.pre_fc_norm_hidden);
@@ -195,6 +203,23 @@ pub const MtpModel = struct {
     /// back to the trunk head).
     pub fn bind(self: *MtpModel, target: *Transformer) !void {
         const cfg = &target.config;
+        if (self.eh_proj != null) {
+            // Hy3 head: no attention output gate, sigmoid-router MoE.
+            if (!std.mem.eql(u8, cfg.model_type, "hy_v3")) return error.UnsupportedMtpArch;
+            const en_shape = mlx.getShape(self.pre_fc_norm_emb);
+            if (en_shape.len != 1 or en_shape[0] != @as(c_int, @intCast(cfg.hidden_size)))
+                return error.MtpTargetMismatch;
+            // The route params live on the weights struct so moeMLP2 needs no
+            // config re-derivation; the loader has no config, so fill here.
+            if (self.mlp == .moe and self.mlp.moe.expert_bias != null) {
+                self.mlp.moe.route_norm = cfg.moe_route_norm;
+                self.mlp.moe.route_scale = cfg.router_scaling_factor;
+            }
+            self.buildDraftHead(target) catch |err| {
+                log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
+            };
+            return;
+        }
         if (!cfg.attn_output_gate) return error.UnsupportedMtpArch;
         const fc_shape = mlx.getShape(self.fc_w_t);
         if (fc_shape.len != 2 or
@@ -232,8 +257,11 @@ pub const MtpModel = struct {
         const bits = draftHeadBitsFromEnv();
         if (bits == 0) return;
         if (target.lm_head_s.ctx == null) return; // dense bf16 head — nothing to shrink
-        const cfg = &target.config;
-        if (bits >= cfg.quant_bits) return; // no byte saving over the trunk head
+        // The head's TRUE params, not the trunk global — mixed checkpoints
+        // (hy_v3: 8-bit head over a 2-bit trunk) diverge, and requantizing
+        // with the wrong source bits reads garbage.
+        const head_qp = headQuantParams(target);
+        if (bits >= head_qp.bits) return; // no byte saving over the trunk head
         const group: u32 = 64;
 
         var dh = try requantizeRows(
@@ -241,9 +269,9 @@ pub const MtpModel = struct {
             target.lm_head_w,
             target.lm_head_s,
             target.lm_head_b,
-            cfg.quant_group_size,
-            cfg.quant_bits,
-            cfg.quant_mode.cstr(),
+            head_qp.group_size,
+            head_qp.bits,
+            head_qp.mode.cstr(),
             group,
             bits,
             32768,
@@ -275,6 +303,7 @@ pub const sidecar_rel_paths = [_][]const u8{
     "mtp/weights.safetensors", // mlx-serve native (ddalcu repos, build_mtp_sidecar.py)
     "mtp.safetensors", // others
     "model-mtp.safetensors", // others
+    "optiq/mtp.safetensors", // oMLX OptiQ (delta-encoded norms — folded at load)
 };
 
 /// Relative path (one of `sidecar_rel_paths`) of the first present, non-empty
@@ -304,6 +333,81 @@ fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
     var owned = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_array_set(&owned, arr));
     return owned;
+}
+
+/// Fraction of `arr`'s entries that are strictly negative (0..1). Used to tell
+/// a delta-encoded RMSNorm weight (many negatives) from a pre-folded one.
+fn negFraction(arr: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    const zero = mlx.mlx_array_new_float(0.0);
+    defer _ = mlx.mlx_array_free(zero);
+    var lt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(lt);
+    try mlx.check(mlx.mlx_less(&lt, arr, zero, s));
+    var ltf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ltf);
+    try mlx.check(mlx.mlx_astype(&ltf, lt, .float32, s));
+    var m = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(m);
+    try mlx.check(mlx.mlx_mean(&m, ltf, false, s));
+    try mlx.check(mlx.mlx_array_eval(m));
+    var out: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&out, m));
+    return out;
+}
+
+/// Fold `+1` into a delta-encoded RMSNorm weight, preserving its dtype. Mirrors
+/// tests/build_mtp_sidecar.py (upcast f32 → add 1 → cast back), so a folded
+/// bf16 head is byte-identical to a natively-folded mlx-serve sidecar.
+fn foldNormPlusOne(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const dt = mlx.mlx_array_dtype(arr);
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, f, one, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&out, sum, dt, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+/// Whether the head's RMSNorm weights are stored DELTA-encoded (the layer
+/// computes `1 + w`, so `w` clusters near 0 with a large NEGATIVE fraction) vs
+/// pre-folded (`1 + w` baked in → strictly positive weights, which is what
+/// mlx-serve's runtime `rmsnorm(x) * w` and build_mtp_sidecar.py expect). The
+/// Qwen original checkpoints and oMLX's OptiQ export ship delta norms; a naive
+/// copy of such a head loads but accepts ~0% (see the CLAUDE.md gotcha), so we
+/// detect and fold at load. Folded RMSNorm scales are positive by construction;
+/// delta ones are ~30-50% negative (every channel that downscales), and the
+/// threshold sits far below that — a miss can only make the runtime acceptance
+/// gate turn MTP off, never corrupt output. All norms in a head share one
+/// convention, so probing a few always-present ones decides for the whole head.
+fn mtpNormsAreDeltaEncoded(w: *const Weights, p: []const u8, s: mlx.mlx_stream) bool {
+    const probes = [_][]const u8{
+        "layers.0.input_layernorm.weight",
+        "layers.0.self_attn.q_norm.weight",
+        "norm.weight",
+    };
+    var kb: [256]u8 = undefined;
+    var max_neg: f32 = 0;
+    for (probes) |rest| {
+        const key = std.fmt.bufPrint(&kb, "{s}mtp.{s}", .{ p, rest }) catch continue;
+        const arr = w.get(key) orelse continue;
+        const nf = negFraction(arr, s) catch continue;
+        if (nf > max_neg) max_neg = nf;
+    }
+    return max_neg > 0.05;
+}
+
+/// Own an RMSNorm weight, folding `+1` when the head stores delta-encoded norms.
+fn ownNorm(w: *const Weights, key: []const u8, s: mlx.mlx_stream, fold: bool) !mlx.mlx_array {
+    const owned = try ownWeight(w, key);
+    if (!fold) return owned;
+    defer _ = mlx.mlx_array_free(owned);
+    return foldNormPlusOne(owned, s);
 }
 
 fn ownAndTranspose2D(w: *const Weights, key: []const u8, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -532,9 +636,21 @@ pub fn loadMtp(
         }
     };
 
+    // Hy3 (hy_v3) layout: `mtp.eh_proj` + `mtp.layer.*` (full decoder layer,
+    // sigmoid-router MoE). Detected by its distinctive projection name.
+    if (weights.get(K.k(&kb, p, "eh_proj.weight")) != null) {
+        return loadHy3Mtp(allocator, s, &weights, p);
+    }
+
     // MLP flavor: a `switch_mlp` router/expert pack marks a MoE-trunk sidecar
     // (35B-A3B); plain gate/up/down is the dense one-layer head.
     const is_moe = weights.get(K.k(&kb, p, "layers.0.mlp.switch_mlp.gate_proj.weight")) != null;
+
+    // Delta-encoded norms (Qwen original layout, oMLX OptiQ) need `+1` folded
+    // in at load so the runtime `rmsnorm(x) * w` matches; a natively-folded
+    // mlx-serve sidecar has strictly-positive norms and is left untouched.
+    const fold_norms = mtpNormsAreDeltaEncoded(&weights, p, s);
+    if (fold_norms) log.info("[mtp] delta-encoded norms detected; folding +1 at load\n", .{});
 
     var m = MtpModel{
         .allocator = allocator,
@@ -542,13 +658,13 @@ pub fn loadMtp(
         .quant_bits = 0, // inferred from tensor geometry below
         .quant_group_size = 0,
         .fc_w_t = try ownAndTranspose2D(&weights, K.k(&kb, p, "fc.weight"), s),
-        .pre_fc_norm_emb = try ownWeight(&weights, K.k(&kb, p, "pre_fc_norm_embedding.weight")),
-        .pre_fc_norm_hidden = try ownWeight(&weights, K.k(&kb, p, "pre_fc_norm_hidden.weight")),
-        .final_norm = try ownWeight(&weights, K.k(&kb, p, "norm.weight")),
-        .input_norm = try ownWeight(&weights, K.k(&kb, p, "layers.0.input_layernorm.weight")),
-        .post_attn_norm = try ownWeight(&weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight")),
-        .q_norm = try ownWeight(&weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight")),
-        .k_norm = try ownWeight(&weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight")),
+        .pre_fc_norm_emb = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_embedding.weight"), s, fold_norms),
+        .pre_fc_norm_hidden = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_hidden.weight"), s, fold_norms),
+        .final_norm = try ownNorm(&weights, K.k(&kb, p, "norm.weight"), s, fold_norms),
+        .input_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.input_layernorm.weight"), s, fold_norms),
+        .post_attn_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight"), s, fold_norms),
+        .q_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight"), s, fold_norms),
+        .k_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight"), s, fold_norms),
         .q = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.q_proj"), s),
         .k = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.k_proj"), s),
         .v = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.v_proj"), s),
@@ -655,6 +771,116 @@ pub fn loadMtp(
     return m;
 }
 
+/// Hy3 (hy_v3) MTP block loader — `model-mtp.safetensors` with post-sanitize
+/// names: mtp.{enorm,hnorm,eh_proj,final_layernorm} + mtp.layer.* holding a
+/// FULL hy3 decoder layer (8-bit attention with per-head QK norms, 2/3-bit
+/// stacked experts, 8-bit sigmoid router + f32 expert_bias, 8-bit UNGATED
+/// shared expert). Norms load VERBATIM — unlike the original Qwen repo,
+/// nothing here is delta-encoded. route_norm/route_scale are filled at
+/// bind() (the loader has no config).
+fn loadHy3Mtp(
+    allocator: std.mem.Allocator,
+    s: mlx.mlx_stream,
+    weights: *const Weights,
+    p: []const u8,
+) !MtpModel {
+    var kb: [256]u8 = undefined;
+    const K = struct {
+        fn k(buf: []u8, pref: []const u8, rest: []const u8) []const u8 {
+            return std.fmt.bufPrint(buf, "{s}mtp.{s}", .{ pref, rest }) catch unreachable;
+        }
+    };
+
+    const router = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.router.gate"), s);
+    const sg = try loadMoeTriple(weights, K.k(&kb, p, "layer.mlp.experts.gate_proj"));
+    const su = try loadMoeTriple(weights, K.k(&kb, p, "layer.mlp.experts.up_proj"));
+    const sd = try loadMoeTriple(weights, K.k(&kb, p, "layer.mlp.experts.down_proj"));
+    const shg = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.shared_mlp.gate_proj"), s);
+    const shu = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.shared_mlp.up_proj"), s);
+    const shd = try loadLinear(weights, allocator, K.k(&kb, p, "layer.mlp.shared_mlp.down_proj"), s);
+
+    var m = MtpModel{
+        .allocator = allocator,
+        .s = s,
+        .quant_bits = 0,
+        .quant_group_size = 0,
+        .fc_w_t = .{ .ctx = null },
+        .eh_proj = try loadLinear(weights, allocator, K.k(&kb, p, "eh_proj"), s),
+        .pre_fc_norm_emb = try ownWeight(weights, K.k(&kb, p, "enorm.weight")),
+        .pre_fc_norm_hidden = try ownWeight(weights, K.k(&kb, p, "hnorm.weight")),
+        .final_norm = try ownWeight(weights, K.k(&kb, p, "final_layernorm.weight")),
+        .input_norm = try ownWeight(weights, K.k(&kb, p, "layer.input_layernorm.weight")),
+        .post_attn_norm = try ownWeight(weights, K.k(&kb, p, "layer.post_attention_layernorm.weight")),
+        .q_norm = try ownWeight(weights, K.k(&kb, p, "layer.self_attn.q_norm.weight")),
+        .k_norm = try ownWeight(weights, K.k(&kb, p, "layer.self_attn.k_norm.weight")),
+        .q = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.q_proj"), s),
+        .k = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.k_proj"), s),
+        .v = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.v_proj"), s),
+        .o = try loadLinear(weights, allocator, K.k(&kb, p, "layer.self_attn.o_proj"), s),
+        .mlp = .{ .moe = .{
+            .router_w = router.w,
+            .router_s = router.s,
+            .router_b = router.b,
+            .switch_gate_w = sg.w,
+            .switch_gate_s = sg.s,
+            .switch_gate_b = sg.b,
+            .switch_up_w = su.w,
+            .switch_up_s = su.s,
+            .switch_up_b = su.b,
+            .switch_down_w = sd.w,
+            .switch_down_s = sd.s,
+            .switch_down_b = sd.b,
+            .shared_gate_w = shg.w,
+            .shared_gate_s = shg.s,
+            .shared_gate_b = shg.b,
+            .shared_up_w = shu.w,
+            .shared_up_s = shu.s,
+            .shared_up_b = shu.b,
+            .shared_down_w = shd.w,
+            .shared_down_s = shd.s,
+            .shared_down_b = shd.b,
+            .expert_bias = try ownWeight(weights, K.k(&kb, p, "layer.mlp.expert_bias")),
+            .shared_ungated = true,
+        } },
+    };
+    errdefer m.deinit();
+
+    // Fallback quant globals from the q projection geometry (hidden pinned by
+    // the enorm length); every matmul re-solves per weight anyway.
+    {
+        const en_shape = mlx.getShape(m.pre_fc_norm_emb);
+        const hidden: u32 = if (en_shape.len == 1) @intCast(en_shape[0]) else 0;
+        m.quant_bits = inferBits(&m.q, hidden) orelse 8;
+        m.quant_group_size = inferGroupSize(&m.q, m.quant_bits) orelse 64;
+    }
+
+    // Materialize now so the first draft doesn't pay for it.
+    {
+        const eval_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(eval_vec);
+        const base = [_]mlx.mlx_array{
+            m.eh_proj.?.w, m.pre_fc_norm_emb, m.pre_fc_norm_hidden, m.final_norm,
+            m.input_norm,  m.post_attn_norm,  m.q_norm,             m.k_norm,
+            m.q.w,         m.k.w,             m.v.w,                m.o.w,
+        };
+        for (base) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        const mw = &m.mlp.moe;
+        const moe_ws = [_]mlx.mlx_array{
+            mw.router_w, mw.switch_gate_w, mw.switch_up_w, mw.switch_down_w,
+            mw.shared_gate_w, mw.shared_up_w, mw.shared_down_w,
+        };
+        for (moe_ws) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        if (mw.expert_bias) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
+        _ = mlx.mlx_eval(eval_vec);
+    }
+
+    log.info("[mtp] loaded Hy3 MTP head (sigmoid-MoE layer; per-weight quant, fallback bits={d}/gs={d})\n", .{
+        m.quant_bits,
+        m.quant_group_size,
+    });
+    return m;
+}
+
 // ── Forward ──
 
 inline fn rmsNormFn(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -742,6 +968,13 @@ fn embedTargetTokens(
         try mlx.check(mlx.mlx_take_axis(&tb, target.emb_b, id_arr, 0, s));
     }
 
+    // Resolve the embed table's OWN quant params from geometry, not the trunk's
+    // global `config.quant_bits` — a mixed-precision checkpoint (oMLX OptiQ)
+    // quantizes embed_tokens to 8-bit while the base is 4-bit, and dequantizing
+    // an 8-bit table as 4-bit crashes (`scales/biases shape mismatch`). Mirrors
+    // `Transformer.embedding` → `quantParamsHinted`. Uniform-4-bit checkpoints
+    // (ddalcu, MTPLX) resolve to the same 4/gs64/affine, so they're unchanged.
+    const emb_qp = transformer_mod.computeQuantParams(&target.config, target.emb_w, target.emb_s, target.config.hidden_size);
     var dequant = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dequant);
     try mlx.check(mlx.mlx_dequantize(
@@ -749,9 +982,9 @@ fn embedTargetTokens(
         tw,
         ts,
         tb,
-        mlx.mlx_optional_int.some(@intCast(target.config.quant_group_size)),
-        mlx.mlx_optional_int.some(@intCast(target.config.quant_bits)),
-        target.config.quant_mode.cstr(),
+        mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
+        mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
+        emb_qp.mode.cstr(),
         .{}, // global_scale
         .{ .value = .bfloat16, .has_value = true },
         s,
@@ -791,6 +1024,11 @@ fn targetLmHead(self: *const MtpModel, target: *Transformer, x: mlx.mlx_array, s
         try mlx.check(mlx.mlx_matmul(&out, x, wt, s));
         return out;
     }
+    // Per-WEIGHT quant params: mixed checkpoints override the head's width
+    // (hy_v3 2-bit trunk ships an 8-bit lm_head — the global bits crashed the
+    // whole process in mlx's shape check, live 2026-07-14). Non-affine trunks
+    // keep the config fallback.
+    const qp = headQuantParams(target);
     try mlx.check(mlx.mlx_quantized_matmul(
         &out,
         x,
@@ -798,12 +1036,28 @@ fn targetLmHead(self: *const MtpModel, target: *Transformer, x: mlx.mlx_array, s
         target.lm_head_s,
         target.lm_head_b,
         true,
-        mlx.mlx_optional_int.some(@intCast(target.config.quant_group_size)),
-        mlx.mlx_optional_int.some(@intCast(target.config.quant_bits)),
-        target.config.quant_mode.cstr(),
+        mlx.mlx_optional_int.some(@intCast(qp.group_size)),
+        mlx.mlx_optional_int.some(@intCast(qp.bits)),
+        qp.mode.cstr(),
         s,
     ));
     return out;
+}
+
+/// The trunk lm_head's TRUE quant params — solved from tensor geometry when
+/// affine (the head's bits routinely differ from the trunk global on mixed
+/// checkpoints), config fallback otherwise.
+fn headQuantParams(target: *Transformer) transformer_mod.QuantParams {
+    if (transformer_mod.affineParamsFromGeometry(
+        target.lm_head_w,
+        target.lm_head_s,
+        @intCast(target.config.hidden_size),
+    )) |qp| return qp;
+    return .{
+        .bits = target.config.quant_bits,
+        .group_size = target.config.quant_group_size,
+        .mode = target.config.quant_mode,
+    };
 }
 
 /// Outputs of the pre-rope half of the MTP layer. All arrays owned.
@@ -857,21 +1111,32 @@ fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array
     }
     var x = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(x);
-    try mlx.check(mlx.mlx_matmul(&x, cat, self.fc_w_t, s));
+    if (self.eh_proj) |*ep| {
+        // Hy3: the concat projection is quantized (mtp.eh_proj, 8-bit).
+        _ = mlx.mlx_array_free(x);
+        x = try qLinearFwd(self, cat, ep);
+    } else {
+        try mlx.check(mlx.mlx_matmul(&x, cat, self.fc_w_t, s));
+    }
 
-    // ── Decoder layer: gated full attention ──
+    // ── Decoder layer: full attention (Qwen: gated q; Hy3: plain q) ──
     const normed = try rmsNormFn(x, self.input_norm, eps, s);
     defer _ = mlx.mlx_array_free(normed);
 
     const q_proj = try qLinearFwd(self, normed, &self.q);
     defer _ = mlx.mlx_array_free(q_proj);
 
-    // q_proj is [1, L, 2*H*D]: reshape to [1, L, H, 2D], split → (queries, gate)
     var queries = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(queries);
     var gate = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(gate);
-    {
+    if (self.eh_proj != null) {
+        // Hy3: no attention output gate — q_proj IS the queries. `gate`
+        // stays a null-ctx handle; backChain skips the sigmoid multiply.
+        const q_shape = [_]c_int{ 1, seq_len, h_count, hd };
+        try mlx.check(mlx.mlx_reshape(&queries, q_proj, &q_shape, 4, s));
+    } else {
+        // q_proj is [1, L, 2*H*D]: reshape to [1, L, H, 2D], split → (queries, gate)
         const q_gate_shape = [_]c_int{ 1, seq_len, h_count, hd * 2 };
         var q_gate_r = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(q_gate_r);
@@ -941,14 +1206,19 @@ fn backChain(self: *const MtpModel, target: *Transformer, attn_out: mlx.mlx_arra
     defer _ = mlx.mlx_array_free(attn_flat);
     try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, s));
 
-    // Output gate: o_proj(attn * sigmoid(gate))
-    var gate_sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gate_sig);
-    try mlx.check(mlx.mlx_sigmoid(&gate_sig, gate, s));
-    var gated = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gated);
-    try mlx.check(mlx.mlx_multiply(&gated, attn_flat, gate_sig, s));
-    const o_out = try qLinearFwd(self, gated, &self.o);
+    // Output gate: o_proj(attn * sigmoid(gate)); ungated archs (Hy3) pass a
+    // null-ctx gate → straight o_proj(attn).
+    const o_out = if (gate.ctx == null)
+        try qLinearFwd(self, attn_flat, &self.o)
+    else blk: {
+        var gate_sig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gate_sig);
+        try mlx.check(mlx.mlx_sigmoid(&gate_sig, gate, s));
+        var gated = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gated);
+        try mlx.check(mlx.mlx_multiply(&gated, attn_flat, gate_sig, s));
+        break :blk try qLinearFwd(self, gated, &self.o);
+    };
     defer _ = mlx.mlx_array_free(o_out);
 
     var h1 = mlx.mlx_array_new();
@@ -1129,6 +1399,96 @@ pub fn stepArr(
 
 const testing = std.testing;
 
+test "mtp: loadMtp detects the Hy3 layout (eh_proj + full decoder layer + sigmoid MoE)" {
+    // Hy3 (hy_v3) checkpoints ship the MTP block in `model-mtp.safetensors`
+    // under post-sanitize names: mtp.{enorm,hnorm,eh_proj,final_layernorm} +
+    // mtp.layer.* (a FULL hy3 decoder layer: attention + 192-expert sigmoid
+    // MoE + UNGATED shared expert + expert_bias). Toy bf16 geometry — this
+    // pins the LAYOUT detection and struct shape; the head's math is pinned
+    // live by tests/test_mtp_equivalence.sh (acceptance floor + temp-0
+    // equivalence).
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model-mtp.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+
+        const H = struct {
+            fn put(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.1;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
+            fn putF32(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int) void {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                var data: [16]f32 = .{0.0} ** 16;
+                const f32_arr = mlx.mlx_array_new_data(&data, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                _ = mlx.mlx_map_string_to_array_insert(m, key, f32_arr);
+            }
+        };
+        // hidden 8, heads 2 × hd 4, kv 1, experts 4, expert inter 6.
+        try H.put(map, "mtp.enorm.weight", &.{8}, s);
+        try H.put(map, "mtp.hnorm.weight", &.{8}, s);
+        try H.put(map, "mtp.final_layernorm.weight", &.{8}, s);
+        try H.put(map, "mtp.eh_proj.weight", &.{ 8, 16 }, s);
+        try H.put(map, "mtp.layer.input_layernorm.weight", &.{8}, s);
+        try H.put(map, "mtp.layer.post_attention_layernorm.weight", &.{8}, s);
+        try H.put(map, "mtp.layer.self_attn.q_norm.weight", &.{4}, s);
+        try H.put(map, "mtp.layer.self_attn.k_norm.weight", &.{4}, s);
+        try H.put(map, "mtp.layer.self_attn.q_proj.weight", &.{ 8, 8 }, s);
+        try H.put(map, "mtp.layer.self_attn.k_proj.weight", &.{ 4, 8 }, s);
+        try H.put(map, "mtp.layer.self_attn.v_proj.weight", &.{ 4, 8 }, s);
+        try H.put(map, "mtp.layer.self_attn.o_proj.weight", &.{ 8, 8 }, s);
+        try H.put(map, "mtp.layer.mlp.router.gate.weight", &.{ 4, 8 }, s);
+        try H.put(map, "mtp.layer.mlp.experts.gate_proj.weight", &.{ 4, 6, 8 }, s);
+        try H.put(map, "mtp.layer.mlp.experts.up_proj.weight", &.{ 4, 6, 8 }, s);
+        try H.put(map, "mtp.layer.mlp.experts.down_proj.weight", &.{ 4, 8, 6 }, s);
+        try H.put(map, "mtp.layer.mlp.shared_mlp.gate_proj.weight", &.{ 6, 8 }, s);
+        try H.put(map, "mtp.layer.mlp.shared_mlp.up_proj.weight", &.{ 6, 8 }, s);
+        try H.put(map, "mtp.layer.mlp.shared_mlp.down_proj.weight", &.{ 8, 6 }, s);
+        H.putF32(map, "mtp.layer.mlp.expert_bias", &.{4});
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    var m = try loadMtp(io, allocator, s, dir_path);
+    defer m.deinit();
+
+    // Hy3 shape: quantizable eh_proj bound, no bf16 fc, MoE mlp with the
+    // sigmoid-router extras, UNGATED shared expert.
+    try testing.expect(m.eh_proj != null);
+    try testing.expect(m.fc_w_t.ctx == null);
+    try testing.expect(m.mlp == .moe);
+    try testing.expect(m.mlp.moe.expert_bias != null);
+    try testing.expect(m.mlp.moe.shared_ungated);
+    try testing.expect(m.mlp.moe.shared_expert_gate_w == null);
+    // enorm/hnorm ride the pre_fc_norm slots (same role, no +1 folding).
+    const en_shape = mlx.getShape(m.pre_fc_norm_emb);
+    try testing.expectEqual(@as(c_int, 8), en_shape[0]);
+}
+
 test "mtp: requantizeRows round-trips through a finer re-encode (chunked)" {
     const s = mlx.gpuStream();
     const rows: usize = 64;
@@ -1196,6 +1556,11 @@ test "mtp: sidecar resolution accepts native and Forge layouts in priority order
     // Nothing present → null.
     try testing.expectEqual(@as(?[]const u8, null), resolveMtpSidecarInDir(io, tmp.dir));
 
+    // oMLX OptiQ layout is discovered when it's the only head present.
+    try tmp.dir.createDirPath(io, "optiq");
+    try tmp.dir.writeFile(io, .{ .sub_path = "optiq/mtp.safetensors", .data = "x" });
+    try testing.expectEqualStrings("optiq/mtp.safetensors", resolveMtpSidecarInDir(io, tmp.dir).?);
+
     try tmp.dir.writeFile(io, .{ .sub_path = "model-mtp.safetensors", .data = "x" });
     try testing.expectEqualStrings("model-mtp.safetensors", resolveMtpSidecarInDir(io, tmp.dir).?);
 
@@ -1215,6 +1580,70 @@ test "mtp: empty sidecar file is not a sidecar" {
     defer tmp.cleanup();
     try tmp.dir.writeFile(io, .{ .sub_path = "mtp.safetensors", .data = "" });
     try testing.expectEqual(@as(?[]const u8, null), resolveMtpSidecarInDir(io, tmp.dir));
+}
+
+test "mtp: delta-encoded norms are detected and folded +1; folded norms untouched" {
+    const s = mlx.gpuStream();
+    const shape = [_]c_int{6};
+
+    // A delta-encoded RMSNorm weight (the layer computes `1 + w`) clusters at 0
+    // with a large negative fraction; the pre-folded form is delta + 1 and is
+    // strictly positive. This is exactly the mlx-serve-vs-OptiQ +1.0 offset.
+    var delta_buf = [_]f32{ -0.5, -0.2, 0.0, 0.3, 0.8, -0.1 };
+    const delta = mlx.mlx_array_new_data(&delta_buf, &shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(delta);
+    var folded_buf = [_]f32{ 0.5, 0.8, 1.0, 1.3, 1.8, 0.9 };
+    const folded = mlx.mlx_array_new_data(&folded_buf, &shape, 1, .float32);
+    defer _ = mlx.mlx_array_free(folded);
+
+    // Detection: the delta head is ~50% negative, the folded head 0% — the
+    // 0.05 threshold sits far from both.
+    try testing.expect((try negFraction(delta, s)) > 0.05);
+    try testing.expect((try negFraction(folded, s)) < 0.01);
+
+    // Folding the delta head recovers the folded weights byte-for-byte, and no
+    // longer trips detection (so a second load can't double-fold).
+    const rec = try foldNormPlusOne(delta, s);
+    defer _ = mlx.mlx_array_free(rec);
+    try testing.expect((try maxAbsDiff(rec, folded, s)) < 1e-6);
+    try testing.expect((try negFraction(rec, s)) < 0.01);
+    try testing.expect(!mtpNormsAreDeltaEnc1D(rec, s));
+
+    // A natively-folded head must be left untouched (dtype + values preserved).
+    const keep = try foldNormPlusOne_ifDelta(folded, s);
+    defer _ = mlx.mlx_array_free(keep);
+    try testing.expect((try maxAbsDiff(keep, folded, s)) < 1e-6);
+}
+
+// Test-only: run the negFraction threshold on a single 1-D norm array.
+fn mtpNormsAreDeltaEnc1D(arr: mlx.mlx_array, s: mlx.mlx_stream) bool {
+    const nf = negFraction(arr, s) catch return false;
+    return nf > 0.05;
+}
+
+// Test-only: fold only when the single array reads as delta-encoded.
+fn foldNormPlusOne_ifDelta(arr: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    if (mtpNormsAreDeltaEnc1D(arr, s)) return foldNormPlusOne(arr, s);
+    var owned = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_array_set(&owned, arr));
+    return owned;
+}
+
+// Test-only: max |a-b| over all elements.
+fn maxAbsDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    var d = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(d);
+    try mlx.check(mlx.mlx_subtract(&d, a, b, s));
+    var ad = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ad);
+    try mlx.check(mlx.mlx_abs(&ad, d, s));
+    var mx = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mx);
+    try mlx.check(mlx.mlx_max(&mx, ad, false, s));
+    try mlx.check(mlx.mlx_array_eval(mx));
+    var out: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&out, mx));
+    return out;
 }
 
 test "mtp: inferGroupSize geometry" {

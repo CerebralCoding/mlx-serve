@@ -302,8 +302,13 @@ add_gemma_targets() {
 # All engines load the same standard mlx-community 4-bit MLX weights (not
 # the unsloth UD variants). The MTPLX-artifact row: 4-bit trunk +
 # MTPLX-calibrated MTP adapter; mlx-serve loads it unmodified (mtp/ sidecar),
-# MTPLX gets its native MTP, oMLX serves the trunk AR — identical weights on
-# every engine. It is the ONLY row where an mtplx cell can run.
+# MTPLX gets its native MTP — identical weights on every engine. It is the
+# ONLY row where an mtplx cell can run.
+#
+# oMLX runs its own native MTP (mtp_enabled, see prepare_omlx_mtp) on the ONE
+# qwen row whose checkpoint ships INLINE mtp weights (Qwen3.6-35B-A3B); on the
+# 27B / mtplxopt rows the MTP head exists only as an mlx-serve `mtp/` sidecar,
+# which omlx can't read, so its cell stays autoregressive there.
 add_qwen36_targets() {
     # Qwen lms_alt ids are the FULL indexed identifiers
     # (publisher/repo/file.gguf): these GGUFs are side-loaded (no LM Studio
@@ -661,6 +666,72 @@ if not auth.get("skip_api_key_verification"):
 PY
 }
 
+# oMLX exposes native Qwen3.5/3.6 multi-token prediction as the per-model
+# `mtp_enabled` flag in ~/.omlx/model_settings.json (keyed by model id = the
+# served subdir basename), applied at engine construction. Turn it ON for the
+# omlx cell so its Qwen bar is an apples-to-apples MTP comparison with
+# mlx-serve's `mtp` cell — but only where it can actually engage:
+#
+#   - omlx's native MTP reads the head from INLINE `*.mtp.*` weights in the
+#     checkpoint; it CANNOT use mlx-serve's `mtp/` sidecar layout. Among the
+#     bench qwen rows only Qwen3.6-35B-A3B-4bit ships inline mtp tensors; the
+#     27B / mtplxopt rows carry the head only as an mlx-serve sidecar, so omlx
+#     stays autoregressive there.
+#   - Forcing the flag on a checkpoint that declares `mtp_num_hidden_layers>0`
+#     but ships no inline weights either no-ops (VLM load path skips the
+#     attach) or FAILS strict weight-load (no-vision mlx-lm path). So gate the
+#     flag on actual inline-weight presence rather than the config declaration.
+#
+# Gemma omlx cells run this too (native MTP is a Qwen feature) and harmlessly
+# resolve to `mtp_enabled:false`. Idempotent read-modify-write that preserves
+# any other persisted per-model settings; also self-heals a stale `true` left
+# by an interactive omlx session on a sidecar-only checkpoint.
+prepare_omlx_mtp() {
+    local served_dir="$1" model_id="$2"
+    python3 - "$served_dir" "$model_id" "$HOME/.omlx/model_settings.json" <<'PY'
+import glob, json, os, struct, sys
+served_dir, model_id, settings_path = sys.argv[1], sys.argv[2], sys.argv[3]
+
+def has_inline_mtp(d):
+    try:
+        cfg = json.load(open(os.path.join(d, "config.json")))
+    except Exception:
+        return False
+    tc = cfg.get("text_config", cfg)
+    if int(tc.get("mtp_num_hidden_layers", 0) or 0) <= 0:
+        return False
+    for f in glob.glob(os.path.join(d, "*.safetensors")):
+        try:
+            with open(f, "rb") as fh:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                hdr = json.loads(fh.read(n))
+        except Exception:
+            continue
+        if any("mtp" in k.lower() for k in hdr if k != "__metadata__"):
+            return True
+    return False
+
+enable = has_inline_mtp(served_dir)
+
+data = {"version": 1, "models": {}}
+if os.path.exists(settings_path):
+    try:
+        data = json.load(open(settings_path))
+    except Exception:
+        data = {"version": 1, "models": {}}
+data.setdefault("version", 1)
+data.setdefault("models", {}).setdefault(model_id, {})["mtp_enabled"] = bool(enable)
+
+os.makedirs(os.path.dirname(settings_path), exist_ok=True)
+tmp = settings_path + ".tmp"
+with open(tmp, "w") as f:
+    json.dump(data, f, indent=2)
+os.replace(tmp, settings_path)
+print(f"  omlx native MTP {'ENABLED' if enable else 'off'} for {model_id}",
+      file=sys.stderr)
+PY
+}
+
 stop_all_engines() {
     pkill -9 -x mlx-serve 2>/dev/null
     # oMLX launches as `python3 -m omlx.cli serve …` — match by `omlx.cli`.
@@ -755,6 +826,10 @@ start_engine() {
             local model_dir model_id
             model_dir="$(dirname "$model_or_path")"
             model_id="$(basename "$model_or_path")"
+            # Enable oMLX native MTP for this model where the checkpoint ships
+            # inline mtp weights (Qwen3.6-35B-A3B); written before boot so the
+            # ModelSettingsManager picks it up at engine construction.
+            prepare_omlx_mtp "$model_or_path" "$model_id"
             # shellcheck disable=SC2086
             omlx serve --model-dir "$model_dir" --port "$OMLX_PORT" \
                 >/tmp/bench_vs_lms_omlx.log 2>&1 &

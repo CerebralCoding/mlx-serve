@@ -17,12 +17,11 @@ private let bytesPerGiB: Double = 1_073_741_824
 /// +20% RAM-with-overhead figure `HFModel.ramEstimate` shows elsewhere) —
 /// not guessed from the model name.
 
-/// Which of the two curated families a pick belongs to — also the pane's two
-/// section headers. The user explicitly asked to keep this pane to Gemma 4
-/// and Qwen 3.5/3.6.
+/// Which curated family a pick belongs to — also the pane's section headers.
 enum RecommendedModelFamily: String {
     case gemma = "Gemma"
     case qwen = "Qwen"
+    case hunyuan = "Hunyuan"
 }
 
 /// One curated, plain-English download recommendation.
@@ -41,13 +40,19 @@ struct RecommendedModelPick: Identifiable, Hashable {
     let family: RecommendedModelFamily
     /// Short capability chips (e.g. "Best for coding").
     let highlights: [String]
+    /// Overrides the generic weights×1.2 RAM estimate for picks where that
+    /// formula misleads. Hunyuan 3's 105 GB weights read as "fits on 128 GB"
+    /// by the formula, but measured live a 128 GB Mac loads it only with the
+    /// memory-preflight override and a ~3K context — the honest
+    /// recommendation gate is above 128.
+    var ramOverrideGB: Double? = nil
 
     var sizeLabel: String { String(format: "~%.1f GB", sizeGB) }
 
     /// Approximate RAM this checkpoint needs once loaded — weights plus the
     /// same ~20% KV-cache/runtime-buffer overhead `HFModel.ramEstimate` and
     /// `GemmaModelOption.sizeEstimate` budget for elsewhere in the app.
-    var approxRAMNeededGB: Double { sizeGB * 1.2 }
+    var approxRAMNeededGB: Double { ramOverrideGB ?? sizeGB * 1.2 }
 
     /// Whether this Mac's physical RAM covers what the model needs. This is a
     /// SOFT signal for the UI (dim the row, explain why) — never a hard
@@ -166,6 +171,23 @@ extension RecommendedModelPick {
         highlights: ["Best for coding", "Built-in speed boost", "Great at agent tasks"]
     )
 
+    /// Tencent Hunyuan 3 (295B-A21B MoE, 2-bit mixed quant) — the largest
+    /// open model this app runs. The recommendation targets Macs with MORE
+    /// than 128 GB (the `ramOverrideGB` gate); on a 128 GB Mac it loads and
+    /// answers correctly but only a minimal context window fits beside the
+    /// weights, so the blurb says so instead of hiding it.
+    static let hy3_295b = RecommendedModelPick(
+        id: "hy3-295b-2bit",
+        name: "Hunyuan 3 295B",
+        tagline: "The biggest model here",
+        blurb: "Tencent's flagship open model — 295 billion parameters, of which it wakes only 21 billion per word (mixture of experts). Top-tier reasoning, agent work, and tool use, entirely on your Mac. Best on Macs with more than 128 GB of memory; on a 128 GB Mac it runs with a minimal context window (short conversations only).",
+        repoId: "ox-ox/Hy3-295B-Instruct-w2q3exp-AProjQ8-SExpQ8-OutQ8-MTP-mlx",
+        sizeGB: 105.0,
+        family: .hunyuan,
+        highlights: ["Flagship quality", "Mixture of experts", "256K context"],
+        ramOverrideGB: 135.0
+    )
+
     static let qwen36_35bA3b = RecommendedModelPick(
         id: "qwen36-35b-a3b",
         name: "Qwen 3.6 35B-A3B",
@@ -189,6 +211,11 @@ extension RecommendedModelPick {
     /// family section.
     static let qwenCatalog: [RecommendedModelPick] = [
         .qwen35_9b, .qwen36_27bMtp, .qwen36_35bA3b,
+    ]
+
+    /// Tencent Hunyuan picks — currently the one 295B flagship.
+    static let hunyuanCatalog: [RecommendedModelPick] = [
+        .hy3_295b,
     ]
 }
 

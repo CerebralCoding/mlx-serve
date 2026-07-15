@@ -58,6 +58,14 @@ struct ServerOptions: Codable, Equatable {
     /// depth live from the measured acceptance rate). A fixed value is a
     /// benchmarking lever; emitted only when non-zero.
     var mtpDepth: Int = 0
+    /// `--mtp`. A MoE checkpoint that ships an MTP head keeps it OFF for every
+    /// request that omits `enable_mtp` (the server's `defaultEnableMtp`: the
+    /// verify forward pays the expert-routing penalty, the same caution the
+    /// drafter carries). That makes the head unreachable from clients which
+    /// send no spec fields at all — Claude Code, llmprobe, curl. Turning this
+    /// on flips the default for MoE targets; dense targets are unaffected
+    /// (they already default ON). Off, matching the server.
+    var forceMTPOnMoE: Bool = false
 
     // Performance (server-launch flags)
     /// Continuous batching: max in-flight chat requests batched through one
@@ -363,6 +371,7 @@ struct ServerOptions: Codable, Equatable {
         draftBlockSize == other.draftBlockSize &&
         enableMTP == other.enableMTP &&
         mtpDepth == other.mtpDepth &&
+        forceMTPOnMoE == other.forceMTPOnMoE &&
         maxConcurrent == other.maxConcurrent &&
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
@@ -459,6 +468,10 @@ struct ServerOptions: Codable, Equatable {
         // testDefaultLaunchOmitsAllMatchDefaultFlags).
         if !enableMTP {
             args += ["--no-mtp"]
+        } else if forceMTPOnMoE {
+            // `--mtp --no-mtp` would be incoherent, and with the head unloaded
+            // there is nothing to force on — so "off" wins over "force".
+            args += ["--mtp"]
         }
         if mtpDepth > 0 {
             args += ["--mtp-depth", "\(mtpDepth)"]
@@ -600,6 +613,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .draftBlockSize) { draftBlockSize = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMTP) { enableMTP = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .forceMTPOnMoE) { forceMTPOnMoE = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxConcurrent) { maxConcurrent = v }
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
@@ -737,6 +751,10 @@ extension ServerOptions {
         "mtpDepth": .init(
             title: "Tokens guessed ahead",
             explainer: "How many tokens the MTP head guesses per step. Automatic (recommended) tunes this live — it guesses deeper while the model keeps accepting the guesses and backs off when it doesn't. Pick a fixed number only if you're measuring performance.",
+            needsRestart: true),
+        "forceMTPOnMoE": .init(
+            title: "Also use MTP on mixture-of-experts models",
+            explainer: "Mixture-of-experts models (e.g. Qwen3.6 35B-A3B) leave their MTP head switched off by default, because checking several guessed tokens at once makes them re-route every expert and that can cost more than it saves. Some MoE heads are good enough to win anyway. Turn this on to use it — and measure: if replies get slower, turn it back off. Models without an MoE layout are unaffected.",
             needsRestart: true),
         "enablePLD": .init(
             title: "Enable PLD (recommended)",

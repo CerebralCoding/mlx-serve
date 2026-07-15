@@ -561,6 +561,53 @@ const func_builtins & value_string_t::get_builtins() const {
             jinja::string str = args.get_pos(0)->as_string();
             return mk_val<value_int>(str.length());
         }},
+        {"format", [](const func_args & args) -> value {
+            // Python str.format — positional fields only ({}, {0}, {1}) plus
+            // {{ / }} escapes. Hunyuan 3 (Hy3) chat templates build every
+            // special token via '<think{}>'.format(HYTK); named fields and
+            // format specs are not implemented.
+            value val_input = args.get_pos(0);
+            if (!is_val<value_string>(val_input)) {
+                throw raised_exception("format() first argument must be a string");
+            }
+            const std::string tmpl = val_input->as_string().str();
+            std::string out;
+            out.reserve(tmpl.size() + 16);
+            size_t auto_idx = 0;
+            size_t i = 0;
+            while (i < tmpl.size()) {
+                char c = tmpl[i];
+                if (c == '{') {
+                    if (i + 1 < tmpl.size() && tmpl[i + 1] == '{') { out += '{'; i += 2; continue; }
+                    size_t close = tmpl.find('}', i + 1);
+                    if (close == std::string::npos) {
+                        throw raised_exception("format() unbalanced '{' in template string");
+                    }
+                    const std::string spec = tmpl.substr(i + 1, close - i - 1);
+                    size_t arg_idx;
+                    if (spec.empty()) {
+                        arg_idx = auto_idx++;
+                    } else {
+                        for (char sc : spec) {
+                            if (sc < '0' || sc > '9') {
+                                throw not_implemented_exception("format() only supports positional {} / {N} fields");
+                            }
+                        }
+                        arg_idx = (size_t) std::stoul(spec);
+                    }
+                    if (arg_idx + 1 >= args.count()) {
+                        throw raised_exception("format() missing positional argument " + std::to_string(arg_idx));
+                    }
+                    out += args.get_pos(arg_idx + 1)->as_string().str();
+                    i = close + 1;
+                    continue;
+                }
+                if (c == '}' && i + 1 < tmpl.size() && tmpl[i + 1] == '}') { out += '}'; i += 2; continue; }
+                out += c;
+                i += 1;
+            }
+            return mk_val<value_string>(jinja::string(out));
+        }},
         {"startswith", [](const func_args & args) -> value {
             args.ensure_vals<value_string, value_string>();
             std::string str = args.get_pos(0)->as_string().str();

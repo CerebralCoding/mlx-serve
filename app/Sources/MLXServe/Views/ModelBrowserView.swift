@@ -156,6 +156,15 @@ private struct RecommendedPane: View {
                 ) {
                     RecommendedFamilyRows(picks: RecommendedModelPick.qwenCatalog, physicalMemoryBytes: physicalMemory)
                 }
+
+                ModelGroupSection(
+                    title: "Hunyuan",
+                    subtitle: "Tencent's flagship 295B — the largest open model this app runs, for Macs with more than 128 GB.",
+                    systemImage: "h.circle",
+                    tint: .red
+                ) {
+                    RecommendedFamilyRows(picks: RecommendedModelPick.hunyuanCatalog, physicalMemoryBytes: physicalMemory)
+                }
             }
             .padding(16)
         }

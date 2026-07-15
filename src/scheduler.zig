@@ -3257,6 +3257,25 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
 /// slot is alive, then markFinished — the conn thread's waitNext might
 /// return immediately after the broadcast and call complete()→deinit, so
 /// we cannot reach into the slot afterwards.
+/// Pure decision for the degenerate-tail-loop guard: when the generated tail
+/// has collapsed into a short repeating cycle, returns the finish reason to
+/// cut the request with; null while generation is healthy.
+///
+/// The reason is "length", NOT "stop": the SERVER is truncating the generation
+/// (the model didn't finish — we cut a runaway loop), and "length" is the one
+/// reason server.toolCallFinishReason preserves through tool-call parsing, so
+/// a call salvaged from the cut buffer reaches the client as a TRUNCATION and
+/// its recovery fires. Live 2026-07-14 (plang/php.html): "stop" became
+/// "tool_calls", presenting a server-cut fragment as a model-completed write.
+pub fn loopStopReason(generated_ids: []const u32) ?[]const u8 {
+    if (generate_mod.isDegenerateTailLoop(
+        generated_ids,
+        generate_mod.degenerate_loop_max_period,
+        generate_mod.degenerate_loop_reps,
+    )) return "length";
+    return null;
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -3846,12 +3865,13 @@ fn runSingleDecodeTick(sch: *Scheduler, slot: *Slot) !void {
     // with no repeat penalty by default and a generous max_tokens, nothing else
     // halts it until the cap. Checked here, before this tick's step, so it
     // covers the regular, PLD, and drafter paths uniformly.
-    if (generate_mod.isDegenerateTailLoop(
-        gen.generated_ids.items,
-        generate_mod.degenerate_loop_max_period,
-        generate_mod.degenerate_loop_reps,
-    )) {
-        finishSlot(sch, slot, "stop");
+    if (loopStopReason(gen.generated_ids.items)) |reason| {
+        // Never cut silently: the 2026-07-14 php.html post-mortem took log
+        // archaeology because this guard left no trace of having fired.
+        log.warn("[loop-stop] degenerate tail loop cut after {d} generated tokens (finish_reason={s})\n", .{
+            gen.generated_ids.items.len, reason,
+        });
+        finishSlot(sch, slot, reason);
         return;
     }
 
@@ -4192,4 +4212,32 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     a.finished = true;
     b.finished = true;
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
+}
+
+test "loopStopReason: a degenerate tail cut reports length, a healthy tail is not cut" {
+    // The reason MUST be "length": the SERVER is truncating the generation
+    // (the model didn't finish — we cut a runaway repetition loop), and
+    // "length" is the one reason server.toolCallFinishReason preserves through
+    // tool-call parsing, so a call salvaged from the cut buffer reaches the
+    // client as a TRUNCATION and its recovery fires. Live 2026-07-14
+    // (plang/php.html): the cut reported "stop" → "tool_calls", presenting a
+    // server-cut fragment as a model-completed write call — pi validated
+    // garbage while the actual cause stayed invisible (the cut also never
+    // logged). Reverting the reason to "stop" turns this red.
+    var ids = std.ArrayList(u32).empty;
+    defer ids.deinit(testing.allocator);
+
+    // Healthy varied tail: never cut.
+    for (0..40) |i| try ids.append(testing.allocator, @as(u32, @intCast(i * 7 + 3)));
+    try testing.expect(loopStopReason(ids.items) == null);
+
+    // Collapse into a short cycle (the php.html shape: "server-side scripting
+    // language, " ≈ a 6-token cycle) past the guard's rep threshold.
+    for (0..generate_mod.degenerate_loop_reps + 1) |_| {
+        for ([_]u32{ 101, 202, 303, 404, 505, 606 }) |t| {
+            try ids.append(testing.allocator, t);
+        }
+    }
+    const reason = loopStopReason(ids.items) orelse return error.TestExpectedLoopCut;
+    try testing.expectEqualStrings("length", reason);
 }

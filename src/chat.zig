@@ -649,6 +649,14 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     } else {
         try buf.appendSlice(allocator, "\"enable_thinking\":false");
     }
+    // Hy3 templates control thinking via `reasoning_effort` (high/low/
+    // no_think), not enable_thinking — and default HIGH when the var is
+    // absent. Always supply the mapped value so thinking-off requests
+    // actually close the think block; templates that don't read it ignore it.
+    try buf.appendSlice(allocator, if (enable_thinking)
+        ",\"reasoning_effort\":\"high\""
+    else
+        ",\"reasoning_effort\":\"no_think\"");
 
     try buf.append(allocator, '}');
     return buf.toOwnedSlice(allocator);
@@ -840,15 +848,140 @@ const TrailingThinkOpen = struct { pos: usize, after: usize };
 fn lastUnclosedThinkOpen(text: []const u8) ?TrailingThinkOpen {
     var from: usize = 0;
     while (nextThinkOpen(text, from)) |o| {
-        const close_tag: []const u8 = if (o.is_think_style) "</think>" else "<channel|>";
-        if (std.mem.indexOfPos(u8, text, o.after, close_tag)) |close_pos| {
+        const close = if (o.is_think_style)
+            indexOfThinkCloseTag(text, o.after)
+        else if (std.mem.indexOfPos(u8, text, o.after, "<channel|>")) |p|
+            TagAt{ .pos = p, .len = "<channel|>".len }
+        else
+            null;
+        if (close) |c| {
             // This block IS closed — keep scanning past its close.
-            from = close_pos + close_tag.len;
+            from = c.pos + c.len;
             continue;
         }
         return .{ .pos = o.pos, .after = o.after };
     }
     return null;
+}
+
+// ── Suffixed think/tool tag matching (Hy3 / Hunyuan 3) ──
+//
+// Hy3 templates suffix every control tag with a release marker:
+// `<think:opensource>`, `</think:opensource>`, `<tool_call:opensource>`, …
+// (HYTK in chat_template.jinja; future releases may carry a different
+// suffix). The helpers below match `BASE>` or `BASE:[A-Za-z0-9_-]+>` so the
+// shared think machinery handles both the canonical and suffixed families
+// without hardcoding any specific suffix.
+
+pub const TagAt = struct { pos: usize, len: usize };
+
+fn tagSuffixChar(c: u8) bool {
+    return (c >= 'a' and c <= 'z') or (c >= 'A' and c <= 'Z') or
+        (c >= '0' and c <= '9') or c == '_' or c == '-';
+}
+
+/// Length of a complete tag at the START of `text` whose base is `base`
+/// (e.g. base "<think" matches "<think>" and "<think:opensource>").
+fn suffixedTagLenAt(text: []const u8, comptime base: []const u8) ?usize {
+    if (!std.mem.startsWith(u8, text, base)) return null;
+    var i: usize = base.len;
+    if (i < text.len and text[i] == '>') return i + 1;
+    if (i >= text.len or text[i] != ':') return null;
+    i += 1;
+    const suffix_start = i;
+    while (i < text.len) : (i += 1) {
+        const c = text[i];
+        if (c == '>') return if (i > suffix_start) i + 1 else null;
+        if (!tagSuffixChar(c)) return null;
+    }
+    return null;
+}
+
+/// True when `text` could still GROW into a `base`-tag with more streamed
+/// bytes (strict prefix: "<th", "<think", "<think:", "<think:opensou").
+fn isPartialSuffixedTag(text: []const u8, comptime base: []const u8) bool {
+    if (text.len == 0) return false;
+    if (text.len <= base.len) return std.mem.startsWith(u8, base, text);
+    if (!std.mem.startsWith(u8, text, base)) return false;
+    if (text[base.len] != ':') return false;
+    for (text[base.len + 1 ..]) |c| {
+        if (!tagSuffixChar(c)) return false;
+    }
+    return true;
+}
+
+pub fn thinkOpenTagLenAt(text: []const u8) ?usize {
+    return suffixedTagLenAt(text, "<think");
+}
+
+pub fn thinkCloseTagLenAt(text: []const u8) ?usize {
+    return suffixedTagLenAt(text, "</think");
+}
+
+fn indexOfThinkOpenTag(text: []const u8, from: usize) ?TagAt {
+    var i = from;
+    while (std.mem.indexOfPos(u8, text, i, "<think")) |p| {
+        if (thinkOpenTagLenAt(text[p..])) |l| return .{ .pos = p, .len = l };
+        i = p + "<think".len;
+    }
+    return null;
+}
+
+pub fn indexOfThinkCloseTag(text: []const u8, from: usize) ?TagAt {
+    var i = from;
+    while (std.mem.indexOfPos(u8, text, i, "</think")) |p| {
+        if (thinkCloseTagLenAt(text[p..])) |l| return .{ .pos = p, .len = l };
+        i = p + "</think".len;
+    }
+    return null;
+}
+
+/// Length of the trailing bytes of `buf` that could still GROW into a think
+/// close tag with more streamed bytes — either family: `</think>`, the
+/// Hy3-suffixed `</think:opensource>`, or Gemma's `<channel|>`. Streaming
+/// reasoning flushes must hold this suffix back: flushing half a close tag
+/// splits it across the flush boundary, so the retained remainder never
+/// matches and the stream stays "inside thinking" forever (tag bytes leak
+/// into reasoning_content). 0 = safe to flush everything.
+pub fn partialThinkCloseSuffixLen(buf: []const u8) usize {
+    // Any real close tag is well under 32 bytes; a longer '<'-run is prose.
+    const window_start = if (buf.len > 32) buf.len - 32 else 0;
+    var i = buf.len;
+    while (i > window_start) {
+        i -= 1;
+        if (buf[i] != '<') continue;
+        const tail = buf[i..];
+        if (isPartialSuffixedTag(tail, "</think")) return tail.len;
+        if (tail.len < "<channel|>".len and std.mem.startsWith(u8, "<channel|>", tail)) return tail.len;
+    }
+    return 0;
+}
+
+test "partialThinkCloseSuffixLen holds back growing close tags, ignores prose" {
+    try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("plain reasoning text"));
+    try testing.expectEqual(@as(usize, 7), partialThinkCloseSuffixLen("thinking…</think"));
+    try testing.expectEqual(@as(usize, 15), partialThinkCloseSuffixLen("thinking…</think:opensou"));
+    try testing.expectEqual(@as(usize, 5), partialThinkCloseSuffixLen("thinking…<chan"));
+    // A COMPLETE tag is not a partial — the scan-side indexOf owns it.
+    try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("done</think:opensource>"));
+    // A '<' too far back is prose, not a growing tag.
+    try testing.expectEqual(@as(usize, 0), partialThinkCloseSuffixLen("a < b and then lots of ordinary words follow here"));
+}
+
+/// Tag length when `text` ENDS with a complete think-close tag.
+fn endsWithThinkCloseTag(text: []const u8) ?usize {
+    if (text.len == 0 or text[text.len - 1] != '>') return null;
+    const lt = std.mem.lastIndexOfScalar(u8, text, '<') orelse return null;
+    const l = thinkCloseTagLenAt(text[lt..]) orelse return null;
+    return if (lt + l == text.len) l else null;
+}
+
+/// Tag length when `text` ENDS with a complete think-open tag.
+fn endsWithThinkOpenTag(text: []const u8) ?usize {
+    if (text.len == 0 or text[text.len - 1] != '>') return null;
+    const lt = std.mem.lastIndexOfScalar(u8, text, '<') orelse return null;
+    const l = thinkOpenTagLenAt(text[lt..]) orelse return null;
+    return if (lt + l == text.len) l else null;
 }
 
 /// Strip `<think>...</think>` or `<|channel>thought\n...<channel|>` block from model output.
@@ -873,8 +1006,8 @@ fn trimTrailingThinkClosers(content: []const u8) []const u8 {
         const t = std.mem.trimEnd(u8, s, "\n \t\r");
         if (std.mem.endsWith(u8, t, "<channel|>")) {
             s = t[0 .. t.len - "<channel|>".len];
-        } else if (std.mem.endsWith(u8, t, "</think>")) {
-            s = t[0 .. t.len - "</think>".len];
+        } else if (endsWithThinkCloseTag(t)) |l| {
+            s = t[0 .. t.len - l];
         } else {
             return t;
         }
@@ -896,11 +1029,11 @@ fn stripThinkBlockLeading(text: []const u8) []const u8 {
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
         return std.mem.trimStart(u8, text[end + 10 ..], "\n ");
     }
-    // Standard style: <think>...</think>
-    if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
-        return std.mem.trimStart(u8, text[think_end + 8 ..], "\n ");
+    // Standard style: <think>...</think> (or the Hy3-suffixed variant)
+    if (indexOfThinkCloseTag(text, 0)) |c| {
+        return std.mem.trimStart(u8, text[c.pos + c.len ..], "\n ");
     }
-    if (std.mem.startsWith(u8, text, "<think>")) return text[0..0];
+    if (thinkOpenTagLenAt(text) != null) return text[0..0];
     if (std.mem.startsWith(u8, text, "<|channel>thought")) return text[0..0];
     return text;
 }
@@ -916,7 +1049,7 @@ pub const ThinkSplit = struct {
 /// render ends with a CLOSED `</think>` block and must not match.
 pub fn promptTailOpensThink(tail: []const u8) bool {
     const trimmed = std.mem.trimEnd(u8, tail, "\n\r\t ");
-    return std.mem.endsWith(u8, trimmed, "<think>");
+    return endsWithThinkOpenTag(trimmed) != null;
 }
 
 /// Split model output into reasoning_content and content.
@@ -946,11 +1079,11 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: boo
             .content = trimTrailingThinkClosers(stripTrailingThinkOpen(content)),
         };
     }
-    // Standard style: <think>...</think>
-    if (std.mem.indexOf(u8, text, "</think>")) |end| {
-        const reasoning_start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else 0;
-        const reasoning = std.mem.trim(u8, text[reasoning_start..end], "\n ");
-        const content = std.mem.trimStart(u8, text[end + 8 ..], "\n ");
+    // Standard style: <think>...</think> (or the Hy3-suffixed variant)
+    if (indexOfThinkCloseTag(text, 0)) |close| {
+        const reasoning_start: usize = thinkOpenTagLenAt(text) orelse 0;
+        const reasoning = std.mem.trim(u8, text[reasoning_start..close.pos], "\n ");
+        const content = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
         return .{
             .reasoning_content = if (reasoning.len > 0) reasoning else null,
             .content = trimTrailingThinkClosers(stripTrailingThinkOpen(content)),
@@ -966,8 +1099,8 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: boo
         //     an unclosed tail is truncated reasoning, never content.
         //   • No literal opener + no template opener → the model answered
         //     directly (Gemma style); keep the answer visible as content.
-        if (std.mem.startsWith(u8, text, "<think>") or std.mem.startsWith(u8, text, "<|channel>thought")) {
-            const start: usize = if (std.mem.startsWith(u8, text, "<think>")) 7 else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else "<|channel>thought".len;
+        if (thinkOpenTagLenAt(text) != null or std.mem.startsWith(u8, text, "<|channel>thought")) {
+            const start: usize = if (thinkOpenTagLenAt(text)) |l| l else if (std.mem.startsWith(u8, text, "<|channel>thought\n")) "<|channel>thought\n".len else "<|channel>thought".len;
             const reasoning = std.mem.trimStart(u8, text[start..], "\n ");
             return .{ .reasoning_content = if (reasoning.len > 0) reasoning else null, .content = "" };
         }
@@ -1004,26 +1137,27 @@ pub fn splitThinkBlock(text: []const u8, thinking: bool, opened_by_template: boo
 
 const ThinkOpen = struct { pos: usize, after: usize, is_think_style: bool };
 
-/// Earliest think/thought opener at or after `from` (either tag family).
+/// Earliest think/thought opener at or after `from` (either tag family;
+/// the think style covers both `<think>` and the Hy3-suffixed form).
 fn nextThinkOpen(text: []const u8, from: usize) ?ThinkOpen {
     const chan = std.mem.indexOfPos(u8, text, from, "<|channel>thought");
-    const think = std.mem.indexOfPos(u8, text, from, "<think>");
+    const think = indexOfThinkOpenTag(text, from);
     if (chan == null and think == null) return null;
-    if (think == null or (chan != null and chan.? < think.?)) {
+    if (think == null or (chan != null and chan.? < think.?.pos)) {
         return .{ .pos = chan.?, .after = chan.? + "<|channel>thought".len, .is_think_style = false };
     }
-    return .{ .pos = think.?, .after = think.? + "<think>".len, .is_think_style = true };
+    return .{ .pos = think.?.pos, .after = think.?.pos + think.?.len, .is_think_style = true };
 }
 
 /// Earliest close tag at or after `from` (either tag family).
 fn nextThinkClose(text: []const u8, from: usize) ?ThinkOpen {
     const chan = std.mem.indexOfPos(u8, text, from, "<channel|>");
-    const think = std.mem.indexOfPos(u8, text, from, "</think>");
+    const think = indexOfThinkCloseTag(text, from);
     if (chan == null and think == null) return null;
-    if (think == null or (chan != null and chan.? < think.?)) {
+    if (think == null or (chan != null and chan.? < think.?.pos)) {
         return .{ .pos = chan.?, .after = chan.? + "<channel|>".len, .is_think_style = false };
     }
-    return .{ .pos = think.?, .after = think.? + "</think>".len, .is_think_style = true };
+    return .{ .pos = think.?.pos, .after = think.?.pos + think.?.len, .is_think_style = true };
 }
 
 /// Skip an optional Gemma 4 CONTENT channel opener (`<|channel>` not followed
@@ -1148,6 +1282,12 @@ pub fn endsWithPartialThinkOpen(buf: []const u8) bool {
             if (std.mem.endsWith(u8, buf, tag[0..l])) return true;
         }
     }
+    // Hy3-suffixed opener mid-stream (`…<think:opensou`): everything from the
+    // last `<` must be a valid growing prefix of `<think:suffix>`.
+    if (std.mem.lastIndexOfScalar(u8, buf, '<')) |lt| {
+        const tail = buf[lt..];
+        if (tail.len > "<think".len and isPartialSuffixedTag(tail, "<think")) return true;
+    }
     return false;
 }
 
@@ -1224,7 +1364,7 @@ pub const StreamThinkGate = enum { flush_text, hold_thinking, split_think };
 pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: bool) StreamThinkGate {
     const has_thinking = (enable_thinking and !think_closed) or
         std.mem.indexOf(u8, buf, "<|channel>thought") != null or
-        std.mem.indexOf(u8, buf, "<think>") != null or
+        indexOfThinkOpenTag(buf, 0) != null or
         (std.mem.startsWith(u8, buf, "<|channel>") and buf.len < 18) or
         (std.mem.startsWith(u8, buf, "<think") and buf.len < 7) or
         // A partial opener at the buffer TAIL (mid-text re-opened channel
@@ -1233,7 +1373,7 @@ pub fn streamThinkGate(buf: []const u8, enable_thinking: bool, think_closed: boo
         endsWithPartialThinkOpen(buf);
     if (!has_thinking) return .flush_text;
     const has_close = std.mem.indexOf(u8, buf, "<channel|>") != null or
-        std.mem.indexOf(u8, buf, "</think>") != null;
+        indexOfThinkCloseTag(buf, 0) != null;
     return if (has_close) .split_think else .hold_thinking;
 }
 
@@ -1243,8 +1383,8 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     var effective_text = text;
     if (std.mem.indexOf(u8, text, "<channel|>")) |end| {
         effective_text = std.mem.trimStart(u8, text[end + 10 ..], "\n ");
-    } else if (std.mem.indexOf(u8, text, "</think>")) |think_end| {
-        effective_text = std.mem.trimStart(u8, text[think_end + 8 ..], "\n ");
+    } else if (indexOfThinkCloseTag(text, 0)) |close| {
+        effective_text = std.mem.trimStart(u8, text[close.pos + close.len ..], "\n ");
     }
 
     var calls = std.ArrayList(ParsedToolCall).empty;
@@ -1278,7 +1418,14 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // When the body fails to parse, advance only past the OPENING `>` so any
     // inner `<tool…>` blocks get a chance — this is what makes the outer
     // `<tool_calls>` wrapper case work.
-    var search_pos: usize = 0;
+    //
+    // Hy3 (Hunyuan 3) SUFFIXED tag format is tried FIRST: its wrapper
+    // (`<tool_calls:opensource>`) would also trip the generic `<tool` scan
+    // below, which would misread the non-JSON arg_key/arg_value body. When it
+    // matched, the generic scans are skipped but the shared safety net at the
+    // bottom still runs.
+    try parseHy3ToolCalls(allocator, effective_text, &calls);
+    var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
         const rel = std.mem.indexOf(u8, effective_text[search_pos..], "<tool") orelse break;
         const after_tool = search_pos + rel + "<tool".len;
@@ -1565,7 +1712,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             else
                 effective_text.len;
 
-            if (parseGemma4ToolCall(allocator, content)) |tc| {
+            // No <tool_call|> close = the generation was CUT mid-call (EOS,
+            // max_tokens, or the degenerate-tail-loop guard) — fragment values
+            // are dropped inside the parse, only completed args ship.
+            if (parseGemma4ToolCall(allocator, content, tag_end_opt == null)) |tc| {
                 try calls.append(allocator, tc);
             } else {
                 log.info("  [tool-parse] Gemma4 parse FAILED for: {s}\n", .{content[0..@min(content.len, 200)]});
@@ -2582,6 +2732,99 @@ fn parseXmlElementArgsJson(allocator: std.mem.Allocator, body: []const u8) ?[]u8
     return std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{}) catch null;
 }
 
+/// Hy3 (Hunyuan 3) tag-format tool calls (chat_template.jinja spec):
+///   <tool_calls:SFX>
+///   <tool_call:SFX>NAME<tool_sep:SFX>
+///   <arg_key:SFX>KEY</arg_key:SFX>
+///   <arg_value:SFX>VALUE</arg_value:SFX> …
+///   </tool_call:SFX> …
+///   </tool_calls:SFX>
+/// Only the SUFFIXED form (`<tool_call:` …) is handled here — bare
+/// `<tool_call>` is Hermes JSON and stays with the generic scan. Values are
+/// kept as RAW STRINGS: the template `tojson`s non-string values on the way
+/// in, and the schema-driven coercion at the server chokepoint types them on
+/// the way back (types come from the SCHEMA, never the value's spelling).
+/// Args build through ObjectMap + Stringify — keys escaped, duplicates
+/// first-wins — per the tag-format-converter class rule. Truncation
+/// (max_tokens mid-call, the big-file-write class): a call whose name is
+/// delimited by `<tool_sep` recovers with its CLOSED key/value pairs only;
+/// partial values are never salvaged.
+fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, text, pos, "<tool_call")) |p| {
+        const after_base = p + "<tool_call".len;
+        // Suffixed form only: `<tool_call:sfx>`. Bare `<tool_call>` (Hermes)
+        // and the plural wrapper `<tool_calls:sfx>` fall through.
+        if (after_base >= text.len or text[after_base] != ':') {
+            pos = after_base;
+            continue;
+        }
+        const open_len = suffixedTagLenAt(text[p..], "<tool_call") orelse {
+            pos = after_base;
+            continue;
+        };
+        const name_start = p + open_len;
+
+        // NAME runs to the <tool_sep:sfx> tag. No sep prefix at all → the cut
+        // happened inside the name; nothing trustworthy to recover.
+        const sep_pos = std.mem.indexOfPos(u8, text, name_start, "<tool_sep") orelse {
+            pos = name_start;
+            continue;
+        };
+        const name = std.mem.trim(u8, text[name_start..sep_pos], " \t\n\r");
+        if (name.len == 0) {
+            pos = name_start;
+            continue;
+        }
+
+        var args_map: std.json.ObjectMap = .empty;
+        defer args_map.deinit(allocator);
+
+        // A truncated/malformed sep tag still recovers the NAME (empty args).
+        var i: usize = undefined;
+        if (suffixedTagLenAt(text[sep_pos..], "<tool_sep")) |sep_len| {
+            i = sep_pos + sep_len;
+            while (true) {
+                while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+                if (i >= text.len) break;
+                if (std.mem.startsWith(u8, text[i..], "</tool_call")) break;
+                const ak_len = suffixedTagLenAt(text[i..], "<arg_key") orelse break;
+                const key_start = i + ak_len;
+                const ak_close = std.mem.indexOfPos(u8, text, key_start, "</arg_key") orelse break;
+                const ak_close_len = suffixedTagLenAt(text[ak_close..], "</arg_key") orelse break;
+                const key = std.mem.trim(u8, text[key_start..ak_close], " \t\n\r");
+                i = ak_close + ak_close_len;
+                while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+                if (i >= text.len) break;
+                const av_len = suffixedTagLenAt(text[i..], "<arg_value") orelse break;
+                const val_start = i + av_len;
+                const av_close = std.mem.indexOfPos(u8, text, val_start, "</arg_value") orelse break;
+                const av_close_len = suffixedTagLenAt(text[av_close..], "</arg_value") orelse break;
+                const value = text[val_start..av_close];
+                i = av_close + av_close_len;
+                if (key.len > 0 and args_map.getEntry(key) == null) {
+                    try args_map.put(allocator, key, .{ .string = value });
+                }
+            }
+        } else {
+            i = sep_pos + "<tool_sep".len;
+        }
+
+        const args_str = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{});
+        errdefer allocator.free(args_str);
+        const name_owned = try allocator.dupe(u8, name);
+        errdefer allocator.free(name_owned);
+        try calls.append(allocator, .{ .name = name_owned, .arguments = args_str });
+
+        if (std.mem.indexOfPos(u8, text, i, "</tool_call")) |cl| {
+            const cl_len = suffixedTagLenAt(text[cl..], "</tool_call") orelse 0;
+            pos = if (cl_len > 0) cl + cl_len else cl + "</tool_call".len;
+        } else {
+            pos = i;
+        }
+    }
+}
+
 fn parseXmlElementToolCall(allocator: std.mem.Allocator, body: []const u8) ?ParsedToolCall {
     var name: ?[]const u8 = null;
     var args_map: std.json.ObjectMap = .empty;
@@ -3208,7 +3451,13 @@ fn sanitizeToolName(raw: []const u8) []const u8 {
 }
 
 /// Parse Gemma 4 tool call format: "call:function_name{json_args}"
-fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?ParsedToolCall {
+/// `input_truncated`: the call had NO `<tool_call|>` close tag — the
+/// generation was cut (EOS mid-call, max_tokens, or the scheduler's
+/// degenerate-tail-loop guard). Under truncation, a value whose scan runs to
+/// end-of-body without its terminator is a FRAGMENT and is dropped (the
+/// Hermes-truncation rule: a half-written file is worse than a re-issued
+/// write); with the close tag present, behavior is byte-identical to before.
+fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8, input_truncated: bool) ?ParsedToolCall {
     const prefix = "call:";
     if (!std.mem.startsWith(u8, content, prefix)) return null;
     const after_prefix = content[prefix.len..];
@@ -3256,7 +3505,7 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?Parse
 
     // Convert Gemma 4 custom format to JSON:
     // {key:<|"|>value<|"|>,key2:<|"|>value2<|"|>} → {"key":"value","key2":"value2"}
-    const json = convertGemma4ArgsToJson(allocator, args_str) orelse {
+    const json = convertGemma4ArgsToJson(allocator, args_str, input_truncated) orelse {
         log.info("  [tool-parse] convertGemma4ArgsToJson FAILED for: {s}\n", .{args_str[0..@min(args_str.len, 200)]});
         return null;
     };
@@ -3275,10 +3524,13 @@ fn parseGemma4ToolCall(allocator: std.mem.Allocator, content: []const u8) ?Parse
 /// recursively — see `convertGemma4Value`. Nested structures that already use
 /// valid JSON (regular `"…"` strings, numbers, bools, null) pass through
 /// unchanged. The args are always an object, with or without a literal `{…}`.
-fn convertGemma4ArgsToJson(allocator: std.mem.Allocator, input: []const u8) ?[]const u8 {
+fn convertGemma4ArgsToJson(allocator: std.mem.Allocator, input: []const u8, input_truncated: bool) ?[]const u8 {
     var result = std.ArrayList(u8).empty;
     errdefer result.deinit(allocator);
-    _ = convertGemma4Object(allocator, &result, input, 0, 0) orelse return null;
+    // `cut` = the truncation landed INSIDE a value somewhere below; the pair
+    // holding it has already been rolled back (fragment values never ship).
+    var cut = false;
+    _ = convertGemma4Object(allocator, &result, input, 0, 0, input_truncated, &cut) orelse return null;
     return result.toOwnedSlice(allocator) catch return null;
 }
 
@@ -3317,6 +3569,8 @@ fn convertGemma4Object(
     body: []const u8,
     start: usize,
     depth: usize,
+    input_truncated: bool,
+    cut: *bool,
 ) ?usize {
     if (depth >= gemma4_max_depth) return null;
     var pos = gemma4SkipWs(body, start);
@@ -3329,12 +3583,14 @@ fn convertGemma4Object(
     var seen = std.ArrayList([]const u8).empty;
     defer seen.deinit(allocator);
 
+    var closed = false;
     var first = true;
     while (pos < body.len) {
         pos = gemma4SkipWsCommas(body, pos);
         if (pos >= body.len) break;
         if (body[pos] == '}') {
             pos += 1;
+            closed = true;
             break;
         }
 
@@ -3357,7 +3613,17 @@ fn convertGemma4Object(
         appendJsonString(allocator, result, key) catch return null;
         result.append(allocator, ':') catch return null;
 
-        pos = convertGemma4Value(allocator, result, body, pos, depth) orelse return null;
+        pos = convertGemma4Value(allocator, result, body, pos, depth, input_truncated, cut) orelse return null;
+
+        // The truncation landed INSIDE this value — it is a fragment (partial
+        // file content, partial url) and must never ship as a real argument
+        // (the Hermes-truncation rule, extended to the Gemma arm 2026-07-14:
+        // php.html loop-stop capture). Roll the whole pair back; the scan
+        // consumed to end-of-body, so this object is done.
+        if (cut.*) {
+            result.shrinkRetainingCapacity(mark); // undo comma+key+value; keep `first`
+            break;
+        }
 
         var is_dup = false;
         for (seen.items) |s| {
@@ -3374,6 +3640,13 @@ fn convertGemma4Object(
         first = false;
     }
 
+    // A NESTED object the cut landed inside (it never saw its `}`) is itself a
+    // fragment — even when every pair inside completed, more were coming; the
+    // parent rolls the whole container back. The ROOT object (depth 0) is
+    // exempt: pairs completed before the cut are intact values and survive —
+    // only the value holding the cut drops.
+    if (input_truncated and depth > 0 and !closed) cut.* = true;
+
     result.append(allocator, '}') catch return null;
     return pos;
 }
@@ -3386,23 +3659,35 @@ fn convertGemma4Array(
     body: []const u8,
     start: usize,
     depth: usize,
+    input_truncated: bool,
+    cut: *bool,
 ) ?usize {
     if (depth >= gemma4_max_depth) return null;
     var pos = start + 1; // consume '['
     result.append(allocator, '[') catch return null;
 
+    var closed = false;
     var first = true;
     while (pos < body.len) {
         pos = gemma4SkipWsCommas(body, pos);
         if (pos >= body.len) break;
         if (body[pos] == ']') {
             pos += 1;
+            closed = true;
             break;
         }
         if (!first) result.append(allocator, ',') catch return null;
         first = false;
-        pos = convertGemma4Value(allocator, result, body, pos, depth) orelse return null;
+        pos = convertGemma4Value(allocator, result, body, pos, depth, input_truncated, cut) orelse return null;
+        // Fragment below: stop consuming; the parent object rolls the whole
+        // container pair back, so no local cleanup is needed.
+        if (cut.*) break;
     }
+
+    // Same fragment rule as nested objects: an unclosed array under truncation
+    // is a partial LIST — more elements were coming (a partial edits[] applies
+    // fragmentary work, the same hazard as partial file content).
+    if (input_truncated and !closed) cut.* = true;
 
     result.append(allocator, ']') catch return null;
     return pos;
@@ -3417,9 +3702,18 @@ fn convertGemma4Value(
     body: []const u8,
     start: usize,
     depth: usize,
+    input_truncated: bool,
+    cut: *bool,
 ) ?usize {
     var pos = gemma4SkipWs(body, start);
     if (pos >= body.len) {
+        // `key:` then end-of-body. Under truncation the value is a fragment
+        // that never arrived — drop the pair (pre-fix this shipped
+        // {"path":""} and a client would act on the bogus empty value).
+        if (input_truncated) {
+            cut.* = true;
+            return pos;
+        }
         result.appendSlice(allocator, "\"\"") catch return null;
         return pos;
     }
@@ -3432,11 +3726,21 @@ fn convertGemma4Value(
         pos += gemma4_str_delim.len;
         const end_idx = std.mem.indexOf(u8, body[pos..], gemma4_str_delim);
         const value = if (end_idx) |e| body[pos .. pos + e] else blk: {
-            // Closing <|"|> missing. A plain to-end-of-body scan swallows the
-            // args object's own `}` and any stray fence garbage the model
-            // tacked on — a real write call reached disk as "mlx_pi1.html`}".
-            // Trim one trailing `}` (the enclosing object's closer) plus
-            // surrounding backtick/whitespace junk.
+            // Closing <|"|> missing.
+            if (input_truncated) {
+                // The call itself was cut (no <tool_call|>): the truncation
+                // landed INSIDE this string — a fragment (partial file
+                // content, partial url) that must never ship as a real
+                // argument (live 2026-07-14 php.html: the loop-stop guard cut
+                // a write call mid-`content` and the 1.1 KB fragment shipped).
+                cut.* = true;
+                return body.len;
+            }
+            // Complete call (close tag present), delimiter just dropped: a
+            // plain to-end-of-body scan swallows the args object's own `}`
+            // and any stray fence garbage the model tacked on — a real write
+            // call reached disk as "mlx_pi1.html`}". Trim one trailing `}`
+            // (the enclosing object's closer) plus backtick/whitespace junk.
             var v = std.mem.trimEnd(u8, body[pos..], " \t\n\r");
             if (std.mem.endsWith(u8, v, "}")) v = v[0 .. v.len - 1];
             v = std.mem.trimEnd(u8, v, "` \t\n\r");
@@ -3453,28 +3757,45 @@ fn convertGemma4Value(
     // Regular JSON string: already valid, copy verbatim (respecting \" escapes).
     if (body[pos] == '"') {
         var end = pos + 1;
+        var closed_quote = false;
         while (end < body.len) : (end += 1) {
             if (body[end] == '\\' and end + 1 < body.len) {
                 end += 1;
                 continue;
             }
             if (body[end] == '"') {
+                closed_quote = true;
                 end += 1;
                 break;
             }
+        }
+        // Unclosed JSON string at end-of-body under truncation: same fragment
+        // rule — and copying it verbatim would emit an UNCLOSED string, i.e.
+        // invalid JSON that only the {}-fallback safety net could catch.
+        if (!closed_quote and input_truncated) {
+            cut.* = true;
+            return body.len;
         }
         result.appendSlice(allocator, body[pos..end]) catch return null;
         return end;
     }
 
-    if (body[pos] == '{') return convertGemma4Object(allocator, result, body, pos, depth + 1);
-    if (body[pos] == '[') return convertGemma4Array(allocator, result, body, pos, depth + 1);
+    if (body[pos] == '{') return convertGemma4Object(allocator, result, body, pos, depth + 1, input_truncated, cut);
+    if (body[pos] == '[') return convertGemma4Array(allocator, result, body, pos, depth + 1, input_truncated, cut);
 
     // Bare value — a JSON literal (number/bool/null) terminates at the
     // enclosing separator and is emitted verbatim.
-    const first_sep = std.mem.indexOfAny(u8, body[pos..], ",}]") orelse (body.len - pos);
+    const sep_rel = std.mem.indexOfAny(u8, body[pos..], ",}]");
+    const first_sep = sep_rel orelse (body.len - pos);
     const head = std.mem.trim(u8, body[pos .. pos + first_sep], " \t\n\r");
     if (isJsonLiteral(head)) {
+        // A literal that ran to end-of-body under truncation has no
+        // terminator either — uniform fragment rule (a cut `5` may have been
+        // `50`; the client re-asks and gets the real value).
+        if (sep_rel == null and input_truncated) {
+            cut.* = true;
+            return body.len;
+        }
         result.appendSlice(allocator, head) catch return null;
         return pos + first_sep;
     }
@@ -3503,7 +3824,16 @@ fn convertGemma4Value(
                 return pos + close_rel + gemma4_str_delim.len;
             }
         }
-        // No usable closing delimiter (both dropped). At the TOP level the value
+        // No usable closing delimiter at all. Under truncation the rest of the
+        // body IS the fragment: consuming to the first comma would ship a
+        // partial value AND shred the remainder into bogus keys, and the
+        // last-`}` heuristic below would cut a truncated page at some interior
+        // CSS brace — drop the whole value instead.
+        if (input_truncated) {
+            cut.* = true;
+            return body.len;
+        }
+        // Complete call, both delimiters dropped. At the TOP level the value
         // runs to the object's closing `}` (the last one); nested values keep
         // the narrow scan since the outer `}` isn't theirs.
         if (depth == 0) {
@@ -3515,6 +3845,13 @@ fn convertGemma4Value(
                 }
             }
         }
+    }
+
+    // A short bare string that ran to end-of-body under truncation is a
+    // fragment too (`command:ls -la` cut mid-flags) — uniform rule.
+    if (sep_rel == null and input_truncated) {
+        cut.* = true;
+        return body.len;
     }
 
     // Plain short bare string — terminate at the first separator (unchanged).
@@ -4970,9 +5307,15 @@ test "parseToolCalls Gemma 4 truncated (no closing tag)" {
     try testing.expectEqualStrings("browse", parsed.value.object.get("action").?.string);
 }
 
-test "parseToolCalls Gemma 4 truncated mid-value" {
+test "parseToolCalls Gemma 4 truncated mid-value drops the partial value" {
     const allocator = testing.allocator;
-    // Model stopped mid-URL, no closing <|"|> for the value
+    // Model stopped mid-URL: no closing <|"|>, no `}`, no <tool_call|>. POLICY
+    // (2026-07-14, aligned with the Hermes truncation rule): a value whose scan
+    // runs to end-of-body without its terminator is a truncation FRAGMENT —
+    // partial bytes must never ship as a real argument (a client executes them:
+    // a fragmentary url browses garbage, a fragmentary content writes a corrupt
+    // file "successfully"). The completed pair before it survives, and the tool
+    // NAME is always recovered so the client's steering fires.
     const text = "<|tool_call>call:browse{action:<|\"|>navigate<|\"|>,url:<|\"|>https://finance.";
     const calls = (try parseToolCalls(allocator, text)).?;
     defer {
@@ -4984,12 +5327,170 @@ test "parseToolCalls Gemma 4 truncated mid-value" {
     }
     try testing.expectEqual(@as(usize, 1), calls.len);
     try testing.expectEqualStrings("browse", calls[0].name);
-    // Should have parsed the complete action and the truncated URL
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
     defer parsed.deinit();
     try testing.expectEqualStrings("navigate", parsed.value.object.get("action").?.string);
-    // URL should be present (truncated but captured)
-    try testing.expect(parsed.value.object.get("url") != null);
+    // The truncated URL must be DROPPED, never shipped as partial bytes.
+    try testing.expect(parsed.value.object.get("url") == null);
+}
+
+test "parseToolCalls Gemma 4 loop-stop truncated content dropped, name recovered (php.html capture)" {
+    const allocator = testing.allocator;
+    // Live 2026-07-14 (pi → gemma-4-26B-A4B-it-qat-4bit, plang/php.html): the
+    // model repetition-looped INSIDE the write call's content string and the
+    // scheduler's degenerate-tail-loop guard cut generation mid-word — the
+    // buffered call arrived with NO closing delimiter, NO `}`, NO <tool_call|>,
+    // and `path` never emitted at all. Pre-fix the salvage shipped
+    // {"content":"<1.1 KB of loop garbage>"}; pi rejected the call on the
+    // missing path and echoed the garbage back into the model's context.
+    const text = "<|tool_call>call:write{content:<|\"|><!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <title>PHP</title>\n</head>\n<body>\n    <p>PHP is a widely-used general-purpose scripting language. It is a server-side scripting language, server-side scripting language, server-side scripting language, server-";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value == .object);
+    try testing.expect(parsed.value.object.get("content") == null);
+    try testing.expect(parsed.value.object.get("path") == null);
+}
+
+test "parseToolCalls Gemma 4 truncated content after a complete path keeps path, drops fragment" {
+    const allocator = testing.allocator;
+    // The ordering that would CORRUPT a file: `path` completed BEFORE the cut.
+    // Pre-fix salvage = {path, <partial garbage content>} — a schema-valid call
+    // the client executes, writing a fragment to a real path and reporting
+    // success. The completed path survives (the client's missing-content error
+    // steers a clean re-issue); the fragment never ships.
+    const text = "<|tool_call>call:write{path:<|\"|>plang/php.html<|\"|>,content:<|\"|><!DOCTYPE html>\n<p>PHP is a server-side scripting language, server-side scripting language, server-";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("plang/php.html", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls Gemma 4 bare rich value truncated at end-of-body is dropped" {
+    const allocator = testing.allocator;
+    // Both <|"|> delimiters dropped AND the generation truncated (no `}`, no
+    // close tag anywhere in the rest): the run-to-end scan must not ship the
+    // fragment as content.
+    const text = "<|tool_call>call:write{content:<!DOCTYPE html>\n<h1>Hi</h1>\n<p>cut mid-";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls Gemma 4 truncated edits container dropped, complete path kept" {
+    const allocator = testing.allocator;
+    // Cut INSIDE a container arg (pi-style edits array): the list is a fragment
+    // — more edits were coming — and applying a partial edit list is the same
+    // fragmentary-work hazard as partial content. The whole container drops;
+    // the completed scalar before it survives.
+    const text = "<|tool_call>call:edit{path:<|\"|>a.sh<|\"|>,edits:[{oldText:<|\"|>x<|\"|>,newText:<|\"|>y<|\"|>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("edit", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a.sh", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("edits") == null);
+}
+
+test "parseToolCalls Gemma 4 EOS after a complete pair keeps the pair (no over-drop)" {
+    const allocator = testing.allocator;
+    // Truncation landing BETWEEN pairs (after a completed value + comma) must
+    // not over-drop: only the value the cut landed INSIDE is a fragment.
+    const text = "<|tool_call>call:write{path:<|\"|>a.html<|\"|>,";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a.html", parsed.value.object.get("path").?.string);
+}
+
+test "parseToolCalls Gemma 4 EOS right after the key colon drops the key" {
+    const allocator = testing.allocator;
+    // `path:` then nothing — pre-fix this shipped {"path":""} and a client
+    // would create a file with an EMPTY name (or reject on a bogus value).
+    // An absent value is a fragment; drop the key, recover the name.
+    const text = "<|tool_call>call:write{path:";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expect(parsed.value.object.get("path") == null);
+}
+
+test "parseToolCalls Gemma 4 JSON-style truncated string value is dropped" {
+    const allocator = testing.allocator;
+    // Same truncation class through the JSON-quoted spelling: the closing `"`
+    // never arrived. Pre-fix the verbatim copy emitted an UNCLOSED JSON string
+    // (invalid args, caught only by the {}-fallback safety net); the complete
+    // first pair must survive and the fragment must drop.
+    const text = "<|tool_call>call:write{\"path\":\"plang/php.html\",\"content\":\"<!DOCTYPE html>\n<p>cut mid-";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("plang/php.html", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("content") == null);
 }
 
 test "parseToolCalls Gemma 4 unterminated string must not swallow the closing brace (pi write regression)" {
@@ -5121,7 +5622,7 @@ test "convertGemma4ArgsToJson nested braces in value" {
     const allocator = testing.allocator;
     // Content value contains JSON-like structures (e.g., JavaScript code with objects)
     const input = "{path:<|\"|>server.js<|\"|>,content:<|\"|>const x = {a: 1, b: {c: 2}};<|\"|>}";
-    const result = convertGemma4ArgsToJson(allocator, input).?;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
     defer allocator.free(result);
     // Verify it produces valid JSON
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
@@ -5135,7 +5636,7 @@ test "convertGemma4ArgsToJson bare array value" {
     const allocator = testing.allocator;
     // Bare array value should be preserved via brace-matching
     const input = "{stops:[\"Rome\",\"Venice\",\"Athens\"],price:1200}";
-    const result = convertGemma4ArgsToJson(allocator, input).?;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
     defer allocator.free(result);
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
     defer parsed.deinit();
@@ -5147,7 +5648,7 @@ test "convertGemma4ArgsToJson bare nested object value" {
     const allocator = testing.allocator;
     // Bare nested object should be preserved via brace-matching
     const input = "{name:test,config:{\"port\":3000,\"host\":\"localhost\"}}";
-    const result = convertGemma4ArgsToJson(allocator, input).?;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
     defer allocator.free(result);
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, result, .{});
     defer parsed.deinit();
@@ -5166,7 +5667,7 @@ test "convertGemma4ArgsToJson issue#16 nested array of custom strings" {
     const expected =
         \\{"nested_array":["foo","bar"]}
     ;
-    const result = convertGemma4ArgsToJson(allocator, input).?;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
     defer allocator.free(result);
     try testing.expectEqualStrings(expected, result);
 }
@@ -5179,7 +5680,7 @@ test "convertGemma4ArgsToJson issue#16 nested object custom format" {
     const expected =
         \\{"nested_object":{"foo":"bar"}}
     ;
-    const result = convertGemma4ArgsToJson(allocator, input).?;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
     defer allocator.free(result);
     try testing.expectEqualStrings(expected, result);
 }
@@ -5192,7 +5693,7 @@ test "convertGemma4ArgsToJson issue#16 nested object inside array" {
     const expected =
         \\{"nested_object_in_array":[{"foo":"bar"}]}
     ;
-    const result = convertGemma4ArgsToJson(allocator, input).?;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
     defer allocator.free(result);
     try testing.expectEqualStrings(expected, result);
 }
@@ -5205,7 +5706,7 @@ test "convertGemma4ArgsToJson issue#16 nested array inside object" {
     const expected =
         \\{"nested_array_in_object":{"foo":["bar"]}}
     ;
-    const result = convertGemma4ArgsToJson(allocator, input).?;
+    const result = convertGemma4ArgsToJson(allocator, input, false).?;
     defer allocator.free(result);
     try testing.expectEqualStrings(expected, result);
 }
@@ -5375,6 +5876,115 @@ test "renderChatTemplate: tool result with raw ANSI escapes still renders via Ji
     try testing.expect(std.mem.indexOf(u8, rendered, "Which template") != null);
     // Fallback format must NOT have been used.
     try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+}
+
+test "renderChatTemplate: Hy3 constructs — str.format tokens, arguments.items(), tojson(ensure_ascii=False)" {
+    // Hy3's chat_template.jinja builds EVERY special token via
+    // `'<think{}>'.format(HYTK)` on line 1 — an engine without str.format
+    // throws there, and renderChatTemplate silently downgrades to
+    // fallbackFormatChat (the wrong-family prompt-format class). This pins the
+    // three constructs the template leans on: positional {} format, dict
+    // .items() iteration over tool-call arguments (requires args serialized as
+    // an OBJECT), and `| tojson(ensure_ascii=False)` on non-string values.
+    const allocator = testing.allocator;
+    const tpl =
+        \\{%- set HYTK = ':opensource' %}
+        \\{%- set eos_token = '<eos{}>'.format(HYTK) %}
+        \\{%- set user_token = '<user{}>'.format(HYTK) %}
+        \\{%- for message in messages -%}
+        \\{%- if message['role'] == 'user' -%}{{ user_token }}{{ message['content'] }}
+        \\{%- elif message['role'] == 'assistant' -%}<asst>{{ message['content'] }}
+        \\{%- if message['tool_calls'] %}{% for tool in message['tool_calls'] %}{%- set arguments = tool['function']['arguments'] %}<call>{{ tool['function']['name'] }}{% for key, value in arguments.items() %}<k>{{ key }}</k>{% if value is not string %}{%- set value = value | tojson(ensure_ascii=False) %}{% endif %}<v>{{ value }}</v>{% endfor %}</call>{% endfor %}{{ eos_token }}{% endif %}
+        \\{%- endif -%}
+        \\{%- endfor -%}
+        \\{# {{ tools }} #}
+    ;
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "write_file", .arguments = "{\"path\": \"a.txt\", \"count\": 2}" }};
+    const messages = [_]Message{
+        .{ .role = "user", .content = "write it" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+    };
+    const rendered = try renderChatTemplate(allocator, &messages, &config, "[]", null, false);
+    defer allocator.free(rendered);
+
+    try testing.expect(std.mem.indexOf(u8, rendered, "<user:opensource>write it") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<eos:opensource>") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<call>write_file") != null);
+    try testing.expect(std.mem.indexOf(u8, rendered, "<k>path</k><v>a.txt</v>") != null);
+    // Non-string value rendered through tojson.
+    try testing.expect(std.mem.indexOf(u8, rendered, "<k>count</k><v>2</v>") != null);
+}
+
+test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback (HY3_MODEL_DIR)" {
+    // Env-gated: HY3_MODEL_DIR=<dir containing chat_template.jinja>. Renders
+    // the actual shipped template with system + tools + a tool round and
+    // pins: no silent fallback (family tokens present), template-opened think
+    // (thinking on), closed think (thinking off), tool-call args rendered via
+    // arguments.items(), tool_response wrapping for role:"tool".
+    const dir = std.c.getenv("HY3_MODEL_DIR") orelse return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{std.mem.span(dir)});
+    defer allocator.free(path);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const tpl = blk: {
+        const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch return error.SkipZigTest;
+        defer f.close(io);
+        var read_buf: [4096]u8 = undefined;
+        var reader_state = f.reader(io, &read_buf);
+        break :blk try reader_state.interface.allocRemaining(allocator, .limited(1024 * 1024));
+    };
+    defer allocator.free(tpl);
+
+    var config = ChatConfig{
+        .chat_template = tpl,
+        .bos_token = null,
+        .eos_token = null,
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+
+    const tools_json =
+        \\[{"type":"function","function":{"name":"get_time","description":"Get time","parameters":{"type":"object","properties":{"timezone":{"type":"string"}},"required":["timezone"]}}}]
+    ;
+    const tc = [_]ToolCall{.{ .id = "tc_0", .name = "get_time", .arguments = "{\"timezone\": \"UTC\"}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What time is it?" },
+        .{ .role = "assistant", .content = "", .tool_calls = &tc },
+        .{ .role = "tool", .content = "12:34 UTC", .tool_call_id = "tc_0" },
+    };
+
+    // Thinking ON: generation prompt must end inside a think block.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, true);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "hy_begin_of_sentence:opensource") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "hy_User:opensource") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<tool_call:opensource>get_time<tool_sep:opensource>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<arg_key:opensource>timezone</arg_key:opensource>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<arg_value:opensource>UTC</arg_value:opensource>") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<tool_response:opensource>") != null);
+        // No fallback-format markers.
+        try testing.expect(std.mem.indexOf(u8, rendered, "<|im_start|>") == null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "<start_of_turn>") == null);
+        // Template-opened think at the generation prompt.
+        try testing.expect(promptTailOpensThink(rendered));
+    }
+    // Thinking OFF (reasoning_effort no_think): think opened AND closed.
+    {
+        const rendered = try renderChatTemplate(allocator, &messages, &config, tools_json, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(!promptTailOpensThink(rendered));
+        try testing.expect(std.mem.indexOf(u8, rendered, "<think:opensource></think:opensource>") != null);
+    }
 }
 
 test "serializeExtraContext with thinking enabled" {
@@ -7393,4 +8003,157 @@ test "splitThinkBlock content never keeps trailing channel close spam" {
     const split = splitThinkBlock(text, true, false);
     try testing.expect(std.mem.indexOf(u8, split.content, "<channel|>") == null);
     try testing.expect(std.mem.indexOf(u8, split.content, "The answer.") != null);
+}
+
+// ── Hy3 (hy_v3 / Hunyuan 3) suffixed think tags + tag-format tool calls ──
+
+test "hy3 think: splitThinkBlock splits on </think:opensource>" {
+    const out = "I reason here.</think:opensource>The answer is 4.";
+    const split = splitThinkBlock(out, true, true);
+    try testing.expectEqualStrings("I reason here.", split.reasoning_content.?);
+    try testing.expectEqualStrings("The answer is 4.", split.content);
+}
+
+test "hy3 think: literal suffixed opener + close" {
+    const out = "<think:opensource>hmm</think:opensource>Answer.";
+    const split = splitThinkBlock(out, true, false);
+    try testing.expectEqualStrings("hmm", split.reasoning_content.?);
+    try testing.expectEqualStrings("Answer.", split.content);
+    try testing.expectEqualStrings("Answer.", stripThinkBlock(out));
+}
+
+test "hy3 think: trailing suffixed close spam trimmed from content" {
+    const out = "r</think:opensource>Answer.</think:opensource></think:opensource>";
+    const split = splitThinkBlock(out, true, true);
+    try testing.expectEqualStrings("Answer.", split.content);
+}
+
+test "hy3 think: dangling re-opened suffixed opener never leaks" {
+    const out = "r</think:opensource>Answer.\n<think:opensource>\nnew thought";
+    const split = splitThinkBlock(out, true, true);
+    try testing.expectEqualStrings("Answer.", split.content);
+    try testing.expect(std.mem.indexOf(u8, split.content, "<think") == null);
+}
+
+test "hy3 think: promptTailOpensThink recognizes the suffixed opener, not a closed no_think tail" {
+    try testing.expect(promptTailOpensThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource>"));
+    try testing.expect(!promptTailOpensThink("<\xEF\xBD\x9Chy_Assistant:opensource\xEF\xBD\x9C><think:opensource></think:opensource>"));
+}
+
+test "hy3 think: streamThinkGate splits on suffixed close and holds on a partial suffixed re-open" {
+    // Template-opened thinking: reasoning streams in with no literal opener.
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("partial reasoning", true, false));
+    try testing.expectEqual(StreamThinkGate.split_think, streamThinkGate("reasoning</think:opensource>ans", true, false));
+    // Mid-text re-open arriving token by token: the partial tail must hold the
+    // flush (leaking "<think:opensou" into visible text is the tag-leak class).
+    try testing.expectEqual(StreamThinkGate.hold_thinking, streamThinkGate("visible<think:opensou", false, true));
+    // Prose that merely mentions "<think about it" is NOT a partial opener.
+    try testing.expectEqual(StreamThinkGate.flush_text, streamThinkGate("let's <think about it", false, true));
+}
+
+test "parseToolCalls hy3 arg_key/arg_value format (single call, hostile value bytes)" {
+    const raw = "<tool_calls:opensource>\n" ++
+        "<tool_call:opensource>write_file<tool_sep:opensource>\n" ++
+        "<arg_key:opensource>path</arg_key:opensource>\n" ++
+        "<arg_value:opensource>jfk.txt</arg_value:opensource>\n" ++
+        "<arg_key:opensource>content</arg_key:opensource>\n" ++
+        "<arg_value:opensource>Hello \"world\"\nline2\ttabbed</arg_value:opensource>\n" ++
+        "</tool_call:opensource>\n</tool_calls:opensource>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    try testing.expect(!calls[0].inferred);
+    // Arguments must be VALID JSON with both keys, hostile bytes escaped.
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("jfk.txt", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings("Hello \"world\"\nline2\ttabbed", parsed.value.object.get("content").?.string);
+}
+
+test "parseToolCalls hy3: two calls in one wrapper" {
+    const raw = "<tool_calls:opensource>\n" ++
+        "<tool_call:opensource>alpha<tool_sep:opensource>\n" ++
+        "<arg_key:opensource>a</arg_key:opensource>\n<arg_value:opensource>1</arg_value:opensource>\n" ++
+        "</tool_call:opensource>\n" ++
+        "<tool_call:opensource>beta<tool_sep:opensource>\n" ++
+        "<arg_key:opensource>b</arg_key:opensource>\n<arg_value:opensource>two</arg_value:opensource>\n" ++
+        "</tool_call:opensource>\n</tool_calls:opensource>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 2), calls.len);
+    try testing.expectEqualStrings("alpha", calls[0].name);
+    try testing.expectEqualStrings("beta", calls[1].name);
+}
+
+test "parseToolCalls hy3: duplicate arg key — first wins, args stay valid JSON" {
+    const raw = "<tool_call:opensource>edit<tool_sep:opensource>\n" ++
+        "<arg_key:opensource>path</arg_key:opensource>\n<arg_value:opensource>a.txt</arg_value:opensource>\n" ++
+        "<arg_key:opensource>path</arg_key:opensource>\n<arg_value:opensource>b.txt</arg_value:opensource>\n" ++
+        "</tool_call:opensource>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("a.txt", parsed.value.object.get("path").?.string);
+}
+
+test "parseToolCalls hy3: truncated mid-value recovers name + closed args only" {
+    // max_tokens cut the generation inside the second value — recover the call
+    // with the CLOSED pair only; never salvage the partial content (the
+    // truncated-opener class: a half-written file is worse than a retry).
+    const raw = "<tool_calls:opensource>\n" ++
+        "<tool_call:opensource>write_file<tool_sep:opensource>\n" ++
+        "<arg_key:opensource>path</arg_key:opensource>\n<arg_value:opensource>x.txt</arg_value:opensource>\n" ++
+        "<arg_key:opensource>content</arg_key:opensource>\n<arg_value:opensource>a very long novel that never clos";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("x.txt", parsed.value.object.get("path").?.string);
+    try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls hy3: suffixed think close before the wrapper still parses" {
+    const raw = "planning the call</think:opensource>\n<tool_calls:opensource>\n" ++
+        "<tool_call:opensource>list_files<tool_sep:opensource>\n" ++
+        "<arg_key:opensource>dir</arg_key:opensource>\n<arg_value:opensource>.</arg_value:opensource>\n" ++
+        "</tool_call:opensource>\n</tool_calls:opensource>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("list_files", calls[0].name);
 }

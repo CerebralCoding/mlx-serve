@@ -734,6 +734,16 @@ let gemmaModelOptions: [GemmaModelOption] = [
         ggufFilename: "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf",
         minHostRamBytes: 96 * (UInt64(1) << 30)
     ),
+    // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
+    // Mixed 2/3-bit experts + 8-bit attention/router/shared expert (RTN
+    // affine), MTP layer included for future self-speculative decode.
+    GemmaModelOption(
+        id: "hy3-295b-2bit",
+        displayName: "Hunyuan 3 295B-A21B (2-bit)",
+        repoId: "ox-ox/Hy3-295B-Instruct-w2q3exp-AProjQ8-SExpQ8-OutQ8-MTP-mlx",
+        sizeEstimate: "~110 GB, needs 128 GB RAM",
+        minHostRamBytes: 128 * (UInt64(1) << 30)
+    ),
 ]
 
 /// Subset of `gemmaModelOptions` surfaced in the menu-bar Download Models

@@ -128,23 +128,27 @@ class DownloadManager: ObservableObject {
 
     /// Filter a HuggingFace `/tree/main?recursive=true` listing down to the
     /// files a model download actually needs: top-level config / tokenizer /
-    /// weight files, PLUS the `mtp/` multi-token-prediction sidecar — the only
-    /// nested artifact the server auto-loads (`mtp/weights.safetensors`).
-    /// Without it, an MTP model silently loses its speculative-decoding speedup
-    /// because a non-recursive listing returns `mtp` as a bare directory entry
-    /// that the `type == "file"` filter drops. Other subdirectories (e.g.
-    /// `original/` or alternate-precision shadow copies) are skipped so we don't
-    /// pull tens of GB of unused weights. Returns (path, size) pairs.
+    /// weight files, PLUS the MTP multi-token-prediction sidecar the server
+    /// auto-loads. Two nested sidecar layouts are pulled: `mtp/weights.safetensors`
+    /// (mlx-serve native) and `optiq/mtp.safetensors` (oMLX OptiQ). Without them
+    /// an MTP model silently loses its speculative-decoding speedup because a
+    /// non-recursive listing returns the dir as a bare entry that the
+    /// `type == "file"` filter drops. Everything else nested — `optiq/optiq_vision.safetensors`
+    /// (the server can't use a relocated vision tower, ~GB), `original/` or
+    /// alternate-precision shadow copies — is skipped so we don't pull tens of
+    /// GB of unused weights. This allowlist mirrors `mtp.sidecar_rel_paths`; keep
+    /// them in sync. Returns (path, size) pairs.
     nonisolated static func selectNeededFiles(from entries: [[String: Any]], selection: FileSelection = .chatDefault) -> [(String, Int64)] {
         let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt"]
         return entries.compactMap { file -> (String, Int64)? in
             guard let path = file["path"] as? String,
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
-            // Depth gate. Chat default: top-level files + the `mtp/` sidecar.
+            // Depth gate. Chat default: top-level files + the MTP sidecar
+            // (native `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`).
             // Media (recursive): keep nested weight subdirs (FLUX's
             // transformer/vae/text_encoder, TTS's speech_tokenizer).
             if !selection.recursive {
-                guard !path.contains("/") || path.hasPrefix("mtp/") else { return nil }
+                guard !path.contains("/") || path.hasPrefix("mtp/") || path == "optiq/mtp.safetensors" else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
             guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }

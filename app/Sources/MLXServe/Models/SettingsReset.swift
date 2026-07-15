@@ -60,6 +60,7 @@ enum SettingsReset {
                 f("draftBlockSize") { $0.draftBlockSize = $1.draftBlockSize },
                 f("enableMTP") { $0.enableMTP = $1.enableMTP },
                 f("mtpDepth") { $0.mtpDepth = $1.mtpDepth },
+                f("forceMTPOnMoE") { $0.forceMTPOnMoE = $1.forceMTPOnMoE },
             ]
 
         // One section, so one reset: the universal knob and the MLX-only ones.

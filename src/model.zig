@@ -87,6 +87,15 @@ pub const ModelConfig = struct {
     num_experts_per_tok: u32 = 0,
     moe_intermediate_size: u32 = 0,
     shared_expert_intermediate_size: u32 = 0,
+    // DeepSeek-V3-style sigmoid routing (hy_v3): scores = sigmoid(logits) in
+    // f32; top-k SELECTED on scores + expert_bias but WEIGHTED by the unbiased
+    // scores; optional renorm (/(sum+1e-20)) then × router_scaling_factor.
+    moe_sigmoid_router: bool = false,
+    moe_route_norm: bool = true,
+    router_scaling_factor: f32 = 1.0,
+    // Layers [0, first_k_dense_replace) use a dense MLP instead of MoE
+    // (hy_v3: layer 0 dense at intermediate_size, the rest MoE).
+    first_k_dense_replace: u32 = 0,
 
     // Linear attention (GatedDeltaNet)
     linear_num_key_heads: u32 = 0,
@@ -335,6 +344,15 @@ pub const ModelConfig = struct {
     pub fn ensureGemmaTerminators(self: *ModelConfig) void {
         if (!self.isEosToken(1)) self.addEosToken(1);
         if (!self.isEosToken(106)) self.addEosToken(106);
+    }
+
+    /// Hy3 (hy_v3) family terminator: <｜hy_eos:opensource｜> = 120025. Real
+    /// MLX conversions (ox-ox 2-bit) ship NO eos in config.json and NO
+    /// generation_config.json, so without this merge generation never halts.
+    /// Additive + dedup-guarded like ensureGemmaTerminators — never gate a
+    /// known chat-terminator on "config provided no eos".
+    pub fn ensureHy3Terminators(self: *ModelConfig) void {
+        if (!self.isEosToken(120025)) self.addEosToken(120025);
     }
 
     /// Fill still-null sampling recommendations with the FAMILY's documented
@@ -999,6 +1017,52 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (cfg_obj.get("query_pre_attn_scalar") == null) {
             config.query_pre_attn_scalar = config.head_dim;
         }
+    } else if (std.mem.eql(u8, model_type, "hy_v3")) {
+        // Tencent Hunyuan 3 (Hy3, 295B-A21B MoE; July 2026). Pure
+        // full-attention MoE that rides the qwen3_moe forward arms: GQA with
+        // per-head QK RMS-norm, full rotary, scale = head_dim^-0.5, no output
+        // gate, plain "model" prefix. Family-specific pieces handled
+        // explicitly: DeepSeek-V3-style SIGMOID router with expert bias
+        // (mlp.expert_bias, f32) + top-k renorm + router_scaling_factor, an
+        // UNGATED always-added shared expert (mlp.shared_mlp.*), and
+        // first_k_dense_replace dense bottom layers. Reference: mlx-lm PR
+        // #1211 (converted repos ship hy_v3.py alongside the weights).
+        // NOTE: tencent's generation_config documents temp 0.9 / top_k -1 /
+        // top_p 1 — untruncated by design, so applyFamilySamplingDefaults
+        // deliberately has no hy_v3 fill.
+        config.model_type = "hy_v3";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.has_sliding_window = false;
+        config.rope_scaling_factor = 1.0;
+        config.rope_local_base_freq = config.rope_theta;
+        config.moe_sigmoid_router = true;
+        // qk_norm / route_norm default TRUE when absent (mlx-lm ModelArgs
+        // defaults) but an explicit false must win.
+        if (cfg_obj.get("qk_norm")) |v| { if (v == .bool) config.has_qk_norm = v.bool; }
+        if (cfg_obj.get("route_norm")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
+        if (cfg_obj.get("router_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+        if (cfg_obj.get("first_k_dense_replace")) |v| { if (v == .integer) config.first_k_dense_replace = @intCast(v.integer); }
+        // Expert width may ride as expert_hidden_dim when moe_intermediate_size
+        // is absent (both = 1536 on the 295B).
+        if (config.moe_intermediate_size == 0) {
+            if (cfg_obj.get("expert_hidden_dim")) |v| { if (v == .integer) config.moe_intermediate_size = @intCast(v.integer); }
+        }
+        // No explicit shared_expert_intermediate_size key in hy_v3 configs:
+        // derive num_shared_experts × expert width. 0 shared experts leaves it
+        // 0 and the binder/forward skip the shared branch.
+        if (cfg_obj.get("num_shared_experts")) |v| {
+            if (v == .integer) config.shared_expert_intermediate_size =
+                @as(u32, @intCast(v.integer)) * config.moe_intermediate_size;
+        }
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
+        config.ensureHy3Terminators();
     } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
         config.model_type = "qwen3_next";
         config.weight_prefix = "model";
@@ -1360,8 +1424,26 @@ fn loadSafetensorsFile(
             continue;
         }
 
+        // Quant SIDE tensors (scales/biases) stored as f16 beside our bf16
+        // activations force gather_qmm/qmatmul onto a ~4x slower mixed-dtype
+        // path (hy_v3 2-bit live, 2026-07-14: 0.70 vs 0.18 ms per 8-expert
+        // gather — 1.2 tok/s on the 295B instead of ~15+). Cast once here;
+        // the node stays lazy so the load-time batch eval materializes bf16
+        // directly. Dequant delta from the 3 dropped mantissa bits: cos
+        // 0.99999994 — far below any quant noise floor. Plain WEIGHTS keep
+        // their dtype (dense-f16 tables are legitimate and handled per-site).
+        var final_value = value;
+        if ((std.mem.endsWith(u8, key_str, ".scales") or std.mem.endsWith(u8, key_str, ".biases")) and
+            mlx.mlx_array_dtype(value) == .float16)
+        {
+            var cast = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&cast, value, .bfloat16, s));
+            _ = mlx.mlx_array_free(value);
+            final_value = cast;
+        }
+
         const owned_key = try allocator.dupe(u8, key_str);
-        try weights.map.put(owned_key, value);
+        try weights.map.put(owned_key, final_value);
     }
 }
 
@@ -1410,6 +1492,64 @@ test "ModelConfig defaults" {
     try testing.expectEqual(@as(u32, 0), config.quant_bits); // 0 = dense bf16 (no "quantization" key)
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expect(!config.tie_word_embeddings);
+}
+
+test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-path class)" {
+    // hy_v3 2-bit (ox-ox) ships F16 scales/biases beside bf16 activations —
+    // MLX's gather_qmm/qmatmul take a ~4x slower mixed-dtype path (measured
+    // 2026-07-14: 0.70 vs 0.18 ms per 8-expert gather; 1.2 tok/s on the 295B
+    // instead of ~15+). The loader must cast quant SIDE tensors to bf16 once;
+    // weights and non-quant tensors keep their dtype. Dequant delta from the
+    // 3 dropped mantissa bits: cos 0.99999994 — under the 2-bit noise floor.
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+
+    // Build a tiny map: an f16 "scales", an f16 "biases", an f16 plain weight
+    // (must NOT be cast), and a bf16 scales (no-op).
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+
+        const shape = [_]c_int{ 4, 4 };
+        const data = [_]f32{0.5} ** 16;
+        const f32_arr = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(f32_arr);
+        var f16_arr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f16_arr);
+        try mlx.check(mlx.mlx_astype(&f16_arr, f32_arr, .float16, s));
+        var bf16_arr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bf16_arr);
+        try mlx.check(mlx.mlx_astype(&bf16_arr, f32_arr, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(f16_arr));
+        try mlx.check(mlx.mlx_array_eval(bf16_arr));
+
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.gate_proj.scales", f16_arr);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.gate_proj.biases", f16_arr);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.up_proj.weight", f16_arr);
+        _ = mlx.mlx_map_string_to_array_insert(map, "model.layers.0.mlp.down_proj.scales", bf16_arr);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    var weights = try loadWeights(io, allocator, dir_path);
+    defer weights.deinit();
+
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.gate_proj.scales").?));
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.gate_proj.biases").?));
+    // A plain WEIGHT stays f16 (dense-f16 tables are legitimate — only the
+    // quant side tensors force the mixed-dtype qmm path).
+    try testing.expectEqual(mlx.mlx_dtype.float16, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.up_proj.weight").?));
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(weights.get("model.layers.0.mlp.down_proj.scales").?));
 }
 
 test "loadWeights on a weightless dir (incomplete download) errors clearly, not empty map" {
@@ -2274,6 +2414,111 @@ test "parseConfigFromJson qwen3_moe (Qwen3-30B-A3B) → MoE, no shared expert, n
     try testing.expect(!config.has_hybrid_layers);
     try testing.expect(!config.has_sliding_window);
     try testing.expectEqual(@as(u32, 8), config.quant_bits);
+}
+
+test "parseConfigFromJson hy_v3 (Tencent Hunyuan 3 295B-A21B) → sigmoid-router MoE, first-k dense, shared expert" {
+    // tencent/Hy3 (July 2026): pure full-attention MoE, GQA 64/8 hd-128 with
+    // QK-norm, 192 experts top-8 + 1 ungated shared expert, DeepSeek-V3-style
+    // sigmoid router with expert bias + top-k renorm + scaling factor, and
+    // layer 0 dense (first_k_dense_replace). Real checkpoints (ox-ox MLX
+    // conversion) ship NO eos/bos in config.json and NO generation_config.json
+    // — the eos (<｜hy_eos:opensource｜> = 120025) must be filled by the arm or
+    // generation never stops. qk_norm/route_norm are ABSENT in the real config
+    // and default true (mlx-lm hy_v3 ModelArgs defaults).
+    const json =
+        \\{
+        \\  "model_type": "hy_v3",
+        \\  "vocab_size": 120832,
+        \\  "hidden_size": 4096,
+        \\  "intermediate_size": 13312,
+        \\  "num_hidden_layers": 80,
+        \\  "num_attention_heads": 64,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 128,
+        \\  "max_position_embeddings": 262144,
+        \\  "rms_norm_eps": 1e-05,
+        \\  "rope_theta": 11158840.0,
+        \\  "tie_word_embeddings": false,
+        \\  "num_experts": 192,
+        \\  "num_experts_per_tok": 8,
+        \\  "moe_intermediate_size": 1536,
+        \\  "num_shared_experts": 1,
+        \\  "first_k_dense_replace": 1,
+        \\  "router_scaling_factor": 2.826,
+        \\  "moe_router_use_sigmoid": true,
+        \\  "moe_router_enable_expert_bias": true,
+        \\  "num_nextn_predict_layers": 1,
+        \\  "expert_hidden_dim": 1536,
+        \\  "quantization": {"bits": 2, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("hy_v3", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    try testing.expect(config.isMoe());
+    try testing.expectEqual(@as(u32, 192), config.num_experts);
+    try testing.expectEqual(@as(u32, 8), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 1536), config.moe_intermediate_size);
+    // 1 shared expert × expert_hidden_dim — there is no explicit
+    // shared_expert_intermediate_size key in hy_v3 configs.
+    try testing.expectEqual(@as(u32, 1536), config.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(u32, 1), config.first_k_dense_replace);
+    // Sigmoid router + bias + renorm + scaling factor.
+    try testing.expect(config.moe_sigmoid_router);
+    try testing.expect(config.moe_route_norm);
+    try testing.expectApproxEqAbs(@as(f32, 2.826), config.router_scaling_factor, 1e-6);
+    // Attention: qwen3-shaped — QK-norm (default-true when key absent), no
+    // output gate, full rotary, scale = head_dim^-0.5.
+    try testing.expect(config.has_qk_norm);
+    try testing.expect(!config.attn_output_gate);
+    try testing.expect(!config.has_sliding_window);
+    try testing.expect(!config.has_hybrid_layers);
+    try testing.expect(!config.isLinearLayer(0));
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expectEqual(@as(u32, 128), config.query_pre_attn_scalar);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), config.partial_rotary_factor, 1e-6);
+    try testing.expectEqual(HiddenAct.silu, config.hidden_act);
+    try testing.expect(!config.scale_embeddings);
+    try testing.expect(!config.tie_word_embeddings);
+    // eos fallback: config carries none; the arm must add 120025 or generation
+    // never halts (same class as ensureGemmaTerminators).
+    try testing.expect(config.isEosToken(120025));
+    try testing.expectEqual(@as(u32, 2), config.quant_bits);
+    try testing.expectEqual(@as(u32, 262144), config.max_position_embeddings);
+}
+
+test "parseConfigFromJson hy_v3 explicit route_norm/qk_norm false are honored" {
+    // The arm defaults route_norm/qk_norm TRUE when absent; explicit false in a
+    // future checkpoint must win (never bake the default over a declared value).
+    const json =
+        \\{
+        \\  "model_type": "hy_v3",
+        \\  "hidden_size": 1024,
+        \\  "num_hidden_layers": 4,
+        \\  "num_attention_heads": 8,
+        \\  "num_key_value_heads": 2,
+        \\  "head_dim": 128,
+        \\  "num_experts": 16,
+        \\  "num_experts_per_tok": 2,
+        \\  "moe_intermediate_size": 256,
+        \\  "num_shared_experts": 2,
+        \\  "route_norm": false,
+        \\  "qk_norm": false,
+        \\  "eos_token_id": [7, 9]
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(!config.moe_route_norm);
+    try testing.expect(!config.has_qk_norm);
+    try testing.expect(config.moe_sigmoid_router);
+    // 2 shared experts × 256.
+    try testing.expectEqual(@as(u32, 512), config.shared_expert_intermediate_size);
+    // Declared eos survives; the 120025 merge is additive, never a replace.
+    try testing.expect(config.isEosToken(7));
+    try testing.expect(config.isEosToken(9));
+    try testing.expect(config.isEosToken(120025));
+    // router_scaling_factor absent → neutral 1.0.
+    try testing.expectApproxEqAbs(@as(f32, 1.0), config.router_scaling_factor, 1e-6);
 }
 
 test "parseConfigFromJson qwen2 (Qwen2.5) → dense, no QK-norm, silu" {

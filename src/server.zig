@@ -370,6 +370,12 @@ pub const ServerConfig = struct {
     default_temperature: ?f32 = null,
     default_top_p: ?f32 = null,
     default_top_k: ?u32 = null,
+    /// `--mtp`: force the native MTP head ON for MoE targets too. The
+    /// per-request default is otherwise `sidecar loaded and !isMoe()` (the
+    /// verify-forward expert-routing caution the drafter shares), which makes
+    /// a MoE MTP checkpoint unreachable from any client that doesn't send
+    /// `enable_mtp:true` in the body. Per-request `enable_mtp` still wins.
+    default_force_mtp: bool = false,
 };
 
 /// Sampling-default resolution chain: request body > CLI launch flag >
@@ -377,6 +383,19 @@ pub const ServerConfig = struct {
 /// value of 0 (greedy / disabled) is a value, not an omission.
 fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T, fallback: T) T {
     return request orelse cli orelse gen_config orelse fallback;
+}
+
+/// The per-request `enable_mtp` default, for a request that omitted the field.
+/// The ONE place this policy lives — every HTTP surface calls it, so a new
+/// surface can't silently ship a different default (the drafter-dispatch-hole
+/// lesson: an output-equality test cannot see a spec path that never engaged).
+///
+/// MoE targets default OFF because the verify forward pays the expert-routing
+/// penalty; `--mtp` (`default_force_mtp`) overrides that for operators who
+/// measured otherwise — the 35B-A3B sidecar holds ~73% per-draft.
+pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool) bool {
+    if (!mtp_loaded) return false;
+    return !is_moe or force;
 }
 
 /// parseJsonFloat variant that distinguishes "omitted / wrong type" (null)
@@ -956,6 +975,9 @@ pub fn serve(
     }
     if (scheduler.drafter != null) {
         log.info("Drafter speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
+    }
+    if (server_config.default_force_mtp) {
+        log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
     log.info("\nServer listening on http://{s}:{d}\n", .{ host, port });
     if (g_api_key != null) {
@@ -2160,13 +2182,19 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 ///     8×seq×ffn envelope over-billed a 255K prompt by ~60 GB and rejected
 ///     requests that fit comfortably (PR #69).
 pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, layers: u64, hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64) u64 {
+    // A forward is never wider than the prompt: a prompt shorter than the
+    // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
+    // scales with min(chunk, seq) — billing the raw chunk cap rejected a
+    // 31-token prompt for "needing" 6.2 GB on a memory-squeezed hy_v3 host
+    // (live 2026-07-14). No-op for prompts >= one chunk.
+    const fwd: u64 = @min(chunk, @max(seq, 1));
     const kv_bytes: u64 = if (kv_bits >= 16)
         layers * 2 * seq * kv_heads * hdim * 2
     else
         layers * 2 * seq * kv_heads * hdim * (2 * kv_bits + 1) / 16;
-    const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(hdim))) heads * chunk * seq * 2 else 0;
+    const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(hdim))) heads * fwd * seq * 2 else 0;
     const dequant: u64 = if (kv_bits < 16) 2 * seq * kv_heads * hdim * 2 else 0;
-    const mlp: u64 = 8 * chunk * @max(hidden, ffn) * 2;
+    const mlp: u64 = 8 * fwd * @max(hidden, ffn) * 2;
     return (kv_bytes + scores + dequant + 3 * mlp) * 5 / 4;
 }
 
@@ -3864,7 +3892,7 @@ fn handleChatCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        (lm.mtp != null and !config.isMoe());
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
@@ -4174,7 +4202,7 @@ fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        (lm.mtp != null and !config.isMoe());
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
 
     // Log the request
@@ -5498,9 +5526,10 @@ fn handleStreamingGeneration(
             // the opener into the prompt so the model's first tokens are already
             // INSIDE the thinking block — no opener appears in the streamed text.
             if (!skipped_think_open and think_buf.items.len >= 7) {
-                if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
-                    // Remove <think> prefix and any leading newline
-                    var skip: usize = 7;
+                if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
+                    // Remove the opener (<think> or the Hy3-suffixed form) and
+                    // any leading newline.
+                    var skip: usize = olen;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                     const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
                     think_buf.clearAndFree(allocator);
@@ -5520,6 +5549,9 @@ fn handleStreamingGeneration(
                 } else if (think_buf.items.len < 17 and std.mem.startsWith(u8, "<|channel>thought", think_buf.items)) {
                     // Buffer is still a partial prefix of `<|channel>thought` —
                     // wait for more tokens before deciding.
+                } else if (think_buf.items.len < 32 and chat_mod.endsWithPartialThinkOpen(think_buf.items)) {
+                    // Still a growing suffixed opener (`<think:opensou`) —
+                    // wait before deciding, or the raw tag leaks as reasoning.
                 } else {
                     // Not a known opener — template already injected one.
                     // Stay inside the think block; close tag is detected dynamically below.
@@ -5542,23 +5574,24 @@ fn handleStreamingGeneration(
 
             // Check for the close tag — accept whichever appears first.
             // Models with templates that pre-inject the opener (Qwen 3.5/3.6,
-            // some Gemma 4 variants) don't reveal which format they use until
-            // the close tag arrives, so we look for both.
-            const think_pos = std.mem.indexOf(u8, think_buf.items, "</think>");
+            // some Gemma 4 variants, Hy3's suffixed form) don't reveal which
+            // format they use until the close tag arrives, so look for both
+            // families (indexOfThinkCloseTag covers bare AND suffixed </think…>).
+            const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
-            const close_match: ?struct { pos: usize, tag: []const u8 } = blk: {
-                if (think_pos == null and channel_pos == null) break :blk null;
-                if (think_pos == null) break :blk .{ .pos = channel_pos.?, .tag = "<channel|>" };
-                if (channel_pos == null) break :blk .{ .pos = think_pos.?, .tag = "</think>" };
-                if (think_pos.? <= channel_pos.?) break :blk .{ .pos = think_pos.?, .tag = "</think>" };
-                break :blk .{ .pos = channel_pos.?, .tag = "<channel|>" };
+            const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
+                if (think_match == null and channel_pos == null) break :blk null;
+                if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
+                if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
+                if (think_match.?.pos <= channel_pos.?) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
+                break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
             };
 
             if (close_match) |m| {
                 if (m.pos > 0) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..m.pos] }, null, null, null);
                 }
-                const after = m.pos + m.tag.len;
+                const after = m.pos + m.len;
                 var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                 // Strip Gemma 4 content channel tag: <|channel>\n or <|channel>
                 if (std.mem.startsWith(u8, content_after, "<|channel>\n")) {
@@ -5572,16 +5605,16 @@ fn handleStreamingGeneration(
                 }
                 think_buf.clearRetainingCapacity();
                 in_think_block = false;
-                think_close_tag = m.tag;
+                think_close_tag = if (m.is_channel) "<channel|>" else "</think>";
             } else if (skipped_think_open) {
-                // Flush reasoning tokens that can't be part of either close tag.
-                // Hold back the longest possible partial-tag suffix (max 9 bytes
-                // to cover both "</think>" and "<channel|>").
-                const max_partial: usize = 9;
-                const safe_len = if (think_buf.items.len > max_partial)
-                    think_buf.items.len - max_partial
-                else
-                    0;
+                // Flush reasoning tokens that can't be part of a close tag.
+                // Hold back a still-growing partial close tag (suffixed forms
+                // like `</think:opensource>` included), then back the cut off
+                // to a UTF-8 boundary — a flush cut mid-codepoint ships a lone
+                // continuation byte in the delta JSON (live hy_v3 2026-07-14:
+                // `"reasoning_content":"2\xc2"` — '²' split across deltas).
+                var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
+                while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
                 if (safe_len > 0) {
                     try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .reasoning_content = think_buf.items[0..safe_len] }, null, null, null);
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
@@ -7585,7 +7618,7 @@ fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        (lm.mtp != null and !config.isMoe());
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
     if (enable_mtp and lm.mtp == null) enable_mtp = false;
 
     // Log request
@@ -8192,8 +8225,8 @@ fn handleAnthropicStreaming(
             think_tokens += 1;
 
             if (!skipped_think_open and think_buf.items.len >= 7) {
-                if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
-                    var skip: usize = 7;
+                if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
+                    var skip: usize = olen;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
                     const remaining = try allocator.dupe(u8, think_buf.items[skip..]);
                     think_buf.clearAndFree(allocator);
@@ -8227,6 +8260,8 @@ fn handleAnthropicStreaming(
                     }
                 } else if (think_buf.items.len < 17 and std.mem.startsWith(u8, "<|channel>thought", think_buf.items)) {
                     // Partial prefix of `<|channel>thought` — wait for more tokens.
+                } else if (think_buf.items.len < 32 and chat_mod.endsWithPartialThinkOpen(think_buf.items)) {
+                    // Still a growing suffixed opener (`<think:opensou`) — wait.
                 } else {
                     // No opener in the model's output — template injected one.
                     // Stay in the think block; close tag is detected dynamically.
@@ -8258,15 +8293,16 @@ fn handleAnthropicStreaming(
                 continue;
             }
 
-            // Check for the close tag — accept whichever appears first.
-            const think_pos = std.mem.indexOf(u8, think_buf.items, "</think>");
+            // Check for the close tag — accept whichever appears first
+            // (indexOfThinkCloseTag covers bare AND Hy3-suffixed </think…>).
+            const think_match = chat_mod.indexOfThinkCloseTag(think_buf.items, 0);
             const channel_pos = std.mem.indexOf(u8, think_buf.items, "<channel|>");
-            const close_match: ?struct { pos: usize, tag: []const u8 } = blk: {
-                if (think_pos == null and channel_pos == null) break :blk null;
-                if (think_pos == null) break :blk .{ .pos = channel_pos.?, .tag = "<channel|>" };
-                if (channel_pos == null) break :blk .{ .pos = think_pos.?, .tag = "</think>" };
-                if (think_pos.? <= channel_pos.?) break :blk .{ .pos = think_pos.?, .tag = "</think>" };
-                break :blk .{ .pos = channel_pos.?, .tag = "<channel|>" };
+            const close_match: ?struct { pos: usize, len: usize, is_channel: bool } = blk: {
+                if (think_match == null and channel_pos == null) break :blk null;
+                if (think_match == null) break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
+                if (channel_pos == null) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
+                if (think_match.?.pos <= channel_pos.?) break :blk .{ .pos = think_match.?.pos, .len = think_match.?.len, .is_channel = false };
+                break :blk .{ .pos = channel_pos.?, .len = "<channel|>".len, .is_channel = true };
             };
 
             if (close_match) |m| {
@@ -8278,7 +8314,7 @@ fn handleAnthropicStreaming(
                     thinking_block_open = false;
                     block_index += 1;
                 }
-                const after = m.pos + m.tag.len;
+                const after = m.pos + m.len;
                 var content_after = std.mem.trimStart(u8, think_buf.items[after..], "\n ");
                 if (std.mem.startsWith(u8, content_after, "<|channel>\n")) content_after = content_after[11..];
                 if (std.mem.startsWith(u8, content_after, "<|channel>")) content_after = content_after[10..];
@@ -8296,15 +8332,13 @@ fn handleAnthropicStreaming(
                 }
                 think_buf.clearRetainingCapacity();
                 in_think_block = false;
-                think_close_tag = m.tag;
+                think_close_tag = if (m.is_channel) "<channel|>" else "</think>";
             } else if (skipped_think_open and thinking_block_open) {
-                // Hold back the longest possible partial-tag suffix (max 9 bytes
-                // covers both "</think>" and "<channel|>").
-                const max_partial: usize = 9;
-                const safe_len = if (think_buf.items.len > max_partial)
-                    think_buf.items.len - max_partial
-                else
-                    0;
+                // Hold back a still-growing partial close tag (suffixed forms
+                // included), then back off to a UTF-8 boundary — a cut mid-
+                // codepoint ships a lone continuation byte in the delta JSON.
+                var safe_len = think_buf.items.len - chat_mod.partialThinkCloseSuffixLen(think_buf.items);
+                while (safe_len > 0 and safe_len < think_buf.items.len and (think_buf.items[safe_len] & 0xC0) == 0x80) safe_len -= 1;
                 if (safe_len > 0) {
                     try emitAnthropicThinkingDelta(allocator, stream, block_index, think_buf.items[0..safe_len]);
                     const remaining = try allocator.dupe(u8, think_buf.items[safe_len..]);
@@ -9174,7 +9208,7 @@ fn handleResponses(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        (lm.mtp != null and !config.isMoe());
+        defaultEnableMtp(lm.mtp != null, config.isMoe(), server_config.default_force_mtp);
     if (enable_mtp_resp and lm.mtp == null) enable_mtp_resp = false;
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
@@ -11921,6 +11955,20 @@ test "readyCapsJson: every resident media engine surfaces its capability (mesh -
     );
 }
 
+test "prefillMemoryNeeded: a prompt shorter than the chunk bills the prompt-width forward, not the chunk cap" {
+    // hy_v3 live 2026-07-14: with 111 GB of weights resident (~4 GB headroom),
+    // a 31-TOKEN prompt was rejected "needs ~6246MB" — the MLP envelope was
+    // billed at the hd-128 8192 chunk cap while the actual prefill runs ONE
+    // 31-token forward (~25 MB). A forward is never wider than the prompt:
+    // the envelope must use min(chunk, seq). Guard-tracks-reality rule.
+    const small = prefillMemoryNeeded(31, 64, 8, 80, 128, 4096, 13312, 8, 31);
+    const capped = prefillMemoryNeeded(31, 64, 8, 80, 128, 4096, 13312, 8, 8192);
+    try std.testing.expectEqual(small, capped);
+    // Sanity: the clamped estimate for the live 31-token case sits far below
+    // the ~4 GB that was actually available.
+    try std.testing.expect(capped < 512 * 1024 * 1024);
+}
+
 test "prefillMemoryNeeded: quantized KV is billed at its real width, not fp16" {
     const t = std.testing;
     transformer_mod.fused256_override = false;
@@ -12026,4 +12074,20 @@ test "truncateEmbeddingDims: OpenAI dimensions semantics (truncate + L2-renormal
     const zt = truncateEmbeddingDims(&z, 2);
     try t.expectEqual(@as(usize, 2), zt.len);
     for (zt) |x| try t.expect(!std.math.isNan(x));
+}
+
+test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
+    const t = std.testing;
+    // No sidecar loaded → never on, whatever the operator asked for.
+    try t.expect(!defaultEnableMtp(false, false, false));
+    try t.expect(!defaultEnableMtp(false, true, true));
+    // Dense target with a sidecar → on by default (unchanged behavior).
+    try t.expect(defaultEnableMtp(true, false, false));
+    try t.expect(defaultEnableMtp(true, false, true));
+    // MoE target → OFF by default (the verify-forward routing caution) ...
+    try t.expect(!defaultEnableMtp(true, true, false));
+    // ... but ON when the operator passed --mtp. Without this, a MoE MTP
+    // checkpoint is unreachable from any client that doesn't send
+    // `enable_mtp:true` in the body (llmprobe, Claude Code, curl).
+    try t.expect(defaultEnableMtp(true, true, true));
 }

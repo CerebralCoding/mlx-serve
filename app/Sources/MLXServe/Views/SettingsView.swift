@@ -1103,6 +1103,18 @@ private struct SpecDecodeSectionContent: View {
                 .disabled(!appState.serverOptions.enableMTP)
             }
         }
+        if let m = meta["forceMTPOnMoE"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.forceMTPOnMoE)
+            ) {
+                Toggle("", isOn: opts.forceMTPOnMoE)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+                    .disabled(!appState.serverOptions.enableMTP)
+            }
+        }
     }
 }
 

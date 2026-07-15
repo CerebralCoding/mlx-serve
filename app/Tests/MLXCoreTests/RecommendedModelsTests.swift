@@ -13,11 +13,12 @@ final class RecommendedModelsTests: XCTestCase {
 
     // MARK: - Catalog shape
 
-    /// The pane's whole layout assumes exactly two family sections.
-    func testExactlyTwoFamiliesArePresent() {
+    /// The pane's whole layout assumes exactly three family sections.
+    func testExactlyThreeFamiliesArePresent() {
         let families = Set(RecommendedModelPick.gemmaCatalog.map(\.family))
             .union(RecommendedModelPick.qwenCatalog.map(\.family))
-        XCTAssertEqual(families, [.gemma, .qwen])
+            .union(RecommendedModelPick.hunyuanCatalog.map(\.family))
+        XCTAssertEqual(families, [.gemma, .qwen, .hunyuan])
     }
 
     /// A family catalog can't be empty — a section with zero rows would be a
@@ -25,6 +26,7 @@ final class RecommendedModelsTests: XCTestCase {
     func testNeitherFamilyCatalogIsEmpty() {
         XCTAssertFalse(RecommendedModelPick.gemmaCatalog.isEmpty)
         XCTAssertFalse(RecommendedModelPick.qwenCatalog.isEmpty)
+        XCTAssertFalse(RecommendedModelPick.hunyuanCatalog.isEmpty)
     }
 
     /// Every entry in `gemmaCatalog` is actually Gemma, and every entry in
@@ -36,6 +38,9 @@ final class RecommendedModelsTests: XCTestCase {
         for p in RecommendedModelPick.qwenCatalog {
             XCTAssertEqual(p.family, .qwen, p.id)
         }
+        for p in RecommendedModelPick.hunyuanCatalog {
+            XCTAssertEqual(p.family, .hunyuan, p.id)
+        }
     }
 
     /// Each family list renders smallest-to-largest, so a beginner scans it
@@ -45,19 +50,21 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(gemmaSizes, gemmaSizes.sorted())
         let qwenSizes = RecommendedModelPick.qwenCatalog.map(\.sizeGB)
         XCTAssertEqual(qwenSizes, qwenSizes.sorted())
+        let hunyuanSizes = RecommendedModelPick.hunyuanCatalog.map(\.sizeGB)
+        XCTAssertEqual(hunyuanSizes, hunyuanSizes.sorted())
     }
 
     /// No id collisions within or across the two catalogs — ids key the
     /// SwiftUI `ForEach`/download-state lookups.
     func testNoDuplicateIdsAcrossBothCatalogs() {
-        let ids = (RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog).map(\.id)
+        let ids = (RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.hunyuanCatalog).map(\.id)
         XCTAssertEqual(ids.count, Set(ids).count)
     }
 
     /// Every repo id must look like a real, resolvable HuggingFace path
     /// (`org/repo`, no whitespace) — a typo here silently 404s the download.
     func testRepoIdsAreWellFormed() {
-        for p in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog {
+        for p in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.hunyuanCatalog {
             XCTAssertTrue(p.repoId.contains("/"), p.repoId)
             XCTAssertFalse(p.repoId.contains(" "), p.repoId)
             XCTAssertEqual(p.repoId.split(separator: "/").count, 2, p.repoId)
@@ -67,7 +74,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// Every entry needs real, non-empty plain-English copy — an empty blurb
     /// or tagline would silently render a blank description.
     func testEveryPickHasNonEmptyBeginnerCopy() {
-        for p in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog {
+        for p in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.hunyuanCatalog {
             XCTAssertFalse(p.name.isEmpty, p.id)
             XCTAssertFalse(p.tagline.isEmpty, p.id)
             XCTAssertGreaterThan(p.blurb.count, 40, "\(p.id) blurb reads as a stub")
@@ -98,6 +105,20 @@ final class RecommendedModelsTests: XCTestCase {
         let pick = RecommendedModelPick.gemma31B
         XCTAssertFalse(pick.meetsSystemRequirements(physicalMemoryBytes: 18 * GiB))
         XCTAssertTrue(pick.meetsSystemRequirements(physicalMemoryBytes: 32 * GiB))
+    }
+
+    /// Hunyuan 3 is the "over 128 GB" recommendation: on a 128 GB Mac it
+    /// sorts behind the "Requires more RAM" disclosure (it RUNS there, with a
+    /// minimal context window — the blurb says so — but the recommendation
+    /// targets bigger Macs), while a 192 GB+ Mac sees it inline. The override
+    /// exists because the generic weights×1.2 formula reads 105 GB as
+    /// "fits on 128" — measured live, a 128 GB Mac needs the memory-preflight
+    /// override and pins a ~3K context.
+    func testHunyuan3IsGatedAbove128GB() {
+        let hy3 = RecommendedModelPick.hy3_295b
+        XCTAssertFalse(hy3.meetsSystemRequirements(physicalMemoryBytes: 128 * GiB))
+        XCTAssertTrue(hy3.meetsSystemRequirements(physicalMemoryBytes: 192 * GiB))
+        XCTAssertTrue(hy3.blurb.contains("128 GB"), "blurb must carry the runs-on-128 caveat")
     }
 
     // MARK: - Partitioning (inline vs "Requires more RAM" disclosure)

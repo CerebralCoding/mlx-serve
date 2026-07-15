@@ -72,6 +72,12 @@ const Expect = struct {
     /// Expected BOOLEAN-typed argument in the first call (schema entries only).
     tool_bool_key: ?[]const u8 = null,
     tool_bool_value: ?bool = null,
+    /// Assert this key is ABSENT from the first call's arguments. Used by the
+    /// truncation-salvage entries: a value the cut landed inside is a FRAGMENT
+    /// and must be dropped, never shipped as a real argument (a client executes
+    /// what it receives — fragmentary content writes a corrupt file
+    /// "successfully").
+    tool_arg_absent: ?[]const u8 = null,
 };
 
 /// Claude Code's Edit tool, post `server.buildOpenAIToolsJson`. `replace_all`
@@ -88,6 +94,12 @@ const edit_tool_schema =
 /// oldText/newText — which is what makes a buried `path` provably misplaced.
 const pi_edit_tool_schema =
     \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"]},"description":"One or more targeted replacements."}},"required":["path","edits"]}}}]
+;
+
+/// Weather tool with a boolean arg — used by the LIVE Hy3 capture to pin the
+/// tag-format string→bool schema coercion.
+const weather_tool_schema =
+    \\[{"type":"function","function":{"name":"get_weather","description":"Get weather","parameters":{"type":"object","properties":{"city":{"type":"string"},"celsius":{"type":"boolean"}},"required":["city"]}}}]
 ;
 
 /// pi-style write/read pair — used by the hallucinated-raw-JSON (George
@@ -660,6 +672,43 @@ const corpus = [_]Expect{
         .tool_arg_key = "path",
         .tool_arg_value = "us_presidents/generate_site.sh",
     },
+    // ── Loop-stop truncated Gemma call (partial-value salvage class) ────────
+    // Class: the server's degenerate-tail-loop guard (scheduler.runSingleDecodeTick)
+    // cuts a repetition-looping generation mid-tool-call, so a Gemma-format
+    // call arrives with an unterminated value, no `}`, and no <tool_call|>.
+    // The salvage must recover the tool NAME and DROP the fragment value — the
+    // Hermes-truncation rule ("a half-written file is worse than a re-issued
+    // write") now applied to the Gemma arm too. The cut itself reports
+    // finish_reason "length" (server truncation; scheduler.loopStopReason), so
+    // client truncation recovery fires instead of validating a fragment.
+    .{
+        // Live 2026-07-14 (pi → gemma-4-26B-A4B-it-qat-4bit, plang/php.html):
+        // the model looped "server-side scripting language, " (a ~6-token
+        // cycle) inside `content`; the guard cut at its 16-rep threshold
+        // mid-word. `path` was never generated — no parse layer can conjure
+        // it; what must NOT happen is the 1.1 KB loop fragment shipping as a
+        // real argument (pi echoed it back into context verbatim).
+        .family = "gemma4",
+        .name = "loop-stop truncated write: fragment content dropped, name recovered",
+        .raw = "<|tool_call>call:write{content:<|\"|><!DOCTYPE html>\n<html lang=\"en\">\n<head>\n    <title>PHP</title>\n</head>\n<body>\n    <p>PHP is a widely-used general-purpose scripting language. It is a server-side scripting language, server-side scripting language, server-side scripting language, server-",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_absent = "content",
+    },
+    .{
+        // The ordering that would CORRUPT a file: `path` completed BEFORE the
+        // cut. Pre-fix salvage = {path, <partial garbage>} — schema-valid, so
+        // the client writes the fragment to a real file and reports success.
+        // The complete path survives; the fragment never ships.
+        .family = "gemma4",
+        .name = "loop-stop truncated write after complete path: path kept, fragment dropped",
+        .raw = "<|tool_call>call:write{path:<|\"|>plang/php.html<|\"|>,content:<|\"|><!DOCTYPE html>\n<p>PHP is a server-side scripting language, server-side scripting language, server-",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "plang/php.html",
+        .tool_arg_absent = "content",
+    },
     // ── Negatives ────────────────────────────────────────────────────────────
     .{
         // Prose containing a `<tool…>`-ish tag that is NOT a tool call.
@@ -701,6 +750,123 @@ const corpus = [_]Expect{
         .tool_name = "write",
         .tool_arg_key = "path",
         .tool_arg_value = "a.txt",
+    },
+    // ── Hy3 / Hunyuan 3 (hy_v3): suffixed think tags + arg_key/arg_value tool
+    // format. Entries are template-spec-shaped (chat_template.jinja, HYTK
+    // ":opensource"); replace/extend with harvested live bytes once the 295B
+    // runs locally (MLX_SERVE_RAW_DUMP_FILE workflow above). Thinking is
+    // template-opened by default (generation prompt ends with the opener when
+    // reasoning_effort is high/low). ─────────────────────────────────────────
+    .{
+        .family = "hy3",
+        .name = "full think round, template-opened, suffixed close tag",
+        .raw = "The user wants 17*24. 17*24 = 408.</think:opensource>17 × 24 = **408**.",
+        .thinking = true,
+        .opened_by_template = true,
+        .content_contains = "408",
+        .reasoning_contains = "17*24 = 408",
+    },
+    .{
+        .family = "hy3",
+        .name = "template-opened truncated thinking stays out of content (suffixed family)",
+        .raw = "Let me work through the request step by step: first",
+        .thinking = true,
+        .opened_by_template = true,
+        .content_exact = "",
+        .reasoning_contains = "step by step",
+    },
+    .{
+        .family = "hy3",
+        .name = "arg_key/arg_value tool call after thinking, string→bool schema coercion",
+        .raw = "I should edit the file.</think:opensource><tool_calls:opensource>\n" ++
+            "<tool_call:opensource>Edit<tool_sep:opensource>\n" ++
+            "<arg_key:opensource>file_path</arg_key:opensource>\n" ++
+            "<arg_value:opensource>src/main.py</arg_value:opensource>\n" ++
+            "<arg_key:opensource>old_string</arg_key:opensource>\n" ++
+            "<arg_value:opensource>x = 1</arg_value:opensource>\n" ++
+            "<arg_key:opensource>new_string</arg_key:opensource>\n" ++
+            "<arg_value:opensource>x = 2</arg_value:opensource>\n" ++
+            "<arg_key:opensource>replace_all</arg_key:opensource>\n" ++
+            "<arg_value:opensource>false</arg_value:opensource>\n" ++
+            "</tool_call:opensource>\n</tool_calls:opensource>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = edit_tool_schema,
+        .tool_name = "Edit",
+        .tool_arg_key = "file_path",
+        .tool_arg_value = "src/main.py",
+        .tool_bool_key = "replace_all",
+        .tool_bool_value = false,
+    },
+    .{
+        .family = "hy3",
+        .name = "parallel calls in one wrapper keep their own args",
+        .raw = "<tool_calls:opensource>\n" ++
+            "<tool_call:opensource>read<tool_sep:opensource>\n" ++
+            "<arg_key:opensource>path</arg_key:opensource>\n" ++
+            "<arg_value:opensource>a.txt</arg_value:opensource>\n" ++
+            "</tool_call:opensource>\n" ++
+            "<tool_call:opensource>read<tool_sep:opensource>\n" ++
+            "<arg_key:opensource>path</arg_key:opensource>\n" ++
+            "<arg_value:opensource>b.txt</arg_value:opensource>\n" ++
+            "</tool_call:opensource>\n</tool_calls:opensource>",
+        .tools_json = write_read_tools_schema,
+        .tool_count = 2,
+        .tool_name = "read",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+        .last_tool_arg_value = "b.txt",
+    },
+    .{
+        // Big-file-write truncation class, hy3 shape: max_tokens landed inside
+        // the `content` value. Recover the call with the CLOSED pair only —
+        // the fragment must never ship as a real argument.
+        .family = "hy3",
+        .name = "truncated mid-arg_value recovers name + closed args, drops the fragment",
+        .raw = "<tool_calls:opensource>\n" ++
+            "<tool_call:opensource>write<tool_sep:opensource>\n" ++
+            "<arg_key:opensource>path</arg_key:opensource>\n" ++
+            "<arg_value:opensource>novel.txt</arg_value:opensource>\n" ++
+            "<arg_key:opensource>content</arg_key:opensource>\n" ++
+            "<arg_value:opensource>Chapter 1. It was a dark and stormy night and the",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "novel.txt",
+        .tool_arg_absent = "content",
+    },
+    .{
+        // Prose mentioning the format's pieces (without an actual opener tag —
+        // the control tags are special tokens a real generation can't casually
+        // reproduce mid-prose) must not parse as a call.
+        .family = "hy3",
+        .name = "prose about arg_key/arg_value is not a tool call",
+        .raw = "Hy3 encodes each argument as an arg_key/arg_value pair inside the call block.",
+        .tools_json = write_read_tools_schema,
+        .no_tool_calls = true,
+        .content_contains = "arg_key/arg_value pair",
+    },
+    .{
+        // LIVE capture 2026-07-14 — first Hy3 (295B, 2-bit) run on this
+        // engine; raw bytes verbatim from the debug log ("Weather in Tokyo in
+        // celsius please", temp 0). Confirms the shipped model emits the
+        // template-spec format exactly; the "true" arg is a STRING in the tag
+        // format and the schema coercion must type it.
+        .family = "hy3",
+        .name = "LIVE: get_weather call, wrapper + sep + arg tags, string→bool coercion",
+        .raw = "<tool_calls:opensource>\n" ++
+            "<tool_call:opensource>get_weather<tool_sep:opensource>\n" ++
+            "<arg_key:opensource>city</arg_key:opensource>\n" ++
+            "<arg_value:opensource>Tokyo</arg_value:opensource>\n" ++
+            "<arg_key:opensource>celsius</arg_key:opensource>\n" ++
+            "<arg_value:opensource>true</arg_value:opensource>\n" ++
+            "</tool_call:opensource>\n</tool_calls:opensource>",
+        .tools_json = weather_tool_schema,
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Tokyo",
+        .tool_bool_key = "celsius",
+        .tool_bool_value = true,
     },
 };
 
@@ -809,6 +975,13 @@ test "format corpus: recorded model outputs across families" {
                     try fail(entry, "boolean arg is not the expected JSON boolean", cs[0].arguments);
                 }
             }
+            if (entry.tool_arg_absent) |key| {
+                const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});
+                defer parsed.deinit();
+                if (parsed.value == .object and parsed.value.object.get(key) != null) {
+                    try fail(entry, "fragment arg shipped — key must be ABSENT after truncation salvage", cs[0].arguments);
+                }
+            }
             if (entry.tool_arg_key) |key| {
                 const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});
                 defer parsed.deinit();
@@ -886,10 +1059,11 @@ test "format corpus: streaming think-gate never leaks thinking mid-stream" {
     for (corpus) |entry| {
         if (!entry.thinking) continue;
 
-        // Earliest end position of a think close tag, either family.
+        // Earliest end position of a think close tag, any family (the chat
+        // helper covers both `</think>` and the Hy3-suffixed variant).
         const close_end: ?usize = blk: {
             var best: ?usize = null;
-            if (std.mem.indexOf(u8, entry.raw, "</think>")) |p| best = p + "</think>".len;
+            if (chat.indexOfThinkCloseTag(entry.raw, 0)) |c| best = c.pos + c.len;
             if (std.mem.indexOf(u8, entry.raw, "<channel|>")) |p| {
                 const e = p + "<channel|>".len;
                 if (best == null or e < best.?) best = e;

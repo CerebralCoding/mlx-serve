@@ -42,6 +42,7 @@ const supported_model_types = [_][]const u8{
     "nemotron_h",
     "bert",
     "deepseek_v4",
+    "hy_v3",        // Tencent Hunyuan 3 (295B-A21B MoE)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -706,16 +707,38 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     if (parsed.value != .object) return meta;
     const root = parsed.value.object;
     meta.found = true;
-    meta.vocab_size = jsonU32(root, "vocab_size");
-    meta.hidden_size = jsonU32(root, "hidden_size");
-    meta.num_hidden_layers = jsonU32(root, "num_hidden_layers");
-    meta.max_position_embeddings = jsonU32(root, "max_position_embeddings");
+
+    // A multimodal checkpoint puts EVERY text dim under `text_config` and
+    // leaves only model_type / vision_config / quantization at the root. Read
+    // the nested block first and fall back to the root per field (a minimal
+    // `text_config` may omit fields the root still carries) — the same merge
+    // `model.zig parseConfigFromJson` does. Reading the root alone made
+    // /v1/models report hidden=0 / layers=0 / ctx=0 / is_moe=false for every
+    // unloaded Gemma 3/4 and Qwen-VL model.
+    const text_cfg: ?std.json.ObjectMap = if (root.get("text_config")) |tc|
+        (if (tc == .object) tc.object else null)
+    else
+        null;
+    const cfgU32 = struct {
+        fn get(r: std.json.ObjectMap, tc: ?std.json.ObjectMap, key: []const u8) u32 {
+            if (tc) |t| {
+                const v = jsonU32(t, key);
+                if (v > 0) return v;
+            }
+            return jsonU32(r, key);
+        }
+    }.get;
+
+    meta.vocab_size = cfgU32(root, text_cfg, "vocab_size");
+    meta.hidden_size = cfgU32(root, text_cfg, "hidden_size");
+    meta.num_hidden_layers = cfgU32(root, text_cfg, "num_hidden_layers");
+    meta.max_position_embeddings = cfgU32(root, text_cfg, "max_position_embeddings");
     if (root.get("quantization")) |q| {
         if (q == .object) meta.quant_bits = jsonU32(q.object, "bits");
     }
-    meta.is_moe = jsonU32(root, "num_experts") > 0 or
-        jsonU32(root, "num_local_experts") > 0 or
-        jsonU32(root, "n_routed_experts") > 0;
+    meta.is_moe = cfgU32(root, text_cfg, "num_experts") > 0 or
+        cfgU32(root, text_cfg, "num_local_experts") > 0 or
+        cfgU32(root, text_cfg, "n_routed_experts") > 0;
     const mt: []const u8 = if (root.get("model_type")) |v|
         (if (v == .string) v.string else "")
     else
@@ -1161,6 +1184,48 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     {
         const m = parseStubMeta(a, "{\"model_type\":\"bert\",\"hidden_size\":384}", true);
         try testing.expect(!m.has_chat);
+    }
+    // A MULTIMODAL checkpoint keeps every text dim under `text_config` — the
+    // root carries only model_type / vision_config / quantization. Reading the
+    // root alone reported hidden=0, layers=0, ctx=0, is_moe=false on /v1/models
+    // for EVERY unloaded Gemma 3/4 and Qwen-VL model (which is most of them),
+    // so a client couldn't tell a 128-expert MoE from a dense model without
+    // cold-loading 16 GB of weights. Same class as the "Config fields omitted
+    // by nested text_config" gotcha, different parser.
+    {
+        // gemma-4-26B-A4B-it-qat-4bit's real shape.
+        const json =
+            \\{"model_type":"gemma4","vision_config":{"hidden_size":1152},
+            \\"quantization":{"bits":4,"group_size":32},
+            \\"text_config":{"vocab_size":262144,"hidden_size":2560,"num_hidden_layers":62,
+            \\"max_position_embeddings":131072,"num_experts":128,"top_k_experts":8}}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expect(m.found);
+        try testing.expectEqual(@as(u32, 262144), m.vocab_size);
+        try testing.expectEqual(@as(u32, 2560), m.hidden_size);
+        try testing.expectEqual(@as(u32, 62), m.num_hidden_layers);
+        try testing.expectEqual(@as(u32, 131072), m.max_position_embeddings);
+        try testing.expectEqual(@as(u32, 4), m.quant_bits); // still root-level
+        try testing.expect(m.is_moe);
+        try testing.expect(m.has_vision);
+    }
+    // A flat checkpoint whose text_config is absent keeps reading the root, and
+    // a nested block that OMITS a field falls back to the root rather than
+    // reporting 0 (mirrors the model.zig text_config merge).
+    {
+        const json =
+            \\{"model_type":"gemma3","max_position_embeddings":8192,
+            \\"text_config":{"hidden_size":3840}}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expectEqual(@as(u32, 3840), m.hidden_size);
+        try testing.expectEqual(@as(u32, 8192), m.max_position_embeddings);
+    }
+    // Qwen3.5/3.6 MoE nests its expert count too (Ornith-1.0-35B: 256 experts).
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"qwen3_5_moe\",\"text_config\":{\"num_experts\":256}}", true);
+        try testing.expect(m.is_moe);
     }
     // Malformed → found=false.
     {

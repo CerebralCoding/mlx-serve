@@ -25,8 +25,9 @@
 #
 # Usage: MTP_TEST_MODEL=<model-dir> ./tests/test_mtp_equivalence.sh [port]
 # Default model: ~/hf-staging/Qwen3.6-27B-4bit-MTP-MLX-Serve (any Qwen 3.5/3.6
-# dir with an MTP sidecar — mtp/weights.safetensors, mtp.safetensors, or
-# model-mtp.safetensors — works).
+# dir with an MTP sidecar — mtp/weights.safetensors, mtp.safetensors,
+# model-mtp.safetensors, or optiq/mtp.safetensors — works). This list mirrors
+# mtp.sidecar_rel_paths; keep them in sync.
 #
 # MoE trunks (35B-A3B) keep MTP default-OFF per request; set MTP_FORCE_ENABLE=1
 # to inject "enable_mtp":true into every request body so engagement +
@@ -48,7 +49,7 @@ if [ "${MTP_FORCE_ENABLE:-0}" = "1" ]; then
     OPTIN='"enable_mtp":true,'
 fi
 
-if [ ! -d "$MODEL" ] || { [ ! -f "$MODEL/mtp/weights.safetensors" ] && [ ! -f "$MODEL/mtp.safetensors" ] && [ ! -f "$MODEL/model-mtp.safetensors" ]; }; then
+if [ ! -d "$MODEL" ] || { [ ! -f "$MODEL/mtp/weights.safetensors" ] && [ ! -f "$MODEL/mtp.safetensors" ] && [ ! -f "$MODEL/model-mtp.safetensors" ] && [ ! -f "$MODEL/optiq/mtp.safetensors" ]; }; then
     echo "SKIP: model with MTP sidecar not found at $MODEL"
     exit 0
 fi

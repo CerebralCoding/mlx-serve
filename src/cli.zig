@@ -58,6 +58,10 @@ pub const aliases = [_]Alias{
     .{ .name = "qwen3.6", .tag = "27b", .repo = "ddalcu/Qwen3.6-27B-4bit-MTP-MLX-Serve", .is_default = true },
     .{ .name = "qwen3.5", .tag = "0.8b", .repo = "mlx-community/Qwen3.5-0.8B-MLX-4bit", .is_default = true },
     .{ .name = "deepseek-v4", .tag = "flash", .repo = "antirez/deepseek-v4-gguf", .is_default = true, .gguf_file = "DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf" },
+    // Tencent Hunyuan 3 (hy_v3, 295B-A21B MoE) — mixed 2/3-bit experts +
+    // 8-bit attention/router/shared, MTP layer included. ~110 GB on disk;
+    // needs a 128 GB Mac.
+    .{ .name = "hy3", .tag = "295b", .repo = "ox-ox/Hy3-295B-Instruct-w2q3exp-AProjQ8-SExpQ8-OutQ8-MTP-mlx", .is_default = true },
     .{ .name = "bge-small", .tag = "en", .repo = "mlx-community/bge-small-en-v1.5-8bit", .is_default = true },
 };
 
