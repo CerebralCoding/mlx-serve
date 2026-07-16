@@ -994,18 +994,24 @@ pub fn stripThinkBlock(text: []const u8) []const u8 {
     return trimTrailingThinkClosers(trimmed);
 }
 
-/// Trim trailing think/channel CLOSE markers (and surrounding whitespace) from
-/// visible content. A close marker is never valid at the tail of content — but a
-/// degenerate model can spam them (live: a Gemma variant emitted 16 bare
+/// Trim trailing think/channel/tool CLOSE markers (and surrounding whitespace)
+/// from visible content. A close marker is never valid at the tail of content —
+/// but a degenerate model can spam them (live: a Gemma variant emitted 16 bare
 /// `<channel|>` after its answer; the leading strip cuts the FIRST close, the
-/// trailing-OPEN strip ignores closes, so they leaked). Loops so a run of closers
-/// is fully removed. Returns a prefix slice (no allocation).
+/// trailing-OPEN strip ignores closes, so they leaked). The Gemma tool CLOSE
+/// `<tool_call|>` is here too: a degenerate 1-token bare close with no
+/// `<|tool_call>` opener leaked as the entire content (live 2026-07-16 soak,
+/// gemma-4-26B). parseToolCalls runs BEFORE this strip and extracts any real
+/// call, so any residual `<tool_call|>` reaching here is orphan by construction.
+/// Loops so a run of closers is fully removed. Returns a prefix slice (no alloc).
 fn trimTrailingThinkClosers(content: []const u8) []const u8 {
     var s = content;
     while (true) {
         const t = std.mem.trimEnd(u8, s, "\n \t\r");
         if (std.mem.endsWith(u8, t, "<channel|>")) {
             s = t[0 .. t.len - "<channel|>".len];
+        } else if (std.mem.endsWith(u8, t, "<tool_call|>")) {
+            s = t[0 .. t.len - "<tool_call|>".len];
         } else if (endsWithThinkCloseTag(t)) |l| {
             s = t[0 .. t.len - l];
         } else {
@@ -2749,29 +2755,70 @@ fn parseXmlElementArgsJson(allocator: std.mem.Allocator, body: []const u8) ?[]u8
 /// (max_tokens mid-call, the big-file-write class): a call whose name is
 /// delimited by `<tool_sep` recovers with its CLOSED key/value pairs only;
 /// partial values are never salvaged.
+/// Earliest position at/after `from` where any of `needles` occurs, or null.
+fn earliestIndexOfAny(text: []const u8, from: usize, needles: []const []const u8) ?usize {
+    var best: ?usize = null;
+    for (needles) |n| {
+        if (std.mem.indexOfPos(u8, text, from, n)) |q| {
+            if (best == null or q < best.?) best = q;
+        }
+    }
+    return best;
+}
+
 fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std.ArrayList(ParsedToolCall)) !void {
     var pos: usize = 0;
     while (std.mem.indexOfPos(u8, text, pos, "<tool_call")) |p| {
         const after_base = p + "<tool_call".len;
-        // Suffixed form only: `<tool_call:sfx>`. Bare `<tool_call>` (Hermes)
-        // and the plural wrapper `<tool_calls:sfx>` fall through.
-        if (after_base >= text.len or text[after_base] != ':') {
+        var name_start: usize = undefined;
+        if (after_base < text.len and text[after_base] == ':') {
+            // Canonical singular per-call opener `<tool_call:sfx>`.
+            const open_len = suffixedTagLenAt(text[p..], "<tool_call") orelse {
+                pos = after_base;
+                continue;
+            };
+            name_start = p + open_len;
+        } else if (std.mem.startsWith(u8, text[p..], "<tool_calls:")) {
+            // Suffixed plural WRAPPER `<tool_calls:sfx>` (hy3 only — the BARE
+            // DSV4/generic `<tool_calls>` wrapper is a different format and must
+            // fall through to its own parser). Normally an inner singular
+            // `<tool_call:sfx>` opener follows — defer to it (the next loop
+            // iteration parses that). A weak model (Hy3-REAP62, live 2026-07-16
+            // raw capture) DROPS the singular opener and jumps straight to the
+            // NAME, leaking the whole (otherwise well-formed) call; recover by
+            // treating the wrapper's end as the opener. Same weak-model
+            // delimiter-drop class as the <tool_sep> drop below, one delimiter over.
+            const wrap_len = suffixedTagLenAt(text[p..], "<tool_calls") orelse {
+                pos = after_base;
+                continue;
+            };
+            var probe = p + wrap_len;
+            while (probe < text.len and std.ascii.isWhitespace(text[probe])) probe += 1;
+            const inner_singular = std.mem.startsWith(u8, text[probe..], "<tool_call") and
+                probe + "<tool_call".len < text.len and text[probe + "<tool_call".len] == ':';
+            if (inner_singular) {
+                pos = p + wrap_len;
+                continue;
+            }
+            name_start = p + wrap_len;
+        } else {
+            // Bare `<tool_call>` (Hermes) — not this format; fall through.
             pos = after_base;
             continue;
         }
-        const open_len = suffixedTagLenAt(text[p..], "<tool_call") orelse {
-            pos = after_base;
-            continue;
-        };
-        const name_start = p + open_len;
 
-        // NAME runs to the <tool_sep:sfx> tag. No sep prefix at all → the cut
-        // happened inside the name; nothing trustworthy to recover.
-        const sep_pos = std.mem.indexOfPos(u8, text, name_start, "<tool_sep") orelse {
+        // NAME runs to the first structural marker after the opener. Canonically
+        // that's <tool_sep:sfx>; a mangled call (weak model dropped <tool_sep> —
+        // live 2026-07-16, Hy3-REAP62 via pi) instead closes the name with
+        // </arg_value>/<arg_key>/</tool_call>, so accept any of them. No marker
+        // at all → the cut happened inside the name; nothing to recover.
+        const name_end = earliestIndexOfAny(text, name_start, &.{
+            "<tool_sep", "<arg_key", "<arg_value", "</tool_call", "</arg_key", "</arg_value",
+        }) orelse {
             pos = name_start;
             continue;
         };
-        const name = std.mem.trim(u8, text[name_start..sep_pos], " \t\n\r");
+        const name = std.mem.trim(u8, text[name_start..name_end], " \t\n\r");
         if (name.len == 0) {
             pos = name_start;
             continue;
@@ -2780,34 +2827,45 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
         var args_map: std.json.ObjectMap = .empty;
         defer args_map.deinit(allocator);
 
-        // A truncated/malformed sep tag still recovers the NAME (empty args).
-        var i: usize = undefined;
-        if (suffixedTagLenAt(text[sep_pos..], "<tool_sep")) |sep_len| {
-            i = sep_pos + sep_len;
-            while (true) {
-                while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
-                if (i >= text.len) break;
-                if (std.mem.startsWith(u8, text[i..], "</tool_call")) break;
-                const ak_len = suffixedTagLenAt(text[i..], "<arg_key") orelse break;
-                const key_start = i + ak_len;
-                const ak_close = std.mem.indexOfPos(u8, text, key_start, "</arg_key") orelse break;
-                const ak_close_len = suffixedTagLenAt(text[ak_close..], "</arg_key") orelse break;
-                const key = std.mem.trim(u8, text[key_start..ak_close], " \t\n\r");
-                i = ak_close + ak_close_len;
-                while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
-                if (i >= text.len) break;
-                const av_len = suffixedTagLenAt(text[i..], "<arg_value") orelse break;
-                const val_start = i + av_len;
-                const av_close = std.mem.indexOfPos(u8, text, val_start, "</arg_value") orelse break;
-                const av_close_len = suffixedTagLenAt(text[av_close..], "</arg_value") orelse break;
-                const value = text[val_start..av_close];
-                i = av_close + av_close_len;
-                if (key.len > 0 and args_map.getEntry(key) == null) {
-                    try args_map.put(allocator, key, .{ .string = value });
-                }
+        // Consume a valid <tool_sep:sfx> if present; a mangled call that dropped
+        // it (weak model — live REAP capture) starts the arg scan right at the
+        // name's (wrong) close tag instead.
+        var i: usize = name_end;
+        if (suffixedTagLenAt(text[name_end..], "<tool_sep")) |sep_len| {
+            i = name_end + sep_len;
+        }
+        // Parse <arg_key>/<arg_value> pairs, bounded by this call's </tool_call>.
+        // SCAN to the next <arg_key> (rather than requiring it right here) so a
+        // stray name-close tag between the name and the first key is skipped, and
+        // match the KEY block's close TOLERANTLY (</arg_key> OR </arg_value>) —
+        // REAP closes it with </arg_value> (live 2026-07-16 raw capture: bash /
+        // command / "ls -la"). The well-formed path is unchanged: its <tool_sep>
+        // is consumed above, <arg_key> is found immediately, and </arg_key> is the
+        // earliest close.
+        const call_end = std.mem.indexOfPos(u8, text, i, "</tool_call") orelse text.len;
+        while (true) {
+            const ak_at = std.mem.indexOfPos(u8, text, i, "<arg_key") orelse break;
+            if (ak_at >= call_end) break;
+            const ak_len = suffixedTagLenAt(text[ak_at..], "<arg_key") orelse {
+                i = ak_at + "<arg_key".len;
+                continue;
+            };
+            const key_start = ak_at + ak_len;
+            const ak_close = earliestIndexOfAny(text, key_start, &.{ "</arg_key", "</arg_value" }) orelse break;
+            const ak_close_len = suffixedTagLenAt(text[ak_close..], "</arg_key") orelse
+                suffixedTagLenAt(text[ak_close..], "</arg_value") orelse break;
+            const key = std.mem.trim(u8, text[key_start..ak_close], " \t\n\r");
+            i = ak_close + ak_close_len;
+            while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
+            const av_len = suffixedTagLenAt(text[i..], "<arg_value") orelse break;
+            const val_start = i + av_len;
+            const av_close = std.mem.indexOfPos(u8, text, val_start, "</arg_value") orelse break;
+            const av_close_len = suffixedTagLenAt(text[av_close..], "</arg_value") orelse break;
+            const value = text[val_start..av_close];
+            i = av_close + av_close_len;
+            if (key.len > 0 and args_map.getEntry(key) == null) {
+                try args_map.put(allocator, key, .{ .string = value });
             }
-        } else {
-            i = sep_pos + "<tool_sep".len;
         }
 
         const args_str = try std.json.Stringify.valueAlloc(allocator, std.json.Value{ .object = args_map }, .{});
@@ -7998,6 +8056,21 @@ test "stripThinkBlock removes trailing </think> close spam too" {
     try testing.expect(std.mem.indexOf(u8, content, "The answer.") != null);
 }
 
+test "stripThinkBlock removes orphan Gemma <tool_call|> close from content (no-tag-leak)" {
+    // Live 2026-07-16 soak (gemma-4-26B-A4B-it-qat-4bit, tools present, a "no
+    // tools needed" probe at temp 0.7): the model degenerated into a bare
+    // 1-token <tool_call|> CLOSE with NO <|tool_call> opener, so parseToolCalls
+    // found no call and the orphan control token leaked as the ENTIRE visible
+    // content (server response content == "<tool_call|>"). A tool CLOSE marker is
+    // never valid at the tail of content — same class as the <channel|> spam.
+    // parseToolCalls already extracted any real call before this strip runs, so
+    // any residual <tool_call|> here is orphan by construction.
+    try testing.expectEqualStrings("", stripThinkBlock("<tool_call|>"));
+    try testing.expectEqualStrings("Sure.", stripThinkBlock("Sure.<tool_call|>"));
+    // Legit prose (no control token) is untouched.
+    try testing.expectEqualStrings("2 + 2 = 4", stripThinkBlock("2 + 2 = 4"));
+}
+
 test "splitThinkBlock content never keeps trailing channel close spam" {
     const text = "<|channel>thought\nplan<channel|>\n<|channel>\nThe answer.<channel|><channel|><channel|>";
     const split = splitThinkBlock(text, true, false);
@@ -8139,6 +8212,70 @@ test "parseToolCalls hy3: truncated mid-value recovers name + closed args only" 
     defer parsed.deinit();
     try testing.expectEqualStrings("x.txt", parsed.value.object.get("path").?.string);
     try testing.expect(parsed.value.object.get("content") == null);
+}
+
+test "parseToolCalls hy3: dropped <tool_sep> + mangled key-close still recovers name AND args" {
+    // Live 2026-07-16 RAW capture (pipenetwork/Hy3-REAP62 via the running server,
+    // MLX_SERVE_RAW_DUMP_FILE): the pruned model drops <tool_sep> (closes the NAME
+    // with </arg_value:opensource>) and closes the arg KEY block with
+    // </arg_value:opensource> instead of </arg_key:opensource> — the VALUE block is
+    // well-formed. Before the fix the strict parser bailed at the missing
+    // <tool_sep> and the whole call LEAKED as content (finish_reason stop), so pi
+    // saw bash({}) → "command required" and looped. The corruption is small and
+    // regular, so recover the FULL call: name=bash, {"command":"ls -la"}.
+    const raw = "<tool_calls:opensource>\n" ++
+        "<tool_call:opensource>bash</arg_value:opensource>\n" ++
+        "<arg_key:opensource>command</arg_value:opensource>\n" ++
+        "<arg_value:opensource>ls -la</arg_value:opensource>\n" ++
+        "</tool_call:opensource>\n</tool_calls:opensource>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("bash", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("ls -la", parsed.value.object.get("command").?.string);
+}
+
+test "parseToolCalls hy3: dropped singular <tool_call> opener (plural wrapper only) still recovers" {
+    // Live 2026-07-16 RAW capture (pipenetwork/Hy3-REAP62 via the running server,
+    // MLX_SERVE_RAW_DUMP_FILE): the pruned model emitted the PLURAL wrapper
+    // <tool_calls:opensource> and jumped STRAIGHT to the NAME, dropping the
+    // singular per-call <tool_call:opensource> opener the parser keys on — so the
+    // whole (well-structured, complete) call LEAKED as content (finish_reason
+    // stop). Same weak-model delimiter-drop class as the <tool_sep> drop above,
+    // one delimiter over. The call is otherwise regular (name/key closed with
+    // </arg_value>), so recover the FULL call incl. the quote-bearing content.
+    const raw = "<tool_calls:opensource>\n" ++
+        "write_file</arg_value:opensource>\n" ++
+        "<arg_key:opensource>path</arg_value:opensource>\n" ++
+        "<arg_value:opensource>page.html</arg_value:opensource>\n" ++
+        "<arg_key:opensource>content</arg_value:opensource>\n" ++
+        "<arg_value:opensource><meta charset=\"UTF-8\"><a href=\"/x\">L</a><div class=\"hero\">Hi</div></arg_value:opensource>\n" ++
+        "</tool_call:opensource>\n</tool_calls:opensource>";
+    const calls = (try parseToolCalls(testing.allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            testing.allocator.free(tc.name);
+            testing.allocator.free(tc.arguments);
+        }
+        testing.allocator.free(calls);
+    }
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write_file", calls[0].name);
+    const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, calls[0].arguments, .{});
+    defer parsed.deinit();
+    try testing.expectEqualStrings("page.html", parsed.value.object.get("path").?.string);
+    try testing.expectEqualStrings(
+        "<meta charset=\"UTF-8\"><a href=\"/x\">L</a><div class=\"hero\">Hi</div>",
+        parsed.value.object.get("content").?.string,
+    );
 }
 
 test "parseToolCalls hy3: suffixed think close before the wrapper still parses" {

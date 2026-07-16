@@ -751,10 +751,18 @@ stop_all_engines() {
     # kernel time to reclaim the prior model's MLX buffers (5-20 GB) before the
     # next engine allocates — when this is too short, oMLX in particular has
     # been observed to die mid-prefill on the next cell.
+    # Wait only for the ports we actually KILLED above (same list as the sweep).
+    # NOT LMS_PORT: LM Studio's server is a persistent daemon we deliberately
+    # never kill — its MODEL is freed by `lms unload --all`, not by dropping the
+    # socket — so waiting on it can NEVER succeed and burns the full 30s timeout
+    # + sleep 5 on EVERY start_engine. With --lmstudio that was ~40 s × 17 starts
+    # = ~11 min of dead wait in a 20 min `--family all` run (measured 2026-07-16;
+    # the run is ~4.7 min of actual generation). Waiting for a port you never
+    # free is a category error — keep this list == the kill list above.
     local waited=0
     while (( waited < 30 )); do
         local busy=0
-        for p in "$SERVER_PORT" "$OMLX_PORT" "$LMS_PORT" "$MTPLX_PORT"; do
+        for p in "$SERVER_PORT" "$OMLX_PORT" "$MTPLX_PORT"; do
             if lsof -ti:"$p" >/dev/null 2>&1; then busy=1; break; fi
         done
         (( busy == 0 )) && break
@@ -1100,16 +1108,18 @@ for row in "${TARGETS[@]}"; do
             continue
         fi
         # The `mtp` cell only makes sense on rows whose checkpoint ships an
-        # MTP sidecar (ANY of the three accepted layouts) — without one it
-        # would silently measure plain decode under an "mtp" label. NOTE:
-        # this must be an any-of check per file — `ls a b c` exits non-zero
-        # when ANY operand is missing, which silently skipped the mtp cell
-        # on EVERY row in the 2026-07-14 run (no model ships all three
-        # names).
+        # MTP sidecar (ANY of the four accepted layouts — mirrors
+        # mtp.sidecar_rel_paths in src/mtp.zig, incl. the OptiQ layout) —
+        # without one it would silently measure plain decode under an "mtp"
+        # label. NOTE: this must be an any-of check per file — `ls a b c`
+        # exits non-zero when ANY operand is missing, which silently
+        # skipped the mtp cell on EVERY row in the 2026-07-14 run (no model
+        # ships all three names).
         if [[ "$spec" == "mtp" &&
               ! -e "$mlxserve_path/mtp/weights.safetensors" &&
               ! -e "$mlxserve_path/mtp.safetensors" &&
-              ! -e "$mlxserve_path/model-mtp.safetensors" ]]; then
+              ! -e "$mlxserve_path/model-mtp.safetensors" &&
+              ! -e "$mlxserve_path/optiq/mtp.safetensors" ]]; then
             continue
         fi
         row_mlx_specs+=("$spec")
