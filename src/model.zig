@@ -114,6 +114,12 @@ pub const ModelConfig = struct {
     layer_norm_eps: f32 = 1e-12,
     type_vocab_size: u32 = 0,
 
+    // Bidirectional-attention embedding models (EmbeddingGemma): a decoder
+    // arch (gemma3_text) trained as an encoder. Implies is_encoder_only.
+    use_bidirectional_attention: bool = false,
+    // BOS id from config.json (embedding models wrap inputs <bos>…<eos>).
+    bos_token_id: ?u32 = null,
+
     // Context length from config.json (0 = unknown)
     max_position_embeddings: u32 = 0,
 
@@ -585,6 +591,19 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     if (cfg_obj.get("full_attention_interval")) |v| config.full_attention_interval = @intCast(v.integer);
     if (cfg_obj.get("attn_output_gate")) |v| {
         if (v == .bool) config.attn_output_gate = v.bool;
+    }
+
+    // Bidirectional-attention embedding models (EmbeddingGemma): a decoder
+    // arch trained as an encoder. Routes to the encoder forward + the
+    // /v1/embeddings surface; chat surfaces reject it.
+    if (cfg_obj.get("use_bidirectional_attention")) |v| {
+        if (v == .bool and v.bool) {
+            config.use_bidirectional_attention = true;
+            config.is_encoder_only = true;
+        }
+    }
+    if (cfg_obj.get("bos_token_id")) |v| {
+        if (v == .integer and v.integer >= 0) config.bos_token_id = @intCast(v.integer);
     }
 
     // Rope parameters (nested for Qwen3.5)
@@ -1956,6 +1975,58 @@ test "ModelConfig parses gemma4_unified text_config" {
     try testing.expectEqual(@as(u32, 48), config.num_hidden_layers);
     // Unified flag drives the encoder-free vision/audio embedder path.
     try testing.expect(config.is_gemma4_unified);
+}
+
+test "ModelConfig: use_bidirectional_attention marks an embedding encoder (EmbeddingGemma, issue #79)" {
+    // Real shape of mlx-community/embeddinggemma-300m-8bit's config.json: a
+    // gemma3_text DECODER config trained bidirectionally. Without the flag
+    // routing it to the encoder path, it loads as a causal chat model
+    // (garbage output) and /v1/embeddings rejects it.
+    const json =
+        \\{
+        \\  "model_type": "gemma3_text",
+        \\  "use_bidirectional_attention": true,
+        \\  "hidden_size": 768,
+        \\  "num_hidden_layers": 24,
+        \\  "num_attention_heads": 3,
+        \\  "num_key_value_heads": 1,
+        \\  "head_dim": 256,
+        \\  "intermediate_size": 1152,
+        \\  "sliding_window": 512,
+        \\  "bos_token_id": 2,
+        \\  "eos_token_id": 1,
+        \\  "pad_token_id": 0,
+        \\  "max_position_embeddings": 2048,
+        \\  "rope_theta": 1000000.0,
+        \\  "rope_local_base_freq": 10000.0,
+        \\  "query_pre_attn_scalar": 256,
+        \\  "vocab_size": 262144,
+        \\  "quantization": {"group_size": 64, "bits": 8}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expect(config.use_bidirectional_attention);
+    // Implies encoder-only: /v1/embeddings accepts it, chat surfaces 400 it,
+    // discovery advertises the embeddings capability.
+    try testing.expect(config.is_encoder_only);
+    try testing.expectEqual(@as(?u32, 2), config.bos_token_id);
+    try testing.expectEqual(@as(u32, 8), config.quant_bits);
+
+    // A chat gemma3_text WITHOUT the flag must stay a generation model.
+    const chat_json =
+        \\{
+        \\  "model_type": "gemma3_text",
+        \\  "hidden_size": 768,
+        \\  "num_hidden_layers": 24,
+        \\  "num_attention_heads": 3,
+        \\  "num_key_value_heads": 1,
+        \\  "head_dim": 256,
+        \\  "vocab_size": 262144
+        \\}
+    ;
+    const chat_config = try parseConfigFromJson(testing.allocator, chat_json);
+    try testing.expect(!chat_config.use_bidirectional_attention);
+    try testing.expect(!chat_config.is_encoder_only);
 }
 
 test "ModelConfig fills HF gemma3 defaults when text_config omits head counts" {

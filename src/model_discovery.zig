@@ -717,6 +717,9 @@ pub const StubMeta = struct {
     is_moe: bool = false,
     has_vision: bool = false,
     has_chat: bool = false,
+    /// bert, or a bidirectional embedding model (EmbeddingGemma) — the stub
+    /// advertises "embeddings" and no chat capabilities.
+    is_encoder: bool = false,
 };
 
 fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
@@ -778,8 +781,24 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
-    const is_encoder = std.mem.eql(u8, mt, "bert");
-    meta.has_chat = has_chat_template and !is_encoder;
+    const bidirectional = blk: {
+        const cfgBool = struct {
+            fn get(r: std.json.ObjectMap, tc: ?std.json.ObjectMap, key: []const u8) bool {
+                if (tc) |t| {
+                    if (t.get(key)) |v| {
+                        if (v == .bool) return v.bool;
+                    }
+                }
+                if (r.get(key)) |v| {
+                    if (v == .bool) return v.bool;
+                }
+                return false;
+            }
+        }.get;
+        break :blk cfgBool(root, text_cfg, "use_bidirectional_attention");
+    };
+    meta.is_encoder = std.mem.eql(u8, mt, "bert") or bidirectional;
+    meta.has_chat = has_chat_template and !meta.is_encoder;
     return meta;
 }
 
@@ -1230,6 +1249,26 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     {
         const m = parseStubMeta(a, "{\"model_type\":\"bert\",\"hidden_size\":384}", true);
         try testing.expect(!m.has_chat);
+        try testing.expect(m.is_encoder);
+    }
+    // Bidirectional embedding model (EmbeddingGemma): a gemma3_text config
+    // with use_bidirectional_attention — the stub must advertise embeddings,
+    // never chat, WITHOUT cold-loading (issue #79).
+    {
+        const json =
+            \\{"model_type":"gemma3_text","use_bidirectional_attention":true,
+            \\"hidden_size":768,"num_hidden_layers":24,"max_position_embeddings":2048}
+        ;
+        const m = parseStubMeta(a, json, true);
+        try testing.expect(m.is_encoder);
+        try testing.expect(!m.has_chat);
+        try testing.expectEqual(@as(u32, 768), m.hidden_size);
+    }
+    // A chat gemma3_text WITHOUT the flag stays a chat model.
+    {
+        const m = parseStubMeta(a, "{\"model_type\":\"gemma3_text\",\"hidden_size\":768}", true);
+        try testing.expect(!m.is_encoder);
+        try testing.expect(m.has_chat);
     }
     // A MULTIMODAL checkpoint keeps every text dim under `text_config` — the
     // root carries only model_type / vision_config / quantization. Reading the

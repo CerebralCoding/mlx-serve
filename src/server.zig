@@ -2643,7 +2643,8 @@ fn renderModelEntry(
     // same rule the loaded path uses) plus "vision" when a vision config is
     // present. Reasoning/audio stay load-gated (they need the live template /
     // encoder), so an unloaded stub may under-report those two.
-    const is_encoder_stub = std.mem.eql(u8, entry.arch_hint, "bert");
+    const is_encoder_stub = std.mem.eql(u8, entry.arch_hint, "bert") or
+        (sm.found and sm.is_encoder);
     // GGUF discovery stub (issue #59): no config.json to read StubMeta from,
     // but the embedded llama/ds4 engines always serve chat (the GGUF's own
     // template is adopted at load), so advertise the chat capability set the
@@ -3249,6 +3250,46 @@ fn htmlEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
     return try buf.toOwnedSlice(allocator);
 }
 
+/// `<bos> ids <eos>` for bidirectional embedding models. Either special is
+/// skipped when unknown; already-wrapped input is not double-wrapped.
+fn wrapEncoderIds(allocator: std.mem.Allocator, ids: []const u32, bos: ?u32, eos: ?u32) ![]u32 {
+    const need_bos = bos != null and (ids.len == 0 or ids[0] != bos.?);
+    const need_eos = eos != null and (ids.len == 0 or ids[ids.len - 1] != eos.?);
+    const out = try allocator.alloc(u32, ids.len + @intFromBool(need_bos) + @intFromBool(need_eos));
+    var i: usize = 0;
+    if (need_bos) {
+        out[i] = bos.?;
+        i += 1;
+    }
+    @memcpy(out[i .. i + ids.len], ids);
+    i += ids.len;
+    if (need_eos) out[i] = eos.?;
+    return out;
+}
+
+test "wrapEncoderIds: <bos> … <eos> wrapping for embedding models" {
+    const a = testing.allocator;
+    // EmbeddingGemma shape: bos 2, eos 1.
+    const wrapped = try wrapEncoderIds(a, &.{ 10, 11, 12 }, 2, 1);
+    defer a.free(wrapped);
+    try testing.expectEqualSlices(u32, &.{ 2, 10, 11, 12, 1 }, wrapped);
+
+    // Missing specials are skipped, never invented.
+    const no_bos = try wrapEncoderIds(a, &.{ 10, 11 }, null, 1);
+    defer a.free(no_bos);
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 1 }, no_bos);
+
+    // Already-wrapped input is left alone (idempotent).
+    const already = try wrapEncoderIds(a, &.{ 2, 10, 1 }, 2, 1);
+    defer a.free(already);
+    try testing.expectEqualSlices(u32, &.{ 2, 10, 1 }, already);
+
+    // Empty input still gets both specials.
+    const empty = try wrapEncoderIds(a, &.{}, 2, 1);
+    defer a.free(empty);
+    try testing.expectEqualSlices(u32, &.{ 2, 1 }, empty);
+}
+
 fn handleEmbeddings(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -3337,7 +3378,19 @@ fn handleEmbeddings(
         seqs.deinit(allocator);
     }
     for (texts.items) |text| {
-        const ids = try tok.encode(allocator, text);
+        const raw_ids = try tok.encode(allocator, text);
+        // Bidirectional embedding models (EmbeddingGemma) declare
+        // add_bos_token + add_eos_token; the SentencePiece encode path adds
+        // neither, so wrap here. BERT's [CLS]/[SEP] come from WordPiece itself.
+        const ids = if (config.use_bidirectional_attention) blk: {
+            defer allocator.free(raw_ids);
+            break :blk try wrapEncoderIds(
+                allocator,
+                raw_ids,
+                config.bos_token_id,
+                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
+            );
+        } else raw_ids;
         total_tokens += ids.len;
         try seqs.append(allocator, ids);
     }

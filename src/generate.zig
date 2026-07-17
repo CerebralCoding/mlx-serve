@@ -4812,14 +4812,12 @@ pub fn buildKeyPadMask(allocator: std.mem.Allocator, lengths: []const usize, max
     return mask;
 }
 
-/// Mean-pool `hidden` [B, T, H] over each row's first `lengths[b]` positions
-/// and L2-normalize. Returns B owned rows of H f32 each (plus the outer
-/// slice); caller frees all.
-pub fn maskedMeanPoolNormalize(allocator: std.mem.Allocator, hidden: mlx.mlx_array, lengths: []const usize, s: mlx.mlx_stream) ![][]f32 {
+/// Mean-pool `hidden` [B, T, H] over each row's first `lengths[b]` positions.
+/// Returns the pooled [B, H] mlx array (f32-promoted); caller frees.
+pub fn maskedMeanPool(allocator: std.mem.Allocator, hidden: mlx.mlx_array, lengths: []const usize, s: mlx.mlx_stream) !mlx.mlx_array {
     const shape = mlx.getShape(hidden);
     const batch: usize = @intCast(shape[0]);
     const seq_len: usize = @intCast(shape[1]);
-    const dim: usize = @intCast(shape[2]);
 
     // Pool weights [B, T, 1]: 1/len over real positions, 0 over padding — a
     // weighted sum along T is then exactly the masked mean. f32 weights also
@@ -4841,8 +4839,25 @@ pub fn maskedMeanPoolNormalize(allocator: std.mem.Allocator, hidden: mlx.mlx_arr
     try mlx.check(mlx.mlx_multiply(&weighted, hidden, weights, s));
 
     var pooled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(pooled);
+    errdefer _ = mlx.mlx_array_free(pooled);
     try mlx.check(mlx.mlx_sum_axis(&pooled, weighted, 1, false, s)); // [B, H]
+    return pooled;
+}
+
+/// Mean-pool `hidden` [B, T, H] over each row's first `lengths[b]` positions
+/// and L2-normalize. Returns B owned rows of H f32 each (plus the outer
+/// slice); caller frees all.
+pub fn maskedMeanPoolNormalize(allocator: std.mem.Allocator, hidden: mlx.mlx_array, lengths: []const usize, s: mlx.mlx_stream) ![][]f32 {
+    const pooled = try maskedMeanPool(allocator, hidden, lengths, s);
+    defer _ = mlx.mlx_array_free(pooled);
+    return l2NormalizeRows(allocator, pooled, s);
+}
+
+/// L2-normalize each row of `pooled` [B, H] and read out as owned f32 rows.
+pub fn l2NormalizeRows(allocator: std.mem.Allocator, pooled: mlx.mlx_array, s: mlx.mlx_stream) ![][]f32 {
+    const pshape = mlx.getShape(pooled);
+    const batch: usize = @intCast(pshape[0]);
+    const dim: usize = @intCast(pshape[1]);
 
     // L2 normalize rows: pooled / max(sqrt(sum(pooled^2)), eps).
     var squared = mlx.mlx_array_new();
@@ -4920,7 +4935,15 @@ pub fn computeEmbeddingsBatch(
         const hidden = try xfm.forwardEmbeddingMasked(input, mask);
         defer _ = mlx.mlx_array_free(hidden);
 
-        const rows = try maskedMeanPoolNormalize(allocator, hidden, pb.lengths, xfm.s);
+        // Sentence-transformers pipeline order: pool → dense head (when the
+        // checkpoint ships one — EmbeddingGemma) → normalize.
+        const rows = if (xfm.hasEmbedProjection()) blk: {
+            const pooled = try maskedMeanPool(allocator, hidden, pb.lengths, xfm.s);
+            defer _ = mlx.mlx_array_free(pooled);
+            const projected = try xfm.embedProjection(pooled);
+            defer _ = mlx.mlx_array_free(projected);
+            break :blk try l2NormalizeRows(allocator, projected, xfm.s);
+        } else try maskedMeanPoolNormalize(allocator, hidden, pb.lengths, xfm.s);
         defer allocator.free(rows);
         for (rows, 0..) |r, i| {
             results[start + i] = r;
