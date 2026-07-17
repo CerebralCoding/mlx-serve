@@ -754,7 +754,8 @@ pub const Generator = struct {
         mtp: ?*mtp_mod.MtpModel = null,
         /// Max tokens drafted per nextMtp round. 0 = auto (`--mtp-depth` not
         /// passed): resolved by `resolveMtpDepthCap` — MTP_ADAPTIVE_DEFAULT_CAP
-        /// under the EV controller, DEFAULT_DEPTH in fixed mode.
+        /// (MTP_ADAPTIVE_NAX_CAP on M5-class NAX machines) under the EV
+        /// controller, DEFAULT_DEPTH in fixed mode.
         mtp_depth: u32 = 0,
         /// When set, this slice (rather than `prompt_ids`) becomes the
         /// `prompt_ids_owned` source for PLD's n-gram lookup. Used by the
@@ -3235,12 +3236,23 @@ pub const Generator = struct {
     // fixed-depth controller above).
 
     /// Default depth cap when `--mtp-depth` is not passed (0 = auto) and the
-    /// EV controller is active. 6 keeps the verify forward at seq 1+6 = 7,
-    /// the split-K verify-qmm kernel's ceiling (M=8 hits a spill/occupancy
-    /// cliff, and on the kernel's cost surface depth 6 strictly dominates
-    /// depth 7-on-stock: max 7 tokens at ~84 ms beats max 8 at ~115 ms).
-    /// Seq 7 also stays under sdpa_vector's hd-256 ceiling (seq <= 8).
+    /// EV controller is active, keyed on the verify-qmm kernel family's M
+    /// ceiling (transformer.verifyQmmNaxEnabled — the controller must never
+    /// plan verify widths the dispatch won't serve, so killing the NAX lane
+    /// with any switch reverts the cap too):
+    /// - plain SIMD (M1-M4): 6 keeps the verify forward at seq 1+6 = 7,
+    ///   the split-K verify-qmm kernel's ceiling (M=8 hits a spill/occupancy
+    ///   cliff, and on the kernel's cost surface depth 6 strictly dominates
+    ///   depth 7-on-stock: max 7 tokens at ~84 ms beats max 8 at ~115 ms).
+    ///   Seq 7 also stays under sdpa_vector's hd-256 ceiling (seq <= 8).
+    /// - M5-class NAX (MTP_ADAPTIVE_NAX_CAP): the m16 tensor-ops tile serves
+    ///   verify qmms through 16 rows, so the SIMD cliff does not apply; 8 =
+    ///   MAX_DEPTH (verify seq 9 <= 16 rows). NOTE for the M5 trace sweep
+    ///   (todo-m5-nax.md §9.5): verify seq 9 leaves sdpa_vector's hd-256
+    ///   seq<=8 fast path for attention — if T(8) reads poorly there,
+    ///   `--mtp-depth 7` is the same-boot A/B (explicit values win below).
     pub const MTP_ADAPTIVE_DEFAULT_CAP: u32 = 6;
+    pub const MTP_ADAPTIVE_NAX_CAP: u32 = 8;
     /// Rounds of legacy (fixed-depth windowed) behavior while the EMAs fill.
     /// Warmup, but converges in ROUNDS, not 43 s of offline calibration.
     pub const MTP_EV_WARMUP_ROUNDS: u32 = 10;
@@ -3311,15 +3323,18 @@ pub const Generator = struct {
     };
 
     /// Resolve the configured depth cap. 0 = auto (`--mtp-depth` not passed):
-    /// MTP_ADAPTIVE_DEFAULT_CAP under the EV controller, DEFAULT_DEPTH fixed.
-    /// Explicit values win in both modes, clamped to [1, MAX_DEPTH].
-    pub fn mtpDepthCapFor(configured: u32, adaptive: bool) u32 {
+    /// under the EV controller MTP_ADAPTIVE_DEFAULT_CAP, raised to
+    /// MTP_ADAPTIVE_NAX_CAP where the NAX verify-qmm lane serves (M5-class);
+    /// DEFAULT_DEPTH fixed. Explicit values win in both modes, clamped to
+    /// [1, MAX_DEPTH].
+    pub fn mtpDepthCapFor(configured: u32, adaptive: bool, nax: bool) u32 {
         if (configured != 0) return @min(mtp_mod.MAX_DEPTH, @max(1, configured));
-        return if (adaptive) MTP_ADAPTIVE_DEFAULT_CAP else mtp_mod.DEFAULT_DEPTH;
+        if (adaptive) return if (nax) MTP_ADAPTIVE_NAX_CAP else MTP_ADAPTIVE_DEFAULT_CAP;
+        return mtp_mod.DEFAULT_DEPTH;
     }
 
     pub fn resolveMtpDepthCap(configured: u32) u32 {
-        return mtpDepthCapFor(configured, mtpAdaptiveEnabled());
+        return mtpDepthCapFor(configured, mtpAdaptiveEnabled(), transformer_mod.verifyQmmNaxEnabled());
     }
 
     /// Expected committed tokens for an m-deep round: the always-committed t1
@@ -6037,15 +6052,27 @@ test "mtpDepthDecision: confidence gates on disable, promote, cooldown" {
     try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(2, 3, 0.30, 5, true));
 }
 
-test "mtpDepthCapFor: auto cap is 7 in adaptive mode, DEFAULT_DEPTH fixed; explicit always wins" {
+test "mtpDepthCapFor: auto adaptive cap is 6 plain-SIMD / 8 NAX; DEFAULT_DEPTH fixed; explicit always wins" {
     // 0 = auto (--mtp-depth not passed).
-    try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapFor(0, true));
-    try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapFor(0, false));
-    // Explicit values win in both modes, clamped to [1, MAX_DEPTH].
-    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapFor(5, true));
-    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapFor(5, false));
-    try testing.expectEqual(@as(u32, 2), Generator.mtpDepthCapFor(2, true));
-    try testing.expectEqual(mtp_mod.MAX_DEPTH, Generator.mtpDepthCapFor(12, true));
+    try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapFor(0, true, false));
+    // M5-class NAX machines: the m16 verify-qmm tile serves M up to 16, so
+    // the plain-SIMD spill cliff that capped depth at 6 does not apply —
+    // the auto cap rises to 8 (verify seq 9 <= 16 rows).
+    try testing.expectEqual(Generator.MTP_ADAPTIVE_NAX_CAP, Generator.mtpDepthCapFor(0, true, true));
+    try testing.expectEqual(@as(u32, 8), Generator.mtpDepthCapFor(0, true, true));
+    // The mtp_ev_accept EMA array is [MAX_DEPTH]f32 — the NAX cap must fit.
+    try testing.expect(Generator.MTP_ADAPTIVE_NAX_CAP <= mtp_mod.MAX_DEPTH);
+    // Fixed-depth mode ignores the probe (DEFAULT_DEPTH is not kernel-bound).
+    try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapFor(0, false, false));
+    try testing.expectEqual(mtp_mod.DEFAULT_DEPTH, Generator.mtpDepthCapFor(0, false, true));
+    // Explicit values win in both modes and on both machine classes,
+    // clamped to [1, MAX_DEPTH].
+    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapFor(5, true, false));
+    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapFor(5, true, true));
+    try testing.expectEqual(@as(u32, 5), Generator.mtpDepthCapFor(5, false, false));
+    try testing.expectEqual(@as(u32, 2), Generator.mtpDepthCapFor(2, true, false));
+    try testing.expectEqual(mtp_mod.MAX_DEPTH, Generator.mtpDepthCapFor(12, true, false));
+    try testing.expectEqual(mtp_mod.MAX_DEPTH, Generator.mtpDepthCapFor(12, true, true));
 }
 
 test "mtpEvExpectedTokens: 1 + sum of acceptance chain products" {

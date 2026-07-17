@@ -105,6 +105,15 @@ methodology): **no regression** — every mlx-serve decode cell within ±5%.
 | hy_v3 manual reading (no bench family) | Hy3-oQ2e (295B-A21B 2-bit) decode 25–28 tok/s · Hy3-REAP62 4-bit ~26 tok/s |
 | **A GGUF-only chart flatters us** | vs LM-GGUF the 26B-A4B row reads +33%; vs oMLX it is **+1.6%**. Never quote a win without naming the engine it's over. |
 
+### Perf gate 2026-07-16 (`feature/m5-neural-accel` — NAX verify-qmm lane, dormant on this M4)
+
+CSV: `docs/perf-csvs/bench-all-20260716-233545.csv` vs `all-26.7.9.csv` (same
+methodology): **no regression** — every decode cell within ±3.5%, signs mixed
+(35B mtp +3.5%, 31B pld +11.3% = PLD spread); worst deltas are prefill cells
+(−4.7/−4.5%) with equal-sized prefill gains elsewhere — prefill never reaches
+the touched dispatch. MTP cells 76.4/78.3/222.7 vs 76.1/77.8/215.1 baseline.
+NAX lane never engages here (probe false: `applegpu_g16s`); M5 numbers TBD.
+
 ## Long-context prefill (hd-256)
 
 | Case | Result |

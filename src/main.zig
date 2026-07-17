@@ -341,7 +341,7 @@ pub fn main(init: std.process.Init) !void {
     // ships a sidecar is otherwise unreachable from clients that never send
     // `enable_mtp:true` (llmprobe, Claude Code, curl).
     var force_mtp = false;
-    var mtp_depth: u32 = 0; // 0 = auto (resolveMtpDepthCap: EV cap 7 / fixed cap 3); explicit flag wins
+    var mtp_depth: u32 = 0; // 0 = auto (resolveMtpDepthCap: EV cap 6, 8 on M5-NAX / fixed cap 3); explicit flag wins
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
