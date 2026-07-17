@@ -1,8 +1,8 @@
 class MlxServe < Formula
   desc "Native LLM server for Apple Silicon with OpenAI & Anthropic compatible APIs"
   homepage "https://github.com/ddalcu/mlx-serve"
-  version "26.7.8"
-  sha256 "4ad488e0671da242a466495f919ee89d40649ce7c503415a29a07826bc13f161"
+  version "26.7.9"
+  sha256 "e1f433ff5d0773befe5a62eae40af2afcfb7a4fa3ddb1c8ca3cbf76e1af8dd65"
   url "https://github.com/ddalcu/mlx-serve/releases/download/v#{version}/mlx-serve-bin-macos-arm64.tar.gz"
 
   depends_on macos: :sonoma
