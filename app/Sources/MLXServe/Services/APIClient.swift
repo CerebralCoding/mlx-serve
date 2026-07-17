@@ -261,7 +261,9 @@ class APIClient {
         request.setValue("application/json", forHTTPHeaderField: "Content-Type")
         // First call may cold-load the encoder model (seconds, not minutes).
         request.timeoutInterval = 120
-        request.httpBody = try JSONSerialization.data(withJSONObject: ["model": model, "input": input])
+        // withoutEscapingSlashes: a LAN model id's org prefix ("ddalcu/…@peer")
+        // must not ship as `\/` — the server compares ids byte-wise.
+        request.httpBody = try JSONSerialization.data(withJSONObject: ["model": model, "input": input], options: [.withoutEscapingSlashes])
         let (data, response) = try await session.data(for: request)
         guard let http = response as? HTTPURLResponse, http.statusCode == 200 else {
             let code = (response as? HTTPURLResponse)?.statusCode ?? -1
@@ -475,7 +477,10 @@ class APIClient {
             if let v = defaults.enablePLD { body["enable_pld"] = v }
             if let v = defaults.enableDrafter { body["enable_drafter"] = v }
             if let tools { body["tools"] = tools }
-            request.httpBody = try JSONSerialization.data(withJSONObject: body)
+            // withoutEscapingSlashes: same rationale as loadModel — a LAN model
+            // id ("ddalcu/…@peer") escaped to `\/` misses the peer-table
+            // byte-compare (live 404 "no longer shares this model").
+            request.httpBody = try JSONSerialization.data(withJSONObject: body, options: [.withoutEscapingSlashes])
         }
 
         let streamStart = Date()

@@ -6234,14 +6234,22 @@ const LAN_PEER_WAIT_MS: i64 = 15_000;
 /// 502 when the peer resolves but stops accepting. Never a silent fallback
 /// to the local default model.
 fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, method: []const u8, raw_path: []const u8, body: []const u8, full_id: []const u8) !void {
-    const rid = lan_mod.splitRemoteId(full_id).?;
+    // Swift/PHP clients escape '/' as '\/', so the raw body slice can read
+    // `ddalcu\/gemma…@peer` while the peer table stores the canonical id
+    // (live 404 "no longer shares this model" from the app). Look up with
+    // the CANONICAL form — and splice the canonical bare id into the
+    // forwarded body too, or the peer's own scanner would miss it and
+    // silently serve its default model.
+    var canon_buf: [512]u8 = undefined;
+    const canon = lan_mod.unescapeJsonSlashes(&canon_buf, full_id);
+    const rid = lan_mod.splitRemoteId(canon).?;
     if (!l.discover) {
         try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "This id names a LAN peer's model, but LAN discovery is off on this server — start it with --lan-discover (app: Settings > LAN Sharing > Use models shared by other Macs)", 404);
         return;
     }
     const deadline = nowMsMonotonic(stream.io) + LAN_PEER_WAIT_MS;
     const remote: lan_mod.Remote = remote: while (true) {
-        switch (l.lookupRemote(full_id)) {
+        switch (l.lookupRemote(canon)) {
             .found => |r| break :remote r,
             .model_unlisted => {
                 try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "The LAN peer no longer shares this model", 404);

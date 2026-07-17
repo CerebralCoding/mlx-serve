@@ -155,6 +155,24 @@ pub fn rewriteModelValue(alloc: std.mem.Allocator, body: []const u8, model_value
     return out;
 }
 
+/// Collapse JSON's optional `\/` escape to `/`. Swift's JSONSerialization
+/// (and PHP's json_encode) escape every slash, so a remote id's org prefix
+/// arrives as `ddalcu\/gemma…` from the app while the peer table stores the
+/// canonical form — the same `\/` class the load-model handler documents.
+/// Returns the input verbatim (zero-copy) when there is nothing to collapse
+/// or the scratch buffer is too small.
+pub fn unescapeJsonSlashes(buf: []u8, s: []const u8) []const u8 {
+    if (std.mem.indexOf(u8, s, "\\/") == null or s.len > buf.len) return s;
+    var n: usize = 0;
+    var i: usize = 0;
+    while (i < s.len) : (i += 1) {
+        if (s[i] == '\\' and i + 1 < s.len and s[i + 1] == '/') continue;
+        buf[n] = s[i];
+        n += 1;
+    }
+    return buf[0..n];
+}
+
 /// TXT record wire format: length-prefixed `key=value` strings.
 pub fn txtBuild(buf: []u8, token: []const u8) []const u8 {
     std.debug.assert(buf.len >= 5 + 2 + token.len and token.len <= 253);
@@ -1038,6 +1056,22 @@ test "lan: parsePeerModels rewrites ids, adds lan_peer, keeps meta" {
     // Not an mlx-serve shape → error, not a crash.
     try t.expectError(error.BadPeerJson, parsePeerModels(a, "{\"nope\":true}", "x"));
     try t.expectError(error.BadPeerJson, parsePeerModels(a, "not json", "x"));
+}
+
+test "lan: JSON-escaped slashes canonicalize (Swift clients send org\\/name)" {
+    var buf: [256]u8 = undefined;
+    // JSONSerialization (Swift, PHP, …) legally escapes '/' as '\/'. The org/
+    // prefix of a remote id then misses the byte-compare — live 404 "no longer
+    // shares this model" from the app on ddalcu\/gemma-4-e2b…@Davids-Mac-mini.
+    try t.expectEqualStrings("ddalcu/gemma-e2b@Mini", unescapeJsonSlashes(&buf, "ddalcu\\/gemma-e2b@Mini"));
+    // No escapes → the INPUT slice comes back verbatim (zero-copy).
+    const plain = "ddalcu/gemma-e2b@Mini";
+    try t.expect(unescapeJsonSlashes(&buf, plain).ptr == plain.ptr);
+    // Only the two-byte sequence `\/` collapses; other backslashes survive.
+    try t.expectEqualStrings("a\\b/c", unescapeJsonSlashes(&buf, "a\\b\\/c"));
+    // Oversized input degrades to verbatim rather than truncating.
+    var tiny: [4]u8 = undefined;
+    try t.expectEqualStrings("x\\/y", unescapeJsonSlashes(tiny[0..2], "x\\/y"));
 }
 
 test "lan: lookupRemote distinguishes found / unlisted / unknown" {
