@@ -260,7 +260,7 @@ pub const MtpModel = struct {
         // The head's TRUE params, not the trunk global — mixed checkpoints
         // (hy_v3: 8-bit head over a 2-bit trunk) diverge, and requantizing
         // with the wrong source bits reads garbage.
-        const head_qp = headQuantParams(target);
+        const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
         if (bits >= head_qp.bits) return; // no byte saving over the trunk head
         const group: u32 = 64;
 
@@ -1028,7 +1028,7 @@ fn targetLmHead(self: *const MtpModel, target: *Transformer, x: mlx.mlx_array, s
     // (hy_v3 2-bit trunk ships an 8-bit lm_head — the global bits crashed the
     // whole process in mlx's shape check, live 2026-07-14). Non-affine trunks
     // keep the config fallback.
-    const qp = headQuantParams(target);
+    const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
     try mlx.check(mlx.mlx_quantized_matmul(
         &out,
         x,
@@ -1044,20 +1044,15 @@ fn targetLmHead(self: *const MtpModel, target: *Transformer, x: mlx.mlx_array, s
     return out;
 }
 
-/// The trunk lm_head's TRUE quant params — solved from tensor geometry when
-/// affine (the head's bits routinely differ from the trunk global on mixed
-/// checkpoints), config fallback otherwise.
-fn headQuantParams(target: *Transformer) transformer_mod.QuantParams {
-    if (transformer_mod.affineParamsFromGeometry(
-        target.lm_head_w,
-        target.lm_head_s,
-        @intCast(target.config.hidden_size),
-    )) |qp| return qp;
-    return .{
-        .bits = target.config.quant_bits,
-        .group_size = target.config.quant_group_size,
-        .mode = target.config.quant_mode,
-    };
+/// The trunk lm_head's TRUE quant params, via the same dtype-gated resolver
+/// the trunk itself uses: uint8 scales → the config's non-affine mode (a raw
+/// geometry solve mis-reads mxfp8 8-bit/gs32 as AFFINE 8-bit/gs32 — issue
+/// #81, "Biases must be provided" crash on biasless heads); float scales →
+/// exact per-geometry affine solve (the head's bits routinely differ from
+/// the trunk global on mixed checkpoints — hy_v3 ships an 8-bit head over a
+/// 2-bit trunk).
+fn headQuantParams(config: *const model_mod.ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array) transformer_mod.QuantParams {
+    return transformer_mod.computeQuantParams(config, w, sc, config.hidden_size);
 }
 
 /// Outputs of the pre-rope half of the MTP layer. All arrays owned.
@@ -1548,6 +1543,63 @@ test "mtp: requantizeRows round-trips through a finer re-encode (chunked)" {
     try testing.expectEqual(@as(c_int, @intCast(cols / 4)), w8_shape[1]);
 }
 
+test "mtp: requantizeRows accepts a non-affine (mxfp8) source — the issue-#81 draft-head path" {
+    // With headQuantParams fixed, buildDraftHead on an mxfp8 trunk passes
+    // mode="mxfp8" and the load path's null-ctx biases into requantizeRows.
+    // The source dequantize must ride that without demanding affine biases
+    // (else the crash just moves from the first forward to bind time), and
+    // the 3-bit affine draft re-encode must stay correlated.
+    const s = mlx.gpuStream();
+    const rows: usize = 64;
+    const cols: usize = 256;
+
+    var prng = std.Random.DefaultPrng.init(7);
+    const buf = try testing.allocator.alloc(f32, rows * cols);
+    defer testing.allocator.free(buf);
+    for (buf) |*x| x.* = prng.random().floatNorm(f32);
+    const shape = [_]c_int{ @intCast(rows), @intCast(cols) };
+    const dense_f32 = mlx.mlx_array_new_data(buf.ptr, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(dense_f32);
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_astype(&dense, dense_f32, .bfloat16, s));
+
+    // mxfp8 "trunk head": a (w, scales) pair — no biases tensor, by design.
+    var pair = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(pair);
+    try mlx.check(mlx.mlx_quantize(&pair, dense, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{}, s));
+    var qmx = QLinear{ .w = mlx.mlx_array_new(), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() };
+    defer qmx.deinit();
+    try mlx.check(mlx.mlx_vector_array_get(&qmx.w, pair, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&qmx.s, pair, 1));
+    // qmx.b stays null-ctx — exactly what the load path hands buildDraftHead.
+
+    // The live buildDraftHead call shape: 3-bit/gs64 draft re-encode, chunked.
+    var q3 = try requantizeRows(s, qmx.w, qmx.s, qmx.b, 32, 8, "mxfp8", 64, 3, 16);
+    defer q3.deinit();
+
+    var deq = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (deq) |d| {
+        _ = mlx.mlx_array_free(d);
+    };
+    try mlx.check(mlx.mlx_dequantize(&deq[0], qmx.w, qmx.s, qmx.b, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{}, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&deq[1], q3.w, q3.s, q3.b, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(3), "affine", .{}, .{ .value = .float32, .has_value = true }, s));
+    for (deq) |d| try mlx.check(mlx.mlx_array_eval(d));
+
+    const a = mlx.mlx_array_data_float32(deq[0]).?;
+    const b = mlx.mlx_array_data_float32(deq[1]).?;
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (0..rows * cols) |i| {
+        dot += @as(f64, a[i]) * b[i];
+        na += @as(f64, a[i]) * a[i];
+        nb += @as(f64, b[i]) * b[i];
+    }
+    const cos = dot / (@sqrt(na) * @sqrt(nb));
+    try testing.expect(cos > 0.95);
+}
+
 test "mtp: sidecar resolution accepts native and Forge layouts in priority order" {
     const io = testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1665,6 +1717,65 @@ test "mtp: inferGroupSize geometry" {
     // The real sidecar geometry: in=5120 packed to 640 u32 cols at 4 bits,
     // scales 160 cols → group 32.
     try testing.expectEqual(@as(u32, 32), (5120 / 160));
+}
+
+test "mtp: headQuantParams never mis-resolves a non-affine lm_head as affine (issue #81)" {
+    // An mxfp8 8-bit/gs32 lm_head's GEOMETRY coincidentally solves as a valid
+    // affine 8-bit/gs32 (w [V, H/4] u32, scales [V, H/32]) — but the scales
+    // are fp8-encoded uint8 and no biases tensor exists, so a mode="affine"
+    // matmul/dequantize throws "Biases must be provided for affine
+    // quantization" and kills the first MTP forward. The scales-dtype gate
+    // (uint8 → the config's non-affine mode) must win over the geometry
+    // shortcut, exactly as computeQuantParams resolves the trunk.
+    const s = mlx.gpuStream();
+    const H = 512;
+    const V = 8;
+
+    const mk = struct {
+        fn arr(shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st));
+            return a;
+        }
+    };
+
+    // mxfp8 head: w [V, H*8/32] u32, scales [V, H/32] u8.
+    const w8 = try mk.arr(&.{ V, H * 8 / 32 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(w8);
+    const s8 = try mk.arr(&.{ V, H / 32 }, .uint8, s);
+    defer _ = mlx.mlx_array_free(s8);
+
+    var cfg = model_mod.ModelConfig{};
+    cfg.hidden_size = H;
+    cfg.quant_bits = 8;
+    cfg.quant_group_size = 32;
+    cfg.quant_mode = .mxfp8;
+
+    const qp8 = headQuantParams(&cfg, w8, s8);
+    try testing.expectEqual(model_mod.QuantMode.mxfp8, qp8.mode);
+    try testing.expectEqual(@as(u32, 8), qp8.bits);
+    try testing.expectEqual(@as(u32, 32), qp8.group_size);
+
+    // mxfp4 (same class, 4-bit/gs32 — also a false-positive affine geometry).
+    const w4 = try mk.arr(&.{ V, H * 4 / 32 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(w4);
+    cfg.quant_bits = 4;
+    cfg.quant_mode = .mxfp4;
+    const qp4 = headQuantParams(&cfg, w4, s8);
+    try testing.expectEqual(model_mod.QuantMode.mxfp4, qp4.mode);
+
+    // Characterization (green before AND after): the mixed-AFFINE shape this
+    // function exists for — hy_v3's 8-bit/gs32 head (bf16 scales) over a
+    // 2-bit/gs64 trunk still resolves per-geometry, never per-config.
+    const sb = try mk.arr(&.{ V, H / 32 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(sb);
+    cfg.quant_bits = 2;
+    cfg.quant_group_size = 64;
+    cfg.quant_mode = .affine;
+    const qpa = headQuantParams(&cfg, w8, sb);
+    try testing.expectEqual(model_mod.QuantMode.affine, qpa.mode);
+    try testing.expectEqual(@as(u32, 8), qpa.bits);
+    try testing.expectEqual(@as(u32, 32), qpa.group_size);
 }
 
 test "loadMtp: MoE sidecar layout (language_model. prefix, switch_mlp experts)" {
