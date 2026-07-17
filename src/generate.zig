@@ -2544,7 +2544,7 @@ pub const Generator = struct {
         const s = xfm.s;
         const head = self.mtp.?;
         const mc = &self.mtp_cache.?;
-        // Opt-in cross-request EV seed: inherit the head's last healthy acceptance
+        // Cross-request EV seed: inherit the head's last healthy acceptance
         // surface so the controller plans from round 1 instead of re-warming
         // (~10 legacy rounds + a +1/round base climb — a third of a short
         // generation). Demotion stays instant (EMA decay + sticky disable are
@@ -3518,12 +3518,18 @@ pub const Generator = struct {
         return on;
     }
 
-    /// Cross-request EV seeding gate — opt in with MLX_SERVE_MTP_EV_SEED=1.
-    /// Default OFF keeps request planning independent of unrelated traffic.
+    /// Cross-request EV seeding gate — default ON; set
+    /// MLX_SERVE_MTP_EV_SEED=0 to keep request planning independent.
     var mtp_ev_seed_cache: ?bool = null;
+    fn mtpEvSeedEnabledFromEnv(raw: ?[]const u8) bool {
+        const value = raw orelse return true;
+        return value.len == 0 or value[0] != '0';
+    }
+
     fn mtpEvSeedEnabled() bool {
         if (mtp_ev_seed_cache) |v| return v;
-        const on = readEnvBool("MLX_SERVE_MTP_EV_SEED");
+        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_EV_SEED")) |p| std.mem.span(p) else null;
+        const on = mtpEvSeedEnabledFromEnv(raw);
         mtp_ev_seed_cache = on;
         return on;
     }
@@ -6144,6 +6150,14 @@ test "mtpDepthDecision: confidence gates on disable, promote, cooldown" {
     try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.95, 8, true));
     // Demote reacts on a small sample, even during cooldown.
     try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(2, 3, 0.30, 5, true));
+}
+
+test "MTP EV seed defaults on and explicit zero disables" {
+    try testing.expect(Generator.mtpEvSeedEnabledFromEnv(null));
+    try testing.expect(Generator.mtpEvSeedEnabledFromEnv(""));
+    try testing.expect(Generator.mtpEvSeedEnabledFromEnv("1"));
+    try testing.expect(!Generator.mtpEvSeedEnabledFromEnv("0"));
+    try testing.expect(!Generator.mtpEvSeedEnabledFromEnv("0-disabled"));
 }
 
 test "mtpDepthCapFor: auto cap follows the selected NAX profile; explicit always wins" {
