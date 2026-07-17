@@ -198,14 +198,14 @@ pub const MtpModel = struct {
     draft_head_bits: u32 = 0,
     draft_head_group: u32 = 0,
 
-    /// Opt-in cross-request EV controller seed (inference thread only, like every
+    /// Cross-request EV controller seed (inference thread only, like every
     /// mutable field here): the last HEALTHY request's per-index acceptance
     /// EMAs + base depth, written by `Generator.deinit`, consumed by the
     /// first `nextMtp` round of the next request. A fresh controller burns
     /// ~10 legacy-warmup rounds plus a +1/round base climb per request —
     /// a third of a short protocol-style generation; seeding restores the
-    /// learned surface from round 1 when MLX_SERVE_MTP_EV_SEED=1. Never
-    /// written by disabled/short runs; disabled by default for request isolation.
+    /// learned surface from round 1. Never written by disabled/short runs;
+    /// set MLX_SERVE_MTP_EV_SEED=0 to opt into request isolation.
     ev_seed_accept: ?[MAX_DEPTH]f32 = null,
     ev_seed_m_lo: u32 = 1,
 
