@@ -874,4 +874,86 @@ extension ServerOptionsTests {
         let back = try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(o))
         XCTAssertEqual(back.wakePhrase, "hey jarvis")
     }
+
+    // MARK: - LAN sharing flags
+
+    /// Everything LAN defaults OFF: a default launch must stay flag-free
+    /// (mirrors the server, where sharing/discovery only exist when asked).
+    func testLanFlagsOmittedByDefault() {
+        let args = ServerOptions().toCLIArgs()
+        XCTAssertFalse(contains(args, flag: "--lan-share"))
+        XCTAssertFalse(args.contains("--lan-discover"))
+        XCTAssertFalse(contains(args, flag: "--lan-name"))
+    }
+
+    func testLanShareAllEmitsAll() {
+        var o = ServerOptions()
+        o.lanShareEnabled = true
+        XCTAssertTrue(contains(o.toCLIArgs(), flag: "--lan-share", value: "all"))
+    }
+
+    func testLanShareSelectedEmitsCsv() {
+        var o = ServerOptions()
+        o.lanShareEnabled = true
+        o.lanShareAll = false
+        o.lanSharedModels = ["gemma-4-e4b-it-4bit", "qwen3.6-27b"]
+        XCTAssertTrue(contains(o.toCLIArgs(), flag: "--lan-share",
+                               value: "gemma-4-e4b-it-4bit,qwen3.6-27b"))
+    }
+
+    /// Share ON with nothing picked shares nothing — the flag is omitted
+    /// entirely (the server treats an empty set as sharing disabled anyway).
+    func testLanShareNothingSelectedOmitsFlag() {
+        var o = ServerOptions()
+        o.lanShareEnabled = true
+        o.lanShareAll = false
+        o.lanSharedModels = []
+        XCTAssertFalse(contains(o.toCLIArgs(), flag: "--lan-share"))
+    }
+
+    func testLanDiscoverAndNameEmission() {
+        var o = ServerOptions()
+        o.lanName = "Studio"
+        // A name with LAN fully off is dead config — never emitted.
+        XCTAssertFalse(contains(o.toCLIArgs(), flag: "--lan-name"))
+        o.lanDiscoverEnabled = true
+        let args = o.toCLIArgs()
+        XCTAssertTrue(args.contains("--lan-discover"))
+        XCTAssertTrue(contains(args, flag: "--lan-name", value: "Studio"))
+    }
+
+    /// LAN fields are server-launch flags — editing any of them must trip
+    /// the restart banner.
+    func testLanTogglesTriggerRestart() {
+        let base = ServerOptions()
+        for mutate in [
+            { (o: inout ServerOptions) in o.lanShareEnabled = true },
+            { (o: inout ServerOptions) in o.lanShareAll = false },
+            { (o: inout ServerOptions) in o.lanSharedModels = ["m"] },
+            { (o: inout ServerOptions) in o.lanDiscoverEnabled = true },
+            { (o: inout ServerOptions) in o.lanName = "Studio" },
+        ] {
+            var edited = base
+            mutate(&edited)
+            XCTAssertFalse(base.serverLaunchEquals(edited))
+        }
+    }
+
+    /// Migration safety: a stored blob that predates the LAN fields decodes
+    /// with everything off, and a custom config round-trips.
+    func testLanFieldsDecodeTolerantlyAndRoundTrip() throws {
+        let legacy = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
+        XCTAssertFalse(legacy.lanShareEnabled)
+        XCTAssertTrue(legacy.lanShareAll)
+        XCTAssertFalse(legacy.lanDiscoverEnabled)
+
+        var o = ServerOptions()
+        o.lanShareEnabled = true
+        o.lanShareAll = false
+        o.lanSharedModels = ["a", "b"]
+        o.lanDiscoverEnabled = true
+        o.lanName = "Studio"
+        let back = try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(o))
+        XCTAssertEqual(back, o)
+    }
 }

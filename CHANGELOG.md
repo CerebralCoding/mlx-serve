@@ -1,5 +1,12 @@
 # Changelog
 
+## v26.7.10 — Share models across your Macs
+
+- **LAN model sharing.** Flip one switch and every Mac on your network can use the models this Mac hosts — chat, and image / speech / music / video / 3D generation alike. Zero setup: hosts find each other automatically over Bonjour, shared models appear in every model picker as "model · peer", and requests stream to the hosting Mac. The MacBook in the kitchen can chat on the Studio's 27B; Claude Code pointed at localhost picks up network models too. Everything is off by default, you choose exactly which models to share, and only inference is ever exposed — model management, metrics, and the status page stay private to each Mac. Heads-up shown in Settings: prompts sent to a shared model are visible to the Mac that runs it.
+- **Headless sharing for CLI users.** `mlx-serve --serve --lan-share all` shares from any Mac without the app; `--lan-discover` mirrors peers' models into `/v1/models` as `<model>@<peer>` and transparently proxies requests that name one.
+
+---
+
 ## v26.7.9 — DeepSeek drafts ahead, and sturdier tool calls
 
 - **DeepSeek V4 Flash learns to draft ahead.** The 284B flagship now uses its published draft head for speculative decoding: the app downloads the small companion file automatically beside the model, and the server drafts and verifies several tokens per pass with identical output. On by default; `--no-ds4-mtp` turns it off.

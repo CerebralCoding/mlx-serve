@@ -650,6 +650,10 @@ struct ImageGenRequest {
     /// Keep the model resident after this generation (default off → unload
     /// when done, freeing GPU memory). On → instant reuse for the next gen.
     var keepResident: Bool = false
+    /// Set when the pane picked a network model: the LAN routing id
+    /// (`<model>@<peer>`). The gen service then skips local resolve/load/
+    /// unload — the hosting Mac loads on demand and manages its own memory.
+    var lanModelId: String? = nil
     /// Apply the server's NSFW content filter (on by default). Off → sends
     /// `"safety": false` so the server skips it for this request.
     var safeMode: Bool = true
@@ -735,6 +739,10 @@ struct VideoGenRequest {
     var audioPath: String? = nil
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Set when the pane picked a network model: the LAN routing id
+    /// (`<model>@<peer>`). The gen service then skips local resolve/load/
+    /// unload — the hosting Mac loads on demand and manages its own memory.
+    var lanModelId: String? = nil
     /// Style LoRA (Advanced): absolute path to a .safetensors adapter applied
     /// to the DiT at runtime. nil = none.
     var loraPath: String? = nil
@@ -758,6 +766,10 @@ struct AudioGenRequest {
     var temperature: Double = 0.7
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Set when the pane picked a network model: the LAN routing id
+    /// (`<model>@<peer>`). The gen service then skips local resolve/load/
+    /// unload — the hosting Mac loads on demand and manages its own memory.
+    var lanModelId: String? = nil
 }
 
 struct MusicGenRequest {
@@ -778,6 +790,10 @@ struct MusicGenRequest {
     var seed: Int = -1
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Set when the pane picked a network model: the LAN routing id
+    /// (`<model>@<peer>`). The gen service then skips local resolve/load/
+    /// unload — the hosting Mac loads on demand and manages its own memory.
+    var lanModelId: String? = nil
 }
 
 struct Model3DGenRequest {
@@ -795,6 +811,10 @@ struct Model3DGenRequest {
     var seed: Int = -1
     /// Keep the model resident after this generation (default off → unload).
     var keepResident: Bool = false
+    /// Set when the pane picked a network model: the LAN routing id
+    /// (`<model>@<peer>`). The gen service then skips local resolve/load/
+    /// unload — the hosting Mac loads on demand and manages its own memory.
+    var lanModelId: String? = nil
     /// Run the P2 paint stage (full PBR texture) after shape generation.
     /// Off by default until the paint port is validated end to end.
     var texture: Bool = false

@@ -895,7 +895,7 @@ struct ChatDetailView: View {
                                isLive: composerState == .generatingHere,
                                contextLength: contextUsage?.contextLength
                                    ?? AgentEngine.effectiveContextLength(appContextSize: appState.contextSize,
-                                                                         modelContextLength: server.modelInfo?.contextLength))
+                                                                         modelContextLength: server.chatModelInfo?.contextLength))
             }
 
             // Input area — iMessage style
@@ -1392,7 +1392,7 @@ struct ChatDetailView: View {
     /// Whether the active model understands audio (Gemma 4 12B unified). Gates
     /// the mic button and audio-file attachment so they only appear where audio
     /// actually does something.
-    private var audioSupported: Bool { server.modelInfo?.supportsAudio ?? false }
+    private var audioSupported: Bool { server.chatModelInfo?.supportsAudio ?? false }
 
     /// Mic tap handler: start recording (after a permission check), or stop and
     /// turn the captured PCM into a pending audio attachment.
@@ -1488,7 +1488,7 @@ struct ChatDetailView: View {
         if let last = messages.last(where: { $0.promptTokens != nil && $0.promptTokens! > 0 }) {
             let ctxLen = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
-                modelContextLength: server.modelInfo?.contextLength
+                modelContextLength: server.chatModelInfo?.contextLength
             )
             return (promptTokens: last.promptTokens!, completionTokens: last.completionTokens ?? 0, contextLength: ctxLen)
         }

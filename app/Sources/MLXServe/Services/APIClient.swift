@@ -162,7 +162,8 @@ class APIClient {
             // are missing entirely on a pre-this-feature server.
             recTemperature: meta["gen_temperature"] as? Double,
             recTopP: meta["gen_top_p"] as? Double,
-            recTopK: meta["gen_top_k"] as? Int
+            recTopK: meta["gen_top_k"] as? Int,
+            lanPeer: first["lan_peer"] as? String
         )
     }
 

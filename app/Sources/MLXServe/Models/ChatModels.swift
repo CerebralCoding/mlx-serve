@@ -266,6 +266,18 @@ struct ModelInfo {
     var recTopP: Double? = nil
     var recTopK: Int? = nil
 
+    /// Set when this entry is a LAN-discovered model hosted by another Mac
+    /// (the server badges remote entries with `lan_peer`; their ids are
+    /// `<model>@<peer>` and requests are proxied to that host). nil = local.
+    var lanPeer: String? = nil
+
+    /// "model · peer" — the picker label for a LAN entry (`name` carries the
+    /// raw `<model>@<peer>` routing id, which is what requests must send).
+    var lanDisplayName: String {
+        guard let at = name.lastIndex(of: "@") else { return name }
+        return "\(name[name.startIndex..<at]) · \(name[name.index(after: at)...])"
+    }
+
     /// Which backend serves this model — derived from `architecture`
     /// (`model_type` in config.json / the GGUF stub). Drives the engine-
     /// aware Settings UI so toggles that don't apply (e.g. MLX `--kv-quant`

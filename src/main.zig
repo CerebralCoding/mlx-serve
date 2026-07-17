@@ -221,6 +221,19 @@ fn printUsage(io: std.Io) void {
         \\                        Accepts Authorization: Bearer, x-api-key, HTTP
         \\                        Basic (key = password), or ?api_key=. /health
         \\                        stays open. Unset = no auth (default).
+        \\  --lan-share <all|id,...>
+        \\                      Share models with the local network: advertise
+        \\                        this server over Bonjour and let LAN clients
+        \\                        run inference on the listed models (or all).
+        \\                        Everything else stays host-local. Off by
+        \\                        default. Prompts sent to shared models are
+        \\                        visible to this machine.
+        \\  --lan-discover      Discover models other mlx-serve hosts share on
+        \\                        the LAN: they appear in /v1/models as
+        \\                        <id>@<peer> and requests naming one are
+        \\                        proxied to that host. Off by default.
+        \\  --lan-name <name>   Bonjour instance name for --lan-share
+        \\                        (default: this Mac's hostname).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --log-file <path>   Persist the server log ("off" disables).
         \\                      Default: ~/.mlx-serve/logs/mlx-serve-<port>.log
@@ -461,6 +474,16 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             // Borrowed from argv (lives for the process). Empty ⇒ leave open.
             if (args[i].len > 0) server_mod.g_api_key = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lan-share") and i + 1 < args.len) {
+            i += 1;
+            // Borrowed from argv, like --api-key. serve() starts the LAN
+            // subsystem (src/lan.zig) once the listener is bound.
+            if (args[i].len > 0) server_mod.g_lan_share_spec = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lan-name") and i + 1 < args.len) {
+            i += 1;
+            if (args[i].len > 0) server_mod.g_lan_name = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lan-discover")) {
+            server_mod.g_lan_discover = true;
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {

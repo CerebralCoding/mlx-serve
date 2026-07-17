@@ -12,6 +12,7 @@ import Foundation
 enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
     case modelFolders
     case server
+    case lanSharing
     case specDecode
     /// The universal knobs AND the MLX-only ones, in one section: two adjacent
     /// cards both called "Performance" was a distinction only the maintainers
@@ -35,6 +36,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .modelFolders:      return "Model Folders"
         case .server:            return "Server"
+        case .lanSharing:        return "LAN Sharing"
         case .performance:       return "Performance"
         case .specDecode:        return "Speculative Decoding (MLX only)"
         case .ggufPerformance:   return "GGUF Performance (llama.cpp)"
@@ -64,6 +66,7 @@ enum SettingsCategory: String, CaseIterable, Identifiable, Hashable {
         switch self {
         case .modelFolders:      return "folder"
         case .server:            return "server.rack"
+        case .lanSharing:        return "antenna.radiowaves.left.and.right"
         case .performance:       return "speedometer"
         case .specDecode:        return "hare"
         case .ggufPerformance:   return "shippingbox"

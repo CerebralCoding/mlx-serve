@@ -142,9 +142,11 @@ enum GenExperiment: String, CaseIterable, Identifiable {
 /// CHAT-PICKABLE subset, not the raw list — a Mac with only media/drafter
 /// downloads has a non-empty `localModels` but nothing the picker can
 /// actually offer, which used to fall through to a broken empty dropdown
-/// instead of this message. Pure so it's unit-tested without SwiftUI.
-func trayHasNoUsableModels(_ localModels: [LocalModel]) -> Bool {
-    !localModels.contains { $0.isChatPickable }
+/// instead of this message. LAN-discovered chat models count as usable: a
+/// Mac with nothing downloaded can still chat on a peer's model. Pure so
+/// it's unit-tested without SwiftUI.
+func trayHasNoUsableModels(_ localModels: [LocalModel], lanChatModelCount: Int = 0) -> Bool {
+    lanChatModelCount == 0 && !localModels.contains { $0.isChatPickable }
 }
 
 struct StatusMenuView: View {
@@ -221,7 +223,7 @@ struct StatusMenuView: View {
                 // a broken empty dropdown instead of this message.
                 let pickableModels = appState.localModels.filter { $0.isChatPickable }
 
-                if trayHasNoUsableModels(appState.localModels) {
+                if trayHasNoUsableModels(appState.localModels, lanChatModelCount: server.lanModels(capability: "chat").count) {
                     VStack(alignment: .leading, spacing: 4) {
                         Text("No models yet")
                             .font(.caption.weight(.medium))
@@ -234,7 +236,7 @@ struct StatusMenuView: View {
                     // gear lives where the user picks what to load. Tuning
                     // anything else lives in the Settings window the gear opens.
                     HStack(spacing: 6) {
-                        Picker("Model", selection: $appState.selectedModelPath) {
+                        Picker("Model", selection: trayModelSelection) {
                             let pickable = pickableModels
                             // macOS .menu Pickers key the checkmark by item
                             // TITLE — two same-named rows (one GGUF, one MLX)
@@ -270,6 +272,17 @@ struct StatusMenuView: View {
                                 Section("Custom Folder") {
                                     ForEach(custom) { model in
                                         Text(modelPickerLabel(model, dupNames: dupNames)).tag(model.path)
+                                    }
+                                }
+                            }
+                            // Chat models other Macs share on this network
+                            // (server running with LAN discovery on). Tags are
+                            // "lan:"-prefixed so they can't collide with paths.
+                            let lanChat = server.lanModels(capability: "chat")
+                            if !lanChat.isEmpty {
+                                Section("On Your Network") {
+                                    ForEach(lanChat, id: \.name) { m in
+                                        Text(m.lanDisplayName).tag("lan:" + m.name)
                                     }
                                 }
                             }
@@ -656,6 +669,25 @@ struct StatusMenuView: View {
         .buttonStyle(.bordered)
         .controlSize(.small)
         .help(help)
+    }
+
+    /// The one tray picker drives BOTH selections: a local model path (the
+    /// existing `selectedModelPath` flow: launch/hot-switch) or a LAN model
+    /// ("lan:<id>@<peer>" tags — recorded on the ServerManager and carried by
+    /// every chat request; the local server proxies it to the hosting Mac).
+    /// Picking a local model always clears the LAN choice.
+    private var trayModelSelection: Binding<String> {
+        Binding(
+            get: { server.lanChatModelId.map { "lan:" + $0 } ?? appState.selectedModelPath },
+            set: { picked in
+                if picked.hasPrefix("lan:") {
+                    appState.selectLanModel(String(picked.dropFirst(4)))
+                } else {
+                    server.lanChatModelId = nil
+                    appState.selectedModelPath = picked
+                }
+            }
+        )
     }
 
     /// Append a "+ assist" suffix to every model row that *could* use the

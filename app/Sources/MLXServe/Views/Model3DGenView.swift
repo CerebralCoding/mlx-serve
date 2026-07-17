@@ -17,6 +17,8 @@ struct Model3DGenView: View {
 
     @State private var photoURL: URL? = nil
     @State private var model: Model3DModelPreset = .hunyuan3d21_8bit
+    /// Selected network model's routing id (`<model>@<peer>`); nil = local.
+    @State private var lanModel: String? = nil
     @State private var steps: Int = 30
     @State private var guidance: Double = 5.0
     @State private var resolution: Int = 384
@@ -42,6 +44,9 @@ struct Model3DGenView: View {
                 didHydrate = true
                 DispatchQueue.main.async { hydrating = false }
             }
+            // Freshen the network-model list so LAN entries are current in
+            // the picker (discovery lands seconds after the server boots).
+            if server.status == .running { Task { await server.refreshModels() } }
         }
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: steps) { _, _ in guard !hydrating else { return }; persist() }
@@ -121,10 +126,15 @@ struct Model3DGenView: View {
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: $model) {
+            Picker("", selection: LanPick.selection(
+                model: $model, lanModel: $lanModel,
+                resolve: { id in Model3DModelPreset.all.first { $0.id == id } },
+                persist: persist)
+            ) {
                 ForEach(Model3DModelPreset.all) { preset in
-                    Text(preset.name).tag(preset)
+                    Text(preset.name).tag(preset.id)
                 }
+                LanModelPickerRows(capability: "3d")
             }
             .labelsHidden()
             .pickerStyle(.menu)
@@ -182,7 +192,7 @@ struct Model3DGenView: View {
 
     private var actionRow: some View {
         VStack(spacing: 8) {
-            if !downloads.bundleReady(model.bundle) {
+            if lanModel == nil && !downloads.bundleReady(model.bundle) {
                 // Local-only models have no HF download yet — steer the user to
                 // the on-device conversion instead of a Download button.
                 if model.isLocalOnly { convertHint } else { BundleDownloadBar(bundle: model.bundle) }
@@ -199,7 +209,7 @@ struct Model3DGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(photoURL == nil || !downloads.bundleReady(model.bundle))
+                    .disabled(photoURL == nil || (lanModel == nil && !downloads.bundleReady(model.bundle)))
                 }
             }
         }
@@ -322,6 +332,7 @@ struct Model3DGenView: View {
     private func hydrate() {
         let s = Model3DGenSettings.load()
         model = s.resolvedModel
+        lanModel = LanPick.lanId(s.modelId)
         steps = s.steps
         guidance = s.guidance
         resolution = s.resolution
@@ -332,7 +343,7 @@ struct Model3DGenView: View {
 
     private func persist() {
         var s = Model3DGenSettings()
-        s.modelId = model.id
+        s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.steps = steps
         s.guidance = guidance
         s.resolution = resolution
@@ -353,6 +364,7 @@ struct Model3DGenView: View {
             guidanceScale: guidance,
             octreeResolution: resolution,
             keepResident: keepResident,
+            lanModelId: lanModel,
             texture: texture
         )
         persist()

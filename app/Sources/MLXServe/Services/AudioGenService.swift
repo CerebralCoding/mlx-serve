@@ -43,7 +43,7 @@ final class AudioGenService: ObservableObject {
             phase = .failed("Text is empty.")
             return
         }
-        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
+        guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
             phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
             return
         }
@@ -70,16 +70,15 @@ final class AudioGenService: ObservableObject {
                 if !keep, let id = loadedId { try? await server.unloadModel(id: id) }
             }
             do {
-                let port = try await server.ensureRunning(forGenModelDir: modelDir)
-                if Task.isCancelled { phase = .idle; return }
-                let info = try await server.loadModel(id: modelDir)
-                loadedId = info.name
+                let (port, modelId, unloadId) = try await server.prepareGenModel(
+                    lanModelId: request.lanModelId, repo: request.model.repo)
+                loadedId = unloadId
                 if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
                 // SSE: audio length is model-determined, so `progress` events carry
                 // a growing frame count (total=0 → indeterminate bar); the
                 // `complete` event carries the WAV as base64.
                 var wav: Data? = nil
-                var reqJson: [String: Any] = ["model": info.name, "input": text]
+                var reqJson: [String: Any] = ["model": modelId, "input": text]
                 if let refB64 { reqJson["ref_audio"] = refB64 }
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/audio/speech",

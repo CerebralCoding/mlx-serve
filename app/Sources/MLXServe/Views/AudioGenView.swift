@@ -114,6 +114,8 @@ struct VoiceGenView: View {
 
     @State private var text: String = ""
     @State private var model: AudioModelPreset = .qwen3TTS06B8bit
+    /// Selected network model's routing id (`<model>@<peer>`); nil = local.
+    @State private var lanModel: String? = nil
     @State private var refAudioURL: URL? = nil
     @State private var refText: String = ""
     @State private var speed: Double = 1.0
@@ -141,6 +143,9 @@ struct VoiceGenView: View {
                 didHydrate = true
                 DispatchQueue.main.async { hydrating = false }
             }
+            // Freshen the network-model list so LAN entries are current in
+            // the picker (discovery lands seconds after the server boots).
+            if server.status == .running { Task { await server.refreshModels() } }
         }
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: speed) { _, _ in guard !hydrating else { return }; persist() }
@@ -217,10 +222,15 @@ struct VoiceGenView: View {
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: $model) {
+            Picker("", selection: LanPick.selection(
+                model: $model, lanModel: $lanModel,
+                resolve: { id in AudioModelPreset.all.first { $0.id == id } },
+                persist: persist)
+            ) {
                 ForEach(AudioModelPreset.all) { preset in
-                    Text(preset.name).tag(preset)
+                    Text(preset.name).tag(preset.id)
                 }
+                LanModelPickerRows(capability: "audio")
             }
             .labelsHidden()
             .pickerStyle(.menu)
@@ -331,7 +341,7 @@ struct VoiceGenView: View {
 
     private var actionRow: some View {
         VStack(spacing: 8) {
-            if !downloads.bundleReady(model.bundle) {
+            if lanModel == nil && !downloads.bundleReady(model.bundle) {
                 BundleDownloadBar(bundle: model.bundle)
             }
             HStack {
@@ -346,7 +356,7 @@ struct VoiceGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle))
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)))
                 }
             }
         }
@@ -483,6 +493,7 @@ struct VoiceGenView: View {
     private func hydrate() {
         let s = AudioGenSettings.load()
         model = s.resolvedModel
+        lanModel = LanPick.lanId(s.modelId)
         speed = s.speed
         temperature = s.temperature
         keepResident = s.keepResident
@@ -490,7 +501,7 @@ struct VoiceGenView: View {
 
     private func persist() {
         var s = AudioGenSettings()
-        s.modelId = model.id
+        s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.speed = speed
         s.temperature = temperature
         s.keepResident = keepResident
@@ -507,7 +518,8 @@ struct VoiceGenView: View {
             refText: refText,
             speed: speed,
             temperature: temperature,
-            keepResident: keepResident
+            keepResident: keepResident,
+            lanModelId: lanModel
         )
         persist()
         let total = RAMChecker.totalGB

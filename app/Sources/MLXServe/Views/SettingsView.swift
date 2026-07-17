@@ -84,6 +84,12 @@ struct SettingsView: View {
                     ) {
                         ServerSectionContent()
                     }
+                    SettingsSection(
+                        category: .lanSharing,
+                        subtitle: "Share models with other Macs on your local network and use theirs — zero-setup discovery over Bonjour, everything off by default. Restart the server to apply."
+                    ) {
+                        LanSharingSectionContent()
+                    }
                     // Engine-aware sections. Each panel is hidden when its
                     // controls don't apply to the active engine — flipping
                     // `--kv-quant` on a GGUF model silently no-ops, so we'd
@@ -698,13 +704,102 @@ private struct ModelFoldersSectionContent: View {
 
 // MARK: - Server section
 
+// MARK: - LAN sharing section
+
+private struct LanSharingSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
+    }
+
+    var body: some View {
+        if let m = meta["lanShareEnabled"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanShareEnabled)) {
+                Toggle("", isOn: $appState.serverOptions.lanShareEnabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
+        if appState.serverOptions.lanShareEnabled {
+            if let m = meta["lanShareAll"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanShareAll)) {
+                    Toggle("", isOn: $appState.serverOptions.lanShareAll)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+            }
+            if !appState.serverOptions.lanShareAll {
+                sharedModelList
+            }
+            if let m = meta["lanName"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanName)) {
+                    TextField(
+                        "",
+                        text: $appState.serverOptions.lanName,
+                        prompt: Text(Host.current().localizedName ?? "this Mac")
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 200)
+                }
+            }
+        }
+        if let m = meta["lanDiscoverEnabled"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanDiscoverEnabled)) {
+                Toggle("", isOn: $appState.serverOptions.lanDiscoverEnabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
+        // The privacy disclosure — sharing means running other people's
+        // prompts, and using a network model means the host reads yours.
+        Text("Privacy: prompts sent to a model you share are processed on — and visible to — this Mac. Prompts you send to a network model are visible to the Mac hosting it. Traffic stays on your local network, and everything here is off unless you turn it on.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 4)
+    }
+
+    /// One checkbox per local model name. Names are deduped — a GGUF and an
+    /// MLX build of the same repo share a name and are shared together (the
+    /// server matches share entries against registry ids basename-tolerantly).
+    private var sharedModelList: some View {
+        let names = Array(Set(appState.localModels.map(\.name))).sorted()
+        return VStack(alignment: .leading, spacing: 4) {
+            if names.isEmpty {
+                Text("No local models yet — download one first.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            ForEach(names, id: \.self) { name in
+                Toggle(name, isOn: Binding(
+                    get: { appState.serverOptions.lanSharedModels.contains(name) },
+                    set: { on in
+                        var list = appState.serverOptions.lanSharedModels
+                        list.removeAll { $0 == name }
+                        if on { list.append(name) }
+                        appState.serverOptions.lanSharedModels = list.sorted()
+                    }
+                ))
+                .toggleStyle(.checkbox)
+                .font(.caption)
+            }
+        }
+        .padding(.leading, 8)
+        .padding(.vertical, 2)
+    }
+}
+
 private struct ServerSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     var body: some View {
@@ -822,7 +917,7 @@ private struct PortRow: View {
     @State private var text: String = ""
 
     private var isDirty: Bool {
-        guard let last = server.lastLaunchedOptions else { return false }
+        guard let last = server.liveLaunchedOptions else { return false }
         return appState.serverOptions.port != last.port
     }
 
@@ -899,7 +994,7 @@ private struct ContextSizeRow: View {
     }
 
     private var isDirty: Bool {
-        guard let last = server.lastLaunchedOptions else { return false }
+        guard let last = server.liveLaunchedOptions else { return false }
         return appState.serverOptions.ctxSize != last.ctxSize
     }
 
@@ -1006,7 +1101,7 @@ private struct SpecDecodeSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     /// `draftBlockSize` stays CLI-only — `recommendedBlockSize` in drafter.zig
@@ -1148,7 +1243,7 @@ private struct PerformanceSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     var body: some View {
@@ -1251,7 +1346,7 @@ private struct CommonPerformanceSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     var body: some View {
@@ -1284,7 +1379,7 @@ private struct LlamaPerformanceSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     var body: some View {
@@ -1333,7 +1428,7 @@ private struct Ds4PerformanceSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     var body: some View {
@@ -1373,7 +1468,7 @@ private struct DrafterRow: View {
     @Environment(\.openWindow) private var openWindow
 
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     /// Drafter the loaded model would pair with — nil for non-Gemma-4 or

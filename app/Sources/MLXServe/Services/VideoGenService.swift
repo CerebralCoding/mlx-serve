@@ -71,7 +71,7 @@ final class VideoGenService: ObservableObject {
             phase = .failed("Prompt is empty.")
             return
         }
-        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
+        guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
             phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
             return
         }
@@ -117,16 +117,15 @@ final class VideoGenService: ObservableObject {
                     setPhase(.failed("Couldn't read the audio clip. Pick a WAV, MP3, M4A, or AAC file."), for: gen)
                     return
                 }
-                let port = try await server.ensureRunning(forGenModelDir: modelDir)
-                if Task.isCancelled { setPhase(.cancelled, for: gen); return }
-                let info = try await server.loadModel(id: modelDir)
-                loadedId = info.name
+                let (port, modelId, unloadId) = try await server.prepareGenModel(
+                    lanModelId: request.lanModelId, repo: request.model.repo)
+                loadedId = unloadId
                 // Cancelled right after load: deliberately leave the model
                 // resident (an unload from a cancelled task can't run anyway,
                 // and the likely next action is a retry — the residency row
                 // in the pane shows the state).
                 if Task.isCancelled { setPhase(.cancelled, for: gen); return }
-                let body = Self.requestBody(model: info.name, prompt: prompt,
+                let body = Self.requestBody(model: modelId, prompt: prompt,
                                             request: request, firstFrameB64: firstFrameB64,
                                             audioB64: audioB64)
                 // SSE: the server pushes `progress` events per denoise step, then a

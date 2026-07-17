@@ -65,7 +65,19 @@ pub var g_api_key: ?[]const u8 = null;
 /// mistyped value reaches the client verbatim, which strict clients reject.
 pub var g_tool_autocorrect: bool = true;
 
+/// LAN model sharing (src/lan.zig). Started by `serve()` when `--lan-share`
+/// and/or `--lan-discover` are set (the three `g_lan_*` config globals below
+/// are written by main.zig, mirroring the `g_api_key` pattern). When sharing
+/// is on and NO api-key is configured, non-loopback requests are limited to
+/// the shared inference surface (`lanShareDenial`); when discovery is on,
+/// requests naming a `<id>@<peer>` model are tunneled to that peer.
+pub var g_lan: ?*lan_mod.Lan = null;
+pub var g_lan_share_spec: ?[]const u8 = null;
+pub var g_lan_name: ?[]const u8 = null;
+pub var g_lan_discover: bool = false;
+
 const io_util = @import("io_util.zig");
+const lan_mod = @import("lan.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
 const cli_mod = @import("cli.zig");
@@ -940,6 +952,28 @@ pub fn serve(
     var server = try ip_addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
 
+    // ── LAN sharing/discovery (src/lan.zig): started HERE — the one chokepoint
+    //    every serve path (model/headless/gen/ds4/llama) flows through — so the
+    //    advertised port is always the bound port. Bonjour being unavailable
+    //    degrades to a warning; it must never kill the server.
+    if (g_lan_share_spec != null or g_lan_discover) {
+        g_lan = lan_mod.Lan.start(allocator, .{
+            .port = port,
+            .share_spec = g_lan_share_spec,
+            .name = g_lan_name,
+            .discover = g_lan_discover,
+        }) catch |err| blk: {
+            log.warn("[lan] failed to start ({s}); LAN sharing disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    // Runs after the conn-thread drain below (LIFO), so no tunnel is mid-pump
+    // and no request is mid-lookup when the peer table is freed.
+    defer if (g_lan) |l| {
+        g_lan = null;
+        l.shutdown();
+    };
+
     // Freeze the auto-context NOW, at startup, while the model is freshly
     // loaded and nothing else has taken RAM. Clients read this number once
     // (pi/opencode bake it into a config file) and budget against it for the
@@ -1221,6 +1255,19 @@ fn handleConnection(
         return;
     }
 
+    // ── LAN sharing gate. With sharing ON and no --api-key set, a non-loopback
+    //    client gets exactly the shared inference surface: allowlisted routes
+    //    (lan.routeClass) on shared models only. With a key set, unauthorized
+    //    non-loopback requests already died above and key-holders keep full
+    //    access — so this gate only exists in keyless mode.
+    if (lanGateApplies(stream)) {
+        if (lanShareDenial(g_lan.?, registry, method, path, request_body)) |denial| {
+            log.debug("{s} {s} -> 403 (lan: {s})\n", .{ method, path, denial });
+            try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", denial, 403);
+            return;
+        }
+    }
+
     // ── Plan 05: routes that don't depend on a loaded model (connectivity
     //    probes + CORS preflight + listing endpoints). Handle these BEFORE
     //    `scheduler.ensureLoaded` so they don't trigger a cold load of the
@@ -1273,7 +1320,9 @@ fn handleConnection(
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
         log.debug("GET  /v1/models -> 200\n", .{});
-        try handleModels(allocator, stream);
+        // A keyless LAN peer sees only shared models and never the remote
+        // stubs (a mirrored entry would invite multi-hop loops).
+        try handleModels(allocator, stream, lanGateApplies(stream));
         return;
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/v1/responses/")) {
@@ -1336,6 +1385,17 @@ fn handleConnection(
     // just respond with whatever it has loaded; the multi-model registry's
     // strict-id semantics are opt-in by sending an id we registered.
     var requested_model_id = parseModelFromBody(request_body) orelse "";
+    // ── LAN-discovered remote model (`<id>@<peer>`) → proxy the request to
+    //    its host byte-for-byte, model field rewritten to the bare id.
+    //    Loopback clients only (the gate above already denied multi-hop); a
+    //    registered LOCAL id containing '@' keeps winning via the peek; an
+    //    offline peer is an honest 404, never a silent local-default answer.
+    if (g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
+        peerIsLoopback(stream) and registry.peek(requested_model_id) == null)
+    {
+        try handleLanProxy(allocator, stream, g_lan.?, method, raw_path, request_body, requested_model_id);
+        return;
+    }
     if (requested_model_id.len > 0 and !std.mem.eql(u8, requested_model_id, "mlx-serve")) {
         if (registry.peek(requested_model_id) == null) {
             // Ollama clients send tagged/short names ("qwen3.6:latest");
@@ -2664,6 +2724,9 @@ fn renderModelEntry(
 fn handleModels(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    /// True for a keyless LAN peer: list only shared models, and never the
+    /// remote stubs (mirroring a peer's peer invites multi-hop loops).
+    lan_filtered: bool,
 ) !void {
     // Plan 05 Phase E: emit every registry entry (loaded + unloaded), not
     // just the default model + flat discovery list. Default model is sorted
@@ -2701,13 +2764,17 @@ fn handleModels(
         };
         std.sort.pdq(*LoadedModel, ordered.items, default_id, Cmp.lt);
 
-        for (ordered.items, 0..) |entry, idx| {
-            if (idx > 0) try entries_buf.append(allocator, ',');
+        for (ordered.items) |entry| {
+            if (lan_filtered and !g_lan.?.sharedAllows(entry.id)) continue;
+            if (entries_buf.items.len > 0) try entries_buf.append(allocator, ',');
             const json = try renderModelEntry(allocator, stream.io, entry);
             defer allocator.free(json);
             try entries_buf.appendSlice(allocator, json);
         }
     }
+
+    // Discovered LAN models ride the same list for local clients.
+    if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
 
     const body = try std.fmt.allocPrint(allocator,
         \\{{"object":"list","data":[{s}]}}
@@ -2746,6 +2813,20 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     } else |_| {
         requested_id = parseModelFromBody(request_body) orelse "";
     }
+    // A LAN-discovered remote id: nothing to load here — the peer loads on
+    // demand when the first proxied request arrives. Answer 200 with the
+    // mirrored entry so client flows (load → generate → unload) work
+    // unchanged on network models. Unknown peer/model falls through to
+    // ensureLoaded's honest 404.
+    if (g_lan) |l| if (lan_mod.splitRemoteId(requested_id) != null) {
+        if (l.remoteEntryFor(allocator, requested_id)) |entry| {
+            defer allocator.free(entry);
+            const body = try std.fmt.allocPrint(allocator, "{{\"model\":{s}}}", .{entry});
+            defer allocator.free(body);
+            try sendResponse(stream, "200 OK", "application/json", body);
+            return;
+        }
+    };
     // Register-by-path: an absolute path to a model directory OUTSIDE the
     // --model-dir scan (e.g. the app's auto-downloaded embedding encoder).
     // The dir is validated exactly like discovery (config.json, supported
@@ -2918,6 +2999,15 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
         var trimmed = requested_id;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
         requested_id = std.fs.path.basename(trimmed);
+    }
+
+    // Remote ids hold no residency on THIS host — idempotent 200, matching
+    // the load-model no-op (the peer's owner controls its memory).
+    if (g_lan != null and lan_mod.splitRemoteId(requested_id) != null and
+        (global_registry == null or global_registry.?.peek(requested_id) == null))
+    {
+        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        return;
     }
 
     scheduler.unloadModel(requested_id) catch |err| switch (err) {
@@ -6097,6 +6187,52 @@ fn peerIsLoopback(conn: *const Conn) bool {
     return ipIsLoopback(conn.stream.socket.address);
 }
 
+/// True when the LAN-share gate governs this request: sharing on, keyless
+/// mode (a configured --api-key already gated non-loopback traffic), and the
+/// client is not local.
+fn lanGateApplies(stream: *const Conn) bool {
+    const l = g_lan orelse return false;
+    return l.sharing() and g_api_key == null and !peerIsLoopback(stream);
+}
+
+/// LAN-share gate decision for one non-loopback request; null = allowed.
+/// The effective model resolves exactly like dispatch will (unknown/absent
+/// ids fall back to the default model), so the gate can never disagree with
+/// what would actually run.
+fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8, path: []const u8, body: []const u8) ?[]const u8 {
+    switch (lan_mod.routeClass(method, path)) {
+        .open => return null,
+        .denied => return "This endpoint is host-local; LAN sharing exposes inference on shared models only",
+        .model_gated => {},
+    }
+    const mid = parseModelFromBody(body) orelse "";
+    if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null)
+        return "Remote (@peer) model ids are host-local — ask that peer directly";
+    const effective = if (mid.len > 0 and !std.mem.eql(u8, mid, "mlx-serve") and registry.peek(mid) != null)
+        mid
+    else
+        registry.default_id;
+    if (!l.sharedAllows(effective)) return "Model not shared on this host";
+    return null;
+}
+
+/// Proxy a request naming `<bare>@<peer>` to that peer (lan.tunnel). 404
+/// when the peer vanished, 502 when it stopped accepting — never a silent
+/// fallback to the local default model.
+fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, method: []const u8, raw_path: []const u8, body: []const u8, full_id: []const u8) !void {
+    const rid = lan_mod.splitRemoteId(full_id).?;
+    const remote = l.remoteFor(full_id) orelse {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "LAN peer for this model is offline", 404);
+        return;
+    };
+    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, rid.bare);
+    defer allocator.free(rewritten);
+    log.info("[lan] proxy {s} {s} -> \"{s}\" @ {d}.{d}.{d}.{d}:{d}\n", .{ method, raw_path, rid.peer, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port });
+    lan_mod.tunnel(remote, method, raw_path, rewritten, stream) catch {
+        try sendErrorResponse(allocator, stream, "502 Bad Gateway", "lan_peer_unreachable", "LAN peer did not accept the connection", 502);
+    };
+}
+
 /// Case-insensitive HTTP header lookup in the raw header block. `name_lower`
 /// must be lowercase (e.g. "authorization"). Returns the trimmed value, or null.
 fn findHeaderValueCI(headers: []const u8, name_lower: []const u8) ?[]const u8 {
@@ -6212,6 +6348,50 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
     // No key configured ⇒ always authorized (open mode)
     g_api_key = null;
     try std.testing.expect(apiKeyAuthorized("", "/v1/chat/completions"));
+}
+
+test "lanShareDenial: shared inference surface only, resolved like dispatch" {
+    const a = std.testing.allocator;
+    const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer reg.deinit();
+    const shared_entry = try reg.registerStub("gemma-4-e4b-it-4bit", "/m/g", 1);
+    _ = try reg.registerStub("qwen3.6-27b", "/m/q", 1);
+    reg.default_id = shared_entry.id;
+
+    var l = lan_mod.Lan{
+        .alloc = a,
+        .port = 0,
+        .discover = false,
+        .peers = .init(a),
+        .known = .init(a),
+        .share = try lan_mod.SharedSet.parse(a, "gemma-4-e4b-it-4bit"),
+    };
+    defer {
+        l.share.?.deinit(a);
+        l.peers.deinit();
+        l.known.deinit();
+    }
+
+    // Open routes pass with no model check; host-local ones are denied.
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/health", "") == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/v1/models", "") == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "OPTIONS", "/v1/messages", "") == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/load-model", "{}") != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/metrics", "") != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/", "") != null);
+
+    // Shared model allowed; unshared denied — on chat AND media surfaces.
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"gemma-4-e4b-it-4bit\"}") == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"qwen3.6-27b\"}") != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/generations", "{\"model\":\"qwen3.6-27b\"}") != null);
+
+    // Omitted / unknown ids resolve to the default model exactly like
+    // dispatch will — here the default is shared, so both pass.
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}") == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}") == null);
+
+    // @peer ids are host-local: no multi-hop proxying for LAN clients.
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}") != null);
 }
 
 test "ipIsLoopback exempts local addresses only" {

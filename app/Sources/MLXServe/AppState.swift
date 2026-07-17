@@ -116,6 +116,12 @@ class AppState: ObservableObject {
             AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
                                           baseImage: serverOptions.sandbox.baseImage,
                                           network: serverOptions.sandbox.network)
+            // Turning LAN sharing/discovery ON means "the server runs" — boot
+            // it (headless if no model is selected) on the transition only, so
+            // unrelated settings edits never start anything.
+            let lanOn = serverOptions.lanShareEnabled || serverOptions.lanDiscoverEnabled
+            let lanWasOn = oldValue.lanShareEnabled || oldValue.lanDiscoverEnabled
+            if lanOn && !lanWasOn { ensureServerForLan() }
         }
     }
     /// Legacy bridge: `maxTokens` is now stored in `serverOptions.defaultMaxTokens`.
@@ -267,6 +273,12 @@ class AppState: ObservableObject {
         if autoStartServer, !selectedModelPath.isEmpty {
             server.start(modelPath: selectedModelPath, options: serverOptions)
         }
+        // LAN sharing/discovery lives in the server process — with either
+        // enabled the server should be up (headless when nothing was
+        // auto-started) so this Mac shares and sees network models.
+        if serverOptions.lanShareEnabled || serverOptions.lanDiscoverEnabled {
+            ensureServerForLan()
+        }
 
         // Fallback health detection — runs detached to avoid blocking MainActor
         if autoStartServer {
@@ -283,6 +295,36 @@ class AppState: ObservableObject {
                 }
             }
         }
+    }
+
+    /// Chat on a LAN model: record the remote id and make sure the (proxying)
+    /// local server is up — headless when no local model is selected. The
+    /// remote id rides every chat request via `server.chatModelId`.
+    func selectLanModel(_ id: String) {
+        server.lanChatModelId = id
+        ensureServerForLan()
+    }
+
+    /// Start the server for LAN duty if it isn't running: with the selected
+    /// local model when there is one (it keeps serving chat AND the LAN),
+    /// else headless over the models root.
+    func ensureServerForLan() {
+        guard server.status != .running, server.status != .starting else { return }
+        if !selectedModelPath.isEmpty {
+            server.start(modelPath: selectedModelPath, options: serverOptions)
+        } else {
+            let root = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
+            server.startHeadless(modelsDir: root, options: serverOptions)
+        }
+    }
+
+    /// Freshen the network-model list for a picker that is about to show it.
+    /// No-op when discovery is off; boots the server (headless) when needed.
+    func refreshLanModels() async {
+        guard serverOptions.lanDiscoverEnabled else { return }
+        ensureServerForLan()
+        try? await server.waitUntilRunning(timeout: 60)
+        await server.refreshModels()
     }
 
     func refreshModels() {
