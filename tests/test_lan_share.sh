@@ -139,6 +139,53 @@ assert d.get("model"), "no model echoed"' 2>/dev/null
         -H 'Content-Type: application/json' -d "{\"model\":\"$RID\"}")
     [ "$UNLOAD_CODE" = "200" ]
     check "unload-model on a remote id is a 200 no-op" $?
+
+    # ── 3b. Proxy failure modes are distinct + honest ──
+    # A model the (live, known) peer does not share: instant 404, no wait.
+    START_TS=$SECONDS
+    MSG=$(curl -s -m 20 "http://127.0.0.1:$PORT_B/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d "{\"model\":\"not-a-real-model@$PEER_NAME\",\"messages\":[]}")
+    ELAPSED=$((SECONDS - START_TS))
+    echo "$MSG" | grep -q "no longer shares" && [ "$ELAPSED" -lt 5 ]
+    check "unlisted model on a live peer fails fast with an honest message (${ELAPSED}s)" $?
+
+    # Discovery-off server (share-only boot): the error must say WHY instead
+    # of the misleading "peer offline" (the live bite: a --lan-share-only
+    # boot 404'd every persisted LAN selection as \"offline\").
+    PORT_C=$((PORT_A + 2))
+    "$BINARY" --serve --port "$PORT_C" --model-dir "$EMPTY_DIR" --lan-share all \
+        --lan-name "lantest-c-$$" --log-file off >/dev/null 2>&1 &
+    PID_C=$!
+    wait_health "$PORT_C" || bad "share-only server C never became healthy"
+    curl -s -m 10 "http://127.0.0.1:$PORT_C/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d "{\"model\":\"anything@$PEER_NAME\",\"messages\":[]}" | grep -q "discovery is off"
+    check "share-only server says discovery is off, not 'peer offline'" $?
+    kill "$PID_C" 2>/dev/null
+
+    # ── 3c. Peer restart mid-session: the proxy WAITS for rediscovery ──
+    # Kill A, wait for B to drop it, then relaunch A and fire the chat
+    # IMMEDIATELY — the convergence wait must carry it through (red on the
+    # instant-404 code: this is the live \"chatted while the peer Mac was
+    # redeploying\" failure).
+    kill "$PID_A" 2>/dev/null; PID_A=""
+    for _ in $(seq 1 40); do
+        curl -s "http://127.0.0.1:$PORT_B/v1/models" | grep -q "@$PEER_NAME" || break
+        sleep 1
+    done
+    curl -s "http://127.0.0.1:$PORT_B/v1/models" | grep -q "@$PEER_NAME"
+    [ $? -ne 0 ]; check "B drops the peer's models once it goes offline" $?
+
+    "$BINARY" --model "$MODEL" --serve --port "$PORT_A" --log-level debug \
+        --lan-share all --lan-name "$PEER_NAME" --lan-discover --log-file off >"$LOG_A" 2>&1 &
+    PID_A=$!
+    RESP=$(curl -s -m 60 "http://127.0.0.1:$PORT_B/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$RID\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly one word: pong\"}],\"max_tokens\":20,\"temperature\":0}")
+    echo "$RESP" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+assert d["choices"][0]["message"]["content"].strip(), "empty content"' 2>/dev/null
+    check "chat fired during peer restart waits for rediscovery and succeeds" $?
 fi
 
 # ── 4. Share gate on A (requests via the LAN IP are non-loopback) ──

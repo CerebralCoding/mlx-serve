@@ -58,6 +58,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | Continuous batching | ✅ | ❌ | ✅ | ❌ |
 | Built-in agent loop + MCP client | ✅ 10 tools | ❌ | ❌ | ❌ |
 | Sandboxed agent shell (isolated Linux VM) | ✅ | ❌ | ❌ | ❌ |
+| LAN model sharing (use another Mac's models) | ✅ | ❌ | ❌ | ❌ |
 | One-click launchers (Claude Code, OpenCode, Pi) | ✅ | ❌ | ❌ | ❌ |
 | Python required at runtime | ❌ | ❌ | ❌ | ✅ |
 | Native menu-bar app (no Electron) | ✅ | ❌ Electron | ❌ | ❌ |
@@ -97,6 +98,7 @@ Across 18 cells (best mlx-serve vs best LM Studio per model × workload, geomean
 - **Long-context prefill that flies** — a custom flash-attention Metal kernel handles Gemma's sliding-window layers during prefill, skipping everything outside the attention window: 2.4× prefill (299 → 715 tok/s) on a ~100K-token prompt with *less* peak memory. Qwen 3.5/3.6 long prompts prefill in architecture-tuned chunks: ~5% faster with peak memory down ~9 GB on the 27B.
 - **KV-cache quantization** — 4-bit / 8-bit / TurboQuant variants shrink KV memory ~4× / ~2× / further still, so 16K contexts fit on hardware that couldn't hold them dense.
 - **Continuous batching** — `--max-concurrent N` batches decode requests through one forward pass for ~1.6× throughput at 4-way parallel.
+- **LAN model sharing** — `--lan-share all` lets other Macs on your network run inference on this Mac's models; `--lan-discover` mirrors peers' models into `/v1/models` as `model@peer` and proxies requests transparently, so Claude Code on a MacBook chats with the Studio's 27B through plain `localhost`. Off by default, zero configuration (Bonjour), share list enforced server-side, and only inference is ever exposed.
 - **Prefix cache** — shared system-prompt KV reuse across turns and across conversations. v26.5.7 adds an LRU of llama.cpp KV sessions so multi-doc agent loops stay warm.
 - **Tokenize cache** — chat-template render + tokenize cached per request; the second hit on a long conversation is a memcpy. Warm TTFT 7.7× faster on 1.8K-token prompts.
 - **Vision** — Gemma 4 SigLIP encoder; send images via `image_url` content blocks.
@@ -116,6 +118,7 @@ Menu-bar app that wraps the server with a full UI:
 - **Agent Sandbox** — flip one toggle and every agent shell command runs inside an isolated Linux VM built on Apple's Virtualization framework: boots in under a second, guest servers mirror to `localhost` live (an Express app on guest port 8080 is `http://localhost:8080` on your Mac), and a green shield in the toolbar shows when commands run isolated. Let the agent go wild — your Mac stays untouched.
 - **⌃Space Quick Launcher** — a Spotlight-style prompt panel over any app: hit ⌃Space, ask, and the answer streams in from your local model. Follow-ups keep context; ⌘↩ hands the conversation off to the full chat window.
 - **Hands-free Voice Mode** — say "Hey Loki" and just talk: on-device speech recognition (audio never leaves the Mac), spoken replies with barge-in interruption, and voice-driven agent tools — all from the menu bar with no window open.
+- **LAN Sharing** — share chosen models with the other Macs in your house and use theirs: peers appear automatically, shared models show up in the tray and every generation pane as "model · peer", and requests stream to the Mac that hosts the weights — chat, image, speech, music, video, and 3D alike, with models loading on demand on the host. Per-model share checkboxes in Settings; prompts sent to a shared model run on (and are visible to) the hosting Mac.
 - **Telegram bridge** — message your local model from your phone: no public URL, no port-forwarding, no cloud relay. Agent tools and scheduled tasks work remotely; the bot locks to the first chat that messages it.
 - **Scheduled tasks** — hand the agent a goal and a schedule in plain English ("weekdays at 8am, check my watched sites and write a briefing") and it runs unattended, with saved transcripts.
 - **Document folder RAG** — attach a folder of mixed files and ask questions about them; GPU-batched embeddings index ~500 files in ~7 s, everything in memory, nothing leaves the Mac.
@@ -188,32 +191,34 @@ brew install mlx-c webp
 
 ## Quick Start
 
-### Download a model
-
-The MLX Core app can download models directly, or use the CLI:
+### Build from source
 
 ```bash
-pip install huggingface-hub
-huggingface-cli download mlx-community/gemma-4-e4b-it-4bit --local-dir ~/.mlx-serve/models/gemma-4-e4b-it-4bit
+git clone --recurse-submodules https://github.com/ddalcu/mlx-serve && cd mlx-serve
+git submodule update --init    # only if you cloned WITHOUT --recurse-submodules (lib/ds4, the DeepSeek V4 engine)
+./scripts/fetch-llama.sh       # once — stages the pinned llama.cpp dylib (git-ignored, fetched not tracked)
+zig build -Doptimize=ReleaseFast
 ```
 
-### Build and run
+### Get a model and run
+
+The MLX Core app downloads models with a progress UI, or do it all from the binary you just built — no Python, no extra tools:
 
 ```bash
-./scripts/fetch-llama.sh (only once)
-zig build -Doptimize=ReleaseFast
-./zig-out/bin/mlx-serve --model ~/.mlx-serve/models/gemma-4-e4b-it-4bit --serve --port 8080
+./zig-out/bin/mlx-serve run gemma4     # download (resumable) + serve + chat REPL in one
+# or piece by piece:
+./zig-out/bin/mlx-serve pull gemma4
+./zig-out/bin/mlx-serve --model ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit --serve --port 8080
 ```
 
 ### Build the app
 
 ```bash
-./scripts/fetch-llama.sh (only once)
 cd app && SKIP_NOTARIZE=1 bash build.sh
 open "MLX Core.app"
 ```
 
-Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code signing.
+`SKIP_NOTARIZE=1` dev builds are ad-hoc signed — no Apple developer account needed. Notarized release builds require `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID`.
 
 ## Usage
 
@@ -242,7 +247,7 @@ Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code
 |---|---|---|
 | `--model PATH` | required | Path to the model directory or a `.gguf` file |
 | `--serve` | off | Start the HTTP server |
-| `--host ADDR` | `127.0.0.1` | Host address to bind |
+| `--host ADDR` | `0.0.0.0` | Bind address (all interfaces — set `127.0.0.1` for strictly local) |
 | `--port N` | `11234` | Port for the HTTP server |
 | `--prompt TEXT` | `"Hello"` | Prompt for interactive mode |
 | `--max-tokens N` | `100` | Maximum tokens to generate |
@@ -268,6 +273,9 @@ Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code
 | `--prefix-cache-disk N{MB,GB}` | off | SSD tier: prefixes survive restarts (11K-token restart TTFT 5.9 s → 0.7 s) |
 | `--metrics` | off | Prometheus `/metrics` + live dashboard panel on `/` |
 | `--api-key KEY` | none | Require a key for non-localhost requests (localhost stays open) |
+| `--lan-share <all\|id,...>` | off | Share the listed models (or all) with your local network over Bonjour — only inference is exposed, model management stays host-local |
+| `--lan-discover` | off | Discover models other Macs share: they appear in `/v1/models` as `model@peer` and requests proxy to that Mac |
+| `--lan-name NAME` | hostname | The Bonjour name other Macs see |
 | `--model-dir PATH` | none | Discover and serve every model in a folder (LRU resident set) |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 
@@ -443,6 +451,9 @@ Yes. mlx-serve embeds llama.cpp's inference library (`libllama`) inside the same
 ### Does mlx-serve work with Claude Code?
 Yes — natively. mlx-serve implements Anthropic's `/v1/messages` endpoint including streaming, tool calling, and extended thinking. Point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:11234`. The MLX Core app ships a one-click "Launch Claude Code" button that wires up the env vars for you.
 
+### Can my Macs share models over the network?
+Yes — LAN Sharing, off by default. Turn on sharing where the models live (Settings ▸ LAN Sharing, or `mlx-serve --serve --lan-share all`) and discovery on the Mac that wants to use them (`--lan-discover`). They find each other over Bonjour — no IPs, no config — and shared models appear in every model picker as "model · peer" and in `/v1/models` as `model@peer`, so even Claude Code pointed at `localhost` can run on the other Mac's model. Works for chat and image/speech/music/video/3D generation; models cold-load on demand on the host; only inference is exposed (model management, metrics, and the status page stay private to each Mac).
+
 ### What about the OpenAI SDK, Continue, Cursor, Open WebUI?
 All work — anything that talks the OpenAI chat-completions or Anthropic Messages wire protocol does. mlx-serve also implements the newer OpenAI Responses API (`/v1/responses`) for clients that want stateful chains via `previous_response_id`, plus a WebSocket transport on the same endpoint.
 
@@ -468,7 +479,7 @@ Zig with direct `mlx-c` FFI — no Python runtime, no Electron, no IPC bridge. T
 For greedy decoding (temp=0), mlx-serve is byte-identical to the reference for the first ~30-80 generated tokens, with the long-tail divergence inherent to INT4 float-reduction order (documented in `CLAUDE.md`). For temp > 0, the Leviathan probability-ratio sampler keeps speculative decoding mathematically exact in distribution. Equivalence is pinned by `tests/test_pld_equivalence.sh`, `test_drafter_equivalence.sh`, and `test_kv_quant_equivalence.sh`.
 
 ### Where does my data go?
-Nowhere. Everything runs locally on your Mac — no analytics, no telemetry, no cloud calls. The HTTP server binds to `127.0.0.1` by default. Open source under MIT.
+Nowhere off your machines. Everything runs locally — no analytics, no telemetry, no cloud calls. The HTTP server listens on your local network interface by default (`--host 0.0.0.0`) so your own devices can reach it; set `--host 127.0.0.1` to make it strictly local, or `--api-key` to gate every non-localhost request. With LAN Sharing on, prompts sent to a shared model travel only across your local network to the Mac hosting that model. Open source under MIT.
 
 ### How do I update?
 The MLX Core app self-updates by checking the GitHub releases feed. CLI: `brew upgrade --cask mlx-core` or `brew upgrade mlx-serve`.

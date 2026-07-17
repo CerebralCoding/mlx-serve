@@ -6216,14 +6216,48 @@ fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8,
     return null;
 }
 
-/// Proxy a request naming `<bare>@<peer>` to that peer (lan.tunnel). 404
-/// when the peer vanished, 502 when it stopped accepting — never a silent
-/// fallback to the local default model.
+/// How long a proxied request waits for discovery to converge before the
+/// honest "peer offline" 404. Covers a local restart's cold peer table AND a
+/// peer Mac mid-reboot/redeploy: the peer needs to boot, advertise, and be
+/// re-fetched — seconds, not milliseconds. A genuinely dead peer costs the
+/// client this long once; an unlisted model or discovery-off never waits.
+const LAN_PEER_WAIT_MS: i64 = 15_000;
+
+/// Proxy a request naming `<bare>@<peer>` to that peer (lan.tunnel). The
+/// failure modes are deliberately distinct — the live bite was one instant
+/// "peer offline" 404 covering all three:
+///   • discovery off on THIS server → say so (a share-only boot can never
+///     resolve a peer, and "offline" sent the user debugging the wrong Mac);
+///   • peer known but model unlisted → fail fast, honestly;
+///   • peer unknown → poke discovery and wait up to LAN_PEER_WAIT_MS
+///     (client disconnect abandons the wait), then 404.
+/// 502 when the peer resolves but stops accepting. Never a silent fallback
+/// to the local default model.
 fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, method: []const u8, raw_path: []const u8, body: []const u8, full_id: []const u8) !void {
     const rid = lan_mod.splitRemoteId(full_id).?;
-    const remote = l.remoteFor(full_id) orelse {
-        try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "LAN peer for this model is offline", 404);
+    if (!l.discover) {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "This id names a LAN peer's model, but LAN discovery is off on this server — start it with --lan-discover (app: Settings > LAN Sharing > Use models shared by other Macs)", 404);
         return;
+    }
+    const deadline = nowMsMonotonic(stream.io) + LAN_PEER_WAIT_MS;
+    const remote: lan_mod.Remote = remote: while (true) {
+        switch (l.lookupRemote(full_id)) {
+            .found => |r| break :remote r,
+            .model_unlisted => {
+                try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "The LAN peer no longer shares this model", 404);
+                return;
+            },
+            .peer_unknown => {
+                if (nowMsMonotonic(stream.io) >= deadline) {
+                    try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "LAN peer for this model is offline (waited 15 s for discovery)", 404);
+                    return;
+                }
+                if (stream.peerClosed()) return; // client gave up while we waited
+                l.pokeDiscovery();
+                const ts = std.c.timespec{ .sec = 0, .nsec = 250_000_000 };
+                _ = std.c.nanosleep(&ts, null);
+            },
+        }
     };
     const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, rid.bare);
     defer allocator.free(rewritten);

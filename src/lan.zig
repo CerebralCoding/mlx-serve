@@ -303,6 +303,8 @@ pub const Lan = struct {
     /// micro critical section (same rationale as log.zig's sink_mutex).
     mu: std.c.pthread_mutex_t = .{},
     peers: std.StringHashMap(Peer),
+    /// Set by `pokeDiscovery` (conn threads); consumed by the browser loop.
+    refresh_asap: std.atomic.Value(bool) = .init(false),
     // Browser-thread only (events + refresh both run there — no lock):
     events: std.ArrayList(BrowseEvent) = .empty,
     /// Every service name browse has ever reported, with its consecutive
@@ -378,15 +380,32 @@ pub const Lan = struct {
         return if (l.share) |s| s.allows(id) else false;
     }
 
-    /// Host+port for a `<bare>@<peer>` id, if that peer currently offers it.
-    pub fn remoteFor(l: *Lan, id: []const u8) ?Remote {
-        const rid = splitRemoteId(id) orelse return null;
+    pub const RemoteLookup = union(enum) { found: Remote, peer_unknown, model_unlisted };
+
+    /// Three-state lookup for a `<bare>@<peer>` id. `found` → tunnel it.
+    /// `model_unlisted` → the peer answered recently and does NOT offer this
+    /// model: definitive, fail fast. `peer_unknown` → the peer isn't in the
+    /// table (yet): offline, mid-restart, or discovery still converging —
+    /// the proxy WAITS briefly and retries instead of failing instantly
+    /// (live: a chat fired while the peer Mac was redeploying — or right
+    /// after a local restart — got an instant misleading 404). A peer
+    /// installed with an EMPTY model list (mid-boot) counts as unknown so
+    /// the wait covers it too.
+    pub fn lookupRemote(l: *Lan, id: []const u8) RemoteLookup {
+        const rid = splitRemoteId(id) orelse return .peer_unknown;
         _ = std.c.pthread_mutex_lock(&l.mu);
         defer _ = std.c.pthread_mutex_unlock(&l.mu);
-        const p = l.peers.getPtr(rid.peer) orelse return null;
+        const p = l.peers.getPtr(rid.peer) orelse return .peer_unknown;
         for (p.models) |m|
-            if (std.mem.eql(u8, m.id, rid.bare)) return .{ .ip4 = p.ip4, .port = p.port };
-        return null;
+            if (std.mem.eql(u8, m.id, rid.bare)) return .{ .found = .{ .ip4 = p.ip4, .port = p.port } };
+        return if (p.models.len == 0) .peer_unknown else .model_unlisted;
+    }
+
+    /// Ask the browser thread to re-attempt every known service NOW instead
+    /// of at the next 10 s tick — the proxy's convergence wait uses this so
+    /// a rebooted peer is picked up within a poll cycle, not a refresh cycle.
+    pub fn pokeDiscovery(l: *Lan) void {
+        l.refresh_asap.store(true, .release);
     }
 
     /// Owned copy of the /v1/models entry JSON for a remote id (the
@@ -743,7 +762,8 @@ fn threadMain(l: *Lan) void {
             l.attemptKnown(ev.name);
         }
         const now = monoMs();
-        if (l.discover and now - last_refresh > 10_000) {
+        const poked = l.refresh_asap.swap(false, .acq_rel);
+        if (l.discover and (poked or now - last_refresh > 10_000)) {
             last_refresh = now;
             l.refreshKnown();
         }
@@ -1018,6 +1038,35 @@ test "lan: parsePeerModels rewrites ids, adds lan_peer, keeps meta" {
     // Not an mlx-serve shape → error, not a crash.
     try t.expectError(error.BadPeerJson, parsePeerModels(a, "{\"nope\":true}", "x"));
     try t.expectError(error.BadPeerJson, parsePeerModels(a, "not json", "x"));
+}
+
+test "lan: lookupRemote distinguishes found / unlisted / unknown" {
+    const a = t.allocator;
+    var l = Lan{ .alloc = a, .port = 0, .discover = true, .peers = .init(a), .known = .init(a) };
+    defer {
+        var it = l.peers.valueIterator();
+        while (it.next()) |p| p.deinit(a);
+        l.peers.deinit();
+        l.known.deinit();
+    }
+
+    // Unknown peer (and non-remote ids) → unknown: the proxy waits for
+    // discovery to converge instead of failing instantly.
+    try t.expect(l.lookupRemote("gemma@ghost") == .peer_unknown);
+    try t.expect(l.lookupRemote("local-model") == .peer_unknown);
+
+    const models = try a.alloc(PeerModel, 1);
+    models[0] = .{ .id = try a.dupe(u8, "gemma"), .entry_json = try a.dupe(u8, "{}") };
+    l.installPeer("studio", .{ 127, 0, 0, 1 }, 1234, models);
+    try t.expect(l.lookupRemote("gemma@studio") == .found);
+    // The peer answered recently and does NOT offer this model — definitive,
+    // fail fast (probes/typos must not burn the wait).
+    try t.expect(l.lookupRemote("other@studio") == .model_unlisted);
+
+    // A mid-boot empty install (peer reachable, models not served yet)
+    // counts as unknown so the wait covers it too.
+    l.installPeer("booting", .{ 127, 0, 0, 1 }, 1235, &.{});
+    try t.expect(l.lookupRemote("anything@booting") == .peer_unknown);
 }
 
 /// Duck-typed stand-in for server.Conn in tunnel tests.
