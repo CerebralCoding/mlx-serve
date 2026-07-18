@@ -15,7 +15,7 @@ MTPLX 2.0.2, mlx-lm 0.31.3. Identical weights within every row. Last refreshed
 Model `Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed` (4-bit trunk + calibrated MTP
 adapter; LM Studio has no MTP support and decodes plain AR). Coding-agent prompts,
 temp 0.6, max_tokens 128, fresh loads, **cold prompts**, best-of-N per cell.
-CSV: `docs/perf-csvs/mtp-ladder-26.7.6.csv` · chart: `docs/perf-mtp-ladder-26.7.6.png`.
+CSV: `docs/perf-csvs/mtp-ladder-26.7.6.csv` · chart: `docs/perf-pngs/perf-mtp-ladder-26.7.6.png`.
 
 | prefill tok/s | 0.5k | 1k | 2k | 4k | 8k | 16k | 32k | 64k |
 |---|---:|---:|---:|---:|---:|---:|---:|---:|
@@ -71,7 +71,7 @@ gemma-4bit PLD byte-equivalence (kernel engages there too), full suite green.
 ## vs LM Studio — family matrix (ctx 4096, temp 0, best cell vs best cell)
 
 CSVs: `docs/perf-csvs/{gemma,qwen36}-26.7.6.csv` · chart:
-`docs/perf-vs-lmstudio-qwen36-26.7.6.png`. Geomean over 18 cells: **+47.7%**
+`website/perf-vs-lmstudio-qwen36-26.7.6.png`. Geomean over 18 cells: **+47.7%**
 (**+38.0%** with native-MTP cells excluded).
 
 | Model | Echo | Code | Free-form |
@@ -86,7 +86,7 @@ CSVs: `docs/perf-csvs/{gemma,qwen36}-26.7.6.csv` · chart:
 ### Refresh 2026-07-16 (`feature/more-hy3-fixes` soak) — all 4 engines, code cell (echo/free-form opt-in)
 
 CSV: `docs/perf-csvs/all-26.7.9.csv` · chart:
-`docs/perf-vs-lmstudio-omlx-all-26.7.9.png`. vs `all-26.7.7.csv` (same
+`docs/perf-pngs/perf-vs-lmstudio-omlx-all-26.7.9.png`. vs `all-26.7.7.csv` (same
 methodology): **no regression** — every mlx-serve decode cell within ±5%.
 **oMLX — not LM Studio — is the competitor to watch.**
 

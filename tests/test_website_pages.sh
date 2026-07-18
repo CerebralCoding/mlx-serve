@@ -1,21 +1,21 @@
 #!/bin/bash
-# test_docs_pages.sh — static checks for the docs/ marketing site (GitHub Pages).
+# test_website_pages.sh — static checks for the website/ marketing site (GitHub Pages).
 #
 # Verifies, without a browser:
-#   1. every feature deep-dive page exists at docs/<slug>/index.html
+#   1. every feature deep-dive page exists at website/<slug>/index.html
 #   2. each page carries the SEO contract: <title>, meta description, canonical
 #      URL matching its slug, Open Graph tags, JSON-LD, and the shared stylesheet
-#   3. every relative href/src across all docs pages resolves to a real file
+#   3. every relative href/src across all site pages resolves to a real file
 #      (screenshots/ refs are reported as PENDING, not failures — they are the
 #      screenshot shopping list)
 #   4. sitemap.xml lists the homepage + every deep-dive URL; robots.txt points at it
 #   5. index.html links to every deep-dive page (internal-link SEO)
 #
-# Usage: ./tests/test_docs_pages.sh
+# Usage: ./tests/test_website_pages.sh
 
 set -u
 cd "$(dirname "$0")/.." || exit 1
-DOCS="docs"
+DOCS="website"
 BASE_URL="https://ddalcu.github.io/mlx-serve"
 
 SLUGS=(
@@ -104,14 +104,14 @@ if [ -f "$DOCS/sitemap.xml" ]; then
     check "$DOCS/sitemap.xml" "$BASE_URL/$slug/</loc>" "sitemap: $slug entry"
   done
 else
-  fail "docs/sitemap.xml missing"
+  fail "$DOCS/sitemap.xml missing"
 fi
 
 if [ -f "$DOCS/robots.txt" ]; then
   pass
   check "$DOCS/robots.txt" "Sitemap: $BASE_URL/sitemap.xml" "robots.txt: sitemap reference"
 else
-  fail "docs/robots.txt missing"
+  fail "$DOCS/robots.txt missing"
 fi
 
 # ── 5: index.html links to every deep-dive page ─────────────────────────────
@@ -129,6 +129,6 @@ for f in "${html_files[@]}"; do
 done
 
 echo ""
-echo "docs pages: $PASS passed, $FAIL failed, $PEND pending screenshots"
+echo "website pages: $PASS passed, $FAIL failed, $PEND pending screenshots"
 [ "$FAIL" -eq 0 ] || exit 1
 exit 0

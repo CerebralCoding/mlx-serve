@@ -25,7 +25,7 @@ prefix < one 2048 chunk) so ascending-session values are already cold.
 
 Usage:
   python3 tests/plot_mtp_ladder.py docs/perf-csvs/mtp-ladder-26.7.6.csv \
-      docs/perf-mtp-ladder-26.7.6.png
+      docs/perf-pngs/perf-mtp-ladder-26.7.6.png
 
 Requires matplotlib; style matches tests/plot_vs_lmstudio_omlx.py.
 """

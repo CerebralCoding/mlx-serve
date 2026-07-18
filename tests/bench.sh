@@ -5,7 +5,7 @@
 # prompts (fast dev-loop iteration; echo and free-form are opt-in via
 # --echo / --freeform since 2026-07-14), MLX-format checkpoints only. Pass
 # --lmstudio and/or --omlx to add the apples-to-apples comparison cells that
-# produce charts in docs/perf-vs-lmstudio-omlx*.png — --lmstudio includes the
+# produce charts in docs/perf-pngs/perf-vs-lmstudio-omlx*.png — --lmstudio includes the
 # LM Studio GGUF alt cell (the canonical chart's BASELINE); pass --gguf to
 # also add the mlx-serve llama.cpp GGUF alt cell. Pass --concurrent N to also
 # emit batched throughput rows (folded from the old bench_concurrent.py).
@@ -39,7 +39,7 @@
 #     a default thinking mode, so the workaround is a no-op there.
 #
 # Output:
-#   - CSV at $OUT (default docs/perf-vs-lmstudio-omlx-<family>.csv) with rows:
+#   - CSV at $OUT (default docs/perf-csvs — data only; charts land in docs/perf-pngs/) with rows:
 #     label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|hardware|notes
 #   - To generate the chart: python3 tests/plot_vs_lmstudio_omlx.py <csv> <png> [--family <family>]
 #
@@ -174,7 +174,7 @@ Options:
                        /v1/chat/completions are fired; the row's tok/s is the
                        aggregate rate. Default 0 (off).
   --out PATH           Chart PNG output path. Default is timestamped:
-                       docs/perf-vs-lmstudio-omlx-<family>-YYYYMMDD-HHMMSS.png
+                       docs/perf-pngs/perf-vs-lmstudio-omlx-<family>-YYYYMMDD-HHMMSS.png
                        The chart is skipped when no comparison engines are
                        enabled (a single-engine bar chart isn't useful).
   --keep-csv PATH      CSV output path. Default (since 2026-07-14):
@@ -244,7 +244,7 @@ cd "$REPO_ROOT"
 # each other (handy when sweeping over runs / comparing tweaks). Override
 # with --out PATH to pick an exact filename (e.g. one referenced by README).
 TS="$(date +%Y%m%d-%H%M%S)"
-[[ -z "$PNG_OUT" ]] && PNG_OUT="docs/perf-vs-lmstudio-omlx-${FAMILY}-${TS}.png"
+[[ -z "$PNG_OUT" ]] && PNG_OUT="docs/perf-pngs/perf-vs-lmstudio-omlx-${FAMILY}-${TS}.png"
 
 # The CSV is ALWAYS retained (2026-07-14): re-rendering / restyling a chart
 # from a kept CSV is free, re-running the bench is an hour. --keep-csv PATH
