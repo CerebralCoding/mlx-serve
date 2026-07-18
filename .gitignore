@@ -1,6 +1,8 @@
 .zig-cache/
 zig-out/
-.claude/
+# .claude stays private (settings.local.json, locks) EXCEPT checked-in project skills
+.claude/*
+!.claude/skills/
 /models/
 *.safetensors
 

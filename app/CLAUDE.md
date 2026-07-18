@@ -1,0 +1,58 @@
+# Swift macOS app (MLX Core) — AI context
+
+Compressed rules. Full war stories: `../docs/gotchas/app.md`. Full service contracts: `../docs/reference.md`. Repo-wide policy (TDD, release, conventions): root `../CLAUDE.md`.
+
+## Build
+
+- ALWAYS ship via `bash app/build.sh` (signs, entitlements, links Zig artifacts, keeps MLXCore + mlx-serve in lockstep); dev: `SKIP_NOTARIZE=1`. Swift-only fast iteration escape hatch: `cd app && swift build -c release -Xswiftc -swift-version -Xswiftc 5` (flag vestigial since swift-sdk 0.12.1 — keep sdk >= 0.12.1; 0.10.x cannot compile in the MAS Xcode project).
+- The .app bundles TWO binaries (MLXCore UI + mlx-serve server) — always update together; a stale sibling is the classic "still doesn't work".
+- Agent Sandbox needs `com.apple.security.virtualization` in BOTH signing branches of build.sh (ad-hoc included) or VZ refuses to boot. `swift build` binaries / xctest can't boot VMs; live guard = `SANDBOX_SMOKE=1 <MLXCore binary>`.
+
+## Layout
+
+| Path | Role |
+|---|---|
+| `MLXServeApp.swift` | Entry, menu bar + Chat/Browser windows |
+| `AppState.swift` | Global state, chat session persistence, `deleteSession` (must stop orphaned turns) |
+| `Models/{ChatModels,AgentModels,ServerOptions}.swift` | `ChatMessage`, `SerializedToolCall`, launch flags (`toCLIArgs`) |
+| `Services/APIClient.swift` | HTTP + SSE streaming client; accumulates tool-call deltas, emits on `finish_reason` (incl. "length") |
+| `Services/AgentPrompt.swift` | System prompt, 10 tools, `SkillManager`; env-specific facts ride `executionEnvironmentSection`, never the base prompt |
+| `Services/AgentBudget.swift` | Derives context/output budgets for agent CLI configs from server `meta.context_length` — NEVER hardcode |
+| `Services/AgentEngine.swift` | Shared agent logic: history, tool exec (`normalizeWriteFileArgs`), repetition tracking, `AgentRetryBudget` (consecutive, resets on real tool round) |
+| `Services/ToolExecutor.swift` | Tool handlers (shell, file, search, browse, webSearch, saveMemory) |
+| `Services/ChatTurnEngine.swift` | ONE turn at a time app-wide (chat window + Quick Launcher share it; Tasks/Telegram own instances); `composerState(for:)`, `stopIfOrphaned` |
+| `Services/DocumentIndex.swift` | Folder-RAG: embeds ONLY via server `/v1/embeddings` (auto-downloads bge-small, registers by abs path); server down → lexical-only |
+| `Services/{AgentSandbox,VzGuest,OCIClient,SandboxSmoke}.swift` | VZ Linux guest: virtiofs root, hvc1 shell (`ShellSentinel`), hvc2 monitor, `SandboxPortForwarder` |
+| `Services/ClonedVoiceSynthesizer.swift` | Voice-clone TTS pipeline behind `SpeechSynthesizing`; per-utterance fallback to system voice, never dead air |
+| `Services/QuickLauncher*.swift` | ⌃Space launcher: Carbon hotkey + non-activating NSPanel; pure `QuickLauncherLogic` |
+| `Services/{ImagePreprocessor,BrowserManager,ServerManager,TestServer,AgentMemory}.swift` | Image prep, WKWebView, server lifecycle, test server :8090, agent context |
+| `Services/TaskScheduler.swift` | Scheduled tasks ("claw"): own ChatTurnEngine, durable runs, `reconcileStaleRuns` |
+| `Views/{ChatView,StatusMenuView,BrowserView}.swift` | Chat UI + `runAgentLoop()` (150 iters max), menu bar, browser |
+
+Agent loop: tools → parse → exec → feed back; history builder is budget-aware (pins first user+assistant, truncates, auto-compacts tool results). Tool errors echo sent args + retry hint for self-correction.
+
+## Rules
+
+- **ServerOptions defaults mirror Zig defaults** (`src/main.zig` CLI vars / `src/server.zig` pub globals). Changing a server default = update the Swift field default AND the `toCLIArgs` emit-guard in the same change; memory-critical caps always-emit (prefix-cache-entries, RAM-clamped). Guard: `testDefaultLaunchOmitsAllMatchDefaultFlags`.
+- **writeFile append-flag conflation**: a boolean flag adjacent to a large free-text value is a JSON-mangle magnet — type it `boolean` in the schema, never string; `normalizeWriteFileArgs` peels flag+body welds; `appendFlagIsTrue` parses dirty flags (`"true,"`); the missing-content error must NEVER claim truncation (only the loop, which knows `maxTokensHit`, may say "cut off"). Guards: WriteFileHandlerTests, AgentWriteFileRecoveryTests.
+- **Error steers**: an error sent back to a model must never contain an empty/placeholder example (`toolExample` extracts from any `Example…{` marker — class guard `testEveryToolDescriptionExampleIsExtractable`) and must name the missing key RELATIVE to keys actually sent, with a concrete example built from the model's own values. `parseLineNumber` reads `"45,"` as 45. Guards: EditFileRecoveryTests.
+- **Reproduce from the real capture**: fix model-output bugs from the failing model's actual bytes (`chat-history.json`, `last-agent-request.json`, `tool-calls.log`), never a steered/different-format analogue.
+- **LSUIElement activation**: go `.regular` BEFORE presenting any window/panel, synchronously — everything through the `AppActivation` chokepoint; never bare `openWindow(id:)` or `panel.runModal()` (source-audit tests enforce). Symptom: half-focused window/picker that activates only after a click.
+- **NSToolbar can't re-measure dynamic content** — any strip whose members appear/change density at runtime is a plain view row (`.safeAreaInset(edge: .top)`), density from measured width (`ChatMetrics`), never ToolbarItems (» eviction, mangled overflow).
+- **Per-tab chat state keyed by session id** — `ChatDetailView` is REUSED across tabs (no `.id(sessionId)`): per-conversation state lives in id-keyed structures (`SessionToolAllowList`), persisted toggles on `ChatSession`, synced in BOTH `.onAppear` and `.onChange(of: sessionId)`; never a shared flag, never reset-on-switch. Guard: PerSessionUIStateTests.
+- **Ghost turns**: any session-removal site must `chatEngine.stopIfOrphaned()`; `runAgentLoop` re-checks the session exists each iteration. Symptom: every surface says "answering another chat", nothing visibly streams, `last-agent-request.json` keeps updating, survives server restart. Guard: OrphanedTurnTests.
+- **TaskRun.summary is a 280-char UI cap** — full results via `fullLastAssistantText(transcript…)`; Telegram sends split at 4096 (`splitForTelegram`) at every send site. Stale `.running` runs healed at launch (`reconcileStaleRuns`); `.needsApproval` durable; live-run Stop via `cancelledRunIds`.
+- **No launch-eager audio graphs** (TCC class): AVSpeechSynthesizer/AVAudioEngine graphs built lazily on first use, idle paths must not force creation — else mic permission prompt at APP LAUNCH (re-prompts every ad-hoc rebuild). Guard: VoiceActivityTests lazy-init. Diagnose: `/usr/bin/log show --predicate 'process == "tccd"'` (zsh `log` builtin shadows it).
+- **VAD is relative**: threshold = `max(0.015, ambient_floor × 2)` (min-statistics window) + a 2s transcript-stall backstop; never an absolute energy level. Symptom: run-on partials, stuck "Listening…", no user message ever lands.
+- **Sandbox**: `TerminalOutput.sanitize` normalizes `\r\n`→`\n` BEFORE bare-`\r` collapse (tty ONLCR class — else every line wiped); hvc2 lines are CRLF → split with `whereSeparator: \.isNewline` (Swift treats `"\r\n"` as ONE grapheme); port forwarder binds BOTH 127.0.0.1 AND ::1 (localhost resolves v6-first); served-URL form is env-specific (localhost in sandbox, LAN IP on host) and rides the env section + tool-result steer, never the base prompt.
+- **Multi-input AVAssetWriter**: feed the single-shot track (audio) fully + `markAsFinished()` BEFORE the frame loop, or backpressure deadlocks; toy-scale stays green — guard runs at realistic scale (97×256×256).
+- **SwiftUI VideoPlayer is unsafe under state transitions (macOS 26.4)** — wrap AVPlayerView via NSViewRepresentable.
+- **LAN picks**: chat routes through `server.chatModelId`/`chatModelInfo` (LAN wins over local default) — never read `modelInfo?.name` directly at a new chat surface; gen services route `ServerManager.prepareGenModel` (LAN ids pass through, no local load/unload); `AppState.ensureServerForLan` keeps the server running for either toggle.
+- **WKWebView**: `BrowserManager` is `@MainActor`, created eagerly at launch; `browse.readText`/`webSearch` navigate first, then extract.
+- **JSONSerialization**: tool-call `arguments` must be a JSON String, not a nested dict (server checks `v == .string`); `[String: Any]` key order non-deterministic; `""` stays `""`.
+
+## Debugging
+
+- `print()` is invisible when launched via `open` — run the binary directly or write to file.
+- Every agent request → `~/.mlx-serve/last-agent-request.json` (replay via curl); history `~/.mlx-serve/chat-history.json`; server stderr tail in the menu-bar log viewer (`ThrottledLogBuffer`, 1 MB; full history in `~/.mlx-serve/logs/`).
+- Headless agent-loop driving: TestServer on :8090 (`TESTING_MODE=1`, `/test/agent` + poll `/test/history`).
