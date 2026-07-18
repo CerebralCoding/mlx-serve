@@ -80,6 +80,43 @@ const QLinear = struct {
     }
 };
 
+fn m5NaxQLinearMatches(q: *const QLinear, in_dim: u32, out_dim: u32, bits: u32, group_size: u32) bool {
+    if (q.w.ctx == null or q.s.ctx == null or q.b.ctx == null) return false;
+    if (mlx.mlx_array_dtype(q.w) != .uint32 or
+        mlx.mlx_array_dtype(q.s) != .bfloat16 or
+        mlx.mlx_array_dtype(q.b) != .bfloat16) return false;
+    if (in_dim == 0 or out_dim == 0 or out_dim > std.math.maxInt(c_int)) return false;
+    const out: c_int = @intCast(out_dim);
+    const w_shape = mlx.getShape(q.w);
+    const s_shape = mlx.getShape(q.s);
+    const b_shape = mlx.getShape(q.b);
+    if (w_shape.len != 2 or s_shape.len != 2 or b_shape.len != 2) return false;
+    if (w_shape[0] != out or s_shape[0] != out or b_shape[0] != out) return false;
+    if (s_shape[1] != b_shape[1]) return false;
+    const qp = transformer_mod.affineParamsFromGeometry(q.w, q.s, in_dim) orelse return false;
+    return qp.bits == bits and qp.group_size == group_size and qp.mode == .affine;
+}
+
+fn m5NaxNormMatches(norm: mlx.mlx_array, len: u32) bool {
+    if (norm.ctx == null or mlx.mlx_array_dtype(norm) != .bfloat16) return false;
+    if (len == 0 or len > std.math.maxInt(c_int)) return false;
+    const shape = mlx.getShape(norm);
+    return shape.len == 1 and shape[0] == @as(c_int, @intCast(len));
+}
+
+fn m5NaxDraftHeadMatches(
+    draft: ?*const QLinear,
+    bits: u32,
+    group_size: u32,
+    hidden_size: u32,
+    vocab_size: u32,
+) bool {
+    const q = draft orelse return false;
+    return bits == 3 and
+        group_size == 64 and
+        m5NaxQLinearMatches(q, hidden_size, vocab_size, 3, 64);
+}
+
 /// MTP MLP: dense SwiGLU (0.8B/27B-class sidecars) or the sparse MoE of a
 /// qwen3_5_moe trunk (35B-A3B-class sidecars: router `mlp.gate` + packed
 /// `switch_mlp` experts + shared expert + shared-expert gate). The MoE arm
@@ -167,7 +204,8 @@ pub const MtpModel = struct {
     /// first `nextMtp` round of the next request. A fresh controller burns
     /// ~10 legacy-warmup rounds plus a +1/round base climb per request —
     /// a third of a short protocol-style generation; seeding restores the
-    /// learned surface from round 1. Never written by disabled/short runs.
+    /// learned surface from round 1. Never written by disabled/short runs;
+    /// set MLX_SERVE_MTP_EV_SEED=0 to opt into request isolation.
     ev_seed_accept: ?[MAX_DEPTH]f32 = null,
     ev_seed_m_lo: u32 = 1,
 
@@ -194,6 +232,62 @@ pub const MtpModel = struct {
     pub fn makeCache(self: *const MtpModel, allocator: std.mem.Allocator) !KVCache {
         _ = self;
         return KVCache.init(allocator, 1);
+    }
+
+    /// Whether this bound sidecar and target match the complete cost surface
+    /// measured for the M5/G17 depth-8 controller. The cheap draft marginal
+    /// assumes the successful 3-bit/gs-64 draft-only lm_head plus the native
+    /// dense 8-bit/gs-32 Qwen3.6-27B MTP layer. A compatible but differently
+    /// quantized sidecar remains correct, but keeps the conservative profile.
+    pub fn m5NaxCostProfileEnabled(self: *const MtpModel, target: *const Transformer) bool {
+        if (!target.mtpNaxProfileEnabled()) return false;
+        if (self.eh_proj != null or self.quant_bits != 8 or self.quant_group_size != 32) return false;
+
+        const cfg = &target.config;
+        const full_out_wide = @as(u64, cfg.num_attention_heads) * cfg.head_dim;
+        const q_out_wide = full_out_wide * 2;
+        const kv_out_wide = @as(u64, cfg.num_key_value_heads) * cfg.head_dim;
+        if (full_out_wide == 0 or full_out_wide > std.math.maxInt(u32) or
+            q_out_wide > std.math.maxInt(u32) or
+            kv_out_wide == 0 or kv_out_wide > std.math.maxInt(u32)) return false;
+        const full_out: u32 = @intCast(full_out_wide);
+        const q_out: u32 = @intCast(q_out_wide);
+        const kv_out: u32 = @intCast(kv_out_wide);
+
+        const fc_shape = mlx.getShape(self.fc_w_t);
+        if (mlx.mlx_array_dtype(self.fc_w_t) != .bfloat16 or
+            fc_shape.len != 2 or
+            fc_shape[0] != @as(c_int, @intCast(cfg.hidden_size * 2)) or
+            fc_shape[1] != @as(c_int, @intCast(cfg.hidden_size))) return false;
+        if (!m5NaxNormMatches(self.pre_fc_norm_emb, cfg.hidden_size) or
+            !m5NaxNormMatches(self.pre_fc_norm_hidden, cfg.hidden_size) or
+            !m5NaxNormMatches(self.final_norm, cfg.hidden_size) or
+            !m5NaxNormMatches(self.input_norm, cfg.hidden_size) or
+            !m5NaxNormMatches(self.post_attn_norm, cfg.hidden_size) or
+            !m5NaxNormMatches(self.q_norm, cfg.head_dim) or
+            !m5NaxNormMatches(self.k_norm, cfg.head_dim)) return false;
+
+        if (!m5NaxQLinearMatches(&self.q, cfg.hidden_size, q_out, 8, 32) or
+            !m5NaxQLinearMatches(&self.k, cfg.hidden_size, kv_out, 8, 32) or
+            !m5NaxQLinearMatches(&self.v, cfg.hidden_size, kv_out, 8, 32) or
+            !m5NaxQLinearMatches(&self.o, full_out, cfg.hidden_size, 8, 32)) return false;
+        switch (self.mlp) {
+            .dense => |*mlp| {
+                if (!m5NaxQLinearMatches(&mlp.gate, cfg.hidden_size, cfg.intermediate_size, 8, 32) or
+                    !m5NaxQLinearMatches(&mlp.up, cfg.hidden_size, cfg.intermediate_size, 8, 32) or
+                    !m5NaxQLinearMatches(&mlp.down, cfg.intermediate_size, cfg.hidden_size, 8, 32)) return false;
+            },
+            .moe => return false,
+        }
+
+        const draft: ?*const QLinear = if (self.draft_head) |*q| q else null;
+        return m5NaxDraftHeadMatches(
+            draft,
+            self.draft_head_bits,
+            self.draft_head_group,
+            cfg.hidden_size,
+            cfg.vocab_size,
+        );
     }
 
     /// Validate the head against the target trunk: dims must line up and the
@@ -1776,6 +1870,61 @@ test "mtp: headQuantParams never mis-resolves a non-affine lm_head as affine (is
     try testing.expectEqual(model_mod.QuantMode.affine, qpa.mode);
     try testing.expectEqual(@as(u32, 8), qpa.bits);
     try testing.expectEqual(@as(u32, 32), qpa.group_size);
+}
+
+test "mtp: M5 NAX cost profile requires exact sidecar and draft-head quant geometry" {
+    const s = mlx.gpuStream();
+    const IN: u32 = 128;
+    const OUT: u32 = 64;
+    const mk = struct {
+        fn qlinear(in_dim: u32, out_dim: u32, bits: u32, group: u32, stream: mlx.mlx_stream) !QLinear {
+            const w_shape = [_]c_int{ @intCast(out_dim), @intCast(in_dim * bits / 32) };
+            const sb_shape = [_]c_int{ @intCast(out_dim), @intCast(in_dim / group) };
+            var q: QLinear = .{
+                .w = mlx.mlx_array_new(),
+                .s = mlx.mlx_array_new(),
+                .b = mlx.mlx_array_new(),
+            };
+            errdefer q.deinit();
+            try mlx.check(mlx.mlx_zeros(&q.w, &w_shape, 2, .uint32, stream));
+            try mlx.check(mlx.mlx_zeros(&q.s, &sb_shape, 2, .bfloat16, stream));
+            try mlx.check(mlx.mlx_zeros(&q.b, &sb_shape, 2, .bfloat16, stream));
+            return q;
+        }
+    };
+
+    var sidecar = try mk.qlinear(IN, OUT, 8, 32, s);
+    defer sidecar.deinit();
+    try testing.expect(m5NaxQLinearMatches(&sidecar, IN, OUT, 8, 32));
+    try testing.expect(!m5NaxQLinearMatches(&sidecar, IN, OUT + 1, 8, 32));
+    try testing.expect(!m5NaxQLinearMatches(&sidecar, IN, OUT, 4, 32));
+    try testing.expect(!m5NaxQLinearMatches(&sidecar, IN, OUT, 8, 64));
+
+    var off_bits = try mk.qlinear(IN, OUT, 4, 32, s);
+    defer off_bits.deinit();
+    try testing.expect(!m5NaxQLinearMatches(&off_bits, IN, OUT, 8, 32));
+    var off_group = try mk.qlinear(IN, OUT, 8, 64, s);
+    defer off_group.deinit();
+    try testing.expect(!m5NaxQLinearMatches(&off_group, IN, OUT, 8, 32));
+
+    var draft = try mk.qlinear(IN, OUT, 3, 64, s);
+    defer draft.deinit();
+    try testing.expect(m5NaxQLinearMatches(&draft, IN, OUT, 3, 64));
+    try testing.expect(m5NaxDraftHeadMatches(&draft, 3, 64, IN, OUT));
+    try testing.expect(!m5NaxDraftHeadMatches(null, 3, 64, IN, OUT));
+    try testing.expect(!m5NaxDraftHeadMatches(&draft, 4, 64, IN, OUT));
+    try testing.expect(!m5NaxDraftHeadMatches(&draft, 3, 32, IN, OUT));
+    try testing.expect(!m5NaxDraftHeadMatches(&sidecar, 3, 64, IN, OUT));
+
+    var dense: QLinear = .{
+        .w = mlx.mlx_array_new(),
+        .s = mlx.mlx_array_new(),
+        .b = mlx.mlx_array_new(),
+    };
+    defer dense.deinit();
+    const dense_shape = [_]c_int{ @intCast(OUT), @intCast(IN) };
+    try mlx.check(mlx.mlx_zeros(&dense.w, &dense_shape, 2, .bfloat16, s));
+    try testing.expect(!m5NaxQLinearMatches(&dense, IN, OUT, 8, 32));
 }
 
 test "loadMtp: MoE sidecar layout (language_model. prefix, switch_mlp experts)" {

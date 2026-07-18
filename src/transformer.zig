@@ -228,9 +228,8 @@ fn getGdnKernelSeq() !mlx.mlx_fast_metal_kernel {
 // availability probes) → us (plan: todo-m5-nax.md). The kernel object is
 // NEVER built — not just never dispatched — where the probe is false:
 // matmul2d<.., execution_simdgroup> pipeline creation can fail on non-G17
-// hardware. Switches: MLX_SERVE_VERIFY_QMM_NAX=0 kills the lane (the MTP
-// adaptive depth cap reverts with it — one predicate, verifyQmmNaxEnabled,
-// so controller and dispatch cannot drift); MLX_SERVE_FORCE_GPU_FAMILY_
+// hardware. Switches: MLX_SERVE_VERIFY_QMM_NAX=0 kills the lane;
+// MLX_SERVE_FORCE_GPU_FAMILY_
 // FALLBACK=1 pretends the units are absent (QA rehearsal of the exact
 // M1-M4 path on an M5); MLX_SERVE_VERIFY_QMM_NAX_MIN_M lowers the NAX
 // takeover width (default 8) for the M5-day A/B of routing M 5..7 to NAX
@@ -790,11 +789,9 @@ fn naxLaneEnvEnabled() bool {
     return on;
 }
 
-/// The NAX lane will actually serve M 8..16 verify rows: family kill
-/// switch, lane kill switch, and the hardware probe all pass. The MTP
-/// adaptive depth cap keys on THIS predicate (generate.resolveMtpDepthCap)
-/// so the controller can never plan verify widths the dispatch won't serve
-/// — killing the lane with any switch reverts the cap to the plain-SIMD 6.
+/// Family-wide NAX readiness: family kill switch, lane kill switch, and the
+/// hardware probe all pass. This intentionally says nothing about a specific
+/// M/K/N dispatch; controller decisions use verifyQmmNaxEnabledForM instead.
 pub fn verifyQmmNaxEnabled() bool {
     return verifyQmmEnabled() and naxLaneEnvEnabled() and verifyQmmNaxAvailable();
 }
@@ -817,6 +814,35 @@ fn naxMinM() c_int {
     const m = naxMinMFrom(if (std.c.getenv("MLX_SERVE_VERIFY_QMM_NAX_MIN_M")) |p| std.mem.span(p) else null);
     vqmm_nax_min_m_cache = m;
     return m;
+}
+
+/// Exact NAX-dispatch predicate, pure over the runtime gates and shape. Keep
+/// controller policy behind this seam so a kill switch, takeover-width tweak,
+/// or ineligible projection geometry can never advertise a NAX cost profile
+/// while verifyQmm would actually fall through to stock qmm.
+pub fn verifyQmmNaxEnabledForMFrom(
+    m: c_int,
+    K: c_int,
+    N: c_int,
+    verify_on: bool,
+    lane_on: bool,
+    available: bool,
+    min_m: c_int,
+) bool {
+    return verify_on and vqmmLaneFor(m, K, N, lane_on and available, min_m) == .nax;
+}
+
+/// Runtime form of verifyQmmNaxEnabledForMFrom.
+pub fn verifyQmmNaxEnabledForM(m: c_int, K: c_int, N: c_int) bool {
+    return verifyQmmNaxEnabledForMFrom(
+        m,
+        K,
+        N,
+        verifyQmmEnabled(),
+        naxLaneEnvEnabled(),
+        verifyQmmNaxAvailable(),
+        naxMinM(),
+    );
 }
 
 const VQMM_NAX_HEADER: [:0]const u8 =
@@ -2859,6 +2885,179 @@ const HybridLayerWeights = struct {
 // supporting mixed-precision quantization (Gemma-4 MoE per-layer bits, etc.).
 const BITS_CACHE_CAP: usize = 1024; // plenty for 60 layers × ~10 quant weights × factor
 pub const QuantParams = struct { bits: u32, group_size: u32, mode: QuantMode = .affine };
+
+/// Pure inputs for the calibrated M5 MTP cost profile. The profile was
+/// measured on a dense trunk whose actual lm_head takes the NAX lane at both
+/// verify widths produced by depth 8 (M=8 and M=9); every field below mirrors
+/// a production dispatch precondition rather than trusting model-wide config.
+const MtpNaxProfileInputs = struct {
+    dense_model: bool,
+    calibrated_model: bool,
+    uniform_affine_trunk: bool,
+    model_quant: QuantParams,
+    weight_present: bool,
+    packed_weight: bool,
+    scales_present: bool,
+    biases_present: bool,
+    quant: QuantParams,
+    K: c_int,
+    N: c_int,
+    packed_k: c_int,
+    verify_on: bool,
+    lane_on: bool,
+    available: bool,
+    min_m: c_int,
+};
+
+fn mtpNaxCalibratedModelFrom(config: *const ModelConfig, lm_head_n: c_int) bool {
+    return std.mem.eql(u8, config.model_type, "qwen3_5_moe") and
+        !config.isMoe() and
+        config.hidden_size == 5120 and
+        config.intermediate_size == 17408 and
+        config.num_hidden_layers == 64 and
+        config.vocab_size == 248320 and
+        lm_head_n == 248320 and
+        config.num_attention_heads == 24 and
+        config.num_key_value_heads == 4 and
+        config.head_dim == 256 and
+        config.full_attention_interval == 4 and
+        config.linear_num_key_heads == 16 and
+        config.linear_num_value_heads == 48 and
+        config.linear_key_head_dim == 128 and
+        config.linear_value_head_dim == 128 and
+        config.attn_output_gate and
+        !config.tie_word_embeddings;
+}
+
+fn mtpNaxProfileEnabledFrom(input: MtpNaxProfileInputs) bool {
+    if (!input.dense_model or !input.calibrated_model or !input.uniform_affine_trunk) return false;
+    if (!input.weight_present or !input.packed_weight) return false;
+    if (!input.scales_present or !input.biases_present) return false;
+    if (input.model_quant.bits != 4 or input.model_quant.mode != .affine) return false;
+    if (input.model_quant.group_size != 64) return false;
+    if (input.quant.bits != 4 or input.quant.mode != .affine) return false;
+    if (input.quant.group_size != 64) return false;
+    if (input.K <= 0 or input.N <= 0 or input.packed_k <= 0) return false;
+    if (@mod(input.K, 8) != 0 or input.packed_k != @divExact(input.K, 8)) return false;
+
+    return verifyQmmNaxEnabledForMFrom(
+        8,
+        input.K,
+        input.N,
+        input.verify_on,
+        input.lane_on,
+        input.available,
+        input.min_m,
+    ) and verifyQmmNaxEnabledForMFrom(
+        9,
+        input.K,
+        input.N,
+        input.verify_on,
+        input.lane_on,
+        input.available,
+        input.min_m,
+    );
+}
+
+fn mtpNaxAffineProjectionMatches(
+    config: *const ModelConfig,
+    w: mlx.mlx_array,
+    sc: mlx.mlx_array,
+    bi: mlx.mlx_array,
+    in_dim: u32,
+    out_dim: u32,
+) bool {
+    if (w.ctx == null or sc.ctx == null or bi.ctx == null) return false;
+    if (mlx.mlx_array_dtype(w) != .uint32 or
+        mlx.mlx_array_dtype(sc) != .bfloat16 or
+        mlx.mlx_array_dtype(bi) != .bfloat16) return false;
+    if (in_dim == 0 or out_dim == 0 or
+        in_dim > std.math.maxInt(c_int) or out_dim > std.math.maxInt(c_int)) return false;
+    const out: c_int = @intCast(out_dim);
+    const w_shape = mlx.getShape(w);
+    const s_shape = mlx.getShape(sc);
+    const b_shape = mlx.getShape(bi);
+    if (w_shape.len != 2 or s_shape.len != 2 or b_shape.len != 2) return false;
+    if (w_shape[0] != out or s_shape[0] != out or b_shape[0] != out) return false;
+    if (s_shape[1] != b_shape[1]) return false;
+    const qp = affineParamsFromGeometry(w, sc, in_dim) orelse return false;
+    if (qp.bits != config.quant_bits or
+        qp.group_size != config.quant_group_size or
+        qp.mode != config.quant_mode) return false;
+
+    // Every material projection on the calibrated surface must take NAX at
+    // both depth-8 verify widths. Tiny per-head A/B gates (N < 512) remain on
+    // stock by design and are too small to recreate the weight-stream cliff.
+    if (out_dim >= 512) {
+        const K: c_int = @intCast(in_dim);
+        const N: c_int = @intCast(out_dim);
+        if (!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, true, 8) or
+            !verifyQmmNaxEnabledForMFrom(9, K, N, true, true, true, 8)) return false;
+    }
+    return true;
+}
+
+fn mtpNaxDenseMlpMatches(config: *const ModelConfig, mlp: *const DenseMlpWeights) bool {
+    return mtpNaxAffineProjectionMatches(config, mlp.gate_w, mlp.gate_s, mlp.gate_b, config.hidden_size, config.intermediate_size) and
+        mtpNaxAffineProjectionMatches(config, mlp.up_w, mlp.up_s, mlp.up_b, config.hidden_size, config.intermediate_size) and
+        mtpNaxAffineProjectionMatches(config, mlp.down_w, mlp.down_s, mlp.down_b, config.intermediate_size, config.hidden_size);
+}
+
+/// The depth-8 controller constants describe the measured homogeneous affine
+/// Qwen3.6-27B trunk, not merely its architecture. Same-shape mixed checkpoints
+/// (notably Unsloth Dynamic) may store individual projections as BF16 or mxfp8
+/// while retaining a model-wide affine-4 config. Inspect every resident linear
+/// used by the dense trunk so those checkpoints stay on the conservative cap 6.
+fn mtpNaxUniformAffineTrunkFrom(config: *const ModelConfig, maybe_layers: ?[]MoeLayerWeights) bool {
+    if (config.isMoe() or config.full_attention_interval == 0) return false;
+    if (config.hidden_size == 0 or config.intermediate_size == 0) return false;
+    const layers = maybe_layers orelse return false;
+    if (layers.len != @as(usize, @intCast(config.num_hidden_layers))) return false;
+
+    const full_out_wide = @as(u64, config.num_attention_heads) * config.head_dim;
+    const full_q_out_wide = full_out_wide * 2;
+    const kv_out_wide = @as(u64, config.num_key_value_heads) * config.head_dim;
+    const linear_key_out_wide = @as(u64, config.linear_num_key_heads) * config.linear_key_head_dim;
+    const linear_out_wide = @as(u64, config.linear_num_value_heads) * config.linear_value_head_dim;
+    const linear_qkv_out_wide = 2 * linear_key_out_wide + linear_out_wide;
+    if (full_out_wide == 0 or full_out_wide > std.math.maxInt(u32) or
+        full_q_out_wide > std.math.maxInt(u32) or
+        kv_out_wide == 0 or kv_out_wide > std.math.maxInt(u32) or
+        linear_key_out_wide == 0 or linear_key_out_wide > std.math.maxInt(u32) or
+        linear_out_wide == 0 or linear_out_wide > std.math.maxInt(u32) or
+        linear_qkv_out_wide > std.math.maxInt(u32)) return false;
+    const full_out: u32 = @intCast(full_out_wide);
+    const full_q_out: u32 = @intCast(full_q_out_wide);
+    const kv_out: u32 = @intCast(kv_out_wide);
+    const linear_out: u32 = @intCast(linear_out_wide);
+    const linear_qkv_out: u32 = @intCast(linear_qkv_out_wide);
+
+    for (layers, 0..) |*layer, i| {
+        if (layer.is_linear != config.isLinearLayer(@intCast(i))) return false;
+        switch (layer.attn) {
+            .full => |*attn| {
+                if (!mtpNaxAffineProjectionMatches(config, attn.q_w, attn.q_s, attn.q_b, config.hidden_size, full_q_out) or
+                    !mtpNaxAffineProjectionMatches(config, attn.k_w, attn.k_s, attn.k_b, config.hidden_size, kv_out) or
+                    !mtpNaxAffineProjectionMatches(config, attn.v_w, attn.v_s, attn.v_b, config.hidden_size, kv_out) or
+                    !mtpNaxAffineProjectionMatches(config, attn.o_w, attn.o_s, attn.o_b, full_out, config.hidden_size)) return false;
+            },
+            .linear => |*attn| {
+                if (attn.combined_proj) return false;
+                if (!mtpNaxAffineProjectionMatches(config, attn.qkv_w, attn.qkv_s, attn.qkv_b, config.hidden_size, linear_qkv_out) or
+                    !mtpNaxAffineProjectionMatches(config, attn.z_w, attn.z_s, attn.z_b, config.hidden_size, linear_out) or
+                    !mtpNaxAffineProjectionMatches(config, attn.a_w, attn.a_s, attn.a_b, config.hidden_size, config.linear_num_value_heads) or
+                    !mtpNaxAffineProjectionMatches(config, attn.b_w, attn.b_s, attn.b_b, config.hidden_size, config.linear_num_value_heads) or
+                    !mtpNaxAffineProjectionMatches(config, attn.out_w, attn.out_s, attn.out_b, linear_out, config.hidden_size)) return false;
+            },
+        }
+        switch (layer.mlp) {
+            .dense => |*mlp| if (!mtpNaxDenseMlpMatches(config, mlp)) return false,
+            .moe => return false,
+        }
+    }
+    return true;
+}
+
 const QuantParamsCache = struct {
     keys: [BITS_CACHE_CAP]?*anyopaque = [_]?*anyopaque{null} ** BITS_CACHE_CAP,
     vals_bits: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
@@ -3084,6 +3283,11 @@ pub const Transformer = struct {
     // with per-layer overrides work correctly while keeping zero per-call FFI overhead
     // after the first touch.
     bits_cache: BitsCache = .{},
+
+    // True only for the exact measured Qwen3.6-27B architecture when its token
+    // embedding and every resident trunk projection are homogeneous
+    // affine-4/gs-64. Computed once at load; mixed checkpoints keep this false.
+    mtp_uniform_affine_trunk: bool = false,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !Transformer {
         // Use the current thread's default GPU stream rather than a dedicated stream.
@@ -3501,6 +3705,15 @@ pub const Transformer = struct {
             log.info("Batch eval all weights: {d}ms\n", .{eval_ms});
         }
 
+        const profile_head_shape = mlx.getShape(lm_head_w);
+        const profile_head_n: c_int = if (profile_head_shape.len == 2) profile_head_shape[0] else 0;
+        const mtp_uniform_affine_trunk = mtpNaxCalibratedModelFrom(&config, profile_head_n) and
+            config.quant_bits == 4 and
+            config.quant_group_size == 64 and
+            config.quant_mode == .affine and
+            mtpNaxAffineProjectionMatches(&config, emb_w, emb_s_arr, emb_b_arr, config.hidden_size, config.vocab_size) and
+            mtpNaxUniformAffineTrunkFrom(&config, moe_layers);
+
         return .{
             .config = config,
             .cache = cache,
@@ -3560,6 +3773,7 @@ pub const Transformer = struct {
             .embedding_norm = embedding_norm_w,
             .prompt_cache = null,
             .bits_cache = bits_cache,
+            .mtp_uniform_affine_trunk = mtp_uniform_affine_trunk,
         };
     }
 
@@ -4215,6 +4429,63 @@ pub const Transformer = struct {
         }
         // Probe window saturated — fall through to direct detect, no cache write.
         return computeQuantParams(&self.config, w, sc, in_dim);
+    }
+
+    /// Whether this resident model may use the calibrated M5 depth-8 MTP cost
+    /// profile. Resolve the lm_head's TRUE per-weight quantization and packed
+    /// geometry, and require the once-validated homogeneous affine trunk:
+    /// mixed checkpoints can contradict config.quant_bits/group_size, and a
+    /// dense or missing-bias projection would change the measured cost surface.
+    /// Requiring NAX dispatch at both M=8 and M=9 keeps the controller aligned
+    /// with the two verification widths exercised by a depth-8 round.
+    pub fn mtpNaxProfileEnabled(self: *const Transformer) bool {
+        if (self.config.isMoe()) return false;
+        if (self.config.hidden_size > std.math.maxInt(c_int)) return false;
+        if (self.config.quant_bits != 4 or self.config.quant_mode != .affine) return false;
+        if (self.config.quant_group_size != 64) return false;
+        if (self.lm_head_w.ctx == null or
+            self.lm_head_s.ctx == null or
+            self.lm_head_b.ctx == null) return false;
+        if (mlx.mlx_array_dtype(self.lm_head_w) != .uint32) return false;
+        const K: c_int = @intCast(self.config.hidden_size);
+        const w_shape = mlx.getShape(self.lm_head_w);
+        if (w_shape.len != 2) return false;
+        // The cost fit is intentionally narrower than kernel eligibility. It
+        // was measured on the dense Qwen3.6-27B class; other NAX-capable
+        // models retain auto cap 6 until their full-round surface is measured
+        // (explicit --mtp-depth 7/8 still works there).
+        const calibrated_model = mtpNaxCalibratedModelFrom(&self.config, w_shape[0]);
+        const calibrated_head = mtpNaxAffineProjectionMatches(
+            &self.config,
+            self.lm_head_w,
+            self.lm_head_s,
+            self.lm_head_b,
+            self.config.hidden_size,
+            self.config.vocab_size,
+        );
+
+        return mtpNaxProfileEnabledFrom(.{
+            .dense_model = true,
+            .calibrated_model = calibrated_model,
+            .uniform_affine_trunk = self.mtp_uniform_affine_trunk,
+            .model_quant = .{
+                .bits = self.config.quant_bits,
+                .group_size = self.config.quant_group_size,
+                .mode = self.config.quant_mode,
+            },
+            .weight_present = self.lm_head_w.ctx != null,
+            .packed_weight = calibrated_head,
+            .scales_present = self.lm_head_s.ctx != null,
+            .biases_present = self.lm_head_b.ctx != null,
+            .quant = self.quantParamsHinted(self.lm_head_w, self.lm_head_s, self.config.hidden_size),
+            .K = K,
+            .N = w_shape[0],
+            .packed_k = w_shape[1],
+            .verify_on = verifyQmmEnabled(),
+            .lane_on = naxLaneEnvEnabled(),
+            .available = verifyQmmNaxAvailable(),
+            .min_m = naxMinM(),
+        });
     }
 
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
@@ -12390,6 +12661,270 @@ test "vqmmLaneFor: NAX dispatch table (M 8..16 route to the m16 tile only when t
     try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(7, 5120, 151936, nax_on, 5));
     try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, nax_on, 5));
     try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(5, 5184, 17408, nax_on, 5)); // K % 256 fails, % 64 holds
+}
+
+test "verifyQmmNaxEnabledForMFrom mirrors flags, min-M, and dispatch geometry" {
+    const K: c_int = 5120;
+    const N: c_int = 151936;
+
+    try testing.expect(verifyQmmNaxEnabledForMFrom(8, K, N, true, true, true, 8));
+    try testing.expect(verifyQmmNaxEnabledForMFrom(9, K, N, true, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, false, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, true, false, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, false, 8));
+
+    // The takeover knob is part of controller readiness, not just kernel
+    // dispatch: min-M 9 leaves M=8 on stock even though M=9 is NAX.
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, true, 9));
+    try testing.expect(verifyQmmNaxEnabledForMFrom(9, K, N, true, true, true, 9));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(9, K, N, true, true, true, 10));
+    try testing.expect(verifyQmmNaxEnabledForMFrom(8, K, N, true, true, true, 5));
+
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, 5184, N, true, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, 151940, true, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(8, K, 480, true, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(1, K, N, true, true, true, 8));
+    try testing.expect(!verifyQmmNaxEnabledForMFrom(17, K, N, true, true, true, 8));
+}
+
+fn mtpNaxTestConfig() ModelConfig {
+    var config = ModelConfig{};
+    config.model_type = "qwen3_5_moe";
+    config.hidden_size = 5120;
+    config.intermediate_size = 17408;
+    config.num_hidden_layers = 64;
+    config.vocab_size = 248320;
+    config.num_attention_heads = 24;
+    config.num_key_value_heads = 4;
+    config.head_dim = 256;
+    config.full_attention_interval = 4;
+    config.linear_num_key_heads = 16;
+    config.linear_num_value_heads = 48;
+    config.linear_key_head_dim = 128;
+    config.linear_value_head_dim = 128;
+    config.attn_output_gate = true;
+    config.tie_word_embeddings = false;
+    config.num_experts = 0;
+    config.quant_bits = 4;
+    config.quant_group_size = 64;
+    config.quant_mode = .affine;
+    return config;
+}
+
+test "mtpNaxCalibratedModelFrom pins the complete measured dense Qwen3.6-27B architecture" {
+    const good = mtpNaxTestConfig();
+    try testing.expect(mtpNaxCalibratedModelFrom(&good, 248320));
+
+    var bad = good;
+    bad.model_type = "qwen3_moe";
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.hidden_size = 4096;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.intermediate_size = 17440;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.num_hidden_layers = 48;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.vocab_size = 151936;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 151936));
+    try testing.expect(!mtpNaxCalibratedModelFrom(&good, 151936));
+    bad = good;
+    bad.num_attention_heads = 20;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.num_key_value_heads = 8;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.head_dim = 128;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.full_attention_interval = 8;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.linear_num_value_heads = 32;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.linear_value_head_dim = 64;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.attn_output_gate = false;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.tie_word_embeddings = true;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+    bad = good;
+    bad.num_experts = 8;
+    try testing.expect(!mtpNaxCalibratedModelFrom(&bad, 248320));
+}
+
+test "mtpNaxAffineProjectionMatches rejects mixed storage and off-profile quant geometry" {
+    const s = mlx.gpuStream();
+    const IN: u32 = 128;
+    const OUT: u32 = 4;
+    var config = ModelConfig{};
+    config.quant_bits = 4;
+    config.quant_group_size = 64;
+    config.quant_mode = .affine;
+
+    const mk = struct {
+        fn arr(shape: []const c_int, dtype: mlx.mlx_dtype, stream: mlx.mlx_stream) !mlx.mlx_array {
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dtype, stream));
+            return a;
+        }
+    };
+
+    const w4 = try mk.arr(&.{ OUT, IN * 4 / 32 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(w4);
+    const sc64 = try mk.arr(&.{ OUT, IN / 64 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(sc64);
+    const bi64 = try mk.arr(&.{ OUT, IN / 64 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(bi64);
+    try testing.expect(mtpNaxAffineProjectionMatches(&config, w4, sc64, bi64, IN, OUT));
+    try testing.expect(!mtpNaxAffineProjectionMatches(&config, w4, sc64, bi64, IN, OUT + 1));
+
+    // Unsloth Dynamic projection: BF16 weight with no quant metadata.
+    const w_bf16 = try mk.arr(&.{ OUT, IN }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(w_bf16);
+    const none = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(none);
+    try testing.expect(!mtpNaxAffineProjectionMatches(&config, w_bf16, none, none, IN, OUT));
+
+    // Same affine storage types, but per-tensor bits/group disagree with the
+    // calibrated global 4-bit/gs-64 surface.
+    const w2 = try mk.arr(&.{ OUT, IN * 2 / 32 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(w2);
+    try testing.expect(!mtpNaxAffineProjectionMatches(&config, w2, sc64, bi64, IN, OUT));
+    const sc128 = try mk.arr(&.{ OUT, IN / 128 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(sc128);
+    const bi128 = try mk.arr(&.{ OUT, IN / 128 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(bi128);
+    try testing.expect(!mtpNaxAffineProjectionMatches(&config, w4, sc128, bi128, IN, OUT));
+
+    // mxfp8-style uint8 scales cannot inherit the affine cost fit even if a
+    // synthetic bias handle is present.
+    const sc_mx = try mk.arr(&.{ OUT, IN / 64 }, .uint8, s);
+    defer _ = mlx.mlx_array_free(sc_mx);
+    try testing.expect(!mtpNaxAffineProjectionMatches(&config, w4, sc_mx, bi64, IN, OUT));
+
+    // Material projections must also satisfy the actual M=8/M=9 NAX lane
+    // geometry. K=256/N=512 qualifies; an otherwise valid K=320 affine
+    // tensor does not (K % 256 != 0).
+    const big_w = try mk.arr(&.{ 512, 256 * 4 / 32 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(big_w);
+    const big_sc = try mk.arr(&.{ 512, 256 / 64 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(big_sc);
+    const big_bi = try mk.arr(&.{ 512, 256 / 64 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(big_bi);
+    try testing.expect(mtpNaxAffineProjectionMatches(&config, big_w, big_sc, big_bi, 256, 512));
+
+    const off_lane_w = try mk.arr(&.{ 512, 320 * 4 / 32 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(off_lane_w);
+    const off_lane_sc = try mk.arr(&.{ 512, 320 / 64 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(off_lane_sc);
+    const off_lane_bi = try mk.arr(&.{ 512, 320 / 64 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(off_lane_bi);
+    try testing.expect(!mtpNaxAffineProjectionMatches(&config, off_lane_w, off_lane_sc, off_lane_bi, 320, 512));
+}
+
+test "mtpNaxProfileEnabledFrom composes measured model, homogeneous trunk, and affine lm-head lane" {
+    const model = mtpNaxTestConfig();
+    const good: MtpNaxProfileInputs = .{
+        .dense_model = true,
+        .calibrated_model = mtpNaxCalibratedModelFrom(&model, 248320),
+        .uniform_affine_trunk = true,
+        .model_quant = .{ .bits = 4, .group_size = 64, .mode = .affine },
+        .weight_present = true,
+        .packed_weight = true,
+        .scales_present = true,
+        .biases_present = true,
+        .quant = .{ .bits = 4, .group_size = 64, .mode = .affine },
+        .K = 5120,
+        .N = 248320,
+        .packed_k = 640,
+        .verify_on = true,
+        .lane_on = true,
+        .available = true,
+        .min_m = 8,
+    };
+    try testing.expect(mtpNaxProfileEnabledFrom(good));
+
+    var bad = good;
+    bad.dense_model = false;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.calibrated_model = false;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.uniform_affine_trunk = false;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.model_quant.bits = 8;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.model_quant.group_size = 16;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.model_quant.mode = .nvfp4;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.weight_present = false;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.packed_weight = false;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.scales_present = false;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.biases_present = false;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+
+    bad = good;
+    bad.quant.bits = 8;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.quant.group_size = 16;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.quant.mode = .nvfp4;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+
+    bad = good;
+    bad.packed_k = 639;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.K = 5184;
+    bad.packed_k = 648;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.N = 248324;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.N = 480;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+
+    // Both depth-8 verify widths must take NAX. A min-M of 9 only covers one.
+    bad = good;
+    bad.min_m = 9;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.verify_on = false;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.lane_on = false;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+    bad = good;
+    bad.available = false;
+    try testing.expect(!mtpNaxProfileEnabledFrom(bad));
+
+    // Lowering the takeover width retains M=8/M=9 coverage.
+    bad = good;
+    bad.min_m = 5;
+    try testing.expect(mtpNaxProfileEnabledFrom(bad));
 }
 
 test "NAX availability probe: G17 prefix + macOS 26.2 floor + fallback rehearsal (pure parts)" {
