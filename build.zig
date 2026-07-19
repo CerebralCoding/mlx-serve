@@ -439,7 +439,10 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
 const BrewDep = struct { name: []const u8, min: std.SemanticVersion };
 
 const required_brew_deps = [_]BrewDep{
-    .{ .name = "mlx", .min = .{ .major = 0, .minor = 31, .patch = 2 } },
+    // 0.32.0: the runtime the M5 NAX depth-8 profile was calibrated/measured on
+    // (integer stream; 117.6 vs 104.2 tok/s auto-8 vs cap-6). 0.31.2 runs it
+    // correctly but lands at the bottom of the measured gain range.
+    .{ .name = "mlx", .min = .{ .major = 0, .minor = 32, .patch = 0 } },
     .{ .name = "mlx-c", .min = .{ .major = 0, .minor = 6, .patch = 0 } },
     .{ .name = "webp", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
 };

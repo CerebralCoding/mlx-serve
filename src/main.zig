@@ -131,7 +131,8 @@ fn printUsage(io: std.Io) void {
         \\                        in the request body.
         \\  --mtp-depth <n>     Max tokens drafted per MTP round (default:
         \\                        adaptive — the EV controller plans depth
-        \\                        per round up to 7; MLX_SERVE_MTP_ADAPTIVE=0
+        \\                        per round up to 8 on eligible M5 NAX targets,
+        \\                        otherwise 6; MLX_SERVE_MTP_ADAPTIVE=0
         \\                        reverts to the fixed windowed controller,
         \\                        cap 3). Pass an explicit <n> to hard-cap.
         \\  --mtp-history-window <n>
@@ -341,7 +342,7 @@ pub fn main(init: std.process.Init) !void {
     // ships a sidecar is otherwise unreachable from clients that never send
     // `enable_mtp:true` (llmprobe, Claude Code, curl).
     var force_mtp = false;
-    var mtp_depth: u32 = 0; // 0 = auto (resolveMtpDepthCap: EV cap 7 / fixed cap 3); explicit flag wins
+    var mtp_depth: u32 = 0; // 0 = auto (EV cap 8 on eligible M5 NAX, else 6; fixed cap 3); explicit wins
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
@@ -762,14 +763,8 @@ pub fn main(init: std.process.Init) !void {
         const chosen = chooseGgufEngine(io, allocator, model_dir, engine_override);
         if (serve_mode) {
             switch (chosen) {
-                .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget,
-            if (temp_explicit) temperature else null,
-            top_p_flag,
-            top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
-                .llama => try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget,
-            if (temp_explicit) temperature else null,
-            top_p_flag,
-            top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
+                .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
+                .llama => try runLlamaServe(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
             }
             return;
         }
