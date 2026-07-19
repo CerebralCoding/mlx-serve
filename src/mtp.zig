@@ -1605,7 +1605,7 @@ test "mtp: loadMtp detects the Hy3 layout (eh_proj + full decoder layer + sigmoi
             fn putF32(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int) void {
                 var total: usize = 1;
                 for (shape) |d| total *= @intCast(d);
-                var data: [16]f32 = .{0.0} ** 16;
+                var data: [16]f32 = @splat(0.0);
                 const f32_arr = mlx.mlx_array_new_data(&data, shape.ptr, @intCast(shape.len), .float32);
                 defer _ = mlx.mlx_array_free(f32_arr);
                 _ = mlx.mlx_map_string_to_array_insert(m, key, f32_arr);
@@ -1869,8 +1869,8 @@ test "mtp: inferGroupSize geometry" {
     // 4-bit packed: weight [out, in*4/32] u32, scales [out, in/group].
     // Synthetic pair: packed_cols=4 → expanded in=32; scale_cols=2 → group 16.
     var q = QLinear{
-        .w = mlx.mlx_array_new_data(&[_]i32{0} ** 8, &[_]c_int{ 2, 4 }, 2, .int32),
-        .s = mlx.mlx_array_new_data(&[_]f32{0} ** 4, &[_]c_int{ 2, 2 }, 2, .float32),
+        .w = mlx.mlx_array_new_data(&@as([8]i32, @splat(0)), &[_]c_int{ 2, 4 }, 2, .int32),
+        .s = mlx.mlx_array_new_data(&@as([4]f32, @splat(0)), &[_]c_int{ 2, 2 }, 2, .float32),
         .b = mlx.mlx_array_new(),
     };
     defer q.deinit();

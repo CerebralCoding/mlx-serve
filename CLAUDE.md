@@ -15,7 +15,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.16+; mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.0, `lib/mlxc-src` fba4470 = brew 0.6.0_3 equivalent) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); llama.cpp C++17 Jinja2 pre-compiled as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp (vision); safetensors; BPE tokenizers. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
+Zig 0.17 (nightly build required until 0.17.0 stable ships — homebrew's zig formula still tracks 0.16.0; see `build.zig`'s version-gate comptime block for why 0.16.0 stopped working: its bundled libc++ fails against the macOS 27 SDK); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.0, `lib/mlxc-src` fba4470 = brew 0.6.0_3 equivalent) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); llama.cpp C++17 Jinja2 pre-compiled as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp (vision); safetensors; BPE tokenizers. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
 
 ## Layout (`src/`)
 
@@ -63,6 +63,8 @@ Swift app: see `app/CLAUDE.md`.
 
 ## Building
 
+- **First-time setup**: `./scripts/fetch-zig.sh` stages the pinned Zig nightly at `.zig-toolchain/` (homebrew's `zig` formula still ships 0.16.0, which no longer builds — see the version-gate comptime block at the top of `build.zig`). Put it on PATH (`export PATH="$PWD/.zig-toolchain:$PATH"`) or invoke `.zig-toolchain/zig` directly. CI runs the same script (`.github/workflows/release.yml`). Retire this once 0.17.0 ships stable and homebrew catches up.
+- **Zig 0.17 caches configure-time subprocess output in `.zig-cache`** (`b.runAllowFail` — e.g. build.zig's `xcrun --show-sdk-path`): after a toolchain/SDK change (a macOS upgrade removing the CLT), the link keeps referencing the GHOST path until `rm -rf .zig-cache`. build.sh/xcode-build-server.sh prefer the CLT SDK but fall back to `xcode-select -p` when it's absent (story: docs/gotchas/app.md).
 - **ALWAYS `zig build -Doptimize=ReleaseFast` — never bare `zig build`** (Debug is 2–4× slower ⇒ fake regressions; ReleaseFast binary ≈ 7 MB, Debug ≈ 2×). Rebuild the exe before any live perf A/B — `zig build test` does NOT refresh `zig-out/bin/mlx-serve`.
 - Swift app: `bash app/build.sh` (see app/CLAUDE.md). The two bundle binaries (MLXCore + mlx-serve) move together.
 - mlx + mlx-c are NOT brew deps: pinned submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → MLX's NAX kernels compiled in; script + `tests/test_mlx_staged_nax.sh` ASSERT the metallib contains `*_nax` — the CMake gate fails silently). The brew bottle is built at 26.0 and hard-wires `is_nax_available()` false even on M5. Effective min macOS is 26.2 everywhere (app `LSMinimumSystemVersion`, `Package.swift`, bundled dylibs). Bump = checkout new tag in submodule → rerun script → re-diff `src/mlx.zig` externs. Brew floor remaining: webp ≥ 1.6.0 (`verifyBrewDeps`). mlx v0.32.0 = the runtime the M5 NAX profile was calibrated on.

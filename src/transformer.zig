@@ -6,6 +6,22 @@ const kv_quant = @import("kv_quant.zig");
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
 pub const KVQuantScheme = kv_quant.Scheme;
 
+/// `std.meta.fields` was replaced by parallel `fieldNames`/`fieldTypes`
+/// arrays — zip them into the `.name`/`.type` shape every call site below
+/// already expects.
+const WeightField = struct { name: [:0]const u8, type: type };
+
+fn structFields(comptime T: type) []const WeightField {
+    return comptime blk: {
+        const names = std.meta.fieldNames(T);
+        const types = std.meta.fieldTypes(T);
+        var result: [names.len]WeightField = undefined;
+        for (names, types, 0..) |name, ty, i| result[i] = .{ .name = name, .type = ty };
+        const final = result;
+        break :blk &final;
+    };
+}
+
 // ── GatedDeltaNet fused Metal kernel ──
 // Ported from mlx-lm/models/gated_delta.py: `_make_gated_delta_kernel(has_mask=False, vectorized=False)`.
 // Processes the entire T-step delta recurrence in a single kernel dispatch, eliminating
@@ -408,7 +424,7 @@ const VQMM_MSG_NAMES = [6][*:0]const u8{
     "mlxserve_vqmm_msg_m5", "mlxserve_vqmm_msg_m6", "mlxserve_vqmm_msg_m7",
 };
 
-var vqmm_msg_kernels: [6]?mlx.mlx_fast_metal_kernel = .{null} ** 6;
+var vqmm_msg_kernels: [6]?mlx.mlx_fast_metal_kernel = @splat(null);
 
 fn getVerifyQmmMsgKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
     if (m < 2 or m > 7) return error.UnsupportedShape;
@@ -453,7 +469,7 @@ const VQMM_NAMES = [6][*:0]const u8{
     "mlxserve_vqmm_ks_m5", "mlxserve_vqmm_ks_m6", "mlxserve_vqmm_ks_m7",
 };
 
-var vqmm_kernels: [6]?mlx.mlx_fast_metal_kernel = .{null} ** 6;
+var vqmm_kernels: [6]?mlx.mlx_fast_metal_kernel = @splat(null);
 
 fn getVerifyQmmKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
     if (m < 2 or m > 7) return error.UnsupportedShape;
@@ -3083,12 +3099,12 @@ fn mtpNaxUniformAffineTrunkFrom(config: *const ModelConfig, maybe_layers: ?[]Moe
 }
 
 const QuantParamsCache = struct {
-    keys: [BITS_CACHE_CAP]?*anyopaque = [_]?*anyopaque{null} ** BITS_CACHE_CAP,
-    vals_bits: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
+    keys: [BITS_CACHE_CAP]?*anyopaque = @splat(null),
+    vals_bits: [BITS_CACHE_CAP]u8 = @splat(0),
     // group_size is always a small power of two in MLX (16, 32, 64, 128).
     // Store as group_size/8 to fit u8 with headroom up to 2040.
-    vals_gs_div8: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
-    vals_mode: [BITS_CACHE_CAP]u8 = [_]u8{0} ** BITS_CACHE_CAP,
+    vals_gs_div8: [BITS_CACHE_CAP]u8 = @splat(0),
+    vals_mode: [BITS_CACHE_CAP]u8 = @splat(0),
 
     inline fn slot(key: *anyopaque) usize {
         const h: usize = @intFromPtr(key);
@@ -3660,7 +3676,7 @@ pub const Transformer = struct {
                     if (lw.layer_scalar) |n| _ = mlx.mlx_vector_array_append_value(all_vec, n);
                     appendHybridMlpWeights(all_vec, &lw.mlp);
                     if (lw.shared_mlp) |smlp| {
-                        inline for (std.meta.fields(DenseMlpWeights)) |field| {
+                        inline for (comptime structFields(DenseMlpWeights)) |field| {
                             const arr = @field(smlp, field.name);
                             if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, arr);
                         }
@@ -9618,7 +9634,7 @@ fn initHybridLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: 
 }
 
 fn appendFullAttnWeights(vec: mlx.mlx_vector_array, fa: *const FullAttnWeights) void {
-    inline for (std.meta.fields(FullAttnWeights)) |field| {
+    inline for (comptime structFields(FullAttnWeights)) |field| {
         // Dense bf16 full-attn layers carry null-ctx scales/biases — skip those
         // so null arrays don't poison the eval batch. Mirrors the linear/mlp paths.
         const arr = @field(fa, field.name);
@@ -9627,7 +9643,7 @@ fn appendFullAttnWeights(vec: mlx.mlx_vector_array, fa: *const FullAttnWeights) 
 }
 
 fn appendLinearAttnWeights(vec: mlx.mlx_vector_array, la: *const LinearAttnWeights) void {
-    inline for (std.meta.fields(LinearAttnWeights)) |field| {
+    inline for (comptime structFields(LinearAttnWeights)) |field| {
         if (comptime field.type != mlx.mlx_array) continue;
         const za_field = comptime std.mem.startsWith(u8, field.name, "z_") or std.mem.startsWith(u8, field.name, "a_");
         const skip_za = za_field and la.combined_proj;
@@ -9646,7 +9662,7 @@ fn appendHybridMlpWeights(vec: mlx.mlx_vector_array, hw: *const HybridMlpWeights
     // so they don't pollute the eval batch. Mirrors `appendLinearAttnWeights`.
     switch (hw.*) {
         .moe => |*mw| {
-            inline for (std.meta.fields(MoeMlpWeights)) |field| {
+            inline for (comptime structFields(MoeMlpWeights)) |field| {
                 if (field.type == ?mlx.mlx_array) {
                     if (@field(mw, field.name)) |arr| {
                         if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
@@ -9658,7 +9674,7 @@ fn appendHybridMlpWeights(vec: mlx.mlx_vector_array, hw: *const HybridMlpWeights
             }
         },
         .dense => |*dw| {
-            inline for (std.meta.fields(DenseMlpWeights)) |field| {
+            inline for (comptime structFields(DenseMlpWeights)) |field| {
                 const arr = @field(dw, field.name);
                 if (arr.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, arr);
             }
@@ -10371,7 +10387,7 @@ fn initBert(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         _ = mlx.mlx_vector_array_append_value(all_vec, emb_norm_b);
 
         for (bert_layers) |lw| {
-            inline for (std.meta.fields(BertLayerWeights)) |field| {
+            inline for (comptime structFields(BertLayerWeights)) |field| {
                 _ = mlx.mlx_vector_array_append_value(all_vec, @field(lw, field.name));
             }
         }
@@ -12045,7 +12061,7 @@ test "hy3RoutingChain route_norm=false keeps raw sigmoid weights (scaled only)" 
     defer _ = mlx.mlx_array_free(logits);
 
     // Zero bias: selection = top-2 of raw sigmoid = {0.8808, 0.7311}.
-    const bias_data = [_]f32{0.0} ** 6;
+    const bias_data: [6]f32 = @splat(0.0);
     const bias_shape = [_]c_int{6};
     const bias = mlx.mlx_array_new_data(&bias_data, &bias_shape, 1, .float32);
     defer _ = mlx.mlx_array_free(bias);

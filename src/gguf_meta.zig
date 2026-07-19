@@ -371,7 +371,7 @@ test "parseInfo: short-circuits once both keys found" {
 }
 
 test "parseInfo: bad magic → BadMagic" {
-    const bytes = "NOPE\x03\x00\x00\x00" ++ ([_]u8{0} ** 16);
+    const bytes = "NOPE\x03\x00\x00\x00" ++ @as([16]u8, @splat(0));
     try testing.expectError(error.BadMagic, parseBytes(testing.allocator, bytes));
 }
 

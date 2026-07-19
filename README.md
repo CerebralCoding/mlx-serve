@@ -182,7 +182,7 @@ Any quantized MLX model using one of the above architectures works natively. Any
 ## Prerequisites
 
 - macOS 26.2+ with Apple Silicon (M1/M2/M3/M4/M5) — the bundled MLX is built at deployment target 26.2 so the M5 neural-accelerator (NAX) kernels ship enabled
-- [Zig 0.16+](https://ziglang.org/download/) *(only if building from source)*
+- [Zig 0.17 nightly](https://ziglang.org/download/) *(only if building from source — staged automatically by `./scripts/fetch-zig.sh` into `.zig-toolchain/`)*
 - libwebp *(only if building from source)*: `brew install webp`
 - Xcode 26.2+ with the Metal Toolchain component *(only if building from source — mlx + mlx-c are pinned submodules compiled by `scripts/build-mlx.sh`, not brew packages, so the NAX kernels the brew bottle silently omits are included)*
 

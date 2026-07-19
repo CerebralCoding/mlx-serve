@@ -141,7 +141,7 @@ pub fn ensureMetalKernels(allocator: std.mem.Allocator) Error!void {
 
     const dir_path_slice = std.fmt.allocPrint(allocator, "{s}/.mlx-serve/ds4-metal/{s}", .{ home, hash_hex }) catch return Error.OutOfMemory;
     defer allocator.free(dir_path_slice);
-    const dir_path = allocator.dupeZ(u8, dir_path_slice) catch return Error.OutOfMemory;
+    const dir_path = allocator.dupeSentinel(u8, dir_path_slice, 0) catch return Error.OutOfMemory;
     defer allocator.free(dir_path);
 
     // Best-effort recursive mkdir via libc. Walk the path component-by-component
@@ -164,7 +164,7 @@ pub fn ensureMetalKernels(allocator: std.mem.Allocator) Error!void {
     for (kernel_entries) |k| {
         const file_path_slice = std.fmt.allocPrint(allocator, "{s}/{s}", .{ dir_path, k.file_name }) catch return Error.OutOfMemory;
         defer allocator.free(file_path_slice);
-        const file_path = allocator.dupeZ(u8, file_path_slice) catch return Error.OutOfMemory;
+        const file_path = allocator.dupeSentinel(u8, file_path_slice, 0) catch return Error.OutOfMemory;
         defer allocator.free(file_path);
 
         // Always rewrite — staging is cheap (19 small kernel files), and the
@@ -228,10 +228,10 @@ pub const Ds4Engine = struct {
     pub fn open(allocator: std.mem.Allocator, model_path: []const u8, opts: OpenOptions) Error!*Ds4Engine {
         try ensureMetalKernels(allocator);
 
-        const path_z = allocator.dupeZ(u8, model_path) catch return Error.OutOfMemory;
+        const path_z = allocator.dupeSentinel(u8, model_path, 0) catch return Error.OutOfMemory;
         errdefer allocator.free(path_z);
 
-        const mtp_z: ?[:0]u8 = if (opts.mtp_path) |p| (allocator.dupeZ(u8, p) catch return Error.OutOfMemory) else null;
+        const mtp_z: ?[:0]u8 = if (opts.mtp_path) |p| (allocator.dupeSentinel(u8, p, 0) catch return Error.OutOfMemory) else null;
         errdefer if (mtp_z) |s| allocator.free(s);
 
         var options = ffi.EngineOptions{
@@ -303,7 +303,7 @@ pub const Ds4Engine = struct {
     /// Tokenize free-form text (no chat scaffolding). Caller owns the returned
     /// slice and frees with `allocator.free`.
     pub fn tokenizeText(self: *Ds4Engine, allocator: std.mem.Allocator, text: []const u8) Error![]i32 {
-        const text_z = allocator.dupeZ(u8, text) catch return Error.OutOfMemory;
+        const text_z = allocator.dupeSentinel(u8, text, 0) catch return Error.OutOfMemory;
         defer allocator.free(text_z);
 
         var tv = ffi.Tokens{};
@@ -322,9 +322,9 @@ pub const Ds4Engine = struct {
         user: []const u8,
         think_mode: ffi.ThinkMode,
     ) Error![]i32 {
-        const sys_z: ?[:0]u8 = if (system) |s| (allocator.dupeZ(u8, s) catch return Error.OutOfMemory) else null;
+        const sys_z: ?[:0]u8 = if (system) |s| (allocator.dupeSentinel(u8, s, 0) catch return Error.OutOfMemory) else null;
         defer if (sys_z) |s| allocator.free(s);
-        const user_z = allocator.dupeZ(u8, user) catch return Error.OutOfMemory;
+        const user_z = allocator.dupeSentinel(u8, user, 0) catch return Error.OutOfMemory;
         defer allocator.free(user_z);
 
         var tv = ffi.Tokens{};
@@ -356,16 +356,16 @@ pub const Ds4Engine = struct {
         ffi.ds4_chat_begin(self.handle, &tv);
 
         if (system) |s| {
-            const z = allocator.dupeZ(u8, s) catch return Error.OutOfMemory;
+            const z = allocator.dupeSentinel(u8, s, 0) catch return Error.OutOfMemory;
             defer allocator.free(z);
             const role_z: [*:0]const u8 = "system";
             ffi.ds4_chat_append_message(self.handle, &tv, role_z, z.ptr);
         }
 
         for (turns) |t| {
-            const role_z = allocator.dupeZ(u8, t.role) catch return Error.OutOfMemory;
+            const role_z = allocator.dupeSentinel(u8, t.role, 0) catch return Error.OutOfMemory;
             defer allocator.free(role_z);
-            const content_z = allocator.dupeZ(u8, t.content) catch return Error.OutOfMemory;
+            const content_z = allocator.dupeSentinel(u8, t.content, 0) catch return Error.OutOfMemory;
             defer allocator.free(content_z);
             ffi.ds4_chat_append_message(self.handle, &tv, role_z.ptr, content_z.ptr);
         }

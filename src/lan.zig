@@ -599,7 +599,7 @@ pub const Lan = struct {
     /// always re-registers.
     fn attemptKnown(l: *Lan, name: []const u8) void {
         const entry = l.known.getPtr(name) orelse return;
-        const name_z = l.alloc.dupeZ(u8, name) catch return;
+        const name_z = l.alloc.dupeSentinel(u8, name, 0) catch return;
         defer l.alloc.free(name_z);
         switch (l.resolveAndInstall(name_z, entry.domain)) {
             .installed => entry.fails = 0,
@@ -740,8 +740,8 @@ fn onBrowse(ref: DNSServiceRef, flags: u32, if_idx: u32, err: i32, name: ?[*:0]c
     // ADD and REMOVE both route through resolveAndInstall (see its doc), so
     // the event only needs the service identity.
     log.debug("[lan] browse event: \"{s}\" (flags 0x{x})\n", .{ std.mem.span(name orelse return), flags });
-    const n = l.alloc.dupeZ(u8, std.mem.span(name.?)) catch return;
-    const d = l.alloc.dupeZ(u8, std.mem.span(domain orelse "local.")) catch {
+    const n = l.alloc.dupeSentinel(u8, std.mem.span(name.?), 0) catch return;
+    const d = l.alloc.dupeSentinel(u8, std.mem.span(domain orelse "local."), 0) catch {
         l.alloc.free(n);
         return;
     };

@@ -70,17 +70,26 @@ bash "$PROJECT_ROOT/scripts/fetch-llama.sh"
 # BEFORE the CLT-forced zig build below.
 echo "→ Building mlx + mlx-c (pinned submodules)..."
 bash "$PROJECT_ROOT/scripts/build-mlx.sh"
+# Pinned Zig nightly (homebrew's `zig` formula still ships 0.16.0, which no
+# longer builds — see build.zig's version-gate comptime block).
+bash "$PROJECT_ROOT/scripts/fetch-zig.sh"
+ZIG="$PROJECT_ROOT/.zig-toolchain/zig"
+# The zig link resolves the SDK via xcrun. Prefer the CommandLineTools SDK
+# (historical default), but a macOS upgrade can remove the CLT entirely —
+# fall back to the selected Xcode then (same SDK CI links against).
+ZIG_DEVELOPER_DIR=/Library/Developer/CommandLineTools
+[ -d "$ZIG_DEVELOPER_DIR" ] || ZIG_DEVELOPER_DIR="$(xcode-select -p)"
 # Engine-version pins surfaced by `mlx-serve --version` (parsed by the app so
 # Settings can show engine versions without booting the server — src/version.zig).
 # MLX + ggml self-report at runtime; these three have no runtime API:
 MLXC_VERSION="$(git -C "$PROJECT_ROOT/lib/mlxc-src" describe --tags --always 2>/dev/null)"
 DS4_COMMIT="$(git -C "$PROJECT_ROOT/lib/ds4" rev-parse --short HEAD 2>/dev/null)"
 LLAMA_TAG="$(cat "$PROJECT_ROOT/lib/llama/.version" 2>/dev/null)"
-DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Doptimize=ReleaseFast -Dversion="$MLX_SERVE_VERSION" \
+DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build -Doptimize=ReleaseFast -Dversion="$MLX_SERVE_VERSION" \
   -Dmlx-c-version="${MLXC_VERSION:-unknown}" -Dds4-commit="${DS4_COMMIT:-unknown}" -Dllama-tag="${LLAMA_TAG:-unknown}" \
   ${ZIG_MODE_FLAGS[@]+"${ZIG_MODE_FLAGS[@]}"} 2>&1 | tail -3
 # The bundled guest agent (static aarch64-linux ELF) rides inside the app.
-DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build vz-agent 2>&1 | tail -1
+DEVELOPER_DIR="$ZIG_DEVELOPER_DIR" "$ZIG" build vz-agent 2>&1 | tail -1
 MLX_BIN="zig-out/bin/mlx-serve"
 if [ ! -f "$MLX_BIN" ]; then
     echo "ERROR: Zig build failed"

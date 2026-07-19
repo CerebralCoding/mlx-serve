@@ -460,8 +460,8 @@ pub const Generator = struct {
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     mtp_accepted_tokens: u64 = 0,
     /// Adaptive-depth moving window: per-round drafted/accepted counts.
-    mtp_window_drafted: [MTP_DEPTH_WINDOW]u8 = [_]u8{0} ** MTP_DEPTH_WINDOW,
-    mtp_window_accepted: [MTP_DEPTH_WINDOW]u8 = [_]u8{0} ** MTP_DEPTH_WINDOW,
+    mtp_window_drafted: [MTP_DEPTH_WINDOW]u8 = @splat(0),
+    mtp_window_accepted: [MTP_DEPTH_WINDOW]u8 = @splat(0),
     mtp_window_idx: u32 = 0,
     mtp_rounds_since_switch: u32 = 0,
     /// Rounds remaining during which promotion is blocked (set after a
@@ -476,7 +476,7 @@ pub const Generator = struct {
     /// EV controller: conditional acceptance EMA per draft index,
     /// a[i] = P(draft i accepted | drafts 0..i-1 accepted). Optimistic prior;
     /// warmup rounds pull the low indices to reality before it can matter.
-    mtp_ev_accept: [mtp_mod.MAX_DEPTH]f32 = [_]f32{MTP_EV_PRIOR} ** mtp_mod.MAX_DEPTH,
+    mtp_ev_accept: [mtp_mod.MAX_DEPTH]f32 = @splat(MTP_EV_PRIOR),
     /// Rounds seen by the EV controller (drives the legacy-behavior warmup).
     mtp_ev_rounds: u32 = 0,
     /// Last round's planned m_lo (base-depth climb damping: +1/round max).
@@ -3497,10 +3497,10 @@ pub const Generator = struct {
     pub const MtpTrace = struct {
         pub const LOG_EVERY: u32 = 32;
         pub const Phase = enum(u4) { draft, sync, ext, verify, corr, eval, hist, commit };
-        pub const N_PHASES = @typeInfo(Phase).@"enum".fields.len;
+        pub const N_PHASES = @typeInfo(Phase).@"enum".field_names.len;
 
         rounds: u32 = 0,
-        ns: [N_PHASES]u64 = [_]u64{0} ** N_PHASES,
+        ns: [N_PHASES]u64 = @splat(0),
         drafted: u64 = 0,
         accepted: u64 = 0,
         extended: u32 = 0,
@@ -6167,12 +6167,12 @@ fn mtpEvTestGenerator() Generator {
     var g: Generator = undefined;
     g.mtp_depth = Generator.MTP_ADAPTIVE_DEFAULT_CAP;
     g.mtp_depth_current = 1;
-    g.mtp_window_drafted = [_]u8{0} ** Generator.MTP_DEPTH_WINDOW;
-    g.mtp_window_accepted = [_]u8{0} ** Generator.MTP_DEPTH_WINDOW;
+    g.mtp_window_drafted = @splat(0);
+    g.mtp_window_accepted = @splat(0);
     g.mtp_window_idx = 0;
     g.mtp_rounds_since_switch = 0;
     g.mtp_promote_cooldown = 0;
-    g.mtp_ev_accept = [_]f32{Generator.MTP_EV_PRIOR} ** mtp_mod.MAX_DEPTH;
+    g.mtp_ev_accept = @splat(Generator.MTP_EV_PRIOR);
     g.mtp_ev_rounds = Generator.MTP_EV_WARMUP_ROUNDS;
     g.mtp_ev_m_lo_prev = 1;
     g.mtp_ev_costs = Generator.MTP_EV_DEFAULT_COSTS;
@@ -6254,8 +6254,8 @@ test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit alway
 
 test "mtpFloorDisableObserve: extension misses do not poison depth one" {
     const W = Generator.MTP_DEPTH_WINDOW;
-    var drafted = [_]u8{0} ** W;
-    var accepted = [_]u8{0} ** W;
+    var drafted: [W]u8 = @splat(0);
+    var accepted: [W]u8 = @splat(0);
     var idx: u32 = 0;
 
     var rate: ?f32 = null;
@@ -6266,8 +6266,8 @@ test "mtpFloorDisableObserve: extension misses do not poison depth one" {
     try testing.expectApproxEqAbs(@as(f32, 1.0), rate.?, 1e-5);
     for (drafted) |sample| try testing.expectEqual(@as(u8, 1), sample);
 
-    drafted = [_]u8{0} ** W;
-    accepted = [_]u8{0} ** W;
+    drafted = @splat(0);
+    accepted = @splat(0);
     idx = 0;
     for (0..W) |i| {
         rate = Generator.mtpFloorDisableObserve(
@@ -6285,8 +6285,8 @@ test "mtpFloorDisableObserve: extension misses do not poison depth one" {
 
 test "mtpFloorDisableObserve: disable needs 16 fresh failures at base depth one" {
     const W = Generator.MTP_DEPTH_WINDOW;
-    var drafted = [_]u8{0} ** W;
-    var accepted = [_]u8{0} ** W;
+    var drafted: [W]u8 = @splat(0);
+    var accepted: [W]u8 = @splat(0);
     var idx: u32 = 0;
 
     // Fifteen depth-one failures are insufficient.

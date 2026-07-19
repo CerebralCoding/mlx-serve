@@ -2,11 +2,15 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 comptime {
-    const required: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 0 };
-    if (builtin.zig_version.order(required) == .lt) {
+    // 0.17.0 isn't tagged stable yet (homebrew still ships 0.16.0) — a nightly
+    // build from ziglang.org/download is required until it is. 0.16.0's
+    // bundled libc++ fails to compile against the macOS 27 beta SDK
+    // (`use of undeclared identifier 'INFINITY'` in its vendored <random>);
+    // fixed upstream by 0.17.0-dev, which is why the floor moved.
+    if (builtin.zig_version.major == 0 and builtin.zig_version.minor < 17) {
         @compileError(std.fmt.comptimePrint(
-            "mlx-serve requires Zig {d}.{d}.{d} or newer (have {d}.{d}.{d}). Run `brew upgrade zig`.",
-            .{ required.major, required.minor, required.patch, builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch },
+            "mlx-serve requires Zig 0.17 (nightly until 0.17.0 stable ships) (have {d}.{d}.{d}). Grab a nightly from https://ziglang.org/download/.",
+            .{ builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch },
         ));
     }
 }
@@ -91,6 +95,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
+            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize) },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize) },
         },
     });
 
@@ -154,9 +161,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run mlx-serve");
     run_step.dependOn(&run_cmd.step);
@@ -170,6 +175,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
+            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize) },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize) },
         },
     });
 
@@ -340,11 +348,15 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{ios_sdk}) });
     mod.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{ios_sdk}) });
 
-    // Headers for the @cImport sites (jinja_wrapper.h, stb_image.h, webp/decode.h).
-    // The matching static archives are linked by Xcode at final app-link time.
+    // Headers for the @import("jinja_c")/@import("stb") sites (jinja_wrapper.h,
+    // stb_image.h, webp/decode.h). The matching static archives are linked by
+    // Xcode at final app-link time.
     mod.addIncludePath(b.path("lib/jinja_cpp"));
     mod.addIncludePath(b.path("lib"));
     mod.addIncludePath(.{ .cwd_relative = ios_include });
+    mod.addImport("jinja_c", addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), ios_target, .ReleaseFast));
+    mod.addImport("stb", addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), ios_target, .ReleaseFast));
+    mod.addImport("webp", addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/webp/decode.h", .{ios_include}) }, .{ .cwd_relative = ios_include }, ios_target, .ReleaseFast));
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
     // xatlas UV unwrapping (C++), used by the Hunyuan3D texture paint stage via
@@ -365,6 +377,25 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     });
     const step = b.step(slice.step, b.fmt("Build the iOS engine static lib ({s})", .{slice.sdk}));
     step.dependOn(&install.step);
+}
+
+/// Translates a single C header into an importable module (`@import("name")`
+/// at the call site) via `addTranslateC`, replacing an inline `@cImport` —
+/// removed as a language builtin in 0.17.0-dev.
+fn addCHeaderModule(
+    b: *std.Build,
+    header_path: std.Build.LazyPath,
+    include_dir: std.Build.LazyPath,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const translate = b.addTranslateC(.{
+        .root_source_file = header_path,
+        .target = target,
+        .optimize = optimize,
+    });
+    translate.addIncludePath(include_dir);
+    return translate.createModule();
 }
 
 fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
@@ -407,12 +438,16 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_metal.m"), .flags = objc_flags });
 }
 
+fn buildRootHandle(b: *std.Build) std.Io.Dir {
+    return b.root.root_dir.handle;
+}
+
 /// The llama.cpp tag staged by scripts/fetch-llama.sh (it writes LLAMA_TAG to
 /// `lib/llama/.version`). Read at configure time so a plain `zig build` reports
 /// the real tag without app/build.sh having to pass `--llama-tag`. Returns null
 /// (→ "unknown") when llama hasn't been fetched yet.
 fn readLlamaTag(b: *std.Build) ?[]const u8 {
-    const bytes = b.build_root.handle.readFileAlloc(
+    const bytes = buildRootHandle(b).readFileAlloc(
         b.graph.io,
         "lib/llama/.version",
         b.allocator,
@@ -468,9 +503,9 @@ fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
 /// leftover brew copy from /opt/homebrew/lib).
 fn verifyMlxStage(b: *std.Build) void {
     const stage_ok = blk: {
-        b.build_root.handle.access(b.graph.io, "lib/mlx/lib/libmlxc.dylib", .{}) catch break :blk false;
-        b.build_root.handle.access(b.graph.io, "lib/mlx/lib/mlx.metallib", .{}) catch break :blk false;
-        b.build_root.handle.access(b.graph.io, "lib/mlx/.version", .{}) catch break :blk false;
+        buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/libmlxc.dylib", .{}) catch break :blk false;
+        buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/mlx.metallib", .{}) catch break :blk false;
+        buildRootHandle(b).access(b.graph.io, "lib/mlx/.version", .{}) catch break :blk false;
         break :blk true;
     };
     if (!stage_ok) {
@@ -487,7 +522,7 @@ fn verifyMlxStage(b: *std.Build) void {
 /// scripts/build-mlx.sh as "mlx=<sha> mlxc=<sha> target=<ver>"), surfaced in
 /// `mlx-serve --version`. Returns null (→ "unknown") when not staged yet.
 fn readMlxcPin(b: *std.Build) ?[]const u8 {
-    const bytes = b.build_root.handle.readFileAlloc(
+    const bytes = buildRootHandle(b).readFileAlloc(
         b.graph.io,
         "lib/mlx/.version",
         b.allocator,

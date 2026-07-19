@@ -1,5 +1,8 @@
 .zig-cache/
 zig-out/
+
+# Pinned Zig nightly, staged at build time by scripts/fetch-zig.sh (not vendored)
+/.zig-toolchain/
 # .claude stays private (settings.local.json, locks) EXCEPT checked-in project skills
 .claude/*
 !.claude/skills/

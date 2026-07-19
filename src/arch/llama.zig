@@ -31,7 +31,7 @@ pub const LlamaEngine = struct {
     model_path_owned: [:0]u8,
 
     pub fn open(allocator: std.mem.Allocator, model_path: []const u8, opts: OpenOptions) Error!*LlamaEngine {
-        const path_z = allocator.dupeZ(u8, model_path) catch return Error.OutOfMemory;
+        const path_z = allocator.dupeSentinel(u8, model_path, 0) catch return Error.OutOfMemory;
         errdefer allocator.free(path_z);
 
         var err_buf: [256]u8 = undefined;
@@ -154,9 +154,9 @@ pub const LlamaEngine = struct {
         }
 
         for (turns) |t| {
-            const role_z = allocator.dupeZ(u8, t.role) catch return Error.OutOfMemory;
+            const role_z = allocator.dupeSentinel(u8, t.role, 0) catch return Error.OutOfMemory;
             owned.append(allocator, role_z) catch return Error.OutOfMemory;
-            const content_z = allocator.dupeZ(u8, t.content) catch return Error.OutOfMemory;
+            const content_z = allocator.dupeSentinel(u8, t.content, 0) catch return Error.OutOfMemory;
             owned.append(allocator, content_z) catch return Error.OutOfMemory;
             roles.append(allocator, role_z.ptr) catch return Error.OutOfMemory;
             contents.append(allocator, content_z.ptr) catch return Error.OutOfMemory;

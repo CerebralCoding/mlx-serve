@@ -1,7 +1,5 @@
 const std = @import("std");
-const jinja_c = @cImport({
-    @cInclude("jinja_wrapper.h");
-});
+const jinja_c = @import("jinja_c");
 const tokenizer_mod = @import("tokenizer.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
 const ds4_ffi = if (@import("build_options").ios) @import("ds4_ffi_stub.zig") else @import("ds4_ffi.zig");
@@ -385,17 +383,17 @@ fn renderChatTemplate(
     defer allocator.free(extra_json);
 
     // Null-terminate strings for C
-    const tmpl_z = try allocator.dupeZ(u8, chat_config.chat_template);
+    const tmpl_z = try allocator.dupeSentinel(u8, chat_config.chat_template, 0);
     defer allocator.free(tmpl_z);
-    const msgs_z = try allocator.dupeZ(u8, messages_json);
+    const msgs_z = try allocator.dupeSentinel(u8, messages_json, 0);
     defer allocator.free(msgs_z);
-    const extra_z = try allocator.dupeZ(u8, extra_json);
+    const extra_z = try allocator.dupeSentinel(u8, extra_json, 0);
     defer allocator.free(extra_z);
 
     var tools_z: ?[:0]const u8 = null;
     defer if (tools_z) |tz| allocator.free(tz);
     if (effective_tools_json) |tj| {
-        tools_z = try allocator.dupeZ(u8, tj);
+        tools_z = try allocator.dupeSentinel(u8, tj, 0);
     }
 
     const result_ptr = jinja_c.jinja_render_chat(

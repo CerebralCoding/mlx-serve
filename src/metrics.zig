@@ -435,7 +435,7 @@ pub fn Histogram(comptime N: usize) type {
         pub fn init(bounds: [N]u64) Self {
             return .{
                 .bounds = bounds,
-                .buckets = [_]std.atomic.Value(u64){std.atomic.Value(u64).init(0)} ** (N + 1),
+                .buckets = @splat(std.atomic.Value(u64).init(0)),
                 .sum = std.atomic.Value(u64).init(0),
                 .count = std.atomic.Value(u64).init(0),
             };

@@ -6,8 +6,8 @@ Thanks for your interest in contributing! Here's how to get started.
 
 **Prerequisites:**
 - macOS with Apple Silicon (M1+)
-- [Zig 0.16+](https://ziglang.org/download/)
-- mlx-c: `brew install mlx-c`
+- [Zig 0.17 nightly](https://ziglang.org/download/) — staged by `./scripts/fetch-zig.sh` into `.zig-toolchain/` (add it to PATH or invoke `.zig-toolchain/zig` directly)
+- mlx + mlx-c: pinned submodules built by `scripts/build-mlx.sh` (not brew packages)
 
 **Build:**
 ```bash

@@ -135,7 +135,7 @@ pub const ModelConfig = struct {
     pinned_context: u32 = 0,
 
     // Stop tokens (populated from config.json)
-    eos_token_ids: [8]u32 = .{0} ** 8,
+    eos_token_ids: [8]u32 = @splat(0),
     num_eos_tokens: u32 = 0,
 
     // Model-author sampling recommendations from generation_config.json
@@ -150,7 +150,7 @@ pub const ModelConfig = struct {
 
     // Gemma 4: explicit layer type map (bit = 1 means full/global attention)
     has_explicit_layer_types: bool = false,
-    layer_is_global: [128]bool = .{false} ** 128,
+    layer_is_global: [128]bool = @splat(false),
 
     // Vision encoder (Gemma 4 SigLIP)
     has_vision: bool = false,
@@ -214,7 +214,7 @@ pub const ModelConfig = struct {
     // (e.g. "<|turn>user\n" for Gemma 4, "<|im_start|>user\n" for Qwen ChatML).
     // Used by insertImageTokens to locate the latest user turn — a hard-coded
     // ID search would silently break across architectures and quantizations.
-    user_turn_marker_ids: [16]u32 = .{0} ** 16,
+    user_turn_marker_ids: [16]u32 = @splat(0),
     user_turn_marker_len: u8 = 0,
 
     // Gemma 4: dual head dimensions and KV sharing
@@ -244,7 +244,7 @@ pub const ModelConfig = struct {
 
     // Hybrid layers (LFM2, Nemotron-H): per-layer type dispatch
     has_hybrid_layers: bool = false,
-    layer_block_types: [128]LayerBlockType = .{.attention} ** 128,
+    layer_block_types: [128]LayerBlockType = @splat(.attention),
     has_embedding_norm: bool = false, // LFM2: RMS norm applied to embeddings
     has_final_norm: bool = true, // false for LFM2 (no model.norm.weight)
 
@@ -1339,7 +1339,7 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
 
-    const pathz = try allocator.dupeZ(u8, abs_path);
+    const pathz = try allocator.dupeSentinel(u8, abs_path, 0);
     defer allocator.free(pathz);
     try loadSafetensorsFile(allocator, &weights, pathz, s, false);
 
@@ -1383,7 +1383,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
 
         const path_slice = try std.fmt.allocPrint(allocator, "{s}/{s}", .{ model_dir, entry.name });
         defer allocator.free(path_slice);
-        const path = try allocator.dupeZ(u8, path_slice);
+        const path = try allocator.dupeSentinel(u8, path_slice, 0);
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
@@ -1541,7 +1541,7 @@ test "loadWeights casts f16 quant scales/biases to bf16 (mixed-dtype qmm slow-pa
         defer _ = mlx.mlx_map_string_to_string_free(meta);
 
         const shape = [_]c_int{ 4, 4 };
-        const data = [_]f32{0.5} ** 16;
+        const data: [16]f32 = @splat(0.5);
         const f32_arr = mlx.mlx_array_new_data(&data, &shape, 2, .float32);
         defer _ = mlx.mlx_array_free(f32_arr);
         var f16_arr = mlx.mlx_array_new();

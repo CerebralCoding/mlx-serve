@@ -21,8 +21,8 @@ const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
 const media_mod = @import("gen.zig");
-const stb = @cImport({ @cInclude("stb_image.h"); });
-const webp = @cImport({ @cInclude("webp/decode.h"); });
+const stb = @import("stb");
+const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
 
@@ -1689,12 +1689,12 @@ fn ollamaResolveRegistryId(io: std.Io, registry: *ModelRegistry, name: []const u
 }
 
 fn ollamaQuantOf(id: []const u8) []const u8 {
-    if (std.ascii.indexOfIgnoreCase(id, "4bit") != null) return "4bit";
-    if (std.ascii.indexOfIgnoreCase(id, "8bit") != null) return "8bit";
-    if (std.ascii.indexOfIgnoreCase(id, "bf16") != null) return "BF16";
-    if (std.ascii.indexOfIgnoreCase(id, "nvfp4") != null) return "NVFP4";
-    if (std.ascii.indexOfIgnoreCase(id, "q4") != null) return "Q4";
-    if (std.ascii.indexOfIgnoreCase(id, "q8") != null) return "Q8";
+    if (std.ascii.findIgnoreCase(id, "4bit") != null) return "4bit";
+    if (std.ascii.findIgnoreCase(id, "8bit") != null) return "8bit";
+    if (std.ascii.findIgnoreCase(id, "bf16") != null) return "BF16";
+    if (std.ascii.findIgnoreCase(id, "nvfp4") != null) return "NVFP4";
+    if (std.ascii.findIgnoreCase(id, "q4") != null) return "Q4";
+    if (std.ascii.findIgnoreCase(id, "q8") != null) return "Q8";
     return "";
 }
 
@@ -6226,9 +6226,10 @@ fn ipIsLoopback(addr: std.Io.net.IpAddress) bool {
         .ip4 => |a4| a4.bytes[0] == 127, // 127.0.0.0/8
         .ip6 => |a6| blk: {
             const b = a6.bytes; // big-endian 16 bytes
-            const zeros10 = [_]u8{0} ** 10;
+            const zeros10: [10]u8 = @splat(0);
             // ::1
-            if (std.mem.eql(u8, b[0..15], &([_]u8{0} ** 15)) and b[15] == 1) break :blk true;
+            const zeros15: [15]u8 = @splat(0);
+            if (std.mem.eql(u8, b[0..15], &zeros15) and b[15] == 1) break :blk true;
             // ::ffff:127.x.x.x  (IPv4-mapped loopback)
             if (std.mem.eql(u8, b[0..10], &zeros10) and b[10] == 0xff and b[11] == 0xff and b[12] == 127) break :blk true;
             break :blk false;

@@ -1,9 +1,11 @@
-# Brewfile can't pin versions (and no zig@0.16 formula exists while 0.16 IS
-# stable) — the floors are ENFORCED at build time instead:
-#   zig  >= 0.16.0  comptime check at the top of build.zig (CI pins 0.16.0
-#                   via mlugg/setup-zig in release.yml)
+# Zig is NOT a brew dep: homebrew's `zig` formula still ships 0.16.0, but this
+# project requires a 0.17 nightly (comptime check at the top of build.zig —
+# 0.16.0's bundled libc++ fails against the macOS 27 SDK) until 0.17.0 stable
+# ships. `scripts/fetch-zig.sh` fetches the pinned nightly into
+# .zig-toolchain/ instead (CI: same script in release.yml).
+#
+# Brewfile can't pin versions, so this floor is enforced at build time:
 #   webp >= 1.6.0   build.zig verifyBrewDeps
-brew "zig"
 # mlx + mlx-c are NOT brew deps: pinned submodules (lib/mlx-src, lib/mlxc-src)
 # built by scripts/build-mlx.sh so the NAX (M5) kernels ship enabled — the
 # brew bottle is compiled at deployment target 26.0 and silently disables them.

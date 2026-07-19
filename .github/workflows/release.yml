@@ -34,9 +34,9 @@ jobs:
           xcode-version: latest-stable
 
       - name: Install Zig
-        uses: mlugg/setup-zig@v2
-        with:
-          version: 0.16.0
+        run: |
+          bash scripts/fetch-zig.sh
+          echo "$GITHUB_WORKSPACE/.zig-toolchain" >> "$GITHUB_PATH"
 
       - name: Install dependencies
         run: brew bundle install --file=Brewfile

@@ -125,7 +125,7 @@ fn scalarValue(arr: mlx.mlx_array, s: mlx.mlx_stream) ?f32 {
 /// arrays GPU-usable afterwards).
 pub fn loadFile(allocator: std.mem.Allocator, path: []const u8) !File {
     if (path.len == 0 or !std.fs.path.isAbsolute(path)) return error.BadLoraPath;
-    const pathz = try allocator.dupeZ(u8, path);
+    const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
