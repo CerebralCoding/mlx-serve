@@ -55,6 +55,13 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// don't re-render the tray (the MenuBarExtra churn class). nil while no
     /// guest is running.
     @Published private(set) var guestMemoryText: String?
+    /// Host loopback port mirroring the guest's sshd. nil until a NETWORKED
+    /// guest with ssh support has booted. Changes at boot/teardown cadence
+    /// (same as `guestRunning`) — safe for the tray to observe.
+    @Published private(set) var sshPort: UInt16?
+
+    /// Copyable one-liner for the "connect from your own terminal" row.
+    var sshDisplayCommand: String? { sshPort.map { SandboxSSH.displayCommand(port: $0) } }
 
     private let lock = NSLock()
     private var enabled = AgentSandbox.resolveEnabled(requested: false)
@@ -89,6 +96,9 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     private func setGuestMemoryText(_ v: String?) {
         DispatchQueue.main.async { if self.guestMemoryText != v { self.guestMemoryText = v } }
     }
+    private func setSshPort(_ v: UInt16?) {
+        DispatchQueue.main.async { if self.sshPort != v { self.sshPort = v } }
+    }
 
     /// Tray RAM readout: used (total − available) quantized to 16 MB so nearby
     /// readings map to the SAME string (no per-second tray re-render); totals
@@ -109,6 +119,20 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// Host side of the live guest→host port map (created per boot when
     /// networking is on; fed by the guest's hvc2 net-report stream).
     private var forwarder: SandboxPortForwarder?
+    /// Dedicated ssh mirror: `localhost:<sshPort>` → guest `:22` (dropbear).
+    /// Separate from `forwarder` so the guest's own listener churn can never
+    /// close the ssh mapping. Zero changes to SandboxPortForwarder itself —
+    /// `targetPortOverride` is the seam.
+    private var sshForwarder: SandboxPortForwarder?
+    /// Live CLI sessions (embedded terminal / agent TUIs) pinning the guest —
+    /// while non-empty, a workspace switch that needs a remount is DECLINED
+    /// instead of silently rebooting the VM out from under the session.
+    private var cliPins: [String] = []
+    /// The live guest's ssh mirror port and rootfs dir — synchronous mirrors
+    /// of what `ensureBooted` set up (`sshPort` is @Published on main, so it
+    /// lags; the session-start path must not race it). Guarded by `bootLock`.
+    private var currentSshPort: UInt16?
+    private var rootfsPath: String?
 
     private init() {}
 
@@ -164,17 +188,31 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// must run off the calling thread. `bootLock` is NOT held across the async
     /// hop, so a concurrent `ensureBooted` can boot a fresh guest safely.
     func teardown(shutdownBlocking: @escaping (VzGuest) -> Void) {
+        guard let g = detachGuest() else { return }
+        DispatchQueue.global(qos: .utility).async { shutdownBlocking(g) }
+    }
+
+    /// Detach the live guest + forwarders SYNCHRONOUSLY (UI state and a fresh
+    /// `ensureBooted` are correct at once) and return the detached guest —
+    /// the caller decides how its blocking stop runs (fire-and-forget for
+    /// teardown; strictly BEFORE any rootfs delete for re-pull/reset).
+    private func detachGuest() -> VzGuest? {
         bootLock.lock()
         let g = guest
         let fwd = forwarder
+        let sfwd = sshForwarder
         guest = nil
         sharedRoot = nil
         forwarder = nil
+        sshForwarder = nil
+        currentSshPort = nil
+        rootfsPath = nil
         bootLock.unlock()
         fwd?.stop()
+        sfwd?.stop()
         setGuestRunning(false)
-        guard let g else { return }
-        DispatchQueue.global(qos: .utility).async { shutdownBlocking(g) }
+        setSshPort(nil)
+        return g
     }
 
     // MARK: Test hooks (no VM — install/inspect the detached guest reference)
@@ -287,6 +325,105 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     static func needsRemount(sharedRoot: String, requestedCwd: String?) -> Bool {
         guard let requestedCwd else { return false }
         return !guestPath(hostPath: requestedCwd, sharedRoot: sharedRoot).mapped
+    }
+
+    // MARK: CLI-session pinning (agent CLIs living in the guest)
+
+    /// A workspace switch that would remount (= reboot) the guest is declined
+    /// while a CLI session is live — the session's shell/TUI would die
+    /// silently mid-keystroke otherwise. nil = proceed as before.
+    static func remountBlockMessage(pinnedLabels: [String], needsRemount: Bool) -> String? {
+        guard needsRemount, let label = pinnedLabels.last else { return nil }
+        return "a sandboxed \(label) session is using the VM — close it before switching the workspace"
+    }
+
+    /// The most recent live CLI session's label (nil = unpinned). For the
+    /// remount-decline message and the window title.
+    var pinnedCliSessionLabel: String? {
+        bootLock.lock(); defer { bootLock.unlock() }; return cliPins.last
+    }
+
+    func pinCliSession(label: String) {
+        bootLock.lock(); cliPins.append(label); bootLock.unlock()
+    }
+
+    func unpinCliSession(label: String) {
+        bootLock.lock()
+        if let i = cliPins.lastIndex(of: label) { cliPins.remove(at: i) }
+        bootLock.unlock()
+    }
+
+    /// Preflight verdict for a cached rootfs that predates the ssh-enabled
+    /// image (no dropbear baked in). Surfaced with a re-pull action — never a
+    /// silent boot into a guest the terminal can't reach.
+    static func staleImageMessage(image: String) -> String {
+        "the cached sandbox image \"\(image)\" predates ssh support (no dropbear) — re-pull the image to update it"
+    }
+
+    /// Does the LIVE (or lazily-booted) guest ship dropbear? The ssh preflight.
+    func guestHasDropbear() async -> Bool {
+        await guestCommandSucceeds("command -v dropbear")
+    }
+
+    /// The stale-image fix: drop the cached rootfs for the current base image
+    /// and tear down any live guest — the next boot re-pulls fresh.
+    func repullBaseImage() {
+        repullBaseImage(shutdownBlocking: { $0.shutdown() },
+                        deleteImageDir: { try? FileManager.default.removeItem(at: $0) })
+    }
+
+    /// Seam for tests (same pattern as `teardown(shutdownBlocking:)`), and the
+    /// reason repull is NOT `teardown()` + delete: teardown's stop is
+    /// fire-and-forget, and deleting the cached image dir — the live guest's
+    /// virtiofs root — under a still-stopping VM risks a partial delete that
+    /// `provisionRootfs` later mistakes for a valid cache (marker + bin/sh +
+    /// sidecar surviving = cache hit on a gutted tree). The stop completes
+    /// FIRST; call off-main (the alert site uses Task.detached — the stop
+    /// blocks up to ~10 s).
+    func repullBaseImage(shutdownBlocking: (VzGuest) -> Void,
+                         deleteImageDir: (URL) -> Void) {
+        let image = { lock.lock(); defer { lock.unlock() }; return baseImage }()
+        if let g = detachGuest() { shutdownBlocking(g) }
+        let dir = cacheDir.appendingPathComponent("images/\(Self.imageDirName(image))", isDirectory: true)
+        deleteImageDir(dir)
+    }
+
+    // MARK: Factory reset (Settings → Reset Sandbox)
+
+    /// The one directory the factory reset deletes (`~/.mlx-serve/sandbox`):
+    /// cached kernel, every pulled image — including ALL in-guest state
+    /// (installed CLIs, agent configs, files outside /workspace) — and the
+    /// app-owned ssh identity. Scope is pinned by AgentSandboxTests: never
+    /// `~/.mlx-serve` itself (models/logs/workspace live next door).
+    var dataDirectory: URL { cacheDir }
+
+    /// Reset the sandbox to factory state: stop any live guest (live CLI
+    /// sessions die with it — the confirmation UI says so in red), delete
+    /// `dataDirectory`, and clear the transcript. The next use re-provisions
+    /// everything from scratch (kernel, image, fresh ssh keypair).
+    ///
+    /// The guest shutdown is BLOCKING (bounded ~10 s) and runs off-main
+    /// before the delete — removing a rootfs out from under a still-stopping
+    /// VM risks a partial delete that a later boot mistakes for a valid
+    /// cache. Guest detach is synchronous (same shape as `teardown`).
+    func resetAllData(completion: (@Sendable () -> Void)? = nil) {
+        let g = detachGuest()
+        bootLock.lock()
+        terminalCwd = "/workspace"
+        bootLock.unlock()
+        let dir = dataDirectory
+        DispatchQueue.global(qos: .userInitiated).async {
+            g?.shutdown() // blocking, bounded — files closed before the delete
+            try? FileManager.default.removeItem(at: dir)
+            DispatchQueue.main.async {
+                self.transcriptStore.reset()
+                self.transcriptStore.append(Entry(
+                    source: .system, command: "",
+                    output: "sandbox reset — guest stopped; cached kernel, images (with all in-guest data) and the ssh identity deleted. Next use re-provisions from scratch.",
+                    exitCode: 0, at: Date()))
+                completion?()
+            }
+        }
     }
 
     /// Guest CPU architecture. The Virtualization.framework guest on Apple
@@ -572,6 +709,102 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         }
     }
 
+    // MARK: CLI sessions in the guest (embedded terminal / user ssh)
+
+    /// Everything the embedded terminal needs to open one session. `sshArgs`
+    /// is the argv for `/usr/bin/ssh`; `displayCommand` is the copyable
+    /// "connect from your own terminal" line (same option set, pinned by
+    /// SandboxSSHTests).
+    struct CliSession {
+        let label: String        // "pi" / "hermes" / "shell" — window title + pin
+        let agentId: String?     // nil = plain login shell
+        let sshPort: UInt16
+        let sshArgs: [String]
+        let displayCommand: String
+    }
+
+    /// Boot (if needed), verify the image ships dropbear, materialize the
+    /// agent's config + bootstrap into the rootfs, wait for the ssh mirror,
+    /// and pin the guest. The caller MUST balance with `endCliSession(_:)`
+    /// when the terminal exits. Throws `SandboxError` with an actionable
+    /// message on every distinct failure — never a hung terminal.
+    func startCliSession(agent: SandboxAgentSpec?, model: String?, serverPort: UInt16,
+                         budget: AgentBudget.Budget, apiKey: String?) async throws -> CliSession {
+        let image = { lock.lock(); defer { lock.unlock() }; return baseImage }()
+        return try await withCheckedThrowingContinuation { cont in
+            DispatchQueue.global(qos: .userInitiated).async {
+                do {
+                    let (g, _) = try self.ensureBooted(image: image, workingDirectory: nil)
+                    let (port, rootfs): (UInt16?, String?) = {
+                        self.bootLock.lock(); defer { self.bootLock.unlock() }
+                        return (self.currentSshPort, self.rootfsPath)
+                    }()
+                    guard let sshPort = port, let rootfsDir = rootfs else {
+                        throw SandboxError(message: "the sandbox guest has no ssh channel — turn on guest networking in Settings → Agent Sandbox")
+                    }
+                    // Stale-cache preflight: the ssh transport needs dropbear
+                    // BAKED into the image; an old cached rootfs simply lacks
+                    // it (the fix is a re-pull, offered by the UI).
+                    let probe = try g.exec("command -v dropbear", timeout: 20)
+                    guard !probe.timedOut, probe.exitCode == 0 else {
+                        throw SandboxError(message: Self.staleImageMessage(image: image))
+                    }
+
+                    var remoteCommand: String?
+                    if let agent {
+                        guard let model, !model.isEmpty else {
+                            throw SandboxError(message: "no model is loaded — start the server before opening a \(agent.displayName) session")
+                        }
+                        let bootstrap = try SandboxAgentRegistry.materialize(
+                            spec: agent, model: model, serverPort: serverPort,
+                            budget: budget, apiKey: apiKey, rootfsDir: rootfsDir)
+                        remoteCommand = "sh \(bootstrap)"
+                    }
+
+                    // The mirror listens once the first net snapshot delivers
+                    // the guest IP (~1 s cadence). Bounded wait, distinct error.
+                    let deadline = Date().addingTimeInterval(20)
+                    while Date() < deadline, !self.sshMirrorActive(port: sshPort) {
+                        Thread.sleep(forTimeInterval: 0.1)
+                    }
+                    guard self.sshMirrorActive(port: sshPort) else {
+                        throw SandboxError(message: "the guest network never came up — no ssh mirror on localhost:\(sshPort)")
+                    }
+
+                    let label = agent?.displayName ?? "shell"
+                    self.pinCliSession(label: label)
+                    self.record(Entry(source: .system, command: "",
+                                      output: "\(label) session opened — ssh mirror localhost:\(sshPort) → guest :22",
+                                      exitCode: 0, at: Date()))
+                    cont.resume(returning: CliSession(
+                        label: label, agentId: agent?.id, sshPort: sshPort,
+                        sshArgs: SandboxSSH.sshArgs(port: sshPort,
+                                                    keyPath: SandboxSSH.privateKeyPath,
+                                                    knownHostsPath: SandboxSSH.knownHostsPath,
+                                                    remoteCommand: remoteCommand),
+                        displayCommand: SandboxSSH.displayCommand(port: sshPort)))
+                } catch {
+                    cont.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    /// Balance for `startCliSession` — releases the workspace pin. Safe to
+    /// call after the guest already died (the pin list is host state).
+    func endCliSession(_ session: CliSession) {
+        unpinCliSession(label: session.label)
+        record(Entry(source: .system, command: "",
+                     output: "\(session.label) session closed", exitCode: 0, at: Date()))
+    }
+
+    private func sshMirrorActive(port: UInt16) -> Bool {
+        let fwd: SandboxPortForwarder? = {
+            bootLock.lock(); defer { bootLock.unlock() }; return sshForwarder
+        }()
+        return fwd?.activePorts.contains(port) ?? false
+    }
+
     /// The kernel+rootfs source for this build: bundled on the App Store,
     /// downloaded on Developer ID. The download arm delegates to the existing
     /// `provisionKernel`/`provisionRootfs` (which own the caching); the bundled
@@ -593,14 +826,23 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// Serialized by `bootLock`. Returns the guest and its shared-root host path.
     private func ensureBooted(image: String, workingDirectory: String?) throws -> (VzGuest, String) {
         bootLock.lock(); defer { bootLock.unlock() }
-        if let g = guest, !g.isFinished, let root = sharedRoot,
-           !Self.needsRemount(sharedRoot: root, requestedCwd: workingDirectory) {
-            return (g, root)
+        if let g = guest, !g.isFinished, let root = sharedRoot {
+            if !Self.needsRemount(sharedRoot: root, requestedCwd: workingDirectory) {
+                return (g, root)
+            }
+            // A live CLI session pins the guest: decline the remount loudly
+            // instead of rebooting the VM out from under the session.
+            if let blocked = Self.remountBlockMessage(pinnedLabels: cliPins, needsRemount: true) {
+                throw SandboxError(message: blocked)
+            }
         }
         // Stale/dead guest, or the working folder moved outside the shared
         // root (remount) — tear down and boot fresh with the right share.
         guest?.shutdown(); guest = nil; sharedRoot = nil
         forwarder?.stop(); forwarder = nil
+        sshForwarder?.stop(); sshForwarder = nil
+        currentSshPort = nil; rootfsPath = nil
+        setSshPort(nil)
         terminalCwd = "/workspace" // a fresh guest starts in its workdir
 
         #if !arch(arm64)
@@ -645,6 +887,29 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         }
         let net = { lock.lock(); defer { lock.unlock() }; return networkEnabled }()
         cfg.network = net
+
+        // SSH: every networked boot gets dropbear (key-only) + a dedicated
+        // loopback mirror — the embedded terminal, the copyable ssh command,
+        // and the smoke all ride the same transport. Failure here degrades to
+        // a guest without ssh (shell/agent tools keep working), never a boot
+        // failure.
+        var bootSshPort: UInt16?
+        if net {
+            do {
+                try SandboxSSH.ensureKeypair()
+                SandboxSSH.resetKnownHosts() // host keys churn with re-pulls; stale entry = MITM banner
+                try SandboxSSH.injectAuthorizedKeys(rootfsDir: rootfs)
+                try SandboxSSH.injectGuestProfile(rootfsDir: rootfs)
+                if let port = SandboxSSH.allocateSshPort(taken: []) {
+                    cfg.sshEnabled = true
+                    bootSshPort = port
+                } else {
+                    NSLog("[sandbox] ssh mirror skipped: no free loopback port from 2222")
+                }
+            } catch {
+                NSLog("[sandbox] ssh setup skipped: \(error)")
+            }
+        }
         // The rootfs is demand-paged over virtiofs (not RAM-resident like the old
         // initramfs boot), so guest RAM is pure workload headroom.
         let ramGB = ProcessInfo.processInfo.environment["SANDBOX_RAM_GB"].flatMap { UInt64($0) } ?? 1
@@ -664,12 +929,25 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             }
             forwarder = fwd
         }
+        if let sp = bootSshPort {
+            // Own forwarder for ssh: same class, fixed mapping localhost:sp →
+            // guest :22, immune to the guest's own listener churn (dropbear
+            // binds 0.0.0.0:22, which the general forwarder would ALSO mirror
+            // to localhost:22 — the dedicated instance is the stable address).
+            let sfwd = SandboxPortForwarder()
+            sfwd.targetPortOverride = { _ in 22 }
+            sshForwarder = sfwd
+        }
         var announcedIP: String?
-        g.onNetSnapshot = { [weak self, weak fwd = forwarder] text in
+        g.onNetSnapshot = { [weak self, weak fwd = forwarder, weak sshFwd = sshForwarder] text in
             guard let self else { return }
             let snap = GuestNetParser.parse(text)
             if let total = snap.memTotalKB, let avail = snap.memAvailableKB {
                 self.setGuestMemoryText(Self.memoryDisplayText(availableKB: avail, totalKB: total))
+            }
+            if let sshFwd, let ip = snap.ip, let sp = bootSshPort {
+                sshFwd.setTarget(host: ip)
+                sshFwd.update(ports: [sp])
             }
             guard let fwd else { return }
             if let ip = snap.ip {
@@ -681,7 +959,10 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                                       exitCode: 0, at: Date()))
                 }
             }
-            fwd.update(ports: snap.ports)
+            // The guest's own :22 listener rides the DEDICATED mirror only —
+            // mirroring it here too would fight the ssh forwarder for
+            // localhost:22 (and usually lose to a host sshd anyway).
+            fwd.update(ports: snap.ports.filter { $0 != 22 })
         }
         do {
             try g.boot(cfg, readyTimeout: 60)
@@ -691,11 +972,14 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             let tail = String(g.consoleSnapshot().suffix(1500))
             g.shutdown()
             forwarder?.stop(); forwarder = nil
+            sshForwarder?.stop(); sshForwarder = nil
             NSLog("[sandbox] boot failed: \(error)\n--- guest console tail ---\n\(tail)\n--- end ---")
             throw SandboxError(message: "sandbox failed to start: \(error). Turn off the Agent Sandbox in Settings to run on the host, or check the base image. (guest console tail written to the server log)")
         }
         guest = g; sharedRoot = root
+        currentSshPort = bootSshPort; rootfsPath = rootfs
         setGuestRunning(true)
+        setSshPort(bootSshPort)
         record(Entry(source: .system, command: "", output: "sandbox ready — \(image), sharing \(root) at /workspace", exitCode: 0, at: Date()))
         return (g, root)
         #endif
@@ -820,5 +1104,10 @@ final class SandboxTranscript: ObservableObject {
         if entries.count > Self.maxEntries {
             entries.removeFirst(entries.count - Self.maxEntries)
         }
+    }
+
+    /// Factory reset — the transcript is sandbox data too.
+    func reset() {
+        entries.removeAll()
     }
 }

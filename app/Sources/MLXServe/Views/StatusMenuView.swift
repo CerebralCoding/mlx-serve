@@ -605,7 +605,14 @@ struct StatusMenuView: View {
                         baseURL: server.baseURL,
                         servedModelId: server.modelInfo?.name ?? "mlx-serve",
                         serverContextLength: server.modelInfo?.contextLength,
-                        isEnabled: server.status == .running
+                        isEnabled: server.status == .running,
+                        openSandboxAgent: { agentId in
+                            // Post the request FIRST — the Sandbox window
+                            // reads it in .onAppear when this click is what
+                            // opens the window.
+                            appState.pendingSandboxAgentLaunch = .init(agentId: agentId)
+                            openSandboxTerminal()
+                        }
                     )
                 } else {
                     CLISetupInstructionsButton(

@@ -83,6 +83,14 @@ class AppState: ObservableObject {
     /// Set by the menu bar's Voice action; the chat detail view consumes it to
     /// auto-start Voice mode (whether the window was already open or just opened).
     @Published var pendingVoiceLaunch = false
+    /// Set by the tray's "pi/hermes in Sandbox" shortcut; the Sandbox window
+    /// consumes it (focus a running session of that agent, else start one)
+    /// and clears it. Fresh `id` per click so repeat clicks re-fire onChange.
+    struct SandboxAgentLaunch: Equatable {
+        let id = UUID()
+        let agentId: String
+    }
+    @Published var pendingSandboxAgentLaunch: SandboxAgentLaunch?
     @Published var agentMemory = AgentMemory()
     @Published var toolExecutor = ToolExecutor()
     /// Owns every agent-spawned background process (started via shell

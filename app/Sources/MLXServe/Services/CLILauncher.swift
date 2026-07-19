@@ -225,11 +225,12 @@ extension LauncherCLI {
 
 // MARK: - UI
 
-/// Launcher button for the menu bar. Renders either:
-///   * nothing (when we've scanned and found no CLIs installed — the user
-///     doesn't care about a feature they can't use),
-///   * a single bordered button for one CLI (skips the extra click),
-///   * a `Menu` dropdown for 2+ CLIs.
+/// Launcher button for the menu bar: one `Menu` with the detected host CLIs
+/// (launched in Terminal.app against the local server) plus the sandboxed
+/// agents (pi/hermes INSIDE the guest VM — routed to the Sandbox window via
+/// `openSandboxAgent`). The sandbox rows are always present, so the button no
+/// longer hides when no host CLI is installed — running an agent needs
+/// nothing on the host anymore.
 @MainActor
 struct CLILauncherButton: View {
     let baseURL: String
@@ -240,6 +241,10 @@ struct CLILauncherButton: View {
     /// at the conservative fallback. See `AgentBudget`.
     let serverContextLength: Int?
     let isEnabled: Bool
+    /// Tray → Sandbox window hand-off (agent id): the tray can't drive the
+    /// window's state directly, so this posts the launch request and opens
+    /// the window; the window focuses a running session or starts one.
+    let openSandboxAgent: (String) -> Void
 
     private var budget: AgentBudget.Budget { AgentBudget.forServerContext(serverContextLength) }
 
@@ -251,25 +256,26 @@ struct CLILauncherButton: View {
                 // Still scanning — reserve the space with a placeholder so the
                 // footer doesn't reflow when scan finishes a moment later.
                 Color.clear.frame(width: 0, height: 0)
-            } else if detector.available.isEmpty {
-                // None installed — hide entirely.
-                EmptyView()
-            } else if detector.available.count == 1, let only = detector.available.first {
-                Button {
-                    detector.launchWithPicker(only, baseURL: baseURL, servedModelId: servedModelId, budget: budget)
-                } label: {
-                    label(for: only).frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(!isEnabled)
-                .help("Launch \(only.displayName)")
             } else {
                 Menu {
-                    ForEach(detector.available) { cli in
-                        Button {
-                            detector.launchWithPicker(cli, baseURL: baseURL, servedModelId: servedModelId, budget: budget)
-                        } label: {
-                            Label(cli.displayName, systemImage: cli.iconSystemName ?? "terminal")
+                    if !detector.available.isEmpty {
+                        Section("On this Mac") {
+                            ForEach(detector.available) { cli in
+                                Button {
+                                    detector.launchWithPicker(cli, baseURL: baseURL, servedModelId: servedModelId, budget: budget)
+                                } label: {
+                                    Label(cli.displayName, systemImage: cli.iconSystemName ?? "terminal")
+                                }
+                            }
+                        }
+                    }
+                    Section("In the sandbox") {
+                        ForEach(SandboxAgentRegistry.all) { spec in
+                            Button {
+                                openSandboxAgent(spec.id)
+                            } label: {
+                                Label("\(spec.displayName) in Sandbox", systemImage: "shippingbox")
+                            }
                         }
                     }
                 } label: {
@@ -287,22 +293,9 @@ struct CLILauncherButton: View {
                 .buttonStyle(.bordered)
                 .menuIndicator(.hidden)
                 .disabled(!isEnabled)
-                .help("Launch coding agent (\(detector.available.map(\.displayName).joined(separator: ", ")))")
+                .help("Launch a coding agent — on this Mac (\(detector.available.isEmpty ? "none detected" : detector.available.map(\.displayName).joined(separator: ", "))) or inside the sandbox (pi, hermes)")
             }
         }
         .task { await detector.refresh() }
-    }
-
-    /// Tray launcher label — icon + "Code" so it sits alongside the Chat/Tasks buttons.
-    @ViewBuilder
-    private func label(for cli: LauncherCLI) -> some View {
-        HStack(spacing: TrayFooterMetrics.iconSpacing) {
-            if cli.useClaudeIcon {
-                ClaudeIcon(size: 12)
-            } else {
-                Image(systemName: cli.iconSystemName ?? "terminal")
-            }
-            Text("Code")
-        }
     }
 }

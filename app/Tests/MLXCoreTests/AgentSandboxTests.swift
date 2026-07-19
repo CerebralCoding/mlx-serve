@@ -161,6 +161,105 @@ final class AgentSandboxTests: XCTestCase {
         wait(for: [shutdownRan], timeout: 5)
     }
 
+    // MARK: re-pull must not delete the rootfs under a still-stopping VM
+
+    func testRepullStopsTheGuestBeforeDeletingTheImageCache() {
+        // repullBaseImage tears down a guest whose virtiofs root IS the cached
+        // image dir. The delete must be sequenced strictly AFTER the blocking
+        // stop completes — removing the rootfs under a still-stopping VM risks
+        // a partial delete that provisionRootfs later mistakes for a valid
+        // cache (marker + bin/sh + sidecar surviving = cache hit on a gutted
+        // tree). Same hazard resetAllData documents; re-pull is triggered
+        // exactly when a guest is likely live (the stale-image alert).
+        let sandbox = AgentSandbox.shared
+        sandbox._testInstallGuest(VzGuest())
+        let lock = NSLock()
+        var events: [String] = []
+        let stopped = expectation(description: "blocking stop completed")
+        let returned = expectation(description: "repull returned")
+        DispatchQueue.global().async {
+            sandbox.repullBaseImage(
+                shutdownBlocking: { _ in
+                    Thread.sleep(forTimeInterval: 0.3) // simulate the VZ stop wait
+                    lock.lock(); events.append("stopped"); lock.unlock()
+                    stopped.fulfill()
+                },
+                deleteImageDir: { _ in
+                    lock.lock(); events.append("deleted"); lock.unlock()
+                })
+            returned.fulfill()
+        }
+        wait(for: [returned, stopped], timeout: 5)
+        XCTAssertEqual(events, ["stopped", "deleted"],
+                       "the image-dir delete must wait for the guest's blocking stop")
+        XCTAssertFalse(sandbox._testHasGuest, "guest must be detached so the next boot re-pulls fresh")
+    }
+
+    // MARK: CLI-session pinning (issue #89 follow-up: agent CLIs in the guest)
+
+    func testRemountBlockMessageOnlyWhenPinnedAndRemountNeeded() {
+        // A live CLI session pins the shared guest: a workspace switch that
+        // would remount (= reboot) the VM is DECLINED with a clear message,
+        // never a silent kill mid-session.
+        XCTAssertNil(AgentSandbox.remountBlockMessage(pinnedLabels: [], needsRemount: true),
+                     "no session → remount proceeds as before")
+        XCTAssertNil(AgentSandbox.remountBlockMessage(pinnedLabels: ["pi"], needsRemount: false),
+                     "pinned but no remount needed → nothing to block")
+        let msg = AgentSandbox.remountBlockMessage(pinnedLabels: ["pi"], needsRemount: true)
+        XCTAssertNotNil(msg)
+        XCTAssertTrue(msg!.contains("pi"), "the message must NAME the session holding the pin: \(msg!)")
+        XCTAssertTrue(msg!.lowercased().contains("close"), "must tell the user the way out: \(msg!)")
+    }
+
+    func testCliSessionPinRefcounts() {
+        let sandbox = AgentSandbox.shared
+        XCTAssertNil(sandbox.pinnedCliSessionLabel)
+        sandbox.pinCliSession(label: "pi")
+        sandbox.pinCliSession(label: "hermes")
+        XCTAssertNotNil(sandbox.pinnedCliSessionLabel)
+        sandbox.unpinCliSession(label: "pi")
+        XCTAssertEqual(sandbox.pinnedCliSessionLabel, "hermes",
+                       "two sessions → dropping one keeps the other's pin")
+        sandbox.unpinCliSession(label: "hermes")
+        XCTAssertNil(sandbox.pinnedCliSessionLabel, "last session gone → guest unpinned")
+        // Unbalanced unpin must not underflow.
+        sandbox.unpinCliSession(label: "hermes")
+        XCTAssertNil(sandbox.pinnedCliSessionLabel)
+    }
+
+    // MARK: stale image (dropbear preflight)
+
+    func testStaleImageMessageNamesTheImageAndTheFix() {
+        let msg = AgentSandbox.staleImageMessage(image: "ddalcu/agent-shell-mlxserve")
+        XCTAssertTrue(msg.contains("ddalcu/agent-shell-mlxserve"), msg)
+        XCTAssertTrue(msg.lowercased().contains("ssh"), "must say WHAT the cached image lacks: \(msg)")
+        XCTAssertTrue(msg.lowercased().contains("re-pull") || msg.lowercased().contains("update"),
+                      "must name the fix: \(msg)")
+    }
+
+    // MARK: factory reset (Settings → Reset Sandbox)
+
+    func testResetScopeIsTheSandboxDirAndCoversTheSshIdentity() {
+        // The reset deletes EXACTLY this directory: wide enough that the ssh
+        // identity + known hosts go with the images (a keypair that outlives
+        // the guest's authorized_keys would just break the next boot), narrow
+        // enough that it can never touch models/logs/workspace next door.
+        let root = AgentSandbox.shared.dataDirectory
+        XCTAssertEqual(root.lastPathComponent, "sandbox",
+                       "reset scope must be ~/.mlx-serve/sandbox — NEVER ~/.mlx-serve itself")
+        XCTAssertTrue(root.path.hasSuffix(".mlx-serve/sandbox"), root.path)
+        XCTAssertTrue(SandboxSSH.sshDir.path.hasPrefix(root.path + "/"),
+                      "the ssh identity must live INSIDE the reset scope: \(SandboxSSH.sshDir.path)")
+    }
+
+    func testTranscriptResetEmptiesTheStore() {
+        let store = SandboxTranscript()
+        store.append(AgentSandbox.Entry(source: .user, command: "ls", output: "", exitCode: 0, at: Date()))
+        store.append(AgentSandbox.Entry(source: .system, command: "", output: "x", exitCode: 0, at: Date()))
+        store.reset()
+        XCTAssertTrue(store.entries.isEmpty)
+    }
+
     // MARK: transcript store (tray redraw churn)
 
     func testTranscriptStoreCapsAt400Entries() {

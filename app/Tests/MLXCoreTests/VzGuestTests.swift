@@ -194,6 +194,33 @@ final class VzGuestTests: XCTestCase {
         }
     }
 
+    // MARK: ssh (dropbear) arm
+
+    func testInitScriptSshArmStartsDropbearKeyOnlyWithPtys() {
+        var c = vsockConfig()
+        c.network = true
+        c.sshEnabled = true
+        let s = VzGuest.buildInitScript(config: c)
+        // Key-only auth (-s), stable host keys generated into the persistent
+        // rootfs (-R), on the standard port the dedicated forwarder targets.
+        XCTAssertTrue(s.contains("dropbear -R -s -p 22"), s)
+        // dropbear is baked into the image, not host-injected — a stale cached
+        // image simply lacks it, so the start must be gated, never a hard fail.
+        XCTAssertTrue(s.contains("command -v dropbear"), "missing dropbear must not break boot")
+        // ssh sessions allocate ptys; the base init only mounts devtmpfs, which
+        // does NOT auto-mount /dev/pts — without it every session dies with
+        // "PTY allocation request failed".
+        XCTAssertTrue(s.contains("mount -t devpts devpts /dev/pts"), s)
+    }
+
+    func testInitScriptWithoutSshHasNoDropbear() {
+        var c = vsockConfig()
+        c.network = true
+        let s = VzGuest.buildInitScript(config: c)
+        XCTAssertFalse(s.contains("dropbear"), "ssh off → no sshd, no devpts requirement")
+        XCTAssertFalse(s.contains("devpts"))
+    }
+
     // MARK: shell quoting
 
     func testShellQuoteWrapsAndEscapesSingleQuotes() {

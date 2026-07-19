@@ -239,6 +239,54 @@ enum SandboxSmoke {
                 if sane == true { log("[smoke]   ✓ ANSI escapes stripped (clean transcript text)") }
                 else { log("[smoke]   ✗ ANSI sanitize failed (escapes leaked into the transcript)"); ok = false }
 
+                // Phase 5: the ssh transport (issue #89 follow-up) — dropbear
+                // baked into the image, the dedicated loopback mirror, and a
+                // real /usr/bin/ssh session end to end. SKIPs (does not fail)
+                // when the image predates dropbear, so pre-ssh caches still
+                // pass the rest of the smoke.
+                if env["SANDBOX_SMOKE_NO_NETWORK"] != "1" {
+                    log("[smoke] phase 5: ssh into the guest…")
+                    let hasDropbear = syncAwait { await AgentSandbox.shared.guestHasDropbear() }
+                    if !hasDropbear {
+                        log("[smoke]   SKIP: image ships no dropbear (pre-ssh image — re-pull to enable)")
+                    } else {
+                        // The mirror port publishes on the main queue at boot.
+                        var sshPort: UInt16?
+                        let portDeadline = Date().addingTimeInterval(10)
+                        while Date() < portDeadline && sshPort == nil {
+                            RunLoop.main.run(until: Date().addingTimeInterval(0.1))
+                            sshPort = AgentSandbox.shared.sshPort
+                        }
+                        if let port = sshPort {
+                            log("[smoke]   ssh mirror localhost:\(port) → guest :22")
+                            let out = hostSsh(port: port, command: "echo SSH_OK_$((5*5))", timeout: 60)
+                            if out.contains("SSH_OK_25") { log("[smoke]   ✓ ssh session round-trips (key auth, no prompts)") }
+                            else { log("[smoke]   ✗ ssh failed: \(out.trimmingCharacters(in: .whitespacesAndNewlines).prefix(200))"); ok = false }
+
+                            // Optional: prove an agent CLI installs + runs in-guest
+                            // (SANDBOX_SMOKE_AGENT=pi). First run downloads — slow,
+                            // network-bound — hence opt-in.
+                            if let agentId = env["SANDBOX_SMOKE_AGENT"],
+                               let spec = SandboxAgentRegistry.all.first(where: { $0.id == agentId }) {
+                                log("[smoke] phase 5b: \(spec.displayName) install + --version in-guest…")
+                                let cmd = "export PATH=\"$PATH:/root/.local/bin\"; "
+                                    + "if ! command -v \(spec.binaryName) >/dev/null 2>&1; then \(spec.installScript); fi; "
+                                    + "\(spec.binaryName) --version"
+                                let vout = hostSsh(port: port, command: cmd, timeout: 600)
+                                let tail = vout.trimmingCharacters(in: .whitespacesAndNewlines)
+                                    .split(separator: "\n").last.map(String.init) ?? ""
+                                if !tail.isEmpty && !vout.contains("install failed") {
+                                    log("[smoke]   ✓ \(spec.binaryName) --version → \(tail)")
+                                } else {
+                                    log("[smoke]   ✗ \(spec.displayName) install/version failed:\n\(vout.suffix(400))"); ok = false
+                                }
+                            }
+                        } else {
+                            log("[smoke]   ✗ ssh mirror port never published (guest network up?)"); ok = false
+                        }
+                    }
+                }
+
                 // Tray RAM readout: the guest's /proc/meminfo report must have
                 // produced a published display string by now (@Published lands
                 // on the main queue — pump it like the transcript check above).
@@ -273,6 +321,42 @@ enum SandboxSmoke {
     static var guestArchNote: String {
         let img = ProcessInfo.processInfo.environment["SANDBOX_SMOKE_IMAGE"] ?? "ddalcu/agent-shell-mlxserve"
         return "\(img) (\(AgentSandbox.guestArch))"
+    }
+
+    /// One `/usr/bin/ssh` round-trip into the guest via the loopback mirror —
+    /// exactly the invocation the embedded terminal uses (`SandboxSSH.sshArgs`)
+    /// plus BatchMode so a broken key errors instead of prompting. Returns
+    /// merged stdout+stderr.
+    private static func hostSsh(port: UInt16, command: String, timeout: TimeInterval) -> String {
+        let proc = Process()
+        proc.executableURL = URL(fileURLWithPath: SandboxSSH.sshExecutablePath)
+        proc.arguments = ["-o", "BatchMode=yes"]
+            + SandboxSSH.sshArgs(port: port,
+                                 keyPath: SandboxSSH.privateKeyPath,
+                                 knownHostsPath: SandboxSSH.knownHostsPath,
+                                 remoteCommand: command)
+        let pipe = Pipe()
+        proc.standardOutput = pipe
+        proc.standardError = pipe
+        // Drain incrementally: an install's output easily exceeds the 64 KB
+        // pipe buffer, and a full pipe would deadlock the wait-for-exit loop.
+        let buffer = NSMutableData()
+        let bufferLock = NSLock()
+        pipe.fileHandleForReading.readabilityHandler = { h in
+            let d = h.availableData
+            guard !d.isEmpty else { return }
+            bufferLock.lock(); buffer.append(d); bufferLock.unlock()
+        }
+        defer { pipe.fileHandleForReading.readabilityHandler = nil }
+        do { try proc.run() } catch { return "<spawn failed: \(error)>" }
+        let deadline = Date().addingTimeInterval(timeout)
+        while proc.isRunning && Date() < deadline {
+            Thread.sleep(forTimeInterval: 0.1)
+        }
+        if proc.isRunning { proc.terminate(); return "<ssh timed out after \(Int(timeout))s>" }
+        Thread.sleep(forTimeInterval: 0.2) // let the last readability callback land
+        bufferLock.lock(); defer { bufferLock.unlock() }
+        return String(decoding: buffer as Data, as: UTF8.self)
     }
 
     /// Run an async op to completion from this synchronous entry point. The op

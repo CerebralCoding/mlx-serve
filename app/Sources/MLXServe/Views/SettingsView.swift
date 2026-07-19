@@ -1943,6 +1943,8 @@ private struct VoiceCloneSectionContent: View {
 /// `appState.serverOptions.sandbox` with no restart banner and no CLI flag.
 private struct SandboxSectionContent: View {
     @EnvironmentObject var appState: AppState
+    @State private var showResetConfirm = false
+    @State private var resetting = false
 
     var body: some View {
         // No host shell in the App Store build → the sandbox can't be turned
@@ -1978,6 +1980,45 @@ private struct SandboxSectionContent: View {
                     .textFieldStyle(.roundedBorder)
                     .font(.body.monospaced())
                     .frame(width: 260)
+            }
+        }
+
+        SettingsRow(
+            title: "Reset sandbox",
+            explainer: "Deletes ALL sandbox data and returns it to factory state: the downloaded guest image and everything inside it (installed CLIs like pi/hermes, their configs and logins, any files created outside the shared workspace), the cached kernel, the sandbox ssh identity, and the activity transcript. Any running guest and live agent sessions are stopped immediately. Your workspace folder, models, and other app data on this Mac are not touched. The sandbox re-provisions itself on next use."
+        ) {
+            Button(role: .destructive) {
+                showResetConfirm = true
+            } label: {
+                if resetting {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Resetting…")
+                    }
+                } else {
+                    Label("Reset Sandbox…", systemImage: "trash")
+                        .foregroundStyle(.red)
+                }
+            }
+            .disabled(resetting)
+            .confirmationDialog(
+                "Reset the Agent Sandbox?",
+                isPresented: $showResetConfirm,
+                titleVisibility: .visible
+            ) {
+                Button("Delete All Sandbox Data", role: .destructive) {
+                    resetting = true
+                    AgentSandbox.shared.resetAllData {
+                        resetting = false
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("""
+                This permanently deletes everything the sandbox has downloaded and every change made inside it — installed agent CLIs (pi, hermes), their configs and logins, and any files outside the shared workspace. Any running guest and live sessions stop immediately.
+
+                Files in your workspace folder on this Mac are kept. This cannot be undone.
+                """)
             }
         }
     }

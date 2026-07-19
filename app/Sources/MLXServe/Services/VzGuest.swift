@@ -234,6 +234,11 @@ final class VzGuest {
         /// NAT networking + the live port-report stream. When false the guest
         /// gets NO network device and never DHCPs — fully isolated.
         var network: Bool = false
+        /// Start dropbear (baked into the image) on guest :22, key-only auth.
+        /// The host reaches it through a dedicated SandboxPortForwarder;
+        /// authorized_keys + /root/.profile are host-injected before boot
+        /// (`SandboxSSH`). Meaningful only with `network` on.
+        var sshEnabled: Bool = false
 
         var transport: Transport = .vsock
         /// Host path to the `vz-agent` ELF, copied into the rootfs before boot.
@@ -343,6 +348,26 @@ final class VzGuest {
             ip link set lo up 2>/dev/null
             [ -s /proc/net/pnp ] || dhclient -1 eth0 2>/dev/null || udhcpc -i eth0 -n -q 2>/dev/null || dhcpcd -1 eth0 2>/dev/null || true
             grep -E '^(nameserver|domain|search)' /proc/net/pnp > /etc/resolv.conf 2>/dev/null || true
+
+            """
+        }
+        if config.sshEnabled {
+            // dropbear ships IN the image (a stale cached rootfs simply lacks
+            // it — gate on presence so boot never breaks; the app-side
+            // preflight reports the stale image with a re-pull action).
+            // -R: host keys generate on first connection into /etc/dropbear.
+            //     They persist in the writable rootfs but CHURN on re-pulls,
+            //     so the host side resets its known_hosts each boot
+            //     (SandboxSSH.resetKnownHosts — TOFU-per-boot).
+            // -s: key-only auth (authorized_keys is host-injected pre-boot).
+            // devpts: ssh sessions allocate ptys; devtmpfs does NOT auto-mount
+            // /dev/pts, and without it every session fails PTY allocation.
+            s += """
+            if command -v dropbear >/dev/null 2>&1; then
+              mkdir -p /dev/pts /etc/dropbear
+              mount -t devpts devpts /dev/pts 2>/dev/null
+              dropbear -R -s -p 22 2>/dev/null
+            fi
 
             """
         }

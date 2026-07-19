@@ -24,6 +24,11 @@ let package = Package(
         // Ogg/Opus voice notes, which AVFoundation can't read. Used only by
         // `VoicePreprocessor`; statically linked, so no dylib bundling/signing.
         .package(url: "https://github.com/element-hq/swift-ogg.git", from: "0.0.4"),
+        // Terminal emulator for the Sandbox window's embedded terminal
+        // (agent CLIs over ssh into the guest). Imported by exactly ONE file —
+        // EmbeddedTerminalView — so a libghostty-backed view can replace it
+        // wholesale later. Pinned to the 1.14 line.
+        .package(url: "https://github.com/migueldeicaza/SwiftTerm.git", "1.14.0" ..< "2.0.0"),
     ],
     targets: [
         .executableTarget(
@@ -32,6 +37,7 @@ let package = Package(
                 .product(name: "MCP", package: "swift-sdk"),
                 .product(name: "OrderedCollections", package: "swift-collections"),
                 .product(name: "SwiftOGG", package: "swift-ogg"),
+                .product(name: "SwiftTerm", package: "SwiftTerm"),
             ],
             path: "Sources/MLXServe",
             exclude: ["Resources"]

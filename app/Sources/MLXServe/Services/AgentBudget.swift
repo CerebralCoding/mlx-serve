@@ -55,14 +55,19 @@ enum AgentConfigs {
     /// pi `models.json` — written to the dedicated `~/.mlx-serve/pi/` config
     /// dir (selected via `PI_CODING_AGENT_DIR`), never the user's real
     /// `~/.pi/agent`, so their own providers are never overwritten.
-    static func piModelsJSON(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
+    ///
+    /// `apiKey` defaults to the placeholder the loopback-trusted server
+    /// ignores; the SANDBOXED session passes the real `--api-key` when one is
+    /// set — guest→host traffic arrives non-loopback (via the NAT gateway).
+    static func piModelsJSON(baseURL: String, model: String, budget: AgentBudget.Budget,
+                             apiKey: String = "mlx-serve") -> String {
         """
         {
           "providers": {
             "mlx": {
               "baseUrl": "\(baseURL)/v1",
               "api": "openai-completions",
-              "apiKey": "mlx-serve",
+              "apiKey": "\(apiKey)",
               "compat": {
                 "supportsDeveloperRole": false,
                 "supportsReasoningEffort": false,

@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **Run coding agents inside the sandbox.** The Sandbox window now has a real terminal: open a pi or hermes session — or a plain shell — that runs entirely inside the isolated Linux VM and talks to your local model; nothing runs on your Mac. First run installs the CLI in-guest with progress streaming right into the terminal, and a copyable ssh command opens the same sandbox from your own terminal app. While a session is live the VM is pinned: switching the chat workspace asks you to close the session instead of killing the VM under it. Needs guest networking and a server reachable from the VM (bound to 0.0.0.0); an older cached sandbox image is detected and re-pulled in one click.
+
 ## v26.7.10 — Share models across your Macs
 
 - **LAN model sharing.** Flip one switch and every Mac on your network can use the models this Mac hosts — chat, and image / speech / music / video / 3D generation alike. Zero setup: hosts find each other automatically over Bonjour, shared models appear in every model picker as "model · peer", and requests stream to the hosting Mac. The MacBook in the kitchen can chat on the Studio's 27B; Claude Code pointed at localhost picks up network models too. Everything is off by default, you choose exactly which models to share, and only inference is ever exposed — model management, metrics, and the status page stay private to each Mac. Heads-up shown in Settings: prompts sent to a shared model are visible to the Mac that runs it.
