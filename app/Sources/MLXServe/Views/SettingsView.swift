@@ -2231,28 +2231,15 @@ private struct UpdatesSectionContent: View {
     }
 
     /// Friendly display name for a raw `--version` component name.
+    // Label + explainer text live on EngineVersions (pure, tested —
+    // EngineVersionsTests) so the display mapping and the parse contract
+    // stay in one place.
     private static func engineLabel(_ name: String) -> String {
-        switch name {
-        case "mlx": return "MLX"
-        case "mlx-c": return "mlx-c"
-        case "ggml": return "ggml"
-        case "llama.cpp": return "llama.cpp"
-        case "gguf": return "GGUF format"
-        case "ds4": return "ds4"
-        default: return name
-        }
+        EngineVersions.displayLabel(name)
     }
 
     private static func engineExplainer(_ name: String) -> String {
-        switch name {
-        case "mlx": return "Apple's MLX array framework — the native engine for `.safetensors` models."
-        case "mlx-c": return "The C bindings the server links MLX through."
-        case "ggml": return "The tensor library under the llama.cpp GGUF engine (with its short commit)."
-        case "llama.cpp": return "Pinned llama.cpp release serving `.gguf` models. Ships inside the app download."
-        case "gguf": return "GGUF file-format version the engine reads."
-        case "ds4": return "Embedded ds4 engine (DeepSeek-V4-Flash), pinned commit."
-        default: return ""
-        }
+        EngineVersions.explainer(name)
     }
 
     private var statusText: String {

@@ -181,13 +181,10 @@ Any quantized MLX model using one of the above architectures works natively. Any
 
 ## Prerequisites
 
-- macOS 26+ with Apple Silicon (M1/M2/M3/M4/M5) — the released app bundles MLX dylibs built for macOS 26; older macOS needs a from-source build against a local mlx
+- macOS 26.2+ with Apple Silicon (M1/M2/M3/M4/M5) — the bundled MLX is built at deployment target 26.2 so the M5 neural-accelerator (NAX) kernels ship enabled
 - [Zig 0.16+](https://ziglang.org/download/) *(only if building from source)*
-- mlx-c and libwebp *(only if building from source)*:
-
-```bash
-brew install mlx-c webp
-```
+- libwebp *(only if building from source)*: `brew install webp`
+- Xcode 26.2+ with the Metal Toolchain component *(only if building from source — mlx + mlx-c are pinned submodules compiled by `scripts/build-mlx.sh`, not brew packages, so the NAX kernels the brew bottle silently omits are included)*
 
 ## Quick Start
 
@@ -195,8 +192,9 @@ brew install mlx-c webp
 
 ```bash
 git clone --recurse-submodules https://github.com/ddalcu/mlx-serve && cd mlx-serve
-git submodule update --init    # only if you cloned WITHOUT --recurse-submodules (lib/ds4, the DeepSeek V4 engine)
+git submodule update --init    # only if you cloned WITHOUT --recurse-submodules (lib/ds4 + lib/mlx-src + lib/mlxc-src)
 ./scripts/fetch-llama.sh       # once — stages the pinned llama.cpp dylib (git-ignored, fetched not tracked)
+./scripts/build-mlx.sh         # once per pin bump — builds mlx + mlx-c from the submodules, NAX kernels asserted
 zig build -Doptimize=ReleaseFast
 ```
 

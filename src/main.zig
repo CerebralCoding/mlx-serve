@@ -392,6 +392,7 @@ pub fn main(init: std.process.Init) !void {
                 .app = VERSION,
                 .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
                 .mlx_c = build_options.mlx_c_version,
+                .nax = transformer_mod.naxStatus(),
                 .ggml = std.mem.span(ggml_version()),
                 .ggml_commit = std.mem.span(ggml_commit()),
                 .llama_tag = build_options.llama_tag,

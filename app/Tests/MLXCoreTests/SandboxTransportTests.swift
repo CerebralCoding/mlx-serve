@@ -44,6 +44,42 @@ final class SandboxTransportTests: XCTestCase {
         XCTAssertFalse(AgentSandbox.kernelHasVirtiofsSupport(kernel(withVsock: true, withVirtiofs: false)))
     }
 
+    // MARK: fallback reason names the missing half
+
+    /// Issue #89: every Developer ID build shipped WITHOUT the vz-agent in
+    /// `Resources/guest/` (build.sh staged it only for MAS; the release
+    /// workflow never built it), so sandboxed MCP always failed with a
+    /// message blaming "kernel + vz-agent" collectively. The two halves fail
+    /// independently and send the user to different fixes — the error must
+    /// name the one that is actually missing.
+    func testFallbackReasonNamesTheMissingAgent() {
+        let reason = AgentSandbox.transportFallbackReason(kernelData: kernel(withVsock: true),
+                                                          agentBinary: nil)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.contains("vz-agent"), reason!)
+        XCTAssertFalse(reason!.contains("kernel predates"), reason!)
+    }
+
+    func testFallbackReasonNamesTheStaleKernel() {
+        let reason = AgentSandbox.transportFallbackReason(kernelData: kernel(withVsock: false),
+                                                          agentBinary: "/tmp/vz-agent")
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.contains("kernel predates"), reason!)
+        XCTAssertFalse(reason!.contains("missing from the app bundle"), reason!)
+    }
+
+    func testFallbackReasonIsNilWhenVsockIsAvailable() {
+        XCTAssertNil(AgentSandbox.transportFallbackReason(kernelData: kernel(withVsock: true),
+                                                          agentBinary: "/tmp/vz-agent"))
+    }
+
+    func testFallbackReasonNamesBothWhenBothAreMissing() {
+        let reason = AgentSandbox.transportFallbackReason(kernelData: nil, agentBinary: nil)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.contains("vz-agent"), reason!)
+        XCTAssertTrue(reason!.contains("kernel"), reason!)
+    }
+
     // MARK: kernel cache is tag-versioned
 
     /// Bumping the kernel must invalidate every older cache by construction —

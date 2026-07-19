@@ -12,12 +12,15 @@ comptime {
 }
 
 pub fn build(b: *std.Build) void {
-    // Pin LC_BUILD_VERSION minos to macOS 14 (Sonoma) so binaries built on newer
-    // runners (macos-26 in CI) still load on Sonoma. dyld refuses any image whose
-    // minos is newer than the running OS.
+    // Pin LC_BUILD_VERSION minos to macOS 26.2 — the honest floor: the linked
+    // libmlx is built at deployment target 26.2 (NAX kernels, scripts/
+    // build-mlx.sh), so on older macOS the binary can't run anyway; failing at
+    // the binary with a clear dyld version error beats "loading" and dying on
+    // the dylib. Matches app LSMinimumSystemVersion + Package.swift. Guard:
+    // tests/test_mlx_staged_nax.sh (binary minos check).
     const target = b.standardTargetOptions(.{
         .default_target = .{
-            .os_version_min = .{ .semver = .{ .major = 14, .minor = 0, .patch = 0 } },
+            .os_version_min = .{ .semver = .{ .major = 26, .minor = 2, .patch = 0 } },
         },
     });
     const optimize = b.standardOptimizeOption(.{});
@@ -39,6 +42,7 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .macos) {
         verifyBrewDeps(b);
+        verifyMlxStage(b);
     }
 
     // Version from build option or default
@@ -49,12 +53,13 @@ pub fn build(b: *std.Build) void {
     // Engine-version pins surfaced by `mlx-serve --version` (the macOS app spawns
     // it and parses the output — see src/version.zig). These are the versions
     // that have NO runtime query API (MLX + ggml report themselves at runtime):
-    //   --mlx-c-version  Homebrew mlx-c version (build.sh: `brew list --versions mlx-c`)
+    //   --mlx-c-version  pinned mlx-c submodule version; defaults from the
+    //                    lib/mlx/.version stamp (written by scripts/build-mlx.sh)
     //   --ds4-commit     pinned ds4 submodule short commit (build.sh: `git rev-parse`)
     //   --llama-tag      llama.cpp release tag; defaults from lib/llama/.version
     //                    (written by scripts/fetch-llama.sh) so a plain dev build
     //                    still reports it. app/build.sh passes all three.
-    const mlx_c_version = b.option([]const u8, "mlx-c-version", "Homebrew mlx-c version") orelse "unknown";
+    const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
     const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
     const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse readLlamaTag(b) orelse "unknown";
 
@@ -119,10 +124,14 @@ pub fn build(b: *std.Build) void {
     // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
     addLlamaLib(b, mod);
 
-    // mlx-c include/lib paths (homebrew)
+    // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
+    // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
+    // enabled (the Homebrew bottle ships without them). MUST come before the
+    // /opt/homebrew lib path so a leftover brew mlx-c can never win the link.
+    addMlxLib(b, mod);
+    // webp include/lib paths (homebrew)
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    mod.linkSystemLibrary("mlxc", .{});
     mod.linkSystemLibrary("webp", .{});
 
     if (macos_sdk_frameworks) |fw_path| {
@@ -176,9 +185,9 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/ds4"));
     addLlamaLib(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
+    addMlxLib(b, test_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    test_mod.linkSystemLibrary("mlxc", .{});
     test_mod.linkSystemLibrary("webp", .{});
 
     if (macos_sdk_frameworks) |fw_path| {
@@ -436,14 +445,66 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     });
 }
 
+/// Link the self-built mlx + mlx-c staged in lib/mlx by scripts/build-mlx.sh
+/// (pinned submodules lib/mlx-src + lib/mlxc-src, deployment target 26.2 so
+/// MLX's NAX kernels are compiled in — the Homebrew bottle ships without them
+/// and hard-wires is_nax_available() false even on M5). Install names are
+/// @rpath/...; the build-tree rpath resolves them in dev, release.yml /
+/// app/build.sh rewrite to @executable_path and re-sign for bundles.
+/// Guard test: tests/test_mlx_staged_nax.sh.
+fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
+    module.addIncludePath(b.path("lib/mlx/include"));
+    module.addLibraryPath(b.path("lib/mlx/lib"));
+    // use_pkg_config = .no: a leftover Homebrew mlx-c must never hijack this
+    // link — we want exactly the staged NAX-enabled pair (same class as the
+    // llama.pc hijack above).
+    module.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
+    module.addRPath(b.path("lib/mlx/lib"));
+}
+
+/// Configure-time check that scripts/build-mlx.sh has staged the pinned
+/// mlx/mlx-c build. Mirrors verifyBrewDeps: fail loudly with the fix, never
+/// let the linker produce a confusing -lmlxc error (or silently pick up a
+/// leftover brew copy from /opt/homebrew/lib).
+fn verifyMlxStage(b: *std.Build) void {
+    const stage_ok = blk: {
+        b.build_root.handle.access(b.graph.io, "lib/mlx/lib/libmlxc.dylib", .{}) catch break :blk false;
+        b.build_root.handle.access(b.graph.io, "lib/mlx/lib/mlx.metallib", .{}) catch break :blk false;
+        b.build_root.handle.access(b.graph.io, "lib/mlx/.version", .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (!stage_ok) {
+        std.debug.print(
+            "\n[mlx-serve] lib/mlx is not staged (self-built mlx + mlx-c). Run:\n" ++
+                "  git submodule update --init lib/mlx-src lib/mlxc-src && ./scripts/build-mlx.sh\n\n",
+            .{},
+        );
+        std.process.exit(1);
+    }
+}
+
+/// The pinned mlx-c revision from lib/mlx/.version (written by
+/// scripts/build-mlx.sh as "mlx=<sha> mlxc=<sha> target=<ver>"), surfaced in
+/// `mlx-serve --version`. Returns null (→ "unknown") when not staged yet.
+fn readMlxcPin(b: *std.Build) ?[]const u8 {
+    const bytes = b.build_root.handle.readFileAlloc(
+        b.graph.io,
+        "lib/mlx/.version",
+        b.allocator,
+        .limited(256),
+    ) catch return null;
+    var it = std.mem.tokenizeScalar(u8, std.mem.trim(u8, bytes, " \t\r\n"), ' ');
+    while (it.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "mlxc=")) return b.dupe(tok["mlxc=".len..]);
+    }
+    return null;
+}
+
 const BrewDep = struct { name: []const u8, min: std.SemanticVersion };
 
 const required_brew_deps = [_]BrewDep{
-    // 0.32.0: the runtime the M5 NAX depth-8 profile was calibrated/measured on
-    // (integer stream; 117.6 vs 104.2 tok/s auto-8 vs cap-6). 0.31.2 runs it
-    // correctly but lands at the bottom of the measured gain range.
-    .{ .name = "mlx", .min = .{ .major = 0, .minor = 32, .patch = 0 } },
-    .{ .name = "mlx-c", .min = .{ .major = 0, .minor = 6, .patch = 0 } },
+    // mlx + mlx-c are NOT brew deps anymore: they are pinned submodules built
+    // by scripts/build-mlx.sh (see addMlxLib) so the NAX kernels ship enabled.
     .{ .name = "webp", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
 };
 
@@ -456,7 +517,7 @@ fn verifyBrewDeps(b: *std.Build) void {
             .inherit,
         ) catch {
             std.debug.print(
-                "\n[mlx-serve] missing Homebrew dependency '{s}' (>= {d}.{d}.{d}). Install with: brew install mlx-c webp\n\n",
+                "\n[mlx-serve] missing Homebrew dependency '{s}' (>= {d}.{d}.{d}). Install with: brew install webp\n\n",
                 .{ dep.name, dep.min.major, dep.min.minor, dep.min.patch },
             );
             std.process.exit(1);

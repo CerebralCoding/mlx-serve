@@ -61,6 +61,9 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// Transport the live guest booted with. Read by the MCP spawner and the
     /// background-process path; `.legacyConsole` until a guest exists.
     private(set) var transport: VzGuest.Transport = .legacyConsole
+    /// Why the live guest is NOT on vsock (nil when it is, or before boot) —
+    /// captured at boot so the MCP error can name the missing half.
+    private(set) var transportFallback: String?
     /// Sandbox Terminal working directory. Under vsock each command is its own
     /// shell, so an interactive `cd` is carried here instead of in the guest.
     private var terminalCwd = "/workspace"
@@ -351,6 +354,26 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         return .vsock
     }
 
+    /// Why `chooseTransport` fell back, for the MCP error message — the two
+    /// halves fail independently and send the user to different fixes (issue
+    /// #89: every Developer ID build shipped without the vz-agent, and the
+    /// collective "kernel + vz-agent" wording hid which half was broken).
+    /// nil = vsock is available, no fallback.
+    static func transportFallbackReason(kernelData: Data?, agentBinary: String?) -> String? {
+        var missing: [String] = []
+        if agentBinary == nil {
+            missing.append("the vz-agent guest binary is missing from the app bundle (reinstall or rebuild the app)")
+        }
+        if let kernelData {
+            if !kernelHasVsockSupport(kernelData) {
+                missing.append("the guest kernel predates \(kernelTag) (no vsock support — delete ~/.mlx-serve/sandbox to re-fetch)")
+            }
+        } else {
+            missing.append("the guest kernel could not be read")
+        }
+        return missing.isEmpty ? nil : missing.joined(separator: "; ")
+    }
+
     // MARK: Execution
 
     struct SandboxError: LocalizedError {
@@ -526,9 +549,9 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                 do {
                     let (g, root) = try self.ensureBooted(image: image, workingDirectory: hostCwd)
                     guard self.transport == .vsock else {
+                        let why = self.transportFallback ?? "the guest booted the legacy console shell"
                         throw SandboxError(message:
-                            "MCP servers need the vsock guest transport (kernel \(Self.kernelTag) + vz-agent); "
-                            + "the guest booted the legacy console shell")
+                            "MCP servers need the vsock guest transport: \(why)")
                     }
                     // Only the shared folder exists in the guest; anything else
                     // maps to /workspace rather than silently landing elsewhere.
@@ -611,6 +634,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         cfg.transport = Self.chooseTransport(kernelData: kernelData, agentBinary: agentBinary)
         cfg.agentBinaryPath = agentBinary
         transport = cfg.transport
+        transportFallback = Self.transportFallbackReason(kernelData: kernelData, agentBinary: agentBinary)
 
         // The App Store build's guest is bundled: there is no download path to a
         // different kernel or a missing agent, so a legacy fallback there means

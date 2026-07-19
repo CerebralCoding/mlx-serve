@@ -64,10 +64,16 @@ cd "$PROJECT_ROOT"
 # Stage libllama (llama.cpp GGUF engine) before the Zig build links against it.
 echo "→ Fetching libllama..."
 bash "$PROJECT_ROOT/scripts/fetch-llama.sh"
+# Build the pinned mlx + mlx-c submodules into lib/mlx (NAX kernels enabled —
+# the brew bottle ships without them). Idempotent: no-op when the stage
+# matches the pinned SHAs. Needs full Xcode (Metal Toolchain), so it runs
+# BEFORE the CLT-forced zig build below.
+echo "→ Building mlx + mlx-c (pinned submodules)..."
+bash "$PROJECT_ROOT/scripts/build-mlx.sh"
 # Engine-version pins surfaced by `mlx-serve --version` (parsed by the app so
 # Settings can show engine versions without booting the server — src/version.zig).
 # MLX + ggml self-report at runtime; these three have no runtime API:
-MLXC_VERSION="$(brew list --versions mlx-c 2>/dev/null | awk '{print $2}')"
+MLXC_VERSION="$(git -C "$PROJECT_ROOT/lib/mlxc-src" describe --tags --always 2>/dev/null)"
 DS4_COMMIT="$(git -C "$PROJECT_ROOT/lib/ds4" rev-parse --short HEAD 2>/dev/null)"
 LLAMA_TAG="$(cat "$PROJECT_ROOT/lib/llama/.version" 2>/dev/null)"
 DEVELOPER_DIR=/Library/Developer/CommandLineTools zig build -Doptimize=ReleaseFast -Dversion="$MLX_SERVE_VERSION" \
@@ -117,13 +123,23 @@ cp "$PROJECT_ROOT/$MLX_BIN" "$CONTENTS/MacOS/mlx-serve"
 # Info.plist (the build-mode variant, already version-stamped)
 cp "$INFO_PLIST_SRC" "$CONTENTS/Info.plist"
 
+# The vz-agent guest binary ships in EVERY build variant (issue #89: it was
+# MAS-only, so Developer ID / ad-hoc builds always booted the legacy console
+# shell and sandboxed MCP could never connect). Only the kernel + rootfs stay
+# download-provisioned outside MAS.
+echo "→ Staging vz-agent guest binary..."
+mkdir -p "$CONTENTS/Resources/guest"
+cp "$PROJECT_ROOT/zig-out/guest/vz-agent" "$CONTENTS/Resources/guest/vz-agent"
+if [ ! -f "$CONTENTS/Resources/guest/vz-agent" ]; then
+    echo "ERROR: vz-agent missing from the bundle — sandboxed MCP would be broken (issue #89)"
+    exit 1
+fi
+
 if [ "$MAS" = "1" ]; then
-    echo "→ Staging bundled guest (kernel + rootfs + vz-agent)..."
+    echo "→ Staging bundled guest (kernel + rootfs)..."
     bash "$PROJECT_ROOT/scripts/fetch-guest-rootfs.sh"
-    mkdir -p "$CONTENTS/Resources/guest"
     cp "$PROJECT_ROOT/lib/guest/kernel"        "$CONTENTS/Resources/guest/kernel"
     cp "$PROJECT_ROOT/lib/guest/rootfs.tar.gz" "$CONTENTS/Resources/guest/rootfs.tar.gz"
-    cp "$PROJECT_ROOT/zig-out/guest/vz-agent"  "$CONTENTS/Resources/guest/vz-agent"
     cp "$SCRIPT_DIR/PrivacyInfo.xcprivacy"     "$CONTENTS/Resources/PrivacyInfo.xcprivacy"
     # The embedded provisioning profile is required for a Mac App Store binary.
     if [ -n "${MAS_PROVISION_PROFILE:-}" ] && [ -f "$MAS_PROVISION_PROFILE" ]; then
@@ -138,38 +154,20 @@ if [ -f "$ICON_DIR/AppIcon.icns" ]; then
     cp "$ICON_DIR/AppIcon.icns" "$CONTENTS/Resources/"
 fi
 
-# Bundle dylibs (prefer /opt/homebrew/lib for source-built versions, then Homebrew Cellar)
-if [ -f "/opt/homebrew/lib/libmlxc.dylib" ]; then
-    MLXC_LIB="/opt/homebrew/lib"
-else
-    MLXC_LIB=$(brew --prefix mlx-c 2>/dev/null || echo "/opt/homebrew/opt/mlx-c")/lib
+# Bundle dylibs: the self-built mlx + mlx-c staged by scripts/build-mlx.sh —
+# libmlxc + libmlx + @rpath sibling deps like libjaccl (missing siblings cause
+# a "Library not loaded" dyld error at startup) + the NAX-enabled metallib.
+MLX_STAGE_LIB="$PROJECT_ROOT/lib/mlx/lib"
+if [ ! -f "$MLX_STAGE_LIB/libmlxc.dylib" ]; then
+    echo "ERROR: lib/mlx not staged — run scripts/build-mlx.sh"
+    exit 1
 fi
-if [ -f "/opt/homebrew/lib/libmlx.dylib" ]; then
-    MLX_LIB="/opt/homebrew/lib"
-else
-    MLX_LIB=$(brew --prefix mlx 2>/dev/null || echo "/opt/homebrew/opt/mlx")/lib
-fi
-
-for lib in libmlxc.dylib; do
-    if [ -f "$MLXC_LIB/$lib" ]; then
-        cp "$MLXC_LIB/$lib" "$CONTENTS/Frameworks/"
-    fi
-done
-
-# Copy ALL dylibs from mlx's lib dir, not just libmlx.dylib — newer mlx (0.31.2+) introduced
-# sibling deps like libjaccl.dylib referenced via @rpath. Missing them causes a "Library not loaded"
-# dyld error at startup. We deliberately use the keg-only path (`brew --prefix mlx`/lib) instead
-# of `$MLX_LIB` because the latter can fall back to `/opt/homebrew/lib` (the symlink dir for ALL
-# Homebrew libs), which would copy thousands of unrelated dylibs.
-MLX_KEG_LIB="$(brew --prefix mlx 2>/dev/null || echo "/opt/homebrew/opt/mlx")/lib"
-for f in "$MLX_KEG_LIB"/*.dylib; do
+for f in "$MLX_STAGE_LIB"/*.dylib; do
     [ -f "$f" ] && cp "$f" "$CONTENTS/Frameworks/"
 done
 
-# Metal shader library
-if [ -f "$MLX_LIB/mlx.metallib" ]; then
-    cp "$MLX_LIB/mlx.metallib" "$CONTENTS/Frameworks/"
-fi
+# Metal shader library (NAX kernels included — guarded by tests/test_mlx_staged_nax.sh)
+cp "$MLX_STAGE_LIB/mlx.metallib" "$CONTENTS/Frameworks/"
 
 # libwebp + libsharpyuv for WebP image decoding in vision pipeline
 WEBP_LIB="$(brew --prefix webp 2>/dev/null || echo "/opt/homebrew/opt/webp")/lib"

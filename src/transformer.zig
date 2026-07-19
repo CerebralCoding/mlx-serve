@@ -711,6 +711,30 @@ pub fn naxAvailableFrom(force_fallback: bool, arch: []const u8, os_ver: []const 
     return macosVersionAtLeast(os_ver, 26, 2);
 }
 
+/// Human-readable NAX status for `--version` / the app's Settings ("nax"
+/// line, first token on/off, remainder the reason). Hardware + OS is the
+/// whole story for OUR binaries: the bundled MLX always ships the NAX
+/// kernels (build-mlx.sh + tests/test_mlx_staged_nax.sh assert them), so
+/// this mirrors MLX's stock-op is_nax_available() gate (GPU gen >= 17,
+/// macOS >= 26.2 — that symbol is not exported, hence the mirror).
+/// Deliberately ignores the verifyQmm-lane QA env switches: those scope
+/// our custom kernel lane, not MLX's stock dispatch.
+pub fn naxStatusFrom(arch: []const u8, os_ver: []const u8) []const u8 {
+    if (!naxArchIsG17(arch)) return "off (requires M5-class GPU)";
+    if (!macosVersionAtLeast(os_ver, 26, 2)) return "off (requires macOS 26.2+)";
+    return "on (M5 neural accelerators)";
+}
+
+/// naxStatusFrom over the real device: mlx device-info arch + sysctl OS
+/// version (same sources as the verifyQmm probe).
+pub fn naxStatus() []const u8 {
+    var arch_buf: [128]u8 = undefined;
+    const arch = gpuArchitecture(&arch_buf) orelse "";
+    var ver_buf: [64]u8 = undefined;
+    const ver = macosProductVersion(&ver_buf) orelse "";
+    return naxStatusFrom(arch, ver);
+}
+
 extern "c" fn sysctlbyname(name: [*:0]const u8, oldp: ?*anyopaque, oldlenp: ?*usize, newp: ?*const anyopaque, newlen: usize) c_int;
 
 /// "kern.osproductversion" → "26.4"-style string (the sysctl mirror of
@@ -12959,6 +12983,20 @@ test "NAX availability probe: G17 prefix + macOS 26.2 floor + fallback rehearsal
     // MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK=1 QA rehearsal: an M5 pretends the
     // units are absent so the exact M1-M4 plain-SIMD path runs there.
     try testing.expect(!naxAvailableFrom(true, "applegpu_g17d", "26.4"));
+}
+
+test "naxStatusFrom: on for G17 + 26.2, off names the missing leg (--version / Settings display)" {
+    // Hardware + OS both satisfied → active. Kernels-present is a build-time
+    // invariant for our binaries (build-mlx.sh + tests/test_mlx_staged_nax.sh),
+    // so hardware capability == MLX's stock-op is_nax_available() gate.
+    try testing.expectEqualStrings("on (M5 neural accelerators)", naxStatusFrom("applegpu_g17s", "26.2"));
+    try testing.expectEqualStrings("on (M5 neural accelerators)", naxStatusFrom("applegpu_g17d", "27.0"));
+    // Pre-M5 GPU: the GPU is the blocker regardless of OS.
+    try testing.expectEqualStrings("off (requires M5-class GPU)", naxStatusFrom("applegpu_g16s", "26.4"));
+    try testing.expectEqualStrings("off (requires M5-class GPU)", naxStatusFrom("", "26.4"));
+    // M5 on an old OS: the OS is the blocker (bundle min is 26.2 anyway, but
+    // a dev build can run anywhere).
+    try testing.expectEqualStrings("off (requires macOS 26.2+)", naxStatusFrom("applegpu_g17s", "26.1"));
 }
 
 test "verifyQmmNaxAvailable: false on every non-G17 device (kernel is never built here)" {

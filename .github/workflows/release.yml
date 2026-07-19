@@ -41,6 +41,33 @@ jobs:
       - name: Install dependencies
         run: brew bundle install --file=Brewfile
 
+      # mlx + mlx-c are pinned submodules built from source with deployment
+      # target 26.2 so MLX's NAX (M5 neural-accelerator) kernels are compiled
+      # in — the Homebrew bottle is built at 26.0 and ships with them silently
+      # disabled (MLX_METAL_NO_NAX). scripts/build-mlx.sh asserts the built
+      # metallib actually contains *_nax kernels. Compiling needs no M5: the
+      # runtime probe (GPU gen >= 17) gates dispatch on user machines.
+      - name: Compute mlx pin cache key
+        id: mlxpin
+        run: |
+          echo "mlx=$(git -C lib/mlx-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "mlxc=$(git -C lib/mlxc-src rev-parse --short=12 HEAD)" >> "$GITHUB_OUTPUT"
+          echo "xcode=$(xcodebuild -version | tr ' \n' '--')" >> "$GITHUB_OUTPUT"
+
+      - name: Cache self-built mlx + mlx-c
+        uses: actions/cache@v4
+        with:
+          path: lib/mlx
+          key: mlx-stage-${{ steps.mlxpin.outputs.mlx }}-${{ steps.mlxpin.outputs.mlxc }}-${{ steps.mlxpin.outputs.xcode }}
+
+      - name: Build mlx + mlx-c (NAX-enabled)
+        run: |
+          # Xcode 26 ships the Metal compiler as a separate component; fetch it
+          # if the image doesn't have it (build-mlx.sh hard-fails without it).
+          xcrun -sdk macosx metal --version >/dev/null 2>&1 \
+            || sudo xcodebuild -downloadComponent MetalToolchain
+          bash scripts/build-mlx.sh
+
       - name: Import signing certificate
         env:
           APPLE_CERTIFICATE_BASE64: ${{ secrets.APPLE_CERTIFICATE_BASE64 }}
@@ -95,6 +122,13 @@ jobs:
       - name: Build mlx-serve (Zig)
         run: zig build -Doptimize=ReleaseFast -Dversion=${{ steps.version.outputs.version }}
 
+      # The Agent Sandbox's guest-side binary (static aarch64-linux ELF). It
+      # rides inside the .app at Resources/guest/vz-agent — without it the
+      # guest boots the legacy console shell and sandboxed MCP can never
+      # connect (issue #89: the release bundle shipped without it).
+      - name: Build vz-agent guest binary
+        run: zig build vz-agent
+
       - name: Smoke test mlx-serve binary
         run: |
           ./zig-out/bin/mlx-serve --version
@@ -125,12 +159,11 @@ jobs:
           mkdir -p "$STAGING/lib"
 
           cp zig-out/bin/mlx-serve "$STAGING/"
-          cp /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib "$STAGING/lib/"
-          # Copy ALL dylibs from mlx's lib dir, not just libmlx.dylib — newer mlx (0.31.2+)
-          # introduced sibling deps like libjaccl.dylib referenced via @rpath. Missing them
-          # causes a "no such file" dyld error at startup on the user's machine.
-          cp /opt/homebrew/opt/mlx/lib/*.dylib "$STAGING/lib/" 2>/dev/null || true
-          cp /opt/homebrew/opt/mlx/lib/mlx.metallib "$STAGING/lib/"
+          # Self-built mlx + mlx-c (scripts/build-mlx.sh): libmlxc + libmlx +
+          # sibling deps like libjaccl (@rpath-referenced — missing them causes
+          # a "no such file" dyld error at startup) + the NAX-enabled metallib.
+          cp lib/mlx/lib/*.dylib "$STAGING/lib/"
+          cp lib/mlx/lib/mlx.metallib "$STAGING/lib/"
 
           # WebP libraries for vision pipeline
           WEBP_LIB="$(brew --prefix webp)/lib"
@@ -142,7 +175,7 @@ jobs:
           [ -f "lib/llama/lib/libllama.dylib" ] && cp "lib/llama/lib/libllama.dylib" "$STAGING/lib/"
 
           install_name_tool -change \
-            /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib \
+            @rpath/libmlxc.dylib \
             @executable_path/lib/libmlxc.dylib \
             "$STAGING/mlx-serve"
 
@@ -152,7 +185,7 @@ jobs:
             "$STAGING/mlx-serve" 2>/dev/null || true
 
           install_name_tool -change \
-            /opt/homebrew/opt/mlx/lib/libmlx.dylib \
+            @rpath/libmlx.dylib \
             @loader_path/libmlx.dylib \
             "$STAGING/lib/libmlxc.dylib"
 
@@ -201,6 +234,16 @@ jobs:
           # App resources (tray icon etc.)
           cp -R app/Sources/MLXServe/Resources/* "$CONTENTS/Resources/" 2>/dev/null || true
 
+          # vz-agent guest binary — required in EVERY build variant or the
+          # sandbox boots the legacy console shell and MCP servers can never
+          # connect (issue #89). Mirrors app/build.sh.
+          mkdir -p "$CONTENTS/Resources/guest"
+          cp zig-out/guest/vz-agent "$CONTENTS/Resources/guest/vz-agent"
+          if [ ! -f "$CONTENTS/Resources/guest/vz-agent" ]; then
+            echo "::error::vz-agent missing from the app bundle — sandboxed MCP would be broken (issue #89)"
+            exit 1
+          fi
+
           # Info.plist
           cp app/Info.plist "$CONTENTS/"
 
@@ -218,12 +261,12 @@ jobs:
             rm -rf "$ICON_DIR"
           fi
 
-          # Bundled libraries
-          cp /opt/homebrew/opt/mlx-c/lib/libmlxc.dylib "$CONTENTS/Frameworks/"
-          # Copy ALL dylibs from mlx's lib dir (libmlx.dylib + sibling deps like libjaccl.dylib
-          # introduced in mlx 0.31.2). Missing siblings cause a dyld "no such file" error at startup.
-          cp /opt/homebrew/opt/mlx/lib/*.dylib "$CONTENTS/Frameworks/" 2>/dev/null || true
-          cp /opt/homebrew/opt/mlx/lib/mlx.metallib "$CONTENTS/Frameworks/"
+          # Bundled libraries: self-built mlx + mlx-c (scripts/build-mlx.sh) —
+          # libmlxc + libmlx + sibling deps like libjaccl (@rpath-referenced;
+          # missing siblings cause a dyld "no such file" error at startup) +
+          # the NAX-enabled metallib.
+          cp lib/mlx/lib/*.dylib "$CONTENTS/Frameworks/"
+          cp lib/mlx/lib/mlx.metallib "$CONTENTS/Frameworks/"
 
           # WebP libraries for vision pipeline
           WEBP_LIB="$(brew --prefix webp)/lib"

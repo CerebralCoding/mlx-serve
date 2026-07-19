@@ -3,7 +3,9 @@ import PackageDescription
 
 let package = Package(
     name: "MLXCore",
-    platforms: [.macOS(.v14)],
+    // 26.2 floor matches the bundled libmlx's deployment target (NAX-enabled
+    // self-built mlx — scripts/build-mlx.sh) and Info.plist LSMinimumSystemVersion.
+    platforms: [.macOS("26.2")],
     dependencies: [
         // 0.12.x needs Swift 6.2+ (uses 6.2-only `withThrowingTaskGroup { }`
         // syntax) — fine everywhere since CI moved to the macos-26 runner

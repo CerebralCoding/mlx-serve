@@ -290,9 +290,29 @@ const BrowseEvent = struct { name: [:0]u8, domain: [:0]u8 };
 
 const Known = struct { domain: [:0]u8, fails: u8 = 0 };
 /// Consecutive failed resolves before a service is forgotten (~4 min at the
-/// 10 s refresh cadence) — the peer table itself is cleaned on the FIRST
-/// failure; this only bounds quiet background retries.
+/// 10 s refresh cadence). Until then the service keeps retrying quietly.
 const KNOWN_MAX_FAILS: u8 = 24;
+/// Consecutive failed resolves before an INSTALLED peer leaves the table
+/// (~20-30 s at the refresh cadence). One transient dns_sd hiccup — a busy
+/// mDNSResponder, an interface appearing/vanishing (VM or docker bridge), a
+/// 3 s resolve timeout while the peer's GPU is pinned by a load — must not
+/// evict a live peer: its cached ip4:port still tunnels, and eviction turns
+/// the next chat into a "LAN peer for this model is offline" 404 (live
+/// 2026-07-19: chats through a proxy alternated success/404 while the peer
+/// stayed up and advertising the whole time). A genuinely-gone peer still
+/// leaves within PEER_DROP_FAILS refreshes; the tunnel answers 502 honestly
+/// if it is picked during the grace window.
+const PEER_DROP_FAILS: u8 = 3;
+
+const KnownFailureAction = enum { retain, drop_peer, drop_and_forget };
+
+/// Pure policy: what a known service's consecutive-failure count (AFTER
+/// incrementing for the current failure) does to the peer table + registry.
+fn knownFailureAction(fails: u8) KnownFailureAction {
+    if (fails >= KNOWN_MAX_FAILS) return .drop_and_forget;
+    if (fails >= PEER_DROP_FAILS) return .drop_peer;
+    return .retain;
+}
 
 pub const Options = struct {
     port: u16,
@@ -362,7 +382,10 @@ pub const Lan = struct {
                 l.startAdvertise();
             }
         }
-        if (l.reg_ref != null or l.discover)
+        // Spawn whenever sharing was REQUESTED (not only when the initial
+        // registration succeeded) — the browser thread's revive loop can
+        // heal a registration that failed at boot or died with the daemon.
+        if (l.share != null or l.discover)
             l.thread = try std.Thread.spawn(.{}, threadMain, .{l});
         return l;
     }
@@ -496,9 +519,11 @@ pub const Lan = struct {
     const Attempt = enum { installed, self_ad, failed };
 
     /// Re-resolve + re-fetch one service. Serves both browse ADDs and the
-    /// periodic refresh; a REMOVE event also routes here — only a service
-    /// that no longer resolves is dropped from the PEER table (instantly,
-    /// so stale entries never linger), while `known` keeps quietly retrying.
+    /// periodic refresh; a REMOVE event also routes here. A failure NEVER
+    /// removes the peer directly — `attemptKnown` owns the removal decision
+    /// (grace of PEER_DROP_FAILS consecutive failures), so one transient
+    /// dns_sd hiccup can't evict a live peer whose cached ip4:port still
+    /// tunnels fine.
     fn resolveAndInstall(l: *Lan, service_name: [:0]const u8, domain: [:0]const u8) Attempt {
         var disp_buf: [64]u8 = undefined;
         const display = sanitizeName(&disp_buf, service_name);
@@ -510,7 +535,6 @@ pub const Lan = struct {
         DNSServiceRefDeallocate(ref);
         if (!resolved) {
             log.debug("[lan] resolve timed out for \"{s}\"\n", .{display});
-            l.removePeer(display);
             return .failed;
         }
         if (std.mem.eql(u8, res.token[0..res.token_len], &l.token_hex)) return .self_ad;
@@ -523,7 +547,6 @@ pub const Lan = struct {
         DNSServiceRefDeallocate(aref);
         if (!addressed or addr.count == 0) {
             log.debug("[lan] no IPv4 for \"{s}\" host \"{s}\"\n", .{ display, res.host[0..res.host_len] });
-            l.removePeer(display);
             return .failed;
         }
 
@@ -551,10 +574,7 @@ pub const Lan = struct {
             reachable = true;
             break;
         }
-        if (!reachable) {
-            l.removePeer(display);
-            return .failed;
-        }
+        if (!reachable) return .failed;
         const fetched = models orelse {
             l.installPeer(display, ip4, res.port, &.{});
             return .installed;
@@ -572,9 +592,11 @@ pub const Lan = struct {
         return .installed;
     }
 
-    /// Attempt one known service and keep its failure bookkeeping. Forgetting
-    /// happens here ONLY (self-ads immediately; persistent failures after
-    /// KNOWN_MAX_FAILS) — a fresh browse ADD always re-registers.
+    /// Attempt one known service and keep its failure bookkeeping. Peer
+    /// removal AND forgetting both happen here ONLY (self-ads forget
+    /// immediately; an installed peer survives PEER_DROP_FAILS-1 transient
+    /// failures; KNOWN_MAX_FAILS forgets the service) — a fresh browse ADD
+    /// always re-registers.
     fn attemptKnown(l: *Lan, name: []const u8) void {
         const entry = l.known.getPtr(name) orelse return;
         const name_z = l.alloc.dupeZ(u8, name) catch return;
@@ -583,11 +605,18 @@ pub const Lan = struct {
             .installed => entry.fails = 0,
             .self_ad => l.forgetKnown(name),
             .failed => {
-                entry.fails += 1;
-                if (entry.fails >= KNOWN_MAX_FAILS) {
-                    var disp_buf: [64]u8 = undefined;
-                    l.removePeer(sanitizeName(&disp_buf, name));
-                    l.forgetKnown(name);
+                entry.fails +|= 1;
+                switch (knownFailureAction(entry.fails)) {
+                    .retain => {},
+                    .drop_peer => {
+                        var disp_buf: [64]u8 = undefined;
+                        l.removePeer(sanitizeName(&disp_buf, name));
+                    },
+                    .drop_and_forget => {
+                        var disp_buf: [64]u8 = undefined;
+                        l.removePeer(sanitizeName(&disp_buf, name));
+                        l.forgetKnown(name);
+                    },
                 }
             },
         }
@@ -722,20 +751,39 @@ fn onBrowse(ref: DNSServiceRef, flags: u32, if_idx: u32, err: i32, name: ?[*:0]c
     };
 }
 
+/// How often a dead dns_sd ref (browse or advertise) is re-created. Also the
+/// retry cadence while mDNSResponder itself is down.
+const REVIVE_INTERVAL_MS: i64 = 5_000;
+
 fn threadMain(l: *Lan) void {
     var browse_ref: DNSServiceRef = null;
-    if (l.discover) {
-        if (DNSServiceBrowse(&browse_ref, 0, 0, SERVICE_TYPE, null, onBrowse, l) != 0) {
-            log.warn("[lan] Bonjour browse failed to start; discovery disabled\n", .{});
-            browse_ref = null;
-        } else {
-            log.info("[lan] discovering peers ({s})\n", .{SERVICE_TYPE});
-        }
-    }
     defer if (browse_ref != null) DNSServiceRefDeallocate(browse_ref);
 
     var last_refresh = monoMs();
+    // Dead refs are REVIVED, never left null forever: an mDNSResponder
+    // restart (macOS update, daemon crash) or a sleep/wake cycle can
+    // invalidate every dns_sd connection at once, and a permanently-dead
+    // browse leaves this server blind to peers that are up and advertising
+    // — every remote chat then 404s "peer offline" until a manual restart.
+    // `revive_at = 0` makes the first loop iteration do the initial starts.
+    var revive_at: i64 = 0;
     while (!l.stop_flag.load(.acquire)) {
+        const now_ms = monoMs();
+        if (now_ms >= revive_at) {
+            revive_at = now_ms + REVIVE_INTERVAL_MS;
+            if (l.discover and browse_ref == null) {
+                if (DNSServiceBrowse(&browse_ref, 0, 0, SERVICE_TYPE, null, onBrowse, l) != 0) {
+                    log.warn("[lan] Bonjour browse failed to start; retrying in {d} s\n", .{@divTrunc(REVIVE_INTERVAL_MS, 1000)});
+                    browse_ref = null;
+                } else {
+                    log.info("[lan] discovering peers ({s})\n", .{SERVICE_TYPE});
+                }
+            }
+            // Sharing was requested but the registration is gone (failed at
+            // boot, or the daemon dropped it) — re-advertise, or peers see
+            // this host vanish while it keeps serving.
+            if (l.share != null and l.reg_ref == null) l.startAdvertise();
+        }
         var fds: [2]std.posix.pollfd = undefined;
         var refs: [2]DNSServiceRef = undefined;
         var n: usize = 0;
@@ -754,11 +802,22 @@ fn threadMain(l: *Lan) void {
         }
         const ready = std.posix.poll(fds[0..n], 1000) catch break;
         if (ready > 0) for (fds[0..n], refs[0..n]) |fd, r| {
-            if (fd.revents & std.posix.POLL.IN != 0) {
-                if (DNSServiceProcessResult(r) != 0 and r == browse_ref) {
-                    DNSServiceRefDeallocate(browse_ref);
-                    browse_ref = null;
-                }
+            if (fd.revents == 0) continue;
+            // IN with a clean ProcessResult = normal traffic. Anything else
+            // (ProcessResult error, or HUP/ERR/NVAL with no data) means the
+            // daemon dropped this connection — tear the ref down so the
+            // revive above re-creates it, instead of hot-spinning on a dead
+            // fd or silently losing discovery/advertising.
+            const alive = fd.revents & std.posix.POLL.IN != 0 and DNSServiceProcessResult(r) == 0;
+            if (alive) continue;
+            if (r == browse_ref) {
+                log.warn("[lan] dns_sd browse connection lost; will re-browse\n", .{});
+                DNSServiceRefDeallocate(browse_ref);
+                browse_ref = null;
+            } else if (r == l.reg_ref) {
+                log.warn("[lan] dns_sd advertise connection lost; will re-register\n", .{});
+                DNSServiceRefDeallocate(l.reg_ref);
+                l.reg_ref = null;
             }
         };
         // Drain browse events (appended by onBrowse inside ProcessResult —
@@ -941,6 +1000,24 @@ test "lan: splitRemoteId splits on the LAST @ and rejects degenerate forms" {
     try t.expect(splitRemoteId("@peer") == null);
     try t.expect(splitRemoteId("model@") == null);
     try t.expect(splitRemoteId("") == null);
+}
+
+test "lan: transient resolve failures retain a live peer; only persistent failure drops it" {
+    // Grace policy for the browse thread's failure bookkeeping. dns_sd
+    // resolves hiccup transiently on a LIVE peer (busy mDNSResponder, a
+    // VM/docker bridge interface appearing or vanishing mid-toggle, a 3 s
+    // resolve timeout while the peer's GPU is pinned) — one such hiccup
+    // must NOT evict the peer from the table: the entry's cached ip4:port
+    // still tunnels fine, and eviction turns the next chat into a
+    // user-visible "LAN peer for this model is offline" 404. Only a
+    // PERSISTENT failure streak drops the peer, and only KNOWN_MAX_FAILS
+    // forgets the service name entirely.
+    try t.expectEqual(KnownFailureAction.retain, knownFailureAction(1));
+    try t.expectEqual(KnownFailureAction.retain, knownFailureAction(PEER_DROP_FAILS - 1));
+    try t.expectEqual(KnownFailureAction.drop_peer, knownFailureAction(PEER_DROP_FAILS));
+    try t.expectEqual(KnownFailureAction.drop_peer, knownFailureAction(KNOWN_MAX_FAILS - 1));
+    try t.expectEqual(KnownFailureAction.drop_and_forget, knownFailureAction(KNOWN_MAX_FAILS));
+    try t.expectEqual(KnownFailureAction.drop_and_forget, knownFailureAction(255));
 }
 
 test "lan: routeClass allows exactly the shared inference surface" {
