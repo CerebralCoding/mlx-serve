@@ -1970,19 +1970,6 @@ private struct SandboxSectionContent: View {
                 .toggleStyle(.switch)
         }
 
-        if BuildFeatures.current.ociPull {
-            SettingsRow(
-                title: "Base image",
-                explainer: "The Docker/OCI image the sandbox boots from. Must have an arm64 build (Apple Silicon) — an amd64-only image won't boot. The default ddalcu/agent-shell-mlxserve is a purpose-built agentic shell (Node.js + Python3/pip + git/curl + apt). Pulled once on first use, then cached; a heavier image uses more disk and takes longer the first time."
-            ) {
-                TextField("", text: $appState.serverOptions.sandbox.baseImage,
-                          prompt: Text("ddalcu/agent-shell-mlxserve"))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.body.monospaced())
-                    .frame(width: 260)
-            }
-        }
-
         SettingsRow(
             title: "Reset sandbox",
             explainer: "Deletes ALL sandbox data and returns it to factory state: the downloaded guest image and everything inside it (installed CLIs like pi/hermes, their configs and logins, any files created outside the shared workspace), the cached kernel, the sandbox ssh identity, and the activity transcript. Any running guest and live agent sessions are stopped immediately. Your workspace folder, models, and other app data on this Mac are not touched. The sandbox re-provisions itself on next use."

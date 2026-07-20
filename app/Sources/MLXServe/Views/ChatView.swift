@@ -652,6 +652,35 @@ struct ChatDetailView: View {
         }
     }
 
+    /// Sandbox status shield, rendered in the COMPOSER row (never in the
+    /// toolbar band: adding anything there re-triggers the » eviction class —
+    /// live regression 2026-07-19, the extra icon tipped the cluster width and
+    /// small windows overflowed everything into the » menu). Same glyph in both
+    /// states, only the color changes: green = agent tools + MCP servers run
+    /// inside the isolated Linux VM (click opens the sandbox terminal); gray =
+    /// they run on the host (tooltip names Settings, click opens it).
+    private var sandboxShield: some View {
+        let state = SandboxShield.state(
+            requestedEnabled: appState.serverOptions.sandbox.enabled)
+        return Button {
+            AppActivation.openWindow(id: state.windowId, using: openWindow)
+        } label: {
+            Image(systemName: "checkmark.shield.fill")
+                .font(.system(size: 13, weight: .medium))
+                .foregroundStyle(state.isOn ? Color.green : Color.secondary.opacity(0.6))
+                .frame(width: ChatMetrics.composerIconSize, height: ChatMetrics.composerIconSize)
+                .background(Color.secondary.opacity(0.15))
+                .clipShape(Circle())
+                // Full control frame == the pill's resting height (ChatMetrics
+                // contract, same as the paperclip) so the bottom-aligned row
+                // centers the circle against the input pill.
+                .frame(width: ChatMetrics.composerControlSize, height: ChatMetrics.composerControlSize)
+                .contentShape(Circle())
+        }
+        .buttonStyle(.plain)
+        .help(state.help)
+    }
+
     @ViewBuilder
     private var modePillCluster: some View {
         HStack(spacing: ChatMetrics.togglePillSpacing) {
@@ -937,6 +966,9 @@ struct ChatDetailView: View {
                 }
 
                 HStack(alignment: .bottom, spacing: 8) {
+                    // Sandbox status shield (green = isolated VM, gray = host).
+                    sandboxShield
+
                     // Attachment menu (images/PDFs/audio + document folder)
                     Menu {
                         Button {
@@ -2999,5 +3031,34 @@ fileprivate final class ComposerTextView: NSTextView {
         let ok = super.resignFirstResponder()
         if ok { onResignFocus?() }
         return ok
+    }
+}
+
+/// Pure state for the chat header's sandbox shield (rendered by
+/// `sandboxShield` in `headerControls`; pinned by SandboxTransportTests).
+/// Green shield = the Agent Sandbox is effectively on (including builds with
+/// no host shell, where it is always on); gray = tools run on the host and
+/// the tooltip tells the user where to enable it.
+enum SandboxShield {
+    struct State {
+        let isOn: Bool
+        /// Where a click lands: the live sandbox terminal when on, Settings
+        /// (the place to enable it) when off.
+        let windowId: String
+        let help: String
+    }
+
+    static func state(requestedEnabled: Bool,
+                      hostShellAllowed: Bool = BuildFeatures.current.hostShell) -> State {
+        if AgentSandbox.resolveEnabled(requested: requestedEnabled, hostShellAllowed: hostShellAllowed) {
+            return State(
+                isOn: true,
+                windowId: "sandboxTerminal",
+                help: "Agent Sandbox ON — shell commands and MCP servers run inside an isolated Linux VM, not on your Mac. Click to open the sandbox terminal.")
+        }
+        return State(
+            isOn: false,
+            windowId: "settings",
+            help: "Agent Sandbox OFF — agent tools and MCP servers run directly on this Mac. Turn it on in Settings → Agent Sandbox. Click to open Settings.")
     }
 }

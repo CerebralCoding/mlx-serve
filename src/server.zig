@@ -778,6 +778,13 @@ fn parseToolCallsForRequest(
     allocator: std.mem.Allocator,
     text: []const u8,
     tools_json: ?[]const u8,
+    /// OpenAI `parallel_tool_calls` (Anthropic spelling:
+    /// !tool_choice.disable_parallel_tool_use). false = the client accepts AT
+    /// MOST ONE call per response, so the chokepoint keeps the first parsed
+    /// call and drops the rest (the model re-issues them next round after the
+    /// first result). Deliberately NOT gated by --no-tool-autocorrect:
+    /// client-requested behavior, not a repair heuristic.
+    allow_parallel: bool,
 ) !?[]chat_mod.ParsedToolCall {
     var parsed_calls = try chat_mod.parseToolCalls(allocator, text);
     // Heuristically-inferred raw-JSON calls must name a DECLARED tool — a
@@ -787,9 +794,21 @@ fn parseToolCallsForRequest(
     if (parsed_calls) |c| {
         if (tools_json) |tj| parsed_calls = try chat_mod.filterInferredBySchema(allocator, c, tj);
     }
-    const calls = parsed_calls orelse
+    var calls = parsed_calls orelse
         (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
         return null;
+    if (!allow_parallel and calls.len > 1) {
+        log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});
+        for (calls[1..]) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        const kept = calls[0];
+        allocator.free(calls);
+        const one = try allocator.alloc(chat_mod.ParsedToolCall, 1);
+        one[0] = kept;
+        calls = one;
+    }
     if (g_tool_autocorrect) {
         if (tools_json) |tj| {
             // Order matters: put a buried required param back where the schema
@@ -3607,6 +3626,46 @@ fn handleDetokenize(
     try sendResponse(stream, "200 OK", "application/json", result.items);
 }
 
+/// OpenAI `n` (choice count): this is a single-choice engine and n>1 is
+/// deliberately unimplemented (YAGNI — no agent client sends it). Silently
+/// returning one choice for n=2 is the silent-no-op class llmprobe flags;
+/// reject with an honest 400 instead. Absent, null, 1, or 1.0 all mean
+/// "one choice" and pass.
+/// jsonEscape with an OOM fallback to the literal `""`. Ownership is reported
+/// by PROVENANCE (`owned`), never inferred from content — escaping an empty
+/// string also yields `""` but that one is allocated (2-byte leak per
+/// all-reasoning request under the old content-equality defer).
+const EscapedText = struct { slice: []const u8, owned: bool };
+fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) EscapedText {
+    const s = jsonEscape(allocator, text) catch return .{ .slice = "\"\"", .owned = false };
+    return .{ .slice = s, .owned = true };
+}
+
+const ReasoningEffort = struct { enable: bool, budget: i32 };
+
+/// OpenAI-standard `reasoning_effort` on chat/completions (none | minimal |
+/// low | medium | high | xhigh — values are model-dependent, so unknown
+/// strings still enable). "none" is an explicit off (the gpt-5.1 default
+/// spelling). Absent or non-string → null: the vendor `enable_thinking` bool
+/// stays in charge and existing clients see zero behavior change.
+fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32) ?ReasoningEffort {
+    const v = root.get("reasoning_effort") orelse return null;
+    if (v != .string) return null;
+    if (std.mem.eql(u8, v.string, "none")) return .{ .enable = false, .budget = default_budget };
+    return .{ .enable = true, .budget = responses_mod.effortBudget(v.string, default_budget) };
+}
+
+fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
+    const v = root.get("n") orelse return null;
+    switch (v) {
+        .null => return null,
+        .integer => |i| if (i == 1) return null,
+        .float => |f| if (f == 1.0) return null,
+        else => {},
+    }
+    return "'n' > 1 is not supported: this server returns a single choice per request; omit 'n' or set it to 1";
+}
+
 fn handleChatCompletions(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -3637,6 +3696,12 @@ fn handleChatCompletions(
         return;
     }
     const root = parsed.value.object;
+
+    if (nChoicesRejectReason(root)) |reason| {
+        log.warn("POST /v1/chat/completions -> 400 (unsupported n)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
 
     // Extract messages
     const messages_val = root.get("messages") orelse {
@@ -3833,6 +3898,13 @@ fn handleChatCompletions(
         if (tool_choice_instruction) |tci| allocator.free(tci);
     };
 
+    // OpenAI parallel_tool_calls: only an explicit false clamps to one call
+    // per response (the SDK sets false in strict structured-output mode).
+    const allow_parallel_tools = if (root.get("parallel_tool_calls")) |v|
+        !(v == .bool and !v.bool)
+    else
+        true;
+
     if (has_tools) {
         // Parse tool_choice: "none" | "auto" | "required" | {"type":"function","function":{"name":"..."}}
         if (root.get("tool_choice")) |tc| {
@@ -3969,15 +4041,21 @@ fn handleChatCompletions(
         break :blk false;
     } else false;
 
-    // Parse enable_thinking (default: false — strips <think> blocks from output)
-    const enable_thinking = if (root.get("enable_thinking")) |v| v == .bool and v.bool else false;
+    // Thinking opt-ins: the OpenAI-standard `reasoning_effort` string and the
+    // vendor `enable_thinking` bool (Qwen/vLLM chat_template_kwargs family).
+    // Either switch turns thinking on; effort "none" alone never does.
+    // Default: off — strips <think> blocks from output.
+    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget);
+    const enable_thinking = (if (root.get("enable_thinking")) |v| v == .bool and v.bool else false) or
+        (if (effort_cfg) |e| e.enable else false);
 
-    // Parse reasoning_budget_tokens: max tokens in <think> block (-1 = unlimited)
-    // Per-request override, falls back to server --reasoning-budget flag
+    // Reasoning budget (max tokens in <think> block, -1 = unlimited):
+    // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
+    const effort_budget: i32 = if (effort_cfg) |e| e.budget else server_config.default_reasoning_budget;
     const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| @intCast(i),
-        else => server_config.default_reasoning_budget,
-    } else server_config.default_reasoning_budget;
+        else => effort_budget,
+    } else effort_budget;
 
     // Wave 1.A: per-request KV-quant override. When unset, falls back to the
     // process-level --kv-quant default carried on the scheduler. Cross-scheme
@@ -4229,7 +4307,7 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -4240,7 +4318,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -4268,6 +4346,12 @@ fn handleCompletions(
         return;
     }
     const root = parsed.value.object;
+
+    if (nChoicesRejectReason(root)) |reason| {
+        log.warn("POST /v1/completions -> 400 (unsupported n)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
 
     // Extract prompt (required)
     const prompt_text = if (root.get("prompt")) |v|
@@ -4501,8 +4585,9 @@ fn handleNonStreamingCompletion(
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
-    const escaped_text = jsonEscape(allocator, final_text) catch "\"\"";
-    defer if (!std.mem.eql(u8, escaped_text, "\"\"")) allocator.free(escaped_text);
+    const escaped = jsonEscapeOrEmpty(allocator, final_text);
+    const escaped_text = escaped.slice;
+    defer if (escaped.owned) allocator.free(escaped.slice);
 
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
@@ -4851,6 +4936,9 @@ fn handleNonStreamingGeneration(
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
     tools_json: ?[]const u8,
+    /// false = client set parallel_tool_calls:false (Anthropic:
+    /// tool_choice.disable_parallel_tool_use) — at most one call per response.
+    allow_parallel_tools: bool,
     logprobs_n: u32,
     enable_thinking: bool,
     reasoning_budget: i32,
@@ -4952,7 +5040,7 @@ fn handleNonStreamingGeneration(
     // Check for tool calls in the output
     if (has_tools) {
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
-        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json);
+        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -5010,8 +5098,11 @@ fn handleNonStreamingGeneration(
                 try allocator.alloc(u8, 0);
             defer allocator.free(tc_timings_field);
 
+            const tc_usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, "");
+            defer allocator.free(tc_usage_obj);
+
             const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
+                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"{s}"}}],"usage":{s}{s}}}
             , .{
                 nowMs(stream.io),
                 nowSecs(stream.io),
@@ -5019,9 +5110,7 @@ fn handleNonStreamingGeneration(
                 tc_reasoning_json,
                 tc_buf.items,
                 toolCallFinishReason(finish_reason),
-                result.prompt_tokens,
-                result.completion_tokens,
-                result.prompt_tokens + result.completion_tokens,
+                tc_usage_obj,
                 tc_timings_field,
             });
             defer allocator.free(response);
@@ -5040,8 +5129,9 @@ fn handleNonStreamingGeneration(
     const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking, opens_think);
     const content_text = if (enable_thinking) think_split.content else chat_mod.stripThinkBlock(final_text);
 
-    const escaped_text = jsonEscape(allocator, content_text) catch "\"\"";
-    defer if (!std.mem.eql(u8, escaped_text, "\"\"")) allocator.free(escaped_text);
+    const escaped = jsonEscapeOrEmpty(allocator, content_text);
+    const escaped_text = escaped.slice;
+    defer if (escaped.owned) allocator.free(escaped.slice);
 
     // Build logprobs JSON if requested
     var logprobs_json: []const u8 = "null";
@@ -5085,8 +5175,11 @@ fn handleNonStreamingGeneration(
         try allocator.alloc(u8, 0);
     defer allocator.free(timings_field);
 
+    const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, usage_details_json);
+    defer allocator.free(usage_obj);
+
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}{s}}}{s}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{s}{s}}}
     , .{
         nowMs(stream.io),
         nowSecs(stream.io),
@@ -5095,10 +5188,7 @@ fn handleNonStreamingGeneration(
         reasoning_json,
         logprobs_json,
         finish_reason,
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.prompt_tokens + result.completion_tokens,
-        usage_details_json,
+        usage_obj,
         timings_field,
     });
     defer allocator.free(response);
@@ -5406,6 +5496,9 @@ fn handleStreamingGeneration(
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
     tools_json: ?[]const u8,
+    /// false = client set parallel_tool_calls:false (Anthropic:
+    /// tool_choice.disable_parallel_tool_use) — at most one call per response.
+    allow_parallel_tools: bool,
     logprobs_n: u32,
     enable_thinking: bool,
     reasoning_budget: i32,
@@ -5841,7 +5934,7 @@ fn handleStreamingGeneration(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json);
+        const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -5946,9 +6039,7 @@ fn handleStreamingGeneration(
         // Usage chunk (if requested via stream_options.include_usage). Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
         if (include_usage) {
-            const usage_json = try std.fmt.allocPrint(allocator,
-                \\{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}
-            , .{ total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
+            const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
             defer allocator.free(usage_json);
             const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
             defer allocator.free(timings_obj);
@@ -6643,6 +6734,25 @@ fn cachedFormatChat(
         };
     };
     return ids;
+}
+
+/// The chat-completions `usage` object, shared by the non-stream, tool-call
+/// and streaming-final-chunk emitters so the shape never drifts per path.
+/// `prompt_tokens_details.cached_tokens` is ALWAYS present (0 when cold) —
+/// OpenAI emits it unconditionally, and black-box conformance/cost tooling
+/// (llmprobe) treats a missing field as "no prompt caching" even though the
+/// engine caches. `extra_details` is a pre-formatted `,"key":{...}` fragment
+/// (completion_tokens_details) or "".
+fn formatChatUsage(
+    allocator: std.mem.Allocator,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cached_tokens: u32,
+    extra_details: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(allocator,
+        \\{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d},"prompt_tokens_details":{{"cached_tokens":{d}}}{s}}}
+    , .{ prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens, extra_details });
 }
 
 fn formatTimingsObject(
@@ -7471,6 +7581,15 @@ fn mapFinishToStopReason(finish_reason: []const u8) []const u8 {
     return "end_turn";
 }
 
+/// Anthropic stop_reason with the client-stop-sequence case: a matched stop
+/// sequence reports "stop_sequence" (callers learn WHICH stop fired via the
+/// echoed `stop_sequence` field) — but only over a plain "stop"; it never
+/// masks a max_tokens truncation or a parsed tool call.
+fn anthropicStopReason(finish_reason: []const u8, matched_stop_seq: ?[]const u8) []const u8 {
+    if (matched_stop_seq != null and std.mem.eql(u8, finish_reason, "stop")) return "stop_sequence";
+    return mapFinishToStopReason(finish_reason);
+}
+
 /// Serialize a std.json.Value to JSON text, appending to buf.
 fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: std.json.Value) !void {
     switch (value) {
@@ -7825,6 +7944,7 @@ fn handleAnthropicMessages(
     var tools_json_allocated = false;
     defer if (tools_json_allocated) allocator.free(tools_json.?);
     var has_tools = false;
+    var allow_parallel_tools = true;
     var tool_choice_instruction: ?[]const u8 = null;
     var tool_choice_allocated = false;
     defer if (tool_choice_allocated) {
@@ -7841,6 +7961,10 @@ fn handleAnthropicMessages(
             // Parse tool_choice
             if (root.get("tool_choice")) |tc| {
                 if (tc == .object) {
+                    // Anthropic spelling of the parallel clamp.
+                    if (tc.object.get("disable_parallel_tool_use")) |d| {
+                        if (d == .bool and d.bool) allow_parallel_tools = false;
+                    }
                     const tc_type = if (tc.object.get("type")) |t| (if (t == .string) t.string else "auto") else "auto";
                     if (std.mem.eql(u8, tc_type, "none")) {
                         has_tools = false;
@@ -8003,7 +8127,7 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -8012,7 +8136,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -8034,6 +8158,9 @@ fn handleAnthropicNonStreaming(
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
     tools_json: ?[]const u8,
+    /// false = client set parallel_tool_calls:false (Anthropic:
+    /// tool_choice.disable_parallel_tool_use) — at most one call per response.
+    allow_parallel_tools: bool,
     enable_thinking: bool,
     reasoning_budget: i32,
     prompt_token_count: u32,
@@ -8080,13 +8207,16 @@ fn handleAnthropicNonStreaming(
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
-    // Apply stop sequences
+    // Apply stop sequences; remember WHICH one matched (Anthropic reports it
+    // as stop_reason "stop_sequence" + the echoed `stop_sequence` field).
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
+    var matched_stop_seq: ?[]const u8 = null;
     for (stop_sequences) |stop_seq| {
         if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
             final_text = final_text[0..idx];
             finish_reason = "stop";
+            matched_stop_seq = stop_seq;
             break;
         }
     }
@@ -8141,7 +8271,7 @@ fn handleAnthropicNonStreaming(
 
     // Check for tool calls
     if (has_tools) {
-        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json);
+        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -8197,7 +8327,11 @@ fn handleAnthropicNonStreaming(
 
     try content.append(allocator, ']');
 
-    const stop_reason = mapFinishToStopReason(finish_reason);
+    const stop_reason = anthropicStopReason(finish_reason, matched_stop_seq);
+    // Echo the matched sequence exactly when the reason is "stop_sequence".
+    const echo_stop_seq = std.mem.eql(u8, stop_reason, "stop_sequence");
+    const stop_seq_json: []const u8 = if (echo_stop_seq) try jsonEscape(allocator, matched_stop_seq.?) else "null";
+    defer if (echo_stop_seq) allocator.free(stop_seq_json);
     var perf_buf: [160]u8 = undefined;
     const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
     log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
@@ -8217,12 +8351,13 @@ fn handleAnthropicNonStreaming(
     defer allocator.free(timings_field);
 
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}{s}}}
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}{s}}}
     , .{
         nowMs(stream.io),
         content.items,
         model_name,
         stop_reason,
+        stop_seq_json,
         prompt_token_count,
         result.completion_tokens,
         result.cached_tokens,
@@ -8247,6 +8382,9 @@ fn handleAnthropicStreaming(
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
     tools_json: ?[]const u8,
+    /// false = client set parallel_tool_calls:false (Anthropic:
+    /// tool_choice.disable_parallel_tool_use) — at most one call per response.
+    allow_parallel_tools: bool,
     enable_thinking: bool,
     reasoning_budget: i32,
     prompt_token_count: u32,
@@ -8363,6 +8501,7 @@ fn handleAnthropicStreaming(
         token_texts.deinit(allocator);
     }
     var stopped = false;
+    var matched_stop_seq: ?[]const u8 = null;
     var client_gone = false;
     var utf8_carry: [3]u8 = undefined;
     var utf8_carry_len: u8 = 0;
@@ -8427,11 +8566,13 @@ fn handleAnthropicStreaming(
             try text_buf.appendSlice(allocator, token_text);
         }
 
-        // Stop sequences
+        // Stop sequences; remember WHICH one matched (reported as stop_reason
+        // "stop_sequence" + the echoed `stop_sequence` field in message_delta).
         if (stop_sequences.len > 0) {
             for (stop_sequences) |stop_seq| {
                 if (std.mem.indexOf(u8, text_buf.items, stop_seq) != null) {
                     stopped = true;
+                    matched_stop_seq = stop_seq;
                     break;
                 }
             }
@@ -8696,7 +8837,7 @@ fn handleAnthropicStreaming(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json);
+        const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| { allocator.free(tc.name); allocator.free(tc.arguments); }
@@ -8812,7 +8953,10 @@ fn handleAnthropicStreaming(
     }
 
     const total_prompt = ts.prompt_tokens;
-    const stop_reason = mapFinishToStopReason(finish_reason);
+    const stop_reason = anthropicStopReason(finish_reason, matched_stop_seq);
+    const echo_stop_seq = std.mem.eql(u8, stop_reason, "stop_sequence");
+    const stop_seq_json: []const u8 = if (echo_stop_seq) try jsonEscape(allocator, matched_stop_seq.?) else "null";
+    defer if (echo_stop_seq) allocator.free(stop_seq_json);
 
     if (!client_gone) {
         // Close text block if open
@@ -8839,8 +8983,8 @@ fn handleAnthropicStreaming(
         // message_delta usage into the final message per Anthropic semantics.
         {
             const md = try std.fmt.allocPrint(allocator,
-                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":null}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
-            , .{ stop_reason, ts.completion_tokens, ts.cached_tokens });
+                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
+            , .{ stop_reason, stop_seq_json, ts.completion_tokens, ts.cached_tokens });
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
@@ -9848,7 +9992,7 @@ fn handleResponses(
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
     if (active_has_tools) {
-        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json);
+        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo);
     }
     defer if (tool_calls) |tcs| {
         for (tcs) |tc| {
@@ -11890,7 +12034,7 @@ test "parseToolCallsForRequest coerces args to the schema (server-side chokepoin
     ;
     const text = "<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n" ++
         "<parameter=file_path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -11904,7 +12048,7 @@ test "parseToolCallsForRequest coerces args to the schema (server-side chokepoin
     try std.testing.expect(ra == .bool); // coerced from the STRING "False"
     try std.testing.expectEqual(false, ra.bool);
     // Null tools_json path must still parse (no coercion, no crash).
-    const calls2 = try parseToolCallsForRequest(allocator, text, null);
+    const calls2 = try parseToolCallsForRequest(allocator, text, null, true);
     defer if (calls2) |cs| {
         for (cs) |tc| {
             allocator.free(tc.name);
@@ -11930,7 +12074,7 @@ test "parseToolCallsForRequest hoists a misplaced required param (server-side ch
     const text = "<tool_call>{\"name\":\"edit\",\"arguments\":{\"edits\":[{\"newText\":\"new\",\"oldText\":\"old\"," ++
         "\"path\":\"us_presidents/generate_site.sh\"}]}}</tool_call>";
 
-    const calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -11949,7 +12093,7 @@ test "parseToolCallsForRequest hoists a misplaced required param (server-side ch
     // (unlike the inferred-name filter, which corrects our own heuristic).
     g_tool_autocorrect = false;
     defer g_tool_autocorrect = true;
-    const raw_calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    const raw_calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
     defer {
         for (raw_calls) |tc| {
             allocator.free(tc.name);
@@ -11977,7 +12121,7 @@ test "parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim" {
 
     g_tool_autocorrect = false;
     defer g_tool_autocorrect = true; // restore the default for other tests
-    const calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -12012,7 +12156,7 @@ test "parseToolCallsForRequest: truncated DATA object is not promoted to a tool 
         "presidents = [\n" ++
         "  {\"name\": \"George Washington\", \"num\": 1, \"party\": \"None (Federalist-leaning)\", \"term\": \"1789\u{2013}1797\", \"vice\": \"John Adams\"},\n" ++
         "  {\"name\": \"John Adams\", \"num\": 2, \"party\": \"Federalist\",";
-    const calls = try parseToolCallsForRequest(allocator, text, tools);
+    const calls = try parseToolCallsForRequest(allocator, text, tools, true);
     defer if (calls) |cs| {
         for (cs) |tc| {
             allocator.free(tc.name);
@@ -12032,7 +12176,7 @@ test "parseToolCallsForRequest: raw-JSON call with a DECLARED name still parses"
         \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
     ;
     const text = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n```";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools)) orelse
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)) orelse
         return error.ExpectedToolCall;
     defer {
         for (calls) |tc| {
@@ -12054,7 +12198,7 @@ test "parseToolCallsForRequest: tag-format call with an UNDECLARED name is kept"
         \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
     ;
     const text = "<tool_call>{\"name\":\"searchWeb\",\"arguments\":{\"q\":\"zig\"}}</tool_call>";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools)) orelse
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)) orelse
         return error.ExpectedToolCall;
     defer {
         for (calls) |tc| {
@@ -12064,6 +12208,65 @@ test "parseToolCallsForRequest: tag-format call with an UNDECLARED name is kept"
         allocator.free(calls);
     }
     try std.testing.expectEqualStrings("searchWeb", calls[0].name);
+}
+
+test "anthropicStopReason: a matched client stop sequence reports stop_sequence, truncation stays honest" {
+    // Anthropic spec: when a CLIENT stop sequence cut the text, stop_reason is
+    // "stop_sequence" (with the matched string echoed) — that's how callers
+    // learn WHICH stop fired. But it never masks the other reasons: a
+    // max_tokens cut stays "max_tokens" (clients key truncation recovery on
+    // it), a parsed tool call stays "tool_use".
+    try std.testing.expectEqualStrings("stop_sequence", anthropicStopReason("stop", "beta"));
+    try std.testing.expectEqualStrings("end_turn", anthropicStopReason("stop", null));
+    try std.testing.expectEqualStrings("max_tokens", anthropicStopReason("length", "beta"));
+    try std.testing.expectEqualStrings("tool_use", anthropicStopReason("tool_calls", "beta"));
+}
+
+test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST call" {
+    // OpenAI contract: parallel_tool_calls=false means AT MOST ONE call per
+    // response (the SDK sets it in strict structured-output mode; those
+    // clients execute tool_calls[0] and assume length 1). We can't constrain
+    // generation, so the chokepoint clamps post-parse: keep the first, drop
+    // the rest — the model re-issues them next round after seeing the first
+    // result. Whole valid calls only; nothing partial ships.
+    const allocator = std.testing.allocator;
+    const text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a\"}}</tool_call>\n" ++
+        "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"b\"}}</tool_call>";
+
+    // allow_parallel=true (default wiring): both calls survive.
+    const both = (try parseToolCallsForRequest(allocator, text, null, true)).?;
+    defer {
+        for (both) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(both);
+    }
+    try std.testing.expectEqual(@as(usize, 2), both.len);
+
+    // allow_parallel=false: only the FIRST survives, intact.
+    const one = (try parseToolCallsForRequest(allocator, text, null, false)).?;
+    defer {
+        for (one) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(one);
+    }
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqualStrings("read", one[0].name);
+
+    // A single call with the flag off passes through untouched.
+    const single_text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a\"}}</tool_call>";
+    const single = (try parseToolCallsForRequest(allocator, single_text, null, false)).?;
+    defer {
+        for (single) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(single);
+    }
+    try std.testing.expectEqual(@as(usize, 1), single.len);
 }
 
 test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma" {
@@ -12092,7 +12295,7 @@ test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma
     };
 
     for (cases) |c| {
-        const calls = (try parseToolCallsForRequest(allocator, c.text, c.tools)) orelse {
+        const calls = (try parseToolCallsForRequest(allocator, c.text, c.tools, true)) orelse {
             std.debug.print("\n[{s}] no tool call parsed\n", .{c.name});
             return error.NoToolCall;
         };
@@ -12130,6 +12333,72 @@ test "toolCallFinishReason preserves truncation over parsed tool calls" {
     try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("stop"));
     try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("tool_calls"));
     try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("client_disconnect"));
+}
+
+test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, rejected: bool }{
+        // Absent, explicit null, and the two spellings of "one choice" pass.
+        .{ .body = "{}", .rejected = false },
+        .{ .body = "{\"n\":null}", .rejected = false },
+        .{ .body = "{\"n\":1}", .rejected = false },
+        .{ .body = "{\"n\":1.0}", .rejected = false },
+        // Anything else is a request for multi-choice (or garbage) — reject
+        // instead of the silent one-choice no-op.
+        .{ .body = "{\"n\":2}", .rejected = true },
+        .{ .body = "{\"n\":0}", .rejected = true },
+        .{ .body = "{\"n\":\"2\"}", .rejected = true },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const reason = nChoicesRejectReason(parsed.value.object);
+        try std.testing.expectEqual(case.rejected, reason != null);
+    }
+}
+
+test "jsonEscapeOrEmpty: escaping an empty string is OWNED (leak class 2026-07-19)" {
+    // The old inline pattern decided ownership by CONTENT
+    // (`if (!mem.eql(escaped, "\"\"")) free`), so a legitimately-allocated
+    // escape of "" — every all-reasoning generation with empty visible
+    // content — matched the OOM-fallback literal and leaked 2 bytes per
+    // request. Ownership keys on provenance; std.testing.allocator fails
+    // this test on any leak.
+    const a = std.testing.allocator;
+    const empty = jsonEscapeOrEmpty(a, "");
+    try std.testing.expect(empty.owned);
+    try std.testing.expectEqualStrings("\"\"", empty.slice);
+    if (empty.owned) a.free(empty.slice);
+
+    const text = jsonEscapeOrEmpty(a, "hi \"there\"");
+    try std.testing.expect(text.owned);
+    try std.testing.expectEqualStrings("\"hi \\\"there\\\"\"", text.slice);
+    if (text.owned) a.free(text.slice);
+}
+
+test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinking + budget" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, expect: ?ReasoningEffort }{
+        // Absent or wrong type → null: the vendor enable_thinking flag stays
+        // in charge and nothing changes for existing clients.
+        .{ .body = "{}", .expect = null },
+        .{ .body = "{\"reasoning_effort\":42}", .expect = null },
+        // "none" is an explicit OFF (gpt-5.1 default), never an enable.
+        .{ .body = "{\"reasoning_effort\":\"none\"}", .expect = .{ .enable = false, .budget = -1 } },
+        // Known efforts enable thinking with the shared Responses budget map.
+        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .expect = .{ .enable = true, .budget = 128 } },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .expect = .{ .enable = true, .budget = 512 } },
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .expect = .{ .enable = true, .budget = 2048 } },
+        .{ .body = "{\"reasoning_effort\":\"high\"}", .expect = .{ .enable = true, .budget = 8192 } },
+        // Unknown efforts (xhigh, future values) enable with the default
+        // budget — spec values are model-dependent, never reject them.
+        .{ .body = "{\"reasoning_effort\":\"xhigh\"}", .expect = .{ .enable = true, .budget = -1 } },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expect, parseReasoningEffort(parsed.value.object, -1));
+    }
 }
 
 test "resolveSamplingDefault: request > CLI > generation_config > fallback" {
@@ -12399,4 +12668,31 @@ test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
     // checkpoint is unreachable from any client that doesn't send
     // `enable_mtp:true` in the body (llmprobe, Claude Code, curl).
     try t.expect(defaultEnableMtp(true, true, true));
+}
+
+test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmprobe chat caching)" {
+    const t = std.testing;
+    const a = t.allocator;
+
+    // Cold request: field present with 0, matching OpenAI's unconditional emission.
+    const cold = try formatChatUsage(a, 100, 5, 0, "");
+    defer a.free(cold);
+    try t.expectEqualStrings(
+        \\{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":0}}
+    , cold);
+
+    // Warm request: cached count surfaces; cached ≤ prompt by construction
+    // (scheduler folds cached into prompt_tokens).
+    const warm = try formatChatUsage(a, 300, 12, 250, "");
+    defer a.free(warm);
+    try t.expectEqualStrings(
+        \\{"prompt_tokens":300,"completion_tokens":12,"total_tokens":312,"prompt_tokens_details":{"cached_tokens":250}}
+    , warm);
+
+    // Reasoning responses append completion_tokens_details after the prompt details.
+    const with_details = try formatChatUsage(a, 10, 20, 4, ",\"completion_tokens_details\":{\"reasoning_tokens\":7}");
+    defer a.free(with_details);
+    try t.expectEqualStrings(
+        \\{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":7}}
+    , with_details);
 }

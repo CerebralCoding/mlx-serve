@@ -74,10 +74,10 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// Sandbox Terminal working directory. Under vsock each command is its own
     /// shell, so an interactive `cd` is carried here instead of in the guest.
     private var terminalCwd = "/workspace"
-    /// Seeded from the settings model's default (single source of truth —
-    /// pinned by ServerOptionsTests); AppState overwrites it via `configure()`
-    /// at launch and on every settings change.
-    private var baseImage = ServerOptions.SandboxConfig().baseImage
+    /// The pinned sandbox image (single source of truth —
+    /// `ServerOptions.SandboxConfig.baseImage`); only tests/smoke override it
+    /// via `configure(baseImage:)`.
+    private var baseImage = ServerOptions.SandboxConfig.baseImage
     /// Guest networking + live port mapping (see SandboxConfig.network).
     private var networkEnabled = ServerOptions.SandboxConfig().network
 
@@ -152,10 +152,27 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         requested || !hostShellAllowed
     }
 
+    /// Posted by `configure` when the EXECUTION PLACEMENT changed (see
+    /// `mcpRestartNeeded`). MCPManager listens and respawns its running stdio
+    /// servers where the current setting routes them — a server is pinned to
+    /// the placement it was spawned with, so without this, servers started
+    /// before "enable sandbox" keep running on the host with full permissions.
+    static let placementChanged = Notification.Name("AgentSandboxPlacementChanged")
+
+    /// Pure rule: must running MCP servers be respawned after this configure()?
+    /// Yes when the effective toggle flipped (either direction — off→on leaves
+    /// host processes unconfined; on→off just killed the guest under live
+    /// bridges), or when a guest re-provision (image/network change) tears down
+    /// a guest that MCP bridges may be running in.
+    static func mcpRestartNeeded(wasEnabled: Bool, nowEnabled: Bool, guestConfigChanged: Bool) -> Bool {
+        wasEnabled != nowEnabled || (nowEnabled && guestConfigChanged)
+    }
+
     /// Apply the Settings values. Turning the sandbox off, or changing the base
     /// image or the network mode, tears down any live guest so the next command
-    /// re-provisions with the new configuration.
-    func configure(enabled: Bool, baseImage: String, network: Bool = ServerOptions.SandboxConfig().network) {
+    /// re-provisions with the new configuration. `baseImage` is only overridden
+    /// by tests/smoke — the app always runs the pinned image.
+    func configure(enabled: Bool, baseImage: String = ServerOptions.SandboxConfig.baseImage, network: Bool = ServerOptions.SandboxConfig().network) {
         let effective = Self.resolveEnabled(requested: enabled)
         let trimmed = baseImage.trimmingCharacters(in: .whitespacesAndNewlines)
         lock.lock()
@@ -168,6 +185,10 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         lock.unlock()
         if (!effective && wasEnabled) || (effective && (imageChanged || networkChanged)) {
             teardown()
+        }
+        if Self.mcpRestartNeeded(wasEnabled: wasEnabled, nowEnabled: effective,
+                                 guestConfigChanged: imageChanged || networkChanged) {
+            NotificationCenter.default.post(name: Self.placementChanged, object: nil)
         }
     }
 

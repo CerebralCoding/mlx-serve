@@ -66,6 +66,36 @@ final class MCPManager: ObservableObject, MCPToolRouting {
     /// restarted when this changes — they'd need an off/on toggle (or app restart) to pick it up.
     var defaultCwd: String?
 
+    /// Sandbox-placement observer token (see `restartStdioForSandboxChange`).
+    private var placementObserver: NSObjectProtocol?
+
+    init() {
+        placementObserver = NotificationCenter.default.addObserver(
+            forName: AgentSandbox.placementChanged, object: nil, queue: .main) { [weak self] _ in
+            Task { @MainActor [weak self] in await self?.restartStdioForSandboxChange() }
+        }
+    }
+
+    deinit {
+        if let placementObserver { NotificationCenter.default.removeObserver(placementObserver) }
+    }
+
+    /// The Agent Sandbox placement changed (toggle flipped, or the guest was
+    /// re-provisioned under live bridges). A stdio server is PINNED to the
+    /// placement it was spawned with — a host process stays a host process
+    /// after "enable sandbox" (confinement hole), and guest bridges are dead
+    /// after "disable" — so every running stdio session is stopped and
+    /// respawned where `MCPSpawnerRouter` routes it NOW. HTTP sessions have no
+    /// placement and are untouched. Strictly respawn-what-was-running: with no
+    /// live stdio sessions this is a no-op, so the launch-time `configure()`
+    /// announcement can never eagerly start servers.
+    func restartStdioForSandboxChange() async {
+        let running = sessions.values.filter { $0.child != nil }.map(\.id)
+        guard !running.isEmpty else { return }
+        for id in running { await stop(id: id) }
+        await startEnabled()
+    }
+
     // MARK: - Config
 
     func reloadConfig() {

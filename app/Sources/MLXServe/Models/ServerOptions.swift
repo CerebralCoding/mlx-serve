@@ -350,23 +350,20 @@ struct ServerOptions: Codable, Equatable {
         /// false = tools run directly on host macOS (default, no extra RAM).
         /// true = shell commands run inside the isolated Linux sandbox.
         var enabled: Bool = false
-        /// OCI/Docker base image pulled once for the sandbox rootfs. MUST have an
-        /// arm64 build (the HVF guest is arm64) — an amd64-only image fails to
-        /// boot. Defaults to `ddalcu/agent-shell-mlxserve`: a purpose-built arm64 agentic
-        /// shell (Debian glibc + Node.js + Python3/pip + git/curl + apt, ~129 MB).
-        /// Any arm64 image works; e.g. `python:3.12-slim` or `debian:stable-slim`.
-        var baseImage: String = "ddalcu/agent-shell-mlxserve"
+        /// The OCI image the sandbox boots from — pinned to our purpose-built
+        /// arm64 agentic shell (Debian glibc + Node.js + Python3/pip + git/curl
+        /// + apt + dropbear for the terminal's ssh transport, ~129 MB; source:
+        /// containers/agent-shell-mlxserve). Deliberately NOT user-configurable:
+        /// the ssh terminal and in-guest MCP servers depend on what this exact
+        /// image ships, and a stored custom/legacy ref left upgraders stuck on
+        /// the pre-ssh image (stale-image dialog forever — see the regression
+        /// test). Test overrides go through `AgentSandbox.configure(baseImage:)`.
+        static let baseImage = "ddalcu/agent-shell-mlxserve"
         /// Outbound network for the guest (NAT) + live guest→host port mapping:
         /// a server the agent starts on guest port N becomes reachable at
         /// `localhost:N` on this Mac. Off → the guest has NO network device at
         /// all (fully isolated). Applies on the next guest boot.
         var network: Bool = true
-
-        /// The base image ref with surrounding whitespace stripped — what the
-        /// image puller actually receives (users paste with trailing newlines).
-        var trimmedBaseImage: String {
-            baseImage.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
     }
 
     // MARK: Restart-detection helpers
@@ -715,7 +712,8 @@ extension ServerOptions.SandboxConfig {
         self.init()
         let c = try decoder.container(keyedBy: CodingKeys.self)
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enabled) { enabled = v }
-        if let v = try c.decodeIfPresent(String.self, forKey: .baseImage) { baseImage = v }
+        // baseImage is hardcoded now (see the static above) — a stored value,
+        // legacy default or custom, is deliberately ignored.
         if let v = try c.decodeIfPresent(Bool.self, forKey: .network) { network = v }
     }
 }

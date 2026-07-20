@@ -315,6 +315,24 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertTrue(opts.serverLaunchEquals(ServerOptions()))
     }
 
+    /// The sandbox image is PINNED (renamed ddalcu/agent-shell → …-mlxserve when
+    /// ssh/dropbear was baked in). A settings blob carrying the old default kept
+    /// upgraders on the pre-ssh image forever: stale-image dialog on every
+    /// session, re-pull "does nothing" (it re-pulls the stored old ref), and
+    /// factory reset doesn't help because the setting survives it. The stored
+    /// value — legacy default or custom — must decode fine and be IGNORED.
+    func testStoredBaseImageIsIgnoredImagePinned() throws {
+        for blob in [#"{"baseImage": "ddalcu/agent-shell"}"#,
+                     #"{"baseImage": "python:3.12-slim"}"#,
+                     "{}"] {
+            let cfg = try JSONDecoder().decode(
+                ServerOptions.SandboxConfig.self, from: Data(blob.utf8))
+            XCTAssertEqual(cfg, ServerOptions.SandboxConfig(), "blob: \(blob)")
+        }
+        XCTAssertEqual(ServerOptions.SandboxConfig.baseImage, "ddalcu/agent-shell-mlxserve",
+                       "the pinned image is the ssh-enabled agent shell (containers/agent-shell-mlxserve)")
+    }
+
     // MARK: - GGUF + common-engine flags
 
     func testLlamaKvQuantOmittedAtDefault() {
@@ -577,7 +595,7 @@ extension ServerOptionsTests {
         o.perRequestEnableDrafter = .off
         o.telegram = .init(enabled: true, botToken: "1:abc", agentMode: true,
                            useMCP: true, enableThinking: true, allowedChatIds: [7, 8])
-        o.sandbox = .init(enabled: true, baseImage: "alpine")
+        o.sandbox = .init(enabled: true, network: false)
 
         XCTAssertNotEqual(o, ServerOptions(), "sanity: every field moved off its default")
         let decoded = try JSONDecoder().decode(ServerOptions.self, from: try JSONEncoder().encode(o))
@@ -779,14 +797,13 @@ extension ServerOptionsTests {
     func testSandboxDefaultsOff() {
         let s = ServerOptions().sandbox
         XCTAssertFalse(s.enabled, "the sandbox must be opt-in (off by default)")
-        XCTAssertEqual(s.baseImage, "ddalcu/agent-shell-mlxserve",
-                       "default base image must be arm64 — the HVF guest can't run an amd64-only image")
+        XCTAssertEqual(ServerOptions.SandboxConfig.baseImage, "ddalcu/agent-shell-mlxserve",
+                       "pinned base image must be arm64 — the HVF guest can't run an amd64-only image")
     }
 
     func testSandboxIsNotAServerLaunchFlag() {
         var opts = ServerOptions()
         opts.sandbox.enabled = true
-        opts.sandbox.baseImage = "ubuntu:24.04"
         XCTAssertTrue(ServerOptions().serverLaunchEquals(opts),
                       "toggling the sandbox is app-side — it must not require a server restart")
         let args = opts.toCLIArgs()
@@ -800,7 +817,6 @@ extension ServerOptionsTests {
         let legacy = #"{"host":"0.0.0.0","port":11234}"#.data(using: .utf8)!
         let decoded = try JSONDecoder().decode(ServerOptions.self, from: legacy)
         XCTAssertFalse(decoded.sandbox.enabled)
-        XCTAssertEqual(decoded.sandbox.baseImage, "ddalcu/agent-shell-mlxserve")
     }
 
     func testSandboxNetworkDefaultsOnAndDecodesLegacyBlobs() throws {
@@ -820,26 +836,19 @@ extension ServerOptionsTests {
 
     func testSandboxRoundTripsThroughDecoder() throws {
         var o = ServerOptions()
-        o.sandbox = .init(enabled: true, baseImage: "python:3.12")
+        o.sandbox = .init(enabled: true, network: false)
         let decoded = try JSONDecoder().decode(ServerOptions.self, from: try JSONEncoder().encode(o))
         XCTAssertEqual(decoded.sandbox, o.sandbox,
                        "a field missing from SandboxConfig.init(from:) would revert to its default here")
-    }
-
-    func testSandboxTrimmedBaseImageStripsWhitespace() {
-        var s = ServerOptions.SandboxConfig()
-        s.baseImage = "  nikolaik/python-nodejs\n"
-        XCTAssertEqual(s.trimmedBaseImage, "nikolaik/python-nodejs")
     }
 
     func testSandboxResetToDefaultsClearsIt() {
         // Settings' "Reset to Defaults" assigns ServerOptions(); the sandbox must
         // come back off with the default image.
         var o = ServerOptions()
-        o.sandbox = .init(enabled: true, baseImage: "alpine")
+        o.sandbox = .init(enabled: true)
         o = ServerOptions()
         XCTAssertFalse(o.sandbox.enabled)
-        XCTAssertEqual(o.sandbox.baseImage, "ddalcu/agent-shell-mlxserve")
     }
 
     // MARK: - Speed/memory trade-off options must state BOTH sides

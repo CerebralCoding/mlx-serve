@@ -109,7 +109,7 @@ enum SandboxSmoke {
                 } else {
                     log("[smoke] (real provisioning: fetch kernel + pull \(Self.guestArchNote))")
                 }
-                let image = env["SANDBOX_SMOKE_IMAGE"] ?? env["CONTAIN_SMOKE_IMAGE"] ?? "ddalcu/agent-shell-mlxserve"
+                let image = env["SANDBOX_SMOKE_IMAGE"] ?? env["CONTAIN_SMOKE_IMAGE"] ?? ServerOptions.SandboxConfig.baseImage
                 AgentSandbox.shared.configure(enabled: true, baseImage: image)
                 let handler = ShellHandler(timeoutSeconds: 40)
                 let routed = syncAwait {
@@ -319,7 +319,7 @@ enum SandboxSmoke {
     }
 
     static var guestArchNote: String {
-        let img = ProcessInfo.processInfo.environment["SANDBOX_SMOKE_IMAGE"] ?? "ddalcu/agent-shell-mlxserve"
+        let img = ProcessInfo.processInfo.environment["SANDBOX_SMOKE_IMAGE"] ?? ServerOptions.SandboxConfig.baseImage
         return "\(img) (\(AgentSandbox.guestArch))"
     }
 
