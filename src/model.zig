@@ -721,6 +721,19 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 };
             }
         }
+        // MLX ships affine kernels only for bits {2,3,4,5,6,8} (ops.cpp
+        // rejects the rest at quantize() time, but an ALREADY-quantized
+        // checkpoint skips that check and dies at Metal kernel load during
+        // warmup — an uncatchable process kill). Reject at parse instead.
+        if (config.quant_mode == .affine and config.quant_bits != 0) {
+            switch (config.quant_bits) {
+                2, 3, 4, 5, 6, 8 => {},
+                else => {
+                    log.err("unsupported affine quantization: {d}-bit (this MLX runtime supports 2, 3, 4, 5, 6, 8)\n", .{config.quant_bits});
+                    return error.UnsupportedQuantBits;
+                },
+            }
+        }
     }
 
     // EOS tokens
@@ -2397,6 +2410,32 @@ test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     try testing.expectEqual(@as(u32, 4), config.quant_bits);
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
+}
+
+test "parseConfigFromJson rejects affine bits MLX has no kernels for" {
+    // A checkpoint declaring an affine bit-width outside MLX's kernel set
+    // ({2,3,4,5,6,8}) must fail at PARSE, not at warmup: mlx only validates
+    // bits inside quantize(), so an already-quantized 1-bit checkpoint sails
+    // through load and dies with an uncatchable Metal kernel-load error
+    // ("Unable to load kernel affine_dequantize_..._b_1") that kills the
+    // whole server. Live bite: prism-ml/Bonsai-27B-mlx-1bit.
+    const json_1bit =
+        \\{
+        \\  "model_type": "qwen3_5",
+        \\  "text_config": {"hidden_size": 5120},
+        \\  "quantization": {"bits": 1, "group_size": 128}
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedQuantBits, parseConfigFromJson(testing.allocator, json_1bit));
+
+    const json_7bit =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "quantization": {"bits": 7, "group_size": 64}
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedQuantBits, parseConfigFromJson(testing.allocator, json_7bit));
 }
 
 test "parseConfigFromJson nvfp4 quantization mode" {

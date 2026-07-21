@@ -244,10 +244,69 @@ PY
 
 if [ "$DIVERGENCE" = "OK" ]; then
     echo -e "${GREEN}PASS${NC} first ${FIRST_N_TOKENS} tokens byte-identical (single vs batched)"
-    exit 0
 else
     echo -e "${RED}FAIL${NC} first-${FIRST_N_TOKENS}-tokens divergence: $DIVERGENCE"
     echo "  single  first ${FIRST_N_TOKENS}: $(echo "$LONG_SINGLE_TOKS" | cut -d',' -f1-${FIRST_N_TOKENS})"
     echo "  batched first ${FIRST_N_TOKENS}: $(echo "$LONG_BATCHED_TOKS" | cut -d',' -f1-${FIRST_N_TOKENS})"
     exit 1
 fi
+
+echo
+echo "== batched-kernel x kv-quant crash guard =="
+# Regression: forwardBatchedDecode read cache.entries[].key_view/value_view
+# RAW. Under --kv-quant those hold the packed quantized words (hd 256 at
+# 8-bit -> last dim 64), so the first concurrent decode fed them straight
+# into SDPA and the MLX shape error killed the whole server:
+#   [scaled_dot_product_attention] ... query shape (1,8,1,256) for keys
+#   shape (1,1,22,64)
+# Attention must read KVCache.denseView (the kv-quant contract). Forcing the
+# batched kernel at N=1 reproduces it deterministically, no race needed.
+
+sleep 2
+KVQ_LOG=$(mktemp)
+MLX_SERVE_FORCE_BATCHED=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --no-pld --kv-quant 8 > "$KVQ_LOG" 2>&1 &
+KVQ_PID=$!
+up=0
+for i in $(seq 1 60); do
+    if curl -s -f "$BASE/health" > /dev/null 2>&1; then
+        up=1
+        break
+    fi
+    sleep 1
+done
+if [ "$up" != "1" ]; then
+    echo -e "${RED}FAIL${NC} kv-quant server did not become healthy in 60s"
+    tail -20 "$KVQ_LOG"
+    kill $KVQ_PID 2>/dev/null || true
+    rm -f "$KVQ_LOG"
+    exit 1
+fi
+
+KVQ_BODY=$(echo "$JSON_PAYLOAD" | curl -s -m 60 -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" || true)
+KVQ_CONTENT=$(echo "$KVQ_BODY" | python3 -c "import sys, json; print(json.load(sys.stdin)['choices'][0]['message']['content'])" 2>/dev/null || true)
+
+KVQ_OK=1
+if [ -z "$KVQ_CONTENT" ]; then
+    echo -e "${RED}FAIL${NC} kv-quant batched request returned no completion"
+    echo "  body: $KVQ_BODY"
+    KVQ_OK=0
+elif ! curl -s -f "$BASE/health" > /dev/null 2>&1; then
+    echo -e "${RED}FAIL${NC} server died after kv-quant batched request"
+    KVQ_OK=0
+elif grep -q "MLX error" "$KVQ_LOG"; then
+    echo -e "${RED}FAIL${NC} MLX error in server log during kv-quant batched decode"
+    KVQ_OK=0
+fi
+
+if [ "$KVQ_OK" != "1" ]; then
+    tail -20 "$KVQ_LOG"
+    kill $KVQ_PID 2>/dev/null || true
+    rm -f "$KVQ_LOG"
+    exit 1
+fi
+
+kill $KVQ_PID 2>/dev/null || true
+wait $KVQ_PID 2>/dev/null || true
+rm -f "$KVQ_LOG"
+echo -e "${GREEN}PASS${NC} batched decode survives --kv-quant 8 (server alive, completion returned)"
+exit 0

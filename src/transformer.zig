@@ -6192,21 +6192,30 @@ pub const Transformer = struct {
             }
 
             // Gather per-slot views and find kv_max. For KV-shared layers the
-            // source layer's view is what we read.
+            // source layer's view is what we read. Reads go through denseView
+            // (kv-quant contract) — the cache's raw key_view/value_view hold
+            // packed quantized words under --kv-quant, and feeding those to
+            // SDPA is a fatal MLX shape error.
             const view_layer: u32 = if (is_kv_shared) lw.kv_source.? else li;
+            const dense_views = try self.allocator.alloc(DenseKVView, ctxs.len);
+            defer {
+                for (dense_views) |*dv| dv.deinit();
+                self.allocator.free(dense_views);
+            }
+            for (dense_views) |*dv| dv.* = .{ .k = .{ .ctx = null }, .v = .{ .ctx = null }, .owned = false };
             var kv_max: c_int = 0;
             for (ctxs, 0..) |slot_ctx, i| {
-                const view = slot_ctx.cache.entries[view_layer].key_view;
-                const vshape = mlx.getShape(view);
+                dense_views[i] = try slot_ctx.cache.denseView(view_layer, self.s);
+                const vshape = mlx.getShape(dense_views[i].k);
                 const klen: c_int = vshape[2];
                 kv_len_buf[i] = klen;
                 if (klen > kv_max) kv_max = klen;
             }
 
             // Pad every slot view to [1, cur_kv_h, kv_max, cur_hd] and concat axis=0.
-            const stacked_k = try self.padAndStackBatchedKV(ctxs, view_layer, true, kv_max);
+            const stacked_k = try self.padAndStackBatchedKV(dense_views, true, kv_max);
             defer _ = mlx.mlx_array_free(stacked_k);
-            const stacked_v = try self.padAndStackBatchedKV(ctxs, view_layer, false, kv_max);
+            const stacked_v = try self.padAndStackBatchedKV(dense_views, false, kv_max);
             defer _ = mlx.mlx_array_free(stacked_v);
 
             // Mask: positions [1,1,1,kv_max] vs kv_lens [N,1,1,1] → broadcast to [N,1,1,kv_max].
@@ -6321,13 +6330,13 @@ pub const Transformer = struct {
         return out;
     }
 
-    // Pads each slot's KV view (shape [1, kv_h, kv_len_i, head_dim]) to a common
-    // kv_max along axis 2 with bf16 zeros and concatenates axis 0 → [N, kv_h, kv_max, head_dim].
-    // `key_not_value`: true selects key_view, false selects value_view.
+    // Pads each slot's dense KV view (shape [1, kv_h, kv_len_i, head_dim]) to a
+    // common kv_max along axis 2 with bf16 zeros and concatenates axis 0 →
+    // [N, kv_h, kv_max, head_dim]. Views come from KVCache.denseView so quant
+    // schemes are already dequantized; `key_not_value` selects k or v.
     fn padAndStackBatchedKV(
         self: *const Transformer,
-        ctxs: []const *ForwardCtx,
-        layer: u32,
+        views: []const DenseKVView,
         key_not_value: bool,
         kv_max: c_int,
     ) !mlx.mlx_array {
@@ -6338,14 +6347,14 @@ pub const Transformer = struct {
         const padded_vec = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(padded_vec);
         // Track padded arrays so we can free them after the concat.
-        var padded_arrs = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
+        var padded_arrs = try self.allocator.alloc(mlx.mlx_array, views.len);
         defer {
             for (padded_arrs) |a| _ = mlx.mlx_array_free(a);
             self.allocator.free(padded_arrs);
         }
 
-        for (ctxs, 0..) |slot_ctx, i| {
-            const view = if (key_not_value) slot_ctx.cache.entries[layer].key_view else slot_ctx.cache.entries[layer].value_view;
+        for (views, 0..) |dv, i| {
+            const view = if (key_not_value) dv.k else dv.v;
             const vshape = mlx.getShape(view);
             const klen: c_int = vshape[2];
             const high_pad: c_int = kv_max - klen;
