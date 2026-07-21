@@ -2,6 +2,17 @@ import Combine
 import Foundation
 import SwiftUI
 
+/// Selection repair for `refreshModels`: keep a still-pickable selection,
+/// swap to the first pickable model otherwise, and CLEAR a dangling one when
+/// nothing pickable remains — a deleted models directory otherwise leaves the
+/// dead path persisted, and every start site (autostart, the LAN share boot,
+/// the tray Start button) launches `--model <gone>` into an instant
+/// FileNotFound.
+func reconciledModelSelection(current: String, pickablePaths: [String]) -> String {
+    if pickablePaths.contains(current) { return current }
+    return pickablePaths.first ?? ""
+}
+
 @MainActor
 class AppState: ObservableObject {
     @Published var server = ServerManager()
@@ -340,10 +351,9 @@ class AppState: ObservableObject {
         // they aren't loadable as the primary chat model (must match the tray
         // picker's filter, or the selection points at a hidden row).
         let baseModels = localModels.filter { $0.isChatPickable }
-        if baseModels.first(where: { $0.path == selectedModelPath }) == nil,
-           let first = baseModels.first {
-            selectedModelPath = first.path
-        }
+        let repaired = reconciledModelSelection(current: selectedModelPath,
+                                                pickablePaths: baseModels.map(\.path))
+        if repaired != selectedModelPath { selectedModelPath = repaired }
     }
 
     /// What `useModelAndAwaitReady` must do once `selectedModelPath`'s

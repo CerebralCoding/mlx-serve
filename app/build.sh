@@ -12,6 +12,13 @@ TEAM_ID="${APPLE_TEAM_ID:?Set APPLE_TEAM_ID in env}"
 
 cd "$SCRIPT_DIR"
 
+# Preflight: make sure the pinned submodules (lib/ds4, lib/mlx-src, lib/mlxc-src)
+# are actually checked out at their pins before anything links against them. A
+# drifted engine submodule otherwise fails the Zig build with a cryptic
+# missing-file error (or compiles against a mismatched struct ABI). --fix snaps
+# a clean drift back to the pin; local edits inside a submodule are left alone.
+bash "$PROJECT_ROOT/scripts/check-submodules.sh" --fix
+
 MAS="${MAS:-0}"
 if [ "$MAS" = "1" ]; then
     echo "=== $MAS ==="

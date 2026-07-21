@@ -33,7 +33,7 @@ class ServerManager: ObservableObject {
     /// "video", "music", "audio", "3d"). Empty when the server is down or
     /// discovery is off — pickers then show local models only.
     func lanModels(capability: String) -> [ModelInfo] {
-        allModels.filter { $0.lanPeer != nil && $0.capabilities.contains(capability) }
+        allModels.filter { $0.lanAdvertises(capability) }
     }
     @Published var memoryInfo: MemoryInfo?
     @Published var port: UInt16 = 11234

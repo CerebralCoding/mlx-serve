@@ -232,6 +232,11 @@ pub fn parsePeerModels(alloc: std.mem.Allocator, body: []const u8, peer: []const
         if (item.* != .object) continue;
         const id_v = item.object.get("id") orelse continue;
         if (id_v != .string) continue;
+        // Never mirror the peer's own REMOTE stubs (entries badged lan_peer):
+        // a peer that fails to filter its list — old binary, or a loopback
+        // fetch between two servers on one Mac bypassing the non-loopback
+        // gate — would otherwise chain re-exports into `@a@b` ids.
+        if (item.object.get("lan_peer") != null) continue;
         const bare = try alloc.dupe(u8, id_v.string);
         errdefer alloc.free(bare);
         // Mutations of the parsed tree allocate from ITS arena (freed
@@ -558,11 +563,15 @@ pub const Lan = struct {
         var models: ?[]PeerModel = null;
         var reachable = false;
         for (candidates) |cand| {
-            models = fetchPeerModels(l.alloc, cand, res.port, display) catch |err| switch (err) {
+            models = fetchPeerModels(l.alloc, cand, res.port, display, &l.token_hex) catch |err| switch (err) {
                 error.PeerUnreachable => {
                     log.debug("[lan] \"{s}\" unreachable at {d}.{d}.{d}.{d}:{d}\n", .{ display, cand[0], cand[1], cand[2], cand[3], res.port });
                     continue;
                 },
+                // The fetch landed on OURSELVES (stale record of a former
+                // self — resolve-time TXT check can't see it). Forget the
+                // service; the real record, if any, re-registers via browse.
+                error.SelfFetch => return .self_ad,
                 else => blk: {
                     // Connected but no usable answer (booting, mid-restart):
                     // keep the peer listed empty; the next refresh heals it.
@@ -923,8 +932,33 @@ fn readFd(fd: fd_t, buf: []u8) !usize {
     return @intCast(n);
 }
 
+/// Case-insensitive header lookup in a raw HTTP head. `name_lower` must be
+/// lowercase; matches at line starts only. Returns the trimmed value.
+pub fn headerValueCI(head: []const u8, name_lower: []const u8) ?[]const u8 {
+    var it = std.mem.splitSequence(u8, head, "\r\n");
+    while (it.next()) |line| {
+        if (line.len < name_lower.len + 1) continue;
+        var matches = true;
+        for (name_lower, 0..) |c, i| {
+            if (std.ascii.toLower(line[i]) != c) {
+                matches = false;
+                break;
+            }
+        }
+        if (!matches or line[name_lower.len] != ':') continue;
+        return std.mem.trim(u8, line[name_lower.len + 1 ..], " \t");
+    }
+    return null;
+}
+
 /// Discovery fetch: GET the peer's (shared-filtered) /v1/models.
-fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display: []const u8) ![]PeerModel {
+/// `error.SelfFetch` when the response carries OUR OWN process token
+/// (`X-MLX-LAN-Token`): a stale Bonjour record of a former self — same name
+/// and port, different TXT token, so the resolve-time TXT check can't catch
+/// it — resolves back to this very server, and the loopback-first fetch
+/// would happily install our own models as a "peer" (live test_lan_share
+/// self-mirror after the peer-restart section, 2026-07-21).
+fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display: []const u8, own_token: []const u8) ![]PeerModel {
     const fd = try connectTimeout(ip4, port, 3000);
     defer _ = std.c.close(fd);
     const tv = std.c.timeval{ .sec = 5, .usec = 0 };
@@ -942,6 +976,9 @@ fn fetchPeerModels(alloc: std.mem.Allocator, ip4: [4]u8, port: u16, peer_display
     const line_end = std.mem.indexOf(u8, raw, "\r\n") orelse return error.BadPeerJson;
     if (std.mem.indexOf(u8, raw[0..line_end], " 200") == null) return error.BadPeerJson;
     const header_end = std.mem.indexOf(u8, raw, "\r\n\r\n") orelse return error.BadPeerJson;
+    if (headerValueCI(raw[0..header_end], "x-mlx-lan-token")) |tok| {
+        if (std.mem.eql(u8, tok, own_token)) return error.SelfFetch;
+    }
     return parsePeerModels(alloc, raw[header_end + 4 ..], peer_display);
 }
 
@@ -987,6 +1024,15 @@ pub fn tunnel(remote: Remote, method: []const u8, raw_path: []const u8, body: []
 // ─────────────────────────────────────────────────────────────────────────────
 
 const t = std.testing;
+
+test "lan: headerValueCI finds a header case-insensitively and trims the value" {
+    const head = "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nX-MLX-LAN-Token: deadbeefcafef00d\r\n";
+    try t.expectEqualStrings("deadbeefcafef00d", headerValueCI(head, "x-mlx-lan-token").?);
+    try t.expectEqualStrings("application/json", headerValueCI(head, "content-type").?);
+    try t.expect(headerValueCI(head, "x-missing") == null);
+    // Name must match at line start, not mid-header.
+    try t.expect(headerValueCI("X-Foo-Bar: 1\r\n", "bar") == null);
+}
 
 test "lan: splitRemoteId splits on the LAST @ and rejects degenerate forms" {
     const r = splitRemoteId("gemma-4-e4b-it-4bit@Davids-Mac").?;
@@ -1118,9 +1164,15 @@ test "lan: parsePeerModels rewrites ids, adds lan_peer, keeps meta" {
         \\{"object":"list","data":[
         \\ {"id":"gemma-4-e4b-it-4bit","object":"model","loaded":true,"capabilities":["chat","vision"],"meta":{"context_length":94000}},
         \\ {"id":"flux2-klein-4bit","object":"model","loaded":false,"capabilities":["image"]},
+        \\ {"id":"qwen3.6-27b@SomeoneElse","object":"model","loaded":true,"lan_peer":"SomeoneElse"},
         \\ {"id":42,"object":"junk"}
         \\]}
     ;
+    // The lan_peer entry above is the peer's OWN remote stub — a peer that
+    // fails to filter its list (old binary, loopback fetch between two
+    // servers on one Mac) would otherwise chain re-exports (`@a@b` ids;
+    // live 2026-07-21: a third server on the test Mac leaked its mirrors
+    // into test_lan_share's servers). Never mirror someone else's mirror.
     const models = try parsePeerModels(a, body, "Studio");
     defer freePeerModels(a, models);
     try t.expectEqual(@as(usize, 2), models.len);

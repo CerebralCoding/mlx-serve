@@ -223,19 +223,21 @@ struct StatusMenuView: View {
                 // a broken empty dropdown instead of this message.
                 let pickableModels = appState.localModels.filter { $0.isChatPickable }
 
-                if trayHasNoUsableModels(appState.localModels, lanChatModelCount: server.lanModels(capability: "chat").count) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("No models yet")
-                            .font(.caption.weight(.medium))
-                        Text("Download a model below to start chatting.")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                } else {
-                    // Model picker + Settings shortcut on the same row so the
-                    // gear lives where the user picks what to load. Tuning
-                    // anything else lives in the Settings window the gear opens.
-                    HStack(spacing: 6) {
+                // Model picker (or the no-models message) + Settings shortcut
+                // on the same row so the gear lives where the user picks what
+                // to load. The gear renders in BOTH states — with no models
+                // downloaded it is the tray's only route to Settings.
+                HStack(spacing: 6) {
+                    if trayHasNoUsableModels(appState.localModels, lanChatModelCount: server.lanModels(capability: "chat").count) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("No models yet")
+                                .font(.caption.weight(.medium))
+                            Text("Download a model below to start chatting.")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                    } else {
                         Picker("Model", selection: trayModelSelection) {
                             let pickable = pickableModels
                             // macOS .menu Pickers key the checkmark by item
@@ -289,14 +291,16 @@ struct StatusMenuView: View {
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
-
-                        Button { openSettings() } label: {
-                            Image(systemName: "gear")
-                        }
-                        .buttonStyle(.bordered)
-                        .help("Settings")
                     }
 
+                    Button { openSettings() } label: {
+                        Image(systemName: "gear")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Settings")
+                }
+
+                if !trayHasNoUsableModels(appState.localModels, lanChatModelCount: server.lanModels(capability: "chat").count) {
                     HStack(spacing: 6) {
                         let control = ServerControlButtonPresentation(status: server.status)
                         Button {

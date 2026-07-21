@@ -307,6 +307,20 @@ struct ModelInfo {
     /// `<model>@<peer>` and requests are proxied to that host). nil = local.
     var lanPeer: String? = nil
 
+    /// Whether this LAN-mirrored entry serves `capability` — the tray
+    /// empty-state and the "On Your Network" pickers count through this, not
+    /// raw `capabilities`. Empty capabilities on a LAN entry means a peer
+    /// running pre-26.7.11: those servers rendered a loaded GGUF (embedded
+    /// ds4/llama engine, no chat_template in the header) with
+    /// capabilities:[], so the tray said "No models yet" while the user was
+    /// chatting on the peer's model. Media entries always advertise their
+    /// modality, so empty counts as chat and nothing else.
+    func lanAdvertises(_ capability: String) -> Bool {
+        guard lanPeer != nil else { return false }
+        if capabilities.contains(capability) { return true }
+        return capability == "chat" && capabilities.isEmpty
+    }
+
     /// "model · peer" — the picker label for a LAN entry (`name` carries the
     /// raw `<model>@<peer>` routing id, which is what requests must send).
     var lanDisplayName: String {

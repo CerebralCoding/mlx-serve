@@ -1280,7 +1280,7 @@ fn handleConnection(
     //    non-loopback requests already died above and key-holders keep full
     //    access — so this gate only exists in keyless mode.
     if (lanGateApplies(stream)) {
-        if (lanShareDenial(g_lan.?, registry, method, path, request_body)) |denial| {
+        if (lanShareDenial(g_lan.?, registry, method, path, request_body, isTunneledRequest(request[0..header_end_pos]))) |denial| {
             log.debug("{s} {s} -> 403 (lan: {s})\n", .{ method, path, denial });
             try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", denial, 403);
             return;
@@ -1340,8 +1340,13 @@ fn handleConnection(
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
         log.debug("GET  /v1/models -> 200\n", .{});
         // A keyless LAN peer sees only shared models and never the remote
-        // stubs (a mirrored entry would invite multi-hop loops).
-        try handleModels(allocator, stream, lanGateApplies(stream));
+        // stubs (a mirrored entry would invite multi-hop loops). Peer
+        // discovery fetches self-identify with the X-MLX-LAN marker and get
+        // the SAME filtered view even over loopback — two servers on one Mac
+        // resolve each other loopback-first, and the unfiltered list leaked
+        // remote stubs into `@a@b` re-export chains (live 2026-07-21).
+        try handleModels(allocator, stream, lanGateApplies(stream) or
+            (g_lan != null and isTunneledRequest(request[0..header_end_pos])));
         return;
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/v1/responses/")) {
@@ -1406,11 +1411,14 @@ fn handleConnection(
     var requested_model_id = parseModelFromBody(request_body) orelse "";
     // ── LAN-discovered remote model (`<id>@<peer>`) → proxy the request to
     //    its host byte-for-byte, model field rewritten to the bare id.
-    //    Loopback clients only (the gate above already denied multi-hop); a
+    //    Any DIRECT client may initiate the hop (loopback app, the
+    //    agent-sandbox VM over its NAT interface, LAN clients); a request
+    //    that itself arrived through a peer's tunnel never hops again —
+    //    that marker, not loopback-ness, is the multi-hop bound. A
     //    registered LOCAL id containing '@' keeps winning via the peek; an
     //    offline peer is an honest 404, never a silent local-default answer.
     if (g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
-        peerIsLoopback(stream) and registry.peek(requested_model_id) == null)
+        !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
     {
         try handleLanProxy(allocator, stream, g_lan.?, method, raw_path, request_body, requested_model_id);
         return;
@@ -2427,6 +2435,18 @@ const ReadyCaps = struct {
     has_mesh_engine: bool = false,
 };
 
+/// Chat capability for a READY entry. Template presence is NOT the gate for
+/// embedded-engine (ds4/llama) models: a GGUF without a chat_template in its
+/// header still serves chat via fallback formatting, and gating on the
+/// template made a loaded DSV4-Flash advertise capabilities:[] — LAN clients
+/// hid the peer's model as "no chat models" while chatting on it (live
+/// 2026-07-21). The unloaded GGUF stub path already advertises the chat set
+/// unconditionally; loaded must never advertise less than its stub.
+fn readyHasChat(is_encoder_only: bool, chat_template_len: usize, has_embedded_lm: bool) bool {
+    if (is_encoder_only) return false;
+    return chat_template_len > 0 or has_embedded_lm;
+}
+
 /// `capabilities` JSON array for a ready model. Caller deinits.
 fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) {
     var caps = std.ArrayList(u8).empty;
@@ -2555,7 +2575,11 @@ fn renderModelEntry(
             try std.fmt.allocPrint(allocator, "null", .{});
         defer allocator.free(ctx_str);
 
-        const has_chat = !config.is_encoder_only and chat_config.chat_template.len > 0;
+        const has_chat = readyHasChat(
+            config.is_encoder_only,
+            chat_config.chat_template.len,
+            entry.ds4_engine != null or entry.llama_engine != null,
+        );
         const has_vision = entry.vision_encoder != null;
         const has_audio = if (entry.vision_encoder) |ve| ve.supportsAudio() else false;
         var caps = try readyCapsJson(allocator, .{
@@ -2800,7 +2824,26 @@ fn handleModels(
         \\{{"object":"list","data":[{s}]}}
     , .{entries_buf.items});
     defer allocator.free(body);
-    try sendResponse(stream, "200 OK", "application/json", body);
+    try sendModelsResponse(stream, body);
+}
+
+/// `/v1/models` responses carry the per-process LAN token
+/// (`X-MLX-LAN-Token`) when LAN mode is on, so a discovering server can
+/// recognize a fetch that landed on ITSELF: a stale Bonjour record of a
+/// former self (same name + port, different TXT token) walks through the
+/// resolve-time TXT check, and the loopback-first fetch would install our
+/// own models as a "peer" (live self-mirror after a restart, 2026-07-21).
+fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
+    logHttpResponse("200 OK", "application/json", body);
+    const l = g_lan orelse return sendResponseFramed(stream, "200 OK", "application/json", body);
+    if (stream.ws_mode != null) return sendResponseFramed(stream, "200 OK", "application/json", body);
+    var hdr_buf: [512]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nX-MLX-LAN-Token: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n", .{
+        body.len,
+        &l.token_hex,
+    }) catch return error.Overflow;
+    try stream.writeAll(hdr);
+    if (body.len > 0) try stream.writeAll(body);
 }
 
 /// Plan 05 Phase E: `POST /v1/load-model`. Renders a status payload for the
@@ -3179,7 +3222,11 @@ fn handleStatusPage(
     _ = mlx.mlx_get_active_memory(&active_mem);
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const ctx_len = getEffectiveContextLength(config);
-    const has_chat = !config.is_encoder_only and chat_config.chat_template.len > 0;
+    const has_chat = readyHasChat(
+        config.is_encoder_only,
+        chat_config.chat_template.len,
+        lm.ds4_engine != null or lm.llama_engine != null,
+    );
     const has_vision = lm.vision_encoder != null;
     const has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template);
 
@@ -6340,19 +6387,36 @@ fn lanGateApplies(stream: *const Conn) bool {
     return l.sharing() and g_api_key == null and !peerIsLoopback(stream);
 }
 
+/// True when this request arrived through another mlx-serve's LAN tunnel
+/// (`lan.tunnel` stamps `X-MLX-LAN: 1` on every request it forwards).
+/// Tunneled requests are never proxied again — THAT is the multi-hop bound
+/// (depth 1 by construction), so proxying no longer keys on loopback-ness:
+/// any direct client (the local app, the agent-sandbox VM arriving over the
+/// NAT interface, a phone on the LAN) may initiate the single hop.
+fn isTunneledRequest(raw_headers: []const u8) bool {
+    return findHeaderValueCI(raw_headers, "x-mlx-lan") != null;
+}
+
 /// LAN-share gate decision for one non-loopback request; null = allowed.
 /// The effective model resolves exactly like dispatch will (unknown/absent
 /// ids fall back to the default model), so the gate can never disagree with
 /// what would actually run.
-fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8, path: []const u8, body: []const u8) ?[]const u8 {
+fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8, path: []const u8, body: []const u8, tunneled: bool) ?[]const u8 {
     switch (lan_mod.routeClass(method, path)) {
         .open => return null,
         .denied => return "This endpoint is host-local; LAN sharing exposes inference on shared models only",
         .model_gated => {},
     }
     const mid = parseModelFromBody(body) orelse "";
-    if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null)
-        return "Remote (@peer) model ids are host-local — ask that peer directly";
+    if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null) {
+        // A remote (@peer) id from a DIRECT client is allowed — dispatch
+        // proxies exactly one hop and the peer's own gate governs its model
+        // (the old blanket deny also 403'd the agent-sandbox guest, which is
+        // non-loopback by construction; live 2026-07-21). A request that
+        // arrived through a peer's tunnel never hops again.
+        if (tunneled) return "Remote (@peer) model ids cannot be proxied onward — ask that peer directly";
+        return null;
+    }
     const effective = if (mid.len > 0 and !std.mem.eql(u8, mid, "mlx-serve") and registry.peek(mid) != null)
         mid
     else
@@ -6560,25 +6624,36 @@ test "lanShareDenial: shared inference surface only, resolved like dispatch" {
     }
 
     // Open routes pass with no model check; host-local ones are denied.
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/health", "") == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/v1/models", "") == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "OPTIONS", "/v1/messages", "") == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/load-model", "{}") != null);
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/metrics", "") != null);
-    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/", "") != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/health", "", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/v1/models", "", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "OPTIONS", "/v1/messages", "", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/load-model", "{}", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/metrics", "", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/", "", false) != null);
 
     // Shared model allowed; unshared denied — on chat AND media surfaces.
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"gemma-4-e4b-it-4bit\"}") == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"qwen3.6-27b\"}") != null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/generations", "{\"model\":\"qwen3.6-27b\"}") != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"gemma-4-e4b-it-4bit\"}", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"qwen3.6-27b\"}", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/generations", "{\"model\":\"qwen3.6-27b\"}", false) != null);
 
     // Omitted / unknown ids resolve to the default model exactly like
     // dispatch will — here the default is shared, so both pass.
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}") == null);
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}") == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}", false) == null);
 
-    // @peer ids are host-local: no multi-hop proxying for LAN clients.
-    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}") != null);
+    // @peer ids: a DIRECT client (not tunneled) may initiate the single hop —
+    // the old blanket deny also 403'd the agent-sandbox guest, which reaches
+    // this host over the VM NAT interface (live 2026-07-21). A request that
+    // ARRIVED through a peer's tunnel never hops again (the multi-hop bound).
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", true) != null);
+}
+
+test "isTunneledRequest keys on the lan.tunnel marker header, case-insensitive" {
+    try std.testing.expect(isTunneledRequest("X-MLX-LAN: 1\r\n"));
+    try std.testing.expect(isTunneledRequest("x-mlx-lan: 1\r\n"));
+    try std.testing.expect(!isTunneledRequest("Content-Type: application/json\r\n"));
+    try std.testing.expect(!isTunneledRequest(""));
 }
 
 test "ipIsLoopback exempts local addresses only" {
@@ -12517,6 +12592,24 @@ test "readyCapsJson: every resident media engine surfaces its capability (mesh -
         "[\"chat\",\"tool_use\",\"streaming\",\"reasoning\",\"json_schema\"]",
         chat.items,
     );
+}
+
+test "readyHasChat: embedded-engine GGUF without a chat template still advertises chat" {
+    const t = std.testing;
+    // MLX model with a template — chat.
+    try t.expect(readyHasChat(false, 1234, false));
+    // Encoder-only never chats, template or not.
+    try t.expect(!readyHasChat(true, 1234, false));
+    try t.expect(!readyHasChat(true, 0, true));
+    // The live bug (2026-07-21): a loaded DSV4-Flash GGUF ships no
+    // chat_template in its header (fallback formatting serves chat fine), but
+    // the ready path gated "chat" on template presence — the peer advertised
+    // capabilities:[] and LAN clients hid the model ("No models yet" in the
+    // tray while actively chatting on it). The unloaded GGUF stub path
+    // already advertises the chat set; loaded must not advertise LESS.
+    try t.expect(readyHasChat(false, 0, true));
+    // Templateless pure-MLX entry keeps the existing conservative behavior.
+    try t.expect(!readyHasChat(false, 0, false));
 }
 
 test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill memory guard" {

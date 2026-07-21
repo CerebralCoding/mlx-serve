@@ -31,4 +31,38 @@ final class StatusMenuTrayTests: XCTestCase {
         let chatModel = local("gemma-4-e4b-it-4bit", path: "/m/gemma", type: "gemma4")
         XCTAssertFalse(trayHasNoUsableModels([media, chatModel]))
     }
+
+    // MARK: - Source audit
+
+    /// The Settings gear must render OUTSIDE the empty-state if/else. Live
+    /// bug: the gear lived in the populated branch only, so a Mac with no
+    /// usable models (fresh install, deleted models dir) had NO route to
+    /// Settings from the tray at all.
+    func testSettingsGearRendersOutsideTheEmptyStateBranch() throws {
+        let source = URL(fileURLWithPath: #filePath)
+            .deletingLastPathComponent()  // MLXCoreTests
+            .deletingLastPathComponent()  // Tests
+            .deletingLastPathComponent()  // app
+            .appendingPathComponent("Sources/MLXServe/Views/StatusMenuView.swift")
+        let lines = try String(contentsOf: source, encoding: .utf8)
+            .components(separatedBy: "\n")
+        let ifIdx = try XCTUnwrap(
+            lines.firstIndex { $0.contains("if trayHasNoUsableModels(") })
+        let gearIdx = try XCTUnwrap(
+            lines.firstIndex { $0.contains("openSettings()") })
+        // Gear before the branch is trivially unconditional; after it, the
+        // if/else must have fully closed first (brace depth back to zero).
+        guard gearIdx > ifIdx else { return }
+        var depth = 0
+        for line in lines[ifIdx..<gearIdx] {
+            for ch in line where ch == "{" || ch == "}" {
+                depth += ch == "{" ? 1 : -1
+            }
+        }
+        XCTAssertEqual(depth, 0, """
+            The Settings gear button must be rendered unconditionally, not \
+            inside the trayHasNoUsableModels else-branch — with no models \
+            downloaded the gear is the only way to reach Settings.
+            """)
+    }
 }

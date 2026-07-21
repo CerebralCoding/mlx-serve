@@ -9,8 +9,11 @@
 #      back (non-stream + SSE stream with [DONE]).
 #   3. /v1/load-model + /v1/unload-model on B with the remote id → 200 no-ops.
 #   4. Share gate on A via the machine's LAN IP (non-loopback): /metrics,
-#      GET /, /v1/load-model and `@peer` model ids are all 403 host-local,
-#      while the same requests from loopback keep today's behavior.
+#      GET /, /v1/load-model are 403 host-local, while the same requests
+#      from loopback keep today's behavior. `@peer` ids from a DIRECT
+#      non-loopback client are ALLOWED to proxy one hop (the agent-sandbox
+#      guest reaches the host over the VM NAT interface — live 2026-07-21);
+#      a request carrying the tunnel marker (X-MLX-LAN) never hops again.
 #   5. Self-detection: A (also discovering) never lists its own shared
 #      models as remote entries.
 #
@@ -110,6 +113,13 @@ if [ -n "$RID" ]; then
     echo "$ENTRY" | grep -q "\"lan_peer\":\"$PEER_NAME\""
     check "remote entry carries lan_peer badge" $?
 
+    # A peer's discovery fetch self-identifies (X-MLX-LAN) and gets the
+    # FILTERED list even over loopback — two servers on one Mac resolve each
+    # other loopback-first, and the unfiltered list re-exported remote stubs
+    # as @a@b chains (live 2026-07-21, leaked from a third server).
+    curl -s -H 'X-MLX-LAN: 1' "http://127.0.0.1:$PORT_B/v1/models" | grep -q "@$PEER_NAME"
+    if [ $? -ne 0 ]; then ok "peer-marked fetch never sees remote stubs (loopback)"; else bad "loopback peer fetch leaked remote stubs"; fi
+
     # ── 2. Chat through B → proxied to A ──
     RESP=$(curl -s -m 120 "http://127.0.0.1:$PORT_B/v1/chat/completions" \
         -H 'Content-Type: application/json' \
@@ -196,9 +206,29 @@ CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "http://$LAN_IP:$PORT_A/")
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "http://$LAN_IP:$PORT_A/v1/load-model" \
     -H 'Content-Type: application/json' -d '{"model":"x"}')
 [ "$CODE" = "403" ]; check "LAN client: /v1/load-model is host-local (403, got $CODE)" $?
+# A request that ARRIVED through a peer's tunnel (X-MLX-LAN marker) never
+# hops again — that marker, not loopback-ness, is the multi-hop bound.
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "http://$LAN_IP:$PORT_A/v1/chat/completions" \
+    -H 'Content-Type: application/json' -H 'X-MLX-LAN: 1' -d '{"model":"x@nowhere","messages":[]}')
+[ "$CODE" = "403" ]; check "tunneled request: @peer ids never hop again (403, got $CODE)" $?
+# A DIRECT non-loopback client may initiate the single hop: an unknown peer
+# earns the honest discovery-wait 404 (15 s), NOT the old 403 gate denial.
+CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 25 "http://$LAN_IP:$PORT_A/v1/chat/completions" \
     -H 'Content-Type: application/json' -d '{"model":"x@nowhere","messages":[]}')
-[ "$CODE" = "403" ]; check "LAN client: @peer ids are denied (no multi-hop; 403, got $CODE)" $?
+[ "$CODE" = "404" ]; check "LAN client: direct @peer id proxies (unknown peer -> 404, got $CODE)" $?
+# The sandbox-guest scenario end-to-end: a NON-LOOPBACK client of B names a
+# remote model and gets a real proxied completion (pre-fix: impossible, the
+# proxy was loopback-only and the VZ guest's NAT traffic 403'd/fell through).
+if [ -n "$RID" ]; then
+    RESP=$(curl -s -m 120 "http://$LAN_IP:$PORT_B/v1/chat/completions" \
+        -H 'Content-Type: application/json' \
+        -d "{\"model\":\"$RID\",\"messages\":[{\"role\":\"user\",\"content\":\"Reply with exactly one word: pong\"}],\"max_tokens\":30,\"temperature\":0}")
+    echo "$RESP" | python3 -c '
+import json,sys
+d = json.load(sys.stdin)
+assert d["choices"][0]["message"]["content"].strip(), "empty content"' 2>/dev/null
+    check "non-loopback client of B chats on @peer model (sandbox-guest path)" $?
+fi
 CODE=$(curl -s -o /dev/null -w "%{http_code}" -m 5 "http://$LAN_IP:$PORT_A/health")
 [ "$CODE" = "200" ]; check "LAN client: /health stays open (200, got $CODE)" $?
 curl -s -m 5 "http://$LAN_IP:$PORT_A/v1/models" | grep -q '"data"'
