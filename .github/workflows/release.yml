@@ -4,6 +4,11 @@ on:
   push:
     tags:
       - 'v*'
+  # PR builds run the FULL packaging pipeline — sign, notarize, DMG — and
+  # upload the result as a workflow artifact. They never tag, never create a
+  # GitHub release, never push Homebrew formulas (step gates below). Fork PRs
+  # skip the whole job (no access to signing secrets — job-level `if`).
+  pull_request:
   workflow_dispatch:
     inputs:
       dry_run:
@@ -11,8 +16,17 @@ on:
         type: boolean
         default: false
 
+# A PR force-push mid-notarization should cancel the stale run; release runs
+# (tag push / dispatch) are never cancelled.
+concurrency:
+  group: release-${{ github.event_name }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 jobs:
   build:
+    # Fork PRs have no signing/notarization secrets — skip cleanly instead of
+    # dying at the certificate import.
+    if: github.event_name != 'pull_request' || github.event.pull_request.head.repo.full_name == github.repository
     # macos-26 (Tahoe) so the Swift app links against the macOS 26 SDK. SwiftUI's
     # MenuBarExtra(.window) popover only gets the correct Tahoe resize/height
     # behavior when linked on-or-after the 26 SDK; building on macos-14 produced a
@@ -105,6 +119,13 @@ jobs:
             VERSION="${PREFIX}.${N}"
             echo "version=$VERSION" >> "$GITHUB_OUTPUT"
             echo "tag=v$VERSION" >> "$GITHUB_OUTPUT"
+          elif [ "${{ github.event_name }}" = "pull_request" ]; then
+            # PR package: CalVer prefix + PR number + commit — never tagged,
+            # never released; only names the artifact and --version output.
+            PREFIX="$(date -u +%y.%-m)"
+            VERSION="${PREFIX}.0-pr${{ github.event.pull_request.number }}.$(git rev-parse --short HEAD)"
+            echo "version=$VERSION" >> "$GITHUB_OUTPUT"
+            echo "tag=" >> "$GITHUB_OUTPUT"
           else
             echo "version=${GITHUB_REF_NAME#v}" >> "$GITHUB_OUTPUT"
             echo "tag=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
@@ -134,7 +155,18 @@ jobs:
           ./zig-out/bin/mlx-serve --version
           ./zig-out/bin/mlx-serve --help > /dev/null
 
+      # Static guard: the staged metallib contains the *_nax kernels, minos
+      # >= 26.2, and the built binary links no leftover brew mlx/mlx-c. ci.yml
+      # runs the same check, but a cache-miss rebuild on THIS runner is the
+      # stage that actually ships in the DMG — guard it here too (mirrors the
+      # brew-bottle silent-fallback class in docs/gotchas/engine-mlx.md).
+      - name: Verify staged mlx (NAX kernels + minos)
+        run: bash tests/test_mlx_staged_nax.sh
+
       - name: Run Zig tests
+        # PR commits already run the identical suite in ci.yml — don't pay for
+        # it twice; releases keep the belt-and-braces run.
+        if: github.event_name != 'pull_request'
         run: zig build test --summary all
 
       - name: Build Swift app
@@ -147,6 +179,8 @@ jobs:
           echo "SWIFT_BIN_PATH=$(swift build -c release -Xswiftc -swift-version -Xswiftc 5 --show-bin-path)" >> "$GITHUB_ENV"
 
       - name: Run Swift tests
+        # Same rationale as the Zig tests — ci.yml covers the PR commit.
+        if: github.event_name != 'pull_request'
         working-directory: app
         run: swift test -Xswiftc -swift-version -Xswiftc 5
 
@@ -398,7 +432,7 @@ jobs:
         run: security delete-keychain $RUNNER_TEMP/signing.keychain-db || true
 
       - name: Create Release
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
@@ -408,18 +442,20 @@ jobs:
             mlx-serve-bin-macos-arm64.tar.gz
             MLXCore.dmg
 
-      - name: Upload dry-run artifacts
-        if: ${{ inputs.dry_run }}
+      - name: Upload PR / dry-run artifacts
+        if: ${{ inputs.dry_run || github.event_name == 'pull_request' }}
         uses: actions/upload-artifact@v4
         with:
-          name: dry-run-${{ steps.version.outputs.version }}
+          # PR versions embed the PR number + SHA, so the name is unambiguous
+          # either way (e.g. package-26.7.0-pr12.abc1234 / package-26.7.11).
+          name: package-${{ steps.version.outputs.version }}
           path: |
             mlx-serve-bin-macos-arm64.tar.gz
             MLXCore.dmg
           retention-days: 7
 
       - name: Update Homebrew formulas
-        if: ${{ !inputs.dry_run }}
+        if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
         run: |
           VERSION="${{ steps.version.outputs.version }}"
           DMG_SHA=$(shasum -a 256 MLXCore.dmg | awk '{print $1}')
