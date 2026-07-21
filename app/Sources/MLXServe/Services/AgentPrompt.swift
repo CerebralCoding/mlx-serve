@@ -418,6 +418,28 @@ class SkillManager {
     system prompt when a trigger matches.)
     """
 
+    /// Whole-word/phrase trigger match: `keyword` must appear in `text` bounded
+    /// by non-alphanumeric characters or the string edges — a plain
+    /// `text.contains(keyword)` fired on fragments inside unrelated words
+    /// ("ui" in "build", "review" in "preview"), injecting whole skill bodies
+    /// on ordinary turns (issue #92). Multi-word phrases ("code review") and
+    /// non-alphanumeric edges ("/plan", "requirements.txt") still match.
+    /// Both arguments are already lowercased.
+    static func triggerMatches(_ text: String, _ keyword: String) -> Bool {
+        guard !keyword.isEmpty else { return false }
+        func isAlnum(_ c: Character) -> Bool { c.isLetter || c.isNumber }
+        var searchStart = text.startIndex
+        while let range = text.range(of: keyword, range: searchStart..<text.endIndex) {
+            let beforeOK = range.lowerBound == text.startIndex
+                || !isAlnum(text[text.index(before: range.lowerBound)])
+            let afterOK = range.upperBound == text.endIndex
+                || !isAlnum(text[range.upperBound])
+            if beforeOK && afterOK { return true }
+            searchStart = text.index(after: range.lowerBound)
+        }
+        return false
+    }
+
     /// Returns skill index (always) + matching skill bodies (when triggered).
     func matchingSkills(for userMessage: String) -> String {
         reloadIfNeeded()
@@ -427,7 +449,7 @@ class SkillManager {
         var result = "\nAvailable skills: " + skills.map { "\($0.name) (\($0.description))" }.joined(separator: ", ")
 
         let matched = skills.filter { skill in
-            skill.triggers.contains { lower.contains($0) }
+            skill.triggers.contains { Self.triggerMatches(lower, $0) }
         }
         for skill in matched {
             result += "\n\n## Skill: \(skill.name)\n\(skill.body)"
