@@ -227,6 +227,71 @@ final class AgentSandboxTests: XCTestCase {
         XCTAssertNil(sandbox.pinnedCliSessionLabel)
     }
 
+    // MARK: workspace change → VM remount (Settings default / chat folder pick)
+
+    func testWorkspaceChangeActionRules() {
+        // A workspace pick (Settings default or the chat toolbar) must leave
+        // the VM sharing the RIGHT folder: live guest whose share no longer
+        // covers the new folder tears down so the next command reboots with
+        // the new share; a pinned guest declines exactly like shell does.
+        typealias Action = AgentSandbox.WorkspaceChangeAction
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: false, sharedRoot: nil, newWorkspace: "/w", pinnedLabels: []),
+            Action.none, "no live guest → the next boot shares the right folder anyway")
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/w/sub", pinnedLabels: []),
+            Action.none, "share already covers the new folder → keep the guest")
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: nil, pinnedLabels: []),
+            Action.none, "nil workspace → nothing to remount to")
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/elsewhere", pinnedLabels: []),
+            Action.teardown, "stale share, unpinned → tear down for a fresh remount")
+        guard case .blocked(let msg) = AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/elsewhere", pinnedLabels: ["pi"])
+        else { return XCTFail("pinned guest must decline the remount, not die under the session") }
+        XCTAssertEqual(msg, AgentSandbox.remountBlockMessage(pinnedLabels: ["pi"], needsRemount: true),
+                       "same decline message as shell — one workspace-pin story everywhere")
+    }
+
+    func testWorkspaceChangeActionForceRestartsPinnedSessions() {
+        // A Settings workspace pick is EXPLICIT intent to re-anchor the
+        // sandbox (live 2026-07-20: `ls /workspace` kept showing the old
+        // folder until an app restart, because a live terminal session pinned
+        // the guest and the change was quietly declined). With
+        // restartPinnedSessions the pick tears the guest down anyway and the
+        // terminal UI respawns its sessions in the new share — the pin only
+        // keeps declining IMPLICIT switches (a chat command from a
+        // different-workspace tab).
+        typealias Action = AgentSandbox.WorkspaceChangeAction
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/elsewhere",
+            pinnedLabels: ["pi"], restartPinnedSessions: true),
+            Action.teardownRestartingSessions,
+            "an explicit pick must remount even under a live session — restarting it")
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/elsewhere",
+            pinnedLabels: [], restartPinnedSessions: true),
+            Action.teardown, "no sessions → plain teardown, nothing to restart")
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/w/sub",
+            pinnedLabels: ["pi"], restartPinnedSessions: true),
+            Action.none, "share already covers the new folder → sessions keep running")
+        guard case .blocked = AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/elsewhere",
+            pinnedLabels: ["pi"], restartPinnedSessions: false)
+        else { return XCTFail("implicit switches must still decline under a pin") }
+    }
+
+    func testNoteWorkspaceChangedIsSafeWithNoGuest() {
+        // The Settings row calls this on every pick; with no live guest it must
+        // be a quiet no-op (nil = proceed, nothing torn down, nothing thrown).
+        let sandbox = AgentSandbox.shared
+        sandbox._testInstallGuest(nil)
+        XCTAssertNil(sandbox.noteWorkspaceChanged("/anywhere"))
+        XCTAssertFalse(sandbox._testHasGuest)
+    }
+
     // MARK: stale image (dropbear preflight)
 
     func testStaleImageMessageNamesTheImageAndTheFix() {

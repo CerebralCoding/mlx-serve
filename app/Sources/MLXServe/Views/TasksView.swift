@@ -346,7 +346,7 @@ extension TaskAutonomy {
         case .readOnly: "Can browse, search and read. Pauses before changing anything."
         case .workspace: "Can also create and edit files inside the task's own folder."
         case .fullAuto: "Can run shell commands too. File writes still stay in the folder."
-        case .yolo: "Unrestricted — runs any command anywhere and never asks. Use with care."
+        case .yolo: "Never asks — every tool auto-approved, shell can run anything. Files go to your default agent workspace. Use with care."
         }
     }
 }

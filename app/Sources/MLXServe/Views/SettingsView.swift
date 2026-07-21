@@ -1945,8 +1945,35 @@ private struct SandboxSectionContent: View {
     @EnvironmentObject var appState: AppState
     @State private var showResetConfirm = false
     @State private var resetting = false
+    /// Mirrors the stored default so the row re-renders on change; writes go
+    /// through `AppState.setDefaultAgentWorkspace` (retarget + VM remount),
+    /// never directly through this binding.
+    @AppStorage(ChatSession.defaultWorkspaceDefaultsKey) private var storedWorkspace = ""
+
+    private var currentWorkspace: String {
+        storedWorkspace.isEmpty ? ChatSession.builtinDefaultWorkingDirectory : storedWorkspace
+    }
 
     var body: some View {
+        SettingsRow(
+            title: "Agent workspace folder",
+            explainer: "The default working folder for the agent's tools (shell, readFile, writeFile, …) in every chat — and the folder shared into the sandbox VM at /workspace while the sandbox is on. Changing it moves chats still on the previous default, remounts a running sandbox, and restarts any open terminal sessions in the new folder; a chat with its own picked folder (the folder icon on the Agent pill) keeps it."
+        ) {
+            HStack(spacing: 8) {
+                Text((currentWorkspace as NSString).abbreviatingWithTildeInPath)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(currentWorkspace)
+                Button("Choose…") {
+                    if let picked = WorkspacePicker.pickDirectory() {
+                        appState.setDefaultAgentWorkspace(picked)
+                    }
+                }
+            }
+        }
+
         // No host shell in the App Store build → the sandbox can't be turned
         // off (`AgentSandbox.resolveEnabled`), so offering the toggle would be
         // a lie; the base image is likewise locked to the bundled guest.

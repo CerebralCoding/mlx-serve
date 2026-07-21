@@ -238,8 +238,11 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
 
     // MARK: Test hooks (no VM — install/inspect the detached guest reference)
 
-    func _testInstallGuest(_ g: VzGuest?) {
-        bootLock.lock(); guest = g; bootLock.unlock()
+    func _testInstallGuest(_ g: VzGuest?, sharedRoot: String? = nil) {
+        bootLock.lock()
+        guest = g
+        self.sharedRoot = (g == nil) ? nil : (sharedRoot ?? self.sharedRoot)
+        bootLock.unlock()
     }
     var _testHasGuest: Bool {
         bootLock.lock(); defer { bootLock.unlock() }; return guest != nil
@@ -362,6 +365,103 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// remount-decline message and the window title.
     var pinnedCliSessionLabel: String? {
         bootLock.lock(); defer { bootLock.unlock() }; return cliPins.last
+    }
+
+    /// The live pinned guest's shared root + most recent CLI-session label,
+    /// read by the file-tool gate (`FileToolSandboxGate`). (nil, nil) unless a
+    /// LIVE guest is pinned — a dead guest's pin doesn't block file tools,
+    /// exactly as `ensureBooted` reboots past it for shell.
+    var pinnedWorkspace: (root: String?, label: String?) {
+        bootLock.lock(); defer { bootLock.unlock() }
+        guard let g = guest, !g.isFinished, let root = sharedRoot, let label = cliPins.last else {
+            return (nil, nil)
+        }
+        return (root, label)
+    }
+
+    // MARK: Workspace change (Settings default / chat folder pick)
+
+    /// What a user workspace pick means for the live guest.
+    enum WorkspaceChangeAction: Equatable {
+        case none            // no live guest, or the share already covers the folder
+        case teardown        // stale share → free the guest; next command reboots with the new share
+        /// Stale share under live CLI sessions, but the pick was EXPLICIT
+        /// (Settings) — tear down anyway; the terminal UI respawns its
+        /// sessions in the new share (`workspaceRemounted` notification).
+        case teardownRestartingSessions
+        case blocked(String) // pinned + implicit switch — decline, same as shell
+    }
+
+    /// Posted after a workspace change tore down a PINNED guest (explicit
+    /// Settings pick). The Sandbox window observes it and restarts every
+    /// living session tab in the new share — without this, a live terminal
+    /// quietly kept the OLD folder mounted until an app restart (live
+    /// 2026-07-20: `ls /workspace` showed the previous workspace).
+    static let workspaceRemounted = Notification.Name("AgentSandboxWorkspaceRemounted")
+
+    /// Pure rule (unit-tested): mirrors `ensureBooted`'s remount decision so an
+    /// EAGER pick-time remount can never disagree with the lazy command-time
+    /// one. `restartPinnedSessions` distinguishes an EXPLICIT user pick (the
+    /// Settings workspace row — re-anchoring the sandbox is the point, so
+    /// live sessions restart) from an IMPLICIT switch (a chat tab's folder —
+    /// still declined under a pin, exactly like shell).
+    static func workspaceChangeAction(guestAlive: Bool, sharedRoot: String?,
+                                      newWorkspace: String?, pinnedLabels: [String],
+                                      restartPinnedSessions: Bool = false) -> WorkspaceChangeAction {
+        guard guestAlive, let root = sharedRoot,
+              needsRemount(sharedRoot: root, requestedCwd: newWorkspace) else { return .none }
+        guard let blocked = remountBlockMessage(pinnedLabels: pinnedLabels, needsRemount: true) else {
+            return .teardown
+        }
+        return restartPinnedSessions ? .teardownRestartingSessions : .blocked(blocked)
+    }
+
+    /// Called when the user picks a new agent workspace. Tears down a live
+    /// guest whose `/workspace` share doesn't cover the new folder so the
+    /// NEXT command boots sharing the right one (sub-second on virtiofs) —
+    /// the same teardown `configure` does for an image/network change. Both
+    /// teardown arms post `placementChanged` so guest-side MCP bridges (which
+    /// die with the VM) respawn into the fresh guest.
+    ///
+    /// `restartPinnedSessions: true` (the Settings default-workspace row) also
+    /// remounts under live CLI sessions and posts `workspaceRemounted` so the
+    /// terminal respawns them in the new share. `false` (a chat tab's folder
+    /// pick) returns the decline message while pinned — the chat's next tool
+    /// call explains with the same words.
+    @discardableResult
+    func noteWorkspaceChanged(_ newWorkspace: String?, restartPinnedSessions: Bool = false) -> String? {
+        bootLock.lock()
+        let alive = guest.map { !$0.isFinished } ?? false
+        let root = sharedRoot
+        let pins = cliPins
+        bootLock.unlock()
+        switch Self.workspaceChangeAction(guestAlive: alive, sharedRoot: root,
+                                          newWorkspace: newWorkspace, pinnedLabels: pins,
+                                          restartPinnedSessions: restartPinnedSessions) {
+        case .none:
+            return nil
+        case .teardown:
+            recordRemount(newWorkspace, restartingSessions: false)
+            teardown()
+            NotificationCenter.default.post(name: Self.placementChanged, object: nil)
+            return nil
+        case .teardownRestartingSessions:
+            recordRemount(newWorkspace, restartingSessions: true)
+            teardown()
+            NotificationCenter.default.post(name: Self.placementChanged, object: nil)
+            NotificationCenter.default.post(name: Self.workspaceRemounted, object: nil)
+            return nil
+        case .blocked(let msg):
+            return msg
+        }
+    }
+
+    private func recordRemount(_ newWorkspace: String?, restartingSessions: Bool) {
+        let dest = newWorkspace ?? Self.fallbackSharedRoot()
+        record(Entry(source: .system, command: "",
+                     output: "workspace changed — guest restarts sharing \(dest) at /workspace"
+                         + (restartingSessions ? "; live sessions restart there" : ""),
+                     exitCode: 0, at: Date()))
     }
 
     func pinCliSession(label: String) {

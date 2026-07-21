@@ -440,6 +440,26 @@ class AppState: ObservableObject {
         saveChatHistory()
     }
 
+    /// Apply a new DEFAULT agent workspace picked in Settings: persist the
+    /// setting, keep a security-scoped bookmark so the App Sandbox build can
+    /// reach the folder after relaunch, retarget sessions still on the old
+    /// default (the chat toolbar folder stays in sync with Settings), and
+    /// remount the sandbox. An EXPLICIT pick remounts even under live CLI
+    /// sessions (`restartPinnedSessions` — the Sandbox window restarts them
+    /// in the new share); without it, a live terminal quietly kept the old
+    /// folder mounted until an app restart.
+    func setDefaultAgentWorkspace(_ path: String) {
+        let old = ChatSession.defaultWorkingDirectory
+        ChatSession.setDefaultWorkingDirectory(path)
+        SecurityScopedBookmark.store(URL(fileURLWithPath: path),
+                                     name: SecurityScopedBookmark.defaultWorkspaceName)
+        SecurityScopedBookmark.startAccessOnce(name: SecurityScopedBookmark.defaultWorkspaceName)
+        agentMemory.recordDirectory(path)
+        chatSessions = ChatSession.retargeted(chatSessions, from: old, to: path)
+        saveChatHistory()
+        AgentSandbox.shared.noteWorkspaceChanged(path, restartPinnedSessions: true)
+    }
+
     var activeSession: ChatSession? {
         get { chatSessions.first { $0.id == activeChatId } }
         set {

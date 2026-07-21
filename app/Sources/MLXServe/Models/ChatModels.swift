@@ -71,13 +71,49 @@ struct ChatSession: Identifiable, Codable {
         attachedFolderPath = try c.decodeIfPresent(String.self, forKey: .attachedFolderPath)
     }
 
-    /// Shared default cwd for all chat sessions. Same path used by CLILauncher, AgentEngine,
-    /// and MCPManager.resolveWorkingDirectory.
-    static let defaultWorkingDirectory: String = {
-        let path = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
+    /// Shared default cwd for all chat sessions — a SETTING since 2026-07-20
+    /// (Settings → Agent Sandbox), UserDefaults-backed with the historical
+    /// `~/.mlx-serve/workspace` as fallback. Same value feeds CLILauncher,
+    /// AgentEngine, MCPManager.resolveWorkingDirectory and
+    /// `AgentSandbox.fallbackSharedRoot` — change it through
+    /// `AppState.setDefaultAgentWorkspace`, which also retargets sessions
+    /// still on the old default and remounts a live sandbox guest.
+    static let defaultWorkspaceDefaultsKey = "agentDefaultWorkspace"
+
+    static var defaultWorkingDirectory: String { defaultWorkingDirectory(defaults: .standard) }
+
+    static var builtinDefaultWorkingDirectory: String {
+        NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
+    }
+
+    static func defaultWorkingDirectory(defaults: UserDefaults) -> String {
+        let stored = defaults.string(forKey: defaultWorkspaceDefaultsKey)
+        let path = (stored?.isEmpty == false) ? stored! : builtinDefaultWorkingDirectory
+        // The folder must exist so agent tools can use it immediately (idempotent).
         try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
         return path
-    }()
+    }
+
+    /// nil (or empty) restores the builtin default.
+    static func setDefaultWorkingDirectory(_ path: String?, defaults: UserDefaults = .standard) {
+        if let path, !path.isEmpty {
+            defaults.set(path, forKey: defaultWorkspaceDefaultsKey)
+        } else {
+            defaults.removeObject(forKey: defaultWorkspaceDefaultsKey)
+        }
+    }
+
+    /// Sessions still on the OLD default follow a default change (the chat
+    /// toolbar's folder tooltip stays in sync with Settings); a per-session
+    /// pick — or an unset wd — is never overridden.
+    static func retargeted(_ sessions: [ChatSession], from old: String, to new: String) -> [ChatSession] {
+        guard old != new else { return sessions }
+        return sessions.map { session in
+            var session = session
+            if session.workingDirectory == old { session.workingDirectory = new }
+            return session
+        }
+    }
 }
 
 /// A tool call made by the assistant, stored on the assistant message for history replay.

@@ -1544,6 +1544,12 @@ struct ChatDetailView: View {
                     } else {
                         SecurityScopedBookmark.clear(name: slot)
                     }
+                    // A live guest sharing the OLD folder remounts eagerly
+                    // (torn down now, rebooted on the next command) so shell
+                    // AND the file-tool gate see the new folder immediately.
+                    // Pinned (live CLI session) → declined; the next command's
+                    // error explains, same as before this hook existed.
+                    AgentSandbox.shared.noteWorkspaceChanged(newValue)
                 }
             }
         )

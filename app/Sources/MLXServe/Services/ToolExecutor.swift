@@ -22,6 +22,52 @@ protocol ToolHandler: Sendable {
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String
 }
 
+// MARK: - File-tool sandbox gate
+
+/// With the Agent Sandbox ON, the five file tools stay HOST-side (the guest
+/// shares the workspace via virtiofs, so in-workspace bytes are identical
+/// either way — routing them through the VM would move the same bytes through
+/// a shell pipe to the same place) — but they must honor the same confinement
+/// story as `shell`: never in a folder the pinned VM isn't sharing. Live
+/// 2026-07-20: writeFile wrote to the host workspace in the same turn where
+/// shell was declined with the remount-block message. The companion rule —
+/// a working directory is MANDATORY in every mode — lives at
+/// `resolveAndConfine` (`workspaceRequiredMessage`), not here: it is not a
+/// sandbox rule. browse/webSearch/saveMemory are not file tools and stay
+/// ungated. A NEW file tool must take this gate and check it first —
+/// FileToolSandboxGateTests pins the wiring for all five.
+struct FileToolSandboxGate: Sendable {
+    /// Read at execution time — the setting changes between calls. Injectable
+    /// (same seam as `ShellHandler.sandboxEnabled`) so gate tests never depend
+    /// on the build flavor (MAS forces the sandbox on).
+    var sandboxEnabled: () -> Bool = { AgentSandbox.shared.isEnabled }
+    /// The live pinned guest's shared root + CLI-session label. (nil, nil)
+    /// when no live pinned guest exists — then shell would remount silently,
+    /// so file tools must not block either.
+    var pinnedWorkspace: () -> (root: String?, label: String?) = { AgentSandbox.shared.pinnedWorkspace }
+
+    func check(workingDirectory: String?) throws {
+        let pin = pinnedWorkspace()
+        if let reason = Self.rejectReason(sandboxEnabled: sandboxEnabled(),
+                                          workingDirectory: workingDirectory,
+                                          pinnedRoot: pin.root, pinnedLabel: pin.label) {
+            throw ToolError.executionFailed(reason)
+        }
+    }
+
+    /// Pure verdict (unit-tested): nil = proceed. Only the PIN question — a
+    /// nil working directory is answered by `resolveAndConfine` for all modes.
+    static func rejectReason(sandboxEnabled: Bool, workingDirectory: String?,
+                             pinnedRoot: String?, pinnedLabel: String?) -> String? {
+        guard sandboxEnabled, let wd = workingDirectory else { return nil }
+        if let root = pinnedRoot, let label = pinnedLabel,
+           AgentSandbox.needsRemount(sharedRoot: root, requestedCwd: wd) {
+            return "a sandboxed \(label) session pins the sandbox to \(root) — this session's working folder \(wd) is outside that share, so file tools are blocked. Close the \(label) session, or move the working folder back under \(root)."
+        }
+        return nil
+    }
+}
+
 // MARK: - Shell
 
 struct ShellHandler: ToolHandler {
@@ -417,7 +463,10 @@ final class ManagedAtomicFlag: @unchecked Sendable {
 // MARK: - Read File
 
 struct ReadFileHandler: ToolHandler {
+    var gate = FileToolSandboxGate()
+
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
+        try gate.check(workingDirectory: workingDirectory)
         guard let path = parameters["path"] else {
             throw ToolError.missingParameter("path")
         }
@@ -477,7 +526,10 @@ struct WriteFileHandler: ToolHandler {
         return false
     }
 
+    var gate = FileToolSandboxGate()
+
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
+        try gate.check(workingDirectory: workingDirectory)
         guard let path = parameters["path"], let content = parameters["content"] else {
             throw ToolError.missingParameter("path and content")
         }
@@ -508,7 +560,10 @@ struct WriteFileHandler: ToolHandler {
 // MARK: - Edit File
 
 struct EditFileHandler: ToolHandler {
+    var gate = FileToolSandboxGate()
+
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
+        try gate.check(workingDirectory: workingDirectory)
         guard let path = parameters["path"] else {
             throw ToolError.missingParameter("path")
         }
@@ -584,7 +639,10 @@ struct EditFileHandler: ToolHandler {
 // MARK: - Search Files
 
 struct SearchFilesHandler: ToolHandler {
+    var gate = FileToolSandboxGate()
+
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
+        try gate.check(workingDirectory: workingDirectory)
         guard let pattern = parameters["pattern"] else {
             throw ToolError.missingParameter("pattern")
         }
@@ -613,7 +671,10 @@ struct SearchFilesHandler: ToolHandler {
 // MARK: - List Files
 
 struct ListFilesHandler: ToolHandler {
+    var gate = FileToolSandboxGate()
+
     func execute(parameters: [String: String], workingDirectory: String?) async throws -> String {
+        try gate.check(workingDirectory: workingDirectory)
         let path = parameters["path"] ?? "."
         let fullPath = try resolveAndConfine(path, workingDirectory: workingDirectory)
         let pattern = parameters["pattern"]
@@ -825,22 +886,29 @@ private func resolvePath(_ path: String, workingDirectory: String?) -> String {
     return path
 }
 
+/// A file tool ran without a working directory. MANDATORY in every mode since
+/// 2026-07-20 — the old contract returned the path UNCONFINED here (the yolo
+/// lever), which meant "sandbox on" never confined file tools for a nil-wd
+/// run. Yolo task runs now anchor at the default agent workspace instead
+/// (TaskScheduler.workDir); yolo keeps its meaning at the APPROVAL layer only.
+let workspaceRequiredMessage = "no working folder is set for this session — the agent's file tools always run confined to one, in every mode. Set a working folder (the folder icon on the Agent pill, or Settings → Agent Sandbox) and retry."
+
 /// Resolve a path and verify it stays within the working directory.
-/// Returns the resolved absolute path, or throws if it escapes the workspace.
+/// Returns the resolved absolute path, or throws if it escapes the workspace
+/// — or when no workspace is set at all (never unconfined).
 private func resolveAndConfine(_ path: String, workingDirectory: String?) throws -> String {
+    guard let wd = workingDirectory else {
+        throw ToolError.executionFailed(workspaceRequiredMessage)
+    }
     let resolved: String
     if path.hasPrefix("/") || path.hasPrefix("~") {
         resolved = NSString(string: path).expandingTildeInPath
-    } else if let wd = workingDirectory {
-        resolved = (wd as NSString).appendingPathComponent(path)
     } else {
-        return path // no workspace set, can't enforce
+        resolved = (wd as NSString).appendingPathComponent(path)
     }
 
     // Normalize to resolve ".." and symlinks for accurate prefix check
     let normalizedResolved = (resolved as NSString).standardizingPath
-
-    guard let wd = workingDirectory else { return normalizedResolved }
     let normalizedWd = (wd as NSString).standardizingPath
 
     guard normalizedResolved == normalizedWd || normalizedResolved.hasPrefix(normalizedWd + "/") else {

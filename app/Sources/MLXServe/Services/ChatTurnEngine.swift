@@ -356,6 +356,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // MCP servers below always run with the grant live. No bookmark stored
         // (default workspace, DMG build) → no-op.
         SecurityScopedBookmark.startAccessOnce(name: SecurityScopedBookmark.workingFolderName(sessionId))
+        // Sessions inheriting the DEFAULT workspace have no per-session slot;
+        // a custom default picked in Settings rides this global bookmark.
+        SecurityScopedBookmark.startAccessOnce(name: SecurityScopedBookmark.defaultWorkspaceName)
 
         generationTask = Task { [weak self] in
             guard let self else { return }

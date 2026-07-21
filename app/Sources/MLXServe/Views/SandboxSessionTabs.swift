@@ -64,6 +64,18 @@ struct SandboxSessionTabs: Equatable {
         tabs[i].phase = .exited(exitCode)
     }
 
+    /// A workspace remount restarts a living session IN PLACE: same tab, same
+    /// display name — never a new numbered tab for what the user still thinks
+    /// of as "pi". Exited tabs stay exited (resurrecting a corpse the user
+    /// already saw die would read as a ghost session).
+    mutating func restart(_ id: UUID) {
+        guard let i = tabs.firstIndex(where: { $0.id == id }) else { return }
+        switch tabs[i].phase {
+        case .preparing, .live: tabs[i].phase = .preparing
+        case .exited: break
+        }
+    }
+
     mutating func select(_ id: UUID) {
         guard tabs.contains(where: { $0.id == id }) else { return }
         selectedID = id

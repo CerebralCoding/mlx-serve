@@ -18,8 +18,11 @@ import AppKit
 /// 2026-07-19: flipping to Activity killed the pi session).
 ///
 /// One shared guest: sessions here and the in-app agent's tools use the same
-/// VM. Live sessions PIN it — switching the chat workspace mid-session is
-/// declined with a clear message. Quitting the app kills the VM (accepted v1).
+/// VM. Live sessions PIN it — an IMPLICIT workspace switch (a chat tab's
+/// folder) is declined with a clear message, but an EXPLICIT Settings
+/// workspace change remounts anyway and this window restarts its sessions in
+/// the new share (`workspaceRemounted`). Quitting the app kills the VM
+/// (accepted v1).
 struct SandboxTerminalView: View {
     @ObservedObject private var sandbox = AgentSandbox.shared
     /// Per-command appends publish through the dedicated store (NOT through
@@ -95,6 +98,11 @@ struct SandboxTerminalView: View {
         .onAppear { handleAgentLaunchRequest() }
         .onChange(of: appState.pendingSandboxAgentLaunch) { _, _ in
             handleAgentLaunchRequest()
+        }
+        // Settings workspace pick under live sessions: the guest was already
+        // torn down — restart every living tab in the NEW /workspace share.
+        .onReceive(NotificationCenter.default.publisher(for: AgentSandbox.workspaceRemounted)) { _ in
+            respawnSessionsAfterRemount()
         }
         .alert(item: $alert) { a in
             switch a.action {
@@ -306,7 +314,7 @@ struct SandboxTerminalView: View {
                 EmbeddedTerminalView(executable: SandboxSSH.sshExecutablePath,
                                      args: rt.cli.sshArgs,
                                      controller: rt.controller,
-                                     onExit: { code in sessionExited(tab.id, code: code) })
+                                     onExit: { code in sessionExited(tab.id, runtime: rt, code: code) })
                     .id(tab.id)
             }
         case .exited:
@@ -393,13 +401,19 @@ struct SandboxTerminalView: View {
 
         let label = agent?.displayName ?? "shell"
         let id = sessions.addPreparing(label: label)
+        launchSession(into: id, agent: agent)
+    }
+
+    /// Boot + connect a CLI session into an existing (preparing) tab. Shared
+    /// by `startSession` and the workspace-remount respawn.
+    private func launchSession(into id: UUID, agent: SandboxAgentSpec?) {
         // Chat chokepoint rule: the model the sandboxed agent targets is
         // `server.chatModelId` (LAN picks win), budgets derive from the
         // advertised context — never hardcoded.
         let model = server.chatModelId
         let port = server.port
         let budget = AgentBudget.forServerContext(server.chatModelInfo?.contextLength)
-        let key = opts.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        let key = appState.serverOptions.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
         Task {
             do {
                 let cli = try await sandbox.startCliSession(
@@ -421,11 +435,32 @@ struct SandboxTerminalView: View {
         }
     }
 
-    private func sessionExited(_ id: UUID, code: Int32?) {
-        if let rt = runtimes.removeValue(forKey: id) {
-            sandbox.endCliSession(rt.cli)
+    /// The default workspace changed under live sessions: the guest was torn
+    /// down (`noteWorkspaceChanged(restartPinnedSessions: true)`) — restart
+    /// every living tab's CLI so it lands in the NEW /workspace share.
+    /// In place: tab identity and display name survive; conversation state
+    /// inside the CLIs does not (the VM it lived in is gone).
+    private func respawnSessionsAfterRemount() {
+        for tab in sessions.tabs where tab.phase == .live || tab.phase == .preparing {
+            if let rt = runtimes.removeValue(forKey: tab.id) {
+                rt.controller.terminate()
+                sandbox.endCliSession(rt.cli)
+            }
+            sessions.restart(tab.id)
+            launchSession(into: tab.id,
+                          agent: SandboxAgentRegistry.all.first { $0.displayName == tab.label })
         }
-        sessions.markExited(id, exitCode: code) // no-op if the tab was closed
+    }
+
+    private func sessionExited(_ id: UUID, runtime: SessionRuntime, code: Int32?) {
+        // A stale exit from a session replaced by the remount respawn must not
+        // kill the replacement — only the CURRENT runtime's exit counts. (A
+        // closed tab's late exit is also caught here: closeTab already removed
+        // the runtime.)
+        guard runtimes[id] === runtime else { return }
+        runtimes.removeValue(forKey: id)
+        sandbox.endCliSession(runtime.cli)
+        sessions.markExited(id, exitCode: code)
     }
 
     private func closeTab(_ id: UUID) {

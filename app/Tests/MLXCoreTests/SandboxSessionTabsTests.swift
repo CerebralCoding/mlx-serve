@@ -112,6 +112,30 @@ final class SandboxSessionTabsTests: XCTestCase {
         XCTAssertEqual(m.mostRecentActive(label: "pi"), c)
     }
 
+    func testRestartKeepsIdentityAndReturnsToPreparing() {
+        // A workspace remount (Settings pick under live sessions) restarts
+        // each session IN PLACE: same tab, same display name — never a new
+        // "pi 2" tab for what the user still thinks of as "pi".
+        var tabs = SandboxSessionTabs()
+        let pi = tabs.addPreparing(label: "pi")
+        tabs.markLive(pi)
+        tabs.restart(pi)
+        XCTAssertEqual(tabs.tabs.first?.phase, .preparing)
+        XCTAssertEqual(tabs.displayName(pi), "pi", "restart must not renumber")
+        XCTAssertEqual(tabs.selectedID, pi, "restart must not steal selection elsewhere")
+    }
+
+    func testRestartLeavesExitedTabsAlone() {
+        // Only living sessions respawn on a remount — resurrecting a tab the
+        // user already saw die would read as a ghost session.
+        var tabs = SandboxSessionTabs()
+        let pi = tabs.addPreparing(label: "pi")
+        tabs.markLive(pi)
+        tabs.markExited(pi, exitCode: 0)
+        tabs.restart(pi)
+        XCTAssertEqual(tabs.tabs.first?.phase, .exited(0))
+    }
+
     func testCloseOfUnknownIdIsANoop() {
         var m = SandboxSessionTabs()
         let a = m.addPreparing(label: "pi")

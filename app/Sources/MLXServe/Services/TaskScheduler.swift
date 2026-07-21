@@ -352,11 +352,18 @@ final class TaskScheduler: ObservableObject {
         }
     }
 
-    /// YOLO passes a nil working directory so `ToolExecutor.resolveAndConfine` does
-    /// not guard — the documented "no confinement" lever. Other levels confine to
-    /// the per-run folder.
-    private func workDir(for task: ScheduledTask, runId: UUID) -> String? {
-        task.autonomy == .yolo ? nil : TaskPaths.runDir(task.id, runId)
+    /// Every run gets a REAL working directory — mandatory since 2026-07-20:
+    /// `resolveAndConfine` refuses a nil wd in every mode, so the old "yolo
+    /// passes nil = unconfined" lever is gone. Yolo now anchors at the user's
+    /// default agent workspace (widest sane folder; its approval matrix stays
+    /// unrestricted — see ApprovalPolicy); other levels confine to the
+    /// per-run folder as before.
+    nonisolated static func workDir(for autonomy: TaskAutonomy, taskId: UUID, runId: UUID) -> String {
+        autonomy == .yolo ? ChatSession.defaultWorkingDirectory : TaskPaths.runDir(taskId, runId)
+    }
+
+    private func workDir(for task: ScheduledTask, runId: UUID) -> String {
+        Self.workDir(for: task.autonomy, taskId: task.id, runId: runId)
     }
 
     private func execute(_ task: ScheduledTask, reason: String) async {
@@ -512,7 +519,7 @@ final class TaskScheduler: ObservableObject {
             await appState.mcpManager.startEnabled()
         }
         if approved {
-            var wd = dir
+            var wd: String? = dir
             let repetition = AgentEngine.RepetitionTracker()
             let result = await AgentEngine.executeToolCall(
                 tc, workingDirectory: &wd, repetition: repetition, iteration: 0,
