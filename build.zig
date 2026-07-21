@@ -417,13 +417,22 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     };
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4.c"), .flags = c_flags });
     // ds4.c #includes ds4_distributed.h; the engine/session path links its impl.
-    // ds4_gpu.h is implemented in ds4_metal.m; ds4_kvstore/web/help/agent.c are
-    // CLI/server-only and not part of the library path mlx-serve embeds.
+    // ds4_gpu.h is implemented in ds4_metal.m; ds4_kvstore/web/help/agent.c and
+    // ds4_gpu_args.c are CLI/server-only and not part of the library path
+    // mlx-serve embeds (upstream Makefile CORE_OBJS is the authority).
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_distributed.c"), .flags = c_flags });
     // SSD weight-streaming (issue #39): ds4_ssd.c is a standalone TU (#includes
     // only ds4_ssd.h) implementing the streaming expert cache the engine_options
     // ssd_streaming_* fields drive. Added upstream after the previous pin.
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_ssd.c"), .flags = c_flags });
+    // Two-machine tensor parallelism + multi-GPU layer placement (pin efdadd4):
+    // ds4.c references ds4_tp_* and ds4_compute_layer_placement/ds4_layer_pack_print
+    // unconditionally, so both TUs must link even though we never enable TP.
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_tp.c"), .flags = c_flags });
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_layer_pack.c"), .flags = c_flags });
+    // Our own shim: exports sizeof/offsetof of the real C structs so the
+    // ds4_ffi.zig layout test catches mirror drift (mid-struct-insert class).
+    module.addCSourceFile(.{ .file = b.path("src/ds4_layout_check.c"), .flags = c_flags });
 
     const objc_flags = &[_][]const u8{
         "-O3",

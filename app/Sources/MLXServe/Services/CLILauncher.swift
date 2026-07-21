@@ -191,6 +191,11 @@ extension LauncherCLI {
             let config = AgentConfigs.piModelsJSON(baseURL: baseURL, model: model, budget: budget)
             let path = (dir as NSString).appendingPathComponent("models.json")
             try? config.write(toFile: path, atomically: true, encoding: .utf8)
+            // Global context file — pi injects it into every session's system
+            // prompt (same builder the sandbox registry materializes in-guest).
+            try? AgentConfigs.piAgentsMD(budget: budget)
+                .write(toFile: (dir as NSString).appendingPathComponent("AGENTS.md"),
+                       atomically: true, encoding: .utf8)
         },
         scriptBody: { _, model, cdLine, _ in
             """

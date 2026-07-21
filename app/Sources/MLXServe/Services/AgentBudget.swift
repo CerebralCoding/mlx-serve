@@ -25,9 +25,12 @@ enum AgentBudget {
     /// 400 on an oversized prompt.
     static let fallback = Budget(context: 32768, output: 8192)
 
-    /// Cap on a single response. Enough for a one-shot whole-file `write`
-    /// (measured: 8–11k tokens), without inviting a mega-write on a huge context.
-    private static let maxOutput = 16384
+    /// Cap on a single response. Thinking tokens share the response budget, so
+    /// "enough for a one-shot whole-file write (8–11k measured)" was NOT enough:
+    /// a flat 16384 truncated every large `write` at 262K context and looped a
+    /// pi session for hours (2026-07-20). The budget scales with context
+    /// (context/4); this cap only bounds a degenerate runaway generation.
+    private static let maxOutput = 65536
 
     /// The advertised context is declared to the CLI VERBATIM — no second margin.
     ///
@@ -81,6 +84,35 @@ enum AgentConfigs {
             }
           }
         }
+        """
+    }
+
+    /// pi's global context file — `AGENTS.md` in the agent config dir is
+    /// injected into every session's system prompt (pi's resource loader
+    /// checks the agent dir before the workspace). It exists to break the
+    /// mega-write loop (live 2026-07-20): pi ALWAYS sends its configured
+    /// `maxTokens` (<=0 is a models.json validation error, there is no
+    /// omit-the-field mode), its `write` tool has NO append flag, and thinking
+    /// shares the response budget — so a file bigger than the cap can only
+    /// land via chunked bash appends, and a truncated call re-issued
+    /// unchanged fails identically forever.
+    static func piAgentsMD(budget: AgentBudget.Budget) -> String {
+        """
+        # mlx-serve local model — session rules
+
+        Each response (thinking + text + tool calls together) has a hard cap of
+        \(budget.output) output tokens. A `write` whose content approaches that
+        cap is cut off mid-call and can never succeed, however often it is
+        retried.
+
+        - Big files: never one giant `write`. Create the file with the first
+          ~150 lines, then append the rest in ~150-line chunks with `bash`:
+          `cat >> path <<'EOF'` … `EOF`.
+        - "arguments may be truncated", or a `write` rejected for missing
+          `content` right after a token-limit stop, means the call was cut
+          off — do not re-issue it unchanged; split the content into smaller
+          pieces instead.
+        - Keep commentary before a tool call to one short sentence.
         """
     }
 

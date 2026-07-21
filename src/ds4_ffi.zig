@@ -5,7 +5,7 @@
 // `src/arch/ds4.zig`. Keeping this layer mechanical means an upstream `ds4.h`
 // drift shows up as a Zig compile error here rather than in the bridge.
 //
-// Submodule pin: lib/ds4 @ 613e9b2.
+// Submodule pin: lib/ds4 @ efdadd4.
 
 const std = @import("std");
 
@@ -72,18 +72,48 @@ pub const DistributedOptions = extern struct {
     debug: bool = false,
 };
 
+// Two-machine tensor parallelism (pin efdadd4). Never enabled by mlx-serve —
+// mirrored only because ds4_engine_options embeds it by value.
+pub const TpRole = enum(c_int) {
+    none = 0,
+    leader = 1,
+    worker = 2,
+};
+
+pub const TpTransport = enum(c_int) {
+    auto = 0,
+    rdma = 1,
+    tcp = 2,
+};
+
+pub const TpOptions = extern struct {
+    role: TpRole = .none,
+    requested: bool = false,
+    listen_host: ?[*:0]const u8 = null,
+    listen_port: c_int = 0,
+    leader_host: ?[*:0]const u8 = null,
+    leader_port: c_int = 0,
+    transport: TpTransport = .auto,
+    rdma_device: ?[*:0]const u8 = null,
+    rdma_gid_index: c_int = 0,
+    rdma_gid_index_set: bool = false,
+    glm_token_prefill: bool = false,
+    debug_hash: c_int = 0,
+};
+
 // Mirrors `ds4_engine_options` in lib/ds4/ds4.h EXACTLY (field order + types are
-// the C ABI contract; a mismatch silently corrupts the struct at open time).
-// The ssd_streaming_* / prefill_chunk / expert_profile_path / simulate_used_memory_bytes
-// fields were added upstream alongside SSD weight-streaming (issue #39).
+// the C ABI contract; a mismatch silently corrupts the struct at open time —
+// the layout test at the bottom of this file pins it against the real header).
 pub const EngineOptions = extern struct {
     model_path: ?[*:0]const u8 = null,
     mtp_path: ?[*:0]const u8 = null,
     backend: Backend = .metal,
     n_threads: c_int = 0,
+    context_size: c_int = 0,
     prefill_chunk: u32 = 0,
     mtp_draft_tokens: c_int = 0,
     mtp_margin: f32 = 0,
+    dspark_confidence_threshold: f32 = 0,
     directional_steering_file: ?[*:0]const u8 = null,
     expert_profile_path: ?[*:0]const u8 = null,
     directional_steering_attn: f32 = 0,
@@ -91,18 +121,31 @@ pub const EngineOptions = extern struct {
     power_percent: c_int = 0,
     ssd_streaming_cache_experts: u32 = 0,
     ssd_streaming_cache_bytes: u64 = 0,
+    ssd_streaming_full_layers: u32 = 0,
     ssd_streaming_preload_experts: u32 = 0,
     simulate_used_memory_bytes: u64 = 0,
     warm_weights: bool = false,
     quality: bool = false,
+    glm_mtp: bool = false,
+    glm_mtp_timing: bool = false,
+    dspark: bool = false,
+    dspark_strict: bool = false,
+    dspark_confidence_threshold_set: bool = false,
+    cuda_tensor_parallel: bool = false,
     ssd_streaming: bool = false,
     ssd_streaming_cold: bool = false,
+    ssd_streaming_full_layers_set: bool = false,
     inspect_only: bool = false,
+    placement_ctx_hint: c_int = 0,
+    share_session_prefill_workspace: bool = false,
+    first_token_test: bool = false,
+    metal_graph_test: bool = false,
     load_slice: bool = false,
     load_layer_start: u32 = 0,
     load_layer_end: u32 = 0,
     load_output: bool = false,
     distributed: DistributedOptions = .{},
+    tp: TpOptions = .{},
 };
 
 pub const ContextMemory = extern struct {
@@ -220,3 +263,29 @@ pub extern fn ds4_session_payload_bytes(s: *Session) u64;
 pub extern fn ds4_session_save_snapshot(s: *Session, snap: *SessionSnapshot, err: ?[*]u8, errlen: usize) c_int;
 pub extern fn ds4_session_load_snapshot(s: *Session, snap: *const SessionSnapshot, err: ?[*]u8, errlen: usize) c_int;
 pub extern fn ds4_session_snapshot_free(snap: *SessionSnapshot) void;
+
+// Layout cross-check exports from src/ds4_layout_check.c (compiled against the
+// real lib/ds4/ds4.h). Test-only; never call these on a hot path.
+extern fn mlxserve_ds4_sizeof_engine_options() usize;
+extern fn mlxserve_ds4_offsetof_mtp_draft_tokens() usize;
+extern fn mlxserve_ds4_offsetof_ssd_streaming() usize;
+extern fn mlxserve_ds4_offsetof_distributed() usize;
+extern fn mlxserve_ds4_sizeof_distributed_options() usize;
+extern fn mlxserve_ds4_sizeof_tokens() usize;
+extern fn mlxserve_ds4_sizeof_context_memory() usize;
+extern fn mlxserve_ds4_sizeof_session_snapshot() usize;
+
+test "ds4 FFI mirror layout matches ds4.h (mid-struct-insert guard)" {
+    // Upstream inserts fields mid-struct on upgrades; a stale mirror corrupts
+    // ds4_engine_options at open time and generation hangs with no error.
+    // sizeof catches inserts/appends; the three offsets catch reorders in the
+    // head, the bool block, and the tail respectively.
+    try std.testing.expectEqual(mlxserve_ds4_sizeof_engine_options(), @sizeOf(EngineOptions));
+    try std.testing.expectEqual(mlxserve_ds4_offsetof_mtp_draft_tokens(), @offsetOf(EngineOptions, "mtp_draft_tokens"));
+    try std.testing.expectEqual(mlxserve_ds4_offsetof_ssd_streaming(), @offsetOf(EngineOptions, "ssd_streaming"));
+    try std.testing.expectEqual(mlxserve_ds4_offsetof_distributed(), @offsetOf(EngineOptions, "distributed"));
+    try std.testing.expectEqual(mlxserve_ds4_sizeof_distributed_options(), @sizeOf(DistributedOptions));
+    try std.testing.expectEqual(mlxserve_ds4_sizeof_tokens(), @sizeOf(Tokens));
+    try std.testing.expectEqual(mlxserve_ds4_sizeof_context_memory(), @sizeOf(ContextMemory));
+    try std.testing.expectEqual(mlxserve_ds4_sizeof_session_snapshot(), @sizeOf(SessionSnapshot));
+}

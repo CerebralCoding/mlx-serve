@@ -50,7 +50,10 @@ extension SandboxAgentSpec {
                 guestPath: "/root/.pi/agent/models.json",
                 content: AgentConfigs.piModelsJSON(
                     baseURL: "http://\(SandboxAgentRegistry.hostPlaceholder):\(serverPort)",
-                    model: model, budget: budget, apiKey: apiKey ?? "mlx-serve"))]
+                    model: model, budget: budget, apiKey: apiKey ?? "mlx-serve")),
+             SandboxAgentFile(
+                guestPath: "/root/.pi/agent/AGENTS.md",
+                content: AgentConfigs.piAgentsMD(budget: budget))]
         },
         launchCommand: { model in "pi --provider mlx --model \(VzGuest.shellQuote(model))" }
     )
@@ -153,6 +156,7 @@ enum SandboxAgentRegistry {
           echo "Installing \(spec.displayName) (first run — output streams below)…"
           \(spec.installScript) || { echo "mlx-serve: \(spec.displayName) install failed" >&2; exit 1; }
         fi
+        cd /workspace 2>/dev/null || echo "mlx-serve: /workspace share missing — starting in $HOME" >&2
         exec \(spec.launchCommand(model))
         """
     }

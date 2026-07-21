@@ -22,7 +22,7 @@ final class SandboxAgentRegistryTests: XCTestCase {
 
     func testPiConfigIsAgentConfigsPiModelsJSONAtTheHostPlaceholder() {
         let files = SandboxAgentRegistry.pi.configFiles("gemma-4-12b", 11234, budget, nil)
-        XCTAssertEqual(files.count, 1)
+        XCTAssertEqual(files.count, 2, "models.json + the AGENTS.md session rules")
         XCTAssertEqual(files[0].guestPath, "/root/.pi/agent/models.json",
                        "guest HOME is /root; pi reads ~/.pi/agent — no PI_CODING_AGENT_DIR isolation needed in a VM that is ALL ours")
         // Same generator the host launcher + MAS instructions use — one shape,
@@ -32,6 +32,11 @@ final class SandboxAgentRegistryTests: XCTestCase {
                                                  model: "gemma-4-12b", budget: budget))
         XCTAssertTrue(files[0].content.contains("\"contextWindow\": 65536"),
                       "budget must ride the config verbatim (never hardcoded)")
+        // The global context file pi injects into every session's system
+        // prompt — the chunked-write convention (2026-07-20 mega-write loop).
+        // Same builder the host launcher writes, so the surfaces can't drift.
+        XCTAssertEqual(files[1].guestPath, "/root/.pi/agent/AGENTS.md")
+        XCTAssertEqual(files[1].content, AgentConfigs.piAgentsMD(budget: budget))
     }
 
     func testPiConfigCarriesTheRealApiKeyWhenOneIsSet() {
@@ -129,6 +134,29 @@ final class SandboxAgentRegistryTests: XCTestCase {
         // 6. Installer-managed bins must be on PATH before the probe.
         XCTAssertTrue(s.range(of: "/root/.local/bin")!.lowerBound
                       < s.range(of: "command -v")!.lowerBound, s)
+    }
+
+    // ssh drops the bootstrap in /root, and nothing cd'd before the exec —
+    // live 2026-07-20 a pi session built its whole project in /root/fps-game,
+    // invisible on the host, while the configured workspace share sat empty.
+    // `/workspace` IS the configured default agent workspace (ensureBooted's
+    // nil-workingDirectory share = ChatSession.defaultWorkingDirectory), so
+    // every agent session must start there; a missing share stays loud but
+    // non-fatal.
+    func testBootstrapStartsAgentSessionsInTheWorkspaceShare() {
+        for spec in SandboxAgentRegistry.all {
+            let s = SandboxAgentRegistry.bootstrapScript(for: spec, model: "m")
+            let cd = s.range(of: "cd /workspace")
+            let ex = s.range(of: "exec ")
+            XCTAssertNotNil(cd, "\(spec.id): must start in the workspace share, not /root")
+            XCTAssertNotNil(ex, spec.id)
+            if let cd, let ex {
+                XCTAssertLessThan(cd.lowerBound, ex.lowerBound,
+                                  "\(spec.id): the cd must precede the agent exec")
+            }
+            XCTAssertTrue(s.contains("/workspace share missing"),
+                          "\(spec.id): a missing share must be loud, never a silent /root session")
+        }
     }
 
     func testBootstrapQuotesTheModelId() {

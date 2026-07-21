@@ -54,6 +54,25 @@ final class AgentBudgetTests: XCTestCase {
         }
     }
 
+    // Live 2026-07-20 (pi in the sandbox, Qwen3.6-27B at 262K ctx): the flat
+    // 16384 output cap — which thinking tokens share — truncated every
+    // whole-file `write` of a large map.js. The server salvaged path-only
+    // args, the model misread the validation error as "I forgot content",
+    // and the session looped for hours; at 11% context usage pi never
+    // compacted the poisoned history away. The output budget must SCALE with
+    // the advertised context (context/4), capped at 65536 so a degenerate
+    // runaway generation stays bounded, floored at 1024.
+    func testOutputBudgetScalesWithContext() {
+        XCTAssertEqual(AgentBudget.forServerContext(262144).output, 65536)
+        XCTAssertEqual(AgentBudget.forServerContext(131072).output, 32768)
+        XCTAssertEqual(AgentBudget.forServerContext(524288).output, 65536,
+                       "runaway cap holds at huge contexts")
+        XCTAssertEqual(AgentBudget.forServerContext(65536).output, 16384,
+                       "mid contexts unchanged")
+        XCTAssertEqual(AgentBudget.forServerContext(32768).output, 8192)
+        XCTAssertEqual(AgentBudget.forServerContext(2048).output, 1024, "floor")
+    }
+
     func testBudgetGrowsMonotonicallyWithServerContext() {
         var last = 0
         for advertised in [8192, 16384, 32768, 65536, 94729] {
@@ -83,6 +102,25 @@ final class AgentBudgetTests: XCTestCase {
         XCTAssertEqual(m["maxTokens"] as? Int, b.output)
         XCTAssertNotEqual(m["contextWindow"] as? Int, 32768, "still hardcoded")
         XCTAssertEqual(m["id"] as? String, "Qwen3.6-27B")
+    }
+
+    // pi loads an `AGENTS.md` from its agent config dir into every session's
+    // system prompt (global context file). Ours teaches the chunked-write
+    // convention: pi's `write` has no append flag and pi ALWAYS sends its
+    // configured `maxTokens` (a <=0 value is a config validation error), so a
+    // file bigger than the response cap can only land via bash appends — the
+    // 2026-07-20 loop re-issued an impossible one-shot `write` for hours.
+    func testPiAgentsMDStatesTheCapAndTheChunkingRecovery() {
+        let b = AgentBudget.forServerContext(262144)
+        let md = AgentConfigs.piAgentsMD(budget: b)
+        XCTAssertTrue(md.contains("\(b.output)"),
+                      "must state the real response cap, never a hardcode")
+        XCTAssertTrue(md.lowercased().contains("append"),
+                      "must name the chunked-append escape hatch")
+        XCTAssertTrue(md.lowercased().contains("cut off"),
+                      "must teach truncation recognition — the loop class misread it as a forgotten parameter")
+        XCTAssertFalse(md.contains("__MLX_HOST__"),
+                       "static guidance must not depend on bootstrap substitution")
     }
 
     func testOpencodeConfigDeclaresPerModelLimits() throws {
