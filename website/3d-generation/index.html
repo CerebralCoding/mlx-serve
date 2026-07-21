@@ -7,24 +7,24 @@
   <meta name="description" content="Turn a single photo into a textured 3D model on your Apple Silicon Mac. Hunyuan3D-2.1 runs natively on MLX — shape generation, marching cubes, and a full PBR texture stage, all on-device. Standard GLB output that opens in Blender, Unity, and any glTF viewer.">
   <meta name="keywords" content="photo to 3D model Mac, image to 3D local, Hunyuan3D Mac, AI 3D model generator offline, 3D mesh from photo, GLB generator Apple Silicon, on-device 3D generation, PBR texture generation">
   <meta name="author" content="David Dalcu">
-  <link rel="canonical" href="https://ddalcu.github.io/mlx-serve/3d-generation/">
+  <link rel="canonical" href="https://mlxserve.com/3d-generation/">
   <meta property="og:type" content="website">
-  <meta property="og:url" content="https://ddalcu.github.io/mlx-serve/3d-generation/">
+  <meta property="og:url" content="https://mlxserve.com/3d-generation/">
   <meta property="og:title" content="One photo in. A textured 3D model out. All on your Mac.">
   <meta property="og:description" content="Hunyuan3D-2.1 ported natively to Apple Silicon: shape generation, PBR texturing, and a built-in 3D viewer — no cloud, no upload, standard glTF output.">
-  <meta property="og:image" content="https://ddalcu.github.io/mlx-serve/screenshots/3d-generation.png">
+  <meta property="og:image" content="https://mlxserve.com/screenshots/3d-generation.png">
   <meta property="og:site_name" content="mlx-serve">
   <meta name="twitter:card" content="summary_large_image">
   <meta name="twitter:title" content="One photo in. A textured 3D model out. All on your Mac.">
   <meta name="twitter:description" content="Local image-to-3D with full PBR texturing — standard GLB output, no cloud.">
-  <meta name="twitter:image" content="https://ddalcu.github.io/mlx-serve/screenshots/3d-generation.png">
+  <meta name="twitter:image" content="https://mlxserve.com/screenshots/3d-generation.png">
   <script type="application/ld+json">
   {
     "@context": "https://schema.org",
     "@type": "BreadcrumbList",
     "itemListElement": [
-      { "@type": "ListItem", "position": 1, "name": "mlx-serve", "item": "https://ddalcu.github.io/mlx-serve/" },
-      { "@type": "ListItem", "position": 2, "name": "3D generation", "item": "https://ddalcu.github.io/mlx-serve/3d-generation/" }
+      { "@type": "ListItem", "position": 1, "name": "mlx-serve", "item": "https://mlxserve.com/" },
+      { "@type": "ListItem", "position": 2, "name": "3D generation", "item": "https://mlxserve.com/3d-generation/" }
     ]
   }
   </script>
@@ -69,10 +69,15 @@
     <a href="../" class="nav-logo">
       <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
       <span>mlx-serve</span>
+      <span class="nav-ver">v26.7.10</span>
     </a>
     <ul class="nav-links">
-      <li><a href="../" class="hide-mobile">Overview</a></li>
-      <li><a href="../image-generation/" class="hide-mobile">Image</a></li>
+      <li><a href="../#explore" class="hide-mobile">Deep dives</a></li>
+      <li><a href="../#performance" class="hide-mobile">Performance</a></li>
+      <li><a href="../#features" class="hide-mobile">Features</a></li>
+      <li><a href="../api/" class="hide-mobile">API</a></li>
+      <li><a href="../cli/" class="hide-mobile">CLI</a></li>
+      <li><a href="../llm-tier-list/" class="hide-mobile">Tier list</a></li>
       <li><a href="#faq" class="hide-mobile">FAQ</a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></li>
       <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl">Download</a></li>

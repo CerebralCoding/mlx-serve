@@ -16,7 +16,9 @@
 set -u
 cd "$(dirname "$0")/.." || exit 1
 DOCS="website"
-BASE_URL="https://ddalcu.github.io/mlx-serve"
+# custom domain (repo Settings → Pages) — the old ddalcu.github.io/mlx-serve
+# URLs 301 here, but nothing in the site may reference them anymore
+BASE_URL="https://mlxserve.com"
 
 SLUGS=(
   claude-code-local
@@ -29,6 +31,7 @@ SLUGS=(
   agent-sandbox
   speculative-decoding
   local-ai-assistant
+  llm-tier-list
 )
 
 PASS=0; FAIL=0; PEND=0
@@ -127,6 +130,75 @@ DMG_URL="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dm
 for f in "${html_files[@]}"; do
   check "$f" "$DMG_URL" "$f: direct DMG download CTA"
 done
+
+# ── 7: llm-tier-list interactive contract ──────────────────────────────────
+# The tier-list page is the one interactive page: an S–D tier board, a
+# unified-memory hardware filter, and Google-account voting via Firebase
+# (Auth + Firestore). Votes degrade to localStorage until the Firebase web
+# config is pasted in, so the page must always ship both paths.
+TIER="$DOCS/llm-tier-list/index.html"
+if [ -f "$TIER" ]; then
+  pass
+  check "$TIER" 'id="tier-board"'          "tier-list: tier board container"
+  for t in S A B C D; do
+    check "$TIER" "data-tier=\"$t\""       "tier-list: tier row $t"
+  done
+  check "$TIER" 'id="unranked-table"'      "tier-list: unranked models table"
+  check "$TIER" 'id="unranked-search"'     "tier-list: unranked text filter"
+  check "$TIER" 'promote-pop'              "tier-list: tier-promotion effect"
+  if grep -q 'class="hero-f"' "$TIER"; then
+    fail "tier-list: hero section must stay removed (board above the fold)"
+  else
+    pass
+  fi
+  check "$TIER" 'data-ram='                "tier-list: hardware RAM filter buttons"
+  check "$TIER" 'const SEED_MODELS'        "tier-list: pinned seed/fallback model list"
+  check "$TIER" 'huggingface.co/api/models' "tier-list: live HF popularity query"
+  check "$TIER" 'base_model:quantized'     "tier-list: quant roll-up lineage rule"
+  check "$TIER" 'const firebaseConfig'     "tier-list: firebase web config block"
+  check "$TIER" 'gstatic.com/firebasejs'   "tier-list: firebase SDK import"
+  check "$TIER" 'GoogleAuthProvider'       "tier-list: google sign-in"
+  check "$TIER" 'wilsonLower'              "tier-list: wilson-score tier ranking"
+  check "$TIER" 'localStorage'             "tier-list: unconfigured localStorage fallback"
+  # unit-test the page's embedded logic (tiering, vote sanitization, model
+  # data integrity) — evals the page's own script, so no drift possible
+  if command -v node >/dev/null 2>&1; then
+    if node tests/website_tier_list_logic.mjs; then pass; else fail "tier-list: logic assertions (tests/website_tier_list_logic.mjs)"; fi
+  else
+    pend "tier-list logic assertions skipped (node not installed)"
+  fi
+else
+  fail "llm-tier-list: interactive page missing ($TIER)"
+fi
+
+# ── 8: ONE shared header on every page ──────────────────────────────────────
+# Every page carries the same nav: version pill (= the CHANGELOG's newest
+# entry — catches stale-version drift at release time), a Tier list link,
+# and the Download CTA.
+CL_VER=$(grep -m1 '^## v' CHANGELOG.md | sed -E 's/^## (v[0-9.]+).*/\1/')
+if [ -n "$CL_VER" ]; then
+  pass
+  for f in "$DOCS"/index.html "$DOCS"/*/index.html; do
+    page=$(basename "$(dirname "$f")")
+    check "$f" "nav-ver\">$CL_VER<" "$page: nav version pill = CHANGELOG top ($CL_VER)"
+    check "$f" 'class="nav-dl"'     "$page: nav Download CTA"
+    check "$f" '>Tier list<'        "$page: nav Tier list link"
+  done
+else
+  fail "could not read top version from CHANGELOG.md"
+fi
+
+# ── 9: anchor links must land clear of the fixed 52px nav ───────────────────
+check "$DOCS/assets/feature.css" 'scroll-padding-top' "feature.css: scroll offset for fixed nav"
+check "$DOCS/index.html"         'scroll-padding-top' "index: scroll offset for fixed nav"
+
+# ── 10: tier page has NO local FAQ — its nav points at the homepage FAQ ─────
+if grep -q 'class="faq-wrap"' "$TIER"; then
+  fail "tier-list: local FAQ must stay removed (FAQ lives on the homepage)"
+else
+  pass
+fi
+check "$TIER" 'href="../#faq"' "tier-list: FAQ nav link points at homepage FAQ"
 
 echo ""
 echo "website pages: $PASS passed, $FAIL failed, $PEND pending screenshots"

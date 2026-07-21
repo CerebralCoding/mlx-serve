@@ -1,0 +1,912 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Local LLM Tier List for Apple Silicon — Community Ranked · mlx-serve</title>
+  <meta name="description" content="An S-tier ranking of local LLMs that actually run on Apple Silicon, filtered by your Mac's unified memory. Vote models up or down with your Google account — one vote per model, per person.">
+  <meta name="keywords" content="local LLM tier list, best local LLM Mac, LLM ranking Apple Silicon, best model 16GB Mac, best model 32GB Mac, MLX models ranked, Gemma vs Qwen vs Llama local, which LLM fits my Mac">
+  <meta name="author" content="David Dalcu">
+  <link rel="canonical" href="https://mlxserve.com/llm-tier-list/">
+  <meta property="og:type" content="website">
+  <meta property="og:url" content="https://mlxserve.com/llm-tier-list/">
+  <meta property="og:title" content="The Local LLM Tier List — ranked by people, filtered by your Mac">
+  <meta property="og:description" content="S-tier rankings of local LLMs on Apple Silicon. Pick your Mac's memory, see what fits, vote with your Google account.">
+  <meta property="og:image" content="https://mlxserve.com/appiconb.png">
+  <meta property="og:site_name" content="mlx-serve">
+  <meta name="twitter:card" content="summary">
+  <meta name="twitter:title" content="The Local LLM Tier List — ranked by people, filtered by your Mac">
+  <meta name="twitter:description" content="S-tier rankings of local LLMs on Apple Silicon, filtered by unified memory. One Google account, one vote per model.">
+  <meta name="twitter:image" content="https://mlxserve.com/appiconb.png">
+  <script type="application/ld+json">
+  {
+    "@context": "https://schema.org",
+    "@type": "BreadcrumbList",
+    "itemListElement": [
+      { "@type": "ListItem", "position": 1, "name": "mlx-serve", "item": "https://mlxserve.com/" },
+      { "@type": "ListItem", "position": 2, "name": "LLM tier list", "item": "https://mlxserve.com/llm-tier-list/" }
+    ]
+  }
+  </script>
+  <!-- Firebase init lives in the page's main module script below: the vote
+       backend must share ONE app instance (a second initializeApp throws
+       app/duplicate-app), and Analytics is initialized there alongside it. -->
+  <link rel="icon" href="../appiconb.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link href="https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
+  <link rel="stylesheet" href="../assets/feature.css">
+  <style>:root { --accent: #5e5ce6; --accent2: #bf5af2; }</style>
+  <style>
+    /* ─── tier-list-specific styles (extends feature.css) ─── */
+    .board-wrap { max-width: 1040px; margin: 0 auto; padding: 0 24px 40px; }
+
+    .controls {
+      display: flex; flex-direction: column; gap: 14px;
+      background: var(--bg-alt); border-radius: var(--radius);
+      padding: 18px 20px; margin-bottom: 28px;
+    }
+    .controls-row { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+    .controls-label {
+      font-size: 12px; font-weight: 600; letter-spacing: 0.04em; text-transform: uppercase;
+      color: var(--text-tertiary); min-width: 104px;
+    }
+    .seg { display: flex; gap: 6px; flex-wrap: wrap; }
+    .seg button {
+      font: inherit; font-size: 13px; font-weight: 500; cursor: pointer;
+      padding: 6px 13px; border-radius: 100px; border: 1px solid var(--border);
+      background: var(--white); color: var(--text-secondary);
+      transition: all 0.15s ease;
+    }
+    .seg button:hover { border-color: var(--accent); color: var(--text-primary); }
+    .seg button.on {
+      background: var(--accent); border-color: var(--accent);
+      color: var(--white); font-weight: 600;
+    }
+
+    .auth-row { display: flex; align-items: center; gap: 12px; margin-left: auto; }
+    .auth-btn {
+      font: inherit; font-size: 13px; font-weight: 600; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 8px;
+      padding: 7px 15px; border-radius: 100px; border: 1px solid var(--border);
+      background: var(--white); color: var(--text-primary);
+      transition: all 0.15s ease;
+    }
+    .auth-btn:hover { border-color: var(--accent); box-shadow: var(--shadow-card); }
+    .auth-btn svg { width: 15px; height: 15px; }
+    .auth-user { display: none; align-items: center; gap: 8px; font-size: 13px; color: var(--text-secondary); }
+    .auth-user img { width: 24px; height: 24px; border-radius: 50%; }
+    .auth-user .signout {
+      font: inherit; font-size: 12px; cursor: pointer; border: none; background: none;
+      color: var(--text-tertiary); text-decoration: underline;
+    }
+    .auth-user .signout:hover { color: var(--text-primary); }
+
+    .vote-note {
+      font-size: 12.5px; color: var(--text-tertiary); line-height: 1.45;
+      border-top: 1px solid var(--border); padding-top: 12px;
+    }
+    .vote-note.warn { color: #b25000; }
+
+    /* ─── tier rows ─── */
+    .tier-row {
+      display: flex; align-items: stretch; gap: 0;
+      border: 1px solid var(--border); border-radius: var(--radius);
+      background: var(--white); box-shadow: var(--shadow-card);
+      margin-bottom: 14px; overflow: hidden; min-height: 96px;
+    }
+    .tier-badge {
+      flex: 0 0 84px; display: flex; align-items: center; justify-content: center;
+      font-size: 40px; font-weight: 800; letter-spacing: -0.02em; color: #fff;
+      font-family: var(--mono);
+    }
+    .tier-row[data-tier="S"] .tier-badge { background: linear-gradient(135deg, #ff9f0a, #ff375f); }
+    .tier-row[data-tier="A"] .tier-badge { background: linear-gradient(135deg, #30d158, #0e8a4f); }
+    .tier-row[data-tier="B"] .tier-badge { background: linear-gradient(135deg, #64d2ff, #0a84ff); }
+    .tier-row[data-tier="C"] .tier-badge { background: linear-gradient(135deg, #a8a8ad, #6e6e73); }
+    .tier-row[data-tier="D"] .tier-badge { background: linear-gradient(135deg, #d8d8dc, #aeaeb2); color: #6e6e73; }
+    .tier-row[data-tier="U"] .tier-badge {
+      background: repeating-linear-gradient(135deg, #f5f5f7, #f5f5f7 8px, #ececef 8px, #ececef 16px);
+      color: var(--text-tertiary); font-size: 15px; font-weight: 600; font-family: inherit;
+      text-align: center; line-height: 1.3;
+    }
+    .tier-cards {
+      flex: 1; display: flex; flex-wrap: wrap; gap: 10px;
+      padding: 12px; align-content: flex-start;
+    }
+    .tier-empty {
+      align-self: center; font-size: 13px; color: var(--text-tertiary); padding: 8px 6px;
+    }
+
+    .model-chip {
+      border: 1px solid var(--border); border-radius: var(--radius-sm);
+      background: var(--white); padding: 10px 12px 8px;
+      display: flex; flex-direction: column; gap: 5px; min-width: 190px;
+      transition: box-shadow 0.15s ease, transform 0.15s ease;
+    }
+    .model-chip:hover { box-shadow: var(--shadow-card); transform: translateY(-1px); }
+    .mc-name { font-size: 13.5px; font-weight: 600; letter-spacing: -0.01em; }
+    .mc-meta { font-size: 11.5px; color: var(--text-tertiary); font-family: var(--mono); }
+    .mc-tags { display: flex; gap: 4px; flex-wrap: wrap; }
+    .mc-tag {
+      font-size: 10px; font-weight: 600; letter-spacing: 0.03em; text-transform: uppercase;
+      color: var(--accent); background: var(--accent-soft);
+      border-radius: 5px; padding: 2px 6px;
+    }
+    .mc-tag.mc-new { color: #0e8a4f; background: #e4f8ea; }
+    .mc-votes { display: flex; gap: 6px; margin-top: 2px; }
+    .vote-btn {
+      font: inherit; font-size: 12px; font-weight: 600; cursor: pointer;
+      display: inline-flex; align-items: center; gap: 5px;
+      padding: 4px 10px; border-radius: 7px; border: 1px solid var(--border);
+      background: var(--bg-alt); color: var(--text-secondary);
+      transition: all 0.12s ease;
+    }
+    .vote-btn:hover { border-color: var(--text-secondary); color: var(--text-primary); }
+    .vote-btn.vote-up.mine { background: #e4f8ea; border-color: #30d158; color: #0e8a4f; }
+    .vote-btn.vote-down.mine { background: #ffe9e7; border-color: #ff6961; color: #c22e26; }
+
+    /* ─── compact header (hero removed: board stays above the fold) ─── */
+    .page-head { padding: 26px 0 18px; }
+    .page-head .crumbs { font-size: 12px; color: var(--text-tertiary); margin-bottom: 10px; }
+    .page-head .crumbs a { color: var(--text-tertiary); text-decoration: none; }
+    .page-head .crumbs a:hover { color: var(--text-primary); }
+    .page-head .crumbs .sep { margin: 0 6px; }
+    .page-title { font-size: 32px; font-weight: 700; letter-spacing: -0.02em; line-height: 1.15; }
+    .page-title .grad {
+      background: linear-gradient(90deg, var(--accent), var(--accent2));
+      -webkit-background-clip: text; background-clip: text; color: transparent;
+    }
+    .page-sub { font-size: 14px; color: var(--text-secondary); margin-top: 7px; max-width: 660px; }
+
+    /* ─── unranked table ─── */
+    .unranked-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; margin: 34px 0 4px; flex-wrap: wrap; }
+    .unranked-head h2 { font-size: 20px; letter-spacing: -0.01em; }
+    #unranked-search {
+      font: inherit; font-size: 13px; padding: 7px 14px; min-width: 230px;
+      border-radius: 100px; border: 1px solid var(--border); background: var(--white); outline: none;
+      transition: border-color 0.15s ease, box-shadow 0.15s ease;
+    }
+    #unranked-search:focus { border-color: var(--accent); box-shadow: 0 0 0 3px var(--accent-soft); }
+    .unranked-sub { font-size: 12.5px; color: var(--text-tertiary); margin-bottom: 12px; }
+    .table-wrap {
+      overflow-x: auto; border: 1px solid var(--border); border-radius: var(--radius);
+      background: var(--white); box-shadow: var(--shadow-card);
+    }
+    #unranked-table { width: 100%; border-collapse: collapse; font-size: 13px; }
+    #unranked-table th {
+      text-align: left; font-size: 11px; font-weight: 600; text-transform: uppercase;
+      letter-spacing: 0.05em; color: var(--text-tertiary);
+      padding: 10px 12px; border-bottom: 1px solid var(--border); white-space: nowrap;
+    }
+    #unranked-table td { padding: 9px 12px; border-bottom: 1px solid var(--border); vertical-align: middle; white-space: nowrap; }
+    #unranked-table tr:last-child td { border-bottom: none; }
+    #unranked-table tbody tr:hover { background: var(--bg-alt); }
+    .td-name { font-weight: 600; }
+    .table-empty { text-align: center; color: var(--text-tertiary); padding: 18px 12px; }
+
+    /* ─── tier-promotion effect + toast ─── */
+    @keyframes promote-pop {
+      0% { transform: scale(0.6); box-shadow: 0 0 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+      45% { transform: scale(1.08); }
+      100% { transform: scale(1); box-shadow: 0 0 0 18px transparent; }
+    }
+    .model-chip.promoted { animation: promote-pop 1.4s cubic-bezier(0.2, 0.9, 0.3, 1.2); border-color: var(--accent); }
+    .toast {
+      position: fixed; left: 50%; bottom: 28px; transform: translateX(-50%);
+      background: var(--ink); color: #fff; font-size: 13.5px; font-weight: 600;
+      padding: 11px 20px; border-radius: 100px; box-shadow: var(--shadow-elevated);
+      z-index: 200; pointer-events: none; max-width: min(92vw, 480px); text-align: center;
+      animation: toast-in-out 4s ease forwards;
+    }
+    @keyframes toast-in-out {
+      0% { opacity: 0; transform: translate(-50%, 12px); }
+      8%, 88% { opacity: 1; transform: translate(-50%, 0); }
+      100% { opacity: 0; transform: translate(-50%, -6px); }
+    }
+
+    @media (max-width: 600px) {
+      .tier-badge { flex-basis: 56px; font-size: 28px; }
+      .model-chip { min-width: 150px; flex: 1; }
+      .auth-row { margin-left: 0; }
+      .page-title { font-size: 26px; }
+      #unranked-table th:nth-child(5), #unranked-table td:nth-child(5),
+      #unranked-table th:nth-child(6), #unranked-table td:nth-child(6) { display: none; }
+    }
+  </style>
+</head>
+<body>
+
+  <nav>
+    <a href="../" class="nav-logo">
+      <img src="../appiconb.png" alt="MLX Core" class="nav-logo-img">
+      <span>mlx-serve</span>
+      <span class="nav-ver">v26.7.10</span>
+    </a>
+    <ul class="nav-links">
+      <li><a href="../#explore" class="hide-mobile">Deep dives</a></li>
+      <li><a href="../#performance" class="hide-mobile">Performance</a></li>
+      <li><a href="../#features" class="hide-mobile">Features</a></li>
+      <li><a href="../api/" class="hide-mobile">API</a></li>
+      <li><a href="../cli/" class="hide-mobile">CLI</a></li>
+      <li><a href="./" class="hide-mobile nav-current">Tier list</a></li>
+      <li><a href="../#faq" class="hide-mobile">FAQ</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" class="nav-github" target="_blank" rel="noopener" aria-label="GitHub"><svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg></a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl">Download</a></li>
+    </ul>
+  </nav>
+
+  <section class="section" style="padding-top: 72px;">
+    <div class="board-wrap">
+
+      <div class="page-head">
+        <div class="crumbs"><a href="../">mlx-serve</a><span class="sep">/</span><span class="here">Community · Tier list</span></div>
+        <h1 class="page-title">The local LLM tier list<span class="grad">.</span></h1>
+        <p class="page-sub">Community-voted rankings of the LLMs that run locally on Apple Silicon — auto-updated from Hugging Face, filtered to your Mac's unified memory. One Google account, one vote per model.</p>
+      </div>
+
+      <div class="controls reveal">
+        <div class="controls-row">
+          <span class="controls-label">My Mac has</span>
+          <div class="seg" id="ram-filter">
+            <button data-ram="0" class="on">Any</button>
+            <button data-ram="8">8 GB</button>
+            <button data-ram="16">16 GB</button>
+            <button data-ram="24">24 GB</button>
+            <button data-ram="32">32 GB</button>
+            <button data-ram="48">48 GB</button>
+            <button data-ram="64">64 GB</button>
+            <button data-ram="96">96 GB</button>
+            <button data-ram="128">128 GB</button>
+            <button data-ram="192">192+ GB</button>
+          </div>
+        </div>
+        <div class="controls-row">
+          <span class="controls-label">Must have</span>
+          <div class="seg" id="tag-filter">
+            <button data-tag="vision">Vision</button>
+            <button data-tag="moe">MoE</button>
+            <button data-tag="fast">Small &amp; fast</button>
+          </div>
+          <div class="auth-row">
+            <button class="auth-btn" id="signin-btn">
+              <svg viewBox="0 0 48 48"><path fill="#EA4335" d="M24 9.5c3.54 0 6.71 1.22 9.21 3.6l6.85-6.85C35.9 2.38 30.47 0 24 0 14.62 0 6.51 5.38 2.56 13.22l7.98 6.19C12.43 13.72 17.74 9.5 24 9.5z"/><path fill="#4285F4" d="M46.98 24.55c0-1.57-.15-3.09-.38-4.55H24v9.02h12.94c-.58 2.96-2.26 5.48-4.78 7.18l7.73 6c4.51-4.18 7.09-10.36 7.09-17.65z"/><path fill="#FBBC05" d="M10.53 28.59c-.48-1.45-.76-2.99-.76-4.59s.27-3.14.76-4.59l-7.98-6.19C.92 16.46 0 20.12 0 24c0 3.88.92 7.54 2.56 10.78l7.97-6.19z"/><path fill="#34A853" d="M24 48c6.48 0 11.93-2.13 15.89-5.81l-7.73-6c-2.15 1.45-4.92 2.3-8.16 2.3-6.26 0-11.57-4.22-13.47-9.91l-7.98 6.19C6.51 42.62 14.62 48 24 48z"/></svg>
+              Sign in to vote
+            </button>
+            <span class="auth-user" id="auth-user">
+              <img id="auth-avatar" alt="" referrerpolicy="no-referrer">
+              <span id="auth-name"></span>
+              <button class="signout" id="signout-btn">sign out</button>
+            </span>
+          </div>
+        </div>
+        <div class="vote-note" id="vote-note">Loading votes…</div>
+      </div>
+
+      <div id="tier-board">
+        <div class="tier-row" data-tier="S"><div class="tier-badge">S</div><div class="tier-cards"></div></div>
+        <div class="tier-row" data-tier="A"><div class="tier-badge">A</div><div class="tier-cards"></div></div>
+        <div class="tier-row" data-tier="B"><div class="tier-badge">B</div><div class="tier-cards"></div></div>
+        <div class="tier-row" data-tier="C"><div class="tier-badge">C</div><div class="tier-cards"></div></div>
+        <div class="tier-row" data-tier="D"><div class="tier-badge">D</div><div class="tier-cards"></div></div>
+      </div>
+
+      <div class="unranked-head">
+        <h2>Not yet ranked</h2>
+        <input id="unranked-search" type="search" placeholder="Filter models…" aria-label="Filter unranked models">
+      </div>
+      <p class="unranked-sub">The first community vote puts a model on the board. Same hardware filters as above; rows hold their position while you vote.</p>
+      <div class="table-wrap">
+        <table id="unranked-table">
+          <thead>
+            <tr><th>Model</th><th>Params</th><th>~Size</th><th>Runs on</th><th>↓ / mo</th><th>Tags</th><th>Your vote</th></tr>
+          </thead>
+          <tbody id="unranked-tbody"></tbody>
+        </table>
+      </div>
+
+    </div>
+  </section>
+
+  <section class="section section-alt" id="how">
+    <div class="section-header reveal">
+      <div class="section-label">How it works</div>
+      <h2 class="section-title">Honest rankings, tiny rules</h2>
+    </div>
+    <div class="mini-grid">
+      <div class="mini-card reveal"><span class="mini-k">Voting</span><h4>One account, one vote per model</h4><p>Sign in with Google, then ▲ or ▼ any model. Click the same arrow again to take your vote back, or the other one to flip it. Your votes are keyed to your account — refreshing, reinstalling, or switching devices can't double-count you.</p></div>
+      <div class="mini-card reveal"><span class="mini-k">Tiers</span><h4>Wilson score, not raw sums</h4><p>Tiers come from the lower bound of the Wilson confidence interval on the up-ratio — a first vote enters a model cautiously (C), and it needs consistent upvotes to climb toward S. Ten early fans can't out-rank a hundred mixed reviews.</p></div>
+      <div class="mini-card reveal"><span class="mini-k">Hardware</span><h4>The filter is about fitting</h4><p>Each model lists its approximate quantized footprint; the RAM filter hides anything that wouldn't leave your Mac room to breathe (weights ≲ 75% of unified memory). Votes are global — the filter changes what you see, not the scores.</p></div>
+      <div class="mini-card reveal"><span class="mini-k">Privacy</span><h4>No emails stored, ever</h4><p>Votes are stored against an opaque account id in Firestore. The public data is just <i>model → up/down counts</i>; your name and email never leave the sign-in widget in your own browser.</p></div>
+    </div>
+  </section>
+
+
+  <section class="section" style="padding-top: 0;">
+    <div class="cta-band reveal">
+      <h2>Found your model?<br>Run it in one command.</h2>
+      <p><code>mlx-serve run &lt;model&gt;</code> downloads it straight from Hugging Face and drops you into a chat — or grab the Mac app.</p>
+      <div class="hero-ctas">
+        <a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="btn btn-primary">Download for Mac</a>
+        <a href="https://github.com/ddalcu/mlx-serve" class="btn btn-secondary" target="_blank" rel="noopener">View on GitHub</a>
+      </div>
+    </div>
+  </section>
+
+  <footer>
+    <ul class="footer-links">
+      <li><a href="../">Home</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve" target="_blank" rel="noopener">GitHub</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases" target="_blank" rel="noopener">Releases</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/blob/main/CHANGELOG.md" target="_blank" rel="noopener">Changelog</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/issues" target="_blank" rel="noopener">Issues</a></li>
+    </ul>
+    <p class="footer-copy">MIT License · mlx-serve · built for Apple Silicon</p>
+  </footer>
+
+  <script src="../assets/feature.js"></script>
+
+  <script type="module">
+  // ════════════════════════════════════════════════════════════════════════
+  // MODEL LIST — ranked live from Hugging Face download popularity (see the
+  // pipeline below). SEED_MODELS is the pinned/fallback set: models HF's MLX
+  // filter can't surface (GGUF-only engines) plus an offline fallback when
+  // the API is unreachable. Ids are normalized base names — they double as
+  // the vote keys, so NEVER reuse an id for a different model.
+  //   sizeGb  : approx 4-bit quantized footprint (weights on disk ≈ in RAM)
+  //   minRam  : smallest unified-memory tier it's comfortable on
+  //   tags    : vision | moe | fast
+  // ════════════════════════════════════════════════════════════════════════
+  const SEED_MODELS = [
+    { id: "gemma-4-e2b",      name: "Gemma 4 E2B",       params: "5B (2B act)",  sizeGb: 2.4, minRam: 8,   tags: ["fast", "vision"], downloads: 0 },
+    { id: "gemma-4-e4b",      name: "Gemma 4 E4B",       params: "8B (4B act)",  sizeGb: 4.2, minRam: 8,   tags: ["fast", "vision"], downloads: 0 },
+    { id: "gemma-4-12b",      name: "Gemma 4 12B",       params: "12B",          sizeGb: 7.0, minRam: 16,  tags: ["vision"], downloads: 0 },
+    { id: "gemma-4-26b-a4b",  name: "Gemma 4 26B-A4B",   params: "26B (4B act)", sizeGb: 15,  minRam: 24,  tags: ["moe", "vision", "fast"], downloads: 0 },
+    { id: "qwen3.6-27b",      name: "Qwen3.6 27B",       params: "27B",          sizeGb: 15.5, minRam: 24, tags: [], downloads: 0 },
+    { id: "qwen3.6-35b-a3b",  name: "Qwen3.6 35B-A3B",   params: "35B (3B act)", sizeGb: 20,  minRam: 32,  tags: ["moe", "fast"], downloads: 0 },
+    { id: "llama-3.3-70b",    name: "Llama 3.3 70B",     params: "70B",          sizeGb: 40,  minRam: 64,  tags: [], downloads: 0 },
+    { id: "deepseek-v4-flash", name: "DeepSeek-V4-Flash", params: "MoE · GGUF",  sizeGb: 81,  minRam: 128, tags: ["moe"], downloads: 0 },
+    { id: "hy3",              name: "Hunyuan 3 295B",    params: "295B MoE",     sizeGb: 95,  minRam: 128, tags: ["moe"], downloads: 0 },
+  ];
+  const TAG_LABELS = { vision: "Vision", moe: "MoE", fast: "Fast" };
+
+  // ════════════════════════════════════════════════════════════════════════
+  // HUGGING FACE POPULARITY PIPELINE (pure part — unit-tested by
+  // tests/website_tier_list_logic.mjs against the code below verbatim).
+  //
+  // The board shows TOP-LEVEL models only. Every fetched repo is
+  // canonicalized: official-org repos count as themselves; quantized
+  // conversions (base_model:quantized:X lineage tag) roll their downloads up
+  // into official X; community finetunes/merges/adapters are rejected.
+  // -Base / -Instruct / -it siblings collapse into one entry.
+  // ════════════════════════════════════════════════════════════════════════
+  const HF_API = "https://huggingface.co/api/models";
+  const OFFICIAL_ORGS = new Set(["qwen", "google", "meta-llama", "mistralai",
+    "deepseek-ai", "liquidai", "nvidia", "tencent", "moonshotai", "microsoft",
+    "ibm-granite", "zai-org", "openai", "antirez",
+    "deepreinforce-ai", "prism-ml", "minimaxai"]);
+  // Modern-generation architectures worth ranking. This is a POPULARITY
+  // gate, not a runnability guarantee: most entries run in mlx-serve
+  // (natively or via the embedded GGUF engines), a few frontier-scale ones
+  // are listed for completeness. Legacy generations (qwen2/2.5, gpt2, opt,
+  // phi, gemma2, …) are deliberately absent — see MODERN_FLOOR too.
+  const LISTED_ARCHS = new Set(["gemma4", "gemma4_text", "diffusion_gemma",
+    "gemma3", "gemma3_text", "qwen3", "qwen3_5", "qwen3_5_moe",
+    "qwen3_5_moe_text", "qwen3_next", "qwen3_moe", "qwen3_vl", "qwen3_vl_moe",
+    "nemotron_h", "lfm2", "hy_v3", "llama", "mistral",
+    "gpt_oss", "deepseek_v4", "glm_moe_dsa", "glm4_moe_lite", "glm4_moe",
+    "granite", "kimi_k2", "kimi_k25", "minimax_m2", "minimax_m3_vl"]);
+  // no-legacy backstop: a group whose model launched before this never lists
+  const MODERN_FLOOR = Date.parse("2024-01-01T00:00:00Z");
+  const STRIP_TOKENS = new Set(["mlx", "gguf", "bf16", "fp16", "f16", "fp8",
+    "fp4", "nvfp4", "mxfp4", "mxfp8", "int4", "int8", "dwq", "qat", "awq",
+    "gptq", "instruct", "it", "base", "pt", "chat", "hf"]);
+  const RAM_TIERS = [8, 16, 24, 32, 48, 64, 96, 128, 192];
+  const NEW_WINDOW_MS = 45 * 864e5;
+
+  function normalizeBaseName(basename) {
+    const words = basename.split("-");
+    while (words.length > 1) {
+      const w = words[words.length - 1].toLowerCase();
+      if (STRIP_TOKENS.has(w) || /^\d+-?bit$/.test(w) || /^q\d(_.+)?$/.test(w)) words.pop();
+      else break;
+    }
+    return words.join("-").toLowerCase();
+  }
+  function prettyName(basename) {
+    const words = basename.split("-");
+    while (words.length > 1 && STRIP_TOKENS.has(words[words.length - 1].toLowerCase())) words.pop();
+    return words.map((w) => {
+      if (/^\d+(\.\d+)?[bm]$/i.test(w)) return w.toUpperCase();
+      if (w.length <= 3 && /^[a-z](\d+[a-z]?|[a-z]{0,2})$/i.test(w)) return w.toUpperCase();
+      return w.charAt(0).toUpperCase() + w.slice(1);
+    }).join(" ");
+  }
+  function baseModelRels(tags) {
+    const rel = { quantized: [], finetune: [], other: [], plain: [] };
+    for (const t of tags || []) {
+      if (!t.startsWith("base_model:")) continue;
+      const rest = t.slice("base_model:".length);
+      const m = rest.match(/^(quantized|finetune|adapter|merge):(.+)$/);
+      if (!m) rel.plain.push(rest);
+      else if (m[1] === "quantized") rel.quantized.push(m[2]);
+      else if (m[1] === "finetune") rel.finetune.push(m[2]);
+      else rel.other.push(m[2]);
+    }
+    return rel;
+  }
+  function canonicalRepoFor(item) {
+    const org = item.id.split("/")[0].toLowerCase();
+    if (OFFICIAL_ORGS.has(org)) return item.id;
+    const rel = baseModelRels(item.tags);
+    if (rel.finetune.length || rel.other.length) return null; // derivative work
+    const target = rel.quantized[0] || rel.plain[0];
+    if (target && OFFICIAL_ORGS.has(target.split("/")[0].toLowerCase())) return target;
+    return null;
+  }
+  function paramsFor(item, basename) {
+    if (item.safetensors && item.safetensors.total) return item.safetensors.total;
+    const sizes = (basename.match(/\d+(\.\d+)?b(?![a-z0-9])/ig) || []).map(parseFloat);
+    return sizes.length ? Math.max(...sizes) * 1e9 : 0;
+  }
+  function minRamFor(sizeGb) {
+    for (const tier of RAM_TIERS) if (sizeGb <= tier * 0.75) return tier;
+    return RAM_TIERS[RAM_TIERS.length - 1];
+  }
+  function paramsLabel(params, activeM) {
+    const b = params / 1e9;
+    const label = (b >= 10 ? Math.round(b) : Math.round(b * 10) / 10) + "B";
+    return activeM ? label + " (" + activeM[1] + "B act)" : label;
+  }
+  function groupHfModels(textItems, visionItems, now) {
+    const groups = new Map();
+    const consider = (textItems || []).map((i) => ({ i, vision: false }))
+      .concat((visionItems || []).map((i) => ({ i, vision: true })));
+    for (const { i, vision } of consider) {
+      const canonical = canonicalRepoFor(i);
+      if (!canonical) continue;
+      const tags = i.tags || [];
+      const arch = tags.find((t) => LISTED_ARCHS.has(t));
+      // GGUF releases often carry no model_type tag (Bonsai class); the org/
+      // lineage gate above already vouches for them
+      if (!arch && !tags.includes("gguf")) continue;
+      const cbase = canonical.split("/").pop();
+      const key = normalizeBaseName(cbase);
+      let g = groups.get(key);
+      if (!g) { g = { id: key, base: cbase, arch, downloads: 0, params: 0, vision: false, created: Infinity }; groups.set(key, g); }
+      if (!g.arch && arch) g.arch = arch;
+      g.downloads += i.downloads || 0;
+      g.params = Math.max(g.params, paramsFor(i, cbase) || 0);
+      g.vision = g.vision || vision || (i.tags || []).includes("image-text-to-text");
+      const c = Date.parse(i.createdAt || "");
+      if (!isNaN(c)) g.created = Math.min(g.created, c);
+    }
+    const out = [];
+    for (const g of groups.values()) {
+      if (!g.params) continue; // can't size it -> can't place it on the board
+      if (g.created !== Infinity && g.created < MODERN_FLOOR) continue; // legacy
+      const sizeGb = Math.max(0.1, Math.round(g.params * 0.5625 / 1e9 * 10) / 10);
+      const activeM = g.base.match(/(?:^|-)a(\d+(\.\d+)?)b(?:-|$)/i);
+      const arch = g.arch || "";
+      const moe = !!activeM || arch.endsWith("_moe") || arch === "hy_v3" || arch === "glm_moe_dsa";
+      const tags = [];
+      if (g.vision) tags.push("vision");
+      if (moe) tags.push("moe");
+      if (sizeGb <= 5 || (activeM && parseFloat(activeM[1]) <= 5.5)) tags.push("fast");
+      out.push({
+        id: g.id, name: prettyName(g.base), params: paramsLabel(g.params, activeM),
+        sizeGb, minRam: minRamFor(sizeGb), tags, downloads: g.downloads,
+        isNew: now - g.created < NEW_WINDOW_MS,
+      });
+    }
+    out.sort((a, b) => b.downloads - a.downloads);
+    // 60 keeps the new-lab / frontier tail (Bonsai, Kimi, MiniMax ~1M dl/mo)
+    // on the board; the unranked table is filterable so length is cheap
+    return out.slice(0, 60);
+  }
+  function mergeWithSeed(groups, seeds) {
+    const have = new Set(groups.map((g) => g.id));
+    return groups.concat(seeds.filter((s) => !have.has(s.id)));
+  }
+
+  // ── unranked-table helpers ─────────────────────────────────────────────
+  // The table's order is popularity, NEVER vote score — so casting a vote
+  // can't shuffle rows under the user's cursor. A model only moves when it
+  // earns its MIN_VOTES-th vote and leaves the table for the tier board.
+  function matchesQuery(m, q) {
+    q = (q || "").trim().toLowerCase();
+    if (!q) return true;
+    const hay = (m.name + " " + m.id + " " + m.params + " " + (m.tags || []).join(" ")).toLowerCase();
+    return hay.includes(q);
+  }
+  function unrankedOrder(models) {
+    return models.slice().sort((a, b) =>
+      (b.downloads || 0) - (a.downloads || 0) || a.name.localeCompare(b.name));
+  }
+  // A promotion = an entry moving "U" → ranked between two TRACKED renders.
+  // The first render with real tallies passes track=false so it only
+  // baselines `prev` — otherwise every already-ranked model would
+  // "celebrate" on page load.
+  function promotionsSince(prev, entries, track) {
+    const out = [];
+    for (const e of entries) {
+      if (track && prev[e.id] === "U" && e.tier !== "U") out.push(e);
+      prev[e.id] = e.tier;
+    }
+    return out;
+  }
+
+  // ════════════════════════════════════════════════════════════════════════
+  // FIREBASE WEB CONFIG (project: mlxserve) — PUBLIC BY DESIGN: it only
+  // identifies the Firebase project; write access is enforced by the
+  // Firestore security rules (docs/llm-tier-list-setup.md). Auth, Firestore,
+  // and Analytics all hang off the single app initialized in the vote
+  // backend below. If the config is ever blanked back to a PASTE_
+  // placeholder, the page falls back to local demo mode.
+  // ════════════════════════════════════════════════════════════════════════
+  const firebaseConfig = {
+    apiKey: "AIzaSyC3puJTUMJ2hZV4aWlSIOCUjwDToer6_2s",
+    authDomain: "mlxserve.firebaseapp.com",
+    projectId: "mlxserve",
+    storageBucket: "mlxserve.firebasestorage.app",
+    messagingSenderId: "1017559680175",
+    appId: "1:1017559680175:web:d85b66892cd3a043bb805a",
+    measurementId: "G-TMW6L07M84",
+  };
+  const FIREBASE_READY = !firebaseConfig.apiKey.startsWith("PASTE_");
+
+  // ── ranking: Wilson score lower bound (z = 1.28 ≈ 80% one-sided) ─────────
+  const MIN_VOTES = 1;
+  function wilsonLower(up, down) {
+    const n = up + down;
+    if (n === 0) return 0;
+    const z = 1.28, z2 = z * z, p = up / n;
+    return (p + z2 / (2 * n) - z * Math.sqrt((p * (1 - p) + z2 / (4 * n)) / n)) / (1 + z2 / n);
+  }
+  function tierFor(up, down) {
+    if (up + down < MIN_VOTES) return "U";
+    const w = wilsonLower(up, down);
+    if (w >= 0.78) return "S";
+    if (w >= 0.62) return "A";
+    if (w >= 0.46) return "B";
+    if (w >= 0.30) return "C";
+    return "D";
+  }
+
+  // ── state ────────────────────────────────────────────────────────────────
+  const state = {
+    ram: 0,                  // 0 = any
+    tags: new Set(),
+    query: "",               // unranked-table text filter
+    talliesReady: false,     // true once real vote data has arrived
+    tallies: {},             // modelId -> {up, down}
+    mine: {},                // modelId -> 1 | -1 (this user's votes)
+    user: null,              // firebase user or null
+  };
+  // active list starts as the seed and is swapped for the live HF ranking at
+  // boot; vote sanitization always follows the ACTIVE list
+  let activeModels = SEED_MODELS;
+  let validIds = new Set(SEED_MODELS.map((m) => m.id));
+  function setActiveModels(list) {
+    activeModels = list;
+    validIds = new Set(list.map((m) => m.id));
+  }
+
+  // ── vote backends: firestore when configured, localStorage otherwise ─────
+  const LS_KEY = "llm-tier-list-demo-votes";
+  let backend;
+
+  function localBackend() {
+    let choices = {};
+    try { choices = JSON.parse(localStorage.getItem(LS_KEY) || "{}"); } catch (_) {}
+    return {
+      demo: true,
+      start() {
+        state.mine = sanitize(choices);
+        state.tallies = talliesFrom([state.mine]);
+        state.talliesReady = true;
+        render();
+      },
+      async vote(modelId, value) {
+        if (value === 0) delete choices[modelId]; else choices[modelId] = value;
+        localStorage.setItem(LS_KEY, JSON.stringify(choices));
+        this.start();
+      },
+      async signIn() {}, async signOut() {},
+    };
+  }
+
+  async function firestoreBackend() {
+    const [appMod, auth, fs] = await Promise.all([
+      import("https://www.gstatic.com/firebasejs/12.16.0/firebase-app.js"),
+      import("https://www.gstatic.com/firebasejs/12.16.0/firebase-auth.js"),
+      import("https://www.gstatic.com/firebasejs/12.16.0/firebase-firestore.js"),
+    ]);
+    const app = appMod.getApps().length ? appMod.getApp() : appMod.initializeApp(firebaseConfig);
+    // Analytics (from the console snippet) — fire-and-forget, never fatal
+    import("https://www.gstatic.com/firebasejs/12.16.0/firebase-analytics.js")
+      .then((an) => an.isSupported().then((ok) => { if (ok) an.getAnalytics(app); }))
+      .catch(() => {});
+    const db = fs.getFirestore(app);
+    const a = auth.getAuth(app);
+    let myChoices = {};
+    return {
+      demo: false,
+      start() {
+        auth.onAuthStateChanged(a, (user) => {
+          state.user = user;
+          renderAuth();
+        });
+        // Live tallies: one doc per account, { choices: { modelId: ±1 } }.
+        // Reads scale with the number of VOTERS, not votes — fine for a
+        // community page; see docs/llm-tier-list-setup.md for the upgrade
+        // path if this ever outgrows the Firestore free tier.
+        fs.onSnapshot(fs.collection(db, "votes"), (snap) => {
+          const all = [];
+          snap.forEach((d) => {
+            const c = sanitize((d.data() || {}).choices);
+            all.push(c);
+            if (state.user && d.id === state.user.uid) { myChoices = c; state.mine = c; }
+          });
+          state.tallies = talliesFrom(all);
+          state.talliesReady = true;
+          render();
+        }, (err) => note("Couldn't load votes (" + err.code + "). Check the Firestore rules.", true));
+      },
+      async vote(modelId, value) {
+        if (!state.user) { await this.signIn(); if (!state.user) return; }
+        if (value === 0) delete myChoices[modelId]; else myChoices[modelId] = value;
+        state.mine = { ...myChoices };
+        render(); // optimistic; the snapshot listener reconciles
+        await fs.setDoc(fs.doc(db, "votes", state.user.uid), {
+          choices: myChoices,
+          updated: fs.serverTimestamp(),
+        });
+      },
+      async signIn() {
+        try { await auth.signInWithPopup(a, new auth.GoogleAuthProvider()); }
+        catch (e) { if (e.code !== "auth/popup-closed-by-user") note("Sign-in failed: " + e.code, true); }
+      },
+      async signOut() { await auth.signOut(a); state.mine = {}; myChoices = {}; render(); },
+    };
+  }
+
+  function sanitize(choices) {
+    // Reader-side enforcement: only known models, only exact ±1 — a
+    // hand-edited vote doc still counts as at most one vote per model.
+    const out = {};
+    for (const [k, v] of Object.entries(choices || {})) {
+      if (validIds.has(k) && (v === 1 || v === -1)) out[k] = v;
+    }
+    return out;
+  }
+  function talliesFrom(allChoices) {
+    const t = {};
+    for (const m of activeModels) t[m.id] = { up: 0, down: 0 };
+    for (const c of allChoices) {
+      for (const [id, v] of Object.entries(c)) {
+        if (v === 1) t[id].up++; else t[id].down++;
+      }
+    }
+    return t;
+  }
+
+  // ── rendering ────────────────────────────────────────────────────────────
+  const board = document.getElementById("tier-board");
+  const rows = {};
+  board.querySelectorAll(".tier-row").forEach((r) => { rows[r.dataset.tier] = r.querySelector(".tier-cards"); });
+
+  function fits(m) {
+    if (state.ram !== 0 && m.minRam > state.ram) return false;
+    for (const t of state.tags) if (!m.tags.includes(t)) return false;
+    return true;
+  }
+
+  const lastTier = {};
+  let promotionsTracked = false; // flips true one render AFTER real tallies land
+
+  function render() {
+    for (const cards of Object.values(rows)) cards.innerHTML = "";
+    const placed = { S: [], A: [], B: [], C: [], D: [] };
+    const unranked = [];
+    const transitions = [];
+    for (const m of activeModels) {
+      const t = state.tallies[m.id] || { up: 0, down: 0 };
+      const tier = tierFor(t.up, t.down);
+      transitions.push({ id: m.id, tier, m });
+      if (!fits(m)) continue;
+      if (tier === "U") {
+        if (matchesQuery(m, state.query)) unranked.push({ m, t });
+      } else {
+        placed[tier].push({ m, t });
+      }
+    }
+    for (const [tier, list] of Object.entries(placed)) {
+      list.sort((x, y) => wilsonLower(y.t.up, y.t.down) - wilsonLower(x.t.up, x.t.down)
+        || (y.t.up - y.t.down) - (x.t.up - x.t.down)
+        || (y.m.downloads || 0) - (x.m.downloads || 0));
+      if (list.length === 0) {
+        rows[tier].innerHTML = '<span class="tier-empty">—</span>';
+        continue;
+      }
+      for (const { m, t } of list) rows[tier].appendChild(chip(m, t));
+    }
+    // unranked table: vote-stable ordering (popularity only)
+    const tbody = document.getElementById("unranked-tbody");
+    tbody.innerHTML = "";
+    const talliesById = Object.fromEntries(unranked.map((x) => [x.m.id, x.t]));
+    const ordered = unrankedOrder(unranked.map((x) => x.m));
+    for (const m of ordered) tbody.appendChild(tableRow(m, talliesById[m.id]));
+    if (!ordered.length) {
+      const tr = document.createElement("tr");
+      tr.innerHTML = '<td colspan="7" class="table-empty">' +
+        (state.query ? "No unranked models match the filter." : "Everything that fits your filters is already on the board.") + "</td>";
+      tbody.appendChild(tr);
+    }
+    const promoted = promotionsSince(lastTier, transitions, promotionsTracked);
+    if (state.talliesReady) promotionsTracked = true;
+    promoted.forEach((p, i) => celebratePromotion(p.m, p.tier, i));
+    if (backend && backend.demo) {
+      note("Community voting isn't wired up yet — votes below stay in this browser only. (Site owner: paste the Firebase config to go live.)", true);
+    } else if (state.user) {
+      note("Signed in — your votes are live. Click an arrow again to undo it.");
+    } else {
+      note("Models auto-ranked from live Hugging Face downloads (quants roll up into their base model). Sign in with Google to vote — one per model.");
+    }
+  }
+
+  function fmtCount(n) {
+    if (n >= 1e6) return (n / 1e6).toFixed(1) + "M";
+    if (n >= 1e3) return Math.round(n / 1e3) + "K";
+    return "" + n;
+  }
+  function chip(m, t) {
+    const el = document.createElement("div");
+    el.className = "model-chip";
+    el.dataset.model = m.id;
+    const mine = state.mine[m.id] || 0;
+    el.innerHTML =
+      '<div class="mc-name"></div>' +
+      '<div class="mc-meta">' + m.params + " · ~" + m.sizeGb + " GB · " + m.minRam + "+ GB Mac" +
+        (m.downloads ? " · ↓" + fmtCount(m.downloads) + "/mo" : "") + "</div>" +
+      '<div class="mc-tags">' + (m.isNew ? '<span class="mc-tag mc-new">New</span>' : "") +
+        m.tags.map((x) => '<span class="mc-tag">' + TAG_LABELS[x] + "</span>").join("") + "</div>" +
+      '<div class="mc-votes">' +
+        '<button class="vote-btn vote-up' + (mine === 1 ? " mine" : "") + '" aria-label="Upvote ' + m.name + '">▲ ' + t.up + "</button>" +
+        '<button class="vote-btn vote-down' + (mine === -1 ? " mine" : "") + '" aria-label="Downvote ' + m.name + '">▼ ' + t.down + "</button>" +
+      "</div>";
+    el.querySelector(".mc-name").textContent = m.name;
+    el.querySelector(".vote-up").addEventListener("click", () => backend.vote(m.id, mine === 1 ? 0 : 1));
+    el.querySelector(".vote-down").addEventListener("click", () => backend.vote(m.id, mine === -1 ? 0 : -1));
+    return el;
+  }
+
+  function tableRow(m, t) {
+    const tr = document.createElement("tr");
+    const mine = state.mine[m.id] || 0;
+    tr.innerHTML =
+      '<td class="td-name"></td>' +
+      "<td>" + m.params + "</td>" +
+      "<td>~" + m.sizeGb + " GB</td>" +
+      "<td>" + m.minRam + "+ GB</td>" +
+      "<td>" + (m.downloads ? fmtCount(m.downloads) : "—") + "</td>" +
+      "<td>" + (m.isNew ? '<span class="mc-tag mc-new">New</span> ' : "") +
+        m.tags.map((x) => '<span class="mc-tag">' + TAG_LABELS[x] + "</span>").join(" ") + "</td>" +
+      '<td><button class="vote-btn vote-up' + (mine === 1 ? " mine" : "") + '" aria-label="Upvote ' + m.name + '">▲ ' + t.up + "</button> " +
+        '<button class="vote-btn vote-down' + (mine === -1 ? " mine" : "") + '" aria-label="Downvote ' + m.name + '">▼ ' + t.down + "</button></td>";
+    tr.querySelector(".td-name").textContent = m.name;
+    tr.querySelector(".vote-up").addEventListener("click", () => backend.vote(m.id, mine === 1 ? 0 : 1));
+    tr.querySelector(".vote-down").addEventListener("click", () => backend.vote(m.id, mine === -1 ? 0 : -1));
+    return tr;
+  }
+
+  function showToast(msg, slot) {
+    const el = document.createElement("div");
+    el.className = "toast";
+    el.style.bottom = 28 + (slot || 0) * 52 + "px";
+    el.textContent = msg;
+    document.body.appendChild(el);
+    setTimeout(() => el.remove(), 4200);
+  }
+  function celebratePromotion(m, tier, slot) {
+    showToast(m.name + " just entered the tiers — " + tier + "!", slot);
+    const chipEl = board.querySelector('.model-chip[data-model="' + m.id + '"]');
+    if (chipEl) {
+      chipEl.classList.add("promoted");
+      setTimeout(() => chipEl.classList.remove("promoted"), 1600);
+    }
+  }
+
+  function renderAuth() {
+    const signin = document.getElementById("signin-btn");
+    const userEl = document.getElementById("auth-user");
+    if (state.user) {
+      signin.style.display = "none";
+      userEl.style.display = "inline-flex";
+      document.getElementById("auth-avatar").src = state.user.photoURL || "../appiconb.png";
+      document.getElementById("auth-name").textContent = state.user.displayName || "Signed in";
+    } else {
+      signin.style.display = backend && backend.demo ? "none" : "inline-flex";
+      userEl.style.display = "none";
+    }
+    render();
+  }
+
+  function note(msg, warn) {
+    const el = document.getElementById("vote-note");
+    el.textContent = msg;
+    el.className = "vote-note" + (warn ? " warn" : "");
+  }
+
+  // ── filters ──────────────────────────────────────────────────────────────
+  document.querySelectorAll("#ram-filter button").forEach((b) => {
+    b.addEventListener("click", () => {
+      document.querySelectorAll("#ram-filter button").forEach((x) => x.classList.remove("on"));
+      b.classList.add("on");
+      state.ram = parseInt(b.dataset.ram, 10);
+      render();
+    });
+  });
+  document.querySelectorAll("#tag-filter button").forEach((b) => {
+    b.addEventListener("click", () => {
+      const t = b.dataset.tag;
+      if (state.tags.has(t)) { state.tags.delete(t); b.classList.remove("on"); }
+      else { state.tags.add(t); b.classList.add("on"); }
+      render();
+    });
+  });
+  document.getElementById("unranked-search").addEventListener("input", (e) => {
+    state.query = e.target.value;
+    render();
+  });
+
+  // ── live model list from Hugging Face (cached 6 h; seeds on failure) ─────
+  const HF_CACHE_KEY = "llm-tier-list-hf-cache-v1";
+  const HF_TTL_MS = 6 * 3600 * 1000;
+  function hfCached() {
+    try {
+      const c = JSON.parse(localStorage.getItem(HF_CACHE_KEY) || "null");
+      if (c && Array.isArray(c.models) && c.models.length) return c;
+    } catch (_) {}
+    return null;
+  }
+  async function loadHfModels() {
+    const c = hfCached();
+    if (c && Date.now() - c.t < HF_TTL_MS) return c.models;
+    const q = (pipeline) => HF_API + "?library=mlx&pipeline_tag=" + pipeline +
+      "&sort=downloads&direction=-1&limit=200" +
+      "&expand[]=downloads&expand[]=likes&expand[]=tags&expand[]=safetensors&expand[]=createdAt";
+    // two pipelines: VLMs live under image-text-to-text, not text-generation
+    const [text, vision] = await Promise.all([
+      fetch(q("text-generation")).then((r) => { if (!r.ok) throw new Error("HF " + r.status); return r.json(); }),
+      fetch(q("image-text-to-text")).then((r) => (r.ok ? r.json() : [])).catch(() => []),
+    ]);
+    const models = groupHfModels(text, vision, Date.now());
+    if (models.length) {
+      try { localStorage.setItem(HF_CACHE_KEY, JSON.stringify({ t: Date.now(), models })); } catch (_) {}
+    }
+    return models;
+  }
+
+  // ── boot ─────────────────────────────────────────────────────────────────
+  (async () => {
+    try {
+      setActiveModels(mergeWithSeed(await loadHfModels(), SEED_MODELS));
+    } catch (e) {
+      const c = hfCached(); // stale ranking beats the static seed
+      if (c) setActiveModels(mergeWithSeed(c.models, SEED_MODELS));
+    }
+    try {
+      backend = FIREBASE_READY ? await firestoreBackend() : localBackend();
+    } catch (e) {
+      note("Firebase failed to load (" + (e && e.message) + ") — falling back to this-browser-only votes.", true);
+      backend = localBackend();
+    }
+    document.getElementById("signin-btn").addEventListener("click", () => backend.signIn());
+    document.getElementById("signout-btn").addEventListener("click", () => backend.signOut());
+    renderAuth();
+    backend.start();
+  })();
+  </script>
+</body>
+</html>
