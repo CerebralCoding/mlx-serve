@@ -211,6 +211,209 @@ fn getGdnKernelSeq() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
+// ── GatedDeltaNet blocked-seq PREFILL kernel ──
+// Port of oMLX's `gated_delta_blocked_seq` (custom_kernels/qwen35_prefill/
+// gdn.py, Apache-2.0, oMLX by jundot — keep this provenance chain). Same
+// EXACT recurrence as GDN_KERNEL_SOURCE — no chunked/WY reformulation —
+// restructured for Apple-GPU efficiency: k/q/v staged into threadgroup
+// memory in TB-token blocks with coalesced cooperative loads (the stock
+// kernel re-reads k/q from device once per (Dv/4)-slice threadgroup => 32x
+// redundant traffic, ~13 GB per 16K-token layer), state register-resident
+// as (dv row, 16-wide d segment) fragments, and the k·state / q·state
+// contractions reduced across the 8 segment-threads of a dv row via
+// simd_shuffle_down — no threadgroup barriers in the hot token loop. Their
+// measurement: 14.9 ms vs 29.7 ms per layer @16K = ~2x over the stock
+// kernel shape; 48 of the 27B's 64 layers are GDN.
+// Geometry contract (checked by gdnBlockedEligible): Dk == 128 exactly
+// (8 threads x 16-wide fragments), Dv % 32 == 0 (DB=32 dv rows per
+// threadgroup). Anything else — and decode (T==1), PLD/MTP verify, and the
+// per-position-state capture path — stays on the stock kernels.
+// Kill switch: MLX_SERVE_GDN_BLOCKED=0; block size: MLX_SERVE_GDN_BLOCK_T
+// (16|32|48, default 32 for bf16 — Metal's 32 KiB threadgroup limit
+// governs; fp32 inputs would need 16, but our GDN inputs are always bf16).
+
+/// Test seam: forces the blocked-prefill route on/off without the environment.
+pub var gdn_blocked_override: ?bool = null;
+var gdn_blocked_env_cached: ?bool = null;
+
+pub fn gdnBlockedEnabled() bool {
+    if (gdn_blocked_override) |v| return v;
+    if (gdn_blocked_env_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_GDN_BLOCKED");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    gdn_blocked_env_cached = enabled;
+    return enabled;
+}
+
+/// Prefill-width floor for the blocked kernel (mirrors oMLX's OMLX_GDN_MIN_T
+/// default). Below this the per-token stock kernel wins on launch overhead.
+pub const GDN_BLOCKED_MIN_T: c_int = 64;
+
+/// Pure routing predicate: geometry + width gate for the blocked-seq kernel.
+pub fn gdnBlockedEligible(seq_len: c_int, dk: c_int, dv: c_int, num_k_heads: c_int, num_v_heads: c_int) bool {
+    if (seq_len < GDN_BLOCKED_MIN_T) return false;
+    if (dk != 128) return false;
+    if (dv < 32 or @rem(dv, 32) != 0) return false;
+    if (num_k_heads <= 0 or @rem(num_v_heads, num_k_heads) != 0) return false;
+    return true;
+}
+
+const GDN_BLOCKED_TBS = [_]u32{ 16, 32, 48 };
+var gdn_blocked_cached: [GDN_BLOCKED_TBS.len]?mlx.mlx_fast_metal_kernel = @splat(null);
+var gdn_block_t_cached: ?u32 = null;
+
+pub fn gdnBlockT() u32 {
+    if (gdn_block_t_cached) |v| return v;
+    const v: u32 = blk: {
+        const raw = std.c.getenv("MLX_SERVE_GDN_BLOCK_T") orelse break :blk 32;
+        const parsed = std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch break :blk 32;
+        for (GDN_BLOCKED_TBS) |cand| {
+            if (cand == parsed) break :blk parsed;
+        }
+        break :blk 32;
+    };
+    gdn_block_t_cached = v;
+    return v;
+}
+
+// Body of the blocked-seq kernel; the `constexpr int TB = N;` line is
+// prepended per block size by gdnBlockedSource (one cached kernel per TB,
+// DISTINCT names — two specializations sharing a name bind the wrong binary).
+// Faithful transcription of oMLX's _KERNEL_S_SRC with one generalization:
+// state loads/stores go through vec<StT,4> (theirs hard-codes float4 — their
+// state is fp32, ours rides the bf16 ssm_state buffer exactly like the stock
+// kernel, so cross-chunk behavior is unchanged).
+const GDN_KERNEL_BLOCKED_BODY =
+    \\constexpr int DB = 32;                             // dv rows per threadgroup
+    \\const int tid = thread_position_in_threadgroup.x;  // 0..255
+    \\const int blk = threadgroup_position_in_grid.x;    // Dv/DB block
+    \\const int hv  = threadgroup_position_in_grid.y;
+    \\const int b   = threadgroup_position_in_grid.z;
+    \\const int hk  = hv / (Hv / Hk);
+    \\const int dv0 = blk * DB;
+    \\
+    \\// thread -> (dv row, 16-wide d segment); 8 threads per dv row, all in
+    \\// the same simdgroup (lane = (dvr%4)*8 + seg).
+    \\const int dvr = tid / 8;            // 0..31
+    \\const int seg = tid % 8;            // 0..7
+    \\const int d0  = seg * 16;
+    \\
+    \\threadgroup InT k_s[TB][Dk + 8];
+    \\threadgroup InT q_s[TB][Dk + 8];
+    \\threadgroup InT v_s[TB][DB + 8];
+    \\threadgroup float g_s[TB];
+    \\threadgroup float b_s[TB];
+    \\
+    \\const device InT* k_base = k + ((size_t)b * T * Hk + hk) * Dk;
+    \\const device InT* q_base = q + ((size_t)b * T * Hk + hk) * Dk;
+    \\const device InT* v_base = v + ((size_t)b * T * Hv + hv) * Dv + dv0;
+    \\const size_t krow = (size_t)Hk * Dk;
+    \\
+    \\// state fragment in registers: [dv0+dvr][d0..d0+16]
+    \\float4 st[4];
+    \\{
+    \\    const device vec<StT,4>* S_in = (const device vec<StT,4>*)(
+    \\        state_in + (((size_t)b * Hv + hv) * Dv + dv0 + dvr) * Dk + d0);
+    \\    for (int i = 0; i < 4; ++i) st[i] = float4(S_in[i]);
+    \\}
+    \\
+    \\device InT* y_base = y + ((size_t)b * T * Hv + hv) * Dv + dv0;
+    \\
+    \\for (int t0 = 0; t0 < T; t0 += TB) {
+    \\    const int tt = min(TB, T - t0);
+    \\    // cooperative staging (coalesced): k/q rows, v slice, g/beta
+    \\    for (int p = tid; p < tt * Dk; p += 256) {
+    \\        const int r = p / Dk, d = p % Dk;
+    \\        k_s[r][d] = k_base[(size_t)(t0 + r) * krow + d];
+    \\        q_s[r][d] = q_base[(size_t)(t0 + r) * krow + d];
+    \\    }
+    \\    for (int p = tid; p < tt * DB; p += 256) {
+    \\        const int r = p / DB, d = p % DB;
+    \\        v_s[r][d] = v_base[(size_t)(t0 + r) * Hv * Dv + d];
+    \\    }
+    \\    for (int p = tid; p < tt; p += 256) {
+    \\        g_s[p] = (float)g[((size_t)b * T + t0 + p) * Hv + hv];
+    \\        b_s[p] = (float)beta[((size_t)b * T + t0 + p) * Hv + hv];
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\
+    \\    for (int t = 0; t < tt; ++t) {
+    \\        const float gt = g_s[t];
+    \\        const float bt = b_s[t];
+    \\        const threadgroup vec<InT,4>* k4 =
+    \\            (const threadgroup vec<InT,4>*)&k_s[t][d0];
+    \\        const threadgroup vec<InT,4>* q4 =
+    \\            (const threadgroup vec<InT,4>*)&q_s[t][d0];
+    \\        float4 kf[4];
+    \\        for (int i = 0; i < 4; ++i) kf[i] = float4(k4[i]);
+    \\        // kv_mem = (g*state) . k ; decay applied to state first
+    \\        float4 p4 = 0.0f;
+    \\        for (int i = 0; i < 4; ++i) {
+    \\            st[i] *= gt;
+    \\            p4 += st[i] * kf[i];
+    \\        }
+    \\        float part = p4.x + p4.y + p4.z + p4.w;
+    \\        // reduce across the 8 segment-threads of this dv row
+    \\        part += simd_shuffle_down(part, 4);
+    \\        part += simd_shuffle_down(part, 2);
+    \\        part += simd_shuffle_down(part, 1);
+    \\        const float kv_mem = simd_shuffle(part, (tid % 32) / 8 * 8);
+    \\        const float delta = ((float)v_s[t][dvr] - kv_mem) * bt;
+    \\
+    \\        float4 o4 = 0.0f;
+    \\        for (int i = 0; i < 4; ++i) {
+    \\            st[i] += kf[i] * delta;
+    \\            o4 += st[i] * float4(q4[i]);
+    \\        }
+    \\        float out = o4.x + o4.y + o4.z + o4.w;
+    \\        out += simd_shuffle_down(out, 4);
+    \\        out += simd_shuffle_down(out, 2);
+    \\        out += simd_shuffle_down(out, 1);
+    \\        if (seg == 0) {
+    \\            y_base[(size_t)(t0 + t) * Hv * Dv + dvr] = (InT)out;
+    \\        }
+    \\    }
+    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\}
+    \\
+    \\{
+    \\    device vec<StT,4>* S_out = (device vec<StT,4>*)(
+    \\        state_out + (((size_t)b * Hv + hv) * Dv + dv0 + dvr) * Dk + d0);
+    \\    for (int i = 0; i < 4; ++i) S_out[i] = vec<StT,4>(st[i]);
+    \\}
+;
+
+fn gdnBlockedSource(comptime tb: u32) [:0]const u8 {
+    return std.fmt.comptimePrint("constexpr int TB = {d};\n", .{tb}) ++ GDN_KERNEL_BLOCKED_BODY;
+}
+
+fn getGdnKernelBlocked(tb: u32) !mlx.mlx_fast_metal_kernel {
+    inline for (GDN_BLOCKED_TBS, 0..) |cand, i| {
+        if (cand == tb) {
+            if (gdn_blocked_cached[i]) |k| return k;
+            const input_names = [_][*:0]const u8{ "q", "k", "v", "g", "beta", "state_in", "T" };
+            const output_names = [_][*:0]const u8{ "y", "state_out" };
+            const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+            defer _ = mlx.mlx_vector_string_free(in_vec);
+            const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+            defer _ = mlx.mlx_vector_string_free(out_vec);
+            const kernel = mlx.mlx_fast_metal_kernel_new(
+                std.fmt.comptimePrint("gated_delta_blocked_tb{d}", .{cand}),
+                in_vec,
+                out_vec,
+                gdnBlockedSource(cand),
+                "",
+                true,
+                false,
+            );
+            if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+            gdn_blocked_cached[i] = kernel;
+            return kernel;
+        }
+    }
+    return error.UnsupportedGdnBlockT;
+}
+
 // ── Verify-width split-K quantized matmul (spec-decode fast path) ──
 //
 // Stock MLX qmm is tuned for M=1 decode (qmv) and large-M prefill (steel);
@@ -1237,6 +1440,16 @@ const ATTN256_KERNEL_SOURCE =
     \\const float scale_log2e = scl[0] * 1.44269504088896340736f;
     \\const int SW = win[0];
     \\
+    \\// Budgeted kv-chunk dispatch (causal arm): this dispatch covers keys
+    \\// [k_begin, k_end); online-softmax state (m/l/unnormalized O) rides fp32
+    \\// carry buffers between dispatches — exact register precision, so the
+    \\// chunked chain is bit-identical to one long dispatch. phase bit 0 =
+    \\// carry-in present, bit 1 = final chunk (normalize + bf16 store).
+    \\const int k_begin = kr[0];
+    \\const int k_end = metal::min(kr[1], kL);
+    \\const bool has_carry = (phase[0] & 1) != 0;
+    \\const bool is_final = (phase[0] & 2) != 0;
+    \\
     \\// Bottom-right aligned causal: query row r of this chunk sits at
     \\// absolute KV position q_off + r.
     \\const int q_off = kL - qL;
@@ -1290,12 +1503,31 @@ const ATTN256_KERNEL_SOURCE =
     \\float max_score = -3.0e38f;
     \\float sum_score = 0.0f;
     \\
-    \\const int NK = (kL + BK - 1) / BK;
+    \\// Resume carried softmax state from the previous kv chunk. Rows past
+    \\// the ragged q tail never carry (their outputs are discarded anyway).
+    \\// (m_in/l_in/o_in are indexed directly, never through a typed pointer:
+    \\// MLX binds sub-4KB inputs — the no-carry dummies — in the `constant`
+    \\// address space and real carries in `device`, and the source must
+    \\// compile under both.)
+    \\if (has_carry) {
+    \\  const int qr = tm + sm;
+    \\  if (qr < q_rows) {
+    \\    const long crow = (((long)bb * Hq + hq) * (long)qL + (long)(tqx * BQ + qr));
+    \\    max_score = m_in[crow];
+    \\    sum_score = l_in[crow];
+    \\    const long obase = crow * (long)BD;
+    \\    for (int dd = 0; dd < BD / 8; ++dd) {
+    \\      Ofrag[dd] = float2(o_in[obase + dd * 8 + sn], o_in[obase + dd * 8 + sn + 1]);
+    \\    }
+    \\  }
+    \\}
+    \\
+    \\const int NK = (k_end + BK - 1) / BK;
     \\const int q_lo = tqx * BQ + q_off;
     \\const int q_hi = q_lo + BQ - 1;
     \\const int kb_lim = metal::min(NK, (q_hi + BK) / BK);
-    \\int kb = 0;
-    \\if (SW > 0) kb = metal::max(0, q_lo - SW + 1) / BK;
+    \\int kb = k_begin / BK;
+    \\if (SW > 0) kb = metal::max(kb, metal::max(0, q_lo - SW + 1) / BK);
     \\const int kb_min_causal = metal::max(0, q_lo) / BK;
     \\const int row_pos = q_lo + tm + sm;
     \\
@@ -1411,14 +1643,27 @@ const ATTN256_KERNEL_SOURCE =
     \\  }
     \\}
     \\
-    \\// Normalize + store (output is freshly allocated, contiguous).
+    \\// Final chunk: normalize + store bf16 (output freshly allocated,
+    \\// contiguous). Mid chunk: store the raw fp32 state for the next
+    \\// dispatch (m/l written by all 4 lane-threads of a row — same value).
     \\const int local_row = tm + sm;
     \\if (local_row < q_rows) {
-    \\  const float inv = 1.0f / sum_score;
-    \\  device T* Optr = Op + (long)local_row * BD + sn;
-    \\  for (int id = 0; id < BD / 8; ++id) {
-    \\    Optr[id * 8] = T(Ofrag[id].x * inv);
-    \\    Optr[id * 8 + 1] = T(Ofrag[id].y * inv);
+    \\  if (is_final) {
+    \\    const float inv = 1.0f / sum_score;
+    \\    device T* Optr = Op + (long)local_row * BD + sn;
+    \\    for (int id = 0; id < BD / 8; ++id) {
+    \\      Optr[id * 8] = T(Ofrag[id].x * inv);
+    \\      Optr[id * 8 + 1] = T(Ofrag[id].y * inv);
+    \\    }
+    \\  } else {
+    \\    const long crow = (((long)bb * Hq + hq) * (long)qL + (long)(tqx * BQ + local_row));
+    \\    m_out[crow] = max_score;
+    \\    l_out[crow] = sum_score;
+    \\    device float* Orow = o_out + crow * (long)BD;
+    \\    for (int id = 0; id < BD / 8; ++id) {
+    \\      Orow[id * 8 + sn] = Ofrag[id].x;
+    \\      Orow[id * 8 + sn + 1] = Ofrag[id].y;
+    \\    }
     \\  }
     \\}
 ;
@@ -1427,8 +1672,8 @@ var attn256_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 
 fn getAttn256Kernel() !mlx.mlx_fast_metal_kernel {
     if (attn256_kernel_cached) |kk| return kk;
-    const input_names = [_][*:0]const u8{ "q", "k", "v", "scl", "win" };
-    const output_names = [_][*:0]const u8{"out"};
+    const input_names = [_][*:0]const u8{ "q", "k", "v", "scl", "win", "kr", "phase", "m_in", "l_in", "o_in" };
+    const output_names = [_][*:0]const u8{ "out", "m_out", "l_out", "o_out" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
@@ -1463,32 +1708,80 @@ pub fn fused256Enabled() bool {
     return enabled;
 }
 
-/// Plain-CAUSAL dispatch mode. Default `.off`: composed GQA GEMM keeps
-/// causal prefill. The v2 kernel BEATS composed on the µbench at kL <= 2*qL
-/// (+63% at ratio 1, +15% at 2, +80% at 8192x8192) — but LIVE on the
-/// Qwen3.6-27B ladder (transposed-Q views, warm GPU, kernel interleaved
-/// with GDN/MLP work in one command stream) every ratio-gated variant
-/// measured a NET LOSS in same-boot A/Bs (8K: fused-to-ratio-4 231.5,
-/// fused-to-ratio-2 232.9, composed 234.7 tok/s — monotonic: more fused =
-/// slower). Until that µbench-vs-live gap is understood, causal stays
-/// composed; the 2048 chunk cap (generate.boundedPrefillChunk, non-sliding
-/// archs) is what actually closed the qwen prefill gap.
-/// MLX_SERVE_FUSED_256_CAUSAL=1 forces ALL causal calls through the kernel
-/// (perf experiments — the v2 tiles cut the forced path's deficit from
-/// ~3.5x at long kv to ~6-10%). The SLIDING-BAND arm (window > 0) has no
-/// such competition — composed computes full-width scores + a GB-scale mask
-/// while the kernel block-skips outside the band (gemma-26B 99K: 317 -> 712
-/// tok/s) — so it rides the master switch alone.
+/// Plain-CAUSAL dispatch mode. Default `.all` since the kv-chunk dispatch
+/// budget landed (2026-07-22): the historical net-LOSS of every pre-budget
+/// ratio-gated variant (8K: fused-to-ratio-4 231.5, fused-to-ratio-2 232.9,
+/// composed 234.7 tok/s — monotonic: more fused = slower, despite the v2
+/// kernel winning the µbench at kL <= 2*qL) was the macOS IOGPU
+/// interactivity-preemption class: one long dispatch scanning the whole KV
+/// gets preempted, and the penalty scales with dispatch length. With the
+/// key axis split into budget-sized dispatches (see
+/// FUSED256_DEFAULT_DISPATCH_BUDGET) the causal arm WINS the same
+/// same-session A/B on the 27B: +2.9%/+2.3%/+4.6% at 8K/16K/32K.
+/// MLX_SERVE_FUSED_256_CAUSAL=0 restores composed causal (and the old
+/// OOM-guard score billing via prefillHeadDimFused).
+/// The SLIDING-BAND arm (window > 0) has no such competition — composed
+/// computes full-width scores + a GB-scale mask while the kernel
+/// block-skips outside the band (gemma-26B 99K: 317 -> 712 tok/s) — so it
+/// rides the master switch alone and never chunks.
 pub const Fused256CausalMode = enum { all, off };
+
+// ── Dispatch work budget (kv-axis chunked dispatch) ──
+// One long dispatch scanning the whole KV monopolizes the GPU long enough at
+// high kv_len to trip macOS IOGPU interactivity preemption, collapsing
+// long-context prefill (oMLX issue #2225: the M3 Max cliff sits near ~1.5e9
+// work units ≈ 50 ms/dispatch; design ported from oMLX's
+// qwen35_fa256_attention.py, Apache-2.0, oMLX by jundot). Above the budget
+// (work = batch·Hq·qL·kL) the CAUSAL arm splits the key axis into
+// separately-dispatched BK-aligned chunks with exact online-softmax carry
+// (fp32 m/l/O buffers chained between dispatches — bit-identical to the
+// single-dispatch result). The band arm never chunks: its in-kernel block
+// skip already bounds per-dispatch work by the window.
+// MLX_SERVE_FUSED_256_BUDGET overrides (0 = single-dispatch, pre-budget
+// behavior); default mirrors oMLX's 250M fallback (~23 ms/dispatch on the
+// M4 Max at the kernel's measured ~1.1e10 work-units/s).
+pub const FUSED256_DEFAULT_DISPATCH_BUDGET: i64 = 250_000_000;
+
+/// Test seam: forces the budget without the environment.
+pub var fused256_budget_override: ?i64 = null;
+var fused256_budget_env_cached: ?i64 = null;
+
+pub fn fused256DispatchBudget() i64 {
+    if (fused256_budget_override) |v| return v;
+    if (fused256_budget_env_cached) |v| return v;
+    const v: i64 = blk: {
+        const raw = std.c.getenv("MLX_SERVE_FUSED_256_BUDGET") orelse break :blk FUSED256_DEFAULT_DISPATCH_BUDGET;
+        break :blk std.fmt.parseInt(i64, std.mem.sliceTo(raw, 0), 10) catch FUSED256_DEFAULT_DISPATCH_BUDGET;
+    };
+    fused256_budget_env_cached = v;
+    return v;
+}
+
+/// kv-axis chunk length for the budgeted causal dispatch: the largest
+/// BK(32)-multiple keeping work-per-dispatch = batch·hq·ql·chunk within
+/// budget, floored at one BK block, capped at kl. budget <= 0 = one dispatch.
+pub fn fused256KvChunkLen(batch: i64, hq: i64, ql: i64, kl: i64, budget: i64) c_int {
+    if (budget <= 0) return @intCast(kl);
+    const per_key = batch * hq * ql;
+    var chunk = @divTrunc(budget, @max(per_key, 1));
+    chunk = @divTrunc(chunk, 32) * 32;
+    if (chunk < 32) chunk = 32;
+    if (chunk > kl) chunk = kl;
+    return @intCast(chunk);
+}
+
+/// Test seam: dispatches issued by the LAST fusedSdpa256Prefill call
+/// (engagement is counted, never inferred from output equality).
+pub var fused256_last_dispatch_count: u32 = 0;
 
 pub fn fused256CausalMode() Fused256CausalMode {
     if (fused256_override) |v| return if (v) .all else .off;
     if (!fused256Enabled()) return .off;
     if (fused256_causal_env_cached) |v| return v;
     const mode: Fused256CausalMode = blk: {
-        const raw = std.c.getenv("MLX_SERVE_FUSED_256_CAUSAL") orelse break :blk .off;
-        if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1")) break :blk .all;
-        break :blk .off;
+        const raw = std.c.getenv("MLX_SERVE_FUSED_256_CAUSAL") orelse break :blk .all;
+        if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0")) break :blk .off;
+        break :blk .all;
     };
     fused256_causal_env_cached = mode;
     return mode;
@@ -1498,11 +1791,10 @@ pub fn fused256CausalMode() Fused256CausalMode {
 /// sites: true when prefill attention at this head_dim will NOT materialize
 /// the composed [heads, chunk, total_kv] score tensor — either MLX's own
 /// fused kernel covers it (<= 128) or our hd-256 kernel does for EVERY arm.
-/// Keyed on causal mode `.all`: with causal composed (the default), score
-/// tensors still materialize for causal layers (gemma global layers, every
-/// qwen full-attn layer), so the guards must keep billing them; sliding
-/// layers going fused only makes that conservative, never wrong. Guards and
-/// dispatch must never drift (the effectivePrefillChunk rule).
+/// Keyed on causal mode: at `.all` (the default since the budgeted-dispatch
+/// flip) no hd-256 score tensor materializes; MLX_SERVE_FUSED_256_CAUSAL=0
+/// restores composed causal AND the guards' score billing together. Guards
+/// and dispatch must never drift (the effectivePrefillChunk rule).
 pub fn prefillHeadDimFused(head_dim: u32) bool {
     return head_dim <= 128 or (head_dim == 256 and fused256CausalMode() == .all);
 }
@@ -1538,12 +1830,14 @@ pub fn fusedSdpa256Prefill(
     const ks = mlx.getShape(k);
     const vs = mlx.getShape(v);
     if (qs[3] != 256 or ks[3] != 256 or vs[3] != 256) return null;
-    // Short sequences (<= 8: decode AND spec-decode VERIFY forwards) belong
-    // to MLX's sdpa_vector, which covers hd 256 natively and beats a 32-row
-    // prefill tile walking the whole KV for a 2-4-row query — dispatching
+    // Short sequences (< 16: decode AND spec-decode VERIFY forwards) belong
+    // to MLX's sdpa_vector, which covers hd 256 natively and beats a 64-row
+    // prefill tile walking the whole KV for a few-row query — dispatching
     // those here measured decode 48 -> 18 tok/s at 4K ctx on the 27B (MTP
-    // verify is seq 1+depth). Mirrors MLX's own supports_sdpa_full gate.
-    if (qs[2] <= 8) return null;
+    // verify is seq 1+depth, up to 9 at the NAX depth-8 cap — with causal
+    // fused default-on the floor must clear it). 16 matches oMLX's
+    // _MIN_ROUTE_Q_LEN; genuine prefill chunks are always far above it.
+    if (qs[2] < 16) return null;
     if (ks[1] <= 0 or @rem(qs[1], ks[1]) != 0) return null;
     if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1] or ks[0] != qs[0] or vs[0] != qs[0]) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
@@ -1558,28 +1852,106 @@ pub fn fusedSdpa256Prefill(
     const win = mlx.mlx_array_new_data(&win_data, &one, 1, .int32);
     defer _ = mlx.mlx_array_free(win);
 
-    const config = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
-    const o_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .bfloat16));
-    // One threadgroup (32,8,1) per 64-row q tile per head per batch; grid is
-    // in THREADS (dispatch_threads), padded to whole tiles so every
-    // threadgroup is full (the cooperative staging loops assume NT=256).
-    const nq_tiles: c_int = @divTrunc(qs[2] + 63, 64);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, nq_tiles * 32, qs[1] * 8, qs[0]));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 8, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+    // Budgeted kv-axis chunking (CAUSAL arm only — the band arm's in-kernel
+    // block skip already bounds per-dispatch work by the window, so chunking
+    // it would only add carry traffic). Chunk boundaries are BK(32)-aligned;
+    // the fp32 m/l/O carry chained between dispatches keeps the result
+    // bit-identical to a single dispatch (see the budget comment above).
+    const kL: c_int = ks[2];
+    const chunk_len: c_int = if (window > 0)
+        kL
+    else
+        fused256KvChunkLen(@intCast(qs[0]), @intCast(qs[1]), @intCast(qs[2]), @intCast(kL), fused256DispatchBudget());
 
-    const inputs_arr = [_]mlx.mlx_array{ q, k, v, scl, win };
-    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
-    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    // Dummy 1-elem f32 stands in for absent carry inputs / unwritten outputs.
+    const dummy_data = [_]f32{0};
+    const dummy = mlx.mlx_array_new_data(&dummy_data, &one, 1, .float32);
+    defer _ = mlx.mlx_array_free(dummy);
 
-    var outputs_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var m_prev = mlx.mlx_array{ .ctx = null };
+    var l_prev = mlx.mlx_array{ .ctx = null };
+    var o_prev = mlx.mlx_array{ .ctx = null };
+    defer {
+        if (m_prev.ctx != null) _ = mlx.mlx_array_free(m_prev);
+        if (l_prev.ctx != null) _ = mlx.mlx_array_free(l_prev);
+        if (o_prev.ctx != null) _ = mlx.mlx_array_free(o_prev);
+    }
+
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    errdefer _ = mlx.mlx_array_free(out);
+    var dispatches: u32 = 0;
+    var k0: c_int = 0;
+    while (k0 < kL) : (k0 += chunk_len) {
+        const k1: c_int = @min(k0 + chunk_len, kL);
+        const final = k1 == kL;
+        const has_carry = k0 > 0;
+
+        const two = [_]c_int{2};
+        const kr_data = [_]i32{ @intCast(k0), @intCast(k1) };
+        const kr = mlx.mlx_array_new_data(&kr_data, &two, 1, .int32);
+        defer _ = mlx.mlx_array_free(kr);
+        const phase_data = [_]i32{(if (has_carry) @as(i32, 1) else 0) | (if (final) @as(i32, 2) else 0)};
+        const phase = mlx.mlx_array_new_data(&phase_data, &one, 1, .int32);
+        defer _ = mlx.mlx_array_free(phase);
+
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        if (final) {
+            const o_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &o_shape, 4, .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one, 1, .float32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one, 1, .float32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one, 1, .float32));
+        } else {
+            const ml_shape = [_]c_int{ qs[0], qs[1], qs[2] };
+            const oc_shape = [_]c_int{ qs[0], qs[1], qs[2], 256 };
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &one, 1, .bfloat16));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 3, .float32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ml_shape, 3, .float32));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &oc_shape, 4, .float32));
+        }
+        // One threadgroup (32,8,1) per 64-row q tile per head per batch; grid
+        // is in THREADS (dispatch_threads), padded to whole tiles so every
+        // threadgroup is full (the cooperative staging loops assume NT=256).
+        const nq_tiles: c_int = @divTrunc(qs[2] + 63, 64);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, nq_tiles * 32, qs[1] * 8, qs[0]));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 8, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+
+        const inputs_arr = [_]mlx.mlx_array{
+            q,                                    k,
+            v,                                    scl,
+            win,                                  kr,
+            phase,                                if (has_carry) m_prev else dummy,
+            if (has_carry) l_prev else dummy,     if (has_carry) o_prev else dummy,
+        };
+        const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+        defer _ = mlx.mlx_vector_array_free(inputs_vec);
+
+        var outputs_vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outputs_vec);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+        if (mlx.mlx_vector_array_size(outputs_vec) != 4) return error.MetalKernelBadOutputCount;
+        dispatches += 1;
+
+        if (final) {
+            try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+        } else {
+            var m_new = mlx.mlx_array_new();
+            var l_new = mlx.mlx_array_new();
+            var o_new = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&m_new, outputs_vec, 1));
+            try mlx.check(mlx.mlx_vector_array_get(&l_new, outputs_vec, 2));
+            try mlx.check(mlx.mlx_vector_array_get(&o_new, outputs_vec, 3));
+            if (m_prev.ctx != null) _ = mlx.mlx_array_free(m_prev);
+            if (l_prev.ctx != null) _ = mlx.mlx_array_free(l_prev);
+            if (o_prev.ctx != null) _ = mlx.mlx_array_free(o_prev);
+            m_prev = m_new;
+            l_prev = l_new;
+            o_prev = o_new;
+        }
+    }
+    fused256_last_dispatch_count = dispatches;
     return out;
 }
 const model_mod = @import("model.zig");
@@ -8455,9 +8827,20 @@ pub const Transformer = struct {
         } else {
             const state_shape_out = [_]c_int{ batch, num_v_heads, dv, dk };
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_shape_out, 4, .bfloat16));
-            // Grid: (32, Dv, B*Hv) threads; threadgroup: (32, 4, 1). Matches mlx-lm.
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+            // Blocked-seq kernel at prefill widths on the 128-Dk/32-aligned-Dv
+            // geometry (oMLX port, ~2x per GDN layer at 16K). Decode (T==1),
+            // spec verify widths, and off-geometry shapes keep the stock
+            // per-token kernel; the PLD capture path above is untouched.
+            const use_blocked = gdnBlockedEnabled() and gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads);
+            if (use_blocked) {
+                // Grid: (256*(Dv/32), Hv, B) threads; threadgroup (256,1,1).
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 256 * @divExact(dv, 32), num_v_heads, batch));
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
+            } else {
+                // Grid: (32, Dv, B*Hv) threads; threadgroup: (32, 4, 1). Matches mlx-lm.
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
+                try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+            }
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", dk));
@@ -8469,7 +8852,7 @@ pub const Transformer = struct {
             const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
             defer _ = mlx.mlx_vector_array_free(inputs_vec);
 
-            const gdn_kernel = try getGdnKernel();
+            const gdn_kernel = if (use_blocked) try getGdnKernelBlocked(gdnBlockT()) else try getGdnKernel();
             var outputs_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(outputs_vec);
             try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gdn_kernel, inputs_vec, config, self.s));
@@ -10098,6 +10481,37 @@ fn splitPackedGateUp(arr: mlx.mlx_array, s: mlx.mlx_stream) !struct { gate: mlx.
     return .{ .gate = gate, .up = up };
 }
 
+// ── Prefill-width dequant+GEMM qmm route ──
+// Stock MLX qmm_t runs a 32x32x32 steel tile; at prefill widths (M >= 2048)
+// on the qwen 27B shapes that underuses the compute units by ~10% (µbench,
+// M4 Max: gate/up q4 M=2048 stock 28.05 ms vs dequant+bf16-GEMM 25.36 ms
+// INCLUDING the per-call dequant; pre-dequantized floor 24.64 ms). oMLX
+// closes the same gap by re-instantiating qmm_t at bigger tiles (bm 64-128,
+// their qwen35_q4_mlp patch); we get within ~3% of that with zero custom
+// kernel: dequantize the weight to a bf16 [N,K] transient and run MLX's
+// steel GEMM. The transient repeats identical sizes per layer, so the MLX
+// allocator cache recycles it; numerics differ from in-kernel dequant only
+// by the bf16 rounding of w = s*q + b (pinned no-worse-than-stock by test).
+// Decode (M=1) and spec-verify widths never route. Kill switch:
+// MLX_SERVE_PREFILL_DQ_GEMM=0.
+pub const PREFILL_DQ_GEMM_MIN_M: usize = 2048;
+
+/// Test seam: forces the route on/off without the environment.
+pub var prefill_dq_gemm_override: ?bool = null;
+var prefill_dq_gemm_env_cached: ?bool = null;
+
+pub fn prefillDqGemmEnabled() bool {
+    if (prefill_dq_gemm_override) |v| return v;
+    if (prefill_dq_gemm_env_cached) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PREFILL_DQ_GEMM");
+    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
+    prefill_dq_gemm_env_cached = enabled;
+    return enabled;
+}
+
+/// Test seam: engagement is counted, never inferred from output equality.
+pub var prefill_dq_gemm_engaged: u64 = 0;
+
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
     // Plain BF16 weight: scales array is unset. Used by mixed-precision Unsloth
     // Dynamic checkpoints that leave a subset of layers (e.g. linear_attn
@@ -10169,6 +10583,10 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     // (see VERIFY_QMM_SOURCE) — stock qmm's qmv/steel dead zone.
     if (try verifyQmm(s, x, w, sc, bi, bits, group_size)) |vy| return vy;
 
+    // Prefill-width fast path: M >= 2048 dequantizes + runs the steel bf16
+    // GEMM (see prefillDqGemm) — stock qmm_t's 32x32x32 tile dead zone.
+    if (try prefillDqGemm(x, w, sc, bi, bits, group_size, s)) |py| return py;
+
     var result = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_quantized_matmul(
         &result,
@@ -10183,6 +10601,34 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
         s,
     ));
     return result;
+}
+
+/// The dequant+GEMM prefill route (see the block comment above
+/// prefillDqGemmEnabled). Returns null when the call must stay on stock qmm.
+fn prefillDqGemm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!prefillDqGemmEnabled()) return null;
+    switch (bits) {
+        2, 3, 4, 5, 6, 8 => {},
+        else => return null,
+    }
+    const last = lastDim(x) orelse return null;
+    if (last == 0) return null;
+    const rows = mlx.mlx_array_size(x) / @as(usize, @intCast(last));
+    if (rows < PREFILL_DQ_GEMM_MIN_M) return null;
+    const xd = mlx.mlx_array_dtype(x);
+    if (xd != .bfloat16 and xd != .float16) return null;
+
+    var dq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dq);
+    try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = xd, .has_value = true }, s));
+    var dq_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dq_t);
+    try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_matmul(&out, x, dq_t, s));
+    prefill_dq_gemm_engaged += 1;
+    return out;
 }
 
 /// Extract timestep t from a [B, T, H, D] tensor → [B, H, D]
@@ -11567,6 +12013,110 @@ test "gatherExpertMm dense bf16 matches per-expert ground truth (decode + prefil
     }
 }
 
+test "qmatmulBits: prefill-width affine calls take the dequant+GEMM route (engaged + no worse than stock)" {
+    const s = mlx.gpuStream();
+    const al = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xD0DE);
+    const rnd = prng.random();
+    const K: c_int = 256;
+    const N: c_int = 384;
+    const M: c_int = @intCast(PREFILL_DQ_GEMM_MIN_M);
+
+    // Random bf16 weight quantized to affine q4 gs64 (the 27B trunk class).
+    const wn: usize = @intCast(N * K);
+    const wbuf = try al.alloc(f32, wn);
+    for (wbuf) |*v| v.* = bf16Trunc(rnd.float(f32) - 0.5);
+    const wshape = [_]c_int{ N, K };
+    const w32 = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 2, .float32);
+    al.free(wbuf);
+    defer _ = mlx.mlx_array_free(w32);
+    var wb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wb);
+    try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var wq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wq);
+    var wsc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wsc);
+    var wbi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wbi);
+    try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+
+    const xn: usize = @intCast(M * K);
+    const xbuf = try al.alloc(f32, xn);
+    for (xbuf) |*v| v.* = bf16Trunc(rnd.float(f32) - 0.5);
+    const xshape = [_]c_int{ 1, M, K };
+    const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+    al.free(xbuf);
+    defer _ = mlx.mlx_array_free(x32);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+
+    // f32 ground truth: fp32 dequant + fp32 GEMM.
+    var wdq32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wdq32);
+    try mlx.check(mlx.mlx_dequantize(&wdq32, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .float32, .has_value = true }, s));
+    var wdq32_t = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(wdq32_t);
+    try mlx.check(mlx.mlx_transpose(&wdq32_t, wdq32, s));
+    var gt = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gt);
+    try mlx.check(mlx.mlx_matmul(&gt, x32, wdq32_t, s));
+    try mlx.check(mlx.mlx_array_eval(gt));
+    const gtd = mlx.mlx_array_data_float32(gt) orelse return error.InvalidDtype;
+    const on: usize = @intCast(M * N);
+
+    // Stock qmm (route forced off).
+    prefill_dq_gemm_override = false;
+    const stock = try qmatmulBits(x, wq, wsc, wbi, 4, 64, .affine, s);
+    defer _ = mlx.mlx_array_free(stock);
+    const stock_f = try evalToF32(al, stock, on, s);
+    defer al.free(stock_f);
+
+    // Routed (default on): engagement must be COUNTED.
+    prefill_dq_gemm_override = true;
+    defer prefill_dq_gemm_override = null;
+    const before = prefill_dq_gemm_engaged;
+    const routed = try qmatmulBits(x, wq, wsc, wbi, 4, 64, .affine, s);
+    defer _ = mlx.mlx_array_free(routed);
+    try testing.expectEqual(before + 1, prefill_dq_gemm_engaged);
+    const routed_f = try evalToF32(al, routed, on, s);
+    defer al.free(routed_f);
+
+    var stock_err: f32 = 0;
+    var routed_err: f32 = 0;
+    for (0..on) |i| {
+        stock_err = @max(stock_err, @abs(stock_f[i] - gtd[i]));
+        routed_err = @max(routed_err, @abs(routed_f[i] - gtd[i]));
+    }
+    // bf16-weight-rounding is the only extra error source — same magnitude
+    // class as the stock kernel's own bf16 output rounding.
+    try testing.expect(routed_err <= 1.5 * stock_err + 5e-3);
+
+    // Decode/verify widths never route (M below the floor).
+    var x8 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x8);
+    {
+        var x8_32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x8_32);
+        const s8 = [_]c_int{ 0, 0, 0 };
+        const e8 = [_]c_int{ 1, 8, K };
+        const st8 = [_]c_int{ 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&x8_32, x32, &s8, 3, &e8, 3, &st8, 3, s));
+        try mlx.check(mlx.mlx_astype(&x8, x8_32, .bfloat16, s));
+    }
+    const small_before = prefill_dq_gemm_engaged;
+    const small = try qmatmulBits(x8, wq, wsc, wbi, 4, 64, .affine, s);
+    defer _ = mlx.mlx_array_free(small);
+    try mlx.check(mlx.mlx_array_eval(small));
+    try testing.expectEqual(small_before, prefill_dq_gemm_engaged);
+}
+
 test "qmatmulBits nvfp4 matches dequantize+matmul reference" {
     // NVFP4 (issue #24): packed-u32 weight + fp8-e4m3 uint8 scales, NO biases,
     // group_size 16. qmatmulBits must route the bias-less weight to mode
@@ -12368,6 +12918,416 @@ fn gdnTestRunSeqAt(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_reshape(&out, sliced, &fshape, 4, s));
     return out;
+}
+
+// ── GDN blocked-seq kernel test harness ──
+
+/// Truncate an f32 to a bf16-representable value (top 16 bits). Test inputs
+/// pass through this so the f64 host reference and the bf16 kernels consume
+/// IDENTICAL values — the only error left is kernel accumulation/rounding.
+fn bf16Trunc(x: f32) f32 {
+    const bits: u32 = @bitCast(x);
+    return @bitCast(bits & 0xFFFF_0000);
+}
+
+const GdnHostRef = struct { y: []f32, state: []f32 };
+
+/// f64 host ground truth of the exact GDN recurrence (the stock kernel's
+/// math, per house rule: GPU parity is judged vs fp32+ ground truth, never
+/// kernel-vs-kernel bf16 agreement).
+fn gdnHostRef(
+    al: std.mem.Allocator,
+    qd: []const f32,
+    kd: []const f32,
+    vd: []const f32,
+    gd: []const f32,
+    bd: []const f32,
+    sd: []const f32,
+    B: usize,
+    T: usize,
+    Hk: usize,
+    Hv: usize,
+    Dk: usize,
+    Dv: usize,
+) !GdnHostRef {
+    const y = try al.alloc(f32, B * T * Hv * Dv);
+    errdefer al.free(y);
+    const st_out = try al.alloc(f32, B * Hv * Dv * Dk);
+    errdefer al.free(st_out);
+    const S = try al.alloc(f64, Dv * Dk);
+    defer al.free(S);
+    const group = Hv / Hk;
+    for (0..B) |b| {
+        for (0..Hv) |hv| {
+            const hk = hv / group;
+            for (0..Dv) |dvi| {
+                for (0..Dk) |dki| S[dvi * Dk + dki] = sd[((b * Hv + hv) * Dv + dvi) * Dk + dki];
+            }
+            for (0..T) |t| {
+                const gt: f64 = gd[(b * T + t) * Hv + hv];
+                const bt: f64 = bd[(b * T + t) * Hv + hv];
+                const kbase = ((b * T + t) * Hk + hk) * Dk;
+                for (S) |*x| x.* *= gt;
+                for (0..Dv) |dvi| {
+                    var kv: f64 = 0;
+                    for (0..Dk) |dki| kv += S[dvi * Dk + dki] * @as(f64, kd[kbase + dki]);
+                    const delta = (@as(f64, vd[((b * T + t) * Hv + hv) * Dv + dvi]) - kv) * bt;
+                    var out: f64 = 0;
+                    for (0..Dk) |dki| {
+                        S[dvi * Dk + dki] += @as(f64, kd[kbase + dki]) * delta;
+                        out += S[dvi * Dk + dki] * @as(f64, qd[kbase + dki]);
+                    }
+                    y[((b * T + t) * Hv + hv) * Dv + dvi] = @floatCast(out);
+                }
+            }
+            for (0..Dv) |dvi| {
+                for (0..Dk) |dki| st_out[((b * Hv + hv) * Dv + dvi) * Dk + dki] = @floatCast(S[dvi * Dk + dki]);
+            }
+        }
+    }
+    return .{ .y = y, .state = st_out };
+}
+
+const GdnRunOut = struct { y: mlx.mlx_array, state: mlx.mlx_array };
+
+/// Run the GDN recurrence via the stock single-state kernel (blocked=false)
+/// or the blocked-seq prefill kernel (blocked=true) and return BOTH outputs.
+fn gdnRunYState(blocked: bool, tb: u32, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dk: c_int, Dv: c_int, s: mlx.mlx_stream) !GdnRunOut {
+    const T_scalar = mlx.mlx_array_new_int(T);
+    defer _ = mlx.mlx_array_free(T_scalar);
+    const y_shape = [_]c_int{ B, T, Hv, Dv };
+    const so_shape = [_]c_int{ B, Hv, Dv, Dk };
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &so_shape, 4, .bfloat16));
+    if (blocked) {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 256 * @divExact(Dv, 32), Hv, B));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
+    } else {
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, Dv, B * Hv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
+    }
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "StT", .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dk", Dk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Dv", Dv));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hk", Hk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "Hv", Hv));
+
+    const inputs_arr = [_]mlx.mlx_array{ q, k, v, g, beta, state_in, T_scalar };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+    const kern = if (blocked) try getGdnKernelBlocked(tb) else try getGdnKernel();
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kern, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
+    var yo = mlx.mlx_array_new();
+    var so = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&yo, outputs_vec, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&so, outputs_vec, 1));
+    return .{ .y = yo, .state = so };
+}
+
+/// Eval an mlx array as f32 and copy its data into a fresh slice.
+fn evalToF32(al: std.mem.Allocator, arr: mlx.mlx_array, n: usize, s: mlx.mlx_stream) ![]f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f));
+    const d = mlx.mlx_array_data_float32(f) orelse return error.InvalidDtype;
+    const out = try al.alloc(f32, n);
+    @memcpy(out, d[0..n]);
+    return out;
+}
+
+fn maxAbsDiff(a: []const f32, b: []const f32) f32 {
+    var m: f32 = 0;
+    for (a, b) |x, y| m = @max(m, @abs(x - y));
+    return m;
+}
+
+const GdnCase = struct { B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dv: c_int, tb: u32 };
+
+/// Runs one geometry through host ref + stock + blocked and asserts the
+/// blocked kernel is no less accurate than the stock kernel it replaces.
+fn gdnBlockedParityCase(case: GdnCase, s: mlx.mlx_stream) !void {
+    const al = testing.allocator;
+    const B = case.B;
+    const T = case.T;
+    const Hk = case.Hk;
+    const Hv = case.Hv;
+    const Dk: c_int = 128;
+    const Dv = case.Dv;
+    const qn: usize = @intCast(B * T * Hk * Dk);
+    const vn: usize = @intCast(B * T * Hv * Dv);
+    const gn: usize = @intCast(B * T * Hv);
+    const sn: usize = @intCast(B * Hv * Dv * Dk);
+
+    var prng = std.Random.DefaultPrng.init(0xB10C5ED);
+    const rnd = prng.random();
+    const qd = try al.alloc(f32, qn);
+    defer al.free(qd);
+    const kd = try al.alloc(f32, qn);
+    defer al.free(kd);
+    const vd = try al.alloc(f32, vn);
+    defer al.free(vd);
+    const gd = try al.alloc(f32, gn);
+    defer al.free(gd);
+    const bd = try al.alloc(f32, gn);
+    defer al.free(bd);
+    const sd = try al.alloc(f32, sn);
+    defer al.free(sd);
+    for (qd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+    for (kd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+    for (vd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+    for (gd) |*x| x.* = bf16Trunc(0.5 + 0.4 * rnd.float(f32));
+    for (bd) |*x| x.* = bf16Trunc(rnd.float(f32));
+    for (sd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+
+    const ref = try gdnHostRef(al, qd, kd, vd, gd, bd, sd, @intCast(B), @intCast(T), @intCast(Hk), @intCast(Hv), @intCast(Dk), @intCast(Dv));
+    defer al.free(ref.y);
+    defer al.free(ref.state);
+
+    const qsh = [_]c_int{ B, T, Hk, Dk };
+    const vsh = [_]c_int{ B, T, Hv, Dv };
+    const gsh = [_]c_int{ B, T, Hv };
+    const ssh = [_]c_int{ B, Hv, Dv, Dk };
+    const q32 = mlx.mlx_array_new_data(qd.ptr, &qsh, 4, .float32);
+    defer _ = mlx.mlx_array_free(q32);
+    const k32 = mlx.mlx_array_new_data(kd.ptr, &qsh, 4, .float32);
+    defer _ = mlx.mlx_array_free(k32);
+    const v32 = mlx.mlx_array_new_data(vd.ptr, &vsh, 4, .float32);
+    defer _ = mlx.mlx_array_free(v32);
+    const g32 = mlx.mlx_array_new_data(gd.ptr, &gsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(g32);
+    const b32 = mlx.mlx_array_new_data(bd.ptr, &gsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(b32);
+    const st32 = mlx.mlx_array_new_data(sd.ptr, &ssh, 4, .float32);
+    defer _ = mlx.mlx_array_free(st32);
+
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    var kk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kk);
+    var v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v);
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    var beta = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(beta);
+    var st = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(st);
+    try mlx.check(mlx.mlx_astype(&q, q32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&kk, k32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&v, v32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&g, g32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&beta, b32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&st, st32, .bfloat16, s));
+
+    const stock = try gdnRunYState(false, 0, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
+    defer _ = mlx.mlx_array_free(stock.y);
+    defer _ = mlx.mlx_array_free(stock.state);
+    const blocked = try gdnRunYState(true, case.tb, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
+    defer _ = mlx.mlx_array_free(blocked.y);
+    defer _ = mlx.mlx_array_free(blocked.state);
+
+    const stock_y = try evalToF32(al, stock.y, vn, s);
+    defer al.free(stock_y);
+    const stock_st = try evalToF32(al, stock.state, sn, s);
+    defer al.free(stock_st);
+    const blk_y = try evalToF32(al, blocked.y, vn, s);
+    defer al.free(blk_y);
+    const blk_st = try evalToF32(al, blocked.state, sn, s);
+    defer al.free(blk_st);
+
+    // No-worse-than-reference: the blocked kernel's error vs the f64 ground
+    // truth must not exceed the stock kernel's (both bf16-out; 1.5x headroom
+    // covers fp32 summation-order differences, gross bugs blow way past it).
+    const stock_y_err = maxAbsDiff(stock_y, ref.y);
+    const stock_st_err = maxAbsDiff(stock_st, ref.state);
+    const blk_y_err = maxAbsDiff(blk_y, ref.y);
+    const blk_st_err = maxAbsDiff(blk_st, ref.state);
+    if (blk_y_err > 1.5 * stock_y_err + 0.02 or blk_st_err > 1.5 * stock_st_err + 0.02) {
+        std.debug.print(
+            "GDN blocked parity FAIL (B={d} T={d} Hk={d} Hv={d} Dv={d} tb={d}): y {d:.5} vs stock {d:.5}, state {d:.5} vs stock {d:.5}\n",
+            .{ case.B, case.T, case.Hk, case.Hv, case.Dv, case.tb, blk_y_err, stock_y_err, blk_st_err, stock_st_err },
+        );
+        return error.GdnBlockedParityFailed;
+    }
+}
+
+test "GDN blocked-seq kernel: no worse than stock vs f64 ground truth (T/GQA/Dv/TB sweep)" {
+    const s = mlx.gpuStream();
+    // T deliberately hits non-multiples of every supported TB (16/32/48);
+    // Hk<Hv exercises GQA head mapping; Dv 32..128 exercises 1..4 DB blocks.
+    const cases = [_]GdnCase{
+        .{ .B = 1, .T = 100, .Hk = 2, .Hv = 4, .Dv = 128, .tb = 32 }, // live-like 27B geometry (fewer heads)
+        .{ .B = 2, .T = 64, .Hk = 1, .Hv = 2, .Dv = 32, .tb = 32 }, // batch>1, minimal Dv
+        .{ .B = 1, .T = 65, .Hk = 1, .Hv = 2, .Dv = 64, .tb = 16 }, // TB=16 variant, ragged tail 1
+        .{ .B = 1, .T = 49, .Hk = 2, .Hv = 2, .Dv = 32, .tb = 48 }, // TB=48 variant, ragged tail 1
+    };
+    for (cases) |case| try gdnBlockedParityCase(case, s);
+}
+
+test "GDN blocked-seq kernel: chunk-boundary state continuity (split run == full run)" {
+    const s = mlx.gpuStream();
+    const al = testing.allocator;
+    const B: c_int = 1;
+    const T: c_int = 100;
+    const T1: c_int = 48; // non-multiple of TB=32: exercises the ragged tail mid-sequence
+    const Hk: c_int = 2;
+    const Hv: c_int = 4;
+    const Dk: c_int = 128;
+    const Dv: c_int = 64;
+    const qn: usize = @intCast(B * T * Hk * Dk);
+    const vn: usize = @intCast(B * T * Hv * Dv);
+    const gn: usize = @intCast(B * T * Hv);
+    const sn: usize = @intCast(B * Hv * Dv * Dk);
+
+    var prng = std.Random.DefaultPrng.init(0x5EC0DD);
+    const rnd = prng.random();
+    const qd = try al.alloc(f32, qn);
+    defer al.free(qd);
+    const kd = try al.alloc(f32, qn);
+    defer al.free(kd);
+    const vd = try al.alloc(f32, vn);
+    defer al.free(vd);
+    const gd = try al.alloc(f32, gn);
+    defer al.free(gd);
+    const bd = try al.alloc(f32, gn);
+    defer al.free(bd);
+    const sd = try al.alloc(f32, sn);
+    defer al.free(sd);
+    for (qd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+    for (kd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+    for (vd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+    for (gd) |*x| x.* = bf16Trunc(0.5 + 0.4 * rnd.float(f32));
+    for (bd) |*x| x.* = bf16Trunc(rnd.float(f32));
+    for (sd) |*x| x.* = bf16Trunc(rnd.float(f32) - 0.5);
+
+    const qsh = [_]c_int{ B, T, Hk, Dk };
+    const vsh = [_]c_int{ B, T, Hv, Dv };
+    const gsh = [_]c_int{ B, T, Hv };
+    const ssh = [_]c_int{ B, Hv, Dv, Dk };
+    const q32 = mlx.mlx_array_new_data(qd.ptr, &qsh, 4, .float32);
+    defer _ = mlx.mlx_array_free(q32);
+    const k32 = mlx.mlx_array_new_data(kd.ptr, &qsh, 4, .float32);
+    defer _ = mlx.mlx_array_free(k32);
+    const v32 = mlx.mlx_array_new_data(vd.ptr, &vsh, 4, .float32);
+    defer _ = mlx.mlx_array_free(v32);
+    const g32 = mlx.mlx_array_new_data(gd.ptr, &gsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(g32);
+    const b32 = mlx.mlx_array_new_data(bd.ptr, &gsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(b32);
+    const st32 = mlx.mlx_array_new_data(sd.ptr, &ssh, 4, .float32);
+    defer _ = mlx.mlx_array_free(st32);
+
+    var q = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q);
+    var kk = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(kk);
+    var v = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v);
+    var g = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g);
+    var beta = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(beta);
+    var st = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(st);
+    try mlx.check(mlx.mlx_astype(&q, q32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&kk, k32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&v, v32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&g, g32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&beta, b32, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&st, st32, .bfloat16, s));
+
+    // Full run.
+    const full = try gdnRunYState(true, 32, q, kk, v, g, beta, st, B, T, Hk, Hv, Dk, Dv, s);
+    defer _ = mlx.mlx_array_free(full.y);
+    defer _ = mlx.mlx_array_free(full.state);
+
+    // Split run: [0, T1) then [T1, T), carrying the bf16 state — exactly what
+    // chunked prefill does (ssm_state hand-off between forwardWith chunks).
+    const strides4 = [_]c_int{ 1, 1, 1, 1 };
+    const strides3 = [_]c_int{ 1, 1, 1 };
+    var q1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q1);
+    var k1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k1);
+    var v1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v1);
+    var g1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g1);
+    var b1 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b1);
+    try mlx.check(mlx.mlx_slice(&q1, q, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ B, T1, Hk, Dk }, 4, &strides4, 4, s));
+    try mlx.check(mlx.mlx_slice(&k1, kk, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ B, T1, Hk, Dk }, 4, &strides4, 4, s));
+    try mlx.check(mlx.mlx_slice(&v1, v, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ B, T1, Hv, Dv }, 4, &strides4, 4, s));
+    try mlx.check(mlx.mlx_slice(&g1, g, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ B, T1, Hv }, 3, &strides3, 3, s));
+    try mlx.check(mlx.mlx_slice(&b1, beta, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ B, T1, Hv }, 3, &strides3, 3, s));
+    var q2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q2);
+    var k2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(k2);
+    var v2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(v2);
+    var g2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(g2);
+    var b2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(b2);
+    try mlx.check(mlx.mlx_slice(&q2, q, &[_]c_int{ 0, T1, 0, 0 }, 4, &[_]c_int{ B, T, Hk, Dk }, 4, &strides4, 4, s));
+    try mlx.check(mlx.mlx_slice(&k2, kk, &[_]c_int{ 0, T1, 0, 0 }, 4, &[_]c_int{ B, T, Hk, Dk }, 4, &strides4, 4, s));
+    try mlx.check(mlx.mlx_slice(&v2, v, &[_]c_int{ 0, T1, 0, 0 }, 4, &[_]c_int{ B, T, Hv, Dv }, 4, &strides4, 4, s));
+    try mlx.check(mlx.mlx_slice(&g2, g, &[_]c_int{ 0, T1, 0 }, 3, &[_]c_int{ B, T, Hv }, 3, &strides3, 3, s));
+    try mlx.check(mlx.mlx_slice(&b2, beta, &[_]c_int{ 0, T1, 0 }, 3, &[_]c_int{ B, T, Hv }, 3, &strides3, 3, s));
+
+    const part1 = try gdnRunYState(true, 32, q1, k1, v1, g1, b1, st, B, T1, Hk, Hv, Dk, Dv, s);
+    defer _ = mlx.mlx_array_free(part1.y);
+    defer _ = mlx.mlx_array_free(part1.state);
+    const part2 = try gdnRunYState(true, 32, q2, k2, v2, g2, b2, part1.state, B, T - T1, Hk, Hv, Dk, Dv, s);
+    defer _ = mlx.mlx_array_free(part2.y);
+    defer _ = mlx.mlx_array_free(part2.state);
+
+    const full_st = try evalToF32(al, full.state, sn, s);
+    defer al.free(full_st);
+    const split_st = try evalToF32(al, part2.state, sn, s);
+    defer al.free(split_st);
+
+    // The only divergence allowed is the one bf16 state rounding injected at
+    // the boundary (live chunked prefill injects the identical rounding).
+    var max_mag: f32 = 0;
+    for (full_st) |x| max_mag = @max(max_mag, @abs(x));
+    const tol = 0.02 * max_mag + 0.02;
+    const st_diff = maxAbsDiff(full_st, split_st);
+    try testing.expect(st_diff < tol);
+
+    // y of the second chunk must also line up with the full run's tail.
+    var y_tail = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_tail);
+    try mlx.check(mlx.mlx_slice(&y_tail, full.y, &[_]c_int{ 0, T1, 0, 0 }, 4, &[_]c_int{ B, T, Hv, Dv }, 4, &strides4, 4, s));
+    const n2: usize = @intCast(B * (T - T1) * Hv * Dv);
+    const tail_f = try evalToF32(al, y_tail, n2, s);
+    defer al.free(tail_f);
+    const part2_y = try evalToF32(al, part2.y, n2, s);
+    defer al.free(part2_y);
+    try testing.expect(maxAbsDiff(tail_f, part2_y) < tol);
+}
+
+test "gdnBlockedEligible: width floor + exact-128 Dk + Dv/head-group alignment" {
+    // Live 27B GDN geometry at prefill width: eligible.
+    try testing.expect(gdnBlockedEligible(2048, 128, 128, 16, 32));
+    try testing.expect(gdnBlockedEligible(GDN_BLOCKED_MIN_T, 128, 128, 16, 32));
+    // Below the width floor (decode, spec verify widths): stock kernel.
+    try testing.expect(!gdnBlockedEligible(GDN_BLOCKED_MIN_T - 1, 128, 128, 16, 32));
+    try testing.expect(!gdnBlockedEligible(1, 128, 128, 16, 32));
+    // Off-geometry: Dk != 128, Dv not a multiple of 32, ragged GQA grouping.
+    try testing.expect(!gdnBlockedEligible(2048, 96, 128, 16, 32));
+    try testing.expect(!gdnBlockedEligible(2048, 256, 128, 16, 32));
+    try testing.expect(!gdnBlockedEligible(2048, 128, 48, 16, 32));
+    try testing.expect(!gdnBlockedEligible(2048, 128, 16, 16, 32));
+    try testing.expect(!gdnBlockedEligible(2048, 128, 128, 3, 32));
 }
 
 /// Assert a verify-kernel output is NO LESS ACCURATE than the stock qmm it
@@ -13257,6 +14217,125 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)
     }
 }
 
+test "prefill qmm µbench: stock qmm vs dequant+GEMM at 27B prefill shapes (MLX_SERVE_PREFILL_QMM_UBENCH=1)" {
+    if (std.c.getenv("MLX_SERVE_PREFILL_QMM_UBENCH") == null) return error.SkipZigTest;
+    const io_util = @import("io_util.zig");
+    const tio = testing.io;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0xFEED);
+    const rnd = prng.random();
+    const WARM = 3;
+    const ITERS = 10;
+
+    // The 27B oQ4e prefill shapes: MLP gate/up (q4 gs64), MLP down (q5
+    // gs64), GDN qkvz (q4). oMLX's prefill patch replaces exactly this class
+    // with retiled qmm_t (bm 64-128 vs stock 32) — measure whether
+    // dequant+dense-GEMM (steel bf16 gemm at near-peak) beats stock qmm
+    // per-call, and what the amortized (pre-dequantized) ceiling is.
+    const shapes = [_]struct { name: []const u8, k: c_int, n: c_int, bits: c_int }{
+        .{ .name = "gate/up-q4", .k = 5120, .n = 17408, .bits = 4 },
+        .{ .name = "down-q5", .k = 17408, .n = 5120, .bits = 5 },
+        .{ .name = "qkvz-q4", .k = 5120, .n = 16384, .bits = 4 },
+    };
+    std.debug.print("\n[pqmm-ubench] {s:>10} {s:>5} {s:>9} {s:>12} {s:>12}\n", .{ "shape", "M", "stock_ms", "dq+gemm_ms", "gemm_ms" });
+    for (shapes) |sh| {
+        const wn: usize = @intCast(sh.n * sh.k);
+        const wbuf = try allocator.alloc(f32, wn);
+        for (wbuf) |*v| v.* = rnd.float(f32) - 0.5;
+        const wshape = [_]c_int{ sh.n, sh.k };
+        const w32 = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 2, .float32);
+        allocator.free(wbuf);
+        defer _ = mlx.mlx_array_free(w32);
+        var wb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wb);
+        try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(sh.bits), "affine", .{}, s));
+        var wq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wq);
+        var wsc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wsc);
+        var wbi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wbi);
+        try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+        for ([_]mlx.mlx_array{ wq, wsc, wbi }) |a| try mlx.check(mlx.mlx_array_eval(a));
+
+        // Pre-dequantized weight for the amortized-GEMM ceiling.
+        var wdq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wdq);
+        try mlx.check(mlx.mlx_dequantize(&wdq, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(sh.bits), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .bfloat16, .has_value = true }, s));
+        var wdq_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wdq_t);
+        try mlx.check(mlx.mlx_transpose(&wdq_t, wdq, s));
+        try mlx.check(mlx.mlx_array_eval(wdq_t));
+
+        for ([_]c_int{ 2048, 4096 }) |m| {
+            const xn: usize = @intCast(m * sh.k);
+            const xbuf = try allocator.alloc(f32, xn);
+            for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
+            const xshape = [_]c_int{ 1, m, sh.k };
+            const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+            allocator.free(xbuf);
+            defer _ = mlx.mlx_array_free(x32);
+            var x = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+            try mlx.check(mlx.mlx_array_eval(x));
+
+            var stock_ms: f64 = 0;
+            {
+                var it: usize = 0;
+                var sw = io_util.Stopwatch.init(tio);
+                while (it < WARM + ITERS) : (it += 1) {
+                    if (it == WARM) sw.reset();
+                    const r1 = try qmatmulBits(x, wq, wsc, wbi, @intCast(sh.bits), 64, .affine, s);
+                    try mlx.check(mlx.mlx_array_eval(r1));
+                    _ = mlx.mlx_array_free(r1);
+                }
+                stock_ms = @as(f64, @floatFromInt(sw.read())) / @as(f64, ITERS) / 1e6;
+            }
+            var dq_ms: f64 = 0;
+            {
+                var it: usize = 0;
+                var sw = io_util.Stopwatch.init(tio);
+                while (it < WARM + ITERS) : (it += 1) {
+                    if (it == WARM) sw.reset();
+                    var dq = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_dequantize(&dq, wq, wsc, wbi, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(sh.bits), "affine", .{ .ctx = null }, mlx.mlx_optional_dtype{ .value = .bfloat16, .has_value = true }, s));
+                    var dq_t = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_transpose(&dq_t, dq, s));
+                    var r2 = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_matmul(&r2, x, dq_t, s));
+                    try mlx.check(mlx.mlx_array_eval(r2));
+                    _ = mlx.mlx_array_free(dq);
+                    _ = mlx.mlx_array_free(dq_t);
+                    _ = mlx.mlx_array_free(r2);
+                }
+                dq_ms = @as(f64, @floatFromInt(sw.read())) / @as(f64, ITERS) / 1e6;
+            }
+            var gemm_ms: f64 = 0;
+            {
+                var it: usize = 0;
+                var sw = io_util.Stopwatch.init(tio);
+                while (it < WARM + ITERS) : (it += 1) {
+                    if (it == WARM) sw.reset();
+                    var r3 = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_matmul(&r3, x, wdq_t, s));
+                    try mlx.check(mlx.mlx_array_eval(r3));
+                    _ = mlx.mlx_array_free(r3);
+                }
+                gemm_ms = @as(f64, @floatFromInt(sw.read())) / @as(f64, ITERS) / 1e6;
+            }
+            _ = mlx.mlx_clear_cache();
+            std.debug.print("[pqmm-ubench] {s:>10} {d:>5} {d:>9.2} {d:>12.2} {d:>12.2}\n", .{ sh.name, m, stock_ms, dq_ms, gemm_ms });
+        }
+    }
+}
+
 test "GDN µbench: sequential kernel vs bare qmm at 27B shapes (attribution; MLX_SERVE_GDN_UBENCH=1)" {
     // ATTRIBUTION probe, not a pass/fail guard (live A/Bs decide shipping):
     // decomposes the multi-token forward ladder into (a) the GDN recurrence
@@ -13637,19 +14716,25 @@ test "fusedSdpa256Prefill: declines cleanly outside its envelope" {
     defer fused256_override = null;
     try std.testing.expect((try fusedSdpa256Prefill(s, q128, q128, q128, 1.0, 0)) == null);
 
-    // Decode/verify shapes (seq <= 8) -> null (sdpa_vector owns hd 256
-    // there; stealing MTP verify forwards measured decode 48 -> 18 tok/s).
+    // Decode/verify shapes (q_len < 16) -> null (sdpa_vector owns hd 256
+    // there; stealing MTP verify forwards measured decode 48 -> 18 tok/s;
+    // the 16 floor matches oMLX's _MIN_ROUTE_Q_LEN — with causal fused
+    // default-on, a depth-8 MTP verify is q_len 9 and must NOT route here).
     const q1_shape = [_]c_int{ 1, 4, 1, 256 };
     const q8_shape = [_]c_int{ 1, 4, 8, 256 };
+    const q15_shape = [_]c_int{ 1, 4, 15, 256 };
     const kv_shape = [_]c_int{ 1, 4, 64, 256 };
     const q1 = try attn256RandBf16(rnd, &q1_shape, s);
     defer _ = mlx.mlx_array_free(q1);
     const q8 = try attn256RandBf16(rnd, &q8_shape, s);
     defer _ = mlx.mlx_array_free(q8);
+    const q15 = try attn256RandBf16(rnd, &q15_shape, s);
+    defer _ = mlx.mlx_array_free(q15);
     const k1 = try attn256RandBf16(rnd, &kv_shape, s);
     defer _ = mlx.mlx_array_free(k1);
     try std.testing.expect((try fusedSdpa256Prefill(s, q1, k1, k1, 1.0, 0)) == null);
     try std.testing.expect((try fusedSdpa256Prefill(s, q8, k1, k1, 1.0, 0)) == null);
+    try std.testing.expect((try fusedSdpa256Prefill(s, q15, k1, k1, 1.0, 0)) == null);
 
     // Kill switch -> null even for a conforming call.
     fused256_override = false;
@@ -13659,16 +14744,17 @@ test "fusedSdpa256Prefill: declines cleanly outside its envelope" {
     try std.testing.expect((try fusedSdpa256Prefill(s, q, q, q, 1.0, 0)) == null);
 }
 
-test "fusedSdpa256Prefill: causal defaults composed, band defaults fused" {
+test "fusedSdpa256Prefill: causal and band both default FUSED (budgeted-dispatch flip)" {
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x4A7E);
     const rnd = prng.random();
 
-    // No override, no env: the causal arm must DECLINE even at the kernel's
-    // best shape (kL == qL, +63% on the µbench) — live same-boot A/Bs on the
-    // 27B measured every fused-causal variant as a net loss (see
-    // fused256CausalMode), so composed keeps causal until that gap is
-    // understood. The band arm (window > 0) stays fused by default.
+    // No override, no env: BOTH arms engage. The causal arm's historical
+    // net-loss (every pre-budget ratio-gated variant lost same-boot on the
+    // 27B) was the IOGPU preemption class — with the kv-chunk dispatch
+    // budget it wins live (2026-07-22 same-session A/B: +2.9%/+2.3%/+4.6%
+    // at 8K/16K/32K on the 27B), so causal is default-on now.
+    // MLX_SERVE_FUSED_256_CAUSAL=0 restores composed causal.
     std.debug.assert(fused256_override == null);
     const q_shape = [_]c_int{ 1, 6, 64, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -13677,11 +14763,127 @@ test "fusedSdpa256Prefill: causal defaults composed, band defaults fused" {
     const k = try attn256RandBf16(rnd, &kv_shape, s);
     defer _ = mlx.mlx_array_free(k);
 
-    try std.testing.expect((try fusedSdpa256Prefill(s, q, k, k, 1.0, 0)) == null);
+    const causal = try fusedSdpa256Prefill(s, q, k, k, 1.0, 0);
+    try std.testing.expect(causal != null);
+    if (causal) |f| _ = mlx.mlx_array_free(f);
 
     const banded = try fusedSdpa256Prefill(s, q, k, k, 1.0, 40);
     try std.testing.expect(banded != null);
     if (banded) |f| _ = mlx.mlx_array_free(f);
+}
+
+test "fused256KvChunkLen: BK alignment, one-block floor, kl cap, budget-off" {
+    const t = std.testing;
+    // budget <= 0: single dispatch covering the full key axis.
+    try t.expectEqual(@as(c_int, 193), fused256KvChunkLen(1, 6, 70, 193, 0));
+    try t.expectEqual(@as(c_int, 65536), fused256KvChunkLen(1, 24, 2048, 65536, -1));
+    // 27B live shape (24 heads, 2048-chunk q) at the default budget:
+    // 250M / (24*2048) = 5086 keys -> floored to the BK(32) multiple 5056.
+    try t.expectEqual(@as(c_int, 5056), fused256KvChunkLen(1, 24, 2048, 65536, FUSED256_DEFAULT_DISPATCH_BUDGET));
+    // Never below one BK block even at absurdly small budgets…
+    try t.expectEqual(@as(c_int, 32), fused256KvChunkLen(1, 24, 2048, 65536, 1));
+    // …and never above the actual key length.
+    try t.expectEqual(@as(c_int, 193), fused256KvChunkLen(1, 6, 70, 193, 1 << 40));
+}
+
+test "fusedSdpa256Prefill: budgeted kv chunking engages and is exact vs single dispatch" {
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    var prng = std.Random.DefaultPrng.init(0xC4A2);
+    const rnd = prng.random();
+
+    // Hq=6/Hk=2, qL=70 (ragged q tile), kL=193 (ragged kv block). Per-key
+    // work = 6*70 = 420; budget 40000 -> chunk 64 -> dispatches over
+    // [0,64) [64,128) [128,192) [192,193) — 4, incl. a 1-key ragged tail.
+    const q_shape = [_]c_int{ 1, 6, 70, 256 };
+    const kv_shape = [_]c_int{ 1, 2, 193, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v);
+    const scale: f32 = 1.0 / 16.0;
+
+    fused256_budget_override = 0;
+    const single = (try fusedSdpa256Prefill(s, q, k, v, scale, 0)) orelse {
+        fused256_budget_override = null;
+        return error.FusedDeclined;
+    };
+    defer _ = mlx.mlx_array_free(single);
+    try std.testing.expectEqual(@as(u32, 1), fused256_last_dispatch_count);
+
+    fused256_budget_override = 40_000;
+    defer fused256_budget_override = null;
+    const chunked = (try fusedSdpa256Prefill(s, q, k, v, scale, 0)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(chunked);
+    // Engagement counted, not inferred: the budget must actually split.
+    try std.testing.expectEqual(@as(u32, 4), fused256_last_dispatch_count);
+
+    // The carry rides fp32 buffers — the exact register precision — so the
+    // chunked result is BIT-IDENTICAL to the single dispatch, not just close.
+    const max_diff = try attn256MaxDiff(single, chunked, s);
+    try std.testing.expect(max_diff == 0.0);
+
+    // And still correct in absolute terms vs the composed reference.
+    const ref = try attn256Reference(q, k, v, scale, "causal", .{ .ctx = null }, s);
+    defer _ = mlx.mlx_array_free(ref);
+    const ref_diff = try attn256MaxDiff(chunked, ref, s);
+    try std.testing.expect(ref_diff < 0.005);
+}
+
+test "fusedSdpa256Prefill: band arm never chunks (single dispatch under a tiny budget)" {
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    fused256_budget_override = 1; // would force max chunking on the causal arm
+    defer fused256_budget_override = null;
+    var prng = std.Random.DefaultPrng.init(0xBA9D2);
+    const rnd = prng.random();
+
+    const qL: c_int = 70;
+    const kL: c_int = 193;
+    const sw: c_int = 40;
+    const q_shape = [_]c_int{ 1, 4, qL, 256 };
+    const kv_shape = [_]c_int{ 1, 4, kL, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256RandBf16(rnd, &kv_shape, s);
+    defer _ = mlx.mlx_array_free(v);
+
+    const fused = (try fusedSdpa256Prefill(s, q, k, v, 1.0, sw)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+    // The band arm's block skip already bounds per-dispatch work; chunking it
+    // would only add carry traffic. It must stay a single dispatch.
+    try std.testing.expectEqual(@as(u32, 1), fused256_last_dispatch_count);
+
+    // Unchanged band semantics (same reference as the band parity test).
+    const mask_n: usize = @intCast(qL * kL);
+    const mask_data = try std.testing.allocator.alloc(f32, mask_n);
+    defer std.testing.allocator.free(mask_data);
+    const off: c_int = kL - qL;
+    var r: c_int = 0;
+    while (r < qL) : (r += 1) {
+        var c: c_int = 0;
+        while (c < kL) : (c += 1) {
+            const row_abs = off + r;
+            const masked = (c > row_abs) or (row_abs - c >= sw);
+            mask_data[@intCast(r * kL + c)] = if (masked) -std.math.inf(f32) else 0.0;
+        }
+    }
+    const mask_shape = [_]c_int{ 1, 1, qL, kL };
+    const mask_f32 = mlx.mlx_array_new_data(mask_data.ptr, &mask_shape, 4, .float32);
+    defer _ = mlx.mlx_array_free(mask_f32);
+    var mask = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(mask);
+    try mlx.check(mlx.mlx_astype(&mask, mask_f32, .bfloat16, s));
+    const ref = try attn256Reference(q, k, v, 1.0, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    const max_diff = try attn256MaxDiff(fused, ref, s);
+    try std.testing.expect(max_diff < 0.02);
 }
 
 test "fusedSdpa256Prefill: causal parity at Qwen 24q/4kv geometry (gqa 6, ragged 64-row tile)" {

@@ -93,15 +93,25 @@ pub const PREFILL_CHUNK_FLOOR: usize = 512;
 /// comment). Gemma keeps the formula-only policy for its fused band layers.
 pub fn boundedPrefillChunk(base_chunk: usize, head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool) usize {
     if (head_dim <= 128 or n_heads == 0 or total_ctx == 0) return base_chunk;
-    // Archs with NO sliding-band layers (has_sliding_window=false: the
-    // qwen3_5/3_6 class) run every hd-256 prefill through the composed
-    // causal path, where SMALL chunks measured strictly faster AND lighter
-    // on the 27B (2026-07-12 ladder, M4 Max): 8K 225 -> 235.8 tok/s and
-    // peak 28.9 -> 19.8 GB at chunk 2048; 32K 205.4 -> 209.3. Chunk
-    // boundaries ARE block-level causal skipping for composed attention.
-    // Sliding-band archs (gemma) keep big chunks — their local layers run
-    // the fused band kernel, which block-skips in-kernel and wants the
-    // fewest KV re-walks (26B@99K: 712 tok/s at the formula chunk).
+    // Non-sliding hd-256 archs under FUSED causal (the default since the
+    // budgeted-dispatch flip): no score tensor exists, so the scores-budget
+    // formula below is moot — and its old shrink (1024 at 64K on 24 heads)
+    // starved the dequant+GEMM qmm route, which needs M >= 2048 to engage
+    // (the 64K rung was the ladder's weakest for exactly this reason).
+    // Chunk 4096 measured faster than 2048 same-session on the 27B even
+    // before the dq route (+1.2% 8K / +0.6% 32K) and halves the per-chunk
+    // dequant overhead on top. Never raises a caller-lowered base.
+    if (!sliding_band_arch and transformer_mod.fused256CausalMode() == .all) {
+        return @min(base_chunk, 4096);
+    }
+    // Composed-causal fallback (MLX_SERVE_FUSED_256_CAUSAL=0): SMALL chunks
+    // measured strictly faster AND lighter on the 27B (2026-07-12 ladder,
+    // M4 Max): 8K 225 -> 235.8 tok/s and peak 28.9 -> 19.8 GB at chunk
+    // 2048; 32K 205.4 -> 209.3. Chunk boundaries ARE block-level causal
+    // skipping for composed attention. Sliding-band archs (gemma) keep big
+    // chunks — their local layers run the fused band kernel, which
+    // block-skips in-kernel and wants the fewest KV re-walks (26B@99K:
+    // 712 tok/s at the formula chunk).
     const causal_cap: usize = if (sliding_band_arch) base_chunk else @min(base_chunk, 2048);
     const per_row: u64 = @as(u64, n_heads) * @as(u64, total_ctx) * 2;
     const max_chunk: u64 = PREFILL_SCORES_BUDGET_BYTES / per_row;
@@ -2621,13 +2631,23 @@ pub const Generator = struct {
             _ = mlx.mlx_array_free(h);
         };
 
-        {
-            // Draft proposal sampler. Greedy (argmax) drafts make the one-hot
-            // proposal model exact AND remove draft-side sampling noise from
-            // the acceptance rate; opt in via MLX_SERVE_MTP_DRAFT_GREEDY=1.
-            var draft_sampling = self.sampling;
-            if (mtpDraftGreedy()) draft_sampling.temperature = 0.0;
+        // Draft proposal sampler (see mtpDraftSamplingFor): sharpened
+        // stochastic by default for stochastic targets; greedy for greedy
+        // targets or under the MLX_SERVE_MTP_DRAFT_GREEDY=1 override. With
+        // stochastic proposals each step ALSO keeps its filtered draft
+        // distribution q ([1, vocab] lazy) — the ratio accept and the
+        // residual both need it in Phase 4, and it rides the same lazy
+        // graph (one-bounded-sync discipline unchanged).
+        const draft_sampling = mtpDraftSamplingFor(self.sampling, mtpDraftGreedy());
+        const sharp_drafts = draft_sampling.temperature > 0.01;
+        const q_probs: ?[]mlx.mlx_array = if (sharp_drafts) try allocator.alloc(mlx.mlx_array, m_max) else null;
+        var n_qp: u32 = 0;
+        defer if (q_probs) |slots| {
+            for (slots[0..n_qp]) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(slots);
+        };
 
+        {
             var prev_tok_arr: mlx.mlx_array = t1_arr;
             var i: u32 = 0;
             while (i < m) : (i += 1) {
@@ -2665,7 +2685,18 @@ pub const Generator = struct {
                     }
                     break :blk try mtp_mod.forward(head, xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), true);
                 } else try mtp_mod.stepArr(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(mtp_off0 + i));
-                draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
+                if (q_probs) |slots| {
+                    // Sharp proposal: q = filtered softmax of the draft-head
+                    // logits at the FIXED sharpened constants; the draft is
+                    // sampled from exactly this distribution (log+categorical
+                    // == categorical over the filtered logits), so the q used
+                    // in the accept ratio is the true proposal density.
+                    slots[i] = try probsAtLastPos(step_out.logits, draft_sampling, s);
+                    n_qp = i + 1;
+                    draft_arrs[i] = try sampleFromProbsLazy(slots[i], s);
+                } else {
+                    draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
+                }
                 n_drafted = i + 1;
                 if (conf_arrs != null and i < m_lo) {
                     // Chunk-A confidence: log p_head(draft) — built from the
@@ -2788,6 +2819,8 @@ pub const Generator = struct {
         };
         var accept_p_vec = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(accept_p_vec);
+        var accept_q_vec = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(accept_q_vec);
         var corr_samples: ?[]mlx.mlx_array = null;
         defer if (corr_samples) |slots| {
             for (slots) |arr| _ = mlx.mlx_array_free(arr);
@@ -2830,6 +2863,27 @@ pub const Generator = struct {
                 try mlx.check(mlx.mlx_astype(&accept_p_vec, cat, .float32, s));
             }
 
+            // accept_q_vec[k] = q_k[draft_k] — the proposal's own density at
+            // the sampled draft, for the Leviathan ratio (sharp drafts only).
+            if (q_probs) |qslots| {
+                const taken = try allocator.alloc(mlx.mlx_array, m);
+                defer {
+                    for (taken) |arr| _ = mlx.mlx_array_free(arr);
+                    allocator.free(taken);
+                }
+                for (0..m) |k| {
+                    taken[k] = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_take_axis(&taken[k], qslots[k], draft_arrs[k], -1, s));
+                }
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                for (taken) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+                var cat = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(cat);
+                try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 0, s));
+                try mlx.check(mlx.mlx_astype(&accept_q_vec, cat, .float32, s));
+            }
+
             // Candidate correction for every possible reject position a<m
             // (residual sample) plus the full-accept bonus at a=m. Only the
             // one at the realized `accepted` is read; the rest are a few
@@ -2844,17 +2898,23 @@ pub const Generator = struct {
             for (corrs, 0..) |*slot, a| {
                 slot.* = mlx.mlx_array_new();
                 if (a < m) {
-                    // residual = max(target_p − one_hot(draft_a), 0); the
-                    // one-hot is built from the lazy draft id (arange == id).
-                    var onehot_b = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(onehot_b);
-                    try mlx.check(mlx.mlx_equal(&onehot_b, indices, draft_arrs[a], s));
-                    var onehot = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(onehot);
-                    try mlx.check(mlx.mlx_astype(&onehot, onehot_b, .float32, s));
+                    // residual = max(target_p − proposal, 0): the proposal is
+                    // the FULL sharpened q distribution under sharp drafts
+                    // (exact Leviathan residual), the one-hot of the lazy
+                    // draft id under greedy drafts (arange == id).
                     var diff = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(diff);
-                    try mlx.check(mlx.mlx_subtract(&diff, per_pos_probs.?[a], onehot, s));
+                    if (q_probs) |qslots| {
+                        try mlx.check(mlx.mlx_subtract(&diff, per_pos_probs.?[a], qslots[a], s));
+                    } else {
+                        var onehot_b = mlx.mlx_array_new();
+                        defer _ = mlx.mlx_array_free(onehot_b);
+                        try mlx.check(mlx.mlx_equal(&onehot_b, indices, draft_arrs[a], s));
+                        var onehot = mlx.mlx_array_new();
+                        defer _ = mlx.mlx_array_free(onehot);
+                        try mlx.check(mlx.mlx_astype(&onehot, onehot_b, .float32, s));
+                        try mlx.check(mlx.mlx_subtract(&diff, per_pos_probs.?[a], onehot, s));
+                    }
                     const zero = mlx.mlx_array_new_float(0.0);
                     defer _ = mlx.mlx_array_free(zero);
                     var residual = mlx.mlx_array_new();
@@ -2895,6 +2955,7 @@ pub const Generator = struct {
             for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
             if (stochastic) {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
+                if (q_probs != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_q_vec);
                 for (corr_samples.?) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
             } else {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
@@ -2917,14 +2978,23 @@ pub const Generator = struct {
 
         var accepted: u32 = 0;
         if (stochastic) {
-            // One-hot proposal (argmax draft): accept with min(1, target_p).
+            // Sharp drafts: full Leviathan ratio min(1, p/q) against the
+            // proposal's own density. Greedy-forced drafts keep the exact
+            // one-hot rule min(1, target_p).
             try mlx.check(mlx.mlx_array_eval(accept_p_vec));
             const p_data = mlx.mlx_array_data_float32(accept_p_vec) orelse {
                 return error.MlxArrayDataNull;
             };
+            var q_data: ?[*]const f32 = null;
+            if (q_probs != null) {
+                try mlx.check(mlx.mlx_array_eval(accept_q_vec));
+                q_data = mlx.mlx_array_data_float32(accept_q_vec) orelse {
+                    return error.MlxArrayDataNull;
+                };
+            }
             var k: u32 = 0;
             while (k < m) : (k += 1) {
-                const accept_prob: f32 = @min(1.0, p_data[k]);
+                const accept_prob: f32 = if (q_data) |qd| specAcceptProb(p_data[k], qd[k]) else @min(1.0, p_data[k]);
                 const u: f32 = self.prng.random().float(f32);
                 if (u >= accept_prob) break;
                 accepted += 1;
@@ -3147,15 +3217,26 @@ pub const Generator = struct {
     // re-forward-era 0.60 — hysteresis band keeps switch churn down.
     pub const MTP_DEMOTE_BELOW: f32 = 0.40; // per-draft rate at depth > 1 → step down
     pub const MTP_PROMOTE_ABOVE: f32 = 0.60; // per-draft rate below configured depth → step up
-    pub const MTP_DISABLE_BELOW: f32 = 0.50; // per-draft rate at depth 1 → disable (sticky)
+    // Disable floor = the MEASURED depth-1 breakeven plus margin, not a
+    // quality judgment: a d1 round costs ~AR+6 ms (44 vs 38.4 ms at 8K on
+    // the 27B, mtp-trace 2026-07-22) and yields (1+p) tokens, so speculation
+    // pays down to p ≈ 0.15 — at p=0.45 it is +27% over AR. The old 0.50
+    // floor sticky-disabled mid-request on the oQ4e head at long context
+    // (window rate dips 0.45-0.55) and cratered 16K/32K ladder decode to
+    // bare AR (24-26 tok/s vs oMLX's 41-47, which never fully disables).
+    pub const MTP_DISABLE_BELOW: f32 = 0.20; // per-draft rate at depth 1 → disable (sticky)
     pub const MTP_PROMOTE_COOLDOWN: u32 = 32; // rounds promotion stays blocked after a demotion
 
-    /// Greedy (argmax) MTP draft proposals — DEFAULT ON: the acceptance rule
-    /// (`min(1, p_target[draft])` + one-hot residual) models the proposal as
-    /// deterministic, so argmax drafts make the math exact where sampled
-    /// drafts only approximated it — and measured per-draft acceptance is
-    /// equal-or-higher with far less run-to-run variance (drafts no longer
-    /// carry sampling noise). MLX_SERVE_MTP_DRAFT_GREEDY=0 reverts.
+    /// Greedy (argmax) MTP draft proposals — DEFAULT ON. Measured on the
+    /// Jundot oQ4e head (2026-07-22, ladder coding prompts, temp 0.6): the
+    /// sharpened stochastic proposal + exact Leviathan ratio (oMLX
+    /// Lightning's scheme, see mtpDraftSamplingFor) reads 48-50% per-draft
+    /// vs greedy's 58-63% — on LOW-entropy agent/code content the temp-0.6
+    /// target is sharper than any sampled proposal, so `min(1,
+    /// p_target[argmax])` dominates `1 − TV(p, q)`; draft-head precision
+    /// (3-bit/8-bit/trunk q) moved nothing. MLX_SERVE_MTP_DRAFT_GREEDY=0
+    /// flips to the sharpened sampled proposal (exactness holds either way —
+    /// pinned by the toy-vocab test; only the acceptance RATE differs).
     var mtp_draft_greedy_cache: ?bool = null;
     fn mtpDraftGreedy() bool {
         if (mtp_draft_greedy_cache) |v| return v;
@@ -3166,6 +3247,41 @@ pub const Generator = struct {
         }
         mtp_draft_greedy_cache = on;
         return on;
+    }
+
+    // ── Sharpened stochastic draft proposals (Lightning-class acceptance) ──
+    // Drafts for a stochastic target are SAMPLED from a fixed sharper
+    // distribution (constants mirror oMLX's _DRAFT_SAMPLER_*: their comment —
+    // matched-temp drafting "collapses to ~10-20% on high-entropy content"),
+    // acceptance is the full Leviathan/Chen ratio min(1, p/q) with q = the
+    // draft sampler's own filtered distribution, and rejection re-samples
+    // from normalize(max(p-q, 0)). Output distribution provably equals the
+    // target's filtered p for ANY proposal q (pinned by the toy-vocab
+    // exactness test); q only moves the ACCEPTANCE RATE, which is why the
+    // draft head's quantization never affects correctness.
+    pub const MTP_DRAFT_TEMP: f32 = 0.6;
+    pub const MTP_DRAFT_TOP_P: f32 = 0.95;
+    pub const MTP_DRAFT_TOP_K: u32 = 20;
+
+    /// Draft-proposal sampler for a round: greedy targets keep greedy drafts
+    /// (temp-0 identity contract); stochastic targets draft from the fixed
+    /// sharpened distribution unless greedy is forced.
+    pub fn mtpDraftSamplingFor(target: SamplingParams, force_greedy: bool) SamplingParams {
+        var d = target;
+        if (force_greedy or target.temperature <= 0.01) {
+            d.temperature = 0.0;
+            return d;
+        }
+        d.temperature = MTP_DRAFT_TEMP;
+        d.top_p = MTP_DRAFT_TOP_P;
+        d.top_k = MTP_DRAFT_TOP_K;
+        return d;
+    }
+
+    /// Full Leviathan acceptance ratio; q clamped so a sampled draft (q > 0
+    /// by construction) can never divide by an underflowed zero.
+    pub fn specAcceptProb(p: f32, q_draft: f32) f32 {
+        return @min(1.0, p / @max(q_draft, 1e-12));
     }
 
     /// Pure depth-policy step. `rate` is the windowed per-draft acceptance
@@ -4290,6 +4406,22 @@ fn sampleResidual(target_probs: mlx.mlx_array, draft_probs: mlx.mlx_array, s: ml
     try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
 
     return sampleFromProbs(residual, s);
+}
+
+/// Lazy categorical sample from an already-filtered probability row
+/// ([1, vocab]): log(probs) puts masked tokens at -inf, categorical draws
+/// within the kept set — the same distribution as sampling the filtered
+/// logits directly, but the caller keeps `probs` as the proposal density q.
+fn sampleFromProbsLazy(probs: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var logp = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logp);
+    try mlx.check(mlx.mlx_log(&logp, probs, s));
+    var sampled = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(sampled);
+    const null_key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(null_key);
+    try mlx.check(mlx.mlx_random_categorical(&sampled, logp, -1, null_key, s));
+    return sampled;
 }
 
 pub fn sampleTokenLazy(logits: mlx.mlx_array, sampling: SamplingParams, s: mlx.mlx_stream) mlx.mlx_array {
@@ -6121,20 +6253,18 @@ test "boundedPrefillChunk: never raises a caller-lowered base chunk" {
     try testing.expectEqual(@as(usize, 256), boundedPrefillChunk(256, 256, 16, 262_144, true));
 }
 
-test "boundedPrefillChunk: composed-causal hd-256 archs cap at 2048" {
-    // Archs with NO sliding-band layers (qwen3_5/3_6 class: GDN + full
-    // attention, has_sliding_window=false) run every hd-256 prefill through
-    // the composed causal path, where SMALLER chunks measured faster on the
-    // 27B ladder (2026-07-12, M4 Max): 8K prompt 225 -> 235.8 tok/s at
-    // chunk 2048 (peak 28.9 -> 19.8 GB), 32K 205.4 -> 209.3. Chunking IS
-    // block-level causal skipping for composed attention, and the score
-    // transient shrinks with it. Cap the auto chunk at 2048.
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false));
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 16384, false));
-    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false));
-    // The scores-budget formula still wins BELOW the cap: 64K on 24 heads
-    // yields 1024 (measured better than 2048 there: 186 vs 182.3 tok/s).
-    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 24, 65536, false));
+test "boundedPrefillChunk: fused-causal (default) non-sliding hd-256 caps at 4096, no score-formula shrink" {
+    // With the causal arm FUSED (default since the budgeted-dispatch flip) no
+    // score tensor exists, so the scores-budget formula is moot for the
+    // qwen3_5/3_6 class — and its old shrink to 1024 at 64K starved the
+    // dequant+GEMM qmm route (engages at M >= 2048): the 64K rung was the
+    // ladder's weakest for exactly this reason. Measured on the 27B: chunk
+    // 4096 beats 2048 same-session (+1.2% 8K / +0.6% 32K even before the
+    // dq route; the per-chunk dequant overhead halves on top).
+    std.debug.assert(transformer_mod.fused256_override == null);
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 8192, false));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 65536, false));
+    try testing.expectEqual(@as(usize, 4096), boundedPrefillChunk(8192, 256, 24, 140_000, false));
     // Never raises a caller-lowered base.
     try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(1024, 256, 24, 8192, false));
     // Sliding-band archs (gemma: fused band kernel wants big chunks) keep
@@ -6142,6 +6272,21 @@ test "boundedPrefillChunk: composed-causal hd-256 archs cap at 2048" {
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 16, 8192, true));
     // Fused head dims never cap regardless of arch.
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 128, 24, 1_000_000, false));
+}
+
+test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + score formula" {
+    // MLX_SERVE_FUSED_256_CAUSAL=0 restores composed causal, where SMALLER
+    // chunks measured faster on the 27B ladder (2026-07-12, M4 Max): 8K
+    // prompt 225 -> 235.8 tok/s at chunk 2048 (peak 28.9 -> 19.8 GB).
+    // Chunking IS block-level causal skipping for composed attention, and
+    // the score transient shrinks with it.
+    transformer_mod.fused256_override = false;
+    defer transformer_mod.fused256_override = null;
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 8192, false));
+    try testing.expectEqual(@as(usize, 2048), boundedPrefillChunk(8192, 256, 24, 32768, false));
+    // The scores-budget formula still wins BELOW the cap: 64K on 24 heads
+    // yields 1024 (measured better than 2048 there: 186 vs 182.3 tok/s).
+    try testing.expectEqual(@as(usize, 1024), boundedPrefillChunk(8192, 256, 24, 65536, false));
 }
 
 test "effectiveSsmCheckpointStride: MoE coarsens to PREFILL_CHUNK, dense keeps fine" {
@@ -6180,6 +6325,93 @@ fn mtpEvTestGenerator() Generator {
     return g;
 }
 
+test "mtpDraftSamplingFor: sharpened fixed proposal for stochastic targets, greedy stays greedy" {
+    // Stochastic target: drafts sample from the FIXED sharpened distribution
+    // (temp 0.6 / top_p 0.95 / top_k 20 — oMLX Lightning's _DRAFT_SAMPLER_*
+    // constants; matched-temp drafting collapses on high-entropy content).
+    const target = SamplingParams{ .temperature = 1.0, .top_p = 1.0, .top_k = 0, .repeat_penalty = 1.1 };
+    const d = Generator.mtpDraftSamplingFor(target, false);
+    try testing.expectEqual(@as(f32, 0.6), d.temperature);
+    try testing.expectEqual(@as(f32, 0.95), d.top_p);
+    try testing.expectEqual(@as(u32, 20), d.top_k);
+    // Non-sampler fields ride through untouched.
+    try testing.expectEqual(@as(f32, 1.1), d.repeat_penalty);
+
+    // Greedy target keeps greedy drafts (the temp-0 identity contract).
+    const greedy = SamplingParams{ .temperature = 0.0 };
+    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(greedy, false).temperature);
+    const near_greedy = SamplingParams{ .temperature = 0.005 };
+    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(near_greedy, false).temperature);
+
+    // Explicit greedy override (MLX_SERVE_MTP_DRAFT_GREEDY=1) wins.
+    try testing.expectEqual(@as(f32, 0.0), Generator.mtpDraftSamplingFor(target, true).temperature);
+}
+
+test "specAcceptProb: full Leviathan ratio, q-clamped" {
+    // p <= q: accept with p/q.
+    try testing.expect(@abs(Generator.specAcceptProb(0.2, 0.4) - 0.5) < 1e-6);
+    // p > q: always accept.
+    try testing.expectEqual(@as(f32, 1.0), Generator.specAcceptProb(0.4, 0.2));
+    try testing.expectEqual(@as(f32, 1.0), Generator.specAcceptProb(0.4, 0.4));
+    // Degenerate q underflow never divides by zero.
+    try testing.expectEqual(@as(f32, 1.0), Generator.specAcceptProb(0.5, 0.0));
+}
+
+test "spec sampling exactness: draft-from-q + ratio-accept + residual reproduces target p (toy vocab)" {
+    // Host-level simulation of the exact per-position algorithm the MTP
+    // stochastic round runs: draft ~ q, accept with min(1, p/q), on reject
+    // sample from normalize(max(p - q, 0)). The output distribution must
+    // equal p (Leviathan/Chen) — this is the invariant the one-hot rule
+    // broke for sampled proposals.
+    const p = [_]f64{ 0.1, 0.2, 0.3, 0.4 };
+    const q = [_]f64{ 0.4, 0.3, 0.2, 0.1 };
+    var residual: [4]f64 = undefined;
+    var res_sum: f64 = 0;
+    for (0..4) |i| {
+        residual[i] = @max(p[i] - q[i], 0);
+        res_sum += residual[i];
+    }
+    for (&residual) |*r| r.* /= res_sum;
+
+    var prng = std.Random.DefaultPrng.init(0x5A3E);
+    const rnd = prng.random();
+    var counts = [_]u64{ 0, 0, 0, 0 };
+    const N: usize = 400_000;
+    for (0..N) |_| {
+        // draft ~ q
+        var u = rnd.float(f64);
+        var draft: usize = 0;
+        var acc: f64 = 0;
+        for (q, 0..) |qi, i| {
+            acc += qi;
+            if (u < acc) {
+                draft = i;
+                break;
+            }
+        }
+        const a = Generator.specAcceptProb(@floatCast(p[draft]), @floatCast(q[draft]));
+        if (rnd.float(f32) < a) {
+            counts[draft] += 1;
+        } else {
+            u = rnd.float(f64);
+            acc = 0;
+            var res_tok: usize = 3;
+            for (residual, 0..) |ri, i| {
+                acc += ri;
+                if (u < acc) {
+                    res_tok = i;
+                    break;
+                }
+            }
+            counts[res_tok] += 1;
+        }
+    }
+    for (0..4) |i| {
+        const freq = @as(f64, @floatFromInt(counts[i])) / @as(f64, @floatFromInt(N));
+        try testing.expect(@abs(freq - p[i]) < 0.01);
+    }
+}
+
 test "mtpNextDepth: adaptive depth policy transitions" {
     const configured: u32 = 3;
     // Hot at configured depth: stay.
@@ -6198,8 +6430,13 @@ test "mtpNextDepth: adaptive depth policy transitions" {
     try testing.expectEqual(@as(u32, 3), Generator.mtpNextDepth(2, configured, 0.70));
     // Never exceeds configured.
     try testing.expectEqual(@as(u32, 3), Generator.mtpNextDepth(3, configured, 0.99));
-    // Depth 1 below the floor: disable (0).
-    try testing.expectEqual(@as(u32, 0), Generator.mtpNextDepth(1, configured, 0.40));
+    // Depth 1 at 0.40: speculation still pays (~+27% over AR at current
+    // round costs — the disable floor sits at the measured breakeven, not
+    // at "acceptance feels low"). The old 0.50 floor DISABLED here and
+    // cratered the oQ4e 16K/32K ladder cells to bare AR (24-26 tok/s).
+    try testing.expectEqual(@as(u32, 1), Generator.mtpNextDepth(1, configured, 0.40));
+    // Depth 1 below the true breakeven (+margin): disable (0).
+    try testing.expectEqual(@as(u32, 0), Generator.mtpNextDepth(1, configured, 0.15));
     // Demote-before-disable: a terrible rate at depth 2 still goes through 1.
     try testing.expectEqual(@as(u32, 1), Generator.mtpNextDepth(2, configured, 0.10));
 }
@@ -6207,9 +6444,11 @@ test "mtpNextDepth: adaptive depth policy transitions" {
 test "mtpDepthDecision: confidence gates on disable, promote, cooldown" {
     const W = Generator.MTP_DEPTH_WINDOW;
     // Disable needs a FULL window of evidence; small samples hold at depth 1.
-    try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.20, 5, false));
-    try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.20, W - 1, false));
-    try testing.expectEqual(@as(u32, 0), Generator.mtpDepthDecision(1, 3, 0.20, W, false));
+    try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.15, 5, false));
+    try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.15, W - 1, false));
+    try testing.expectEqual(@as(u32, 0), Generator.mtpDepthDecision(1, 3, 0.15, W, false));
+    // Rates the old 0.50 floor killed keep speculating at any window size.
+    try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.40, W, false));
     // Promote needs >= 8 rounds AND no active cooldown.
     try testing.expectEqual(@as(u32, 1), Generator.mtpDepthDecision(1, 3, 0.95, 7, false));
     try testing.expectEqual(@as(u32, 2), Generator.mtpDepthDecision(1, 3, 0.95, 8, false));
@@ -6279,7 +6518,9 @@ test "mtpFloorDisableObserve: extension misses do not poison depth one" {
             @intFromBool(i % 2 == 0),
         );
     }
-    try testing.expectApproxEqAbs(Generator.MTP_DISABLE_BELOW, rate.?, 1e-5);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), rate.?, 1e-5);
+    // A 50% depth-one window is comfortably above the breakeven floor —
+    // this rate must never disable (the old 0.50 floor sat exactly here).
     try testing.expect(!(rate.? < Generator.MTP_DISABLE_BELOW));
 }
 
