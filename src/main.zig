@@ -1143,10 +1143,11 @@ pub fn main(init: std.process.Init) !void {
         }
         log.info("Model ready.\n", .{});
 
-        // Qwen native MTP head — auto-load when the model ships a sidecar.
+        // Qwen native MTP head — auto-load when the model ships one (sidecar
+        // file or in-checkpoint tensors in the trunk shards).
         var mtp_head: ?mtp_mod.MtpModel = null;
         defer if (mtp_head) |*h| h.deinit();
-        if (enable_mtp and mtp_mod.hasMtpSidecar(io, model_dir)) {
+        if (enable_mtp and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
             // A failed load (e.g. a sidecar layout we can't bind yet) only
             // disables the head — mirrors the serve path's graceful degrade.
             if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {

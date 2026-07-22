@@ -46,7 +46,7 @@ Zig 0.17 (nightly build required until 0.17.0 stable ships — homebrew's zig fo
 | `pld_index.zig` | PLD n-gram index (`findMatch`, `ngramRepeatScore`) |
 | `prefix_cache.zig` / `kv_disk_cache.zig` | Hot prefix cache + SSD tier (`--prefix-cache-disk`, default OFF; chunked safetensors, hybrid-SSM checkpoints, restart restore) |
 | `drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode, sparse MaskedEmbedding head, per-target `recommendedBlockSize`) |
-| `mtp.zig` | Qwen 3.5/3.6 native MTP head (self-contained sidecar; dense-or-MoE MLP union; per-weight quant re-solve; committed-history cache) |
+| `mtp.zig` | Qwen 3.5/3.6 native MTP head (sidecar file OR in-checkpoint `[language_model.]mtp.*` in the trunk shards — `resolveMtpSource`, marker-gated on `fc`/`eh_proj`, loads only the indexed shards; dense-or-MoE MLP union; per-weight quant re-solve; committed-history cache) |
 | `diffusion.zig` | DiffusionGemma block-diffusion canvas loop (entropy-bound sampler, self-conditioning, per-slot Runner) |
 | `scheduler.zig` | Slots, inference thread (sole MLX caller), queues (load/vision/embed/gen/unload), batching, loop-stop guard |
 | `model_discovery.zig` / `model_registry.zig` | Discovery (two-level org/name, GGUF classification, stub meta), multi-model registry |

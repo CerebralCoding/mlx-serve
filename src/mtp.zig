@@ -483,13 +483,139 @@ pub fn resolveMtpSidecarInDir(io: std.Io, dir: std.Io.Dir) ?[]const u8 {
     return null;
 }
 
-/// True when `model_dir` carries an MTP sidecar file we know how to load.
-/// `model_dir` is absolute (same contract as `model.parseConfig`).
-pub fn hasMtpSidecar(io: std.Io, model_dir: []const u8) bool {
+/// Where a model's MTP head lives.
+pub const MtpSource = union(enum) {
+    /// A separate sidecar file — rel path, one of `sidecar_rel_paths`.
+    sidecar_file: []const u8,
+    /// Inside the main checkpoint safetensors (Qwen HF releases and oMLX
+    /// oQ4e-class conversions ship `[language_model.]mtp.*` in the trunk
+    /// shards). Loading reads ONLY the shards the index names for mtp keys.
+    in_checkpoint,
+};
+
+/// Marker projections that prove a LOADABLE head: `fc` (Qwen dense/MoE
+/// layouts) or `eh_proj` (hy3). Discovery and the shard sweep both gate on
+/// this same set, so a checkpoint with stray `mtp.*` auxiliaries but no
+/// marker never claims a head it can't bind.
+const mtp_marker_keys = [_][]const u8{
+    "mtp.fc.weight",
+    "language_model.mtp.fc.weight",
+    "mtp.eh_proj.weight",
+    "language_model.mtp.eh_proj.weight",
+};
+
+/// Any tensor belonging to the head (either root prefix).
+fn isMtpHeadKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "mtp.") or
+        std.mem.indexOf(u8, key, ".mtp.") != null;
+}
+
+/// Sanity bound for index.json / safetensors headers (the Jundot 27B index
+/// is ~212 KB; headers of the largest checkpoints stay well under this).
+const checkpoint_header_limit: usize = 64 * 1024 * 1024;
+
+/// Parse a sharded checkpoint's `model.safetensors.index.json` and return
+/// the unique shard basenames holding MTP-head tensors, in first-seen order
+/// (caller frees each name + the slice). Empty when the checkpoint carries
+/// no loadable head — the sweep is gated on `mtp_marker_keys`, so partial
+/// auxiliaries never produce a doomed load.
+fn mtpShardsFromIndexJson(allocator: std.mem.Allocator, bytes: []const u8) ![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |sh| allocator.free(sh);
+        out.deinit(allocator);
+    }
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch
+        return out.toOwnedSlice(allocator);
+    defer parsed.deinit();
+    if (parsed.value != .object) return out.toOwnedSlice(allocator);
+    const weight_map = parsed.value.object.get("weight_map") orelse
+        return out.toOwnedSlice(allocator);
+    if (weight_map != .object) return out.toOwnedSlice(allocator);
+
+    var has_marker = false;
+    for (&mtp_marker_keys) |marker| {
+        if (weight_map.object.get(marker) != null) {
+            has_marker = true;
+            break;
+        }
+    }
+    if (!has_marker) return out.toOwnedSlice(allocator);
+
+    var it = weight_map.object.iterator();
+    outer: while (it.next()) |entry| {
+        if (!isMtpHeadKey(entry.key_ptr.*)) continue;
+        if (entry.value_ptr.* != .string) continue;
+        const shard = entry.value_ptr.string;
+        for (out.items) |seen| {
+            if (std.mem.eql(u8, seen, shard)) continue :outer;
+        }
+        try out.append(allocator, try allocator.dupe(u8, shard));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Read a file under `dir` fully (bounded); null on absence or overflow.
+fn readDirFileAlloc(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, sub_path: []const u8, limit: usize) ?[]u8 {
+    const f = dir.openFile(io, sub_path, .{}) catch return null;
+    defer f.close(io);
+    var rb: [8192]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    return rs.interface.allocRemaining(allocator, .limited(limit)) catch null;
+}
+
+/// True when the sharded index names an in-checkpoint head.
+fn indexJsonHasMtpHead(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
+    const bytes = readDirFileAlloc(io, allocator, dir, "model.safetensors.index.json", checkpoint_header_limit) orelse return false;
+    defer allocator.free(bytes);
+    const shards = mtpShardsFromIndexJson(allocator, bytes) catch return false;
+    defer {
+        for (shards) |sh| allocator.free(sh);
+        allocator.free(shards);
+    }
+    return shards.len > 0;
+}
+
+/// Single-file checkpoints have no index — peek the safetensors JSON header
+/// (8-byte LE length prefix) for a marker key, without touching tensor data.
+/// Marker names are plain ASCII (dots/letters), so a quoted substring scan
+/// is exact — no JSON-escape variants exist for them.
+fn safetensorsHeaderHasMtpHead(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, sub_path: []const u8) bool {
+    const f = dir.openFile(io, sub_path, .{}) catch return false;
+    defer f.close(io);
+    var rb: [8192]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const header_len = rs.interface.takeInt(u64, .little) catch return false;
+    if (header_len == 0 or header_len > checkpoint_header_limit) return false;
+    const header = allocator.alloc(u8, @intCast(header_len)) catch return false;
+    defer allocator.free(header);
+    rs.interface.readSliceAll(header) catch return false;
+    for (&mtp_marker_keys) |marker| {
+        var quoted_buf: [64]u8 = undefined;
+        const quoted = std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{marker}) catch continue;
+        if (std.mem.indexOf(u8, header, quoted) != null) return true;
+    }
+    return false;
+}
+
+/// Resolve where (if anywhere) this model's MTP head lives. A sidecar file
+/// always outranks an in-checkpoint head so repos shipping both keep
+/// loading exactly what they loaded before.
+pub fn resolveMtpSource(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?MtpSource {
+    if (resolveMtpSidecarInDir(io, dir)) |rel| return .{ .sidecar_file = rel };
+    if (indexJsonHasMtpHead(io, allocator, dir)) return .in_checkpoint;
+    if (safetensorsHeaderHasMtpHead(io, allocator, dir, "model.safetensors")) return .in_checkpoint;
+    return null;
+}
+
+/// True when `model_dir` carries an MTP head we know how to load — a
+/// sidecar file OR in-checkpoint tensors. `model_dir` is absolute (same
+/// contract as `model.parseConfig`).
+pub fn hasMtpHead(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return false;
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
     defer dir.close(io);
-    return resolveMtpSidecarInDir(io, dir) != null;
+    return resolveMtpSource(io, allocator, dir) != null;
 }
 
 fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
@@ -777,22 +903,66 @@ fn loadMoeTriple(w: *const Weights, prefix: []const u8) !struct { w: mlx.mlx_arr
     };
 }
 
-/// Load the MTP head from the model's sidecar file (any `sidecar_rel_paths`
-/// layout — native `mtp/weights.safetensors` and other compatible ones).
+/// Load the head's weights from the MAIN checkpoint: the shards the index
+/// names for `mtp.*` keys (typically one), or the single
+/// `model.safetensors` when there is no index. Safetensors loads are
+/// lazy/mmapped — pulling a multi-GB shard in costs its header parse; only
+/// the head's tensors ever materialize, and `weights.deinit()` after the
+/// head build releases the rest untouched.
+fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !model_mod.Weights {
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
+    defer dir.close(io);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    if (readDirFileAlloc(io, allocator, dir, "model.safetensors.index.json", checkpoint_header_limit)) |bytes| {
+        defer allocator.free(bytes);
+        const shards = try mtpShardsFromIndexJson(allocator, bytes);
+        defer {
+            for (shards) |sh| allocator.free(sh);
+            allocator.free(shards);
+        }
+        if (shards.len == 0) return error.MissingMtpWeight;
+        var weights = model_mod.Weights.init(allocator);
+        errdefer weights.deinit();
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        for (shards) |sh| {
+            const p = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, sh });
+            const pz = try allocator.dupeSentinel(u8, p, 0);
+            defer allocator.free(pz);
+            try model_mod.loadSafetensorsFile(allocator, &weights, pz, s, false);
+        }
+        return weights;
+    }
+    const single = try std.fmt.bufPrint(&path_buf, "{s}/model.safetensors", .{model_dir});
+    return model_mod.loadWeightsSingleFile(allocator, single);
+}
+
+/// Load the MTP head: from the model's sidecar file (any `sidecar_rel_paths`
+/// layout — native `mtp/weights.safetensors` and other compatible ones) or
+/// straight from the main checkpoint when the head rides the trunk shards.
 pub fn loadMtp(
     io: std.Io,
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
     model_dir: []const u8,
 ) !MtpModel {
-    const rel = blk: {
+    const source = blk: {
         var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
         defer dir.close(io);
-        break :blk resolveMtpSidecarInDir(io, dir) orelse return error.MissingMtpWeight;
+        break :blk resolveMtpSource(io, allocator, dir) orelse return error.MissingMtpWeight;
     };
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sidecar_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, rel });
-    var weights = try model_mod.loadWeightsSingleFile(allocator, sidecar_path);
+    var weights = switch (source) {
+        .sidecar_file => |rel| blk: {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const sidecar_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, rel });
+            break :blk try model_mod.loadWeightsSingleFile(allocator, sidecar_path);
+        },
+        .in_checkpoint => blk: {
+            log.info("[mtp] loading in-checkpoint head from the trunk shards\n", .{});
+            break :blk try loadMtpWeightsFromCheckpoint(io, allocator, model_dir);
+        },
+    };
     defer weights.deinit();
 
     const p = mtpKeyPrefix(&weights);
@@ -2331,4 +2501,203 @@ test "mtp: multi-row forward projects the LAST row only and equals appendHistory
     try close(merged.logits, ref.logits, 16, s);
     try close(merged.hidden_next, ref.hidden_next, 8, s);
 
+}
+
+test "mtp: index.json shard sweep is marker-gated (in-checkpoint heads)" {
+    const allocator = testing.allocator;
+
+    // Jundot/oQ4e shape: the head rides the LAST shard of the trunk under
+    // `language_model.mtp.*`; the sweep must name exactly that shard.
+    const jundot =
+        \\{"metadata":{"total_size":1},"weight_map":{
+        \\ "language_model.model.layers.0.mlp.down_proj.weight":"model-00001-of-00004.safetensors",
+        \\ "language_model.mtp.fc.weight":"model-00004-of-00004.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.q_proj.weight":"model-00004-of-00004.safetensors",
+        \\ "language_model.mtp.norm.weight":"model-00004-of-00004.safetensors"}}
+    ;
+    const shards = try mtpShardsFromIndexJson(allocator, jundot);
+    defer {
+        for (shards) |sh| allocator.free(sh);
+        allocator.free(shards);
+    }
+    try testing.expectEqual(@as(usize, 1), shards.len);
+    try testing.expectEqualStrings("model-00004-of-00004.safetensors", shards[0]);
+
+    // Auxiliary mtp.* keys WITHOUT a marker projection (fc / hy3 eh_proj)
+    // never claim a loadable head — empty sweep, not a partial head that
+    // dies later at ownWeight.
+    const no_marker =
+        \\{"weight_map":{"language_model.mtp.norm.weight":"a.safetensors",
+        \\ "model.layers.0.mlp.up_proj.weight":"b.safetensors"}}
+    ;
+    const none = try mtpShardsFromIndexJson(allocator, no_marker);
+    defer allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // Bare-prefix (mtp.*) layout, head spanning TWO shards: both, deduped,
+    // first-seen order.
+    const two =
+        \\{"weight_map":{"mtp.fc.weight":"s2.safetensors",
+        \\ "mtp.norm.weight":"s2.safetensors",
+        \\ "mtp.layers.0.self_attn.q_proj.weight":"s3.safetensors"}}
+    ;
+    const both = try mtpShardsFromIndexJson(allocator, two);
+    defer {
+        for (both) |sh| allocator.free(sh);
+        allocator.free(both);
+    }
+    try testing.expectEqual(@as(usize, 2), both.len);
+    try testing.expectEqualStrings("s2.safetensors", both[0]);
+    try testing.expectEqualStrings("s3.safetensors", both[1]);
+}
+
+test "mtp: resolveMtpSource — sidecar file outranks in-checkpoint; markerless index is null" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir) == null);
+
+    // A trunk-only index is not a head.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{"model.layers.0.mlp.up_proj.weight":"model-00001-of-00002.safetensors"}}
+    });
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir) == null);
+
+    // Index carrying the head → in-checkpoint.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{"language_model.mtp.fc.weight":"model-00002-of-00002.safetensors"}}
+    });
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir).? == .in_checkpoint);
+
+    // A sidecar FILE always outranks the in-checkpoint head — repos shipping
+    // both keep loading exactly what they loaded before.
+    try tmp.dir.writeFile(io, .{ .sub_path = "mtp.safetensors", .data = "x" });
+    const src = resolveMtpSource(io, allocator, tmp.dir).?;
+    try testing.expect(src == .sidecar_file);
+    try testing.expectEqualStrings("mtp.safetensors", src.sidecar_file);
+}
+
+test "mtp: single-file model.safetensors header probe (no index.json)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Minimal valid safetensors: 8-byte LE header length + header JSON + data.
+    const W = struct {
+        fn write(io_: std.Io, dir: std.Io.Dir, header: []const u8) !void {
+            var buf: [512]u8 = undefined;
+            std.mem.writeInt(u64, buf[0..8], @intCast(header.len), .little);
+            @memcpy(buf[8..][0..header.len], header);
+            buf[8 + header.len] = 0;
+            buf[8 + header.len + 1] = 0;
+            try dir.writeFile(io_, .{ .sub_path = "model.safetensors",
+                                      .data = buf[0 .. 8 + header.len + 2] });
+        }
+    };
+
+    try W.write(io, tmp.dir,
+        \\{"language_model.mtp.fc.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}
+    );
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir).? == .in_checkpoint);
+
+    // Head-less single-file checkpoint → null.
+    try W.write(io, tmp.dir,
+        \\{"model.embed_tokens.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}
+    );
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir) == null);
+
+    // Garbage length prefix → null, never a huge allocation or a crash.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors",
+                                 .data = "\xff\xff\xff\xff\xff\xff\xff\xff!!" });
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir) == null);
+}
+
+test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-checkpoint layout)" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+
+    // The dense one-layer head (toy bf16 geometry: hidden 8, 2 heads × hd 4,
+    // 1 kv head, mlp inter 6) written into "shard 2". Shard 1 — the trunk —
+    // deliberately does NOT exist on disk: the loader must open only the
+    // shards the index names for mtp keys, never sweep the directory.
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model-00002-of-00002.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const H = struct {
+            fn put(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 5)) * 0.1 + 0.1;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
+        };
+        try H.put(map, "language_model.mtp.fc.weight", &.{ 8, 16 }, s);
+        try H.put(map, "language_model.mtp.pre_fc_norm_embedding.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.pre_fc_norm_hidden.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.norm.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.layers.0.input_layernorm.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.layers.0.post_attention_layernorm.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.q_norm.weight", &.{4}, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.k_norm.weight", &.{4}, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.q_proj.weight", &.{ 8, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.k_proj.weight", &.{ 4, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.v_proj.weight", &.{ 4, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.o_proj.weight", &.{ 8, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.gate_proj.weight", &.{ 6, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.up_proj.weight", &.{ 6, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.down_proj.weight", &.{ 8, 6 }, s);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{
+        \\ "language_model.model.embed_tokens.weight":"model-00001-of-00002.safetensors",
+        \\ "language_model.mtp.fc.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.pre_fc_norm_embedding.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.pre_fc_norm_hidden.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.input_layernorm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.post_attention_layernorm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.q_norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.k_norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.q_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.k_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.v_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.o_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.gate_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.up_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.down_proj.weight":"model-00002-of-00002.safetensors"}}
+    });
+
+    var m = try loadMtp(io, allocator, s, dir_path);
+    defer m.deinit();
+
+    // Dense flavor, bf16 fc bound and pre-transposed to [2H, H].
+    try testing.expect(m.mlp == .dense);
+    try testing.expect(m.fc_w_t.ctx != null);
+    const fc_shape = mlx.getShape(m.fc_w_t);
+    try testing.expectEqual(@as(c_int, 16), fc_shape[0]);
+    try testing.expectEqual(@as(c_int, 8), fc_shape[1]);
 }

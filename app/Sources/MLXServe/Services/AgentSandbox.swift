@@ -850,7 +850,8 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// when the terminal exits. Throws `SandboxError` with an actionable
     /// message on every distinct failure — never a hung terminal.
     func startCliSession(agent: SandboxAgentSpec?, model: String?, serverPort: UInt16,
-                         budget: AgentBudget.Budget, apiKey: String?) async throws -> CliSession {
+                         budget: AgentBudget.Budget, apiKey: String?,
+                         entries: [AgentModelEntry] = []) async throws -> CliSession {
         let image = { lock.lock(); defer { lock.unlock() }; return baseImage }()
         return try await withCheckedThrowingContinuation { cont in
             DispatchQueue.global(qos: .userInitiated).async {
@@ -878,7 +879,8 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                         }
                         let bootstrap = try SandboxAgentRegistry.materialize(
                             spec: agent, model: model, serverPort: serverPort,
-                            budget: budget, apiKey: apiKey, rootfsDir: rootfsDir)
+                            budget: budget, apiKey: apiKey, entries: entries,
+                            rootfsDir: rootfsDir)
                         remoteCommand = "sh \(bootstrap)"
                     }
 

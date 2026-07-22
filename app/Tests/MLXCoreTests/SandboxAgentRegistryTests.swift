@@ -21,8 +21,8 @@ final class SandboxAgentRegistryTests: XCTestCase {
     // MARK: pi row — config cross-pinned against AgentConfigs (the launcher's source of truth)
 
     func testPiConfigIsAgentConfigsPiModelsJSONAtTheHostPlaceholder() {
-        let files = SandboxAgentRegistry.pi.configFiles("gemma-4-12b", 11234, budget, nil)
-        XCTAssertEqual(files.count, 2, "models.json + the AGENTS.md session rules")
+        let files = SandboxAgentRegistry.pi.configFiles("gemma-4-12b", 11234, budget, nil, [])
+        XCTAssertEqual(files.count, 3, "models.json + AGENTS.md + the live-list extension")
         XCTAssertEqual(files[0].guestPath, "/root/.pi/agent/models.json",
                        "guest HOME is /root; pi reads ~/.pi/agent — no PI_CODING_AGENT_DIR isolation needed in a VM that is ALL ours")
         // Same generator the host launcher + MAS instructions use — one shape,
@@ -42,10 +42,12 @@ final class SandboxAgentRegistryTests: XCTestCase {
     func testPiConfigCarriesTheRealApiKeyWhenOneIsSet() {
         // Guest→host traffic arrives at the server NON-loopback (via the NAT
         // gateway), so a configured --api-key must actually be sent.
-        let files = SandboxAgentRegistry.pi.configFiles("m", 8080, budget, "sekrit-123")
+        let files = SandboxAgentRegistry.pi.configFiles("m", 8080, budget, "sekrit-123", [])
         XCTAssertTrue(files[0].content.contains("\"apiKey\": \"sekrit-123\""), files[0].content)
+        // The live-list extension fetches /v1/models non-loopback too.
+        XCTAssertTrue(files[2].content.contains("sekrit-123"), files[2].content)
         // No key set → the placeholder value the host launcher uses.
-        let noKey = SandboxAgentRegistry.pi.configFiles("m", 8080, budget, nil)
+        let noKey = SandboxAgentRegistry.pi.configFiles("m", 8080, budget, nil, [])
         XCTAssertTrue(noKey[0].content.contains("\"apiKey\": \"mlx-serve\""), noKey[0].content)
     }
 
@@ -68,7 +70,7 @@ final class SandboxAgentRegistryTests: XCTestCase {
         // the /chat/completions path, and context_length rides the
         // custom_providers entry. Writing exactly what the wizard saves means
         // the first run starts CONFIGURED instead of launching the wizard.
-        let files = SandboxAgentRegistry.hermes.configFiles("qwen3.6-27b", 11234, budget, "k1")
+        let files = SandboxAgentRegistry.hermes.configFiles("qwen3.6-27b", 11234, budget, "k1", [])
         XCTAssertEqual(files.count, 2)
         XCTAssertEqual(files[0].guestPath, "/root/.hermes/config.yaml")
         let yaml = files[0].content
@@ -89,7 +91,7 @@ final class SandboxAgentRegistryTests: XCTestCase {
         // and OPENAI_BASE_URL in ~/.hermes/.env ALONE satisfies it (hermes's
         // own comment: local models often don't require an API key). Without
         // this file the wizard hijacks every fresh session (live 2026-07-19).
-        let files = SandboxAgentRegistry.hermes.configFiles("m", 8080, budget, nil)
+        let files = SandboxAgentRegistry.hermes.configFiles("m", 8080, budget, nil, [])
         let env = files.first { $0.guestPath == "/root/.hermes/.env" }
         XCTAssertNotNil(env, "\(files.map(\.guestPath))")
         XCTAssertTrue(env!.content.contains("OPENAI_BASE_URL=http://__MLX_HOST__:8080/v1"), env!.content)
@@ -110,6 +112,41 @@ final class SandboxAgentRegistryTests: XCTestCase {
         XCTAssertTrue(install.contains("hermes-agent.nousresearch.com/install.sh"), install)
         XCTAssertTrue(install.contains("pip install hermes-agent"), install)
         XCTAssertEqual(SandboxAgentRegistry.hermes.binaryName, "hermes")
+    }
+
+    // MARK: pi live-list extension (in-guest /model switching)
+
+    func testPiConfigShipsTheLiveModelListExtension() {
+        // Third file: pi's extension fetches /v1/models IN-GUEST at session
+        // start (the guest's own view — keyless LAN-share mode filters it to
+        // shared models, which is exactly what the guest may use). Same
+        // generator as the host launcher; content is entry-independent (the
+        // list is live), so the bootstrap's dummy-args path enumeration
+        // always includes it.
+        let files = SandboxAgentRegistry.pi.configFiles("gemma-4-12b", 11234, budget, "k7", [])
+        XCTAssertEqual(files.count, 3, "models.json + AGENTS.md + the live-list extension")
+        let ext = files[2]
+        XCTAssertEqual(ext.guestPath, "/root/.pi/agent/extensions/mlx-models.js",
+                       "pi scans <agentDir>/extensions — guest agent dir is /root/.pi/agent")
+        XCTAssertEqual(ext.content,
+                       AgentConfigs.piModelsExtensionJS(baseURL: "http://__MLX_HOST__:11234",
+                                                        apiKey: "k7"))
+        // The bootstrap seds EVERY config file — the extension bakes the
+        // placeholder base URL and must be in the loop.
+        let script = SandboxAgentRegistry.bootstrapScript(for: .pi, model: "m")
+        XCTAssertTrue(script.contains("/root/.pi/agent/extensions/mlx-models.js"), script)
+    }
+
+    func testHermesConfigFilesCarryTheModelListEntries() {
+        let entries = [
+            AgentModelEntry(id: "qwen3.6-27b", budget: AgentBudget.forServerContext(94729), vision: false),
+            AgentModelEntry(id: "small-gguf", budget: AgentBudget.forServerContext(32768), vision: false),
+        ]
+        let files = SandboxAgentRegistry.hermes.configFiles("qwen3.6-27b", 11234, budget, nil, entries)
+        let yaml = files[0].content
+        XCTAssertTrue(yaml.contains("\"small-gguf\":"),
+                      "every chat entry must be switchable via hermes /model: \(yaml)")
+        XCTAssertTrue(yaml.contains("context_length: 32768"), yaml)
     }
 
     // MARK: bootstrap script
@@ -175,7 +212,7 @@ final class SandboxAgentRegistryTests: XCTestCase {
 
         let bootstrap = try SandboxAgentRegistry.materialize(
             spec: .pi, model: "gemma-4", serverPort: 11234,
-            budget: budget, apiKey: "k9", rootfsDir: tmp)
+            budget: budget, apiKey: "k9", entries: [], rootfsDir: tmp)
 
         XCTAssertEqual(bootstrap, "/.vz-bootstrap-pi", "returns the GUEST path the ssh session runs")
         // Config landed at the guest-absolute path under the rootfs, verbatim.

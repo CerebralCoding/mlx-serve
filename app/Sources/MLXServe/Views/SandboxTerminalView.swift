@@ -414,11 +414,15 @@ struct SandboxTerminalView: View {
         let port = server.port
         let budget = AgentBudget.forServerContext(server.chatModelInfo?.contextLength)
         let key = appState.serverOptions.apiKey.trimmingCharacters(in: .whitespacesAndNewlines)
+        // The in-agent /model switch list: the chat-capable registry snapshot
+        // (hermes bakes it; pi's extension re-fetches live in-guest).
+        let entries = AgentModelEntry.chatEntries(from: server.allModels)
         Task {
             do {
                 let cli = try await sandbox.startCliSession(
                     agent: agent, model: model, serverPort: port,
-                    budget: budget, apiKey: key.isEmpty ? nil : key)
+                    budget: budget, apiKey: key.isEmpty ? nil : key,
+                    entries: entries)
                 guard sessions.tabs.contains(where: { $0.id == id }) else {
                     // Tab closed while the guest was booting — balance the pin.
                     sandbox.endCliSession(cli)

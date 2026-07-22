@@ -609,6 +609,7 @@ struct StatusMenuView: View {
                         baseURL: server.baseURL,
                         servedModelId: server.modelInfo?.name ?? "mlx-serve",
                         serverContextLength: server.modelInfo?.contextLength,
+                        models: server.allModels,
                         isEnabled: server.status == .running,
                         openSandboxAgent: { agentId in
                             // Post the request FIRST — the Sandbox window

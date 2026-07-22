@@ -24,9 +24,12 @@ struct SandboxAgentSpec: Identifiable, Equatable {
     let installScript: String
     /// Config files for a session against the local server. `apiKey` nil =
     /// no `--api-key` configured (guest→host arrives NON-loopback, so a real
-    /// key must travel when one is set).
+    /// key must travel when one is set). `entries` is the chat-capable
+    /// registry snapshot — the in-agent /model switch list (pi ignores it:
+    /// its extension fetches the list live, in-guest).
     let configFiles: (_ model: String, _ serverPort: UInt16,
-                      _ budget: AgentBudget.Budget, _ apiKey: String?) -> [SandboxAgentFile]
+                      _ budget: AgentBudget.Budget, _ apiKey: String?,
+                      _ entries: [AgentModelEntry]) -> [SandboxAgentFile]
     /// The line the bootstrap `exec`s once configs are patched + the CLI exists.
     let launchCommand: (_ model: String) -> String
 
@@ -45,15 +48,24 @@ extension SandboxAgentSpec {
         displayName: "pi",
         binaryName: "pi",
         installScript: "npm i -g @earendil-works/pi-coding-agent@0.80.10",
-        configFiles: { model, serverPort, budget, apiKey in
-            [SandboxAgentFile(
+        configFiles: { model, serverPort, budget, apiKey, _ in
+            let base = "http://\(SandboxAgentRegistry.hostPlaceholder):\(serverPort)"
+            let key = apiKey ?? "mlx-serve"
+            return [SandboxAgentFile(
                 guestPath: "/root/.pi/agent/models.json",
                 content: AgentConfigs.piModelsJSON(
-                    baseURL: "http://\(SandboxAgentRegistry.hostPlaceholder):\(serverPort)",
-                    model: model, budget: budget, apiKey: apiKey ?? "mlx-serve")),
+                    baseURL: base, model: model, budget: budget, apiKey: key)),
              SandboxAgentFile(
                 guestPath: "/root/.pi/agent/AGENTS.md",
-                content: AgentConfigs.piAgentsMD(budget: budget))]
+                content: AgentConfigs.piAgentsMD(budget: budget)),
+             // Live /model list: pi auto-discovers <agentDir>/extensions;
+             // the extension fetches the guest's OWN view of /v1/models
+             // (keyless LAN-share mode filters it to shared models — exactly
+             // what the guest may use). Content is entry-independent, so the
+             // bootstrap's dummy-args path enumeration always includes it.
+             SandboxAgentFile(
+                guestPath: "/root/.pi/agent/extensions/mlx-models.js",
+                content: AgentConfigs.piModelsExtensionJS(baseURL: base, apiKey: key))]
         },
         launchCommand: { model in "pi --provider mlx --model \(VzGuest.shellQuote(model))" }
     )
@@ -76,38 +88,21 @@ extension SandboxAgentSpec {
         binaryName: "hermes",
         installScript: "curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash "
             + "|| pip install hermes-agent",
-        configFiles: { model, serverPort, budget, apiKey in
-            let base = "http://\(SandboxAgentRegistry.hostPlaceholder):\(serverPort)/v1"
+        configFiles: { model, serverPort, budget, apiKey, entries in
+            let base = "http://\(SandboxAgentRegistry.hostPlaceholder):\(serverPort)"
             let key = apiKey ?? "mlx-serve"
             return [
                 SandboxAgentFile(
                     guestPath: "/root/.hermes/config.yaml",
-                    content: """
-                    # written by mlx-serve (Agent Sandbox) — rewritten at each session start.
-                    # Mirrors what `hermes setup`'s custom-endpoint flow saves, so the first
-                    # run starts configured instead of launching the wizard.
-                    model:
-                      default: "\(model)"
-                      provider: custom
-                      base_url: "\(base)"
-                      api_key: "\(key)"
-                      api_mode: chat_completions
-                    custom_providers:
-                      - name: mlx-serve
-                        base_url: "\(base)"
-                        api_key: "\(key)"
-                        model: "\(model)"
-                        api_mode: chat_completions
-                        models:
-                          "\(model)":
-                            context_length: \(budget.context)
-                    """),
+                    content: AgentConfigs.hermesConfigYAML(
+                        baseURL: base, apiKey: key, model: model,
+                        budget: budget, entries: entries)),
                 SandboxAgentFile(
                     guestPath: "/root/.hermes/.env",
                     content: """
                     # written by mlx-serve — OPENAI_BASE_URL marks a provider as configured,
                     # which is what keeps the first-run setup wizard out of the session.
-                    OPENAI_BASE_URL=\(base)
+                    OPENAI_BASE_URL=\(base)/v1
                     OPENAI_API_KEY=\(key)
                     """),
             ]
@@ -137,7 +132,9 @@ enum SandboxAgentRegistry {
     /// The session bootstrap. Runs under `ssh -t` as a plain (non-login)
     /// command, so it exports its own PATH rather than relying on `.profile`.
     static func bootstrapScript(for spec: SandboxAgentSpec, model: String) -> String {
-        let configPaths = spec.configFiles(model, 0, AgentBudget.fallback, nil)
+        // Dummy args — only the guest PATHS matter here, and every spec's
+        // path set is argument-independent (pinned by the registry tests).
+        let configPaths = spec.configFiles(model, 0, AgentBudget.fallback, nil, [])
             .map { VzGuest.shellQuote($0.guestPath) }
             .joined(separator: " ")
         return """
@@ -168,9 +165,9 @@ enum SandboxAgentRegistry {
     @discardableResult
     static func materialize(spec: SandboxAgentSpec, model: String, serverPort: UInt16,
                             budget: AgentBudget.Budget, apiKey: String?,
-                            rootfsDir: String) throws -> String {
+                            entries: [AgentModelEntry], rootfsDir: String) throws -> String {
         let fm = FileManager.default
-        for file in spec.configFiles(model, serverPort, budget, apiKey) {
+        for file in spec.configFiles(model, serverPort, budget, apiKey, entries) {
             let host = rootfsDir + file.guestPath
             try fm.createDirectory(atPath: (host as NSString).deletingLastPathComponent,
                                    withIntermediateDirectories: true)

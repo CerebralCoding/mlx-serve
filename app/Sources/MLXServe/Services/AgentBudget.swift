@@ -50,6 +50,38 @@ enum AgentBudget {
     }
 }
 
+/// One chat-capable registry entry as declared to an agent CLI — the model
+/// list behind in-agent switching (/model in pi + hermes, /models in
+/// opencode). Derived from the server's /v1/models snapshot
+/// (`ServerManager.allModels`), LAN `@peer` entries included.
+struct AgentModelEntry: Equatable {
+    let id: String
+    let budget: AgentBudget.Budget
+    /// Advertises image input — opencode gates attachments on this.
+    let vision: Bool
+
+    /// Chat-capable entries only — media/embedding models never enter a
+    /// coding agent's picker. LAN entries go through the `lanAdvertises`
+    /// tolerance (empty capabilities = old peer that serves chat). Budgets
+    /// derive PER MODEL: the single-model plumbing stamped the loaded
+    /// model's budget on whatever id a switch targeted.
+    static func chatEntries(from models: [ModelInfo]) -> [AgentModelEntry] {
+        var seen = Set<String>()
+        var out: [AgentModelEntry] = []
+        for m in models {
+            let chat = m.lanPeer != nil
+                ? m.lanAdvertises("chat")
+                : (m.slotKind == .chat && !m.supportsEmbeddings)
+            guard chat, !m.name.isEmpty, seen.insert(m.name).inserted else { continue }
+            out.append(AgentModelEntry(
+                id: m.name,
+                budget: AgentBudget.forServerContext(m.contextLength),
+                vision: m.supportsVision || m.capabilities.contains("vision")))
+        }
+        return out
+    }
+}
+
 /// The config files / env scripts we write for each third-party agent CLI.
 /// Pure string builders so the emitted JSON is unit-testable — a malformed
 /// config silently strands the user on the CLI's own defaults.
@@ -116,11 +148,113 @@ enum AgentConfigs {
         """
     }
 
+    /// pi live-model-list extension — dropped into the agent config dir's
+    /// `extensions/` (host: `~/.mlx-serve/pi`, guest: `/root/.pi/agent`),
+    /// where pi auto-discovers `.js`/`.ts` files. The factory fetches the
+    /// server's `/v1/models` at session start and registers every
+    /// chat-capable model on the `mlx` provider, so in-session `/model`
+    /// tracks reality (LAN peers come and go) instead of a launch-time
+    /// snapshot. `models.json` keeps the served model as the static
+    /// fallback — an unreachable server registers NOTHING.
+    ///
+    /// Contracts verified against pi 0.80.10 (the pinned sandbox version):
+    /// extensions default-export a factory; `applyExtension` spreads ONLY
+    /// the model definition, so `compat` must ride EVERY model (the
+    /// provider-level compat in models.json is not inherited); `cost` is a
+    /// required field of `ProviderModelConfig`.
+    static func piModelsExtensionJS(baseURL: String, apiKey: String = "mlx-serve") -> String {
+        """
+        // written by mlx-serve — live model list for the `mlx` provider.
+        // Regenerated at each launch; edits here are overwritten.
+        const API_KEY = "\(apiKey)";
+        const FALLBACK_CONTEXT = 32768;
+        const COMPAT = {
+          supportsDeveloperRole: false,
+          supportsReasoningEffort: false,
+          maxTokensField: "max_tokens",
+          thinkingFormat: "qwen",
+        };
+
+        async function fetchMlxModels() {
+          const controller = new AbortController();
+          const timer = setTimeout(() => controller.abort(), 4000);
+          try {
+            const res = await fetch("\(baseURL)/v1/models", {
+              headers: { Authorization: "Bearer " + API_KEY },
+              signal: controller.signal,
+            });
+            if (!res.ok) return [];
+            const body = await res.json();
+            const rows = Array.isArray(body.data) ? body.data : [];
+            return rows
+              .filter((row) => {
+                const caps = Array.isArray(row.capabilities) ? row.capabilities : [];
+                // Chat-capable only; empty caps = an old LAN peer that serves chat.
+                return caps.length === 0 || caps.includes("chat");
+              })
+              .map((row) => {
+                const meta = row.meta || {};
+                const ctx = meta.context_length > 0 ? meta.context_length : FALLBACK_CONTEXT;
+                // Mirrors AgentBudget.forServerContext — keep the two in sync.
+                const maxTokens = Math.min(65536, Math.max(1024, Math.floor(ctx / 4)));
+                const image = Array.isArray(row.input_modalities) && row.input_modalities.includes("image");
+                return {
+                  id: row.id,
+                  name: row.id,
+                  reasoning: true,
+                  input: image ? ["text", "image"] : ["text"],
+                  cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+                  contextWindow: ctx,
+                  maxTokens: maxTokens,
+                  compat: COMPAT,
+                };
+              });
+          } catch {
+            return []; // unreachable/slow server — the static models.json stands
+          } finally {
+            clearTimeout(timer);
+          }
+        }
+
+        export default async function (pi) {
+          const models = await fetchMlxModels();
+          if (models.length === 0) return;
+          pi.registerProvider("mlx", {
+            name: "MLX Serve (local)",
+            baseUrl: "\(baseURL)/v1",
+            apiKey: API_KEY,
+            api: "openai-completions",
+            models,
+            refreshModels: async () => {
+              const fresh = await fetchMlxModels();
+              return fresh.length > 0 ? fresh : models;
+            },
+          });
+        }
+        """
+    }
+
     /// opencode provider block — shipped INLINE via `OPENCODE_CONFIG_CONTENT`
     /// (merges over the user's own config; no file writes). The launch scripts
     /// single-quote it, so the output must never contain a single quote.
-    static func opencodeJSON(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
-        """
+    ///
+    /// Unlike pi, opencode has no runtime provider-registration hook for
+    /// custom providers, so the FULL chat-capable list is baked here — its
+    /// in-session /models picker shows exactly these entries, each with its
+    /// own limits (never the loaded model's budget stamped on everything).
+    static func opencodeJSON(baseURL: String, defaultModel: String,
+                             entries: [AgentModelEntry]) -> String {
+        var list = entries
+        if !list.contains(where: { $0.id == defaultModel }) {
+            list.insert(AgentModelEntry(id: defaultModel, budget: AgentBudget.fallback,
+                                        vision: false), at: 0)
+        }
+        let models = list.map { e -> String in
+            let attachment = e.vision ? " \"attachment\": true," : ""
+            return "\"\(e.id)\": { \"name\": \"\(e.id) (mlx-serve)\",\(attachment) "
+                + "\"limit\": { \"context\": \(e.budget.context), \"output\": \(e.budget.output) } }"
+        }.joined(separator: ",\n        ")
+        return """
         {
           "$schema": "https://opencode.ai/config.json",
           "provider": {
@@ -129,14 +263,56 @@ enum AgentConfigs {
               "name": "MLX Serve (local)",
               "options": { "baseURL": "\(baseURL)/v1" },
               "models": {
-                "\(model)": {
-                  "name": "\(model) (mlx-serve)",
-                  "limit": { "context": \(budget.context), "output": \(budget.output) }
-                }
+                \(models)
               }
             }
           }
         }
+        """
+    }
+
+    /// Single-model convenience — the MAS instructions panel's shape (a user
+    /// typing a config by hand gets the minimal one).
+    static func opencodeJSON(baseURL: String, model: String, budget: AgentBudget.Budget) -> String {
+        opencodeJSON(baseURL: baseURL, defaultModel: model,
+                     entries: [AgentModelEntry(id: model, budget: budget, vision: false)])
+    }
+
+    /// hermes `config.yaml` — mirrors EXACTLY what `hermes setup`'s
+    /// custom-endpoint flow saves (verified against hermes_cli source, never
+    /// its docs), plus one entry under `custom_providers[].models` per
+    /// chat-capable model so in-session `/model` can switch among them
+    /// (`models.<id>.context_length` is hermes's per-model context key).
+    /// The served model stays `default:` and is force-included.
+    static func hermesConfigYAML(baseURL: String, apiKey: String, model: String,
+                                 budget: AgentBudget.Budget,
+                                 entries: [AgentModelEntry]) -> String {
+        var list = entries
+        if !list.contains(where: { $0.id == model }) {
+            list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+        }
+        let models = list.map {
+            "      \"\($0.id)\":\n        context_length: \($0.budget.context)"
+        }.joined(separator: "\n")
+        return """
+        # written by mlx-serve (Agent Sandbox) — rewritten at each session start.
+        # Mirrors what `hermes setup`'s custom-endpoint flow saves, so the first
+        # run starts configured instead of launching the wizard. Every entry
+        # under `models:` is switchable in-session via /model.
+        model:
+          default: "\(model)"
+          provider: custom
+          base_url: "\(baseURL)/v1"
+          api_key: "\(apiKey)"
+          api_mode: chat_completions
+        custom_providers:
+          - name: mlx-serve
+            base_url: "\(baseURL)/v1"
+            api_key: "\(apiKey)"
+            model: "\(model)"
+            api_mode: chat_completions
+            models:
+        \(models)
         """
     }
 

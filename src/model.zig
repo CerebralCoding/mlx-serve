@@ -1421,7 +1421,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     return weights;
 }
 
-fn loadSafetensorsFile(
+pub fn loadSafetensorsFile(
     allocator: std.mem.Allocator,
     weights: *Weights,
     path: [*:0]const u8,
