@@ -703,6 +703,80 @@ fn ownNorm(w: *const Weights, key: []const u8, s: mlx.mlx_stream, fold: bool) !m
     return foldNormPlusOne(owned, s);
 }
 
+/// oMLX's `norm_repair` margin: a head RMSNorm whose mean sits more than this
+/// below its backbone anchor is missing the `+1` zero-centered-gamma shift.
+/// Mirrors `_REPAIR_MARGIN` in oMLX `patches/mlx_lm_mtp/norm_repair.py`.
+pub const MTP_NORM_REPAIR_MARGIN: f32 = 0.4;
+
+/// Mean of `arr` cast to f32 over all axes (RMSNorm gammas are 1-D). Same
+/// eval-then-item pattern as `negFraction`.
+fn arrayMeanF32(arr: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    var m = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(m);
+    try mlx.check(mlx.mlx_mean(&m, f, false, s));
+    try mlx.check(mlx.mlx_array_eval(m));
+    var out: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&out, m));
+    return out;
+}
+
+/// oMLX `norm_repair` rule (pure): repair (fold `+1`) when the head norm's mean
+/// sits more than the margin below its backbone anchor. A correctly-stored head
+/// norm sits at/above its anchor (gap ≤ 0 → false); idempotent — after the `+1`
+/// the mean lands above the anchor, so a second pass is a no-op.
+fn mtpNormNeedsRepair(head_mean: f32, anchor: f32) bool {
+    return anchor - head_mean > MTP_NORM_REPAIR_MARGIN;
+}
+
+/// Anchor for a vulnerable head norm = mean-of-means of the BACKBONE
+/// counterpart norms carried in the same payload (non-`mtp.`, 1-D, ending in
+/// `suffix`). `null` when none are present: a sidecar head ships mtp-only
+/// weights, so there is no anchor and the reference repair is skipped (those
+/// heads never had the oQ bug — their delta norms ride the global fold).
+/// Mirrors oMLX's reference-mean pass in `norm_repair.py`.
+fn mtpBackboneAnchorMean(w: *const Weights, suffix: []const u8, s: mlx.mlx_stream) ?f32 {
+    var it = w.map.iterator();
+    var sum: f32 = 0;
+    var n: u32 = 0;
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.indexOf(u8, key, "mtp.") != null) continue;
+        if (!std.mem.endsWith(u8, key, suffix)) continue;
+        if (mlx.mlx_array_ndim(entry.value_ptr.*) != 1) continue;
+        const mean = arrayMeanF32(entry.value_ptr.*, s) catch continue;
+        sum += mean;
+        n += 1;
+    }
+    if (n == 0) return null;
+    return sum / @as(f32, @floatFromInt(n));
+}
+
+/// Own a vulnerable head RMSNorm with oMLX-style reference-based repair. When
+/// the global delta-fold already handled this head (`fold`), return it verbatim
+/// (both would double-shift). Otherwise, if a backbone anchor exists and the
+/// head norm sits a full `+1` below it (`mtpNormNeedsRepair`), fold `+1`; else
+/// leave it untouched. `backbone_suffix` is the head norm's `_REPAIR_GROUPS`
+/// counterpart (e.g. `mtp.norm.weight` → `model.norm.weight`).
+fn ownHeadNormWithRepair(
+    w: *const Weights,
+    head_key: []const u8,
+    backbone_suffix: []const u8,
+    s: mlx.mlx_stream,
+    fold: bool,
+) !mlx.mlx_array {
+    const owned = try ownNorm(w, head_key, s, fold);
+    if (fold) return owned;
+    const anchor = mtpBackboneAnchorMean(w, backbone_suffix, s) orelse return owned;
+    const head_mean = arrayMeanF32(owned, s) catch return owned;
+    if (!mtpNormNeedsRepair(head_mean, anchor)) return owned;
+    defer _ = mlx.mlx_array_free(owned);
+    log.info("[mtp] repairing head norm {s}: mean {d:.3} < backbone anchor {d:.3} (+1)\n", .{ head_key, head_mean, anchor });
+    return foldNormPlusOne(owned, s);
+}
+
 fn ownAndTranspose2D(w: *const Weights, key: []const u8, s: mlx.mlx_stream) !mlx.mlx_array {
     const arr = w.get(key) orelse {
         log.err("[mtp] missing tensor: {s}\n", .{key});
@@ -997,11 +1071,16 @@ pub fn loadMtp(
         .fc_w_t = try ownAndTranspose2D(&weights, K.k(&kb, p, "fc.weight"), s),
         .pre_fc_norm_emb = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_embedding.weight"), s, fold_norms),
         .pre_fc_norm_hidden = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_hidden.weight"), s, fold_norms),
-        .final_norm = try ownNorm(&weights, K.k(&kb, p, "norm.weight"), s, fold_norms),
+        // The 4 norms an oQ `mean<0.5 → +1` conversion can leave a full +1 too
+        // low (their raw HF means sit above 0.5): fold or repair per oMLX's
+        // norm_repair — the global delta-fold when it fired, else a reference
+        // anchor from the backbone counterpart. pre_fc_norm_* + input_norm are
+        // always converted correctly, so they stay on plain ownNorm.
+        .final_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "norm.weight"), "model.norm.weight", s, fold_norms),
         .input_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.input_layernorm.weight"), s, fold_norms),
-        .post_attn_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight"), s, fold_norms),
-        .q_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight"), s, fold_norms),
-        .k_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight"), s, fold_norms),
+        .post_attn_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight"), ".post_attention_layernorm.weight", s, fold_norms),
+        .q_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight"), ".self_attn.q_norm.weight", s, fold_norms),
+        .k_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight"), ".self_attn.k_norm.weight", s, fold_norms),
         .q = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.q_proj"), s),
         .k = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.k_proj"), s),
         .v = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.v_proj"), s),
@@ -2035,6 +2114,15 @@ fn maxAbsDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
     return out;
 }
 
+test "mtp: reference-based head-norm repair rule (oMLX norm_repair)" {
+    // Gap beyond the margin (an oQ-broken head, ~1 below its backbone anchor)
+    // → repair; a head at/above its anchor → no-op; idempotent after the +1.
+    try testing.expect(mtpNormNeedsRepair(0.75, 1.45)); // gap 0.70 → repair
+    try testing.expect(!mtpNormNeedsRepair(1.30, 1.45)); // gap 0.15 → no-op
+    try testing.expect(!mtpNormNeedsRepair(1.50, 1.45)); // above anchor → no-op
+    try testing.expect(!mtpNormNeedsRepair(0.75 + 1.0, 1.45)); // post-shift → no-op
+}
+
 test "mtp: inferGroupSize geometry" {
     // 4-bit packed: weight [out, in*4/32] u32, scales [out, in/group].
     // Synthetic pair: packed_cols=4 → expanded in=32; scale_cols=2 → group 16.
@@ -2652,6 +2740,22 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
                 try mlx.check(mlx.mlx_array_eval(bf));
                 _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
             }
+            // Fill a tensor with a constant value — lets the test pin a norm's
+            // mean exactly, to drive (or suppress) reference-based repair.
+            fn putConst(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, value: f32, st: mlx.mlx_stream) !void {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data) |*x| x.* = value;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
         };
         try H.put(map, "language_model.mtp.fc.weight", &.{ 8, 16 }, s);
         try H.put(map, "language_model.mtp.pre_fc_norm_embedding.weight", &.{8}, s);
@@ -2659,8 +2763,10 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
         try H.put(map, "language_model.mtp.norm.weight", &.{8}, s);
         try H.put(map, "language_model.mtp.layers.0.input_layernorm.weight", &.{8}, s);
         try H.put(map, "language_model.mtp.layers.0.post_attention_layernorm.weight", &.{8}, s);
-        try H.put(map, "language_model.mtp.layers.0.self_attn.q_norm.weight", &.{4}, s);
-        try H.put(map, "language_model.mtp.layers.0.self_attn.k_norm.weight", &.{4}, s);
+        // Head q_norm sits a full +1 below its backbone anchor (0.7 vs 1.4) —
+        // the oQ conversion bug; k_norm sits at/above (1.5 vs 1.4) — correct.
+        try H.putConst(map, "language_model.mtp.layers.0.self_attn.q_norm.weight", &.{4}, 0.7, s);
+        try H.putConst(map, "language_model.mtp.layers.0.self_attn.k_norm.weight", &.{4}, 1.5, s);
         try H.put(map, "language_model.mtp.layers.0.self_attn.q_proj.weight", &.{ 8, 8 }, s);
         try H.put(map, "language_model.mtp.layers.0.self_attn.k_proj.weight", &.{ 4, 8 }, s);
         try H.put(map, "language_model.mtp.layers.0.self_attn.v_proj.weight", &.{ 4, 8 }, s);
@@ -2668,6 +2774,14 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
         try H.put(map, "language_model.mtp.layers.0.mlp.gate_proj.weight", &.{ 6, 8 }, s);
         try H.put(map, "language_model.mtp.layers.0.mlp.up_proj.weight", &.{ 6, 8 }, s);
         try H.put(map, "language_model.mtp.layers.0.mlp.down_proj.weight", &.{ 8, 6 }, s);
+        // Backbone counterpart norms ride the LAST trunk shard (this same file),
+        // so the head's reference anchors are already loaded — no extra I/O.
+        // Two q_norm layers exercise the mean-of-means anchor.
+        try H.putConst(map, "language_model.model.layers.0.self_attn.q_norm.weight", &.{4}, 1.4, s);
+        try H.putConst(map, "language_model.model.layers.1.self_attn.q_norm.weight", &.{4}, 1.4, s);
+        try H.putConst(map, "language_model.model.layers.0.self_attn.k_norm.weight", &.{4}, 1.4, s);
+        try H.putConst(map, "language_model.model.layers.0.post_attention_layernorm.weight", &.{8}, 1.4, s);
+        try H.putConst(map, "language_model.model.norm.weight", &.{8}, 1.9, s);
         try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
     }
 
@@ -2700,4 +2814,11 @@ test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-c
     const fc_shape = mlx.getShape(m.fc_w_t);
     try testing.expectEqual(@as(c_int, 16), fc_shape[0]);
     try testing.expectEqual(@as(c_int, 8), fc_shape[1]);
+
+    // oMLX head-norm repair: q_norm sat +1 below its backbone anchor (0.7 vs
+    // 1.4) → repaired to ~1.7; k_norm sat at/above (1.5 vs 1.4) → untouched.
+    const q_mean = try arrayMeanF32(m.q_norm, s);
+    try testing.expect(q_mean > 1.6 and q_mean < 1.8);
+    const k_mean = try arrayMeanF32(m.k_norm, s);
+    try testing.expect(k_mean > 1.45 and k_mean < 1.55);
 }

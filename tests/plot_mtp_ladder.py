@@ -48,6 +48,25 @@ ENGINES = [
     ("ours",  "MLX-serve (native MTP)",        "#ea580c", "#1f2937", False),
 ]
 
+DEFAULT_TITLE = "Native MTP head-to-head — LM Studio vs MTPLX vs MLX-serve, 0.5K to 64K context"
+# Percent-delta annotation: (engine whose bar gets the label, engine it is
+# compared against). Legacy chart: ours vs MTPLX.
+DEFAULT_DELTA = ("ours", "mtplx")
+
+
+def parse_engines(spec: str) -> list[tuple]:
+    """`key:Label:#color[:light]` comma-separated → ENGINES-shaped tuples.
+    `light=1` renders the in-bar value dark-on-light (pale bar colors)."""
+    out = []
+    for item in spec.split(","):
+        parts = item.split(":")
+        if len(parts) < 3:
+            sys.exit(f"--engines spec needs key:Label:#color[:light], got: {item}")
+        key, label, color = parts[0], parts[1], parts[2]
+        light = len(parts) > 3 and parts[3] == "1"
+        out.append((key, label, color, "#6b7280" if light else "#1f2937", light))
+    return out
+
 
 def load_csv(path: Path) -> list[dict]:
     rows = []
@@ -63,7 +82,9 @@ def load_csv(path: Path) -> list[dict]:
     return rows
 
 
-def render(csv_path: Path, png_out: Path) -> None:
+def render(csv_path: Path, png_out: Path, engines: list[tuple] = ENGINES,
+           title: str = DEFAULT_TITLE, subtitle: str = SUBTITLE,
+           delta: tuple = DEFAULT_DELTA) -> None:
     rows = load_csv(csv_path)
     contexts = [r["context"] for r in rows]
 
@@ -80,9 +101,8 @@ def render(csv_path: Path, png_out: Path) -> None:
     })
 
     fig, axes = plt.subplots(1, 2, figsize=(20, 6.6))
-    fig.suptitle("Native MTP head-to-head — LM Studio vs MTPLX vs MLX-serve, 0.5K to 64K context",
-                 fontsize=15, fontweight="bold", color="#111827", y=0.99)
-    fig.text(0.5, 0.925, SUBTITLE, ha="center", fontsize=9.5, color="#4b5563")
+    fig.suptitle(title, fontsize=15, fontweight="bold", color="#111827", y=0.99)
+    fig.text(0.5, 0.925, subtitle, ha="center", fontsize=9.5, color="#4b5563")
 
     panels = [
         ("prefill", "Prefill (tok/s)", "prefill tok/s"),
@@ -90,13 +110,13 @@ def render(csv_path: Path, png_out: Path) -> None:
     ]
 
     x = np.arange(len(contexts))
-    width = 0.27
+    width = 0.81 / len(engines)
     for ax, (key, panel_title, ylab) in zip(axes, panels):
-        series = {eng: [float(r[f"{eng}_{key}"]) for r in rows] for eng, *_ in ENGINES}
+        series = {eng: [float(r[f"{eng}_{key}"]) for r in rows] for eng, *_ in engines}
         top = max(v for vals in series.values() for v in vals)
-        for e_idx, (eng, label, color, edge, light) in enumerate(ENGINES):
+        for e_idx, (eng, label, color, edge, light) in enumerate(engines):
             vals = series[eng]
-            offset = (e_idx - 1) * width
+            offset = (e_idx - (len(engines) - 1) / 2) * width
             bars = ax.bar(x + offset, vals, width, label=label, color=color,
                           edgecolor=edge, linewidth=0.5, zorder=2)
             for bar, val in zip(bars, vals):
@@ -105,10 +125,10 @@ def render(csv_path: Path, png_out: Path) -> None:
                         ha="center", va="center", fontsize=8,
                         color="#111827" if light else "#ffffff",
                         fontweight="bold", rotation=90)
-            # Percent delta above OUR bar, vs MTPLX at the same rung — the
-            # MTP-runtime race; LM Studio is the no-MTP floor.
-            if eng == "ours":
-                for bar, val, base in zip(bars, vals, series["mtplx"]):
+            # Percent delta above the `delta[0]` bar vs `delta[1]` at the same
+            # rung — the head-to-head race the chart is about.
+            if eng == delta[0] and delta[1] in series:
+                for bar, val, base in zip(bars, vals, series[delta[1]]):
                     if base <= 0:
                         continue
                     gain = (val / base - 1) * 100
@@ -136,13 +156,21 @@ def render(csv_path: Path, png_out: Path) -> None:
 
 def main() -> None:
     p = argparse.ArgumentParser(
-        description="Render the LM Studio / MTPLX / MLX-serve MTP-ladder chart.")
+        description="Render an MTP-ladder chart (default: the legacy LM Studio / "
+                    "MTPLX / MLX-serve trio; --engines re-targets the columns).")
     p.add_argument("csv", type=Path, help="input CSV path")
     p.add_argument("png", type=Path, help="output PNG path")
+    p.add_argument("--engines", help="key:Label:#color[:light],… — CSV column prefixes to plot")
+    p.add_argument("--title", default=DEFAULT_TITLE)
+    p.add_argument("--subtitle", default=SUBTITLE)
+    p.add_argument("--delta", default=":".join(DEFAULT_DELTA),
+                   help="annotated:baseline engine keys for the percent labels")
     args = p.parse_args()
     if not args.csv.exists():
         sys.exit(f"CSV not found: {args.csv}")
-    render(args.csv, args.png)
+    engines = parse_engines(args.engines) if args.engines else ENGINES
+    render(args.csv, args.png, engines=engines, title=args.title,
+           subtitle=args.subtitle, delta=tuple(args.delta.split(":", 1)))
 
 
 if __name__ == "__main__":
