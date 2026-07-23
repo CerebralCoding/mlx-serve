@@ -58,15 +58,17 @@ pub const MtpCostProfile = enum {
     generic,
     g17_nax_q8_gs32,
     g17_nax_q4_gs32,
+    g17_nax_oq4e_q4_gs64,
 };
 
 fn m5NaxCostProfileForQuant(bits: u32, group_size: u32) MtpCostProfile {
-    if (group_size != 32) return .generic;
-    return switch (bits) {
+    if (bits == 4 and group_size == 64) return .g17_nax_oq4e_q4_gs64;
+    if (group_size == 32) return switch (bits) {
         8 => .g17_nax_q8_gs32,
         4 => .g17_nax_q4_gs32,
         else => .generic,
     };
+    return .generic;
 }
 
 /// Prefill history windowing (OPT-IN via `--mtp-history-window <n>`; mirrors
@@ -288,12 +290,21 @@ pub const MtpModel = struct {
     /// q8/gs-32 and q4/gs-32 draft costs are calibrated independently.
     /// Compatible but off-profile geometry remains correct under `generic`.
     pub fn m5NaxCostProfile(self: *const MtpModel, target: *const Transformer) MtpCostProfile {
-        if (!target.mtpNaxProfileEnabled()) return .generic;
         if (self.eh_proj != null) return .generic;
         const profile = m5NaxCostProfileForQuant(self.quant_bits, self.quant_group_size);
+        switch (profile) {
+            .g17_nax_oq4e_q4_gs64 => if (!target.mtpOqeNaxProfileEnabled()) return .generic,
+            .g17_nax_q8_gs32, .g17_nax_q4_gs32 => if (!target.mtpNaxProfileEnabled()) return .generic,
+            .generic => return .generic,
+        }
         const sidecar_bits: u32 = switch (profile) {
             .g17_nax_q8_gs32 => 8,
-            .g17_nax_q4_gs32 => 4,
+            .g17_nax_q4_gs32, .g17_nax_oq4e_q4_gs64 => 4,
+            .generic => return .generic,
+        };
+        const sidecar_group_size: u32 = switch (profile) {
+            .g17_nax_q8_gs32, .g17_nax_q4_gs32 => 32,
+            .g17_nax_oq4e_q4_gs64 => 64,
             .generic => return .generic,
         };
 
@@ -340,7 +351,7 @@ pub const MtpModel = struct {
                         .full_out = full_out,
                         .intermediate = cfg.intermediate_size,
                         .bits = sidecar_bits,
-                        .group_size = 32,
+                        .group_size = sidecar_group_size,
                     },
                 )) return .generic;
             },
@@ -1165,8 +1176,8 @@ pub fn loadMtp(
             },
             .moe => |*mw| {
                 const moe_ws = [_]mlx.mlx_array{
-                    mw.router_w, mw.switch_gate_w, mw.switch_up_w, mw.switch_down_w,
-                    mw.shared_gate_w, mw.shared_up_w, mw.shared_down_w,
+                    mw.router_w,      mw.switch_gate_w, mw.switch_up_w,   mw.switch_down_w,
+                    mw.shared_gate_w, mw.shared_up_w,   mw.shared_down_w,
                 };
                 for (moe_ws) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
                 if (mw.shared_expert_gate_w) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
@@ -1282,8 +1293,8 @@ fn loadHy3Mtp(
         for (base) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
         const mw = &m.mlp.moe;
         const moe_ws = [_]mlx.mlx_array{
-            mw.router_w, mw.switch_gate_w, mw.switch_up_w, mw.switch_down_w,
-            mw.shared_gate_w, mw.shared_up_w, mw.shared_down_w,
+            mw.router_w,      mw.switch_gate_w, mw.switch_up_w,   mw.switch_down_w,
+            mw.shared_gate_w, mw.shared_up_w,   mw.shared_down_w,
         };
         for (moe_ws) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
         if (mw.expert_bias) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
@@ -2227,7 +2238,7 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
     try testing.expectEqual(MtpCostProfile.g17_nax_q8_gs32, m5NaxCostProfileForQuant(8, 32));
     try testing.expectEqual(MtpCostProfile.g17_nax_q4_gs32, m5NaxCostProfileForQuant(4, 32));
     try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForQuant(8, 64));
-    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForQuant(4, 64));
+    try testing.expectEqual(MtpCostProfile.g17_nax_oq4e_q4_gs64, m5NaxCostProfileForQuant(4, 64));
     try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForQuant(3, 32));
 
     var sidecar = try mk.qlinear(IN, OUT, 8, 32, s);
@@ -2245,6 +2256,10 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
     var off_group = try mk.qlinear(IN, OUT, 8, 64, s);
     defer off_group.deinit();
     try testing.expect(!m5NaxQLinearMatches(&off_group, IN, OUT, 8, 32));
+    var sidecar_q4_gs64 = try mk.qlinear(IN, OUT, 4, 64, s);
+    defer sidecar_q4_gs64.deinit();
+    try testing.expect(m5NaxQLinearMatches(&sidecar_q4_gs64, IN, OUT, 4, 64));
+    try testing.expect(!m5NaxQLinearMatches(&sidecar_q4_gs64, IN, OUT, 4, 32));
 
     var q4_set = [_]QLinear{
         try mk.qlinear(IN, OUT, 4, 32, s),
@@ -2267,20 +2282,40 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
     };
     defer for (&q8_set) |*q| q.deinit();
     const q4_linears: M5NaxDenseSidecarLinears = .{
-        .q = &q4_set[0], .k = &q4_set[1], .v = &q4_set[2], .o = &q4_set[3],
-        .gate = &q4_set[4], .up = &q4_set[5], .down = &q4_set[6],
+        .q = &q4_set[0],
+        .k = &q4_set[1],
+        .v = &q4_set[2],
+        .o = &q4_set[3],
+        .gate = &q4_set[4],
+        .up = &q4_set[5],
+        .down = &q4_set[6],
     };
     const q8_linears: M5NaxDenseSidecarLinears = .{
-        .q = &q8_set[0], .k = &q8_set[1], .v = &q8_set[2], .o = &q8_set[3],
-        .gate = &q8_set[4], .up = &q8_set[5], .down = &q8_set[6],
+        .q = &q8_set[0],
+        .k = &q8_set[1],
+        .v = &q8_set[2],
+        .o = &q8_set[3],
+        .gate = &q8_set[4],
+        .up = &q8_set[5],
+        .down = &q8_set[6],
     };
     const q4_geom: M5NaxDenseSidecarGeometry = .{
-        .hidden = IN, .q_out = OUT, .kv_out = OUT, .full_out = OUT,
-        .intermediate = OUT, .bits = 4, .group_size = 32,
+        .hidden = IN,
+        .q_out = OUT,
+        .kv_out = OUT,
+        .full_out = OUT,
+        .intermediate = OUT,
+        .bits = 4,
+        .group_size = 32,
     };
     const q8_geom: M5NaxDenseSidecarGeometry = .{
-        .hidden = IN, .q_out = OUT, .kv_out = OUT, .full_out = OUT,
-        .intermediate = OUT, .bits = 8, .group_size = 32,
+        .hidden = IN,
+        .q_out = OUT,
+        .kv_out = OUT,
+        .full_out = OUT,
+        .intermediate = OUT,
+        .bits = 8,
+        .group_size = 32,
     };
     try testing.expect(m5NaxDenseSidecarMatches(q4_linears, q4_geom));
     try testing.expect(m5NaxDenseSidecarMatches(q8_linears, q8_geom));
@@ -2588,7 +2623,6 @@ test "mtp: multi-row forward projects the LAST row only and equals appendHistory
     }.f;
     try close(merged.logits, ref.logits, 16, s);
     try close(merged.hidden_next, ref.hidden_next, 8, s);
-
 }
 
 test "mtp: index.json shard sweep is marker-gated (in-checkpoint heads)" {
@@ -2681,8 +2715,7 @@ test "mtp: single-file model.safetensors header probe (no index.json)" {
             @memcpy(buf[8..][0..header.len], header);
             buf[8 + header.len] = 0;
             buf[8 + header.len + 1] = 0;
-            try dir.writeFile(io_, .{ .sub_path = "model.safetensors",
-                                      .data = buf[0 .. 8 + header.len + 2] });
+            try dir.writeFile(io_, .{ .sub_path = "model.safetensors", .data = buf[0 .. 8 + header.len + 2] });
         }
     };
 
@@ -2698,8 +2731,7 @@ test "mtp: single-file model.safetensors header probe (no index.json)" {
     try testing.expect(resolveMtpSource(io, allocator, tmp.dir) == null);
 
     // Garbage length prefix → null, never a huge allocation or a crash.
-    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors",
-                                 .data = "\xff\xff\xff\xff\xff\xff\xff\xff!!" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "\xff\xff\xff\xff\xff\xff\xff\xff!!" });
     try testing.expect(resolveMtpSource(io, allocator, tmp.dir) == null);
 }
 

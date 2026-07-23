@@ -752,6 +752,14 @@ pub fn verifyQmmEnabled() bool {
 
 pub const VqmmLane = enum { none, splitk, msg, nax };
 
+/// The byte-unpack NAX tile is profitable for oQe's wide q5/q6 projections,
+/// but loses to stock MLX on the 1024-wide K/V projections. This threshold is
+/// the measured split on M5 Max at M=8; q4 keeps its existing full geometry.
+fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
+    if (bits == 4) return true;
+    return (bits == 5 or bits == 6) and group_size == 64 and n >= 5120;
+}
+
 /// Pure lane selection for the verify-qmm family (hermetically pinned by
 /// the NAX dispatch-table test). Shared floors: M 2..16, N >= 512 (tiny-N
 /// projections — GDN ba proj, MoE routers — gain nothing over stock qmv
@@ -788,7 +796,11 @@ pub fn verifyQmm(
     group_size: u32,
 ) !?mlx.mlx_array {
     if (!verifyQmmEnabled()) return null;
-    if (bits != 4) return null;
+    // The plain-SIMD split-K/msg kernels below remain 4-bit specializations.
+    // The M5 NAX tile additionally handles the 5/6-bit affine projections in
+    // oQe checkpoints; those widths fall through to stock below the NAX
+    // takeover row instead of entering a 4-bit kernel.
+    if (bits != 4 and bits != 5 and bits != 6) return null;
     if (group_size != 32 and group_size != 64 and group_size != 128) return null;
     if (sc.ctx == null or bi.ctx == null) return null;
     const xd = mlx.mlx_array_dtype(x);
@@ -801,15 +813,20 @@ pub fn verifyQmm(
     const wsh = mlx.getShape(w);
     if (wsh.len != 2) return null;
     const N: c_int = wsh[0];
-    // 4-bit pack geometry sanity (every lane): packed cols must be exactly
-    // K/8 u32 words.
-    if (wsh[1] * 8 != K) return null;
+    // Affine packed geometry sanity: one uint32 column carries 32/bits source
+    // values (5/6-bit rows are byte-packed but still exposed as uint32 arrays).
+    if (@as(i64, wsh[1]) * 32 != @as(i64, K) * @as(i64, bits)) return null;
     const nax_on = naxLaneEnvEnabled() and verifyQmmNaxAvailable();
-    switch (vqmmLaneFor(m, K, N, nax_on, naxMinM())) {
+    const lane = vqmmLaneFor(m, K, N, nax_on, naxMinM());
+    if (bits != 4 and
+        (lane != .nax or
+            !naxMixedBitsEnvEnabled() or
+            !mixedNaxShapeEnabled(bits, group_size, N))) return null;
+    switch (lane) {
         .none => return null,
         // NAX m16 tile (M5-class): M 8..16 by default — past the plain-SIMD
         // register cliff. Construction stays strictly behind the probe.
-        .nax => return try runVerifyQmmNax(s, x, w, sc, bi, group_size, m, K, N, xd, xsh),
+        .nax => return try runVerifyQmmNax(s, x, w, sc, bi, bits, group_size, m, K, N, xd, xsh),
         // Huge-N (lm_head class): the tiny-tile split-K grid thrashes the
         // scheduler there (measured 2.1x stock at M=4) — route through the
         // wide multi-simdgroup tile instead (2-column tile at M=7).
@@ -1046,6 +1063,21 @@ fn naxLaneEnvEnabled() bool {
     return on;
 }
 
+var vqmm_nax_mixed_env_cache: ?bool = null;
+/// oQe A/B seam: keep the q4 NAX lane live while routing affine q5/q6 back
+/// through stock qmm. This isolates the mixed-bit kernel contribution without
+/// changing model/controller state or disabling NAX for q4 projections.
+fn naxMixedBitsEnvEnabled() bool {
+    if (vqmm_nax_mixed_env_cache) |v| return v;
+    var on = true;
+    if (std.c.getenv("MLX_SERVE_VERIFY_QMM_NAX_MIXED")) |p| {
+        const val = std.mem.span(p);
+        if (val.len > 0 and val[0] == '0') on = false;
+    }
+    vqmm_nax_mixed_env_cache = on;
+    return on;
+}
+
 /// Family-wide NAX readiness: family kill switch, lane kill switch, and the
 /// hardware probe all pass. This intentionally says nothing about a specific
 /// M/K/N dispatch; controller decisions use verifyQmmNaxEnabledForM instead.
@@ -1129,7 +1161,7 @@ const VQMM_NAX_SOURCE: [:0]const u8 =
     \\constexpr int BK = 16;
     \\constexpr int NSG = 8;
     \\constexpr int K = KCONST;
-    \\constexpr int K_by_8 = K / 8;
+    \\constexpr int K_bytes = K * BITS / 8;
     \\constexpr int K_by_gs = K / GS;
     \\constexpr int K_chunk = K / NSG;
     \\
@@ -1179,22 +1211,56 @@ const VQMM_NAX_SOURCE: [:0]const u8 =
     \\
     \\int n_global = n0 + int(lane);
     \\for (int k0 = k_begin; k0 < k_end; k0 += BK) {
-    \\    uint32_t p0 = w_q[n_global * K_by_8 + ((k0 + 0) >> 3)];
-    \\    uint32_t p1 = w_q[n_global * K_by_8 + ((k0 + 8) >> 3)];
-    \\    float s0 = float(scales[n_global * K_by_gs + ((k0 + 0) / GS)]);
-    \\    float s1 = float(scales[n_global * K_by_gs + ((k0 + 8) / GS)]);
-    \\    float b0 = float(biases[n_global * K_by_gs + ((k0 + 0) / GS)]);
-    \\    float b1 = float(biases[n_global * K_by_gs + ((k0 + 8) / GS)]);
+    \\    const device uchar* wp =
+    \\        ((const device uchar*)w_q) + n_global * K_bytes + (k0 * BITS) / 8;
+    \\    float scale = float(scales[n_global * K_by_gs + (k0 / GS)]);
+    \\    float bias = float(biases[n_global * K_by_gs + (k0 / GS)]);
     \\
-    \\    _Pragma("unroll")
-    \\    for (int ki = 0; ki < 8; ++ki) {
-    \\        uint32_t nib = (p0 >> (ki * 4)) & 0xFu;
-    \\        B_tile[sg_id][ki * BN + int(lane)] = T(float(nib) * s0 + b0);
-    \\    }
-    \\    _Pragma("unroll")
-    \\    for (int ki = 0; ki < 8; ++ki) {
-    \\        uint32_t nib = (p1 >> (ki * 4)) & 0xFu;
-    \\        B_tile[sg_id][(8 + ki) * BN + int(lane)] = T(float(nib) * s1 + b1);
+    \\    if constexpr (BITS == 4) {
+    \\        _Pragma("unroll")
+    \\        for (int pack = 0; pack < 2; ++pack) {
+    \\            uint32_t p =
+    \\                uint32_t(wp[pack * 4 + 0]) |
+    \\                (uint32_t(wp[pack * 4 + 1]) << 8) |
+    \\                (uint32_t(wp[pack * 4 + 2]) << 16) |
+    \\                (uint32_t(wp[pack * 4 + 3]) << 24);
+    \\            _Pragma("unroll")
+    \\            for (int ki = 0; ki < 8; ++ki) {
+    \\                uint32_t q = (p >> (ki * 4)) & 0xFu;
+    \\                B_tile[sg_id][(pack * 8 + ki) * BN + int(lane)] =
+    \\                    T(float(q) * scale + bias);
+    \\            }
+    \\        }
+    \\    } else if constexpr (BITS == 5) {
+    \\        _Pragma("unroll")
+    \\        for (int pack = 0; pack < 2; ++pack) {
+    \\            ulong p =
+    \\                ulong(wp[pack * 5 + 0]) |
+    \\                (ulong(wp[pack * 5 + 1]) << 8) |
+    \\                (ulong(wp[pack * 5 + 2]) << 16) |
+    \\                (ulong(wp[pack * 5 + 3]) << 24) |
+    \\                (ulong(wp[pack * 5 + 4]) << 32);
+    \\            _Pragma("unroll")
+    \\            for (int ki = 0; ki < 8; ++ki) {
+    \\                uint32_t q = uint32_t((p >> (ki * 5)) & 0x1Ful);
+    \\                B_tile[sg_id][(pack * 8 + ki) * BN + int(lane)] =
+    \\                    T(float(q) * scale + bias);
+    \\            }
+    \\        }
+    \\    } else {
+    \\        _Pragma("unroll")
+    \\        for (int pack = 0; pack < 4; ++pack) {
+    \\            uint32_t p =
+    \\                uint32_t(wp[pack * 3 + 0]) |
+    \\                (uint32_t(wp[pack * 3 + 1]) << 8) |
+    \\                (uint32_t(wp[pack * 3 + 2]) << 16);
+    \\            _Pragma("unroll")
+    \\            for (int ki = 0; ki < 4; ++ki) {
+    \\                uint32_t q = (p >> (ki * 6)) & 0x3Fu;
+    \\                B_tile[sg_id][(pack * 4 + ki) * BN + int(lane)] =
+    \\                    T(float(q) * scale + bias);
+    \\            }
+    \\        }
     \\    }
     \\    simdgroup_barrier(mem_flags::mem_threadgroup);
     \\
@@ -1298,6 +1364,7 @@ fn runVerifyQmmNax(
     w: mlx.mlx_array,
     sc: mlx.mlx_array,
     bi: mlx.mlx_array,
+    bits: u32,
     group_size: u32,
     m: c_int,
     K: c_int,
@@ -1317,6 +1384,7 @@ fn runVerifyQmmNax(
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 256, @divExact(N, 32), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 256, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "KCONST", K));
 
@@ -1933,11 +2001,11 @@ pub fn fusedSdpa256Prefill(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
 
         const inputs_arr = [_]mlx.mlx_array{
-            q,                                    k,
-            v,                                    scl,
-            win,                                  kr,
-            phase,                                if (has_carry) m_prev else dummy,
-            if (has_carry) l_prev else dummy,     if (has_carry) o_prev else dummy,
+            q,                                k,
+            v,                                scl,
+            win,                              kr,
+            phase,                            if (has_carry) m_prev else dummy,
+            if (has_carry) l_prev else dummy, if (has_carry) o_prev else dummy,
         };
         const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
         defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -3325,7 +3393,7 @@ pub const QuantParams = struct { bits: u32, group_size: u32, mode: QuantMode = .
 const MtpNaxProfileInputs = struct {
     dense_model: bool,
     calibrated_model: bool,
-    uniform_affine_trunk: bool,
+    profiled_affine_trunk: bool,
     model_quant: QuantParams,
     weight_present: bool,
     packed_weight: bool,
@@ -3362,7 +3430,7 @@ fn mtpNaxCalibratedModelFrom(config: *const ModelConfig, lm_head_n: c_int) bool 
 }
 
 fn mtpNaxProfileEnabledFrom(input: MtpNaxProfileInputs) bool {
-    if (!input.dense_model or !input.calibrated_model or !input.uniform_affine_trunk) return false;
+    if (!input.dense_model or !input.calibrated_model or !input.profiled_affine_trunk) return false;
     if (!input.weight_present or !input.packed_weight) return false;
     if (!input.scales_present or !input.biases_present) return false;
     if (input.model_quant.bits != 4 or input.model_quant.mode != .affine) return false;
@@ -3391,13 +3459,13 @@ fn mtpNaxProfileEnabledFrom(input: MtpNaxProfileInputs) bool {
     );
 }
 
-fn mtpNaxAffineProjectionMatches(
-    config: *const ModelConfig,
+fn mtpNaxAffineProjectionMatchesQuant(
     w: mlx.mlx_array,
     sc: mlx.mlx_array,
     bi: mlx.mlx_array,
     in_dim: u32,
     out_dim: u32,
+    expected: QuantParams,
 ) bool {
     if (w.ctx == null or sc.ctx == null or bi.ctx == null) return false;
     if (mlx.mlx_array_dtype(w) != .uint32 or
@@ -3413,14 +3481,14 @@ fn mtpNaxAffineProjectionMatches(
     if (w_shape[0] != out or s_shape[0] != out or b_shape[0] != out) return false;
     if (s_shape[1] != b_shape[1]) return false;
     const qp = affineParamsFromGeometry(w, sc, in_dim) orelse return false;
-    if (qp.bits != config.quant_bits or
-        qp.group_size != config.quant_group_size or
-        qp.mode != config.quant_mode) return false;
+    if (qp.bits != expected.bits or
+        qp.group_size != expected.group_size or
+        qp.mode != expected.mode) return false;
 
     // Every material projection on the calibrated surface must take NAX at
-    // both depth-8 verify widths. Tiny per-head A/B gates (N < 512) remain on
-    // stock by design and are too small to recreate the weight-stream cliff.
-    if (out_dim >= 512) {
+    // both depth-8 verify widths. Tiny per-head A/B gates and the measured
+    // narrow q5/q6 regressions remain on stock by design.
+    if (out_dim >= 512 and mixedNaxShapeEnabled(expected.bits, expected.group_size, @intCast(out_dim))) {
         const K: c_int = @intCast(in_dim);
         const N: c_int = @intCast(out_dim);
         if (!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, true, 8) or
@@ -3429,10 +3497,110 @@ fn mtpNaxAffineProjectionMatches(
     return true;
 }
 
+fn mtpNaxAffineProjectionMatches(
+    config: *const ModelConfig,
+    w: mlx.mlx_array,
+    sc: mlx.mlx_array,
+    bi: mlx.mlx_array,
+    in_dim: u32,
+    out_dim: u32,
+) bool {
+    return mtpNaxAffineProjectionMatchesQuant(w, sc, bi, in_dim, out_dim, .{
+        .bits = config.quant_bits,
+        .group_size = config.quant_group_size,
+        .mode = config.quant_mode,
+    });
+}
+
 fn mtpNaxDenseMlpMatches(config: *const ModelConfig, mlp: *const DenseMlpWeights) bool {
     return mtpNaxAffineProjectionMatches(config, mlp.gate_w, mlp.gate_s, mlp.gate_b, config.hidden_size, config.intermediate_size) and
         mtpNaxAffineProjectionMatches(config, mlp.up_w, mlp.up_s, mlp.up_b, config.hidden_size, config.intermediate_size) and
         mtpNaxAffineProjectionMatches(config, mlp.down_w, mlp.down_s, mlp.down_b, config.intermediate_size, config.hidden_size);
+}
+
+const OQE_MLP_DOWN_BITS = "5555555555555555555555555556555644444444444444444444444444444444";
+const OQE_LINEAR_Z_BITS = "5554444444545554555454444444444444444444444444444444444444444444";
+const OQE_LINEAR_AB_BITS = "5554544444545554555455545554555444444444444444444444444444444444";
+const OQE_LINEAR_OUT_BITS = "5554555455545554555455545554555455545554555455545554555455545554";
+const OQE_FULL_QK_BITS = "4444444444444444444444444445444544444444444444444444444444444444";
+const OQE_FULL_V_BITS = "4444444444444444444444444446444444444444444444444444444444444444";
+const OQE_FULL_O_BITS = "4444444444454445444544444444444444444444444444444444444444444444";
+
+fn oqeLayerBits(pattern: *const [64:0]u8, layer: usize) u32 {
+    std.debug.assert(layer < 64);
+    return pattern[layer] - '0';
+}
+
+fn mtpNaxOqeProjectionMatches(
+    w: mlx.mlx_array,
+    sc: mlx.mlx_array,
+    bi: mlx.mlx_array,
+    in_dim: u32,
+    out_dim: u32,
+    bits: u32,
+) bool {
+    return mtpNaxAffineProjectionMatchesQuant(w, sc, bi, in_dim, out_dim, .{
+        .bits = bits,
+        .group_size = 64,
+        .mode = .affine,
+    });
+}
+
+/// Exact resident-tensor fingerprint for Jundot's Qwen3.6-27B-oQ4e trunk.
+/// The checkpoint is globally affine-4/gs64 with a fixed layer/role map of
+/// affine q5/q6 overrides. Matching the full map avoids granting cap 8 to
+/// unrelated "mixed 4-bit" checkpoints with a different round-cost surface.
+fn mtpNaxOqeAffineTrunkFrom(config: *const ModelConfig, maybe_layers: ?[]MoeLayerWeights) bool {
+    if (config.isMoe() or config.full_attention_interval == 0) return false;
+    if (config.num_hidden_layers != 64 or config.hidden_size == 0 or config.intermediate_size == 0) return false;
+    const layers = maybe_layers orelse return false;
+    if (layers.len != 64) return false;
+
+    const full_out_wide = @as(u64, config.num_attention_heads) * config.head_dim;
+    const full_q_out_wide = full_out_wide * 2;
+    const kv_out_wide = @as(u64, config.num_key_value_heads) * config.head_dim;
+    const linear_key_out_wide = @as(u64, config.linear_num_key_heads) * config.linear_key_head_dim;
+    const linear_out_wide = @as(u64, config.linear_num_value_heads) * config.linear_value_head_dim;
+    const linear_qkv_out_wide = 2 * linear_key_out_wide + linear_out_wide;
+    if (full_out_wide == 0 or full_out_wide > std.math.maxInt(u32) or
+        full_q_out_wide > std.math.maxInt(u32) or
+        kv_out_wide == 0 or kv_out_wide > std.math.maxInt(u32) or
+        linear_out_wide == 0 or linear_out_wide > std.math.maxInt(u32) or
+        linear_qkv_out_wide > std.math.maxInt(u32)) return false;
+    const full_out: u32 = @intCast(full_out_wide);
+    const full_q_out: u32 = @intCast(full_q_out_wide);
+    const kv_out: u32 = @intCast(kv_out_wide);
+    const linear_out: u32 = @intCast(linear_out_wide);
+    const linear_qkv_out: u32 = @intCast(linear_qkv_out_wide);
+
+    for (layers, 0..) |*layer, i| {
+        if (layer.is_linear != config.isLinearLayer(@intCast(i))) return false;
+        switch (layer.attn) {
+            .full => |*attn| {
+                if (!mtpNaxOqeProjectionMatches(attn.q_w, attn.q_s, attn.q_b, config.hidden_size, full_q_out, oqeLayerBits(OQE_FULL_QK_BITS, i)) or
+                    !mtpNaxOqeProjectionMatches(attn.k_w, attn.k_s, attn.k_b, config.hidden_size, kv_out, oqeLayerBits(OQE_FULL_QK_BITS, i)) or
+                    !mtpNaxOqeProjectionMatches(attn.v_w, attn.v_s, attn.v_b, config.hidden_size, kv_out, oqeLayerBits(OQE_FULL_V_BITS, i)) or
+                    !mtpNaxOqeProjectionMatches(attn.o_w, attn.o_s, attn.o_b, full_out, config.hidden_size, oqeLayerBits(OQE_FULL_O_BITS, i))) return false;
+            },
+            .linear => |*attn| {
+                if (attn.combined_proj) return false;
+                if (!mtpNaxOqeProjectionMatches(attn.qkv_w, attn.qkv_s, attn.qkv_b, config.hidden_size, linear_qkv_out, 4) or
+                    !mtpNaxOqeProjectionMatches(attn.z_w, attn.z_s, attn.z_b, config.hidden_size, linear_out, oqeLayerBits(OQE_LINEAR_Z_BITS, i)) or
+                    !mtpNaxOqeProjectionMatches(attn.a_w, attn.a_s, attn.a_b, config.hidden_size, config.linear_num_value_heads, oqeLayerBits(OQE_LINEAR_AB_BITS, i)) or
+                    !mtpNaxOqeProjectionMatches(attn.b_w, attn.b_s, attn.b_b, config.hidden_size, config.linear_num_value_heads, oqeLayerBits(OQE_LINEAR_AB_BITS, i)) or
+                    !mtpNaxOqeProjectionMatches(attn.out_w, attn.out_s, attn.out_b, linear_out, config.hidden_size, oqeLayerBits(OQE_LINEAR_OUT_BITS, i))) return false;
+            },
+        }
+        switch (layer.mlp) {
+            .dense => |*mlp| {
+                if (!mtpNaxOqeProjectionMatches(mlp.gate_w, mlp.gate_s, mlp.gate_b, config.hidden_size, config.intermediate_size, 4) or
+                    !mtpNaxOqeProjectionMatches(mlp.up_w, mlp.up_s, mlp.up_b, config.hidden_size, config.intermediate_size, 4) or
+                    !mtpNaxOqeProjectionMatches(mlp.down_w, mlp.down_s, mlp.down_b, config.intermediate_size, config.hidden_size, oqeLayerBits(OQE_MLP_DOWN_BITS, i))) return false;
+            },
+            .moe => return false,
+        }
+    }
+    return true;
 }
 
 /// The depth-8 controller constants describe the measured homogeneous affine
@@ -3727,6 +3895,9 @@ pub const Transformer = struct {
     // embedding and every resident trunk projection are homogeneous
     // affine-4/gs-64. Computed once at load; mixed checkpoints keep this false.
     mtp_uniform_affine_trunk: bool = false,
+    // Exact oQ4e mixed q4/q5/q6 layer-role fingerprint. Kept separate from
+    // the homogeneous profile because its measured NAX cost surface differs.
+    mtp_oqe_affine_trunk: bool = false,
 
     pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights) !Transformer {
         // Use the current thread's default GPU stream rather than a dedicated stream.
@@ -4192,6 +4363,12 @@ pub const Transformer = struct {
             config.quant_mode == .affine and
             mtpNaxAffineProjectionMatches(&config, emb_w, emb_s_arr, emb_b_arr, config.hidden_size, config.vocab_size) and
             mtpNaxUniformAffineTrunkFrom(&config, moe_layers);
+        const mtp_oqe_affine_trunk = mtpNaxCalibratedModelFrom(&config, profile_head_n) and
+            config.quant_bits == 4 and
+            config.quant_group_size == 64 and
+            config.quant_mode == .affine and
+            mtpNaxAffineProjectionMatches(&config, emb_w, emb_s_arr, emb_b_arr, config.hidden_size, config.vocab_size) and
+            mtpNaxOqeAffineTrunkFrom(&config, moe_layers);
 
         return .{
             .config = config,
@@ -4255,6 +4432,7 @@ pub const Transformer = struct {
             .prompt_cache = null,
             .bits_cache = bits_cache,
             .mtp_uniform_affine_trunk = mtp_uniform_affine_trunk,
+            .mtp_oqe_affine_trunk = mtp_oqe_affine_trunk,
         };
     }
 
@@ -4914,18 +5092,12 @@ pub const Transformer = struct {
         return computeQuantParams(&self.config, w, sc, in_dim);
     }
 
-    /// Whether this resident model may use the calibrated M5 depth-8 MTP cost
-    /// profile. Resolve the lm_head's TRUE per-weight quantization and packed
-    /// geometry, and require the once-validated homogeneous affine trunk:
-    /// mixed checkpoints can contradict config.quant_bits/group_size, and a
-    /// dense or missing-bias projection would change the measured cost surface.
-    /// Requiring NAX dispatch at both M=8 and M=9 keeps the controller aligned
-    /// with the two verification widths exercised by a depth-8 round.
-    pub fn mtpNaxProfileEnabled(self: *const Transformer) bool {
+    fn mtpNaxProfileEnabledForTrunk(self: *const Transformer, profiled_trunk: bool, mixed_bits: bool) bool {
         if (self.config.isMoe()) return false;
         if (self.config.hidden_size > std.math.maxInt(c_int)) return false;
         if (self.config.quant_bits != 4 or self.config.quant_mode != .affine) return false;
         if (self.config.quant_group_size != 64) return false;
+        if (mixed_bits and !naxMixedBitsEnvEnabled()) return false;
         if (self.lm_head_w.ctx == null or
             self.lm_head_s.ctx == null or
             self.lm_head_b.ctx == null) return false;
@@ -4950,7 +5122,7 @@ pub const Transformer = struct {
         return mtpNaxProfileEnabledFrom(.{
             .dense_model = true,
             .calibrated_model = calibrated_model,
-            .uniform_affine_trunk = self.mtp_uniform_affine_trunk,
+            .profiled_affine_trunk = profiled_trunk,
             .model_quant = .{
                 .bits = self.config.quant_bits,
                 .group_size = self.config.quant_group_size,
@@ -4969,6 +5141,19 @@ pub const Transformer = struct {
             .available = verifyQmmNaxAvailable(),
             .min_m = naxMinM(),
         });
+    }
+
+    /// Homogeneous q4/gs64 target profile used by the existing q4/q8-gs32
+    /// MTP sidecar cost surfaces.
+    pub fn mtpNaxProfileEnabled(self: *const Transformer) bool {
+        return self.mtpNaxProfileEnabledForTrunk(self.mtp_uniform_affine_trunk, false);
+    }
+
+    /// Exact oQ4e mixed q4/q5/q6 target profile. The q5/q6 lane kill switch
+    /// also revokes the cost profile so auto depth never assumes unavailable
+    /// mixed-bit acceleration.
+    pub fn mtpOqeNaxProfileEnabled(self: *const Transformer) bool {
+        return self.mtpNaxProfileEnabledForTrunk(self.mtp_oqe_affine_trunk, true);
     }
 
     inline fn rmsNorm(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array) !mlx.mlx_array {
@@ -7442,7 +7627,6 @@ pub const Transformer = struct {
             if (prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % hybrid_eval_cadence == 0) {
                 try mlx.check(mlx.mlx_array_eval(h));
             }
-
         }
 
         ctx.moe_seq_offset.* += @intCast(seq_len);
@@ -7723,7 +7907,6 @@ pub const Transformer = struct {
             } else {
                 try mlx.check(mlx.mlx_array_set(&C_t, C_t_sq));
             }
-
 
             // dA = exp(A * dt_t): [B, num_heads]
             var A_dt = mlx.mlx_array_new();
@@ -9981,32 +10164,34 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 sw_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.scales") orelse mlx.mlx_array_new();
                 sw_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "experts.switch_glu.down_proj.biases") orelse mlx.mlx_array_new();
             }
-            lw.mlp = .{ .moe = .{
-                .router_w = getLayerWeight(weights, name_buf, prefix, li, "router.proj.weight"),
-                .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "router.proj.scales") orelse mlx.mlx_array_new(),
-                .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "router.proj.biases") orelse mlx.mlx_array_new(),
-                .router_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.scale"),
-                .per_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.per_expert_scale"),
-                .switch_gate_w = sw_gate_w,
-                .switch_gate_s = sw_gate_s,
-                .switch_gate_b = sw_gate_b,
-                .switch_up_w = sw_up_w,
-                .switch_up_s = sw_up_s,
-                .switch_up_b = sw_up_b,
-                .switch_down_w = sw_down_w,
-                .switch_down_s = sw_down_s,
-                .switch_down_b = sw_down_b,
-                // Shared expert handled via lw.shared_mlp for Gemma 4 (separate branch in forward)
-                .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
-                .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
-                .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
-                .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.scales") orelse mlx.mlx_array_new(),
-                .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
-                .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.scales") orelse mlx.mlx_array_new(),
-                .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.biases") orelse mlx.mlx_array_new(),
-            } };
+            lw.mlp = .{
+                .moe = .{
+                    .router_w = getLayerWeight(weights, name_buf, prefix, li, "router.proj.weight"),
+                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "router.proj.scales") orelse mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "router.proj.biases") orelse mlx.mlx_array_new(),
+                    .router_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.scale"),
+                    .per_expert_scale = getLayerWeightOpt(weights, name_buf, prefix, li, "router.per_expert_scale"),
+                    .switch_gate_w = sw_gate_w,
+                    .switch_gate_s = sw_gate_s,
+                    .switch_gate_b = sw_gate_b,
+                    .switch_up_w = sw_up_w,
+                    .switch_up_s = sw_up_s,
+                    .switch_up_b = sw_up_b,
+                    .switch_down_w = sw_down_w,
+                    .switch_down_s = sw_down_s,
+                    .switch_down_b = sw_down_b,
+                    // Shared expert handled via lw.shared_mlp for Gemma 4 (separate branch in forward)
+                    .shared_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate_proj.weight"),
+                    .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.up_proj.weight"),
+                    .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.up_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.down_proj.weight"),
+                    .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.down_proj.biases") orelse mlx.mlx_array_new(),
+                },
+            };
             {
                 const mw = &lw.mlp.moe;
                 try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
@@ -10038,43 +10223,45 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // nvfp4 experts carry scales (u8 fp8) but no biases (bias-less mode);
             // the router/shared weights are bf16 (null-ctx scales → pre-transposed
             // to plain matmul by maybeTransposeForBf16).
-            lw.mlp = .{ .moe = .{
-                .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
-                .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
-                .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
-                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
-                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
-                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
-                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
-                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight") orelse mlx.mlx_array_new(),
-                .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.scales") orelse mlx.mlx_array_new(),
-                .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_up_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.weight") orelse mlx.mlx_array_new(),
-                .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.scales") orelse mlx.mlx_array_new(),
-                .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_down_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.weight") orelse mlx.mlx_array_new(),
-                .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.scales") orelse mlx.mlx_array_new(),
-                .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.biases") orelse mlx.mlx_array_new(),
-                .expert_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.e_score_correction_bias") orelse blk: {
-                    // Some community conversions (mlx-lm quantizer) DROP the
-                    // aux-loss-free bias — the reference zero-inits it, so
-                    // selection reduces to plain sigmoid top-k. Non-null keeps
-                    // moeMLP2 on the sigmoid chain (null falls back to softmax).
-                    var zeros = mlx.mlx_array_new();
-                    const zshape = [_]c_int{@intCast(config.num_experts)};
-                    try mlx.check(mlx.mlx_zeros(&zeros, &zshape, 1, .float32, s));
-                    try owned_bf16.append(allocator, zeros);
-                    break :blk zeros;
+            lw.mlp = .{
+                .moe = .{
+                    .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
+                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
+                    .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight") orelse mlx.mlx_array_new(),
+                    .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_up_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.weight") orelse mlx.mlx_array_new(),
+                    .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_down_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.weight") orelse mlx.mlx_array_new(),
+                    .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .expert_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.e_score_correction_bias") orelse blk: {
+                        // Some community conversions (mlx-lm quantizer) DROP the
+                        // aux-loss-free bias — the reference zero-inits it, so
+                        // selection reduces to plain sigmoid top-k. Non-null keeps
+                        // moeMLP2 on the sigmoid chain (null falls back to softmax).
+                        var zeros = mlx.mlx_array_new();
+                        const zshape = [_]c_int{@intCast(config.num_experts)};
+                        try mlx.check(mlx.mlx_zeros(&zeros, &zshape, 1, .float32, s));
+                        try owned_bf16.append(allocator, zeros);
+                        break :blk zeros;
+                    },
+                    .route_norm = config.moe_route_norm,
+                    .route_scale = config.router_scaling_factor,
+                    .shared_ungated = true,
                 },
-                .route_norm = config.moe_route_norm,
-                .route_scale = config.router_scaling_factor,
-                .shared_ungated = true,
-            } };
+            };
             {
                 const mw = &lw.mlp.moe;
                 try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
@@ -10099,43 +10286,45 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             // builds) — probe once and thread the resolved name through.
             const ex = hy3ExpertContainer(weights, name_buf, prefix, li);
             var exbuf: [64]u8 = undefined;
-            lw.mlp = .{ .moe = .{
-                .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.router.gate.weight"),
-                .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.gate.scales") orelse mlx.mlx_array_new(),
-                .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.gate.biases") orelse mlx.mlx_array_new(),
-                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
-                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
-                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
-                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
-                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
-                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
-                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
-                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
-                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
-                .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.weight") orelse mlx.mlx_array_new(),
-                .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
-                .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_up_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.up_proj.weight") orelse mlx.mlx_array_new(),
-                .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
-                .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                .shared_down_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.down_proj.weight") orelse mlx.mlx_array_new(),
-                .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
-                .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
-                .expert_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.expert_bias") orelse blk: {
-                    // moe_router_enable_expert_bias=false checkpoints ship no
-                    // bias tensor; the reference keeps zeros — selection
-                    // reduces to plain sigmoid top-k. Non-null keeps moeMLP2
-                    // on the sigmoid chain (null would fall back to softmax).
-                    var zeros = mlx.mlx_array_new();
-                    const zshape = [_]c_int{@intCast(config.num_experts)};
-                    try mlx.check(mlx.mlx_zeros(&zeros, &zshape, 1, .float32, s));
-                    try owned_bf16.append(allocator, zeros);
-                    break :blk zeros;
+            lw.mlp = .{
+                .moe = .{
+                    .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.router.gate.weight"),
+                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.gate.scales") orelse mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.router.gate.biases") orelse mlx.mlx_array_new(),
+                    .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
+                    .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.weight") orelse mlx.mlx_array_new(),
+                    .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_up_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.up_proj.weight") orelse mlx.mlx_array_new(),
+                    .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_down_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.down_proj.weight") orelse mlx.mlx_array_new(),
+                    .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .expert_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.expert_bias") orelse blk: {
+                        // moe_router_enable_expert_bias=false checkpoints ship no
+                        // bias tensor; the reference keeps zeros — selection
+                        // reduces to plain sigmoid top-k. Non-null keeps moeMLP2
+                        // on the sigmoid chain (null would fall back to softmax).
+                        var zeros = mlx.mlx_array_new();
+                        const zshape = [_]c_int{@intCast(config.num_experts)};
+                        try mlx.check(mlx.mlx_zeros(&zeros, &zshape, 1, .float32, s));
+                        try owned_bf16.append(allocator, zeros);
+                        break :blk zeros;
+                    },
+                    .route_norm = config.moe_route_norm,
+                    .route_scale = config.router_scaling_factor,
+                    .shared_ungated = true,
                 },
-                .route_norm = config.moe_route_norm,
-                .route_scale = config.router_scaling_factor,
-                .shared_ungated = true,
-            } };
+            };
             {
                 const mw = &lw.mlp.moe;
                 try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
@@ -12883,7 +13072,7 @@ test "moeRoutingChain produces top-K indices and renormalized softmax weights" {
     const n_exp: c_int = 6;
     const k: c_int = 2;
     const data = [_]f32{
-        10.0, 0.0, 0.0, 5.0, 0.0, 0.0,
+        10.0, 0.0,  0.0, 5.0, 0.0, 0.0,
         0.0,  10.0, 0.0, 0.0, 5.0, 0.0,
     };
     const shape = [_]c_int{ n_rows, n_exp };
@@ -13821,6 +14010,7 @@ fn expectVerifyQmmNoWorseThanStock(
     wq: mlx.mlx_array,
     wsc: mlx.mlx_array,
     wbi: mlx.mlx_array,
+    bits: u32,
     gs: u32,
     wdq_t: mlx.mlx_array,
     got: mlx.mlx_array,
@@ -13828,7 +14018,7 @@ fn expectVerifyQmmNoWorseThanStock(
 ) !void {
     var ref = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(ref);
-    try mlx.check(mlx.mlx_quantized_matmul(&ref, x, wq, wsc, wbi, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(4), "affine", s));
+    try mlx.check(mlx.mlx_quantized_matmul(&ref, x, wq, wsc, wbi, true, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", s));
 
     var xf = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(xf);
@@ -13997,7 +14187,7 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             try testing.expectEqual(m, gsh[1]);
             try testing.expectEqual(cs.n, gsh[2]);
 
-            try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, cs.gs, wdq_t, got, label);
+            try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, 4, cs.gs, wdq_t, got, label);
         }
 
         // Ineligible widths fall through to stock (null). The NAX probe is
@@ -14036,6 +14226,109 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             defer _ = mlx.mlx_array_free(x);
             try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
             try testing.expectEqual(@as(?mlx.mlx_array, null), try verifyQmm(s, x, wq, wsc, wbi, 4, cs.gs));
+        }
+    }
+
+    // oQe mixed-precision trunk projections: only the M5 NAX lane adopts
+    // affine 5/6-bit weights. Keep this self-gated like the NAX rows above so
+    // non-G17 CI never attempts to compile an unavailable MPP kernel.
+    if (verifyQmmNaxEnabled()) {
+        const k: c_int = 512;
+        const n: c_int = 5120;
+        const gs: u32 = 64;
+        for ([_]u32{ 5, 6 }) |bits| {
+            const wn: usize = @intCast(n * k);
+            const wbuf = try allocator.alloc(f32, wn);
+            defer allocator.free(wbuf);
+            for (wbuf) |*v| v.* = rnd.float(f32) - 0.5;
+            const wshape = [_]c_int{ n, k };
+            const w32 = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 2, .float32);
+            defer _ = mlx.mlx_array_free(w32);
+            var wb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wb);
+            try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(
+                &triple,
+                wb,
+                mlx.mlx_optional_int.some(@intCast(gs)),
+                mlx.mlx_optional_int.some(@intCast(bits)),
+                "affine",
+                .{},
+                s,
+            ));
+            var wq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wq);
+            var wsc = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wsc);
+            var wbi = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wbi);
+            try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+            try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+            try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+
+            var wdq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wdq);
+            try mlx.check(mlx.mlx_dequantize(
+                &wdq,
+                wq,
+                wsc,
+                wbi,
+                mlx.mlx_optional_int.some(@intCast(gs)),
+                mlx.mlx_optional_int.some(@intCast(bits)),
+                "affine",
+                .{ .ctx = null },
+                mlx.mlx_optional_dtype{ .has_value = true, .value = .float32 },
+                s,
+            ));
+            var wdq_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wdq_t);
+            const t_axes = [_]c_int{ 1, 0 };
+            try mlx.check(mlx.mlx_transpose_axes(&wdq_t, wdq, &t_axes, 2, s));
+
+            const m: c_int = 8;
+            const xn: usize = @intCast(m * k);
+            const xbuf = try allocator.alloc(f32, xn);
+            defer allocator.free(xbuf);
+            for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
+            const xshape = [_]c_int{ 1, m, k };
+            const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+            defer _ = mlx.mlx_array_free(x32);
+            var x = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+
+            const got_opt = try verifyQmm(s, x, wq, wsc, wbi, bits, gs);
+            try testing.expect(got_opt != null);
+            const got = got_opt.?;
+            defer _ = mlx.mlx_array_free(got);
+            try expectVerifyQmmNoWorseThanStock(
+                s,
+                x,
+                wq,
+                wsc,
+                wbi,
+                bits,
+                gs,
+                wdq_t,
+                got,
+                if (bits == 5) "nax oQe q5" else "nax oQe q6",
+            );
+
+            // Below the NAX takeover row these bit widths stay on stock qmm;
+            // the existing split-K/msg kernels remain exact q4 specializations.
+            const x6buf = try allocator.alloc(f32, 6 * @as(usize, @intCast(k)));
+            defer allocator.free(x6buf);
+            for (x6buf) |*v| v.* = 0.1;
+            const x6shape = [_]c_int{ 1, 6, k };
+            const x6f = mlx.mlx_array_new_data(x6buf.ptr, &x6shape, 3, .float32);
+            defer _ = mlx.mlx_array_free(x6f);
+            var x6 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x6);
+            try mlx.check(mlx.mlx_astype(&x6, x6f, .bfloat16, s));
+            try testing.expectEqual(@as(?mlx.mlx_array, null), try verifyQmm(s, x6, wq, wsc, wbi, bits, gs));
         }
     }
 
@@ -14092,7 +14385,7 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             const got = (try runVerifyQmmMsg(s, x, wq, wsc, wbi, 64, m, mk, mn, .bfloat16, xsh)).?;
             defer _ = mlx.mlx_array_free(got);
 
-            try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, 64, wdq_t, got, "msg ragged-N");
+            try expectVerifyQmmNoWorseThanStock(s, x, wq, wsc, wbi, 4, 64, wdq_t, got, "msg ragged-N");
         }
     }
 }
@@ -14141,6 +14434,29 @@ test "vqmmLaneFor: NAX dispatch table (M 8..16 route to the m16 tile only when t
     try testing.expectEqual(VqmmLane.nax, vqmmLaneFor(7, 5120, 151936, nax_on, 5));
     try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, nax_on, 5));
     try testing.expectEqual(VqmmLane.splitk, vqmmLaneFor(5, 5184, 17408, nax_on, 5)); // K % 256 fails, % 64 holds
+}
+
+test "mixedNaxShapeEnabled keeps measured q5/q6 wins and rejects narrow regressions" {
+    try testing.expect(mixedNaxShapeEnabled(4, 32, 1024));
+    try testing.expect(mixedNaxShapeEnabled(5, 64, 5120));
+    try testing.expect(mixedNaxShapeEnabled(6, 64, 5120));
+    try testing.expect(!mixedNaxShapeEnabled(5, 64, 1024));
+    try testing.expect(!mixedNaxShapeEnabled(6, 64, 1024));
+    try testing.expect(!mixedNaxShapeEnabled(5, 32, 5120));
+    try testing.expect(!mixedNaxShapeEnabled(6, 128, 5120));
+}
+
+test "oQ4e layer-role fingerprint pins every mixed override" {
+    try testing.expectEqual(@as(usize, 30), std.mem.count(u8, OQE_MLP_DOWN_BITS, "5"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, OQE_MLP_DOWN_BITS, "6"));
+    try testing.expectEqual(@as(usize, 11), std.mem.count(u8, OQE_LINEAR_Z_BITS, "5"));
+    try testing.expectEqual(@as(usize, 20), std.mem.count(u8, OQE_LINEAR_AB_BITS, "5"));
+    try testing.expectEqual(@as(usize, 48), std.mem.count(u8, OQE_LINEAR_OUT_BITS, "5"));
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, OQE_FULL_QK_BITS, "5"));
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, OQE_FULL_V_BITS, "6"));
+    try testing.expectEqual(@as(usize, 3), std.mem.count(u8, OQE_FULL_O_BITS, "5"));
+    try testing.expectEqual(@as(u32, 5), oqeLayerBits(OQE_MLP_DOWN_BITS, 0));
+    try testing.expectEqual(@as(u32, 4), oqeLayerBits(OQE_MLP_DOWN_BITS, 63));
 }
 
 test "verifyQmmNaxEnabledForMFrom mirrors flags, min-M, and dispatch geometry" {
@@ -14315,7 +14631,7 @@ test "mtpNaxProfileEnabledFrom composes measured model, homogeneous trunk, and a
     const good: MtpNaxProfileInputs = .{
         .dense_model = true,
         .calibrated_model = mtpNaxCalibratedModelFrom(&model, 248320),
-        .uniform_affine_trunk = true,
+        .profiled_affine_trunk = true,
         .model_quant = .{ .bits = 4, .group_size = 64, .mode = .affine },
         .weight_present = true,
         .packed_weight = true,
@@ -14339,7 +14655,7 @@ test "mtpNaxProfileEnabledFrom composes measured model, homogeneous trunk, and a
     bad.calibrated_model = false;
     try testing.expect(!mtpNaxProfileEnabledFrom(bad));
     bad = good;
-    bad.uniform_affine_trunk = false;
+    bad.profiled_affine_trunk = false;
     try testing.expect(!mtpNaxProfileEnabledFrom(bad));
     bad = good;
     bad.model_quant.bits = 8;
@@ -14685,6 +15001,164 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)
                 std.debug.print("[vqmm-ubench] {s:>8} {d:>3} {d:>10.3} {s:>10} {s:>8}\n", .{ sh.name, m, stock_ms, "fallback", "-" });
             }
         }
+    }
+}
+
+test "verifyQmm mixed-width NAX µbench (MLX_SERVE_VQMM_MIXED_UBENCH=1)" {
+    if (std.c.getenv("MLX_SERVE_VQMM_MIXED_UBENCH") == null) return error.SkipZigTest;
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const io_util = @import("io_util.zig");
+    const tio = testing.io;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x0C4E);
+    const rnd = prng.random();
+    const WARM = 10;
+    const ITERS = 80;
+    const M: c_int = 8;
+
+    const shapes = [_]struct { name: []const u8, bits: u32, k: c_int, n: c_int }{
+        .{ .name = "q4-gate", .bits = 4, .k = 5120, .n = 17408 },
+        .{ .name = "q5-in_z", .bits = 5, .k = 5120, .n = 6144 },
+        .{ .name = "q5-qproj", .bits = 5, .k = 5120, .n = 12288 },
+        .{ .name = "q5-kproj", .bits = 5, .k = 5120, .n = 1024 },
+        .{ .name = "q5-out", .bits = 5, .k = 6144, .n = 5120 },
+        .{ .name = "q5-down", .bits = 5, .k = 17408, .n = 5120 },
+        .{ .name = "q6-v", .bits = 6, .k = 5120, .n = 1024 },
+        .{ .name = "q6-down", .bits = 6, .k = 17408, .n = 5120 },
+    };
+    std.debug.print("\n[vqmm-mixed] {s:>8} {s:>4} {s:>10} {s:>10} {s:>8}\n", .{
+        "shape", "bits", "stock_ms", "nax_ms", "ratio",
+    });
+    for (shapes) |sh| {
+        const wn: usize = @intCast(sh.n * sh.k);
+        const wbuf = try allocator.alloc(f32, wn);
+        for (wbuf) |*v| v.* = rnd.float(f32) - 0.5;
+        const wshape = [_]c_int{ sh.n, sh.k };
+        const w32 = mlx.mlx_array_new_data(wbuf.ptr, &wshape, 2, .float32);
+        allocator.free(wbuf);
+        defer _ = mlx.mlx_array_free(w32);
+        var wb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wb);
+        try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(
+            &triple,
+            wb,
+            mlx.mlx_optional_int.some(64),
+            mlx.mlx_optional_int.some(@intCast(sh.bits)),
+            "affine",
+            .{},
+            s,
+        ));
+        var wq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wq);
+        var wsc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wsc);
+        var wbi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(wbi);
+        try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+        for ([_]mlx.mlx_array{ wq, wsc, wbi }) |a| try mlx.check(mlx.mlx_array_eval(a));
+
+        const xn: usize = @intCast(M * sh.k);
+        const xbuf = try allocator.alloc(f32, xn);
+        defer allocator.free(xbuf);
+        for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
+        const xshape = [_]c_int{ 1, M, sh.k };
+        const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xshape, 3, .float32);
+        defer _ = mlx.mlx_array_free(x32);
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(x));
+
+        // Interleave the two paths (and reverse their order every iteration)
+        // so GPU frequency/thermal drift cannot systematically favor the path
+        // measured second.
+        var it: usize = 0;
+        while (it < WARM) : (it += 1) {
+            var stock = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_quantized_matmul(
+                &stock,
+                x,
+                wq,
+                wsc,
+                wbi,
+                true,
+                mlx.mlx_optional_int.some(64),
+                mlx.mlx_optional_int.some(@intCast(sh.bits)),
+                "affine",
+                s,
+            ));
+            try mlx.check(mlx.mlx_array_eval(stock));
+            _ = mlx.mlx_array_free(stock);
+            const nax = (try verifyQmm(s, x, wq, wsc, wbi, sh.bits, 64)) orelse
+                return error.TestUnexpectedResult;
+            try mlx.check(mlx.mlx_array_eval(nax));
+            _ = mlx.mlx_array_free(nax);
+        }
+        var stock_ns: u64 = 0;
+        var nax_ns: u64 = 0;
+        it = 0;
+        while (it < ITERS) : (it += 1) {
+            if (it % 2 == 0) {
+                var sw = io_util.Stopwatch.init(tio);
+                var stock = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_quantized_matmul(
+                    &stock,
+                    x,
+                    wq,
+                    wsc,
+                    wbi,
+                    true,
+                    mlx.mlx_optional_int.some(64),
+                    mlx.mlx_optional_int.some(@intCast(sh.bits)),
+                    "affine",
+                    s,
+                ));
+                try mlx.check(mlx.mlx_array_eval(stock));
+                _ = mlx.mlx_array_free(stock);
+                stock_ns += sw.read();
+                sw.reset();
+                const nax = (try verifyQmm(s, x, wq, wsc, wbi, sh.bits, 64)) orelse
+                    return error.TestUnexpectedResult;
+                try mlx.check(mlx.mlx_array_eval(nax));
+                _ = mlx.mlx_array_free(nax);
+                nax_ns += sw.read();
+            } else {
+                var sw = io_util.Stopwatch.init(tio);
+                const nax = (try verifyQmm(s, x, wq, wsc, wbi, sh.bits, 64)) orelse
+                    return error.TestUnexpectedResult;
+                try mlx.check(mlx.mlx_array_eval(nax));
+                _ = mlx.mlx_array_free(nax);
+                nax_ns += sw.read();
+                sw.reset();
+                var stock = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_quantized_matmul(
+                    &stock,
+                    x,
+                    wq,
+                    wsc,
+                    wbi,
+                    true,
+                    mlx.mlx_optional_int.some(64),
+                    mlx.mlx_optional_int.some(@intCast(sh.bits)),
+                    "affine",
+                    s,
+                ));
+                try mlx.check(mlx.mlx_array_eval(stock));
+                _ = mlx.mlx_array_free(stock);
+                stock_ns += sw.read();
+            }
+        }
+        const stock_ms = @as(f64, @floatFromInt(stock_ns)) / @as(f64, ITERS) / 1e6;
+        const nax_ms = @as(f64, @floatFromInt(nax_ns)) / @as(f64, ITERS) / 1e6;
+        std.debug.print("[vqmm-mixed] {s:>8} {d:>4} {d:>10.3} {d:>10.3} {d:>8.2}\n", .{
+            sh.name, sh.bits, stock_ms, nax_ms, nax_ms / stock_ms,
+        });
     }
 }
 
