@@ -23,6 +23,7 @@ private let bytesPerGiB: Double = 1_073_741_824
 enum RecommendedModelFamily: String {
     case gemma = "Gemma"
     case qwen = "Qwen"
+    case poolside = "poolside"
     case largest = "Largest models"
 }
 
@@ -223,6 +224,23 @@ extension RecommendedModelPick {
         family: .qwen,
         highlights: ["Strong reasoning", "Mixture of experts"]
     )
+
+    /// poolside's Laguna S 2.1 — a coding-specialist mixture-of-experts model
+    /// (117.6B total, ~8.5B active per word). This is the compact 2-bit MLX
+    /// build (~35 GB on disk) the app was validated on, resolvable at the
+    /// on-disk repo path `pipenetwork/Laguna-S-2.1-MLX-2bit`. It's its own
+    /// family: not Gemma, not Qwen, and — at ~42 GB RAM with overhead — not a
+    /// 96 GB+ "largest" pick either, so it fits a mid-range Mac inline.
+    static let lagunaS21 = RecommendedModelPick(
+        id: "laguna-s-2.1-2bit",
+        name: "Laguna S 2.1",
+        tagline: "Built for code",
+        blurb: "poolside's coding-specialist model, built specifically for writing and editing code and for multi-step \u{201c}agent\u{201d} work like using tools across a whole project. It's a large mixture-of-experts model — 117 billion parameters in total, but only about 8.5 billion wake up per word — so it stays efficient for its size. This is a compact 2-bit build that fits comfortably on a Mac with a fair amount of memory.",
+        repoId: "pipenetwork/Laguna-S-2.1-MLX-2bit",
+        sizeGB: 35.2,
+        family: .poolside,
+        highlights: ["Best for coding", "Mixture of experts", "Great at agent tasks"]
+    )
 }
 
 extension RecommendedModelPick {
@@ -236,6 +254,13 @@ extension RecommendedModelPick {
     /// family section.
     static let qwenCatalog: [RecommendedModelPick] = [
         .qwen35_9b, .qwen36_27bMtp, .qwen36_35bA3b,
+    ]
+
+    /// poolside's Laguna family — currently the single 2-bit Laguna S 2.1
+    /// coder build. Its own section: a coding specialist that isn't Gemma,
+    /// Qwen, or a 96 GB+ "largest" pick.
+    static let poolsideCatalog: [RecommendedModelPick] = [
+        .lagunaS21,
     ]
 
     /// The largest models this app runs, ascending by on-disk size (the app's

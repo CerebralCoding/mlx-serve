@@ -114,6 +114,13 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
 
     // Live guest + the host dir it shares at /workspace. Guarded by `bootLock`.
     private let bootLock = NSLock()
+    /// Serializes a project hot-mount (the `setProjectShares` swap + verify +
+    /// `mountedProjects` update). Separate from `bootLock` so it can be held
+    /// across the guest exec that verifies the mount without blocking every
+    /// other guest command — two commands first-using two DIFFERENT folders
+    /// concurrently would otherwise clobber each other's share (last full-map
+    /// write wins, dropping the other slug).
+    private let mountLock = NSLock()
     private var guest: VzGuest?
     private var sharedRoot: String?
     /// Host side of the live guest→host port map (created per boot when
@@ -128,6 +135,13 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     /// while non-empty, a workspace switch that needs a remount is DECLINED
     /// instead of silently rebooting the VM out from under the session.
     private var cliPins: [String] = []
+    /// Per-chat project folders currently hot-mounted in the live guest at
+    /// `/projects/<slug>` (slug → host path). `/workspace` stays the Settings
+    /// default (pi/hermes + chats on the default); a chat whose folder differs
+    /// gets its folder hot-mounted here on first tool use — no VM reboot.
+    /// Cleared on teardown (a fresh guest re-mounts on demand). Guarded by
+    /// `bootLock`.
+    private var mountedProjects: [String: String] = [:]
     /// The live guest's ssh mirror port and rootfs dir — synchronous mirrors
     /// of what `ensureBooted` set up (`sshPort` is @Published on main, so it
     /// lags; the session-start path must not race it). Guarded by `bootLock`.
@@ -224,6 +238,7 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         let sfwd = sshForwarder
         guest = nil
         sharedRoot = nil
+        mountedProjects = [:]
         forwarder = nil
         sshForwarder = nil
         currentSshPort = nil
@@ -275,6 +290,73 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             return (rel.isEmpty ? "/workspace" : "/workspace/" + rel, true)
         }
         return ("/workspace", false)
+    }
+
+    /// A filesystem-safe `/projects` subdirectory name for a host folder: the
+    /// sanitized basename plus a short DETERMINISTIC suffix derived from the full
+    /// path, so two different `.../src` folders never collide on one slug while
+    /// the SAME folder always maps to the SAME slug (stable across commands).
+    /// Guaranteed to satisfy `VZMultipleDirectoryShare` name rules (no `/`, not
+    /// empty, well under NAME_MAX).
+    static func projectSlug(hostPath: String) -> String {
+        let host = (hostPath as NSString).standardizingPath
+        let base = (host as NSString).lastPathComponent
+        let safe = String(base.map { ch -> Character in
+            (ch.isLetter || ch.isNumber || ch == "." || ch == "_" || ch == "-") ? ch : "-"
+        })
+        var name = safe
+        if name.isEmpty || name == "." || name == ".." { name = "dir" }
+        if name.count > 40 { name = String(name.suffix(40)) }
+        // FNV-1a over the full path → 6 hex chars. Deterministic (no hashValue,
+        // which is per-process randomized).
+        var h: UInt64 = 1469598103934665603
+        for b in host.utf8 { h = (h ^ UInt64(b)) &* 1099511628211 }
+        return "\(name)-\(String(h & 0xffffff, radix: 16))"
+    }
+
+    /// Where a chat's host working folder lands in the guest, and whether that
+    /// requires a hot-mount. `/workspace` covers the Settings default (and its
+    /// descendants); an already-mounted project folder resolves under its
+    /// `/projects/<slug>`; anything else is a NEW project that must be mounted
+    /// (`mountSlug`/`mountHost` non-nil). Pure — the mount itself is the
+    /// caller's side effect.
+    struct GuestCwd: Equatable {
+        var path: String
+        var mountSlug: String?
+        var mountHost: String?
+        var mapped: Bool
+    }
+
+    static func resolveGuestCwd(hostPath: String?, defaultRoot: String,
+                                mounted: [String: String]) -> GuestCwd {
+        // 1. The default workspace (or a descendant) → /workspace.
+        let onDefault = guestPath(hostPath: hostPath, sharedRoot: defaultRoot)
+        if onDefault.mapped {
+            return GuestCwd(path: onDefault.path, mountSlug: nil, mountHost: nil, mapped: true)
+        }
+        guard let hostPath else {
+            return GuestCwd(path: "/workspace", mountSlug: nil, mountHost: nil, mapped: false)
+        }
+        let host = (hostPath as NSString).standardizingPath
+        // 2. Already hot-mounted project (exact folder or a descendant of one).
+        //    Longest-root-first so a nested mount wins over its ancestor.
+        for (slug, mhost) in mounted.sorted(by: { $0.value.count > $1.value.count }) {
+            let root = (mhost as NSString).standardizingPath
+            let base = "\(VzGuest.guestProjectsPath)/\(slug)"
+            if host == root {
+                return GuestCwd(path: base, mountSlug: nil, mountHost: nil, mapped: true)
+            }
+            let rootWithSep = root.hasSuffix("/") ? root : root + "/"
+            if host.hasPrefix(rootWithSep) {
+                let rel = String(host.dropFirst(rootWithSep.count))
+                return GuestCwd(path: rel.isEmpty ? base : "\(base)/\(rel)",
+                                mountSlug: nil, mountHost: nil, mapped: true)
+            }
+        }
+        // 3. A new project folder — needs a hot-mount at /projects/<slug>.
+        let slug = projectSlug(hostPath: host)
+        return GuestCwd(path: "\(VzGuest.guestProjectsPath)/\(slug)",
+                        mountSlug: slug, mountHost: host, mapped: true)
     }
 
     /// Wrap a command so it runs in the mapped guest dir. `cd` failure is ignored
@@ -701,7 +783,11 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
             DispatchQueue.global(qos: .userInitiated).async {
                 do {
                     let (g, root) = try self.ensureBooted(image: image, workingDirectory: workingDirectory)
-                    let gp = Self.guestPath(hostPath: workingDirectory ?? hostCwd, sharedRoot: root)
+                    // Map the chat's folder to /workspace (the default) or hot-mount
+                    // it at /projects/<slug> on first use — no VM reboot.
+                    let gp = self.resolveAndMountProject(guest: g,
+                                                         hostPath: workingDirectory ?? hostCwd,
+                                                         defaultRoot: root)
                     let wrapped = Self.wrap(command: command, guestCwd: gp.path)
                     let r = try g.exec(wrapped, timeout: timeout)
                     // hvc1 is a tty → tools emit ANSI color + progress animations;
@@ -726,6 +812,88 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
                 }
             }
         }
+    }
+
+    /// Resolve a chat command's guest cwd, hot-mounting the folder at
+    /// `/projects/<slug>` on FIRST use if it isn't the Settings default (or an
+    /// already-mounted project). Runs on the exec thread (never the main
+    /// thread); `bootLock` is taken only to read/update `mountedProjects`, never
+    /// held across a guest `exec`. Returns `mapped: false` only when the folder
+    /// can't be mounted (not a real dir, or the hot-swap failed) — the command
+    /// then runs in `/workspace` with the existing warning.
+    private func resolveAndMountProject(guest g: VzGuest, hostPath: String?,
+                                        defaultRoot: String) -> GuestCwd {
+        let snapshot: [String: String] = {
+            bootLock.lock(); defer { bootLock.unlock() }; return mountedProjects
+        }()
+        let r = Self.resolveGuestCwd(hostPath: hostPath, defaultRoot: defaultRoot, mounted: snapshot)
+        guard let slug = r.mountSlug, let host = r.mountHost else { return r }
+
+        // Only mount a folder that actually exists as a directory on the host.
+        var isDir: ObjCBool = false
+        guard FileManager.default.fileExists(atPath: host, isDirectory: &isDir), isDir.boolValue else {
+            return GuestCwd(path: "/workspace", mountSlug: nil, mountHost: nil, mapped: false)
+        }
+
+        // Serialize the actual mount so a concurrent first-use of a different
+        // folder can't clobber this slug (each rebuilds the FULL share map).
+        mountLock.lock(); defer { mountLock.unlock() }
+        let current: [String: String] = {
+            bootLock.lock(); defer { bootLock.unlock() }; return mountedProjects
+        }()
+        if current[slug] == host {
+            return GuestCwd(path: r.path, mountSlug: nil, mountHost: nil, mapped: true)
+        }
+        var next = current
+        next[slug] = host
+        guard g.setProjectShares(next) else {
+            // Legacy guest without the projects device — fall back to /workspace.
+            return GuestCwd(path: "/workspace", mountSlug: nil, mountHost: nil, mapped: false)
+        }
+        // The runtime `.share` swap usually surfaces the new subdir live; if the
+        // guest hasn't picked it up, an in-guest remount of the projects tag does
+        // (still NO VM reboot, so live CLI sessions survive).
+        if !Self.guestHasProjectDir(g, slug: slug) {
+            _ = try? g.exec("mount -t virtiofs \(VzGuest.projectsTag) \(VzGuest.guestProjectsPath) 2>/dev/null; true",
+                            timeout: 10)
+            if !Self.guestHasProjectDir(g, slug: slug) {
+                return GuestCwd(path: "/workspace", mountSlug: nil, mountHost: nil, mapped: false)
+            }
+        }
+        bootLock.lock(); mountedProjects[slug] = host; bootLock.unlock()
+        record(Entry(source: .system, command: "",
+                     output: "mounted \(host) at \(VzGuest.guestProjectsPath)/\(slug)", exitCode: 0, at: Date()))
+        return GuestCwd(path: r.path, mountSlug: nil, mountHost: nil, mapped: true)
+    }
+
+    /// Ensure a chat's folder is hot-mounted at `/projects/<slug>` when a LIVE
+    /// guest exists — the host-side file tools (writeFile, readFile, …) call
+    /// this so a file-only session still shows up in the VM, not just sessions
+    /// that ran `shell`. Fire-and-forget: the file tool operates on the host
+    /// bytes immediately and never waits on the mount. Deliberately does NOT
+    /// boot a guest — a host-side file write shouldn't spin up a VM; the folder
+    /// mounts when a shell first runs (which does boot). No-op when the sandbox
+    /// is off, no folder was given, or the folder is the default workspace.
+    func ensureProjectMountedAsync(workingDirectory: String?) {
+        guard isEnabled, let wd = workingDirectory else { return }
+        DispatchQueue.global(qos: .utility).async {
+            let live: (g: VzGuest, root: String)? = {
+                self.bootLock.lock(); defer { self.bootLock.unlock() }
+                guard let g = self.guest, !g.isFinished, let root = self.sharedRoot else { return nil }
+                return (g, root)
+            }()
+            guard let live else { return }        // no guest booted → mounts on first shell
+            _ = self.resolveAndMountProject(guest: live.g, hostPath: wd, defaultRoot: live.root)
+        }
+    }
+
+    /// Does `/projects/<slug>` exist in the live guest? (Confirms a hot-mount
+    /// actually surfaced.)
+    private static func guestHasProjectDir(_ g: VzGuest, slug: String) -> Bool {
+        let path = "\(VzGuest.guestProjectsPath)/\(slug)"
+        guard let r = try? g.exec("test -d \(VzGuest.shellQuote(path)) && echo __VZ_OK__", timeout: 10)
+        else { return false }
+        return r.output.contains("__VZ_OK__")
     }
 
     /// Run a command typed by the user in the Sandbox Terminal. Same guest as
@@ -946,22 +1114,19 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
     }
 
     /// Ensure a live guest exists, provisioning the kernel + rootfs on first use.
-    /// Serialized by `bootLock`. Returns the guest and its shared-root host path.
+    /// Serialized by `bootLock`. Returns the guest and its `/workspace` shared
+    /// root (always the Settings default). A live guest is REUSED regardless of
+    /// which chat folder the command targets: a folder outside `/workspace` is
+    /// hot-mounted at `/projects/<slug>` by the caller, never a VM reboot. Only
+    /// a Settings default change (`noteWorkspaceChanged`, which tears the guest
+    /// down) or a dead guest boots a fresh one.
     private func ensureBooted(image: String, workingDirectory: String?) throws -> (VzGuest, String) {
         bootLock.lock(); defer { bootLock.unlock() }
         if let g = guest, !g.isFinished, let root = sharedRoot {
-            if !Self.needsRemount(sharedRoot: root, requestedCwd: workingDirectory) {
-                return (g, root)
-            }
-            // A live CLI session pins the guest: decline the remount loudly
-            // instead of rebooting the VM out from under the session.
-            if let blocked = Self.remountBlockMessage(pinnedLabels: cliPins, needsRemount: true) {
-                throw SandboxError(message: blocked)
-            }
+            return (g, root)
         }
-        // Stale/dead guest, or the working folder moved outside the shared
-        // root (remount) — tear down and boot fresh with the right share.
-        guest?.shutdown(); guest = nil; sharedRoot = nil
+        // Stale/dead guest — tear down and boot fresh sharing the default.
+        guest?.shutdown(); guest = nil; sharedRoot = nil; mountedProjects = [:]
         forwarder?.stop(); forwarder = nil
         sshForwarder?.stop(); sshForwarder = nil
         currentSshPort = nil; rootfsPath = nil
@@ -977,7 +1142,11 @@ final class AgentSandbox: ObservableObject, @unchecked Sendable {
         let provisioner = makeProvisioner()
         let kernel = try provisioner.kernelPath()
         let rootfs = try provisioner.rootfsDir(image: image)
-        let root = workingDirectory ?? Self.fallbackSharedRoot()
+        // `/workspace` is ALWAYS the Settings default (pi/hermes + chats on the
+        // default live here); a chat's own folder is hot-mounted at /projects on
+        // first use. `workingDirectory` no longer selects the boot share.
+        _ = workingDirectory
+        let root = Self.fallbackSharedRoot()
 
         // The image's Env/WorkingDir (written by the pull) feed the init script;
         // absent sidecar (dev rootfs override) → plain defaults.

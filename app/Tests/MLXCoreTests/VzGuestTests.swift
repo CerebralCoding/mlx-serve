@@ -66,6 +66,29 @@ final class VzGuestTests: XCTestCase {
         XCTAssertFalse(s.contains("mount -t virtiofs \(VzGuest.workspaceTag)"))
     }
 
+    func testInitScriptAlwaysMountsProjectsShare() {
+        // The `projects` device is always configured (empty until a chat folder
+        // is hot-mounted), so its mount point must be established at boot — even
+        // with no workspace share.
+        XCTAssertTrue(VzGuest.buildInitScript(config: baseConfig())
+            .contains("mount -t virtiofs \(VzGuest.projectsTag) \(VzGuest.guestProjectsPath)"),
+            "projects tag must be mounted at boot for hot-mounts to surface")
+        var noWs = baseConfig(); noWs.workspacePath = nil
+        XCTAssertTrue(VzGuest.buildInitScript(config: noWs)
+            .contains("mount -t virtiofs \(VzGuest.projectsTag) \(VzGuest.guestProjectsPath)"))
+        XCTAssertTrue(VzGuest.buildInitScript(config: baseConfig())
+            .contains("mkdir -p /proc /sys /dev \(VzGuest.guestProjectsPath)"),
+            "the /projects mount point must be created before the mount")
+    }
+
+    func testMultiDirectoryShareMapsSlugsToHostDirs() {
+        let share = VzGuest.multiDirectoryShare(["proj-abc": "/Users/d/proj", "lib-def": "/Users/d/lib"])
+        XCTAssertEqual(Set(share.directories.keys), ["proj-abc", "lib-def"])
+        XCTAssertEqual(share.directories["proj-abc"]?.url.path, "/Users/d/proj")
+        XCTAssertEqual(VzGuest.multiDirectoryShare([:]).directories.count, 0,
+                       "an empty set is valid — mounts as an empty /projects")
+    }
+
     func testLegacyInitScriptRunsShellOnSecondConsolePort() {
         let s = VzGuest.buildInitScript(config: baseConfig())
         // The shell lives on /dev/hvc1 — a dedicated clean channel. hvc0 keeps

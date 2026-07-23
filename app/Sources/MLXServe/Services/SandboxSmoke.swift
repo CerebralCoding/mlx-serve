@@ -92,6 +92,26 @@ enum SandboxSmoke {
                 check("ls /workspace", expectExit: 0)                  // virtiofs share works
             }
 
+            // Hot-mount: swap the `projects` share on the RUNNING guest and prove
+            // a new /projects/<slug> subdir surfaces WITHOUT a reboot — the whole
+            // point of per-chat folder mounting (live CLI sessions survive). Uses
+            // a fresh temp dir with a marker file; the check mirrors production's
+            // in-guest-remount fallback (still no VM reboot).
+            let hotDir = (NSTemporaryDirectory() as NSString).appendingPathComponent("smoke-hot-\(getpid())")
+            try? FileManager.default.createDirectory(atPath: hotDir, withIntermediateDirectories: true)
+            FileManager.default.createFile(atPath: (hotDir as NSString).appendingPathComponent("MARKER"),
+                                           contents: Data("hi".utf8))
+            if guest.setProjectShares(["smoke-hot": hotDir]) {
+                let live = (try? guest.exec("test -f /projects/smoke-hot/MARKER && echo LIVE", timeout: checkTimeout))?
+                    .output.contains("LIVE") ?? false
+                log("[smoke] hot-mount live-swap surfaced=\(live) (fallback = in-guest remount, no reboot)")
+                check("test -f /projects/smoke-hot/MARKER && echo HOT_OK || (mount -t virtiofs projects /projects 2>/dev/null; test -f /projects/smoke-hot/MARKER && echo HOT_OK)",
+                      expectContains: "HOT_OK")
+            } else {
+                log("[smoke]   ✗ setProjectShares returned false (projects device missing)"); ok = false
+            }
+            try? FileManager.default.removeItem(atPath: hotDir)
+
             guest.shutdown()
 
             // Phase 2: prove the real integration path — ShellHandler routes to

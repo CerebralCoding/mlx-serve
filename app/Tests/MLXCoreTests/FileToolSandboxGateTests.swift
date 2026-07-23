@@ -15,9 +15,14 @@ import XCTest
 ///     or off. The nil-wd "unconfined" lever is gone; yolo tasks anchor at the
 ///     default agent workspace instead (approval stays unrestricted — see
 ///     ApprovalPolicy; confinement is this layer's job).
-///  2. With the sandbox ON, a VM pinned to a workspace that doesn't cover this
-///     session's folder declines file tools with shell's remount-block
-///     semantics (`FileToolSandboxGate`).
+///  2. Every file tool consults `FileToolSandboxGate` (wiring guard below). The
+///     gate's pin-block is now RETIRED: a chat's folder is hot-mounted into the
+///     guest at `/projects/<slug>` on first shell use (no VM reboot, CLI
+///     sessions survive), so a CLI session pinned to `/workspace` no longer
+///     makes any folder unreachable and shell never declines on the pin — so
+///     file tools don't either. `rejectReason` returns nil in every case; the
+///     seam is retained for a future sandbox rule and the wiring is proven via
+///     the gate's `forcedRejection` test hook.
 final class FileToolSandboxGateTests: XCTestCase {
 
     private func makeTempDir() throws -> String {
@@ -69,20 +74,17 @@ final class FileToolSandboxGateTests: XCTestCase {
             sandboxEnabled: true, workingDirectory: "/w", pinnedRoot: "/w", pinnedLabel: "pi"))
     }
 
-    func testSandboxOnPinnedElsewhereRejectsNamingBothPathsAndSession() {
-        let reason = FileToolSandboxGate.rejectReason(
-            sandboxEnabled: true, workingDirectory: "/projects/wksp",
-            pinnedRoot: "/other/root", pinnedLabel: "pi")
-        XCTAssertNotNil(reason, "file tools must agree with shell's remount-block")
-        XCTAssertTrue(reason!.contains("pi"), "must NAME the pinning session: \(reason!)")
-        XCTAssertTrue(reason!.contains("/other/root"), "must name the pinned share: \(reason!)")
-        XCTAssertTrue(reason!.contains("/projects/wksp"), "must name this session's folder: \(reason!)")
-        XCTAssertTrue(reason!.lowercased().contains("close"), "must tell the way out: \(reason!)")
+    func testSandboxOnPinnedElsewhereNowAllowsBecauseHotMounted() {
+        // Retired block: a CLI session pinned elsewhere no longer blocks file
+        // tools, because the session's folder is hot-mounted into the guest at
+        // /projects/<slug> (no reboot) — shell doesn't decline, so neither does
+        // this gate.
+        XCTAssertNil(FileToolSandboxGate.rejectReason(
+            sandboxEnabled: true, workingDirectory: "/some/proj",
+            pinnedRoot: "/other/root", pinnedLabel: "pi"))
     }
 
     func testPinnedWithoutLabelDoesNotReject() {
-        // A stale sharedRoot with no live CLI pin is shell's silent-remount
-        // case — file tools must not block where shell would proceed.
         XCTAssertNil(FileToolSandboxGate.rejectReason(
             sandboxEnabled: true, workingDirectory: "/w", pinnedRoot: "/other", pinnedLabel: nil))
     }
@@ -117,24 +119,47 @@ final class FileToolSandboxGateTests: XCTestCase {
 
     // MARK: Gate wiring — every file tool consults the pin gate
 
-    func testEveryFileToolRejectsWhenPinnedElsewhere() async throws {
-        let pinned = FileToolSandboxGate(sandboxEnabled: { true },
-                                         pinnedWorkspace: { ("/pinned/elsewhere", "hermes") })
+    func testEveryFileToolConsultsTheGate() async throws {
+        // The gate no longer blocks in production (hot-mount), so wiring is
+        // proven with a forced rejection: every file tool must surface it.
+        let sentinel = "__GATE_WIRED__"
+        let forced = FileToolSandboxGate(forcedRejection: { _ in sentinel })
         let dir = try makeTempDir()
         defer { try? FileManager.default.removeItem(atPath: dir) }
 
-        for (name, handler, params) in fileToolCases(gate: pinned, dir: dir) {
+        for (name, handler, params) in fileToolCases(gate: forced, dir: dir) {
             do {
                 _ = try await handler.execute(parameters: params, workingDirectory: dir)
-                XCTFail("\(name) must consult the sandbox pin gate")
+                XCTFail("\(name) must consult the sandbox gate")
             } catch {
-                XCTAssertTrue(error.localizedDescription.contains("hermes"),
+                XCTAssertTrue(error.localizedDescription.contains(sentinel),
                               "\(name) must throw the GATE's error, got: \(error.localizedDescription)")
             }
         }
         XCTAssertFalse(FileManager.default.fileExists(
             atPath: (dir as NSString).appendingPathComponent("f.txt")),
             "a declined writeFile must not have touched the disk")
+    }
+
+    func testEveryFileToolEnsuresItsFolderIsHotMounted() async throws {
+        // A file-only session (never runs `shell`) must still appear in the VM
+        // at /projects/<slug>: every file tool routes its working folder through
+        // the mount hook. `check` runs the hook before the tool body, so the
+        // body's own success is irrelevant here.
+        let dir = try makeTempDir()
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        final class Recorder: @unchecked Sendable { var seen: [String] = [] }
+        let rec = Recorder()
+        let gate = FileToolSandboxGate(sandboxEnabled: { true },
+                                       pinnedWorkspace: { (nil, nil) },
+                                       ensureMounted: { if let wd = $0 { rec.seen.append(wd) } })
+
+        for (_, handler, params) in fileToolCases(gate: gate, dir: dir) {
+            _ = try? await handler.execute(parameters: params, workingDirectory: dir)
+        }
+        XCTAssertEqual(rec.seen.count, 5, "every file tool must ensure its folder is mounted")
+        XCTAssertTrue(rec.seen.allSatisfy { $0 == dir },
+                      "each tool must pass its OWN working folder: \(rec.seen)")
     }
 
     // MARK: Allowed paths stay allowed

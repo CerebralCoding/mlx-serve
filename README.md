@@ -391,7 +391,7 @@ Three flavors, all greedy-equivalent (byte-identical at temp=0 within the first 
 - **PLD** (Prompt Lookup Decoding) — model-agnostic n-gram match in `prompt + generated_tokens`. Default-on (`--pld`); zero per-model setup. Wins on agentic loops, RAG, code editing, anywhere the answer echoes prompt content.
 - **Gemma 4 assistant drafter** — Google's small 4-layer cross-attention drafters (`gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant-bf16`). Opt-in via `--drafter <dir>`. The drafter cross-attends into the target's KV cache — no separate weights duplicated.
 
-![Native MTP head-to-head — LM Studio vs MTPLX vs MLX-serve](docs/perf-pngs/perf-mtp-ladder-26.7.6.png)
+![Native MTP context ladder — MLX-serve vs oMLX & MTPLX (Qwen3.6-27B), 0.5K–64K prefill + decode](docs/perf-pngs/perf-mtp-ladder-26.7.10.png)
 
 *Three engines, one identical checkpoint ([Qwen3.6-27B-MTPLX-Optimized-Speed](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed), 4-bit + its calibrated MTP adapter; Apple M4 Max, coding-agent prompts, temp 0.6, fresh loads, cold prompts, best-of-N per cell). Decode: mlx-serve leads [MTPLX](https://github.com/youssofal/MTPLX) 2.0.2 at all 8 rungs (+11–30%) and LM Studio 0.4.15 — which has no MTP support, so it decodes plain AR — by +54–89%. Prefill: mlx-serve is ahead of MTPLX at all 8 rungs (+1.4–3.7%) and within ±2.5% of LM Studio at every rung while also paying the MTP-history capture that buys its decode lead — all three engines share the same MLX composed-attention floor on this hd-256 hybrid arch. (An earlier revision showed LM Studio "winning" 8K+ prefill by 45–75%; that was its prompt cache reusing the ladder's nested prompts — 2048-token-chunk granular — not prefill speed. Measured cold, its 8K–64K rungs drop from 311/359/368/324 to 239/227/215/189 tok/s.)*
 
@@ -426,11 +426,11 @@ Reproduce with **`./tests/bench.sh --family gemma`** (mlx-serve only — emits p
 
 
 
-![mlx-serve vs LM Studio (GGUF + MLX) · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-pngs/perf-vs-lmstudio-omlx-all-26.7.9.png)
+![mlx-serve vs LM Studio (GGUF + MLX) · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-pngs/perf-vs-lmstudio-omlx-all-26.7.10.png)
 
-*Code completion decode tok/s, identical weights per box (Apple M4 Max, ctx=4096, temp=0). Baseline is **LM Studio GGUF** — the llama.cpp path most LM Studio users actually run — with LM Studio MLX, oMLX, and MTPLX beside it. The blue bar is mlx-serve's best configuration for that model, with the winning speculative mode named in the label (PLD / drafter / native MTP). MTPLX shows 0 where it can't run (it requires its own MTP artifacts).*
+*Code completion decode tok/s, identical weights per box (Apple M4 Max, ctx=4096, temp=0). Baseline is **LM Studio GGUF** — the llama.cpp path most LM Studio users actually run — with LM Studio MLX, oMLX, and MTPLX beside it. The blue bar is mlx-serve's best configuration for that model, with the winning speculative mode named in the label (PLD / drafter / native MTP). MTPLX shows 0 where it can't run (it requires its own MTP artifacts). The Qwen 3.6 27B cell runs oMLX's own oQ4e checkpoint with their native Lightning MTP enabled on both engines — same weights, mlx-serve still wins.*
 
-Reproduce: `./tests/bench.sh --family all --lmstudio --omlx --mtplx`. Requires `lms`, `jq`, `python3`, `matplotlib` (CSV: [`docs/perf-csvs/all-26.7.9.csv`](docs/perf-csvs/all-26.7.9.csv)).
+Reproduce: `./tests/bench.sh --family all --lmstudio --omlx --mtplx`. Requires `lms`, `jq`, `python3`, `matplotlib` (CSV: [`docs/perf-csvs/all-26.7.10.csv`](docs/perf-csvs/all-26.7.10.csv)).
 
 ## FAQ
 

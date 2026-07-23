@@ -1544,12 +1544,11 @@ struct ChatDetailView: View {
                     } else {
                         SecurityScopedBookmark.clear(name: slot)
                     }
-                    // A live guest sharing the OLD folder remounts eagerly
-                    // (torn down now, rebooted on the next command) so shell
-                    // AND the file-tool gate see the new folder immediately.
-                    // Pinned (live CLI session) → declined; the next command's
-                    // error explains, same as before this hook existed.
-                    AgentSandbox.shared.noteWorkspaceChanged(newValue)
+                    // No eager remount: /workspace stays the Settings default
+                    // (pi/hermes live there). This chat's folder is hot-mounted
+                    // at /projects/<slug> the first time a tool runs — no VM
+                    // reboot, so live CLI sessions are never torn down. Only a
+                    // Settings default change remounts /workspace.
                 }
             }
         )

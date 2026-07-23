@@ -115,6 +115,57 @@ final class AgentSandboxTests: XCTestCase {
                       "sibling sharing a path prefix is NOT under the root")
     }
 
+    // MARK: per-chat project folders → /projects/<slug> (hot-mount on first use)
+
+    func testProjectSlugIsDeterministicAndFilesystemSafe() {
+        let a = AgentSandbox.projectSlug(hostPath: "/Users/d/My Project")
+        XCTAssertEqual(a, AgentSandbox.projectSlug(hostPath: "/Users/d/My Project"),
+                       "same path → same slug (stable across commands)")
+        XCTAssertFalse(a.contains("/"), "slug must be a single path segment: \(a)")
+        XCTAssertFalse(a.contains(" "), "slug must be filesystem-safe: \(a)")
+        XCTAssertTrue(a.hasPrefix("My-Project-"), "keeps a readable basename: \(a)")
+    }
+
+    func testProjectSlugDisambiguatesSameBasename() {
+        // Two different "/src" folders must not collide on one guest subdir.
+        let a = AgentSandbox.projectSlug(hostPath: "/Users/d/alpha/src")
+        let b = AgentSandbox.projectSlug(hostPath: "/Users/d/beta/src")
+        XCTAssertNotEqual(a, b, "distinct paths sharing a basename need distinct slugs")
+    }
+
+    func testResolveDefaultFolderMapsToWorkspace() {
+        let r = AgentSandbox.resolveGuestCwd(hostPath: "/Users/d/ws/sub",
+                                             defaultRoot: "/Users/d/ws", mounted: [:])
+        XCTAssertEqual(r.path, "/workspace/sub")
+        XCTAssertNil(r.mountSlug, "the default workspace never needs a project mount")
+        XCTAssertTrue(r.mapped)
+    }
+
+    func testResolveNewFolderRequestsAHotMount() {
+        let r = AgentSandbox.resolveGuestCwd(hostPath: "/Users/d/other/proj",
+                                             defaultRoot: "/Users/d/ws", mounted: [:])
+        XCTAssertEqual(r.mountHost, "/Users/d/other/proj", "the folder must be scheduled for mounting")
+        let slug = AgentSandbox.projectSlug(hostPath: "/Users/d/other/proj")
+        XCTAssertEqual(r.mountSlug, slug)
+        XCTAssertEqual(r.path, "/projects/\(slug)")
+        XCTAssertTrue(r.mapped)
+    }
+
+    func testResolveAlreadyMountedFolderNeedsNoRemount() {
+        let slug = AgentSandbox.projectSlug(hostPath: "/Users/d/other/proj")
+        let mounted = [slug: "/Users/d/other/proj"]
+        // Exact folder.
+        let r1 = AgentSandbox.resolveGuestCwd(hostPath: "/Users/d/other/proj",
+                                              defaultRoot: "/Users/d/ws", mounted: mounted)
+        XCTAssertEqual(r1.path, "/projects/\(slug)")
+        XCTAssertNil(r1.mountSlug, "an already-mounted folder must NOT trigger another mount")
+        // Descendant of a mounted folder.
+        let r2 = AgentSandbox.resolveGuestCwd(hostPath: "/Users/d/other/proj/src",
+                                              defaultRoot: "/Users/d/ws", mounted: mounted)
+        XCTAssertEqual(r2.path, "/projects/\(slug)/src")
+        XCTAssertNil(r2.mountSlug)
+    }
+
     // MARK: command wrapping (cd into mapped dir, then run)
 
     func testWrapCommandCdsIntoGuestPath() {

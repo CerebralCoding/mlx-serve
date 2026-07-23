@@ -225,6 +225,11 @@ final class VzGuest {
         /// Host directory shared into the guest at `guestWorkspacePath` (rw).
         var workspacePath: String? = nil
         var guestWorkspacePath: String = "/workspace"
+        /// Per-chat project folders to expose under `/projects/<slug>` at boot
+        /// (slug → host path). Usually empty at boot — folders are hot-mounted
+        /// on first use via `setProjectShares`; this seeds any that were already
+        /// in use before a re-provision.
+        var projectShares: [String: String] = [:]
         /// "KEY=VALUE" entries from the OCI image config, exported before the shell.
         var imageEnv: [String] = []
         /// Directory the shell starts in (best-effort `cd`).
@@ -276,6 +281,13 @@ final class VzGuest {
     // Virtiofs tags + boot plumbing (shared with the unit tests).
     static let rootfsTag = "rootfs"
     static let workspaceTag = "workspace"
+    /// A SECOND workspace device, always present, backed by a
+    /// `VZMultipleDirectoryShare` so per-chat project folders can be hot-mounted
+    /// as `/projects/<slug>` subdirectories on a LIVE guest (the runtime
+    /// `VZVirtioFileSystemDevice.share` is read/write) — no VM reboot, so live
+    /// CLI sessions survive. Empty at boot; `setProjectShares` populates it.
+    static let projectsTag = "projects"
+    static let guestProjectsPath = "/projects"
     static let initScriptGuestPath = "/.vz-init"
     /// Where the guest agent is injected, alongside `/.vz-init`. Host-injected
     /// rather than baked into the image, so ANY base image works.
@@ -331,7 +343,7 @@ final class VzGuest {
         var s = """
         #!/bin/sh
         export PATH=/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin HOME=/root TERM=linux
-        mkdir -p /proc /sys /dev\(config.workspacePath != nil ? " \(config.guestWorkspacePath)" : "") 2>/dev/null
+        mkdir -p /proc /sys /dev \(guestProjectsPath)\(config.workspacePath != nil ? " \(config.guestWorkspacePath)" : "") 2>/dev/null
         mount -t proc proc /proc 2>/dev/null
         mount -t sysfs sysfs /sys 2>/dev/null
         mount -t devtmpfs devtmpfs /dev 2>/dev/null
@@ -340,6 +352,10 @@ final class VzGuest {
         if config.workspacePath != nil {
             s += "mount -t virtiofs \(workspaceTag) \(config.guestWorkspacePath) 2>/dev/null\n"
         }
+        // The `projects` device is always configured (empty until a chat folder
+        // is hot-mounted), so its mount point is always established at boot —
+        // `setProjectShares` then makes subdirectories appear live under it.
+        s += "mount -t virtiofs \(projectsTag) \(guestProjectsPath) 2>/dev/null\n"
         if config.network {
             // The kernel already DHCPed eth0 (`ip=dhcp` on the cmdline) and wrote
             // its answer to /proc/net/pnp. Userspace clients are only a fallback
@@ -483,6 +499,35 @@ final class VzGuest {
         return shell.isEmpty ? boot : boot + "\n--- shell channel ---\n" + shell.suffix(2000)
     }
 
+    /// Build a `VZMultipleDirectoryShare` from a slug→host-path map (the shared
+    /// dictionary keys are the guest subdirectory names). Empty map = an empty
+    /// share, which is valid and mounts as an empty `/projects`.
+    static func multiDirectoryShare(_ shares: [String: String]) -> VZMultipleDirectoryShare {
+        var dict: [String: VZSharedDirectory] = [:]
+        for (slug, host) in shares {
+            dict[slug] = VZSharedDirectory(url: URL(fileURLWithPath: host), readOnly: false)
+        }
+        return VZMultipleDirectoryShare(directories: dict)
+    }
+
+    /// Hot-swap the LIVE guest's `projects` share to `shares` (slug → host path).
+    /// The runtime `VZVirtioFileSystemDevice.share` is read/write, so the guest's
+    /// `/projects` mount reflects the new set of subdirectories WITHOUT a reboot.
+    /// Pass the FULL desired set each call (additive by replacement). Returns
+    /// false when there is no live VM or the `projects` device is missing (a
+    /// legacy guest that predates it) — the caller then falls back to a remount.
+    @discardableResult
+    func setProjectShares(_ shares: [String: String]) -> Bool {
+        guard let vm else { return false }
+        return vmQueue.sync {
+            guard let dev = vm.directorySharingDevices.first(where: {
+                ($0 as? VZVirtioFileSystemDevice)?.tag == Self.projectsTag
+            }) as? VZVirtioFileSystemDevice else { return false }
+            dev.share = Self.multiDirectoryShare(shares)
+            return true
+        }
+    }
+
     // MARK: Boot
 
     /// Boot the guest and wait for its shell to be ready. Blocking — call off the
@@ -558,6 +603,13 @@ final class VzGuest {
                 directory: VZSharedDirectory(url: URL(fileURLWithPath: ws), readOnly: false))
             shares.append(wsDev)
         }
+        // The `projects` device is ALWAYS present (even with no folders yet) so
+        // `setProjectShares` can hot-add subdirectories to a running guest — VZ
+        // has no filesystem-device hotplug, only a runtime `.share` swap on a
+        // device that already exists.
+        let projDev = VZVirtioFileSystemDeviceConfiguration(tag: Self.projectsTag)
+        projDev.share = Self.multiDirectoryShare(cfg.projectShares)
+        shares.append(projDev)
         vmConfig.directorySharingDevices = shares
 
         vmConfig.entropyDevices = [VZVirtioEntropyDeviceConfiguration()]

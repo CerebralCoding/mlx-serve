@@ -431,13 +431,33 @@ jobs:
         if: always()
         run: security delete-keychain $RUNNER_TEMP/signing.keychain-db || true
 
+      # Pulls the top entry out of CHANGELOG.md (from its "## v..." heading
+      # down to, but not including, the "---" separator) so the release body
+      # matches what we already wrote by hand instead of GitHub's auto-generated
+      # commit list.
+      - name: Extract changelog entry
+        if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
+        id: changelog
+        run: |
+          ENTRY=$(awk '
+            /^## / { c++; if (c==2) exit }
+            /^---$/ { if (c==1) exit }
+            c==1 { print }
+          ' CHANGELOG.md)
+          {
+            echo "notes<<CHANGELOG_EOF"
+            echo "$ENTRY"
+            echo "CHANGELOG_EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Create Release
         if: ${{ !inputs.dry_run && github.event_name != 'pull_request' }}
         uses: softprops/action-gh-release@v2
         with:
           tag_name: ${{ steps.version.outputs.tag }}
           name: mlx-serve v${{ steps.version.outputs.version }}
-          generate_release_notes: true
+          body: ${{ steps.changelog.outputs.notes }}
+          draft: true
           files: |
             mlx-serve-bin-macos-arm64.tar.gz
             MLXCore.dmg

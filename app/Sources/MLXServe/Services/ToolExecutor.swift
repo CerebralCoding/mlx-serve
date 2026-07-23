@@ -45,25 +45,39 @@ struct FileToolSandboxGate: Sendable {
     /// when no live pinned guest exists — then shell would remount silently,
     /// so file tools must not block either.
     var pinnedWorkspace: () -> (root: String?, label: String?) = { AgentSandbox.shared.pinnedWorkspace }
+    /// Test seam: force a rejection so each file tool's gate wiring stays
+    /// provable now that production never blocks on the pin (hot-mount shares
+    /// any folder). Nil in production.
+    var forcedRejection: ((String?) -> String?)? = nil
+    /// Every file tool hits this chokepoint, so it's where a host-side file op
+    /// ensures its folder is hot-mounted into a LIVE guest — otherwise a session
+    /// that only ever writes/reads files (never `shell`) never appears in the
+    /// VM at /projects/<slug>. Fire-and-forget; injectable so tests don't touch
+    /// the shared guest.
+    var ensureMounted: (String?) -> Void = { AgentSandbox.shared.ensureProjectMountedAsync(workingDirectory: $0) }
 
     func check(workingDirectory: String?) throws {
+        if let forced = forcedRejection, let reason = forced(workingDirectory) {
+            throw ToolError.executionFailed(reason)
+        }
         let pin = pinnedWorkspace()
         if let reason = Self.rejectReason(sandboxEnabled: sandboxEnabled(),
                                           workingDirectory: workingDirectory,
                                           pinnedRoot: pin.root, pinnedLabel: pin.label) {
             throw ToolError.executionFailed(reason)
         }
+        ensureMounted(workingDirectory)
     }
 
-    /// Pure verdict (unit-tested): nil = proceed. Only the PIN question — a
-    /// nil working directory is answered by `resolveAndConfine` for all modes.
+    /// Pure verdict (unit-tested): nil = proceed. A chat's working folder is now
+    /// hot-mounted into the guest at `/projects/<slug>` on first shell use — no
+    /// VM reboot, so a CLI session pinned to `/workspace` no longer makes any
+    /// folder unreachable. shell therefore never declines on the pin, so file
+    /// tools don't either. Confinement + the mandatory-working-directory rule
+    /// stay at `resolveAndConfine`; this always returns nil, retained as a
+    /// stable seam for any future sandbox rule.
     static func rejectReason(sandboxEnabled: Bool, workingDirectory: String?,
                              pinnedRoot: String?, pinnedLabel: String?) -> String? {
-        guard sandboxEnabled, let wd = workingDirectory else { return nil }
-        if let root = pinnedRoot, let label = pinnedLabel,
-           AgentSandbox.needsRemount(sharedRoot: root, requestedCwd: wd) {
-            return "a sandboxed \(label) session pins the sandbox to \(root) — this session's working folder \(wd) is outside that share, so file tools are blocked. Close the \(label) session, or move the working folder back under \(root)."
-        }
         return nil
     }
 }

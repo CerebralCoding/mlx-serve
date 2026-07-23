@@ -236,6 +236,21 @@ pub const SamplingParams = struct {
     constraint: ?*Constraint = null,
 };
 
+/// A speculative decode step (PLD / drafter / MTP) cannot honor a grammar
+/// constraint — the drafts bypass the per-token grammar mask — nor per-token
+/// logprobs, which the draft path never captures. The scheduler and server
+/// already select a spec mode only when both are absent, but `nextPld` /
+/// `nextDrafter` / `nextMtp` only *documented* that with `std.debug.assert`,
+/// which compiles out in the ReleaseFast build users actually run (issue #97).
+/// A future dispatch bug that let a constrained request reach a spec step would
+/// then read the constrained branch's placeholder token as a real commit and
+/// stream silently off-schema output as a normal 200. So the spec steps gate on
+/// this real, release-enforced check and return `error.SpecDecodeUnsupported`
+/// instead of asserting.
+fn specDecodeUnsupported(sampling: SamplingParams, logprobs_n: u32) bool {
+    return sampling.constraint != null or logprobs_n != 0;
+}
+
 /// Generation result (for non-streaming use).
 pub const GenerationResult = struct {
     text: []u8,
@@ -1644,8 +1659,11 @@ pub const Generator = struct {
         key_len: u32,
     ) !?PldStepResult {
         if (self.done) return null;
-        std.debug.assert(self.sampling.constraint == null); // PLD + grammar not supported
-        std.debug.assert(self.logprobs_n == 0); // PLD + logprobs not supported
+        // Release-enforced guard (issue #97): PLD cannot honor a grammar
+        // constraint or logprobs. These were std.debug.asserts, compiled out in
+        // ReleaseFast; fail loud instead of streaming off-schema output if a
+        // dispatch bug ever routes such a request here.
+        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
         // Runtime acceptance gate: if a prior step set the flag, fall back
         // to the regular `next()` path. Under v2, PLD's exit invariant has
@@ -2126,8 +2144,9 @@ pub const Generator = struct {
         if (self.done) return null;
         std.debug.assert(self.drafter != null);
         std.debug.assert(self.has_last_hidden); // captured at init or last accept
-        std.debug.assert(self.sampling.constraint == null); // grammar + drafter unsupported
-        std.debug.assert(self.logprobs_n == 0); // logprobs + drafter unsupported
+        // Release-enforced guard (issue #97): the drafter path cannot honor a
+        // grammar constraint or logprobs (compiled-out asserts before).
+        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
         // Runtime acceptance gate: if a prior step set the flag, fall back
         // to the regular `next()` path. Drafter's exit invariant is "t1 NOT
@@ -2935,8 +2954,9 @@ pub const Generator = struct {
         std.debug.assert(self.mtp != null);
         std.debug.assert(self.mtp_cache != null);
         std.debug.assert(self.has_last_hidden);
-        std.debug.assert(self.sampling.constraint == null); // grammar + MTP unsupported
-        std.debug.assert(self.logprobs_n == 0); // logprobs + MTP unsupported
+        // Release-enforced guard (issue #97): the MTP path cannot honor a
+        // grammar constraint or logprobs (compiled-out asserts before).
+        if (specDecodeUnsupported(self.sampling, self.logprobs_n)) return error.SpecDecodeUnsupported;
 
         // Runtime acceptance gate: same hand-off contract as the drafter
         // (`next()`'s transition shim seeds pending_logits).
@@ -6321,6 +6341,21 @@ test "SamplingParams custom values" {
     try testing.expectApproxEqAbs(@as(f32, 0.9), params.top_p, 0.001);
     try testing.expectEqual(@as(u32, 40), params.top_k);
     try testing.expectEqual(@as(u64, 42), params.seed.?);
+}
+
+test "specDecodeUnsupported: release-enforced guard for spec + constraint/logprobs (issue #97)" {
+    // Speculative decode (PLD/drafter/MTP) cannot honor a grammar constraint or
+    // per-token logprobs. nextPld/nextDrafter/nextMtp only asserted this, which
+    // compiles out in ReleaseFast (issue #97) — this is the real check they now
+    // use to fail loud instead of streaming silently off-schema output.
+    try testing.expect(!specDecodeUnsupported(.{}, 0)); // plain sampling → spec OK
+    try testing.expect(specDecodeUnsupported(.{}, 1)); // any logprobs → not OK
+    try testing.expect(specDecodeUnsupported(.{}, 5));
+    // A grammar constraint present → not OK. The guard only null-checks the
+    // pointer (never dereferences), so a dummy address is sufficient here.
+    var dummy: Constraint = undefined;
+    try testing.expect(specDecodeUnsupported(.{ .constraint = &dummy }, 0));
+    try testing.expect(specDecodeUnsupported(.{ .constraint = &dummy }, 3));
 }
 
 test "GenerationResult fields" {

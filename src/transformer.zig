@@ -7063,6 +7063,10 @@ pub const Transformer = struct {
         self.spec_capture_ssm = ctx.capture_ssm_seq;
         defer self.spec_capture_ssm = false;
 
+        // Decode sub-block profiler: start the clock before embedding.
+        const prof_on = decodeProfileEnabled();
+        var pclk: ProfClock = if (prof_on) ProfClock.init() else undefined;
+
         var h = try self.embedding(token_ids);
 
         // Splice vision embeddings at image_token_id positions (prefill only)
@@ -7072,6 +7076,11 @@ pub const Transformer = struct {
         const batch: c_int = x_shape[0];
         const seq_len: c_int = x_shape[1];
         const is_prefill = seq_len > 1;
+        const prof = prof_on and seq_len == 1; // profile decode only
+        if (prof) {
+            try mlx.check(mlx.mlx_array_eval(h));
+            decode_prof.embed_ns += pclk.lap();
+        }
 
         // Qwen3-VL interleaved M-RoPE: build the per-prefill-chunk cos/sin once
         // (shared by every full-attn layer this forward), freed after the loop.
@@ -7143,6 +7152,10 @@ pub const Transformer = struct {
                     try self.gatedFullAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill),
             };
             defer _ = mlx.mlx_array_free(attn_out);
+            if (prof) {
+                try mlx.check(mlx.mlx_array_eval(attn_out));
+                decode_prof.attn_ns += pclk.lap();
+            }
 
             if (is_gemma4) {
                 h = try self.gemma4MoeLayerTail(h, attn_out, lw, ctx.use_encoder_scalars);
@@ -7165,6 +7178,11 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_add(&h_next, h, mlp_out, self.s));
                 _ = mlx.mlx_array_free(h);
                 h = h_next;
+            }
+
+            if (prof) {
+                try mlx.check(mlx.mlx_array_eval(h));
+                decode_prof.mlp_ns += pclk.lap();
             }
 
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and (layer_idx + 1) % moe_eval_cadence == 0) {
@@ -7208,6 +7226,13 @@ pub const Transformer = struct {
             const capped = try self.applySoftcap(logits);
             _ = mlx.mlx_array_free(logits);
             logits = capped;
+        }
+
+        if (prof) {
+            try mlx.check(mlx.mlx_array_eval(logits));
+            decode_prof.lmhead_ns += pclk.lap();
+            decode_prof.calls += 1;
+            if (decode_prof.calls % 64 == 0) decodeProfReport();
         }
 
         return logits;
@@ -9348,11 +9373,37 @@ pub const Transformer = struct {
         return self.moeMLP2(x, x, mw);
     }
 
+    /// Decode-width expert projection via take + batched quantized_matmul,
+    /// dodging our libmlx's serialized gather_qmm. `x_bc` is the [K,1,in] input
+    /// (per-expert broadcast); `inds_flat` is the [K] selected-expert index
+    /// vector. Returns [K,1,out]. Caller owns the result.
+    fn batchedExpertMm(self: *Transformer, x_bc: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, inds_flat: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode) !mlx.mlx_array {
+        var w_k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w_k);
+        try mlx.check(mlx.mlx_take_axis(&w_k, w, inds_flat, 0, self.s));
+        var sc_k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc_k);
+        try mlx.check(mlx.mlx_take_axis(&sc_k, sc, inds_flat, 0, self.s));
+        var bi_k = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bi_k);
+        var bi_arg = mlx.mlx_array{ .ctx = null };
+        if (bi.ctx != null) {
+            try mlx.check(mlx.mlx_take_axis(&bi_k, bi, inds_flat, 0, self.s));
+            bi_arg = bi_k;
+        }
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_quantized_matmul(&out, x_bc, w_k, sc_k, bi_arg, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), self.s));
+        return out; // [K, 1, out]
+    }
+
     /// MoE MLP with separate router and expert inputs.
     /// router_x: input for routing (raw hidden states).
     /// expert_x: input for expert computation (possibly normalized).
     fn moeMLP2(self: *Transformer, router_x: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const cfg = &self.config;
+        // Decode MoE-internals profiler (MLX_SERVE_DECODE_PROFILE=1, S==1 only).
+        const moe_prof = decodeProfileEnabled() and mlx.getShape(expert_x)[1] == 1;
+        var mclk: ProfClock = if (moe_prof) ProfClock.init() else undefined;
         // Per-expert-weight params: mixed-precision MoE checkpoints vary bits
         // (and, with non-affine modes, group size + mode) per weight — resolve
         // each individually. gate/up consume the hidden dim; down consumes the
@@ -9425,6 +9476,12 @@ pub const Transformer = struct {
         //   on MoE: at block_size=4 + top_k=8 the old `total_inds >= 64`
         //   threshold left verify (32 inds) on the slow scatter path while the
         //   sorted path's argsort overhead is negligible at that size.
+        if (moe_prof) {
+            try mlx.check(mlx.mlx_array_eval(inds));
+            try mlx.check(mlx.mlx_array_eval(norm_scores));
+            decode_prof.moe_router_ns += mclk.lap();
+        }
+
         const x_shape = mlx.getShape(expert_x);
         const B = x_shape[0];
         const S = x_shape[1];
@@ -9521,8 +9578,43 @@ pub const Transformer = struct {
             const hidden = mlx.getShape(down_unsorted)[1];
             const bskh_shape = [_]c_int{ B, S, K, hidden };
             try mlx.check(mlx.mlx_reshape(&down_out, down_unsorted, &bskh_shape, 4, self.s));
+        } else if (B * S == 1 and useBatchedExpertDecode(self) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null) {
+            // ── Decode fast path: take experts + batched quantized_matmul ──
+            // Dodges our libmlx's serialized decode gather_qmm. A per-arch
+            // VALIDATED opt-in (laguna by default) — NOT default-on-for-all-MoE:
+            // on small-expert MoEs (gemma4/qwen3.6) the take-materialization is a
+            // net loss vs gather. See `useBatchedExpertDecode` / the policy test.
+            // Quantized experts only (dense bf16 has null scales → gather path).
+            var inds_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(inds_flat);
+            const kshape = [_]c_int{K};
+            try mlx.check(mlx.mlx_reshape(&inds_flat, inds, &kshape, 1, self.s));
+
+            // x_bc: expert_x [B,S,D] → [1,1,D] → broadcast [K,1,D]
+            var x_1d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x_1d);
+            const x1_shape = [_]c_int{ 1, 1, D };
+            try mlx.check(mlx.mlx_reshape(&x_1d, expert_x, &x1_shape, 3, self.s));
+            var x_bc = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x_bc);
+            const bc_shape = [_]c_int{ K, 1, D };
+            try mlx.check(mlx.mlx_broadcast_to(&x_bc, x_1d, &bc_shape, 3, self.s));
+
+            const gate_out = try self.batchedExpertMm(x_bc, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, inds_flat, gate_qp.bits, gate_qp.group_size, gate_qp.mode); // [K,1,inter]
+            defer _ = mlx.mlx_array_free(gate_out);
+            const up_out = try self.batchedExpertMm(x_bc, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, inds_flat, up_qp.bits, up_qp.group_size, up_qp.mode); // [K,1,inter]
+            defer _ = mlx.mlx_array_free(up_out);
+
+            const expert_act = try self.computeGeglu(gate_out, up_out); // [K,1,inter]
+            defer _ = mlx.mlx_array_free(expert_act);
+
+            const down = try self.batchedExpertMm(expert_act, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, inds_flat, down_qp.bits, down_qp.group_size, down_qp.mode); // [K,1,hidden]
+            defer _ = mlx.mlx_array_free(down);
+            const hidden = mlx.getShape(down)[mlx.getShape(down).len - 1];
+            const bskh_shape = [_]c_int{ B, S, K, hidden };
+            try mlx.check(mlx.mlx_reshape(&down_out, down, &bskh_shape, 4, self.s)); // [B,S,K,hidden]
         } else {
-            // ── Decode / small-prefill path ──
+            // ── Decode / small-prefill path (gather_qmm) ──
             const exp_shape = [_]c_int{ B, S, 1, 1, D };
             var x_exp = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(x_exp);
@@ -9554,6 +9646,11 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_squeeze(&down_out, down_5d, self.s)); // [B, S, K, hidden]
         }
 
+        if (moe_prof) {
+            try mlx.check(mlx.mlx_array_eval(down_out));
+            decode_prof.moe_experts_ns += mclk.lap();
+        }
+
         // Weight by scores: down_out * norm_scores[..., None] → sum over K
         var scores_exp = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(scores_exp);
@@ -9580,6 +9677,10 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_array_free(sh_down);
             var result = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_add(&result, expert_sum, sh_down, self.s));
+            if (moe_prof) {
+                try mlx.check(mlx.mlx_array_eval(result));
+                decode_prof.moe_shared_ns += mclk.lap();
+            }
             return result;
         }
 
@@ -11005,6 +11106,112 @@ fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: 
     try mlx.check(mlx.mlx_astype(&norm_scores, scaled, .bfloat16, s));
 
     return .{ .inds = inds, .norm_scores = norm_scores };
+}
+
+// ── Decode sub-block profiler (MLX_SERVE_DECODE_PROFILE=1) ──
+// Serializes the S=1 decode forward with per-sub-block evals to attribute the
+// per-token GPU cost across embed / attn / mlp / lm_head. DIAGNOSTIC ONLY: the
+// evals defeat the async pipeline (absolute tok/s drops while active), so the
+// signal is the RELATIVE split plus the serialized total vs the pipelined
+// per-token time — a serialized total near the pipelined per-token means we are
+// compute-bound; far below it means the gap is dispatch/pipeline overhead.
+const DecodeProf = struct {
+    calls: u64 = 0,
+    embed_ns: u64 = 0,
+    attn_ns: u64 = 0,
+    mlp_ns: u64 = 0,
+    lmhead_ns: u64 = 0,
+    // MoE internals (summed across all MoE layers per token)
+    moe_router_ns: u64 = 0,
+    moe_experts_ns: u64 = 0,
+    moe_shared_ns: u64 = 0,
+};
+var decode_prof: DecodeProf = .{};
+var decode_prof_enabled: ?bool = null;
+
+// Self-contained monotonic lap timer (this Zig nightly has no std.time.Timer;
+// the repo times via std.Io). `lap()` returns ns since the previous lap.
+const ProfClock = struct {
+    io: std.Io,
+    start: std.Io.Timestamp,
+    mark_ns: u64 = 0,
+    fn init() ProfClock {
+        const io = std.Io.Threaded.global_single_threaded.io();
+        return .{ .io = io, .start = std.Io.Timestamp.now(io, .boot) };
+    }
+    fn lap(self: *ProfClock) u64 {
+        const cum: u64 = @intCast(self.start.untilNow(self.io, .boot).nanoseconds);
+        const d = cum - self.mark_ns;
+        self.mark_ns = cum;
+        return d;
+    }
+};
+
+fn decodeProfileEnabled() bool {
+    if (decode_prof_enabled) |v| return v;
+    const v = std.c.getenv("MLX_SERVE_DECODE_PROFILE") != null;
+    decode_prof_enabled = v;
+    return v;
+}
+
+// MoE decode expert compute: our self-built libmlx serializes `gather_qmm` at
+// decode width (~10× vs a batched `quantized_matmul`; plain qmv overlaps fine —
+// verified by the MoE gather µbench). So at S==1 we CAN compute the top-K experts
+// as `take(experts) + broadcast(x) + batched quantized_matmul` (batchedExpertMm)
+// instead of one gather_qmm. Numerically the same per-expert matmul; not bit-
+// identical to the gather kernel (different reduction order, qmv-vs-qmm class).
+//
+// But this is a per-arch VALIDATED opt-in, NOT default-on-for-all-MoE. The
+// take-materialization (extracting the top-K experts from the bank every token)
+// only pays off where the serialized gather dominates — Laguna 2-bit large
+// experts: 17→48 tok/s. On small-expert MoEs the materialization overhead is a
+// NET LOSS: gemma4-26B-A4B measured 114→85 and Qwen3.6-MoE regressed too when
+// this path was briefly default-on (the 26.7.10 bench). Same class as the
+// "eligibility predicate silently adopts every matching shape" kernel rule.
+//
+// Policy (pure, unit-tested by `batchedExpertDecodePolicy` test):
+//   - MLX_SERVE_MOE_GATHER_DECODE=1  → hard force gather (beats everything).
+//   - MLX_SERVE_MOE_BATCHED_DECODE=1 → hard force batched (for A/B on any arch).
+//   - otherwise                      → batched ONLY for laguna, gather for the rest.
+fn batchedExpertDecodePolicy(model_type: []const u8, gather_force: bool, batched_force: bool) bool {
+    if (gather_force) return false;
+    if (batched_force) return true;
+    return std.mem.eql(u8, model_type, "laguna");
+}
+
+var moe_gather_force_env: ?bool = null;
+var moe_batched_force_env: ?bool = null;
+fn envFlagCached(cache: *?bool, name: [*:0]const u8) bool {
+    if (cache.*) |v| return v;
+    const v = std.c.getenv(name) != null;
+    cache.* = v;
+    return v;
+}
+fn useBatchedExpertDecode(self: *const Transformer) bool {
+    return batchedExpertDecodePolicy(
+        self.config.model_type,
+        envFlagCached(&moe_gather_force_env, "MLX_SERVE_MOE_GATHER_DECODE"),
+        envFlagCached(&moe_batched_force_env, "MLX_SERVE_MOE_BATCHED_DECODE"),
+    );
+}
+
+fn decodeProfReport() void {
+    const n = decode_prof.calls;
+    if (n == 0) return;
+    const per = struct {
+        fn ms(ns: u64, calls: u64) f64 {
+            return @as(f64, @floatFromInt(ns)) / @as(f64, @floatFromInt(calls)) / 1.0e6;
+        }
+    };
+    const e = per.ms(decode_prof.embed_ns, n);
+    const a = per.ms(decode_prof.attn_ns, n);
+    const m = per.ms(decode_prof.mlp_ns, n);
+    const l = per.ms(decode_prof.lmhead_ns, n);
+    const mr = per.ms(decode_prof.moe_router_ns, n);
+    const mx_ = per.ms(decode_prof.moe_experts_ns, n);
+    const ms_ = per.ms(decode_prof.moe_shared_ns, n);
+    log.info("[decode-prof] n={d} serial/tok={d:.2}ms  embed={d:.2} attn={d:.2} mlp={d:.2} lmhead={d:.2} ms | moe: router={d:.2} experts={d:.2} shared={d:.2} ms\n", .{ n, e + a + m + l, e, a, m, l, mr, mx_, ms_ });
+    decode_prof = .{};
 }
 
 /// Gathered matmul for MoE expert dispatch — handles both quantized and dense bf16.
@@ -13062,6 +13269,26 @@ test "appendHybridMlpWeights skips dense fields with null ctx (UD dense bf16)" {
     try testing.expectEqual(@as(usize, 3), mlx.mlx_vector_array_size(vec));
 }
 
+test "batchedExpertDecodePolicy: batched decode is a validated per-arch opt-in" {
+    // The batchedExpertMm decode path (take + batched quantized_matmul) dodges
+    // our self-built libmlx's serialized decode gather_qmm. It is a big win only
+    // where the per-token gather cost dominates (Laguna 2-bit large experts:
+    // 17→48 tok/s) and a NET LOSS where experts are small and the take-
+    // materialization overhead dominates (gemma4-26B-A4B: 114→85, Qwen3.6-MoE
+    // likewise — captured in the 26.7.10 bench). So it must NEVER be default-on
+    // for all quantized MoE — only Laguna opts in by default.
+    try testing.expect(batchedExpertDecodePolicy("laguna", false, false));
+    try testing.expect(!batchedExpertDecodePolicy("gemma4_text", false, false));
+    try testing.expect(!batchedExpertDecodePolicy("qwen3_5_moe", false, false));
+    try testing.expect(!batchedExpertDecodePolicy("hy_v3", false, false));
+    // MLX_SERVE_MOE_BATCHED_DECODE forces it on for any arch (experimentation A/B).
+    try testing.expect(batchedExpertDecodePolicy("gemma4_text", false, true));
+    // MLX_SERVE_MOE_GATHER_DECODE is the hard override: beats both the laguna
+    // default and the batched force.
+    try testing.expect(!batchedExpertDecodePolicy("laguna", true, false));
+    try testing.expect(!batchedExpertDecodePolicy("gemma4_text", true, true));
+}
+
 test "moeRoutingChain produces top-K indices and renormalized softmax weights" {
     const s = mlx.gpuStream();
 
@@ -14901,6 +15128,357 @@ test "NAX host scaffolding: zero-pad to 16 rows + slice-back are exact (runs off
             for (0..mn) |i| try testing.expectEqual(fd[i], md[i]);
             for (mn..@intCast(16 * N)) |i| try testing.expectEqual(@as(f32, 0.0), @abs(fd[i]));
         }
+    }
+}
+
+test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
+    // Reproduces the Laguna decode expert-gather with OUR self-built MLX, to
+    // compare against the pip-MLX Python sim (single gather ~133us, 47-layer
+    // MoE ~7.5ms). If this is far slower, the gap is our MLX build/runtime;
+    // if it matches, the gap is the live server context (stream/alloc/pipeline).
+    if (std.c.getenv("MLX_SERVE_MOE_GATHER_UBENCH") == null) return error.SkipZigTest;
+    const io_util = @import("io_util.zig");
+    const tio = testing.io;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    // Trace mode: run the gather and qmv sections in long sustained bursts so an
+    // Instruments Metal System Trace shows a clean, comparable GPU timeline.
+    const gather_trace = std.c.getenv("MLX_SERVE_MOE_GATHER_TRACE") != null;
+    const E: c_int = 256;
+    const N: c_int = 1024; // moe_intermediate (gate/up out)
+    const K: c_int = 3072; // hidden
+    const TOPK: c_int = 10;
+    const GS = 64;
+    const BITS = 2;
+
+    // Build a quantized [E,N,K] gate/up bank and a [E,K,N] down bank.
+    const makeBank = struct {
+        fn go(a: std.mem.Allocator, e: c_int, out: c_int, in: c_int, str: mlx.mlx_stream, rndp: *std.Random.DefaultPrng) ![3]mlx.mlx_array {
+            const cnt: usize = @intCast(e * out * in);
+            const buf = try a.alloc(f32, cnt);
+            defer a.free(buf);
+            const rr = rndp.random();
+            for (buf) |*v| v.* = rr.float(f32) - 0.5;
+            const wsh = [_]c_int{ e, out, in };
+            const w32 = mlx.mlx_array_new_data(buf.ptr, &wsh, 3, .float32);
+            defer _ = mlx.mlx_array_free(w32);
+            var wb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wb);
+            try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, str));
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", .{}, str));
+            var wq = mlx.mlx_array_new();
+            var wsc = mlx.mlx_array_new();
+            var wbi = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+            try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+            try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+            for ([_]mlx.mlx_array{ wq, wsc, wbi }) |aa| try mlx.check(mlx.mlx_array_eval(aa));
+            return .{ wq, wsc, wbi };
+        }
+    }.go;
+
+    var prng = std.Random.DefaultPrng.init(0xF00D);
+    const gate = try makeBank(allocator, E, N, K, s, &prng);
+    const down = try makeBank(allocator, E, K, N, s, &prng);
+    defer for (gate ++ down) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+
+    // x [1,1,3072], inds [1,1,10]
+    const xbuf = try allocator.alloc(f32, @intCast(K));
+    defer allocator.free(xbuf);
+    for (xbuf) |*v| v.* = prng.random().float(f32) - 0.5;
+    const xsh = [_]c_int{ 1, 1, K };
+    const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xsh, 3, .float32);
+    defer _ = mlx.mlx_array_free(x32);
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
+    const idxvals = [_]i32{ 0, 5, 9, 13, 40, 77, 120, 200, 3, 88 };
+    const idxsh = [_]c_int{ 1, 1, TOPK };
+    const inds = mlx.mlx_array_new_data(&idxvals, &idxsh, 3, .int32);
+    defer _ = mlx.mlx_array_free(inds);
+    const no_idx = mlx.mlx_array{ .ctx = null };
+
+    _ = no_idx;
+    // One decode gather at our 5-D shape, optionally biasing x by `add` to
+    // defeat common-subexpression dedup when many are built in one graph.
+    const oneGather = struct {
+        fn go(str: mlx.mlx_stream, xin: mlx.mlx_array, bank: [3]mlx.mlx_array, ind: mlx.mlx_array, add: f32) !mlx.mlx_array {
+            const sh5 = [_]c_int{ 1, 1, 1, 1, K };
+            var xe = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xe);
+            try mlx.check(mlx.mlx_reshape(&xe, xin, &sh5, 5, str));
+            if (add != 0.0) {
+                const sc = mlx.mlx_array_new_float(add);
+                defer _ = mlx.mlx_array_free(sc);
+                var xa = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&xa, xe, sc, str));
+                _ = mlx.mlx_array_free(xe);
+                xe = xa;
+            }
+            var out5 = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_gather_qmm(&out5, xe, bank[0], bank[1], bank[2], .{ .ctx = null }, ind, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", false, str));
+            return out5;
+        }
+    }.go;
+
+    var sw = io_util.Stopwatch.init(tio);
+    // (1) single gather, 400 iters (cached) — compare to pip-MLX Python 133us
+    {
+        var i: usize = 0;
+        while (i < 20) : (i += 1) {
+            const g = try oneGather(s, x, gate, inds, 0.0);
+            try mlx.check(mlx.mlx_array_eval(g));
+            _ = mlx.mlx_array_free(g);
+        }
+        sw.reset();
+        const ITER = 400;
+        i = 0;
+        while (i < ITER) : (i += 1) {
+            const g = try oneGather(s, x, gate, inds, 0.0);
+            try mlx.check(mlx.mlx_array_eval(g));
+            _ = mlx.mlx_array_free(g);
+        }
+        const us = @as(f64, @floatFromInt(sw.read())) / 1000.0 / @as(f64, @floatFromInt(ITER));
+        std.debug.print("\n[moe-gather-ubench] single gather_qmm (our MLX): {d:.1} us/call\n", .{us});
+    }
+    // (2) 141 INDEPENDENT gathers (varied x → no CSE) in ONE eval — measures
+    // how well our MLX overlaps them (pip-MLX 47-layer MoE sim was ~7.5ms).
+    {
+        const NG = 141;
+        var warm: usize = 0;
+        while (warm < 3) : (warm += 1) {
+            var acc = mlx.mlx_array_new();
+            var first = true;
+            var j: usize = 0;
+            while (j < NG) : (j += 1) {
+                const g = try oneGather(s, x, gate, inds, @as(f32, @floatFromInt(j)) * 0.001);
+                if (first) {
+                    acc = g;
+                    first = false;
+                } else {
+                    var na = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    _ = mlx.mlx_array_free(acc);
+                    _ = mlx.mlx_array_free(g);
+                    acc = na;
+                }
+            }
+            try mlx.check(mlx.mlx_array_eval(acc));
+            _ = mlx.mlx_array_free(acc);
+        }
+        sw.reset();
+        const ITER: usize = if (gather_trace) 200 else 20;
+        var i: usize = 0;
+        while (i < ITER) : (i += 1) {
+            var acc = mlx.mlx_array_new();
+            var first = true;
+            var j: usize = 0;
+            while (j < NG) : (j += 1) {
+                const g = try oneGather(s, x, gate, inds, @as(f32, @floatFromInt(j)) * 0.001);
+                if (first) {
+                    acc = g;
+                    first = false;
+                } else {
+                    var na = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    _ = mlx.mlx_array_free(acc);
+                    _ = mlx.mlx_array_free(g);
+                    acc = na;
+                }
+            }
+            try mlx.check(mlx.mlx_array_eval(acc));
+            _ = mlx.mlx_array_free(acc);
+        }
+        const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / @as(f64, @floatFromInt(ITER));
+        std.debug.print("[moe-gather-ubench] 141 independent gathers, one eval (our MLX): {d:.2} ms  ({d:.1} us/gather)\n", .{ ms, ms * 1000.0 / @as(f64, NG) });
+    }
+    // (3) 141 INDEPENDENT quantized_matmul (dense qmv, NOT gather) in one eval —
+    // does plain qmv overlap in our build where gather does not? If yes, an
+    // engine-level workaround (extract experts + qmv) can dodge the gather bug.
+    {
+        // one 2D quantized weight [N, K] for qmv (transpose=true → x@w^T)
+        const wn2: usize = @intCast(N * K);
+        const wbuf2 = try allocator.alloc(f32, wn2);
+        defer allocator.free(wbuf2);
+        for (wbuf2) |*v| v.* = prng.random().float(f32) - 0.5;
+        const wsh2 = [_]c_int{ N, K };
+        const w2_32 = mlx.mlx_array_new_data(wbuf2.ptr, &wsh2, 2, .float32);
+        defer _ = mlx.mlx_array_free(w2_32);
+        var w2b = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w2b);
+        try mlx.check(mlx.mlx_astype(&w2b, w2_32, .bfloat16, s));
+        var trip = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(trip);
+        try mlx.check(mlx.mlx_quantize(&trip, w2b, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", .{}, s));
+        var q = mlx.mlx_array_new();
+        var sc = mlx.mlx_array_new();
+        var bi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q);
+        defer _ = mlx.mlx_array_free(sc);
+        defer _ = mlx.mlx_array_free(bi);
+        try mlx.check(mlx.mlx_vector_array_get(&q, trip, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&sc, trip, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&bi, trip, 2));
+        for ([_]mlx.mlx_array{ q, sc, bi }) |a| try mlx.check(mlx.mlx_array_eval(a));
+
+        const oneQmv = struct {
+            fn go(str: mlx.mlx_stream, xin: mlx.mlx_array, wq_: mlx.mlx_array, wsc_: mlx.mlx_array, wbi_: mlx.mlx_array, add: f32) !mlx.mlx_array {
+                var xe = mlx.mlx_array_new();
+                if (add != 0.0) {
+                    const scl = mlx.mlx_array_new_float(add);
+                    defer _ = mlx.mlx_array_free(scl);
+                    try mlx.check(mlx.mlx_add(&xe, xin, scl, str));
+                } else {
+                    try mlx.check(mlx.mlx_astype(&xe, xin, .bfloat16, str));
+                }
+                defer _ = mlx.mlx_array_free(xe);
+                var out = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_quantized_matmul(&out, xe, wq_, wsc_, wbi_, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", str));
+                return out;
+            }
+        }.go;
+
+        const NG = 141;
+        var warm: usize = 0;
+        while (warm < 3) : (warm += 1) {
+            var acc = mlx.mlx_array_new();
+            var first = true;
+            var j: usize = 0;
+            while (j < NG) : (j += 1) {
+                const g = try oneQmv(s, x, q, sc, bi, @as(f32, @floatFromInt(j)) * 0.001);
+                if (first) {
+                    acc = g;
+                    first = false;
+                } else {
+                    var na = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    _ = mlx.mlx_array_free(acc);
+                    _ = mlx.mlx_array_free(g);
+                    acc = na;
+                }
+            }
+            try mlx.check(mlx.mlx_array_eval(acc));
+            _ = mlx.mlx_array_free(acc);
+        }
+        sw.reset();
+        const ITER: usize = if (gather_trace) 200 else 20;
+        var i: usize = 0;
+        while (i < ITER) : (i += 1) {
+            var acc = mlx.mlx_array_new();
+            var first = true;
+            var j: usize = 0;
+            while (j < NG) : (j += 1) {
+                const g = try oneQmv(s, x, q, sc, bi, @as(f32, @floatFromInt(j)) * 0.001);
+                if (first) {
+                    acc = g;
+                    first = false;
+                } else {
+                    var na = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    _ = mlx.mlx_array_free(acc);
+                    _ = mlx.mlx_array_free(g);
+                    acc = na;
+                }
+            }
+            try mlx.check(mlx.mlx_array_eval(acc));
+            _ = mlx.mlx_array_free(acc);
+        }
+        const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / @as(f64, @floatFromInt(ITER));
+        std.debug.print("[moe-gather-ubench] 141 independent quantized_matmul (qmv), one eval (our MLX): {d:.2} ms  ({d:.1} us/qmv)\n", .{ ms, ms * 1000.0 / @as(f64, NG) });
+    }
+    // (4) FULL WORKAROUND: take 10 experts from the [256,N,K] bank + broadcast x
+    // + BATCHED quantized_matmul. Includes the extraction cost. If fast, this is
+    // the decode drop-in for gather_qmm.
+    {
+        const idx10 = [_]i32{ 0, 5, 9, 13, 40, 77, 120, 200, 3, 88 };
+        const idx10sh = [_]c_int{10};
+        const inds10 = mlx.mlx_array_new_data(&idx10, &idx10sh, 1, .int32);
+        defer _ = mlx.mlx_array_free(inds10);
+        // take from the real 256-expert `gate` bank each call (extraction cost)
+        const oneBatched = struct {
+            fn go(str: mlx.mlx_stream, xin: mlx.mlx_array, bank: [3]mlx.mlx_array, ind: mlx.mlx_array, add: f32) !mlx.mlx_array {
+                var wq_ = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(wq_);
+                var wsc_ = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(wsc_);
+                var wbi_ = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(wbi_);
+                try mlx.check(mlx.mlx_take_axis(&wq_, bank[0], ind, 0, str));
+                try mlx.check(mlx.mlx_take_axis(&wsc_, bank[1], ind, 0, str));
+                try mlx.check(mlx.mlx_take_axis(&wbi_, bank[2], ind, 0, str));
+                const sh3 = [_]c_int{ 1, 1, K };
+                var xe = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_reshape(&xe, xin, &sh3, 3, str));
+                if (add != 0.0) {
+                    const scl = mlx.mlx_array_new_float(add);
+                    defer _ = mlx.mlx_array_free(scl);
+                    var xa = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_add(&xa, xe, scl, str));
+                    _ = mlx.mlx_array_free(xe);
+                    xe = xa;
+                }
+                defer _ = mlx.mlx_array_free(xe);
+                const bsh = [_]c_int{ 10, 1, K };
+                var xbc = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(xbc);
+                try mlx.check(mlx.mlx_broadcast_to(&xbc, xe, &bsh, 3, str));
+                var out = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_quantized_matmul(&out, xbc, wq_, wsc_, wbi_, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", str));
+                return out; // [10,1,N]
+            }
+        }.go;
+
+        const NG = 141;
+        var warm: usize = 0;
+        while (warm < 3) : (warm += 1) {
+            var acc = mlx.mlx_array_new();
+            var first = true;
+            var j: usize = 0;
+            while (j < NG) : (j += 1) {
+                const g = try oneBatched(s, x, gate, inds10, @as(f32, @floatFromInt(j)) * 0.001);
+                if (first) {
+                    acc = g;
+                    first = false;
+                } else {
+                    var na = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    _ = mlx.mlx_array_free(acc);
+                    _ = mlx.mlx_array_free(g);
+                    acc = na;
+                }
+            }
+            try mlx.check(mlx.mlx_array_eval(acc));
+            _ = mlx.mlx_array_free(acc);
+        }
+        sw.reset();
+        const ITER: usize = if (gather_trace) 200 else 20;
+        var i: usize = 0;
+        while (i < ITER) : (i += 1) {
+            var acc = mlx.mlx_array_new();
+            var first = true;
+            var j: usize = 0;
+            while (j < NG) : (j += 1) {
+                const g = try oneBatched(s, x, gate, inds10, @as(f32, @floatFromInt(j)) * 0.001);
+                if (first) {
+                    acc = g;
+                    first = false;
+                } else {
+                    var na = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_add(&na, acc, g, s));
+                    _ = mlx.mlx_array_free(acc);
+                    _ = mlx.mlx_array_free(g);
+                    acc = na;
+                }
+            }
+            try mlx.check(mlx.mlx_array_eval(acc));
+            _ = mlx.mlx_array_free(acc);
+        }
+        const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / @as(f64, @floatFromInt(ITER));
+        std.debug.print("[moe-gather-ubench] 141 BATCHED qmv over 10 experts, one eval (our MLX): {d:.2} ms  ({d:.1} us/batched)\n", .{ ms, ms * 1000.0 / @as(f64, NG) });
     }
 }
 
