@@ -306,7 +306,7 @@ const Spawn = struct {
     envp: [:null]?[*:0]const u8,
 
     fn build(gpa: std.mem.Allocator, req: Request) !Spawn {
-        const command = try gpa.dupeZ(u8, req.command);
+        const command = try gpa.dupeSentinel(u8, req.command, 0);
         var argv = try gpa.allocSentinel(?[*:0]const u8, 3, null);
         argv[0] = "sh";
         argv[1] = "-c";
@@ -402,7 +402,7 @@ fn serveConnectionInner(gpa: std.mem.Allocator, sock: c_int) !void {
     defer gpa.free(req.env);
 
     const spawn = try Spawn.build(gpa, req);
-    const cwd_z: ?[*:0]const u8 = if (req.cwd.len > 0) (try gpa.dupeZ(u8, req.cwd)).ptr else null;
+    const cwd_z: ?[*:0]const u8 = if (req.cwd.len > 0) (try gpa.dupeSentinel(u8, req.cwd, 0)).ptr else null;
 
     if (req.detach) return detachedRun(gpa, sock, spawn, cwd_z, req.log_path);
     return foregroundRun(gpa, sock, spawn, cwd_z);
@@ -445,7 +445,7 @@ fn foregroundRun(gpa: std.mem.Allocator, sock: c_int, spawn: Spawn, cwd_z: ?[*:0
 /// back through a pipe; the host uses it to `kill` the process later.
 fn detachedRun(gpa: std.mem.Allocator, sock: c_int, spawn: Spawn, cwd_z: ?[*:0]const u8, log_path: []const u8) !void {
     const log_z: [*:0]const u8 = if (log_path.len > 0)
-        (try gpa.dupeZ(u8, log_path)).ptr
+        (try gpa.dupeSentinel(u8, log_path, 0)).ptr
     else
         "/dev/null";
 

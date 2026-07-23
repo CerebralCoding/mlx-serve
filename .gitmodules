@@ -1,3 +1,9 @@
 [submodule "lib/ds4"]
 	path = lib/ds4
 	url = https://github.com/antirez/ds4
+[submodule "lib/mlx-src"]
+	path = lib/mlx-src
+	url = https://github.com/ml-explore/mlx
+[submodule "lib/mlxc-src"]
+	path = lib/mlxc-src
+	url = https://github.com/ml-explore/mlx-c

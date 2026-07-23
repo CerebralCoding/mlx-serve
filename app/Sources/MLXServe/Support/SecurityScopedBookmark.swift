@@ -76,6 +76,12 @@ enum SecurityScopedBookmark {
         "workingFolder.\(sessionId.uuidString)"
     }
 
+    /// The user-configured DEFAULT agent workspace (Settings → Agent Sandbox).
+    /// Sessions inheriting the default have no per-session slot — this global
+    /// one keeps a custom default reachable after relaunch under the App
+    /// Sandbox (the builtin `~/.mlx-serve/workspace` needs no bookmark).
+    static let defaultWorkspaceName = "agentDefaultWorkspace"
+
     /// The session's attached document folder (mini RAG).
     static func attachedFolderName(_ sessionId: UUID) -> String {
         "attachedFolder.\(sessionId.uuidString)"

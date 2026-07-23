@@ -294,7 +294,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 temperature: appState.serverOptions.defaultTemperature,
                 enableThinking: config.enableThinking || appState.serverOptions.defaultEnableThinking,
                 defaults: APIClient.RequestDefaults.from(appState.serverOptions),
-                modelId: server.modelInfo?.name
+                modelId: server.chatModelId
             )
             var coalescer = StreamCoalescer()
             beginLiveTokenCount()
@@ -356,6 +356,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // MCP servers below always run with the grant live. No bookmark stored
         // (default workspace, DMG build) → no-op.
         SecurityScopedBookmark.startAccessOnce(name: SecurityScopedBookmark.workingFolderName(sessionId))
+        // Sessions inheriting the DEFAULT workspace have no per-session slot;
+        // a custom default picked in Settings rides this global bookmark.
+        SecurityScopedBookmark.startAccessOnce(name: SecurityScopedBookmark.defaultWorkspaceName)
 
         generationTask = Task { [weak self] in
             guard let self else { return }
@@ -439,7 +442,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // Build message history for API
             let contextLength = AgentEngine.effectiveContextLength(
                 appContextSize: appState.contextSize,
-                modelContextLength: server.modelInfo?.contextLength
+                modelContextLength: server.chatModelInfo?.contextLength
             )
             let useServerPreprocess = wantsServerImagePreprocess
             var history = AgentEngine.buildAgentHistory(
@@ -558,7 +561,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 enableThinking: config.enableThinking,
                 toolsJSON: combinedToolsJSON,
                 defaults: APIClient.RequestDefaults.from(appState.serverOptions),
-                modelId: server.modelInfo?.name
+                modelId: server.chatModelId
             )
 
             // No client-side stream watchdog: long generations (large
@@ -956,10 +959,13 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         }
         let s = ImageGenSettings.load()
         let model = s.resolvedModel
+        // A LAN model picked in the Image pane needs no local download —
+        // the hosting Mac has the weights.
+        let lanId = LanPick.lanId(s.modelId)
         // Don't kick off a silent multi-GB download from a chat turn — if the
         // saved image model isn't present, tell the user to grab it from the
         // Image window once (the only place with a progress bar + RAM gate).
-        guard ServerManager.resolveModelDir(repo: model.repo) != nil else {
+        guard lanId != nil || ServerManager.resolveModelDir(repo: model.repo) != nil else {
             return "The image model “\(model.name)” isn't downloaded yet, so I can't generate an image. Open the Image generation window once (menu-bar tray ▸ Image) to download it (~\(model.approxDownloadGB) GB), then ask me again."
         }
         let resolution = s.resolvedResolution(for: model)
@@ -973,6 +979,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             steps: s.steps,
             guidance: s.guidance,
             keepResident: s.keepResident,
+            lanModelId: lanId,
             safeMode: s.safeMode
         )
         do {
@@ -1075,6 +1082,6 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// Whether the loaded model wants server-side image preprocessing (Qwen3-VL):
     /// its `x-mlx-pixels` square format is Gemma-only, so Qwen sends raw images.
     var wantsServerImagePreprocess: Bool {
-        (server.modelInfo?.architecture ?? "").hasPrefix("qwen")
+        (server.chatModelInfo?.architecture ?? "").hasPrefix("qwen")
     }
 }

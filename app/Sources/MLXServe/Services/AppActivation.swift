@@ -74,6 +74,9 @@ enum AppActivation {
         case "settings":     return "Settings"
         case "serverLog":    return "Server Log"
         case "tasks":        return "Tasks"
+        // Base title only — a live session retitles to "pi — MLX Sandbox";
+        // the identifier fallback in windowMatches covers that state.
+        case "sandboxTerminal": return "MLX Sandbox"
         default:             return "Browser"
         }
     }

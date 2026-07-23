@@ -1,7 +1,5 @@
 const std = @import("std");
-const jinja_c = @cImport({
-    @cInclude("jinja_wrapper.h");
-});
+const jinja_c = @import("jinja_c");
 const tokenizer_mod = @import("tokenizer.zig");
 const arch_ds4 = if (@import("build_options").ios) @import("arch/ds4_stub.zig") else @import("arch/ds4.zig");
 const ds4_ffi = if (@import("build_options").ios) @import("ds4_ffi_stub.zig") else @import("ds4_ffi.zig");
@@ -385,17 +383,17 @@ fn renderChatTemplate(
     defer allocator.free(extra_json);
 
     // Null-terminate strings for C
-    const tmpl_z = try allocator.dupeZ(u8, chat_config.chat_template);
+    const tmpl_z = try allocator.dupeSentinel(u8, chat_config.chat_template, 0);
     defer allocator.free(tmpl_z);
-    const msgs_z = try allocator.dupeZ(u8, messages_json);
+    const msgs_z = try allocator.dupeSentinel(u8, messages_json, 0);
     defer allocator.free(msgs_z);
-    const extra_z = try allocator.dupeZ(u8, extra_json);
+    const extra_z = try allocator.dupeSentinel(u8, extra_json, 0);
     defer allocator.free(extra_z);
 
     var tools_z: ?[:0]const u8 = null;
     defer if (tools_z) |tz| allocator.free(tz);
     if (effective_tools_json) |tj| {
-        tools_z = try allocator.dupeZ(u8, tj);
+        tools_z = try allocator.dupeSentinel(u8, tj, 0);
     }
 
     const result_ptr = jinja_c.jinja_render_chat(
@@ -2801,8 +2799,24 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
                 continue;
             }
             name_start = p + wrap_len;
+        } else if (after_base < text.len and text[after_base] == '>' and blk: {
+            // Bare `<tool_call>` has two sub-formats sharing this opener:
+            //   • Hermes JSON `<tool_call>{…}` / function-tag `<tool_call><function=…>`
+            //     → the generic scan reads those; fall through.
+            //   • GLM (Laguna, tokenizer tool_parser_type "glm47"):
+            //     `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…`
+            //     — bare opener, NAME, then arg_key/arg_value pairs, NO plural
+            //     wrapper. Route HERE only when an `<arg_key` precedes this
+            //     call's close (the unambiguous GLM signal a JSON/function body
+            //     never has), so the Hermes path is untouched.
+            const body = after_base + 1;
+            const this_close = std.mem.indexOfPos(u8, text, body, "</tool_call") orelse text.len;
+            const ak_at = std.mem.indexOfPos(u8, text, body, "<arg_key") orelse text.len;
+            break :blk ak_at < this_close;
+        }) {
+            name_start = after_base + 1;
         } else {
-            // Bare `<tool_call>` (Hermes) — not this format; fall through.
+            // Bare `<tool_call>` Hermes JSON / function-tag — not this format.
             pos = after_base;
             continue;
         }

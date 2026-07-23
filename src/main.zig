@@ -222,6 +222,19 @@ fn printUsage(io: std.Io) void {
         \\                        Accepts Authorization: Bearer, x-api-key, HTTP
         \\                        Basic (key = password), or ?api_key=. /health
         \\                        stays open. Unset = no auth (default).
+        \\  --lan-share <all|id,...>
+        \\                      Share models with the local network: advertise
+        \\                        this server over Bonjour and let LAN clients
+        \\                        run inference on the listed models (or all).
+        \\                        Everything else stays host-local. Off by
+        \\                        default. Prompts sent to shared models are
+        \\                        visible to this machine.
+        \\  --lan-discover      Discover models other mlx-serve hosts share on
+        \\                        the LAN: they appear in /v1/models as
+        \\                        <id>@<peer> and requests naming one are
+        \\                        proxied to that host. Off by default.
+        \\  --lan-name <name>   Bonjour instance name for --lan-share
+        \\                        (default: this Mac's hostname).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --log-file <path>   Persist the server log ("off" disables).
         \\                      Default: ~/.mlx-serve/logs/mlx-serve-<port>.log
@@ -379,6 +392,7 @@ pub fn main(init: std.process.Init) !void {
                 .app = VERSION,
                 .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
                 .mlx_c = build_options.mlx_c_version,
+                .nax = transformer_mod.naxStatus(),
                 .ggml = std.mem.span(ggml_version()),
                 .ggml_commit = std.mem.span(ggml_commit()),
                 .llama_tag = build_options.llama_tag,
@@ -462,6 +476,16 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             // Borrowed from argv (lives for the process). Empty ⇒ leave open.
             if (args[i].len > 0) server_mod.g_api_key = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lan-share") and i + 1 < args.len) {
+            i += 1;
+            // Borrowed from argv, like --api-key. serve() starts the LAN
+            // subsystem (src/lan.zig) once the listener is bound.
+            if (args[i].len > 0) server_mod.g_lan_share_spec = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lan-name") and i + 1 < args.len) {
+            i += 1;
+            if (args[i].len > 0) server_mod.g_lan_name = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lan-discover")) {
+            server_mod.g_lan_discover = true;
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
@@ -1119,10 +1143,11 @@ pub fn main(init: std.process.Init) !void {
         }
         log.info("Model ready.\n", .{});
 
-        // Qwen native MTP head — auto-load when the model ships a sidecar.
+        // Qwen native MTP head — auto-load when the model ships one (sidecar
+        // file or in-checkpoint tensors in the trunk shards).
         var mtp_head: ?mtp_mod.MtpModel = null;
         defer if (mtp_head) |*h| h.deinit();
-        if (enable_mtp and mtp_mod.hasMtpSidecar(io, model_dir)) {
+        if (enable_mtp and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
             // A failed load (e.g. a sidecar layout we can't bind yet) only
             // disables the head — mirrors the serve path's graceful degrade.
             if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {

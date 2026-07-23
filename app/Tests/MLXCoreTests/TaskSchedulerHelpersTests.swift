@@ -19,6 +19,21 @@ final class TaskSchedulerHelpersTests: XCTestCase {
         XCTAssertLessThanOrEqual(title.count, 49)
     }
 
+    func testEveryAutonomyLevelGetsARealWorkingDirectory() {
+        // The old contract passed nil for yolo ("unconfined") — file tools now
+        // REQUIRE a working directory in every mode, so yolo anchors at the
+        // user's default agent workspace (approval stays unrestricted; the
+        // per-run folder still confines the other levels).
+        let taskId = UUID(), runId = UUID()
+        XCTAssertEqual(TaskScheduler.workDir(for: .yolo, taskId: taskId, runId: runId),
+                       ChatSession.defaultWorkingDirectory)
+        for level in [TaskAutonomy.readOnly, .workspace, .fullAuto] {
+            XCTAssertEqual(TaskScheduler.workDir(for: level, taskId: taskId, runId: runId),
+                           TaskPaths.runDir(taskId, runId),
+                           "\(level) must confine to the per-run folder")
+        }
+    }
+
     func testLastAssistantTextPicksLatestNonEmpty() {
         let msgs = [
             ChatMessage(role: .user, content: "do it"),

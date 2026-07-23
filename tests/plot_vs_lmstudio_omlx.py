@@ -56,7 +56,7 @@ FAMILIES = {
             "gemma4-e4b-4bit":              "Gemma 4 E4B (4bit)",
             "gemma4-31b-4bit":              "Gemma 4 31B (4bit)",
             "gemma4-26b-a4b-moe-qat-4bit":  "Gemma 4 26B-A4B MoE (QAT 4bit)",
-            "qwen36-27b":                   "Qwen 3.6 27B (4bit)",
+            "qwen36-27b":                   "Qwen 3.6 27B (oQ4e, oMLX Lightning MTP)",
             "qwen36-35b-a3b":               "Qwen 3.6 35B-A3B MoE (4bit)",
             "qwen36-27b-mtplxopt":          "Qwen 3.6 27B (MTPLX-opt 4bit)",
         }.get(key, key),
@@ -138,7 +138,7 @@ FAMILIES = {
     "qwen36": {
         "title": "MLX-serve vs LM Studio — Qwen 3.6 (Apple Silicon, decode tok/s)",
         "x_label": lambda key: {
-            "qwen36-27b":          "27B (4bit)",
+            "qwen36-27b":          "27B (oQ4e, oMLX Lightning MTP)",
             "qwen36-35b-a3b":      "35B-A3B (4bit)",
             "qwen36-27b-mtplxopt": "27B (MTPLX-opt 4bit)",
         }.get(key, key),

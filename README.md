@@ -1,4 +1,4 @@
-![mlx-serve — the unified AI powerhouse on Apple Silicon: chat, coding agents, image, video, music, voice clone, 3D](docs/assets/mlx-serve-header.png)
+![mlx-serve — the unified AI powerhouse on Apple Silicon: chat, coding agents, image, video, music, voice clone, 3D](website/assets/mlx-serve-header.png)
 
 # mlx-serve — run any LLM on your Mac
 
@@ -13,11 +13,11 @@
 [![Zig](https://img.shields.io/badge/built%20with-Zig-f7a41d?style=flat-square&logo=zig)](https://ziglang.org)
 [![ddalcu%2Fmlx-serve | Trendshift](https://trendshift.io/api/badge/repositories/43025)](https://trendshift.io/repositories/43025)
 
-**[ddalcu.github.io/mlx-serve](https://ddalcu.github.io/mlx-serve/)** · [Download MLX Core.app](https://github.com/ddalcu/mlx-serve/releases/latest) · [Changelog](CHANGELOG.md)
+**[mlxserve.com](https://mlxserve.com/)** · [Download MLX Core.app](https://github.com/ddalcu/mlx-serve/releases/latest) · [Changelog](CHANGELOG.md)
 
 mlx-serve is a native Zig server that runs **any LLM on Apple Silicon** — MLX-format models *and* every GGUF on HuggingFace (Qwen, Llama, Mistral, Gemma, DeepSeek V4 Flash, thousands more). It exposes **OpenAI-compatible** *and* **Anthropic-compatible** HTTP APIs out of the box, so the same `http://localhost:11234` works with Claude Code, the OpenAI SDK, Continue, Cursor, Open WebUI, and anything else that speaks one of those wires. Beyond text, the same server generates **images, video, music, speech (with voice cloning), and 3D models** — all natively on MLX. Ships with **MLX Core**, a macOS menu-bar app with chat, agent mode, MCP tool calling, and model management.
 
-[<img src="docs/appiconb.png" width="48" align="center">](https://github.com/ddalcu/mlx-serve/releases/latest) **[Download MLX Core.app](https://github.com/ddalcu/mlx-serve/releases/latest)** — latest release for macOS (Apple Silicon)
+[<img src="website/appiconb.png" width="48" align="center">](https://github.com/ddalcu/mlx-serve/releases/latest) **[Download MLX Core.app](https://github.com/ddalcu/mlx-serve/releases/latest)** — latest release for macOS (Apple Silicon)
 
 ### Install via Homebrew
 
@@ -58,6 +58,7 @@ If you're already on LM Studio, Ollama, or `mlx-lm` and wondering whether to swi
 | Continuous batching | ✅ | ❌ | ✅ | ❌ |
 | Built-in agent loop + MCP client | ✅ 10 tools | ❌ | ❌ | ❌ |
 | Sandboxed agent shell (isolated Linux VM) | ✅ | ❌ | ❌ | ❌ |
+| LAN model sharing (use another Mac's models) | ✅ | ❌ | ❌ | ❌ |
 | One-click launchers (Claude Code, OpenCode, Pi) | ✅ | ❌ | ❌ | ❌ |
 | Python required at runtime | ❌ | ❌ | ❌ | ✅ |
 | Native menu-bar app (no Electron) | ✅ | ❌ Electron | ❌ | ❌ |
@@ -97,6 +98,7 @@ Across 18 cells (best mlx-serve vs best LM Studio per model × workload, geomean
 - **Long-context prefill that flies** — a custom flash-attention Metal kernel handles Gemma's sliding-window layers during prefill, skipping everything outside the attention window: 2.4× prefill (299 → 715 tok/s) on a ~100K-token prompt with *less* peak memory. Qwen 3.5/3.6 long prompts prefill in architecture-tuned chunks: ~5% faster with peak memory down ~9 GB on the 27B.
 - **KV-cache quantization** — 4-bit / 8-bit / TurboQuant variants shrink KV memory ~4× / ~2× / further still, so 16K contexts fit on hardware that couldn't hold them dense.
 - **Continuous batching** — `--max-concurrent N` batches decode requests through one forward pass for ~1.6× throughput at 4-way parallel.
+- **LAN model sharing** — `--lan-share all` lets other Macs on your network run inference on this Mac's models; `--lan-discover` mirrors peers' models into `/v1/models` as `model@peer` and proxies requests transparently, so Claude Code on a MacBook chats with the Studio's 27B through plain `localhost`. Off by default, zero configuration (Bonjour), share list enforced server-side, and only inference is ever exposed.
 - **Prefix cache** — shared system-prompt KV reuse across turns and across conversations. v26.5.7 adds an LRU of llama.cpp KV sessions so multi-doc agent loops stay warm.
 - **Tokenize cache** — chat-template render + tokenize cached per request; the second hit on a long conversation is a memcpy. Warm TTFT 7.7× faster on 1.8K-token prompts.
 - **Vision** — Gemma 4 SigLIP encoder; send images via `image_url` content blocks.
@@ -105,7 +107,7 @@ Across 18 cells (best mlx-serve vs best LM Studio per model × workload, geomean
 
 ## MLX Core (macOS App)
 
-![MLX Core](docs/demo-diffusion.gif)
+![MLX Core](website/demo-diffusion.gif)
 
 Menu-bar app that wraps the server with a full UI:
 
@@ -116,6 +118,7 @@ Menu-bar app that wraps the server with a full UI:
 - **Agent Sandbox** — flip one toggle and every agent shell command runs inside an isolated Linux VM built on Apple's Virtualization framework: boots in under a second, guest servers mirror to `localhost` live (an Express app on guest port 8080 is `http://localhost:8080` on your Mac), and a green shield in the toolbar shows when commands run isolated. Let the agent go wild — your Mac stays untouched.
 - **⌃Space Quick Launcher** — a Spotlight-style prompt panel over any app: hit ⌃Space, ask, and the answer streams in from your local model. Follow-ups keep context; ⌘↩ hands the conversation off to the full chat window.
 - **Hands-free Voice Mode** — say "Hey Loki" and just talk: on-device speech recognition (audio never leaves the Mac), spoken replies with barge-in interruption, and voice-driven agent tools — all from the menu bar with no window open.
+- **LAN Sharing** — share chosen models with the other Macs in your house and use theirs: peers appear automatically, shared models show up in the tray and every generation pane as "model · peer", and requests stream to the Mac that hosts the weights — chat, image, speech, music, video, and 3D alike, with models loading on demand on the host. Per-model share checkboxes in Settings; prompts sent to a shared model run on (and are visible to) the hosting Mac.
 - **Telegram bridge** — message your local model from your phone: no public URL, no port-forwarding, no cloud relay. Agent tools and scheduled tasks work remotely; the bot locks to the first chat that messages it.
 - **Scheduled tasks** — hand the agent a goal and a schedule in plain English ("weekdays at 8am, check my watched sites and write a briefing") and it runs unattended, with saved transcripts.
 - **Document folder RAG** — attach a folder of mixed files and ask questions about them; GPU-batched embeddings index ~500 files in ~7 s, everything in memory, nothing leaves the Mac.
@@ -178,42 +181,42 @@ Any quantized MLX model using one of the above architectures works natively. Any
 
 ## Prerequisites
 
-- macOS 26+ with Apple Silicon (M1/M2/M3/M4/M5) — the released app bundles MLX dylibs built for macOS 26; older macOS needs a from-source build against a local mlx
-- [Zig 0.16+](https://ziglang.org/download/) *(only if building from source)*
-- mlx-c and libwebp *(only if building from source)*:
-
-```bash
-brew install mlx-c webp
-```
+- macOS 26.2+ with Apple Silicon (M1/M2/M3/M4/M5) — the bundled MLX is built at deployment target 26.2 so the M5 neural-accelerator (NAX) kernels ship enabled
+- [Zig 0.17 nightly](https://ziglang.org/download/) *(only if building from source — staged automatically by `./scripts/fetch-zig.sh` into `.zig-toolchain/`)*
+- libwebp *(only if building from source)*: `brew install webp`
+- Xcode 26.2+ with the Metal Toolchain component *(only if building from source — mlx + mlx-c are pinned submodules compiled by `scripts/build-mlx.sh`, not brew packages, so the NAX kernels the brew bottle silently omits are included)*
 
 ## Quick Start
 
-### Download a model
-
-The MLX Core app can download models directly, or use the CLI:
+### Build from source
 
 ```bash
-pip install huggingface-hub
-huggingface-cli download mlx-community/gemma-4-e4b-it-4bit --local-dir ~/.mlx-serve/models/gemma-4-e4b-it-4bit
+git clone --recurse-submodules https://github.com/ddalcu/mlx-serve && cd mlx-serve
+git submodule update --init    # only if you cloned WITHOUT --recurse-submodules (lib/ds4 + lib/mlx-src + lib/mlxc-src)
+./scripts/fetch-llama.sh       # once — stages the pinned llama.cpp dylib (git-ignored, fetched not tracked)
+./scripts/build-mlx.sh         # once per pin bump — builds mlx + mlx-c from the submodules, NAX kernels asserted
+zig build -Doptimize=ReleaseFast
 ```
 
-### Build and run
+### Get a model and run
+
+The MLX Core app downloads models with a progress UI, or do it all from the binary you just built — no Python, no extra tools:
 
 ```bash
-./scripts/fetch-llama.sh (only once)
-zig build -Doptimize=ReleaseFast
-./zig-out/bin/mlx-serve --model ~/.mlx-serve/models/gemma-4-e4b-it-4bit --serve --port 8080
+./zig-out/bin/mlx-serve run gemma4     # download (resumable) + serve + chat REPL in one
+# or piece by piece:
+./zig-out/bin/mlx-serve pull gemma4
+./zig-out/bin/mlx-serve --model ~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit --serve --port 8080
 ```
 
 ### Build the app
 
 ```bash
-./scripts/fetch-llama.sh (only once)
 cd app && SKIP_NOTARIZE=1 bash build.sh
 open "MLX Core.app"
 ```
 
-Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code signing.
+`SKIP_NOTARIZE=1` dev builds are ad-hoc signed — no Apple developer account needed. Notarized release builds require `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID`.
 
 ## Usage
 
@@ -242,7 +245,7 @@ Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code
 |---|---|---|
 | `--model PATH` | required | Path to the model directory or a `.gguf` file |
 | `--serve` | off | Start the HTTP server |
-| `--host ADDR` | `127.0.0.1` | Host address to bind |
+| `--host ADDR` | `0.0.0.0` | Bind address (all interfaces — set `127.0.0.1` for strictly local) |
 | `--port N` | `11234` | Port for the HTTP server |
 | `--prompt TEXT` | `"Hello"` | Prompt for interactive mode |
 | `--max-tokens N` | `100` | Maximum tokens to generate |
@@ -268,6 +271,9 @@ Requires `APPLE_DEVELOPER_ID` and `APPLE_TEAM_ID` environment variables for code
 | `--prefix-cache-disk N{MB,GB}` | off | SSD tier: prefixes survive restarts (11K-token restart TTFT 5.9 s → 0.7 s) |
 | `--metrics` | off | Prometheus `/metrics` + live dashboard panel on `/` |
 | `--api-key KEY` | none | Require a key for non-localhost requests (localhost stays open) |
+| `--lan-share <all\|id,...>` | off | Share the listed models (or all) with your local network over Bonjour — only inference is exposed, model management stays host-local |
+| `--lan-discover` | off | Discover models other Macs share: they appear in `/v1/models` as `model@peer` and requests proxy to that Mac |
+| `--lan-name NAME` | hostname | The Bonjour name other Macs see |
 | `--model-dir PATH` | none | Discover and serve every model in a folder (LRU resident set) |
 | `--log-level` | `info` | Log level (error, warn, info, debug) |
 
@@ -385,7 +391,7 @@ Three flavors, all greedy-equivalent (byte-identical at temp=0 within the first 
 - **PLD** (Prompt Lookup Decoding) — model-agnostic n-gram match in `prompt + generated_tokens`. Default-on (`--pld`); zero per-model setup. Wins on agentic loops, RAG, code editing, anywhere the answer echoes prompt content.
 - **Gemma 4 assistant drafter** — Google's small 4-layer cross-attention drafters (`gemma-4-{E2B,E4B,26B-A4B,31B}-it-assistant-bf16`). Opt-in via `--drafter <dir>`. The drafter cross-attends into the target's KV cache — no separate weights duplicated.
 
-![Native MTP head-to-head — LM Studio vs MTPLX vs MLX-serve](docs/perf-mtp-ladder-26.7.6.png)
+![Native MTP context ladder — MLX-serve vs oMLX & MTPLX (Qwen3.6-27B), 0.5K–64K prefill + decode](docs/perf-pngs/perf-mtp-ladder-26.7.10.png)
 
 *Three engines, one identical checkpoint ([Qwen3.6-27B-MTPLX-Optimized-Speed](https://huggingface.co/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed), 4-bit + its calibrated MTP adapter; Apple M4 Max, coding-agent prompts, temp 0.6, fresh loads, cold prompts, best-of-N per cell). Decode: mlx-serve leads [MTPLX](https://github.com/youssofal/MTPLX) 2.0.2 at all 8 rungs (+11–30%) and LM Studio 0.4.15 — which has no MTP support, so it decodes plain AR — by +54–89%. Prefill: mlx-serve is ahead of MTPLX at all 8 rungs (+1.4–3.7%) and within ±2.5% of LM Studio at every rung while also paying the MTP-history capture that buys its decode lead — all three engines share the same MLX composed-attention floor on this hd-256 hybrid arch. (An earlier revision showed LM Studio "winning" 8K+ prefill by 45–75%; that was its prompt cache reusing the ladder's nested prompts — 2048-token-chunk granular — not prefill speed. Measured cold, its 8K–64K rungs drop from 311/359/368/324 to 239/227/215/189 tok/s.)*
 
@@ -420,11 +426,11 @@ Reproduce with **`./tests/bench.sh --family gemma`** (mlx-serve only — emits p
 
 
 
-![mlx-serve vs LM Studio (GGUF + MLX) · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-vs-lmstudio-omlx-all-26.7.9.png)
+![mlx-serve vs LM Studio (GGUF + MLX) · oMLX · MTPLX — Gemma 4 + Qwen 3.6, code completion (M4 Max)](docs/perf-pngs/perf-vs-lmstudio-omlx-all-26.7.10.png)
 
-*Code completion decode tok/s, identical weights per box (Apple M4 Max, ctx=4096, temp=0). Baseline is **LM Studio GGUF** — the llama.cpp path most LM Studio users actually run — with LM Studio MLX, oMLX, and MTPLX beside it. The blue bar is mlx-serve's best configuration for that model, with the winning speculative mode named in the label (PLD / drafter / native MTP). MTPLX shows 0 where it can't run (it requires its own MTP artifacts).*
+*Code completion decode tok/s, identical weights per box (Apple M4 Max, ctx=4096, temp=0). Baseline is **LM Studio GGUF** — the llama.cpp path most LM Studio users actually run — with LM Studio MLX, oMLX, and MTPLX beside it. The blue bar is mlx-serve's best configuration for that model, with the winning speculative mode named in the label (PLD / drafter / native MTP). MTPLX shows 0 where it can't run (it requires its own MTP artifacts). The Qwen 3.6 27B cell runs oMLX's own oQ4e checkpoint with their native Lightning MTP enabled on both engines — same weights, mlx-serve still wins.*
 
-Reproduce: `./tests/bench.sh --family all --lmstudio --omlx --mtplx`. Requires `lms`, `jq`, `python3`, `matplotlib` (CSV: [`docs/perf-csvs/all-26.7.9.csv`](docs/perf-csvs/all-26.7.9.csv)).
+Reproduce: `./tests/bench.sh --family all --lmstudio --omlx --mtplx`. Requires `lms`, `jq`, `python3`, `matplotlib` (CSV: [`docs/perf-csvs/all-26.7.10.csv`](docs/perf-csvs/all-26.7.10.csv)).
 
 ## FAQ
 
@@ -442,6 +448,9 @@ Yes. mlx-serve embeds llama.cpp's inference library (`libllama`) inside the same
 
 ### Does mlx-serve work with Claude Code?
 Yes — natively. mlx-serve implements Anthropic's `/v1/messages` endpoint including streaming, tool calling, and extended thinking. Point Claude Code at it with `ANTHROPIC_BASE_URL=http://localhost:11234`. The MLX Core app ships a one-click "Launch Claude Code" button that wires up the env vars for you.
+
+### Can my Macs share models over the network?
+Yes — LAN Sharing, off by default. Turn on sharing where the models live (Settings ▸ LAN Sharing, or `mlx-serve --serve --lan-share all`) and discovery on the Mac that wants to use them (`--lan-discover`). They find each other over Bonjour — no IPs, no config — and shared models appear in every model picker as "model · peer" and in `/v1/models` as `model@peer`, so even Claude Code pointed at `localhost` can run on the other Mac's model. Works for chat and image/speech/music/video/3D generation; models cold-load on demand on the host; only inference is exposed (model management, metrics, and the status page stay private to each Mac).
 
 ### What about the OpenAI SDK, Continue, Cursor, Open WebUI?
 All work — anything that talks the OpenAI chat-completions or Anthropic Messages wire protocol does. mlx-serve also implements the newer OpenAI Responses API (`/v1/responses`) for clients that want stateful chains via `previous_response_id`, plus a WebSocket transport on the same endpoint.
@@ -468,7 +477,7 @@ Zig with direct `mlx-c` FFI — no Python runtime, no Electron, no IPC bridge. T
 For greedy decoding (temp=0), mlx-serve is byte-identical to the reference for the first ~30-80 generated tokens, with the long-tail divergence inherent to INT4 float-reduction order (documented in `CLAUDE.md`). For temp > 0, the Leviathan probability-ratio sampler keeps speculative decoding mathematically exact in distribution. Equivalence is pinned by `tests/test_pld_equivalence.sh`, `test_drafter_equivalence.sh`, and `test_kv_quant_equivalence.sh`.
 
 ### Where does my data go?
-Nowhere. Everything runs locally on your Mac — no analytics, no telemetry, no cloud calls. The HTTP server binds to `127.0.0.1` by default. Open source under MIT.
+Nowhere off your machines. Everything runs locally — no analytics, no telemetry, no cloud calls. The HTTP server listens on your local network interface by default (`--host 0.0.0.0`) so your own devices can reach it; set `--host 127.0.0.1` to make it strictly local, or `--api-key` to gate every non-localhost request. With LAN Sharing on, prompts sent to a shared model travel only across your local network to the Mac hosting that model. Open source under MIT.
 
 ### How do I update?
 The MLX Core app self-updates by checking the GitHub releases feed. CLI: `brew upgrade --cask mlx-core` or `brew upgrade mlx-serve`.

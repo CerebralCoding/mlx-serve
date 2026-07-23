@@ -115,6 +115,57 @@ final class AgentSandboxTests: XCTestCase {
                       "sibling sharing a path prefix is NOT under the root")
     }
 
+    // MARK: per-chat project folders → /projects/<slug> (hot-mount on first use)
+
+    func testProjectSlugIsDeterministicAndFilesystemSafe() {
+        let a = AgentSandbox.projectSlug(hostPath: "/Users/d/My Project")
+        XCTAssertEqual(a, AgentSandbox.projectSlug(hostPath: "/Users/d/My Project"),
+                       "same path → same slug (stable across commands)")
+        XCTAssertFalse(a.contains("/"), "slug must be a single path segment: \(a)")
+        XCTAssertFalse(a.contains(" "), "slug must be filesystem-safe: \(a)")
+        XCTAssertTrue(a.hasPrefix("My-Project-"), "keeps a readable basename: \(a)")
+    }
+
+    func testProjectSlugDisambiguatesSameBasename() {
+        // Two different "/src" folders must not collide on one guest subdir.
+        let a = AgentSandbox.projectSlug(hostPath: "/Users/d/alpha/src")
+        let b = AgentSandbox.projectSlug(hostPath: "/Users/d/beta/src")
+        XCTAssertNotEqual(a, b, "distinct paths sharing a basename need distinct slugs")
+    }
+
+    func testResolveDefaultFolderMapsToWorkspace() {
+        let r = AgentSandbox.resolveGuestCwd(hostPath: "/Users/d/ws/sub",
+                                             defaultRoot: "/Users/d/ws", mounted: [:])
+        XCTAssertEqual(r.path, "/workspace/sub")
+        XCTAssertNil(r.mountSlug, "the default workspace never needs a project mount")
+        XCTAssertTrue(r.mapped)
+    }
+
+    func testResolveNewFolderRequestsAHotMount() {
+        let r = AgentSandbox.resolveGuestCwd(hostPath: "/Users/d/other/proj",
+                                             defaultRoot: "/Users/d/ws", mounted: [:])
+        XCTAssertEqual(r.mountHost, "/Users/d/other/proj", "the folder must be scheduled for mounting")
+        let slug = AgentSandbox.projectSlug(hostPath: "/Users/d/other/proj")
+        XCTAssertEqual(r.mountSlug, slug)
+        XCTAssertEqual(r.path, "/projects/\(slug)")
+        XCTAssertTrue(r.mapped)
+    }
+
+    func testResolveAlreadyMountedFolderNeedsNoRemount() {
+        let slug = AgentSandbox.projectSlug(hostPath: "/Users/d/other/proj")
+        let mounted = [slug: "/Users/d/other/proj"]
+        // Exact folder.
+        let r1 = AgentSandbox.resolveGuestCwd(hostPath: "/Users/d/other/proj",
+                                              defaultRoot: "/Users/d/ws", mounted: mounted)
+        XCTAssertEqual(r1.path, "/projects/\(slug)")
+        XCTAssertNil(r1.mountSlug, "an already-mounted folder must NOT trigger another mount")
+        // Descendant of a mounted folder.
+        let r2 = AgentSandbox.resolveGuestCwd(hostPath: "/Users/d/other/proj/src",
+                                              defaultRoot: "/Users/d/ws", mounted: mounted)
+        XCTAssertEqual(r2.path, "/projects/\(slug)/src")
+        XCTAssertNil(r2.mountSlug)
+    }
+
     // MARK: command wrapping (cd into mapped dir, then run)
 
     func testWrapCommandCdsIntoGuestPath() {
@@ -159,6 +210,170 @@ final class AgentSandboxTests: XCTestCase {
         XCTAssertLessThan(elapsed, 1.0, "teardown blocked the caller for \(elapsed)s")
         XCTAssertFalse(sandbox._testHasGuest, "guest must be detached synchronously so a fresh boot is safe")
         wait(for: [shutdownRan], timeout: 5)
+    }
+
+    // MARK: re-pull must not delete the rootfs under a still-stopping VM
+
+    func testRepullStopsTheGuestBeforeDeletingTheImageCache() {
+        // repullBaseImage tears down a guest whose virtiofs root IS the cached
+        // image dir. The delete must be sequenced strictly AFTER the blocking
+        // stop completes — removing the rootfs under a still-stopping VM risks
+        // a partial delete that provisionRootfs later mistakes for a valid
+        // cache (marker + bin/sh + sidecar surviving = cache hit on a gutted
+        // tree). Same hazard resetAllData documents; re-pull is triggered
+        // exactly when a guest is likely live (the stale-image alert).
+        let sandbox = AgentSandbox.shared
+        sandbox._testInstallGuest(VzGuest())
+        let lock = NSLock()
+        var events: [String] = []
+        let stopped = expectation(description: "blocking stop completed")
+        let returned = expectation(description: "repull returned")
+        DispatchQueue.global().async {
+            sandbox.repullBaseImage(
+                shutdownBlocking: { _ in
+                    Thread.sleep(forTimeInterval: 0.3) // simulate the VZ stop wait
+                    lock.lock(); events.append("stopped"); lock.unlock()
+                    stopped.fulfill()
+                },
+                deleteImageDir: { _ in
+                    lock.lock(); events.append("deleted"); lock.unlock()
+                })
+            returned.fulfill()
+        }
+        wait(for: [returned, stopped], timeout: 5)
+        XCTAssertEqual(events, ["stopped", "deleted"],
+                       "the image-dir delete must wait for the guest's blocking stop")
+        XCTAssertFalse(sandbox._testHasGuest, "guest must be detached so the next boot re-pulls fresh")
+    }
+
+    // MARK: CLI-session pinning (issue #89 follow-up: agent CLIs in the guest)
+
+    func testRemountBlockMessageOnlyWhenPinnedAndRemountNeeded() {
+        // A live CLI session pins the shared guest: a workspace switch that
+        // would remount (= reboot) the VM is DECLINED with a clear message,
+        // never a silent kill mid-session.
+        XCTAssertNil(AgentSandbox.remountBlockMessage(pinnedLabels: [], needsRemount: true),
+                     "no session → remount proceeds as before")
+        XCTAssertNil(AgentSandbox.remountBlockMessage(pinnedLabels: ["pi"], needsRemount: false),
+                     "pinned but no remount needed → nothing to block")
+        let msg = AgentSandbox.remountBlockMessage(pinnedLabels: ["pi"], needsRemount: true)
+        XCTAssertNotNil(msg)
+        XCTAssertTrue(msg!.contains("pi"), "the message must NAME the session holding the pin: \(msg!)")
+        XCTAssertTrue(msg!.lowercased().contains("close"), "must tell the user the way out: \(msg!)")
+    }
+
+    func testCliSessionPinRefcounts() {
+        let sandbox = AgentSandbox.shared
+        XCTAssertNil(sandbox.pinnedCliSessionLabel)
+        sandbox.pinCliSession(label: "pi")
+        sandbox.pinCliSession(label: "hermes")
+        XCTAssertNotNil(sandbox.pinnedCliSessionLabel)
+        sandbox.unpinCliSession(label: "pi")
+        XCTAssertEqual(sandbox.pinnedCliSessionLabel, "hermes",
+                       "two sessions → dropping one keeps the other's pin")
+        sandbox.unpinCliSession(label: "hermes")
+        XCTAssertNil(sandbox.pinnedCliSessionLabel, "last session gone → guest unpinned")
+        // Unbalanced unpin must not underflow.
+        sandbox.unpinCliSession(label: "hermes")
+        XCTAssertNil(sandbox.pinnedCliSessionLabel)
+    }
+
+    // MARK: workspace change → VM remount (Settings default / chat folder pick)
+
+    func testWorkspaceChangeActionRules() {
+        // A workspace pick (Settings default or the chat toolbar) must leave
+        // the VM sharing the RIGHT folder: live guest whose share no longer
+        // covers the new folder tears down so the next command reboots with
+        // the new share; a pinned guest declines exactly like shell does.
+        typealias Action = AgentSandbox.WorkspaceChangeAction
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: false, sharedRoot: nil, newWorkspace: "/w", pinnedLabels: []),
+            Action.none, "no live guest → the next boot shares the right folder anyway")
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/w/sub", pinnedLabels: []),
+            Action.none, "share already covers the new folder → keep the guest")
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: nil, pinnedLabels: []),
+            Action.none, "nil workspace → nothing to remount to")
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/elsewhere", pinnedLabels: []),
+            Action.teardown, "stale share, unpinned → tear down for a fresh remount")
+        guard case .blocked(let msg) = AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/elsewhere", pinnedLabels: ["pi"])
+        else { return XCTFail("pinned guest must decline the remount, not die under the session") }
+        XCTAssertEqual(msg, AgentSandbox.remountBlockMessage(pinnedLabels: ["pi"], needsRemount: true),
+                       "same decline message as shell — one workspace-pin story everywhere")
+    }
+
+    func testWorkspaceChangeActionForceRestartsPinnedSessions() {
+        // A Settings workspace pick is EXPLICIT intent to re-anchor the
+        // sandbox (live 2026-07-20: `ls /workspace` kept showing the old
+        // folder until an app restart, because a live terminal session pinned
+        // the guest and the change was quietly declined). With
+        // restartPinnedSessions the pick tears the guest down anyway and the
+        // terminal UI respawns its sessions in the new share — the pin only
+        // keeps declining IMPLICIT switches (a chat command from a
+        // different-workspace tab).
+        typealias Action = AgentSandbox.WorkspaceChangeAction
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/elsewhere",
+            pinnedLabels: ["pi"], restartPinnedSessions: true),
+            Action.teardownRestartingSessions,
+            "an explicit pick must remount even under a live session — restarting it")
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/elsewhere",
+            pinnedLabels: [], restartPinnedSessions: true),
+            Action.teardown, "no sessions → plain teardown, nothing to restart")
+        XCTAssertEqual(AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/w/sub",
+            pinnedLabels: ["pi"], restartPinnedSessions: true),
+            Action.none, "share already covers the new folder → sessions keep running")
+        guard case .blocked = AgentSandbox.workspaceChangeAction(
+            guestAlive: true, sharedRoot: "/w", newWorkspace: "/elsewhere",
+            pinnedLabels: ["pi"], restartPinnedSessions: false)
+        else { return XCTFail("implicit switches must still decline under a pin") }
+    }
+
+    func testNoteWorkspaceChangedIsSafeWithNoGuest() {
+        // The Settings row calls this on every pick; with no live guest it must
+        // be a quiet no-op (nil = proceed, nothing torn down, nothing thrown).
+        let sandbox = AgentSandbox.shared
+        sandbox._testInstallGuest(nil)
+        XCTAssertNil(sandbox.noteWorkspaceChanged("/anywhere"))
+        XCTAssertFalse(sandbox._testHasGuest)
+    }
+
+    // MARK: stale image (dropbear preflight)
+
+    func testStaleImageMessageNamesTheImageAndTheFix() {
+        let msg = AgentSandbox.staleImageMessage(image: "ddalcu/agent-shell-mlxserve")
+        XCTAssertTrue(msg.contains("ddalcu/agent-shell-mlxserve"), msg)
+        XCTAssertTrue(msg.lowercased().contains("ssh"), "must say WHAT the cached image lacks: \(msg)")
+        XCTAssertTrue(msg.lowercased().contains("re-pull") || msg.lowercased().contains("update"),
+                      "must name the fix: \(msg)")
+    }
+
+    // MARK: factory reset (Settings → Reset Sandbox)
+
+    func testResetScopeIsTheSandboxDirAndCoversTheSshIdentity() {
+        // The reset deletes EXACTLY this directory: wide enough that the ssh
+        // identity + known hosts go with the images (a keypair that outlives
+        // the guest's authorized_keys would just break the next boot), narrow
+        // enough that it can never touch models/logs/workspace next door.
+        let root = AgentSandbox.shared.dataDirectory
+        XCTAssertEqual(root.lastPathComponent, "sandbox",
+                       "reset scope must be ~/.mlx-serve/sandbox — NEVER ~/.mlx-serve itself")
+        XCTAssertTrue(root.path.hasSuffix(".mlx-serve/sandbox"), root.path)
+        XCTAssertTrue(SandboxSSH.sshDir.path.hasPrefix(root.path + "/"),
+                      "the ssh identity must live INSIDE the reset scope: \(SandboxSSH.sshDir.path)")
+    }
+
+    func testTranscriptResetEmptiesTheStore() {
+        let store = SandboxTranscript()
+        store.append(AgentSandbox.Entry(source: .user, command: "ls", output: "", exitCode: 0, at: Date()))
+        store.append(AgentSandbox.Entry(source: .system, command: "", output: "x", exitCode: 0, at: Date()))
+        store.reset()
+        XCTAssertTrue(store.entries.isEmpty)
     }
 
     // MARK: transcript store (tray redraw churn)

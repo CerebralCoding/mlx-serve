@@ -287,6 +287,39 @@ assert_contains "logprobs has content" '"logprobs"' "$RESP"
 assert_contains "logprobs has top_logprobs" '"top_logprobs"' "$RESP"
 echo ""
 
+# ── Test: n>1 rejected honestly ──
+# Single-choice engine: n:2 must 400 (silent one-choice no-op is the
+# llmprobe-flagged conformance failure), n:1 must work normally.
+echo -e "${YELLOW}Test: n>1 choices rejected${NC}"
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":3,"n":2}')
+assert_eq "chat n:2 returns 400" "400" "$HTTP_CODE"
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/v1/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"prompt":"Hi","max_tokens":3,"n":2}')
+assert_eq "completions n:2 returns 400" "400" "$HTTP_CODE"
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":3,"n":1}')
+assert_eq "chat n:1 still accepted" "200" "$HTTP_CODE"
+echo ""
+
+# ── Test: reasoning_effort accepted ──
+# OpenAI-standard thinking opt-in on chat/completions. Whether the model
+# actually emits reasoning depends on its template, so assert acceptance,
+# not reasoning_content presence.
+echo -e "${YELLOW}Test: reasoning_effort accepted${NC}"
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":3,"reasoning_effort":"low"}')
+assert_eq "reasoning_effort low returns 200" "200" "$HTTP_CODE"
+HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" "$BASE/v1/chat/completions" \
+    -H "Content-Type: application/json" \
+    -d '{"messages":[{"role":"user","content":"Hi"}],"max_tokens":3,"reasoning_effort":"none"}')
+assert_eq "reasoning_effort none returns 200" "200" "$HTTP_CODE"
+echo ""
+
 # ── Test: CORS ──
 echo -e "${YELLOW}Test: CORS preflight${NC}"
 HTTP_CODE=$(curl -s -o /dev/null -w "%{http_code}" -X OPTIONS "$BASE/v1/chat/completions")

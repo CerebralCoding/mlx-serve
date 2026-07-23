@@ -36,7 +36,9 @@ enum TaskAutonomy: String, Codable, CaseIterable {
     case workspace
     /// Auto-approve all tools (shell included) while file writes stay confined.
     case fullAuto
-    /// Unrestricted: every tool auto-approved, no path confinement, never asks.
+    /// Every tool auto-approved, never asks. File tools anchor at the default
+    /// agent workspace (a working directory is mandatory in every mode since
+    /// 2026-07-20 — see TaskScheduler.workDir); shell commands are unrestricted.
     case yolo
 }
 

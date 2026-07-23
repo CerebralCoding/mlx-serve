@@ -142,9 +142,11 @@ enum GenExperiment: String, CaseIterable, Identifiable {
 /// CHAT-PICKABLE subset, not the raw list — a Mac with only media/drafter
 /// downloads has a non-empty `localModels` but nothing the picker can
 /// actually offer, which used to fall through to a broken empty dropdown
-/// instead of this message. Pure so it's unit-tested without SwiftUI.
-func trayHasNoUsableModels(_ localModels: [LocalModel]) -> Bool {
-    !localModels.contains { $0.isChatPickable }
+/// instead of this message. LAN-discovered chat models count as usable: a
+/// Mac with nothing downloaded can still chat on a peer's model. Pure so
+/// it's unit-tested without SwiftUI.
+func trayHasNoUsableModels(_ localModels: [LocalModel], lanChatModelCount: Int = 0) -> Bool {
+    lanChatModelCount == 0 && !localModels.contains { $0.isChatPickable }
 }
 
 struct StatusMenuView: View {
@@ -221,20 +223,22 @@ struct StatusMenuView: View {
                 // a broken empty dropdown instead of this message.
                 let pickableModels = appState.localModels.filter { $0.isChatPickable }
 
-                if trayHasNoUsableModels(appState.localModels) {
-                    VStack(alignment: .leading, spacing: 4) {
-                        Text("No models yet")
-                            .font(.caption.weight(.medium))
-                        Text("Download a model below to start chatting.")
-                            .font(.caption)
-                            .foregroundStyle(.tertiary)
-                    }
-                } else {
-                    // Model picker + Settings shortcut on the same row so the
-                    // gear lives where the user picks what to load. Tuning
-                    // anything else lives in the Settings window the gear opens.
-                    HStack(spacing: 6) {
-                        Picker("Model", selection: $appState.selectedModelPath) {
+                // Model picker (or the no-models message) + Settings shortcut
+                // on the same row so the gear lives where the user picks what
+                // to load. The gear renders in BOTH states — with no models
+                // downloaded it is the tray's only route to Settings.
+                HStack(spacing: 6) {
+                    if trayHasNoUsableModels(appState.localModels, lanChatModelCount: server.lanModels(capability: "chat").count) {
+                        VStack(alignment: .leading, spacing: 4) {
+                            Text("No models yet")
+                                .font(.caption.weight(.medium))
+                            Text("Download a model below to start chatting.")
+                                .font(.caption)
+                                .foregroundStyle(.tertiary)
+                        }
+                        Spacer()
+                    } else {
+                        Picker("Model", selection: trayModelSelection) {
                             let pickable = pickableModels
                             // macOS .menu Pickers key the checkmark by item
                             // TITLE — two same-named rows (one GGUF, one MLX)
@@ -273,17 +277,30 @@ struct StatusMenuView: View {
                                     }
                                 }
                             }
+                            // Chat models other Macs share on this network
+                            // (server running with LAN discovery on). Tags are
+                            // "lan:"-prefixed so they can't collide with paths.
+                            let lanChat = server.lanModels(capability: "chat")
+                            if !lanChat.isEmpty {
+                                Section("On Your Network") {
+                                    ForEach(lanChat, id: \.name) { m in
+                                        Text(m.lanDisplayName).tag("lan:" + m.name)
+                                    }
+                                }
+                            }
                         }
                         .labelsHidden()
                         .pickerStyle(.menu)
-
-                        Button { openSettings() } label: {
-                            Image(systemName: "gear")
-                        }
-                        .buttonStyle(.bordered)
-                        .help("Settings")
                     }
 
+                    Button { openSettings() } label: {
+                        Image(systemName: "gear")
+                    }
+                    .buttonStyle(.bordered)
+                    .help("Settings")
+                }
+
+                if !trayHasNoUsableModels(appState.localModels, lanChatModelCount: server.lanModels(capability: "chat").count) {
                     HStack(spacing: 6) {
                         let control = ServerControlButtonPresentation(status: server.status)
                         Button {
@@ -592,7 +609,15 @@ struct StatusMenuView: View {
                         baseURL: server.baseURL,
                         servedModelId: server.modelInfo?.name ?? "mlx-serve",
                         serverContextLength: server.modelInfo?.contextLength,
-                        isEnabled: server.status == .running
+                        models: server.allModels,
+                        isEnabled: server.status == .running,
+                        openSandboxAgent: { agentId in
+                            // Post the request FIRST — the Sandbox window
+                            // reads it in .onAppear when this click is what
+                            // opens the window.
+                            appState.pendingSandboxAgentLaunch = .init(agentId: agentId)
+                            openSandboxTerminal()
+                        }
                     )
                 } else {
                     CLISetupInstructionsButton(
@@ -656,6 +681,25 @@ struct StatusMenuView: View {
         .buttonStyle(.bordered)
         .controlSize(.small)
         .help(help)
+    }
+
+    /// The one tray picker drives BOTH selections: a local model path (the
+    /// existing `selectedModelPath` flow: launch/hot-switch) or a LAN model
+    /// ("lan:<id>@<peer>" tags — recorded on the ServerManager and carried by
+    /// every chat request; the local server proxies it to the hosting Mac).
+    /// Picking a local model always clears the LAN choice.
+    private var trayModelSelection: Binding<String> {
+        Binding(
+            get: { server.lanChatModelId.map { "lan:" + $0 } ?? appState.selectedModelPath },
+            set: { picked in
+                if picked.hasPrefix("lan:") {
+                    appState.selectLanModel(String(picked.dropFirst(4)))
+                } else {
+                    server.lanChatModelId = nil
+                    appState.selectedModelPath = picked
+                }
+            }
+        )
     }
 
     /// Append a "+ assist" suffix to every model row that *could* use the

@@ -1108,8 +1108,8 @@ fn loadAudioComp(alloc: std.mem.Allocator) !?ltx.Component {
     const dir = std.mem.span(raw);
     var ap: [1024]u8 = undefined;
     var vp: [1024]u8 = undefined;
-    const audio_path = try std.fmt.bufPrintZ(&ap, "{s}/audio_vae.safetensors", .{dir});
-    const voc_path = try std.fmt.bufPrintZ(&vp, "{s}/vocoder.safetensors", .{dir});
+    const audio_path = try std.fmt.bufPrintSentinel(&ap, "{s}/audio_vae.safetensors", .{dir}, 0);
+    const voc_path = try std.fmt.bufPrintSentinel(&vp, "{s}/vocoder.safetensors", .{dir}, 0);
     const cpu_s = mlx.mlx_default_cpu_stream_new();
     return try loadAudioComponents(alloc, audio_path, voc_path, cpu_s);
 }
@@ -1310,7 +1310,7 @@ test "melSpectrogramStereo rejects too-short audio (reflect pad bound)" {
     const alloc = testing.allocator;
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    const pcm = [_]f32{0.0} ** 512; // 256 frames/ch < 513 minimum
+    const pcm: [512]f32 = @splat(0.0); // 256 frames/ch < 513 minimum
     try testing.expectError(error.AudioTooShort, melSpectrogramStereo(alloc, &pcm, s));
 }
 
@@ -1382,7 +1382,7 @@ test "audioVaeEncode surfaces MissingAudioWeight on a wrong-keyed checkpoint" {
     defer comp.deinit();
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    const vals = [_]f32{0.0} ** (2 * 64);
+    const vals: [2 * 64]f32 = @splat(0.0);
     const mel = mlx.mlx_array_new_data(&vals, &[_]c_int{ 1, 2, 1, 64 }, 4, .float32);
     defer _ = mlx.mlx_array_free(mel);
     try std.testing.expectError(error.MissingAudioWeight, audioVaeEncode(&comp, mel, s));
@@ -1396,7 +1396,7 @@ test "audioVaeDecode surfaces MissingAudioWeight instead of panicking on a wrong
     defer comp.deinit();
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
-    const vals = [_]f32{0.0} ** 128;
+    const vals: [128]f32 = @splat(0.0);
     const latent = mlx.mlx_array_new_data(&vals, &[_]c_int{ 1, 1, 128 }, 3, .float32);
     defer _ = mlx.mlx_array_free(latent);
     try std.testing.expectError(error.MissingAudioWeight, audioVaeDecode(&comp, latent, s));

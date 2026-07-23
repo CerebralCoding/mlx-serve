@@ -43,7 +43,9 @@ final class ImageGenService: ObservableObject {
             phase = .failed("Prompt is empty.")
             return
         }
-        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
+        // Network (LAN) models skip the local-download requirement — the
+        // hosting Mac has the weights.
+        guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
             phase = .failed("Model \(request.model.repo) is not downloaded. Download it first.")
             return
         }
@@ -65,15 +67,14 @@ final class ImageGenService: ObservableObject {
                 if !keep, let id = loadedId { try? await server.unloadModel(id: id) }
             }
             do {
-                let port = try await server.ensureRunning(forGenModelDir: modelDir)
-                if Task.isCancelled { phase = .idle; return }
-                let info = try await server.loadModel(id: modelDir)  // registry id = dir basename
-                loadedId = info.name
+                let (port, modelId, unloadId) = try await server.prepareGenModel(
+                    lanModelId: request.lanModelId, repo: request.model.repo)
+                loadedId = unloadId
                 if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
                 // SSE: per-step `progress` events drive a determinate bar, then a
                 // `complete` event carries the PNG.
                 var png: Data? = nil
-                let genJson = Self.requestJson(for: request, modelName: info.name, seed: seedToSend)
+                let genJson = Self.requestJson(for: request, modelName: modelId, seed: seedToSend)
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/images/generations",
                     json: genJson) {
@@ -134,7 +135,7 @@ final class ImageGenService: ObservableObject {
         guard !request.prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             throw GenError.emptyPrompt
         }
-        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
+        guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
             throw GenError.notDownloaded(request.model.name)
         }
 
@@ -142,15 +143,14 @@ final class ImageGenService: ObservableObject {
         let seedToSend = request.seed >= 0 ? request.seed : Int.random(in: 0...0xFFFF_FFFF)
         let keep = request.keepResident
 
-        let port = try await server.ensureRunning(forGenModelDir: modelDir)
-        let info = try await server.loadModel(id: modelDir)  // registry id = dir basename
-        let loadedId = info.name
+        let (port, modelId, unloadId) = try await server.prepareGenModel(
+            lanModelId: request.lanModelId, repo: request.model.repo)
         func releaseIfNeeded() async {
-            if !keep { try? await server.unloadModel(id: loadedId) }
+            if !keep, let id = unloadId { try? await server.unloadModel(id: id) }
         }
         do {
             var png: Data? = nil
-            let genJson = Self.requestJson(for: request, modelName: info.name, seed: seedToSend)
+            let genJson = Self.requestJson(for: request, modelName: modelId, seed: seedToSend)
             for try await ev in api.streamGeneration(
                 port: port, path: "/v1/images/generations", json: genJson) {
                 switch ev["type"] as? String {

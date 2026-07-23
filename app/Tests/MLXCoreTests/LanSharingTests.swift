@@ -1,0 +1,71 @@
+import XCTest
+@testable import MLXCore
+
+/// LAN model sharing, app side: /v1/models entries badged `lan_peer` become
+/// pickable network models (tray + every media pane), selections route the
+/// remote id into requests, and `LanPick` keeps the "lan:"-prefixed
+/// persistence format consistent across panes.
+final class LanSharingTests: XCTestCase {
+
+    func testParseModelInfoReadsLanPeerBadge() {
+        let entry: [String: Any] = [
+            "id": "gemma-4-e4b-it-4bit@Studio",
+            "lan_peer": "Studio",
+            "capabilities": ["chat", "vision"],
+            "meta": ["context_length": 94000],
+        ]
+        let info = APIClient.parseModelInfo(entry)
+        XCTAssertEqual(info.lanPeer, "Studio")
+        // `name` keeps the raw routing id — that's what requests must send.
+        XCTAssertEqual(info.name, "gemma-4-e4b-it-4bit@Studio")
+        XCTAssertEqual(info.lanDisplayName, "gemma-4-e4b-it-4bit · Studio")
+        XCTAssertEqual(info.contextLength, 94000)
+        XCTAssertTrue(info.supportsVision)
+
+        // Local entries stay unbadged.
+        XCTAssertNil(APIClient.parseModelInfo(["id": "local-model"]).lanPeer)
+    }
+
+    func testLanPickIdHelpers() {
+        XCTAssertEqual(LanPick.lanId("lan:model@peer"), "model@peer")
+        XCTAssertNil(LanPick.lanId("flux2-klein-4b-q4"))
+        XCTAssertEqual(LanPick.persisted(lanModel: "m@p", presetId: "x"), "lan:m@p")
+        XCTAssertEqual(LanPick.persisted(lanModel: nil, presetId: "x"), "x")
+        XCTAssertEqual(LanPick.peer(of: "gemma-4-e4b-it-4bit@Studio"), "Studio")
+    }
+
+    @MainActor
+    func testLanModelsFilterByBadgeAndCapability() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        mgr.allModels = [
+            APIClient.parseModelInfo(["id": "big@studio", "lan_peer": "studio", "capabilities": ["chat"]]),
+            APIClient.parseModelInfo(["id": "flux@studio", "lan_peer": "studio", "capabilities": ["image"]]),
+            APIClient.parseModelInfo(["id": "local-chat", "capabilities": ["chat"]]),
+        ]
+        XCTAssertEqual(mgr.lanModels(capability: "chat").map(\.name), ["big@studio"])
+        XCTAssertEqual(mgr.lanModels(capability: "image").map(\.name), ["flux@studio"])
+        XCTAssertTrue(mgr.lanModels(capability: "3d").isEmpty)
+    }
+
+    /// Chat requests carry the LAN selection when set; its metadata (context
+    /// length budgets, vision) resolves through the discovered entry.
+    @MainActor
+    func testChatModelIdAndInfoPreferLanSelection() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let lan = APIClient.parseModelInfo([
+            "id": "big@studio", "lan_peer": "studio",
+            "capabilities": ["chat"], "meta": ["context_length": 131072],
+        ])
+        mgr.allModels = [lan]
+        XCTAssertNil(mgr.chatModelId) // nothing selected, no local default
+
+        mgr.lanChatModelId = "big@studio"
+        XCTAssertEqual(mgr.chatModelId, "big@studio")
+        XCTAssertEqual(mgr.chatModelInfo?.contextLength, 131072)
+
+        mgr.lanChatModelId = nil
+        XCTAssertNil(mgr.chatModelId)
+    }
+}

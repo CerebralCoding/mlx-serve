@@ -2,22 +2,29 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 comptime {
-    const required: std.SemanticVersion = .{ .major = 0, .minor = 16, .patch = 0 };
-    if (builtin.zig_version.order(required) == .lt) {
+    // 0.17.0 isn't tagged stable yet (homebrew still ships 0.16.0) — a nightly
+    // build from ziglang.org/download is required until it is. 0.16.0's
+    // bundled libc++ fails to compile against the macOS 27 beta SDK
+    // (`use of undeclared identifier 'INFINITY'` in its vendored <random>);
+    // fixed upstream by 0.17.0-dev, which is why the floor moved.
+    if (builtin.zig_version.major == 0 and builtin.zig_version.minor < 17) {
         @compileError(std.fmt.comptimePrint(
-            "mlx-serve requires Zig {d}.{d}.{d} or newer (have {d}.{d}.{d}). Run `brew upgrade zig`.",
-            .{ required.major, required.minor, required.patch, builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch },
+            "mlx-serve requires Zig 0.17 (nightly until 0.17.0 stable ships) (have {d}.{d}.{d}). Grab a nightly from https://ziglang.org/download/.",
+            .{ builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch },
         ));
     }
 }
 
 pub fn build(b: *std.Build) void {
-    // Pin LC_BUILD_VERSION minos to macOS 14 (Sonoma) so binaries built on newer
-    // runners (macos-26 in CI) still load on Sonoma. dyld refuses any image whose
-    // minos is newer than the running OS.
+    // Pin LC_BUILD_VERSION minos to macOS 26.2 — the honest floor: the linked
+    // libmlx is built at deployment target 26.2 (NAX kernels, scripts/
+    // build-mlx.sh), so on older macOS the binary can't run anyway; failing at
+    // the binary with a clear dyld version error beats "loading" and dying on
+    // the dylib. Matches app LSMinimumSystemVersion + Package.swift. Guard:
+    // tests/test_mlx_staged_nax.sh (binary minos check).
     const target = b.standardTargetOptions(.{
         .default_target = .{
-            .os_version_min = .{ .semver = .{ .major = 14, .minor = 0, .patch = 0 } },
+            .os_version_min = .{ .semver = .{ .major = 26, .minor = 2, .patch = 0 } },
         },
     });
     const optimize = b.standardOptimizeOption(.{});
@@ -39,6 +46,7 @@ pub fn build(b: *std.Build) void {
 
     if (target.result.os.tag == .macos) {
         verifyBrewDeps(b);
+        verifyMlxStage(b);
     }
 
     // Version from build option or default
@@ -49,12 +57,13 @@ pub fn build(b: *std.Build) void {
     // Engine-version pins surfaced by `mlx-serve --version` (the macOS app spawns
     // it and parses the output — see src/version.zig). These are the versions
     // that have NO runtime query API (MLX + ggml report themselves at runtime):
-    //   --mlx-c-version  Homebrew mlx-c version (build.sh: `brew list --versions mlx-c`)
+    //   --mlx-c-version  pinned mlx-c submodule version; defaults from the
+    //                    lib/mlx/.version stamp (written by scripts/build-mlx.sh)
     //   --ds4-commit     pinned ds4 submodule short commit (build.sh: `git rev-parse`)
     //   --llama-tag      llama.cpp release tag; defaults from lib/llama/.version
     //                    (written by scripts/fetch-llama.sh) so a plain dev build
     //                    still reports it. app/build.sh passes all three.
-    const mlx_c_version = b.option([]const u8, "mlx-c-version", "Homebrew mlx-c version") orelse "unknown";
+    const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
     const ds4_commit = b.option([]const u8, "ds4-commit", "Pinned ds4 submodule short commit") orelse "unknown";
     const llama_tag = b.option([]const u8, "llama-tag", "llama.cpp release tag (bNNNN)") orelse readLlamaTag(b) orelse "unknown";
 
@@ -86,6 +95,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
+            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize) },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize) },
         },
     });
 
@@ -119,10 +131,14 @@ pub fn build(b: *std.Build) void {
     // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
     addLlamaLib(b, mod);
 
-    // mlx-c include/lib paths (homebrew)
+    // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
+    // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
+    // enabled (the Homebrew bottle ships without them). MUST come before the
+    // /opt/homebrew lib path so a leftover brew mlx-c can never win the link.
+    addMlxLib(b, mod);
+    // webp include/lib paths (homebrew)
     mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    mod.linkSystemLibrary("mlxc", .{});
     mod.linkSystemLibrary("webp", .{});
 
     if (macos_sdk_frameworks) |fw_path| {
@@ -145,9 +161,7 @@ pub fn build(b: *std.Build) void {
 
     const run_cmd = b.addRunArtifact(exe);
     run_cmd.step.dependOn(b.getInstallStep());
-    if (b.args) |args| {
-        run_cmd.addArgs(args);
-    }
+    run_cmd.addPassthruArgs();
 
     const run_step = b.step("run", "Run mlx-serve");
     run_step.dependOn(&run_cmd.step);
@@ -161,6 +175,9 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize) },
+            .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize) },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize) },
         },
     });
 
@@ -176,9 +193,9 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/ds4"));
     addLlamaLib(b, test_mod);
     test_mod.linkSystemLibrary("c++", .{});
+    addMlxLib(b, test_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
     test_mod.addLibraryPath(.{ .cwd_relative = "/opt/homebrew/lib" });
-    test_mod.linkSystemLibrary("mlxc", .{});
     test_mod.linkSystemLibrary("webp", .{});
 
     if (macos_sdk_frameworks) |fw_path| {
@@ -331,11 +348,15 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     mod.addSystemIncludePath(.{ .cwd_relative = b.fmt("{s}/usr/include", .{ios_sdk}) });
     mod.addFrameworkPath(.{ .cwd_relative = b.fmt("{s}/System/Library/Frameworks", .{ios_sdk}) });
 
-    // Headers for the @cImport sites (jinja_wrapper.h, stb_image.h, webp/decode.h).
-    // The matching static archives are linked by Xcode at final app-link time.
+    // Headers for the @import("jinja_c")/@import("stb") sites (jinja_wrapper.h,
+    // stb_image.h, webp/decode.h). The matching static archives are linked by
+    // Xcode at final app-link time.
     mod.addIncludePath(b.path("lib/jinja_cpp"));
     mod.addIncludePath(b.path("lib"));
     mod.addIncludePath(.{ .cwd_relative = ios_include });
+    mod.addImport("jinja_c", addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), ios_target, .ReleaseFast));
+    mod.addImport("stb", addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), ios_target, .ReleaseFast));
+    mod.addImport("webp", addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/webp/decode.h", .{ios_include}) }, .{ .cwd_relative = ios_include }, ios_target, .ReleaseFast));
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = &.{"-O2"} });
     // xatlas UV unwrapping (C++), used by the Hunyuan3D texture paint stage via
@@ -358,6 +379,25 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     step.dependOn(&install.step);
 }
 
+/// Translates a single C header into an importable module (`@import("name")`
+/// at the call site) via `addTranslateC`, replacing an inline `@cImport` —
+/// removed as a language builtin in 0.17.0-dev.
+fn addCHeaderModule(
+    b: *std.Build,
+    header_path: std.Build.LazyPath,
+    include_dir: std.Build.LazyPath,
+    target: std.Build.ResolvedTarget,
+    optimize: std.builtin.OptimizeMode,
+) *std.Build.Module {
+    const translate = b.addTranslateC(.{
+        .root_source_file = header_path,
+        .target = target,
+        .optimize = optimize,
+    });
+    translate.addIncludePath(include_dir);
+    return translate.createModule();
+}
+
 fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     // Match ds4's Makefile flags (lib/ds4/Makefile lines 10–11). We drop
     // `-mcpu=native` so the produced binary stays portable across Apple
@@ -377,13 +417,22 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     };
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4.c"), .flags = c_flags });
     // ds4.c #includes ds4_distributed.h; the engine/session path links its impl.
-    // ds4_gpu.h is implemented in ds4_metal.m; ds4_kvstore/web/help/agent.c are
-    // CLI/server-only and not part of the library path mlx-serve embeds.
+    // ds4_gpu.h is implemented in ds4_metal.m; ds4_kvstore/web/help/agent.c and
+    // ds4_gpu_args.c are CLI/server-only and not part of the library path
+    // mlx-serve embeds (upstream Makefile CORE_OBJS is the authority).
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_distributed.c"), .flags = c_flags });
     // SSD weight-streaming (issue #39): ds4_ssd.c is a standalone TU (#includes
     // only ds4_ssd.h) implementing the streaming expert cache the engine_options
     // ssd_streaming_* fields drive. Added upstream after the previous pin.
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_ssd.c"), .flags = c_flags });
+    // Two-machine tensor parallelism + multi-GPU layer placement (pin efdadd4):
+    // ds4.c references ds4_tp_* and ds4_compute_layer_placement/ds4_layer_pack_print
+    // unconditionally, so both TUs must link even though we never enable TP.
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_tp.c"), .flags = c_flags });
+    module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_layer_pack.c"), .flags = c_flags });
+    // Our own shim: exports sizeof/offsetof of the real C structs so the
+    // ds4_ffi.zig layout test catches mirror drift (mid-struct-insert class).
+    module.addCSourceFile(.{ .file = b.path("src/ds4_layout_check.c"), .flags = c_flags });
 
     const objc_flags = &[_][]const u8{
         "-O3",
@@ -398,12 +447,16 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_metal.m"), .flags = objc_flags });
 }
 
+fn buildRootHandle(b: *std.Build) std.Io.Dir {
+    return b.root.root_dir.handle;
+}
+
 /// The llama.cpp tag staged by scripts/fetch-llama.sh (it writes LLAMA_TAG to
 /// `lib/llama/.version`). Read at configure time so a plain `zig build` reports
 /// the real tag without app/build.sh having to pass `--llama-tag`. Returns null
 /// (→ "unknown") when llama hasn't been fetched yet.
 fn readLlamaTag(b: *std.Build) ?[]const u8 {
-    const bytes = b.build_root.handle.readFileAlloc(
+    const bytes = buildRootHandle(b).readFileAlloc(
         b.graph.io,
         "lib/llama/.version",
         b.allocator,
@@ -436,14 +489,66 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     });
 }
 
+/// Link the self-built mlx + mlx-c staged in lib/mlx by scripts/build-mlx.sh
+/// (pinned submodules lib/mlx-src + lib/mlxc-src, deployment target 26.2 so
+/// MLX's NAX kernels are compiled in — the Homebrew bottle ships without them
+/// and hard-wires is_nax_available() false even on M5). Install names are
+/// @rpath/...; the build-tree rpath resolves them in dev, release.yml /
+/// app/build.sh rewrite to @executable_path and re-sign for bundles.
+/// Guard test: tests/test_mlx_staged_nax.sh.
+fn addMlxLib(b: *std.Build, module: *std.Build.Module) void {
+    module.addIncludePath(b.path("lib/mlx/include"));
+    module.addLibraryPath(b.path("lib/mlx/lib"));
+    // use_pkg_config = .no: a leftover Homebrew mlx-c must never hijack this
+    // link — we want exactly the staged NAX-enabled pair (same class as the
+    // llama.pc hijack above).
+    module.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
+    module.addRPath(b.path("lib/mlx/lib"));
+}
+
+/// Configure-time check that scripts/build-mlx.sh has staged the pinned
+/// mlx/mlx-c build. Mirrors verifyBrewDeps: fail loudly with the fix, never
+/// let the linker produce a confusing -lmlxc error (or silently pick up a
+/// leftover brew copy from /opt/homebrew/lib).
+fn verifyMlxStage(b: *std.Build) void {
+    const stage_ok = blk: {
+        buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/libmlxc.dylib", .{}) catch break :blk false;
+        buildRootHandle(b).access(b.graph.io, "lib/mlx/lib/mlx.metallib", .{}) catch break :blk false;
+        buildRootHandle(b).access(b.graph.io, "lib/mlx/.version", .{}) catch break :blk false;
+        break :blk true;
+    };
+    if (!stage_ok) {
+        std.debug.print(
+            "\n[mlx-serve] lib/mlx is not staged (self-built mlx + mlx-c). Run:\n" ++
+                "  git submodule update --init lib/mlx-src lib/mlxc-src && ./scripts/build-mlx.sh\n\n",
+            .{},
+        );
+        std.process.exit(1);
+    }
+}
+
+/// The pinned mlx-c revision from lib/mlx/.version (written by
+/// scripts/build-mlx.sh as "mlx=<sha> mlxc=<sha> target=<ver>"), surfaced in
+/// `mlx-serve --version`. Returns null (→ "unknown") when not staged yet.
+fn readMlxcPin(b: *std.Build) ?[]const u8 {
+    const bytes = buildRootHandle(b).readFileAlloc(
+        b.graph.io,
+        "lib/mlx/.version",
+        b.allocator,
+        .limited(256),
+    ) catch return null;
+    var it = std.mem.tokenizeScalar(u8, std.mem.trim(u8, bytes, " \t\r\n"), ' ');
+    while (it.next()) |tok| {
+        if (std.mem.startsWith(u8, tok, "mlxc=")) return b.dupe(tok["mlxc=".len..]);
+    }
+    return null;
+}
+
 const BrewDep = struct { name: []const u8, min: std.SemanticVersion };
 
 const required_brew_deps = [_]BrewDep{
-    // 0.32.0: the runtime the M5 NAX depth-8 profile was calibrated/measured on
-    // (integer stream; 117.6 vs 104.2 tok/s auto-8 vs cap-6). 0.31.2 runs it
-    // correctly but lands at the bottom of the measured gain range.
-    .{ .name = "mlx", .min = .{ .major = 0, .minor = 32, .patch = 0 } },
-    .{ .name = "mlx-c", .min = .{ .major = 0, .minor = 6, .patch = 0 } },
+    // mlx + mlx-c are NOT brew deps anymore: they are pinned submodules built
+    // by scripts/build-mlx.sh (see addMlxLib) so the NAX kernels ship enabled.
     .{ .name = "webp", .min = .{ .major = 1, .minor = 6, .patch = 0 } },
 };
 
@@ -456,7 +561,7 @@ fn verifyBrewDeps(b: *std.Build) void {
             .inherit,
         ) catch {
             std.debug.print(
-                "\n[mlx-serve] missing Homebrew dependency '{s}' (>= {d}.{d}.{d}). Install with: brew install mlx-c webp\n\n",
+                "\n[mlx-serve] missing Homebrew dependency '{s}' (>= {d}.{d}.{d}). Install with: brew install webp\n\n",
                 .{ dep.name, dep.min.major, dep.min.minor, dep.min.patch },
             );
             std.process.exit(1);

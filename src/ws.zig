@@ -252,8 +252,8 @@ pub fn findHeader(headers: []const u8, name: []const u8) ?[]const u8 {
 pub fn isUpgrade(headers: []const u8) bool {
     const upg = findHeader(headers, "Upgrade") orelse return false;
     const conn = findHeader(headers, "Connection") orelse return false;
-    if (std.ascii.indexOfIgnoreCase(upg, "websocket") == null) return false;
-    if (std.ascii.indexOfIgnoreCase(conn, "upgrade") == null) return false;
+    if (std.ascii.findIgnoreCase(upg, "websocket") == null) return false;
+    if (std.ascii.findIgnoreCase(conn, "upgrade") == null) return false;
     return true;
 }
 

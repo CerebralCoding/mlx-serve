@@ -5,7 +5,7 @@
 # prompts (fast dev-loop iteration; echo and free-form are opt-in via
 # --echo / --freeform since 2026-07-14), MLX-format checkpoints only. Pass
 # --lmstudio and/or --omlx to add the apples-to-apples comparison cells that
-# produce charts in docs/perf-vs-lmstudio-omlx*.png — --lmstudio includes the
+# produce charts in docs/perf-pngs/perf-vs-lmstudio-omlx*.png — --lmstudio includes the
 # LM Studio GGUF alt cell (the canonical chart's BASELINE); pass --gguf to
 # also add the mlx-serve llama.cpp GGUF alt cell. Pass --concurrent N to also
 # emit batched throughput rows (folded from the old bench_concurrent.py).
@@ -39,7 +39,7 @@
 #     a default thinking mode, so the workaround is a no-op there.
 #
 # Output:
-#   - CSV at $OUT (default docs/perf-vs-lmstudio-omlx-<family>.csv) with rows:
+#   - CSV at $OUT (default docs/perf-csvs — data only; charts land in docs/perf-pngs/) with rows:
 #     label|engine|model|spec|prompt|prefill_tps|decode_tps|prompt_toks|completion_toks|hardware|notes
 #   - To generate the chart: python3 tests/plot_vs_lmstudio_omlx.py <csv> <png> [--family <family>]
 #
@@ -174,7 +174,7 @@ Options:
                        /v1/chat/completions are fired; the row's tok/s is the
                        aggregate rate. Default 0 (off).
   --out PATH           Chart PNG output path. Default is timestamped:
-                       docs/perf-vs-lmstudio-omlx-<family>-YYYYMMDD-HHMMSS.png
+                       docs/perf-pngs/perf-vs-lmstudio-omlx-<family>-YYYYMMDD-HHMMSS.png
                        The chart is skipped when no comparison engines are
                        enabled (a single-engine bar chart isn't useful).
   --keep-csv PATH      CSV output path. Default (since 2026-07-14):
@@ -244,7 +244,7 @@ cd "$REPO_ROOT"
 # each other (handy when sweeping over runs / comparing tweaks). Override
 # with --out PATH to pick an exact filename (e.g. one referenced by README).
 TS="$(date +%Y%m%d-%H%M%S)"
-[[ -z "$PNG_OUT" ]] && PNG_OUT="docs/perf-vs-lmstudio-omlx-${FAMILY}-${TS}.png"
+[[ -z "$PNG_OUT" ]] && PNG_OUT="docs/perf-pngs/perf-vs-lmstudio-omlx-${FAMILY}-${TS}.png"
 
 # The CSV is ALWAYS retained (2026-07-14): re-rendering / restyling a chart
 # from a kept CSV is free, re-running the bench is an hour. --keep-csv PATH
@@ -316,8 +316,18 @@ add_qwen36_targets() {
     # short hub id doesn't exist — but LM Studio JIT-loads the full
     # identifier fine (verified live 2026-07-14). The mtplxopt row has no
     # GGUF counterpart (MTPLX artifacts are MLX-only) — empty lms_alt.
+    #
+    # qwen36-27b's mlxserve_path is oMLX's OWN checkpoint (Jundot's oQ4e
+    # build, inline `language_model.mtp.*` trunk-shard weights — no sidecar
+    # dir) as of the 26.7.10 chart: this is oMLX's home-turf model + their
+    # native "Lightning" MTP (prepare_omlx_mtp auto-enables it via
+    # has_inline_mtp), loaded UNMODIFIED by mlx-serve too (same trunk-shard
+    # marker mechanism as the mtplxopt row's MTPLX artifact) — the point
+    # being mlx-serve can run oMLX's model but not vice versa. lms_baseline/
+    # lms_alt stay the vanilla mlx-community/GGUF ids (LM Studio can't load
+    # oMLX's inline-mtp layout) so those bars remain the plain-AR reference.
     TARGETS+=(
-        "qwen36-27b|$LMS_DIR/mlx-community/Qwen3.6-27B-4bit|qwen3.6-27b|lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf||$GGUF_DIR/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf"
+        "qwen36-27b|$MD/Jundot/Qwen3.6-27B-oQ4e-mtp|qwen3.6-27b|lmstudio-community/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf||$GGUF_DIR/Qwen3.6-27B-GGUF/Qwen3.6-27B-Q4_K_M.gguf"
         "qwen36-35b-a3b|$LMS_DIR/mlx-community/Qwen3.6-35B-A3B-4bit|qwen3.6-35b-a3b|lmstudio-community/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf||$GGUF_DIR/Qwen3.6-35B-A3B-GGUF/Qwen3.6-35B-A3B-Q4_K_M.gguf"
         "qwen36-27b-mtplxopt|$LMS_DIR/Youssofal/Qwen3.6-27B-MTPLX-Optimized-Speed|qwen3.6-27b-mtplx-optimized-speed|||"
     )
@@ -1108,18 +1118,21 @@ for row in "${TARGETS[@]}"; do
             continue
         fi
         # The `mtp` cell only makes sense on rows whose checkpoint ships an
-        # MTP sidecar (ANY of the four accepted layouts — mirrors
-        # mtp.sidecar_rel_paths in src/mtp.zig, incl. the OptiQ layout) —
-        # without one it would silently measure plain decode under an "mtp"
-        # label. NOTE: this must be an any-of check per file — `ls a b c`
-        # exits non-zero when ANY operand is missing, which silently
-        # skipped the mtp cell on EVERY row in the 2026-07-14 run (no model
-        # ships all three names).
+        # MTP head (ANY of the four sidecar layouts — mirrors
+        # mtp.sidecar_rel_paths in src/mtp.zig, incl. the OptiQ layout — OR
+        # inline `*.mtp.*` keys in the regular indexed trunk shards, e.g.
+        # oMLX's oQ4e checkpoints) — without one it would silently measure
+        # plain decode under an "mtp" label. NOTE: this must be an any-of
+        # check per file — `ls a b c` exits non-zero when ANY operand is
+        # missing, which silently skipped the mtp cell on EVERY row in the
+        # 2026-07-14 run (no model ships all three names).
         if [[ "$spec" == "mtp" &&
               ! -e "$mlxserve_path/mtp/weights.safetensors" &&
               ! -e "$mlxserve_path/mtp.safetensors" &&
               ! -e "$mlxserve_path/model-mtp.safetensors" &&
-              ! -e "$mlxserve_path/optiq/mtp.safetensors" ]]; then
+              ! -e "$mlxserve_path/optiq/mtp.safetensors" ]] &&
+           ! { [[ -f "$mlxserve_path/model.safetensors.index.json" ]] &&
+               grep -qi 'mtp' "$mlxserve_path/model.safetensors.index.json"; }; then
             continue
         fi
         row_mlx_specs+=("$spec")
@@ -1165,6 +1178,22 @@ for row in "${TARGETS[@]}"; do
             "mtplx|base")
                 [[ "$INCLUDE_MTPLX" -eq 1 ]] || continue
                 [[ "$HAS_MTPLX" -eq 1 ]] || { echo "  SKIP ${logical}/mtplx/${spec} (mtplx binary not found)" >&2; continue; }
+                # Gate on the artifact naming rather than trusting warmup to
+                # refuse (2026-07-23 finding): MTPLX does NOT reliably fail
+                # closed on a non-MTPLX-artifact checkpoint — it loads, its
+                # native MTP head engages (runtime_mtp_enabled:true), and
+                # produces GIBBERISH with near-zero draft acceptance
+                # (confirmed on both the new oQ4e row and the pre-existing
+                # Qwen3.6-35B-A3B-4bit row: mostly-non-language token soup,
+                # accepted_drafts ~0-10 of 100+ rejected) instead of an
+                # honest error — a chart showing a decode tok/s number for
+                # that cell would be measuring garbage output, not a real
+                # comparison. Only Youssofal/*-MTPLX-Optimized-* checkpoints
+                # are calibrated for MTPLX's MTP path.
+                if [[ "$(basename "$mlxserve_path")" != *MTPLX-Optimized* ]]; then
+                    echo "  SKIP ${logical}/mtplx/${spec} (not an MTPLX-verified artifact — MTPLX produces garbage output on foreign checkpoints, see comment)" >&2
+                    continue
+                fi
                 run_cell "${logical}/mtplx/${spec}"              "mtplx"     "$mlxserve_path" "$spec" "" ""
                 ;;
             "mlx-serve|alt")

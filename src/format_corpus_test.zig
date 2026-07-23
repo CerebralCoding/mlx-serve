@@ -901,6 +901,95 @@ const corpus = [_]Expect{
         .tool_arg_key = "path",
         .tool_arg_value = "page.html",
     },
+
+    // ── Laguna (poolside Laguna S 2.1, model_type "laguna"): BARE <tool_call>
+    // GLM-style tags (tokenizer tool_parser_type "glm47") + <think>/</think>.
+    // The chat template PRE-OPENS <think> at the generation prompt, so output
+    // starts inside reasoning (opened_by_template). Distinct from hy3's
+    // SUFFIXED <tool_call:sfx> + plural <tool_calls:sfx> wrapper — Laguna emits
+    // a BARE <tool_call> opener, the NAME, then arg_key/arg_value pairs, no
+    // plural wrapper. Entries are template-spec shaped (chat_template.jinja);
+    // replace with harvested live bytes once the 117.6B runs on GPU
+    // (MLX_SERVE_RAW_DUMP_FILE workflow above). ────────────────────────────
+    .{
+        .family = "laguna",
+        .name = "full think round, template-opened, plain close tag",
+        .raw = "The user wants 17*23. 17*20=340, 17*3=51, total 391.</think>17 × 23 = **391**.",
+        .thinking = true,
+        .opened_by_template = true,
+        .content_contains = "391",
+        .reasoning_contains = "total 391",
+    },
+    .{
+        .family = "laguna",
+        .name = "template-opened truncated thinking stays out of content",
+        .raw = "Let me compute step by step: 17*20 = 340, then",
+        .thinking = true,
+        .opened_by_template = true,
+        .content_exact = "",
+        .reasoning_contains = "step by step",
+    },
+    .{
+        // The load-bearing new-code case: a BARE <tool_call> opener (no :sfx)
+        // followed by the NAME then arg_key/arg_value pairs. parseHy3ToolCalls
+        // used to fall bare <tool_call> through to the Hermes JSON scan, which
+        // can't read the GLM body — the whole call leaked. String values stay
+        // strings; schema coercion types the boolean.
+        .family = "laguna",
+        .name = "bare <tool_call> GLM call after thinking, string→bool coercion",
+        .raw = "I should edit the file.</think><tool_call>Edit" ++
+            "<arg_key>file_path</arg_key><arg_value>src/main.py</arg_value>" ++
+            "<arg_key>old_string</arg_key><arg_value>x = 1</arg_value>" ++
+            "<arg_key>new_string</arg_key><arg_value>x = 2</arg_value>" ++
+            "<arg_key>replace_all</arg_key><arg_value>false</arg_value>" ++
+            "</tool_call>",
+        .thinking = true,
+        .opened_by_template = true,
+        .tools_json = edit_tool_schema,
+        .tool_name = "Edit",
+        .tool_arg_key = "file_path",
+        .tool_arg_value = "src/main.py",
+        .tool_bool_key = "replace_all",
+        .tool_bool_value = false,
+    },
+    .{
+        .family = "laguna",
+        .name = "consecutive bare <tool_call> calls each keep their own args",
+        .raw = "<tool_call>read<arg_key>path</arg_key><arg_value>a.txt</arg_value></tool_call>" ++
+            "<tool_call>read<arg_key>path</arg_key><arg_value>b.txt</arg_value></tool_call>",
+        .tools_json = write_read_tools_schema,
+        .tool_count = 2,
+        .tool_name = "read",
+        .tool_arg_key = "path",
+        .tool_arg_value = "a.txt",
+        .last_tool_arg_value = "b.txt",
+    },
+    .{
+        // Truncation: max_tokens landed inside the content arg_value (no closing
+        // </arg_value>, no </tool_call>). Recover the name + the one CLOSED pair;
+        // the fragment must never ship as a real argument.
+        .family = "laguna",
+        .name = "truncated mid-arg_value recovers name + closed args, drops fragment",
+        .raw = "<tool_call>write" ++
+            "<arg_key>path</arg_key><arg_value>novel.txt</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value>Chapter 1. It was a dark and stormy night and the",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "novel.txt",
+        .tool_arg_absent = "content",
+    },
+    .{
+        // Prose that merely NAMES the format pieces (no literal <tool_call> tag —
+        // the tags are special tokens a real generation won't casually emit
+        // mid-prose) must not parse as a call and must pass through as content.
+        .family = "laguna",
+        .name = "prose mentioning tool_call/arg_key is not a call",
+        .raw = "Laguna encodes each argument as an arg_key/arg_value pair inside the tool_call block.",
+        .tools_json = write_read_tools_schema,
+        .no_tool_calls = true,
+        .content_contains = "arg_key/arg_value pair",
+    },
 };
 
 /// Control tags that must never appear in visible content, regardless of

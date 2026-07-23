@@ -1,0 +1,10 @@
+# Keep the build context tiny — nothing here needs to ship into the image.
+.git
+.gitignore
+*.md
+Makefile
+node_modules
+__pycache__
+*.pyc
+.venv
+.env

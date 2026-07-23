@@ -44,7 +44,7 @@ final class Model3DGenService: ObservableObject {
             phase = .failed("Choose a photo first.")
             return
         }
-        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
+        guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
             phase = .failed("Model \(request.model.repo) isn't available locally. Convert it first.")
             return
         }
@@ -79,15 +79,14 @@ final class Model3DGenService: ObservableObject {
                     phase = .failed("Couldn't read the photo. Pick a PNG or JPEG.")
                     return
                 }
-                let port = try await server.ensureRunning(forGenModelDir: modelDir)
-                if Task.isCancelled { phase = .idle; return }
-                let info = try await server.loadModel(id: modelDir)  // registry id = dir basename
-                loadedId = info.name
+                let (port, modelId, unloadId) = try await server.prepareGenModel(
+                    lanModelId: request.lanModelId, repo: request.model.repo)
+                loadedId = unloadId
                 if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
                 // SSE: per-step `progress` events drive a determinate bar, then a
                 // `complete` event carries the GLB as base64.
                 var glb: Data? = nil
-                let genJson = Self.requestJson(for: request, modelName: info.name, imageB64: imageB64, seed: seedToSend)
+                let genJson = Self.requestJson(for: request, modelName: modelId, imageB64: imageB64, seed: seedToSend)
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/3d/generations",
                     json: genJson) {

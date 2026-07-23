@@ -10,6 +10,31 @@ class ServerManager: ObservableObject {
     /// loop. UI uses this for the "Loaded Models" section and the model
     /// picker. First entry mirrors `modelInfo` (server sorts default first).
     @Published var allModels: [ModelInfo] = []
+    /// Chat target when the user picked a LAN model in the tray: the remote
+    /// routing id (`<model>@<peer>`). nil = the local server's default model.
+    /// Persisted so the choice survives relaunch; cleared by picking a local
+    /// model. The local server (running with --lan-discover) proxies requests
+    /// naming this id to the hosting peer.
+    @Published var lanChatModelId: String? = UserDefaults.standard.string(forKey: "lanChatModelId") {
+        didSet { UserDefaults.standard.set(lanChatModelId, forKey: "lanChatModelId") }
+    }
+    /// The model id chat requests should carry: the LAN selection when set,
+    /// else the local default. Every chat surface reads THIS, never
+    /// `modelInfo?.name` directly, so a LAN selection applies everywhere.
+    var chatModelId: String? { lanChatModelId ?? modelInfo?.name }
+    /// Metadata for the chat model (context length, vision, architecture):
+    /// the LAN entry when one is selected and discovered, else the local
+    /// default's info.
+    var chatModelInfo: ModelInfo? {
+        if let lan = lanChatModelId, let info = allModels.first(where: { $0.name == lan }) { return info }
+        return modelInfo
+    }
+    /// Discovered LAN models advertising `capability` ("chat", "image",
+    /// "video", "music", "audio", "3d"). Empty when the server is down or
+    /// discovery is off — pickers then show local models only.
+    func lanModels(capability: String) -> [ModelInfo] {
+        allModels.filter { $0.lanAdvertises(capability) }
+    }
     @Published var memoryInfo: MemoryInfo?
     @Published var port: UInt16 = 11234
     @Published var currentModelPath: String = ""
@@ -61,11 +86,23 @@ class ServerManager: ObservableObject {
 
     var baseURL: String { "http://localhost:\(port)" }
 
+    /// Diff base for the Settings restart banner + per-row dirty dots: the
+    /// last-launched options while the process is LIVE, nil once it stops or
+    /// errors out. A dead server has nothing to restart — edited launch
+    /// flags simply apply on the next start, so showing "Restart Now" there
+    /// is a lie (live bite: the banner appeared on a stopped server).
+    var liveLaunchedOptions: ServerOptions? {
+        switch status {
+        case .running, .starting: return lastLaunchedOptions
+        case .stopped, .error: return nil
+        }
+    }
+
     /// True when the user has edited any server-launch field since the running
     /// process was started. Per-request defaults never trigger this — they
-    /// apply on the next chat request.
+    /// apply on the next chat request. Always false for a stopped server.
     func needsRestartFor(_ current: ServerOptions) -> Bool {
-        guard let last = lastLaunchedOptions else { return false }
+        guard let last = liveLaunchedOptions else { return false }
         return !last.serverLaunchEquals(current)
     }
 
@@ -525,7 +562,7 @@ class ServerManager: ObservableObject {
         // every 3 s for the lifetime of the session.
     }
 
-    private func refreshModels() async {
+    func refreshModels() async {
         if let all = try? await api.fetchAllModels(port: port) {
             allModels = all
             if let first = all.first { modelInfo = first }
@@ -546,6 +583,25 @@ class ServerManager: ObservableObject {
     func unloadModel(id: String) async throws {
         try await api.unloadModel(port: port, id: id)
         await refreshModels()
+    }
+
+    /// Media-gen model prep shared by all five gen services. A LAN model id
+    /// passes straight through — the hosting PEER loads on demand and manages
+    /// its own memory, so there is nothing to resolve, load, or unload here.
+    /// A local preset repo resolves to its downloaded dir and hot-loads.
+    /// Returns the id for the request body plus the id to unload afterward
+    /// (nil for LAN models).
+    func prepareGenModel(lanModelId: String?, repo: String) async throws -> (port: UInt16, modelId: String, unloadId: String?) {
+        if let lan = lanModelId {
+            let port = try await ensureRunning(forGenModelDir: "")
+            return (port, lan, nil)
+        }
+        guard let dir = Self.resolveModelDir(repo: repo) else {
+            throw GenServerError.modelMissing(repo)
+        }
+        let port = try await ensureRunning(forGenModelDir: dir)
+        let info = try await loadModel(id: dir)  // registry id = dir basename
+        return (port, info.name, info.name)
     }
 
     /// Errors surfaced to the media-gen services.

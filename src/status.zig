@@ -97,7 +97,7 @@ const VmStats64 = extern struct {
 };
 
 // ── CPU delta tracking (module-level state) ──
-var prev_ticks: [4]u64 = .{0} ** 4;
+var prev_ticks: [4]u64 = @splat(0);
 
 // ── Public metric helpers ──
 

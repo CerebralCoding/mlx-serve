@@ -105,9 +105,18 @@ pub fn parseReasoning(reasoning_val: ?std.json.Value, default_budget: i32) Reaso
     if (v != .object) return .{ .enable = false, .budget = default_budget };
     const effort_val = v.object.get("effort") orelse return .{ .enable = true, .budget = default_budget };
     if (effort_val != .string) return .{ .enable = true, .budget = default_budget };
-    const e = effort_val.string;
-    const budget: i32 = if (std.mem.eql(u8, e, "minimal")) 128 else if (std.mem.eql(u8, e, "low")) 512 else if (std.mem.eql(u8, e, "medium")) 2048 else if (std.mem.eql(u8, e, "high")) 8192 else default_budget;
-    return .{ .enable = true, .budget = budget };
+    return .{ .enable = true, .budget = effortBudget(effort_val.string, default_budget) };
+}
+
+/// Effort → thinking-budget mapping shared by the Responses `reasoning.effort`
+/// object and the chat-completions `reasoning_effort` string. Unknown efforts
+/// (model-dependent spec values like "xhigh") fall back to the default budget.
+pub fn effortBudget(effort: []const u8, default_budget: i32) i32 {
+    if (std.mem.eql(u8, effort, "minimal")) return 128;
+    if (std.mem.eql(u8, effort, "low")) return 512;
+    if (std.mem.eql(u8, effort, "medium")) return 2048;
+    if (std.mem.eql(u8, effort, "high")) return 8192;
+    return default_budget;
 }
 
 // ─── text.format → schema constraint ──────────────────────────────────────

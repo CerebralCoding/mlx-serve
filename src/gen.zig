@@ -35,9 +35,7 @@ const log = @import("log.zig");
 const metrics = @import("status.zig");
 const sse = @import("gen_sse.zig");
 const server_mod = @import("server.zig");
-const stb = @cImport({
-    @cInclude("stb_image.h");
-});
+const stb = @import("stb");
 
 const Conn = server_mod.Conn;
 
@@ -837,7 +835,7 @@ pub const VideoEngine = struct {
 
     fn hasVariant(self: *VideoEngine, io: std.Io, variant: TransformerVariant) bool {
         var buf: [1024]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&buf, "{s}/{s}", .{ self.model_dir, variant.fileName() }) catch return false;
+        const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ self.model_dir, variant.fileName() }, 0) catch return false;
         return fileExists(io, p);
     }
 
@@ -901,7 +899,7 @@ pub const VideoEngine = struct {
     pub fn ensureUpsampler(self: *VideoEngine, io: std.Io) !*const ltx.Component {
         if (self.upsampler) |*u| return u;
         var buf: [1024]u8 = undefined;
-        const p = std.fmt.bufPrintZ(&buf, "{s}/{s}.safetensors", .{ self.model_dir, ltx.UPSAMPLER_PREFIX }) catch return error.MissingUpsampler;
+        const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}.safetensors", .{ self.model_dir, ltx.UPSAMPLER_PREFIX }, 0) catch return error.MissingUpsampler;
         if (!fileExists(io, p)) return error.MissingUpsampler;
         const cpu_s = mlx.mlx_default_cpu_stream_new();
         var comp = try ltx.loadComponent(self.allocator, p, cpu_s);
@@ -938,7 +936,7 @@ fn loadTransformerVariant(allocator: std.mem.Allocator, model_dir: []const u8, v
 /// text-to-video unaffected). Mirrors `loadAudioVae`.
 fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, cpu_s: mlx.mlx_stream) ?ltx.Component {
     var p: [1024]u8 = undefined;
-    const path = std.fmt.bufPrintZ(&p, "{s}/vae_encoder.safetensors", .{model_dir}) catch return null;
+    const path = std.fmt.bufPrintSentinel(&p, "{s}/vae_encoder.safetensors", .{model_dir}, 0) catch return null;
     if (!fileExists(io, path)) {
         log.info("[video] no vae_encoder.safetensors in {s} — image-to-video disabled (text-to-video only)\n", .{model_dir});
         return null;
@@ -1132,8 +1130,8 @@ fn loadAudioVae(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8,
     } else model_dir;
     var ap: [1024]u8 = undefined;
     var vp: [1024]u8 = undefined;
-    const audio_path = std.fmt.bufPrintZ(&ap, "{s}/audio_vae.safetensors", .{dir}) catch return null;
-    const voc_path = std.fmt.bufPrintZ(&vp, "{s}/vocoder.safetensors", .{dir}) catch return null;
+    const audio_path = std.fmt.bufPrintSentinel(&ap, "{s}/audio_vae.safetensors", .{dir}, 0) catch return null;
+    const voc_path = std.fmt.bufPrintSentinel(&vp, "{s}/vocoder.safetensors", .{dir}, 0) catch return null;
     if (!fileExists(io, audio_path) or !fileExists(io, voc_path)) {
         log.info("[video] no audio VAE/vocoder in {s} — generated video will be silent\n", .{dir});
         return null;

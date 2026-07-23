@@ -2,6 +2,17 @@ import Combine
 import Foundation
 import SwiftUI
 
+/// Selection repair for `refreshModels`: keep a still-pickable selection,
+/// swap to the first pickable model otherwise, and CLEAR a dangling one when
+/// nothing pickable remains — a deleted models directory otherwise leaves the
+/// dead path persisted, and every start site (autostart, the LAN share boot,
+/// the tray Start button) launches `--model <gone>` into an instant
+/// FileNotFound.
+func reconciledModelSelection(current: String, pickablePaths: [String]) -> String {
+    if pickablePaths.contains(current) { return current }
+    return pickablePaths.first ?? ""
+}
+
 @MainActor
 class AppState: ObservableObject {
     @Published var server = ServerManager()
@@ -83,6 +94,14 @@ class AppState: ObservableObject {
     /// Set by the menu bar's Voice action; the chat detail view consumes it to
     /// auto-start Voice mode (whether the window was already open or just opened).
     @Published var pendingVoiceLaunch = false
+    /// Set by the tray's "pi/hermes in Sandbox" shortcut; the Sandbox window
+    /// consumes it (focus a running session of that agent, else start one)
+    /// and clears it. Fresh `id` per click so repeat clicks re-fire onChange.
+    struct SandboxAgentLaunch: Equatable {
+        let id = UUID()
+        let agentId: String
+    }
+    @Published var pendingSandboxAgentLaunch: SandboxAgentLaunch?
     @Published var agentMemory = AgentMemory()
     @Published var toolExecutor = ToolExecutor()
     /// Owns every agent-spawned background process (started via shell
@@ -114,8 +133,13 @@ class AppState: ObservableObject {
             // Push the agent-sandbox setting to the shared manager so the next
             // shell command routes to the guest (or the host) accordingly.
             AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
-                                          baseImage: serverOptions.sandbox.baseImage,
                                           network: serverOptions.sandbox.network)
+            // Turning LAN sharing/discovery ON means "the server runs" — boot
+            // it (headless if no model is selected) on the transition only, so
+            // unrelated settings edits never start anything.
+            let lanOn = serverOptions.lanShareEnabled || serverOptions.lanDiscoverEnabled
+            let lanWasOn = oldValue.lanShareEnabled || oldValue.lanDiscoverEnabled
+            if lanOn && !lanWasOn { ensureServerForLan() }
         }
     }
     /// Legacy bridge: `maxTokens` is now stored in `serverOptions.defaultMaxTokens`.
@@ -236,7 +260,6 @@ class AppState: ObservableObject {
 
         // Same for the agent sandbox: apply the persisted setting once at launch.
         AgentSandbox.shared.configure(enabled: serverOptions.sandbox.enabled,
-                                      baseImage: serverOptions.sandbox.baseImage,
                                       network: serverOptions.sandbox.network)
 
         // And the quick launcher's global ⌃Space hotkey.
@@ -267,6 +290,12 @@ class AppState: ObservableObject {
         if autoStartServer, !selectedModelPath.isEmpty {
             server.start(modelPath: selectedModelPath, options: serverOptions)
         }
+        // LAN sharing/discovery lives in the server process — with either
+        // enabled the server should be up (headless when nothing was
+        // auto-started) so this Mac shares and sees network models.
+        if serverOptions.lanShareEnabled || serverOptions.lanDiscoverEnabled {
+            ensureServerForLan()
+        }
 
         // Fallback health detection — runs detached to avoid blocking MainActor
         if autoStartServer {
@@ -285,6 +314,36 @@ class AppState: ObservableObject {
         }
     }
 
+    /// Chat on a LAN model: record the remote id and make sure the (proxying)
+    /// local server is up — headless when no local model is selected. The
+    /// remote id rides every chat request via `server.chatModelId`.
+    func selectLanModel(_ id: String) {
+        server.lanChatModelId = id
+        ensureServerForLan()
+    }
+
+    /// Start the server for LAN duty if it isn't running: with the selected
+    /// local model when there is one (it keeps serving chat AND the LAN),
+    /// else headless over the models root.
+    func ensureServerForLan() {
+        guard server.status != .running, server.status != .starting else { return }
+        if !selectedModelPath.isEmpty {
+            server.start(modelPath: selectedModelPath, options: serverOptions)
+        } else {
+            let root = NSString(string: "~/.mlx-serve/models").expandingTildeInPath
+            server.startHeadless(modelsDir: root, options: serverOptions)
+        }
+    }
+
+    /// Freshen the network-model list for a picker that is about to show it.
+    /// No-op when discovery is off; boots the server (headless) when needed.
+    func refreshLanModels() async {
+        guard serverOptions.lanDiscoverEnabled else { return }
+        ensureServerForLan()
+        try? await server.waitUntilRunning(timeout: 60)
+        await server.refreshModels()
+    }
+
     func refreshModels() {
         localModels = downloads.discoverLocalModels()
         // Auto-select a base model if none selected or the current selection is
@@ -292,10 +351,9 @@ class AppState: ObservableObject {
         // they aren't loadable as the primary chat model (must match the tray
         // picker's filter, or the selection points at a hidden row).
         let baseModels = localModels.filter { $0.isChatPickable }
-        if baseModels.first(where: { $0.path == selectedModelPath }) == nil,
-           let first = baseModels.first {
-            selectedModelPath = first.path
-        }
+        let repaired = reconciledModelSelection(current: selectedModelPath,
+                                                pickablePaths: baseModels.map(\.path))
+        if repaired != selectedModelPath { selectedModelPath = repaired }
     }
 
     /// What `useModelAndAwaitReady` must do once `selectedModelPath`'s
@@ -390,6 +448,26 @@ class AppState: ObservableObject {
             activeChatId = chatSessions.first?.id
         }
         saveChatHistory()
+    }
+
+    /// Apply a new DEFAULT agent workspace picked in Settings: persist the
+    /// setting, keep a security-scoped bookmark so the App Sandbox build can
+    /// reach the folder after relaunch, retarget sessions still on the old
+    /// default (the chat toolbar folder stays in sync with Settings), and
+    /// remount the sandbox. An EXPLICIT pick remounts even under live CLI
+    /// sessions (`restartPinnedSessions` — the Sandbox window restarts them
+    /// in the new share); without it, a live terminal quietly kept the old
+    /// folder mounted until an app restart.
+    func setDefaultAgentWorkspace(_ path: String) {
+        let old = ChatSession.defaultWorkingDirectory
+        ChatSession.setDefaultWorkingDirectory(path)
+        SecurityScopedBookmark.store(URL(fileURLWithPath: path),
+                                     name: SecurityScopedBookmark.defaultWorkspaceName)
+        SecurityScopedBookmark.startAccessOnce(name: SecurityScopedBookmark.defaultWorkspaceName)
+        agentMemory.recordDirectory(path)
+        chatSessions = ChatSession.retargeted(chatSessions, from: old, to: path)
+        saveChatHistory()
+        AgentSandbox.shared.noteWorkspaceChanged(path, restartPinnedSessions: true)
     }
 
     var activeSession: ChatSession? {

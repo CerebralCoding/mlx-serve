@@ -470,4 +470,27 @@ final class MCPTests: XCTestCase {
         XCTAssertTrue(out.contains("doc") && out.contains("https://x.test/doc"))
         XCTAssertEqual(MCPManager.renderToolContent([]), "(no content)")
     }
+
+    /// The sandbox placement observer must never EAGERLY start servers: the
+    /// launch-time `configure()` also announces a placement change, and at that
+    /// point nothing is running yet — restart is strictly "respawn what was
+    /// already running", so with zero sessions it must not touch the config's
+    /// enabled entries (not even to record a spawn failure).
+    @MainActor func testSandboxRestartNoOpsWhenNothingIsRunning() async throws {
+        // Sandbox the mcp.json path (same pattern as MCPDockerSpawnTests) so the
+        // test never clobbers the user's real config.
+        let dir = NSTemporaryDirectory().appending("mcp-restart-\(UUID().uuidString)")
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        setenv("MCP_CONFIG_PATH", (dir as NSString).appendingPathComponent("mcp.json"), 1)
+        defer { unsetenv("MCP_CONFIG_PATH"); try? FileManager.default.removeItem(atPath: dir) }
+        let manager = MCPManager()
+        var config = MCPConfig()
+        config.mcpServers["would-spawn"] = MCPServerEntry(
+            command: "/usr/bin/false", args: [], env: nil, disabled: false)
+        try manager.saveConfig(config)
+        await manager.restartStdioForSandboxChange()
+        XCTAssertTrue(manager.sessions.isEmpty, "restart must not spawn anything by itself")
+        XCTAssertTrue(manager.startErrors.isEmpty,
+                      "a spawn attempt would have recorded a failure for /usr/bin/false — restart must not reach startEnabled with zero running sessions")
+    }
 }

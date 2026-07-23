@@ -58,15 +58,17 @@ pub const MtpCostProfile = enum {
     generic,
     g17_nax_q8_gs32,
     g17_nax_q4_gs32,
+    g17_nax_oq4e_q4_gs64,
 };
 
 fn m5NaxCostProfileForQuant(bits: u32, group_size: u32) MtpCostProfile {
-    if (group_size != 32) return .generic;
-    return switch (bits) {
+    if (bits == 4 and group_size == 64) return .g17_nax_oq4e_q4_gs64;
+    if (group_size == 32) return switch (bits) {
         8 => .g17_nax_q8_gs32,
         4 => .g17_nax_q4_gs32,
         else => .generic,
     };
+    return .generic;
 }
 
 /// Prefill history windowing (OPT-IN via `--mtp-history-window <n>`; mirrors
@@ -288,12 +290,21 @@ pub const MtpModel = struct {
     /// q8/gs-32 and q4/gs-32 draft costs are calibrated independently.
     /// Compatible but off-profile geometry remains correct under `generic`.
     pub fn m5NaxCostProfile(self: *const MtpModel, target: *const Transformer) MtpCostProfile {
-        if (!target.mtpNaxProfileEnabled()) return .generic;
         if (self.eh_proj != null) return .generic;
         const profile = m5NaxCostProfileForQuant(self.quant_bits, self.quant_group_size);
+        switch (profile) {
+            .g17_nax_oq4e_q4_gs64 => if (!target.mtpOqeNaxProfileEnabled()) return .generic,
+            .g17_nax_q8_gs32, .g17_nax_q4_gs32 => if (!target.mtpNaxProfileEnabled()) return .generic,
+            .generic => return .generic,
+        }
         const sidecar_bits: u32 = switch (profile) {
             .g17_nax_q8_gs32 => 8,
-            .g17_nax_q4_gs32 => 4,
+            .g17_nax_q4_gs32, .g17_nax_oq4e_q4_gs64 => 4,
+            .generic => return .generic,
+        };
+        const sidecar_group_size: u32 = switch (profile) {
+            .g17_nax_q8_gs32, .g17_nax_q4_gs32 => 32,
+            .g17_nax_oq4e_q4_gs64 => 64,
             .generic => return .generic,
         };
 
@@ -340,7 +351,7 @@ pub const MtpModel = struct {
                         .full_out = full_out,
                         .intermediate = cfg.intermediate_size,
                         .bits = sidecar_bits,
-                        .group_size = 32,
+                        .group_size = sidecar_group_size,
                     },
                 )) return .generic;
             },
@@ -427,7 +438,7 @@ pub const MtpModel = struct {
         // The head's TRUE params, not the trunk global — mixed checkpoints
         // (hy_v3: 8-bit head over a 2-bit trunk) diverge, and requantizing
         // with the wrong source bits reads garbage.
-        const head_qp = headQuantParams(target);
+        const head_qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
         if (bits >= head_qp.bits) return; // no byte saving over the trunk head
         const group: u32 = 64;
 
@@ -483,13 +494,139 @@ pub fn resolveMtpSidecarInDir(io: std.Io, dir: std.Io.Dir) ?[]const u8 {
     return null;
 }
 
-/// True when `model_dir` carries an MTP sidecar file we know how to load.
-/// `model_dir` is absolute (same contract as `model.parseConfig`).
-pub fn hasMtpSidecar(io: std.Io, model_dir: []const u8) bool {
+/// Where a model's MTP head lives.
+pub const MtpSource = union(enum) {
+    /// A separate sidecar file — rel path, one of `sidecar_rel_paths`.
+    sidecar_file: []const u8,
+    /// Inside the main checkpoint safetensors (Qwen HF releases and oMLX
+    /// oQ4e-class conversions ship `[language_model.]mtp.*` in the trunk
+    /// shards). Loading reads ONLY the shards the index names for mtp keys.
+    in_checkpoint,
+};
+
+/// Marker projections that prove a LOADABLE head: `fc` (Qwen dense/MoE
+/// layouts) or `eh_proj` (hy3). Discovery and the shard sweep both gate on
+/// this same set, so a checkpoint with stray `mtp.*` auxiliaries but no
+/// marker never claims a head it can't bind.
+const mtp_marker_keys = [_][]const u8{
+    "mtp.fc.weight",
+    "language_model.mtp.fc.weight",
+    "mtp.eh_proj.weight",
+    "language_model.mtp.eh_proj.weight",
+};
+
+/// Any tensor belonging to the head (either root prefix).
+fn isMtpHeadKey(key: []const u8) bool {
+    return std.mem.startsWith(u8, key, "mtp.") or
+        std.mem.indexOf(u8, key, ".mtp.") != null;
+}
+
+/// Sanity bound for index.json / safetensors headers (the Jundot 27B index
+/// is ~212 KB; headers of the largest checkpoints stay well under this).
+const checkpoint_header_limit: usize = 64 * 1024 * 1024;
+
+/// Parse a sharded checkpoint's `model.safetensors.index.json` and return
+/// the unique shard basenames holding MTP-head tensors, in first-seen order
+/// (caller frees each name + the slice). Empty when the checkpoint carries
+/// no loadable head — the sweep is gated on `mtp_marker_keys`, so partial
+/// auxiliaries never produce a doomed load.
+fn mtpShardsFromIndexJson(allocator: std.mem.Allocator, bytes: []const u8) ![][]u8 {
+    var out: std.ArrayList([]u8) = .empty;
+    errdefer {
+        for (out.items) |sh| allocator.free(sh);
+        out.deinit(allocator);
+    }
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch
+        return out.toOwnedSlice(allocator);
+    defer parsed.deinit();
+    if (parsed.value != .object) return out.toOwnedSlice(allocator);
+    const weight_map = parsed.value.object.get("weight_map") orelse
+        return out.toOwnedSlice(allocator);
+    if (weight_map != .object) return out.toOwnedSlice(allocator);
+
+    var has_marker = false;
+    for (&mtp_marker_keys) |marker| {
+        if (weight_map.object.get(marker) != null) {
+            has_marker = true;
+            break;
+        }
+    }
+    if (!has_marker) return out.toOwnedSlice(allocator);
+
+    var it = weight_map.object.iterator();
+    outer: while (it.next()) |entry| {
+        if (!isMtpHeadKey(entry.key_ptr.*)) continue;
+        if (entry.value_ptr.* != .string) continue;
+        const shard = entry.value_ptr.string;
+        for (out.items) |seen| {
+            if (std.mem.eql(u8, seen, shard)) continue :outer;
+        }
+        try out.append(allocator, try allocator.dupe(u8, shard));
+    }
+    return out.toOwnedSlice(allocator);
+}
+
+/// Read a file under `dir` fully (bounded); null on absence or overflow.
+fn readDirFileAlloc(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, sub_path: []const u8, limit: usize) ?[]u8 {
+    const f = dir.openFile(io, sub_path, .{}) catch return null;
+    defer f.close(io);
+    var rb: [8192]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    return rs.interface.allocRemaining(allocator, .limited(limit)) catch null;
+}
+
+/// True when the sharded index names an in-checkpoint head.
+fn indexJsonHasMtpHead(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) bool {
+    const bytes = readDirFileAlloc(io, allocator, dir, "model.safetensors.index.json", checkpoint_header_limit) orelse return false;
+    defer allocator.free(bytes);
+    const shards = mtpShardsFromIndexJson(allocator, bytes) catch return false;
+    defer {
+        for (shards) |sh| allocator.free(sh);
+        allocator.free(shards);
+    }
+    return shards.len > 0;
+}
+
+/// Single-file checkpoints have no index — peek the safetensors JSON header
+/// (8-byte LE length prefix) for a marker key, without touching tensor data.
+/// Marker names are plain ASCII (dots/letters), so a quoted substring scan
+/// is exact — no JSON-escape variants exist for them.
+fn safetensorsHeaderHasMtpHead(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, sub_path: []const u8) bool {
+    const f = dir.openFile(io, sub_path, .{}) catch return false;
+    defer f.close(io);
+    var rb: [8192]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const header_len = rs.interface.takeInt(u64, .little) catch return false;
+    if (header_len == 0 or header_len > checkpoint_header_limit) return false;
+    const header = allocator.alloc(u8, @intCast(header_len)) catch return false;
+    defer allocator.free(header);
+    rs.interface.readSliceAll(header) catch return false;
+    for (&mtp_marker_keys) |marker| {
+        var quoted_buf: [64]u8 = undefined;
+        const quoted = std.fmt.bufPrint(&quoted_buf, "\"{s}\"", .{marker}) catch continue;
+        if (std.mem.indexOf(u8, header, quoted) != null) return true;
+    }
+    return false;
+}
+
+/// Resolve where (if anywhere) this model's MTP head lives. A sidecar file
+/// always outranks an in-checkpoint head so repos shipping both keep
+/// loading exactly what they loaded before.
+pub fn resolveMtpSource(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir) ?MtpSource {
+    if (resolveMtpSidecarInDir(io, dir)) |rel| return .{ .sidecar_file = rel };
+    if (indexJsonHasMtpHead(io, allocator, dir)) return .in_checkpoint;
+    if (safetensorsHeaderHasMtpHead(io, allocator, dir, "model.safetensors")) return .in_checkpoint;
+    return null;
+}
+
+/// True when `model_dir` carries an MTP head we know how to load — a
+/// sidecar file OR in-checkpoint tensors. `model_dir` is absolute (same
+/// contract as `model.parseConfig`).
+pub fn hasMtpHead(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return false;
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
     defer dir.close(io);
-    return resolveMtpSidecarInDir(io, dir) != null;
+    return resolveMtpSource(io, allocator, dir) != null;
 }
 
 fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
@@ -574,6 +711,80 @@ fn ownNorm(w: *const Weights, key: []const u8, s: mlx.mlx_stream, fold: bool) !m
     const owned = try ownWeight(w, key);
     if (!fold) return owned;
     defer _ = mlx.mlx_array_free(owned);
+    return foldNormPlusOne(owned, s);
+}
+
+/// oMLX's `norm_repair` margin: a head RMSNorm whose mean sits more than this
+/// below its backbone anchor is missing the `+1` zero-centered-gamma shift.
+/// Mirrors `_REPAIR_MARGIN` in oMLX `patches/mlx_lm_mtp/norm_repair.py`.
+pub const MTP_NORM_REPAIR_MARGIN: f32 = 0.4;
+
+/// Mean of `arr` cast to f32 over all axes (RMSNorm gammas are 1-D). Same
+/// eval-then-item pattern as `negFraction`.
+fn arrayMeanF32(arr: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_astype(&f, arr, .float32, s));
+    var m = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(m);
+    try mlx.check(mlx.mlx_mean(&m, f, false, s));
+    try mlx.check(mlx.mlx_array_eval(m));
+    var out: f32 = 0;
+    try mlx.check(mlx.mlx_array_item_float32(&out, m));
+    return out;
+}
+
+/// oMLX `norm_repair` rule (pure): repair (fold `+1`) when the head norm's mean
+/// sits more than the margin below its backbone anchor. A correctly-stored head
+/// norm sits at/above its anchor (gap ≤ 0 → false); idempotent — after the `+1`
+/// the mean lands above the anchor, so a second pass is a no-op.
+fn mtpNormNeedsRepair(head_mean: f32, anchor: f32) bool {
+    return anchor - head_mean > MTP_NORM_REPAIR_MARGIN;
+}
+
+/// Anchor for a vulnerable head norm = mean-of-means of the BACKBONE
+/// counterpart norms carried in the same payload (non-`mtp.`, 1-D, ending in
+/// `suffix`). `null` when none are present: a sidecar head ships mtp-only
+/// weights, so there is no anchor and the reference repair is skipped (those
+/// heads never had the oQ bug — their delta norms ride the global fold).
+/// Mirrors oMLX's reference-mean pass in `norm_repair.py`.
+fn mtpBackboneAnchorMean(w: *const Weights, suffix: []const u8, s: mlx.mlx_stream) ?f32 {
+    var it = w.map.iterator();
+    var sum: f32 = 0;
+    var n: u32 = 0;
+    while (it.next()) |entry| {
+        const key = entry.key_ptr.*;
+        if (std.mem.indexOf(u8, key, "mtp.") != null) continue;
+        if (!std.mem.endsWith(u8, key, suffix)) continue;
+        if (mlx.mlx_array_ndim(entry.value_ptr.*) != 1) continue;
+        const mean = arrayMeanF32(entry.value_ptr.*, s) catch continue;
+        sum += mean;
+        n += 1;
+    }
+    if (n == 0) return null;
+    return sum / @as(f32, @floatFromInt(n));
+}
+
+/// Own a vulnerable head RMSNorm with oMLX-style reference-based repair. When
+/// the global delta-fold already handled this head (`fold`), return it verbatim
+/// (both would double-shift). Otherwise, if a backbone anchor exists and the
+/// head norm sits a full `+1` below it (`mtpNormNeedsRepair`), fold `+1`; else
+/// leave it untouched. `backbone_suffix` is the head norm's `_REPAIR_GROUPS`
+/// counterpart (e.g. `mtp.norm.weight` → `model.norm.weight`).
+fn ownHeadNormWithRepair(
+    w: *const Weights,
+    head_key: []const u8,
+    backbone_suffix: []const u8,
+    s: mlx.mlx_stream,
+    fold: bool,
+) !mlx.mlx_array {
+    const owned = try ownNorm(w, head_key, s, fold);
+    if (fold) return owned;
+    const anchor = mtpBackboneAnchorMean(w, backbone_suffix, s) orelse return owned;
+    const head_mean = arrayMeanF32(owned, s) catch return owned;
+    if (!mtpNormNeedsRepair(head_mean, anchor)) return owned;
+    defer _ = mlx.mlx_array_free(owned);
+    log.info("[mtp] repairing head norm {s}: mean {d:.3} < backbone anchor {d:.3} (+1)\n", .{ head_key, head_mean, anchor });
     return foldNormPlusOne(owned, s);
 }
 
@@ -777,22 +988,66 @@ fn loadMoeTriple(w: *const Weights, prefix: []const u8) !struct { w: mlx.mlx_arr
     };
 }
 
-/// Load the MTP head from the model's sidecar file (any `sidecar_rel_paths`
-/// layout — native `mtp/weights.safetensors` and other compatible ones).
+/// Load the head's weights from the MAIN checkpoint: the shards the index
+/// names for `mtp.*` keys (typically one), or the single
+/// `model.safetensors` when there is no index. Safetensors loads are
+/// lazy/mmapped — pulling a multi-GB shard in costs its header parse; only
+/// the head's tensors ever materialize, and `weights.deinit()` after the
+/// head build releases the rest untouched.
+fn loadMtpWeightsFromCheckpoint(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !model_mod.Weights {
+    var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
+    defer dir.close(io);
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+
+    if (readDirFileAlloc(io, allocator, dir, "model.safetensors.index.json", checkpoint_header_limit)) |bytes| {
+        defer allocator.free(bytes);
+        const shards = try mtpShardsFromIndexJson(allocator, bytes);
+        defer {
+            for (shards) |sh| allocator.free(sh);
+            allocator.free(shards);
+        }
+        if (shards.len == 0) return error.MissingMtpWeight;
+        var weights = model_mod.Weights.init(allocator);
+        errdefer weights.deinit();
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        for (shards) |sh| {
+            const p = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, sh });
+            const pz = try allocator.dupeSentinel(u8, p, 0);
+            defer allocator.free(pz);
+            try model_mod.loadSafetensorsFile(allocator, &weights, pz, s, false);
+        }
+        return weights;
+    }
+    const single = try std.fmt.bufPrint(&path_buf, "{s}/model.safetensors", .{model_dir});
+    return model_mod.loadWeightsSingleFile(allocator, single);
+}
+
+/// Load the MTP head: from the model's sidecar file (any `sidecar_rel_paths`
+/// layout — native `mtp/weights.safetensors` and other compatible ones) or
+/// straight from the main checkpoint when the head rides the trunk shards.
 pub fn loadMtp(
     io: std.Io,
     allocator: std.mem.Allocator,
     s: mlx.mlx_stream,
     model_dir: []const u8,
 ) !MtpModel {
-    const rel = blk: {
+    const source = blk: {
         var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
         defer dir.close(io);
-        break :blk resolveMtpSidecarInDir(io, dir) orelse return error.MissingMtpWeight;
+        break :blk resolveMtpSource(io, allocator, dir) orelse return error.MissingMtpWeight;
     };
-    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-    const sidecar_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, rel });
-    var weights = try model_mod.loadWeightsSingleFile(allocator, sidecar_path);
+    var weights = switch (source) {
+        .sidecar_file => |rel| blk: {
+            var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+            const sidecar_path = try std.fmt.bufPrint(&path_buf, "{s}/{s}", .{ model_dir, rel });
+            break :blk try model_mod.loadWeightsSingleFile(allocator, sidecar_path);
+        },
+        .in_checkpoint => blk: {
+            log.info("[mtp] loading in-checkpoint head from the trunk shards\n", .{});
+            break :blk try loadMtpWeightsFromCheckpoint(io, allocator, model_dir);
+        },
+    };
     defer weights.deinit();
 
     const p = mtpKeyPrefix(&weights);
@@ -827,11 +1082,16 @@ pub fn loadMtp(
         .fc_w_t = try ownAndTranspose2D(&weights, K.k(&kb, p, "fc.weight"), s),
         .pre_fc_norm_emb = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_embedding.weight"), s, fold_norms),
         .pre_fc_norm_hidden = try ownNorm(&weights, K.k(&kb, p, "pre_fc_norm_hidden.weight"), s, fold_norms),
-        .final_norm = try ownNorm(&weights, K.k(&kb, p, "norm.weight"), s, fold_norms),
+        // The 4 norms an oQ `mean<0.5 → +1` conversion can leave a full +1 too
+        // low (their raw HF means sit above 0.5): fold or repair per oMLX's
+        // norm_repair — the global delta-fold when it fired, else a reference
+        // anchor from the backbone counterpart. pre_fc_norm_* + input_norm are
+        // always converted correctly, so they stay on plain ownNorm.
+        .final_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "norm.weight"), "model.norm.weight", s, fold_norms),
         .input_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.input_layernorm.weight"), s, fold_norms),
-        .post_attn_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight"), s, fold_norms),
-        .q_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight"), s, fold_norms),
-        .k_norm = try ownNorm(&weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight"), s, fold_norms),
+        .post_attn_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.post_attention_layernorm.weight"), ".post_attention_layernorm.weight", s, fold_norms),
+        .q_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.self_attn.q_norm.weight"), ".self_attn.q_norm.weight", s, fold_norms),
+        .k_norm = try ownHeadNormWithRepair(&weights, K.k(&kb, p, "layers.0.self_attn.k_norm.weight"), ".self_attn.k_norm.weight", s, fold_norms),
         .q = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.q_proj"), s),
         .k = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.k_proj"), s),
         .v = try loadLinear(&weights, allocator, K.k(&kb, p, "layers.0.self_attn.v_proj"), s),
@@ -916,8 +1176,8 @@ pub fn loadMtp(
             },
             .moe => |*mw| {
                 const moe_ws = [_]mlx.mlx_array{
-                    mw.router_w, mw.switch_gate_w, mw.switch_up_w, mw.switch_down_w,
-                    mw.shared_gate_w, mw.shared_up_w, mw.shared_down_w,
+                    mw.router_w,      mw.switch_gate_w, mw.switch_up_w,   mw.switch_down_w,
+                    mw.shared_gate_w, mw.shared_up_w,   mw.shared_down_w,
                 };
                 for (moe_ws) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
                 if (mw.shared_expert_gate_w) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
@@ -1033,8 +1293,8 @@ fn loadHy3Mtp(
         for (base) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
         const mw = &m.mlp.moe;
         const moe_ws = [_]mlx.mlx_array{
-            mw.router_w, mw.switch_gate_w, mw.switch_up_w, mw.switch_down_w,
-            mw.shared_gate_w, mw.shared_up_w, mw.shared_down_w,
+            mw.router_w,      mw.switch_gate_w, mw.switch_up_w,   mw.switch_down_w,
+            mw.shared_gate_w, mw.shared_up_w,   mw.shared_down_w,
         };
         for (moe_ws) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
         if (mw.expert_bias) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
@@ -1195,7 +1455,7 @@ fn targetLmHead(self: *const MtpModel, target: *Transformer, x: mlx.mlx_array, s
     // (hy_v3 2-bit trunk ships an 8-bit lm_head — the global bits crashed the
     // whole process in mlx's shape check, live 2026-07-14). Non-affine trunks
     // keep the config fallback.
-    const qp = headQuantParams(target);
+    const qp = headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
     try mlx.check(mlx.mlx_quantized_matmul(
         &out,
         x,
@@ -1211,20 +1471,15 @@ fn targetLmHead(self: *const MtpModel, target: *Transformer, x: mlx.mlx_array, s
     return out;
 }
 
-/// The trunk lm_head's TRUE quant params — solved from tensor geometry when
-/// affine (the head's bits routinely differ from the trunk global on mixed
-/// checkpoints), config fallback otherwise.
-fn headQuantParams(target: *Transformer) transformer_mod.QuantParams {
-    if (transformer_mod.affineParamsFromGeometry(
-        target.lm_head_w,
-        target.lm_head_s,
-        @intCast(target.config.hidden_size),
-    )) |qp| return qp;
-    return .{
-        .bits = target.config.quant_bits,
-        .group_size = target.config.quant_group_size,
-        .mode = target.config.quant_mode,
-    };
+/// The trunk lm_head's TRUE quant params, via the same dtype-gated resolver
+/// the trunk itself uses: uint8 scales → the config's non-affine mode (a raw
+/// geometry solve mis-reads mxfp8 8-bit/gs32 as AFFINE 8-bit/gs32 — issue
+/// #81, "Biases must be provided" crash on biasless heads); float scales →
+/// exact per-geometry affine solve (the head's bits routinely differ from
+/// the trunk global on mixed checkpoints — hy_v3 ships an 8-bit head over a
+/// 2-bit trunk).
+fn headQuantParams(config: *const model_mod.ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array) transformer_mod.QuantParams {
+    return transformer_mod.computeQuantParams(config, w, sc, config.hidden_size);
 }
 
 /// Outputs of the pre-rope half of the MTP layer. All arrays owned.
@@ -1610,7 +1865,7 @@ test "mtp: loadMtp detects the Hy3 layout (eh_proj + full decoder layer + sigmoi
             fn putF32(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int) void {
                 var total: usize = 1;
                 for (shape) |d| total *= @intCast(d);
-                var data: [16]f32 = .{0.0} ** 16;
+                var data: [16]f32 = @splat(0.0);
                 const f32_arr = mlx.mlx_array_new_data(&data, shape.ptr, @intCast(shape.len), .float32);
                 defer _ = mlx.mlx_array_free(f32_arr);
                 _ = mlx.mlx_map_string_to_array_insert(m, key, f32_arr);
@@ -1715,6 +1970,63 @@ test "mtp: requantizeRows round-trips through a finer re-encode (chunked)" {
     try testing.expectEqual(@as(c_int, @intCast(cols / 4)), w8_shape[1]);
 }
 
+test "mtp: requantizeRows accepts a non-affine (mxfp8) source — the issue-#81 draft-head path" {
+    // With headQuantParams fixed, buildDraftHead on an mxfp8 trunk passes
+    // mode="mxfp8" and the load path's null-ctx biases into requantizeRows.
+    // The source dequantize must ride that without demanding affine biases
+    // (else the crash just moves from the first forward to bind time), and
+    // the 3-bit affine draft re-encode must stay correlated.
+    const s = mlx.gpuStream();
+    const rows: usize = 64;
+    const cols: usize = 256;
+
+    var prng = std.Random.DefaultPrng.init(7);
+    const buf = try testing.allocator.alloc(f32, rows * cols);
+    defer testing.allocator.free(buf);
+    for (buf) |*x| x.* = prng.random().floatNorm(f32);
+    const shape = [_]c_int{ @intCast(rows), @intCast(cols) };
+    const dense_f32 = mlx.mlx_array_new_data(buf.ptr, &shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(dense_f32);
+    var dense = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dense);
+    try mlx.check(mlx.mlx_astype(&dense, dense_f32, .bfloat16, s));
+
+    // mxfp8 "trunk head": a (w, scales) pair — no biases tensor, by design.
+    var pair = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(pair);
+    try mlx.check(mlx.mlx_quantize(&pair, dense, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{}, s));
+    var qmx = QLinear{ .w = mlx.mlx_array_new(), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() };
+    defer qmx.deinit();
+    try mlx.check(mlx.mlx_vector_array_get(&qmx.w, pair, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&qmx.s, pair, 1));
+    // qmx.b stays null-ctx — exactly what the load path hands buildDraftHead.
+
+    // The live buildDraftHead call shape: 3-bit/gs64 draft re-encode, chunked.
+    var q3 = try requantizeRows(s, qmx.w, qmx.s, qmx.b, 32, 8, "mxfp8", 64, 3, 16);
+    defer q3.deinit();
+
+    var deq = [2]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (deq) |d| {
+        _ = mlx.mlx_array_free(d);
+    };
+    try mlx.check(mlx.mlx_dequantize(&deq[0], qmx.w, qmx.s, qmx.b, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "mxfp8", .{}, .{ .value = .float32, .has_value = true }, s));
+    try mlx.check(mlx.mlx_dequantize(&deq[1], q3.w, q3.s, q3.b, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(3), "affine", .{}, .{ .value = .float32, .has_value = true }, s));
+    for (deq) |d| try mlx.check(mlx.mlx_array_eval(d));
+
+    const a = mlx.mlx_array_data_float32(deq[0]).?;
+    const b = mlx.mlx_array_data_float32(deq[1]).?;
+    var dot: f64 = 0;
+    var na: f64 = 0;
+    var nb: f64 = 0;
+    for (0..rows * cols) |i| {
+        dot += @as(f64, a[i]) * b[i];
+        na += @as(f64, a[i]) * a[i];
+        nb += @as(f64, b[i]) * b[i];
+    }
+    const cos = dot / (@sqrt(na) * @sqrt(nb));
+    try testing.expect(cos > 0.95);
+}
+
 test "mtp: sidecar resolution accepts native and Forge layouts in priority order" {
     const io = testing.io;
     var tmp = std.testing.tmpDir(.{ .iterate = true });
@@ -1813,12 +2125,21 @@ fn maxAbsDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
     return out;
 }
 
+test "mtp: reference-based head-norm repair rule (oMLX norm_repair)" {
+    // Gap beyond the margin (an oQ-broken head, ~1 below its backbone anchor)
+    // → repair; a head at/above its anchor → no-op; idempotent after the +1.
+    try testing.expect(mtpNormNeedsRepair(0.75, 1.45)); // gap 0.70 → repair
+    try testing.expect(!mtpNormNeedsRepair(1.30, 1.45)); // gap 0.15 → no-op
+    try testing.expect(!mtpNormNeedsRepair(1.50, 1.45)); // above anchor → no-op
+    try testing.expect(!mtpNormNeedsRepair(0.75 + 1.0, 1.45)); // post-shift → no-op
+}
+
 test "mtp: inferGroupSize geometry" {
     // 4-bit packed: weight [out, in*4/32] u32, scales [out, in/group].
     // Synthetic pair: packed_cols=4 → expanded in=32; scale_cols=2 → group 16.
     var q = QLinear{
-        .w = mlx.mlx_array_new_data(&[_]i32{0} ** 8, &[_]c_int{ 2, 4 }, 2, .int32),
-        .s = mlx.mlx_array_new_data(&[_]f32{0} ** 4, &[_]c_int{ 2, 2 }, 2, .float32),
+        .w = mlx.mlx_array_new_data(&@as([8]i32, @splat(0)), &[_]c_int{ 2, 4 }, 2, .int32),
+        .s = mlx.mlx_array_new_data(&@as([4]f32, @splat(0)), &[_]c_int{ 2, 2 }, 2, .float32),
         .b = mlx.mlx_array_new(),
     };
     defer q.deinit();
@@ -1832,6 +2153,65 @@ test "mtp: inferGroupSize geometry" {
     // The real sidecar geometry: in=5120 packed to 640 u32 cols at 4 bits,
     // scales 160 cols → group 32.
     try testing.expectEqual(@as(u32, 32), (5120 / 160));
+}
+
+test "mtp: headQuantParams never mis-resolves a non-affine lm_head as affine (issue #81)" {
+    // An mxfp8 8-bit/gs32 lm_head's GEOMETRY coincidentally solves as a valid
+    // affine 8-bit/gs32 (w [V, H/4] u32, scales [V, H/32]) — but the scales
+    // are fp8-encoded uint8 and no biases tensor exists, so a mode="affine"
+    // matmul/dequantize throws "Biases must be provided for affine
+    // quantization" and kills the first MTP forward. The scales-dtype gate
+    // (uint8 → the config's non-affine mode) must win over the geometry
+    // shortcut, exactly as computeQuantParams resolves the trunk.
+    const s = mlx.gpuStream();
+    const H = 512;
+    const V = 8;
+
+    const mk = struct {
+        fn arr(shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
+            var a = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_zeros(&a, shape.ptr, shape.len, dt, st));
+            return a;
+        }
+    };
+
+    // mxfp8 head: w [V, H*8/32] u32, scales [V, H/32] u8.
+    const w8 = try mk.arr(&.{ V, H * 8 / 32 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(w8);
+    const s8 = try mk.arr(&.{ V, H / 32 }, .uint8, s);
+    defer _ = mlx.mlx_array_free(s8);
+
+    var cfg = model_mod.ModelConfig{};
+    cfg.hidden_size = H;
+    cfg.quant_bits = 8;
+    cfg.quant_group_size = 32;
+    cfg.quant_mode = .mxfp8;
+
+    const qp8 = headQuantParams(&cfg, w8, s8);
+    try testing.expectEqual(model_mod.QuantMode.mxfp8, qp8.mode);
+    try testing.expectEqual(@as(u32, 8), qp8.bits);
+    try testing.expectEqual(@as(u32, 32), qp8.group_size);
+
+    // mxfp4 (same class, 4-bit/gs32 — also a false-positive affine geometry).
+    const w4 = try mk.arr(&.{ V, H * 4 / 32 }, .uint32, s);
+    defer _ = mlx.mlx_array_free(w4);
+    cfg.quant_bits = 4;
+    cfg.quant_mode = .mxfp4;
+    const qp4 = headQuantParams(&cfg, w4, s8);
+    try testing.expectEqual(model_mod.QuantMode.mxfp4, qp4.mode);
+
+    // Characterization (green before AND after): the mixed-AFFINE shape this
+    // function exists for — hy_v3's 8-bit/gs32 head (bf16 scales) over a
+    // 2-bit/gs64 trunk still resolves per-geometry, never per-config.
+    const sb = try mk.arr(&.{ V, H / 32 }, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(sb);
+    cfg.quant_bits = 2;
+    cfg.quant_group_size = 64;
+    cfg.quant_mode = .affine;
+    const qpa = headQuantParams(&cfg, w8, sb);
+    try testing.expectEqual(model_mod.QuantMode.affine, qpa.mode);
+    try testing.expectEqual(@as(u32, 8), qpa.bits);
+    try testing.expectEqual(@as(u32, 32), qpa.group_size);
 }
 
 test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geometry" {
@@ -1858,7 +2238,7 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
     try testing.expectEqual(MtpCostProfile.g17_nax_q8_gs32, m5NaxCostProfileForQuant(8, 32));
     try testing.expectEqual(MtpCostProfile.g17_nax_q4_gs32, m5NaxCostProfileForQuant(4, 32));
     try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForQuant(8, 64));
-    try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForQuant(4, 64));
+    try testing.expectEqual(MtpCostProfile.g17_nax_oq4e_q4_gs64, m5NaxCostProfileForQuant(4, 64));
     try testing.expectEqual(MtpCostProfile.generic, m5NaxCostProfileForQuant(3, 32));
 
     var sidecar = try mk.qlinear(IN, OUT, 8, 32, s);
@@ -1876,6 +2256,10 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
     var off_group = try mk.qlinear(IN, OUT, 8, 64, s);
     defer off_group.deinit();
     try testing.expect(!m5NaxQLinearMatches(&off_group, IN, OUT, 8, 32));
+    var sidecar_q4_gs64 = try mk.qlinear(IN, OUT, 4, 64, s);
+    defer sidecar_q4_gs64.deinit();
+    try testing.expect(m5NaxQLinearMatches(&sidecar_q4_gs64, IN, OUT, 4, 64));
+    try testing.expect(!m5NaxQLinearMatches(&sidecar_q4_gs64, IN, OUT, 4, 32));
 
     var q4_set = [_]QLinear{
         try mk.qlinear(IN, OUT, 4, 32, s),
@@ -1898,20 +2282,40 @@ test "mtp: M5 NAX cost profiles require exact sidecar and draft-head quant geome
     };
     defer for (&q8_set) |*q| q.deinit();
     const q4_linears: M5NaxDenseSidecarLinears = .{
-        .q = &q4_set[0], .k = &q4_set[1], .v = &q4_set[2], .o = &q4_set[3],
-        .gate = &q4_set[4], .up = &q4_set[5], .down = &q4_set[6],
+        .q = &q4_set[0],
+        .k = &q4_set[1],
+        .v = &q4_set[2],
+        .o = &q4_set[3],
+        .gate = &q4_set[4],
+        .up = &q4_set[5],
+        .down = &q4_set[6],
     };
     const q8_linears: M5NaxDenseSidecarLinears = .{
-        .q = &q8_set[0], .k = &q8_set[1], .v = &q8_set[2], .o = &q8_set[3],
-        .gate = &q8_set[4], .up = &q8_set[5], .down = &q8_set[6],
+        .q = &q8_set[0],
+        .k = &q8_set[1],
+        .v = &q8_set[2],
+        .o = &q8_set[3],
+        .gate = &q8_set[4],
+        .up = &q8_set[5],
+        .down = &q8_set[6],
     };
     const q4_geom: M5NaxDenseSidecarGeometry = .{
-        .hidden = IN, .q_out = OUT, .kv_out = OUT, .full_out = OUT,
-        .intermediate = OUT, .bits = 4, .group_size = 32,
+        .hidden = IN,
+        .q_out = OUT,
+        .kv_out = OUT,
+        .full_out = OUT,
+        .intermediate = OUT,
+        .bits = 4,
+        .group_size = 32,
     };
     const q8_geom: M5NaxDenseSidecarGeometry = .{
-        .hidden = IN, .q_out = OUT, .kv_out = OUT, .full_out = OUT,
-        .intermediate = OUT, .bits = 8, .group_size = 32,
+        .hidden = IN,
+        .q_out = OUT,
+        .kv_out = OUT,
+        .full_out = OUT,
+        .intermediate = OUT,
+        .bits = 8,
+        .group_size = 32,
     };
     try testing.expect(m5NaxDenseSidecarMatches(q4_linears, q4_geom));
     try testing.expect(m5NaxDenseSidecarMatches(q8_linears, q8_geom));
@@ -2219,5 +2623,234 @@ test "mtp: multi-row forward projects the LAST row only and equals appendHistory
     }.f;
     try close(merged.logits, ref.logits, 16, s);
     try close(merged.hidden_next, ref.hidden_next, 8, s);
+}
 
+test "mtp: index.json shard sweep is marker-gated (in-checkpoint heads)" {
+    const allocator = testing.allocator;
+
+    // Jundot/oQ4e shape: the head rides the LAST shard of the trunk under
+    // `language_model.mtp.*`; the sweep must name exactly that shard.
+    const jundot =
+        \\{"metadata":{"total_size":1},"weight_map":{
+        \\ "language_model.model.layers.0.mlp.down_proj.weight":"model-00001-of-00004.safetensors",
+        \\ "language_model.mtp.fc.weight":"model-00004-of-00004.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.q_proj.weight":"model-00004-of-00004.safetensors",
+        \\ "language_model.mtp.norm.weight":"model-00004-of-00004.safetensors"}}
+    ;
+    const shards = try mtpShardsFromIndexJson(allocator, jundot);
+    defer {
+        for (shards) |sh| allocator.free(sh);
+        allocator.free(shards);
+    }
+    try testing.expectEqual(@as(usize, 1), shards.len);
+    try testing.expectEqualStrings("model-00004-of-00004.safetensors", shards[0]);
+
+    // Auxiliary mtp.* keys WITHOUT a marker projection (fc / hy3 eh_proj)
+    // never claim a loadable head — empty sweep, not a partial head that
+    // dies later at ownWeight.
+    const no_marker =
+        \\{"weight_map":{"language_model.mtp.norm.weight":"a.safetensors",
+        \\ "model.layers.0.mlp.up_proj.weight":"b.safetensors"}}
+    ;
+    const none = try mtpShardsFromIndexJson(allocator, no_marker);
+    defer allocator.free(none);
+    try testing.expectEqual(@as(usize, 0), none.len);
+
+    // Bare-prefix (mtp.*) layout, head spanning TWO shards: both, deduped,
+    // first-seen order.
+    const two =
+        \\{"weight_map":{"mtp.fc.weight":"s2.safetensors",
+        \\ "mtp.norm.weight":"s2.safetensors",
+        \\ "mtp.layers.0.self_attn.q_proj.weight":"s3.safetensors"}}
+    ;
+    const both = try mtpShardsFromIndexJson(allocator, two);
+    defer {
+        for (both) |sh| allocator.free(sh);
+        allocator.free(both);
+    }
+    try testing.expectEqual(@as(usize, 2), both.len);
+    try testing.expectEqualStrings("s2.safetensors", both[0]);
+    try testing.expectEqualStrings("s3.safetensors", both[1]);
+}
+
+test "mtp: resolveMtpSource — sidecar file outranks in-checkpoint; markerless index is null" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir) == null);
+
+    // A trunk-only index is not a head.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{"model.layers.0.mlp.up_proj.weight":"model-00001-of-00002.safetensors"}}
+    });
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir) == null);
+
+    // Index carrying the head → in-checkpoint.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{"language_model.mtp.fc.weight":"model-00002-of-00002.safetensors"}}
+    });
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir).? == .in_checkpoint);
+
+    // A sidecar FILE always outranks the in-checkpoint head — repos shipping
+    // both keep loading exactly what they loaded before.
+    try tmp.dir.writeFile(io, .{ .sub_path = "mtp.safetensors", .data = "x" });
+    const src = resolveMtpSource(io, allocator, tmp.dir).?;
+    try testing.expect(src == .sidecar_file);
+    try testing.expectEqualStrings("mtp.safetensors", src.sidecar_file);
+}
+
+test "mtp: single-file model.safetensors header probe (no index.json)" {
+    const io = testing.io;
+    const allocator = testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    // Minimal valid safetensors: 8-byte LE header length + header JSON + data.
+    const W = struct {
+        fn write(io_: std.Io, dir: std.Io.Dir, header: []const u8) !void {
+            var buf: [512]u8 = undefined;
+            std.mem.writeInt(u64, buf[0..8], @intCast(header.len), .little);
+            @memcpy(buf[8..][0..header.len], header);
+            buf[8 + header.len] = 0;
+            buf[8 + header.len + 1] = 0;
+            try dir.writeFile(io_, .{ .sub_path = "model.safetensors", .data = buf[0 .. 8 + header.len + 2] });
+        }
+    };
+
+    try W.write(io, tmp.dir,
+        \\{"language_model.mtp.fc.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}
+    );
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir).? == .in_checkpoint);
+
+    // Head-less single-file checkpoint → null.
+    try W.write(io, tmp.dir,
+        \\{"model.embed_tokens.weight":{"dtype":"BF16","shape":[1],"data_offsets":[0,2]}}
+    );
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir) == null);
+
+    // Garbage length prefix → null, never a huge allocation or a crash.
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = "\xff\xff\xff\xff\xff\xff\xff\xff!!" });
+    try testing.expect(resolveMtpSource(io, allocator, tmp.dir) == null);
+}
+
+test "mtp: loadMtp loads a dense head straight from checkpoint shards (oQ4e in-checkpoint layout)" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    const dir_path = path_buf[0..root_len];
+
+    // The dense one-layer head (toy bf16 geometry: hidden 8, 2 heads × hd 4,
+    // 1 kv head, mlp inter 6) written into "shard 2". Shard 1 — the trunk —
+    // deliberately does NOT exist on disk: the loader must open only the
+    // shards the index names for mtp keys, never sweep the directory.
+    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model-00002-of-00002.safetensors", .{dir_path}, 0);
+    defer allocator.free(st_path);
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const H = struct {
+            fn put(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, st: mlx.mlx_stream) !void {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 5)) * 0.1 + 0.1;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
+            // Fill a tensor with a constant value — lets the test pin a norm's
+            // mean exactly, to drive (or suppress) reference-based repair.
+            fn putConst(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, value: f32, st: mlx.mlx_stream) !void {
+                var total: usize = 1;
+                for (shape) |d| total *= @intCast(d);
+                const data = try std.testing.allocator.alloc(f32, total);
+                defer std.testing.allocator.free(data);
+                for (data) |*x| x.* = value;
+                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
+                defer _ = mlx.mlx_array_free(f32_arr);
+                var bf = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(bf);
+                try mlx.check(mlx.mlx_astype(&bf, f32_arr, .bfloat16, st));
+                try mlx.check(mlx.mlx_array_eval(bf));
+                _ = mlx.mlx_map_string_to_array_insert(m, key, bf);
+            }
+        };
+        try H.put(map, "language_model.mtp.fc.weight", &.{ 8, 16 }, s);
+        try H.put(map, "language_model.mtp.pre_fc_norm_embedding.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.pre_fc_norm_hidden.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.norm.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.layers.0.input_layernorm.weight", &.{8}, s);
+        try H.put(map, "language_model.mtp.layers.0.post_attention_layernorm.weight", &.{8}, s);
+        // Head q_norm sits a full +1 below its backbone anchor (0.7 vs 1.4) —
+        // the oQ conversion bug; k_norm sits at/above (1.5 vs 1.4) — correct.
+        try H.putConst(map, "language_model.mtp.layers.0.self_attn.q_norm.weight", &.{4}, 0.7, s);
+        try H.putConst(map, "language_model.mtp.layers.0.self_attn.k_norm.weight", &.{4}, 1.5, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.q_proj.weight", &.{ 8, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.k_proj.weight", &.{ 4, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.v_proj.weight", &.{ 4, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.self_attn.o_proj.weight", &.{ 8, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.gate_proj.weight", &.{ 6, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.up_proj.weight", &.{ 6, 8 }, s);
+        try H.put(map, "language_model.mtp.layers.0.mlp.down_proj.weight", &.{ 8, 6 }, s);
+        // Backbone counterpart norms ride the LAST trunk shard (this same file),
+        // so the head's reference anchors are already loaded — no extra I/O.
+        // Two q_norm layers exercise the mean-of-means anchor.
+        try H.putConst(map, "language_model.model.layers.0.self_attn.q_norm.weight", &.{4}, 1.4, s);
+        try H.putConst(map, "language_model.model.layers.1.self_attn.q_norm.weight", &.{4}, 1.4, s);
+        try H.putConst(map, "language_model.model.layers.0.self_attn.k_norm.weight", &.{4}, 1.4, s);
+        try H.putConst(map, "language_model.model.layers.0.post_attention_layernorm.weight", &.{8}, 1.4, s);
+        try H.putConst(map, "language_model.model.norm.weight", &.{8}, 1.9, s);
+        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
+    }
+
+    try tmp_dir.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data =
+        \\{"weight_map":{
+        \\ "language_model.model.embed_tokens.weight":"model-00001-of-00002.safetensors",
+        \\ "language_model.mtp.fc.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.pre_fc_norm_embedding.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.pre_fc_norm_hidden.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.input_layernorm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.post_attention_layernorm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.q_norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.k_norm.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.q_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.k_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.v_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.self_attn.o_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.gate_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.up_proj.weight":"model-00002-of-00002.safetensors",
+        \\ "language_model.mtp.layers.0.mlp.down_proj.weight":"model-00002-of-00002.safetensors"}}
+    });
+
+    var m = try loadMtp(io, allocator, s, dir_path);
+    defer m.deinit();
+
+    // Dense flavor, bf16 fc bound and pre-transposed to [2H, H].
+    try testing.expect(m.mlp == .dense);
+    try testing.expect(m.fc_w_t.ctx != null);
+    const fc_shape = mlx.getShape(m.fc_w_t);
+    try testing.expectEqual(@as(c_int, 16), fc_shape[0]);
+    try testing.expectEqual(@as(c_int, 8), fc_shape[1]);
+
+    // oMLX head-norm repair: q_norm sat +1 below its backbone anchor (0.7 vs
+    // 1.4) → repaired to ~1.7; k_norm sat at/above (1.5 vs 1.4) → untouched.
+    const q_mean = try arrayMeanF32(m.q_norm, s);
+    try testing.expect(q_mean > 1.6 and q_mean < 1.8);
+    const k_mean = try arrayMeanF32(m.k_norm, s);
+    try testing.expect(k_mean > 1.45 and k_mean < 1.55);
 }

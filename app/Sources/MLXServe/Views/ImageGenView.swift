@@ -18,6 +18,8 @@ struct ImageGenView: View {
     @State private var negative: String = ""
     @State private var showAdvanced: Bool = false
     @State private var model: ImageModelPreset = .flux2Klein4B_Q4
+    /// Selected network model's routing id (`<model>@<peer>`); nil = local.
+    @State private var lanModel: String? = nil
     @State private var quality: QualityPreset = .good
     @State private var resolution: ResolutionOption = ImageModelPreset.flux2Klein4B_Q4.defaultResolution
     @State private var steps: Int = 8
@@ -69,6 +71,9 @@ struct ImageGenView: View {
                 // fired by hydration's state writes is ignored.
                 DispatchQueue.main.async { hydrating = false }
             }
+            // Freshen the network-model list so LAN entries are current in
+            // the picker (discovery lands seconds after the server boots).
+            if server.status == .running { Task { await server.refreshModels() } }
             downloads.ensureNsfwClassifier() // best-effort: provision the shared content filter
         }
         // Persist every other sticky field on change (model/quality persist in
@@ -245,15 +250,20 @@ struct ImageGenView: View {
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: $model) {
+            Picker("", selection: LanPick.selection(
+                model: $model, lanModel: $lanModel,
+                resolve: { id in ImageModelPreset.all.first { $0.id == id } },
+                persist: persist)
+            ) {
                 ForEach(ImageModelPreset.all) { preset in
-                    Text(preset.name).tag(preset)
+                    Text(preset.name).tag(preset.id)
                 }
+                LanModelPickerRows(capability: "image")
             }
             .labelsHidden()
             .pickerStyle(.menu)
             .onChange(of: model) { _, _ in guard !hydrating else { return }; applyModelDefaults(); persist() }
-            Text("~\(model.approxRAMGB) GB RAM")
+            Text(lanModel.map { "Runs on \(LanPick.peer(of: $0)) over your network — nothing to download." } ?? "~\(model.approxRAMGB) GB RAM")
                 .font(.caption)
                 .foregroundStyle(.secondary)
         }
@@ -479,7 +489,7 @@ struct ImageGenView: View {
 
     private var actionRow: some View {
         VStack(spacing: 8) {
-            if !downloads.bundleReady(model.bundle) {
+            if lanModel == nil && !downloads.bundleReady(model.bundle) {
                 BundleDownloadBar(bundle: model.bundle)
             }
             HStack {
@@ -500,7 +510,7 @@ struct ImageGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle) || !condWeightsValid)
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)) || !condWeightsValid)
                 }
             }
         }
@@ -584,6 +594,7 @@ struct ImageGenView: View {
     private func hydrate() {
         let s = ImageGenSettings.load()
         model = s.resolvedModel
+        lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)
         steps = s.steps
@@ -606,7 +617,7 @@ struct ImageGenView: View {
     /// Capture the current controls as the new last-used settings.
     private func persist() {
         var s = ImageGenSettings()
-        s.modelId = model.id
+        s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.quality = quality
         s.resolutionId = resolution.id
         s.steps = steps
@@ -653,6 +664,7 @@ struct ImageGenView: View {
             steps: steps,
             guidance: guidance,
             keepResident: keepResident,
+            lanModelId: lanModel,
             safeMode: safeMode,
             initImagePath: initImageURL?.path,
             strength: strength,

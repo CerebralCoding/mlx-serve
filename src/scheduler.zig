@@ -2571,11 +2571,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     };
 
     // Qwen native MTP head (optional). Auto-loaded when the model dir ships
-    // an `mtp/weights.safetensors` sidecar that binds to this trunk; a
-    // failed load or bind only disables the head — the model still serves.
+    // one — an `mtp/weights.safetensors`-class sidecar file OR in-checkpoint
+    // `[language_model.]mtp.*` tensors in the trunk shards; a failed load or
+    // bind only disables the head — the model still serves.
     var mtp_ptr: ?*mtp_mod.MtpModel = null;
     var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
-    if (params.mtp_enabled and mtp_mod.hasMtpSidecar(sch.io, params.model_dir)) {
+    if (params.mtp_enabled and mtp_mod.hasMtpHead(sch.io, sch.allocator, params.model_dir)) {
         if (sch.allocator.create(mtp_mod.MtpModel)) |h| {
             if (mtp_mod.loadMtp(sch.io, sch.allocator, mlx.gpuStream(), params.model_dir)) |loaded| {
                 h.* = loaded;

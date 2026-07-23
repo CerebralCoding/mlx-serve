@@ -32,6 +32,8 @@ final class HostEscapeAuditTests: XCTestCase {
             "HostMCPSpawner's login zsh, used only when the Agent Sandbox is OFF. Compiled out under MAS_BUILD.",
         "ProcessRegistry.swift":
             "login zsh for the agent's host shell tool. Guest-only under MAS_BUILD (Phase 4).",
+        "SandboxSSH.swift":
+            "ssh-keygen (one-time app-owned keypair) + /usr/bin/ssh, which the embedded terminal spawns to enter the sandbox GUEST — the inversion of a host escape. Key + known_hosts are container-scoped; MAS live behavior is a release-validation item (if blocked → Developer-ID-only with an explicit message).",
     ]
 
     /// Matches a string literal naming an absolute path into a system bin dir.

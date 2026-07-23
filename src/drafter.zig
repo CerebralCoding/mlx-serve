@@ -802,39 +802,7 @@ fn embedTargetTokenArr(
     target: *Transformer,
     id_arr: mlx.mlx_array,
 ) !mlx.mlx_array {
-    var tw = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(tw);
-    try mlx.check(mlx.mlx_take_axis(&tw, target.emb_w, id_arr, 0, self.s));
-
-    var ts = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ts);
-    try mlx.check(mlx.mlx_take_axis(&ts, target.emb_s, id_arr, 0, self.s));
-
-    // Bias-less trunk quant modes (nvfp4 etc.) have a null-ctx emb_b.
-    var tb = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(tb);
-    if (target.emb_b.ctx != null) {
-        try mlx.check(mlx.mlx_take_axis(&tb, target.emb_b, id_arr, 0, self.s));
-    }
-
-    var dequant = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(dequant);
-    try mlx.check(mlx.mlx_dequantize(
-        &dequant,
-        tw,
-        ts,
-        tb,
-        mlx.mlx_optional_int.some(@intCast(target.config.quant_group_size)),
-        mlx.mlx_optional_int.some(@intCast(target.config.quant_bits)),
-        target.config.quant_mode.cstr(),
-        .{}, // global_scale
-        .{ .value = .bfloat16, .has_value = true },
-        self.s,
-    ));
-
-    var emb = mlx.mlx_array_new();
-    const out_shape = [_]c_int{ 1, 1, @intCast(target.config.hidden_size) };
-    try mlx.check(mlx.mlx_reshape(&emb, dequant, &out_shape, 3, self.s));
+    const emb = try embedTableRow(self.s, target.emb_w, target.emb_s, target.emb_b, &target.config, id_arr);
 
     // Apply embed_scale (Gemma 4: sqrt(target.hidden_size)).
     if (self.target_embed_scale != 1.0) {
@@ -845,6 +813,69 @@ fn embedTargetTokenArr(
         _ = mlx.mlx_array_free(emb);
         return scaled;
     }
+    return emb;
+}
+
+/// Gather one row of a possibly-quantized embed table and return it as
+/// `[1, 1, hidden]` bf16, unscaled — the caller applies any embed scale.
+/// Mirrors mtp.embedTargetTokens: a DENSE (bf16) table has null-ctx scales
+/// and the gathered row IS the embedding (the unconditional emb_s take_axis
+/// was a fatal "expected a non-empty mlx_array" at drafter load on bf16
+/// targets); a quantized table resolves its OWN params from geometry, never
+/// the config globals (mixed-precision checkpoints quantize the table at
+/// different bits than the trunk).
+fn embedTableRow(
+    s: mlx.mlx_stream,
+    emb_w: mlx.mlx_array,
+    emb_s: mlx.mlx_array,
+    emb_b: mlx.mlx_array,
+    config: *const ModelConfig,
+    id_arr: mlx.mlx_array,
+) !mlx.mlx_array {
+    const out_shape = [_]c_int{ 1, 1, @intCast(config.hidden_size) };
+
+    var tw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tw);
+    try mlx.check(mlx.mlx_take_axis(&tw, emb_w, id_arr, 0, s));
+
+    if (emb_s.ctx == null) {
+        var cast = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(cast);
+        try mlx.check(mlx.mlx_astype(&cast, tw, .bfloat16, s));
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&out, cast, &out_shape, 3, s));
+        return out;
+    }
+
+    var ts = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ts);
+    try mlx.check(mlx.mlx_take_axis(&ts, emb_s, id_arr, 0, s));
+
+    // Bias-less trunk quant modes (nvfp4 etc.) have a null-ctx emb_b.
+    var tb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(tb);
+    if (emb_b.ctx != null) {
+        try mlx.check(mlx.mlx_take_axis(&tb, emb_b, id_arr, 0, s));
+    }
+
+    const emb_qp = transformer_mod.computeQuantParams(config, emb_w, emb_s, config.hidden_size);
+    var dequant = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(dequant);
+    try mlx.check(mlx.mlx_dequantize(
+        &dequant,
+        tw,
+        ts,
+        tb,
+        mlx.mlx_optional_int.some(@intCast(emb_qp.group_size)),
+        mlx.mlx_optional_int.some(@intCast(emb_qp.bits)),
+        emb_qp.mode.cstr(),
+        .{}, // global_scale
+        .{ .value = .bfloat16, .has_value = true },
+        s,
+    ));
+
+    var emb = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_reshape(&emb, dequant, &out_shape, 3, s));
     return emb;
 }
 
@@ -1386,6 +1417,87 @@ pub fn stepArr(
 // ── Tests ──
 
 const testing = std.testing;
+
+test "drafter: embedTableRow handles dense bf16 and mixed-quant target tables (bf16-target crash)" {
+    // A dense bf16 target (gemma-4-12B-it-bf16) has NULL-ctx emb_s/emb_b —
+    // the unconditional scales take_axis was a fatal "expected a non-empty
+    // mlx_array" at drafter load (the dry-run runs this path). The gathered
+    // row IS the embedding; nothing to dequantize. Mirrors
+    // mtp.embedTargetTokens, which already carries both branches.
+    const s = mlx.gpuStream();
+    const V = 8;
+    const H = 64;
+
+    var table_f32: [V * H]f32 = undefined;
+    for (0..V) |r| {
+        for (0..H) |c| table_f32[r * H + c] = @as(f32, @floatFromInt(r)) + @as(f32, @floatFromInt(c)) * 0.01;
+    }
+    const tshape = [_]c_int{ V, H };
+    const table_raw = mlx.mlx_array_new_data(&table_f32, &tshape, 2, .float32);
+    defer _ = mlx.mlx_array_free(table_raw);
+    var table = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(table);
+    try mlx.check(mlx.mlx_astype(&table, table_raw, .bfloat16, s));
+
+    const id_i32: i32 = 3;
+    const id_shape = [_]c_int{1};
+    const id_arr = mlx.mlx_array_new_data(&id_i32, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(id_arr);
+
+    var cfg = ModelConfig{};
+    cfg.hidden_size = H;
+    cfg.quant_bits = 0; // dense checkpoint: no quantization key
+
+    const null_s = mlx.mlx_array_new();
+    const null_b = mlx.mlx_array_new();
+    const emb = try embedTableRow(s, table, null_s, null_b, &cfg, id_arr);
+    defer _ = mlx.mlx_array_free(emb);
+    try mlx.check(mlx.mlx_array_eval(emb));
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(emb));
+    const eshape = mlx.getShape(emb);
+    try testing.expectEqual(@as(c_int, 1), eshape[0]);
+    try testing.expectEqual(@as(c_int, 1), eshape[1]);
+    try testing.expectEqual(@as(c_int, H), eshape[2]);
+    var emb_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(emb_f32);
+    try mlx.check(mlx.mlx_astype(&emb_f32, emb, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(emb_f32));
+    const vals = mlx.mlx_array_data_float32(emb_f32).?;
+    try testing.expect(@abs(vals[0] - 3.0) < 0.05); // row 3, col 0
+    try testing.expect(@abs(vals[10] - 3.10) < 0.05); // row 3, col 10
+
+    // Mixed-precision target: the table quantized 8-bit/gs32 while the
+    // config declares 4-bit/gs64 (the mtp OptiQ class). Config-global
+    // dequant reads the row at the wrong width (128 values from a 64-wide
+    // row) and dies in the reshape; params must come from the table's own
+    // geometry via computeQuantParams.
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, table, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(8), "affine", .{}, s));
+    var qw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qw);
+    var qs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qs);
+    var qb = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(qb);
+    try mlx.check(mlx.mlx_vector_array_get(&qw, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&qs, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&qb, triple, 2));
+
+    cfg.quant_bits = 4;
+    cfg.quant_group_size = 64;
+    cfg.quant_mode = .affine;
+
+    const emb_q = try embedTableRow(s, qw, qs, qb, &cfg, id_arr);
+    defer _ = mlx.mlx_array_free(emb_q);
+    var emb_q_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(emb_q_f32);
+    try mlx.check(mlx.mlx_astype(&emb_q_f32, emb_q, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(emb_q_f32));
+    const qvals = mlx.mlx_array_data_float32(emb_q_f32).?;
+    try testing.expect(@abs(qvals[0] - 3.0) < 0.1); // 8-bit quant is near-lossless here
+    try testing.expect(@abs(qvals[10] - 3.10) < 0.1);
+}
 
 test "DrafterConfig parses gemma-4-E4B drafter config.json shape" {
     const json =

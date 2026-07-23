@@ -200,6 +200,66 @@ final class AgentPromptTests: XCTestCase {
         XCTAssertFalse(untriggered.contains("## Skill: review"))
     }
 
+    // MARK: - Skill trigger word-boundary matching (issue #92)
+
+    private func makeSkillsDir(files: [String: String]) throws -> String {
+        let dir = tempSkillsDir()
+        // Create the dir BEFORE SkillManager sees it so first-run seeding
+        // doesn't drop the example review.md into the fixture.
+        try FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+        for (name, content) in files {
+            try content.write(toFile: (dir as NSString).appendingPathComponent(name),
+                              atomically: true, encoding: .utf8)
+        }
+        return dir
+    }
+
+    private func skillFile(name: String, trigger: String) -> String {
+        """
+        ---
+        name: \(name)
+        description: test skill \(name)
+        trigger: \(trigger)
+        ---
+        BODY-\(name)
+        """
+    }
+
+    // A trigger is a whole-word/phrase match, never a substring scan (issue
+    // #92): "ui" fired inside "build"/"guide", "review" inside "preview" —
+    // and every false hit injects the skill's ENTIRE body into the system
+    // prompt, a silent per-request context tax on small-context local models.
+    func testSkillTriggersMatchWholeWordsNotSubstrings() throws {
+        let dir = try makeSkillsDir(files: [
+            "ui.md": skillFile(name: "ui-helper", trigger: "ui"),
+            "review.md": skillFile(name: "reviewer", trigger: "review"),
+            "phrase.md": skillFile(name: "phrase-only", trigger: "code review"),
+            "plan.md": skillFile(name: "planner", trigger: "/plan"),
+            "deps.md": skillFile(name: "deps", trigger: "requirements.txt"),
+        ])
+        defer { try? FileManager.default.removeItem(atPath: dir) }
+        let mgr = SkillManager(skillsDir: dir)
+
+        // Fragments inside unrelated words must NOT fire.
+        XCTAssertFalse(mgr.matchingSkills(for: "build the project").contains("## Skill: ui-helper"),
+                       "'ui' must not fire inside 'build'")
+        XCTAssertFalse(mgr.matchingSkills(for: "please guide me").contains("## Skill: ui-helper"),
+                       "'ui' must not fire inside 'guide'")
+        XCTAssertFalse(mgr.matchingSkills(for: "preview the deployment").contains("## Skill: reviewer"),
+                       "'review' must not fire inside 'preview'")
+        XCTAssertFalse(mgr.matchingSkills(for: "scan this barcode reviews page").contains("## Skill: phrase-only"),
+                       "'code review' must not fire inside 'barcode reviews'")
+
+        // Whole words and phrases still fire — mid-message, at string edges,
+        // next to punctuation, and case-insensitively.
+        XCTAssertTrue(mgr.matchingSkills(for: "build a ui").contains("## Skill: ui-helper"))
+        XCTAssertTrue(mgr.matchingSkills(for: "ui layout, please").contains("## Skill: ui-helper"))
+        XCTAssertTrue(mgr.matchingSkills(for: "Review my changes").contains("## Skill: reviewer"))
+        XCTAssertTrue(mgr.matchingSkills(for: "do a code review please").contains("## Skill: phrase-only"))
+        XCTAssertTrue(mgr.matchingSkills(for: "run /plan now").contains("## Skill: planner"))
+        XCTAssertTrue(mgr.matchingSkills(for: "open requirements.txt").contains("## Skill: deps"))
+    }
+
     func testSkillManagerDoesNotReSeedAfterUserDeletesExample() throws {
         let dir = tempSkillsDir()
         defer { try? FileManager.default.removeItem(atPath: dir) }

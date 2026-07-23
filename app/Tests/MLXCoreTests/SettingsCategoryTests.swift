@@ -70,7 +70,7 @@ final class SettingsCategoryTests: XCTestCase {
     /// down the list scrolls the form around at random.
     func testSidebarOrderMatchesRenderOrder() {
         XCTAssertEqual(SettingsCategory.visible(engine: .mlx, selfUpdate: true), [
-            .modelFolders, .server, .specDecode, .performance,
+            .modelFolders, .server, .lanSharing, .specDecode, .performance,
             .requestDefaults, .voice, .sandbox, .messaging, .updates,
         ])
     }

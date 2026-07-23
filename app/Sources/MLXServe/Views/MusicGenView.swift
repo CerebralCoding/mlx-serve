@@ -13,6 +13,8 @@ struct MusicGenView: View {
     @State private var prompt: String = ""
     @State private var lyrics: String = ""
     @State private var model: MusicModelPreset = .acestepXLTurbo8bit
+    /// Selected network model's routing id (`<model>@<peer>`); nil = local.
+    @State private var lanModel: String? = nil
     @State private var durationSeconds: Double = 60
     @State private var vocalLanguage: String = "en"
     @State private var bpm: Int? = nil
@@ -45,6 +47,9 @@ struct MusicGenView: View {
                 didHydrate = true
                 DispatchQueue.main.async { hydrating = false }
             }
+            // Freshen the network-model list so LAN entries are current in
+            // the picker (discovery lands seconds after the server boots).
+            if server.status == .running { Task { await server.refreshModels() } }
         }
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: durationSeconds) { _, _ in guard !hydrating else { return }; persist() }
@@ -155,10 +160,15 @@ struct MusicGenView: View {
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: $model) {
+            Picker("", selection: LanPick.selection(
+                model: $model, lanModel: $lanModel,
+                resolve: { id in MusicModelPreset.all.first { $0.id == id } },
+                persist: persist)
+            ) {
                 ForEach(MusicModelPreset.all) { preset in
-                    Text(preset.name).tag(preset)
+                    Text(preset.name).tag(preset.id)
                 }
+                LanModelPickerRows(capability: "music")
             }
             .labelsHidden()
             .pickerStyle(.menu)
@@ -257,7 +267,7 @@ struct MusicGenView: View {
 
     private var actionRow: some View {
         VStack(spacing: 8) {
-            if !downloads.bundleReady(model.bundle) {
+            if lanModel == nil && !downloads.bundleReady(model.bundle) {
                 // Local-only models have no HF download yet — steer the user to
                 // the on-device conversion instead of a Download button.
                 if model.isLocalOnly { convertHint } else { BundleDownloadBar(bundle: model.bundle) }
@@ -274,7 +284,7 @@ struct MusicGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle))
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)))
                 }
             }
         }
@@ -368,6 +378,7 @@ struct MusicGenView: View {
     private func hydrate() {
         let s = MusicGenSettings.load()
         model = s.resolvedModel
+        lanModel = LanPick.lanId(s.modelId)
         durationSeconds = Double(s.durationSeconds)
         vocalLanguage = s.vocalLanguage
         keepResident = s.keepResident
@@ -375,7 +386,7 @@ struct MusicGenView: View {
 
     private func persist() {
         var s = MusicGenSettings()
-        s.modelId = model.id
+        s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.durationSeconds = Int(durationSeconds)
         s.vocalLanguage = vocalLanguage
         s.keepResident = keepResident
@@ -461,7 +472,8 @@ struct MusicGenView: View {
             timesignature: timesignature,
             durationSeconds: Int(durationSeconds),
             seed: Int(seedText.trimmingCharacters(in: .whitespaces)) ?? -1,
-            keepResident: keepResident
+            keepResident: keepResident,
+            lanModelId: lanModel
         )
         persist()
         let total = RAMChecker.totalGB

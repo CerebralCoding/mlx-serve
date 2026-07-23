@@ -158,6 +158,15 @@ private struct RecommendedPane: View {
                 }
 
                 ModelGroupSection(
+                    title: "Laguna",
+                    subtitle: "poolside's Laguna S 2.1 — a coding-specialist mixture-of-experts model.",
+                    systemImage: "chevron.left.forwardslash.chevron.right",
+                    tint: .purple
+                ) {
+                    RecommendedFamilyRows(picks: RecommendedModelPick.poolsideCatalog, physicalMemoryBytes: physicalMemory)
+                }
+
+                ModelGroupSection(
                     title: "Largest models (96 GB+ RAM)",
                     subtitle: "The biggest models this app runs — DeepSeek-V4-Flash (ds4) and Tencent's 295B Hunyuan 3 — for Macs with a lot of memory.",
                     systemImage: "memorychip",

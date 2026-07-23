@@ -233,7 +233,7 @@ test "hy3d-paint-unet: 3D PoseRoPE tables + interleaved rotation match reference
 test "hy3d-paint-unet: voxel indices match reference (mean, threshold, background)" {
     const a = testing.allocator;
     // One view, 3x8x8 maps, all background except a 4x4 patch at 0.5.
-    var maps = [_]f32{1.0} ** (3 * 8 * 8);
+    var maps: [3 * 8 * 8]f32 = @splat(1.0);
     for (0..3) |c| for (0..4) |y| for (0..4) |x| {
         maps[c * 64 + y * 8 + x] = 0.5;
     };
@@ -244,7 +244,7 @@ test "hy3d-paint-unet: voxel indices match reference (mean, threshold, backgroun
     try testing.expectEqualSlices(u32, &expected, vi);
 
     // Single valid texel (count 1 ≥ thres 16/16=1): mean 0.25 → round(3.75)=4.
-    var maps2 = [_]f32{1.0} ** (3 * 8 * 8);
+    var maps2: [3 * 8 * 8]f32 = @splat(1.0);
     for (0..3) |c| maps2[c * 64] = 0.25;
     const vi2 = try voxelIndices(a, &maps2, 1, 8, 8, 2, 16);
     defer a.free(vi2);
@@ -952,7 +952,7 @@ pub const BaseUnet = struct {
 
 /// Canonical index order: down_{0,1,2}_{0,1}=0..5, mid_0=6, up_{1,2,3}_{0,1,2}=7..15.
 pub const RefCache = struct {
-    entries: [16]?mlx.mlx_array = .{null} ** 16,
+    entries: [16]?mlx.mlx_array = @splat(null),
 
     fn set(self: *RefCache, idx: usize, arr: mlx.mlx_array) void {
         if (self.entries[idx]) |old| rel(old);
@@ -1651,12 +1651,12 @@ test "hy3d-paint-unet: GeGLU applies the activation to the SECOND half (gate)" {
     // identity weight [out,in]: proj is [8,4] identity-ish -> we want proj(x)=x
     // padded to 8 by stacking [x ; x] so value=x, gate=x, out should be x*gelu(x).
     // Build ff0 weight [8,4] = [I4 ; I4]; ff2 weight [4,4] = I4.
-    var proj = [_]f32{0} ** 32;
+    var proj: [32]f32 = @splat(0);
     for (0..4) |i| {
         proj[i * 4 + i] = 1.0; // top I4 (value rows)
         proj[(i + 4) * 4 + i] = 1.0; // bottom I4 (gate rows)
     }
-    var eye = [_]f32{0} ** 16;
+    var eye: [16]f32 = @splat(0);
     for (0..4) |i| eye[i * 4 + i] = 1.0;
 
     var w = Weights.init(a);
@@ -1715,8 +1715,8 @@ test "hy3d-paint-unet: RA splits per-head value output before merging heads" {
     // output equals the split value), n_pbr=2, n_views=1, l=1.
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();
-    var eye = [_]f32{0} ** (128 * 128);
-    var two_eye = [_]f32{0} ** (128 * 128);
+    var eye: [128 * 128]f32 = @splat(0);
+    var two_eye: [128 * 128]f32 = @splat(0);
     for (0..128) |i| {
         eye[i * 128 + i] = 1.0;
         two_eye[i * 128 + i] = 2.0;
@@ -1760,10 +1760,10 @@ test "hy3d-paint-unet: RA splits per-head value output before merging heads" {
         tb.rv_out_mr.?.deinit();
     }
 
-    var ones_nh = [_]f32{1} ** (2 * 128); // nh [n_pbr·n_views, l, c] = [2,1,128]
+    var ones_nh: [2 * 128]f32 = @splat(1); // nh [n_pbr·n_views, l, c] = [2,1,128]
     const nh = mlx.mlx_array_new_data(&ones_nh, &[_]c_int{ 2, 1, 128 }, 3, .float32);
     defer rel(nh);
-    var ones_enc = [_]f32{1} ** 128; // enc [1, l_ref, c] = [1,1,128]
+    var ones_enc: [128]f32 = @splat(1); // enc [1, l_ref, c] = [1,1,128]
     const enc = mlx.mlx_array_new_data(&ones_enc, &[_]c_int{ 1, 1, 128 }, 3, .float32);
     defer rel(enc);
 
