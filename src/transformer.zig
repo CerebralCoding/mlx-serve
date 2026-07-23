@@ -115,15 +115,22 @@ fn getGdnKernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-// Per-position-state variant of the GDN recurrence kernel, used ONLY on the PLD
-// verify forward (small T). Identical math to GDN_KERNEL_SOURCE, but instead of
-// writing only the FINAL state it records the state after EVERY timestep into
+// Per-position-state variant of the GDN recurrence kernel, used ONLY on the
+// spec verify forward (small T). Identical math to GDN_KERNEL_SOURCE, but in
+// addition to the FINAL state (`state_out`, written from registers like the
+// stock kernel) it records the state after every INTERMEDIATE timestep into
 // `state_seq` ([T, B, Hv, Dv, Dk]). That lets partial-accept rollback restore
 // the accepted-position SSM state by slicing — no re-forward of the accepted
 // prefix (the costly part on a 48-layer GatedDeltaNet trunk). The decode and
 // prefill paths keep using the original single-state kernel, so this adds zero
 // cost outside speculative decoding. `seq_stride` = (B*Hv)*Dv*Dk = per-timestep
 // element stride into `state_seq` (passed as a scalar, mirroring `T`).
+//
+// Capture-tail trim: state_seq[T-1] is deliberately NEVER written — a partial
+// accept reads index `accepted` <= T-2 (index T-1 would be a full accept,
+// which keeps `state_out` via the normal flow), so the last row was a
+// redundant global write + forced the engine's final state to be a slice VIEW
+// pinning the whole [T,...] capture buffer across rounds.
 const GDN_KERNEL_SEQ_SOURCE =
     \\auto n = thread_position_in_grid.z;
     \\auto b_idx = n / Hv;
@@ -141,6 +148,7 @@ const GDN_KERNEL_SEQ_SOURCE =
     \\auto dv_idx = thread_position_in_grid.y;
     \\
     \\auto i_state = state_in + (n * Dv + dv_idx) * Dk;
+    \\auto o_state = state_out + (n * Dv + dv_idx) * Dk;
     \\auto seq_base = (n * Dv + dv_idx) * Dk;
     \\
     \\float state[n_per_t];
@@ -173,10 +181,12 @@ const GDN_KERNEL_SEQ_SOURCE =
     \\  if (thread_index_in_simdgroup == 0) {
     \\    y[dv_idx] = static_cast<InT>(out);
     \\  }
-    \\  auto t_state = state_seq + t * seq_stride + seq_base;
-    \\  for (int i = 0; i < n_per_t; ++i) {
-    \\    auto s_idx = n_per_t * dk_idx + i;
-    \\    t_state[s_idx] = static_cast<StT>(state[i]);
+    \\  if (t + 1 < T) {
+    \\    auto t_state = state_seq + t * seq_stride + seq_base;
+    \\    for (int i = 0; i < n_per_t; ++i) {
+    \\      auto s_idx = n_per_t * dk_idx + i;
+    \\      t_state[s_idx] = static_cast<StT>(state[i]);
+    \\    }
     \\  }
     \\  q_ += Hk * Dk;
     \\  k_ += Hk * Dk;
@@ -185,6 +195,10 @@ const GDN_KERNEL_SEQ_SOURCE =
     \\  g_ += Hv;
     \\  beta_ += Hv;
     \\}
+    \\for (int i = 0; i < n_per_t; ++i) {
+    \\  auto s_idx = n_per_t * dk_idx + i;
+    \\  o_state[s_idx] = static_cast<StT>(state[i]);
+    \\}
 ;
 
 var gdn_kernel_seq_cached: ?mlx.mlx_fast_metal_kernel = null;
@@ -192,7 +206,7 @@ var gdn_kernel_seq_cached: ?mlx.mlx_fast_metal_kernel = null;
 fn getGdnKernelSeq() !mlx.mlx_fast_metal_kernel {
     if (gdn_kernel_seq_cached) |k| return k;
     const input_names = [_][*:0]const u8{ "q", "k", "v", "g", "beta", "state_in", "T", "seq_stride" };
-    const output_names = [_][*:0]const u8{ "y", "state_seq" };
+    const output_names = [_][*:0]const u8{ "y", "state_seq", "state_out" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
@@ -8778,10 +8792,14 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(y_bthd);
 
         if (self.spec_capture_ssm) {
-            // PLD verify pass: emit per-position states so partial-accept
-            // rollback needs no re-forward. state_seq: [T, B, Hv, Dv, Dk].
+            // Spec verify pass: emit per-position states so partial-accept
+            // rollback needs no re-forward. state_seq: [T, B, Hv, Dv, Dk]
+            // (last row unwritten — capture-tail trim), final state as its
+            // own [B, Hv, Dv, Dk] output.
             const state_seq_shape = [_]c_int{ seq_len, batch, num_v_heads, dv, dk };
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_seq_shape, 5, .bfloat16));
+            const state_out_shape = [_]c_int{ batch, num_v_heads, dv, dk };
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &state_out_shape, 4, .bfloat16));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, dv, batch * num_v_heads));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));
@@ -8802,26 +8820,20 @@ pub const Transformer = struct {
             var outputs_vec = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(outputs_vec);
             try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, gdn_kernel, inputs_vec, config, self.s));
-            if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
+            if (mlx.mlx_vector_array_size(outputs_vec) != 3) return error.MetalKernelBadOutputCount;
             try mlx.check(mlx.mlx_vector_array_get(&y_bthd, outputs_vec, 0));
 
-            // Stash the full per-position sequence for rollback (takes ownership).
+            // Stash the per-position sequence for rollback (takes ownership).
             var state_seq = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&state_seq, outputs_vec, 1));
             if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
             ssm.spec_state_seq = state_seq;
 
-            // Continue normal flow with the FINAL state = state_seq[T-1].
-            const last: c_int = seq_len - 1;
-            const fs_start = [_]c_int{ last, 0, 0, 0, 0 };
-            const fs_stop = [_]c_int{ seq_len, batch, num_v_heads, dv, dk };
-            const fs_strides = [_]c_int{ 1, 1, 1, 1, 1 };
-            var final_sliced = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_slice(&final_sliced, state_seq, &fs_start, 5, &fs_stop, 5, &fs_strides, 5, self.s));
-            defer _ = mlx.mlx_array_free(final_sliced);
-            const fin_shape = [_]c_int{ batch, num_v_heads, dv, dk };
+            // Continue normal flow with the kernel's own final state — no
+            // slice view into the capture buffer (a view would pin the whole
+            // [T,...] buffer across rounds and add 2 graph nodes per layer).
             var final_state = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_reshape(&final_state, final_sliced, &fin_shape, 4, self.s));
+            try mlx.check(mlx.mlx_vector_array_get(&final_state, outputs_vec, 2));
             _ = mlx.mlx_array_free(ssm.ssm_state);
             ssm.ssm_state = final_state;
         } else {
@@ -12689,6 +12701,10 @@ fn gdnTestRun(comptime seq: bool, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx
     if (seq) {
         const ss_shape = [_]c_int{ T, B, Hv, Dv, Dk };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ss_shape, 5, .bfloat16));
+        // Final state is its own output (written from registers); the seq
+        // buffer's last row is deliberately UNWRITTEN (capture-tail trim).
+        const so_shape = [_]c_int{ B, Hv, Dv, Dk };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &so_shape, 4, .bfloat16));
     } else {
         const so_shape = [_]c_int{ B, Hv, Dv, Dk };
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &so_shape, 4, .bfloat16));
@@ -12712,19 +12728,10 @@ fn gdnTestRun(comptime seq: bool, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx
         defer _ = mlx.mlx_vector_array_free(inputs_vec);
         const kern = try getGdnKernelSeq();
         try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kern, inputs_vec, config, s));
-        var ss = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(ss);
-        try mlx.check(mlx.mlx_vector_array_get(&ss, outputs_vec, 1));
-        // slice [T-1] -> [1,B,Hv,Dv,Dk] -> reshape [B,Hv,Dv,Dk]
-        const start = [_]c_int{ T - 1, 0, 0, 0, 0 };
-        const stop = [_]c_int{ T, B, Hv, Dv, Dk };
-        const strides = [_]c_int{ 1, 1, 1, 1, 1 };
-        var sliced = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sliced);
-        try mlx.check(mlx.mlx_slice(&sliced, ss, &start, 5, &stop, 5, &strides, 5, s));
-        const fshape = [_]c_int{ B, Hv, Dv, Dk };
+        // Final state comes from the dedicated state_out output — after the
+        // capture-tail trim, state_seq[T-1] is never written.
         var out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&out, sliced, &fshape, 4, s));
+        try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 2));
         return out;
     } else {
         const inputs_arr = [_]mlx.mlx_array{ q, k, v, g, beta, state_in, T_scalar };
@@ -12888,6 +12895,8 @@ fn gdnTestRunSeqAt(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 4, .bfloat16));
     const ss_shape = [_]c_int{ T, B, Hv, Dv, Dk };
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &ss_shape, 5, .bfloat16));
+    const so_shape = [_]c_int{ B, Hv, Dv, Dk };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &so_shape, 4, .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, Dv, B * Hv));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 4, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "InT", .bfloat16));

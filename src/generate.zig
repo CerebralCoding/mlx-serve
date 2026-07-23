@@ -483,6 +483,11 @@ pub const Generator = struct {
     mtp_drafted_tokens: u64 = 0,
     /// Rounds where the confidence gate extended into chunk B.
     mtp_ext_rounds: u64 = 0,
+    /// Extension dry-spell gate: consecutive extension-CONSIDERED rounds
+    /// whose confidence gate did not clear, and the single-chunk cooldown
+    /// that a full dry streak triggers (see mtpExtDryAllows).
+    mtp_ext_dry_streak: u32 = 0,
+    mtp_ext_cooldown: u32 = 0,
     /// EV controller: conditional acceptance EMA per draft index,
     /// a[i] = P(draft i accepted | drafts 0..i-1 accepted). Optimistic prior;
     /// warmup rounds pull the low indices to reality before it can matter.
@@ -495,14 +500,32 @@ pub const Generator = struct {
     /// NAX surface requires the measured trunk, native sidecar, and 3-bit
     /// draft-only head; every other combination keeps the M1-M4 surface.
     mtp_ev_costs: MtpEvCosts = MTP_EV_DEFAULT_COSTS,
+    /// Live-cost EMAs (ms), 0 = unseeded. `mtp_ev_sync_ms` is the measured
+    /// chunk-A confidence-read sync — updated ONLY on extension-considered
+    /// rounds, so it holds the true cost of a sync when one happens (not the
+    /// suppressed-round average). `mtp_ev_round_ms` is the realized round
+    /// wall-clock. Their ratio drives the cost-aware exploration throttle
+    /// (mtpExtDryThresholdFor) so a dry sync tax self-limits to a small
+    /// fraction of the round. Always-on; the trace is not required.
+    mtp_ev_sync_ms: f32 = 0,
+    mtp_ev_round_ms: f32 = 0,
     /// Per-phase wall-time trace (MLX_SERVE_MTP_TRACE=1; else untouched).
     mtp_trace: MtpTrace = .{},
+    /// Trace-only: stopwatch running across the scheduler gap (round return
+    /// → next round entry); bills the `.gap` phase. Null when not tracing.
+    mtp_gap_watch: ?io_util.Stopwatch = null,
     /// Deferred committed-history append: the round's (tokens, true verify
     /// hiddens) pair, folded into the NEXT round's first draft step as one
     /// multi-row head forward instead of a separate appendHistory forward.
     /// Rounds with no successor (EOS/length/runtime disable) never pay for
     /// the append; the stash is freed unconsumed in `deinit`.
     mtp_hist_stash: ?MtpHistStash = null,
+    /// Cross-round pre-draft (round pipelining): the NEXT round's chunk-A
+    /// draft chain, built and async-dispatched at the CURRENT round's tail
+    /// so the head chain runs on the GPU while the CPU emits tokens. The
+    /// build consumes `mtp_hist_stash`, so the two are mutually exclusive
+    /// (asserted at consume). Freed unconsumed in `deinit`.
+    mtp_pre_draft: ?MtpPreDraft = null,
 
     // ── Phase 1: SSM checkpoints captured during prefill ──
     /// Owned SSM-state snapshots taken at stride-aligned positions during
@@ -1432,6 +1455,10 @@ pub const Generator = struct {
         if (self.mtp_hist_stash) |*st| {
             st.deinit();
             self.mtp_hist_stash = null;
+        }
+        if (self.mtp_pre_draft) |*pd| {
+            pd.deinit(allocator);
+            self.mtp_pre_draft = null;
         }
         // Publish the EV surface for the next request when the experimental
         // cross-request seed is explicitly enabled.
@@ -2532,6 +2559,377 @@ pub const Generator = struct {
         return cache_step;
     }
 
+    /// One round's lazily-built MTP draft chain — the Phase 0/1 state that
+    /// cross-round pre-drafting (`mtpMaybePreDraft`) moves into the PREVIOUS
+    /// round's tail. Owns every handle it holds; `deinit` frees whatever was
+    /// built so far, so it is safe on partial builds and on a pre-draft left
+    /// unconsumed at request end.
+    pub const MtpPreDraft = struct {
+        plan: MtpRoundPlan,
+        /// Head-cache position of this round's first draft entry.
+        off0: usize,
+        t1: u32,
+        /// `[1]` int32 t1 — the verify input needs it again in Phase 3.
+        t1_arr: mlx.mlx_array,
+        /// Host draft ids, filled at the Phase 4b sync. len = plan.m_hi.
+        drafts: []u32,
+        /// Lazy `[1]` int32 draft ids. len = plan.m_hi; [0..n_drafted) valid.
+        draft_arrs: []mlx.mlx_array,
+        n_drafted: u32,
+        /// Chunk-A log-confidence graphs (two-chunk plans only). len m_lo.
+        conf_arrs: ?[]mlx.mlx_array,
+        n_conf: u32,
+        /// Sharp-draft proposal distributions q. len m_hi; [0..n_qp) valid.
+        q_probs: ?[]mlx.mlx_array,
+        n_qp: u32,
+        /// Chain hidden after the last built step (owned) — a chunk-B
+        /// extension resumes from it; freed once the chain is complete.
+        h_chain: ?mlx.mlx_array,
+        /// Tokens actually drafted this round; starts at m_lo, grows to
+        /// m_hi iff the confidence gate clears at the chunk boundary.
+        m: u32,
+
+        pub fn deinit(self: *MtpPreDraft, allocator: std.mem.Allocator) void {
+            _ = mlx.mlx_array_free(self.t1_arr);
+            for (self.draft_arrs[0..self.n_drafted]) |arr| _ = mlx.mlx_array_free(arr);
+            allocator.free(self.draft_arrs);
+            if (self.conf_arrs) |slots| {
+                for (slots[0..self.n_conf]) |arr| _ = mlx.mlx_array_free(arr);
+                allocator.free(slots);
+            }
+            if (self.q_probs) |slots| {
+                for (slots[0..self.n_qp]) |arr| _ = mlx.mlx_array_free(arr);
+                allocator.free(slots);
+            }
+            if (self.h_chain) |h| _ = mlx.mlx_array_free(h);
+            allocator.free(self.drafts);
+        }
+    };
+
+    /// Allocate an empty draft chain for `plan` (nothing built yet).
+    fn mtpChainInit(self: *Generator, allocator: std.mem.Allocator, plan: MtpRoundPlan, t1: u32) !MtpPreDraft {
+        const consider_ext = plan.m_hi > plan.m_lo;
+        const sharp_drafts = mtpDraftSamplingFor(self.sampling, mtpDraftGreedy()).temperature > 0.01;
+        const drafts = try allocator.alloc(u32, plan.m_hi);
+        errdefer allocator.free(drafts);
+        const draft_arrs = try allocator.alloc(mlx.mlx_array, plan.m_hi);
+        errdefer allocator.free(draft_arrs);
+        const conf_arrs: ?[]mlx.mlx_array = if (consider_ext) try allocator.alloc(mlx.mlx_array, plan.m_lo) else null;
+        errdefer if (conf_arrs) |slots| allocator.free(slots);
+        const q_probs: ?[]mlx.mlx_array = if (sharp_drafts) try allocator.alloc(mlx.mlx_array, plan.m_hi) else null;
+        const t1_i32: i32 = @intCast(t1);
+        const t1_shape = [_]c_int{1};
+        return .{
+            .plan = plan,
+            .off0 = mtpRoundOff0(self.mtp_hist_stash, self.mtp_cache.?.step),
+            .t1 = t1,
+            .t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 1, .int32),
+            .drafts = drafts,
+            .draft_arrs = draft_arrs,
+            .n_drafted = 0,
+            .conf_arrs = conf_arrs,
+            .n_conf = 0,
+            .q_probs = q_probs,
+            .n_qp = 0,
+            .h_chain = null,
+            .m = plan.m_lo,
+        };
+    }
+
+    /// Build draft steps [from..to) of `chain` — graph construction only, no
+    /// sync; the caller dispatches. Each step's sampled token ([1] lazy
+    /// array) feeds the next step's embedding lookup; the MTP post-norm
+    /// hidden chains as the next h_prev. Step 0 merges the deferred history
+    /// append (consumes `self.mtp_hist_stash`); a chunk-B call resumes from
+    /// `chain.h_chain`.
+    fn mtpChainBuild(self: *Generator, chain: *MtpPreDraft, from: u32, to: u32) !void {
+        const xfm = self.xfm;
+        const s = xfm.s;
+        const head = self.mtp.?;
+        const mc = &self.mtp_cache.?;
+        const draft_sampling = mtpDraftSamplingFor(self.sampling, mtpDraftGreedy());
+        std.debug.assert(chain.n_drafted == from);
+        var i: u32 = from;
+        while (i < to) : (i += 1) {
+            const h_prev_arg: mlx.mlx_array = if (chain.h_chain) |h| h else self.last_hidden;
+            const prev_tok_arr: mlx.mlx_array = if (i == 0) chain.t1_arr else chain.draft_arrs[i - 1];
+            const step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
+                // Deferred history append (stashed at the END of the
+                // previous round, Phase 5a) merged into this chain's first
+                // draft: ONE (n+1)-row head forward appends the
+                // committed-history entries AND the first draft entry,
+                // replacing the old per-round appendHistory forward. RoPE
+                // offsets and cache-append order are byte-identical to the
+                // appendHistory-then-stepArr sequence (pinned by the merged-
+                // forward equivalence test in mtp.zig).
+                var st = self.mtp_hist_stash.?;
+                self.mtp_hist_stash = null;
+                defer st.deinit();
+                // Drop the previous round's stale draft tail — the old
+                // Phase 5a truncate, moved to consume time (offset-only).
+                try mc.truncate(st.off0, s);
+                var merged_ids = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(merged_ids);
+                var merged_hidden = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(merged_hidden);
+                {
+                    const idv = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(idv);
+                    _ = mlx.mlx_vector_array_append_value(idv, st.ids);
+                    _ = mlx.mlx_vector_array_append_value(idv, prev_tok_arr);
+                    try mlx.check(mlx.mlx_concatenate_axis(&merged_ids, idv, 0, s));
+                    const hv = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(hv);
+                    _ = mlx.mlx_vector_array_append_value(hv, st.hidden);
+                    _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
+                    try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
+                }
+                break :blk try mtp_mod.forward(head, xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), true);
+            } else try mtp_mod.stepArr(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(chain.off0 + i));
+            if (chain.q_probs) |slots| {
+                // Sharp proposal: q = filtered softmax of the draft-head
+                // logits at the FIXED sharpened constants; the draft is
+                // sampled from exactly this distribution (log+categorical
+                // == categorical over the filtered logits), so the q used
+                // in the accept ratio is the true proposal density.
+                slots[i] = try probsAtLastPos(step_out.logits, draft_sampling, s);
+                chain.n_qp = i + 1;
+                chain.draft_arrs[i] = try sampleFromProbsLazy(slots[i], s);
+            } else {
+                chain.draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
+            }
+            chain.n_drafted = i + 1;
+            if (chain.conf_arrs != null and i < chain.plan.m_lo) {
+                // Chunk-A confidence: log p_head(draft) — built from the
+                // step's own logits BEFORE they're freed (lazy graphs
+                // hold their inputs internally).
+                chain.conf_arrs.?[i] = try draftConfidenceGraph(step_out.logits, chain.draft_arrs[i], s);
+                chain.n_conf = i + 1;
+            }
+            _ = mlx.mlx_array_free(step_out.logits);
+            if (chain.h_chain) |h_old| _ = mlx.mlx_array_free(h_old);
+            chain.h_chain = step_out.hidden_next;
+        }
+    }
+
+    /// Fire the chain's built graphs [from..to) at the GPU (async, no
+    /// sync) so the head chain computes while the CPU builds the round's
+    /// remaining graphs. Chunk-A dispatches (from == 0) on two-chunk plans
+    /// also carry the confidence graphs and the chain hidden, so a
+    /// consume-time extension decision reads materialized arrays (near-free
+    /// sync) and chunk B resumes from a realized buffer. Dispatch timing
+    /// only — lazy sampling ops bind their PRNG key at graph BUILD time, so
+    /// values are identical.
+    fn mtpChainDispatch(chain: *const MtpPreDraft, from: u32, to: u32) !void {
+        const ev = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(ev);
+        for (chain.draft_arrs[from..to]) |arr| _ = mlx.mlx_vector_array_append_value(ev, arr);
+        if (chain.q_probs) |slots| {
+            for (slots[from..to]) |arr| _ = mlx.mlx_vector_array_append_value(ev, arr);
+        }
+        if (from == 0) {
+            if (chain.conf_arrs) |slots| {
+                for (slots[0..chain.n_conf]) |arr| _ = mlx.mlx_vector_array_append_value(ev, arr);
+                if (chain.h_chain) |h| _ = mlx.mlx_vector_array_append_value(ev, h);
+            }
+        }
+        try mlx.check(mlx.mlx_async_eval(ev));
+    }
+
+    /// Batched accept/correction graph for one stochastic round. Replaces
+    /// the per-position construction — m single-element gathers + concat
+    /// for accept_p (again for accept_q under sharp drafts) and 1+m
+    /// SEPARATE full-vocab log+categorical correction samplers — with
+    /// single batched kernels: one [m,1] take_along_axis per accept vector
+    /// and ONE [1+m, V] log+categorical covering every possible reject
+    /// position plus the full-accept bonus. Identical math and identical
+    /// output distributions; only the dispatch count (and the PRNG key
+    /// split pattern — one batched categorical draw instead of 1+m
+    /// sequential ones) changes.
+    pub const MtpBatchedGraph = struct {
+        /// [1+m] int32 pre-sampled corrections (index a = residual sample
+        /// for a reject at position a; index m = full-accept bonus).
+        corr_samples: mlx.mlx_array,
+        /// [m] f32 filtered target probability of each draft.
+        accept_p: mlx.mlx_array,
+        /// [m] f32 proposal density at each draft (sharp drafts only;
+        /// null-ctx under greedy proposals).
+        accept_q: mlx.mlx_array,
+
+        pub fn deinit(self: *MtpBatchedGraph) void {
+            _ = mlx.mlx_array_free(self.corr_samples);
+            _ = mlx.mlx_array_free(self.accept_p);
+            if (self.accept_q.ctx != null) _ = mlx.mlx_array_free(self.accept_q);
+        }
+    };
+
+    pub fn mtpBatchedAcceptGraph(
+        probs_all: mlx.mlx_array,
+        draft_arrs: []const mlx.mlx_array,
+        q_probs: ?[]const mlx.mlx_array,
+        m: u32,
+        s: mlx.mlx_stream,
+    ) !MtpBatchedGraph {
+        const shape = mlx.getShape(probs_all); // [1, 1+m, V]
+        const vocab = shape[2];
+        const mi: c_int = @intCast(m);
+        const strides2 = [_]c_int{ 1, 1 };
+
+        var p2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(p2d);
+        const p2_shape = [_]c_int{ mi + 1, vocab };
+        try mlx.check(mlx.mlx_reshape(&p2d, probs_all, &p2_shape, 2, s));
+
+        var ids_2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ids_2d);
+        {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            for (draft_arrs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_concatenate_axis(&flat, vec, 0, s));
+            const id2_shape = [_]c_int{ mi, 1 };
+            try mlx.check(mlx.mlx_reshape(&ids_2d, flat, &id2_shape, 2, s));
+        }
+
+        // Draft-position rows [m, V] and the bonus row [1, V] (slice views).
+        var p_rows = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(p_rows);
+        var bonus = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bonus);
+        {
+            const r_start = [_]c_int{ 0, 0 };
+            const r_stop = [_]c_int{ mi, vocab };
+            try mlx.check(mlx.mlx_slice(&p_rows, p2d, &r_start, 2, &r_stop, 2, &strides2, 2, s));
+            const b_start = [_]c_int{ mi, 0 };
+            const b_stop = [_]c_int{ mi + 1, vocab };
+            try mlx.check(mlx.mlx_slice(&bonus, p2d, &b_start, 2, &b_stop, 2, &strides2, 2, s));
+        }
+
+        // Proposal stack [m, V]: the full sharpened q rows under sharp
+        // drafts (exact Leviathan residual), one-hot of the lazy draft ids
+        // under greedy proposals.
+        var proposal = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(proposal);
+        if (q_probs) |qs| {
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            for (qs[0..m]) |arr| _ = mlx.mlx_vector_array_append_value(vec, arr);
+            try mlx.check(mlx.mlx_concatenate_axis(&proposal, vec, 0, s));
+        } else {
+            var indices = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(indices);
+            try mlx.check(mlx.mlx_arange(&indices, 0, @as(f64, @floatFromInt(vocab)), 1, .int32, s));
+            var onehot_b = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(onehot_b);
+            try mlx.check(mlx.mlx_equal(&onehot_b, indices, ids_2d, s));
+            try mlx.check(mlx.mlx_astype(&proposal, onehot_b, mlx.mlx_array_dtype(p2d), s));
+        }
+
+        // residual = max(p − proposal, 0) rows, then [residual; bonus] and
+        // ONE categorical over the whole stack.
+        var corr_samples = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(corr_samples);
+        {
+            var diff = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(diff);
+            try mlx.check(mlx.mlx_subtract(&diff, p_rows, proposal, s));
+            const zero = mlx.mlx_array_new_float(0.0);
+            defer _ = mlx.mlx_array_free(zero);
+            var residual = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(residual);
+            try mlx.check(mlx.mlx_maximum(&residual, diff, zero, s));
+            var stack = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(stack);
+            {
+                const vec = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(vec);
+                _ = mlx.mlx_vector_array_append_value(vec, residual);
+                _ = mlx.mlx_vector_array_append_value(vec, bonus);
+                try mlx.check(mlx.mlx_concatenate_axis(&stack, vec, 0, s));
+            }
+            var log_stack = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(log_stack);
+            try mlx.check(mlx.mlx_log(&log_stack, stack, s));
+            const null_key = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(null_key);
+            var sampled = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sampled);
+            try mlx.check(mlx.mlx_random_categorical(&sampled, log_stack, -1, null_key, s));
+            try mlx.check(mlx.mlx_astype(&corr_samples, sampled, .int32, s));
+        }
+
+        // accept_p[k] = p_rows[k][draft_k]; accept_q[k] = proposal density.
+        var accept_p = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(accept_p);
+        var accept_q: mlx.mlx_array = .{ .ctx = null };
+        errdefer if (accept_q.ctx != null) {
+            _ = mlx.mlx_array_free(accept_q);
+        };
+        {
+            var taken = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken);
+            try mlx.check(mlx.mlx_take_along_axis(&taken, p_rows, ids_2d, -1, s));
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            const m_shape = [_]c_int{mi};
+            try mlx.check(mlx.mlx_reshape(&flat, taken, &m_shape, 1, s));
+            try mlx.check(mlx.mlx_astype(&accept_p, flat, .float32, s));
+        }
+        if (q_probs != null) {
+            var taken = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(taken);
+            try mlx.check(mlx.mlx_take_along_axis(&taken, proposal, ids_2d, -1, s));
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            const m_shape = [_]c_int{mi};
+            try mlx.check(mlx.mlx_reshape(&flat, taken, &m_shape, 1, s));
+            accept_q = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&accept_q, flat, .float32, s));
+        }
+
+        return .{ .corr_samples = corr_samples, .accept_p = accept_p, .accept_q = accept_q };
+    }
+
+    /// Batched-corrections kill switch — MLX_SERVE_MTP_BATCH_CORR=0
+    /// restores the per-position accept/correction graphs for A/Bs.
+    var mtp_batch_corr_cache: ?bool = null;
+    pub fn mtpBatchCorrEnabledFromEnv(raw: ?[]const u8) bool {
+        const value = raw orelse return true;
+        return value.len == 0 or value[0] != '0';
+    }
+
+    fn mtpBatchCorrEnabled() bool {
+        if (mtp_batch_corr_cache) |v| return v;
+        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_BATCH_CORR")) |p| std.mem.span(p) else null;
+        const on = mtpBatchCorrEnabledFromEnv(raw);
+        mtp_batch_corr_cache = on;
+        return on;
+    }
+
+    /// Cross-round pre-draft (round pipelining): at the round's tail — the
+    /// accept decision made, trunk committed/rolled back, EV updated,
+    /// last_hidden/next_token_id already pointing at the next round — build
+    /// the NEXT round's chunk-A draft chain (consuming the history stash
+    /// Phase 5a just created, exactly as the next round's Phase 1 would)
+    /// and fire it at the GPU. The CPU then returns to the scheduler for
+    /// emit/SSE work while the head chain runs; the next nextMtp call finds
+    /// its drafts already materialized. The plan is computed AFTER this
+    /// round's EV update, so it is byte-identical to the one the next
+    /// round's entry would compute.
+    fn mtpMaybePreDraft(self: *Generator, allocator: std.mem.Allocator) !void {
+        if (!mtpPredraftEnabled()) return;
+        if (self.spec_disabled_runtime) return;
+        std.debug.assert(self.mtp_pre_draft == null);
+        const plan = self.mtpRoundPlan();
+        var chain = try self.mtpChainInit(allocator, plan, self.next_token_id);
+        errdefer chain.deinit(allocator);
+        try self.mtpChainBuild(&chain, 0, plan.m_lo);
+        try mtpChainDispatch(&chain, 0, plan.m_lo);
+        self.mtp_pre_draft = chain;
+    }
+
     pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.done) return null;
         std.debug.assert(self.mtp != null);
@@ -2543,6 +2941,13 @@ pub const Generator = struct {
         // Runtime acceptance gate: same hand-off contract as the drafter
         // (`next()`'s transition shim seeds pending_logits).
         if (self.spec_disabled_runtime) {
+            // Defensive: a pre-draft is never built once the gate trips
+            // (mtpMaybePreDraft checks), but free any live one before the
+            // AR fallback so its handles can't outlive the round state.
+            if (self.mtp_pre_draft) |*pd| {
+                pd.deinit(allocator);
+                self.mtp_pre_draft = null;
+            }
             const tok_opt = try self.next(allocator);
             if (tok_opt == null) return null;
             const tokens = try allocator.alloc(u32, 1);
@@ -2556,7 +2961,6 @@ pub const Generator = struct {
         const xfm = self.xfm;
         const s = xfm.s;
         const head = self.mtp.?;
-        const mc = &self.mtp_cache.?;
         // Cross-request EV seed: inherit the head's last healthy acceptance
         // surface so the controller plans from round 1 instead of re-warming
         // (~10 legacy rounds + a +1/round base climb — a third of a short
@@ -2571,169 +2975,102 @@ pub const Generator = struct {
                 self.mtp_ev_rounds = MTP_EV_WARMUP_ROUNDS;
             }
         }
-        // Round plan: fixed mode (and EV warmup) is today's single chunk at
-        // the windowed adaptive depth; post-warmup EV mode plans a base chunk
-        // m_lo plus a confidence-gated extension to m_hi (see the EV
-        // controller section below). `m` is the tokens actually drafted this
-        // round — it grows from m_lo to m_hi iff the gate clears.
-        const plan = self.mtpRoundPlan();
-        const m_lo: u32 = plan.m_lo;
-        const m_max: u32 = plan.m_hi;
-        var m: u32 = m_lo;
-        const t1: u32 = self.next_token_id;
-
         const tracing = mtpTraceEnabled();
         var ph: io_util.Stopwatch = undefined;
-        if (tracing) ph = io_util.Stopwatch.init(self.timer.io);
-
-        // ── Phase 0: record the MTP history length at the round boundary ──
-        // No snapshot: a snapshot refcount-shares the head's KV buffer, which
-        // forces every draft append's slice_update to copy-on-write the WHOLE
-        // history buffer (~268 MB/append at 64k). Rollback is truncate —
-        // offset-only — since draft entries only ever append past mtp_off0.
-        // With a pending history stash the cache still holds the PREVIOUS
-        // round's draft tail (mc.step is stale until the consume-time
-        // truncate), so the committed origin comes from the stash.
-        const mtp_off0: usize = mtpRoundOff0(self.mtp_hist_stash, mc.step);
-
-        // ── Phase 1: draft m tokens lazily, no per-step CPU sync ──
-        // Each step's sampled token ([1] lazy array) feeds the next step's
-        // embedding lookup; the MTP post-norm hidden chains as next h_prev.
-        // Two-chunk shape (EV mode only, when m_max > m_lo): chunk A also
-        // builds a lazy log-confidence per draft; ONE bounded sync at the
-        // chunk boundary reads the ids + confidences, and the round extends
-        // into chunk B iff the chain confidence clears the plan's tau. When
-        // the plan is single-chunk this block is byte-identical in shape to
-        // the fixed-depth path — no confidence graph, no extra sync.
-        var drafts = try allocator.alloc(u32, m_max);
-        errdefer allocator.free(drafts);
-        const draft_arrs = try allocator.alloc(mlx.mlx_array, m_max);
-        var n_drafted: u32 = 0;
-        defer {
-            for (draft_arrs[0..n_drafted]) |arr| _ = mlx.mlx_array_free(arr);
-            allocator.free(draft_arrs);
-        }
-        const consider_ext = m_max > m_lo;
-        var conf_arrs: ?[]mlx.mlx_array = if (consider_ext) try allocator.alloc(mlx.mlx_array, m_lo) else null;
-        var n_conf: u32 = 0;
-        defer if (conf_arrs) |slots| {
-            for (slots[0..n_conf]) |arr| _ = mlx.mlx_array_free(arr);
-            allocator.free(slots);
-        };
-
-        const t1_i32: i32 = @intCast(t1);
-        const t1_shape = [_]c_int{1};
-        const t1_arr = mlx.mlx_array_new_data(&t1_i32, &t1_shape, 1, .int32);
-        defer _ = mlx.mlx_array_free(t1_arr);
-
-        var h_prev_owner: ?mlx.mlx_array = null;
-        defer if (h_prev_owner) |h| {
-            _ = mlx.mlx_array_free(h);
-        };
-
-        // Draft proposal sampler (see mtpDraftSamplingFor): sharpened
-        // stochastic by default for stochastic targets; greedy for greedy
-        // targets or under the MLX_SERVE_MTP_DRAFT_GREEDY=1 override. With
-        // stochastic proposals each step ALSO keeps its filtered draft
-        // distribution q ([1, vocab] lazy) — the ratio accept and the
-        // residual both need it in Phase 4, and it rides the same lazy
-        // graph (one-bounded-sync discipline unchanged).
-        const draft_sampling = mtpDraftSamplingFor(self.sampling, mtpDraftGreedy());
-        const sharp_drafts = draft_sampling.temperature > 0.01;
-        const q_probs: ?[]mlx.mlx_array = if (sharp_drafts) try allocator.alloc(mlx.mlx_array, m_max) else null;
-        var n_qp: u32 = 0;
-        defer if (q_probs) |slots| {
-            for (slots[0..n_qp]) |arr| _ = mlx.mlx_array_free(arr);
-            allocator.free(slots);
-        };
-
-        {
-            var prev_tok_arr: mlx.mlx_array = t1_arr;
-            var i: u32 = 0;
-            while (i < m) : (i += 1) {
-                const h_prev_arg: mlx.mlx_array = if (h_prev_owner) |h| h else self.last_hidden;
-                const step_out = if (i == 0 and self.mtp_hist_stash != null) blk: {
-                    // Deferred history append (stashed at the END of the
-                    // previous round, Phase 5a) merged into this round's
-                    // first draft: ONE (n+1)-row head forward appends the
-                    // committed-history entries AND the first draft entry,
-                    // replacing the old per-round appendHistory forward.
-                    // RoPE offsets and cache-append order are byte-identical
-                    // to the appendHistory-then-stepArr sequence (pinned by
-                    // the merged-forward equivalence test in mtp.zig).
-                    var st = self.mtp_hist_stash.?;
-                    self.mtp_hist_stash = null;
-                    defer st.deinit();
-                    // Drop the previous round's stale draft tail — the old
-                    // Phase 5a truncate, moved to consume time (offset-only).
-                    try mc.truncate(st.off0, s);
-                    var merged_ids = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(merged_ids);
-                    var merged_hidden = mlx.mlx_array_new();
-                    defer _ = mlx.mlx_array_free(merged_hidden);
-                    {
-                        const idv = mlx.mlx_vector_array_new();
-                        defer _ = mlx.mlx_vector_array_free(idv);
-                        _ = mlx.mlx_vector_array_append_value(idv, st.ids);
-                        _ = mlx.mlx_vector_array_append_value(idv, prev_tok_arr);
-                        try mlx.check(mlx.mlx_concatenate_axis(&merged_ids, idv, 0, s));
-                        const hv = mlx.mlx_vector_array_new();
-                        defer _ = mlx.mlx_vector_array_free(hv);
-                        _ = mlx.mlx_vector_array_append_value(hv, st.hidden);
-                        _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
-                        try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
-                    }
-                    break :blk try mtp_mod.forward(head, xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), true);
-                } else try mtp_mod.stepArr(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(mtp_off0 + i));
-                if (q_probs) |slots| {
-                    // Sharp proposal: q = filtered softmax of the draft-head
-                    // logits at the FIXED sharpened constants; the draft is
-                    // sampled from exactly this distribution (log+categorical
-                    // == categorical over the filtered logits), so the q used
-                    // in the accept ratio is the true proposal density.
-                    slots[i] = try probsAtLastPos(step_out.logits, draft_sampling, s);
-                    n_qp = i + 1;
-                    draft_arrs[i] = try sampleFromProbsLazy(slots[i], s);
-                } else {
-                    draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
-                }
-                n_drafted = i + 1;
-                if (conf_arrs != null and i < m_lo) {
-                    // Chunk-A confidence: log p_head(draft) — built from the
-                    // step's own logits BEFORE they're freed (lazy graphs
-                    // hold their inputs internally).
-                    conf_arrs.?[i] = try draftConfidenceGraph(step_out.logits, draft_arrs[i], s);
-                    n_conf = i + 1;
-                }
-                _ = mlx.mlx_array_free(step_out.logits);
-                if (h_prev_owner) |h_old| {
-                    _ = mlx.mlx_array_free(h_old);
-                }
-                h_prev_owner = step_out.hidden_next;
-                prev_tok_arr = draft_arrs[i];
-
-                // ── chunk-A boundary: the one bounded sync of the round ──
-                if (consider_ext and i + 1 == m_lo) {
-                    if (tracing) {
-                        self.mtp_trace.add(.draft, ph.read());
-                        ph.reset();
-                    }
-                    const chain_ln = try readChainConfidence(draft_arrs[0..m_lo], conf_arrs.?[0..m_lo], s);
-                    if (chain_ln >= plan.tau_ln) {
-                        m = m_max;
-                        self.mtp_ext_rounds += 1;
-                    }
-                    if (tracing) {
-                        self.mtp_trace.add(.sync, ph.read());
-                        ph.reset();
-                    }
-                }
-            }
-        }
         if (tracing) {
-            self.mtp_trace.add(if (m > m_lo) .ext else .draft, ph.read());
+            ph = io_util.Stopwatch.init(self.timer.io);
+            // Close the scheduler gap opened at the previous round's return.
+            if (self.mtp_gap_watch) |*gw| self.mtp_trace.add(.gap, gw.read());
+            self.mtp_gap_watch = null;
+        }
+        // Always-on round wall-clock for the live-cost round EMA (the
+        // denominator of the sync fraction). Read at both commit exits.
+        const livecost = mtpLiveCostEnabled();
+        var round_watch = io_util.Stopwatch.init(self.timer.io);
+
+        // ── Phase 0/1: acquire this round's draft chain ──
+        // Round plan: fixed mode (and EV warmup) is a single chunk at the
+        // windowed adaptive depth; post-warmup EV mode plans a base chunk
+        // m_lo plus a confidence-gated extension to m_hi (see the EV
+        // controller section below). `chain.m` is the tokens actually
+        // drafted this round — it grows from m_lo to m_hi iff the gate
+        // clears at the chunk boundary below.
+        //
+        // Either the PREVIOUS round built + dispatched chunk A at its tail
+        // (cross-round pipelining, `mtpMaybePreDraft` — the drafts are
+        // already materializing on the GPU) or we build it here (round 1,
+        // MLX_SERVE_MTP_PREDRAFT=0, or a round with no successor state).
+        //
+        // No head-cache snapshot in either case: a snapshot refcount-shares
+        // the head's KV buffer, which forces every draft append's
+        // slice_update to copy-on-write the WHOLE history buffer (~268
+        // MB/append at 64k). Rollback is truncate — offset-only — since
+        // draft entries only ever append past chain.off0 (the committed
+        // origin, resolved from the pending history stash when one exists).
+        var chain: MtpPreDraft = if (self.mtp_pre_draft) |pd| blk: {
+            self.mtp_pre_draft = null;
+            // The pre-draft consumed the history stash when it was built.
+            std.debug.assert(self.mtp_hist_stash == null);
+            std.debug.assert(pd.t1 == self.next_token_id);
+            break :blk pd;
+        } else blk: {
+            const plan_now = self.mtpRoundPlan();
+            var c = try self.mtpChainInit(allocator, plan_now, self.next_token_id);
+            errdefer c.deinit(allocator);
+            try self.mtpChainBuild(&c, 0, plan_now.m_lo);
+            if (mtpEarlyDispatchEnabled()) try mtpChainDispatch(&c, 0, plan_now.m_lo);
+            break :blk c;
+        };
+        defer chain.deinit(allocator);
+        const plan = chain.plan;
+        const m_lo: u32 = plan.m_lo;
+        const m_max: u32 = plan.m_hi;
+        const t1: u32 = chain.t1;
+        const mtp_off0: usize = chain.off0;
+        if (tracing) {
+            self.mtp_trace.add(.draft, ph.read());
             ph.reset();
         }
+
+        // ── chunk-A boundary: extension decision (two-chunk EV plans) ──
+        // The one bounded sync of the round; near-free when the chain was
+        // pre-drafted (ids + confidences already materialized).
+        if (m_max > m_lo) {
+            var sync_watch = io_util.Stopwatch.init(self.timer.io);
+            const chain_ln = try readChainConfidence(chain.draft_arrs[0..m_lo], chain.conf_arrs.?[0..m_lo], s);
+            const sync_ns = sync_watch.read();
+            // Live sync-cost EMA: measured only on considered rounds, so it
+            // holds the true per-sync cost (not the suppressed-round average).
+            if (livecost) self.mtp_ev_sync_ms = mtpEmaMs(self.mtp_ev_sync_ms, sync_ns);
+            if (tracing) {
+                self.mtp_trace.add(.sync, sync_ns);
+                ph.reset();
+            }
+            if (chain_ln >= plan.tau_ln) {
+                chain.m = m_max;
+                self.mtp_ext_rounds += 1;
+                self.mtp_ext_dry_streak = 0;
+                try self.mtpChainBuild(&chain, m_lo, m_max);
+                if (mtpEarlyDispatchEnabled()) try mtpChainDispatch(&chain, m_lo, m_max);
+            } else {
+                // Considered but the gate didn't clear — feeds the
+                // dry-spell policy (mtpExtDryAllows).
+                self.mtp_ext_dry_streak +|= 1;
+            }
+            if (tracing) {
+                self.mtp_trace.add(.ext, ph.read());
+                ph.reset();
+            }
+        }
+        const m: u32 = chain.m;
+        // Chain complete — release the chain hidden (only chunk B needed it).
+        if (chain.h_chain) |h| {
+            _ = mlx.mlx_array_free(h);
+            chain.h_chain = null;
+        }
+        const drafts = chain.drafts;
+        const draft_arrs = chain.draft_arrs;
+        const q_probs = chain.q_probs;
 
         // ── Phase 2: record rollback anchors (NO snapshot on the GDN path) ──
         // A KVCache.snapshot() refcount-shares the KV buffers, which forces
@@ -2755,7 +3092,7 @@ pub const Generator = struct {
         const reshape_2d = [_]c_int{ 1, 1 };
         var t1_2d = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(t1_2d);
-        try mlx.check(mlx.mlx_reshape(&t1_2d, t1_arr, &reshape_2d, 2, s));
+        try mlx.check(mlx.mlx_reshape(&t1_2d, chain.t1_arr, &reshape_2d, 2, s));
 
         var verify_input = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(verify_input);
@@ -2826,8 +3163,31 @@ pub const Generator = struct {
             for (slots) |arr| _ = mlx.mlx_array_free(arr);
             allocator.free(slots);
         };
+        // Batched-corrections path: ONE [1+m] pre-sampled correction array
+        // instead of the per-position corr_samples slots.
+        var corr_batch: mlx.mlx_array = .{ .ctx = null };
+        defer if (corr_batch.ctx != null) {
+            _ = mlx.mlx_array_free(corr_batch);
+        };
 
-        if (stochastic) {
+        if (stochastic and mtpBatchCorrEnabled()) {
+            const probs_all = try probsAllPositions(verify_logits, self.sampling, s);
+            defer _ = mlx.mlx_array_free(probs_all);
+            const bg = try mtpBatchedAcceptGraph(
+                probs_all,
+                draft_arrs[0..m],
+                if (q_probs) |qs| qs[0..m] else null,
+                m,
+                s,
+            );
+            corr_batch = bg.corr_samples;
+            _ = mlx.mlx_array_free(accept_p_vec);
+            accept_p_vec = bg.accept_p;
+            if (bg.accept_q.ctx != null) {
+                _ = mlx.mlx_array_free(accept_q_vec);
+                accept_q_vec = bg.accept_q;
+            }
+        } else if (stochastic) {
             const slice_strides = [_]c_int{ 1, 1, 1 };
             // Filtered + softmaxed target probs for ALL 1+m positions in one
             // batched kernel set, then per-position slice VIEWS (no copies).
@@ -2956,7 +3316,11 @@ pub const Generator = struct {
             if (stochastic) {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, accept_p_vec);
                 if (q_probs != null) _ = mlx.mlx_vector_array_append_value(eval_vec, accept_q_vec);
-                for (corr_samples.?) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
+                if (corr_batch.ctx != null) {
+                    _ = mlx.mlx_vector_array_append_value(eval_vec, corr_batch);
+                } else {
+                    for (corr_samples.?) |arr| _ = mlx.mlx_vector_array_append_value(eval_vec, arr);
+                }
             } else {
                 _ = mlx.mlx_vector_array_append_value(eval_vec, verify_argmax);
             }
@@ -3013,6 +3377,14 @@ pub const Generator = struct {
 
         const next_pending: u32 = blk: {
             if (stochastic) {
+                if (corr_batch.ctx != null) {
+                    // Pre-sampled [1+m] batch; index at the realized accept.
+                    try mlx.check(mlx.mlx_array_eval(corr_batch));
+                    const d = mlx.mlx_array_data_int32(corr_batch) orelse {
+                        return error.MlxArrayDataNull;
+                    };
+                    break :blk @intCast(d[accepted]);
+                }
                 // Pre-sampled in the round batch; realized already.
                 const corr = corr_samples.?[accepted];
                 try mlx.check(mlx.mlx_array_eval(corr));
@@ -3103,10 +3475,18 @@ pub const Generator = struct {
             self.step += 1 + m;
             self.completion_tokens += 1 + m;
 
-            allocator.free(drafts);
             if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, m) else self.updateMtpDepth(m, m);
-            if (tracing) self.mtp_trace.add(.commit, ph.read());
+            if (tracing) {
+                self.mtp_trace.add(.commit, ph.read());
+                ph.reset();
+            }
+            try self.mtpMaybePreDraft(allocator);
+            if (tracing) {
+                self.mtp_trace.add(.predraft, ph.read());
+                self.mtp_gap_watch = io_util.Stopwatch.init(self.timer.io);
+            }
             self.mtpTraceRoundEnd(m, m, m_lo);
+            if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
             return DrafterStepResult{
                 .tokens = tokens,
                 .accepted_tokens = m,
@@ -3189,10 +3569,18 @@ pub const Generator = struct {
         self.step += 1 + accepted;
         self.completion_tokens += 1 + accepted;
 
-        allocator.free(drafts);
         if (mtpAdaptiveEnabled()) self.updateMtpEvRound(m, accepted) else self.updateMtpDepth(m, accepted);
-        if (tracing) self.mtp_trace.add(.commit, ph.read());
+        if (tracing) {
+            self.mtp_trace.add(.commit, ph.read());
+            ph.reset();
+        }
+        try self.mtpMaybePreDraft(allocator);
+        if (tracing) {
+            self.mtp_trace.add(.predraft, ph.read());
+            self.mtp_gap_watch = io_util.Stopwatch.init(self.timer.io);
+        }
         self.mtpTraceRoundEnd(m, accepted, m_lo);
+        if (livecost) self.mtp_ev_round_ms = mtpEmaMs(self.mtp_ev_round_ms, round_watch.read());
         return DrafterStepResult{
             .tokens = tokens,
             .accepted_tokens = accepted,
@@ -3389,6 +3777,13 @@ pub const Generator = struct {
     /// Clamp band for the extension confidence threshold.
     pub const MTP_EV_TAU_MIN: f32 = 0.05;
     pub const MTP_EV_TAU_MAX: f32 = 0.95;
+    /// Minimum base-round EV (tokens per round-cost) for the exploration
+    /// horizon: below this the base itself barely beats AR, so keeping an
+    /// extension position reachable would only add sync tax to a dying
+    /// speculation (the sticky-disable floor is likely next anyway). 1.10
+    /// keeps fully-cold EMAs collapsed on every cost profile (cold best_r:
+    /// generic 1.00, G17-NAX 1.07/1.08).
+    pub const MTP_EV_EXPLORE_MIN_R: f32 = 1.10;
 
     /// Round-cost model in units of the fixed round cost (verify-forward
     /// floor + round eval/read + commit ≈ 1.0 ≈ 32 ms on the 27B since the
@@ -3424,13 +3819,21 @@ pub const Generator = struct {
         nax_from: u32 = 0,
         per_pos_nax: f32 = 0.0,
     };
-    /// 2026-07-13 refit #2, AFTER the split-K verify-qmm kernel landed
-    /// (transformer.verifyQmm): same-session saturated sweep T(1)=44.6,
-    /// T(3)=54.4, T(6)=89.9 ms → floor ≈ 40 ms, flat marginal 4.9 ms/pos
-    /// (the kernel holds verify qmms near the weight-stream floor through
-    /// M=7), ramp 11.8 ms/pos (stock lm_head at growing M + attention +
-    /// eval/read).
-    pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.06, .per_pos_lo = 0.06, .per_pos_hi = 0.24, .flat_max = 3, .sync = 0.02 };
+    /// 2026-07-22 refit #3, AFTER round pipelining (early draft dispatch +
+    /// cross-round pre-draft + GDN capture-tail trim): same-session
+    /// saturated ECHO sweep on the Jundot oQ4e 27B @8K, M4 Max — T(1)=45.4,
+    /// T(2)=53.3 (two fully-saturated m_avg=2.0 windows; deeper depths
+    /// can't saturate on this head, chained acceptance ~0.5) → floor
+    /// ≈ 37.9 ms, flat marginal ≈ 7.5 ms/pos = 0.20 floor units. The
+    /// pipelining hid the CPU graph-build (floor down from ~40), so
+    /// per-position marginals RISE in floor units (draft+lo 0.12 → 0.20).
+    /// per_pos_hi carries over from refit #2 (ramp unmeasurable on this
+    /// head; conservative — higher hi only raises tau). sync = 0.01: the
+    /// chunk-A boundary read is near-free now that pre-drafted ids are
+    /// materialized before the round starts.
+    /// (Refit #2, 2026-07-13, post-verify-qmm, for the record: T(1)=44.6,
+    /// T(3)=54.4, T(6)=89.9 → .06/.06/.24/.02 on a ~40 ms floor.)
+    pub const MTP_EV_DEFAULT_COSTS: MtpEvCosts = .{ .draft = 0.10, .per_pos_lo = 0.10, .per_pos_hi = 0.24, .flat_max = 3, .sync = 0.01 };
     /// M5 Max/G17 refit (2026-07-17), same-session saturated fixed-depth
     /// sweep after the NAX m16 verify lane landed: T(1..4) ~= 41.35 ms,
     /// T(6)=62.15 ms, T(8)=68.39 ms. In floor units this identifies
@@ -3575,7 +3978,24 @@ pub const Generator = struct {
             t_sum += mc;
             m_hi += 1;
         }
-        if (m_hi == m_lo) return .{ .m_lo = m_lo, .m_hi = m_lo, .tau_ln = 0.0 };
+        if (m_hi == m_lo) {
+            // Exploration valve for the horizon itself (2026-07-22): the
+            // index one past m_lo is observable ONLY when extension fires —
+            // at m_lo-deep rounds a[m_lo] never updates — so an EMA dragged
+            // cold under an earlier workload (or an easier tau regime)
+            // would otherwise close the horizon FOREVER: m stays at m_lo,
+            // a[m_lo] never re-proves itself, and pure echo runs at
+            // ext_rounds=0 (the exact class the TAU_MAX valve exists for,
+            // resurfaced by refit #3's honest marginals). Whenever the base
+            // itself pays, keep ONE extension position reachable at the
+            // clamped tau; the dry-spell gate bounds the consideration tax
+            // on workloads where confidence never clears it.
+            if (best_r <= MTP_EV_EXPLORE_MIN_R) return .{ .m_lo = m_lo, .m_hi = m_lo, .tau_ln = 0.0 };
+            const mc = mtpEvMarginalCost(costs, m_lo + 1);
+            const s = @max(a[m_lo], 1e-6);
+            const tau_x = std.math.clamp(best_r * mc / s, MTP_EV_TAU_MIN, MTP_EV_TAU_MAX);
+            return .{ .m_lo = m_lo, .m_hi = m_lo + 1, .tau_ln = @log(tau_x) };
+        }
         // The TAU_MAX clamp doubles as the exploration valve: on razor-thin
         // horizons the honest tau approaches 1 ("never extend"), and 0.95
         // lets near-perfect-confidence rounds through so the deep EMAs can
@@ -3612,7 +4032,7 @@ pub const Generator = struct {
     /// (every stamp is guarded on the cached env check).
     pub const MtpTrace = struct {
         pub const LOG_EVERY: u32 = 32;
-        pub const Phase = enum(u4) { draft, sync, ext, verify, corr, eval, hist, commit };
+        pub const Phase = enum(u4) { draft, sync, ext, verify, corr, eval, hist, commit, predraft, gap };
         pub const N_PHASES = @typeInfo(Phase).@"enum".field_names.len;
 
         rounds: u32 = 0,
@@ -3683,6 +4103,47 @@ pub const Generator = struct {
         return on;
     }
 
+    /// Early draft-chain dispatch (round pipelining) — DEFAULT ON. Fires the
+    /// draft-chain graph at the GPU as soon as Phase 1 finishes building it,
+    /// so the head chain runs while the CPU builds the verify/accept graphs
+    /// (~2 ms the GPU used to spend idle each round). Dispatch timing only —
+    /// lazy sampling ops bind their PRNG key at graph BUILD time, so values
+    /// are identical. MLX_SERVE_MTP_EARLY_DISPATCH=0 restores the serial
+    /// round shape for same-boot A/Bs.
+    var mtp_early_dispatch_cache: ?bool = null;
+    pub fn mtpEarlyDispatchEnabledFromEnv(raw: ?[]const u8) bool {
+        const value = raw orelse return true;
+        return value.len == 0 or value[0] != '0';
+    }
+
+    fn mtpEarlyDispatchEnabled() bool {
+        if (mtp_early_dispatch_cache) |v| return v;
+        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_EARLY_DISPATCH")) |p| std.mem.span(p) else null;
+        const on = mtpEarlyDispatchEnabledFromEnv(raw);
+        mtp_early_dispatch_cache = on;
+        return on;
+    }
+
+    /// Cross-round pre-draft (round pipelining) — DEFAULT ON. Builds and
+    /// dispatches the next round's chunk-A draft chain at the current
+    /// round's tail (see mtpMaybePreDraft) so the GPU drafts while the CPU
+    /// does emit/SSE bookkeeping. MLX_SERVE_MTP_PREDRAFT=0 reverts to
+    /// head-of-round drafting for same-boot A/Bs (combine with
+    /// MLX_SERVE_MTP_EARLY_DISPATCH=0 for the fully serial round shape).
+    var mtp_predraft_cache: ?bool = null;
+    pub fn mtpPredraftEnabledFromEnv(raw: ?[]const u8) bool {
+        const value = raw orelse return true;
+        return value.len == 0 or value[0] != '0';
+    }
+
+    fn mtpPredraftEnabled() bool {
+        if (mtp_predraft_cache) |v| return v;
+        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_PREDRAFT")) |p| std.mem.span(p) else null;
+        const on = mtpPredraftEnabledFromEnv(raw);
+        mtp_predraft_cache = on;
+        return on;
+    }
+
     var mtp_trace_cache: ?bool = null;
     fn mtpTraceEnabled() bool {
         if (mtp_trace_cache) |v| return v;
@@ -3742,10 +4203,134 @@ pub const Generator = struct {
         );
     }
 
+    /// Extension dry-spell gate constants: after MTP_EXT_DRY_ROUNDS
+    /// consecutive extension-CONSIDERED rounds whose confidence gate never
+    /// cleared, consideration collapses to single-chunk for
+    /// MTP_EXT_DRY_COOLDOWN rounds, then re-opens for a fresh trial.
+    /// Rationale (2026-07-22, post-round-pipelining sweep): a two-chunk
+    /// round pays a REAL mid-pipeline cost the EV surface can't see — the
+    /// chunk-A boundary sync fires ~0.3 ms after the pre-draft dispatch, so
+    /// it blocks on the still-running head chain + confidence graphs
+    /// (measured sync 0.5-3.7 ms/round at ext_rate 0.00; EV default lost
+    /// 3-6 tok/s at 0.5K to fixed depths from this tax alone). The gate is
+    /// fed by the REALIZED extension rate, never by priors — the war-story
+    /// failure mode (docs/gotchas/engine-mlx.md, ext_rounds=0 on echo) was
+    /// a prior-fed expected-gain gate blocking the FIRST trial; this one
+    /// guarantees a fresh 16-round trial every 48 rounds, and a single
+    /// extension firing resets the streak entirely. Worst-case waste on a
+    /// permanently-dry workload: a third of rounds pay the sync. The
+    /// cooldown is deliberately SHORT relative to a typical request (a
+    /// 160-token echo ≈ 70 rounds): a 64-round blackout swallowed the whole
+    /// echoing stretch after a dry preamble and re-created the very
+    /// ext_rounds=0 regression this design avoids (caught by
+    /// tests/test_mtp_equivalence.sh).
+    pub const MTP_EXT_DRY_ROUNDS: u32 = 16;
+    pub const MTP_EXT_DRY_COOLDOWN: u32 = 32;
+    /// Floor for the cost-aware dry threshold. Even the most expensive sync
+    /// tolerates this many dry considered rounds before a cooldown, so the
+    /// worst-case fresh-trial cadence (MTP_EXT_DRY_MIN + MTP_EXT_DRY_COOLDOWN)
+    /// still fits inside a typical echo stretch (~70 rounds) — the horizon is
+    /// never closed regardless of measured cost.
+    pub const MTP_EXT_DRY_MIN: u32 = 3;
+    /// Tolerated cumulative chunk-A sync per dry exploration burst, expressed
+    /// as a fraction of one round. The cost-aware threshold is
+    /// SYNC_BUDGET / (sync_ms/round_ms): a costlier sync backs off sooner, a
+    /// near-free one keeps the full MTP_EXT_DRY_ROUNDS budget. Calibrated so
+    /// the measured 8K operating point (sync ~2.4 ms of a ~45 ms round,
+    /// frac ~0.053) lands near a ~15% exploration duty (threshold ~6, cooldown
+    /// 32) — matching oMLX's duty-bounded probing.
+    pub const MTP_EXT_SYNC_BUDGET: f32 = 0.30;
+
+    /// Cost-aware dry-explore threshold (consecutive dry considered rounds
+    /// tolerated before a cooldown), derived from the LIVE-measured sync
+    /// fraction `sync_ms / round_ms`. Bounded to
+    /// [MTP_EXT_DRY_MIN, MTP_EXT_DRY_ROUNDS] so a fresh trial always fits
+    /// inside an echo stretch. Unmeasured (either EMA still 0) keeps the fixed
+    /// budget — no behavior change until the live cost is observed.
+    pub fn mtpExtDryThresholdFor(sync_ms: f32, round_ms: f32) u32 {
+        if (sync_ms <= 0.0 or round_ms <= 0.0) return MTP_EXT_DRY_ROUNDS;
+        const frac = sync_ms / round_ms; // measured exploration cost fraction
+        if (frac <= 0.0) return MTP_EXT_DRY_ROUNDS;
+        const max_f: f32 = @floatFromInt(MTP_EXT_DRY_ROUNDS);
+        // Tolerate ~SYNC_BUDGET round-times of accumulated sync per dry burst:
+        // a costlier sync (larger frac) yields fewer tolerated dry rounds.
+        const raw = @min(MTP_EXT_SYNC_BUDGET / frac, max_f);
+        const rounded: u32 = @intFromFloat(@round(@max(0.0, raw)));
+        return @min(MTP_EXT_DRY_ROUNDS, @max(MTP_EXT_DRY_MIN, rounded));
+    }
+
+    /// Pure dry-spell policy step, called once per post-warmup EV round
+    /// whose plan considers extension. Returns whether the two-chunk shape
+    /// is allowed this round; mutates the streak/cooldown state. The caller
+    /// bumps `streak` on a considered-but-not-extended round and zeroes it
+    /// when extension fires. `threshold` is the cost-aware dry limit
+    /// (mtpExtDryThresholdFor) — the live-cost lever that shortens dry
+    /// exploration bursts when the measured sync is expensive.
+    pub fn mtpExtDryAllows(dry_streak: *u32, cooldown: *u32, threshold: u32) bool {
+        if (cooldown.* > 0) {
+            cooldown.* -= 1;
+            return false;
+        }
+        if (dry_streak.* >= threshold) {
+            cooldown.* = MTP_EXT_DRY_COOLDOWN - 1;
+            dry_streak.* = 0;
+            return false;
+        }
+        return true;
+    }
+
+    /// Dry-spell gate kill switch — MLX_SERVE_MTP_EXT_DRY=0 restores
+    /// unconditional extension consideration for same-boot A/Bs.
+    var mtp_ext_dry_cache: ?bool = null;
+    pub fn mtpExtDryEnabledFromEnv(raw: ?[]const u8) bool {
+        const value = raw orelse return true;
+        return value.len == 0 or value[0] != '0';
+    }
+
+    fn mtpExtDryEnabled() bool {
+        if (mtp_ext_dry_cache) |v| return v;
+        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_EXT_DRY")) |p| std.mem.span(p) else null;
+        const on = mtpExtDryEnabledFromEnv(raw);
+        mtp_ext_dry_cache = on;
+        return on;
+    }
+
+    /// EMA weight for the live round/sync cost EMAs. Slower than the
+    /// acceptance EMA (cost drifts with context/thermal, not content) and
+    /// paired with the seed-on-first-sample rule so warmup fills them cleanly.
+    pub const MTP_EV_COST_BETA: f32 = 0.10;
+
+    /// Fold a nanosecond wall-time sample into a millisecond EMA. Seeds on the
+    /// first sample (prev <= 0). Pure — the live-cost measurement plumbing is
+    /// just Stopwatch reads feeding this.
+    pub fn mtpEmaMs(prev_ms: f32, sample_ns: u64) f32 {
+        const sample_ms = @as(f32, @floatFromInt(sample_ns)) / 1.0e6;
+        if (prev_ms <= 0.0) return sample_ms;
+        return prev_ms + MTP_EV_COST_BETA * (sample_ms - prev_ms);
+    }
+
+    /// Live-cost throttle kill switch — MLX_SERVE_MTP_LIVECOST=0 reverts the
+    /// dry-exploration threshold to the fixed MTP_EXT_DRY_ROUNDS (the
+    /// pre-live-cost cadence) for same-boot A/Bs.
+    var mtp_livecost_cache: ?bool = null;
+    pub fn mtpLiveCostEnabledFromEnv(raw: ?[]const u8) bool {
+        const value = raw orelse return true;
+        return value.len == 0 or value[0] != '0';
+    }
+
+    fn mtpLiveCostEnabled() bool {
+        if (mtp_livecost_cache) |v| return v;
+        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_LIVECOST")) |p| std.mem.span(p) else null;
+        const on = mtpLiveCostEnabledFromEnv(raw);
+        mtp_livecost_cache = on;
+        return on;
+    }
+
     /// Per-round draft plan. Fixed mode (and EV warmup): today's adaptive
     /// depth, no extension — byte-identical round shape to the legacy path.
     /// Post-warmup EV mode: the pure plan over the acceptance EMAs, with the
-    /// base-depth climb damped to one step per round.
+    /// base-depth climb damped to one step per round and two-chunk plans
+    /// gated by the extension dry-spell policy.
     fn mtpRoundPlan(self: *Generator) MtpRoundPlan {
         const cap: u32 = @min(@max(@as(u32, 1), self.mtp_depth), mtp_mod.MAX_DEPTH);
         if (!mtpAdaptiveEnabled() or self.mtp_ev_rounds < MTP_EV_WARMUP_ROUNDS) {
@@ -3753,8 +4338,20 @@ pub const Generator = struct {
             self.mtp_ev_m_lo_prev = d;
             return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
         }
-        const plan = mtpEvPlanFor(self.mtp_ev_accept[0..cap], cap, self.mtp_ev_costs, self.mtp_ev_m_lo_prev + 1);
+        var plan = mtpEvPlanFor(self.mtp_ev_accept[0..cap], cap, self.mtp_ev_costs, self.mtp_ev_m_lo_prev + 1);
         self.mtp_ev_m_lo_prev = plan.m_lo;
+        // Live-cost lever: shorten dry exploration bursts when the MEASURED
+        // chunk-A sync is an expensive fraction of the round (mtpExtDryThresholdFor).
+        const dry_threshold = if (mtpLiveCostEnabled())
+            mtpExtDryThresholdFor(self.mtp_ev_sync_ms, self.mtp_ev_round_ms)
+        else
+            MTP_EXT_DRY_ROUNDS;
+        if (plan.m_hi > plan.m_lo and mtpExtDryEnabled() and
+            !mtpExtDryAllows(&self.mtp_ext_dry_streak, &self.mtp_ext_cooldown, dry_threshold))
+        {
+            plan.m_hi = plan.m_lo;
+            plan.tau_ln = 0.0;
+        }
         return plan;
     }
 
@@ -3828,7 +4425,7 @@ pub const Generator = struct {
         if (!self.mtp_trace.endRound(m, accepted, m > m_lo)) return;
         const t = &self.mtp_trace;
         log.info(
-            "  [mtp-trace] rounds={d} avg_ms draft={d:.2} sync={d:.2} ext={d:.2} verify={d:.2} corr={d:.2} eval={d:.2} hist={d:.2} commit={d:.2} total={d:.2} | m_avg={d:.2} acc_avg={d:.2} ext_rate={d:.2}\n",
+            "  [mtp-trace] rounds={d} avg_ms draft={d:.2} sync={d:.2} ext={d:.2} verify={d:.2} corr={d:.2} eval={d:.2} hist={d:.2} commit={d:.2} predraft={d:.2} gap={d:.2} total={d:.2} | m_avg={d:.2} acc_avg={d:.2} ext_rate={d:.2}\n",
             .{
                 t.rounds,
                 t.avgMs(.draft),
@@ -3839,6 +4436,8 @@ pub const Generator = struct {
                 t.avgMs(.eval),
                 t.avgMs(.hist),
                 t.avgMs(.commit),
+                t.avgMs(.predraft),
+                t.avgMs(.gap),
                 t.totalAvgMs(),
                 @as(f64, @floatFromInt(t.drafted)) / @as(f64, @floatFromInt(t.rounds)),
                 @as(f64, @floatFromInt(t.accepted)) / @as(f64, @floatFromInt(t.rounds)),
@@ -6465,6 +7064,30 @@ test "MTP EV seed defaults on and explicit zero disables" {
     try testing.expect(!Generator.mtpEvSeedEnabledFromEnv("0-disabled"));
 }
 
+test "MTP early dispatch defaults on and explicit zero disables" {
+    try testing.expect(Generator.mtpEarlyDispatchEnabledFromEnv(null));
+    try testing.expect(Generator.mtpEarlyDispatchEnabledFromEnv(""));
+    try testing.expect(Generator.mtpEarlyDispatchEnabledFromEnv("1"));
+    try testing.expect(!Generator.mtpEarlyDispatchEnabledFromEnv("0"));
+    try testing.expect(!Generator.mtpEarlyDispatchEnabledFromEnv("0-disabled"));
+}
+
+test "MTP cross-round pre-draft defaults on and explicit zero disables" {
+    try testing.expect(Generator.mtpPredraftEnabledFromEnv(null));
+    try testing.expect(Generator.mtpPredraftEnabledFromEnv(""));
+    try testing.expect(Generator.mtpPredraftEnabledFromEnv("1"));
+    try testing.expect(!Generator.mtpPredraftEnabledFromEnv("0"));
+    try testing.expect(!Generator.mtpPredraftEnabledFromEnv("0-disabled"));
+    // The tail-side pre-draft bills its own trace phase; the round total
+    // stays the honest sum of all phases.
+    var t = Generator.MtpTrace{};
+    t.add(.predraft, 2_000_000);
+    t.add(.eval, 8_000_000);
+    _ = t.endRound(1, 1, false);
+    try testing.expectApproxEqAbs(@as(f64, 2.0), t.avgMs(.predraft), 1e-9);
+    try testing.expectApproxEqAbs(@as(f64, 10.0), t.totalAvgMs(), 1e-9);
+}
+
 test "mtpDepthCapFor: auto cap follows the selected cost profile; explicit always wins" {
     // 0 = auto (--mtp-depth not passed).
     try testing.expectEqual(Generator.MTP_ADAPTIVE_DEFAULT_CAP, Generator.mtpDepthCapForProfile(0, true, .generic));
@@ -6729,6 +7352,22 @@ test "mtpEvPlanFor: hot flat acceptance rides the flat region and extends into t
     try testing.expectApproxEqAbs(@as(f32, -0.1484), plan.tau_ln, 5e-3);
 }
 
+test "mtpEvPlanFor: a stale-cold EMA one past m_lo cannot close the horizon permanently" {
+    // a[1] is observable ONLY when extension fires (at m=1 rounds it never
+    // updates), so a value dragged down under an old workload must not be
+    // able to lock the horizon shut — the live regression was ext_rounds=0
+    // on the equivalence echo after refit #3's honest marginals. When the
+    // base pays, one extension position stays reachable at the clamped
+    // exploration tau; realized extensions then re-observe a[1] honestly.
+    const costs = Generator.MTP_EV_DEFAULT_COSTS;
+    const a = [_]f32{ 0.75, 0.28, 0.85, 0.85, 0.85, 0.85, 0.85, 0.85 };
+    const plan = Generator.mtpEvPlanFor(&a, 8, costs, 8);
+    try testing.expectEqual(@as(u32, 1), plan.m_lo);
+    try testing.expectEqual(@as(u32, 2), plan.m_hi);
+    // tau clamps to TAU_MAX: only near-perfect-confidence rounds extend.
+    try testing.expectApproxEqAbs(@log(Generator.MTP_EV_TAU_MAX), plan.tau_ln, 1e-6);
+}
+
 test "mtpEvPlanFor: cold acceptance collapses to depth 1, single chunk" {
     const costs = Generator.MtpEvCosts{ .draft = 0.10, .per_pos_lo = 0.09, .per_pos_hi = 0.22, .flat_max = 3, .sync = 0.02 };
     const a = [_]f32{ 0.2, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1, 0.1 };
@@ -6764,26 +7403,171 @@ test "mtpEvPlanFor: unobserved deep indices at the prior still open the extensio
     try testing.expectApproxEqAbs(@as(f32, -0.1168), plan.tau_ln, 5e-3);
 }
 
-test "mtpEvPlanFor: DEFAULT costs carry the post-verify-qmm surface (2026-07-13 refit #2)" {
-    // Pins MTP_EV_DEFAULT_COSTS to the surface measured AFTER the split-K
-    // verify-qmm kernel (same-session saturated sweep, Youssofal 27B,
-    // M4 Max: T(1)=44.6, T(3)=54.4, T(6)=89.9 ms → floor ≈ 40 ms,
-    // draft+lo = 0.12, draft+hi = 0.30). Flat-region positions are now
-    // nearly free, so the base holds 3 deep into marginal acceptance where
-    // the pre-kernel surface demoted to 2.
+test "mtpEvPlanFor: DEFAULT costs carry the round-pipelined surface (2026-07-22 refit #3)" {
+    // Pins MTP_EV_DEFAULT_COSTS to the surface measured AFTER round
+    // pipelining (early dispatch + cross-round pre-draft + capture-tail
+    // trim; same-session saturated echo sweep, Jundot oQ4e 27B @8K,
+    // M4 Max: T(1)=45.4, T(2)=53.3 → floor ≈ 37.9 ms, flat marginal
+    // draft+lo ≈ 0.20; the ramp is unmeasurable on this head — chained
+    // acceptance can't saturate depth > 2 — so per_pos_hi carries over).
+    // The pipelining hid the CPU graph-build, so the FLOOR dropped and the
+    // per-position marginals grew in floor units (0.12 → 0.20): the
+    // controller now correctly prefers m_lo 2 on this head's decayed
+    // chain (~{0.78, 0.5, ...}) instead of riding a stale cheap flat region.
     const costs = Generator.MTP_EV_DEFAULT_COSTS;
     // Hot uniform 90%: base rides the flat region, extension into the ramp.
     const hot = [_]f32{ 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9, 0.9 };
     const hot_plan = Generator.mtpEvPlanFor(&hot, 8, costs, 8);
     try testing.expectEqual(@as(u32, 3), hot_plan.m_lo);
     try testing.expectEqual(@as(u32, 5), hot_plan.m_hi);
-    try testing.expectApproxEqAbs(@as(f32, -0.1196), hot_plan.tau_ln, 5e-3);
-    // Marginal 75%: base stays 3 on the cheap flat region, short extension.
+    try testing.expectApproxEqAbs(@as(f32, -0.1569), hot_plan.tau_ln, 5e-3);
+    // Marginal 75%: base stays 3 on the flat region, short extension.
     const mid = [_]f32{ 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75, 0.75 };
     const mid_plan = Generator.mtpEvPlanFor(&mid, 8, costs, 8);
     try testing.expectEqual(@as(u32, 3), mid_plan.m_lo);
     try testing.expectEqual(@as(u32, 4), mid_plan.m_hi);
-    try testing.expectApproxEqAbs(@as(f32, -0.2179), mid_plan.tau_ln, 5e-3);
+    try testing.expectApproxEqAbs(@as(f32, -0.2552), mid_plan.tau_ln, 5e-3);
+    // The oQ4e head's measured decayed chain plans a 2-deep base — the
+    // shape the refit exists to unlock (d2 wins on the new cost surface).
+    const oq4e = [_]f32{ 0.78, 0.50, 0.45, 0.45, 0.45, 0.45, 0.45, 0.45 };
+    const oq4e_plan = Generator.mtpEvPlanFor(&oq4e, 8, costs, 8);
+    try testing.expectEqual(@as(u32, 2), oq4e_plan.m_lo);
+}
+
+test "mtpExtDryAllows: a dry streak collapses to single-chunk, cooldown expires into a fresh trial" {
+    var streak: u32 = 0;
+    var cooldown: u32 = 0;
+    const thr = Generator.MTP_EXT_DRY_ROUNDS;
+    // Considering rounds below the streak threshold stay allowed.
+    var i: u32 = 0;
+    while (i < thr - 1) : (i += 1) {
+        try testing.expect(Generator.mtpExtDryAllows(&streak, &cooldown, thr));
+        streak += 1; // caller records "considered, did not extend"
+    }
+    // The full dry streak trips the cooldown: consideration collapses.
+    streak = thr;
+    try testing.expect(!Generator.mtpExtDryAllows(&streak, &cooldown, thr));
+    try testing.expectEqual(@as(u32, 0), streak);
+    // Cooldown rounds stay collapsed and count down.
+    var blocked: u32 = 0;
+    while (!Generator.mtpExtDryAllows(&streak, &cooldown, thr)) blocked += 1;
+    try testing.expectEqual(Generator.MTP_EXT_DRY_COOLDOWN - 1, blocked);
+    // After the cooldown, consideration re-opens (fresh trial, streak 0).
+    try testing.expectEqual(@as(u32, 0), streak);
+    try testing.expect(Generator.mtpExtDryAllows(&streak, &cooldown, thr));
+    // An extension firing resets the streak (caller does streak = 0) — the
+    // gate never trips on workloads where extension pays.
+}
+
+test "mtpExtDryAllows: a lower cost-aware threshold trips the cooldown sooner" {
+    var streak: u32 = 0;
+    var cooldown: u32 = 0;
+    const thr: u32 = 4; // e.g. an expensive sync throttled hard
+    var i: u32 = 0;
+    while (i < thr - 1) : (i += 1) {
+        try testing.expect(Generator.mtpExtDryAllows(&streak, &cooldown, thr));
+        streak += 1;
+    }
+    streak = thr;
+    try testing.expect(!Generator.mtpExtDryAllows(&streak, &cooldown, thr));
+    try testing.expectEqual(@as(u32, 0), streak);
+    // The fresh trial still fits inside an echo stretch even at the floor.
+    try testing.expect(Generator.MTP_EXT_DRY_MIN + Generator.MTP_EXT_DRY_COOLDOWN < 70);
+}
+
+test "mtpExtDryThresholdFor: cost-aware dry threshold scales inversely with the measured sync fraction" {
+    const D = Generator;
+    // Unmeasured (either EMA still 0) keeps the fixed dry budget — no behavior
+    // change until the live cost is known.
+    try testing.expectEqual(D.MTP_EXT_DRY_ROUNDS, D.mtpExtDryThresholdFor(0.0, 45.0));
+    try testing.expectEqual(D.MTP_EXT_DRY_ROUNDS, D.mtpExtDryThresholdFor(2.4, 0.0));
+    // A near-free sync (tiny fraction) tolerates the full dry budget.
+    try testing.expectEqual(D.MTP_EXT_DRY_ROUNDS, D.mtpExtDryThresholdFor(0.2, 45.0));
+    // An expensive sync (large fraction) collapses toward the floor.
+    try testing.expectEqual(D.MTP_EXT_DRY_MIN, D.mtpExtDryThresholdFor(9.0, 45.0));
+    // Monotonic: a costlier sync never tolerates MORE dry rounds.
+    try testing.expect(D.mtpExtDryThresholdFor(4.0, 45.0) <= D.mtpExtDryThresholdFor(1.0, 45.0));
+    // Always bounded — never below the floor (a zero threshold would trip
+    // every round and close the horizon; the fresh-trial guarantee survives
+    // any cost).
+    try testing.expect(D.mtpExtDryThresholdFor(1000.0, 45.0) >= D.MTP_EXT_DRY_MIN);
+    // The measured 8K operating point (sync ~2.4 ms of a ~45 ms round) lands
+    // in the throttled band, well below the fixed 16.
+    const at_8k = D.mtpExtDryThresholdFor(2.4, 45.0);
+    try testing.expect(at_8k >= D.MTP_EXT_DRY_MIN and at_8k < D.MTP_EXT_DRY_ROUNDS);
+}
+
+test "mtpEmaMs: seeds on the first sample then folds nanoseconds into a ms EMA" {
+    const D = Generator;
+    // First sample seeds (prev <= 0): 45 ms == 45_000_000 ns, exactly.
+    try testing.expectApproxEqAbs(@as(f32, 45.0), D.mtpEmaMs(0.0, 45_000_000), 1e-3);
+    // A subsequent sample folds at MTP_EV_COST_BETA toward the new value.
+    const folded = D.mtpEmaMs(45.0, 40_000_000); // 40 ms sample
+    try testing.expectApproxEqAbs(45.0 + D.MTP_EV_COST_BETA * (40.0 - 45.0), folded, 1e-3);
+    // Env parse: default on, "0" off, "" on.
+    try testing.expect(D.mtpLiveCostEnabledFromEnv(null));
+    try testing.expect(!D.mtpLiveCostEnabledFromEnv("0"));
+    try testing.expect(D.mtpLiveCostEnabledFromEnv(""));
+}
+
+test "batched corrections: point-mass residuals sample deterministically, accept vec gathers draft probs" {
+    try testing.expect(Generator.mtpBatchCorrEnabledFromEnv(null));
+    try testing.expect(!Generator.mtpBatchCorrEnabledFromEnv("0"));
+
+    const s = mlx.gpuStream();
+    // V=4, m=2. Row residuals are POINT MASSES so the batched categorical
+    // is deterministic end-to-end (no seed dependence):
+    //   row0: p=[.5,.5,0,0], draft=0 → residual [0,.5,0,0] → corr 1
+    //   row1: p=[0,.25,.75,0], draft=2 → residual [0,.25,0,0] → corr 1
+    //   bonus: p=[0,0,0,1] → corr 3
+    const p_data = [_]f32{ 0.5, 0.5, 0, 0, 0, 0.25, 0.75, 0, 0, 0, 0, 1.0 };
+    const p_shape = [_]c_int{ 1, 3, 4 };
+    const probs_all = mlx.mlx_array_new_data(&p_data, &p_shape, 3, .float32);
+    defer _ = mlx.mlx_array_free(probs_all);
+    const id_shape = [_]c_int{1};
+    const d0_data: i32 = 0;
+    const d1_data: i32 = 2;
+    const d0 = mlx.mlx_array_new_data(&d0_data, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(d0);
+    const d1 = mlx.mlx_array_new_data(&d1_data, &id_shape, 1, .int32);
+    defer _ = mlx.mlx_array_free(d1);
+    const drafts = [_]mlx.mlx_array{ d0, d1 };
+
+    // Greedy proposals (q == null): one-hot residuals.
+    var g = try Generator.mtpBatchedAcceptGraph(probs_all, &drafts, null, 2, s);
+    defer g.deinit();
+    try mlx.check(mlx.mlx_array_eval(g.corr_samples));
+    const corr = mlx.mlx_array_data_int32(g.corr_samples) orelse return error.InvalidDtype;
+    try testing.expectEqual(@as(i32, 1), corr[0]);
+    try testing.expectEqual(@as(i32, 1), corr[1]);
+    try testing.expectEqual(@as(i32, 3), corr[2]);
+    try mlx.check(mlx.mlx_array_eval(g.accept_p));
+    const ap = mlx.mlx_array_data_float32(g.accept_p) orelse return error.InvalidDtype;
+    try testing.expectApproxEqAbs(@as(f32, 0.5), ap[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.75), ap[1], 1e-6);
+    try testing.expect(g.accept_q.ctx == null);
+
+    // Sharp proposals: q rows equal to the one-hots reproduce the same
+    // residuals, and accept_q gathers the proposal's own density.
+    const q_data0 = [_]f32{ 1, 0, 0, 0 };
+    const q_data1 = [_]f32{ 0, 0, 1, 0 };
+    const q_shape = [_]c_int{ 1, 4 };
+    const q0 = mlx.mlx_array_new_data(&q_data0, &q_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(q0);
+    const q1 = mlx.mlx_array_new_data(&q_data1, &q_shape, 2, .float32);
+    defer _ = mlx.mlx_array_free(q1);
+    const qs = [_]mlx.mlx_array{ q0, q1 };
+    var gs = try Generator.mtpBatchedAcceptGraph(probs_all, &drafts, &qs, 2, s);
+    defer gs.deinit();
+    try mlx.check(mlx.mlx_array_eval(gs.corr_samples));
+    const corr2 = mlx.mlx_array_data_int32(gs.corr_samples) orelse return error.InvalidDtype;
+    try testing.expectEqual(@as(i32, 1), corr2[0]);
+    try testing.expectEqual(@as(i32, 1), corr2[1]);
+    try testing.expectEqual(@as(i32, 3), corr2[2]);
+    try mlx.check(mlx.mlx_array_eval(gs.accept_q));
+    const aq = mlx.mlx_array_data_float32(gs.accept_q) orelse return error.InvalidDtype;
+    try testing.expectApproxEqAbs(@as(f32, 1.0), aq[0], 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), aq[1], 1e-6);
 }
 
 test "mtpEvPlanFor: cap 1 is a plain depth-1 round" {
