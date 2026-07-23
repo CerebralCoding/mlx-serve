@@ -181,7 +181,10 @@ if [ -n "$CL_VER" ]; then
   for f in "$DOCS"/index.html "$DOCS"/*/index.html; do
     page=$(basename "$(dirname "$f")")
     check "$f" "nav-ver\">$CL_VER<" "$page: nav version pill = CHANGELOG top ($CL_VER)"
-    check "$f" 'class="nav-dl"'     "$page: nav Download CTA"
+    check "$f" 'class="nav-dl '     "$page: nav Download CTA"
+    check "$f" 'nav-dl-desktop"'    "$page: nav Download CTA (desktop variant)"
+    check "$f" 'class="nav-appstore"' "$page: nav App Store CTA (mobile variant)"
+    check "$f" 'appstore.svg'       "$page: nav App Store badge asset ref"
     check "$f" '>Tier list<'        "$page: nav Tier list link"
   done
 else

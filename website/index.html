@@ -213,7 +213,6 @@
       height: 52px;
       display: flex;
       align-items: center;
-      justify-content: space-between;
       padding: 0 max(24px, calc((100vw - 1040px) / 2));
       background: rgba(255, 255, 255, 0.72);
       backdrop-filter: saturate(180%) blur(20px);
@@ -227,11 +226,13 @@
       gap: 10px;
       text-decoration: none;
       color: var(--text-primary);
+      margin-right: auto;
+      flex-shrink: 0;
     }
 
     .nav-logo-img { width: 28px; height: 28px; border-radius: 7px; }
 
-    .nav-logo span { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; }
+    .nav-logo span { font-size: 15px; font-weight: 600; letter-spacing: -0.01em; white-space: nowrap; }
 
     .nav-ver {
       font-family: var(--mono);
@@ -251,6 +252,9 @@
     }
     .nav-dl:hover { transform: scale(1.03); background: var(--ink); }
 
+    .nav-appstore { display: none; align-items: center; flex-shrink: 0; }
+    .nav-appstore img { display: block; height: 28px; width: auto; }
+
     .nav-links { display: flex; align-items: center; gap: 28px; list-style: none; }
 
     .nav-links a {
@@ -265,6 +269,14 @@
     .nav-github { display: flex; align-items: center; gap: 6px; }
     .nav-github svg { width: 18px; height: 18px; fill: var(--text-primary); transition: fill 0.2s; }
     .nav-github:hover svg { fill: var(--blue); }
+
+    /* mobile hamburger toggle — checkbox hack, no JS */
+    .nav-toggle-input { position: absolute; opacity: 0; pointer-events: none; }
+    .nav-burger {
+      display: none; flex-direction: column; justify-content: center; gap: 4px;
+      width: 22px; height: 22px; margin-left: 14px; cursor: pointer; flex-shrink: 0;
+    }
+    .nav-burger span { display: block; width: 100%; height: 1.5px; background: var(--text-primary); transition: transform 0.2s ease, opacity 0.2s ease; }
 
     /* ─── HERO ─── */
     .hero {
@@ -1151,9 +1163,27 @@
     }
 
     @media (max-width: 768px) {
-      nav { padding: 0 16px; }
-      .nav-links { gap: 16px; }
+      nav { padding: 0 12px; }
+      .nav-logo { gap: 8px; }
+      .nav-links { gap: 10px; }
       .nav-links .hide-mobile { display: none; }
+      .nav-ver { display: none; }
+      .nav-burger { display: flex; margin-left: 10px; }
+      .nav-dl-desktop { display: none; }
+      .nav-appstore { display: flex; }
+      .nav-appstore img { height: 24px; }
+      .nav-toggle-input:checked ~ .nav-links {
+        position: fixed; top: 52px; left: 0; right: 0;
+        flex-direction: column; align-items: flex-start; gap: 2px;
+        background: var(--white); border-bottom: 1px solid var(--border);
+        box-shadow: var(--shadow-elevated); padding: 8px 20px 18px;
+      }
+      .nav-toggle-input:checked ~ .nav-links li { width: 100%; }
+      .nav-toggle-input:checked ~ .nav-links .hide-mobile { display: block; padding: 11px 0; font-size: 15px; }
+      .nav-toggle-input:checked ~ .nav-links .nav-appstore { margin-top: 6px; }
+      .nav-toggle-input:checked ~ .nav-burger span:nth-child(1) { transform: translateY(5.5px) rotate(45deg); }
+      .nav-toggle-input:checked ~ .nav-burger span:nth-child(2) { opacity: 0; }
+      .nav-toggle-input:checked ~ .nav-burger span:nth-child(3) { transform: translateY(-5.5px) rotate(-45deg); }
       .hero { padding: 120px 20px 56px; }
       .hero-meta { gap: 16px; flex-wrap: wrap; }
       .section { padding: 72px 20px; }
@@ -1161,6 +1191,12 @@
       .features-grid { grid-template-columns: 1fr 1fr; gap: 14px; }
       .perf-stats { gap: 30px 40px; }
       .models-grid { grid-template-columns: 1fr 1fr; }
+    }
+
+    @media (max-width: 332px) {
+      /* wordmark no longer fits beside the App Store badge + burger — keep just the icon.
+         330px is the exact measured crossover; +2px covers font-rendering variance. */
+      .nav-logo span:not(.nav-ver) { display: none; }
     }
 
     @media (max-width: 480px) {
@@ -1182,7 +1218,8 @@
       <span>mlx-serve</span>
       <span class="nav-ver">v26.7.10</span>
     </a>
-    <ul class="nav-links">
+    <input type="checkbox" id="nav-toggle" class="nav-toggle-input">
+    <ul class="nav-links" onclick="if(event.target.closest('a')) document.getElementById('nav-toggle').checked=false">
       <li><a href="#explore" class="hide-mobile">Deep dives</a></li>
       <li><a href="#performance" class="hide-mobile">Performance</a></li>
       <li><a href="#features" class="hide-mobile">Features</a></li>
@@ -1195,18 +1232,16 @@
           <svg viewBox="0 0 16 16"><path d="M8 0C3.58 0 0 3.58 0 8c0 3.54 2.29 6.53 5.47 7.59.4.07.55-.17.55-.38 0-.19-.01-.82-.01-1.49-2.01.37-2.53-.49-2.69-.94-.09-.23-.48-.94-.82-1.13-.28-.15-.68-.52-.01-.53.63-.01 1.08.58 1.23.82.72 1.21 1.87.87 2.33.66.07-.52.28-.87.51-1.07-1.78-.2-3.64-.89-3.64-3.95 0-.87.31-1.59.82-2.15-.08-.2-.36-1.02.08-2.12 0 0 .67-.21 2.2.82.64-.18 1.32-.27 2-.27.68 0 1.36.09 2 .27 1.53-1.04 2.2-.82 2.2-.82.44 1.1.16 1.92.08 2.12.51.56.82 1.27.82 2.15 0 3.07-1.87 3.75-3.65 3.95.29.25.54.73.54 1.48 0 1.07-.01 1.93-.01 2.2 0 .21.15.46.55.38A8.013 8.013 0 0016 8c0-4.42-3.58-8-8-8z"/></svg>
         </a>
       </li>
-      <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl">Download</a></li>
+      <li><a href="https://github.com/ddalcu/mlx-serve/releases/latest/download/MLXCore.dmg" class="nav-dl nav-dl-desktop">Download</a></li>
+      <li><a href="https://apps.apple.com/us/app/mlx-chat-local-ai/id6787603518" class="nav-appstore" target="_blank" rel="noopener"><img src="assets/appstore.svg" alt="Download on the App Store" width="120" height="40"></a></li>
     </ul>
+    <label for="nav-toggle" class="nav-burger" aria-label="Menu"><span></span><span></span><span></span></label>
   </nav>
 
   <!-- HERO -->
   <section class="hero">
     <div class="hero-glow"><span class="g1"></span><span class="g2"></span><span class="g3"></span></div>
-    <a href="https://github.com/ddalcu/mlx-serve/releases/latest" class="hero-badge">
-      <span class="new-pill">v26.7.10</span>
-      Share models across your Macs · coding agents in the sandbox terminal · M5 neural-accelerator speedups
-      <span class="arrow">→</span>
-    </a>
+
     <h1>A private AI that<br>lives on your <span class="grad">Mac</span></h1>
     <p class="hero-sub">Chat with it, ask it about your own documents, make images, music, video and 3D, and let it run errands on your computer — <strong>free, open source, and fully offline</strong>. It runs every major open model, faster than LM&nbsp;Studio, and nothing you type ever leaves the machine.</p>
     <div class="hero-ctas">
@@ -1589,8 +1624,8 @@
         <div class="perf-label">tok/s prefill</div>
       </div>
       <div class="perf-stat">
-        <div class="perf-number" data-target="284" data-suffix="B">284B</div>
-        <div class="perf-label">params, DeepSeek V4 Flash — local</div>
+        <div class="perf-number" data-target="200" data-suffix="%">~200%</div>
+        <div class="perf-label">faster on Qwen 27B MTP</div>
       </div>
       <div class="perf-stat">
         <div class="perf-number" data-target="48" data-suffix="%">48%</div>
@@ -1606,7 +1641,7 @@
       </div>
       <div class="chart-legend" id="chartLegend"></div>
       <p class="chart-caption">
-        <b>Decode</b> = free-form generation · <b>Echo</b> = high-repetition (where PLD shines) · <b>Code</b> = code completion (where the drafter and native MTP shine).
+        <b>Code completion</b> — where the drafter and native MTP shine.
         Tokens per second — how fast the AI writes; higher is better. Apple M4 Max (128 GB) · identical 4-bit MLX weights · ctx 4096 · temp 0 · LM Studio (MLX runtime) as baseline.
       </p>
     </div>

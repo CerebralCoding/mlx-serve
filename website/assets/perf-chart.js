@@ -4,40 +4,41 @@
 (function () {
   if (!document.getElementById('perfChart')) return;
 
-  // ─── Performance chart (real data, mlx-serve v26.7.6 vs LM Studio 0.4.15, M4 Max 128GB) ───
-  // Source: docs/perf-csvs/{gemma,qwen36}-26.7.6.csv (decode_tps per workload).
-  // Workloads: [Decode, Echo, Code] in tokens/sec.
+  // ─── Performance chart (real data, mlx-serve v26.7.10 vs LM Studio, M4 Max 128GB) ───
+  // Source: docs/perf-csvs/all-26.7.10.csv (code-prompt decode_tps; the default
+  // `bench.sh --family all` run only measures the code cell now — echo and
+  // free-form decode are opt-in via --echo/--freeform and weren't re-run for
+  // this release, so that workload was dropped rather than left stale).
+  // 'LM Studio' = lmstudio-baseline (MLX runtime) variant, spec none.
+  // 'mlx-serve (X)' = the single FASTEST mlx-serve spec cell for that model
+  // (none/PLD/Drafter/MTP) — the winning spec is named right in the series
+  // label. Gemma 4 E2B and Qwen 3.6 27B (MTPLX-opt) are not charted.
   const PERF = {
-    'gemma-e2b':   { name: 'Gemma 4 E2B', series: {
-      'LM Studio': [194.0, 192.8, 190.6], 'mlx-serve': [198.6, 194.2, 190.6],
-      '+ PLD': [188.6, 407.0, 191.6], '+ Drafter': [172.6, 233.1, 239.2] } },
     'gemma-e4b':   { name: 'Gemma 4 E4B', series: {
-      'LM Studio': [120.2, 118.7, 118.8], 'mlx-serve': [120.1, 118.0, 117.9],
-      '+ PLD': [116.4, 252.4, 119.9], '+ Drafter': [113.9, 228.1, 194.3] } },
+      'LM Studio': [116.4], 'mlx-serve (Drafter)': [166.9] } },
     'gemma-31b':   { name: 'Gemma 4 31B', series: {
-      'LM Studio': [25.6, 25.6, 25.1], 'mlx-serve': [25.4, 25.3, 25.0],
-      '+ PLD': [25.1, 50.6, 28.7], '+ Drafter': [23.8, 37.8, 31.1] } },
+      'LM Studio': [25.2], 'mlx-serve (Drafter)': [32.0] } },
     'gemma-26moe': { name: 'Gemma 4 26B-A4B MoE', series: {
-      'LM Studio': [118.3, 118.1, 117.5], 'mlx-serve': [118.1, 115.9, 115.7],
-      '+ PLD': [114.1, 191.7, 123.8] } },
+      'LM Studio': [116.6], 'mlx-serve (PLD)': [126.4] } },
     'qwen-27b':    { name: 'Qwen 3.6 27B', series: {
-      'LM Studio': [30.4, 29.9, 29.5], 'mlx-serve': [29.2, 28.9, 29.0],
-      '+ PLD': [28.8, 63.5, 30.3], '+ MTP': [40.1, 58.7, 58.4] } },
+      'LM Studio': [23.0], 'mlx-serve (MTP)': [75.9] } },
     'qwen-35moe':  { name: 'Qwen 3.6 35B-A3B MoE', series: {
-      'LM Studio': [103.2, 103.0, 103.0], 'mlx-serve': [131.3, 130.0, 130.7],
-      '+ PLD': [125.3, 238.8, 140.4], '+ MTP': [135.9, 185.6, 175.1] } },
+      'LM Studio': [86.7], 'mlx-serve (MTP)': [227.0] } },
   };
-  const WORKLOADS = ['Decode', 'Echo', 'Code'];
-  const COLORS = {
-    'LM Studio': '#c2c2cc', 'mlx-serve': '#0071e3',
-    '+ PLD': '#30d158', '+ Drafter': '#f7a41d', '+ MTP': '#bf5af2'
-  };
+  const WORKLOADS = ['Code'];
+  const COLORS = { 'LM Studio': '#c2c2cc' };
+  const MLX_SERVE_COLOR = '#0071e3';
+  function colorFor(seriesName) {
+    if (COLORS[seriesName]) return COLORS[seriesName];
+    if (seriesName.startsWith('mlx-serve')) return MLX_SERVE_COLOR;
+    return '#999';
+  }
 
   const canvas = document.getElementById('perfChart');
   const ctx = canvas.getContext('2d');
   const tooltip = document.getElementById('chartTooltip');
-  // Default pill: the 35B-A3B MoE is the strongest showing — +27% raw decode
-  // over LM Studio before any speculation, 2.3x echo with PLD, +70% code with MTP.
+  // Default pill: the 35B-A3B MoE is the strongest showing — native MTP hits
+  // 227 tok/s vs LM Studio's 87 (+162%).
   let activeKey = 'qwen-35moe';
   let animProgress = 0, animRAF = null;
   let hitRects = [];
@@ -109,7 +110,7 @@
         const h = fullH * animProgress;
         const x = gx + si * (barW + gap);
         const y = baseY - h;
-        ctx.fillStyle = COLORS[s] || '#999';
+        ctx.fillStyle = colorFor(s);
         roundedTopRect(ctx, x, y, barW, h, 4);
         ctx.fill();
         hitRects.push({ x, y: baseY - fullH, w: barW, h: fullH, series: s, workload: wl, value: val });
@@ -161,7 +162,7 @@
     Object.keys(PERF[activeKey].series).forEach(s => {
       const item = document.createElement('div');
       item.className = 'legend-item';
-      item.innerHTML = '<span class="legend-swatch" style="background:' + (COLORS[s] || '#999') + '"></span>' + s;
+      item.innerHTML = '<span class="legend-swatch" style="background:' + colorFor(s) + '"></span>' + s;
       wrap.appendChild(item);
     });
   }
