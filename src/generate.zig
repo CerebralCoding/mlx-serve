@@ -334,6 +334,15 @@ pub fn effectiveSsmCheckpointStride(base: usize, is_moe: bool, prefill_chunk: us
     return base;
 }
 
+/// Vision embeddings are scattered from the beginning of their source tensor
+/// within a forward pass, so checkpoint-aligned chunk boundaries would restart
+/// that scatter and reuse the first image features in every chunk. Keep vision
+/// prefill single-pass; image-bearing prompts are excluded from prefix reuse
+/// independently because equal placeholder IDs do not imply equal images.
+pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool, has_vision: bool) bool {
+    return stride > 0 and has_ssm and !has_vision;
+}
+
 /// Number of chunks a cold prefill of `prefix_len` tokens splits into for the
 /// given chunk size / SSM-checkpoint stride. Mirrors the loop in `init` exactly
 /// (drives the same `nextChunkEnd`), so a test on this is a faithful proxy for
@@ -924,10 +933,12 @@ pub const Generator = struct {
             for (ssm_checkpoints.items) |*cp| cp.deinit(allocator);
             ssm_checkpoints.deinit(allocator);
         }
-        const want_ssm_cp =
-            options.ssm_checkpoint_stride > 0 and
-            ctx.ssm_entries != null and
-            ctx.ssm_entries.?.len > 0;
+        const has_vision = ctx.vision_embeddings != null;
+        const want_ssm_cp = shouldCheckpointSsmPrefill(
+            options.ssm_checkpoint_stride,
+            ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0,
+            has_vision,
+        );
         // Coarsen the checkpoint stride for MoE so memory-bound expert-weight
         // re-streaming doesn't tax cold prefill (see effectiveSsmCheckpointStride).
         // The predicate is config.isMoe() (real experts), NOT moe_layers != null:
@@ -961,7 +972,6 @@ pub const Generator = struct {
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
-            const has_vision = ctx.vision_embeddings != null;
             const default_chunk = if (has_vision) prefix_len else PREFILL_CHUNK;
             // Last-window MTP history: chunks entirely before the window skip
             // the full-hidden capture AND the head forward (see
@@ -6138,6 +6148,25 @@ test "effectiveSsmCheckpointStride: MoE coarsens to PREFILL_CHUNK, dense keeps f
     // (was 4 at the raw 256), while a dense/non-MoE hybrid stays at 4.
     try testing.expectEqual(@as(usize, 1), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, true, PREFILL_CHUNK), 0));
     try testing.expectEqual(@as(usize, 4), prefillChunkCount(851, PREFILL_CHUNK, true, effectiveSsmCheckpointStride(256, false, PREFILL_CHUNK), 0));
+}
+
+test "vision prefill is not split at SSM checkpoint boundaries" {
+    const prefix_len: usize = 1587;
+    const checkpoint_stride: u32 = 256;
+
+    const vision_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, true);
+    try testing.expect(!vision_checkpoints);
+    try testing.expectEqual(
+        prefix_len,
+        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0),
+    );
+
+    const text_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, false);
+    try testing.expect(text_checkpoints);
+    try testing.expectEqual(
+        @as(usize, checkpoint_stride),
+        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0),
+    );
 }
 
 fn mtpEvTestGenerator() Generator {
