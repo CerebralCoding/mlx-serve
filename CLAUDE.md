@@ -108,6 +108,7 @@ Dispatch on `config.json` `model_type` (model.zig config/weights, transformer.zi
 | `nemotron_h` | Hybrid transformer + Mamba2 (`backbone` prefix) |
 | `lfm2` | Hybrid gated conv + full attention |
 | `hy_v3` | Hunyuan 3 MoE (expert container probed — varies by converter) |
+| `laguna` | poolside Laguna S 2.1 (117.6B-A8.5B coder). nvfp4 experts; per-layer Q-heads (48 full/72 sliding, KV uniform 8); softplus per-head attn output gate (`self_attn.g_proj`); YaRN rope on full-attn layers + default rope on 512-window sliding layers; sigmoid MoE routing (hy3 chain) w/ `mlp.gate.e_score_correction_bias` + UNGATED shared expert; qwen-naming MoE weights; dense `mlp_only_layers` (probed). Pre-opened `<think>`; bare `<tool_call>` GLM tags. Serial (MoE → no batched decode) |
 | `llama`, `mistral` | Standard |
 | `*.gguf` | ds4/llama.cpp; dirs discoverable + cold-loadable (GGUF presence WINS over stray config.json) |
 | media types | `flux2*`/`krea*`/`qwen3_tts`/`acestep`/`AudioVideo`/`hunyuan3d*` → gen.zig modality slots |

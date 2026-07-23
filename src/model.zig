@@ -96,6 +96,9 @@ pub const ModelConfig = struct {
     // Layers [0, first_k_dense_replace) use a dense MLP instead of MoE
     // (hy_v3: layer 0 dense at intermediate_size, the rest MoE).
     first_k_dense_replace: u32 = 0,
+    // Laguna: MoE router logit soft-capping (tanh). 0 = off (the shipped
+    // Laguna-S-2.1 checkpoint sets moe_router_logit_softcapping: 0.0).
+    moe_router_logit_softcapping: f32 = 0.0,
 
     // Linear attention (GatedDeltaNet)
     linear_num_key_heads: u32 = 0,
@@ -108,6 +111,26 @@ pub const ModelConfig = struct {
     full_attention_interval: u32 = 0,
     partial_rotary_factor: f32 = 1.0,
     attn_output_gate: bool = false,
+
+    // Laguna: softplus per-head attention output gate. self_attn.g_proj →
+    // softplus(fp32) → per-head scalar × attn output (reshaped [..,H,D]) before
+    // o_proj. Distinct from attn_output_gate (qwen3-next sigmoid + doubled
+    // q_proj) — separate weight, softplus activation, per-head broadcast.
+    laguna_attn_gate: bool = false,
+    // Laguna: per-layer Q-head count (full-attention layers 48, sliding 72;
+    // KV heads uniform at num_key_value_heads). 0 = uniform num_attention_heads.
+    num_attention_heads_per_layer: [128]u32 = @splat(0),
+    has_per_layer_heads: bool = false,
+
+    // Laguna YaRN RoPE (full-attention layers only; sliding layers use default
+    // RoPE at rope_local_base_freq). rope_yarn gates the freqs + mscale
+    // precompute at model load; the sliding/full split is by isGlobalLayer.
+    rope_yarn: bool = false,
+    yarn_factor: f32 = 1.0,
+    yarn_orig_max_pos: u32 = 0,
+    yarn_beta_fast: f32 = 32.0,
+    yarn_beta_slow: f32 = 1.0,
+    yarn_attention_factor: f32 = 1.0,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -296,6 +319,16 @@ pub const ModelConfig = struct {
             return self.global_head_dim;
         }
         return self.head_dim;
+    }
+
+    /// Per-layer Q-head count (Laguna: 48 on full-attention layers, 72 on
+    /// sliding). Every other arch has uniform heads, so this falls back to
+    /// num_attention_heads. KV heads stay uniform (layerKVHeads).
+    pub fn layerNumHeads(self: ModelConfig, layer_idx: u32) u32 {
+        if (self.has_per_layer_heads and layer_idx < 128 and self.num_attention_heads_per_layer[layer_idx] > 0) {
+            return self.num_attention_heads_per_layer[layer_idx];
+        }
+        return self.num_attention_heads;
     }
 
     /// Get effective num_kv_heads for a layer.
@@ -1095,6 +1128,90 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             config.query_pre_attn_scalar = config.head_dim;
         }
         config.ensureHy3Terminators();
+    } else if (std.mem.eql(u8, model_type, "laguna")) {
+        // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder; nvfp4 experts, 256K
+        // ctx). Pure-attention MoE that rides the qwen3.5/hy_v3 MoE forward
+        // arms. Family-specific pieces: (1) per-layer Q-head counts
+        // (num_attention_heads_per_layer: 48 full / 72 sliding; KV uniform 8),
+        // (2) a softplus per-head attention OUTPUT gate (self_attn.g_proj), and
+        // (3) YaRN RoPE on full-attention layers (theta 5e5, factor 32) with
+        // default RoPE (theta 1e4, full rotary) on the 512-window sliding
+        // layers. MoE routing is DeepSeek-V3 SIGMOID + expert bias
+        // (mlp.gate.e_score_correction_bias) exactly like hy_v3, but the weight
+        // NAMING matches qwen3_moe (mlp.gate router, mlp.switch_mlp experts,
+        // mlp.shared_expert UNGATED always-added). Dense MLP on mlp_only_layers
+        // (layer 0 on the shipped checkpoint), resolved by per-layer weight
+        // presence probe at load. Reference: modeling_laguna.py (Apache-2.0).
+        config.model_type = "laguna";
+        config.weight_prefix = "model";
+        config.norm_has_offset = false;
+        config.scale_embeddings = false;
+        config.has_pre_ff_norm = false;
+        config.has_qk_norm = true;
+        config.hidden_act = .silu;
+        config.laguna_attn_gate = true;
+        config.moe_sigmoid_router = true;
+        config.rope_scaling_factor = 1.0;
+        // scale = head_dim^-0.5 (query_pre_attn_scalar absent in Laguna config).
+        if (cfg_obj.get("query_pre_attn_scalar") == null) {
+            config.query_pre_attn_scalar = config.head_dim;
+        }
+        // Router: norm_topk_prob → route_norm; moe_routed_scaling_factor → scale.
+        if (cfg_obj.get("norm_topk_prob")) |v| { if (v == .bool) config.moe_route_norm = v.bool; }
+        if (cfg_obj.get("moe_routed_scaling_factor")) |v| config.router_scaling_factor = jsonFloat(v);
+        if (cfg_obj.get("moe_router_logit_softcapping")) |v| config.moe_router_logit_softcapping = jsonFloat(v);
+        // Router logit soft-capping is off on the shipped checkpoint and untested;
+        // reject a >0 value rather than silently ignore it (honest reject).
+        if (config.moe_router_logit_softcapping > 0.0) {
+            log.err("laguna: moe_router_logit_softcapping > 0 not supported in v1 (got {d})\n", .{config.moe_router_logit_softcapping});
+            return error.UnsupportedLagunaConfig;
+        }
+        // Only per-head gating is implemented (assert uniform; honest reject).
+        if (cfg_obj.get("gating")) |v| {
+            if (v == .string and !std.mem.eql(u8, v.string, "per-head") and !std.mem.eql(u8, v.string, "per_head")) {
+                log.err("laguna: only per-head attention gating supported (got '{s}')\n", .{v.string});
+                return error.UnsupportedLagunaConfig;
+            }
+        }
+        // Per-layer Q-head count (cap 128 like layer_is_global).
+        if (cfg_obj.get("num_attention_heads_per_layer")) |v| {
+            if (v == .array) {
+                config.has_per_layer_heads = true;
+                for (v.array.items, 0..) |item, i| {
+                    if (i >= 128) break;
+                    if (item == .integer) config.num_attention_heads_per_layer[i] = @intCast(item.integer);
+                }
+            }
+        }
+        // YaRN on full-attention layers. The generic nested-rope block above
+        // already set rope_theta (5e5), partial_rotary_factor_global (0.5) from
+        // full_attention and rope_local_base_freq (1e4) from sliding_attention;
+        // here we pull the YaRN-specific fields and flag the precompute.
+        if (cfg_obj.get("rope_parameters")) |rp| {
+            if (rp == .object) {
+                if (rp.object.get("full_attention")) |fa_val| {
+                    if (fa_val == .object) {
+                        const fa = fa_val.object;
+                        const is_yarn = if (fa.get("rope_type")) |rt|
+                            (rt == .string and std.mem.eql(u8, rt.string, "yarn"))
+                        else
+                            false;
+                        if (is_yarn) {
+                            config.rope_yarn = true;
+                            if (fa.get("factor")) |x| config.yarn_factor = jsonFloat(x);
+                            if (fa.get("beta_fast")) |x| config.yarn_beta_fast = jsonFloat(x);
+                            if (fa.get("beta_slow")) |x| config.yarn_beta_slow = jsonFloat(x);
+                            if (fa.get("attention_factor")) |x| config.yarn_attention_factor = jsonFloat(x);
+                            if (fa.get("original_max_position_embeddings")) |x| {
+                                if (x == .integer) config.yarn_orig_max_pos = @intCast(x.integer);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        // eos [2, 24] (〈|EOS|〉, </assistant>) parsed generically from
+        // eos_token_id above; no additive terminator merge needed.
     } else if (std.mem.eql(u8, model_type, "qwen3_next")) {
         config.model_type = "qwen3_next";
         config.weight_prefix = "model";
@@ -1988,6 +2105,102 @@ test "ModelConfig parses gemma4_unified text_config" {
     try testing.expectEqual(@as(u32, 48), config.num_hidden_layers);
     // Unified flag drives the encoder-free vision/audio embedder path.
     try testing.expect(config.is_gemma4_unified);
+}
+
+test "ModelConfig parses laguna (poolside Laguna-S-2.1): per-layer heads, softplus gate, YaRN, sigmoid MoE" {
+    // Trimmed but faithful copy of poolside/Laguna-S-2.1-NVFP4-mlx config.json.
+    // 4 layers = one full/sliding group (full@0, sliding@1..3) so per-layer
+    // head counts and layer_types both exercise a global/local boundary.
+    const json =
+        \\{
+        \\  "model_type": "laguna",
+        \\  "hidden_size": 3072,
+        \\  "intermediate_size": 12288,
+        \\  "num_hidden_layers": 4,
+        \\  "num_attention_heads": 48,
+        \\  "num_key_value_heads": 8,
+        \\  "head_dim": 128,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "vocab_size": 100352,
+        \\  "max_position_embeddings": 262144,
+        \\  "tie_word_embeddings": false,
+        \\  "eos_token_id": [2, 24],
+        \\  "bos_token_id": 2,
+        \\  "gating": "per-head",
+        \\  "sliding_window": 512,
+        \\  "num_experts": 256,
+        \\  "num_experts_per_tok": 10,
+        \\  "moe_intermediate_size": 1024,
+        \\  "shared_expert_intermediate_size": 1024,
+        \\  "moe_routed_scaling_factor": 2.5,
+        \\  "norm_topk_prob": true,
+        \\  "moe_router_logit_softcapping": 0.0,
+        \\  "mlp_only_layers": [0],
+        \\  "num_attention_heads_per_layer": [48, 72, 72, 72],
+        \\  "layer_types": ["full_attention", "sliding_attention", "sliding_attention", "sliding_attention"],
+        \\  "rope_parameters": {
+        \\    "full_attention": {
+        \\      "rope_theta": 500000.0, "rope_type": "yarn", "factor": 32.0,
+        \\      "original_max_position_embeddings": 8192, "beta_slow": 1.0, "beta_fast": 32.0,
+        \\      "attention_factor": 1.3465735902799727, "partial_rotary_factor": 0.5
+        \\    },
+        \\    "sliding_attention": {"rope_type": "default", "rope_theta": 10000.0, "partial_rotary_factor": 1.0}
+        \\  },
+        \\  "quantization": {"group_size": 16, "bits": 4, "mode": "nvfp4"}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("laguna", config.model_type);
+    try testing.expectEqualStrings("model", config.weight_prefix);
+    // Qwen/hy3-style norm + embedding flags.
+    try testing.expect(!config.norm_has_offset);
+    try testing.expect(!config.scale_embeddings);
+    try testing.expect(!config.has_pre_ff_norm);
+    try testing.expect(config.has_qk_norm);
+    // Laguna-specific attention gate + sigmoid router.
+    try testing.expect(config.laguna_attn_gate);
+    try testing.expect(config.moe_sigmoid_router);
+    try testing.expect(config.moe_route_norm);
+    try testing.expectApproxEqAbs(@as(f32, 2.5), config.router_scaling_factor, 1e-6);
+    // MoE dims.
+    try testing.expectEqual(@as(u32, 256), config.num_experts);
+    try testing.expectEqual(@as(u32, 10), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 1024), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 1024), config.shared_expert_intermediate_size);
+    // Attention shape + scale (query_pre_attn_scalar defaults to head_dim).
+    try testing.expectEqual(@as(u32, 128), config.head_dim);
+    try testing.expectEqual(@as(u32, 8), config.num_key_value_heads);
+    try testing.expectEqual(@as(u32, 128), config.query_pre_attn_scalar);
+    // Per-layer Q-heads: 48 on full (layer 0), 72 on sliding (layer 1+).
+    try testing.expect(config.has_per_layer_heads);
+    try testing.expectEqual(@as(u32, 48), config.layerNumHeads(0));
+    try testing.expectEqual(@as(u32, 72), config.layerNumHeads(1));
+    // Layer types: full@0 = global, sliding@1 = local.
+    try testing.expect(config.has_explicit_layer_types);
+    try testing.expect(config.isGlobalLayer(0));
+    try testing.expect(!config.isGlobalLayer(1));
+    try testing.expect(config.has_sliding_window);
+    try testing.expectEqual(@as(u32, 512), config.sliding_window);
+    // RoPE: full-attn YaRN (theta 5e5, partial 0.5) + sliding default (theta 1e4, full rotary).
+    try testing.expectApproxEqAbs(@as(f32, 500000.0), config.rope_theta, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), config.partial_rotary_factor_global, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), config.rope_local_base_freq, 1.0);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), config.partial_rotary_factor, 1e-6);
+    try testing.expect(config.rope_yarn);
+    try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_factor, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 32.0), config.yarn_beta_fast, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.0), config.yarn_beta_slow, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 1.3465735902799727), config.yarn_attention_factor, 1e-9);
+    try testing.expectEqual(@as(u32, 8192), config.yarn_orig_max_pos);
+    // Quant: nvfp4, gs16.
+    try testing.expectEqual(QuantMode.nvfp4, config.quant_mode);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 16), config.quant_group_size);
+    // EOS pair (〈|EOS|〉=2, </assistant>=24).
+    const eos = config.eosTokenSlice();
+    try testing.expectEqual(@as(usize, 2), eos.len);
+    try testing.expectEqual(@as(u32, 2), eos[0]);
+    try testing.expectEqual(@as(u32, 24), eos[1]);
 }
 
 test "ModelConfig: use_bidirectional_attention marks an embedding encoder (EmbeddingGemma, issue #79)" {

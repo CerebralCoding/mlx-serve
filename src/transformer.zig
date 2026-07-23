@@ -3129,6 +3129,12 @@ const FullAttnWeights = struct {
     o_b: mlx.mlx_array,
     q_norm: mlx.mlx_array,
     k_norm: mlx.mlx_array,
+    // Laguna softplus per-head output gate (self_attn.g_proj, bf16, no
+    // scales/biases). Null-ctx on every other arch → skipped by
+    // appendFullAttnWeights and by lagunaAttnWith's gate branch.
+    g_w: mlx.mlx_array = .{ .ctx = null },
+    g_s: mlx.mlx_array = .{ .ctx = null },
+    g_b: mlx.mlx_array = .{ .ctx = null },
 };
 
 const LinearAttnWeights = struct {
@@ -3643,6 +3649,13 @@ pub const Transformer = struct {
     // Proportional RoPE frequencies for global/full attention layers (Gemma 4)
     rope_freqs_global: ?mlx.mlx_array,
 
+    // Laguna YaRN (full-attention layers only): the per-dim RoPE denominator
+    // array handed to mlx_fast_rope (rope_freqs_yarn, [rotary_dim/2] f32) and
+    // the mscale vector (yarn_mscale, [head_dim] f32 = attention_factor on the
+    // rotated dims, 1.0 on the pass-through tail). Null on every other arch.
+    rope_freqs_yarn: ?mlx.mlx_array = null,
+    yarn_mscale: ?mlx.mlx_array = null,
+
     // BERT encoder-only (null for decoder models)
     bert_layers: ?[]BertLayerWeights,
     bert_pos_w: mlx.mlx_array,
@@ -4027,6 +4040,46 @@ pub const Transformer = struct {
             rope_freqs_global = freqs_arr;
         }
 
+        // Laguna YaRN (full-attention layers): precompute the mlx_fast_rope
+        // denominator array + the mscale vector (attention_factor on rotated
+        // dims, 1.0 on the pass-through tail). Sliding layers use default RoPE.
+        var rope_freqs_yarn: ?mlx.mlx_array = null;
+        var yarn_mscale: ?mlx.mlx_array = null;
+        if (config.rope_yarn) {
+            const rotary_dim: u32 = @intFromFloat(@as(f32, @floatFromInt(config.head_dim)) * config.partial_rotary_factor_global);
+            const half: usize = rotary_dim / 2;
+            const freqs_f64 = try allocator.alloc(f64, half);
+            defer allocator.free(freqs_f64);
+            computeYarnFreqs(
+                freqs_f64,
+                config.head_dim,
+                config.partial_rotary_factor_global,
+                config.rope_theta,
+                config.yarn_factor,
+                config.yarn_beta_fast,
+                config.yarn_beta_slow,
+                config.yarn_orig_max_pos,
+            );
+            const freqs_f32 = try allocator.alloc(f32, half);
+            defer allocator.free(freqs_f32);
+            for (freqs_f64, 0..) |v, i| freqs_f32[i] = @floatCast(v);
+            const fshape = [_]c_int{@intCast(half)};
+            rope_freqs_yarn = mlx.mlx_array_new_data(freqs_f32.ptr, &fshape, 1, .float32);
+            // mscale vector [head_dim]: af on rotary dims, 1.0 on the tail.
+            // Multiplying the post-rope q/k by this is exactly the reference's
+            // cos/sin *= attention_factor (rotated dims only, pass dims untouched).
+            const mscale_f32 = try allocator.alloc(f32, config.head_dim);
+            defer allocator.free(mscale_f32);
+            for (mscale_f32, 0..) |*m, i| m.* = if (i < rotary_dim) config.yarn_attention_factor else 1.0;
+            const mshape = [_]c_int{@intCast(config.head_dim)};
+            yarn_mscale = mlx.mlx_array_new_data(mscale_f32.ptr, &mshape, 1, .float32);
+            const eval_vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(eval_vec);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, rope_freqs_yarn.?);
+            _ = mlx.mlx_vector_array_append_value(eval_vec, yarn_mscale.?);
+            try mlx.check(mlx.mlx_eval(eval_vec));
+        }
+
         // Batch eval all weights
         {
             const eval_start = std.Io.Timestamp.now(io, .awake);
@@ -4182,6 +4235,8 @@ pub const Transformer = struct {
             .self_cond = self_cond,
             .ones_hidden = ones_hidden,
             .rope_freqs_global = rope_freqs_global,
+            .rope_freqs_yarn = rope_freqs_yarn,
+            .yarn_mscale = yarn_mscale,
             .bert_layers = null,
             .bert_pos_w = mlx.mlx_array_new(),
             .bert_pos_s = mlx.mlx_array_new(),
@@ -4742,6 +4797,8 @@ pub const Transformer = struct {
         if (self.gdn_q_scale) |q| _ = mlx.mlx_array_free(q);
         if (self.gdn_k_scale) |k| _ = mlx.mlx_array_free(k);
         if (self.ones_hidden) |o| _ = mlx.mlx_array_free(o);
+        if (self.rope_freqs_yarn) |f| _ = mlx.mlx_array_free(f);
+        if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
         if (self.prompt_cache) |*pc| pc.deinit();
         self.cache.deinit();
         if (self.emb_scale) |es| _ = mlx.mlx_array_free(es);
@@ -6813,6 +6870,7 @@ pub const Transformer = struct {
         const offset = ctx.moe_seq_offset.*;
         const cfg = &self.config;
         const is_gemma4 = cfg.isGemma4Layers();
+        const is_laguna = std.mem.eql(u8, cfg.model_type, "laguna");
 
         // PLD spec-decode: thread the per-position SSM capture flag down to the
         // GatedDeltaNet layers (which don't take the ctx). Reset on exit so it
@@ -6846,13 +6904,13 @@ pub const Transformer = struct {
             ctx.mrope_sin_cur = null;
         }
 
-        // Precompute sliding window masks (Gemma 4)
+        // Precompute sliding window masks (Gemma 4 + Laguna sliding layers)
         var local_prefill_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(local_prefill_mask);
         var local_decode_mask = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(local_decode_mask);
 
-        if (is_gemma4 and cfg.has_sliding_window) {
+        if ((is_gemma4 or is_laguna) and cfg.has_sliding_window) {
             const sw: c_int = @intCast(cfg.sliding_window);
             const total_kv: c_int = @as(c_int, @intCast(offset)) + seq_len;
             if (is_prefill) {
@@ -6892,7 +6950,9 @@ pub const Transformer = struct {
             // Attention: linear (GatedDeltaNet) or full
             const attn_out = switch (lw.attn) {
                 .linear => |la| try self.gatedDeltaNet(normed, &la, &ctx.ssm_entries.?[layer_idx], batch, seq_len),
-                .full => |fa| if (is_gemma4)
+                .full => |fa| if (is_laguna)
+                    try self.lagunaAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
+                else if (is_gemma4)
                     try self.gemma4MoeAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
                 else
                     try self.gatedFullAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill),
@@ -8392,6 +8452,195 @@ pub const Transformer = struct {
         return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
     }
 
+    // ── Laguna attention (per-layer heads, YaRN/default RoPE, softplus gate) ──
+    // Full-attention layers: 48 Q-heads, YaRN RoPE (theta 5e5, partial 0.5),
+    // no sliding window. Sliding layers: 72 Q-heads, default RoPE (theta 1e4,
+    // full rotary), 512-window mask. KV heads uniform (8). Per-head QK RMS-norm
+    // before RoPE (qwen3 pattern); softplus per-head output gate before o_proj.
+    // Mirrors gemma4MoeAttnWith's sliding-mask plumbing (head_dim 128 → no
+    // fused hd-256 kernel). Reference: modeling_laguna.py LagunaAttention.
+    fn lagunaAttnWith(
+        self: *Transformer,
+        ctx: *ForwardCtx,
+        x: mlx.mlx_array,
+        fa: *const FullAttnWeights,
+        layer: u32,
+        offset: c_int,
+        batch: c_int,
+        seq_len: c_int,
+        is_prefill: bool,
+        local_prefill_mask: *mlx.mlx_array,
+        local_decode_mask: mlx.mlx_array,
+    ) !mlx.mlx_array {
+        const cfg = &self.config;
+        // "global" = full_attention layer (isGlobalLayer keys on layer_is_global).
+        const is_full = cfg.isGlobalLayer(layer);
+        const h_count: c_int = @intCast(cfg.layerNumHeads(layer)); // 48 full / 72 sliding
+        const kv_h: c_int = @intCast(cfg.num_key_value_heads); // 8 uniform
+        const hd: c_int = @intCast(cfg.head_dim); // 128
+        const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
+        const q_shape = [_]c_int{ batch, seq_len, h_count, hd };
+        const kv_shape = [_]c_int{ batch, seq_len, kv_h, hd };
+        const flat_shape = [_]c_int{ batch, seq_len, h_count * hd };
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        const perm_back = [_]c_int{ 0, 2, 1, 3 };
+
+        // Per-layer-type RoPE. Full layers: YaRN precomputed freqs (dims =
+        // rotary_dim = head_dim*partial_global) + mscale on the rotated slice.
+        // Sliding layers: default RoPE at rope_local_base_freq, full rotary.
+        const use_yarn = is_full and self.rope_freqs_yarn != null;
+        const rope_dims: c_int = if (use_yarn)
+            @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor_global)
+        else
+            @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
+        const rope_base = mlx.mlx_optional_float{
+            .value = if (is_full) cfg.rope_theta else cfg.rope_local_base_freq,
+            .has_value = !use_yarn, // yarn freqs override base
+        };
+        const rope_freqs: mlx.mlx_array = if (use_yarn) self.rope_freqs_yarn.? else .{ .ctx = null };
+
+        const none_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(none_mask);
+
+        // Q: proj → reshape → q_norm → transpose → rope
+        const q_proj = try self.qmatmul(x, fa.q_w, fa.q_s, fa.q_b);
+        defer _ = mlx.mlx_array_free(q_proj);
+        var q_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_r);
+        try mlx.check(mlx.mlx_reshape(&q_r, q_proj, &q_shape, 4, self.s));
+        const q_normed = try self.rmsNorm(q_r, fa.q_norm);
+        defer _ = mlx.mlx_array_free(q_normed);
+        var q_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_t);
+        try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed, &perm, 4, self.s));
+        var q_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(q_rope);
+        try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+
+        // K: proj → reshape → k_norm → transpose → rope
+        const k_proj = try self.qmatmul(x, fa.k_w, fa.k_s, fa.k_b);
+        defer _ = mlx.mlx_array_free(k_proj);
+        var k_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_r);
+        try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, self.s));
+        const k_normed = try self.rmsNorm(k_r, fa.k_norm);
+        defer _ = mlx.mlx_array_free(k_normed);
+        var k_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_t);
+        try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, self.s));
+        var k_rope = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(k_rope);
+        try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+
+        // YaRN mscale: scale the rotated slice of q/k by attention_factor. This
+        // is exactly the reference's cos/sin *= attention_factor (the mscale
+        // vector is 1.0 on the pass-through tail). Broadcast [head_dim] over BHS.
+        if (use_yarn) {
+            if (self.yarn_mscale) |ms| {
+                var q_scaled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_multiply(&q_scaled, q_rope, ms, self.s));
+                _ = mlx.mlx_array_free(q_rope);
+                q_rope = q_scaled;
+                var k_scaled = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_multiply(&k_scaled, k_rope, ms, self.s));
+                _ = mlx.mlx_array_free(k_rope);
+                k_rope = k_scaled;
+            }
+        }
+
+        // V: proj → reshape → transpose
+        const v_proj = try self.qmatmul(x, fa.v_w, fa.v_s, fa.v_b);
+        defer _ = mlx.mlx_array_free(v_proj);
+        var v_r = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_r);
+        try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, self.s));
+        var v_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(v_t);
+        try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
+
+        // KV cache: sliding layers trim to the window on DECODE (prefill keeps
+        // the full buffer; the mask handles scope), full layers keep everything.
+        const max_kv: u32 = if (is_full) 0 else cfg.sliding_window;
+        var kv_view = try ctx.cache.update(layer, k_rope, v_t, self.s, max_kv);
+        defer kv_view.deinit();
+        const full_k = kv_view.k;
+        const full_v = kv_view.v;
+
+        // SDPA with sliding-window masking (mirrors gemma4MoeAttnWith exactly,
+        // minus the fused hd-256 kernel — Laguna's head_dim is 128).
+        var attn_out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_out);
+        if (is_full) {
+            if (is_prefill) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            } else {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+            }
+        } else {
+            const sw: c_int = @intCast(cfg.sliding_window);
+            const total_kv: c_int = offset + seq_len;
+            if (is_prefill and total_kv <= sw) {
+                // Window degenerates to plain causal — same kernel/reduction the
+                // reference picks for short prompts.
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, self.s));
+            } else if (is_prefill) {
+                if (local_prefill_mask.ctx == null) {
+                    local_prefill_mask.* = try self.createSlidingWindowMask(seq_len, total_kv, sw);
+                }
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_prefill_mask.*, .{ .ctx = null }, self.s));
+            } else if (@as(c_int, @intCast(ctx.cache.seqLen(layer))) <= sw) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "", none_mask, .{ .ctx = null }, self.s));
+            } else {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "array", local_decode_mask, .{ .ctx = null }, self.s));
+            }
+        }
+
+        // [B,H,S,D] → [B,S,H*D]
+        var attn_t = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_t);
+        try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm_back, 4, self.s));
+        var attn_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(attn_flat);
+        try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
+
+        // Softplus per-head output gate BEFORE o_proj (reference LagunaAttention):
+        //   g = softplus(g_proj(x)) in fp32, cast to attn dtype (per-head scalar)
+        //   attn = (attn.reshape[B,S,H,D] * g[...,None]).reshape[B,S,H*D]
+        // softplus(x) = logaddexp(0, x) (numerically stable).
+        if (cfg.laguna_attn_gate and fa.g_w.ctx != null) {
+            const g_logits = try self.qmatmul(x, fa.g_w, fa.g_s, fa.g_b); // [B,S,h_count]
+            defer _ = mlx.mlx_array_free(g_logits);
+            var g_f32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(g_f32);
+            try mlx.check(mlx.mlx_astype(&g_f32, g_logits, .float32, self.s));
+            const zero = mlx.mlx_array_new_float(0.0);
+            defer _ = mlx.mlx_array_free(zero);
+            var g_sp = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(g_sp);
+            try mlx.check(mlx.mlx_logaddexp(&g_sp, zero, g_f32, self.s));
+            // Cast gate to attn dtype (bf16), then per-head broadcast multiply.
+            var g_bf16 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(g_bf16);
+            try mlx.check(mlx.mlx_astype(&g_bf16, g_sp, .bfloat16, self.s));
+            const g_shape = [_]c_int{ batch, seq_len, h_count, 1 };
+            var g_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(g_r);
+            try mlx.check(mlx.mlx_reshape(&g_r, g_bf16, &g_shape, 4, self.s));
+            var attn_4d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_4d);
+            try mlx.check(mlx.mlx_reshape(&attn_4d, attn_flat, &q_shape, 4, self.s));
+            var gated_4d = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gated_4d);
+            try mlx.check(mlx.mlx_multiply(&gated_4d, attn_4d, g_r, self.s));
+            var gated_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gated_flat);
+            try mlx.check(mlx.mlx_reshape(&gated_flat, gated_4d, &flat_shape, 3, self.s));
+            return self.qmatmul(gated_flat, fa.o_w, fa.o_s, fa.o_b);
+        }
+
+        return self.qmatmul(attn_flat, fa.o_w, fa.o_s, fa.o_b);
+    }
+
     // ── Gemma 4 Full Attention for MoE layers ──
     // Handles dual head dims, v_norm, sliding window, per-layer RoPE.
 
@@ -9471,6 +9720,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
     // both take the gemma4 binding/forward arms here.
     const is_gemma4 = config.isGemma4Layers();
     const is_hy3 = std.mem.eql(u8, config.model_type, "hy_v3");
+    const is_laguna = std.mem.eql(u8, config.model_type, "laguna");
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -9592,8 +9842,18 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 try maybeTransposeForBf16(&la.out_w, la.out_s, &owned_bf16, allocator, s);
             }
         } else {
+            // Laguna ships in two quant layouts: poolside nvfp4 (attention DENSE
+            // bf16 — no scales) and mlx-lm affine (attention QUANTIZED — scales
+            // present, q/k/v/o all U32+scales+biases). Probe per-tensor: scales
+            // present → the quant path (quantParamsHinted resolves bits from
+            // geometry); absent → bf16 (maybeTransposeForBf16). Other archs keep
+            // mandating scales (config.quant_bits) so a genuinely-missing scale
+            // still errors loudly. getLayerBias already tolerates absence.
+            const k_s = if (is_laguna)
+                (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.k_proj.scales") orelse mlx.mlx_array_new())
+            else
+                getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
             const k_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_proj.weight");
-            const k_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.k_proj.scales", config.quant_bits);
             const k_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.k_proj.biases", &config);
             // Gemma 4 MoE: global layers use K=V (no separate v_proj)
             const v_w = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.v_proj.weight") orelse k_w;
@@ -9602,7 +9862,10 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
             const v_aliases_k = v_w.ctx == k_w.ctx;
             lw.attn = .{ .full = .{
                 .q_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_proj.weight"),
-                .q_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
+                .q_s = if (is_laguna)
+                    (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.q_proj.scales") orelse mlx.mlx_array_new())
+                else
+                    getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.q_proj.scales", config.quant_bits),
                 .q_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.q_proj.biases", &config),
                 .k_w = k_w,
                 .k_s = k_s,
@@ -9611,7 +9874,10 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 .v_s = v_s,
                 .v_b = v_b,
                 .o_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.o_proj.weight"),
-                .o_s = getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
+                .o_s = if (is_laguna)
+                    (getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.o_proj.scales") orelse mlx.mlx_array_new())
+                else
+                    getLayerScaleOrEmpty(weights, name_buf, prefix, li, "self_attn.o_proj.scales", config.quant_bits),
                 .o_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.o_proj.biases", &config),
                 .q_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.q_norm.weight"),
                 .k_norm = getLayerWeight(weights, name_buf, prefix, li, "self_attn.k_norm.weight"),
@@ -9630,13 +9896,29 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 } else {
                     try maybeTransposeForBf16(&fa.v_w, fa.v_s, &owned_bf16, allocator, s);
                 }
+                // Laguna softplus per-head output gate (self_attn.g_proj →
+                // per-head logits [B,S,n_heads]). bf16 in the nvfp4 layout
+                // (scales absent → pre-transposed), quantized in the mlx-lm
+                // affine layout (scales+biases present → quant path). Probe.
+                if (is_laguna) {
+                    fa.g_w = getLayerWeight(weights, name_buf, prefix, li, "self_attn.g_proj.weight");
+                    fa.g_s = getLayerWeightOpt(weights, name_buf, prefix, li, "self_attn.g_proj.scales") orelse mlx.mlx_array_new();
+                    fa.g_b = getLayerBias(weights, name_buf, prefix, li, "self_attn.g_proj.biases", &config);
+                    try maybeTransposeForBf16(&fa.g_w, fa.g_s, &owned_bf16, allocator, s);
+                }
             }
         }
 
         // hy_v3: layers [0, first_k_dense_replace) are DENSE (layer 0 on the
         // 295B) — they take the dense binding arm below. Every established
         // arch has first_k_dense_replace == 0, so layer_is_moe == isMoe() there.
-        const layer_is_moe = config.isMoe() and li >= config.first_k_dense_replace;
+        // Laguna: mlp_only_layers (layer 0) are dense; resolve by a per-layer
+        // weight-presence probe (converter-proof — a future variant with a
+        // non-prefix dense-layer set stays correct without a config field).
+        const layer_is_moe = if (is_laguna)
+            (getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight") != null)
+        else
+            (config.isMoe() and li >= config.first_k_dense_replace);
         if (layer_is_moe and is_gemma4) {
             // Gemma 4 MoE: different weight naming, Sigma-MoE routing, no shared expert gate.
             // Each `*_s`/`*_b` is loaded optionally for Unsloth Dynamic compatibility —
@@ -9746,6 +10028,62 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *co
                 try mlx.check(mlx.mlx_multiply(&folded, rs, root_scalar, s));
                 try owned_bf16.append(allocator, folded);
                 lw.mlp.moe.router_scale = folded;
+            }
+        } else if (layer_is_moe and is_laguna) {
+            // Laguna: qwen3_moe WEIGHT NAMING (mlp.gate router bf16,
+            // mlp.switch_mlp.* nvfp4 experts, mlp.shared_expert.* bf16 shared)
+            // with hy_v3 ROUTING SEMANTICS — sigmoid + f32 selection bias
+            // (mlp.gate.e_score_correction_bias) + top-k renorm + route_scale,
+            // and the shared expert ALWAYS added, no gate (shared_ungated). The
+            // nvfp4 experts carry scales (u8 fp8) but no biases (bias-less mode);
+            // the router/shared weights are bf16 (null-ctx scales → pre-transposed
+            // to plain matmul by maybeTransposeForBf16).
+            lw.mlp = .{ .moe = .{
+                .router_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
+                .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
+                .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
+                .switch_gate_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
+                .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
+                .switch_up_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
+                .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
+                .switch_down_w = getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
+                .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
+                .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
+                .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight") orelse mlx.mlx_array_new(),
+                .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.biases") orelse mlx.mlx_array_new(),
+                .shared_up_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.weight") orelse mlx.mlx_array_new(),
+                .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.up_proj.biases") orelse mlx.mlx_array_new(),
+                .shared_down_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.weight") orelse mlx.mlx_array_new(),
+                .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.scales") orelse mlx.mlx_array_new(),
+                .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.down_proj.biases") orelse mlx.mlx_array_new(),
+                .expert_bias = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.e_score_correction_bias") orelse blk: {
+                    // Some community conversions (mlx-lm quantizer) DROP the
+                    // aux-loss-free bias — the reference zero-inits it, so
+                    // selection reduces to plain sigmoid top-k. Non-null keeps
+                    // moeMLP2 on the sigmoid chain (null falls back to softmax).
+                    var zeros = mlx.mlx_array_new();
+                    const zshape = [_]c_int{@intCast(config.num_experts)};
+                    try mlx.check(mlx.mlx_zeros(&zeros, &zshape, 1, .float32, s));
+                    try owned_bf16.append(allocator, zeros);
+                    break :blk zeros;
+                },
+                .route_norm = config.moe_route_norm,
+                .route_scale = config.router_scaling_factor,
+                .shared_ungated = true,
+            } };
+            {
+                const mw = &lw.mlp.moe;
+                try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_gate_w, mw.switch_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_up_w, mw.switch_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_down_w, mw.switch_down_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
             }
         } else if (layer_is_moe and is_hy3) {
             // Hy3 (hy_v3): stacked experts (already [E, out, packed] in MLX
@@ -10347,6 +10685,56 @@ fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !T
     try mlx.check(mlx.mlx_divide(&norm_scores, top_weights, weight_sum, s));
 
     return .{ .inds = inds, .norm_scores = norm_scores };
+}
+
+/// HF `_compute_yarn_parameters` → the per-dim RoPE DENOMINATOR array (`freqs`)
+/// that mlx_fast_rope consumes: mlx computes angle = position / freqs[i], so we
+/// return 1/inv_freq where inv_freq is the YaRN-corrected inverse frequency.
+/// `out.len` must equal the rotary half-dim (= int(head_dim * partial) / 2).
+/// Pure f64 math (no MLX) so it unit-tests directly against reference values.
+/// Mirrors modeling_laguna.py's rope for the full-attention layers verbatim,
+/// with truncate=True (Laguna's rope_parameters omits the flag → default True).
+fn computeYarnFreqs(
+    out: []f64,
+    head_dim: u32,
+    partial: f32,
+    base: f64,
+    factor: f64,
+    beta_fast: f64,
+    beta_slow: f64,
+    orig_max: u32,
+) void {
+    const dim: f64 = @floor(@as(f64, @floatFromInt(head_dim)) * @as(f64, partial)); // 64
+    const n = out.len; // dim/2 = 32
+    const mp: f64 = @floatFromInt(orig_max);
+    const two_log_base = 2.0 * @log(base);
+    // find_correction_dim(num_rotations) = dim * ln(orig_max/(num_rot*2π)) / (2·ln base)
+    const corr = struct {
+        fn f(num_rot: f64, d: f64, max_pos: f64, tlb: f64) f64 {
+            return (d * @log(max_pos / (num_rot * 2.0 * std.math.pi))) / tlb;
+        }
+    }.f;
+    var low = @floor(corr(beta_fast, dim, mp, two_log_base));
+    var high = @ceil(corr(beta_slow, dim, mp, two_log_base));
+    if (low < 0) low = 0;
+    if (high > dim - 1) high = dim - 1;
+    var ramp_denom = high - low;
+    if (ramp_denom == 0) ramp_denom = 0.001;
+
+    var i: usize = 0;
+    while (i < n) : (i += 1) {
+        // pos_freqs = base^(arange(0,dim,2)[i]/dim) = base^(2i/dim)
+        const pos_freq = std.math.pow(f64, base, @as(f64, @floatFromInt(2 * i)) / dim);
+        const inv_extrapolation = 1.0 / pos_freq;
+        const inv_interpolation = 1.0 / (factor * pos_freq);
+        // linear_ramp_factor(low, high) clamped to [0,1], then extrapolation factor = 1 - ramp
+        var ramp = (@as(f64, @floatFromInt(i)) - low) / ramp_denom;
+        if (ramp < 0) ramp = 0;
+        if (ramp > 1) ramp = 1;
+        const extrapolation_factor = 1.0 - ramp;
+        const inv_freq = inv_interpolation * (1.0 - extrapolation_factor) + inv_extrapolation * extrapolation_factor;
+        out[i] = 1.0 / inv_freq;
+    }
 }
 
 /// Hy3 (hy_v3 / DeepSeek-V3-style) sigmoid routing chain — mirrors the
@@ -12652,6 +13040,80 @@ test "hy3RoutingChain route_norm=false keeps raw sigmoid weights (scaled only)" 
     const ss = mlx.mlx_array_data_float32(scores_sum) orelse return error.InvalidDtype;
     // (0.880797 + 0.731059) × 2.0 = 3.2237 — un-normalized, scaled.
     try testing.expect(@abs(ss[0] - 3.2237) < 0.02);
+}
+
+test "computeYarnFreqs matches HF _compute_yarn_parameters (Laguna full-attn rope)" {
+    // Golden values from the reference YaRN math (tests/dump_laguna_fixtures.py
+    // and the pure-Python cross-check): head_dim 128, partial 0.5 → dim 64 →
+    // 32 freqs; base 5e5, factor 32, beta_fast 32, beta_slow 1, orig_max 8192.
+    // low/high correction dims truncate to 9/18.
+    var freqs: [32]f64 = undefined;
+    computeYarnFreqs(&freqs, 128, 0.5, 500000.0, 32.0, 32.0, 1.0, 8192);
+    // Spot-check the denominator array mlx_fast_rope consumes (angle = pos/freqs).
+    const golden = [_]struct { idx: usize, val: f64 }{
+        .{ .idx = 0, .val = 1.000000000e+00 },
+        .{ .idx = 1, .val = 1.506929076e+00 },
+        .{ .idx = 2, .val = 2.270835240e+00 },
+        .{ .idx = 7, .val = 1.764613870e+01 },
+        .{ .idx = 15, .val = 1.324904288e+03 },
+        .{ .idx = 16, .val = 2.868264127e+03 },
+        .{ .idx = 23, .val = 3.992865387e+05 },
+        .{ .idx = 31, .val = 1.061761980e+07 },
+    };
+    for (golden) |g| {
+        try testing.expectApproxEqRel(g.val, freqs[g.idx], 1e-7);
+    }
+    // Below the low correction dim (9): pure extrapolation → freqs = base^(2i/64).
+    try testing.expectApproxEqRel(std.math.pow(f64, 500000.0, 0.0), freqs[0], 1e-9);
+    // Above the high correction dim (18): pure interpolation → freqs = factor·base^(2i/64).
+    try testing.expectApproxEqRel(32.0 * std.math.pow(f64, 500000.0, @as(f64, 2 * 31) / 64.0), freqs[31], 1e-6);
+}
+
+test "laguna yarn parity vs modeling_laguna.py (LAGUNA_FIXTURES)" {
+    // Env-gated cos/value oracle: compare computeYarnFreqs against the
+    // full-attention rotary frequencies dumped from the reference
+    // modeling_laguna.py (tests/dump_laguna_fixtures.py, CPU fp32). Dormant in
+    // normal CI; run with LAGUNA_FIXTURES=/tmp/laguna_fixtures.json. The
+    // fixture's `yarn.freqs` = 1/inv_freq (the mlx_fast_rope denominator).
+    const path_z = std.c.getenv("LAGUNA_FIXTURES") orelse return error.SkipZigTest;
+    const path = std.mem.span(path_z);
+    if (path.len == 0) return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const file = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer file.close(io);
+    var read_buf: [4096]u8 = undefined;
+    var reader_state = file.reader(io, &read_buf);
+    const data = try reader_state.interface.allocRemaining(testing.allocator, .limited(1 << 20));
+    defer testing.allocator.free(data);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, data, .{});
+    defer parsed.deinit();
+    const yarn = parsed.value.object.get("yarn").?.object;
+    const cfg = parsed.value.object.get("config").?.object;
+
+    const head_dim: u32 = @intCast(cfg.get("head_dim").?.integer);
+    const partial: f32 = @floatCast(jsonF64(yarn.get("partial_rotary_factor").?));
+    const base = jsonF64(yarn.get("rope_theta").?);
+    const factor = jsonF64(yarn.get("factor").?);
+    const beta_fast = jsonF64(yarn.get("beta_fast").?);
+    const beta_slow = jsonF64(yarn.get("beta_slow").?);
+    const orig_max: u32 = @intCast(yarn.get("original_max_position_embeddings").?.integer);
+
+    const ref = yarn.get("freqs").?.array;
+    const out = try testing.allocator.alloc(f64, ref.items.len);
+    defer testing.allocator.free(out);
+    computeYarnFreqs(out, head_dim, partial, base, factor, beta_fast, beta_slow, orig_max);
+    for (ref.items, 0..) |item, i| {
+        try testing.expectApproxEqRel(jsonF64(item), out[i], 1e-6);
+    }
+    std.debug.print("[laguna-yarn] {d} freqs match reference (max rel err < 1e-6)\n", .{ref.items.len});
+}
+
+fn jsonF64(v: std.json.Value) f64 {
+    return switch (v) {
+        .float => |f| f,
+        .integer => |i| @floatFromInt(i),
+        else => std.math.nan(f64),
+    };
 }
 
 test "gdnGateChain matches g = exp(-exp(A_log) * softplus(a + dt_bias))" {

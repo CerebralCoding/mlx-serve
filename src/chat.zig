@@ -2799,8 +2799,24 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
                 continue;
             }
             name_start = p + wrap_len;
+        } else if (after_base < text.len and text[after_base] == '>' and blk: {
+            // Bare `<tool_call>` has two sub-formats sharing this opener:
+            //   • Hermes JSON `<tool_call>{…}` / function-tag `<tool_call><function=…>`
+            //     → the generic scan reads those; fall through.
+            //   • GLM (Laguna, tokenizer tool_parser_type "glm47"):
+            //     `<tool_call>NAME<arg_key>K</arg_key><arg_value>V</arg_value>…`
+            //     — bare opener, NAME, then arg_key/arg_value pairs, NO plural
+            //     wrapper. Route HERE only when an `<arg_key` precedes this
+            //     call's close (the unambiguous GLM signal a JSON/function body
+            //     never has), so the Hermes path is untouched.
+            const body = after_base + 1;
+            const this_close = std.mem.indexOfPos(u8, text, body, "</tool_call") orelse text.len;
+            const ak_at = std.mem.indexOfPos(u8, text, body, "<arg_key") orelse text.len;
+            break :blk ak_at < this_close;
+        }) {
+            name_start = after_base + 1;
         } else {
-            // Bare `<tool_call>` (Hermes) — not this format; fall through.
+            // Bare `<tool_call>` Hermes JSON / function-tag — not this format.
             pos = after_base;
             continue;
         }
