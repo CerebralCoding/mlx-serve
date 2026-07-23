@@ -7070,7 +7070,15 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
         const chw = allocator.alloc(f32, @as(usize, C) * plane) catch return null;
         defer allocator.free(chw);
         const source_len: usize = @as(usize, src_h) * src_w * C;
-        qwen_vision.resizeRgbBicubicNormalizedChw(chw, px[0..source_len], src_h, src_w, rh, rw);
+        qwen_vision.resizeRgbBicubicNormalizedChw(
+            allocator,
+            chw,
+            px[0..source_len],
+            src_h,
+            src_w,
+            rh,
+            rw,
+        ) catch return null;
 
         const pv_bytes = allocator.alloc(u8, n * feat * 4) catch return null;
         const pv_f32 = @as([*]f32, @alignCast(@ptrCast(pv_bytes.ptr)))[0 .. n * feat];
