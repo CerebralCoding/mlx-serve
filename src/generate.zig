@@ -459,6 +459,10 @@ pub const Generator = struct {
     // `deinit`).
     mtp: ?*mtp_mod.MtpModel = null,
     mtp_cache: ?KVCache = null,
+    /// Absolute target position represented by MTP-cache position 0. Usually
+    /// zero; nonzero when the head keeps only a suffix of a restored/long
+    /// prompt. Used to map the sidecar's relative offsets into Qwen M-RoPE.
+    mtp_position_base: usize = 0,
     /// CONFIGURED max tokens drafted per round (verify length = depth + 1).
     mtp_depth: u32 = mtp_mod.DEFAULT_DEPTH,
     /// CURRENT adaptive depth (see updateMtpDepth). Starts at `mtp_depth`,
@@ -969,6 +973,8 @@ pub const Generator = struct {
         const mtp_active = options.mtp_enabled and options.mtp != null;
         var mtp_cache: ?KVCache = if (mtp_active) try options.mtp.?.makeCache(allocator) else null;
         errdefer if (mtp_cache) |*mc| mc.deinit();
+        var mtp_position_base: usize = ssm_cp_offset;
+        var mtp_history_started = false;
 
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
@@ -1047,13 +1053,25 @@ pub const Generator = struct {
                 // the chunk loop spans [0, prefix_len) and prompt_ids has
                 // prefix_len + 1 entries.
                 if (mtp_capture) {
-                    try mtp_mod.appendHistory(
+                    if (!mtp_history_started) {
+                        std.debug.assert(mtp_cache.?.step == 0);
+                        mtp_position_base = ssm_cp_offset + pos;
+                        mtp_history_started = true;
+                    }
+                    const mtp_mrope_ctx: ?mtp_mod.MropeContext = if (ctx.mrope_pos) |positions| .{
+                        .pos = positions,
+                        .total = ctx.mrope_total,
+                        .delta = ctx.mrope_delta,
+                        .base = mtp_position_base,
+                    } else null;
+                    try mtp_mod.appendHistoryWithMrope(
                         options.mtp.?,
                         xfm,
                         &mtp_cache.?,
                         prompt_ids[pos + 1 .. end + 1],
                         chunk_hidden_all,
                         @intCast(mtp_cache.?.step),
+                        mtp_mrope_ctx,
                     );
                 }
 
@@ -1299,6 +1317,7 @@ pub const Generator = struct {
                 .drafter_block_size = options.drafter_block_size,
                 .mtp = if (mtp_active) options.mtp else null,
                 .mtp_cache = mtp_cache,
+                .mtp_position_base = mtp_position_base,
                 .mtp_depth = resolveMtpDepthCapForProfile(options.mtp_depth, mtp_cost_profile),
                 .mtp_ev_costs = mtpEvCosts(mtp_cost_profile),
                 // Start at depth 1 and climb with evidence: the cheap depth
@@ -2532,6 +2551,16 @@ pub const Generator = struct {
         return cache_step;
     }
 
+    fn mtpMropeContext(self: *const Generator) ?mtp_mod.MropeContext {
+        const positions = self.ctx.mrope_pos orelse return null;
+        return .{
+            .pos = positions,
+            .total = self.ctx.mrope_total,
+            .delta = self.ctx.mrope_delta,
+            .base = self.mtp_position_base,
+        };
+    }
+
     pub fn nextMtp(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.done) return null;
         std.debug.assert(self.mtp != null);
@@ -2557,6 +2586,7 @@ pub const Generator = struct {
         const s = xfm.s;
         const head = self.mtp.?;
         const mc = &self.mtp_cache.?;
+        const mtp_mrope_ctx = self.mtpMropeContext();
         // Cross-request EV seed: inherit the head's last healthy acceptance
         // surface so the controller plans from round 1 instead of re-warming
         // (~10 legacy rounds + a +1/round base climb — a third of a short
@@ -2673,8 +2703,8 @@ pub const Generator = struct {
                         _ = mlx.mlx_vector_array_append_value(hv, h_prev_arg);
                         try mlx.check(mlx.mlx_concatenate_axis(&merged_hidden, hv, 1, s));
                     }
-                    break :blk try mtp_mod.forward(head, xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), true);
-                } else try mtp_mod.stepArr(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(mtp_off0 + i));
+                    break :blk try mtp_mod.forwardWithMrope(head, xfm, mc, merged_ids, merged_hidden, @intCast(st.off0), true, mtp_mrope_ctx);
+                } else try mtp_mod.stepArrWithMrope(head, xfm, mc, prev_tok_arr, h_prev_arg, @intCast(mtp_off0 + i), mtp_mrope_ctx);
                 draft_arrs[i] = sampleTokenLazy(step_out.logits, draft_sampling, s);
                 n_drafted = i + 1;
                 if (conf_arrs != null and i < m_lo) {
