@@ -84,6 +84,12 @@ struct SettingsView: View {
                     ) {
                         ServerSectionContent()
                     }
+                    SettingsSection(
+                        category: .lanSharing,
+                        subtitle: "Share models with other Macs on your local network and use theirs — zero-setup discovery over Bonjour, everything off by default. Restart the server to apply."
+                    ) {
+                        LanSharingSectionContent()
+                    }
                     // Engine-aware sections. Each panel is hidden when its
                     // controls don't apply to the active engine — flipping
                     // `--kv-quant` on a GGUF model silently no-ops, so we'd
@@ -698,13 +704,102 @@ private struct ModelFoldersSectionContent: View {
 
 // MARK: - Server section
 
+// MARK: - LAN sharing section
+
+private struct LanSharingSectionContent: View {
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
+    }
+
+    var body: some View {
+        if let m = meta["lanShareEnabled"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanShareEnabled)) {
+                Toggle("", isOn: $appState.serverOptions.lanShareEnabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
+        if appState.serverOptions.lanShareEnabled {
+            if let m = meta["lanShareAll"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanShareAll)) {
+                    Toggle("", isOn: $appState.serverOptions.lanShareAll)
+                        .labelsHidden()
+                        .toggleStyle(.switch)
+                }
+            }
+            if !appState.serverOptions.lanShareAll {
+                sharedModelList
+            }
+            if let m = meta["lanName"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanName)) {
+                    TextField(
+                        "",
+                        text: $appState.serverOptions.lanName,
+                        prompt: Text(Host.current().localizedName ?? "this Mac")
+                    )
+                    .textFieldStyle(.roundedBorder)
+                    .multilineTextAlignment(.trailing)
+                    .frame(width: 200)
+                }
+            }
+        }
+        if let m = meta["lanDiscoverEnabled"] {
+            SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanDiscoverEnabled)) {
+                Toggle("", isOn: $appState.serverOptions.lanDiscoverEnabled)
+                    .labelsHidden()
+                    .toggleStyle(.switch)
+            }
+        }
+        // The privacy disclosure — sharing means running other people's
+        // prompts, and using a network model means the host reads yours.
+        Text("Privacy: prompts sent to a model you share are processed on — and visible to — this Mac. Prompts you send to a network model are visible to the Mac hosting it. Traffic stays on your local network, and everything here is off unless you turn it on.")
+            .font(.caption)
+            .foregroundStyle(.secondary)
+            .fixedSize(horizontal: false, vertical: true)
+            .padding(.top, 4)
+    }
+
+    /// One checkbox per local model name. Names are deduped — a GGUF and an
+    /// MLX build of the same repo share a name and are shared together (the
+    /// server matches share entries against registry ids basename-tolerantly).
+    private var sharedModelList: some View {
+        let names = Array(Set(appState.localModels.map(\.name))).sorted()
+        return VStack(alignment: .leading, spacing: 4) {
+            if names.isEmpty {
+                Text("No local models yet — download one first.")
+                    .font(.caption)
+                    .foregroundStyle(.tertiary)
+            }
+            ForEach(names, id: \.self) { name in
+                Toggle(name, isOn: Binding(
+                    get: { appState.serverOptions.lanSharedModels.contains(name) },
+                    set: { on in
+                        var list = appState.serverOptions.lanSharedModels
+                        list.removeAll { $0 == name }
+                        if on { list.append(name) }
+                        appState.serverOptions.lanSharedModels = list.sorted()
+                    }
+                ))
+                .toggleStyle(.checkbox)
+                .font(.caption)
+            }
+        }
+        .padding(.leading, 8)
+        .padding(.vertical, 2)
+    }
+}
+
 private struct ServerSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     var body: some View {
@@ -822,7 +917,7 @@ private struct PortRow: View {
     @State private var text: String = ""
 
     private var isDirty: Bool {
-        guard let last = server.lastLaunchedOptions else { return false }
+        guard let last = server.liveLaunchedOptions else { return false }
         return appState.serverOptions.port != last.port
     }
 
@@ -899,7 +994,7 @@ private struct ContextSizeRow: View {
     }
 
     private var isDirty: Bool {
-        guard let last = server.lastLaunchedOptions else { return false }
+        guard let last = server.liveLaunchedOptions else { return false }
         return appState.serverOptions.ctxSize != last.ctxSize
     }
 
@@ -1006,7 +1101,7 @@ private struct SpecDecodeSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     /// `draftBlockSize` stays CLI-only — `recommendedBlockSize` in drafter.zig
@@ -1148,7 +1243,7 @@ private struct PerformanceSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     var body: some View {
@@ -1251,7 +1346,7 @@ private struct CommonPerformanceSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     var body: some View {
@@ -1284,7 +1379,7 @@ private struct LlamaPerformanceSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     var body: some View {
@@ -1333,7 +1428,7 @@ private struct Ds4PerformanceSectionContent: View {
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     var body: some View {
@@ -1373,7 +1468,7 @@ private struct DrafterRow: View {
     @Environment(\.openWindow) private var openWindow
 
     private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.lastLaunchedOptions)
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
     /// Drafter the loaded model would pair with — nil for non-Gemma-4 or
@@ -1848,8 +1943,37 @@ private struct VoiceCloneSectionContent: View {
 /// `appState.serverOptions.sandbox` with no restart banner and no CLI flag.
 private struct SandboxSectionContent: View {
     @EnvironmentObject var appState: AppState
+    @State private var showResetConfirm = false
+    @State private var resetting = false
+    /// Mirrors the stored default so the row re-renders on change; writes go
+    /// through `AppState.setDefaultAgentWorkspace` (retarget + VM remount),
+    /// never directly through this binding.
+    @AppStorage(ChatSession.defaultWorkspaceDefaultsKey) private var storedWorkspace = ""
+
+    private var currentWorkspace: String {
+        storedWorkspace.isEmpty ? ChatSession.builtinDefaultWorkingDirectory : storedWorkspace
+    }
 
     var body: some View {
+        SettingsRow(
+            title: "Agent workspace folder",
+            explainer: "The default working folder for the agent's tools (shell, readFile, writeFile, …) in every chat — and the folder shared into the sandbox VM at /workspace while the sandbox is on. Changing it moves chats still on the previous default, remounts a running sandbox, and restarts any open terminal sessions in the new folder; a chat with its own picked folder (the folder icon on the Agent pill) keeps it."
+        ) {
+            HStack(spacing: 8) {
+                Text((currentWorkspace as NSString).abbreviatingWithTildeInPath)
+                    .font(.caption.monospaced())
+                    .foregroundStyle(.secondary)
+                    .lineLimit(1)
+                    .truncationMode(.middle)
+                    .help(currentWorkspace)
+                Button("Choose…") {
+                    if let picked = WorkspacePicker.pickDirectory() {
+                        appState.setDefaultAgentWorkspace(picked)
+                    }
+                }
+            }
+        }
+
         // No host shell in the App Store build → the sandbox can't be turned
         // off (`AgentSandbox.resolveEnabled`), so offering the toggle would be
         // a lie; the base image is likewise locked to the bundled guest.
@@ -1873,16 +1997,42 @@ private struct SandboxSectionContent: View {
                 .toggleStyle(.switch)
         }
 
-        if BuildFeatures.current.ociPull {
-            SettingsRow(
-                title: "Base image",
-                explainer: "The Docker/OCI image the sandbox boots from. Must have an arm64 build (Apple Silicon) — an amd64-only image won't boot. The default ddalcu/agent-shell-mlxserve is a purpose-built agentic shell (Node.js + Python3/pip + git/curl + apt). Pulled once on first use, then cached; a heavier image uses more disk and takes longer the first time."
+        SettingsRow(
+            title: "Reset sandbox",
+            explainer: "Deletes ALL sandbox data and returns it to factory state: the downloaded guest image and everything inside it (installed CLIs like pi/hermes, their configs and logins, any files created outside the shared workspace), the cached kernel, the sandbox ssh identity, and the activity transcript. Any running guest and live agent sessions are stopped immediately. Your workspace folder, models, and other app data on this Mac are not touched. The sandbox re-provisions itself on next use."
+        ) {
+            Button(role: .destructive) {
+                showResetConfirm = true
+            } label: {
+                if resetting {
+                    HStack(spacing: 6) {
+                        ProgressView().controlSize(.small)
+                        Text("Resetting…")
+                    }
+                } else {
+                    Label("Reset Sandbox…", systemImage: "trash")
+                        .foregroundStyle(.red)
+                }
+            }
+            .disabled(resetting)
+            .confirmationDialog(
+                "Reset the Agent Sandbox?",
+                isPresented: $showResetConfirm,
+                titleVisibility: .visible
             ) {
-                TextField("", text: $appState.serverOptions.sandbox.baseImage,
-                          prompt: Text("ddalcu/agent-shell-mlxserve"))
-                    .textFieldStyle(.roundedBorder)
-                    .font(.body.monospaced())
-                    .frame(width: 260)
+                Button("Delete All Sandbox Data", role: .destructive) {
+                    resetting = true
+                    AgentSandbox.shared.resetAllData {
+                        resetting = false
+                    }
+                }
+                Button("Cancel", role: .cancel) {}
+            } message: {
+                Text("""
+                This permanently deletes everything the sandbox has downloaded and every change made inside it — installed agent CLIs (pi, hermes), their configs and logins, and any files outside the shared workspace. Any running guest and live sessions stop immediately.
+
+                Files in your workspace folder on this Mac are kept. This cannot be undone.
+                """)
             }
         }
     }
@@ -2136,28 +2286,15 @@ private struct UpdatesSectionContent: View {
     }
 
     /// Friendly display name for a raw `--version` component name.
+    // Label + explainer text live on EngineVersions (pure, tested —
+    // EngineVersionsTests) so the display mapping and the parse contract
+    // stay in one place.
     private static func engineLabel(_ name: String) -> String {
-        switch name {
-        case "mlx": return "MLX"
-        case "mlx-c": return "mlx-c"
-        case "ggml": return "ggml"
-        case "llama.cpp": return "llama.cpp"
-        case "gguf": return "GGUF format"
-        case "ds4": return "ds4"
-        default: return name
-        }
+        EngineVersions.displayLabel(name)
     }
 
     private static func engineExplainer(_ name: String) -> String {
-        switch name {
-        case "mlx": return "Apple's MLX array framework — the native engine for `.safetensors` models."
-        case "mlx-c": return "The C bindings the server links MLX through."
-        case "ggml": return "The tensor library under the llama.cpp GGUF engine (with its short commit)."
-        case "llama.cpp": return "Pinned llama.cpp release serving `.gguf` models. Ships inside the app download."
-        case "gguf": return "GGUF file-format version the engine reads."
-        case "ds4": return "Embedded ds4 engine (DeepSeek-V4-Flash), pinned commit."
-        default: return ""
-        }
+        EngineVersions.explainer(name)
     }
 
     private var statusText: String {

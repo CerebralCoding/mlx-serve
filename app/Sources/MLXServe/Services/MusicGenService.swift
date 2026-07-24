@@ -90,7 +90,7 @@ final class MusicGenService: ObservableObject {
             phase = .failed("Prompt is empty.")
             return
         }
-        guard let modelDir = ServerManager.resolveModelDir(repo: request.model.repo) else {
+        guard request.lanModelId != nil || ServerManager.resolveModelDir(repo: request.model.repo) != nil else {
             phase = .failed("Model \(request.model.repo) is not installed. Convert or download it first.")
             return
         }
@@ -108,15 +108,14 @@ final class MusicGenService: ObservableObject {
                 if !keep, let id = loadedId { try? await server.unloadModel(id: id) }
             }
             do {
-                let port = try await server.ensureRunning(forGenModelDir: modelDir)
-                if Task.isCancelled { phase = .idle; return }
-                let info = try await server.loadModel(id: modelDir)
-                loadedId = info.name
+                let (port, modelId, unloadId) = try await server.prepareGenModel(
+                    lanModelId: request.lanModelId, repo: request.model.repo)
+                loadedId = unloadId
                 if Task.isCancelled { await releaseIfNeeded(); phase = .idle; return }
                 // SSE stages: encode (conditioning) → diffuse (8 turbo steps)
                 // → decode (VAE chunks); the `complete` event carries the WAV.
                 var wav: Data? = nil
-                let reqJson = Self.requestBody(request, modelName: info.name)
+                let reqJson = Self.requestBody(request, modelName: modelId)
                 let resolvedSeed = reqJson["seed"] as? Int ?? request.seed
                 for try await ev in api.streamGeneration(
                     port: port, path: "/v1/audio/music-generations",
@@ -152,7 +151,7 @@ final class MusicGenService: ObservableObject {
                 try wav.write(to: URL(fileURLWithPath: outputPath))
                 // Settings sidecar: <track>.txt with the prompt/lyrics/params,
                 // so every generated track is documented + reproducible.
-                let settings = Self.settingsText(request, resolvedSeed: resolvedSeed, modelName: info.name)
+                let settings = Self.settingsText(request, resolvedSeed: resolvedSeed, modelName: modelId)
                 try? settings.write(to: URL(fileURLWithPath: Self.sidecarPath(forWav: outputPath)),
                                     atomically: true, encoding: .utf8)
                 phase = .completed(path: outputPath)

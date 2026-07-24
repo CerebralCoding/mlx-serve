@@ -17,8 +17,12 @@ pub const Info = struct {
     app: []const u8,
     /// MLX core, from `mlx_version()` at runtime.
     mlx: []const u8,
-    /// mlx-c C bindings, a Homebrew pin (no runtime API).
+    /// mlx-c C bindings, the pinned submodule revision (no runtime API).
     mlx_c: []const u8,
+    /// M5 NAX (neural accelerator) status: "on (...)" / "off (<reason>)",
+    /// from `transformer.naxStatus()` (GPU gen + macOS floor; the bundled
+    /// MLX always ships the NAX kernels — asserted at build time).
+    nax: []const u8,
     /// ggml library version, from `ggml_version()` at runtime.
     ggml: []const u8,
     /// ggml short commit, from `ggml_commit()`. May be empty.
@@ -40,6 +44,7 @@ pub fn writeReport(w: *std.Io.Writer, info: Info) !void {
     try w.print("mlx-serve {s}\n", .{val(info.app)});
     try w.print("mlx {s}\n", .{val(info.mlx)});
     try w.print("mlx-c {s}\n", .{val(info.mlx_c)});
+    try w.print("nax {s}\n", .{val(info.nax)});
     if (info.ggml_commit.len > 0) {
         try w.print("ggml {s} ({s})\n", .{ val(info.ggml), info.ggml_commit });
     } else {
@@ -69,6 +74,7 @@ test "version: report renders one name-value line per component" {
         .app = "26.7.9",
         .mlx = "0.32.0",
         .mlx_c = "0.6.0",
+        .nax = "on (M5 neural accelerators)",
         .ggml = "0.16.0",
         .ggml_commit = "47c786924",
         .llama_tag = "b9999",
@@ -80,6 +86,7 @@ test "version: report renders one name-value line per component" {
         \\mlx-serve 26.7.9
         \\mlx 0.32.0
         \\mlx-c 0.6.0
+        \\nax on (M5 neural accelerators)
         \\ggml 0.16.0 (47c786924)
         \\llama.cpp b9999
         \\gguf 3
@@ -93,6 +100,7 @@ test "version: empty ggml commit drops the parenthetical; blank pins read as unk
         .app = "26.7.9",
         .mlx = "0.32.0",
         .mlx_c = "", // build.sh couldn't resolve it (dev build)
+        .nax = "",
         .ggml = "0.16.0",
         .ggml_commit = "",
         .llama_tag = "b9999",
@@ -104,6 +112,7 @@ test "version: empty ggml commit drops the parenthetical; blank pins read as unk
         \\mlx-serve 26.7.9
         \\mlx 0.32.0
         \\mlx-c unknown
+        \\nax unknown
         \\ggml 0.16.0
         \\llama.cpp b9999
         \\gguf 3

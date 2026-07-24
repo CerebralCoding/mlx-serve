@@ -11,9 +11,11 @@ enum ApprovalDecision: Equatable {
 /// a tool call, decides whether to auto-allow, auto-deny, or pause and ask the user.
 ///
 /// This is the *approval* layer only. Hard filesystem confinement is independently
-/// enforced by `ToolExecutor.resolveAndConfine` — so even a buggy `allow` here can't
-/// write outside the workspace unless the run is `yolo` (which passes a nil working
-/// directory, the documented lever at ToolExecutor.swift `resolveAndConfine`).
+/// enforced by `ToolExecutor.resolveAndConfine` — a buggy `allow` here still can't
+/// write outside the workspace. Yolo is unrestricted HERE (auto-allow everything)
+/// but no longer unconfined THERE: since 2026-07-20 every run has a mandatory
+/// working directory (yolo anchors at the default agent workspace —
+/// `TaskScheduler.workDir`), and file tools refuse to run without one.
 ///
 /// Kept `nonisolated`/pure so the whole autonomy matrix is unit-testable without a
 /// running server, model, or main actor.

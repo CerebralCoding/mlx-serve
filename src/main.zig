@@ -152,6 +152,16 @@ fn printUsage(io: std.Io) void {
         \\                        `fused` consumes the quant triples directly
         \\                        via mlx_quantized_matmul (opt-in; only
         \\                        effective at --kv-quant 4 or 8).
+        \\  --prefill-chunk <n> Max tokens forwarded per prefill chunk
+        \\                        (default: 8192). Auto-capped further per model
+        \\                        so one layer's attention scores stay within
+        \\                        budget; this flag is the ceiling, not a floor.
+        \\                        Lower it if a long prompt spikes memory.
+        \\  --prefix-cache-entries <n>
+        \\                      Hot prefix cache LRU capacity in entries
+        \\                        (default: 32). 0 disables the cache — which also
+        \\                        turns off SSM checkpoint capture, since
+        \\                        checkpoints exist only to feed it.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
@@ -163,6 +173,24 @@ fn printUsage(io: std.Io) void {
         \\                        evictions instead of recomputed. Can use many
         \\                        GB of disk, so it's opt-in; e.g. 10GB. 0/off
         \\                        disables.
+        \\  --ssm-checkpoint-stride <n>
+        \\                      Hybrid SSM architectures only (e.g. Qwen3.5/3.6
+        \\                        GDN): capture an SSM/conv state checkpoint every
+        \\                        <n> tokens during chunked prefill, so a later
+        \\                        request sharing a prefix can restore mid-prompt
+        \\                        instead of re-prefilling (default: 256). 0
+        \\                        disables capture — hybrid models then bypass the
+        \\                        hot prefix cache entirely. On MoE targets the
+        \\                        effective stride is raised to the prefill chunk,
+        \\                        because each checkpoint forces a chunk boundary
+        \\                        and every extra chunk re-streams the expert
+        \\                        weights; see --prefill-chunk.
+        \\  --ssm-checkpoint-max <n>
+        \\                      Cap on SSM checkpoints retained per cache entry
+        \\                        (default: 32). The first stride-aligned position
+        \\                        is always kept; beyond the cap the oldest are
+        \\                        dropped. 0 = unlimited, bounded only by the
+        \\                        prefix cache's byte budget.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
@@ -222,6 +250,19 @@ fn printUsage(io: std.Io) void {
         \\                        Accepts Authorization: Bearer, x-api-key, HTTP
         \\                        Basic (key = password), or ?api_key=. /health
         \\                        stays open. Unset = no auth (default).
+        \\  --lan-share <all|id,...>
+        \\                      Share models with the local network: advertise
+        \\                        this server over Bonjour and let LAN clients
+        \\                        run inference on the listed models (or all).
+        \\                        Everything else stays host-local. Off by
+        \\                        default. Prompts sent to shared models are
+        \\                        visible to this machine.
+        \\  --lan-discover      Discover models other mlx-serve hosts share on
+        \\                        the LAN: they appear in /v1/models as
+        \\                        <id>@<peer> and requests naming one are
+        \\                        proxied to that host. Off by default.
+        \\  --lan-name <name>   Bonjour instance name for --lan-share
+        \\                        (default: this Mac's hostname).
         \\  --log-level <lvl>   Log level: error, warn, info, debug (default: info)
         \\  --log-file <path>   Persist the server log ("off" disables).
         \\                      Default: ~/.mlx-serve/logs/mlx-serve-<port>.log
@@ -379,6 +420,7 @@ pub fn main(init: std.process.Init) !void {
                 .app = VERSION,
                 .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
                 .mlx_c = build_options.mlx_c_version,
+                .nax = transformer_mod.naxStatus(),
                 .ggml = std.mem.span(ggml_version()),
                 .ggml_commit = std.mem.span(ggml_commit()),
                 .llama_tag = build_options.llama_tag,
@@ -462,6 +504,16 @@ pub fn main(init: std.process.Init) !void {
             i += 1;
             // Borrowed from argv (lives for the process). Empty ⇒ leave open.
             if (args[i].len > 0) server_mod.g_api_key = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lan-share") and i + 1 < args.len) {
+            i += 1;
+            // Borrowed from argv, like --api-key. serve() starts the LAN
+            // subsystem (src/lan.zig) once the listener is bound.
+            if (args[i].len > 0) server_mod.g_lan_share_spec = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lan-name") and i + 1 < args.len) {
+            i += 1;
+            if (args[i].len > 0) server_mod.g_lan_name = args[i];
+        } else if (std.mem.eql(u8, args[i], "--lan-discover")) {
+            server_mod.g_lan_discover = true;
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
@@ -785,6 +837,13 @@ pub fn main(init: std.process.Init) !void {
     try mlx.check(mlx.mlx_version(&ver));
     log.info("mlx-serve {s} (MLX {s})\n", .{ VERSION, mlx.mlx_string_data(ver) });
 
+    // Every text-gen serve path takes the PLD defaults from this ONE value —
+    // see `server.PldDefaults`. Built after arg parsing so it can't capture a
+    // pre-flag default, and passed whole so a path can't honor `--pld` while
+    // dropping the two lengths next to it (which is precisely what headless
+    // mode did).
+    const cli_pld = server_mod.PldDefaults.fromCli(enable_pld, pld_draft_len, pld_key_len);
+
     // Echo the resolved arguments — makes drafter/target mismatches obvious
     // from the log without having to scroll through the whole launch line in
     // the parent's process listing.
@@ -836,7 +895,7 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, force_mtp);
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, force_mtp, cli_pld);
             return;
         }
 
@@ -1062,9 +1121,9 @@ pub fn main(init: std.process.Init) !void {
             .default_temperature = if (temp_explicit) temperature else null,
             .default_top_p = top_p_flag,
             .default_top_k = top_k_flag,
-            .default_enable_pld = enable_pld,
-            .default_pld_draft_len = pld_draft_len,
-            .default_pld_key_len = pld_key_len,
+            .default_enable_pld = cli_pld.enable,
+            .default_pld_draft_len = cli_pld.draft_len,
+            .default_pld_key_len = cli_pld.key_len,
             .default_kv_attn_fused = kv_attn_fused_default,
             .default_force_mtp = force_mtp,
         });
@@ -1119,10 +1178,11 @@ pub fn main(init: std.process.Init) !void {
         }
         log.info("Model ready.\n", .{});
 
-        // Qwen native MTP head — auto-load when the model ships a sidecar.
+        // Qwen native MTP head — auto-load when the model ships one (sidecar
+        // file or in-checkpoint tensors in the trunk shards).
         var mtp_head: ?mtp_mod.MtpModel = null;
         defer if (mtp_head) |*h| h.deinit();
-        if (enable_mtp and mtp_mod.hasMtpSidecar(io, model_dir)) {
+        if (enable_mtp and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
             // A failed load (e.g. a sidecar layout we can't bind yet) only
             // disables the head — mirrors the serve path's graceful degrade.
             if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {
@@ -1470,9 +1530,12 @@ fn runGenServe(
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
-        .default_enable_pld = false,
-        .default_pld_draft_len = 5,
-        .default_pld_key_len = 3,
+        // PLD is unreachable on this path (decode never routes through the
+        // PLD-capable generator), so say so once instead of three literals
+        // that read like a decision but drift like a typo.
+        .default_enable_pld = server_mod.PldDefaults.off.enable,
+        .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
+        .default_pld_key_len = server_mod.PldDefaults.off.key_len,
         .default_kv_attn_fused = false,
     });
 }
@@ -1497,6 +1560,7 @@ fn runHeadlessServe(
     idle_evict_secs: ?u32,
     kv_quant_config: transformer_mod.KVQuantConfig,
     force_mtp: bool,
+    pld: server_mod.PldDefaults,
 ) !void {
     log.info("mlx-serve {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
@@ -1586,9 +1650,16 @@ fn runHeadlessServe(
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
-        .default_enable_pld = false,
-        .default_pld_draft_len = 5,
-        .default_pld_key_len = 3,
+        // Honor the whole --pld/--pld-draft-len/--pld-key-len trio in headless
+        // mode. All three were hardcoded here, so none of them reached a
+        // headless request — only an explicit per-request "enable_pld": true
+        // did — while MLX Core's own UI describes Auto as "follow the server's
+        // --pld setting". Headless is the mode the app ALWAYS launches, and it
+        // always passes all three flags. Taking them as one `PldDefaults`
+        // is what keeps the next edit from honoring one and dropping two.
+        .default_enable_pld = pld.enable,
+        .default_pld_draft_len = pld.draft_len,
+        .default_pld_key_len = pld.key_len,
         .default_kv_attn_fused = false,
         // On-demand MLX loads auto-attach an MTP sidecar (LoadParams.mtp_enabled
         // defaults true), so the MoE force flag has to reach this path too.
@@ -1792,9 +1863,12 @@ fn runDs4Serve(
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,
-        .default_enable_pld = false,
-        .default_pld_draft_len = 5,
-        .default_pld_key_len = 3,
+        // PLD is unreachable on this path (decode never routes through the
+        // PLD-capable generator), so say so once instead of three literals
+        // that read like a decision but drift like a typo.
+        .default_enable_pld = server_mod.PldDefaults.off.enable,
+        .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
+        .default_pld_key_len = server_mod.PldDefaults.off.key_len,
         .default_kv_attn_fused = false,
     });
 }
@@ -2061,9 +2135,12 @@ fn runLlamaServe(
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,
-        .default_enable_pld = false,
-        .default_pld_draft_len = 5,
-        .default_pld_key_len = 3,
+        // PLD is unreachable on this path (decode never routes through the
+        // PLD-capable generator), so say so once instead of three literals
+        // that read like a decision but drift like a typo.
+        .default_enable_pld = server_mod.PldDefaults.off.enable,
+        .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
+        .default_pld_key_len = server_mod.PldDefaults.off.key_len,
         .default_kv_attn_fused = false,
     });
 }

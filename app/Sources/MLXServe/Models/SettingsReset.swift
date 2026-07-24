@@ -51,6 +51,15 @@ enum SettingsReset {
                 f("skipMemPreflight") { $0.skipMemPreflight = $1.skipMemPreflight },
             ]
 
+        case .lanSharing:
+            return [
+                f("lanShareEnabled") { $0.lanShareEnabled = $1.lanShareEnabled },
+                f("lanShareAll") { $0.lanShareAll = $1.lanShareAll },
+                f("lanSharedModels") { $0.lanSharedModels = $1.lanSharedModels },
+                f("lanDiscoverEnabled") { $0.lanDiscoverEnabled = $1.lanDiscoverEnabled },
+                f("lanName") { $0.lanName = $1.lanName },
+            ]
+
         case .specDecode:
             return [
                 f("enablePLD") { $0.enablePLD = $1.enablePLD },

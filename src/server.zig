@@ -21,8 +21,8 @@ const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const arch_llama = if (@import("build_options").ios) @import("arch/llama_stub.zig") else @import("arch/llama.zig");
 const media_mod = @import("gen.zig");
-const stb = @cImport({ @cInclude("stb_image.h"); });
-const webp = @cImport({ @cInclude("webp/decode.h"); });
+const stb = @import("stb");
+const webp = @import("webp");
 const metrics = @import("status.zig");
 const instr = @import("metrics.zig");
 
@@ -65,7 +65,19 @@ pub var g_api_key: ?[]const u8 = null;
 /// mistyped value reaches the client verbatim, which strict clients reject.
 pub var g_tool_autocorrect: bool = true;
 
+/// LAN model sharing (src/lan.zig). Started by `serve()` when `--lan-share`
+/// and/or `--lan-discover` are set (the three `g_lan_*` config globals below
+/// are written by main.zig, mirroring the `g_api_key` pattern). When sharing
+/// is on and NO api-key is configured, non-loopback requests are limited to
+/// the shared inference surface (`lanShareDenial`); when discovery is on,
+/// requests naming a `<id>@<peer>` model are tunneled to that peer.
+pub var g_lan: ?*lan_mod.Lan = null;
+pub var g_lan_share_spec: ?[]const u8 = null;
+pub var g_lan_name: ?[]const u8 = null;
+pub var g_lan_discover: bool = false;
+
 const io_util = @import("io_util.zig");
+const lan_mod = @import("lan.zig");
 const ws_mod = @import("ws.zig");
 const ollama_mod = @import("ollama.zig");
 const cli_mod = @import("cli.zig");
@@ -565,6 +577,71 @@ test "effectiveSsmCheckpointStride: disabled prefix cache disables checkpoint ca
     try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32));
 }
 
+/// PLD request defaults carried as ONE value, so a `ServerConfig` builder
+/// cannot thread the enable bit and forget the two lengths beside it.
+///
+/// That is exactly how this broke: `runHeadlessServe` hand-rolled all three
+/// as `false`/`5`/`3` literals, so no `--pld*` flag reached a headless
+/// request. Threading `enable` alone fixed a third of it and left
+/// `--pld-draft-len` / `--pld-key-len` silently dropped — and headless is
+/// the mode the Swift app ALWAYS launches (`--serve --model-dir`, no
+/// `--model`), passing all three flags on every boot. Single chokepoint for
+/// every ServerConfig builder; `effectiveSsmCheckpointStride` above plays
+/// the same role for LoadParams.
+///
+/// Serve paths whose decode never routes through the PLD-capable generator
+/// (media gen, ds4, llama.cpp) take `.off`: the field is dead weight there,
+/// and saying so once beats five hand-written `false`s that read like a
+/// decision but drift like a typo.
+pub const PldDefaults = struct {
+    enable: bool,
+    draft_len: u32,
+    key_len: u32,
+
+    /// Embedded-engine and media-gen serve paths — PLD is unreachable.
+    pub const off: PldDefaults = .{ .enable = false, .draft_len = 5, .key_len = 3 };
+
+    /// Text-gen serve paths: the CLI's values verbatim, no reinterpretation.
+    /// `--no-pld` arrives as `enable == false` and the lengths ride along
+    /// unused, so flipping PLD back on later cannot resurrect stale numbers.
+    pub fn fromCli(enable: bool, draft_len: u32, key_len: u32) PldDefaults {
+        return .{ .enable = enable, .draft_len = draft_len, .key_len = key_len };
+    }
+};
+
+test "PldDefaults: CLI lengths survive alongside the enable bit" {
+    // The regression: `enable` reached headless while the lengths stayed at
+    // the 5/3 literals. All three travel together or the class is back.
+    const cli = PldDefaults.fromCli(true, 8, 4);
+    try std.testing.expect(cli.enable);
+    try std.testing.expectEqual(@as(u32, 8), cli.draft_len);
+    try std.testing.expectEqual(@as(u32, 4), cli.key_len);
+
+    // --no-pld carries its lengths unchanged rather than snapping to defaults.
+    const disabled = PldDefaults.fromCli(false, 8, 4);
+    try std.testing.expect(!disabled.enable);
+    try std.testing.expectEqual(@as(u32, 8), disabled.draft_len);
+
+    // The non-text serve paths stay pinned to the historical literals.
+    try std.testing.expect(!PldDefaults.off.enable);
+    try std.testing.expectEqual(@as(u32, 5), PldDefaults.off.draft_len);
+    try std.testing.expectEqual(@as(u32, 3), PldDefaults.off.key_len);
+}
+
+test "PldDefaults: ServerConfig built from it reports the CLI values" {
+    // Pins the wiring, not just the struct: a ServerConfig fed from
+    // `fromCli` must expose the CLI numbers on the exact fields every
+    // request path and the boot banner read.
+    const cfg = ServerConfig{
+        .default_enable_pld = PldDefaults.fromCli(true, 8, 4).enable,
+        .default_pld_draft_len = PldDefaults.fromCli(true, 8, 4).draft_len,
+        .default_pld_key_len = PldDefaults.fromCli(true, 8, 4).key_len,
+    };
+    try std.testing.expect(cfg.default_enable_pld);
+    try std.testing.expectEqual(@as(u32, 8), cfg.default_pld_draft_len);
+    try std.testing.expectEqual(@as(u32, 4), cfg.default_pld_key_len);
+}
+
 /// Iteration 2 (perf-plan Phase 4 #3): LRU capacity of the per-LoadedModel
 /// chat-template tokenize cache. 0 disables (every request re-renders +
 /// re-tokenizes, restoring pre-Iteration-2 behavior). Default 4 is small
@@ -766,6 +843,13 @@ fn parseToolCallsForRequest(
     allocator: std.mem.Allocator,
     text: []const u8,
     tools_json: ?[]const u8,
+    /// OpenAI `parallel_tool_calls` (Anthropic spelling:
+    /// !tool_choice.disable_parallel_tool_use). false = the client accepts AT
+    /// MOST ONE call per response, so the chokepoint keeps the first parsed
+    /// call and drops the rest (the model re-issues them next round after the
+    /// first result). Deliberately NOT gated by --no-tool-autocorrect:
+    /// client-requested behavior, not a repair heuristic.
+    allow_parallel: bool,
 ) !?[]chat_mod.ParsedToolCall {
     var parsed_calls = try chat_mod.parseToolCalls(allocator, text);
     // Heuristically-inferred raw-JSON calls must name a DECLARED tool — a
@@ -775,9 +859,21 @@ fn parseToolCallsForRequest(
     if (parsed_calls) |c| {
         if (tools_json) |tj| parsed_calls = try chat_mod.filterInferredBySchema(allocator, c, tj);
     }
-    const calls = parsed_calls orelse
+    var calls = parsed_calls orelse
         (if (tools_json) |tj| try chat_mod.inferBareJsonToolCalls(allocator, text, tj) else null) orelse
         return null;
+    if (!allow_parallel and calls.len > 1) {
+        log.info("  parallel_tool_calls=false: clamping {d} parsed calls to the first\n", .{calls.len});
+        for (calls[1..]) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        const kept = calls[0];
+        allocator.free(calls);
+        const one = try allocator.alloc(chat_mod.ParsedToolCall, 1);
+        one[0] = kept;
+        calls = one;
+    }
     if (g_tool_autocorrect) {
         if (tools_json) |tj| {
             // Order matters: put a buried required param back where the schema
@@ -939,6 +1035,28 @@ pub fn serve(
     const ip_addr: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = ip4_bytes, .port = port } };
     var server = try ip_addr.listen(io, .{ .reuse_address = true });
     defer server.deinit(io);
+
+    // ── LAN sharing/discovery (src/lan.zig): started HERE — the one chokepoint
+    //    every serve path (model/headless/gen/ds4/llama) flows through — so the
+    //    advertised port is always the bound port. Bonjour being unavailable
+    //    degrades to a warning; it must never kill the server.
+    if (g_lan_share_spec != null or g_lan_discover) {
+        g_lan = lan_mod.Lan.start(allocator, .{
+            .port = port,
+            .share_spec = g_lan_share_spec,
+            .name = g_lan_name,
+            .discover = g_lan_discover,
+        }) catch |err| blk: {
+            log.warn("[lan] failed to start ({s}); LAN sharing disabled\n", .{@errorName(err)});
+            break :blk null;
+        };
+    }
+    // Runs after the conn-thread drain below (LIFO), so no tunnel is mid-pump
+    // and no request is mid-lookup when the peer table is freed.
+    defer if (g_lan) |l| {
+        g_lan = null;
+        l.shutdown();
+    };
 
     // Freeze the auto-context NOW, at startup, while the model is freshly
     // loaded and nothing else has taken RAM. Clients read this number once
@@ -1221,6 +1339,19 @@ fn handleConnection(
         return;
     }
 
+    // ── LAN sharing gate. With sharing ON and no --api-key set, a non-loopback
+    //    client gets exactly the shared inference surface: allowlisted routes
+    //    (lan.routeClass) on shared models only. With a key set, unauthorized
+    //    non-loopback requests already died above and key-holders keep full
+    //    access — so this gate only exists in keyless mode.
+    if (lanGateApplies(stream)) {
+        if (lanShareDenial(g_lan.?, registry, method, path, request_body, isTunneledRequest(request[0..header_end_pos]))) |denial| {
+            log.debug("{s} {s} -> 403 (lan: {s})\n", .{ method, path, denial });
+            try sendErrorResponse(allocator, stream, "403 Forbidden", "forbidden", denial, 403);
+            return;
+        }
+    }
+
     // ── Plan 05: routes that don't depend on a loaded model (connectivity
     //    probes + CORS preflight + listing endpoints). Handle these BEFORE
     //    `scheduler.ensureLoaded` so they don't trigger a cold load of the
@@ -1273,7 +1404,14 @@ fn handleConnection(
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
         log.debug("GET  /v1/models -> 200\n", .{});
-        try handleModels(allocator, stream);
+        // A keyless LAN peer sees only shared models and never the remote
+        // stubs (a mirrored entry would invite multi-hop loops). Peer
+        // discovery fetches self-identify with the X-MLX-LAN marker and get
+        // the SAME filtered view even over loopback — two servers on one Mac
+        // resolve each other loopback-first, and the unfiltered list leaked
+        // remote stubs into `@a@b` re-export chains (live 2026-07-21).
+        try handleModels(allocator, stream, lanGateApplies(stream) or
+            (g_lan != null and isTunneledRequest(request[0..header_end_pos])));
         return;
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.startsWith(u8, path, "/v1/responses/")) {
@@ -1336,6 +1474,20 @@ fn handleConnection(
     // just respond with whatever it has loaded; the multi-model registry's
     // strict-id semantics are opt-in by sending an id we registered.
     var requested_model_id = parseModelFromBody(request_body) orelse "";
+    // ── LAN-discovered remote model (`<id>@<peer>`) → proxy the request to
+    //    its host byte-for-byte, model field rewritten to the bare id.
+    //    Any DIRECT client may initiate the hop (loopback app, the
+    //    agent-sandbox VM over its NAT interface, LAN clients); a request
+    //    that itself arrived through a peer's tunnel never hops again —
+    //    that marker, not loopback-ness, is the multi-hop bound. A
+    //    registered LOCAL id containing '@' keeps winning via the peek; an
+    //    offline peer is an honest 404, never a silent local-default answer.
+    if (g_lan != null and lan_mod.splitRemoteId(requested_model_id) != null and
+        !isTunneledRequest(request[0..header_end_pos]) and registry.peek(requested_model_id) == null)
+    {
+        try handleLanProxy(allocator, stream, g_lan.?, method, raw_path, request_body, requested_model_id);
+        return;
+    }
     if (requested_model_id.len > 0 and !std.mem.eql(u8, requested_model_id, "mlx-serve")) {
         if (registry.peek(requested_model_id) == null) {
             // Ollama clients send tagged/short names ("qwen3.6:latest");
@@ -1629,12 +1781,12 @@ fn ollamaResolveRegistryId(io: std.Io, registry: *ModelRegistry, name: []const u
 }
 
 fn ollamaQuantOf(id: []const u8) []const u8 {
-    if (std.ascii.indexOfIgnoreCase(id, "4bit") != null) return "4bit";
-    if (std.ascii.indexOfIgnoreCase(id, "8bit") != null) return "8bit";
-    if (std.ascii.indexOfIgnoreCase(id, "bf16") != null) return "BF16";
-    if (std.ascii.indexOfIgnoreCase(id, "nvfp4") != null) return "NVFP4";
-    if (std.ascii.indexOfIgnoreCase(id, "q4") != null) return "Q4";
-    if (std.ascii.indexOfIgnoreCase(id, "q8") != null) return "Q8";
+    if (std.ascii.findIgnoreCase(id, "4bit") != null) return "4bit";
+    if (std.ascii.findIgnoreCase(id, "8bit") != null) return "8bit";
+    if (std.ascii.findIgnoreCase(id, "bf16") != null) return "BF16";
+    if (std.ascii.findIgnoreCase(id, "nvfp4") != null) return "NVFP4";
+    if (std.ascii.findIgnoreCase(id, "q4") != null) return "Q4";
+    if (std.ascii.findIgnoreCase(id, "q8") != null) return "Q8";
     return "";
 }
 
@@ -2348,6 +2500,18 @@ const ReadyCaps = struct {
     has_mesh_engine: bool = false,
 };
 
+/// Chat capability for a READY entry. Template presence is NOT the gate for
+/// embedded-engine (ds4/llama) models: a GGUF without a chat_template in its
+/// header still serves chat via fallback formatting, and gating on the
+/// template made a loaded DSV4-Flash advertise capabilities:[] — LAN clients
+/// hid the peer's model as "no chat models" while chatting on it (live
+/// 2026-07-21). The unloaded GGUF stub path already advertises the chat set
+/// unconditionally; loaded must never advertise less than its stub.
+fn readyHasChat(is_encoder_only: bool, chat_template_len: usize, has_embedded_lm: bool) bool {
+    if (is_encoder_only) return false;
+    return chat_template_len > 0 or has_embedded_lm;
+}
+
 /// `capabilities` JSON array for a ready model. Caller deinits.
 fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) {
     var caps = std.ArrayList(u8).empty;
@@ -2476,7 +2640,11 @@ fn renderModelEntry(
             try std.fmt.allocPrint(allocator, "null", .{});
         defer allocator.free(ctx_str);
 
-        const has_chat = !config.is_encoder_only and chat_config.chat_template.len > 0;
+        const has_chat = readyHasChat(
+            config.is_encoder_only,
+            chat_config.chat_template.len,
+            entry.ds4_engine != null or entry.llama_engine != null,
+        );
         const has_vision = entry.vision_encoder != null;
         const has_audio = if (entry.vision_encoder) |ve| ve.supportsAudio() else false;
         var caps = try readyCapsJson(allocator, .{
@@ -2583,7 +2751,8 @@ fn renderModelEntry(
     // same rule the loaded path uses) plus "vision" when a vision config is
     // present. Reasoning/audio stay load-gated (they need the live template /
     // encoder), so an unloaded stub may under-report those two.
-    const is_encoder_stub = std.mem.eql(u8, entry.arch_hint, "bert");
+    const is_encoder_stub = std.mem.eql(u8, entry.arch_hint, "bert") or
+        (sm.found and sm.is_encoder);
     // GGUF discovery stub (issue #59): no config.json to read StubMeta from,
     // but the embedded llama/ds4 engines always serve chat (the GGUF's own
     // template is adopted at load), so advertise the chat capability set the
@@ -2664,6 +2833,9 @@ fn renderModelEntry(
 fn handleModels(
     allocator: std.mem.Allocator,
     stream: *Conn,
+    /// True for a keyless LAN peer: list only shared models, and never the
+    /// remote stubs (mirroring a peer's peer invites multi-hop loops).
+    lan_filtered: bool,
 ) !void {
     // Plan 05 Phase E: emit every registry entry (loaded + unloaded), not
     // just the default model + flat discovery list. Default model is sorted
@@ -2701,19 +2873,42 @@ fn handleModels(
         };
         std.sort.pdq(*LoadedModel, ordered.items, default_id, Cmp.lt);
 
-        for (ordered.items, 0..) |entry, idx| {
-            if (idx > 0) try entries_buf.append(allocator, ',');
+        for (ordered.items) |entry| {
+            if (lan_filtered and !g_lan.?.sharedAllows(entry.id)) continue;
+            if (entries_buf.items.len > 0) try entries_buf.append(allocator, ',');
             const json = try renderModelEntry(allocator, stream.io, entry);
             defer allocator.free(json);
             try entries_buf.appendSlice(allocator, json);
         }
     }
 
+    // Discovered LAN models ride the same list for local clients.
+    if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
+
     const body = try std.fmt.allocPrint(allocator,
         \\{{"object":"list","data":[{s}]}}
     , .{entries_buf.items});
     defer allocator.free(body);
-    try sendResponse(stream, "200 OK", "application/json", body);
+    try sendModelsResponse(stream, body);
+}
+
+/// `/v1/models` responses carry the per-process LAN token
+/// (`X-MLX-LAN-Token`) when LAN mode is on, so a discovering server can
+/// recognize a fetch that landed on ITSELF: a stale Bonjour record of a
+/// former self (same name + port, different TXT token) walks through the
+/// resolve-time TXT check, and the loopback-first fetch would install our
+/// own models as a "peer" (live self-mirror after a restart, 2026-07-21).
+fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
+    logHttpResponse("200 OK", "application/json", body);
+    const l = g_lan orelse return sendResponseFramed(stream, "200 OK", "application/json", body);
+    if (stream.ws_mode != null) return sendResponseFramed(stream, "200 OK", "application/json", body);
+    var hdr_buf: [512]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nX-MLX-LAN-Token: {s}\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Methods: POST, GET, OPTIONS\r\nAccess-Control-Allow-Headers: Content-Type, Authorization\r\n\r\n", .{
+        body.len,
+        &l.token_hex,
+    }) catch return error.Overflow;
+    try stream.writeAll(hdr);
+    if (body.len > 0) try stream.writeAll(body);
 }
 
 /// Plan 05 Phase E: `POST /v1/load-model`. Renders a status payload for the
@@ -2746,6 +2941,20 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     } else |_| {
         requested_id = parseModelFromBody(request_body) orelse "";
     }
+    // A LAN-discovered remote id: nothing to load here — the peer loads on
+    // demand when the first proxied request arrives. Answer 200 with the
+    // mirrored entry so client flows (load → generate → unload) work
+    // unchanged on network models. Unknown peer/model falls through to
+    // ensureLoaded's honest 404.
+    if (g_lan) |l| if (lan_mod.splitRemoteId(requested_id) != null) {
+        if (l.remoteEntryFor(allocator, requested_id)) |entry| {
+            defer allocator.free(entry);
+            const body = try std.fmt.allocPrint(allocator, "{{\"model\":{s}}}", .{entry});
+            defer allocator.free(body);
+            try sendResponse(stream, "200 OK", "application/json", body);
+            return;
+        }
+    };
     // Register-by-path: an absolute path to a model directory OUTSIDE the
     // --model-dir scan (e.g. the app's auto-downloaded embedding encoder).
     // The dir is validated exactly like discovery (config.json, supported
@@ -2920,6 +3129,15 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
         requested_id = std.fs.path.basename(trimmed);
     }
 
+    // Remote ids hold no residency on THIS host — idempotent 200, matching
+    // the load-model no-op (the peer's owner controls its memory).
+    if (g_lan != null and lan_mod.splitRemoteId(requested_id) != null and
+        (global_registry == null or global_registry.?.peek(requested_id) == null))
+    {
+        try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
+        return;
+    }
+
     scheduler.unloadModel(requested_id) catch |err| switch (err) {
         error.UnknownModelId => {
             try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
@@ -3069,7 +3287,11 @@ fn handleStatusPage(
     _ = mlx.mlx_get_active_memory(&active_mem);
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const ctx_len = getEffectiveContextLength(config);
-    const has_chat = !config.is_encoder_only and chat_config.chat_template.len > 0;
+    const has_chat = readyHasChat(
+        config.is_encoder_only,
+        chat_config.chat_template.len,
+        lm.ds4_engine != null or lm.llama_engine != null,
+    );
     const has_vision = lm.vision_encoder != null;
     const has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template);
 
@@ -3157,6 +3379,46 @@ fn htmlEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
         else => try buf.append(allocator, c),
     };
     return try buf.toOwnedSlice(allocator);
+}
+
+/// `<bos> ids <eos>` for bidirectional embedding models. Either special is
+/// skipped when unknown; already-wrapped input is not double-wrapped.
+fn wrapEncoderIds(allocator: std.mem.Allocator, ids: []const u32, bos: ?u32, eos: ?u32) ![]u32 {
+    const need_bos = bos != null and (ids.len == 0 or ids[0] != bos.?);
+    const need_eos = eos != null and (ids.len == 0 or ids[ids.len - 1] != eos.?);
+    const out = try allocator.alloc(u32, ids.len + @intFromBool(need_bos) + @intFromBool(need_eos));
+    var i: usize = 0;
+    if (need_bos) {
+        out[i] = bos.?;
+        i += 1;
+    }
+    @memcpy(out[i .. i + ids.len], ids);
+    i += ids.len;
+    if (need_eos) out[i] = eos.?;
+    return out;
+}
+
+test "wrapEncoderIds: <bos> … <eos> wrapping for embedding models" {
+    const a = testing.allocator;
+    // EmbeddingGemma shape: bos 2, eos 1.
+    const wrapped = try wrapEncoderIds(a, &.{ 10, 11, 12 }, 2, 1);
+    defer a.free(wrapped);
+    try testing.expectEqualSlices(u32, &.{ 2, 10, 11, 12, 1 }, wrapped);
+
+    // Missing specials are skipped, never invented.
+    const no_bos = try wrapEncoderIds(a, &.{ 10, 11 }, null, 1);
+    defer a.free(no_bos);
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 1 }, no_bos);
+
+    // Already-wrapped input is left alone (idempotent).
+    const already = try wrapEncoderIds(a, &.{ 2, 10, 1 }, 2, 1);
+    defer a.free(already);
+    try testing.expectEqualSlices(u32, &.{ 2, 10, 1 }, already);
+
+    // Empty input still gets both specials.
+    const empty = try wrapEncoderIds(a, &.{}, 2, 1);
+    defer a.free(empty);
+    try testing.expectEqualSlices(u32, &.{ 2, 1 }, empty);
 }
 
 fn handleEmbeddings(
@@ -3247,7 +3509,19 @@ fn handleEmbeddings(
         seqs.deinit(allocator);
     }
     for (texts.items) |text| {
-        const ids = try tok.encode(allocator, text);
+        const raw_ids = try tok.encode(allocator, text);
+        // Bidirectional embedding models (EmbeddingGemma) declare
+        // add_bos_token + add_eos_token; the SentencePiece encode path adds
+        // neither, so wrap here. BERT's [CLS]/[SEP] come from WordPiece itself.
+        const ids = if (config.use_bidirectional_attention) blk: {
+            defer allocator.free(raw_ids);
+            break :blk try wrapEncoderIds(
+                allocator,
+                raw_ids,
+                config.bos_token_id,
+                if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null,
+            );
+        } else raw_ids;
         total_tokens += ids.len;
         try seqs.append(allocator, ids);
     }
@@ -3464,6 +3738,46 @@ fn handleDetokenize(
     try sendResponse(stream, "200 OK", "application/json", result.items);
 }
 
+/// OpenAI `n` (choice count): this is a single-choice engine and n>1 is
+/// deliberately unimplemented (YAGNI — no agent client sends it). Silently
+/// returning one choice for n=2 is the silent-no-op class llmprobe flags;
+/// reject with an honest 400 instead. Absent, null, 1, or 1.0 all mean
+/// "one choice" and pass.
+/// jsonEscape with an OOM fallback to the literal `""`. Ownership is reported
+/// by PROVENANCE (`owned`), never inferred from content — escaping an empty
+/// string also yields `""` but that one is allocated (2-byte leak per
+/// all-reasoning request under the old content-equality defer).
+const EscapedText = struct { slice: []const u8, owned: bool };
+fn jsonEscapeOrEmpty(allocator: std.mem.Allocator, text: []const u8) EscapedText {
+    const s = jsonEscape(allocator, text) catch return .{ .slice = "\"\"", .owned = false };
+    return .{ .slice = s, .owned = true };
+}
+
+const ReasoningEffort = struct { enable: bool, budget: i32 };
+
+/// OpenAI-standard `reasoning_effort` on chat/completions (none | minimal |
+/// low | medium | high | xhigh — values are model-dependent, so unknown
+/// strings still enable). "none" is an explicit off (the gpt-5.1 default
+/// spelling). Absent or non-string → null: the vendor `enable_thinking` bool
+/// stays in charge and existing clients see zero behavior change.
+fn parseReasoningEffort(root: std.json.ObjectMap, default_budget: i32) ?ReasoningEffort {
+    const v = root.get("reasoning_effort") orelse return null;
+    if (v != .string) return null;
+    if (std.mem.eql(u8, v.string, "none")) return .{ .enable = false, .budget = default_budget };
+    return .{ .enable = true, .budget = responses_mod.effortBudget(v.string, default_budget) };
+}
+
+fn nChoicesRejectReason(root: std.json.ObjectMap) ?[]const u8 {
+    const v = root.get("n") orelse return null;
+    switch (v) {
+        .null => return null,
+        .integer => |i| if (i == 1) return null,
+        .float => |f| if (f == 1.0) return null,
+        else => {},
+    }
+    return "'n' > 1 is not supported: this server returns a single choice per request; omit 'n' or set it to 1";
+}
+
 fn handleChatCompletions(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -3494,6 +3808,12 @@ fn handleChatCompletions(
         return;
     }
     const root = parsed.value.object;
+
+    if (nChoicesRejectReason(root)) |reason| {
+        log.warn("POST /v1/chat/completions -> 400 (unsupported n)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
 
     // Extract messages
     const messages_val = root.get("messages") orelse {
@@ -3690,6 +4010,13 @@ fn handleChatCompletions(
         if (tool_choice_instruction) |tci| allocator.free(tci);
     };
 
+    // OpenAI parallel_tool_calls: only an explicit false clamps to one call
+    // per response (the SDK sets false in strict structured-output mode).
+    const allow_parallel_tools = if (root.get("parallel_tool_calls")) |v|
+        !(v == .bool and !v.bool)
+    else
+        true;
+
     if (has_tools) {
         // Parse tool_choice: "none" | "auto" | "required" | {"type":"function","function":{"name":"..."}}
         if (root.get("tool_choice")) |tc| {
@@ -3826,15 +4153,21 @@ fn handleChatCompletions(
         break :blk false;
     } else false;
 
-    // Parse enable_thinking (default: false — strips <think> blocks from output)
-    const enable_thinking = if (root.get("enable_thinking")) |v| v == .bool and v.bool else false;
+    // Thinking opt-ins: the OpenAI-standard `reasoning_effort` string and the
+    // vendor `enable_thinking` bool (Qwen/vLLM chat_template_kwargs family).
+    // Either switch turns thinking on; effort "none" alone never does.
+    // Default: off — strips <think> blocks from output.
+    const effort_cfg = parseReasoningEffort(root, server_config.default_reasoning_budget);
+    const enable_thinking = (if (root.get("enable_thinking")) |v| v == .bool and v.bool else false) or
+        (if (effort_cfg) |e| e.enable else false);
 
-    // Parse reasoning_budget_tokens: max tokens in <think> block (-1 = unlimited)
-    // Per-request override, falls back to server --reasoning-budget flag
+    // Reasoning budget (max tokens in <think> block, -1 = unlimited):
+    // explicit reasoning_budget_tokens > effort-mapped budget > --reasoning-budget flag
+    const effort_budget: i32 = if (effort_cfg) |e| e.budget else server_config.default_reasoning_budget;
     const reasoning_budget: i32 = if (root.get("reasoning_budget_tokens")) |v| switch (v) {
         .integer => |i| @intCast(i),
-        else => server_config.default_reasoning_budget,
-    } else server_config.default_reasoning_budget;
+        else => effort_budget,
+    } else effort_budget;
 
     // Wave 1.A: per-request KV-quant override. When unset, falls back to the
     // process-level --kv-quant default carried on the scheduler. Cross-scheme
@@ -4086,7 +4419,7 @@ fn handleChatCompletions(
     const sub_mrope = local_mrope;
     local_mrope = .{}; // ownership transferred to the sub-handler → slot
     if (is_stream) {
-        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, include_usage, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             // Send SSE error event so the client gets a proper error instead of a dropped connection
             const err_chunk = std.fmt.allocPrint(allocator,
@@ -4097,7 +4430,7 @@ fn handleChatCompletions(
             stream.writeAll("\n\ndata: [DONE]\n\n") catch {};
         };
     } else {
-        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
+        handleNonStreamingGeneration(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, logprobs_n, enable_thinking, reasoning_budget, enable_pld, enable_drafter, enable_mtp, sub_ve, sub_mrope, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", @errorName(err), 500) catch {};
         };
@@ -4125,6 +4458,12 @@ fn handleCompletions(
         return;
     }
     const root = parsed.value.object;
+
+    if (nChoicesRejectReason(root)) |reason| {
+        log.warn("POST /v1/completions -> 400 (unsupported n)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+        return;
+    }
 
     // Extract prompt (required)
     const prompt_text = if (root.get("prompt")) |v|
@@ -4358,8 +4697,9 @@ fn handleNonStreamingCompletion(
         result.prompt_tokens, result.completion_tokens, elapsed_ms, perf, finish_reason,
     });
 
-    const escaped_text = jsonEscape(allocator, final_text) catch "\"\"";
-    defer if (!std.mem.eql(u8, escaped_text, "\"\"")) allocator.free(escaped_text);
+    const escaped = jsonEscapeOrEmpty(allocator, final_text);
+    const escaped_text = escaped.slice;
+    defer if (escaped.owned) allocator.free(escaped.slice);
 
     const response = try std.fmt.allocPrint(allocator,
         \\{{"id":"cmpl-{d}","object":"text_completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"text":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}}}
@@ -4708,6 +5048,9 @@ fn handleNonStreamingGeneration(
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
     tools_json: ?[]const u8,
+    /// false = client set parallel_tool_calls:false (Anthropic:
+    /// tool_choice.disable_parallel_tool_use) — at most one call per response.
+    allow_parallel_tools: bool,
     logprobs_n: u32,
     enable_thinking: bool,
     reasoning_budget: i32,
@@ -4809,7 +5152,7 @@ fn handleNonStreamingGeneration(
     // Check for tool calls in the output
     if (has_tools) {
         log.debug("  checking {d} bytes of generated text for tool calls\n", .{final_text.len});
-        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json);
+        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -4867,8 +5210,11 @@ fn handleNonStreamingGeneration(
                 try allocator.alloc(u8, 0);
             defer allocator.free(tc_timings_field);
 
+            const tc_usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, "");
+            defer allocator.free(tc_usage_obj);
+
             const response = try std.fmt.allocPrint(allocator,
-                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}{s}}}
+                \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":null{s},"tool_calls":{s}}},"finish_reason":"{s}"}}],"usage":{s}{s}}}
             , .{
                 nowMs(stream.io),
                 nowSecs(stream.io),
@@ -4876,9 +5222,7 @@ fn handleNonStreamingGeneration(
                 tc_reasoning_json,
                 tc_buf.items,
                 toolCallFinishReason(finish_reason),
-                result.prompt_tokens,
-                result.completion_tokens,
-                result.prompt_tokens + result.completion_tokens,
+                tc_usage_obj,
                 tc_timings_field,
             });
             defer allocator.free(response);
@@ -4897,8 +5241,9 @@ fn handleNonStreamingGeneration(
     const think_split = chat_mod.splitThinkBlock(final_text, enable_thinking, opens_think);
     const content_text = if (enable_thinking) think_split.content else chat_mod.stripThinkBlock(final_text);
 
-    const escaped_text = jsonEscape(allocator, content_text) catch "\"\"";
-    defer if (!std.mem.eql(u8, escaped_text, "\"\"")) allocator.free(escaped_text);
+    const escaped = jsonEscapeOrEmpty(allocator, content_text);
+    const escaped_text = escaped.slice;
+    defer if (escaped.owned) allocator.free(escaped.slice);
 
     // Build logprobs JSON if requested
     var logprobs_json: []const u8 = "null";
@@ -4942,8 +5287,11 @@ fn handleNonStreamingGeneration(
         try allocator.alloc(u8, 0);
     defer allocator.free(timings_field);
 
+    const usage_obj = try formatChatUsage(allocator, result.prompt_tokens, result.completion_tokens, result.cached_tokens, usage_details_json);
+    defer allocator.free(usage_obj);
+
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}{s}}}{s}}}
+        \\{{"id":"chatcmpl-{d}","object":"chat.completion","created":{d},"model":"{s}","system_fingerprint":"mlx-serve","choices":[{{"index":0,"message":{{"role":"assistant","content":{s}{s}}},"logprobs":{s},"finish_reason":"{s}"}}],"usage":{s}{s}}}
     , .{
         nowMs(stream.io),
         nowSecs(stream.io),
@@ -4952,10 +5300,7 @@ fn handleNonStreamingGeneration(
         reasoning_json,
         logprobs_json,
         finish_reason,
-        result.prompt_tokens,
-        result.completion_tokens,
-        result.prompt_tokens + result.completion_tokens,
-        usage_details_json,
+        usage_obj,
         timings_field,
     });
     defer allocator.free(response);
@@ -5263,6 +5608,9 @@ fn handleStreamingGeneration(
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
     tools_json: ?[]const u8,
+    /// false = client set parallel_tool_calls:false (Anthropic:
+    /// tool_choice.disable_parallel_tool_use) — at most one call per response.
+    allow_parallel_tools: bool,
     logprobs_n: u32,
     enable_thinking: bool,
     reasoning_budget: i32,
@@ -5698,7 +6046,7 @@ fn handleStreamingGeneration(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json);
+        const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -5803,9 +6151,7 @@ fn handleStreamingGeneration(
         // Usage chunk (if requested via stream_options.include_usage). Scheduler
         // accounts for any prompt-cache hits in `ts.prompt_tokens` directly.
         if (include_usage) {
-            const usage_json = try std.fmt.allocPrint(allocator,
-                \\{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d}}}
-            , .{ total_prompt, ts.completion_tokens, total_prompt + ts.completion_tokens });
+            const usage_json = try formatChatUsage(allocator, total_prompt, ts.completion_tokens, ts.cached_tokens, "");
             defer allocator.free(usage_json);
             const timings_obj = try formatTimingsObject(allocator, total_prompt, ts.cached_tokens, ts.completion_tokens, ts.prefill_ns, ts.decode_ns, tokenize_ns);
             defer allocator.free(timings_obj);
@@ -6083,9 +6429,10 @@ fn ipIsLoopback(addr: std.Io.net.IpAddress) bool {
         .ip4 => |a4| a4.bytes[0] == 127, // 127.0.0.0/8
         .ip6 => |a6| blk: {
             const b = a6.bytes; // big-endian 16 bytes
-            const zeros10 = [_]u8{0} ** 10;
+            const zeros10: [10]u8 = @splat(0);
             // ::1
-            if (std.mem.eql(u8, b[0..15], &([_]u8{0} ** 15)) and b[15] == 1) break :blk true;
+            const zeros15: [15]u8 = @splat(0);
+            if (std.mem.eql(u8, b[0..15], &zeros15) and b[15] == 1) break :blk true;
             // ::ffff:127.x.x.x  (IPv4-mapped loopback)
             if (std.mem.eql(u8, b[0..10], &zeros10) and b[10] == 0xff and b[11] == 0xff and b[12] == 127) break :blk true;
             break :blk false;
@@ -6095,6 +6442,111 @@ fn ipIsLoopback(addr: std.Io.net.IpAddress) bool {
 
 fn peerIsLoopback(conn: *const Conn) bool {
     return ipIsLoopback(conn.stream.socket.address);
+}
+
+/// True when the LAN-share gate governs this request: sharing on, keyless
+/// mode (a configured --api-key already gated non-loopback traffic), and the
+/// client is not local.
+fn lanGateApplies(stream: *const Conn) bool {
+    const l = g_lan orelse return false;
+    return l.sharing() and g_api_key == null and !peerIsLoopback(stream);
+}
+
+/// True when this request arrived through another mlx-serve's LAN tunnel
+/// (`lan.tunnel` stamps `X-MLX-LAN: 1` on every request it forwards).
+/// Tunneled requests are never proxied again — THAT is the multi-hop bound
+/// (depth 1 by construction), so proxying no longer keys on loopback-ness:
+/// any direct client (the local app, the agent-sandbox VM arriving over the
+/// NAT interface, a phone on the LAN) may initiate the single hop.
+fn isTunneledRequest(raw_headers: []const u8) bool {
+    return findHeaderValueCI(raw_headers, "x-mlx-lan") != null;
+}
+
+/// LAN-share gate decision for one non-loopback request; null = allowed.
+/// The effective model resolves exactly like dispatch will (unknown/absent
+/// ids fall back to the default model), so the gate can never disagree with
+/// what would actually run.
+fn lanShareDenial(l: *lan_mod.Lan, registry: *ModelRegistry, method: []const u8, path: []const u8, body: []const u8, tunneled: bool) ?[]const u8 {
+    switch (lan_mod.routeClass(method, path)) {
+        .open => return null,
+        .denied => return "This endpoint is host-local; LAN sharing exposes inference on shared models only",
+        .model_gated => {},
+    }
+    const mid = parseModelFromBody(body) orelse "";
+    if (lan_mod.splitRemoteId(mid) != null and registry.peek(mid) == null) {
+        // A remote (@peer) id from a DIRECT client is allowed — dispatch
+        // proxies exactly one hop and the peer's own gate governs its model
+        // (the old blanket deny also 403'd the agent-sandbox guest, which is
+        // non-loopback by construction; live 2026-07-21). A request that
+        // arrived through a peer's tunnel never hops again.
+        if (tunneled) return "Remote (@peer) model ids cannot be proxied onward — ask that peer directly";
+        return null;
+    }
+    const effective = if (mid.len > 0 and !std.mem.eql(u8, mid, "mlx-serve") and registry.peek(mid) != null)
+        mid
+    else
+        registry.default_id;
+    if (!l.sharedAllows(effective)) return "Model not shared on this host";
+    return null;
+}
+
+/// How long a proxied request waits for discovery to converge before the
+/// honest "peer offline" 404. Covers a local restart's cold peer table AND a
+/// peer Mac mid-reboot/redeploy: the peer needs to boot, advertise, and be
+/// re-fetched — seconds, not milliseconds. A genuinely dead peer costs the
+/// client this long once; an unlisted model or discovery-off never waits.
+const LAN_PEER_WAIT_MS: i64 = 15_000;
+
+/// Proxy a request naming `<bare>@<peer>` to that peer (lan.tunnel). The
+/// failure modes are deliberately distinct — the live bite was one instant
+/// "peer offline" 404 covering all three:
+///   • discovery off on THIS server → say so (a share-only boot can never
+///     resolve a peer, and "offline" sent the user debugging the wrong Mac);
+///   • peer known but model unlisted → fail fast, honestly;
+///   • peer unknown → poke discovery and wait up to LAN_PEER_WAIT_MS
+///     (client disconnect abandons the wait), then 404.
+/// 502 when the peer resolves but stops accepting. Never a silent fallback
+/// to the local default model.
+fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, method: []const u8, raw_path: []const u8, body: []const u8, full_id: []const u8) !void {
+    // Swift/PHP clients escape '/' as '\/', so the raw body slice can read
+    // `ddalcu\/gemma…@peer` while the peer table stores the canonical id
+    // (live 404 "no longer shares this model" from the app). Look up with
+    // the CANONICAL form — and splice the canonical bare id into the
+    // forwarded body too, or the peer's own scanner would miss it and
+    // silently serve its default model.
+    var canon_buf: [512]u8 = undefined;
+    const canon = lan_mod.unescapeJsonSlashes(&canon_buf, full_id);
+    const rid = lan_mod.splitRemoteId(canon).?;
+    if (!l.discover) {
+        try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "This id names a LAN peer's model, but LAN discovery is off on this server — start it with --lan-discover (app: Settings > LAN Sharing > Use models shared by other Macs)", 404);
+        return;
+    }
+    const deadline = nowMsMonotonic(stream.io) + LAN_PEER_WAIT_MS;
+    const remote: lan_mod.Remote = remote: while (true) {
+        switch (l.lookupRemote(canon)) {
+            .found => |r| break :remote r,
+            .model_unlisted => {
+                try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "The LAN peer no longer shares this model", 404);
+                return;
+            },
+            .peer_unknown => {
+                if (nowMsMonotonic(stream.io) >= deadline) {
+                    try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "LAN peer for this model is offline (waited 15 s for discovery)", 404);
+                    return;
+                }
+                if (stream.peerClosed()) return; // client gave up while we waited
+                l.pokeDiscovery();
+                const ts = std.c.timespec{ .sec = 0, .nsec = 250_000_000 };
+                _ = std.c.nanosleep(&ts, null);
+            },
+        }
+    };
+    const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, rid.bare);
+    defer allocator.free(rewritten);
+    log.info("[lan] proxy {s} {s} -> \"{s}\" @ {d}.{d}.{d}.{d}:{d}\n", .{ method, raw_path, rid.peer, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port });
+    lan_mod.tunnel(remote, method, raw_path, rewritten, stream) catch {
+        try sendErrorResponse(allocator, stream, "502 Bad Gateway", "lan_peer_unreachable", "LAN peer did not accept the connection", 502);
+    };
 }
 
 /// Case-insensitive HTTP header lookup in the raw header block. `name_lower`
@@ -6212,6 +6664,61 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
     // No key configured ⇒ always authorized (open mode)
     g_api_key = null;
     try std.testing.expect(apiKeyAuthorized("", "/v1/chat/completions"));
+}
+
+test "lanShareDenial: shared inference surface only, resolved like dispatch" {
+    const a = std.testing.allocator;
+    const reg = try ModelRegistry.init(a, std.Io.Threaded.global_single_threaded.io(), null, 8, 0, null);
+    defer reg.deinit();
+    const shared_entry = try reg.registerStub("gemma-4-e4b-it-4bit", "/m/g", 1);
+    _ = try reg.registerStub("qwen3.6-27b", "/m/q", 1);
+    reg.default_id = shared_entry.id;
+
+    var l = lan_mod.Lan{
+        .alloc = a,
+        .port = 0,
+        .discover = false,
+        .peers = .init(a),
+        .known = .init(a),
+        .share = try lan_mod.SharedSet.parse(a, "gemma-4-e4b-it-4bit"),
+    };
+    defer {
+        l.share.?.deinit(a);
+        l.peers.deinit();
+        l.known.deinit();
+    }
+
+    // Open routes pass with no model check; host-local ones are denied.
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/health", "", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/v1/models", "", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "OPTIONS", "/v1/messages", "", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/load-model", "{}", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/metrics", "", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "GET", "/", "", false) != null);
+
+    // Shared model allowed; unshared denied — on chat AND media surfaces.
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"gemma-4-e4b-it-4bit\"}", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{\"model\":\"qwen3.6-27b\"}", false) != null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/images/generations", "{\"model\":\"qwen3.6-27b\"}", false) != null);
+
+    // Omitted / unknown ids resolve to the default model exactly like
+    // dispatch will — here the default is shared, so both pass.
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/chat/completions", "{}", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"gpt-4\"}", false) == null);
+
+    // @peer ids: a DIRECT client (not tunneled) may initiate the single hop —
+    // the old blanket deny also 403'd the agent-sandbox guest, which reaches
+    // this host over the VM NAT interface (live 2026-07-21). A request that
+    // ARRIVED through a peer's tunnel never hops again (the multi-hop bound).
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", false) == null);
+    try std.testing.expect(lanShareDenial(&l, reg, "POST", "/v1/messages", "{\"model\":\"x@peer\"}", true) != null);
+}
+
+test "isTunneledRequest keys on the lan.tunnel marker header, case-insensitive" {
+    try std.testing.expect(isTunneledRequest("X-MLX-LAN: 1\r\n"));
+    try std.testing.expect(isTunneledRequest("x-mlx-lan: 1\r\n"));
+    try std.testing.expect(!isTunneledRequest("Content-Type: application/json\r\n"));
+    try std.testing.expect(!isTunneledRequest(""));
 }
 
 test "ipIsLoopback exempts local addresses only" {
@@ -6367,6 +6874,25 @@ fn cachedFormatChat(
         };
     };
     return ids;
+}
+
+/// The chat-completions `usage` object, shared by the non-stream, tool-call
+/// and streaming-final-chunk emitters so the shape never drifts per path.
+/// `prompt_tokens_details.cached_tokens` is ALWAYS present (0 when cold) —
+/// OpenAI emits it unconditionally, and black-box conformance/cost tooling
+/// (llmprobe) treats a missing field as "no prompt caching" even though the
+/// engine caches. `extra_details` is a pre-formatted `,"key":{...}` fragment
+/// (completion_tokens_details) or "".
+fn formatChatUsage(
+    allocator: std.mem.Allocator,
+    prompt_tokens: u32,
+    completion_tokens: u32,
+    cached_tokens: u32,
+    extra_details: []const u8,
+) ![]u8 {
+    return try std.fmt.allocPrint(allocator,
+        \\{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d},"prompt_tokens_details":{{"cached_tokens":{d}}}{s}}}
+    , .{ prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens, extra_details });
 }
 
 fn formatTimingsObject(
@@ -7223,6 +7749,15 @@ fn mapFinishToStopReason(finish_reason: []const u8) []const u8 {
     return "end_turn";
 }
 
+/// Anthropic stop_reason with the client-stop-sequence case: a matched stop
+/// sequence reports "stop_sequence" (callers learn WHICH stop fired via the
+/// echoed `stop_sequence` field) — but only over a plain "stop"; it never
+/// masks a max_tokens truncation or a parsed tool call.
+fn anthropicStopReason(finish_reason: []const u8, matched_stop_seq: ?[]const u8) []const u8 {
+    if (matched_stop_seq != null and std.mem.eql(u8, finish_reason, "stop")) return "stop_sequence";
+    return mapFinishToStopReason(finish_reason);
+}
+
 /// Serialize a std.json.Value to JSON text, appending to buf.
 fn serializeJsonValue(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), value: std.json.Value) !void {
     switch (value) {
@@ -7577,6 +8112,7 @@ fn handleAnthropicMessages(
     var tools_json_allocated = false;
     defer if (tools_json_allocated) allocator.free(tools_json.?);
     var has_tools = false;
+    var allow_parallel_tools = true;
     var tool_choice_instruction: ?[]const u8 = null;
     var tool_choice_allocated = false;
     defer if (tool_choice_allocated) {
@@ -7593,6 +8129,10 @@ fn handleAnthropicMessages(
             // Parse tool_choice
             if (root.get("tool_choice")) |tc| {
                 if (tc == .object) {
+                    // Anthropic spelling of the parallel clamp.
+                    if (tc.object.get("disable_parallel_tool_use")) |d| {
+                        if (d == .bool and d.bool) allow_parallel_tools = false;
+                    }
                     const tc_type = if (tc.object.get("type")) |t| (if (t == .string) t.string else "auto") else "auto";
                     if (std.mem.eql(u8, tc_type, "none")) {
                         has_tools = false;
@@ -7755,7 +8295,7 @@ fn handleAnthropicMessages(
     const sub_ve = local_ve;
     local_ve = null;
     if (is_stream) {
-        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> streaming error: {}\n", .{err});
             const err_data = std.fmt.allocPrint(allocator,
                 \\{{"type":"error","error":{{"type":"api_error","message":"Internal server error: {s}"}}}}
@@ -7764,7 +8304,7 @@ fn handleAnthropicMessages(
             sendAnthropicEvent(stream, "error", err_data) catch {};
         };
     } else {
-        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
+        handleAnthropicNonStreaming(allocator, stream, lm, tok, prompt_ids, effective_max_tokens, sampling, eos_slice, stop_sequences.items, model_name, has_tools, tools_json, allow_parallel_tools, enable_thinking, reasoning_budget, @intCast(prompt_ids.len), enable_pld, enable_drafter, enable_mtp, sub_ve, kv_quant_override, tokenize_ns) catch |err| {
             log.err("  -> 500 ({s})\n", .{@errorName(err)});
             sendAnthropicError(allocator, stream, "api_error", @errorName(err), 500) catch {};
         };
@@ -7786,6 +8326,9 @@ fn handleAnthropicNonStreaming(
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
     tools_json: ?[]const u8,
+    /// false = client set parallel_tool_calls:false (Anthropic:
+    /// tool_choice.disable_parallel_tool_use) — at most one call per response.
+    allow_parallel_tools: bool,
     enable_thinking: bool,
     reasoning_budget: i32,
     prompt_token_count: u32,
@@ -7832,13 +8375,16 @@ fn handleAnthropicNonStreaming(
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
 
-    // Apply stop sequences
+    // Apply stop sequences; remember WHICH one matched (Anthropic reports it
+    // as stop_reason "stop_sequence" + the echoed `stop_sequence` field).
     var final_text: []const u8 = result.text;
     var finish_reason = result.finish_reason;
+    var matched_stop_seq: ?[]const u8 = null;
     for (stop_sequences) |stop_seq| {
         if (std.mem.indexOf(u8, final_text, stop_seq)) |idx| {
             final_text = final_text[0..idx];
             finish_reason = "stop";
+            matched_stop_seq = stop_seq;
             break;
         }
     }
@@ -7893,7 +8439,7 @@ fn handleAnthropicNonStreaming(
 
     // Check for tool calls
     if (has_tools) {
-        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json);
+        const found_calls = try parseToolCallsForRequest(allocator, final_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| {
@@ -7949,7 +8495,11 @@ fn handleAnthropicNonStreaming(
 
     try content.append(allocator, ']');
 
-    const stop_reason = mapFinishToStopReason(finish_reason);
+    const stop_reason = anthropicStopReason(finish_reason, matched_stop_seq);
+    // Echo the matched sequence exactly when the reason is "stop_sequence".
+    const echo_stop_seq = std.mem.eql(u8, stop_reason, "stop_sequence");
+    const stop_seq_json: []const u8 = if (echo_stop_seq) try jsonEscape(allocator, matched_stop_seq.?) else "null";
+    defer if (echo_stop_seq) allocator.free(stop_seq_json);
     var perf_buf: [160]u8 = undefined;
     const perf = formatPerfBracket(&perf_buf, result.prompt_tokens, result.cached_tokens, result.completion_tokens, result.prefill_ns, result.decode_ns);
     log.info("  <- {d}+{d} tokens ({d}ms) [{s}] [{s}]\n", .{
@@ -7969,12 +8519,13 @@ fn handleAnthropicNonStreaming(
     defer allocator.free(timings_field);
 
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}{s}}}
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}{s}}}
     , .{
         nowMs(stream.io),
         content.items,
         model_name,
         stop_reason,
+        stop_seq_json,
         prompt_token_count,
         result.completion_tokens,
         result.cached_tokens,
@@ -7999,6 +8550,9 @@ fn handleAnthropicStreaming(
     /// OpenAI-shape tools JSON (for bare-args tool-call inference); null when
     /// the request defined no tools.
     tools_json: ?[]const u8,
+    /// false = client set parallel_tool_calls:false (Anthropic:
+    /// tool_choice.disable_parallel_tool_use) — at most one call per response.
+    allow_parallel_tools: bool,
     enable_thinking: bool,
     reasoning_budget: i32,
     prompt_token_count: u32,
@@ -8115,6 +8669,7 @@ fn handleAnthropicStreaming(
         token_texts.deinit(allocator);
     }
     var stopped = false;
+    var matched_stop_seq: ?[]const u8 = null;
     var client_gone = false;
     var utf8_carry: [3]u8 = undefined;
     var utf8_carry_len: u8 = 0;
@@ -8179,11 +8734,13 @@ fn handleAnthropicStreaming(
             try text_buf.appendSlice(allocator, token_text);
         }
 
-        // Stop sequences
+        // Stop sequences; remember WHICH one matched (reported as stop_reason
+        // "stop_sequence" + the echoed `stop_sequence` field in message_delta).
         if (stop_sequences.len > 0) {
             for (stop_sequences) |stop_seq| {
                 if (std.mem.indexOf(u8, text_buf.items, stop_seq) != null) {
                     stopped = true;
+                    matched_stop_seq = stop_seq;
                     break;
                 }
             }
@@ -8448,7 +9005,7 @@ fn handleAnthropicStreaming(
         const norm_owned = try chat_mod.normalizeEmbeddedThinkBlocks(allocator, text_buf.items);
         defer if (norm_owned) |n| allocator.free(n);
         const gen_text: []const u8 = norm_owned orelse text_buf.items;
-        const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json);
+        const found_calls = try parseToolCallsForRequest(allocator, gen_text, tools_json, allow_parallel_tools);
         if (found_calls) |tool_calls| {
             defer {
                 for (tool_calls) |tc| { allocator.free(tc.name); allocator.free(tc.arguments); }
@@ -8564,7 +9121,10 @@ fn handleAnthropicStreaming(
     }
 
     const total_prompt = ts.prompt_tokens;
-    const stop_reason = mapFinishToStopReason(finish_reason);
+    const stop_reason = anthropicStopReason(finish_reason, matched_stop_seq);
+    const echo_stop_seq = std.mem.eql(u8, stop_reason, "stop_sequence");
+    const stop_seq_json: []const u8 = if (echo_stop_seq) try jsonEscape(allocator, matched_stop_seq.?) else "null";
+    defer if (echo_stop_seq) allocator.free(stop_seq_json);
 
     if (!client_gone) {
         // Close text block if open
@@ -8591,8 +9151,8 @@ fn handleAnthropicStreaming(
         // message_delta usage into the final message per Anthropic semantics.
         {
             const md = try std.fmt.allocPrint(allocator,
-                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":null}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
-            , .{ stop_reason, ts.completion_tokens, ts.cached_tokens });
+                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
+            , .{ stop_reason, stop_seq_json, ts.completion_tokens, ts.cached_tokens });
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
@@ -9600,7 +10160,7 @@ fn handleResponses(
 
     var tool_calls: ?[]chat_mod.ParsedToolCall = null;
     if (active_has_tools) {
-        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json);
+        tool_calls = try parseToolCallsForRequest(allocator, final_text, active_tools_json, parallel_tool_calls_echo);
     }
     defer if (tool_calls) |tcs| {
         for (tcs) |tc| {
@@ -11642,7 +12202,7 @@ test "parseToolCallsForRequest coerces args to the schema (server-side chokepoin
     ;
     const text = "<tool_call>\n<function=Edit>\n<parameter=replace_all>\nFalse\n</parameter>\n" ++
         "<parameter=file_path>\n/tmp/x\n</parameter>\n</function>\n</tool_call>";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -11656,7 +12216,7 @@ test "parseToolCallsForRequest coerces args to the schema (server-side chokepoin
     try std.testing.expect(ra == .bool); // coerced from the STRING "False"
     try std.testing.expectEqual(false, ra.bool);
     // Null tools_json path must still parse (no coercion, no crash).
-    const calls2 = try parseToolCallsForRequest(allocator, text, null);
+    const calls2 = try parseToolCallsForRequest(allocator, text, null, true);
     defer if (calls2) |cs| {
         for (cs) |tc| {
             allocator.free(tc.name);
@@ -11682,7 +12242,7 @@ test "parseToolCallsForRequest hoists a misplaced required param (server-side ch
     const text = "<tool_call>{\"name\":\"edit\",\"arguments\":{\"edits\":[{\"newText\":\"new\",\"oldText\":\"old\"," ++
         "\"path\":\"us_presidents/generate_site.sh\"}]}}</tool_call>";
 
-    const calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -11701,7 +12261,7 @@ test "parseToolCallsForRequest hoists a misplaced required param (server-side ch
     // (unlike the inferred-name filter, which corrects our own heuristic).
     g_tool_autocorrect = false;
     defer g_tool_autocorrect = true;
-    const raw_calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    const raw_calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
     defer {
         for (raw_calls) |tc| {
             allocator.free(tc.name);
@@ -11729,7 +12289,7 @@ test "parseToolCallsForRequest: --no-tool-autocorrect leaves args verbatim" {
 
     g_tool_autocorrect = false;
     defer g_tool_autocorrect = true; // restore the default for other tests
-    const calls = (try parseToolCallsForRequest(allocator, text, tools)).?;
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)).?;
     defer {
         for (calls) |tc| {
             allocator.free(tc.name);
@@ -11764,7 +12324,7 @@ test "parseToolCallsForRequest: truncated DATA object is not promoted to a tool 
         "presidents = [\n" ++
         "  {\"name\": \"George Washington\", \"num\": 1, \"party\": \"None (Federalist-leaning)\", \"term\": \"1789\u{2013}1797\", \"vice\": \"John Adams\"},\n" ++
         "  {\"name\": \"John Adams\", \"num\": 2, \"party\": \"Federalist\",";
-    const calls = try parseToolCallsForRequest(allocator, text, tools);
+    const calls = try parseToolCallsForRequest(allocator, text, tools, true);
     defer if (calls) |cs| {
         for (cs) |tc| {
             allocator.free(tc.name);
@@ -11784,7 +12344,7 @@ test "parseToolCallsForRequest: raw-JSON call with a DECLARED name still parses"
         \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"},"content":{"type":"string"}},"required":["path","content"]}}}]
     ;
     const text = "```json\n{\"name\": \"write\", \"arguments\": {\"path\": \"a.txt\", \"content\": \"hi\"}}\n```";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools)) orelse
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)) orelse
         return error.ExpectedToolCall;
     defer {
         for (calls) |tc| {
@@ -11806,7 +12366,7 @@ test "parseToolCallsForRequest: tag-format call with an UNDECLARED name is kept"
         \\[{"type":"function","function":{"name":"write","parameters":{"type":"object","properties":{"path":{"type":"string"}},"required":["path"]}}}]
     ;
     const text = "<tool_call>{\"name\":\"searchWeb\",\"arguments\":{\"q\":\"zig\"}}</tool_call>";
-    const calls = (try parseToolCallsForRequest(allocator, text, tools)) orelse
+    const calls = (try parseToolCallsForRequest(allocator, text, tools, true)) orelse
         return error.ExpectedToolCall;
     defer {
         for (calls) |tc| {
@@ -11816,6 +12376,65 @@ test "parseToolCallsForRequest: tag-format call with an UNDECLARED name is kept"
         allocator.free(calls);
     }
     try std.testing.expectEqualStrings("searchWeb", calls[0].name);
+}
+
+test "anthropicStopReason: a matched client stop sequence reports stop_sequence, truncation stays honest" {
+    // Anthropic spec: when a CLIENT stop sequence cut the text, stop_reason is
+    // "stop_sequence" (with the matched string echoed) — that's how callers
+    // learn WHICH stop fired. But it never masks the other reasons: a
+    // max_tokens cut stays "max_tokens" (clients key truncation recovery on
+    // it), a parsed tool call stays "tool_use".
+    try std.testing.expectEqualStrings("stop_sequence", anthropicStopReason("stop", "beta"));
+    try std.testing.expectEqualStrings("end_turn", anthropicStopReason("stop", null));
+    try std.testing.expectEqualStrings("max_tokens", anthropicStopReason("length", "beta"));
+    try std.testing.expectEqualStrings("tool_use", anthropicStopReason("tool_calls", "beta"));
+}
+
+test "parseToolCallsForRequest: parallel_tool_calls=false clamps to the FIRST call" {
+    // OpenAI contract: parallel_tool_calls=false means AT MOST ONE call per
+    // response (the SDK sets it in strict structured-output mode; those
+    // clients execute tool_calls[0] and assume length 1). We can't constrain
+    // generation, so the chokepoint clamps post-parse: keep the first, drop
+    // the rest — the model re-issues them next round after seeing the first
+    // result. Whole valid calls only; nothing partial ships.
+    const allocator = std.testing.allocator;
+    const text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a\"}}</tool_call>\n" ++
+        "<tool_call>{\"name\":\"write\",\"arguments\":{\"path\":\"b\"}}</tool_call>";
+
+    // allow_parallel=true (default wiring): both calls survive.
+    const both = (try parseToolCallsForRequest(allocator, text, null, true)).?;
+    defer {
+        for (both) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(both);
+    }
+    try std.testing.expectEqual(@as(usize, 2), both.len);
+
+    // allow_parallel=false: only the FIRST survives, intact.
+    const one = (try parseToolCallsForRequest(allocator, text, null, false)).?;
+    defer {
+        for (one) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(one);
+    }
+    try std.testing.expectEqual(@as(usize, 1), one.len);
+    try std.testing.expectEqualStrings("read", one[0].name);
+
+    // A single call with the flag off passes through untouched.
+    const single_text = "<tool_call>{\"name\":\"read\",\"arguments\":{\"path\":\"a\"}}</tool_call>";
+    const single = (try parseToolCallsForRequest(allocator, single_text, null, false)).?;
+    defer {
+        for (single) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(single);
+    }
+    try std.testing.expectEqual(@as(usize, 1), single.len);
 }
 
 test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma" {
@@ -11844,7 +12463,7 @@ test "parseToolCallsForRequest: coercion fires across think on/off × qwen/gemma
     };
 
     for (cases) |c| {
-        const calls = (try parseToolCallsForRequest(allocator, c.text, c.tools)) orelse {
+        const calls = (try parseToolCallsForRequest(allocator, c.text, c.tools, true)) orelse {
             std.debug.print("\n[{s}] no tool call parsed\n", .{c.name});
             return error.NoToolCall;
         };
@@ -11882,6 +12501,72 @@ test "toolCallFinishReason preserves truncation over parsed tool calls" {
     try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("stop"));
     try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("tool_calls"));
     try std.testing.expectEqualStrings("tool_calls", toolCallFinishReason("client_disconnect"));
+}
+
+test "nChoicesRejectReason: n>1 earns an honest 400, single-choice spellings pass" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, rejected: bool }{
+        // Absent, explicit null, and the two spellings of "one choice" pass.
+        .{ .body = "{}", .rejected = false },
+        .{ .body = "{\"n\":null}", .rejected = false },
+        .{ .body = "{\"n\":1}", .rejected = false },
+        .{ .body = "{\"n\":1.0}", .rejected = false },
+        // Anything else is a request for multi-choice (or garbage) — reject
+        // instead of the silent one-choice no-op.
+        .{ .body = "{\"n\":2}", .rejected = true },
+        .{ .body = "{\"n\":0}", .rejected = true },
+        .{ .body = "{\"n\":\"2\"}", .rejected = true },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        const reason = nChoicesRejectReason(parsed.value.object);
+        try std.testing.expectEqual(case.rejected, reason != null);
+    }
+}
+
+test "jsonEscapeOrEmpty: escaping an empty string is OWNED (leak class 2026-07-19)" {
+    // The old inline pattern decided ownership by CONTENT
+    // (`if (!mem.eql(escaped, "\"\"")) free`), so a legitimately-allocated
+    // escape of "" — every all-reasoning generation with empty visible
+    // content — matched the OOM-fallback literal and leaked 2 bytes per
+    // request. Ownership keys on provenance; std.testing.allocator fails
+    // this test on any leak.
+    const a = std.testing.allocator;
+    const empty = jsonEscapeOrEmpty(a, "");
+    try std.testing.expect(empty.owned);
+    try std.testing.expectEqualStrings("\"\"", empty.slice);
+    if (empty.owned) a.free(empty.slice);
+
+    const text = jsonEscapeOrEmpty(a, "hi \"there\"");
+    try std.testing.expect(text.owned);
+    try std.testing.expectEqualStrings("\"hi \\\"there\\\"\"", text.slice);
+    if (text.owned) a.free(text.slice);
+}
+
+test "parseReasoningEffort: standard chat reasoning_effort opt-in maps to thinking + budget" {
+    const allocator = std.testing.allocator;
+    const cases = [_]struct { body: []const u8, expect: ?ReasoningEffort }{
+        // Absent or wrong type → null: the vendor enable_thinking flag stays
+        // in charge and nothing changes for existing clients.
+        .{ .body = "{}", .expect = null },
+        .{ .body = "{\"reasoning_effort\":42}", .expect = null },
+        // "none" is an explicit OFF (gpt-5.1 default), never an enable.
+        .{ .body = "{\"reasoning_effort\":\"none\"}", .expect = .{ .enable = false, .budget = -1 } },
+        // Known efforts enable thinking with the shared Responses budget map.
+        .{ .body = "{\"reasoning_effort\":\"minimal\"}", .expect = .{ .enable = true, .budget = 128 } },
+        .{ .body = "{\"reasoning_effort\":\"low\"}", .expect = .{ .enable = true, .budget = 512 } },
+        .{ .body = "{\"reasoning_effort\":\"medium\"}", .expect = .{ .enable = true, .budget = 2048 } },
+        .{ .body = "{\"reasoning_effort\":\"high\"}", .expect = .{ .enable = true, .budget = 8192 } },
+        // Unknown efforts (xhigh, future values) enable with the default
+        // budget — spec values are model-dependent, never reject them.
+        .{ .body = "{\"reasoning_effort\":\"xhigh\"}", .expect = .{ .enable = true, .budget = -1 } },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, case.body, .{});
+        defer parsed.deinit();
+        try std.testing.expectEqual(case.expect, parseReasoningEffort(parsed.value.object, -1));
+    }
 }
 
 test "resolveSamplingDefault: request > CLI > generation_config > fallback" {
@@ -12000,6 +12685,24 @@ test "readyCapsJson: every resident media engine surfaces its capability (mesh -
         "[\"chat\",\"tool_use\",\"streaming\",\"reasoning\",\"json_schema\"]",
         chat.items,
     );
+}
+
+test "readyHasChat: embedded-engine GGUF without a chat template still advertises chat" {
+    const t = std.testing;
+    // MLX model with a template — chat.
+    try t.expect(readyHasChat(false, 1234, false));
+    // Encoder-only never chats, template or not.
+    try t.expect(!readyHasChat(true, 1234, false));
+    try t.expect(!readyHasChat(true, 0, true));
+    // The live bug (2026-07-21): a loaded DSV4-Flash GGUF ships no
+    // chat_template in its header (fallback formatting serves chat fine), but
+    // the ready path gated "chat" on template presence — the peer advertised
+    // capabilities:[] and LAN clients hid the model ("No models yet" in the
+    // tray while actively chatting on it). The unloaded GGUF stub path
+    // already advertises the chat set; loaded must not advertise LESS.
+    try t.expect(readyHasChat(false, 0, true));
+    // Templateless pure-MLX entry keeps the existing conservative behavior.
+    try t.expect(!readyHasChat(false, 0, false));
 }
 
 test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill memory guard" {
@@ -12151,4 +12854,31 @@ test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
     // checkpoint is unreachable from any client that doesn't send
     // `enable_mtp:true` in the body (llmprobe, Claude Code, curl).
     try t.expect(defaultEnableMtp(true, true, true));
+}
+
+test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmprobe chat caching)" {
+    const t = std.testing;
+    const a = t.allocator;
+
+    // Cold request: field present with 0, matching OpenAI's unconditional emission.
+    const cold = try formatChatUsage(a, 100, 5, 0, "");
+    defer a.free(cold);
+    try t.expectEqualStrings(
+        \\{"prompt_tokens":100,"completion_tokens":5,"total_tokens":105,"prompt_tokens_details":{"cached_tokens":0}}
+    , cold);
+
+    // Warm request: cached count surfaces; cached ≤ prompt by construction
+    // (scheduler folds cached into prompt_tokens).
+    const warm = try formatChatUsage(a, 300, 12, 250, "");
+    defer a.free(warm);
+    try t.expectEqualStrings(
+        \\{"prompt_tokens":300,"completion_tokens":12,"total_tokens":312,"prompt_tokens_details":{"cached_tokens":250}}
+    , warm);
+
+    // Reasoning responses append completion_tokens_details after the prompt details.
+    const with_details = try formatChatUsage(a, 10, 20, 4, ",\"completion_tokens_details\":{\"reasoning_tokens\":7}");
+    defer a.free(with_details);
+    try t.expectEqualStrings(
+        \\{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":7}}
+    , with_details);
 }

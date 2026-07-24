@@ -36,6 +36,36 @@ enum EngineVersions {
         parse(text).filter { $0.name != "mlx-serve" }
     }
 
+    /// Human label for a `--version` component name (Settings row title).
+    /// Unknown names fall back to the raw token so a new Zig line still
+    /// renders (ugly beats invisible).
+    static func displayLabel(_ name: String) -> String {
+        switch name {
+        case "mlx": return "MLX"
+        case "mlx-c": return "mlx-c"
+        case "nax": return "M5 Neural Accelerators"
+        case "ggml": return "ggml"
+        case "llama.cpp": return "llama.cpp"
+        case "gguf": return "GGUF format"
+        case "ds4": return "ds4"
+        default: return name
+        }
+    }
+
+    /// Explainer text under a component row; empty for unknown names.
+    static func explainer(_ name: String) -> String {
+        switch name {
+        case "mlx": return "Apple's MLX array framework — the native engine for `.safetensors` models."
+        case "mlx-c": return "The C bindings the server links MLX through (pinned submodule revision)."
+        case "nax": return "Whether MLX dispatches to the M5 GPU's neural accelerators (NAX). The bundled MLX always ships the NAX kernels; \"on\" needs an M5-class GPU on macOS 26.2+."
+        case "ggml": return "The tensor library under the llama.cpp GGUF engine (with its short commit)."
+        case "llama.cpp": return "Pinned llama.cpp release serving `.gguf` models. Ships inside the app download."
+        case "gguf": return "GGUF file-format version the engine reads."
+        case "ds4": return "Embedded ds4 engine (DeepSeek-V4-Flash), pinned commit."
+        default: return ""
+        }
+    }
+
     /// Spawn `<binaryPath> --version` as a one-shot subprocess and parse it.
     /// Returns [] if the binary is missing or the run fails. Runs off the main
     /// thread; the process prints and exits immediately (no server, no port).

@@ -221,12 +221,16 @@ struct MLXCoreApp: App {
         }
         .defaultSize(width: 900, height: 560)
 
-        // Live terminal into the agent sandbox guest — see the agent's commands
-        // and run your own in the same isolated Linux VM.
-        Window("Sandbox Terminal", id: "sandboxTerminal") {
+        // The Sandbox window: an embedded terminal for agent CLI sessions
+        // (pi / hermes / shell over ssh) inside the guest, plus the Activity
+        // transcript of everything running in it. Title tracks the live
+        // session via .navigationTitle ("pi — MLX Sandbox").
+        Window("MLX Sandbox", id: "sandboxTerminal") {
             SandboxTerminalView()
+                .environmentObject(appState)
+                .environmentObject(appState.server)
         }
-        .defaultSize(width: 720, height: 520)
+        .defaultSize(width: 780, height: 560)
 
         // Scheduled / on-demand agent tasks — the unattended "claw" surface.
         Window("Tasks", id: "tasks") {

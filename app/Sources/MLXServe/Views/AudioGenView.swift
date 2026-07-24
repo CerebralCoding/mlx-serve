@@ -114,6 +114,8 @@ struct VoiceGenView: View {
 
     @State private var text: String = ""
     @State private var model: AudioModelPreset = .qwen3TTS06B8bit
+    /// Selected network model's routing id (`<model>@<peer>`); nil = local.
+    @State private var lanModel: String? = nil
     @State private var refAudioURL: URL? = nil
     @State private var refText: String = ""
     @State private var speed: Double = 1.0
@@ -121,6 +123,13 @@ struct VoiceGenView: View {
     @State private var showAdvanced: Bool = false
 
     @State private var refError: String? = nil
+    /// Dictation into the text editor: the voice-mode recognizer emits one
+    /// finalized utterance per silence gap; each is appended via `Dictation`.
+    /// Created lazily on first use — never at launch (audio-graph TCC rule).
+    @State private var dictation: (any SpeechRecognizing)? = nil
+    @State private var dictating: Bool = false
+    @State private var dictationPartial: String = ""
+    @State private var dictationError: String? = nil
     @State private var showRAMWarning: Bool = false
     @State private var ramWarningMessage: String = ""
     @State private var pendingRequest: AudioGenRequest? = nil
@@ -141,7 +150,11 @@ struct VoiceGenView: View {
                 didHydrate = true
                 DispatchQueue.main.async { hydrating = false }
             }
+            // Freshen the network-model list so LAN entries are current in
+            // the picker (discovery lands seconds after the server boots).
+            if server.status == .running { Task { await server.refreshModels() } }
         }
+        .onDisappear { stopDictation() }
         .onChange(of: model) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: speed) { _, _ in guard !hydrating else { return }; persist() }
         .onChange(of: temperature) { _, _ in guard !hydrating else { return }; persist() }
@@ -204,23 +217,87 @@ struct VoiceGenView: View {
 
     private var textSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Text to speak").font(.subheadline.weight(.semibold))
+            HStack {
+                Text("Text to speak").font(.subheadline.weight(.semibold))
+                Spacer()
+                Button { toggleDictation() } label: {
+                    Image(systemName: dictating ? "mic.fill" : "mic")
+                        .foregroundStyle(dictating ? AnyShapeStyle(Color.red) : AnyShapeStyle(.secondary))
+                }
+                .buttonStyle(.borderless)
+                .help(dictating ? "Stop dictation" : "Dictate the text to speak")
+            }
             TextEditor(text: $text)
                 .font(.body)
                 .frame(height: 120)
                 .overlay(
                     RoundedRectangle(cornerRadius: 6).stroke(Color.secondary.opacity(0.3), lineWidth: 0.5)
                 )
+            if dictating {
+                Text(dictationPartial.isEmpty ? "Listening…" : dictationPartial)
+                    .font(.caption2).foregroundStyle(.secondary)
+                    .lineLimit(2)
+            }
+            if let err = dictationError {
+                Text(err).font(.caption2).foregroundStyle(.orange)
+            }
         }
+    }
+
+    // MARK: - Dictation
+
+    private func toggleDictation() {
+        dictating ? stopDictation() : startDictation()
+    }
+
+    private func startDictation() {
+        dictationError = nil
+        Task {
+            let rec = dictation ?? makeSpeechRecognizer()
+            dictation = rec
+            guard await rec.requestAuthorization() else {
+                dictationError = "Microphone or speech-recognition access is off. Enable both in System Settings ▸ Privacy & Security."
+                return
+            }
+            rec.onPartialTranscript = { dictationPartial = $0 }
+            rec.onFinalTranscript = {
+                text = Dictation.appending($0, to: text)
+                dictationPartial = ""
+            }
+            rec.onError = { msg in
+                dictationError = msg
+                stopDictation()
+            }
+            do {
+                try rec.start()
+                dictating = true
+            } catch {
+                dictationError = error.localizedDescription
+            }
+        }
+    }
+
+    private func stopDictation() {
+        // Words spoken but not yet finalized by the silence gap land too —
+        // stopping mid-sentence must not eat them.
+        if !dictationPartial.isEmpty { text = Dictation.appending(dictationPartial, to: text) }
+        dictationPartial = ""
+        dictation?.stop()
+        dictating = false
     }
 
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: $model) {
+            Picker("", selection: LanPick.selection(
+                model: $model, lanModel: $lanModel,
+                resolve: { id in AudioModelPreset.all.first { $0.id == id } },
+                persist: persist)
+            ) {
                 ForEach(AudioModelPreset.all) { preset in
-                    Text(preset.name).tag(preset)
+                    Text(preset.name).tag(preset.id)
                 }
+                LanModelPickerRows(capability: "audio")
             }
             .labelsHidden()
             .pickerStyle(.menu)
@@ -331,7 +408,7 @@ struct VoiceGenView: View {
 
     private var actionRow: some View {
         VStack(spacing: 8) {
-            if !downloads.bundleReady(model.bundle) {
+            if lanModel == nil && !downloads.bundleReady(model.bundle) {
                 BundleDownloadBar(bundle: model.bundle)
             }
             HStack {
@@ -346,7 +423,7 @@ struct VoiceGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle))
+                    .disabled(text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)))
                 }
             }
         }
@@ -446,6 +523,7 @@ struct VoiceGenView: View {
 
     private func startRecording() {
         refError = nil
+        stopDictation() // one mic user at a time
         Task {
             guard await AudioRecorder.requestPermission() else {
                 refError = "Microphone access denied. Enable it in System Settings ▸ Privacy ▸ Microphone."
@@ -483,6 +561,7 @@ struct VoiceGenView: View {
     private func hydrate() {
         let s = AudioGenSettings.load()
         model = s.resolvedModel
+        lanModel = LanPick.lanId(s.modelId)
         speed = s.speed
         temperature = s.temperature
         keepResident = s.keepResident
@@ -490,7 +569,7 @@ struct VoiceGenView: View {
 
     private func persist() {
         var s = AudioGenSettings()
-        s.modelId = model.id
+        s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.speed = speed
         s.temperature = temperature
         s.keepResident = keepResident
@@ -500,6 +579,7 @@ struct VoiceGenView: View {
     // MARK: - Generate
 
     private func tryGenerate() {
+        stopDictation() // the open mic would pick up the played result
         let req = AudioGenRequest(
             model: model,
             text: text,
@@ -507,7 +587,8 @@ struct VoiceGenView: View {
             refText: refText,
             speed: speed,
             temperature: temperature,
-            keepResident: keepResident
+            keepResident: keepResident,
+            lanModelId: lanModel
         )
         persist()
         let total = RAMChecker.totalGB

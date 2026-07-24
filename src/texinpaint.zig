@@ -137,7 +137,7 @@ pub fn meshVerticeInpaintSmooth(
         var uncolored_count: usize = 0;
         for (uncolored.items) |raw| {
             const vidx: usize = @intCast(raw);
-            var sum = [_]f32{0} ** MAX_CHANNEL;
+            var sum: [MAX_CHANNEL]f32 = @splat(0);
             var total_weight: f32 = 0;
             const p0 = vertexPos(positions, vidx);
             for (graph[vidx].items) |craw| {
@@ -196,7 +196,7 @@ pub fn diffuseFill(
     // Mean of the valid texels per channel — the initial guess for every unknown texel. It is within
     // [min,max] of the valid field, so seeding with it can never create an extremum, and for a constant
     // field it is already the exact answer.
-    var mean = [_]f64{0} ** MAX_CHANNEL;
+    var mean: [MAX_CHANNEL]f64 = @splat(0);
     var valid_count: usize = 0;
     for (0..n) |p| {
         if (valid[p] > 0) {

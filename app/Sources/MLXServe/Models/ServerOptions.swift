@@ -41,6 +41,25 @@ struct ServerOptions: Codable, Equatable {
     /// ONLY when false, so a default launch stays flag-free.
     var toolAutocorrect: Bool = true
 
+    // MARK: LAN sharing (server-launch flags)
+    /// Share models with other Macs on this network (`--lan-share`). OFF by
+    /// default. When on, this Mac advertises itself over Bonjour and LAN
+    /// clients can run inference on the shared models — model management,
+    /// metrics and the status page stay host-local. Privacy: prompts sent to
+    /// a shared model are processed on (and visible to) this Mac.
+    var lanShareEnabled: Bool = false
+    /// Share every local model (default), or only `lanSharedModels`.
+    var lanShareAll: Bool = true
+    /// Model names shared when `lanShareAll` is off (LocalModel.name — the
+    /// server matches registry ids basename-tolerantly).
+    var lanSharedModels: [String] = []
+    /// Use models other Macs share (`--lan-discover`): they appear in every
+    /// model picker as `model @ peer` and requests are proxied to that Mac —
+    /// which sees those prompts. OFF by default.
+    var lanDiscoverEnabled: Bool = false
+    /// Name other Macs see for this one (`--lan-name`). Empty = hostname.
+    var lanName: String = ""
+
     // Speculative decoding (server-launch flags)
     var enablePLD: Bool = true          // --pld is default-on now (CLI flips with --no-pld)
     var pldDraftLen: Int = 5
@@ -331,23 +350,20 @@ struct ServerOptions: Codable, Equatable {
         /// false = tools run directly on host macOS (default, no extra RAM).
         /// true = shell commands run inside the isolated Linux sandbox.
         var enabled: Bool = false
-        /// OCI/Docker base image pulled once for the sandbox rootfs. MUST have an
-        /// arm64 build (the HVF guest is arm64) — an amd64-only image fails to
-        /// boot. Defaults to `ddalcu/agent-shell-mlxserve`: a purpose-built arm64 agentic
-        /// shell (Debian glibc + Node.js + Python3/pip + git/curl + apt, ~129 MB).
-        /// Any arm64 image works; e.g. `python:3.12-slim` or `debian:stable-slim`.
-        var baseImage: String = "ddalcu/agent-shell-mlxserve"
+        /// The OCI image the sandbox boots from — pinned to our purpose-built
+        /// arm64 agentic shell (Debian glibc + Node.js + Python3/pip + git/curl
+        /// + apt + dropbear for the terminal's ssh transport, ~129 MB; source:
+        /// containers/agent-shell-mlxserve). Deliberately NOT user-configurable:
+        /// the ssh terminal and in-guest MCP servers depend on what this exact
+        /// image ships, and a stored custom/legacy ref left upgraders stuck on
+        /// the pre-ssh image (stale-image dialog forever — see the regression
+        /// test). Test overrides go through `AgentSandbox.configure(baseImage:)`.
+        static let baseImage = "ddalcu/agent-shell-mlxserve"
         /// Outbound network for the guest (NAT) + live guest→host port mapping:
         /// a server the agent starts on guest port N becomes reachable at
         /// `localhost:N` on this Mac. Off → the guest has NO network device at
         /// all (fully isolated). Applies on the next guest boot.
         var network: Bool = true
-
-        /// The base image ref with surrounding whitespace stripped — what the
-        /// image puller actually receives (users paste with trailing newlines).
-        var trimmedBaseImage: String {
-            baseImage.trimmingCharacters(in: .whitespacesAndNewlines)
-        }
     }
 
     // MARK: Restart-detection helpers
@@ -364,6 +380,11 @@ struct ServerOptions: Codable, Equatable {
         enableMetrics == other.enableMetrics &&
         apiKey == other.apiKey &&
         toolAutocorrect == other.toolAutocorrect &&
+        lanShareEnabled == other.lanShareEnabled &&
+        lanShareAll == other.lanShareAll &&
+        lanSharedModels == other.lanSharedModels &&
+        lanDiscoverEnabled == other.lanDiscoverEnabled &&
+        lanName == other.lanName &&
         enablePLD == other.enablePLD &&
         pldDraftLen == other.pldDraftLen &&
         pldKeyLen == other.pldKeyLen &&
@@ -453,6 +474,23 @@ struct ServerOptions: Codable, Equatable {
         // stays flag-free (guarded by testDefaultLaunchOmitsAllMatchDefaultFlags).
         if !toolAutocorrect {
             args += ["--no-tool-autocorrect"]
+        }
+        // LAN sharing: everything defaults off, so a default launch stays
+        // flag-free. Share-on with nothing selected shares nothing — omit.
+        if lanShareEnabled {
+            let list = lanSharedModels.filter { !$0.isEmpty }
+            if lanShareAll {
+                args += ["--lan-share", "all"]
+            } else if !list.isEmpty {
+                args += ["--lan-share", list.joined(separator: ",")]
+            }
+        }
+        if lanDiscoverEnabled {
+            args += ["--lan-discover"]
+        }
+        let trimmedLanName = lanName.trimmingCharacters(in: .whitespacesAndNewlines)
+        if (lanShareEnabled || lanDiscoverEnabled) && !trimmedLanName.isEmpty {
+            args += ["--lan-name", trimmedLanName]
         }
         // Spec-decode: explicit flags either way so the server's CLI defaults
         // can't drift out from under the UI.
@@ -611,6 +649,11 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Int.self, forKey: .pldKeyLen) { pldKeyLen = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .drafterPath) { drafterPath = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .draftBlockSize) { draftBlockSize = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareEnabled) { lanShareEnabled = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .lanShareAll) { lanShareAll = v }
+        if let v = try c.decodeIfPresent([String].self, forKey: .lanSharedModels) { lanSharedModels = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .lanDiscoverEnabled) { lanDiscoverEnabled = v }
+        if let v = try c.decodeIfPresent(String.self, forKey: .lanName) { lanName = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enableMTP) { enableMTP = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .mtpDepth) { mtpDepth = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .forceMTPOnMoE) { forceMTPOnMoE = v }
@@ -669,7 +712,8 @@ extension ServerOptions.SandboxConfig {
         self.init()
         let c = try decoder.container(keyedBy: CodingKeys.self)
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enabled) { enabled = v }
-        if let v = try c.decodeIfPresent(String.self, forKey: .baseImage) { baseImage = v }
+        // baseImage is hardcoded now (see the static above) — a stored value,
+        // legacy default or custom, is deliberately ignored.
         if let v = try c.decodeIfPresent(Bool.self, forKey: .network) { network = v }
     }
 }
@@ -739,6 +783,22 @@ extension ServerOptions {
         "apiKey": .init(
             title: "API key",
             explainer: "Require this key for requests from OTHER machines (the OpenAI/Anthropic/Ollama APIs + index page + metrics). Sent as Authorization: Bearer, x-api-key, HTTP Basic, or ?api_key=. Localhost is trusted, so this app never needs it — it protects the server when exposed on the network. Blank = no auth.",
+            needsRestart: true),
+        "lanShareEnabled": .init(
+            title: "Share my models on this network",
+            explainer: "Advertise this Mac over Bonjour and let other Macs on your local network run inference on the models you share below. Only inference is exposed — model management, metrics, and the status page stay private to this Mac.",
+            needsRestart: true),
+        "lanShareAll": .init(
+            title: "Share all models",
+            explainer: "Share everything in your library (chat AND image/audio/video/3D). Turn off to pick individual models.",
+            needsRestart: true),
+        "lanName": .init(
+            title: "Shown to others as",
+            explainer: "The name other Macs see next to your shared models. Blank = this Mac's hostname.",
+            needsRestart: true),
+        "lanDiscoverEnabled": .init(
+            title: "Use models shared by other Macs",
+            explainer: "Discover models other mlx-serve hosts share on this network. They appear in the model pickers as \u{201C}model · peer\u{201D} and run on the hosting Mac — nothing to download.",
             needsRestart: true),
         "toolAutocorrect": .init(
             title: "Tool-call auto-correct",

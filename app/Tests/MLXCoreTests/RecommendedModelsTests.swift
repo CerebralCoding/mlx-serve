@@ -11,21 +11,30 @@ final class RecommendedModelsTests: XCTestCase {
 
     private let GiB: UInt64 = 1_073_741_824
 
+    /// Every recommended pick across all four family sections — the union the
+    /// invariant tests below sweep, so a new section can't slip past them.
+    private var allRecommended: [RecommendedModelPick] {
+        RecommendedModelPick.gemmaCatalog
+            + RecommendedModelPick.qwenCatalog
+            + RecommendedModelPick.poolsideCatalog
+            + RecommendedModelPick.largestCatalog
+    }
+
     // MARK: - Catalog shape
 
-    /// The pane's whole layout assumes exactly three family sections.
-    func testExactlyThreeFamiliesArePresent() {
-        let families = Set(RecommendedModelPick.gemmaCatalog.map(\.family))
-            .union(RecommendedModelPick.qwenCatalog.map(\.family))
-            .union(RecommendedModelPick.largestCatalog.map(\.family))
-        XCTAssertEqual(families, [.gemma, .qwen, .largest])
+    /// The pane's whole layout assumes exactly four family sections
+    /// (Gemma 4, Qwen, poolside Laguna, Largest).
+    func testExactlyFourFamiliesArePresent() {
+        let families = Set(allRecommended.map(\.family))
+        XCTAssertEqual(families, [.gemma, .qwen, .poolside, .largest])
     }
 
     /// A family catalog can't be empty — a section with zero rows would be a
     /// dead header in the UI.
-    func testNeitherFamilyCatalogIsEmpty() {
+    func testNoFamilyCatalogIsEmpty() {
         XCTAssertFalse(RecommendedModelPick.gemmaCatalog.isEmpty)
         XCTAssertFalse(RecommendedModelPick.qwenCatalog.isEmpty)
+        XCTAssertFalse(RecommendedModelPick.poolsideCatalog.isEmpty)
         XCTAssertFalse(RecommendedModelPick.largestCatalog.isEmpty)
     }
 
@@ -37,6 +46,9 @@ final class RecommendedModelsTests: XCTestCase {
         }
         for p in RecommendedModelPick.qwenCatalog {
             XCTAssertEqual(p.family, .qwen, p.id)
+        }
+        for p in RecommendedModelPick.poolsideCatalog {
+            XCTAssertEqual(p.family, .poolside, p.id)
         }
         for p in RecommendedModelPick.largestCatalog {
             XCTAssertEqual(p.family, .largest, p.id)
@@ -50,21 +62,23 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(gemmaSizes, gemmaSizes.sorted())
         let qwenSizes = RecommendedModelPick.qwenCatalog.map(\.sizeGB)
         XCTAssertEqual(qwenSizes, qwenSizes.sorted())
+        let poolsideSizes = RecommendedModelPick.poolsideCatalog.map(\.sizeGB)
+        XCTAssertEqual(poolsideSizes, poolsideSizes.sorted())
         let hunyuanSizes = RecommendedModelPick.largestCatalog.map(\.sizeGB)
         XCTAssertEqual(hunyuanSizes, hunyuanSizes.sorted())
     }
 
-    /// No id collisions within or across the two catalogs — ids key the
+    /// No id collisions within or across the catalogs — ids key the
     /// SwiftUI `ForEach`/download-state lookups.
-    func testNoDuplicateIdsAcrossBothCatalogs() {
-        let ids = (RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.largestCatalog).map(\.id)
+    func testNoDuplicateIdsAcrossAllCatalogs() {
+        let ids = allRecommended.map(\.id)
         XCTAssertEqual(ids.count, Set(ids).count)
     }
 
     /// Every repo id must look like a real, resolvable HuggingFace path
     /// (`org/repo`, no whitespace) — a typo here silently 404s the download.
     func testRepoIdsAreWellFormed() {
-        for p in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.largestCatalog {
+        for p in allRecommended {
             XCTAssertTrue(p.repoId.contains("/"), p.repoId)
             XCTAssertFalse(p.repoId.contains(" "), p.repoId)
             XCTAssertEqual(p.repoId.split(separator: "/").count, 2, p.repoId)
@@ -74,7 +88,7 @@ final class RecommendedModelsTests: XCTestCase {
     /// Every entry needs real, non-empty plain-English copy — an empty blurb
     /// or tagline would silently render a blank description.
     func testEveryPickHasNonEmptyBeginnerCopy() {
-        for p in RecommendedModelPick.gemmaCatalog + RecommendedModelPick.qwenCatalog + RecommendedModelPick.largestCatalog {
+        for p in allRecommended {
             XCTAssertFalse(p.name.isEmpty, p.id)
             XCTAssertFalse(p.tagline.isEmpty, p.id)
             XCTAssertGreaterThan(p.blurb.count, 40, "\(p.id) blurb reads as a stub")
@@ -182,6 +196,27 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(ds4.ggufFilename?.contains("imatrix"), true, "curated pick must be the imatrix build")
         XCTAssertEqual(ds4.ggufFilename?.contains("IQ2XXS"), true)
         XCTAssertNil(RecommendedModelPick.gemmaE4B.ggufFilename, "safetensors picks fetch the whole repo")
+    }
+
+    /// poolside's Laguna S 2.1 is its own family section — a coding-specialist
+    /// MoE that isn't Gemma, Qwen, or a 96 GB+ "largest" pick. It's the compact
+    /// 2-bit MLX build the app was validated on, resolvable at the on-disk repo
+    /// path `pipenetwork/Laguna-S-2.1-MLX-2bit`.
+    func testPoolsideSectionHoldsLagunaS21TwoBit() {
+        XCTAssertEqual(RecommendedModelPick.poolsideCatalog.map(\.id), ["laguna-s-2.1-2bit"])
+        let laguna = RecommendedModelPick.lagunaS21
+        XCTAssertEqual(laguna.family, .poolside)
+        XCTAssertEqual(laguna.repoId, "pipenetwork/Laguna-S-2.1-MLX-2bit")
+        XCTAssertNil(laguna.ggufFilename, "the MLX build fetches the whole safetensors repo")
+    }
+
+    /// The 2-bit Laguna build is ~35 GB on disk, so ~42 GB with the ×1.2 RAM
+    /// overhead: it fits a 48 GB Mac inline but lands behind "Requires more RAM"
+    /// on a 32 GB one — it is NOT a 96 GB+ pick and must not read as one.
+    func testLagunaFitsMidRangeMacButNotSmallOne() {
+        let laguna = RecommendedModelPick.lagunaS21
+        XCTAssertTrue(laguna.meetsSystemRequirements(physicalMemoryBytes: 48 * GiB))
+        XCTAssertFalse(laguna.meetsSystemRequirements(physicalMemoryBytes: 32 * GiB))
     }
 
     /// The old 0.8B entry-level Qwen pick was replaced with 9B — too small

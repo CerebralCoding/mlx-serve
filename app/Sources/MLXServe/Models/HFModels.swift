@@ -41,6 +41,7 @@ let supportedModelTypes: Set<String> = [
     "lfm2", "lfm2-vl",
     "nemotron_h",
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
+    "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so

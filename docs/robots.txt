@@ -1,4 +1,0 @@
-User-agent: *
-Allow: /
-
-Sitemap: https://ddalcu.github.io/mlx-serve/sitemap.xml

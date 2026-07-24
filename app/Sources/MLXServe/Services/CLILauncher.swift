@@ -95,7 +95,7 @@ final class CLILauncher: ObservableObject {
 
     /// Launch a CLI with a folder picker for its working directory.
     func launchWithPicker(_ cli: LauncherCLI, baseURL: String, servedModelId: String,
-                          budget: AgentBudget.Budget) {
+                          budget: AgentBudget.Budget, entries: [AgentModelEntry]) {
         let panel = NSOpenPanel()
         panel.canChooseDirectories = true
         panel.canChooseFiles = false
@@ -108,20 +108,23 @@ final class CLILauncher: ObservableObject {
         panel.directoryURL = URL(fileURLWithPath: defaultWS)
         guard AppActivation.runModal(panel) == .OK, let url = panel.url else { return }
         launch(cli, baseURL: baseURL, servedModelId: servedModelId,
-               budget: budget, workingDirectory: url.path)
+               budget: budget, entries: entries, workingDirectory: url.path)
     }
 
     /// Write a shell script that sets the right env vars / config for the given
     /// CLI, then hand it to Terminal.app via NSWorkspace.
     func launch(_ cli: LauncherCLI, baseURL: String, servedModelId: String,
-                budget: AgentBudget.Budget, workingDirectory: String?) {
+                budget: AgentBudget.Budget, entries: [AgentModelEntry],
+                workingDirectory: String?) {
         // pi and opencode both need their config files written before launch.
-        // The budget travels with them: neither CLI reads `/v1/models`, so the
-        // number we write here IS the context they believe the model has.
+        // The budget travels with them: neither CLI reads `/v1/models` on its
+        // own (pi's live list rides the extension we write), so the numbers
+        // baked here ARE the contexts they believe the models have. `entries`
+        // is the full chat-capable registry — the in-agent /model switch list.
         cli.prepareConfig?(baseURL, servedModelId, budget)
 
         let cdLine = workingDirectory.map { "cd '\($0)'" } ?? ""
-        let script = cli.scriptBody(baseURL, servedModelId, cdLine, budget)
+        let script = cli.scriptBody(baseURL, servedModelId, cdLine, budget, entries)
         let fullScript = "#!/bin/zsh -l\n\(script)\n"
 
         let filename = "mlx-launch-\(cli.id).command"
@@ -143,9 +146,12 @@ struct LauncherCLI: Identifiable, Equatable {
     /// pi's `models.json` into its dedicated `~/.mlx-serve/pi/` config dir).
     let prepareConfig: (@Sendable (_ baseURL: String, _ servedModelId: String,
                                   _ budget: AgentBudget.Budget) -> Void)?
-    /// Shell body that sets env vars and execs the CLI. Does NOT include the shebang.
+    /// Shell body that sets env vars and execs the CLI. Does NOT include the
+    /// shebang. `entries` = the chat-capable registry snapshot (opencode bakes
+    /// it into its inline config; pi/Claude Code ignore it — pi's list is
+    /// fetched live by its extension, Claude Code has no per-model config).
     let scriptBody: (_ baseURL: String, _ servedModelId: String, _ cdLine: String,
-                     _ budget: AgentBudget.Budget) -> String
+                     _ budget: AgentBudget.Budget, _ entries: [AgentModelEntry]) -> String
     var resolvedPath: String = ""
 
     static func == (lhs: LauncherCLI, rhs: LauncherCLI) -> Bool { lhs.id == rhs.id }
@@ -162,7 +168,7 @@ extension LauncherCLI {
         iconSystemName: nil,
         useClaudeIcon: true,
         prepareConfig: nil,
-        scriptBody: { baseURL, model, cdLine, budget in
+        scriptBody: { baseURL, model, cdLine, budget, _ in
             """
             \(AgentConfigs.claudeCodeExports(baseURL: baseURL, model: model, budget: budget))
             \(cdLine)
@@ -191,8 +197,22 @@ extension LauncherCLI {
             let config = AgentConfigs.piModelsJSON(baseURL: baseURL, model: model, budget: budget)
             let path = (dir as NSString).appendingPathComponent("models.json")
             try? config.write(toFile: path, atomically: true, encoding: .utf8)
+            // Global context file — pi injects it into every session's system
+            // prompt (same builder the sandbox registry materializes in-guest).
+            try? AgentConfigs.piAgentsMD(budget: budget)
+                .write(toFile: (dir as NSString).appendingPathComponent("AGENTS.md"),
+                       atomically: true, encoding: .utf8)
+            // Live /model list: pi auto-discovers <agentDir>/extensions/*.js;
+            // this one fetches /v1/models at session start and registers every
+            // chat-capable model (LAN @peer entries included) on the `mlx`
+            // provider. models.json above stays the offline fallback.
+            let extDir = (dir as NSString).appendingPathComponent("extensions")
+            try? FileManager.default.createDirectory(atPath: extDir, withIntermediateDirectories: true)
+            try? AgentConfigs.piModelsExtensionJS(baseURL: baseURL)
+                .write(toFile: (extDir as NSString).appendingPathComponent("mlx-models.js"),
+                       atomically: true, encoding: .utf8)
         },
-        scriptBody: { _, model, cdLine, _ in
+        scriptBody: { _, model, cdLine, _, _ in
             """
             export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi"
             \(cdLine)
@@ -213,9 +233,17 @@ extension LauncherCLI {
         iconSystemName: "chevron.left.forwardslash.chevron.right",
         useClaudeIcon: false,
         prepareConfig: nil,
-        scriptBody: { baseURL, model, cdLine, budget in
-            """
-            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, model: model, budget: budget))'
+        scriptBody: { baseURL, model, cdLine, budget, entries in
+            // Full chat-capable list — opencode's in-session /models picker
+            // shows exactly what this config declares. The served model is
+            // force-included (with ITS budget) so `--model mlx/<id>` always
+            // resolves, even on an empty registry snapshot.
+            var list = entries
+            if !list.contains(where: { $0.id == model }) {
+                list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+            }
+            return """
+            export OPENCODE_CONFIG_CONTENT='\(AgentConfigs.opencodeJSON(baseURL: baseURL, defaultModel: model, entries: list))'
             \(cdLine)
             opencode --model mlx/\(model)
             """
@@ -225,11 +253,12 @@ extension LauncherCLI {
 
 // MARK: - UI
 
-/// Launcher button for the menu bar. Renders either:
-///   * nothing (when we've scanned and found no CLIs installed — the user
-///     doesn't care about a feature they can't use),
-///   * a single bordered button for one CLI (skips the extra click),
-///   * a `Menu` dropdown for 2+ CLIs.
+/// Launcher button for the menu bar: one `Menu` with the detected host CLIs
+/// (launched in Terminal.app against the local server) plus the sandboxed
+/// agents (pi/hermes INSIDE the guest VM — routed to the Sandbox window via
+/// `openSandboxAgent`). The sandbox rows are always present, so the button no
+/// longer hides when no host CLI is installed — running an agent needs
+/// nothing on the host anymore.
 @MainActor
 struct CLILauncherButton: View {
     let baseURL: String
@@ -239,9 +268,17 @@ struct CLILauncherButton: View {
     /// into their config, so passing nil here silently caps every agent session
     /// at the conservative fallback. See `AgentBudget`.
     let serverContextLength: Int?
+    /// Full registry snapshot (`ServerManager.allModels`) — the chat-capable
+    /// subset becomes each CLI's in-agent /model switch list.
+    let models: [ModelInfo]
     let isEnabled: Bool
+    /// Tray → Sandbox window hand-off (agent id): the tray can't drive the
+    /// window's state directly, so this posts the launch request and opens
+    /// the window; the window focuses a running session or starts one.
+    let openSandboxAgent: (String) -> Void
 
     private var budget: AgentBudget.Budget { AgentBudget.forServerContext(serverContextLength) }
+    private var entries: [AgentModelEntry] { AgentModelEntry.chatEntries(from: models) }
 
     @StateObject private var detector = CLILauncher()
 
@@ -251,25 +288,27 @@ struct CLILauncherButton: View {
                 // Still scanning — reserve the space with a placeholder so the
                 // footer doesn't reflow when scan finishes a moment later.
                 Color.clear.frame(width: 0, height: 0)
-            } else if detector.available.isEmpty {
-                // None installed — hide entirely.
-                EmptyView()
-            } else if detector.available.count == 1, let only = detector.available.first {
-                Button {
-                    detector.launchWithPicker(only, baseURL: baseURL, servedModelId: servedModelId, budget: budget)
-                } label: {
-                    label(for: only).frame(maxWidth: .infinity)
-                }
-                .buttonStyle(.bordered)
-                .disabled(!isEnabled)
-                .help("Launch \(only.displayName)")
             } else {
                 Menu {
-                    ForEach(detector.available) { cli in
-                        Button {
-                            detector.launchWithPicker(cli, baseURL: baseURL, servedModelId: servedModelId, budget: budget)
-                        } label: {
-                            Label(cli.displayName, systemImage: cli.iconSystemName ?? "terminal")
+                    if !detector.available.isEmpty {
+                        Section("On this Mac") {
+                            ForEach(detector.available) { cli in
+                                Button {
+                                    detector.launchWithPicker(cli, baseURL: baseURL, servedModelId: servedModelId,
+                                                              budget: budget, entries: entries)
+                                } label: {
+                                    Label(cli.displayName, systemImage: cli.iconSystemName ?? "terminal")
+                                }
+                            }
+                        }
+                    }
+                    Section("In the sandbox") {
+                        ForEach(SandboxAgentRegistry.all) { spec in
+                            Button {
+                                openSandboxAgent(spec.id)
+                            } label: {
+                                Label("\(spec.displayName) in Sandbox", systemImage: "shippingbox")
+                            }
                         }
                     }
                 } label: {
@@ -287,22 +326,9 @@ struct CLILauncherButton: View {
                 .buttonStyle(.bordered)
                 .menuIndicator(.hidden)
                 .disabled(!isEnabled)
-                .help("Launch coding agent (\(detector.available.map(\.displayName).joined(separator: ", ")))")
+                .help("Launch a coding agent — on this Mac (\(detector.available.isEmpty ? "none detected" : detector.available.map(\.displayName).joined(separator: ", "))) or inside the sandbox (pi, hermes)")
             }
         }
         .task { await detector.refresh() }
-    }
-
-    /// Tray launcher label — icon + "Code" so it sits alongside the Chat/Tasks buttons.
-    @ViewBuilder
-    private func label(for cli: LauncherCLI) -> some View {
-        HStack(spacing: TrayFooterMetrics.iconSpacing) {
-            if cli.useClaudeIcon {
-                ClaudeIcon(size: 12)
-            } else {
-                Image(systemName: cli.iconSystemName ?? "terminal")
-            }
-            Text("Code")
-        }
     }
 }

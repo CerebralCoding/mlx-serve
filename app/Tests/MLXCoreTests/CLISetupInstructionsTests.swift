@@ -53,7 +53,7 @@ final class CLISetupInstructionsTests: XCTestCase {
     /// or the two surfaces configure two different pis.
     func testDMGLauncherUsesTheSameIsolatedPiConfigDir() {
         let script = LauncherCLI.pi.scriptBody("http://localhost:11234", "gemma-4-e4b-it-4bit",
-                                               "cd '/tmp'", budget)
+                                               "cd '/tmp'", budget, [])
         XCTAssertTrue(script.contains(#"export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/pi""#), script)
         XCTAssertTrue(script.contains("pi --provider mlx --model gemma-4-e4b-it-4bit"))
     }
@@ -82,7 +82,7 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertNil(LauncherCLI.opencode.prepareConfig,
                      "no file writes — the config rides OPENCODE_CONFIG_CONTENT")
         let script = LauncherCLI.opencode.scriptBody("http://localhost:11234",
-                                                     "gemma-4-e4b-it-4bit", "cd '/tmp'", budget)
+                                                     "gemma-4-e4b-it-4bit", "cd '/tmp'", budget, [])
         let json = AgentConfigs.opencodeJSON(
             baseURL: "http://localhost:11234", model: "gemma-4-e4b-it-4bit", budget: budget)
         XCTAssertTrue(script.contains("export OPENCODE_CONFIG_CONTENT='\(json)'"), script)

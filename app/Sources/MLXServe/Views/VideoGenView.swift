@@ -16,6 +16,8 @@ struct VideoGenView: View {
     @State private var prompt: String = ""
     @State private var showAdvanced: Bool = false
     @State private var model: VideoModelPreset = .ltx23Q4
+    /// Selected network model's routing id (`<model>@<peer>`); nil = local.
+    @State private var lanModel: String? = nil
     @State private var quality: QualityPreset = .good
     @State private var resolution: ResolutionOption = VideoModelPreset.ltx23Q4.defaultResolution
     @State private var numFrames: Int = 97
@@ -67,6 +69,9 @@ struct VideoGenView: View {
                 didHydrate = true
                 DispatchQueue.main.async { hydrating = false }
             }
+            // Freshen the network-model list so LAN entries are current in
+            // the picker (discovery lands seconds after the server boots).
+            if server.status == .running { Task { await server.refreshModels() } }
         }
         // Persist the fields not owned by the model/quality/resolution sections.
         .onChange(of: numFrames) { _, _ in guard !hydrating else { return }; persist() }
@@ -210,10 +215,15 @@ struct VideoGenView: View {
     private var modelSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             Text("Model").font(.subheadline.weight(.semibold))
-            Picker("", selection: $model) {
+            Picker("", selection: LanPick.selection(
+                model: $model, lanModel: $lanModel,
+                resolve: { id in VideoModelPreset.all.first { $0.id == id } },
+                persist: persist)
+            ) {
                 ForEach(VideoModelPreset.all) { preset in
-                    Text(preset.name).tag(preset)
+                    Text(preset.name).tag(preset.id)
                 }
+                LanModelPickerRows(capability: "video")
             }
             .labelsHidden()
             .pickerStyle(.menu)
@@ -759,7 +769,7 @@ struct VideoGenView: View {
 
     private var actionRow: some View {
         VStack(spacing: 8) {
-            if !downloads.bundleReady(model.bundle) {
+            if lanModel == nil && !downloads.bundleReady(model.bundle) {
                 BundleDownloadBar(bundle: model.bundle)
             }
             HStack {
@@ -780,7 +790,7 @@ struct VideoGenView: View {
                     }
                     .buttonStyle(.borderedProminent)
                     .keyboardShortcut(.return, modifiers: [.command])
-                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || !downloads.bundleReady(model.bundle))
+                    .disabled(prompt.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty || (lanModel == nil && !downloads.bundleReady(model.bundle)))
                 }
             }
         }
@@ -861,6 +871,7 @@ struct VideoGenView: View {
     private func hydrate() {
         let s = VideoGenSettings.load()
         model = s.resolvedModel
+        lanModel = LanPick.lanId(s.modelId)
         quality = s.quality
         resolution = s.resolvedResolution(for: model)
         numFrames = s.numFrames
@@ -883,7 +894,7 @@ struct VideoGenView: View {
 
     private func persist() {
         var s = VideoGenSettings()
-        s.modelId = model.id
+        s.modelId = LanPick.persisted(lanModel: lanModel, presetId: model.id)
         s.quality = quality
         s.resolutionId = resolution.id
         s.numFrames = numFrames
@@ -950,6 +961,7 @@ struct VideoGenView: View {
             firstFrameImagePath: firstFrameImageURL?.path,
             audioPath: audioURL?.path,
             keepResident: keepResident,
+            lanModelId: lanModel,
             loraPath: loraPath.isEmpty ? nil : loraPath
         )
         persist()

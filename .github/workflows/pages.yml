@@ -3,7 +3,7 @@ name: Deploy to GitHub Pages
 on:
   push:
     branches: [main]
-    paths: [docs/**]
+    paths: [website/**]
   workflow_dispatch:
 
 permissions:
@@ -28,7 +28,7 @@ jobs:
 
       - uses: actions/upload-pages-artifact@v3
         with:
-          path: docs
+          path: website
 
       - id: deployment
         uses: actions/deploy-pages@v4

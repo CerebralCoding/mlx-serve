@@ -60,4 +60,5 @@ test {
     _ = @import("gen.zig");
     _ = @import("ollama.zig");
     _ = @import("cli.zig");
+    _ = @import("lan.zig");
 }

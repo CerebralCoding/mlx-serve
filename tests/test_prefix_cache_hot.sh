@@ -56,12 +56,16 @@ build_body_multiturn() {
         '{model:"x",messages:[{role:"system",content:$s},{role:"user",content:$u1},{role:"assistant",content:$a1},{role:"user",content:$u2}],max_tokens:1,temperature:0.0,stream:false,enable_thinking:false}'
 }
 
+# Last response body lands here so callers can assert on usage fields after
+# the timing runs complete (overwritten per call — holds B2 after a full run).
+RESP_FILE="/tmp/test_prefix_cache_resp.json"
+
 call_and_time() {
     local body="$1"
     local t0 t1
     t0=$(python3 -c 'import time;print(int(time.time()*1000))')
     curl -sf -m 60 -X POST "http://127.0.0.1:$PORT/v1/chat/completions" \
-        -H "Content-Type: application/json" -d "$body" >/dev/null
+        -H "Content-Type: application/json" -d "$body" -o "$RESP_FILE"
     t1=$(python3 -c 'import time;print(int(time.time()*1000))')
     echo "$((t1 - t0))"
 }
@@ -104,11 +108,13 @@ echo "=== capacity=0 (hot cache disabled) ==="
 read -r a1_c0 b1_c0 a2_c0 b2_c0 <<< "$(run_with_capacity 0)"
 echo "  walls: A1=${a1_c0}ms B1=${b1_c0}ms A2=${a2_c0}ms B2=${b2_c0}ms"
 log_c0="$(cat /tmp/test_prefix_cache.log)"
+usage_c0="$(jq -c '.usage' "$RESP_FILE")"
 
 echo "=== capacity=2 (hot prefix cache) ==="
 read -r a1_c2 b1_c2 a2_c2 b2_c2 <<< "$(run_with_capacity 2)"
 echo "  walls: A1=${a1_c2}ms B1=${b1_c2}ms A2=${a2_c2}ms B2=${b2_c2}ms"
 log_c2="$(cat /tmp/test_prefix_cache.log)"
+usage_c2="$(jq -c '.usage' "$RESP_FILE")"
 
 # Behavior assertions (more robust than wall-time deltas, which are noisy
 # at short prompts and decode-dominated regimes):
@@ -151,6 +157,29 @@ if ! echo "$log_c2" | grep -qE "entry [0-9]+/[2-9][0-9]*\)"; then
     exit 1
 fi
 echo "PASS: cap=2 holds multiple entries simultaneously"
+
+# Assertion 4: cache hits must be VISIBLE in the OpenAI usage object.
+# llmprobe (and any cost dashboard) is black-box: it only sees
+# usage.prompt_tokens_details.cached_tokens, so an engine that caches but
+# doesn't report scores as "no prompt caching". The field must be present
+# on EVERY response (0 when cold, OpenAI parity) and positive + <= prompt
+# on a warm hit. usage_c0/usage_c2 hold B2's usage (last call of each run).
+cached_c0="$(echo "$usage_c0" | jq '.prompt_tokens_details.cached_tokens')"
+cached_c2="$(echo "$usage_c2" | jq '.prompt_tokens_details.cached_tokens')"
+prompt_c2="$(echo "$usage_c2" | jq '.prompt_tokens')"
+if [[ "$cached_c0" == "null" || "$cached_c2" == "null" ]]; then
+    echo "FAIL: usage.prompt_tokens_details.cached_tokens missing (c0=$usage_c0 c2=$usage_c2)" >&2
+    exit 1
+fi
+if [[ "$cached_c2" -le 0 ]]; then
+    echo "FAIL: warm cap=2 request reported cached_tokens=$cached_c2 (usage=$usage_c2)" >&2
+    exit 1
+fi
+if [[ "$cached_c2" -gt "$prompt_c2" ]]; then
+    echo "FAIL: cached_tokens $cached_c2 > prompt_tokens $prompt_c2" >&2
+    exit 1
+fi
+echo "PASS: usage reports cached_tokens (cold=$cached_c0, warm=$cached_c2/$prompt_c2)"
 
 echo
 echo "PASS: hot prefix cache wired correctly"

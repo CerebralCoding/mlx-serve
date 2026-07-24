@@ -451,15 +451,16 @@ pub fn parseConfigText(allocator: std.mem.Allocator, text: []const u8) !Hy3dConf
     const mt = obj.get("model_type") orelse return error.BadHy3dConfig;
     if (mt != .string or !std.mem.startsWith(u8, mt.string, "hunyuan3d")) return error.BadHy3dConfig;
     var cfg = Hy3dConfig{};
-    inline for (@typeInfo(Hy3dConfig).@"struct".fields) |f| {
-        if (obj.get(f.name)) |v| {
-            switch (f.type) {
+    const ti = @typeInfo(Hy3dConfig).@"struct";
+    inline for (ti.field_names, ti.field_types) |name, FieldType| {
+        if (obj.get(name)) |v| {
+            switch (FieldType) {
                 u32 => {
-                    if (v == .integer) @field(cfg, f.name) = @intCast(v.integer);
+                    if (v == .integer) @field(cfg, name) = @intCast(v.integer);
                 },
                 f32 => {
-                    if (v == .float) @field(cfg, f.name) = @floatCast(v.float);
-                    if (v == .integer) @field(cfg, f.name) = @floatFromInt(v.integer);
+                    if (v == .float) @field(cfg, name) = @floatCast(v.float);
+                    if (v == .integer) @field(cfg, name) = @floatFromInt(v.integer);
                 },
                 else => {},
             }

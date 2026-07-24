@@ -66,6 +66,29 @@ final class VzGuestTests: XCTestCase {
         XCTAssertFalse(s.contains("mount -t virtiofs \(VzGuest.workspaceTag)"))
     }
 
+    func testInitScriptAlwaysMountsProjectsShare() {
+        // The `projects` device is always configured (empty until a chat folder
+        // is hot-mounted), so its mount point must be established at boot — even
+        // with no workspace share.
+        XCTAssertTrue(VzGuest.buildInitScript(config: baseConfig())
+            .contains("mount -t virtiofs \(VzGuest.projectsTag) \(VzGuest.guestProjectsPath)"),
+            "projects tag must be mounted at boot for hot-mounts to surface")
+        var noWs = baseConfig(); noWs.workspacePath = nil
+        XCTAssertTrue(VzGuest.buildInitScript(config: noWs)
+            .contains("mount -t virtiofs \(VzGuest.projectsTag) \(VzGuest.guestProjectsPath)"))
+        XCTAssertTrue(VzGuest.buildInitScript(config: baseConfig())
+            .contains("mkdir -p /proc /sys /dev \(VzGuest.guestProjectsPath)"),
+            "the /projects mount point must be created before the mount")
+    }
+
+    func testMultiDirectoryShareMapsSlugsToHostDirs() {
+        let share = VzGuest.multiDirectoryShare(["proj-abc": "/Users/d/proj", "lib-def": "/Users/d/lib"])
+        XCTAssertEqual(Set(share.directories.keys), ["proj-abc", "lib-def"])
+        XCTAssertEqual(share.directories["proj-abc"]?.url.path, "/Users/d/proj")
+        XCTAssertEqual(VzGuest.multiDirectoryShare([:]).directories.count, 0,
+                       "an empty set is valid — mounts as an empty /projects")
+    }
+
     func testLegacyInitScriptRunsShellOnSecondConsolePort() {
         let s = VzGuest.buildInitScript(config: baseConfig())
         // The shell lives on /dev/hvc1 — a dedicated clean channel. hvc0 keeps
@@ -192,6 +215,33 @@ final class VzGuestTests: XCTestCase {
             XCTAssertTrue(s.contains("/proc/meminfo"), "network=\(network)")
             XCTAssertTrue(s.contains("=EOS="), "network=\(network)")
         }
+    }
+
+    // MARK: ssh (dropbear) arm
+
+    func testInitScriptSshArmStartsDropbearKeyOnlyWithPtys() {
+        var c = vsockConfig()
+        c.network = true
+        c.sshEnabled = true
+        let s = VzGuest.buildInitScript(config: c)
+        // Key-only auth (-s), stable host keys generated into the persistent
+        // rootfs (-R), on the standard port the dedicated forwarder targets.
+        XCTAssertTrue(s.contains("dropbear -R -s -p 22"), s)
+        // dropbear is baked into the image, not host-injected — a stale cached
+        // image simply lacks it, so the start must be gated, never a hard fail.
+        XCTAssertTrue(s.contains("command -v dropbear"), "missing dropbear must not break boot")
+        // ssh sessions allocate ptys; the base init only mounts devtmpfs, which
+        // does NOT auto-mount /dev/pts — without it every session dies with
+        // "PTY allocation request failed".
+        XCTAssertTrue(s.contains("mount -t devpts devpts /dev/pts"), s)
+    }
+
+    func testInitScriptWithoutSshHasNoDropbear() {
+        var c = vsockConfig()
+        c.network = true
+        let s = VzGuest.buildInitScript(config: c)
+        XCTAssertFalse(s.contains("dropbear"), "ssh off → no sshd, no devpts requirement")
+        XCTAssertFalse(s.contains("devpts"))
     }
 
     // MARK: shell quoting

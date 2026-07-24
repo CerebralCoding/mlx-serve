@@ -71,13 +71,49 @@ struct ChatSession: Identifiable, Codable {
         attachedFolderPath = try c.decodeIfPresent(String.self, forKey: .attachedFolderPath)
     }
 
-    /// Shared default cwd for all chat sessions. Same path used by CLILauncher, AgentEngine,
-    /// and MCPManager.resolveWorkingDirectory.
-    static let defaultWorkingDirectory: String = {
-        let path = NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
+    /// Shared default cwd for all chat sessions — a SETTING since 2026-07-20
+    /// (Settings → Agent Sandbox), UserDefaults-backed with the historical
+    /// `~/.mlx-serve/workspace` as fallback. Same value feeds CLILauncher,
+    /// AgentEngine, MCPManager.resolveWorkingDirectory and
+    /// `AgentSandbox.fallbackSharedRoot` — change it through
+    /// `AppState.setDefaultAgentWorkspace`, which also retargets sessions
+    /// still on the old default and remounts a live sandbox guest.
+    static let defaultWorkspaceDefaultsKey = "agentDefaultWorkspace"
+
+    static var defaultWorkingDirectory: String { defaultWorkingDirectory(defaults: .standard) }
+
+    static var builtinDefaultWorkingDirectory: String {
+        NSString(string: "~/.mlx-serve/workspace").expandingTildeInPath
+    }
+
+    static func defaultWorkingDirectory(defaults: UserDefaults) -> String {
+        let stored = defaults.string(forKey: defaultWorkspaceDefaultsKey)
+        let path = (stored?.isEmpty == false) ? stored! : builtinDefaultWorkingDirectory
+        // The folder must exist so agent tools can use it immediately (idempotent).
         try? FileManager.default.createDirectory(atPath: path, withIntermediateDirectories: true)
         return path
-    }()
+    }
+
+    /// nil (or empty) restores the builtin default.
+    static func setDefaultWorkingDirectory(_ path: String?, defaults: UserDefaults = .standard) {
+        if let path, !path.isEmpty {
+            defaults.set(path, forKey: defaultWorkspaceDefaultsKey)
+        } else {
+            defaults.removeObject(forKey: defaultWorkspaceDefaultsKey)
+        }
+    }
+
+    /// Sessions still on the OLD default follow a default change (the chat
+    /// toolbar's folder tooltip stays in sync with Settings); a per-session
+    /// pick — or an unset wd — is never overridden.
+    static func retargeted(_ sessions: [ChatSession], from old: String, to new: String) -> [ChatSession] {
+        guard old != new else { return sessions }
+        return sessions.map { session in
+            var session = session
+            if session.workingDirectory == old { session.workingDirectory = new }
+            return session
+        }
+    }
 }
 
 /// A tool call made by the assistant, stored on the assistant message for history replay.
@@ -265,6 +301,32 @@ struct ModelInfo {
     var recTemperature: Double? = nil
     var recTopP: Double? = nil
     var recTopK: Int? = nil
+
+    /// Set when this entry is a LAN-discovered model hosted by another Mac
+    /// (the server badges remote entries with `lan_peer`; their ids are
+    /// `<model>@<peer>` and requests are proxied to that host). nil = local.
+    var lanPeer: String? = nil
+
+    /// Whether this LAN-mirrored entry serves `capability` — the tray
+    /// empty-state and the "On Your Network" pickers count through this, not
+    /// raw `capabilities`. Empty capabilities on a LAN entry means a peer
+    /// running pre-26.7.11: those servers rendered a loaded GGUF (embedded
+    /// ds4/llama engine, no chat_template in the header) with
+    /// capabilities:[], so the tray said "No models yet" while the user was
+    /// chatting on the peer's model. Media entries always advertise their
+    /// modality, so empty counts as chat and nothing else.
+    func lanAdvertises(_ capability: String) -> Bool {
+        guard lanPeer != nil else { return false }
+        if capabilities.contains(capability) { return true }
+        return capability == "chat" && capabilities.isEmpty
+    }
+
+    /// "model · peer" — the picker label for a LAN entry (`name` carries the
+    /// raw `<model>@<peer>` routing id, which is what requests must send).
+    var lanDisplayName: String {
+        guard let at = name.lastIndex(of: "@") else { return name }
+        return "\(name[name.startIndex..<at]) · \(name[name.index(after: at)...])"
+    }
 
     /// Which backend serves this model — derived from `architecture`
     /// (`model_type` in config.json / the GGUF stub). Drives the engine-

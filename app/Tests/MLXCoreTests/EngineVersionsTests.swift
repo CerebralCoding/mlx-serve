@@ -12,7 +12,8 @@ final class EngineVersionsTests: XCTestCase {
     private let sample = """
     mlx-serve 26.7.9
     mlx 0.32.0
-    mlx-c 0.6.0_3
+    mlx-c fba4470b8907
+    nax off (requires M5-class GPU)
     ggml 0.16.0 (47c786924)
     llama.cpp b9999
     gguf 3
@@ -21,8 +22,22 @@ final class EngineVersionsTests: XCTestCase {
 
     func testParsesEveryComponentInOrder() {
         let rows = EngineVersions.parse(sample)
-        XCTAssertEqual(rows.map(\.name), ["mlx-serve", "mlx", "mlx-c", "ggml", "llama.cpp", "gguf", "ds4"])
-        XCTAssertEqual(rows.map(\.version), ["26.7.9", "0.32.0", "0.6.0_3", "0.16.0 (47c786924)", "b9999", "3", "80ebbc3"])
+        XCTAssertEqual(rows.map(\.name), ["mlx-serve", "mlx", "mlx-c", "nax", "ggml", "llama.cpp", "gguf", "ds4"])
+        XCTAssertEqual(rows.map(\.version), ["26.7.9", "0.32.0", "fba4470b8907", "off (requires M5-class GPU)", "0.16.0 (47c786924)", "b9999", "3", "80ebbc3"])
+    }
+
+    func testNaxRowDisplayLabelAndExplainer() {
+        // The `nax` line ("on (...)"/"off (<reason>)", src/transformer.zig
+        // naxStatusFrom) gets a human label + explainer in Settings; every
+        // engine name must have a non-defaulted label so a new Zig line can't
+        // silently render as its raw token.
+        XCTAssertEqual(EngineVersions.displayLabel("nax"), "M5 Neural Accelerators")
+        XCTAssertFalse(EngineVersions.explainer("nax").isEmpty)
+        XCTAssertEqual(EngineVersions.displayLabel("mlx"), "MLX")
+        XCTAssertEqual(EngineVersions.displayLabel("gguf"), "GGUF format")
+        // Unknown names fall back to the raw token, never crash.
+        XCTAssertEqual(EngineVersions.displayLabel("future-engine"), "future-engine")
+        XCTAssertEqual(EngineVersions.explainer("future-engine"), "")
     }
 
     func testVersionKeepsInternalSpaces() {

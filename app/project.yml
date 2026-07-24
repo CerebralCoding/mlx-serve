@@ -23,6 +23,10 @@ packages:
   swift-ogg:
     url: https://github.com/element-hq/swift-ogg.git
     majorVersion: 0.0.4
+  SwiftTerm:
+    url: https://github.com/migueldeicaza/SwiftTerm.git
+    minVersion: 1.14.0
+    maxVersion: 2.0.0
 
 targets:
   MLXCore:
@@ -46,6 +50,8 @@ targets:
         product: OrderedCollections
       - package: swift-ogg
         product: SwiftOGG
+      - package: SwiftTerm
+        product: SwiftTerm
     settings:
       base:
         # CFBundleExecutable in Info-MAS.plist is MLXCore.

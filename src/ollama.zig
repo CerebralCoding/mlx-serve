@@ -456,7 +456,7 @@ pub fn resolveName(candidate: []const u8, ids: []const []const u8) ?usize {
     {
         var found: ?usize = null;
         for (ids, 0..) |id, i| {
-            if (std.ascii.indexOfIgnoreCase(id, base) != null) {
+            if (std.ascii.findIgnoreCase(id, base) != null) {
                 if (found != null) return null; // ambiguous
                 found = i;
             }
@@ -733,7 +733,7 @@ pub const Sink = struct {
             } else {
                 self.inner_status = try self.allocator.dupe(u8, "500 Internal Server Error");
             }
-            self.inner_is_sse = std.ascii.indexOfIgnoreCase(head, "text/event-stream") != null;
+            self.inner_is_sse = std.ascii.findIgnoreCase(head, "text/event-stream") != null;
             self.consume(he + 4);
             self.headers_done = true;
         }

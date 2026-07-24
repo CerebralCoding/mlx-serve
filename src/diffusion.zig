@@ -694,7 +694,7 @@ test "diffusion: live converged-canvas self-consistency vs mlx-vlm (DIFFUSION_TE
 
     // The canvas the reference loop committed for this prompt
     // ("<|channel>thought\n<channel|>Hello to you, friend.<turn|><eos>…").
-    var conv_host: [64]i32 = .{1} ** 64;
+    var conv_host: [64]i32 = @splat(1);
     const content = [_]i32{ 100, 45518, 107, 101, 9259, 531, 611, 236764, 4389, 236761, 106 };
     @memcpy(conv_host[0..content.len], &content);
     const cv_shape = [_]c_int{ 1, 64 };

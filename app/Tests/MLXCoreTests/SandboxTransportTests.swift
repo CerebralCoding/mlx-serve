@@ -44,6 +44,42 @@ final class SandboxTransportTests: XCTestCase {
         XCTAssertFalse(AgentSandbox.kernelHasVirtiofsSupport(kernel(withVsock: true, withVirtiofs: false)))
     }
 
+    // MARK: fallback reason names the missing half
+
+    /// Issue #89: every Developer ID build shipped WITHOUT the vz-agent in
+    /// `Resources/guest/` (build.sh staged it only for MAS; the release
+    /// workflow never built it), so sandboxed MCP always failed with a
+    /// message blaming "kernel + vz-agent" collectively. The two halves fail
+    /// independently and send the user to different fixes — the error must
+    /// name the one that is actually missing.
+    func testFallbackReasonNamesTheMissingAgent() {
+        let reason = AgentSandbox.transportFallbackReason(kernelData: kernel(withVsock: true),
+                                                          agentBinary: nil)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.contains("vz-agent"), reason!)
+        XCTAssertFalse(reason!.contains("kernel predates"), reason!)
+    }
+
+    func testFallbackReasonNamesTheStaleKernel() {
+        let reason = AgentSandbox.transportFallbackReason(kernelData: kernel(withVsock: false),
+                                                          agentBinary: "/tmp/vz-agent")
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.contains("kernel predates"), reason!)
+        XCTAssertFalse(reason!.contains("missing from the app bundle"), reason!)
+    }
+
+    func testFallbackReasonIsNilWhenVsockIsAvailable() {
+        XCTAssertNil(AgentSandbox.transportFallbackReason(kernelData: kernel(withVsock: true),
+                                                          agentBinary: "/tmp/vz-agent"))
+    }
+
+    func testFallbackReasonNamesBothWhenBothAreMissing() {
+        let reason = AgentSandbox.transportFallbackReason(kernelData: nil, agentBinary: nil)
+        XCTAssertNotNil(reason)
+        XCTAssertTrue(reason!.contains("vz-agent"), reason!)
+        XCTAssertTrue(reason!.contains("kernel"), reason!)
+    }
+
     // MARK: kernel cache is tag-versioned
 
     /// Bumping the kernel must invalidate every older cache by construction —
@@ -196,11 +232,74 @@ final class SandboxForcedOnTests: XCTestCase {
     func testConfigureAppliesTheResolvedValue() {
         let expected = AgentSandbox.resolveEnabled(requested: false)
         let before = AgentSandbox.shared.isEnabled
-        AgentSandbox.shared.configure(enabled: false,
-                                      baseImage: ServerOptions.SandboxConfig().baseImage)
+        AgentSandbox.shared.configure(enabled: false)
         XCTAssertEqual(AgentSandbox.shared.isEnabled, expected)
         // Restore whatever the suite started with (other tests read the singleton).
-        AgentSandbox.shared.configure(enabled: before,
-                                      baseImage: ServerOptions.SandboxConfig().baseImage)
+        AgentSandbox.shared.configure(enabled: before)
+    }
+
+    // MARK: - Chat header sandbox shield
+
+    /// The chat header's shield chip: green + "click opens the sandbox
+    /// terminal" when the sandbox is effectively on; gray + "turn it on in
+    /// Settings" when off. Pure state so the view stays a dumb renderer; the
+    /// MAS build (no host shell) always resolves ON.
+    func testSandboxShieldState() {
+        let on = SandboxShield.state(requestedEnabled: true, hostShellAllowed: true)
+        XCTAssertTrue(on.isOn)
+        XCTAssertEqual(on.windowId, "sandboxTerminal")
+        XCTAssertTrue(on.help.contains("isolated Linux VM"))
+
+        let off = SandboxShield.state(requestedEnabled: false, hostShellAllowed: true)
+        XCTAssertFalse(off.isOn)
+        XCTAssertEqual(off.windowId, "settings")
+        XCTAssertTrue(off.help.contains("Settings"), "OFF tooltip must tell the user where to enable it")
+
+        let mas = SandboxShield.state(requestedEnabled: false, hostShellAllowed: false)
+        XCTAssertTrue(mas.isOn, "no-host-shell builds are always sandboxed — shield must show green")
+    }
+
+    // MARK: - MCP placement follows the sandbox toggle (spawn-time decision class)
+
+    /// A stdio MCP server is pinned to the placement it was SPAWNED with (host
+    /// process vs guest bridge). The pure rule for "running servers must be
+    /// respawned": the effective toggle flipped, or the guest is being
+    /// re-provisioned under live guest-side bridges.
+    func testMcpRestartNeededRule() {
+        // Toggle flips → restart, both directions.
+        XCTAssertTrue(AgentSandbox.mcpRestartNeeded(wasEnabled: false, nowEnabled: true, guestConfigChanged: false))
+        XCTAssertTrue(AgentSandbox.mcpRestartNeeded(wasEnabled: true, nowEnabled: false, guestConfigChanged: false))
+        // Guest re-provision (image/network change) kills live bridges → restart,
+        // but only while the sandbox is actually on.
+        XCTAssertTrue(AgentSandbox.mcpRestartNeeded(wasEnabled: true, nowEnabled: true, guestConfigChanged: true))
+        XCTAssertFalse(AgentSandbox.mcpRestartNeeded(wasEnabled: false, nowEnabled: false, guestConfigChanged: true))
+        // Nothing moved → no restart.
+        XCTAssertFalse(AgentSandbox.mcpRestartNeeded(wasEnabled: true, nowEnabled: true, guestConfigChanged: false))
+        XCTAssertFalse(AgentSandbox.mcpRestartNeeded(wasEnabled: false, nowEnabled: false, guestConfigChanged: false))
+    }
+
+    /// `configure` must announce a placement change so MCPManager can respawn
+    /// running stdio servers where the CURRENT setting says they belong —
+    /// without this, servers started before "enable sandbox" keep running on
+    /// the host with full user permissions (live report 2026-07-19).
+    func testConfigurePostsPlacementChangeOnToggleFlip() {
+        let before = AgentSandbox.shared.isEnabled
+        defer { AgentSandbox.shared.configure(enabled: before) }
+        // Only meaningful where the toggle actually resolves both ways
+        // (Developer ID build; MAS forces the sandbox on).
+        guard AgentSandbox.resolveEnabled(requested: false) == false else { return }
+
+        AgentSandbox.shared.configure(enabled: false) // known baseline
+        var posts = 0
+        let token = NotificationCenter.default.addObserver(
+            forName: AgentSandbox.placementChanged, object: nil, queue: nil) { _ in posts += 1 }
+        defer { NotificationCenter.default.removeObserver(token) }
+
+        AgentSandbox.shared.configure(enabled: true)
+        XCTAssertEqual(posts, 1, "off→on must announce the placement change")
+        AgentSandbox.shared.configure(enabled: true)
+        XCTAssertEqual(posts, 1, "no-op reapply must NOT announce")
+        AgentSandbox.shared.configure(enabled: false)
+        XCTAssertEqual(posts, 2, "on→off must announce (guest bridges just died)")
     }
 }
