@@ -9396,6 +9396,80 @@ pub const Transformer = struct {
         return out; // [K, 1, out]
     }
 
+    /// Decode-width MoE expert compute through the in-place gather-qmv kernel
+    /// (`gatherQmv`), which indexes the expert bank directly instead of
+    /// materializing the top-K experts. On success writes [B,S,K,hidden] into
+    /// `out` and returns true; returns false when any projection is outside the
+    /// kernel's supported set (non-affine bank, 3/5/6-bit width, odd geometry),
+    /// leaving `out` untouched so the caller runs the batched take path.
+    fn moeDecodeGatherQmv(
+        self: *Transformer,
+        out: *mlx.mlx_array,
+        expert_x: mlx.mlx_array,
+        inds: mlx.mlx_array,
+        mw: *const MoeMlpWeights,
+        gate_qp: anytype,
+        up_qp: anytype,
+        down_qp: anytype,
+        D: c_int,
+        K: c_int,
+        B: c_int,
+        S: c_int,
+    ) !bool {
+        // Routing indices arrive as int32/uint32 [.., K]; the kernel reads a
+        // flat uint32 [K].
+        var inds_u32 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(inds_u32);
+        {
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            const kshape = [_]c_int{K};
+            try mlx.check(mlx.mlx_reshape(&flat, inds, &kshape, 1, self.s));
+            try mlx.check(mlx.mlx_astype(&inds_u32, flat, .uint32, self.s));
+        }
+        var x_flat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x_flat);
+        const dshape = [_]c_int{D};
+        try mlx.check(mlx.mlx_reshape(&x_flat, expert_x, &dshape, 1, self.s));
+
+        // gate / up share the single token's hidden state.
+        const gate_2d = try gatherQmv(self.s, x_flat, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, inds_u32, gate_qp.bits, gate_qp.group_size, gate_qp.mode, false) orelse return false;
+        defer _ = mlx.mlx_array_free(gate_2d);
+        const up_2d = try gatherQmv(self.s, x_flat, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, inds_u32, up_qp.bits, up_qp.group_size, up_qp.mode, false) orelse return false;
+        defer _ = mlx.mlx_array_free(up_2d);
+
+        const inter = mlx.getShape(gate_2d)[1];
+        const k1i = [_]c_int{ K, 1, inter };
+        var gate_out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gate_out);
+        try mlx.check(mlx.mlx_reshape(&gate_out, gate_2d, &k1i, 3, self.s));
+        var up_out = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(up_out);
+        try mlx.check(mlx.mlx_reshape(&up_out, up_2d, &k1i, 3, self.s));
+
+        const expert_act = try self.computeGeglu(gate_out, up_out); // [K,1,inter]
+        defer _ = mlx.mlx_array_free(expert_act);
+
+        // down: each expert consumes ITS OWN activation → per-expert x layout.
+        var act_2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(act_2d);
+        const ki = [_]c_int{ K, inter };
+        try mlx.check(mlx.mlx_reshape(&act_2d, expert_act, &ki, 2, self.s));
+        const down_2d = try gatherQmv(self.s, act_2d, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b, inds_u32, down_qp.bits, down_qp.group_size, down_qp.mode, true) orelse return false;
+        defer _ = mlx.mlx_array_free(down_2d);
+
+        const hidden = mlx.getShape(down_2d)[1];
+        const bskh_shape = [_]c_int{ B, S, K, hidden };
+        try mlx.check(mlx.mlx_reshape(out, down_2d, &bskh_shape, 4, self.s));
+        // Engagement is COUNTED, never inferred: a silent fallback to the
+        // batched take path is output-identical and would look like a null win.
+        if (!gqmv_engaged) {
+            gqmv_engaged = true;
+            log.info("[moe] gather-qmv kernel engaged: E_topk={d} inter={d} hidden={d} bits={d} gs={d}\n", .{ K, mlx.getShape(gate_2d)[1], hidden, gate_qp.bits, gate_qp.group_size });
+        }
+        return true;
+    }
+
     /// MoE MLP with separate router and expert inputs.
     /// router_x: input for routing (raw hidden states).
     /// expert_x: input for expert computation (possibly normalized).
@@ -9578,6 +9652,16 @@ pub const Transformer = struct {
             const hidden = mlx.getShape(down_unsorted)[1];
             const bskh_shape = [_]c_int{ B, S, K, hidden };
             try mlx.check(mlx.mlx_reshape(&down_out, down_unsorted, &bskh_shape, 4, self.s));
+        } else if (B * S == 1 and useBatchedExpertDecode(self) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
+            try self.moeDecodeGatherQmv(&down_out, expert_x, inds, mw, gate_qp, up_qp, down_qp, D, K, B, S))
+        {
+            // ── Decode fast path: in-place gather-qmv kernel ──
+            // Reads the expert bank directly with GPU-resident indices, so it
+            // moves the ideal 9.8 MB/projection instead of the take path's 3x
+            // (µbench at Laguna's 201 MB bank: 37 us vs batched 72 vs stock
+            // gather_qmm 349). Everything is done inside the predicate; a null
+            // return (non-affine bank, unsupported width) falls through to the
+            // batched take path below with no behaviour change.
         } else if (B * S == 1 and useBatchedExpertDecode(self) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null) {
             // ── Decode fast path: take experts + batched quantized_matmul ──
             // Dodges our libmlx's serialized decode gather_qmm. A per-arch
@@ -11212,6 +11296,185 @@ fn decodeProfReport() void {
     const ms_ = per.ms(decode_prof.moe_shared_ns, n);
     log.info("[decode-prof] n={d} serial/tok={d:.2}ms  embed={d:.2} attn={d:.2} mlp={d:.2} lmhead={d:.2} ms | moe: router={d:.2} experts={d:.2} shared={d:.2} ms\n", .{ n, e + a + m + l, e, a, m, l, mr, mx_, ms_ });
     decode_prof = .{};
+}
+
+// ── MoE decode gather-qmv kernel ──
+// MLX's `gather_qmm` at decode width costs O(EXPERT BANK SIZE), not O(work), in
+// any C/C++ process (it is flat under pip-Python with the identical dylib —
+// measured E-sweep in the `MoE decode gather` µbench: 30/50/77/300 us at banks
+// of 8/25/50/201 MB, all reading the SAME 10 experts). 141 gathers/token x 300 us
+// is the whole 42 ms/token Laguna decode. `take` from the same 201 MB bank does
+// NOT pay it, so indexed reads are fine; the penalty is specific to gather_qmm's
+// addressing.
+//
+// The shipped workaround (`batchedExpertMm`: take + broadcast + batched qmm)
+// dodges it but pays a materialization round-trip — read 9.8 MB of experts,
+// write 9.8 MB, read 9.8 MB back = 3x the ideal traffic, which is exactly its
+// measured 70 us against a 67 us bandwidth prediction. It cannot go faster.
+//
+// This kernel reads the bank IN PLACE with GPU-resident indices: one simdgroup
+// per (expert slot, output row), each lane striding the packed row and reducing
+// with simd_sum. Ideal traffic, no copy, no host sync for the top-K indices.
+//
+// `X_PER_EXPERT` picks the input layout: 0 = one shared x [K] (gate/up
+// projections, every expert sees the same token), 1 = x [TOPK, K] (the down
+// projection, where each expert consumes its own activation).
+fn gatherQmvSource(comptime x_per_expert: bool) [:0]const u8 {
+    // Everything is indexed off the raw buffer names rather than through
+    // explicitly address-spaced pointers: MLX generates the signature from each
+    // input's ACTUAL dtype and puts arrays with fewer than 8 elements in
+    // `constant` instead of `device` (backend/common/metal_kernel.cpp), so a
+    // hand-declared `const device T*` would mismatch on both counts. `x` in
+    // particular arrives as float32 on Laguna while scales/biases are bf16.
+    //
+    // A uint4 (128-bit) load variant was measured and is NOT kept: 38.9 us vs
+    // 37.3 for the scalar form. At ~5 ALU ops per dequantized value this loop
+    // is ALU-bound, not load-width bound, so widening the loads only adds code.
+    return std.fmt.comptimePrint(
+        \\auto lane = thread_index_in_simdgroup;
+        \\uint n = thread_position_in_grid.y;      // output row within the expert
+        \\uint e = thread_position_in_grid.z;      // top-K slot
+        \\
+        \\int K = int(K_size);
+        \\int N = int(N_size);
+        \\int VPW = 32 / BITS;                     // quantized values per uint32 word
+        \\int K_by_p = K / VPW;                    // packed words per row
+        \\int K_by_gs = K / GS;                    // quant groups per row
+        \\uint mask = (1u << BITS) - 1u;
+        \\
+        \\uint eid = inds[e];                      // bank row for this slot
+        \\size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_p + (size_t)n * (size_t)K_by_p;
+        \\size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
+        \\size_t xoff = {s};
+        \\
+        \\// Four independent accumulators so the per-lane FMA chain is not one
+        \\// serial dependency; VPW is 16/8/4 for bits 2/4/8, always a multiple of 4.
+        \\float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+        \\for (int pack = int(lane); pack < K_by_p; pack += 32) {{
+        \\  uint32_t packed = w_q[wbase + (size_t)pack];
+        \\  int k_base = pack * VPW;
+        \\  int gi = k_base / GS;                  // GS >= VPW, so one group per word
+        \\  float sj = float(scales[gbase + (size_t)gi]);
+        \\  float bj = float(biases[gbase + (size_t)gi]);
+        \\  for (int ki = 0; ki < VPW; ki += 4) {{
+        \\    size_t xi = xoff + (size_t)(k_base + ki);
+        \\    uint32_t q = packed >> (ki * BITS);
+        \\    a0 += float(x[xi + 0]) * (float((q >> (0 * BITS)) & mask) * sj + bj);
+        \\    a1 += float(x[xi + 1]) * (float((q >> (1 * BITS)) & mask) * sj + bj);
+        \\    a2 += float(x[xi + 2]) * (float((q >> (2 * BITS)) & mask) * sj + bj);
+        \\    a3 += float(x[xi + 3]) * (float((q >> (3 * BITS)) & mask) * sj + bj);
+        \\  }}
+        \\}}
+        \\float acc = simd_sum((a0 + a1) + (a2 + a3));
+        \\if (lane == 0) {{
+        \\  y[(size_t)e * (size_t)N + (size_t)n] = T(acc);
+        \\}}
+    , .{if (x_per_expert) "(size_t)e * (size_t)K" else "0"});
+}
+
+const GQMV_SOURCES = [2][:0]const u8{ gatherQmvSource(false), gatherQmvSource(true) };
+const GQMV_NAMES = [2][*:0]const u8{ "mlxserve_moe_gather_qmv", "mlxserve_moe_gather_qmv_px" };
+var gqmv_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
+
+fn getGatherQmvKernel(x_per_expert: bool) !mlx.mlx_fast_metal_kernel {
+    const idx: usize = @intFromBool(x_per_expert);
+    if (gqmv_kernels[idx]) |k| return k;
+    const input_names = [_][*:0]const u8{ "x", "w_q", "scales", "biases", "inds", "K_size", "N_size" };
+    const output_names = [_][*:0]const u8{"y"};
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const kernel = mlx.mlx_fast_metal_kernel_new(
+        GQMV_NAMES[idx],
+        in_vec,
+        out_vec,
+        GQMV_SOURCES[idx],
+        "",
+        true,
+        false,
+    );
+    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+    gqmv_kernels[idx] = kernel;
+    return kernel;
+}
+
+var gqmv_disabled_env: ?bool = null;
+var gqmv_engaged: bool = false;
+
+/// Decode-width gathered qmv over an expert bank, read in place.
+/// `x`: [K] shared (x_per_expert=false) or [TOPK, K] (true), bf16/fp16.
+/// `w`/`sc`/`bi`: the affine bank, [E, N, K*BITS/32] / [E, N, K/GS].
+/// `inds`: [TOPK] uint32 bank rows. Returns [TOPK, N], or null when the shape
+/// or quant geometry is outside the supported set (caller falls back).
+fn gatherQmv(
+    s: mlx.mlx_stream,
+    x: mlx.mlx_array,
+    w: mlx.mlx_array,
+    sc: mlx.mlx_array,
+    bi: mlx.mlx_array,
+    inds: mlx.mlx_array,
+    bits: u32,
+    group_size: u32,
+    mode: QuantMode,
+    x_per_expert: bool,
+) !?mlx.mlx_array {
+    if (envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    // The kernel implements the AFFINE dequant (q * scale + bias) only. Laguna's
+    // upstream checkpoint ships nvfp4 experts, so this guard is load-bearing:
+    // running an nvfp4 bank through affine math is silently wrong, not a crash.
+    if (mode != .affine) return null;
+    // Only widths where one uint32 holds a whole number of values (5/6-bit
+    // affine is byte-packed differently — those fall back).
+    if (bits != 2 and bits != 4 and bits != 8) return null;
+    if (group_size % (32 / bits) != 0) return null; // one quant group per word
+    if (sc.ctx == null or bi.ctx == null) return null;
+    const xd = mlx.mlx_array_dtype(x);
+    if (xd != .bfloat16 and xd != .float16 and xd != .float32) return null;
+    if (mlx.mlx_array_dtype(inds) != .uint32) return null;
+
+    const wsh = mlx.getShape(w);
+    if (wsh.len != 3) return null;
+    const N: c_int = wsh[1];
+    const K: c_int = @intCast(@divExact(@as(u32, @intCast(wsh[2])) * 32, bits));
+    if (@rem(K, @as(c_int, @intCast(group_size))) != 0) return null;
+    const ish = mlx.getShape(inds);
+    if (ish.len != 1) return null;
+    const topk: c_int = ish[0];
+    const xsh = mlx.getShape(x);
+    var xelems: i64 = 1;
+    for (xsh) |d| xelems *= d;
+    const want: i64 = if (x_per_expert) @as(i64, topk) * K else K;
+    if (xelems != want) return null;
+
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    const y_shape = [_]c_int{ topk, N };
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
+    // One simdgroup per (slot, row); 8 simdgroups to a threadgroup.
+    const sgs_per_tg: c_int = 8;
+    if (@rem(N, sgs_per_tg) != 0) return null;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, N, topk));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, sgs_per_tg, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
+
+    const K_arr = cachedScalarInt(K);
+    const N_arr = cachedScalarInt(N);
+    const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, inds, K_arr, N_arr };
+    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
+    defer _ = mlx.mlx_vector_array_free(inputs_vec);
+
+    const kernel = try getGatherQmvKernel(x_per_expert);
+    var outputs_vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs_vec);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
+    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
+    return y;
 }
 
 /// Gathered matmul for MoE expert dispatch — handles both quantized and dense bf16.
@@ -12982,6 +13245,169 @@ test "qmatmulBits nvfp4 matches dequantize+matmul reference" {
     try testReadF32(got, &got_host, s);
 
     for (0..OUT) |o| try testing.expectApproxEqAbs(gt[o], got_host[o], 5e-2);
+}
+
+test "gatherQmv is no worse than stock gather_qmm vs fp32 dequant ground truth" {
+    // Per the kernel-testing rule: assert NO-WORSE-THAN-REFERENCE against fp32
+    // dequant ground truth, never kernel-vs-kernel agreement (both round to
+    // bf16 in different orders, so exact agreement is not a real invariant).
+    // Covers BOTH input layouts: the shared-x gate/up projection and the
+    // per-expert-x down projection.
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x9E3779B9);
+    const rnd = prng.random();
+
+    const E: c_int = 8;
+    const N: c_int = 64;
+    const K: c_int = 256;
+    const TOPK: c_int = 3;
+
+    for ([_]struct { bits: u32, gs: u32 }{
+        .{ .bits = 2, .gs = 64 },
+        .{ .bits = 4, .gs = 64 },
+        .{ .bits = 8, .gs = 32 },
+    }) |cfg| {
+        // fp32 is the LIVE Laguna case: expert_x arrives as float32 while the
+        // bank's scales/biases are bf16. A bf16-only test missed it entirely.
+        for ([_]mlx.mlx_dtype{ .bfloat16, .float32 }) |xdt| {
+        for ([_]bool{ false, true }) |x_per_expert| {
+            // ── quantized bank [E,N,K] ──
+            const wcnt: usize = @intCast(E * N * K);
+            const wbuf = try allocator.alloc(f32, wcnt);
+            defer allocator.free(wbuf);
+            for (wbuf) |*v| v.* = rnd.float(f32) - 0.5;
+            const wsh = [_]c_int{ E, N, K };
+            const w32 = mlx.mlx_array_new_data(wbuf.ptr, &wsh, 3, .float32);
+            defer _ = mlx.mlx_array_free(w32);
+            var wb = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wb);
+            try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
+            var triple = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(triple);
+            try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(@intCast(cfg.gs)), mlx.mlx_optional_int.some(@intCast(cfg.bits)), "affine", .{}, s));
+            var wq = mlx.mlx_array_new();
+            var wsc = mlx.mlx_array_new();
+            var wbi = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wq);
+            defer _ = mlx.mlx_array_free(wsc);
+            defer _ = mlx.mlx_array_free(wbi);
+            try mlx.check(mlx.mlx_vector_array_get(&wq, triple, 0));
+            try mlx.check(mlx.mlx_vector_array_get(&wsc, triple, 1));
+            try mlx.check(mlx.mlx_vector_array_get(&wbi, triple, 2));
+
+            // ── x: [K] shared, or [TOPK,K] per expert ──
+            const xrows: c_int = if (x_per_expert) TOPK else 1;
+            const xcnt: usize = @intCast(xrows * K);
+            const xbuf = try allocator.alloc(f32, xcnt);
+            defer allocator.free(xbuf);
+            for (xbuf) |*v| v.* = rnd.float(f32) - 0.5;
+            const xsh = [_]c_int{ xrows, K };
+            const x32 = mlx.mlx_array_new_data(xbuf.ptr, &xsh, 2, .float32);
+            defer _ = mlx.mlx_array_free(x32);
+            var x = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x);
+            try mlx.check(mlx.mlx_astype(&x, x32, xdt, s));
+
+            const idxvals = [_]u32{ 5, 0, 3 };
+            const idxsh = [_]c_int{TOPK};
+            const inds = mlx.mlx_array_new_data(&idxvals, &idxsh, 1, .uint32);
+            defer _ = mlx.mlx_array_free(inds);
+
+            // ── fp32 ground truth: dequantize the bank, take the 3 experts,
+            // and do the matmul entirely in float32.
+            var deq = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(deq);
+            try mlx.check(mlx.mlx_dequantize(&deq, wq, wsc, wbi, mlx.mlx_optional_int.some(@intCast(cfg.gs)), mlx.mlx_optional_int.some(@intCast(cfg.bits)), "affine", .{}, .{}, s));
+            var deq32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(deq32);
+            try mlx.check(mlx.mlx_astype(&deq32, deq, .float32, s));
+            var sel = mlx.mlx_array_new(); // [TOPK,N,K]
+            defer _ = mlx.mlx_array_free(sel);
+            try mlx.check(mlx.mlx_take_axis(&sel, deq32, inds, 0, s));
+            var selT = mlx.mlx_array_new(); // [TOPK,K,N]
+            defer _ = mlx.mlx_array_free(selT);
+            const tax = [_]c_int{ 0, 2, 1 };
+            try mlx.check(mlx.mlx_transpose_axes(&selT, sel, &tax, 3, s));
+            // x as [TOPK,1,K] (broadcast the shared row when needed)
+            var x32r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x32r);
+            const x3 = [_]c_int{ xrows, 1, K };
+            try mlx.check(mlx.mlx_reshape(&x32r, x32, &x3, 3, s));
+            var x32b = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x32b);
+            const xb3 = [_]c_int{ TOPK, 1, K };
+            try mlx.check(mlx.mlx_broadcast_to(&x32b, x32r, &xb3, 3, s));
+            var truth = mlx.mlx_array_new(); // [TOPK,1,N]
+            defer _ = mlx.mlx_array_free(truth);
+            try mlx.check(mlx.mlx_matmul(&truth, x32b, selT, s));
+            const tflat = [_]c_int{ TOPK, N };
+            var truth2 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(truth2);
+            try mlx.check(mlx.mlx_reshape(&truth2, truth, &tflat, 2, s));
+
+            // ── stock gather_qmm, same layouts ──
+            var xg = mlx.mlx_array_new(); // [TOPK,1,K]
+            defer _ = mlx.mlx_array_free(xg);
+            {
+                var xr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(xr);
+                try mlx.check(mlx.mlx_reshape(&xr, x, &x3, 3, s));
+                try mlx.check(mlx.mlx_broadcast_to(&xg, xr, &xb3, 3, s));
+            }
+            var stock3 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(stock3);
+            const lhs3 = [_]u32{ 0, 1, 2 };
+            const lhs_used = if (x_per_expert) blk: {
+                break :blk mlx.mlx_array_new_data(&lhs3, &idxsh, 1, .uint32);
+            } else blk: {
+                const zeros = [_]u32{ 0, 0, 0 };
+                break :blk mlx.mlx_array_new_data(&zeros, &idxsh, 1, .uint32);
+            };
+            defer _ = mlx.mlx_array_free(lhs_used);
+            try mlx.check(mlx.mlx_gather_qmm(&stock3, xg, wq, wsc, wbi, lhs_used, inds, true, mlx.mlx_optional_int.some(@intCast(cfg.gs)), mlx.mlx_optional_int.some(@intCast(cfg.bits)), "affine", false, s));
+            var stock2 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(stock2);
+            try mlx.check(mlx.mlx_reshape(&stock2, stock3, &tflat, 2, s));
+
+            // ── ours ──
+            const maybe = try gatherQmv(s, x, wq, wsc, wbi, inds, cfg.bits, cfg.gs, .affine, x_per_expert);
+            try testing.expect(maybe != null);
+            const ours = maybe.?;
+            defer _ = mlx.mlx_array_free(ours);
+
+            const maxAbsErr = struct {
+                fn go(a: mlx.mlx_array, ref: mlx.mlx_array, str: mlx.mlx_stream) !f32 {
+                    var a32 = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(a32);
+                    try mlx.check(mlx.mlx_astype(&a32, a, .float32, str));
+                    var d = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(d);
+                    try mlx.check(mlx.mlx_subtract(&d, a32, ref, str));
+                    var ad = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(ad);
+                    try mlx.check(mlx.mlx_abs(&ad, d, str));
+                    var mx = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(mx);
+                    try mlx.check(mlx.mlx_max(&mx, ad, false, str));
+                    try mlx.check(mlx.mlx_array_eval(mx));
+                    var out: f32 = 0;
+                    try mlx.check(mlx.mlx_array_item_float32(&out, mx));
+                    return out;
+                }
+            }.go;
+
+            const err_ours = try maxAbsErr(ours, truth2, s);
+            const err_stock = try maxAbsErr(stock2, truth2, s);
+            // No worse than stock against the same fp32 ground truth (small
+            // slack for bf16 accumulation-order differences).
+            testing.expect(err_ours <= err_stock * 1.05 + 1e-3) catch |e| {
+                std.debug.print("\n[gather-qmv] bits={d} gs={d} xdt={any} per_expert_x={} ours_err={d:.6} stock_err={d:.6}\n", .{ cfg.bits, cfg.gs, xdt, x_per_expert, err_ours, err_stock });
+                return e;
+            };
+        }
+        }
+    }
 }
 
 test "gatherExpertMm nvfp4 matches per-expert dequantized reference" {
@@ -15479,6 +15905,254 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
         }
         const ms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / @as(f64, @floatFromInt(ITER));
         std.debug.print("[moe-gather-ubench] 141 BATCHED qmv over 10 experts, one eval (our MLX): {d:.2} ms  ({d:.1} us/batched)\n", .{ ms, ms * 1000.0 / @as(f64, NG) });
+    }
+    // (4b) OUR gatherQmv kernel: reads the bank IN PLACE with GPU-resident
+    // indices, so it moves the ideal 9.8 MB instead of the batched path's 3x.
+    // Target is pip-Python's gather number (~22 us), not the batched 70 us.
+    {
+        const idx10 = [_]u32{ 0, 5, 9, 13, 40, 77, 120, 200, 3, 88 };
+        const idx10sh = [_]c_int{TOPK};
+        const inds_u32 = mlx.mlx_array_new_data(&idx10, &idx10sh, 1, .uint32);
+        defer _ = mlx.mlx_array_free(inds_u32);
+        const xk = [_]c_int{K};
+        var xflat = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xflat);
+        try mlx.check(mlx.mlx_reshape(&xflat, x, &xk, 1, s));
+        try mlx.check(mlx.mlx_array_eval(xflat));
+
+        const NG = 141;
+        const ITER: usize = if (gather_trace) 200 else 20;
+        var pass: usize = 0;
+        while (pass < ITER + 1) : (pass += 1) {
+            if (pass == 1) sw.reset();
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var j: usize = 0;
+            while (j < NG) : (j += 1) {
+                const g = (try gatherQmv(s, xflat, gate[0], gate[1], gate[2], inds_u32, BITS, GS, .affine, false)).?;
+                defer _ = mlx.mlx_array_free(g);
+                try mlx.check(mlx.mlx_vector_array_append_value(vec, g));
+            }
+            try mlx.check(mlx.mlx_eval(vec));
+        }
+        const gms = @as(f64, @floatFromInt(sw.read())) / 1.0e6 / @as(f64, @floatFromInt(ITER));
+        std.debug.print("[moe-gather-ubench] 141 OUR gatherQmv (in-place bank), one eval: {d:.2} ms  ({d:.1} us/gather)\n", .{ gms, gms * 1000.0 / @as(f64, NG) });
+    }
+    // (5) ISOLATION MATRIX. A solo gather is ~144 us but 141-in-one-graph is
+    // ~349 us EACH — batching makes each gather SLOWER than running it alone,
+    // so this is not merely "fails to overlap". Two candidate serializers, each
+    // testable independently (2x2):
+    //   - add-chain: the accumulate in (2) is a serial dependency chain, and
+    //     every dependent op forces a FULL `memoryBarrier(BarrierScopeBuffers)`
+    //     in MLX's concurrent command encoder (backend/metal/device.cpp
+    //     maybeInsertBarrier) — one barrier per link drains the whole GPU.
+    //   - implicit lhs_indices: `gather_qmm` with a null lhs runs
+    //     `indices_or_default` (ops.cpp), which emits a per-call
+    //     arange+reshape. The gather then READS that fresh arange output, so
+    //     each gather is data-dependent on a kernel dispatched immediately
+    //     before it => another guaranteed barrier per gather. Plain qmv has no
+    //     index prep at all, which is exactly why it overlaps.
+    // Passing an explicit lhs (broadcastable zeros) hoists the index array out
+    // of the per-call graph and should remove the second barrier entirely.
+    {
+        const NG = 141;
+        // Explicit lhs_indices, built ONCE and reused by every gather: uint32
+        // zeros shaped [1,1,TOPK] so it broadcasts against rhs without work.
+        const lhs_vals = [_]u32{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0 }; // TOPK zeros
+        const lhs_sh = [_]c_int{ 1, 1, TOPK };
+        const lhs_idx = mlx.mlx_array_new_data(&lhs_vals, &lhs_sh, 3, .uint32);
+        defer _ = mlx.mlx_array_free(lhs_idx);
+        try mlx.check(mlx.mlx_array_eval(lhs_idx));
+
+        const oneGatherLhs = struct {
+            fn go(str: mlx.mlx_stream, xin: mlx.mlx_array, bank: [3]mlx.mlx_array, lhs: mlx.mlx_array, ind: mlx.mlx_array, add: f32) !mlx.mlx_array {
+                const sh5 = [_]c_int{ 1, 1, 1, 1, K };
+                var xe = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(xe);
+                try mlx.check(mlx.mlx_reshape(&xe, xin, &sh5, 5, str));
+                if (add != 0.0) {
+                    const sc = mlx.mlx_array_new_float(add);
+                    defer _ = mlx.mlx_array_free(sc);
+                    var xa = mlx.mlx_array_new();
+                    try mlx.check(mlx.mlx_add(&xa, xe, sc, str));
+                    _ = mlx.mlx_array_free(xe);
+                    xe = xa;
+                }
+                var out5 = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_gather_qmm(&out5, xe, bank[0], bank[1], bank[2], lhs, ind, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", false, str));
+                return out5;
+            }
+        }.go;
+
+        // Run one cell of the matrix: `explicit_lhs` x `chain` (add-chain vs a
+        // flat vector eval of 141 independent results).
+        const cell = struct {
+            fn go(str: mlx.mlx_stream, xin: mlx.mlx_array, bank: [3]mlx.mlx_array, lhs: mlx.mlx_array, ind: mlx.mlx_array, explicit_lhs: bool, chain: bool, iters: usize, watch: *io_util.Stopwatch) !f64 {
+                var pass: usize = 0;
+                var total_ns: u64 = 0;
+                // one warmup pass then `iters` timed passes
+                while (pass < iters + 1) : (pass += 1) {
+                    if (pass == 1) watch.reset();
+                    var acc = mlx.mlx_array_new();
+                    var first = true;
+                    const vec = mlx.mlx_vector_array_new();
+                    defer _ = mlx.mlx_vector_array_free(vec);
+                    var j: usize = 0;
+                    while (j < NG) : (j += 1) {
+                        const bias = @as(f32, @floatFromInt(j)) * 0.001;
+                        const g = if (explicit_lhs)
+                            try oneGatherLhs(str, xin, bank, lhs, ind, bias)
+                        else
+                            try oneGather(str, xin, bank, ind, bias);
+                        if (!chain) {
+                            try mlx.check(mlx.mlx_vector_array_append_value(vec, g));
+                            _ = mlx.mlx_array_free(g);
+                            continue;
+                        }
+                        if (first) {
+                            acc = g;
+                            first = false;
+                        } else {
+                            var na = mlx.mlx_array_new();
+                            try mlx.check(mlx.mlx_add(&na, acc, g, str));
+                            _ = mlx.mlx_array_free(acc);
+                            _ = mlx.mlx_array_free(g);
+                            acc = na;
+                        }
+                    }
+                    if (chain) {
+                        try mlx.check(mlx.mlx_array_eval(acc));
+                        _ = mlx.mlx_array_free(acc);
+                    } else {
+                        try mlx.check(mlx.mlx_eval(vec));
+                    }
+                }
+                total_ns = watch.read();
+                return @as(f64, @floatFromInt(total_ns)) / 1.0e6 / @as(f64, @floatFromInt(iters));
+            }
+        }.go;
+
+        const ITER: usize = if (gather_trace) 200 else 20;
+        std.debug.print("[moe-gather-ubench] --- isolation matrix (141 gathers, one eval) ---\n", .{});
+        for ([_]bool{ false, true }) |explicit_lhs| {
+            for ([_]bool{ true, false }) |chain| {
+                const ms = try cell(s, x, gate, lhs_idx, inds, explicit_lhs, chain, ITER, &sw);
+                std.debug.print("[moe-gather-ubench]   lhs={s:<8} accum={s:<9} {d:6.2} ms  ({d:.1} us/gather)\n", .{
+                    if (explicit_lhs) "explicit" else "implicit",
+                    if (chain) "add-chain" else "none",
+                    ms,
+                    ms * 1000.0 / @as(f64, NG),
+                });
+            }
+        }
+
+        // (6) FULLY INDEPENDENT: every input pre-materialized, so the 141
+        // gathers have NO producer op in the graph at all — no add feeding x,
+        // no arange feeding the indices, no accumulate consuming the outputs.
+        // If these still fail to overlap, no data dependency (and therefore no
+        // MLX barrier) is responsible and the cost is the kernel itself.
+        // The qmv control runs on the SAME pre-materialized x list.
+        {
+            var xs: [NG]mlx.mlx_array = undefined;
+            for (&xs, 0..) |*slot, j| {
+                const sh5 = [_]c_int{ 1, 1, 1, 1, K };
+                var xr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(xr);
+                try mlx.check(mlx.mlx_reshape(&xr, x, &sh5, 5, s));
+                const scl = mlx.mlx_array_new_float(@as(f32, @floatFromInt(j)) * 0.001);
+                defer _ = mlx.mlx_array_free(scl);
+                var xa = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&xa, xr, scl, s));
+                try mlx.check(mlx.mlx_array_eval(xa)); // materialize: no producer left
+                slot.* = xa;
+            }
+            defer for (xs) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+
+            const indep = struct {
+                fn go(str: mlx.mlx_stream, xlist: []const mlx.mlx_array, bank: [3]mlx.mlx_array, lhs: mlx.mlx_array, ind: mlx.mlx_array, iters: usize, watch: *io_util.Stopwatch) !f64 {
+                    var pass: usize = 0;
+                    while (pass < iters + 1) : (pass += 1) {
+                        if (pass == 1) watch.reset();
+                        const vec = mlx.mlx_vector_array_new();
+                        defer _ = mlx.mlx_vector_array_free(vec);
+                        for (xlist) |xj| {
+                            var out5 = mlx.mlx_array_new();
+                            defer _ = mlx.mlx_array_free(out5);
+                            try mlx.check(mlx.mlx_gather_qmm(&out5, xj, bank[0], bank[1], bank[2], lhs, ind, true, mlx.mlx_optional_int.some(GS), mlx.mlx_optional_int.some(BITS), "affine", false, str));
+                            try mlx.check(mlx.mlx_vector_array_append_value(vec, out5));
+                        }
+                        try mlx.check(mlx.mlx_eval(vec));
+                    }
+                    return @as(f64, @floatFromInt(watch.read())) / 1.0e6 / @as(f64, @floatFromInt(iters));
+                }
+            }.go;
+
+            const ms_impl = try indep(s, &xs, gate, .{ .ctx = null }, inds, ITER, &sw);
+            std.debug.print("[moe-gather-ubench]   lhs=implicit inputs=premat {d:6.2} ms  ({d:.1} us/gather)\n", .{ ms_impl, ms_impl * 1000.0 / @as(f64, NG) });
+            const ms_expl = try indep(s, &xs, gate, lhs_idx, inds, ITER, &sw);
+            std.debug.print("[moe-gather-ubench]   lhs=explicit inputs=premat {d:6.2} ms  ({d:.1} us/gather)\n", .{ ms_expl, ms_expl * 1000.0 / @as(f64, NG) });
+
+            // (7) BANK-SIZE SWEEP. Every cell below reads the SAME 10 experts
+            // (identical bytes touched, identical FLOPs) — only the size of the
+            // bank they are indexed out of changes. A flat curve means the
+            // gather kernel is uniformly slow; a curve that rises with E means
+            // the cost is bank-extent addressing (TLB/cache), not the math.
+            const E_SWEEP = [_]c_int{ 10, 32, 64, 256 };
+            // MLX's default wired limit is 0 (backend/metal/allocator.cpp), so
+            // the residency set wires NOTHING and every expert bank lives in
+            // `unwired_set_`. Run the sweep at the default and again with the
+            // banks wired: if the O(E) slope collapses when wired, the cost is
+            // per-dispatch residency/page validation of the bound allocation,
+            // not the gather math.
+            // Python's sweep runs from a clean allocator (active=0/cache=0) and
+            // is FLAT in E; ours runs after ~11 GB of buffer cache has piled up
+            // from building the banks. Sweep both ways: `clear` drops MLX's
+            // cached MTLBuffers first.
+            for ([_]bool{ false, true }) |clear_first| {
+                if (clear_first) try mlx.check(mlx.mlx_clear_cache());
+                var prev: usize = 0;
+                const wired: usize = 0;
+                try mlx.check(mlx.mlx_set_wired_limit(&prev, wired));
+                var a0: usize = 0;
+                var c0: usize = 0;
+                try mlx.check(mlx.mlx_get_active_memory(&a0));
+                try mlx.check(mlx.mlx_get_cache_memory(&c0));
+                std.debug.print("[moe-gather-ubench]   -- clear_cache_first={} (active={d} MB cache={d} MB) --\n", .{ clear_first, a0 >> 20, c0 >> 20 });
+                for (E_SWEEP) |e| {
+                    var sweep_prng = std.Random.DefaultPrng.init(0xC0FFEE);
+                    const bank = try makeBank(allocator, e, N, K, s, &sweep_prng);
+                    defer for (bank) |a| {
+                        _ = mlx.mlx_array_free(a);
+                    };
+                    // Re-apply the limit so banks allocated just now get pulled
+                    // out of unwired_set_ by ResidencySet::resize.
+                    var p2: usize = 0;
+                    try mlx.check(mlx.mlx_set_wired_limit(&p2, 0));
+                    try mlx.check(mlx.mlx_set_wired_limit(&p2, wired));
+                    // indices must stay in range for the small banks; keep the same
+                    // COUNT (10) so the work per gather is identical across cells.
+                    var iv: [10]i32 = undefined;
+                    for (&iv, 0..) |*slot, j| slot.* = @intCast(@mod(@as(c_int, @intCast(j)), e));
+                    const isz = [_]c_int{ 1, 1, TOPK };
+                    const ind_e = mlx.mlx_array_new_data(&iv, &isz, 3, .int32);
+                    defer _ = mlx.mlx_array_free(ind_e);
+                    const ms_e = try indep(s, &xs, bank, lhs_idx, ind_e, ITER, &sw);
+                    const mb = @as(f64, @floatFromInt(@as(i64, e) * N * K)) * 0.25 / 1.0e6;
+                    std.debug.print("[moe-gather-ubench]   E={d:<4} bank={d:5.0} MB   {d:6.2} ms  ({d:.1} us/gather)\n", .{ e, mb, ms_e, ms_e * 1000.0 / @as(f64, NG) });
+                }
+            }
+            var restore: usize = 0;
+            try mlx.check(mlx.mlx_set_wired_limit(&restore, 0));
+            var act: usize = 0;
+            var cch: usize = 0;
+            var pk: usize = 0;
+            try mlx.check(mlx.mlx_get_active_memory(&act));
+            try mlx.check(mlx.mlx_get_cache_memory(&cch));
+            try mlx.check(mlx.mlx_get_peak_memory(&pk));
+            std.debug.print("[moe-gather-ubench]   mem: active={d} MB cache={d} MB peak={d} MB\n", .{ act >> 20, cch >> 20, pk >> 20 });
+        }
     }
 }
 
