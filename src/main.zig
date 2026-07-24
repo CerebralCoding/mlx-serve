@@ -152,6 +152,16 @@ fn printUsage(io: std.Io) void {
         \\                        `fused` consumes the quant triples directly
         \\                        via mlx_quantized_matmul (opt-in; only
         \\                        effective at --kv-quant 4 or 8).
+        \\  --prefill-chunk <n> Max tokens forwarded per prefill chunk
+        \\                        (default: 8192). Auto-capped further per model
+        \\                        so one layer's attention scores stay within
+        \\                        budget; this flag is the ceiling, not a floor.
+        \\                        Lower it if a long prompt spikes memory.
+        \\  --prefix-cache-entries <n>
+        \\                      Hot prefix cache LRU capacity in entries
+        \\                        (default: 32). 0 disables the cache — which also
+        \\                        turns off SSM checkpoint capture, since
+        \\                        checkpoints exist only to feed it.
         \\  --prefix-cache-mem <n>{{KB,MB,GB}}
         \\                      Hot prefix cache KV-bytes budget (default: 2GB).
         \\                      Evicts LRU entries until the budget fits.
@@ -827,6 +837,13 @@ pub fn main(init: std.process.Init) !void {
     try mlx.check(mlx.mlx_version(&ver));
     log.info("mlx-serve {s} (MLX {s})\n", .{ VERSION, mlx.mlx_string_data(ver) });
 
+    // Every text-gen serve path takes the PLD defaults from this ONE value —
+    // see `server.PldDefaults`. Built after arg parsing so it can't capture a
+    // pre-flag default, and passed whole so a path can't honor `--pld` while
+    // dropping the two lengths next to it (which is precisely what headless
+    // mode did).
+    const cli_pld = server_mod.PldDefaults.fromCli(enable_pld, pld_draft_len, pld_key_len);
+
     // Echo the resolved arguments — makes drafter/target mismatches obvious
     // from the log without having to scroll through the whole launch line in
     // the parent's process listing.
@@ -878,7 +895,7 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, force_mtp, enable_pld);
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, force_mtp, cli_pld);
             return;
         }
 
@@ -1104,9 +1121,9 @@ pub fn main(init: std.process.Init) !void {
             .default_temperature = if (temp_explicit) temperature else null,
             .default_top_p = top_p_flag,
             .default_top_k = top_k_flag,
-            .default_enable_pld = enable_pld,
-            .default_pld_draft_len = pld_draft_len,
-            .default_pld_key_len = pld_key_len,
+            .default_enable_pld = cli_pld.enable,
+            .default_pld_draft_len = cli_pld.draft_len,
+            .default_pld_key_len = cli_pld.key_len,
             .default_kv_attn_fused = kv_attn_fused_default,
             .default_force_mtp = force_mtp,
         });
@@ -1513,9 +1530,12 @@ fn runGenServe(
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
-        .default_enable_pld = false,
-        .default_pld_draft_len = 5,
-        .default_pld_key_len = 3,
+        // PLD is unreachable on this path (decode never routes through the
+        // PLD-capable generator), so say so once instead of three literals
+        // that read like a decision but drift like a typo.
+        .default_enable_pld = server_mod.PldDefaults.off.enable,
+        .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
+        .default_pld_key_len = server_mod.PldDefaults.off.key_len,
         .default_kv_attn_fused = false,
     });
 }
@@ -1540,7 +1560,7 @@ fn runHeadlessServe(
     idle_evict_secs: ?u32,
     kv_quant_config: transformer_mod.KVQuantConfig,
     force_mtp: bool,
-    enable_pld: bool,
+    pld: server_mod.PldDefaults,
 ) !void {
     log.info("mlx-serve {s} (headless — models load on demand)\n", .{VERSION});
     log.info("[args] serve: {s}:{d}\n", .{ host, port });
@@ -1630,14 +1650,16 @@ fn runHeadlessServe(
         .default_temperature = null,
         .default_top_p = null,
         .default_top_k = null,
-        // Honor --pld/--no-pld in headless mode. Hardcoding this false meant
-        // the flag's default never reached a headless request — only an
-        // explicit per-request "enable_pld": true did — while MLX Core's own
-        // UI describes Auto as "follow the server's --pld setting". Mirrors
-        // the --model startup path in main().
-        .default_enable_pld = enable_pld,
-        .default_pld_draft_len = 5,
-        .default_pld_key_len = 3,
+        // Honor the whole --pld/--pld-draft-len/--pld-key-len trio in headless
+        // mode. All three were hardcoded here, so none of them reached a
+        // headless request — only an explicit per-request "enable_pld": true
+        // did — while MLX Core's own UI describes Auto as "follow the server's
+        // --pld setting". Headless is the mode the app ALWAYS launches, and it
+        // always passes all three flags. Taking them as one `PldDefaults`
+        // is what keeps the next edit from honoring one and dropping two.
+        .default_enable_pld = pld.enable,
+        .default_pld_draft_len = pld.draft_len,
+        .default_pld_key_len = pld.key_len,
         .default_kv_attn_fused = false,
         // On-demand MLX loads auto-attach an MTP sidecar (LoadParams.mtp_enabled
         // defaults true), so the MoE force flag has to reach this path too.
@@ -1841,9 +1863,12 @@ fn runDs4Serve(
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,
-        .default_enable_pld = false,
-        .default_pld_draft_len = 5,
-        .default_pld_key_len = 3,
+        // PLD is unreachable on this path (decode never routes through the
+        // PLD-capable generator), so say so once instead of three literals
+        // that read like a decision but drift like a typo.
+        .default_enable_pld = server_mod.PldDefaults.off.enable,
+        .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
+        .default_pld_key_len = server_mod.PldDefaults.off.key_len,
         .default_kv_attn_fused = false,
     });
 }
@@ -2110,9 +2135,12 @@ fn runLlamaServe(
         .default_temperature = default_temperature,
         .default_top_p = default_top_p,
         .default_top_k = default_top_k,
-        .default_enable_pld = false,
-        .default_pld_draft_len = 5,
-        .default_pld_key_len = 3,
+        // PLD is unreachable on this path (decode never routes through the
+        // PLD-capable generator), so say so once instead of three literals
+        // that read like a decision but drift like a typo.
+        .default_enable_pld = server_mod.PldDefaults.off.enable,
+        .default_pld_draft_len = server_mod.PldDefaults.off.draft_len,
+        .default_pld_key_len = server_mod.PldDefaults.off.key_len,
         .default_kv_attn_fused = false,
     });
 }

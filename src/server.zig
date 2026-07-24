@@ -577,6 +577,71 @@ test "effectiveSsmCheckpointStride: disabled prefix cache disables checkpoint ca
     try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32));
 }
 
+/// PLD request defaults carried as ONE value, so a `ServerConfig` builder
+/// cannot thread the enable bit and forget the two lengths beside it.
+///
+/// That is exactly how this broke: `runHeadlessServe` hand-rolled all three
+/// as `false`/`5`/`3` literals, so no `--pld*` flag reached a headless
+/// request. Threading `enable` alone fixed a third of it and left
+/// `--pld-draft-len` / `--pld-key-len` silently dropped — and headless is
+/// the mode the Swift app ALWAYS launches (`--serve --model-dir`, no
+/// `--model`), passing all three flags on every boot. Single chokepoint for
+/// every ServerConfig builder; `effectiveSsmCheckpointStride` above plays
+/// the same role for LoadParams.
+///
+/// Serve paths whose decode never routes through the PLD-capable generator
+/// (media gen, ds4, llama.cpp) take `.off`: the field is dead weight there,
+/// and saying so once beats five hand-written `false`s that read like a
+/// decision but drift like a typo.
+pub const PldDefaults = struct {
+    enable: bool,
+    draft_len: u32,
+    key_len: u32,
+
+    /// Embedded-engine and media-gen serve paths — PLD is unreachable.
+    pub const off: PldDefaults = .{ .enable = false, .draft_len = 5, .key_len = 3 };
+
+    /// Text-gen serve paths: the CLI's values verbatim, no reinterpretation.
+    /// `--no-pld` arrives as `enable == false` and the lengths ride along
+    /// unused, so flipping PLD back on later cannot resurrect stale numbers.
+    pub fn fromCli(enable: bool, draft_len: u32, key_len: u32) PldDefaults {
+        return .{ .enable = enable, .draft_len = draft_len, .key_len = key_len };
+    }
+};
+
+test "PldDefaults: CLI lengths survive alongside the enable bit" {
+    // The regression: `enable` reached headless while the lengths stayed at
+    // the 5/3 literals. All three travel together or the class is back.
+    const cli = PldDefaults.fromCli(true, 8, 4);
+    try std.testing.expect(cli.enable);
+    try std.testing.expectEqual(@as(u32, 8), cli.draft_len);
+    try std.testing.expectEqual(@as(u32, 4), cli.key_len);
+
+    // --no-pld carries its lengths unchanged rather than snapping to defaults.
+    const disabled = PldDefaults.fromCli(false, 8, 4);
+    try std.testing.expect(!disabled.enable);
+    try std.testing.expectEqual(@as(u32, 8), disabled.draft_len);
+
+    // The non-text serve paths stay pinned to the historical literals.
+    try std.testing.expect(!PldDefaults.off.enable);
+    try std.testing.expectEqual(@as(u32, 5), PldDefaults.off.draft_len);
+    try std.testing.expectEqual(@as(u32, 3), PldDefaults.off.key_len);
+}
+
+test "PldDefaults: ServerConfig built from it reports the CLI values" {
+    // Pins the wiring, not just the struct: a ServerConfig fed from
+    // `fromCli` must expose the CLI numbers on the exact fields every
+    // request path and the boot banner read.
+    const cfg = ServerConfig{
+        .default_enable_pld = PldDefaults.fromCli(true, 8, 4).enable,
+        .default_pld_draft_len = PldDefaults.fromCli(true, 8, 4).draft_len,
+        .default_pld_key_len = PldDefaults.fromCli(true, 8, 4).key_len,
+    };
+    try std.testing.expect(cfg.default_enable_pld);
+    try std.testing.expectEqual(@as(u32, 8), cfg.default_pld_draft_len);
+    try std.testing.expectEqual(@as(u32, 4), cfg.default_pld_key_len);
+}
+
 /// Iteration 2 (perf-plan Phase 4 #3): LRU capacity of the per-LoadedModel
 /// chat-template tokenize cache. 0 disables (every request re-renders +
 /// re-tokenizes, restoring pre-Iteration-2 behavior). Default 4 is small
