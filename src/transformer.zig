@@ -15995,6 +15995,8 @@ pub const Transformer = struct {
     /// at construction from `MLX_SERVE_DECODE_ASYNC_LADDER` — a per-layer
     /// getenv would cost more than the overlap it buys.
     decode_async_ladder: u32 = 0,
+    /// The qwen4_exp batched-decode ladder stride, resolved the same way (`qwen4DecodeLadderStride`).
+    decode_async_ladder_qwen4: u32 = 0,
 
     gelu_coeff: ?mlx.mlx_array,
     gelu_inner: ?mlx.mlx_array,
@@ -16916,6 +16918,9 @@ pub const Transformer = struct {
             .owns_lm_head = owns_lm_head,
             .owns_norms = config.norm_has_offset,
             .decode_async_ladder = decodeAsyncLadderStride(
+                if (std.c.getenv("MLX_SERVE_DECODE_ASYNC_LADDER")) |v| std.mem.span(v) else null,
+            ),
+            .decode_async_ladder_qwen4 = qwen4DecodeLadderStride(
                 if (std.c.getenv("MLX_SERVE_DECODE_ASYNC_LADDER")) |v| std.mem.span(v) else null,
             ),
             .gelu_coeff = if (need_gelu) bf16Scalar(0.7978845608028654, s) else null,
@@ -19201,10 +19206,11 @@ pub const Transformer = struct {
     /// Monotonically worse as the stride tightens. Kept as a knob because the
     /// balance is per-arch (a model with a much cheaper CPU-side graph could
     /// still be build-bound), but it ships off and any future default-on needs
-    /// its own A/B on the arch in question.
+    /// its own A/B on the arch in question. Exception: qwen4_exp batched decode
+    /// ships on (`qwen4DecodeLadderStride`).
     ///
     /// `MLX_SERVE_DECODE_ASYNC_LADDER` picks the boundary set:
-    ///   unset / "0" / "off"  disabled (the shipped default)
+    ///   unset / "0" / "off"  disabled (the shipped default; unset is every 4th layer on qwen4_exp batched decode)
     ///   "auto"               every 8th layer
     ///   "<n>"                every n-th layer
     /// Only decode-width forwards ladder: a spec-verify or prefill forward
@@ -19219,6 +19225,15 @@ pub const Transformer = struct {
 
     const DECODE_ASYNC_LADDER_AUTO: u32 = 8;
 
+    /// qwen4_exp's batched decode builds each step's graph while the GPU idles, so its ladder ships ON at this stride;
+    /// an explicit `MLX_SERVE_DECODE_ASYNC_LADDER` (including "0"/"off") still wins. Serial decode and other arches
+    /// keep `decode_async_ladder`.
+    pub fn qwen4DecodeLadderStride(raw: ?[]const u8) u32 {
+        return if (raw == null) QWEN4_DECODE_ASYNC_LADDER_DEFAULT else decodeAsyncLadderStride(raw);
+    }
+
+    const QWEN4_DECODE_ASYNC_LADDER_DEFAULT: u32 = 4;
+
     // A PREFILL-side async-eval ladder (mlxfast-challenge prefillLadder:
     // asyncEval every 3rd-4th layer at seq >= 512) was ported and measured
     // 2026-08-16 (qwen3.8-27B-4bit, 43.7k-token prompt, M4 Max): off 227.9
@@ -19229,12 +19244,14 @@ pub const Transformer = struct {
     /// Fire the ladder at this layer boundary, if it is one. `h` is the live
     /// residual; handing it to `mlx_async_eval` starts every op it depends on.
     fn ladderStep(self: *Transformer, h: mlx.mlx_array, layer_idx: usize, seq_len: c_int) void {
+        ladderStepMulti(&.{h}, self.decode_async_ladder, layer_idx, seq_len);
+    }
+
+    fn ladderStepMulti(arrs: []const mlx.mlx_array, stride: u32, layer_idx: usize, seq_len: c_int) void {
         if (seq_len != 1) return;
-        const stride = self.decode_async_ladder;
         if (stride == 0) return;
         if ((layer_idx + 1) % stride != 0) return;
-        const one = [_]mlx.mlx_array{h};
-        const vec = mlx.mlx_vector_array_new_data(&one, 1);
+        const vec = mlx.mlx_vector_array_new_data(arrs.ptr, arrs.len);
         defer _ = mlx.mlx_vector_array_free(vec);
         // Best-effort: a failed async eval is a missed overlap, never a wrong
         // answer — the value is computed by the step's own terminal eval.
@@ -24677,6 +24694,8 @@ pub const Transformer = struct {
         var pending: ?HcPending = null;
         defer if (pending) |*pd| pd.deinit();
 
+        const ladder = if (ctx.batch_slots != null) self.decode_async_ladder_qwen4 else self.decode_async_ladder;
+        var ladder_blocked = false;
         for (0..layerCap(cfg.num_hidden_layers)) |layer_idx| {
             const li: u32 = @intCast(layer_idx);
             const lw = &ml[layer_idx];
@@ -24731,6 +24750,16 @@ pub const Transformer = struct {
             if (prof.timing) try self.hcFlush(&h, batch, seq_len, &pending);
             try prof.lap(h, .hc_write);
             prof.endLayer(if (lw.ple != null) .ple else if (lw.attn == .linear) .gdn else .attn);
+            if (ladder != 0 and seq_len == 1 and (layer_idx + 1) % ladder == 0 and !ladder_blocked) {
+                // A host-filled PLE leaf reads as zeros until `flushDeferredPle`, so fill it before the first early
+                // eval; while its ids are still a lazy sample, skip the ladder for this forward rather than sync.
+                if (ctx.ple_pending) |pp| if (!pp.gpu) {
+                    var ids_avail = false;
+                    if (mlx._mlx_array_is_available(&ids_avail, pp.token_ids) == 0 and ids_avail) try self.flushDeferredPle(ctx) else ladder_blocked = true;
+                };
+                // `mlp_out` rides along: the HC write that folds it into `h` is deferred to the next read.
+                if (!ladder_blocked) ladderStepMulti(&.{ h, mlp_out }, ladder, layer_idx, seq_len);
+            }
 
             if (ctx.capture_layers) |cl| {
                 for (cl.ids, cl.out) |cid, *slot| {
@@ -68412,4 +68441,256 @@ test "qwen4 PLE gpu arm: without --ple-gpu the load wraps no table buffer and a 
     try on.init(null);
     defer on.deinit();
     try testing.expect(on.gpu != null and on.st.table.gpu_owns_map);
+}
+
+/// A decode-width `forwardQwen4With` over dense synthetic weights with every block a stand-in: the graph is the
+/// embedding, one host-gathered PLE layer, the final mixer and the lm_head. Ladder strides start at the shipped
+/// defaults (serial off, batched `qwen4DecodeLadderStride(null)`).
+const Qwen4LadderRig = struct {
+    fx: PleArmFixture,
+    layer_bytes: [LAYERS * @sizeOf(MoeLayerWeights)]u8 align(@alignOf(MoeLayerWeights)),
+    arrs: [16]mlx.mlx_array,
+    n: usize,
+
+    const LAYERS = 4;
+    const HIDDEN = 128;
+    const HC = 2;
+    const RANK = 16;
+    const VOCAB = 64;
+
+    const Slot = struct {
+        entries: [LAYERS]SSMCacheEntry,
+        off: usize,
+
+        fn init() Slot {
+            var s: Slot = .{ .entries = undefined, .off = 0 };
+            for (&s.entries) |*e| e.* = pleArmEntry();
+            return s;
+        }
+
+        fn deinit(self: *Slot) void {
+            for (&self.entries) |*e| ssmFreeQsaState(e);
+        }
+    };
+
+    const Step = struct { logits: []f32, pending: bool };
+
+    fn init(self: *Qwen4LadderRig) !void {
+        try self.fx.init(null);
+        self.n = 0;
+        try self.fx.arm(false);
+        const x = self.fx.xfm();
+        const st = x.qwen4.?;
+        const emb_dim: c_int = @intCast(st.table.dim * st.hash.n_heads);
+        x.config = .{ .model_type = "qwen4_exp", .hidden_size = HIDDEN, .hc_count = HC, .num_hidden_layers = LAYERS, .vocab_size = VOCAB };
+        var prng = std.Random.DefaultPrng.init(59);
+        const r = prng.random();
+        x.emb_w = try self.weight(r, &.{ VOCAB, HIDDEN });
+        x.lm_head_w = try self.weight(r, &.{ VOCAB, HIDDEN });
+        var ones = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_ones(&ones, &[_]c_int{HIDDEN}, 1, .bfloat16, x.s));
+        self.keep(ones);
+        x.ones_hidden = ones;
+        const none: mlx.mlx_array = .{ .ctx = null };
+        x.qwen4_mixer = .{
+            .norm_w = try self.weight(r, &.{ HC, HIDDEN }),
+            .down_w = try self.weight(r, &.{ HC * HIDDEN, RANK }),
+            .down_s = none,
+            .down_b = none,
+            .up_w = try self.weight(r, &.{ RANK, HC * HIDDEN }),
+            .up_s = none,
+            .up_b = none,
+        };
+        self.layer_bytes = @splat(0);
+        const layers: [*]MoeLayerWeights = @ptrCast(&self.layer_bytes);
+        for (layers[0..LAYERS]) |*lw| {
+            lw.hc_attn = null;
+            lw.hc_mlp = null;
+            lw.ple = null;
+        }
+        layers[0].ple = .{
+            .key_w = try self.weight(r, &.{ emb_dim, HC * HIDDEN }),
+            .key_s = none,
+            .key_b = none,
+            .value_w = try self.weight(r, &.{ emb_dim, HIDDEN }),
+            .value_s = none,
+            .value_b = none,
+            .norm_key = try self.weight(r, &.{ HC, HIDDEN }),
+            .norm_query = try self.weight(r, &.{ HC, HIDDEN }),
+            .norm_conv = try self.weight(r, &.{ HC, HIDDEN }),
+            .conv_w = try self.weight(r, &.{ HC * HIDDEN, @intCast(x.config.ple_conv_kernel), 1 }),
+        };
+        x.moe_layers = layers[0..LAYERS];
+        x.decode_async_ladder = 0;
+        x.decode_async_ladder_qwen4 = Transformer.qwen4DecodeLadderStride(null);
+    }
+
+    fn deinit(self: *Qwen4LadderRig) void {
+        for (self.arrs[0..self.n]) |a| _ = mlx.mlx_array_free(a);
+        self.fx.deinit();
+    }
+
+    fn keep(self: *Qwen4LadderRig, a: mlx.mlx_array) void {
+        self.arrs[self.n] = a;
+        self.n += 1;
+    }
+
+    fn weight(self: *Qwen4LadderRig, r: std.Random, shape: []const c_int) !mlx.mlx_array {
+        const a = try attn256RandBf16(r, shape, self.fx.xfm().s);
+        self.keep(a);
+        return a;
+    }
+
+    /// One serial decode step on a deferred PLE leaf at serial ladder stride `ladder`; reports whether the leaf was
+    /// still pending when the build returned, then fills it and reads the logits.
+    fn step(self: *Qwen4LadderRig, slot: *Slot, ids: mlx.mlx_array, ladder: u32) !Step {
+        const x = self.fx.xfm();
+        x.decode_async_ladder = ladder;
+        defer x.decode_async_ladder = 0;
+        var ctx: ForwardCtx = .{ .cache = @ptrCast(&self.fx.cache_bytes), .moe_seq_offset = &slot.off, .ssm_entries = &slot.entries, .capture_hidden = null, .vision_embeddings = null, .ple_defer = true };
+        const logits = try x.forwardQwen4With(&ctx, ids);
+        defer _ = mlx.mlx_array_free(logits);
+        const pending = ctx.ple_pending != null;
+        try x.flushDeferredPle(&ctx);
+        return .{ .logits = try qwen4ReadF32(testing.allocator, logits, x.s), .pending = pending };
+    }
+
+    fn prefill(self: *Qwen4LadderRig, sl: *Qwen4TestSlot, ids: []const i32) !void {
+        const shape = [_]c_int{ 1, @intCast(ids.len) };
+        const arr = mlx.mlx_array_new_data(@ptrCast(ids.ptr), &shape, 2, .int32);
+        defer _ = mlx.mlx_array_free(arr);
+        const logits = try self.fx.xfm().forwardQwen4With(&sl.ctx, arr);
+        defer _ = mlx.mlx_array_free(logits);
+        try mlx.check(mlx.mlx_array_eval(logits));
+    }
+
+    /// One batched decode step over `slots` at batched ladder stride `ladder`, filling (or discarding) the leaf.
+    fn batchedStep(self: *Qwen4LadderRig, slots: []const *Qwen4TestSlot, ids: []const i32, ladder: u32, fill: bool) !Step {
+        const x = self.fx.xfm();
+        x.decode_async_ladder_qwen4 = ladder;
+        defer x.decode_async_ladder_qwen4 = Transformer.qwen4DecodeLadderStride(null);
+        const run = try qwen4BatchedPleForward(x, slots, ids, 1, false, true, fill);
+        defer _ = mlx.mlx_array_free(run.logits);
+        return .{ .logits = try qwen4ReadF32(testing.allocator, run.logits, x.s), .pending = run.pending };
+    }
+};
+
+fn expectLogitBitsEqual(want: []const f32, got: []const f32) !void {
+    try testing.expectEqual(want.len, got.len);
+    if (std.mem.eql(u8, std.mem.sliceAsBytes(want), std.mem.sliceAsBytes(got))) return;
+    var n: usize = 0;
+    var max: f32 = 0;
+    for (want, got) |a, b| {
+        if (@as(u32, @bitCast(a)) == @as(u32, @bitCast(b))) continue;
+        n += 1;
+        max = @max(max, @abs(a - b));
+    }
+    std.debug.print("logits differ in {d}/{d} entries, max |diff| {d}\n", .{ n, want.len, max });
+    return error.TestExpectedEqual;
+}
+
+test "qwen4 decode ladder: stride resolution keeps an explicit off and leaves other arches off" {
+    try testing.expectEqual(@as(u32, 4), Transformer.qwen4DecodeLadderStride(null));
+    try testing.expectEqual(@as(u32, 0), Transformer.qwen4DecodeLadderStride("0"));
+    try testing.expectEqual(@as(u32, 0), Transformer.qwen4DecodeLadderStride("off"));
+    try testing.expectEqual(@as(u32, 0), Transformer.qwen4DecodeLadderStride(""));
+    try testing.expectEqual(@as(u32, 2), Transformer.qwen4DecodeLadderStride("2"));
+    try testing.expectEqual(@as(u32, 8), Transformer.qwen4DecodeLadderStride("auto"));
+    try testing.expectEqual(@as(u32, 0), Transformer.decodeAsyncLadderStride(null));
+}
+
+test "qwen4 decode ladder: serial decode keeps the default off; an explicit stride fills host ids first, skips lazy ones" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    qwen4_standin_override = .{ .gdn = true, .attn = true, .mlp = true, .hc = true };
+    defer qwen4_standin_override = null;
+    var rig: Qwen4LadderRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const s = rig.fx.xfm().s;
+    const strides = [_]u32{ 1, 4 };
+
+    var off = Qwen4LadderRig.Slot.init();
+    defer off.deinit();
+    var on: [strides.len]Qwen4LadderRig.Slot = .{ Qwen4LadderRig.Slot.init(), Qwen4LadderRig.Slot.init() };
+    defer for (&on) |*sl| sl.deinit();
+    var lazy = Qwen4LadderRig.Slot.init();
+    defer lazy.deinit();
+    const zero = mlx.mlx_array_new_int(0);
+    defer _ = mlx.mlx_array_free(zero);
+    for ([_]u32{ 11, 42, 7 }) |tok| {
+        const ids = pleArmIds(&[_]u32{tok}, 1);
+        defer _ = mlx.mlx_array_free(ids);
+        // The batched default does not reach a serial forward.
+        decode_ladder_engaged = false;
+        const want = try rig.step(&off, ids, 0);
+        defer testing.allocator.free(want.logits);
+        try testing.expect(want.pending);
+        try testing.expect(!decode_ladder_engaged);
+
+        // Host-readable ids: the guard fills the leaf mid-build and the ladder fires.
+        for (strides, &on) |stride, *sl| {
+            decode_ladder_engaged = false;
+            const got = try rig.step(sl, ids, stride);
+            defer testing.allocator.free(got.logits);
+            try expectLogitBitsEqual(want.logits, got.logits);
+            try testing.expect(!got.pending);
+            try testing.expect(decode_ladder_engaged);
+        }
+
+        // Ids still a lazy sample (pipelined decode): the ladder stands down instead of syncing on them.
+        var lazy_ids = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(lazy_ids);
+        try mlx.check(mlx.mlx_add(&lazy_ids, ids, zero, s));
+        decode_ladder_engaged = false;
+        const got = try rig.step(&lazy, lazy_ids, 1);
+        defer testing.allocator.free(got.logits);
+        try expectLogitBitsEqual(want.logits, got.logits);
+        try testing.expect(got.pending);
+        try testing.expect(!decode_ladder_engaged);
+    }
+}
+
+test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits and per-slot history bit-identical to off" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    qwen4_standin_override = .{ .gdn = true, .attn = true, .mlp = true, .hc = true };
+    defer qwen4_standin_override = null;
+    var rig: Qwen4LadderRig = undefined;
+    try rig.init();
+    defer rig.deinit();
+    const alloc = testing.allocator;
+    // Arms: off, on at stride 1, on at the shipped stride, and an unfilled leaf.
+    const strides = [_]u32{ 0, 1, Transformer.qwen4DecodeLadderStride(null) };
+    const prompts = [2][]const i32{ &.{ 5, 17, 42, 9 }, &.{ 11, 4, 19 } };
+    var slots: [strides.len + 1][2]*Qwen4TestSlot = undefined;
+    var made: usize = 0;
+    defer for (0..made) |k| slots[k / 2][k % 2].deinit(alloc);
+    for (&slots) |*arm| for (arm, prompts) |*sl, p| {
+        sl.* = try Qwen4TestSlot.init(alloc, Qwen4LadderRig.LAYERS);
+        made += 1;
+        try rig.prefill(sl.*, p);
+    };
+
+    const steps = [_][2]i32{ .{ 13, 6 }, .{ 27, 3 }, .{ 40, 12 } };
+    for (steps, 0..) |ids, k| {
+        const want = try rig.batchedStep(&slots[0], &ids, strides[0], true);
+        defer alloc.free(want.logits);
+        try testing.expect(want.pending);
+        if (k == 0) {
+            // The harness has teeth: a leaf left unfilled changes the logits.
+            const zeroed = try rig.batchedStep(&slots[strides.len], &ids, strides[0], false);
+            defer alloc.free(zeroed.logits);
+            try testing.expect(!std.mem.eql(u8, std.mem.sliceAsBytes(want.logits), std.mem.sliceAsBytes(zeroed.logits)));
+        }
+        for (strides[1..], slots[1..strides.len]) |stride, *arm| {
+            decode_ladder_engaged = false;
+            const got = try rig.batchedStep(arm, &ids, stride, true);
+            defer alloc.free(got.logits);
+            try expectLogitBitsEqual(want.logits, got.logits);
+            try testing.expect(!got.pending);
+            try testing.expect(decode_ladder_engaged);
+            for (slots[0], arm.*) |a, b| {
+                for (a.entries, b.entries) |*ea, *eb| try expectPleHistoryEqual(ea, eb);
+            }
+        }
+    }
 }
