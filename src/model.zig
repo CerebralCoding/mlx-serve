@@ -447,6 +447,12 @@ pub const ModelConfig = struct {
     mtp_acceptance_override: ?mtp_acceptance_mod.Mode = null,
     /// Dense context K/V a loaded DFlash drafter keeps per trunk token, per request. Stamped at load.
     drafter_ctx_bytes_per_token: u64 = 0,
+    /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.
+    drafter_override: ?[]const u8 = null,
+    /// Every quantized projection fits the row-exact kernels (`Transformer.init`).
+    row_exact_covered: bool = false,
+    /// A DFlash drafter is bound (`DflashModel.bind`): its block tree needs exact verify rows.
+    dflash_bound: bool = false,
 
     /// The prefill chunk this model was sized for, FROZEN at load
     /// (`server.pinPrefillChunk`). 0 = not pinned yet, which keeps the
@@ -895,6 +901,40 @@ pub const ModelConfig = struct {
         return null;
     }
 
+    /// Decode-width projections go through the row-exact kernels, whose rows
+    /// get the same bits at any window width: a verify row reproduces serial
+    /// decoding. Only where every projection fits them AND a DFlash drafter is
+    /// bound: serial and MTP keep the faster stock paths otherwise.
+    pub fn rowExactDecode(self: *const ModelConfig) bool {
+        return self.row_exact_covered and self.dflash_bound and self.rowExactArch();
+    }
+
+    /// MTP acceptance for this load: exact while a DFlash drafter is bound, so
+    /// the MTP rounds it yields to stay byte-exact too.
+    pub fn mtpAcceptance(self: *const ModelConfig, default: mtp_acceptance_mod.Mode) mtp_acceptance_mod.Mode {
+        if (self.dflash_bound) return .exact;
+        return self.mtp_acceptance_override orelse default;
+    }
+
+    pub fn rowExactArch(self: *const ModelConfig) bool {
+        if (std.mem.eql(u8, self.model_type, "nemotron_h")) return true;
+        return std.mem.startsWith(u8, self.model_type, "qwen3_5") and !self.isMoe() and self.hadamard_block == 0;
+    }
+
+    /// The MTP head's hidden input is the trunk's final-normed hidden, not the
+    /// residual (Nemotron-H: more drafts kept at depth 1 and 2).
+    pub fn mtpReadsFinalNorm(self: *const ModelConfig) bool {
+        return std.mem.eql(u8, self.model_type, "nemotron_h");
+    }
+
+    /// Vocab rows a spec drafter proposes from (0 = all): Qwen3.8's tokenizer
+    /// puts 99.64% of committed tokens below id 98304, so a draft reads 40% of
+    /// the head. A token past it is never drafted: speed only, never output.
+    pub fn draftVocab(self: *const ModelConfig) c_int {
+        if (self.rowExactDecode() and std.mem.startsWith(u8, self.model_type, "qwen3_5") and self.vocab_size >= 248320) return 98304;
+        return 0;
+    }
+
     pub fn isMoe(self: *const ModelConfig) bool {
         return self.num_experts > 0;
     }
@@ -1301,13 +1341,15 @@ pub const ModelConfig = struct {
         });
     }
 
-    /// Free the one allocator-owned field (`ngram_table_path`, allocPrint'd by
-    /// `parseConfig`); everything else is plain data or a borrowed slice. Every
+    /// Free the allocator-owned fields (`ngram_table_path`, allocPrint'd by
+    /// `parseConfig`, and `drafter_override`); everything else is plain data or a borrowed slice. Every
     /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
     /// path. Idempotent.
     pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
         if (self.ngram_table_path) |p| allocator.free(p);
         self.ngram_table_path = null;
+        if (self.drafter_override) |p| allocator.free(p);
+        self.drafter_override = null;
     }
 };
 
@@ -7459,4 +7501,26 @@ test "ModelConfig parses k2_horizon (K2-Horizon-7B): llama trunk with grouped RM
     try testing.expect(!config.tie_word_embeddings);
     try testing.expect(!config.norm_has_offset);
     try testing.expect(!config.has_pre_ff_norm);
+}
+
+test "rowExactDecode: a covered trunk decodes exact only while a DFlash drafter is bound" {
+    var cfg = ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    cfg.row_exact_covered = true;
+    // Serial and MTP keep the stock paths: exact mode costs MTP ~30%.
+    try std.testing.expect(!cfg.rowExactDecode());
+    cfg.dflash_bound = true;
+    try std.testing.expect(cfg.rowExactDecode());
+    cfg.row_exact_covered = false;
+    try std.testing.expect(!cfg.rowExactDecode());
+}
+
+test "mtpAcceptance: exact while a DFlash drafter is bound, else the model setting, else the launch default" {
+    var cfg = ModelConfig{};
+    const typical: mtp_acceptance_mod.Mode = .{ .typical = .{ .delta = 0.2 } };
+    try std.testing.expect(std.meta.activeTag(cfg.mtpAcceptance(typical)) == .typical);
+    cfg.mtp_acceptance_override = .{ .tokenv3 = 0.95 };
+    try std.testing.expect(std.meta.activeTag(cfg.mtpAcceptance(typical)) == .tokenv3);
+    cfg.dflash_bound = true;
+    try std.testing.expect(cfg.mtpAcceptance(typical) == .exact);
 }

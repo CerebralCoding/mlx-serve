@@ -490,7 +490,11 @@ pub fn resolveKvAttnFusedPure(mode: KvAttnMode, explicit: ?bool, prompt_len: usi
 }
 
 /// Wrapper reading the live server config + scheduler default scheme.
+/// Exact decode (a DFlash drafter bound) reads every row through `row_attn`
+/// over the dense view: the packed kernels neither take a draft tree's mask
+/// nor give a serial step and a verify row the same bits.
 fn resolveKvAttnFused(config: *const model_mod.ModelConfig, explicit: ?bool, prompt_len: usize, kv_override: ?transformer_mod.KVQuantConfig) bool {
+    if (config.rowExactDecode()) return false;
     const scheme: kv_quant_mod.Scheme = (kv_override orelse configuredKvQuantFor(config)).scheme;
     return resolveKvAttnFusedPure(server_config.kv_attn_mode, explicit, prompt_len, scheme);
 }
@@ -1471,6 +1475,33 @@ fn maxTokensBudgetSqueezed(max_tokens: u32, remaining: u32) bool {
     return remaining < max_tokens / 4;
 }
 
+/// vLLM `ignore_eos`: when true, EOS and stop tokens do not end the reply —
+/// only `max_tokens` (or the request timeout) does. Stop sequences are a
+/// separate field and stay active.
+fn requestEosSlice(config: *const model_mod.ModelConfig, root: std.json.ObjectMap) []const u32 {
+    if (root.get("ignore_eos")) |v| {
+        if (v == .bool and v.bool) return &.{};
+    }
+    return config.eosTokenSlice();
+}
+
+test "requestEosSlice: ignore_eos swaps the EOS list for empty" {
+    var config = model_mod.ModelConfig{};
+    config.addEosToken(151645);
+    config.addEosToken(151643);
+    var arena_state = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena_state.deinit();
+    const parsed_off = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), "{\"ignore_eos\": true}", .{});
+    defer parsed_off.deinit();
+    try std.testing.expectEqual(@as(usize, 0), requestEosSlice(&config, parsed_off.value.object).len);
+    const parsed_on = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), "{\"ignore_eos\": false}", .{});
+    defer parsed_on.deinit();
+    try std.testing.expectEqual(@as(usize, 2), requestEosSlice(&config, parsed_on.value.object).len);
+    const parsed_absent = try std.json.parseFromSlice(std.json.Value, arena_state.allocator(), "{\"max_tokens\": 64}", .{});
+    defer parsed_absent.deinit();
+    try std.testing.expectEqual(@as(usize, 2), requestEosSlice(&config, parsed_absent.value.object).len);
+}
+
 /// The auto budget's own tightness question: under a quarter of the window left.
 fn autoBudgetWindowTight(remaining: u32, effective_ctx: u32) bool {
     return remaining < effective_ctx / 4;
@@ -2228,7 +2259,8 @@ fn handleConnection(
         if (g_metrics) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
-            try instr.renderJson(m, &out.writer);
+            var sessions: [2 * instr.MAX_SESSIONS]instr.Session = undefined;
+            try instr.renderJson(m, liveSessions(registry, &sessions), &out.writer);
             // Quiet: the index panel polls this ~1 Hz — don't log the body.
             try sendResponseQuiet(stream, "200 OK", "application/json", out.written());
         } else {
@@ -3142,6 +3174,37 @@ fn pinAutoContext(config: *model_mod.ModelConfig) u32 {
         config.pinned_context = autoContextFor(config);
     }
     return config.pinned_context;
+}
+
+/// Live requests, then every hot-cache entry no live request restored from, each row stamped
+/// with its model's context limit.
+fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Session) []instr.Session {
+    const sch = global_scheduler orelse return buf[0..0];
+    sch.queue_mu.lockUncancelable(sch.io);
+    const live = sch.live_session_count;
+    @memcpy(buf[0..live], sch.live_sessions[0..live]);
+    sch.queue_mu.unlock(sch.io);
+
+    var n = live;
+    sch.digest_mu.lockUncancelable(sch.io);
+    for (sch.cached_sessions[0..sch.cached_session_count]) |c| {
+        const in_use = for (buf[0..live]) |l| {
+            if (l.entry_id == c.entry_id and std.mem.eql(u8, l.model(), c.model())) break true;
+        } else false;
+        if (in_use) continue;
+        buf[n] = c;
+        n += 1;
+    }
+    sch.digest_mu.unlock(sch.io);
+
+    registry.mutex.lockUncancelable(registry.io);
+    defer registry.mutex.unlock(registry.io);
+    for (buf[0..n]) |*s| {
+        const entry = registry.peekLocked(s.model()) orelse continue;
+        if (entry.state != .ready) continue;
+        if (entry.config) |cfg| s.context_length = getEffectiveContextLength(cfg);
+    }
+    return buf[0..n];
 }
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
@@ -6506,7 +6569,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id,
             nowSecs(io),
@@ -6535,6 +6598,7 @@ fn renderModelEntry(
             drafter_path_json,
             if (mtp_loaded) "true" else "false",
             if (mtp_loaded or model_discovery.readStubMeta(io, allocator, entry.path).has_mtp) "true" else "false",
+            if (config.rowExactDecode()) "true" else "false",
             configuredKvQuantFor(config).wireName(),
             gen_temp_str,
             gen_top_p_str,
@@ -7272,7 +7336,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .mtp_loaded = mtpCapable(lm),
         .mtp_default_on = defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm)),
-        .mtp_acceptance = config.mtp_acceptance_override orelse generate_mod.mtp_acceptance_default,
+        .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_depth = lm.mtp_depth,
         .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
@@ -8937,7 +9001,7 @@ fn handleChatCompletions(
     // Prompt caching: reuse KV cache for shared prefix.
     // Force invalidation when images are present — image tokens have identical IDs
     // but different vision embeddings, so prefix matching would reuse stale features.
-    const eos_slice = config.eosTokenSlice();
+    const eos_slice = requestEosSlice(config, root);
 
     var sampling = generate_mod.SamplingParams{
         .temperature = temperature,
@@ -9198,7 +9262,7 @@ fn handleCompletions(
         // chat-completions site): MTP wins whenever loaded.
     }
 
-    const eos_slice = config.eosTokenSlice();
+    const eos_slice = requestEosSlice(config, root);
     const sampling = generate_mod.SamplingParams{
         .temperature = temperature,
         .top_p = top_p,
@@ -22040,6 +22104,17 @@ test "truncateEmbeddingDims: OpenAI dimensions semantics (truncate + L2-renormal
     const zt = truncateEmbeddingDims(&z, 2);
     try t.expectEqual(@as(usize, 2), zt.len);
     for (zt) |x| try t.expect(!std.math.isNan(x));
+}
+
+test "resolveKvAttnFused: exact decode never reads packed KV, even when a request asks" {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    cfg.row_exact_covered = true;
+    cfg.dflash_bound = true;
+    const kv8 = transformer_mod.KVQuantConfig.affine(8);
+    try std.testing.expect(!resolveKvAttnFused(&cfg, true, 8192, kv8));
+    cfg.dflash_bound = false;
+    try std.testing.expect(resolveKvAttnFused(&cfg, true, 8192, kv8));
 }
 
 test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" {

@@ -671,12 +671,6 @@ struct StatusMenuView: View {
         )
     }
 
-    /// Append a "+ assist" suffix to every model row that *could* use the
-    /// assistant drafter — i.e. drafter is currently enabled overall AND a
-    /// matching `gemma-4-*-it-assistant-bf16` checkpoint is on disk for this
-    /// row. Lets the user see at a glance which models keep the speedup if
-    /// they switch (auto-sync swaps `drafterPath` to the matching one on
-    /// model change). When drafter is off, no badges anywhere.
     private func modelPickerLabel(_ model: LocalModel, dupNames: Set<String>) -> String {
         // `displayLabel`, not `name`: a GGUF repo ships several quants and each
         // is its own row here, so the row has to say WHICH quant it loads
@@ -685,11 +679,7 @@ struct StatusMenuView: View {
         if dupNames.contains(label) {
             label += " · \(model.engine.shortLabel)"
         }
-        guard !appState.serverOptions.drafterPath.isEmpty,
-              downloads.recommendedDrafterFromPath(model.path) != nil else {
-            return label
-        }
-        return "\(label) + assist"
+        return label
     }
 
     /// One resident-model slot: modality icon, name, badges (chat quant /
@@ -717,7 +707,16 @@ struct StatusMenuView: View {
                     .background(.quaternary)
                     .clipShape(Capsule())
             }
-            // Speculative-decoding speedup badge (MTP / drafter).
+            if let kv = info.kvBadge {
+                Text(kv)
+                    .font(.app(.caption2).weight(.semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.quaternary)
+                    .clipShape(Capsule())
+                    .help("KV cache stored at \(info.kvQuant)-bit")
+            }
+            // Speculative-decoding speedup badge (DFlash family / MTP / drafter).
             if let badge = info.specDecodeBadge {
                 Text(L10n.text(badge))
                     .font(.app(.caption2).weight(.semibold))
@@ -726,9 +725,9 @@ struct StatusMenuView: View {
                     .padding(.vertical, 1)
                     .background(Color.green.opacity(0.15))
                     .clipShape(Capsule())
-                    .help(info.mtpLoaded
+                    .help(badge == "+MTP"
                           ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
-                          : "Assistant drafter loaded — faster decode via speculative decoding")
+                          : "\(info.drafterStone?.label ?? "Assistant drafter") loaded — faster decode via speculative decoding")
             }
             Spacer()
             if info.bytesResident > 0 {

@@ -10,7 +10,8 @@
 #   SMOKE_MAX_GB=20 ./tests/test_smoke_matrix.sh  # skip bigger packs (default 40)
 #
 # Configs: default | kv4 (--kv-quant 4) | kv8 (--kv-quant 8) | mtp (--mtp, only
-# where the pack ships a head) | nospec (--no-pld --no-mtp --no-drafter).
+# where the pack ships a head) | nospec (--no-pld --no-mtp --no-drafter) |
+# drafter / drafter_kv8 (a DFlash drafter, dense and 8-bit KV, where one is on disk).
 # Per boot: chat non-stream/stream, thinking on/off, tools, json_schema,
 # logprobs, max_tokens cap, prefix-cache hit, 2-way concurrency, /v1/completions,
 # /v1/messages (both modes), /v1/responses (both modes), Ollama /api/chat +
@@ -52,7 +53,14 @@ ARCHES=(
     "gguf_llama|yes|$GD/models-dl/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf|$GD/gguf/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf"
     "qwen4_exp|yes|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
 )
-CONFIGS="${SMOKE_CONFIGS:-default,kv4,kv8,mtp,nospec}"
+CONFIGS="${SMOKE_CONFIGS:-default,kv4,kv8,mtp,nospec,drafter,drafter_kv8}"
+# A DFlash drafter per arch when the pack carries none in drafter/.
+drafter_for() { # $1 arch, $2 model
+    [[ -f "$2/drafter/config.json" ]] && { echo "$2/drafter"; return; }
+    case "$1" in
+        qwen3_5_27b) [[ -d "$GD/models-dl/z-lab/Qwen3.8-27B-DFlash2" ]] && echo "$GD/models-dl/z-lab/Qwen3.8-27B-DFlash2" ;;
+    esac
+}
 
 PASS=0; FAIL=0; SKIP=0
 declare -a FAILS=()
@@ -272,6 +280,11 @@ for entry in "${ARCHES[@]}"; do
             kv8)     flags=(--kv-quant 8) ;;
             mtp)     has_mtp_head "$model" || { skip "$CELL" "no MTP head"; continue; }; flags=(--mtp) ;;
             nospec)  flags=(--no-pld --no-mtp --no-drafter) ;;
+            drafter|drafter_kv8)
+                d=$(drafter_for "$arch" "$model")
+                [[ -n "$d" ]] || { skip "$CELL" "no DFlash drafter"; continue; }
+                flags=(--drafter "$d")
+                [[ "$cfg" == drafter_kv8 ]] && flags+=(--kv-quant 8) ;;
             *) skip "$CELL" "unknown config"; continue ;;
         esac
         # GGUF rides an embedded engine: KV-quant flags are MLX-only
@@ -284,6 +297,14 @@ for entry in "${ARCHES[@]}"; do
         run_checks "$think"
         if [[ "$cfg" == mtp ]]; then
             check "mtp: engaged in the log" "$(grep -q 'spec-stats\] mode=mtp' "$OUT/$CELL.server.log" && echo 0 || echo 1)"
+        fi
+        if [[ "$cfg" == drafter* ]]; then
+            check "drafter: engaged in the log" "$(grep -q 'spec-stats\] mode=dflash' "$OUT/$CELL.server.log" && echo 0 || echo 1)"
+            # Past 2k KV tokens, with packed-KV reads forced: drafted bytes == serial bytes on one load.
+            long=$(python3 -c "print(open('src/rowqmv.zig').read()[:12000])" | python3 -c 'import sys,json; print(json.dumps("Here is a file:\n"+sys.stdin.read()+"\nList its public functions."))')
+            a=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$long}],\"max_tokens\":160,\"temperature\":0,\"enable_thinking\":false,\"kv_attn_mode\":\"fused\",\"enable_drafter\":false,\"enable_mtp\":false,\"enable_pld\":false}" | J 'd["choices"][0]["message"]["content"]')
+            b=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$long}],\"max_tokens\":160,\"temperature\":0,\"enable_thinking\":false,\"kv_attn_mode\":\"fused\",\"enable_drafter\":true}" | J 'd["choices"][0]["message"]["content"]')
+            check "drafter: long-context drafted == serial" "$([[ -n "$a" && "$a" == "$b" ]] && echo 0 || echo 1)" "serial=${a:0:80} drafted=${b:0:80}"
         fi
         if [[ "$cfg" == nospec ]]; then
             check "nospec: no speculation engaged" "$(grep -Eq 'spec-stats\] mode=(mtp|pld|drafter|dflash)' "$OUT/$CELL.server.log" && echo 1 || echo 0)"

@@ -5277,3 +5277,38 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
   handles (a copy would stay resident beside the joined buffer) and reports
   `[load] row-joined projection groups: N`; a Hadamard/2-bit pack logs none.
 
+## Drafted output differed from serial, and seeded output from itself on a cache hit (2026-09-27)
+
+- Defect: speculative rounds on Nemotron-H / Qwen3.5 produced text that differed from serial
+  decoding at T=1 even with the same seed, and a seeded request changed its text on a
+  prefix-cache hit.
+- Cause: a verify row's bits differed from the one-row step (MLX kernels reduce in a
+  width-dependent order; the GDN window kept an f32 state where serial stores bf16 per
+  token; the MoE combine summed differently at T>1), rows sampled with a different key than
+  serial, and the sampler position counted from the uncached prompt suffix.
+- Fix: row-exact kernels ported from TensorFold (`rowqmv`, `simd_qmm`, `row_attn`), per-token
+  state rounding in `gdn_decode`, `keyed_sample` (hash of seed, absolute position, id) for
+  verify rows and drafts alike, `position_base` = full prompt length.
+- Trap: `--no-mtp` still runs PLD, whose sampled acceptance is not serial; compare against
+  `--no-mtp --no-pld --no-drafter`.
+- Guard: `gdn_decode.recurSeq: a T-row window equals T one-row calls`, the rowqmv/simd_qmm/
+  row_attn width-invariance tests, `keyed_sample` pinned to TensorFold's reference tokens,
+  seeded cold==warm in `tests/test_hybrid_reuse_equivalence.sh`.
+
+## A draft tree failed the second request under --kv-quant 8 (2026-09-27)
+
+- Defect: with a DFlash2 drafter and `--kv-quant 8` (the app's default profile), the first
+  request answered and the next one 500'd: `decode tick failed: SpecTreeUnsupported`.
+- Cause: `KVCache.compactRows`, which moves a tree's accepted path into place, returned the
+  error for any quantized scheme. Only a round whose accepted path is not the first branch
+  compacts, so short or lucky requests passed. The tree gate was decided at load with no
+  look at the KV scheme, so the refusal surfaced mid-decode.
+- Fix: the affine scales and biases move with their rows (groups run along head_dim, so a
+  row is self-contained); the stored rows equal what serial appends would write.
+- Second half (PR #590 review): past the fused-KV crossover the packed-KV kernels served
+  serial steps and verify rows, ignoring the tree mask and splitting their bits. Exact
+  decode now never reads packed KV (`resolveKvAttnFused`); trees also need the GDN recur.
+- Guard: `KVCache.compactRows: a tree's accepted path lands as serial appends would, dense
+  and quantized`; smoke matrix `drafter` / `drafter_kv8` cells (red on the old binary);
+  same-load serial vs drafter byte check under `--kv-quant 8`; the smoke's long-context
+  drafted == serial check with `kv_attn_mode: "fused"` (0/4 before, 4/4 after).
