@@ -176,6 +176,9 @@ struct ServerOptions: Codable, Equatable {
     /// disables the byte cap (count cap still applies). Empty = server default
     /// (2GB, or one session at the working context on qwen4_exp when larger).
     var prefixCacheMem: String = ""
+    /// `--ple-gpu`: Qwen3.8-Flash-Next keeps its ~30 GB n-gram table resident for the GPU
+    /// gather. OFF matches the server: rows are read from the mmapped file on demand.
+    var pleGpu: Bool = false
     /// SSD tier for the prefix cache. OFF by default because it can persist
     /// gigabytes of KV under ~/.mlx-serve/kv-cache. When on, seen prefixes
     /// survive restarts + RAM evictions (turns a cold 30-50 s long-context
@@ -527,6 +530,7 @@ struct ServerOptions: Codable, Equatable {
         kvQuant == other.kvQuant &&
         prefixCacheEntries == other.prefixCacheEntries &&
         prefixCacheMem == other.prefixCacheMem &&
+        pleGpu == other.pleGpu &&
         enablePrefixCacheDisk == other.enablePrefixCacheDisk &&
         prefixCacheDisk == other.prefixCacheDisk &&
         maxResidentMemGB == other.maxResidentMemGB &&
@@ -722,6 +726,7 @@ struct ServerOptions: Codable, Equatable {
         if !trimmedPrefixMem.isEmpty {
             args += ["--prefix-cache-mem", trimmedPrefixMem]
         }
+        if pleGpu { args += ["--ple-gpu"] }
         // ALWAYS emit — the SSD tier can persist gigabytes of KV, so the app is
         // authoritative: `off` when the toggle is off (regardless of any server
         // default), the chosen size when on. Mirrors the prefix-cache-entries
@@ -910,6 +915,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(KVQuant.self, forKey: .kvQuant) { kvQuant = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .prefixCacheEntries) { prefixCacheEntries = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheMem) { prefixCacheMem = v }
+        if let v = try c.decodeIfPresent(Bool.self, forKey: .pleGpu) { pleGpu = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePrefixCacheDisk) { enablePrefixCacheDisk = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentMemGB) { maxResidentMemGB = v }
@@ -1151,6 +1157,11 @@ extension ServerOptions {
             title: "Prefix cache memory cap",
             explainer: "Maximum RAM for the prefix cache. Accepts '2GB', '512MB', '0' (disable byte cap). Empty = Auto: 2GB, or enough for one full-length conversation on long-context hybrid models, so their longest chats restore instead of re-reading the tail.",
             needsRestart: true),
+        "pleGpu": .init(
+            title: "Keep n-gram table in memory (Qwen3.8-Flash-Next)",
+            explainer: "Qwen3.8-Flash-Next looks up rows in a ~30 GB n-gram table on every token. Off (default): the table stays on disk and only the rows a prompt needs are read, so it costs almost no memory. On: the whole table is loaded into GPU memory beside the weights, for a few percent faster prompt processing and up to ~15% faster replies at long context. On a Mac without ~30 GB to spare, the first request after a load can stall for a minute or more while the table is pulled in. Other models ignore this setting.",
+            needsRestart: true,
+            cost: "Memory: about 30 GB more while Qwen3.8-Flash-Next is loaded."),
         "enablePrefixCacheDisk": .init(
             title: "SSD prefix cache",
             explainer: "Persist seen KV prefixes to disk (~/.mlx-serve/kv-cache) so they survive restarts + RAM evictions — turns a cold 30-50s long-context first-token wait into a fast SSD read. OFF by default because it can use many gigabytes of disk.",

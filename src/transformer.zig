@@ -16784,7 +16784,7 @@ pub const Transformer = struct {
             }
             var weights_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&weights_bytes);
-            st.gpu = ple_gpu.load(&st.table, if (std.c.getenv("MLX_SERVE_PLE_GPU")) |v| std.mem.span(v) else null, weights_bytes);
+            st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
             st.table.startWarm(); // the weights load just evicted the table from page cache
             qwen4_state = st;
             qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
@@ -68051,7 +68051,7 @@ test "weightsHaveDenseAttnProj: decode-attn-quant applies only to a dense text a
 // ── qwen4 PLE: the GPU arm against the host gather (synthetic table, no model) ──
 
 /// A zeroed Transformer carrying only what `pleEmbedding` reads, over a synthetic 4-bit table.
-/// With `env` the table goes through `ple_gpu.load`, so the env switch is what is tested;
+/// With `gate` the table goes through `ple_gpu.load`, so the `--ple-gpu` switch is what is tested;
 /// without it the table is wrapped directly, because `load`'s working-set gate (table plus
 /// 16 GB headroom) rightly picks the host gather on a small CI runner, and these tests are
 /// about the arms, not the gate. `arm(false)` hides the table buffer to run the host gather.
@@ -68063,10 +68063,10 @@ const PleArmFixture = struct {
     cache_bytes: [@sizeOf(KVCache)]u8 align(@alignOf(KVCache)),
     off: usize,
 
-    fn init(self: *PleArmFixture, env: ?[]const u8) !void {
+    fn init(self: *PleArmFixture, gate: ?bool) !void {
         const hash = try qwen4_mod.NgramHash.init(1000, 3, 8, 500, 1, 1234, 0, 999);
         self.fx = try ple_gpu.writeFixture(4, hash.total_rows, 64, 32, 21);
-        self.gpu = if (env != null) ple_gpu.load(&self.fx.table, env, 0) else try ple_gpu.wrap(&self.fx.table);
+        self.gpu = if (gate) |on| ple_gpu.load(&self.fx.table, on, 0) else try ple_gpu.wrap(&self.fx.table);
         self.st = .{ .hash = hash, .table = self.fx.table, .gpu = self.gpu };
         self.xfm_bytes = @splat(0);
         self.cache_bytes = @splat(0);
@@ -68256,10 +68256,10 @@ test "qwen4 PLE gpu arm: batched slots keep the host gather, a serial forward di
     try testing.expectEqual(d0 + 1, ple_gpu.dispatches);
 }
 
-test "qwen4 PLE gpu arm: MLX_SERVE_PLE_GPU=0 loads no table buffer and a forward never dispatches" {
+test "qwen4 PLE gpu arm: without --ple-gpu the load wraps no table buffer and a forward never dispatches" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var off: PleArmFixture = undefined;
-    try off.init("0");
+    try off.init(false);
     defer off.deinit();
     try testing.expect(off.gpu == null);
     try testing.expect(!off.st.table.gpu_owns_map);

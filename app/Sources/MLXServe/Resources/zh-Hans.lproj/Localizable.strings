@@ -2054,3 +2054,9 @@
 "Model %@" = "模型 %@";
 "KV cache %@" = "KV 缓存 %@";
 "Working %@" = "运行中 %@";
+"Memory" = "内存";
+"How much memory the engine may use: resident models, the OS reserve, the KV cache and the hot prefix cache. Server-launch flags — restart to apply." = "引擎可用的内存：常驻模型、为系统预留的内存、KV cache 与热前缀缓存。属服务器启动参数 —— 需重启生效。";
+"Continuous batching, decode attention requant, and the SSD prefix cache. Server-launch flags — restart to apply." = "连续批处理、解码注意力重量化，以及 SSD 前缀缓存。属服务器启动参数 —— 需重启生效。";
+"Keep n-gram table in memory (Qwen3.8-Flash-Next)" = "将 n-gram 表保留在内存中（Qwen3.8-Flash-Next）";
+"Qwen3.8-Flash-Next looks up rows in a ~30 GB n-gram table on every token. Off (default): the table stays on disk and only the rows a prompt needs are read, so it costs almost no memory. On: the whole table is loaded into GPU memory beside the weights, for a few percent faster prompt processing and up to ~15% faster replies at long context. On a Mac without ~30 GB to spare, the first request after a load can stall for a minute or more while the table is pulled in. Other models ignore this setting." = "Qwen3.8-Flash-Next 每生成一个 token 都要在约 30 GB 的 n-gram 表中查找若干行。关闭（默认）：表留在磁盘上，只读取提示词需要的行，几乎不占内存。开启：整张表与权重一起载入 GPU 内存，提示词处理快几个百分点，长上下文下回复最多快约 15%。如果这台 Mac 腾不出约 30 GB，加载后的第一个请求可能要卡住一分钟以上等表载入。其他模型忽略此设置。";
+"Memory: about 30 GB more while Qwen3.8-Flash-Next is loaded." = "内存：加载 Qwen3.8-Flash-Next 时多占约 30 GB。";

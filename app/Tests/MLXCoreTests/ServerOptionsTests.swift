@@ -399,6 +399,14 @@ final class ServerOptionsTests: XCTestCase {
                                flag: "--prefix-cache-mem", value: "2GB"))
     }
 
+    /// The n-gram table stays on disk unless the user opts in, matching the server default.
+    func testPleGpuIsOptIn() {
+        var opts = ServerOptions()
+        XCTAssertFalse(opts.toCLIArgs(physicalMemoryBytes: 128 * Self.GiB).contains("--ple-gpu"))
+        opts.pleGpu = true
+        XCTAssertTrue(opts.toCLIArgs(physicalMemoryBytes: 128 * Self.GiB).contains("--ple-gpu"))
+    }
+
     /// A blob saved while "2GB" was the default migrates to Auto once; a later "2GB" stays.
     func testLegacyPrefixCacheMemDefaultMigratesToAutoOnce() throws {
         let defaults = UserDefaults(suiteName: "PrefixCacheMemMigration.\(UUID().uuidString)")!
