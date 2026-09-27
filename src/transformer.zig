@@ -14003,7 +14003,57 @@ const DenseMlpWeights = struct {
     /// Row-joined [gate | up] for decode width; gate/up are views of it once
     /// built (fuseRowGroup).
     gu: FusedRows = .{},
+    /// Handles belong to Transformer.owned_bf16; do not separately deinit.
+    shared_tensor: ?struct { gu: tensor_qmm.Projection, down: tensor_qmm.Projection } = null,
 };
+
+fn installSharedTensorMlp(dw: *DenseMlpWeights, config: *const ModelConfig, weights: *Weights, li: u32, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !bool {
+    if (!mlx.streamIsGpu(s) or dw.shared_tensor != null or config.quant_bits != 4 or config.quant_group_size != 64 or config.quant_mode != .affine or
+        config.hadamard_block != 0 or dw.gu.w.ctx == null or !mtpNaxDenseMlpMatches(config, dw) or
+        config.hidden_size % 32 != 0 or config.intermediate_size % 64 != 0) return false;
+    const fields = [_][3]*mlx.mlx_array{ .{ &dw.gate_w, &dw.gate_s, &dw.gate_b }, .{ &dw.up_w, &dw.up_s, &dw.up_b }, .{ &dw.down_w, &dw.down_s, &dw.down_b } };
+    const names = [_][]const u8{ "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" };
+    const leaves = [_][]const u8{ "weight", "scales", "biases" };
+    var nb: [256]u8 = undefined;
+    for (fields, names) |fs, name| for (fs, leaves) |p, leaf| {
+        const key = try std.fmt.bufPrint(&nb, "{s}.layers.{d}.{s}.{s}", .{ config.weight_prefix, li, name, leaf });
+        const held = weights.get(key) orelse return false;
+        if (held.ctx != p.ctx) return false;
+    };
+    const joined = [_]mlx.mlx_array{ dw.gu.w, dw.gu.s, dw.gu.b };
+    for (joined) |old| {
+        var found = false;
+        for (owned.items) |v| if (v.ctx == old.ctx) {
+            found = true;
+            break;
+        };
+        if (!found) return false;
+    }
+    // Allocate and materialize before mutating any original owner.
+    try owned.ensureUnusedCapacity(allocator, 4);
+    var gu = try tensor_qmm.Projection.init(dw.gu.w, dw.gu.s, dw.gu.b, s);
+    errdefer gu.deinit();
+    var down = try tensor_qmm.Projection.init(dw.down_w, dw.down_s, dw.down_b, s);
+    errdefer down.deinit();
+    owned.appendSliceAssumeCapacity(&.{ gu.storage.w, gu.storage.sb, down.storage.w, down.storage.sb });
+    for (fields, names) |fs, name| for (fs, leaves) |p, leaf| {
+        const key = std.fmt.bufPrint(&nb, "{s}.layers.{d}.{s}.{s}", .{ config.weight_prefix, li, name, leaf }) catch unreachable;
+        weights.replace(key, .{ .ctx = null });
+        p.* = .{ .ctx = null };
+    };
+    for (joined) |old| for (owned.items, 0..) |v, i| {
+        if (v.ctx == old.ctx) {
+            _ = mlx.mlx_array_free(v);
+            _ = owned.swapRemove(i);
+            break;
+        }
+    };
+    dw.gu.w = .{ .ctx = null };
+    dw.gu.s = .{ .ctx = null };
+    dw.gu.b = .{ .ctx = null };
+    dw.shared_tensor = .{ .gu = gu, .down = down };
+    return true;
+}
 
 /// ANE channel-split GPU complement for one layer (A1): the output-channel
 /// rest-slices the GPU computes while the ANE runs channels [0..k). The
@@ -14384,6 +14434,9 @@ fn mtpNaxAffineProjectionMatches(
 }
 
 fn mtpNaxDenseMlpMatches(config: *const ModelConfig, mlp: *const DenseMlpWeights) bool {
+    if (mlp.shared_tensor) |p| return config.quant_bits == 4 and config.quant_group_size == 64 and config.quant_mode == .affine and
+        p.gu.k == config.hidden_size and p.gu.n == 2 * config.intermediate_size and
+        p.down.k == config.intermediate_size and p.down.n == config.hidden_size;
     return mtpNaxAffineProjectionMatches(config, mlp.gate_w, mlp.gate_s, mlp.gate_b, config.hidden_size, config.intermediate_size) and
         mtpNaxAffineProjectionMatches(config, mlp.up_w, mlp.up_s, mlp.up_b, config.hidden_size, config.intermediate_size) and
         mtpNaxAffineProjectionMatches(config, mlp.down_w, mlp.down_s, mlp.down_b, config.intermediate_size, config.hidden_size);
@@ -29547,6 +29600,25 @@ pub const Transformer = struct {
     }
 
     fn denseMLP(self: *Transformer, x: mlx.mlx_array, dw: *const DenseMlpWeights) !mlx.mlx_array {
+        if (dw.shared_tensor) |*p| {
+            const both = try p.gu.forward(x, self.s);
+            defer _ = mlx.mlx_array_free(both);
+            if (self.config.hidden_act == .silu and self.compiled_geglu == null) {
+                if (try fusedJoinedSwiGLU(self.s, both)) |activated| {
+                    defer _ = mlx.mlx_array_free(activated);
+                    return p.down.forward(activated, self.s);
+                }
+            }
+            var gate = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gate);
+            var up = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(up);
+            try dw.gu.part(&gate, both, 0, self.s);
+            try dw.gu.part(&up, both, 1, self.s);
+            const activated = try self.computeGeglu(gate, up);
+            defer _ = mlx.mlx_array_free(activated);
+            return p.down.forward(activated, self.s);
+        }
         const xsh = mlx.getShape(x);
         var rows: c_int = 1;
         for (xsh[0 .. xsh.len - 1]) |d| rows *= d;
@@ -30041,6 +30113,13 @@ pub const Transformer = struct {
         const ml = self.moe_layers orelse {
             log.warn("[ane] --ane-prefill: {s} is outside the v1 scope (qwen3_5-family dense MLP) — disabled\n", .{cfg.model_type});
             return;
+        };
+        for (ml) |*lw| switch (lw.mlp) {
+            .dense => |*dw| if (dw.shared_tensor != null) {
+                log.warn("[ane] shared tensor MLP experiment owns tiled weights; ANE prefill disabled\n", .{});
+                return;
+            },
+            .moe => {},
         };
         if (!std.mem.eql(u8, cfg.model_type, "qwen3_5_moe")) {
             log.warn("[ane] --ane-prefill: {s} is outside the qwen3_5-family scope — disabled\n", .{cfg.model_type});
@@ -32070,6 +32149,9 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const is_bailing = std.mem.eql(u8, config.model_type, "bailing_hybrid");
     const is_qwen4 = config.isQwen4();
     const is_gpt_oss = std.mem.eql(u8, config.model_type, "gpt_oss");
+    const shared_mlp = tensor_qmm.sharedMlpEnabled() and config.rowExactDecode() and
+        std.mem.startsWith(u8, config.model_type, "qwen3_5") and verifyQmmNaxAvailable();
+    var shared_count: usize = 0;
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -33067,6 +33149,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                     const names = [_][]const u8{ "mlp.gate_proj", "mlp.up_proj" };
                     dw.gu = try fuseRowsInPlace(&parts, 0, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
                 }
+                if (shared_mlp and try installSharedTensorMlp(dw, &config, weights, li, &owned_bf16, allocator, s)) shared_count += 1;
             }
         }
 
@@ -33077,6 +33160,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
         };
     }
 
+    if (shared_count > 0) log.info("[shared-tensor-mlp] {d} layers prepared; original MLP arrays released; tiled layout serves all row counts\n", .{shared_count});
     // The PLE is placed by exact equality inside the loop above and nothing downstream notices
     // its absence; a silently PLE-less qwen4 emits plausible text.
     if (config.isQwen4()) {
@@ -38512,6 +38596,72 @@ pub fn fusedSwiGLU(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array) !?
     if (dt != .bfloat16 and dt != .float16) return null;
     const sigtab = try swigluSigTable(s, dt, std.heap.c_allocator);
     return tableGateMul(s, .silu, gate, up, sigtab);
+}
+
+const JOINED_SWIGLU_SOURCE =
+    \\const uint c = thread_position_in_grid.x;
+    \\const uint r = thread_position_in_grid.y;
+    \\if (c >= uint(W)) return;
+    \\const size_t base = (size_t)r * (2 * W) + c;
+    \\T g = GU[base];
+    \\T sig = sigtab[as_type<ushort>(g)];
+    \\T act = g * sig;
+    \\y[(size_t)r * W + c] = act * GU[base + W];
+;
+var joined_swiglu_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var joined_swiglu_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var joined_swiglu_key: GateMulCfgKey = std.mem.zeroes(GateMulCfgKey);
+var joined_swiglu_logged = false;
+
+/// Consume the contiguous joined projection directly: slicing it into gate
+/// and up would make the ordinary activation kernel copy both strided views.
+fn fusedJoinedSwiGLU(s: mlx.mlx_stream, both: mlx.mlx_array) !?mlx.mlx_array {
+    if (!swigluFusedEnabled() or !mlx.streamIsGpu(s) or mlx.mlx_array_dtype(both) != .bfloat16) return null;
+    const sh = mlx.getShape(both);
+    if (sh.len == 0 or sh.len > 5 or sh[sh.len - 1] <= 0 or @rem(sh[sh.len - 1], 2) != 0) return null;
+    const width = @divExact(sh[sh.len - 1], 2);
+    const rows = mlx.mlx_array_size(both) / @as(usize, @intCast(2 * width));
+    if (rows == 0 or rows > std.math.maxInt(c_int)) return null;
+    const table = try swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+    if (joined_swiglu_kernel == null) {
+        const inputs = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{ "GU", "sigtab" }, 2);
+        defer _ = mlx.mlx_vector_string_free(inputs);
+        const outputs = mlx.mlx_vector_string_new_data(&[_][*:0]const u8{"y"}, 1);
+        defer _ = mlx.mlx_vector_string_free(outputs);
+        const kernel = mlx.mlx_fast_metal_kernel_new("mlxserve_joined_swiglu", inputs, outputs, JOINED_SWIGLU_SOURCE, "", true, false);
+        if (kernel.ctx == null) return error.MetalKernelCompileFailed;
+        joined_swiglu_kernel = kernel;
+    }
+    const key = GateMulCfgKey{ .shape = ShapeKey.from(sh), .dtype = .bfloat16 };
+    if (joined_swiglu_cfg == null or !std.meta.eql(joined_swiglu_key, key)) {
+        var out_shape: [5]c_int = undefined;
+        @memcpy(out_shape[0..sh.len], sh);
+        out_shape[sh.len - 1] = width;
+        const config = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, sh.len, .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", .bfloat16));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "W", width));
+        const tg = @min(@as(c_int, 256), @divTrunc(width + 31, 32) * 32);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(width + tg - 1, tg) * tg, @intCast(rows), 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
+        if (joined_swiglu_cfg) |old| _ = mlx.mlx_fast_metal_kernel_config_free(old);
+        joined_swiglu_cfg = config;
+        joined_swiglu_key = key;
+    }
+    const inputs = mlx.mlx_vector_array_new_data(&[_]mlx.mlx_array{ both, table }, 2);
+    defer _ = mlx.mlx_vector_array_free(inputs);
+    var outputs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outputs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs, joined_swiglu_kernel.?, inputs, joined_swiglu_cfg.?, s));
+    var y = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs, 0));
+    if (!joined_swiglu_logged) {
+        @import("log.zig").info("[shared-tensor-mlp] joined SwiGLU reads gate/up in place\n", .{});
+        joined_swiglu_logged = true;
+    }
+    return y;
 }
 
 /// `gelu_tanh(x)` (whatever `Transformer.gelu` runs: compiled or the op
@@ -47337,6 +47487,123 @@ test "fused row projections are bit-identical to the separate matmuls at decode 
                 }
             }
         }
+    }
+}
+
+test "shared tensor MLP: conversion releases originals and serves decode and prefill" {
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const a = testing.allocator;
+    const s = mlx.gpuStream();
+    var weights = Weights.init(a);
+    defer weights.deinit();
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |v| _ = mlx.mlx_array_free(v);
+        owned.deinit(a);
+    }
+    const cfg = ModelConfig{ .hidden_size = 64, .intermediate_size = 128, .quant_bits = 4, .quant_group_size = 64, .weight_prefix = "model", .hidden_act = .silu };
+    var dw: DenseMlpWeights = undefined;
+    dw.gu = .{};
+    dw.shared_tensor = null;
+    const fields = [_][3]*mlx.mlx_array{ .{ &dw.gate_w, &dw.gate_s, &dw.gate_b }, .{ &dw.up_w, &dw.up_s, &dw.up_b }, .{ &dw.down_w, &dw.down_s, &dw.down_b } };
+    const names = [_][]const u8{ "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" };
+    var nb: [256]u8 = undefined;
+    for (fields, 0..) |fs, i| {
+        const shape = if (i == 2) [_]c_int{ 64, 128 } else [_]c_int{ 128, 64 };
+        var values: [8192]f32 = undefined;
+        for (&values, 0..) |*v, j| v.* = @sin(@as(f32, @floatFromInt(j + i * 101)) * 0.137) * 0.1;
+        const f = mlx.mlx_array_new_data(&values, &shape, 2, .float32);
+        defer _ = mlx.mlx_array_free(f);
+        var bf = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bf);
+        try mlx.check(mlx.mlx_astype(&bf, f, .bfloat16, s));
+        var q = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(q);
+        try mlx.check(mlx.mlx_quantize(&q, bf, .some(64), .some(4), "affine", .{}, s));
+        for (fs, [_][]const u8{ "weight", "scales", "biases" }, 0..) |dst, leaf, j| {
+            dst.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(dst, q, j));
+            const name = try std.fmt.allocPrint(a, "model.layers.0.{s}.{s}", .{ names[i], leaf });
+            try weights.map.put(name, dst.*);
+        }
+    }
+    var parts = [_][3]*mlx.mlx_array{ fields[0], fields[1] };
+    dw.gu = try fuseRowsInPlace(&parts, 0, names[0..2], &weights, &nb, "model", 0, &owned, a, s);
+    var xfm: Transformer = undefined;
+    xfm.s = s;
+    xfm.config = cfg;
+    xfm.compiled_geglu = null;
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    try testing.expect(!try installSharedTensorMlp(&dw, &cfg, &weights, 0, &owned, a, cpu));
+    try testing.expect(dw.shared_tensor == null and dw.gu.w.ctx != null);
+    for ([_]u32{ 6, 8 }) |bits| {
+        var unsupported = cfg;
+        unsupported.quant_bits = @intCast(bits);
+        try testing.expect(!try installSharedTensorMlp(&dw, &unsupported, &weights, 0, &owned, a, s));
+        try testing.expect(dw.shared_tensor == null and dw.gu.w.ctx != null);
+    }
+    // The shared branch must not read any old raw weight or cache field.
+    try testing.expect(try installSharedTensorMlp(&dw, &cfg, &weights, 0, &owned, a, s));
+    for (fields) |fs| for (fs) |p| try testing.expect(p.ctx == null);
+    var it = weights.map.valueIterator();
+    while (it.next()) |v| try testing.expect(v.ctx == null);
+    try testing.expect(dw.gu.w.ctx == null);
+    try testing.expect(mtpNaxDenseMlpMatches(&cfg, &dw));
+    var live: usize = 0;
+    for (owned.items) |v| if (v.ctx != null) {
+        live += 1;
+    };
+    try testing.expectEqual(@as(usize, 4), live);
+    for ([_]c_int{ 1, 16, 33, 129 }) |m| {
+        var x = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x);
+        try mlx.check(mlx.mlx_ones(&x, &[_]c_int{ 1, m, 64 }, 3, .bfloat16, s));
+        const y = try xfm.denseMLP(x, &dw);
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_array_eval(y));
+        try testing.expectEqualSlices(c_int, &.{ 1, m, 64 }, mlx.getShape(y));
+    }
+}
+
+test "shared tensor MLP: joined SwiGLU matches the unfused activation without slice copies" {
+    const s = mlx.gpuStream();
+    const saved = swiglu_fused_override;
+    defer swiglu_fused_override = saved;
+    swiglu_fused_override = true;
+    for ([_][3]c_int{ .{ 1, 1, 66 }, .{ 2, 17, 66 }, .{ 1, 129, 66 }, .{ 1, 17, 34816 } }) |shape| {
+        const count: usize = @intCast(shape[0] * shape[1] * shape[2]);
+        const values = try testing.allocator.alloc(f32, count);
+        defer testing.allocator.free(values);
+        for (values, 0..) |*v, i| v.* = @sin(@as(f32, @floatFromInt(i)) * 0.137) * 8;
+        const f = mlx.mlx_array_new_data(values.ptr, &shape, 3, .float32);
+        defer _ = mlx.mlx_array_free(f);
+        try testing.expectEqual(null, try fusedJoinedSwiGLU(s, f));
+        var both = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(both);
+        try mlx.check(mlx.mlx_astype(&both, f, .bfloat16, s));
+        const got = (try fusedJoinedSwiGLU(s, both)) orelse return error.JoinedSwiGLUDeclined;
+        defer _ = mlx.mlx_array_free(got);
+        const width = @divExact(shape[2], 2);
+        const gate = try sliceLastDim(both, 0, width, s);
+        defer _ = mlx.mlx_array_free(gate);
+        const up = try sliceLastDim(both, width, 2 * width, s);
+        defer _ = mlx.mlx_array_free(up);
+        var sig = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sig);
+        var act = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(act);
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_sigmoid(&sig, gate, s));
+        try mlx.check(mlx.mlx_multiply(&act, gate, sig, s));
+        try mlx.check(mlx.mlx_multiply(&want, act, up, s));
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, got, want, false, s));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try testing.expect(same);
     }
 }
 

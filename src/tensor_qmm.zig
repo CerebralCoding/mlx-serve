@@ -22,6 +22,10 @@ const Plan = struct {
     main_config: mlx.mlx_fast_metal_kernel_config,
 };
 var plans: std.AutoHashMapUnmanaged(Key, Plan) = .{};
+const PrefillPlan = struct { main: mlx.mlx_fast_metal_kernel, config: mlx.mlx_fast_metal_kernel_config };
+var prefill_plans: std.AutoHashMapUnmanaged(Key, PrefillPlan) = .{};
+var prefill_logged = false;
+var transient_prefill_logged = false;
 var enabled_cache: ?bool = null;
 
 pub fn enabled() bool {
@@ -30,6 +34,11 @@ pub fn enabled() bool {
     const on = if (std.c.getenv("MLX_SERVE_ROW_TENSOR_QMM")) |v| !std.mem.eql(u8, std.mem.span(v), "0") else false;
     enabled_cache = on;
     return on;
+}
+
+pub fn sharedMlpEnabled() bool {
+    const raw = std.c.getenv("MLX_SERVE_SHARED_TENSOR_MLP") orelse return false;
+    return enabled() and std.mem.eql(u8, std.mem.span(raw), "1");
 }
 
 fn kernel(name: [*:0]const u8, inputs: []const [*:0]const u8, output: [*:0]const u8, source: [*:0]const u8, header: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
@@ -48,7 +57,9 @@ fn planFor(key: Key) !Plan {
     const tiles = @divTrunc(key.n + 31, 32);
     var split: c_int = 1;
     while (split < 8 and tiles * split < 1024 and @divTrunc(@divExact(key.k, 64), split * 2) >= 8) split *= 2;
-    const constants = try std.fmt.allocPrint(a, "constexpr int M={d}, MP=16, N={d}, K={d}, TMR=1, NT=32, SK={d}; constexpr bool TILED={s};\n", .{ key.m, key.n, key.k, split, if (@rem(key.n, 32) == 0) "true" else "false" });
+    const block: c_int = if (key.m <= 16) 16 else 32;
+    const mp = @divTrunc(key.m + block - 1, block) * block;
+    const constants = try std.fmt.allocPrint(a, "constexpr int M={d}, MP={d}, N={d}, K={d}, TMR={d}, NT=32, SK={d}; constexpr bool TILED={s};\n", .{ key.m, mp, key.n, key.k, @divExact(block, 16), split, if (@rem(key.n, 32) == 0) "true" else "false" });
     defer a.free(constants);
     const sum_source = try std.mem.concatWithSentinel(a, u8, &.{ constants, SUM }, 0);
     defer a.free(sum_source);
@@ -64,13 +75,13 @@ fn planFor(key: Key) !Plan {
     errdefer _ = mlx.mlx_fast_metal_kernel_free(main);
     const sum_config = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(sum_config);
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(sum_config, &[_]c_int{ @divExact(key.k, 64), 16 }, 2, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(sum_config, @divExact(key.k, 64), 16, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(sum_config, &[_]c_int{ @divExact(key.k, 64), mp }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(sum_config, @divExact(key.k, 64), mp, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(sum_config, @min(@divExact(key.k, 64), 256), 1, 1));
     const main_config = mlx.mlx_fast_metal_kernel_config_new();
     errdefer _ = mlx.mlx_fast_metal_kernel_config_free(main_config);
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(main_config, &[_]c_int{ key.m, key.n }, 2, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(main_config, tiles * 32 * split, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(main_config, tiles * 32 * split, @divExact(mp, block), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(main_config, 32 * split, 1, 1));
     const p = Plan{ .sum = sum, .sum_config = sum_config, .main = main, .main_config = main_config };
     try plans.put(a, key, p);
@@ -87,6 +98,30 @@ fn apply(k: mlx.mlx_fast_metal_kernel, config: mlx.mlx_fast_metal_kernel_config,
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
     return out;
+}
+
+fn prefillPlanFor(key: Key) !PrefillPlan {
+    if (prefill_plans.get(key)) |p| return p;
+    const a = std.heap.c_allocator;
+    const bm: c_int = if (key.m >= 256) 128 else 64;
+    const bn: c_int = 64;
+    const tg = 2 * bn;
+    const constants = try std.fmt.allocPrint(a, "constexpr int M={d}, N={d}, K={d}, BM={d}, BN={d}; constexpr bool TILED={s};\n", .{ key.m, key.n, key.k, bm, bn, if (@rem(key.n, 32) == 0) "true" else "false" });
+    defer a.free(constants);
+    const source = try std.mem.concatWithSentinel(a, u8, &.{ constants, @embedFile("metal/tensor_qmm_prefill.metal") }, 0);
+    defer a.free(source);
+    const name = try std.fmt.allocPrintSentinel(a, "msv_tiled_prefill_m{d}_n{d}_k{d}", .{ key.m, key.n, key.k }, 0);
+    defer a.free(name);
+    const main = try kernel(name.ptr, &.{ "X", "Wq", "SBt" }, "Y", source.ptr, HEADER);
+    errdefer _ = mlx.mlx_fast_metal_kernel_free(main);
+    const config = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(config);
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{ key.m, key.n }, 2, .bfloat16));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(key.n + bn - 1, bn) * tg, @divTrunc(key.m + bm - 1, bm), 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
+    const p = PrefillPlan{ .main = main, .config = config };
+    try prefill_plans.put(a, key, p);
+    return p;
 }
 
 /// Caller gates M5 support; unsupported geometry declines to the existing path.
@@ -194,6 +229,111 @@ const Packed = struct {
         _ = mlx.mlx_array_free(self.w);
         _ = mlx.mlx_array_free(self.sb);
         for (self.inputs) |v| _ = mlx.mlx_array_free(v);
+    }
+};
+
+/// A projection whose only resident representation is the prepared layout.
+pub const Projection = struct {
+    storage: Packed,
+    n: c_int,
+    k: c_int,
+
+    pub fn init(w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_stream) !Projection {
+        var storage = try Packed.init(w, sc, bi, s);
+        // Unlike Cache, this object is addressed directly by its owning layer.
+        // Source descriptors are neither cache keys nor required consumers.
+        for (&storage.inputs) |*a| {
+            _ = mlx.mlx_array_free(a.*);
+            a.* = .{ .ctx = null };
+        }
+        return .{ .storage = storage, .n = mlx.getShape(w)[0], .k = mlx.getShape(w)[1] * 8 };
+    }
+
+    pub fn deinit(self: *Projection) void {
+        self.storage.deinit();
+    }
+
+    /// Decode/verification keep row-exact arithmetic; larger prefills use
+    /// tile-local bf16 dequantization, matching stock prefill's precision.
+    pub fn forward(self: *const Projection, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        return self.forwardImpl(x, s, true);
+    }
+
+    fn forwardImpl(self: *const Projection, x: mlx.mlx_array, s: mlx.mlx_stream, prefill: bool) !mlx.mlx_array {
+        if (!mlx.streamIsGpu(s) or mlx.mlx_array_dtype(x) != .bfloat16) return error.InvalidSharedProjectionInput;
+        const xs = mlx.getShape(x);
+        if (xs.len == 0 or xs.len > 8 or xs[xs.len - 1] != self.k) return error.InvalidSharedProjectionInput;
+        const count = mlx.mlx_array_size(x) / @as(usize, @intCast(self.k));
+        if (count == 0 or count > 1048576) return error.InvalidSharedProjectionInput;
+        const m: c_int = @intCast(count);
+        var x2 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x2);
+        try mlx.check(mlx.mlx_reshape(&x2, x, &[_]c_int{ m, self.k }, 2, s));
+        const key = Key{ .m = m, .n = self.n, .k = self.k };
+        const y = if (prefill and m >= 1024) blk: {
+            const out = try self.nativePrefill(x2, s);
+            if (!transient_prefill_logged) {
+                @import("log.zig").info("[shared-tensor-mlp] transient stock prefill engaged (no retained row-major weights)\n", .{});
+                transient_prefill_logged = true;
+            }
+            break :blk out;
+        } else if (prefill and m > 16) blk: {
+            const p = try prefillPlanFor(key);
+            const out = try apply(p.main, p.config, &.{ x2, self.storage.w, self.storage.sb }, s);
+            if (!prefill_logged) {
+                @import("log.zig").info("[shared-tensor-mlp] dedicated tiled prefill reader engaged (BM=64/128, BN=64)\n", .{});
+                prefill_logged = true;
+            }
+            break :blk out;
+        } else blk: {
+            const p = try planFor(key);
+            const sums = try apply(p.sum, p.sum_config, &.{x2}, s);
+            defer _ = mlx.mlx_array_free(sums);
+            break :blk try apply(p.main, p.main_config, &.{ x2, sums, self.storage.w, self.storage.sb }, s);
+        };
+        defer _ = mlx.mlx_array_free(y);
+        var shape: [8]c_int = undefined;
+        @memcpy(shape[0..xs.len], xs);
+        shape[xs.len - 1] = self.n;
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_reshape(&out, y, &shape, xs.len, s));
+        return out;
+    }
+
+    fn nativePrefill(self: *const Projection, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        const kg = @divExact(self.k, 64);
+        var w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w);
+        if (@rem(self.n, 32) == 0) {
+            var shaped = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(shaped);
+            var transposed = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(transposed);
+            try mlx.check(mlx.mlx_reshape(&shaped, self.storage.w, &[_]c_int{ @divExact(self.n, 32), kg, 32, 8 }, 4, s));
+            try mlx.check(mlx.mlx_transpose_axes(&transposed, shaped, &[_]c_int{ 0, 2, 1, 3 }, 4, s));
+            try mlx.check(mlx.mlx_reshape(&w, transposed, &[_]c_int{ self.n, @divExact(self.k, 8) }, 2, s));
+        } else try mlx.check(mlx.mlx_array_set(&w, self.storage.w));
+        var params = [_]mlx.mlx_array{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+        defer for (params) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (&params, 0..) |*p, index| {
+            const i: c_int = @intCast(index);
+            var sliced = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sliced);
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_slice(&sliced, self.storage.sb, &[_]c_int{ 0, 0, i }, 3, &[_]c_int{ kg, self.n, i + 1 }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            try mlx.check(mlx.mlx_reshape(&flat, sliced, &[_]c_int{ kg, self.n }, 2, s));
+            try mlx.check(mlx.mlx_transpose(p, flat, s));
+        }
+        // No model/cache owner retains these arrays. MLX can release the
+        // transient row-major buffers once this projection is evaluated.
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_quantized_matmul(&out, x, w, params[0], params[1], true, .some(64), .some(4), "affine", s));
+        return out;
     }
 };
 
@@ -395,4 +535,129 @@ test "tensor_qmm: unsupported dtype, quantization and geometry decline without a
     defer _ = mlx.mlx_array_free(bad_scale);
     try std.testing.expectEqual(null, try qmm(x, w, bad_scale, bi, 4, 64, s));
     try std.testing.expectEqual(null, try qmm(x, w, sc, bad_scale, 4, 64, s));
+}
+
+test "tensor_qmm: shared projection serves prefill boundaries without source ownership" {
+    if (!@import("transformer.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
+    for ([_]c_int{ 512, 1024, 2048, 8192 }) |k| try sharedProjectionCase(64, k, 8192);
+    try sharedProjectionCase(96, 512, 8192); // Partial 64-column prefill tile.
+    try sharedProjectionCase(40, 512, 8192); // Packed's untiled column remainder.
+    try sharedProjectionCase(5120, 17408, 1025); // Actual 27B down projection.
+    try sharedProjectionCase(34816, 5120, 1025); // Actual joined gate/up.
+}
+
+fn sharedProjectionCase(n: c_int, k: c_int, max_rows: c_int) !void {
+    const s = mlx.gpuStream();
+    const wf = try random(&.{ n, k }, 900, s);
+    defer _ = mlx.mlx_array_free(wf);
+    var quant = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(quant);
+    try mlx.check(mlx.mlx_quantize(&quant, wf, .some(64), .some(4), "affine", .{}, s));
+    var arrs: [3]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
+    defer for (arrs) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&arrs, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, quant, i));
+    var projection = try Projection.init(arrs[0], arrs[1], arrs[2], s);
+    defer projection.deinit();
+    for (projection.storage.inputs) |a| try std.testing.expect(a.ctx == null);
+    const x = try random(&.{ max_rows, k }, 901, s);
+    defer _ = mlx.mlx_array_free(x);
+    const first = try rows(x, 0, 1, s);
+    defer _ = mlx.mlx_array_free(first);
+    const serial = (try qmm(first, arrs[0], arrs[1], arrs[2], 4, 64, s)).?;
+    defer _ = mlx.mlx_array_free(serial);
+    for ([_]c_int{ 1, 16, 17, 31, 32, 33, 63, 64, 65, 127, 128, 129, 255, 256, 257, 511, 512, 513, 1023, 1024, 1025, 4096, 8192 }) |m| {
+        if (m > max_rows) continue;
+        const block = try rows(x, 0, m, s);
+        defer _ = mlx.mlx_array_free(block);
+        const got = try projection.forwardImpl(block, s, false);
+        defer _ = mlx.mlx_array_free(got);
+        const row = try rows(got, 0, 1, s);
+        defer _ = mlx.mlx_array_free(row);
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, row, serial, false, s));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try std.testing.expect(same);
+        // Check the last row as well: exercises grid Y and padded final blocks.
+        const last_x = try rows(x, m - 1, m, s);
+        defer _ = mlx.mlx_array_free(last_x);
+        const want = (try qmm(last_x, arrs[0], arrs[1], arrs[2], 4, 64, s)).?;
+        defer _ = mlx.mlx_array_free(want);
+        const last_y = try rows(got, m - 1, m, s);
+        defer _ = mlx.mlx_array_free(last_y);
+        try mlx.check(mlx.mlx_array_equal(&eq, last_y, want, false, s));
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try std.testing.expect(same);
+        if (m > 16) {
+            // Validate every output, including interior row blocks, against
+            // independently dequantized f32 matmul (not another tiled reader).
+            var wd = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wd);
+            try mlx.check(mlx.mlx_dequantize(&wd, arrs[0], arrs[1], arrs[2], .some(64), .some(4), "affine", .{}, .{ .value = .float32, .has_value = true }, s));
+            var wt = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(wt);
+            try mlx.check(mlx.mlx_transpose(&wt, wd, s));
+            var xf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xf);
+            try mlx.check(mlx.mlx_astype(&xf, block, .float32, s));
+            var truth = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(truth);
+            try mlx.check(mlx.mlx_matmul(&truth, xf, wt, s));
+            const fast = try projection.forward(block, s);
+            defer _ = mlx.mlx_array_free(fast);
+            if (m == 1024 and n >= 5120) {
+                var before: usize = 0;
+                var after: usize = 0;
+                try mlx.check(mlx.mlx_synchronize(s));
+                try mlx.check(mlx.mlx_get_active_memory(&before));
+                try mlx.check(mlx.mlx_array_eval(fast));
+                try mlx.check(mlx.mlx_synchronize(s));
+                try mlx.check(mlx.mlx_get_active_memory(&after));
+                // Allow the result and bounded allocator bookkeeping; a
+                // retained restored projection exceeds this by tens of MiB.
+                if (after > before + mlx.mlx_array_size(fast) * 2 + 65536) {
+                    std.debug.print("transient prefill M={d} N={d} K={d}: active before={d}, after={d}, output={d}\n", .{ m, n, k, before, after, mlx.mlx_array_size(fast) * 2 });
+                    return error.TransientWeightsRetained;
+                }
+            }
+            var gotf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(gotf);
+            try mlx.check(mlx.mlx_astype(&gotf, fast, .float32, s));
+            var stock = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(stock);
+            try mlx.check(mlx.mlx_quantized_matmul(&stock, block, arrs[0], arrs[1], arrs[2], true, .some(64), .some(4), "affine", s));
+            if (m == 8192 or (m >= 129 and n >= 5120)) {
+                // Stock uses its unsplit NAX prefill path at this geometry.
+                // Match its bf16 dequantization and ordered 16-wide FMAs.
+                try mlx.check(mlx.mlx_array_equal(&eq, fast, stock, false, s));
+                var stock_same = false;
+                try mlx.check(mlx.mlx_array_item_bool(&stock_same, eq));
+                try std.testing.expect(stock_same);
+            }
+            var stockf = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(stockf);
+            try mlx.check(mlx.mlx_astype(&stockf, stock, .float32, s));
+            try mlx.check(mlx.mlx_array_eval(truth));
+            try mlx.check(mlx.mlx_array_eval(gotf));
+            try mlx.check(mlx.mlx_array_eval(stockf));
+            const count = mlx.mlx_array_size(truth);
+            const actual = mlx.mlx_array_data_float32(gotf).?[0..count];
+            const expected = mlx.mlx_array_data_float32(truth).?[0..count];
+            const baseline = mlx.mlx_array_data_float32(stockf).?[0..count];
+            var error_squared: f64 = 0;
+            var baseline_squared: f64 = 0;
+            var truth_squared: f64 = 0;
+            for (actual, expected, baseline) |a, e, b| {
+                try std.testing.expect(std.math.isFinite(a) and std.math.isFinite(e));
+                error_squared += @as(f64, a - e) * (a - e);
+                baseline_squared += @as(f64, b - e) * (b - e);
+                truth_squared += @as(f64, e) * e;
+            }
+            try std.testing.expect(@sqrt(error_squared / truth_squared) < 0.01);
+            try std.testing.expect(error_squared <= 9 * baseline_squared);
+        }
+    }
 }

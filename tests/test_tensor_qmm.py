@@ -40,6 +40,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--url", default="http://127.0.0.1:19288")
     parser.add_argument("--log", type=Path, required=True)
+    parser.add_argument("--shared", action="store_true", help="require shared MLP installation and check long prefills")
+    parser.add_argument("--report", type=Path, help="save the complete serial/MTP responses")
     args = parser.parse_args()
     cases = [
         ("Explain why the sky is blue in three sentences.", 0.0, 42, 96),
@@ -49,6 +51,16 @@ def main():
         ("Describe a small garden.", 0.7, 17, 1),
         ("Describe a small garden.", 0.7, 17, 3),
     ]
+    if args.shared:
+        assert "[shared-tensor-mlp]" in args.log.read_text(), "shared layout was not installed"
+        context = "Oak trees grow beside the river. The old bridge connects two quiet villages.\n" * 250
+        cases.extend([
+            (context + "Summarize this scene in two sentences.", 0.0, 37, 64),
+            (context + "Write a brief description of the river.", 0.7, 37, 64),
+            # Cross the server's default 8192-token prefill chunk boundary.
+            (context + context + context[:4000] + "Summarize this scene in one sentence.", 0.7, 37, 32),
+        ])
+    results = []
     for index, (prompt, temperature, seed, budget) in enumerate(cases, 1):
         before = args.log.read_text().count("[spec-stats] mode=mtp")
         serial = complete(args.url, prompt, temperature, seed, False, budget)
@@ -57,10 +69,18 @@ def main():
         drafted = complete(args.url, prompt, temperature, seed, True, budget)
         after = args.log.read_text()
         assert "[tensor-qmm] tiled row-invariant M5 projections engaged" in after, "tensor path declined"
+        if args.shared:
+            assert "dedicated tiled prefill reader engaged" in after, "shared prefill path declined"
+            assert "joined SwiGLU reads gate/up in place" in after, "joined activation path declined"
         if budget > 3:
             assert after.count("[spec-stats] mode=mtp") > before, "MTP silently declined"
         assert serial == drafted, f"case {index}: serial/MTP mismatch\n{serial!r}\n{drafted!r}"
+        results.append({"case": index, "serial": serial, "mtp": drafted})
+        if args.report:
+            args.report.write_text(json.dumps(results, indent=2) + "\n")
         print(f"PASS {index}: temperature={temperature}, seed={seed}, budget={budget}, tokens={serial[2]}")
+    if args.shared:
+        assert "transient stock prefill engaged" in args.log.read_text(), "large prefill path declined"
 
 
 if __name__ == "__main__":

@@ -213,6 +213,11 @@ v2 tiling (BQ=64, BK=32, 8 simdgroups, register-resident Q, uint4 staging) was
 picked by our own microbenchmark sweep, and a sliding-window band arm and
 key-axis chunked dispatch were added.
 
+`src/metal/tensor_qmm_prefill.metal` adapts the affine dequantization and
+threadgroup tiling in MLX's `quantized_nax.h` (Copyright 2023-2025 Apple Inc.).
+It reads TensorFold's tiled Q4 storage with interleaved scales/biases and
+uses a direct MPP matrix operation over each threadgroup weight tile.
+
 The verifier expert-pair kernel (`VERIFY_EXPERT_REUSE_SOURCE`) adapts the
 4-bit affine `qmv_impl`, `load_vector` and `qdot` arithmetic from MLX's
 `backend/metal/kernels/quantized.h`. Modifications: sorted expert-run pairing,
