@@ -2840,14 +2840,16 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
             // contracted decoder (Qwen3-Embedding) reports it too (issue #116).
             const has_embedding = if (e_ready and e.config != null) e.config.?.hasEmbeddingCapability() else std.mem.eql(u8, e.arch_hint, "bert");
             const has_chat = !is_encoder;
+            // An entry that is not resident has no live template or tower; its files still say what it can do.
+            const sm: model_discovery.StubMeta = if (e.state != .ready) model_discovery.readStubMeta(stream.io, allocator, e.path) else .{};
             rendered = try ollama_mod.renderShowJson(allocator, .{
                 .tag = ollamaTagEntryOf(stream.io, e),
                 .context_length = if (e_ready and e.config != null) getEffectiveContextLength(e.config.?) else 0,
                 .template = template,
                 .has_chat = has_chat,
                 .has_tools = has_chat,
-                .has_vision = e.vision_encoder != null,
-                .has_thinking = has_chat and chatTemplateSupportsThinking(template),
+                .has_vision = e.vision_encoder != null or sm.has_vision,
+                .has_thinking = has_chat and (model_discovery.templateSupportsThinking(template) or sm.has_thinking),
                 .has_embedding = has_embedding,
             });
         }
@@ -6139,17 +6141,6 @@ fn clampMaxTokens(max_tokens: u32, prompt_len: usize, effective_ctx: u32) u32 {
     return max_tokens;
 }
 
-/// Heuristic: chat templates that contain a thinking-block opener indicate the
-/// model can produce reasoning_content. Covers Qwen (`enable_thinking`,
-/// `<think>`), Gemma 4 (`<|channel>thought`), and generic `<think>` templates.
-fn chatTemplateSupportsThinking(tmpl: []const u8) bool {
-    return std.mem.indexOf(u8, tmpl, "enable_thinking") != null or
-        std.mem.indexOf(u8, tmpl, "<think>") != null or
-        std.mem.indexOf(u8, tmpl, "<ifm|think") != null or
-        std.mem.indexOf(u8, tmpl, "thought") != null or
-        std.mem.indexOf(u8, tmpl, "<|channel>") != null;
-}
-
 /// Render an optional model-author sampling recommendation (from the model's
 /// generation_config.json) as a JSON scalar: the number when present, the
 /// literal `null` when the model ships no value. Caller owns the slice.
@@ -6430,7 +6421,7 @@ fn renderModelEntry(
             .has_chat = has_chat,
             .has_vision = has_vision,
             .has_audio = has_audio,
-            .has_reasoning = has_chat and chatTemplateSupportsThinking(chat_config.chat_template),
+            .has_reasoning = has_chat and model_discovery.templateSupportsThinking(chat_config.chat_template),
             .has_embedding = config.hasEmbeddingCapability(),
             .has_image_engine = entry.image_engine != null,
             .has_audio_engine = entry.audio_engine != null,
