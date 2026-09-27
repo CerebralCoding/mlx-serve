@@ -790,6 +790,18 @@ struct ServerOptions: Codable, Equatable {
         return args
     }
 
+    private static let prefixCacheMemMigratedKey = "prefixCacheMemAutoMigrated"
+
+    /// Blobs saved while "2GB" was the default store it as if chosen, and the UI never
+    /// offered 2GB apart from the default, so it is cleared to Auto once.
+    mutating func migrateLegacyPrefixCacheMem(_ defaults: UserDefaults = .standard) {
+        guard !defaults.bool(forKey: Self.prefixCacheMemMigratedKey) else { return }
+        defaults.set(true, forKey: Self.prefixCacheMemMigratedKey)
+        if prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines) == "2GB" {
+            prefixCacheMem = ""
+        }
+    }
+
     // MARK: Settings-field validation helpers
 
     /// Parse the Settings port text field. Accepts exactly what a TCP listen

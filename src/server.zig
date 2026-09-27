@@ -7156,6 +7156,9 @@ fn renderPropsBody(
     available_mem: u64,
     safe_ctx: u32,
     cache_mem: usize,
+    /// Registry residency of every ready model, and the hot prefix cache's KV.
+    weights_mem: u64,
+    kv_cache_mem: u64,
     /// Leading-comma JSON fragments spliced before the root close (the ANE
     /// object, the qwen4 n-gram warm object). Concatenated by the handler.
     extra_json: []const u8,
@@ -7170,7 +7173,7 @@ fn renderPropsBody(
     // was invisible: the panel read 19.6 GB of `active_bytes` while the process
     // sat at 81.4 GB, and nothing we served named the other 61.
     return std.fmt.allocPrint(allocator,
-        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d}}}{s}}}
+        \\{{"default_generation_settings":{{"model":"{s}","n_ctx":{s}}},"total_slots":1,"model_info":{{"vocab_size":{d},"hidden_size":{d},"num_hidden_layers":{d},"num_attention_heads":{d},"num_key_value_heads":{d},"head_dim":{d},"quantization_bits":{d},"quantization_group_size":{d},"max_position_embeddings":{d}}},"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":{d},"cache_bytes":{d},"weights_bytes":{d},"kv_cache_bytes":{d}}}{s}}}
     , .{
         config.model_type,              ctx_str,
         config.vocab_size,              config.hidden_size,
@@ -7180,6 +7183,7 @@ fn renderPropsBody(
         config.max_position_embeddings, active_mem,
         peak_mem,                       available_mem,
         safe_ctx,                       cache_mem,
+        weights_mem,                    kv_cache_mem,
         extra_json,
     });
 }
@@ -7409,9 +7413,18 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json });
     defer allocator.free(extra_json);
 
-    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, extra_json);
+    const kv_cache_mem: u64 = if (global_scheduler) |sch| sch.resident_hot_cache_bytes.load(.monotonic) else 0;
+    const body = try renderPropsBody(allocator, config, ctx_str, active_mem, peak_mem, available_mem, safe_ctx, cache_mem, residentWeightsBytes(stream.io), kv_cache_mem, extra_json);
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
+}
+
+/// The registry's residency bill: the weights of every ready model, media ones included.
+fn residentWeightsBytes(io: std.Io) u64 {
+    const reg = global_registry orelse return 0;
+    reg.mutex.lockUncancelable(io);
+    defer reg.mutex.unlock(io);
+    return reg.current_resident_bytes;
 }
 
 /// Memory-only `/props` for a boot with no default chat model (headless
@@ -7425,8 +7438,8 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     _ = mlx.mlx_get_peak_memory(&peak_mem);
     const available_mem = metrics.getAvailableMemBytes();
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}}}
-    , .{ active_mem, peak_mem, available_mem, scheduler_mod.MAX_BATCH_GROUP });
+        \\{{"total_slots":1,"memory":{{"active_bytes":{d},"peak_bytes":{d},"available_bytes":{d},"max_safe_context":0,"weights_bytes":{d}}},"batching":{{"supported":false,"reason":"no_model","max_group":{d}}}}}
+    , .{ active_mem, peak_mem, available_mem, residentWeightsBytes(stream.io), scheduler_mod.MAX_BATCH_GROUP });
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
 }
@@ -19995,7 +20008,7 @@ test "renderPropsBody omits chat_template" {
     config.max_position_embeddings = 8192;
     config.model_type = "gemma4";
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 7777, 8888, "");
     defer testing.allocator.free(body);
 
     try testing.expect(std.mem.indexOf(u8, body, "\"chat_template\"") == null);
@@ -20013,7 +20026,7 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     // Spliced into a props body it stays valid JSON with the object present.
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen3_5_moe";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -20037,7 +20050,7 @@ test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill 
     };
     const dual = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &two);
     defer testing.allocator.free(dual);
-    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, dual);
+    const dual_body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, dual);
     defer testing.allocator.free(dual_body);
     var dual_parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, dual_body, .{});
     defer dual_parsed.deinit();
@@ -20081,7 +20094,7 @@ test "settingsPropsJson: /props names the effective serving settings a benchmark
     defer testing.allocator.free(frag);
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen3_5";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -20146,7 +20159,7 @@ test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
 
     var config = model_mod.ModelConfig{};
     config.model_type = "qwen4_exp";
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, frag);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
     defer testing.allocator.free(body);
     var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
     defer parsed.deinit();
@@ -20161,7 +20174,7 @@ test "ngramWarmPropsJson: /props names how far the qwen4 ngram warm has got" {
     defer testing.allocator.free(ane);
     const both = try std.fmt.allocPrint(testing.allocator, "{s}{s}", .{ ane, frag });
     defer testing.allocator.free(both);
-    const body2 = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, both);
+    const body2 = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, both);
     defer testing.allocator.free(body2);
     var parsed2 = try std.json.parseFromSlice(std.json.Value, testing.allocator, body2, .{});
     defer parsed2.deinit();
@@ -20182,7 +20195,7 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     config.quant_group_size = 64;
     config.max_position_embeddings = 8192;
 
-    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, "");
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1234, 5678, 9_000_000_000, 16384, 4321, 7777, 8888, "");
     defer testing.allocator.free(body);
 
     // Hit every field a known consumer reads.
@@ -20198,6 +20211,9 @@ test "renderPropsBody keeps fields the Swift app + integration tests rely on" {
     // The missing 61 GB was MLX's reclaimable buffer pool, which nothing we
     // expose reported — so the bug was invisible from every surface.
     try testing.expect(std.mem.indexOf(u8, body, "\"cache_bytes\":4321") != null); // Swift fetchProps
+    // The tray splits active_bytes into loaded weights, the prefix KV cache and the rest.
+    try testing.expect(std.mem.indexOf(u8, body, "\"weights_bytes\":7777") != null);
+    try testing.expect(std.mem.indexOf(u8, body, "\"kv_cache_bytes\":8888") != null);
 }
 
 test "mlxCacheLimitBytes: RAM-proportional cap, 2 GB floor, 8 GB ceiling" {

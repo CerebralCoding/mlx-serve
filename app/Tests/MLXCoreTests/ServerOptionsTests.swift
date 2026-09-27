@@ -399,6 +399,19 @@ final class ServerOptionsTests: XCTestCase {
                                flag: "--prefix-cache-mem", value: "2GB"))
     }
 
+    /// A blob saved while "2GB" was the default migrates to Auto once; a later "2GB" stays.
+    func testLegacyPrefixCacheMemDefaultMigratesToAutoOnce() throws {
+        let defaults = UserDefaults(suiteName: "PrefixCacheMemMigration.\(UUID().uuidString)")!
+        var opts = try JSONDecoder().decode(ServerOptions.self, from: Data(#"{"prefixCacheMem":"2GB"}"#.utf8))
+        opts.migrateLegacyPrefixCacheMem(defaults)
+        XCTAssertFalse(opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB).contains("--prefix-cache-mem"))
+
+        opts.prefixCacheMem = "2GB"
+        opts.migrateLegacyPrefixCacheMem(defaults)
+        XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB),
+                               flag: "--prefix-cache-mem", value: "2GB"))
+    }
+
     func testPrefixCacheEntriesAlwaysEmitted() {
         let args = ServerOptions().toCLIArgs(physicalMemoryBytes: 64 * Self.GiB)
         XCTAssertTrue(args.contains("--prefix-cache-entries"),
