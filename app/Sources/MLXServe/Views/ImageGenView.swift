@@ -149,13 +149,15 @@ struct ImageGenView: View {
             .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
-            Button("Cancel", role: .cancel) { pendingRequest = nil }
-            Button("Generate Anyway", role: .destructive) {
+            Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
+            Button(role: .destructive) {
                 if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
-            }
+            } label: { Text("Generate Anyway")
+                .font(.app(.body)) }
         } message: {
-            Text(L10n.text(ramWarningMessage))
+            Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
     }
 
@@ -164,7 +166,7 @@ struct ImageGenView: View {
     private var promptSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack(spacing: 8) {
-                Text("Prompt").font(.app(.subheadline).weight(.semibold))
+                Text("Prompt").font(.app(.headline).weight(.semibold))
                 Spacer()
                 templatesMenu
             }
@@ -444,14 +446,14 @@ struct ImageGenView: View {
         // is the same silent-no-op the capability flags exist to kill.
         if model.stepsAreFixed {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Quality").font(.app(.subheadline).weight(.semibold))
+                Text("Quality").font(.app(.headline).weight(.semibold))
                 Text("Fixed at \(model.fixedSteps) steps — this model is distilled for a \(model.fixedSteps)-step schedule, so more steps cost time without adding detail.")
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)
             }
         } else {
             VStack(alignment: .leading, spacing: 6) {
-                Text("Quality").font(.app(.subheadline).weight(.semibold))
+                Text("Quality").font(.app(.rowTitle).weight(.semibold))
                 // Measured, not `ViewThatFits`: the menu variant is `fixedSize`
                 // and would never re-fit. Five segments degrade to a menu
                 // rather than shortening the tier names the Create panes share.
@@ -498,10 +500,10 @@ struct ImageGenView: View {
     private func qualityPicker(segmented: Bool) -> some View {
         let picker = Picker("", selection: qualitySelection) {
             ForEach(QualityPreset.allCases) { q in
-                Text(L10n.text(q.label)).tag(QualitySelection.preset(q))
+                Text(L10n.text(q.label)).font(.app(.body)).tag(QualitySelection.preset(q))
             }
             if matchedQuality == nil {
-                Text("Custom").tag(QualitySelection.custom)
+                Text("Custom").font(.app(.body)).tag(QualitySelection.custom)
             }
         }
         .labelsHidden()
@@ -564,7 +566,7 @@ struct ImageGenView: View {
                 .fixedSize()
             TextField("", text: text)
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 80)
+                .frame(width: 80).font(.app(.body))
         }
     }
 
@@ -610,7 +612,7 @@ struct ImageGenView: View {
             // Disabled as a plain ITEM, not as a disabled submenu: a submenu
             // still opens on hover, and an empty one that opens reads as a
             // bug rather than as "pick a picture first".
-            Button("Set by source image…") {}
+            Button { } label: { Text("Set by source image…").font(.app(.body)) }
                 .disabled(true)
         } else {
             Menu {
@@ -935,7 +937,7 @@ struct ImageGenView: View {
             Group {
                 switch service.phase {
                 case .idle:
-                    ContentUnavailableView("No generation yet", systemImage: "photo", description: Text("Enter a prompt and press Generate."))
+                    ContentUnavailableView("No generation yet", systemImage: "photo", description: Text("Enter a prompt and press Generate.").font(.app(.body)))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
                         ProgressView(value: Double(step), total: max(1, Double(total)))
@@ -947,11 +949,12 @@ struct ImageGenView: View {
                     completedPreview(path: path)
                 case .failed(let msg):
                     ContentUnavailableView {
-                        Label("Failed", systemImage: "exclamationmark.triangle")
+                        Label("Failed", systemImage: "exclamationmark.triangle").font(.app(.body))
                     } description: {
                         Text(msg)
                     } actions: {
-                        Button("Show log") { showLogWindow() }
+                        Button { showLogWindow() } label: { Text("Show log")
+                            .font(.app(.body)) }
                     }
                 }
             }

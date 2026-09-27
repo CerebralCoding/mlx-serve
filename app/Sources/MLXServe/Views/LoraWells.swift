@@ -51,7 +51,7 @@ struct LoraAdapterRow: View {
                 .help("Remove this LoRA")
             }
             HStack(spacing: 8) {
-                Text("Scale").font(.app(.caption))
+                Text("Scale").font(.app(.rowTitle))
                 Slider(value: $lora.scale, in: 0...2, step: 0.05)
                 // Fixed width: a readout that sizes to its digits drags the
                 // slider's right edge every time the value crosses a width.
