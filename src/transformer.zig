@@ -4744,7 +4744,7 @@ fn qsaSelectComposedOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.mlx_
     return qsaSortWithInvisible(s, top_idx, vis3, all_vis);
 }
 
-// ── Fused sparse attention at verify widths (msv_attn_qsa256_q) ──
+// ── Fused sparse attention at verify widths and batched decode (msv_attn_qsa256_q) ──
 //
 // At 2 <= S < 16 the QSA path spent ~50 dependent ops per layer and attended a fixed union
 // of the S rows' selections under a mask (6x the MACs at S=6, plus a 12.6 MB slab). This is
@@ -5129,10 +5129,16 @@ pub const QSA_ATTN_MAX_NSPLIT: c_int = 64;
 /// Default lower width bound for the fused kernel. `MLX_SERVE_QSA_ATTN_MIN_S=1` is the S=1 measurement's lever.
 pub const QSA_ATTN_MIN_S_DEFAULT: c_int = 2;
 
+/// Width floor for a batched decode step of two or more slots: its S=1 rows take the fused kernel,
+/// which beats the per-slot decode gather there (a lone stream keeps the decode gather).
+/// `MLX_SERVE_QSA_ATTN_BATCHED_MIN_S=2` hands batched S=1 rows back to the decode gather.
+pub const QSA_ATTN_BATCHED_MIN_S_DEFAULT: c_int = 1;
+
 var qsa_attn_nsplit_env: ?c_int = null;
 pub var qsa_attn_nsplit_override: ?c_int = null;
 var qsa_attn_min_s_env: ?c_int = null;
 pub var qsa_attn_min_s_override: ?c_int = null;
+var qsa_attn_batched_min_s_env: ?c_int = null;
 
 fn qsaAttnEnvInt(cache: *?c_int, name: [*:0]const u8, dflt: c_int) c_int {
     if (cache.*) |v| return v;
@@ -5166,6 +5172,7 @@ pub fn warmQsaEnvCaches() void {
     _ = qsaAttnDenseEnabled();
     _ = qsaAttnNSplit();
     _ = qsaAttnMinS();
+    _ = qsaAttnBatchedMinS();
     _ = qsaAttnBk();
     _ = qsaAttnBalanced();
     _ = qsaScoreSheetBudget();
@@ -5188,6 +5195,12 @@ pub fn qsaAttnNSplit() c_int {
 /// Lowest query width the fused kernel serves. `MLX_SERVE_QSA_ATTN_MIN_S`.
 pub fn qsaAttnMinS() c_int {
     const v = qsa_attn_min_s_override orelse qsaAttnEnvInt(&qsa_attn_min_s_env, "MLX_SERVE_QSA_ATTN_MIN_S", QSA_ATTN_MIN_S_DEFAULT);
+    return @max(1, @min(v, FUSED256_MIN_Q_LEN - 1));
+}
+
+/// Lowest width the fused kernel serves for S=1 rows of a batched step with two or more slots.
+pub fn qsaAttnBatchedMinS() c_int {
+    const v = qsaAttnEnvInt(&qsa_attn_batched_min_s_env, "MLX_SERVE_QSA_ATTN_BATCHED_MIN_S", QSA_ATTN_BATCHED_MIN_S_DEFAULT);
     return @max(1, @min(v, FUSED256_MIN_Q_LEN - 1));
 }
 
@@ -5324,8 +5337,8 @@ fn getQsaAttnQKernel() !mlx.mlx_fast_metal_kernel {
 pub var qsa_attn_kernel_override: ?bool = null;
 var qsa_attn_kernel_env: ?bool = null;
 
-/// Fused QSA sparse attention at verify widths (default on). `MLX_SERVE_QSA_ATTN_KERNEL=0`
-/// restores `qsaVerifyGatherAttn`.
+/// Fused QSA sparse attention at verify widths and batched decode (default on).
+/// `MLX_SERVE_QSA_ATTN_KERNEL=0` restores the gather arms.
 pub fn qsaAttnKernelEnabled() bool {
     if (qsa_attn_kernel_override) |v| return v;
     if (qsa_attn_kernel_env) |v| return v;
@@ -5499,9 +5512,9 @@ fn qsaAttnDenseInputs(kv_view: *const DenseKVView) ?QsaAttnKvInputs {
     return .{ .arrays = arrays, .n = 2, .h_kv = ks[1], .kv = ks[2], .bits = 16, .gs = 0 };
 }
 
-/// One fused sparse-attention dispatch for a verify-width block: each row indexes its own
-/// selected blocks plus its own tail. Quantized KV unpacks its triples in-kernel; dense
-/// (bf16) KV takes the same split pass with plain loads. Null = declined.
+/// One fused sparse-attention dispatch for a verify-width block or a batched decode row: each
+/// row indexes its own selected blocks plus its own tail. Quantized KV unpacks its triples
+/// in-kernel; dense (bf16) KV takes the same split pass with plain loads. Null = declined.
 pub fn qsaSparseAttn(
     s: mlx.mlx_stream,
     q_rope: mlx.mlx_array, // [1, Hq, S, 256] bf16, post-RoPE
@@ -5510,14 +5523,27 @@ pub fn qsaSparseAttn(
     ratio: c_int,
     attn_scale: f32,
 ) !?mlx.mlx_array {
+    return qsaSparseAttnFloor(s, q_rope, kv_view, blocks, ratio, attn_scale, qsaAttnMinS());
+}
+
+/// `qsaSparseAttn` under an explicit width floor (the batched decode floor for S=1 rows of a batch).
+pub fn qsaSparseAttnFloor(
+    s: mlx.mlx_stream,
+    q_rope: mlx.mlx_array,
+    kv_view: *const DenseKVView,
+    blocks: mlx.mlx_array,
+    ratio: c_int,
+    attn_scale: f32,
+    min_s: c_int,
+) !?mlx.mlx_array {
     if (!qsaAttnKernelEnabled()) return null;
     if (!mlx.streamIsGpu(s)) return null;
     if (mlx.mlx_array_ndim(q_rope) != 4 or mlx.mlx_array_ndim(blocks) != 3) return null;
     const qs = mlx.getShape(q_rope);
     const seq_len = qs[2];
-    // Decode width keeps `qsaDecodeGatherAttn` (excluded by `qsaAttnMinS`, not a literal);
+    // `min_s` keeps a lone decode row on `qsaDecodeGatherAttn` (a batched step lowers it);
     // prefill keeps `gatherQsa256`; a dense cache follows `MLX_SERVE_QSA_ATTN_DENSE`.
-    if (!qsaSparseAttnServes(kv_view.has_quant_triple, seq_len, qsaAttnMinS())) return null;
+    if (!qsaSparseAttnServes(kv_view.has_quant_triple, seq_len, min_s)) return null;
     if (qs[0] != 1 or qs[3] != 256) return null;
     if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return null;
     if (mlx.mlx_array_dtype(blocks) != .int32) return null;
@@ -5627,7 +5653,7 @@ pub fn qsaSparseAttn(
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (qsa_attn_engaged_bits.take(qsaWidthBucket(seq_len) + @as(u5, if (dense) 4 else 0))) {
         log.info(
-            "[qsa-attn] engaged (S={d} kv={d} kv-bits={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 restores the union gather, MLX_SERVE_QSA_ATTN_DENSE=0 the dense mask arm\n",
+            "[qsa-attn] engaged (S={d} kv={d} kv-bits={d}/gs{d} gqa={d} bk={d} nsplit={d} tgs={d}) — MLX_SERVE_QSA_ATTN_KERNEL=0 (or MLX_SERVE_QSA_ATTN_DENSE=0 on a dense cache) hands the call back to the gather or mask arm below it\n",
             .{ seq_len, kv, kvin.bits, kvin.gs, gqa, bk, nsplit, seq_len * h_kv * nsplit },
         );
     }
@@ -6120,7 +6146,7 @@ pub fn qsaBatchedGatherAttn(
     if (views.len != n or blocks.len != n) return error.QsaBatchedGatherLen;
     if (masks.len != 0 and masks.len != n) return error.QsaBatchedGatherLen;
     if (out_arms.len != 0 and out_arms.len != n) return error.QsaBatchedGatherLen;
-    const fused_min_s = qsaAttnMinS();
+    const fused_min_s = if (n >= 2 and seq_len == 1) qsaAttnBatchedMinS() else qsaAttnMinS();
     const standin_sdpa = qwen4Standin().attn_sdpa;
     var outs = try allocator.alloc(mlx.mlx_array, n);
     defer allocator.free(outs);
@@ -6148,7 +6174,7 @@ pub fn qsaBatchedGatherAttn(
         var gathered: ?mlx.mlx_array = null;
         const qsa_ok = blk.ctx != null and slot_mask.ctx == null and !standin_sdpa;
         if (qsa_ok and seq_len >= fused_min_s and seq_len < FUSED256_MIN_Q_LEN) {
-            gathered = try qsaSparseAttn(s, q_slot, kv_view, blk, ratio, attn_scale);
+            gathered = try qsaSparseAttnFloor(s, q_slot, kv_view, blk, ratio, attn_scale, fused_min_s);
         }
         if (gathered == null and qsa_ok and seq_len == 1) {
             gathered = try qsaDecodeGatherAttn(s, q_slot, kv_view, blk, ratio, attn_scale);
@@ -56078,6 +56104,76 @@ test "qsa batched gather S=1: N=1 is byte-identical to solo, N=2 matches per-slo
     try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(bat2, want, s));
 }
 
+test "qsa batched gather S=1: two or more slots take the fused kernel exactly as solo fused launches; one slot keeps the decode gather" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    try std.testing.expectEqual(@as(c_int, 2), qsaAttnMinS());
+    try std.testing.expectEqual(@as(c_int, 1), qsaAttnBatchedMinS());
+    var prng = std.Random.DefaultPrng.init(0x51_0B47);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const kb: c_int = 64;
+    const kvs = [_]c_int{ 4096, 3000 };
+    const scale: f32 = 1.0 / 16.0;
+    const qcfg = kv_quant.KVQuantConfig.affine(8);
+
+    var ks: [2]mlx.mlx_array = undefined;
+    var vs: [2]mlx.mlx_array = undefined;
+    var dviews: [2]DenseKVView = undefined;
+    var qviews: [2]DenseKVView = undefined;
+    var caches: [2]KVCache = undefined;
+    var blks: [2]mlx.mlx_array = undefined;
+    var hosts: [2][]i32 = undefined;
+    var qs: [2]mlx.mlx_array = undefined;
+    for (0..2) |i| {
+        ks[i] = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kvs[i], 256 }, s);
+        vs[i] = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kvs[i], 256 }, s);
+        dviews[i] = DenseKVView{ .k = ks[i], .v = vs[i], .owned = false };
+        caches[i] = try KVCache.initWithConfig(ta, 1, qcfg);
+        qviews[i] = try qsaAttnCacheFixture(ta, s, ks[i], vs[i], kvs[i], @divTrunc(kvs[i], 2), qcfg, &caches[i]);
+        hosts[i] = try qsaVerifyBlocksHost(ta, rnd, 1, kvs[i], kb, ratio);
+        blks[i] = mlx.mlx_array_new_data(hosts[i].ptr, &[_]c_int{ 1, 1, kb }, 3, .int32);
+        qs[i] = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, 1, 256 }, s);
+    }
+    defer for (0..2) |i| {
+        _ = mlx.mlx_array_free(ks[i]);
+        _ = mlx.mlx_array_free(vs[i]);
+        qviews[i].deinit();
+        caches[i].deinit();
+        _ = mlx.mlx_array_free(blks[i]);
+        ta.free(hosts[i]);
+        _ = mlx.mlx_array_free(qs[i]);
+    };
+    var q2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q2);
+    const qvec = mlx.mlx_vector_array_new_data(&qs, 2);
+    defer _ = mlx.mlx_vector_array_free(qvec);
+    try mlx.check(mlx.mlx_concatenate_axis(&q2, qvec, 0, s));
+
+    for ([_]*const [2]DenseKVView{ &dviews, &qviews }) |views| {
+        var solos: [2]mlx.mlx_array = undefined;
+        for (0..2) |i| solos[i] = (try qsaSparseAttnFloor(s, qs[i], &views[i], blks[i], ratio, scale, 1)) orelse return error.SparseAttnDeclined;
+        defer for (solos) |o| {
+            _ = mlx.mlx_array_free(o);
+        };
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        const wvec = mlx.mlx_vector_array_new_data(&solos, 2);
+        defer _ = mlx.mlx_vector_array_free(wvec);
+        try mlx.check(mlx.mlx_concatenate_axis(&want, wvec, 0, s));
+        const got = try qsaBatchedGatherAttn(ta, s, q2, views, &blks, &.{}, ratio, scale, &.{});
+        defer _ = mlx.mlx_array_free(got);
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(got, want, s));
+
+        const lone_ref = (try qsaDecodeGatherAttn(s, qs[0], &views[0], blks[0], ratio, scale)) orelse return error.GatherDeclined;
+        defer _ = mlx.mlx_array_free(lone_ref);
+        const lone = try qsaBatchedGatherAttn(ta, s, qs[0], views[0..1], blks[0..1], &.{}, ratio, scale, &.{});
+        defer _ = mlx.mlx_array_free(lone);
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(lone, lone_ref, s));
+    }
+}
+
 test "qsa batched gather mixed group: a mask-only slot matches its solo masked SDPA" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -56713,7 +56809,7 @@ test "qsa verify gather: subset SDPA matches masked full SDPA at verify widths (
     try std.testing.expect((try qsaVerifyGatherAttn(s, q, &dv2, bl, ratio, 1.0)) == null);
 }
 
-// ── Fused sparse attention at verify widths (msv_attn_qsa256_q) ──
+// ── Fused sparse attention at verify widths and batched decode (msv_attn_qsa256_q) ──
 
 /// Build a KVCache whose view is a strided slice of a larger capacity buffer (the shape the serving path hands the kernel).
 fn qsaAttnCacheFixture(
@@ -57117,7 +57213,7 @@ test "qsa sparse attn: one fused dispatch replaces the arm's op chain (>= 100 op
     try std.testing.expect(gather_ops - kernel_ops >= 100);
 }
 
-test "qsa sparse attn dense: bf16 cache views at verify widths equal the masked reference (S 2..15, kv 2100..40000)" {
+test "qsa sparse attn dense: bf16 cache views at decode and verify widths equal the masked reference (S 1..15, kv 2100..40000)" {
     // The dense arm must attend exactly the mask arm's key set (each row's own blocks + its own
     // causal tail) through any view the cache hands it: the cache's capacity-strided view, a
     // hand-built slice of a wider buffer, and a head slice with a non-zero data offset.
@@ -57132,6 +57228,9 @@ test "qsa sparse attn dense: bf16 cache views at verify widths equal the masked 
     qsa_attn_dense_override = null;
 
     const cases = [_]struct { s: c_int, kv: c_int, kb: c_int, hq: c_int, hkv: c_int }{
+        // Decode width, as batched steps serve it (floor 1): NSPLIT at its ceiling, most splits empty.
+        .{ .s = 1, .kv = 9000, .kb = 512, .hq = 24, .hkv = 2 },
+        .{ .s = 1, .kv = 40000, .kb = 512, .hq = 24, .hkv = 2 },
         .{ .s = 2, .kv = 2100, .kb = 512, .hq = 24, .hkv = 2 },
         .{ .s = 4, .kv = 2100, .kb = 512, .hq = 24, .hkv = 2 },
         .{ .s = 6, .kv = 9000, .kb = 512, .hq = 24, .hkv = 2 },
@@ -57185,7 +57284,7 @@ test "qsa sparse attn dense: bf16 cache views at verify widths equal the masked 
 
         // Contiguous input: the parity bar against the masked reference.
         var cview = DenseKVView{ .k = k_c, .v = v_c, .owned = false };
-        const got_c = (try qsaSparseAttn(s, q, &cview, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
+        const got_c = (try qsaSparseAttnFloor(s, q, &cview, blocks, ratio, scale, 1)) orelse return error.SparseAttnDeclined;
         defer _ = mlx.mlx_array_free(got_c);
         const dd = try attn256MaxDiff(got_c, ref, s);
         const dc = try attn256Cosine(got_c, ref, s);
@@ -57195,7 +57294,7 @@ test "qsa sparse attn dense: bf16 cache views at verify widths equal the masked 
 
         // Strided, offset view of the same values: bit-identical to the contiguous input.
         var sview = DenseKVView{ .k = k_view, .v = v_view, .owned = false };
-        const got_s = (try qsaSparseAttn(s, q, &sview, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
+        const got_s = (try qsaSparseAttnFloor(s, q, &sview, blocks, ratio, scale, 1)) orelse return error.SparseAttnDeclined;
         defer _ = mlx.mlx_array_free(got_s);
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got_s, got_c, s));
 
@@ -57206,7 +57305,7 @@ test "qsa sparse attn dense: bf16 cache views at verify widths equal the masked 
         defer view.deinit();
         try std.testing.expect(!view.has_quant_triple);
         try std.testing.expectEqual(c.kv, mlx.getShape(view.k)[2]);
-        const got_v = (try qsaSparseAttn(s, q, &view, blocks, ratio, scale)) orelse return error.SparseAttnDeclined;
+        const got_v = (try qsaSparseAttnFloor(s, q, &view, blocks, ratio, scale, 1)) orelse return error.SparseAttnDeclined;
         defer _ = mlx.mlx_array_free(got_v);
         try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(got_v, got_c, s));
 
