@@ -368,6 +368,9 @@ Ported into mlx-serve:
   - `src/rowqmv.zig`: the row-exact 4-bit matvec, routed-expert and router
     kernels of `rows.py` (one simdgroup per input row, MLX's qmv_fast loop).
   - `src/simd_qmm.zig`: the `simd_qmm` fixed-order matmul kernels.
+  - `src/tensor_qmm.zig` and `src/metal/tensor_qmm.metal`: the native
+    `lanes.zig` M5 row-invariant affine projection and `lane_qmm` kernels
+    from the TensorFold Zig refactor at commit 2fbd46c.
   - `src/row_attn.zig`: the fixed-split row attention of `row_attention`.
   - `src/keyed_sample.zig`: the keyed Gumbel-max GPU sampler of
     `gpu_sampling.py` (Metal source reproduced unchanged).
@@ -376,7 +379,10 @@ Ported into mlx-serve:
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c with our own
 host dispatch; `simd_qmm` gains a 2-3 row `rows` kind; draft trees verify
-through our GDN fold kernel and path attention.
+through our GDN fold kernel and path attention. The tensor projection uses
+model-owned tiled weights and interleaved scales/biases, a fixed 16-row tile,
+and declines unsupported geometry to the SIMD path. Joined gate/up geometry
+is held constant across serial decoding and verification windows.
 
 
 ================================================================================

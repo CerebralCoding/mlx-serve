@@ -14,6 +14,7 @@ const rht = @import("rht.zig");
 const qmv2 = @import("qmv2.zig");
 const rowqmv = @import("rowqmv.zig");
 const simd_qmm = @import("simd_qmm.zig");
+const tensor_qmm = @import("tensor_qmm.zig");
 const row_attn = @import("row_attn.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
@@ -16250,6 +16251,7 @@ pub const Transformer = struct {
     moe_owned_bf16: ?[]mlx.mlx_array = null,
     /// Prism Hadamard sign vectors keyed on weight handles; null on every other checkpoint.
     rht: ?*rht.Registry = null,
+    row_tensor: ?*tensor_qmm.Cache = null,
     /// A 2-bit group-128 pack without rotations whose every matmul weight has
     /// biases == -scales (Prism's ternary codec): qmv2's ternary kernel applies.
     ternary_2bit: bool = false,
@@ -16923,6 +16925,15 @@ pub const Transformer = struct {
         }
 
         var rht_registry: ?*rht.Registry = null;
+        var row_tensor: ?*tensor_qmm.Cache = null;
+        errdefer if (row_tensor) |tc| {
+            tc.deinit();
+            allocator.destroy(tc);
+        };
+        if (config.rowExactDecode() and !std.mem.eql(u8, config.model_type, "nemotron_h") and verifyQmmNaxAvailable() and tensor_qmm.enabled()) {
+            row_tensor = try allocator.create(tensor_qmm.Cache);
+            row_tensor.?.* = .{};
+        }
         errdefer if (rht_registry) |reg| {
             reg.deinit();
             allocator.destroy(reg);
@@ -17046,6 +17057,7 @@ pub const Transformer = struct {
             .moe_seq_offset = 0,
             .moe_owned_bf16 = moe_owned_bf16,
             .rht = rht_registry,
+            .row_tensor = row_tensor,
             .ternary_2bit = ternary_2bit,
             .hybrid_layers = hybrid_layers,
             .embedding_norm = embedding_norm_w,
@@ -17732,6 +17744,11 @@ pub const Transformer = struct {
 
     pub fn deinit(self: *Transformer) void {
         self.releaseJoinedVerifyLogits();
+        if (self.row_tensor) |cache| {
+            cache.deinit();
+            self.allocator.destroy(cache);
+            self.row_tensor = null;
+        }
         if (self.ane_prefill) |eng| {
             eng.deinit();
             self.ane_prefill = null;
@@ -17898,6 +17915,15 @@ pub const Transformer = struct {
             if (try qmv2.qmm(x, w, sc, bi, qp.bits, qp.group_size, true, false, self.s)) |y| return y;
         }
         if (self.config.rowExactDecode() and qp.mode == .affine) {
+            if (self.row_tensor) |cache| {
+                if (try tensor_qmm.qmmCached(cache, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| {
+                    if (!tensor_qmm_engaged) {
+                        tensor_qmm_engaged = true;
+                        log.info("[tensor-qmm] tiled row-invariant M5 projections engaged (MLX_SERVE_ROW_TENSOR_QMM=0 restores SIMD)\n", .{});
+                    }
+                    return y;
+                }
+            }
             if (try rowExactQmm(&self.config, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
         }
         return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
@@ -29528,7 +29554,14 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(gate);
         var up = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(up);
-        if (dw.gu.w.ctx != null and rows <= FUSED_ROWS_MAX_M) {
+        // Tensor split-K depends on output width. Keep the joined gate/up
+        // geometry identical in serial decode and every verification row.
+        const tensor_joined = if (self.row_tensor != null and dw.gu.w.ctx != null) blk: {
+            const qp = self.quantParamsHinted(dw.gu.w, dw.gu.s, lastDim(x));
+            break :blk qp.mode == .affine and tensor_qmm.supports(x, dw.gu.w, dw.gu.s, dw.gu.b, qp.bits, qp.group_size, self.s);
+        } else false;
+        const fused_max = if (tensor_joined) simd_qmm.MAX_ROWS else FUSED_ROWS_MAX_M;
+        if (dw.gu.w.ctx != null and rows <= fused_max) {
             const both = try self.qmatmul(x, dw.gu.w, dw.gu.s, dw.gu.b);
             defer _ = mlx.mlx_array_free(both);
             try dw.gu.part(&gate, both, 0, self.s);
@@ -33381,6 +33414,8 @@ fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: 
     }
     return rowqmv.qmv(x, w, sc, bi, bits, group_size, s);
 }
+
+var tensor_qmm_engaged = false;
 
 /// q [1, H, S, hd] over k/v [1, KVH, L, hd] whose last S rows are the
 /// window's: row r takes the one-query sdpa over keys [0, L - S + r].
