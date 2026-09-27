@@ -2052,3 +2052,8 @@
 "This folder has a config but no usable model weights, so nothing can load it. It is safe to delete." = "이 폴더에는 설정 파일은 있지만 사용 가능한 모델 가중치가 없어 로드할 수 없습니다. 삭제해도 안전합니다.";
 "Delete Message" = "메시지 삭제";
 "From a depth map" = "깊이 맵에서";
+"Maximum prompt + completion tokens. \"Auto\" fits the model to available memory when it loads — well under the model max — and holds that value until the server restarts. Higher values use more memory." = "프롬프트와 응답을 합한 최대 토큰 수입니다. \"자동\"은 모델을 불러올 때 사용 가능한 메모리에 맞춰 모델의 최대값보다 낮게 설정하고, 서버를 다시 시작할 때까지 그 값을 유지합니다. 값을 높이면 메모리를 더 사용합니다.";
+"Speak it" = "말로 입력";
+"Dictate the text instead of typing it" = "키보드 대신 말로 텍스트 입력";
+"Choose audio file…" = "오디오 파일 선택…";
+"Record audio…" = "오디오 녹음…";
