@@ -39674,21 +39674,20 @@ pub var moe_verify_rows_override: ?bool = null; // test seam
 var moe_verify_rows_cached: ?bool = null;
 var moe_verify_rows_logged: bool = false;
 
-/// Single-slot verify widths (B == 1, 2 <= S <= 8) through the rows arm. On by
-/// default on Ultra chips only; MLX_SERVE_MOE_VERIFY_ROWS=1/0 forces it on any chip.
+/// Single-slot verify widths (B == 1, 2 <= S <= 8) through the rows arm, on by
+/// default (M4 Max Flash Next S=2 26.9 -> 23.5 ms); MLX_SERVE_MOE_VERIFY_ROWS=0 keeps the sorted path.
 fn moeVerifyRowsEnabled() bool {
     if (moe_verify_rows_override) |v| return v;
     if (moe_verify_rows_cached) |v| return v;
-    var buf: [128]u8 = undefined;
     const raw = std.c.getenv("MLX_SERVE_MOE_VERIFY_ROWS");
-    const on = moeVerifyRowsFor(if (raw) |r| std.mem.sliceTo(r, 0) else null, ane_offload.chipBrandString(&buf));
+    const on = moeVerifyRowsFor(if (raw) |r| std.mem.sliceTo(r, 0) else null);
     moe_verify_rows_cached = on;
     return on;
 }
 
-fn moeVerifyRowsFor(env: ?[]const u8, chip: []const u8) bool {
+fn moeVerifyRowsFor(env: ?[]const u8) bool {
     if (env) |e| return !std.mem.eql(u8, e, "0");
-    return std.mem.indexOf(u8, chip, "Ultra") != null;
+    return true;
 }
 
 const MoeDecodeDispatchArm = enum { rows, sorted, gather_qmv };
@@ -48409,10 +48408,9 @@ test "moe decode dispatch: single-slot verify widths take the rows arm when enab
     moe_verify_rows_override = false;
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false));
 
-    try std.testing.expect(moeVerifyRowsFor(null, "Apple M5 Ultra"));
-    try std.testing.expect(!moeVerifyRowsFor(null, "Apple M5 Max"));
-    try std.testing.expect(!moeVerifyRowsFor("0", "Apple M5 Ultra"));
-    try std.testing.expect(moeVerifyRowsFor("1", "Apple M5 Max"));
+    try std.testing.expect(moeVerifyRowsFor(null));
+    try std.testing.expect(!moeVerifyRowsFor("0"));
+    try std.testing.expect(moeVerifyRowsFor("1"));
 }
 
 test "gatherQmvGateUpRows accepts N=8 K=10" {

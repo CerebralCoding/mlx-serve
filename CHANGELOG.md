@@ -14,6 +14,7 @@
   | Spark-X2.5 4B 4-bit | +10% | · | · | · |
 
 - **Decoding streams keep moving through another request's prefill.** `--prefill-decode-share` gives decoders a share of wall time while a long prompt prefills, instead of freezing them for seconds on a 32k prompt (#568).
+- **Qwen3.8 Flash Next MTP rounds on every chip.** Verify widths of 2 to 8 rows take the fused MoE rows kernel on all Apple Silicon, not only Ultra chips: on an M4 Max a 2-row verify forward drops from 26.9 to 23.5 ms and MTP decode gains 5-8% (code 101.7 -> 109.2 tok/s, greedy chat 83.6 -> 90.4).
 - **Qwen3.8 Flash Next after long prompts.** Decode past 32k is about 12% faster with the default bf16 KV, the n-gram gather runs on the GPU (prefill 2-4% faster everywhere, decode +15% at 128k), and MTP rounds draft the next chain before the host read (#555, #539, #545, #554, #556).
 - **Qwen-Image-2.1 instruction editing.** One checkpoint serves text-to-image and `mode:"edit"` with an image plus up to 10 references (#512).
 - **Console in Simplified Chinese with a light theme**, and the app's alerts and hints are translated (#487, #485, #463).
