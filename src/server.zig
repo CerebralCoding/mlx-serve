@@ -2958,7 +2958,7 @@ fn handleOllamaPull(allocator: std.mem.Allocator, stream: *Conn, body: []const u
     // Make it loadable by name right away. GGUF-only dirs (no config.json)
     // aren't registerable this way — they still work via --model / the app.
     if (global_registry) |registry| {
-        _ = registry.registerByPath(stream.io, dest) catch {};
+        _ = registry.registerByPath(stream.io, dest, resolved.repo) catch {};
     }
     sink.quiet = false;
     sink.emit("status", "success") catch {};
@@ -6823,7 +6823,7 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
             try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503);
             return;
         };
-        requested_id = registry.registerByPath(stream.io, requested_id) catch |err| switch (err) {
+        requested_id = registry.registerByPath(stream.io, requested_id, null) catch |err| switch (err) {
             error.ModelDirNotFound, error.InvalidModelPath => {
                 try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "No loadable model directory at that path", 404);
                 return;
