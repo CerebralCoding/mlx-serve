@@ -4,16 +4,45 @@
 const std = @import("std");
 const dflash = @import("dflash.zig");
 
-pub const MAX_NODES = 15;
+pub const MAX_NODES = 31;
+pub const DEFAULT_MAX_NODES = 15;
 pub fn nodeBudget(proposal: u32) usize {
-    const raw = std.c.getenv("MLX_SERVE_DFLASH_TREE_NODES") orelse return @min(proposal -| 1, MAX_NODES);
+    const fallback = @min(proposal -| 1, DEFAULT_MAX_NODES);
+    const raw = std.c.getenv("MLX_SERVE_DFLASH_TREE_NODES") orelse return fallback;
     // Zero is a correctness control: verify only the pending token, using the
     // identical target kernels/state path as a full tree, without speculation.
-    return @min(std.fmt.parseInt(usize, std.mem.span(raw), 10) catch MAX_NODES, MAX_NODES);
+    return @min(std.fmt.parseInt(usize, std.mem.span(raw), 10) catch fallback, MAX_NODES);
 }
 pub fn allocationEnabled() bool {
     const raw = std.c.getenv("MLX_SERVE_DFLASH_TREE_ALLOCATE") orelse return false;
     return !std.mem.eql(u8, std.mem.span(raw), "0");
+}
+
+pub const Tuning = struct {
+    children: usize = 4,
+    tau: f32 = 1.5,
+    edge_w: f32 = 0.6,
+
+    pub fn fitted(self: Tuning) bool {
+        return self.children == 4 and self.tau == 1.5 and self.edge_w == 0.6;
+    }
+};
+var search_tuning: ?Tuning = null;
+
+pub fn tuning() Tuning {
+    if (search_tuning) |v| return v;
+    var v = Tuning{};
+    if (std.c.getenv("MLX_SERVE_DFLASH_TREE_CHILDREN")) |raw|
+        v.children = std.math.clamp(std.fmt.parseInt(usize, std.mem.span(raw), 10) catch v.children, 1, 16);
+    const fields = .{ .{ "tau", "MLX_SERVE_DFLASH_TREE_TAU", 0.25, 4.0 }, .{ "edge_w", "MLX_SERVE_DFLASH_TREE_EDGE_WEIGHT", 0.0, 2.0 } };
+    inline for (fields) |field| {
+        if (std.c.getenv(field[1])) |raw| {
+            const value = std.fmt.parseFloat(f32, std.mem.span(raw)) catch @field(v, field[0]);
+            if (std.math.isFinite(value)) @field(v, field[0]) = std.math.clamp(value, field[2], field[3]);
+        }
+    }
+    search_tuning = v;
+    return v;
 }
 const Calibration = struct {
     depth_edges: [6]u32,
@@ -44,7 +73,9 @@ fn fitted() !Data {
 pub fn proposalBlock(config: u32, requested: u32, explicit: bool, wide: bool) u32 {
     // Larger proposals are available explicitly; the current target kernels
     // do not yet amortize sixteen rows well enough to widen by default.
-    return if (explicit) @min(@max(requested, 2), MAX_NODES + 1) else @min(@max(config, 2), if (wide) MAX_NODES + 1 else @as(u32, 8));
+    // Node count and proposal depth are independent: wider trees spend more
+    // nodes on the same lattice, without changing the drafter's trained block.
+    return if (explicit) @min(@max(requested, 2), DEFAULT_MAX_NODES + 1) else @min(@max(config, 2), if (wide) DEFAULT_MAX_NODES + 1 else @as(u32, 8));
 }
 
 /// Reorder in place, most likely eligible node first; every prefix is a tree.
@@ -89,7 +120,7 @@ pub fn order(tree: *dflash.DraftTree, sampled: bool, use_fit: bool) ![MAX_NODES]
 /// geometry must be fixed for a model instance; only the verified prefix varies.
 pub const Costs = struct {
     const Cell = struct { n: u32 = 0, ms: f32 = 0 };
-    const Bucket = struct { cells: [16]Cell = @splat(.{}), rounds: u32 = 0 };
+    const Bucket = struct { cells: [MAX_NODES + 1]Cell = @splat(.{}), rounds: u32 = 0 };
     buckets: [8]Bucket = @splat(.{}),
     proposal: u32 = 0,
 
@@ -172,4 +203,18 @@ test "dflash tree allocation: probability ordering preserves ancestry and select
     try std.testing.expectEqual(@as(usize, 4), costs.choose(9000, p[0..4]));
     costs.resetFor(16);
     try std.testing.expectEqual(@as(usize, 4), costs.choose(100, p[0..4]));
+}
+
+test "dflash tree allocation: prices all 31 nodes without widening the proposal" {
+    var costs = Costs{};
+    for (0..3) |_| {
+        costs.observe(0, 31, 58, true);
+        costs.observe(0, 7, 35, true);
+        costs.observe(0, 0, 30, true);
+    }
+    try std.testing.expectEqual(@as(usize, 31), costs.choose(0, &@as([31]f32, @splat(0.5))));
+    try std.testing.expectEqual(@as(usize, 0), costs.choose(0, &@as([31]f32, @splat(0.001))));
+    try std.testing.expectEqual(@as(u32, 16), proposalBlock(16, 32, true, true));
+    try std.testing.expect((Tuning{}).fitted());
+    try std.testing.expect(!(Tuning{ .tau = 1 }).fitted());
 }

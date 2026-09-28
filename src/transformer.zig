@@ -17904,7 +17904,7 @@ pub const Transformer = struct {
         // Canonical tiled storage must never reach an original-layout reader,
         // including prefill and a one-row speculative fallback.
         if (@import("dflash_tiled.zig").isTiled(w))
-            return @import("dflash_tiled.zig").qmm(x, w, sc, bi, null, self.s);
+            return @import("dflash_tiled.zig").qmmWithRows(x, w, sc, bi, null, self.spec_tree != null, self.s);
         // Resolve (bits, group_size, mode) per weight. Most weights inherit the
         // global config; per-weight overrides (mixed-precision checkpoints, e.g.
         // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
@@ -17925,7 +17925,7 @@ pub const Transformer = struct {
             if (try qmv2.qmm(x, w, sc, bi, qp.bits, qp.group_size, true, false, self.s)) |y| return y;
         }
         if (self.config.rowExactDecode() and qp.mode == .affine) {
-            if (try rowExactQmm(&self.config, x, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
+            if (try rowExactQmm(&self.config, x, w, sc, bi, qp.bits, qp.group_size, self.spec_tree != null, self.s)) |y| return y;
         }
         return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
     }
@@ -27335,7 +27335,7 @@ pub const Transformer = struct {
         }
         if (kv_fused_done) {
             // packed kernel handled this layer
-        } else if (self.config.rowExactDecode() and seq_len <= row_attn.MAX_ROWS and batch == 1 and
+        } else if (self.config.rowExactDecode() and seq_len <= (if (ctx.tree != null) row_attn.MAX_ROWS else @as(c_int, 16)) and batch == 1 and
             try row_attn.sdpa(&attn_out, q_rope, full_k, full_v, attn_scale, if (ctx.tree) |t| t.attn else null, self.s))
         {
             // every row, serial steps included, through the one fixed arithmetic
@@ -29007,7 +29007,7 @@ pub const Transformer = struct {
             }, tree.parents, self.s)) orelse return error.SpecTreeUnsupported;
             defer _ = mlx.mlx_array_free(out.y);
             errdefer out.record.deinit();
-            const flat = (try gdnTreeNormGateFused(self.s, out.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse return error.SpecTreeUnsupported;
+            const flat = (try gdnNormGateFusedImpl(self.s, out.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len, true)) orelse return error.SpecTreeUnsupported;
             defer _ = mlx.mlx_array_free(flat);
             var conv_input = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(conv_input);
@@ -29602,12 +29602,13 @@ pub const Transformer = struct {
         // The NAX split count depends on N. Use the same joined matrix for
         // one-row and tree calls so verification keeps the serial arithmetic.
         var joined: ?mlx.mlx_array = null;
-        if (@import("dflash_tiled.zig").isTiled(dw.gu.w) and rows <= 16) {
-            joined = try @import("dflash_tiled.zig").qmm(x, dw.gu.w, dw.gu.s, dw.gu.b, dw.gu.widths[0], self.s);
-        } else if (dw.gu.w.ctx != null and rows <= 16 and dflashNaxTarget(&self.config) and dw.gu.count == 2 and dw.gu.widths[0] == dw.gu.widths[1]) {
+        const joined_rows: c_int = if (self.spec_tree != null) @import("dflash_nax.zig").MAX_ROWS else 16;
+        if (@import("dflash_tiled.zig").isTiled(dw.gu.w) and rows <= joined_rows) {
+            joined = try @import("dflash_tiled.zig").qmmWithRows(x, dw.gu.w, dw.gu.s, dw.gu.b, dw.gu.widths[0], self.spec_tree != null, self.s);
+        } else if (dw.gu.w.ctx != null and rows <= joined_rows and dflashNaxTarget(&self.config) and dw.gu.count == 2 and dw.gu.widths[0] == dw.gu.widths[1]) {
             const qp = quantParamsOrDense(&self.config, dw.gu.w, dw.gu.s, lastDim(x));
             if (qp.mode == .affine)
-                joined = try @import("dflash_nax.zig").qmmWithSplitColumns(x, dw.gu.w, dw.gu.s, dw.gu.b, qp.bits, qp.group_size, dw.gu.widths[0], self.s);
+                joined = try @import("dflash_nax.zig").qmmWithTile(x, dw.gu.w, dw.gu.s, dw.gu.b, qp.bits, qp.group_size, dw.gu.widths[0], @import("dflash_nax.zig").tileWidth(), self.s);
         }
         // A declined native kernel retains main's original fusion envelope,
         // including other quantization widths and mixed-precision layers.
@@ -29623,7 +29624,7 @@ pub const Transformer = struct {
         }
         const activated = try self.computeGeglu(gate, up);
         defer _ = mlx.mlx_array_free(activated);
-        if (dw.tiled_reference and rows > 16) return @import("dflash_tiled.zig").originalQmm(activated, dw.down_w, dw.down_s, dw.down_b, null, self.s);
+        if (dw.tiled_reference and rows > joined_rows) return @import("dflash_tiled.zig").originalQmm(activated, dw.down_w, dw.down_s, dw.down_b, null, self.s);
         return self.qmatmul(activated, dw.down_w, dw.down_s, dw.down_b);
     }
 
@@ -29923,7 +29924,12 @@ pub const Transformer = struct {
     fn dflashSharedInput(self: *const Transformer, x: mlx.mlx_array) !?@import("dflash_nax.zig").Input {
         const nax = @import("dflash_nax.zig");
         if (!nax.sharedInputEnabled() or !dflashNaxTarget(&self.config) or self.rht != null or self.ternary_2bit) return null;
-        return nax.Input.init(x, self.s);
+        var input = (try nax.Input.init(x, self.s)) orelse return null;
+        if (self.spec_tree == null and input.m > 16) {
+            input.deinit();
+            return null;
+        }
+        return input;
     }
 
     fn dflashSharedProject(self: *const Transformer, shared: *?@import("dflash_nax.zig").Input, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !?mlx.mlx_array {
@@ -33497,11 +33503,46 @@ fn dflashNaxModel(cfg: *const ModelConfig) bool {
         cfg.rowExactArch() and @import("dflash_nax.zig").enabled() and verifyQmmNaxAvailable();
 }
 
-fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, wide: bool, s: mlx.mlx_stream) anyerror!?mlx.mlx_array {
     if (!std.mem.eql(u8, cfg.model_type, "nemotron_h")) {
         const dflash_nax = @import("dflash_nax.zig");
         if (dflashNaxTarget(cfg)) {
-            if (try dflash_nax.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
+            const y = if (wide) try dflash_nax.qmmWithTile(x, w, sc, bi, bits, group_size, null, dflash_nax.tileWidth(), s) else try dflash_nax.qmm(x, w, sc, bi, bits, group_size, s);
+            if (y) |result| return result;
+        }
+        // Small GDN a/b projections (N=48) and non-uint4 weights cannot use
+        // the native tile. Preserve their existing arithmetic at wider tree
+        // widths by slicing activations only; both calls borrow the same weights.
+        const xs = mlx.getShape(x);
+        if (wide and xs.len >= 2 and xs.len <= 8 and xs[xs.len - 1] > 0) {
+            const k = xs[xs.len - 1];
+            const rows: c_int = @intCast(mlx.mlx_array_size(x) / @as(usize, @intCast(k)));
+            if (rows > 16 and rows <= @import("dflash_nax.zig").MAX_ROWS) {
+                var flat = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(flat);
+                try mlx.check(mlx.mlx_reshape(&flat, x, &.{ rows, k }, 2, s));
+                const parts = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(parts);
+                var lo: c_int = 0;
+                while (lo < rows) : (lo += 16) {
+                    var chunk = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(chunk);
+                    try mlx.check(mlx.mlx_slice(&chunk, flat, &.{ lo, 0 }, 2, &.{ @min(lo + 16, rows), k }, 2, &.{ 1, 1 }, 2, s));
+                    const out = (try rowExactQmm(cfg, chunk, w, sc, bi, bits, group_size, false, s)) orelse return null;
+                    defer _ = mlx.mlx_array_free(out);
+                    try mlx.check(mlx.mlx_vector_array_append_value(parts, out));
+                }
+                var joined = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(joined);
+                try mlx.check(mlx.mlx_concatenate_axis(&joined, parts, 0, s));
+                var shape: [8]c_int = undefined;
+                @memcpy(shape[0..xs.len], xs);
+                shape[xs.len - 1] = mlx.getShape(joined)[1];
+                var out = mlx.mlx_array_new();
+                errdefer _ = mlx.mlx_array_free(out);
+                try mlx.check(mlx.mlx_reshape(&out, joined, &shape, xs.len, s));
+                return out;
+            }
         }
         if (try simd_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
     }
@@ -33542,7 +33583,7 @@ fn rowByRowSdpa(out: *mlx.mlx_array, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.
 fn projectWithConfig(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const qp = quantParamsOrDense(cfg, w, sc, lastDim(x));
     if (cfg.rowExactDecode() and qp.mode == .affine) {
-        if (try rowExactQmm(cfg, x, w, sc, bi, qp.bits, qp.group_size, s)) |y| return y;
+        if (try rowExactQmm(cfg, x, w, sc, bi, qp.bits, qp.group_size, false, s)) |y| return y;
     }
     return qmatmulBits(x, w, sc, bi, qp.bits, qp.group_size, qp.mode, s);
 }
@@ -36370,7 +36411,7 @@ const GDN_NORMGATE_SOURCE =
 var gdn_normgate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gdn_normgate_engaged: bool = false;
 var gdn_normgate_declined: bool = false;
-const GdnNormGateCfgKey = struct { hv: c_int, seq: c_int, batch: c_int, zs: c_int, zo: c_int, swish: bool, dt: mlx.mlx_dtype };
+const GdnNormGateCfgKey = struct { hv: c_int, seq: c_int, batch: c_int, zs: c_int, zo: c_int, swish: bool, table: bool, dt: mlx.mlx_dtype };
 var gdn_normgate_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gdn_normgate_cfg_key: GdnNormGateCfgKey = std.mem.zeroes(GdnNormGateCfgKey);
 
@@ -36406,10 +36447,10 @@ pub fn gdnNormGateFused(
     // Preserve main's eligibility for every existing caller. Only tree replay
     // opts into the additional verification rows below.
     if (!gdnPrefillFusedFor(seq, batch) and seq > 9) return null;
-    return gdnTreeNormGateFused(s, y, z, z_off, z_stride, norm_w, eps, swish, hv, dv, batch, seq);
+    return gdnNormGateFusedImpl(s, y, z, z_off, z_stride, norm_w, eps, swish, hv, dv, batch, seq, false);
 }
 
-fn gdnTreeNormGateFused(
+fn gdnNormGateFusedImpl(
     s: mlx.mlx_stream,
     y: mlx.mlx_array, // [B, S, Hv, Dv] bf16
     z: mlx.mlx_array, // rows of [.. ZOFF + Hv*Dv ..] bf16
@@ -36422,11 +36463,15 @@ fn gdnTreeNormGateFused(
     dv: c_int,
     batch: c_int,
     seq: c_int,
+    tree: bool,
 ) !?mlx.mlx_array {
     if (dv != 128) return null;
-    const prefill = gdnPrefillFusedFor(seq, batch);
+    const prefill = !tree and gdnPrefillFusedFor(seq, batch);
     if (!prefill and !gdnDecodeFusedEnabled()) return null;
-    if (!prefill and (seq < 1 or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
+    if (!prefill and (seq < 1 or batch < 1 or batch * seq > (if (tree) gdn_decode.MAX_TREE else GDN_FUSED_MAX_ROWS))) return null;
+    // Tree verification must retain the serial sigmoid arithmetic. The prefill
+    // table differs by an ULP for some finite BF16 inputs (exhaustively tested).
+    const table = !tree and seq >= 17;
     const dt = mlx.mlx_array_dtype(y);
     inline for (.{ y, z, norm_w }, 0..) |arr, i| {
         if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(arr) != dt) {
@@ -36446,7 +36491,7 @@ fn gdnTreeNormGateFused(
         }
         return null;
     }
-    const key = GdnNormGateCfgKey{ .hv = hv, .seq = seq, .batch = batch, .zs = z_stride, .zo = z_off, .swish = swish, .dt = dt };
+    const key = GdnNormGateCfgKey{ .hv = hv, .seq = seq, .batch = batch, .zs = z_stride, .zo = z_off, .swish = swish, .table = table, .dt = dt };
     if (gdn_normgate_cfg == null or !std.meta.eql(gdn_normgate_cfg_key, key)) {
         if (gdn_normgate_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const config = mlx.mlx_fast_metal_kernel_config_new();
@@ -36455,14 +36500,14 @@ fn gdnTreeNormGateFused(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32, batch * seq, hv));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", dt));
-        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off }, .{ "TAB", @as(c_int, @intFromBool(seq >= 17)) } };
+        const ints = .{ .{ "HV", hv }, .{ "DV", dv }, .{ "ZSTRIDE", z_stride }, .{ "ZOFF", z_off }, .{ "TAB", @as(c_int, @intFromBool(table)) } };
         inline for (ints) |kv| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, kv[0], kv[1]));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "SWISH", @intFromBool(swish)));
         gdn_normgate_cfg = config;
         gdn_normgate_cfg_key = key;
     }
     const kernel = try getGdnNormGateKernel();
-    const inputs_arr = [_]mlx.mlx_array{ y, z, norm_w, eps, if (seq >= 17) try sigmoidTableFor(s, dt) else y };
+    const inputs_arr = [_]mlx.mlx_array{ y, z, norm_w, eps, if (table) try sigmoidTableFor(s, dt) else y };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
     var outputs_vec = mlx.mlx_vector_array_new();
@@ -53101,6 +53146,50 @@ test "DFlash tiled MLP: one resident layout survives views, ragged prefill and s
     }
 }
 
+test "DFlash wide fallback: small GDN projections keep narrow-row arithmetic" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xDF48);
+    const rnd = prng.random();
+    const cfg = ModelConfig{};
+    const k = 5120;
+    const n = 48; // GDN a/b heads: deliberately not a native uint4 tile width.
+    const wb = try testRandWeightBf16(rnd, &.{ n, k }, s);
+    defer _ = mlx.mlx_array_free(wb);
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
+    const x = try attn256RandBf16(rnd, &.{ 1, 32, k }, s);
+    defer _ = mlx.mlx_array_free(x);
+    for ([_]c_int{ 17, 24, 32 }) |rows| {
+        var xm = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(xm);
+        try mlx.check(mlx.mlx_slice(&xm, x, &.{ 0, 0, 0 }, 3, &.{ 1, rows, k }, 3, &.{ 1, 1, 1 }, 3, s));
+        const all = (try rowExactQmm(&cfg, xm, w, sc, bi, 4, 64, true, s)) orelse return error.WideFallbackDeclined;
+        defer _ = mlx.mlx_array_free(all);
+        var row: c_int = 0;
+        while (row < rows) : (row += 1) {
+            var xr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xr);
+            try mlx.check(mlx.mlx_slice(&xr, x, &.{ 0, row, 0 }, 3, &.{ 1, row + 1, k }, 3, &.{ 1, 1, 1 }, 3, s));
+            const one = (try rowExactQmm(&cfg, xr, w, sc, bi, 4, 64, false, s)) orelse return error.NarrowFallbackDeclined;
+            defer _ = mlx.mlx_array_free(one);
+            var yr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(yr);
+            try mlx.check(mlx.mlx_slice(&yr, all, &.{ 0, row, 0 }, 3, &.{ 1, row + 1, n }, 3, &.{ 1, 1, 1 }, 3, s));
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(one, yr, s));
+        }
+    }
+}
+
 test "DFlash uint4 NAX: row invariant and no worse than stock at target shapes" {
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -53132,14 +53221,14 @@ test "DFlash uint4 NAX: row invariant and no worse than stock at target shapes" 
         var dqt = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(dqt);
         try mlx.check(mlx.mlx_transpose_axes(&dqt, dq, &[_]c_int{ 1, 0 }, 2, s));
-        const x = try attn256RandBf16(rnd, &[_]c_int{ 1, 16, k }, s);
+        const x = try attn256RandBf16(rnd, &[_]c_int{ 1, 32, k }, s);
         defer _ = mlx.mlx_array_free(x);
-        for ([_]c_int{ 1, 2, 5, 8, 12, 16 }) |m| {
+        for ([_]c_int{ 1, 2, 5, 8, 12, 16, 17, 24, 32 }) |m| {
             var xm = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(xm);
             try mlx.check(mlx.mlx_slice(&xm, x, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, m, k }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
             const split_columns: ?c_int = if (n == 34816) 17408 else null;
-            const y = (try @import("dflash_nax.zig").qmmWithSplitColumns(xm, w, sc, bi, 4, @intCast(gs), split_columns, s)) orelse return error.KernelDeclined;
+            const y = (try @import("dflash_nax.zig").qmmWithTile(xm, w, sc, bi, 4, @intCast(gs), split_columns, @import("dflash_nax.zig").tileWidth(), s)) orelse return error.KernelDeclined;
             defer _ = mlx.mlx_array_free(y);
             const tiled_y = try @import("dflash_tiled.zig").qmm(xm, tiled, sc, bi, split_columns, s);
             defer _ = mlx.mlx_array_free(tiled_y);
@@ -53216,7 +53305,7 @@ test "DFlash uint4 NAX: row invariant and no worse than stock at target shapes" 
                         o.* = mlx.mlx_array_new();
                         try mlx.check(mlx.mlx_slice(o, a, &[_]c_int{ lo, 0 }, 2, &[_]c_int{ lo + half, cols }, 2, &[_]c_int{ 1, 1 }, 2, s));
                     }
-                    const apart = (try @import("dflash_nax.zig").qmmWithSplitColumns(xm, sliced[0], sliced[1], sliced[2], 4, @intCast(gs), null, s)).?;
+                    const apart = (try @import("dflash_nax.zig").qmmWithTile(xm, sliced[0], sliced[1], sliced[2], 4, @intCast(gs), null, @import("dflash_nax.zig").tileWidth(), s)).?;
                     defer _ = mlx.mlx_array_free(apart);
                     var joined_part = mlx.mlx_array_new();
                     defer _ = mlx.mlx_array_free(joined_part);
@@ -61328,6 +61417,8 @@ fn gdnTreeReplayParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dty
     try std.testing.expect(after -| before <= compact_bytes + 65536);
     // Retained prework is linear in head width, not the 128x128 state matrix.
     try std.testing.expectEqual(@as(usize, @intCast(t_len * hv * 386)), mlx.mlx_array_size(got.record.pre));
+    const gated = (try gdnNormGateFusedImpl(s, got.y, z, 0, value_dim, norm_w, eps_arr, true, hv, dv, 1, t_len, true)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(gated);
     var states: [gdn_decode.MAX_TREE]mlx.mlx_array = @splat(.{ .ctx = null });
     var convs = states;
     defer for (states, convs) |state, conv| {
@@ -61361,6 +61452,15 @@ fn gdnTreeReplayParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dty
         defer _ = mlx.mlx_array_free(yr);
         try mlx.check(mlx.mlx_take_axis(&yr, got.y, idx, 1, s));
         try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(ref.y, yr, s));
+        var zr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(zr);
+        try mlx.check(mlx.mlx_take_axis(&zr, z, idx, 1, s));
+        const one_gated = (try gdnNormGateFusedImpl(s, ref.y, zr, 0, value_dim, norm_w, eps_arr, true, hv, dv, 1, 1, true)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(one_gated);
+        var gate_row = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(gate_row);
+        try mlx.check(mlx.mlx_take_axis(&gate_row, gated, idx, 1, s));
+        try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(one_gated, gate_row, s));
         var path: [gdn_decode.MAX_TREE]u32 = undefined;
         var n: usize = 0;
         var r: i32 = @intCast(row);
@@ -61375,12 +61475,12 @@ fn gdnTreeReplayParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dty
     }
 }
 
-test "gdn tree replay: every branch output and committed state equal serial, through sixteen rows" {
+test "gdn tree replay: every branch output and committed state equal serial, through thirty-two rows" {
     mlx.installErrorHandler();
     const s = mlx.gpuStream();
     for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 } }) |dts| {
-        for ([_]usize{ 1, 5, 8, 16 }) |width| {
-            var parents: [16]i32 = undefined;
+        for ([_]usize{ 1, 5, 8, 16, 17, 24, 32 }) |width| {
+            var parents: [gdn_decode.MAX_TREE]i32 = undefined;
             for (0..width) |r| parents[r] = @as(i32, @intCast(r)) - 1;
             try gdnTreeReplayParityCase(s, dts[0], dts[1], 2, 8, parents[0..width]);
             for (1..width) |r| parents[r] = @intCast((r - 1) / 2);
@@ -61767,6 +61867,44 @@ fn gdnParityRand(rnd: std.Random, shape: []const c_int, scale: f32, dt: mlx.mlx_
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&out, b, dt, s));
     return out;
+}
+
+test "gdn tree norm-gate: every finite bf16 gate matches single-row decoding" {
+    const s = mlx.gpuStream();
+    const hv = 16;
+    const dv = 128;
+    const width = hv * dv;
+    var bits: [65536]u16 = undefined;
+    for (&bits, 0..) |*v, i| v.* = if (i & 0x7f80 == 0x7f80) 0 else @intCast(i);
+    const z = mlx.mlx_array_new_data(&bits, &.{ 1, 32, width }, 3, .bfloat16);
+    defer _ = mlx.mlx_array_free(z);
+    const one = mlx.mlx_array_new_float(1);
+    defer _ = mlx.mlx_array_free(one);
+    var y = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_full(&y, &.{ 1, 32, hv, dv }, 4, one, .bfloat16, s));
+    var norm = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(norm);
+    try mlx.check(mlx.mlx_full(&norm, &.{dv}, 1, one, .bfloat16, s));
+    const eps = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps);
+    const all = (try gdnNormGateFusedImpl(s, y, z, 0, width, norm, eps, true, hv, dv, 1, 32, true)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(all);
+    var r: c_int = 0;
+    while (r < 32) : (r += 1) {
+        var yr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(yr);
+        try mlx.check(mlx.mlx_slice(&yr, y, &.{ 0, r, 0, 0 }, 4, &.{ 1, r + 1, hv, dv }, 4, &.{ 1, 1, 1, 1 }, 4, s));
+        var zr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(zr);
+        try mlx.check(mlx.mlx_slice(&zr, z, &.{ 0, r, 0 }, 3, &.{ 1, r + 1, width }, 3, &.{ 1, 1, 1 }, 3, s));
+        const want = (try gdnNormGateFusedImpl(s, yr, zr, 0, width, norm, eps, true, hv, dv, 1, 1, true)) orelse return error.FusedDeclined;
+        defer _ = mlx.mlx_array_free(want);
+        var got = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(got);
+        try mlx.check(mlx.mlx_slice(&got, all, &.{ 0, r, 0 }, 3, &.{ 1, r + 1, width }, 3, &.{ 1, 1, 1 }, 3, s));
+        try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(want, got, s));
+    }
 }
 
 test "gdn norm-gate fused: bit-identical to rms_norm + silu(z) * y at decode and prefill widths, z at a folded offset" {

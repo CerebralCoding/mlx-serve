@@ -170,9 +170,15 @@ fn launch(sum: bool, c: mlx.mlx_fast_metal_kernel_config, inputs: []const mlx.ml
 /// Mandatory consumer of a tiled matrix. Declining to stock would interpret
 /// its bytes incorrectly; unsupported activations produce an explicit error.
 pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, split_columns: ?c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    return qmmWithRows(x, w, sc, bi, split_columns, false, s);
+}
+
+pub fn qmmWithRows(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, split_columns: ?c_int, wide: bool, s: mlx.mlx_stream) !mlx.mlx_array {
     if (!isTiled(w)) return error.InvalidTiledProjection;
     const nt = narrowTile();
-    if (nt != 64) {
+    const xs = mlx.getShape(x);
+    const narrow_rows = xs.len >= 2 and xs[xs.len - 1] > 0 and mlx.mlx_array_size(x) / @as(usize, @intCast(xs[xs.len - 1])) <= 16;
+    if (nt != 64 and (wide or narrow_rows)) {
         if (try @import("dflash_nax.zig").qmmTiled(x, w, sc, bi, @intCast(mlx.getShape(w)[3] * 8), split_columns, nt, s)) |y| {
             if (!logged_narrow) {
                 logged_narrow = true;

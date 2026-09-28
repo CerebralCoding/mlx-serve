@@ -11,7 +11,7 @@ const mlx = @import("mlx.zig");
 const CK = 128;
 const SPLIT = 4;
 const BLK = 4;
-pub const MAX_ROWS = 16;
+pub const MAX_ROWS = 32;
 
 // K/V are the KV cache's views [1, HKV, L, D]: indexed through their strides,
 // never copied. The window's rows sit at cache rows P .. P + W - 1 (P = L - W);
@@ -335,11 +335,12 @@ test "row_attn: a tree node equals the one-row step over its own path's keys" {
     const HKV: c_int = 4;
     const D: c_int = 256;
     const P: c_int = 150; // committed keys
-    const W: c_int = 6;
-    // rows: 0 root, 1 and 2 children of 0, 3 child of 1, 4 child of 2, 5 child of 3
-    const parents = [_]i32{ -1, 0, 0, 1, 2, 3 };
+    const W: c_int = 32;
+    var parents: [W]i32 = undefined;
+    parents[0] = -1;
+    for (1..W) |r| parents[r] = @intCast((r - 1) / 2);
     var depth: [W]i32 = undefined;
-    const MAXD: c_int = 4;
+    const MAXD: c_int = 6;
     var path: [W * MAXD]i32 = @splat(0);
     for (0..W) |r| {
         depth[r] = if (parents[r] < 0) 0 else depth[@intCast(parents[r])] + 1;

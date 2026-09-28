@@ -7,10 +7,10 @@ const log = @import("log.zig");
 const HEADER = "#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>\nusing namespace mpp::tensor_ops;\n";
 const SUM =
     \\const int g = thread_position_in_grid.x, m = thread_position_in_grid.y;
-    \\if (g >= K / GS || m >= 16) return;
+    \\if (g >= K / GS || m >= MP) return;
     \\float acc = 0.0f;
     \\if (m < X_shape[0]) for (int i = 0; i < GS; i++) acc += float(X[m*K+g*GS+i]);
-    \\XS[g*16+m] = acc;
+    \\XS[g*MP+m] = acc;
 ;
 
 const MAIN =
@@ -19,6 +19,7 @@ const MAIN =
     \\const short fm = (qid & 4) | ((lane >> 1) & 3);
     \\const short fn = ((qid & 2) | (lane & 1)) * 4;
     \\const int M = X_shape[0], n0 = threadgroup_position_in_grid.x * NT;
+    \\const int m0 = threadgroup_position_in_grid.y * 16;
     \\constexpr int KG = K / GS;
     \\threadgroup bfloat metadata[META == 2 ? NT*KG*2 : 1];
     \\if constexpr (META == 2) {
@@ -31,13 +32,13 @@ const MAIN =
     \\}
     \\constexpr auto desc = matmul2d_descriptor(16, NT, GS, false, true, false, matmul2d_descriptor::mode::multiply);
     \\matmul2d<desc, execution_simdgroup> op;
-    \\tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA((device bfloat*)X, dextents<int32_t, 2>(K, M));
+    \\tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA((device bfloat*)X+m0*K, dextents<int32_t, 2>(K, min(16, M-m0)));
     \\float C[NT/2];
     \\for (int i = 0; i < NT/2; i++) C[i] = 0.0f;
     \\for (int g = (sg*KG)/SK; g < ((sg+1)*KG)/SK; g++) {
     \\  float scales[NT/4], biases[NT/4], xs[2];
     \\  if constexpr (META != 0) {
-    \\    xs[0] = XS[g*16+fm]; xs[1] = XS[g*16+fm+8];
+    \\    xs[0] = XS[g*MP+m0+fm]; xs[1] = XS[g*MP+m0+fm+8];
     \\    for (int f = 0; f < NT/16; f++) for (int j = 0; j < 4; j++) {
     \\      const int n = f*16+fn+j;
     \\      scales[f*4+j] = float(META == 2 ? metadata[(g*NT+n)*2] : SC[(n0+n)*KG+g]);
@@ -56,7 +57,7 @@ const MAIN =
     \\    const float bi = META != 0 ? biases[f*4+j] : float(BI[n*KG+g]);
     \\    for (int r = 0; r < 2; r++) {
     \\      const int i = f*8+r*4+j;
-    \\      C[i] = fma(sc, P[i], fma(bi, META != 0 ? xs[r] : XS[g*16+fm+r*8], C[i]));
+    \\      C[i] = fma(sc, P[i], fma(bi, META != 0 ? xs[r] : XS[g*MP+m0+fm+r*8], C[i]));
     \\    }
     \\  }
     \\}
@@ -67,7 +68,7 @@ const MAIN =
     \\  if (sg == 0) for (int s2 = 1; s2 < SK; s2++) for (int i = 0; i < NT/2; i++) C[i] += part[((s2-1)*(NT/2)+i)*32+lane];
     \\}
     \\if (sg == 0) for (int f = 0; f < NT/16; f++) for (int r = 0; r < 2; r++) {
-    \\  const int m = fm+8*r, n = n0+f*16+fn;
+    \\  const int m = m0+fm+8*r, n = n0+f*16+fn;
     \\  if (m < M) for (int j = 0; j < 4; j++) Y[m*N+n+j] = bfloat(C[f*8+r*4+j]);
     \\}
 ;
@@ -75,7 +76,8 @@ const Plan = struct { sum: mlx.mlx_fast_metal_kernel_config, main: mlx.mlx_fast_
 var plans: std.AutoHashMapUnmanaged([8]c_int, Plan) = .{};
 var sum_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var main_kernel: ?mlx.mlx_fast_metal_kernel = null;
-var logged: u32 = 0;
+pub const MAX_ROWS = 32;
+var logged: u64 = 0;
 var logged_shared: bool = false;
 var logged_metadata: [3]bool = @splat(false);
 
@@ -136,17 +138,19 @@ fn plan(m: c_int, k: c_int, n: c_int, gs: c_int, split_n: c_int, nt: c_int, meta
     for ([_]mlx.mlx_fast_metal_kernel_config{ p.sum, p.main }) |c| {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "K", k));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "GS", gs));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, "MP", @divTrunc(m + 15, 16) * 16));
     }
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(p.main, "NT", nt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(p.main, "N", n));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(p.main, "SK", sk));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(p.main, "META", metadata));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(p.main, "TILED", @intFromBool(tiled)));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(p.sum, &[_]c_int{ @divExact(k, gs), 16 }, 2, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(p.sum, @divExact(k, gs), 16, 1));
+    const mp = @divTrunc(m + 15, 16) * 16;
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(p.sum, &[_]c_int{ @divExact(k, gs), mp }, 2, .float32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(p.sum, @divExact(k, gs), mp, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(p.sum, 32, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(p.main, &[_]c_int{ m, n }, 2, .bfloat16));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(p.main, @divExact(n, nt) * sk * 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(p.main, @divExact(n, nt) * sk * 32, @divExact(mp, 16), 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(p.main, sk * 32, 1, 1));
     try plans.put(std.heap.c_allocator, key, p);
     return p;
@@ -176,7 +180,10 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
 /// Like TensorFold's lane_fuse, joined projections preserve each member's
 /// split count rather than recomputing it from the combined output width.
 pub fn qmmWithSplitColumns(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, split_columns: ?c_int, s: mlx.mlx_stream) !?mlx.mlx_array {
-    return qmmWithTile(x, w, sc, bi, bits, group_size, split_columns, tileWidth(), s);
+    var input = (try Input.init(x, s)) orelse return null;
+    defer input.deinit();
+    if (input.m > 16) return null;
+    return input.project(w, sc, bi, bits, group_size, split_columns, tileWidth());
 }
 
 pub fn qmmWithTile(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, split_columns: ?c_int, nt: c_int, s: mlx.mlx_stream) !?mlx.mlx_array {
@@ -214,7 +221,7 @@ pub const Input = struct {
         if (k <= 0 or @mod(k, 64) != 0) return null;
         var m: c_int = 1;
         for (xs[0 .. xs.len - 1]) |d| {
-            if (d < 1 or d > 16 or m > @divTrunc(16, d)) return null;
+            if (d < 1 or d > MAX_ROWS or m > @divTrunc(MAX_ROWS, d)) return null;
             m *= d;
         }
         var input = Input{ .x = mlx.mlx_array_new(), .shape = undefined, .ndim = xs.len, .m = m, .k = k, .s = s };
@@ -281,7 +288,7 @@ pub const Input = struct {
         var out = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_reshape(&out, y, &shape, self.ndim, self.s));
-        const flag = @as(u32, 1) << @as(u5, @intCast(self.m));
+        const flag = @as(u64, 1) << @as(u6, @intCast(self.m));
         if (logged & flag == 0) {
             logged |= flag;
             log.info("[dflash-nax] uint4 engaged: rows={d} K={d} N={d} gs={d} tile={d} layout={s}\n", .{ self.m, self.k, n, gs, nt, if (tiled) "tiled" else "original" });

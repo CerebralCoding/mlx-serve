@@ -451,7 +451,7 @@ pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
 pub const RecurSeq = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array };
 
 pub const MAX_SEQ: c_int = 8;
-pub const MAX_TREE: c_int = 16;
+pub const MAX_TREE: c_int = 32;
 
 pub fn treeReplayEnabled() bool {
     // Memory wins are established; a small decode cost remains on M5 Max.

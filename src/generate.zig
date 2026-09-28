@@ -5566,8 +5566,15 @@ pub const Generator = struct {
     ) !DrafterStepResult {
         const xfm = self.xfm;
         const s = xfm.s;
-        const MAX_W = 16;
+        const MAX_W = dflash_tree.MAX_NODES + 1;
         const tracing = dflashTraceEnabled();
+        const memory_probe = if (std.c.getenv("MLX_SERVE_DFLASH_MEMORY_PROBE")) |raw| std.mem.eql(u8, std.mem.span(raw), "1") else false;
+        var memory_before: usize = 0;
+        if (memory_probe) {
+            try mlx.check(mlx.mlx_synchronize(s));
+            try mlx.check(mlx.mlx_get_active_memory(&memory_before));
+            try mlx.check(mlx.mlx_reset_peak_memory());
+        }
         var phase: io_util.Stopwatch = undefined;
         if (tracing) phase = io_util.Stopwatch.init(self.timer.io);
         var lat = try dflash_mod.lattice(allocator, &model.selector.?, model.config.selector_top_k, blk_hidden, draft_logits, t1, s);
@@ -5575,14 +5582,18 @@ pub const Generator = struct {
         // A sampled target's scores carry its own noise at each position's candidates.
         const noise: ?[]f32 = if (serial) try self.treeNoise(allocator, &lat) else null;
         defer if (noise) |nz| allocator.free(nz);
+        const tuning = dflash_tree.tuning();
         var tree = try dflash_mod.bestFirstTree(allocator, &lat, .{
             .max_nodes = @min(dflash_tree.nodeBudget(m + 1), if (gdn_decode.treeReplayEnabled()) dflash_tree.MAX_NODES else @as(usize, gdn_decode.MAX_SEQ - 1)),
+            .children = tuning.children,
+            .tau = tuning.tau,
+            .edge_w = tuning.edge_w,
             .temperature = if (serial) self.sampling.temperature else 1.0,
             .noise = noise,
         });
         defer tree.deinit(allocator);
         const allocated = dflash_tree.allocationEnabled();
-        const fit = xfm.config.hidden_size == 5120 and xfm.config.num_hidden_layers == 64 and
+        const fit = tuning.fitted() and xfm.config.hidden_size == 5120 and xfm.config.num_hidden_layers == 64 and
             (!serial or (self.sampling.temperature == 1 and self.sampling.top_k == 20 and self.sampling.top_p == 0.95));
         const probabilities = if (allocated) try dflash_tree.order(&tree, serial, fit) else @as([dflash_tree.MAX_NODES]f32, @splat(0));
         const costs = &xfm.dflash_tree_cost[@intFromBool(serial)];
@@ -5599,7 +5610,7 @@ pub const Generator = struct {
         }
         if (!dflash_tree_logged) {
             dflash_tree_logged = true;
-            log.info("[dflash] draft trees engaged: up to {d} nodes a round\n", .{tree.tokens.len});
+            log.info("[dflash] draft trees engaged: up to {d} nodes a round, children={d} tau={d:.2} edge={d:.2}\n", .{ tree.tokens.len, tuning.children, tuning.tau, tuning.edge_w });
         }
 
         // Rows: 0 = t1 (the root), 1 + i = tree node i.
@@ -5684,6 +5695,13 @@ pub const Generator = struct {
         try mlx.check(mlx.mlx_array_eval(targets.lazy()));
         const ids = try targets.ids(w);
         const verify_done_ns = if (tracing) phase.read() else 0;
+        if (memory_probe) {
+            var active: usize = 0;
+            var peak: usize = 0;
+            try mlx.check(mlx.mlx_get_active_memory(&active));
+            try mlx.check(mlx.mlx_get_peak_memory(&peak));
+            log.info("[dflash-tree-memory] rows={d} active_before={d} active_verified={d} peak_verify={d}\n", .{ w, memory_before, active, peak });
+        }
 
         // Walk the target's tokens down the tree.
         var path_rows: [MAX_W]u32 = undefined;

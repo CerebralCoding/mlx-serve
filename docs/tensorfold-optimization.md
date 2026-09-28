@@ -50,14 +50,23 @@ The first observation at a new width is excluded from its steady-state price.
 ## Controls and evidence
 
 - `--draft-block-size 8|16`: proposal positions on supported tree targets.
-- `MLX_SERVE_DFLASH_TREE_NODES=0..15`: independent draft-node budget; defaults
-  to proposal positions minus one. Zero verifies only the pending root token
+- `MLX_SERVE_DFLASH_TREE_NODES=0..31`: independent experimental draft-node budget;
+  defaults to proposal positions minus one, capped at 15. Zero verifies only the pending root token
   with the same target kernels: a correctness control, not the ordinary serial
   engine configuration.
 - `MLX_SERVE_DFLASH_TREE_ALLOCATE=1`: enable probability/cost allocation;
   default 0 preserves the original preorder tree arm.
-- `MLX_SERVE_DFLASH_TREE_REPLAY=1`: enable compact replay and support up to sixteen
+- `MLX_SERVE_DFLASH_TREE_REPLAY=1`: enable compact replay and support up to thirty-two
   verification rows. Default 0 retains original capture, limited to eight rows.
+- Proposal depth remains capped at 16 even with 31 nodes; extra nodes explore
+  alternatives within the same lattice.
+- `MLX_SERVE_DFLASH_TREE_CHILDREN=1..16`, `MLX_SERVE_DFLASH_TREE_TAU=0.25..4`,
+  and `MLX_SERVE_DFLASH_TREE_EDGE_WEIGHT=0..2` tune proposal search only. Defaults
+  remain 4, 1.5, and 0.6. Changing them disables the fitted probability table
+  when allocation is enabled; the allocator then uses uncalibrated path scores.
+- `MLX_SERVE_DFLASH_MEMORY_PROBE=1` synchronizes and resets MLX peak allocation
+  each tree round, reporting live memory at verification. Use separately from
+  timing runs; its reported peak excludes model loading and is not a process peak.
 
 To reproduce the original block-8 geometry, combine block 8, node budget 7,
 allocation off, and replay off. To isolate state storage, enable only replay.
@@ -520,8 +529,8 @@ refactor. The mixed direction of the per-cell changes does not establish a
 performance improvement from the refactor itself.
 
 All servers were stopped. TensorFold's mirror still has the same HEAD and a
-clean status. Runtime changes remain local and opt-in; no commits, pushes or
-PR updates were made during this pass. Reproduction configs are
+clean status. These opt-in runtime changes are included in `e99557e`.
+Reproduction configs are
 `zig-out/tfo/deep-{latest-tf,validation,shared,controls,binary-control}.json`;
 the full logs, commands, dependency versions, replies and measurements use
 the corresponding artifact names under `~/claude-tmp/tfo/`.
@@ -984,5 +993,208 @@ cache, and unchanged measured process peak. Conversion does temporarily need
 one replacement projection (up to 85 MiB). A no-regression default still
 requires faster one-row and wide-prefill consumers of this same storage;
 retaining the original weights beside it is not an acceptable workaround.
-These measurements were collected from the uncommitted working tree; the
-binary hashes above identify the exact tested builds.
+The single-storage implementation is published in `e99557e`; the binary
+hashes above distinguish the tested builds and configurations.
+
+### Larger trees: first reconcile the request format
+
+The independent rerun used TensorFold's unmodified client: its code prompt
+uses `/v1/completions`. Our requested protocol sends both prompts through
+`/v1/chat/completions`, with thinking disabled. On the unchanged `e99557e`
+binary, a chat / native-client / chat sequence reproduced the discrepancy:
+
+| Request format | Code T=1 | Chat T=1 | Code T=0 | Chat T=0 |
+|---|---:|---:|---:|---:|
+| both prompts through chat | 223.92 | 78.66 | 278.38 | 79.67 |
+| original client: raw code, chat question | 111.69 | 81.71 | 116.41 | 80.93 |
+| both through chat, repeat | 230.54 | 80.00 | 277.77 | 81.92 |
+
+Same binary, weights, flags, 64 output tokens, five seeds per cell and a
+warmup, on AC with one server at a time. Median accepted draft tokens per
+round on code were 8.14/9.67 through chat (T=1/T=0) versus 3.92/3.92 raw.
+Chat-question replies and all repeated chat-format replies matched exactly.
+The independent ~111 code tok/s is reproducible by changing the endpoint;
+it does not by itself identify a machine-specific kernel or acceptance gap.
+Artifacts: `wide-protocol-{chat,native,chat-repeat}` under `~/claude-tmp/tfo/`.
+
+The adapter is now included as `tests/dflash_bench.py`. It imports the
+read-only TensorFold checkout's client and preserves timing, seeds, warmup,
+and aggregation. It records full replies plus the exact URL and JSON body
+of every request. `--native-prompts` retains the original raw-code endpoint;
+without it both prompts use chat. `--tensorfold-root` selects the checkout.
+For a running server:
+
+```sh
+python3 tests/dflash_bench.py http://127.0.0.1:18080 Qwen3.8-27B-MLX-4bit --tokens 64 --reps 5 --output zig-out/tfo/chat.json
+python3 tests/dflash_bench.py http://127.0.0.1:18080 Qwen3.8-27B-MLX-4bit --native-prompts --tokens 64 --reps 5 --output zig-out/tfo/native.json
+```
+
+### Acceptance search, matched endpoints, and wider verification
+
+The controlled search sweep held the 15-node budget, block 16, canonical
+single-layout weights, metadata mode 2, tile 32, and replay/pipeline settings
+fixed. Only the named search parameter changed. These are five-run medians
+after a warmup, with full reply comparisons, on the Vontra 4-bit checkpoint.
+
+| Search setting | Code T=1 | Chat T=1 | Code T=0 | Chat T=0 |
+|---|---:|---:|---:|---:|
+| defaults, before | 218.95 | 80.88 | 275.60 | 80.84 |
+| tau 1 | 189.16 | 74.55 | 274.66 | 71.92 |
+| tau 2 | 190.00 | 80.33 | 268.77 | 75.28 |
+| children 2 | 227.78 | 75.45 | 224.58 | 76.79 |
+| children 8 | 223.96 | 80.20 | 276.18 | 85.32 |
+| edge weight 0 | 167.40 | 73.98 | 171.45 | 74.68 |
+| edge weight 1 | 192.70 | 80.76 | 274.48 | 71.60 |
+| probability/cost allocation on | 221.54 | 80.61 | 276.13 | 77.35 |
+| defaults, after | 222.29 | 78.09 | 272.80 | 79.24 |
+
+Artifacts: `wide-cal-*`. Allocation disabled speculation on one sampled-chat
+request (37.85 tok/s); its median hides that failure mode. It is not a new
+default. All fixed-budget scoring variants reproduced every control reply.
+
+Eight children reduced greedy-chat verification rounds from 18 to 17 and
+increased accepted drafts/round from 2.556 to 2.765. Reverse-order confirmation
+(`wide-confirm-children8`, `wide-confirm-control`,
+`wide-confirm-children8-repeat`) measured 86.40 / 81.24 / 83.65 tok/s on that
+cell. Code and sampled-chat movement was smaller and inconsistent; this is a
+selective acceptance improvement, not a universal speed claim. Every arm
+matched all 24 control responses. The longer `wide-confirm-validation8` corpus
+matched all 40 reference responses, repeated deterministically, and passed
+all 16 scored cases. Active/peak allocation matched the preceding validation
+control at 16,399,874,904 / 19,993,722,396 bytes.
+
+A fresh, adjacent latest-TensorFold comparison used the same weights, prompts,
+seeds, output length, and chat endpoints. TensorFold was the unchanged read-only
+`34bae79` mirror, Python MLX 0.32.2; native MLX remained 0.32.3. All values
+below were rerun, not taken from TensorFold's claims.
+
+| Engine / arm | Code T=1 | Chat T=1 | Code T=0 | Chat T=0 |
+|---|---:|---:|---:|---:|
+| ours, 4 children before | 220.32 | 77.91 | 272.06 | 79.87 |
+| ours, 4 children after | 221.56 | 78.62 | 273.46 | 79.87 |
+| ours, 8 children | 220.99 | 80.56 | 273.89 | 86.41 |
+| latest TensorFold | 199.22 | 78.46 | 203.74 | 88.39 |
+
+The eight-child arm still loses greedy-chat decode by 2.2%, and its median
+first-token latency is 151–157 ms versus TensorFold's 69–74 ms. The all-cell
+goal is not met; search defaults remain unchanged. Our 15-node arms have
+identical 16,399,871,292-byte active and 19,993,722,396-byte peak MLX allocation.
+Artifacts: `wide-fixed-n15-{before,after}`, `wide-fixed-children8`,
+`wide-latest-tf-chat`. Native executable SHA-256:
+`6d674c248a3c1284b6fa74cbb3013a258b80afcaf82f841538cdc00e95e9e089`.
+
+Engagement evidence from `wide-fixed-children8.log`:
+
+```text
+[dflash-tree] proposal=16 nodes=15/15 allocation=fixed calibration=path-score state=replay
+[dflash] draft trees engaged: up to 15 nodes a round, children=8 tau=1.50 edge=0.60
+[dflash-tree] pipeline engaged: layers=1 first-alone=true
+```
+
+Every one of its 24 requests logged `[spec-stats] mode=dflash` and
+`runtime_disabled=false`.
+
+The raw-code endpoint comparison was rerun on both engines too:
+
+| Engine, native client endpoints | Raw code T=1 | Chat T=1 | Raw code T=0 | Chat T=0 |
+|---|---:|---:|---:|---:|
+| latest TensorFold | 101.22 | 77.74 | 99.51 | 88.35 |
+| ours, 4 children | 111.67 | 77.79 | 116.15 | 80.58 |
+
+Both servers counted 14 prompt tokens for raw code, versus 26 for the chat
+version. Changing the endpoint also approximately halves TensorFold's code
+throughput here. Comparing our raw-code ~111 against TensorFold's chat-code
+~199 is therefore not a valid engine comparison. Artifacts:
+`wide-latest-tf-native`, `wide-fixed-native`.
+
+#### Widening must preserve every target operation
+
+The 31-node experiment extends verification to 32 rows while retaining the
+16-position proposal lattice. Native uint4 verification uses two 16-row tiles
+over the same resident arrays. Replay retains compact per-node prework, not a
+full recurrent-state matrix per node. Prefill and ordinary decode retain their
+existing dispatch limits; no second weight layout is created.
+
+Simply widening the main kernels was insufficient. Two less visible dispatch
+transitions broke parity:
+
+1. GDN a/b projections have only 48 output columns, outside the native tile.
+   Their existing SIMD fallback stops at 16 rows. Wider verification therefore
+   reached stock matmul with different arithmetic. Wide fallback now splits
+   activation rows into at most 16-row calls, borrowing the same weights. A
+   failing regression test became exact at 17/24/32 rows after this fix.
+2. GDN norm-gate switched to the prefill sigmoid table at 17 rows. Random
+   tests passed, but exhaustive coverage of all 65,280 finite BF16 gate values
+   exposed a difference (first failure: absolute error 0.000061035156).
+   Tree verification now uses the serial formula at every width. Ordinary
+   prefill retains its table, and the kernel configuration cache distinguishes
+   the two modes. The exhaustive test passes after the fix.
+
+Before either fix, only 8/24 benchmark replies matched the 15-node control.
+Fixing the small projections restored all 12 greedy replies, but left four
+sampled replies different; the longer validation also found six mismatches
+out of 40. These intermediate `wide-v2-*` and 31-node `wide-fixed-*` artifacts
+are diagnostics, not correctness-qualified performance results. In particular,
+the apparent greedy-chat acceptance gain in the first prototype was invalid.
+
+With both fixes, the final executable
+`15b522098ee887a279798769e0706a36501290fb96b23b4e6efa07403296dc8c`
+reproduced all 24 control replies at 31 nodes, including sampled replies.
+
+| Final arm | Code T=1 | Chat T=1 | Code T=0 | Chat T=0 |
+|---|---:|---:|---:|---:|
+| 15 nodes, 4 children | 217.80 | 78.41 | 271.69 | 79.95 |
+| 31 nodes, 4 children | 149.63 | 52.80 | 228.28 | 51.68 |
+| 15 nodes, 8 children | 219.69 | 79.89 | 273.28 | 85.58 |
+| 15 nodes, 12 children | 220.83 | 78.41 | 271.56 | 85.27 |
+| 15 nodes, 16 children | 221.98 | 78.88 | 275.08 | 85.35 |
+| 15 nodes, 8 children, repeat | 222.68 | 80.30 | 274.91 | 85.00 |
+
+All six arms reproduced the same 24 replies and engaged speculation for every
+request with no runtime disables. The 31-node arm improved greedy-code
+acceptance from 9.667 to 11.8 drafts/round (six rounds down to five), but its
+verification cost outweighed that gain: decode still fell 16%. The other
+three cells retained their median acceptance and lost 31–35% throughput.
+Increasing children beyond eight did not remove another greedy-chat round.
+Keep the node-budget and search defaults unchanged; this experiment supports
+broader candidate selection within the existing budget, not enabling 31 nodes
+as a speed optimization. Artifacts: `wide-exact-n{15,31}` and
+`wide-exact-c{8-0,12-1,16-2,8-3}`.
+
+The final 31-node arm's post-request active allocation was 16,399,871,804 bytes,
+only 512 bytes above 15 nodes. Both had the same 19,993,722,396-byte process
+peak. The extra 128 KiB gate table from the intermediate prototype is gone.
+This does not mean verification scratch is free: transient allocations and
+the allocator cache must be measured separately from post-request active
+memory. The cache grew from about 148 MB to 192 MB at 31 nodes.
+
+ReleaseFast build and the full suite passed: 2,811 tests passed, 210 skipped,
+zero failures. This includes the new fallback and exhaustive gate regression
+tests, NAX projection parity through 32 rows, tree attention parity, and
+branch-output/recurrent-state parity through 32 rows. The default proposal
+block and node budget remain unchanged.
+
+The final `wide-exact-validation31` run also matched all 40 longer reference
+replies, had zero repeat mismatches, and passed all 16 scored cases. TensorFold's
+read-only checkout remained clean, and every experiment server was stopped.
+
+Separate synchronized probes (`wide-exact-probe15`, `wide-exact-probe31`) ran
+the greedy code/chat requests with a warmup and one measured request each.
+These reset peak allocation per round and are not throughput results:
+
+| Verification allocation | 15 nodes | 31 nodes |
+|---|---:|---:|
+| maximum active bytes at verification | 16,558,687,618 | 16,611,467,490 |
+| maximum per-round peak bytes | 16,628,879,968 | 16,679,404,732 |
+| median peak increment above round entry | 80,291,818 | 88,285,700 |
+
+The observed verification peak grows by 48.2 MiB, despite nearly identical
+post-request active memory and identical model-loading peaks. This is real
+transient overhead, not duplicate weight storage. The hard one-layout
+constraint is preserved; wider trees are not memory-free.
+
+Diagnostic phase medians locate the cost: verification/sampling grows from
+39.8–40.2 ms at 16 rows to 63.4–66.2 ms at 32 rows. Assistant work remains
+about 3.7–4.6 ms and tree/head work about 1.4–1.5 ms. The wider verifier is
+therefore the next cost to address before larger node budgets could pay;
+raising the budget alone is a measured regression.
