@@ -14002,6 +14002,7 @@ const SelfCondWeights = struct {
 };
 
 const DenseMlpWeights = struct {
+    tiled_reference: bool = false,
     gate_w: mlx.mlx_array,
     gate_s: mlx.mlx_array,
     gate_b: mlx.mlx_array,
@@ -17900,6 +17901,10 @@ pub const Transformer = struct {
     // ── Core ops ──
 
     inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
+        // Canonical tiled storage must never reach an original-layout reader,
+        // including prefill and a one-row speculative fallback.
+        if (@import("dflash_tiled.zig").isTiled(w))
+            return @import("dflash_tiled.zig").qmm(x, w, sc, bi, null, self.s);
         // Resolve (bits, group_size, mode) per weight. Most weights inherit the
         // global config; per-weight overrides (mixed-precision checkpoints, e.g.
         // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
@@ -27033,8 +27038,10 @@ pub const Transformer = struct {
         const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor);
         const flat_shape = [_]c_int{ batch, seq_len, h_count * hd };
 
+        var shared = if (projected == null) try self.dflashSharedInput(x) else null;
+        defer if (shared) |*input| input.deinit();
         // Q projection
-        const q_proj = if (projected) |values| values.q else try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, batch == 1 and !is_prefill, layer);
+        const q_proj = if (projected) |values| values.q else (try self.dflashSharedProject(&shared, fa.q_w, fa.q_s, fa.q_b)) orelse try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, batch == 1 and !is_prefill, layer);
         defer if (projected == null) {
             _ = mlx.mlx_array_free(q_proj);
         };
@@ -27076,11 +27083,11 @@ pub const Transformer = struct {
         }
 
         // K, V projections
-        const k_proj = if (projected) |values| values.k else try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, batch == 1 and !is_prefill, layer);
+        const k_proj = if (projected) |values| values.k else (try self.dflashSharedProject(&shared, fa.k_w, fa.k_s, fa.k_b)) orelse try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, batch == 1 and !is_prefill, layer);
         defer if (projected == null) {
             _ = mlx.mlx_array_free(k_proj);
         };
-        const v_proj = if (projected) |values| values.v else try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, batch == 1 and !is_prefill, layer);
+        const v_proj = if (projected) |values| values.v else (try self.dflashSharedProject(&shared, fa.v_w, fa.v_s, fa.v_b)) orelse try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, batch == 1 and !is_prefill, layer);
         defer if (projected == null) {
             _ = mlx.mlx_array_free(v_proj);
         };
@@ -29595,7 +29602,9 @@ pub const Transformer = struct {
         // The NAX split count depends on N. Use the same joined matrix for
         // one-row and tree calls so verification keeps the serial arithmetic.
         var joined: ?mlx.mlx_array = null;
-        if (dw.gu.w.ctx != null and rows <= 16 and dflashNaxTarget(&self.config) and dw.gu.count == 2 and dw.gu.widths[0] == dw.gu.widths[1]) {
+        if (@import("dflash_tiled.zig").isTiled(dw.gu.w) and rows <= 16) {
+            joined = try @import("dflash_tiled.zig").qmm(x, dw.gu.w, dw.gu.s, dw.gu.b, dw.gu.widths[0], self.s);
+        } else if (dw.gu.w.ctx != null and rows <= 16 and dflashNaxTarget(&self.config) and dw.gu.count == 2 and dw.gu.widths[0] == dw.gu.widths[1]) {
             const qp = quantParamsOrDense(&self.config, dw.gu.w, dw.gu.s, lastDim(x));
             if (qp.mode == .affine)
                 joined = try @import("dflash_nax.zig").qmmWithSplitColumns(x, dw.gu.w, dw.gu.s, dw.gu.b, qp.bits, qp.group_size, dw.gu.widths[0], self.s);
@@ -29609,11 +29618,12 @@ pub const Transformer = struct {
             try dw.gu.part(&gate, both, 0, self.s);
             try dw.gu.part(&up, both, 1, self.s);
         } else {
-            gate = try self.qmatmul(x, dw.gate_w, dw.gate_s, dw.gate_b);
-            up = try self.qmatmul(x, dw.up_w, dw.up_s, dw.up_b);
+            gate = if (dw.tiled_reference) try @import("dflash_tiled.zig").originalQmm(x, dw.gate_w, dw.gate_s, dw.gate_b, null, self.s) else try self.qmatmul(x, dw.gate_w, dw.gate_s, dw.gate_b);
+            up = if (dw.tiled_reference) try @import("dflash_tiled.zig").originalQmm(x, dw.up_w, dw.up_s, dw.up_b, null, self.s) else try self.qmatmul(x, dw.up_w, dw.up_s, dw.up_b);
         }
         const activated = try self.computeGeglu(gate, up);
         defer _ = mlx.mlx_array_free(activated);
+        if (dw.tiled_reference and rows > 16) return @import("dflash_tiled.zig").originalQmm(activated, dw.down_w, dw.down_s, dw.down_b, null, self.s);
         return self.qmatmul(activated, dw.down_w, dw.down_s, dw.down_b);
     }
 
@@ -29910,10 +29920,25 @@ pub const Transformer = struct {
 
     /// GDN projections through explicit weight arrays (the channel rest
     /// slices ride this; gdnProjGpu delegates for the full weights).
+    fn dflashSharedInput(self: *const Transformer, x: mlx.mlx_array) !?@import("dflash_nax.zig").Input {
+        const nax = @import("dflash_nax.zig");
+        if (!nax.sharedInputEnabled() or !dflashNaxTarget(&self.config) or self.rht != null or self.ternary_2bit) return null;
+        return nax.Input.init(x, self.s);
+    }
+
+    fn dflashSharedProject(self: *const Transformer, shared: *?@import("dflash_nax.zig").Input, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !?mlx.mlx_array {
+        const input = if (shared.*) |*value| value else return null;
+        const qp = self.quantParamsHinted(w, sc, @intCast(input.k));
+        if (qp.mode != .affine) return null;
+        return input.project(w, sc, bi, qp.bits, qp.group_size, null, @import("dflash_nax.zig").tileWidth());
+    }
+
     fn gdnProjArrays(self: *Transformer, x: mlx.mlx_array, qkv_w: mlx.mlx_array, qkv_s: mlx.mlx_array, qkv_b: mlx.mlx_array, z_w: mlx.mlx_array, z_s: mlx.mlx_array, z_b: mlx.mlx_array) !GdnProj {
-        const qkv = try self.qmatmul(x, qkv_w, qkv_s, qkv_b);
+        var shared = try self.dflashSharedInput(x);
+        defer if (shared) |*input| input.deinit();
+        const qkv = (try self.dflashSharedProject(&shared, qkv_w, qkv_s, qkv_b)) orelse try self.qmatmul(x, qkv_w, qkv_s, qkv_b);
         errdefer _ = mlx.mlx_array_free(qkv);
-        const z = try self.qmatmul(x, z_w, z_s, z_b);
+        const z = (try self.dflashSharedProject(&shared, z_w, z_s, z_b)) orelse try self.qmatmul(x, z_w, z_s, z_b);
         return .{ .qkv = qkv, .z = z };
     }
 
@@ -30088,6 +30113,13 @@ pub const Transformer = struct {
             log.warn("[ane] --ane-prefill: {s} is outside the qwen3_5-family scope — disabled\n", .{cfg.model_type});
             return;
         }
+        for (ml) |*lw| switch (lw.mlp) {
+            .dense => |dw| if (@import("dflash_tiled.zig").isTiled(dw.down_w)) {
+                log.warn("[ane] tiled MLP weights use the GPU reader; ANE prefill disabled\n", .{});
+                return;
+            },
+            else => {},
+        };
         // A MoE checkpoint's routed experts are data-dependent and can never
         // ride a fixed-shape ANE graph, and its shared-expert MLP measured a
         // ~5% FLOPs ceiling (A7 spike, 35B-A3B) — but the GDN input
@@ -33108,6 +33140,9 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                     var parts = [_][3]*mlx.mlx_array{ .{ &dw.gate_w, &dw.gate_s, &dw.gate_b }, .{ &dw.up_w, &dw.up_s, &dw.up_b } };
                     const names = [_][]const u8{ "mlp.gate_proj", "mlp.up_proj" };
                     dw.gu = try fuseRowsInPlace(&parts, 0, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
+                    const tiled = @import("dflash_tiled.zig");
+                    if ((tiled.enabled() or tiled.referenceEnabled()) and dflashNaxModel(&config) and mlx.streamIsGpu(s))
+                        try tileDenseMlpInPlace(dw, &config, weights, name_buf, prefix, li, &owned_bf16, tiled.enabled(), s);
                 }
             }
         }
@@ -33451,10 +33486,15 @@ fn quantParamsOrDense(cfg: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_arr
 /// through `rowqmv`'s per-row matvecs, the dense Qwen3.8 through `simd_qmm`,
 /// whose multi-row MMA reads each weight once. Null outside both.
 fn dflashNaxTarget(cfg: *const ModelConfig) bool {
+    return cfg.rowExactDecode() and dflashNaxModel(cfg);
+}
+
+fn dflashNaxModel(cfg: *const ModelConfig) bool {
     // Experimental dispatch is scoped to the Qwen 27B target being validated.
     // Other families may have additional width-dependent projection fusions.
+    // Load-time layout selection precedes the drafter bind/coverage checks.
     return cfg.hidden_size == 5120 and cfg.num_hidden_layers == 64 and
-        cfg.rowExactDecode() and @import("dflash_nax.zig").enabled() and verifyQmmNaxAvailable();
+        cfg.rowExactArch() and @import("dflash_nax.zig").enabled() and verifyQmmNaxAvailable();
 }
 
 fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
@@ -37462,6 +37502,92 @@ fn fuseRowsInPlace(
         }
     }
     return fused;
+}
+
+/// Replace the fused allocation AND its map-owned views. The map/owned list
+/// remain the sole owners; no handle registry or original-layout cache exists.
+/// Eligibility is intentionally limited to the measured dense Qwen MLP path.
+fn tileDenseMlpInPlace(dw: *DenseMlpWeights, cfg: *const ModelConfig, weights: *Weights, name_buf: *[256]u8, prefix: []const u8, li: u32, owned: *std.ArrayList(mlx.mlx_array), convert: bool, s: mlx.mlx_stream) !void {
+    const tiled = @import("dflash_tiled.zig");
+    if (cfg.actDtype() != .bfloat16) return;
+    if (dw.gu.count != 2 or dw.gu.widths[0] != dw.gu.widths[1] or @mod(dw.gu.widths[0], 64) != 0) return;
+    const gu_qp = quantParamsOrDense(cfg, dw.gu.w, dw.gu.s, cfg.hidden_size);
+    const down_qp = quantParamsOrDense(cfg, dw.down_w, dw.down_s, @intCast(dw.gu.widths[0]));
+    for ([_]QuantParams{ gu_qp, down_qp }) |qp| {
+        if (qp.mode != .affine or qp.bits != 4 or (qp.group_size != 32 and qp.group_size != 64)) return;
+    }
+    for ([_]mlx.mlx_array{ dw.gu.s, dw.gu.b, dw.down_s, dw.down_b }) |a| {
+        if (a.ctx == null or mlx.mlx_array_dtype(a) != .bfloat16) return;
+    }
+    const down_shape = mlx.getShape(dw.down_w);
+    if (down_shape.len != 2 or @mod(down_shape[0], 64) != 0) return;
+    var gu_owner: ?usize = null;
+    for (owned.items, 0..) |a, j| if (a.ctx == dw.gu.w.ctx) {
+        gu_owner = j;
+        break;
+    };
+    const owner = gu_owner orelse return error.TiledWeightOwnerMissing;
+    const names = [_][]const u8{ "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight" };
+    const held = [_]mlx.mlx_array{ dw.gate_w, dw.up_w, dw.down_w };
+    for (names, held) |suffix, a| {
+        const name = std.fmt.bufPrint(name_buf, "{s}.layers.{d}.{s}", .{ prefix, li, suffix }) catch unreachable;
+        if ((weights.get(name) orelse return error.TiledWeightOwnerMissing).ctx != a.ctx) return error.TiledWeightOwnerMissing;
+    }
+    // The reference arm must cover exactly the same quantization/dtype shapes.
+    dw.tiled_reference = !convert;
+    if (!convert) return;
+    // Materialize existing inputs before measuring ownership replacement.
+    try mlx.check(mlx.mlx_array_eval(dw.down_w));
+    try mlx.check(mlx.mlx_synchronize(s));
+    try mlx.check(mlx.mlx_clear_cache());
+    var before: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&before));
+    const tw = try tiled.tile(dw.gu.w, @intCast(gu_qp.group_size), s);
+    var transferred = false;
+    errdefer if (!transferred) {
+        _ = mlx.mlx_array_free(tw);
+    };
+    var views: [2]mlx.mlx_array = @splat(.{ .ctx = null });
+    errdefer if (!transferred) {
+        for (views) |a| {
+            _ = mlx.mlx_array_free(a);
+        }
+    };
+    const tsh = mlx.getShape(tw);
+    const half = @divExact(tsh[0], 2);
+    for (&views, 0..) |*view, j| {
+        const start: c_int = @as(c_int, @intCast(j)) * half;
+        try mlx.check(mlx.mlx_slice(view, tw, &[_]c_int{ start, 0, 0, 0 }, 4, &[_]c_int{ start + half, tsh[1], 64, tsh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+        try mlx.check(mlx.mlx_array_eval(view.*));
+    }
+    for (names[0..2], views) |suffix, view| {
+        const name = std.fmt.bufPrint(name_buf, "{s}.layers.{d}.{s}", .{ prefix, li, suffix }) catch unreachable;
+        weights.replace(name, view);
+    }
+    _ = mlx.mlx_array_free(owned.items[owner]);
+    owned.items[owner] = tw;
+    dw.gu.w = tw;
+    dw.gate_w = views[0];
+    dw.up_w = views[1];
+    transferred = true;
+    // Release one projection's old storage before converting the next.
+    try mlx.check(mlx.mlx_synchronize(s));
+    try mlx.check(mlx.mlx_clear_cache());
+    const down = try tiled.tile(dw.down_w, @intCast(down_qp.group_size), s);
+    const down_name = std.fmt.bufPrint(name_buf, "{s}.layers.{d}.{s}", .{ prefix, li, names[2] }) catch unreachable;
+    weights.replace(down_name, down);
+    dw.down_w = down;
+    try mlx.check(mlx.mlx_synchronize(s));
+    try mlx.check(mlx.mlx_clear_cache());
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    // Equal packed payload size. Permit only allocator granularity, never a
+    // retained projection (tens of MB). Fail closed before serving requests.
+    if (after > before + 65536) {
+        log.err("[dflash-tiled] retained allocation: before={d} after={d} delta={d}\n", .{ before, after, after - before });
+        return error.TiledWeightRetainedOriginal;
+    }
+    if (li == 0 or li + 1 == cfg.num_hidden_layers) log.info("[dflash-tiled] MLP layer {d} replaced original storage: active_before={d} active_after={d} duplicate_weight_bytes=0\n", .{ li, before, after });
 }
 
 fn buildFusedQkv(
@@ -41897,6 +42023,14 @@ fn firstRowExactMiss(config: *const ModelConfig, weights: *const Weights, gather
         const w = weights.map.get(std.fmt.bufPrint(&buf, "{s}.weight", .{base}) catch return key) orelse continue;
         if (gather_only.ctx != null and w.ctx == gather_only.ctx) continue;
         const bi = weights.map.get(std.fmt.bufPrint(&buf, "{s}.biases", .{base}) catch return key) orelse return key;
+        if (@import("dflash_tiled.zig").isTiled(w)) {
+            const ws = mlx.getShape(w);
+            for ([_]mlx.mlx_array{ kv.value_ptr.*, bi }) |a| {
+                const sh = mlx.getShape(a);
+                if (mlx.mlx_array_dtype(a) != .bfloat16 or sh.len != 2 or sh[0] != ws[0] * 64 or sh[1] != ws[1]) return key;
+            }
+            continue;
+        }
         const qp = computeQuantParams(config, w, kv.value_ptr.*, null);
         if (qp.mode != .affine or !rowqmv.fits(w, kv.value_ptr.*, bi, qp.bits, qp.group_size)) return key;
     }
@@ -52866,6 +53000,107 @@ test "mixedPlainShapeEnabled: adoption is what was MEASURED, per width and per s
     for ([_]u32{ 2, 3, 7 }) |b| try t.expect(!mixedPlainShapeEnabled(b, 64, 17408));
 }
 
+test "DFlash tiled MLP: one resident layout survives views, ragged prefill and serial reads" {
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const tiled = @import("dflash_tiled.zig");
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x711ED);
+    const rnd = prng.random();
+    var weights = Weights.init(allocator);
+    defer weights.deinit();
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| {
+            _ = mlx.mlx_array_free(a);
+        }
+        owned.deinit(allocator);
+    }
+    const names = [_][]const u8{ "mlp.gate_proj", "mlp.up_proj", "mlp.down_proj" };
+    var arrays: [3][3]mlx.mlx_array = undefined;
+    var inputs: [3]mlx.mlx_array = @splat(.{ .ctx = null });
+    var expected: [3]mlx.mlx_array = @splat(.{ .ctx = null });
+    defer {
+        for (inputs) |a| {
+            _ = mlx.mlx_array_free(a);
+        }
+        for (expected) |a| {
+            _ = mlx.mlx_array_free(a);
+        }
+    }
+    for (names, 0..) |name, i| {
+        const k: c_int = if (i == 2) 1024 else 512;
+        const n: c_int = if (i == 2) 512 else 1024;
+        const wb = try testRandWeightBf16(rnd, &[_]c_int{ n, k }, s);
+        defer _ = mlx.mlx_array_free(wb);
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, wb, .some(64), .some(4), "affine", .{}, s));
+        for ([_][]const u8{ "weight", "scales", "biases" }, 0..) |leaf, j| {
+            arrays[i][j] = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(&arrays[i][j], triple, j));
+            const key = try std.fmt.allocPrint(allocator, "model.layers.0.{s}.{s}", .{ name, leaf });
+            try weights.map.put(key, arrays[i][j]);
+        }
+        inputs[i] = try attn256RandBf16(rnd, &[_]c_int{ 129, k }, s);
+        var chunks: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (chunks.items) |a| {
+                _ = mlx.mlx_array_free(a);
+            }
+            chunks.deinit(allocator);
+        }
+        var start: c_int = 0;
+        while (start < 129) : (start += 16) {
+            var slice = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(slice);
+            try mlx.check(mlx.mlx_slice(&slice, inputs[i], &[_]c_int{ start, 0 }, 2, &[_]c_int{ @min(start + 16, 129), k }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            try chunks.append(allocator, (try @import("dflash_nax.zig").qmm(slice, arrays[i][0], arrays[i][1], arrays[i][2], 4, 64, s)).?);
+        }
+        const vec = mlx.mlx_vector_array_new_data(chunks.items.ptr, chunks.items.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_concatenate_axis(&expected[i], vec, 0, s));
+        try mlx.check(mlx.mlx_array_eval(expected[i]));
+    }
+    var dw = DenseMlpWeights{ .gate_w = arrays[0][0], .gate_s = arrays[0][1], .gate_b = arrays[0][2], .up_w = arrays[1][0], .up_s = arrays[1][1], .up_b = arrays[1][2], .down_w = arrays[2][0], .down_s = arrays[2][1], .down_b = arrays[2][2] };
+    var parts = [_][3]*mlx.mlx_array{ .{ &dw.gate_w, &dw.gate_s, &dw.gate_b }, .{ &dw.up_w, &dw.up_s, &dw.up_b } };
+    var name_buf: [256]u8 = undefined;
+    dw.gu = try fuseRowsInPlace(&parts, 0, names[0..2], &weights, &name_buf, "model", 0, &owned, allocator, s);
+    try testing.expectEqual(@as(u8, 2), dw.gu.count);
+    const cfg = ModelConfig{ .hidden_size = 512, .quant_bits = 4, .quant_group_size = 64 };
+    var before: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&before));
+    try tileDenseMlpInPlace(&dw, &cfg, &weights, &name_buf, "model", 0, &owned, false, s);
+    try testing.expect(dw.tiled_reference and !tiled.isTiled(dw.gu.w));
+    try tileDenseMlpInPlace(&dw, &cfg, &weights, &name_buf, "model", 0, &owned, true, s);
+    try testing.expect(!dw.tiled_reference);
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    try testing.expect(after <= before + 16384);
+    try testing.expect(tiled.isTiled(dw.gu.w));
+    try testing.expect(firstRowExactMiss(&cfg, &weights, .{ .ctx = null }) == null);
+    // The two map views physically share the joined allocation.
+    const base = @intFromPtr(mlx.mlx_array_data_uint32(dw.gu.w).?);
+    try testing.expectEqual(base, @intFromPtr(mlx.mlx_array_data_uint32(dw.gate_w).?));
+    const half_bytes = mlx.mlx_array_size(dw.gu.w) * mlx.mlx_array_itemsize(dw.gu.w) / 2;
+    try testing.expectEqual(base + half_bytes, @intFromPtr(mlx.mlx_array_data_uint32(dw.up_w).?));
+    const live = [_][3]mlx.mlx_array{ .{ dw.gate_w, dw.gate_s, dw.gate_b }, .{ dw.up_w, dw.up_s, dw.up_b }, .{ dw.down_w, dw.down_s, dw.down_b } };
+    for (live, inputs, expected) |q, x, want| {
+        try testing.expect(tiled.isTiled(q[0]));
+        for ([_]c_int{ 1, 5, 16, 17, 33, 129 }) |rows| {
+            var xs = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xs);
+            var ys = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ys);
+            try mlx.check(mlx.mlx_slice(&xs, x, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ rows, mlx.getShape(x)[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            try mlx.check(mlx.mlx_slice(&ys, want, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ rows, mlx.getShape(want)[1] }, 2, &[_]c_int{ 1, 1 }, 2, s));
+            const y = try tiled.qmm(xs, q[0], q[1], q[2], null, s);
+            defer _ = mlx.mlx_array_free(y);
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(ys, y, s));
+        }
+    }
+}
+
 test "DFlash uint4 NAX: row invariant and no worse than stock at target shapes" {
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
@@ -52889,6 +53124,8 @@ test "DFlash uint4 NAX: row invariant and no worse than stock at target shapes" 
         try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
         try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
         try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
+        const tiled = try @import("dflash_tiled.zig").tile(w, gs, s);
+        defer _ = mlx.mlx_array_free(tiled);
         var dq = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(dq);
         try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, .{ .has_value = true, .value = .float32 }, s));
@@ -52904,9 +53141,68 @@ test "DFlash uint4 NAX: row invariant and no worse than stock at target shapes" 
             const split_columns: ?c_int = if (n == 34816) 17408 else null;
             const y = (try @import("dflash_nax.zig").qmmWithSplitColumns(xm, w, sc, bi, 4, @intCast(gs), split_columns, s)) orelse return error.KernelDeclined;
             defer _ = mlx.mlx_array_free(y);
+            const tiled_y = try @import("dflash_tiled.zig").qmm(xm, tiled, sc, bi, split_columns, s);
+            defer _ = mlx.mlx_array_free(tiled_y);
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(y, tiled_y, s));
+            for ([_]c_int{ 16, 32 }) |tile_n| {
+                const narrow_tiled = (try @import("dflash_nax.zig").qmmTiled(xm, tiled, sc, bi, @intCast(gs), split_columns, tile_n, s)) orelse return error.KernelDeclined;
+                defer _ = mlx.mlx_array_free(narrow_tiled);
+                try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(y, narrow_tiled, s));
+            }
+            const original_coop = try @import("dflash_tiled.zig").originalQmm(xm, w, sc, bi, split_columns, s);
+            defer _ = mlx.mlx_array_free(original_coop);
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(y, original_coop, s));
             const narrow = (try @import("dflash_nax.zig").qmmWithTile(xm, w, sc, bi, 4, @intCast(gs), split_columns, 16, s)).?;
             defer _ = mlx.mlx_array_free(narrow);
             try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(y, narrow, s));
+            for ([_]u2{ 1, 2, 3 }) |metadata_mode| {
+                for ([_]c_int{ 16, 32 }) |metadata_tile| {
+                    var staged_input = (try @import("dflash_nax.zig").Input.init(xm, s)).?;
+                    defer staged_input.deinit();
+                    const staged = (try staged_input.projectWithMetadata(w, sc, bi, 4, @intCast(gs), split_columns, metadata_tile, metadata_mode)).?;
+                    defer _ = mlx.mlx_array_free(staged);
+                    try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(y, staged, s));
+                }
+            }
+            const reused = blk: {
+                var input = (try @import("dflash_nax.zig").Input.init(xm, s)).?;
+                defer input.deinit();
+                const first = (try input.project(w, sc, bi, 4, @intCast(gs), split_columns, 16)).?;
+                defer _ = mlx.mlx_array_free(first);
+                const second = (try input.project(w, sc, bi, 4, @intCast(gs), split_columns, 32)).?;
+                errdefer _ = mlx.mlx_array_free(second);
+                // Do not evaluate until after Input is destroyed: the returned
+                // lazy projection must retain its shared activation and sums.
+                break :blk second;
+            };
+            defer _ = mlx.mlx_array_free(reused);
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(y, reused, s));
+            if (gs == 32 and m == 16) {
+                // Mixed quantization metadata on the same input needs distinct
+                // sums for each group size, including alternating accesses.
+                var triple64 = mlx.mlx_vector_array_new();
+                defer _ = mlx.mlx_vector_array_free(triple64);
+                try mlx.check(mlx.mlx_quantize(&triple64, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+                var parts: [3]mlx.mlx_array = @splat(.{ .ctx = null });
+                defer for (parts) |a| {
+                    _ = mlx.mlx_array_free(a);
+                };
+                for (&parts, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, triple64, i));
+                var input = (try @import("dflash_nax.zig").Input.init(xm, s)).?;
+                defer input.deinit();
+                const a32 = (try input.project(w, sc, bi, 4, 32, null, 16)).?;
+                defer _ = mlx.mlx_array_free(a32);
+                const a64 = (try input.project(parts[0], parts[1], parts[2], 4, 64, null, 16)).?;
+                defer _ = mlx.mlx_array_free(a64);
+                const again32 = (try input.project(w, sc, bi, 4, 32, null, 32)).?;
+                defer _ = mlx.mlx_array_free(again32);
+                const independent64 = (try @import("dflash_nax.zig").qmmWithTile(xm, parts[0], parts[1], parts[2], 4, 64, null, 16, s)).?;
+                defer _ = mlx.mlx_array_free(independent64);
+                try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(a32, again32, s));
+                try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(a64, independent64, s));
+                try testing.expect((try input.project(w, sc, bi, 8, 32, null, 16)) == null);
+                try testing.expect((try input.project(w, sc, bi, 4, 128, null, 16)) == null);
+            }
             if (split_columns != null) {
                 const widths = [_]c_int{ 17408, 17408 };
                 var lo: c_int = 0;
