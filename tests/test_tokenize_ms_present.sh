@@ -14,7 +14,7 @@
 #
 # Env:
 #   MODEL    Path to any MLX model dir. Default: Gemma 4 E4B 4-bit under
-#            /Volumes/Sandisk_1TB/Models. Skipped if missing.
+#            any model root (tests/_lib_models.sh). Skipped if missing.
 #   PORT     Server port. Default 19101.
 #   BINARY   Path to mlx-serve. Default ./zig-out/bin/mlx-serve.
 
@@ -22,7 +22,8 @@ set -uo pipefail
 
 PORT="${PORT:-19101}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
-MODEL="${MODEL:-/Volumes/Sandisk_1TB/Models/mlx-community/gemma-4-e4b-it-4bit}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${MODEL:-$(find_model mlx-community/gemma-4-e4b-it-4bit)}"
 BASE="http://127.0.0.1:$PORT"
 
 [ -d "$MODEL" ] || { echo "SKIP: model dir missing: $MODEL"; exit 0; }

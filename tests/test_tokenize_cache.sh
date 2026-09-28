@@ -19,7 +19,8 @@ set -uo pipefail
 
 PORT="${PORT:-19105}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
-MODEL="${MODEL:-/Volumes/Sandisk_1TB/Models/mlx-community/gemma-4-e4b-it-4bit}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${MODEL:-$(find_model mlx-community/gemma-4-e4b-it-4bit)}"
 BASE="http://127.0.0.1:$PORT"
 
 [ -d "$MODEL" ] || { echo "SKIP: model dir missing: $MODEL"; exit 0; }

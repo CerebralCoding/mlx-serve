@@ -20,12 +20,9 @@ cd "$(dirname "$0")/.."
 PORT="${1:-11387}"
 ONLY="${2:-}"
 IMAGE="tests/fixtures/house.jpeg"
-ROOTS=(
-  "$HOME/.mlx-serve/models"
-  "/Volumes/G Drive SSD/models"
-  "/Volumes/G Drive SSD/models-dl"
-  "$HOME/.lmstudio/models"
-)
+source tests/_lib_models.sh
+ROOTS=()
+while IFS= read -r r; do ROOTS+=("$r"); done < <(model_roots)
 
 # arch-label | boot-log signature | candidate dirs (relative to a root)
 # No gemma-3: mlx-community's pack ships SigLIP under HF names

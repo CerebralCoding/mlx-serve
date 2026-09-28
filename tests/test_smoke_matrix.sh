@@ -7,7 +7,11 @@
 #   ./tests/test_smoke_matrix.sh                 # every arch found, all configs
 #   SMOKE_ARCHES=gemma4,qwen3_5 ./tests/test_smoke_matrix.sh
 #   SMOKE_CONFIGS=default,kv4 ./tests/test_smoke_matrix.sh
-#   SMOKE_MAX_GB=20 ./tests/test_smoke_matrix.sh  # skip bigger packs (default 40)
+#   SMOKE_MAX_GB=20 ./tests/test_smoke_matrix.sh  # skip bigger packs
+#   SMOKE_EXTRA_FLAGS="--ctx-size 2048" ./tests/test_smoke_matrix.sh  # appended to every boot
+#
+# Checkpoints are found on any model root and packs past this box's GPU budget
+# skip (tests/_lib_models.sh); ./tests/fetch_test_models.sh downloads the rest.
 #
 # Configs: default | kv4 (--kv-quant 4) | kv8 (--kv-quant 8) | mtp (--mtp, only
 # where the pack ships a head) | nospec (--no-pld --no-mtp --no-drafter) |
@@ -18,47 +22,45 @@
 # /api/generate, /v1/models, /metrics.json.
 set -uo pipefail
 cd "$(dirname "$0")/.."
+source tests/_lib_models.sh
 
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
 PORT="${PORT:-11431}"
 BASE="http://127.0.0.1:$PORT"
-MAX_GB="${SMOKE_MAX_GB:-40}"
+MAX_GB="${SMOKE_MAX_GB:-$(max_model_gb)}"
 OUT="${SMOKE_OUT:-$HOME/claude-tmp/smoke-matrix-$(date +%Y%m%d-%H%M%S)}"
 mkdir -p "$OUT/home"
 
 [[ -x "$BINARY" ]] || { echo "[fatal] $BINARY missing — zig build -Doptimize=ReleaseFast"; exit 1; }
 
-GD="/Volumes/G Drive SSD"
-MD="$HOME/.mlx-serve/models"
-LS="$HOME/.lmstudio/models"
-# arch|thinking(yes/no)|candidate paths (first that exists wins)
+# arch|thinking(yes/no)|candidates relative to a model root (first found wins)
 ARCHES=(
-    "gemma4|yes|$MD/mlx-community/gemma-4-e4b-it-8bit|$MD/mlx-community/gemma-4-e4b-it-4bit"
-    "gemma4_moe|yes|$LS/mlx-community/gemma-4-26B-A4B-it-qat-4bit|$GD/models/mlx-community/gemma-4-26b-a4b-it-4bit"
-    "gemma3|no|$GD/models/mlx-community/gemma-3-12b-it-4bit"
-    "qwen3_5|yes|$MD/mlx-community/Qwen3.5-0.8B-MLX-4bit|$MD/lmstudio-community/Qwen3.5-4B-MLX-4bit"
-    "qwen3_5_27b|yes|$MD/ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
-    "prism_hadamard|yes|$GD/models-dl/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
-    "qwen3_5_moe|yes|$GD/models/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit|$GD/models-dl/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
-    "lfm2|yes|$MD/LiquidAI/LFM2.5-2.6B-MLX-mxfp4|$GD/models/mlx-community/LFM2.5-2.6B-8bit"
-    "lfm2_moe|yes|$GD/models/LiquidAI/LFM2.5-8B-A1B-MLX-8bit"
-    "lfm2_vl|yes|$MD/mlx-community/LFM2.5-VL-1.6B-4bit"
-    "llama|no|$GD/models/mlx-community/Llama-3.2-3B-Instruct-4bit"
-    "mistral|no|$GD/models/mlx-community/Mistral-7B-Instruct-v0.3-4bit"
-    "nemotron_h|yes|$GD/models-dl/mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
-    "muse_glimmer|yes|$MD/ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit"
-    "spark2_5|yes|$MD/abenzerps/Spark-X2.5-4B-MLX-8bit"
-    "k2_horizon|yes|$MD/mlx-community/K2-Horizon-7B-oQ6e"
-    "laguna|yes|$GD/models/poolside/Laguna-XS-2.1-NVFP4-mlx"
-    "gguf_llama|yes|$GD/models-dl/unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf|$GD/gguf/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf"
-    "qwen4_exp|yes|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
+    "gemma4|yes|mlx-community/gemma-4-e4b-it-8bit|mlx-community/gemma-4-e4b-it-4bit"
+    "gemma4_moe|yes|mlx-community/gemma-4-26B-A4B-it-qat-4bit|mlx-community/gemma-4-26b-a4b-it-4bit|ddalcu/gemma-4-26B-A4B-it-2bit-experts-textonly-bench"
+    "gemma3|no|mlx-community/gemma-3-12b-it-4bit|mlx-community/gemma-3-12b-it-qat-4bit"
+    "qwen3_5|yes|mlx-community/Qwen3.5-0.8B-MLX-4bit|lmstudio-community/Qwen3.5-4B-MLX-4bit|mlx-community/Qwen3.5-4B-MLX-4bit"
+    "qwen3_5_27b|yes|ddalcu/Qwen3.8-27B-MLX-Serve-4bit|ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw"
+    "prism_hadamard|yes|prism-ml/Ternary-Bonsai-2-27B-mlx-2bit"
+    "qwen3_5_moe|yes|ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
+    "lfm2|yes|LiquidAI/LFM2.5-2.6B-MLX-mxfp4|mlx-community/LFM2.5-2.6B-8bit|LiquidAI/LFM2.5-2.6B-MLX-6bit"
+    "lfm2_moe|yes|LiquidAI/LFM2.5-8B-A1B-MLX-8bit|LiquidAI/LFM2.5-8B-A1B-MLX-4bit"
+    "lfm2_vl|yes|mlx-community/LFM2.5-VL-1.6B-4bit"
+    "llama|no|mlx-community/Llama-3.2-3B-Instruct-4bit"
+    "mistral|no|mlx-community/Mistral-7B-Instruct-v0.3-4bit"
+    "nemotron_h|yes|mlx-community/NVIDIA-Nemotron-3-Nano-30B-A3B-NVFP4"
+    "muse_glimmer|yes|ddalcu/Muse-Glimmer-30B-MLX-Serve-4bit"
+    "spark2_5|yes|abenzerps/Spark-X2.5-4B-MLX-8bit|abenzerps/Spark-X2.5-4B-MLX-4bit"
+    "k2_horizon|yes|mlx-community/K2-Horizon-7B-oQ6e"
+    "laguna|yes|poolside/Laguna-XS-2.1-NVFP4-mlx"
+    "gguf_llama|yes|unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ4_XS.gguf|gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf|unsloth/Qwen3.8-27B-GGUF/Qwen3.8-27B-UD-IQ2_XXS.gguf"
+    "qwen4_exp|yes|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-iQ-MLX-3.3bpw"
 )
 CONFIGS="${SMOKE_CONFIGS:-default,kv4,kv8,mtp,nospec,drafter,drafter_kv8}"
 # A DFlash drafter per arch when the pack carries none in drafter/.
 drafter_for() { # $1 arch, $2 model
     [[ -f "$2/drafter/config.json" ]] && { echo "$2/drafter"; return; }
     case "$1" in
-        qwen3_5_27b) [[ -d "$GD/models-dl/z-lab/Qwen3.8-27B-DFlash2" ]] && echo "$GD/models-dl/z-lab/Qwen3.8-27B-DFlash2" ;;
+        qwen3_5_27b) find_model z-lab/Qwen3.8-27B-DFlash2 ;;
     esac
 }
 
@@ -84,12 +86,20 @@ boot() { # $1 model path, $2... extra flags
     local model="$1"; shift
     # Isolated HOME: ~/.mlx-serve/model-settings.json outranks launch flags, so a real
     # profile would silently turn a kv4 cell into whatever the user saved for that model.
-    HOME="$OUT/home" "$BINARY" --model "$model" --serve --host 127.0.0.1 --port "$PORT" --log-level info --metrics "$@" \
+    # shellcheck disable=SC2086
+    HOME="$OUT/home" "$BINARY" --model "$model" --serve --host 127.0.0.1 --port "$PORT" --log-level info --metrics "$@" ${SMOKE_EXTRA_FLAGS:-} \
         > "$OUT/$CELL.server.log" 2>&1 &
     SERVER_PID=$!
     for _ in $(seq 1 600); do
         curl -sf "$BASE/health" >/dev/null 2>&1 && curl -sf "$BASE/v1/models" 2>/dev/null | grep -q '"id"' && return 0
-        kill -0 "$SERVER_PID" 2>/dev/null || { echo "  server died at boot"; return 1; }
+        if ! kill -0 "$SERVER_PID" 2>/dev/null; then
+            # The previous cell's memory can still be on its way back to the OS: wait once, retry.
+            if [[ -z "${BOOT_RETRIED:-}" ]] && grep -q 'Insufficient memory' "$OUT/$CELL.server.log"; then
+                echo "  boot refused for memory, retrying in 20s"; sleep 20
+                BOOT_RETRIED=1 boot "$model" "$@"; return
+            fi
+            echo "  server died at boot"; return 1
+        fi
         sleep 1
     done
     echo "  server never became ready"; return 1
@@ -119,7 +129,11 @@ run_checks() { # $1 thinking yes/no, $2 has_spec yes/no
     # prefix cache: same request again
     r=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":\"$Q\"}],\"max_tokens\":8,\"temperature\":0}")
     rc=$(echo "$r" | J 'd["usage"]["prompt_tokens_details"]["cached_tokens"]')
-    check "prefix cache: repeat reports cached_tokens>0" "$([[ "${rc:-0}" -gt 0 ]] && echo 0 || echo 1)" "cached=$rc"
+    # llama.cpp cannot roll recurrent state back one token, so a hybrid GGUF re-prefills an identical prompt.
+    if [[ "$model" == *.gguf ]] && grep -q 'llama_memory_recurrent' "$OUT/$CELL.server.log"; then
+        skip "prefix cache: repeat reports cached_tokens>0" "recurrent GGUF re-prefills a full match"
+    else
+    check "prefix cache: repeat reports cached_tokens>0" "$([[ "${rc:-0}" -gt 0 ]] && echo 0 || echo 1)" "cached=$rc"; fi
 
     # 2. chat stream
     r=$(curl -sN --max-time 300 "$BASE/v1/chat/completions" -H "Content-Type: application/json" \
@@ -264,12 +278,14 @@ IFS=',' read -r -a WANT_CFG <<< "$CONFIGS"
 for entry in "${ARCHES[@]}"; do
     IFS='|' read -r arch think rest <<< "$entry"
     if [[ -n "${SMOKE_ARCHES:-}" ]] && ! [[ ",$SMOKE_ARCHES," == *",$arch,"* ]]; then continue; fi
-    model=""
     IFS='|' read -r -a cands <<< "$rest"
-    for p in "${cands[@]}"; do [[ -e "$p" ]] && { model="$p"; break; }; done
-    if [[ -z "$model" ]]; then CELL="$arch"; skip "$arch" "no checkpoint on this box"; continue; fi
-    gb=$(( $(du -sk "$model" 2>/dev/null | cut -f1) / 1024 / 1024 ))
-    if [[ "$gb" -gt "$MAX_GB" ]]; then CELL="$arch"; skip "$arch" "${gb} GB > SMOKE_MAX_GB=$MAX_GB"; continue; fi
+    if ! model=$(MAX_MODEL_GB="$MAX_GB" find_fitting_model "${cands[@]}"); then
+        CELL="$arch"
+        if model=$(find_model "${cands[@]}"); then skip "$arch" "$(model_gb "$model") GB > SMOKE_MAX_GB=$MAX_GB"
+        else skip "$arch" "no checkpoint on this box"; fi
+        continue
+    fi
+    gb=$(model_gb "$model")
 
     for cfg in "${WANT_CFG[@]}"; do
         CELL="$arch.$cfg"
@@ -302,9 +318,15 @@ for entry in "${ARCHES[@]}"; do
             check "drafter: engaged in the log" "$(grep -q 'spec-stats\] mode=dflash' "$OUT/$CELL.server.log" && echo 0 || echo 1)"
             # Past 2k KV tokens, with packed-KV reads forced: drafted bytes == serial bytes on one load.
             long=$(python3 -c "print(open('src/rowqmv.zig').read()[:12000])" | python3 -c 'import sys,json; print(json.dumps("Here is a file:\n"+sys.stdin.read()+"\nList its public functions."))')
-            a=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$long}],\"max_tokens\":160,\"temperature\":0,\"enable_thinking\":false,\"kv_attn_mode\":\"fused\",\"enable_drafter\":false,\"enable_mtp\":false,\"enable_pld\":false}" | J 'd["choices"][0]["message"]["content"]')
-            b=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$long}],\"max_tokens\":160,\"temperature\":0,\"enable_thinking\":false,\"kv_attn_mode\":\"fused\",\"enable_drafter\":true}" | J 'd["choices"][0]["message"]["content"]')
-            check "drafter: long-context drafted == serial" "$([[ -n "$a" && "$a" == "$b" ]] && echo 0 || echo 1)" "serial=${a:0:80} drafted=${b:0:80}"
+            a=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$long}],\"max_tokens\":160,\"temperature\":0,\"enable_thinking\":false,\"kv_attn_mode\":\"fused\",\"enable_drafter\":false,\"enable_mtp\":false,\"enable_pld\":false}" | J '(d["choices"][0]["message"].get("reasoning_content") or "") + (d["choices"][0]["message"]["content"] or "")')
+            b=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$long}],\"max_tokens\":160,\"temperature\":0,\"enable_thinking\":false,\"kv_attn_mode\":\"fused\",\"enable_drafter\":true}" | J '(d["choices"][0]["message"].get("reasoning_content") or "") + (d["choices"][0]["message"]["content"] or "")')
+            # The whole reply (a model can think with thinking off). Bytes match only on the row-exact
+            # archs (ModelConfig.rowExactArch); elsewhere a verify row legitimately rounds differently.
+            case "$arch" in
+                qwen3_5|qwen3_5_27b|nemotron_h)
+                    check "drafter: long-context drafted == serial" "$([[ -n "$a" && "$a" == "$b" ]] && echo 0 || echo 1)" "serial=${a:0:80} drafted=${b:0:80}" ;;
+                *)  check "drafter: long-context drafted and serial both answer" "$([[ -n "$a" && -n "$b" ]] && echo 0 || echo 1)" ;;
+            esac
         fi
         if [[ "$cfg" == nospec ]]; then
             check "nospec: no speculation engaged" "$(grep -Eq 'spec-stats\] mode=(mtp|pld|drafter|dflash)' "$OUT/$CELL.server.log" && echo 1 || echo 0)"

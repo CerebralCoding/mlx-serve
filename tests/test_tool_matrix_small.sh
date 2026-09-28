@@ -37,6 +37,7 @@
 
 set -u
 cd "$(dirname "$0")/.."
+source tests/_lib_models.sh
 
 PORT="${PORT:-11298}"
 BASE="http://127.0.0.1:$PORT"
@@ -45,13 +46,13 @@ PASS=0; FAIL=0; MODEL_FAIL=0; RAN=0
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[1;34m'; NC='\033[0m'
 
-# logical|display|path
+# logical|display|candidates relative to a model root (tests/_lib_models.sh), first found wins
 MODELS=(
-    "qwen35-0.8b|Qwen3.5 0.8B 4bit|$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
-    "qwen35-2b|Qwen3.5 2B 4bit|$HOME/.lmstudio/models/lmstudio-community/Qwen3.5-2B-MLX-4bit"
-    "qwen35-4b|Qwen3.5 4B 4bit|$HOME/.lmstudio/models/lmstudio-community/Qwen3.5-4B-MLX-4bit"
-    "gemma4-e2b|Gemma 4 E2B it 4bit|$HOME/.lmstudio/models/mlx-community/gemma-4-e2b-it-4bit"
-    "gemma4-e4b|Gemma 4 E4B it 4bit|$HOME/.lmstudio/models/mlx-community/gemma-4-e4b-it-4bit"
+    "qwen35-0.8b|Qwen3.5 0.8B 4bit|mlx-community/Qwen3.5-0.8B-MLX-4bit"
+    "qwen35-2b|Qwen3.5 2B 4bit|lmstudio-community/Qwen3.5-2B-MLX-4bit|mlx-community/Qwen3.5-2B-MLX-4bit"
+    "qwen35-4b|Qwen3.5 4B 4bit|lmstudio-community/Qwen3.5-4B-MLX-4bit|mlx-community/Qwen3.5-4B-MLX-4bit"
+    "gemma4-e2b|Gemma 4 E2B it 4bit|mlx-community/gemma-4-e2b-it-4bit"
+    "gemma4-e4b|Gemma 4 E4B it 4bit|mlx-community/gemma-4-e4b-it-4bit"
 )
 
 if [ -n "${TOOL_MODELS:-}" ]; then
@@ -163,7 +164,7 @@ print(f"{call_ok}|{json_ok}|{path_ok}|{content_ok}|{leak_ok}")
 run_model() {
     local logical="$1" display="$2" path="$3"
     echo -e "${BLUE}=== [$logical] $display ===${NC}"
-    if [ ! -d "$path" ]; then echo -e "${YELLOW}SKIP${NC}: model dir not found: $path"; return 0; fi
+    if [ ! -d "$path" ]; then echo -e "${YELLOW}SKIP${NC}: not on any model root"; return 0; fi
 
     local log="/tmp/test_tool_matrix_$logical.log"
     pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
@@ -246,8 +247,9 @@ run_model() {
 trap 'pkill -f "mlx-serve.*--port $PORT" 2>/dev/null' EXIT
 
 for entry in "${MODELS[@]}"; do
-    IFS='|' read -r logical display path <<< "$entry"
-    run_model "$logical" "$display" "$path"
+    IFS='|' read -r logical display rest <<< "$entry"
+    IFS='|' read -r -a cands <<< "$rest"
+    run_model "$logical" "$display" "$(find_model "${cands[@]}")"
     pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 2
 done
 

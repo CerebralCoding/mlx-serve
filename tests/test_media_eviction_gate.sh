@@ -41,6 +41,10 @@ JSON
 
 MODEL_ID="fake/MiniMax-H3-Gate"
 rc=0
+# Arms [1], [3] and [4] need the 17.3 GB staged peak to clear the server's
+# real-RAM preflight too; below a 48 GB Mac it refuses first (503), correctly.
+RAM_GB=$(( $(sysctl -n hw.memsize) / 1073741824 ))
+FITS=1; [ "$RAM_GB" -ge 48 ] || FITS=0
 
 boot() { # boot <cap> <logfile>
   "$BIN" --serve --port "$PORT" --model-dir "$TMP/models" --max-resident-mem "$1" >"$2" 2>&1 &
@@ -56,6 +60,7 @@ stop() { [ -n "$SRV" ] && { kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null; };
 
 # ── [1] A cap ABOVE the staged peak but BELOW the dir sum must not refuse.
 # 30 GB is exactly what a 48 GB Mac's `auto` resolves to, i.e. the reported bug.
+if [ "$FITS" -eq 1 ]; then
 LOG1="$TMP/above.log"
 boot 30GB "$LOG1" || exit 1
 BODY=$(curl -s -o "$TMP/b1.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/load-model" \
@@ -71,6 +76,9 @@ if grep -q "Refusing to load" "$LOG1"; then
   echo "FAIL: gate logged a refusal at a cap above the staged peak"; rc=1
 fi
 stop
+else
+  echo "SKIP: [1] needs a 48 GB Mac (${RAM_GB} GB here)"
+fi
 
 # ── [2] A cap BELOW the staged peak still refuses — and says what and how.
 LOG2="$TMP/below.log"
@@ -112,6 +120,7 @@ stop
 # so the sparse pack exercises them hermetically. A missing turbo_lora file is
 # a NAMED 400 (never a silent slow render — the silent-flag-eater class), and
 # the 4-step floor is the distillation's own.
+if [ "$FITS" -eq 1 ]; then
 LOG3="$TMP/turbo.log"
 boot 30GB "$LOG3" || exit 1
 CODE=$(curl -s -o "$TMP/b3.json" -w '%{http_code}' -X POST "http://127.0.0.1:$PORT/v1/video/generations" \
@@ -174,6 +183,9 @@ if [ "$CODE" = "400" ] && grep -q "chain_windows must be 1-6" "$TMP/b6.json"; th
   echo "PASS: out-of-range chain_windows is a named 400"
 else
   echo "FAIL: expected the chain_windows-range 400, got $CODE: $(cat "$TMP/b6.json" | head -c 200)"; rc=1
+fi
+else
+  echo "SKIP: [3] [4] turbo, LoRA and chain_windows arms need a 48 GB Mac (${RAM_GB} GB here)"
 fi
 # A REF2VA pack cannot chain (no keyframe row to chain through) — refused by
 # name, never a generation that silently ignores the request.

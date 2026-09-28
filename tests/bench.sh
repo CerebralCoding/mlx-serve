@@ -56,28 +56,27 @@ done
 OUT="$HOME/claude-tmp/bench-$TAG"
 mkdir -p "$OUT"
 
-# ── Model matrix: logical|path ──
-# A missing path skips the row silently — a bench you can't run on this box
+# ── Model matrix: logical|candidates relative to a model root ──
+# The first candidate found wins (tests/_lib_models.sh). A row with no checkpoint
+# on this box, or one past its GPU budget, skips: a bench you can't run here
 # isn't an error on the box that can.
-MD="$HOME/.mlx-serve/models"
-LMS_DIR="$HOME/.lmstudio/models"
-GD="/Volumes/G Drive SSD"
 # ANE=1 adds --ane-prefill to every boot
 # (a named refusal on non-qwen3_5-dense models, so it is safe matrix-wide);
 # ane-on cells are their own column, never diffed against ane-off ones.
-QWEN38_27B="$MD/ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
+source "$SCRIPT_DIR/_lib_models.sh"
 TARGETS=(
-    "gemma4-e4b-4bit|$MD/mlx-community/gemma-4-e4b-it-4bit"
-    "gemma4-26b-a4b-moe-qat-4bit|$LMS_DIR/mlx-community/gemma-4-26B-A4B-it-qat-4bit"
-    "qwen36-35b-a3b|$GD/models-dl/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
-    "qwen38-27b|$QWEN38_27B"
-    "qwen38-flash-next|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
+    "gemma4-e4b-4bit|mlx-community/gemma-4-e4b-it-4bit"
+    "gemma4-26b-a4b-moe-qat-4bit|mlx-community/gemma-4-26B-A4B-it-qat-4bit"
+    "qwen36-35b-a3b|ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
+    "qwen38-27b|ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
+    "qwen38-27b-iq|ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw"
+    "qwen38-flash-next|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
 )
 
 # Only ever called on the path that STARTED a server: --url may be pointed at
 # a local mlx-serve someone else is using, and a bench must not kill it.
 stop_server() {
-    pkill -f "mlx-serve --serve" 2>/dev/null
+    pkill -f "mlx-serve --serve .*--port $PORT" 2>/dev/null
     for _ in $(seq 1 30); do
         lsof -ti tcp:"$PORT" >/dev/null 2>&1 || return 0
         sleep 1
@@ -117,9 +116,10 @@ else
     trap 'stop_server' EXIT
     stop_server
     for row in "${TARGETS[@]}"; do
-        IFS='|' read -r logical path <<< "$row"
+        IFS='|' read -r logical rest <<< "$row"
         [[ -n "$ONLY" && "$logical" != *"$ONLY"* ]] && continue
-        [[ -e "$path" ]] || { echo "SKIP $logical (no checkpoint at $path)" >&2; continue; }
+        IFS='|' read -r -a cands <<< "$rest"
+        path=$(find_fitting_model "${cands[@]}") || { echo "SKIP $logical (no checkpoint within $(max_model_gb) GB on this box)" >&2; continue; }
         flags="$(spec_flags "$path")"
         echo; echo ">> $logical$flags"
         # shellcheck disable=SC2086

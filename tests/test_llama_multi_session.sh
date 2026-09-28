@@ -30,7 +30,8 @@ set -uo pipefail
 
 PORT="${PORT:-19107}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
-MODEL="${LLAMA_GGUF_MODEL:-/Volumes/Sandisk_1TB/Models/unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-IQ4_NL.gguf}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${LLAMA_GGUF_MODEL:-$(find_model unsloth/Qwen3.5-4B-GGUF/Qwen3.5-4B-IQ4_NL.gguf)}"
 BASE="http://127.0.0.1:$PORT"
 
 [ -f "$MODEL" ] || { echo "SKIP: GGUF file missing: $MODEL"; exit 0; }

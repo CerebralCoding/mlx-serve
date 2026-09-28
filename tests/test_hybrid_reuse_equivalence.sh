@@ -25,7 +25,8 @@
 
 set -uo pipefail
 
-MODEL="${MLX_HYBRID_MODEL:-/Volumes/Sandisk_1TB/Models/mlx-community/Qwen3.5-4B-MLX-4bit}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${MLX_HYBRID_MODEL:-$(find_model mlx-community/Qwen3.5-4B-MLX-4bit)}"
 PORT="${PORT:-19077}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
 BASE="http://127.0.0.1:$PORT"

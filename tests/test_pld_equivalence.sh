@@ -34,7 +34,8 @@ YELLOW='\033[0;33m'
 NC='\033[0m'
 
 # Resolve model directory: explicit env var first, else a sensible default.
-MODEL="${PLD_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${PLD_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-8bit)}"
 
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_pld_equivalence: model directory not found."

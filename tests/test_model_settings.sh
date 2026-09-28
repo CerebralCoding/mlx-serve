@@ -120,7 +120,8 @@ check "[4] malformed file: load -> 200 (got $CODE), globals apply (ctx $(row "$M
 check "[4] malformed file logged" "$(grep -q "\[model-settings\] .*malformed" "$LOG" && echo 1 || echo 0)"
 
 # [5] the per-model drafter: "off" silences a pack's own drafter/, "auto" brings it back
-DRAFT_MODEL="${DRAFT_MODEL:-/Volumes/G Drive SSD/models/mlx-community/LFM2.5-2.6B-8bit}"
+source "$(dirname "$0")/_lib_models.sh"
+DRAFT_MODEL="${DRAFT_MODEL:-$(find_model mlx-community/LFM2.5-2.6B-8bit)}"
 if [ -f "$DRAFT_MODEL/drafter/config.json" ]; then
     drafter_loaded() {
         curl -s "http://127.0.0.1:$PORT/v1/models" | python3 -c "

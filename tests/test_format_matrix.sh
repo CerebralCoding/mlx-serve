@@ -31,6 +31,7 @@
 set -u
 
 cd "$(dirname "$0")/.."
+source tests/_lib_models.sh
 
 PORT="${PORT:-11297}"
 BASE="http://127.0.0.1:$PORT"
@@ -46,18 +47,18 @@ YELLOW='\033[0;33m'
 BLUE='\033[1;34m'
 NC='\033[0m'
 
-# logical|display|path|engine|has_thinking
+# logical|display|path relative to a model root, comma-separated alternatives (tests/_lib_models.sh)|engine|has_thinking
 MODELS=(
-    "qwen36|Qwen 3.6 27B dense (think tags + raw-JSON tools)|$HOME/.lmstudio/models/mlx-community/Qwen3.6-27B-4bit|mlx|yes"
-    "gemma4-12b|Gemma 4 12B (channel tags + custom string-delim tool args)|$HOME/.mlx-serve/models/mlx-community/gemma-4-12b-it-4bit|mlx|yes"
-    "gemma4-e4b|Gemma 4 E4B (standard gemma4)|$HOME/.lmstudio/models/mlx-community/gemma-4-e4b-it-4bit|mlx|no"
-    "qwen3-coder|Qwen3-Coder 30B-A3B (qwen3_moe flat-brace quirks)|$HOME/.mlx-serve/models/mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit|mlx|no"
-    "gemma3-12b|Gemma 3 12B (fallback chat format)|$HOME/.mlx-serve/models/mlx-community/gemma-3-12b-it-qat-4bit|mlx|no"
-    "e4b-gguf|Gemma 4 E4B GGUF (embedded llama.cpp engine)|$HOME/.lmstudio/models/lmstudio-community/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf|gguf|no"
-    "ds4-flash|DeepSeek-V4-Flash GGUF (embedded ds4 engine)|$HOME/.mlx-serve/models/antirez/deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf|gguf|no"
-    "qwen38-27b|Qwen 3.8 27B dense (think tags + XML tools)|$HOME/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit|mlx|yes"
-    "gemma4-26b-gguf|Gemma 4 26B-A4B GGUF (embedded llama.cpp engine)|/Volumes/G Drive SSD/gguf/gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf|gguf|no"
-    "flashnext-gguf|Qwen 3.8 Flash Next GGUF (embedded ds4 engine)|/Volumes/G Drive SSD/models-dl/antirez/qwen3.8-flash-next-gguf/Qwen3.8-Flash-Next-Q2.gguf|gguf|yes"
+    "qwen36|Qwen 3.6 27B dense (think tags + raw-JSON tools)|mlx-community/Qwen3.6-27B-4bit|mlx|yes"
+    "gemma4-12b|Gemma 4 12B (channel tags + custom string-delim tool args)|mlx-community/gemma-4-12b-it-4bit|mlx|yes"
+    "gemma4-e4b|Gemma 4 E4B (standard gemma4)|mlx-community/gemma-4-e4b-it-4bit|mlx|no"
+    "qwen3-coder|Qwen3-Coder 30B-A3B (qwen3_moe flat-brace quirks)|mlx-community/Qwen3-Coder-30B-A3B-Instruct-8bit|mlx|no"
+    "gemma3-12b|Gemma 3 12B (fallback chat format)|mlx-community/gemma-3-12b-it-qat-4bit,mlx-community/gemma-3-12b-it-4bit|mlx|no"
+    "e4b-gguf|Gemma 4 E4B GGUF (embedded llama.cpp engine)|lmstudio-community/gemma-4-E4B-it-GGUF/gemma-4-E4B-it-Q4_K_M.gguf|gguf|no"
+    "ds4-flash|DeepSeek-V4-Flash GGUF (embedded ds4 engine)|antirez/deepseek-v4-gguf/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2.gguf|gguf|no"
+    "qwen38-27b|Qwen 3.8 27B dense (think tags + XML tools)|ddalcu/Qwen3.8-27B-MLX-Serve-4bit,ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw|mlx|yes"
+    "gemma4-26b-gguf|Gemma 4 26B-A4B GGUF (embedded llama.cpp engine)|gemma-4-26B-A4B-it-GGUF/gemma-4-26B-A4B-it-Q4_K_M.gguf|gguf|no"
+    "flashnext-gguf|Qwen 3.8 Flash Next GGUF (embedded ds4 engine)|antirez/qwen3.8-flash-next-gguf/Qwen3.8-Flash-Next-Q2.gguf|gguf|yes"
 )
 
 # FORMAT_MODELS=csv filter of logical names. Unknown names simply match
@@ -164,30 +165,14 @@ run_model() {
 
     echo -e "${BLUE}=== [$logical] $display ===${NC}"
 
-    # The table's path is one PLACE the checkpoint may live, not the only one:
-    # the same model is equally at home under ~/.mlx-serve/models (the app's
-    # single download root) or ~/.lmstudio/models. A matrix arm that skips
-    # because a model sits in the other root is silently missing coverage —
-    # the gemma4-e4b arm skipped for exactly that reason while the checkpoint
-    # was present (2026-08-04). Try the sibling root before giving up.
-    if [ ! -e "$path" ]; then
-        case "$path" in
-            "$HOME/.lmstudio/models/"*) alt="$HOME/.mlx-serve/models/${path#$HOME/.lmstudio/models/}" ;;
-            "$HOME/.mlx-serve/models/"*) alt="$HOME/.lmstudio/models/${path#$HOME/.mlx-serve/models/}" ;;
-            *) alt="" ;;
-        esac
-        if [ -n "$alt" ] && [ -e "$alt" ]; then
-            echo -e "${DIM:-}  (found under the sibling model root)${NC}"
-            path="$alt"
-        fi
-    fi
-
-    if [ "$engine" = "gguf" ] && [ ! -f "$path" ]; then
-        echo -e "${YELLOW}SKIP${NC}: GGUF not found: $path"
+    local rel="$path" cands
+    IFS=',' read -r -a cands <<< "$rel"
+    if ! path=$(find_model "${cands[@]}"); then
+        echo -e "${YELLOW}SKIP${NC}: $rel not on any model root"
         return 0
     fi
-    if [ "$engine" = "mlx" ] && [ ! -d "$path" ]; then
-        echo -e "${YELLOW}SKIP${NC}: model dir not found: $path"
+    if ! model_fits "$path"; then
+        echo -e "${YELLOW}SKIP${NC}: $(model_gb "$path") GB > $(max_model_gb) GB budget"
         return 0
     fi
 

@@ -23,7 +23,9 @@
 
 set -u
 
-MODEL="${1:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}"
+source "$(dirname "$0")/_lib_models.sh"
+# The ~27k-token prompt needs ~4 GB of KV beside the weights.
+MODEL="${1:-$(MODEL_HEADROOM_GB=6 find_fitting_model mlx-community/gemma-4-e4b-it-8bit mlx-community/gemma-4-e4b-it-4bit)}"
 PORT="${2:-11264}"
 BASE="http://127.0.0.1:$PORT"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"

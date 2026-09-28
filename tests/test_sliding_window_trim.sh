@@ -41,11 +41,11 @@ if [ ! -x "$BINARY" ]; then
     exit 1
 fi
 
-SSD="/Volumes/G Drive SSD/models"
-GEMMA4_MOE="${SLIDING_GEMMA4_MOE_MODEL:-$SSD/mlx-community/gemma-4-26b-a4b-it-4bit}"
-LAGUNA="${SLIDING_LAGUNA_MODEL:-$SSD/poolside/Laguna-XS-2.1-NVFP4-mlx}"
-INKLING="${SLIDING_INKLING_MODEL:-$SSD/mlx-community/Inkling-Small-mlx-2bit}"
-GPT_OSS="${SLIDING_GPT_OSS_MODEL:-$HOME/.mlx-serve/models/mlx-community/gpt-oss-20b-MXFP4-Q8}"
+source "$(dirname "$0")/_lib_models.sh"
+GEMMA4_MOE="${SLIDING_GEMMA4_MOE_MODEL:-$(find_model mlx-community/gemma-4-26b-a4b-it-4bit)}"
+LAGUNA="${SLIDING_LAGUNA_MODEL:-$(find_model poolside/Laguna-XS-2.1-NVFP4-mlx)}"
+INKLING="${SLIDING_INKLING_MODEL:-$(find_model mlx-community/Inkling-Small-mlx-2bit)}"
+GPT_OSS="${SLIDING_GPT_OSS_MODEL:-$(find_model mlx-community/gpt-oss-20b-MXFP4-Q8)}"
 
 FAILURES=0
 RAN=0

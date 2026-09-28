@@ -7,7 +7,8 @@
 # Usage: HADAMARD_TEST_MODEL=<pack dir> ./tests/test_hadamard_fidelity.sh [port]
 # Needs python3 with mlx, mlx_lm and tokenizers.
 set -u
-MODEL="${HADAMARD_TEST_MODEL:-/Volumes/G Drive SSD/models-dl/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${HADAMARD_TEST_MODEL:-$(find_model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit)}"
 PORT="${1:-11281}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
 if [ ! -d "$MODEL" ]; then echo "skip: model not found ($MODEL)"; exit 0; fi

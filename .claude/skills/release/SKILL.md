@@ -9,7 +9,7 @@ Timings measured 2026-07-16 on the M4 Max 128 GB, AFTER the `stop_all_engines` p
 
 | # | Step | Command | Time |
 |---|---|---|---|
-| 1 | Hermetic suite | `zig build test` (**must** be 6/6 steps, 0 fail) + `cd app && swift test` | ~1 min |
+| 1 | Hermetic suite | `zig build test` (**must** be every step, 9/9 today, 0 fail) + `cd app && swift test` | ~1 min |
 | 2 | ReleaseFast binary | `zig build -Doptimize=ReleaseFast` → `du -h zig-out/bin/mlx-serve` ≈ **16 MB** in 26.9.6 (Debug ≈ 2× = fake regression) | ~10 s |
 | 3 | **Perf gate** (did WE regress?) | `./tests/bench.sh` (mlx-serve only, llmprobe) → diff vs the previous column in `benchmarks.md` → append this release's column | ~15 min |
 | 4 | Tool-call correctness | `zig build test -Dtest-filter="format corpus"` + `-Dtest-filter="tool traffic"`; live: `./tests/test_tool_matrix_small.sh` | ~3 min |
@@ -20,6 +20,7 @@ Timings measured 2026-07-16 on the M4 Max 128 GB, AFTER the `stop_all_engines` p
 | 9 | Bundle | `SKIP_NOTARIZE=1 bash app/build.sh` (both binaries move together) | ~2 min |
 
 **Rules:**
+- **Any Mac runs the matrix.** Scripts find checkpoints on every model root and skip packs past the box's GPU budget (`tests/_lib_models.sh`); run `./tests/fetch_test_models.sh --dry-run` first, then without it to pull what's missing. The run is only as wide as what fits, so name the machine when you report it.
 - **Steps 3 and 8 are different questions.** 3 = "did our code regress" — mlx-serve only, the ONLY one needed every release. 8 = the public comparison; LM Studio/oMLX/MTPLX numbers cannot move when only OUR code changes, so re-run 8 only when an engine version bumps.
 - **Diff step 3 against llmprobe columns only.** Columns through 26.7.12 are the pre-2026-08 hand-rolled bench, a DIFFERENT methodology — frozen history, never a diff target. See /bench.
 - **`--only <substr>`** runs a single model row for tight dev loops.

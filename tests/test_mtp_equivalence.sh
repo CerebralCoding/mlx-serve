@@ -36,7 +36,8 @@
 # engagement + acceptance-floor checks exercise the MoE head arm.
 
 set -u
-MODEL="${MTP_TEST_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-27B-MLX-Serve-4bit}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${MTP_TEST_MODEL:-$(find_model ddalcu/Qwen3.8-27B-MLX-Serve-4bit ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw)}"
 PORT="${1:-11313}"
 BIN="./zig-out/bin/mlx-serve"
 # ~24 tokens of prefix. Mirrors the PLD/KV-quant first-N thresholds: INT4
