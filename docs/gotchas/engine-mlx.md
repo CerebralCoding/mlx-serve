@@ -5312,3 +5312,20 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
   and quantized`; smoke matrix `drafter` / `drafter_kv8` cells (red on the old binary);
   same-load serial vs drafter byte check under `--kv-quant 8`; the smoke's long-context
   drafted == serial check with `kv_attn_mode: "fused"` (0/4 before, 4/4 after).
+
+## A 1024-thread threadgroup failed on the CI runner, and 512 fails on M1/M2 (2026-09-28)
+
+- Defect: CI went red on every commit after #590 with the new `simd_qmm` bit-exact test
+  failing in `prepare`, then three DiskTier tests asserting no MLX latch, then a scheduler
+  test segfaulting in `markError` on an `undefined` Slot. One MLX error, four collateral.
+- Cause: Metal caps each COMPILED kernel's threads per threadgroup by its register use, and
+  on M1/M2 the cap falls (TensorFold measured this kernel at 704, and 448 for its 512-thread
+  build; M3+ grant 1024 to everything). The `mma` kernel ran S=32 simdgroups for n <= 64 and
+  S=16 elsewhere, so 1024 and 512 threads. The latched error was invisible because `log`
+  disables stderr under test, and nothing dropped it before the next test.
+- Fix: S caps at 16; a fresh `mma` plan is evaluated once at creation and on "Thread group
+  size" halves its simdgroups per threadgroup (`mma_sg`, the S chunks walked in the same
+  order, so the bits do not change); any other probe failure declines the shape by name to
+  `rowqmv`. The test prints and drops its own latch.
+- Guard: `simd_qmm: mma over half the simdgroups per threadgroup gives the same bits`;
+  `simd_qmm: a shape whose probe fails on this GPU declines by name and leaves no latch`.

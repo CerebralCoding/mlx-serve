@@ -14,7 +14,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.2, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
+Zig 0.17 (pinned nightly via `scripts/fetch-zig.sh`; brew 0.16 no longer builds); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` d73eb752e = v0.32.2 + the sorted gather_qmm NAX 32K-row fix #3922, `lib/mlxc-src` 56b2d39 = PR #127) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF).
 
 ## Layout (`src/`)
 
@@ -417,6 +417,7 @@ Kernels + numerics:
 - **verifyQmm lanes** (`vqmmLaneForTile`): split-K M 2–7 / wide tile / NAX m16 M 8–16 / shader matmul2d on G16 (4-bit, M 8–24) / crossrow opt-in; plain-SIMD tiles BITS-templated and SHAPE-gated (`mixedPlainShapeEnabled`). M=8 is the plain-SIMD cliff.
 - **A verify lane is never byte-identical to stock**; parity = fp32-dequant truth per width, RMS ratio vs stock ≤ 3.0x, never cosine (`VerifyQmmParity`). 2-bit GEMV accumulates in f32 from exact products (`qmv2.zig`, M 1..8; unmeasured GPU generations keep the old M 1..3 dispatch).
 - **A `metal_kernel` config cache is keyed by FULL SHAPE** (`ShapeKey`); a borrowed-handle cache evicts LRU (`vqmmScalarEvictIndex`). A bandwidth bench smaller than a real step measures CACHE.
+- **Metal caps threads per threadgroup PER COMPILED KERNEL, by register use** (M1/M2: 704 and 448 for `simd_qmm` mma, 1024 for everything on M3+): a kernel above 256 threads probes on its first eval and shrinks simdgroups in the same summation order (`mma_sg`); under test a latched MLX error is invisible and poisons the next tests, so a kernel test drops its own latch.
 - **A diagnostic env goes through `diagEnvOn`** (absent or `0` = off). A default belongs to the engine that MEASURED it.
 - **Kernel testing**: parity = no-worse-than fp32 truth, never kernel-vs-kernel; same-boot A/Bs at per-cell MEDIANS, interleaved in one process; every adopted shape gets its own A/B; content-forking arms need 3+ reps with a NONCE per rep.
 - **QSA** (qwen4): GATHERS selected blocks, never a dense `[S, kv]` mask (`gatherQsa256`, `qsaSparseAttn`, `qsaDecodeGatherAttn`); exact select `msv_qsa_select` (split 16-way at decode, `MLX_SERVE_QSA_SELECT_SPLIT=0`); score sheet one NAX kernel (`msv_qsa_score`, `qsaScoreFusedActiveFor`); verify gather floor per KV scheme (`qsaVerifyGatherMinKvFor`); NAX gather via `qsaNaxEligible` (`MLX_SERVE_QSA_NAX=0`, bar = error vs float64).

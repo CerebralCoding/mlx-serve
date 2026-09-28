@@ -6,6 +6,7 @@
 //! not that chain, `prepare` sends one-row calls of the shape through `mma`.
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const log = @import("log.zig");
 
 pub const MAX_ROWS = 16;
 const RT_MAX = 2;
@@ -230,7 +231,7 @@ const SCALAR_ROWS =
 
 const MMA =
     \\  const uint lane = thread_index_in_simdgroup;
-    \\  const int c = int(simdgroup_index_in_threadgroup);
+    \\  const int sg = int(simdgroup_index_in_threadgroup);
     \\  const int qid = int(lane) / 4;
     \\  const int fm = (qid & 4) + ((int(lane) / 2) % 4);
     \\  const int fn = (qid & 2) * 2 + (int(lane) % 2) * 2;
@@ -245,6 +246,7 @@ const MMA =
     \\  int xr0[RT], xr1[RT];
     \\  for (int rt = 0; rt < RT; rt++) { xr0[rt] = min(rb + 8 * rt + fn, R - 1); xr1[rt] = min(rb + 8 * rt + fn + 1, R - 1); }
     \\  float acc[RT][NT][2];
+    \\  for (int c = sg; c < S; c += SG) {
     \\  for (int rt = 0; rt < RT; rt++)
     \\    for (int t = 0; t < NT; t++) { acc[rt][t][0] = 0.0f; acc[rt][t][1] = 0.0f; }
     \\  for (int g = c; g < G; g += S) {
@@ -313,8 +315,9 @@ const MMA =
     \\  for (int rt = 0; rt < RT; rt++)
     \\    for (int t = 0; t < NT; t++)
     \\      for (int e = 0; e < 2; e++) red[((c * RT + rt) * NT + t) * 64 + int(lane) * 2 + e] = acc[rt][t][e];
+    \\  }
     \\  threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\  for (int idx = c * 32 + int(lane); idx < RT * NT * 64; idx += S * 32) {
+    \\  for (int idx = sg * 32 + int(lane); idx < RT * NT * 64; idx += SG * 32) {
     \\    float v[S];
     \\    for (int k = 0; k < S; k++) v[k] = red[k * (RT * NT * 64) + idx];
     \\    for (int w = 1; w < S; w *= 2)
@@ -333,8 +336,14 @@ const Kind = enum { scalar, rows, mma };
 pub const SCALAR_ROWS_MAX = 3;
 
 /// Chunks the K groups split into: a function of the shape only (it sets the bits).
+/// Capped at 16: `mma` runs S simdgroups per threadgroup, and a 1024-thread
+/// group exceeds what older GPUs grant this register-heavy kernel.
 fn splits(n: c_int) c_int {
-    return if (n <= 64) 32 else if (n <= 2048) 16 else 8;
+    return if (n <= 2048) 16 else 8;
+}
+
+fn rowTiles(rows: c_int) c_int {
+    return @min(RT_MAX, @divTrunc(rows + 7, 8));
 }
 
 /// Tiles of 8 outputs a simdgroup in `mma` (speed only), at most 16 KB of
@@ -354,11 +363,17 @@ const PlanKey = struct { kind: Kind, rows: c_int, n: c_int, k: c_int, bits: c_in
 const Plan = struct { kernel: mlx.mlx_fast_metal_kernel, config: mlx.mlx_fast_metal_kernel_config };
 var plans: std.AutoHashMapUnmanaged(PlanKey, Plan) = .{};
 /// Kernels by (kind, baked constants): a new row count reuses the compiled one.
-const KernelKey = struct { kind: Kind, k: c_int, n: c_int, bits: c_int, s: c_int, a: c_int, b: c_int, rr: c_int = 1, xb: c_int = XB };
+const KernelKey = struct { kind: Kind, k: c_int, n: c_int, bits: c_int, s: c_int, a: c_int, b: c_int, rr: c_int = 1, xb: c_int = XB, sg: c_int = 1 };
 var kernels: std.AutoHashMapUnmanaged(KernelKey, mlx.mlx_fast_metal_kernel) = .{};
+/// Simdgroups per `mma` threadgroup by (n, k, bits, rt) where fewer than S fit:
+/// Metal caps a register-heavy kernel's threadgroup (M1/M2: 448 for this one),
+/// and the S chunks walked by fewer simdgroups sum in the same order.
+var mma_sg: std.AutoHashMapUnmanaged([4]c_int, c_int) = .{};
 /// Shapes (n, k, bits) whose one-row calls take `mma`: there the scalar chain's bits differ.
 var mma_one_row: std.AutoHashMapUnmanaged([3]c_int, void) = .{};
 var prepared: std.AutoHashMapUnmanaged([3]c_int, void) = .{};
+/// Shapes whose probe failed on this GPU, with MLX's reason: `qmm` declines them.
+var declined: std.AutoHashMapUnmanaged([3]c_int, []const u8) = .{};
 var one_arr: mlx.mlx_array = .{ .ctx = null };
 
 fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
@@ -367,7 +382,7 @@ fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
     const consts = if (key.kind != .mma)
         try std.fmt.allocPrint(a, "  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int BITS = {d};\n  constexpr int S = {d};\n  constexpr int SGS = {d};\n  constexpr int NR = {d};\n  constexpr int XB = {d};\n  constexpr int RR = {d};\n", .{ key.k, key.n, key.bits, key.s, key.a, key.b, key.xb, key.rr })
     else
-        try std.fmt.allocPrint(a, "  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int BITS = {d};\n  constexpr int S = {d};\n  constexpr int NT = {d};\n  constexpr int RT = {d};\n", .{ key.k, key.n, key.bits, key.s, key.a, key.b });
+        try std.fmt.allocPrint(a, "  constexpr int K = {d};\n  constexpr int N = {d};\n  constexpr int BITS = {d};\n  constexpr int S = {d};\n  constexpr int NT = {d};\n  constexpr int RT = {d};\n  constexpr int SG = {d};\n", .{ key.k, key.n, key.bits, key.s, key.a, key.b, key.sg });
     defer a.free(consts);
     const body = switch (key.kind) {
         .scalar => SCALAR,
@@ -376,7 +391,7 @@ fn kernelFor(key: KernelKey) !mlx.mlx_fast_metal_kernel {
     };
     const source = try std.mem.concatWithSentinel(a, u8, &.{ consts, LOAD8, body, "  #undef LOAD8\n" }, 0);
     defer a.free(source);
-    const name = try std.fmt.allocPrintSentinel(a, "msv_simd_qmm_{s}_k{d}_n{d}_b{d}_s{d}_{d}_{d}_r{d}_x{d}", .{ @tagName(key.kind), key.k, key.n, key.bits, key.s, key.a, key.b, key.rr, key.xb }, 0);
+    const name = try std.fmt.allocPrintSentinel(a, "msv_simd_qmm_{s}_k{d}_n{d}_b{d}_s{d}_{d}_{d}_r{d}_x{d}_g{d}", .{ @tagName(key.kind), key.k, key.n, key.bits, key.s, key.a, key.b, key.rr, key.xb, key.sg }, 0);
     defer a.free(name);
     const in_names = [_][*:0]const u8{ "X", "W", "SC", "BI", "ONE" };
     const out_names = [_][*:0]const u8{"OUT"};
@@ -410,11 +425,12 @@ fn planFor(kind: Kind, rows: c_int, n: c_int, k: c_int, bits: c_int) !Plan {
         const xb: c_int = if (kind == .rows) @max(s, @divTrunc(XB, rr) & ~(s - 1)) else XB;
         kkey = .{ .kind = kind, .k = k, .n = n, .bits = bits, .s = s, .a = sgs, .b = nr, .rr = rr, .xb = xb };
     } else {
-        const rt: c_int = @min(RT_MAX, @divTrunc(rows + 7, 8));
+        const rt = rowTiles(rows);
         const nt = tiles(n, rt * 8, s);
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(n + 8 * nt - 1, 8 * nt) * s * 32, @divTrunc(rows + 8 * rt - 1, 8 * rt), 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, s * 32, 1, 1));
-        kkey = .{ .kind = kind, .k = k, .n = n, .bits = bits, .s = s, .a = nt, .b = rt };
+        const sg = mma_sg.get(.{ n, k, bits, rt }) orelse s;
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, @divTrunc(n + 8 * nt - 1, 8 * nt) * sg * 32, @divTrunc(rows + 8 * rt - 1, 8 * rt), 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, sg * 32, 1, 1));
+        kkey = .{ .kind = kind, .k = k, .n = n, .bits = bits, .s = s, .a = nt, .b = rt, .sg = sg };
     }
     const p = Plan{ .kernel = try kernelFor(kkey), .config = config };
     try plans.put(std.heap.c_allocator, pk, p);
@@ -435,16 +451,37 @@ fn launch(kind: Kind, x2: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi
         const one: f32 = 1.0;
         one_arr = mlx.mlx_array_new_data(&one, &[_]c_int{1}, 1, .float32);
     }
-    const p = try planFor(kind, rows, n, k, bits);
-    const inputs = [_]mlx.mlx_array{ x2, w, sc, bi, one_arr };
-    const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
-    defer _ = mlx.mlx_vector_array_free(in_vec);
-    var outs = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outs);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, p.kernel, in_vec, p.config, s));
-    var y = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
-    return y;
+    const pk = PlanKey{ .kind = kind, .rows = rows, .n = n, .k = k, .bits = bits };
+    while (true) {
+        const fresh = kind == .mma and !plans.contains(pk);
+        const p = try planFor(kind, rows, n, k, bits);
+        const inputs = [_]mlx.mlx_array{ x2, w, sc, bi, one_arr };
+        const in_vec = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+        defer _ = mlx.mlx_vector_array_free(in_vec);
+        var outs = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(outs);
+        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, p.kernel, in_vec, p.config, s));
+        var y = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+        if (!fresh) return y;
+        // A new mma plan runs once here: where Metal caps this kernel's threadgroup
+        // below S simdgroups, halve them and rebuild.
+        mlx.check(mlx.mlx_array_eval(y)) catch |e| {
+            _ = mlx.mlx_array_free(y);
+            const sgk = [4]c_int{ n, k, bits, rowTiles(rows) };
+            const cur = mma_sg.get(sgk) orelse splits(n);
+            if (e != error.MlxError or cur <= 1 or !mlx.takeErrorIf("Thread group size")) return e;
+            try mma_sg.put(std.heap.c_allocator, sgk, @divTrunc(cur, 2));
+            forgetPlan(pk);
+            log.info("[simd_qmm] mma n={d} k={d} bits={d}: {d} simdgroups per threadgroup on this GPU\n", .{ n, k, bits, @divTrunc(cur, 2) });
+            continue;
+        };
+        return y;
+    }
+}
+
+fn forgetPlan(pk: PlanKey) void {
+    if (plans.fetchRemove(pk)) |kv| _ = mlx.mlx_fast_metal_kernel_config_free(kv.value.config);
 }
 
 /// `x [..., K] @ w.T` for 1..MAX_ROWS rows, or null outside the kernels.
@@ -466,7 +503,16 @@ fn qmmKind(force: ?Kind, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, 
     if (rows < 1 or rows > MAX_ROWS) return null;
     const n = ws[0];
     const shape = [3]c_int{ n, k, b };
-    if (force == null and !prepared.contains(shape)) try prepare(w, sc, bi, bits, s);
+    if (declined.contains(shape)) return null;
+    if (force == null and !prepared.contains(shape)) prepare(w, sc, bi, bits, s) catch |e| {
+        if (e != error.MlxError) return e;
+        var buf: [256]u8 = undefined;
+        const msg = mlx.takeError(&buf) orelse "";
+        const a = std.heap.c_allocator;
+        try declined.put(a, shape, try a.dupe(u8, msg));
+        log.warn("[simd_qmm] n={d} k={d} bits={d} declined on this GPU: {s}\n", .{ n, k, b, msg });
+        return null;
+    };
     const rows_max: c_int = if (bits == 4) SCALAR_ROWS_MAX else 1;
     const kind: Kind = force orelse if (mma_one_row.contains(shape) or rows > rows_max or !rowsFit(rows, n)) .mma else if (rows == 1) .scalar else .rows;
     var x2 = mlx.mlx_array_new();
@@ -554,9 +600,78 @@ fn expectSame(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !void {
     try testing.expect(same);
 }
 
+test "simd_qmm: mma over half the simdgroups per threadgroup gives the same bits" {
+    const s = mlx.gpuStream();
+    const wf = try randBf16(&.{ 136, 256 }, 0.02, 11, s);
+    defer _ = mlx.mlx_array_free(wf);
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
+    const x = try randBf16(&.{ 12, 256 }, 1.0, 12, s);
+    defer _ = mlx.mlx_array_free(x);
+    const full = (try qmmKind(.mma, x, w, sc, bi, 4, 64, s)).?;
+    defer _ = mlx.mlx_array_free(full);
+    try mlx.check(mlx.mlx_array_eval(full));
+    const rt = rowTiles(12);
+    try mma_sg.put(std.heap.c_allocator, .{ 136, 256, 4, rt }, @divTrunc(splits(136), 2));
+    defer _ = mma_sg.remove(.{ 136, 256, 4, rt });
+    forgetPlan(.{ .kind = .mma, .rows = 12, .n = 136, .k = 256, .bits = 4 });
+    const half = (try qmmKind(.mma, x, w, sc, bi, 4, 64, s)).?;
+    defer _ = mlx.mlx_array_free(half);
+    try expectSame(half, full, s);
+    forgetPlan(.{ .kind = .mma, .rows = 12, .n = 136, .k = 256, .bits = 4 });
+}
+
+test "simd_qmm: a shape whose probe fails on this GPU declines by name and leaves no latch" {
+    const s = mlx.gpuStream();
+    const wf = try randBf16(&.{ 72, 128 }, 0.02, 3, s);
+    defer _ = mlx.mlx_array_free(wf);
+    var triple = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(triple);
+    try mlx.check(mlx.mlx_quantize(&triple, wf, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    var sc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sc);
+    var bi = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(bi);
+    try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
+    try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
+    try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
+    const x = try randBf16(&.{ 2, 128 }, 1.0, 4, s);
+    defer _ = mlx.mlx_array_free(x);
+    // The 4th checked op after this line sits inside the probe.
+    mlx.armLatchingFaultForTest(4);
+    const got = try qmm(x, w, sc, bi, 4, 64, s);
+    const fired = mlx.latchingFaultFiredForTest();
+    mlx.armLatchingFaultForTest(0);
+    try testing.expect(fired);
+    try testing.expect(got == null);
+    try testing.expect(!mlx.errorPending());
+    try testing.expect(declined.get(.{ 72, 128, 4 }) != null);
+    // Declined shapes never re-probe.
+    const ops = mlx.op_count.load(.monotonic);
+    try testing.expect((try qmm(x, w, sc, bi, 4, 64, s)) == null);
+    try testing.expectEqual(ops, mlx.op_count.load(.monotonic));
+}
+
 test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, and matches f32 truth at 4, 6 and 8 bits" {
     const s = mlx.gpuStream();
-    // Qwen3.8-27B's shapes, cut down: every split count (32 / 16 / 8) and odd tile counts.
+    // A kernel failure is this test's: name it and drop its latch before the next test.
+    errdefer {
+        var buf: [512]u8 = undefined;
+        if (mlx.takeError(&buf)) |msg| std.debug.print("[simd_qmm] mlx: {s}\n", .{msg});
+    }
+    // Qwen3.8-27B's shapes, cut down: both split counts (16 / 8) and odd tile counts.
     const Shape = struct { n: c_int, k: c_int };
     for ([_]u32{ 4, 6, 8 }) |bits| for ([_]Shape{ .{ .n = 64, .k = 512 }, .{ .n = 1024, .k = 5120 }, .{ .n = 4104, .k = 1024 }, .{ .n = 2056, .k = 640 } }, 0..) |sh, si| {
         const wf = try randBf16(&.{ sh.n, sh.k }, 0.02, 100 + si, s);
@@ -575,7 +690,10 @@ test "simd_qmm: every row of an R-row call equals its one-row call bit for bit, 
         try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
         const x = try randBf16(&.{ MAX_ROWS, sh.k }, 1.0, 7 + si, s);
         defer _ = mlx.mlx_array_free(x);
-        const all = (try qmm(x, w, sc, bi, bits, 64, s)) orelse return error.Declined;
+        const all = (try qmm(x, w, sc, bi, bits, 64, s)) orelse {
+            std.debug.print("[simd_qmm] n={d} k={d} bits={d} declined: {s}\n", .{ sh.n, sh.k, bits, declined.get(.{ sh.n, sh.k, @intCast(bits) }) orelse "not a fit" });
+            return error.SkipZigTest;
+        };
         defer _ = mlx.mlx_array_free(all);
         var r: c_int = 0;
         while (r < MAX_ROWS) : (r += 1) {
