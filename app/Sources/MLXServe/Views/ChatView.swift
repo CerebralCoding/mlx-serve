@@ -1597,7 +1597,7 @@ struct ChatSidebar: View {
                     let displayTitle = ChatSessionTitle.display(title: session.title,
                                                                 agentName: agent?.name)
                     Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
-                        .font(.app(.rowTitle, weight: .medium))
+                        .font(.app(.rowTitle))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                     if let dot = activity.dot(for: session.id, isSelected: isSelected) {
@@ -1718,7 +1718,7 @@ struct ChatSidebar: View {
                     .foregroundStyle(terminalTint(t.phase))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(L10n.text(t.displayName))
-                        .font(.app(.rowTitle, weight: .medium))
+                        .font(.app(.rowTitle))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                     Text((t.workspace as NSString).lastPathComponent)
@@ -1938,13 +1938,10 @@ struct ChatSidebar: View {
             Image(systemName: icon)
                 .font(.app(.rowTitle, weight: .medium))
                 .frame(width: 16)
-            // `rowTitle`, the same role a settings row uses: a sidebar row
-            // names a place, a settings row names a setting, and both were
-            // rendering at 14 while the sidebar's was named `.headline`.
-            // The selected row is already marked by its own background, so the
-            // weight stays the same for every row — size carries the level.
+            // `rowTitle`, regular weight like a native sidebar; the selected
+            // row is marked by its background, not its weight.
             Text(L10n.text(title))
-                .font(.app(.rowTitle, weight: .medium))
+                .font(.app(.rowTitle))
             Spacer(minLength: 4)
             if badge > 0 {
                 Text("\(badge)")

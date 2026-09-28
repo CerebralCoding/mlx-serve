@@ -1,34 +1,14 @@
 import SwiftUI
 import AppKit
 
-/// The app's type ladder: macOS's own text styles, each snapped to a whole even
-/// point and never below `floor`.
+/// The app's type ladder: macOS's own text styles, never below `floor`.
 ///
-/// Fixed on purpose, and the reason is measured rather than stylistic. macOS
-/// has no dynamic type: `NSFont.preferredFont(forTextStyle:)` hands the same
-/// numbers to every user, and `.dynamicTypeSize(_:)` does not move a semantic
-/// font here at all — a `Text` at `.body` renders the same height under
-/// `.xSmall` and under `.accessibility4`, because that environment is an iOS
-/// one. Naming a system style therefore buys ONE VOCABULARY, not scaling, and
-/// the numbers below are where that vocabulary comes from: each system size,
-/// taken once, with the odd steps moved up a point and nothing under 12.
-///
-/// The floor is 12, not 10. Ten was the system's own `caption` size and it is
-/// legal, but it is a size you *can* read rather than one you enjoy reading,
-/// and with a floor that low the smallest step a view could name was the one
-/// nobody wanted — settings prose ended up there by default. Raising the floor
-/// is what stops that from being reachable by accident: the smallest step a
-/// view can name is now one that reads.
-///
-/// Three steps collapse onto each other, and that is the price of even-only
-/// with this floor: `body`/`headline` both land on 14, and `subheadline`,
-/// `callout`, `footnote`, `caption` and `caption2` all land on 12. The names
-/// still differ because the roles differ — a heading is still a heading when
-/// the system's heading grows, and the role table below says which step each
-/// role takes so the collapse is a deliberate choice rather than a drift.
+/// macOS has no dynamic type (`.dynamicTypeSize` does not move a semantic font
+/// here), so the numbers come from this table. They are the platform's, so the
+/// app sits at the same size as Notes or Finder; only the 10pt steps are raised.
 enum AppType {
     /// No text in the app renders smaller than this.
-    static let floor: CGFloat = 12
+    static let floor: CGFloat = 11
 
     /// Every step, with the macOS size it was derived from. The `system` column
     /// is what the ladder is anchored to: `SystemTypeTests` fails when macOS
@@ -37,15 +17,15 @@ enum AppType {
     static let table: [(style: Font.TextStyle, system: CGFloat, pointSize: CGFloat)] = [
         (.largeTitle,  26, 26),
         (.title,       22, 22),
-        (.title2,      17, 18),
-        (.title3,      15, 16),
-        (.headline,    13, 14),
-        (.body,        13, 14),
+        (.title2,      17, 17),
+        (.title3,      15, 15),
+        (.headline,    13, 13),
+        (.body,        13, 13),
         (.callout,     12, 12),
-        (.subheadline, 11, 12),
-        (.footnote,    10, 12),
-        (.caption,     10, 12),
-        (.caption2,    10, 12),
+        (.subheadline, 11, 11),
+        (.footnote,    10, 11),
+        (.caption,     10, 11),
+        (.caption2,    10, 11),
     ]
 
     /// The point size a step renders at.
@@ -53,10 +33,9 @@ enum AppType {
         table.first { $0.style == style }?.pointSize ?? floor
     }
 
-    /// May the app render text at this size? The two rules the ladder keeps:
-    /// whole even points, and never under `floor`.
+    /// May the app render text at this size? Whole points, never under `floor`.
     static func isLegal(_ size: CGFloat) -> Bool {
-        size >= floor && size.truncatingRemainder(dividingBy: 2) == 0
+        size >= floor && size == size.rounded()
     }
 
     /// What a piece of text IS, which is what picks its step. Without this the
@@ -86,11 +65,8 @@ enum AppType {
         var step: Font.TextStyle {
             switch self {
             case .pageTitle:   return .largeTitle
-            // 16, not `.headline`(14): seventeen sheet and section headings in
-            // this app already sit at `.title3`, and a pane column's title in
-            // the toolbar cannot render SMALLER than the section headings
-            // underneath it. The role table follows the code, not the other
-            // way round.
+            // `.title3`, not `.headline`: seventeen sheet and section headings
+            // already sit there, and a pane title cannot be smaller than them.
             case .sectionTitle: return .title3
             case .rowTitle:    return .body
             case .explainer:   return .callout

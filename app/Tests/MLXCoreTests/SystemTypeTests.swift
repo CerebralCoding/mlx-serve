@@ -3,8 +3,8 @@ import SwiftUI
 import XCTest
 @testable import MLXCore
 
-/// One ladder for the app's text: the system's own styles, snapped to whole
-/// even points, never under 10, reached only through `Font.app(_:)`.
+/// One ladder for the app's text: the system's own styles, never under the
+/// floor, reached only through `Font.app(_:)`.
 ///
 /// Why a ladder and not the system styles themselves: macOS has no dynamic
 /// type. `NSFont.preferredFont(forTextStyle:)` hands every user the same
@@ -22,39 +22,33 @@ final class SystemTypeTests: XCTestCase {
 
     // MARK: - The ladder
 
-    /// The two rules the ladder exists to keep: whole even points, never under
-    /// the floor. Whatever a view renders has to pass both.
-    func testEveryStepIsEvenAndNeverBelowTheFloor() {
+    /// The two rules the ladder exists to keep: whole points, never under the
+    /// floor. Whatever a view renders has to pass both.
+    func testEveryStepIsWholeAndNeverBelowTheFloor() {
         XCTAssertEqual(AppType.table.count, 11, "a step was added without saying so here")
         for step in AppType.table {
             XCTAssertTrue(
                 AppType.isLegal(step.pointSize),
-                "\(step.style) is \(step.pointSize): sizes are whole even points, at least \(AppType.floor)"
+                "\(step.style) is \(step.pointSize): sizes are whole points, at least \(AppType.floor)"
             )
         }
-        // The rule has teeth: an odd size and one under the floor both fail.
-        XCTAssertFalse(AppType.isLegal(11), "odd")
+        XCTAssertFalse(AppType.isLegal(12.5), "fractional")
         XCTAssertFalse(AppType.isLegal(8), "under the floor")
         XCTAssertTrue(AppType.isLegal(AppType.floor), "the floor itself is legal")
     }
 
     /// The ladder is anchored to the platform, not to taste: each step is the
-    /// system's size for the style it names, rounded up to an even point and
-    /// floored. When macOS moves one this fails — which is the signal to
+    /// system's size for the style it names, floored. When macOS moves one this fails — which is the signal to
     /// re-derive `AppType.table`, not to let the app drift on its own.
     func testEveryStepIsTheSystemStyleItNames() {
         for step in AppType.table {
             let live = NSFont.preferredFont(forTextStyle: appKitStyle(for: step.style)).pointSize
             XCTAssertEqual(live, step.system, accuracy: 0.01, """
                 macOS now renders this style at \(live)pt; AppType.table says \(step.system). \
-                Re-derive the ladder: odd steps up one, floor \(AppType.floor).
+                Re-derive the ladder: the system size, floor \(AppType.floor).
                 """)
-
-            var expected = live
-            if expected.truncatingRemainder(dividingBy: 2) != 0 { expected += 1 }
-            expected = max(expected, AppType.floor)
-            XCTAssertEqual(step.pointSize, expected, accuracy: 0.01,
-                           "\(step.style): \(step.pointSize) is not the system's \(live)pt snapped")
+            XCTAssertEqual(step.pointSize, max(live, AppType.floor), accuracy: 0.01,
+                           "\(step.style): \(step.pointSize) is not the system's \(live)pt floored")
         }
     }
 
@@ -88,34 +82,20 @@ final class SystemTypeTests: XCTestCase {
 
     // MARK: - The floor, and the roles that sit on it
 
-    /// The ladder only ever makes text BIGGER, and it does it by ADDING one.
-    /// This is the whole point of the rule: text that is hard to read is the
-    /// defect the ladder exists to fix, so a step that renders SMALLER than the
-    /// macOS size it was derived from is the rule working backwards. The even
-    /// snap is `13 -> 14`, never `13 -> 12`, and an even system size is left
-    /// alone rather than nudged up again.
-    func testTheLadderOnlyEverMakesTextBigger() {
-        for step in AppType.table {
-            XCTAssertGreaterThanOrEqual(
-                step.pointSize, step.system,
-                "\(step.style) renders \(step.pointSize)pt from the system's \(step.system)pt — the ladder may round a step up, never down")
-            if Int(step.system) % 2 == 1 {
-                XCTAssertEqual(
-                    step.pointSize, step.system + 1,
-                    "\(step.style) is an odd step (\(step.system)); it moves up one, it does not come down")
-            }
+    /// macOS's own sizes are the ladder; only what sits under the floor moves.
+    func testTheLadderMatchesMacOSAboveTheFloor() {
+        for step in AppType.table where step.system >= AppType.floor {
+            XCTAssertEqual(step.pointSize, step.system,
+                           "\(step.style) renders \(step.pointSize)pt, macOS says \(step.system)pt")
         }
-        XCTAssertGreaterThanOrEqual(
-            AppType.floor, 10,
-            "the floor may rise for readability; lowering it puts small text back")
+        XCTAssertEqual(AppType.pointSize(for: .body), 13, "body is 13 on macOS, like Notes and Finder")
     }
 
-
     func testTheFloorIsTheSmallestTextTheAppIsAllowedToRender() {
-        XCTAssertEqual(AppType.floor, 12, "a 10pt explainer is readable, not pleasant to read")
-        XCTAssertFalse(AppType.isLegal(10), "10 is under the floor now")
-        XCTAssertTrue(AppType.isLegal(12))
-        XCTAssertFalse(AppType.isLegal(13), "odd sizes still go up one")
+        XCTAssertEqual(AppType.floor, 11, "10pt captions are raised, nothing else moves")
+        XCTAssertFalse(AppType.isLegal(10))
+        XCTAssertTrue(AppType.isLegal(11))
+        XCTAssertTrue(AppType.isLegal(13))
     }
 
     func testEveryRoleLandsOnARealStep() {
