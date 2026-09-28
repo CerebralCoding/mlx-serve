@@ -451,6 +451,204 @@ pub fn step(g: Geometry, in: Inputs, s: mlx.mlx_stream) !?Outputs {
 pub const RecurSeq = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_state: mlx.mlx_array, state_seq: mlx.mlx_array };
 
 pub const MAX_SEQ: c_int = 8;
+pub const MAX_TREE: c_int = 16;
+
+pub fn treeReplayEnabled() bool {
+    // Memory wins are established; a small decode cost remains on M5 Max.
+    // Keep the original capture default until replay also clears that bar.
+    const raw = std.c.getenv("MLX_SERVE_DFLASH_TREE_REPLAY") orelse return false;
+    return !std.mem.eql(u8, std.mem.span(raw), "0");
+}
+
+// Tree verification stores only row-local prework. The recurrence's branch
+// states are private to a GPU thread; the accepted path is replayed at commit.
+// Keep the exact casts/reductions of K1S: bf16 state rounds at EVERY step.
+const TREE_PRE_SOURCE =
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint sg = simdgroup_index_in_threadgroup;
+    \\uint hv = threadgroup_position_in_grid.x;
+    \\uint hk = hv / (HV / HK);
+    \\for (int t = 0; t < TL; ++t) {
+    \\  uint dst = (t * HV + hv) * 386;
+    \\  if (sg < 3) {
+    \\    uint cb = sg == 0 ? hk * 128 : (sg == 1 ? HK * 128 + hk * 128 : 2 * HK * 128 + hv * 128);
+    \\    T act[4]; float sumsq = 0.0f;
+    \\    for (int i = 0; i < 4; ++i) {
+    \\      uint ch = cb + lane * 4 + i;
+    \\      float acc = 0.0f;
+    \\      for (int tap = 0; tap < 4; ++tap) {
+    \\        int w = parents[TL + t * 4 + tap];
+    \\        T xv = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
+    \\        acc += float(xv) * float(conv_w[ch * 4 + tap]);
+    \\      }
+    \\      T conv = T(acc);
+    \\      T sy = T(1) / (T(1) + metal::exp(metal::abs(conv))); T sig = conv < T(0) ? sy : T(1) - sy;
+    \\      act[i] = conv * sig;
+    \\      float v = float(act[i]); sumsq += v * v;
+    \\    }
+    \\    if (sg < 2) {
+    \\      sumsq = simd_sum(sumsq);
+    \\      float inv = metal::precise::rsqrt(sumsq / 128.0f + 1e-6f);
+    \\      T scale = sg == 0 ? q_scale : k_scale;
+    \\      for (int i = 0; i < 4; ++i) pre[dst + sg * 128 + lane * 4 + i] = scale * T(1) * T(float(act[i]) * inv);
+    \\    } else {
+    \\      for (int i = 0; i < 4; ++i) pre[dst + 256 + lane * 4 + i] = act[i];
+    \\    }
+    \\  }
+    \\  if (sg == 3 && lane == 31) {
+    \\    T bv = b_in[t * HV + hv];
+    \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
+    \\    T apd = T(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
+    \\    float sp = msv_log1p(metal::precise::exp(float(apd)));
+    \\    float ea = metal::precise::exp(float(A_log[hv]));
+    \\    pre[dst + 384] = T(metal::precise::exp(-(ea * sp)));
+    \\    pre[dst + 385] = bsig;
+    \\  }
+    \\}
+;
+
+const TREE_RECUR_SOURCE =
+    \\uint lane = thread_index_in_simdgroup;
+    \\uint dv = threadgroup_position_in_grid.y * 4 + simdgroup_index_in_threadgroup;
+    \\uint hv = threadgroup_position_in_grid.z;
+    \\uint sb = (hv * 128 + dv) * 128 + lane * 4;
+    \\float initial[4], st[4];
+    \\float states[REPLAY ? 1 : TL][4];
+    \\for (int i = 0; i < 4; ++i) { initial[i] = float(state_in[sb + i]); st[i] = initial[i]; }
+    \\for (int step = 0; step < COUNT; ++step) {
+    \\  int t = REPLAY ? int(rows[step]) : step;
+    \\  if (!REPLAY) {
+    \\    int p = rows[t];
+    \\    for (int i = 0; i < 4; ++i) st[i] = p < 0 ? initial[i] : states[p][i];
+    \\  }
+    \\  uint base = (t * HV + hv) * 386;
+    \\  float g = float(pre[base + 384]), beta = float(pre[base + 385]);
+    \\  float kk[4], qq[4], kv_mem = 0.0f;
+    \\  for (int i = 0; i < 4; ++i) {
+    \\    kk[i] = float(pre[base + 128 + lane * 4 + i]); qq[i] = float(pre[base + lane * 4 + i]);
+    \\    st[i] = st[i] * g; kv_mem += st[i] * kk[i];
+    \\  }
+    \\  kv_mem = simd_sum(kv_mem);
+    \\  float delta = (float(pre[base + 256 + dv]) - kv_mem) * beta;
+    \\  float out = 0.0f;
+    \\  for (int i = 0; i < 4; ++i) { st[i] = st[i] + kk[i] * delta; out += st[i] * qq[i]; }
+    \\  out = simd_sum(out);
+    \\  if (!REPLAY && lane == 0) y[(t * HV + hv) * 128 + dv] = T(out);
+    \\  for (int i = 0; i < 4; ++i) {
+    \\    st[i] = float(StT(st[i]));
+    \\    if (!REPLAY) states[t][i] = st[i];
+    \\  }
+    \\}
+    \\if (REPLAY) for (int i = 0; i < 4; ++i) state_out[sb + i] = StT(st[i]);
+;
+
+pub const TreeRecord = struct {
+    pre: mlx.mlx_array,
+    initial: mlx.mlx_array,
+
+    pub fn deinit(self: TreeRecord) void {
+        _ = mlx.mlx_array_free(self.pre);
+        _ = mlx.mlx_array_free(self.initial);
+    }
+};
+pub const TreeOutput = struct { y: mlx.mlx_array, record: TreeRecord };
+var tree_pre_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var tree_recur_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const TreeRecurKey = struct { hv: c_int, width: c_int, count: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype };
+var tree_recur_keys: [2]?TreeRecurKey = @splat(null);
+var tree_recur_cfgs: [2]?mlx.mlx_fast_metal_kernel_config = @splat(null);
+const TreePreKey = struct { g: Geometry, width: c_int, dt: mlx.mlx_dtype };
+var tree_pre_key: ?TreePreKey = null;
+var tree_pre_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+
+fn treeRecurrence(record: TreeRecord, rows: mlx.mlx_array, count: c_int, replay: bool, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sh = mlx.getShape(record.pre);
+    const width = sh[0];
+    const hv = sh[1];
+    if (tree_recur_kernel == null) tree_recur_kernel = try makeKernel("msv_gdn_tree_replay", &.{ "pre", "state_in", "rows" }, &.{ "y", "state_out" }, TREE_RECUR_SOURCE, "");
+    const dt = mlx.mlx_array_dtype(record.pre);
+    const st = mlx.mlx_array_dtype(record.initial);
+    const slot: usize = @intFromBool(replay);
+    const key = TreeRecurKey{ .hv = hv, .width = width, .count = count, .dt = dt, .st = st };
+    if (tree_recur_keys[slot] == null or !std.meta.eql(tree_recur_keys[slot].?, key)) {
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        const dummy_shape = [_]c_int{1};
+        const y_shape = [_]c_int{ 1, width, hv, 128 };
+        const state_shape = [_]c_int{ 1, hv, 128, 128 };
+        const ys: []const c_int = if (replay) &dummy_shape else &y_shape;
+        const ss: []const c_int = if (replay) &state_shape else &dummy_shape;
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, ys.ptr, ys.len, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, ss.ptr, ss.len, st));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128, 32, hv));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
+        inline for (.{ .{ "HV", hv }, .{ "TL", width }, .{ "COUNT", count }, .{ "REPLAY", @as(c_int, @intFromBool(replay)) } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+        if (tree_recur_cfgs[slot]) |old| _ = mlx.mlx_fast_metal_kernel_config_free(old);
+        tree_recur_cfgs[slot] = cfg;
+        tree_recur_keys[slot] = key;
+    }
+    const inputs = [_]mlx.mlx_array{ record.pre, record.initial, rows };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, tree_recur_kernel.?, iv, tree_recur_cfgs[slot].?, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, ov, if (replay) 1 else 0));
+    return out;
+}
+
+/// Tree verification without a [T,Hv,Dv,Dk] device capture. No cache mutation.
+pub fn recurTree(g: Geometry, width: c_int, in: Inputs, parents: mlx.mlx_array, s: mlx.mlx_stream) !?TreeOutput {
+    if (!mlx.streamIsGpu(s) or width < 1 or width > MAX_TREE or g.dk != 128 or g.dv != 128 or g.hk <= 0 or g.hv <= 0 or @rem(g.hv, g.hk) != 0) return null;
+    const dt = mlx.mlx_array_dtype(in.qkv);
+    const st = mlx.mlx_array_dtype(in.ssm_state);
+    if ((dt != .bfloat16 and dt != .float16) or (st != dt and st != .float32)) return null;
+    for ([_]mlx.mlx_array{ in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale }) |a|
+        if (mlx.mlx_array_dtype(a) != dt) return null;
+    if (!inputsFit(g, width, in, false) or !sizeIs(parents, 5 * width) or mlx.mlx_array_dtype(parents) != .int32) return null;
+    if (tree_pre_kernel == null) tree_pre_kernel = try makeKernel("msv_gdn_tree_pre", &.{ "qkv", "a_in", "b_in", "conv_state", "conv_w", "A_log", "dt_bias", "q_scale", "k_scale", "parents" }, &.{"pre"}, TREE_PRE_SOURCE, HEADER);
+    const key = TreePreKey{ .g = g, .width = width, .dt = dt };
+    if (tree_pre_key == null or !std.meta.eql(tree_pre_key.?, key)) {
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ width, g.hv, 386 }, 3, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * g.hv, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+        inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "TL", width }, .{ "C", 2 * g.hk * 128 + g.hv * 128 } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+        if (tree_pre_cfg) |old| _ = mlx.mlx_fast_metal_kernel_config_free(old);
+        tree_pre_cfg = cfg;
+        tree_pre_key = key;
+    }
+    const inputs = [_]mlx.mlx_array{ in.qkv, in.a, in.b, in.conv_state, in.conv_w, in.A_log, in.dt_bias, in.q_scale, in.k_scale, parents };
+    const iv = mlx.mlx_vector_array_new_data(&inputs, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(iv);
+    var ov = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(ov);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&ov, tree_pre_kernel.?, iv, tree_pre_cfg.?, s));
+    var record = TreeRecord{ .pre = mlx.mlx_array_new(), .initial = mlx.mlx_array_new() };
+    errdefer record.deinit();
+    try mlx.check(mlx.mlx_vector_array_get(&record.pre, ov, 0));
+    try mlx.check(mlx.mlx_array_set(&record.initial, in.ssm_state));
+    return .{ .y = try treeRecurrence(record, parents, width, false, s), .record = record };
+}
+
+/// Replay already computed prework, rounding to the original state dtype at
+/// each accepted step. The returned state owns a compact allocation.
+pub fn replayTree(record: TreeRecord, path: []const u32, s: mlx.mlx_stream) !mlx.mlx_array {
+    const width: u32 = @intCast(mlx.getShape(record.pre)[0]);
+    if (path.len == 0 or path.len > width or path[0] != 0) return error.InvalidTreePath;
+    for (path, 0..) |r, i| if (r >= width or (i > 0 and r <= path[i - 1])) return error.InvalidTreePath;
+    const rows = mlx.mlx_array_new_data(path.ptr, &[_]c_int{@intCast(path.len)}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(rows);
+    return treeRecurrence(record, rows, @intCast(path.len), true, s);
+}
 var k1s_cache: ?mlx.mlx_fast_metal_kernel = null;
 var seq_cfgs: [MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 var seq_cfg_key: ?CfgKey = null;

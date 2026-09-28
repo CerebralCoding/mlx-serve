@@ -8613,6 +8613,8 @@ pub const SSMCacheEntry = struct {
     /// re-running it for the accepted prefix is pure waste. Null outside a
     /// capturing verify; freed at the end of every `nextPld` round.
     spec_state_seq: mlx.mlx_array = .{ .ctx = null },
+    /// DFlash trees retain row-local prework and replay the accepted path.
+    spec_tree_replay: ?gdn_decode.TreeRecord = null,
     /// PLD spec-decode capture: the conv1d input `[B, (kernel-1)+T, conv_dim]`
     /// of the verify forward, so the accepted-position `conv_state` is just a
     /// slice (no re-forward). Null outside capture.
@@ -9226,6 +9228,10 @@ pub fn ssmRestore(dst: *SSMCacheEntry, snap: *const SSMCacheEntrySnapshot) !void
 /// entry that never captured. Called at the end of every `nextPld` round and
 /// in the cache teardown paths so the capture never outlives a round.
 pub fn ssmFreeSpecCapture(entry: *SSMCacheEntry) void {
+    if (entry.spec_tree_replay) |record| {
+        record.deinit();
+        entry.spec_tree_replay = null;
+    }
     if (entry.spec_state_seq.ctx != null) {
         _ = mlx.mlx_array_free(entry.spec_state_seq);
         entry.spec_state_seq = .{ .ctx = null };
@@ -9321,8 +9327,13 @@ fn splitSpecCaptures(s: mlx.mlx_stream, m: *const SSMCacheEntry, e: *SSMCacheEnt
 /// `state_row` (every row's state is captured in tree mode) and the conv
 /// state from the capture's conv-input rows `conv_rows` (0..2 the pre-verify
 /// conv state, 3 + r window row r).
-pub fn ssmCommitTreePath(entry: *SSMCacheEntry, state_row: u32, conv_rows: [3]i32, s: mlx.mlx_stream) !void {
-    if (entry.spec_state_seq.ctx != null) {
+pub fn ssmCommitTreePath(entry: *SSMCacheEntry, path: []const u32, conv_rows: [3]i32, s: mlx.mlx_stream) !void {
+    if (entry.spec_tree_replay) |record| {
+        const state = try gdn_decode.replayTree(record, path, s);
+        _ = mlx.mlx_array_free(entry.ssm_state);
+        entry.ssm_state = state;
+    } else if (entry.spec_state_seq.ctx != null) {
+        const state_row = path[path.len - 1];
         const sh = mlx.getShape(entry.spec_state_seq); // [T, B, Hv, Dv, Dk]
         const r: c_int = @intCast(state_row);
         var row = mlx.mlx_array_new();
@@ -16117,6 +16128,8 @@ pub const Transformer = struct {
     /// two measured widths. Lives on the model, not the request — a request
     /// spans only its own max_tokens. Inference thread only.
     round_cost: round_cost_mod.Table = .{},
+    // Greedy and keyed sampling have different verify costs.
+    dflash_tree_cost: [2]@import("dflash_tree.zig").Costs = @splat(.{}),
     mtp_group_cost: group_cost_mod.Table = .{},
     cost_trace_active: bool = false,
     cost_attention: u8 = 0,
@@ -25224,7 +25237,9 @@ pub const Transformer = struct {
 
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and ((layer_idx + 1) % moe_eval_cadence == 0 or layer_idx + 1 == layerCap(cfg.num_hidden_layers))) {
                 try evalCadencePoint(h, ctx.ssm_entries);
-            } else if (ctx.pipeline_build > 0 and (layer_idx + 1) % ctx.pipeline_build == 0 and layer_idx + 1 < n_layers) {
+            } else if (ctx.pipeline_build > 0 and ((layer_idx + 1) % ctx.pipeline_build == 0 or
+                (layer_idx == 0 and ctx.tree != null and std.c.getenv("MLX_SERVE_DFLASH_PIPELINE") != null)) and layer_idx + 1 < n_layers)
+            {
                 const v = mlx.mlx_vector_array_new_value(h);
                 defer _ = mlx.mlx_vector_array_free(v);
                 try mlx.check(mlx.mlx_async_eval(v));
@@ -28777,10 +28792,10 @@ pub const Transformer = struct {
         const kernel: c_int = @intCast(cfg.linear_conv_kernel_dim);
 
         // Projections: combined (qkvz+ba) or separate (qkv+z+a+b)
-        var qkv: mlx.mlx_array = undefined;
-        var z_proj: mlx.mlx_array = undefined;
-        var a_proj: mlx.mlx_array = undefined;
-        var b_proj: mlx.mlx_array = undefined;
+        var qkv: mlx.mlx_array = .{ .ctx = null };
+        var z_proj: mlx.mlx_array = .{ .ctx = null };
+        var a_proj: mlx.mlx_array = .{ .ctx = null };
+        var b_proj: mlx.mlx_array = .{ .ctx = null };
         defer _ = mlx.mlx_array_free(qkv);
         defer _ = mlx.mlx_array_free(z_proj);
         defer _ = mlx.mlx_array_free(a_proj);
@@ -28960,6 +28975,46 @@ pub const Transformer = struct {
             }
             return if (skip_output) standinRef(flat) else self.qmatmul(flat, la.out_w, la.out_s, la.out_b);
         }
+
+        // Trees retain compact prework, not a full recurrent state per node.
+        if (gdn_decode.treeReplayEnabled()) if (self.spec_tree) |tree| {
+            if (self.rht != null or batch != 1 or projected != null or !self.spec_capture_ssm or
+                !ssm.initialized or kernel != 4 or cfg.kda_vector_gate or cfg.kdaUsesBoundedGate()) return error.SpecTreeUnsupported;
+            if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
+            const geo = gdn_decode.Geometry{ .hk = num_k_heads, .hv = num_v_heads, .dk = dk, .dv = dv };
+            const out = (try gdn_decode.recurTree(geo, seq_len, .{
+                .qkv = qkv,
+                .z = z_proj,
+                .a = a_proj,
+                .b = b_proj,
+                .conv_state = ssm.conv_state,
+                .ssm_state = ssm.ssm_state,
+                .conv_w = la.conv1d_w,
+                .A_log = la.A_log,
+                .dt_bias = la.dt_bias,
+                .q_scale = inv_scale_sq,
+                .k_scale = inv_sqrt_sc,
+                .norm_w = la.norm_w,
+                .eps = self.gdn_eps.?,
+                .signs = .{ .ctx = null },
+            }, tree.parents, self.s)) orelse return error.SpecTreeUnsupported;
+            defer _ = mlx.mlx_array_free(out.y);
+            errdefer out.record.deinit();
+            const flat = (try gdnTreeNormGateFused(self.s, out.y, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, 1, seq_len)) orelse return error.SpecTreeUnsupported;
+            defer _ = mlx.mlx_array_free(flat);
+            var conv_input = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(conv_input);
+            const arr = [_]mlx.mlx_array{ ssm.conv_state, qkv };
+            const vec = mlx.mlx_vector_array_new_data(&arr, arr.len);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            try mlx.check(mlx.mlx_concatenate_axis(&conv_input, vec, 1, self.s));
+            // Build the output before transferring capture ownership to the cache.
+            const result = if (skip_output) try standinRef(flat) else try self.qmatmul(flat, la.out_w, la.out_s, la.out_b);
+            ssmFreeSpecCapture(ssm);
+            ssm.spec_conv_input = conv_input;
+            ssm.spec_tree_replay = out.record;
+            return result;
+        };
 
         // MTP verify rows (spec capture, 2 <= S <= 8): the same kernel over S
         // tokens with the per-step state capture rollback reads, then the norm-gate.
@@ -29537,8 +29592,19 @@ pub const Transformer = struct {
         defer _ = mlx.mlx_array_free(gate);
         var up = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(up);
-        if (dw.gu.w.ctx != null and rows <= FUSED_ROWS_MAX_M) {
-            const both = try self.qmatmul(x, dw.gu.w, dw.gu.s, dw.gu.b);
+        // The NAX split count depends on N. Use the same joined matrix for
+        // one-row and tree calls so verification keeps the serial arithmetic.
+        var joined: ?mlx.mlx_array = null;
+        if (dw.gu.w.ctx != null and rows <= 16 and dflashNaxTarget(&self.config) and dw.gu.count == 2 and dw.gu.widths[0] == dw.gu.widths[1]) {
+            const qp = quantParamsOrDense(&self.config, dw.gu.w, dw.gu.s, lastDim(x));
+            if (qp.mode == .affine)
+                joined = try @import("dflash_nax.zig").qmmWithSplitColumns(x, dw.gu.w, dw.gu.s, dw.gu.b, qp.bits, qp.group_size, dw.gu.widths[0], self.s);
+        }
+        // A declined native kernel retains main's original fusion envelope,
+        // including other quantization widths and mixed-precision layers.
+        if (joined == null and dw.gu.w.ctx != null and rows <= FUSED_ROWS_MAX_M)
+            joined = try self.qmatmul(x, dw.gu.w, dw.gu.s, dw.gu.b);
+        if (joined) |both| {
             defer _ = mlx.mlx_array_free(both);
             try dw.gu.part(&gate, both, 0, self.s);
             try dw.gu.part(&up, both, 1, self.s);
@@ -33384,8 +33450,19 @@ fn quantParamsOrDense(cfg: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_arr
 /// A row-exact 4/6/8-bit matmul: Nemotron-H's thin MoE trunk streams faster
 /// through `rowqmv`'s per-row matvecs, the dense Qwen3.8 through `simd_qmm`,
 /// whose multi-row MMA reads each weight once. Null outside both.
+fn dflashNaxTarget(cfg: *const ModelConfig) bool {
+    // Experimental dispatch is scoped to the Qwen 27B target being validated.
+    // Other families may have additional width-dependent projection fusions.
+    return cfg.hidden_size == 5120 and cfg.num_hidden_layers == 64 and
+        cfg.rowExactDecode() and @import("dflash_nax.zig").enabled() and verifyQmmNaxAvailable();
+}
+
 fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!std.mem.eql(u8, cfg.model_type, "nemotron_h")) {
+        const dflash_nax = @import("dflash_nax.zig");
+        if (dflashNaxTarget(cfg)) {
+            if (try dflash_nax.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
+        }
         if (try simd_qmm.qmm(x, w, sc, bi, bits, group_size, s)) |y| return y;
     }
     return rowqmv.qmv(x, w, sc, bi, bits, group_size, s);
@@ -36274,6 +36351,26 @@ fn getGdnNormGateKernel() !mlx.mlx_fast_metal_kernel {
 /// `rms_norm(y) * silu(z)` flattened to [B, S, Hv*Dv]. Null → composed chain.
 pub fn gdnNormGateFused(
     s: mlx.mlx_stream,
+    y: mlx.mlx_array,
+    z: mlx.mlx_array,
+    z_off: c_int,
+    z_stride: c_int,
+    norm_w: mlx.mlx_array,
+    eps: mlx.mlx_array,
+    swish: bool,
+    hv: c_int,
+    dv: c_int,
+    batch: c_int,
+    seq: c_int,
+) !?mlx.mlx_array {
+    // Preserve main's eligibility for every existing caller. Only tree replay
+    // opts into the additional verification rows below.
+    if (!gdnPrefillFusedFor(seq, batch) and seq > 9) return null;
+    return gdnTreeNormGateFused(s, y, z, z_off, z_stride, norm_w, eps, swish, hv, dv, batch, seq);
+}
+
+fn gdnTreeNormGateFused(
+    s: mlx.mlx_stream,
     y: mlx.mlx_array, // [B, S, Hv, Dv] bf16
     z: mlx.mlx_array, // rows of [.. ZOFF + Hv*Dv ..] bf16
     z_off: c_int,
@@ -36289,7 +36386,7 @@ pub fn gdnNormGateFused(
     if (dv != 128) return null;
     const prefill = gdnPrefillFusedFor(seq, batch);
     if (!prefill and !gdnDecodeFusedEnabled()) return null;
-    if (!prefill and (seq < 1 or seq > 9 or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
+    if (!prefill and (seq < 1 or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
     const dt = mlx.mlx_array_dtype(y);
     inline for (.{ y, z, norm_w }, 0..) |arr, i| {
         if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(arr) != dt) {
@@ -38107,7 +38204,7 @@ var gate_mul_cfg_key: [3]GateMulCfgKey = @splat(std.mem.zeroes(GateMulCfgKey));
 var gate_mul_engaged: [3]bool = @splat(false);
 
 fn getGateMulKernel(kind: GateMulKind) !mlx.mlx_fast_metal_kernel {
-    const k: usize = @intFromEnum(kind);
+    const k: usize = @backingInt(kind);
     if (gate_mul_kernels[k]) |kr| return kr;
     const input_names = [_][*:0]const u8{ "gate", "up", "sigtab", "N_size" };
     const output_names = [_][*:0]const u8{"y"};
@@ -38155,7 +38252,7 @@ fn tableGateMul(s: mlx.mlx_stream, kind: GateMulKind, gate: mlx.mlx_array, up: m
     }
     if (n <= 0 or n > std.math.maxInt(c_int)) return null;
     const ni: c_int = @intCast(n);
-    const k: usize = @intFromEnum(kind);
+    const k: usize = @backingInt(kind);
 
     const tg: c_int = @min(@as(c_int, 256), @max(@as(c_int, 32), @divTrunc(ni + 31, 32) * 32));
     const key = GateMulCfgKey{ .shape = ShapeKey.from(gsh), .dtype = dt };
@@ -52769,6 +52866,86 @@ test "mixedPlainShapeEnabled: adoption is what was MEASURED, per width and per s
     for ([_]u32{ 2, 3, 7 }) |b| try t.expect(!mixedPlainShapeEnabled(b, 64, 17408));
 }
 
+test "DFlash uint4 NAX: row invariant and no worse than stock at target shapes" {
+    if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xDF1A5);
+    const rnd = prng.random();
+    for ([_][3]c_int{ .{ 5120, 34816, 64 }, .{ 17408, 5120, 64 }, .{ 5120, 1024, 32 } }) |cs| {
+        const k = cs[0];
+        const n = cs[1];
+        const gs = cs[2];
+        const wb = try testRandWeightBf16(rnd, &[_]c_int{ n, k }, s);
+        defer _ = mlx.mlx_array_free(wb);
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", .{}, s));
+        var w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w);
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        var bi = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bi);
+        try mlx.check(mlx.mlx_vector_array_get(&w, triple, 0));
+        try mlx.check(mlx.mlx_vector_array_get(&sc, triple, 1));
+        try mlx.check(mlx.mlx_vector_array_get(&bi, triple, 2));
+        var dq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dq);
+        try mlx.check(mlx.mlx_dequantize(&dq, w, sc, bi, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(4), "affine", .{ .ctx = null }, .{ .has_value = true, .value = .float32 }, s));
+        var dqt = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(dqt);
+        try mlx.check(mlx.mlx_transpose_axes(&dqt, dq, &[_]c_int{ 1, 0 }, 2, s));
+        const x = try attn256RandBf16(rnd, &[_]c_int{ 1, 16, k }, s);
+        defer _ = mlx.mlx_array_free(x);
+        for ([_]c_int{ 1, 2, 5, 8, 12, 16 }) |m| {
+            var xm = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xm);
+            try mlx.check(mlx.mlx_slice(&xm, x, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, m, k }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            const split_columns: ?c_int = if (n == 34816) 17408 else null;
+            const y = (try @import("dflash_nax.zig").qmmWithSplitColumns(xm, w, sc, bi, 4, @intCast(gs), split_columns, s)) orelse return error.KernelDeclined;
+            defer _ = mlx.mlx_array_free(y);
+            const narrow = (try @import("dflash_nax.zig").qmmWithTile(xm, w, sc, bi, 4, @intCast(gs), split_columns, 16, s)).?;
+            defer _ = mlx.mlx_array_free(narrow);
+            try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(y, narrow, s));
+            if (split_columns != null) {
+                const widths = [_]c_int{ 17408, 17408 };
+                var lo: c_int = 0;
+                for (widths) |half| {
+                    var sliced: [3]mlx.mlx_array = @splat(.{ .ctx = null });
+                    defer for (sliced) |a| {
+                        _ = mlx.mlx_array_free(a);
+                    };
+                    for ([_]mlx.mlx_array{ w, sc, bi }, &sliced) |a, *o| {
+                        const cols = mlx.getShape(a)[1];
+                        o.* = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_slice(o, a, &[_]c_int{ lo, 0 }, 2, &[_]c_int{ lo + half, cols }, 2, &[_]c_int{ 1, 1 }, 2, s));
+                    }
+                    const apart = (try @import("dflash_nax.zig").qmmWithSplitColumns(xm, sliced[0], sliced[1], sliced[2], 4, @intCast(gs), null, s)).?;
+                    defer _ = mlx.mlx_array_free(apart);
+                    var joined_part = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(joined_part);
+                    try mlx.check(mlx.mlx_slice(&joined_part, y, &[_]c_int{ 0, 0, lo }, 3, &[_]c_int{ 1, m, lo + half }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+                    try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(apart, joined_part, s));
+                    lo += half;
+                }
+            }
+            try expectVerifyQmmNoWorseThanStock(s, xm, w, sc, bi, 4, @intCast(gs), dqt, y, "DFlash native uint4");
+            var r: c_int = 0;
+            while (r < m) : (r += 1) {
+                var xr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(xr);
+                try mlx.check(mlx.mlx_slice(&xr, xm, &[_]c_int{ 0, r, 0 }, 3, &[_]c_int{ 1, r + 1, k }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+                const single = (try @import("dflash_nax.zig").qmmWithSplitColumns(xr, w, sc, bi, 4, @intCast(gs), split_columns, s)).?;
+                defer _ = mlx.mlx_array_free(single);
+                var yr = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(yr);
+                try mlx.check(mlx.mlx_slice(&yr, y, &[_]c_int{ 0, r, 0 }, 3, &[_]c_int{ 1, r + 1, n }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+                try testing.expectEqual(@as(f32, 0), try attn256MaxDiff(yr, single, s));
+            }
+        }
+    }
+}
+
 test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit affine)" {
     // The spec-verify fast path: stock MLX qmm is tuned for M=1 (qmv) and
     // large M (steel); the 2..8-row verify shapes fall in a dead zone.
@@ -60622,10 +60799,20 @@ fn gdnDecodeRowsCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, t_
     const eps_arr = mlx.mlx_array_new_float(1e-6);
     defer _ = mlx.mlx_array_free(eps_arr);
     var in = gdn_decode.Inputs{
-        .qkv = rows[0], .z = rows[1], .a = rows[2], .b = rows[3],
-        .conv_state = conv_state, .ssm_state = ssm_state, .conv_w = conv_w,
-        .A_log = A_log, .dt_bias = dt_bias, .q_scale = q_scale, .k_scale = k_scale,
-        .norm_w = norm_w, .eps = eps_arr, .signs = .{ .ctx = null },
+        .qkv = rows[0],
+        .z = rows[1],
+        .a = rows[2],
+        .b = rows[3],
+        .conv_state = conv_state,
+        .ssm_state = ssm_state,
+        .conv_w = conv_w,
+        .A_log = A_log,
+        .dt_bias = dt_bias,
+        .q_scale = q_scale,
+        .k_scale = k_scale,
+        .norm_w = norm_w,
+        .eps = eps_arr,
+        .signs = .{ .ctx = null },
     };
     const all = (try gdn_decode.recurSeq(g, t_len, in, s)) orelse return error.FusedDeclined;
     defer for ([_]mlx.mlx_array{ all.y, all.conv_state, all.ssm_state, all.state_seq }) |a| {
@@ -60713,8 +60900,8 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
     const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = 128, .dv = 128 };
     var arrs: [14]mlx.mlx_array = undefined;
     const shapes = [_][]const c_int{
-        &.{ 1, t_len, c_dim }, &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim }, &.{ 1, hv, 128, 128 },
-        &.{ c_dim, 4, 1 },     &.{hv},                   &.{hv},              &.{128},             &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
+        &.{ 1, t_len, c_dim },     &.{ 1, t_len, hv * 128 }, &.{ 1, t_len, hv }, &.{ 1, t_len, hv }, &.{ 1, 3, c_dim },            &.{ 1, hv, 128, 128 },
+        &.{ c_dim, 4, 1 },         &.{hv},                   &.{hv},             &.{128},            &.{ 1, t_len, hv * 128 + 1 }, &.{ 1, t_len, hv + 1 },
         &.{ 1, t_len + 1, c_dim }, &.{ 1, 3, c_dim + 1 },
     };
     for (&arrs, shapes) |*a, sh| a.* = try gdnParityRand(rnd, sh, 1.0, dt, s);
@@ -60766,6 +60953,146 @@ test "gdn_decode: recurSeqFold and recurSeq decline inputs whose width the kerne
     try std.testing.expect((try gdn_decode.recurSeqFold(g, t_len, good, false, null, cpu)) == null);
     try std.testing.expect((try gdn_decode.recurSeq(g, t_len, good, cpu)) == null);
     try std.testing.expect(!mlx.errorPending());
+}
+
+fn gdnTreeReplayParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, hk: c_int, hv: c_int, parents: []const i32) !void {
+    const t_len: c_int = @intCast(parents.len);
+    var prng = std.Random.DefaultPrng.init(0xF01D + @as(u64, @intCast(t_len * 131 + hv)));
+    const rnd = prng.random();
+    const dk: c_int = 128;
+    const dv: c_int = 128;
+    const c_dim: c_int = hk * dk * 2 + hv * dv;
+    const value_dim: c_int = hv * dv;
+    const g = gdn_decode.Geometry{ .hk = hk, .hv = hv, .dk = dk, .dv = dv };
+
+    const q_scale = try scalarOf(1.0 / 128.0, dt, s);
+    defer _ = mlx.mlx_array_free(q_scale);
+    const k_scale = try scalarOf(@sqrt(1.0 / 128.0), dt, s);
+    defer _ = mlx.mlx_array_free(k_scale);
+    const A_log = try gdnParityRand(rnd, &[_]c_int{hv}, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(A_log);
+    const dt_bias = try gdnParityRand(rnd, &[_]c_int{hv}, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(dt_bias);
+    const qkv = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, c_dim }, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(qkv);
+    const z = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, value_dim }, 4.0, dt, s);
+    defer _ = mlx.mlx_array_free(z);
+    const b_in = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, hv }, 16.0, dt, s);
+    defer _ = mlx.mlx_array_free(b_in);
+    const a_in = try gdnParityRand(rnd, &[_]c_int{ 1, t_len, hv }, 16.0, dt, s);
+    defer _ = mlx.mlx_array_free(a_in);
+    const conv_state = try gdnParityRand(rnd, &[_]c_int{ 1, 3, c_dim }, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(conv_state);
+    const ssm_state = try gdnParityRand(rnd, &[_]c_int{ 1, hv, dv, dk }, 1.0, st, s);
+    defer _ = mlx.mlx_array_free(ssm_state);
+    const conv_w = try gdnParityRand(rnd, &[_]c_int{ c_dim, 4, 1 }, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(conv_w);
+    const norm_w = try gdnParityRand(rnd, &[_]c_int{dv}, 1.0, dt, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+    const eps_arr = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps_arr);
+    const in = gdn_decode.Inputs{
+        .qkv = qkv,
+        .z = z,
+        .a = a_in,
+        .b = b_in,
+        .conv_state = conv_state,
+        .ssm_state = ssm_state,
+        .conv_w = conv_w,
+        .A_log = A_log,
+        .dt_bias = dt_bias,
+        .q_scale = q_scale,
+        .k_scale = k_scale,
+        .norm_w = norm_w,
+        .eps = eps_arr,
+        .signs = .{ .ctx = null },
+    };
+
+    var table: [5 * gdn_decode.MAX_TREE]i32 = undefined;
+    gdn_decode.treeTable(parents, table[0 .. 5 * parents.len]);
+    const par = mlx.mlx_array_new_data(&table, &[_]c_int{5 * t_len}, 1, .int32);
+    defer _ = mlx.mlx_array_free(par);
+    const ready = [_]mlx.mlx_array{ qkv, z, a_in, b_in, conv_state, ssm_state, conv_w, A_log, dt_bias, q_scale, k_scale, norm_w, eps_arr, par };
+    const ready_vec = mlx.mlx_vector_array_new_data(&ready, ready.len);
+    defer _ = mlx.mlx_vector_array_free(ready_vec);
+    try mlx.check(mlx.mlx_eval(ready_vec));
+    var before: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&before));
+    const got = (try gdn_decode.recurTree(g, t_len, in, par, s)) orelse return error.TreeDeclined;
+    defer {
+        _ = mlx.mlx_array_free(got.y);
+        got.record.deinit();
+    }
+    try mlx.check(mlx.mlx_array_eval(got.y));
+    var after: usize = 0;
+    try mlx.check(mlx.mlx_get_active_memory(&after));
+    // A device snapshot per node would exceed this by more than an order of
+    // magnitude. Allow page rounding, but count REAL active MLX allocation.
+    const compact_bytes: usize = @intCast(t_len * hv * (386 + 128) * 2);
+    try std.testing.expect(after -| before <= compact_bytes + 65536);
+    // Retained prework is linear in head width, not the 128x128 state matrix.
+    try std.testing.expectEqual(@as(usize, @intCast(t_len * hv * 386)), mlx.mlx_array_size(got.record.pre));
+    var states: [gdn_decode.MAX_TREE]mlx.mlx_array = @splat(.{ .ctx = null });
+    var convs = states;
+    defer for (states, convs) |state, conv| {
+        if (state.ctx != null) _ = mlx.mlx_array_free(state);
+        if (conv.ctx != null) _ = mlx.mlx_array_free(conv);
+    };
+    for (parents, 0..) |parent, row| {
+        const index: i32 = @intCast(row);
+        const idx = mlx.mlx_array_new_data(&index, &[_]c_int{1}, 1, .int32);
+        defer _ = mlx.mlx_array_free(idx);
+        var qs = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(qs);
+        var aa = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(aa);
+        var bb = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(bb);
+        try mlx.check(mlx.mlx_take_axis(&qs, qkv, idx, 1, s));
+        try mlx.check(mlx.mlx_take_axis(&aa, a_in, idx, 1, s));
+        try mlx.check(mlx.mlx_take_axis(&bb, b_in, idx, 1, s));
+        var one = in;
+        one.qkv = qs;
+        one.a = aa;
+        one.b = bb;
+        one.ssm_state = if (parent < 0) ssm_state else states[@intCast(parent)];
+        one.conv_state = if (parent < 0) conv_state else convs[@intCast(parent)];
+        const ref = (try gdn_decode.recur(g, one, s)) orelse return error.FusedDeclined;
+        states[row] = ref.ssm_state;
+        convs[row] = ref.conv_state;
+        defer _ = mlx.mlx_array_free(ref.y);
+        var yr = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(yr);
+        try mlx.check(mlx.mlx_take_axis(&yr, got.y, idx, 1, s));
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(ref.y, yr, s));
+        var path: [gdn_decode.MAX_TREE]u32 = undefined;
+        var n: usize = 0;
+        var r: i32 = @intCast(row);
+        while (r >= 0) : (r = parents[@intCast(r)]) {
+            path[n] = @intCast(r);
+            n += 1;
+        }
+        std.mem.reverse(u32, path[0..n]);
+        const committed = try gdn_decode.replayTree(got.record, path[0..n], s);
+        defer _ = mlx.mlx_array_free(committed);
+        try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(ref.ssm_state, committed, s));
+    }
+}
+
+test "gdn tree replay: every branch output and committed state equal serial, through sixteen rows" {
+    mlx.installErrorHandler();
+    const s = mlx.gpuStream();
+    for ([_][2]mlx.mlx_dtype{ .{ .bfloat16, .bfloat16 }, .{ .float16, .float32 } }) |dts| {
+        for ([_]usize{ 1, 5, 8, 16 }) |width| {
+            var parents: [16]i32 = undefined;
+            for (0..width) |r| parents[r] = @as(i32, @intCast(r)) - 1;
+            try gdnTreeReplayParityCase(s, dts[0], dts[1], 2, 8, parents[0..width]);
+            for (1..width) |r| parents[r] = @intCast((r - 1) / 2);
+            try gdnTreeReplayParityCase(s, dts[0], dts[1], 2, 8, parents[0..width]);
+        }
+        try gdnTreeReplayParityCase(s, dts[0], dts[1], 16, 48, &.{ -1, 0, 1, 1, 0, 4, 4, 6, 7, 8, 7, 6, 4, 0, 13, 14 });
+        try gdnTreeReplayParityCase(s, dts[0], dts[1], 16, 48, &.{ -1, 0, 0, 1, 2, 1, 4, 2 });
+    }
 }
 
 fn gdnDecodeFoldParityCase(s: mlx.mlx_stream, dt: mlx.mlx_dtype, st: mlx.mlx_dtype, hk: c_int, hv: c_int, t_len: c_int, swish: bool) !void {

@@ -17,6 +17,7 @@ const drafter_mod = @import("drafter.zig");
 const mtp_mod = @import("mtp.zig");
 const mtp_acceptance = @import("mtp_acceptance.zig");
 const round_cost = @import("round_cost.zig");
+const dflash_tree = @import("dflash_tree.zig");
 const group_cost = @import("mtp_group_cost.zig");
 const group_planner = @import("mtp_group_planner.zig");
 const ane_mod = @import("ane.zig");
@@ -1462,6 +1463,11 @@ pub const Generator = struct {
     dflash_round_width: u32 = 0,
     /// Stats: count of nextDflash calls that ran a verify forward.
     dflash_attempted: u64 = 0,
+    dflash_tree_round: bool = false,
+    dflash_tree_sampled: bool = false,
+    dflash_tree_rounds: u64 = 0,
+    dflash_tree_nodes: u64 = 0,
+    dflash_tree_last_width: ?usize = null,
     /// Stats: cumulative draft tokens accepted (excluding always-accepted t1).
     dflash_accepted_tokens: u64 = 0,
     /// Per-phase wall-time trace (MLX_SERVE_DFLASH_TRACE=1; else untouched).
@@ -1970,7 +1976,7 @@ pub const Generator = struct {
             const drafts_per_round: u32 = if (self.dflash_block_size >= 1) self.dflash_block_size - 1 else 0;
             // Under the chooser the width varies per round: drafts proposed
             // is the histogram's sum, not attempts x a fixed block.
-            const drafts_proposed: u64 = if (self.dflash_chooser) |ch| ch.draftsProposed() else self.dflash_attempted * @as(u64, drafts_per_round);
+            const drafts_proposed: u64 = if (self.dflash_tree_rounds > 0) self.dflash_tree_nodes else if (self.dflash_chooser) |ch| ch.draftsProposed() else self.dflash_attempted * @as(u64, drafts_per_round);
             const per_draft_pct: f64 = if (drafts_proposed > 0)
                 100.0 * @as(f64, @floatFromInt(self.dflash_accepted_tokens)) /
                     @as(f64, @floatFromInt(drafts_proposed))
@@ -1993,7 +1999,7 @@ pub const Generator = struct {
                     self.xfm.round_cost.dropped_contended,
                     self.xfm.round_cost.dropped_bad,
                     self.xfm.round_cost.dropped_implausible,
-                    if (self.dflash_chooser) |ch| ch.avgWidth() else @as(f32, @floatFromInt(drafts_per_round)),
+                    if (self.dflash_tree_rounds > 0) @as(f32, @floatFromInt(self.dflash_tree_nodes)) / @as(f32, @floatFromInt(self.dflash_tree_rounds)) else if (self.dflash_chooser) |ch| ch.avgWidth() else @as(f32, @floatFromInt(drafts_per_round)),
                     if (self.dflash_chooser) |*ch| ch.formatHist(&hist_buf) else "",
                     if (self.dflash_chooser) |ch| ch.trial.trials else 0,
                 },
@@ -4953,6 +4959,8 @@ pub const Generator = struct {
         // the "no spec" candidate a width chooser needs).
         const dflash_gen_before = self.generated_ids.items.len;
         self.dflash_round_width = 0;
+        self.dflash_tree_round = false;
+        const tree_kv_before = self.mtpKvLen();
         const dflash_rounds_before: u64 = if (self.dflash_chooser) |ch| ch.rounds else self.dflash_attempted;
         defer {
             const ms = @as(f32, @floatFromInt(dflash_kv_watch.read())) / @as(f32, std.time.ns_per_ms);
@@ -4961,6 +4969,8 @@ pub const Generator = struct {
             const wall = if (post_warmup) self.mtpRegimeWallMs(ms) else ms;
             self.specObserveRound(self.dflash_round_width, wall, @floatFromInt(emitted), post_warmup and emitted > 0, false);
             if (self.dflash_chooser) |*ch| ch.note(self.dflash_round_width);
+            if (self.dflash_tree_round and emitted > 0)
+                self.xfm.dflash_tree_cost[@intFromBool(self.dflash_tree_sampled)].observe(tree_kv_before, self.dflash_round_width, ms, self.spec_cost_solo);
         }
         if (self.done) return null;
         std.debug.assert(self.dflash != null);
@@ -4985,7 +4995,10 @@ pub const Generator = struct {
         // (serial = width 0 is a candidate, so "serial wins" is the gate),
         // the fixed block until it has data.
         var round_width: u32 = @max(self.dflash_block_size, 2) - 1;
-        if (self.dflash_chooser) |*ch| {
+        const tree_eligible = self.dflash.?.selector != null and self.dflash.?.markov == null and dflashSelectorEnabled() and
+            (self.sampling.temperature <= 0.01 or (self.sampling.keyed and self.sampling.seed != null)) and self.xfm.specTreeSupported();
+        if (!tree_eligible) round_width = @min(round_width, @max(self.dflash.?.config.block_size, 2) - 1);
+        if (!tree_eligible or !dflash_tree.allocationEnabled()) if (self.dflash_chooser) |*ch| {
             if (ch.rounds >= dflashGateWarmup()) {
                 const d = if (mtpDepthPolicy() == .accept) self.dflashAcceptChoose(ch) else ch.choose(&self.xfm.round_cost, self.mtpKvLen(), ch.rounds);
                 round_width = d.width;
@@ -5005,7 +5018,7 @@ pub const Generator = struct {
                     }
                 }
             }
-        }
+        };
         self.dflash_round_width = round_width;
         if (round_width == 0) {
             const tok_opt = try self.next(allocator);
@@ -5068,6 +5081,7 @@ pub const Generator = struct {
         if (tracing) {
             try mlx.check(mlx.mlx_array_eval(blk_hidden));
             self.dflash_trace.add(.assist, ph.read());
+            log.info("[dflash-tree-trace] assistant_ms={d:.2}\n", .{@as(f64, @floatFromInt(ph.read())) / 1e6});
             ph.reset();
         }
         const draft_logits_all = try model.draftLogits(xfm, blk_hidden);
@@ -5553,24 +5567,43 @@ pub const Generator = struct {
         const xfm = self.xfm;
         const s = xfm.s;
         const MAX_W = 16;
+        const tracing = dflashTraceEnabled();
+        var phase: io_util.Stopwatch = undefined;
+        if (tracing) phase = io_util.Stopwatch.init(self.timer.io);
         var lat = try dflash_mod.lattice(allocator, &model.selector.?, model.config.selector_top_k, blk_hidden, draft_logits, t1, s);
         defer lat.deinit(allocator);
         // A sampled target's scores carry its own noise at each position's candidates.
         const noise: ?[]f32 = if (serial) try self.treeNoise(allocator, &lat) else null;
         defer if (noise) |nz| allocator.free(nz);
         var tree = try dflash_mod.bestFirstTree(allocator, &lat, .{
-            .max_nodes = @min(m, MAX_W - 1),
+            .max_nodes = @min(dflash_tree.nodeBudget(m + 1), if (gdn_decode.treeReplayEnabled()) dflash_tree.MAX_NODES else @as(usize, gdn_decode.MAX_SEQ - 1)),
             .temperature = if (serial) self.sampling.temperature else 1.0,
             .noise = noise,
         });
         defer tree.deinit(allocator);
+        const allocated = dflash_tree.allocationEnabled();
+        const fit = xfm.config.hidden_size == 5120 and xfm.config.num_hidden_layers == 64 and
+            (!serial or (self.sampling.temperature == 1 and self.sampling.top_k == 20 and self.sampling.top_p == 0.95));
+        const probabilities = if (allocated) try dflash_tree.order(&tree, serial, fit) else @as([dflash_tree.MAX_NODES]f32, @splat(0));
+        const costs = &xfm.dflash_tree_cost[@intFromBool(serial)];
+        costs.resetFor(m + 1);
+        const selected = if (allocated) costs.choose(anchor_pos, probabilities[0..tree.tokens.len]) else tree.tokens.len;
+        self.dflash_round_width = @intCast(selected);
+        self.dflash_tree_round = true;
+        self.dflash_tree_sampled = serial;
+        self.dflash_tree_rounds += 1;
+        self.dflash_tree_nodes += selected;
+        if (self.dflash_tree_last_width != selected) {
+            self.dflash_tree_last_width = selected;
+            log.info("[dflash-tree] proposal={d} nodes={d}/{d} allocation={s} calibration={s} state={s}\n", .{ m + 1, selected, tree.tokens.len, if (allocated) "probability/cost" else "fixed", if (fit) "qwen27-dflash2" else "path-score", if (gdn_decode.treeReplayEnabled()) "replay" else "capture" });
+        }
         if (!dflash_tree_logged) {
             dflash_tree_logged = true;
-            log.info("[dflash] draft trees engaged: up to {d} nodes a round\n", .{@min(m, MAX_W - 1)});
+            log.info("[dflash] draft trees engaged: up to {d} nodes a round\n", .{tree.tokens.len});
         }
 
         // Rows: 0 = t1 (the root), 1 + i = tree node i.
-        const w: usize = 1 + tree.tokens.len;
+        const w: usize = 1 + selected;
         var parents: [MAX_W]i32 = undefined;
         var depth: [MAX_W]i32 = undefined;
         var toks: [MAX_W]i32 = undefined;
@@ -5578,7 +5611,7 @@ pub const Generator = struct {
         depth[0] = 0;
         toks[0] = @intCast(t1);
         var max_depth: i32 = 0;
-        for (tree.tokens, tree.parents, tree.depth, 1..) |tok, par, d, row| {
+        for (tree.tokens[0..selected], tree.parents[0..selected], tree.depth[0..selected], 1..) |tok, par, d, row| {
             parents[row] = if (par < 0) 0 else par + 1;
             depth[row] = @intCast(d + 1);
             toks[row] = @intCast(tok);
@@ -5617,16 +5650,27 @@ pub const Generator = struct {
         self.ctx.capture_layers = &cl;
         self.ctx.capture_ssm_seq = self.ctx.ssm_entries != null;
         self.ctx.tree = &spec_tree;
-        self.ctx.pipeline_build = VERIFY_PIPELINE_LAYERS;
+        self.ctx.pipeline_build = if (std.c.getenv("MLX_SERVE_DFLASH_PIPELINE")) |raw|
+            @min(std.fmt.parseInt(u32, std.mem.span(raw), 10) catch VERIFY_PIPELINE_LAYERS, 64)
+        else
+            VERIFY_PIPELINE_LAYERS;
+        const PipelineLog = struct {
+            var logged = false;
+        };
+        if (!PipelineLog.logged and self.ctx.pipeline_build > 0 and std.c.getenv("MLX_SERVE_DFLASH_PIPELINE") != null) {
+            PipelineLog.logged = true;
+            log.info("[dflash-tree] pipeline engaged: layers={d} first-alone=true\n", .{self.ctx.pipeline_build});
+        }
+        defer if (self.ctx.ssm_entries) |entries| {
+            for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
+        };
+        const propose_done_ns = if (tracing) phase.read() else 0;
         const verify_logits = xfm.forwardWith(&self.ctx, verify_input);
         self.ctx.capture_layers = null;
         self.ctx.capture_ssm_seq = false;
         self.ctx.tree = null;
         self.ctx.pipeline_build = 0;
         const logits = try verify_logits;
-        defer if (self.ctx.ssm_entries) |entries| {
-            for (entries) |*entry| transformer_mod.ssmFreeSpecCapture(entry);
-        };
         self.dflash_attempted += 1;
 
         var targets = blk: {
@@ -5639,6 +5683,7 @@ pub const Generator = struct {
         defer targets.deinit();
         try mlx.check(mlx.mlx_array_eval(targets.lazy()));
         const ids = try targets.ids(w);
+        const verify_done_ns = if (tracing) phase.read() else 0;
 
         // Walk the target's tokens down the tree.
         var path_rows: [MAX_W]u32 = undefined;
@@ -5676,7 +5721,7 @@ pub const Generator = struct {
                 const dd: i32 = @as(i32, @intCast(accepted)) - 2 + @as(i32, @intCast(i));
                 conv_rows[i] = if (dd < 0) dd + 3 else 3 + @as(i32, @intCast(path_rows[@intCast(dd)]));
             }
-            for (entries) |*entry| try transformer_mod.ssmCommitTreePath(entry, path_rows[accepted], conv_rows, s);
+            for (entries) |*entry| try transformer_mod.ssmCommitTreePath(entry, path_rows[0..n_commit], conv_rows, s);
         }
         self.ctx.moe_seq_offset.* = anchor_pos + n_commit;
         if (accepted + 1 < w) self.partial_rounds += 1;
@@ -5712,6 +5757,9 @@ pub const Generator = struct {
         self.next_token_id = next_pending;
         self.advanceStep(@intCast(n_commit));
         self.checkDflashRuntimeGate();
+        if (tracing) {
+            log.info("[dflash-tree-trace] rows={d} accepted={d} head_tree_ms={d:.2} verify_sample_ms={d:.2} commit_build_ms={d:.2}\n", .{ w, accepted, @as(f64, @floatFromInt(propose_done_ns)) / 1e6, @as(f64, @floatFromInt(verify_done_ns - propose_done_ns)) / 1e6, @as(f64, @floatFromInt(phase.read() - verify_done_ns)) / 1e6 });
+        }
         if (self.completion_tokens >= self.max_tokens) {
             self.done = true;
             self.finish_reason = "length";

@@ -4055,7 +4055,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             dflash_ptr = d;
             const wide_lane = dflash_mod.wideVerifyLaneAvailable();
             const block_cap = dflash_mod.blockCapForMachine(ane_mod.chipBrand(), d.selector != null and xfm_ptr.specTreeSupported());
-            sch.drafter_block_size = dflash_mod.resolveBlockSize(
+            const tree_supported = d.selector != null and xfm_ptr.specTreeSupported();
+            sch.drafter_block_size = if (tree_supported) @import("dflash_tree.zig").proposalBlock(
+                d.config.block_size,
+                params.draft_block_size,
+                params.draft_block_size_explicit,
+                wide_lane,
+            ) else dflash_mod.resolveBlockSize(
                 d.config.block_size,
                 params.draft_block_size,
                 params.draft_block_size_explicit,
@@ -4063,7 +4069,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 block_cap.cap,
             );
             if (params.draft_block_size_explicit and params.draft_block_size > sch.drafter_block_size)
-                log.warn("--draft-block-size {d} is past the drafter's trained block; using {d}\n", .{ params.draft_block_size, sch.drafter_block_size });
+                log.warn("--draft-block-size {d} exceeds the supported proposal width; using {d}\n", .{ params.draft_block_size, sch.drafter_block_size });
+            if (tree_supported and !@import("gdn_decode.zig").treeReplayEnabled()) sch.drafter_block_size = @min(sch.drafter_block_size, 8);
             var cap_note_buf: [96]u8 = undefined;
             const cap_note: []const u8 = if (params.draft_block_size_explicit)
                 ", user-clamped"

@@ -368,15 +368,28 @@ Ported into mlx-serve:
   - `src/rowqmv.zig`: the row-exact 4-bit matvec, routed-expert and router
     kernels of `rows.py` (one simdgroup per input row, MLX's qmv_fast loop).
   - `src/simd_qmm.zig`: the `simd_qmm` fixed-order matmul kernels.
+  - `src/dflash_nax.zig`: native uint4 NAX group matmul and activation sums
+    from the Python `kernels/qwen/dense/v1/lane_qmm.py` implementation at
+    beddbb7bc818b432163c30500aea256e2b46ff8a; restricted to sixteen rows,
+    with the original MLX weight/scales/biases layout and Zig host dispatch.
+    Joined gate/up projections retain their original split count, following
+    the same Python implementation's lane_fuse.py.
+  - The DFlash first-layer GPU submission follows Python row_forward.py.
   - `src/row_attn.zig`: the fixed-split row attention of `row_attention`.
   - `src/keyed_sample.zig`: the keyed Gumbel-max GPU sampler of
     `gpu_sampling.py` (Metal source reproduced unchanged).
   - `src/dflash.zig`: the best-first draft-tree parameters and the
     lattice/tree construction scheme.
+  - `src/dflash_tree.zig` and `src/dflash2_calibration.json`: probability
+    ordering/allocation and Qwen3.8-27B DFlash2 calibration data from
+    TensorFold beddbb7bc818b432163c30500aea256e2b46ff8a.
+  - `src/gdn_decode.zig`: private branch-state verification and accepted-path
+    replay informed by TensorFold's lane_tree/stream_gdn design; arithmetic
+    retains mlx-serve's per-step state-dtype rounding.
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c with our own
 host dispatch; `simd_qmm` gains a 2-3 row `rows` kind; draft trees verify
-through our GDN fold kernel and path attention.
+through our GDN fold or compact replay kernels and path attention.
 
 
 ================================================================================

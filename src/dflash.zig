@@ -505,6 +505,10 @@ pub const DflashLinear = struct {
     }
 
     pub fn apply(self: *const DflashLinear, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+        const nax = @import("dflash_nax.zig");
+        if (nax.drafterEnabled() and transformer_mod.verifyQmmNaxAvailable()) {
+            if (try nax.qmm(x, self.w, self.scales, self.biases, self.bits, self.group_size, s)) |y| return y;
+        }
         var out = mlx.mlx_array_new();
         if (!self.isQuantized()) {
             try mlx.check(mlx.mlx_matmul(&out, x, self.w, s));
@@ -1560,7 +1564,6 @@ fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !m
 
 // ── DFlash2 path selector (forward + host trace) ──
 
-
 pub const SelectedPath = struct {
     ids: []u32, // [m] chosen draft token ids
     chosen_idx: []u32, // [m] index of the choice within its candidate row
@@ -1788,7 +1791,6 @@ pub fn lattice(
         lat.e = try allocator.dupe(f32, e_data[0 .. (m - 1) * k * k]);
     }
     return lat;
-
 }
 
 /// A best-first draft tree over the lattice: node values are path sums of
@@ -1814,11 +1816,13 @@ pub const DraftTree = struct {
     tokens: []u32,
     parents: []i32,
     depth: []u32,
+    scores: []f32,
 
     pub fn deinit(self: *DraftTree, allocator: std.mem.Allocator) void {
         allocator.free(self.tokens);
         allocator.free(self.parents);
         allocator.free(self.depth);
+        allocator.free(self.scores);
     }
 };
 
@@ -1827,8 +1831,15 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
     const Item = struct { value: f32, parent: i32, depth: u32, cand: u32 };
     var queue: std.ArrayList(Item) = .empty;
     defer queue.deinit(allocator);
-    var tree = DraftTree{ .tokens = try allocator.alloc(u32, p.max_nodes), .parents = try allocator.alloc(i32, p.max_nodes), .depth = try allocator.alloc(u32, p.max_nodes) };
-    errdefer tree.deinit(allocator);
+    const tokens = try allocator.alloc(u32, p.max_nodes);
+    errdefer allocator.free(tokens);
+    const parents = try allocator.alloc(i32, p.max_nodes);
+    errdefer allocator.free(parents);
+    const depths = try allocator.alloc(u32, p.max_nodes);
+    errdefer allocator.free(depths);
+    const values = try allocator.alloc(f32, p.max_nodes);
+    errdefer allocator.free(values);
+    var tree = DraftTree{ .tokens = tokens, .parents = parents, .depth = depths, .scores = values };
     var scores: [64]f32 = undefined;
     std.debug.assert(k <= scores.len);
 
@@ -1872,13 +1883,24 @@ pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeP
         tree.tokens[n] = @intCast(lat.cands[@as(usize, it.depth) * k + it.cand]);
         tree.parents[n] = it.parent;
         tree.depth[n] = it.depth;
+        tree.scores[n] = it.value;
         if (it.depth + 1 < lat.m) try Push.run(allocator, &queue, lat, scores[0..k], p, @intCast(n), it.cand, it.depth + 1, it.value);
         n += 1;
     }
     if (n < p.max_nodes) {
-        tree.tokens = try allocator.realloc(tree.tokens, n);
-        tree.parents = try allocator.realloc(tree.parents, n);
-        tree.depth = try allocator.realloc(tree.depth, n);
+        // Usually fills the budget; allocate exact arrays only for a tiny lattice.
+        const compact_tokens = try allocator.dupe(u32, tree.tokens[0..n]);
+        errdefer allocator.free(compact_tokens);
+        const compact_parents = try allocator.dupe(i32, tree.parents[0..n]);
+        errdefer allocator.free(compact_parents);
+        const compact_depth = try allocator.dupe(u32, tree.depth[0..n]);
+        errdefer allocator.free(compact_depth);
+        const compact_scores = try allocator.dupe(f32, tree.scores[0..n]);
+        errdefer allocator.free(compact_scores);
+        var compact = DraftTree{ .tokens = compact_tokens, .parents = compact_parents, .depth = compact_depth, .scores = compact_scores };
+        try preorder(allocator, &compact);
+        tree.deinit(allocator);
+        return compact;
     }
     try preorder(allocator, &tree);
     return tree;
@@ -1919,9 +1941,12 @@ fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
     defer allocator.free(parents);
     const depth = try allocator.dupe(u32, t.depth);
     defer allocator.free(depth);
+    const scores = try allocator.dupe(f32, t.scores);
+    defer allocator.free(scores);
     for (order, 0..) |old, i| {
         t.tokens[i] = tokens[old];
         t.depth[i] = depth[old];
+        t.scores[i] = scores[old];
         t.parents[i] = if (parents[old] < 0) -1 else new_index[@intCast(parents[old])];
     }
 }
