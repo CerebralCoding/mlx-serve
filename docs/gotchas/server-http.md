@@ -1576,6 +1576,13 @@ First live run on qwen4_exp: `[hot-cache] hybrid miss (no checkpoint <= 514 of 5
 `scheduler.modelDiskBytes` summed every `*.safetensors` in the directory. A third-party gemma-4 E4B pack shipped two shards no `weight_map` entry references; the bill was 2x the loaded size, so loading a small image model evicted the chat model. The index is the truth when present: `indexShardSet` reads `model.safetensors.index.json` and only named shards count. Guard: `test "modelDiskBytes bills only the shards the index names (issue #274)"`.
 
 
+## The SSD tier outgrew `--prefix-cache-disk`: in-place commits under-billed their files (#573)
+
+**Defect.** Under an agent workload (Flash-Next, `--mtp`, `--prefix-cache-disk 40GB`) entries billed far less than the files they list, some down to 0, so `gcToBudget` never fired and the store grew past 300 GB until a restart re-scanned it.
+**Cause.** Two terms. The big one: `appendSsmOnly` billed a hand-rolled per-term delta that, in ReleaseFast builds, dropped the entry's whole checkpoint list from its bill on every spec/SSM-only append once the entry held 4+ checkpoints; Debug builds billed it correctly. The small one: `persistQsaHistory` reported 0 bytes for a commit that carried no QSA checkpoint while the entry's `qsa.safetensors` stayed on disk.
+**Fix.** `appendSsmOnly` bills by measure, `nonChunkBytes` after minus before; `persistQsaHistory` returns the held file when nothing new is written.
+**Guard.** `DiskTier: in-place commits keep an entry's bytes equal to the files it owns`, red only under `zig build test -Doptimize=ReleaseFast`, so run it in the mode that ships.
+
 ## The SSD tier refused a volume with 117 GB usable (2026-09-14)
 
 `kv_disk_cache.volumeSpace` read `statfs.f_bavail`, which is what `df` prints and which excludes the purgeable space macOS frees on demand. The release box showed 36 GB free by df and 117 GB by Finder, so the tier declined every persist under its 64 GiB reserve and the Flash-Next SSD-first soak restored nothing after a restart. Fix: one ObjC probe, `msv_volume_free_for_use(path)`, returns `volumeAvailableCapacityForImportantUsage`; `volumeSpace` reports that as `free` (statfs stays the fallback and the total) and the ANE compile-cache cap reads the same probe. Guard: `test "volumeSpace: free is what the OS grants"` (red on this box: 117 GB expected, 36 GB found).

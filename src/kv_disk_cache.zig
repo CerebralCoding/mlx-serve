@@ -1357,7 +1357,7 @@ pub const DiskTier = struct {
         else
             kv_len;
         if (inherited_qsa) inherited_qsa_rows = @min(inherited_qsa_rows, prefix_rows);
-        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, prefix_rows, s);
+        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, inherited_qsa, inherited_qsa_rows, inherited_qsa_bytes, prefix_rows, s);
         const complete = chunk_complete and ssm_res.complete;
 
         // v4 spec snapshots — one sidecar file, REPLACED wholesale by every
@@ -1525,17 +1525,16 @@ pub const DiskTier = struct {
         const dir_rel = try std.fmt.allocPrint(self.allocator, "{s}/e{d}", .{ self.root, self.entries.items[idx].id });
         defer self.allocator.free(dir_rel);
         const e = &self.entries.items[idx];
+        // Chunks and the token record are untouched here, so the bill moves by the non-chunk files.
+        const old_non_chunk = nonChunkBytes(e);
         var written_bytes: u64 = 0;
         // Write-ahead bound: the token record, not the flushed kv_len — a
         // checkpoint beyond the current chunks is position-keyed and becomes
         // restorable when a later extend raises kv_len past it.
         var ssm_res = try self.persistSsmCheckpoints(e.id, dir_rel, @intCast(e.tokens.len), e.ssm_positions, e.ssm_bytes, ssm_checkpoints, &written_bytes, s, self.max_flush_bytes);
         errdefer ssm_res.deinit(self.allocator);
-        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, e.inherited_qsa, e.qsa_history_rows, e.kv_len, s);
+        const qsa_res = try self.persistQsaHistory(dir_rel, ssm_checkpoints, e.inherited_qsa, e.qsa_history_rows, e.qsa_history_bytes, e.kv_len, s);
 
-        // Captured before the sidecar write overwrites it: this path bills a delta.
-        const old_spec_bytes: u64 = e.spec_bytes;
-        const old_qsa_billed: u64 = if (e.inherited_qsa) 0 else e.qsa_history_bytes;
         if (specWorkPending(e, dflash_snap, mtp_snap)) {
             const spec_res: SpecSidecarResult = self.writeSpecSidecar(dir_rel, dflash_snap, mtp_snap, s) catch |err| blk: {
                 log.warn("  [disk-cache] spec persist failed: {s} — entry keeps its old spec\n", .{@errorName(err)});
@@ -1545,15 +1544,6 @@ pub const DiskTier = struct {
             e.spec_dflash = spec_res.dflash;
             e.spec_mtp = spec_res.mtp;
         }
-
-        // Recompute total bytes: chunks + token record are unchanged; only the
-        // ssm/spec contributions changed.
-        // Delta-based like the extend path; both non-chunk terms are in the delta.
-        var delta: i64 = @as(i64, @intCast(e.spec_bytes)) - @as(i64, @intCast(old_spec_bytes));
-        for (ssm_res.bytes) |b| delta += @as(i64, @intCast(b));
-        for (e.ssm_bytes) |b| delta -= @as(i64, @intCast(b));
-        const new_qsa_billed: u64 = if (qsa_res.inherited) 0 else qsa_res.bytes;
-        delta += @as(i64, @intCast(new_qsa_billed)) - @as(i64, @intCast(old_qsa_billed));
 
         self.allocator.free(e.ssm_positions);
         self.allocator.free(e.ssm_bytes);
@@ -1566,6 +1556,7 @@ pub const DiskTier = struct {
             e.qsa_history_rows = qsa_res.rows;
             e.inherited_qsa = false;
         }
+        const delta: i64 = @as(i64, @intCast(nonChunkBytes(e))) - @as(i64, @intCast(old_non_chunk));
         e.bytes = clampAdd(e.bytes, delta);
         self.total_bytes = clampAdd(self.total_bytes, delta);
         e.last_used = self.bump();
@@ -2506,14 +2497,14 @@ pub const DiskTier = struct {
         cps_opt: ?[]const transformer_mod.SSMCheckpoint,
         inherited: bool,
         inherited_rows: u32,
+        held_bytes: u64,
         prefix_rows: u32,
         s: mlx.mlx_stream,
     ) !QsaHistoryResult {
-        const cps = cps_opt orelse return .{ .inherited = inherited, .rows = inherited_rows, .bytes = 0 };
-        const src = DiskTier.newestQsaCheckpoint(cps) orelse {
-            if (inherited) return .{ .inherited = true, .rows = inherited_rows, .bytes = 0 };
-            return .{};
-        };
+        // A commit with no QSA checkpoint leaves the entry's own file on disk, so it keeps its bill.
+        const kept: QsaHistoryResult = .{ .inherited = inherited, .rows = inherited_rows, .bytes = if (inherited) 0 else held_bytes };
+        const cps = cps_opt orelse return kept;
+        const src = DiskTier.newestQsaCheckpoint(cps) orelse return kept;
         const rows: u32 = @intCast(DiskTier.qsaHistoryRowsOf(src));
         if (inherited and rows > 0 and rows <= inherited_rows and rows <= prefix_rows) {
             return .{ .inherited = true, .rows = @min(inherited_rows, prefix_rows), .bytes = 0 };
@@ -7440,4 +7431,78 @@ test "DiskTier: a failed restore drops the latch it raised and keeps a foreign o
     _ = tier.restoreInto(&target, m.idx, s) catch {};
     var msg: [512]u8 = undefined;
     try testing.expectEqualStrings("foreign pre-existing error", mlx.takeError(&msg).?);
+}
+
+test "DiskTier: in-place commits keep an entry's bytes equal to the files it owns" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-qsa-bill", 0, 128);
+    defer tier.deinit();
+
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 900, 8, 0.0, .float32);
+    var tokens: [900]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+
+    var src = buildHybridEntries(s, 200.0, 600.0);
+    defer freeHybridEntries(&src);
+    const aux_shape = [_]c_int{ 1, 600, 8 };
+    const pooled_shape = [_]c_int{ 1, 150, 8 };
+    src[2].aux_state = makeArange(s, &aux_shape, 700.0);
+    src[2].qsa_pooled = makeArange(s, &pooled_shape, 800.0);
+    src[2].qsa_ratio = 4;
+    var cps = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 128, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 256, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 384, s),
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 600, s),
+    };
+    defer for (&cps) |*cp| cp.deinit(testing.allocator);
+    try transformer_mod.attachQsaHistoryToLatest(&cps, &src, s);
+    // A fifth checkpoint with no QSA history: the append adds a file and leaves qsa.safetensors alone.
+    var more = [_]transformer_mod.SSMCheckpoint{
+        try transformer_mod.captureSsmCheckpoint(testing.allocator, &src, 64, s),
+    };
+    defer for (&more) |*cp| cp.deinit(testing.allocator);
+
+    const Owned = struct {
+        // Every file in a non-sharing entry's dir is its own; meta.json is the manifest, never billed.
+        fn bytes(t: *DiskTier, e: *const IndexEntry) !u64 {
+            const dir = try std.fmt.allocPrint(testing.allocator, "{s}/e{d}", .{ t.root, e.id });
+            defer testing.allocator.free(dir);
+            var d = try std.Io.Dir.openDirAbsolute(t.io, dir, .{});
+            defer d.close(t.io);
+            const meta = try d.statFile(t.io, "meta.json", .{});
+            return dirBytes(t.io, dir) - meta.size;
+        }
+    };
+
+    // Turn 1: 600 tokens land with four checkpoints and a QSA history file.
+    _ = try tier.appendCommit(cache.entries, 600, cache.config, tokens[0..600], false, &cps, s);
+    try testing.expect(tier.entries.items[0].qsa_history_bytes > 0);
+    try testing.expectEqual(try Owned.bytes(&tier, &tier.entries.items[0]), tier.entries.items[0].bytes);
+
+    // Turn 2: same tokens, an MTP snap and one more checkpoint -> the ssm/spec-only append.
+    var mtp = try KVCache.init(testing.allocator, 1);
+    defer mtp.deinit();
+    try fillCache(&mtp, s, 1, 590, 8, 9.5, .float32);
+    _ = try tier.appendCommitWithSpec(cache.entries, 600, cache.config, tokens[0..600], false, &more, null, .{ .entries = mtp.entries, .step = mtp.step, .config = mtp.config, .base_pos = 0 }, s);
+    try testing.expect(tier.entries.items[0].spec_bytes > 0);
+    try testing.expectEqual(@as(usize, 5), tier.entries.items[0].ssm_positions.len);
+    try testing.expectEqual(try Owned.bytes(&tier, &tier.entries.items[0]), tier.entries.items[0].bytes);
+    try testing.expectEqual(tier.entries.items[0].bytes, tier.total_bytes);
+
+    // Turn 3: the conversation grows to 900 tokens, again with no checkpoints -> extend in place.
+    _ = try tier.appendCommit(cache.entries, 900, cache.config, &tokens, false, null, s);
+    const e = &tier.entries.items[0];
+    try testing.expectEqual(@as(u32, 900), e.kv_len);
+    try testing.expect(e.qsa_history_bytes > 0);
+    try testing.expectEqual(try Owned.bytes(&tier, e), e.bytes);
+    try testing.expectEqual(e.bytes, tier.total_bytes);
 }
