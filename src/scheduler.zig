@@ -4068,9 +4068,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 wide_lane,
                 block_cap.cap,
             );
+            if (tree_supported and !@import("gdn_decode.zig").treeReplayEnabled()) sch.drafter_block_size = @min(sch.drafter_block_size, 8);
             if (params.draft_block_size_explicit and params.draft_block_size > sch.drafter_block_size)
                 log.warn("--draft-block-size {d} exceeds the supported proposal width; using {d}\n", .{ params.draft_block_size, sch.drafter_block_size });
-            if (tree_supported and !@import("gdn_decode.zig").treeReplayEnabled()) sch.drafter_block_size = @min(sch.drafter_block_size, 8);
             var cap_note_buf: [96]u8 = undefined;
             const cap_note: []const u8 = if (params.draft_block_size_explicit)
                 ", user-clamped"

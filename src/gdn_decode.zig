@@ -453,11 +453,11 @@ pub const RecurSeq = struct { y: mlx.mlx_array, conv_state: mlx.mlx_array, ssm_s
 pub const MAX_SEQ: c_int = 8;
 pub const MAX_TREE: c_int = 16;
 
+var tree_replay_env: ?bool = null;
+
+/// Opt-in: replay keeps only row-local prework instead of a state per node.
 pub fn treeReplayEnabled() bool {
-    // Memory wins are established; a small decode cost remains on M5 Max.
-    // Keep the original capture default until replay also clears that bar.
-    const raw = std.c.getenv("MLX_SERVE_DFLASH_TREE_REPLAY") orelse return false;
-    return !std.mem.eql(u8, std.mem.span(raw), "0");
+    return @import("dflash_nax.zig").envOnCached(&tree_replay_env, "MLX_SERVE_DFLASH_TREE_REPLAY");
 }
 
 // Tree verification stores only row-local prework. The recurrence's branch
@@ -468,7 +468,8 @@ const TREE_PRE_SOURCE =
     \\uint sg = simdgroup_index_in_threadgroup;
     \\uint hv = threadgroup_position_in_grid.x;
     \\uint hk = hv / (HV / HK);
-    \\for (int t = 0; t < TL; ++t) {
+    \\uint t = threadgroup_position_in_grid.y;
+    \\{
     \\  uint dst = (t * HV + hv) * 386;
     \\  if (sg < 3) {
     \\    uint cb = sg == 0 ? hk * 128 : (sg == 1 ? HK * 128 + hk * 128 : 2 * HK * 128 + hv * 128);
@@ -515,7 +516,8 @@ const TREE_RECUR_SOURCE =
     \\float initial[4], st[4];
     \\float states[REPLAY ? 1 : TL][4];
     \\for (int i = 0; i < 4; ++i) { initial[i] = float(state_in[sb + i]); st[i] = initial[i]; }
-    \\for (int step = 0; step < COUNT; ++step) {
+    \\const int count = REPLAY ? int(rows_shape[0]) : TL;
+    \\for (int step = 0; step < count; ++step) {
     \\  int t = REPLAY ? int(rows[step]) : step;
     \\  if (!REPLAY) {
     \\    int p = rows[t];
@@ -554,14 +556,16 @@ pub const TreeRecord = struct {
 pub const TreeOutput = struct { y: mlx.mlx_array, record: TreeRecord };
 var tree_pre_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var tree_recur_kernel: ?mlx.mlx_fast_metal_kernel = null;
-const TreeRecurKey = struct { hv: c_int, width: c_int, count: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype };
+const TreeRecurKey = struct { hv: c_int, width: c_int, dt: mlx.mlx_dtype, st: mlx.mlx_dtype };
 var tree_recur_keys: [2]?TreeRecurKey = @splat(null);
 var tree_recur_cfgs: [2]?mlx.mlx_fast_metal_kernel_config = @splat(null);
 const TreePreKey = struct { g: Geometry, width: c_int, dt: mlx.mlx_dtype };
 var tree_pre_key: ?TreePreKey = null;
 var tree_pre_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 
-fn treeRecurrence(record: TreeRecord, rows: mlx.mlx_array, count: c_int, replay: bool, s: mlx.mlx_stream) !mlx.mlx_array {
+/// The replayed path length is read from `rows` at run time: a template value
+/// would compile one kernel per accepted length, mid-round.
+fn treeRecurrence(record: TreeRecord, rows: mlx.mlx_array, replay: bool, s: mlx.mlx_stream) !mlx.mlx_array {
     const sh = mlx.getShape(record.pre);
     const width = sh[0];
     const hv = sh[1];
@@ -569,7 +573,7 @@ fn treeRecurrence(record: TreeRecord, rows: mlx.mlx_array, count: c_int, replay:
     const dt = mlx.mlx_array_dtype(record.pre);
     const st = mlx.mlx_array_dtype(record.initial);
     const slot: usize = @intFromBool(replay);
-    const key = TreeRecurKey{ .hv = hv, .width = width, .count = count, .dt = dt, .st = st };
+    const key = TreeRecurKey{ .hv = hv, .width = width, .dt = dt, .st = st };
     if (tree_recur_keys[slot] == null or !std.meta.eql(tree_recur_keys[slot].?, key)) {
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
@@ -584,7 +588,7 @@ fn treeRecurrence(record: TreeRecord, rows: mlx.mlx_array, count: c_int, replay:
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "StT", st));
-        inline for (.{ .{ "HV", hv }, .{ "TL", width }, .{ "COUNT", count }, .{ "REPLAY", @as(c_int, @intFromBool(replay)) } }) |kv|
+        inline for (.{ .{ "HV", hv }, .{ "TL", width }, .{ "REPLAY", @as(c_int, @intFromBool(replay)) } }) |kv|
             try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
         if (tree_recur_cfgs[slot]) |old| _ = mlx.mlx_fast_metal_kernel_config_free(old);
         tree_recur_cfgs[slot] = cfg;
@@ -617,7 +621,8 @@ pub fn recurTree(g: Geometry, width: c_int, in: Inputs, parents: mlx.mlx_array, 
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ width, g.hv, 386 }, 3, dt));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * g.hv, 1, 1));
+        // One threadgroup per (head, row): rows are independent.
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 128 * g.hv, width, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 128, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
         inline for (.{ .{ "HK", g.hk }, .{ "HV", g.hv }, .{ "TL", width }, .{ "C", 2 * g.hk * 128 + g.hv * 128 } }) |kv|
@@ -636,7 +641,7 @@ pub fn recurTree(g: Geometry, width: c_int, in: Inputs, parents: mlx.mlx_array, 
     errdefer record.deinit();
     try mlx.check(mlx.mlx_vector_array_get(&record.pre, ov, 0));
     try mlx.check(mlx.mlx_array_set(&record.initial, in.ssm_state));
-    return .{ .y = try treeRecurrence(record, parents, width, false, s), .record = record };
+    return .{ .y = try treeRecurrence(record, parents, false, s), .record = record };
 }
 
 /// Replay already computed prework, rounding to the original state dtype at
@@ -647,7 +652,7 @@ pub fn replayTree(record: TreeRecord, path: []const u32, s: mlx.mlx_stream) !mlx
     for (path, 0..) |r, i| if (r >= width or (i > 0 and r <= path[i - 1])) return error.InvalidTreePath;
     const rows = mlx.mlx_array_new_data(path.ptr, &[_]c_int{@intCast(path.len)}, 1, .uint32);
     defer _ = mlx.mlx_array_free(rows);
-    return treeRecurrence(record, rows, @intCast(path.len), true, s);
+    return treeRecurrence(record, rows, true, s);
 }
 var k1s_cache: ?mlx.mlx_fast_metal_kernel = null;
 var seq_cfgs: [MAX_SEQ + 1]?mlx.mlx_fast_metal_kernel_config = @splat(null);

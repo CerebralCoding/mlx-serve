@@ -55,14 +55,25 @@ var sum_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var main_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var logged: u32 = 0;
 
+var enabled_env: ?bool = null;
+var drafter_env: ?bool = null;
+
+/// Opt-in switches, read once: both gate a per-matmul dispatch.
 pub fn enabled() bool {
-    const p = std.c.getenv("MLX_SERVE_DFLASH_NAX") orelse return false;
-    return std.mem.eql(u8, std.mem.span(p), "1");
+    return envOnCached(&enabled_env, "MLX_SERVE_DFLASH_NAX");
 }
 
 pub fn drafterEnabled() bool {
-    const p = std.c.getenv("MLX_SERVE_DFLASH_NAX_DRAFTER") orelse return false;
-    return std.mem.eql(u8, std.mem.span(p), "1");
+    return envOnCached(&drafter_env, "MLX_SERVE_DFLASH_NAX_DRAFTER");
+}
+
+/// Set and not `0`, like the engine's other diagnostic switches.
+pub fn envOnCached(cache: *?bool, name: [*:0]const u8) bool {
+    if (cache.*) |v| return v;
+    const raw = std.c.getenv(name);
+    const v = raw != null and raw.?[0] != '0';
+    cache.* = v;
+    return v;
 }
 
 fn kernel(sum: bool) !mlx.mlx_fast_metal_kernel {
@@ -131,9 +142,9 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
 /// Like TensorFold's lane_fuse, joined projections preserve each member's
 /// split count rather than recomputing it from the combined output width.
 pub fn qmmWithSplitColumns(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, split_columns: ?c_int, s: mlx.mlx_stream) !?mlx.mlx_array {
-    const raw = std.c.getenv("MLX_SERVE_DFLASH_NAX_TILE");
-    const nt: c_int = if (raw != null and std.mem.eql(u8, std.mem.span(raw.?), "16")) 16 else 32;
-    return qmmWithTile(x, w, sc, bi, bits, group_size, split_columns, nt, s);
+    // 16 columns per threadgroup keeps the partial-sum tile at 7 KiB; 32
+    // doubles it past the occupancy bar for the same bits.
+    return qmmWithTile(x, w, sc, bi, bits, group_size, split_columns, 16, s);
 }
 
 pub fn qmmWithTile(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, split_columns: ?c_int, nt: c_int, s: mlx.mlx_stream) !?mlx.mlx_array {
@@ -171,6 +182,7 @@ pub fn qmmWithTile(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_reshape(&out, y, &shape, xs.len, s));
     const flag = @as(u32, 1) << @as(u5, @intCast(m));
+    if (logged == 0) log.info("[dflash-nax] serial and drafted rows share these kernels; output bits differ from the default kernels\n", .{});
     if (logged & flag == 0) {
         logged |= flag;
         log.info("[dflash-nax] uint4 engaged: rows={d} K={d} N={d} gs={d} tile={d} layout=original\n", .{ m, k, n, gs, nt });

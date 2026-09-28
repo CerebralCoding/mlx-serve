@@ -19520,7 +19520,8 @@ pub const Transformer = struct {
     /// Verify rows can form a draft tree: every per-row piece of this forward
     /// follows a row's ancestors (row-exact kernels, the GDN fold).
     pub fn specTreeSupported(self: *const Transformer) bool {
-        return self.config.rowExactDecode() and self.moe_layers != null and self.rht == null and gdnVerifyFoldEnabled() and gdnDecodeRecurEnabled();
+        return self.config.rowExactDecode() and self.moe_layers != null and self.rht == null and gdnVerifyFoldEnabled() and gdnDecodeRecurEnabled() and
+            (!gdn_decode.treeReplayEnabled() or gdnDecodeFusedEnabled());
     }
 
     /// The quantized head's first `rows` vocab rows only (a draft vocabulary).
@@ -28977,7 +28978,7 @@ pub const Transformer = struct {
         }
 
         // Trees retain compact prework, not a full recurrent state per node.
-        if (gdn_decode.treeReplayEnabled()) if (self.spec_tree) |tree| {
+        if (self.spec_tree) |tree| if (gdn_decode.treeReplayEnabled()) {
             if (self.rht != null or batch != 1 or projected != null or !self.spec_capture_ssm or
                 !ssm.initialized or kernel != 4 or cfg.kda_vector_gate or cfg.kdaUsesBoundedGate()) return error.SpecTreeUnsupported;
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
@@ -33447,9 +33448,6 @@ fn quantParamsOrDense(cfg: *const ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_arr
     return computeQuantParams(cfg, w, sc, in_dim);
 }
 
-/// A row-exact 4/6/8-bit matmul: Nemotron-H's thin MoE trunk streams faster
-/// through `rowqmv`'s per-row matvecs, the dense Qwen3.8 through `simd_qmm`,
-/// whose multi-row MMA reads each weight once. Null outside both.
 fn dflashNaxTarget(cfg: *const ModelConfig) bool {
     // Experimental dispatch is scoped to the Qwen 27B target being validated.
     // Other families may have additional width-dependent projection fusions.
@@ -33457,6 +33455,9 @@ fn dflashNaxTarget(cfg: *const ModelConfig) bool {
         cfg.rowExactDecode() and @import("dflash_nax.zig").enabled() and verifyQmmNaxAvailable();
 }
 
+/// A row-exact 4/6/8-bit matmul: Nemotron-H's thin MoE trunk streams faster
+/// through `rowqmv`'s per-row matvecs, the dense Qwen3.8 through `simd_qmm`,
+/// whose multi-row MMA reads each weight once. Null outside both.
 fn rowExactQmm(cfg: *const ModelConfig, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!std.mem.eql(u8, cfg.model_type, "nemotron_h")) {
         const dflash_nax = @import("dflash_nax.zig");

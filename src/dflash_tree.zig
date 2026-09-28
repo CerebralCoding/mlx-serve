@@ -6,14 +6,15 @@ const dflash = @import("dflash.zig");
 
 pub const MAX_NODES = 15;
 pub fn nodeBudget(proposal: u32) usize {
-    const raw = std.c.getenv("MLX_SERVE_DFLASH_TREE_NODES") orelse return @min(proposal -| 1, MAX_NODES);
+    const default = @min(proposal -| 1, MAX_NODES);
+    const raw = std.c.getenv("MLX_SERVE_DFLASH_TREE_NODES") orelse return default;
     // Zero is a correctness control: verify only the pending token, using the
     // identical target kernels/state path as a full tree, without speculation.
-    return @min(std.fmt.parseInt(usize, std.mem.span(raw), 10) catch MAX_NODES, MAX_NODES);
+    return @min(std.fmt.parseInt(usize, std.mem.span(raw), 10) catch default, MAX_NODES);
 }
+var allocate_env: ?bool = null;
 pub fn allocationEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_DFLASH_TREE_ALLOCATE") orelse return false;
-    return !std.mem.eql(u8, std.mem.span(raw), "0");
+    return @import("dflash_nax.zig").envOnCached(&allocate_env, "MLX_SERVE_DFLASH_TREE_ALLOCATE");
 }
 const Calibration = struct {
     depth_edges: [6]u32,
@@ -172,4 +173,19 @@ test "dflash tree allocation: probability ordering preserves ancestry and select
     try std.testing.expectEqual(@as(usize, 4), costs.choose(9000, p[0..4]));
     costs.resetFor(16);
     try std.testing.expectEqual(@as(usize, 4), costs.choose(100, p[0..4]));
+}
+
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "dflash tree nodeBudget: an unparsable MLX_SERVE_DFLASH_TREE_NODES keeps the default" {
+    defer _ = unsetenv("MLX_SERVE_DFLASH_TREE_NODES");
+    _ = unsetenv("MLX_SERVE_DFLASH_TREE_NODES");
+    try std.testing.expectEqual(@as(usize, 7), nodeBudget(8));
+    _ = setenv("MLX_SERVE_DFLASH_TREE_NODES", "lots", 1);
+    try std.testing.expectEqual(@as(usize, 7), nodeBudget(8));
+    _ = setenv("MLX_SERVE_DFLASH_TREE_NODES", "0", 1);
+    try std.testing.expectEqual(@as(usize, 0), nodeBudget(8));
+    _ = setenv("MLX_SERVE_DFLASH_TREE_NODES", "99", 1);
+    try std.testing.expectEqual(@as(usize, MAX_NODES), nodeBudget(8));
 }

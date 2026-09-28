@@ -5671,7 +5671,7 @@ pub const Generator = struct {
         self.ctx.tree = null;
         self.ctx.pipeline_build = 0;
         const logits = try verify_logits;
-        self.dflash_attempted += 1;
+        if (selected > 0) self.dflash_attempted += 1;
 
         var targets = blk: {
             defer _ = mlx.mlx_array_free(logits);
