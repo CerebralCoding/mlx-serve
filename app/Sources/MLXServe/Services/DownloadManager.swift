@@ -1108,6 +1108,16 @@ class DownloadManager: ObservableObject {
         activeTasks[repo] = task
     }
 
+    /// `startUpdate` for one listed model, clearing its update badge once the files landed.
+    func applyUpdate(_ check: UpdateCheck, for model: LocalModel, onFinish: @escaping @MainActor () -> Void) {
+        startUpdate(check) { [weak self] in
+            onFinish()
+            guard let self, self.downloads[check.repo]?.status == .completed else { return }
+            self.updateChecks[model.id] = nil
+            self.packUpdates[model.name] = nil
+        }
+    }
+
     private static func fileSelections(_ selection: UpdateSelection) -> [FileSelection] {
         switch selection {
         case .chat(let drafter): return [.chatDefault] + (drafter ? [.packFolder(DrafterGems.packFolder)] : [])
