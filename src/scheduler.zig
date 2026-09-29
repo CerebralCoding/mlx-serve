@@ -1972,7 +1972,7 @@ pub const Scheduler = struct {
         var owned = cpu_state;
         var owned_active: bool = true;
         defer if (owned_active) freeCpuState(self.allocator, &owned);
-        applyModelSettings(owned.config, owned.chat_config, &settings);
+        applyModelSettings(owned.config, owned.chat_config, &settings, self.mtp_enabled);
         // The resolved .gguf path (when this is a GGUF entry) is borrowed by
         // the LoadRequest until `done`; the engines dupe what they keep, so
         // it's released here on success AND failure.
@@ -2700,10 +2700,11 @@ const GgufRoute = struct {
 /// Both load construction sites (here and main.zig's startup load) stamp the
 /// per-model settings onto the config the bills and defaults read.
 /// The kwargs strings MOVE to the freshly loaded `chat_config` (same allocator).
-pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *model_settings.Override) void {
+/// `mtp_flag` false (`--no-mtp`) stamps the head off so the memory bills skip it.
+pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *model_settings.Override, mtp_flag: bool) void {
     config.ctx_override = o.ctx_size orelse 0;
     config.kv_quant_override = o.kv_quant;
-    config.mtp_override = o.mtp;
+    config.mtp_override = o.mtp orelse if (mtp_flag) null else false;
     config.mtp_acceptance_override = o.mtp_acceptance;
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.int8_prefill_override = o.int8_prefill;
@@ -10541,4 +10542,19 @@ test "takeMergeable: merges the contiguous run of same-model decision jobs withi
     batch[0] = &media;
     try q.append(a, &r[1]);
     try testing.expectEqual(@as(usize, 1), takeMergeable(&q, &batch, 1));
+}
+
+test "applyModelSettings: --no-mtp stamps the head off unless the model's own setting names it" {
+    var cc = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    for ([_]struct { flag: bool, setting: ?bool, want: ?bool }{
+        .{ .flag = false, .setting = null, .want = false },
+        .{ .flag = false, .setting = true, .want = true },
+        .{ .flag = true, .setting = null, .want = null },
+        .{ .flag = true, .setting = false, .want = false },
+    }) |c| {
+        var cfg = ModelConfig{};
+        var o = model_settings.Override{ .mtp = c.setting };
+        applyModelSettings(&cfg, &cc, &o, c.flag);
+        try testing.expectEqual(c.want, cfg.mtp_override);
+    }
 }
