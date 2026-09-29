@@ -18,6 +18,7 @@ const row_attn = @import("row_attn.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const sushi_exl3 = @import("sushi_exl3");
 const qmv_nax2 = @import("qmv_nax2.zig");
+const qmm_int8 = @import("qmm_int8.zig");
 const gdn_decode = @import("gdn_decode.zig");
 const mamba2_decode = @import("mamba2_decode.zig");
 const add_norm = @import("add_norm.zig");
@@ -16264,6 +16265,9 @@ pub const Transformer = struct {
     /// A 2-bit group-128 pack without rotations whose every matmul weight has
     /// biases == -scales (Prism's ternary codec): qmv2's ternary kernel applies.
     ternary_2bit: bool = false,
+    /// LOSSY int8-activation prefill (`qmm_int8`), per model: allocated when its
+    /// `int8_prefill` setting (else the process default) turns the route on.
+    int8_cache: ?*qmm_int8.Cache = null,
 
     // When non-null, the next forward pass captures the post-final-norm
     // hidden state at the last position into the pointed-to array
@@ -16933,6 +16937,13 @@ pub const Transformer = struct {
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
         }
 
+        const int8_on = config.int8_prefill_override orelse qmm_int8.enabled();
+        var int8_cache: ?*qmm_int8.Cache = null;
+        errdefer if (int8_cache) |c| allocator.destroy(c);
+        if (int8_on) {
+            int8_cache = try allocator.create(qmm_int8.Cache);
+            int8_cache.?.* = .{};
+        }
         var rht_registry: ?*rht.Registry = null;
         errdefer if (rht_registry) |reg| {
             reg.deinit();
@@ -17066,6 +17077,7 @@ pub const Transformer = struct {
             .moe_owned_bf16 = moe_owned_bf16,
             .rht = rht_registry,
             .ternary_2bit = ternary_2bit,
+            .int8_cache = int8_cache,
             .hybrid_layers = hybrid_layers,
             .embedding_norm = embedding_norm_w,
             .prompt_cache = null,
@@ -17770,6 +17782,11 @@ pub const Transformer = struct {
             self.allocator.destroy(reg);
             self.rht = null;
         }
+        if (self.int8_cache) |c| {
+            c.deinit();
+            self.allocator.destroy(c);
+            self.int8_cache = null;
+        }
         if (self.compiled_forward) |cf| _ = mlx.mlx_closure_free(cf);
         if (self.compiled_gelu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
@@ -17907,6 +17924,9 @@ pub const Transformer = struct {
         // ternary ones without rotations. Every other 2-bit pack keeps stock qmm.
         if (self.rht) |reg| {
             const signs = reg.get(w);
+            // Prompt width with int8 on: the rotation rides the quantizer, so the
+            // rotated activation is never written (the narrow routes stop at 16 rows).
+            if (self.int8_cache) |ic| if (signs) |sg| if (try qmm_int8.qmmRotated(ic, x, sg, reg.block, w, sc, bi, qp.bits, qp.group_size, reg.bias_is_neg_scale, self.s)) |y| return y;
             const xr = if (signs) |sg| try reg.applyIn(x, sg, self.s) else x;
             defer if (signs != null) {
                 _ = mlx.mlx_array_free(xr);
@@ -17915,6 +17935,9 @@ pub const Transformer = struct {
             // 6 rows up it beats qmv2 on every 27B projection shape.
             if (try qmv_nax2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, self.s)) |y| return y;
             if (try qmv2.qmm(xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, true, self.s)) |y| return y;
+            // OPT-IN and LOSSY (activations to int8); declines unless the
+            // model or process enables it, and below prompt width.
+            if (self.int8_cache) |ic| if (try qmm_int8.qmm(ic, xr, w, sc, bi, qp.bits, qp.group_size, signs != null and reg.bias_is_neg_scale, self.s)) |y| return y;
             return qmatmulBits(xr, w, sc, bi, qp.bits, qp.group_size, qp.mode, self.s);
         }
         if (self.ternary_2bit) {
