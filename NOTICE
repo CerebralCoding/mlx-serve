@@ -113,6 +113,9 @@ Used in mlx-serve (`src/transformer.zig`):
     (`qsa_fast.py`, `qwen4_qsa_sparse_gqa`). The `msv_attn_qsa256` kernel
     body itself derives from our own `msv_attn_p256`, not from their source.
     thank you Jonathan Spangler.
+  * The segmented sorted NAX gather_qmm tile scan and affine matmul schedules,
+    with row-mapped inputs and paired gate/up SwiGLU epilogue, ported from
+    `omlx/patches/m5_gather_qmm_nax.py` at d6b2b92.
     
 Used in mlx-serve (`lib/ane/`, `src/ane.zig`):
 
@@ -236,6 +239,10 @@ kernel from `omlx/patches/mlx_vlm_qwen4_exp_compat/vendor/mlx_vlm/models/
 qwen4_exp/qsa_nax.py` at d6b2b92 (Apache-2.0).
 https://github.com/jundot/omlx/pull/4020
 Original mlx-serve QSA NAX implementation contributed by Nikolai V.
+
+`src/kernels/gather_qmm_nax_header.metal` adapts the NAX matmul fragment and
+MMA helpers from MLX's `steel/gemm/nax.h` (Copyright (c) 2025 Apple Inc., MIT
+License).
 
 --------------------------------------------------------------------------------
 mlx-lm
