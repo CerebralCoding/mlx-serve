@@ -96,7 +96,7 @@ Feature = unit test that fails without it (+ integration script if HTTP-observab
 
 **Class bugs get class guards.** A live failure revealing a CLASS ships: the instance regression test; a corpus entry or universal invariant in `src/format_corpus_test.zig`; a rule here + story in `docs/gotchas/`.
 
-Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dtest-filter="tool traffic"`. Full matrix: `tests/CLAUDE.md`.
+Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -Dtest-filter="tool traffic"` (the replay is gated behind `-Dslow-tests`; the bare filter compiles and reports success without running it). Full suite: `zig build test -Dslow-tests`. Full matrix: `tests/CLAUDE.md`.
 
 ## Releases & benchmarking
 
