@@ -2789,6 +2789,33 @@ pub fn qsaGatherMinKv() c_int {
     return v;
 }
 
+/// The prefill floor where the tensor-unit QSA kernel serves: it beats the mask arm from the
+/// first sparse chunk (Flash Next, M5 Ultra, first 8192-row chunk: QSA stage 634 -> 120 ms per
+/// chunk). At or below (top-512 + 1) * 4 keys every block is visible and there is nothing to skip.
+pub const QSA_GATHER_MIN_KV_NAX: c_int = 2052;
+
+/// The kv floor for prefill widths. `MLX_SERVE_QSA_GATHER_MIN_KV` and the test override win;
+/// otherwise the NAX floor when the tensor-unit kernel serves, else the stock gather's floor.
+/// Decode and verify widths keep `qsaGatherMinKv`: their gathers do not use the NAX kernel.
+pub fn qsaPrefillGatherMinKv() c_int {
+    if (qsa_gather_min_kv_override != null) return qsaGatherMinKv();
+    if (std.c.getenv("MLX_SERVE_QSA_GATHER_MIN_KV") != null) return qsaGatherMinKv();
+    if (!qsaNaxEnabled() or !qsaNaxOsOk() or !verifyQmmNaxAvailable()) return qsaGatherMinKv();
+    return QSA_GATHER_MIN_KV_NAX;
+}
+
+test "qsa prefill floor: the NAX floor only where the tensor-unit kernel serves, overrides win" {
+    defer qsa_nax_override = null;
+    defer qsa_gather_min_kv_override = null;
+    qsa_nax_override = false;
+    try std.testing.expectEqual(qsaGatherMinKv(), qsaPrefillGatherMinKv());
+    qsa_nax_override = true;
+    if (qsaNaxOsOk() and verifyQmmNaxAvailable() and std.c.getenv("MLX_SERVE_QSA_GATHER_MIN_KV") == null)
+        try std.testing.expectEqual(QSA_GATHER_MIN_KV_NAX, qsaPrefillGatherMinKv());
+    qsa_gather_min_kv_override = 5000;
+    try std.testing.expectEqual(@as(c_int, 5000), qsaPrefillGatherMinKv());
+}
+
 pub const QSA_GATHER_BK_DEFAULT: c_int = 32;
 var qsa_gather_bk_cached: ?c_int = null;
 pub var qsa_gather_bk_override: ?c_int = null;
@@ -3335,11 +3362,12 @@ fn qsaNaxRunProbe() bool {
     defer _ = mlx.mlx_array_free(k);
     const v = qsaProbeLcgBf16(s, &[_]c_int{ 1, 2, 16, 256 }, 0xC0FFEE3) orelse return false;
     defer _ = mlx.mlx_array_free(v);
-    var blk: [16 * 4]i32 = undefined;
+    var blk: [16 * 512]i32 = undefined;
     for (0..16) |r| {
-        for (0..4) |b| blk[r * 4 + b] = @intCast(b);
+        const complete = (r + 1) / 4;
+        for (0..512) |b| blk[r * 512 + b] = if (b < complete) @intCast(b) else std.math.maxInt(i32);
     }
-    const bshape = [_]c_int{ 1, 16, 4 };
+    const bshape = [_]c_int{ 1, 16, 512 };
     const blocks = mlx.mlx_array_new_data(&blk, &bshape, 3, .int32);
     defer _ = mlx.mlx_array_free(blocks);
     const scale: f32 = 1.0 / 16.0;
@@ -3435,7 +3463,16 @@ pub fn gatherQsa256(
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
 
     qsaNaxArm();
-    var use_nax = qsaNaxEnabled() and qsaNaxEligible(
+    const qst = mlx.mlx_array_strides(q);
+    const kst = mlx.mlx_array_strides(k);
+    const vst = mlx.mlx_array_strides(v);
+    const bst = mlx.mlx_array_strides(blocks);
+    const nax_aligned = qst[3] == 1 and kst[3] == 1 and vst[3] == 1 and bst[2] == 1 and
+        qst[1] % 8 == 0 and qst[2] % 8 == 0 and
+        kst[1] % 8 == 0 and kst[2] % 8 == 0 and
+        vst[1] % 8 == 0 and vst[2] % 8 == 0;
+    var use_nax = nax_aligned and ratio == 4 and qs[0] == 1 and qs[1] == 24 and ks[1] == 2 and bs[2] == 512 and
+        qsaNaxEnabled() and qsaNaxEligible(
         mlx.mlx_array_dtype(q),
         mlx.mlx_array_dtype(k),
         mlx.mlx_array_dtype(v),
@@ -3496,7 +3533,7 @@ pub fn gatherQsa256(
     const engaged_bit: u5 = qsaEngagedBit(.prefill_gather, qs[2]) + @as(u5, if (use_nax) 16 else 0);
     if (qsa_engaged_bits.take(engaged_bit)) {
         const tgmem: usize = if (use_nax)
-            @as(usize, @intCast(bk)) * 264 * 2 + 2 * 512 * 4
+            2 * 8 * 32 * 4
         else
             @as(usize, @intCast(bk + 8)) * 256 * 2;
         if (use_nax) {
@@ -5243,8 +5280,8 @@ pub fn qsaFusedVerifyServes(quantized: bool, seq_len: c_int) bool {
 pub fn qsaWantsBlocks(batch: c_int, kv: c_int, seq_len: c_int, quantized: bool) bool {
     if (batch != 1 or !qsaGatherEnabled()) return false;
     if (qsaFusedVerifyServes(quantized, seq_len)) return true;
+    if (seq_len >= FUSED256_MIN_Q_LEN) return kv > qsaPrefillGatherMinKv();
     if (kv <= qsaGatherMinKv()) return false;
-    if (seq_len >= FUSED256_MIN_Q_LEN) return true;
     if (seq_len == 1) return qsaDecodeGatherEnabled();
     return qsaVerifyGatherEnabled() and kv > qsaVerifyGatherMinKvFor(quantized);
 }
@@ -23480,9 +23517,12 @@ pub const Transformer = struct {
                 }
             }
         }
+        const prof = Qwen4AttnProf.begin(x, seq_len);
+        defer Qwen4AttnProf.active = false;
         if (fa.idx_qk_w.ctx != null and !qwen4Standin().attn_qsa) {
             ctx.qsa_mask = try self.qsaMask(ctx, x, fa, entry, layer, cache_len, pos_base, batch, seq_len);
         }
+        if (prof) Qwen4AttnProf.lap(if (ctx.qsa_blocks.ctx != null) ctx.qsa_blocks else ctx.qsa_mask, .indexer);
         if (ctx.head_place) |p| {
             const vis = try headPlaceVisibility(self.s, ctx.qsa_mask, p, @intCast(self.config.indexer_compress_ratio), cache_len + seq_len);
             if (ctx.qsa_mask.ctx != null) _ = mlx.mlx_array_free(ctx.qsa_mask);
@@ -23497,7 +23537,9 @@ pub const Transformer = struct {
                 Qwen4Trace.set(&tr.qsa_mask, m);
             }
         };
-        return self.gatedFullAttnProjected(ctx, x, fa, layer, pos_base + cache_len, batch, seq_len, is_prefill, projected, skip_output);
+        const out = try self.gatedFullAttnProjected(ctx, x, fa, layer, pos_base + cache_len, batch, seq_len, is_prefill, projected, skip_output);
+        if (prof) Qwen4AttnProf.lap(out, .tail);
+        return out;
     }
 
     /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
@@ -24941,6 +24983,7 @@ pub const Transformer = struct {
         ctx.moe_seq_offset.* += @intCast(seq_len);
         dt.end(h);
         prof.report(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)), ctx.capture_ssm_seq, cfg.num_hidden_layers - cfg.attnCacheLayerCount(), cfg.attnCacheLayerCount());
+        Qwen4AttnProf.flush(seq_len, @as(usize, @intCast(offset)) + @as(usize, @intCast(seq_len)));
         if (ctx.capture_stream_all) |target| _ = mlx.mlx_array_set(target, h);
         // On this arch the spec "hidden" IS the pre-mixer stream: the MTP head
         // consumes `[B, L, hc*hidden]`, never the mixed 2560 (vLLM/SGLang).
@@ -27336,7 +27379,13 @@ pub const Transformer = struct {
             // (causal folded in). Prefill gathers them by index; decode/
             // verify widths (and a declined gather) run under the bool mask.
             const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
+            if (Qwen4AttnProf.active) {
+                Qwen4AttnProf.sync(full_k);
+                Qwen4AttnProf.sync(full_v);
+                Qwen4AttnProf.lap(q_rope, .proj);
+            }
             const served = try qsaSlotAttn(self.s, q_rope, &kv_view, ctx.qsa_blocks, &ctx.qsa_mask, &ctx.qsa_arms, seq_len, ratio, attn_scale);
+            if (Qwen4AttnProf.active) Qwen4AttnProf.lap(served.out, .qsa);
             if (self.cost_trace_active) self.cost_attention |= served.cost_bit;
             _ = mlx.mlx_array_free(attn_out);
             attn_out = served.out;
@@ -35319,6 +35368,52 @@ const ProfClock = struct {
         const d = cum - self.mark_ns;
         self.mark_ns = cum;
         return d;
+    }
+};
+
+/// QWEN4_PROFILE_ATTN=1: split every qwen4_exp full-attention layer of a prefill forward (S > 16)
+/// into the QSA indexer, q/k/v projection + rope + KV append, the QSA kernel, and the gate + o_proj
+/// tail, with a sync at each boundary. Summed over the forward's layers and logged once per
+/// forward next to `[qwen4-prof]`. Diagnostic only, never on by default.
+const Qwen4AttnProf = struct {
+    const Stage = enum(u2) { indexer, proj, qsa, tail };
+    var on: ?bool = null;
+    var active = false;
+    var clock: ProfClock = undefined;
+    var ns: [4]u64 = @splat(0);
+    var layers: u32 = 0;
+
+    fn sync(arr: mlx.mlx_array) void {
+        if (arr.ctx == null) return;
+        mlx.check(mlx.mlx_array_eval(arr)) catch {};
+    }
+
+    /// Syncs `x` and starts the clock when profiling this layer; false otherwise.
+    fn begin(x: mlx.mlx_array, seq_len: c_int) bool {
+        if (on == null) on = diagEnvOn("QWEN4_PROFILE_ATTN");
+        if (!on.? or seq_len <= 16) return false;
+        sync(x);
+        clock = ProfClock.init();
+        active = true;
+        layers += 1;
+        return true;
+    }
+
+    fn lap(arr: mlx.mlx_array, stage: Stage) void {
+        sync(arr);
+        ns[@intFromEnum(stage)] += clock.lap();
+    }
+
+    fn flush(seq_len: c_int, kv: usize) void {
+        if (layers == 0) return;
+        const ms = struct {
+            fn f(n: u64) f64 {
+                return @as(f64, @floatFromInt(n)) / 1e6;
+            }
+        }.f;
+        log.info("[qwen4-attn] S={d} kv={d} layers={d} indexer {d:.3} ms  proj+rope+kv {d:.3} ms  qsa {d:.3} ms  gate+o_proj {d:.3} ms\n", .{ seq_len, kv, layers, ms(ns[0]), ms(ns[1]), ms(ns[2]), ms(ns[3]) });
+        ns = @splat(0);
+        layers = 0;
     }
 };
 
@@ -55837,6 +55932,7 @@ fn qsaNaxAssertNoWorseThanStock(
     qsa_nax_override = true;
     const nax = (try gatherQsa256(stream, q, k, v, scale, blocks, ratio)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(nax);
+    try std.testing.expect(qsa_gather_used_nax);
     const max_stock = try attn256MaxDiff(stock, ref, stream);
     const max_nax = try attn256MaxDiff(nax, ref, stream);
     std.debug.print("max_stock={e} max_nax={e} floor={e} bar={e}\n", .{ max_stock, max_nax, floor, @max(1.5 * max_stock, floor) });
@@ -55956,11 +56052,10 @@ test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
     var prng = std.Random.DefaultPrng.init(0x9a7e);
     const rnd = prng.random();
 
-    // qwen4_exp geometry (24/2 heads, hd 256, ratio 4) with a tiny block
-    // budget so the chunk's rows cross from "every block fits" to top-k.
+    // Early rows have fewer visible blocks than the selection capacity.
     const qL: c_int = 40;
     const kL: c_int = 101;
-    const kb: c_int = 6;
+    const kb: c_int = 512;
     const q_shape = [_]c_int{ 1, 24, qL, 256 };
     const kv_shape = [_]c_int{ 1, 2, kL, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -55981,6 +56076,12 @@ test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
         defer _ = mlx.mlx_array_free(out);
         try std.testing.expect(try attn256MaxDiff(out, ref, s) < 0.005);
     }
+    try std.testing.expect(qsa_gather_used_nax);
+    var smaller = try QsaBlockFixture.build(rnd, qL, kL, 6, 4);
+    defer smaller.deinit();
+    const fallback = (try gatherQsa256(s, q, k, v, scale, smaller.blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(fallback);
+    try std.testing.expect(!qsa_gather_used_nax);
 }
 
 test "gatherQsa256 NAX: max error vs f32 gather-softmax is at most 1.5x stock" {
@@ -55997,7 +56098,7 @@ test "gatherQsa256 NAX: max error vs f32 gather-softmax is at most 1.5x stock" {
     const rnd = prng.random();
     const qL: c_int = 40;
     const kL: c_int = 101;
-    const kb: c_int = 6;
+    const kb: c_int = 512;
     const q_shape = [_]c_int{ 1, 24, qL, 256 };
     const kv_shape = [_]c_int{ 1, 2, kL, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -56025,7 +56126,7 @@ test "gatherQsa256 NAX: online softmax rescale across 32-key tiles vs f32 gather
     const rnd = prng.random();
     const qL: c_int = 40;
     const kL: c_int = 203;
-    const kb: c_int = 32;
+    const kb: c_int = 512;
     const q_shape = [_]c_int{ 1, 24, qL, 256 };
     const kv_shape = [_]c_int{ 1, 2, kL, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -56040,6 +56141,34 @@ test "gatherQsa256 NAX: online softmax rescale across 32-key tiles vs f32 gather
     defer _ = mlx.mlx_array_free(k);
     const scale: f32 = 1.0 / 16.0;
     try qsaNaxAssertNoWorseThanStock(s, q, k, v, scale, fx.blocks, 4, 4.9e-4);
+}
+
+test "gatherQsa256 NAX: top-512 selection and partial causal tail vs f32 gather-softmax" {
+    if (!verifyQmmNaxAvailable() or !qsaNaxOsOk()) return error.SkipZigTest;
+    const saved_nax = qsa_nax_override;
+    qsa_nax_override = true;
+    defer qsa_nax_override = saved_nax;
+    if (!qsaNaxEnabled()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    qsa_gather_override = true;
+    defer qsa_gather_override = null;
+    var prng = std.Random.DefaultPrng.init(0x4020);
+    const rnd = prng.random();
+    const qL: c_int = 16;
+    const kb: c_int = 512;
+    const qshape = [_]c_int{ 1, 24, qL, 256 };
+    const q = try attn256RandBf16(rnd, &qshape, s);
+    defer _ = mlx.mlx_array_free(q);
+    for ([_]c_int{ 2053, 2153 }) |kL| {
+        const kvshape = [_]c_int{ 1, 2, kL, 256 };
+        const k = try attn256RandBf16(rnd, &kvshape, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try attn256RandBf16(rnd, &kvshape, s);
+        defer _ = mlx.mlx_array_free(v);
+        var fx = try QsaBlockFixture.build(rnd, qL, kL, kb, 4);
+        defer fx.deinit();
+        try qsaNaxAssertNoWorseThanStock(s, q, k, v, 1.0 / 16.0, fx.blocks, 4, 4.9e-4);
+    }
 }
 
 test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the stock arm" {
@@ -56059,7 +56188,7 @@ test "gatherQsa256 NAX: probe failure latches stock gather bit-identical to the 
     const rnd = prng.random();
     const qL: c_int = 16;
     const kL: c_int = 16;
-    const kb: c_int = 4;
+    const kb: c_int = 512;
     const q_shape = [_]c_int{ 1, 24, qL, 256 };
     const kv_shape = [_]c_int{ 1, 2, kL, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -56104,7 +56233,7 @@ test "gatherQsa256 NAX: a probe mismatch latches the stock gather" {
     const rnd = prng.random();
     const qL: c_int = 16;
     const kL: c_int = 16;
-    const kb: c_int = 4;
+    const kb: c_int = 512;
     const q_shape = [_]c_int{ 1, 24, qL, 256 };
     const kv_shape = [_]c_int{ 1, 2, kL, 256 };
     const q = try attn256RandBf16(rnd, &q_shape, s);
@@ -56182,7 +56311,7 @@ test "gatherQsa256 NAX: latch is consulted before NAX kernel construction" {
     defer _ = mlx.mlx_array_free(k);
     const v = try attn256RandBf16(rnd, &kv_shape, s);
     defer _ = mlx.mlx_array_free(v);
-    var fx = try QsaBlockFixture.build(rnd, qL, qL, 4, 4);
+    var fx = try QsaBlockFixture.build(rnd, qL, qL, 512, 4);
     defer fx.deinit();
     const out = (try gatherQsa256(s, q, k, v, 1.0 / 16.0, fx.blocks, 4)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(out);
@@ -56234,7 +56363,7 @@ test "gatherQsa256: stock then NAX each fire one engaged line" {
     defer _ = mlx.mlx_array_free(k);
     const v = try attn256RandBf16(rnd, &kv_shape, s);
     defer _ = mlx.mlx_array_free(v);
-    var fx = try QsaBlockFixture.build(rnd, qL, qL, 4, 4);
+    var fx = try QsaBlockFixture.build(rnd, qL, qL, 512, 4);
     defer fx.deinit();
     const scale: f32 = 1.0 / 16.0;
     qsa_nax_override = false;
@@ -57999,8 +58128,8 @@ test "qsa route: qsaWantsBlocks admits verify widths wherever the fused kernel s
     }
     // Decode and prefill keep their own floor.
     try std.testing.expect(!qsaWantsBlocks(1, qsaGatherMinKv(), 1, false));
-    try std.testing.expect(!qsaWantsBlocks(1, qsaGatherMinKv(), FUSED256_MIN_Q_LEN, false));
-    try std.testing.expect(qsaWantsBlocks(1, qsaGatherMinKv() + 1, FUSED256_MIN_Q_LEN, false));
+    try std.testing.expect(!qsaWantsBlocks(1, qsaPrefillGatherMinKv(), FUSED256_MIN_Q_LEN, false));
+    try std.testing.expect(qsaWantsBlocks(1, qsaPrefillGatherMinKv() + 1, FUSED256_MIN_Q_LEN, false));
     // The scheduler's pad estimate follows the same predicate.
     try std.testing.expectEqual(@as(c_int, 0), qsaBatchedGatherFloor(4, false));
 
