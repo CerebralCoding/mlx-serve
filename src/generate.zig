@@ -18962,7 +18962,7 @@ test "dflash: nextDflash greedy equals serial decode, invariants exact each roun
         defer tmp_a2.cleanup();
         var a2_buf: [512]u8 = undefined;
         const a2_path = a2_buf[0..try tmp_a2.dir.realPath(io, &a2_buf)];
-        try dflash_mod.TinyFix.writeAssistant2(io, tmp_a2.dir, a2_path, s);
+        try dflash_mod.TinyFix.writeAssistant2(io, tmp_a2.dir, a2_path, s, false);
 
         var xfm = try Transformer.init(io, allocator, config, &weights);
         defer xfm.deinit();
