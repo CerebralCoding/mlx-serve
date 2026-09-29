@@ -195,6 +195,7 @@ pub fn build(b: *std.Build) void {
     // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
     addLlamaLib(b, mod);
     addGgufModule(b, mod, target, optimize);
+    addExl3Module(b, mod, target, optimize);
 
     // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
     // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
@@ -262,6 +263,7 @@ pub fn build(b: *std.Build) void {
     addAneSources(b, test_mod);
     addLlamaLib(b, test_mod);
     addGgufModule(b, test_mod, target, optimize);
+    addExl3Module(b, test_mod, target, optimize);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -409,6 +411,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     // Jinja2 template engine — same vendored sources as the macOS graph, built
     // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
     addGgufModule(b, mod, target, optimize);
+    addExl3Module(b, mod, target, optimize);
     mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
     mod.addIncludePath(b.path("lib/jinja_cpp"));
 
@@ -579,6 +582,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
         },
     });
     addGgufModule(b, mod, ios_target, .ReleaseFast);
+    addExl3Module(b, mod, ios_target, .ReleaseFast);
 
     // Apple cross-compiles don't auto-resolve the SDK's libc/frameworks from
     // --sysroot alone, so wire them explicitly (resolved per slice via xcrun).
@@ -762,6 +766,28 @@ fn ggufRoot(b: *std.Build) std.Build.LazyPath {
     const dir = b.option([]const u8, "gguf-dir", "mlx-serve-gguf checkout to build against (default: lib/mlx-serve-gguf)");
     gguf_root = if (dir) |d| .{ .cwd_relative = b.pathJoin(&.{ d, "src/root.zig" }) } else b.path("lib/mlx-serve-gguf/src/root.zig");
     return gguf_root.?;
+}
+
+/// lib/sushi: EXL3 routed experts, Sushi's `sushi_exl3` module. It reaches
+/// mlx, log and io_util through `mlx_host`, so the host root exposes them.
+/// `-Dsushi-dir=/abs/path` builds against a checkout instead of the submodule.
+fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const exl3 = b.createModule(.{
+        .root_source_file = exl3Root(b),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_host", .module = host }},
+    });
+    host.addImport("sushi_exl3", exl3);
+}
+
+var exl3_root: ?std.Build.LazyPath = null;
+fn exl3Root(b: *std.Build) std.Build.LazyPath {
+    if (exl3_root) |r| return r;
+    const dir = b.option([]const u8, "sushi-dir", "sushi checkout to build against (default: lib/sushi)");
+    exl3_root = if (dir) |d| .{ .cwd_relative = b.pathJoin(&.{ d, "src/exl3/root.zig" }) } else b.path("lib/sushi/src/exl3/root.zig");
+    return exl3_root.?;
 }
 
 fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {

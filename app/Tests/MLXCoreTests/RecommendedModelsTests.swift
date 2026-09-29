@@ -135,7 +135,8 @@ final class RecommendedModelsTests: XCTestCase {
     /// Flash-Next sits above the 27B.
     func testMtpScoredPicksAreTheOnesShippingADraftHead() {
         let mtp = Set(allRecommended.filter(\.speedIsWithMtp).map(\.id))
-        XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next"])
+        XCTAssertEqual(mtp, ["qwen38-27b", "bonsai2-27b", "qwen36-35b-a3b", "qwen38-flash-next",
+                             "sushi-2bpw", "sushi-3bpw"])
         XCTAssertEqual(RecommendedModelPick.qwen36_35bA3b.speed, allRecommended.map(\.speed).max())
         XCTAssertGreaterThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen38_27b.speed)
         XCTAssertLessThan(RecommendedModelPick.qwen38FlashNext.speed, RecommendedModelPick.qwen36_35bA3b.speed)
@@ -174,7 +175,8 @@ final class RecommendedModelsTests: XCTestCase {
     /// point of carrying the flag.
     func testOnlyTheModelsAbsentFromTheIndexAreFlaggedEstimated() {
         let estimated = Set(allRecommended.filter(\.intelligenceIsEstimated).map(\.id))
-        XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next", "mimo-9b"])
+        XCTAssertEqual(estimated, ["qwen38-27b", "bonsai2-27b", "qwen38-flash-next", "mimo-9b",
+                                   "sushi-2bpw", "sushi-3bpw"])
     }
 
     /// The bar fractions the pane draws stay inside the track, and context —
@@ -292,6 +294,18 @@ final class RecommendedModelsTests: XCTestCase {
     /// never resident, so the honest RAM gate is the ~70 GB of weights plus
     /// headroom: inline on a 96 GB Mac (tight against Metal's default working
     /// set there), behind "Requires more RAM" on 64 GB.
+    /// Each Sushi pack lands the Mac its own README sizes it for, and not the tier below.
+    func testSushiPacksFitTheirMacTier() {
+        let tiers: [(RecommendedModelPick, UInt64, UInt64)] = [
+            (.sushi2bpw, 48, 32), (.sushi3bpw, 64, 48),
+        ]
+        for (pick, fits, below) in tiers {
+            XCTAssertTrue(pick.meetsSystemRequirements(physicalMemoryBytes: fits * GiB), pick.id)
+            XCTAssertFalse(pick.meetsSystemRequirements(physicalMemoryBytes: below * GiB), pick.id)
+            XCTAssertEqual(pick.intelligence, RecommendedModelPick.qwen38FlashNext.intelligence, pick.id)
+        }
+    }
+
     func testFlashNextFitsOn96GBButNotBelow() {
         let fn = RecommendedModelPick.qwen38FlashNext
         XCTAssertTrue(fn.meetsSystemRequirements(physicalMemoryBytes: 96 * GiB))
@@ -402,7 +416,8 @@ final class RecommendedModelsTests: XCTestCase {
     /// first like every other catalog: the ~100 GB Qwen 3.8 Flash-Next pack
     /// then the ~130 GB native-MLX DeepSeek-V4-Flash mirror.
     func testLargestSectionHoldsFlashNextThenDeepseek() {
-        XCTAssertEqual(RecommendedModelPick.largestCatalog.map(\.id), ["qwen38-flash-next", "deepseek-v4-flash"])
+        XCTAssertEqual(RecommendedModelPick.largestCatalog.map(\.id),
+                       ["sushi-2bpw", "sushi-3bpw", "qwen38-flash-next", "deepseek-v4-flash"])
         let fn = RecommendedModelPick.qwen38FlashNext
         XCTAssertEqual(fn.repoId, "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit")
         XCTAssertEqual(fn.quantLabel, "mixed 4/8-bit")
@@ -460,6 +475,7 @@ final class RecommendedModelsTests: XCTestCase {
         XCTAssertEqual(label("mlx-community/Hy3-oQ2e"), "oQ2e")
         XCTAssertEqual(label("ddalcu/DeepSeek-V4-Flash-0731-MLX-Serve-mixed-2-3-8bit"), "mixed 2/3/8-bit")
         XCTAssertEqual(label("ddalcu/DeepSeek-V4-Flash-0731-iQ-MLX-3.3bpw"), "iQ-MLX 3.3 bpw")
+        XCTAssertEqual(label("beamster/Qwen3.8-Flash-Next-Sushi-2.6bpw"), "Sushi 2.6 bpw")
         XCTAssertEqual(label("poolside/Laguna-S-2.1-NVFP4-mlx"), "NVFP4")
         XCTAssertEqual(label("x/y", gguf: "model-Q4_K_M.gguf"), "Q4_K_M")
         XCTAssertNil(label("x/plain-model"))

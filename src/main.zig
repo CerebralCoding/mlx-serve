@@ -1,6 +1,8 @@
 const std = @import("std");
 const build_options = @import("build_options");
-pub const mlx = @import("mlx.zig"); // pub: lib/mlx-serve-gguf reaches MLX through its host root
+// pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
+pub const mlx = @import("mlx.zig");
+pub const io_util = @import("io_util.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const model_mod = @import("model.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -24,7 +26,7 @@ const llama_arch = if (build_options.macos_engines) @import("arch/llama.zig") el
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
 const launch_mod = @import("launch.zig");
-const log = @import("log.zig");
+pub const log = @import("log.zig");
 const metrics_mod = @import("metrics.zig");
 const sleep_inhibit_mod = @import("sleep_inhibit.zig");
 const version_mod = @import("version.zig");
@@ -207,11 +209,8 @@ fn printUsage(io: std.Io) void {
         \\                        declines by name where the copy does not fit.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
         \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
-        \\  --mtp               Force the MTP head ON for MoE targets too.
-        \\                        Requests default to MTP only on DENSE models;
-        \\                        a MoE checkpoint that ships a sidecar is
-        \\                        otherwise reachable only via `enable_mtp:true`
-        \\                        in the request body.
+        \\  --mtp               No-op: a loaded MTP head drafts by default,
+        \\                        dense or MoE (--no-mtp turns it off).
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
         \\                        --kv-quant (default OFF: the head keeps
         \\                        dense bf16 KV).
@@ -566,11 +565,6 @@ pub fn main(init: std.process.Init) !void {
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
-    // --mtp: force the head ON for MoE targets too. Requests default to MTP
-    // only on DENSE targets (server.defaultEnableMtp); a MoE checkpoint that
-    // ships a sidecar is otherwise unreachable from clients that never send
-    // `enable_mtp:true` (llmprobe, Claude Code, curl).
-    var force_mtp = false;
     var mtp_head_kv_quant = false;
     var mtp_depth: u32 = 0; // 0 = auto (EV cap 8 on eligible M5 NAX, else 6; fixed cap 3); explicit wins
     var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
@@ -758,7 +752,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
-            force_mtp = true;
+            // The default now; still accepted so existing launch lines work.
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
@@ -1270,7 +1264,7 @@ pub fn main(init: std.process.Init) !void {
         if (model_dir.len == 0) {
             const discovery_for_registry = discovery_storage;
             discovery_storage = null; // ownership moves to the registry
-            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, force_mtp, cli_pld);
+            try runHeadlessServe(io, allocator, discovery_for_registry, host, port, ctx_size, timeout, reasoning_budget, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs, kv_quant_config, cli_pld);
             return;
         }
 
@@ -1488,7 +1482,6 @@ pub fn main(init: std.process.Init) !void {
             .default_pld_draft_len = cli_pld.draft_len,
             .default_pld_key_len = cli_pld.key_len,
             .kv_attn_mode = kv_attn_mode,
-            .default_force_mtp = force_mtp,
         });
     } else {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
@@ -1933,7 +1926,6 @@ fn runHeadlessServe(
     max_resident_mem_explicit: bool,
     idle_evict_secs: ?u32,
     kv_quant_config: transformer_mod.KVQuantConfig,
-    force_mtp: bool,
     pld: server_mod.PldDefaults,
 ) !void {
     log.info("mlx-serve {s} (headless — models load on demand)\n", .{VERSION});
@@ -2047,9 +2039,6 @@ fn runHeadlessServe(
         .default_pld_draft_len = pld.draft_len,
         .default_pld_key_len = pld.key_len,
         .kv_attn_mode = .auto,
-        // On-demand MLX loads auto-attach an MTP sidecar (LoadParams.mtp_enabled
-        // defaults true), so the MoE force flag has to reach this path too.
-        .default_force_mtp = force_mtp,
     });
 }
 

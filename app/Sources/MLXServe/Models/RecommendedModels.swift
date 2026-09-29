@@ -127,9 +127,10 @@ struct RecommendedModelPick: Identifiable, Hashable {
             let bits = name[r].dropFirst("mixed-".count).dropLast("bit".count).split(separator: "-")
             return "mixed \(bits.joined(separator: "/"))-bit"
         }
-        if let r = name.range(of: "iQ-MLX-[0-9.]+bpw", options: .regularExpression) {
-            let bpw = name[r].dropFirst("iQ-MLX-".count).dropLast("bpw".count)
-            return "iQ-MLX \(bpw) bpw"
+        if let r = name.range(of: "(iQ-MLX|Sushi)-[0-9.]+bpw", options: .regularExpression) {
+            let tag = name[r].dropLast("bpw".count)
+            let dash = tag.lastIndex(of: "-")!
+            return "\(tag[..<dash]) \(tag[tag.index(after: dash)...]) bpw"
         }
         if let r = name.range(of: "(?<![A-Za-z0-9])[0-9]+bit", options: .regularExpression) {
             return name[r].dropLast("bit".count) + "-bit"
@@ -392,7 +393,7 @@ extension RecommendedModelPick {
     /// Max, 26.9.2).
     static let qwen38FlashNext = RecommendedModelPick(
         id: "qwen38-flash-next",
-        name: "Qwen 3.8 Flash-Next",
+        name: "Qwen Flash-Next 4-8bit",
         tagline: "Frontier-class, still quick",
         blurb: "Qwen's largest model here — 125 billion parameters, of which it wakes only about 6 billion per word (mixture of experts), so it answers at a pace closer to a mid-size model than to one this big. Reasoning, coding and agent work at the same level as DeepSeek-V4-Flash, it reads images, and it ships with a built-in speed trick that drafts and double-checks several words at once. This is our own mixed 4/8-bit build, about 100 GB on disk, of which a 32 GB lookup table stays on disk while it runs, so it fits a Mac with 96 GB of memory.",
         repoId: "ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit",
@@ -406,6 +407,32 @@ extension RecommendedModelPick {
         activeParamsB: 6.0,
         ramOverrideGB: 78.0
     )
+
+    /// Qwen 3.8 Flash-Next in the Sushi project's packs (beamster): routed experts
+    /// in EXL3, served through lib/sushi. Scores are Flash-Next's own (the bars
+    /// describe the original weights), context is the checkpoint's YaRN 1M, and
+    /// the RAM gate is Sushi's README figure for a full 128k context (GiB).
+    static let sushi2bpw = sushi("2", sizeGB: 69.6, ramGB: 41.7, macGB: 48)
+    static let sushi3bpw = sushi("3", sizeGB: 85.0, ramGB: 56.1, macGB: 64)
+
+    private static func sushi(_ bpw: String, sizeGB: Double, ramGB: Double, macGB: Int) -> RecommendedModelPick {
+        RecommendedModelPick(
+            id: "sushi-\(bpw)bpw",
+            name: "Qwen Flash-Next Sushi \(bpw)bpw",
+            tagline: "EXL3 Variant for \(macGB) GB Macs",
+            blurb: "The same 125 billion parameter Qwen 3.8 Flash-Next, packed by the Sushi project to about \(bpw) bits per weight so it fits a Mac with \(macGB) GB of memory. Fewer bits means a smaller download and less memory, at a small cost in answer quality. Part of the download is a lookup table that stays on disk while it runs.",
+            repoId: "beamster/Qwen3.8-Flash-Next-Sushi-\(bpw)bpw",
+            sizeGB: sizeGB,
+            family: .largest,
+            intelligence: qwen38FlashNext.intelligence,
+            intelligenceIsEstimated: true,
+            speed: qwen38FlashNext.speed,
+            speedIsWithMtp: true,
+            contextTokens: 1_048_576,
+            activeParamsB: 6.0,
+            ramOverrideGB: ramGB
+        )
+    }
 
 }
 
@@ -429,7 +456,7 @@ extension RecommendedModelPick {
     /// DeepSeek-V4-Flash (~130 GB). Grouped by "needs a very large Mac"
     /// rather than by vendor.
     static let largestCatalog: [RecommendedModelPick] = [
-        .qwen38FlashNext, .deepseekV4Flash,
+        .sushi2bpw, .sushi3bpw, .qwen38FlashNext, .deepseekV4Flash,
     ]
 
     /// Every curated pick, across all three sections — the union the score

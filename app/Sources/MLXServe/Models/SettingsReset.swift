@@ -73,7 +73,6 @@ enum SettingsReset {
                 f("pldKeyLen") { $0.pldKeyLen = $1.pldKeyLen },
                 f("enableMTP") { $0.enableMTP = $1.enableMTP },
                 f("mtpDepth") { $0.mtpDepth = $1.mtpDepth },
-                f("mtpOnMoE") { $0.mtpOnMoE = $1.mtpOnMoE },
                 f("enableDSpark") { $0.enableDSpark = $1.enableDSpark },
             ]
 

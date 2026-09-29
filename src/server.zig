@@ -551,12 +551,6 @@ pub const ServerConfig = struct {
     /// 0 = flag not given). Agent clients send nothing, and an omitted budget is the rest of
     /// the window, which the admission bill reserves for. Read through `launchMaxTokensDefault`.
     default_max_tokens: u32 = 0,
-    /// `--mtp`: force the native MTP head ON for MoE targets too. The
-    /// per-request default is otherwise `sidecar loaded and !isMoe()` (the
-    /// verify-forward expert-routing caution the drafter shares), which makes
-    /// a MoE MTP checkpoint unreachable from any client that doesn't send
-    /// `enable_mtp:true` in the body. Per-request `enable_mtp` still wins.
-    default_force_mtp: bool = false,
 };
 
 /// Sampling-default resolution chain: request body > CLI launch flag >
@@ -570,40 +564,11 @@ fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T
 /// The ONE place this policy lives — every HTTP surface calls it, so a new
 /// surface can't silently ship a different default (the drafter-dispatch-hole
 /// lesson: an output-equality test cannot see a spec path that never engaged).
-///
-/// MoE targets default OFF because the verify forward pays the expert-routing
-/// penalty; `--mtp` (`default_force_mtp`) overrides that for operators who
-/// measured otherwise — the 35B-A3B sidecar holds ~73% per-draft.
-///
-/// `dsv4_stages`: DeepSeek-V4 DSpark — the checkpoint's OWN draft stages,
-/// designed for exactly this MoE trunk. `dsv4_stages` is true only when the
-/// stages were LOADED (opt-in `--dspark` + memory fit-gate, so `n_mtp > 0`);
-/// then requests default ON outright (the qwen MoE-verify caution is about
-/// a bolted-on sidecar, not a native design). Like qwen MTP it is never
-/// subject to the n-gram prompt gate; explicit `enable_mtp:false` opts out
-/// per request.
-///
-/// `native_measured`: same exemption, for an arch whose head ships inside the
-/// checkpoint AND has been measured no-worse-than-serial across the context
-/// ladder (`Transformer.nativeMoeMtpHeadMeasured`, which carries the bar). It
-/// still needs a head LOADED — the claim is about the head, not the arch.
-/// `--mtp` process-wide, or the model's own `"mtp": true` in `model-settings.json`.
-fn forceMtpFor(config: *const model_mod.ModelConfig) bool {
-    return config.mtp_override == true or server_config.default_force_mtp;
-}
-
-pub fn defaultEnableMtp(mtp_loaded: bool, is_moe: bool, force: bool, dsv4_stages: bool, native_measured: bool) bool {
-    if (dsv4_stages) return true;
-    if (!mtp_loaded) return false;
-    return !is_moe or force or native_measured;
-}
-
-/// Does this model's MTP head carry the measured native-MoE exemption above?
-/// Mirrors `dsv4DraftStages` — a NAMED per-arch capability read once here, so
-/// the four call sites can never disagree (the list-of-one class).
-fn nativeMeasuredMoeHead(lm: *LoadedModel) bool {
-    const x = lm.transformer orelse return false;
-    return x.nativeMoeMtpHeadMeasured();
+/// A loaded head drafts, dense or MoE; `--no-mtp`, a model's `"mtp": false` or a
+/// request's `enable_mtp:false` opt out. `dsv4_stages`: DeepSeek-V4's own DSpark
+/// stages, loaded only on opt-in `--dspark`, which carry no qwen head.
+pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
+    return mtp_loaded or dsv4_stages;
 }
 
 /// Does this model serve DeepSeek-V4 with DSpark draft stages loaded?
@@ -1961,9 +1926,6 @@ pub fn serve(
         log.info("DFlash speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
     } else if (scheduler.drafter != null and scheduler.dflash == null) {
         log.info("Drafter speculative decoding: ENABLED (block_size={d}; default for new requests)\n", .{scheduler.drafter_block_size});
-    }
-    if (server_config.default_force_mtp) {
-        log.info("MTP: forced ON for MoE targets (--mtp; default for new requests)\n", .{});
     }
     if (transformer_mod.Transformer.mtp_head_kv_quant_flag) {
         log.info("MTP head KV: following --kv-quant (--mtp-head-kv-quant)\n", .{});
@@ -4422,7 +4384,8 @@ test "the clamp bills the context that will be SERVED, not the placeholder" {
     const t = std.testing;
     transformer_mod.qsa_score_fused_override = false;
     defer transformer_mod.qsa_score_fused_override = null;
-    const cfg = qwen4RequestTestConfig();
+    var cfg = qwen4RequestTestConfig();
+    cfg.mtp_override = false; // the trunk's bill; the head term has its own test
     const kv_bits: u64 = 8;
     const MiB: u64 = 1 << 20;
     const active: u64 = 69_827 * MiB;
@@ -4613,7 +4576,8 @@ test "the load-time session bill is billed at the boot's --kv-quant, not bf16" {
     // `off` alike (dense 29,952 B/tok): `defaultKvBits` asked `global_scheduler`, which `serve`
     // assigns only after `Scheduler.init` performs the load.
     const t = std.testing;
-    const cfg = qwen4RequestTestConfig();
+    var cfg = qwen4RequestTestConfig();
+    cfg.mtp_override = false; // the trunk's bill; the head term has its own test
     const MiB: u64 = 1 << 20;
     transformer_mod.qsa_history_share_override = true;
     defer transformer_mod.qsa_history_share_override = null;
@@ -5486,8 +5450,13 @@ fn mtpHeadStateBytesPerToken(config: *const model_mod.ModelConfig) u64 {
     return statePerTokenBilled(config) / n;
 }
 
+/// A loaded head drafts by default, so its KV is billed unless the model opts out.
+fn mtpHeadBilled(config: *const model_mod.ModelConfig) bool {
+    return config.mtp_override != false;
+}
+
 fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
-    const head: u64 = if (forceMtpFor(config)) mtpHeadKvBytesPerToken(config) +| mtpHeadStateBytesPerToken(config) else 0;
+    const head: u64 = if (mtpHeadBilled(config)) mtpHeadKvBytesPerToken(config) +| mtpHeadStateBytesPerToken(config) else 0;
     return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config) +| head;
 }
 
@@ -5509,7 +5478,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
     const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(config)), seq);
     // Only the headroom is new here: the prompt's own rows are already billed.
     const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
-    const mtp_on = warm.mtp_on or forceMtpFor(config);
+    const mtp_on = warm.mtp_on;
     const head_per_tok: u64 = if (mtp_on) mtpHeadKvBytesPerToken(config) else 0;
     const head_qsa_ring: u64 = if (mtp_on) mtpHeadQsaRingBytes(config) else 0;
     const head_state_per_tok: u64 = if (mtp_on) mtpHeadStateBytesPerToken(config) else 0;
@@ -7406,7 +7375,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .mtp_loaded = mtpCapable(lm),
-        .mtp_default_on = defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm)),
+        .mtp_default_on = defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm)),
         .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
@@ -8885,7 +8854,7 @@ fn handleChatCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
@@ -9277,7 +9246,7 @@ fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // Log the request
@@ -15192,7 +15161,7 @@ fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
     if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
@@ -17114,7 +17083,7 @@ fn handleResponsesInner(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, config.isMoe(), forceMtpFor(config), dsv4DraftStages(lm), nativeMeasuredMoeHead(lm));
+        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
     if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
@@ -22270,31 +22239,12 @@ test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" 
     try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
 }
 
-test "defaultEnableMtp: --mtp forces the native head on for MoE targets" {
+test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {
     const t = std.testing;
-    // No sidecar loaded → never on, whatever the operator asked for.
-    try t.expect(!defaultEnableMtp(false, false, false, false, false));
-    try t.expect(!defaultEnableMtp(false, true, true, false, false));
-    // Dense target with a sidecar → on by default (unchanged behavior).
-    try t.expect(defaultEnableMtp(true, false, false, false, false));
-    try t.expect(defaultEnableMtp(true, false, true, false, false));
-    // MoE target → OFF by default (the verify-forward routing caution) ...
-    try t.expect(!defaultEnableMtp(true, true, false, false, false));
-    // ... but ON when the operator passed --mtp. Without this, a MoE MTP
-    // checkpoint is unreachable from any client that doesn't send
-    // `enable_mtp:true` in the body (llmprobe, Claude Code, curl).
-    try t.expect(defaultEnableMtp(true, true, true, false, false));
-    // DSpark: dsv4's own stages default ON outright — MoE-ness and --mtp
-    // never gate the checkpoint's native draft design.
-    try t.expect(defaultEnableMtp(false, true, false, true, false));
-    try t.expect(defaultEnableMtp(false, false, false, true, false));
-    // A MEASURED native MoE head defaults ON despite is_moe — the
-    // caution above is about a bolted-on sidecar paying expert routing it was
-    // never designed around, and this arch was measured no-worse-than-serial
-    // at every context rung on two prompt shapes.
-    try t.expect(defaultEnableMtp(true, true, false, false, true));
-    // The claim is about the HEAD, so it still needs one loaded.
-    try t.expect(!defaultEnableMtp(false, true, false, false, true));
+    try t.expect(!defaultEnableMtp(false, false));
+    try t.expect(defaultEnableMtp(true, false));
+    // DSpark: dsv4's own stages, loaded without a qwen head.
+    try t.expect(defaultEnableMtp(false, true));
 }
 
 test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmprobe chat caching)" {
@@ -23695,9 +23645,6 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const qsa_fused_off = qsaScoreFusedOffGuard();
     defer qsa_fused_off.deinit();
     const t = std.testing;
-    const saved_force = server_config.default_force_mtp;
-    defer server_config.default_force_mtp = saved_force;
-    server_config.default_force_mtp = false;
     const saved_ov = transformer_mod.Transformer.mtp_head_kv_quant_override;
     defer transformer_mod.Transformer.mtp_head_kv_quant_override = saved_ov;
     transformer_mod.Transformer.mtp_head_kv_quant_override = false;
@@ -23705,8 +23652,8 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     defer configured_kv_quant = saved_boot;
     configured_kv_quant = transformer_mod.KVQuantConfig.affine(8);
     var cfg = qwen4ExpOomConfig();
-    cfg.mtp_override = null;
-    try t.expect(!forceMtpFor(&cfg));
+    cfg.mtp_override = false;
+    try t.expect(!mtpHeadBilled(&cfg));
     const seq: u64 = 200_000;
     const chunk: u64 = 4096;
     const max_tokens: u64 = 8192;

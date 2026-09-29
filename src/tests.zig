@@ -1,7 +1,10 @@
 // Test root — imports all modules to run their embedded tests.
 // Run with: zig build test
 
-pub const mlx = @import("mlx.zig"); // pub: lib/mlx-serve-gguf reaches MLX through its host root
+// pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
+pub const mlx = @import("mlx.zig");
+pub const io_util = @import("io_util.zig");
+pub const log = @import("log.zig");
 
 test {
     _ = @import("log.zig");

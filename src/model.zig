@@ -3,6 +3,7 @@ const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
+const sushi_exl3 = @import("sushi_exl3");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
@@ -285,6 +286,9 @@ pub const ModelConfig = struct {
     indexer_head_dim: u32 = 0,
     indexer_budget: u32 = 0,
     indexer_compress_ratio: u32 = 0,
+    /// Routed experts in EXL3 (Sushi packs, `expert_quant` in config.json),
+    /// served by lib/sushi; null = the pack's own affine banks.
+    exl3: ?sushi_exl3.Spec = null,
     /// The TEXT config's own eos (its first entry): the n-gram hash's segment
     /// reset token, independent of the generation-time stop set.
     ngram_eos: u32 = 0,
@@ -2554,6 +2558,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             if (config.num_eos_tokens == 0) config.addEosToken(config.ngram_eos);
         }
         try validateQwen4Config(&config);
+        if (jsonField(root, "expert_quant") != null) {
+            config.exl3 = try sushi_exl3.parseExpertQuant(root);
+            try sushi_exl3.admitTopK(config.num_experts_per_tok);
+        }
     } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
         std.mem.eql(u8, model_type, "qwen3_moe_text"))
     {
@@ -7173,6 +7181,17 @@ test "parseConfigFromJson: qwen4_exp YaRN rope_parameters extends 262144 to 1048
     // 12 layers × 2 kv heads × (K+V) × 256 dims × 2 bytes = 24 KiB per token.
     try testing.expectEqual(@as(u32, 12), c.attnCacheLayerCount());
     try testing.expectEqual(@as(u64, 24_576), c.kvBytesPerToken());
+}
+
+test "parseConfigFromJson: a Sushi qwen4_exp pack's expert_quant selects EXL3 banks" {
+    const eq = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mcg\",\"window\":15},";
+    const c = try parseConfigFromJson(testing.allocator, eq ++ QWEN4_SHIPPED[1..]);
+    try testing.expect(c.exl3 != null);
+    try testing.expectEqual(@as(u32, 32), c.exl3.?.rate.n);
+    try testing.expectEqual(sushi_exl3.format.Codebook.mcg, c.exl3.?.codebook);
+    try testing.expect((try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED)).exl3 == null);
+    const bad = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mul2\"},";
+    try testing.expectError(error.ExpertLayoutUnsupported, parseConfigFromJson(testing.allocator, bad ++ QWEN4_SHIPPED[1..]));
 }
 
 test "parseConfigFromJson: the shipped (unscaled) qwen4_exp config is untouched" {

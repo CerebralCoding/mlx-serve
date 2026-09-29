@@ -1909,7 +1909,7 @@ private struct LocalModelRow: View {
         hasOverrides = o?.hasSettings ?? false
         guard model.isChatPickable, model.quantFile == nil else { return }
         badge = DrafterGems.badge(o ?? ModelOverride(), modelDir: model.path, hasMtpHead: model.hasMtpHead,
-                                  isMoE: model.numExperts != nil, options: appState.serverOptions)
+                                  options: appState.serverOptions)
     }
 
     private func revealInFinder() {

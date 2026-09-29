@@ -211,7 +211,6 @@
 "Allow" = "允许";
 "Allow all tools this session" = "本次会话允许所有工具";
 "Allow this tool call?" = "允许这次工具调用吗？";
-"Also use MTP on mixture-of-experts models" = "在混合专家模型上也使用 MTP";
 "Always" = "始终允许";
 "Always this model" = "始终使用此模型";
 "American English" = "美式英语";
@@ -991,7 +990,6 @@
 "MiniMax-H3 was trained on detailed shot descriptions — style, action, camera movement and sound. Try Examples above." = "MiniMax-H3 是在详细的镜头描述上训练的 —— 包括风格、动作、运镜和声音。试试上方的示例。";
 "MiniMax-H3 was trained on labelled prompts. Start with “%@”, then overall_soundscape: and non_diegetic_music:. Try Examples or Prompt tips above." = "MiniMax-H3 是在带标签的提示词上训练的。先写“%@”，然后写 overall_soundscape: 和 non_diegetic_music:。可试试上方的「示例」或「提示词技巧」。";
 "Missing shards" = "缺少分片";
-"Mixture-of-experts models (Qwen3.6 35B-A3B, Qwen3.8-Flash-Next) ship an MTP head the server leaves off for multi-user boxes. In this app it is on: measured on an M4 Max, 35B-A3B goes 166 -> 244 tok/s on code and 122 -> 177 at 16k context, with prose a wash. Turn it off if you run several chats at once — the MTP slot decodes alone, so concurrent requests stop batching. Dense models are unaffected." = "MoE 模型（Qwen3.6 35B-A3B、Qwen3.8-Flash-Next）自带 MTP 头，服务器在多用户机器上默认不启用。在本应用中它是开启的：在 M4 Max 上实测，35B-A3B 在代码任务上从 166 -> 244 tok/s，在 16k 上下文时从 122 -> 177，散文类任务基本持平。如果你同时运行多个会话，请关闭它 —— MTP 槽位单独解码，因此并发请求不再批处理。稠密模型不受影响。";
 "Mode" = "模式";
 "Model" = "模型";
 "Model Details…" = "模型详情…";
