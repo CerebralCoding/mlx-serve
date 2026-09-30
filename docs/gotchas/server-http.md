@@ -2416,3 +2416,17 @@ reaches `ensureLoaded` and its named 500. An unregistered path is a 404. The LAN
 the same helper. Startup was already loud: a failed `--model` load exits 1.
 Guards: `resolveRequestModelId: a path names its own entry, never the default model`,
 `tests/test_load_failure_no_fallback.sh`.
+
+## A streamed Responses turn reported no prompt-cache hit
+
+Defect: the same 3,016-token prompt sent twice to `/v1/responses` reported
+`input_tokens_details.cached_tokens` 2985 non-streaming and 0 on the streamed
+`response.completed`, and the streamed `timings` read 0 ms, while the log showed the
+`[hot-cache]` reuse.
+
+Cause: the streaming arm rebuilt its `GenerationResult` by hand and copied only the token
+counts from the finalized stream; the non-streaming arm takes every field from the slot.
+
+Fix: `StreamingTokenStream.generationResult` builds the result from everything `finalize`
+snapshotted. Guards: `a streamed turn's result keeps the prompt-cache hit and timings the
+slot measured`, `tests/test_responses_streaming.sh` [F].

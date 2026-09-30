@@ -288,5 +288,32 @@ else
 fi
 echo ""
 
+# ── Test F: a streamed repeat reports the prefix-cache hit in its usage ──
+echo "--- Test F: streamed response.completed usage carries cached_tokens + timings ---"
+BODY='{"model":"mlx-serve","input":"List three primary colors, one per line.","max_output_tokens":24,"temperature":0,"stream":true}'
+sse_with_timestamps "$BODY" > /dev/null
+USAGE=$(sse_with_timestamps "$BODY" | python3 -c '
+import sys, json
+for line in sys.stdin:
+    payload = line.split("\t", 1)[-1].strip()
+    if payload.startswith("data: {") and "\"response.completed\"" in payload:
+        r = json.loads(payload[6:])["response"]
+        t = r.get("timings") or {}
+        print(r["usage"]["input_tokens"], r["usage"]["input_tokens_details"]["cached_tokens"], t.get("predicted_ms", 0))
+')
+read -r IN_TOK CACHED PRED_MS <<< "${USAGE:-0 0 0}"
+echo "  input_tokens=$IN_TOK cached_tokens=$CACHED predicted_ms=$PRED_MS"
+if [ "${CACHED:-0}" -gt 0 ] && [ "$CACHED" -le "$IN_TOK" ]; then
+    run_test "streamed repeat reports cached_tokens > 0" "PASS" ""
+else
+    run_test "streamed repeat reports cached_tokens > 0" "FAIL" "cached_tokens=$CACHED of $IN_TOK"
+fi
+if python3 -c "import sys; sys.exit(0 if float('${PRED_MS:-0}') > 0 else 1)"; then
+    run_test "streamed response.completed carries decode timings" "PASS" ""
+else
+    run_test "streamed response.completed carries decode timings" "FAIL" "timings.predicted_ms=$PRED_MS"
+fi
+echo ""
+
 echo "=== Result: $PASS/$TOTAL passed ==="
 [ "$FAIL" -eq 0 ]

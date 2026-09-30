@@ -10319,6 +10319,25 @@ const StreamingTokenStream = struct {
         }
     }
 
+    /// The finalized stream as a `GenerationResult`, for surfaces that share
+    /// their post-generation tail with the non-streaming path.
+    fn generationResult(self: *const StreamingTokenStream, text: []u8, token_ids: []u32, finish_reason: []const u8, constraint_payload_byte: ?usize) generate_mod.GenerationResult {
+        return .{
+            .text = text,
+            .token_ids = token_ids,
+            .prompt_tokens = self.prompt_tokens,
+            .completion_tokens = self.completion_tokens,
+            .finish_reason = finish_reason,
+            .prefill_tps = generate_mod.prefillTokensPerSec(self.prompt_tokens, self.cached_tokens, self.prefill_ns),
+            .decode_tps = generate_mod.tokensPerSec(self.completion_tokens, self.decode_ns),
+            .prefill_ns = self.prefill_ns,
+            .decode_ns = self.decode_ns,
+            .cached_tokens = self.cached_tokens,
+            .finish_details = self.finish_details,
+            .constraint_payload_byte = constraint_payload_byte,
+        };
+    }
+
     const NextOrIdle = union(enum) { token: u32, done, idle };
 
     /// `next` with an idle timeout (scheduler path only): returns `.idle`
@@ -17609,17 +17628,12 @@ fn handleResponsesInner(
             return;
         }
 
-        result = .{
-            .constraint_payload_byte = if (delivery) |d| d.payload_byte else null,
-            .text = try raw_buf.toOwnedSlice(allocator),
-            .token_ids = try token_ids_buf.toOwnedSlice(allocator),
-            .prompt_tokens = ts.prompt_tokens,
-            .completion_tokens = ts.completion_tokens,
-            .finish_reason = if (stopped) "stop" else ts.finish_reason,
-            .prefill_tps = 0.0,
-            .decode_tps = 0.0,
-            .finish_details = ts.finish_details,
-        };
+        result = ts.generationResult(
+            try raw_buf.toOwnedSlice(allocator),
+            try token_ids_buf.toOwnedSlice(allocator),
+            if (stopped) "stop" else ts.finish_reason,
+            if (delivery) |d| d.payload_byte else null,
+        );
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
@@ -24042,4 +24056,15 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
     try t.expectEqual(kv_only + retainedSsmCheckpointBytes(&cfg, ctx, 0, chunk), entry);
     // The defaulted ask covers the whole entry, so the commit path never trims it.
     try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
+}
+
+test "a streamed turn's result keeps the prompt-cache hit and timings the slot measured" {
+    const t = std.testing;
+    const ts: StreamingTokenStream = .{ .mode = .regular, .eos_token_ids = &.{}, .prompt_tokens = 3016, .cached_tokens = 2985, .completion_tokens = 40, .prefill_ns = 90_000_000, .decode_ns = 1_200_000_000 };
+    var text = "ok".*;
+    var ids = [_]u32{ 7, 8 };
+    const r = ts.generationResult(&text, &ids, "stop", null);
+    try t.expectEqual(@as(u32, 2985), r.cached_tokens);
+    try t.expectEqual(ts.prefill_ns, r.prefill_ns);
+    try t.expectEqual(ts.decode_ns, r.decode_ns);
 }
