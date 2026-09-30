@@ -290,7 +290,9 @@ echo ""
 
 # ── Test F: a streamed repeat reports the prefix-cache hit in its usage ──
 echo "--- Test F: streamed response.completed usage carries cached_tokens + timings ---"
-BODY='{"model":"mlx-serve","input":"List three primary colors, one per line.","max_output_tokens":24,"temperature":0,"stream":true}'
+# Long enough that a hybrid (GDN) model has a restorable checkpoint behind the prompt end.
+FILLER=$(printf 'The quick brown fox jumps over the lazy dog. %.0s' $(seq 1 30))
+BODY="{\"model\":\"mlx-serve\",\"input\":\"${FILLER}Name three primary colors, one per line.\",\"max_output_tokens\":24,\"temperature\":0,\"stream\":true}"
 sse_with_timestamps "$BODY" > /dev/null
 USAGE=$(sse_with_timestamps "$BODY" | python3 -c '
 import sys, json
