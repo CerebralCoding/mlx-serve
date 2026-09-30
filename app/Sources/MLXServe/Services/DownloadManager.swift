@@ -1847,16 +1847,17 @@ class DownloadManager: ObservableObject {
         )]
     }
 
-    /// A `.partial` beside a moving progress bar is not an interrupted download,
-    /// so a dir that is the destination of a live transfer loses that defect.
-    nonisolated static func clearingInFlightDefects(_ models: [LocalModel], activeDirs: Set<String>) -> [LocalModel] {
+    /// The destination of a live transfer is DOWNLOADING: not broken (its
+    /// `.partial` and missing shards are progress), and not loadable either —
+    /// between two files it can look whole while its tokenizer has yet to land.
+    nonisolated static func markingInFlight(_ models: [LocalModel], activeDirs: Set<String>) -> [LocalModel] {
         guard !activeDirs.isEmpty else { return models }
         return models.map { m in
-            guard m.defect == .interruptedDownload,
-                  activeDirs.contains((m.path as NSString).standardizingPath) else { return m }
-            var fixed = m
-            fixed.defect = nil
-            return fixed
+            guard activeDirs.contains((m.path as NSString).standardizingPath) else { return m }
+            var marked = m
+            marked.defect = nil
+            marked.isDownloading = true
+            return marked
         }
     }
 
@@ -2061,7 +2062,7 @@ class DownloadManager: ObservableObject {
             out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
         }
 
-        return Self.clearingInFlightDefects(out, activeDirs: inputs.inFlightDirs)
+        return Self.markingInFlight(out, activeDirs: inputs.inFlightDirs)
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.

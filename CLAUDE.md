@@ -105,7 +105,9 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 
 ## Conventions
 
-- Minimal DRY Zig; tests at the bottom of each source file; shell integration tests in `tests/`. Env levers only for paths with two arms worth comparing (lossy/tradeoff), never for an obvious win/fix.
+- KISS, DRY, YAGNI; simple is not easy: the elegant solution, minimal and fast code, no speculative abstractions or knobs.
+- Tests at the bottom of each source file; shell integration tests in `tests/`. Env levers only for paths with two arms worth comparing (lossy/tradeoff), never for an obvious win/fix.
+- Commit messages and PR bodies carry no `Co-Authored-By` or generated-by line.
 - Inference thread is the SOLE mlx caller (even frees) — media gen posts to `gen_queue`, never a gpu mutex. A long gen blocks chat decode (accepted).
 - Concurrent requests batch-decode on pure-attention archs + the qwen3_5 family incl. `qwen3_5_moe` and `qwen4_exp` (`configBatchesDecode`); `--max-concurrent` sizes the submit queue, not a decode gate. The per-slot verdict is a `BatchVerdict` reason: `[batched] slot serial: <reason>` once per slot, `/props` `batching`, `/v1/models` `batched_decode`, `mlx_serve:decode_serial_total{reason}`. Slots entering a batch mid-generation drain lazy pipeline state first.
 - A batched group past 1024 KV tokens attends PER SLOT (`perSlotBatchedAttn`: own view, no pad/stack/array mask; causal + quantized-KV kernels eligible). Below that, and on qwen4's QSA reads, the STACKED arm is capped by PADDING WASTE (`groupKeepCount`, `MAX_PAD_WASTE` 1.5, must stay < 2.0); longest slots fall to serial.
