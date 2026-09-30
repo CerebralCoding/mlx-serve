@@ -17244,6 +17244,8 @@ fn handleResponsesInner(
     var streamed_reasoning_id: ?[]u8 = null;
     var streamed_reasoning_index: u32 = 0;
     var streamed_reasoning_started = false;
+    // Bytes of the thought a tool-active stream already sent; the end sends the rest.
+    var tool_reasoning_streamed: usize = 0;
     var streamed_message_id: ?[]u8 = null;
     var streamed_message_index: u32 = 0;
     var streamed_message_started = false;
@@ -17369,6 +17371,8 @@ fn handleResponsesInner(
         // Inkling thinking message seen — its close is <|end_message|>.
         var inkling_think = false;
         var live_output_index: u32 = 0;
+        var tool_thought_open = active_has_tools;
+        var tool_think_scan: chat_mod.ThinkScan = .{};
 
         while (true) {
             // A stop cut resolved on the previous token ends the turn here.
@@ -17445,9 +17449,9 @@ fn handleResponsesInner(
             }
 
             // Beat BEFORE the tool early-continue below: a tool-active request
-            // emits nothing for its whole generation, and the thinking branch
-            // holds until its close tag. Both look identical to a dead server
-            // from the client's socket.
+            // emits nothing past its thought until generation ends, and the
+            // thinking branch holds until its close tag. Both look identical to
+            // a dead server from the client's socket.
             beatStreamKeepalive(stream, .sse_comment) catch {
                 log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                 slot_handle.?.cancel();
@@ -17455,9 +17459,29 @@ fn handleResponsesInner(
                 break;
             };
 
-            // Tool-active requests buffer entirely — we cannot emit text deltas
-            // before knowing whether the output is a tool call.
-            if (active_has_tools) continue;
+            // Tool-active requests hold the answer for the tool-call parse. The
+            // leading thought streams as it arrives, in the chat stream's order:
+            // tool hold first, then the think gate.
+            if (active_has_tools) {
+                if (tool_thought_open and !chat_mod.streamShouldBufferForTools(raw_buf.items)) {
+                    const gate = chat_mod.streamThinkGateScan(raw_buf.items, enable_thinking, false, opens_think, &tool_think_scan);
+                    tool_thought_open = gate == .hold_thinking;
+                    if (gate != .flush_text) if (chat_mod.splitThinkBlock(raw_buf.items, true, opens_think).reasoning_content) |rc| {
+                        const ready = if (tool_thought_open) chat_mod.streamableReasoning(rc) else rc;
+                        if (chat_mod.unstreamedReasoning(ready, tool_reasoning_streamed)) |fresh| {
+                            if (!streamed_reasoning_started) {
+                                streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
+                                streamed_reasoning_index = live_output_index;
+                                try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                                streamed_reasoning_started = true;
+                            }
+                            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, fresh);
+                            tool_reasoning_streamed = ready.len;
+                        }
+                    };
+                }
+                continue;
+            }
 
             if (delivery) |*d| {
                 try d.feed(allocator, token_text);
@@ -17715,6 +17739,9 @@ fn handleResponsesInner(
             // Live deltas already streamed; emit just the closing events with
             // the canonical reasoning text from splitThinkBlock.
             try responses_mod.appendReasoningItem(allocator, &out_buf, streamed_reasoning_id.?, rt);
+            if (active_has_tools) if (chat_mod.unstreamedReasoning(rt, tool_reasoning_streamed)) |rest| {
+                try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rest);
+            };
             try emitResponsesReasoningEnd(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
         } else {
             const rid = try responses_mod.makeId(stream.io, allocator, "rs");
