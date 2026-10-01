@@ -5380,6 +5380,20 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
 - Guard: `round_cost: a round measured cheaper per token than a serial step beats it,
   unmeasured is unknown`.
 
+## A kernel config cached by ROW COUNT handed a 16-slot tick a 16-wide verify's shape (2026-10-01)
+
+- Defect: the 27B 4-bit with its drafter served 16 concurrent streams and failed every stream
+  past that: `[concatenate] ... (16,3,10240), (1,16,10240)` in the GDN conv path, then
+  `batched decode aborted ... failing all 16 slots`. Never seen in a single-stream sweep.
+- Cause: `add_norm` keyed its Metal config on `rows = B*S`, and the config carries the output
+  SHAPE. A speculating slot's 16-token verify ran as `[1,16,D]`; the next 16-slot batched tick,
+  `[16,1,D]`, had the same row count, reused the config and got its hidden state back as
+  `[1,16,D]`. The GDN layer's fused step then declined (`qsh[0] != batch`) and the fallback
+  concatenated the merged `[16,3,C]` state with a `[1,16,C]` input. Three new things met:
+  the NAX-wide block of 16, 16 slots batching, and both on one server.
+- Fix: `CfgKey` carries `b` and `s`, the rule every `metal_kernel` config cache already states.
+- Guard: `addNorm returns each call's own [B,S,D] layout at one row count` (hermetic) and
+  `tests/test_batched_past_block_width.sh` (20 streams on a drafter-bound GDN pack).
 
 ## Raw BF16 n-gram tables have no quantization groups
 

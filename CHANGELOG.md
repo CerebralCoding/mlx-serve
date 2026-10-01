@@ -1,9 +1,12 @@
 # Changelog
 
-## Unreleased
+## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
 ### Fixes
+- Serving more than 16 simultaneous chats on Qwen3.8 27B with its drafter could fail a whole batch of streams mid-answer; every stream now completes (measured to 32 at once on an M5 Ultra).
 - Sushi Flash Next packs with unquantized BF16 n-gram tables now load when their table metadata declares no quantization groups.
+
+---
 
 ## v26.10.1 — Speed Across the Board - GGUF on Our MLX Engine - Sushi Flash Next - Qwen-Image Editing
 
@@ -17,6 +20,7 @@
   | Qwen3.8 27B 4-bit + drafter | M4 Max | +28% | 0% |
   | Qwen3.8 27B 4-bit + drafter | M1 Pro 32 GB | +37% | · |
   | Qwen3.8 Flash Next | M5 Ultra | 0% | +51% |
+  | Qwen3.8 Flash Next | M4 Max | +11% | +2% |
   | Qwen3.6 35B-A3B | M5 Ultra | 0% | +12% |
   | Qwen3.6 35B-A3B | M4 Max | -2% | +2% |
   | Gemma 4 26B-A4B 4-bit | M5 Ultra | +14% | +18% |
@@ -25,6 +29,7 @@
 
   Differences within a few percent are run-to-run noise on speculative cells. The M1 Pro's 27B prefill has no 26.9.6 figure because 26.9.6 refused the long prompts (see Fixes). Bonsai-2's new tensor-unit verify route pays on quoted text (edits, rewrites, repeats): a verbatim-rewrite prompt decodes 48% faster on the M5 Ultra (185 to 273 tok/s), while novel-text decode is unchanged.
 
+- **MLX-Serve Skills** When you launch Pi, you can now ask it to build you something using MLX-Serve API's, like build you a game with Audio and Images generated locally. Or a Laya / Kev Decision / Music generator Web App. (install pi so it shows up in launcher)
 - **Chats no longer freeze while another request reads a long prompt.** Streams that are already answering keep moving instead of stalling for seconds behind a 32k-token prompt (#568). Thanks @STRML.
 - **Qwen3.8 Flash Next is faster everywhere.**
   - **On every Apple Silicon chip, not just Ultra:** speculative decoding gains 5-8% on an M4 Max (code 101.7 → 109.2 tok/s, chat 83.6 → 90.4).

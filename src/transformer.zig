@@ -10817,6 +10817,46 @@ test "persistent group: join leave cancel capture snapshot rollback restore matc
     }
 }
 
+test "persistent group: a member released from a full 16-row group owns a single-row state" {
+    // The bar: after `ssmGroupReleaseCtx` the leaving slot's conv/ssm state has batch 1 and
+    // equals its row of the merged group, so its own verify never sees the [N, ...] arrays.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(alloc, 1);
+    defer cache.deinit();
+    const kinds = try ssmTickKinds(alloc, 2);
+    defer alloc.free(kinds);
+    const n = 16;
+    var slots: [n]SsmTickSlot = undefined;
+    var ctxs: [n]*ForwardCtx = undefined;
+    for (0..n) |i| {
+        slots[i] = try SsmTickSlot.init(alloc, s, kinds, &cache, @as(f32, @floatFromInt(i + 1)));
+        slots[i].bind();
+        ctxs[i] = &slots[i].ctx;
+    }
+    defer for (&slots) |*sl| sl.deinit(alloc);
+    var group: PersistentSsmGroup = .{ .allocator = alloc };
+    defer group.deinit();
+    try ssmTickBind(alloc, s, &group, &ctxs, kinds, true);
+    try ssmTickBumpMerged(s, group.layers, kinds);
+    try ssmTickBind(alloc, s, &group, &ctxs, kinds, true);
+    try ssmTickBumpMerged(s, group.layers, kinds);
+    // Row 5 leaves for a serial round of its own, the way the scheduler releases a speculating slot.
+    const leaver = 5;
+    const expect_conv = try ssmRowView(s, group.layers[0].conv_state, leaver);
+    defer _ = mlx.mlx_array_free(expect_conv);
+    const expect_ssm = try ssmRowView(s, group.layers[0].ssm_state, leaver);
+    defer _ = mlx.mlx_array_free(expect_ssm);
+    try ssmGroupReleaseCtx(&group, s, ctxs[leaver]);
+    const e = &slots[leaver].entries[0];
+    try std.testing.expectEqual(@as(c_int, 1), mlx.getShape(e.conv_state)[0]);
+    try std.testing.expectEqual(@as(c_int, 1), mlx.getShape(e.ssm_state)[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e.conv_state, expect_conv, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e.ssm_state, expect_ssm, s));
+    try std.testing.expectEqual(@as(usize, n - 1), group.n);
+}
+
 test "persistent group: merge/split op counts at N=2/4/8 after the first tick are zero" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
