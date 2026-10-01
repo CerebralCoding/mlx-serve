@@ -155,7 +155,8 @@ pub const LoadParams = struct {
     /// 4/8-bit affine quantization via `--kv-quant {4,8}`. Stored on every
     /// per-slot KVCache and consulted at every read/write boundary.
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
-    /// Per-model hot prefix cache capacity (count). 0 disables.
+    /// Per-model hot prefix cache capacity (count). 0 disables RAM retention while an enabled
+    /// SSD tier remains available for persistent prefix reuse.
     prefix_cache_capacity: u32 = 1,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
     prefix_cache_mem_bytes: u64 = 0,
@@ -4440,23 +4441,28 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // KV and SSM to a snapshotted prefix; without them, divergence forces a
     // full reset, so we keep the legacy single-slot path for hybrid.
     const enable_ssm_cps = params.ssm_checkpoint_stride > 0;
-    if (params.prefix_cache_capacity > 0 and
+    const ram_prefix_cache = params.prefix_cache_capacity > 0;
+    const disk_prefix_cache = params.prefix_cache_disk_bytes > 0;
+    if ((ram_prefix_cache or disk_prefix_cache) and
         prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps))
     {
         // The weights are resident here, so the resolver's active-memory read
         // is honest; the raw launch budget never reaches initWithMem (a 40 GB
         // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
-        // RAM allowance for idle entries on the SSD-first arm; 0 elsewhere.
+        // Disk-only mode retains no reusable KV in RAM, so it asks for no RAM budget.
         var ssd_idle_mem: u64 = 0;
-        const clamped_prefix_mem: u64 = if (params.prefix_cache_mem_resolver) |resolve|
+        const clamped_prefix_mem: u64 = if (!ram_prefix_cache)
+            1
+        else if (params.prefix_cache_mem_resolver) |resolve|
             resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
             sch.allocator,
-            params.prefix_cache_capacity,
+            @max(params.prefix_cache_capacity, 1),
             clamped_prefix_mem,
         );
+        entry.prefix_cache.?.ram_enabled = ram_prefix_cache;
         entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
         // Checkpoint-retention arch gate, mirrored once: `HotPrefixCache`/`DiskTier` never
         // see a ModelConfig. The ungated value names the previous behaviour at each site.
@@ -4496,8 +4502,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 break :attach;
             };
             entry.prefix_cache.?.disk.?.cp_thin =
-                if (params.config.longCtxGated()) .min_span_recency else .oldest;
-            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.longCtxGated())
+                if (params.config.longCtxGated() or !ram_prefix_cache) .min_span_recency else .oldest;
+            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.longCtxGated() or !ram_prefix_cache)
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
@@ -4507,6 +4513,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
             params.config,
             entry.prefix_cache.?.disk != null,
+            ram_prefix_cache,
         );
         if (entry.prefix_cache.?.ssd_first) {
             entry.prefix_cache.?.disk.?.ssd_first = true;
@@ -5593,6 +5600,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // ~95k tokens per retry).
     switch (st) {
         .ok => |n| log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ n, slot.full_prompt.len }),
+        .disk_only => |n| log.info("[disk-cache] captured {d}/{d} prompt tokens from a cancelled prefill\n", .{ n, slot.full_prompt.len }),
         .kept_resident => |n| log.info("[hot-cache] kept resident {d}-token entry; oversized candidate declined\n", .{n}),
         .declined => {},
     }
@@ -6339,7 +6347,8 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
     wc.chunks += 1;
-    // Bounded to one chunk per boundary: this runs inside the prefill.
+    // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
+    // prefill or the first completed turn can leave most of its prefix unavailable after restart.
     _ = d.appendCommitBounded(
         slot.cache.entries,
         abs_kv_pos,
@@ -6348,7 +6357,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
         slot.has_tools,
         if (cps.len > 0) cps else null,
         s,
-        WRITE_THROUGH_FLUSH_BOUND_BYTES,
+        if (hc.ram_enabled) WRITE_THROUGH_FLUSH_BOUND_BYTES else std.math.maxInt(u64),
     ) catch |err| {
         log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
     };
