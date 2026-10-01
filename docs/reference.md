@@ -35,7 +35,7 @@ Verbatim deep detail: per-file contracts, subsystem designs, API surfaces. Root 
 | `responses.zig` | OpenAI Responses API: parser, envelope, in-memory `ResponseStore`, compaction blob |
 | `ws.zig` | RFC 6455 WebSocket framing (server-side, generic over `Conn`) |
 | `pld_index.zig` | PLD n-gram index (`PldLookup.findMatch`, `ngramRepeatScore`) |
-| `kv_disk_cache.zig` | Persistent prefix tier (`--prefix-cache-disk`, default OFF): chunked safetensors survive RAM eviction and server restart. `--prefix-cache-entries 0` disables only idle RAM retention when disk is enabled; completed prefixes write through continuously and restore directly into the next request's working KV. Hybrid SSM checkpoints persist beside KV chunks and restore both states at one position. Schemes off/affine, B==1. Guard: `tests/test_prefix_cache_disk.sh` + hermetic DiskTier/HotPrefixCache tests. |
+| `kv_disk_cache.zig` | Persistent prefix tier (`--prefix-cache-disk`, default OFF): chunked safetensors survive RAM eviction and server restart. `--no-prefix-cache-ram` disables only idle RAM retention when disk is enabled (`--prefix-cache-entries 0` disables both tiers); completed prefixes write through continuously and restore directly into the next request's working KV. Hybrid SSM checkpoints persist beside KV chunks and restore both states at one position. Schemes off/affine, B==1. Guard: `tests/test_prefix_cache_disk.sh` + hermetic DiskTier/HotPrefixCache tests. |
 | `drafter.zig` | Gemma 4 assistant drafter (cross-attention spec-decode) |
 | `mtp.zig` | Qwen 3.5/3.6 native MTP head (sidecar spec-decode; self-contained — delete this + `Generator.nextMtp` to remove the feature). MLP is a union: dense SwiGLU OR the 35B-A3B MoE layout (`language_model.mtp.` prefix, mlx-lm `switch_mlp` split experts + shared expert + SEG — forwards through the trunk's `moeMLP`); quant params re-solve PER WEIGHT per call (`transformer.affineParamsFromGeometry` — sidecars mix 5/6-bit gs-128 beside 4-bit gs-64). Prefill history is FULL by default (`--mtp-history-window` opts into last-window capture; the A/B showed windowing costs 14 acceptance points at 64K on the stock head) |
 | `diffusion.zig` | DiffusionGemma block-diffusion generation: canvas denoising loop, entropy-bound sampler, self-conditioning, per-slot `Runner` |
@@ -470,7 +470,7 @@ When an entry must go (count cap, byte budget, `evictLruToAdmit`), `lruIndexExcl
 
 Qwen4_exp uses SSD-first automatically when its disk tier is enabled. Any MLX
 architecture with a restorable prefix cache uses the same path when
-`--prefix-cache-entries 0 --prefix-cache-disk <size>` selects SSD-only mode:
+`--no-prefix-cache-ram --prefix-cache-disk <size>` selects SSD-only mode:
 RAM holds model weights plus active requests, while completed reusable prefixes
 remain only on SSD.
 

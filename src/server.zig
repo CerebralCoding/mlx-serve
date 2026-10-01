@@ -877,6 +877,8 @@ pub fn parseModelFromRequest(body: []const u8, content_type: []const u8) ?[]cons
 // (`--prefix-cache-mem`, default 2 GB) is what actually bounds memory,
 // evicting LRU entries by size. 0 disables.
 pub var prefix_cache_capacity: u32 = 32;
+/// `--no-prefix-cache-ram` keeps the disk tier eligible without idle RAM retention.
+pub var prefix_cache_ram_enabled: bool = true;
 
 /// Wave 1.B — hot prefix cache memory budget. The cache evicts LRU entries on
 /// commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. The
@@ -914,7 +916,7 @@ var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED
 
 /// The hot-cache byte budget every post-load reserve must bill: the clamp's answer once loaded, the raw ask before.
 pub fn resolvedPrefixCacheMem() u64 {
-    if (prefix_cache_capacity == 0) return 0;
+    if (prefix_cache_capacity == 0 or !prefix_cache_ram_enabled) return 0;
     const v = hot_cache_mem_resolved.load(.monotonic);
     return if (v != HOT_CACHE_MEM_UNRESOLVED) v else prefix_cache_mem_bytes;
 }
@@ -970,18 +972,19 @@ pub var ssm_checkpoint_stride: u32 = 256;
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
 pub var ssm_checkpoint_max: u32 = 16;
 
-/// SSM prefill checkpoints exist only to feed a reusable prefix tier. Capture stays on when
-/// either RAM retention or SSD persistence is enabled, and off when both are disabled.
-pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32, disk_bytes: u64) u32 {
-    if (cache_capacity == 0 and disk_bytes == 0) return 0;
+/// SSM checkpoints feed reusable prefix tiers; zero capacity disables all reuse.
+pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32, ram_enabled: bool, disk_bytes: u64) u32 {
+    if (cache_capacity == 0 or (!ram_enabled and disk_bytes == 0)) return 0;
     return stride;
 }
 
-test "effectiveSsmCheckpointStride: either prefix tier keeps checkpoint capture" {
-    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0, 0));
-    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, 0));
-    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 0, 4 << 30));
-    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32, 0));
+test "effectiveSsmCheckpointStride: zero capacity disables both tiers, RAM-off preserves disk" {
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0, true, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0, false, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, true, 0));
+    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, false, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 32, false, 0));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32, true, 0));
 }
 
 /// PLD request defaults carried as ONE value, so a `ServerConfig` builder
@@ -1777,7 +1780,7 @@ pub fn serve(
             " [hybrid: SSM checkpoints]"
         else
             "";
-        if (prefix_cache_capacity == 0 and prefix_cache_disk_bytes > 0) {
+        if (!prefix_cache_ram_enabled and prefix_cache_disk_bytes > 0) {
             log.info("Prefix cache: SSD ONLY (RAM retention disabled, disk cap={d:.1} MB){s}\n", .{
                 @as(f64, @floatFromInt(prefix_cache_disk_bytes)) / (1024.0 * 1024.0),
                 ssm_note,
@@ -3947,7 +3950,7 @@ fn ssdFirstBudgetForLoad(
     quiet: bool,
 ) ?u64 {
     // The predicate, shared with the spill site: without a disk tier the mode's floor would be RAM the server cannot use.
-    if (!prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_capacity > 0)) return null;
+    if (prefix_cache_capacity == 0 or !prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) return null;
     const budget = ssdFirstPrefixCacheMem(
         requested,
         ceiling,
@@ -7389,7 +7392,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .max_concurrent = max_concurrent,
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
-        .prefix_cache_ram_enabled = prefix_cache_capacity > 0,
+        .prefix_cache_ram_enabled = prefix_cache_capacity > 0 and prefix_cache_ram_enabled,
         // Diffusion prefill returns before the interleave hook: nothing to share.
         .prefill_decode_share = if (config.isDiffusion()) 0 else scheduler_mod.prefillDecodeShare(),
     };
@@ -23360,6 +23363,19 @@ test "the published hot-cache budget is retired when the cache is dropped" {
     try t.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
     clearResolvedPrefixCacheMem();
     try t.expectEqual(prefix_cache_mem_bytes, resolvedPrefixCacheMem());
+}
+
+test "resolvedPrefixCacheMem: RAM-off bills zero despite a configured disk tier" {
+    const capacity = prefix_cache_capacity;
+    const ram = prefix_cache_ram_enabled;
+    defer prefix_cache_capacity = capacity;
+    defer prefix_cache_ram_enabled = ram;
+    prefix_cache_capacity = 8;
+    prefix_cache_ram_enabled = false;
+    try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    prefix_cache_ram_enabled = true;
+    prefix_cache_capacity = 0;
+    try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
 }
 
 test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 19,032 MB)" {

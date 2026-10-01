@@ -15,7 +15,7 @@
 #      the whole entry (`persisted` with a small chunk count).
 #   5. `--prefix-cache-disk off` boots clean, serves, and never touches the
 #      kv-cache dir.
-#   6. `--prefix-cache-entries 0` keeps RAM residency at zero while SSD still
+#   6. `--no-prefix-cache-ram` keeps RAM residency at zero while SSD still
 #      persists and restores prefixes across a restart.
 #
 # Usage: ./tests/test_prefix_cache_disk.sh [/path/to/model] [port]
@@ -208,7 +208,7 @@ stop_server
 echo
 echo "== 6. SSD-only mode persists without RAM retention =="
 rm -rf "$KV_DIR"
-start_server --prefix-cache-entries 0 || { echo -e "${RED}FAIL${NC} SSD-only server failed to start"; exit 1; }
+start_server --no-prefix-cache-ram || { echo -e "${RED}FAIL${NC} SSD-only server failed to start"; exit 1; }
 fire_long > /dev/null
 sleep 1
 if grep -q 'Prefix cache: SSD ONLY' "$LOGFILE" &&
@@ -219,7 +219,11 @@ else
     tail -30 "$LOGFILE"; FAIL=1
 fi
 stop_server
-start_server --prefix-cache-entries 0 || { echo -e "${RED}FAIL${NC} SSD-only restart failed"; exit 1; }
+start_server --no-prefix-cache-ram || { echo -e "${RED}FAIL${NC} SSD-only restart failed"; exit 1; }
+curl -fsS "$BASE/v1/unload-model" -H 'Content-Type: application/json' -d '{"model":"mlx-serve"}' > /dev/null
+jq -nc --arg model "$MODEL" '{model:$model}' |
+    curl -fsS "$BASE/v1/load-model" -H 'Content-Type: application/json' --data-binary @- > /dev/null
+curl -fsS "$BASE/props" | jq -e '.settings.prefix_cache | .ram_enabled == false and .mem_bytes == 0' > /dev/null
 fire_long > /dev/null
 if grep -q '\[disk-cache\] restored .* tokens from SSD' "$LOGFILE" &&
    ! grep -q '\[hot-cache\] resident=' "$LOGFILE"; then
@@ -227,6 +231,16 @@ if grep -q '\[disk-cache\] restored .* tokens from SSD' "$LOGFILE" &&
 else
     echo -e "${RED}FAIL${NC} SSD-only restart did not restore cleanly"
     tail -30 "$LOGFILE"; FAIL=1
+fi
+stop_server
+
+echo "  -- zero entries disables all reuse even with SSD configured --"
+start_server --prefix-cache-entries 0 || { echo -e "${RED}FAIL${NC} cache-off server failed"; exit 1; }
+fire_long > /dev/null
+if grep -q '\[disk-cache\]\|\[hot-cache\] reused' "$LOGFILE"; then
+    echo -e "${RED}FAIL${NC} zero entries still reused or wrote prefixes"; FAIL=1
+else
+    echo -e "${GREEN}PASS${NC} zero entries disables both tiers"
 fi
 stop_server
 

@@ -696,7 +696,8 @@ struct ServerOptions: Codable, Equatable {
         // omitting this silently launched a 32-entry cache that filled small
         // Macs. Emit the RAM-clamped value so the entry count stays bounded.
         let cappedEntries = Self.ramCappedPrefixCacheEntries(prefixCacheEntries, physicalMemoryBytes: physicalMemoryBytes)
-        args += ["--prefix-cache-entries", hotPrefixCacheEnabled ? "\(cappedEntries)" : "0"]
+        args += ["--prefix-cache-entries", "\(cappedEntries)"]
+        if !hotPrefixCacheEnabled { args += ["--no-prefix-cache-ram"] }
         // Empty leaves the size to the server; any value, the old "2GB" default included, is sent.
         let trimmedPrefixMem = prefixCacheMem.trimmingCharacters(in: .whitespacesAndNewlines)
         if !trimmedPrefixMem.isEmpty {
@@ -908,6 +909,7 @@ extension ServerOptions {
         if let v = try c.decodeIfPresent(Bool.self, forKey: .pleGpu) { pleGpu = v }
         if let v = try c.decodeIfPresent(Bool.self, forKey: .enablePrefixCacheDisk) { enablePrefixCacheDisk = v }
         if let v = try c.decodeIfPresent(String.self, forKey: .prefixCacheDisk) { prefixCacheDisk = v }
+        if !c.contains(.hotPrefixCacheEnabled) && storedPrefixEntries == 0 { enablePrefixCacheDisk = false }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentMemGB) { maxResidentMemGB = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .maxResidentModels) { maxResidentModels = v }
         if let v = try c.decodeIfPresent(Int.self, forKey: .idleEvictSecs) { idleEvictSecs = v }

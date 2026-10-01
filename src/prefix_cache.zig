@@ -463,7 +463,8 @@ pub const HotPrefixCache = struct {
     pub fn initWithMem(allocator: std.mem.Allocator, max_entries: u32, max_kv_bytes: u64) HotPrefixCache {
         return .{
             .entries = std.ArrayList(Entry).empty,
-            .max_entries = if (max_entries == 0) 1 else max_entries,
+            .max_entries = max_entries,
+            .ram_enabled = max_entries > 0,
             .max_kv_bytes = max_kv_bytes,
             .current_kv_bytes = 0,
             .allocator = allocator,
@@ -2982,10 +2983,11 @@ test "HotPrefixCache: shouldUse rejects deepseek_v4 (module-owned decode state)"
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
 }
 
-test "HotPrefixCache: init zero capacity clamps to 1" {
+test "HotPrefixCache: zero capacity disables RAM retention" {
     var cache = HotPrefixCache.init(testing.allocator, 0);
     defer cache.deinit();
-    try testing.expectEqual(@as(u32, 1), cache.max_entries);
+    try testing.expectEqual(@as(u32, 0), cache.max_entries);
+    try testing.expect(!cache.ram_enabled);
     try testing.expectEqual(@as(usize, 0), cache.entryCount());
 }
 
@@ -3275,10 +3277,14 @@ test "HotPrefixCache: disk-only commit persists the full prefix and retains no R
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
 
     {
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        hc.ram_enabled = false;
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+        try testing.expectEqual(@as(u32, 0), hc.max_entries);
+        try testing.expect(!hc.ram_enabled);
         hc.ssd_first = true;
         hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-disk-only", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.enableBackgroundWriter();
+        try testing.expect(hc.disk.?.writer != null);
         defer hc.deinit();
 
         var cache = try KVCache.init(testing.allocator, 2);
@@ -3295,10 +3301,14 @@ test "HotPrefixCache: disk-only commit persists the full prefix and retains no R
     }
 
     {
-        var hc = HotPrefixCache.initWithMem(testing.allocator, 4, 0);
-        hc.ram_enabled = false;
+        var hc = HotPrefixCache.initWithMem(testing.allocator, 0, 0);
+        try testing.expectEqual(@as(u32, 0), hc.max_entries);
+        try testing.expect(!hc.ram_enabled);
         hc.ssd_first = true;
         hc.disk = try kv_disk_cache.DiskTier.init(testing.allocator, io, base, "fp-disk-only", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.enableBackgroundWriter();
+        try testing.expect(hc.disk.?.writer != null);
         defer hc.deinit();
 
         var cache = try KVCache.init(testing.allocator, 2);
@@ -3307,6 +3317,65 @@ test "HotPrefixCache: disk-only commit persists the full prefix and retains no R
         const restored = try hc.lookupAndRestore(&cache, &moe_offset, null, s, &tokens, false, &.{}, null, null);
         try testing.expect(restored.slot_owned);
         try testing.expectEqual(@as(usize, tokens.len - 1), restored.matched);
+        try testing.expectEqual(@as(usize, 0), hc.entryCount());
+        try testing.expectEqual(@as(u64, 0), hc.residentBytes());
+    }
+}
+
+test "HotPrefixCache: SSD-only LFM2 conv state survives background flush and restart" {
+    const a = testing.allocator;
+    const io = testing.io;
+    const s = mlx.gpuStream();
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var path: [512]u8 = undefined;
+    const base = path[0..try tmp.dir.realPath(io, &path)];
+    var config = model_mod.ModelConfig{ .model_type = "lfm2", .has_hybrid_layers = true };
+    try testing.expect(HotPrefixCache.shouldUse(&config, true));
+    try testing.expect(ssdFirstActive(&config, true, false));
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*token, i| token.* = @intCast(i + 7);
+    for (0..2) |boot| {
+        var hc = HotPrefixCache.initWithMem(a, 0, 0);
+        hc.ssd_first = true;
+        hc.disk = try kv_disk_cache.DiskTier.init(a, io, base, "lfm-conv", 0, 128);
+        hc.disk.?.ssd_first = true;
+        hc.disk.?.enableBackgroundWriter();
+        defer hc.deinit();
+        try testing.expect(hc.disk.?.writer != null);
+        var cache = try KVCache.init(a, 3);
+        defer cache.deinit();
+        if (boot == 0) {
+            var written: u32 = 0;
+            while (written < tokens.len) : (written += 64) {
+                try testWriteCacheLayer(&cache, s, 1, written, @intCast(@min(64, tokens.len - written)));
+            }
+            var source = pcEmptySsm();
+            defer pcFreeHybrid(&source);
+            _ = mlx.mlx_array_free(source[0].conv_state);
+            source[0].conv_state = pcArange(s, &conv_shape_pc, 300);
+            source[0].initialized = true;
+            const cps = try a.alloc(SSMCheckpoint, 1);
+            cps[0] = try transformer_mod.captureSsmCheckpoint(a, &source, 512, s);
+            const status = try hc.commitWithSsm(&cache, &tokens, false, cps, null, null);
+            try testing.expectEqual(@as(usize, tokens.len), status.disk_only);
+            hc.flushPendingDisk(s);
+            hc.disk.?.drainWriter();
+            try testing.expectEqual(@as(u64, 0), hc.disk.?.writeErrors());
+        } else {
+            var restored = pcEmptySsm();
+            defer pcFreeHybrid(&restored);
+            var offset: usize = 0;
+            const hit = try hc.lookupAndRestore(&cache, &offset, &restored, s, &tokens, false, &.{}, null, null);
+            try testing.expectEqual(@as(usize, 512), hit.matched);
+            try testing.expectEqual(@as(usize, 512), offset);
+            try testing.expect(!cache.entries[0].initialized);
+            try testing.expect(cache.entries[1].initialized);
+            try testing.expectEqual(@as(usize, 512), cache.entries[1].offset);
+            try testing.expect(restored[0].initialized);
+            try testing.expectEqual(@as(f32, 300), pcSsmVal(restored[0].conv_state, 0, s));
+            try testing.expect(restored[0].ssm_state.ctx == null);
+        }
         try testing.expectEqual(@as(usize, 0), hc.entryCount());
         try testing.expectEqual(@as(u64, 0), hc.residentBytes());
     }
