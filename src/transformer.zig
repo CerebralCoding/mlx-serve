@@ -17274,6 +17274,9 @@ pub const Transformer = struct {
             }
             var weights_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&weights_bytes);
+            if (config.embedded_ple_payload_bytes != null and ple_gpu.enabled) {
+                log.info("[qwen4] --ple-gpu declined: embedded PLE table is unsupported by the GPU kernel; host row gather is active.\n", .{});
+            }
             st.gpu = if (config.embedded_ple_payload_bytes == null) ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes) else null;
             st.table.startWarm(); // the weights load just evicted the table from page cache
             qwen4_state = st;

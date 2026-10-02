@@ -268,16 +268,7 @@ pub const NgramTable = struct {
         };
     }
 
-    const HeaderRegion = struct {
-        rows: u64,
-        cols: u64,
-        start: u64, // relative to the data section, as the header spells it
-        end: u64,
-
-        fn overlaps(a: HeaderRegion, b: HeaderRegion) bool {
-            return a.start < b.end and b.start < a.end;
-        }
-    };
+    const HeaderRegion = embedded_ple.HeaderRegion;
 
     /// One header entry, every access checked and the region proven to hold exactly
     /// `rows x cols x elem` bytes inside the mapping.
@@ -289,34 +280,12 @@ pub const NgramTable = struct {
         map_len: usize,
         data_off: usize,
     ) !HeaderRegion {
-        const v = obj.get(key) orelse return error.NgramTableHeader;
-        if (v != .object) return error.NgramTableHeader;
-        const o = v.object;
-        const dt = o.get("dtype") orelse return error.NgramTableHeader;
-        if (dt != .string or !std.mem.eql(u8, dt.string, dtype)) return error.NgramTableHeader;
-        const shape = o.get("shape") orelse return error.NgramTableHeader;
-        if (shape != .array or shape.array.items.len != 2) return error.NgramTableHeader;
-        if (shape.array.items[0] != .integer or shape.array.items[1] != .integer) return error.NgramTableHeader;
-        const dofs = o.get("data_offsets") orelse return error.NgramTableHeader;
-        if (dofs != .array or dofs.array.items.len != 2) return error.NgramTableHeader;
-        if (dofs.array.items[0] != .integer or dofs.array.items[1] != .integer) return error.NgramTableHeader;
-
-        const rows_i = shape.array.items[0].integer;
-        const cols_i = shape.array.items[1].integer;
-        const start_i = dofs.array.items[0].integer;
-        const end_i = dofs.array.items[1].integer;
-        if (rows_i <= 0 or cols_i <= 0 or start_i < 0 or end_i < start_i) return error.NgramTableRegion;
-        const r: HeaderRegion = .{
-            .rows = @intCast(rows_i),
-            .cols = @intCast(cols_i),
-            .start = @intCast(start_i),
-            .end = @intCast(end_i),
+        const r = embedded_ple.headerRegion(obj, key, dtype, elem, map_len, data_off, .matrix) catch |err| return switch (err) {
+            error.TensorHeader, error.TensorDtype => error.NgramTableHeader,
+            error.TensorRegion => error.NgramTableRegion,
+            error.TensorTruncated => error.NgramTableTruncated,
         };
         if (r.cols > std.math.maxInt(u32) or r.rows > std.math.maxInt(u32)) return error.NgramTableRegion;
-        const need = std.math.mul(u64, r.rows, r.cols * elem) catch return error.NgramTableRegion;
-        if (r.end - r.start != need) return error.NgramTableRegion;
-        const abs_end = std.math.add(u64, data_off, r.end) catch return error.NgramTableTruncated;
-        if (abs_end > map_len) return error.NgramTableTruncated;
         return r;
     }
 

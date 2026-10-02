@@ -89,7 +89,9 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 
 **TODO**: `phi`/`phi3` (different layout), `command-r` (different arch).
 
-The embedded Qwen4 PLE path accepts indexed safetensors with complete `ngram_embedding.shards.N.{weight,scales,biases}` triplets matching the config's shard count and table geometry. It reads table rows from disk through host memory; `--ple-gpu` falls back to this path. The loader leaves other PLE weights in MLX, folds the raw checkpoint's delta RMS weights into the engine's stored-weight convention, and excludes only the validated table payload from resident-weight estimates while keeping the usual memory reserves. This supports the verified Qwen4 layout, not every oQ model architecture.
+The embedded Qwen4 PLE path accepts indexed safetensors with complete `ngram_embedding.shards.N.{weight,scales,biases}` triplets matching the config's shard count and table geometry. `ngram_embedding.weight_scale` may be absent (identity) or a scalar BF16 1.0; other values are refused. The table is read through host memory; `--ple-gpu` logs that the embedded layout uses host row gather. The loader leaves other PLE weights in MLX and excludes only the validated table payload from the one resident-weight estimate used by eviction, preflight, and commit.
+
+The root `config.json` field `"qwen4_norm_convention"` must be `"delta"` for raw zero-centered RMS weights or `"folded"` when they already contain `1+w`; the choice is independent of table layout. An unmarked embedded pack is refused as ambiguous. For an unmarked raw oQ pack, launch with `--config-overrides '{"qwen4_norm_convention":"delta"}'`; this override applies to every model loaded by that server. Checkpoint-local markers support mixed conventions in one server; use separate servers if a global override would affect another pack. Existing unmarked external-table packs retain their folded convention. Only the ten Qwen4 norm suffixes in `qwen4NormNeedsFold` are folded for `delta`; the gated linear-attention norm stays unchanged.
 
 ### GGUF auto-routing
 

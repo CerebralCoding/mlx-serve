@@ -126,6 +126,8 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
     return null;
 }
 
+pub const Qwen4NormConvention = enum { delta, folded };
+
 pub const ModelConfig = struct {
     // Architecture identity
     model_type: []const u8 = "gemma3",
@@ -284,6 +286,7 @@ pub const ModelConfig = struct {
     ngram_seed: u64 = 1234,
     split_ngram_parts: u32 = 128,
     embedded_ple_payload_bytes: ?u64 = null,
+    qwen4_norm_convention: ?Qwen4NormConvention = null,
     indexer_n_heads: u32 = 0, // 0 = dense attention
     indexer_head_dim: u32 = 0,
     indexer_budget: u32 = 0,
@@ -1393,9 +1396,14 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     defer allocator.free(content);
 
     var config = try parseConfigFromJson(allocator, content);
+    errdefer config.deinit(allocator);
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
+            if (config.qwen4_norm_convention == null) {
+                log.err("[qwen4] embedded PLE pack at {s} has ambiguous norm convention; set qwen4_norm_convention to delta or folded in config.json, or launch with --config-overrides '{{\"qwen4_norm_convention\":\"delta\"}}' (use folded when the checkpoint already stores 1+w).\n", .{model_dir});
+                return error.AmbiguousQwen4NormConvention;
+            }
             config.embedded_ple_payload_bytes = info.payload_bytes;
         }
     }
@@ -2519,7 +2527,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     {
         config.model_type = "qwen4_exp";
         config.weight_prefix = "language_model.model";
-        config.norm_has_offset = false; // the converter folds every (1 + w) norm
+        config.norm_has_offset = false;
+        if (root.get("qwen4_norm_convention")) |v| {
+            if (v != .string) return error.InvalidQwen4NormConvention;
+            config.qwen4_norm_convention = std.meta.stringToEnum(Qwen4NormConvention, v.string) orelse return error.InvalidQwen4NormConvention;
+        }
         config.has_final_norm = false; // hyper_connection_mixer replaces model.norm
         config.scale_embeddings = false;
         config.has_pre_ff_norm = false;
@@ -3805,7 +3817,7 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
 /// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false };
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, fold_qwen4_norms: bool = false };
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
@@ -3816,7 +3828,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
-    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null });
+    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .fold_qwen4_norms = config.isQwen4() and config.qwen4_norm_convention == .delta });
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -4013,7 +4025,7 @@ pub fn loadSafetensorsFile(
         // ndim is a use-after-free, not a zero.
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
-        if (opts.embedded_ple and qwen4NormNeedsFold(key_str)) {
+        if (opts.fold_qwen4_norms and qwen4NormNeedsFold(key_str)) {
             const folded = try foldQwen4Norm(value, s);
             _ = mlx.mlx_array_free(value);
             final_value = folded;
@@ -4054,7 +4066,7 @@ pub fn qwen4NormNeedsFold(key: []const u8) bool {
     return false;
 }
 
-test "embedded Qwen4 loader folds only delta RMS weights and leaves other PLE weights" {
+test "Qwen4 norm convention and embedded table layout are independent" {
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const s = mlx.mlx_default_cpu_stream_new();
@@ -4065,10 +4077,22 @@ test "embedded Qwen4 loader folds only delta RMS weights and leaves other PLE we
     const root_len = try tmp.dir.realPath(io, &root_buf);
     const path = try std.fmt.allocPrintSentinel(allocator, "{s}/model.safetensors", .{root_buf[0..root_len]}, 0);
     defer allocator.free(path);
-    const norm = "language_model.model.layers.1.ple.norm_key.weight";
+    const norms = [_][:0]const u8{
+        "language_model.model.layers.0.attn_hyper_connection.hc_norm.weight",
+        "language_model.model.layers.1.self_attn.q_norm.weight",
+        "language_model.model.layers.1.self_attn.k_norm.weight",
+        "language_model.model.layers.1.self_attn.indexer.q_layernorm.weight",
+        "language_model.model.layers.1.self_attn.indexer.k_layernorm.weight",
+        "language_model.model.layers.1.ple.norm_key.weight",
+        "language_model.model.layers.1.ple.norm_query.weight",
+        "language_model.model.layers.1.ple.norm_conv.weight",
+        "language_model.model.mtp.pre_fc_norm_embedding.weight",
+        "language_model.model.mtp.pre_fc_norm_hidden.weight",
+    };
     const gate = "language_model.model.layers.1.linear_attn.norm.weight";
     const multiplier = "language_model.model.layers.1.ple.ple_embedding.layer_multipliers";
     const shard = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.weight";
+    const scale = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale";
     {
         const map = mlx.mlx_map_string_to_array_new();
         defer _ = mlx.mlx_map_string_to_array_free(map);
@@ -4082,51 +4106,58 @@ test "embedded Qwen4 loader folds only delta RMS weights and leaves other PLE we
         defer _ = mlx.mlx_array_free(raw);
         try mlx.check(mlx.mlx_astype(&raw, value, .bfloat16, s));
         try mlx.check(mlx.mlx_array_eval(raw));
-        _ = mlx.mlx_map_string_to_array_insert(map, norm, raw);
+        for (norms) |norm| _ = mlx.mlx_map_string_to_array_insert(map, norm, raw);
         _ = mlx.mlx_map_string_to_array_insert(map, gate, raw);
         _ = mlx.mlx_map_string_to_array_insert(map, multiplier, raw);
         _ = mlx.mlx_map_string_to_array_insert(map, shard, raw);
+        _ = mlx.mlx_map_string_to_array_insert(map, scale, raw);
         try mlx.check(mlx.mlx_save_safetensors(path.ptr, map, meta));
     }
     var weights = Weights.init(allocator);
     defer weights.deinit();
-    try loadSafetensorsFile(allocator, &weights, path, s, .{ .embedded_ple = true });
+    try loadSafetensorsFile(allocator, &weights, path, s, .{ .embedded_ple = true, .fold_qwen4_norms = true });
     try testing.expect(weights.get(shard) == null);
+    try testing.expect(weights.get(scale) == null);
     try testing.expect(weights.get(multiplier) != null);
-    const folded = weights.get(norm).?;
-    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(folded));
-    var f32_folded = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f32_folded);
-    try mlx.check(mlx.mlx_astype(&f32_folded, folded, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(f32_folded));
-    try testing.expectEqual(@as(f32, 1.5), mlx.mlx_array_data_float32(f32_folded).?[0]);
     var f32_gate = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(f32_gate);
     try mlx.check(mlx.mlx_astype(&f32_gate, weights.get(gate).?, .float32, s));
     try mlx.check(mlx.mlx_array_eval(f32_gate));
     try testing.expectEqual(@as(f32, 0.5), mlx.mlx_array_data_float32(f32_gate).?[0]);
     try testing.expect(!qwen4NormNeedsFold(gate));
-    for ([_][]const u8{
-        "layers.0.attn_hyper_connection.hc_norm.weight",
-        "layers.3.self_attn.q_norm.weight",
-        "layers.3.self_attn.k_norm.weight",
-        "layers.3.self_attn.indexer.q_layernorm.weight",
-        "layers.3.self_attn.indexer.k_layernorm.weight",
-        "layers.1.ple.norm_key.weight",
-        "layers.1.ple.norm_query.weight",
-        "layers.1.ple.norm_conv.weight",
-        "mtp.pre_fc_norm_embedding.weight",
-        "mtp.pre_fc_norm_hidden.weight",
-    }) |name| try testing.expect(qwen4NormNeedsFold(name));
     var converted = Weights.init(allocator);
     defer converted.deinit();
     try loadSafetensorsFile(allocator, &converted, path, s, .{});
     try testing.expect(converted.get(shard) != null);
-    var f32_original = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f32_original);
-    try mlx.check(mlx.mlx_astype(&f32_original, converted.get(norm).?, .float32, s));
-    try mlx.check(mlx.mlx_array_eval(f32_original));
-    try testing.expectEqual(@as(f32, 0.5), mlx.mlx_array_data_float32(f32_original).?[0]);
+    try testing.expect(converted.get(scale) != null);
+    var external_delta = Weights.init(allocator);
+    defer external_delta.deinit();
+    try loadSafetensorsFile(allocator, &external_delta, path, s, .{ .fold_qwen4_norms = true });
+    try testing.expect(external_delta.get(shard) != null);
+    try testing.expect(external_delta.get(scale) != null);
+    var embedded_folded = Weights.init(allocator);
+    defer embedded_folded.deinit();
+    try loadSafetensorsFile(allocator, &embedded_folded, path, s, .{ .embedded_ple = true });
+    try testing.expect(embedded_folded.get(shard) == null);
+    try testing.expect(embedded_folded.get(scale) == null);
+    const cases = [_]struct { weights: *Weights, expected: f32 }{
+        .{ .weights = &weights, .expected = 1.5 },
+        .{ .weights = &external_delta, .expected = 1.5 },
+        .{ .weights = &converted, .expected = 0.5 },
+        .{ .weights = &embedded_folded, .expected = 0.5 },
+    };
+    for (norms) |norm| {
+        try testing.expect(qwen4NormNeedsFold(norm));
+        for (cases) |case| {
+            const value = case.weights.get(norm).?;
+            if (case.expected == 1.5) try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(value));
+            var f32_value = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f32_value);
+            try mlx.check(mlx.mlx_astype(&f32_value, value, .float32, s));
+            try mlx.check(mlx.mlx_array_eval(f32_value));
+            try testing.expectEqual(case.expected, mlx.mlx_array_data_float32(f32_value).?[0]);
+        }
+    }
 }
 
 /// True if the safetensors weight `key` should be retained for the text
@@ -7554,6 +7585,72 @@ const QWEN4_GOOD_FIELDS =
     "\"ple_layer_ids\":[2],\"ngram_size\":3,\"heads_per_ngram\":8," ++
     "\"ngram_vocab_size_base\":20000000,\"make_ngram_vocab_size_divisible_by\":128," ++
     "\"indexer_n_heads\":4,\"indexer_head_dim\":128,\"indexer_budget\":2048,\"indexer_compress_ratio\":4";
+
+test "qwen4 norm convention is an explicit root marker with strict values" {
+    const unmarked = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
+    try testing.expectEqual(@as(?Qwen4NormConvention, null), unmarked.qwen4_norm_convention);
+    const delta = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"qwen4_norm_convention\":\"delta\""));
+    try testing.expectEqual(Qwen4NormConvention.delta, delta.qwen4_norm_convention.?);
+    const folded = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"qwen4_norm_convention\":\"folded\""));
+    try testing.expectEqual(Qwen4NormConvention.folded, folded.qwen4_norm_convention.?);
+    for ([_][]const u8{
+        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"qwen4_norm_convention\":null"),
+        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"qwen4_norm_convention\":1"),
+        qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"qwen4_norm_convention\":\"other\""),
+    }) |json| try testing.expectError(error.InvalidQwen4NormConvention, parseConfigFromJson(testing.allocator, json));
+    defer setConfigOverrides(null);
+    setConfigOverrides("{\"qwen4_norm_convention\":\"delta\"}");
+    const overridden = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
+    try testing.expectEqual(Qwen4NormConvention.delta, overridden.qwen4_norm_convention.?);
+}
+
+test "unmarked embedded qwen4 norm convention is refused with a named error" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try @import("qwen4_ple.zig").writeFixture(&td, .valid);
+    const json =
+        \\{"model_type":"qwen4_exp","hidden_size":64,"num_hidden_layers":2,
+        \\"num_attention_heads":1,"num_key_value_heads":1,"head_dim":64,
+        \\"vocab_size":1,"ple_layer_ids":[2],"ple_embed_dim":64,
+        \\"ngram_size":3,"heads_per_ngram":1,"ngram_vocab_size_base":2,
+        \\"make_ngram_vocab_size_divisible_by":6,"split_ngram_parts":3}
+    ;
+    try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try td.dir.realPath(io, &path);
+    try testing.expectError(error.AmbiguousQwen4NormConvention, parseConfig(io, testing.allocator, path[0..len]));
+    defer setConfigOverrides(null);
+    setConfigOverrides("{\"qwen4_norm_convention\":\"delta\"}");
+    var accepted = try parseConfig(io, testing.allocator, path[0..len]);
+    defer accepted.deinit(testing.allocator);
+    try testing.expectEqual(Qwen4NormConvention.delta, accepted.qwen4_norm_convention.?);
+    try testing.expectEqual(@as(?u64, 120), accepted.embedded_ple_payload_bytes);
+}
+
+test "local oQ Qwen4 metadata requires an explicit delta convention" {
+    const raw = std.c.getenv("QWEN4_EMBEDDED_TEST_MODEL") orelse return error.SkipZigTest;
+    const path = std.mem.span(raw);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try testing.expectError(error.AmbiguousQwen4NormConvention, parseConfig(io, testing.allocator, path));
+    defer setConfigOverrides(null);
+    setConfigOverrides("{\"qwen4_norm_convention\":\"delta\"}");
+    var config = try parseConfig(io, testing.allocator, path);
+    defer config.deinit(testing.allocator);
+    try testing.expect(config.isQwen4());
+    try testing.expectEqual(Qwen4NormConvention.delta, config.qwen4_norm_convention.?);
+    try testing.expect(config.embedded_ple_payload_bytes.? > 0);
+}
+
+test "local legacy Qwen4 metadata keeps external folded default" {
+    const raw = std.c.getenv("QWEN4_EXTERNAL_TEST_MODEL") orelse return error.SkipZigTest;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try parseConfig(io, testing.allocator, std.mem.span(raw));
+    defer config.deinit(testing.allocator);
+    try testing.expect(config.isQwen4());
+    try testing.expectEqual(@as(?Qwen4NormConvention, null), config.qwen4_norm_convention);
+    try testing.expectEqual(@as(?u64, null), config.embedded_ple_payload_bytes);
+}
 
 test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load error" {
     const good = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));

@@ -5416,3 +5416,10 @@ raw BF16 rows do not depend on quantization group size`.
   slot's cached keys already carry their positions. The `any_mrope` refusals (`qsaBatchedGatherOn`, the block-keeping
   branch of `qsaMask`, the gather's early return) and the raw pad-waste bill for such slots are gone.
 - Guard: `qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions`.
+
+## An embedded PLE table does not identify the norm convention
+
+- Defect: a Qwen4 pack with embedded PLE shards and already folded RMS weights would load and add 1 again, corrupting every affected norm while decoding without an error.
+- Cause: the loader used table storage to choose the norm transform, though the two are independent checkpoint choices.
+- Fix: root `qwen4_norm_convention` explicitly selects `delta` or `folded`; unmarked embedded packs fail by name. External-table packs retain the legacy folded default. Embedded `weight_scale` must be identity when present.
+- Guard: the model tests cover all ten norm roles across both table layouts, strict marker parsing, unmarked refusal, and the scale/header fixtures; residency uses one validated weight estimate at eviction, preflight and commit.

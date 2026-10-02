@@ -5,6 +5,7 @@ pub const EmbeddedInfo = struct { payload_bytes: u64 };
 const prefix = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.";
 const layer_prefix = "language_model.model.layers.";
 const shard_marker = ".ple.ple_embedding.ngram_embedding.shards.";
+const scale_marker = ".ple.ple_embedding.ngram_embedding.weight_scale";
 const Part = enum(u2) { weight, scales, biases };
 
 const Key = struct { layer: u32, shard: u32, part: Part };
@@ -24,7 +25,50 @@ fn parseKey(name: []const u8) ?Key {
 }
 
 pub fn embeddedTensorName(name: []const u8) bool {
-    return parseKey(name) != null;
+    return parseKey(name) != null or (std.mem.startsWith(u8, name, layer_prefix) and std.mem.endsWith(u8, name, scale_marker));
+}
+
+pub fn regionsOverlap(a_start: u64, a_end: u64, b_start: u64, b_end: u64) bool {
+    return a_start < b_end and b_start < a_end;
+}
+
+pub const HeaderRegion = struct {
+    rows: u64,
+    cols: u64,
+    start: u64,
+    end: u64,
+
+    pub fn overlaps(a: HeaderRegion, b: HeaderRegion) bool {
+        return regionsOverlap(a.start, a.end, b.start, b.end);
+    }
+};
+
+pub const RegionShape = enum { matrix, scalar };
+
+pub fn headerRegion(obj: std.json.ObjectMap, name: []const u8, dtype: []const u8, elem: u64, map_len: usize, data_off: usize, shape_kind: RegionShape) !HeaderRegion {
+    const v = obj.get(name) orelse return error.TensorHeader;
+    if (v != .object) return error.TensorHeader;
+    const dt = v.object.get("dtype") orelse return error.TensorHeader;
+    if (dt != .string or !std.mem.eql(u8, dt.string, dtype)) return error.TensorDtype;
+    const shape = v.object.get("shape") orelse return error.TensorHeader;
+    const offsets = v.object.get("data_offsets") orelse return error.TensorHeader;
+    if (shape != .array or offsets != .array or offsets.array.items.len != 2) return error.TensorHeader;
+    const dims = shape.array.items;
+    if (shape_kind == .matrix and dims.len != 2) return error.TensorHeader;
+    if (shape_kind == .scalar and dims.len != 0 and dims.len != 1) return error.TensorHeader;
+    const o = offsets.array.items;
+    for (o) |x| if (x != .integer) return error.TensorHeader;
+    for (dims) |x| if (x != .integer) return error.TensorHeader;
+    const rows_i: i64 = if (shape_kind == .scalar) 1 else dims[0].integer;
+    const cols_i: i64 = if (shape_kind == .scalar and dims.len == 0) 1 else if (shape_kind == .scalar) dims[0].integer else dims[1].integer;
+    if (rows_i <= 0 or cols_i <= 0 or o[0].integer < 0 or o[1].integer < o[0].integer) return error.TensorRegion;
+    if (shape_kind == .scalar and cols_i != 1) return error.TensorRegion;
+    const r: HeaderRegion = .{ .rows = @intCast(rows_i), .cols = @intCast(cols_i), .start = @intCast(o[0].integer), .end = @intCast(o[1].integer) };
+    const need = std.math.mul(u64, std.math.mul(u64, r.rows, r.cols) catch return error.TensorRegion, elem) catch return error.TensorRegion;
+    if (r.end - r.start != need) return error.TensorRegion;
+    const abs_end = std.math.add(u64, data_off, r.end) catch return error.TensorTruncated;
+    if (abs_end > map_len) return error.TensorTruncated;
+    return r;
 }
 
 const Candidate = struct {
@@ -137,27 +181,13 @@ fn openFile(a: std.mem.Allocator, model_dir: []const u8, name: []const u8) !File
 }
 
 fn tensor(file: File, file_id: usize, name: []const u8, dtype: []const u8, elem: u64) !Tensor {
-    const v = file.obj.get(name) orelse return error.EmbeddedPleHeader;
-    if (v != .object) return error.EmbeddedPleHeader;
-    const dt = v.object.get("dtype") orelse return error.EmbeddedPleHeader;
-    if (dt != .string or !std.mem.eql(u8, dt.string, dtype)) return error.EmbeddedPleDtype;
-    const shape = v.object.get("shape") orelse return error.EmbeddedPleHeader;
-    const offsets = v.object.get("data_offsets") orelse return error.EmbeddedPleHeader;
-    if (shape != .array or shape.array.items.len != 2 or offsets != .array or offsets.array.items.len != 2) return error.EmbeddedPleHeader;
-    const r = shape.array.items;
-    const o = offsets.array.items;
-    for ([_]std.json.Value{ r[0], r[1], o[0], o[1] }) |x| if (x != .integer) return error.EmbeddedPleHeader;
-    if (r[0].integer <= 0 or r[1].integer <= 0 or o[0].integer < 0 or o[1].integer < o[0].integer) return error.EmbeddedPleRegion;
-    const rows: u64 = @intCast(r[0].integer);
-    const cols: u64 = @intCast(r[1].integer);
-    const start: u64 = @intCast(o[0].integer);
-    const stop: u64 = @intCast(o[1].integer);
-    if (cols > std.math.maxInt(u32)) return error.EmbeddedPleRegion;
-    const need = std.math.mul(u64, std.math.mul(u64, rows, cols) catch return error.EmbeddedPleRegion, elem) catch return error.EmbeddedPleRegion;
-    if (stop - start != need) return error.EmbeddedPleRegion;
-    const absolute = std.math.add(u64, file.data_off, stop) catch return error.EmbeddedPleRegion;
-    if (absolute > file.map.len) return error.EmbeddedPleRegion;
-    return .{ .file = file_id, .off = file.data_off + @as(usize, @intCast(start)), .len = @intCast(need), .rows = rows, .cols = @intCast(cols) };
+    const region = headerRegion(file.obj, name, dtype, elem, file.map.len, file.data_off, .matrix) catch |err| return switch (err) {
+        error.TensorHeader => error.EmbeddedPleHeader,
+        error.TensorDtype => error.EmbeddedPleDtype,
+        error.TensorRegion, error.TensorTruncated => error.EmbeddedPleRegion,
+    };
+    if (region.cols > std.math.maxInt(u32)) return error.EmbeddedPleRegion;
+    return .{ .file = file_id, .off = file.data_off + @as(usize, @intCast(region.start)), .len = @intCast(region.end - region.start), .rows = region.rows, .cols = @intCast(region.cols) };
 }
 
 pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTable {
@@ -175,14 +205,21 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
     if (weights != .object) return error.EmbeddedPleIndex;
     const candidates = try a.alloc(Candidate, expected.shards);
     for (candidates) |*c| c.* = .{};
+    const scale_name = try std.fmt.allocPrint(a, "{s}{d}{s}", .{ layer_prefix, expected.layer_index, scale_marker });
+    var scale_file: ?[]const u8 = null;
     var found: usize = 0;
     var it = weights.object.iterator();
     while (it.next()) |entry| {
         const name = entry.key_ptr.*;
+        if (std.mem.startsWith(u8, name, layer_prefix) and std.mem.endsWith(u8, name, scale_marker)) {
+            if (!std.mem.eql(u8, name, scale_name) or entry.value_ptr.* != .string) return error.EmbeddedPleIndex;
+            scale_file = entry.value_ptr.string;
+            continue;
+        }
         if (!std.mem.startsWith(u8, name, layer_prefix) or std.mem.indexOf(u8, name, shard_marker) == null) continue;
         const key = parseKey(name) orelse return error.EmbeddedPleIndex;
         if (key.layer != expected.layer_index or key.shard >= expected.shards or entry.value_ptr.* != .string) return error.EmbeddedPleIndex;
-        const part = @intFromEnum(key.part);
+        const part = @backingInt(key.part);
         const c = &candidates[key.shard];
         if (c.names[part] != null) return error.EmbeddedPleDuplicate;
         c.names[part] = name;
@@ -226,7 +263,7 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
         const gs = expected.dim / parts[1].cols;
         if (gs == 0 or gs > 1024 or (i != 0 and (parts[0].cols != wcols or parts[1].cols != scols or gs != group_size))) return error.EmbeddedPleGeometry;
         for (parts, 0..) |p, x| for (parts[0..x]) |q| {
-            if (p.file == q.file and p.off < q.off + q.len and q.off < p.off + p.len) return error.EmbeddedPleOverlap;
+            if (p.file == q.file and regionsOverlap(p.off, p.off + p.len, q.off, q.off + q.len)) return error.EmbeddedPleOverlap;
         };
         shards[i] = .{ .first = first, .rows = parts[0].rows, .parts = parts };
         first = std.math.add(u64, first, parts[0].rows) catch return error.EmbeddedPleRegion;
@@ -237,9 +274,30 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
     if (first != expected.rows) return error.EmbeddedPleGeometry;
     for (shards, 0..) |shard, i| for (shard.parts) |p| {
         for (shards[0..i]) |prior| for (prior.parts) |q| {
-            if (p.file == q.file and p.off < q.off + q.len and q.off < p.off + p.len) return error.EmbeddedPleOverlap;
+            if (p.file == q.file and regionsOverlap(p.off, p.off + p.len, q.off, q.off + q.len)) return error.EmbeddedPleOverlap;
         };
     };
+    if (scale_file) |file_name| {
+        const id = if (file_ids.get(file_name)) |existing| existing else blk: {
+            const f = try openFile(a, model_dir, file_name);
+            const next = files.items.len;
+            try files.append(a, f);
+            try file_ids.put(a, file_name, next);
+            break :blk next;
+        };
+        const file = files.items[id];
+        const region = headerRegion(file.obj, scale_name, "BF16", 2, file.map.len, file.data_off, .scalar) catch |err| return switch (err) {
+            error.TensorHeader => error.EmbeddedPleHeader,
+            error.TensorDtype => error.EmbeddedPleDtype,
+            error.TensorRegion, error.TensorTruncated => error.EmbeddedPleRegion,
+        };
+        for (shards) |shard| for (shard.parts) |part| {
+            if (part.file == id and regionsOverlap(region.start, region.end, part.off - file.data_off, part.off + part.len - file.data_off)) return error.EmbeddedPleOverlap;
+        };
+        const off = file.data_off + @as(usize, @intCast(region.start));
+        if (std.mem.readInt(u16, file.map[off..][0..2], .little) != 0x3f80) return error.EmbeddedPleWeightScale;
+        payload = std.math.add(u64, payload, region.end - region.start) catch return error.EmbeddedPleRegion;
+    }
     return .{ .arena = arena, .files = files.items, .shards = shards, .rows = first, .dim = expected.dim, .bits = 4, .group_size = group_size, .wcols = wcols, .scols = scols, .payload_bytes = payload };
 }
 
@@ -249,42 +307,37 @@ pub fn inspectEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?Embedded
     return .{ .payload_bytes = table.payload_bytes };
 }
 
-pub const FixtureVariant = enum { valid, missing, duplicate, extra, dtype, bounds, overlap };
+pub const FixtureVariant = enum { valid, missing, duplicate, extra, dtype, bounds, overlap, scale_unit, scale_scalar, scale_nonunit, scale_dtype, scale_shape, scale_overlap };
 
 pub fn writeFixture(td: *std.testing.TmpDir, variant: FixtureVariant) !void {
     const a = std.testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    const index = try std.fmt.allocPrint(a,
-        "{{\"weight_map\":{{\"{s}2.biases\":\"a.safetensors\",\"{s}0.weight\":\"a.safetensors\",\"{s}1.weight\":\"b.safetensors\",\"{s}2.weight\":\"a.safetensors\",\"{s}0.scales\":\"a.safetensors\",\"{s}1.scales\":\"b.safetensors\",\"{s}0.biases\":\"a.safetensors\",\"{s}2.scales\":\"a.safetensors\"{s}}}}}",
-        .{ prefix, prefix, prefix, prefix, prefix, prefix, prefix, prefix, if (variant == .missing) "" else if (variant == .duplicate) ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.weight\":\"a.safetensors\",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.1.biases\":\"b.safetensors\"" else if (variant == .extra) ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.1.biases\":\"b.safetensors\",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.3.weight\":\"a.safetensors\"" else ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.1.biases\":\"b.safetensors\"" });
+    const index = try std.fmt.allocPrint(a, "{{\"weight_map\":{{\"{s}2.biases\":\"a.safetensors\",\"{s}0.weight\":\"a.safetensors\",\"{s}1.weight\":\"b.safetensors\",\"{s}2.weight\":\"a.safetensors\",\"{s}0.scales\":\"a.safetensors\",\"{s}1.scales\":\"b.safetensors\",\"{s}0.biases\":\"a.safetensors\",\"{s}2.scales\":\"a.safetensors\"{s}}}}}", .{ prefix, prefix, prefix, prefix, prefix, prefix, prefix, prefix, if (variant == .missing) "" else if (variant == .duplicate) ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.weight\":\"a.safetensors\",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.1.biases\":\"b.safetensors\"" else if (variant == .extra) ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.1.biases\":\"b.safetensors\",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.3.weight\":\"a.safetensors\"" else if (@backingInt(variant) >= @backingInt(FixtureVariant.scale_unit)) ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.1.biases\":\"b.safetensors\",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale\":\"a.safetensors\"" else ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.1.biases\":\"b.safetensors\"" });
     defer a.free(index);
     try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = index });
-    const header_a = try std.fmt.allocPrint(a,
-        "{{\"{s}2.biases\":{{\"dtype\":\"BF16\",\"shape\":[3,1],\"data_offsets\":[0,6]}}," ++
-            "\"{s}0.weight\":{{\"dtype\":\"{s}\",\"shape\":[2,4],\"data_offsets\":[6,38]}}," ++
-            "\"{s}2.weight\":{{\"dtype\":\"U32\",\"shape\":[3,4],\"data_offsets\":[{d},{d}]}}," ++
-            "\"{s}0.scales\":{{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[86,90]}}," ++
-            "\"{s}0.biases\":{{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[{d},{d}]}}," ++
-            "\"{s}2.scales\":{{\"dtype\":\"BF16\",\"shape\":[3,1],\"data_offsets\":[94,100]}}}}",
-        .{ prefix, prefix, if (variant == .dtype) "F32" else "U32", prefix, if (variant == .bounds) @as(u32, 999) else 38, if (variant == .bounds) @as(u32, 1047) else 86, prefix, prefix, if (variant == .overlap) @as(u32, 88) else 90, if (variant == .overlap) @as(u32, 92) else 94, prefix });
+    const header_a = try std.fmt.allocPrint(a, "{{\"{s}2.biases\":{{\"dtype\":\"BF16\",\"shape\":[3,1],\"data_offsets\":[0,6]}}," ++
+        "\"{s}0.weight\":{{\"dtype\":\"{s}\",\"shape\":[2,4],\"data_offsets\":[6,38]}}," ++
+        "\"{s}2.weight\":{{\"dtype\":\"U32\",\"shape\":[3,4],\"data_offsets\":[{d},{d}]}}," ++
+        "\"{s}0.scales\":{{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[86,90]}}," ++
+        "\"{s}0.biases\":{{\"dtype\":\"BF16\",\"shape\":[2,1],\"data_offsets\":[{d},{d}]}}," ++
+        "\"{s}2.scales\":{{\"dtype\":\"BF16\",\"shape\":[3,1],\"data_offsets\":[94,100]}}{s}}}", .{ prefix, prefix, if (variant == .dtype) "F32" else "U32", prefix, if (variant == .bounds) @as(u32, 999) else 38, if (variant == .bounds) @as(u32, 1047) else 86, prefix, prefix, if (variant == .overlap) @as(u32, 88) else 90, if (variant == .overlap) @as(u32, 92) else 94, prefix, if (@backingInt(variant) >= @backingInt(FixtureVariant.scale_unit)) if (variant == .scale_dtype) ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale\":{\"dtype\":\"F16\",\"shape\":[1],\"data_offsets\":[100,102]}" else if (variant == .scale_shape) ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale\":{\"dtype\":\"BF16\",\"shape\":[2],\"data_offsets\":[100,102]}" else if (variant == .scale_scalar) ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale\":{\"dtype\":\"BF16\",\"shape\":[],\"data_offsets\":[100,102]}" else if (variant == .scale_overlap) ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[98,100]}" else ",\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale\":{\"dtype\":\"BF16\",\"shape\":[1],\"data_offsets\":[100,102]}" else "" });
     defer a.free(header_a);
-    const header_b = try std.fmt.allocPrint(a,
-        "{{\"{s}1.scales\":{{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[0,2]}}," ++
-            "\"{s}1.weight\":{{\"dtype\":\"U32\",\"shape\":[1,4],\"data_offsets\":[2,18]}}," ++
-            "\"{s}1.biases\":{{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[18,20]}}}}",
-        .{ prefix, prefix, prefix });
+    const header_b = try std.fmt.allocPrint(a, "{{\"{s}1.scales\":{{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[0,2]}}," ++
+        "\"{s}1.weight\":{{\"dtype\":\"U32\",\"shape\":[1,4],\"data_offsets\":[2,18]}}," ++
+        "\"{s}1.biases\":{{\"dtype\":\"BF16\",\"shape\":[1,1],\"data_offsets\":[18,20]}}}}", .{ prefix, prefix, prefix });
     defer a.free(header_b);
-    var data_a: [100]u8 = @splat(0);
+    var data_a: [102]u8 = @splat(0);
     @memset(data_a[6..22], 0x00);
     @memset(data_a[22..38], 0x11);
     @memset(data_a[38..54], 0x33);
     @memset(data_a[54..70], 0x44);
     @memset(data_a[70..86], 0x55);
     for ([_]usize{ 86, 88, 94, 96, 98 }) |off| std.mem.writeInt(u16, data_a[off..][0..2], 0x3f80, .little);
+    std.mem.writeInt(u16, data_a[100..102], if (variant == .scale_nonunit) 0x4000 else 0x3f80, .little);
     var data_b: [20]u8 = @splat(0);
     std.mem.writeInt(u16, data_b[0..2], 0x3f80, .little);
     @memset(data_b[2..18], 0x22);
-    try writeSafetensors(td, "a.safetensors", header_a, &data_a);
+    try writeSafetensors(td, "a.safetensors", header_a, data_a[0..if (@backingInt(variant) >= @backingInt(FixtureVariant.scale_unit)) 102 else 100]);
     try writeSafetensors(td, "b.safetensors", header_b, &data_b);
 }
 
@@ -329,6 +382,7 @@ test "embedded PLE reads unequal numbered shards across mixed files" {
     }
     try std.testing.expect(!embeddedTensorName(prefix ++ "00.weight"));
     try std.testing.expect(!embeddedTensorName("language_model.model.layers.1.ple.ple_embedding.layer_multipliers"));
+    try std.testing.expect(embeddedTensorName("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale"));
 }
 
 test "embedded PLE rejects partial and corrupt shard layouts" {
@@ -351,9 +405,45 @@ test "embedded PLE rejects partial and corrupt shard layouts" {
     }
 }
 
+test "embedded PLE validates optional global weight scale" {
+    const spec: EmbeddedSpec = .{ .rows = 6, .dim = 32, .shards = 3 };
+    inline for (.{ .valid, .scale_unit, .scale_scalar, .scale_nonunit, .scale_dtype, .scale_shape, .scale_overlap }) |variant| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        try writeFixture(&td, variant);
+        const io = std.Io.Threaded.global_single_threaded.io();
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try td.dir.realPath(io, &path_buf);
+        const path = path_buf[0..path_len];
+        if (variant == .valid or variant == .scale_unit or variant == .scale_scalar) {
+            const info = (try inspectEmbedded(path, spec)).?;
+            try std.testing.expectEqual(@as(u64, if (variant == .valid) 120 else 122), info.payload_bytes);
+        } else {
+            try std.testing.expectError(switch (variant) {
+                .scale_nonunit => error.EmbeddedPleWeightScale,
+                .scale_dtype => error.EmbeddedPleDtype,
+                .scale_shape => error.EmbeddedPleRegion,
+                .scale_overlap => error.EmbeddedPleOverlap,
+                else => unreachable,
+            }, openEmbedded(path, spec));
+        }
+    }
+}
+
+test "global weight scale without shards leaves external table layout available" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeFixture(&td, .scale_unit);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale\":\"a.safetensors\"}}" });
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    try std.testing.expect((try inspectEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 })) == null);
+}
+
 test "embedded PLE indexed checkpoint metadata validates without tensor reads" {
     const raw = std.c.getenv("QWEN4_EMBEDDED_TEST_MODEL") orelse return error.SkipZigTest;
     const path = std.mem.sliceTo(raw, 0);
     const info = (try inspectEmbedded(path, .{ .rows = 320_001_536, .dim = 160, .shards = 128 })).?;
-    try std.testing.expectEqual(@as(u64, 32_000_153_600), info.payload_bytes);
+    try std.testing.expectEqual(@as(u64, 32_000_153_602), info.payload_bytes);
 }
