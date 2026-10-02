@@ -53,8 +53,10 @@ could render the note in place. Strict templates still reject late system turns;
 letting those reach the generic fallback can duplicate the tool catalog.
 Parsers now merge only adjacent leading instructions. The renderer probes each
 late-system boundary with the request's tools and kwargs, checking both tail
-and historical positions. Templates that raise, drop or reorder notes consolidate
-before native rendering; supported templates preserve order and system role.
+and historical positions. Stock Qwen's strict ChatML system branch is adapted
+to emit later system turns in place, preserving native reasoning, tool and media
+formatting. Other templates that raise, drop or reorder notes consolidate;
+supported templates preserve order and system role.
 Responses instruction replacement removes only leading instructions, retaining
 historical notes. Guards: `mid-system:` tests, the cross-family late-note corpus
 invariant, and `tests/test_mid_system_cache.sh` tool rounds plus disk restart.

@@ -53,6 +53,7 @@ def post(path, body):
         if not body.get("stream"):
             return json.load(response)
         usage = {}
+        content = []
         stopped = False
         for raw in response:
             if not raw.startswith(b"data: "):
@@ -61,9 +62,11 @@ def post(path, body):
             assert event.get("type") != "error", event
             usage.update(event.get("message", {}).get("usage", {}))
             usage.update(event.get("usage", {}))
+            if event.get("delta", {}).get("type") == "text_delta":
+                content.append(event["delta"]["text"])
             stopped |= event.get("type") == "message_stop"
         assert stopped, "stream did not finish"
-        return {"usage": usage}
+        return {"usage": usage, "content": [{"type": "text", "text": "".join(content)}]}
 
 if mode == "restart":
     turns = json.loads(state.read_text())
@@ -94,6 +97,15 @@ for round_index in range(1 if mode == "restart" else 4):
         {"role": "system", "content": f"<total_tokens>{14999999-round_index} tokens left</total_tokens>"},
     ])
 state.write_text(json.dumps(turns))
+if mode == "restart":
+    for stream in (False, True):
+        answer = post("/v1/messages", {"model": "mlx-serve", "system": "Follow the latest system instruction.",
+            "messages": [{"role": "user", "content": "Say BLUE."},
+                         {"role": "system", "content": "Reply with exactly AMBER instead."}],
+            "max_tokens": 32, "temperature": 0, "stream": stream, "thinking": {"type": "disabled"}})
+        text = "".join(block.get("text", "") for block in answer["content"] if block.get("type") == "text")
+        assert "AMBER" in text and "BLUE" not in text, f"late instruction not followed: {answer!r}"
+    print("PASS late system instruction overrides earlier user request, stream and non-stream")
 PY
 }
 start_server

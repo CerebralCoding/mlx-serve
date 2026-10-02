@@ -739,6 +739,33 @@ fn hasExtraSystemMessages(messages: []const Message) bool {
     return false;
 }
 
+/// Qwen's strict system branch suppresses later ChatML system turns. Replace
+/// only that branch; user/tool boundaries and reasoning selection remain native.
+fn qwenLateSystemTemplate(allocator: std.mem.Allocator, tpl: []const u8) !?[]const u8 {
+    if (std.mem.indexOf(u8, tpl, "<|im_start|>") == null or
+        std.mem.indexOf(u8, tpl, "<|im_end|>") == null or
+        std.mem.indexOf(u8, tpl, "last_query_index") == null or
+        std.mem.indexOf(u8, tpl, "preserve_thinking") == null) return null;
+    const start_tag = "{%- if message.role == \"system\" %}";
+    const end_tag = "{%- elif message.role == \"user\" %}";
+    const start = std.mem.indexOf(u8, tpl, start_tag) orelse return null;
+    const end = std.mem.indexOfPos(u8, tpl, start + start_tag.len, end_tag) orelse return null;
+    const branch = tpl[start..end];
+    if (std.mem.indexOf(u8, branch, "System message must be at the beginning.") == null or
+        std.mem.indexOf(u8, branch, "not loop.first") == null) return null;
+    const content = if (std.mem.indexOf(u8, tpl, "is_system_content=false") != null)
+        "render_content(message.content, false, true)|trim"
+    else
+        "content";
+    return try std.mem.concat(allocator, u8, &.{
+        tpl[0..start],
+        "{%- if message.role == \"system\" %}{%- if not loop.first %}{{- '<|im_start|>system\\n' + (",
+        content,
+        ") + '<|im_end|>\\n' }}{%- endif %}",
+        tpl[end..],
+    });
+}
+
 fn renderJinja(
     allocator: std.mem.Allocator,
     messages: []const Message,
@@ -749,7 +776,9 @@ fn renderJinja(
 ) !?[]const u8 {
     const json = try serializeMessagesJsonFor(allocator, messages, empty_content, config);
     defer allocator.free(json);
-    const tpl = try allocator.dupeSentinel(u8, config.chat_template, 0);
+    const adapted = if (hasExtraSystemMessages(messages)) try qwenLateSystemTemplate(allocator, config.chat_template) else null;
+    defer if (adapted) |t| allocator.free(t);
+    const tpl = try allocator.dupeSentinel(u8, adapted orelse config.chat_template, 0);
     defer allocator.free(tpl);
     const msgs = try allocator.dupeSentinel(u8, json, 0);
     defer allocator.free(msgs);
@@ -14814,6 +14843,76 @@ test "mid-system: supported templates preserve late notes and stable history" {
     defer allocator.free(after);
     try testing.expect(std.mem.startsWith(u8, after, before));
     try testing.expect(std.mem.indexOf(u8, after, "result<|im_end|>\n<|im_start|>system\n<total_tokens>14999999") != null);
+}
+
+test "mid-system: stock Qwen notes preserve tool rounds without rewriting history" {
+    const a = testing.allocator;
+    const templates = [_][]const u8{
+        @embedFile("fixtures/qwen38_27b_chat_template.jinja"),
+        @embedFile("fixtures/qwen38_chat_template.jinja"),
+    };
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"description\":\"Read a value\",\"parameters\":{\"type\":\"object\"}}}]";
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "lookup", .arguments = "{\"index\":3}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable instructions" },
+        .{ .role = "user", .content = "first question" },
+        .{ .role = "system", .content = "runtime note one" },
+        .{ .role = "assistant", .content = "checking", .reasoning_content = "current reasoning", .tool_calls = &calls },
+        .{ .role = "tool", .content = "first result", .tool_call_id = "call_1" },
+        .{ .role = "system", .content = "runtime note two" },
+        .{ .role = "system", .content = "runtime note three" },
+        .{ .role = "assistant", .content = "answer", .reasoning_content = "more reasoning" },
+    };
+    for (templates) |tpl| {
+        const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+        const first = try renderChatTemplate(a, messages[0..3], &config, tools, null, true, "low", false);
+        defer a.free(first);
+        const second = try renderChatTemplate(a, messages[0..6], &config, tools, null, true, "low", false);
+        defer a.free(second);
+        const third = try renderChatTemplate(a, &messages, &config, tools, null, true, "low", false);
+        defer a.free(third);
+        try testing.expectEqualStrings(first, second[0..@min(first.len, second.len)]);
+        const stable_second = second[0 .. second.len - "<|im_start|>assistant\n<think>\n".len];
+        try testing.expectEqualStrings(stable_second, third[0..@min(stable_second.len, third.len)]);
+        try testing.expect(std.mem.indexOf(u8, third, "<|im_start|>system\nruntime note one<|im_end|>\n<|im_start|>assistant") != null);
+        try testing.expect(std.mem.indexOf(u8, third, "</tool_response><|im_end|>\n<|im_start|>system\nruntime note two") != null);
+        try testing.expect(std.mem.indexOf(u8, third, "<|im_start|>system\nruntime note three<|im_end|>") != null);
+        try testing.expect(std.mem.indexOf(u8, third, "current reasoning") != null);
+        try testing.expect(std.mem.indexOf(u8, third, "<function=lookup>\n<parameter=index>\n3\n</parameter>") != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, third, "<tools>"));
+    }
+}
+
+test "mid-system: stock Qwen adapter leaves unchanged turns and media native" {
+    const a = testing.allocator;
+    const tpl = @embedFile("fixtures/qwen38_27b_chat_template.jinja");
+    const config = ChatConfig{ .chat_template = tpl, .bos_token = null, .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = a };
+    const images = [_]ImageData{.{ .pixels = "", .width = 1, .height = 1 }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable" },
+        .{ .role = "user", .content = "question", .images = &images },
+        .{ .role = "assistant", .content = "answer", .reasoning_content = "thought" },
+        .{ .role = "tool", .content = "result one" },
+        .{ .role = "system", .content = "late note" },
+        .{ .role = "tool", .content = "result two", .images = &images },
+    };
+    const adapted = (try qwenLateSystemTemplate(a, tpl)).?;
+    defer a.free(adapted);
+    var native = config;
+    native.chat_template = adapted;
+    const original = try renderChatTemplate(a, messages[0..3], &config, null, null, true, "low", false);
+    defer a.free(original);
+    const equivalent = try renderChatTemplate(a, messages[0..3], &native, null, null, true, "low", false);
+    defer a.free(equivalent);
+    try testing.expectEqualStrings(original, equivalent);
+    const rendered = try renderChatTemplate(a, &messages, &config, null, null, true, "low", false);
+    defer a.free(rendered);
+    try testing.expectEqual(@as(usize, 2), std.mem.count(u8, rendered, "<|vision_start|><|image_pad|><|vision_end|>"));
+    try testing.expect(std.mem.indexOf(u8, rendered, "</tool_response><|im_end|>\n<|im_start|>system\nlate note<|im_end|>\n<|im_start|>user\n<tool_response>") != null);
+    const media_note = [_]Message{ messages[0], messages[1], .{ .role = "system", .content = "invalid", .images = &images } };
+    const extra = try serializeExtraContext(a, &config, true, "low");
+    defer a.free(extra);
+    try testing.expect((try renderJinja(a, &media_note, &config, null, extra, .null_literal)) == null);
 }
 
 test "mid-system: a tail-only template uses stable consolidation across turns" {

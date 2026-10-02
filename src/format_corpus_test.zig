@@ -67,6 +67,7 @@ test "format corpus: late system notes never vanish or rewrite supported history
         const n = std.mem.indexOf(u8, first, "corpus runtime note marker").?;
         try testing.expect(std.mem.indexOf(u8, next, "corpus runtime note marker") != null);
         try testing.expect(std.mem.indexOf(u8, next, "corpus newer note marker") != null);
+        if (std.mem.indexOf(u8, tpl, "preserve_thinking") != null) try testing.expect(n > q);
         if (n > q) try testing.expect(std.mem.startsWith(u8, next, first[0 .. n + "corpus runtime note marker".len]));
     }
 }
