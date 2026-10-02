@@ -2,6 +2,9 @@
 
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
+### Features
+- The console Monitor keeps its own history in the browser, computed from the server's counters: 1 hour of samples then one per minute up to 24 hours, kept across reloads, with failed, rejected and cancelled rates, per-model totals and a request table.
+
 ### Fixes
 - Serving more than 16 simultaneous chats on Qwen3.8 27B with its drafter could fail a whole batch of streams mid-answer; every stream now completes (measured to 32 at once on an M5 Ultra).
 - Sushi Flash Next packs with unquantized BF16 n-gram tables now load when their table metadata declares no quantization groups.
