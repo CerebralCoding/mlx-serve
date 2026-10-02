@@ -127,7 +127,7 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
     return null;
 }
 
-pub const Qwen4NormConvention = qwen4_ple.NormConvention;
+pub const Qwen4NormConvention = enum { delta, folded };
 
 pub const ModelConfig = struct {
     // Architecture identity
@@ -1401,19 +1401,6 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
-            if (config.qwen4_norm_convention == null) {
-                if (config.num_hidden_layers > 4096) return error.InvalidQwen4NormAnchor;
-                var full_layers: std.ArrayList(u32) = .empty;
-                defer full_layers.deinit(allocator);
-                for (0..config.num_hidden_layers) |layer| {
-                    if (!config.isLinearLayer(@intCast(layer))) try full_layers.append(allocator, @intCast(layer));
-                }
-                config.qwen4_norm_convention = qwen4_ple.inferNormConvention(model_dir, full_layers.items, config.indexer_head_dim) catch |err| {
-                    log.err("[qwen4] cannot infer norm convention for {s}: {s}; set qwen4_norm_convention to delta or folded in this checkpoint's config.json.\n", .{ model_dir, @errorName(err) });
-                    return err;
-                };
-                log.info("[qwen4] inferred {s} norm convention from trunk indexer norms: {s}\n", .{ @tagName(config.qwen4_norm_convention.?), model_dir });
-            }
             config.embedded_ple_payload_bytes = info.payload_bytes;
         }
     }
@@ -3831,10 +3818,10 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
 /// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, fold_qwen4_norms: bool = false };
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false };
 
 /// The text model's weights for `config`.
-pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
+pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
     if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
@@ -3842,7 +3829,16 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
-    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .fold_qwen4_norms = config.isQwen4() and config.qwen4_norm_convention == .delta });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4() });
+    errdefer weights.deinit();
+    if (config.isQwen4()) {
+        defer reportF16Narrowing();
+        resolveWeightPrefix(config, &weights);
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        try resolveAndFoldQwen4Norms(config, &weights, s, model_dir);
+    }
+    return weights;
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -3931,7 +3927,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     }
 
     log.info("Loaded {d} weights from {d} file(s)\n", .{ weights.count(), file_count });
-    reportF16Narrowing();
+    if (!opts.defer_qwen4_norms) reportF16Narrowing();
     return weights;
 }
 
@@ -4039,11 +4035,8 @@ pub fn loadSafetensorsFile(
         // ndim is a use-after-free, not a zero.
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
-        if (opts.fold_qwen4_norms and qwen4NormNeedsFold(key_str)) {
-            const folded = try foldQwen4Norm(value, s);
-            _ = mlx.mlx_array_free(value);
-            final_value = folded;
-        } else if (!opts.keep_f16 and narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
+        if (!(opts.defer_qwen4_norms and qwen4NormNeedsFold(key_str)) and
+            !opts.keep_f16 and narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
             (ndim != 1 or narrow1dEnabled()))
         {
             var cast = mlx.mlx_array_new();
@@ -4068,6 +4061,83 @@ fn foldQwen4Norm(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     errdefer _ = mlx.mlx_array_free(folded);
     try mlx.check(mlx.mlx_astype(&folded, shifted, .bfloat16, s));
     return folded;
+}
+
+fn inferLoadedQwen4Norms(config: *const ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Qwen4NormConvention {
+    if (config.num_hidden_layers > 4096 or config.indexer_head_dim == 0) return error.InvalidQwen4NormAnchor;
+    var inferred: ?Qwen4NormConvention = null;
+    var total_bytes: u64 = 0;
+    for (0..config.num_hidden_layers) |layer| {
+        if (config.isLinearLayer(@intCast(layer))) continue;
+        for ([_][]const u8{ "q_layernorm.weight", "k_layernorm.weight" }) |suffix| {
+            var name_buf: [256]u8 = undefined;
+            const name = std.fmt.bufPrint(&name_buf, "{s}.layers.{d}.self_attn.indexer.{s}", .{ config.weight_prefix, layer, suffix }) catch return error.InvalidQwen4NormAnchor;
+            const value = weights.get(name) orelse {
+                log.err("[qwen4] missing norm anchor {s}\n", .{name});
+                return error.MissingQwen4NormAnchor;
+            };
+            const shape = mlx.getShape(value);
+            if (shape.len != 1 or shape[0] != config.indexer_head_dim) return error.InvalidQwen4NormAnchor;
+            const dtype = mlx.mlx_array_dtype(value);
+            if (dtype != .float32 and dtype != .float16 and dtype != .bfloat16) return error.InvalidQwen4NormAnchor;
+            const bytes = std.math.mul(u64, @as(u64, @intCast(mlx.mlx_array_size(value))), @as(u64, @intCast(mlx.mlx_array_itemsize(value)))) catch return error.InvalidQwen4NormAnchor;
+            total_bytes = std.math.add(u64, total_bytes, bytes) catch return error.InvalidQwen4NormAnchor;
+            if (total_bytes > 1024 * 1024) return error.InvalidQwen4NormAnchor;
+
+            var f32_value = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f32_value);
+            try mlx.check(mlx.mlx_astype(&f32_value, value, .float32, s));
+            try mlx.check(mlx.mlx_array_eval(f32_value));
+            const data = mlx.mlx_array_data_float32(f32_value) orelse return error.InvalidQwen4NormAnchor;
+            var sum: f64 = 0;
+            for (data[0..@intCast(config.indexer_head_dim)]) |number| {
+                if (!std.math.isFinite(number)) return error.AmbiguousQwen4NormConvention;
+                sum += number;
+            }
+            const mean: f32 = @floatCast(sum / @as(f64, @floatFromInt(config.indexer_head_dim)));
+            const current: Qwen4NormConvention = if (mean >= -0.2 and mean <= 0.2) .delta else if (mean >= 0.8 and mean <= 1.2) .folded else return error.AmbiguousQwen4NormConvention;
+            if (inferred) |prior| {
+                if (prior != current) return error.AmbiguousQwen4NormConvention;
+            } else inferred = current;
+        }
+    }
+    return inferred orelse error.InvalidQwen4NormAnchor;
+}
+
+fn resolveAndFoldQwen4Norms(config: *ModelConfig, weights: *Weights, s: mlx.mlx_stream, model_dir: []const u8) !void {
+    const marked = config.qwen4_norm_convention != null;
+    const inferred = config.qwen4_norm_convention == null and config.embedded_ple_payload_bytes != null;
+    const convention = if (config.qwen4_norm_convention) |marker| marker else if (inferred)
+        inferLoadedQwen4Norms(config, weights, s) catch |err| {
+            log.err("[qwen4] cannot infer norm convention for {s}: {s}; set qwen4_norm_convention to delta or folded in this checkpoint's config.json.\n", .{ model_dir, @errorName(err) });
+            return err;
+        }
+    else
+        Qwen4NormConvention.folded;
+
+    var it = weights.map.iterator();
+    while (it.next()) |entry| {
+        if (!qwen4NormNeedsFold(entry.key_ptr.*)) continue;
+        const value = entry.value_ptr.*;
+        if (convention == .delta) {
+            entry.value_ptr.* = try foldQwen4Norm(value, s);
+        } else if (config.actDtype() != .float16 and narrowsLoadedF16(entry.key_ptr.*, mlx.mlx_array_ndim(value), mlx.mlx_array_dtype(value)) and narrow1dEnabled()) {
+            var cast = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(cast);
+            try mlx.check(mlx.mlx_astype(&cast, value, .bfloat16, s));
+            entry.value_ptr.* = cast;
+            narrowed_1d += 1;
+        } else continue;
+        _ = mlx.mlx_array_free(value);
+    }
+    config.qwen4_norm_convention = convention;
+    if (inferred) {
+        log.info("[qwen4] inferred {s} norm convention from loaded trunk indexer norms: {s}\n", .{ @tagName(convention), model_dir });
+    } else if (!marked) {
+        log.info("[qwen4] using folded norm convention (legacy external-table default): {s}\n", .{model_dir});
+    } else {
+        log.info("[qwen4] using checkpoint-local {s} norm convention: {s}\n", .{ @tagName(convention), model_dir });
+    }
 }
 
 pub fn qwen4NormNeedsFold(key: []const u8) bool {
@@ -4128,7 +4198,9 @@ test "Qwen4 norm convention and embedded table layout are independent" {
     }
     var weights = Weights.init(allocator);
     defer weights.deinit();
-    try loadSafetensorsFile(allocator, &weights, path, s, .{ .embedded_ple = true, .fold_qwen4_norms = true });
+    try loadSafetensorsFile(allocator, &weights, path, s, .{ .embedded_ple = true, .defer_qwen4_norms = true });
+    var embedded_delta_config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = .delta, .embedded_ple_payload_bytes = 120 };
+    try resolveAndFoldQwen4Norms(&embedded_delta_config, &weights, s, "fixture");
     try testing.expect(weights.get(shard) == null);
     try testing.expect(weights.get(scale) == null);
     try testing.expect(weights.get(multiplier) != null);
@@ -4140,17 +4212,23 @@ test "Qwen4 norm convention and embedded table layout are independent" {
     try testing.expect(!qwen4NormNeedsFold(gate));
     var converted = Weights.init(allocator);
     defer converted.deinit();
-    try loadSafetensorsFile(allocator, &converted, path, s, .{});
+    try loadSafetensorsFile(allocator, &converted, path, s, .{ .defer_qwen4_norms = true });
+    var external_folded_config = ModelConfig{ .model_type = "qwen4_exp" };
+    try resolveAndFoldQwen4Norms(&external_folded_config, &converted, s, "fixture");
     try testing.expect(converted.get(shard) != null);
     try testing.expect(converted.get(scale) != null);
     var external_delta = Weights.init(allocator);
     defer external_delta.deinit();
-    try loadSafetensorsFile(allocator, &external_delta, path, s, .{ .fold_qwen4_norms = true });
+    try loadSafetensorsFile(allocator, &external_delta, path, s, .{ .defer_qwen4_norms = true });
+    var external_delta_config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = .delta };
+    try resolveAndFoldQwen4Norms(&external_delta_config, &external_delta, s, "fixture");
     try testing.expect(external_delta.get(shard) != null);
     try testing.expect(external_delta.get(scale) != null);
     var embedded_folded = Weights.init(allocator);
     defer embedded_folded.deinit();
-    try loadSafetensorsFile(allocator, &embedded_folded, path, s, .{ .embedded_ple = true });
+    try loadSafetensorsFile(allocator, &embedded_folded, path, s, .{ .embedded_ple = true, .defer_qwen4_norms = true });
+    var embedded_folded_config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = .folded, .embedded_ple_payload_bytes = 120 };
+    try resolveAndFoldQwen4Norms(&embedded_folded_config, &embedded_folded, s, "fixture");
     try testing.expect(embedded_folded.get(shard) == null);
     try testing.expect(embedded_folded.get(scale) == null);
     const cases = [_]struct { weights: *Weights, expected: f32 }{
@@ -4170,6 +4248,134 @@ test "Qwen4 norm convention and embedded table layout are independent" {
             try mlx.check(mlx.mlx_array_eval(f32_value));
             try testing.expectEqual(case.expected, mlx.mlx_array_data_float32(f32_value).?[0]);
         }
+    }
+}
+
+fn addQwen4NormTestArray(weights: *Weights, name: []const u8, values: []const f32, shape: []const c_int, dtype: mlx.mlx_dtype, s: mlx.mlx_stream) !void {
+    const raw = mlx.mlx_array_new_data(values.ptr, shape.ptr, @intCast(shape.len), .float32);
+    var value = raw;
+    if (dtype != .float32) {
+        value = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&value, raw, dtype, s));
+        _ = mlx.mlx_array_free(raw);
+    }
+    errdefer _ = mlx.mlx_array_free(value);
+    const key = try weights.allocator.dupe(u8, name);
+    errdefer weights.allocator.free(key);
+    try weights.map.put(key, value);
+}
+
+test "Qwen4 loaded indexer norms infer only unanimous finite full-attention anchors" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const names = [_][]const u8{
+        "language_model.model.layers.0.self_attn.indexer.q_layernorm.weight",
+        "language_model.model.layers.0.self_attn.indexer.k_layernorm.weight",
+        "language_model.model.layers.1.self_attn.indexer.q_layernorm.weight",
+        "language_model.model.layers.1.self_attn.indexer.k_layernorm.weight",
+    };
+    const shape = [_]c_int{4};
+    for ([_]struct { value: f32, dtype: mlx.mlx_dtype, expected: Qwen4NormConvention }{
+        .{ .value = 0.05, .dtype = .float32, .expected = .delta },
+        .{ .value = 0.05, .dtype = .float16, .expected = .delta },
+        .{ .value = 0.95, .dtype = .bfloat16, .expected = .folded },
+    }) |case| {
+        var weights = Weights.init(testing.allocator);
+        defer weights.deinit();
+        for (names) |name| {
+            const values = [_]f32{ case.value, case.value, case.value, case.value };
+            try addQwen4NormTestArray(&weights, name, &values, &shape, case.dtype, s);
+        }
+        const config = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 2, .full_attention_interval = 1, .indexer_head_dim = 4 };
+        try testing.expectEqual(case.expected, try inferLoadedQwen4Norms(&config, &weights, s));
+    }
+
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    const values = [_]f32{ 0.05, 0.05, 0.05, 0.05 };
+    try addQwen4NormTestArray(&weights, names[2], &values, &shape, .float32, s);
+    try addQwen4NormTestArray(&weights, names[3], &values, &shape, .float32, s);
+    const hybrid = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 2, .full_attention_interval = 2, .indexer_head_dim = 4 };
+    try testing.expectEqual(Qwen4NormConvention.delta, try inferLoadedQwen4Norms(&hybrid, &weights, s));
+}
+
+test "Qwen4 loaded indexer norms refuse missing malformed mixed and nonfinite anchors" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    const names = [_][]const u8{
+        "language_model.model.layers.0.self_attn.indexer.q_layernorm.weight",
+        "language_model.model.layers.0.self_attn.indexer.k_layernorm.weight",
+        "language_model.model.layers.1.self_attn.indexer.q_layernorm.weight",
+        "language_model.model.layers.1.self_attn.indexer.k_layernorm.weight",
+    };
+    const config = ModelConfig{ .model_type = "qwen4_exp", .num_hidden_layers = 2, .full_attention_interval = 1, .indexer_head_dim = 4 };
+    for ([_]struct { bad: usize, value: f32 = 0.05, dtype: mlx.mlx_dtype = .float32, shape: []const c_int = &.{4}, omit: bool = false, expected: anyerror }{
+        .{ .bad = 0, .omit = true, .expected = error.MissingQwen4NormAnchor },
+        .{ .bad = 3, .omit = true, .expected = error.MissingQwen4NormAnchor },
+        .{ .bad = 1, .value = 0.95, .expected = error.AmbiguousQwen4NormConvention },
+        .{ .bad = 3, .value = 0.5, .expected = error.AmbiguousQwen4NormConvention },
+        .{ .bad = 2, .value = std.math.nan(f32), .expected = error.AmbiguousQwen4NormConvention },
+        .{ .bad = 0, .value = std.math.inf(f32), .expected = error.AmbiguousQwen4NormConvention },
+        .{ .bad = 1, .dtype = .int32, .expected = error.InvalidQwen4NormAnchor },
+        .{ .bad = 2, .shape = &.{ 2, 2 }, .expected = error.InvalidQwen4NormAnchor },
+    }) |case| {
+        var weights = Weights.init(testing.allocator);
+        defer weights.deinit();
+        for (names, 0..) |name, i| {
+            if (i == case.bad and case.omit) continue;
+            const value = if (i == case.bad) case.value else @as(f32, 0.05);
+            const values = [_]f32{ value, value, value, value };
+            try addQwen4NormTestArray(&weights, name, &values, if (i == case.bad) case.shape else &.{4}, if (i == case.bad) case.dtype else .float32, s);
+        }
+        try testing.expectError(case.expected, inferLoadedQwen4Norms(&config, &weights, s));
+    }
+    var empty = Weights.init(testing.allocator);
+    defer empty.deinit();
+    var no_full = config;
+    no_full.num_hidden_layers = 0;
+    try testing.expectError(error.InvalidQwen4NormAnchor, inferLoadedQwen4Norms(&no_full, &empty, s));
+}
+
+test "Qwen4 delta folds f16 before bf16 narrowing and resolves the shared MTP map once" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    const shape = [_]c_int{1};
+    const values = [_]f32{0.0117};
+    const trunk = "language_model.model.layers.1.self_attn.indexer.q_layernorm.weight";
+    const mtp = "language_model.model.mtp.pre_fc_norm_hidden.weight";
+    try addQwen4NormTestArray(&weights, trunk, &values, &shape, .float16, s);
+    try addQwen4NormTestArray(&weights, mtp, &values, &shape, .float16, s);
+    var config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = .delta, .embedded_ple_payload_bytes = 120 };
+    try resolveAndFoldQwen4Norms(&config, &weights, s, "fixture");
+    try testing.expectEqual(Qwen4NormConvention.delta, config.qwen4_norm_convention.?);
+    for ([_][]const u8{ trunk, mtp }) |name| {
+        const arr = weights.get(name).?;
+        try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(arr));
+        var f32_value = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f32_value);
+        try mlx.check(mlx.mlx_astype(&f32_value, arr, .float32, s));
+        try mlx.check(mlx.mlx_array_eval(f32_value));
+        try testing.expectEqual(@as(f32, 1.0078125), mlx.mlx_array_data_float32(f32_value).?[0]);
+    }
+}
+
+test "Qwen4 folded f16 keeps generic narrowing after convention resolution" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    defer reportF16Narrowing();
+    const shape = [_]c_int{1};
+    const values = [_]f32{0.95};
+    const name = "language_model.model.layers.1.self_attn.indexer.k_layernorm.weight";
+    for ([_]?Qwen4NormConvention{ .folded, null }) |marker| {
+        var weights = Weights.init(testing.allocator);
+        defer weights.deinit();
+        try addQwen4NormTestArray(&weights, name, &values, &shape, .float16, s);
+        var config = ModelConfig{ .model_type = "qwen4_exp", .qwen4_norm_convention = marker };
+        try resolveAndFoldQwen4Norms(&config, &weights, s, "fixture");
+        try testing.expectEqual(Qwen4NormConvention.folded, config.qwen4_norm_convention.?);
+        try testing.expectEqual(if (narrow1dEnabled()) mlx.mlx_dtype.bfloat16 else mlx.mlx_dtype.float16, mlx.mlx_array_dtype(weights.get(name).?));
     }
 }
 
@@ -7618,7 +7824,7 @@ test "qwen4 norm convention is an explicit root marker with strict values" {
     try testing.expectEqual(@as(u32, 131072), overridden.max_position_embeddings);
 }
 
-test "unmarked embedded qwen4 with absent norm anchors is refused but a local marker resolves it" {
+test "unmarked embedded qwen4 defers norm convention until weights load" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
@@ -7634,7 +7840,10 @@ test "unmarked embedded qwen4 with absent norm anchors is refused but a local ma
     try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
     var path: [std.fs.max_path_bytes]u8 = undefined;
     const len = try td.dir.realPath(io, &path);
-    try testing.expectError(error.MissingQwen4NormAnchor, parseConfig(io, testing.allocator, path[0..len]));
+    var unmarked = try parseConfig(io, testing.allocator, path[0..len]);
+    defer unmarked.deinit(testing.allocator);
+    try testing.expectEqual(@as(?Qwen4NormConvention, null), unmarked.qwen4_norm_convention);
+    try testing.expectEqual(@as(?u64, 120), unmarked.embedded_ple_payload_bytes);
     const marked_json = try std.fmt.allocPrint(testing.allocator, "{s},\"qwen4_norm_convention\":\"delta\"}}", .{std.mem.trimEnd(u8, json, " \n\r\t}")});
     defer testing.allocator.free(marked_json);
     try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked_json });
@@ -7644,14 +7853,14 @@ test "unmarked embedded qwen4 with absent norm anchors is refused but a local ma
     try testing.expectEqual(@as(?u64, 120), accepted.embedded_ple_payload_bytes);
 }
 
-test "local oQ Qwen4 metadata infers delta convention" {
+test "local oQ Qwen4 metadata defers convention until loaded weights" {
     const raw = std.c.getenv("QWEN4_EMBEDDED_TEST_MODEL") orelse return error.SkipZigTest;
     const path = std.mem.span(raw);
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try parseConfig(io, testing.allocator, path);
     defer config.deinit(testing.allocator);
     try testing.expect(config.isQwen4());
-    try testing.expectEqual(Qwen4NormConvention.delta, config.qwen4_norm_convention.?);
+    try testing.expectEqual(@as(?Qwen4NormConvention, null), config.qwen4_norm_convention);
     try testing.expect(config.embedded_ple_payload_bytes.? > 0);
 }
 
@@ -7680,7 +7889,7 @@ test "Qwen4 norm selection stays checkpoint-local across mixed model loads" {
     for ([_]usize{ 0, 1, 1, 0 }) |i| {
         var config = try parseConfig(io, testing.allocator, paths[i]);
         defer config.deinit(testing.allocator);
-        try testing.expectEqual(@as(?Qwen4NormConvention, if (i == 0) .delta else null), config.qwen4_norm_convention);
+        try testing.expectEqual(@as(?Qwen4NormConvention, null), config.qwen4_norm_convention);
         try testing.expectEqual(i == 0, config.embedded_ple_payload_bytes != null);
     }
 }
