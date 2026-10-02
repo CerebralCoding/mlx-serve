@@ -318,6 +318,9 @@ pub const Conn = struct {
     /// True once this connection has written a `text/event-stream` head: past it a generation
     /// failure can only be an SSE `error` event. Set only in `sendSseHeaders`.
     sse_headers_sent: bool = false,
+    /// True once this connection has written a response head with a `Content-Length`: the body
+    /// ends by its length, not at the close, so `close` need not wait for the peer.
+    length_framed: bool = false,
     /// Non-null while an Ollama /api/* handler runs an inner /v1 handler:
     /// every write the inner handler makes is fed to the sink (SSE → NDJSON
     /// re-framing) instead of the socket. The sink writes its translated
@@ -333,6 +336,7 @@ pub const Conn = struct {
         c.ws_mode = null;
         c.ollama_sink = null;
         c.sse_headers_sent = false;
+        c.length_framed = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
     }
 
@@ -380,8 +384,28 @@ pub const Conn = struct {
         };
     }
 
+    /// Longest `close` waits for the peer to hang up before releasing the socket anyway.
+    const CLOSE_WAIT_MS: i64 = 5 * 60 * 1000;
+
+    /// A close-delimited body (SSE, NDJSON: no `Content-Length`) ends at the close, so this sends
+    /// our FIN and holds the socket until the peer closes. A socket closed under a reader that
+    /// still lags is dropped by the kernel with an RST once its FIN_WAIT_2 timer runs out (60 s
+    /// on macOS), so the reader gets the whole body and then ECONNRESET, not EOF. A length-framed
+    /// response closes at once: its reader knows where the body ends.
     pub fn close(c: *Conn) void {
         c.flush() catch {};
+        if (c.length_framed) return c.stream.close(c.io);
+        const fd = c.stream.socket.handle;
+        _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
+        const deadline = nowMsMonotonic(c.io) + CLOSE_WAIT_MS;
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        var sink: [256]u8 = undefined;
+        while (nowMsMonotonic(c.io) < deadline and !shutdown_requested.load(.acquire)) {
+            const n = std.posix.poll(&fds, 500) catch break;
+            if (n == 0) continue;
+            // EOF or reset ends the wait; a byte from a pipelining client is dropped.
+            if (std.c.recv(fd, &sink, sink.len, std.posix.MSG.DONTWAIT) <= 0) break;
+        }
         c.stream.close(c.io);
     }
 
@@ -914,6 +938,7 @@ var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED
 
 /// The hot-cache byte budget every post-load reserve must bill: the clamp's answer once loaded, the raw ask before.
 pub fn resolvedPrefixCacheMem() u64 {
+    if (prefix_cache_capacity == 0) return 0;
     const v = hot_cache_mem_resolved.load(.monotonic);
     return if (v != HOT_CACHE_MEM_UNRESOLVED) v else prefix_cache_mem_bytes;
 }
@@ -1814,7 +1839,7 @@ pub fn serve(
     // at every value so a default-1 boot does not read as "one at a time".
     if (scheduler_mod.configBatchesDecode(config)) {
         log.info("Concurrency: --max-concurrent={d}, batched decode on\n", .{max_concurrent});
-        if (prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
+        if (prefix_cache_capacity > 0 and prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
@@ -3985,6 +4010,7 @@ const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 /// The previous context-sizing cache reserve: the raw `--prefix-cache-mem` ask. Kept for
 /// ungated archs so their advertised `context_length` does not move.
 fn legacyPrefixCacheAsk() u64 {
+    if (prefix_cache_capacity == 0) return 0;
     return prefix_cache_mem_bytes; // legacy_ask_read
 }
 
@@ -5080,6 +5106,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 /// The cache reserve the context sizer bills. Gated: the ask-independent constant. Ungated:
 /// the raw `--prefix-cache-mem`. Both load-time wrappers must pass the same value.
 fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
+    if (prefix_cache_capacity == 0) return 0;
     return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk();
 }
 
@@ -6859,6 +6886,7 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
         &l.token_hex,
     }) catch return error.Overflow;
     try stream.writeAll(hdr);
+    stream.length_framed = true;
     if (body.len > 0) try stream.writeAll(body);
 }
 
@@ -7384,7 +7412,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
         .pld = .{ .enable = server_config.default_enable_pld, .draft_len = server_config.default_pld_draft_len, .key_len = server_config.default_pld_key_len },
         .max_concurrent = max_concurrent,
-        .prefix_cache_mem_bytes = prefix_cache_mem_bytes,
+        .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
         // Diffusion prefill returns before the interleave hook: nothing to share.
         .prefill_decode_share = if (config.isDiffusion()) 0 else scheduler_mod.prefillDecodeShare(),
@@ -11826,6 +11854,7 @@ fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []const u
         body.len,
     }) catch return error.Overflow;
     try stream.writeAll(hdr);
+    stream.length_framed = true;
     if (body.len > 0) try stream.writeAll(body);
 }
 
@@ -12381,6 +12410,7 @@ fn sendUnauthorized(stream: *Conn) !void {
     var hdr_buf: [512]u8 = undefined;
     const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nWWW-Authenticate: Basic realm=\"mlx-serve\"\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, x-api-key\r\n\r\n", .{body.len}) catch return error.Overflow;
     try stream.writeAll(hdr);
+    stream.length_framed = true;
     try stream.writeAll(body);
 }
 
@@ -13087,6 +13117,12 @@ fn formatChatUsage(
     return try std.fmt.allocPrint(allocator,
         \\{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d},"prompt_tokens_details":{{"cached_tokens":{d}}}{s}}}
     , .{ prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens, extra_details });
+}
+
+fn formatAnthropicUsage(allocator: std.mem.Allocator, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
+    return try std.fmt.allocPrint(allocator,
+        \\{{"input_tokens":{d},"output_tokens":{d},"cache_creation_input_tokens":0,"cache_read_input_tokens":{d}}}
+    , .{ prompt_tokens -| cached_tokens, completion_tokens, @min(cached_tokens, prompt_tokens) });
 }
 
 fn formatTimingsObject(
@@ -15639,17 +15675,17 @@ fn handleAnthropicNonStreaming(
         try allocator.alloc(u8, 0);
     defer allocator.free(timings_field);
 
+    const usage = try formatAnthropicUsage(allocator, prompt_token_count, result.completion_tokens, result.cached_tokens);
+    defer allocator.free(usage);
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}{s}}}
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{s}{s}}}
     , .{
         nowMs(stream.io),
         content.items,
         model_name,
         stop_reason,
         stop_seq_json,
-        prompt_token_count,
-        result.completion_tokens,
-        result.cached_tokens,
+        usage,
         timings_field,
     });
     defer allocator.free(response);
@@ -15758,9 +15794,7 @@ fn handleAnthropicStreaming(
 
     // message_start
     {
-        const data = try std.fmt.allocPrint(allocator,
-            \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
-        , .{ nowMs(stream.io), model_name, prompt_token_count });
+        const data = try formatAnthropicMessageStart(allocator, nowMs(stream.io), model_name, prompt_token_count);
         defer allocator.free(data);
         try sendAnthropicEvent(stream, "message_start", data);
     }
@@ -16465,14 +16499,10 @@ fn handleAnthropicStreaming(
             try sendAnthropicEvent(stream, "content_block_stop", sd2);
         }
 
-        // message_delta. Scheduler accounts for any prompt-cache hits in `ts.prompt_tokens`.
-        // cache_read_input_tokens rides here (not message_start) because the
-        // prefix-cache hit count is only known after prefill; clients merge
-        // message_delta usage into the final message per Anthropic semantics.
+        // Cache hits are known after prefill. Cumulative usage replaces the
+        // provisional message_start counts with disjoint input buckets.
         {
-            const md = try std.fmt.allocPrint(allocator,
-                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
-            , .{ stop_reason, stop_seq_json, ts.completion_tokens, ts.cached_tokens });
+            const md = try formatAnthropicMessageDelta(allocator, stop_reason, stop_seq_json, total_prompt, ts.completion_tokens, ts.cached_tokens);
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
@@ -16484,6 +16514,20 @@ fn handleAnthropicStreaming(
     log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, perf, stop_reason,
     });
+}
+
+fn formatAnthropicMessageStart(allocator: std.mem.Allocator, id: i64, model_name: []const u8, prompt_tokens: u32) ![]u8 {
+    return try std.fmt.allocPrint(allocator,
+        \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
+    , .{ id, model_name, prompt_tokens });
+}
+
+fn formatAnthropicMessageDelta(allocator: std.mem.Allocator, stop_reason: []const u8, stop_seq_json: []const u8, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
+    const usage = try formatAnthropicUsage(allocator, prompt_tokens, completion_tokens, cached_tokens);
+    defer allocator.free(usage);
+    return try std.fmt.allocPrint(allocator,
+        \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{s}}}
+    , .{ stop_reason, stop_seq_json, usage });
 }
 
 /// Emit a text_delta event for Anthropic streaming.
@@ -18954,6 +18998,72 @@ test "Conn.peerClosed: alive socket returns false, closed peer returns true" {
     const closed = conn.peerClosed();
     _ = std.c.close(server_fd);
     try testing.expect(closed);
+}
+
+/// Runs `Conn.close` after one response, with a peer that stays connected, and checks whether it
+/// held the socket (`close_delimited`) or returned at once.
+fn expectCloseWaitsForPeer(close_delimited: bool) !void {
+    var sv: [2]std.posix.fd_t = undefined;
+    const AF_UNIX: c_uint = 1;
+    const SOCK_STREAM: c_uint = 1;
+    try testing.expect(std.c.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) == 0);
+
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    const tail: []const u8 = if (close_delimited) "data: [DONE]\n\n" else "{}";
+    if (close_delimited) {
+        try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT);
+        try conn.writeAll(tail);
+    } else {
+        try sendResponseFramed(&conn, "200 OK", "application/json", tail);
+    }
+
+    var closed = std.atomic.Value(bool).init(false);
+    const closer = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Conn, done: *std.atomic.Value(bool)) void {
+            c.close();
+            done.store(true, .release);
+        }
+    }.run, .{ &conn, &closed });
+    var client_open = true;
+    defer closer.join();
+    defer if (client_open) {
+        _ = std.c.close(sv[1]);
+    };
+
+    // The reader gets the whole response and then EOF ...
+    var buf: [512]u8 = undefined;
+    var got: usize = 0;
+    while (true) {
+        const n = std.c.recv(sv[1], &buf[got], buf.len - got, 0);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    try testing.expect(std.mem.endsWith(u8, buf[0..got], tail));
+
+    // ... and only a close-delimited body keeps the server's end open, so the kernel cannot
+    // reset a lagging reader.
+    var waited: u32 = 0;
+    while (!closed.load(.acquire) and waited < 50) : (waited += 1) {
+        std.Io.sleep(testing.io, .fromMilliseconds(10), .real) catch {};
+    }
+    try testing.expectEqual(!close_delimited, closed.load(.acquire));
+
+    _ = std.c.close(sv[1]);
+    client_open = false;
+    waited = 0;
+    while (!closed.load(.acquire) and waited < 300) : (waited += 1) {
+        std.Io.sleep(testing.io, .fromMilliseconds(10), .real) catch {};
+    }
+    try testing.expect(closed.load(.acquire));
+}
+
+test "Conn.close keeps the socket until the peer hangs up, after a close-delimited body" {
+    try expectCloseWaitsForPeer(true);
+}
+
+test "Conn.close does not wait for the peer after a Content-Length response" {
+    try expectCloseWaitsForPeer(false);
 }
 
 test "listenExclusive: a second server cannot bind a port that is already listening" {
@@ -22283,6 +22393,66 @@ test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmpr
     , with_details);
 }
 
+test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
+    const a = testing.allocator;
+    for ([_]struct { prompt: u32, cached: u32, input: u32 }{
+        .{ .prompt = 100, .cached = 0, .input = 100 },
+        .{ .prompt = 100, .cached = 40, .input = 60 },
+        .{ .prompt = 92934, .cached = 91863, .input = 1071 },
+        .{ .prompt = 100, .cached = 100, .input = 0 },
+        .{ .prompt = 100, .cached = 101, .input = 0 },
+    }) |case| {
+        const json = try formatAnthropicUsage(a, case.prompt, 126, case.cached);
+        defer a.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        const usage = parsed.value.object;
+        const input = usage.get("input_tokens").?.integer;
+        const created = if (usage.get("cache_creation_input_tokens")) |v| v.integer else 0;
+        const cached = usage.get("cache_read_input_tokens").?.integer;
+        try testing.expectEqual(@as(i64, case.prompt), input + created + cached);
+        try testing.expectEqual(@as(i64, case.input), input);
+        try testing.expectEqual(@as(i64, 0), created);
+        try testing.expectEqual(@as(i64, @min(case.cached, case.prompt)), cached);
+        try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
+
+        const openai = try formatChatUsage(a, case.prompt, 126, case.cached, "");
+        defer a.free(openai);
+        const chat_usage = try std.json.parseFromSlice(std.json.Value, a, openai, .{});
+        defer chat_usage.deinit();
+        const obj = chat_usage.value.object;
+        try testing.expectEqual(@as(i64, case.prompt), obj.get("prompt_tokens").?.integer);
+        try testing.expectEqual(@as(i64, case.prompt) + 126, obj.get("total_tokens").?.integer);
+        try testing.expectEqual(@as(i64, case.cached), obj.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer);
+    }
+}
+
+test "Anthropic usage: message_delta overwrites provisional message_start counts" {
+    for ([_]u32{ 0, 40000, 91863, 92934, 92935 }) |cached_tokens| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const start = try formatAnthropicMessageStart(a, 1, "mlx-serve", 92934);
+        const delta = try formatAnthropicMessageDelta(a, "end_turn", "null", 92934, 126, cached_tokens);
+        const start_event = try std.json.parseFromSliceLeaky(std.json.Value, a, start, .{});
+        const delta_event = try std.json.parseFromSliceLeaky(std.json.Value, a, delta, .{});
+        try testing.expectEqualStrings("message_start", start_event.object.get("type").?.string);
+        try testing.expectEqualStrings("message_delta", delta_event.object.get("type").?.string);
+        var usage = start_event.object.get("message").?.object.get("usage").?.object;
+        try testing.expectEqual(@as(i64, 92934), usage.get("input_tokens").?.integer);
+        var fields = delta_event.object.get("usage").?.object.iterator();
+        while (fields.next()) |field| try usage.put(a, field.key_ptr.*, field.value_ptr.*);
+        const input = usage.get("input_tokens").?.integer;
+        const created = if (usage.get("cache_creation_input_tokens")) |v| v.integer else 0;
+        const cached = usage.get("cache_read_input_tokens").?.integer;
+        try testing.expectEqual(@as(i64, 92934), input + created + cached);
+        try testing.expectEqual(@as(i64, 92934 -| cached_tokens), input);
+        try testing.expectEqual(@as(i64, 0), created);
+        try testing.expectEqual(@as(i64, @min(cached_tokens, 92934)), cached);
+        try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
+    }
+}
+
 test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     // #126: an idle server with zero models loaded and 21 MB RSS answered
     // "retry after current requests complete", which is unactionable advice
@@ -24051,4 +24221,30 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
     try t.expectEqual(kv_only + retainedSsmCheckpointBytes(&cfg, ctx, 0, chunk), entry);
     // The defaulted ask covers the whole entry, so the commit path never trims it.
     try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
+}
+
+test "disabled prefix cache: sizing releases the cache reserve on every arch" {
+    const saved_capacity = prefix_cache_capacity;
+    const saved_ask = prefix_cache_mem_bytes;
+    defer prefix_cache_capacity = saved_capacity;
+    defer prefix_cache_mem_bytes = saved_ask;
+
+    var gated = longCtxTestConfig();
+    var other = longCtxTestConfig();
+    other.model_type = "qwen3_5_moe";
+    const configs = [_]*model_mod.ModelConfig{ &gated, &other };
+    for ([_]u64{ 0, 2 << 30, 60 << 30 }) |ask| {
+        prefix_cache_mem_bytes = ask;
+        prefix_cache_capacity = 0;
+        for (configs) |cfg| {
+            try testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(cfg));
+        }
+        try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk());
+        try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    }
+    prefix_cache_capacity = 32;
+    prefix_cache_mem_bytes = 10 << 30;
+    try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
+    try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
+    try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
 }
