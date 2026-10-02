@@ -7,6 +7,7 @@ const sushi_exl3 = @import("sushi_exl3");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
+const qwen4_ple = @import("qwen4_ple.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
 
@@ -126,7 +127,7 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
     return null;
 }
 
-pub const Qwen4NormConvention = enum { delta, folded };
+pub const Qwen4NormConvention = qwen4_ple.NormConvention;
 
 pub const ModelConfig = struct {
     // Architecture identity
@@ -1401,8 +1402,17 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
         if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
             if (config.qwen4_norm_convention == null) {
-                log.err("[qwen4] embedded PLE pack at {s} has ambiguous norm convention; set qwen4_norm_convention to delta or folded in config.json, or launch with --config-overrides '{{\"qwen4_norm_convention\":\"delta\"}}' (use folded when the checkpoint already stores 1+w).\n", .{model_dir});
-                return error.AmbiguousQwen4NormConvention;
+                if (config.num_hidden_layers > 4096) return error.InvalidQwen4NormAnchor;
+                var full_layers: std.ArrayList(u32) = .empty;
+                defer full_layers.deinit(allocator);
+                for (0..config.num_hidden_layers) |layer| {
+                    if (!config.isLinearLayer(@intCast(layer))) try full_layers.append(allocator, @intCast(layer));
+                }
+                config.qwen4_norm_convention = qwen4_ple.inferNormConvention(model_dir, full_layers.items, config.indexer_head_dim) catch |err| {
+                    log.err("[qwen4] cannot infer norm convention for {s}: {s}; set qwen4_norm_convention to delta or folded in this checkpoint's config.json.\n", .{ model_dir, @errorName(err) });
+                    return err;
+                };
+                log.info("[qwen4] inferred {s} norm convention from trunk indexer norms: {s}\n", .{ @tagName(config.qwen4_norm_convention.?), model_dir });
             }
             config.embedded_ple_payload_bytes = info.payload_bytes;
         }
@@ -1874,6 +1884,10 @@ fn mergeConfigJson(allocator: std.mem.Allocator, base: []const u8, overrides: []
     var dst = try std.json.parseFromSliceLeaky(std.json.Value, a, base, .{});
     const src = try std.json.parseFromSliceLeaky(std.json.Value, a, overrides, .{});
     if (dst != .object or src != .object) return error.ConfigOverridesMustBeObject;
+    if (src.object.contains("qwen4_norm_convention")) {
+        log.err("[qwen4] qwen4_norm_convention cannot be set through server-wide --config-overrides; remove that override and use a checkpoint-local config.json marker.\n", .{});
+        return error.GlobalQwen4NormOverride;
+    }
     try mergeObjects(a, &dst.object, src.object);
     var out: std.Io.Writer.Allocating = .init(a);
     var jws: std.json.Stringify = .{ .writer = &out.writer, .options = .{} };
@@ -4058,9 +4072,8 @@ fn foldQwen4Norm(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
 
 pub fn qwen4NormNeedsFold(key: []const u8) bool {
     const suffixes = [_][]const u8{
-        "hc_norm.weight", "q_norm.weight", "k_norm.weight", "q_layernorm.weight", "k_layernorm.weight",
-        "ple.norm_key.weight", "ple.norm_query.weight", "ple.norm_conv.weight",
-        "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight",
+        "hc_norm.weight",      "q_norm.weight",         "k_norm.weight",        "q_layernorm.weight",           "k_layernorm.weight",
+        "ple.norm_key.weight", "ple.norm_query.weight", "ple.norm_conv.weight", "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight",
     };
     for (suffixes) |suffix| if (std.mem.endsWith(u8, key, suffix)) return true;
     return false;
@@ -7599,12 +7612,13 @@ test "qwen4 norm convention is an explicit root marker with strict values" {
         qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"qwen4_norm_convention\":\"other\""),
     }) |json| try testing.expectError(error.InvalidQwen4NormConvention, parseConfigFromJson(testing.allocator, json));
     defer setConfigOverrides(null);
-    setConfigOverrides("{\"qwen4_norm_convention\":\"delta\"}");
-    const overridden = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS));
-    try testing.expectEqual(Qwen4NormConvention.delta, overridden.qwen4_norm_convention.?);
+    setConfigOverrides("{\"max_position_embeddings\":131072}");
+    const overridden = try parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"qwen4_norm_convention\":\"folded\""));
+    try testing.expectEqual(Qwen4NormConvention.folded, overridden.qwen4_norm_convention.?);
+    try testing.expectEqual(@as(u32, 131072), overridden.max_position_embeddings);
 }
 
-test "unmarked embedded qwen4 norm convention is refused with a named error" {
+test "unmarked embedded qwen4 with absent norm anchors is refused but a local marker resolves it" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
@@ -7614,32 +7628,38 @@ test "unmarked embedded qwen4 norm convention is refused with a named error" {
         \\"num_attention_heads":1,"num_key_value_heads":1,"head_dim":64,
         \\"vocab_size":1,"ple_layer_ids":[2],"ple_embed_dim":64,
         \\"ngram_size":3,"heads_per_ngram":1,"ngram_vocab_size_base":2,
-        \\"make_ngram_vocab_size_divisible_by":6,"split_ngram_parts":3}
+        \\"make_ngram_vocab_size_divisible_by":6,"split_ngram_parts":3,
+        \\"indexer_n_heads":1,"indexer_head_dim":4,"indexer_budget":8,"indexer_compress_ratio":2}
     ;
     try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = json });
     var path: [std.fs.max_path_bytes]u8 = undefined;
     const len = try td.dir.realPath(io, &path);
-    try testing.expectError(error.AmbiguousQwen4NormConvention, parseConfig(io, testing.allocator, path[0..len]));
-    defer setConfigOverrides(null);
-    setConfigOverrides("{\"qwen4_norm_convention\":\"delta\"}");
+    try testing.expectError(error.MissingQwen4NormAnchor, parseConfig(io, testing.allocator, path[0..len]));
+    const marked_json = try std.fmt.allocPrint(testing.allocator, "{s},\"qwen4_norm_convention\":\"delta\"}}", .{std.mem.trimEnd(u8, json, " \n\r\t}")});
+    defer testing.allocator.free(marked_json);
+    try td.dir.writeFile(io, .{ .sub_path = "config.json", .data = marked_json });
     var accepted = try parseConfig(io, testing.allocator, path[0..len]);
     defer accepted.deinit(testing.allocator);
     try testing.expectEqual(Qwen4NormConvention.delta, accepted.qwen4_norm_convention.?);
     try testing.expectEqual(@as(?u64, 120), accepted.embedded_ple_payload_bytes);
 }
 
-test "local oQ Qwen4 metadata requires an explicit delta convention" {
+test "local oQ Qwen4 metadata infers delta convention" {
     const raw = std.c.getenv("QWEN4_EMBEDDED_TEST_MODEL") orelse return error.SkipZigTest;
     const path = std.mem.span(raw);
     const io = std.Io.Threaded.global_single_threaded.io();
-    try testing.expectError(error.AmbiguousQwen4NormConvention, parseConfig(io, testing.allocator, path));
-    defer setConfigOverrides(null);
-    setConfigOverrides("{\"qwen4_norm_convention\":\"delta\"}");
     var config = try parseConfig(io, testing.allocator, path);
     defer config.deinit(testing.allocator);
     try testing.expect(config.isQwen4());
     try testing.expectEqual(Qwen4NormConvention.delta, config.qwen4_norm_convention.?);
     try testing.expect(config.embedded_ple_payload_bytes.? > 0);
+}
+
+test "Qwen4 norm global override is rejected independently of the checkpoint marker" {
+    defer setConfigOverrides(null);
+    setConfigOverrides("{\"qwen4_norm_convention\":\"delta\"}");
+    try testing.expectError(error.GlobalQwen4NormOverride, parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS)));
+    try testing.expectError(error.GlobalQwen4NormOverride, parseConfigFromJson(testing.allocator, qwen4CaseJson(QWEN4_GOOD_FIELDS ++ ",\"qwen4_norm_convention\":\"folded\"")));
 }
 
 test "local legacy Qwen4 metadata keeps external folded default" {
@@ -7650,6 +7670,19 @@ test "local legacy Qwen4 metadata keeps external folded default" {
     try testing.expect(config.isQwen4());
     try testing.expectEqual(@as(?Qwen4NormConvention, null), config.qwen4_norm_convention);
     try testing.expectEqual(@as(?u64, null), config.embedded_ple_payload_bytes);
+}
+
+test "Qwen4 norm selection stays checkpoint-local across mixed model loads" {
+    const raw = std.c.getenv("QWEN4_EMBEDDED_TEST_MODEL") orelse return error.SkipZigTest;
+    const legacy = std.c.getenv("QWEN4_EXTERNAL_TEST_MODEL") orelse return error.SkipZigTest;
+    const paths = [_][]const u8{ std.mem.span(raw), std.mem.span(legacy) };
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]usize{ 0, 1, 1, 0 }) |i| {
+        var config = try parseConfig(io, testing.allocator, paths[i]);
+        defer config.deinit(testing.allocator);
+        try testing.expectEqual(@as(?Qwen4NormConvention, if (i == 0) .delta else null), config.qwen4_norm_convention);
+        try testing.expectEqual(i == 0, config.embedded_ple_payload_bytes != null);
+    }
 }
 
 test "qwen4_exp config: an n-gram bound past the fixed arrays is a named load error" {

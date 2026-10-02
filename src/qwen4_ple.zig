@@ -43,7 +43,7 @@ pub const HeaderRegion = struct {
     }
 };
 
-pub const RegionShape = enum { matrix, scalar };
+pub const RegionShape = enum { matrix, scalar, vector };
 
 pub fn headerRegion(obj: std.json.ObjectMap, name: []const u8, dtype: []const u8, elem: u64, map_len: usize, data_off: usize, shape_kind: RegionShape) !HeaderRegion {
     const v = obj.get(name) orelse return error.TensorHeader;
@@ -56,11 +56,12 @@ pub fn headerRegion(obj: std.json.ObjectMap, name: []const u8, dtype: []const u8
     const dims = shape.array.items;
     if (shape_kind == .matrix and dims.len != 2) return error.TensorHeader;
     if (shape_kind == .scalar and dims.len != 0 and dims.len != 1) return error.TensorHeader;
+    if (shape_kind == .vector and dims.len != 1) return error.TensorHeader;
     const o = offsets.array.items;
     for (o) |x| if (x != .integer) return error.TensorHeader;
     for (dims) |x| if (x != .integer) return error.TensorHeader;
-    const rows_i: i64 = if (shape_kind == .scalar) 1 else dims[0].integer;
-    const cols_i: i64 = if (shape_kind == .scalar and dims.len == 0) 1 else if (shape_kind == .scalar) dims[0].integer else dims[1].integer;
+    const rows_i: i64 = if (shape_kind != .matrix) 1 else dims[0].integer;
+    const cols_i: i64 = if (shape_kind == .scalar and dims.len == 0) 1 else if (shape_kind != .matrix) dims[0].integer else dims[1].integer;
     if (rows_i <= 0 or cols_i <= 0 or o[0].integer < 0 or o[1].integer < o[0].integer) return error.TensorRegion;
     if (shape_kind == .scalar and cols_i != 1) return error.TensorRegion;
     const r: HeaderRegion = .{ .rows = @intCast(rows_i), .cols = @intCast(cols_i), .start = @intCast(o[0].integer), .end = @intCast(o[1].integer) };
@@ -305,6 +306,183 @@ pub fn inspectEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?Embedded
     var table = (try openEmbedded(model_dir, expected)) orelse return null;
     defer table.close();
     return .{ .payload_bytes = table.payload_bytes };
+}
+
+pub const NormConvention = enum { delta, folded };
+
+/// Inspect only the small QSA indexer norm tensors named by the checkpoint index.
+pub fn inferNormConvention(model_dir: []const u8, layers: []const u32, head_dim: u32) !NormConvention {
+    if (layers.len == 0 or layers.len > 1024 or head_dim == 0) return error.InvalidQwen4NormAnchor;
+    var arena = std.heap.ArenaAllocator.init(std.heap.page_allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var dir = try std.Io.Dir.cwd().openDir(io, model_dir, .{});
+    defer dir.close(io);
+    const index = dir.readFileAlloc(io, "model.safetensors.index.json", a, .limited(16 * 1024 * 1024)) catch return error.InvalidQwen4NormAnchor;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, a, index, .{}) catch return error.InvalidQwen4NormAnchor;
+    if (parsed != .object) return error.InvalidQwen4NormAnchor;
+    const weight_map = parsed.object.get("weight_map") orelse return error.InvalidQwen4NormAnchor;
+    if (weight_map != .object) return error.InvalidQwen4NormAnchor;
+
+    var files: std.ArrayList(File) = .empty;
+    defer for (files.items) |file| {
+        std.posix.munmap(file.map);
+        _ = std.c.close(file.fd);
+    };
+    var file_ids: std.StringHashMapUnmanaged(usize) = .empty;
+    const Seen = struct { file_id: usize, region: HeaderRegion };
+    var seen: std.ArrayList(Seen) = .empty;
+    var total_bytes: u64 = 0;
+    var inferred: ?NormConvention = null;
+    for (layers) |layer| {
+        for ([_][]const u8{ "q_layernorm.weight", "k_layernorm.weight" }) |suffix| {
+            const name = try std.fmt.allocPrint(a, "language_model.model.layers.{d}.self_attn.indexer.{s}", .{ layer, suffix });
+            const file_value = weight_map.object.get(name) orelse return error.MissingQwen4NormAnchor;
+            if (file_value != .string or !validFileName(file_value.string)) return error.InvalidQwen4NormAnchor;
+            const file_id = if (file_ids.get(file_value.string)) |id| id else blk: {
+                const file = openFile(a, model_dir, file_value.string) catch return error.InvalidQwen4NormAnchor;
+                const id = files.items.len;
+                files.append(a, file) catch |err| {
+                    std.posix.munmap(file.map);
+                    _ = std.c.close(file.fd);
+                    return err;
+                };
+                try file_ids.put(a, file_value.string, id);
+                break :blk id;
+            };
+            const file = files.items[file_id];
+            const value = file.obj.get(name) orelse return error.MissingQwen4NormAnchor;
+            if (value != .object) return error.InvalidQwen4NormAnchor;
+            const dtype_value = value.object.get("dtype") orelse return error.InvalidQwen4NormAnchor;
+            if (dtype_value != .string) return error.InvalidQwen4NormAnchor;
+            const elem_bytes: u64 = if (std.mem.eql(u8, dtype_value.string, "F32")) 4 else if (std.mem.eql(u8, dtype_value.string, "F16") or std.mem.eql(u8, dtype_value.string, "BF16")) 2 else return error.InvalidQwen4NormAnchor;
+            const region = headerRegion(file.obj, name, dtype_value.string, elem_bytes, file.map.len, file.data_off, .vector) catch return error.InvalidQwen4NormAnchor;
+            if (region.cols != head_dim) return error.InvalidQwen4NormAnchor;
+            const size = region.end - region.start;
+            total_bytes = std.math.add(u64, total_bytes, size) catch return error.InvalidQwen4NormAnchor;
+            if (total_bytes > 1024 * 1024) return error.InvalidQwen4NormAnchor;
+            for (seen.items) |prior| {
+                if (prior.file_id == file_id and region.overlaps(prior.region)) return error.InvalidQwen4NormAnchor;
+            }
+            try seen.append(a, .{ .file_id = file_id, .region = region });
+            const start = file.data_off + @as(usize, @intCast(region.start));
+            const bytes = file.map[start..][0..@intCast(size)];
+            var sum: f64 = 0;
+            for (0..head_dim) |i| {
+                const offset = i * @as(usize, @intCast(elem_bytes));
+                const number: f32 = if (elem_bytes == 4) @bitCast(std.mem.readInt(u32, bytes[offset..][0..4], .little)) else blk: {
+                    const bits = std.mem.readInt(u16, bytes[offset..][0..2], .little);
+                    if (std.mem.eql(u8, dtype_value.string, "BF16")) break :blk @bitCast(@as(u32, bits) << 16);
+                    break :blk @floatCast(@as(f16, @bitCast(bits)));
+                };
+                if (!std.math.isFinite(number)) return error.AmbiguousQwen4NormConvention;
+                sum += number;
+            }
+            const mean: f32 = @floatCast(sum / @as(f64, @floatFromInt(head_dim)));
+            const current: NormConvention = if (mean >= -0.2 and mean <= 0.2) .delta else if (mean >= 0.8 and mean <= 1.2) .folded else return error.AmbiguousQwen4NormConvention;
+            if (inferred) |prior| {
+                if (prior != current) return error.AmbiguousQwen4NormConvention;
+            } else inferred = current;
+        }
+    }
+    return inferred.?;
+}
+
+const NormFixture = struct {
+    values: [4]f32 = @splat(0),
+    dtype: []const u8 = "F32",
+    shape: []const u8 = "[4]",
+    missing: ?usize = null,
+    overlap: bool = false,
+    truncated: bool = false,
+};
+
+fn writeNormFixture(td: *std.testing.TmpDir, opts: NormFixture) !void {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const names = [_][]const u8{
+        "language_model.model.layers.0.self_attn.indexer.q_layernorm.weight",
+        "language_model.model.layers.0.self_attn.indexer.k_layernorm.weight",
+        "language_model.model.layers.1.self_attn.indexer.q_layernorm.weight",
+        "language_model.model.layers.1.self_attn.indexer.k_layernorm.weight",
+    };
+    const width: usize = if (std.mem.eql(u8, opts.dtype, "F32")) 4 else 2;
+    var header: std.ArrayList(u8) = .empty;
+    var index: std.ArrayList(u8) = .empty;
+    try header.appendSlice(a, "{");
+    try index.appendSlice(a, "{\"weight_map\":{");
+    var included: usize = 0;
+    for (names, 0..) |name, i| {
+        if (opts.missing == i) continue;
+        const start: usize = if (opts.overlap and i == 1) 0 else if (opts.truncated and i == 3) 100000 else i * 4 * width;
+        const item = try std.fmt.allocPrint(a, "{s}\"{s}\":{{\"dtype\":\"{s}\",\"shape\":{s},\"data_offsets\":[{d},{d}]}}", .{ if (included == 0) "" else ",", name, opts.dtype, opts.shape, start, start + 4 * width });
+        try header.appendSlice(a, item);
+        const map_item = try std.fmt.allocPrint(a, "{s}\"{s}\":\"norm.safetensors\"", .{ if (included == 0) "" else ",", name });
+        try index.appendSlice(a, map_item);
+        included += 1;
+    }
+    try header.appendSlice(a, "}");
+    try index.appendSlice(a, "}}");
+    const payload_len = names.len * 4 * width;
+    const bytes = try a.alloc(u8, 8 + header.items.len + payload_len);
+    std.mem.writeInt(u64, bytes[0..8], header.items.len, .little);
+    @memcpy(bytes[8..][0..header.items.len], header.items);
+    @memset(bytes[8 + header.items.len ..], 0);
+    for (opts.values, 0..) |value, i| for (0..4) |j| {
+        const off = 8 + header.items.len + (i * 4 + j) * width;
+        if (width == 4) {
+            std.mem.writeInt(u32, bytes[off..][0..4], @bitCast(value), .little);
+        } else {
+            const bits: u16 = if (std.mem.eql(u8, opts.dtype, "BF16")) @truncate(@as(u32, @bitCast(value)) >> 16) else @bitCast(@as(f16, @floatCast(value)));
+            std.mem.writeInt(u16, bytes[off..][0..2], bits, .little);
+        }
+    };
+    try td.dir.writeFile(io, .{ .sub_path = "norm.safetensors", .data = bytes });
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = index.items });
+}
+
+test "Qwen4 norm inference requires unanimous bounded trunk indexer anchors" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]struct { fixture: NormFixture, expected: NormConvention }{
+        .{ .fixture = .{ .values = .{ -0.2, 0, 0.1, 0.2 } }, .expected = .delta },
+        .{ .fixture = .{ .values = .{ 0.8, 1, 1.1, 1.2 } }, .expected = .folded },
+        .{ .fixture = .{ .values = @splat(0.05), .dtype = "BF16" }, .expected = .delta },
+        .{ .fixture = .{ .values = @splat(0.95), .dtype = "F16" }, .expected = .folded },
+    }) |case| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        try writeNormFixture(&td, case.fixture);
+        var path: [std.fs.max_path_bytes]u8 = undefined;
+        const len = try td.dir.realPath(io, &path);
+        try std.testing.expectEqual(case.expected, try inferNormConvention(path[0..len], &.{ 0, 1 }, 4));
+    }
+}
+
+test "Qwen4 norm inference refuses absent mixed malformed and nonfinite anchors" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    for ([_]struct { fixture: NormFixture, expected: anyerror }{
+        .{ .fixture = .{ .missing = 1 }, .expected = error.MissingQwen4NormAnchor },
+        .{ .fixture = .{ .missing = 3 }, .expected = error.MissingQwen4NormAnchor },
+        .{ .fixture = .{ .values = .{ 0, 1, 0, 0 } }, .expected = error.AmbiguousQwen4NormConvention },
+        .{ .fixture = .{ .values = .{ 0, 0, 1, 1 } }, .expected = error.AmbiguousQwen4NormConvention },
+        .{ .fixture = .{ .values = @splat(0.5) }, .expected = error.AmbiguousQwen4NormConvention },
+        .{ .fixture = .{ .values = .{ 0, 0, 0, std.math.nan(f32) } }, .expected = error.AmbiguousQwen4NormConvention },
+        .{ .fixture = .{ .values = .{ 0, 0, 0, std.math.inf(f32) } }, .expected = error.AmbiguousQwen4NormConvention },
+        .{ .fixture = .{ .dtype = "U16" }, .expected = error.InvalidQwen4NormAnchor },
+        .{ .fixture = .{ .shape = "[3]" }, .expected = error.InvalidQwen4NormAnchor },
+        .{ .fixture = .{ .overlap = true }, .expected = error.InvalidQwen4NormAnchor },
+        .{ .fixture = .{ .truncated = true }, .expected = error.InvalidQwen4NormAnchor },
+    }) |case| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        try writeNormFixture(&td, case.fixture);
+        var path: [std.fs.max_path_bytes]u8 = undefined;
+        const len = try td.dir.realPath(io, &path);
+        try std.testing.expectError(case.expected, inferNormConvention(path[0..len], &.{ 0, 1 }, 4));
+    }
 }
 
 pub const FixtureVariant = enum { valid, missing, duplicate, extra, dtype, bounds, overlap, scale_unit, scale_scalar, scale_nonunit, scale_dtype, scale_shape, scale_overlap };
