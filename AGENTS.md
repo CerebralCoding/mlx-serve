@@ -328,7 +328,7 @@ MLX errors + threads:
 
 LAN + console:
 - **LAN**: per-INTERFACE dns_sd callbacks, loopback-first fetches, eviction via `attemptKnown`; proxying bounded by the TUNNEL MARKER (`isTunneledRequest` at gate AND dispatch, ONE hop, `error.SelfFetch`).
-- **Console**: `index.html` is a std.fmt FORMAT string; mic only in `listening`; markdown from ESCAPED input; ONE gen per turn, tool `model` enum == `editableIds`. Guard: `tests/html_console_test.mjs`.
+- **Console**: `index.html` is a std.fmt FORMAT string; mic only in `listening`; markdown from ESCAPED input; ONE gen per turn, tool `model` enum == `editableIds`. Every request resolves through `apiPrefix(location.pathname)` (`metrics.js` twin). Guard: `tests/html_console_test.mjs`.
 
 ### Engine: KV, spec-decode, kernels, MLX (→ docs/gotchas/engine-mlx.md)
 

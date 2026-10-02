@@ -21,7 +21,7 @@ const src = readFileSync(join(here, '..', 'src', 'html', 'metrics.js'), 'utf8');
 // The file guards its IIFE on `typeof document`, so in node only the top-level
 // helpers evaluate. It hands them back through `globalThis.__mlxPanel`.
 new Function(src)();
-const { computeRates } = globalThis.__mlxPanel ?? {};
+const { computeRates, apiPrefix } = globalThis.__mlxPanel ?? {};
 assert.ok(computeRates, 'metrics.js must expose computeRates for tests');
 
 const counters = (over = {}) => ({
@@ -131,6 +131,15 @@ test('decode tok/s is 0 when nothing is running', () => {
   ];
   const r = computeRates(now, samples, counters(), gauges({ requests_running: 0 }), 5.0);
   assert.equal(r.decodeTps, 0);
+});
+
+// The panel polls through the prefix the page was served under, not the proxy's root.
+test('the metrics poll resolves against the page prefix', () => {
+  assert.equal(apiPrefix('/'), '');
+  assert.equal(apiPrefix('/mount'), '/mount');
+  assert.equal(apiPrefix('/mount/'), '/mount');
+  assert.equal(apiPrefix('/x/index.html'), '/x');
+  assert.equal(apiPrefix('https://x/y'), '');
 });
 
 console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
