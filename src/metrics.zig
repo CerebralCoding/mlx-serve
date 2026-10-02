@@ -298,21 +298,21 @@ pub fn renderPrometheus(m: *const Metrics, w: *std.Io.Writer) !void {
 pub const MAX_SESSIONS = 32;
 
 /// Which agent sent a request; the only trace of the User-Agent that leaves the connection.
+/// Each token is the product a real client sends (claude-cli, opencode, codex_exec, omp); a client
+/// that sends a generic SDK header, such as pi's, is `other`.
 pub const Client = enum {
     claude_code,
     opencode,
     codex,
-    pi,
+    omp,
     other,
 
     const max_user_agent = 256;
     const products = [_]struct { []const u8, Client }{
         .{ "claude-cli", .claude_code },
-        .{ "claude-code", .claude_code },
         .{ "opencode", .opencode },
-        .{ "codex_cli_rs", .codex },
-        .{ "codex", .codex },
-        .{ "pi", .pi },
+        .{ "codex_exec", .codex },
+        .{ "omp", .omp },
     };
 
     /// Matches the product token before the first `/`, ignoring case.
@@ -329,7 +329,7 @@ pub const Client = enum {
             .claude_code => "claude-code",
             .opencode => "opencode",
             .codex => "codex",
-            .pi => "pi",
+            .omp => "omp",
             .other => "other",
         };
     }
@@ -1001,12 +1001,14 @@ test "renderJson lists each live session's context against its model's limit" {
 test "Client.fromUserAgent maps known agents and nothing else" {
     const C = Client;
     const t = std.testing;
-    try t.expectEqual(C.claude_code, C.fromUserAgent("claude-cli/2.1.0 (external, cli)"));
-    try t.expectEqual(C.claude_code, C.fromUserAgent("claude-code/2.1.0"));
-    try t.expectEqual(C.opencode, C.fromUserAgent("opencode/1.4.2"));
-    try t.expectEqual(C.codex, C.fromUserAgent("codex_cli_rs/0.40.0 (Mac OS 15; arm64)"));
-    try t.expectEqual(C.codex, C.fromUserAgent("codex/0.40.0"));
-    try t.expectEqual(C.pi, C.fromUserAgent("pi/0.7.1"));
+    // Verbatim from the real clients' requests.
+    try t.expectEqual(C.claude_code, C.fromUserAgent("claude-cli/2.1.287 (external, sdk-cli)"));
+    try t.expectEqual(C.opencode, C.fromUserAgent("opencode/1.18.32 ai-sdk/provider-utils/4.0.23 runtime/bun/1.3.14"));
+    try t.expectEqual(C.codex, C.fromUserAgent("codex_exec/0.159.3 (Mac OS 27.0.1; arm64) unknown (codex_exec; 0.159.3)"));
+    try t.expectEqual(C.omp, C.fromUserAgent("omp/18.4.9"));
+    // pi sends the OpenAI SDK's default header, which names no agent.
+    try t.expectEqual(C.other, C.fromUserAgent("OpenAI/JS 6.26.0"));
+    try t.expectEqual(C.other, C.fromUserAgent("pi/0.7.1"));
     try t.expectEqual(C.claude_code, C.fromUserAgent("Claude-CLI/2.1.0"));
     try t.expectEqual(C.opencode, C.fromUserAgent("OpenCode/1"));
     try t.expectEqual(C.other, C.fromUserAgent(null));
