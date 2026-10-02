@@ -2,6 +2,9 @@
 
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
+### Features
+- `/metrics.json` sessions now name the calling agent (`claude-code`, `opencode`, `codex`, `pi` or `other`) with a per-request id, and a `process_start_time_seconds` gauge lets monitors detect restarts.
+
 ### Fixes
 - Serving more than 16 simultaneous chats on Qwen3.8 27B with its drafter could fail a whole batch of streams mid-answer; every stream now completes (measured to 32 at once on an M5 Ultra).
 - Sushi Flash Next packs with unquantized BF16 n-gram tables now load when their table metadata declares no quantization groups.
