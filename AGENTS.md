@@ -269,6 +269,7 @@ Sampling + logprobs + streams:
 - **A client cannot time our stream**: final-chunk server `timings`; the `include_usage` chunk ships `"choices": []`. Guard: `tests/test_loop_stop_signal.sh`.
 - **Liveness is a property of the SOCKET** (`beatStreamKeepalive`, 5 s byte-silence; `StreamHeartbeat` mirrors `StallClock`). GAP: Ollama sink drops SSE comments. `--timeout` is a STALL timeout; `toolCallFinishReason` preserves "length".
 - **A long job's abort must not depend on the RESPONSE SHAPE** (`gen_sse.StreamCtx.stream`, `Conn.peerClosed`).
+- **`Conn.close` sends FIN, then waits for the PEER to hang up (≤ 5 min) when the body is close-delimited** (SSE, NDJSON: no `Content-Length`): the body ends at the close, and a socket closed under a reader still lagging is dropped with an RST by the kernel's `fin_timeout` (60 s), so the client read every byte, then ECONNRESET. A response written with a `Content-Length` sets `Conn.length_framed` and closes at once; an unmarked head keeps the wait. Guard: `tests/test_responses_streaming.sh` [G].
 - **Grammar**: every state has a legal byte; the mask never walks the vocabulary (#380, `token_mask.buildMask`, `nextConstrained` lazy); NO whitespace OUTSIDE the root, the model's own layout inside (`MAX_FREE_WS` 16); token→bytes tables are per-MODEL (`grammarTokenBytes`). Guard: `tests/test_json_mode_multi_model.sh`.
 
 Loading + residency:
