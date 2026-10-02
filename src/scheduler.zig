@@ -2366,6 +2366,7 @@ pub const Scheduler = struct {
         if (slotReleasePending(slot)) return .head_release_pending;
         if (slot.sampling.constraint != null) return .grammar;
         if (slot.logprobs_n > 0) return .logprobs;
+        if (slot.sampling.penalized()) return .penalty;
         // Embedded-GGUF slots (ds4 / llama.cpp) have no `ForwardCtx` — they
         // always fall through to the per-slot decode path (which dispatches
         // into the engine).
@@ -2389,6 +2390,7 @@ pub const BatchVerdict = enum {
     head_release_pending,
     grammar,
     logprobs,
+    penalty,
     embedded_engine,
     arch,
     pad_waste,
