@@ -391,7 +391,7 @@ if (typeof document !== 'undefined') (function () {
 :root[data-theme=light] .mwin button{border-color:#e1e2e6;color:#5b616b}
 :root[data-theme=light] .mwin button.on{background:#ececf0;color:#1e1f22}
 :root[data-theme=light] .mhist .mnote{color:#878d96}
-.msess{margin-top:12px}
+.msess{margin-top:12px;overflow-x:auto}
 .msess table{width:100%;border-collapse:collapse;font-size:0.75rem}
 .msess th{text-align:left;font-weight:600;font-size:0.625rem;text-transform:uppercase;letter-spacing:.07em;color:#7d8794;padding:0 8px 6px 0}
 .msess td{padding:6px 8px 6px 0;border-top:1px solid #1f242c;font-family:ui-monospace,SFMono-Regular,Menlo,monospace;color:#e6e9ee;white-space:nowrap}
