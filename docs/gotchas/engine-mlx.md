@@ -5401,3 +5401,15 @@ Sushi Flash Next packs ship a raw BF16 n-gram table with `bits=16, group_size=0`
 the group-size range check ran before the BF16 branch and failed the load with
 `NgramTableBits`. It now runs only in the quantized branch. Guard: `ngram table
 raw BF16 rows do not depend on quantization group size`.
+
+## An image in any stream dropped the whole batched group to the dense mask
+
+- Defect: Flash-Next behind an agent that attaches screenshots lost most of its aggregate decode speed at three or more
+  streams; the same transcripts without the images did not.
+- Cause: an M-RoPE slot (`mrope_pos`) made the batched decode setup refuse the QSA gather arm for the WHOLE group
+  (`any_mrope`), so every plain tick ran the dense mask over the full KV. One or two MTP slots verify per row and never
+  reach it; the MTP crowd path folds three or more into one plain batched tick, which does.
+- Fix: the batched gather arm serves M-RoPE slots. It reads no rope tables: queries are rotated before it and each
+  slot's cached keys already carry their positions. The `any_mrope` refusals (`qsaBatchedGatherOn`, the block-keeping
+  branch of `qsaMask`, the gather's early return) and the raw pad-waste bill for such slots are gone.
+- Guard: `qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions`.
