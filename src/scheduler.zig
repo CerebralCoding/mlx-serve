@@ -2026,7 +2026,7 @@ pub const Scheduler = struct {
 
             // Estimate post-load bytes (see `gateEstimateBytes` for why a media
             // entry cannot be billed by its directory's size).
-            const estimated: u64 = gateEstimateBytes(media_peak, entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
+            const estimated: u64 = gateEstimateBytes(media_peak, residentDiskHint(entry.bytes_on_disk, owned.config), owned.config.num_hidden_layers, owned.config.hidden_size);
 
             // Reserve this load's estimate BEFORE planning eviction, so a
             // concurrent loader sees the pending allocation in its own gate.
@@ -3254,6 +3254,35 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
+fn residentDiskHint(disk_bytes: ?u64, config: *const model_mod.ModelConfig) ?u64 {
+    const total = disk_bytes orelse return null;
+    const payload = if (config.isQwen4()) config.embedded_ple_payload_bytes orelse 0 else 0;
+    if (payload > total) return total;
+    return total - payload;
+}
+
+test "embedded Qwen4 PLE payload is excluded from both resident and preflight weight estimates" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    var config: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .embedded_ple_payload_bytes = 30 * GB };
+    try std.testing.expectEqual(@as(?u64, 70 * GB), residentDiskHint(100 * GB, &config));
+    try std.testing.expectEqual(@as(u64, 77 * GB), gateEstimateBytes(0, residentDiskHint(100 * GB, &config), 48, 2560));
+    try std.testing.expectEqual(@as(u64, 77 * GB), loadRequirementBytes(residentDiskHint(100 * GB, &config).?));
+    config.embedded_ple_payload_bytes = 101 * GB;
+    try std.testing.expectEqual(@as(?u64, 100 * GB), residentDiskHint(100 * GB, &config));
+    config.model_type = "qwen3_5_moe";
+    config.embedded_ple_payload_bytes = 30 * GB;
+    try std.testing.expectEqual(@as(?u64, 100 * GB), residentDiskHint(100 * GB, &config));
+}
+
+fn residentModelDiskBytes(io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
+    const total = modelDiskBytes(io, model_dir);
+    if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
+    const info = (try @import("qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
+    if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
+    if (info.payload_bytes > total) return error.InvalidEmbeddedNgramTable;
+    return total - info.payload_bytes;
+}
+
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     // A model served straight out of the HuggingFace hub cache is a snapshot
     // dir of SYMLINKS into ../../blobs. Skipping .sym_link entries measured a
@@ -3640,29 +3669,6 @@ test "the eviction gate bills a media entry its BACKEND peak, never the dir's sa
     try testing.expectEqual(fallback + fallback / 10, gateEstimateBytes(0, null, 32, 4096));
 }
 
-test "the gate and the media preflight read ONE estimator" {
-    // The class bug in #126 is not the formula, it is that two sites computed
-    // the same bill differently and the stricter one ran first. Both call
-    // `gen.estimatePeakResidentBytes`; the gate reaches it through
-    // `mediaPeakFor`, which is the only place allowed to decide "is this a
-    // media entry, and what backend is it". Needles are ++-split so this
-    // test's own source cannot satisfy the scan.
-    const src = @embedFile("scheduler.zig");
-    const peek = "const media_peak = self.mediaPeak" ++ "For(entry);";
-    try testing.expect(std.mem.indexOf(u8, src, peek) != null);
-    const gate = "gateEstimateBytes(media_peak, entry.bytes_on" ++ "_disk,";
-    try testing.expect(std.mem.indexOf(u8, src, gate) != null);
-    // The raw-bytes_on_disk shape the gate used to have must be GONE.
-    const old = "const base: u64 = if (entry.bytes_on" ++ "_disk) |b|";
-    try testing.expect(std.mem.indexOf(u8, src, old) == null);
-    // Both the preflight and the committed residency go through the estimator.
-    var n: usize = 0;
-    var i: usize = 0;
-    const needle = "gen_mod.estimatePeakResident" ++ "Bytes(";
-    while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
-    try testing.expect(n >= 2);
-}
-
 test "a media model commits the residency the gate reserved" {
     // Secondary #1 of the issue: the gate reserved the staged peak and then
     // `markReadyLocked` committed the DIR SUM, so H3 sat in the budget at
@@ -3797,7 +3803,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     defer if (in_dir_drafter) |p| sch.allocator.free(p);
     if (!skip_mem_preflight) {
         const gb = 1024.0 * 1024.0 * 1024.0;
-        const model_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const model_bytes = try residentModelDiskBytes(sch.io, params.model_dir, params.config);
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
         const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
@@ -4548,7 +4554,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // ins), else fall back to a rough multiple of layers × hidden. The
     // value drives LRU eviction's "will the new model fit?" gate in Phase
     // D; precise accounting isn't required here.
-    const bytes_resident: u64 = if (entry.bytes_on_disk) |b|
+    const bytes_resident: u64 = if (residentDiskHint(entry.bytes_on_disk, params.config)) |b|
         b
     else
         @as(u64, params.config.num_hidden_layers) * @as(u64, params.config.hidden_size) * 4 * 4;

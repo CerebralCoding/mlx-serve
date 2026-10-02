@@ -79,6 +79,7 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `gemma3` | Gemma 3 | `language_model.model` | -- | -- | |
 | `qwen3` | Qwen 3 | `model` | -- | -- | QK norm |
 | `qwen3_5`, `qwen3_5_moe(_text)` | Qwen 3.5/3.6 | `language_model.model` | -- | Optional | GatedDeltaNet + MoE/dense, shared expert routing |
+| `qwen4_exp` | Qwen3.8-Flash-Next | `language_model.model` | Qwen3-VL | 512/top-10 | Hyper-connections, n-gram PLE, QSA; external or embedded PLE table |
 | `qwen3_next` | Qwen 3-next | `model` | -- | Optional | DeltaNet |
 | `nemotron_h` | Nemotron-H | `backbone` | -- | -- | Hybrid transformer + Mamba2 SSM |
 | `lfm2`, `lfm2_vl` | Liquid LFM2.5 / LFM2.5-VL | `model` | -- | `vision_tower` + `multi_modal_projector` | Hybrid gated conv + full attention; the VL tag adds a SigLIP2-NaFlex tower (`src/lfm2_vision.zig`) |
@@ -87,6 +88,8 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `*.gguf` (any) | via llama.cpp | -- | -- | -- | Embedded libllama engine; reported as `model_type=gguf`. See Embedded engines. |
 
 **TODO**: `phi`/`phi3` (different layout), `command-r` (different arch).
+
+The embedded Qwen4 PLE path accepts indexed safetensors with complete `ngram_embedding.shards.N.{weight,scales,biases}` triplets matching the config's shard count and table geometry. It reads table rows from disk through host memory; `--ple-gpu` falls back to this path. The loader leaves other PLE weights in MLX, folds the raw checkpoint's delta RMS weights into the engine's stored-weight convention, and excludes only the validated table payload from resident-weight estimates while keeping the usual memory reserves. This supports the verified Qwen4 layout, not every oQ model architecture.
 
 ### GGUF auto-routing
 

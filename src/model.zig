@@ -282,6 +282,8 @@ pub const ModelConfig = struct {
     ngram_vocab_base: u64 = 20_000_000,
     ngram_vocab_divisor: u32 = 128,
     ngram_seed: u64 = 1234,
+    split_ngram_parts: u32 = 128,
+    embedded_ple_payload_bytes: ?u64 = null,
     indexer_n_heads: u32 = 0, // 0 = dense attention
     indexer_head_dim: u32 = 0,
     indexer_budget: u32 = 0,
@@ -1393,6 +1395,9 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     var config = try parseConfigFromJson(allocator, content);
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
+        if (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(&config))) |info| {
+            config.embedded_ple_payload_bytes = info.payload_bytes;
+        }
     }
 
     // Model-author sampling recommendations ride in a sibling file. Optional —
@@ -1654,6 +1659,9 @@ fn validateQwen4Config(config: *const ModelConfig) !void {
     if (config.ngram_vocab_divisor == 0 or config.ngram_vocab_base < 2) {
         return error.InvalidQwen4NgramVocab;
     }
+    if (config.ple_embed_dim == 0 or config.ple_embed_dim % ((config.ngram_size - 1) * config.heads_per_ngram) != 0 or config.split_ngram_parts == 0) {
+        return error.InvalidQwen4PleGeometry;
+    }
     // The forward divides kv by the ratio and selects `budget / ratio` blocks.
     if (config.indexer_n_heads > 0) {
         if (config.indexer_head_dim == 0) return error.InvalidQwen4Indexer;
@@ -1663,6 +1671,13 @@ fn validateQwen4Config(config: *const ModelConfig) !void {
     if (config.ple_layer_idx < 0 or config.ple_layer_idx >= @as(i64, config.num_hidden_layers)) {
         return error.InvalidQwen4PleLayer;
     }
+}
+
+pub fn qwen4EmbeddedSpec(config: *const ModelConfig) !qwen4_exp.EmbeddedSpec {
+    const hash = try qwen4_exp.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, config.ngram_eos);
+    if (config.ple_embed_dim == 0 or config.ple_embed_dim % hash.n_heads != 0) return error.InvalidQwen4PleGeometry;
+    if (config.ple_layer_idx < 0) return error.InvalidQwen4PleLayer;
+    return .{ .rows = hash.total_rows, .dim = config.ple_embed_dim / hash.n_heads, .shards = config.split_ngram_parts, .layer_index = @intCast(config.ple_layer_idx) };
 }
 
 /// True when the layer loop installed the PLE on exactly the layer the config names. A negative
@@ -2545,6 +2560,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (try qwen4ConfigU64(cfg_obj, "ngram_vocab_size_base")) |v| config.ngram_vocab_base = v;
         if (try qwen4ConfigU32(cfg_obj, "make_ngram_vocab_size_divisible_by")) |v| config.ngram_vocab_divisor = v;
         if (try qwen4ConfigU64(cfg_obj, "seed")) |v| config.ngram_seed = v;
+        if (try qwen4ConfigU32(cfg_obj, "split_ngram_parts")) |v| config.split_ngram_parts = v;
         if (try qwen4ConfigU32(cfg_obj, "indexer_n_heads")) |v| config.indexer_n_heads = v;
         if (try qwen4ConfigU32(cfg_obj, "indexer_head_dim")) |v| config.indexer_head_dim = v;
         if (try qwen4ConfigU32(cfg_obj, "indexer_budget")) |v| config.indexer_budget = v;
@@ -3789,14 +3805,18 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
 /// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false };
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
     if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
-    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16 });
+    if (config.embedded_ple_payload_bytes != null) {
+        const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
+        if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
+    }
+    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null });
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -3984,7 +4004,7 @@ pub fn loadSafetensorsFile(
 
         const key_str = std.mem.span(key.?);
 
-        if (!shouldKeepWeightKey(key_str, load_vision)) {
+        if (!shouldKeepWeightKey(key_str, load_vision) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str))) {
             _ = mlx.mlx_array_free(value);
             continue;
         }
@@ -3993,7 +4013,11 @@ pub fn loadSafetensorsFile(
         // ndim is a use-after-free, not a zero.
         const ndim = mlx.mlx_array_ndim(value);
         var final_value = value;
-        if (!opts.keep_f16 and narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
+        if (opts.embedded_ple and qwen4NormNeedsFold(key_str)) {
+            const folded = try foldQwen4Norm(value, s);
+            _ = mlx.mlx_array_free(value);
+            final_value = folded;
+        } else if (!opts.keep_f16 and narrowsLoadedF16(key_str, ndim, mlx.mlx_array_dtype(value)) and
             (ndim != 1 or narrow1dEnabled()))
         {
             var cast = mlx.mlx_array_new();
@@ -4006,6 +4030,103 @@ pub fn loadSafetensorsFile(
         const owned_key = try allocator.dupe(u8, key_str);
         try weights.map.put(owned_key, final_value);
     }
+}
+
+fn foldQwen4Norm(value: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    const one = mlx.mlx_array_new_float(1.0);
+    defer _ = mlx.mlx_array_free(one);
+    var shifted = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(shifted);
+    try mlx.check(mlx.mlx_add(&shifted, value, one, s));
+    var folded = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(folded);
+    try mlx.check(mlx.mlx_astype(&folded, shifted, .bfloat16, s));
+    return folded;
+}
+
+pub fn qwen4NormNeedsFold(key: []const u8) bool {
+    const suffixes = [_][]const u8{
+        "hc_norm.weight", "q_norm.weight", "k_norm.weight", "q_layernorm.weight", "k_layernorm.weight",
+        "ple.norm_key.weight", "ple.norm_query.weight", "ple.norm_conv.weight",
+        "pre_fc_norm_embedding.weight", "pre_fc_norm_hidden.weight",
+    };
+    for (suffixes) |suffix| if (std.mem.endsWith(u8, key, suffix)) return true;
+    return false;
+}
+
+test "embedded Qwen4 loader folds only delta RMS weights and leaves other PLE weights" {
+    const allocator = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [512]u8 = undefined;
+    const root_len = try tmp.dir.realPath(io, &root_buf);
+    const path = try std.fmt.allocPrintSentinel(allocator, "{s}/model.safetensors", .{root_buf[0..root_len]}, 0);
+    defer allocator.free(path);
+    const norm = "language_model.model.layers.1.ple.norm_key.weight";
+    const gate = "language_model.model.layers.1.linear_attn.norm.weight";
+    const multiplier = "language_model.model.layers.1.ple.ple_embedding.layer_multipliers";
+    const shard = "language_model.model.layers.1.ple.ple_embedding.ngram_embedding.shards.0.weight";
+    {
+        const map = mlx.mlx_map_string_to_array_new();
+        defer _ = mlx.mlx_map_string_to_array_free(map);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        const shape = [_]c_int{1};
+        const data = [_]f32{0.5};
+        const value = mlx.mlx_array_new_data(&data, &shape, 1, .float32);
+        defer _ = mlx.mlx_array_free(value);
+        var raw = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(raw);
+        try mlx.check(mlx.mlx_astype(&raw, value, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(raw));
+        _ = mlx.mlx_map_string_to_array_insert(map, norm, raw);
+        _ = mlx.mlx_map_string_to_array_insert(map, gate, raw);
+        _ = mlx.mlx_map_string_to_array_insert(map, multiplier, raw);
+        _ = mlx.mlx_map_string_to_array_insert(map, shard, raw);
+        try mlx.check(mlx.mlx_save_safetensors(path.ptr, map, meta));
+    }
+    var weights = Weights.init(allocator);
+    defer weights.deinit();
+    try loadSafetensorsFile(allocator, &weights, path, s, .{ .embedded_ple = true });
+    try testing.expect(weights.get(shard) == null);
+    try testing.expect(weights.get(multiplier) != null);
+    const folded = weights.get(norm).?;
+    try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(folded));
+    var f32_folded = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32_folded);
+    try mlx.check(mlx.mlx_astype(&f32_folded, folded, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f32_folded));
+    try testing.expectEqual(@as(f32, 1.5), mlx.mlx_array_data_float32(f32_folded).?[0]);
+    var f32_gate = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32_gate);
+    try mlx.check(mlx.mlx_astype(&f32_gate, weights.get(gate).?, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f32_gate));
+    try testing.expectEqual(@as(f32, 0.5), mlx.mlx_array_data_float32(f32_gate).?[0]);
+    try testing.expect(!qwen4NormNeedsFold(gate));
+    for ([_][]const u8{
+        "layers.0.attn_hyper_connection.hc_norm.weight",
+        "layers.3.self_attn.q_norm.weight",
+        "layers.3.self_attn.k_norm.weight",
+        "layers.3.self_attn.indexer.q_layernorm.weight",
+        "layers.3.self_attn.indexer.k_layernorm.weight",
+        "layers.1.ple.norm_key.weight",
+        "layers.1.ple.norm_query.weight",
+        "layers.1.ple.norm_conv.weight",
+        "mtp.pre_fc_norm_embedding.weight",
+        "mtp.pre_fc_norm_hidden.weight",
+    }) |name| try testing.expect(qwen4NormNeedsFold(name));
+    var converted = Weights.init(allocator);
+    defer converted.deinit();
+    try loadSafetensorsFile(allocator, &converted, path, s, .{});
+    try testing.expect(converted.get(shard) != null);
+    var f32_original = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32_original);
+    try mlx.check(mlx.mlx_astype(&f32_original, converted.get(norm).?, .float32, s));
+    try mlx.check(mlx.mlx_array_eval(f32_original));
+    try testing.expectEqual(@as(f32, 0.5), mlx.mlx_array_data_float32(f32_original).?[0]);
 }
 
 /// True if the safetensors weight `key` should be retained for the text
