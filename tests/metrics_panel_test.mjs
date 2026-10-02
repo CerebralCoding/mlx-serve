@@ -31,6 +31,8 @@ const counters = (over = {}) => ({
   generation_tokens_total: 500,
   requests_success_total: 4,
   requests_cancelled_total: 0,
+  requests_failed_total: 0,
+  requests_rejected_total: 0,
   prefix_cache_queries_total: 4,
   prefix_cache_hits_total: 2,
   ...over,
@@ -290,28 +292,11 @@ test('row 14: a request that spans polls opens on its request_id and closes when
   rows = rowsOf(rows, [], T0 + 2000);
   assert.equal(rows.length, 1);
   assert.equal(rows[0].endT, T0 + 2000);
-  assert.equal(P.clientLabel(rows[0]), 'claude-code');
+  assert.equal(rows[0].client, 'claude-code');
 });
 
 test('row 14: idle cached sessions are not requests', () => {
   assert.deepEqual(rowsOf([], [{ model: 'm', phase: 'cached', context_tokens: 9 }], T0), []);
-});
-
-test('row 19: an old server without request_id, client or the new counters still renders', () => {
-  const s = { model: 'm', phase: 'decode', context_tokens: 10, context_length: 100, cached_tokens: 0, generated_tokens: 3, state_bytes: 1 };
-  let rows = rowsOf([], [s], T0);
-  rows = rowsOf(rows, [{ ...s, generated_tokens: 8 }], T0 + 1000);
-  assert.equal(rows.length, 1, 'keyed on model plus phase');
-  assert.equal(P.clientLabel(rows[0]), '—');
-  rows = rowsOf(rows, [{ ...s, phase: 'cached' }], T0 + 2000);
-  assert.equal(rows[0].endT, T0 + 2000);
-
-  const a = poll(T0, { requests_success_total: 1 }), b = poll(T0 + 1000, { requests_success_total: 3 });
-  assert.equal(a.c.requests_failed_total, 0);
-  const tot = P.windowTotals([a, b], T0, T0 + 1000);
-  assert.equal(tot.requests_failed_total, 0);
-  assert.equal(tot.requests_rejected_total, 0);
-  assert.equal(tot.requests_success_total, 2);
 });
 
 test('failed, rejected and cancelled move as counter deltas', () => {

@@ -110,7 +110,6 @@ function activeModel(sessions) {
   return live.size === 1 ? [...live][0] : null;
 }
 
-// A counter a server does not export yet reads as zero.
 function makeSample(now, d) {
   const c = (d && d.counters) || {};
   const g = (d && d.gauges) || {};
@@ -120,7 +119,7 @@ function makeSample(now, d) {
     m: activeModel(d && d.sessions),
     c: {},
   };
-  for (const k of HISTORY_KEYS) out.c[k] = finite(c[k]) ? c[k] : 0;
+  for (const k of HISTORY_KEYS) out.c[k] = c[k];
   return out;
 }
 
@@ -233,7 +232,7 @@ function mkRow(r) {
   };
 }
 
-const requestKey = (s) => (finite(s.request_id) ? 'r' + s.request_id : s.model + '|' + s.phase);
+const requestKey = (s) => 'r' + s.request_id;
 
 function capClosed(rows) {
   const closed = rows.filter((r) => r.endT !== null);
@@ -241,8 +240,7 @@ function capClosed(rows) {
   return rows.filter((r) => !drop.has(r));
 }
 
-// A row opens when its session appears and closes when it leaves. A server
-// without request_id keys on model plus phase, so a phase change is a new row.
+// A row opens when its session appears and closes when it leaves.
 function trackRequests(rows, sessions, now) {
   const out = rows.map((r) => Object.assign({}, r));
   const seen = new Set();
@@ -273,8 +271,6 @@ function mergeRows(a, b) {
   }
   return capClosed(out);
 }
-
-const clientLabel = (row) => (row.client ? row.client : '—');
 
 // ── Persistence ──────────────────────────────────────────────────────────────
 //
@@ -346,7 +342,7 @@ async function persistDoc(env, doc, now) {
 // consumer. Either way the IIFE below only runs in a real page.
 if (typeof globalThis !== 'undefined') globalThis.__mlxPanel = {
   computeRates, panelAt, makeSample, appendSample, mergeStores, rateOver, rateSeries, windowTotals,
-  modelTotals, trackRequests, clientLabel, loadDoc, saveDoc, persistDoc, mergeDocs, HISTORY_KEYS,
+  modelTotals, trackRequests, loadDoc, saveDoc, persistDoc, mergeDocs, HISTORY_KEYS,
 };
 
 if (typeof document !== 'undefined') (function () {
@@ -659,7 +655,7 @@ if (typeof document !== 'undefined') (function () {
 
     const rows = doc.rows.slice().reverse().slice(0, 50);
     renderHistoryTable($('m-h-rows'), ['Started', 'Client', 'Model', 'Phase', 'Duration', 'Context', 'Cached', 'Generated'],
-      rows.map((r) => [clock(r.startT), clientLabel(r), r.model,
+      rows.map((r) => [clock(r.startT), r.client, r.model,
         r.endT === null ? t({ prefill: 'prefilling', decode: 'decoding' }[r.phase] || r.phase) : t('finished'),
         secs((r.endT === null ? now : r.endT) - r.startT), fmt(r.ctx, 0), fmt(r.cached, 0), fmt(r.generated, 0)]),
       'No requests yet');
