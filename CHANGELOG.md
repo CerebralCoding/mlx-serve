@@ -4,6 +4,7 @@
 
 ### Features
 - The console Monitor keeps its own history in the browser, computed from the server's counters: 1 hour of samples then one per minute up to 24 hours, kept across reloads, with failed, rejected and cancelled rates, per-model totals and a request table.
+- `/metrics.json` sessions now name the calling agent (`claude-code`, `opencode`, `codex`, `pi` or `other`) with a per-request id, and a `process_start_time_seconds` gauge lets monitors detect restarts.
 
 ### Fixes
 - Serving more than 16 simultaneous chats on Qwen3.8 27B with its drafter could fail a whole batch of streams mid-answer; every stream now completes (measured to 32 at once on an M5 Ultra).
