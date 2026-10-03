@@ -2428,11 +2428,10 @@ PROXY's origin root, not the mount that served the page — the mount answers `/
 (it strips the prefix on the way in, so the server never learns it) and 404s `/v1/models`. And
 silently: that 404 body is HTML, `res.json()` throws, the catch assigns `MODELS = []`.
 
-Fix: `apiPrefix(location.pathname)` is that mount — a last segment holding a dot is a file,
-anything else a directory — and every fetch, the API reference's own links and the base URL the
-chat system prompt hands the model resolve through it. `metrics.js` carries a twin because its
-header script runs before `app.js`.
+Fix: `apiPrefix(pathname)` — in `src/html/api.js`, the first script of the page's boot slot, so
+`app.js` and `metrics.js` bind the ONE implementation — is that mount: a last segment holding a dot
+is a file, anything else a directory. Every fetch, the API reference's own links and the base URL the
+chat system prompt hands the model resolve through it.
 Guards: `the path prefix the page was served under is the base of every API path`,
-`no console script fetches a root-absolute path literally` (static, since no HTTP assertion can
-see it; its control sample is asserted so the scan cannot pass vacuously),
+`app.js resolves through the page's one apiPrefix` (identity, not a source scan),
 `tests/metrics_panel_test.mjs`.

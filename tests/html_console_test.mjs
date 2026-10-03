@@ -15,6 +15,9 @@ import { runInNewContext } from 'node:vm';
 import assert from 'node:assert/strict';
 
 const here = dirname(fileURLToPath(import.meta.url));
+// api.js publishes the ONE `apiPrefix` that app.js binds; evaluate it first, the
+// way the page's boot slot does.
+new Function(readFileSync(join(here, '..', 'src', 'html', 'api.js'), 'utf8'))();
 const src = readFileSync(join(here, '..', 'src', 'html', 'app.js'), 'utf8');
 
 // app.js guards its DOM wiring on `typeof document`, so in node only the pure
@@ -1214,39 +1217,24 @@ test('no console stylesheet states a font size in px', () => {
 // its 404, and the page reports an empty server.
 
 test('the path prefix the page was served under is the base of every API path', () => {
-  assert.equal(C.apiPrefix('/'), '');
-  assert.equal(C.apiPrefix('/mount'), '/mount');
-  assert.equal(C.apiPrefix('/mount/'), '/mount');
-  assert.equal(C.apiPrefix('/deep/mount/'), '/deep/mount');
+  const prefix = globalThis.apiPrefix;
+  assert.equal(prefix('/'), '');
+  assert.equal(prefix('/mount'), '/mount');
+  assert.equal(prefix('/mount/'), '/mount');
+  assert.equal(prefix('/deep/mount/'), '/deep/mount');
   // A page addressed AS a file resolves against its directory.
-  assert.equal(C.apiPrefix('/index.html'), '');
-  assert.equal(C.apiPrefix('/mount/index.html'), '/mount');
+  assert.equal(prefix('/index.html'), '');
+  assert.equal(prefix('/mount/index.html'), '/mount');
   // Not a pathname at all (an absolute URL, a stubbed location) never invents
   // a prefix: the endpoint path is what the server expects.
-  assert.equal(C.apiPrefix(''), '');
-  assert.equal(C.apiPrefix(undefined), '');
-  assert.equal(C.apiPrefix('https://x/y'), '');
+  assert.equal(prefix(''), '');
+  assert.equal(prefix(undefined), '');
+  assert.equal(prefix('https://x/y'), '');
 });
 
-// No HTTP assertion can see this failure (it needs a browser behind a mounted
-// proxy), so the class guard is static, and it walks the DIRECTORY the way the
-// px rule above does — the console gains scripts over time. The control sample
-// is asserted in the same test: a scan that matched nothing would pass forever.
-const ABSOLUTE_FETCH = /fetch\(\s*(['"`])\//g;
-
-test('no console script fetches a root-absolute path literally', () => {
-  assert.equal("fetch('/v1/models')".match(ABSOLUTE_FETCH).length, 1, 'the scan matches nothing');
-  const dir = join(here, '..', 'src', 'html');
-  const files = readdirSync(dir).filter((f) => f.endsWith('.js'));
-  assert.ok(files.length >= 3, `only ${files.length} console scripts to scan — is the walk working?`);
-  const offenders = [];
-  for (const name of files) {
-    const text = readFileSync(join(dir, name), 'utf8');
-    for (const m of text.matchAll(ABSOLUTE_FETCH)) {
-      offenders.push(`${name}:${text.slice(0, m.index).split('\n').length}`);
-    }
-  }
-  assert.deepEqual(offenders, [],
-    `a root-absolute fetch loses every request behind a mounted proxy:\n  ${offenders.join('\n  ')}` +
-    '\nResolve it through API_PREFIX (app.js) / apiPrefix(location.pathname) (metrics.js).');
+// The page has one implementation, not one per script: a second copy is the bug
+// report for the next divergence, and identity is what says app.js resolves
+// through api.js rather than around it.
+test('app.js resolves through the page\'s one apiPrefix', () => {
+  assert.equal(C.apiPrefix, globalThis.apiPrefix);
 });

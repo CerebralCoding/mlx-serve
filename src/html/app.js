@@ -700,19 +700,6 @@
     return key ? { Authorization: 'Bearer ' + key } : {};
   }
 
-  /// The mount the page was served under, '' at the origin root. A proxy that
-  /// mounts below its root strips the prefix on the way in, so only the page's
-  /// own URL carries it. A last segment holding a dot is a file, so a file's
-  /// directory is the mount; anything else is the mount itself.
-  function apiPrefix(pathname) {
-    var p = String(pathname || '');
-    if (p.charAt(0) !== '/') return '';
-    while (p.length > 1 && p.charAt(p.length - 1) === '/') p = p.slice(0, -1);
-    var slash = p.lastIndexOf('/');
-    if (p.indexOf('.', slash) >= 0) p = p.slice(0, slash);
-    return p === '/' ? '' : p;
-  }
-
   /// Sum the server's own timing block across the rounds of one turn.
   ///
   /// Client wall-clock cannot measure this: with `tools` present the server
@@ -909,7 +896,8 @@
 
   var $ = function (id) { return document.getElementById(id); };
   var API_KEY = apiKeyFrom(location.search);
-  // A root-absolute fetch asks a proxy's origin root, and its 404 reads as an empty server.
+  // Every request resolves through the mount the page was served under (`api.js`):
+  // a root-absolute fetch asks the proxy's origin root and reads as an empty server.
   var API_PREFIX = apiPrefix(location.pathname);
   var MODELS = [];
   var API_ENTRIES = [];

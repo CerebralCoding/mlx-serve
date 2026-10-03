@@ -28,16 +28,8 @@ function panelAt(now, samples, winMs) {
   return s;
 }
 
-// Twin of `apiPrefix` in app.js — this header script runs before that file
-// exists, so the poll cannot resolve through it. Keep the two in sync.
-function apiPrefix(pathname) {
-  let p = String(pathname || '');
-  if (p.charAt(0) !== '/') return '';
-  while (p.length > 1 && p.charAt(p.length - 1) === '/') p = p.slice(0, -1);
-  const slash = p.lastIndexOf('/');
-  if (p.indexOf('.', slash) >= 0) p = p.slice(0, slash);
-  return p === '/' ? '' : p;
-}
+// `apiPrefix` (the mount the page was served under) comes from `api.js`, the
+// boot script that this panel's own script is rendered after.
 
 function computeRates(now, samples, c, g, psum) {
   const liveTok = (g.generation_tokens_live != null) ? g.generation_tokens_live : c.generation_tokens_total;
