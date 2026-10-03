@@ -5,6 +5,9 @@ Full histories: live failures, measurements, diagnosis ladders, dead ends. The d
 ### `top_p: 0` masked every token and sampled uniform garbage (2026-09-16)
 The nucleus keeps a rank while the mass STRICTLY above it is `< top_p`. Rank 0 sees exactly 0, so a literal `top_p: 0` (what clients send for "greedy") kept nothing: the row went `-inf` everywhere and the categorical draw was uniform over 248k ids ("będziemyWATCH끈 გა stimulation"). 0.001 and up were fine, which is why no sweep ever saw it. Fix: the threshold floors at `floatMin(f32)`, so rank 0 is always inside and `top_p 0` is greedy like `top_k 1`. Guard: `applyTopP at top_p 0 keeps exactly the argmax` (generate.zig) + `tests/test_api_edges.sh` (top_p 0 == temperature 0 live).
 
+### A penalty applied only on the logprobs path was silently ignored everywhere else (#564)
+`repeat_penalty` / `frequency_penalty` / `presence_penalty` reached `applyRepeatPenalty` only through `sampleToken`, which the decode loop calls only when logprobs are requested. The pipelined fast path, the grammar path, spec verify (PLD/MTP/DFlash) and batched decode all sampled raw logits: "apple ×40" gave 120 apples at `repeat_penalty 2.0` and 3 with `logprobs: true`, and `json_schema` replies were byte-identical at any penalty. Fix: `Generator.sampleLazy` penalizes over the realized `generated_ids`; `SamplingParams.penalized()` keeps a request off `next`'s fast path (its pending token is not realized yet), off spec (`requestSpecModes` `shaped_logits`) and off batched decode (`BatchVerdict.penalty`). Guard: `repeat penalty shapes every sampling path` (generate.zig, `LOGPROBS_TEST_MODEL`) + `tests/test_repeat_penalty.sh` (engagement counts for PLD and batching).
+
 ### Every sampled token ranked the whole vocabulary; a shortlist is exact only if it ranks the way the row does
 `applyTopP` argsorted 248,320 logits per sampled token and `applyTopK` paid a second pass through `mlx_argpartition`. On Metal `Partition::eval_gpu` and `ArgPartition::eval_gpu` "direct partition to sort for now", so `mlx_topk` and `mlx_argpartition` ARE the multi-block merge sort and buy nothing. Qwen3.8-Flash-Next on M4 Max, MTP off: 65.0 tok/s greedy vs 60.5 at temperature 1 / top_p 0.95 / top_k 20.
 
@@ -156,6 +159,17 @@ Group-wise affine quantization of K/V via `mlx_quantize`/`mlx_dequantize` (no ne
 
 ### Hot prefix cache memory budget (`--prefix-cache-mem`)
 Wave 1.B — the hot prefix cache used to cap on entry count alone; with 4 KB-ctx entries on Gemma 4 E4B that's an 8 GB worst case. `--prefix-cache-mem N{KB,MB,GB}` (default 2 GB) caps resident KV bytes; `commit` evicts LRU entries until `current_kv_bytes + new_bytes <= budget`. `0`/`off` disables the byte cap (count cap still applies). Each `HotEntry` records its bytes at commit time (sum of `mlx_array_size × mlx_array_itemsize` across keys/values plus the scales/biases triples in quant mode). Log line: `[hot-cache] resident=X.XX / Y.YY MB (E entries)` on every commit / eviction.
+
+### Disabled prefix cache still reduced available context
+
+`--prefix-cache-entries 0` disabled allocation but left the configured RAM budget
+in context and prefill-chunk sizing. Gated architectures still reserved 2 GiB;
+other architectures reserved the raw ask. `/props` also reported that unused budget.
+All three reserve accessors now return zero when the entry count is zero;
+startup preserves zero rather than raising it to the concurrency count, and
+`/props` reads the effective budget.
+The `disabled prefix cache` unit test covers both architecture paths, several
+byte caps, and restoration of the enabled-cache behavior.
 
 ### head_dim-256 prefill: the msv_attn_p256 band kernel + the guards that stay load-bearing (long-context OOM class)
 MLX's fused SDPA covers head_dim ≤ 128 in prefill (`sdpa_full`; `sdpa_vector` covers 256 for seq ≤ 8); **every Gemma-4 and Qwen3.5/3.6 checkpoint ships head_dim 256**, whose prefill otherwise rides the composed path that MATERIALIZES a `[heads, chunk, total_kv]` bf16 score tensor per layer (tens of GB/layer at long ctx — the uncatchable Metal OOM class). The self-contained flash-style kernel `msv_attn_p256` (transformer.zig, `mlx_fast_metal_kernel`; FA-2 online softmax, register-resident Q, float32 accum) covers hd-256 prefill via `fusedSdpa256Prefill` (null → composed fallback). Scoping is three regimes:
@@ -5380,3 +5394,36 @@ Known gap: the first request of a burst sees no company and stays DFlash until i
 - Guard: `round_cost: a round measured cheaper per token than a serial step beats it,
   unmeasured is unknown`.
 
+## A kernel config cached by ROW COUNT handed a 16-slot tick a 16-wide verify's shape (2026-10-01)
+
+- Defect: the 27B 4-bit with its drafter served 16 concurrent streams and failed every stream
+  past that: `[concatenate] ... (16,3,10240), (1,16,10240)` in the GDN conv path, then
+  `batched decode aborted ... failing all 16 slots`. Never seen in a single-stream sweep.
+- Cause: `add_norm` keyed its Metal config on `rows = B*S`, and the config carries the output
+  SHAPE. A speculating slot's 16-token verify ran as `[1,16,D]`; the next 16-slot batched tick,
+  `[16,1,D]`, had the same row count, reused the config and got its hidden state back as
+  `[1,16,D]`. The GDN layer's fused step then declined (`qsh[0] != batch`) and the fallback
+  concatenated the merged `[16,3,C]` state with a `[1,16,C]` input. Three new things met:
+  the NAX-wide block of 16, 16 slots batching, and both on one server.
+- Fix: `CfgKey` carries `b` and `s`, the rule every `metal_kernel` config cache already states.
+- Guard: `addNorm returns each call's own [B,S,D] layout at one row count` (hermetic) and
+  `tests/test_batched_past_block_width.sh` (20 streams on a drafter-bound GDN pack).
+
+## Raw BF16 n-gram tables have no quantization groups
+
+Sushi Flash Next packs ship a raw BF16 n-gram table with `bits=16, group_size=0`;
+the group-size range check ran before the BF16 branch and failed the load with
+`NgramTableBits`. It now runs only in the quantized branch. Guard: `ngram table
+raw BF16 rows do not depend on quantization group size`.
+
+## An image in any stream dropped the whole batched group to the dense mask
+
+- Defect: Flash-Next behind an agent that attaches screenshots lost most of its aggregate decode speed at three or more
+  streams; the same transcripts without the images did not.
+- Cause: an M-RoPE slot (`mrope_pos`) made the batched decode setup refuse the QSA gather arm for the WHOLE group
+  (`any_mrope`), so every plain tick ran the dense mask over the full KV. One or two MTP slots verify per row and never
+  reach it; the MTP crowd path folds three or more into one plain batched tick, which does.
+- Fix: the batched gather arm serves M-RoPE slots. It reads no rope tables: queries are rotated before it and each
+  slot's cached keys already carry their positions. The `any_mrope` refusals (`qsaBatchedGatherOn`, the block-keeping
+  branch of `qsaMask`, the gather's early return) and the raw pad-waste bill for such slots are gone.
+- Guard: `qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions`.

@@ -2950,8 +2950,7 @@ pub fn qsaBatchedGatherEnabled() bool {
     return v;
 }
 
-pub fn qsaBatchedGatherOn(seq_len: c_int, any_mrope: bool) bool {
-    if (any_mrope) return false;
+pub fn qsaBatchedGatherOn(seq_len: c_int) bool {
     const st = qwen4Standin();
     if (st.attn_qsa or st.attn_sdpa) return false;
     if (!qsaBatchedGatherEnabled()) return false;
@@ -10817,6 +10816,46 @@ test "persistent group: join leave cancel capture snapshot rollback restore matc
     }
 }
 
+test "persistent group: a member released from a full 16-row group owns a single-row state" {
+    // The bar: after `ssmGroupReleaseCtx` the leaving slot's conv/ssm state has batch 1 and
+    // equals its row of the merged group, so its own verify never sees the [N, ...] arrays.
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const alloc = std.testing.allocator;
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(alloc, 1);
+    defer cache.deinit();
+    const kinds = try ssmTickKinds(alloc, 2);
+    defer alloc.free(kinds);
+    const n = 16;
+    var slots: [n]SsmTickSlot = undefined;
+    var ctxs: [n]*ForwardCtx = undefined;
+    for (0..n) |i| {
+        slots[i] = try SsmTickSlot.init(alloc, s, kinds, &cache, @as(f32, @floatFromInt(i + 1)));
+        slots[i].bind();
+        ctxs[i] = &slots[i].ctx;
+    }
+    defer for (&slots) |*sl| sl.deinit(alloc);
+    var group: PersistentSsmGroup = .{ .allocator = alloc };
+    defer group.deinit();
+    try ssmTickBind(alloc, s, &group, &ctxs, kinds, true);
+    try ssmTickBumpMerged(s, group.layers, kinds);
+    try ssmTickBind(alloc, s, &group, &ctxs, kinds, true);
+    try ssmTickBumpMerged(s, group.layers, kinds);
+    // Row 5 leaves for a serial round of its own, the way the scheduler releases a speculating slot.
+    const leaver = 5;
+    const expect_conv = try ssmRowView(s, group.layers[0].conv_state, leaver);
+    defer _ = mlx.mlx_array_free(expect_conv);
+    const expect_ssm = try ssmRowView(s, group.layers[0].ssm_state, leaver);
+    defer _ = mlx.mlx_array_free(expect_ssm);
+    try ssmGroupReleaseCtx(&group, s, ctxs[leaver]);
+    const e = &slots[leaver].entries[0];
+    try std.testing.expectEqual(@as(c_int, 1), mlx.getShape(e.conv_state)[0]);
+    try std.testing.expectEqual(@as(c_int, 1), mlx.getShape(e.ssm_state)[0]);
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e.conv_state, expect_conv, s));
+    try std.testing.expectEqual(@as(f32, 0.0), try attn256MaxDiff(e.ssm_state, expect_ssm, s));
+    try std.testing.expectEqual(@as(usize, n - 1), group.n);
+}
+
 test "persistent group: merge/split op counts at N=2/4/8 after the first tick are zero" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const alloc = std.testing.allocator;
@@ -16122,7 +16161,7 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
     const h_kv: c_int = ks[1];
     if (h_kv <= 0 or @rem(h_q, h_kv) != 0 or vs[1] != h_kv or vs[2] != ks[2] or ks[0] != 1) return null;
     const gqa: c_int = @divExact(h_q, h_kv);
-    if (gqa * t_q > 64) return null;
+    if (@divTrunc(gqa * t_q + 7, 8) * 8 > 56) return null; // past 56 padded rows the threadgroup arrays exceed Metal's 32 KiB
     const t_k: c_int = ks[2];
     if (t_k < t_q) return null;
 
@@ -23383,11 +23422,9 @@ pub const Transformer = struct {
         defer self.allocator.free(kv_lens);
         var kv_max: c_int = 0;
         var any = false;
-        var any_mrope = false;
         var any_blocks = false;
         const ratio: c_int = @intCast(self.config.indexer_compress_ratio);
         for (slots, 0..) |sc, i| {
-            if (sc.mrope_pos != null) any_mrope = true;
             const e = qsaSlotEntry(sc, layer);
             const cache_len: c_int = @intCast(sc.moe_seq_offset.*);
             const i_c: c_int = @intCast(i);
@@ -23400,7 +23437,7 @@ pub const Transformer = struct {
             if (masks[i].ctx != null) any = true;
             if (sc.qsa_blocks.ctx != null) any_blocks = true;
         }
-        const keep_blocks = qsaBatchedGatherEnabled() and self.qwen4 != null and !any_mrope and any_blocks;
+        const keep_blocks = qsaBatchedGatherEnabled() and self.qwen4 != null and any_blocks;
         if (keep_blocks) {
             for (slots, 0..) |sc, i| {
                 if (sc.qsa_blocks.ctx == null and masks[i].ctx != null) {
@@ -27363,7 +27400,6 @@ pub const Transformer = struct {
         if (!qsaBatchedGatherEnabled()) return null;
         if (self.qwen4 == null) return null;
         if (ctx.qsa_mask.ctx != null) return null;
-        for (slots) |sc| if (sc.mrope_pos != null) return null;
         var any_blocks = false;
         for (slots) |sc| if (sc.qsa_blocks.ctx != null) {
             any_blocks = true;
@@ -44213,6 +44249,12 @@ test "qkv matmul2d kernel parity: t_q 1..8 x bits, partial last page, many split
     try qkvVerParityCaseWith(24, 4, 256, 8, 0, 4, true); // cache holds only the verify rows
 }
 
+test "qkv matmul2d kernel declines rows past its 32 KiB threadgroup budget (GQA 8 x t_q 8)" {
+    if (verifyQmmTile() == .off) return error.SkipZigTest;
+    try testing.expectError(error.KernelDeclined, qkvVerParityCaseWith(16, 2, 256, 4, 3000, 8, true));
+    try qkvVerParityCaseWith(16, 2, 256, 4, 3000, 7, true);
+}
+
 test "qkvMppWins: the matmul2d window needs rows or length" {
     try testing.expect(qkvMppWins(4, 2048));
     try testing.expect(!qkvMppWins(2, 4096));
@@ -57729,7 +57771,7 @@ test "qsa batched gather S=2 and S=4: N=1 is byte-identical to solo verify, N=2 
     }
 }
 
-test "qsaBatchedAttn: kill switch and mrope refuse the gather arm" {
+test "qsaBatchedAttn: the kill switch refuses the gather arm" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
     const xfm: *Transformer = @ptrCast(&xfm_bytes);
@@ -57749,14 +57791,74 @@ test "qsaBatchedAttn: kill switch and mrope refuse the gather arm" {
     defer qsa_batched_gather_override = prev_g;
     qsa_batched_gather_override = false;
     try std.testing.expect((try xfm.qsaBatchedAttn(&ctx, &slots, dummy, 0, 4, 1.0)) == null);
-
-    qsa_batched_gather_override = true;
-    const pos = [_]i32{ 0, 1, 2 };
-    slot.mrope_pos = &pos;
-    try std.testing.expect((try xfm.qsaBatchedAttn(&ctx, &slots, dummy, 0, 4, 1.0)) == null);
 }
 
-test "qsaBatchedGatherOn matches the arm's switches and vision refusal" {
+test "qsaBatchedAttn: an M-RoPE slot takes the gather arm, byte-identical to the same slot without positions" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const ta = std.testing.allocator;
+    qsa_decode_gather_override = true;
+    defer qsa_decode_gather_override = null;
+    qsa_batched_gather_override = true;
+    defer qsa_batched_gather_override = null;
+    var prng = std.Random.DefaultPrng.init(0x3b0e);
+    const rnd = prng.random();
+    const ratio: c_int = 4;
+    const kb: c_int = 3;
+    const hq: c_int = 4;
+    const hkv: c_int = 2;
+    const hd: c_int = 64;
+    const kls = [_]c_int{ 50, 36 };
+
+    var xfm_bytes: [@sizeOf(Transformer)]u8 align(@alignOf(Transformer)) = @splat(0);
+    const xfm: *Transformer = @ptrCast(&xfm_bytes);
+    xfm.allocator = ta;
+    xfm.s = s;
+    xfm.config.indexer_compress_ratio = @intCast(ratio);
+    var q4_bytes: [@sizeOf(qwen4_mod.Qwen4State)]u8 align(@alignOf(qwen4_mod.Qwen4State)) = @splat(0);
+    xfm.qwen4 = @ptrCast(&q4_bytes);
+
+    var caches: [2]KVCache = undefined;
+    var fxs: [2]QsaBlockFixture = undefined;
+    var offs: [2]usize = undefined;
+    var ctxs: [2]ForwardCtx = undefined;
+    var qs: [2]mlx.mlx_array = undefined;
+    for (0..2) |i| {
+        caches[i] = try KVCache.init(ta, 1);
+        const k = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kls[i], hd }, s);
+        defer _ = mlx.mlx_array_free(k);
+        const v = try attn256RandBf16(rnd, &[_]c_int{ 1, hkv, kls[i], hd }, s);
+        defer _ = mlx.mlx_array_free(v);
+        var view = try caches[i].update(0, k, v, s, 128);
+        view.deinit();
+        fxs[i] = try QsaBlockFixture.build(rnd, 1, kls[i], kb, ratio);
+        offs[i] = @intCast(kls[i]);
+        ctxs[i] = .{ .cache = &caches[i], .moe_seq_offset = &offs[i], .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
+        ctxs[i].qsa_blocks = fxs[i].blocks;
+        qs[i] = try attn256RandBf16(rnd, &[_]c_int{ 1, hq, 1, hd }, s);
+    }
+    defer for (0..2) |i| {
+        caches[i].deinit();
+        fxs[i].deinit();
+        _ = mlx.mlx_array_free(qs[i]);
+    };
+    var q_n2 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(q_n2);
+    const qvec = mlx.mlx_vector_array_new_data(&qs, 2);
+    defer _ = mlx.mlx_vector_array_free(qvec);
+    try mlx.check(mlx.mlx_concatenate_axis(&q_n2, qvec, 0, s));
+
+    const slots = [_]*ForwardCtx{ &ctxs[0], &ctxs[1] };
+    const plain = (try xfm.qsaBatchedAttn(&ctxs[0], &slots, q_n2, 0, 1, 0.125)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(plain);
+    const pos = [_]i32{ 0, 1, 2 };
+    ctxs[1].mrope_pos = &pos;
+    const with_pos = (try xfm.qsaBatchedAttn(&ctxs[0], &slots, q_n2, 0, 1, 0.125)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(with_pos);
+    try std.testing.expectEqual(@as(f32, 0), try attn256MaxDiff(with_pos, plain, s));
+}
+
+test "qsaBatchedGatherOn matches the arm's switches" {
     const prev_b = qsa_batched_gather_override;
     const prev_g = qsa_gather_override;
     const prev_d = qsa_decode_gather_override;
@@ -57771,39 +57873,37 @@ test "qsaBatchedGatherOn matches the arm's switches and vision refusal" {
     qsa_gather_override = true;
     qsa_decode_gather_override = true;
     qsa_verify_gather_override = true;
-    try std.testing.expect(qsaBatchedGatherOn(1, false));
-    try std.testing.expect(qsaBatchedGatherOn(4, false));
-    try std.testing.expect(!qsaBatchedGatherOn(1, true));
-    try std.testing.expect(!qsaBatchedGatherOn(4, true));
+    try std.testing.expect(qsaBatchedGatherOn(1));
+    try std.testing.expect(qsaBatchedGatherOn(4));
     qsa_batched_gather_override = false;
-    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1));
     qsa_batched_gather_override = true;
     qsa_gather_override = false;
-    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1));
     qsa_gather_override = true;
     qsa_decode_gather_override = false;
-    try std.testing.expect(!qsaBatchedGatherOn(1, false));
-    try std.testing.expect(qsaBatchedGatherOn(4, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1));
+    try std.testing.expect(qsaBatchedGatherOn(4));
     qsa_decode_gather_override = true;
     qsa_verify_gather_override = false;
-    try std.testing.expect(qsaBatchedGatherOn(1, false));
+    try std.testing.expect(qsaBatchedGatherOn(1));
     // The fused verify kernel still takes blocks at verify widths; its switch too turns them off.
-    try std.testing.expect(qsaBatchedGatherOn(4, false));
+    try std.testing.expect(qsaBatchedGatherOn(4));
     {
         const prev_k = qsa_attn_kernel_override;
         defer qsa_attn_kernel_override = prev_k;
         qsa_attn_kernel_override = false;
-        try std.testing.expect(!qsaBatchedGatherOn(4, false));
+        try std.testing.expect(!qsaBatchedGatherOn(4));
     }
     qsa_verify_gather_override = true;
     const prev_st = qwen4_standin_override;
     defer qwen4_standin_override = prev_st;
     qwen4_standin_override = .{ .attn_qsa = true };
-    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1));
     qwen4_standin_override = .{ .attn_sdpa = true };
-    try std.testing.expect(!qsaBatchedGatherOn(1, false));
+    try std.testing.expect(!qsaBatchedGatherOn(1));
     qwen4_standin_override = .{};
-    try std.testing.expect(qsaBatchedGatherOn(1, false));
+    try std.testing.expect(qsaBatchedGatherOn(1));
 }
 
 // ── Verify-width QSA gather (S = 2 .. FUSED256_MIN_Q_LEN-1) ──
