@@ -14883,6 +14883,32 @@ test "mid-system: stock Qwen notes preserve tool rounds without rewriting histor
     }
 }
 
+test "mid-system: real Qwen pack loaded through ChatConfig preserves tool-round prefixes" {
+    const dir = std.c.getenv("QWEN_MID_SYSTEM_MODEL_DIR") orelse return error.SkipZigTest;
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try loadChatConfig(io, a, std.mem.span(dir));
+    defer config.deinit();
+    const tools = "[{\"type\":\"function\",\"function\":{\"name\":\"lookup\",\"parameters\":{\"type\":\"object\"}}}]";
+    const calls = [_]ToolCall{.{ .id = "call_1", .name = "lookup", .arguments = "{}" }};
+    const messages = [_]Message{
+        .{ .role = "system", .content = "stable instructions" },
+        .{ .role = "user", .content = "first question" },
+        .{ .role = "system", .content = "runtime note one" },
+        .{ .role = "assistant", .content = "checking", .reasoning_content = "thought", .tool_calls = &calls },
+        .{ .role = "tool", .content = "result", .tool_call_id = "call_1" },
+        .{ .role = "system", .content = "runtime note two" },
+    };
+    const first = try renderChatTemplate(a, messages[0..3], &config, tools, null, true, "low", false);
+    defer a.free(first);
+    const next = try renderChatTemplate(a, &messages, &config, tools, null, true, "low", false);
+    defer a.free(next);
+    try testing.expect(std.mem.indexOf(u8, first, "first question<|im_end|>\n<|im_start|>system\nruntime note one<|im_end|>") != null);
+    try testing.expect(std.mem.startsWith(u8, next, first));
+    try testing.expect(std.mem.indexOf(u8, next, "</tool_response><|im_end|>\n<|im_start|>system\nruntime note two<|im_end|>") != null);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, next, "<tools>"));
+}
+
 test "mid-system: unknown Qwen revisions consolidate without rewriting the template" {
     const a = testing.allocator;
     const messages = [_]Message{
