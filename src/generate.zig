@@ -22091,3 +22091,70 @@ test "host seams: deepseek_v4 and every in-tree model take no decode handover (u
     }
 }
 
+/// Upstream af34af04's spec chokepoint in `Generator.initWithOptions`, as a pure function of what it read: the
+/// deepseek_v4 module (present, stage count), the request and the init options. Returns {active, stochastic}.
+pub fn upstreamDsv4Chokepoint(has_dsv4: bool, n_mtp: usize, sampling: SamplingParams, options: *Generator.InitOptions) [2]bool {
+    var out = [2]bool{ false, false };
+    if (has_dsv4 and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+        const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
+        // af34af04's `dsparkArmFor`, verbatim.
+        const clean = sampling.repeat_penalty == 1.0 and sampling.presence_penalty == 0.0 and
+            sampling.constraint == null and options.logprobs_n == 0;
+        const arm: Generator.DsparkArm = if (!clean) .off else if (sampling.temperature < 0.01 or sampling.top_k == 1)
+            .greedy
+        else if (Generator.dsparkStochEnabled()) .stochastic else .off;
+        if (n_mtp > 0 and !dspark_env_off and arm != .off) {
+            out = .{ true, arm == .stochastic };
+        }
+        options.pld_enabled = false;
+        options.drafter_enabled = false;
+        options.drafter = null;
+        options.mtp_enabled = false;
+        options.mtp = null;
+        options.dflash_enabled = false;
+        options.dflash = null;
+    }
+    return out;
+}
+
+fn hostSeamRequests() [7]SamplingParams {
+    return .{
+        .{ .temperature = 0.0 },
+        .{ .temperature = 0.7, .top_k = 1 },
+        .{ .temperature = 0.6, .top_p = 0.95 },
+        .{ .temperature = 0.0, .repeat_penalty = 1.1 },
+        .{ .temperature = 0.7, .presence_penalty = 0.5 },
+        .{ .temperature = 0.005, .top_p = 0.5 },
+        .{ .temperature = 1.0, .top_k = 40 },
+    };
+}
+
+test "host seams: upstream's deepseek_v4 DSpark chokepoint arms exactly dsparkArmFor's clean requests on a staged model, and turns every other drafter off" {
+    const dummy_drafter: *DrafterModel = @ptrFromInt(0x10000);
+    const dummy_dflash: *DflashModel = @ptrFromInt(0x20000);
+    const env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
+    for ([_]bool{ false, true }) |has_dsv4| for ([_]usize{ 0, 3 }) |n_mtp| for (hostSeamRequests()) |sp| for ([_]u32{ 0, 3 }) |lp| for (0..16) |flags| {
+        var o: Generator.InitOptions = .{
+            .pld_enabled = flags & 1 != 0,
+            .drafter_enabled = flags & 2 != 0,
+            .mtp_enabled = flags & 4 != 0,
+            .dflash_enabled = flags & 8 != 0,
+            .drafter = if (flags & 2 != 0) dummy_drafter else null,
+            .dflash = if (flags & 8 != 0) dummy_dflash else null,
+            .logprobs_n = lp,
+        };
+        const base = o;
+        const got = upstreamDsv4Chokepoint(has_dsv4, n_mtp, sp, &o);
+        const engaged = has_dsv4 and flags != 0;
+        const arm = Generator.dsparkArmFor(sp, lp, Generator.dsparkStochEnabled());
+        try testing.expectEqual(engaged and n_mtp > 0 and !env_off and arm != .off, got[0]);
+        try testing.expectEqual(got[0] and arm == .stochastic, got[1]);
+        if (engaged) {
+            try testing.expect(!o.pld_enabled and !o.drafter_enabled and !o.mtp_enabled and !o.dflash_enabled);
+            try testing.expect(o.drafter == null and o.dflash == null and o.mtp == null);
+        } else {
+            inline for (.{ "pld_enabled", "drafter_enabled", "mtp_enabled", "dflash_enabled", "drafter", "dflash" }) |f|
+                try testing.expectEqual(@field(base, f), @field(o, f));
+        }
+    };
+}
