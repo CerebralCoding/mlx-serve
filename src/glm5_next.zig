@@ -4,7 +4,7 @@
 //! Numerics follow mlx-vlm's `glm5_next` (the reference this port is held to); the
 //! fused Sinkhorn-collapse kernel is mlx-vlm's `hc_sinkhorn_collapse`.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 pub const HC: c_int = 4;
 const MIX: c_int = (2 + HC) * HC;
@@ -602,7 +602,7 @@ pub fn hcPre(s: mlx.mlx_stream, x: ?mlx.mlx_array, deferred: ?*const Deferred, f
             if (e != error.MlxError or tpg <= 256 or !mlx.takeErrorIf("Thread group size")) return e;
             out.deinit();
             hc_pre_tpg = @divTrunc(tpg, 2);
-            @import("log.zig").info("[glm5] hcPre: {d} threads per threadgroup on this GPU\n", .{hc_pre_tpg});
+            @import("log").info("[glm5] hcPre: {d} threads per threadgroup on this GPU\n", .{hc_pre_tpg});
             continue;
         };
         probed.* = true;
@@ -873,7 +873,7 @@ fn indexerScoresNax(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, p
     try mlx.check(mlx.mlx_vector_array_get(&out, ov, 0));
     if (!indexer_nax_engaged) {
         indexer_nax_engaged = true;
-        @import("log.zig").info("[dsa] NAX indexer scores engaged\n", .{});
+        @import("log").info("[dsa] NAX indexer scores engaged\n", .{});
     }
     return out;
 }
@@ -1946,7 +1946,7 @@ pub fn sparseLatentNax(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: mlx.mlx_
     try mlx.check(mlx.mlx_reshape(&out, o3, &[_]c_int{ 1, h, l, 512 }, 4, s));
     if (!sparse_nax_engaged) {
         sparse_nax_engaged = true;
-        @import("log.zig").info("[dsa] NAX sparse latent attention engaged\n", .{});
+        @import("log").info("[dsa] NAX sparse latent attention engaged\n", .{});
     }
     return out;
 }
@@ -2138,7 +2138,7 @@ pub fn moeDecode(s: mlx.mlx_stream, x: mlx.mlx_array, inds: mlx.mlx_array, score
     });
     if (!moe_decode_engaged) {
         moe_decode_engaged = true;
-        @import("log.zig").info("[moe] glm5 decode kernels engaged: topk={d} inter={d} bits={d}/{d}\n", .{ topk, inter, gate.bits, down.bits });
+        @import("log").info("[moe] glm5 decode kernels engaged: topk={d} inter={d} bits={d}/{d}\n", .{ topk, inter, gate.bits, down.bits });
     }
     return out[0];
 }

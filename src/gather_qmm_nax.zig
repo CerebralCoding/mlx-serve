@@ -1,8 +1,8 @@
 // SPDX-License-Identifier: Apache-2.0
 // Ported from oMLX (jundot/omlx) omlx/patches/m5_gather_qmm_nax.py @ d6b2b92.
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 
 const Plan = struct { sched: enum { seg, db }, bm: c_int, bk: c_int, gx: c_int, pad: c_int };
 /// `mx`: an MXFP4 bank (uint8 e8m0 scales, no biases) instead of affine.

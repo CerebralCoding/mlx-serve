@@ -14,7 +14,7 @@
 //! is read by nothing else: past MAX_ROWS rows (a prompt) it takes `PREFILL`,
 //! MLX's NAX qmm with the tiled addressing.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const steel = @import("mlx_steel_sources");
 
 pub const MAX_ROWS = 128;

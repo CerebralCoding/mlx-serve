@@ -7,8 +7,8 @@
 //! appends to the head's own one-layer latent + indexer cache (mlx-vlm's `glm5_next_mtp`
 //! drafter, which `tests/dump_glm5_next_fixtures.py` records as the oracle).
 const std = @import("std");
-const mlx = @import("mlx.zig");
-const log = @import("log.zig");
+const mlx = @import("mlx");
+const log = @import("log");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const mtp_mod = @import("mtp.zig");

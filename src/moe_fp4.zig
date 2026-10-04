@@ -4,7 +4,7 @@
 //! values of x in registers across them (MLX's `fp_qmv_fast` shape), so x is
 //! read once per row group rather than once per row.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const xfm = @import("transformer.zig");
 
 const ROWS: c_int = 4;
@@ -196,7 +196,7 @@ pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: B
     const y = try apply(kernels[ki].downred.?, &.{ act, down.w, down.s, inds, scores }, &.{ rows, hidden }, dt, .{ 32, @divExact(hidden, ROWS), rows }, &.{ .{ "I", inter }, .{ "H", hidden }, .{ "GS", gs }, .{ "TOPK", topk } }, s);
     if (!engaged) {
         engaged = true;
-        @import("log.zig").info("[moe] fp4 decode kernels engaged: {s} rows={d} topk={d} inter={d} hidden={d}\n", .{ @tagName(mode), rows, topk, inter, hidden });
+        @import("log").info("[moe] fp4 decode kernels engaged: {s} rows={d} topk={d} inter={d} hidden={d}\n", .{ @tagName(mode), rows, topk, inter, hidden });
     }
     return y;
 }

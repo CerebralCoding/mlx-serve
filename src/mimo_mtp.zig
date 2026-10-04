@@ -14,7 +14,7 @@
 //! history ever appended), so only differences reach the rope.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const mtp_mod = @import("mtp.zig");
@@ -333,7 +333,7 @@ pub const Head = struct {
         const key = try std.fmt.bufPrint(&name, "model.mtp.layers.{d}." ++ fmt, .{k});
         const src = weights.get(key) orelse {
             if (!required) return .{ .ctx = null };
-            @import("log.zig").err("[mimo-mtp] missing {s}\n", .{key});
+            @import("log").err("[mimo-mtp] missing {s}\n", .{key});
             return error.MissingWeight;
         };
         var arr = mlx.mlx_array_new();

@@ -12,7 +12,7 @@
 //! `"bits":"16"`) for bit-exact PLE lookups.
 
 const std = @import("std");
-const log = @import("log.zig");
+const log = @import("log");
 const ple_gpu = @import("ple_gpu.zig");
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;

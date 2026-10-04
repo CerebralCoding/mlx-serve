@@ -9,7 +9,7 @@
 //! chunks. A serial step is the one-node window, so a node and the step at its
 //! position see the same tiles in the same order.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const row_attn = @import("row_attn.zig");
 
 pub const MAX_ROWS = row_attn.MAX_ROWS;

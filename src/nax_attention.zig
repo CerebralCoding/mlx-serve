@@ -6,7 +6,7 @@
 //! (bit-identical to one dispatch), so a pass's K/V stays in the on-chip caches;
 //! those passes also split the head dims over simdgroup pairs.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 
 const BK: c_int = 32;
 const THREADS: c_int = 128;
@@ -83,7 +83,7 @@ pub fn attention(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.m
     const out = try dispatch(s, q, k, v, scale, window, sinks, edges, if (edges.len > 2) 2 else 1);
     if (!engaged) {
         engaged = true;
-        @import("log.zig").info("[attn] NAX 192/128 prefill attention engaged (window={d}, passes={d})\n", .{ window, edges.len - 1 });
+        @import("log").info("[attn] NAX 192/128 prefill attention engaged (window={d}, passes={d})\n", .{ window, edges.len - 1 });
     }
     return out;
 }

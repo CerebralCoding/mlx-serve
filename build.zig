@@ -123,7 +123,8 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "macos_engines", true);
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
-    build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
+    build_options.addOption(bool, "slow_tests", slowTests(b));
+    const shared = addShared(b, target, optimize);
 
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
     // named module so src/arch/ds4.zig can import them with `@import("ds4_metal_sources")`
@@ -165,6 +166,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
         },
     });
+    shared.importInto(mod);
 
     // Jinja2 template engine (from llama.cpp's common/jinja + nlohmann/json).
     // Pre-compiled as a static library with system clang++ (C++17 requires system libc++).
@@ -203,8 +205,6 @@ pub fn build(b: *std.Build) void {
     // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained
     // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
     addLlamaLib(b, mod);
-    addGgufModule(b, mod, target, optimize);
-    addExl3Module(b, mod, target, optimize);
 
     // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
     // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
@@ -242,6 +242,19 @@ pub fn build(b: *std.Build) void {
     const run_step = b.step("run", "Run mlx-serve");
     run_step.dependOn(&run_cmd.step);
 
+    // The server graph's semantic check: nothing depends on this artifact's binary, so no code is generated.
+    const check_exe = b.addExecutable(.{ .name = "mlx-serve-check", .root_module = mod });
+    const check_step = b.step("check", "Check that the server graph compiles, without codegen");
+    check_step.dependOn(&check_exe.step);
+    // The Linux graph's semantic check (stub engines): its module without link inputs, nothing emitted, Homebrew's
+    // webp headers in place of the system's; glibc 2.39 (arc4random_buf, as a current distribution's).
+    const linux_check = b.addExecutable(.{
+        .name = "mlx-serve-linux-check",
+        .root_module = linuxModule(b, b.resolveTargetQuery(.{ .cpu_arch = .aarch64, .os_tag = .linux, .abi = .gnu, .glibc_version = .{ .major = 2, .minor = 39, .patch = 0 } }), .Debug, version, "unknown", "/opt/homebrew/include"),
+    });
+    const check_linux = b.step("check-linux", "Check that the Linux server graph (stub engines) compiles, without codegen or a Linux MLX stage");
+    check_linux.dependOn(&linux_check.step);
+
     // Unit tests — reuses the same module config (mlx-c, jinja_cpp, etc.)
     const test_mod = b.createModule(.{
         .root_source_file = b.path("src/tests.zig"),
@@ -259,6 +272,7 @@ pub fn build(b: *std.Build) void {
             .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/opt/homebrew/include/webp/decode.h" }, .{ .cwd_relative = "/opt/homebrew/include" }, target, optimize, "") },
         },
     });
+    shared.importInto(test_mod);
 
     test_mod.addObjectFile(b.path("lib/jinja_cpp/libjinja.a"));
     test_mod.addIncludePath(b.path("lib/jinja_cpp"));
@@ -274,8 +288,6 @@ pub fn build(b: *std.Build) void {
     test_mod.addIncludePath(b.path("lib/ds4"));
     addAneSources(b, test_mod);
     addLlamaLib(b, test_mod);
-    addGgufModule(b, test_mod, target, optimize);
-    addExl3Module(b, test_mod, target, optimize);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -314,6 +326,24 @@ pub fn build(b: *std.Build) void {
     }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+
+    // Only the test root's module runs its `test` decls, so each shared module gets its own artifact.
+    // mlx.zig's tests create arrays (the device): the full suite runs them, the hermetic lanes never do.
+    // mlx-test gets its own module instance: linking MLX into the shared one would link it into the CPU lane.
+    const mlx_test_mod = b.createModule(.{
+        .root_source_file = b.path("src/mlx.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "log", .module = shared.log }},
+    });
+    addMlxLib(b, mlx_test_mod);
+    const shared_tests = [_]*std.Build.Step.Compile{
+        b.addTest(.{ .name = "log-test", .root_module = shared.log }),
+        b.addTest(.{ .name = "io_util-test", .root_module = shared.io_util }),
+        b.addTest(.{ .name = "mlx-test", .root_module = mlx_test_mod }),
+    };
+    for (shared_tests) |t| test_step.dependOn(&b.addRunArtifact(t).step);
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //
@@ -383,7 +413,43 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 
     const version = b.option([]const u8, "version", "Version string") orelse readAppVersion(b) orelse "0.0.0-dev";
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
+    const mod = linuxModule(b, target, optimize, version, mlx_c_version, "/usr/include");
 
+    // Jinja2 template engine — same vendored sources as the macOS graph, built
+    // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
+    mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
+
+    // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
+    addMlxLib(b, mod);
+    // ELF has no @loader_path: the Mach-O rpaths emitted above are inert here,
+    // so the loader never finds libmlxc.so. Mirror them in $ORIGIN form.
+    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/mlx/lib" });
+    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../../lib/mlx/lib" });
+
+    // System libwebp for the vision pipeline (pkg-config resolves -lwebp).
+    mod.linkSystemLibrary("webp", .{});
+
+    // Bonjour/mDNS peer discovery (src/lan.zig) via Avahi's dns_sd compat lib
+    // (Arch: avahi ships /usr/lib/libdns_sd.so; Debian: libavahi-compat-libdnssd-dev).
+    mod.linkSystemLibrary("dns_sd", .{ .use_pkg_config = .no });
+
+    const exe = b.addExecutable(.{
+        .name = "mlx-serve",
+        .root_module = mod,
+    });
+    b.installArtifact(exe);
+
+    const run_cmd = b.addRunArtifact(exe);
+    run_cmd.step.dependOn(b.getInstallStep());
+    run_cmd.addPassthruArgs();
+    const run_step = b.step("run", "Run mlx-serve");
+    run_step.dependOn(&run_cmd.step);
+}
+
+/// The Linux server graph's module: its build options (stub engines), imports, include paths and portable C sources,
+/// without the link inputs (the staged Linux mlx / mlx-c, libjinja-linux.a, libwebp, dns_sd), which `addLinuxServe` adds.
+/// `check-linux` checks this module alone from the macOS host: nothing is emitted, so no Linux MLX stage is needed.
+fn linuxModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, version: []const u8, mlx_c_version: []const u8, webp_include: []const u8) *std.Build.Module {
     const build_options = b.addOptions();
     build_options.addOption([]const u8, "version", version);
     build_options.addOption(bool, "mas", false);
@@ -393,9 +459,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
     build_options.addOption(bool, "macos_engines", false);
-    // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
-    // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
-    build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
+    build_options.addOption(bool, "slow_tests", slowTests(b));
 
     const opencode2_plugin = b.createModule(.{
         .root_source_file = b.path("lib/opencode2_plugin.zig"),
@@ -425,15 +489,12 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
             .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/usr/include/webp/decode.h" }, .{ .cwd_relative = "/usr/include" }, target, optimize, "") },
+            .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = b.fmt("{s}/webp/decode.h", .{webp_include}) }, .{ .cwd_relative = webp_include }, target, optimize, "") },
         },
     });
+    addShared(b, target, optimize).importInto(mod);
 
-    // Jinja2 template engine — same vendored sources as the macOS graph, built
-    // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
-    addGgufModule(b, mod, target, optimize);
-    addExl3Module(b, mod, target, optimize);
-    mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
+    // Jinja2's headers (its ELF static lib, built by scripts/build-mlx-linux.sh, is a link input: addLinuxServe).
     mod.addIncludePath(b.path("lib/jinja_cpp"));
 
     // stb_image (JPEG/PNG decode) + stb_image_write (PNG encode), xatlas
@@ -450,32 +511,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     // ANE offload C ABI → unavailable stubs on Linux (src/ane_stub.c); ane.zig
     // compiles unchanged and gates itself off via available() == false.
     mod.addCSourceFile(.{ .file = b.path("src/ane_stub.c"), .flags = &.{"-O2"} });
-
-    // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
-    addMlxLib(b, mod);
-    // ELF has no @loader_path: the Mach-O rpaths emitted above are inert here,
-    // so the loader never finds libmlxc.so. Mirror them in $ORIGIN form.
-    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../lib/mlx/lib" });
-    mod.addRPath(.{ .cwd_relative = "$ORIGIN/../../../lib/mlx/lib" });
-
-    // System libwebp for the vision pipeline (pkg-config resolves -lwebp).
-    mod.linkSystemLibrary("webp", .{});
-
-    // Bonjour/mDNS peer discovery (src/lan.zig) via Avahi's dns_sd compat lib
-    // (Arch: avahi ships /usr/lib/libdns_sd.so; Debian: libavahi-compat-libdnssd-dev).
-    mod.linkSystemLibrary("dns_sd", .{ .use_pkg_config = .no });
-
-    const exe = b.addExecutable(.{
-        .name = "mlx-serve",
-        .root_module = mod,
-    });
-    b.installArtifact(exe);
-
-    const run_cmd = b.addRunArtifact(exe);
-    run_cmd.step.dependOn(b.getInstallStep());
-    run_cmd.addPassthruArgs();
-    const run_step = b.step("run", "Run mlx-serve");
-    run_step.dependOn(&run_cmd.step);
+    return mod;
 }
 
 /// Linux counterpart of verifyMlxStage: fail loudly when scripts/
@@ -604,8 +640,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
             .{ .name = "build_options", .module = ios_options.createModule() },
         },
     });
-    addGgufModule(b, mod, ios_target, .ReleaseFast);
-    addExl3Module(b, mod, ios_target, .ReleaseFast);
+    addShared(b, ios_target, .ReleaseFast).importInto(mod);
 
     // Apple cross-compiles don't auto-resolve the SDK's libc/frameworks from
     // --sysroot alone, so wire them explicitly (resolved per slice via xcrun).
@@ -657,6 +692,10 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     });
     const step = b.step(slice.step, b.fmt("Build the iOS engine static lib ({s})", .{slice.sdk}));
     step.dependOn(&install.step);
+    // The same graph's semantic check: nothing emitted.
+    const check_lib = b.addLibrary(.{ .name = "mlxserve-check", .root_module = mod, .linkage = .static });
+    const check = b.step(b.fmt("{s}-check", .{slice.step}), b.fmt("Check that the iOS engine graph ({s}) compiles, without codegen", .{slice.sdk}));
+    check.dependOn(&check_lib.step);
 }
 
 /// Translates a single C header into an importable module (`@import("name")`
@@ -751,6 +790,45 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
     module.addIncludePath(b.path("lib/ane"));
 }
 
+/// The modules every graph shares by name: the MLX FFI, logging and the I/O helpers, plus lib/mlx-serve-gguf and
+/// lib/sushi's EXL3 module over them. One instance per graph, so the host and the engine modules see one set of types.
+const Shared = struct {
+    mlx: *std.Build.Module,
+    log: *std.Build.Module,
+    io_util: *std.Build.Module,
+    /// lib/mlx-serve-gguf and lib/sushi's EXL3 module, which reach mlx, log and io_util through `mlx_host`.
+    gguf: *std.Build.Module,
+    exl3: *std.Build.Module,
+
+    fn importInto(s: Shared, m: *std.Build.Module) void {
+        m.addImport("mlx", s.mlx);
+        m.addImport("log", s.log);
+        m.addImport("io_util", s.io_util);
+        m.addImport("mlx_serve_gguf", s.gguf);
+        m.addImport("sushi_exl3", s.exl3);
+    }
+};
+
+fn addShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) Shared {
+    const log = b.createModule(.{ .root_source_file = b.path("src/log.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const io_util = b.createModule(.{ .root_source_file = b.path("src/io_util.zig"), .target = target, .optimize = optimize, .link_libc = true });
+    const mlx = b.createModule(.{
+        .root_source_file = b.path("src/mlx.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "log", .module = log }},
+    });
+    const host = b.createModule(.{
+        .root_source_file = b.path("src/mlx_host.zig"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "mlx", .module = mlx }, .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util } },
+    });
+    return .{ .mlx = mlx, .log = log, .io_util = io_util, .gguf = engineModule(b, ggufRoot(b), host, target, optimize), .exl3 = engineModule(b, exl3Root(b), host, target, optimize) };
+}
+
 fn buildRootHandle(b: *std.Build) std.Io.Dir {
     return b.root.root_dir.handle;
 }
@@ -759,6 +837,14 @@ fn buildRootHandle(b: *std.Build) std.Io.Dir {
 /// `lib/llama/.version`). Read at configure time so a plain `zig build` reports
 /// the real tag without app/build.sh having to pass `--llama-tag`. Returns null
 /// (→ "unknown") when llama hasn't been fetched yet.
+/// `b.option` may be declared once; the macOS graphs and the Linux check share this answer.
+var slow_tests_opt: ?bool = null;
+fn slowTests(b: *std.Build) bool {
+    if (slow_tests_opt) |v| return v;
+    slow_tests_opt = b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false;
+    return slow_tests_opt.?;
+}
+
 fn readLlamaTag(b: *std.Build) ?[]const u8 {
     const bytes = buildRootHandle(b).readFileAlloc(
         b.graph.io,
@@ -770,20 +856,19 @@ fn readLlamaTag(b: *std.Build) ?[]const u8 {
     return if (trimmed.len == 0) null else b.dupe(trimmed);
 }
 
-/// lib/mlx-serve-gguf: GGUF files served on MLX (no llama.cpp). It reaches
-/// MLX through `host.mlx`, so the host root file must expose `pub const mlx`.
-/// `-Dgguf-dir=/abs/path` builds against a checkout instead of the submodule.
-fn addGgufModule(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    const gguf = b.createModule(.{
-        .root_source_file = ggufRoot(b),
+/// An engine module from its own repo (lib/mlx-serve-gguf, lib/sushi): it reaches mlx, log and io_util through
+/// `mlx_host` (src/mlx_host.zig, which exposes all three), so every graph shares one instance of each.
+fn engineModule(b: *std.Build, root: std.Build.LazyPath, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+    return b.createModule(.{
+        .root_source_file = root,
         .target = target,
         .optimize = optimize,
         .link_libc = true,
         .imports = &.{.{ .name = "mlx_host", .module = host }},
     });
-    host.addImport("mlx_serve_gguf", gguf);
 }
 
+/// `-Dgguf-dir=/abs/path` builds against a mlx-serve-gguf checkout instead of the submodule.
 /// `b.option` may be declared once; the graphs share this answer.
 var gguf_root: ?std.Build.LazyPath = null;
 fn ggufRoot(b: *std.Build) std.Build.LazyPath {
@@ -793,20 +878,7 @@ fn ggufRoot(b: *std.Build) std.Build.LazyPath {
     return gguf_root.?;
 }
 
-/// lib/sushi: EXL3 routed experts, Sushi's `sushi_exl3` module. It reaches
-/// mlx, log and io_util through `mlx_host`, so the host root exposes them.
-/// `-Dsushi-dir=/abs/path` builds against a checkout instead of the submodule.
-fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    const exl3 = b.createModule(.{
-        .root_source_file = exl3Root(b),
-        .target = target,
-        .optimize = optimize,
-        .link_libc = true,
-        .imports = &.{.{ .name = "mlx_host", .module = host }},
-    });
-    host.addImport("sushi_exl3", exl3);
-}
-
+/// `-Dsushi-dir=/abs/path` builds against a sushi checkout instead of the submodule.
 var exl3_root: ?std.Build.LazyPath = null;
 fn exl3Root(b: *std.Build) std.Build.LazyPath {
     if (exl3_root) |r| return r;

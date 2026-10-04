@@ -6,8 +6,8 @@
 //! Anything the module can't serve stays with the embedded engines.
 const std = @import("std");
 const gguf = @import("mlx_serve_gguf");
-const log = @import("../log.zig");
-const mlx = @import("../mlx.zig");
+const log = @import("log");
+const mlx = @import("mlx");
 const model_discovery = @import("../model_discovery.zig");
 
 pub const kernels = gguf.kernels;

@@ -3,7 +3,7 @@
 //! NOTICE). The gate `exp(lb * sigmoid(exp(A_log) * (a + dt_bias)))` is evaluated while
 //! staging, so the f32 [T, H, Dk] gate never reaches memory; the f32 state stays in registers.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const status = @import("status.zig");
 
 /// Value rows one threadgroup carries: 8 lanes each, at most two heads.
@@ -137,7 +137,7 @@ pub fn recur(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_a
     const out = try launch(s, q, k, v, a_c, beta_c, alog, dtb, lb, state, plan);
     if (!engaged) {
         engaged = true;
-        @import("log.zig").info("[kda] per-core prefill recurrence engaged ({d} threadgroups x {d} rows)\n", .{ plan.ntg, plan.rows });
+        @import("log").info("[kda] per-core prefill recurrence engaged ({d} threadgroups x {d} rows)\n", .{ plan.ntg, plan.rows });
     }
     return out;
 }
@@ -226,7 +226,7 @@ pub fn decodeStep(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa:
     }
     if (!decode_engaged) {
         decode_engaged = true;
-        @import("log.zig").info("[kda] decode step engaged (T={d}, gate bits {d})\n", .{ t, f_b.bits });
+        @import("log").info("[kda] decode step engaged (T={d}, gate bits {d})\n", .{ t, f_b.bits });
     }
     return out;
 }

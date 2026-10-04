@@ -20,7 +20,7 @@
 //! so the 2-bit codes are expanded to int8 straight into the tensor op's right
 //! operand in registers, as their register-staged form does.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const log = std.log.scoped(.qmm_int8);
 
 pub const MIN_ROWS: c_int = 64;

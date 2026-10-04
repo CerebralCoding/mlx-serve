@@ -17,7 +17,7 @@
 //! (Layr-Labs/mlxfast-bonsai2-27b-engine, MIT). See NOTICE.
 
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const log = std.log.scoped(.qmv_nax2);
 
 /// Rows below this stay on qmv2's ALU kernels, which win at narrow widths.

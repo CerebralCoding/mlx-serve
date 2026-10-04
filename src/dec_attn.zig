@@ -6,7 +6,7 @@
 //! second dispatch merges the splits. MLX's vector kernel re-reads the keys per
 //! query head and declines verify widths (rows x GQA > 32) to its composed path.
 const std = @import("std");
-const mlx = @import("mlx.zig");
+const mlx = @import("mlx");
 const xfm = @import("transformer.zig");
 
 /// Query positions a dispatch takes (an MTP verify window).
@@ -235,7 +235,7 @@ pub fn attention(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.m
     try mlx.check(mlx.mlx_vector_array_get(&out, outs, 0));
     if (!engaged) {
         engaged = true;
-        @import("log.zig").info("[attn] split-K decode attention engaged: rows={d} heads={d}/{d} keys={d} splits={d}\n", .{ rows, hq, hk, n, splits });
+        @import("log").info("[attn] split-K decode attention engaged: rows={d} heads={d}/{d} keys={d} splits={d}\n", .{ rows, hq, hk, n, splits });
     }
     return out;
 }
