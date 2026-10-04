@@ -7098,6 +7098,7 @@ pub fn qsaMaskFromBlocks(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ra
     const bs = mlx.getShape(blocks);
     const batch = bs[0];
     const seq_len = bs[1];
+    if (batch == 1 and seq_len == 1) if (try qsa_row_mask.rowMask(s, blocks, kv, ratio)) |m| return m;
     const nb: c_int = @divTrunc(kv, ratio);
     const nb_i = mlx.mlx_array_new_int(nb);
     defer _ = mlx.mlx_array_free(nb_i);
@@ -7704,6 +7705,7 @@ const ModelConfig = model_mod.ModelConfig;
 const QuantMode = model_mod.QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const hc_decode2 = @import("hc_decode2.zig");
+const qsa_row_mask = @import("qsa_mask.zig");
 const moe_affine4 = @import("moe_affine4.zig");
 const glm5 = @import("glm5_next.zig");
 const glm_mtp = @import("glm_mtp.zig");
@@ -23921,6 +23923,8 @@ pub const Transformer = struct {
                 defer _ = mlx.mlx_array_free(bounds);
                 if (qsaSelectTopBlocks(s, scores, bounds, block_topk) catch null) |picks| {
                     defer _ = mlx.mlx_array_free(picks);
+                    // One row: the sorted picks (INT_MAX where short) go straight to the visibility mask.
+                    if (seq_len == 1) if (try qsa_row_mask.rowMask(s, picks, kv, ratio)) |m| return m;
                     // The kernel pads a short row with INT_MAX; clamping those to 0 is safe because
                     // the `logical_and` with the sheet below clears block 0 when it is not visible.
                     const nb_v = mlx.mlx_array_new_int(nb);
