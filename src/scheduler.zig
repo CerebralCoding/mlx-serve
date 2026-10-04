@@ -33,6 +33,7 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const ple_gpu = @import("ple_gpu.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
@@ -2036,7 +2037,8 @@ pub const Scheduler = struct {
 
             // Estimate post-load bytes (see `gateEstimateBytes` for why a media
             // entry cannot be billed by its directory's size).
-            const estimated: u64 = gateEstimateBytes(media_peak, entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
+            const estimated: u64 = gateEstimateBytes(media_peak, entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size) +
+                pleTableBill(self.io, owned.config.ngram_table_path);
 
             // Reserve this load's estimate BEFORE planning eviction, so a
             // concurrent loader sees the pending allocation in its own gate.
@@ -2049,7 +2051,7 @@ pub const Scheduler = struct {
             // (multi-victim). On failure — every other resident model is pinned
             // by an in-flight request — roll back and surface a 503 instead of
             // loading anyway and crashing.
-            const n = self.registry.planEvictionsLocked(entry.id, &victims_buf) orelse {
+            const n = self.registry.planEvictionsLocked(entry.id, &victims_buf, mlxActiveBytes()) orelse {
                 // Name the numbers. A refusal that logs NOTHING sends the user
                 // hunting for a concurrent request that does not exist: on an
                 // idle server the cause is always the static cap (#126), and
@@ -3282,6 +3284,22 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     if (hot_cache_budget_invalidate) |f| f();
 }
 
+/// Bytes MLX holds right now across every resident model (an allocator counter, safe off the inference thread).
+fn mlxActiveBytes() u64 {
+    var n: usize = 0;
+    _ = mlx.mlx_get_active_memory(&n);
+    return n;
+}
+
+/// The n-gram table is resident, wired, only on the `--ple-gpu` arm, and sits outside the
+/// `.safetensors` sum; the host gather only faults in the rows it reads.
+fn pleTableBill(io: std.Io, table_path: ?[]const u8) u64 {
+    const p = table_path orelse return 0;
+    if (!ple_gpu.enabled) return 0;
+    const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return 0;
+    return @intCast(st.size);
+}
+
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
 /// by the load pre-flight. Returns 0 if the dir can't be read (treated as
 /// "unknown" by the caller, which then skips the check). Symlinked weights
@@ -3305,6 +3323,26 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
         total += @intCast(st.size);
     }
     return total;
+}
+
+test "pleTableBill: the GPU arm bills the n-gram table, the host gather does not" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ngram_table.bin", .data = "0123456789" });
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/ngram_table.bin", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(path);
+
+    const was = ple_gpu.enabled;
+    defer ple_gpu.enabled = was;
+    ple_gpu.enabled = false;
+    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, path));
+    ple_gpu.enabled = true;
+    try std.testing.expectEqual(@as(u64, 10), pleTableBill(io, path));
+    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, null));
 }
 
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
@@ -4666,10 +4704,11 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // ins), else fall back to a rough multiple of layers × hidden. The
     // value drives LRU eviction's "will the new model fit?" gate in Phase
     // D; precise accounting isn't required here.
-    const bytes_resident: u64 = if (entry.bytes_on_disk) |b|
+    const bytes_resident: u64 = (if (entry.bytes_on_disk) |b|
         b
     else
-        @as(u64, params.config.num_hidden_layers) * @as(u64, params.config.hidden_size) * 4 * 4;
+        @as(u64, params.config.num_hidden_layers) * @as(u64, params.config.hidden_size) * 4 * 4) +
+        pleTableBill(sch.io, params.config.ngram_table_path);
 
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bytes_resident);
