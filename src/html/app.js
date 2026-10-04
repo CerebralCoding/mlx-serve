@@ -902,6 +902,7 @@
       VOICE_STATES: VOICE_STATES,
       apiKeyFrom: apiKeyFrom,
       authHeaders: authHeaders,
+      apiPrefix: apiPrefix,
       addTimings: addTimings,
       formatTurnStats: formatTurnStats,
       tokensPerSecond: tokensPerSecond,
@@ -915,6 +916,9 @@
 
   var $ = function (id) { return document.getElementById(id); };
   var API_KEY = apiKeyFrom(location.search);
+  // Every request resolves through the mount the page was served under (`api.js`):
+  // a root-absolute fetch asks the proxy's origin root and reads as an empty server.
+  var API_PREFIX = apiPrefix(location.pathname);
   var MODELS = [];
   var API_ENTRIES = [];
 
@@ -1041,6 +1045,9 @@
         path: path.textContent.trim(),
         desc: source || (desc ? desc.textContent.trim() : ''),
       });
+      // The reference's own links ride the same prefix as the fetches.
+      var link = path.querySelector('a[href^="/"]');
+      if (link) link.href = API_PREFIX + link.getAttribute('href');
     }
   })();
 
@@ -1182,7 +1189,7 @@
 
   async function refreshModels() {
     try {
-      var res = await fetch('/v1/models', { headers: authHeaders(API_KEY) });
+      var res = await fetch(API_PREFIX + '/v1/models', { headers: authHeaders(API_KEY) });
       var payload = await res.json();
       MODELS = Array.isArray(payload.data) ? payload.data : [];
     } catch (e) {
@@ -1206,7 +1213,7 @@
 
   async function refreshMemory() {
     try {
-      var res = await fetch('/props', { headers: authHeaders(API_KEY) });
+      var res = await fetch(API_PREFIX + '/props', { headers: authHeaders(API_KEY) });
       var p = await res.json();
       var mem = p && p.memory ? p.memory.active_bytes : 0;
       $('hdr-mem').textContent = t('%@ resident', [formatBytes(mem)]);
@@ -1557,7 +1564,7 @@
         var form = new FormData();
         plan.fields.forEach(function (f) { form.append(f[0], f[1]); });
         plan.refs.forEach(function (f, i) { form.append('image[]', f, f.name || ('ref' + i + '.png')); });
-        var res = await fetch('/v1/images/edits', {
+        var res = await fetch(API_PREFIX + '/v1/images/edits', {
           method: 'POST', headers: authHeaders(API_KEY), body: form, signal: chatAbort && chatAbort.signal,
         });
         if (!res.ok) throw new Error(await failureText(res));
@@ -1599,7 +1606,7 @@
   /// `progress` / `complete` / `error` event shape (gen_sse.zig).
   async function runGenStream(path, body, onComplete) {
     body.stream = true;
-    var res = await fetch(path, {
+    var res = await fetch(API_PREFIX + path, {
       method: 'POST', headers: jsonHeaders(), body: JSON.stringify(body),
       signal: chatAbort && chatAbort.signal,
     });
@@ -1647,13 +1654,13 @@
   /// half-written syntax.
   async function streamTurn(model, out, sTurns, partial) {
     var startedAt = Date.now();
-    var res = await fetch('/v1/chat/completions', {
+    var res = await fetch(API_PREFIX + '/v1/chat/completions', {
       method: 'POST',
       headers: jsonHeaders(),
       signal: chatAbort.signal,
       body: JSON.stringify(chatBody({
         model: model,
-        system: systemPrompt({ models: MODELS, api: API_ENTRIES, origin: location.origin, tools: chatTools() }),
+        system: systemPrompt({ models: MODELS, api: API_ENTRIES, origin: location.origin + API_PREFIX, tools: chatTools() }),
         turns: sTurns,
         thinking: THINKING,
         tools: chatTools(),
@@ -1984,7 +1991,7 @@
 
   async function fetchSpeech(model, text) {
     try {
-      var r = await fetch('/v1/audio/speech', {
+      var r = await fetch(API_PREFIX + '/v1/audio/speech', {
         method: 'POST',
         headers: authHeaders({ 'content-type': 'application/json' }),
         body: JSON.stringify(speechBody({ model: model, text: text, voice: VOICE_NAME })),

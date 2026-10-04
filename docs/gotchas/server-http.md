@@ -2474,3 +2474,22 @@ counts from the finalized stream; the non-streaming arm takes every field from t
 Fix: `StreamingTokenStream.generationResult` builds the result from everything `finalize`
 snapshotted. Guards: `a streamed turn's result keeps the prompt-cache hit and timings the
 slot measured`, `tests/test_responses_streaming.sh` [F].
+
+## The console showed 0 models behind a proxy that mounts it under a path (#698)
+
+Defect: reached through a reverse proxy that mounts the server below its own root
+(`tailscale serve --set-path /mlx-serve http://127.0.0.1:8003`), the console opened and reported
+"0 models", no memory and a dead Monitor panel — on a server with everything loaded.
+
+Cause: every console request was root-absolute (`fetch('/v1/models')`), so it resolved against the
+PROXY's origin root, not the mount that served the page — the mount answers `/<prefix>/v1/models`
+(it strips the prefix on the way in, so the server never learns it) and 404s `/v1/models`. And
+silently: that 404 body is HTML, `res.json()` throws, the catch assigns `MODELS = []`.
+
+Fix: `apiPrefix(pathname)` — in `src/html/api.js`, the first script of the page's boot slot, so
+`app.js` and `metrics.js` bind the ONE implementation — is that mount: a last segment holding a dot
+is a file, anything else a directory. Every fetch, the API reference's own links and the base URL the
+chat system prompt hands the model resolve through it.
+Guards: `the path prefix the page was served under is the base of every API path`,
+`app.js resolves through the page's one apiPrefix` (identity, not a source scan),
+`tests/metrics_panel_test.mjs`.
