@@ -1383,14 +1383,6 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     }
     const kw_obj: ?std.json.ObjectMap = if (kwargs) |k| (if (k.value == .object) k.value.object else null) else null;
 
-    // Qwen3.8 renders EVERY turn's <think> when `preserve_thinking` is
-    // undefined; round-tripped agent reasoning then swamps the prompt.
-    if (std.mem.indexOf(u8, chat_config.chat_template, "preserve_thinking") != null and
-        (kw_obj == null or kw_obj.?.get("preserve_thinking") == null))
-    {
-        try buf.appendSlice(allocator, ",\"preserve_thinking\":false");
-    }
-
     if (kw_obj) |obj| {
         // Set above from resolved values, or the wrapper's own context.
         const reserved = [_][]const u8{ "bos_token", "eos_token", "enable_thinking", "reasoning_effort", "thinking_mode", "reasoning_strength", "messages", "tools", "add_generation_prompt" };
@@ -13667,9 +13659,8 @@ test "serializeExtraContext: muse maps effort onto reasoning_strength" {
     try testing.expect(std.mem.indexOf(u8, r, "reasoning_strength") == null);
 }
 
-test "serializeExtraContext: preserve_thinking defaults false; chat_template_kwargs fill what the request did not decide" {
-    // Qwen3.8's template keeps EVERY turn's <think> block when the variable is
-    // undefined; the bar is that prior-turn reasoning stays out of the prompt.
+test "serializeExtraContext: preserve_thinking keeps the template's default; chat_template_kwargs fill what the request did not decide" {
+    // Qwen3.8 is trained to reuse prior-turn reasoning; only an explicit kwarg turns it off.
     const allocator = testing.allocator;
     var qwen38 = ChatConfig{
         .chat_template = "…{%- if preserve_thinking is undefined or preserve_thinking is true or loop.index0 > ns.last_query_index %}…",
@@ -13680,17 +13671,16 @@ test "serializeExtraContext: preserve_thinking defaults false; chat_template_kwa
     };
     const r = try serializeExtraContext(allocator, &qwen38, true, null);
     defer allocator.free(r);
-    try testing.expect(std.mem.indexOf(u8, r, "\"preserve_thinking\":false") != null);
-    // The per-model kwargs turn Qwen's trained-for behaviour back on and carry
-    // any other key; a key the request decides (enable_thinking) is not theirs.
-    qwen38.chat_template_kwargs = "{\"preserve_thinking\":true,\"custom\":{\"n\":1},\"enable_thinking\":false}";
-    const on = try serializeExtraContext(allocator, &qwen38, true, null);
-    defer allocator.free(on);
-    try testing.expect(std.mem.indexOf(u8, on, "\"preserve_thinking\":true") != null);
-    try testing.expect(std.mem.indexOf(u8, on, "\"preserve_thinking\":false") == null);
-    try testing.expect(std.mem.indexOf(u8, on, "\"custom\":{\"n\":1}") != null);
-    try testing.expect(std.mem.indexOf(u8, on, "\"enable_thinking\":true") != null);
-    try testing.expect(std.mem.indexOf(u8, on, "\"enable_thinking\":false") == null);
+    try testing.expect(std.mem.indexOf(u8, r, "preserve_thinking") == null);
+    // The per-model kwargs can turn it off and carry any other key; a key the
+    // request decides (enable_thinking) is not theirs.
+    qwen38.chat_template_kwargs = "{\"preserve_thinking\":false,\"custom\":{\"n\":1},\"enable_thinking\":false}";
+    const off = try serializeExtraContext(allocator, &qwen38, true, null);
+    defer allocator.free(off);
+    try testing.expect(std.mem.indexOf(u8, off, "\"preserve_thinking\":false") != null);
+    try testing.expect(std.mem.indexOf(u8, off, "\"custom\":{\"n\":1}") != null);
+    try testing.expect(std.mem.indexOf(u8, off, "\"enable_thinking\":true") != null);
+    try testing.expect(std.mem.indexOf(u8, off, "\"enable_thinking\":false") == null);
 
     // A kwarg can never replace the conversation the wrapper puts in context.
     qwen38.chat_template_kwargs = "{\"messages\":[],\"tools\":[],\"add_generation_prompt\":false}";
