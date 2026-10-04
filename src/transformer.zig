@@ -14562,6 +14562,9 @@ pub const MoeMlpWeights = struct {
     shared_down_w: mlx.mlx_array,
     shared_down_s: mlx.mlx_array,
     shared_down_b: mlx.mlx_array,
+    // The dense shared-expert gate as one contiguous [hidden] vector (null-ctx otherwise): the softmax
+    // router kernel dots it with x.
+    shared_gate_vec: mlx.mlx_array = .{ .ctx = null },
     // Shared expert gating (Qwen3.5; null for Gemma 4)
     shared_expert_gate_w: ?mlx.mlx_array = null,
     shared_expert_gate_s: ?mlx.mlx_array = null,
@@ -18060,7 +18063,8 @@ pub const Transformer = struct {
 
     /// Result type for the MoE routing helpers. Both fields are owned arrays —
     /// caller is responsible for freeing them.
-    const MoeRouting = struct { inds: mlx.mlx_array, norm_scores: mlx.mlx_array };
+    /// `gate_logit` rides along when the router kernel also computed the shared-expert gate's logit.
+    const MoeRouting = struct { inds: mlx.mlx_array, norm_scores: mlx.mlx_array, gate_logit: mlx.mlx_array = .{ .ctx = null } };
 
     /// Pure subgraph for MoE routing. Inputs:
     ///   [0] router_logits — shape [..., num_experts]
@@ -18156,6 +18160,7 @@ pub const Transformer = struct {
             .bfloat16,
             0,
             0,
+            null,
         )) |fused| return fused;
         if (self.compiled_hy3_routing) |compiled| {
             const in_arr = [_]mlx.mlx_array{ router_logits, expert_bias };
@@ -18185,7 +18190,7 @@ pub const Transformer = struct {
 
     /// Apply the compiled MoE routing closure if available, else fall back.
     /// Returns owned `inds` + `norm_scores` — caller must free both.
-    fn computeMoeRouting(self: *const Transformer, router_logits: mlx.mlx_array) !MoeRouting {
+    fn computeMoeRouting(self: *const Transformer, router_logits: mlx.mlx_array, gate: ?RouterGate) !MoeRouting {
         const k: c_int = @intCast(self.config.num_experts_per_tok);
         if (try moeRouterTopK(
             self.s,
@@ -18198,6 +18203,7 @@ pub const Transformer = struct {
             mlx.mlx_array_dtype(router_logits),
             0,
             0,
+            gate,
         )) |fused| return fused;
         if (self.compiled_moe_routing) |compiled| {
             const in_arr = [_]mlx.mlx_array{router_logits};
@@ -31943,13 +31949,15 @@ pub const Transformer = struct {
         return result;
     }
 
-    fn moeAddGatedShared(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+    /// `gate_logit`: the shared-expert gate's logit when the router kernel already computed it.
+    fn moeAddGatedShared(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, gate_logit: ?mlx.mlx_array) !mlx.mlx_array {
         const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
         defer _ = mlx.mlx_array_free(down);
-        return self.moeAddSharedDown(expert_sum, expert_x, down, mw);
+        return self.moeAddSharedDown(expert_sum, expert_x, down, mw, gate_logit);
     }
 
-    fn moeAddSharedDown(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, down: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+    fn moeAddSharedDown(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, down: mlx.mlx_array, mw: *const MoeMlpWeights, gate_logit_in: ?mlx.mlx_array) !mlx.mlx_array {
+        if (gate_logit_in) |logit| return self.moeSharedGateTail(expert_sum, logit, down);
         const seg_w = mw.shared_expert_gate_w.?;
         const seg_qp = self.quantParamsHinted(seg_w, mw.shared_expert_gate_s.?, lastDim(expert_x));
         const gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, seg_qp.mode, self.s);
@@ -32080,8 +32088,8 @@ pub const Transformer = struct {
                 var down_row = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(down_row);
                 try mlx.check(mlx.mlx_slice(&down_row, down, &.{ 0, start, 0 }, 3, &.{ 1, start + seq, hidden }, 3, &.{ 1, 1, 1 }, 3, self.s));
-                break :blk try self.moeAddSharedDown(expert_row, input, down_row, mw);
-            } else try self.moeAddGatedShared(expert_row, input, mw);
+                break :blk try self.moeAddSharedDown(expert_row, input, down_row, mw, null);
+            } else try self.moeAddGatedShared(expert_row, input, mw, null);
             built += 1;
             start += seq;
         }
@@ -32489,10 +32497,23 @@ pub const Transformer = struct {
 
         // Top-K + softmax/renormalize as a single fused kernel (when compiled).
         // Hy3 (expert_bias bound): sigmoid+bias selection instead of softmax.
+        // At one decode row the shared-expert gate's logit rides the softmax router kernel (RouterMode.softmax_gate).
+        const gate_fold: ?RouterGate = blk: {
+            if (mw.expert_bias != null or router_override != null or skip_shared or mw.shared_ungated or mw.shared_gate_vec.ctx == null) break :blk null;
+            if (qwen4Standin().moe_shared or qwen4Standin().moe_router) break :blk null;
+            const lsh = mlx.getShape(router_logits);
+            var rows: usize = 1;
+            for (lsh[0 .. lsh.len - 1]) |d| rows *= @intCast(d);
+            if (rows != 1 or mlx.mlx_array_size(expert_x) != mlx.mlx_array_size(mw.shared_gate_vec)) break :blk null;
+            break :blk .{ .x = expert_x, .w = mw.shared_gate_vec };
+        };
         const routed = if (mw.expert_bias) |bias|
             try self.computeHy3Routing(router_logits, bias)
         else
-            try self.computeMoeRouting(router_logits);
+            try self.computeMoeRouting(router_logits, gate_fold);
+        defer if (routed.gate_logit.ctx != null) {
+            _ = mlx.mlx_array_free(routed.gate_logit);
+        };
         var inds = routed.inds;
         defer _ = mlx.mlx_array_free(inds);
         var norm_scores = routed.norm_scores;
@@ -32567,7 +32588,7 @@ pub const Transformer = struct {
             const y = try sushi_exl3.moe(self.s, expert_x, bank, inds, norm_scores, dec, skip_shared and router_override != null);
             if (skip_shared or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
             defer _ = mlx.mlx_array_free(y);
-            return self.moeAddGatedShared(y, expert_x, mw);
+            return self.moeAddGatedShared(y, expert_x, mw, null);
         }
 
         // Expert computation. Two paths:
@@ -32988,7 +33009,7 @@ pub const Transformer = struct {
         // Gemma 4: shared expert is handled separately in forwardMoe, just return expert_sum
         if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return expert_sum;
         defer _ = mlx.mlx_array_free(expert_sum);
-        return self.moeAddGatedShared(expert_sum, expert_x, mw);
+        return self.moeAddGatedShared(expert_sum, expert_x, mw, if (routed.gate_logit.ctx != null) routed.gate_logit else null);
     }
 
     // ── Mask helpers ──
@@ -34568,6 +34589,15 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
                 if (mw.shared_expert_gate_w) |*seg_w_ptr| {
                     try maybeTransposeForBf16(seg_w_ptr, mw.shared_expert_gate_s.?, &owned_bf16, allocator, s);
+                    if (mw.shared_expert_gate_s.?.ctx == null and mlx.mlx_array_size(seg_w_ptr.*) == config.hidden_size) {
+                        var flat = mlx.mlx_array_new();
+                        defer _ = mlx.mlx_array_free(flat);
+                        try mlx.check(mlx.mlx_reshape(&flat, seg_w_ptr.*, &[_]c_int{@intCast(config.hidden_size)}, 1, s));
+                        var vec = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_contiguous(&vec, flat, false, s));
+                        try owned_bf16.append(allocator, vec);
+                        mw.shared_gate_vec = vec;
+                    }
                 }
                 const Bk = moe_affine4.Bank;
                 mw.bank_views = try moe_affine4.bindViews(Bk{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b }, Bk{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b }, Bk{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b }, &owned_bf16, allocator, s);
@@ -36015,6 +36045,7 @@ pub fn groupLimitedRouting(
         .float32,
         n_group,
         topk_group,
+        null,
     )) |fused| return fused;
 
     // Router runs in fp32 (`router_dtype: "fp32"`).
@@ -36205,7 +36236,10 @@ fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: 
 /// before selection. The composed chain is ~28 dispatches per MoE layer x 41 layers,
 /// and a dispatch prices at 1.76 us on this arch (MLX_SERVE_DISPATCH_PROBE
 /// slope over 1000 injected ops), so that chain alone is ~2 ms of a 19 ms token.
-const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2 };
+/// `softmax_gate` is `softmax` plus the shared-expert gate's logit, a dot of one x row with a flat
+/// weight vector, which the 7 simdgroups that sit out the selection compute while it runs (the
+/// matmul it replaces is two dependent launches ahead of the router).
+const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2, softmax_gate = 3 };
 
 /// Largest expert count the kernel will stage in threadgroup memory. The
 /// sigmoid arm keeps two f32 planes (key + raw weight), so 2048 experts is
@@ -36215,6 +36249,7 @@ const ROUTER_MAX_EXPERTS: c_int = 2048;
 fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
     const sigmoid = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped;
     const grouped = mode == .sigmoid_bias_grouped;
+    const gate = mode == .softmax_gate;
     return std.fmt.comptimePrint(
         \\uint row = thread_position_in_grid.y;
         \\uint tid = thread_position_in_threadgroup.x;
@@ -36223,13 +36258,13 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
         \\threadgroup float rk[NE];
         \\{s}
         \\threadgroup uint sel[NK];
-        \\
+        \\{s}
         \\size_t rbase = (size_t)row * (size_t)NE;
         \\for (uint e = tid; e < NE; e += TG) {{
         \\{s}
         \\}}
         \\threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\
+        \\{s}
         \\// Selection runs on simdgroup 0 only: K rounds of "max, then mask".
         \\// simd_min over the candidate indices makes the tie-break the LOWEST
         \\// expert id, so the pick is a pure function of the keys.
@@ -36276,11 +36311,16 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
         \\    scores[(size_t)row * (size_t)NK + lane] = TOUT(w);
         \\  }}
         \\}}
+        \\{s}
     , .{
         if (grouped)
             "threadgroup float rw[NE];\nthreadgroup float gs[NG];"
         else if (sigmoid)
             "threadgroup float rw[NE];"
+        else
+            "",
+        if (gate)
+            \\threadgroup float gp[TG / 32];
         else
             "",
         if (sigmoid)
@@ -36304,6 +36344,17 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
         else
             \\  rk[e] = float(logits[rbase + e]);
         ,
+        if (gate)
+            // Simdgroups 1.. take the shared-expert gate's dot while simdgroup 0 selects; their partials
+            // meet after the selection, so the dot never waits on it nor the selection on the dot.
+            \\if (tid >= 32) {
+            \\  float ga = 0.0f;
+            \\  for (uint k = tid - 32; k < uint(GK); k += TG - 32) ga += float(gx[(size_t)row * (size_t)GK + k]) * float(gw[k]);
+            \\  ga = simd_sum(ga);
+            \\  if (lane == 0) gp[tid / 32] = ga;
+            \\}
+        else
+            "",
         if (grouped)
             // The group limit (`group_limited_topk` shape). One lane
             // per group scores it by the SUM OF ITS TOP TWO biased experts, then
@@ -36408,26 +36459,39 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             // before the divide, exactly as mlx_sum_axis + mlx_divide do.
             \\  w = w / float(TOUT(tot));
         ,
+        if (gate)
+            \\threadgroup_barrier(mem_flags::mem_threadgroup);
+            \\if (tid == 0) {
+            \\  float gt = 0.0f;
+            \\  for (uint g = 1; g < TG / 32; ++g) gt += gp[g];
+            \\  glogit[row] = TOUT(gt);
+            \\}
+        else
+            "",
     });
 }
 
-const ROUTER_SOURCES = [3][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped) };
-const ROUTER_NAMES = [3][*:0]const u8{ "mlxserve_moe_router_softmax", "mlxserve_moe_router_sigmoid", "mlxserve_moe_router_sigmoid_grouped" };
-var router_kernels: [3]?mlx.mlx_fast_metal_kernel = @splat(null);
+const ROUTER_SOURCES = [4][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped), moeRouterSource(.softmax_gate) };
+const ROUTER_NAMES = [4][*:0]const u8{ "mlxserve_moe_router_softmax", "mlxserve_moe_router_sigmoid", "mlxserve_moe_router_sigmoid_grouped", "mlxserve_moe_router_softmax_gate" };
+var router_kernels: [4]?mlx.mlx_fast_metal_kernel = @splat(null);
 
 fn getMoeRouterKernel(mode: RouterMode) !mlx.mlx_fast_metal_kernel {
     const mi: usize = @backingInt(mode);
     if (router_kernels[mi]) |k| return k;
     const softmax_inputs = [_][*:0]const u8{"logits"};
+    const gate_inputs = [_][*:0]const u8{ "logits", "gx", "gw" };
     const sigmoid_inputs = [_][*:0]const u8{ "logits", "bias", "scale" };
     const input_names: []const [*:0]const u8 = switch (mode) {
         .softmax => &softmax_inputs,
+        .softmax_gate => &gate_inputs,
         .sigmoid_bias, .sigmoid_bias_grouped => &sigmoid_inputs,
     };
-    const output_names = [_][*:0]const u8{ "inds", "scores" };
+    const plain_outputs = [_][*:0]const u8{ "inds", "scores" };
+    const gate_outputs = [_][*:0]const u8{ "inds", "scores", "glogit" };
+    const output_names: []const [*:0]const u8 = if (mode == .softmax_gate) &gate_outputs else &plain_outputs;
     const in_vec = mlx.mlx_vector_string_new_data(input_names.ptr, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
-    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    const out_vec = mlx.mlx_vector_string_new_data(output_names.ptr, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const kernel = mlx.mlx_fast_metal_kernel_new(
         ROUTER_NAMES[mi],
@@ -36480,13 +36544,14 @@ const RouterCfgKey = struct {
     scale: f32,
     n_group: c_int = 0,
     topk_group: c_int = 0,
+    gate_k: c_int = 0,
 };
 const RouterCfgSlot = struct {
     cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null },
     key: RouterCfgKey = std.mem.zeroes(RouterCfgKey),
     scale_arr: mlx.mlx_array = .{ .ctx = null },
 };
-var router_cfg_cache: [3]RouterCfgSlot = .{ .{}, .{}, .{} };
+var router_cfg_cache: [4]RouterCfgSlot = .{ .{}, .{}, .{}, .{} };
 
 pub var moe_router_fused_override: ?bool = null;
 var moe_router_fused_env: ?bool = null;
@@ -36504,19 +36569,25 @@ fn moeRouterFusedEnabled() bool {
 /// One-kernel replacement for `moeRoutingChain` / `hy3RoutingChain`.
 /// Returns null when the geometry or dtype is outside the supported set, so
 /// every caller keeps its chain fallback.
+/// The shared-expert gate's logit, folded into the softmax router: `x` [rows * gate_k] and the flat
+/// weight vector `w` [gate_k], one logit per row.
+pub const RouterGate = struct { x: mlx.mlx_array, w: mlx.mlx_array };
+
 fn moeRouterTopK(
     s: mlx.mlx_stream,
     logits: mlx.mlx_array,
     bias: mlx.mlx_array,
     k: c_int,
-    mode: RouterMode,
+    mode_in: RouterMode,
     route_norm: bool,
     route_scale: f32,
     out_dtype: mlx.mlx_dtype,
     n_group: c_int,
     topk_group: c_int,
+    gate: ?RouterGate,
 ) !?Transformer.MoeRouting {
     if (!moeRouterFusedEnabled()) return null;
+    const mode: RouterMode = if (gate != null and mode_in == .softmax) .softmax_gate else mode_in;
     const sigmoid_mode = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped;
     const lsh = mlx.getShape(logits);
     if (lsh.len < 1 or lsh.len > 4) return null;
@@ -36539,6 +36610,17 @@ fn moeRouterTopK(
     var rows: c_int = 1;
     for (lsh[0 .. lsh.len - 1]) |d| rows *= d;
     if (rows < 1) return null;
+    // The gate logit: one flat weight vector, x holding one row of it per router row, in a threadgroup
+    // that has a simdgroup to spare for every 32 threads.
+    var gate_k: c_int = 0;
+    if (gate) |gt| {
+        const wn = mlx.mlx_array_size(gt.w);
+        if (wn == 0 or wn > 65536 or mlx.mlx_array_size(gt.x) != @as(usize, @intCast(rows)) * wn) return null;
+        const xd = mlx.mlx_array_dtype(gt.x);
+        const wd = mlx.mlx_array_dtype(gt.w);
+        if ((xd != .bfloat16 and xd != .float16) or (wd != .bfloat16 and wd != .float16)) return null;
+        gate_k = @intCast(wn);
+    }
 
     const tg = moeRouterThreadGroup(num_experts);
 
@@ -36555,6 +36637,7 @@ fn moeRouterTopK(
         .scale = route_scale,
         .n_group = n_group,
         .topk_group = topk_group,
+        .gate_k = gate_k,
     };
     const slot = &router_cfg_cache[@backingInt(mode)];
     if (slot.cfg.ctx == null or !std.meta.eql(slot.key, key)) {
@@ -36567,6 +36650,11 @@ fn moeRouterTopK(
         out_shape[lsh.len - 1] = k;
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, lsh.len, .uint32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, lsh.len, out_dtype));
+        if (mode == .softmax_gate) {
+            // One logit per router row.
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{rows}, 1, out_dtype));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GK", gate_k));
+        }
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, tg, rows, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "TOUT", out_dtype));
@@ -36584,9 +36672,11 @@ fn moeRouterTopK(
     const config = slot.cfg;
 
     const softmax_inputs = [_]mlx.mlx_array{logits};
+    const gate_inputs = [_]mlx.mlx_array{ logits, if (gate) |gt| gt.x else logits, if (gate) |gt| gt.w else logits };
     const sigmoid_inputs = [_]mlx.mlx_array{ logits, bias, slot.scale_arr };
     const inputs_arr: []const mlx.mlx_array = switch (mode) {
         .softmax => &softmax_inputs,
+        .softmax_gate => &gate_inputs,
         .sigmoid_bias, .sigmoid_bias_grouped => &sigmoid_inputs,
     };
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs_arr.ptr, inputs_arr.len);
@@ -36596,7 +36686,7 @@ fn moeRouterTopK(
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
+    if (mlx.mlx_vector_array_size(outputs_vec) != (if (mode == .softmax_gate) @as(usize, 3) else 2)) return error.MetalKernelBadOutputCount;
 
     var inds = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(inds);
@@ -36604,12 +36694,17 @@ fn moeRouterTopK(
     var scores = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(scores);
     try mlx.check(mlx.mlx_vector_array_get(&scores, outputs_vec, 1));
+    var gate_logit = mlx.mlx_array{ .ctx = null };
+    if (mode == .softmax_gate) {
+        gate_logit = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&gate_logit, outputs_vec, 2));
+    }
 
     if (!moe_router_engaged) {
         moe_router_engaged = true;
         log.info("[moe] fused router kernel engaged: mode={s} E={d} K={d} tg={d}\n", .{ @tagName(mode), num_experts, k, tg });
     }
-    return .{ .inds = inds, .norm_scores = scores };
+    return .{ .inds = inds, .norm_scores = scores, .gate_logit = gate_logit };
 }
 
 // ── Decode sub-block profiler (MLX_SERVE_DECODE_PROFILE=1) ──
@@ -48933,7 +49028,7 @@ test "fused MoE router reproduces the softmax routing chain's top-K and beats it
     defer allocator.free(host);
     try testReadF32(lbf, host, s);
 
-    const fused = (try moeRouterTopK(s, lbf, .{ .ctx = null }, K, .softmax, true, 1.0, .bfloat16, 0, 0)) orelse
+    const fused = (try moeRouterTopK(s, lbf, .{ .ctx = null }, K, .softmax, true, 1.0, .bfloat16, 0, 0, null)) orelse
         return error.FusedRouterDeclined;
     defer _ = mlx.mlx_array_free(fused.inds);
     defer _ = mlx.mlx_array_free(fused.norm_scores);
@@ -49004,6 +49099,76 @@ test "fused MoE router reproduces the softmax routing chain's top-K and beats it
     try testing.expect(fused_err <= chain_err);
 }
 
+test "fused softmax router folds the shared-expert gate's logit: routing unchanged, the logit within a bf16 ulp of the f64 dot" {
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6A7E10);
+    const rnd = prng.random();
+    moe_router_fused_override = true;
+    defer moe_router_fused_override = null;
+
+    const rows: c_int = 3;
+    const E: c_int = 512;
+    const K: c_int = 10;
+    const GK: c_int = 2560;
+    const randBf = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, shape: []const c_int, scale: f32) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(f32, n);
+            defer a.free(buf);
+            for (buf) |*v| v.* = (r.float(f32) - 0.5) * scale;
+            const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(a32);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st));
+            return out;
+        }
+    }.f;
+    const logits = try randBf(allocator, rnd, s, &.{ rows, E }, 8.0);
+    defer _ = mlx.mlx_array_free(logits);
+    const x = try randBf(allocator, rnd, s, &.{ rows, GK }, 4.0);
+    defer _ = mlx.mlx_array_free(x);
+    const w = try randBf(allocator, rnd, s, &.{GK}, 0.4);
+    defer _ = mlx.mlx_array_free(w);
+
+    const plain = (try moeRouterTopK(s, logits, .{ .ctx = null }, K, .softmax, true, 1.0, .bfloat16, 0, 0, null)) orelse return error.FusedRouterDeclined;
+    defer _ = mlx.mlx_array_free(plain.inds);
+    defer _ = mlx.mlx_array_free(plain.norm_scores);
+    const gated = (try moeRouterTopK(s, logits, .{ .ctx = null }, K, .softmax, true, 1.0, .bfloat16, 0, 0, .{ .x = x, .w = w })) orelse return error.FusedRouterDeclined;
+    defer _ = mlx.mlx_array_free(gated.inds);
+    defer _ = mlx.mlx_array_free(gated.norm_scores);
+    defer _ = mlx.mlx_array_free(gated.gate_logit);
+    try testing.expect(gated.gate_logit.ctx != null);
+
+    const kn: usize = @intCast(rows * K);
+    inline for (.{ "inds", "norm_scores" }) |name| {
+        const a = try allocator.alloc(f32, kn);
+        defer allocator.free(a);
+        const b = try allocator.alloc(f32, kn);
+        defer allocator.free(b);
+        try testReadF32(@field(plain, name), a, s);
+        try testReadF32(@field(gated, name), b, s);
+        try testing.expectEqualSlices(f32, a, b);
+    }
+
+    const xn: usize = @intCast(rows * GK);
+    const xh = try allocator.alloc(f32, xn);
+    defer allocator.free(xh);
+    const wh = try allocator.alloc(f32, @intCast(GK));
+    defer allocator.free(wh);
+    const got = try allocator.alloc(f32, @intCast(rows));
+    defer allocator.free(got);
+    try testReadF32(x, xh, s);
+    try testReadF32(w, wh, s);
+    try testReadF32(gated.gate_logit, got, s);
+    for (0..@intCast(rows)) |r| {
+        var want: f64 = 0;
+        for (wh, 0..) |wv, k| want += @as(f64, wv) * xh[r * @as(usize, @intCast(GK)) + k];
+        try testing.expect(@abs(@as(f64, got[r]) - want) <= 0.004 * @abs(want) + 1e-3);
+    }
+}
+
 test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512/8/4/8 geometry" {
     // Bit equality with the composed chain is the bar, not "close enough": the
     // first live A/B of the plain fused router computed a cleaner softmax and
@@ -49046,7 +49211,7 @@ test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512
     const bias = mlx.mlx_array_new_data(bbuf.ptr, &bsh, 1, .float32);
     defer _ = mlx.mlx_array_free(bias);
 
-    const fused = (try moeRouterTopK(s, l32, bias, K, .sigmoid_bias_grouped, true, ROUTE_SCALE, .float32, NG, TOPKG)) orelse
+    const fused = (try moeRouterTopK(s, l32, bias, K, .sigmoid_bias_grouped, true, ROUTE_SCALE, .float32, NG, TOPKG, null)) orelse
         return error.FusedRouterDeclined;
     defer _ = mlx.mlx_array_free(fused.inds);
     defer _ = mlx.mlx_array_free(fused.norm_scores);
@@ -49171,7 +49336,7 @@ test "fused MoE router reproduces the hy3 sigmoid+bias routing chain" {
     defer allocator.free(host);
     try testReadF32(lbf, host, s);
 
-    const fused = (try moeRouterTopK(s, lbf, bias, K, .sigmoid_bias, true, ROUTE_SCALE, .bfloat16, 0, 0)) orelse
+    const fused = (try moeRouterTopK(s, lbf, bias, K, .sigmoid_bias, true, ROUTE_SCALE, .bfloat16, 0, 0, null)) orelse
         return error.FusedRouterDeclined;
     defer _ = mlx.mlx_array_free(fused.inds);
     defer _ = mlx.mlx_array_free(fused.norm_scores);
