@@ -32340,8 +32340,9 @@ pub const Transformer = struct {
     }
 
     /// Affine-4 banks at ONE decode token: `moe_affine4`'s two dispatches over the token's
-    /// experts. Writes the weighted sum [1,1,D] into `out`; false when the kernels decline.
-    fn moeAffine4Decode(self: *Transformer, out: *mlx.mlx_array, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, mw: *const MoeMlpWeights, group_size: u32) !bool {
+    /// experts. Writes the weighted sum [1,1,D] into `out` (with the gated shared expert added when
+    /// `shared` is given); false when the kernels decline.
+    fn moeAffine4Decode(self: *Transformer, out: *mlx.mlx_array, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, mw: *const MoeMlpWeights, group_size: u32, shared: ?moe_affine4.Shared) !bool {
         const xs = mlx.getShape(expert_x);
         const ks = mlx.getShape(inds);
         const k = ks[ks.len - 1];
@@ -32359,7 +32360,7 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_reshape(&sc1, norm_scores, &.{k}, 1, self.s));
         const sigtab = try swigluSigTable(self.s, mlx.mlx_array_dtype(expert_x), std.heap.c_allocator);
         const Bank = moe_affine4.Bank;
-        const y = (try moe_affine4.decode(self.s, x1, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b }, mw.bank_views, ind_u, sc1, sigtab, group_size)) orelse return false;
+        const y = (try moe_affine4.decode(self.s, x1, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b }, mw.bank_views, shared, ind_u, sc1, sigtab, group_size)) orelse return false;
         defer _ = mlx.mlx_array_free(y);
         try mlx.check(mlx.mlx_reshape(out, y, &.{ xs[0], xs[1], xs[2] }, 3, self.s));
         return true;
@@ -32514,6 +32515,12 @@ pub const Transformer = struct {
         defer if (routed.gate_logit.ctx != null) {
             _ = mlx.mlx_array_free(routed.gate_logit);
         };
+        // With the gate's logit in hand the shared expert's down output is built up front: the affine-4
+        // down kernel adds it in its epilogue, and the tail below uses it when another arm served the routed part.
+        const shared_down: ?mlx.mlx_array = if (routed.gate_logit.ctx != null) (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})) else null;
+        defer if (shared_down) |sd| {
+            _ = mlx.mlx_array_free(sd);
+        };
         var inds = routed.inds;
         defer _ = mlx.mlx_array_free(inds);
         var norm_scores = routed.norm_scores;
@@ -32639,6 +32646,8 @@ pub const Transformer = struct {
         // sum [B,S,hidden] (fused down+reduce kernel) — the multiply+sum
         // below must then be skipped, not repeated.
         var moe_reduced = false;
+        // True when the affine-4 down kernel already added the gated shared expert.
+        var shared_fused = false;
         var cost_arm: u8 = 4;
 
         if (moeFp4DecodeEligible(B * S, has_expert_bias, swigluClampLimit(&self.config), gate_qp.mode, up_qp.mode, down_qp.mode) and
@@ -32649,9 +32658,10 @@ pub const Transformer = struct {
         } else if (B * S == 1 and !has_expert_bias and (swigluClampLimit(&self.config) orelse 1) == 0 and cfg.hidden_act == .silu and
             gate_qp.mode == .affine and up_qp.mode == .affine and down_qp.mode == .affine and
             gate_qp.bits == 4 and up_qp.bits == 4 and down_qp.bits == 4 and gate_qp.group_size == up_qp.group_size and gate_qp.group_size == down_qp.group_size and
-            try self.moeAffine4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size))
+            try self.moeAffine4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size, if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null))
         {
             moe_reduced = true;
+            shared_fused = shared_down != null;
             cost_arm = 1;
         } else if (moeDecodeDispatchArm(B, S, K, has_expert_bias) == .rows and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
@@ -32981,7 +32991,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_sum_axis(&expert_sum, weighted, -2, false, self.s)); // [B, S, hidden]
         }
 
-        if (skip_shared) return expert_sum;
+        if (skip_shared or shared_fused) return expert_sum;
 
         // Hy3: shared expert ALWAYS added, no gate (reference MoE.__call__:
         // `y = y + self.shared_mlp(x)`). shared_gate_w carries a real handle
@@ -33009,7 +33019,8 @@ pub const Transformer = struct {
         // Gemma 4: shared expert is handled separately in forwardMoe, just return expert_sum
         if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return expert_sum;
         defer _ = mlx.mlx_array_free(expert_sum);
-        return self.moeAddGatedShared(expert_sum, expert_x, mw, if (routed.gate_logit.ctx != null) routed.gate_logit else null);
+        if (shared_down) |sd| return self.moeSharedGateTail(expert_sum, routed.gate_logit, sd);
+        return self.moeAddGatedShared(expert_sum, expert_x, mw, null);
     }
 
     // ── Mask helpers ──
