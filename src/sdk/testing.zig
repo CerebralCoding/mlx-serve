@@ -1,15 +1,16 @@
 //! Conformance (docs/plugins.md): the checks a plugin's kinds run against the SDK's contracts, and the
 //! fakes the host's own tests drive. Every check declares its lane:
 //! - `cpu`: `zig build conformance` with no device; the lane fails if a Metal device was created.
-//! - `gpu_small`: fixture shapes on an author's Mac.
+//! - `gpu_small`: fixture shapes on a Mac with a GPU.
 //! - `window`: a plugin's own full-size checks, never in the suite.
 
 const std = @import("std");
 const builtin = @import("builtin");
+const mlx = @import("mlx");
 const peek = @import("peek.zig");
 const arch = @import("arch.zig");
-
-pub const Lane = enum { cpu, gpu_small, window };
+const bill = @import("memory_bill.zig");
+const bill_mod = bill;
 
 // ── The CPU lane's device check ──
 
@@ -66,20 +67,56 @@ pub fn expectClaims(claims: *const fn (*const peek.ConfigPeek) ?peek.Priority, c
     }
 }
 
+// ── Bills, fills and admission (cpu) ──
+
+/// G4: an arch's itemized bill (`A.bill`) bounds the process exactly as its load preflight (`A.loadBytes`) bills it, at
+/// the fill's floor rows: the preflight and the admission read one bill.
+pub fn expectBillBoundsLoad(comptime A: type, gpa: std.mem.Allocator, io: std.Io, cfg: *const A.Config, facts: *const arch.LoadFacts, req: *const bill.BillRequest, floor: bill.Rows) !void {
+    const mb = try A.bill(gpa, io, req);
+    defer mb.free(gpa);
+    try std.testing.expectEqual(try A.loadBytes(gpa, io, cfg, facts, req.ceiling), mb.processBound(floor));
+}
+
 // ── Fakes for the host's tests (cpu) ──
 
 pub const FakeOptions = struct {
     caps: arch.Caps = .{ .owns_decode_state = true, .prefill_whole_prompt = true, .prefill_yields_last_logits = true },
     /// The model_type the fake claims.
     model_type: []const u8 = "fake_arch",
+    handover: bool = true,
+    /// The prompt admission's bytes; null = the host's estimator.
+    prompt_bytes: ?u64 = null,
+    /// `restorePrefix`: the most positions of a prefix-cache match the fake keeps; null = no hook.
+    restore_cap: ?u64 = null,
 };
 
-/// An arch for host tests: no MLX, caps per test.
+/// Every call a fake arch's module received.
+pub const FakeCalls = struct {
+    init: u32 = 0,
+    deinit: u32 = 0,
+    prefill: u32 = 0,
+    step: u32 = 0,
+    handover: u32 = 0,
+    restore: u32 = 0,
+};
+
+/// An arch for host tests: no MLX (its logits are empty handles), caps per test, every call counted.
 pub fn FakeArch(comptime opts: FakeOptions) type {
     return struct {
         pub const name = "fake-arch";
         pub const caps = opts.caps;
         pub const Config = struct { settings_applied: u32 = 0 };
+        pub const Module = struct {
+            gpa: std.mem.Allocator,
+            calls: *FakeCalls,
+            position: u64 = 0,
+            last_handover: ?arch.DecodeHandover = null,
+            last_request: ?arch.RequestShape = null,
+            /// The match the last `restorePrefix` was offered.
+            last_prefix: usize = 0,
+        };
+        /// The counters every module of this fake writes; reset per test.
+        pub var calls: FakeCalls = .{};
 
         pub fn claims(p: *const peek.ConfigPeek) ?peek.Priority {
             const t = p.modelType() orelse return null;
@@ -100,14 +137,65 @@ pub fn FakeArch(comptime opts: FakeOptions) type {
         pub fn shell(_: *const Config) arch.Shell {
             return .{ .num_experts = 4, .num_layers = 2 };
         }
+        pub fn applySettings(c: *Config, _: std.json.Value) void {
+            c.settings_applied += 1;
+        }
+        pub fn loadBytes(_: std.mem.Allocator, _: std.Io, _: *const Config, _: *const arch.LoadFacts, _: u64) !u64 {
+            return 1_000_000_000;
+        }
+        pub const promptBytes = if (opts.prompt_bytes) |n| struct {
+            fn f(_: *const Config, _: u64, _: u32) u64 {
+                return n;
+            }
+        }.f else {};
+        pub fn init(load: *const arch.LoadCtx, _: *const Config) !*Module {
+            const m = try load.gpa.create(Module);
+            m.* = .{ .gpa = load.gpa, .calls = &calls };
+            calls.init += 1;
+            return m;
+        }
+        pub fn deinit(m: *Module) void {
+            m.calls.deinit += 1;
+            m.gpa.destroy(m);
+        }
+        pub fn prefill(m: *Module, ids: []const u32, req: arch.RequestShape) !mlx.mlx_array {
+            m.calls.prefill += 1;
+            m.position = ids.len;
+            m.last_request = req;
+            return .{};
+        }
+        pub fn step(m: *Module, ids: []const u32) !mlx.mlx_array {
+            m.calls.step += 1;
+            m.position += ids.len;
+            return .{};
+        }
+        pub fn position(m: *const Module) u64 {
+            return m.position;
+        }
+        pub const handover = if (opts.handover) struct {
+            fn f(m: *Module, h: arch.DecodeHandover) !void {
+                m.calls.handover += 1;
+                m.last_handover = h;
+            }
+        }.f else {};
+        pub const restorePrefix = if (opts.restore_cap) |cap| struct {
+            fn f(m: *Module, prefix: []const u32) u64 {
+                m.calls.restore += 1;
+                m.last_prefix = prefix.len;
+                m.position = @min(prefix.len, cap);
+                return m.position;
+            }
+        }.f else {};
     };
 }
 
 const testing = std.testing;
 
-test "sdk testing: the fake arch's table carries its name, caps and claim, and refuses by name through its diag" {
-    const vt = comptime arch.Arch.of(FakeArch(.{}));
-    try testing.expect(vt.caps.owns_decode_state);
+test "sdk testing: the fake arch's table counts every call, and its optional hooks follow its options" {
+    const Fake = FakeArch(.{ .prompt_bytes = 7 });
+    Fake.calls = .{};
+    const vt = comptime arch.Arch.of(Fake);
+    try testing.expect(vt.caps.owns_decode_state and vt.handover != null and vt.prompt_bytes != null and vt.bill == null);
     var diag: peek.Diag = .{};
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
@@ -115,12 +203,37 @@ test "sdk testing: the fake arch's table carries its name, caps and claim, and r
     try testing.expectEqual(@as(?peek.Priority, .native), vt.claims(&p));
     const cfg = try vt.parse(testing.allocator, &p, &diag);
     defer vt.free_config(testing.allocator, cfg);
+    vt.apply_settings(cfg, .null);
     try testing.expectEqual(@as(u32, 2), vt.shell(cfg).num_layers);
+    try testing.expectEqual(@as(u64, 7), vt.prompt_bytes.?(cfg, 16384, 1024));
+    const load: arch.LoadCtx = .{ .gpa = testing.allocator, .io = testing.io, .stream = .{}, .weights = undefined, .loader = undefined, .facts = .{ .wired_margin_bytes = 0 }, .ceiling = 0 };
+    const m = try vt.init(&load, cfg);
+    _ = try vt.prefill(m, &.{ 1, 2, 3 }, .{ .prompt_tokens = 3, .max_tokens = 8, .host_context = 4096 });
+    try vt.handover.?(m, .{ .prompt_tokens = 3, .reserved_tokens = 0, .native_draft = true });
+    _ = try vt.step(m, &.{9});
+    vt.deinit(m);
+    try testing.expectEqual(FakeCalls{ .init = 1, .deinit = 1, .prefill = 1, .step = 1, .handover = 1 }, Fake.calls);
 
-    const bare = comptime arch.Arch.of(FakeArch(.{ .caps = .{} }));
-    try testing.expect(!bare.caps.owns_decode_state);
+    const Bare = FakeArch(.{ .handover = false, .caps = .{} });
+    const bare = comptime arch.Arch.of(Bare);
+    try testing.expect(bare.handover == null and bare.prompt_bytes == null and !bare.caps.owns_decode_state);
+    try testing.expect(vt.restore_prefix == null and bare.restore_prefix == null);
     try testing.expectError(error.FakeArchRefused, vt.parse(testing.allocator, &(try peek.ConfigPeek.parse(arena.allocator(), "/m", "{\"model_type\":\"fake_arch\",\"refuse\":1}")), &diag));
     try testing.expectEqualStrings("fake arch: refused by the fixture", diag.message());
+}
+
+test "sdk arch: restore_prefix keeps at most the host's match, counted; absent unless declared" {
+    const Fake = FakeArch(.{ .restore_cap = 5 });
+    Fake.calls = .{};
+    const vt = comptime arch.Arch.of(Fake);
+    var m: Fake.Module = .{ .gpa = testing.allocator, .calls = &Fake.calls };
+    const ids = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8 };
+    // The match past what the module holds: it keeps its own 5; a shorter match: the match.
+    try testing.expectEqual(@as(u64, 5), vt.restore_prefix.?(&m, &ids));
+    try testing.expectEqual(@as(usize, 8), m.last_prefix);
+    try testing.expectEqual(@as(u64, 4), vt.restore_prefix.?(&m, ids[0..4]));
+    try testing.expectEqual(@as(u64, 0), vt.restore_prefix.?(&m, ids[0..0]));
+    try testing.expectEqual(@as(u32, 3), Fake.calls.restore);
 }
 
 test "sdk testing: claims fixtures run on any arch's claim" {
@@ -131,9 +244,76 @@ test "sdk testing: claims fixtures run on any arch's claim" {
     });
 }
 
+test "sdk testing: an arch's bill bounds its load preflight at the floor rows, or the check names the gap" {
+    const gb: u64 = 1_000_000_000;
+    const Bills = struct {
+        fn of(per_row: u64) type {
+            return struct {
+                pub const Config = struct {};
+                const terms = [_]bill_mod.MemoryBill.Term{.{ .name = "residents", .bytes = .{ 1 * gb, 1 * gb }, .at_construction = true }};
+                pub fn bill(gpa: std.mem.Allocator, _: std.Io, _: *const bill_mod.BillRequest) !bill_mod.MemoryBill {
+                    return .{ .terms = try gpa.dupe(bill_mod.MemoryBill.Term, &terms), .per_row = per_row };
+                }
+                pub fn loadBytes(_: std.mem.Allocator, _: std.Io, _: *const Config, _: *const arch.LoadFacts, _: u64) !u64 {
+                    // the fake arch's own preflight: 1 GB of residents and 1 GB of slot rows
+                    return 2 * gb;
+                }
+            };
+        }
+    };
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const p = try peek.ConfigPeek.parse(arena.allocator(), "/m", "{}");
+    const req: bill.BillRequest = .{ .peek = &p, .cfg = &p, .routes = &p, .prompt_tokens = 1, .max_tokens = 1, .ceiling = 100 * gb, .stop = 2 * gb };
+    const facts: arch.LoadFacts = .{ .wired_margin_bytes = 0 };
+    const floor: bill.Rows = .{ .prompt = 8, .decode = 16 };
+    const cfg: Bills.of(0).Config = .{};
+    // 1 GB + 16 decode rows x 1/16 GB = the preflight's 2 GB
+    try expectBillBoundsLoad(Bills.of(gb / 16), testing.allocator, testing.io, &cfg, &facts, &req, floor);
+    // twice the row bytes: the bill bounds 3 GB where the preflight asks 2
+    try testing.expectError(error.TestExpectedEqual, expectBillBoundsLoad(Bills.of(gb / 8), testing.allocator, testing.io, &cfg, &facts, &req, floor));
+}
+
 test "sdk testing: the CPU lane's device probe reads the loaded images and has created no device here" {
     try testing.expect(!deviceCreated());
     try expectNoDevice();
+}
+
+test "sdk arch: the table's load preflight and bill call the arch's own; a hook switched off is absent" {
+    const Base = FakeArch(.{ .handover = false });
+    const Billed = struct {
+        pub const name = Base.name;
+        pub const caps = Base.caps;
+        pub const Config = Base.Config;
+        pub const Module = Base.Module;
+        pub const claims = Base.claims;
+        pub const parse = Base.parse;
+        pub const freeConfig = Base.freeConfig;
+        pub const shell = Base.shell;
+        pub const applySettings = Base.applySettings;
+        pub const loadBytes = Base.loadBytes;
+        pub const init = Base.init;
+        pub const deinit = Base.deinit;
+        pub const prefill = Base.prefill;
+        pub const step = Base.step;
+        pub const position = Base.position;
+        pub const handover = {};
+        pub fn bill(_: std.mem.Allocator, _: std.Io, req: *const bill_mod.BillRequest) !bill_mod.MemoryBill {
+            return .{ .per_row = req.prompt_tokens };
+        }
+    };
+    const vt = comptime arch.Arch.of(Billed);
+    try testing.expect(vt.handover == null and vt.prompt_bytes == null);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    var diag: peek.Diag = .{};
+    const p = try peek.ConfigPeek.parse(arena.allocator(), "/m", "{\"model_type\":\"fake_arch\"}");
+    const cfg = try vt.parse(testing.allocator, &p, &diag);
+    defer vt.free_config(testing.allocator, cfg);
+    const facts: arch.LoadFacts = .{ .wired_margin_bytes = 0 };
+    try testing.expectEqual(@as(u64, 1_000_000_000), try vt.load_bytes(testing.allocator, testing.io, cfg, &facts, 0));
+    const req: bill.BillRequest = .{ .peek = &p, .cfg = cfg, .routes = cfg, .prompt_tokens = 77, .max_tokens = 1, .ceiling = 0, .stop = 0 };
+    try testing.expectEqual(@as(u64, 77), (try vt.bill.?(testing.allocator, testing.io, &req)).per_row);
 }
 
 test "sdk testing: a claims fixture and a group fixture that disagree fail the check" {

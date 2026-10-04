@@ -1990,6 +1990,7 @@ pub const Scheduler = struct {
         var owned_active: bool = true;
         defer if (owned_active) freeCpuState(self.allocator, &owned);
         applyModelSettings(owned.config, owned.chat_config, &settings, self.mtp_enabled);
+        if (owned.config.arch) |vt| model_settings.applyArch(self.allocator, self.io, entry.path, vt, owned.config.arch_cfg.?);
         // The resolved .gguf path (when this is a GGUF entry) is borrowed by
         // the LoadRequest until `done`; the engines dupe what they keep, so
         // it's released here on success AND failure.
@@ -2625,7 +2626,7 @@ fn slotHoldsForMemory(sch: *Scheduler, slot: *Slot) bool {
     const numbers_fn = prefill_admission_numbers orelse return false;
     const live = liveDecodingCount(sch);
     if (live == 0) sch.promise_ledger = .{};
-    const bill = numbers_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null), slot.enable_mtp);
+    const bill = numbers_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, generate_mod.prefillUnchunked(cfg, slot.vision_embeddings != null), slot.enable_mtp);
     var active_now: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_now);
     const fits = admissionFits(bill[0], bill[1], sch.promise_ledger.outstanding(active_now), sch.gen_reserve_bytes, live);
@@ -3287,6 +3288,16 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
 /// by the load pre-flight. Returns 0 if the dir can't be read (treated as
 /// "unknown" by the caller, which then skips the check). Symlinked weights
 /// count (statFile follows links) — an HF hub-cache snapshot is ALL symlinks.
+/// The load preflight's weights figure for a pack, as the MLX load bills it: a module-owned arch's own load bill
+/// (streamed experts: `transformer.archLoadRequirementBytes`), else the shards on disk. `mlx-serve --print-load-bytes`
+/// prints it, so the bench's model lookup (tests/_lib_models.sh) sizes a streamed pack by the bill it is admitted on.
+pub const PackLoadBill = struct { arch: bool, bytes: u64 };
+
+pub fn packLoadBill(io: std.Io, allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, model_dir: []const u8) PackLoadBill {
+    if (transformer_mod.archLoadRequirementBytes(io, allocator, config)) |b| return .{ .arch = true, .bytes = b };
+    return .{ .arch = false, .bytes = modelDiskBytes(io, model_dir) };
+}
+
 fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     if (mlx_gguf.weightBytes(io, model_dir)) |bytes| return bytes;
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
@@ -3333,6 +3344,24 @@ test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
     defer std.testing.allocator.free(snap);
 
     try std.testing.expectEqual(@as(u64, 16), modelDiskBytes(io, snap));
+}
+
+test "packLoadBill: an arch without its own load bill is billed its shards, as the preflight bills it" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/model.safetensors", .data = "0123456789abcdef0123" });
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const dir = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/m", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(dir);
+    const cfg: model_mod.ModelConfig = .{};
+    const bill = packLoadBill(io, std.testing.allocator, &cfg, dir);
+    try std.testing.expect(!bill.arch);
+    try std.testing.expectEqual(@as(u64, 20), bill.bytes);
+    try std.testing.expectEqual(modelDiskBytes(io, dir), bill.bytes);
 }
 
 test "modelDiskBytes bills only the shards the index names (issue #274)" {
@@ -3868,6 +3897,19 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // an actionable error, when free RAM clearly can't hold the weights + warmup
     // headroom — catches the common "restarted before the prior server released
     // its memory" case. Bypass with --skip-mem-preflight.
+    // A module-owned arch that bills its own load (streamed experts: the bill, not the shards) sizes itself
+    // against the memory already in use: sampled here, before the weights load (after, it would count them),
+    // unless `--memory-baseline-gb` stated it.
+    // The registry's load claim of the process's one expert reader (G6), before the preflight and the weights; the
+    // loaded Transformer owns it from its construction on (given back at its deinit).
+    var arch_claim = transformer_mod.archClaimProcess(params.config) catch |e| {
+        log.err("{s}: refused: {s} (the process's expert reader belongs to a loaded model)\n", .{ params.config.model_type, @errorName(e) });
+        return e;
+    };
+    errdefer if (arch_claim) |release| release();
+    const arch_load_bytes = transformer_mod.archLoadRequirementBytes(sch.io, sch.allocator, params.config);
+    if (arch_load_bytes != null and params.config.memory_baseline_bytes == null)
+        params.config.memory_baseline_bytes = status.getTotalMemBytes() -| status.getAvailableMemBytes();
     // The sidecar is resolved here so the preflight bills it with the weights:
     // launch flags, then the per-model setting; otherwise the checkpoint's own
     // `drafter/` subdir (dflash.resolveInDirDrafter). That is what makes the
@@ -3882,7 +3924,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     defer if (in_dir_drafter) |p| sch.allocator.free(p);
     if (!skip_mem_preflight) {
         const gb = 1024.0 * 1024.0 * 1024.0;
-        const model_bytes = modelDiskBytes(sch.io, params.model_dir);
+        const model_bytes = arch_load_bytes orelse modelDiskBytes(sch.io, params.model_dir);
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
         const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
@@ -3939,6 +3981,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     const xfm_ptr = try sch.allocator.create(Transformer);
     errdefer sch.allocator.destroy(xfm_ptr);
     xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
+    xfm_ptr.arch_claim = arch_claim;
+    arch_claim = null;
     errdefer xfm_ptr.deinit();
 
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
@@ -4576,7 +4620,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // RAM cache is unaffected.
         const has_ssm_layers = params.config.has_hybrid_layers or
             params.config.full_attention_interval > 0;
-        const disk_ok = !has_ssm_layers or enable_ssm_cps;
+        // A module-owned arch's state never reaches the disk tier's KV chunks.
+        const disk_ok = (!has_ssm_layers or enable_ssm_cps) and !params.config.moduleOwnsDecodeState();
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
             const fp = kv_disk_cache.modelFingerprintWithLayout(
                 sch.allocator,
@@ -6917,6 +6962,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             }
         }
     }
+    hot_matched = try archKeptPrefix(xfm_ptr.arch, &slot.cache, &slot.moe_seq_offset, slot.full_prompt, hot_matched, xfm_ptr.s);
+    prefill_tokens = slot.full_prompt[hot_matched..];
 
     // Phase 1 (perf-plan): forward the SSM-checkpoint stride from the
     // LoadedModel so the prefill loop snapshots SSM state at stride-aligned
@@ -6961,7 +7008,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .seq = slot.full_prompt.len,
                 .max_tokens = slot.max_tokens,
                 .kv_cfg = slot.cache.config,
-                .unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+                .unchunked = generate_mod.prefillUnchunked(cfg, slot.vision_embeddings != null),
                 .warm_matched = hot_matched,
                 .warm_capacity = slot.cache.residentCapacityTokens(),
                 .warm_will_donate = hot_checked_out,
@@ -7026,7 +7073,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             slot.full_prompt.len,
             slot.max_tokens,
             slot.cache.config,
-            generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+            generate_mod.prefillUnchunked(cfg, slot.vision_embeddings != null),
             hot_matched,
             slot.cache.residentCapacityTokens(),
             hot_checked_out,
@@ -7179,6 +7226,21 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .source = "cold",
         });
     }
+}
+
+/// The prefix a hot-cache match leaves the prompt pass. A module-owned arch holds it in its module, not in the slot's
+/// cache: it keeps at most the match (`sdk.Arch.restore_prefix`) and the cache follows what it kept. Every other arch
+/// keeps the match.
+fn archKeptPrefix(arch: ?@import("sdk").ArchInstance, cache: *KVCache, moe_seq_offset: *usize, prompt: []const u32, matched: u32, s: mlx.mlx_stream) !u32 {
+    if (matched == 0) return 0;
+    const a = arch orelse return matched;
+    const restore = a.vt.restore_prefix orelse return matched;
+    const kept: u32 = @intCast(@min(restore(a.module, prompt[0..matched]), matched));
+    if (kept < matched) {
+        try cache.truncate(kept, s);
+        moe_seq_offset.* = kept;
+    }
+    return kept;
 }
 
 /// Sum the in-flight generated tokens over the active slots for the live-tok/s
@@ -9936,18 +9998,103 @@ test "S21: a released module head drops the slot's exclusivity, and the MODEL bi
     try testing.expect(headExclusiveFor(true, true, true, true));
 }
 
-test "modelExclusiveDecode asks the transformer, never one hardcoded arch" {
-    // The 2026-08-02 dsv4 fix hardcoded `t.dsv4 != null` here. When a second
-    // module-owned arch arrived — same `Model.state` shape, same
-    // `reset = cache.step == 0` rebuild — the gate did not follow, and two
-    // concurrent requests shared one state. The predicate now lives beside the fields it reads
-    // (`Transformer.module_owned_state_fields`), and this pins the delegation.
-    // Needles are ++-split so this test's source can't satisfy the scan.
-    const src = @embedFile("scheduler.zig");
-    const delegated = "t.ownsModuleDecode" ++ "State()";
-    try testing.expect(std.mem.indexOf(u8, src, delegated) != null);
-    const hardcoded = "return t.dsv4 " ++ "!= null;";
-    try testing.expect(std.mem.indexOf(u8, src, hardcoded) == null);
+test "modelExclusiveDecode asks the transformer: a registered arch that owns its decode state is single-flight" {
+    const sdk = @import("sdk");
+    var t: transformer_mod.Transformer = undefined;
+    inline for (transformer_mod.Transformer.module_owned_state_fields) |f| @field(t, f) = null;
+    t.arch = null;
+    var lm: model_registry_mod.LoadedModel = undefined;
+    lm.transformer = &t;
+    try testing.expect(!modelExclusiveDecode(&lm));
+    const owning = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+    const sharing = comptime sdk.Arch.of(sdk.testing.FakeArch(.{ .caps = .{} }));
+    var module: u8 = 0;
+    t.arch = .{ .vt = &owning, .cfg = &module, .module = &module };
+    try testing.expect(modelExclusiveDecode(&lm));
+    t.arch = .{ .vt = &sharing, .cfg = &module, .module = &module };
+    try testing.expect(!modelExclusiveDecode(&lm));
+    lm.transformer = null;
+    try testing.expect(!modelExclusiveDecode(&lm));
+}
+
+/// One request of `archKeptPrefix`'s flow on a module arch's shell cache (0 layers, no MLX array): the host's own
+/// lookup over `hc`, the arch keeping what it can, then the request's commit (prompt + generated) as `finishSlot`'s.
+/// Returns the cached tokens the request reports.
+fn testModuleTurn(hc: *prefix_cache_mod.HotPrefixCache, arch: @import("sdk").ArchInstance, prompt: []const u32, generated: []const u32) !u32 {
+    const s: mlx.mlx_stream = .{};
+    var cache = try KVCache.init(testing.allocator, 0);
+    defer cache.deinit();
+    var moe_off: usize = 0;
+    const lookup = try hc.lookupAndRestore(&cache, &moe_off, null, s, prompt, false, &.{}, null, null);
+    const kept = try archKeptPrefix(arch, &cache, &moe_off, prompt, @intCast(lookup.matched), s);
+    try testing.expectEqual(@as(usize, kept), cache.step);
+    try testing.expectEqual(@as(usize, kept), moe_off);
+    // The prompt pass runs `prompt[kept..]`, then decode appends the generated ids.
+    cache.step = prompt.len + generated.len;
+    const all = try std.mem.concat(testing.allocator, u32, &.{ prompt, generated });
+    defer testing.allocator.free(all);
+    _ = try hc.commit(&cache, all, false);
+    return kept;
+}
+
+test "prefix cache drives a module-owned arch through restore_prefix: the host's match, the arch's kept positions, the cached tokens" {
+    const sdk = @import("sdk");
+    // Turn 1: prompt 1..10, answer 20 21 22. Turn 2 re-renders the answer and adds a user turn.
+    const p1 = [_]u32{ 1, 2, 3, 4, 5, 6, 7, 8, 9, 10 };
+    const gen = [_]u32{ 20, 21, 22 };
+    // Thinking off: turn 1's prompt is a prefix of turn 2's and the answer re-tokenizes alike up to 21 (the host's
+    // match: 12 positions).
+    const off2 = p1 ++ [_]u32{ 20, 21, 99, 30, 31, 32 };
+    // Thinking on: the last prompt id (<think>) re-renders as </think> (77): the match stops one short of turn 1's prompt.
+    const on2 = p1[0..9].* ++ [_]u32{ 77, 99, 30, 31 };
+    const Case = struct { cap: u64, prompt: []const u32, want: u32 };
+    // A module that holds turn 1's prompt boundary (cap 10): it keeps the boundary under a longer match, the match under
+    // a shorter one. A module that restores any prefix: the whole match. One that keeps nothing: the prompt runs whole.
+    inline for (.{
+        Case{ .cap = 10, .prompt = &off2, .want = 10 },
+        Case{ .cap = 10, .prompt = &on2, .want = 9 },
+        Case{ .cap = 1 << 20, .prompt = &off2, .want = 12 },
+        Case{ .cap = 0, .prompt = &off2, .want = 0 },
+    }) |c| {
+        const Fake = sdk.testing.FakeArch(.{ .restore_cap = c.cap });
+        Fake.calls = .{};
+        const vt = comptime sdk.Arch.of(Fake);
+        var m: Fake.Module = .{ .gpa = testing.allocator, .calls = &Fake.calls };
+        var cfg: u8 = 0;
+        const arch: sdk.ArchInstance = .{ .vt = &vt, .cfg = &cfg, .module = &m };
+        var hc = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+        defer hc.deinit();
+        // Turn 1 is cold: no match, the arch is not asked.
+        try testing.expectEqual(@as(u32, 0), try testModuleTurn(&hc, arch, &p1, &gen));
+        try testing.expectEqual(@as(u32, 0), Fake.calls.restore);
+        try testing.expectEqual(c.want, try testModuleTurn(&hc, arch, c.prompt, &gen));
+        try testing.expectEqual(@as(u32, 1), Fake.calls.restore);
+        try testing.expectEqual(@as(usize, if (c.prompt.len == off2.len) 12 else 9), m.last_prefix);
+    }
+    // The same prompt again: the host re-runs the last id (its full-reuse rule), so the arch is offered len - 1.
+    {
+        const Fake = sdk.testing.FakeArch(.{ .restore_cap = 10 });
+        Fake.calls = .{};
+        const vt = comptime sdk.Arch.of(Fake);
+        var m: Fake.Module = .{ .gpa = testing.allocator, .calls = &Fake.calls };
+        var cfg: u8 = 0;
+        const arch: sdk.ArchInstance = .{ .vt = &vt, .cfg = &cfg, .module = &m };
+        var hc = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+        defer hc.deinit();
+        _ = try testModuleTurn(&hc, arch, &p1, &.{});
+        try testing.expectEqual(@as(u32, 9), try testModuleTurn(&hc, arch, &p1, &.{}));
+        try testing.expectEqual(@as(usize, 9), m.last_prefix);
+    }
+    // An arch without the hook keeps the host's match as every other arch does (its prefix cache is off: `shouldUse`).
+    {
+        const vt = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+        var cfg: u8 = 0;
+        var cache = try KVCache.init(testing.allocator, 0);
+        defer cache.deinit();
+        var moe_off: usize = 0;
+        try testing.expectEqual(@as(u32, 7), try archKeptPrefix(.{ .vt = &vt, .cfg = &cfg, .module = &cfg }, &cache, &moe_off, &p1, 7, .{}));
+        try testing.expectEqual(@as(u32, 7), try archKeptPrefix(null, &cache, &moe_off, &p1, 7, .{}));
+    }
 }
 
 test "buildGgufStubCpuState: llama stub carries gguf model_type + ctx sizing" {

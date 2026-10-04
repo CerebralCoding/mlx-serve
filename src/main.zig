@@ -157,6 +157,18 @@ fn printUsage(io: std.Io) void {
         \\                        room (default: an eighth of RAM, 2 to 8 GB). 0 turns
         \\                        it off: more context and concurrency, but a small Mac
         \\                        under heavy load can freeze or restart.
+        \\  --memory-baseline-gb <gb>  The memory in use before a streamed-expert model
+        \\                        loads, decimal GB (default: the load preflight's own
+        \\                        reading, total less available).
+        \\  --expert-rows <n>     Decode slot rows per layer for a streamed-expert model
+        \\                        (default: as many as its memory admission fits).
+        \\  --memory-ceiling-gb <gb>  The GPU memory ceiling every memory plan fits under,
+        \\                        decimal GB (default: Metal's working set); a
+        \\                        streamed-expert model's fill lands the wired margin
+        \\                        (--wired-margin-gib / --wired-margin) below it.
+        \\  --print-load-bytes  Print the load pre-flight's weights figure for --model and
+        \\                        exit (nothing loads): "arch <bytes>" for an arch that bills
+        \\                        its own load (streamed experts), else "shards <bytes>".
         \\  --skip-mem-preflight  Bypass the model-load free-RAM pre-flight that
         \\                        refuses a load whose weights + warmup headroom
         \\                        look too big for current free memory. The check
@@ -568,6 +580,7 @@ pub fn main(init: std.process.Init) !void {
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
+    var print_load_bytes = false;
     var mtp_head_kv_quant = false;
     var mtp_depth: u32 = 0; // 0 = auto (EV cap 8 on eligible M5 NAX, else 6; fixed cap 3); explicit wins
     var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
@@ -691,6 +704,8 @@ pub fn main(init: std.process.Init) !void {
             scheduler_mod.no_vision_global = true;
         } else if (std.mem.eql(u8, args[i], "--no-prevent-sleep")) {
             sleep_inhibit_mod.setEnabled(false);
+        } else if (std.mem.eql(u8, args[i], "--print-load-bytes")) {
+            print_load_bytes = true;
         } else if (std.mem.eql(u8, args[i], "--skip-mem-preflight")) {
             scheduler_mod.skip_mem_preflight = true;
         } else if (std.mem.eql(u8, args[i], "--no-safety")) {
@@ -888,6 +903,29 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ssm-checkpoint-max") and i + 1 < args.len) {
             i += 1;
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
+        } else if (std.mem.eql(u8, args[i], "--memory-baseline-gb") and i + 1 < args.len) {
+            i += 1;
+            const gb = std.fmt.parseFloat(f64, args[i]) catch -1;
+            if (!(gb > 0 and gb < 1024)) {
+                log.err("--memory-baseline-gb: expected decimal GB above 0, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            model_mod.memory_baseline_override = @intFromFloat(@round(gb * 1e9));
+        } else if (std.mem.eql(u8, args[i], "--memory-ceiling-gb") and i + 1 < args.len) {
+            i += 1;
+            const gb = std.fmt.parseFloat(f64, args[i]) catch -1;
+            if (!(gb > 4 and gb < 1024)) {
+                log.err("--memory-ceiling-gb: expected decimal GB above 4, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            }
+            // Upstream's static GPU ceiling (what MLX_SERVE_GPU_CEILING_MB sets): every bill reads it.
+            server_mod.gpu_ceiling_mod.static_ceiling_override = @intFromFloat(@round(gb * 1e9));
+        } else if (std.mem.eql(u8, args[i], "--expert-rows") and i + 1 < args.len) {
+            i += 1;
+            model_mod.expert_rows_override = std.fmt.parseInt(u32, args[i], 10) catch {
+                log.err("--expert-rows: expected a row count, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
             server_mod.gpu_ceiling_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
@@ -1026,6 +1064,22 @@ pub fn main(init: std.process.Init) !void {
             log.err("unrecognized argument '{s}' — {s}\n", .{ args[i], reason.hint() });
             std.process.exit(1);
         }
+    }
+
+    // `--print-load-bytes`: the load pre-flight's weights figure for `--model`'s pack, then exit (nothing loads).
+    // The bench's model lookup (tests/_lib_models.sh) sizes a streamed-expert pack by it.
+    if (print_load_bytes) {
+        var cfg = model_mod.parseConfig(io, allocator, model_dir) catch |e| {
+            log.err("--print-load-bytes: no model config at '{s}' ({s})\n", .{ model_dir, @errorName(e) });
+            std.process.exit(1);
+        };
+        defer cfg.deinit(allocator);
+        const bill = scheduler_mod.packLoadBill(io, allocator, &cfg, model_dir);
+        var out_buf: [64]u8 = undefined;
+        var out_w = std.Io.File.stdout().writer(io, &out_buf);
+        out_w.interface.print("{s} {d}\n", .{ if (bill.arch) "arch" else "shards", bill.bytes }) catch {};
+        out_w.interface.flush() catch {};
+        return;
     }
 
     // One value for the three media seams (they run under gen.zig with no
@@ -1373,6 +1427,7 @@ pub fn main(init: std.process.Init) !void {
         var settings = model_settings_mod.overrideFor(allocator, io, model_dir);
         defer settings.deinit(allocator);
         scheduler_mod.applyModelSettings(config, chat_config, &settings, enable_mtp);
+        if (config.arch) |vt| model_settings_mod.applyArch(allocator, io, model_dir, vt, config.arch_cfg.?);
     }
     config.applyTokenizer(tok, chat_config.eos_token);
 

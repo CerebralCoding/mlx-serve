@@ -7,6 +7,7 @@ const std = @import("std");
 const kv_quant = @import("kv_quant.zig");
 const log = @import("log");
 const mtp_acceptance = @import("mtp_acceptance");
+const sdk = @import("sdk");
 
 pub const Override = struct {
     ctx_size: ?u32 = null,
@@ -216,6 +217,15 @@ pub fn load(alloc: std.mem.Allocator, io: std.Io, path: []const u8) Settings {
 pub fn defaultPath(buf: []u8) []const u8 {
     const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
     return std.fmt.bufPrint(buf, "{s}/.mlx-serve/model-settings.json", .{home}) catch "";
+}
+
+/// A registered arch's own keys: the model's settings object from the default file, borrowed for the arch's
+/// `apply_settings` (`.null` when the model has none). Load sites call it after `overrideFor`.
+pub fn applyArch(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8, arch: *const sdk.Arch, cfg: *anyopaque) void {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var s = load(alloc, io, defaultPath(&buf));
+    defer s.deinit();
+    arch.apply_settings(cfg, s.entry(model_path) orelse .null);
 }
 
 /// The plugin a model's entry names to break a `claims` tie between registered archs (`"plugin": "<name>"`, borrowed

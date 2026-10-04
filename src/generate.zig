@@ -3,6 +3,7 @@ const mlx = @import("mlx");
 const keyed_sample = @import("keyed_sample.zig");
 const transformer_mod = @import("transformer.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
+const sdk = @import("sdk");
 const tokenizer_mod = @import("tokenizer.zig");
 const model_mod = @import("model.zig");
 const log = @import("log");
@@ -303,6 +304,29 @@ fn readEnvBool(name: [:0]const u8) bool {
 /// gate, `mtpBatchedAcceptGraph`, the pre-draft and the horizon valve all work
 /// in tokens and probabilities — so the split is exactly these five operations
 /// and nothing else.
+/// The arch's prefill-to-decode handover (`Transformer.decodeHandover`), due once per request at its first decode
+/// step. Built only from the transformer (`of(xfm)`), so no Generator is constructed without its answer.
+pub const HandoverClock = struct {
+    /// Public for the clock's own unit test only; everywhere else construct it with `of(xfm)`.
+    due: bool,
+
+    pub fn of(xfm: *const Transformer) HandoverClock {
+        return .{ .due = xfm.decodeHandoverWanted() };
+    }
+
+    /// A handover arch never pre-forwards t1 inside init: its first forward follows the handover.
+    pub fn skipsLazyPreforward(c: HandoverClock, requested: bool) bool {
+        return requested or c.due;
+    }
+
+    /// True exactly once, at the first decode step, when a handover is due.
+    pub fn fire(c: *HandoverClock) bool {
+        if (!c.due) return false;
+        c.due = false;
+        return true;
+    }
+};
+
 /// Most drafts one MTP round verifies: the head chain or a prompt-lookup run.
 const MAX_ROUND_DRAFTS: usize = @max(mtp_mod.MAX_DEPTH, mtp_lookup.MAX_DRAFT_STRONG);
 
@@ -1305,8 +1329,10 @@ pub fn visionChunkedPrefillEnabled() bool {
 /// vision prompt with chunking killed. The guard and this loop must agree or
 /// admission either over-refuses (bills seq for a chunked prefill) or
 /// under-bills (uncatchable Metal OOM).
-pub fn visionPrefillUnchunked(has_vision: bool) bool {
-    return has_vision and !visionChunkedPrefillEnabled();
+/// The prompt goes in one forward: the vision kill switch, or an arch that chunks the
+/// prompt itself (`ModelConfig.prefillWholePrompt`).
+pub fn prefillUnchunked(config: *const model_mod.ModelConfig, has_vision: bool) bool {
+    return config.prefillWholePrompt() or (has_vision and !visionChunkedPrefillEnabled());
 }
 
 /// Placeholder tokens (vision + audio soft tokens) in `ids` — the number of
@@ -1549,6 +1575,8 @@ pub const Generator = struct {
     /// chokepoint when the request samples (temp ≥ 0.01, top_k ≠ 1) and the
     /// stochastic arm isn't env-killed; meaningless unless `dspark_enabled`.
     dspark_stochastic: bool = false,
+    /// The arch's prefill-to-decode handover (`beginDecode`); no default, so every construction states it.
+    handover: HandoverClock,
     dspark_attempted: u64 = 0,
     dspark_accepted_tokens: u64 = 0,
 
@@ -2542,6 +2570,9 @@ pub const Generator = struct {
         // `&ctx` to every forward call below; the cache/moe/ssm fields
         // mutate in-place through their pointers.
         var ctx: ForwardCtx = options.ctx orelse xfm.defaultCtx();
+        // The request's shape, before its first forward: a registered arch's prompt pass reserves from it.
+        ctx.request = .{ .prompt_tokens = options.ssm_checkpoint_pos_offset + prompt_ids.len, .max_tokens = max_tokens, .host_context = xfm.config.max_position_embeddings };
+        const handover = HandoverClock.of(xfm);
 
         // Certified lm_head prune gate: the pruned projection proves the
         // ARGMAX, not the tail distribution, so it may engage only when this
@@ -2750,7 +2781,10 @@ pub const Generator = struct {
         if (prompt_ids.len > 1) {
             const prefix_len = prompt_ids.len - 1;
             const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
-            const loop_end = prefix_len - snapshot_backoff;
+            // An arch whose prompt forward yields the last row's logits, or that chunks the prompt itself
+            // (`prefillUnchunked`), takes the whole prompt in the final span's one forward: no prefix forwards, no
+            // separate 1-row logits forward.
+            const loop_end = if (xfm.config.prefillYieldsLastLogits() or xfm.config.prefillWholePrompt()) 0 else prefix_len - snapshot_backoff;
             final_start = loop_end;
             // Vision prompts chunk like text (issue #197) — the splice offset
             // below keeps the row scatter chunk-exact. Kill switch restores
@@ -3301,6 +3335,7 @@ pub const Generator = struct {
             }
             var gen = Generator{
                 .xfm = xfm,
+                .handover = handover,
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
@@ -3353,6 +3388,7 @@ pub const Generator = struct {
                 0;
             var gen = Generator{
                 .xfm = xfm,
+                .handover = handover,
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
                 .tok = tok,
@@ -3420,7 +3456,7 @@ pub const Generator = struct {
         // in cache — matches `forwardBatchedDecode`'s expectation and the
         // PLD / drafter init path's invariant. Generator.next's transition
         // shim handles the bootstrap on the first decode tick.
-        if (options.skip_lazy_preforward) {
+        if (handover.skipsLazyPreforward(options.skip_lazy_preforward)) {
             const sample_lazy = sampleTokenLazy(logits, sampling, s);
             try mlx.check(mlx.mlx_array_eval(sample_lazy));
             var first_val: i32 = 0;
@@ -3434,6 +3470,7 @@ pub const Generator = struct {
 
             var gen = Generator{
                 .pending_logprob = first_lp,
+                .handover = handover,
                 .xfm = xfm,
                 .model_has_mtp = options.model_has_mtp,
                 .ctx = ctx,
@@ -3491,6 +3528,7 @@ pub const Generator = struct {
 
         var gen = Generator{
             .pending_logprob = first_lp,
+            .handover = handover,
             .xfm = xfm,
             .model_has_mtp = options.model_has_mtp,
             .ctx = ctx,
@@ -4012,8 +4050,21 @@ pub const Generator = struct {
     /// `deepseek_v4.dsparkRound`; this wrapper only keeps the Generator's
     /// bookkeeping (generated_ids, step accounting, the shell cache.step
     /// that forwardDsv4WithImpl keys fresh-vs-decode on) in sync.
+    /// The arch's prefill-to-decode handover (`Transformer.decodeHandover`), once, at the request's first decode
+    /// step: the first thing `next` and `nextDspark` do, the only decode entries a handover arch reaches (module
+    /// archs keep PLD, drafters, MTP and DFlash off). The prompt's clock (prefill_ns, TTFT) never includes it.
+    fn beginDecode(self: *Generator) !void {
+        if (!self.handover.fire()) return;
+        try self.xfm.decodeHandover(.{
+            .prompt_tokens = self.prompt_tokens,
+            .reserved_tokens = @as(u64, self.prompt_tokens) + self.max_tokens,
+            .native_draft = self.dspark_enabled,
+        });
+    }
+
     pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepResult {
         if (self.done) return null;
+        try self.beginDecode();
         if (!self.dspark_enabled) {
             // Same defensive fallback as nextPld's disarmed arm: the
             // dispatching caller's flag alone must never run a draft.
@@ -11691,6 +11742,7 @@ pub const Generator = struct {
     ///   where y.item() is instant because async_eval forced y's computation.
     pub fn next(self: *Generator, allocator: std.mem.Allocator) !?u32 {
         if (self.done) return null;
+        try self.beginDecode();
         if (self.sampling.constraint != null) return self.nextConstrained(allocator);
 
         // Transition shim: speculative-decode paths may exit with
@@ -21982,3 +22034,60 @@ test "keyed sampling draws the softmax distribution" {
     }
     for (probs, counts) |p, c| try testing.expect(@abs(@as(f32, @floatFromInt(c)) / @as(f32, @floatFromInt(n)) - p) < 0.03);
 }
+
+test "dsv41 handover: the clock fires once, at the first decode step, only when the arch takes a handover" {
+    // No handover: the init pre-forwards t1 only when the slot asked, and no decode step fires.
+    var none: HandoverClock = .{ .due = false };
+    try testing.expect(!none.skipsLazyPreforward(false) and none.skipsLazyPreforward(true));
+    try testing.expect(!none.fire() and !none.fire());
+    // A handover is due: t1 is never pre-forwarded inside init (its first forward follows the handover), the first
+    // decode step fires it, and no later step does.
+    var due: HandoverClock = .{ .due = true };
+    try testing.expect(due.skipsLazyPreforward(false));
+    try testing.expect(due.fire());
+    try testing.expect(!due.fire() and !due.fire());
+}
+
+test "dsv41 handover: the clock is the transformer's answer: due exactly when the arch has a handover" {
+    var xfm: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    xfm.arch = null;
+    try testing.expect(!HandoverClock.of(&xfm).due);
+    const with = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+    const without = comptime sdk.Arch.of(sdk.testing.FakeArch(.{ .handover = false }));
+    var module: u8 = 0;
+    xfm.arch = .{ .vt = &with, .cfg = &module, .module = &module };
+    try testing.expect(HandoverClock.of(&xfm).due);
+    xfm.arch = .{ .vt = &without, .cfg = &module, .module = &module };
+    try testing.expect(!HandoverClock.of(&xfm).due);
+}
+
+// ── host seams: the prompt and handover paths of upstream's models (characterization against upstream af34af04) ──
+
+test "host seams: prefillUnchunked is upstream's visionPrefillUnchunked for every model no registered arch claims" {
+    const types = [_][]const u8{ "gemma3", "gemma4", "qwen3", "qwen3_5", "qwen3_5_moe", "qwen4_exp", "llama", "mistral", "laguna", "mimo_v2", "deepseek_v4", "nemotron_h", "lfm2", "glm5_next", "bailing_hybrid" };
+    for (types) |t| for ([_]bool{ false, true }) |has_vision| {
+        var cfg: model_mod.ModelConfig = .{};
+        cfg.model_type = t;
+        // af34af04: `has_vision and !visionChunkedPrefillEnabled()`.
+        try testing.expectEqual(has_vision and !visionChunkedPrefillEnabled(), prefillUnchunked(&cfg, has_vision));
+        try testing.expect(!cfg.prefillWholePrompt() and !cfg.prefillYieldsLastLogits());
+    };
+}
+
+test "host seams: deepseek_v4 and every in-tree model take no decode handover (upstream's init path)" {
+    var dsv4: dsv4_mod.Dsv4Model = undefined;
+    var xfm: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    xfm.arch = null;
+    for ([_]bool{ false, true }) |with_dsv4| {
+        xfm.dsv4 = if (with_dsv4) &dsv4 else null;
+        var clock = HandoverClock.of(&xfm);
+        try testing.expect(!clock.due);
+        // The lazy pre-forward is skipped exactly when the caller asked, as before the clock.
+        try testing.expect(!clock.skipsLazyPreforward(false) and clock.skipsLazyPreforward(true));
+        try testing.expect(!clock.fire());
+        try xfm.decodeHandover(.{ .prompt_tokens = 8, .reserved_tokens = 16, .native_draft = with_dsv4 });
+    }
+}
+

@@ -1,7 +1,12 @@
 //! The plugin SDK (docs/plugins.md): the one module a plugin imports. The small SDK: what a module-owned arch needs
-//! from the host, as optional declarations of the kinds below. A seam only one plugin consumes stays in that plugin
-//! until a second consumer exists. The registry (src/plugins.zig) builds each kind's table once, at compile time,
-//! and the host resolves a model's tables once at load: a hook runs per request, step or round, never per layer.
+//! from the host (G1 module-owned decode state, G2 the phase change, G4 phase bills, the process
+//! claim, the weight loader and the memory ledgers) as optional declarations of the kinds below. A seam only one
+//! plugin consumes (an expert source, a kernel registry, a quant contract) stays in that plugin until a second
+//! consumer exists. The registry (src/plugins.zig) builds each kind's table once, at compile time, and the host
+//! resolves a model's tables once at load: a hook runs per request, step or round, never per layer.
+//!
+//! `KVCache`, `ForwardCtx` and `Linear` (an arch over the host's cache) land with their first consumer: the
+//! archs registered so far own their decode state (G1).
 
 const std = @import("std");
 
@@ -37,8 +42,26 @@ pub const Segment = peek.Segment;
 
 const arch = @import("sdk/arch.zig");
 pub const Arch = arch.Arch;
+pub const ArchInstance = arch.ArchInstance;
 pub const Caps = arch.Caps;
 pub const Shell = arch.Shell;
+pub const LoadFacts = arch.LoadFacts;
+pub const LoadCtx = arch.LoadCtx;
+pub const RequestShape = arch.RequestShape;
+pub const DecodeHandover = arch.DecodeHandover;
+
+const memory_bill = @import("sdk/memory_bill.zig");
+pub const MemoryBill = memory_bill.MemoryBill;
+pub const BillRequest = memory_bill.BillRequest;
+pub const Rows = memory_bill.Rows;
+pub const fill = memory_bill.fill;
+pub const admit = memory_bill.admit;
+pub const checkMeasured = memory_bill.checkMeasured;
+pub const checkRows = memory_bill.checkRows;
+pub const checkConstruction = memory_bill.checkConstruction;
+
+pub const lifecycle = @import("sdk/lifecycle.zig");
+pub const PhaseObserver = lifecycle.PhaseObserver;
 
 const kinds = @import("sdk/kinds.zig");
 pub const Source = kinds.Source;
@@ -66,6 +89,8 @@ test {
     _ = plugin;
     _ = peek;
     _ = arch;
+    _ = memory_bill;
+    _ = lifecycle;
     _ = kinds;
     _ = testing;
 }

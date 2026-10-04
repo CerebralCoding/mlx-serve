@@ -778,6 +778,7 @@ const registry_refusals = [_]struct { case: []const u8, err: []const u8 }{
     .{ .case = "source_no_claims", .err = "NoClaims: no claims" },
     .{ .case = "engine_wrong_claims", .err = "WrongClaims.claims: parameter *const sdk.peek.GroupPeek where the SDK has *const sdk.peek.ConfigPeek" },
     .{ .case = "arch_batches_owned_state", .err = ": batches_decode with owns_decode_state" },
+    .{ .case = "arch_claim_unpaired", .err = ": claimProcess and releaseProcess come as a pair" },
     .{ .case = "name_not_json_safe", .err = "plugin name not JSON-safe: quo\"te" },
     .{ .case = "source_claims_not_fn", .err = "ClaimsNotFn.claims is not a function" },
     .{ .case = "engine_claims_param_count", .err = "ClaimsTwoParams.claims: takes a different parameter count than the SDK's" },

@@ -2,6 +2,7 @@ const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("mlx");
 const nocache_reader = @import("nocache_reader.zig");
+const gpu_ceiling = @import("gpu_ceiling.zig");
 const log = @import("log");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const sushi_exl3 = @import("sushi_exl3");
@@ -101,6 +102,10 @@ pub fn poolingFromDirName(dir_basename: []const u8, model_type: []const u8) ?Poo
     }
     return null;
 }
+
+/// Upstream's prefill-to-decode handover, passed to a module-owned-state arch (`Transformer.decodeHandover`):
+/// the request's prompt length, the positions it reserved, and whether the shell drives native draft rounds.
+pub const DecodeHandover = @import("sdk").DecodeHandover;
 
 pub const ModelConfig = struct {
     // Architecture identity
@@ -397,6 +402,14 @@ pub const ModelConfig = struct {
     dsv4_dspark_markov_rank: u32 = 0,
     dsv4_dspark_target_layers: [8]u8 = @splat(0),
     dsv4_n_dspark_target_layers: u32 = 0,
+    /// The memory in use before a streamed-expert model loads: `--memory-baseline-gb`, else the load
+    /// preflight's own reading (total less available), stamped before the weights load.
+    memory_baseline_bytes: ?u64 = null,
+    /// A streamed-expert model's decode slot rows per layer (`--expert-rows`); null = its admission's fill.
+    expert_rows: ?u32 = null,
+    /// A streamed-expert model's prompt slot rows per layer (a harness's, with `expert_rows` the decode rows);
+    /// null = its admission's fill.
+    expert_prefill_rows: ?u32 = null,
     /// Load the resident weights past the page cache (the `nocache_weights` model setting; null =
     /// the arch's default).
     nocache_weights: ?bool = null,
@@ -821,6 +834,35 @@ pub const ModelConfig = struct {
         return self.longCtxGated();
     }
 
+    /// The arch keeps its per-request decode state on its own module (deepseek_v4; a registered arch whose caps
+    /// say so): no prefix-cache restore rebuilds it and no batch merges it.
+    pub fn moduleOwnsDecodeState(self: *const ModelConfig) bool {
+        if (self.arch) |a| if (a.caps.owns_decode_state) return true;
+        return std.mem.eql(u8, self.model_type, "deepseek_v4");
+    }
+
+    /// A module-owned arch that restores its state to a prefix-cache match (`sdk.Arch.restore_prefix`).
+    pub fn moduleRestoresPrefix(self: *const ModelConfig) bool {
+        return if (self.arch) |a| a.restore_prefix != null else false;
+    }
+
+    /// The arch chunks the prompt itself, so it takes the whole prompt in one forward.
+    pub fn prefillWholePrompt(self: *const ModelConfig) bool {
+        return if (self.arch) |a| a.caps.prefill_whole_prompt else false;
+    }
+
+    /// The arch's prompt forward yields the last row's logits (a module that owns its prompt pass), so
+    /// the generator sends the whole prompt in ONE forward and takes the first token from it (no
+    /// separate 1-row logits forward, no decode-width last row).
+    pub fn prefillYieldsLastLogits(self: *const ModelConfig) bool {
+        return if (self.arch) |a| a.caps.prefill_yields_last_logits else false;
+    }
+
+    /// The host's generic streamed-expert facts a registered arch loads with.
+    pub fn loadFacts(self: *const ModelConfig) sdk.LoadFacts {
+        return .{ .memory_baseline_bytes = self.memory_baseline_bytes, .expert_rows = self.expert_rows, .expert_prefill_rows = self.expert_prefill_rows, .nocache_weights = self.nocache_weights, .wired_margin_bytes = gpu_ceiling.wired_limit_margin_bytes };
+    }
+
     /// Rows a sliding layer keeps past its window on an arch that caches only the window
     /// (`slidingRing`): spec rollback plus the prefix-cache matches that land near an entry's end.
     pub const SLIDING_RING_SLACK: u32 = 2048;
@@ -1133,7 +1175,7 @@ pub const ModelConfig = struct {
         if (self.isDiffusion()) return false;
         if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
         if (std.mem.eql(u8, self.model_type, "laguna")) return false;
-        if (std.mem.eql(u8, self.model_type, "deepseek_v4")) return false;
+        if (self.moduleOwnsDecodeState()) return false;
         return true;
     }
 
@@ -1910,6 +1952,11 @@ fn yarnMscale(factor: f32) f32 {
 /// therefore the way to A/B a scaling experiment on identical weights.
 var config_overrides: ?[]const u8 = null;
 
+/// `--memory-baseline-gb`, in bytes, and `--expert-rows`: stamped on every parsed config.
+pub var memory_baseline_override: ?u64 = null;
+pub var expert_rows_override: ?u32 = null;
+
+
 pub fn setConfigOverrides(raw: ?[]const u8) void {
     config_overrides = raw;
 }
@@ -1993,6 +2040,8 @@ pub fn parseConfigFromJsonPrefer(allocator: std.mem.Allocator, content: []const 
 
     const root = try jsonValue(.object, parsed.value);
     var config = ModelConfig{};
+    config.memory_baseline_bytes = memory_baseline_override;
+    config.expert_rows = expert_rows_override;
 
     // Detect model_type from top-level (always present)
     const model_type = if (jsonField(root, "model_type")) |v| try jsonValue(.string, v) else "gemma3";
@@ -8266,3 +8315,103 @@ test "host seams: no registered arch claims an upstream model_type; this build r
     try testing.expect(!plugins.registry.arch_ties_possible);
 }
 
+test "host seams: upstream configs parse to no arch, with every new field at its upstream-neutral default" {
+    const dsv4_json =
+        \\{
+        \\  "architectures": ["DeepseekV4ForCausalLM"],
+        \\  "model_type": "deepseek_v4",
+        \\  "bos_token_id": 0,
+        \\  "eos_token_id": 1,
+        \\  "head_dim": 512,
+        \\  "hidden_act": "silu",
+        \\  "hidden_size": 4096,
+        \\  "index_head_dim": 128,
+        \\  "index_n_heads": 64,
+        \\  "index_topk": 512,
+        \\  "max_position_embeddings": 1048576,
+        \\  "moe_intermediate_size": 2048,
+        \\  "n_routed_experts": 256,
+        \\  "n_shared_experts": 1,
+        \\  "norm_topk_prob": true,
+        \\  "num_attention_heads": 64,
+        \\  "num_experts_per_tok": 6,
+        \\  "num_hidden_layers": 43,
+        \\  "num_hash_layers": 3,
+        \\  "num_key_value_heads": 1,
+        \\  "num_nextn_predict_layers": 3,
+        \\  "dspark_block_size": 5,
+        \\  "dspark_noise_token_id": 128799,
+        \\  "dspark_target_layer_ids": [40, 41, 42],
+        \\  "dspark_markov_rank": 256,
+        \\  "o_groups": 8,
+        \\  "o_lora_rank": 1024,
+        \\  "q_lora_rank": 1024,
+        \\  "qk_rope_head_dim": 64,
+        \\  "hc_eps": 1e-06,
+        \\  "hc_mult": 4,
+        \\  "hc_sinkhorn_iters": 20,
+        \\  "rms_norm_eps": 1e-06,
+        \\  "rope_scaling": {
+        \\    "beta_fast": 32,
+        \\    "beta_slow": 1,
+        \\    "factor": 16,
+        \\    "original_max_position_embeddings": 65536,
+        \\    "type": "yarn"
+        \\  },
+        \\  "rope_theta": 10000,
+        \\  "routed_scaling_factor": 1.5,
+        \\  "scoring_func": "sqrtsoftplus",
+        \\  "sliding_window": 128,
+        \\  "swiglu_limit": 10.0,
+        \\  "tie_word_embeddings": false,
+        \\  "topk_method": "noaux_tc",
+        \\  "torch_dtype": "bfloat16",
+        \\  "vocab_size": 129280,
+        \\  "compress_rope_theta": 160000,
+        \\  "compress_ratios": [0, 0, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 128, 4, 0, 0, 0],
+        \\  "quantization": {"group_size": 64, "bits": 8, "mode": "affine",
+        \\    "layers.0.ffn.experts.w1": {"group_size": 64, "bits": 2, "mode": "affine"}}
+        \\}
+    ;
+    const qwen3_moe_json =
+        \\{
+        \\  "model_type": "qwen3_moe",
+        \\  "hidden_size": 2048,
+        \\  "head_dim": 128,
+        \\  "num_hidden_layers": 48,
+        \\  "num_attention_heads": 32,
+        \\  "num_key_value_heads": 4,
+        \\  "num_experts": 128,
+        \\  "num_experts_per_tok": 8,
+        \\  "moe_intermediate_size": 768,
+        \\  "shared_expert_intermediate_size": 0,
+        \\  "use_qk_norm": true,
+        \\  "use_sliding_window": false,
+        \\  "rope_theta": 10000000,
+        \\  "tie_word_embeddings": false,
+        \\  "quantization": {"bits": 8, "group_size": 64}
+        \\}
+    ;
+    const qwen2_json =
+        \\{"model_type": "qwen2", "hidden_size": 5120, "num_hidden_layers": 64, "num_attention_heads": 40,
+        \\ "num_key_value_heads": 8, "intermediate_size": 27648, "rms_norm_eps": 1e-6, "rope_theta": 1000000.0,
+        \\ "hidden_act": "silu", "tie_word_embeddings": false, "quantization": {"bits": 8, "group_size": 64}}
+    ;
+    try testing.expect(memory_baseline_override == null and expert_rows_override == null);
+    for ([_][]const u8{ dsv4_json, qwen3_moe_json, qwen2_json }) |json| {
+        var c = try parseConfigFromJson(testing.allocator, json);
+        defer c.deinit(testing.allocator);
+        try testing.expect(c.arch == null and c.arch_cfg == null);
+        try testing.expect(c.nocache_weights == null and c.memory_baseline_bytes == null);
+        try testing.expect(c.expert_rows == null and c.expert_prefill_rows == null);
+        try testing.expect(!c.prefillWholePrompt() and !c.prefillYieldsLastLogits());
+        // af34af04 keyed module-owned decode state on the model_type alone.
+        try testing.expectEqual(std.mem.eql(u8, c.model_type, "deepseek_v4"), c.moduleOwnsDecodeState());
+        const facts = c.loadFacts();
+        try testing.expect(facts.nocache_weights == null and facts.memory_baseline_bytes == null and facts.expert_rows == null);
+    }
+    var dsv4 = try parseConfigFromJson(testing.allocator, dsv4_json);
+    defer dsv4.deinit(testing.allocator);
+    try testing.expectEqualStrings("deepseek_v4", dsv4.model_type);
+    try testing.expect(!dsv4.supportsBatchedGdnDecode());
+}

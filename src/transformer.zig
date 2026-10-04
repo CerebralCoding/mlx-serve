@@ -1,6 +1,8 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
+const sdk = @import("sdk");
+const gpu_ceiling = @import("gpu_ceiling.zig");
 const qwen4_mod = @import("qwen4_exp.zig");
 const ple_gpu = @import("ple_gpu.zig");
 // The qwen4_exp MTP head shares the sidecar head's draft-rerank scheme
@@ -15103,6 +15105,9 @@ pub const ForwardCtx = struct {
     /// refuses non-standard-path targets so this can never be silently
     /// ignored on an engaged path.
     capture_layers: ?*CaptureLayers = null,
+    /// The request's shape, set once by whoever starts a request (Generator.init, each warm-up pass) before its
+    /// first forward: a registered arch's prompt pass derives its reservation from it (and refuses by name without it).
+    request: ?sdk.RequestShape = null,
     /// An additive attention term composed into the standard PREFILL path's
     /// mask, `[1, 1, q_len, kv_len]` bf16. It must ALREADY be causal: a
     /// "causal"-mode layer swaps to an array mask carrying this verbatim, so
@@ -16701,6 +16706,13 @@ pub const Transformer = struct {
     // and the forward dispatches to the module. v0 decode = full re-forward.
     dsv4: ?*dsv4_mod.Dsv4Model = null,
 
+    // A registered arch (src/plugins.zig): its module owns the trunk and whatever state its caps say, as dsv4
+    // does; the shell stays empty. Reached through its table once per prompt, step, handover or round.
+    arch: ?sdk.ArchInstance = null,
+    /// The arch's process claim (`sdk.Arch.claim_process`, its expert reader), taken at the load claim
+    /// (`archClaimProcess`) and handed to this model by its load: released at deinit, after the arch's module.
+    arch_claim: ?*const fn () void = null,
+
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
     // through forwardQwen4With. `qwen4_mixer` is the final hyper-connection
@@ -16850,6 +16862,7 @@ pub const Transformer = struct {
         // dispatch to forwardGemma3EncoderWith.
         if (config.is_encoder_only and !config.use_bidirectional_attention) return initBert(io, allocator, config, weights, &name_buf, s);
         if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return initDsv4(allocator, config, weights, s);
+        if (config.arch) |vt| return initArch(io, allocator, config, weights, s, vt);
 
         // Embeddings: the table's own name is the checkpoint's, not a family
         // trait — one lookup table, three call sites (weight/scales/biases)
@@ -18264,6 +18277,12 @@ pub const Transformer = struct {
             self.allocator.destroy(mdl);
             self.dsv4 = null;
         }
+        if (self.arch) |a| {
+            a.vt.deinit(a.module);
+            self.arch = null;
+        }
+        if (self.arch_claim) |release| release();
+        self.arch_claim = null;
         if (self.rht) |reg| {
             reg.deinit();
             self.allocator.destroy(reg);
@@ -19929,6 +19948,22 @@ pub const Transformer = struct {
         };
     }
 
+    /// The warm-up's passes, in order: [1, 1] (the decode shape: faults the embedding, compiles the decode
+    /// kernels), then [1, 8] (compiles the short-prefill kernels).
+    /// A decode pass, a verify-width pass, then a prompt-width one (past 16 rows the lane matmul runs 32-row blocks).
+    pub const warmup_passes = [_]u32{ 1, 8, 32 };
+    /// A registered arch's passes: it runs none of the host's lane kernels, so it skips the 32-row one.
+    pub const arch_warmup_passes = [_]u32{ 1, 8 };
+
+    /// A warm-up pass is a request of its own: `prompt_tokens` ids on the shell's own cache, nothing generated. A
+    /// registered arch's prompt pass reserves from this shape (deepseek_v41 reserves nothing); every other forward
+    /// reads only the default context.
+    pub fn warmupCtx(self: *Transformer, prompt_tokens: u32) ForwardCtx {
+        var ctx = self.defaultCtx();
+        ctx.request = .{ .prompt_tokens = prompt_tokens, .max_tokens = 0, .host_context = self.config.max_position_embeddings };
+        return ctx;
+    }
+
     /// Archs whose per-request decode state lives on their OWN module — one
     /// instance per MODEL, not one per slot — instead of in this shell's
     /// KVCache/ssm_entries. Every member is by construction single-flight at
@@ -19937,6 +19972,7 @@ pub const Transformer = struct {
     /// slot deinits and rebuilds the live request's state and both then append
     /// to the ONE state. Add a new arm here the moment its pointer field is
     /// added above, or the arch serves two clients one mangled stream.
+    /// A registered arch says the same through its caps (`owns_decode_state`).
     pub const module_owned_state_fields = [_][]const u8{"dsv4"};
 
     /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
@@ -19948,10 +19984,25 @@ pub const Transformer = struct {
     pub const module_shared_readonly_fields = [_][]const u8{"qwen4"};
 
     pub fn ownsModuleDecodeState(self: *const Transformer) bool {
+        if (self.arch) |a| if (a.vt.caps.owns_decode_state) return true;
         inline for (module_owned_state_fields) |f| {
             if (@field(self, f) != null) return true;
         }
         return false;
+    }
+
+    /// Upstream's prefill-to-decode handover (`model.DecodeHandover`) for a registered arch that takes one (its
+    /// phase change); a no-op for every other arch. Once per request, at the request's first decode step, from the
+    /// Generator (`beginDecode`), never inside prefill.
+    pub fn decodeHandover(self: *Transformer, h: model_mod.DecodeHandover) !void {
+        const a = self.arch orelse return;
+        if (a.vt.handover) |f| return f(a.module, h);
+    }
+
+    /// Whether this model's arch takes the handover: read once, at a Generator's construction.
+    pub fn decodeHandoverWanted(self: *const Transformer) bool {
+        const a = self.arch orelse return false;
+        return a.vt.handover != null;
     }
 
     pub fn sharesModuleReadonlyState(self: *const Transformer) bool {
@@ -20005,6 +20056,7 @@ pub const Transformer = struct {
     pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
         if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
         if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
+        if (self.arch) |a| return forwardArch(self, ctx, token_ids, a);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
         // Bidirectional embedding models (EmbeddingGemma) load standard gemma3
         // weights but never run causal decode.
@@ -20162,43 +20214,21 @@ pub const Transformer = struct {
 
     /// Pre-fault weight pages and trigger first-touch kernel compiles before
     /// the first real request so cold prefill doesn't pay 800+ms of GPU page
-    /// faulting (measured on Gemma 4 E4B 4-bit). Runs three forward passes:
-    ///   1. [1, 1] decode-shape: faults embed matrix + compiles decode kernel
-    ///   2. [1, 8] prefill-shape: compiles short-prefill kernel
-    /// then resets the cache so the first real request starts from clean state.
+    /// faulting (measured on Gemma 4 E4B 4-bit). Runs `warmup_passes` in order,
+    /// each a request of its own (`warmupCtx`), and resets the cache after
+    /// each: the next pass exercises the cold-init path, not the partial-cache
+    /// path, and the first real request starts from clean state.
     /// Idempotent — calling twice is wasted work but not incorrect.
     pub fn warmup(self: *Transformer) !void {
-        const dummy_id: i32 = 0; // BOS-ish placeholder; the actual id doesn't matter for warmup
-        const decode_shape = [_]c_int{ 1, 1 };
-        const decode_input = mlx.mlx_array_new_data(&dummy_id, &decode_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(decode_input);
-        const decode_logits = try self.forward(decode_input);
-        _ = mlx.mlx_array_free(decode_logits);
-        // Materialize the cache update so subsequent forwards see initialized entries.
-        {
-            const eval_vec = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(eval_vec);
-            for (self.cache.entries) |*entry| {
-                if (!entry.initialized) continue;
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.keys);
-                _ = mlx.mlx_vector_array_append_value(eval_vec, entry.values);
-            }
-            _ = mlx.mlx_eval(eval_vec);
-        }
-        _ = mlx.mlx_clear_cache();
-
-        // Reset before the prefill-shape pass so we exercise the cold-init path,
-        // not the partial-cache path.
-        try self.resetCache();
-
-        // A verify-width pass, then a prompt-width one (past 16 rows the lane matmul runs 32-row blocks).
-        const ids: [32]i32 = @splat(0);
-        for ([_]c_int{ 8, 32 }) |width| {
-            const prefill_shape = [_]c_int{ 1, width };
-            const prefill_input = mlx.mlx_array_new_data(&ids, &prefill_shape, 2, .int32);
-            defer _ = mlx.mlx_array_free(prefill_input);
-            const prefill_logits = try self.forward(prefill_input);
-            _ = mlx.mlx_array_free(prefill_logits);
+        const ids: [32]i32 = @splat(0); // BOS-ish placeholders; the actual ids don't matter for warmup
+        for (if (self.arch != null) arch_warmup_passes[0..] else warmup_passes[0..]) |n| {
+            const shape = [_]c_int{ 1, @intCast(n) };
+            const input = mlx.mlx_array_new_data(&ids, &shape, 2, .int32);
+            defer _ = mlx.mlx_array_free(input);
+            var ctx = self.warmupCtx(n);
+            const logits = try self.forwardWith(&ctx, input);
+            _ = mlx.mlx_array_free(logits);
+            // Materialize the cache update so subsequent forwards see initialized entries.
             {
                 const eval_vec = mlx.mlx_vector_array_new();
                 defer _ = mlx.mlx_vector_array_free(eval_vec);
@@ -44601,18 +44631,94 @@ fn forwardDsv4WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_
     return mlx.mlx_array_new_data(logits_host.ptr, &shape, 3, .float32);
 }
 
+/// A registered arch's own load requirement for the load preflight: the bytes it needs free, in place of the
+/// shards' disk bytes (null: the preflight bills the shards). A streamed-expert arch bills its native memory at
+/// the fill's floor rows (the slot banks, residents, prompt wave and caches), so the preflight is the one load gate
+/// and its message and `--skip-mem-preflight` apply.
+pub fn archLoadRequirementBytes(io: std.Io, allocator: std.mem.Allocator, config: *const ModelConfig) ?u64 {
+    const vt = config.arch orelse return null;
+    const facts = config.loadFacts();
+    return vt.load_bytes(allocator, io, config.arch_cfg.?, &facts, gpu_ceiling.staticGpuMemoryCeiling()) catch |e| {
+        std.log.warn("[preflight] {s} bill unavailable ({s}); billing the shards", .{ vt.name, @errorName(e) });
+        return null;
+    };
+}
+
+/// The registry's load claim of what the config's arch holds once per process (`sdk.Arch.claim_process`, e.g. its
+/// expert reader), before the preflight and the weights; the release when taken (the caller owns the claim until it
+/// hands it to the loaded Transformer's `arch_claim`), null when the arch claims nothing. A second load that needs it
+/// is refused by the claim's error (the load site logs the refusal).
+pub fn archClaimProcess(config: *const ModelConfig) anyerror!?*const fn () void {
+    const vt = config.arch orelse return null;
+    const claim = vt.claim_process orelse return null;
+    try claim();
+    return vt.release_process.?;
+}
+
+/// A registered arch: its module over the loaded residents; the shell is dsv4's (a 0-layer KVCache, empty
+/// standard fields).
+fn initArch(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream, vt: *const sdk.Arch) !Transformer {
+    const load: sdk.LoadCtx = .{ .gpa = allocator, .io = io, .stream = s, .weights = weights, .loader = &model_mod.weight_loader, .facts = config.loadFacts(), .ceiling = gpu_ceiling.staticGpuMemoryCeiling() };
+    const m = try vt.init(&load, config.arch_cfg.?);
+    errdefer vt.deinit(m);
+    var t = try initDsv4Shell(allocator, config, s);
+    t.arch = .{ .vt = vt, .cfg = config.arch_cfg.?, .module = m };
+    return t;
+}
+
+/// What a registered arch's forward runs at this context: its prompt pass, with the request's shape, while the cache is
+/// short of the request's prompt (`cache.step == 0`, or the prefix a `restore_prefix` arch kept); its step after it
+/// (null). A fresh request without its shape is refused by name: every caller that starts a request states it
+/// (Generator.init, each warm-up pass).
+fn archPass(ctx: *const ForwardCtx) error{RequestShapeMissing}!?sdk.RequestShape {
+    const req = ctx.request orelse return if (ctx.cache.step == 0) error.RequestShapeMissing else null;
+    return if (ctx.cache.step < req.prompt_tokens) req else null;
+}
+
+/// The prompt at `cache.step == 0` (a fresh request, its shape set by whoever started it), later positions after it;
+/// the last row's logits as rank-3 [1, 1, vocab] f32 (callers slice the last position).
+fn forwardArch(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, a: sdk.ArchInstance) !mlx.mlx_array {
+    const prompt = try archPass(ctx);
+    const n = mlx.mlx_array_size(token_ids);
+    var ids32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids32);
+    try mlx.check(mlx.mlx_astype(&ids32, token_ids, .int32, self.s));
+    try mlx.check(mlx.mlx_array_eval(ids32));
+    const data = mlx.mlx_array_data_int32(ids32) orelse return error.NoData;
+    const ids = try self.allocator.alloc(u32, n);
+    defer self.allocator.free(ids);
+    for (ids, data[0..n]) |*o, id| o.* = @intCast(id);
+    const logits = if (prompt) |req| try a.vt.prefill(a.module, ids, req) else try a.vt.step(a.module, ids);
+    defer _ = mlx.mlx_array_free(logits);
+    ctx.cache.step += n;
+    var f32_logits = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f32_logits);
+    try mlx.check(mlx.mlx_astype(&f32_logits, logits, .float32, self.s));
+    const shape = [_]c_int{ 1, 1, @intCast(mlx.mlx_array_size(f32_logits)) };
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_reshape(&out, f32_logits, &shape, 3, self.s));
+    return out;
+}
+
 fn initDsv4(allocator: std.mem.Allocator, config: ModelConfig, weights: *const Weights, s: mlx.mlx_stream) !Transformer {
     const dw = try dsv4_mod.loadDsv4Weights(allocator, &config, weights);
     const mdl = try allocator.create(dsv4_mod.Dsv4Model);
     errdefer allocator.destroy(mdl);
     mdl.* = try dsv4_mod.initModel(allocator, &config, dw, s);
+    var t = try initDsv4Shell(allocator, config, s);
+    t.dsv4 = mdl;
+    return t;
+}
+
+/// A module arch's shell: a 0-layer KVCache and every standard field empty.
+fn initDsv4Shell(allocator: std.mem.Allocator, config: ModelConfig, s: mlx.mlx_stream) !Transformer {
     const cache = try KVCache.init(allocator, 0);
     return .{
         .config = config,
         .cache = cache,
         .s = s,
         .allocator = allocator,
-        .dsv4 = mdl,
         .emb_w = mlx.mlx_array_new(),
         .emb_s = mlx.mlx_array_new(),
         .emb_b = mlx.mlx_array_new(),
@@ -64430,12 +64536,23 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     var t: Transformer = undefined;
     t.rht = null;
     t.dsv4 = null;
+    t.arch = null;
     t.qwen4 = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
     var fake_dsv4: dsv4_mod.Dsv4Model = undefined;
     t.dsv4 = &fake_dsv4;
     try testing.expect(t.ownsModuleDecodeState());
+
+    // A registered arch says it through its caps.
+    const owning = comptime sdk.Arch.of(sdk.testing.FakeArch(.{}));
+    const sharing = comptime sdk.Arch.of(sdk.testing.FakeArch(.{ .caps = .{} }));
+    var module: u8 = 0;
+    t.dsv4 = null;
+    t.arch = .{ .vt = &owning, .cfg = &module, .module = &module };
+    try testing.expect(t.ownsModuleDecodeState());
+    t.arch = .{ .vt = &sharing, .cfg = &module, .module = &module };
+    try testing.expect(!t.ownsModuleDecodeState());
 }
 
 test "every optional arch-module pointer on Transformer is a declared module-owned arch" {
@@ -64476,6 +64593,63 @@ test "every optional arch-module pointer on Transformer is a declared module-own
     }
     // A scan that matches nothing passes vacuously — pin the known count.
     try testing.expectEqual(Transformer.module_owned_state_fields.len + Transformer.module_shared_readonly_fields.len, found);
+}
+
+test "dsv41 handover: the decode handover reaches a registered arch that takes one, once, with its fields; a no-op elsewhere" {
+    // No module installed: nothing wants it and the call is a no-op.
+    var xfm: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(xfm, f) = null;
+    xfm.arch = null;
+    try testing.expect(!xfm.decodeHandoverWanted());
+    try xfm.decodeHandover(.{ .prompt_tokens = 8, .reserved_tokens = 16, .native_draft = false });
+    // An arch with a handover: wanted, and each call reaches its module with the same fields.
+    const Fake = sdk.testing.FakeArch(.{});
+    Fake.calls = .{};
+    const vt = comptime sdk.Arch.of(Fake);
+    var m: Fake.Module = .{ .gpa = testing.allocator, .calls = &Fake.calls };
+    var cfg: Fake.Config = .{};
+    xfm.arch = .{ .vt = &vt, .cfg = &cfg, .module = &m };
+    try testing.expect(xfm.decodeHandoverWanted());
+    const h: model_mod.DecodeHandover = .{ .prompt_tokens = 16384, .reserved_tokens = 17408, .native_draft = true };
+    try xfm.decodeHandover(h);
+    try testing.expectEqual(@as(u32, 1), Fake.calls.handover);
+    try testing.expectEqual(h, m.last_handover.?);
+    // An arch without one (dsv4's state has no phases either): not wanted, and the call is a no-op.
+    const bare = comptime sdk.Arch.of(sdk.testing.FakeArch(.{ .handover = false }));
+    xfm.arch = .{ .vt = &bare, .cfg = &cfg, .module = &m };
+    try testing.expect(!xfm.decodeHandoverWanted());
+    try xfm.decodeHandover(h);
+    try testing.expectEqual(@as(u32, 1), Fake.calls.handover);
+}
+
+test "dsv41 warmup: each warm-up pass is a request of its own, so a registered arch's prompt pass gets its shape" {
+    // The warm-up once forwarded on the default context: a registered arch refused its first pass by name
+    // (RequestShapeMissing) and every load logged "Warmup failed". MLX arrays are off limits on the host, so this
+    // pins the passes and the contexts `warmup` runs them on, and the decision `forwardArch` makes from each.
+    var t: Transformer = undefined;
+    t.cache.step = 0;
+    t.moe_seq_offset = 0;
+    t.ssm_entries = null;
+    t.capture_hidden = null;
+    t.vision_embeddings = null;
+    t.config.max_position_embeddings = 163_840;
+    try testing.expectEqualSlices(u32, &.{ 1, 8 }, &Transformer.arch_warmup_passes);
+    for (Transformer.arch_warmup_passes) |n| {
+        const ctx = t.warmupCtx(n);
+        try testing.expect(ctx.cache == &t.cache and ctx.moe_seq_offset == &t.moe_seq_offset);
+        try testing.expectEqual(sdk.RequestShape{ .prompt_tokens = n, .max_tokens = 0, .host_context = 163_840 }, (try archPass(&ctx)).?);
+    }
+    // The default context states no request: a prompt pass refuses by name, a step needs none.
+    const plain = t.defaultCtx();
+    try testing.expectError(error.RequestShapeMissing, archPass(&plain));
+    t.cache.step = 1;
+    try testing.expectEqual(@as(?sdk.RequestShape, null), try archPass(&plain));
+    // A request whose first position a `restore_prefix` arch kept: the rest is still its prompt pass; at the prompt's
+    // length its steps follow.
+    const later = t.warmupCtx(8);
+    try testing.expectEqual(later.request.?, (try archPass(&later)).?);
+    t.cache.step = 8;
+    try testing.expectEqual(@as(?sdk.RequestShape, null), try archPass(&later));
 }
 
 test "every generative forward arm splices vision embeddings" {
@@ -72501,4 +72675,26 @@ test "glm5_next MTP fixture: the pack's mtp.0 layer drafts as mlx-vlm's drafter,
     try testing.expectEqual(@as(usize, @intCast(R)), cache2.seqLen(0));
     std.debug.print("[glm5 mtp fixture] history + {d} single rows: min cos {d:.5}, decided misses {d}\n", .{ R - t_pre, worst, misses });
     try testing.expect(one_shot_ok and worst > 0.995 and misses == 0);
+}
+
+// ── host seams: arch dispatch through the registry (characterization against upstream af34af04) ──
+
+test "host seams: an in-tree model warms up with upstream's passes, each on the default context (the request shape is read by registered archs only)" {
+    try testing.expectEqualSlices(u32, &.{ 1, 8, 32 }, &Transformer.warmup_passes);
+    var t: Transformer = undefined;
+    t.cache.step = 0;
+    t.moe_seq_offset = 0;
+    t.ssm_entries = null;
+    t.capture_hidden = null;
+    t.vision_embeddings = null;
+    t.config.max_position_embeddings = 32_768;
+    for (Transformer.warmup_passes) |n| {
+        var ctx = t.warmupCtx(n);
+        try testing.expect(ctx.request != null);
+        ctx.request = null;
+        const plain = t.defaultCtx();
+        inline for (@typeInfo(ForwardCtx).@"struct".field_names) |name| {
+            try testing.expect(std.meta.eql(@field(plain, name), @field(ctx, name)));
+        }
+    }
 }

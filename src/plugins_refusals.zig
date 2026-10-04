@@ -47,6 +47,27 @@ const Nameless = struct {
     pub const claims = Claims.claims;
 };
 
+/// An arch that claims a process resource without the release.
+const ClaimOnly = struct {
+    const F = FakeArch(.{});
+    pub const name = F.name;
+    pub const caps = F.caps;
+    pub const claims = F.claims;
+    pub const Config = F.Config;
+    pub const Module = F.Module;
+    pub const parse = F.parse;
+    pub const freeConfig = F.freeConfig;
+    pub const shell = F.shell;
+    pub const applySettings = F.applySettings;
+    pub const loadBytes = F.loadBytes;
+    pub const init = F.init;
+    pub const deinit = F.deinit;
+    pub const prefill = F.prefill;
+    pub const step = F.step;
+    pub const position = F.position;
+    pub fn claimProcess() !void {}
+};
+
 fn line(comptime name: []const u8, comptime provides: sdk.Provides) sdk.Plugin {
     return .{ .name = name, .api = sdk.api, .mlx = sdk.mlx_pin, .provides = provides };
 }
@@ -73,6 +94,8 @@ else if (is("source_claims_returns"))
     &.{line("p", .{ .source = ClaimsReturnsBool })}
 else if (is("source_no_name"))
     &.{line("p", .{ .source = Nameless })}
+else if (is("arch_claim_unpaired"))
+    &.{line("p", .{ .arch = ClaimOnly })}
 else if (is("name_not_json_safe"))
     &.{line("quo\"te", .{ .arch = FakeArch(.{}) })}
 else
