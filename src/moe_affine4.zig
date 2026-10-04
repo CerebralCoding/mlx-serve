@@ -143,11 +143,50 @@ fn apply(kernel: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, out_s
 
 pub const Bank = struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array };
 
+/// One-expert views of a layer's banks, bound in place of them: MLX bills a command buffer for the
+/// `data_size` of every array a kernel binds, and a whole bank (419 MB) forced a commit per kernel.
+/// The kernels address experts from the buffer pointer, so the view only changes the billing.
+pub const Views = struct { gate: Bank, up: Bank, down: Bank };
+
+var views_enabled: ?bool = null;
+
+/// `MLX_SERVE_MOE_BANK_VIEWS=0` binds the whole banks.
+fn viewsOn() bool {
+    if (views_enabled) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_MOE_BANK_VIEWS");
+    views_enabled = raw == null or raw.?[0] != '0';
+    return views_enabled.?;
+}
+
+fn oneExpert(a: mlx.mlx_array, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !mlx.mlx_array {
+    const sh = mlx.getShape(a);
+    if (sh.len != 3) return a;
+    var v = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(v);
+    try mlx.check(mlx.mlx_slice(&v, a, &[_]c_int{ 0, 0, 0 }, 3, &[_]c_int{ 1, sh[1], sh[2] }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+    try owned.append(allocator, v);
+    return v;
+}
+
+/// Views for banks that carry scales and biases (null otherwise); the caller keeps `owned` alive
+/// as long as the banks.
+pub fn bindViews(gate: Bank, up: Bank, down: Bank, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !?Views {
+    if (!viewsOn()) return null;
+    inline for (.{ gate, up, down }) |bk| {
+        if (bk.s.ctx == null or bk.b.ctx == null) return null;
+    }
+    var out: Views = undefined;
+    inline for (.{ "gate", "up", "down" }, .{ gate, up, down }) |name, bk| {
+        @field(out, name) = .{ .w = try oneExpert(bk.w, owned, allocator, s), .s = try oneExpert(bk.s, owned, allocator, s), .b = try oneExpert(bk.b, owned, allocator, s) };
+    }
+    return out;
+}
+
 /// y [hidden] = sum_k scores[k] * down_k(silu(gate_k(x)) * up_k(x)) for ONE token. `x` [hidden]
 /// bf16/f16, banks [E, out, in/8] u32 with scales and biases [E, out, in/GS] in x's dtype,
 /// `inds` [TOPK] u32, `scores` [TOPK] in x's dtype, `sigtab` the SwiGLU table. Null outside
-/// the kernels' set (caller keeps its path).
-pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: Bank, inds: mlx.mlx_array, scores: mlx.mlx_array, sigtab: mlx.mlx_array, group_size: u32) !?mlx.mlx_array {
+/// the kernels' set (caller keeps its path). `views` (of the same banks) are what the kernels bind.
+pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: Bank, views: ?Views, inds: mlx.mlx_array, scores: mlx.mlx_array, sigtab: mlx.mlx_array, group_size: u32) !?mlx.mlx_array {
     if (!enabled() or !mlx.streamIsGpu(s)) return null;
     if (group_size < 16 or group_size % 16 != 0) return null;
     const dt = mlx.mlx_array_dtype(x);
@@ -179,9 +218,10 @@ pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: B
         const ins = [_][*:0]const u8{ "act", "wd_q", "d_scales", "d_biases", "inds", "scores" };
         downred_kernel = try makeKernel("mlxserve_moe_a4_downred", &ins, DOWNRED_SOURCE);
     }
-    const act = try apply(gateup_kernel.?, &.{ x, gate.w, gate.s, gate.b, up.w, up.s, up.b, inds, sigtab }, &.{ topk, inter }, dt, .{ 32, @divExact(inter, ROWS), topk }, &.{ .{ "K", hidden }, .{ "N", inter }, .{ "GS", gs } }, s);
+    const bound = views orelse Views{ .gate = gate, .up = up, .down = down };
+    const act = try apply(gateup_kernel.?, &.{ x, bound.gate.w, bound.gate.s, bound.gate.b, bound.up.w, bound.up.s, bound.up.b, inds, sigtab }, &.{ topk, inter }, dt, .{ 32, @divExact(inter, ROWS), topk }, &.{ .{ "K", hidden }, .{ "N", inter }, .{ "GS", gs } }, s);
     defer _ = mlx.mlx_array_free(act);
-    const y = try apply(downred_kernel.?, &.{ act, down.w, down.s, down.b, inds, scores }, &.{hidden}, dt, .{ 32, @divExact(hidden, ROWS), 1 }, &.{ .{ "I", inter }, .{ "H", hidden }, .{ "GS", gs }, .{ "TOPK", topk } }, s);
+    const y = try apply(downred_kernel.?, &.{ act, bound.down.w, bound.down.s, bound.down.b, inds, scores }, &.{hidden}, dt, .{ 32, @divExact(hidden, ROWS), 1 }, &.{ .{ "I", inter }, .{ "H", hidden }, .{ "GS", gs }, .{ "TOPK", topk } }, s);
     if (!engaged) {
         engaged = true;
         log.info("[moe] affine-4 decode kernels engaged: topk={d} inter={d} hidden={d} gs={d} (MLX_SERVE_MOE_AFFINE4=0 restores the per-slot gather kernels)\n", .{ topk, inter, hidden, gs });
@@ -284,7 +324,7 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
     try mlx.check(mlx.mlx_astype(&scores, sc32, .bfloat16, s));
     const sigtab = try xfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
 
-    const ours = (try decode(s, x, g.b, u.b, d.b, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
+    const ours = (try decode(s, x, g.b, u.b, d.b, null, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
     defer _ = mlx.mlx_array_free(ours);
     // The shipped per-slot kernels on the same inputs.
     const act = (try xfm.gatherQmvGateUp(s, x, g.b.w, g.b.s, g.b.b, u.b.w, u.b.s, u.b.b, inds, 4, 64, .affine, 0)) orelse return error.GatherDeclined;
@@ -340,4 +380,26 @@ test "moe affine-4 decode: no worse than the per-slot gather kernels against the
         std.debug.print("\n[moe-a4] ours_rms={e:.4} per-slot_rms={e:.4}\n", .{ rms_o, rms_s });
         return e;
     };
+
+    // The views production binds: one expert wide, the banks' own buffers, the same bits out.
+    var owned: std.ArrayList(mlx.mlx_array) = .empty;
+    defer {
+        for (owned.items) |a| _ = mlx.mlx_array_free(a);
+        owned.deinit(testing.allocator);
+    }
+    const views = (try bindViews(g.b, u.b, d.b, &owned, testing.allocator, s)) orelse return error.NoViews;
+    for (owned.items) |a| try mlx.check(mlx.mlx_array_eval(a));
+    inline for (.{ .{ views.gate, g.b }, .{ views.up, u.b }, .{ views.down, d.b } }) |pair| {
+        inline for (.{ "w", "s", "b" }) |f| {
+            const v = @field(pair[0], f);
+            const bank = @field(pair[1], f);
+            try testing.expectEqual(mlx.mlx_array_size(bank) / @as(usize, @intCast(E)), mlx.mlx_array_size(v));
+            try testing.expectEqual(@intFromPtr(mlx.mlx_array_data_uint32(bank)), @intFromPtr(mlx.mlx_array_data_uint32(v)));
+        }
+    }
+    const viewed = (try decode(s, x, g.b, u.b, d.b, views, inds, scores, sigtab, 64)) orelse return error.KernelDeclined;
+    defer _ = mlx.mlx_array_free(viewed);
+    const hv = try readF32(viewed, s);
+    defer testing.allocator.free(hv);
+    try testing.expectEqualSlices(f32, ho, hv);
 }

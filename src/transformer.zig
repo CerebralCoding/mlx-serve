@@ -14592,6 +14592,8 @@ pub const MoeMlpWeights = struct {
     // shared-expert "sink") — not qwen's gated single expert, not hy3's
     // ungated add. Read only by the inkling forward arm.
     router_global_scale: ?mlx.mlx_array = null,
+    // One-expert views of the affine-4 banks the decode kernels bind (`moe_affine4.bindViews`).
+    bank_views: ?moe_affine4.Views = null,
 };
 
 const HybridMlpWeights = union(enum) {
@@ -32348,7 +32350,7 @@ pub const Transformer = struct {
         try mlx.check(mlx.mlx_reshape(&sc1, norm_scores, &.{k}, 1, self.s));
         const sigtab = try swigluSigTable(self.s, mlx.mlx_array_dtype(expert_x), std.heap.c_allocator);
         const Bank = moe_affine4.Bank;
-        const y = (try moe_affine4.decode(self.s, x1, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b }, ind_u, sc1, sigtab, group_size)) orelse return false;
+        const y = (try moe_affine4.decode(self.s, x1, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b }, mw.bank_views, ind_u, sc1, sigtab, group_size)) orelse return false;
         defer _ = mlx.mlx_array_free(y);
         try mlx.check(mlx.mlx_reshape(out, y, &.{ xs[0], xs[1], xs[2] }, 3, self.s));
         return true;
@@ -34566,6 +34568,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 if (mw.shared_expert_gate_w) |*seg_w_ptr| {
                     try maybeTransposeForBf16(seg_w_ptr, mw.shared_expert_gate_s.?, &owned_bf16, allocator, s);
                 }
+                const Bk = moe_affine4.Bank;
+                mw.bank_views = try moe_affine4.bindViews(Bk{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b }, Bk{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b }, Bk{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b }, &owned_bf16, allocator, s);
             }
         } else {
             lw.mlp = .{ .dense = .{
