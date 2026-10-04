@@ -16,11 +16,12 @@ pub const Pending = struct { out: mlx.mlx_array, inj: mlx.mlx_array };
 /// (null-ctx without a pending write).
 pub const Out = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array, stream: mlx.mlx_array };
 
-/// Down rows a simdgroup owns, and so the rows a threadgroup owns: 8 simdgroups of it.
-const RPS: c_int = 4;
+/// Down rows a simdgroup owns (a threadgroup has 8 simdgroups): one row each puts 160 threadgroups
+/// on the 80-core GPU where four rows left it half idle.
+const RPS: c_int = 1;
 const ROWS_TG: c_int = 8 * RPS;
-/// Up columns a threadgroup owns: one per simdgroup.
-const COLS_TG: c_int = 8;
+/// Up columns a threadgroup owns, one per simdgroup.
+const COLS_TG: c_int = 16;
 
 const ND_SOURCE =
     \\const uint t = thread_index_in_threadgroup;
@@ -179,7 +180,7 @@ const U2_SOURCE =
     \\  }
     \\}
     \\// act = silu(T(sum of the stream partials)), as the three-kernel down launch ends.
-    \\for (int i = int(t); i < R; i += 256) {
+    \\for (int i = int(t); i < R; i += COLS * 32) {
     \\  float tsum = 0.0f;
     \\  for (int s = 0; s < HC; ++s) tsum += parts_in[s * PR + i];
     \\  const T v = T(tsum);
@@ -251,14 +252,14 @@ const Stage = struct {
     kernel: ?mlx.mlx_fast_metal_kernel = null,
     cfg: ?mlx.mlx_fast_metal_kernel_config = null,
 
-    fn arm(self: *Stage, outs: []const struct { c_int, mlx.mlx_dtype }, grid: [3]c_int, tmpl: []const struct { [*:0]const u8, c_int }, dt: mlx.mlx_dtype) !void {
+    fn arm(self: *Stage, outs: []const struct { c_int, mlx.mlx_dtype }, grid: [3]c_int, tg: c_int, tmpl: []const struct { [*:0]const u8, c_int }, dt: mlx.mlx_dtype) !void {
         if (self.cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         self.cfg = null;
         const c = mlx.mlx_fast_metal_kernel_config_new();
         errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
         for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{o[0]}, 1, o[1]));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, grid[0], grid[1], grid[2]));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", dt));
         for (tmpl) |a| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, a[0], a[1]));
         self.cfg = c;
@@ -346,8 +347,8 @@ pub fn read(
     const pr: c_int = R + hc;
     if (armed == null or !std.meta.eql(armed.?, key)) {
         const groups = @divExact(R, ROWS_TG) + inj;
-        try nd_stage.arm(&.{ .{ K, dt }, .{ hc * pr, .float32 }, .{ if (wr == 1) K else 1, dt } }, .{ 256, groups * hc, 1 }, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "WR", wr }, .{ "RPS", RPS }, .{ "ROWS_TG", ROWS_TG } }, dt);
-        try up_stage.arm(&.{ .{ hidden, dt }, .{ hc, dt } }, .{ 256, @divExact(hidden, COLS_TG), 1 }, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "COLS", COLS_TG } }, dt);
+        try nd_stage.arm(&.{ .{ K, dt }, .{ hc * pr, .float32 }, .{ if (wr == 1) K else 1, dt } }, .{ 256, groups * hc, 1 }, 256, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "WR", wr }, .{ "RPS", RPS }, .{ "ROWS_TG", ROWS_TG } }, dt);
+        try up_stage.arm(&.{ .{ hidden, dt }, .{ hc, dt } }, .{ 32 * COLS_TG, @divExact(hidden, COLS_TG), 1 }, 32 * COLS_TG, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "COLS", COLS_TG } }, dt);
         armed = key;
     }
     var nd_out: [3]mlx.mlx_array = undefined;
