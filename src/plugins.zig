@@ -348,6 +348,22 @@ test "plugins registry: model-settings.json's plugin breaks a tie between two ar
     }
 }
 
+test "plugins conformance: the host's weight map a plugin binds owns its keys and handles; replace and drop touch only present names" {
+    // empty handles: freeing one is a no-op in mlx-c, so the map's ownership runs without an array
+    var w = sdk.Weights.init(testing.allocator);
+    defer w.deinit();
+    try w.map.put(try testing.allocator.dupe(u8, "a.weight"), .{});
+    try w.map.put(try testing.allocator.dupe(u8, "b.weight"), .{});
+    try testing.expectEqual(@as(u32, 2), w.count());
+    try testing.expect(w.get("a.weight") != null and w.get("c.weight") == null);
+    w.replace("c.weight", .{});
+    try testing.expectEqual(@as(u32, 2), w.count());
+    w.replace("a.weight", .{});
+    w.drop("c.weight");
+    w.drop("b.weight");
+    try testing.expect(w.count() == 1 and w.get("b.weight") == null);
+}
+
 
 test "plugins conformance: the host's MLX pin is the MLX this binary links, and every registered plugin's matches it" {
     var v = sdk.mlx.mlx_string_new();

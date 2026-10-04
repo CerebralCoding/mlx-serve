@@ -8,7 +8,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const transformer_mod = @import("transformer.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
-const mtp_acceptance = @import("mtp_acceptance.zig");
+const mtp_acceptance = @import("mtp_acceptance");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -332,6 +332,10 @@ fn printUsage(io: std.Io) void {
         \\  --wired-margin-gib <n>
         \\                      How far under iogpu.wired_limit_mb a plan may
         \\                        reach (default: 8, integers 2..32).
+        \\  --wired-margin <size>
+        \\                      --wired-margin-gib at byte granularity (bytes,
+        \\                        or KB/MB/GB; 1..32 GiB), e.g. 2000000000 for a
+        \\                        2.0 GB margin. The last margin flag wins.
         \\  --tokenize-cache-entries <n>
         \\                      Per-model LRU cache of chat-template render +
         \\                        tokenize results (default: 4). Skips re-
@@ -886,13 +890,23 @@ pub fn main(init: std.process.Init) !void {
             server_mod.ssm_checkpoint_max = std.fmt.parseInt(u32, args[i], 10) catch 16;
         } else if (std.mem.eql(u8, args[i], "--os-reserve-gib") and i + 1 < args.len) {
             i += 1;
-            server_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
+            server_mod.gpu_ceiling_mod.os_reserve_override = server_mod.parseOsReserveGib(args[i]) catch {
                 log.err("--os-reserve-gib: expected an integer 0..64, got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+        } else if (std.mem.eql(u8, args[i], "--wired-margin") and i + 1 < args.len) {
+            i += 1;
+            const bytes = parseSizeArg(args[i]) catch {
+                log.err("--wired-margin: expected a size (bytes, or KB/MB/GB), got '{s}'\n", .{args[i]});
+                std.process.exit(1);
+            };
+            server_mod.gpu_ceiling_mod.wired_limit_margin_bytes = server_mod.gpu_ceiling_mod.wiredMarginFromBytes(bytes) catch {
+                log.err("--wired-margin: expected 1..32 GiB, got {d} B\n", .{bytes});
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--wired-margin-gib") and i + 1 < args.len) {
             i += 1;
-            server_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
+            server_mod.gpu_ceiling_mod.wired_limit_margin_bytes = server_mod.parseWiredMarginGib(args[i]) catch {
                 log.err("--wired-margin-gib: expected an integer 2..32, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };

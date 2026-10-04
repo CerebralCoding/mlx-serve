@@ -2764,6 +2764,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.mtp_override = o.mtp orelse if (mtp_flag) null else false;
     config.mtp_acceptance_override = o.mtp_acceptance;
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
+    if (o.nocache_weights) |n| config.nocache_weights = n;
     config.int8_prefill_override = o.int8_prefill;
     config.drafter_override = o.drafter;
     o.drafter = null;
@@ -10927,4 +10928,21 @@ test "availForLoad: only a load that would be refused makes media residency let 
     try std.testing.expectEqual(@as(u64, 1000), held.bytes);
     _ = availForLoad(1 << 50); // can never fit: the cache is released before the refusal
     try std.testing.expectEqual(@as(u64, 0), held.bytes);
+}
+
+// ── host seams: one draft-lane dispatch (characterization against upstream af34af04) ──
+
+test "host seams: applyModelSettings leaves the load's page-cache choice alone unless the entry names nocache_weights" {
+    var cfg: ModelConfig = .{};
+    var chat: ChatConfig = .{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    var o: model_settings.Override = .{ .ctx_size = 4096, .mtp = false };
+    applyModelSettings(&cfg, &chat, &o, true);
+    try testing.expect(cfg.nocache_weights == null);
+    cfg.nocache_weights = true;
+    var o2: model_settings.Override = .{};
+    applyModelSettings(&cfg, &chat, &o2, true);
+    try testing.expectEqual(@as(?bool, true), cfg.nocache_weights);
+    var o3: model_settings.Override = .{ .nocache_weights = false };
+    applyModelSettings(&cfg, &chat, &o3, true);
+    try testing.expectEqual(@as(?bool, false), cfg.nocache_weights);
 }

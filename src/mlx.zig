@@ -183,6 +183,22 @@ pub extern "c" fn mlx_map_string_to_string_get(value: *[*:0]const u8, map: mlx_m
 
 // IO
 pub extern "c" fn mlx_load_safetensors(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, file: [*:0]const u8, s: mlx_stream) c_int;
+pub const mlx_io_reader = extern struct { ctx: ?*anyopaque = null };
+/// A custom reader's callbacks over its own descriptor (mlx/c/io_types.h `mlx_io_vtable`).
+pub const mlx_io_vtable = extern struct {
+    is_open: *const fn (?*anyopaque) callconv(.c) bool,
+    good: *const fn (?*anyopaque) callconv(.c) bool,
+    tell: *const fn (?*anyopaque) callconv(.c) usize,
+    seek: *const fn (?*anyopaque, i64, c_int) callconv(.c) void,
+    read: *const fn (?*anyopaque, [*]u8, usize) callconv(.c) void,
+    read_at_offset: *const fn (?*anyopaque, [*]u8, usize, usize) callconv(.c) void,
+    write: *const fn (?*anyopaque, [*]const u8, usize) callconv(.c) void,
+    label: *const fn (?*anyopaque) callconv(.c) [*:0]const u8,
+    free: *const fn (?*anyopaque) callconv(.c) void,
+};
+pub extern "c" fn mlx_io_reader_new(desc: ?*anyopaque, vtable: mlx_io_vtable) mlx_io_reader;
+pub extern "c" fn mlx_io_reader_free(io: mlx_io_reader) c_int;
+pub extern "c" fn mlx_load_safetensors_reader(res_0: *mlx_map_string_to_array, res_1: *mlx_map_string_to_string, in_stream: mlx_io_reader, s: mlx_stream) c_int;
 pub extern "c" fn mlx_save_safetensors(file: [*:0]const u8, param: mlx_map_string_to_array, metadata: mlx_map_string_to_string) c_int;
 
 // ── Ops ──
@@ -209,6 +225,7 @@ pub extern "c" fn mlx_arctan2(res: *mlx_array, a: mlx_array, b: mlx_array, s: ml
 pub extern "c" fn mlx_array_new_complex(real_val: f32, imag_val: f32) mlx_array;
 pub extern "c" fn mlx_minimum(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_matmul(res: *mlx_array, a: mlx_array, b: mlx_array, s: mlx_stream) c_int;
+pub extern "c" fn mlx_einsum(res: *mlx_array, subscripts: [*:0]const u8, operands: mlx_vector_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_square(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_sqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
 pub extern "c" fn mlx_rsqrt(res: *mlx_array, a: mlx_array, s: mlx_stream) c_int;
@@ -267,6 +284,7 @@ pub extern "c" fn mlx_ones(res: *mlx_array, shape: [*]const c_int, shape_num: us
 
 pub extern "c" fn mlx_slice(res: *mlx_array, a: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
 pub extern "c" fn mlx_slice_update(res: *mlx_array, src: mlx_array, update: mlx_array, start: [*]const c_int, start_num: usize, stop: [*]const c_int, stop_num: usize, strides: [*]const c_int, strides_num: usize, s: mlx_stream) c_int;
+pub extern "c" fn mlx_slice_update_dynamic(res: *mlx_array, src: mlx_array, update: mlx_array, start: mlx_array, axes: [*]const c_int, axes_num: usize, s: mlx_stream) c_int;
 
 pub extern "c" fn mlx_triu(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;
 pub extern "c" fn mlx_tril(res: *mlx_array, x: mlx_array, k: c_int, s: mlx_stream) c_int;

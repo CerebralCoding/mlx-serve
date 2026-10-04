@@ -6,7 +6,7 @@
 const std = @import("std");
 const kv_quant = @import("kv_quant.zig");
 const log = @import("log");
-const mtp_acceptance = @import("mtp_acceptance.zig");
+const mtp_acceptance = @import("mtp_acceptance");
 
 pub const Override = struct {
     ctx_size: ?u32 = null,
@@ -14,6 +14,8 @@ pub const Override = struct {
     mtp: ?bool = null,
     mtp_acceptance: ?mtp_acceptance.Mode = null,
     mtp_greedy_tail: ?bool = null,
+    /// Load the resident weights past the page cache (null: the arch's default).
+    nocache_weights: ?bool = null,
     /// LOSSY int8-activation prefill for 2-bit Prism packs (`qmm_int8`).
     int8_prefill: ?bool = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
@@ -29,7 +31,8 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.int8_prefill == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.nocache_weights == null and o.int8_prefill == null and
+            o.chat_template_kwargs == null and o.drafter == null;
     }
 
     pub fn deinit(o: *Override, alloc: std.mem.Allocator) void {
@@ -170,6 +173,10 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
     };
     if (obj.get("mtp_greedy_tail")) |g| switch (g) {
         .bool => |b| o.mtp_greedy_tail = b,
+        else => {},
+    };
+    if (obj.get("nocache_weights")) |n| switch (n) {
+        .bool => |b| o.nocache_weights = b,
         else => {},
     };
     if (obj.get("drafter")) |d| if (d == .string) {
@@ -318,13 +325,14 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
             o.drafter = null;
         };
     };
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} drafter={s} kwargs={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} nocache_weights={s} int8={s} drafter={s} kwargs={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
         if (o.mtp) |m| (if (m) "on" else "off") else "default",
         if (o.mtp_acceptance) |a| mtp_acceptance.name(a) else "default",
         if (o.mtp_greedy_tail) |g| (if (g) "on" else "off") else "default",
+        if (o.nocache_weights) |n| (if (n) "on" else "off") else "default",
         if (o.int8_prefill) |b| (if (b) "on" else "off") else "default",
         o.drafter orelse "auto",
         o.chat_template_kwargs orelse "none",
@@ -388,6 +396,18 @@ test "model_settings: the greedy tail (mtp_greedy_tail) is a bool, anything else
     const t = std.testing.allocator;
     try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").mtp_greedy_tail);
     try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").mtp_greedy_tail);
+    try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
+    try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
+}
+
+test "model_settings: nocache_weights is a bool, anything else is unset" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"nocache_weights": true}, "/m/b": {"nocache_weights": false}, "/m/c": {"nocache_weights": "yes"}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").nocache_weights);
+    try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").nocache_weights);
     try std.testing.expect(!s.lookup(t, "/m/b").isEmpty());
     try std.testing.expect(s.lookup(t, "/m/c").isEmpty());
 }

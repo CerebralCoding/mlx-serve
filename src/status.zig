@@ -1,6 +1,17 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const is_macos = builtin.os.tag == .macos;
+const memory = @import("sdk").memory;
+
+pub const Footprint = memory.Footprint;
+pub const footprint = memory.footprint;
+pub const ProcessMemory = memory.ProcessMemory;
+pub const processMemory = memory.processMemory;
+pub const startFootprintInterval = memory.startFootprintInterval;
+pub const VmBytes = memory.VmBytes;
+pub const vmBytes = memory.vmBytes;
+pub const physicalUsedBytes = memory.physicalUsedBytes;
+const VmStats64 = memory.VmStats64;
 
 // ── macOS Mach externs ──
 
@@ -38,62 +49,8 @@ const TaskBasicInfo = extern struct {
     suspend_count: i32,
 };
 
-/// task_vm_info truncated through phys_footprint (rev1). Field order matches
-/// <mach/task_info.h> exactly; @sizeOf(TaskVmInfo)/@sizeOf(i32) == 38 ==
-/// TASK_VM_INFO_REV1_COUNT, so the kernel fills through phys_footprint without
-/// overrunning the buffer.
-const TaskVmInfo = extern struct {
-    virtual_size: u64,
-    region_count: i32,
-    page_size: i32,
-    resident_size: u64,
-    resident_size_peak: u64,
-    device: u64,
-    device_peak: u64,
-    internal: u64,
-    internal_peak: u64,
-    external: u64,
-    external_peak: u64,
-    reusable: u64,
-    reusable_peak: u64,
-    purgeable_volatile_pmap: u64,
-    purgeable_volatile_resident: u64,
-    purgeable_volatile_virtual: u64,
-    compressed: u64,
-    compressed_peak: u64,
-    compressed_lifetime: u64,
-    phys_footprint: u64,
-};
-
 const CpuLoadInfo = extern struct {
     ticks: [4]u32, // user, system, idle, nice
-};
-
-const VmStats64 = extern struct {
-    free_count: u32,
-    active_count: u32,
-    inactive_count: u32,
-    wire_count: u32,
-    zero_fill_count: u64,
-    reactivations: u64,
-    pageins: u64,
-    pageouts: u64,
-    faults: u64,
-    cow_faults: u64,
-    lookups: u64,
-    hits: u64,
-    purges: u64,
-    purgeable_count: u32,
-    speculative_count: u32,
-    decompressions: u64,
-    compressions: u64,
-    swapins: u64,
-    swapouts: u64,
-    compressor_page_count: u32,
-    throttled_count: u32,
-    external_page_count: u32,
-    internal_page_count: u32,
-    total_uncompressed_pages_in_compressor: u64,
 };
 
 // ── CPU delta tracking (module-level state) ──
@@ -118,10 +75,7 @@ pub fn getAppRssMb() u32 {
 pub fn getAppMemFootprintMb() u32 {
     if (comptime !builtin.os.tag.isDarwin())
         return @intCast(linuxProcStatusKib("VmRSS:") / 1024);
-    var info = std.mem.zeroes(TaskVmInfo);
-    var count: u32 = @sizeOf(TaskVmInfo) / @sizeOf(i32); // 38 = TASK_VM_INFO_REV1_COUNT
-    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
-    return @intCast(info.phys_footprint / (1024 * 1024));
+    return @intCast(memory.footprint().now / (1024 * 1024));
 }
 
 /// Bytes of physical memory available for new allocation without heavy
@@ -167,10 +121,7 @@ pub fn getProcAvailableMemBytes() u64 {
 /// Total physical RAM (hw.memsize on Darwin; /proc/meminfo on Linux). 0 on failure.
 pub fn getTotalMemBytes() u64 {
     if (comptime !builtin.os.tag.isDarwin()) return linuxMemInfoKib("MemTotal:") * 1024;
-    var total_mem: u64 = 0;
-    var len: usize = @sizeOf(u64);
-    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
-    return total_mem;
+    return memory.totalMemBytes();
 }
 
 pub fn getAvailableMemBytes() u64 {
@@ -402,9 +353,130 @@ test "getAppMemFootprintMb returns a plausible nonzero footprint" {
     try std.testing.expect(fp < 1024 * 1024); // < 1 TB sanity bound
 }
 
+test "status: the process ledgers, and the footprint's interval peak restarts and then holds a touched allocation" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const m0 = processMemory();
+    try std.testing.expect(m0.footprint > 0 and m0.internal > 0);
+    try std.testing.expect(m0.footprint_lifetime_peak >= m0.footprint);
+    try std.testing.expect(footprint().now > 0);
+    startFootprintInterval();
+    const m1 = processMemory();
+    try std.testing.expect(m1.footprint_interval_peak <= m1.footprint_lifetime_peak);
+    try std.testing.expect(m1.footprint_interval_peak + (8 << 20) >= m1.footprint);
+    // 64 MiB touched then freed: the interval peak holds it after the free.
+    const buf = try std.heap.page_allocator.alloc(u8, 64 << 20);
+    @memset(buf, 1);
+    const touched = processMemory().footprint;
+    std.heap.page_allocator.free(buf);
+    const m2 = processMemory();
+    try std.testing.expect(touched >= m1.footprint + (60 << 20));
+    try std.testing.expect(m2.footprint_interval_peak >= touched);
+    try std.testing.expect(m2.footprint + (60 << 20) <= m2.footprint_interval_peak);
+    // The megabyte reader agrees with the byte ledger.
+    try std.testing.expect(@as(u64, getAppMemFootprintMb()) * (1 << 20) <= footprint().now + (16 << 20));
+}
+
+test "status: the box's typed page counts hold this process's footprint" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const v = vmBytes();
+    try std.testing.expect(v.wired > 0 and v.active > 0 and v.free > 0);
+    try std.testing.expect(physicalUsedBytes(v) > footprint().now);
+    try std.testing.expect(physicalUsedBytes(v) + v.free <= getTotalMemBytes() + (1 << 30));
+}
+
 test "gpuCoreCount reads the GPU's core count" {
     if (comptime !is_macos) return error.SkipZigTest;
     const n = gpuCoreCount();
     if (n == 0) return error.SkipZigTest; // a VM exposes no AGX accelerator entry
     try std.testing.expect(n >= 7 and n <= 256);
+}
+
+// ── host seams: the ledgers moved into sdk.memory (characterization against upstream af34af04's readers) ──
+
+/// Upstream af34af04's `TaskVmInfo` (rev1, through phys_footprint) and its footprint reader, verbatim.
+const UpstreamTaskVmInfo = extern struct {
+    virtual_size: u64,
+    region_count: i32,
+    page_size: i32,
+    resident_size: u64,
+    resident_size_peak: u64,
+    device: u64,
+    device_peak: u64,
+    internal: u64,
+    internal_peak: u64,
+    external: u64,
+    external_peak: u64,
+    reusable: u64,
+    reusable_peak: u64,
+    purgeable_volatile_pmap: u64,
+    purgeable_volatile_resident: u64,
+    purgeable_volatile_virtual: u64,
+    compressed: u64,
+    compressed_peak: u64,
+    compressed_lifetime: u64,
+    phys_footprint: u64,
+};
+
+fn upstreamAppMemFootprintMb() u32 {
+    var info = std.mem.zeroes(UpstreamTaskVmInfo);
+    var count: u32 = @sizeOf(UpstreamTaskVmInfo) / @sizeOf(i32);
+    if (task_info(mach_task_self_, 22, @ptrCast(&info), &count) != 0) return 0;
+    return @intCast(info.phys_footprint / (1024 * 1024));
+}
+
+fn upstreamTotalMemBytes() u64 {
+    var total_mem: u64 = 0;
+    var len: usize = @sizeOf(u64);
+    if (sysctlbyname("hw.memsize", @ptrCast(&total_mem), &len, null, 0) != 0) return 0;
+    return total_mem;
+}
+
+/// Upstream af34af04's `VmStats64` (vm_statistics64), verbatim: `getAvailableMemBytes` and the CPU sampler now read sdk.memory's.
+const UpstreamVmStats64 = extern struct {
+    free_count: u32,
+    active_count: u32,
+    inactive_count: u32,
+    wire_count: u32,
+    zero_fill_count: u64,
+    reactivations: u64,
+    pageins: u64,
+    pageouts: u64,
+    faults: u64,
+    cow_faults: u64,
+    lookups: u64,
+    hits: u64,
+    purges: u64,
+    purgeable_count: u32,
+    speculative_count: u32,
+    decompressions: u64,
+    compressions: u64,
+    swapins: u64,
+    swapouts: u64,
+    compressor_page_count: u32,
+    throttled_count: u32,
+    external_page_count: u32,
+    internal_page_count: u32,
+    total_uncompressed_pages_in_compressor: u64,
+};
+
+test "host seams: status's vm_statistics64 is upstream's layout, field for field" {
+    try std.testing.expectEqual(@sizeOf(UpstreamVmStats64), @sizeOf(VmStats64));
+    const info = @typeInfo(UpstreamVmStats64).@"struct";
+    try std.testing.expectEqual(info.field_names.len, @typeInfo(VmStats64).@"struct".field_names.len);
+    inline for (info.field_names, info.field_types) |name, T| {
+        try std.testing.expectEqual(@offsetOf(UpstreamVmStats64, name), @offsetOf(VmStats64, name));
+        try std.testing.expectEqual(T, @FieldType(VmStats64, name));
+    }
+}
+
+test "host seams: total RAM and the app footprint read what upstream's own readers read" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    try std.testing.expectEqual(upstreamTotalMemBytes(), getTotalMemBytes());
+    try std.testing.expect(getTotalMemBytes() > 0);
+    // The footprint moves between two reads; both readers see the same ledger within a few MB.
+    const before = upstreamAppMemFootprintMb();
+    const now = getAppMemFootprintMb();
+    const after = upstreamAppMemFootprintMb();
+    try std.testing.expect(before > 0 and now > 0);
+    try std.testing.expect(now + 8 >= @min(before, after) and now <= @max(before, after) + 8);
 }

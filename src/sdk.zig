@@ -44,8 +44,19 @@ const kinds = @import("sdk/kinds.zig");
 pub const Source = kinds.Source;
 pub const Engine = kinds.Engine;
 
+/// Process and box memory readings (the kernel's ledgers) that bills and construction checks compare against.
+pub const memory = @import("sdk/memory.zig");
+const weights = @import("sdk/weights.zig");
+pub const Weights = weights.Weights;
+pub const LoadOpts = weights.LoadOpts;
+pub const WeightLoader = weights.WeightLoader;
+pub const QuantMode = @import("sdk/quant_mode.zig").QuantMode;
+
 /// The comptime interface checks the kinds run on a plugin's namespaces; a plugin's own contracts reuse them.
 pub const check = @import("sdk/check.zig");
+
+/// The MTP acceptance modes the host serves (`Mode`, `DEFAULT_TYPICAL_DELTA`, `typicalThreshold`).
+pub const acceptance = @import("mtp_acceptance");
 
 /// Conformance (docs/plugins.md): every check declares its lane.
 pub const testing = @import("sdk/testing.zig");

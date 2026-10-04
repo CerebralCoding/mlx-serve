@@ -1,6 +1,7 @@
 const std = @import("std");
 const builtin = @import("builtin");
 const mlx = @import("mlx");
+const nocache_reader = @import("nocache_reader.zig");
 const log = @import("log");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const sushi_exl3 = @import("sushi_exl3");
@@ -8,7 +9,7 @@ const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
-const mtp_acceptance_mod = @import("mtp_acceptance.zig");
+const mtp_acceptance_mod = @import("mtp_acceptance");
 const sdk = @import("sdk");
 const plugins = @import("plugins.zig");
 const model_settings = @import("model_settings.zig");
@@ -26,35 +27,7 @@ pub const MAX_VISION_LAYERS = 64;
 /// `MuseGlimmerImageProcessor.max_image_tokens` — MERGED tokens, not pixels.
 pub const MUSE_MAX_IMAGE_TOKENS = 4096;
 
-pub const QuantMode = enum {
-    affine,
-    nvfp4,
-    mxfp4,
-    mxfp8,
-    /// Raw ggml blocks (lib/mlx-serve-gguf). Never reaches an MLX quantized op:
-    /// the per-tensor type rides on the weight, see `mlx_gguf.kernels.Info`.
-    gguf,
-
-    pub fn fromString(name: []const u8) ?QuantMode {
-        return std.meta.stringToEnum(QuantMode, name);
-    }
-
-    /// Mode string for mlx_quantized_matmul / mlx_gather_qmm / mlx_dequantize.
-    pub fn cstr(self: QuantMode) [*:0]const u8 {
-        return switch (self) {
-            .affine => "affine",
-            .nvfp4 => "nvfp4",
-            .mxfp4 => "mxfp4",
-            .mxfp8 => "mxfp8",
-            .gguf => "gguf",
-        };
-    }
-
-    /// Affine is the only mode whose checkpoints carry per-group biases.
-    pub fn hasBiases(self: QuantMode) bool {
-        return self == .affine;
-    }
-};
+pub const QuantMode = @import("sdk").QuantMode;
 
 pub const LayerBlockType = enum { attention, gated_conv, mamba2, mlp, moe };
 
@@ -424,6 +397,9 @@ pub const ModelConfig = struct {
     dsv4_dspark_markov_rank: u32 = 0,
     dsv4_dspark_target_layers: [8]u8 = @splat(0),
     dsv4_n_dspark_target_layers: u32 = 0,
+    /// Load the resident weights past the page cache (the `nocache_weights` model setting; null =
+    /// the arch's default).
+    nocache_weights: ?bool = null,
     /// The registered arch that claimed this model (src/plugins.zig) and its parsed config, freed with this one.
     arch: ?*const sdk.Arch = null,
     arch_cfg: ?*anyopaque = null,
@@ -3496,6 +3472,8 @@ pub fn parseConfigFromJsonPrefer(allocator: std.mem.Allocator, content: []const 
         const sh = e.kind.shell(cfg);
         config.num_experts = sh.num_experts;
         config.num_hidden_layers = sh.num_layers;
+        // A resident set that nearly fills the box: past the page cache unless the model setting says otherwise.
+        if (e.kind.caps.residents_past_page_cache) config.nocache_weights = true;
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
         // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block
         // for the architecture summary; reference is the release's own
@@ -4020,44 +3998,7 @@ fn jsonFloat(v: std.json.Value) !f32 {
     return f;
 }
 
-/// Holds all loaded weights as mlx arrays, keyed by name.
-pub const Weights = struct {
-    map: std.StringHashMap(mlx.mlx_array),
-    allocator: std.mem.Allocator,
-
-    pub fn init(allocator: std.mem.Allocator) Weights {
-        return .{
-            .map = std.StringHashMap(mlx.mlx_array).init(allocator),
-            .allocator = allocator,
-        };
-    }
-
-    pub fn deinit(self: *Weights) void {
-        var it = self.map.iterator();
-        while (it.next()) |entry| {
-            _ = mlx.mlx_array_free(entry.value_ptr.*);
-            self.allocator.free(entry.key_ptr.*);
-        }
-        self.map.deinit();
-    }
-
-    pub fn get(self: *const Weights, name: []const u8) ?mlx.mlx_array {
-        return self.map.get(name);
-    }
-
-    /// Hand the map a new array under `name`, freeing the one it held (load-time
-    /// weight fusion parks its row views here so the originals go away).
-    pub fn replace(self: *Weights, name: []const u8, arr: mlx.mlx_array) void {
-        if (self.map.getPtr(name)) |p| {
-            _ = mlx.mlx_array_free(p.*);
-            p.* = arr;
-        }
-    }
-
-    pub fn count(self: *const Weights) u32 {
-        return @intCast(self.map.count());
-    }
-};
+pub const Weights = sdk.Weights;
 
 /// The generic nestings a text trunk ships under: flat, mlx-community's
 /// re-nest, and meta's VL original (Muse-Glimmer). `parseConfigFromJson`
@@ -4133,17 +4074,25 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     return loadWeightsOpt(io, allocator, model_dir, .{});
 }
 
-/// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
-/// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
-/// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false };
+pub const LoadOpts = sdk.LoadOpts;
+
+/// The host's loaders as a plugin receives them (`sdk.LoadCtx.loader`).
+pub const weight_loader: sdk.WeightLoader = .{ .dir = loaderDir, .file = loaderFile };
+
+fn loaderDir(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, opts: LoadOpts) anyerror!Weights {
+    return loadWeightsOpt(io, allocator, model_dir, opts);
+}
+
+fn loaderFile(allocator: std.mem.Allocator, weights: *Weights, path: [*:0]const u8, s: mlx.mlx_stream, opts: LoadOpts) anyerror!void {
+    return loadSafetensorsFile(allocator, weights, path, s, opts);
+}
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *const ModelConfig, load_vision: bool) !Weights {
     var gguf_weights = Weights.init(allocator);
     errdefer gguf_weights.deinit();
     if (try mlx_gguf.loadWeights(io, allocator, model_dir, &gguf_weights.map)) return gguf_weights;
-    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16 });
+    return loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .nocache = config.nocache_weights orelse false });
 }
 
 /// Load ONE safetensors file (absolute path) into a Weights map — for
@@ -4171,7 +4120,7 @@ pub fn loadWeightsWithVision(io: std.Io, allocator: std.mem.Allocator, model_dir
     return loadWeightsOpt(io, allocator, model_dir, .{ .vision = true });
 }
 
-fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, opts: LoadOpts) !Weights {
+pub fn loadWeightsOpt(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, opts: LoadOpts) !Weights {
     var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true });
     defer dir.close(io);
     return loadWeightsFromOpenDir(io, allocator, dir, model_dir, opts);
@@ -4354,7 +4303,15 @@ pub fn loadSafetensorsFile(
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
 
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
+    if (opts.nocache) {
+        const reader = nocache_reader.reader(std.mem.span(path)) catch |e| {
+            log.err("cannot open {s} past the page cache: {s}\n", .{ path, @errorName(e) });
+            return e;
+        };
+        // Drops our reference only: MLX keeps the reader while an array still reads through it.
+        defer _ = mlx.mlx_io_reader_free(reader);
+        try mlx.check(mlx.mlx_load_safetensors_reader(&tensor_map, &meta_map, reader, s));
+    } else try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
 
     const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
     defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);
@@ -8252,6 +8209,48 @@ test "parseConfigFromJson accepts real checkpoint configs" {
 }
 
 // ── host seams: the registry's arch dispatch and the SDK types, as upstream's models see them ──
+
+/// Upstream af34af04's `QuantMode`, verbatim (now `sdk.QuantMode`).
+const UpstreamQuantMode = enum {
+    affine,
+    nvfp4,
+    mxfp4,
+    mxfp8,
+    gguf,
+
+    fn fromString(name: []const u8) ?UpstreamQuantMode {
+        return std.meta.stringToEnum(UpstreamQuantMode, name);
+    }
+    fn cstr(self: UpstreamQuantMode) [*:0]const u8 {
+        return switch (self) {
+            .affine => "affine",
+            .nvfp4 => "nvfp4",
+            .mxfp4 => "mxfp4",
+            .mxfp8 => "mxfp8",
+            .gguf => "gguf",
+        };
+    }
+    fn hasBiases(self: UpstreamQuantMode) bool {
+        return self == .affine;
+    }
+};
+
+test "host seams: QuantMode (now sdk.QuantMode) parses, names and bills biases as upstream's enum" {
+    const old_tags = @typeInfo(UpstreamQuantMode).@"enum".field_names;
+    try testing.expectEqual(old_tags.len, @typeInfo(QuantMode).@"enum".field_names.len);
+    inline for (old_tags) |name| {
+        const new = QuantMode.fromString(name).?;
+        const old = UpstreamQuantMode.fromString(name).?;
+        try testing.expectEqualStrings(name, @tagName(new));
+        try testing.expectEqualStrings(std.mem.span(old.cstr()), std.mem.span(new.cstr()));
+        try testing.expectEqual(old.hasBiases(), new.hasBiases());
+    }
+    for ([_][]const u8{ "", "Affine", "fp8", "int4", "nvfp4 " }) |s|
+        try testing.expectEqual(UpstreamQuantMode.fromString(s) == null, QuantMode.fromString(s) == null);
+    // LoadOpts (now sdk.LoadOpts): upstream's two fields keep their defaults, and the new one is off.
+    const o: LoadOpts = .{};
+    try testing.expect(!o.vision and !o.keep_f16 and !o.nocache);
+}
 
 test "host seams: no registered arch claims an upstream model_type; this build reads no tie-break setting" {
     var arena = std.heap.ArenaAllocator.init(testing.allocator);

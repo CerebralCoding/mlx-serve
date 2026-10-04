@@ -56,6 +56,8 @@ test {
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
     _ = @import("plugins.zig");
+    _ = @import("nocache_reader.zig");
+    _ = @import("gpu_ceiling.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");
