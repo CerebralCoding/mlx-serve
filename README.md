@@ -33,7 +33,8 @@ Needs macOS 26.2+ on Apple Silicon.
 
 ```bash
 brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
-brew install --cask mlx-core   # the app (recommended)
+brew trust ddalcu/mlx-serve
+brew install --cask mlx-serve  # the app (recommended)
 brew install mlx-serve         # CLI + server only, no GUI
 ```
 

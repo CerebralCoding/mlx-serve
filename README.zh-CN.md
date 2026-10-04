@@ -35,7 +35,8 @@ mlx-serve 是一个原生 Zig 服务器，让**任意 LLM 都能跑在 Apple Sil
 
 ```bash
 brew tap ddalcu/mlx-serve https://github.com/ddalcu/mlx-serve
-brew install --cask mlx-core   # 应用（推荐）
+brew trust ddalcu/mlx-serve
+brew install --cask mlx-serve  # 应用（推荐）
 brew install mlx-serve         # 仅 CLI + 服务器，不含 GUI
 ```
 
