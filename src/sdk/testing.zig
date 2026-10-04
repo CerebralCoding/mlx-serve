@@ -9,6 +9,7 @@ const builtin = @import("builtin");
 const mlx = @import("mlx");
 const peek = @import("peek.zig");
 const arch = @import("arch.zig");
+const spec = @import("spec.zig");
 const bill = @import("memory_bill.zig");
 const bill_mod = bill;
 
@@ -84,6 +85,8 @@ pub const FakeOptions = struct {
     /// The model_type the fake claims.
     model_type: []const u8 = "fake_arch",
     handover: bool = true,
+    /// Rows a round verifies; 0 = no draft lane.
+    block_size: u32 = 0,
     /// The prompt admission's bytes; null = the host's estimator.
     prompt_bytes: ?u64 = null,
     /// `restorePrefix`: the most positions of a prefix-cache match the fake keeps; null = no hook.
@@ -97,6 +100,7 @@ pub const FakeCalls = struct {
     prefill: u32 = 0,
     step: u32 = 0,
     handover: u32 = 0,
+    rounds: u32 = 0,
     restore: u32 = 0,
 };
 
@@ -186,13 +190,36 @@ pub fn FakeArch(comptime opts: FakeOptions) type {
                 return m.position;
             }
         }.f else {};
+        pub const draft_lane = if (opts.block_size > 0) struct {
+            pub fn blockSize(_: *const Module) u32 {
+                return opts.block_size;
+            }
+            pub fn laneName(_: *const Module) []const u8 {
+                return "fake lane";
+            }
+            pub fn arm(_: *const Module, req: spec.ArmRequest) spec.DraftArm {
+                return if (req.greedy and req.clean) .typical else .off;
+            }
+            /// Keeps min(cap, block - 1) drafts: [t1, t1 + 1, ...], the next token after them.
+            pub fn round(m: *Module, a: std.mem.Allocator, t1: u32, accepted_cap: u32) !spec.DraftRound {
+                const k = @min(accepted_cap, opts.block_size - 1);
+                const toks = try a.alloc(u32, k + 1);
+                for (toks, 0..) |*t, i| t.* = t1 + @as(u32, @intCast(i));
+                m.calls.rounds += 1;
+                m.position += toks.len;
+                return .{ .tokens = toks, .accepted = k, .next_token = t1 + k + 1 };
+            }
+            pub fn stats(m: *const Module) spec.DraftStats {
+                return .{ .rounds = m.calls.rounds };
+            }
+        } else {};
     };
 }
 
 const testing = std.testing;
 
 test "sdk testing: the fake arch's table counts every call, and its optional hooks follow its options" {
-    const Fake = FakeArch(.{ .prompt_bytes = 7 });
+    const Fake = FakeArch(.{ .block_size = 5, .prompt_bytes = 7 });
     Fake.calls = .{};
     const vt = comptime arch.Arch.of(Fake);
     try testing.expect(vt.caps.owns_decode_state and vt.handover != null and vt.prompt_bytes != null and vt.bill == null);
@@ -216,7 +243,7 @@ test "sdk testing: the fake arch's table counts every call, and its optional hoo
 
     const Bare = FakeArch(.{ .handover = false, .caps = .{} });
     const bare = comptime arch.Arch.of(Bare);
-    try testing.expect(bare.handover == null and bare.prompt_bytes == null and !bare.caps.owns_decode_state);
+    try testing.expect(bare.handover == null and bare.prompt_bytes == null and bare.spec == .none and !bare.caps.owns_decode_state);
     try testing.expect(vt.restore_prefix == null and bare.restore_prefix == null);
     try testing.expectError(error.FakeArchRefused, vt.parse(testing.allocator, &(try peek.ConfigPeek.parse(arena.allocator(), "/m", "{\"model_type\":\"fake_arch\",\"refuse\":1}")), &diag));
     try testing.expectEqualStrings("fake arch: refused by the fixture", diag.message());
@@ -242,6 +269,26 @@ test "sdk testing: claims fixtures run on any arch's claim" {
         .{ .config = "{\"model_type\":\"deepseek_v4\"}", .want = null },
         .{ .config = "{\"architectures\":[\"X\"]}", .want = null },
     });
+}
+
+test "sdk testing: the fake's draft lane names itself, arms only greedy clean requests and counts its rounds" {
+    const Fake = FakeArch(.{ .block_size = 3 });
+    Fake.calls = .{};
+    const vt = comptime arch.Arch.of(Fake);
+    const lane = vt.spec.draft_lane;
+    var calls: FakeCalls = .{};
+    var m: Fake.Module = .{ .gpa = testing.allocator, .calls = &calls };
+    try testing.expectEqual(@as(u32, 3), lane.block_size(&m));
+    try testing.expectEqualStrings("fake lane", lane.lane_name(&m));
+    try testing.expectEqual(spec.DraftArm.typical, lane.arm(&m, .{ .greedy = true, .clean = true }));
+    try testing.expectEqual(spec.DraftArm.off, lane.arm(&m, .{ .greedy = true, .clean = false }));
+    try testing.expectEqual(spec.DraftArm.off, lane.arm(&m, .{ .greedy = false, .clean = true }));
+    // a cap past the block keeps block - 1 drafts
+    var r = try lane.round(&m, testing.allocator, 40, 9);
+    defer r.deinit(testing.allocator);
+    try testing.expectEqualSlices(u32, &.{ 40, 41, 42 }, r.tokens);
+    try testing.expectEqual(@as(u32, 43), r.next_token);
+    try testing.expectEqual(@as(u64, 1), lane.stats(&m).rounds);
 }
 
 test "sdk testing: an arch's bill bounds its load preflight at the floor rows, or the check names the gap" {
@@ -298,12 +345,13 @@ test "sdk arch: the table's load preflight and bill call the arch's own; a hook 
         pub const step = Base.step;
         pub const position = Base.position;
         pub const handover = {};
+        pub const draft_lane = {};
         pub fn bill(_: std.mem.Allocator, _: std.Io, req: *const bill_mod.BillRequest) !bill_mod.MemoryBill {
             return .{ .per_row = req.prompt_tokens };
         }
     };
     const vt = comptime arch.Arch.of(Billed);
-    try testing.expect(vt.handover == null and vt.prompt_bytes == null);
+    try testing.expect(vt.handover == null and vt.spec == .none and vt.prompt_bytes == null);
     var arena = std.heap.ArenaAllocator.init(testing.allocator);
     defer arena.deinit();
     var diag: peek.Diag = .{};

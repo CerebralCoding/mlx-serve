@@ -1,5 +1,5 @@
 //! The plugin SDK (docs/plugins.md): the one module a plugin imports. The small SDK: what a module-owned arch needs
-//! from the host (G1 module-owned decode state, G2 the phase change, G4 phase bills, the process
+//! from the host (G1 module-owned decode state, G2 the phase change, G3 spec decode, G4 phase bills, the process
 //! claim, the weight loader and the memory ledgers) as optional declarations of the kinds below. A seam only one
 //! plugin consumes (an expert source, a kernel registry, a quant contract) stays in that plugin until a second
 //! consumer exists. The registry (src/plugins.zig) builds each kind's table once, at compile time, and the host
@@ -50,6 +50,14 @@ pub const LoadCtx = arch.LoadCtx;
 pub const RequestShape = arch.RequestShape;
 pub const DecodeHandover = arch.DecodeHandover;
 
+const spec = @import("sdk/spec.zig");
+pub const Spec = spec.Spec;
+pub const DraftLane = spec.DraftLane;
+pub const ArmRequest = spec.ArmRequest;
+pub const DraftArm = spec.DraftArm;
+pub const DraftRound = spec.DraftRound;
+pub const DraftStats = spec.DraftStats;
+
 const memory_bill = @import("sdk/memory_bill.zig");
 pub const MemoryBill = memory_bill.MemoryBill;
 pub const BillRequest = memory_bill.BillRequest;
@@ -89,6 +97,7 @@ test {
     _ = plugin;
     _ = peek;
     _ = arch;
+    _ = spec;
     _ = memory_bill;
     _ = lifecycle;
     _ = kinds;

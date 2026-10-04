@@ -1,12 +1,13 @@
 //! The `arch` kind: one erased table per arch, built at comptime from the plugin's namespace. Resolved once: `claims`
 //! at discovery, `parse` at config parse, `apply_settings` at the load sites, `init` at load; the host copies `caps`
-//! into its own tables there. Called once per prompt, serial step and handover, never per layer: the
+//! into its own tables there. Called once per prompt, serial step, handover and draft round, never per layer: the
 //! routed experts, the quant and the reader stay inside the plugin, bound at comptime. A hook that fails at load
 //! refuses the load by name; an installed lane runs directly.
 
 const std = @import("std");
 const mlx = @import("mlx");
 const peek = @import("peek.zig");
+const spec = @import("spec.zig");
 const bill = @import("memory_bill.zig");
 const check = @import("check.zig");
 const weights_mod = @import("weights.zig");
@@ -100,6 +101,7 @@ pub const Arch = struct {
     restore_prefix: ?*const fn (m: *anyopaque, prefix: []const u32) u64,
     /// The phase change; null = the arch has none.
     handover: ?*const fn (m: *anyopaque, h: DecodeHandover) anyerror!void,
+    spec: spec.Spec,
     /// G4: the arch's terms of the composed bill (waves, KV by owner, prompt state, cache limits); null = none.
     /// Pure host: it may read the model's headers through `io`, never the device.
     bill: ?*const fn (gpa: Allocator, io: std.Io, req: *const bill.BillRequest) anyerror!bill.MemoryBill,
@@ -112,7 +114,7 @@ pub const Arch = struct {
     /// The table of `T`, a namespace declaring the arch (a missing or mistyped declaration is a compile error
     /// naming it): name, caps, claims, Config, parse, freeConfig, shell, applySettings, loadBytes, Module, init,
     /// deinit, prefill, step, position; optional (absent when undeclared or `{}`) promptBytes, handover,
-    /// restorePrefix (only with `owns_decode_state`), bill, and the pair claimProcess / releaseProcess.
+    /// restorePrefix (only with `owns_decode_state`), draft_lane, bill, and the pair claimProcess / releaseProcess.
     pub fn of(comptime T: type) Arch {
         comptime {
             const w = "arch " ++ @typeName(T);
@@ -221,6 +223,7 @@ pub const Arch = struct {
             .position = W.position,
             .handover = if (check.has(T, "handover")) W.handover else null,
             .restore_prefix = if (check.has(T, "restorePrefix")) W.restorePrefix else null,
+            .spec = if (check.has(T, "draft_lane")) .{ .draft_lane = spec.DraftLane.of(T.Module, T.draft_lane) } else .none,
             .bill = if (check.has(T, "bill")) W.billOf else null,
             .claim_process = if (check.has(T, "claimProcess")) W.claimProcess else null,
             .release_process = if (check.has(T, "claimProcess")) W.releaseProcess else null,

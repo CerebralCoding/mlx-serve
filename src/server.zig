@@ -612,17 +612,18 @@ fn resolveSamplingDefault(comptime T: type, request: ?T, cli: ?T, gen_config: ?T
 /// surface can't silently ship a different default (the drafter-dispatch-hole
 /// lesson: an output-equality test cannot see a spec path that never engaged).
 /// A loaded head drafts, dense or MoE; `--no-mtp`, a model's `"mtp": false` or a
-/// request's `enable_mtp:false` opt out. `dsv4_stages`: DeepSeek-V4's own DSpark
-/// stages, loaded only on opt-in `--dspark`, which carry no qwen head.
-pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
-    return mtp_loaded or dsv4_stages;
+/// request's `enable_mtp:false` opt out. `native_stages`: the module's OWN DSpark draft
+/// lane (DeepSeek-V4's stages, loaded only on opt-in `--dspark`; DeepSeek-V4.1's draft
+/// head, installed with its served tier), which carries no qwen head.
+pub fn defaultEnableMtp(mtp_loaded: bool, native_stages: bool) bool {
+    return mtp_loaded or native_stages;
 }
 
-/// Does this model serve DeepSeek-V4 with DSpark draft stages loaded?
-fn dsv4DraftStages(lm: *LoadedModel) bool {
+/// Does this model serve its module's own DSpark draft lane (DeepSeek-V4's loaded stages,
+/// DeepSeek-V4.1's installed draft head)? The transformer's one readiness signal.
+fn nativeDraftStages(lm: *LoadedModel) bool {
     const x = lm.transformer orelse return false;
-    const d = x.dsv4 orelse return false;
-    return d.n_mtp > 0;
+    return x.nativeDraftBlock() > 0;
 }
 
 /// Can this model run an MTP-flagged request speculatively? Either a qwen
@@ -631,7 +632,7 @@ fn dsv4DraftStages(lm: *LoadedModel) bool {
 /// the bare conjunct silently killed the flag for dsv4 at submit while the
 /// default/dispatch layers were correct (the per-surface wiring class).
 fn mtpCapable(lm: *LoadedModel) bool {
-    return lm.mtp != null or dsv4DraftStages(lm);
+    return lm.mtp != null or nativeDraftStages(lm);
 }
 
 /// `--max-mtp-ctx` admission: MTP is refused past the operator's context ceiling. Called once
@@ -7337,7 +7338,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .mtp_loaded = mtpCapable(lm),
-        .mtp_default_on = defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm)),
+        .mtp_default_on = defaultEnableMtp(lm.mtp != null, nativeDraftStages(lm)),
         .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
@@ -8811,8 +8812,8 @@ fn handleChatCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
-    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, nativeDraftStages(lm));
+    if (enable_mtp and lm.mtp == null and !nativeDraftStages(lm)) enable_mtp = false;
     if (enable_mtp and logprobs_n > 0) {
         log.info("  mtp=disabled (logprobs requested)\n", .{});
         enable_mtp = false;
@@ -9188,8 +9189,8 @@ fn handleCompletions(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
-    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, nativeDraftStages(lm));
+    if (enable_mtp and lm.mtp == null and !nativeDraftStages(lm)) enable_mtp = false;
 
     // Log the request
     const preview_len = @min(prompt_text.?.len, 80);
@@ -15284,8 +15285,8 @@ fn handleAnthropicMessages(
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
-    if (enable_mtp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp = false;
+        defaultEnableMtp(lm.mtp != null, nativeDraftStages(lm));
+    if (enable_mtp and lm.mtp == null and !nativeDraftStages(lm)) enable_mtp = false;
 
     // `output_config.format` json_schema — the same two-layer enforcement as
     // chat-completions' `response_format`: a schema instruction in the system
@@ -17213,8 +17214,8 @@ fn handleResponsesInner(
     var enable_mtp_resp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
     else
-        defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm));
-    if (enable_mtp_resp and lm.mtp == null and !dsv4DraftStages(lm)) enable_mtp_resp = false;
+        defaultEnableMtp(lm.mtp != null, nativeDraftStages(lm));
+    if (enable_mtp_resp and lm.mtp == null and !nativeDraftStages(lm)) enable_mtp_resp = false;
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
     // Check if attention computation would exceed GPU memory.
@@ -24505,6 +24506,34 @@ test "host seams: the ceiling helpers in gpu_ceiling.zig compute what upstream's
     gpu_ceiling_mod.static_ceiling_override = 12_345 << 20;
     try testing.expectEqual(@as(u64, 12_345 << 20), staticGpuMemoryCeiling());
     try testing.expectEqual(@as(u64, 12_345 << 20), getGpuWorkingSetLimit());
+}
+
+test "host seams: MTP capability and its default read upstream's deepseek_v4 stage readiness" {
+    var t: transformer_mod.Transformer = undefined;
+    inline for (transformer_mod.Transformer.module_owned_state_fields) |f| @field(t, f) = null;
+    t.arch = null;
+    var dsv4: dsv4_mod.Dsv4Model = undefined;
+    var lm: LoadedModel = undefined;
+    lm.mtp = null;
+    lm.transformer = null;
+    // af34af04's `dsv4DraftStages`: a transformer whose dsv4 module has stages.
+    const upstream = struct {
+        fn stages(m: *LoadedModel) bool {
+            const x = m.transformer orelse return false;
+            const d = x.dsv4 orelse return false;
+            return d.n_mtp > 0;
+        }
+    }.stages;
+    try testing.expectEqual(upstream(&lm), nativeDraftStages(&lm));
+    lm.transformer = &t;
+    for ([_]bool{ false, true }) |with| for ([_]usize{ 0, 1, 3 }) |n_mtp| {
+        t.dsv4 = if (with) &dsv4 else null;
+        dsv4.n_mtp = n_mtp;
+        dsv4.ds_block = if (n_mtp > 0) 5 else 0;
+        try testing.expectEqual(upstream(&lm), nativeDraftStages(&lm));
+        try testing.expectEqual(upstream(&lm), mtpCapable(&lm));
+        try testing.expectEqual(upstream(&lm), defaultEnableMtp(lm.mtp != null, nativeDraftStages(&lm)));
+    };
 }
 
 test "host seams: a host with zero plugins routes nothing and adds nothing to /v1/models or /props" {

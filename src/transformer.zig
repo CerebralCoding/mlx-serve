@@ -20020,6 +20020,18 @@ pub const Transformer = struct {
         return self.ownsModuleDecodeState() or self.sharesModuleReadonlyState();
     }
 
+    /// The arch's own block-parallel draft lane (DSpark), as its readiness signal: the block size when
+    /// the module ships one and it is installed, else 0 (ds4's `mtpDraftTokens` class). Every surface
+    /// that arms, defaults or dispatches the lane reads this one answer.
+    pub fn nativeDraftBlock(self: *const Transformer) u32 {
+        if (self.dsv4) |m| return if (m.n_mtp > 0) @intCast(m.ds_block) else 0;
+        if (self.arch) |a| return switch (a.vt.spec) {
+            .draft_lane => |l| l.block_size(a.module),
+            else => 0,
+        };
+        return 0;
+    }
+
     /// Can this arch's MODULE-owned decode state be rolled back across a
     /// speculative verify?
     ///
@@ -72678,6 +72690,26 @@ test "glm5_next MTP fixture: the pack's mtp.0 layer drafts as mlx-vlm's drafter,
 }
 
 // ── host seams: arch dispatch through the registry (characterization against upstream af34af04) ──
+
+test "host seams: the native draft block is upstream's DSpark readiness (deepseek_v4 with stages), 0 for every other model" {
+    var t: Transformer = undefined;
+    inline for (Transformer.module_owned_state_fields) |f| @field(t, f) = null;
+    t.arch = null;
+    t.qwen4 = null;
+    try testing.expectEqual(@as(u32, 0), t.nativeDraftBlock());
+    var m: dsv4_mod.Dsv4Model = undefined;
+    t.dsv4 = &m;
+    // af34af04's server readiness was `dsv4.n_mtp > 0`; n_mtp > 0 always comes with a block (`dsparkStageCount`).
+    for ([_][2]usize{ .{ 0, 0 }, .{ 0, 5 }, .{ 1, 5 }, .{ 3, 5 }, .{ 3, 16 } }) |c| {
+        m.n_mtp = c[0];
+        m.ds_block = c[1];
+        try testing.expectEqual(m.n_mtp > 0, t.nativeDraftBlock() > 0);
+        if (m.n_mtp > 0) try testing.expectEqual(@as(u32, @intCast(m.ds_block)), t.nativeDraftBlock());
+        // deepseek_v4 takes no handover: the call stays a no-op.
+        try testing.expect(!t.decodeHandoverWanted());
+        try t.decodeHandover(.{ .prompt_tokens = 1, .reserved_tokens = 2, .native_draft = m.n_mtp > 0 });
+    }
+}
 
 test "host seams: an in-tree model warms up with upstream's passes, each on the default context (the request shape is read by registered archs only)" {
     try testing.expectEqualSlices(u32, &.{ 1, 8, 32 }, &Transformer.warmup_passes);
