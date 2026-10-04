@@ -62,11 +62,15 @@ final class CLISetupInstructionsTests: XCTestCase {
         defer { try? fm.removeItem(at: root) }
         let oldHome = getenv("HOME").map { String(cString: $0) }
         let oldZdotdir = getenv("ZDOTDIR").map { String(cString: $0) }
+        // /etc/zshrc sources /etc/zshrc_$TERM_PROGRAM; Terminal.app's session save prints after the marker.
+        let oldTermProgram = getenv("TERM_PROGRAM").map { String(cString: $0) }
         setenv("HOME", root.path, 1)
         setenv("ZDOTDIR", root.path, 1)
+        unsetenv("TERM_PROGRAM")
         defer {
             if let oldHome { setenv("HOME", oldHome, 1) } else { unsetenv("HOME") }
             if let oldZdotdir { setenv("ZDOTDIR", oldZdotdir, 1) } else { unsetenv("ZDOTDIR") }
+            if let oldTermProgram { setenv("TERM_PROGRAM", oldTermProgram, 1) }
         }
         try "export HOME=\(CLILauncher.shellSingleQuoted(root.path))\n".write(
             to: root.appendingPathComponent(".zshenv"), atomically: true, encoding: .utf8)
