@@ -4285,6 +4285,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var sw = io_u.Stopwatch.init(tio);
             var build_ns: u64 = 0;
             var eval_ns: u64 = 0;
+            var encode_ns: u64 = 0;
             var ops_total: u64 = 0;
             var done: usize = 0;
             for (0..n) |_| {
@@ -4296,7 +4297,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 build_ns += swb.read();
                 ops_total += mlx.op_count.load(.monotonic) - ops_before;
+                // The eval is two host phases: encoding every kernel (MLX runs `eval_gpu` on the
+                // calling thread, throttled to MAX_ACTIVE_TASKS open command buffers), then the
+                // wait for the GPU. The split says which side bounds the forward.
                 var swe = io_u.Stopwatch.init(tio);
+                const lgv = mlx.mlx_vector_array_new_value(lg);
+                _ = mlx.mlx_async_eval(lgv);
+                _ = mlx.mlx_vector_array_free(lgv);
+                encode_ns += swe.read();
                 _ = mlx.mlx_array_eval(lg);
                 eval_ns += swe.read();
                 _ = mlx.mlx_array_free(lg);
@@ -4305,11 +4313,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const dn: f64 = @floatFromInt(@max(done, 1));
             const ms = if (prefill_rows) @as(f64, @floatFromInt(build_ns + eval_ns)) / 1.0e6 / dn else @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
             transformer_mod.decodeProfReport();
-            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU, {d:.0} ops/forward)\n", .{
+            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU [encode {d:.3} + wait {d:.3}], {d:.0} ops/forward)\n", .{
                 done,
                 ms,
                 @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(encode_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(eval_ns - encode_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(ops_total)) / dn,
             });
 
@@ -5945,6 +5955,8 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         // legacy/CLI path) makes it dead on every served request.
         g.logQsaArms();
         g.persistRoundCost();
+        // The cache commit below snapshots the n-gram history: settle the pipelined step's owed advance first.
+        g.xfm.flushDeferredPle(&g.ctx) catch g.xfm.discardDeferredPle(&g.ctx);
     }
     const latched: ?[]const u8 = mlx.peekErrorName();
     if (latched) |name| {

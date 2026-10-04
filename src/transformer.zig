@@ -7703,6 +7703,7 @@ fn totalMemBytes() u64 {
 const ModelConfig = model_mod.ModelConfig;
 const QuantMode = model_mod.QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
+const moe_affine4 = @import("moe_affine4.zig");
 const glm5 = @import("glm5_next.zig");
 const glm_mtp = @import("glm_mtp.zig");
 const kda_recurrence = @import("kda_recurrence.zig");
@@ -22752,6 +22753,9 @@ pub const Transformer = struct {
     /// for all N·heads rows.
     fn pleEmbedding(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int) !mlx.mlx_array {
         const st = self.qwen4.?;
+        // A pipelined serial step on the GPU arm leaves its history settle to the next forward:
+        // by now those ids are evaluated, so the read waits on nothing.
+        if (ctx.ple_pending) |p| if (p.gpu) try self.flushDeferredPle(ctx);
         const emb_dim: usize = st.table.dim * st.hash.n_heads;
         const n: usize = mlx.mlx_array_size(token_ids);
         const batch: c_int = @intCast(n / @as(usize, @intCast(seq_len)));
@@ -22938,6 +22942,21 @@ pub const Transformer = struct {
 
     /// The GPU arm's host half: read the ids (the one sync), advance the history.
     fn pleSettleFromArray(self: *Transformer, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, capture: bool) !void {
+        // A one-token id is read in place after waiting on its own event (no new ops): the
+        // cast+contiguous eval below would queue behind whatever the GPU is running, which for a
+        // settle deferred past its own forward is the next forward.
+        if (mlx.mlx_array_size(token_ids) == 1) {
+            try mlx.check(mlx.mlx_array_eval(token_ids));
+            const one: ?u32 = switch (mlx.mlx_array_dtype(token_ids)) {
+                .int32 => if (mlx.mlx_array_data_int32(token_ids)) |p| @intCast(p[0]) else null,
+                .uint32 => if (mlx.mlx_array_data_uint32(token_ids)) |p| p[0] else null,
+                else => null,
+            };
+            if (one) |id| {
+                _ = pleAdvanceSerial(self.qwen4.?, entry, &[_]u32{id}, capture);
+                return;
+            }
+        }
         const ids_c = try self.pleEvalIds(token_ids);
         defer _ = mlx.mlx_array_free(ids_c);
         const ids = try self.pleHostIds(ids_c);
@@ -32309,6 +32328,32 @@ pub const Transformer = struct {
         return true;
     }
 
+    /// Affine-4 banks at ONE decode token: `moe_affine4`'s two dispatches over the token's
+    /// experts. Writes the weighted sum [1,1,D] into `out`; false when the kernels decline.
+    fn moeAffine4Decode(self: *Transformer, out: *mlx.mlx_array, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, mw: *const MoeMlpWeights, group_size: u32) !bool {
+        const xs = mlx.getShape(expert_x);
+        const ks = mlx.getShape(inds);
+        const k = ks[ks.len - 1];
+        var x1 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x1);
+        try mlx.check(mlx.mlx_reshape(&x1, expert_x, &.{xs[2]}, 1, self.s));
+        var ind1 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ind1);
+        try mlx.check(mlx.mlx_reshape(&ind1, inds, &.{k}, 1, self.s));
+        var ind_u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ind_u);
+        try mlx.check(mlx.mlx_astype(&ind_u, ind1, .uint32, self.s));
+        var sc1 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc1);
+        try mlx.check(mlx.mlx_reshape(&sc1, norm_scores, &.{k}, 1, self.s));
+        const sigtab = try swigluSigTable(self.s, mlx.mlx_array_dtype(expert_x), std.heap.c_allocator);
+        const Bank = moe_affine4.Bank;
+        const y = (try moe_affine4.decode(self.s, x1, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b }, ind_u, sc1, sigtab, group_size)) orelse return false;
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_reshape(out, y, &.{ xs[0], xs[1], xs[2] }, 3, self.s));
+        return true;
+    }
+
     /// The fused-rows MoE arm at decode (B >= 2). It runs ahead of the sorted
     /// chain, which stays the fallback whenever this declines: a decline is never
     /// a wrong answer, only the sorted chain's extra dispatches.
@@ -32574,6 +32619,13 @@ pub const Transformer = struct {
 
         if (moeFp4DecodeEligible(B * S, has_expert_bias, swigluClampLimit(&self.config), gate_qp.mode, up_qp.mode, down_qp.mode) and
             try self.moeFp4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size))
+        {
+            moe_reduced = true;
+            cost_arm = 1;
+        } else if (B * S == 1 and !has_expert_bias and (swigluClampLimit(&self.config) orelse 1) == 0 and cfg.hidden_act == .silu and
+            gate_qp.mode == .affine and up_qp.mode == .affine and down_qp.mode == .affine and
+            gate_qp.bits == 4 and up_qp.bits == 4 and down_qp.bits == 4 and gate_qp.group_size == up_qp.group_size and gate_qp.group_size == down_qp.group_size and
+            try self.moeAffine4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size))
         {
             moe_reduced = true;
             cost_arm = 1;
@@ -36179,19 +36231,27 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
         \\if (tid < 32) {{
         \\{s}
         \\{s}
+        \\  // The lane's strided slice of the keys lives in registers for the K rounds: a round is
+        \\  // a register max, two simd reductions and a register mask, no threadgroup traffic.
+        \\  constexpr uint EPL = (NE + 31) / 32;
+        \\  float mine[EPL];
+        \\  for (uint i = 0; i < EPL; ++i) {{
+        \\    uint e = lane + 32 * i;
+        \\    mine[i] = (e < NE) ? rk[e] : -INFINITY;
+        \\  }}
         \\  for (uint r = 0; r < NK; ++r) {{
         \\    float best = -INFINITY;
-        \\    uint bidx = 0xFFFFFFFFu;
-        \\    for (uint e = lane; e < NE; e += 32) {{
-        \\      float v = rk[e];
-        \\      if (v > best) {{ best = v; bidx = e; }}
+        \\    uint bslot = 0xFFFFFFFFu;
+        \\    for (uint i = 0; i < EPL; ++i) {{
+        \\      if (mine[i] > best) {{ best = mine[i]; bslot = i; }}
         \\    }}
         \\    float gmax = simd_max(best);
-        \\    uint cand = (best == gmax) ? bidx : 0xFFFFFFFFu;
+        \\    uint cand = (best == gmax) ? lane + 32 * bslot : 0xFFFFFFFFu;
         \\    uint gidx = metal::min(simd_min(cand), uint(NE - 1));
-        \\    if (lane == 0) {{ sel[r] = gidx; rk[gidx] = -INFINITY; }}
-        \\    simdgroup_barrier(mem_flags::mem_threadgroup);
+        \\    if (gidx % 32 == lane) mine[gidx / 32] = -INFINITY;
+        \\    if (lane == 0) sel[r] = gidx;
         \\  }}
+        \\  simdgroup_barrier(mem_flags::mem_threadgroup);
         \\
         \\  float w = 0.0f;
         \\  uint myidx = 0;
@@ -41098,6 +41158,17 @@ fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx
     return result;
 }
 
+/// Diagnostic (`MLX_SERVE_HC_DIAG_SKIP=n|d|u`): one fused read kernel stands in (N: the
+/// stream itself, D: zeros, U: stream 0) so its in-situ cost reads off the forward.
+var hc_diag_skip: ?u8 = null;
+fn hcDiagSkip() u8 {
+    if (hc_diag_skip) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_HC_DIAG_SKIP");
+    const v: u8 = if (raw != null and raw.?[0] != 0 and raw.?[0] != '0') raw.?[0] else 0;
+    hc_diag_skip = v;
+    return v;
+}
+
 pub fn hcReadFused(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -41242,7 +41313,16 @@ pub fn hcReadFused(
     var n_out: [3]mlx.mlx_array = undefined;
     const wo = if (pend) |pd| pd.out else nw;
     const wi = if (pend) |pd| pd.inj else nw;
-    try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi }, 3, &n_out);
+    const skip = hcDiagSkip();
+    if (skip == 'n') {
+        // Stand-in: the stream itself, unit-free mix partials, the deferred write dropped.
+        n_out[0] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&n_out[0], x));
+        n_out[1] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&n_out[1], &[_]c_int{rows * hc * hc}, 1, .float32, s));
+        n_out[2] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&n_out[2], x));
+    } else try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi }, 3, &n_out);
     const xn = n_out[0];
     defer _ = mlx.mlx_array_free(xn);
     const ipart = n_out[1];
@@ -41263,13 +41343,28 @@ pub fn hcReadFused(
         stream_out = shaped;
     }
     var d_out: [2]mlx.mlx_array = undefined;
-    try apply(s, 1, &.{ xn, dw, ds, db, ipart }, 2, &d_out);
+    if (skip == 'd') {
+        d_out[0] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&d_out[0], &[_]c_int{rows * R}, 1, xd, s));
+        d_out[1] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_zeros(&d_out[1], &[_]c_int{rows * hc}, 1, xd, s));
+    } else try apply(s, 1, &.{ xn, dw, ds, db, ipart }, 2, &d_out);
     const act = d_out[0];
     defer _ = mlx.mlx_array_free(act);
     const inj_flat = d_out[1];
     defer _ = mlx.mlx_array_free(inj_flat);
     var u_out: [1]mlx.mlx_array = undefined;
-    try apply(s, 2, &.{ xn, act, uw, us, ub }, 1, &u_out);
+    if (skip == 'u') {
+        // Stand-in: stream 0 as the mixed read (a view, no kernel).
+        var rows2d = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(rows2d);
+        try mlx.check(mlx.mlx_reshape(&rows2d, xn, &[_]c_int{ rows, K }, 2, s));
+        var s0 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(s0);
+        try mlx.check(mlx.mlx_slice(&s0, rows2d, &[_]c_int{ 0, 0 }, 2, &[_]c_int{ rows, hidden }, 2, &[_]c_int{ 1, 1 }, 2, s));
+        u_out[0] = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_reshape(&u_out[0], s0, &[_]c_int{rows * hidden}, 1, s));
+    } else try apply(s, 2, &.{ xn, act, uw, us, ub }, 1, &u_out);
     const mixed_flat = u_out[0];
     defer _ = mlx.mlx_array_free(mixed_flat);
 
