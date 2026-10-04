@@ -36619,7 +36619,7 @@ fn layerCap(n: usize) usize {
 var decode_prof: DecodeProf = .{};
 var decode_prof_enabled: ?bool = null;
 
-// Self-contained monotonic lap timer (this Zig nightly has no std.time.Timer;
+// Self-contained monotonic lap timer (Zig 0.17 has no std.time.Timer;
 // the repo times via std.Io). `lap()` returns ns since the previous lap.
 /// QWEN4_STANDIN=gdn,attn,mlp,gdn_recur,gdn_proj,attn_qsa,attn_sdpa,hc,moe_shared,moe_router,moe_gateup,moe_down — replace a block
 /// with a free stand-in (a +1 ref of its input / a cached ones array) so the

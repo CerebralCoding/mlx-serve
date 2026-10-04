@@ -2,14 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 comptime {
-    // 0.17.0 isn't tagged stable yet (homebrew still ships 0.16.0) — a nightly
-    // build from ziglang.org/download is required until it is. 0.16.0's
-    // bundled libc++ fails to compile against the macOS 27 beta SDK
+    // 0.16.0's bundled libc++ fails to compile against the macOS 27 SDK
     // (`use of undeclared identifier 'INFINITY'` in its vendored <random>);
-    // fixed upstream by 0.17.0-dev, which is why the floor moved.
+    // fixed in 0.17.0, which is why the floor moved.
     if (builtin.zig_version.major == 0 and builtin.zig_version.minor < 17) {
         @compileError(std.fmt.comptimePrint(
-            "mlx-serve requires Zig 0.17 (nightly until 0.17.0 stable ships) (have {d}.{d}.{d}). Grab a nightly from https://ziglang.org/download/.",
+            "mlx-serve requires Zig 0.17 (have {d}.{d}.{d}). Run ./scripts/fetch-zig.sh or grab it from https://ziglang.org/download/.",
             .{ builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch },
         ));
     }

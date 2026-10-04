@@ -3645,7 +3645,7 @@ pub const GenResult = struct {
     }
 };
 
-/// Monotonic lap clock over std.Io (this Zig nightly has no std.time.Timer).
+/// Monotonic lap clock over std.Io (Zig 0.17 has no std.time.Timer).
 const LapClock = struct {
     io: std.Io,
     start: std.Io.Timestamp,
