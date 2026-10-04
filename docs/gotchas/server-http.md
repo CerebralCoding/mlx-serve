@@ -2443,3 +2443,20 @@ each boundary and at job end (`invalidateDecodeClocks`), or a media step folds i
 as one slow spec round. Loads still run whole.
 Guard: `tests/test_gen_chat_interleave.sh` (chat before gen, same image bytes, `[gen-yield] engaged`,
 cancel frees the server, chat during the mesh job), `admissionFits`, the `offload`/`boundary` tests.
+
+## An image turn never reached the SSD tier, not even its text (#494)
+
+Defect: once a session carried an image, none of it was persisted. An idle unload or restart
+then restored an older text-only entry (123k of a 364k-token Qwen3.8-Flash-Next session) and
+prefilled the rest cold.
+
+Cause: restore already served the text before the first media item, but every disk writer
+skipped media entries outright: the SSD-first capture in `commitWithMediaState`, both
+`spillDeclinedToDisk` call sites, and the plain `flushPendingDisk`.
+
+Fix: the writers persist `HotPrefixCache.diskTokens`, the record cut at the first item (the KV
+extent follows `tokens.len`, checkpoints past it are skipped). No spec snapshot rides a media
+turn, since it covers rows past the cut. The disk key stays token-only and never holds an image row.
+A hybrid restores only from an SSM checkpoint, so its record stops at the last checkpoint below
+the item (`HotPrefixCache.hybrid`, set at load) and nothing is written when there is none.
+Guard: `an image turn persists the text before its first item to the SSD tier`.
