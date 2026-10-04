@@ -851,11 +851,15 @@ Qwen3.8 template renders `<think>` for ALL of them when `preserve_thinking` is
 undefined. Half the rendered prompt was prior reasoning, including the
 previous turn's loop.
 
-Fix: `serializeExtraContext` passes `preserve_thinking:false` to any template
-that reads it, so only turns after the last user query keep their reasoning.
-Qwen's default is deliberate (3.6+ is trained to reuse prior thinking), so the
-model's `chat_template_kwargs` in `model-settings.json`, or the request's own,
-can turn it back on. Precedence: request, model settings, generation_config, arch.
+Fix: `serializeExtraContext` forced `preserve_thinking:false`. Reversed on
+2026-10-04: on the imatrix Flash Next pack a real 162-turn pi session replayed
+at 60k-170k tokens looped 0 of 24 times either way, preserve-on scored +2.5 on
+tool-eval-bench (the multi-turn scenarios), and preserve-off re-prefilled up to
+44k tokens at every user follow-up because dropping prior reasoning moves the
+prefix. The template default stands; `chat_template_kwargs`
+`preserve_thinking:false` (request or `model-settings.json`) restores the old
+behaviour. A loop in history is the re-seed: non-streaming replies arrive with
+it cut (`loopTrimmedIds`), a streamed one cannot be retracted.
 Guard: the `preserve_thinking` test beside `serializeExtraContext`,
 `resolveChatThinking` in `server.zig`.
 

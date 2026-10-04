@@ -94,3 +94,5 @@ tests/soak_log.csv
 
 # Agent eval runs (tests/agent_eval): projects, sessions, frames, verdicts
 /tests/agent_eval/out/
+runs/*
+data
