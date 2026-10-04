@@ -5976,6 +5976,12 @@ pub fn qsaSlotAttn(
         // One fused dispatch per layer: each row indexes its own selection + tail.
         if (try qsaSparseAttn(s, q_rope, kv_view, blocks, ratio, attn_scale)) |g| return qsaSlotGathered(arms, seq_len, g, 1);
     }
+    if (qsa_ok and seq_len == 1 and !kv_view.has_quant_triple) {
+        if (try qsa_decode.attend(s, q_rope, kv_view.k, kv_view.v, blocks, ratio, attn_scale)) |g| {
+            if (qsa_dec_engaged_bits.take(0)) log.info("[qsa-dec] engaged (kv={d}) (MLX_SERVE_QSA_DEC_KERNEL=0 restores the gather / mask arms)\n", .{mlx.getShape(kv_view.k)[2]});
+            return qsaSlotGathered(arms, seq_len, g, 2);
+        }
+    }
     if (qsa_ok and seq_len == 1) {
         // Decode width: subset triples (or dense rows) → subset
         // dequant -> dense SDPA over K'<<kv. Declines to the mask arm.
@@ -6193,6 +6199,7 @@ fn noteQsaArmForSlots(slots: []const *ForwardCtx, arm: QsaArm) void {
 /// Engagement meters, one-shot per (arm, width bucket): bit = arm*4 + bucket.
 var qsa_engaged_bits: OneShotBits = .{};
 var qsa_decode_decline_bits: OneShotBits = .{};
+var qsa_dec_engaged_bits: OneShotBits = .{};
 var qsa_verify_decline_bits: OneShotBits = .{};
 
 fn qsaEngagedBit(arm: QsaArm, seq_len: c_int) u5 {
@@ -7706,6 +7713,7 @@ const QuantMode = model_mod.QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const hc_decode2 = @import("hc_decode2.zig");
 const qsa_row_mask = @import("qsa_mask.zig");
+const qsa_decode = @import("qsa_decode.zig");
 const moe_affine4 = @import("moe_affine4.zig");
 const glm5 = @import("glm5_next.zig");
 const glm_mtp = @import("glm_mtp.zig");
@@ -23600,7 +23608,7 @@ pub const Transformer = struct {
         const qk = try self.qmatmul(x, fa.idx_qk_w, fa.idx_qk_s, fa.idx_qk_b); // [B,S,(n+1)*hd]
         defer _ = mlx.mlx_array_free(qk);
         if (ctx.batch_slots) |slots| return self.qsaMaskBatched(slots, qk, fa, layer);
-        return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len, layer);
+        return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len, layer, true);
     }
 
     /// Batched decode: the indexer projection ran once on `[N,1,·]`; each row
@@ -23637,7 +23645,7 @@ pub const Transformer = struct {
             var qk_i = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(qk_i);
             try mlx.check(mlx.mlx_slice(&qk_i, qk, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, seq_len, w }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-            masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, sc.qsa_pos_base, 1, seq_len, layer);
+            masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, sc.qsa_pos_base, 1, seq_len, layer, false);
             kv_lens[i] = cache_len + seq_len;
             if (kv_lens[i] > kv_max) kv_max = kv_lens[i];
             if (masks[i].ctx != null) any = true;
@@ -23692,7 +23700,7 @@ pub const Transformer = struct {
     }
 
     /// Serial per-slot body of `qsaMask` over the projected `qk` rows.
-    fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, layer: u32) !mlx.mlx_array {
+    fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, layer: u32, solo: bool) !mlx.mlx_array {
         const offset = cache_len;
         const cfg = &self.config;
         const n_idx: c_int = @intCast(cfg.indexer_n_heads);
@@ -23825,7 +23833,9 @@ pub const Transformer = struct {
         // higher than the prefill/decode one — the union is fixed-size.
         // A placed draft row takes the mask arm: its dead rows are masked, which no gatherer reads.
         const want_blocks = qsaWantsBlocks(batch, kv, seq_len, ctx.cache.config.scheme == .affine) and ctx.head_place == null;
-        if (want_blocks) {
+        // A solo decode row on dense KV hands its picks to `qsa_decode` at every kv; the mask arm needs none.
+        const dec_row = solo and batch == 1 and seq_len == 1 and ctx.head_place == null and !ctx.cache.config.isQuant() and qsa_decode.enabled();
+        if (want_blocks or dec_row) {
             // Prefill: sorted per-row block indices for the gather kernel;
             // the dense [S, kv] mask is never built. Decode (S==1): the same
             // single-row selection for the decode gatherer.
