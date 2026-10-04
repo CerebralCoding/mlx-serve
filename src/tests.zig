@@ -28,6 +28,7 @@ test {
     _ = @import("qmv2.zig");
     _ = @import("moe_gather_ubench.zig");
     _ = @import("moe_affine4.zig");
+    _ = @import("hc_decode2.zig");
     _ = @import("rowqmv.zig");
     _ = @import("simd_qmm.zig");
     _ = @import("lane_qmm.zig");

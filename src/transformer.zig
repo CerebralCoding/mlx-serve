@@ -7703,6 +7703,7 @@ fn totalMemBytes() u64 {
 const ModelConfig = model_mod.ModelConfig;
 const QuantMode = model_mod.QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
+const hc_decode2 = @import("hc_decode2.zig");
 const moe_affine4 = @import("moe_affine4.zig");
 const glm5 = @import("glm5_next.zig");
 const glm_mtp = @import("glm_mtp.zig");
@@ -41173,6 +41174,18 @@ fn hcDiagSkip() u8 {
     return v;
 }
 
+/// The epsilon operand the hc kernels bind, cached per value.
+fn hcEpsArray(eps: f32) !mlx.mlx_array {
+    if (hc_fused_eps == null or hc_fused_eps_val != eps) {
+        if (hc_fused_eps) |e| _ = mlx.mlx_array_free(e);
+        const esh = [_]c_int{1};
+        var ev = eps;
+        hc_fused_eps = mlx.mlx_array_new_data(&ev, &esh, 1, .float32);
+        hc_fused_eps_val = eps;
+    }
+    return hc_fused_eps.?;
+}
+
 pub fn hcReadFused(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -41229,6 +41242,28 @@ pub fn hcReadFused(
         if (ish.len != 2 or ish[0] != K or ish[1] != hc) return null;
     }
 
+    if (rows == 1 and hcDiagSkip() == 0) {
+        if (try hc_decode2.read(s, x, nw, dw, ds, db, uw, us, ub, iw, try hcEpsArray(eps), hc, hidden, bits, group_size, if (pend) |pd| .{ .out = pd.out, .inj = pd.inj } else null)) |two| {
+            defer inline for (.{ "mixed", "inj", "stream" }) |name| {
+                if (@field(two, name).ctx != null) _ = mlx.mlx_array_free(@field(two, name));
+            };
+            const xsh = mlx.getShape(x);
+            var out: HcFusedOut = .{ .mixed = mlx.mlx_array_new(), .inj = .{ .ctx = null }, .stream = .{ .ctx = null } };
+            errdefer inline for (.{ "mixed", "inj", "stream" }) |name| {
+                if (@field(out, name).ctx != null) _ = mlx.mlx_array_free(@field(out, name));
+            };
+            try mlx.check(mlx.mlx_reshape(&out.mixed, two.mixed, &[_]c_int{ batch, seq, hidden }, 3, s));
+            if (two.inj.ctx != null) {
+                out.inj = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_reshape(&out.inj, two.inj, &[_]c_int{ batch, seq, hc, 1 }, 4, s));
+            }
+            if (two.stream.ctx != null) {
+                out.stream = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_reshape(&out.stream, two.stream, xsh.ptr, @intCast(xsh.len), s));
+            }
+            return out;
+        }
+    }
     const uv = xd == .bfloat16 and hcUvEligible(hc, R, bits, group_size, rows, uw);
     const key = HcFusedKey{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .bits = bits, .gs = group_size, .dtype = xd, .rows = rows, .uv = uv };
     if (hc_fused_cfgs[0] == null or !std.meta.eql(hc_fused_key, key)) {
@@ -41285,13 +41320,7 @@ pub fn hcReadFused(
         hc_fused_cfgs[2] = cu;
         hc_fused_key = key;
     }
-    if (hc_fused_eps == null or hc_fused_eps_val != eps) {
-        if (hc_fused_eps) |e| _ = mlx.mlx_array_free(e);
-        const esh = [_]c_int{1};
-        var ev = eps;
-        hc_fused_eps = mlx.mlx_array_new_data(&ev, &esh, 1, .float32);
-        hc_fused_eps_val = eps;
-    }
+    _ = try hcEpsArray(eps);
 
     const apply = struct {
         fn f(st: mlx.mlx_stream, which: usize, ins: []const mlx.mlx_array, n_out: usize, outs: []mlx.mlx_array) !void {
