@@ -4,6 +4,7 @@
 //! the token is in the incomplete tail" (every key of a one-row step is causal-visible).
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const log = @import("log.zig");
 
 // grid (kv), one thread a token. `blocks` is sorted ascending with INT_MAX sentinels, so a binary
 // search finds a token's block; a sentinel never equals a block id.
@@ -26,6 +27,7 @@ const SOURCE =
 ;
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
+var engaged = false;
 var env_enabled: ?bool = null;
 pub var override: ?bool = null;
 
@@ -72,6 +74,10 @@ pub fn rowMask(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ratio: c_int
     var out = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(out);
     try mlx.check(mlx.mlx_vector_array_get(&out, o, 0));
+    if (!engaged) {
+        engaged = true;
+        log.info("[qsa] one-row key mask kernel engaged (MLX_SERVE_QSA_MASK_KERNEL=0 restores the op chain)\n", .{});
+    }
     return out;
 }
 
