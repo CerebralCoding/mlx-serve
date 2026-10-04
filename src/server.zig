@@ -6264,6 +6264,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         // is evictable here by construction (the withheld case took the deferral arm).
         const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill);
         defer allocator.free(msg);
+        countRejected();
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
@@ -9054,6 +9055,7 @@ fn handleChatCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -9324,6 +9326,7 @@ fn handleCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -10491,6 +10494,25 @@ const StreamingTokenStream = struct {
             self.completion_tokens = g.completion_tokens;
             self.finish_reason = g.finish_reason;
         }
+    }
+
+    /// The finalized stream as a `GenerationResult`, for surfaces that share
+    /// their post-generation tail with the non-streaming path.
+    fn generationResult(self: *const StreamingTokenStream, text: []u8, token_ids: []u32, finish_reason: []const u8, constraint_payload_byte: ?usize) generate_mod.GenerationResult {
+        return .{
+            .text = text,
+            .token_ids = token_ids,
+            .prompt_tokens = self.prompt_tokens,
+            .completion_tokens = self.completion_tokens,
+            .finish_reason = finish_reason,
+            .prefill_tps = generate_mod.prefillTokensPerSec(self.prompt_tokens, self.cached_tokens, self.prefill_ns),
+            .decode_tps = generate_mod.tokensPerSec(self.completion_tokens, self.decode_ns),
+            .prefill_ns = self.prefill_ns,
+            .decode_ns = self.decode_ns,
+            .cached_tokens = self.cached_tokens,
+            .finish_details = self.finish_details,
+            .constraint_payload_byte = constraint_payload_byte,
+        };
     }
 
     const NextOrIdle = union(enum) { token: u32, done, idle };
@@ -13164,6 +13186,11 @@ fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *s
     try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
 }
 
+/// A request refused before it owned a slot. A null sink (metrics off) is one branch.
+fn countRejected() void {
+    if (g_metrics) |m| m.recordRejected();
+}
+
 fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
     return std.fmt.bufPrint(
         buf,
@@ -13215,6 +13242,15 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
     return if (actual < expected) actual else 0;
 }
 
+/// Bytes of a streamed think buffer safe to emit now: hold back the last 9
+/// bytes (the longest possible partial close tag) and cut on a UTF-8
+/// boundary; the escaper turns a split character into U+FFFD.
+fn thinkHoldBackLen(buf: []const u8) usize {
+    const max_partial: usize = 9;
+    var safe_len: usize = if (buf.len > max_partial) buf.len - max_partial else 0;
+    if (safe_len > 0) safe_len -= utf8TrailingIncomplete(buf[0..safe_len]);
+    return safe_len;
+}
 /// Build a llama.cpp-style `timings` JSON object (no surrounding key) from
 /// raw nanosecond counts and token totals. Caller frees. Returns an empty
 /// string when `prefill_ns`, `decode_ns`, AND `tokenize_ns` are all zero
@@ -15547,6 +15583,7 @@ fn handleAnthropicMessages(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -17312,6 +17349,7 @@ fn handleResponsesInner(
     // ── context limit ──
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -17468,6 +17506,8 @@ fn handleResponsesInner(
     var streamed_reasoning_id: ?[]u8 = null;
     var streamed_reasoning_index: u32 = 0;
     var streamed_reasoning_started = false;
+    // Bytes of the thought a tool-active stream already sent; the end sends the rest.
+    var tool_reasoning_streamed: usize = 0;
     var streamed_message_id: ?[]u8 = null;
     var streamed_message_index: u32 = 0;
     var streamed_message_started = false;
@@ -17596,6 +17636,8 @@ fn handleResponsesInner(
         // Inkling thinking message seen — its close is <|end_message|>.
         var inkling_think = false;
         var live_output_index: u32 = 0;
+        var tool_thought_open = active_has_tools;
+        var tool_think_scan: chat_mod.ThinkScan = .{};
 
         while (true) {
             // A stop cut resolved on the previous token ends the turn here.
@@ -17668,9 +17710,9 @@ fn handleResponsesInner(
             } else try raw_buf.appendSlice(allocator, token_text);
 
             // Beat BEFORE the tool early-continue below: a tool-active request
-            // emits nothing for its whole generation, and the thinking branch
-            // holds until its close tag. Both look identical to a dead server
-            // from the client's socket.
+            // emits nothing past its thought until generation ends, and the
+            // thinking branch holds until its close tag. Both look identical to
+            // a dead server from the client's socket.
             beatStreamKeepalive(stream, .sse_comment) catch {
                 log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                 slot_handle.?.cancel();
@@ -17678,9 +17720,29 @@ fn handleResponsesInner(
                 break;
             };
 
-            // Tool-active requests buffer entirely — we cannot emit text deltas
-            // before knowing whether the output is a tool call.
-            if (active_has_tools) continue;
+            // Tool-active requests hold the answer for the tool-call parse. The
+            // leading thought streams as it arrives, in the chat stream's order:
+            // tool hold first, then the think gate.
+            if (active_has_tools) {
+                if (tool_thought_open and !chat_mod.streamShouldBufferForTools(raw_buf.items)) {
+                    const gate = chat_mod.streamThinkGateScan(raw_buf.items, enable_thinking, false, opens_think, &tool_think_scan);
+                    tool_thought_open = gate == .hold_thinking;
+                    if (gate != .flush_text) if (chat_mod.splitThinkBlock(raw_buf.items, true, opens_think).reasoning_content) |rc| {
+                        const ready = if (tool_thought_open) chat_mod.streamableReasoning(rc) else rc;
+                        if (chat_mod.unstreamedReasoning(ready, tool_reasoning_streamed)) |fresh| {
+                            if (!streamed_reasoning_started) {
+                                streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
+                                streamed_reasoning_index = live_output_index;
+                                try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                                streamed_reasoning_started = true;
+                            }
+                            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, fresh);
+                            tool_reasoning_streamed = ready.len;
+                        }
+                    };
+                }
+                continue;
+            }
 
             if (delivery) |*d| {
                 try d.feed(allocator, token_text);
@@ -17779,10 +17841,7 @@ fn handleResponsesInner(
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
                 } else if (skipped_think_open) {
-                    // Hold back the longest possible partial-tag suffix (max 9 bytes
-                    // covers both "</think>" and "<channel|>").
-                    const max_partial: usize = 9;
-                    const safe_len = if (think_buf.items.len > max_partial) think_buf.items.len - max_partial else 0;
+                    const safe_len = thinkHoldBackLen(think_buf.items);
                     if (safe_len > 0) {
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
@@ -17851,17 +17910,12 @@ fn handleResponsesInner(
             return;
         }
 
-        result = .{
-            .constraint_payload_byte = if (delivery) |d| d.payload_byte else null,
-            .text = try raw_buf.toOwnedSlice(allocator),
-            .token_ids = try token_ids_buf.toOwnedSlice(allocator),
-            .prompt_tokens = ts.prompt_tokens,
-            .completion_tokens = ts.completion_tokens,
-            .finish_reason = if (stopped) "stop" else ts.finish_reason,
-            .prefill_tps = 0.0,
-            .decode_tps = 0.0,
-            .finish_details = ts.finish_details,
-        };
+        result = ts.generationResult(
+            try raw_buf.toOwnedSlice(allocator),
+            try token_ids_buf.toOwnedSlice(allocator),
+            if (stopped) "stop" else ts.finish_reason,
+            if (delivery) |d| d.payload_byte else null,
+        );
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
@@ -17943,6 +17997,9 @@ fn handleResponsesInner(
             // Live deltas already streamed; emit just the closing events with
             // the canonical reasoning text from splitThinkBlock.
             try responses_mod.appendReasoningItem(allocator, &out_buf, streamed_reasoning_id.?, rt);
+            if (active_has_tools) if (chat_mod.unstreamedReasoning(rt, tool_reasoning_streamed)) |rest| {
+                try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rest);
+            };
             try emitResponsesReasoningEnd(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
         } else {
             const rid = try responses_mod.makeId(stream.io, allocator, "rs");
@@ -19395,6 +19452,42 @@ test "utf8TrailingIncomplete partial after complete" {
 
 test "utf8TrailingIncomplete empty" {
     try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
+}
+
+test "responses think hold-back never cuts a multibyte character" {
+    // A CJK thought replayed token-by-token through the hold-back: every emitted
+    // prefix must be valid UTF-8, and the stream must reassemble byte-exact.
+    const allocator = testing.allocator;
+    const tokens = [_][]const u8{
+        "\xE7\x94\xA8",
+        "\xE6\x88\xB7\xE9\x97\xAE",
+        "\xE7\x9A\x84 9.11",
+        "\xE8\xBF\x98\xE6\x98\xAF 9.9",
+        "\xEF\xBC\x8C\xE5\x85\x88\xE6\xAF\x94",
+        "\xE6\x95\xB4\xE6\x95\xB0",
+        "\xEF\xBC\x8C\xE5\x86\x8D",
+        "<|im_",
+        "end|>",
+    };
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var reconstituted = std.ArrayList(u8).empty;
+    defer reconstituted.deinit(allocator);
+    for (tokens) |tok| {
+        try buf.appendSlice(allocator, tok);
+        const safe_len = thinkHoldBackLen(buf.items);
+        if (safe_len == 0) continue;
+        // The emitted prefix must be valid UTF-8 standing alone.
+        try testing.expect(std.unicode.utf8ValidateSlice(buf.items[0..safe_len]));
+        try reconstituted.appendSlice(allocator, buf.items[0..safe_len]);
+        const remaining = try allocator.dupe(u8, buf.items[safe_len..]);
+        defer allocator.free(remaining);
+        buf.clearRetainingCapacity();
+        try buf.appendSlice(allocator, remaining);
+    }
+    try reconstituted.appendSlice(allocator, buf.items);
+    const want = "\xE7\x94\xA8\xE6\x88\xB7\xE9\x97\xAE\xE7\x9A\x84 9.11\xE8\xBF\x98\xE6\x98\xAF 9.9\xEF\xBC\x8C\xE5\x85\x88\xE6\xAF\x94\xE6\x95\xB4\xE6\x95\xB0\xEF\xBC\x8C\xE5\x86\x8D<|im_end|>";
+    try testing.expectEqualStrings(want, reconstituted.items);
 }
 
 test "parseJsonFloat returns value when present" {
@@ -24477,6 +24570,17 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
     try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
 }
 
+test "a streamed turn's result keeps the prompt-cache hit and timings the slot measured" {
+    const t = std.testing;
+    const ts: StreamingTokenStream = .{ .mode = .regular, .eos_token_ids = &.{}, .prompt_tokens = 3016, .cached_tokens = 2985, .completion_tokens = 40, .prefill_ns = 90_000_000, .decode_ns = 1_200_000_000 };
+    var text = "ok".*;
+    var ids = [_]u32{ 7, 8 };
+    const r = ts.generationResult(&text, &ids, "stop", null);
+    try t.expectEqual(@as(u32, 2985), r.cached_tokens);
+    try t.expectEqual(ts.prefill_ns, r.prefill_ns);
+    try t.expectEqual(ts.decode_ns, r.decode_ns);
+}
+
 test "Conn names the client from each request's User-Agent and keeps no header text" {
     const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
     var conn: Conn = undefined;
@@ -24513,4 +24617,20 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
     try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
     try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
+}
+
+test "outcome row 7/9: countRejected moves the rejected counter, and does nothing with metrics off" {
+    const t = std.testing;
+    const saved = g_metrics;
+    defer g_metrics = saved;
+
+    g_metrics = null;
+    countRejected();
+
+    var m = instr.Metrics.init();
+    g_metrics = &m;
+    countRejected();
+    try t.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
+    try t.expectEqual(@as(u64, 0), m.requests_failed_total.load());
+    try t.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
 }

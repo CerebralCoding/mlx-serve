@@ -327,7 +327,7 @@ Prefix cache (RAM + SSD):
 - **Checkpoint retention thins the INTERIOR, dense newest quarter** (`spanPreservingDropIndex`, `ThinPolicy`); a decline is observable (`CommitStatus`, `TrimDecline`).
 - **Eviction is WORKLOAD-fair** (#378, `cache_key` via `requestCacheKey`, `lruIndexExcluding`). Guard: `tests/test_prefix_cache_workloads.sh`.
 - **State AT/AFTER media is keyed per ITEM on its PIXELS** (`Entry.media: []MediaSpan`; a match stops at the first item differing in position or pixels, `mediaSharedBound`; an entry keeps only the items it covers); inheritance + thinning obey the first item (`bestCheckpointDonor`, `boundaryCheckpointIndex`). Guard: `tests/test_vision_prefix_cache.sh`.
-- **SSD tier**: serves the text before the first media item, entries with media never spill; checkpoints come off the TOP of the flush budget; hybrid arm ranks by restorable checkpoint (`bestHybridMatch`); a RAM decline spills (`spillDeclinedToDisk`, 4 GB floor).
+- **SSD tier**: serves AND persists the text before the first media item (`diskTokens`, #494; a hybrid only to its last checkpoint there), never an image row; checkpoints come off the TOP of the flush budget; hybrid arm ranks by restorable checkpoint (`bestHybridMatch`); a RAM decline spills (`spillDeclinedToDisk`, 4 GB floor).
 - **A change to what stored K/V MEAN gets a fresh SSD root** (`ModelConfig.cacheLayoutNamespace` → `modelFingerprintWithLayout`; null keeps the old root): the fingerprint hashes only the dir, the config's stat and the overrides, so a fixed model would restore its buggy keys (Nemotron-H NoPE).
 - **A disk restore evals each chunk before loading the next** (a lazy `mlx_load_safetensors` holds its fd until eval: 256 files = ~250k tokens); restore entry points drop their own latch, or the cold fallback fails.
 - **SSD-first** (qwen4 + disk tier, `ssdFirstActive`): RAM floors at one session; spill and EVICT are two decisions (`PersistOutcome`); writes ride `kv_disk_writer.zig`; a checkout is a PROMISE until the append DONATES (`donateCheckout`/`releaseCheckout`).
@@ -497,6 +497,7 @@ Weights, quant, loading:
 qwen4_exp:
 - **NOT a qwen3_5 pack**: hyper-connections, n-gram PLE, QSA around the trunk; HF `hidden_states[i]` is the INPUT of layer i. Vision rows splice BEFORE the hc tile (`forwardQwen4With`).
 - **Tiny MoE oracles tie everywhere**: fixtures dump the reference's OWN margins, `Qwen4Ties` acquits by those; k < E selection coverage = the MTP head's one MoE layer (`--topk 2`, `route_gap`).
+- **PLE read-path selection is measured before and after warming**, on the inference thread (`NgramTable.calibrateArm`); the warmer only signals completion. Explicit overrides win, and the long-KV pool gate remains. Guard: `ngram prefill` tests.
 - **QSA's visible tail is PER QUERY**; scores in f32; `torch.topk` keeps the LOWER index on ties; n-gram hash eos is the TEXT config's (`ngram_eos`).
 - **The spec "hidden" IS the pre-mixer stream** (`[B,L,hc*hidden]`); head row r = (stream r, token r+1) at position r+1 (`pos_base`).
 - **Per-request state outside conv/ssm rides `SSMCacheEntry.aux_state` + `ple_prev`**; every reset/free via `ssmFreeQsaState`; restore-parity bar = the CHUNKING class (~0.3 nats top-5).
