@@ -1163,7 +1163,10 @@ pub fn main(init: std.process.Init) !void {
     // defer clears the global so an early serve() failure can't leave it
     // dangling. Off (the default) → null: a single per-request branch, no cost.
     var metrics_instance: ?metrics_mod.Metrics = if (metrics_enabled) metrics_mod.Metrics.init() else null;
-    if (metrics_instance) |*m| server_mod.g_metrics = m;
+    if (metrics_instance) |*m| {
+        m.process_start_time_seconds.set(@intCast(@max(0, io_util.nowSecs(io))));
+        server_mod.g_metrics = m;
+    }
     defer server_mod.g_metrics = null;
 
     // ── GGUF early-branch: route to an embedded engine ──

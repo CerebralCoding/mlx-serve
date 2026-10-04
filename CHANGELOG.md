@@ -7,6 +7,8 @@
 - **GLM-5.3-Flash.** TensorFold's MLX packs of GLM-5-Next run with text, thinking (with `reasoning_effort`) and tool calls, and the pack's own multi-token-prediction layer drafts ahead of the model (`--no-mtp` turns it off).
 - **Sound effects with Stable Audio 3.** `POST /v1/audio/sound-generations` turns a description into up to two minutes of 44.1 kHz stereo in about a second, from Stability's own `stabilityai/stable-audio-3-small-sfx` repo as downloaded; the app gets a Sound Effects tab in Audio and a `generate_sound` chat tool.
 - **MiMo-V2.6-Flash.** Xiaomi's 309B MoE runs on a 256 GB Mac, from the MLX packs already on Hugging Face or from the release via `tests/convert_mimo_v2.py`, whose packs also load in mlx-lm; text, thinking and tool calls, with the checkpoint's own MTP heads drafting (up to ~30% faster decode on code).
+- **Monitor history in the browser.** The console Monitor keeps its own history in the browser, computed from the server's counters: 1 hour of samples then one per minute up to 24 hours, kept across reloads, with failed, rejected and cancelled rates, per-model totals and a request table.
+- **Sessions name their agent.** `/metrics.json` sessions now name the calling agent (`claude-code`, `opencode`, `codex`, `omp` or `other`) with a per-request id, and a `process_start_time_seconds` gauge lets monitors detect restarts.
 
 ### Speed
 - **Textured 3D models in about a minute.** The Hunyuan3D texture stage now simplifies the mesh to 40,000 faces before unwrapping it, as the reference pipeline does; a detailed (resolution 320) textured model that ran for more than ten minutes now finishes in about a minute.

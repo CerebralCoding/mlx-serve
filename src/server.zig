@@ -327,10 +327,13 @@ pub const Conn = struct {
     /// output through `writer()` directly, bypassing this hook — same
     /// interception pattern as `ws_mode`. See src/ollama.zig.
     ollama_sink: ?*ollama_mod.Sink = null,
+    /// Agent named by the current request's User-Agent.
+    client: instr.Client = .other,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
+        c.client = .other;
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
@@ -338,6 +341,11 @@ pub const Conn = struct {
         c.sse_headers_sent = false;
         c.length_framed = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
+    }
+
+    /// Replaces the previous request's client, so a request without a User-Agent never inherits it.
+    pub fn noteRequestHeaders(c: *Conn, headers: []const u8) void {
+        c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
     }
 
     /// True when the connection has been silent long enough that a streaming
@@ -2205,6 +2213,7 @@ fn handleConnection(
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
     logHttpRequest(method, raw_path, request_body);
+    stream.noteRequestHeaders(request[0..header_end_pos]);
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic/Ollama APIs AND the index page
@@ -9523,6 +9532,7 @@ fn handleStreamingCompletion(
         .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, null),
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
+        .client = stream.client,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
 
@@ -9893,6 +9903,7 @@ fn nonStreamingViaScheduler(
         .vision_embeddings = vision_embeddings,
         .media = media,
         .cache_key = cache_key,
+        .client = if (conn) |c| c.client else .other,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -10869,6 +10880,7 @@ fn handleStreamingGeneration(
         .vision_embeddings = slot_ve_s,
         .media = media,
         .cache_key = cache_key,
+        .client = stream.client,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -15960,6 +15972,7 @@ fn handleAnthropicStreaming(
         .vision_embeddings = slot_ve_anth,
         .media = media,
         .cache_key = cache_key,
+        .client = stream.client,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -17543,6 +17556,7 @@ fn handleResponsesInner(
             .vision_embeddings = slot_ve_resp,
             .media = mm.media,
             .cache_key = cache_key,
+            .client = stream.client,
             .mrope_pos = slot_mrope.pos,
             .mrope_total = slot_mrope.total,
             .mrope_delta = slot_mrope.delta,
@@ -24461,6 +24475,18 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
     try t.expectEqual(kv_only + retainedSsmCheckpointBytes(&cfg, ctx, 0, chunk), entry);
     // The defaulted ask covers the whole entry, so the commit path never trims it.
     try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
+}
+
+test "Conn names the client from each request's User-Agent and keeps no header text" {
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = -1, .address = peer } }, std.Io.Threaded.global_single_threaded.io());
+    try std.testing.expectEqual(instr.Client.other, conn.client);
+
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nUser-Agent: opencode/1.4\r\n\r\n");
+    try std.testing.expectEqual(instr.Client.opencode, conn.client);
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n");
+    try std.testing.expectEqual(instr.Client.other, conn.client);
 }
 
 test "disabled prefix cache: sizing releases the cache reserve on every arch" {
