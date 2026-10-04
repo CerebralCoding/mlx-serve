@@ -5521,3 +5521,26 @@ Addendum, same night: bigger command buffers lose. `MLX_MAX_OPS_PER_BUFFER=200` 
 ## The routed-expert kernels were kernel-time bound, and the fp4 shape fixes them (2026-10-04)
 
 The kernel microbench (`src/moe_gather_ubench.zig`, `MOE_UBENCH=1`) put the shipped per-slot gather kernels at 26 us for gate+up (~700 GB/s) and 26 us for down+reduce (~340 GB/s, latency-bound at K=640: 320 bytes of weights per row), within a few us of the in-situ profile, so the cost was real kernel work. `moe_affine4.zig` ports `moe_fp4`'s shape to 4-bit affine with biases: a simdgroup owns four output rows and keeps its 16 values of x in registers across them, 8-byte loads, no threadgroup memory, the down kernel accumulates every expert of the token in registers with the score folded in, the bias rides a per-group sum of x, and a K that is not a whole 512 block (640) is predicated per lane. One token only (a row re-reads its own experts). Same-boot A/B, 3+3 boots: 10.17/10.19/10.29 vs 10.51/10.40/10.42 ms GPU, about -0.22 ms; bar `moe affine-4 decode: no worse than the per-slot gather kernels against the f32 truth`. `MLX_SERVE_MOE_AFFINE4=0` restores the per-slot kernels.
+
+## Long-context decode: the attention layer is a chain, and one-token QSA attention shortens it (2026-10-04)
+
+Past the indexer budget (2051 tokens) a serial Flash Next step costs ~1 ms more: per attention layer indexer prep, `msv_qsa_score` (20 us), `msv_qsa_select` (8), a ~35 us mask or gather op chain, two-pass SDPA (20 + 9) and the gate multiply, one dependent launch after another.
+
+What the profile taught, so it is not re-measured:
+- MLX gives a concurrent encoder a GLOBAL barrier before any kernel that reads an outstanding write, so two branches overlap for one stage only. The 34 us q projection ran before the indexer chain; ordering it behind the indexer with `mlx_depends` made the layer 8 us worse (the tape still put it before the score).
+- `msv_qsa_score` costs 13-16 us at 2k AND 10k blocks: eight dependent matrix-op latencies, not bytes. No scalar order reproduces it: seven candidate accumulation orders (sequential FMA, 16-deep chunks, trees, an exactly rounded f64 sum) each differ from the matrix unit in ~30% of scores, and decode, verify and prefill must pick the same blocks, so the score stays on that kernel.
+- Kept: one kernel writes the row's key mask (+0.7% at 8k), then `qsa_decode.zig` (split pass + merge straight over the picks, no mask, gather or SDPA): 8k 99.3 -> 103.1, 21k 97.6 -> 102.5, 40k 96.8 -> 101.1 tok/s, `MLX_SERVE_QSA_DEC_KERNEL=0` restores. Dense KV, solo rows only (`solo` in `qsaMaskFromQk`; batched slots and verify widths keep their arms).
+- Four q heads per simdgroup cost 28 us (registers), one per simdgroup 21 us. An eight-key butterfly leaves key `lane >> 2` on four lanes; a reduction inside divergent code (`key ? reduce(...) : -inf`) returns garbage for the tail keys, so reduce first and select after.
+
+Guard: `qsa decode: the one-token kernel is no worse than the masked SDPA against the f64 truth` (six contexts, 0 and 3 tail keys) and `qsa mask: the one-row kernel equals the op chain`.
+
+## Rows per simdgroup is an occupancy decision: the affine-4 MoE kernels at one row (2026-10-04)
+
+Both `moe_affine4` kernels shared four output rows a simdgroup (x registers amortized over four dots). The down kernel alone read 17.7 us for 9.2 MB (520 GB/s), so it looked latency-bound, and three plausible fixes lost or tied:
+- Ablating inside the kernel priced it: no activation loads -0.06 ms/token, no scale/bias loads -0.07, no WEIGHT loads at all -0.32 of the kernel's 0.85. The rest is issue and occupancy, not bytes.
+- Hoisting the expert ids and unrolling the expert loop: a tie. Double-buffering the next expert's weights in registers plus the mask-instead-of-shift nibble dot: 6% SLOWER (104.2 vs 110.7 tok/s) with identical text, the register file again. Splitting a row's ten experts over 2, 5 or 10 simdgroups with a threadgroup sum: +0.5% at best.
+- What won was a constant: rows per simdgroup 4 -> 1 on both kernels, 110.5 -> 114.8 tok/s (8k: 103.1 -> 107.0; 2 rows ~113.8, 8 rows 101.8; threadgroup width 1-8 simdgroups did not matter; down alone +1.6, gate+up +2.5). The same lesson as `qsa_decode` (one head a simdgroup).
+
+Rule: before porting or deepening a multi-row decode kernel, sweep rows per simdgroup in situ (`serial_run` short context, env knob, one boot per value). A sweep script must word-split its configs explicitly: zsh does not split `$cfg`, and a bad knob made the kernels decline silently to the slow arm, so a first sweep measured nothing.
+
+What is left in the hyper-connection reads is not a single-kernel job: one read is 6.6 MB (down 3.3 + up 3.3), floor ~6 us, now 12.4 us in two launches; the up launch is itself a 3.3 MB GEMV, so folding it into the down launch needs a grid-wide handoff for little.
