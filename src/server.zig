@@ -20390,6 +20390,42 @@ test "renderPropsBody omits chat_template" {
     parsed.deinit();
 }
 
+test "dsv41 plugins: /props and /v1/models carry the plugins that serve deepseek_v41; a model no plugin serves carries none" {
+    var config = model_mod.ModelConfig{};
+    config.model_type = "gemma4";
+    try testing.expectEqualStrings("", plugins.registry.servedJson(config.arch));
+    const plain = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, plugins.registry.servedJson(config.arch));
+    defer testing.allocator.free(plain);
+    try testing.expect(std.mem.indexOf(u8, plain, "\"plugins\"") == null);
+    _ = plugins.mlx_stream_testing orelse return error.SkipZigTest;
+    // The arch the registry's claims route a deepseek_v41 config to (model.zig's discovery), as the load keeps it.
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const peek = try @import("sdk").ConfigPeek.parse(arena.allocator(), "/m", "{\"model_type\":\"deepseek_v41\"}");
+    config.arch = &(plugins.registry.arch(&peek, null) orelse return error.NotClaimed).kind;
+    config.model_type = "deepseek_v41";
+    const frag = plugins.registry.servedJson(config.arch);
+    const body = try renderPropsBody(testing.allocator, &config, "4096", 1, 2, 3, 4, 5, 0, 0, frag);
+    defer testing.allocator.free(body);
+    std.debug.print("dsv41 plugins props: {s}\n", .{body});
+    // A /v1/models ready row ends `...,"meta":{...}<frag>}`.
+    const row = try std.fmt.allocPrint(testing.allocator, "{{\"id\":\"m\",\"meta\":{{\"architecture\":\"deepseek_v41\"}}{s}}}", .{frag});
+    defer testing.allocator.free(row);
+    for ([_][]const u8{ body, row }) |json| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer parsed.deinit();
+        const list = (parsed.value.object.get("plugins") orelse return error.MissingPlugins).array.items;
+        // The arch only: its quant and expert source are the plugin's internals (the small SDK registers archs).
+        const want = [_][3][]const u8{.{ "mlx-stream", "arch", "deepseek_v41" }};
+        try testing.expectEqual(want.len, list.len);
+        for (want, list) |w, got| {
+            try testing.expectEqualStrings(w[0], got.object.get("plugin").?.string);
+            try testing.expectEqualStrings(w[1], got.object.get("kind").?.string);
+            try testing.expectEqualStrings(w[2], got.object.get("name").?.string);
+        }
+    }
+}
+
 test "anePropsJson: the /props ane object carries mode, coverage, the int8 bill and eval counts" {
     const one = [_]AneUnitStat{.{ .instance = 0, .evals = 112, .eval_failures = 0 }};
     const frag = try anePropsJson(testing.allocator, "channel", 64, 48, 8192, 8192, 0.45, 9_469_231_104, &one);
@@ -22140,6 +22176,34 @@ test "prefillMemoryNeeded: a sparse-attention arch bills its KEY BOUND, not the 
         prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 5806, 0, 0, .{}),
         prefillMemoryNeeded(5806, 64, 1, 44032, 256, 256, 4096, 2048, 8, 5632, 641, 0, 0, .{}),
     );
+}
+
+test "dsv41 server: the prefill admission bills deepseek_v41 by its own chunks and waves; it does not batch decode" {
+    const t = std.testing;
+    const pkg = @import("plugins.zig").mlx_stream_testing orelse return error.SkipZigTest;
+    const json = try pkg.v41.testConfigJson(t.allocator, .real);
+    defer t.allocator.free(json);
+    var cfg = try model_mod.parseConfigFromJson(t.allocator, json);
+    defer cfg.deinit(t.allocator);
+    // The arch's own config behind the registry: its settings and its bill.
+    const ac: *pkg.Settings = @ptrCast(@alignCast(cfg.arch_cfg.?));
+    const bill = ac.dsv41_prefill.?;
+    // The per-request guard takes the arch's own number: what a prompt needs beyond the module's construction admission,
+    // which already billed every prompt up to its context (both phases) and frees its decode rows before a prompt: none,
+    // on either pass and at any length (a prompt over the context is the module's refusal by name).
+    for ([_]u64{ 1, 2047, 4096, 16384, 131072 }) |n| try t.expectEqual(@as(u64, 0), prefillNeededAtChunk(&cfg, n, 1024, 16, n, .{}));
+    ac.layer_major_prefill = false;
+    try t.expectEqual(@as(u64, 0), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
+    ac.layer_major_prefill = null;
+    try t.expectEqual(@as(u64, 953), bill.chunkRows(16384));
+    try t.expect(bill.bytes(16384, 1024, .stock) > bill.waveBytes(953, 16201, .stock) + bill.head_promotion_bytes);
+    // A 64-token prompt: a small bill.
+    try t.expect(bill.bytes(64, 32, .served) < 5_000_000_000);
+    // The module's tier and pass choose the bill.
+    ac.numeric_tier = .stock;
+    try t.expectEqual(@as(u64, 0), prefillNeededAtChunk(&cfg, 16384, 1024, 16, 16384, .{}));
+    ac.numeric_tier = null;
+    try t.expect(!scheduler_mod.configBatchesDecode(&cfg));
 }
 
 test "dsv4PrefillMemoryNeeded: bills the arch's own sub-chunk and f32 gather, not the generic MoE chunk" {

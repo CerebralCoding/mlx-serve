@@ -55,6 +55,9 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
+    // The mlx-stream plugin's own tests are its repo's (lib/mlx-stream; `zig build mlx-stream-test` and
+    // `mlx-stream-conformance` run them against this host). Host tests reach the plugin through the registry
+    // (`plugins.mlx_stream_testing`), so a build with -Dmlx-stream=false analyzes none of its files.
     _ = @import("plugins.zig");
     _ = @import("nocache_reader.zig");
     _ = @import("gpu_ceiling.zig");

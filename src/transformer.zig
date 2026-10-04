@@ -44667,6 +44667,19 @@ pub fn archClaimProcess(config: *const ModelConfig) anyerror!?*const fn () void 
     return vt.release_process.?;
 }
 
+test "dsv41 plugin: the load claim takes the one expert reader; a second load claim is refused by name until it is given back" {
+    _ = @import("plugins.zig").mlx_stream_testing orelse return error.SkipZigTest;
+    var config: ModelConfig = .{};
+    try std.testing.expectEqual(null, try archClaimProcess(&config)); // no registered arch: nothing taken
+    for (&@import("plugins.zig").registry.archs) |*e| {
+        if (std.mem.eql(u8, e.kind.name, "deepseek_v41")) config.arch = &e.kind;
+    }
+    const release = (try archClaimProcess(&config)).?;
+    try std.testing.expectError(error.ExpertReaderInUse, archClaimProcess(&config));
+    release(); // what the loaded Transformer's deinit does after the arch's module
+    (try archClaimProcess(&config)).?();
+}
+
 /// A registered arch: its module over the loaded residents; the shell is dsv4's (a 0-layer KVCache, empty
 /// standard fields).
 fn initArch(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, s: mlx.mlx_stream, vt: *const sdk.Arch) !Transformer {

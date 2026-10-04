@@ -7,9 +7,36 @@ const sdk = @import("sdk");
 const build_options = @import("build_options");
 
 /// One line per plugin: `@import("<its module>").plugin`. Each plugin is its own repo, a pinned submodule under lib/
-/// (`-D<name>-dir` builds against a checkout instead): the host reaches a plugin through this table only. None is
-/// registered yet: every model takes the host's own paths.
-pub const all = [_]sdk.Plugin{};
+/// (`-D<name>-dir` builds against a checkout instead); a plugin left out (`-Dmlx-stream=false`) leaves none of its
+/// files in the build: the host reaches a plugin through this table only.
+pub const all = if (registers_mlx_stream) [_]sdk.Plugin{
+    @import("mlx_stream").plugin,
+} else [_]sdk.Plugin{};
+/// Whether this build registers mlx-stream (lib/mlx-stream, `-Dmlx-stream`, default on; the unit-test graph follows it).
+pub const registers_mlx_stream = if (@hasDecl(build_options, "plugin_mlx_stream")) build_options.plugin_mlx_stream else true;
+
+/// The registered mlx-stream plugin's test surface (its root's `testing`), null in a build that leaves the plugin out:
+/// the host's tests reach the plugin through the registry only, so such a build analyzes none of its files.
+pub const mlx_stream_testing: ?type = if (registers_mlx_stream) @import("mlx_stream").testing else null;
+
+/// The model types a known plugin serves, and that plugin: a build that leaves the plugin out refuses such a model by
+/// name at config parse (`unservedPlugin`) instead of reading it as another arch.
+pub const known = [_]struct { model_type: []const u8, plugin: []const u8 }{
+    .{ .model_type = "deepseek_v41", .plugin = "mlx-stream" },
+};
+
+/// The plugin that serves `model_type` when this build does not register it; null when it does, or when no known
+/// plugin serves that model type.
+pub fn unservedPlugin(model_type: []const u8) ?[]const u8 {
+    return unservedIn(registry, model_type);
+}
+
+fn unservedIn(comptime R: type, model_type: []const u8) ?[]const u8 {
+    for (known) |k| {
+        if (std.mem.eql(u8, k.model_type, model_type) and !R.registered(k.plugin)) return k.plugin;
+    }
+    return null;
+}
 
 /// This build's registry. A macOS-only plugin registers nothing on graphs without the macOS-only sources.
 pub const registry = Registry(&all, .{ .macos = build_options.macos_engines });
@@ -230,6 +257,14 @@ test "plugins registry: a registry without plugins claims nothing (the host buil
     try testing.expect(R.arch(&peek, null) == null and R.source(&peek, null) == null and R.engine(&peek, null) == null);
 }
 
+test "plugins registry: a model only a plugin serves is refused by that plugin's name on a build without it" {
+    const none = Registry(&.{}, .{ .macos = true });
+    try testing.expectEqualStrings("mlx-stream", unservedIn(none, "deepseek_v41").?);
+    try testing.expect(unservedIn(none, "qwen3") == null);
+    // This build registers mlx-stream exactly when -Dmlx-stream is on.
+    try testing.expectEqual(!registers_mlx_stream, unservedPlugin("deepseek_v41") != null);
+}
+
 test "plugins registry: the winner of a claims round" {
     const names = [_][]const u8{ "a", "b", "c", "d" };
     try testing.expectEqual(@as(?usize, null), pick(&names, &.{ null, null, null, null }, null));
@@ -346,6 +381,20 @@ test "plugins registry: model-settings.json's plugin breaks a tie between two ar
         const entry = try std.json.parseFromSliceLeaky(std.json.Value, a, c.entry, .{});
         try testing.expectEqualStrings(c.want, R.arch(&peek, model_settings.pluginOf(entry)).?.plugin);
     }
+}
+
+test "plugins registry: this build's registry follows -Dmlx-stream (the plugin's tables, its tests and its name together)" {
+    try testing.expectEqual(registers_mlx_stream, all.len == 1);
+    try testing.expectEqual(registers_mlx_stream, mlx_stream_testing != null);
+    try testing.expectEqual(registers_mlx_stream and build_options.macos_engines, registry.registered("mlx-stream"));
+    const n: usize = if (registers_mlx_stream and build_options.macos_engines) 1 else 0;
+    try testing.expectEqual(n, registry.archs.len);
+    try testing.expect(registry.sources.len == 0 and registry.engines.len == 0 and !registry.arch_ties_possible);
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const v41 = try peekOf(arena.allocator(), "{\"model_type\":\"deepseek_v41\"}");
+    try testing.expectEqual(n == 1, registry.arch(&v41, null) != null);
+    inline for (all) |p| try sdk.negotiate(p, sdk.host);
 }
 
 test "plugins conformance: the host's weight map a plugin binds owns its keys and handles; replace and drop touch only present names" {

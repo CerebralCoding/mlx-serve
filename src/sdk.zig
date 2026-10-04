@@ -17,6 +17,8 @@ pub const api: Version = .{ .major = 1, .minor = 0 };
 /// The MLX this binary links (lib/mlx-src 64ea011cb: v0.32.3). One MLX per process: a plugin tested on another is
 /// refused at compile time, so an MLX bump is one change that moves this pin and every plugin's.
 pub const mlx_pin = "v0.32.3";
+/// Compile the registered plugins' profile probes in (`-Dplugin-profile=true`); off in every served build.
+pub const plugin_profile: bool = @import("sdk_build").plugin_profile;
 
 pub const mlx = @import("mlx");
 pub const log = @import("log");

@@ -107,9 +107,11 @@ pub fn build(b: *std.Build) void {
     // The slim host (docs/plugins.md): the MLX engine and the registered plugins; ds4, llama.cpp and the ANE bridge
     // are left out for their stubs. Only the server graph is slimmed; the test graph is always the full one.
     const slim = b.option(bool, "slim", "Slim host: the MLX engine and the registered plugins; no ds4, llama.cpp or ANE") orelse false;
+    // The registry's plugin lines (src/plugins.zig): false builds the server without that plugin's files at all.
+    const with_mlx_stream = b.option(bool, "mlx-stream", "Register the mlx-stream plugin (lib/mlx-stream: the DeepSeek-V4.1 arch)") orelse true;
     const core: CoreOptions = .{ .version = version, .mas = mas, .mlx_c_version = mlx_c_version, .ds4_commit = ds4_commit, .llama_tag = llama_tag, .git_sha = git_sha, .slow_tests = slowTests(b) };
-    const build_options = core.add(b, !slim);
-    const test_options = core.add(b, true);
+    const build_options = core.add(b, !slim, with_mlx_stream);
+    const test_options = core.add(b, true, with_mlx_stream);
     const shared = addShared(b, target, optimize);
 
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
@@ -182,6 +184,7 @@ pub fn build(b: *std.Build) void {
         addDs4Sources(b, mod);
         mod.addIncludePath(b.path("lib/ds4"));
     }
+    if (with_mlx_stream) _ = addMlxStreamModule(b, mod, shared.sdk, target, optimize, .{});
 
     // ANE prefill-MLP offload (perf-plan-aug-17 P5): objc bridge to the
     // private AppleNeuralEngine framework (dlopen'd at runtime — the probe
@@ -246,7 +249,7 @@ pub fn build(b: *std.Build) void {
     check_linux.dependOn(&linux_check.step);
 
     // Unit tests — reuses the same module config (mlx-c, jinja_cpp, etc.)
-    const test_deps: TestDeps = .{ .options = test_options, .shared = shared, .ds4_metal_sources = ds4_metal_sources, .mlx_steel_sources = mlx_steel_sources, .opencode2_plugin = opencode2_plugin, .agent_skills = agent_skills, .frameworks = macos_sdk_frameworks };
+    const test_deps: TestDeps = .{ .options = test_options, .shared = shared, .ds4_metal_sources = ds4_metal_sources, .mlx_steel_sources = mlx_steel_sources, .opencode2_plugin = opencode2_plugin, .agent_skills = agent_skills, .frameworks = macos_sdk_frameworks, .with_mlx_stream = with_mlx_stream };
     const test_mod = test_deps.module(b, b.path("src/tests.zig"), target, optimize);
 
     const test_filter = b.option([]const u8, "test-filter", "Only run tests whose name contains this substring");
@@ -319,6 +322,23 @@ pub fn build(b: *std.Build) void {
     test_step.dependOn(conformance);
     const sdk_test_build = b.step("sdk-test-build", "Compile the SDK, conformance and shared-module tests without running them (mlx-test creates arrays)");
     for ([_]*std.Build.Step.Compile{ sdk_tests, conformance_tests } ++ shared_tests) |t| sdk_test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+
+    // The mlx-stream plugin's own tests (its repo's src/tests.zig) and its conformance suite (src/conformance.zig),
+    // built against this host: the plugin module is each test build's root, and the host files its harnesses reach
+    // (src/sdk_test_host.zig) import it back as `mlx_stream`. `zig build test` runs both (the gated ones skip without
+    // their environment).
+    if (with_mlx_stream) {
+        const pkg_tests = addMlxStreamTests(b, test_deps, "mlx-stream-test", "src/tests.zig", target, optimize, test_filter);
+        const pkg_conformance = addMlxStreamTests(b, test_deps, "mlx-stream-conformance", "src/conformance.zig", target, optimize, "mlx-stream conformance");
+        const pkg_test_build = b.step("mlx-stream-test-build", "Compile the mlx-stream plugin's tests and conformance suite without running them");
+        for ([_]*std.Build.Step.Compile{ pkg_tests, pkg_conformance }) |t| pkg_test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        const pkg_test = b.step("mlx-stream-test", "Run the mlx-stream plugin's tests against this host");
+        pkg_test.dependOn(&b.addRunArtifact(pkg_tests).step);
+        const pkg_conf = b.step("mlx-stream-conformance", "Run the mlx-stream plugin's conformance suite against this host (CPU lane, no device)");
+        pkg_conf.dependOn(&b.addRunArtifact(pkg_conformance).step);
+        conformance.dependOn(pkg_conf);
+        test_step.dependOn(pkg_test);
+    }
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //
@@ -436,6 +456,8 @@ fn linuxModule(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.bu
     build_options.addOption(bool, "macos_engines", false);
     build_options.addOption(bool, "embedded_engines", false);
     build_options.addOption(bool, "slow_tests", slowTests(b));
+    // mlx-stream is macOS-only: the Linux graph registers no plugin and builds none of its files.
+    build_options.addOption(bool, "plugin_mlx_stream", false);
 
     const opencode2_plugin = b.createModule(.{
         .root_source_file = b.path("lib/opencode2_plugin.zig"),
@@ -606,6 +628,8 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
     ios_options.addOption([]const u8, "git_sha", "");
+    // mlx-stream is macOS-only: the iOS graphs register no plugin and build none of its files.
+    ios_options.addOption(bool, "plugin_mlx_stream", false);
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/ios_lib.zig"),
@@ -753,6 +777,104 @@ fn addDs4Sources(b: *std.Build, module: *std.Build.Module) void {
     module.addCSourceFile(.{ .file = b.path("lib/ds4/ds4_metal.m"), .flags = objc_flags });
 }
 
+/// lib/mlx-stream: the DeepSeek-V4.1 arch as a plugin (docs/plugins.md), its own repo, a pinned submodule. It reaches
+/// the host only through `sdk`. `-Dmlx-stream-dir=/abs/path` builds against a checkout instead of the submodule.
+/// Returns the plugin's module, imported into `host` as `mlx_stream`.
+fn addMlxStreamModule(b: *std.Build, host: *std.Build.Module, sdk: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, o: MlxStreamModule) *std.Build.Module {
+    const root = mlxStreamRoot(b);
+    const m = b.createModule(.{
+        .root_source_file = if (root) |r| r.path(b, o.root) else missingMlxStream(b),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "sdk", .module = sdk }},
+    });
+    if (root) |r| addMlxStreamCSources(b, m, r, o.inject);
+    host.addImport("mlx_stream", m);
+    return m;
+}
+
+const MlxStreamModule = struct {
+    /// The module's root file in the plugin checkout: src/root.zig, or a test build's root.
+    root: []const u8 = "src/root.zig",
+    /// The read pool's scripted-fault hooks (test builds only).
+    inject: bool = false,
+};
+
+var mlx_stream_root: ?std.Build.LazyPath = null;
+var mlx_stream_resolved = false;
+/// The plugin checkout, or null when it is missing (no submodule checkout, no `-Dmlx-stream-dir`): then every graph
+/// that registers the plugin fails to compile with one message that says what to do (`missingMlxStream`), and the
+/// graphs that do not (`-Dmlx-stream=false`, vz-agent, --help) are unaffected.
+fn mlxStreamRoot(b: *std.Build) ?std.Build.LazyPath {
+    if (mlx_stream_resolved) return mlx_stream_root;
+    mlx_stream_resolved = true;
+    const dir = b.option([]const u8, "mlx-stream-dir", "mlx-stream checkout to build against (default: lib/mlx-stream)");
+    const base = if (dir != null) std.Io.Dir.cwd() else buildRootHandle(b);
+    base.access(b.graph.io, b.pathJoin(&.{ dir orelse "lib/mlx-stream", "src/root.zig" }), .{}) catch return null;
+    mlx_stream_root = if (dir) |d| .{ .cwd_relative = d } else b.path("lib/mlx-stream");
+    return mlx_stream_root;
+}
+
+fn missingMlxStream(b: *std.Build) std.Build.LazyPath {
+    return b.addWriteFiles().add("mlx_stream_missing.zig",
+        \\comptime {
+        \\    @compileError("mlx-stream: no plugin checkout at lib/mlx-stream. Check out the submodule (git submodule update --init lib/mlx-stream), build against a checkout (-Dmlx-stream-dir=/abs/path), or build without the plugin (-Dmlx-stream=false)");
+        \\}
+        \\pub const plugin = @import("sdk").Plugin{ .name = "mlx-stream", .api = @import("sdk").api, .mlx = @import("sdk").mlx_pin, .provides = .{} };
+        \\pub const testing = struct {};
+        \\
+    );
+}
+
+/// The plugin's C sources (csrc/): the lookahead read pool (pthreads, pread + memcpy into slot rows, never MLX) and
+/// its MTLSharedEvent signal (non-ARC objc), and the MLX event / alloc shims, which include the staged MLX's private
+/// headers, so they compile against this host's MLX and link libmlx. With `sdk.plugin_profile` on, the decode
+/// profile's command-buffer timeline sources too.
+fn addMlxStreamCSources(b: *std.Build, module: *std.Build.Module, root: std.Build.LazyPath, inject: bool) void {
+    const profile = pluginProfile(b);
+    const flags: []const []const u8 = if (inject)
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" }
+    else if (profile)
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_EVSIG" }
+    else
+        &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
+    const objc: []const []const u8 = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" };
+    const cxx: []const []const u8 = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" };
+    module.addCSourceFile(.{ .file = root.path(b, "csrc/q3_lookahead4_exl3.c"), .flags = flags });
+    module.addCSourceFile(.{ .file = root.path(b, "csrc/q3_event_shim.mm"), .flags = objc });
+    module.addIncludePath(root.path(b, "csrc"));
+    module.addCSourceFile(.{ .file = root.path(b, "csrc/mlx_event_shim.cpp"), .flags = cxx });
+    module.addCSourceFile(.{ .file = root.path(b, "csrc/mlx_alloc_shim.cpp"), .flags = cxx });
+    module.addIncludePath(b.path("lib/mlx/include"));
+    module.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
+    module.addIncludePath(b.path("lib/mlxc-src"));
+    module.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
+    if (profile) {
+        module.addCSourceFile(.{ .file = root.path(b, "csrc/dsv41_cb_timeline.mm"), .flags = objc });
+        module.addCSourceFile(.{ .file = root.path(b, "csrc/dsv41_newbuffer_count.mm"), .flags = objc });
+        module.addCSourceFile(.{ .file = root.path(b, "csrc/dsv41_tl_mlx.cpp"), .flags = cxx });
+    }
+}
+
+/// A plugin test build (`root` in the plugin checkout): the plugin module is the test root, and the host files its
+/// harnesses reach come in as `mlx_serve_host` (src/sdk_test_host.zig), whose module imports the plugin back as
+/// `mlx_stream` (one plugin module per build).
+fn addMlxStreamTests(b: *std.Build, d: TestDeps, name: []const u8, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, filter: ?[]const u8) *std.Build.Step.Compile {
+    const bridge = d.moduleWith(b, b.path("src/sdk_test_host.zig"), target, optimize);
+    const pkg = addMlxStreamModule(b, bridge, d.shared.sdk, target, optimize, .{ .root = root, .inject = true });
+    pkg.addImport("mlx_serve_host", bridge);
+    return b.addTest(.{ .name = name, .root_module = pkg, .filters = if (filter) |f| &.{f} else &.{} });
+}
+
+/// `-Dplugin-profile`: compile the registered plugins' profile probes in (`sdk.plugin_profile`); off in served builds.
+var plugin_profile_opt: ?bool = null;
+fn pluginProfile(b: *std.Build) bool {
+    if (plugin_profile_opt) |v| return v;
+    plugin_profile_opt = b.option(bool, "plugin-profile", "Compile the registered plugins' profile probes in (profile builds only)") orelse false;
+    return plugin_profile_opt.?;
+}
+
 /// ANE prefill offload sources (lib/ane): the private-framework bridge and
 /// the per-layer MLP program builder, both ARC objc. Runtime-probed —
 /// compiling them in costs nothing on machines without the framework.
@@ -769,11 +891,11 @@ fn addAneSources(b: *std.Build, module: *std.Build.Module) void {
 
 /// What the macOS unit-test graphs link and import: the unit tests and the conformance suite share it.
 /// src/plugins_refusals.zig's cases and the compile error line each must end with. A negotiation refusal ends with the
-/// host's MLX pin, so its line matches up to `/?/` from the registry's refusal site (plugins.zig:28).
+/// host's MLX pin, so its line matches up to `/?/` from the registry's refusal site (plugins.zig:55).
 const registry_refusals = [_]struct { case: []const u8, err: []const u8 }{
-    .{ .case = "api_major", .err = "src/plugins.zig:28:50: error: plugin bad-api: ApiMajorMismatch (built against SDK 2.0 on MLX /?/)" },
-    .{ .case = "mlx_pin", .err = "src/plugins.zig:28:50: error: plugin bad-mlx: MlxPinMismatch (built against SDK 1.0 on MLX v0.0.1; this host is SDK 1.0 on MLX v/?/)" },
-    .{ .case = "mlx_pin_macos_only", .err = "src/plugins.zig:28:50: error: plugin mac-pin: MlxPinMismatch (built against SDK 1.0 on MLX v0.0.1;/?/)" },
+    .{ .case = "api_major", .err = "src/plugins.zig:55:50: error: plugin bad-api: ApiMajorMismatch (built against SDK 2.0 on MLX /?/)" },
+    .{ .case = "mlx_pin", .err = "src/plugins.zig:55:50: error: plugin bad-mlx: MlxPinMismatch (built against SDK 1.0 on MLX v0.0.1; this host is SDK 1.0 on MLX v/?/)" },
+    .{ .case = "mlx_pin_macos_only", .err = "src/plugins.zig:55:50: error: plugin mac-pin: MlxPinMismatch (built against SDK 1.0 on MLX v0.0.1;/?/)" },
     .{ .case = "duplicate", .err = "plugin twin: registered twice" },
     .{ .case = "source_no_claims", .err = "NoClaims: no claims" },
     .{ .case = "engine_wrong_claims", .err = "WrongClaims.claims: parameter *const sdk.peek.GroupPeek where the SDK has *const sdk.peek.ConfigPeek" },
@@ -794,8 +916,17 @@ const TestDeps = struct {
     opencode2_plugin: *std.Build.Module,
     agent_skills: *std.Build.Module,
     frameworks: ?[]const u8,
+    /// The registry registers mlx-stream (`-Dmlx-stream`).
+    with_mlx_stream: bool,
 
     fn module(d: TestDeps, b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
+        const m = d.moduleWith(b, root, target, optimize);
+        if (d.with_mlx_stream) _ = addMlxStreamModule(b, m, d.shared.sdk, target, optimize, .{ .inject = true });
+        return m;
+    }
+
+    /// A test graph's module without the plugin: the caller imports `mlx_stream` (a plugin test build's own module).
+    fn moduleWith(d: TestDeps, b: *std.Build, root: std.Build.LazyPath, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) *std.Build.Module {
         const m = b.createModule(.{
             .root_source_file = root,
             .target = target,
@@ -853,7 +984,7 @@ const CoreOptions = struct {
     git_sha: []const u8,
     slow_tests: bool,
 
-    fn add(c: CoreOptions, b: *std.Build, embedded_engines: bool) *std.Build.Step.Options {
+    fn add(c: CoreOptions, b: *std.Build, embedded_engines: bool, mlx_stream: bool) *std.Build.Step.Options {
         const o = b.addOptions();
         o.addOption([]const u8, "version", c.version);
         o.addOption(bool, "mas", c.mas);
@@ -874,6 +1005,8 @@ const CoreOptions = struct {
         // The embedded engines (ds4 Metal, libllama) are linked: the macOS exe and tests, not the
         // slim host, iOS or Linux, which select src/arch/*_stub.zig and src/ds4_ffi_stub.zig.
         o.addOption(bool, "embedded_engines", embedded_engines);
+        // The registry registers mlx-stream (src/plugins.zig); the unit-test graph follows -Dmlx-stream too.
+        o.addOption(bool, "plugin_mlx_stream", mlx_stream);
         // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
         // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
         o.addOption(bool, "slow_tests", c.slow_tests);
@@ -916,12 +1049,14 @@ fn addShared(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.buil
         .link_libc = true,
         .imports = &.{.{ .name = "log", .module = log }},
     });
+    const sdk_build = b.addOptions();
+    sdk_build.addOption(bool, "plugin_profile", pluginProfile(b));
     const sdk = b.createModule(.{
         .root_source_file = b.path("src/sdk.zig"),
         .target = target,
         .optimize = optimize,
         .link_libc = true,
-        .imports = &.{ .{ .name = "mlx", .module = mlx }, .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util }, .{ .name = "mtp_acceptance", .module = mtp_acceptance } },
+        .imports = &.{ .{ .name = "mlx", .module = mlx }, .{ .name = "log", .module = log }, .{ .name = "io_util", .module = io_util }, .{ .name = "mtp_acceptance", .module = mtp_acceptance }, .{ .name = "sdk_build", .module = sdk_build.createModule() } },
     });
     return .{ .mlx = mlx, .log = log, .io_util = io_util, .mtp_acceptance = mtp_acceptance, .sdk = sdk, .gguf = engineModule(b, ggufRoot(b), sdk, target, optimize), .exl3 = engineModule(b, exl3Root(b), sdk, target, optimize) };
 }
