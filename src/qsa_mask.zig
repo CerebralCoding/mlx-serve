@@ -79,6 +79,7 @@ const testing = std.testing;
 
 test "qsa mask: the one-row kernel equals the op chain for sorted selections with sentinels and tails" {
     const xfm = @import("transformer.zig");
+    defer override = null;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x9A5C);
     const rnd = prng.random();
@@ -110,7 +111,6 @@ test "qsa mask: the one-row kernel equals the op chain for sorted selections wit
         const want = try xfm.qsaMaskFromBlocks(s, blocks, c.kv, ratio);
         override = true;
         const got = (try rowMask(s, blocks, c.kv, ratio)) orelse return error.KernelDeclined;
-        override = null;
         defer _ = mlx.mlx_array_free(want);
         defer _ = mlx.mlx_array_free(got);
         try testing.expectEqualSlices(c_int, &[_]c_int{ 1, 1, 1, c.kv }, mlx.getShape(got));

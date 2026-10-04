@@ -314,6 +314,7 @@ fn hostF32(s: mlx.mlx_stream, a: mlx.mlx_array) !struct { arr: mlx.mlx_array, da
 
 test "qsa decode: the one-token kernel is no worse than the masked SDPA against the f64 truth" {
     const xfm = @import("transformer.zig");
+    defer override = null;
     const s = mlx.gpuStream();
     const hq: usize = 24;
     const hk: usize = 2;
@@ -393,7 +394,6 @@ test "qsa decode: the one-token kernel is no worse than the masked SDPA against 
 
         override = true;
         const got = (try attend(s, q, kview, vview, blocks, @intCast(ratio), scale)) orelse return error.KernelDeclined;
-        override = null;
         defer _ = mlx.mlx_array_free(got);
         const mask = try xfm.qsaMaskFromBlocks(s, blocks, @intCast(kv), @intCast(ratio));
         defer _ = mlx.mlx_array_free(mask);

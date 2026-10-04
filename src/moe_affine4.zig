@@ -8,14 +8,9 @@ const std = @import("std");
 const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 
-/// One output row a simdgroup: more rows share the x registers but their live state cuts occupancy, and
-/// 1 beat 2 and 4 on both kernels (110.7 -> 114.7 tok/s).
+/// One output row a simdgroup: more rows share the x registers but their live state cuts occupancy.
 const ROWS: c_int = 1;
 const SGS: c_int = 2;
-/// A row re-reads its own experts, so past one token the sorted gather wins.
-pub const MAX_ROWS: c_int = 1;
-/// 16 values a lane, 32 lanes: a K block; a lane whose block start is past K idles.
-const BLOCK: c_int = 512;
 
 const DOT16 =
     \\inline float mlxserve_a4_dot16(uint2 w, thread const float* x) {

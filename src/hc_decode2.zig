@@ -16,8 +16,8 @@ pub const Pending = struct { out: mlx.mlx_array, inj: mlx.mlx_array };
 /// (null-ctx without a pending write).
 pub const Out = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array, stream: mlx.mlx_array };
 
-/// Down rows a simdgroup owns (a threadgroup has 8 simdgroups): one row each puts 160 threadgroups
-/// on the 80-core GPU where four rows left it half idle.
+/// Down rows a simdgroup owns (a threadgroup has 8 simdgroups): one row each spreads the launch over
+/// the most threadgroups, where four rows left cores idle.
 const RPS: c_int = 1;
 const ROWS_TG: c_int = 8 * RPS;
 /// Up columns a threadgroup owns, one per simdgroup.
@@ -456,6 +456,7 @@ fn parityCase(h: c_int, r: c_int, bits: u32, seed: u64) !void {
     const rnd = prng.random();
     xfm.hc_fused_override = true;
     defer xfm.hc_fused_override = null;
+    defer override = null;
     const hc: c_int = 4;
     const k = hc * h;
     const down = try quantRandom(rnd, r, k, bits, s);
@@ -483,7 +484,6 @@ fn parityCase(h: c_int, r: c_int, bits: u32, seed: u64) !void {
         try testing.expectEqual(before, served);
         override = true;
         const got = (try xfm.hcReadFused(s, x, 1, 1, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, 64, pend)) orelse return error.HcFusedDeclined;
-        override = null;
         try testing.expectEqual(before + 1, served);
         defer inline for (.{ ref, got }) |o| {
             _ = mlx.mlx_array_free(o.mixed);

@@ -36262,8 +36262,8 @@ fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: 
 /// and a dispatch prices at 1.76 us on this arch (MLX_SERVE_DISPATCH_PROBE
 /// slope over 1000 injected ops), so that chain alone is ~2 ms of a 19 ms token.
 /// `softmax_gate` is `softmax` plus the shared-expert gate's logit, a dot of one x row with a flat
-/// weight vector, which the 7 simdgroups that sit out the selection compute while it runs (the
-/// matmul it replaces is two dependent launches ahead of the router).
+/// weight vector that the simdgroups sitting out the selection compute while it runs (the matmul it
+/// replaces is two dependent launches ahead of the router). It needs at least two simdgroups.
 const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2, softmax_gate = 3 };
 
 /// Largest expert count the kernel will stage in threadgroup memory. The
@@ -36591,13 +36591,13 @@ fn moeRouterFusedEnabled() bool {
     return enabled;
 }
 
-/// One-kernel replacement for `moeRoutingChain` / `hy3RoutingChain`.
-/// Returns null when the geometry or dtype is outside the supported set, so
-/// every caller keeps its chain fallback.
 /// The shared-expert gate's logit, folded into the softmax router: `x` [rows * gate_k] and the flat
 /// weight vector `w` [gate_k], one logit per row.
 pub const RouterGate = struct { x: mlx.mlx_array, w: mlx.mlx_array };
 
+/// One-kernel replacement for `moeRoutingChain` / `hy3RoutingChain`.
+/// Returns null when the geometry or dtype is outside the supported set, so
+/// every caller keeps its chain fallback.
 fn moeRouterTopK(
     s: mlx.mlx_stream,
     logits: mlx.mlx_array,
@@ -36648,6 +36648,8 @@ fn moeRouterTopK(
     }
 
     const tg = moeRouterThreadGroup(num_experts);
+    // The gate's dot runs on the simdgroups that sit out the selection: with one there is none to run it.
+    if (mode == .softmax_gate and tg < 64) return moeRouterTopK(s, logits, bias, k, .softmax, route_norm, route_scale, out_dtype, n_group, topk_group, null);
 
     // The whole point of the kernel is to spend ONE dispatch where the chain
     // spent a dozen; rebuilding the config every call would just move that cost
@@ -41283,8 +41285,8 @@ fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx
     return result;
 }
 
-/// Diagnostic (`MLX_SERVE_HC_DIAG_SKIP=n|d|u`): one fused read kernel stands in (N: the
-/// stream itself, D: zeros, U: stream 0) so its in-situ cost reads off the forward.
+/// Diagnostic (`MLX_SERVE_HC_DIAG_SKIP=d|u`): one fused read kernel stands in (D: zeros, U: stream 0)
+/// so its in-situ cost reads off the forward.
 var hc_diag_skip: ?u8 = null;
 fn hcDiagSkip() u8 {
     if (hc_diag_skip) |v| return v;
@@ -41467,15 +41469,7 @@ pub fn hcReadFused(
     const wo = if (pend) |pd| pd.out else nw;
     const wi = if (pend) |pd| pd.inj else nw;
     const skip = hcDiagSkip();
-    if (skip == 'n') {
-        // Stand-in: the stream itself, unit-free mix partials, the deferred write dropped.
-        n_out[0] = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(&n_out[0], x));
-        n_out[1] = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_zeros(&n_out[1], &[_]c_int{rows * hc * hc}, 1, .float32, s));
-        n_out[2] = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(&n_out[2], x));
-    } else try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi }, 3, &n_out);
+    try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi }, 3, &n_out);
     const xn = n_out[0];
     defer _ = mlx.mlx_array_free(xn);
     const ipart = n_out[1];
@@ -49191,6 +49185,37 @@ test "fused softmax router folds the shared-expert gate's logit: routing unchang
         var want: f64 = 0;
         for (wh, 0..) |wv, k| want += @as(f64, wv) * xh[r * @as(usize, @intCast(GK)) + k];
         try testing.expect(@abs(@as(f64, got[r]) - want) <= 0.004 * @abs(want) + 1e-3);
+    }
+}
+
+test "fused softmax router: a router with no spare simdgroup routes without the gate logit" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x6A7E11);
+    const rnd = prng.random();
+    moe_router_fused_override = true;
+    defer moe_router_fused_override = null;
+
+    // 16 experts is one simdgroup: nothing is left to dot the gate vector, and a zero logit must never ship.
+    const logits = try testRandUniformBf16(rnd, &.{ 2, 16 }, -4.0, 4.0, s);
+    defer _ = mlx.mlx_array_free(logits);
+    const x = try testRandUniformBf16(rnd, &.{ 2, 64 }, -2.0, 2.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    const w = try testRandUniformBf16(rnd, &.{64}, -0.2, 0.2, s);
+    defer _ = mlx.mlx_array_free(w);
+
+    const plain = (try moeRouterTopK(s, logits, .{ .ctx = null }, 4, .softmax, true, 1.0, .bfloat16, 0, 0, null)) orelse return error.FusedRouterDeclined;
+    defer _ = mlx.mlx_array_free(plain.inds);
+    defer _ = mlx.mlx_array_free(plain.norm_scores);
+    const gated = (try moeRouterTopK(s, logits, .{ .ctx = null }, 4, .softmax, true, 1.0, .bfloat16, 0, 0, .{ .x = x, .w = w })) orelse return error.FusedRouterDeclined;
+    defer _ = mlx.mlx_array_free(gated.inds);
+    defer _ = mlx.mlx_array_free(gated.norm_scores);
+    try testing.expect(gated.gate_logit.ctx == null);
+    inline for (.{ "inds", "norm_scores" }) |name| {
+        var a: [8]f32 = undefined;
+        var b: [8]f32 = undefined;
+        try testReadF32(@field(plain, name), &a, s);
+        try testReadF32(@field(gated, name), &b, s);
+        try testing.expectEqualSlices(f32, &a, &b);
     }
 }
 
