@@ -12,6 +12,7 @@ const chat_mod = @import("chat.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const token_mask = @import("token_mask.zig");
 const model_mod = @import("model.zig");
+const plugins = @import("plugins.zig");
 const dsv4_mod = @import("deepseek_v4.zig");
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
@@ -24,11 +25,11 @@ const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
-const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
+const ds4_ffi = if (@import("build_options").embedded_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
 const stb = @import("stb");
 const webp = @import("webp");
@@ -6664,7 +6665,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":"{d}-bit","context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}{s}}}
         , .{
             model_id,
             nowSecs(io),
@@ -6698,6 +6699,8 @@ fn renderModelEntry(
             gen_temp_str,
             gen_top_p_str,
             gen_top_k_str,
+            // The plugins that serve it (`,"plugins":[...]`), "" for a model no registered arch serves.
+            plugins.registry.servedJson(config.arch),
         });
     }
 
@@ -7594,7 +7597,8 @@ fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel) !v
     defer allocator.free(batching_json);
     const settings_json = try settingsPropsJson(allocator, propsSettingsFor(lm));
     defer allocator.free(settings_json);
-    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json });
+    // The plugins that serve the model (`,"plugins":[...]`), "" for a model no registered arch serves.
+    const extra_json = try std.fmt.allocPrint(allocator, "{s}{s}{s}{s}{s}", .{ ane_json, ngram_json, batching_json, settings_json, plugins.registry.servedJson(config.arch) });
     defer allocator.free(extra_json);
 
     const kv_cache_mem: u64 = if (global_scheduler) |sch|
@@ -24513,4 +24517,64 @@ test "disabled prefix cache: sizing releases the cache reserve on every arch" {
     try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
     try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
     try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
+}
+
+// ── host seams: gpu_ceiling.zig, the native draft readiness and the plugins fragment (characterization) ──
+
+test "host seams: a host with zero plugins routes nothing and adds nothing to /v1/models or /props" {
+    const none = plugins.Registry(&.{}, .{ .macos = true });
+    try testing.expectEqual(@as(usize, 0), none.archs.len);
+    try testing.expect(!none.arch_ties_possible);
+    try testing.expect(!none.registered("mlx-stream"));
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    for ([_][]const u8{ "{\"model_type\":\"deepseek_v41\"}", "{\"model_type\":\"gemma4\"}", "{}" }) |text| {
+        const peek = try @import("sdk").ConfigPeek.parse(arena.allocator(), "/m", text);
+        try testing.expect(none.arch(&peek, null) == null);
+        try testing.expect(none.source(&peek, null) == null and none.engine(&peek, null) == null);
+    }
+    try testing.expectEqualStrings("", none.servedJson(null));
+    // This build's registry: a model no registered arch serves gets the empty fragment too.
+    try testing.expectEqualStrings("", plugins.registry.servedJson(null));
+}
+
+test "host seams: a ready /v1/models row for a model no plugin serves keeps upstream's keys, in order" {
+    var config = model_mod.ModelConfig{};
+    config.model_type = "qwen3";
+    config.pinned_context = 4096;
+    var chat_config = chat_mod.ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = testing.allocator };
+    var entry: LoadedModel = .{
+        .allocator = testing.allocator,
+        .id = "m",
+        .path = "/nonexistent/host-seams-model",
+        .bytes_on_disk = 1234,
+        .arch_hint = "",
+        .config = &config,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = &chat_config,
+        .vision_encoder = null,
+        .drafter = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = .init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 99,
+        .state = .ready,
+        .error_name = null,
+    };
+    const json = try renderModelEntry(testing.allocator, testing.io, &entry);
+    defer testing.allocator.free(json);
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+    defer parsed.deinit();
+    const top = [_][]const u8{ "id", "object", "created", "owned_by", "loaded", "state", "bytes_resident", "bytes_on_disk", "context_length", "max_model_len", "batched_decode", "capabilities", "input_modalities", "meta" };
+    try testing.expectEqual(top.len, parsed.value.object.count());
+    for (top, parsed.value.object.keys()) |want, got| try testing.expectEqualStrings(want, got);
+    const meta_keys = [_][]const u8{ "architecture", "engine", "vocab_size", "hidden_size", "num_layers", "quantization", "context_length", "model_max_tokens", "embedding_max_length", "is_moe", "drafter_loaded", "drafter_path", "mtp_loaded", "mtp_available", "spec_exact", "kv_quant", "gen_temperature", "gen_top_p", "gen_top_k" };
+    const meta = parsed.value.object.get("meta").?.object;
+    try testing.expectEqual(meta_keys.len, meta.count());
+    for (meta_keys, meta.keys()) |want, got| try testing.expectEqualStrings(want, got);
+    try testing.expect(std.mem.endsWith(u8, json, "}}"));
 }

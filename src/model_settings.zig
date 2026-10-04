@@ -52,18 +52,22 @@ pub const Settings = struct {
 
     /// The returned Override owns its strings (`deinit`).
     pub fn lookup(self: *const Settings, alloc: std.mem.Allocator, model_path: []const u8) Override {
-        const p = self.parsed orelse return .{};
+        return fromValue(alloc, self.entry(model_path) orelse return .{});
+    }
+
+    /// The model's settings object as written (borrowed from this parse).
+    pub fn entry(self: *const Settings, model_path: []const u8) ?std.json.Value {
+        const p = self.parsed orelse return null;
         const root = switch (p.value) {
             .object => |o| o,
-            else => return .{},
+            else => return null,
         };
         const want = trimSlash(model_path);
         var it = root.iterator();
         while (it.next()) |kv| {
-            if (!std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) continue;
-            return fromValue(alloc, kv.value_ptr.*);
+            if (std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) return kv.value_ptr.*;
         }
-        return .{};
+        return null;
     }
 
     /// The model path whose `alias` is `name`; a name claimed twice goes to the
@@ -205,6 +209,27 @@ pub fn load(alloc: std.mem.Allocator, io: std.Io, path: []const u8) Settings {
 pub fn defaultPath(buf: []u8) []const u8 {
     const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
     return std.fmt.bufPrint(buf, "{s}/.mlx-serve/model-settings.json", .{home}) catch "";
+}
+
+/// The plugin a model's entry names to break a `claims` tie between registered archs (`"plugin": "<name>"`, borrowed
+/// from the entry); null when it names none. Not part of `Override`: the host's override and its log line stay as
+/// they are, and only a build where two archs can tie reads it (`plugins.registry.arch_ties_possible`).
+pub fn pluginOf(entry: std.json.Value) ?[]const u8 {
+    const obj = switch (entry) {
+        .object => |o| o,
+        else => return null,
+    };
+    const v = obj.get("plugin") orelse return null;
+    return if (v == .string and v.string.len > 0) v.string else null;
+}
+
+/// `pluginOf` for the model in the default file, owned by the caller.
+pub fn pluginFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) ?[]u8 {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var s = load(alloc, io, defaultPath(&buf));
+    defer s.deinit();
+    const name = pluginOf(s.entry(model_path) orelse return null) orelse return null;
+    return alloc.dupe(u8, name) catch null;
 }
 
 /// The parsed file kept for the request path: re-stats at most once per
@@ -407,6 +432,31 @@ test "model_settings: drafter is off, auto or an absolute path; anything else is
     try std.testing.expect(s.lookup(t, "/m/e").isEmpty());
 }
 
+test "model_settings: a registered arch reads its own keys from the model's entry; they leave the host's override empty" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"numeric_tier": "stock", "expert_wide_depth": 2}}
+    );
+    defer s.deinit();
+    try std.testing.expect(s.lookup(std.testing.allocator, "/m/a").isEmpty());
+    const e = s.entry("/m/a/").?;
+    try std.testing.expectEqualStrings("stock", e.object.get("numeric_tier").?.string);
+    try std.testing.expect(s.entry("/m/b") == null);
+}
+
+test "dsv41 plugins: model-settings.json's plugin names a claims tie-break; anything else is unset, and the override stays empty" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"plugin": "mlx-stream"}, "/m/b": {"plugin": 1}, "/m/c": {"plugin": ""}, "/m/d": {"ctx_size": 4096}}
+    );
+    defer s.deinit();
+    try std.testing.expectEqualStrings("mlx-stream", pluginOf(s.entry("/m/a/").?).?);
+    try std.testing.expect(pluginOf(s.entry("/m/b").?) == null);
+    try std.testing.expect(pluginOf(s.entry("/m/c").?) == null);
+    try std.testing.expect(pluginOf(s.entry("/m/d").?) == null);
+    try std.testing.expect(pluginOf(.null) == null);
+    // The key is the registry's, not the host override's: an entry naming only a plugin logs no [model-settings] line.
+    try std.testing.expect(s.lookup(std.testing.allocator, "/m/a").isEmpty());
+}
+
 test "model_settings: an alias names its model path; an invalid alias names nothing" {
     var s = try parse(std.testing.allocator,
         \\{"/m/a/": {"alias": "qwen"}, "/m/b": {"alias": "mlx-serve"}, "/m/c": {"alias": "x@peer"},
@@ -469,4 +519,75 @@ test "model_settings: an alias two models claim is named with both paths" {
     );
     defer one.deinit();
     try std.testing.expect(one.duplicateAlias() == null);
+}
+
+// ── host seams: lookup split into entry + fromValue; plugin tie-break (characterization against upstream af34af04) ──
+
+/// Upstream af34af04's `Settings.lookup`, verbatim.
+fn upstreamLookup(self: *const Settings, alloc: std.mem.Allocator, model_path: []const u8) Override {
+    const p = self.parsed orelse return .{};
+    const root = switch (p.value) {
+        .object => |o| o,
+        else => return .{},
+    };
+    const want = trimSlash(model_path);
+    var it = root.iterator();
+    while (it.next()) |kv| {
+        if (!std.mem.eql(u8, trimSlash(kv.key_ptr.*), want)) continue;
+        return fromValue(alloc, kv.value_ptr.*);
+    }
+    return .{};
+}
+
+/// Upstream af34af04's `Override.isEmpty` (no `nocache_weights`).
+fn upstreamIsEmpty(o: Override) bool {
+    return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
+        o.mtp_greedy_tail == null and o.int8_prefill == null and o.chat_template_kwargs == null and o.drafter == null;
+}
+
+fn expectSameOverride(a: Override, b: Override) !void {
+    const info = @typeInfo(Override).@"struct";
+    inline for (info.field_names, info.field_types) |name, T| {
+        const x = @field(a, name);
+        const y = @field(b, name);
+        if (T == ?[]const u8) {
+            try std.testing.expectEqual(x == null, y == null);
+            if (x) |s| try std.testing.expectEqualStrings(s, y.?);
+        } else try std.testing.expect(std.meta.eql(x, y));
+    }
+}
+
+test "host seams: a model's settings resolve exactly as upstream's lookup did, for files written before the plugin keys" {
+    const t = std.testing.allocator;
+    const files = [_][]const u8{
+        "{}",
+        "[]",
+        "{\"/m/a\": 3}",
+        \\{"/m/a/": {"ctx_size": 8192, "kv_quant": "8", "mtp": false}, "/m/a": {"ctx_size": 1}}
+        ,
+        \\{"/m/b": {"mtp_acceptance": "typical", "mtp_greedy_tail": true, "int8_prefill": true, "drafter": "off"}}
+        ,
+        \\{"/m/c": {"chat_template_kwargs": {"preserve_thinking": true}, "enable_thinking": false, "reasoning_effort": "low"}}
+        ,
+        \\{"/m/d": {"ctx_size": "big", "kv_quant": 3, "drafter": "relative/path", "alias": "x"}}
+        ,
+        \\{"/m/e": {"plugin": "mlx-stream", "numeric_tier": "stock"}, "/m/f": {"drafter": "/abs/dir", "plugin": 7}}
+        ,
+    };
+    const paths = [_][]const u8{ "/m/a", "/m/a/", "/m/b", "/m/c", "/m/d", "/m/e", "/m/f", "/m/zz", "" };
+    for (files, 0..) |body, fi| {
+        var s = try parse(t, body);
+        defer s.deinit();
+        for (paths) |p| {
+            var want = upstreamLookup(&s, t, p);
+            defer want.deinit(t);
+            var got = s.lookup(t, p);
+            defer got.deinit(t);
+            try expectSameOverride(want, got);
+            try std.testing.expectEqual(upstreamIsEmpty(want), got.isEmpty());
+            // The tie-break reads the entry `lookup` resolved; only /m/e names a plugin by string.
+            const named = if (s.entry(p)) |e| pluginOf(e) else null;
+            try std.testing.expectEqual(fi == files.len - 1 and std.mem.eql(u8, trimSlash(p), "/m/e"), named != null);
+        }
+    }
 }

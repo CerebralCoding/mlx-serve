@@ -1,9 +1,9 @@
 const std = @import("std");
 const jinja_c = @import("jinja_c");
 const tokenizer_mod = @import("tokenizer.zig");
-const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const ds4_ffi = if (@import("build_options").macos_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const ds4_ffi = if (@import("build_options").embedded_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
+const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const log = @import("log");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 
@@ -14892,4 +14892,12 @@ test "renderChatTemplate: GLM-5-Next tool history renders natively (jinja `obj.0
     defer testing.allocator.free(out);
     try testing.expect(std.mem.indexOf(u8, out, "<|observation|><tool_response>{\"temp_c\": 21}</tool_response><|assistant|><think>") != null);
     try testing.expect(std.mem.indexOf(u8, out, "<start_of_turn>") == null);
+}
+
+test "host seams: the default macOS build embeds the engines upstream's macos_engines switch did" {
+    // The engine picks key on `embedded_engines` (was `macos_engines`); only the slim host's exe turns it off.
+    const bo = @import("build_options");
+    try std.testing.expectEqual(bo.macos_engines, bo.embedded_engines);
+    try std.testing.expectEqual(bo.embedded_engines, arch_ds4 == @import("arch/ds4.zig"));
+    try std.testing.expectEqual(bo.embedded_engines, arch_llama == @import("arch/llama.zig"));
 }

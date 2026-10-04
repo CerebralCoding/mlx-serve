@@ -58,11 +58,11 @@ const model_registry_mod = @import("model_registry.zig");
 const model_settings = @import("model_settings.zig");
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
-const arch_ds4 = if (@import("build_options").macos_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const arch_llama = if (@import("build_options").macos_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
-const mlx_gguf = @import("arch/mlx_gguf.zig");
+const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const log = @import("log");
 const io_util = @import("io_util");
+const mlx_gguf = @import("arch/mlx_gguf.zig");
 const status = @import("status.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
 

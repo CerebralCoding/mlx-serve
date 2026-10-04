@@ -9,6 +9,9 @@ const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const kv_quant_mod = @import("kv_quant.zig");
 const mtp_acceptance_mod = @import("mtp_acceptance.zig");
+const sdk = @import("sdk");
+const plugins = @import("plugins.zig");
+const model_settings = @import("model_settings.zig");
 
 pub const HiddenAct = enum { gelu_approx, gelu, silu, relu_sq };
 
@@ -421,6 +424,9 @@ pub const ModelConfig = struct {
     dsv4_dspark_markov_rank: u32 = 0,
     dsv4_dspark_target_layers: [8]u8 = @splat(0),
     dsv4_n_dspark_target_layers: u32 = 0,
+    /// The registered arch that claimed this model (src/plugins.zig) and its parsed config, freed with this one.
+    arch: ?*const sdk.Arch = null,
+    arch_cfg: ?*anyopaque = null,
 
     // BERT encoder-only
     is_encoder_only: bool = false,
@@ -1456,12 +1462,14 @@ pub const ModelConfig = struct {
     }
 
     /// Free the allocator-owned fields (`ngram_table_path`, allocPrint'd by
-    /// `parseConfig`, and `drafter_override`); everything else is plain data or a borrowed slice. Every
-    /// `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
+    /// `parseConfig`, the registered arch's config, and `drafter_override`); everything else is plain data or a
+    /// borrowed slice. Every `destroy` of a parsed config pairs with this, or a qwen4 load leaks the
     /// path. Idempotent.
     pub fn deinit(self: *ModelConfig, allocator: std.mem.Allocator) void {
         if (self.ngram_table_path) |p| allocator.free(p);
         self.ngram_table_path = null;
+        if (self.arch_cfg) |c| self.arch.?.free_config(allocator, c);
+        self.arch_cfg = null;
         if (self.drafter_override) |p| allocator.free(p);
         self.drafter_override = null;
     }
@@ -1481,7 +1489,12 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     };
     defer allocator.free(content);
 
-    var config = try parseConfigFromJson(allocator, content);
+    // Two registered archs can tie on a model only in a build that registers two or more; there the model's
+    // model-settings.json entry may name the plugin that breaks the tie (`plugin`). A build with one arch reads nothing.
+    const prefer: ?[]u8 = if (plugins.registry.arch_ties_possible) model_settings.pluginFor(allocator, io, model_dir) else null;
+    defer if (prefer) |p| allocator.free(p);
+    if (prefer) |p| if (!plugins.registry.registered(p)) log.warn("[model-settings] {s}: plugin {s} is not registered in this build, ignored\n", .{ model_dir, p });
+    var config = try parseConfigFromJsonPrefer(allocator, content, model_dir, prefer);
     if (config.isQwen4()) {
         config.ngram_table_path = try std.fmt.allocPrint(allocator, "{s}/ngram_table.bin", .{model_dir});
     }
@@ -1980,6 +1993,17 @@ fn refuseUnconvertedMimo(cfg_obj: std.json.ObjectMap) !void {
 }
 
 pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !ModelConfig {
+    return parseConfigFromJsonIn(allocator, content, "");
+}
+
+/// `parseConfigFromJson` for the model in `model_dir` ("" for none): a registered arch's own parse sees it.
+pub fn parseConfigFromJsonIn(allocator: std.mem.Allocator, content: []const u8, model_dir: []const u8) !ModelConfig {
+    return parseConfigFromJsonPrefer(allocator, content, model_dir, null);
+}
+
+/// `parseConfigFromJsonIn` with the plugin that breaks a `claims` tie between registered archs (`prefer`, from the
+/// model's settings; null: registry order).
+pub fn parseConfigFromJsonPrefer(allocator: std.mem.Allocator, content: []const u8, model_dir: []const u8, prefer: ?[]const u8) !ModelConfig {
     // The launch-time overrides apply to EVERY parse (primary load, on-demand
     // load, discovery stubs), so the advertised context and the loaded model
     // can never disagree about what window the checkpoint has.
@@ -3458,6 +3482,20 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 return error.UnsupportedInklingConfig;
             }
         }
+    } else if (plugins.registry.arch(&.{ .model_dir = model_dir, .text = merged orelse content, .root = root }, prefer)) |e| {
+        // A registered arch (src/plugins.zig): its own parse refuses by name; its module owns everything past the
+        // shell's generic fields, which it states (`shell`).
+        var diag: sdk.Diag = .{};
+        const cfg = e.kind.parse(allocator, &.{ .model_dir = model_dir, .text = merged orelse content, .root = root }, &diag) catch |err| {
+            log.err("{s}: {s}\n", .{ e.kind.name, diag.message() });
+            return err;
+        };
+        config.arch = &e.kind;
+        config.arch_cfg = cfg;
+        config.model_type = e.kind.name;
+        const sh = e.kind.shell(cfg);
+        config.num_experts = sh.num_experts;
+        config.num_hidden_layers = sh.num_layers;
     } else if (std.mem.eql(u8, model_type, "deepseek_v4")) {
         // DeepSeek V4 Flash (284B-A13B, 1M ctx). See the dsv4_* field block
         // for the architecture summary; reference is the release's own
@@ -8212,3 +8250,20 @@ test "parseConfigFromJson accepts real checkpoint configs" {
     }
     try testing.expect(!failed);
 }
+
+// ── host seams: the registry's arch dispatch and the SDK types, as upstream's models see them ──
+
+test "host seams: no registered arch claims an upstream model_type; this build reads no tie-break setting" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const types = [_][]const u8{ "gemma3", "gemma3_text", "gemma4", "gemma4_text", "diffusion_gemma", "muse_glimmer", "spark2_5", "qwen2", "qwen3", "qwen3_5", "qwen3_5_moe", "qwen3_5_moe_text", "qwen3_next", "qwen4_exp", "qwen3_moe", "gpt_oss", "glm5_next", "glm5_next_text", "mimo_v2", "mimo_v2_flash", "hy_v3", "bailing_hybrid", "laguna", "inkling_mm_model", "deepseek_v4", "deepseek_v3", "llama", "mistral", "nemotron_h", "lfm2", "lfm2_moe", "lfm2_vl", "k2_horizon", "prism_hadamard_qwen35", "bert", "" };
+    for (types) |t| {
+        const text = try std.fmt.allocPrint(arena.allocator(), "{{\"model_type\":\"{s}\"}}", .{t});
+        const peek = try sdk.ConfigPeek.parse(arena.allocator(), "/m", text);
+        try testing.expect(plugins.registry.arch(&peek, null) == null);
+        try testing.expect(plugins.registry.arch(&peek, "mlx-stream") == null);
+    }
+    // One registered arch at most: `parseConfig` never reads model-settings.json's `plugin`.
+    try testing.expect(!plugins.registry.arch_ties_possible);
+}
+
