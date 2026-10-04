@@ -318,22 +318,34 @@ pub const Conn = struct {
     /// True once this connection has written a `text/event-stream` head: past it a generation
     /// failure can only be an SSE `error` event. Set only in `sendSseHeaders`.
     sse_headers_sent: bool = false,
+    /// True once this connection has written a response head with a `Content-Length`: the body
+    /// ends by its length, not at the close, so `close` need not wait for the peer.
+    length_framed: bool = false,
     /// Non-null while an Ollama /api/* handler runs an inner /v1 handler:
     /// every write the inner handler makes is fed to the sink (SSE → NDJSON
     /// re-framing) instead of the socket. The sink writes its translated
     /// output through `writer()` directly, bypassing this hook — same
     /// interception pattern as `ws_mode`. See src/ollama.zig.
     ollama_sink: ?*ollama_mod.Sink = null,
+    /// Agent named by the current request's User-Agent.
+    client: instr.Client = .other,
 
     pub fn init(c: *Conn, stream: std.Io.net.Stream, io: std.Io) void {
         c.stream = stream;
         c.io = io;
+        c.client = .other;
         c.write_state = stream.writer(io, &c.write_buf);
         c.read_state = stream.reader(io, &c.read_buf);
         c.ws_mode = null;
         c.ollama_sink = null;
         c.sse_headers_sent = false;
+        c.length_framed = false;
         c.heartbeat = .{ .last_write_ms = nowMsMonotonic(io) };
+    }
+
+    /// Replaces the previous request's client, so a request without a User-Agent never inherits it.
+    pub fn noteRequestHeaders(c: *Conn, headers: []const u8) void {
+        c.client = instr.Client.fromUserAgent(findHeaderValue(headers, "user-agent"));
     }
 
     /// True when the connection has been silent long enough that a streaming
@@ -380,8 +392,28 @@ pub const Conn = struct {
         };
     }
 
+    /// Longest `close` waits for the peer to hang up before releasing the socket anyway.
+    const CLOSE_WAIT_MS: i64 = 5 * 60 * 1000;
+
+    /// A close-delimited body (SSE, NDJSON: no `Content-Length`) ends at the close, so this sends
+    /// our FIN and holds the socket until the peer closes. A socket closed under a reader that
+    /// still lags is dropped by the kernel with an RST once its FIN_WAIT_2 timer runs out (60 s
+    /// on macOS), so the reader gets the whole body and then ECONNRESET, not EOF. A length-framed
+    /// response closes at once: its reader knows where the body ends.
     pub fn close(c: *Conn) void {
         c.flush() catch {};
+        if (c.length_framed) return c.stream.close(c.io);
+        const fd = c.stream.socket.handle;
+        _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
+        const deadline = nowMsMonotonic(c.io) + CLOSE_WAIT_MS;
+        var fds = [_]std.posix.pollfd{.{ .fd = fd, .events = std.posix.POLL.IN, .revents = 0 }};
+        var sink: [256]u8 = undefined;
+        while (nowMsMonotonic(c.io) < deadline and !shutdown_requested.load(.acquire)) {
+            const n = std.posix.poll(&fds, 500) catch break;
+            if (n == 0) continue;
+            // EOF or reset ends the wait; a byte from a pipelining client is dropped.
+            if (std.c.recv(fd, &sink, sink.len, std.posix.MSG.DONTWAIT) <= 0) break;
+        }
         c.stream.close(c.io);
     }
 
@@ -738,6 +770,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/tokenize",
     "/v1/3d/generations",
     "/v1/audio/music-generations",
+    "/v1/audio/sound-generations",
     "/v1/audio/speech",
     "/v1/chat/completions",
     "/v1/completions",
@@ -896,7 +929,7 @@ pub var prefix_cache_mem_explicit = false;
 /// Bytes one cached session at `ctx_tokens` holds: its KV and state, plus the SSM checkpoints
 /// a cold prefill of that length retains, which the commit path bills to the entry.
 pub fn oneSessionEntryBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
-    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes() +|
+    return sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| slotFixedKvBytes(config, kv_bits, chunk) +|
         retainedSsmCheckpointBytes(config, ctx_tokens, 0, chunk);
 }
 
@@ -914,6 +947,7 @@ var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED
 
 /// The hot-cache byte budget every post-load reserve must bill: the clamp's answer once loaded, the raw ask before.
 pub fn resolvedPrefixCacheMem() u64 {
+    if (prefix_cache_capacity == 0) return 0;
     const v = hot_cache_mem_resolved.load(.monotonic);
     return if (v != HOT_CACHE_MEM_UNRESOLVED) v else prefix_cache_mem_bytes;
 }
@@ -1814,7 +1848,7 @@ pub fn serve(
     // at every value so a default-1 boot does not read as "one at a time".
     if (scheduler_mod.configBatchesDecode(config)) {
         log.info("Concurrency: --max-concurrent={d}, batched decode on\n", .{max_concurrent});
-        if (prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
+        if (prefix_cache_capacity > 0 and prefix_cache_capacity < max_concurrent) prefix_cache_capacity = max_concurrent;
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
@@ -2179,6 +2213,7 @@ fn handleConnection(
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
     logHttpRequest(method, raw_path, request_body);
+    stream.noteRequestHeaders(request[0..header_end_pos]);
 
     // ── API-key auth gate. When --api-key is set, every NON-LOOPBACK request
     //    requires the key (the OpenAI/Anthropic/Ollama APIs AND the index page
@@ -2624,6 +2659,10 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .music);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/sound-generations")) {
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const body = request[header_end + 4 .. total_read];
+        try handleGen(allocator, stream, body, lm, .sound);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/video/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -3582,7 +3621,7 @@ pub fn prefillTransientReserveAtKv(
         config.prefillAttnKeys(seq),
         prefillStreamBytesPerToken(config),
         prefillDequantWeightBytes(config),
-        .{ .qsa_ring_bytes = config.qsaRingBytes(), .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits) },
+        .{ .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk), .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits) },
     ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 }
 
@@ -3647,7 +3686,8 @@ pub fn ctxBarEnabled() bool {
 /// Widths `resolvePrefillChunk` will step down through. Descending, floored at
 /// `generate.PREFILL_CHUNK_FLOOR` — below that the score-budget path refuses to
 /// go either, and a 256-token forward stops amortizing the per-chunk sweeps.
-pub const PREFILL_CHUNK_LADDER = [_]u32{ 8192, 4096, 2048, 1024, 512 };
+/// The top rung is `WIDE_PREFILL_CHUNK`, pinned only by an arch with no prefill score tensor.
+pub const PREFILL_CHUNK_LADDER = [_]u32{ @intCast(generate_mod.WIDE_PREFILL_CHUNK), 8192, 4096, 2048, 1024, 512 };
 
 /// How much of the post-weights serving budget a ONE-OFF prefill transient may
 /// claim before the chunk steps down. A quarter: past that the machine is
@@ -3713,6 +3753,7 @@ pub fn resolvePrefillChunk(
 ) u32 {
     const cap: u64 = prefillChunkCap(config, ceiling, active_mem, ctx_kv_bytes, hot_cache_ask);
     for (PREFILL_CHUNK_LADDER) |chunk| {
+        if (chunk == generate_mod.WIDE_PREFILL_CHUNK and config.prefillScoreHeadDim() != 0) continue;
         if (prefillTransientReserve(config, kv_bits, chunk) <= cap) return chunk;
     }
     // Nothing fits the share — the model barely fits at all. Take the narrowest
@@ -3752,7 +3793,9 @@ pub fn billedPrefillChunk(
 /// explicit `--ctx-size`, 0 while the context is auto (the auto sizer adapts to the rung).
 pub fn sizerCtxKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64) u64 {
     if (manualContext(config) == 0) return 0;
-    return sessionBytesPerToken(config, kv_bits) *| manualContext(config) +| config.qsaRingBytes();
+    // Runs inside `pinPrefillChunk`: before the pin, bill the widest rung.
+    const chunk: u64 = if (config.pinned_prefill_chunk > 0) config.pinned_prefill_chunk else generate_mod.WIDE_PREFILL_CHUNK;
+    return sessionBytesPerToken(config, kv_bits) *| manualContext(config) +| slotFixedKvBytes(config, kv_bits, chunk);
 }
 
 /// Freeze this model's prefill chunk at load, from live memory. Idempotent.
@@ -3857,7 +3900,7 @@ pub fn planHotCache(
     const chunk = billedPrefillChunk(config, kv_bits, ceiling, active_weights, sizer_ctx_kv, requested, chunk_override);
     const reserve_chunk = clampReserveWidth(config, chunk);
     const reserve = prefillTransientReserve(config, kv_bits, reserve_chunk);
-    const ctx_kv: u64 = sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| config.qsaRingBytes();
+    const ctx_kv: u64 = sessionBytesPerToken(config, kv_bits) *| ctx_tokens +| slotFixedKvBytes(config, kv_bits, chunk);
     return .{
         .chunk = chunk,
         .reserve_chunk = reserve_chunk,
@@ -3930,7 +3973,7 @@ fn ssdFirstSessionTokensNow(config: *const model_mod.ModelConfig, kv_bits: u64, 
 /// The bytes the SSD-first budget floors at: one session at the working context, at the width the cache stores.
 fn ssdFirstSessionKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, ceiling: u64, active_mem: u64, chunk: u32) u64 {
     return sessionBytesPerToken(config, kv_bits) *|
-        ssdFirstSessionTokensNow(config, kv_bits, ceiling, active_mem, chunk) +| config.qsaRingBytes();
+        ssdFirstSessionTokensNow(config, kv_bits, ceiling, active_mem, chunk) +| slotFixedKvBytes(config, kv_bits, chunk);
 }
 
 /// The SSD-first arm of `prefixCacheMemForLoad`, gate and log included. Null when the arch
@@ -3984,7 +4027,15 @@ const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The previous context-sizing cache reserve: the raw `--prefix-cache-mem` ask. Kept for
 /// ungated archs so their advertised `context_length` does not move.
+/// The ungated arm's ask. A sliding-ring entry cannot be trimmed below its ring (`ringFloor`), so
+/// a budget under one session caches nothing for it: it asks for one session at the working context.
+fn ungatedHotCacheAsk(config: *const model_mod.ModelConfig, requested: u64, explicit: bool, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
+    if (!config.slidingRing()) return requested;
+    return defaultPrefixCacheAsk(requested, explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, chunk));
+}
+
 fn legacyPrefixCacheAsk() u64 {
+    if (prefix_cache_capacity == 0) return 0;
     return prefix_cache_mem_bytes; // legacy_ask_read
 }
 
@@ -4018,9 +4069,10 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         const chunk: u64 = pinPrefillChunk(config);
         // `statePerTokenBilled` is 0 off qwen4_exp.
         const ctx_kv: u64 = (kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config)) *|
-            getEffectiveContextLength(config) +| config.qsaRingBytes();
+            getEffectiveContextLength(config) +| slotFixedKvBytes(config, kv_bits, chunk);
+        const ask = ungatedHotCacheAsk(config, requested, prefix_cache_mem_explicit, kv_bits, getEffectiveContextLength(config), chunk);
         const clamped = clampedPrefixCacheMem(
-            requested,
+            ask,
             currentGpuMemoryCeiling(config, active_mem),
             active_mem,
             ctx_kv,
@@ -4029,8 +4081,10 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         // Publishing the resolved budget is kept on every arch: the ANE gate used to reserve the raw ask.
         publishResolvedPrefixCacheMem(clamped);
         if (revise.quiet) return clamped;
-        if (requested > 0 and clamped < requested) {
-            log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ requested >> 20, clamped >> 20 });
+        if (ask > 0 and clamped < ask) {
+            log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ ask >> 20, clamped >> 20 });
+        } else if (ask != requested) {
+            log.info("[hot-cache] budget {d} MB (one session at the working context: a sliding-ring entry is never trimmed)\n", .{clamped >> 20});
         } else if (requested == 0) {
             log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
         }
@@ -4746,8 +4800,8 @@ test "a 512k QSA session drops the raw-key overbill and bills the ring once" {
     const seq: u64 = 512 * 1024;
     const short = prefillRequestTerms(&cfg, 1024, 2048, 8, 4096, .{});
     const long = prefillRequestTerms(&cfg, seq, 2048, 8, 4096, .{});
-    try t.expectEqual(cfg.qsaRingBytes(), short.qsa_ring_bytes);
-    try t.expectEqual(cfg.qsaRingBytes(), long.qsa_ring_bytes);
+    try t.expectEqual(cfg.qsaRingBytes(), short.slot_fixed_kv_bytes);
+    try t.expectEqual(cfg.qsaRingBytes(), long.slot_fixed_kv_bytes);
     const reserved = @max(reservedCacheTokens(seq, 2048, 4096, getEffectiveContextLength(&cfg)), seq);
     const new_needed = prefillNeededAtChunk(&cfg, seq, 2048, 8, 4096, .{});
     const old_needed = new_needed +| (reserved * 3_072 * 5 / 4);
@@ -5080,6 +5134,7 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
 /// The cache reserve the context sizer bills. Gated: the ask-independent constant. Ungated:
 /// the raw `--prefix-cache-mem`. Both load-time wrappers must pass the same value.
 fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
+    if (prefix_cache_capacity == 0) return 0;
     return if (config.longCtxGated()) CTX_SIZING_CACHE_RESERVE else legacyPrefixCacheAsk();
 }
 
@@ -5128,6 +5183,13 @@ fn ctxSizingCacheReserve(config: *const model_mod.ModelConfig) u64 {
 /// Both the auto-context sizer and the prefill admission guard bill through
 /// here. The sizer used to bill fp16 unconditionally, so a `--kv-quant 4`
 /// server reported — and served — under a third of the context it can hold.
+/// KV every live slot holds whatever its length: the QSA key ring and the sliding rings
+/// (`ModelConfig.slidingRing`), whose buffers hold keep + one prefill chunk of rows.
+pub fn slotFixedKvBytes(config: *const model_mod.ModelConfig, kv_bits: u64, chunk: u64) u64 {
+    const ring_rows: u64 = @as(u64, config.slidingKeepRows()) +| chunk;
+    return config.qsaRingBytes() +| kvBytesPerTokenAtBits(config.slidingRowBytes(), kv_bits) *| ring_rows;
+}
+
 pub fn kvBytesPerTokenAtBits(dense: u64, kv_bits: u64) u64 {
     if (kv_bits >= 16) return dense;
     return dense * (2 * kv_bits + 1) / 32;
@@ -5236,7 +5298,8 @@ pub const PrefillRequestTerms = struct {
     /// Zero when nothing grows and when the restore was shared (the whole copy is billed
     /// uncredited instead).
     grow_coexist_bytes: u64 = 0,
-    qsa_ring_bytes: u64 = 0,
+    /// KV the slot holds whatever its length (`slotFixedKvBytes`).
+    slot_fixed_kv_bytes: u64 = 0,
     mtp_head_kv_bytes: u64 = 0,
     /// Forward width from which the dequant+GEMM route fires (`prefillDqGemmMinRows`).
     dq_min_rows: u64 = transformer_mod.PREFILL_DQ_GEMM_MIN_M,
@@ -5268,7 +5331,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     // already dominates.
     const dq_weights: u64 = if (fwd >= req.dq_min_rows) dequant_weights else 0;
     const gross: u64 = kv_bytes + req.reserved_kv_bytes + req.state_bytes + req.checkpoint_bytes +
-        req.grow_coexist_bytes + req.qsa_ring_bytes + req.mtp_head_kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
+        req.grow_coexist_bytes + req.slot_fixed_kv_bytes + req.mtp_head_kv_bytes + scores + dequant + envelope + dq_weights + PREFILL_RUNTIME_FLOOR_BYTES;
     // The one place a warm turn's resident rows leave the bill, inside the 5/4.
     return (gross -| req.shared_resident_bytes) * 5 / 4;
 }
@@ -5323,6 +5386,13 @@ pub fn dsv4PrefillMemoryNeeded(seq: u64, layers: u64, latent: u64, hidden: u64, 
 ///
 /// Attention-only archs return 0 and keep exactly the bill they had.
 fn prefillStreamBytesPerToken(config: *const model_mod.ModelConfig) u64 {
+    return prefillStreamBytesPerTokenOn(config, transformer_mod.verifyQmmNaxAvailable());
+}
+
+fn prefillStreamBytesPerTokenOn(config: *const model_mod.ModelConfig, nax: bool) u64 {
+    // GLM-5 on NAX: the sorted expert gather reads tokens through its row map (no top_k
+    // replica) and the per-core KDA recurrence holds no per-layer q/k/v stream.
+    if (nax and config.isGlm5()) return 0;
     var per_tok: u64 = 0;
     const linear_layers: u64 = @as(u64, config.num_hidden_layers) -| config.attnCacheLayerCount();
     if (config.linear_num_value_heads > 0 and linear_layers > 0) {
@@ -5471,6 +5541,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         return .{
             .shared_resident_bytes = warm.creditedRows(seq) *| kv_per_tok,
             .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
+            .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk),
             .dq_min_rows = dq_min_rows,
         };
     }
@@ -5492,7 +5563,7 @@ pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_t
         .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
         .shared_resident_bytes = credited *| kv_per_tok,
         .grow_coexist_bytes = growCoexistBytes(config, warm, seq, kv_per_tok),
-        .qsa_ring_bytes = config.qsaRingBytes() +| head_qsa_ring,
+        .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk) +| head_qsa_ring,
         .mtp_head_kv_bytes = reserved *| head_per_tok,
         .dq_min_rows = dq_min_rows,
     };
@@ -6276,6 +6347,8 @@ const ReadyCaps = struct {
     /// Audio engine's backend is the ACE-Step music generator (advertises
     /// "music" ADDITIVELY beside "audio", the ready-model "3d" precedent).
     has_music_backend: bool = false,
+    /// Stable Audio 3 text-to-audio: "sound" beside "audio", the same rule.
+    has_sound_backend: bool = false,
     has_video_engine: bool = false,
     has_mesh_engine: bool = false,
     has_decision_engine: bool = false,
@@ -6320,6 +6393,7 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_image_engine) try append_cap(allocator, &caps, &n_caps, "image");
     if (c.has_audio_engine and !c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
     if (c.has_music_backend) try append_cap(allocator, &caps, &n_caps, "music");
+    if (c.has_sound_backend) try append_cap(allocator, &caps, &n_caps, "sound");
     if (c.has_video_engine) try append_cap(allocator, &caps, &n_caps, "video");
     if (c.has_mesh_engine) try append_cap(allocator, &caps, &n_caps, "3d");
     if (c.has_decision_engine) try append_cap(allocator, &caps, &n_caps, "decisions");
@@ -6443,7 +6517,7 @@ fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
     };
     if (modality) |m| return switch (m) {
         .image => "This is an image generation model; it cannot serve chat/text requests. Use POST /v1/images/generations instead.",
-        .audio => "This is an audio generation model; it cannot serve chat/text requests. Use POST /v1/audio/speech (TTS) or /v1/audio/music-generations (music) instead.",
+        .audio => "This is an audio generation model; it cannot serve chat/text requests. Use POST /v1/audio/speech (TTS), /v1/audio/music-generations (music) or /v1/audio/sound-generations (text-to-audio) instead.",
         .video => "This is a video generation model; it cannot serve chat/text requests. Use POST /v1/video/generations instead.",
         .mesh => "This is a 3D generation model; it cannot serve chat/text requests. Use POST /v1/3d/generations instead.",
         .decision => "This is a typed-decision model; it cannot serve chat/text requests. Use POST /v1/decisions instead.",
@@ -6536,6 +6610,7 @@ fn renderModelEntry(
                 .music, .music3 => true,
                 else => false,
             } else false,
+            .has_sound_backend = if (entry.audio_engine) |ae| ae.backend == .sound else false,
             .has_video_engine = entry.video_engine != null,
             .has_mesh_engine = entry.mesh_engine != null,
             .has_decision_engine = entry.decision_engine != null,
@@ -6681,6 +6756,8 @@ fn renderModelEntry(
             // too (matches the ready-path readyCapsJson additive rule).
             if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint).servesMusic())
                 break :blk try allocator.dupe(u8, ",\"capabilities\":[\"audio\",\"music\"]");
+            if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint) == .sound)
+                break :blk try allocator.dupe(u8, ",\"capabilities\":[\"audio\",\"sound\"]");
             break :blk try std.fmt.allocPrint(allocator, ",\"capabilities\":[\"{s}\"]", .{m.capability()});
         }
         if (is_encoder_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"embeddings\"]");
@@ -6859,6 +6936,7 @@ fn sendModelsResponse(stream: *Conn, body: []const u8) !void {
         &l.token_hex,
     }) catch return error.Overflow;
     try stream.writeAll(hdr);
+    stream.length_framed = true;
     if (body.len > 0) try stream.writeAll(body);
 }
 
@@ -7060,6 +7138,7 @@ fn genJobRun(ctx: *anyopaque) void {
         .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .speech => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .music => if (job.lm.audio_engine) |e| media_mod.handleMusic(job.allocator, job.conn, job.body, e) else error.WrongModality,
+        .sound => if (job.lm.audio_engine) |e| media_mod.handleSound(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
         .mesh => if (job.lm.mesh_engine) |e| media_mod.handleMesh(job.allocator, job.conn, job.body, e) else error.WrongModality,
         .decisions => {
@@ -7384,7 +7463,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",
         .pld = .{ .enable = server_config.default_enable_pld, .draft_len = server_config.default_pld_draft_len, .key_len = server_config.default_pld_key_len },
         .max_concurrent = max_concurrent,
-        .prefix_cache_mem_bytes = prefix_cache_mem_bytes,
+        .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
         // Diffusion prefill returns before the interleave hook: nothing to share.
         .prefill_decode_share = if (config.isDiffusion()) 0 else scheduler_mod.prefillDecodeShare(),
@@ -8580,26 +8659,20 @@ fn handleChatCompletions(
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
-    const repeat_penalty: f32 = blk: {
-        const rp = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
-        if (rp > 0.0) break :blk rp;
-        // Also check frequency_penalty (OpenAI format: 0-2 range, mapped to 1.0 + fp)
-        const fp = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
-        break :blk if (fp > 0.0) 1.0 + fp else 1.0;
-    };
+    const repeat_penalty = requestRepeatPenalty(root);
 
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
-    // Parse logprobs: "logprobs": true, "top_logprobs": N (0-20)
+    // Parse logprobs: "logprobs": true, "top_logprobs": N (0..MAX_TOP_LOGPROBS)
     const logprobs_n: u32 = blk: {
         const lp = root.get("logprobs") orelse break :blk 0;
         if (lp != .bool or !lp.bool) break :blk 0;
         // logprobs=true without top_logprobs defaults to 0 (just the chosen token's logprob)
         const tlp = root.get("top_logprobs") orelse break :blk 1;
         break :blk switch (tlp) {
-            .integer => |i| @intCast(@min(@max(i, 0), 20)),
+            .integer => |i| @intCast(@min(@max(i, 0), generate_mod.MAX_TOP_LOGPROBS)),
             else => 1,
         };
     };
@@ -9146,7 +9219,7 @@ fn handleCompletions(
     // silently ignored field, which reads to a client as "this model has no
     // opinion" rather than "this server never asked".
     const logprobs_n: u32 = if (root.get("logprobs")) |v| switch (v) {
-        .integer => |i| @intCast(@min(@max(i, 0), 20)),
+        .integer => |i| @intCast(@min(@max(i, 0), generate_mod.MAX_TOP_LOGPROBS)),
         else => 0,
     } else 0;
 
@@ -9176,23 +9249,8 @@ fn handleCompletions(
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
 
-    const repeat_penalty: f32 = if (root.get("repeat_penalty")) |v| switch (v) {
-        .float => |f| @floatCast(f),
-        .integer => |i| @floatFromInt(i),
-        else => blk: {
-            break :blk if (root.get("frequency_penalty")) |fp| switch (fp) {
-                .float => |f| 1.0 + @as(f32, @floatCast(f)),
-                .integer => |i| 1.0 + @as(f32, @floatFromInt(i)),
-                else => 1.0,
-            } else 1.0;
-        },
-    } else 1.0;
-
-    const presence_penalty_c: f32 = if (root.get("presence_penalty")) |v| switch (v) {
-        .float => |f| @floatCast(@min(@max(f, 0.0), 2.0)),
-        .integer => |i| @floatFromInt(@min(@max(i, 0), 2)),
-        else => 0.0,
-    } else 0.0;
+    const repeat_penalty = requestRepeatPenalty(root);
+    const presence_penalty_c = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
 
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
@@ -9349,7 +9407,7 @@ fn handleNonStreamingCompletion(
     // Spec dispatch: `requestSpecModes` (DFlash > MTP > drafter > PLD).
     // logprobs needs every step's own distribution, so it disables speculation
     // here exactly as it does on chat.
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n, requestHasCompany());
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), logprobs_n, requestHasCompany());
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
     const use_pld = spec.use_pld;
@@ -9440,7 +9498,7 @@ fn handleStreamingCompletion(
     const created_ts = nowSecs(stream.io);
     var timer = Stopwatch.init(stream.io);
 
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n, requestHasCompany());
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), logprobs_n, requestHasCompany());
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -9474,6 +9532,7 @@ fn handleStreamingCompletion(
         .kv_attn_fused = resolveKvAttnFused(lm.config.?, null, prompt_ids.len, null),
         .logprobs_n = logprobs_n,
         .cache_key = cache_key,
+        .client = stream.client,
     });
     var ts = StreamingTokenStream.initFromSlot(slot_handle.?, stream_mode, eos_token_ids);
 
@@ -9494,6 +9553,8 @@ fn handleStreamingCompletion(
     try sendSseHeaders(stream, "completions", SSE_ALLOW_HEADERS_DEFAULT);
 
     var text_buf = std.ArrayList(u8).empty;
+    var stop_stream: StopStream = .{};
+    defer stop_stream.deinit(allocator);
     defer text_buf.deinit(allocator);
     var stopped = false;
     var utf8_carry_c: [3]u8 = undefined;
@@ -9502,10 +9563,10 @@ fn handleStreamingCompletion(
 
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
-        if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        if (stopped or stop_stream.flushed) break;
+        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_stream.holding()) null else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -9531,12 +9592,11 @@ fn handleStreamingCompletion(
             client_gone = true;
             break;
         }
-        try lps.note(token_id);
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded_c = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-
         // Handle incomplete UTF-8 sequences across token boundaries
-        var token_text = blk: {
+        var token_text = if (next_id) |token_id| blk: {
+            try lps.note(token_id);
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded_c = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
             const with_carry = if (utf8_carry_c_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_c_len + raw_decoded_c.len);
                 @memcpy(combined[0..utf8_carry_c_len], utf8_carry_c[0..utf8_carry_c_len]);
@@ -9561,18 +9621,17 @@ fn handleStreamingCompletion(
                 break :blk trimmed;
             }
             break :blk with_carry;
-        };
+        } else try stop_stream.takeHeld(allocator);
         defer allocator.free(token_text);
 
         if (stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
-            if (stopSequenceCut(text_buf.items, token_text.len, stop_sequences)) |cut| {
-                stopped = true;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) break;
-                token_text = try allocator.realloc(token_text, cut.token_keep);
-            }
+            const fed = try stop_stream.feed(allocator, &text_buf, token_text, stop_sequences, null);
+            allocator.free(token_text);
+            token_text = fed.send;
+            if (fed.stop != null) stopped = true;
+            if (token_text.len == 0) continue;
         }
+        lps.sent(token_text.len, utf8_carry_c_len);
 
         const escaped = try jsonEscape(allocator, token_text);
         defer allocator.free(escaped);
@@ -9647,6 +9706,112 @@ fn stopSequenceCut(text: []const u8, token_len: usize, stops: []const []const u8
         best = .{ .index = idx, .token_keep = if (idx > emitted) idx - emitted else 0, .matched = stop_seq };
     }
     return best;
+}
+
+/// Bytes at the end of `text`, at most `fresh` of them, that could still begin a stop string.
+fn stopPrefixTail(text: []const u8, fresh: usize, stops: []const []const u8) usize {
+    var hold: usize = 0;
+    for (stops) |stop| {
+        var n = @min(stop.len -| 1, fresh);
+        while (n > hold) : (n -= 1) {
+            if (std.mem.endsWith(u8, text, stop[0..n])) {
+                hold = n;
+                break;
+            }
+        }
+    }
+    return hold;
+}
+
+/// Client stop strings on a stream: a tail that could still begin one is held until the next
+/// token decides it, so the stream sends exactly the bytes the finished reply keeps.
+const StopStream = struct {
+    held: std.ArrayList(u8) = .empty,
+    /// The held tail went out as the stream's last token.
+    flushed: bool = false,
+
+    const Fed = struct { send: []u8, stop: ?[]const u8 };
+
+    fn deinit(self: *StopStream, a: std.mem.Allocator) void {
+        self.held.deinit(a);
+    }
+
+    fn holding(self: *const StopStream) bool {
+        return self.held.items.len > 0 and !self.flushed;
+    }
+
+    /// The held tail as one last token, once generation ended without a match.
+    fn takeHeld(self: *StopStream, a: std.mem.Allocator) ![]u8 {
+        self.flushed = true;
+        const out = try a.dupe(u8, self.held.items);
+        self.held.clearRetainingCapacity();
+        return out;
+    }
+
+    /// Appends `token` to `buf` (the text sent so far) and returns what may go out now: up to
+    /// a stop match (judged answer-only like `answerStopCut` when `answer_opened` is set), else
+    /// everything but a tail that could still begin a stop string. The caller owns `send`.
+    fn feed(self: *StopStream, a: std.mem.Allocator, buf: *std.ArrayList(u8), token: []const u8, stops: []const []const u8, answer_opened: ?bool) !Fed {
+        const sent = buf.items.len;
+        try buf.appendSlice(a, self.held.items);
+        self.held.clearRetainingCapacity();
+        try buf.appendSlice(a, token);
+        const fresh = buf.items.len - sent;
+        const cut = if (answer_opened) |o| answerStopCut(buf.items, fresh, stops, o) else stopSequenceCut(buf.items, fresh, stops);
+        var end = buf.items.len;
+        if (cut) |c| {
+            end = @max(c.index, sent);
+        } else if (!self.flushed) {
+            end -= stopPrefixTail(buf.items, fresh, stops);
+            try self.held.appendSlice(a, buf.items[end..]);
+        }
+        const send = try a.dupe(u8, buf.items[sent..end]);
+        buf.shrinkRetainingCapacity(end);
+        return .{ .send = send, .stop = if (cut) |c| c.matched else null };
+    }
+};
+
+/// The text a stream of `text` split at `i` and `j` sends through a `StopStream`, and whether it stopped.
+fn stopStreamReplay(a: std.mem.Allocator, text: []const u8, i: usize, j: usize, stops: []const []const u8) !struct { sent: []u8, stopped: bool } {
+    var ss: StopStream = .{};
+    defer ss.deinit(a);
+    var buf: std.ArrayList(u8) = .empty;
+    defer buf.deinit(a);
+    var out: std.ArrayList(u8) = .empty;
+    errdefer out.deinit(a);
+    for ([_][]const u8{ text[0..i], text[i..j], text[j..] }) |token| {
+        const fed = try ss.feed(a, &buf, token, stops, null);
+        defer a.free(fed.send);
+        try out.appendSlice(a, fed.send);
+        if (fed.stop != null) return .{ .sent = try out.toOwnedSlice(a), .stopped = true };
+    }
+    if (ss.holding()) {
+        const tail = try ss.takeHeld(a);
+        defer a.free(tail);
+        const fed = try ss.feed(a, &buf, tail, stops, null);
+        defer a.free(fed.send);
+        try out.appendSlice(a, fed.send);
+    }
+    return .{ .sent = try out.toOwnedSlice(a), .stopped = false };
+}
+
+test "StopStream: at every token split, a stream sends what the finished reply keeps" {
+    const a = std.testing.allocator;
+    const Case = struct { text: []const u8, stop: []const u8, want: []const u8, stopped: bool };
+    const cases = [_]Case{
+        .{ .text = "9, 10, 11, 12, 13", .stop = ", 12", .want = "9, 10, 11", .stopped = true },
+        .{ .text = "28, 29, 30", .stop = ", 30x", .want = "28, 29, 30", .stopped = false },
+        .{ .text = "a, b, a", .stop = "a, c", .want = "a, b, a", .stopped = false },
+    };
+    for (cases) |c| {
+        const stops = [_][]const u8{c.stop};
+        for (0..c.text.len + 1) |i| for (i..c.text.len + 1) |j| {
+            const r = try stopStreamReplay(a, c.text, i, j, &stops);
+            defer a.free(r.sent);
+            try std.testing.expectEqualStrings(c.want, r.sent);
+            try std.testing.expectEqual(c.stopped, r.stopped);
+        };
+    }
 }
 
 /// `stopSequenceCut` for a chat surface: a stop string ends the answer, never the reasoning.
@@ -9738,6 +9903,7 @@ fn nonStreamingViaScheduler(
         .vision_embeddings = vision_embeddings,
         .media = media,
         .cache_key = cache_key,
+        .client = if (conn) |c| c.client else .other,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -9769,6 +9935,14 @@ fn nonStreamingViaScheduler(
             .token => |t| try output_ids.append(allocator, t),
             .done => break :wait,
             .err => return slotFailure(slot),
+        }
+        if (conn) |c| {
+            if (c.peerClosed()) {
+                log.info("  [cancel] client disconnected while decoding (non-stream) — cancelling slot\n", .{});
+                slot.cancel();
+                client_gone = true;
+                break :wait;
+            }
         }
     }
 
@@ -9968,7 +10142,7 @@ fn handleNonStreamingGeneration(
     //   2. PLD next if requested AND no logprobs AND no grammar constraint
     //      (constrained decode requires per-token state advancement).
     //   3. Otherwise the regular pipeline.
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n, requestHasCompany());
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), logprobs_n, requestHasCompany());
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
     const use_pld = spec.use_pld;
@@ -10535,7 +10709,8 @@ fn requestHasCompany() bool {
 /// (`--drafter` or the pack's own `drafter/`) while the MTP head ships with
 /// the checkpoint, so the sidecar wins; `--no-drafter` / `enable_drafter:
 /// false` hand the round back to MTP. The gemma cross-attention drafter
-/// stays below MTP. logprobs and a grammar constraint disable every mode.
+/// stays below MTP. logprobs, a grammar constraint or a penalty (`shaped_logits`)
+/// disable every mode: verify compares raw logits.
 /// `has_company` (another request live at admission) hands a DFlash round to
 /// a loaded MTP head: only MTP slots batch.
 /// `enable_drafter` arrives with the hybrid veto (`archBlocksAssistantSidecar`)
@@ -10547,11 +10722,11 @@ pub fn requestSpecModes(
     gemma_drafter_loaded: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
-    has_constraint: bool,
+    shaped_logits: bool,
     logprobs_n: u32,
     has_company: bool,
 ) RequestSpec {
-    const spec_ok = logprobs_n == 0 and !has_constraint;
+    const spec_ok = logprobs_n == 0 and !shaped_logits;
     const sidecar = spec_ok and enable_drafter and (gemma_drafter_loaded or dflash_loaded);
     // DFlash slots decode serial; MTP slots draft and verify as one group.
     const dflash_yields = has_company and enable_mtp and mtp_loaded;
@@ -10572,11 +10747,11 @@ fn pickStreamMode(
     gemma_drafter_loaded: bool,
     dflash_loaded: bool,
     mtp_loaded: bool,
-    has_constraint: bool,
+    shaped_logits: bool,
     logprobs_n: u32,
     has_company: bool,
 ) StreamMode {
-    const r = requestSpecModes(enable_pld, enable_drafter, enable_mtp, gemma_drafter_loaded, dflash_loaded, mtp_loaded, has_constraint, logprobs_n, has_company);
+    const r = requestSpecModes(enable_pld, enable_drafter, enable_mtp, gemma_drafter_loaded, dflash_loaded, mtp_loaded, shaped_logits, logprobs_n, has_company);
     if (r.use_mtp) return .mtp;
     if (r.use_drafter) return .drafter;
     if (r.use_pld) return .pld;
@@ -10681,7 +10856,7 @@ fn handleStreamingGeneration(
     // which feeds `next` (regular), `nextPld` (1..1+draft_len tokens/step),
     // or `nextDrafter` (1..block_size tokens/step) through the same
     // one-token-at-a-time interface.
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, logprobs_n, requestHasCompany());
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), logprobs_n, requestHasCompany());
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -10724,6 +10899,7 @@ fn handleStreamingGeneration(
         .vision_embeddings = slot_ve_s,
         .media = media,
         .cache_key = cache_key,
+        .client = stream.client,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -10752,6 +10928,8 @@ fn handleStreamingGeneration(
 
     // Buffer for stop sequence and tool call detection
     var text_buf = std.ArrayList(u8).empty;
+    var stop_stream: StopStream = .{};
+    defer stop_stream.deinit(allocator);
     defer text_buf.deinit(allocator);
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
@@ -10825,10 +11003,10 @@ fn handleStreamingGeneration(
     // regardless of whether the underlying decode is regular, PLD, or drafter.
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
-        if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        if (stopped or stop_stream.flushed) break;
+        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_stream.holding()) null else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -10854,14 +11032,13 @@ fn handleStreamingGeneration(
             client_gone = true;
             break;
         }
-        try lps.note(token_id);
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-        if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
         // Prepend any carried-over bytes from a previous incomplete UTF-8 sequence,
         // then strip any new trailing incomplete bytes into the carry buffer.
-        var token_text = blk: {
+        var token_text = if (next_id) |token_id| blk: {
+            try lps.note(token_id);
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
+            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
             // Step 1: prepend carry-over from previous token
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
@@ -10893,26 +11070,22 @@ fn handleStreamingGeneration(
             }
 
             break :blk with_carry;
-        };
+        } else try stop_stream.takeHeld(allocator);
 
         // Accumulate for stop sequence and tool call detection
 
-        if (gated_stream or stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
-        }
-
         // The stop cut is an INDEX, not a token boundary: bytes before the match still go out.
         if (stop_sequences.len > 0) {
-            if (answerStopCut(text_buf.items, token_text.len, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed)) |cut| {
-                stopped = true;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) {
-                    allocator.free(token_text);
-                    break;
-                }
-                token_text = try allocator.realloc(token_text, cut.token_keep);
+            const fed = try stop_stream.feed(allocator, &text_buf, token_text, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed);
+            allocator.free(token_text);
+            token_text = fed.send;
+            if (fed.stop != null) stopped = true;
+            if (token_text.len == 0) {
+                allocator.free(token_text);
+                continue;
             }
-        }
+        } else if (gated_stream) try text_buf.appendSlice(allocator, token_text);
+        lps.sent(token_text.len, utf8_carry_len);
 
         if (delivery) |*d| {
             defer allocator.free(token_text);
@@ -11054,7 +11227,7 @@ fn handleStreamingGeneration(
             // Many templates (e.g. Qwen 3.5/3.6, some Gemma 4 variants) pre-inject
             // the opener into the prompt so the model's first tokens are already
             // INSIDE the thinking block — no opener appears in the streamed text.
-            if (!skipped_think_open and think_buf.items.len >= 7) {
+            if (!skipped_think_open and (think_buf.items.len >= 7 or chat_mod.cannotOpenThink(think_buf.items))) {
                 if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
                     // Remove the opener (<think> or the Hy3-suffixed form) and
                     // any leading newline.
@@ -11575,6 +11748,12 @@ const StreamLogprobs = struct {
     lens: std.ArrayList(usize) = .empty,
     /// Total decoded bytes noted so far — the generation's length.
     bytes_noted: usize = 0,
+    /// Decoded bytes the stream has SENT: a stop-string hold keeps a token's
+    /// bytes back and a stop cut drops them, and the entry goes with the bytes
+    /// (`sentTokens`). A trailing incomplete UTF-8 sequence (`carry`) is the
+    /// stream's own buffering, not a hold, so its token still counts.
+    bytes_sent: usize = 0,
+    carry: usize = 0,
     entries: std.ArrayList(generate_mod.LogprobResult) = .empty,
     /// The last rendered JSON, owned here and freed on the next drain — the
     /// caller passes it straight into a chunk and never sees the lifetime.
@@ -11601,6 +11780,11 @@ const StreamLogprobs = struct {
         defer if (text.len > 0) self.allocator.free(text);
         try self.lens.append(self.allocator, text.len);
         self.bytes_noted += text.len;
+    }
+
+    fn sent(self: *StreamLogprobs, n: usize, carry: usize) void {
+        self.bytes_sent += n;
+        self.carry = carry;
     }
 
     /// Drop the entries for tokens whose bytes never reach the client.
@@ -11656,8 +11840,9 @@ const StreamLogprobs = struct {
         const slot = self.slot orelse return null;
         self.cursor = try slot.copyLogprobsFrom(self.allocator, self.cursor, &self.entries);
         // An id with no entry yet (or the reverse) is a partially published
-        // token — hold it for the next chunk rather than shipping a half pair.
-        const avail = @min(self.ids.items.len, self.entries.items.len);
+        // token — hold it for the next chunk rather than shipping a half pair;
+        // so is one whose bytes a stop-string hold has not released.
+        const avail = @min(@min(self.ids.items.len, self.entries.items.len), sentTokens(self.lens.items, self.bytes_sent + self.carry));
         if (avail <= self.emitted) return null;
         const ids = self.ids.items[self.emitted..avail];
         const lps = self.entries.items[self.emitted..avail];
@@ -11670,6 +11855,26 @@ const StreamLogprobs = struct {
         return json;
     }
 };
+
+/// How many leading tokens of `lens` are wholly inside the first `bytes_sent` bytes.
+fn sentTokens(lens: []const usize, bytes_sent: usize) usize {
+    var acc: usize = 0;
+    for (lens, 0..) |len, i| {
+        if (acc + len > bytes_sent) return i;
+        acc += len;
+    }
+    return lens.len;
+}
+
+test "stream logprobs: a token whose bytes a stop hold keeps back waits for its chunk" {
+    const lens = [_]usize{ 2, 3, 0, 4 };
+    try std.testing.expectEqual(@as(usize, 0), sentTokens(&lens, 1));
+    try std.testing.expectEqual(@as(usize, 1), sentTokens(&lens, 2));
+    try std.testing.expectEqual(@as(usize, 1), sentTokens(&lens, 4));
+    try std.testing.expectEqual(@as(usize, 3), sentTokens(&lens, 5));
+    try std.testing.expectEqual(@as(usize, 4), sentTokens(&lens, 9));
+    try std.testing.expectEqual(@as(usize, 4), sentTokens(&lens, 50));
+}
 
 /// How a stream ended: the wire `finish_reason` plus, when the
 /// degenerate-tail guard cut it, the sibling cause (`finishDetailsField`).
@@ -11836,6 +12041,7 @@ fn sendResponseFramed(stream: *Conn, status: []const u8, content_type: []const u
         body.len,
     }) catch return error.Overflow;
     try stream.writeAll(hdr);
+    stream.length_framed = true;
     if (body.len > 0) try stream.writeAll(body);
 }
 
@@ -12391,6 +12597,7 @@ fn sendUnauthorized(stream: *Conn) !void {
     var hdr_buf: [512]u8 = undefined;
     const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 401 Unauthorized\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nWWW-Authenticate: Basic realm=\"mlx-serve\"\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\nAccess-Control-Allow-Headers: Content-Type, Authorization, x-api-key\r\n\r\n", .{body.len}) catch return error.Overflow;
     try stream.writeAll(hdr);
+    stream.length_framed = true;
     try stream.writeAll(body);
 }
 
@@ -12801,6 +13008,20 @@ test "the index page documents every endpoint the server serves (drift guard)" {
     }
 }
 
+test "the mlx-serve agent skill documents every /v1 endpoint it does not deliberately leave out" {
+    // The skill is what an agent reads before writing client code; an endpoint
+    // missing there does not exist for it.
+    const left_out = [_][]const u8{ "/v1/completions", "/v1/models/rescan", "/v1/providers", "/v1/providers/reload", "/v1/responses/compact" };
+    const skills = @import("agent_skills");
+    outer: for (ROUTE_PATHS) |p| {
+        if (!std.mem.startsWith(u8, p, "/v1/")) continue;
+        for (left_out) |l| if (std.mem.eql(u8, p, l)) continue :outer;
+        for (skills.files) |f| if (std.mem.indexOf(u8, f.bytes, p) != null) continue :outer;
+        std.debug.print("endpoint missing from skills/mlx-serve: {s}\n", .{p});
+        return error.EndpointNotInSkill;
+    }
+}
+
 test "parseModelFromRequest reads the model out of a multipart form, not just JSON" {
     // `/v1/images/edits` is the ONE endpoint whose body is multipart, and model
     // resolution runs BEFORE the route translates that form to JSON. A JSON-only
@@ -13097,6 +13318,12 @@ fn formatChatUsage(
     return try std.fmt.allocPrint(allocator,
         \\{{"prompt_tokens":{d},"completion_tokens":{d},"total_tokens":{d},"prompt_tokens_details":{{"cached_tokens":{d}}}{s}}}
     , .{ prompt_tokens, completion_tokens, prompt_tokens + completion_tokens, cached_tokens, extra_details });
+}
+
+fn formatAnthropicUsage(allocator: std.mem.Allocator, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
+    return try std.fmt.allocPrint(allocator,
+        \\{{"input_tokens":{d},"output_tokens":{d},"cache_creation_input_tokens":0,"cache_read_input_tokens":{d}}}
+    , .{ prompt_tokens -| cached_tokens, completion_tokens, @min(cached_tokens, prompt_tokens) });
 }
 
 fn formatTimingsObject(
@@ -13434,6 +13661,15 @@ fn formatLogprobsObject(
 }
 
 /// Parse a float from a JSON value, clamping to [min, max]. Returns default if missing/invalid.
+/// OpenAI's `frequency_penalty` (0-2) is read as `repeat_penalty` 1 + x; an explicit
+/// `repeat_penalty` wins.
+fn requestRepeatPenalty(root: std.json.ObjectMap) f32 {
+    const repeat = parseJsonFloat(root, "repeat_penalty", 0.0, 0.0, 10.0);
+    if (repeat > 0) return repeat;
+    const frequency = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
+    return if (frequency > 0) 1.0 + frequency else 1.0;
+}
+
 fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: f32, max: f32) f32 {
     const raw = if (root.get(key)) |v| switch (v) {
         .float => |f| @as(f32, @floatCast(f)),
@@ -13636,7 +13872,7 @@ fn piecesOf(item: MediaItem) usize {
 }
 
 fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
-    var h = std.hash.Wyhash.init(@intFromEnum(std.meta.activeTag(piece)));
+    var h = std.hash.Wyhash.init(@backingInt(std.meta.activeTag(piece)));
     switch (piece) {
         .image => |im| {
             h.update(std.mem.asBytes(&[_]u32{ im.width, im.height, im.grid_h, im.grid_w }));
@@ -15455,7 +15691,7 @@ fn handleAnthropicNonStreaming(
 
     // Speculative decoding dispatch — same `requestSpecModes` as
     // chat-completions (DFlash > MTP > drafter > PLD).
-    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, 0, requestHasCompany());
+    const spec = requestSpecModes(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
     const use_mtp = spec.use_mtp;
     const use_drafter = spec.use_drafter;
     const use_pld = spec.use_pld;
@@ -15649,17 +15885,17 @@ fn handleAnthropicNonStreaming(
         try allocator.alloc(u8, 0);
     defer allocator.free(timings_field);
 
+    const usage = try formatAnthropicUsage(allocator, prompt_token_count, result.completion_tokens, result.cached_tokens);
+    defer allocator.free(usage);
     const response = try std.fmt.allocPrint(allocator,
-        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{{"input_tokens":{d},"output_tokens":{d},"cache_read_input_tokens":{d}}}{s}}}
+        \\{{"id":"msg_{d}","type":"message","role":"assistant","content":{s},"model":"{s}","stop_reason":"{s}","stop_sequence":{s},"usage":{s}{s}}}
     , .{
         nowMs(stream.io),
         content.items,
         model_name,
         stop_reason,
         stop_seq_json,
-        prompt_token_count,
-        result.completion_tokens,
-        result.cached_tokens,
+        usage,
         timings_field,
     });
     defer allocator.free(response);
@@ -15716,7 +15952,7 @@ fn handleAnthropicStreaming(
     // stream adapter below feeds the per-token Anthropic state machine the
     // same way for all three modes.
     const config = lm.config.?;
-    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.constraint != null, 0, requestHasCompany());
+    const stream_mode = pickStreamMode(enable_pld, enable_drafter, enable_mtp, lm.drafter != null, lm.dflash != null, mtpCapable(lm), sampling.shapesLogits(), 0, requestHasCompany());
     if (stream_mode == .pld) log.info("  pld=enabled (streaming, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
     if (stream_mode == .drafter) log.info("  drafter=enabled (streaming, block_size={d})\n", .{lm.drafter_block_size});
     if (stream_mode == .mtp) log.info("  mtp=enabled (streaming, depth={d})\n", .{lm.mtp_depth});
@@ -15755,6 +15991,7 @@ fn handleAnthropicStreaming(
         .vision_embeddings = slot_ve_anth,
         .media = media,
         .cache_key = cache_key,
+        .client = stream.client,
         .mrope_pos = mrope.pos,
         .mrope_total = mrope.total,
         .mrope_delta = mrope.delta,
@@ -15768,9 +16005,7 @@ fn handleAnthropicStreaming(
 
     // message_start
     {
-        const data = try std.fmt.allocPrint(allocator,
-            \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
-        , .{ nowMs(stream.io), model_name, prompt_token_count });
+        const data = try formatAnthropicMessageStart(allocator, nowMs(stream.io), model_name, prompt_token_count);
         defer allocator.free(data);
         try sendAnthropicEvent(stream, "message_start", data);
     }
@@ -15827,6 +16062,8 @@ fn handleAnthropicStreaming(
     var budget_exhausted = false;
 
     var text_buf = std.ArrayList(u8).empty;
+    var stop_stream: StopStream = .{};
+    defer stop_stream.deinit(allocator);
     defer text_buf.deinit(allocator);
     // Memoized marker scan for the think gate. Owned BESIDE text_buf and reset
     // with it — the gate is otherwise O(buffer) per token for as long as a
@@ -15845,10 +16082,10 @@ fn handleAnthropicStreaming(
 
     while (true) {
         // A stop cut resolved on the previous token ends the turn here.
-        if (stopped) break;
-        const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+        if (stopped or stop_stream.flushed) break;
+        const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
             .token => |t| t,
-            .done => break,
+            .done => if (stop_stream.holding()) null else break,
             .idle => {
                 // No tokens yet (long prefill). Probe the peer: an abandoned
                 // request must cancel instead of grinding a ghost prefill
@@ -15874,12 +16111,11 @@ fn handleAnthropicStreaming(
             client_gone = true;
             break;
         }
-        const strip = tok.tok_type == .sentencepiece_bpe;
-        const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
-        if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
         // UTF-8 carry handling
-        var token_text = blk: {
+        var token_text = if (next_id) |token_id| blk: {
+            const strip = tok.tok_type == .sentencepiece_bpe;
+            const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, strip and false);
+            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
             const with_carry = if (utf8_carry_len > 0) cc: {
                 const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                 @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -15903,26 +16139,23 @@ fn handleAnthropicStreaming(
                 break :blk trimmed;
             }
             break :blk with_carry;
-        };
-
-        if (gated_stream or stop_sequences.len > 0) {
-            try text_buf.appendSlice(allocator, token_text);
-        }
+        } else try stop_stream.takeHeld(allocator);
 
         // Stop sequences; remember WHICH one matched (reported as stop_reason
         // "stop_sequence" + the echoed `stop_sequence` field in message_delta).
         if (stop_sequences.len > 0) {
-            if (answerStopCut(text_buf.items, token_text.len, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed)) |cut| {
+            const fed = try stop_stream.feed(allocator, &text_buf, token_text, stop_sequences, prompt_opened_think and !constrained_proto and !think_closed);
+            allocator.free(token_text);
+            token_text = fed.send;
+            if (fed.stop) |m| {
                 stopped = true;
-                matched_stop_seq = cut.matched;
-                text_buf.shrinkRetainingCapacity(cut.index);
-                if (cut.token_keep == 0) {
-                    allocator.free(token_text);
-                    break;
-                }
-                token_text = try allocator.realloc(token_text, cut.token_keep);
+                matched_stop_seq = m;
             }
-        }
+            if (token_text.len == 0) {
+                allocator.free(token_text);
+                continue;
+            }
+        } else if (gated_stream) try text_buf.appendSlice(allocator, token_text);
 
         if (delivery) |*d| {
             defer allocator.free(token_text);
@@ -16032,7 +16265,7 @@ fn handleAnthropicStreaming(
             try think_buf.appendSlice(allocator, token_text);
             think_tokens += 1;
 
-            if (!skipped_think_open and think_buf.items.len >= 7) {
+            if (!skipped_think_open and (think_buf.items.len >= 7 or chat_mod.cannotOpenThink(think_buf.items))) {
                 if (chat_mod.thinkOpenTagLenAt(think_buf.items)) |olen| {
                     var skip: usize = olen;
                     while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
@@ -16475,14 +16708,10 @@ fn handleAnthropicStreaming(
             try sendAnthropicEvent(stream, "content_block_stop", sd2);
         }
 
-        // message_delta. Scheduler accounts for any prompt-cache hits in `ts.prompt_tokens`.
-        // cache_read_input_tokens rides here (not message_start) because the
-        // prefix-cache hit count is only known after prefill; clients merge
-        // message_delta usage into the final message per Anthropic semantics.
+        // Cache hits are known after prefill. Cumulative usage replaces the
+        // provisional message_start counts with disjoint input buckets.
         {
-            const md = try std.fmt.allocPrint(allocator,
-                \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{{"output_tokens":{d},"cache_read_input_tokens":{d}}}}}
-            , .{ stop_reason, stop_seq_json, ts.completion_tokens, ts.cached_tokens });
+            const md = try formatAnthropicMessageDelta(allocator, stop_reason, stop_seq_json, total_prompt, ts.completion_tokens, ts.cached_tokens);
             defer allocator.free(md);
             try sendAnthropicEvent(stream, "message_delta", md);
         }
@@ -16494,6 +16723,20 @@ fn handleAnthropicStreaming(
     log.info("  <- {d}+{d} tokens streamed [{s}] [{s}]\n", .{
         total_prompt, ts.completion_tokens, perf, stop_reason,
     });
+}
+
+fn formatAnthropicMessageStart(allocator: std.mem.Allocator, id: i64, model_name: []const u8, prompt_tokens: u32) ![]u8 {
+    return try std.fmt.allocPrint(allocator,
+        \\{{"type":"message_start","message":{{"id":"msg_{d}","type":"message","role":"assistant","content":[],"model":"{s}","stop_reason":null,"stop_sequence":null,"usage":{{"input_tokens":{d},"output_tokens":1}}}}}}
+    , .{ id, model_name, prompt_tokens });
+}
+
+fn formatAnthropicMessageDelta(allocator: std.mem.Allocator, stop_reason: []const u8, stop_seq_json: []const u8, prompt_tokens: u32, completion_tokens: u32, cached_tokens: u32) ![]u8 {
+    const usage = try formatAnthropicUsage(allocator, prompt_tokens, completion_tokens, cached_tokens);
+    defer allocator.free(usage);
+    return try std.fmt.allocPrint(allocator,
+        \\{{"type":"message_delta","delta":{{"stop_reason":"{s}","stop_sequence":{s}}},"usage":{s}}}
+    , .{ stop_reason, stop_seq_json, usage });
 }
 
 /// Emit a text_delta event for Anthropic streaming.
@@ -17297,7 +17540,7 @@ fn handleResponsesInner(
     var result: generate_mod.GenerationResult = undefined;
     if (is_stream) {
         // Pick speculative-decoding mode for the streaming Responses path.
-        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.constraint != null, 0, requestHasCompany());
+        const stream_mode = pickStreamMode(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.shapesLogits(), 0, requestHasCompany());
         if (stream_mode == .pld) log.info("  pld=enabled (streaming responses, draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
         if (stream_mode == .drafter) log.info("  drafter=enabled (streaming responses, block_size={d})\n", .{lm.drafter_block_size});
         if (stream_mode == .mtp) log.info("  mtp=enabled (streaming responses, depth={d})\n", .{lm.mtp_depth});
@@ -17334,6 +17577,7 @@ fn handleResponsesInner(
             .vision_embeddings = slot_ve_resp,
             .media = mm.media,
             .cache_key = cache_key,
+            .client = stream.client,
             .mrope_pos = slot_mrope.pos,
             .mrope_total = slot_mrope.total,
             .mrope_delta = slot_mrope.delta,
@@ -17347,6 +17591,8 @@ fn handleResponsesInner(
         defer ts.deinit(allocator);
 
         var raw_buf = std.ArrayList(u8).empty;
+        var stop_stream: StopStream = .{};
+        defer stop_stream.deinit(allocator);
         defer raw_buf.deinit(allocator);
         var token_ids_buf = std.ArrayList(u32).empty;
         defer token_ids_buf.deinit(allocator);
@@ -17376,10 +17622,10 @@ fn handleResponsesInner(
 
         while (true) {
             // A stop cut resolved on the previous token ends the turn here.
-            if (stopped) break;
-            const token_id: u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
+            if (stopped or stop_stream.flushed) break;
+            const next_id: ?u32 = switch (try ts.nextOrIdle(allocator, Conn.STREAM_KEEPALIVE_MS)) {
                 .token => |t| t,
-                .done => break,
+                .done => if (stop_stream.holding()) null else break,
                 .idle => {
                     // No tokens yet (long prefill). Probe the peer: an abandoned
                     // request must cancel instead of grinding a ghost prefill
@@ -17405,12 +17651,11 @@ fn handleResponsesInner(
                 client_gone = true;
                 break;
             }
-            try token_ids_buf.append(allocator, token_id);
-            const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, false);
-            if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
-
             // UTF-8 carry across BPE-token boundaries (matches chat-completion).
-            var token_text = blk: {
+            var token_text = if (next_id) |token_id| blk: {
+                try token_ids_buf.append(allocator, token_id);
+                const raw_decoded = try decodeTokens(allocator, lm, tok, &[_]u32{token_id}, false);
+                if (delivery) |*d| d.noteToken(raw_decoded.len, slot_handle.?.constraintPayloadStart());
                 const with_carry = if (utf8_carry_len > 0) cc: {
                     const combined = try allocator.alloc(u8, utf8_carry_len + raw_decoded.len);
                     @memcpy(combined[0..utf8_carry_len], utf8_carry[0..utf8_carry_len]);
@@ -17434,19 +17679,16 @@ fn handleResponsesInner(
                     break :blk trimmed;
                 }
                 break :blk with_carry;
-            };
+            } else try stop_stream.takeHeld(allocator);
             defer allocator.free(token_text);
 
-            try raw_buf.appendSlice(allocator, token_text);
-
             if (stop_sequences.items.len > 0) {
-                if (answerStopCut(raw_buf.items, token_text.len, stop_sequences.items, opens_think and !constrained_proto)) |cut| {
-                    stopped = true;
-                    raw_buf.shrinkRetainingCapacity(cut.index);
-                    if (cut.token_keep == 0) break;
-                    token_text = try allocator.realloc(token_text, cut.token_keep);
-                }
-            }
+                const fed = try stop_stream.feed(allocator, &raw_buf, token_text, stop_sequences.items, opens_think and !constrained_proto);
+                allocator.free(token_text);
+                token_text = fed.send;
+                if (fed.stop != null) stopped = true;
+                if (token_text.len == 0) continue;
+            } else try raw_buf.appendSlice(allocator, token_text);
 
             // Beat BEFORE the tool early-continue below: a tool-active request
             // emits nothing past its thought until generation ends, and the
@@ -17493,7 +17735,7 @@ fn handleResponsesInner(
                 try think_buf.appendSlice(allocator, token_text);
 
                 // Skip a literal think opener if the template did not pre-inject one.
-                if (!skipped_think_open and think_buf.items.len >= 7) {
+                if (!skipped_think_open and (think_buf.items.len >= 7 or chat_mod.cannotOpenThink(think_buf.items))) {
                     if (std.mem.startsWith(u8, think_buf.items, "<think>")) {
                         var skip: usize = 7;
                         while (skip < think_buf.items.len and think_buf.items[skip] == '\n') skip += 1;
@@ -17661,7 +17903,7 @@ fn handleResponsesInner(
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
-        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.constraint != null, 0, requestHasCompany());
+        const spec = requestSpecModes(enable_pld_resp, enable_drafter_resp, enable_mtp_resp, lm.drafter != null, lm.dflash != null, lm.mtp != null, sampling.shapesLogits(), 0, requestHasCompany());
         const use_mtp = spec.use_mtp;
         const use_drafter = spec.use_drafter;
         const use_pld = spec.use_pld;
@@ -18988,6 +19230,72 @@ test "Conn.peerClosed: alive socket returns false, closed peer returns true" {
     try testing.expect(closed);
 }
 
+/// Runs `Conn.close` after one response, with a peer that stays connected, and checks whether it
+/// held the socket (`close_delimited`) or returned at once.
+fn expectCloseWaitsForPeer(close_delimited: bool) !void {
+    var sv: [2]std.posix.fd_t = undefined;
+    const AF_UNIX: c_uint = 1;
+    const SOCK_STREAM: c_uint = 1;
+    try testing.expect(std.c.socketpair(AF_UNIX, SOCK_STREAM, 0, &sv) == 0);
+
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    const tail: []const u8 = if (close_delimited) "data: [DONE]\n\n" else "{}";
+    if (close_delimited) {
+        try sendSseHeaders(&conn, "test", SSE_ALLOW_HEADERS_DEFAULT);
+        try conn.writeAll(tail);
+    } else {
+        try sendResponseFramed(&conn, "200 OK", "application/json", tail);
+    }
+
+    var closed = std.atomic.Value(bool).init(false);
+    const closer = try std.Thread.spawn(.{}, struct {
+        fn run(c: *Conn, done: *std.atomic.Value(bool)) void {
+            c.close();
+            done.store(true, .release);
+        }
+    }.run, .{ &conn, &closed });
+    var client_open = true;
+    defer closer.join();
+    defer if (client_open) {
+        _ = std.c.close(sv[1]);
+    };
+
+    // The reader gets the whole response and then EOF ...
+    var buf: [512]u8 = undefined;
+    var got: usize = 0;
+    while (true) {
+        const n = std.c.recv(sv[1], &buf[got], buf.len - got, 0);
+        if (n <= 0) break;
+        got += @intCast(n);
+    }
+    try testing.expect(std.mem.endsWith(u8, buf[0..got], tail));
+
+    // ... and only a close-delimited body keeps the server's end open, so the kernel cannot
+    // reset a lagging reader.
+    var waited: u32 = 0;
+    while (!closed.load(.acquire) and waited < 50) : (waited += 1) {
+        std.Io.sleep(testing.io, .fromMilliseconds(10), .real) catch {};
+    }
+    try testing.expectEqual(!close_delimited, closed.load(.acquire));
+
+    _ = std.c.close(sv[1]);
+    client_open = false;
+    waited = 0;
+    while (!closed.load(.acquire) and waited < 300) : (waited += 1) {
+        std.Io.sleep(testing.io, .fromMilliseconds(10), .real) catch {};
+    }
+    try testing.expect(closed.load(.acquire));
+}
+
+test "Conn.close keeps the socket until the peer hangs up, after a close-delimited body" {
+    try expectCloseWaitsForPeer(true);
+}
+
+test "Conn.close does not wait for the peer after a Content-Length response" {
+    try expectCloseWaitsForPeer(false);
+}
+
 test "listenExclusive: a second server cannot bind a port that is already listening" {
     var first = try listenExclusive(testing.io, .{ .ip4 = std.Io.net.Ip4Address.loopback(0) });
     defer first.deinit(testing.io);
@@ -20073,8 +20381,22 @@ test "expandMediaPlaceholders: an LFM2-VL tiled source is one item, every tile l
     // (0,0)=124908, (0,1)=124909, (1,0)=124918, (1,1)=124919.
     const want = [_]u32{
         1,
-        125009, 124908, 124907, 124909, 124907, 124918, 124907, 124919, 124907, 125008, 124907, 125010,
-        125009, 124907, 124907, 125010,
+        125009,
+        124908,
+        124907,
+        124909,
+        124907,
+        124918,
+        124907,
+        124919,
+        124907,
+        125008,
+        124907,
+        125010,
+        125009,
+        124907,
+        124907,
+        125010,
         2,
     };
     try testing.expectEqualSlices(u32, &want, out.ids);
@@ -21395,6 +21717,32 @@ test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill m
     try t.expect(!mlxMemoryGuardApplies(false, true));
 }
 
+test "ungatedHotCacheAsk: a sliding-ring arch asks for one whole session, every other arch keeps its ask" {
+    const t = std.testing;
+    const mimo: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .num_hidden_layers = 4, .head_dim = 192, .v_head_dim = 128, .num_key_value_heads = 8, .num_global_key_value_heads = 4, .sliding_window = 128, .sliding_window_pattern = 4 };
+    const session = oneSessionEntryBytes(&mimo, 16, 1_000_000, 8192);
+    try t.expect(session > PREFIX_CACHE_MEM_DEFAULT);
+    try t.expectEqual(session, ungatedHotCacheAsk(&mimo, PREFIX_CACHE_MEM_DEFAULT, false, 16, 1_000_000, 8192));
+    // An operator's number stands.
+    try t.expectEqual(@as(u64, 1 << 30), ungatedHotCacheAsk(&mimo, 1 << 30, true, 16, 100_000, 8192));
+    const llama: model_mod.ModelConfig = .{ .model_type = "llama" };
+    try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, ungatedHotCacheAsk(&llama, PREFIX_CACHE_MEM_DEFAULT, false, 16, 100_000, 8192));
+}
+
+test "slotFixedKvBytes: a MiMo slot bills its sliding rings once, at keep + one chunk of rows" {
+    const t = std.testing;
+    // Layer 3 global (4 KV heads), layers 0-2 sliding (8 KV heads).
+    const mimo: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .num_hidden_layers = 4, .head_dim = 192, .v_head_dim = 128, .num_key_value_heads = 8, .num_global_key_value_heads = 4, .sliding_window = 128, .sliding_window_pattern = 4 };
+    const rows: u64 = 128 + model_mod.ModelConfig.SLIDING_RING_SLACK + 8192;
+    try t.expectEqual(3 * 8 * (192 + 128) * 2 * rows, slotFixedKvBytes(&mimo, 16, 8192));
+    try t.expectEqual(kvBytesPerTokenAtBits(3 * 8 * (192 + 128) * 2, 8) * rows, slotFixedKvBytes(&mimo, 8, 8192));
+    // The admission guard bills them on an ungated arch too.
+    try t.expectEqual(slotFixedKvBytes(&mimo, 16, 8192), prefillRequestTerms(&mimo, 50_000, 1024, 16, 8192, .{}).slot_fixed_kv_bytes);
+    // Every other arch keeps its old fixed term.
+    const llama: model_mod.ModelConfig = .{ .model_type = "llama" };
+    try t.expectEqual(llama.qsaRingBytes(), slotFixedKvBytes(&llama, 16, 8192));
+}
+
 test "kvBytesPerToken bills only the CACHING layers, at the arch's own K and V widths" {
     const t = std.testing;
     // Uniform arch: every layer caches, K and V are both head_dim wide.
@@ -21811,6 +22159,22 @@ test "prefillMemoryNeeded: the new terms fire only where the measurement put the
     const dense_only = prefillMemoryNeeded(9827, 32, 2, 53248, 128, 128, 6656, 19968, 16, 2048, 9827, 0, 0, .{});
     const pre_fix: u64 = (9827 * 53248 + 3 * 8 * 2048 * 19968 * 2) * 5 / 4;
     try t.expectEqual(dense_only - pre_fix, 512 * 1024 * 1024 * 5 / 4);
+}
+
+test "prefill stream bill: GLM-5 on NAX bills no top_k replica or linear stream" {
+    const t = std.testing;
+    var glm = model_mod.ModelConfig{ .model_type = "glm5_next" };
+    glm.num_hidden_layers = 45;
+    glm.full_attention_interval = 4;
+    glm.linear_num_key_heads = 64;
+    glm.linear_num_value_heads = 64;
+    glm.hidden_size = 4096;
+    glm.num_experts = 288;
+    glm.num_experts_per_tok = 8;
+    glm.moe_intermediate_size = 2048;
+    // Measured 380 KB per chunk-token on M5 (NAX), under the 3-envelope floor.
+    try t.expectEqual(@as(u64, 0), prefillStreamBytesPerTokenOn(&glm, true));
+    try t.expect(prefillStreamBytesPerTokenOn(&glm, false) > 0);
 }
 
 test "prefillStreamBytesPerToken: keyed on the arch's own geometry, zero for plain attention" {
@@ -22313,6 +22677,66 @@ test "formatChatUsage: prompt_tokens_details.cached_tokens always present (llmpr
     try t.expectEqualStrings(
         \\{"prompt_tokens":10,"completion_tokens":20,"total_tokens":30,"prompt_tokens_details":{"cached_tokens":4},"completion_tokens_details":{"reasoning_tokens":7}}
     , with_details);
+}
+
+test "Anthropic usage: cached input is a separate bucket, unlike OpenAI" {
+    const a = testing.allocator;
+    for ([_]struct { prompt: u32, cached: u32, input: u32 }{
+        .{ .prompt = 100, .cached = 0, .input = 100 },
+        .{ .prompt = 100, .cached = 40, .input = 60 },
+        .{ .prompt = 92934, .cached = 91863, .input = 1071 },
+        .{ .prompt = 100, .cached = 100, .input = 0 },
+        .{ .prompt = 100, .cached = 101, .input = 0 },
+    }) |case| {
+        const json = try formatAnthropicUsage(a, case.prompt, 126, case.cached);
+        defer a.free(json);
+        const parsed = try std.json.parseFromSlice(std.json.Value, a, json, .{});
+        defer parsed.deinit();
+        const usage = parsed.value.object;
+        const input = usage.get("input_tokens").?.integer;
+        const created = if (usage.get("cache_creation_input_tokens")) |v| v.integer else 0;
+        const cached = usage.get("cache_read_input_tokens").?.integer;
+        try testing.expectEqual(@as(i64, case.prompt), input + created + cached);
+        try testing.expectEqual(@as(i64, case.input), input);
+        try testing.expectEqual(@as(i64, 0), created);
+        try testing.expectEqual(@as(i64, @min(case.cached, case.prompt)), cached);
+        try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
+
+        const openai = try formatChatUsage(a, case.prompt, 126, case.cached, "");
+        defer a.free(openai);
+        const chat_usage = try std.json.parseFromSlice(std.json.Value, a, openai, .{});
+        defer chat_usage.deinit();
+        const obj = chat_usage.value.object;
+        try testing.expectEqual(@as(i64, case.prompt), obj.get("prompt_tokens").?.integer);
+        try testing.expectEqual(@as(i64, case.prompt) + 126, obj.get("total_tokens").?.integer);
+        try testing.expectEqual(@as(i64, case.cached), obj.get("prompt_tokens_details").?.object.get("cached_tokens").?.integer);
+    }
+}
+
+test "Anthropic usage: message_delta overwrites provisional message_start counts" {
+    for ([_]u32{ 0, 40000, 91863, 92934, 92935 }) |cached_tokens| {
+        var arena = std.heap.ArenaAllocator.init(testing.allocator);
+        defer arena.deinit();
+        const a = arena.allocator();
+        const start = try formatAnthropicMessageStart(a, 1, "mlx-serve", 92934);
+        const delta = try formatAnthropicMessageDelta(a, "end_turn", "null", 92934, 126, cached_tokens);
+        const start_event = try std.json.parseFromSliceLeaky(std.json.Value, a, start, .{});
+        const delta_event = try std.json.parseFromSliceLeaky(std.json.Value, a, delta, .{});
+        try testing.expectEqualStrings("message_start", start_event.object.get("type").?.string);
+        try testing.expectEqualStrings("message_delta", delta_event.object.get("type").?.string);
+        var usage = start_event.object.get("message").?.object.get("usage").?.object;
+        try testing.expectEqual(@as(i64, 92934), usage.get("input_tokens").?.integer);
+        var fields = delta_event.object.get("usage").?.object.iterator();
+        while (fields.next()) |field| try usage.put(a, field.key_ptr.*, field.value_ptr.*);
+        const input = usage.get("input_tokens").?.integer;
+        const created = if (usage.get("cache_creation_input_tokens")) |v| v.integer else 0;
+        const cached = usage.get("cache_read_input_tokens").?.integer;
+        try testing.expectEqual(@as(i64, 92934), input + created + cached);
+        try testing.expectEqual(@as(i64, 92934 -| cached_tokens), input);
+        try testing.expectEqual(@as(i64, 0), created);
+        try testing.expectEqual(@as(i64, @min(cached_tokens, 92934)), cached);
+        try testing.expectEqual(@as(i64, 126), usage.get("output_tokens").?.integer);
+    }
 }
 
 test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
@@ -22971,6 +23395,14 @@ test "ssdFirstPrefixCacheMem: the active session's KV is billed ONCE and is the 
 /// The widest width the adaptive chooser may take for a prompt on this config.
 fn adaptCapFor(cfg: *const model_mod.ModelConfig, seq: u64) u32 {
     return widthForRung(cfg, seq, PREFILL_CHUNK_LADDER[0]);
+}
+
+test "resolvePrefillChunk: only an arch with no prefill score tensor may pin the wide rung" {
+    const mimo: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .head_dim = 192, .num_attention_heads = 64, .num_key_value_heads = 8, .hidden_size = 4096, .intermediate_size = 16384, .num_hidden_layers = 48 };
+    const dense: model_mod.ModelConfig = .{ .model_type = "llama", .head_dim = 128, .num_attention_heads = 32, .num_key_value_heads = 8, .hidden_size = 4096, .intermediate_size = 14336, .num_hidden_layers = 32 };
+    const huge: u64 = 1 << 50;
+    try std.testing.expectEqual(@as(u32, generate_mod.WIDE_PREFILL_CHUNK), resolvePrefillChunk(&mimo, 16, huge, 0, 0, 0));
+    try std.testing.expectEqual(@as(u32, 8192), resolvePrefillChunk(&dense, 16, huge, 0, 0, 0));
 }
 
 test "adaptivePrefillWidth: a step-down is immediate, by as many rungs as it takes, and never 0" {
@@ -23653,7 +24085,8 @@ test "prefillRequestTerms: the reservation terms are qwen4_exp-only, a donated w
     try t.expect(retainedSsmCheckpointBytes(&q35, seq, 0, chunk) > 0);
 
     // A donating warm is credited its resident rows on every arch (a checked-out entry is the slot's own
-    // buffer); a shared one is not, and then the ungated bill is exactly the previous expression.
+    // buffer); a shared one is not, and then the ungated bill is the previous expression plus the
+    // slot's fixed KV.
     const warm = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000, .will_donate = true };
     const shared = WarmPrefix{ .matched_tokens = 100_000, .capacity_tokens = 400_000 };
     for ([_][]const u8{ "qwen3_5", "qwen3_5_moe", "qwen3_next", "bailing_hybrid", "lfm2", "nemotron_h", "llama", "mistral" }) |mt| {
@@ -23669,7 +24102,7 @@ test "prefillRequestTerms: the reservation terms are qwen4_exp-only, a donated w
         const sh = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, shared);
         try t.expectEqual(@as(u64, 0), sh.shared_resident_bytes);
         try t.expectEqual(
-            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{}),
+            prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), .{ .slot_fixed_kv_bytes = slotFixedKvBytes(&cfg, kv_bits, chunk) }),
             prefillMemoryNeeded(seq, 24, 2, cfg.kvBytesPerToken(), 256, 256, 2560, 9216, kv_bits, chunk, cfg.prefillAttnKeys(seq), prefillStreamBytesPerToken(&cfg), prefillDequantWeightBytes(&cfg), sh),
         );
     }
@@ -23709,9 +24142,9 @@ test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero w
     const reserved = @max(reservedCacheTokens(seq, max_tokens, chunk, getEffectiveContextLength(&cfg)), seq);
     try t.expectEqual(reserved * 2048, on.mtp_head_kv_bytes);
     const n: u64 = cfg.attnCacheLayerCount();
-    try t.expectEqual(cfg.qsaRingBytes() + cfg.qsaRingBytes() / n, on.qsa_ring_bytes);
+    try t.expectEqual(cfg.qsaRingBytes() + cfg.qsaRingBytes() / n, on.slot_fixed_kv_bytes);
     try t.expectEqual(reserved * (statePerTokenBilled(&cfg) + statePerTokenBilled(&cfg) / n), on.state_bytes);
-    try t.expectEqual(cfg.qsaRingBytes(), off.qsa_ring_bytes);
+    try t.expectEqual(cfg.qsaRingBytes(), off.slot_fixed_kv_bytes);
     try t.expectEqual(reserved * statePerTokenBilled(&cfg), off.state_bytes);
     var other = cfg;
     other.model_type = "qwen3_5_moe";
@@ -23908,7 +24341,7 @@ test "a WARM append bills the checkpoints its prefill CAPTURES, not the prompt's
         terms.reserved_kv_bytes +
         terms.state_bytes +
         terms.checkpoint_bytes +
-        terms.qsa_ring_bytes +
+        terms.slot_fixed_kv_bytes +
         2 * seq * cfg.num_key_value_heads * cfg.head_dim * 2 +
         envelope +
         PREFILL_RUNTIME_FLOOR_BYTES;
@@ -24094,4 +24527,42 @@ test "a streamed turn's result keeps the prompt-cache hit and timings the slot m
     try t.expectEqual(@as(u32, 2985), r.cached_tokens);
     try t.expectEqual(ts.prefill_ns, r.prefill_ns);
     try t.expectEqual(ts.decode_ns, r.decode_ns);
+}
+
+test "Conn names the client from each request's User-Agent and keeps no header text" {
+    const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = -1, .address = peer } }, std.Io.Threaded.global_single_threaded.io());
+    try std.testing.expectEqual(instr.Client.other, conn.client);
+
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nUser-Agent: opencode/1.4\r\n\r\n");
+    try std.testing.expectEqual(instr.Client.opencode, conn.client);
+    conn.noteRequestHeaders("POST /v1/messages HTTP/1.1\r\nHost: x\r\n\r\n");
+    try std.testing.expectEqual(instr.Client.other, conn.client);
+}
+
+test "disabled prefix cache: sizing releases the cache reserve on every arch" {
+    const saved_capacity = prefix_cache_capacity;
+    const saved_ask = prefix_cache_mem_bytes;
+    defer prefix_cache_capacity = saved_capacity;
+    defer prefix_cache_mem_bytes = saved_ask;
+
+    var gated = longCtxTestConfig();
+    var other = longCtxTestConfig();
+    other.model_type = "qwen3_5_moe";
+    const configs = [_]*model_mod.ModelConfig{ &gated, &other };
+    for ([_]u64{ 0, 2 << 30, 60 << 30 }) |ask| {
+        prefix_cache_mem_bytes = ask;
+        prefix_cache_capacity = 0;
+        for (configs) |cfg| {
+            try testing.expectEqual(@as(u64, 0), ctxSizingCacheReserve(cfg));
+        }
+        try testing.expectEqual(@as(u64, 0), legacyPrefixCacheAsk());
+        try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    }
+    prefix_cache_capacity = 32;
+    prefix_cache_mem_bytes = 10 << 30;
+    try testing.expectEqual(CTX_SIZING_CACHE_RESERVE, ctxSizingCacheReserve(&gated));
+    try testing.expectEqual(prefix_cache_mem_bytes, ctxSizingCacheReserve(&other));
+    try testing.expectEqual(prefix_cache_mem_bytes, legacyPrefixCacheAsk());
 }

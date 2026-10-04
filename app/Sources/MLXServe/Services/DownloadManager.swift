@@ -243,8 +243,8 @@ class DownloadManager: ObservableObject {
 
     /// Filter a HuggingFace `/tree/main?recursive=true` listing down to the
     /// files a model download actually needs: top-level config / tokenizer /
-    /// weight files, PLUS the MTP multi-token-prediction sidecar the server
-    /// auto-loads. Two nested sidecar layouts are pulled: `mtp/weights.safetensors`
+    /// weight files, PLUS the speculation sidecars the server auto-loads (the
+    /// pack's `drafter/`, and the MTP head). Two nested sidecar layouts are pulled: `mtp/weights.safetensors`
     /// (mlx-serve native) and `optiq/mtp.safetensors` (oMLX OptiQ). Without them
     /// an MTP model silently loses its speculative-decoding speedup because a
     /// non-recursive listing returns the dir as a bare entry that the
@@ -266,8 +266,8 @@ class DownloadManager: ObservableObject {
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
             // Depth gate. Variant: exactly the named subfolder's own files
             // (`4bit/config.json`), never anything deeper. Chat default:
-            // top-level files + the MTP sidecar (native `mtp/` dir, or OptiQ's
-            // single `optiq/mtp.safetensors`). Media (recursive): keep nested
+            // top-level files + the pack's `drafter/` + the MTP sidecar (native
+            // `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`). Media (recursive): keep nested
             // weight subdirs (FLUX's transformer/vae/text_encoder, TTS's
             // speech_tokenizer).
             if let folder = selection.packFolder {
@@ -276,7 +276,8 @@ class DownloadManager: ObservableObject {
                 guard path.hasPrefix(sub + "/") else { return nil }
                 guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
             } else if !selection.recursive {
-                guard !path.contains("/") || path.hasPrefix("mtp/") || path == "optiq/mtp.safetensors" else { return nil }
+                guard !path.contains("/") || path.hasPrefix("mtp/") || path.hasPrefix(DrafterGems.packFolder + "/")
+                    || path == "optiq/mtp.safetensors" else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
             guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }
@@ -355,6 +356,7 @@ class DownloadManager: ObservableObject {
         case "minimax_h3": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
+        case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
         default: return nil
         }
     }
@@ -363,9 +365,9 @@ class DownloadManager: ObservableObject {
     /// completeness marker is missing.
     nonisolated static func holdsCompleteMediaPack(_ dir: String) -> Bool {
         let fm = FileManager.default
-        guard let data = fm.contents(atPath: (dir as NSString).appendingPathComponent("config.json")),
-              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let mt = cfg["model_type"] as? String,
+        let cfg = fm.contents(atPath: (dir as NSString).appendingPathComponent("config.json"))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        guard let mt = cfg?["model_type"] as? String ?? markerModelType(inDir: dir),
               let marker = requiredMediaMarker(modelType: mt) else { return true }
         return fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker))
     }
@@ -383,7 +385,21 @@ class DownloadManager: ObservableObject {
             return "laya"
         }
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
+        if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
         return nil
+    }
+
+    /// A stable-audio-tools inpainting model conditioned on T5Gemma: the
+    /// Stable Audio 3 family as Stability publishes it. Twin of
+    /// `model_discovery.peekStableAudio3Config`.
+    nonisolated static func isStableAudio3Config(atPath path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              cfg["model_type"] as? String == "diffusion_cond_inpaint",
+              let model = cfg["model"] as? [String: Any],
+              let cond = model["conditioning"] as? [String: Any],
+              let configs = cond["configs"] as? [[String: Any]] else { return false }
+        return configs.contains { $0["type"] as? String == "t5gemma" }
     }
 
     /// File size in bytes, resolving symlinks first. Hugging Face snapshots
@@ -998,6 +1014,12 @@ class DownloadManager: ObservableObject {
         downloads.removeValue(forKey: gem.repo)
     }
 
+    /// The model's own bytes for a gem fit check: `fits` bills the gem, so the
+    /// pack's `drafter/` must not be counted on both sides.
+    nonisolated static func packBytesWithoutDrafter(_ entries: [[String: Any]]) -> Int64 {
+        selectNeededFiles(from: entries, selection: .chatWithoutDrafter).reduce(0) { $0 + $1.1 }
+    }
+
     /// A fresh download fills its socket with the default gem when it fits in
     /// RAM and the user has not chosen one. A pack's own `drafter/` stays
     /// "auto" (the server finds it); a separate repo is written as a path.
@@ -1010,7 +1032,7 @@ class DownloadManager: ObservableObject {
         let files = PackUpdateCheck.sizes(entries)
         packListings[repoId] = files
         let gems = DrafterGems.gems(forRepoId: repoId, packFiles: files, localDrafter: false, mtpAvailable: false)
-        let modelGB = Double(Self.selectNeededFiles(from: entries).reduce(0) { $0 + $1.1 }) / 1e9
+        let modelGB = Double(Self.packBytesWithoutDrafter(entries)) / 1e9
         guard let gem = DrafterGems.defaultGem(gems),
               DrafterGems.fits(gem, modelGB: modelGB, memory: .current()) else { return }
         if gemPath(gem, modelDir: modelDir) == nil {
@@ -1120,7 +1142,7 @@ class DownloadManager: ObservableObject {
 
     private static func fileSelections(_ selection: UpdateSelection) -> [FileSelection] {
         switch selection {
-        case .chat(let drafter): return [.chatDefault] + (drafter ? [.packFolder(DrafterGems.packFolder)] : [])
+        case .chat(let drafter): return [drafter ? .chatDefault : .chatWithoutDrafter]
         case .variant(let sub): return [.mlxVariant(sub)]
         case .media(let sel): return [sel]
         case .gguf: return []

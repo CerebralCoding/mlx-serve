@@ -32,6 +32,7 @@ struct ModelBrowserPane: View {
             + readyCount(AudioModelPreset.allIncludingVoiceOnly)
             + readyCount(VideoModelPreset.all)
             + readyCount(MusicModelPreset.all)
+            + readyCount(SoundModelPreset.all)
         return .live(localModelCount: appState.localModels.count,
                      activeDownloadCount: activeDownloads.count,
                      mediaReadyCount: media)
@@ -976,6 +977,14 @@ private struct MediaPane: View {
                 ) {
                     ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, modality: .music, physicalMemoryBytes: physicalMemory) }
                 }
+                ModelGroupSection(
+                    title: "Sound Effects",
+                    subtitle: "Text-to-audio: effects and ambiences.",
+                    systemImage: "speaker.wave.3",
+                    tint: .teal
+                ) {
+                    ForEach(SoundModelPreset.all) { MediaModelRow(preset: $0, modality: .sound, physicalMemoryBytes: physicalMemory) }
+                }
             }
             .padding(16)
         }
@@ -1189,10 +1198,9 @@ private struct UseModelButton: View {
                     .controlSize(.small)
                     .frame(width: 30)
             } else {
-                Text("Use")
+                Text("Use").font(.app(.body))
             }
         }
-        .font(.app(.callout))
         .controlSize(.small)
         .disabled(isLoading)
         .help("Load \(name) as the server's model, then open chat")
@@ -1754,9 +1762,9 @@ private struct GgufQuantMenu: View {
                 failed: state?.status == .failed,
                 hasPartial: downloads.hasPartialDownload(repoId)
             )
-))
+)).font(.app(.body))
         }
-        .font(.app(.callout))
+        .menuStyle(.button)
         .controlSize(.small)
         .fixedSize()
         .task {
@@ -1863,9 +1871,9 @@ private struct MlxVariantMenu: View {
                 failed: state?.status == .failed,
                 hasPartial: variants.contains { downloads.hasPartialDownload(localId($0)) }
             )
-))
+)).font(.app(.body))
         }
-        .font(.app(.callout))
+        .menuStyle(.button)
         .controlSize(.small)
         .fixedSize()
         .alert("Delete Quantization", isPresented: .init(
