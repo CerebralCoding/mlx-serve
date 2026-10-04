@@ -15,6 +15,11 @@ const std = @import("std");
 const io_util = @import("io_util.zig");
 const log = @import("log.zig");
 const ple_gpu = @import("ple_gpu.zig");
+const embedded_ple = @import("qwen4_ple.zig");
+pub const EmbeddedSpec = embedded_ple.EmbeddedSpec;
+pub const EmbeddedInfo = embedded_ple.EmbeddedInfo;
+pub const inspectEmbedded = embedded_ple.inspectEmbedded;
+pub const embeddedTensorName = embedded_ple.embeddedTensorName;
 
 const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15;
@@ -156,6 +161,7 @@ fn warmEnabled() bool {
 /// by the warm thread, read lock-free by metrics and `/props`; zero when nothing is warming.
 pub var live_warm_bytes = std.atomic.Value(u64).init(0);
 pub var live_warm_total = std.atomic.Value(u64).init(0);
+const empty_embedded_map: [0]u8 align(std.heap.page_size_min) = .{};
 
 /// A progress line at each 8 GB step or after 10 s of silence, never twice per step. Pure.
 pub const WARM_LOG_BYTES: u64 = 8 << 30;
@@ -203,6 +209,33 @@ pub const NgramTable = struct {
     /// Set once `ple_gpu.wrap` hands the mapping to a no-copy Metal buffer: MLX unmaps it
     /// when its last reference drops, so a kernel still in flight never reads freed pages.
     gpu_owns_map: bool = false,
+    embedded: ?*embedded_ple.EmbeddedTable = null,
+
+    pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !NgramTable {
+        var source = (try embedded_ple.openEmbedded(model_dir, expected)) orelse return error.EmbeddedPleMissing;
+        errdefer source.close();
+        const ptr = try std.heap.page_allocator.create(embedded_ple.EmbeddedTable);
+        ptr.* = source;
+        var table: NgramTable = .{
+            .map = empty_embedded_map[0..],
+            .rows = ptr.rows,
+            .dim = ptr.dim,
+            .bits = ptr.bits,
+            .group_size = ptr.group_size,
+            .w_off = 0,
+            .s_off = 0,
+            .b_off = 0,
+            .wcols = ptr.wcols,
+            .scols = ptr.scols,
+            .embedded = ptr,
+        };
+        if (plePrefetchEnabled()) table.pool = PrefetchPool.create() catch null;
+        return table;
+    }
+
+    pub fn embeddedPayloadBytes(self: *const NgramTable) u64 {
+        return if (self.embedded) |source| source.payload_bytes else 0;
+    }
 
     pub fn open(path: []const u8) !NgramTable {
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
@@ -236,16 +269,7 @@ pub const NgramTable = struct {
         };
     }
 
-    const HeaderRegion = struct {
-        rows: u64,
-        cols: u64,
-        start: u64, // relative to the data section, as the header spells it
-        end: u64,
-
-        fn overlaps(a: HeaderRegion, b: HeaderRegion) bool {
-            return a.start < b.end and b.start < a.end;
-        }
-    };
+    const HeaderRegion = embedded_ple.HeaderRegion;
 
     /// One header entry, every access checked and the region proven to hold exactly
     /// `rows x cols x elem` bytes inside the mapping.
@@ -257,34 +281,12 @@ pub const NgramTable = struct {
         map_len: usize,
         data_off: usize,
     ) !HeaderRegion {
-        const v = obj.get(key) orelse return error.NgramTableHeader;
-        if (v != .object) return error.NgramTableHeader;
-        const o = v.object;
-        const dt = o.get("dtype") orelse return error.NgramTableHeader;
-        if (dt != .string or !std.mem.eql(u8, dt.string, dtype)) return error.NgramTableHeader;
-        const shape = o.get("shape") orelse return error.NgramTableHeader;
-        if (shape != .array or shape.array.items.len != 2) return error.NgramTableHeader;
-        if (shape.array.items[0] != .integer or shape.array.items[1] != .integer) return error.NgramTableHeader;
-        const dofs = o.get("data_offsets") orelse return error.NgramTableHeader;
-        if (dofs != .array or dofs.array.items.len != 2) return error.NgramTableHeader;
-        if (dofs.array.items[0] != .integer or dofs.array.items[1] != .integer) return error.NgramTableHeader;
-
-        const rows_i = shape.array.items[0].integer;
-        const cols_i = shape.array.items[1].integer;
-        const start_i = dofs.array.items[0].integer;
-        const end_i = dofs.array.items[1].integer;
-        if (rows_i <= 0 or cols_i <= 0 or start_i < 0 or end_i < start_i) return error.NgramTableRegion;
-        const r: HeaderRegion = .{
-            .rows = @intCast(rows_i),
-            .cols = @intCast(cols_i),
-            .start = @intCast(start_i),
-            .end = @intCast(end_i),
+        const r = embedded_ple.headerRegion(obj, key, dtype, elem, map_len, data_off, .matrix) catch |err| return switch (err) {
+            error.TensorHeader, error.TensorDtype => error.NgramTableHeader,
+            error.TensorRegion => error.NgramTableRegion,
+            error.TensorTruncated => error.NgramTableTruncated,
         };
         if (r.cols > std.math.maxInt(u32) or r.rows > std.math.maxInt(u32)) return error.NgramTableRegion;
-        const need = std.math.mul(u64, r.rows, r.cols * elem) catch return error.NgramTableRegion;
-        if (r.end - r.start != need) return error.NgramTableRegion;
-        const abs_end = std.math.add(u64, data_off, r.end) catch return error.NgramTableTruncated;
-        if (abs_end > map_len) return error.NgramTableTruncated;
         return r;
     }
 
@@ -372,7 +374,11 @@ pub const NgramTable = struct {
         self.pool = null;
         if (self.fd >= 0) _ = std.c.close(self.fd);
         self.fd = -1;
-        if (!self.gpu_owns_map) std.posix.munmap(self.map);
+        if (self.embedded) |source| {
+            source.close();
+            std.heap.page_allocator.destroy(source);
+            self.embedded = null;
+        } else if (!self.gpu_owns_map) std.posix.munmap(self.map);
     }
 
     /// Sample before background warming; explicit read-path overrides skip calibration.
@@ -390,7 +396,7 @@ pub const NgramTable = struct {
     fn calibrate(self: *const NgramTable, phase: CalibrationPhase) void {
         if (self.bits == 16 or plePrefillPrefetchMode() != .kv_gated) return;
         const p = self.pool orelse return;
-        if (self.fd < 0 or self.rows < 2 * PLE_CALIBRATION_ROWS) return;
+        if ((self.fd < 0 and self.embedded == null) or self.rows < 2 * PLE_CALIBRATION_ROWS) return;
         if (self.wcols * 4 + self.scols * 4 > PrefetchPool.ROW_BUF) return;
 
         var serial_rows: [PLE_CALIBRATION_ROWS]i64 = undefined;
@@ -425,7 +431,10 @@ pub const NgramTable = struct {
     fn touchRow(self: *const NgramTable, r: u64) u64 {
         const wl: usize = self.wcols * 4;
         const sl: usize = self.scols * 2;
-        const regions = [_][]const u8{
+        const regions = if (self.embedded) |source| blk: {
+            const p = source.rowParts(r);
+            break :blk [_][]const u8{ p.weight, p.scales, p.biases };
+        } else [_][]const u8{
             self.map[self.w_off + r * wl ..][0..wl],
             self.map[self.s_off + r * sl ..][0..sl],
             self.map[self.b_off + r * sl ..][0..sl],
@@ -446,6 +455,7 @@ pub const NgramTable = struct {
     /// table sits at its final address (the thread holds `self`). Off via
     /// MLX_SERVE_NGRAM_WARM=0.
     pub fn startWarm(self: *NgramTable) void {
+        if (self.embedded != null) return;
         if (self.fd < 0 or self.warm_thread != null) return;
         // The off arm says so: a cold first request faults rows off the SSD (38k prompt: 174 s vs 55 s).
         if (!warmEnabled()) {
@@ -491,6 +501,11 @@ pub const NgramTable = struct {
     /// straddle a word boundary at 3/5/6 bits).
     pub fn row(self: *const NgramTable, r: u64, out: []f32) void {
         std.debug.assert(r < self.rows and out.len >= self.dim);
+        if (self.embedded) |source| {
+            const parts = source.rowParts(r);
+            self.dequantRow(parts.weight, parts.scales, parts.biases, out);
+            return;
+        }
         // Raw BF16 arm: straight convert, no scales/biases.
         if (self.bits == 16) {
             const raw = self.map[self.w_off + r * self.dim * 2 ..][0 .. self.dim * 2];
@@ -539,9 +554,10 @@ pub const NgramTable = struct {
         const prefer_pool = if (self.pool) |p| p.prefer_pool else false;
         const wide_ok = !wide or plePrefillPrefetchEnabled(kv_len, prefer_pool);
         // Announce the arm that actually runs, not the lever that permits it.
-        const pooled = wide_ok and self.pool != null and self.fd >= 0 and need <= PrefetchPool.ROW_BUF;
+        const readable = self.fd >= 0 or self.embedded != null;
+        const pooled = wide_ok and self.pool != null and readable and need <= PrefetchPool.ROW_BUF;
         if (wide) notePrefillGatherArm(pooled, row_ids.len, prefer_pool);
-        if (self.pool) |p| if (self.fd >= 0 and need <= PrefetchPool.ROW_BUF and wide_ok) {
+        if (self.pool) |p| if (readable and need <= PrefetchPool.ROW_BUF and wide_ok) {
             const wl: usize = self.wcols * 4;
             const sl: usize = self.scols * 2;
             var start: usize = 0;
@@ -567,6 +583,7 @@ pub const NgramTable = struct {
             1 => .{ self.s_off + r * sl, buf[wl .. wl + sl] },
             else => .{ self.b_off + r * sl, buf[wl + sl .. wl + 2 * sl] },
         };
+        if (self.embedded) |source| return source.preadPart(r, region, dst);
         return std.c.pread(self.fd, dst.ptr, dst.len, @intCast(off)) == @as(isize, @intCast(dst.len));
     }
 
@@ -953,6 +970,52 @@ test "ngram table raw bf16 rows copy out converted without scales" {
     try testing.expectEqualSlices(f32, &[_]f32{ 1.0, -2.0, 2.0, 0.0 }, &out);
     t.row(1, &out);
     try testing.expectEqualSlices(f32, &[_]f32{ -1.0, 0.5, -3.0, 3.0 }, &out);
+}
+
+test "embedded PLE rows and gathers match the merged table" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try embedded_ple.writeFixture(&td, .valid);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    var embedded = try NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 });
+    defer embedded.close();
+    try std.testing.expectEqual(@as(u64, 120), embedded.embeddedPayloadBytes());
+
+    const header = "{\"__metadata__\":{\"format\":\"mlx-serve-ngram\",\"bits\":\"4\",\"group_size\":\"32\"}," ++
+        "\"weight\":{\"dtype\":\"U32\",\"shape\":[6,4],\"data_offsets\":[0,96]}," ++
+        "\"scales\":{\"dtype\":\"BF16\",\"shape\":[6,1],\"data_offsets\":[96,108]}," ++
+        "\"biases\":{\"dtype\":\"BF16\",\"shape\":[6,1],\"data_offsets\":[108,120]}}";
+    const flat_buf = try std.testing.allocator.alignedAlloc(u8, .fromByteUnits(std.heap.page_size_min), 8 + 512 + 120);
+    defer std.testing.allocator.free(flat_buf);
+    std.mem.writeInt(u64, flat_buf[0..8], 512, .little);
+    @memset(flat_buf[8..520], ' ');
+    @memcpy(flat_buf[8 .. 8 + header.len], header);
+    for (0..6) |r| {
+        const parts = embedded.embedded.?.rowParts(r);
+        @memcpy(flat_buf[520 + r * 16 ..][0..16], parts.weight);
+        @memcpy(flat_buf[520 + 96 + r * 2 ..][0..2], parts.scales);
+        @memcpy(flat_buf[520 + 108 + r * 2 ..][0..2], parts.biases);
+    }
+    const flat = try NgramTable.parse(flat_buf, flat_buf[8..520], 520);
+    const ids = [_]i64{ 5, 1, 2, 0, 3, 5, 4 };
+    var want: [ids.len * 32]f32 = undefined;
+    var serial: [ids.len * 32]f32 = undefined;
+    var pooled: [ids.len * 32]f32 = undefined;
+    flat.gather(&ids, &want, 0);
+    {
+        const pool = embedded.pool;
+        embedded.pool = null;
+        defer embedded.pool = pool;
+        embedded.gather(&ids, &serial, 0);
+    }
+    try std.testing.expectEqualSlices(f32, &want, &serial);
+    try std.testing.expectEqual(@as(f32, 5), want[0]);
+    if (embedded.pool != null) {
+        embedded.gather(&ids, &pooled, 0);
+        try std.testing.expectEqualSlices(f32, &want, &pooled);
+    }
 }
 
 /// Module-owned state for one loaded qwen4_exp model: the n-gram hash and
