@@ -1256,6 +1256,33 @@ fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tok
     return .{ .budget = @intCast(budget), .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
 }
 
+/// Arm the forced tool-call opener for a `tool_choice` that obliges a call, or
+/// null when the dialect has no opener we can spell or the thought cannot be
+/// tracked. `forced` is allocated; the caller frees it after generation.
+fn armToolForce(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, forced_tool: ?chat_mod.ForcedTool) ?generate_mod.ToolForce {
+    const ft = forced_tool orelse return null;
+    if (lm.transformer == null) return null;
+    const cc = lm.chat_config orelse return null;
+    const text = (chat_mod.forcedToolOpener(allocator, cc.chat_template, ft) catch return null) orelse return null;
+    defer allocator.free(text);
+    const opened = promptOpensThink(allocator, lm, tok, prompt_ids);
+    const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER);
+    if (opened and closer == null) return null;
+    const opener = tok.encode(allocator, text) catch return null;
+    defer allocator.free(opener);
+    const sep = tok.encode(allocator, "\n\n") catch return null;
+    defer allocator.free(sep);
+    const head: usize = if (opened) 1 + sep.len else 0;
+    const forced = allocator.alloc(u32, head + opener.len) catch return null;
+    if (opened) {
+        forced[0] = closer.?;
+        @memcpy(forced[1..head], sep);
+    }
+    @memcpy(forced[head..], opener);
+    log.info("  tool_choice: call opener enforced in-stream\n", .{});
+    return .{ .closer_id = closer, .forced = forced, .opener_at = head, .in_think = opened };
+}
+
 fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) bool {
     const c = lm.config orelse return false;
     if (!std.mem.eql(u8, c.model_type, "muse_glimmer") or prompt_ids.len == 0) return false;
@@ -8681,11 +8708,7 @@ fn handleChatCompletions(
     // Extract tools JSON from request body for chat template injection
     var tools_json: ?[]const u8 = null;
     var has_tools = root.get("tools") != null;
-    var tool_choice_instruction: ?[]const u8 = null;
-    var tool_choice_allocated = false;
-    defer if (tool_choice_allocated) {
-        if (tool_choice_instruction) |tci| allocator.free(tci);
-    };
+    var forced_tool: ?chat_mod.ForcedTool = null;
 
     // OpenAI parallel_tool_calls: only an explicit false clamps to one call
     // per response (the SDK sets false in strict structured-output mode).
@@ -8701,7 +8724,7 @@ fn handleChatCompletions(
                 if (std.mem.eql(u8, tc.string, "none")) {
                     has_tools = false; // Don't inject tools at all
                 } else if (std.mem.eql(u8, tc.string, "required")) {
-                    tool_choice_instruction = "\nYou MUST call one of the available functions. Do not respond with text.";
+                    forced_tool = .any;
                 }
                 // "auto" is the default behavior
             } else if (tc == .object) {
@@ -8709,10 +8732,7 @@ fn handleChatCompletions(
                 if (tc.object.get("function")) |func| {
                     if (func == .object) {
                         if (func.object.get("name")) |name_val| {
-                            if (name_val == .string) {
-                                tool_choice_instruction = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
-                                tool_choice_allocated = true;
-                            }
+                            if (name_val == .string) forced_tool = .{ .name = name_val.string };
                         }
                     }
                 }
@@ -8726,6 +8746,14 @@ fn handleChatCompletions(
             }
         }
     }
+    if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
+        const msg = try std.fmt.allocPrint(allocator, "tool_choice names function \"{s}\", which is not in tools", .{ft.name});
+        defer allocator.free(msg);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    };
+    const tool_choice_instruction: ?[]const u8 = if (forced_tool) |ft| try chat_mod.toolChoiceInstruction(allocator, ft) else null;
+    defer if (tool_choice_instruction) |tci| allocator.free(tci);
 
     // Parse stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -9165,6 +9193,16 @@ fn handleChatCompletions(
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
+
+    var tool_force = armToolForce(allocator, lm, tok, prompt_ids, forced_tool);
+    defer if (tool_force) |tf| allocator.free(tf.forced);
+    if (tool_force) |*tf| sampling.tool_force = tf;
+    // One token per tick: no draft round can carry the turn past the forced opener.
+    if (tool_force != null) {
+        enable_pld = false;
+        enable_drafter = false;
+        enable_mtp = false;
+    }
 
     // Hand vision ownership off to the sub-handler, which transfers it to
     // the slot at submit time.
@@ -15307,11 +15345,7 @@ fn handleAnthropicMessages(
     defer if (tools_json_allocated) allocator.free(tools_json.?);
     var has_tools = false;
     var allow_parallel_tools = true;
-    var tool_choice_instruction: ?[]const u8 = null;
-    var tool_choice_allocated = false;
-    defer if (tool_choice_allocated) {
-        if (tool_choice_instruction) |tci| allocator.free(tci);
-    };
+    var forced_tool: ?chat_mod.ForcedTool = null;
 
     if (root.get("tools")) |tools_val| {
         if (tools_val == .array and tools_val.array.items.len > 0) {
@@ -15331,19 +15365,24 @@ fn handleAnthropicMessages(
                     if (std.mem.eql(u8, tc_type, "none")) {
                         has_tools = false;
                     } else if (std.mem.eql(u8, tc_type, "any")) {
-                        tool_choice_instruction = "\nYou MUST call one of the available functions. Do not respond with text.";
+                        forced_tool = .any;
                     } else if (std.mem.eql(u8, tc_type, "tool")) {
                         if (tc.object.get("name")) |name_val| {
-                            if (name_val == .string) {
-                                tool_choice_instruction = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
-                                tool_choice_allocated = true;
-                            }
+                            if (name_val == .string) forced_tool = .{ .name = name_val.string };
                         }
                     }
                 }
             }
         }
     }
+    if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
+        const msg = try std.fmt.allocPrint(allocator, "tool_choice names tool \"{s}\", which is not in tools", .{ft.name});
+        defer allocator.free(msg);
+        try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+        return;
+    };
+    const tool_choice_instruction: ?[]const u8 = if (forced_tool) |ft| try chat_mod.toolChoiceInstruction(allocator, ft) else null;
+    defer if (tool_choice_instruction) |tci| allocator.free(tci);
 
     // Stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -15642,6 +15681,16 @@ fn handleAnthropicMessages(
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
+
+    var tool_force = armToolForce(allocator, lm, tok, prompt_ids, forced_tool);
+    defer if (tool_force) |tf| allocator.free(tf.forced);
+    if (tool_force) |*tf| sampling.tool_force = tf;
+    // One token per tick: no draft round can carry the turn past the forced opener.
+    if (tool_force != null) {
+        enable_pld = false;
+        enable_drafter = false;
+        enable_mtp = false;
+    }
 
     // Hand vision ownership to the sub-handler (slot takes it on submit).
     const sub_ve = mm.embeddings;
@@ -17198,6 +17247,12 @@ fn handleResponsesInner(
     const tool_choice = try responses_mod.parseToolChoice(allocator, root.get("tool_choice"));
     defer if (tool_choice.instruction) |ins| allocator.free(ins);
     if (!tool_choice.include_tools) has_tools = false;
+    if (tool_choice.forced) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
+        const msg = try std.fmt.allocPrint(allocator, "tool_choice names function \"{s}\", which is not in tools", .{ft.name});
+        defer allocator.free(msg);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    };
 
     // Maps every name the model may spell a namespaced call with (expanded
     // wire names, unique bare child names) back to (namespace, name), so a
@@ -17412,6 +17467,9 @@ fn handleResponsesInner(
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     if (think_bound) |*tb| sampling.think_bound = tb;
+    var tool_force = armToolForce(allocator, lm, tok, prompt_ids, if (active_has_tools) tool_choice.forced else null);
+    defer if (tool_force) |tf| allocator.free(tf.forced);
+    if (tool_force) |*tf| sampling.tool_force = tf;
 
     // ── pre-allocate response id (used in streaming envelopes too) ──
     const resp_id = try responses_mod.makeId(stream.io, allocator, "resp");
@@ -17554,6 +17612,12 @@ fn handleResponsesInner(
         }
         // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
         // chat-completions site): MTP wins whenever loaded.
+    }
+    // One token per tick: no draft round can carry the turn past the forced opener.
+    if (tool_force != null) {
+        enable_pld_resp = false;
+        enable_drafter_resp = false;
+        enable_mtp_resp = false;
     }
 
     var result: generate_mod.GenerationResult = undefined;

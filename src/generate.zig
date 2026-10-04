@@ -111,6 +111,8 @@ pub const SpecDisableReason = enum {
     /// A thinking budget closed the thought through a plain forward; the spec
     /// state is not resynced, the answer decodes regular.
     think_bound,
+    /// A forced tool-call opener went through a plain forward (`ToolForce`).
+    tool_choice,
     /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
     adaptive,
     /// A DFlash slot gained company: it decodes plain so it can join the batched group.
@@ -867,6 +869,32 @@ pub const ThinkBound = struct {
     }
 };
 
+/// `tool_choice` that obliges a call: the family's tool-call opener is
+/// committed once the think block closes, or at once when none is open. A
+/// thought still open with a quarter of `max_tokens` left is closed for it, so
+/// the call fits. `forced` = closer, separator, opener; `opener_at` indexes the opener.
+pub const ToolForce = struct {
+    closer_id: ?u32,
+    forced: []const u32,
+    opener_at: usize,
+    in_think: bool,
+    cursor: usize = 0,
+    fired: bool = false,
+
+    pub const Due = struct { tokens: []const u32, closes_thought: bool };
+
+    /// The tokens to commit now, or null.
+    pub fn due(self: *ToolForce, ids: []const u32, completion_tokens: u32, max_tokens: u32) ?Due {
+        if (self.fired) return null;
+        while (self.in_think and self.cursor < ids.len) : (self.cursor += 1) {
+            if (ids[self.cursor] == self.closer_id) self.in_think = false;
+        }
+        if (!self.in_think) return .{ .tokens = self.forced[self.opener_at..], .closes_thought = false };
+        if (completion_tokens +| max_tokens / 4 >= max_tokens) return .{ .tokens = self.forced, .closes_thought = true };
+        return null;
+    }
+};
+
 /// Sampling parameters for token generation.
 pub const SamplingParams = struct {
     temperature: f32 = 1.0,
@@ -884,6 +912,8 @@ pub const SamplingParams = struct {
     /// In-stream thinking budget (`ThinkBound`), owned by the request handler
     /// like `constraint`; null = no bound.
     think_bound: ?*ThinkBound = null,
+    /// Forced tool-call opener (`ToolForce`), owned like `think_bound`.
+    tool_force: ?*ToolForce = null,
     /// Reserved-token suppression mask: `[vocab]` bool, true = the sampler
     /// must never draw this id (reserved specials like `<|fim_hole|>`, which
     /// a degenerate distribution can rank top-5 at a collapsed position — a
@@ -15685,6 +15715,28 @@ test "isDegenerateTailLoop catches a repeated channel-opener cycle" {
         while (k < degenerate_loop_min_span + 1) : (k += 1) try ids.append(testing.allocator, 42);
         try testing.expect(isDegenerateTailLoop(ids.items, P, R));
     }
+}
+
+test "ToolForce: the opener after the thought closes, the closer too at the deadline, never twice" {
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ CLOSE, 20, 40, 41 }; // closer, separator, opener
+    var tf = ToolForce{ .closer_id = CLOSE, .forced = &forced, .opener_at = 2, .in_think = true };
+    try testing.expect(tf.due(&[_]u32{ 6, 7 }, 2, 100) == null);
+    const after = tf.due(&[_]u32{ 6, 7, CLOSE }, 3, 100).?;
+    try testing.expectEqualSlices(u32, &[_]u32{ 40, 41 }, after.tokens);
+    try testing.expect(!after.closes_thought);
+    tf.fired = true;
+    try testing.expect(tf.due(&[_]u32{ 6, 7, CLOSE, 40 }, 4, 100) == null);
+
+    // Still thinking with a quarter of max_tokens left: close it and call.
+    var late = ToolForce{ .closer_id = CLOSE, .forced = &forced, .opener_at = 2, .in_think = true };
+    try testing.expect(late.due(&[_]u32{6}, 74, 100) == null);
+    const closing = late.due(&[_]u32{6}, 75, 100).?;
+    try testing.expectEqualSlices(u32, &forced, closing.tokens);
+    try testing.expect(closing.closes_thought);
+
+    var open = ToolForce{ .closer_id = null, .forced = forced[2..], .opener_at = 0, .in_think = false };
+    try testing.expectEqualSlices(u32, &[_]u32{ 40, 41 }, open.due(&[_]u32{}, 0, 100).?.tokens);
 }
 
 test "ThinkBound: counts only tokens inside the think block and fires at the budget" {

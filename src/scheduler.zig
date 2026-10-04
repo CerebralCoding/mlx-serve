@@ -7700,7 +7700,8 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         finishSlot(sch, slot, stop.finish_reason);
         return true;
     }
-    return thinkBoundTick(sch, slot, gen);
+    if (try thinkBoundTick(sch, slot, gen)) return true;
+    return toolForceTick(sch, slot, gen);
 }
 
 /// A thinking budget at its limit: commit the early-stop line and the closer
@@ -7715,7 +7716,32 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         log.warn("[think-bound] budget {d} reached with no room to close the thought (max_tokens {d})\n", .{ tb.budget, gen.max_tokens });
         return false;
     }
-    const r = try gen.commitForcedTokens(slot.allocator, tb.forced);
+    if (try commitForcedTick(sch, slot, gen, tb.forced, .think_bound)) {
+        log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
+    }
+    return true;
+}
+
+/// `tool_choice` that obliges a call: once the thought closes, commit the
+/// tool-call opener through the model, which writes the call from there.
+fn toolForceTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
+    const tf = gen.sampling.tool_force orelse return false;
+    const d = tf.due(gen.generated_ids.items, gen.completion_tokens, gen.max_tokens) orelse return false;
+    tf.fired = true;
+    if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, d.tokens.len + 1)) {
+        log.warn("[tool-choice] no room to force the call (max_tokens {d})\n", .{gen.max_tokens});
+        return false;
+    }
+    if (try commitForcedTick(sch, slot, gen, d.tokens, .tool_choice)) {
+        log.info("[tool-choice] call opener forced at {d} generated tokens{s}\n", .{ gen.generated_ids.items.len, if (d.closes_thought) " (thought closed for it)" else "" });
+    }
+    return true;
+}
+
+/// Commit `forced` through the model and publish it; the slot decodes regular
+/// from here. False = the pending token stopped the slot first.
+fn commitForcedTick(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []const u32, reason: generate_mod.SpecDisableReason) !bool {
+    const r = try gen.commitForcedTokens(slot.allocator, forced);
     defer slot.allocator.free(r.emitted);
     for (r.emitted) |t| {
         slot.pushToken(t);
@@ -7725,11 +7751,10 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     std.debug.assert(slot.completion_tokens == gen.completion_tokens);
     if (r.stopped) {
         finishSlot(sch, slot, gen.finish_reason);
-        return true;
+        return false;
     }
     gen.spec_disabled_runtime = true;
-    gen.spec_disable_reason = .think_bound;
-    log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
+    gen.spec_disable_reason = reason;
     return true;
 }
 
