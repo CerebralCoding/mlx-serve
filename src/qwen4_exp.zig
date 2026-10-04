@@ -523,6 +523,8 @@ pub const NgramTable = struct {
 
     fn dequantRow(self: *const NgramTable, words: []const u8, scales: []const u8, biases: []const u8, out: []f32) void {
         const mask: u32 = (@as(u32, 1) << @intCast(self.bits)) - 1;
+        // An embedded pack's global weight scale; 1.0 leaves every other table exact.
+        const ws: f32 = if (self.embedded) |source| source.scale else 1.0;
         var i: u32 = 0;
         while (i < self.dim) : (i += 1) {
             const off = i * self.bits;
@@ -534,7 +536,7 @@ pub const NgramTable = struct {
             const g = i / self.group_size;
             const sc = bf16ToF32(std.mem.readInt(u16, scales[g * 2 ..][0..2], .little));
             const bi = bf16ToF32(std.mem.readInt(u16, biases[g * 2 ..][0..2], .little));
-            out[i] = @as(f32, @floatFromInt(q)) * sc + bi;
+            out[i] = (@as(f32, @floatFromInt(q)) * sc + bi) * ws;
         }
     }
 
@@ -970,6 +972,22 @@ test "ngram table raw bf16 rows copy out converted without scales" {
     try testing.expectEqualSlices(f32, &[_]f32{ 1.0, -2.0, 2.0, 0.0 }, &out);
     t.row(1, &out);
     try testing.expectEqualSlices(f32, &[_]f32{ -1.0, 0.5, -3.0, 3.0 }, &out);
+}
+
+test "embedded PLE rows carry the pack's global weight scale" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var gathered: [2][32]f32 = undefined;
+    inline for (.{ embedded_ple.FixtureVariant.scale_unit, embedded_ple.FixtureVariant.scale_nonunit }, 0..) |variant, i| {
+        var td = std.testing.tmpDir(.{});
+        defer td.cleanup();
+        try embedded_ple.writeFixture(&td, variant);
+        var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const path_len = try td.dir.realPath(io, &path_buf);
+        var table = try NgramTable.openEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 });
+        defer table.close();
+        table.row(5, &gathered[i]);
+    }
+    for (gathered[0], gathered[1]) |unit, doubled| try std.testing.expectEqual(unit * 2, doubled);
 }
 
 test "embedded PLE rows and gathers match the merged table" {

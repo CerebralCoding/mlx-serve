@@ -114,6 +114,9 @@ pub const EmbeddedTable = struct {
     wcols: u32,
     scols: u32,
     payload_bytes: u64,
+    /// The pack's global `weight_scale`: oMLX stores the table unscaled and
+    /// multiplies every gathered row by it (1.0 when absent).
+    scale: f32 = 1.0,
 
     pub fn close(self: *EmbeddedTable) void {
         for (self.files) |f| {
@@ -277,6 +280,7 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
             if (p.file == q.file and regionsOverlap(p.off, p.off + p.len, q.off, q.off + q.len)) return error.EmbeddedPleOverlap;
         };
     };
+    var scale: f32 = 1.0;
     if (scale_file) |file_name| {
         const id = if (file_ids.get(file_name)) |existing| existing else blk: {
             const f = try openFile(a, model_dir, file_name);
@@ -295,10 +299,12 @@ pub fn openEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedTab
             if (part.file == id and regionsOverlap(region.start, region.end, part.off - file.data_off, part.off + part.len - file.data_off)) return error.EmbeddedPleOverlap;
         };
         const off = file.data_off + @as(usize, @intCast(region.start));
-        if (std.mem.readInt(u16, file.map[off..][0..2], .little) != 0x3f80) return error.EmbeddedPleWeightScale;
+        const bits: u32 = std.mem.readInt(u16, file.map[off..][0..2], .little);
+        scale = @bitCast(bits << 16);
+        if (!std.math.isFinite(scale) or scale <= 0) return error.EmbeddedPleWeightScale;
         payload = std.math.add(u64, payload, region.end - region.start) catch return error.EmbeddedPleRegion;
     }
-    return .{ .arena = arena, .files = files.items, .shards = shards, .rows = first, .dim = expected.dim, .bits = 4, .group_size = group_size, .wcols = wcols, .scols = scols, .payload_bytes = payload };
+    return .{ .arena = arena, .files = files.items, .shards = shards, .rows = first, .dim = expected.dim, .bits = 4, .group_size = group_size, .wcols = wcols, .scols = scols, .payload_bytes = payload, .scale = scale };
 }
 
 pub fn inspectEmbedded(model_dir: []const u8, expected: EmbeddedSpec) !?EmbeddedInfo {
@@ -405,7 +411,7 @@ test "embedded PLE rejects partial and corrupt shard layouts" {
     }
 }
 
-test "embedded PLE validates optional global weight scale" {
+test "embedded PLE reads the optional global weight scale and validates its tensor" {
     const spec: EmbeddedSpec = .{ .rows = 6, .dim = 32, .shards = 3 };
     inline for (.{ .valid, .scale_unit, .scale_scalar, .scale_nonunit, .scale_dtype, .scale_shape, .scale_overlap }) |variant| {
         var td = std.testing.tmpDir(.{});
@@ -415,12 +421,14 @@ test "embedded PLE validates optional global weight scale" {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
         const path_len = try td.dir.realPath(io, &path_buf);
         const path = path_buf[0..path_len];
-        if (variant == .valid or variant == .scale_unit or variant == .scale_scalar) {
+        if (variant == .valid or variant == .scale_unit or variant == .scale_scalar or variant == .scale_nonunit) {
             const info = (try inspectEmbedded(path, spec)).?;
             try std.testing.expectEqual(@as(u64, if (variant == .valid) 120 else 122), info.payload_bytes);
+            var table = (try openEmbedded(path, spec)).?;
+            defer table.close();
+            try std.testing.expectEqual(@as(f32, if (variant == .scale_nonunit) 2.0 else 1.0), table.scale);
         } else {
             try std.testing.expectError(switch (variant) {
-                .scale_nonunit => error.EmbeddedPleWeightScale,
                 .scale_dtype => error.EmbeddedPleDtype,
                 .scale_shape => error.EmbeddedPleRegion,
                 .scale_overlap => error.EmbeddedPleOverlap,
