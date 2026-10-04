@@ -643,7 +643,7 @@ fn renderChatTemplate(
             effective_tools_json = filled;
         }
     }
-    if (needs_inject_tools or needs_rewrite_tool_role) {
+    if (needs_inject_tools or needs_rewrite_tool_role or tool_choice_instruction != null) {
         // NEVER re-init: the tool-def fill above may already own this arena,
         // and clobbering it orphans everything allocated there (a leak here, a
         // use-after-free the moment `effective_tools_json` points into it).
@@ -875,6 +875,9 @@ fn synthesizeToolFallbackMessages(
         var buf = std.ArrayList(u8).empty;
         try appendToolSystemPrompt(arena, &buf, tools_json.?, tool_choice_instruction);
         tool_prompt = try buf.toOwnedSlice(arena);
+    } else if (tool_choice_instruction) |instr| {
+        // The template renders the tools itself; only the choice is ours to add.
+        tool_prompt = std.mem.trim(u8, instr, "\n");
     }
 
     var injected = false;
@@ -7148,6 +7151,44 @@ pub fn appendJsonString(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), s
     try buf.append(allocator, '"');
 }
 
+/// `tool_choice` that obliges a call: any declared tool, or the named one.
+pub const ForcedTool = union(enum) { any, name: []const u8 };
+
+/// The prompt line for a forced choice; the caller frees it.
+pub fn toolChoiceInstruction(allocator: std.mem.Allocator, forced: ForcedTool) ![]u8 {
+    return switch (forced) {
+        .any => allocator.dupe(u8, "\nYou MUST call one of the available functions. Do not respond with text."),
+        .name => |n| std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{n}),
+    };
+}
+
+/// Whether a request's `tools` array declares `name`, as `function.name`
+/// (chat completions) or a top-level `name` (Anthropic, Responses).
+pub fn toolsDeclare(tools: ?std.json.Value, name: []const u8) bool {
+    const arr = tools orelse return false;
+    if (arr != .array) return false;
+    for (arr.array.items) |t| {
+        if (t != .object) continue;
+        const holder = if (t.object.get("function")) |f| f else t;
+        if (holder != .object) continue;
+        const n = holder.object.get("name") orelse continue;
+        if (n == .string and std.mem.eql(u8, n.string, name)) return true;
+    }
+    return false;
+}
+
+/// The assistant text that commits a tool call in the template's own dialect,
+/// or null for a dialect we cannot spell (the instruction line alone asks then).
+pub fn forcedToolOpener(allocator: std.mem.Allocator, template: []const u8, forced: ForcedTool) !?[]u8 {
+    // The pair, escaped or literal: Llama 3.1 spells a different `<function=` dialect.
+    if (std.mem.indexOf(u8, template, "<tool_call>\\n<function=") == null and
+        std.mem.indexOf(u8, template, "<tool_call>\n<function=") == null) return null;
+    return switch (forced) {
+        .any => try allocator.dupe(u8, "<tool_call>\n<function="),
+        .name => |n| try std.fmt.allocPrint(allocator, "<tool_call>\n<function={s}>\n", .{n}),
+    };
+}
+
 /// Append tool definitions as a system prompt section.
 fn appendToolSystemPrompt(allocator: std.mem.Allocator, result_buf: *std.ArrayList(u8), tools_json: []const u8, tool_choice_instruction: ?[]const u8) !void {
     try result_buf.appendSlice(allocator,
@@ -10054,6 +10095,71 @@ test "renderChatTemplate: REAL Qwen3.8 chat_template.jinja renders without fallb
         try testing.expect(std.mem.endsWith(u8, rendered, "</think>"));
         try testing.expect(!promptTailOpensThink(rendered));
     }
+}
+
+test "renderChatTemplate: tool_choice reaches a tool-aware template's prompt" {
+    const allocator = testing.allocator;
+    var config = ChatConfig{
+        .chat_template = @embedFile("fixtures/qwen38_chat_template.jinja"),
+        .bos_token = null,
+        .eos_token = "<|im_end|>",
+        .add_bos_token = false,
+        .allocator = allocator,
+    };
+    const tools_json =
+        \\[{"type":"function","function":{"name":"calculator","description":"Math","parameters":{"type":"object","properties":{"expression":{"type":"string"}},"required":["expression"]}}}]
+    ;
+    const instr = "\nYou MUST call one of the available functions. Do not respond with text.";
+    const bare = [_]Message{.{ .role = "user", .content = "What is 7 times 8?" }};
+    const with_system = [_]Message{
+        .{ .role = "system", .content = "You are helpful." },
+        .{ .role = "user", .content = "What is 7 times 8?" },
+    };
+    for ([_][]const Message{ &bare, &with_system }) |msgs| {
+        const rendered = try renderChatTemplate(allocator, msgs, &config, tools_json, instr, true, null, false);
+        defer allocator.free(rendered);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You have access to the following functions:") != null);
+        try testing.expect(std.mem.indexOf(u8, rendered, "You MUST call one of the available functions.") != null);
+        try testing.expectEqual(@as(usize, 1), std.mem.count(u8, rendered, "<|im_start|>system"));
+    }
+}
+
+test "toolChoiceInstruction: one line per forced choice" {
+    const allocator = testing.allocator;
+    const any = try toolChoiceInstruction(allocator, .any);
+    defer allocator.free(any);
+    try testing.expectEqualStrings("\nYou MUST call one of the available functions. Do not respond with text.", any);
+    const named = try toolChoiceInstruction(allocator, .{ .name = "calculator" });
+    defer allocator.free(named);
+    try testing.expectEqualStrings("\nYou MUST call the function \"calculator\". Do not respond with text.", named);
+}
+
+test "toolsDeclare: a name in the OpenAI, Anthropic or Responses tool shape" {
+    const body =
+        \\{"chat":[{"type":"function","function":{"name":"calculator"}}],"flat":[{"name":"probe_ping"}]}
+    ;
+    var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, body, .{});
+    defer parsed.deinit();
+    const chat = parsed.value.object.get("chat");
+    const flat = parsed.value.object.get("flat");
+    try testing.expect(toolsDeclare(chat, "calculator"));
+    try testing.expect(!toolsDeclare(chat, "bogus"));
+    try testing.expect(toolsDeclare(flat, "probe_ping"));
+    try testing.expect(!toolsDeclare(null, "calculator"));
+}
+
+test "forcedToolOpener: the XML dialect commits a call in the template's own spelling" {
+    const allocator = testing.allocator;
+    const qwen = @embedFile("fixtures/qwen38_chat_template.jinja");
+    const any = (try forcedToolOpener(allocator, qwen, .any)).?;
+    defer allocator.free(any);
+    try testing.expectEqualStrings("<tool_call>\n<function=", any);
+    const named = (try forcedToolOpener(allocator, qwen, .{ .name = "calculator" })).?;
+    defer allocator.free(named);
+    try testing.expectEqualStrings("<tool_call>\n<function=calculator>\n", named);
+    try testing.expect(try forcedToolOpener(allocator, "<function=example>{}</function>", .any) == null);
+    // A dialect we cannot spell keeps the instruction line only.
+    try testing.expect(try forcedToolOpener(allocator, @embedFile("fixtures/glm5_next_chat_template.jinja"), .any) == null);
 }
 
 test "renderChatTemplate: Qwen3.8-27B ACCEPTS thinking-off natively (hermetic)" {

@@ -41,8 +41,8 @@ const supported_model_types = [_][]const u8{
     "qwen3_5_text",     "qwen3_5_moe",
     "qwen3_5_moe_text", "qwen3_moe",
     "qwen3_moe_text",   "qwen3_next",
-    "qwen4_exp",        "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
-    "llama",            "mistral",
+    "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
+    "llama",     "mistral",
     "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
     "nemotron_h",
     "bert",
@@ -59,6 +59,7 @@ const supported_model_types = [_][]const u8{
     "spark2_5", // XHToken Spark-X2.5 (dense sliding/full GQA, per-head attn gate)
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
+    "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA inside mHC)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -2048,6 +2049,13 @@ test "isSupportedModelType accepts native media archs (image/audio/video)" {
     try testing.expect(isMediaModelType("acestep"));
     try testing.expect(isSupportedModelType("acestep"));
     try testing.expect(!isMediaModelType("gemma4"));
+}
+
+test "isSupportedModelType accepts every served arch spelling (glm5_next)" {
+    // A served arch missing here is invisible to the picker, and a chat naming
+    // its path is answered 404 instead of cold-loading it.
+    try testing.expect(isSupportedModelType("glm5_next"));
+    try testing.expect(isSupportedModelType("glm5_next_text"));
 }
 
 test "isSupportedModelType accepts gemma3_text (text-only Gemma3ForCausalLM)" {

@@ -5490,3 +5490,67 @@ Guard: `glm5 an output tied to a cache update evaluates the update with it`. Tel
 ## GLM-5.3's long-prompt output moved with the prefill chunk width, and it was not a bug
 
 Defect suspected: on a cold 9.5k-token prompt, token 0's top-2 swapped and one token moved 4+ nats between prefill widths (single pass, 8192, 4096, 2048), and the prefix cache's 30-token tail split flipped the greedy answer against cache-off; Qwen3.6-35B-A3B moved at most 0.25 nats on the same sweep. Cause: rounding order, not carried state. Swapping the KDA recurrence for an equivalent kernel in ONE pass moved the token as far as chunking did (1.16 vs 1.35 nats with the indexer forced dense), a confident next token agreed at every width (-0.06), the per-core KDA kernel matches f64 from a nonzero state with a partial tail block, and the tiny fixture's chunked prefill matches the reference past its indexer budget. DSA's top-k pool choice is discontinuous, so small differences pick other pools. Bar for "chunking bug": a width swing larger than a same-math kernel swap at one pass, or a confident token that moves.
+
+## Flash Next serial decode is GPU-bound at 11 ms, and three dispatch-count fusions were nulls (2026-10-03)
+
+Setup: M5 Ultra, iQ-MLX-4.7bpw pack, `MLX_SERVE_DECODE_FWD_UBENCH=30`, same-boot arms interleaved. The forward reads 5.9 GB per token; the machine's qmv peak is ~1.1 TB/s (lm_head), so the bytes floor is 5.4 ms against 11.0 ms measured.
+
+What was measured first, so the rest is not guessed:
+- The eval is two host phases. With one command buffer per forward (`MLX_MAX_OPS_PER_BUFFER`/`MLX_MAX_MB_PER_BUFFER` huge) the host encode is 3.8 ms and the GPU wait 11.0 ms; the default mode's 9.6 ms "encode" is the encoder throttled on `MAX_ACTIVE_TASKS` (10 open buffers), i.e. GPU pacing. `fwd-ubench` now prints `[encode + wait]`.
+- `MLX_SERVE_DISPATCH_PROBE` 0/4/8: 11.07 / 11.61 / 12.13 ms GPU, ~2.8 us per CHAINED op on this forward. The decode graph dump has 2056 nodes, ~1180 of them kernels (579 custom, 315 qmm), 22 per GDN+MoE layer.
+- `MLX_SERVE_STEP_TRACE=1` on a serial step: build 1.25, PLE flush 0.3-0.5, submit 9.3 (throttled encode), resolve 0.001 ms. The flush is the only GPU idle per token.
+- hc read kernels by stand-in (`MLX_SERVE_HC_DIAG_SKIP=d|u`): U 0.9 ms, D 0.63 ms, all reads 1.95 ms against a 0.6 ms byte floor. The `n` stand-in drops the deferred write, MLX prunes every layer and the forward reads 1.6 ms: not a measurement.
+
+Three nulls, all reverted:
+1. The gated shared expert on the decode gather kernels (a one-expert bank through `gatherQmvGateUp` + a down+reduce variant with the sigmoid gate in-kernel): 8 chained dispatches became 2 and the forward got SLOWER, 11.00 -> 11.22 ms; each kernel alone was slower than the MLX qmv + elementwise it replaced (+0.15 / +0.09 ms). A single-expert GEMV on those kernels is 80 threadgroups each walking 20 serial load iterations: latency-bound. Dense GEMVs belong to MLX's qmv.
+2. Only the tail (sigmoid, multiply, add) folded into the down+reduce epilogue, bit-identical: 11.04 vs 11.02 ms, a wash. Those elementwise dispatches were already free, so the probe's per-op price does not transfer to ops MLX overlaps.
+3. The `uv` up/mix kernel at one row: 11.22/11.24/11.21 vs 11.26/10.98, inside between-boot noise.
+
+Rule: on this forward the MoE block is kernel-time bound; removing small dispatches buys nothing and a replacement kernel must beat MLX's qmv on its own. The levers left are the kernels themselves (hc U and D), the per-step host sync (next story) and bytes.
+
+## The one GPU idle per serial token was the n-gram history settle, and an async batch has ONE event (2026-10-03)
+
+`MLX_SERVE_STEP_TRACE=1` on the GPU PLE arm: build 1.3, flush 0.3, submit 9.3 ms per step; the flush is `flushDeferredPle` reading the step's own token so `pleAdvanceSerial` can move the history, and the GPU idles for that round trip plus the encode lead. The history is only read by the NEXT forward, a batch join, the spec drain and the cache commit at slot finish, so the GPU arm now leaves the record pending and those four sites settle it (`pleEmbedding`, `drainPipelineForBatch`, `drainPipelineForSpec`, `finishSlot`; `Generator.deinit` discards). `MLX_SERVE_PLE_LAZY_SETTLE=0` restores the eager settle.
+
+Two attempts lost 8% before it won: settling at the next build still cost 1.2 ms. MLX gives every array evaluated in one `async_eval` that batch's END event, so waiting on the sampled token (sampled inside the forward's batch) waited for the whole forward. `lazyForward` now `async_eval`s the reshaped token alone before building on it; the deferred settle then waits on the sampler. Reading the id straight off the evaluated array (no cast/contiguous ops, which would queue behind the running forward) is the other half.
+
+Measured (M5 Ultra, iQ-MLX-4.7bpw, `--ple-gpu`, 2+2 interleaved boots): short 90.3/91.8 vs 89.4/88.9 tok/s, 8k 83.3/83.9 vs 81.3/82.2, flush 0.000 ms, greedy text byte-identical to the eager and CPU arms. The CPU arm keeps its per-step gather (it needs the token).
+
+## Per-kernel profile of the Flash Next step: the big GEMVs are at the floor, the small ones are launch-bound (2026-10-04)
+
+Metal System Trace via `xcrun xctrace record --attach`, with the Shader Timeline enabled by a patched template (the CLI refuses the option; recipe and tables in the session scratchpad `prof/`). One serial step on the M5 Ultra, iQ-MLX-4.7bpw, `--ple-gpu`: 996 named kernels, 9.99 ms. MLX's `affine_qmv_fast` is 44% of it and the large projections run AT the machine's bandwidth (GDN in-proj 42 MB in 38.6 us, lm_head 636 MB in 594 us, out-proj 870 GB/s). The waste sits in ~150 SMALL dense GEMVs per step (router 512 rows, shared-expert gate/up 640 rows) at 6.8 us each and the shared-expert down on the generic `qmv` (K=640 misses the fast kernel's 256-wide block) at 13.5 us: 1.65 ms against a ~0.3 ms byte floor.
+
+Two kernels built against that, both nulls or losses, both reverted:
+- A register-resident top-k for the fused router (`moeRouterSource`: the lane's 16 keys stay in registers across the K max-then-mask rounds, no threadgroup traffic or barriers): 10.45/10.48 vs 10.67/10.54/10.72 ms GPU, about -0.18 ms. KEPT; parity tests bit-identical.
+- A split-K small-GEMV (`msv_qmv_small`: a threadgroup per 2-4 rows, 5-8 simdgroups splitting K on group boundaries, 320 threadgroups for a 640-row weight; then a second version with every load hoisted under a compile-time trip count): +0.1 to +0.2 ms GPU over stock in 3+3 interleaved boots, both versions, with the fp32-truth parity green. A custom `metal_kernel` dispatch costs more than MLX's built-in `qmv` at these shapes however the work is laid out; the small GEMVs are launch-latency bound, not parallelism bound.
+
+Rule: on this step the per-dispatch fixed cost (~1000 dispatches) is the structural overhead above the 5.4 ms byte floor; a kernel that replaces one dispatch with one dispatch cannot win there, only a kernel that replaces several and is no slower itself.
+
+Addendum, same night: bigger command buffers lose. `MLX_MAX_OPS_PER_BUFFER=200` with the MB cap lifted (about 17 buffers per step instead of ~100) read 10.82 vs 10.45 ms GPU in 3+3 boots: the encoder stops being throttled (3.8 ms) but the GPU starts later and the overlap at the step's head and tail goes. The ~5 us between kicks is not recoverable by packing.
+
+## The routed-expert kernels were kernel-time bound, and the fp4 shape fixes them (2026-10-04)
+
+The kernel microbench (`src/moe_gather_ubench.zig`, `MOE_UBENCH=1`) put the shipped per-slot gather kernels at 26 us for gate+up (~700 GB/s) and 26 us for down+reduce (~340 GB/s, latency-bound at K=640: 320 bytes of weights per row), within a few us of the in-situ profile, so the cost was real kernel work. `moe_affine4.zig` ports `moe_fp4`'s shape to 4-bit affine with biases: a simdgroup owns `ROWS` output rows (four here, one now: see the occupancy story below) and keeps its 16 values of x in registers across them, 8-byte loads, no threadgroup memory, the down kernel accumulates every expert of the token in registers with the score folded in, the bias rides a per-group sum of x, and a K that is not a whole 512 block (640) is predicated per lane. One token only (a row re-reads its own experts). Same-boot A/B, 3+3 boots: 10.17/10.19/10.29 vs 10.51/10.40/10.42 ms GPU, about -0.22 ms; bar `moe affine-4 decode: no worse than the per-slot gather kernels against the f32 truth`. `MLX_SERVE_MOE_AFFINE4=0` restores the per-slot kernels.
+
+## Long-context decode: the attention layer is a chain, and one-token QSA attention shortens it (2026-10-04)
+
+Past the indexer budget (2051 tokens) a serial Flash Next step costs ~1 ms more: per attention layer indexer prep, `msv_qsa_score` (20 us), `msv_qsa_select` (8), a ~35 us mask or gather op chain, two-pass SDPA (20 + 9) and the gate multiply, one dependent launch after another.
+
+What the profile taught, so it is not re-measured:
+- MLX gives a concurrent encoder a GLOBAL barrier before any kernel that reads an outstanding write, so two branches overlap for one stage only. The 34 us q projection ran before the indexer chain; ordering it behind the indexer with `mlx_depends` made the layer 8 us worse (the tape still put it before the score).
+- `msv_qsa_score` costs 13-16 us at 2k AND 10k blocks, so it is latency, not bytes (most likely its eight dependent matrix-op runs). No scalar order reproduces it: seven candidate accumulation orders (sequential FMA, 16-deep chunks, trees, an exactly rounded f64 sum) each differ from the matrix unit in ~30% of scores, and decode, verify and prefill must pick the same blocks, so the score stays on that kernel.
+- Kept: one kernel writes the row's key mask (+0.7% at 8k), then `qsa_decode.zig` (split pass + merge straight over the picks, no mask, gather or SDPA): 8k 99.3 -> 103.1, 21k 97.6 -> 102.5, 40k 96.8 -> 101.1 tok/s, `MLX_SERVE_QSA_DEC_KERNEL=0` restores. Dense KV, solo rows only (`solo` in `qsaMaskFromQk`; batched slots and verify widths keep their arms).
+- Four q heads per simdgroup cost 28 us (registers), one per simdgroup 21 us. An eight-key butterfly leaves key `lane >> 2` on four lanes; a reduction inside divergent code (`key ? reduce(...) : -inf`) returns garbage for the tail keys, so reduce first and select after.
+
+Guard: `qsa decode: the one-token kernel is no worse than the masked SDPA against the f64 truth` (six contexts, 0 and 3 tail keys) and `qsa mask: the one-row kernel equals the op chain`.
+
+## Rows per simdgroup is an occupancy decision: the affine-4 MoE kernels at one row (2026-10-04)
+
+Both `moe_affine4` kernels shared four output rows a simdgroup (x registers amortized over four dots). The down kernel alone read 17.7 us for 9.2 MB (520 GB/s), so it looked latency-bound, and three plausible fixes lost or tied:
+- Ablating inside the kernel priced it: no activation loads -0.06 ms/token, no scale/bias loads -0.07, no WEIGHT loads at all -0.32 of the kernel's 0.85. The rest is issue and occupancy, not bytes.
+- Hoisting the expert ids and unrolling the expert loop: a tie. Double-buffering the next expert's weights in registers plus the mask-instead-of-shift nibble dot: 6% SLOWER (104.2 vs 110.7 tok/s) with identical text, most likely the register file again. Splitting a row's ten experts over 2, 5 or 10 simdgroups with a threadgroup sum: +0.5% at best.
+- What won was a constant: rows per simdgroup 4 -> 1 on both kernels, 110.5 -> 114.8 tok/s (8k: 103.1 -> 107.0; 2 rows ~113.8, 8 rows 101.8; threadgroup width 1-8 simdgroups did not matter; down alone +1.6, gate+up +2.5). The same lesson as `qsa_decode` (one head a simdgroup).
+
+Rule: before porting or deepening a multi-row decode kernel, sweep rows per simdgroup in situ (a short-context serial run per value, one boot each). A sweep script must word-split its configs explicitly: zsh does not split `$cfg`, and a bad knob made the kernels decline silently to the slow arm, so a first sweep measured nothing.
+
+What is left in the hyper-connection reads is not a single-kernel job: one read is 6.6 MB (down 3.3 + up 3.3), floor ~6 us, now 12.4 us in two launches; the up launch is itself a 3.3 MB GEMV, so folding it into the down launch needs a grid-wide handoff for little.

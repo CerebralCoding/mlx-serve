@@ -883,3 +883,12 @@ GLM-5.3-Flash's template renders tool-call history through `tc.arguments.items()
 
 Fix: `parser.cpp` marks a member access whose property is an integer literal as computed, so `x.0` indexes like `x[0]`.
 Guard: the GLM tool-history render test in `chat.zig` (native `<tool_call>` turns, no fallback markers) and `tests/test_glm5_next.sh` [4].
+
+## `tool_choice: "required"` was a request, not a constraint (2026-10-04)
+
+tool-eval-bench TC-45 sent `tool_choice: "required"` with "What is 7 times 8?" to Qwen3.8 Flash Next and got text. Its probe ("Reply with the single word OK. Do not call any tools.") then showed why a fix in the prompt is not enough: with the instruction line delivered, the model obeyed the user and the bench excluded the scenario as unenforced.
+
+Cause: all three surfaces turned `tool_choice` into an instruction line, which `renderChatTemplate` passed only to the paths that inline our own tool prompt; a template that renders the tools itself dropped it. Even delivered, a line is advice.
+
+Fix: the line reaches every template (`synthesizeToolFallbackMessages`), and the call is forced at decode: `armToolForce` arms a `ToolForce` whose opener (`chat.forcedToolOpener`, `<tool_call>\n<function=` plus the name for a named choice) `toolForceTick` commits once the think block closes. A thought still open with a quarter of `max_tokens` left is closed for the call (at `xhigh` the probe's 256 tokens were all thought). The request decodes plain so no draft round passes the closer. Dialects without a known opener keep the line only.
+Guard: `tests/test_tool_choice_required.sh` (red with the enforcement or the deadline stubbed), `ToolForce` + `forcedToolOpener` unit tests.

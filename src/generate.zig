@@ -111,6 +111,8 @@ pub const SpecDisableReason = enum {
     /// A thinking budget closed the thought through a plain forward; the spec
     /// state is not resynced, the answer decodes regular.
     think_bound,
+    /// A forced tool-call opener went through a plain forward (`ToolForce`).
+    tool_choice,
     /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
     adaptive,
     /// A DFlash slot gained company: it decodes plain so it can join the batched group.
@@ -867,6 +869,32 @@ pub const ThinkBound = struct {
     }
 };
 
+/// `tool_choice` that obliges a call: the family's tool-call opener is
+/// committed once the think block closes, or at once when none is open. A
+/// thought still open with a quarter of `max_tokens` left is closed for it, so
+/// the call fits. `forced` = closer, separator, opener; `opener_at` indexes the opener.
+pub const ToolForce = struct {
+    closer_id: ?u32,
+    forced: []const u32,
+    opener_at: usize,
+    in_think: bool,
+    cursor: usize = 0,
+    fired: bool = false,
+
+    pub const Due = struct { tokens: []const u32, closes_thought: bool };
+
+    /// The tokens to commit now, or null.
+    pub fn due(self: *ToolForce, ids: []const u32, completion_tokens: u32, max_tokens: u32) ?Due {
+        if (self.fired) return null;
+        while (self.in_think and self.cursor < ids.len) : (self.cursor += 1) {
+            if (ids[self.cursor] == self.closer_id) self.in_think = false;
+        }
+        if (!self.in_think) return .{ .tokens = self.forced[self.opener_at..], .closes_thought = false };
+        if (completion_tokens +| max_tokens / 4 >= max_tokens) return .{ .tokens = self.forced, .closes_thought = true };
+        return null;
+    }
+};
+
 /// Sampling parameters for token generation.
 pub const SamplingParams = struct {
     temperature: f32 = 1.0,
@@ -884,6 +912,8 @@ pub const SamplingParams = struct {
     /// In-stream thinking budget (`ThinkBound`), owned by the request handler
     /// like `constraint`; null = no bound.
     think_bound: ?*ThinkBound = null,
+    /// Forced tool-call opener (`ToolForce`), owned like `think_bound`.
+    tool_force: ?*ToolForce = null,
     /// Reserved-token suppression mask: `[vocab]` bool, true = the sampler
     /// must never draw this id (reserved specials like `<|fim_hole|>`, which
     /// a degenerate distribution can rank top-5 at a collapsed position — a
@@ -2026,6 +2056,7 @@ pub const Generator = struct {
     }
 
     pub fn logSpecStats(self: *const Generator) void {
+        StepTrace.report();
         var table_buf: [256]u8 = undefined;
         var hist_buf: [256]u8 = undefined;
         var lookup_buf: [256]u8 = undefined;
@@ -3695,6 +3726,8 @@ pub const Generator = struct {
     }
 
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
+        // A GPU-arm PLE settle still owed dies with the slot's history (the finish settled it first when the cache kept it).
+        self.xfm.discardDeferredPle(&self.ctx);
         if (group_planner.enabled() and self.mtp_planner_owned) log.info("[mtp-planner-stats] tokens={d} plain={d} prime={d} spec={d} probes={d} max_gap_ms={d:.2} recovery={d}\n", .{ self.completion_tokens, self.mtp_planner_plain_ticks, self.mtp_planner_prime_ticks, self.mtp_planner_spec_rounds, self.mtp_planner_probes, self.mtp_planner_max_gap_ms, self.mtp_planner_recovery.rounds });
         if (self.last_logprob) |*lp| {
             allocator.free(lp.top_logprobs);
@@ -3803,6 +3836,8 @@ pub const Generator = struct {
     /// `next_token_id` is sampled but NOT in the cache and pending state is
     /// empty — exactly the batched-tick entry invariant.
     pub fn drainPipelineForBatch(self: *Generator, allocator: std.mem.Allocator) !?u32 {
+        // The batched tick hashes against this slot's history: settle the pipelined step's owed advance first.
+        try self.xfm.flushDeferredPle(&self.ctx);
         try self.resolvePendingToken();
         if (try self.checkStop()) {
             if (self.has_pending_logits) {
@@ -3878,6 +3913,8 @@ pub const Generator = struct {
     /// `pending_logits` WITHOUT forwarding lands exactly on the invariant.
     /// One sync. Also handles the shim-seeded state (`pending_logits` only).
     fn drainPipelineForSpec(self: *Generator, allocator: std.mem.Allocator) !DrainResult {
+        // The spec rounds roll the n-gram history back and forth: settle the pipelined step's owed advance first.
+        try self.xfm.flushDeferredPle(&self.ctx);
         if (!self.has_pending_logits) {
             if (!self.has_pending_token) return .already_clean;
             // pending_token without pending_logits never occurs in the
@@ -11732,14 +11769,18 @@ pub const Generator = struct {
                 defer if (!adopted) {
                     _ = mlx.mlx_array_free(next_logits);
                 };
+                var sw = StepTrace.watch();
                 const arr = [_]mlx.mlx_array{ lazy_token, next_logits };
                 const vec = mlx.mlx_vector_array_new_data(&arr, 2);
                 _ = mlx.mlx_async_eval(vec);
                 _ = mlx.mlx_vector_array_free(vec);
+                StepTrace.lap(&sw, .submit);
 
                 // NOW resolve the pending token — GPU already computed it as a
                 // dependency of the graph we just submitted. Should be instant.
                 try self.resolvePendingToken();
+                StepTrace.lap(&sw, .resolve);
+                if (sw != null) StepTrace.steps += 1;
 
                 // Check stop conditions on the resolved token
                 if (try self.checkStop()) return null;
@@ -12271,6 +12312,45 @@ pub const Generator = struct {
     }
 };
 
+/// Diagnostic (`MLX_SERVE_STEP_TRACE=1`): host time of a pipelined serial step, per phase,
+/// summed across the request and reported with the spec stats.
+const StepTrace = struct {
+    const Phase = enum { build, flush, submit, resolve };
+    var on: ?bool = null;
+    var steps: u64 = 0;
+    var ns: [4]u64 = .{ 0, 0, 0, 0 };
+
+    fn enabled() bool {
+        if (on) |v| return v;
+        const raw = std.c.getenv("MLX_SERVE_STEP_TRACE");
+        const v = raw != null and raw.?[0] != '0';
+        on = v;
+        return v;
+    }
+    fn watch() ?io_util.Stopwatch {
+        return if (enabled()) io_util.Stopwatch.init(std.Io.Threaded.global_single_threaded.io()) else null;
+    }
+    fn lap(sw: *?io_util.Stopwatch, phase: Phase) void {
+        if (sw.*) |*w| {
+            ns[@intFromEnum(phase)] += w.read();
+            w.reset();
+        }
+    }
+    fn report() void {
+        if (!enabled() or steps == 0) return;
+        const n: f64 = @floatFromInt(steps);
+        log.info("  [step-trace] steps={d} build={d:.3} flush={d:.3} submit={d:.3} resolve={d:.3} ms/step\n", .{
+            steps,
+            @as(f64, @floatFromInt(ns[0])) / n / 1e6,
+            @as(f64, @floatFromInt(ns[1])) / n / 1e6,
+            @as(f64, @floatFromInt(ns[2])) / n / 1e6,
+            @as(f64, @floatFromInt(ns[3])) / n / 1e6,
+        });
+        steps = 0;
+        ns = .{ 0, 0, 0, 0 };
+    }
+};
+
 /// Build forward pass from a lazy sampled token array.
 /// Reshapes [1] -> [1, 1] and calls transformer forward. All lazy (no eval).
 fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !mlx.mlx_array {
@@ -12278,21 +12358,46 @@ fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_array) !
     var reshaped = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(reshaped);
     try mlx.check(mlx.mlx_reshape(&reshaped, lazy_token, &tok_shape, 2, xfm.s));
+    // Every array of an async batch carries that batch's END event, so the GPU PLE arm sends
+    // the sampled token out as its own batch: its deferred history settle then waits on the
+    // sampler, not on the forward built on it.
+    if (xfm.qwen4 != null and !pleLazySettleOff()) {
+        const tv = mlx.mlx_vector_array_new_value(reshaped);
+        defer _ = mlx.mlx_vector_array_free(tv);
+        try mlx.check(mlx.mlx_async_eval(tv));
+    }
     // The graph is built while the previous step still runs on the GPU; an
     // arch with a host-side token lookup (qwen4 n-gram PLE) fills its leaf
     // afterwards, so the one sync on the token comes AFTER the build.
     ctx.ple_defer = true;
     defer ctx.ple_defer = false;
+    var sw = StepTrace.watch();
     const logits = xfm.forwardWith(ctx, reshaped) catch |e| {
         xfm.discardDeferredPle(ctx);
         return e;
     };
-    xfm.flushDeferredPle(ctx) catch |e| {
+    StepTrace.lap(&sw, .build);
+    // The GPU arm owes only the host history, and its ids are the token this very forward
+    // waits on; settling now would idle the GPU for the round trip. The next PLE embedding
+    // (or the slot's drain / finish) settles it, when those ids are long evaluated.
+    const settle_now = !Transformer.deferredPleOnGpu(ctx) or pleLazySettleOff();
+    if (settle_now) xfm.flushDeferredPle(ctx) catch |e| {
         xfm.discardDeferredPle(ctx);
         _ = mlx.mlx_array_free(logits);
         return e;
     };
+    StepTrace.lap(&sw, .flush);
     return logits;
+}
+
+var ple_lazy_settle_env: ?bool = null;
+/// `MLX_SERVE_PLE_LAZY_SETTLE=0` restores the per-step host settle on the GPU PLE arm.
+fn pleLazySettleOff() bool {
+    if (ple_lazy_settle_env) |v| return v;
+    const raw = std.c.getenv("MLX_SERVE_PLE_LAZY_SETTLE");
+    const off = raw != null and raw.?[0] == '0';
+    ple_lazy_settle_env = off;
+    return off;
 }
 
 /// Sample a token lazily from logits — returns a lazy MLX array (no eval).
@@ -15610,6 +15715,28 @@ test "isDegenerateTailLoop catches a repeated channel-opener cycle" {
         while (k < degenerate_loop_min_span + 1) : (k += 1) try ids.append(testing.allocator, 42);
         try testing.expect(isDegenerateTailLoop(ids.items, P, R));
     }
+}
+
+test "ToolForce: the opener after the thought closes, the closer too at the deadline, never twice" {
+    const CLOSE: u32 = 11;
+    const forced = [_]u32{ CLOSE, 20, 40, 41 }; // closer, separator, opener
+    var tf = ToolForce{ .closer_id = CLOSE, .forced = &forced, .opener_at = 2, .in_think = true };
+    try testing.expect(tf.due(&[_]u32{ 6, 7 }, 2, 100) == null);
+    const after = tf.due(&[_]u32{ 6, 7, CLOSE }, 3, 100).?;
+    try testing.expectEqualSlices(u32, &[_]u32{ 40, 41 }, after.tokens);
+    try testing.expect(!after.closes_thought);
+    tf.fired = true;
+    try testing.expect(tf.due(&[_]u32{ 6, 7, CLOSE, 40 }, 4, 100) == null);
+
+    // Still thinking with a quarter of max_tokens left: close it and call.
+    var late = ToolForce{ .closer_id = CLOSE, .forced = &forced, .opener_at = 2, .in_think = true };
+    try testing.expect(late.due(&[_]u32{6}, 74, 100) == null);
+    const closing = late.due(&[_]u32{6}, 75, 100).?;
+    try testing.expectEqualSlices(u32, &forced, closing.tokens);
+    try testing.expect(closing.closes_thought);
+
+    var open = ToolForce{ .closer_id = null, .forced = forced[2..], .opener_at = 0, .in_think = false };
+    try testing.expectEqualSlices(u32, &[_]u32{ 40, 41 }, open.due(&[_]u32{}, 0, 100).?.tokens);
 }
 
 test "ThinkBound: counts only tokens inside the think block and fires at the budget" {
