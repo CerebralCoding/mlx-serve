@@ -249,7 +249,8 @@ fn printUsage(io: std.Io) void {
         \\                        verify-width cliff; MLX_SERVE_MTP_ADAPTIVE=0
         \\                        reverts to the fixed windowed controller,
         \\                        cap 3). A --mtp-min-depth above that default
-        \\                        lifts it. Each machine finds its own range.
+        \\                        lifts it. --mtp-depth is the old spelling.
+        \\                        Each machine finds its own range.
         \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
         \\                        Use 0.2 for the Qwen3.8 matched comparison.
         \\  --mtp-tokenv3 <a>  Opt-in lossy TokenV3 cascade (0 <= a <= 1).
@@ -796,14 +797,13 @@ pub fn main(init: std.process.Init) !void {
             transformer_mod.decode_attn_quant_flag = true;
         } else if (std.mem.eql(u8, args[i], "--no-decode-attn-quant")) {
             transformer_mod.decode_attn_quant_flag = false;
-        } else if (std.mem.eql(u8, args[i], "--mtp-depth")) {
-            log.err("{s}\n", .{depth_bounds.removed_flag_message});
-            std.process.exit(1);
-        } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth")) {
+        } else if (std.mem.eql(u8, args[i], "--mtp-min-depth") or std.mem.eql(u8, args[i], "--mtp-max-depth") or std.mem.eql(u8, args[i], "--mtp-depth")) {
             const is_min = std.mem.eql(u8, args[i], "--mtp-min-depth");
+            const deprecated = std.mem.eql(u8, args[i], "--mtp-depth");
+            if (deprecated) log.warn("{s}\n", .{depth_bounds.deprecated_flag_message});
             i += 1;
             const text: []const u8 = if (i < args.len) args[i] else "";
-            const n = depth_bounds.parseDepth(text, mtp_mod.MAX_DEPTH) catch {
+            const n = (if (deprecated) depth_bounds.parseClamped(text, mtp_mod.MAX_DEPTH) else depth_bounds.parseDepth(text, mtp_mod.MAX_DEPTH)) catch {
                 log.err("{s}: expected an integer in 1..{d}; got '{s}'\n", .{ args[i - 1], mtp_mod.MAX_DEPTH, text });
                 std.process.exit(1);
             };
@@ -1054,6 +1054,7 @@ pub fn main(init: std.process.Init) !void {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
         std.process.exit(1);
     };
+    if (std.c.getenv("MLX_SERVE_MTP_FORCE_DEPTH") != null) log.warn("MLX_SERVE_MTP_FORCE_DEPTH no longer does anything: pin a depth with --mtp-min-depth n --mtp-max-depth n\n", .{});
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models

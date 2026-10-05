@@ -4348,7 +4348,7 @@ position) was bookkeeping, head quantization, or the prompt. Three probes:
    merged head forward vs a fresh head over every committed row: cos
    1.00000, argmax 2/2, with the head past its QSA budget. Green — the
    bookkeeping is acquitted (single-forward parity only proved the math).
-3. **Per-index acceptance on the real packs** (`--mtp-min-depth n --mtp-max-depth n`,
+3. **Per-index acceptance on the real packs** (`MLX_SERVE_MTP_FORCE_DEPTH=n`, now `--mtp-min-depth n --mtp-max-depth n`,
    `acc_idx=` on the trace line, temp 0):
 
 | pack (head width) | depth | 8.4k repetitive prompt | code (LRU cache) | prose (essay) |

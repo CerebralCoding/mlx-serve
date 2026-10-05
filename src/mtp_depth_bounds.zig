@@ -11,23 +11,23 @@ pub const Bounds = struct {
     pub fn pinned(self: Bounds) ?u32 {
         return if (self.max != 0 and self.min == self.max) self.min else null;
     }
-
-    pub fn explicit(self: Bounds) bool {
-        return self.min != 1 or self.max != 0;
-    }
 };
 
 /// Process-wide, set once from the launch flags before a model loads.
 pub var active: Bounds = .{};
 
-pub const removed_flag_message =
-    "--mtp-depth was replaced by --mtp-min-depth <n> and --mtp-max-depth <n>: the planner works inside that range, " ++
-    "and the same value for both pins one depth";
+pub const deprecated_flag_message = "--mtp-depth is now --mtp-max-depth; the old spelling is still accepted with the same meaning";
 
 pub fn parseDepth(text: []const u8, max_depth: u32) error{NotADepth}!u32 {
     const n = std.fmt.parseInt(u32, text, 10) catch return error.NotADepth;
     if (n < 1 or n > max_depth) return error.NotADepth;
     return n;
+}
+
+/// The deprecated `--mtp-depth`: any integer, clamped into 1..max_depth as it always was.
+pub fn parseClamped(text: []const u8, max_depth: u32) error{NotADepth}!u32 {
+    const n = std.fmt.parseInt(u32, text, 10) catch return error.NotADepth;
+    return std.math.clamp(n, 1, max_depth);
 }
 
 pub fn validate(b: Bounds) error{MinAboveMax}!void {
@@ -71,6 +71,14 @@ test "mtp depth bounds: parseDepth takes 1..max_depth and nothing else" {
     try std.testing.expectError(error.NotADepth, parseDepth("three", 8));
 }
 
+test "mtp depth bounds: the deprecated --mtp-depth clamps any integer into range" {
+    try std.testing.expectEqual(@as(u32, 1), try parseClamped("0", 8));
+    try std.testing.expectEqual(@as(u32, 5), try parseClamped("5", 8));
+    try std.testing.expectEqual(@as(u32, 8), try parseClamped("12", 8));
+    try std.testing.expectError(error.NotADepth, parseClamped("three", 8));
+    try std.testing.expectError(error.NotADepth, parseClamped("-1", 8));
+}
+
 test "mtp depth bounds: min above an explicit max is refused, min alone is not" {
     try validate(.{ .min = 2, .max = 7 });
     try validate(.{ .min = 4, .max = 4 });
@@ -83,9 +91,6 @@ test "mtp depth bounds: only equal explicit flags pin a depth" {
     try std.testing.expectEqual(@as(?u32, null), (Bounds{ .min = 2, .max = 7 }).pinned());
     try std.testing.expectEqual(@as(?u32, null), (Bounds{ .min = 3, .max = 0 }).pinned());
     try std.testing.expectEqual(@as(?u32, null), (Bounds{}).pinned());
-    try std.testing.expect(!(Bounds{}).explicit());
-    try std.testing.expect((Bounds{ .min = 2 }).explicit());
-    try std.testing.expect((Bounds{ .max = 5 }).explicit());
 }
 
 test "mtp depth bounds: a floor above the planner's own cap lifts it, the default changes nothing" {

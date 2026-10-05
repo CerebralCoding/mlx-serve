@@ -64,7 +64,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--draft-block-size N` | auto | Drafts per round for the drafter (auto-sized to what this Mac's verify path can use) |
 | `--no-mtp` / `--mtp` | on when a head is loaded | Disable the native MTP head; `--mtp` is a no-op kept for old launch lines (dense and MoE both default on) |
 | `--mtp-min-depth N` | `1` | Minimum MTP draft depth (1..8); lifts the automatic cap if needed |
-| `--mtp-max-depth N` | auto | Maximum MTP draft depth (1..8); every planner choice stays within the bounds. Equal min/max pins the depth, replacing `MLX_SERVE_MTP_FORCE_DEPTH`. Native head count and remaining tokens can shorten a round. |
+| `--mtp-max-depth N` | auto | Maximum MTP draft depth (1..8); every planner choice stays within the bounds. Equal min/max pins the depth, replacing `MLX_SERVE_MTP_FORCE_DEPTH`. `--mtp-depth` is the old spelling of this flag. Native head count and remaining tokens can shorten a round. |
 | `--mtp-greedy-tail` | off | Sampled requests draft only the first MTP token by sampling, later ones by argmax; pairs with `--mtp-typical`. A model's `mtp_greedy_tail` in `model-settings.json` outranks it |
 | `--mtp-history-window N` | `0` (full) | Prompts past 16K tokens only build MTP head history for the last N tokens (windowing costs acceptance on stock Qwen heads) |
 | `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model) |
