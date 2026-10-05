@@ -361,3 +361,127 @@ test "kda per-core recurrence follows the bounded-gate delta rule" {
     try testing.expect(max_y < 0.02);
     try testing.expect(max_s < 1e-4);
 }
+
+test "kda decode step over T rows equals T one-row steps, bit for bit, at the gate widths a verify window serves" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    const heads: c_int = 64;
+    const qkv: c_int = heads * 128;
+    const rows: c_int = 4;
+    const off_ga: c_int = 3 * qkv;
+    const off_fa = off_ga + 128;
+    const off_b = off_fa + 128;
+    const w_cols = off_b + heads;
+    var prng = std.Random.DefaultPrng.init(11);
+    const rand = prng.random();
+    const alloc = testing.allocator;
+    const mk = struct {
+        fn f32s(a: std.mem.Allocator, r: std.Random, shape: []const c_int, scale: f32, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(f32, n);
+            defer a.free(buf);
+            for (buf) |*x| x.* = scale * r.floatNorm(f32);
+            const f = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f);
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&o, f, dt, st));
+            return o;
+        }
+        fn words(a: std.mem.Allocator, r: std.Random, rows_: c_int, cols: c_int) !mlx.mlx_array {
+            const n: usize = @intCast(rows_ * cols);
+            const buf = try a.alloc(u32, n);
+            defer a.free(buf);
+            for (buf) |*x| x.* = r.int(u32);
+            return mlx.mlx_array_new_data(buf.ptr, &[_]c_int{ rows_, cols }, 2, .uint32);
+        }
+        fn equal(a: mlx.mlx_array, b: mlx.mlx_array, st: mlx.mlx_stream) !bool {
+            var e = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(e);
+            try mlx.check(mlx.mlx_array_equal(&e, a, b, false, st));
+            try mlx.check(mlx.mlx_array_eval(e));
+            var same = false;
+            try mlx.check(mlx.mlx_array_item_bool(&same, e));
+            return same;
+        }
+    };
+    const proj = try mk.f32s(alloc, rand, &.{ 1, rows, w_cols }, 1.0, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(proj);
+    const conv_w = try mk.f32s(alloc, rand, &.{ 3 * qkv, 4 }, 0.5, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(conv_w);
+    const conv0 = try mk.f32s(alloc, rand, &.{ 1, 3, 3 * qkv }, 1.0, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(conv0);
+    const alog_host = try alloc.alloc(f32, @intCast(heads));
+    defer alloc.free(alog_host);
+    for (alog_host) |*x| x.* = @log(1.0 + 15.0 * rand.float(f32));
+    const a_log = mlx.mlx_array_new_data(alog_host.ptr, &[_]c_int{heads}, 1, .float32);
+    defer _ = mlx.mlx_array_free(a_log);
+    const dt_bias = try mk.f32s(alloc, rand, &.{qkv}, 0.1, .float32, s);
+    defer _ = mlx.mlx_array_free(dt_bias);
+    const state0 = try mk.f32s(alloc, rand, &.{ 1, heads, 128, 128 }, 0.1, .float32, s);
+    defer _ = mlx.mlx_array_free(state0);
+    const norm_w = try mk.f32s(alloc, rand, &.{128}, 1.0, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(norm_w);
+
+    for ([_]u32{ 4, 8 }) |bits| {
+        const cols: c_int = @intCast(128 * bits / 32);
+        const fw = try mk.words(alloc, rand, qkv, cols);
+        defer _ = mlx.mlx_array_free(fw);
+        const gw = try mk.words(alloc, rand, qkv, cols);
+        defer _ = mlx.mlx_array_free(gw);
+        const fs = try mk.f32s(alloc, rand, &.{ qkv, 2 }, 0.02, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(fs);
+        const fbias = try mk.f32s(alloc, rand, &.{ qkv, 2 }, 0.02, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(fbias);
+        const gs_ = try mk.f32s(alloc, rand, &.{ qkv, 2 }, 0.02, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(gs_);
+        const gbias = try mk.f32s(alloc, rand, &.{ qkv, 2 }, 0.02, .bfloat16, s);
+        defer _ = mlx.mlx_array_free(gbias);
+        const f_b: Low = .{ .w = fw, .s = fs, .b = fbias, .bits = bits, .gs = 64 };
+        const g_b: Low = .{ .w = gw, .s = gs_, .b = gbias, .bits = bits, .gs = 64 };
+
+        const multi = (try decodeStep(s, proj, off_ga, off_fa, off_b, heads, conv0, conv_w, a_log, dt_bias, state0, norm_w, f_b, g_b, -5.0, 1e-6, true)) orelse {
+            std.debug.print("decodeStep declined {d} rows at {d}-bit gates\n", .{ rows, bits });
+            return error.Declined;
+        };
+        defer {
+            _ = mlx.mlx_array_free(multi.y);
+            _ = mlx.mlx_array_free(multi.conv_state);
+            _ = mlx.mlx_array_free(multi.state);
+            _ = mlx.mlx_array_free(multi.state_seq);
+        }
+        var conv = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&conv, conv0);
+        var st = mlx.mlx_array_new();
+        _ = mlx.mlx_array_set(&st, state0);
+        defer _ = mlx.mlx_array_free(conv);
+        defer _ = mlx.mlx_array_free(st);
+        for (0..@intCast(rows)) |t| {
+            const ti: c_int = @intCast(t);
+            var p1 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(p1);
+            try mlx.check(mlx.mlx_slice(&p1, proj, &[_]c_int{ 0, ti, 0 }, 3, &[_]c_int{ 1, ti + 1, w_cols }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            const one = (try decodeStep(s, p1, off_ga, off_fa, off_b, heads, conv, conv_w, a_log, dt_bias, st, norm_w, f_b, g_b, -5.0, 1e-6, false)) orelse return error.Declined;
+            defer _ = mlx.mlx_array_free(one.y);
+            _ = mlx.mlx_array_free(conv);
+            conv = one.conv_state;
+            _ = mlx.mlx_array_free(st);
+            st = one.state;
+            var y_row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(y_row);
+            try mlx.check(mlx.mlx_slice(&y_row, multi.y, &[_]c_int{ 0, ti, 0 }, 3, &[_]c_int{ 1, ti + 1, qkv }, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            var seq_row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(seq_row);
+            try mlx.check(mlx.mlx_slice(&seq_row, multi.state_seq, &[_]c_int{ ti, 0, 0, 0 }, 4, &[_]c_int{ ti + 1, heads, 128, 128 }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+            var st4 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(st4);
+            try mlx.check(mlx.mlx_reshape(&st4, st, &[_]c_int{ 1, heads, 128, 128 }, 4, s));
+            if (!try mk.equal(y_row, one.y, s)) std.debug.print("{d}-bit gates: row {d} output differs\n", .{ bits, t });
+            try testing.expect(try mk.equal(y_row, one.y, s));
+            if (!try mk.equal(seq_row, st4, s)) std.debug.print("{d}-bit gates: row {d} captured state differs\n", .{ bits, t });
+            try testing.expect(try mk.equal(seq_row, st4, s));
+        }
+        try testing.expect(try mk.equal(multi.conv_state, conv, s));
+        try testing.expect(try mk.equal(multi.state, st, s));
+    }
+}

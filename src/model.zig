@@ -1148,6 +1148,9 @@ pub const ModelConfig = struct {
     pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
         // MiMo: attention + row-generic MoE with no per-slot recurrent state to merge.
         if (self.isMimo()) return true;
+        // GLM-5-Next: a batched tick's tokens ride as rows of one window; each slot's KDA state and
+        // DSA cache are advanced by its own call (`Transformer.forwardGlmBatchedDecode`).
+        if (self.isGlm5()) return true;
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;

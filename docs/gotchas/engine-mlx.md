@@ -5586,3 +5586,21 @@ What is left in the hyper-connection reads is not a single-kernel job: one read 
 - Cause: the sorted expert gather (MLX's `gather_qmm_rhs` and our NAX `sortedGather`, which mirrors its gate) streams each expert once only at `B / E >= 4` sorted rows per expert; below it every row runs a `gather_qmv` that re-reads its expert's weights.
 - Fix: `nemotronMoeExperts` appends pad rows spread over the experts up to 4 per expert once there are 2+ (`moeStreamPadRows`); the pad rows sort past `total_inds`, so slicing `inv_order` drops them. Only on quantized banks with NAX (`moeStreamPadPays`): dense banks run `mlx_gather_mm` unsorted, and non-NAX machines are unmeasured.
 - Guard: `nemotronMoe matches a host reference of NemotronHMoE` (padded arm, forced by the `stream_pad` argument).
+
+## A restored KV entry had no read views (2026-10-05)
+
+Defect: a GLM request that hit the hot prefix cache with the MTP head's snapshot adopted died intermittently with `expected a non-empty mlx_array`; found under 10-12 concurrent streams (many repeated prompts), the item the GLM notes listed as "wired but untested live".
+Cause: `KVCache.restore` rebinds the buffers but leaves the read views empty, and only `truncate` rebuilt them. The main cache is always truncated (its snapshot is longer than the match); the head's snapshot matches exactly, so nothing ran. GLM's DSA layer reads the cache BEFORE its first append (the previous indexer rows for pooling), so it read an empty view.
+Fix: `rebuildViews`, shared with `truncate`, and `denseView` rebuilds an initialized entry's views when they are empty.
+Guard: `KVCache restore: a restored entry exposes its live rows to a read before the first update`.
+
+## Joint-projection rows fed to the DSA core corrupted it (2026-10-05)
+
+Observation: batching GLM's DSA input projections for N slots and handing each slot a per-slot VIEW of the joint arrays gave a batched tick cos 0.2-0.4 against serial, while evaluating the joint arrays first (or giving each slot its own projection) gave 0.99996. Each field alone was fine; any pair including the indexer row failed. Cause unproven (a lazy-graph hazard around sliced views feeding the pooled-rows kernel and the cache append). The shipped path projects per slot; the KDA step takes sliced views of its joint projection without trouble. Do not retry the DSA split without a bit-level test at N > 1.
+
+## GLM's verify window ran the KDA op chain, silently (2026-10-05)
+
+Defect: documented as "the KDA decode step over the rows", it never engaged for 2 to 8 rows; 34 layers ran the conv/sigmoid/exp/norm chain at every verify width.
+Cause: the fused step needs the row-JOINED input projection (`in_all`), and `rowGroupServes` hands that out at decode width 1 only (a joined group changes the reduction order from M == 2, which matters for the byte-exact qwen archs, not for MTP verify).
+Fix: a KDA window (batch 1, up to 8 rows) takes the joined projection. 2 rows 26.0 -> 24.5 ms, 4 rows 32.9 -> 31.7 ms per forward.
+Guard: `kda decode step over T rows equals T one-row steps` (kda_recurrence.zig), the glm5 fixture's 5-row chunk. Tell: no `[kda] decode step engaged (T=N...)` line at a verify width, `Convolution` primitives in a 2-row graph dump.

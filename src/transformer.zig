@@ -7966,6 +7966,7 @@ pub const SlidingView = struct {
 
 var sliding_block_trim_logged: bool = false; // one-shot log guard
 var gdn_batched_logged: bool = false;
+var glm_batched_logged: bool = false;
 var per_slot_attn_logged: bool = false;
 var gdn_batched_verify_rows_logged: c_int = 0; // widest row total logged so far
 var row_axis_verify_logged: bool = false;
@@ -8630,6 +8631,7 @@ pub const KVCache = struct {
     /// SDPA call sites use this so they don't have to know the scheme.
     pub fn denseView(self: *KVCache, layer: u32, s: mlx.mlx_stream) !DenseKVView {
         const entry = &self.entries[layer];
+        if (entry.initialized and entry.key_view.ctx == null) try self.rebuildViews(entry, s);
         switch (self.config.scheme) {
             .off => return .{ .k = entry.key_view, .v = entry.value_view, .owned = false },
             .affine => {
@@ -8893,32 +8895,37 @@ pub const KVCache = struct {
             // Just update offset — the buffer still holds data but views will
             // only expose [0:len]. No need to shrink the pre-allocated buffer.
             entry.offset = len;
+            try self.rebuildViews(entry, s);
+        }
+    }
 
-            // Recreate views for the truncated range. Each buffer is sliced
-            // against its OWN shape — an MLA cache's V is narrower than its K.
-            const shape = mlx.getShape(entry.keys);
-            if (shape.len < 4) continue;
-            const seq_end: c_int = @intCast(len - entry.base);
-            const v_start = [_]c_int{ 0, 0, 0, 0 };
-            const v_stop = [_]c_int{ shape[0], shape[1], seq_end, shape[3] };
-            const v_strides = [_]c_int{ 1, 1, 1, 1 };
-            try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
-            const val_shape = mlx.getShape(entry.values);
-            const val_stop = [_]c_int{ val_shape[0], val_shape[1], seq_end, val_shape[3] };
-            try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &val_stop, 4, &v_strides, 4, s));
-            if (self.config.scheme != .off) {
-                // K and V scale/bias groups are as wide as their OWN payload —
-                // an MLA cache's V is narrower than its K, so the value views
-                // cannot be sliced against the key scales' shape.
-                const sc_shape = mlx.getShape(entry.keys_scales);
-                const sv_stop = [_]c_int{ sc_shape[0], sc_shape[1], seq_end, sc_shape[3] };
-                try mlx.check(mlx.mlx_slice(&entry.key_scales_view, entry.keys_scales, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
-                try mlx.check(mlx.mlx_slice(&entry.key_biases_view, entry.keys_biases, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
-                const vsc_shape = mlx.getShape(entry.values_scales);
-                const vsv_stop = [_]c_int{ vsc_shape[0], vsc_shape[1], seq_end, vsc_shape[3] };
-                try mlx.check(mlx.mlx_slice(&entry.value_scales_view, entry.values_scales, &v_start, 4, &vsv_stop, 4, &v_strides, 4, s));
-                try mlx.check(mlx.mlx_slice(&entry.value_biases_view, entry.values_biases, &v_start, 4, &vsv_stop, 4, &v_strides, 4, s));
-            }
+    /// Slice the entry's buffers to its live rows `[0, offset - base)` as the read views. `truncate` needs
+    /// them after a rewind, and so does a RESTORED entry, whose views start empty: a layer that reads the
+    /// cache before it first appends (GLM's DSA pools the previous indexer rows) would otherwise read nothing.
+    fn rebuildViews(self: *const KVCache, entry: *KVCacheEntry, s: mlx.mlx_stream) !void {
+        // Each buffer is sliced against its OWN shape — an MLA cache's V is narrower than its K.
+        const shape = mlx.getShape(entry.keys);
+        if (shape.len < 4) return;
+        const seq_end: c_int = @intCast(entry.offset - entry.base);
+        const v_start = [_]c_int{ 0, 0, 0, 0 };
+        const v_stop = [_]c_int{ shape[0], shape[1], seq_end, shape[3] };
+        const v_strides = [_]c_int{ 1, 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+        const val_shape = mlx.getShape(entry.values);
+        const val_stop = [_]c_int{ val_shape[0], val_shape[1], seq_end, val_shape[3] };
+        try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &val_stop, 4, &v_strides, 4, s));
+        if (self.config.scheme != .off) {
+            // K and V scale/bias groups are as wide as their OWN payload —
+            // an MLA cache's V is narrower than its K, so the value views
+            // cannot be sliced against the key scales' shape.
+            const sc_shape = mlx.getShape(entry.keys_scales);
+            const sv_stop = [_]c_int{ sc_shape[0], sc_shape[1], seq_end, sc_shape[3] };
+            try mlx.check(mlx.mlx_slice(&entry.key_scales_view, entry.keys_scales, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
+            try mlx.check(mlx.mlx_slice(&entry.key_biases_view, entry.keys_biases, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
+            const vsc_shape = mlx.getShape(entry.values_scales);
+            const vsv_stop = [_]c_int{ vsc_shape[0], vsc_shape[1], seq_end, vsc_shape[3] };
+            try mlx.check(mlx.mlx_slice(&entry.value_scales_view, entry.values_scales, &v_start, 4, &vsv_stop, 4, &v_strides, 4, s));
+            try mlx.check(mlx.mlx_slice(&entry.value_biases_view, entry.values_biases, &v_start, 4, &vsv_stop, 4, &v_strides, 4, s));
         }
     }
 };
@@ -21802,6 +21809,7 @@ pub const Transformer = struct {
         rope_offsets: []const u32,
         hidden_rows: ?*?[]mlx.mlx_array,
     ) ![]mlx.mlx_array {
+        if (self.config.isGlm5()) return self.forwardGlmBatchedDecode(next_tokens, ctxs, hidden_rows);
         const N: c_int = @intCast(next_tokens.len);
         std.debug.assert(next_tokens.len == ctxs.len);
         if (!gdn_batched_logged) {
@@ -25700,7 +25708,9 @@ pub const Transformer = struct {
         const x_shape = mlx.getShape(emb);
         const batch: c_int = x_shape[0];
         const seq_len: c_int = x_shape[1];
-        const is_prefill = seq_len > 1;
+        // A batched tick's rows are N sequences' next tokens (`glmBranchSlots`), not a prompt chunk.
+        const batched = ctx.batch_slots != null;
+        const is_prefill = seq_len > 1 and !batched;
         var stream = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(stream);
         {
@@ -25730,7 +25740,7 @@ pub const Transformer = struct {
                 try evalCadencePoint(stream, ctx.ssm_entries);
             }
         }
-        ctx.moe_seq_offset.* += @intCast(seq_len);
+        if (!batched) ctx.moe_seq_offset.* += @intCast(seq_len);
         if (deferred) |*df| {
             _ = mlx.mlx_array_free(stream);
             stream = try df.materialize(self.s);
@@ -25820,6 +25830,7 @@ pub const Transformer = struct {
     }
 
     fn glmBranch(self: *Transformer, ctx: *ForwardCtx, normed: mlx.mlx_array, lw: *const MoeLayerWeights, attn: bool, li: usize, offset: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !mlx.mlx_array {
+        if (ctx.batch_slots) |slots| return self.glmBranchSlots(slots, normed, lw, attn, li);
         return if (attn) switch (lw.attn) {
             .linear => |*la| try self.gatedDeltaNet(normed, la, &ctx.ssm_entries.?[li], li, batch, seq_len, is_prefill),
             .full => |*fa| try self.glmDsaAttn(ctx, normed, &fa.dsa.?, @intCast(li), offset, batch, seq_len),
@@ -25827,6 +25838,170 @@ pub const Transformer = struct {
             .moe => |*mw| try self.moeMLP(normed, mw),
             .dense => |*dw| try self.denseMLP(normed, dw),
         };
+    }
+
+    /// One batched tick's branch: `normed` `[1, N, H]` holds N slots' next-token rows. The MLP and
+    /// the projections read their weights once for all N rows; a slot's own state (its KDA
+    /// recurrence, its DSA cache) is advanced by its own call.
+    fn glmBranchSlots(self: *Transformer, slots: []const *ForwardCtx, normed: mlx.mlx_array, lw: *const MoeLayerWeights, attn: bool, li: usize) !mlx.mlx_array {
+        if (!attn) return switch (lw.mlp) {
+            .moe => |*mw| try self.moeMLP(normed, mw),
+            .dense => |*dw| try self.denseMLP(normed, dw),
+        };
+        switch (lw.attn) {
+            .linear => |*la| return self.glmKdaSlots(slots, normed, la, li),
+            .full => |*fa| {
+                var rows: [MOE_DECODE_BATCH_MAX]mlx.mlx_array = undefined;
+                var built: usize = 0;
+                defer for (rows[0..built]) |r| {
+                    _ = mlx.mlx_array_free(r);
+                };
+                for (slots, 0..) |sl, i| {
+                    const row = try axisView(self.s, normed, 1, i);
+                    defer _ = mlx.mlx_array_free(row);
+                    rows[i] = try self.glmDsaAttn(sl, row, &fa.dsa.?, @intCast(li), sl.moe_seq_offset.*, 1, 1);
+                    built += 1;
+                }
+                return concatAxis1(self.s, rows[0..slots.len]);
+            },
+        }
+    }
+
+    /// The low-rank gate second stages the fused KDA step reads: `f_b` (forget) and `g_b` (output).
+    fn kdaLows(self: *Transformer, la: *const LinearAttnWeights, dk: c_int) struct { fb: kda_recurrence.Low, gb: kda_recurrence.Low } {
+        const a2q = self.quantParamsHinted(la.a2.w, la.a2.s, @intCast(dk));
+        const z2q = self.quantParamsHinted(la.z2.w, la.z2.s, @intCast(dk));
+        return .{
+            .fb = .{ .w = la.a2.w, .s = la.a2.s, .b = la.a2.b, .bits = a2q.bits, .gs = a2q.group_size },
+            .gb = .{ .w = la.z2.w, .s = la.z2.s, .b = la.z2.b, .bits = z2q.bits, .gs = z2q.group_size },
+        };
+    }
+
+    /// KDA layer over N slots' rows: ONE joined input projection and ONE output projection, the
+    /// fused one-token step per slot against that slot's own conv + recurrent state. A layer whose
+    /// projection is not joined (layer 0) runs the layer per slot.
+    fn glmKdaSlots(self: *Transformer, slots: []const *ForwardCtx, x: mlx.mlx_array, la: *const LinearAttnWeights, li: usize) !mlx.mlx_array {
+        const cfg = &self.config;
+        const heads: c_int = @intCast(cfg.linear_num_value_heads);
+        const dk: c_int = @intCast(cfg.linear_key_head_dim);
+        var rows: [MOE_DECODE_BATCH_MAX]mlx.mlx_array = undefined;
+        var built: usize = 0;
+        defer for (rows[0..built]) |r| {
+            _ = mlx.mlx_array_free(r);
+        };
+        const joined = la.in.w.ctx != null and la.a_log_h.ctx != null and la.a2.w.ctx != null and la.z2.w.ctx != null;
+        if (joined) {
+            for (slots) |sl| {
+                const e = &sl.ssm_entries.?[li];
+                if (!e.initialized or e.ssm_state.ctx == null or e.conv_state.ctx == null) return error.GlmBatchedStateMissing;
+            }
+            const all = try self.qmatmul(x, la.in.w, la.in.s, la.in.b);
+            defer _ = mlx.mlx_array_free(all);
+            const w = la.in.widths;
+            const lows = self.kdaLows(la, dk);
+            for (slots, 0..) |sl, i| {
+                const e = &sl.ssm_entries.?[li];
+                const proj = try axisView(self.s, all, 1, i);
+                defer _ = mlx.mlx_array_free(proj);
+                const r = (try kda_recurrence.decodeStep(self.s, proj, w[0], w[0] + w[1], w[0] + w[1] + w[2], heads, e.conv_state, la.conv1d_w, la.a_log_h, la.dt_f32, e.ssm_state, la.norm_w, lows.fb, lows.gb, cfg.kda_gate_lower_bound, cfg.rms_norm_eps, false)) orelse return error.GlmBatchedKdaDeclined;
+                _ = mlx.mlx_array_free(e.conv_state);
+                e.conv_state = r.conv_state;
+                _ = mlx.mlx_array_free(e.ssm_state);
+                e.ssm_state = r.state;
+                rows[i] = r.y;
+                built += 1;
+            }
+            const y = try concatAxis1(self.s, rows[0..slots.len]);
+            defer _ = mlx.mlx_array_free(y);
+            return self.qmatmul(y, la.out_w, la.out_s, la.out_b);
+        }
+        for (slots, 0..) |sl, i| {
+            const row = try axisView(self.s, x, 1, i);
+            defer _ = mlx.mlx_array_free(row);
+            rows[i] = try self.gatedDeltaNet(row, la, &sl.ssm_entries.?[li], li, 1, 1, false);
+            built += 1;
+        }
+        return concatAxis1(self.s, rows[0..slots.len]);
+    }
+
+    /// Rows a batched GLM tick carries: the MoE decode kernels' row limit.
+    const MOE_DECODE_BATCH_MAX = 8;
+
+    fn concatAxis1(s: mlx.mlx_stream, parts: []const mlx.mlx_array) !mlx.mlx_array {
+        const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+        return out;
+    }
+
+    /// Next-token logits for N slots in as few trunk forwards as the MoE row limit allows (8 per
+    /// forward): each slot's token is one ROW of a `[1, n]` window, so the weights are read once
+    /// per forward rather than once per slot. `hidden_rows`, when asked, receives each slot's
+    /// post-final-norm hidden (`[1,1,H]`) for an MTP head that resumes after the group. Returns
+    /// N arrays `[1,1,V]`; the caller owns them and the slice.
+    pub fn forwardGlmBatchedDecode(
+        self: *Transformer,
+        next_tokens: []const u32,
+        ctxs: []const *ForwardCtx,
+        hidden_rows: ?*?[]mlx.mlx_array,
+    ) ![]mlx.mlx_array {
+        std.debug.assert(next_tokens.len == ctxs.len and next_tokens.len >= 1);
+        if (!glm_batched_logged) {
+            glm_batched_logged = true;
+            log.info("[batched] glm batched decode engaged (slots={d})\n", .{next_tokens.len});
+        }
+        const out = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
+        var made: usize = 0;
+        errdefer {
+            for (out[0..made]) |a| _ = mlx.mlx_array_free(a);
+            self.allocator.free(out);
+        }
+        var hid: ?[]mlx.mlx_array = null;
+        if (hidden_rows != null) hid = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
+        var hid_made: usize = 0;
+        errdefer if (hid) |h| {
+            for (h[0..hid_made]) |a| _ = mlx.mlx_array_free(a);
+            self.allocator.free(h);
+        };
+        var start: usize = 0;
+        while (start < ctxs.len) {
+            const n = @min(MOE_DECODE_BATCH_MAX, ctxs.len - start);
+            const group = ctxs[start .. start + n];
+            var toks: [MOE_DECODE_BATCH_MAX]i32 = undefined;
+            for (next_tokens[start .. start + n], 0..) |t, i| toks[i] = @intCast(t);
+            const token_arr = mlx.mlx_array_new_data(&toks, &[_]c_int{ 1, @intCast(n) }, 2, .int32);
+            defer _ = mlx.mlx_array_free(token_arr);
+            var scratch_offset: usize = group[0].moe_seq_offset.*;
+            var hidden_all = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(hidden_all);
+            var bctx: ForwardCtx = .{
+                .cache = group[0].cache,
+                .moe_seq_offset = &scratch_offset,
+                .ssm_entries = group[0].ssm_entries,
+                .capture_hidden = null,
+                .capture_hidden_all = if (hid != null) &hidden_all else null,
+                .vision_embeddings = null,
+                .batch_slots = group,
+            };
+            const logits = try self.forwardGlm5With(&bctx, token_arr);
+            defer _ = mlx.mlx_array_free(logits);
+            const v = mlx.getShape(logits)[2];
+            for (0..n) |i| {
+                var row = mlx.mlx_array_new(); // empty until the slice lands, so a failure leaks nothing
+                try mlx.check(mlx.mlx_slice(&row, logits, &[_]c_int{ 0, @intCast(i), 0 }, 3, &[_]c_int{ 1, @intCast(i + 1), v }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
+                out[start + i] = row;
+                made = start + i + 1;
+                if (hid) |h| {
+                    h[start + i] = try axisView(self.s, hidden_all, 1, i);
+                    hid_made = start + i + 1;
+                }
+            }
+            start += n;
+        }
+        if (hidden_rows) |slot| slot.* = hid;
+        return out;
     }
 
     /// GLM-5-Next DeepSeek sparse attention. The cache holds, per token, the 512 latent
@@ -30140,7 +30315,8 @@ pub const Transformer = struct {
             z_proj = try standinOnes(&[_]c_int{ batch, seq_len, value_dim }, self.s);
             a_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
             b_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
-        } else if (la.in.w.ctx != null and self.rowGroupServes(batch * seq_len)) {
+        } else if (la.in.w.ctx != null and (self.rowGroupServes(batch * seq_len) or (cfg.kda_vector_gate and batch == 1 and seq_len <= 8))) {
+            // A KDA verify window rides the row-joined projection too: the fused step below takes up to 8 rows.
             const all = try self.qmatmul(x, la.in.w, la.in.s, la.in.b);
             in_all = all;
             qkv = mlx.mlx_array_new();
@@ -73153,6 +73329,91 @@ test "glm5_next fixture: one-shot and chunked prefill + decode vs mlx-vlm glm5_n
     try testing.expect(worst > 0.995 and misses == 0);
 }
 
+test "glm5_next batched decode: a three-slot tick tracks three serial decodes (GLM5_MODEL, GLM5_FIXTURE)" {
+    const model_dir = std.c.getenv("GLM5_MODEL") orelse return error.SkipZigTest;
+    const fixture_path = std.c.getenv("GLM5_FIXTURE") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.supportsBatchedGdnDecode());
+
+    var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
+    defer fx.deinit();
+    const ids_arr = fx.get("input_ids") orelse return error.MissingFixtureTensor;
+    try mlx.check(mlx.mlx_array_eval(ids_arr));
+    const ids = (mlx.mlx_array_data_int32(ids_arr) orelse return error.Unreadable)[0..mlx.mlx_array_size(ids_arr)];
+    const v: usize = @intCast(config.vocab_size);
+    const ref = try qwen4ReadF32(allocator, fx.get("logits_full") orelse return error.MissingFixtureTensor, s);
+    defer allocator.free(ref);
+
+    // Three slots on shifted windows of the fixture's sequence, each prefilled alone; the second
+    // set of three decodes in one tick. Slot 0 follows the fixture, so it has a reference row.
+    const n_slots = 3;
+    const prompt = 6;
+    const steps = 8;
+    var serial: [n_slots]*Qwen4TestSlot = undefined;
+    var batched: [n_slots]*Qwen4TestSlot = undefined;
+    for (0..n_slots) |i| {
+        serial[i] = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+        batched[i] = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+        for ([_]*Qwen4TestSlot{ serial[i], batched[i] }) |sl| _ = mlx.mlx_array_free(try sl.forward(&xfm, ids[i .. i + prompt]));
+    }
+    defer for (0..n_slots) |i| {
+        serial[i].deinit(allocator);
+        batched[i].deinit(allocator);
+    };
+    var ctxs: [n_slots]*ForwardCtx = undefined;
+    for (&ctxs, batched) |*c, sl| c.* = &sl.ctx;
+
+    var cos_vs_serial: f64 = 1.0;
+    var cos_serial_ref: f64 = 1.0;
+    var cos_batched_ref: f64 = 1.0;
+    for (0..steps) |k| {
+        var toks: [n_slots]u32 = undefined;
+        var offs: [n_slots]u32 = undefined;
+        for (0..n_slots) |i| {
+            toks[i] = @intCast(ids[i + prompt + k]);
+            offs[i] = @intCast(batched[i].off);
+        }
+        try testing.expect(xfm.batchedGdnReady(&ctxs));
+        var hidden: ?[]mlx.mlx_array = null;
+        defer if (hidden) |h| {
+            for (h) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(h);
+        };
+        const out = try xfm.forwardMoeBatchedDecode(&toks, &ctxs, &offs, &hidden);
+        defer {
+            for (out) |o| _ = mlx.mlx_array_free(o);
+            allocator.free(out);
+        }
+        try testing.expectEqual(@as(usize, n_slots), hidden.?.len);
+        for (batched) |sl| sl.off += 1; // the scheduler advances each slot after the tick
+        for (0..n_slots) |i| {
+            const alone = try serial[i].forward(&xfm, &.{@intCast(toks[i])});
+            defer _ = mlx.mlx_array_free(alone);
+            const sv = try qwen4ReadF32(allocator, alone, s);
+            defer allocator.free(sv);
+            const bv = try qwen4ReadF32(allocator, out[i], s);
+            defer allocator.free(bv);
+            cos_vs_serial = @min(cos_vs_serial, qwen4CompareRows(bv, sv, 1, v).min_cos);
+            if (i == 0) {
+                const r = ref[(prompt + k) * v ..][0..v];
+                cos_serial_ref = @min(cos_serial_ref, qwen4CompareRows(sv, r, 1, v).min_cos);
+                cos_batched_ref = @min(cos_batched_ref, qwen4CompareRows(bv, r, 1, v).min_cos);
+            }
+        }
+    }
+    std.debug.print("[glm5 batched] {d} ticks x {d} slots: min cos batched-vs-serial {d:.5}; vs fp32 reference serial {d:.5} batched {d:.5}\n", .{ steps, n_slots, cos_vs_serial, cos_serial_ref, cos_batched_ref });
+    try testing.expect(cos_vs_serial > 0.999 and cos_batched_ref > cos_serial_ref - 0.001);
+}
+
 /// Bit equality of two strided views (cache slices are not row-contiguous).
 fn ringViewsEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !bool {
     const ca = try materializedOwnedCopy(s, a);
@@ -73160,6 +73421,32 @@ fn ringViewsEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !bool {
     const cb = try materializedOwnedCopy(s, b);
     defer _ = mlx.mlx_array_free(cb);
     return bf16BitsEqual(ca, cb);
+}
+
+test "KVCache restore: a restored entry exposes its live rows to a read before the first update" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x7E57);
+    var src = try KVCache.init(testing.allocator, 1);
+    defer src.deinit();
+    const k = try testRandWeightBf16(prng.random(), &.{ 1, 1, 25, 8 }, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try testRandWeightBf16(prng.random(), &.{ 1, 1, 25, 4 }, s);
+    defer _ = mlx.mlx_array_free(v);
+    var first = try src.update(0, k, v, s, 0);
+    first.deinit();
+    var snap = try src.snapshot();
+    defer snap.deinit();
+
+    // The GLM DSA layer reads the cached rows BEFORE it appends (the previous indexer rows for pooling).
+    var back = try KVCache.init(testing.allocator, 1);
+    defer back.deinit();
+    try back.restore(&snap);
+    const view = try back.denseView(0, s);
+    try testing.expect(view.k.ctx != null and view.v.ctx != null);
+    try testing.expectEqual(@as(c_int, 25), mlx.getShape(view.k)[2]);
+    try testing.expectEqual(@as(c_int, 25), mlx.getShape(view.v)[2]);
+    try testing.expect(try ringViewsEqual(s, view.k, k));
 }
 
 test "KVCache sliding ring: a sliding layer keeps its newest rows and serves the full buffer's window" {
