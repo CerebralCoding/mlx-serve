@@ -40,6 +40,8 @@ pub const ImageData = struct {
 /// config. Threaded into `parseImageUrlContent`/`decodeImageToPixels` so decode
 /// stays race-safe (no global state) under `--max-concurrent ≥ 2`.
 pub const VisionPreproc = struct {
+    /// Clef's Pillow RGB conversion discards alpha instead of compositing it.
+    composite_alpha: bool = true,
     /// Which processor produced `ImageData.pixels`: Gemma's fixed CHW square,
     /// or one of the patch-grid towers (each with its own resize + patch order).
     mode: enum { gemma, qwen, muse, lfm2 } = .gemma,
