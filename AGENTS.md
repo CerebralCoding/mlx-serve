@@ -81,7 +81,7 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`; 0.16 no longer builds); mlx + mlx
 | `status.zig` / `log.zig` | TUI status bar; leveled logging + file sink (`~/.mlx-serve/logs/mlx-serve-<port>.log`, 32 MB rotation) |
 | `format_corpus_test.zig` / `tool_traffic_replay_test.zig` / `mtp_replay_test.zig` | Hermetic format corpus + real-traffic replay (`src/fixtures/tool_traffic.jsonl`) + MTP depth-policy replay over recorded acceptance traces (`src/fixtures/mtp_accept_traces.txt`) |
 
-CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p --top-k --ctx-size --config-overrides --embedding-max-length --timeout --reasoning-budget --no-vision --pld --pld-draft-len --pld-key-len --drafter --draft-block-size --no-mtp --mtp --mtp-depth --mtp-greedy-tail --mtp-history-window --max-mtp-ctx --ane-prefill --ane-image --ane-video --ane-audio --ane-split --dspark --decode-attn-quant --no-decode-attn-quant --kv-quant --kv-attn-mode --prefix-cache-entries --no-prefix-cache-ram --prefix-cache-mem --prefix-cache-disk --max-concurrent --prefill-decode-share --skip-mem-preflight --os-reserve-gib --wired-margin-gib --mtp-head-kv-quant --metrics --api-key --lan-share --lan-discover --lan-name --no-drafter --no-tool-autocorrect --no-prevent-sleep --ssd-streaming --ple-gpu --no-ds4-mtp --mlx-gguf --model-dir --log-level --log-file --version --help`
+CLI flags: `mlx-serve --help` (`printUsage` in `src/main.zig` is the source of truth; `docs/cli.md` for users).
 
 Sampling defaults for omitted fields: body > launch flags > model `generation_config.json` > hardcoded (1.0/1.0/off). Missing generation_config = wild-sampling signature.
 
