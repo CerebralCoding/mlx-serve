@@ -135,6 +135,7 @@ class ServerManager: ObservableObject {
         // and dedups against its discovered entry by path. (Was: the selected
         // model's parent dir, which scoped discovery to one org.)
         args += options.toCLIArgs(modelDirs: Self.launchModelDirs(selectedModel: resolvedModel))
+        args += DeepSeekV41.launchArgs(modelType: DeepSeekV41.modelType(atModelPath: resolvedModel))
         launch(args: args, options: options)
     }
 

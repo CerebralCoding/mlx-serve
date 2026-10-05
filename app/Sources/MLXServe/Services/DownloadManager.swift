@@ -280,7 +280,7 @@ class DownloadManager: ObservableObject {
                     || path == "optiq/mtp.safetensors" else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
-            guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }
+            guard neededExtensions.contains(ext) || selection.extraExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }
             if Self.isTorchShadowWeight(path) { return nil }
             // Per-bundle junk filter.
             if selection.excludeSubstrings.contains(where: { path.contains($0) }) { return nil }
@@ -913,7 +913,7 @@ class DownloadManager: ObservableObject {
     func start(repoId: String, onFinish: @escaping @MainActor () -> Void) {
         activeTasks[repoId]?.cancel()
         let task = Task { @MainActor [weak self] in
-            await self?.download(repoId: repoId)
+            await self?.download(repoId: repoId, selection: DeepSeekV41.selection(forRepo: repoId) ?? .chatDefault)
             self?.finalizeIfCancelled(repoId: repoId)
             await self?.autoFillSocket(for: repoId)
             self?.activeTasks.removeValue(forKey: repoId)

@@ -1279,6 +1279,8 @@ let gemmaModelOptions: [GemmaModelOption] = [
         sizeEstimate: "~130 GB, needs 128 GB RAM",
         minHostRamBytes: 128 * (UInt64(1) << 30)
     ),
+    // DeepSeek-V4.1-Flash through the mlx-stream plugin: experts streamed from SSD.
+    DeepSeekV41.catalogEntry,
     // Tencent Hunyuan 3 (hy_v3): 295B-A21B MoE, 256K context, Apache 2.0.
     GemmaModelOption(
         id: "hy3-oq2e",

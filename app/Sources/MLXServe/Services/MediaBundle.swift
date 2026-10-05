@@ -25,6 +25,8 @@ struct FileSelection: Equatable {
     /// When set, pull ONLY this subfolder's files and KEEP the prefix: a pack's
     /// `drafter/` lands at `<model_dir>/drafter/`, where the server finds it.
     var packFolder: String? = nil
+    /// Extensions a pack's own engine reads beyond the default allowlist (DeepSeek-V4.1's `.u32` token map).
+    var extraExtensions: Set<String> = []
 
     /// Chat-model default: the whole pack, as `mlx-serve pull` fetches it —
     /// top-level files + `mtp/` + `drafter/`, all needed extensions.

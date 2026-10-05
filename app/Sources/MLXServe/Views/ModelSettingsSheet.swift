@@ -80,6 +80,10 @@ struct ModelSettingsSheet: View {
         request.path.hasSuffix(".gguf") || appState.localModels.first { $0.path == request.path }?.quantFile != nil
     }
 
+    private var modelType: String? {
+        appState.localModels.first { $0.path == request.path }?.modelType
+    }
+
     /// The int8 prefill route exists only on Prism Hadamard packs (Bonsai 2).
     private var hasInt8PrefillRoute: Bool {
         appState.localModels.first { $0.path == request.path }?.modelType == "prism_hadamard_qwen35"
@@ -186,7 +190,7 @@ struct ModelSettingsSheet: View {
                     get: { override.ctxSize ?? -1 },
                     set: { override.ctxSize = $0 < 0 ? nil : $0 })) {
                     Text("Default").font(.app(.body)).tag(-1)
-                    ForEach(ContextSizeDisplay.presets, id: \.self) { n in
+                    ForEach(DeepSeekV41.contextPresets(modelType: modelType), id: \.self) { n in
                         Text(ContextSizeDisplay.formatTokens(n)).font(.app(.body)).tag(n)
                     }
                 }
