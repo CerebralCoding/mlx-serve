@@ -9,6 +9,7 @@
 - **Sound effects with Stable Audio 3.** `POST /v1/audio/sound-generations` turns a description into up to two minutes of 44.1 kHz stereo in about a second, from Stability's own `stabilityai/stable-audio-3-small-sfx` repo as downloaded; the app gets a Sound Effects tab in Audio and a `generate_sound` chat tool.
 - **MiMo-V2.6-Flash.** Xiaomi's 309B MoE runs on a 256 GB Mac, from the MLX packs already on Hugging Face or from the release via `tests/convert_mimo_v2.py`, whose packs also load in mlx-lm; text, thinking and tool calls, with the checkpoint's own MTP heads drafting (up to ~30% faster decode on code).
 - **Monitor history in the browser.** The console Monitor keeps its own history in the browser, computed from the server's counters: 1 hour of samples then one per minute up to 24 hours, kept across reloads, with failed, rejected and cancelled rates, per-model totals and a request table.
+- **fx and Grok join the launchers.** `mlx-serve launch fx` / `mlx-serve launch grok` and the app's Code menu start either agent against the local server, with every chat model and its real context window declared and no sign-in needed; your own fx default provider and `~/.grok` stay as they were.
 - **Sessions name their agent.** `/metrics.json` sessions now name the calling agent (`claude-code`, `opencode`, `codex`, `omp` or `other`) with a per-request id, and a `process_start_time_seconds` gauge lets monitors detect restarts.
 
 ### Speed

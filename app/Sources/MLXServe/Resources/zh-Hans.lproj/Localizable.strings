@@ -417,7 +417,7 @@
 "Composing music" = "正在创作音乐";
 "Concurrent requests" = "并发请求";
 "Conditioning rebalance" = "条件重平衡";
-"Connect a coding agent CLI (Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider) to this server — shows the terminal commands to run" = "将编码 Agent CLI（Claude Code、pi、oh-my-pi、OpenCode、Codex、hermes、aider）连接到此服务器 —— 显示需要运行的终端命令";
+"Connect a coding agent CLI (Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider, fx, Grok) to this server — shows the terminal commands to run" = "将编码 Agent CLI（Claude Code、pi、oh-my-pi、OpenCode、Codex、hermes、aider、fx、Grok）连接到此服务器 —— 显示需要运行的终端命令";
 "Connect external tools via the Model Context Protocol" = "通过 Model Context Protocol 连接外部工具";
 "Connect from your terminal:" = "从终端连接：";
 "Connected — %lld tool%@" = "已连接 —— %lld 个工具";
@@ -1351,6 +1351,8 @@
 "Requires the Docker daemon to be running locally." = "需要本地运行 Docker 守护进程。";
 "Requires the Qwen3-TTS voice model — download it from the Audio tile in the menu bar." = "需要 Qwen3-TTS 语音模型 —— 请在菜单栏的音频磁贴中下载。";
 "Requires the aider CLI: curl -LsSf https://aider.chat/install.sh | sh" = "需要 aider CLI：curl -LsSf https://aider.chat/install.sh | sh";
+"Requires the fx CLI: https://fx.sh" = "需要 fx CLI：https://fx.sh";
+"Requires the grok CLI: curl -fsSL https://x.ai/cli/install.sh | bash" = "需要 grok CLI：curl -fsSL https://x.ai/cli/install.sh | bash";
 "Requires the claude CLI: npm install -g @anthropic-ai/claude-code" = "需要 claude CLI：npm install -g @anthropic-ai/claude-code";
 "Requires the codex CLI (npm install -g @openai/codex) or the ChatGPT desktop app, which bundles it" = "需要 codex CLI（npm install -g @openai/codex），或已内置它的 ChatGPT 桌面应用";
 "Requires the hermes CLI: curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash" = "需要 hermes CLI：curl -fsSL https://hermes-agent.nousresearch.com/install.sh | bash";

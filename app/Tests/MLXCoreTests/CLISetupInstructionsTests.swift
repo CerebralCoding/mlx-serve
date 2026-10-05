@@ -127,7 +127,7 @@ final class CLISetupInstructionsTests: XCTestCase {
 
     func testTabsHaveStableIdsInLauncherOrder() {
         XCTAssertEqual(tabs.map(\.id),
-                       ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider"],
+                       ["claude", "pi", "omp", "opencode", "opencode2", "codex", "hermes", "aider", "fx", "grok"],
                        "same CLIs, same order as the DMG launcher dropdown")
         for tab in tabs {
             XCTAssertFalse(tab.command.isEmpty, tab.id)
@@ -160,7 +160,7 @@ final class CLISetupInstructionsTests: XCTestCase {
     }
 
     func testEveryOtherLauncherStillRequiresTheServer() {
-        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .codex, .hermes, .aider] {
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .codex, .hermes, .aider, .fx, .grok] {
             XCTAssertTrue(cli.requiresServer, cli.id)
         }
     }
@@ -518,7 +518,7 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertEqual(LauncherCLI.codex.fallbackPaths.count, 4)
         XCTAssertTrue(LauncherCLI.codex.fallbackPaths.contains(
             "/Applications/ChatGPT.app/Contents/Resources/codex"))
-        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .hermes, .aider] {
+        for cli in [LauncherCLI.claudeCode, .pi, .omp, .opencode, .opencode2, .hermes, .aider, .fx, .grok] {
             XCTAssertTrue(cli.fallbackPaths.isEmpty, cli.id)
         }
     }
@@ -579,6 +579,91 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertEqual(obj["openai/m2"]?["max_input_tokens"] as? Int, 262144)
         XCTAssertEqual(obj["openai/m2"]?["max_output_tokens"] as? Int, 65536)
         XCTAssertEqual(obj["openai/m1"]?["litellm_provider"] as? String, "openai")
+    }
+
+    /// fx reads custom providers only from `~/.fx/settings.json`: we own the
+    /// `providers.mlx-serve` key there and leave everything else as found.
+    func testFxSettingsMergeOwnsOnlyOurProvider() throws {
+        let existing = #"{"provider":"gateway","models":{"gateway":"x/y"},"providers":{"other":{"base_url":"https://o/v1"},"mlx-serve":{"base_url":"stale"}}}"#
+        let entries = [
+            AgentModelEntry(id: "org/m1", budget: .init(context: 32768, output: 16384), vision: false),
+            AgentModelEntry(id: "org/m2", budget: .init(context: 262144, output: 65536), vision: true),
+        ]
+        let json = try XCTUnwrap(AgentConfigs.fxSettingsJSON(
+            existing: existing, baseURL: "http://127.0.0.1:11234", entries: entries))
+        let obj = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
+        XCTAssertEqual(obj["provider"] as? String, "gateway")
+        XCTAssertEqual((obj["models"] as? [String: String])?["gateway"], "x/y")
+        let providers = try XCTUnwrap(obj["providers"] as? [String: Any])
+        XCTAssertEqual((providers["other"] as? [String: Any])?["base_url"] as? String, "https://o/v1")
+        let ours = try XCTUnwrap(providers["mlx-serve"] as? [String: Any])
+        XCTAssertEqual(ours["protocol"] as? String, "openai-chat-completions")
+        XCTAssertEqual(ours["base_url"] as? String, "http://127.0.0.1:11234/v1")
+        XCTAssertEqual((ours["auth"] as? [String: String])?["type"], "none")
+        let m2 = try XCTUnwrap((ours["model_metadata"] as? [String: [String: Any]])?["org/m2"])
+        XCTAssertEqual(m2["context_window"] as? Int, 262144)
+        XCTAssertEqual(m2["max_output_tokens"] as? Int, 65536)
+        XCTAssertEqual(m2["supports_tool_use"] as? Bool, true)
+        XCTAssertEqual(m2["supports_vision"] as? Bool, true)
+        XCTAssertFalse(json.contains(#"\/"#), "slashes in model ids stay unescaped")
+    }
+
+    func testFxSettingsMergeNeverReplacesAFileItCannotRead() {
+        let entries = [AgentModelEntry(id: "m1", budget: budget, vision: false)]
+        XCTAssertNotNil(AgentConfigs.fxSettingsJSON(existing: " \n", baseURL: "http://x:1", entries: entries))
+        XCTAssertNil(AgentConfigs.fxSettingsJSON(existing: #"{"provider": "#, baseURL: "http://x:1", entries: entries))
+        XCTAssertNil(AgentConfigs.fxSettingsJSON(existing: "[]", baseURL: "http://x:1", entries: entries))
+    }
+
+    /// Selection rides env, so the user's own default provider never moves.
+    func testFxLauncherSelectsOurProviderByEnv() {
+        let script = LauncherCLI.fx.scriptBody("http://localhost:11234", "org/m1", "cd '/tmp'", budget, [])
+        XCTAssertTrue(script.contains("export FX_PROVIDER=mlx-serve\nexport FX_MODEL=org/m1\ncd '/tmp'\nfx \"$@\""), script)
+        XCTAssertEqual(LauncherCLI.fx.resumeArgs, "--continue")
+    }
+
+    /// The panel writes a fresh settings file, never over an existing one.
+    func testFxTabNeverOverwritesExistingSettings() throws {
+        let tab = try XCTUnwrap(tabs.first { $0.id == "fx" })
+        XCTAssertTrue(tab.command.contains("if [ -s ~/.fx/settings.json ]; then"), tab.command)
+        XCTAssertTrue(tab.command.contains("FX_PROVIDER=mlx-serve FX_MODEL=gemma-4-e4b-it-4bit fx"), tab.command)
+        XCTAssertTrue(tab.command.contains(#""context_window" : 90112"#), tab.command)
+    }
+
+    /// A dummy XAI_API_KEY fails grok's probe against xAI, so each model carries
+    /// its own key; xAI-named helper models are pinned to the launched one.
+    func testGrokConfigDeclaresEveryModelAndPinsTheHelpers() {
+        let entries = [
+            AgentModelEntry(id: "org/m1", budget: .init(context: 32768, output: 16384), vision: false),
+            AgentModelEntry(id: "org/m2", budget: .init(context: 262144, output: 65536), vision: true),
+        ]
+        let toml = AgentConfigs.grokConfigTOML(baseURL: "http://127.0.0.1:11234", model: "org/m2", budget: budget, entries: entries)
+        for key in ["default", "session_summary", "image_description", "prompt_suggestion"] {
+            XCTAssertTrue(toml.contains("\(key) = \"org/m2\"\n"), key)
+        }
+        XCTAssertTrue(toml.contains("""
+            [model."org/m1"]
+            model = "org/m1"
+            base_url = "http://127.0.0.1:11234/v1"
+            name = "org/m1 (mlx-serve)"
+            api_key = "mlx-serve"
+            context_window = 32768
+            max_completion_tokens = 16384
+            supports_reasoning_effort = true
+            """), toml)
+        XCTAssertTrue(toml.contains("context_window = 262144\nmax_completion_tokens = 65536\n"), toml)
+    }
+
+    func testGrokLauncherAndTabUseTheSameIsolatedHome() throws {
+        let script = LauncherCLI.grok.scriptBody("http://localhost:11234", "m1", "cd '/tmp'", budget, [])
+        XCTAssertTrue(script.contains(#"export GROK_HOME="$HOME/.mlx-serve/grok""#), script)
+        XCTAssertTrue(script.contains(#"grok "$@""#), script)
+        XCTAssertEqual(LauncherCLI.grok.resumeArgs, "--continue")
+        XCTAssertEqual(AgentSkills.linkPath(agentId: "grok"), "grok/skills/mlx-serve")
+        let tab = try XCTUnwrap(tabs.first { $0.id == "grok" })
+        XCTAssertTrue(tab.command.contains("cat > ~/.mlx-serve/grok/config.toml <<'EOF'"), tab.command)
+        XCTAssertTrue(tab.command.contains(#"export GROK_HOME="$HOME/.mlx-serve/grok""#), tab.command)
+        XCTAssertFalse(tab.command.contains("~/.grok"), "must never touch the user's real grok home")
     }
 
     /// A heredoc body containing its own delimiter line would truncate the

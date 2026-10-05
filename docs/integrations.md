@@ -27,14 +27,14 @@ Two ways to skip everything below:
 - **`mlx-serve launch <agent>`**: same thing from the terminal, ollama-style:
 
 ```bash
-mlx-serve launch claude              # any of: claude, pi, omp, opencode, opencode2, codex, hermes, aider
+mlx-serve launch claude              # any of: claude, pi, omp, opencode, opencode2, codex, hermes, aider, fx, grok
 mlx-serve launch codex --model Qwen3.5-27B-MLX-4bit
 mlx-serve launch codex -- resume     # everything after -- goes to the agent
 ```
 
 If no server is running, `launch` starts the MLX Core app and waits; without the app installed it tells you to run `mlx-serve serve` first. Flags: `--model`, `--url`, `--port`, `--print` (write the configs and print the launch script instead of running), `--no-start`.
 
-Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes` stay yours).
+Both launchers write configs into dedicated `~/.mlx-serve/<agent>/` folders and never touch your real agent configs (`~/.claude`, `~/.pi`, `~/.omp`, `~/.codex`, `~/.hermes`, `~/.grok` stay yours). fx is the exception: it reads providers only from `~/.fx/settings.json`, so the launch sets the `providers.mlx-serve` entry there and selects it with `FX_PROVIDER`/`FX_MODEL`, leaving the rest of the file, your default provider included, as it was.
 
 ## Coding agents (manual setup)
 
@@ -227,6 +227,55 @@ EOF
 export OPENAI_API_BASE='http://127.0.0.1:11234/v1'
 export OPENAI_API_KEY=mlx-serve
 aider --model openai/MODEL_ID --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
+```
+
+### Grok
+
+xAI's `grok` CLI (Grok Build) reads its whole config tree from `GROK_HOME`. An env-only setup (`GROK_MODELS_BASE_URL` + `XAI_API_KEY`) does not work against a local server: grok checks the key with xAI and treats a placeholder as signed out. The key goes on each model instead, and the helper models (session titles, image descriptions, suggestions) are pinned to the same model; otherwise they ask for an xAI model id.
+
+```bash
+mkdir -p ~/.mlx-serve/grok
+cat > ~/.mlx-serve/grok/config.toml <<'EOF'
+[models]
+default = "MODEL_ID"
+session_summary = "MODEL_ID"
+image_description = "MODEL_ID"
+prompt_suggestion = "MODEL_ID"
+
+[model."MODEL_ID"]
+model = "MODEL_ID"
+base_url = "http://127.0.0.1:11234/v1"
+name = "MODEL_ID (mlx-serve)"
+api_key = "mlx-serve"
+context_window = CTX
+max_completion_tokens = 8192
+supports_reasoning_effort = true
+reasoning_efforts = ["none", "low", "medium", "high"]
+inference_idle_timeout_secs = 1800
+EOF
+export GROK_HOME="$HOME/.mlx-serve/grok"
+grok
+```
+
+### fx
+
+fx reads custom providers only from `~/.fx/settings.json`. Add this entry to its `providers` object (keep the rest of the file):
+
+```json
+"mlx-serve": {
+  "protocol": "openai-chat-completions",
+  "base_url": "http://127.0.0.1:11234/v1",
+  "auth": { "type": "none" },
+  "model_metadata": {
+    "MODEL_ID": { "context_window": CTX, "max_output_tokens": 8192, "supports_tool_use": true }
+  }
+}
+```
+
+Then select it per run, so your default provider stays as it is:
+
+```bash
+FX_PROVIDER=mlx-serve FX_MODEL=MODEL_ID fx
 ```
 
 ## Editors and apps

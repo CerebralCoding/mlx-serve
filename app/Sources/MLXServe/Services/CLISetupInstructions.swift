@@ -23,7 +23,10 @@ enum CLISetupInstructions {
     /// Same CLIs, same order as the DMG launcher dropdown.
     static func tabs(baseURL: String, servedModelId: String,
                      budget: AgentBudget.Budget) -> [Tab] {
-        [
+        let fxSettings = AgentConfigs.fxSettingsJSON(
+            existing: "{}", baseURL: baseURL,
+            entries: [AgentModelEntry(id: servedModelId, budget: budget, vision: false)]) ?? ""
+        return [
             Tab(id: "claude",
                 title: "Claude Code",
                 installHint: "Requires the claude CLI: npm install -g @anthropic-ai/claude-code",
@@ -139,6 +142,38 @@ enum CLISetupInstructions {
                 export OPENAI_API_KEY=mlx-serve
                 aider --model openai/\(servedModelId) --weak-model openai/\(servedModelId) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
                 """),
+            // fx reads providers only from ~/.fx/settings.json; a shell block
+            // cannot merge JSON safely, so it writes a fresh file only and
+            // otherwise prints the entry to merge by hand.
+            Tab(id: "fx",
+                title: "fx",
+                installHint: "Requires the fx CLI: https://fx.sh",
+                command: """
+                mkdir -p ~/.fx
+                if [ -s ~/.fx/settings.json ]; then
+                echo 'Merge "providers"."mlx-serve" below into ~/.fx/settings.json:'
+                cat <<'EOF'
+                \(fxSettings)
+                EOF
+                else
+                cat > ~/.fx/settings.json <<'EOF'
+                \(fxSettings)
+                EOF
+                fi
+                FX_PROVIDER=\(AgentConfigs.fxProvider) FX_MODEL=\(servedModelId) fx
+                """),
+            // grok reads its whole tree from GROK_HOME.
+            Tab(id: "grok",
+                title: "Grok",
+                installHint: "Requires the grok CLI: curl -fsSL https://x.ai/cli/install.sh | bash",
+                command: """
+                mkdir -p ~/.mlx-serve/grok
+                cat > ~/.mlx-serve/grok/config.toml <<'EOF'
+                \(AgentConfigs.grokConfigTOML(baseURL: baseURL, model: servedModelId, budget: budget, entries: []))
+                EOF
+                export GROK_HOME="$HOME/.mlx-serve/grok"
+                grok
+                """),
         ]
     }
 }
@@ -173,7 +208,7 @@ struct CLISetupInstructionsButton: View {
         .frame(maxWidth: .infinity)
         .onHover { hovering = $0 }
         .disabled(!isEnabled)
-        .help("Connect a coding agent CLI (Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider) to this server — shows the terminal commands to run")
+        .help("Connect a coding agent CLI (Claude Code, pi, oh-my-pi, OpenCode, Codex, hermes, aider, fx, Grok) to this server — shows the terminal commands to run")
         .popover(isPresented: $showPanel, arrowEdge: .bottom) {
             CLISetupInstructionsView(
                 tabs: CLISetupInstructions.tabs(

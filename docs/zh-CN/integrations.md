@@ -27,7 +27,7 @@ mlx-serve 支持这些标准 API（OpenAI、Anthropic、Ollama、OpenAI Response
 - **`mlx-serve launch <agent>`**：在终端里做同一件事，Ollama 风格：
 
 ```bash
-mlx-serve launch claude              # 可选：claude、pi、omp、opencode、opencode2、codex、hermes、aider
+mlx-serve launch claude              # 可选：claude、pi、omp、opencode、opencode2、codex、hermes、aider、fx、grok
 mlx-serve launch codex --model Qwen3.5-27B-MLX-4bit
 mlx-serve launch codex -- resume     # -- 之后的参数全部传给 agent
 ```

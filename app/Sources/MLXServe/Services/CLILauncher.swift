@@ -23,6 +23,8 @@ final class CLILauncher: ObservableObject {
         .codex,
         .hermes,
         .aider,
+        .fx,
+        .grok,
     ]
 
     /// Stable id list — pinned against the MAS instructions panel's tabs
@@ -544,6 +546,68 @@ extension LauncherCLI {
             export OPENAI_API_KEY=mlx-serve
             \(cdLine)
             aider --model openai/\(model) --weak-model openai/\(model) --model-metadata-file ~/.mlx-serve/aider/model-metadata.json "$@"
+            """
+        }
+    )
+
+    /// fx (https://fx.sh) — its providers live only in `~/.fx/settings.json`,
+    /// so the launch sets our one key there (`AgentConfigs.fxSettingsJSON`)
+    /// and picks it by env, leaving the user's default provider alone.
+    static let fx = LauncherCLI(
+        id: "fx",
+        displayName: "fx",
+        binaryName: "fx",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, entries in
+            var list = entries
+            if !list.contains(where: { $0.id == model }) {
+                list.insert(AgentModelEntry(id: model, budget: budget, vision: false), at: 0)
+            }
+            let dir = NSString(string: "~/.fx").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            let path = (dir as NSString).appendingPathComponent("settings.json")
+            let existing = (try? String(contentsOfFile: path, encoding: .utf8))
+                ?? (FileManager.default.fileExists(atPath: path) ? nil : "{}")
+            guard let existing,
+                  let json = AgentConfigs.fxSettingsJSON(existing: existing, baseURL: baseURL, entries: list)
+            else { return }
+            // Not atomic: an in-place write keeps the file's owner-only mode.
+            try? Data(json.utf8).write(to: URL(fileURLWithPath: path))
+            try? FileManager.default.setAttributes([.posixPermissions: 0o600], ofItemAtPath: path)
+        },
+        resumeArgs: "--continue",
+        scriptBody: { _, model, cdLine, _, _ in
+            """
+            export FX_PROVIDER=\(AgentConfigs.fxProvider)
+            export FX_MODEL=\(model)
+            \(cdLine)
+            fx "$@"
+            """
+        }
+    )
+
+    /// grok (xAI's Grok Build) — its whole tree rides GROK_HOME, so config.toml
+    /// lands in a dedicated dir and the user's real ~/.grok login stays theirs.
+    static let grok = LauncherCLI(
+        id: "grok",
+        displayName: "Grok",
+        binaryName: "grok",
+        iconSystemName: "terminal",
+        useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, entries in
+            let dir = NSString(string: "~/.mlx-serve/grok").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.grokConfigTOML(baseURL: baseURL, model: model, budget: budget, entries: entries)
+                .write(toFile: (dir as NSString).appendingPathComponent("config.toml"),
+                       atomically: true, encoding: .utf8)
+        },
+        resumeArgs: "--continue",
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            export GROK_HOME="$HOME/.mlx-serve/grok"
+            \(cdLine)
+            grok "$@"
             """
         }
     )

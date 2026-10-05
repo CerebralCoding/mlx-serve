@@ -56,6 +56,8 @@ pub const AgentKind = enum {
     codex,
     hermes,
     aider,
+    fx,
+    grok,
 
     pub fn fromName(name: []const u8) ?AgentKind {
         // The codex rebrand: issue #188 asks for `mlx-serve launch chatgpt`.
@@ -66,7 +68,7 @@ pub const AgentKind = enum {
         return null;
     }
 
-    pub const names = "claude, pi, omp, opencode, opencode2, codex, hermes, aider";
+    pub const names = "claude, pi, omp, opencode, opencode2, codex, hermes, aider, fx, grok";
 };
 
 // ── Config builders (pure — unit-tested below) ──────────────────────────
@@ -331,6 +333,48 @@ pub fn mergePiSettingsJson(allocator: std.mem.Allocator, existing: []const u8, c
     return try std.json.Stringify.valueAlloc(allocator, parsed.value, .{});
 }
 
+/// fx keeps custom providers only in `~/.fx/settings.json` (no config-dir
+/// override), so the launcher owns ONE key there, `providers.mlx-serve`, and
+/// selects it per launch with FX_PROVIDER/FX_MODEL: the user's default
+/// provider and every other setting stay as found. fx rejects unknown keys.
+pub const fx_provider = "mlx-serve";
+
+/// The user's fx `settings.json` with our provider set. A file that is not a
+/// JSON object is an error, never replaced.
+pub fn mergeFxSettingsJson(allocator: std.mem.Allocator, existing: []const u8, base_url: []const u8, entries: []const Entry) ![]u8 {
+    const trimmed = std.mem.trim(u8, existing, " \t\r\n");
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, if (trimmed.len == 0) "{}" else existing, .{}) catch
+        return error.UnreadableFxSettings;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.UnreadableFxSettings;
+    const a = parsed.arena.allocator();
+
+    var metadata: std.json.ObjectMap = .empty;
+    for (entries) |e| {
+        var m: std.json.ObjectMap = .empty;
+        try m.put(a, "context_window", .{ .integer = @intCast(e.budget.context) });
+        try m.put(a, "max_output_tokens", .{ .integer = @intCast(e.budget.output) });
+        try m.put(a, "supports_tool_use", .{ .bool = true });
+        try m.put(a, "supports_vision", .{ .bool = e.vision });
+        try metadata.put(a, e.id, .{ .object = m });
+    }
+    var auth: std.json.ObjectMap = .empty;
+    try auth.put(a, "type", .{ .string = "none" });
+    var provider: std.json.ObjectMap = .empty;
+    try provider.put(a, "protocol", .{ .string = "openai-chat-completions" });
+    try provider.put(a, "base_url", .{ .string = try std.fmt.allocPrint(a, "{s}/v1", .{base_url}) });
+    try provider.put(a, "auth", .{ .object = auth });
+    try provider.put(a, "model_metadata", .{ .object = metadata });
+
+    var providers: std.json.ObjectMap = .empty;
+    if (parsed.value.object.get("providers")) |p| {
+        if (p == .object) providers = p.object;
+    }
+    try providers.put(a, fx_provider, .{ .object = provider });
+    try parsed.value.object.put(a, "providers", .{ .object = providers });
+    return std.json.Stringify.valueAlloc(allocator, parsed.value, .{ .whitespace = .indent_2 });
+}
+
 /// codex `config.toml` — Responses wire API only (codex-rs `WireApi` has one
 /// variant), pointing at our /v1/responses. Keyless: no `env_key` and
 /// `requires_openai_auth` unset means codex skips login; the loopback server
@@ -348,6 +392,42 @@ pub fn codexConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model
         \\wire_api = "responses"
         \\
     , .{ model, budget.context, base_url });
+}
+
+/// grok `config.toml` under a dedicated GROK_HOME. A dummy XAI_API_KEY fails
+/// grok's key probe against xAI, so the credential is each model's `api_key`.
+/// Helper calls (titles, image descriptions, suggestions) default to xAI model
+/// ids, which would reach our server and load its default model: they are
+/// pinned to the launched one.
+pub fn grokConfigToml(allocator: std.mem.Allocator, base_url: []const u8, model: []const u8, entries: []const Entry) ![]u8 {
+    var out = std.ArrayList(u8).empty;
+    errdefer out.deinit(allocator);
+    try out.print(allocator,
+        \\# written by mlx-serve — dedicated GROK_HOME, regenerated at each launch.
+        \\[models]
+        \\default = "{s}"
+        \\session_summary = "{s}"
+        \\image_description = "{s}"
+        \\prompt_suggestion = "{s}"
+        \\
+    , .{ model, model, model, model });
+    for (entries) |e| {
+        try out.print(allocator,
+            \\
+            \\[model."{s}"]
+            \\model = "{s}"
+            \\base_url = "{s}/v1"
+            \\name = "{s} (mlx-serve)"
+            \\api_key = "mlx-serve"
+            \\context_window = {d}
+            \\max_completion_tokens = {d}
+            \\supports_reasoning_effort = true
+            \\reasoning_efforts = ["none", "low", "medium", "high"]
+            \\inference_idle_timeout_secs = 1800
+            \\
+        , .{ e.id, e.id, base_url, e.id, e.budget.context, e.budget.output });
+    }
+    return out.toOwnedSlice(allocator);
 }
 
 /// hermes `config.yaml` — mirrors what `hermes setup`'s custom-endpoint flow
@@ -667,6 +747,19 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
                 \\aider --model openai/{s} --weak-model openai/{s} --model-metadata-file ~/.mlx-serve/aider/model-metadata.json
             , .{ base_url, model, model });
         },
+        .fx => {
+            try out.print(allocator,
+                \\export FX_PROVIDER={s}
+                \\export FX_MODEL={s}
+                \\fx
+            , .{ fx_provider, model });
+        },
+        .grok => {
+            try out.appendSlice(allocator,
+                \\export GROK_HOME="$HOME/.mlx-serve/grok"
+                \\grok
+            );
+        },
     }
     try appendExtras(&out, allocator, extras);
     try out.append(allocator, '\n');
@@ -841,8 +934,9 @@ fn agentSkillLink(kind: AgentKind) ?[]const u8 {
         .omp => "omp/skills/" ++ agent_skills.name,
         .codex => "codex/skills/" ++ agent_skills.name,
         .hermes => "hermes/skills/" ++ agent_skills.name,
+        .grok => "grok/skills/" ++ agent_skills.name,
         .claude => claude_plugin_dir ++ "/skills/" ++ agent_skills.name,
-        .opencode, .opencode2, .aider => null,
+        .opencode, .opencode2, .aider, .fx => null,
     };
 }
 
@@ -938,6 +1032,25 @@ fn writeConfigs(allocator: std.mem.Allocator, io: std.Io, kind: AgentKind, base_
             const json = try aiderMetadataJson(allocator, entries);
             defer allocator.free(json);
             try writeAgentFile(allocator, io, "aider", "model-metadata.json", json);
+        },
+        .fx => {
+            const dir_path = try std.fmt.allocPrint(allocator, "{s}/.fx", .{homeDir()});
+            defer allocator.free(dir_path);
+            var dir = try std.Io.Dir.cwd().createDirPathOpen(io, dir_path, .{});
+            defer dir.close(io);
+            const existing = dir.readFileAlloc(io, "settings.json", allocator, .limited(1 << 20)) catch |err| switch (err) {
+                error.FileNotFound => try allocator.dupe(u8, "{}"),
+                else => return err,
+            };
+            defer allocator.free(existing);
+            const json = try mergeFxSettingsJson(allocator, existing, base_url, entries);
+            defer allocator.free(json);
+            try dir.writeFile(io, .{ .sub_path = "settings.json", .data = json, .flags = .{ .permissions = .fromMode(0o600) } });
+        },
+        .grok => {
+            const toml = try grokConfigToml(allocator, base_url, model, entries);
+            defer allocator.free(toml);
+            try writeAgentFile(allocator, io, "grok", "config.toml", toml);
         },
     }
 }
@@ -1313,6 +1426,85 @@ test "pi settings.json merge scales compaction to the window and keeps the rest"
     const bc = bp.value.object.get("compaction").?.object;
     try t.expectEqual(@as(i64, 16384), bc.get("reserveTokens").?.integer);
     try t.expectEqual(@as(i64, 20000), bc.get("keepRecentTokens").?.integer);
+}
+
+test "fx settings merge owns providers.mlx-serve and keeps everything else" {
+    const existing =
+        \\{"provider":"gateway","models":{"gateway":"x/y"},"providers":{"other":{"protocol":"openai-chat-completions","base_url":"https://o/v1","auth":{"type":"none"}},"mlx-serve":{"base_url":"stale"}}}
+    ;
+    const entries = [_]Entry{
+        .{ .id = "org/m1", .budget = .{ .context = 32768, .output = 16384 }, .vision = false, .loaded = true },
+        .{ .id = "org/m2", .budget = .{ .context = 262144, .output = 65536 }, .vision = true, .loaded = false },
+    };
+    const json = try mergeFxSettingsJson(t.allocator, existing, "http://127.0.0.1:11234", &entries);
+    defer t.allocator.free(json);
+    const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, json, .{});
+    defer parsed.deinit();
+    const obj = parsed.value.object;
+    // The user's default provider and model stay theirs: a launch selects ours by env.
+    try t.expectEqualStrings("gateway", obj.get("provider").?.string);
+    try t.expectEqualStrings("x/y", obj.get("models").?.object.get("gateway").?.string);
+    const providers = obj.get("providers").?.object;
+    try t.expectEqualStrings("https://o/v1", providers.get("other").?.object.get("base_url").?.string);
+    const ours = providers.get(fx_provider).?.object;
+    try t.expectEqualStrings("openai-chat-completions", ours.get("protocol").?.string);
+    try t.expectEqualStrings("http://127.0.0.1:11234/v1", ours.get("base_url").?.string);
+    try t.expectEqualStrings("none", ours.get("auth").?.object.get("type").?.string);
+    const m2 = ours.get("model_metadata").?.object.get("org/m2").?.object;
+    try t.expectEqual(@as(i64, 262144), m2.get("context_window").?.integer);
+    try t.expectEqual(@as(i64, 65536), m2.get("max_output_tokens").?.integer);
+    try t.expectEqual(true, m2.get("supports_tool_use").?.bool);
+    try t.expectEqual(true, m2.get("supports_vision").?.bool);
+    try t.expectEqual(false, ours.get("model_metadata").?.object.get("org/m1").?.object.get("supports_vision").?.bool);
+}
+
+test "fx settings merge starts a missing file and never replaces one it cannot read" {
+    const entries = [_]Entry{.{ .id = "m1", .budget = FALLBACK_BUDGET, .vision = false, .loaded = true }};
+    const fresh = try mergeFxSettingsJson(t.allocator, " \n", "http://x:1", &entries);
+    defer t.allocator.free(fresh);
+    try t.expect(std.mem.indexOf(u8, fresh, "\"mlx-serve\"") != null);
+    try t.expectError(error.UnreadableFxSettings, mergeFxSettingsJson(t.allocator, "{\"provider\": ", "http://x:1", &entries));
+    try t.expectError(error.UnreadableFxSettings, mergeFxSettingsJson(t.allocator, "[]", "http://x:1", &entries));
+}
+
+test "fx script selects our provider and model by env, never by a saved default" {
+    try t.expectEqual(AgentKind.fx, AgentKind.fromName("fx").?);
+    const script = try scriptFor(t.allocator, .fx, "http://x:1", "org/m1", FALLBACK_BUDGET, null, &.{"ask"});
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "export FX_PROVIDER=mlx-serve\nexport FX_MODEL=org/m1\nfx 'ask'\n") != null);
+}
+
+test "grok config: every chat model keyed by its id, helpers pinned to the launched model" {
+    const entries = [_]Entry{
+        .{ .id = "org/m1", .budget = .{ .context = 32768, .output = 16384 }, .vision = false, .loaded = true },
+        .{ .id = "org/m2", .budget = .{ .context = 262144, .output = 65536 }, .vision = true, .loaded = false },
+    };
+    const toml = try grokConfigToml(t.allocator, "http://127.0.0.1:11234", "org/m2", &entries);
+    defer t.allocator.free(toml);
+    // An unknown helper model (grok-4.6) would reach the server and load its default.
+    for ([_][]const u8{ "default", "session_summary", "image_description", "prompt_suggestion" }) |key| {
+        const line = try std.fmt.allocPrint(t.allocator, "{s} = \"org/m2\"\n", .{key});
+        defer t.allocator.free(line);
+        try t.expect(std.mem.indexOf(u8, toml, line) != null);
+    }
+    try t.expect(std.mem.indexOf(u8, toml,
+        \\[model."org/m1"]
+        \\model = "org/m1"
+        \\base_url = "http://127.0.0.1:11234/v1"
+        \\name = "org/m1 (mlx-serve)"
+        \\api_key = "mlx-serve"
+        \\context_window = 32768
+        \\max_completion_tokens = 16384
+        \\supports_reasoning_effort = true
+    ) != null);
+    try t.expect(std.mem.indexOf(u8, toml, "context_window = 262144\nmax_completion_tokens = 65536\n") != null);
+}
+
+test "grok script rides a dedicated GROK_HOME" {
+    try t.expectEqual(AgentKind.grok, AgentKind.fromName("grok").?);
+    const script = try scriptFor(t.allocator, .grok, "http://x:1", "m1", FALLBACK_BUDGET, null, &.{"-c"});
+    defer t.allocator.free(script);
+    try t.expect(std.mem.indexOf(u8, script, "export GROK_HOME=\"$HOME/.mlx-serve/grok\"\ngrok '-c'\n") != null);
 }
 
 test "opencode config: limit.output is the compaction reserve, opencode2 gets a scaled compaction block" {
