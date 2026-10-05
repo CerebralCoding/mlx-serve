@@ -620,7 +620,6 @@ pub const Engine = struct {
         model.resolveWeightPrefix(&self.config, &self.weights);
         self.xfm = try transformer.Transformer.init(io, a, self.config, &self.weights);
         errdefer self.xfm.deinit();
-        self.xfm.vlm_prefill = true;
         self.xfm.compileGdnGate();
         const raw_gelu = mlx.mlx_closure_new_func_payload(&geluClosure, &self.stream, null);
         defer _ = mlx.mlx_closure_free(raw_gelu);
@@ -726,9 +725,6 @@ pub const Engine = struct {
             for (0..3) |axis| @memcpy(positions[axis * ids.len ..][0..ids.len], ri.pos[axis]);
             delta = ri.delta;
         }
-        const rope_dims: c_int = @intFromFloat(@as(f32, @floatFromInt(self.config.head_dim)) * self.config.partial_rotary_factor);
-        var rotation = try @import("mrope_gpu.zig").Rotation.init(a, self.stream, positions, rope_dims, self.config.rope_theta, self.config.mrope_section);
-        defer rotation.deinit();
         var cache = try transformer.KVCache.init(a, self.config.num_hidden_layers);
         defer cache.deinit();
         const entries = try a.alloc(transformer.SSMCacheEntry, self.config.num_hidden_layers);
@@ -751,7 +747,6 @@ pub const Engine = struct {
         ctx.mrope_pos = positions;
         ctx.mrope_total = ids.len;
         ctx.mrope_delta = delta;
-        ctx.mrope_f32 = &rotation;
         if (images.len != 0) {
             ctx.vision_embeddings = try media_ops.cat(embeddings, 1);
         }

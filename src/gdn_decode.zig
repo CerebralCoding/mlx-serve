@@ -74,9 +74,10 @@ const K1_SOURCE =
     \\  T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\  gb[1] = float(bsig);
     \\  const T apd = T(float(a_in[hv]) + float(dt_bias[hv]));
-    \\  float sp = msv_log1p(metal::precise::exp(float(apd)));
+    \\  const T sp_exp = T(metal::precise::exp(-metal::abs(float(apd))));
+    \\  const T sp = T(metal::max(float(apd), 0.0f)) + T(msv_log1p(float(sp_exp)));
     \\  float ea = metal::precise::exp(float(A_log[hv]));
-    \\  gb[0] = float(T(metal::precise::exp(-(ea * sp))));
+    \\  gb[0] = metal::precise::exp(-(ea * float(sp)));
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
     \\float kk[4], qq[4];
@@ -113,8 +114,9 @@ const K2_SOURCE =
     \\  for (int i = 0; i < 4; ++i) {
     \\    const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
     \\    const T zv = z[hb + lane * 4 + i];
-    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); T sig = zv < T(0) ? sy : T(1) - sy;
-    \\    tg[hb - base + lane * 4 + i] = float((zv * sig) * normed) * signs[hb + lane * 4 + i];
+    \\    float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(float(zv))));
+    \\    float sig = zv < T(0) ? sy : 1.0f - sy;
+    \\    tg[hb - base + lane * 4 + i] = float(T((float(zv) * sig) * float(normed))) * signs[hb + lane * 4 + i];
     \\  }
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -212,8 +214,9 @@ const K1S_HEAD =
     \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\    gb[t][1] = float(bsig);
     \\    const T apd = T(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
-    \\    float sp = msv_log1p(metal::precise::exp(float(apd)));
-    \\    gb[t][0] = float(T(metal::precise::exp(-(ea * sp))));
+    \\    const T sp_exp = T(metal::precise::exp(-metal::abs(float(apd))));
+    \\    const T sp = T(metal::max(float(apd), 0.0f)) + T(msv_log1p(float(sp_exp)));
+    \\    gb[t][0] = metal::precise::exp(-(ea * float(sp)));
     \\  }
     \\}
     \\threadgroup_barrier(mem_flags::mem_threadgroup);
@@ -276,7 +279,11 @@ const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
     \\    const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
     \\    const T zv = z[base + i];
     \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); T sig = zv < T(0) ? sy : T(1) - sy;
-    \\    gated[base + i] = SWISH ? (zv * sig) * normed : normed * sig;
+    \\    if constexpr (SWISH) {
+    \\      float sy32 = 1.0f / (1.0f + metal::precise::exp(metal::abs(float(zv))));
+    \\      float sg32 = zv < T(0) ? sy32 : 1.0f - sy32;
+    \\      gated[base + i] = T((float(zv) * sg32) * float(normed));
+    \\    } else gated[base + i] = normed * sig;
     \\  }
     \\}
 ;
@@ -327,8 +334,9 @@ const K1P_SOURCE =
     \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
     \\    pg[(t * HV + h) * 2 + 1] = float(bsig);
     \\    const T apd = T(float(a_in[t * ABS + AOFF + h]) + float(dt_bias[h]));
-    \\    float sp = msv_log1p(metal::precise::exp(float(apd)));
-    \\    pg[(t * HV + h) * 2] = float(T(metal::precise::exp(-(ea * sp))));
+    \\    const T sp_exp = T(metal::precise::exp(-metal::abs(float(apd))));
+    \\    const T sp = T(metal::max(float(apd), 0.0f)) + T(msv_log1p(float(sp_exp)));
+    \\    pg[(t * HV + h) * 2] = metal::precise::exp(-(ea * float(sp)));
     \\  }
     \\}
 ;

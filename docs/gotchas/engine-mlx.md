@@ -306,6 +306,14 @@ return contig(o, s);   // `o` is never freed
 - **Rule**: a handle you still hold pins its buffer through the eval. Release a step's intermediates before evaluating its result, not after.
 - Guard: `sa3: a 30 s sample + decode holds no more than one step's working set` (SA3_TEST_MODEL), red at 9969 MB before the fix.
 
+## GDN reference precision
+
+Casting decay gates to bf16 rounds near-one values to one, changing the
+recurrence's memory decay. Keep `compute_g` and fused gate outputs in f32;
+evaluate the swish norm gate in f32 and cast its result to the activation dtype,
+as mlx-lm and mlx-vlm do. The shared reference-precision and fused/composed
+parity tests cover the decay, output gate, and independent input/state widths.
+
 ## GDN blocked-prefill kernel: hardcoded bf16 vs an f16 checkpoint (2026-07-25)
 
 `./mlx-serve --serve --model=~/.mlx-serve/models/…/Nanbeige…` died mid-request with
@@ -336,8 +344,8 @@ Every other GDN model we serve is bf16. With f16 weights the activations get
 promoted to fp32 (f16 ⊕ f32-scalar → f32, the `scalarLike` class), which the
 mangled kernel name states outright — the input dtype list reads
 `float float float bfloat16_t float bfloat16_t int32_t` for
-q,k,v,g,beta,state_in,T. So q/k/v/beta are fp32 while `g` (our fused gate
-kernel's output) and the state buffer stay bf16: a genuinely MIXED input set.
+q,k,v,g,beta,state_in,T. The kernel must read each input at its own width;
+the decay gate remains f32, independently of activation and state widths.
 
 `transformer.zig` hardcoded `add_template_arg_dtype(config, "InT", .bfloat16)`
 at five sites, and the blocked kernel body hand-declared
@@ -652,7 +660,7 @@ the repo pins Laguna token bytes, so there was no baseline to re-cut.
 into an activation in another silently widens everything downstream of it. The two other
 f32 tables on this decode path already got it right and are the pattern to copy: the MoE
 router computes in f32 deliberately and `astype`s back to bf16 before returning, and
-M-RoPE's cos/sin are built f32 then cast to bf16 before they touch q/k. Same family as
+M-RoPE computes its rotation in f32 then casts the result to the input dtype. Same family as
 MageFlow's `scalarLike` rule. Guards: `constTableAs hands a load-time f32 table back in
 the activation dtype`, `a constant table must not widen the activation it scales`, and a
 source scan (`the YaRN mscale table never reaches a multiply in its load-time dtype`) —

@@ -24,7 +24,6 @@ test {
     _ = @import("muse_vision.zig");
     _ = @import("lfm2_vision.zig");
     _ = @import("mrope.zig");
-    _ = @import("mrope_gpu.zig");
     _ = @import("rht.zig");
     _ = @import("qmv2.zig");
     _ = @import("moe_gather_ubench.zig");
