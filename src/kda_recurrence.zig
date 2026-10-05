@@ -148,6 +148,11 @@ pub fn recur(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_a
 /// short conv, the low-rank gate projections, the q/k l2 norms, the gate, the delta rule and
 /// the gated RMSNorm for T <= 8 tokens of one sequence.
 var decode_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
+/// Threads per threadgroup; a test raises it past any GPU's cap.
+var decode_threads: c_int = 1024;
+/// Whether this GPU launches the decode kernel at that count, per [gate slot][tokens][8-bit gates]:
+/// Metal caps a kernel's threadgroup by its register use and MLX reports it only at evaluation.
+var decode_launchable: [2][9][2]?bool = @splat(@splat(@splat(null)));
 
 pub const Low = struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array, bits: u32, gs: u32 };
 /// `state_seq` f32 [T, H, 128, 128], the state after each row, only under `capture`.
@@ -178,6 +183,8 @@ pub fn decodeStep(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa:
     if (mlx.mlx_array_dtype(f_b.s) != dt or mlx.mlx_array_dtype(g_b.s) != dt) return null;
 
     const slot: usize = @intFromBool(gate5);
+    const launchable_at = &decode_launchable[slot][@intCast(t)][@intFromBool(f_b.bits == 8)];
+    if (launchable_at.* == false) return null;
     const kern = decode_kernels[slot] orelse blk: {
         const ins = [_][*:0]const u8{ "proj", "conv_w", "a_log", "dt_bias", "norm_w", "consts", "conv_state", "state_in", "fb_w", "fb_s", "fb_b", "gb_w", "gb_s", "gb_b" };
         const outs = [_][*:0]const u8{ "y", "conv_state_out", "state_out", "state_seq" };
@@ -201,8 +208,8 @@ pub fn decodeStep(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa:
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, 3, 3 * qkv }, 3, dt));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, heads, 128, 128 }, 4, .float32));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, if (capture) &[_]c_int{ t, heads, 128, 128 } else &[_]c_int{ 1, 1, 1, 1 }, 4, .float32));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 1024 * heads, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 1024, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, decode_threads * heads, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, decode_threads, 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
     inline for (.{ .{ "TOK", t }, .{ "DK", 128 }, .{ "QKV", qkv }, .{ "PROJ_W", ps[2] }, .{ "OFF_FA", off_fa }, .{ "OFF_GA", off_ga }, .{ "OFF_B", off_b }, .{ "BITS", @as(c_int, @intCast(f_b.bits)) }, .{ "GS", @as(c_int, @intCast(f_b.gs)) }, .{ "CAP", @as(c_int, @intFromBool(capture)) } }) |ta| {
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, ta[0], ta[1]));
@@ -223,6 +230,18 @@ pub fn decodeStep(s: mlx.mlx_stream, proj: mlx.mlx_array, off_ga: c_int, off_fa:
     if (capture) {
         out.state_seq = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_vector_array_get(&out.state_seq, ov, 3));
+    }
+    if (launchable_at.* == null) {
+        mlx.check(mlx.mlx_array_eval(out.state)) catch |e| {
+            if (e != error.MlxError or !mlx.takeErrorIf("Thread group size")) return e;
+            launchable_at.* = false;
+            inline for (.{ out.y, out.conv_state, out.state, out.state_seq }) |a| {
+                _ = mlx.mlx_array_free(a);
+            }
+            @import("log.zig").info("[kda] decode step declined: this GPU launches fewer than {d} threads per threadgroup\n", .{decode_threads});
+            return null;
+        };
+        launchable_at.* = true;
     }
     if (!decode_engaged) {
         decode_engaged = true;
@@ -364,6 +383,7 @@ test "kda per-core recurrence follows the bounded-gate delta rule" {
 
 test "kda decode step over T rows equals T one-row steps, bit for bit, at the gate widths a verify window serves" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
     const s = mlx.gpuStream();
     const heads: c_int = 64;
     const qkv: c_int = heads * 128;
@@ -440,7 +460,18 @@ test "kda decode step over T rows equals T one-row steps, bit for bit, at the ga
         const f_b: Low = .{ .w = fw, .s = fs, .b = fbias, .bits = bits, .gs = 64 };
         const g_b: Low = .{ .w = gw, .s = gs_, .b = gbias, .bits = bits, .gs = 64 };
 
+        // A threadgroup past the GPU's cap declines and leaves no latched error behind.
+        const launchable_at = &decode_launchable[0][@intCast(rows)][@intFromBool(bits == 8)];
+        {
+            decode_threads = 2048;
+            defer decode_threads = 1024;
+            const too_wide = try decodeStep(s, proj, off_ga, off_fa, off_b, heads, conv0, conv_w, a_log, dt_bias, state0, norm_w, f_b, g_b, -5.0, 1e-6, true);
+            try testing.expect(too_wide == null and launchable_at.* == false and !mlx.errorPending());
+        }
+        launchable_at.* = null;
+
         const multi = (try decodeStep(s, proj, off_ga, off_fa, off_b, heads, conv0, conv_w, a_log, dt_bias, state0, norm_w, f_b, g_b, -5.0, 1e-6, true)) orelse {
+            if (launchable_at.* == false) return error.SkipZigTest; // a GPU that cannot launch the kernel
             std.debug.print("decodeStep declined {d} rows at {d}-bit gates\n", .{ rows, bits });
             return error.Declined;
         };

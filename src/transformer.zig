@@ -25913,7 +25913,8 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_free(r);
         };
         const joined = la.in.w.ctx != null and la.a_log_h.ctx != null and la.a2.w.ctx != null and la.z2.w.ctx != null;
-        if (joined) {
+        // A GPU that cannot launch the fused step declines at the first slot: the per-slot path below serves it.
+        if (joined) joined_path: {
             for (slots) |sl| {
                 const e = &sl.ssm_entries.?[li];
                 if (!e.initialized or e.ssm_state.ctx == null or e.conv_state.ctx == null) return error.GlmBatchedStateMissing;
@@ -25926,7 +25927,7 @@ pub const Transformer = struct {
                 const e = &sl.ssm_entries.?[li];
                 const proj = try axisView(self.s, all, 1, i);
                 defer _ = mlx.mlx_array_free(proj);
-                const r = (try kda_recurrence.decodeStep(self.s, proj, w[0], w[0] + w[1], w[0] + w[1] + w[2], heads, e.conv_state, la.conv1d_w, la.a_log_h, la.dt_f32, e.ssm_state, la.norm_w, lows.fb, lows.gb, cfg.kda_gate_lower_bound, cfg.rms_norm_eps, false)) orelse return error.GlmBatchedKdaDeclined;
+                const r = (try kda_recurrence.decodeStep(self.s, proj, w[0], w[0] + w[1], w[0] + w[1] + w[2], heads, e.conv_state, la.conv1d_w, la.a_log_h, la.dt_f32, e.ssm_state, la.norm_w, lows.fb, lows.gb, cfg.kda_gate_lower_bound, cfg.rms_norm_eps, false)) orelse if (i == 0) break :joined_path else return error.GlmBatchedKdaDeclined;
                 _ = mlx.mlx_array_free(e.conv_state);
                 e.conv_state = r.conv_state;
                 _ = mlx.mlx_array_free(e.ssm_state);
