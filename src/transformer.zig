@@ -15214,6 +15214,7 @@ pub const ForwardCtx = struct {
     mrope_delta: i32 = 0,
     mrope_cos_cur: ?mlx.mlx_array = null,
     mrope_sin_cur: ?mlx.mlx_array = null,
+    mrope_f32: ?*const @import("mrope_gpu.zig").Rotation = null,
     /// qwen4_exp QSA: the bool `[B, 1, S, kv]` mask (indexer-selected blocks
     /// ∧ causal) `gatedFullAttnWith` must apply this layer. Null-ctx = dense.
     qsa_mask: mlx.mlx_array = .{ .ctx = null },
@@ -16863,6 +16864,8 @@ pub const Transformer = struct {
     gdn_k_scale: ?mlx.mlx_array = null, // bf16 scalar 1/sqrt(dk)
     grouped_norm_ones: ?mlx.mlx_array = null, // k2_horizon: rms_norm ones weight, one group wide
     gdn_eps: ?mlx.mlx_array = null, // f32 scalar rms_norm_eps for the fused norm-gate kernel
+    // Clef requires mlx-vlm's float32 gates and stock recurrence/attention order.
+    vlm_prefill: bool = false,
     /// PLD spec-decode: mirrors `ForwardCtx.capture_ssm_seq` for the current
     /// forward so `gatedDeltaNet`/`conv1dWithCache` (which don't take the ctx)
     /// can capture per-position state. Set+reset only inside `forwardMoeWith`.
@@ -17958,7 +17961,7 @@ pub const Transformer = struct {
         if (mlx.mlx_vector_array_get(&dt_bias, input, 2) != 0) return -1;
         defer _ = mlx.mlx_array_free(dt_bias);
 
-        const g = gdnGateChain(A_log, a, dt_bias, self.s) catch return -1;
+        const g = (if (self.vlm_prefill) gdnGateF32(A_log, a, dt_bias, self.s) else gdnGateChain(A_log, a, dt_bias, self.s)) catch return -1;
         const out_arr = [_]mlx.mlx_array{g};
         res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
         _ = mlx.mlx_array_free(g);
@@ -17981,7 +17984,7 @@ pub const Transformer = struct {
                 return g;
             }
         }
-        return gdnGateChain(A_log, a, dt_bias, self.s);
+        return if (self.vlm_prefill) gdnGateF32(A_log, a, dt_bias, self.s) else gdnGateChain(A_log, a, dt_bias, self.s);
     }
 
     /// qwen4_exp: compile the four hyper-connection elementwise tails.
@@ -27934,6 +27937,7 @@ pub const Transformer = struct {
     /// position table (decode, multi-token spec verify) leave them null and
     /// take the scalar `offset + delta` path.
     fn beginMropeChunk(self: *Transformer, ctx: *ForwardCtx, offset: usize, seq_len: usize, dtype: mlx.mlx_dtype) !void {
+        if (ctx.mrope_f32 != null) return;
         if (ctx.mrope_pos == null or seq_len <= 1 or offset + seq_len > ctx.mrope_total) return;
         const cs = try self.mropeCosSinAt(mropeContext(ctx), offset, 1, seq_len, dtype);
         ctx.mrope_cos_cur = cs.cos;
@@ -28260,7 +28264,7 @@ pub const Transformer = struct {
         var k_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_rope);
         var fused_qk = false;
-        if (batch == 1 and seq_len == 1 and hd == 128 and ctx.mrope_cos_cur == null and ctx.head_rope_pos.ctx == null and
+        if (batch == 1 and seq_len == 1 and hd == 128 and ctx.mrope_f32 == null and ctx.mrope_cos_cur == null and ctx.head_rope_pos.ctx == null and
             fa.q_norm.ctx != null and fa.k_norm.ctx != null and
             self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
         blk: {
@@ -28281,7 +28285,7 @@ pub const Transformer = struct {
         // spec-verify widths (S 1..16) — the hd-128 gate above never fires
         // there, so those layers paid the composed chain on every step.
         if (!fused_qk and batch == 1 and hd == 256 and seq_len <= 32 and
-            ctx.mrope_cos_cur == null and ctx.head_rope_pos.ctx == null and
+            ctx.mrope_f32 == null and ctx.mrope_cos_cur == null and ctx.head_rope_pos.ctx == null and
             fa.q_norm.ctx != null and fa.k_norm.ctx != null and
             self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
         blk: {
@@ -28337,7 +28341,12 @@ pub const Transformer = struct {
             // text-only qwen3_5). YaRN needs nothing here: the M-RoPE tables are
             // filled from the scaled spectrum + mscale at the one choke point
             // (`mropeCosSinAt`), and the scalar arms take the freqs array below.
-            if (ctx.mrope_cos_cur) |cos| {
+            if (ctx.mrope_f32) |rotation| {
+                _ = mlx.mlx_array_free(q_rope);
+                _ = mlx.mlx_array_free(k_rope);
+                q_rope = try rotation.apply(self.s, q_t);
+                k_rope = try rotation.apply(self.s, k_t);
+            } else if (ctx.mrope_cos_cur) |cos| {
                 const sin = ctx.mrope_sin_cur.?;
                 _ = mlx.mlx_array_free(q_rope);
                 _ = mlx.mlx_array_free(k_rope);
@@ -28475,6 +28484,8 @@ pub const Transformer = struct {
             return error.SpecTreeUnsupported;
         } else if (self.config.rowExactDecode() and seq_len > 1 and seq_len <= rowqmv.MAX_ROWS and batch == 1) {
             try rowByRowSdpa(&attn_out, q_rope, full_k, full_v, attn_scale, seq_len, self.s);
+        } else if (self.vlm_prefill and is_prefill) {
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, full_k, full_v, attn_scale, "causal", none_mask, .{ .ctx = null }, false, self.s));
         } else if (is_prefill) {
             if (try fusedSdpa256Prefill(self.s, q_rope, full_k, full_v, attn_scale, 0)) |fused| {
                 _ = mlx.mlx_array_free(attn_out);
@@ -30416,7 +30427,7 @@ pub const Transformer = struct {
         const kda_fused = cfg.kda_vector_gate and cfg.kdaUsesBoundedGate() and !self.spec_capture_ssm and
             kda_recurrence.serves(self.s, num_k_heads, num_v_heads, dk, dv, mlx.mlx_array_dtype(qkv), self.ssmStateDtype());
         // Wide prework is token-local; a cold chunk supplies the same zero history as conv1dWithCache.
-        const prefill_fused = (cfg.longCtxGated() or kda_fused) and is_prefill and gdnPrefillFusedFor(seq_len, batch);
+        const prefill_fused = !self.vlm_prefill and (cfg.longCtxGated() or kda_fused) and is_prefill and gdnPrefillFusedFor(seq_len, batch);
         if (((!cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate()) or kda_fused) and
             (batch * seq_len <= GDN_FUSED_MAX_ROWS or prefill_fused) and
             kernel == 4 and (ssm.initialized or prefill_fused))
@@ -30706,7 +30717,7 @@ pub const Transformer = struct {
             // The blocked kernel reads a PER-HEAD gate; a per-channel (KDA)
             // gate is a different indexing contract, so it declines outright
             // rather than silently reading the wrong element.
-            const blocked_tb: ?u32 = if (!vector_gate and gdnBlockedEnabled() and gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads))
+            const blocked_tb: ?u32 = if (!self.vlm_prefill and !vector_gate and gdnBlockedEnabled() and gdnBlockedEligible(seq_len, dk, dv, num_k_heads, num_v_heads))
                 gdnBlockTFor(gdnBlockT(), dk, gdn_in_itemsize)
             else
                 null;
@@ -30744,7 +30755,7 @@ pub const Transformer = struct {
 
         // Fused epilogue: rms_norm(y) * silu(z) straight to the flat
         // out_proj input (decode/verify widths, per-head swish gate archs).
-        if (fused_prework) {
+        if (fused_prework and !(is_prefill and self.vlm_prefill)) {
             if (self.gdn_eps == null) self.gdn_eps = mlx.mlx_array_new_float(cfg.rms_norm_eps);
             if (try gdnNormGateFused(self.s, y_bthd, z_proj, 0, value_dim, la.norm_w, self.gdn_eps.?, !cfg.kda_sigmoid_out_gate, num_v_heads, dv, batch, seq_len)) |flat| {
                 defer _ = mlx.mlx_array_free(flat);
@@ -30770,6 +30781,18 @@ pub const Transformer = struct {
             var gated = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_multiply(&gated, y_normed, gate, self.s));
             break :blk gated;
+        } else if (is_prefill and self.vlm_prefill) blk: {
+            var z32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(z32);
+            var y32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(y32);
+            try mlx.check(mlx.mlx_astype(&z32, z_heads, .float32, self.s));
+            try mlx.check(mlx.mlx_astype(&y32, y_normed, .float32, self.s));
+            const gated = try self.swiglu(z32, y32);
+            defer _ = mlx.mlx_array_free(gated);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, gated, mlx.mlx_array_dtype(y_bthd), self.s));
+            break :blk out;
         } else try self.swiglu(z_heads, y_normed);
         defer _ = mlx.mlx_array_free(out_gated);
 
@@ -35864,15 +35887,64 @@ pub fn computeQuantParams(config: *const ModelConfig, w: mlx.mlx_array, sc: mlx.
     return .{ .bits = 8, .group_size = 64, .mode = .affine };
 }
 
-/// MoE routing chain (negate→argpartition→slice→softmax→take→sum→expand→divide).
-/// Free-function variant of `Transformer.moeRoutingUncompiled` so unit tests can
-/// exercise the pure subgraph without constructing a full Transformer. Returns
-/// owned `inds` (int32, [..., k]) and `norm_scores` (bf16, [..., k]) — caller
-/// must free both.
-/// GatedDeltaNet gating chain: g = exp(-exp(A_log) * softplus(a + dt_bias)),
-/// computed in float32 for stability and returned as bfloat16. Mirrors
-/// mlx-lm's `compute_g` (which is `@mx.compile`d). Pure — serves as both the
-/// compiled-closure body and the uncompiled fallback. Returns owned array.
+test "clef: GDN decay retains float32 precision near one and finite extreme gates" {
+    const s = mlx.gpuStream();
+    var cache = try KVCache.init(std.testing.allocator, 0);
+    defer cache.deinit();
+    var xfm = std.mem.zeroInit(Transformer, .{ .s = s, .allocator = std.testing.allocator, .cache = cache, .vlm_prefill = true });
+    xfm.compileGdnGate();
+    defer if (xfm.compiled_gdn_gate) |closure| {
+        _ = mlx.mlx_closure_free(closure);
+    };
+    const values = [_]f32{ -128, -8, -2, 0, 2, 8, 128 };
+    const raw = mlx.mlx_array_new_data(&values, &[_]c_int{values.len}, 1, .float32);
+    defer _ = mlx.mlx_array_free(raw);
+    var gate = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(gate);
+    try mlx.check(mlx.mlx_astype(&gate, raw, .bfloat16, s));
+    const zero = try scalarOf(0, .bfloat16, s);
+    defer _ = mlx.mlx_array_free(zero);
+    const result = try xfm.computeGdnGate(zero, gate, zero);
+    defer _ = mlx.mlx_array_free(result);
+    try std.testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(result));
+    try mlx.check(mlx.mlx_array_eval(result));
+    const actual = mlx.mlx_array_data_float32(result).?;
+    for (values, 0..) |v, i| {
+        const softplus: f32 = @floatCast(@log(1 + @exp(@as(f64, v))));
+        const bits: u32 = @bitCast(softplus);
+        const rounded: f32 = @bitCast((bits + 0x7fff + ((bits >> 16) & 1)) & 0xffff0000);
+        try std.testing.expectApproxEqAbs(@exp(-rounded), actual[i], 0.000001);
+    }
+}
+
+fn gdnGateF32(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var log32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(log32);
+    try mlx.check(mlx.mlx_astype(&log32, A_log, .float32, s));
+    var exp_A = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(exp_A);
+    try mlx.check(mlx.mlx_exp(&exp_A, log32, s));
+    var neg_A = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg_A);
+    try mlx.check(mlx.mlx_negative(&neg_A, exp_A, s));
+    var sum = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(sum);
+    try mlx.check(mlx.mlx_add(&sum, a, dt_bias, s));
+    const zero = try scalarOf(0, mlx.mlx_array_dtype(sum), s);
+    defer _ = mlx.mlx_array_free(zero);
+    var softplus = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(softplus);
+    try mlx.check(mlx.mlx_logaddexp(&softplus, sum, zero, s));
+    var decay = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(decay);
+    try mlx.check(mlx.mlx_multiply(&decay, neg_A, softplus, s));
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_exp(&out, decay, s));
+    return out;
+}
+
+/// Returns owned bf16 decay; shared by the compiled closure and raw fallback.
 fn gdnGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     var A_log_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(A_log_f32);
@@ -35958,6 +36030,7 @@ fn kdaGateChain(A_log: mlx.mlx_array, a: mlx.mlx_array, dt_bias: mlx.mlx_array, 
     return g;
 }
 
+/// Returns owned indices (int32) and normalized scores (bf16), both shaped [..., k].
 fn moeRoutingChain(router_logits: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !Transformer.MoeRouting {
     var neg_logits = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(neg_logits);

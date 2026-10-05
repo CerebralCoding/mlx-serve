@@ -27,6 +27,7 @@ const stable_audio = @import("stable_audio.zig");
 const kokoro = @import("kokoro.zig");
 const laya = @import("laya.zig");
 const kev = @import("kev.zig");
+const clef = @import("clef.zig");
 const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
@@ -104,7 +105,7 @@ pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
-    "laya",      "kev",        "stable_audio3",
+    "laya",      "kev",        "clef",           "stable_audio3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -120,7 +121,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
-    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev")) return .decision;
+    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef")) return .decision;
     return null;
 }
 
@@ -183,6 +184,7 @@ pub const AudioBackendKind = enum {
 pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     // Guard the openFileAbsolute assert (ReleaseFast UB on relative/empty paths).
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
+    if (isClefPack(io, model_dir)) return allocator.dupe(u8, "clef") catch null;
     // A Kev pack's root config.json is its qwen3_5 base: the marker is checked first (discovery agrees).
     if (isKevPack(io, model_dir)) return allocator.dupe(u8, "kev") catch null;
     if (readConfigModelType(io, allocator, model_dir)) |mt| return mt;
@@ -203,6 +205,12 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // Stable Audio 3 as Stability publishes it: stable-audio-tools' model_config.json.
     if (isStableAudio3Repo(io, allocator, model_dir)) return allocator.dupe(u8, "stable_audio3") catch null;
     return null;
+}
+
+fn isClefPack(io: std.Io, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekClefPack(io, dir);
 }
 
 /// Thin path→Dir wrapper over `model_discovery.peekStableAudio3Config`.
@@ -979,7 +987,7 @@ pub const DecisionEngine = struct {
     batch_window_us: u32 = 0,
     limits: DecisionLimits = .{},
 
-    pub const Backend = union(enum) { laya: *laya.Engine, kev: *kev.Engine };
+    pub const Backend = union(enum) { laya: *laya.Engine, kev: *kev.Engine, clef: *clef.Engine };
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*DecisionEngine {
         const self = try allocator.create(DecisionEngine);
@@ -987,7 +995,9 @@ pub const DecisionEngine = struct {
         self.allocator = allocator;
         self.stream = mlx.mlx_default_gpu_stream_new();
         errdefer _ = mlx.mlx_stream_free(self.stream);
-        self.backend = if (isKevPack(io, model_dir))
+        self.backend = if (isClefPack(io, model_dir))
+            .{ .clef = try clef.Engine.load(io, allocator, model_dir, self.stream) }
+        else if (isKevPack(io, model_dir))
             .{ .kev = try kev.Engine.load(io, allocator, model_dir, self.stream) }
         else
             .{ .laya = try laya.Engine.load(io, allocator, model_dir, self.stream) };
@@ -999,7 +1009,7 @@ pub const DecisionEngine = struct {
             }
         else
             0;
-        log.info("[decision] {s} engine ready\n", .{if (self.backend == .kev) "Kev" else "Laya"});
+        log.info("[decision] {s} engine ready\n", .{@tagName(self.backend)});
         return self;
     }
 
@@ -1012,10 +1022,11 @@ pub const DecisionEngine = struct {
     }
 
     fn limitMessage(self: *const DecisionEngine, buf: []u8, err: anyerror) ?[]const u8 {
+        if (self.backend == .clef and err == error.TooManyInputTokens) return std.fmt.bufPrint(buf, "Clef schema and state exceed the {d}-token context limit", .{@min(clef.MAX_LENGTH, self.limits.max_input_tokens)}) catch null;
         if (self.limits.message(buf, err)) |msg| return msg;
         return switch (self.backend) {
             .laya => |e| e.limitMessage(buf, err),
-            .kev => null,
+            .kev, .clef => null,
         };
     }
 };
@@ -1026,10 +1037,14 @@ pub const DecisionRequest = struct {
     parsed: std.json.Parsed(std.json.Value),
     state: std.json.Value,
     questions: Questions,
+    truncate: bool = true,
+    images: []const @import("chat.zig").ImageData = &.{},
 
-    pub const Questions = union(enum) { laya: laya.Questions, kev: kev.Questions };
+    pub const Questions = union(enum) { laya: laya.Questions, kev: kev.Questions, clef: clef.Questions };
 
     pub fn deinit(self: *DecisionRequest, allocator: std.mem.Allocator) void {
+        for (self.images) |image| allocator.free(image.pixels);
+        allocator.free(self.images);
         switch (self.questions) {
             inline else => |*q| q.deinit(allocator),
         }
@@ -1061,6 +1076,16 @@ pub fn prepareDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const
         return null;
     }
     const obj = parsed.value.object;
+    var truncate = true;
+    if (engine.backend == .clef) {
+        if (obj.get("truncate")) |v| {
+            if (v != .bool) {
+                try sendError(conn, 400, "truncate must be a boolean");
+                return null;
+            }
+            truncate = v.bool;
+        }
+    }
     const state = obj.get("state") orelse {
         try sendError(conn, 400, "missing 'state'");
         return null;
@@ -1068,6 +1093,14 @@ pub fn prepareDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const
     const questions = obj.get("questions") orelse {
         try sendError(conn, 400, "missing 'questions'");
         return null;
+    };
+    const images = if (engine.backend == .clef) engine.backend.clef.prepareImages(allocator, parsed.value) catch |err| {
+        try sendDecisionError(conn, engine, err);
+        return null;
+    } else &.{};
+    defer if (!keep) {
+        for (images) |image| allocator.free(image.pixels);
+        allocator.free(images);
     };
     const qs: DecisionRequest.Questions = switch (engine.backend) {
         .laya => |e| .{ .laya = e.parseQuestions(allocator, questions, engine.limits.max_questions) catch |err| {
@@ -1078,9 +1111,13 @@ pub fn prepareDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const
             try sendDecisionError(conn, engine, err);
             return null;
         } },
+        .clef => |e| .{ .clef = e.parseQuestions(allocator, questions, engine.limits.max_questions) catch |err| {
+            try sendDecisionError(conn, engine, err);
+            return null;
+        } },
     };
     keep = true;
-    return .{ .parsed = parsed, .state = state, .questions = qs };
+    return .{ .parsed = parsed, .state = state, .questions = qs, .truncate = truncate, .images = images };
 }
 
 /// 400 naming a validation or limit error; 500 for any other.
@@ -1089,6 +1126,7 @@ fn sendDecisionError(conn: *Conn, engine: *DecisionEngine, err: anyerror) !void 
     const named = engine.limitMessage(&limit_buf, err) orelse switch (engine.backend) {
         .laya => laya.errorMessage(err),
         .kev => kev.errorMessage(err),
+        .clef => clef.errorMessage(err) orelse laya.errorMessage(err),
     };
     if (named) |msg| return sendError(conn, 400, msg);
     log.err("[decision] predict failed: {s}\n", .{@errorName(err)});
@@ -1127,6 +1165,12 @@ pub fn handleDecisions(engine: *DecisionEngine, model_id: []const u8, jobs: []co
         },
         .kev => |e| {
             for (jobs) |j| sendDecision(engine, j, e.predict(j.allocator, model_id, j.req.state, &j.req.questions.kev, engine.limits.max_input_tokens)) catch |err| {
+                log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
+            };
+            logDecisionPass(jobs, nq, t0);
+        },
+        .clef => |e| {
+            for (jobs) |j| sendDecision(engine, j, e.predict(j.allocator, model_id, j.req.state, &j.req.questions.clef, engine.limits.max_input_tokens, j.req.truncate, j.req.images)) catch |err| {
                 log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
             };
             logDecisionPass(jobs, nq, t0);

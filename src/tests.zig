@@ -24,6 +24,7 @@ test {
     _ = @import("muse_vision.zig");
     _ = @import("lfm2_vision.zig");
     _ = @import("mrope.zig");
+    _ = @import("mrope_gpu.zig");
     _ = @import("rht.zig");
     _ = @import("qmv2.zig");
     _ = @import("moe_gather_ubench.zig");
@@ -71,6 +72,8 @@ test {
     _ = @import("kokoro.zig");
     _ = @import("laya.zig");
     _ = @import("kev.zig");
+    _ = @import("clef.zig");
+    _ = @import("clef_http_test.zig");
     _ = @import("kokoro_g2p.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
