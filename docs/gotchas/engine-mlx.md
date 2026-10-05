@@ -5561,3 +5561,21 @@ What is left in the hyper-connection reads is not a single-kernel job: one read 
 - Cause: the loader used table storage to choose the norm transform, though the two are independent checkpoint choices.
 - Fix: load the weights unfolded; unmarked embedded packs infer from the loaded indexer q/k arrays on every expected full-attention layer: valid shapes, finite values, and unanimous means near 0 (`delta`) or 1 (`folded`). Fold eligible keys once in the shared trunk/MTP map, adding 1 before narrowing F16 to BF16. Missing, mixed, or ambiguous anchors fail by name; a checkpoint-local `qwen4_norm_convention` marker selects either convention explicitly, while unmarked external-table packs retain the folded default. A server-wide override for this field is refused. Embedded `weight_scale` must be identity when present.
 - Guard: model tests cover both inferred conventions, missing/mixed/malformed anchors, explicit markers across both layouts, all ten norm roles, and refusal of the global override; scale/header fixtures and the shared residency estimate guard the table path.
+
+## A fast path keyed on one pack's quant layout is silent on another's (Flash Next oQ4e, 2026-10-04)
+
+- Defect: oMLX's `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp` loaded and answered correctly, but serial decode ran at half our pack's speed (21.7 vs 11 ms a forward). Nearly every tuned Flash Next path had declined without an error. They had been written against our pack's layout: 8-bit g64 non-expert weights, a dense inject and shared gate, and a merged `ngram_table.bin`.
+- Causes:
+  - Every fused hyper-connection kernel and the `softmax_gate` router fold read the inject and shared gate as dense rows. oQ4e quantizes both.
+  - The HC kernels and the MTP head's row kernel (`msvQmvRows`) unpacked 2/4/8-bit g64 only, and the verify graphs hardcoded 8-bit g64.
+  - The verify lanes were gated on 6-bit g64 at N ≥ 5120, and the `--ple-gpu` arm read one merged file.
+  - Launch-config caches had one slot or ignored the width, so alternating widths rebuilt a config per call. `op_count` in fwd-ubench counts FFI calls, config builds included; that is how 135 rebuilds per forward showed up, even on our own pack.
+- Found on the way: on the dual-die M5 (`applegpu_g17d`), MLX leaves per-row qmv at 18 rows while the joined batched projections allowed 24, so 3 slots × 6 rows stopped matching each slot alone (`qmvBatchLimit` mirrors MLX's table now). The test for it had always skipped on that machine.
+- Fix:
+  - Tiny dense-only tensors are dequantized at load (`dequantizeSmall`).
+  - The kernels unpack every affine width (`hc_pack8`, `msvQmvRows` at 3/5/6 bits and g128), and config caches key per width.
+  - Gates were re-measured per shape: 5/6-bit lanes from N 2560, NAX for those shapes only past 8 rows, while 8-bit N 2560 lost at M 7-8 and stays off.
+  - Embedded n-gram shards are repacked into one buffer for `--ple-gpu`.
+  - Serial decode went from 21.7 to 10.4 ms a forward, 9.6 ms with `--ple-gpu`.
+- Attribution trap: a prefill-width fwd-ubench chunk includes the synchronous host n-gram gather and ranked the GDN prefill fusion backwards on this pack. The server-timed `prefill_ab.sh` decides.
+- Guard: run `tests/qwen4_engagement.sh <pack>` on any new layout before measuring speed. Parity tests cover {4,5,6,8} × {g64,g128}, and the tiny `--oq4e-mix --embedded-ngram` pack runs through the `qwen4 fixture` forward oracle.

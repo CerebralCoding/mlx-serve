@@ -31,7 +31,9 @@ const ND_SOURCE =
     \\const int g = int(threadgroup_position_in_grid.y) / HC;
     \\constexpr int PER = H / 256;
     \\constexpr int K = HC * H;
-    \\constexpr int VPW = 32 / BITS;
+    \\// A slot's 16 values are WPL words at 2/4/8 bits, else two 8-value packs of BITS bytes.
+    \\constexpr bool WORD = (32 % BITS) == 0;
+    \\constexpr int VPW = WORD ? 32 / BITS : 8;
     \\constexpr int WPL = 16 / VPW;
     \\constexpr int KW = K / VPW;
     \\constexpr int KG = K / GS;
@@ -47,7 +49,8 @@ const ND_SOURCE =
     \\const bool down = g < NDG;
     \\
     \\// The down weights do not wait for the norm: every load of this simdgroup's rows goes out first.
-    \\uint pw[RPS][SITER][WPL];
+    \\uint pw[RPS][SITER][WORD ? WPL : 1];
+    \\ulong pr[RPS][SITER][WORD ? 1 : WPL];
     \\float ps[RPS][SITER];
     \\float pb[RPS][SITER];
     \\const int n0 = g * ROWS_TG + int(sg) * RPS;
@@ -56,8 +59,13 @@ const ND_SOURCE =
     \\    for (int i = 0; i < SITER; ++i) {
     \\      const int slot = i * 32 + int(lane);
     \\      if (slot < NSLOT) {
-    \\        const device uint32_t* wp = dw_q + (size_t)(n0 + r) * KW + (size_t)(s * (H / VPW) + slot * WPL);
-    \\        for (int e = 0; e < WPL; ++e) pw[r][i][e] = wp[e];
+    \\        if constexpr (WORD) {
+    \\          const device uint32_t* wp = dw_q + (size_t)(n0 + r) * KW + (size_t)(s * (H / VPW) + slot * WPL);
+    \\          for (int e = 0; e < WPL; ++e) pw[r][i][e] = wp[e];
+    \\        } else {
+    \\          const device uchar* wb = (const device uchar*)dw_q + (size_t)(n0 + r) * (size_t)(K * BITS / 8) + (size_t)(base + slot * 16) * BITS / 8;
+    \\          for (int e = 0; e < WPL; ++e) pr[r][i][e] = hc_pack8<BITS>(wb + e * BITS);
+    \\        }
     \\        const size_t gi = (size_t)(n0 + r) * KG + (size_t)((base + slot * 16) / GS);
     \\        ps[r][i] = float(dw_s[gi]);
     \\        pb[r][i] = float(dw_b[gi]);
@@ -110,7 +118,11 @@ const ND_SOURCE =
     \\      for (int r = 0; r < RPS; ++r) {
     \\        float d = 0.0f;
     \\        for (int w = 0; w < WPL; ++w) {
-    \\          for (int j = 0; j < VPW; ++j) d += xr[w * VPW + j] * float((pw[r][i][w] >> (j * BITS)) & MASK);
+    \\          if constexpr (WORD) {
+    \\            for (int j = 0; j < VPW; ++j) d += xr[w * VPW + j] * float((pw[r][i][w] >> (j * BITS)) & MASK);
+    \\          } else {
+    \\            for (int j = 0; j < VPW; ++j) d += xr[w * VPW + j] * float(uint(pr[r][i][w] >> (j * BITS)) & MASK);
+    \\          }
     \\        }
     \\        acc[r] += ps[r][i] * d + pb[r][i] * xsum;
     \\      }
@@ -153,7 +165,8 @@ const U2_SOURCE =
     \\const uint lane = thread_index_in_simdgroup;
     \\const uint sg = simdgroup_index_in_threadgroup;
     \\const int j = int(threadgroup_position_in_grid.y) * COLS + int(sg);
-    \\constexpr int VPW = 32 / BITS;
+    \\constexpr bool WORD = (32 % BITS) == 0;
+    \\constexpr int VPW = WORD ? 32 / BITS : 8;
     \\constexpr int R_by_p = R / VPW;
     \\constexpr int R_by_gs = R / GS;
     \\constexpr int RIT = (R_by_p + 31) / 32;
@@ -162,7 +175,8 @@ const U2_SOURCE =
     \\threadgroup T acts[R];
     \\
     \\// This column's up rows (one per stream) do not wait for the activation.
-    \\uint pw[HC][RIT];
+    \\uint pw[HC][WORD ? RIT : 1];
+    \\ulong pr[HC][WORD ? 1 : RIT];
     \\float ps[HC][RIT];
     \\float pb[HC][RIT];
     \\float xnv[HC];
@@ -172,7 +186,8 @@ const U2_SOURCE =
     \\  for (int i = 0; i < RIT; ++i) {
     \\    const int pack = int(lane) + 32 * i;
     \\    if (pack < R_by_p) {
-    \\      pw[h][i] = uw_q[row * R_by_p + (size_t)pack];
+    \\      if constexpr (WORD) pw[h][i] = uw_q[row * R_by_p + (size_t)pack];
+    \\      else pr[h][i] = hc_pack8<BITS>((const device uchar*)uw_q + row * (size_t)(R * BITS / 8) + (size_t)pack * BITS);
     \\      const size_t gi = row * R_by_gs + (size_t)((pack * VPW) / GS);
     \\      ps[h][i] = float(uw_s[gi]);
     \\      pb[h][i] = float(uw_b[gi]);
@@ -205,7 +220,8 @@ const U2_SOURCE =
     \\      const int k_base = pack * VPW;
     \\      for (int ki = 0; ki < VPW; ki += 4) {
     \\        const int k = k_base + ki;
-    \\        const uint32_t q = pw[h][i] >> (ki * BITS);
+    \\        // Values ki..ki+3 of this pack; a 3/5/6-bit pack is 8 values in a ulong.
+    \\        const uint q = WORD ? (pw[h][i] >> (ki * BITS)) : uint(pr[h][i] >> (ki * BITS));
     \\        a0 += float(acts[k + 0]) * (float((q >> (0 * BITS)) & MASK) * ps[h][i] + pb[h][i]);
     \\        a1 += float(acts[k + 1]) * (float((q >> (1 * BITS)) & MASK) * ps[h][i] + pb[h][i]);
     \\        a2 += float(acts[k + 2]) * (float((q >> (2 * BITS)) & MASK) * ps[h][i] + pb[h][i]);
@@ -236,58 +252,72 @@ pub fn enabled() bool {
     return env_enabled.?;
 }
 
+/// Values per pack the HC kernels read: one word at 2/4/8 bits, 8 values in BITS bytes at 3/5/6.
+pub fn packValues(bits: u32) ?c_int {
+    return switch (bits) {
+        2, 4, 8 => @intCast(32 / bits),
+        3, 5, 6 => 8,
+        else => null,
+    };
+}
+
+/// Eight B-bit values packed in B bytes (3/5/6-bit), little-endian as mx.quantize lays them out.
+pub const PACK8_HEADER =
+    \\template <int B>
+    \\inline ulong hc_pack8(const device uchar* p) {
+    \\  ulong r = 0;
+    \\  for (int b = 0; b < B; ++b) r |= ulong(p[b]) << (8 * b);
+    \\  return r;
+    \\}
+;
+
 fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, source: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
     const in_vec = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, "", true, false);
+    const k = mlx.mlx_fast_metal_kernel_new(name, in_vec, out_vec, source, PACK8_HEADER, true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     return k;
 }
 
-/// One kernel with its launch config: the config bakes grid, outputs and template values, which a
-/// model's geometry fixes, so it is built once per geometry.
-const Stage = struct {
-    kernel: ?mlx.mlx_fast_metal_kernel = null,
-    cfg: ?mlx.mlx_fast_metal_kernel_config = null,
+/// A launch config bakes grid, outputs and template values, which a layer's geometry fixes.
+fn config(outs: []const struct { c_int, mlx.mlx_dtype }, grid: [3]c_int, tg: c_int, tmpl: []const struct { [*:0]const u8, c_int }, dt: mlx.mlx_dtype) !mlx.mlx_fast_metal_kernel_config {
+    const c = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
+    for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{o[0]}, 1, o[1]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, grid[0], grid[1], grid[2]));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, tg, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", dt));
+    for (tmpl) |a| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, a[0], a[1]));
+    return c;
+}
 
-    fn arm(self: *Stage, outs: []const struct { c_int, mlx.mlx_dtype }, grid: [3]c_int, tg: c_int, tmpl: []const struct { [*:0]const u8, c_int }, dt: mlx.mlx_dtype) !void {
-        if (self.cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        self.cfg = null;
-        const c = mlx.mlx_fast_metal_kernel_config_new();
-        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        for (outs) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(c, &[_]c_int{o[0]}, 1, o[1]));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(c, grid[0], grid[1], grid[2]));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(c, tg, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(c, "T", dt));
-        for (tmpl) |a| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(c, a[0], a[1]));
-        self.cfg = c;
+fn run(kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config, inputs: []const mlx.mlx_array, s: mlx.mlx_stream, res: []mlx.mlx_array) !void {
+    const v = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
+    defer _ = mlx.mlx_vector_array_free(v);
+    var o = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(o);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, kernel, v, cfg, s));
+    if (mlx.mlx_vector_array_size(o) != res.len) return error.MetalKernelBadOutputCount;
+    var got: usize = 0;
+    errdefer for (res[0..got]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (res, 0..) |*r, i| {
+        r.* = mlx.mlx_array_new();
+        got = i + 1;
+        try mlx.check(mlx.mlx_vector_array_get(r, o, i));
     }
-
-    fn run(self: *const Stage, inputs: []const mlx.mlx_array, s: mlx.mlx_stream, res: []mlx.mlx_array) !void {
-        const v = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
-        defer _ = mlx.mlx_vector_array_free(v);
-        var o = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(o);
-        try mlx.check(mlx.mlx_fast_metal_kernel_apply(&o, self.kernel.?, v, self.cfg.?, s));
-        if (mlx.mlx_vector_array_size(o) != res.len) return error.MetalKernelBadOutputCount;
-        var got: usize = 0;
-        errdefer for (res[0..got]) |a| {
-            _ = mlx.mlx_array_free(a);
-        };
-        for (res, 0..) |*r, i| {
-            r.* = mlx.mlx_array_new();
-            got = i + 1;
-            try mlx.check(mlx.mlx_vector_array_get(r, o, i));
-        }
-    }
-};
+}
 
 const Key = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: c_int, dtype: mlx.mlx_dtype };
-var nd_stage: Stage = .{};
-var up_stage: Stage = .{};
-var armed: ?Key = null;
+const Armed = struct { key: Key, nd: mlx.mlx_fast_metal_kernel_config, up: mlx.mlx_fast_metal_kernel_config };
+var nd_kernel: ?mlx.mlx_fast_metal_kernel = null;
+var up_kernel: ?mlx.mlx_fast_metal_kernel = null;
+/// A mixed pack's per-layer widths each keep their configs, so no layer re-arms; round-robin eviction.
+var armed: [16]?Armed = @splat(null);
+var armed_next: usize = 0;
 
 /// The two-launch read of one row, or null outside its envelope (the caller keeps the
 /// three-launch path). `dw` [R, K/vpw] and `uw` [K, R/vpw] are the packed projections with
@@ -317,16 +347,16 @@ pub fn read(
         if (a.ctx == null or mlx.mlx_array_dtype(a) != dt) return null;
     }
     if (iw.ctx != null and mlx.mlx_array_dtype(iw) != dt) return null;
-    if (bits != 2 and bits != 4 and bits != 8) return null;
-    const vpw: c_int = @intCast(32 / bits);
+    const vpw = packValues(bits) orelse return null;
+    const b: c_int = @intCast(bits);
     const gs: c_int = @intCast(group_size);
     const K = hc * hidden;
     if (hc < 1 or hc > 8 or @rem(hidden, 256) != 0 or @rem(gs, 16) != 0 or @rem(hidden, gs) != 0) return null;
     const dsh = mlx.getShape(dw);
     const ush = mlx.getShape(uw);
-    if (dsh.len != 2 or ush.len != 2 or dsh[1] * vpw != K or ush[0] != K) return null;
+    if (dsh.len != 2 or ush.len != 2 or dsh[1] * 32 != K * b or ush[0] != K) return null;
     const R = dsh[0];
-    if (ush[1] * vpw != R or @rem(R, ROWS_TG) != 0 or @rem(R, gs) != 0 or @rem(hidden, COLS_TG) != 0) return null;
+    if (ush[1] * 32 != R * b or @rem(R, vpw) != 0 or @rem(R, ROWS_TG) != 0 or @rem(R, gs) != 0 or @rem(hidden, COLS_TG) != 0) return null;
     // A lane's 16 values are whole words, and a down row's slice splits into whole slots.
     if (@rem(16, vpw) != 0 or @rem(hidden, 16) != 0) return null;
     const inj: c_int = @intFromBool(iw.ctx != null);
@@ -334,32 +364,42 @@ pub fn read(
     if (mlx.mlx_array_size(x) != @as(usize, @intCast(K)) or mlx.mlx_array_size(nw) != @as(usize, @intCast(K))) return null;
 
     const key = Key{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .bits = bits, .gs = gs, .dtype = dt };
-    if (nd_stage.kernel == null) {
+    if (nd_kernel == null) {
         const ins = [_][*:0]const u8{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in", "dw_q", "dw_s", "dw_b" };
         const outs = [_][*:0]const u8{ "xn_out", "parts_out", "xs_out" };
-        nd_stage.kernel = try makeKernel("mlxserve_hc_read_nd", &ins, &outs, ND_SOURCE);
+        nd_kernel = try makeKernel("mlxserve_hc_read_nd", &ins, &outs, ND_SOURCE);
     }
-    if (up_stage.kernel == null) {
+    if (up_kernel == null) {
         const ins = [_][*:0]const u8{ "xn_in", "parts_in", "uw_q", "uw_s", "uw_b" };
         const outs = [_][*:0]const u8{ "mixed_out", "inj_out" };
-        up_stage.kernel = try makeKernel("mlxserve_hc_read_u2", &ins, &outs, U2_SOURCE);
+        up_kernel = try makeKernel("mlxserve_hc_read_u2", &ins, &outs, U2_SOURCE);
     }
     const pr: c_int = R + hc;
-    if (armed == null or !std.meta.eql(armed.?, key)) {
+    const cfgs: Armed = for (armed) |a| {
+        if (a != null and std.meta.eql(a.?.key, key)) break a.?;
+    } else blk: {
         const groups = @divExact(R, ROWS_TG) + inj;
-        try nd_stage.arm(&.{ .{ K, dt }, .{ hc * pr, .float32 }, .{ if (wr == 1) K else 1, dt } }, .{ 256, groups * hc, 1 }, 256, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "WR", wr }, .{ "RPS", RPS }, .{ "ROWS_TG", ROWS_TG } }, dt);
-        try up_stage.arm(&.{ .{ hidden, dt }, .{ hc, dt } }, .{ 32 * COLS_TG, @divExact(hidden, COLS_TG), 1 }, 32 * COLS_TG, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "COLS", COLS_TG } }, dt);
-        armed = key;
-    }
+        const nd = try config(&.{ .{ K, dt }, .{ hc * pr, .float32 }, .{ if (wr == 1) K else 1, dt } }, .{ 256, groups * hc, 1 }, 256, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "WR", wr }, .{ "RPS", RPS }, .{ "ROWS_TG", ROWS_TG } }, dt);
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(nd);
+        const up = try config(&.{ .{ hidden, dt }, .{ hc, dt } }, .{ 32 * COLS_TG, @divExact(hidden, COLS_TG), 1 }, 32 * COLS_TG, &.{ .{ "HC", hc }, .{ "H", hidden }, .{ "R", R }, .{ "GS", gs }, .{ "BITS", @intCast(bits) }, .{ "INJ", inj }, .{ "COLS", COLS_TG } }, dt);
+        if (armed[armed_next]) |old| {
+            _ = mlx.mlx_fast_metal_kernel_config_free(old.nd);
+            _ = mlx.mlx_fast_metal_kernel_config_free(old.up);
+        }
+        const fresh: Armed = .{ .key = key, .nd = nd, .up = up };
+        armed[armed_next] = fresh;
+        armed_next = (armed_next + 1) % armed.len;
+        break :blk fresh;
+    };
     var nd_out: [3]mlx.mlx_array = undefined;
     const wo = if (pend) |p| p.out else nw;
     const wi = if (pend) |p| p.inj else nw;
-    try nd_stage.run(&.{ x, nw, if (inj == 1) iw else nw, eps, wo, wi, dw, ds, db }, s, &nd_out);
+    try run(nd_kernel.?, cfgs.nd, &.{ x, nw, if (inj == 1) iw else nw, eps, wo, wi, dw, ds, db }, s, &nd_out);
     defer _ = mlx.mlx_array_free(nd_out[0]);
     defer _ = mlx.mlx_array_free(nd_out[1]);
     errdefer _ = mlx.mlx_array_free(nd_out[2]);
     var upmix: [2]mlx.mlx_array = undefined;
-    try up_stage.run(&.{ nd_out[0], nd_out[1], uw, us, ub }, s, &upmix);
+    try run(up_kernel.?, cfgs.up, &.{ nd_out[0], nd_out[1], uw, us, ub }, s, &upmix);
     var stream = nd_out[2];
     if (wr == 0) {
         _ = mlx.mlx_array_free(stream);
@@ -404,12 +444,12 @@ const Q = struct {
     }
 };
 
-fn quantRandom(rnd: std.Random, rows: c_int, cols: c_int, bits: u32, s: mlx.mlx_stream) !Q {
+fn quantRandom(rnd: std.Random, rows: c_int, cols: c_int, bits: u32, gs: u32, s: mlx.mlx_stream) !Q {
     const w = try randBf16(rnd, &.{ rows, cols }, 0.2, 0.0, s);
     defer _ = mlx.mlx_array_free(w);
     var triple = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(triple);
-    try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
+    try mlx.check(mlx.mlx_quantize(&triple, w, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
     var q: Q = .{ .w = mlx.mlx_array_new(), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() };
     try mlx.check(mlx.mlx_vector_array_get(&q.w, triple, 0));
     try mlx.check(mlx.mlx_vector_array_get(&q.s, triple, 1));
@@ -449,7 +489,7 @@ fn expectClose(ref: mlx.mlx_array, got: mlx.mlx_array, s: mlx.mlx_stream) !void 
     try testing.expect(dot / @sqrt(nr * ng) >= 0.9999);
 }
 
-fn parityCase(h: c_int, r: c_int, bits: u32, seed: u64) !void {
+fn parityCase(h: c_int, r: c_int, bits: u32, gs: u32, seed: u64) !void {
     const xfm = @import("transformer.zig");
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(seed);
@@ -459,9 +499,9 @@ fn parityCase(h: c_int, r: c_int, bits: u32, seed: u64) !void {
     defer override = null;
     const hc: c_int = 4;
     const k = hc * h;
-    const down = try quantRandom(rnd, r, k, bits, s);
+    const down = try quantRandom(rnd, r, k, bits, gs, s);
     defer down.deinit();
-    const up = try quantRandom(rnd, k, r, bits, s);
+    const up = try quantRandom(rnd, k, r, bits, gs, s);
     defer up.deinit();
     const x = try randBf16(rnd, &.{ 1, 1, k }, 4.0, 0.0, s);
     defer _ = mlx.mlx_array_free(x);
@@ -480,10 +520,10 @@ fn parityCase(h: c_int, r: c_int, bits: u32, seed: u64) !void {
         const pend: ?xfm.HcPending = if (c.pending) .{ .out = wo, .inj = wi } else null;
         override = false;
         const before = served;
-        const ref = (try xfm.hcReadFused(s, x, 1, 1, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, 64, pend)) orelse return error.HcFusedDeclined;
+        const ref = (try xfm.hcReadFused(s, x, 1, 1, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, gs, pend)) orelse return error.HcFusedDeclined;
         try testing.expectEqual(before, served);
         override = true;
-        const got = (try xfm.hcReadFused(s, x, 1, 1, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, 64, pend)) orelse return error.HcFusedDeclined;
+        const got = (try xfm.hcReadFused(s, x, 1, 1, nw, down.w, down.s, down.b, up.w, up.s, up.b, inj_w, 1e-6, hc, h, bits, gs, pend)) orelse return error.HcFusedDeclined;
         try testing.expectEqual(before + 1, served);
         defer inline for (.{ ref, got }) |o| {
             _ = mlx.mlx_array_free(o.mixed);
@@ -499,9 +539,16 @@ fn parityCase(h: c_int, r: c_int, bits: u32, seed: u64) !void {
 }
 
 test "hc decode2: the two-launch read matches the three-launch read (Flash Next geometry, 8-bit)" {
-    try parityCase(2560, 320, 8, 0x2D0DE2);
+    try parityCase(2560, 320, 8, 64, 0x2D0DE2);
 }
 
 test "hc decode2: the two-launch read matches the three-launch read (small geometry, 4-bit)" {
-    try parityCase(512, 64, 4, 0x2D0DE4);
+    try parityCase(512, 64, 4, 64, 0x2D0DE4);
+}
+
+test "hc decode2: the two-launch read matches the three-launch read at byte-packed widths (5/6-bit, g64 and g128)" {
+    for ([_]u32{ 5, 6 }) |bits| {
+        try parityCase(2560, 320, bits, 64, 0x2D0DE5 + bits);
+        try parityCase(512, 128, bits, 128, 0x2D0DE7 + bits);
+    }
 }

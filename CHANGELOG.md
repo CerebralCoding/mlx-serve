@@ -3,7 +3,7 @@
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
 ### New
-- **oMLX's Qwen3.8 Flash Next packs load.** Packs that ship the n-gram table inside the model files (such as `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp`) now run, MTP included; the table is read from host memory, so `--ple-gpu` does not apply to them yet (#686). Thanks @otarkhan.
+- **oMLX's Qwen3.8 Flash Next packs load.** Packs that ship the n-gram table inside the model files (such as `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp`) now run, MTP included, and `--ple-gpu` copies their table into one GPU buffer at load (#686). Thanks @otarkhan.
 - **Chat keeps answering while media renders.** An agent or chat session no longer freezes while the same server generates an image, speech, music, video or a 3D model: chat runs between generation steps, and the CPU-heavy parts of 3D generation run beside it. Two coding agents on Qwen3.8 27B kept their first token under a second while image, speech, music and a textured 3D model rendered on one M5 Ultra, and the images come out byte-identical to a solo run.
 - **GLM-5.3-Flash.** TensorFold's MLX packs of GLM-5-Next run with text, thinking (with `reasoning_effort`) and tool calls, and the pack's own multi-token-prediction layer drafts ahead of the model (`--no-mtp` turns it off).
 - **Sound effects with Stable Audio 3.** `POST /v1/audio/sound-generations` turns a description into up to two minutes of 44.1 kHz stereo in about a second, from Stability's own `stabilityai/stable-audio-3-small-sfx` repo as downloaded; the app gets a Sound Effects tab in Audio and a `generate_sound` chat tool.
@@ -13,6 +13,7 @@
 - **Sessions name their agent.** `/metrics.json` sessions now name the calling agent (`claude-code`, `opencode`, `codex`, `omp` or `other`) with a per-request id, and a `process_start_time_seconds` gauge lets monitors detect restarts.
 
 ### Speed
+- **oMLX's Qwen3.8 Flash Next packs run at full speed.** The fast paths built for our own pack now also serve oMLX's per-layer mixed widths. On an M5 Ultra, `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp` decodes at 172 tok/s with MTP (177 with `--ple-gpu`), against 133 for oMLX 0.7.0 on the same pack and 174 for our own pack.
 - **Textured 3D models in about a minute.** The Hunyuan3D texture stage now simplifies the mesh to 40,000 faces before unwrapping it, as the reference pipeline does; a detailed (resolution 320) textured model that ran for more than ten minutes now finishes in about a minute.
 - **MiniMax-H3 video renders start sooner after the first one.** The text encoder, the DiT and the Turbo adapter now stay loaded between requests while the Mac has the memory for all of them, so a short Turbo clip takes about a quarter less time from the second render on; when memory is short the model is freed first and nothing else is affected.
 

@@ -603,6 +603,19 @@ Moved verbatim from CLAUDE.md on 2026-09-02 (size cap). Stories: `docs/gotchas/e
 - **The ANE split's optimum is per SILICON** (`ane.defaultShare`; M4 channel 0.45 → 311/304, 0.50 regresses; M3 Ultra 0.45 ≈ nothing, 0.35 +8.5%/+13.7%). A share change needs its own A/B, never interpolation. fp16 down-conv wears the (1/16..x16) pow2 wrap.
 
 
+### Media offload
+
+Moved from AGENTS.md on 2026-10-04 (size cap).
+
+- **A denoise step is the ANE case the LM prefill seam never was** (opt-in, LOSSY: `--ane-image` Krea, `--ane-video` H3, `--ane-audio` ACE-Step; ONE value `ane.media_offload` set in `main()`): batch job at the compute roofline; ONE compiled 256-row tile, looped (`ane.mediaMlp`), serves every step AND every request size, so the ANE cache never grows per size. Tables: `docs/reference.md`.
+- **The media share is CALIBRATED once per (chip, model), then STICKS** (`ane.planMediaOffload` → `calibrate`): block 0 alone, compiled at the probe's seed, timed on the ANE and GPU over the same 4096 rows, the GPU fed the dtype the MLP really sees (bf16 ones read ACE's f32 GPU 27% fast); later builds reuse the set's `calibrated share=` tag (`ane.cachedShare`; an explicit `--ane-split` never is), since re-solving recompiled + pruned on size and probe jitter.
+- **The ANE compile cache is capped by FREE DISK and pruned per LINEAGE** (`msv_ane_cache_lineage`: same seam+shape, other share → gone on the next cold compile; byte cap = min(40 GB, volume room − 8 GB reserve)): a fixed cap above free space is not a cap, and two small-disk boxes shipped `ready: N/M`. The gate bills the build's f32 transient against a 4 GB swap floor (`mediaGateRefusal`), refusing by NAME.
+- The seam is the channel-mode one (`ane.packUnitPlanes`/`readPlane`/`dequantToHostF32` shared with `transformer.zig`): ANE holds gate/up channels [0..k) + the matching down K-slabs, GPU the complement, partials ADD. H3's fc1 is FUSED, so its complement is TWO row views (`aneBuildRest`).
+- **The ANE graph is fp16 END TO END, so a partial-sum seam must SCALE** (`ane.OUT_PLANE_SCALE` 256, folded into the `up` copy at build time, multiplied back on read — exact: per-row int8 puts it in the row scale, and `up` is linear into `silu(gate)*up`). Unscaled, H3 saturated to INF from block 36 and rendered BLACK; Krea only lost precision (cos vs GPU 0.996 -> 0.9993).
+- **A LoRA-attached block DECLINES** (`aneBlockEligible` in both): the adapter is summed at forward from the FULL activation, half of which never leaves the ANE program. Turbo binds `blocks.N.mlp.fc1/fc2`, so H3's fast path is GPU-only until the LoRA is folded into the int8 snapshot.
+- **GPU work built AFTER a blocking ANE wait is serial, and a small piece of it is LAUNCH LATENCY, not rows** (`ane.mediaMlp`). Every GPU piece goes out with the complement BEFORE the loop; a partial tile pads onto the ANE only past `tail > T x (1 - share)` (`ane.mediaTilePlan`).
+- **H3 stages the DiT per REQUEST, so the ANE build is paid per request**. Caching the engine across requests is owed.
+
 ## Reasoning with constrained JSON
 
 `src/reasoning_protocol.zig` owns format descriptions, incremental recognition,

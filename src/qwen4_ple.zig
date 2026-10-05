@@ -103,6 +103,8 @@ pub const RowParts = struct {
     biases: []const u8,
 };
 
+pub const Region = struct { fd: std.c.fd_t, off: u64, len: u64 };
+
 pub const EmbeddedTable = struct {
     arena: std.heap.ArenaAllocator,
     files: []File,
@@ -146,6 +148,41 @@ pub const EmbeddedTable = struct {
             .weight = self.files[p[0].file].map[p[0].off + where.local * wlen ..][0..wlen],
             .scales = self.files[p[1].file].map[p[1].off + where.local * slen ..][0..slen],
             .biases = self.files[p[2].file].map[p[2].off + where.local * slen ..][0..slen],
+        };
+    }
+
+    /// The `i`-th byte range a gather reads (each shard's three parts), null past the last.
+    pub fn region(self: *const EmbeddedTable, i: usize) ?Region {
+        if (i >= self.shards.len * 3) return null;
+        const t = self.shards[i / 3].parts[i % 3];
+        return .{ .fd = self.files[t.file].fd, .off = t.off, .len = t.len };
+    }
+
+    /// Bytes of the contiguous `weight | scales | biases` layout `repackInto` writes.
+    pub fn repackedLen(self: *const EmbeddedTable) u64 {
+        return self.rows * (@as(u64, self.wcols) * 4 + @as(u64, self.scols) * 4);
+    }
+
+    /// Copy every shard into `dst` as one `weight | scales | biases` table by global row, the
+    /// layout of `ngram_table.bin`. Reads bypass the page cache: the copy is the resident one.
+    pub fn repackInto(self: *const EmbeddedTable, dst: []u8) !void {
+        if (dst.len < self.repackedLen()) return error.EmbeddedPleRepackShort;
+        const wl: u64 = @as(u64, self.wcols) * 4;
+        const sl: u64 = @as(u64, self.scols) * 2;
+        const base = [3]u64{ 0, self.rows * wl, self.rows * (wl + sl) };
+        const row_len = [3]u64{ wl, sl, sl };
+        for (self.shards) |shard| for (shard.parts, 0..) |t, p| {
+            const fd = self.files[t.file].fd;
+            const out = dst[@intCast(base[p] + shard.first * row_len[p])..][0..t.len];
+            _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 1));
+            defer _ = std.c.fcntl(fd, std.c.F.NOCACHE, @as(c_int, 0));
+            var done: usize = 0;
+            while (done < out.len) {
+                const want = @min(out.len - done, 1 << 30);
+                const got = std.c.pread(fd, out[done..].ptr, want, @intCast(t.off + done));
+                if (got <= 0) return error.EmbeddedPleRead;
+                done += @intCast(got);
+            }
         };
     }
 
@@ -389,6 +426,27 @@ test "embedded PLE reads unequal numbered shards across mixed files" {
     try std.testing.expect(!embeddedTensorName(prefix ++ "00.weight"));
     try std.testing.expect(!embeddedTensorName("language_model.model.layers.1.ple.ple_embedding.layer_multipliers"));
     try std.testing.expect(embeddedTensorName("language_model.model.layers.1.ple.ple_embedding.ngram_embedding.weight_scale"));
+}
+
+test "embedded PLE repacks every shard into one weight | scales | biases table by global row" {
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try writeFixture(&td, .valid);
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var path_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const path_len = try td.dir.realPath(io, &path_buf);
+    var t = (try openEmbedded(path_buf[0..path_len], .{ .rows = 6, .dim = 32, .shards = 3 })).?;
+    defer t.close();
+    try std.testing.expectEqual(@as(u64, 6 * (16 + 4)), t.repackedLen());
+    var buf: [120]u8 = undefined;
+    try std.testing.expectError(error.EmbeddedPleRepackShort, t.repackInto(buf[0..119]));
+    try t.repackInto(&buf);
+    for (0..6) |r| {
+        const parts = t.rowParts(r);
+        try std.testing.expectEqualSlices(u8, parts.weight, buf[r * 16 ..][0..16]);
+        try std.testing.expectEqualSlices(u8, parts.scales, buf[96 + r * 2 ..][0..2]);
+        try std.testing.expectEqualSlices(u8, parts.biases, buf[108 + r * 2 ..][0..2]);
+    }
 }
 
 test "embedded PLE rejects partial and corrupt shard layouts" {

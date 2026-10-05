@@ -450,44 +450,56 @@ pub const NgramTable = struct {
 
     const WARM_CHUNK: usize = 8 << 20;
 
-    /// Read the whole table through the fd once, in the background, so the
+    /// The `i`-th byte range the warm reads: the whole file, or an embedded pack's shard parts.
+    fn warmRegion(self: *const NgramTable, i: usize) ?embedded_ple.Region {
+        if (self.embedded) |source| return source.region(i);
+        return if (i == 0 and self.fd >= 0) .{ .fd = self.fd, .off = 0, .len = self.map.len } else null;
+    }
+
+    /// Read the whole table through its fds once, in the background, so the
     /// first prompt's PLE gathers hit a warm page cache. Call only once the
     /// table sits at its final address (the thread holds `self`). Off via
     /// MLX_SERVE_NGRAM_WARM=0.
     pub fn startWarm(self: *NgramTable) void {
-        if (self.embedded != null) return;
-        if (self.fd < 0 or self.warm_thread != null) return;
+        if (self.warmRegion(0) == null or self.warm_thread != null) return;
         // The off arm says so: a cold first request faults rows off the SSD (38k prompt: 174 s vs 55 s).
         if (!warmEnabled()) {
             log.info("[qwen4] ngram table warm: disabled (MLX_SERVE_NGRAM_WARM=0) - the first long prompt faults the table in from SSD\n", .{});
             return;
         }
+        var total: u64 = 0;
+        var i: usize = 0;
+        while (self.warmRegion(i)) |r| : (i += 1) total += r.len;
         self.warm_stop.store(false, .release);
         self.warm_bytes.store(0, .release);
         live_warm_bytes.store(0, .release);
-        live_warm_total.store(self.map.len, .release);
-        log.info("[qwen4] ngram table warm: started, {d:.1} GB in the background (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{asGb(self.map.len)});
-        self.warm_thread = std.Thread.spawn(.{}, warmMain, .{self}) catch null;
+        live_warm_total.store(total, .release);
+        log.info("[qwen4] ngram table warm: started, {d:.1} GB in the background (page cache; MLX_SERVE_NGRAM_WARM=0 disables)\n", .{asGb(total)});
+        self.warm_thread = std.Thread.spawn(.{}, warmMain, .{ self, total }) catch null;
     }
 
-    fn warmMain(self: *NgramTable) void {
+    fn warmMain(self: *NgramTable, total: u64) void {
         var scratch: [WARM_CHUNK]u8 align(16) = undefined;
         const wio = std.Io.Threaded.global_single_threaded.io();
         const t0 = std.Io.Timestamp.now(wio, .boot);
-        var off: u64 = 0;
-        const total: u64 = self.map.len;
+        var done: u64 = 0;
         var prog: WarmProgress = .{};
-        while (off < total) {
-            if (self.warm_stop.load(.acquire)) return;
-            const want: usize = @intCast(@min(total - off, WARM_CHUNK));
-            const got = std.c.pread(self.fd, &scratch, want, @intCast(off));
-            if (got <= 0) return;
-            off += @intCast(got);
-            self.warm_bytes.store(off, .release);
-            live_warm_bytes.store(off, .release);
-            // One clock read per 8 MB pread is free next to the read itself.
-            const el: u64 = @intCast(t0.untilNow(wio, .boot).nanoseconds);
-            if (prog.should(off, el)) log.info("[qwen4] ngram table warm: {d:.1}/{d:.1} GB after {d:.0} s\n", .{ asGb(off), asGb(total), @as(f64, @floatFromInt(el)) / 1e9 });
+        var i: usize = 0;
+        while (self.warmRegion(i)) |r| : (i += 1) {
+            var off: u64 = 0;
+            while (off < r.len) {
+                if (self.warm_stop.load(.acquire)) return;
+                const want: usize = @intCast(@min(r.len - off, WARM_CHUNK));
+                const got = std.c.pread(r.fd, &scratch, want, @intCast(r.off + off));
+                if (got <= 0) return;
+                off += @intCast(got);
+                done += @intCast(got);
+                self.warm_bytes.store(done, .release);
+                live_warm_bytes.store(done, .release);
+                // One clock read per 8 MB pread is free next to the read itself.
+                const el: u64 = @intCast(t0.untilNow(wio, .boot).nanoseconds);
+                if (prog.should(done, el)) log.info("[qwen4] ngram table warm: {d:.1}/{d:.1} GB after {d:.0} s\n", .{ asGb(done), asGb(total), @as(f64, @floatFromInt(el)) / 1e9 });
+            }
         }
         // Completion does not imply residency when the table exceeds available RAM.
         // Publish a request; recalibration must not race the inference thread's pool use.
@@ -1297,6 +1309,18 @@ test "ngram table warm: touches the whole file in the background; close() joins 
     var t2 = try NgramTable.open(path);
     t2.startWarm();
     t2.close();
+
+    // An embedded pack warms every shard part through its own file.
+    var etd = std.testing.tmpDir(.{});
+    defer etd.cleanup();
+    try embedded_ple.writeFixture(&etd, .valid);
+    const elen = try etd.dir.realPath(io, &pbuf);
+    var te = try NgramTable.openEmbedded(pbuf[0..elen], .{ .rows = 6, .dim = 32, .shards = 3 });
+    te.startWarm();
+    (te.warm_thread orelse return error.WarmThreadMissing).join();
+    te.warm_thread = null;
+    try testing.expectEqual(te.embeddedPayloadBytes(), te.warm_bytes.load(.acquire));
+    te.close();
 
     // Kill switch: no thread.
     warm_override = false;

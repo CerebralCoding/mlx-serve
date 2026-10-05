@@ -2057,7 +2057,7 @@ pub const Scheduler = struct {
             // Estimate post-load bytes (see `gateEstimateBytes` for why a media
             // entry cannot be billed by its directory's size).
             const estimated: u64 = gateEstimateBytes(media_peak, resident_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size) +
-                pleTableBill(self.io, owned.config.ngram_table_path);
+                pleTableBill(self.io, owned.config);
 
             // Reserve this load's estimate BEFORE planning eviction, so a
             // concurrent loader sees the pending allocation in its own gate.
@@ -3314,9 +3314,10 @@ fn mlxActiveBytes() u64 {
 
 /// The n-gram table is resident, wired, only on the `--ple-gpu` arm, and sits outside the
 /// `.safetensors` sum; the host gather only faults in the rows it reads.
-fn pleTableBill(io: std.Io, table_path: ?[]const u8) u64 {
-    const p = table_path orelse return 0;
+fn pleTableBill(io: std.Io, config: *const model_mod.ModelConfig) u64 {
     if (!ple_gpu.enabled) return 0;
+    if (config.embedded_ple_payload_bytes) |bytes| return bytes;
+    const p = config.ngram_table_path orelse return 0;
     const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return 0;
     return @intCast(st.size);
 }
@@ -3346,7 +3347,7 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
     return total;
 }
 
-test "pleTableBill: the GPU arm bills the n-gram table, the host gather does not" {
+test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included; the host gather bills nothing" {
     const io = std.testing.io;
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -3359,11 +3360,16 @@ test "pleTableBill: the GPU arm bills the n-gram table, the host gather does not
 
     const was = ple_gpu.enabled;
     defer ple_gpu.enabled = was;
+    var config: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .ngram_table_path = path };
     ple_gpu.enabled = false;
-    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, path));
+    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
     ple_gpu.enabled = true;
-    try std.testing.expectEqual(@as(u64, 10), pleTableBill(io, path));
-    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, null));
+    try std.testing.expectEqual(@as(u64, 10), pleTableBill(io, &config));
+    // An embedded pack bills its shards' payload; its `ngram_table.bin` path names no file.
+    config.embedded_ple_payload_bytes = 120;
+    try std.testing.expectEqual(@as(u64, 120), pleTableBill(io, &config));
+    config = .{ .model_type = "qwen4_exp" };
+    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
 }
 
 fn residentModelDiskBytes(io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
@@ -4771,7 +4777,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 
     // Commit the same validated weight estimate used by the eviction gate
     // and preflight (zero means no disk estimate), plus a GPU-resident n-gram table.
-    const bytes_resident = committedTextBytes(model_bytes, params.config) + pleTableBill(sch.io, params.config.ngram_table_path);
+    const bytes_resident = committedTextBytes(model_bytes, params.config) + pleTableBill(sch.io, params.config);
 
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bytes_resident);

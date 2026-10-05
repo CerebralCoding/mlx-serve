@@ -1,4 +1,4 @@
-![mlx-serve — the unified AI powerhouse on Apple Silicon: chat, coding agents, image, video, music, voice clone, 3D](website/assets/mlx-serve-header.png)
+![mlx-serve — the unified AI powerhouse on Apple Silicon: chat, coding agents, image, video, music, voice clone, 3D](website/assets/mlx-serve-header.jpg)
 
 # mlx-serve — run any LLM on your Mac
 

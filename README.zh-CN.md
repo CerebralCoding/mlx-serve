@@ -1,4 +1,4 @@
-![mlx-serve —— Apple Silicon 上的统一 AI 平台：聊天、编码 Agent、图像、视频、音乐、语音克隆、3D](website/assets/mlx-serve-header.png)
+![mlx-serve —— Apple Silicon 上的统一 AI 平台：聊天、编码 Agent、图像、视频、音乐、语音克隆、3D](website/assets/mlx-serve-header.jpg)
 
 # mlx-serve —— 在你的 Mac 上运行任意 LLM
 
