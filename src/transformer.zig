@@ -18223,6 +18223,11 @@ pub const Transformer = struct {
     /// Hy3 sigmoid+bias routing — compiled closure when available, else the
     /// direct chain. Returns owned `inds` + `norm_scores`.
     fn computeHy3Routing(self: *const Transformer, router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array) !MoeRouting {
+        if (self.config.moe_logit_select) {
+            const k: c_int = @intCast(self.config.num_experts_per_tok);
+            if (try moeRouterTopK(self.s, router_logits, expert_bias, k, .logit_bias, false, 1.0, .float32, 0, 0, null)) |fused| return fused;
+            return kolibriRoutingChain(router_logits, expert_bias, k, self.s);
+        }
         // Group-limited ("noaux_tc") selection is the same sigmoid+bias chain
         // with a group mask between the bias and the top-k, so it shares this
         // entry point rather than a parallel one. `groupLimitedRouting` has its
@@ -26249,7 +26254,9 @@ pub const Transformer = struct {
         const offset = ctx.moe_seq_offset.*;
         const cfg = &self.config;
         const is_gemma4 = cfg.isGemma4Layers();
-        const is_laguna = std.mem.eql(u8, cfg.model_type, "laguna");
+        const is_kolibri = std.mem.eql(u8, cfg.model_type, "kolibri1");
+        // kolibri1 runs laguna's attention arm (no gate, NoPE on full layers).
+        const is_laguna = is_kolibri or std.mem.eql(u8, cfg.model_type, "laguna");
         const is_inkling = cfg.isInkling();
         const is_mla = cfg.isMla();
         // gpt_oss and MiMo share the sink attention arm (per-layer geometry).
@@ -26405,6 +26412,27 @@ pub const Transformer = struct {
             if (is_gemma4) {
                 const next_norm = if (layer_idx + 1 == n_layers) self.final_norm else ml[layer_idx + 1].input_norm;
                 h = try self.gemma4MoeLayerTail(h, attn_out, lw, ctx.use_encoder_scalars, next_norm, &carried_normed, !is_prefill);
+            } else if (is_kolibri) {
+                // Sandwich norms: post_attn on the attention output, pre_ff on
+                // the residual before the MoE, post_ff on the MoE output.
+                const attn_n = try self.rmsNorm(attn_out, lw.post_attn_norm);
+                defer _ = mlx.mlx_array_free(attn_n);
+                var h_mid = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_mid, h, attn_n, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_mid;
+
+                const ff_normed = try self.rmsNorm(h, lw.pre_ff_norm.?);
+                defer _ = mlx.mlx_array_free(ff_normed);
+                const mlp_out = try self.moeMLP(ff_normed, &lw.mlp.moe);
+                defer _ = mlx.mlx_array_free(mlp_out);
+                const mlp_n = try self.rmsNorm(mlp_out, lw.post_ff_norm.?);
+                defer _ = mlx.mlx_array_free(mlp_n);
+
+                var h_next = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_next, h, mlp_n, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_next;
             } else if (is_inkling) {
                 // Inkling layer tail (inkling_mlx/layers.py):
                 //   h = residual + attn_sconv(attn_out)
@@ -29376,6 +29404,7 @@ pub const Transformer = struct {
         // rotary_dim = head_dim*partial_global) + mscale on the rotated slice.
         // Sliding layers: default RoPE at rope_local_base_freq, full rotary.
         const use_yarn = is_full and self.rope_freqs_yarn != null;
+        const no_rope = cfg.layerSkipsRope(layer); // kolibri1 full layers
         const rope_dims: c_int = if (use_yarn)
             @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor_global)
         else
@@ -29421,7 +29450,7 @@ pub const Transformer = struct {
         var k_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_rope);
         var fused_qk = false;
-        if (batch == 1 and seq_len == 1 and cfg.head_dim == 128 and
+        if (batch == 1 and seq_len == 1 and cfg.head_dim == 128 and !no_rope and
             !fused_qkv_used and fa.q_norm.ctx != null and fa.k_norm.ctx != null and
             self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
         blk: {
@@ -29452,7 +29481,11 @@ pub const Transformer = struct {
             var q_t = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_t);
             try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed, &perm, 4, self.s));
-            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+            if (no_rope) {
+                try mlx.check(mlx.mlx_array_set(&q_rope, q_t));
+            } else {
+                try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+            }
 
             // K: proj → reshape → k_norm → transpose → rope
             if (!fused_qkv_used) {
@@ -29467,7 +29500,11 @@ pub const Transformer = struct {
             var k_t = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(k_t);
             try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, self.s));
-            try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+            if (no_rope) {
+                try mlx.check(mlx.mlx_array_set(&k_rope, k_t));
+            } else {
+                try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+            }
 
             // YaRN mscale: scale the rotated slice of q/k by attention_factor. This
             // is exactly the reference's cos/sin *= attention_factor (the mscale
@@ -32168,6 +32205,16 @@ pub const Transformer = struct {
 
     fn moeRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const cfg = &self.config;
+        if (cfg.moe_logit_select) {
+            // kolibri1 routes on fp32 logits (router_w is bound as f32, [in, out]).
+            var x32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x32);
+            try mlx.check(mlx.mlx_astype(&x32, router_x, .float32, self.s));
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_matmul(&out, x32, mw.router_w, self.s));
+            return out;
+        }
         var logits = if (mw.router_scale) |rs| blk: {
             var normed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(normed);
@@ -33888,6 +33935,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const is_gemma4 = config.isGemma4Layers();
     const is_hy3 = std.mem.eql(u8, config.model_type, "hy_v3");
     const is_laguna = std.mem.eql(u8, config.model_type, "laguna");
+    const is_kolibri = std.mem.eql(u8, config.model_type, "kolibri1");
     const is_inkling = std.mem.eql(u8, config.model_type, "inkling_mm_model");
     const is_bailing = std.mem.eql(u8, config.model_type, "bailing_hybrid");
     const is_qwen4 = config.isQwen4();
@@ -33895,7 +33943,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const is_mimo = config.isMimo();
     const is_glm = config.isGlm5();
     // Attention projections that may ship dense bf16 beside quantized experts.
-    const probe_attn_scales = is_laguna or is_mimo;
+    const probe_attn_scales = is_laguna or is_mimo or is_kolibri;
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -33966,6 +34014,18 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             var enc_buf: [256]u8 = undefined;
             const enc_name = std.fmt.bufPrint(&enc_buf, "model.encoder.language_model.layers.{d}.layer_scalar", .{li}) catch unreachable;
             lw.encoder_layer_scalar = weights.get(enc_name);
+        }
+
+        // kolibri1 sandwich norms, named by what they do (the Gemma convention):
+        // post_attn_norm is applied to the attention output, pre_ff_norm to the
+        // residual before the MoE, post_ff_norm to the MoE output. The checkpoint
+        // spells them differently: its `post_attention_layernorm` is the pre-FFN
+        // norm (already loaded above as post_attn_norm) and its `post_attn_norm`
+        // is the attention-output norm.
+        if (is_kolibri) {
+            lw.pre_ff_norm = lw.post_attn_norm;
+            lw.post_attn_norm = try getLayerWeight(weights, name_buf, prefix, li, "post_attn_norm.weight");
+            lw.post_ff_norm = try getLayerWeight(weights, name_buf, prefix, li, "post_ffn_norm.weight");
         }
 
         // Gemma 4 MoE: extra feedforward norms, layer scalar, shared expert MLP
@@ -34715,6 +34775,56 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try mlx.check(mlx.mlx_array_eval(f));
                 try owned_bf16.append(allocator, f);
                 lw.mlp.moe.router_w = f;
+            }
+        } else if (layer_is_moe and is_kolibri) {
+            // kolibri1: stacked experts under `mlp.experts.*` (mlx-lm layout),
+            // the bf16 router `mlp.gate.weight`, the f32 selection bias
+            // `mlp.expert_bias`, and an UNGATED shared expert `mlp.shared_experts.*`.
+            const ex = hy3ExpertContainer(weights, name_buf, prefix, li);
+            var exbuf: [64]u8 = undefined;
+            lw.mlp = .{
+                .moe = .{
+                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
+                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
+                    .shared_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.weight"),
+                    .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.weight"),
+                    .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.weight"),
+                    .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .expert_bias = try getLayerWeight(weights, name_buf, prefix, li, "mlp.expert_bias"),
+                    .route_norm = false,
+                    .route_scale = 1.0,
+                    .shared_ungated = true,
+                },
+            };
+            {
+                const mw = &lw.mlp.moe;
+                try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
+                if (mw.router_s.ctx != null) return error.UnsupportedKolibriConfig; // router ships bf16
+                var router32 = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(&router32, mw.router_w, .float32, s));
+                try owned_bf16.append(allocator, router32);
+                mw.router_w = router32;
+                try maybeTransposeForBf16(&mw.switch_gate_w, mw.switch_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_up_w, mw.switch_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_down_w, mw.switch_down_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
             }
         } else if (layer_is_moe and is_hy3) {
             // Hy3 (hy_v3): stacked experts (already [E, out, packed] in MLX
@@ -36558,6 +36668,48 @@ fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: 
     return .{ .inds = inds, .norm_scores = norm_scores };
 }
 
+/// kolibri1 routing: the top-k is taken on `logits + expert_bias` (raw logits,
+/// not sigmoid scores), the weights are `sigmoid(logits)` of the picks with no
+/// renormalisation and no scale. Weights stay f32; the caller casts them.
+fn kolibriRoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !Transformer.MoeRouting {
+    var logits_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits_f32);
+    try mlx.check(mlx.mlx_astype(&logits_f32, router_logits, .float32, s));
+
+    var biased = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(biased);
+    try mlx.check(mlx.mlx_add(&biased, logits_f32, expert_bias, s));
+    var neg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg);
+    try mlx.check(mlx.mlx_negative(&neg, biased, s));
+    var partitioned = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(partitioned);
+    try mlx.check(mlx.mlx_argpartition_axis(&partitioned, neg, k - 1, -1, s));
+
+    const p_shape = mlx.getShape(partitioned);
+    var inds = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(inds);
+    {
+        var start_arr: [4]c_int = undefined;
+        var stop_arr: [4]c_int = undefined;
+        var strides_arr: [4]c_int = undefined;
+        for (0..p_shape.len) |d| {
+            start_arr[d] = 0;
+            stop_arr[d] = if (d == p_shape.len - 1) k else p_shape[d];
+            strides_arr[d] = 1;
+        }
+        try mlx.check(mlx.mlx_slice(&inds, partitioned, &start_arr, p_shape.len, &stop_arr, p_shape.len, &strides_arr, p_shape.len, s));
+    }
+
+    var picked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(picked);
+    try mlx.check(mlx.mlx_take_along_axis(&picked, logits_f32, inds, -1, s));
+    var norm_scores = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(norm_scores);
+    try mlx.check(mlx.mlx_sigmoid(&norm_scores, picked, s));
+    return .{ .inds = inds, .norm_scores = norm_scores };
+}
+
 // ── Fused MoE router (top-K selection + weight normalization in ONE kernel) ──
 //
 // The op chains above are ~11 dispatches each — sigmoid/softmax, bias add,
@@ -36597,7 +36749,8 @@ fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: 
 /// `softmax_gate` is `softmax` plus the shared-expert gate's logit, a dot of one x row with a flat
 /// weight vector that the simdgroups sitting out the selection compute while it runs (the matmul it
 /// replaces is two dependent launches ahead of the router). It needs at least two simdgroups.
-const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2, softmax_gate = 3 };
+/// `logit_bias` (kolibri1) selects on `logits + bias` and weights by `sigmoid(logits)`.
+const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2, softmax_gate = 3, logit_bias = 4 };
 
 /// Largest expert count the kernel will stage in threadgroup memory. The
 /// sigmoid arm keeps two f32 planes (key + raw weight), so 2048 experts is
@@ -36605,7 +36758,8 @@ const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_groupe
 const ROUTER_MAX_EXPERTS: c_int = 2048;
 
 fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
-    const sigmoid = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped;
+    const logit_sel = mode == .logit_bias;
+    const sigmoid = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped or logit_sel;
     const grouped = mode == .sigmoid_bias_grouped;
     const gate = mode == .softmax_gate;
     return std.fmt.comptimePrint(
@@ -36697,8 +36851,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             \\  float l = float(logits[rbase + e]);
             \\  float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(l)));
             \\  float sg = (l < 0.0f) ? sy : (1.0f - sy);
-            \\  rk[e] = sg + float(bias[e]);
-            \\  rw[e] = sg;
+            ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
         else
             \\  rk[e] = float(logits[rbase + e]);
         ,
@@ -36829,9 +36982,9 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
     });
 }
 
-const ROUTER_SOURCES = [4][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped), moeRouterSource(.softmax_gate) };
-const ROUTER_NAMES = [4][*:0]const u8{ "mlxserve_moe_router_softmax", "mlxserve_moe_router_sigmoid", "mlxserve_moe_router_sigmoid_grouped", "mlxserve_moe_router_softmax_gate" };
-var router_kernels: [4]?mlx.mlx_fast_metal_kernel = @splat(null);
+const ROUTER_SOURCES = [5][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped), moeRouterSource(.softmax_gate), moeRouterSource(.logit_bias) };
+const ROUTER_NAMES = [5][*:0]const u8{ "mlxserve_moe_router_softmax", "mlxserve_moe_router_sigmoid", "mlxserve_moe_router_sigmoid_grouped", "mlxserve_moe_router_softmax_gate", "mlxserve_moe_router_logit_bias" };
+var router_kernels: [5]?mlx.mlx_fast_metal_kernel = @splat(null);
 
 fn getMoeRouterKernel(mode: RouterMode) !mlx.mlx_fast_metal_kernel {
     const mi: usize = @backingInt(mode);
@@ -36842,7 +36995,7 @@ fn getMoeRouterKernel(mode: RouterMode) !mlx.mlx_fast_metal_kernel {
     const input_names: []const [*:0]const u8 = switch (mode) {
         .softmax => &softmax_inputs,
         .softmax_gate => &gate_inputs,
-        .sigmoid_bias, .sigmoid_bias_grouped => &sigmoid_inputs,
+        .sigmoid_bias, .sigmoid_bias_grouped, .logit_bias => &sigmoid_inputs,
     };
     const plain_outputs = [_][*:0]const u8{ "inds", "scores" };
     const gate_outputs = [_][*:0]const u8{ "inds", "scores", "glogit" };
@@ -36909,7 +37062,7 @@ const RouterCfgSlot = struct {
     key: RouterCfgKey = std.mem.zeroes(RouterCfgKey),
     scale_arr: mlx.mlx_array = .{ .ctx = null },
 };
-var router_cfg_cache: [4]RouterCfgSlot = .{ .{}, .{}, .{}, .{} };
+var router_cfg_cache: [5]RouterCfgSlot = .{ .{}, .{}, .{}, .{}, .{} };
 
 pub var moe_router_fused_override: ?bool = null;
 var moe_router_fused_env: ?bool = null;
@@ -36946,7 +37099,7 @@ fn moeRouterTopK(
 ) !?Transformer.MoeRouting {
     if (!moeRouterFusedEnabled()) return null;
     const mode: RouterMode = if (gate != null and mode_in == .softmax) .softmax_gate else mode_in;
-    const sigmoid_mode = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped;
+    const sigmoid_mode = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped or mode == .logit_bias;
     const lsh = mlx.getShape(logits);
     if (lsh.len < 1 or lsh.len > 4) return null;
     const num_experts = lsh[lsh.len - 1];
@@ -37037,7 +37190,7 @@ fn moeRouterTopK(
     const inputs_arr: []const mlx.mlx_array = switch (mode) {
         .softmax => &softmax_inputs,
         .softmax_gate => &gate_inputs,
-        .sigmoid_bias, .sigmoid_bias_grouped => &sigmoid_inputs,
+        .sigmoid_bias, .sigmoid_bias_grouped, .logit_bias => &sigmoid_inputs,
     };
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs_arr.ptr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -49990,6 +50143,67 @@ test "fused MoE router reproduces the hy3 sigmoid+bias routing chain" {
     }
     // Both round to bf16 at the end, so the bar is "no worse", not "better".
     try testing.expect(fused_err <= chain_err * 1.0001 + 1e-6);
+}
+
+test "fused MoE router reproduces the kolibri1 logit+bias routing chain" {
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4B011B21);
+    const rnd = prng.random();
+    moe_router_fused_override = true;
+    defer moe_router_fused_override = null;
+
+    const ROWS: c_int = 5;
+    const E: c_int = 384;
+    const K: c_int = 6;
+    const en: usize = @intCast(E);
+    const kn: usize = @intCast(ROWS * K);
+
+    const buf = try allocator.alloc(f32, @intCast(ROWS * E));
+    defer allocator.free(buf);
+    for (buf) |*v| v.* = (rnd.float(f32) - 0.5) * 8.0;
+    const lsh = [_]c_int{ ROWS, E };
+    const logits = mlx.mlx_array_new_data(buf.ptr, &lsh, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const bbuf = try allocator.alloc(f32, en);
+    defer allocator.free(bbuf);
+    for (bbuf) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    const bsh = [_]c_int{E};
+    const bias = mlx.mlx_array_new_data(bbuf.ptr, &bsh, 1, .float32);
+    defer _ = mlx.mlx_array_free(bias);
+
+    const fused = (try moeRouterTopK(s, logits, bias, K, .logit_bias, false, 1.0, .float32, 0, 0, null)) orelse
+        return error.FusedRouterDeclined;
+    defer _ = mlx.mlx_array_free(fused.inds);
+    defer _ = mlx.mlx_array_free(fused.norm_scores);
+    const chain = try kolibriRoutingChain(logits, bias, K, s);
+    defer _ = mlx.mlx_array_free(chain.inds);
+    defer _ = mlx.mlx_array_free(chain.norm_scores);
+
+    const f_ids = try allocator.alloc(f32, kn);
+    defer allocator.free(f_ids);
+    const c_ids = try allocator.alloc(f32, kn);
+    defer allocator.free(c_ids);
+    const f_w = try allocator.alloc(f32, kn);
+    defer allocator.free(f_w);
+    const c_w = try allocator.alloc(f32, kn);
+    defer allocator.free(c_w);
+    try testReadF32(fused.inds, f_ids, s);
+    try testReadF32(chain.inds, c_ids, s);
+    try testReadF32(fused.norm_scores, f_w, s);
+    try testReadF32(chain.norm_scores, c_w, s);
+
+    // Same expert set per row, and each expert carries the chain's exact weight.
+    const k: usize = @intCast(K);
+    for (0..@intCast(ROWS)) |r| {
+        for (0..k) |j| {
+            const id = f_ids[r * k + j];
+            var slot: usize = 0;
+            while (slot < k and c_ids[r * k + slot] != id) : (slot += 1) {}
+            try testing.expect(slot < k);
+            try testing.expectEqual(c_w[r * k + slot], f_w[r * k + j]);
+        }
+    }
 }
 
 test "fused attention output gate is bit-identical to the softplus op chain" {

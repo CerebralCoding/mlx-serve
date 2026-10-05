@@ -1281,7 +1281,13 @@ pub fn fillOptionalToolDefKeys(allocator: std.mem.Allocator, tools_json: []const
 /// Qwen3.8's effort vocabulary (xhigh|medium|low); `qwen38EffortFor` maps an
 /// absent effort to low on this family.
 pub fn isQwen38EffortTemplate(tpl: []const u8) bool {
-    return std.mem.indexOf(u8, tpl, "'xhigh'") != null;
+    // Kolibri's effort list also spells 'xhigh' but has its own vocabulary.
+    return std.mem.indexOf(u8, tpl, "'xhigh'") != null and !isKolibriEffortTemplate(tpl);
+}
+
+/// Kolibri-1's template: the one place that names its private effort variable.
+pub fn isKolibriEffortTemplate(tpl: []const u8) bool {
+    return std.mem.indexOf(u8, tpl, "_sv_reasoning_effort") != null;
 }
 
 pub fn templateConsumesEffort(tpl: []const u8) bool {
@@ -1374,6 +1380,17 @@ pub fn mergeTemplateKwargs(allocator: std.mem.Allocator, model_kwargs: ?[]const 
     return buf.toOwnedSlice(allocator);
 }
 
+/// Kolibri-1's template reads none|minimal|low|medium|high|xhigh|max and treats
+/// "none" as thinking-off; any other word it does not know falls through to high.
+fn kolibriEffortFor(effort: ?[]const u8, enable_thinking: bool) []const u8 {
+    if (!enable_thinking) return "none";
+    const e = effort orelse return "high";
+    for ([_][]const u8{ "minimal", "low", "medium", "high", "xhigh", "max" }) |w| {
+        if (std.mem.eql(u8, e, w)) return w;
+    }
+    return "high";
+}
+
 fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatConfig, enable_thinking: bool, effort: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
@@ -1450,6 +1467,10 @@ fn serializeExtraContext(allocator: std.mem.Allocator, chat_config: *const ChatC
     } else if (std.mem.indexOf(u8, chat_config.chat_template, "reasoning_effort in ['low', 'high']") != null) {
         try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
         try buf.appendSlice(allocator, glm5EffortFor(effort));
+        try buf.append(allocator, '"');
+    } else if (isKolibriEffortTemplate(chat_config.chat_template)) {
+        try buf.appendSlice(allocator, ",\"reasoning_effort\":\"");
+        try buf.appendSlice(allocator, kolibriEffortFor(effort, enable_thinking));
         try buf.append(allocator, '"');
     } else try buf.appendSlice(allocator, if (enable_thinking)
         ",\"reasoning_effort\":\"high\""
@@ -10390,6 +10411,18 @@ test "serializeExtraContext: glm5_next maps effort onto low|high|max" {
         var want: [64]u8 = undefined;
         try testing.expect(std.mem.indexOf(u8, r, try std.fmt.bufPrint(&want, "\"reasoning_effort\":\"{s}\"", .{c.out})) != null);
     }
+}
+
+test "kolibriEffortFor: thinking-off is the word 'none', never hy3's no_think" {
+    try testing.expectEqualStrings("none", kolibriEffortFor(null, false));
+    try testing.expectEqualStrings("none", kolibriEffortFor("high", false));
+    try testing.expectEqualStrings("high", kolibriEffortFor(null, true));
+    try testing.expectEqualStrings("low", kolibriEffortFor("low", true));
+    try testing.expectEqualStrings("medium", kolibriEffortFor("medium", true));
+    try testing.expectEqualStrings("high", kolibriEffortFor("banana", true));
+    // Its effort list spells 'xhigh' too, which must not read as Qwen3.8.
+    try testing.expect(!isQwen38EffortTemplate("{%- set _sv_reasoning_effort = reasoning_effort -%}['high', 'xhigh', 'max']"));
+    try testing.expect(isQwen38EffortTemplate("reasoning_effort|default('xhigh')"));
 }
 
 test "dsv4EffortFor: OpenAI effort vocabulary maps onto DeepSeek's low|high|max" {

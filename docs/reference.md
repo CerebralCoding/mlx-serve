@@ -84,6 +84,7 @@ Dispatched on `model_type` in `config.json` via `model.zig` (config/weights) and
 | `nemotron_h` | Nemotron-H | `backbone` | -- | -- | Hybrid transformer + Mamba2 SSM |
 | `lfm2`, `lfm2_vl` | Liquid LFM2.5 / LFM2.5-VL | `model` | -- | `vision_tower` + `multi_modal_projector` | Hybrid gated conv + full attention; the VL tag adds a SigLIP2-NaFlex tower (`src/lfm2_vision.zig`) |
 | `laguna` | poolside Laguna S 2.1 | `model` | -- | 256/top-10 | Pure-attention MoE coder (nvfp4 experts); per-layer Q-heads, softplus attn gate, YaRN rope. See "Laguna" below. |
+| `kolibri1` | Aleph Alpha Kolibri-1 | `model` | -- | 384/top-6 | Pure-attention MoE (78B-A3.5B): 40 sliding(513) + 10 NoPE full layers, sandwich norms, ungated shared expert, top-k on logits + `expert_bias` with sigmoid weights, fp32 router. |
 | `llama`, `mistral` | Llama/Mistral | `model` | -- | -- | |
 | `*.gguf` (any) | via llama.cpp | -- | -- | -- | Embedded libllama engine; reported as `model_type=gguf`. See Embedded engines. |
 
