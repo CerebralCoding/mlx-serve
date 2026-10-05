@@ -32,7 +32,9 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
+const depth_bounds = @import("mtp_depth_bounds.zig");
 const mlx = @import("mlx");
+const ple_gpu = @import("ple_gpu.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
@@ -118,6 +120,7 @@ pub const LoadParams = struct {
     chat_config: *ChatConfig,
     /// Path to the model directory. Borrowed; outlive scheduler.
     model_dir: []const u8,
+    resident_model_bytes: ?u64 = null,
     /// Path to the assistant drafter checkpoint. Empty disables the drafter.
     /// Borrowed; outlive scheduler.
     drafter_dir: []const u8 = "",
@@ -128,7 +131,7 @@ pub const LoadParams = struct {
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
     mtp_head_kv_quant: bool = false,
-    /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
+    /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
     /// Build the ANE prefill-MLP offload at load (`--ane-prefill`,
@@ -158,8 +161,9 @@ pub const LoadParams = struct {
     /// 4/8-bit affine quantization via `--kv-quant {4,8}`. Stored on every
     /// per-slot KVCache and consulted at every read/write boundary.
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
-    /// Per-model hot prefix cache capacity (count). 0 disables.
+    /// Zero disables all prefix reuse; RAM retention is selected separately.
     prefix_cache_capacity: u32 = 1,
+    prefix_cache_ram_enabled: bool = true,
     /// Per-model hot prefix cache KV-bytes budget. 0 disables the byte cap.
     prefix_cache_mem_bytes: u64 = 0,
     /// Clamp the hot-cache byte budget against live post-load headroom
@@ -563,6 +567,8 @@ pub const Slot = struct {
     /// here so the client cannot round-trip the loop into the next prompt.
     loop_trim_start: ?usize,
     cancelled: std.atomic.Value(bool),
+    /// Inference thread only: the request's outcome has been counted in `Metrics`.
+    metrics_recorded: bool = false,
     /// Inference-thread passes (a prefill, a decode tick) holding this slot, taken
     /// under `queue_mu`. `complete` waits it out: the handler owns sampling state
     /// the pass reads (`think_bound`, `constraint`) and frees it once `complete` returns.
@@ -1160,6 +1166,7 @@ pub const LoadRequest = struct {
 
     /// Borrowed paths. Conn thread keeps the buffers alive until `done`.
     model_dir: []const u8,
+    resident_model_bytes: ?u64 = null,
     drafter_dir: []const u8 = "",
     /// `--no-drafter`: never load a drafter, including one MERGED into the
     /// checkpoint. `drafter_dir == ""` stopped meaning "off" the moment a
@@ -1180,7 +1187,7 @@ pub const LoadRequest = struct {
     /// Auto-load the Qwen native MTP sidecar when the model dir ships one.
     mtp_enabled: bool = true,
     mtp_head_kv_quant: bool = false,
-    /// Max MTP draft depth (CLI --mtp-depth; 0 = auto, resolved by
+    /// Max MTP draft depth (CLI --mtp-max-depth; 0 = auto, resolved by
     /// generate_mod.resolveMtpDepthCap at load/Generator init).
     mtp_depth: u32 = 0,
     /// `--ane-prefill` survives cold loads (the flag-eater class).
@@ -1194,6 +1201,7 @@ pub const LoadRequest = struct {
     draft_block_size_explicit: bool = false,
     kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
+    prefix_cache_ram_enabled: bool = true,
     prefix_cache_mem_bytes: u64 = 0,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64 = null,
     /// SSD tier byte budget (mirrors `LoadParams.prefix_cache_disk_bytes`).
@@ -1356,6 +1364,7 @@ pub const Scheduler = struct {
     /// crippled warm reuse — and disabled it entirely on hybrids — after
     /// every model switch.
     prefix_cache_capacity: u32,
+    prefix_cache_ram_enabled: bool,
     prefix_cache_mem_bytes: u64,
     prefix_cache_mem_resolver: ?*const fn (*model_mod.ModelConfig, u64, BudgetRevise, *u64) u64,
     prefix_cache_disk_bytes: u64,
@@ -1363,7 +1372,7 @@ pub const Scheduler = struct {
     ssm_checkpoint_max: u32,
     /// Launch-flag MTP + embedded-llama.cpp settings, retained (same rationale
     /// as the prefix-cache fields above) so COLD-LOADED models — on-demand
-    /// `/v1/load-model`, model switches — honor `--no-mtp` / `--mtp-depth` /
+    /// `/v1/load-model`, model switches — honor `--no-mtp` / `--mtp-max-depth` /
     /// `--llama-cache-entries` / `--llama-kv-quant` like the `--model` primary.
     /// Pre-plumbing, the cold-load `LoadRequest` used its struct defaults
     /// (mtp on, default depth, 4 llama sessions, F16 KV), silently ignoring
@@ -1570,6 +1579,7 @@ pub const Scheduler = struct {
             .kv_quant_config = params.kv_quant_config,
             .gguf_ctx_size = params.ctx_size,
             .prefix_cache_capacity = params.prefix_cache_capacity,
+            .prefix_cache_ram_enabled = params.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = params.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = params.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = params.prefix_cache_disk_bytes,
@@ -2005,6 +2015,17 @@ pub const Scheduler = struct {
         // Peeked OUTSIDE the registry mutex — it stats the model dir, and no
         // other load should block on our filesystem.
         const media_peak = self.mediaPeakFor(entry);
+        const mlx_text = owned.gguf == null and gen_mod.modalityFromType(owned.config.model_type) == null;
+        const validated_model_bytes: ?u64 = if (mlx_text)
+            residentModelDiskBytes(self.io, entry.path, owned.config) catch |err| {
+                self.registry.mutex.lockUncancelable(self.io);
+                if (entry.state == .unloaded) self.registry.markErrorLocked(entry, @errorName(err));
+                self.registry.mutex.unlock(self.io);
+                return error.LoadFailed;
+            }
+        else
+            null;
+        const resident_model_bytes = residentGateBytes(validated_model_bytes, entry.bytes_on_disk, mlx_text);
 
         // ── Stage 1 (registry mutex): claim .loading, plan eviction.
         {
@@ -2037,7 +2058,8 @@ pub const Scheduler = struct {
 
             // Estimate post-load bytes (see `gateEstimateBytes` for why a media
             // entry cannot be billed by its directory's size).
-            const estimated: u64 = gateEstimateBytes(media_peak, entry.bytes_on_disk, owned.config.num_hidden_layers, owned.config.hidden_size);
+            const estimated: u64 = gateEstimateBytes(media_peak, resident_model_bytes, owned.config.num_hidden_layers, owned.config.hidden_size) +
+                pleTableBill(self.io, owned.config);
 
             // Reserve this load's estimate BEFORE planning eviction, so a
             // concurrent loader sees the pending allocation in its own gate.
@@ -2050,7 +2072,7 @@ pub const Scheduler = struct {
             // (multi-victim). On failure — every other resident model is pinned
             // by an in-flight request — roll back and surface a 503 instead of
             // loading anyway and crashing.
-            const n = self.registry.planEvictionsLocked(entry.id, &victims_buf) orelse {
+            const n = self.registry.planEvictionsLocked(entry.id, &victims_buf, mlxActiveBytes()) orelse {
                 // Name the numbers. A refusal that logs NOTHING sends the user
                 // hunting for a concurrent request that does not exist: on an
                 // idle server the cause is always the static cap (#126), and
@@ -2080,6 +2102,7 @@ pub const Scheduler = struct {
             .tok = owned.tok,
             .chat_config = owned.chat_config,
             .model_dir = entry.path,
+            .resident_model_bytes = resident_model_bytes,
             // `--no-drafter` / `--drafter` / `--draft-block-size` reach cold
             // loads too; the path itself is scoped by `coldLoadDrafterDir`.
             .drafter_dir = coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path),
@@ -2093,6 +2116,7 @@ pub const Scheduler = struct {
             // startup model — pre-plumbing these were (1, 0, stride 0),
             // which silently degraded warm reuse after every model switch.
             .prefix_cache_capacity = self.prefix_cache_capacity,
+            .prefix_cache_ram_enabled = self.prefix_cache_ram_enabled,
             .prefix_cache_mem_bytes = self.prefix_cache_mem_bytes,
             .prefix_cache_mem_resolver = self.prefix_cache_mem_resolver,
             .prefix_cache_disk_bytes = self.prefix_cache_disk_bytes,
@@ -2100,7 +2124,7 @@ pub const Scheduler = struct {
             .ssm_checkpoint_max = self.ssm_checkpoint_max,
             // Cold loads honor the launch-flag MTP + embedded-llama.cpp
             // settings too (same reason as prefix-cache above) — pre-plumbing
-            // these were LoadRequest defaults, so --no-mtp / --mtp-depth /
+            // these were LoadRequest defaults, so --no-mtp / --mtp-max-depth /
             // --llama-cache-entries / --llama-kv-quant were silently dropped
             // on every on-demand load and model switch.
             .mtp_enabled = self.mtp_enabled,
@@ -2492,6 +2516,13 @@ fn groupCtxMax(caches: []const *const KVCache) u32 {
     var m: usize = 0;
     for (caches) |c| m = @max(m, c.kvLenForBatching());
     return @intCast(@min(m, std.math.maxInt(u32)));
+}
+
+/// Does the batched forward pad every slot's KV to the group's longest? GLM-5-Next attends per
+/// slot at any length, so it has no padding to cap.
+fn groupPadsKv(slot: *const Slot) bool {
+    const cfg = slot.model.config orelse return true;
+    return !cfg.isGlm5();
 }
 
 /// The per-slot attention arm serves every batched trunk but qwen4's QSA reads.
@@ -3292,6 +3323,23 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     if (hot_cache_budget_invalidate) |f| f();
 }
 
+/// Bytes MLX holds right now across every resident model (an allocator counter, safe off the inference thread).
+fn mlxActiveBytes() u64 {
+    var n: usize = 0;
+    _ = mlx.mlx_get_active_memory(&n);
+    return n;
+}
+
+/// The n-gram table is resident, wired, only on the `--ple-gpu` arm, and sits outside the
+/// `.safetensors` sum; the host gather only faults in the rows it reads.
+fn pleTableBill(io: std.Io, config: *const model_mod.ModelConfig) u64 {
+    if (!ple_gpu.enabled) return 0;
+    if (config.embedded_ple_payload_bytes) |bytes| return bytes;
+    const p = config.ngram_table_path orelse return 0;
+    const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return 0;
+    return @intCast(st.size);
+}
+
 /// Sum of `*.safetensors` bytes in `model_dir` — the MLX weight footprint used
 /// by the load pre-flight. Returns 0 if the dir can't be read (treated as
 /// "unknown" by the caller, which then skips the check). Symlinked weights
@@ -3325,6 +3373,94 @@ fn modelDiskBytes(io: std.Io, model_dir: []const u8) u64 {
         total += @intCast(st.size);
     }
     return total;
+}
+
+test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included; the host gather bills nothing" {
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "ngram_table.bin", .data = "0123456789" });
+    var cwd_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const cwd_ptr = std.c.getcwd(&cwd_buf, cwd_buf.len) orelse return error.NoCwd;
+    const cwd = std.mem.span(@as([*:0]const u8, @ptrCast(cwd_ptr)));
+    const path = try std.fmt.allocPrint(std.testing.allocator, "{s}/.zig-cache/tmp/{s}/ngram_table.bin", .{ cwd, tmp.sub_path });
+    defer std.testing.allocator.free(path);
+
+    const was = ple_gpu.enabled;
+    defer ple_gpu.enabled = was;
+    var config: model_mod.ModelConfig = .{ .model_type = "qwen4_exp", .ngram_table_path = path };
+    ple_gpu.enabled = false;
+    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
+    ple_gpu.enabled = true;
+    try std.testing.expectEqual(@as(u64, 10), pleTableBill(io, &config));
+    // An embedded pack bills its shards' payload; its `ngram_table.bin` path names no file.
+    config.embedded_ple_payload_bytes = 120;
+    try std.testing.expectEqual(@as(u64, 120), pleTableBill(io, &config));
+    config = .{ .model_type = "qwen4_exp" };
+    try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
+}
+
+fn residentModelDiskBytes(io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
+    const total = modelDiskBytes(io, model_dir);
+    if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
+    const info = (try @import("qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
+    if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
+    if (info.payload_bytes > total) return error.InvalidEmbeddedNgramTable;
+    return total - info.payload_bytes;
+}
+
+fn residentGateBytes(validated: ?u64, discovered: ?u64, mlx_text: bool) ?u64 {
+    if (!mlx_text) return discovered;
+    if (validated) |bytes| if (bytes > 0) return bytes;
+    return discovered orelse 0;
+}
+
+test "GGUF and unavailable media peak retain discovery bytes at the eviction gate" {
+    const GB: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(@as(?u64, 100 * GB), residentGateBytes(null, 100 * GB, false));
+    try std.testing.expectEqual(110 * GB, gateEstimateBytes(0, residentGateBytes(null, 100 * GB, false), 48, 2560));
+    try std.testing.expectEqual(24 * GB, gateEstimateBytes(24 * GB, residentGateBytes(null, 100 * GB, false), 0, 0));
+    try std.testing.expectEqual(@as(?u64, 70 * GB), residentGateBytes(70 * GB, 100 * GB, true));
+    try std.testing.expectEqual(@as(?u64, 100 * GB), residentGateBytes(0, 100 * GB, true));
+    try std.testing.expectEqual(@as(?u64, 0), residentGateBytes(0, null, true));
+    try std.testing.expectEqual(@as(?u64, 0), residentGateBytes(null, 0, false));
+}
+
+fn committedTextBytes(model_bytes: u64, config: *const model_mod.ModelConfig) u64 {
+    if (model_bytes > 0) return model_bytes;
+    return @as(u64, config.num_hidden_layers) * @as(u64, config.hidden_size) * 4 * 4;
+}
+
+test "validated embedded weight estimate feeds eviction preflight and residency" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try @import("qwen4_ple.zig").writeFixture(&td, .valid);
+    var path: [std.fs.max_path_bytes]u8 = undefined;
+    const len = try td.dir.realPath(io, &path);
+    const dir = path[0..len];
+    var config: model_mod.ModelConfig = .{
+        .model_type = "qwen4_exp",
+        .vocab_size = 1,
+        .ngram_size = 3,
+        .heads_per_ngram = 1,
+        .ngram_vocab_base = 2,
+        .ngram_vocab_divisor = 6,
+        .ple_embed_dim = 64,
+        .split_ngram_parts = 3,
+        .ple_layer_idx = 1,
+        .embedded_ple_payload_bytes = 120,
+        .num_hidden_layers = 2,
+        .hidden_size = 64,
+    };
+    const disk = modelDiskBytes(io, dir);
+    const snapshot = try residentModelDiskBytes(io, dir, &config);
+    try std.testing.expectEqual(disk - 120, snapshot);
+    try std.testing.expectEqual(snapshot, committedTextBytes(snapshot, &config));
+    try std.testing.expectEqual(snapshot + snapshot / 10, gateEstimateBytes(0, snapshot, config.num_hidden_layers, config.hidden_size));
+    try std.testing.expectEqual(loadRequirementBytes(snapshot), loadRequirementBytes(committedTextBytes(snapshot, &config)));
+    config.embedded_ple_payload_bytes = 121;
+    try std.testing.expectError(error.EmbeddedNgramTableChanged, residentModelDiskBytes(io, dir, &config));
 }
 
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
@@ -3740,29 +3876,6 @@ test "the eviction gate bills a media entry its BACKEND peak, never the dir's sa
     try testing.expectEqual(fallback + fallback / 10, gateEstimateBytes(0, null, 32, 4096));
 }
 
-test "the gate and the media preflight read ONE estimator" {
-    // The class bug in #126 is not the formula, it is that two sites computed
-    // the same bill differently and the stricter one ran first. Both call
-    // `gen.estimatePeakResidentBytes`; the gate reaches it through
-    // `mediaPeakFor`, which is the only place allowed to decide "is this a
-    // media entry, and what backend is it". Needles are ++-split so this
-    // test's own source cannot satisfy the scan.
-    const src = @embedFile("scheduler.zig");
-    const peek = "const media_peak = self.mediaPeak" ++ "For(entry);";
-    try testing.expect(std.mem.indexOf(u8, src, peek) != null);
-    const gate = "gateEstimateBytes(media_peak, entry.bytes_on" ++ "_disk,";
-    try testing.expect(std.mem.indexOf(u8, src, gate) != null);
-    // The raw-bytes_on_disk shape the gate used to have must be GONE.
-    const old = "const base: u64 = if (entry.bytes_on" ++ "_disk) |b|";
-    try testing.expect(std.mem.indexOf(u8, src, old) == null);
-    // Both the preflight and the committed residency go through the estimator.
-    var n: usize = 0;
-    var i: usize = 0;
-    const needle = "gen_mod.estimatePeakResident" ++ "Bytes(";
-    while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
-    try testing.expect(n >= 2);
-}
-
 test "a media model commits the residency the gate reserved" {
     // Secondary #1 of the issue: the gate reserved the staged peak and then
     // `markReadyLocked` committed the DIR SUM, so H3 sat in the budget at
@@ -3898,6 +4011,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         try doLoadGenOnInferenceThread(sch, params, modality);
         return;
     }
+    const model_bytes = params.resident_model_bytes orelse blk: {
+        const scanned = try residentModelDiskBytes(sch.io, params.model_dir, params.config);
+        break :blk residentGateBytes(scanned, params.entry.bytes_on_disk, true).?;
+    };
 
     // GPU-memory pre-flight (MLX path). A Metal OOM during weight load / warmup
     // is thrown by MLX as a C++ exception that can't be caught across the C ABI,
@@ -3932,19 +4049,19 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     defer if (in_dir_drafter) |p| sch.allocator.free(p);
     if (!skip_mem_preflight) {
         const gb = 1024.0 * 1024.0 * 1024.0;
-        const model_bytes = arch_load_bytes orelse modelDiskBytes(sch.io, params.model_dir);
+        const preflight_model_bytes = arch_load_bytes orelse model_bytes;
         const sidecar: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
         const drafter_bytes: u64 = if (sidecar.len == 0) 0 else drafterResidentBytes(modelDiskBytes(sch.io, sidecar), dflash_mod.sidecarQuantBits(sch.io, sch.allocator, sidecar));
         const mtp_bytes = mtpSidecarDiskBytes(sch.io, sch.allocator, params.model_dir, params.config.mtp_override orelse params.mtp_enabled);
-        const weights_bytes = model_bytes + drafter_bytes + mtp_bytes;
+        const weights_bytes = preflight_model_bytes + drafter_bytes + mtp_bytes;
         const avail_bytes = availForLoad(weights_bytes);
         log.info("[preflight] weights ~{d:.2} GB, available {d:.2} GB\n", .{
-            @as(f64, @floatFromInt(model_bytes)) / gb,
+            @as(f64, @floatFromInt(preflight_model_bytes)) / gb,
             @as(f64, @floatFromInt(avail_bytes)) / gb,
         });
         if (drafter_bytes > 0) log.info("[preflight] drafter ~{d:.2} GB at {s}\n", .{ @as(f64, @floatFromInt(drafter_bytes)) / gb, sidecar });
         if (mtp_bytes > 0) log.info("[preflight] mtp sidecar ~{d:.2} GB\n", .{@as(f64, @floatFromInt(mtp_bytes)) / gb});
-        switch (preflightVerdict(model_bytes, drafter_bytes, avail_bytes, in_dir_drafter != null)) {
+        switch (preflightVerdict(preflight_model_bytes, drafter_bytes, avail_bytes, in_dir_drafter != null)) {
             .fits => {},
             .drop_drafter => {
                 log.warn("[dflash] sidecar at {s} skipped: model + drafter need ~{d:.1} GB free, {d:.1} GB available; the model loads without it\n", .{
@@ -4338,6 +4455,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             var sw = io_u.Stopwatch.init(tio);
             var build_ns: u64 = 0;
             var eval_ns: u64 = 0;
+            var encode_ns: u64 = 0;
             var ops_total: u64 = 0;
             var done: usize = 0;
             for (0..n) |_| {
@@ -4349,7 +4467,14 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 const lg = xfm_ptr.forwardWith(&ctx, ti) catch break;
                 build_ns += swb.read();
                 ops_total += mlx.op_count.load(.monotonic) - ops_before;
+                // The eval is two host phases: encoding every kernel (MLX runs `eval_gpu` on the
+                // calling thread, throttled to MAX_ACTIVE_TASKS open command buffers), then the
+                // wait for the GPU. The split says which side bounds the forward.
                 var swe = io_u.Stopwatch.init(tio);
+                const lgv = mlx.mlx_vector_array_new_value(lg);
+                _ = mlx.mlx_async_eval(lgv);
+                _ = mlx.mlx_vector_array_free(lgv);
+                encode_ns += swe.read();
                 _ = mlx.mlx_array_eval(lg);
                 eval_ns += swe.read();
                 _ = mlx.mlx_array_free(lg);
@@ -4358,11 +4483,13 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             const dn: f64 = @floatFromInt(@max(done, 1));
             const ms = if (prefill_rows) @as(f64, @floatFromInt(build_ns + eval_ns)) / 1.0e6 / dn else @as(f64, @floatFromInt(sw.read())) / 1.0e6 / dn;
             transformer_mod.decodeProfReport();
-            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU, {d:.0} ops/forward)\n", .{
+            log.info("[fwd-ubench] {d} decode forwards, eval-per-step: {d:.3} ms/forward (build {d:.3} ms CPU + eval {d:.3} ms GPU [encode {d:.3} + wait {d:.3}], {d:.0} ops/forward)\n", .{
                 done,
                 ms,
                 @as(f64, @floatFromInt(build_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(eval_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(encode_ns)) / 1.0e6 / dn,
+                @as(f64, @floatFromInt(eval_ns - encode_ns)) / 1.0e6 / dn,
                 @as(f64, @floatFromInt(ops_total)) / dn,
             });
 
@@ -4598,21 +4725,25 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // KV and SSM to a snapshotted prefix; without them, divergence forces a
     // full reset, so we keep the legacy single-slot path for hybrid.
     const enable_ssm_cps = params.ssm_checkpoint_stride > 0;
-    if (params.prefix_cache_capacity > 0 and
+    const ram_prefix_cache = params.prefix_cache_ram_enabled;
+    const disk_prefix_cache = params.prefix_cache_disk_bytes > 0;
+    if (params.prefix_cache_capacity > 0 and (ram_prefix_cache or disk_prefix_cache) and
         prefix_cache_mod.HotPrefixCache.shouldUse(params.config, enable_ssm_cps))
     {
         // The weights are resident here, so the resolver's active-memory read
         // is honest; the raw launch budget never reaches initWithMem (a 40 GB
         // cap beside a ~70 GB pack was the 2026-08-30 uncatchable Metal OOM).
-        // RAM allowance for idle entries on the SSD-first arm; 0 elsewhere.
+        // Disk-only mode retains no reusable KV in RAM, so it asks for no RAM budget.
         var ssd_idle_mem: u64 = 0;
-        const clamped_prefix_mem: u64 = if (params.prefix_cache_mem_resolver) |resolve|
+        const clamped_prefix_mem: u64 = if (!ram_prefix_cache)
+            0
+        else if (params.prefix_cache_mem_resolver) |resolve|
             resolve(params.config, params.prefix_cache_mem_bytes, .{}, &ssd_idle_mem)
         else
             params.prefix_cache_mem_bytes;
         entry.prefix_cache = prefix_cache_mod.HotPrefixCache.initWithMem(
             sch.allocator,
-            params.prefix_cache_capacity,
+            if (ram_prefix_cache) params.prefix_cache_capacity else 0,
             clamped_prefix_mem,
         );
         entry.prefix_cache.?.qsa_history_required = params.config.indexer_budget != 0;
@@ -4628,6 +4759,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         // RAM cache is unaffected.
         const has_ssm_layers = params.config.has_hybrid_layers or
             params.config.full_attention_interval > 0;
+        entry.prefix_cache.?.hybrid = has_ssm_layers;
         // A module-owned arch's state never reaches the disk tier's KV chunks.
         const disk_ok = (!has_ssm_layers or enable_ssm_cps) and !params.config.moduleOwnsDecodeState();
         if (params.prefix_cache_disk_bytes > 0 and disk_ok) attach: {
@@ -4655,8 +4787,8 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 break :attach;
             };
             entry.prefix_cache.?.disk.?.cp_thin =
-                if (params.config.longCtxGated()) .min_span_recency else .oldest;
-            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.longCtxGated())
+                if (params.config.longCtxGated() or !ram_prefix_cache) .min_span_recency else .oldest;
+            entry.prefix_cache.?.disk.?.ssm_max_per_entry = if (params.config.longCtxGated() or !ram_prefix_cache)
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY
             else
                 kv_disk_cache.SSM_DISK_MAX_PER_ENTRY_LEGACY;
@@ -4666,6 +4798,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
             params.config,
             entry.prefix_cache.?.disk != null,
+            ram_prefix_cache,
         );
         if (entry.prefix_cache.?.ssd_first) {
             entry.prefix_cache.?.disk.?.ssd_first = true;
@@ -4705,15 +4838,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.llama_kv_type_k = params.llama_kv_type_k;
     entry.llama_kv_type_v = params.llama_kv_type_v;
 
-    // Best-effort bytes_resident estimate: prefer the disk size hint when
-    // available (it's close to actual GPU resident bytes after Metal page-
-    // ins), else fall back to a rough multiple of layers × hidden. The
-    // value drives LRU eviction's "will the new model fit?" gate in Phase
-    // D; precise accounting isn't required here.
-    const bytes_resident: u64 = if (entry.bytes_on_disk) |b|
-        b
-    else
-        @as(u64, params.config.num_hidden_layers) * @as(u64, params.config.hidden_size) * 4 * 4;
+    // Commit the same validated weight estimate used by the eviction gate
+    // and preflight (zero means no disk estimate), plus a GPU-resident n-gram table.
+    const bytes_resident = committedTextBytes(model_bytes, params.config) + pleTableBill(sch.io, params.config);
 
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.markReadyLocked(entry, bytes_resident);
@@ -4755,6 +4882,7 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
             if ((entry == sch.current_model) != current_pass) continue;
             if (entry.state != .ready) continue;
             const hc = if (entry.prefix_cache) |*h| h else continue;
+            if (!hc.ram_enabled) continue;
             const config = entry.config orelse continue;
             var idle: u64 = 0;
             hc.setBudget(resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle));
@@ -4988,6 +5116,7 @@ fn drainSideQueues(sch: *Scheduler) bool {
                 if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
             }
         }
+        recordSlotCleanup(sch.metrics, s);
         // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
         // record must not outlive the bytes `s.deinit()` frees.
         if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
@@ -5850,6 +5979,7 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
     // ~95k tokens per retry).
     switch (st) {
         .ok => |n| log.info("[hot-cache] committed {d}/{d} prompt tokens from a cancelled prefill\n", .{ n, slot.full_prompt.len }),
+        .disk_only => |n| log.info("[disk-cache] captured {d}/{d} prompt tokens from a cancelled prefill\n", .{ n, slot.full_prompt.len }),
         .kept_resident => |n| log.info("[hot-cache] kept resident {d}-token entry; oversized candidate declined\n", .{n}),
         .declined => {},
     }
@@ -5988,6 +6118,51 @@ fn logShortGen(slot: *Slot, reason: []const u8) void {
     )});
 }
 
+/// Outcome of a slot that reached `finishSlot`. A latched MLX failure turns the finish into an error.
+fn finishOutcome(reason: []const u8, latched: ?[]const u8) metrics_mod.Outcome {
+    if (latched != null) return .failed;
+    if (std.mem.eql(u8, reason, "cancelled")) return .cancelled;
+    return .success;
+}
+
+/// Outcome of a slot seen by the cleanup drain without `finishSlot` having recorded it, read only
+/// from state the inference thread set. `cancelled` is never consulted: `Scheduler.complete` sets it
+/// on every completion, normal ones included.
+fn cleanupOutcome(slot: anytype) metrics_mod.Outcome {
+    if (slot.error_code != null) return .failed;
+    if (slot.finished) return finishOutcome(slot.finish_reason, null);
+    return .cancelled;
+}
+
+/// Count a slot's outcome once. The first path to reach a slot wins.
+fn recordSlotEnd(metrics: ?*metrics_mod.Metrics, slot: anytype, outcome: metrics_mod.Outcome) void {
+    const m = metrics orelse return;
+    if (slot.metrics_recorded) return;
+    slot.metrics_recorded = true;
+    m.recordRequest(
+        outcome,
+        slot.first_token_ns,
+        slot.prefill_ns,
+        slot.decode_ns,
+        slot.prompt_tokens,
+        slot.completion_tokens,
+        slot.cached_tokens,
+    );
+}
+
+/// The cleanup drain's count: a slot refused before its first forward is a rejection, anything
+/// `finishSlot` already counted is skipped.
+fn recordSlotCleanup(metrics: ?*metrics_mod.Metrics, slot: anytype) void {
+    const m = metrics orelse return;
+    if (slot.metrics_recorded) return;
+    if (slot.error_code) |name| if (std.mem.eql(u8, name, "PrefillDoesNotFit")) {
+        slot.metrics_recorded = true;
+        m.recordRejected();
+        return;
+    };
+    recordSlotEnd(m, slot, cleanupOutcome(slot));
+}
+
 fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // Emit the `[spec-stats]` summary (no-op for non-speculative slots).
     // The legacy generate() path logs this itself; scheduler-driven slots
@@ -5999,6 +6174,8 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
         // legacy/CLI path) makes it dead on every served request.
         g.logQsaArms();
         g.persistRoundCost();
+        // The cache commit below snapshots the n-gram history: settle the pipelined step's owed advance first.
+        g.xfm.flushDeferredPle(&g.ctx) catch g.xfm.discardDeferredPle(&g.ctx);
     }
     const latched: ?[]const u8 = mlx.peekErrorName();
     if (latched) |name| {
@@ -6024,17 +6201,7 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // a single per-request branch. real_ttft = first_token_ns (queue+prefill,
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
-    if (sch.metrics) |m| {
-        m.recordRequest(
-            if (latched != null) "error" else reason,
-            slot.first_token_ns,
-            slot.prefill_ns,
-            slot.decode_ns,
-            slot.prompt_tokens,
-            slot.completion_tokens,
-            slot.cached_tokens,
-        );
-    }
+    recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {
@@ -6209,7 +6376,7 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
             slot.sampling.temperature,
             @intCast(slot.sampling.top_k),
             slot.sampling.top_p,
-            0.05,
+            slot.sampling.min_p orelse 0.05,
             &slot.ds4_rng,
         );
 
@@ -6239,7 +6406,7 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
         const spec = if (slot.sampling.temperature <= 0.0)
             session.evalSpeculative(next_id, remaining, engine.eosToken(), spec_buf[0..])
         else
-            session.evalSpeculativeSampled(next_id, remaining, engine.eosToken(), slot.sampling.temperature, @intCast(slot.sampling.top_k), slot.sampling.top_p, 0.05, &slot.ds4_rng, spec_buf[0..]);
+            session.evalSpeculativeSampled(next_id, remaining, engine.eosToken(), slot.sampling.temperature, @intCast(slot.sampling.top_k), slot.sampling.top_p, slot.sampling.min_p orelse 0.05, &slot.ds4_rng, spec_buf[0..]);
         const n = spec catch {
             session.invalidate();
             slot.markError("ds4_spec_failed");
@@ -6314,7 +6481,7 @@ fn runLlamaDecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_llama.LlamaSe
             slot.sampling.temperature,
             @intCast(slot.sampling.top_k),
             slot.sampling.top_p,
-            0.0, // min_p disabled — matches the MLX sampler (top_k + top_p only)
+            slot.sampling.min_p orelse 0.0,
             &slot.llama_rng,
         );
 
@@ -6596,7 +6763,8 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
     wc.chunks += 1;
-    // Bounded to one chunk per boundary: this runs inside the prefill.
+    // RAM-backed mode banks one chunk as crash salvage. SSD-only mode must keep pace with
+    // prefill or the first completed turn can leave most of its prefix unavailable after restart.
     _ = d.appendCommitBounded(
         slot.cache.entries,
         abs_kv_pos,
@@ -6605,7 +6773,7 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
         slot.has_tools,
         if (cps.len > 0) cps else null,
         s,
-        WRITE_THROUGH_FLUSH_BOUND_BYTES,
+        if (hc.ram_enabled) WRITE_THROUGH_FLUSH_BOUND_BYTES else std.math.maxInt(u64),
     ) catch |err| {
         log.warn("  [disk-cache] prefill write-through failed: {s}\n", .{@errorName(err)});
     };
@@ -7398,7 +7566,7 @@ fn runDecodeTick(sch: *Scheduler, active: []*Slot) !void {
         // its short neighbours build a tensor orders of magnitude bigger than
         // they need. Sort ascending by kv_len and let `batchedKvKeepCount` say
         // how many still fit; the tail decodes serially this tick.
-        if (group.len >= 2) {
+        if (group.len >= 2 and groupPadsKv(group[0])) {
             var kv_lens: [32]u32 = undefined;
             var ctx_max: u32 = 0;
             {
@@ -7680,7 +7848,8 @@ fn loopGuardTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         finishSlot(sch, slot, stop.finish_reason);
         return true;
     }
-    return thinkBoundTick(sch, slot, gen);
+    if (try thinkBoundTick(sch, slot, gen)) return true;
+    return toolForceTick(sch, slot, gen);
 }
 
 /// A thinking budget at its limit: commit the early-stop line and the closer
@@ -7695,7 +7864,32 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
         log.warn("[think-bound] budget {d} reached with no room to close the thought (max_tokens {d})\n", .{ tb.budget, gen.max_tokens });
         return false;
     }
-    const r = try gen.commitForcedTokens(slot.allocator, tb.forced);
+    if (try commitForcedTick(sch, slot, gen, tb.forced, .think_bound)) {
+        log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
+    }
+    return true;
+}
+
+/// `tool_choice` that obliges a call: once the thought closes, commit the
+/// tool-call opener through the model, which writes the call from there.
+fn toolForceTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
+    const tf = gen.sampling.tool_force orelse return false;
+    const d = tf.due(gen.generated_ids.items, gen.completion_tokens, gen.max_tokens) orelse return false;
+    tf.fired = true;
+    if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, d.tokens.len + 1)) {
+        log.warn("[tool-choice] no room to force the call (max_tokens {d})\n", .{gen.max_tokens});
+        return false;
+    }
+    if (try commitForcedTick(sch, slot, gen, d.tokens, .tool_choice)) {
+        log.info("[tool-choice] call opener forced at {d} generated tokens{s}\n", .{ gen.generated_ids.items.len, if (d.closes_thought) " (thought closed for it)" else "" });
+    }
+    return true;
+}
+
+/// Commit `forced` through the model and publish it; the slot decodes regular
+/// from here. False = the pending token stopped the slot first.
+fn commitForcedTick(sch: *Scheduler, slot: *Slot, gen: *Generator, forced: []const u32, reason: generate_mod.SpecDisableReason) !bool {
+    const r = try gen.commitForcedTokens(slot.allocator, forced);
     defer slot.allocator.free(r.emitted);
     for (r.emitted) |t| {
         slot.pushToken(t);
@@ -7705,11 +7899,10 @@ fn thinkBoundTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     std.debug.assert(slot.completion_tokens == gen.completion_tokens);
     if (r.stopped) {
         finishSlot(sch, slot, gen.finish_reason);
-        return true;
+        return false;
     }
     gen.spec_disabled_runtime = true;
-    gen.spec_disable_reason = .think_bound;
-    log.info("[think-bound] reasoning budget {d} reached at {d} generated tokens; thought closed\n", .{ tb.budget, gen.generated_ids.items.len });
+    gen.spec_disable_reason = reason;
     return true;
 }
 
@@ -8515,10 +8708,14 @@ fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
         probe = true;
         recovering = true;
     }
-    if (Generator.mtpForcedDepth()) |depth| {
-        for (rows[0..active.len], 0..) |row, i| decision.widths[i] = @intCast(@min(depth, row.cap));
-        probe = false;
-        recovering = false;
+    // A width the range moves no longer matches what a probe was meant to price.
+    for (rows[0..active.len], 0..) |row, i| {
+        const width: u8 = @intCast(depth_bounds.plannerWidth(decision.widths[i], row.cap, depth_bounds.active));
+        if (width != decision.widths[i] or depth_bounds.active.pinned() != null) {
+            decision.widths[i] = width;
+            probe = false;
+            recovering = false;
+        }
     }
     var stale: [Planner.MAX_ROWS]bool = undefined;
     for (active, 0..) |slot, row| stale[row] = slot.legacy_gen.?.mtp_hidden_stale;
@@ -8606,6 +8803,8 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
     // A stateless trunk (MiMo) has no grouped verify: its MTP rounds run alone.
     if (!t.hasRecurrentLayers()) return true;
+    // GLM-5-Next likewise: its head drafts one slot at a time.
+    if (t.config.isGlm5()) return true;
     return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
 }
 
@@ -9871,6 +10070,14 @@ test "supportsBatchedGdnDecode refuses every arch the batched GDN path does not 
         q4.num_experts_per_tok = 8;
         try testing.expect(q4.supportsBatchedGdnDecode());
     }
+    {
+        // GLM-5-Next shares bailing's per-channel KDA gate, which is refused above; its own arm batches.
+        var glm = std.mem.zeroes(model_mod.ModelConfig);
+        glm.model_type = "glm5_next";
+        glm.kda_vector_gate = true;
+        try testing.expect(glm.supportsBatchedGdnDecode());
+        try testing.expect(configBatchesDecode(&glm));
+    }
 }
 
 test "admitPendingTick: per-slot exclusivity (qwen4 MTP slot) blocks only its own class" {
@@ -10161,6 +10368,129 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     a.finished = true;
     b.finished = true;
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
+}
+
+const OutcomeStub = struct {
+    finished: bool = false,
+    error_code: ?[]const u8 = null,
+    finish_reason: []const u8 = "",
+    cancelled: std.atomic.Value(bool) = std.atomic.Value(bool).init(false),
+    metrics_recorded: bool = false,
+    first_token_ns: u64 = 5_000_000,
+    prefill_ns: u64 = 4_000_000,
+    decode_ns: u64 = 20_000_000,
+    prompt_tokens: u32 = 100,
+    completion_tokens: u32 = 10,
+    cached_tokens: u32 = 0,
+
+    /// `finishSlot` on the inference thread: records, then publishes the terminator.
+    fn finish(self: *OutcomeStub, m: ?*metrics_mod.Metrics, reason: []const u8) void {
+        recordSlotEnd(m, self, finishOutcome(reason, null));
+        self.finished = true;
+        self.finish_reason = reason;
+    }
+    /// `Slot.markError` mid-decode: no finishSlot follows.
+    fn fail(self: *OutcomeStub, name: []const u8) void {
+        if (self.error_code != null or self.finished) return;
+        self.error_code = name;
+    }
+    /// The connection thread's `Scheduler.complete`: sets `cancelled` on EVERY completion.
+    fn complete(self: *OutcomeStub) void {
+        self.cancelled.store(true, .release);
+    }
+};
+
+fn expectOutcomes(m: *const metrics_mod.Metrics, success: u64, cancelled: u64, failed: u64, rejected: u64) !void {
+    try testing.expectEqual(success, m.requests_success_total.load());
+    try testing.expectEqual(cancelled, m.requests_cancelled_total.load());
+    try testing.expectEqual(failed, m.requests_failed_total.load());
+    try testing.expectEqual(rejected, m.requests_rejected_total.load());
+}
+
+test "outcome row 1: a disconnect while the request waits in pending counts cancelled once" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 1, 0, 0);
+}
+
+test "outcome row 2: a disconnect during prefill is counted once, not again by the drain" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.complete();
+    s.finish(&m, "cancelled");
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 1, 0, 0);
+}
+
+test "outcome row 3: a disconnect during decode never reaches finishSlot and the drain counts it" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.completion_tokens = 7;
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 1, 0, 0);
+    // A cancelled request never feeds the success histograms.
+    try testing.expectEqual(@as(u64, 0), m.ttft_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+}
+
+test "outcome row 4: a normal completion is success once even though complete() sets cancelled" {
+    var m = metrics_mod.Metrics.init();
+    for ([_][]const u8{ "stop", "length" }) |reason| {
+        var s = OutcomeStub{};
+        s.finish(&m, reason);
+        s.complete();
+        recordSlotCleanup(&m, &s);
+    }
+    try expectOutcomes(&m, 2, 0, 0, 0);
+    try testing.expectEqual(@as(u64, 20), m.generation_tokens_total.load());
+}
+
+test "outcome row 5: a mid-decode generation error counts failed and leaves the histograms alone" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.fail("MlxFailure");
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 1, 0);
+    try testing.expectEqual(@as(u64, 0), m.ttft_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.e2e_latency_ns.count.load(.monotonic));
+    try testing.expectEqual(@as(u64, 0), m.generation_tokens_total.load());
+}
+
+test "outcome row 5b: a finish over a latched MLX failure counts failed, not success" {
+    try testing.expectEqual(metrics_mod.Outcome.failed, finishOutcome("stop", "OutOfMemory"));
+    try testing.expectEqual(metrics_mod.Outcome.success, finishOutcome("stop", null));
+    try testing.expectEqual(metrics_mod.Outcome.cancelled, finishOutcome("cancelled", null));
+}
+
+test "outcome row 6: an error followed by a client disconnect is one failure, never two outcomes" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.fail("MlxFailure");
+    recordSlotCleanup(&m, &s);
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 1, 0);
+}
+
+test "outcome row 7: a slot refused before its first forward is a rejection, not a failure" {
+    var m = metrics_mod.Metrics.init();
+    var s = OutcomeStub{};
+    s.fail("PrefillDoesNotFit");
+    s.complete();
+    recordSlotCleanup(&m, &s);
+    try expectOutcomes(&m, 0, 0, 0, 1);
+}
+
+test "outcome row 9: metrics off does no work and leaves the slot untouched" {
+    var s = OutcomeStub{};
+    s.complete();
+    recordSlotCleanup(null, &s);
+    s.finish(null, "stop");
+    try testing.expect(!s.metrics_recorded);
 }
 
 test "loopStopReason: a degenerate tail cut reports stop, a healthy tail is not cut" {

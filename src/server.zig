@@ -791,6 +791,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/decisions",
+    "/v1/systemone",
     "/v1/embeddings",
     "/v1/images/edits",
     "/v1/images/generations",
@@ -828,7 +829,7 @@ pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
         if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
-    if (std.mem.eql(u8, path, "/v1/decisions")) return max_decision_request_bytes;
+    if (std.mem.eql(u8, path, "/v1/decisions") or std.mem.eql(u8, path, "/v1/systemone")) return max_decision_request_bytes;
     return max_request_bytes;
 }
 
@@ -926,6 +927,8 @@ pub fn parseModelFromRequest(body: []const u8, content_type: []const u8) ?[]cons
 // (`--prefix-cache-mem`, default 2 GB) is what actually bounds memory,
 // evicting LRU entries by size. 0 disables.
 pub var prefix_cache_capacity: u32 = 32;
+/// `--no-prefix-cache-ram` keeps the disk tier eligible without idle RAM retention.
+pub var prefix_cache_ram_enabled: bool = true;
 
 /// Wave 1.B — hot prefix cache memory budget. The cache evicts LRU entries on
 /// commit until `current_kv_bytes + new_bytes <= prefix_cache_mem_bytes`. The
@@ -963,7 +966,7 @@ var hot_cache_mem_resolved = std.atomic.Value(u64).init(HOT_CACHE_MEM_UNRESOLVED
 
 /// The hot-cache byte budget every post-load reserve must bill: the clamp's answer once loaded, the raw ask before.
 pub fn resolvedPrefixCacheMem() u64 {
-    if (prefix_cache_capacity == 0) return 0;
+    if (prefix_cache_capacity == 0 or !prefix_cache_ram_enabled) return 0;
     const v = hot_cache_mem_resolved.load(.monotonic);
     return if (v != HOT_CACHE_MEM_UNRESOLVED) v else prefix_cache_mem_bytes;
 }
@@ -1019,20 +1022,19 @@ pub var ssm_checkpoint_stride: u32 = 256;
 /// long prompts. 0 = unlimited (rely on the prefix-cache byte budget alone).
 pub var ssm_checkpoint_max: u32 = 16;
 
-/// SSM prefill checkpoints exist ONLY to feed the hot prefix cache (RAM +
-/// disk tiers key their hybrid restores off them). With the cache disabled
-/// (`--prefix-cache-entries 0`) every capture is a 48-layer materialize +
-/// eval thrown straight away — measured ~2-4% of short-prompt prefill on
-/// Qwen3.6-27B. Single chokepoint for every LoadParams builder.
-pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32) u32 {
-    if (cache_capacity == 0) return 0;
+/// SSM checkpoints feed reusable prefix tiers; zero capacity disables all reuse.
+pub fn effectiveSsmCheckpointStride(stride: u32, cache_capacity: u32, ram_enabled: bool, disk_bytes: u64) u32 {
+    if (cache_capacity == 0 or (!ram_enabled and disk_bytes == 0)) return 0;
     return stride;
 }
 
-test "effectiveSsmCheckpointStride: disabled prefix cache disables checkpoint capture" {
-    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0));
-    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32));
-    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32));
+test "effectiveSsmCheckpointStride: zero capacity disables both tiers, RAM-off preserves disk" {
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0, true, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 0, false, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, true, 0));
+    try std.testing.expectEqual(@as(u32, 256), effectiveSsmCheckpointStride(256, 32, false, 4 << 30));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(256, 32, false, 0));
+    try std.testing.expectEqual(@as(u32, 0), effectiveSsmCheckpointStride(0, 32, true, 0));
 }
 
 /// PLD request defaults carried as ONE value, so a `ServerConfig` builder
@@ -1270,6 +1272,33 @@ fn armThinkBound(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tok
     @memcpy(forced[stop_ids.len + 1 ..], sep_ids);
     log.info("  reasoning budget {d}: enforced in-stream\n", .{budget});
     return .{ .budget = @intCast(budget), .opener_id = opener, .closer_id = closer, .forced = forced, .in_think = opened };
+}
+
+/// Arm the forced tool-call opener for a `tool_choice` that obliges a call, or
+/// null when the dialect has no opener we can spell or the thought cannot be
+/// tracked. `forced` is allocated; the caller frees it after generation.
+fn armToolForce(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32, forced_tool: ?chat_mod.ForcedTool) ?generate_mod.ToolForce {
+    const ft = forced_tool orelse return null;
+    if (lm.transformer == null) return null;
+    const cc = lm.chat_config orelse return null;
+    const text = (chat_mod.forcedToolOpener(allocator, cc.chat_template, ft) catch return null) orelse return null;
+    defer allocator.free(text);
+    const opened = promptOpensThink(allocator, lm, tok, prompt_ids);
+    const closer = atomicTokenId(allocator, tok, chat_mod.BARE_THINK_CLOSER);
+    if (opened and closer == null) return null;
+    const opener = tok.encode(allocator, text) catch return null;
+    defer allocator.free(opener);
+    const sep = tok.encode(allocator, "\n\n") catch return null;
+    defer allocator.free(sep);
+    const head: usize = if (opened) 1 + sep.len else 0;
+    const forced = allocator.alloc(u32, head + opener.len) catch return null;
+    if (opened) {
+        forced[0] = closer.?;
+        @memcpy(forced[1..head], sep);
+    }
+    @memcpy(forced[head..], opener);
+    log.info("  tool_choice: call opener enforced in-stream\n", .{});
+    return .{ .closer_id = closer, .forced = forced, .opener_at = head, .in_think = opened };
 }
 
 fn promptOpensMuseHeader(allocator: std.mem.Allocator, lm: *LoadedModel, tok: *const Tokenizer, prompt_ids: []const u32) bool {
@@ -1822,16 +1851,18 @@ pub fn serve(
     g_model_aliases.alloc = scheduler.registry.allocator;
     g_model_aliases.path = model_settings_mod.defaultPath(&g_model_aliases_path);
 
-    // Plan 05: the hot prefix cache lives on the LoadedModel
-    // (entry.prefix_cache) and is set up by `loadModelOnInferenceThread`
-    // using the per-LoadParams capacity + byte budget. Surface a friendly
-    // log line so users see whether the cache engaged.
+    // Prefix cache lives on LoadedModel and may retain idle prefixes in RAM, SSD, or both.
     if (scheduler.hot_prefix_cache != null) {
         const ssm_note: []const u8 = if (config.has_hybrid_layers)
             " [hybrid: SSM checkpoints]"
         else
             "";
-        if (resolvedPrefixCacheMem() > 0) {
+        if (!prefix_cache_ram_enabled and prefix_cache_disk_bytes > 0) {
+            log.info("Prefix cache: SSD ONLY (RAM retention disabled, disk cap={d:.1} MB){s}\n", .{
+                @as(f64, @floatFromInt(prefix_cache_disk_bytes)) / (1024.0 * 1024.0),
+                ssm_note,
+            });
+        } else if (resolvedPrefixCacheMem() > 0) {
             const cap_mb = @as(f64, @floatFromInt(resolvedPrefixCacheMem())) / (1024.0 * 1024.0);
             log.info("Hot prefix cache: ENABLED (capacity={d}, mem-cap={d:.1} MB){s}\n", .{ prefix_cache_capacity, cap_mb, ssm_note });
         } else {
@@ -1994,7 +2025,7 @@ pub fn serve(
     log.info("  POST /v1/chat/completions\n", .{});
     log.info("  POST /v1/completions\n", .{});
     log.info("  POST /v1/embeddings\n", .{});
-    log.info("  POST /v1/decisions (Laya, Kev)\n", .{});
+    log.info("  POST /v1/decisions, /v1/systemone (Laya, Kev, Clef)\n", .{});
     log.info("  POST /v1/messages (Anthropic)\n", .{});
     log.info("  POST /v1/responses (OpenAI Responses)\n", .{});
     log.info("  POST /v1/responses/compact\n", .{});
@@ -2667,7 +2698,7 @@ fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .speech);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/decisions")) {
+    } else if (std.mem.eql(u8, method, "POST") and (std.mem.eql(u8, path, "/v1/decisions") or std.mem.eql(u8, path, "/v1/systemone"))) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .decisions);
@@ -3883,7 +3914,7 @@ fn ssdFirstBudgetForLoad(
     quiet: bool,
 ) ?u64 {
     // The predicate, shared with the spill site: without a disk tier the mode's floor would be RAM the server cannot use.
-    if (!prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0)) return null;
+    if (prefix_cache_capacity == 0 or !prefix_cache_mod.ssdFirstActive(config, prefix_cache_disk_bytes > 0, prefix_cache_ram_enabled)) return null;
     const budget = ssdFirstPrefixCacheMem(
         requested,
         ceiling,
@@ -4436,13 +4467,14 @@ test "SSD-first is gated on a DISK TIER: with --prefix-cache-disk off, qwen4_exp
     defer gpu_ceiling_mod.static_ceiling_override = orig_ceiling;
     gpu_ceiling_mod.static_ceiling_override = 109_395 * (1 << 20);
 
-    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false));
-    try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true));
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, false, true));
+    try t.expect(prefix_cache_mod.ssdFirstActive(&cfg, true, true));
     var dense = model_mod.ModelConfig{};
     dense.model_type = "qwen3";
-    try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true));
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&dense, true, true));
+    try t.expect(prefix_cache_mod.ssdFirstActive(&dense, true, false));
     prefix_cache_mod.ssd_first_override = false;
-    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, true));
+    try t.expect(!prefix_cache_mod.ssdFirstActive(&cfg, true, true));
     prefix_cache_mod.ssd_first_override = true;
 
     // The SSD arm floors at one session's KV, the RAM arm is a residual bounded by the ask.
@@ -6160,6 +6192,7 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         // is evictable here by construction (the withheld case took the deferral arm).
         const msg = try memoryRefusalMessage(allocator, prompt_len, needed_mb, avail_mb, bill);
         defer allocator.free(msg);
+        countRejected();
         if (is_anthropic) {
             try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
         } else {
@@ -7299,6 +7332,7 @@ const PropsSettings = struct {
     max_concurrent: u32,
     prefix_cache_mem_bytes: u64,
     prefix_cache_disk_bytes: u64,
+    prefix_cache_ram_enabled: bool = true,
     /// `--prefill-decode-share`: decode's target wall-time fraction during another slot's prefill.
     prefill_decode_share: f32 = 0,
 };
@@ -7349,6 +7383,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .max_concurrent = max_concurrent,
         .prefix_cache_mem_bytes = resolvedPrefixCacheMem(),
         .prefix_cache_disk_bytes = prefix_cache_disk_bytes,
+        .prefix_cache_ram_enabled = prefix_cache_capacity > 0 and prefix_cache_ram_enabled,
         // Diffusion prefill returns before the interleave hook: nothing to share.
         .prefill_decode_share = if (config.isDiffusion()) 0 else scheduler_mod.prefillDecodeShare(),
     };
@@ -7362,7 +7397,7 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         .typical => |t| try std.fmt.bufPrint(&param_buf, "{d}", .{t.delta}),
         .tokenv3 => |a| try std.fmt.bufPrint(&param_buf, "{d}", .{a}),
     };
-    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
+    return std.fmt.allocPrint(allocator, ",\"settings\":{{\"version\":\"{s}\",\"engine\":\"{s}\",\"kv_quant\":\"{s}\",\"kv_attn_mode\":\"{s}\",\"decode_attn_quant\":{},\"prefill_chunk\":{d},\"mtp\":{{\"loaded\":{},\"default_on\":{},\"acceptance\":\"{s}\",\"acceptance_param\":{s},\"greedy_tail\":{},\"depth\":{d},\"adaptive\":{},\"max_ctx\":{d}}},\"drafter\":\"{s}\",\"pld\":{{\"default_on\":{},\"draft_len\":{d},\"key_len\":{d}}},\"max_concurrent\":{d},\"prefill_decode_share\":{d:.2},\"prefix_cache\":{{\"ram_enabled\":{},\"mem_bytes\":{d},\"disk_bytes\":{d}}}}}", .{
         build_options.version,                      st.engine,
         st.kv_quant,                                @tagName(st.kv_attn_mode),
         st.decode_attn_quant,                       st.prefill_chunk,
@@ -7373,7 +7408,8 @@ fn settingsPropsJson(allocator: std.mem.Allocator, st: PropsSettings) ![]u8 {
         st.drafter,                                 st.pld.enable,
         st.pld.draft_len,                           st.pld.key_len,
         st.max_concurrent,                          st.prefill_decode_share,
-        st.prefix_cache_mem_bytes,                  st.prefix_cache_disk_bytes,
+        st.prefix_cache_ram_enabled,                st.prefix_cache_mem_bytes,
+        st.prefix_cache_disk_bytes,
     });
 }
 
@@ -7541,12 +7577,17 @@ fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     // the CSS and JS are separate files injected as RUNTIME `{s}` args —
     // std.fmt does not re-parse a runtime argument, so app.css/app.js/
     // metrics.js can be ordinary CSS and JavaScript. Don't inline them back.
-    // The console's two boot scripts share the page's single `<script>{s}`
-    // slot: theme.js sets the stored/OS theme before the stylesheet paints,
-    // i18n.js resolves the language (and <html lang>) before the body. They are
-    // concatenated here rather than given a second slot because std.fmt does
-    // not re-parse a runtime argument, so both stay ordinary JavaScript.
+    // The console's three boot scripts share the page's single `<script>{s}`
+    // slot: api.js publishes `apiPrefix` (the mount the page was served under),
+    // which every later script — including the metrics panel rendered into the
+    // header below — resolves its requests through; theme.js sets the stored/OS
+    // theme before the stylesheet paints; i18n.js resolves the language (and
+    // <html lang>) before the body. They are concatenated here rather than given
+    // a second slot because std.fmt does not re-parse a runtime argument, so all
+    // three stay ordinary JavaScript.
     const boot_script = try std.mem.concat(allocator, u8, &.{
+        @embedFile("html/api.js"),
+        "\n;\n",
         @embedFile("html/theme.js"),
         "\n;\n",
         @embedFile("html/i18n.js"),
@@ -7555,7 +7596,7 @@ fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
     const body = try std.fmt.allocPrint(allocator, @embedFile("html/index.html"), .{
         // <title> version
         version_esc,
-        // <script> — src/html/theme.js + src/html/i18n.js (before first paint)
+        // <script> — src/html/api.js + theme.js + i18n.js (before first paint)
         boot_script,
         // <style> — src/html/app.css
         @embedFile("html/app.css"),
@@ -8543,6 +8584,7 @@ fn handleChatCompletions(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
 
     const repeat_penalty = requestRepeatPenalty(root);
 
@@ -8565,11 +8607,7 @@ fn handleChatCompletions(
     // Extract tools JSON from request body for chat template injection
     var tools_json: ?[]const u8 = null;
     var has_tools = root.get("tools") != null;
-    var tool_choice_instruction: ?[]const u8 = null;
-    var tool_choice_allocated = false;
-    defer if (tool_choice_allocated) {
-        if (tool_choice_instruction) |tci| allocator.free(tci);
-    };
+    var forced_tool: ?chat_mod.ForcedTool = null;
 
     // OpenAI parallel_tool_calls: only an explicit false clamps to one call
     // per response (the SDK sets false in strict structured-output mode).
@@ -8585,7 +8623,7 @@ fn handleChatCompletions(
                 if (std.mem.eql(u8, tc.string, "none")) {
                     has_tools = false; // Don't inject tools at all
                 } else if (std.mem.eql(u8, tc.string, "required")) {
-                    tool_choice_instruction = "\nYou MUST call one of the available functions. Do not respond with text.";
+                    forced_tool = .any;
                 }
                 // "auto" is the default behavior
             } else if (tc == .object) {
@@ -8593,10 +8631,7 @@ fn handleChatCompletions(
                 if (tc.object.get("function")) |func| {
                     if (func == .object) {
                         if (func.object.get("name")) |name_val| {
-                            if (name_val == .string) {
-                                tool_choice_instruction = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
-                                tool_choice_allocated = true;
-                            }
+                            if (name_val == .string) forced_tool = .{ .name = name_val.string };
                         }
                     }
                 }
@@ -8610,6 +8645,14 @@ fn handleChatCompletions(
             }
         }
     }
+    if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
+        const msg = try std.fmt.allocPrint(allocator, "tool_choice names function \"{s}\", which is not in tools", .{ft.name});
+        defer allocator.free(msg);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    };
+    const tool_choice_instruction: ?[]const u8 = if (forced_tool) |ft| try chat_mod.toolChoiceInstruction(allocator, ft) else null;
+    defer if (tool_choice_instruction) |tci| allocator.free(tci);
 
     // Parse stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -8939,6 +8982,7 @@ fn handleChatCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/chat/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -9006,6 +9050,7 @@ fn handleChatCompletions(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .seed = seed,
@@ -9048,6 +9093,16 @@ fn handleChatCompletions(
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
+
+    var tool_force = armToolForce(allocator, lm, tok, prompt_ids, forced_tool);
+    defer if (tool_force) |tf| allocator.free(tf.forced);
+    if (tool_force) |*tf| sampling.tool_force = tf;
+    // One token per tick: no draft round can carry the turn past the forced opener.
+    if (tool_force != null) {
+        enable_pld = false;
+        enable_drafter = false;
+        enable_mtp = false;
+    }
 
     // Hand vision ownership off to the sub-handler, which transfers it to
     // the slot at submit time.
@@ -9133,6 +9188,7 @@ fn handleCompletions(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
 
     const repeat_penalty = requestRepeatPenalty(root);
     const presence_penalty_c = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
@@ -9209,6 +9265,7 @@ fn handleCompletions(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/completions -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -9251,6 +9308,7 @@ fn handleCompletions(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty_c,
         .seed = seed,
@@ -10379,6 +10437,25 @@ const StreamingTokenStream = struct {
             self.completion_tokens = g.completion_tokens;
             self.finish_reason = g.finish_reason;
         }
+    }
+
+    /// The finalized stream as a `GenerationResult`, for surfaces that share
+    /// their post-generation tail with the non-streaming path.
+    fn generationResult(self: *const StreamingTokenStream, text: []u8, token_ids: []u32, finish_reason: []const u8, constraint_payload_byte: ?usize) generate_mod.GenerationResult {
+        return .{
+            .text = text,
+            .token_ids = token_ids,
+            .prompt_tokens = self.prompt_tokens,
+            .completion_tokens = self.completion_tokens,
+            .finish_reason = finish_reason,
+            .prefill_tps = generate_mod.prefillTokensPerSec(self.prompt_tokens, self.cached_tokens, self.prefill_ns),
+            .decode_tps = generate_mod.tokensPerSec(self.completion_tokens, self.decode_ns),
+            .prefill_ns = self.prefill_ns,
+            .decode_ns = self.decode_ns,
+            .cached_tokens = self.cached_tokens,
+            .finish_details = self.finish_details,
+            .constraint_payload_byte = constraint_payload_byte,
+        };
     }
 
     const NextOrIdle = union(enum) { token: u32, done, idle };
@@ -13052,6 +13129,11 @@ fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *s
     try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Model load failed", 500);
 }
 
+/// A request refused before it owned a slot. A null sink (metrics off) is one branch.
+fn countRejected() void {
+    if (g_metrics) |m| m.recordRejected();
+}
+
 fn contextOverflowMessage(buf: []u8, prompt_tokens: usize, ctx: usize) []const u8 {
     return std.fmt.bufPrint(
         buf,
@@ -13103,6 +13185,15 @@ fn utf8TrailingIncomplete(s: []const u8) usize {
     return if (actual < expected) actual else 0;
 }
 
+/// Bytes of a streamed think buffer safe to emit now: hold back the last 9
+/// bytes (the longest possible partial close tag) and cut on a UTF-8
+/// boundary; the escaper turns a split character into U+FFFD.
+fn thinkHoldBackLen(buf: []const u8) usize {
+    const max_partial: usize = 9;
+    var safe_len: usize = if (buf.len > max_partial) buf.len - max_partial else 0;
+    if (safe_len > 0) safe_len -= utf8TrailingIncomplete(buf[0..safe_len]);
+    return safe_len;
+}
 /// Build a llama.cpp-style `timings` JSON object (no surrounding key) from
 /// raw nanosecond counts and token totals. Caller frees. Returns an empty
 /// string when `prefill_ns`, `decode_ns`, AND `tokenize_ns` are all zero
@@ -13919,7 +14010,7 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 ///   data:image/jpeg|png|webp|...;base64,... (decoded + resized via stb_image / libwebp)
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
-fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the
         // projector unshuffles AFTER the tower, so the grid stays plain
@@ -14006,7 +14097,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     }
 }
 
-fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
+pub fn parseImageUrlContent(allocator: std.mem.Allocator, url: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const sep = std.mem.indexOf(u8, url, ";base64,") orelse return null;
     const b64_data = url[sep + 8 ..];
     const decoded_size = std.base64.standard.Decoder.calcSizeForSlice(b64_data) catch return null;
@@ -14233,7 +14324,7 @@ fn appendLfm2Tiles(
     defer allocator.free(raw);
     std.base64.standard.Decoder.decode(raw, b64) catch return;
 
-    const src = decodeRgbOwned(allocator, raw) orelse return;
+    const src = decodeRgbOwned(allocator, raw, true) orelse return;
     defer src.deinit(allocator);
 
     const split = vp.max_tiles > 1 and
@@ -14387,7 +14478,7 @@ const DecodedRgb = struct {
     }
 };
 
-fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb {
+fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8, composite_alpha: bool) ?DecodedRgb {
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
@@ -14397,7 +14488,7 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
         const total_px: usize = @intCast(w * h);
         const rgb = allocator.alloc(u8, total_px * 3) catch return null;
         for (0..total_px) |i| {
-            const a = @as(u16, rgba[i * 4 + 3]);
+            const a: u16 = if (composite_alpha) rgba[i * 4 + 3] else 255;
             const inv_a = 255 - a;
             rgb[i * 3 + 0] = @intCast((a * @as(u16, rgba[i * 4 + 0]) + inv_a * 255) / 255);
             rgb[i * 3 + 1] = @intCast((a * @as(u16, rgba[i * 4 + 1]) + inv_a * 255) / 255);
@@ -14416,10 +14507,10 @@ fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8) ?DecodedRgb
     return .{ .rgb = rgb, .w = @intCast(webp_w), .h = @intCast(webp_h) };
 }
 
-fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
+pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.ImageData {
     const target: u32 = 768; // Gemma 4 default for square images
 
-    const src = decodeRgbOwned(allocator, encoded) orelse return null;
+    const src = decodeRgbOwned(allocator, encoded, vp.composite_alpha) orelse return null;
     defer src.deinit(allocator);
     const px = src.rgb.ptr;
     const src_w: u32 = src.w;
@@ -14506,6 +14597,18 @@ fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp: ch
     return .{ .pixels = out_buf, .width = target, .height = target };
 }
 
+test "clef: transparent image RGB follows the checkpoint processor" {
+    const a = std.testing.allocator;
+    const bytes = try @import("clef_http_test.zig").readFile(std.testing.io, "tests/fixtures/robot.png");
+    defer a.free(bytes);
+    const composited = decodeRgbOwned(a, bytes, true) orelse return error.BadImage;
+    defer composited.deinit(a);
+    const rgb = decodeRgbOwned(a, bytes, false) orelse return error.BadImage;
+    defer rgb.deinit(a);
+    try std.testing.expectEqualSlices(u8, &.{ 255, 255, 255 }, composited.rgb[0..3]);
+    try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb.rgb[0..3]);
+}
+
 /// Decode a `video_url` block's `frames` array — already-decoded-by-the-client
 /// JPEG/PNG data URLs, one per sampled frame; no video codec exists anywhere in
 /// this codebase, so frame extraction is the client's job — into ONE
@@ -14533,7 +14636,7 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         const raw = allocator.alloc(u8, decoded_size) catch return null;
         defer allocator.free(raw);
         std.base64.standard.Decoder.decode(raw, b64) catch return null;
-        const rgb = decodeRgbOwned(allocator, raw) orelse return null;
+        const rgb = decodeRgbOwned(allocator, raw, true) orelse return null;
         decoded.append(allocator, rgb) catch {
             rgb.deinit(allocator);
             return null;
@@ -15132,7 +15235,7 @@ fn handleAnthropicMessages(
         }
     }
 
-    if (try chat_mod.foldSystemMessages(allocator, &messages)) |joined| try content_allocs.append(allocator, joined);
+    if (try chat_mod.foldSystemMessages(allocator, &messages, true)) |joined| try content_allocs.append(allocator, joined);
 
     if (image_decode_failed) {
         log.warn("POST /v1/messages -> 400 (undecodable image)\n", .{});
@@ -15151,6 +15254,7 @@ fn handleAnthropicMessages(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
     const seed: ?u64 = parseRequestSeed(root.get("seed"));
 
     // Tools
@@ -15159,11 +15263,7 @@ fn handleAnthropicMessages(
     defer if (tools_json_allocated) allocator.free(tools_json.?);
     var has_tools = false;
     var allow_parallel_tools = true;
-    var tool_choice_instruction: ?[]const u8 = null;
-    var tool_choice_allocated = false;
-    defer if (tool_choice_allocated) {
-        if (tool_choice_instruction) |tci| allocator.free(tci);
-    };
+    var forced_tool: ?chat_mod.ForcedTool = null;
 
     if (root.get("tools")) |tools_val| {
         if (tools_val == .array and tools_val.array.items.len > 0) {
@@ -15183,19 +15283,24 @@ fn handleAnthropicMessages(
                     if (std.mem.eql(u8, tc_type, "none")) {
                         has_tools = false;
                     } else if (std.mem.eql(u8, tc_type, "any")) {
-                        tool_choice_instruction = "\nYou MUST call one of the available functions. Do not respond with text.";
+                        forced_tool = .any;
                     } else if (std.mem.eql(u8, tc_type, "tool")) {
                         if (tc.object.get("name")) |name_val| {
-                            if (name_val == .string) {
-                                tool_choice_instruction = try std.fmt.allocPrint(allocator, "\nYou MUST call the function \"{s}\". Do not respond with text.", .{name_val.string});
-                                tool_choice_allocated = true;
-                            }
+                            if (name_val == .string) forced_tool = .{ .name = name_val.string };
                         }
                     }
                 }
             }
         }
     }
+    if (forced_tool) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
+        const msg = try std.fmt.allocPrint(allocator, "tool_choice names tool \"{s}\", which is not in tools", .{ft.name});
+        defer allocator.free(msg);
+        try sendAnthropicError(allocator, stream, "invalid_request_error", msg, 400);
+        return;
+    };
+    const tool_choice_instruction: ?[]const u8 = if (forced_tool) |ft| try chat_mod.toolChoiceInstruction(allocator, ft) else null;
+    defer if (tool_choice_instruction) |tci| allocator.free(tci);
 
     // Stop sequences
     var stop_sequences = std.ArrayList([]const u8).empty;
@@ -15435,6 +15540,7 @@ fn handleAnthropicMessages(
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
         log.warn("POST /v1/messages -> 400 (prompt {d} tokens exceeds ctx_size {d})\n", .{ prompt_ids.len, effective_ctx });
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendAnthropicError(allocator, stream, "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -15454,6 +15560,7 @@ fn handleAnthropicMessages(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = 1.0,
         .presence_penalty = 0.0,
         .seed = seed,
@@ -15493,6 +15600,16 @@ fn handleAnthropicMessages(
     defer if (think_bound) |tb| allocator.free(tb.forced);
     const surface_budget: i32 = if (think_bound != null) -1 else reasoning_budget;
     if (think_bound) |*tb| sampling.think_bound = tb;
+
+    var tool_force = armToolForce(allocator, lm, tok, prompt_ids, forced_tool);
+    defer if (tool_force) |tf| allocator.free(tf.forced);
+    if (tool_force) |*tf| sampling.tool_force = tf;
+    // One token per tick: no draft round can carry the turn past the forced opener.
+    if (tool_force != null) {
+        enable_pld = false;
+        enable_drafter = false;
+        enable_mtp = false;
+    }
 
     // Hand vision ownership to the sub-handler (slot takes it on submit).
     const sub_ve = mm.embeddings;
@@ -16964,6 +17081,7 @@ fn handleResponsesInner(
     const temperature = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "temperature", 0.0, 2.0), server_config.default_temperature, config.gen_temperature, 1.0);
     const top_p = resolveSamplingDefault(f32, parseJsonFloatOpt(root, "top_p", 0.0, 1.0), server_config.default_top_p, config.gen_top_p, 1.0);
     const top_k = resolveSamplingDefault(u32, parseJsonTopKOpt(root, "top_k"), server_config.default_top_k, config.gen_top_k, 0);
+    const min_p = parseJsonFloatOpt(root, "min_p", 0.0, 1.0) orelse config.gen_min_p;
     const frequency_penalty = parseJsonFloat(root, "frequency_penalty", 0.0, 0.0, 2.0);
     const repeat_penalty: f32 = if (frequency_penalty > 0.0) 1.0 + frequency_penalty else 1.0;
     const presence_penalty = parseJsonFloat(root, "presence_penalty", 0.0, 0.0, 2.0);
@@ -17049,6 +17167,12 @@ fn handleResponsesInner(
     const tool_choice = try responses_mod.parseToolChoice(allocator, root.get("tool_choice"));
     defer if (tool_choice.instruction) |ins| allocator.free(ins);
     if (!tool_choice.include_tools) has_tools = false;
+    if (tool_choice.forced) |ft| if (ft == .name and !chat_mod.toolsDeclare(root.get("tools"), ft.name)) {
+        const msg = try std.fmt.allocPrint(allocator, "tool_choice names function \"{s}\", which is not in tools", .{ft.name});
+        defer allocator.free(msg);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    };
 
     // Maps every name the model may spell a namespaced call with (expanded
     // wire names, unique bare child names) back to (namespace, name), so a
@@ -17200,6 +17324,7 @@ fn handleResponsesInner(
     // ── context limit ──
     const effective_ctx = getEffectiveContextLength(config);
     if (prompt_ids.len > effective_ctx) {
+        countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
         return;
@@ -17226,6 +17351,7 @@ fn handleResponsesInner(
         .temperature = temperature,
         .top_p = top_p,
         .top_k = top_k,
+        .min_p = min_p,
         .repeat_penalty = repeat_penalty,
         .presence_penalty = presence_penalty,
         .seed = seed,
@@ -17262,6 +17388,9 @@ fn handleResponsesInner(
     var think_bound = armThinkBound(allocator, lm, tok, prompt_ids, enable_thinking, reasoning_budget);
     defer if (think_bound) |tb| allocator.free(tb.forced);
     if (think_bound) |*tb| sampling.think_bound = tb;
+    var tool_force = armToolForce(allocator, lm, tok, prompt_ids, if (active_has_tools) tool_choice.forced else null);
+    defer if (tool_force) |tf| allocator.free(tf.forced);
+    if (tool_force) |*tf| sampling.tool_force = tf;
 
     // ── pre-allocate response id (used in streaming envelopes too) ──
     const resp_id = try responses_mod.makeId(stream.io, allocator, "resp");
@@ -17356,6 +17485,8 @@ fn handleResponsesInner(
     var streamed_reasoning_id: ?[]u8 = null;
     var streamed_reasoning_index: u32 = 0;
     var streamed_reasoning_started = false;
+    // Bytes of the thought a tool-active stream already sent; the end sends the rest.
+    var tool_reasoning_streamed: usize = 0;
     var streamed_message_id: ?[]u8 = null;
     var streamed_message_index: u32 = 0;
     var streamed_message_started = false;
@@ -17402,6 +17533,12 @@ fn handleResponsesInner(
         }
         // Heavy-echo MTP->PLD routing retired 2026-07-13 (see the NOTE at the
         // chat-completions site): MTP wins whenever loaded.
+    }
+    // One token per tick: no draft round can carry the turn past the forced opener.
+    if (tool_force != null) {
+        enable_pld_resp = false;
+        enable_drafter_resp = false;
+        enable_mtp_resp = false;
     }
 
     var result: generate_mod.GenerationResult = undefined;
@@ -17484,6 +17621,8 @@ fn handleResponsesInner(
         // Inkling thinking message seen — its close is <|end_message|>.
         var inkling_think = false;
         var live_output_index: u32 = 0;
+        var tool_thought_open = active_has_tools;
+        var tool_think_scan: chat_mod.ThinkScan = .{};
 
         while (true) {
             // A stop cut resolved on the previous token ends the turn here.
@@ -17556,9 +17695,9 @@ fn handleResponsesInner(
             } else try raw_buf.appendSlice(allocator, token_text);
 
             // Beat BEFORE the tool early-continue below: a tool-active request
-            // emits nothing for its whole generation, and the thinking branch
-            // holds until its close tag. Both look identical to a dead server
-            // from the client's socket.
+            // emits nothing past its thought until generation ends, and the
+            // thinking branch holds until its close tag. Both look identical to
+            // a dead server from the client's socket.
             beatStreamKeepalive(stream, .sse_comment) catch {
                 log.info("  [cancel] keepalive write failed (client disconnected) — cancelling slot\n", .{});
                 slot_handle.?.cancel();
@@ -17566,9 +17705,29 @@ fn handleResponsesInner(
                 break;
             };
 
-            // Tool-active requests buffer entirely — we cannot emit text deltas
-            // before knowing whether the output is a tool call.
-            if (active_has_tools) continue;
+            // Tool-active requests hold the answer for the tool-call parse. The
+            // leading thought streams as it arrives, in the chat stream's order:
+            // tool hold first, then the think gate.
+            if (active_has_tools) {
+                if (tool_thought_open and !chat_mod.streamShouldBufferForTools(raw_buf.items)) {
+                    const gate = chat_mod.streamThinkGateScan(raw_buf.items, enable_thinking, false, opens_think, &tool_think_scan);
+                    tool_thought_open = gate == .hold_thinking;
+                    if (gate != .flush_text) if (chat_mod.splitThinkBlock(raw_buf.items, true, opens_think).reasoning_content) |rc| {
+                        const ready = if (tool_thought_open) chat_mod.streamableReasoning(rc) else rc;
+                        if (chat_mod.unstreamedReasoning(ready, tool_reasoning_streamed)) |fresh| {
+                            if (!streamed_reasoning_started) {
+                                streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
+                                streamed_reasoning_index = live_output_index;
+                                try emitResponsesReasoningStart(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?);
+                                streamed_reasoning_started = true;
+                            }
+                            try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, fresh);
+                            tool_reasoning_streamed = ready.len;
+                        }
+                    };
+                }
+                continue;
+            }
 
             if (delivery) |*d| {
                 try d.feed(allocator, token_text);
@@ -17667,10 +17826,7 @@ fn handleResponsesInner(
                     think_buf.clearRetainingCapacity();
                     in_think_block = false;
                 } else if (skipped_think_open) {
-                    // Hold back the longest possible partial-tag suffix (max 9 bytes
-                    // covers both "</think>" and "<channel|>").
-                    const max_partial: usize = 9;
-                    const safe_len = if (think_buf.items.len > max_partial) think_buf.items.len - max_partial else 0;
+                    const safe_len = thinkHoldBackLen(think_buf.items);
                     if (safe_len > 0) {
                         if (!streamed_reasoning_started) {
                             streamed_reasoning_id = try responses_mod.makeId(stream.io, allocator, "rs");
@@ -17739,17 +17895,12 @@ fn handleResponsesInner(
             return;
         }
 
-        result = .{
-            .constraint_payload_byte = if (delivery) |d| d.payload_byte else null,
-            .text = try raw_buf.toOwnedSlice(allocator),
-            .token_ids = try token_ids_buf.toOwnedSlice(allocator),
-            .prompt_tokens = ts.prompt_tokens,
-            .completion_tokens = ts.completion_tokens,
-            .finish_reason = if (stopped) "stop" else ts.finish_reason,
-            .prefill_tps = 0.0,
-            .decode_tps = 0.0,
-            .finish_details = ts.finish_details,
-        };
+        result = ts.generationResult(
+            try raw_buf.toOwnedSlice(allocator),
+            try token_ids_buf.toOwnedSlice(allocator),
+            if (stopped) "stop" else ts.finish_reason,
+            if (delivery) |d| d.payload_byte else null,
+        );
     } else {
         // Non-streaming Responses: `requestSpecModes` (DFlash > MTP > drafter
         // > PLD) so /v1/responses gets the same speedup as /v1/chat/completions.
@@ -17831,6 +17982,9 @@ fn handleResponsesInner(
             // Live deltas already streamed; emit just the closing events with
             // the canonical reasoning text from splitThinkBlock.
             try responses_mod.appendReasoningItem(allocator, &out_buf, streamed_reasoning_id.?, rt);
+            if (active_has_tools) if (chat_mod.unstreamedReasoning(rt, tool_reasoning_streamed)) |rest| {
+                try emitResponsesReasoningDelta(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rest);
+            };
             try emitResponsesReasoningEnd(allocator, stream, seq_num, streamed_reasoning_index, streamed_reasoning_id.?, rt);
         } else {
             const rid = try responses_mod.makeId(stream.io, allocator, "rs");
@@ -19283,6 +19437,42 @@ test "utf8TrailingIncomplete partial after complete" {
 
 test "utf8TrailingIncomplete empty" {
     try testing.expectEqual(@as(usize, 0), utf8TrailingIncomplete(""));
+}
+
+test "responses think hold-back never cuts a multibyte character" {
+    // A CJK thought replayed token-by-token through the hold-back: every emitted
+    // prefix must be valid UTF-8, and the stream must reassemble byte-exact.
+    const allocator = testing.allocator;
+    const tokens = [_][]const u8{
+        "\xE7\x94\xA8",
+        "\xE6\x88\xB7\xE9\x97\xAE",
+        "\xE7\x9A\x84 9.11",
+        "\xE8\xBF\x98\xE6\x98\xAF 9.9",
+        "\xEF\xBC\x8C\xE5\x85\x88\xE6\xAF\x94",
+        "\xE6\x95\xB4\xE6\x95\xB0",
+        "\xEF\xBC\x8C\xE5\x86\x8D",
+        "<|im_",
+        "end|>",
+    };
+    var buf = std.ArrayList(u8).empty;
+    defer buf.deinit(allocator);
+    var reconstituted = std.ArrayList(u8).empty;
+    defer reconstituted.deinit(allocator);
+    for (tokens) |tok| {
+        try buf.appendSlice(allocator, tok);
+        const safe_len = thinkHoldBackLen(buf.items);
+        if (safe_len == 0) continue;
+        // The emitted prefix must be valid UTF-8 standing alone.
+        try testing.expect(std.unicode.utf8ValidateSlice(buf.items[0..safe_len]));
+        try reconstituted.appendSlice(allocator, buf.items[0..safe_len]);
+        const remaining = try allocator.dupe(u8, buf.items[safe_len..]);
+        defer allocator.free(remaining);
+        buf.clearRetainingCapacity();
+        try buf.appendSlice(allocator, remaining);
+    }
+    try reconstituted.appendSlice(allocator, buf.items);
+    const want = "\xE7\x94\xA8\xE6\x88\xB7\xE9\x97\xAE\xE7\x9A\x84 9.11\xE8\xBF\x98\xE6\x98\xAF 9.9\xEF\xBC\x8C\xE5\x85\x88\xE6\xAF\x94\xE6\x95\xB4\xE6\x95\xB0\xEF\xBC\x8C\xE5\x86\x8D<|im_end|>";
+    try testing.expectEqualStrings(want, reconstituted.items);
 }
 
 test "parseJsonFloat returns value when present" {
@@ -23751,6 +23941,19 @@ test "the published hot-cache budget is retired when the cache is dropped" {
     try t.expectEqual(prefix_cache_mem_bytes, resolvedPrefixCacheMem());
 }
 
+test "resolvedPrefixCacheMem: RAM-off bills zero despite a configured disk tier" {
+    const capacity = prefix_cache_capacity;
+    const ram = prefix_cache_ram_enabled;
+    defer prefix_cache_capacity = capacity;
+    defer prefix_cache_ram_enabled = ram;
+    prefix_cache_capacity = 8;
+    prefix_cache_ram_enabled = false;
+    try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+    prefix_cache_ram_enabled = true;
+    prefix_cache_capacity = 0;
+    try testing.expectEqual(@as(u64, 0), resolvedPrefixCacheMem());
+}
+
 test "a WARM turn is not billed for the prefix it is about to SHARE (786,707 @ 19,032 MB)" {
     const t = std.testing;
     // Live: a 786,707-token warm turn restored its own 786,676-token entry and was then refused
@@ -24447,6 +24650,17 @@ test "oneSessionEntryBytes: a cached session is billed with its SSM checkpoints"
     try t.expect(defaultPrefixCacheAsk(PREFIX_CACHE_MEM_DEFAULT, false, entry) >= entry);
 }
 
+test "a streamed turn's result keeps the prompt-cache hit and timings the slot measured" {
+    const t = std.testing;
+    const ts: StreamingTokenStream = .{ .mode = .regular, .eos_token_ids = &.{}, .prompt_tokens = 3016, .cached_tokens = 2985, .completion_tokens = 40, .prefill_ns = 90_000_000, .decode_ns = 1_200_000_000 };
+    var text = "ok".*;
+    var ids = [_]u32{ 7, 8 };
+    const r = ts.generationResult(&text, &ids, "stop", null);
+    try t.expectEqual(@as(u32, 2985), r.cached_tokens);
+    try t.expectEqual(ts.prefill_ns, r.prefill_ns);
+    try t.expectEqual(ts.decode_ns, r.decode_ns);
+}
+
 test "Conn names the client from each request's User-Agent and keeps no header text" {
     const peer: std.Io.net.IpAddress = .{ .ip4 = .{ .bytes = .{ 10, 0, 0, 9 }, .port = 4242 } };
     var conn: Conn = undefined;
@@ -24656,4 +24870,20 @@ test "host seams: a ready /v1/models row for a model no plugin serves keeps upst
     try testing.expectEqual(meta_keys.len, meta.count());
     for (meta_keys, meta.keys()) |want, got| try testing.expectEqualStrings(want, got);
     try testing.expect(std.mem.endsWith(u8, json, "}}"));
+}
+
+test "outcome row 7/9: countRejected moves the rejected counter, and does nothing with metrics off" {
+    const t = std.testing;
+    const saved = g_metrics;
+    defer g_metrics = saved;
+
+    g_metrics = null;
+    countRejected();
+
+    var m = instr.Metrics.init();
+    g_metrics = &m;
+    countRejected();
+    try t.expectEqual(@as(u64, 1), m.requests_rejected_total.load());
+    try t.expectEqual(@as(u64, 0), m.requests_failed_total.load());
+    try t.expectEqual(@as(u64, 0), m.requests_cancelled_total.load());
 }

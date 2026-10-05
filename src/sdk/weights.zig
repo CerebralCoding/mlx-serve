@@ -55,8 +55,9 @@ pub const Weights = struct {
 /// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
 /// `nocache`: read the shards past the page cache (`nocache_reader`): the
-/// load keeps no file pages next to the array buffers.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, nocache: bool = false };
+/// load keeps no file pages next to the array buffers. `embedded_ple` / `defer_qwen4_norms`: the host's qwen4 load
+/// options (an n-gram table embedded in the shards, norms folded after the load); a plugin leaves them false.
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, nocache: bool = false };
 
 /// The host's safetensors loaders (`model.zig`'s): a model directory's shards, and one file (a sidecar the index does
 /// not name) into an existing map.

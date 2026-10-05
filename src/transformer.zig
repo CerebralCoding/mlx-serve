@@ -1334,9 +1334,15 @@ var vqmm_nax_engaged = false;
 /// measured split on M5 Max at M=8; q4 keeps its existing full geometry.
 /// Qwen3.8-27B 8-bit/g64, forced depth 8, six paired settled boots: 89.81
 /// tok/s NAX vs 79.51 stock (+12.96%); every arm asserted its own engagement.
-fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
+/// Flash Next oQ4e's 5/6-bit 2560-wide and g128 projections lose 2% of the forward
+/// at 8 rows, tie at 10 and win 5% at 12 (M5 Ultra), so they ride the tile past 8 rows;
+/// 8-bit at N 2560 loses 1-4% at M 7-8.
+fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int, m: c_int) bool {
     if (bits == 4) return true;
-    return (bits == 5 or bits == 6 or bits == 8) and group_size == 64 and n >= 5120;
+    const wide = group_size == 64 and n >= 5120;
+    if (bits == 8) return wide;
+    if (bits != 5 and bits != 6) return false;
+    return wide or ((group_size == 64 or group_size == 128) and n >= 2560 and m > 8);
 }
 
 /// Whether the PLAIN-SIMD tiles (split-K / msg) adopt a non-4-bit affine
@@ -1370,16 +1376,19 @@ fn mixedNaxShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
 /// The N floor is where the whole result lives: forcing every shape on
 /// (`MIXED_PLAIN=1`, which adopts the 1024-wide K/V projections too) measured
 /// only 1.01-1.05x on the same pack. Excluding them is worth ~10 points.
+///
+/// MEASURED, Flash Next oQ4e on an M5 Ultra (`MLX_SERVE_VQMM_FN_UBENCH`, two
+/// runs): 5-bit g128 z/out and 5/6-bit g64 o (N 2560/6144) at 0.79-0.86x stock
+/// at M=7, 0.95-0.98x at M 3-5. Shared-expert shapes (N/K 640) lose and stay below the floor.
 pub fn mixedPlainShapeEnabled(bits: u32, group_size: u32, n: c_int) bool {
     if (bits == 4) return true;
-    if (bits != 6) return false;
-    return group_size == 64 and n >= MIXED_PLAIN_MIN_N;
+    if (bits != 5 and bits != 6) return false;
+    return (group_size == 64 or group_size == 128) and n >= MIXED_PLAIN_MIN_N;
 }
 
-/// The N below which the byte-addressed unpack loses to stock — the same split
-/// the NAX tile measured, and the reason force-all-shapes gives back most of
-/// the win.
-pub const MIXED_PLAIN_MIN_N: c_int = 5120;
+/// The N below which the byte-addressed unpack loses to stock (27B's 1024-wide
+/// K/V projections), and the reason force-all-shapes gives back most of the win.
+pub const MIXED_PLAIN_MIN_N: c_int = 2560;
 
 var vqmm_mixed_plain_env_cache: ?u8 = null;
 /// 0 = forced off, 1 = forced on, 2 = follow `mixedPlainShapeEnabled`.
@@ -1400,6 +1409,8 @@ var vqmm_mixed_plain_engaged: bool = false;
 /// Test seam: the parity test drives the plain-SIMD mixed-width arms without
 /// touching the process environment (correctness is not a perf question).
 pub var vqmm_mixed_plain_test_force: ?bool = null;
+/// Same seam for the NAX tile's mixed-width shape gate.
+pub var vqmm_mixed_nax_test_force: ?bool = null;
 
 fn mixedPlainEnabled(bits: u32, group_size: u32, n: c_int) bool {
     if (vqmm_mixed_plain_test_force) |v| return v;
@@ -1508,7 +1519,7 @@ pub fn verifyQmm(
     if (lane == .crossrow and (bits != 4 or group_size != 64)) return null;
     if (bits != 4) switch (lane) {
         .crossrow => return null, // unreachable after the gate above; explicit
-        .nax => if (!naxMixedBitsEnvEnabled() or !mixedNaxShapeEnabled(bits, group_size, N)) return null,
+        .nax => if (!naxMixedBitsEnvEnabled() or !(vqmm_mixed_nax_test_force orelse mixedNaxShapeEnabled(bits, group_size, N, m))) return null,
         // The plain-SIMD tiles now carry the same byte-addressed unpack the
         // NAX tile validated, so 5/6/8-bit no longer fall through to stock on
         // every M1-M4 machine — but adoption is per-shape and measured.
@@ -1553,16 +1564,21 @@ pub fn verifyQmm(
     const K_arr = cachedScalarInt(K);
     const N_arr = cachedScalarInt(N);
 
-    const config = mlx.mlx_fast_metal_kernel_config_new();
-    defer _ = mlx.mlx_fast_metal_kernel_config_free(config);
-    const y_shape = [_]c_int{ m, N };
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &y_shape, 2, xd));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, 32 * k_parts, @divExact(N, bn), 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, 32 * k_parts, 1, 1));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "T", xd));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GS", @intCast(group_size)));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "BITS", @intCast(bits)));
-    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "K_PARTS", k_parts));
+    const key = VqmmSplitkKey{ .m = m, .n = N, .bn = bn, .k_parts = k_parts, .gs = group_size, .bits = bits, .dtype = xd };
+    const config = if (vqmm_splitk_cfgs.get(key)) |hit| hit[0] else blk: {
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        const y_shape = [_]c_int{ m, N };
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 2, xd));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32 * k_parts, @divExact(N, bn), 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32 * k_parts, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", xd));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS", @intCast(group_size)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K_PARTS", k_parts));
+        vqmm_splitk_cfgs.put(key, .{cfg});
+        break :blk cfg;
+    };
 
     const inputs_arr = [_]mlx.mlx_array{ x, w, sc, bi, K_arr, N_arr };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
@@ -1588,6 +1604,10 @@ pub fn verifyQmm(
     try mlx.check(mlx.mlx_reshape(&y, y2, out_shape_buf[0..ndim].ptr, @intCast(ndim), s));
     return y;
 }
+
+/// Every verify width x projection shape x quant width keys its own launch config (~10 FFI calls each to build).
+const VqmmSplitkKey = struct { m: c_int, n: c_int, bn: c_int, k_parts: c_int, gs: u32, bits: u32, dtype: mlx.mlx_dtype };
+var vqmm_splitk_cfgs = KernelCfgCache(VqmmSplitkKey, 1, 64){};
 
 const VQMM_MSG_NSG: c_int = 8; // simdgroups per threadgroup (their sweep winner)
 
@@ -1667,6 +1687,24 @@ pub fn naxArchGeneration(arch: []const u8) struct { gen: u32, phone: bool } {
         .gen = std.fmt.parseInt(u32, suffix[0..digits], 10) catch 0,
         .phone = digits < suffix.len and suffix[digits] == 'p',
     };
+}
+
+pub const DeviceGen = struct { gen: u32, phone: bool };
+
+/// Test seam: pin the GPU generation every generation-keyed plan reads (null = the device's).
+pub var device_gen_override: ?DeviceGen = null;
+var device_gen_cache: ?DeviceGen = null;
+
+/// The device's GPU generation, parsed once. Kernel plans keyed on generation (`qmv2.planFor`, the
+/// down+reduce lane count) read this one cache.
+pub fn deviceGeneration() DeviceGen {
+    if (device_gen_override) |g| return g;
+    if (device_gen_cache) |g| return g;
+    var buf: [128]u8 = undefined;
+    const parsed = naxArchGeneration(gpuArchitecture(&buf) orelse "");
+    const g: DeviceGen = .{ .gen = parsed.gen, .phone = parsed.phone };
+    device_gen_cache = g;
+    return g;
 }
 
 pub fn naxArchSupportedFrom(arch: []const u8) bool {
@@ -2786,6 +2824,18 @@ pub fn fusedSinkAttnPrefill(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_arra
     return fusedSdpa256Impl(s, q, k, v, scale, window, null, sinks);
 }
 
+/// True when a bf16 view's bound address is 16-byte aligned — the bar every
+/// `uint4` staging load in `msv_attn_p256` / `msv_attn_qsa256` needs. A lazy
+/// array has no base yet (the kernel binds its buffer at dispatch, like the
+/// stride checks in `gatherQsa256` see); an available one returns the address
+/// the kernel really reads. Same base test `hcUvEligible` runs for its weights.
+fn attn256Base16Aligned(a: mlx.mlx_array) bool {
+    var avail = false;
+    if (mlx._mlx_array_is_available(&avail, a) != 0 or !avail) return true;
+    const p = mlx.mlx_array_data_uint32(a) orelse return true;
+    return @intFromPtr(p) % 16 == 0;
+}
+
 var qsa_fused_env_cached: ?bool = null;
 pub var qsa_fused_override: ?bool = null;
 
@@ -3564,6 +3614,11 @@ pub fn gatherQsa256(
     if (ratio <= 0) return null;
     if (mlx.mlx_array_dtype(q) != .bfloat16 or mlx.mlx_array_dtype(k) != .bfloat16 or mlx.mlx_array_dtype(v) != .bfloat16) return null;
 
+    // K/V stage through `uint4` loads in the stock kernel: an unaligned
+    // materialized view base reads wrong values; decline and the caller's
+    // mask arm runs the same shape (same bar as `fusedSdpa256Impl`).
+    if (!attn256Base16Aligned(k) or !attn256Base16Aligned(v)) return null;
+
     qsaNaxArm();
     const qst = mlx.mlx_array_strides(q);
     const kst = mlx.mlx_array_strides(k);
@@ -3832,7 +3887,7 @@ const QSA_SELECT_SINGLE_SETUP =
     \\const uint nb = (uint)scores_shape[2];
     \\const int  vbi = bounds[row];
     \\const uint vb  = (vbi > 0) ? (uint)vbi : 0u;
-    \\const device float* sc = scores + (ulong)row * (ulong)nb;
+    \\const auto sc = scores + (ulong)row * (ulong)nb; // `constant` under 8 elements
     \\device int* outp = ids + (ulong)row * (ulong)KTOP;
     \\if (vb <= KTOP) {
     \\  for (uint i = tid; i < KTOP; i += TGN) outp[i] = (i < vb) ? int(i) : SENTINEL;
@@ -3853,7 +3908,7 @@ const QSA_SELECT_SLICE_SETUP =
     \\const uint lo  = (uint)(((ulong)g * (ulong)vb) / (ulong)G);
     \\const uint hi  = (uint)(((ulong)(g + 1u) * (ulong)vb) / (ulong)G);
     \\const uint nsl = hi - lo;
-    \\const device float* sc = scores + (ulong)row * (ulong)nb;
+    \\const auto sc = scores + (ulong)row * (ulong)nb; // `constant` under 8 elements
     \\device int* outp = ids + (((ulong)row * (ulong)G) + (ulong)g) * (ulong)KTOP;
     \\if (nsl <= KTOP) {
     \\  for (uint i = tid; i < KTOP; i += TGN) outp[i] = (i < nsl) ? int(lo + i) : SENTINEL;
@@ -3871,8 +3926,8 @@ const QSA_SELECT_SLICE_SETUP =
 const QSA_SELECT_MERGE_SETUP =
     \\const uint nb = (uint)scores_shape[2];
     \\const uint nc = (uint)local_ids_shape[2];
-    \\const device float* sc = scores + (ulong)row * (ulong)nb;
-    \\const device int* loc = local_ids + (ulong)row * (ulong)nc;
+    \\const auto sc = scores + (ulong)row * (ulong)nb; // `constant` under 8 elements
+    \\const auto loc = local_ids + (ulong)row * (ulong)nc;
     \\device int* outp = ids + (ulong)row * (ulong)KTOP;
     \\
     \\uint nvalid = 0u;
@@ -3999,8 +4054,8 @@ pub var qwen4_mtp_head_graphs: usize = 0;
 pub var mtp_verify_moe_group_graphs: u64 = 0;
 pub var mtp_verify_moe_group_last_ops: u64 = 0;
 pub var mtp_head_force_batched_override: ?bool = null;
-const SingleVerifyFeature = enum { routing, down_reduce, hc_graph };
-var single_verify_test_features: [3]bool = @splat(true);
+const SingleVerifyFeature = enum { routing, down_reduce };
+var single_verify_test_features: [2]bool = @splat(true);
 
 var mtp_verify_shared_rows_calls: u64 = 0;
 var mtp_verify_shared_gate_rows_calls: u64 = 0;
@@ -4032,9 +4087,6 @@ fn sharedGateRowsEligible(widths: []const c_int) bool {
     }
     return total <= 24;
 }
-
-var mtp_verify_hc_prepared_active = false;
-pub var mtp_verify_hc_prepared_calls: u64 = 0;
 
 pub const VerifyKernel = enum { dense_tiles, hc_rows, route_pack };
 pub var mtp_verify_kernel_calls: [3]u64 = @splat(0);
@@ -5611,9 +5663,13 @@ pub fn qsaAttnDenseEnabled() bool {
 /// A small LRU of metal_kernel configs: adaptive MTP alternates verify widths within one
 /// request, and a single slot rebuilt on every alternation. Handles are borrowed.
 fn QsaCfgCache(comptime Key: type, comptime NCFG: usize) type {
+    return KernelCfgCache(Key, NCFG, 4);
+}
+
+fn KernelCfgCache(comptime Key: type, comptime NCFG: usize, comptime slots: usize) type {
     return struct {
         const Self = @This();
-        pub const SLOTS: usize = 4;
+        pub const SLOTS: usize = slots;
         /// Named so the default can be written as an array literal.
         const MaybeCfg = ?mlx.mlx_fast_metal_kernel_config;
         const Entry = struct {
@@ -5978,6 +6034,12 @@ pub fn qsaSlotAttn(
         // One fused dispatch per layer: each row indexes its own selection + tail.
         if (try qsaSparseAttn(s, q_rope, kv_view, blocks, ratio, attn_scale)) |g| return qsaSlotGathered(arms, seq_len, g, 1);
     }
+    if (qsa_ok and seq_len == 1 and !kv_view.has_quant_triple) {
+        if (try qsa_decode.attend(s, q_rope, kv_view.k, kv_view.v, blocks, ratio, attn_scale)) |g| {
+            if (qsa_dec_engaged_bits.take(0)) log.info("[qsa-dec] engaged (kv={d}) (MLX_SERVE_QSA_DEC_KERNEL=0 restores the gather / mask arms)\n", .{mlx.getShape(kv_view.k)[2]});
+            return qsaSlotGathered(arms, seq_len, g, 2);
+        }
+    }
     if (qsa_ok and seq_len == 1) {
         // Decode width: subset triples (or dense rows) → subset
         // dequant -> dense SDPA over K'<<kv. Declines to the mask arm.
@@ -6195,6 +6257,7 @@ fn noteQsaArmForSlots(slots: []const *ForwardCtx, arm: QsaArm) void {
 /// Engagement meters, one-shot per (arm, width bucket): bit = arm*4 + bucket.
 var qsa_engaged_bits: OneShotBits = .{};
 var qsa_decode_decline_bits: OneShotBits = .{};
+var qsa_dec_engaged_bits: OneShotBits = .{};
 var qsa_verify_decline_bits: OneShotBits = .{};
 
 fn qsaEngagedBit(arm: QsaArm, seq_len: c_int) u5 {
@@ -7100,6 +7163,7 @@ pub fn qsaMaskFromBlocks(s: mlx.mlx_stream, blocks: mlx.mlx_array, kv: c_int, ra
     const bs = mlx.getShape(blocks);
     const batch = bs[0];
     const seq_len = bs[1];
+    if (batch == 1 and seq_len == 1) if (try qsa_row_mask.rowMask(s, blocks, kv, ratio)) |m| return m;
     const nb: c_int = @divTrunc(kv, ratio);
     const nb_i = mlx.mlx_array_new_int(nb);
     defer _ = mlx.mlx_array_free(nb_i);
@@ -7374,6 +7438,11 @@ fn fusedSdpa256Impl(
     if (ks[2] < qs[2] or ks[2] != vs[2] or ks[1] != vs[1] or ks[0] != qs[0] or vs[0] != qs[0]) return null;
     const attn_dt = mlx.mlx_array_dtype(q);
     if ((attn_dt != .bfloat16 and attn_dt != .float16) or mlx.mlx_array_dtype(k) != attn_dt or mlx.mlx_array_dtype(v) != attn_dt) return null;
+
+    // K/V stage through `uint4` loads: an unaligned materialized view base
+    // (e.g. the [3,259) slice of a padded cache) reads wrong values; decline
+    // and the caller's fallback runs the same shape.
+    if (!attn256Base16Aligned(k) or !attn256Base16Aligned(v)) return null;
 
     const kernel = getAttn256Kernel() catch return null;
 
@@ -7705,6 +7774,10 @@ fn totalMemBytes() u64 {
 const ModelConfig = model_mod.ModelConfig;
 const QuantMode = model_mod.QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
+const hc_decode2 = @import("hc_decode2.zig");
+const qsa_row_mask = @import("qsa_mask.zig");
+const qsa_decode = @import("qsa_decode.zig");
+const moe_affine4 = @import("moe_affine4.zig");
 const glm5 = @import("glm5_next.zig");
 const glm_mtp = @import("glm_mtp.zig");
 const kda_recurrence = @import("kda_recurrence.zig");
@@ -7910,6 +7983,7 @@ pub const SlidingView = struct {
 
 var sliding_block_trim_logged: bool = false; // one-shot log guard
 var gdn_batched_logged: bool = false;
+var glm_batched_logged: bool = false;
 var per_slot_attn_logged: bool = false;
 var gdn_batched_verify_rows_logged: c_int = 0; // widest row total logged so far
 var row_axis_verify_logged: bool = false;
@@ -8574,6 +8648,7 @@ pub const KVCache = struct {
     /// SDPA call sites use this so they don't have to know the scheme.
     pub fn denseView(self: *KVCache, layer: u32, s: mlx.mlx_stream) !DenseKVView {
         const entry = &self.entries[layer];
+        if (entry.initialized and entry.key_view.ctx == null) try self.rebuildViews(entry, s);
         switch (self.config.scheme) {
             .off => return .{ .k = entry.key_view, .v = entry.value_view, .owned = false },
             .affine => {
@@ -8837,32 +8912,37 @@ pub const KVCache = struct {
             // Just update offset — the buffer still holds data but views will
             // only expose [0:len]. No need to shrink the pre-allocated buffer.
             entry.offset = len;
+            try self.rebuildViews(entry, s);
+        }
+    }
 
-            // Recreate views for the truncated range. Each buffer is sliced
-            // against its OWN shape — an MLA cache's V is narrower than its K.
-            const shape = mlx.getShape(entry.keys);
-            if (shape.len < 4) continue;
-            const seq_end: c_int = @intCast(len - entry.base);
-            const v_start = [_]c_int{ 0, 0, 0, 0 };
-            const v_stop = [_]c_int{ shape[0], shape[1], seq_end, shape[3] };
-            const v_strides = [_]c_int{ 1, 1, 1, 1 };
-            try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
-            const val_shape = mlx.getShape(entry.values);
-            const val_stop = [_]c_int{ val_shape[0], val_shape[1], seq_end, val_shape[3] };
-            try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &val_stop, 4, &v_strides, 4, s));
-            if (self.config.scheme != .off) {
-                // K and V scale/bias groups are as wide as their OWN payload —
-                // an MLA cache's V is narrower than its K, so the value views
-                // cannot be sliced against the key scales' shape.
-                const sc_shape = mlx.getShape(entry.keys_scales);
-                const sv_stop = [_]c_int{ sc_shape[0], sc_shape[1], seq_end, sc_shape[3] };
-                try mlx.check(mlx.mlx_slice(&entry.key_scales_view, entry.keys_scales, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
-                try mlx.check(mlx.mlx_slice(&entry.key_biases_view, entry.keys_biases, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
-                const vsc_shape = mlx.getShape(entry.values_scales);
-                const vsv_stop = [_]c_int{ vsc_shape[0], vsc_shape[1], seq_end, vsc_shape[3] };
-                try mlx.check(mlx.mlx_slice(&entry.value_scales_view, entry.values_scales, &v_start, 4, &vsv_stop, 4, &v_strides, 4, s));
-                try mlx.check(mlx.mlx_slice(&entry.value_biases_view, entry.values_biases, &v_start, 4, &vsv_stop, 4, &v_strides, 4, s));
-            }
+    /// Slice the entry's buffers to its live rows `[0, offset - base)` as the read views. `truncate` needs
+    /// them after a rewind, and so does a RESTORED entry, whose views start empty: a layer that reads the
+    /// cache before it first appends (GLM's DSA pools the previous indexer rows) would otherwise read nothing.
+    fn rebuildViews(self: *const KVCache, entry: *KVCacheEntry, s: mlx.mlx_stream) !void {
+        // Each buffer is sliced against its OWN shape — an MLA cache's V is narrower than its K.
+        const shape = mlx.getShape(entry.keys);
+        if (shape.len < 4) return;
+        const seq_end: c_int = @intCast(entry.offset - entry.base);
+        const v_start = [_]c_int{ 0, 0, 0, 0 };
+        const v_stop = [_]c_int{ shape[0], shape[1], seq_end, shape[3] };
+        const v_strides = [_]c_int{ 1, 1, 1, 1 };
+        try mlx.check(mlx.mlx_slice(&entry.key_view, entry.keys, &v_start, 4, &v_stop, 4, &v_strides, 4, s));
+        const val_shape = mlx.getShape(entry.values);
+        const val_stop = [_]c_int{ val_shape[0], val_shape[1], seq_end, val_shape[3] };
+        try mlx.check(mlx.mlx_slice(&entry.value_view, entry.values, &v_start, 4, &val_stop, 4, &v_strides, 4, s));
+        if (self.config.scheme != .off) {
+            // K and V scale/bias groups are as wide as their OWN payload —
+            // an MLA cache's V is narrower than its K, so the value views
+            // cannot be sliced against the key scales' shape.
+            const sc_shape = mlx.getShape(entry.keys_scales);
+            const sv_stop = [_]c_int{ sc_shape[0], sc_shape[1], seq_end, sc_shape[3] };
+            try mlx.check(mlx.mlx_slice(&entry.key_scales_view, entry.keys_scales, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
+            try mlx.check(mlx.mlx_slice(&entry.key_biases_view, entry.keys_biases, &v_start, 4, &sv_stop, 4, &v_strides, 4, s));
+            const vsc_shape = mlx.getShape(entry.values_scales);
+            const vsv_stop = [_]c_int{ vsc_shape[0], vsc_shape[1], seq_end, vsc_shape[3] };
+            try mlx.check(mlx.mlx_slice(&entry.value_scales_view, entry.values_scales, &v_start, 4, &vsv_stop, 4, &v_strides, 4, s));
+            try mlx.check(mlx.mlx_slice(&entry.value_biases_view, entry.values_biases, &v_start, 4, &vsv_stop, 4, &v_strides, 4, s));
         }
     }
 };
@@ -14562,6 +14642,9 @@ pub const MoeMlpWeights = struct {
     shared_down_w: mlx.mlx_array,
     shared_down_s: mlx.mlx_array,
     shared_down_b: mlx.mlx_array,
+    // The dense shared-expert gate as one contiguous [hidden] vector (null-ctx otherwise): the softmax
+    // router kernel dots it with x.
+    shared_gate_vec: mlx.mlx_array = .{ .ctx = null },
     // Shared expert gating (Qwen3.5; null for Gemma 4)
     shared_expert_gate_w: ?mlx.mlx_array = null,
     shared_expert_gate_s: ?mlx.mlx_array = null,
@@ -14593,6 +14676,8 @@ pub const MoeMlpWeights = struct {
     // shared-expert "sink") — not qwen's gated single expert, not hy3's
     // ungated add. Read only by the inkling forward arm.
     router_global_scale: ?mlx.mlx_array = null,
+    // One-expert views of the affine-4 banks the decode kernels bind (`moe_affine4.bindViews`).
+    bank_views: ?moe_affine4.Views = null,
 };
 
 const HybridMlpWeights = union(enum) {
@@ -14856,7 +14941,7 @@ fn mtpNaxAffineProjectionMatchesQuant(
     // Every material projection on the calibrated surface must take NAX at
     // both depth-8 verify widths. Tiny per-head A/B gates and the measured
     // narrow q5/q6 regressions remain on stock by design.
-    if (out_dim >= 512 and mixedNaxShapeEnabled(expected.bits, expected.group_size, @intCast(out_dim))) {
+    if (out_dim >= 512 and mixedNaxShapeEnabled(expected.bits, expected.group_size, @intCast(out_dim), 8)) {
         const K: c_int = @intCast(in_dim);
         const N: c_int = @intCast(out_dim);
         if (!verifyQmmNaxEnabledForMFrom(8, K, N, true, true, true, 8) or
@@ -16632,7 +16717,7 @@ pub const Transformer = struct {
     /// Persistence key of `round_cost` (empty = not persisted).
     round_cost_key_buf: [64]u8 = undefined,
     round_cost_key_len: u8 = 0,
-    /// MTP depth cap WITHOUT the per-silicon row (explicit --mtp-depth, else
+    /// MTP depth cap WITHOUT the per-silicon row (explicit --mtp-max-depth, else
     /// the adaptive default), set at load. The row-resolved cap travels as
     /// `mtp_depth` through server -> slot -> Generator and reads there like
     /// an explicit flag, so the row-less value needs its own carrier.
@@ -17420,9 +17505,15 @@ pub const Transformer = struct {
             errdefer allocator.destroy(st);
             st.* = .{
                 .hash = try qwen4_mod.NgramHash.init(config.vocab_size, config.ngram_size, config.heads_per_ngram, config.ngram_vocab_base, config.ngram_vocab_divisor, config.ngram_seed, 0, eos),
-                .table = try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
+                .table = if (config.embedded_ple_payload_bytes != null)
+                    try qwen4_mod.NgramTable.openEmbedded(std.fs.path.dirname(config.ngram_table_path orelse return error.MissingNgramTable) orelse return error.MissingNgramTable, try model_mod.qwen4EmbeddedSpec(&config))
+                else
+                    try qwen4_mod.NgramTable.open(config.ngram_table_path orelse return error.MissingNgramTable),
             };
             errdefer st.deinit();
+            if (config.embedded_ple_payload_bytes) |bytes| {
+                if (st.table.embeddedPayloadBytes() != bytes) return error.EmbeddedNgramTableChanged;
+            }
             if (st.table.rows != st.hash.total_rows or st.table.dim * st.hash.n_heads != config.ple_embed_dim) {
                 log.err("[qwen4] ngram_table.bin geometry {d}x{d} does not match the config ({d} rows, {d} heads x dim)\n", .{ st.table.rows, st.table.dim, st.hash.total_rows, st.hash.n_heads });
                 return error.NgramTableMismatch;
@@ -17430,7 +17521,10 @@ pub const Transformer = struct {
             var weights_bytes: usize = 0;
             _ = mlx.mlx_get_active_memory(&weights_bytes);
             st.gpu = ple_gpu.load(&st.table, ple_gpu.enabled, weights_bytes);
-            st.table.startWarm(); // the weights load just evicted the table from page cache
+            if (st.gpu == null) st.table.calibrateArm();
+            // The weights load just evicted the table from page cache; an embedded pack's GPU
+            // arm holds its own copy.
+            if (st.gpu == null or st.table.embedded == null) st.table.startWarm();
             qwen4_state = st;
             qwen4_mtp = try loadQwen4Mtp(allocator, config, weights, &name_buf, s);
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
@@ -18069,7 +18163,8 @@ pub const Transformer = struct {
 
     /// Result type for the MoE routing helpers. Both fields are owned arrays —
     /// caller is responsible for freeing them.
-    const MoeRouting = struct { inds: mlx.mlx_array, norm_scores: mlx.mlx_array };
+    /// `gate_logit` rides along when the router kernel also computed the shared-expert gate's logit.
+    const MoeRouting = struct { inds: mlx.mlx_array, norm_scores: mlx.mlx_array, gate_logit: mlx.mlx_array = .{ .ctx = null } };
 
     /// Pure subgraph for MoE routing. Inputs:
     ///   [0] router_logits — shape [..., num_experts]
@@ -18138,6 +18233,11 @@ pub const Transformer = struct {
     /// Hy3 sigmoid+bias routing — compiled closure when available, else the
     /// direct chain. Returns owned `inds` + `norm_scores`.
     fn computeHy3Routing(self: *const Transformer, router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array) !MoeRouting {
+        if (self.config.moe_logit_select) {
+            const k: c_int = @intCast(self.config.num_experts_per_tok);
+            if (try moeRouterTopK(self.s, router_logits, expert_bias, k, .logit_bias, false, 1.0, .float32, 0, 0, null)) |fused| return fused;
+            return kolibriRoutingChain(router_logits, expert_bias, k, self.s);
+        }
         // Group-limited ("noaux_tc") selection is the same sigmoid+bias chain
         // with a group mask between the bias and the top-k, so it shares this
         // entry point rather than a parallel one. `groupLimitedRouting` has its
@@ -18165,6 +18265,7 @@ pub const Transformer = struct {
             .bfloat16,
             0,
             0,
+            null,
         )) |fused| return fused;
         if (self.compiled_hy3_routing) |compiled| {
             const in_arr = [_]mlx.mlx_array{ router_logits, expert_bias };
@@ -18194,7 +18295,7 @@ pub const Transformer = struct {
 
     /// Apply the compiled MoE routing closure if available, else fall back.
     /// Returns owned `inds` + `norm_scores` — caller must free both.
-    fn computeMoeRouting(self: *const Transformer, router_logits: mlx.mlx_array) !MoeRouting {
+    fn computeMoeRouting(self: *const Transformer, router_logits: mlx.mlx_array, gate: ?RouterGate) !MoeRouting {
         const k: c_int = @intCast(self.config.num_experts_per_tok);
         if (try moeRouterTopK(
             self.s,
@@ -18207,6 +18308,7 @@ pub const Transformer = struct {
             mlx.mlx_array_dtype(router_logits),
             0,
             0,
+            gate,
         )) |fused| return fused;
         if (self.compiled_moe_routing) |compiled| {
             const in_arr = [_]mlx.mlx_array{router_logits};
@@ -21769,6 +21871,7 @@ pub const Transformer = struct {
         rope_offsets: []const u32,
         hidden_rows: ?*?[]mlx.mlx_array,
     ) ![]mlx.mlx_array {
+        if (self.config.isGlm5()) return self.forwardGlmBatchedDecode(next_tokens, ctxs, hidden_rows);
         const N: c_int = @intCast(next_tokens.len);
         std.debug.assert(next_tokens.len == ctxs.len);
         if (!gdn_batched_logged) {
@@ -22547,19 +22650,6 @@ pub const Transformer = struct {
         const dqp = self.quantParamsHinted(w.down_w, w.down_s, @intCast(hc * hidden));
         const uqp = self.quantParamsFor(w.up_w, w.up_s);
         if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
-        if (self.verifyFeatureEnabled(.hc_graph, mtp_verify_hc_prepared_active, batch, seq_len) and batch == 1 and hc == 4 and hidden == 2560 and dqp.bits == 8 and dqp.group_size == 64) {
-            if (try hcReadPrepared(self.s, stream, w.*, seq_len, self.config.rms_norm_eps, pend)) |result| {
-                mtp_verify_hc_prepared_calls +%= 1;
-                const Once = struct {
-                    var logged = false;
-                };
-                if (!Once.logged) {
-                    Once.logged = true;
-                    log.info("[mtp-verify] prepared hyper-connection verifier graphs engaged\n", .{});
-                }
-                return result;
-            }
-        }
         return hcReadFused(self.s, stream, batch, seq_len, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, self.config.rms_norm_eps, hc, hidden, dqp.bits, dqp.group_size, pend);
     }
 
@@ -22590,8 +22680,8 @@ pub const Transformer = struct {
         }
         const dqp = self.quantParamsHinted(w.down_w, w.down_s, 10240);
         const uqp = self.quantParamsFor(w.up_w, w.up_s);
-        if (dqp.bits != 8 or uqp.bits != 8 or dqp.group_size != 64 or uqp.group_size != 64 or dqp.mode != .affine or uqp.mode != .affine) return null;
-        const joined = (try hcReadJoined(self.allocator, self.s, inputs[0..rows.len], w.*, width, self.config.rms_norm_eps, if (has_pending) pending[0..rows.len] else null)) orelse return null;
+        if (dqp.bits != uqp.bits or dqp.group_size != uqp.group_size or dqp.mode != .affine or uqp.mode != .affine) return null;
+        const joined = (try hcReadJoined(self.allocator, self.s, inputs[0..rows.len], w.*, width, self.config.rms_norm_eps, dqp.bits, dqp.group_size, if (has_pending) pending[0..rows.len] else null)) orelse return null;
         defer self.allocator.free(joined);
         errdefer for (joined) |value| inline for (.{ "mixed", "inj", "stream" }) |name| {
             if (@field(value, name).ctx != null) _ = mlx.mlx_array_free(@field(value, name));
@@ -22794,6 +22884,9 @@ pub const Transformer = struct {
     /// for all N·heads rows.
     fn pleEmbedding(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, layer: usize, seq_len: c_int) !mlx.mlx_array {
         const st = self.qwen4.?;
+        // A pipelined serial step on the GPU arm leaves its history settle to the next forward:
+        // by now those ids are evaluated, so the read waits on nothing.
+        if (ctx.ple_pending) |p| if (p.gpu) try self.flushDeferredPle(ctx);
         const emb_dim: usize = st.table.dim * st.hash.n_heads;
         const n: usize = mlx.mlx_array_size(token_ids);
         const batch: c_int = @intCast(n / @as(usize, @intCast(seq_len)));
@@ -22980,6 +23073,21 @@ pub const Transformer = struct {
 
     /// The GPU arm's host half: read the ids (the one sync), advance the history.
     fn pleSettleFromArray(self: *Transformer, token_ids: mlx.mlx_array, entry: *SSMCacheEntry, capture: bool) !void {
+        // A one-token id is read in place after waiting on its own event (no new ops): the
+        // cast+contiguous eval below would queue behind whatever the GPU is running, which for a
+        // settle deferred past its own forward is the next forward.
+        if (mlx.mlx_array_size(token_ids) == 1) {
+            try mlx.check(mlx.mlx_array_eval(token_ids));
+            const one: ?u32 = switch (mlx.mlx_array_dtype(token_ids)) {
+                .int32 => if (mlx.mlx_array_data_int32(token_ids)) |p| @intCast(p[0]) else null,
+                .uint32 => if (mlx.mlx_array_data_uint32(token_ids)) |p| p[0] else null,
+                else => null,
+            };
+            if (one) |id| {
+                _ = pleAdvanceSerial(self.qwen4.?, entry, &[_]u32{id}, capture);
+                return;
+            }
+        }
         const ids_c = try self.pleEvalIds(token_ids);
         defer _ = mlx.mlx_array_free(ids_c);
         const ids = try self.pleHostIds(ids_c);
@@ -23612,7 +23720,7 @@ pub const Transformer = struct {
         const qk = try self.qmatmul(x, fa.idx_qk_w, fa.idx_qk_s, fa.idx_qk_b); // [B,S,(n+1)*hd]
         defer _ = mlx.mlx_array_free(qk);
         if (ctx.batch_slots) |slots| return self.qsaMaskBatched(slots, qk, fa, layer);
-        return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len, layer);
+        return self.qsaMaskFromQk(ctx, qk, fa, entry, cache_len, pos_base, batch, seq_len, layer, true);
     }
 
     /// Batched decode: the indexer projection ran once on `[N,1,·]`; each row
@@ -23649,7 +23757,7 @@ pub const Transformer = struct {
             var qk_i = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(qk_i);
             try mlx.check(mlx.mlx_slice(&qk_i, qk, &[_]c_int{ i_c, 0, 0 }, 3, &[_]c_int{ i_c + 1, seq_len, w }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
-            masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, sc.qsa_pos_base, 1, seq_len, layer);
+            masks[i] = try self.qsaMaskFromQk(sc, qk_i, fa, e, cache_len, sc.qsa_pos_base, 1, seq_len, layer, false);
             kv_lens[i] = cache_len + seq_len;
             if (kv_lens[i] > kv_max) kv_max = kv_lens[i];
             if (masks[i].ctx != null) any = true;
@@ -23704,7 +23812,7 @@ pub const Transformer = struct {
     }
 
     /// Serial per-slot body of `qsaMask` over the projected `qk` rows.
-    fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, layer: u32) !mlx.mlx_array {
+    fn qsaMaskFromQk(self: *Transformer, ctx: *ForwardCtx, qk: mlx.mlx_array, fa: *const FullAttnWeights, entry: *SSMCacheEntry, cache_len: c_int, pos_base: c_int, batch: c_int, seq_len: c_int, layer: u32, solo: bool) !mlx.mlx_array {
         const offset = cache_len;
         const cfg = &self.config;
         const n_idx: c_int = @intCast(cfg.indexer_n_heads);
@@ -23837,7 +23945,9 @@ pub const Transformer = struct {
         // higher than the prefill/decode one — the union is fixed-size.
         // A placed draft row takes the mask arm: its dead rows are masked, which no gatherer reads.
         const want_blocks = qsaWantsBlocks(batch, kv, seq_len, ctx.cache.config.scheme == .affine) and ctx.head_place == null;
-        if (want_blocks) {
+        // A solo decode row on dense KV hands its picks to `qsa_decode` at every kv; the mask arm needs none.
+        const dec_row = solo and batch == 1 and seq_len == 1 and ctx.head_place == null and !ctx.cache.config.isQuant() and qsa_decode.enabled();
+        if (want_blocks or dec_row) {
             // Prefill: sorted per-row block indices for the gather kernel;
             // the dense [S, kv] mask is never built. Decode (S==1): the same
             // single-row selection for the decode gatherer.
@@ -23935,6 +24045,8 @@ pub const Transformer = struct {
                 defer _ = mlx.mlx_array_free(bounds);
                 if (qsaSelectTopBlocks(s, scores, bounds, block_topk) catch null) |picks| {
                     defer _ = mlx.mlx_array_free(picks);
+                    // One row: the sorted picks (INT_MAX where short) go straight to the visibility mask.
+                    if (seq_len == 1) if (try qsa_row_mask.rowMask(s, picks, kv, ratio)) |m| return m;
                     // The kernel pads a short row with INT_MAX; clamping those to 0 is safe because
                     // the `logical_and` with the sheet below clears block 0 when it is not visible.
                     const nb_v = mlx.mlx_array_new_int(nb);
@@ -24122,8 +24234,12 @@ pub const Transformer = struct {
 
     /// Load the qwen4_exp MTP head when the pack ships `mtp.*` (null otherwise).
     fn loadQwen4Mtp(allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights, name_buf: *[256]u8, s: mlx.mlx_stream) !?Qwen4Mtp {
-        const mtp_prefix = "language_model.mtp";
-        if (weights.get(mtp_prefix ++ ".fc_hidden.weight") == null) return null;
+        const mtp_prefix = if (weights.get("language_model.mtp.fc_hidden.weight") != null)
+            "language_model.mtp"
+        else if (weights.get("mtp.fc_hidden.weight") != null)
+            "mtp"
+        else
+            return null;
         var mcfg = config;
         mcfg.weight_prefix = mtp_prefix;
         mcfg.num_hidden_layers = 1;
@@ -24139,11 +24255,16 @@ pub const Transformer = struct {
         allocator.free(ml.moe_layers);
         const entry = ml.ssm_entries[0];
         allocator.free(ml.ssm_entries);
-        const fe = try weightTriple(weights, mtp_prefix ++ ".fc_embedding", &owned, allocator, s);
-        const fh = try weightTriple(weights, mtp_prefix ++ ".fc_hidden", &owned, allocator, s);
-        const mixer = try loadHcWeights(weights, mtp_prefix ++ ".hyper_connection_mixer", false, config.hc_count, config.hidden_size, &owned, allocator, s);
-        const pne = weights.get(mtp_prefix ++ ".pre_fc_norm_embedding.weight") orelse return error.MissingWeight;
-        const pnh = weights.get(mtp_prefix ++ ".pre_fc_norm_hidden.weight") orelse return error.MissingWeight;
+        var fe_buf: [80]u8 = undefined;
+        var fh_buf: [80]u8 = undefined;
+        var mixer_buf: [80]u8 = undefined;
+        var pne_buf: [80]u8 = undefined;
+        var pnh_buf: [80]u8 = undefined;
+        const fe = try weightTriple(weights, try std.fmt.bufPrint(&fe_buf, "{s}.fc_embedding", .{mtp_prefix}), null, &owned, allocator, s);
+        const fh = try weightTriple(weights, try std.fmt.bufPrint(&fh_buf, "{s}.fc_hidden", .{mtp_prefix}), null, &owned, allocator, s);
+        const mixer = try loadHcWeights(weights, try std.fmt.bufPrint(&mixer_buf, "{s}.hyper_connection_mixer", .{mtp_prefix}), false, config.hc_count, config.hidden_size, &owned, allocator, s);
+        const pne = weights.get(try std.fmt.bufPrint(&pne_buf, "{s}.pre_fc_norm_embedding.weight", .{mtp_prefix})) orelse return error.MissingWeight;
+        const pnh = weights.get(try std.fmt.bufPrint(&pnh_buf, "{s}.pre_fc_norm_hidden.weight", .{mtp_prefix})) orelse return error.MissingWeight;
         var cache = try KVCache.init(allocator, config.num_hidden_layers + 1);
         errdefer cache.deinit();
         log.info("[qwen4] MTP head loaded (1 hyper-connected QSA+MoE layer; drafts armed by --mtp)\n", .{});
@@ -25176,9 +25297,6 @@ pub const Transformer = struct {
         out_last: []mlx.mlx_array,
         out_all: []mlx.mlx_array,
     ) !void {
-        const previous_hc_prepared = mtp_verify_hc_prepared_active;
-        mtp_verify_hc_prepared_active = true;
-        defer mtp_verify_hc_prepared_active = previous_hc_prepared;
         const op_start = mlx.op_count.load(.monotonic);
         const cfg = &self.config;
         const layers = self.moe_layers.?;
@@ -25636,7 +25754,9 @@ pub const Transformer = struct {
         const x_shape = mlx.getShape(emb);
         const batch: c_int = x_shape[0];
         const seq_len: c_int = x_shape[1];
-        const is_prefill = seq_len > 1;
+        // A batched tick's rows are N sequences' next tokens (`glmBranchSlots`), not a prompt chunk.
+        const batched = ctx.batch_slots != null;
+        const is_prefill = seq_len > 1 and !batched;
         var stream = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(stream);
         {
@@ -25666,7 +25786,7 @@ pub const Transformer = struct {
                 try evalCadencePoint(stream, ctx.ssm_entries);
             }
         }
-        ctx.moe_seq_offset.* += @intCast(seq_len);
+        if (!batched) ctx.moe_seq_offset.* += @intCast(seq_len);
         if (deferred) |*df| {
             _ = mlx.mlx_array_free(stream);
             stream = try df.materialize(self.s);
@@ -25756,6 +25876,7 @@ pub const Transformer = struct {
     }
 
     fn glmBranch(self: *Transformer, ctx: *ForwardCtx, normed: mlx.mlx_array, lw: *const MoeLayerWeights, attn: bool, li: usize, offset: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !mlx.mlx_array {
+        if (ctx.batch_slots) |slots| return self.glmBranchSlots(slots, normed, lw, attn, li);
         return if (attn) switch (lw.attn) {
             .linear => |*la| try self.gatedDeltaNet(normed, la, &ctx.ssm_entries.?[li], li, batch, seq_len, is_prefill),
             .full => |*fa| try self.glmDsaAttn(ctx, normed, &fa.dsa.?, @intCast(li), offset, batch, seq_len),
@@ -25763,6 +25884,171 @@ pub const Transformer = struct {
             .moe => |*mw| try self.moeMLP(normed, mw),
             .dense => |*dw| try self.denseMLP(normed, dw),
         };
+    }
+
+    /// One batched tick's branch: `normed` `[1, N, H]` holds N slots' next-token rows. The MLP and
+    /// the projections read their weights once for all N rows; a slot's own state (its KDA
+    /// recurrence, its DSA cache) is advanced by its own call.
+    fn glmBranchSlots(self: *Transformer, slots: []const *ForwardCtx, normed: mlx.mlx_array, lw: *const MoeLayerWeights, attn: bool, li: usize) !mlx.mlx_array {
+        if (!attn) return switch (lw.mlp) {
+            .moe => |*mw| try self.moeMLP(normed, mw),
+            .dense => |*dw| try self.denseMLP(normed, dw),
+        };
+        switch (lw.attn) {
+            .linear => |*la| return self.glmKdaSlots(slots, normed, la, li),
+            .full => |*fa| {
+                var rows: [MOE_DECODE_BATCH_MAX]mlx.mlx_array = undefined;
+                var built: usize = 0;
+                defer for (rows[0..built]) |r| {
+                    _ = mlx.mlx_array_free(r);
+                };
+                for (slots, 0..) |sl, i| {
+                    const row = try axisView(self.s, normed, 1, i);
+                    defer _ = mlx.mlx_array_free(row);
+                    rows[i] = try self.glmDsaAttn(sl, row, &fa.dsa.?, @intCast(li), sl.moe_seq_offset.*, 1, 1);
+                    built += 1;
+                }
+                return concatAxis1(self.s, rows[0..slots.len]);
+            },
+        }
+    }
+
+    /// The low-rank gate second stages the fused KDA step reads: `f_b` (forget) and `g_b` (output).
+    fn kdaLows(self: *Transformer, la: *const LinearAttnWeights, dk: c_int) struct { fb: kda_recurrence.Low, gb: kda_recurrence.Low } {
+        const a2q = self.quantParamsHinted(la.a2.w, la.a2.s, @intCast(dk));
+        const z2q = self.quantParamsHinted(la.z2.w, la.z2.s, @intCast(dk));
+        return .{
+            .fb = .{ .w = la.a2.w, .s = la.a2.s, .b = la.a2.b, .bits = a2q.bits, .gs = a2q.group_size },
+            .gb = .{ .w = la.z2.w, .s = la.z2.s, .b = la.z2.b, .bits = z2q.bits, .gs = z2q.group_size },
+        };
+    }
+
+    /// KDA layer over N slots' rows: ONE joined input projection and ONE output projection, the
+    /// fused one-token step per slot against that slot's own conv + recurrent state. A layer whose
+    /// projection is not joined (layer 0) runs the layer per slot.
+    fn glmKdaSlots(self: *Transformer, slots: []const *ForwardCtx, x: mlx.mlx_array, la: *const LinearAttnWeights, li: usize) !mlx.mlx_array {
+        const cfg = &self.config;
+        const heads: c_int = @intCast(cfg.linear_num_value_heads);
+        const dk: c_int = @intCast(cfg.linear_key_head_dim);
+        var rows: [MOE_DECODE_BATCH_MAX]mlx.mlx_array = undefined;
+        var built: usize = 0;
+        defer for (rows[0..built]) |r| {
+            _ = mlx.mlx_array_free(r);
+        };
+        const joined = la.in.w.ctx != null and la.a_log_h.ctx != null and la.a2.w.ctx != null and la.z2.w.ctx != null;
+        // A GPU that cannot launch the fused step declines at the first slot: the per-slot path below serves it.
+        if (joined) joined_path: {
+            for (slots) |sl| {
+                const e = &sl.ssm_entries.?[li];
+                if (!e.initialized or e.ssm_state.ctx == null or e.conv_state.ctx == null) return error.GlmBatchedStateMissing;
+            }
+            const all = try self.qmatmul(x, la.in.w, la.in.s, la.in.b);
+            defer _ = mlx.mlx_array_free(all);
+            const w = la.in.widths;
+            const lows = self.kdaLows(la, dk);
+            for (slots, 0..) |sl, i| {
+                const e = &sl.ssm_entries.?[li];
+                const proj = try axisView(self.s, all, 1, i);
+                defer _ = mlx.mlx_array_free(proj);
+                const r = (try kda_recurrence.decodeStep(self.s, proj, w[0], w[0] + w[1], w[0] + w[1] + w[2], heads, e.conv_state, la.conv1d_w, la.a_log_h, la.dt_f32, e.ssm_state, la.norm_w, lows.fb, lows.gb, cfg.kda_gate_lower_bound, cfg.rms_norm_eps, false)) orelse if (i == 0) break :joined_path else return error.GlmBatchedKdaDeclined;
+                _ = mlx.mlx_array_free(e.conv_state);
+                e.conv_state = r.conv_state;
+                _ = mlx.mlx_array_free(e.ssm_state);
+                e.ssm_state = r.state;
+                rows[i] = r.y;
+                built += 1;
+            }
+            const y = try concatAxis1(self.s, rows[0..slots.len]);
+            defer _ = mlx.mlx_array_free(y);
+            return self.qmatmul(y, la.out_w, la.out_s, la.out_b);
+        }
+        for (slots, 0..) |sl, i| {
+            const row = try axisView(self.s, x, 1, i);
+            defer _ = mlx.mlx_array_free(row);
+            rows[i] = try self.gatedDeltaNet(row, la, &sl.ssm_entries.?[li], li, 1, 1, false);
+            built += 1;
+        }
+        return concatAxis1(self.s, rows[0..slots.len]);
+    }
+
+    /// Rows a batched GLM tick carries: the MoE decode kernels' row limit.
+    const MOE_DECODE_BATCH_MAX = 8;
+
+    fn concatAxis1(s: mlx.mlx_stream, parts: []const mlx.mlx_array) !mlx.mlx_array {
+        const vec = mlx.mlx_vector_array_new_data(parts.ptr, parts.len);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_concatenate_axis(&out, vec, 1, s));
+        return out;
+    }
+
+    /// Next-token logits for N slots in as few trunk forwards as the MoE row limit allows (8 per
+    /// forward): each slot's token is one ROW of a `[1, n]` window, so the weights are read once
+    /// per forward rather than once per slot. `hidden_rows`, when asked, receives each slot's
+    /// post-final-norm hidden (`[1,1,H]`) for an MTP head that resumes after the group. Returns
+    /// N arrays `[1,1,V]`; the caller owns them and the slice.
+    pub fn forwardGlmBatchedDecode(
+        self: *Transformer,
+        next_tokens: []const u32,
+        ctxs: []const *ForwardCtx,
+        hidden_rows: ?*?[]mlx.mlx_array,
+    ) ![]mlx.mlx_array {
+        std.debug.assert(next_tokens.len == ctxs.len and next_tokens.len >= 1);
+        if (!glm_batched_logged) {
+            glm_batched_logged = true;
+            log.info("[batched] glm batched decode engaged (slots={d})\n", .{next_tokens.len});
+        }
+        const out = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
+        var made: usize = 0;
+        errdefer {
+            for (out[0..made]) |a| _ = mlx.mlx_array_free(a);
+            self.allocator.free(out);
+        }
+        var hid: ?[]mlx.mlx_array = null;
+        if (hidden_rows != null) hid = try self.allocator.alloc(mlx.mlx_array, ctxs.len);
+        var hid_made: usize = 0;
+        errdefer if (hid) |h| {
+            for (h[0..hid_made]) |a| _ = mlx.mlx_array_free(a);
+            self.allocator.free(h);
+        };
+        var start: usize = 0;
+        while (start < ctxs.len) {
+            const n = @min(MOE_DECODE_BATCH_MAX, ctxs.len - start);
+            const group = ctxs[start .. start + n];
+            var toks: [MOE_DECODE_BATCH_MAX]i32 = undefined;
+            for (next_tokens[start .. start + n], 0..) |t, i| toks[i] = @intCast(t);
+            const token_arr = mlx.mlx_array_new_data(&toks, &[_]c_int{ 1, @intCast(n) }, 2, .int32);
+            defer _ = mlx.mlx_array_free(token_arr);
+            var scratch_offset: usize = group[0].moe_seq_offset.*;
+            var hidden_all = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(hidden_all);
+            var bctx: ForwardCtx = .{
+                .cache = group[0].cache,
+                .moe_seq_offset = &scratch_offset,
+                .ssm_entries = group[0].ssm_entries,
+                .capture_hidden = null,
+                .capture_hidden_all = if (hid != null) &hidden_all else null,
+                .vision_embeddings = null,
+                .batch_slots = group,
+            };
+            const logits = try self.forwardGlm5With(&bctx, token_arr);
+            defer _ = mlx.mlx_array_free(logits);
+            const v = mlx.getShape(logits)[2];
+            for (0..n) |i| {
+                var row = mlx.mlx_array_new(); // empty until the slice lands, so a failure leaks nothing
+                try mlx.check(mlx.mlx_slice(&row, logits, &[_]c_int{ 0, @intCast(i), 0 }, 3, &[_]c_int{ 1, @intCast(i + 1), v }, 3, &[_]c_int{ 1, 1, 1 }, 3, self.s));
+                out[start + i] = row;
+                made = start + i + 1;
+                if (hid) |h| {
+                    h[start + i] = try axisView(self.s, hidden_all, 1, i);
+                    hid_made = start + i + 1;
+                }
+            }
+            start += n;
+        }
+        if (hidden_rows) |slot| slot.* = hid;
+        return out;
     }
 
     /// GLM-5-Next DeepSeek sparse attention. The cache holds, per token, the 512 latent
@@ -25992,7 +26278,9 @@ pub const Transformer = struct {
         const offset = ctx.moe_seq_offset.*;
         const cfg = &self.config;
         const is_gemma4 = cfg.isGemma4Layers();
-        const is_laguna = std.mem.eql(u8, cfg.model_type, "laguna");
+        const is_kolibri = std.mem.eql(u8, cfg.model_type, "kolibri1");
+        // kolibri1 runs laguna's attention arm (no gate, NoPE on full layers).
+        const is_laguna = is_kolibri or std.mem.eql(u8, cfg.model_type, "laguna");
         const is_inkling = cfg.isInkling();
         const is_mla = cfg.isMla();
         // gpt_oss and MiMo share the sink attention arm (per-layer geometry).
@@ -26148,6 +26436,27 @@ pub const Transformer = struct {
             if (is_gemma4) {
                 const next_norm = if (layer_idx + 1 == n_layers) self.final_norm else ml[layer_idx + 1].input_norm;
                 h = try self.gemma4MoeLayerTail(h, attn_out, lw, ctx.use_encoder_scalars, next_norm, &carried_normed, !is_prefill);
+            } else if (is_kolibri) {
+                // Sandwich norms: post_attn on the attention output, pre_ff on
+                // the residual before the MoE, post_ff on the MoE output.
+                const attn_n = try self.rmsNorm(attn_out, lw.post_attn_norm);
+                defer _ = mlx.mlx_array_free(attn_n);
+                var h_mid = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_mid, h, attn_n, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_mid;
+
+                const ff_normed = try self.rmsNorm(h, lw.pre_ff_norm.?);
+                defer _ = mlx.mlx_array_free(ff_normed);
+                const mlp_out = try self.moeMLP(ff_normed, &lw.mlp.moe);
+                defer _ = mlx.mlx_array_free(mlp_out);
+                const mlp_n = try self.rmsNorm(mlp_out, lw.post_ff_norm.?);
+                defer _ = mlx.mlx_array_free(mlp_n);
+
+                var h_next = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_add(&h_next, h, mlp_n, self.s));
+                _ = mlx.mlx_array_free(h);
+                h = h_next;
             } else if (is_inkling) {
                 // Inkling layer tail (inkling_mlx/layers.py):
                 //   h = residual + attn_sconv(attn_out)
@@ -26848,7 +27157,7 @@ pub const Transformer = struct {
 
             var fused_out: ?add_norm.Out = null;
             if (fuse_here and lw.op == .nemotron_moe and batch * seq_len <= add_norm_max_rows) {
-                const parts = try nemotronMoeExperts(normed, &lw.op.nemotron_moe, cfg, self.s);
+                const parts = try nemotronMoeExperts(normed, &lw.op.nemotron_moe, cfg, moeStreamPadPays(&lw.op.nemotron_moe), self.s);
                 defer parts.deinit();
                 const shared = try nemotronSharedExpert(normed, &lw.op.nemotron_moe, cfg, self.s);
                 defer if (shared) |sx| {
@@ -29119,6 +29428,7 @@ pub const Transformer = struct {
         // rotary_dim = head_dim*partial_global) + mscale on the rotated slice.
         // Sliding layers: default RoPE at rope_local_base_freq, full rotary.
         const use_yarn = is_full and self.rope_freqs_yarn != null;
+        const no_rope = cfg.layerSkipsRope(layer); // kolibri1 full layers
         const rope_dims: c_int = if (use_yarn)
             @intFromFloat(@as(f32, @floatFromInt(cfg.head_dim)) * cfg.partial_rotary_factor_global)
         else
@@ -29164,7 +29474,7 @@ pub const Transformer = struct {
         var k_rope = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(k_rope);
         var fused_qk = false;
-        if (batch == 1 and seq_len == 1 and cfg.head_dim == 128 and
+        if (batch == 1 and seq_len == 1 and cfg.head_dim == 128 and !no_rope and
             !fused_qkv_used and fa.q_norm.ctx != null and fa.k_norm.ctx != null and
             self.rms_eps_arr.ctx != null and qkNormRopeFusedEnabled())
         blk: {
@@ -29195,7 +29505,11 @@ pub const Transformer = struct {
             var q_t = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(q_t);
             try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed, &perm, 4, self.s));
-            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+            if (no_rope) {
+                try mlx.check(mlx.mlx_array_set(&q_rope, q_t));
+            } else {
+                try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+            }
 
             // K: proj → reshape → k_norm → transpose → rope
             if (!fused_qkv_used) {
@@ -29210,7 +29524,11 @@ pub const Transformer = struct {
             var k_t = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(k_t);
             try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, self.s));
-            try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+            if (no_rope) {
+                try mlx.check(mlx.mlx_array_set(&k_rope, k_t));
+            } else {
+                try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, rope_dims, false, rope_base, 1.0, offset, rope_freqs, self.s));
+            }
 
             // YaRN mscale: scale the rotated slice of q/k by attention_factor. This
             // is exactly the reference's cos/sin *= attention_factor (the mscale
@@ -30076,7 +30394,8 @@ pub const Transformer = struct {
             z_proj = try standinOnes(&[_]c_int{ batch, seq_len, value_dim }, self.s);
             a_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
             b_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
-        } else if (la.in.w.ctx != null and self.rowGroupServes(batch * seq_len)) {
+        } else if (la.in.w.ctx != null and (self.rowGroupServes(batch * seq_len) or (cfg.kda_vector_gate and batch == 1 and seq_len <= 8))) {
+            // A KDA verify window rides the row-joined projection too: the fused step below takes up to 8 rows.
             const all = try self.qmatmul(x, la.in.w, la.in.s, la.in.b);
             in_all = all;
             qkv = mlx.mlx_array_new();
@@ -31910,6 +32229,16 @@ pub const Transformer = struct {
 
     fn moeRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
         const cfg = &self.config;
+        if (cfg.moe_logit_select) {
+            // kolibri1 routes on fp32 logits (router_w is bound as f32, [in, out]).
+            var x32 = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(x32);
+            try mlx.check(mlx.mlx_astype(&x32, router_x, .float32, self.s));
+            var out = mlx.mlx_array_new();
+            errdefer _ = mlx.mlx_array_free(out);
+            try mlx.check(mlx.mlx_matmul(&out, x32, mw.router_w, self.s));
+            return out;
+        }
         var logits = if (mw.router_scale) |rs| blk: {
             var normed = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(normed);
@@ -31963,13 +32292,15 @@ pub const Transformer = struct {
         return result;
     }
 
-    fn moeAddGatedShared(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+    /// `gate_logit`: the shared-expert gate's logit when the router kernel already computed it.
+    fn moeAddGatedShared(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, gate_logit: ?mlx.mlx_array) !mlx.mlx_array {
         const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
         defer _ = mlx.mlx_array_free(down);
-        return self.moeAddSharedDown(expert_sum, expert_x, down, mw);
+        return self.moeAddSharedDown(expert_sum, expert_x, down, mw, gate_logit);
     }
 
-    fn moeAddSharedDown(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, down: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+    fn moeAddSharedDown(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, down: mlx.mlx_array, mw: *const MoeMlpWeights, gate_logit_in: ?mlx.mlx_array) !mlx.mlx_array {
+        if (gate_logit_in) |logit| return self.moeSharedGateTail(expert_sum, logit, down);
         const seg_w = mw.shared_expert_gate_w.?;
         const seg_qp = self.quantParamsHinted(seg_w, mw.shared_expert_gate_s.?, lastDim(expert_x));
         const gate_logit = try qmatmulBits(expert_x, seg_w, mw.shared_expert_gate_s.?, mw.shared_expert_gate_b.?, seg_qp.bits, seg_qp.group_size, seg_qp.mode, self.s);
@@ -32100,8 +32431,8 @@ pub const Transformer = struct {
                 var down_row = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(down_row);
                 try mlx.check(mlx.mlx_slice(&down_row, down, &.{ 0, start, 0 }, 3, &.{ 1, start + seq, hidden }, 3, &.{ 1, 1, 1 }, 3, self.s));
-                break :blk try self.moeAddSharedDown(expert_row, input, down_row, mw);
-            } else try self.moeAddGatedShared(expert_row, input, mw);
+                break :blk try self.moeAddSharedDown(expert_row, input, down_row, mw, null);
+            } else try self.moeAddGatedShared(expert_row, input, mw, null);
             built += 1;
             start += seq;
         }
@@ -32351,6 +32682,36 @@ pub const Transformer = struct {
         return true;
     }
 
+    /// Affine-4 banks at ONE decode token: `moe_affine4`'s two dispatches over the token's
+    /// experts. Writes the weighted sum [1,1,D] into `out` (with the gated shared expert added when
+    /// `shared` is given); false when the kernels decline.
+    fn moeAffine4Decode(self: *Transformer, out: *mlx.mlx_array, expert_x: mlx.mlx_array, inds: mlx.mlx_array, norm_scores: mlx.mlx_array, mw: *const MoeMlpWeights, group_size: u32, shared: ?moe_affine4.Shared) !bool {
+        // The sigmoid table covers 16-bit patterns only; an f32 stream (the fixture oracle) declines.
+        const xd = mlx.mlx_array_dtype(expert_x);
+        if (xd != .bfloat16 and xd != .float16) return false;
+        const xs = mlx.getShape(expert_x);
+        const ks = mlx.getShape(inds);
+        const k = ks[ks.len - 1];
+        var x1 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(x1);
+        try mlx.check(mlx.mlx_reshape(&x1, expert_x, &.{xs[2]}, 1, self.s));
+        var ind1 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ind1);
+        try mlx.check(mlx.mlx_reshape(&ind1, inds, &.{k}, 1, self.s));
+        var ind_u = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(ind_u);
+        try mlx.check(mlx.mlx_astype(&ind_u, ind1, .uint32, self.s));
+        var sc1 = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc1);
+        try mlx.check(mlx.mlx_reshape(&sc1, norm_scores, &.{k}, 1, self.s));
+        const sigtab = try swigluSigTable(self.s, mlx.mlx_array_dtype(expert_x), std.heap.c_allocator);
+        const Bank = moe_affine4.Bank;
+        const y = (try moe_affine4.decode(self.s, x1, Bank{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b }, Bank{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b }, Bank{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b }, mw.bank_views, shared, ind_u, sc1, sigtab, group_size)) orelse return false;
+        defer _ = mlx.mlx_array_free(y);
+        try mlx.check(mlx.mlx_reshape(out, y, &.{ xs[0], xs[1], xs[2] }, 3, self.s));
+        return true;
+    }
+
     /// The fused-rows MoE arm at decode (B >= 2). It runs ahead of the sorted
     /// chain, which stays the fallback whenever this declines: a decline is never
     /// a wrong answer, only the sorted chain's extra dispatches.
@@ -32483,10 +32844,29 @@ pub const Transformer = struct {
 
         // Top-K + softmax/renormalize as a single fused kernel (when compiled).
         // Hy3 (expert_bias bound): sigmoid+bias selection instead of softmax.
+        // At one decode row the shared-expert gate's logit rides the softmax router kernel (RouterMode.softmax_gate).
+        const gate_fold: ?RouterGate = blk: {
+            if (mw.expert_bias != null or router_override != null or skip_shared or mw.shared_ungated or mw.shared_gate_vec.ctx == null) break :blk null;
+            if (qwen4Standin().moe_shared or qwen4Standin().moe_router) break :blk null;
+            const lsh = mlx.getShape(router_logits);
+            var rows: usize = 1;
+            for (lsh[0 .. lsh.len - 1]) |d| rows *= @intCast(d);
+            if (rows != 1 or mlx.mlx_array_size(expert_x) != mlx.mlx_array_size(mw.shared_gate_vec)) break :blk null;
+            break :blk .{ .x = expert_x, .w = mw.shared_gate_vec };
+        };
         const routed = if (mw.expert_bias) |bias|
             try self.computeHy3Routing(router_logits, bias)
         else
-            try self.computeMoeRouting(router_logits);
+            try self.computeMoeRouting(router_logits, gate_fold);
+        defer if (routed.gate_logit.ctx != null) {
+            _ = mlx.mlx_array_free(routed.gate_logit);
+        };
+        // With the gate's logit in hand the shared expert's down output is built up front: the affine-4
+        // down kernel adds it in its epilogue, and the tail below uses it when another arm served the routed part.
+        const shared_down: ?mlx.mlx_array = if (routed.gate_logit.ctx != null) (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})) else null;
+        defer if (shared_down) |sd| {
+            _ = mlx.mlx_array_free(sd);
+        };
         var inds = routed.inds;
         defer _ = mlx.mlx_array_free(inds);
         var norm_scores = routed.norm_scores;
@@ -32561,7 +32941,7 @@ pub const Transformer = struct {
             const y = try sushi_exl3.moe(self.s, expert_x, bank, inds, norm_scores, dec, skip_shared and router_override != null);
             if (skip_shared or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
             defer _ = mlx.mlx_array_free(y);
-            return self.moeAddGatedShared(y, expert_x, mw);
+            return self.moeAddGatedShared(y, expert_x, mw, null);
         }
 
         // Expert computation. Two paths:
@@ -32612,12 +32992,22 @@ pub const Transformer = struct {
         // sum [B,S,hidden] (fused down+reduce kernel) — the multiply+sum
         // below must then be skipped, not repeated.
         var moe_reduced = false;
+        // True when the affine-4 down kernel already added the gated shared expert.
+        var shared_fused = false;
         var cost_arm: u8 = 4;
 
         if (moeFp4DecodeEligible(B * S, has_expert_bias, swigluClampLimit(&self.config), gate_qp.mode, up_qp.mode, down_qp.mode) and
             try self.moeFp4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size))
         {
             moe_reduced = true;
+            cost_arm = 1;
+        } else if (B * S == 1 and !has_expert_bias and (swigluClampLimit(&self.config) orelse 1) == 0 and cfg.hidden_act == .silu and
+            gate_qp.mode == .affine and up_qp.mode == .affine and down_qp.mode == .affine and
+            gate_qp.bits == 4 and up_qp.bits == 4 and down_qp.bits == 4 and gate_qp.group_size == up_qp.group_size and gate_qp.group_size == down_qp.group_size and
+            try self.moeAffine4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size, if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null))
+        {
+            moe_reduced = true;
+            shared_fused = shared_down != null;
             cost_arm = 1;
         } else if (moeDecodeDispatchArm(B, S, K, has_expert_bias) == .rows and
             useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
@@ -32947,7 +33337,7 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_sum_axis(&expert_sum, weighted, -2, false, self.s)); // [B, S, hidden]
         }
 
-        if (skip_shared) return expert_sum;
+        if (skip_shared or shared_fused) return expert_sum;
 
         // Hy3: shared expert ALWAYS added, no gate (reference MoE.__call__:
         // `y = y + self.shared_mlp(x)`). shared_gate_w carries a real handle
@@ -32975,7 +33365,8 @@ pub const Transformer = struct {
         // Gemma 4: shared expert is handled separately in forwardMoe, just return expert_sum
         if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return expert_sum;
         defer _ = mlx.mlx_array_free(expert_sum);
-        return self.moeAddGatedShared(expert_sum, expert_x, mw);
+        if (shared_down) |sd| return self.moeSharedGateTail(expert_sum, routed.gate_logit, sd);
+        return self.moeAddGatedShared(expert_sum, expert_x, mw, null);
     }
 
     // ── Mask helpers ──
@@ -33398,18 +33789,36 @@ pub fn maybeTransposeForBf16(
     try owned.append(allocator, transposed);
 }
 
-/// One quantized-or-dense projection triple by full tensor base name.
-fn weightTriple(weights: *const Weights, base: []const u8, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array } {
+/// One quantized-or-dense projection triple by full tensor base name. With
+/// `dense_in` (the input dim) an affine-quantized weight is dequantized first.
+fn weightTriple(weights: *const Weights, base: []const u8, dense_in: ?u32, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array } {
     var nb: [160]u8 = undefined;
     const w = weights.get(std.fmt.bufPrint(&nb, "{s}.weight", .{base}) catch unreachable) orelse {
         log.err("MISSING WEIGHT: {s}.weight\n", .{base});
         return error.MissingWeight;
     };
-    const sc = weights.get(std.fmt.bufPrint(&nb, "{s}.scales", .{base}) catch unreachable) orelse mlx.mlx_array_new();
-    const bi = weights.get(std.fmt.bufPrint(&nb, "{s}.biases", .{base}) catch unreachable) orelse mlx.mlx_array_new();
+    var sc = weights.get(std.fmt.bufPrint(&nb, "{s}.scales", .{base}) catch unreachable) orelse mlx.mlx_array_new();
+    var bi = weights.get(std.fmt.bufPrint(&nb, "{s}.biases", .{base}) catch unreachable) orelse mlx.mlx_array_new();
     var wm = w;
+    if (dense_in) |in_dim| try dequantizeSmall(&wm, &sc, &bi, in_dim, owned_bf16, allocator, s);
     try maybeTransposeForBf16(&wm, sc, owned_bf16, allocator, s);
     return .{ .w = wm, .sc = sc, .bi = bi };
+}
+
+/// A tiny affine-quantized tensor rewritten as the dense `[out, in]` a dense
+/// checkpoint ships (untransposed), so the paths keyed on the dense layout
+/// (hc prefill, the fused HC read, the softmax_gate fold) serve it too.
+fn dequantizeSmall(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array, in_dim: u32, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !void {
+    if (sc.ctx == null or bi.ctx == null) return;
+    const qp = affineParamsFromGeometry(w.*, sc.*, in_dim) orelse return;
+    var d = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(d);
+    try mlx.check(mlx.mlx_dequantize(&d, w.*, sc.*, bi.*, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", .{ .ctx = null }, .{ .value = mlx.mlx_array_dtype(sc.*), .has_value = true }, s));
+    try mlx.check(mlx.mlx_array_eval(d));
+    try owned.append(allocator, d);
+    w.* = d;
+    sc.* = mlx.mlx_array_new();
+    bi.* = mlx.mlx_array_new();
 }
 
 /// A grouped-norm weight `[hc*hidden]` viewed as `[hc, hidden]` (owned).
@@ -33451,8 +33860,8 @@ fn loadMhcWeights(weights: *const Weights, name_buf: *[256]u8, prefix: []const u
 
 fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: bool, hc: u32, hidden: u32, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !HcWeights {
     var nb: [160]u8 = undefined;
-    const down = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.input_mix_weight_down", .{base}) catch unreachable, owned_bf16, allocator, s);
-    const up = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.input_mix_weight_up", .{base}) catch unreachable, owned_bf16, allocator, s);
+    const down = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.input_mix_weight_down", .{base}) catch unreachable, null, owned_bf16, allocator, s);
+    const up = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.input_mix_weight_up", .{base}) catch unreachable, null, owned_bf16, allocator, s);
     var out: HcWeights = .{
         .norm_w = try groupedNormView(weights, std.fmt.bufPrint(&nb, "{s}.hc_norm.weight", .{base}) catch unreachable, hc, hidden, owned_bf16, allocator, s),
         .down_w = down.w,
@@ -33468,7 +33877,7 @@ fn loadHcWeights(weights: *const Weights, base: []const u8, with_inject: bool, h
     defer _ = mlx.mlx_array_free(inv_hc);
     try scaleTriple(&out.down_w, &out.down_s, &out.down_b, inv_hc, owned_bf16, allocator, s);
     if (with_inject) {
-        const inj = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.block_inject_weight", .{base}) catch unreachable, owned_bf16, allocator, s);
+        const inj = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.block_inject_weight", .{base}) catch unreachable, hc * hidden, owned_bf16, allocator, s);
         out.inject_w = inj.w;
         out.inject_s = inj.sc;
         out.inject_b = inj.bi;
@@ -33519,8 +33928,8 @@ fn scaleTriple(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array, k: mlx
 
 fn loadPleWeights(weights: *const Weights, name_buf: *[256]u8, prefix: []const u8, li: u32, hc: u32, hidden: u32, owned_bf16: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) !PleWeights {
     var nb: [160]u8 = undefined;
-    const key = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.key_proj", .{ prefix, li }) catch unreachable, owned_bf16, allocator, s);
-    const value = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.value_proj", .{ prefix, li }) catch unreachable, owned_bf16, allocator, s);
+    const key = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.key_proj", .{ prefix, li }) catch unreachable, null, owned_bf16, allocator, s);
+    const value = try weightTriple(weights, std.fmt.bufPrint(&nb, "{s}.layers.{d}.ple.value_proj", .{ prefix, li }) catch unreachable, null, owned_bf16, allocator, s);
     return .{
         .key_w = key.w,
         .key_s = key.sc,
@@ -33550,6 +33959,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const is_gemma4 = config.isGemma4Layers();
     const is_hy3 = std.mem.eql(u8, config.model_type, "hy_v3");
     const is_laguna = std.mem.eql(u8, config.model_type, "laguna");
+    const is_kolibri = std.mem.eql(u8, config.model_type, "kolibri1");
     const is_inkling = std.mem.eql(u8, config.model_type, "inkling_mm_model");
     const is_bailing = std.mem.eql(u8, config.model_type, "bailing_hybrid");
     const is_qwen4 = config.isQwen4();
@@ -33557,7 +33967,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
     const is_mimo = config.isMimo();
     const is_glm = config.isGlm5();
     // Attention projections that may ship dense bf16 beside quantized experts.
-    const probe_attn_scales = is_laguna or is_mimo;
+    const probe_attn_scales = is_laguna or is_mimo or is_kolibri;
 
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
@@ -33628,6 +34038,18 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             var enc_buf: [256]u8 = undefined;
             const enc_name = std.fmt.bufPrint(&enc_buf, "model.encoder.language_model.layers.{d}.layer_scalar", .{li}) catch unreachable;
             lw.encoder_layer_scalar = weights.get(enc_name);
+        }
+
+        // kolibri1 sandwich norms, named by what they do (the Gemma convention):
+        // post_attn_norm is applied to the attention output, pre_ff_norm to the
+        // residual before the MoE, post_ff_norm to the MoE output. The checkpoint
+        // spells them differently: its `post_attention_layernorm` is the pre-FFN
+        // norm (already loaded above as post_attn_norm) and its `post_attn_norm`
+        // is the attention-output norm.
+        if (is_kolibri) {
+            lw.pre_ff_norm = lw.post_attn_norm;
+            lw.post_attn_norm = try getLayerWeight(weights, name_buf, prefix, li, "post_attn_norm.weight");
+            lw.post_ff_norm = try getLayerWeight(weights, name_buf, prefix, li, "post_ffn_norm.weight");
         }
 
         // Gemma 4 MoE: extra feedforward norms, layer scalar, shared expert MLP
@@ -34378,6 +34800,56 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try owned_bf16.append(allocator, f);
                 lw.mlp.moe.router_w = f;
             }
+        } else if (layer_is_moe and is_kolibri) {
+            // kolibri1: stacked experts under `mlp.experts.*` (mlx-lm layout),
+            // the bf16 router `mlp.gate.weight`, the f32 selection bias
+            // `mlp.expert_bias`, and an UNGATED shared expert `mlp.shared_experts.*`.
+            const ex = hy3ExpertContainer(weights, name_buf, prefix, li);
+            var exbuf: [64]u8 = undefined;
+            lw.mlp = .{
+                .moe = .{
+                    .router_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.gate.weight"),
+                    .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.scales") orelse mlx.mlx_array_new(),
+                    .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.gate.biases") orelse mlx.mlx_array_new(),
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
+                    .shared_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.weight"),
+                    .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.gate_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.weight"),
+                    .shared_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.up_proj.biases") orelse mlx.mlx_array_new(),
+                    .shared_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.weight"),
+                    .shared_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.scales") orelse mlx.mlx_array_new(),
+                    .shared_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_experts.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .expert_bias = try getLayerWeight(weights, name_buf, prefix, li, "mlp.expert_bias"),
+                    .route_norm = false,
+                    .route_scale = 1.0,
+                    .shared_ungated = true,
+                },
+            };
+            {
+                const mw = &lw.mlp.moe;
+                try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
+                if (mw.router_s.ctx != null) return error.UnsupportedKolibriConfig; // router ships bf16
+                var router32 = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_astype(&router32, mw.router_w, .float32, s));
+                try owned_bf16.append(allocator, router32);
+                mw.router_w = router32;
+                try maybeTransposeForBf16(&mw.switch_gate_w, mw.switch_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_up_w, mw.switch_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.switch_down_w, mw.switch_down_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, &owned_bf16, allocator, s);
+                try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
+            }
         } else if (layer_is_moe and is_hy3) {
             // Hy3 (hy_v3): stacked experts (already [E, out, packed] in MLX
             // conversions — never per-expert), the QUANTIZED router under
@@ -34554,8 +35026,20 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, &owned_bf16, allocator, s);
                 try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, &owned_bf16, allocator, s);
                 if (mw.shared_expert_gate_w) |*seg_w_ptr| {
+                    try dequantizeSmall(seg_w_ptr, &mw.shared_expert_gate_s.?, &mw.shared_expert_gate_b.?, config.hidden_size, &owned_bf16, allocator, s);
                     try maybeTransposeForBf16(seg_w_ptr, mw.shared_expert_gate_s.?, &owned_bf16, allocator, s);
+                    if (mw.shared_expert_gate_s.?.ctx == null and mlx.mlx_array_size(seg_w_ptr.*) == config.hidden_size) {
+                        var flat = mlx.mlx_array_new();
+                        defer _ = mlx.mlx_array_free(flat);
+                        try mlx.check(mlx.mlx_reshape(&flat, seg_w_ptr.*, &[_]c_int{@intCast(config.hidden_size)}, 1, s));
+                        var vec = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_contiguous(&vec, flat, false, s));
+                        try owned_bf16.append(allocator, vec);
+                        mw.shared_gate_vec = vec;
+                    }
                 }
+                const Bk = moe_affine4.Bank;
+                mw.bank_views = try moe_affine4.bindViews(Bk{ .w = mw.switch_gate_w, .s = mw.switch_gate_s, .b = mw.switch_gate_b }, Bk{ .w = mw.switch_up_w, .s = mw.switch_up_s, .b = mw.switch_up_b }, Bk{ .w = mw.switch_down_w, .s = mw.switch_down_s, .b = mw.switch_down_b }, &owned_bf16, allocator, s);
             }
         } else {
             lw.mlp = .{ .dense = .{
@@ -34988,7 +35472,8 @@ const NemotronMoeParts = struct {
     }
 };
 
-fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, s: mlx.mlx_stream) !NemotronMoeParts {
+/// `stream_pad`: pad a short sorted window up to the expert-streaming kernel (`moeStreamPadRows`).
+fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, stream_pad: bool, s: mlx.mlx_stream) !NemotronMoeParts {
     const x_shape = mlx.getShape(x);
     const batch = x_shape[0];
     const seq = x_shape[1];
@@ -35019,6 +35504,31 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
         var flat_inds = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat_inds);
         try mlx.check(mlx.mlx_reshape(&flat_inds, routing.inds, &[_]c_int{total_inds}, 1, s));
+        const n_experts = mlx.getShape(nm.fc1_w)[0];
+        const pad = if (stream_pad) moeStreamPadRows(total_inds, n_experts) else 0;
+        if (pad > 0) {
+            // Pad rows sort to order index >= total_inds: the inv_order slice drops them,
+            // so the x row they read (clamped to the last token) is irrelevant.
+            var pad_i = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(pad_i);
+            try mlx.check(mlx.mlx_arange(&pad_i, 0, @floatFromInt(pad), 1, .int32, s));
+            const e_arr = mlx.mlx_array_new_int(n_experts);
+            defer _ = mlx.mlx_array_free(e_arr);
+            var pad_e = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(pad_e);
+            try mlx.check(mlx.mlx_remainder(&pad_e, pad_i, e_arr, s));
+            var pad_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(pad_t);
+            try mlx.check(mlx.mlx_astype(&pad_t, pad_e, mlx.mlx_array_dtype(flat_inds), s));
+            const pair = [_]mlx.mlx_array{ flat_inds, pad_t };
+            const vec = mlx.mlx_vector_array_new_data(&pair, 2);
+            defer _ = mlx.mlx_vector_array_free(vec);
+            var joined = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_concatenate_axis(&joined, vec, 0, s));
+            _ = mlx.mlx_array_free(flat_inds);
+            flat_inds = joined;
+        }
+        const rows_all: c_int = total_inds + pad;
         var order = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(order);
         try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, s));
@@ -35033,12 +35543,20 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
         var lhs_idx = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(lhs_idx);
         try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, s));
+        if (pad > 0) {
+            const last = mlx.mlx_array_new_int(t_count - 1);
+            defer _ = mlx.mlx_array_free(last);
+            var clamped = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_minimum(&clamped, lhs_idx, last, s));
+            _ = mlx.mlx_array_free(lhs_idx);
+            lhs_idx = clamped;
+        }
         var x_gathered = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_gathered);
         try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, s));
         var x_rep = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x_rep);
-        try mlx.check(mlx.mlx_reshape(&x_rep, x_gathered, &[_]c_int{ total_inds, 1, d_dim }, 3, s));
+        try mlx.check(mlx.mlx_reshape(&x_rep, x_gathered, &[_]c_int{ rows_all, 1, d_dim }, 3, s));
 
         const fc1_qp = quantParamsOrDense(cfg, nm.fc1_w, nm.fc1_s, @intCast(d_dim));
         var h_3d = mlx.mlx_array_new();
@@ -35052,6 +35570,12 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
         try gatherExpertMm(&y_3d, act, nm.fc2_w, nm.fc2_s, nm.fc2_b, no_idx, sorted_inds, fc2_qp.bits, fc2_qp.group_size, fc2_qp.mode, true, s);
         var y_unsorted = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_unsorted);
+        if (pad > 0) {
+            var head = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_slice(&head, inv_order, &[_]c_int{0}, 1, &[_]c_int{total_inds}, 1, &[_]c_int{1}, 1, s));
+            _ = mlx.mlx_array_free(inv_order);
+            inv_order = head;
+        }
         try mlx.check(mlx.mlx_take_axis(&y_unsorted, y_3d, inv_order, 0, s));
         try mlx.check(mlx.mlx_reshape(&y_tkh, y_unsorted, &[_]c_int{ t_count, k_count, d_dim }, 3, s));
     }
@@ -35064,7 +35588,7 @@ fn nemotronMoeExperts(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *con
 /// f32 routing weights applied before the K-sum, then the shared expert
 /// added. x [B, S, hidden] → [B, S, hidden]; caller owns.
 pub fn nemotronMoe(x: mlx.mlx_array, nm: *const NemotronMoeWeights, cfg: *const ModelConfig, s: mlx.mlx_stream) !mlx.mlx_array {
-    const parts = try nemotronMoeExperts(x, nm, cfg, s);
+    const parts = try nemotronMoeExperts(x, nm, cfg, moeStreamPadPays(nm), s);
     defer parts.deinit();
     return nemotronMoeCombine(x, &parts, nm, cfg, s);
 }
@@ -35127,6 +35651,19 @@ var nemotron_gqmv_engaged = false;
 /// spec-decode verify windows); wider windows take the sorted gather_qmm
 /// path, which streams each expert once. Test seam.
 pub var nemotron_gather_max_rows: c_int = 8;
+
+/// Rows to append so a sorted quantized gather reaches the expert-streaming kernel, which
+/// needs 4+ rows per expert (`B / E >= 4`, quantized.cpp); below it every row re-reads its
+/// expert. Below 2 rows per expert the re-reads stay cheaper than the pad.
+fn moeStreamPadRows(rows: c_int, experts: c_int) c_int {
+    return if (rows >= 2 * experts and rows < 4 * experts) 4 * experts - rows else 0;
+}
+
+/// The pad was measured only with the NAX sorted gather; dense banks run `mlx_gather_mm`
+/// unsorted, where it is pure extra work.
+fn moeStreamPadPays(nm: *const NemotronMoeWeights) bool {
+    return nm.fc1_s.ctx != null and verifyQmmNaxAvailable();
+}
 
 /// A short window of T tokens: every (token, expert) pair is one `gatherQmv`
 /// row (fc1 with ReLU^2 fused, then fc2), falling back to UNSORTED
@@ -36000,6 +36537,7 @@ pub fn groupLimitedRouting(
         .float32,
         n_group,
         topk_group,
+        null,
     )) |fused| return fused;
 
     // Router runs in fp32 (`router_dtype: "fp32"`).
@@ -36154,6 +36692,48 @@ fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: 
     return .{ .inds = inds, .norm_scores = norm_scores };
 }
 
+/// kolibri1 routing: the top-k is taken on `logits + expert_bias` (raw logits,
+/// not sigmoid scores), the weights are `sigmoid(logits)` of the picks with no
+/// renormalisation and no scale. Weights stay f32; the caller casts them.
+fn kolibriRoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: c_int, s: mlx.mlx_stream) !Transformer.MoeRouting {
+    var logits_f32 = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(logits_f32);
+    try mlx.check(mlx.mlx_astype(&logits_f32, router_logits, .float32, s));
+
+    var biased = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(biased);
+    try mlx.check(mlx.mlx_add(&biased, logits_f32, expert_bias, s));
+    var neg = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(neg);
+    try mlx.check(mlx.mlx_negative(&neg, biased, s));
+    var partitioned = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(partitioned);
+    try mlx.check(mlx.mlx_argpartition_axis(&partitioned, neg, k - 1, -1, s));
+
+    const p_shape = mlx.getShape(partitioned);
+    var inds = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(inds);
+    {
+        var start_arr: [4]c_int = undefined;
+        var stop_arr: [4]c_int = undefined;
+        var strides_arr: [4]c_int = undefined;
+        for (0..p_shape.len) |d| {
+            start_arr[d] = 0;
+            stop_arr[d] = if (d == p_shape.len - 1) k else p_shape[d];
+            strides_arr[d] = 1;
+        }
+        try mlx.check(mlx.mlx_slice(&inds, partitioned, &start_arr, p_shape.len, &stop_arr, p_shape.len, &strides_arr, p_shape.len, s));
+    }
+
+    var picked = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(picked);
+    try mlx.check(mlx.mlx_take_along_axis(&picked, logits_f32, inds, -1, s));
+    var norm_scores = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(norm_scores);
+    try mlx.check(mlx.mlx_sigmoid(&norm_scores, picked, s));
+    return .{ .inds = inds, .norm_scores = norm_scores };
+}
+
 // ── Fused MoE router (top-K selection + weight normalization in ONE kernel) ──
 //
 // The op chains above are ~11 dispatches each — sigmoid/softmax, bias add,
@@ -36190,7 +36770,11 @@ fn hy3RoutingChain(router_logits: mlx.mlx_array, expert_bias: mlx.mlx_array, k: 
 /// before selection. The composed chain is ~28 dispatches per MoE layer x 41 layers,
 /// and a dispatch prices at 1.76 us on this arch (MLX_SERVE_DISPATCH_PROBE
 /// slope over 1000 injected ops), so that chain alone is ~2 ms of a 19 ms token.
-const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2 };
+/// `softmax_gate` is `softmax` plus the shared-expert gate's logit, a dot of one x row with a flat
+/// weight vector that the simdgroups sitting out the selection compute while it runs (the matmul it
+/// replaces is two dependent launches ahead of the router). It needs at least two simdgroups.
+/// `logit_bias` (kolibri1) selects on `logits + bias` and weights by `sigmoid(logits)`.
+const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2, softmax_gate = 3, logit_bias = 4 };
 
 /// Largest expert count the kernel will stage in threadgroup memory. The
 /// sigmoid arm keeps two f32 planes (key + raw weight), so 2048 experts is
@@ -36198,8 +36782,10 @@ const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_groupe
 const ROUTER_MAX_EXPERTS: c_int = 2048;
 
 fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
-    const sigmoid = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped;
+    const logit_sel = mode == .logit_bias;
+    const sigmoid = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped or logit_sel;
     const grouped = mode == .sigmoid_bias_grouped;
+    const gate = mode == .softmax_gate;
     return std.fmt.comptimePrint(
         \\uint row = thread_position_in_grid.y;
         \\uint tid = thread_position_in_threadgroup.x;
@@ -36208,32 +36794,40 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
         \\threadgroup float rk[NE];
         \\{s}
         \\threadgroup uint sel[NK];
-        \\
+        \\{s}
         \\size_t rbase = (size_t)row * (size_t)NE;
         \\for (uint e = tid; e < NE; e += TG) {{
         \\{s}
         \\}}
         \\threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\
+        \\{s}
         \\// Selection runs on simdgroup 0 only: K rounds of "max, then mask".
         \\// simd_min over the candidate indices makes the tie-break the LOWEST
         \\// expert id, so the pick is a pure function of the keys.
         \\if (tid < 32) {{
         \\{s}
         \\{s}
+        \\  // The lane's strided slice of the keys lives in registers for the K rounds: a round is
+        \\  // a register max, two simd reductions and a register mask, no threadgroup traffic.
+        \\  constexpr uint EPL = (NE + 31) / 32;
+        \\  float mine[EPL];
+        \\  for (uint i = 0; i < EPL; ++i) {{
+        \\    uint e = lane + 32 * i;
+        \\    mine[i] = (e < NE) ? rk[e] : -INFINITY;
+        \\  }}
         \\  for (uint r = 0; r < NK; ++r) {{
         \\    float best = -INFINITY;
-        \\    uint bidx = 0xFFFFFFFFu;
-        \\    for (uint e = lane; e < NE; e += 32) {{
-        \\      float v = rk[e];
-        \\      if (v > best) {{ best = v; bidx = e; }}
+        \\    uint bslot = 0xFFFFFFFFu;
+        \\    for (uint i = 0; i < EPL; ++i) {{
+        \\      if (mine[i] > best) {{ best = mine[i]; bslot = i; }}
         \\    }}
         \\    float gmax = simd_max(best);
-        \\    uint cand = (best == gmax) ? bidx : 0xFFFFFFFFu;
+        \\    uint cand = (best == gmax) ? lane + 32 * bslot : 0xFFFFFFFFu;
         \\    uint gidx = metal::min(simd_min(cand), uint(NE - 1));
-        \\    if (lane == 0) {{ sel[r] = gidx; rk[gidx] = -INFINITY; }}
-        \\    simdgroup_barrier(mem_flags::mem_threadgroup);
+        \\    if (gidx % 32 == lane) mine[gidx / 32] = -INFINITY;
+        \\    if (lane == 0) sel[r] = gidx;
         \\  }}
+        \\  simdgroup_barrier(mem_flags::mem_threadgroup);
         \\
         \\  float w = 0.0f;
         \\  uint myidx = 0;
@@ -36253,11 +36847,16 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
         \\    scores[(size_t)row * (size_t)NK + lane] = TOUT(w);
         \\  }}
         \\}}
+        \\{s}
     , .{
         if (grouped)
             "threadgroup float rw[NE];\nthreadgroup float gs[NG];"
         else if (sigmoid)
             "threadgroup float rw[NE];"
+        else
+            "",
+        if (gate)
+            \\threadgroup float gp[TG / 32];
         else
             "",
         if (sigmoid)
@@ -36276,11 +36875,21 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             \\  float l = float(logits[rbase + e]);
             \\  float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(l)));
             \\  float sg = (l < 0.0f) ? sy : (1.0f - sy);
-            \\  rk[e] = sg + float(bias[e]);
-            \\  rw[e] = sg;
+            ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
         else
             \\  rk[e] = float(logits[rbase + e]);
         ,
+        if (gate)
+            // Simdgroups 1.. take the shared-expert gate's dot while simdgroup 0 selects; their partials
+            // meet after the selection, so the dot never waits on it nor the selection on the dot.
+            \\if (tid >= 32) {
+            \\  float ga = 0.0f;
+            \\  for (uint k = tid - 32; k < uint(GK); k += TG - 32) ga += float(gx[(size_t)row * (size_t)GK + k]) * float(gw[k]);
+            \\  ga = simd_sum(ga);
+            \\  if (lane == 0) gp[tid / 32] = ga;
+            \\}
+        else
+            "",
         if (grouped)
             // The group limit (`group_limited_topk` shape). One lane
             // per group scores it by the SUM OF ITS TOP TWO biased experts, then
@@ -36385,26 +36994,39 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             // before the divide, exactly as mlx_sum_axis + mlx_divide do.
             \\  w = w / float(TOUT(tot));
         ,
+        if (gate)
+            \\threadgroup_barrier(mem_flags::mem_threadgroup);
+            \\if (tid == 0) {
+            \\  float gt = 0.0f;
+            \\  for (uint g = 1; g < TG / 32; ++g) gt += gp[g];
+            \\  glogit[row] = TOUT(gt);
+            \\}
+        else
+            "",
     });
 }
 
-const ROUTER_SOURCES = [3][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped) };
-const ROUTER_NAMES = [3][*:0]const u8{ "mlxserve_moe_router_softmax", "mlxserve_moe_router_sigmoid", "mlxserve_moe_router_sigmoid_grouped" };
-var router_kernels: [3]?mlx.mlx_fast_metal_kernel = @splat(null);
+const ROUTER_SOURCES = [5][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped), moeRouterSource(.softmax_gate), moeRouterSource(.logit_bias) };
+const ROUTER_NAMES = [5][*:0]const u8{ "mlxserve_moe_router_softmax", "mlxserve_moe_router_sigmoid", "mlxserve_moe_router_sigmoid_grouped", "mlxserve_moe_router_softmax_gate", "mlxserve_moe_router_logit_bias" };
+var router_kernels: [5]?mlx.mlx_fast_metal_kernel = @splat(null);
 
 fn getMoeRouterKernel(mode: RouterMode) !mlx.mlx_fast_metal_kernel {
     const mi: usize = @backingInt(mode);
     if (router_kernels[mi]) |k| return k;
     const softmax_inputs = [_][*:0]const u8{"logits"};
+    const gate_inputs = [_][*:0]const u8{ "logits", "gx", "gw" };
     const sigmoid_inputs = [_][*:0]const u8{ "logits", "bias", "scale" };
     const input_names: []const [*:0]const u8 = switch (mode) {
         .softmax => &softmax_inputs,
-        .sigmoid_bias, .sigmoid_bias_grouped => &sigmoid_inputs,
+        .softmax_gate => &gate_inputs,
+        .sigmoid_bias, .sigmoid_bias_grouped, .logit_bias => &sigmoid_inputs,
     };
-    const output_names = [_][*:0]const u8{ "inds", "scores" };
+    const plain_outputs = [_][*:0]const u8{ "inds", "scores" };
+    const gate_outputs = [_][*:0]const u8{ "inds", "scores", "glogit" };
+    const output_names: []const [*:0]const u8 = if (mode == .softmax_gate) &gate_outputs else &plain_outputs;
     const in_vec = mlx.mlx_vector_string_new_data(input_names.ptr, input_names.len);
     defer _ = mlx.mlx_vector_string_free(in_vec);
-    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    const out_vec = mlx.mlx_vector_string_new_data(output_names.ptr, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const kernel = mlx.mlx_fast_metal_kernel_new(
         ROUTER_NAMES[mi],
@@ -36457,13 +37079,14 @@ const RouterCfgKey = struct {
     scale: f32,
     n_group: c_int = 0,
     topk_group: c_int = 0,
+    gate_k: c_int = 0,
 };
 const RouterCfgSlot = struct {
     cfg: mlx.mlx_fast_metal_kernel_config = .{ .ctx = null },
     key: RouterCfgKey = std.mem.zeroes(RouterCfgKey),
     scale_arr: mlx.mlx_array = .{ .ctx = null },
 };
-var router_cfg_cache: [3]RouterCfgSlot = .{ .{}, .{}, .{} };
+var router_cfg_cache: [5]RouterCfgSlot = .{ .{}, .{}, .{}, .{}, .{} };
 
 pub var moe_router_fused_override: ?bool = null;
 var moe_router_fused_env: ?bool = null;
@@ -36478,6 +37101,10 @@ fn moeRouterFusedEnabled() bool {
     return enabled;
 }
 
+/// The shared-expert gate's logit, folded into the softmax router: `x` [rows * gate_k] and the flat
+/// weight vector `w` [gate_k], one logit per row.
+pub const RouterGate = struct { x: mlx.mlx_array, w: mlx.mlx_array };
+
 /// One-kernel replacement for `moeRoutingChain` / `hy3RoutingChain`.
 /// Returns null when the geometry or dtype is outside the supported set, so
 /// every caller keeps its chain fallback.
@@ -36486,15 +37113,17 @@ fn moeRouterTopK(
     logits: mlx.mlx_array,
     bias: mlx.mlx_array,
     k: c_int,
-    mode: RouterMode,
+    mode_in: RouterMode,
     route_norm: bool,
     route_scale: f32,
     out_dtype: mlx.mlx_dtype,
     n_group: c_int,
     topk_group: c_int,
+    gate: ?RouterGate,
 ) !?Transformer.MoeRouting {
     if (!moeRouterFusedEnabled()) return null;
-    const sigmoid_mode = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped;
+    const mode: RouterMode = if (gate != null and mode_in == .softmax) .softmax_gate else mode_in;
+    const sigmoid_mode = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped or mode == .logit_bias;
     const lsh = mlx.getShape(logits);
     if (lsh.len < 1 or lsh.len > 4) return null;
     const num_experts = lsh[lsh.len - 1];
@@ -36516,8 +37145,21 @@ fn moeRouterTopK(
     var rows: c_int = 1;
     for (lsh[0 .. lsh.len - 1]) |d| rows *= d;
     if (rows < 1) return null;
+    // The gate logit: one flat weight vector, x holding one row of it per router row, in a threadgroup
+    // that has a simdgroup to spare for every 32 threads.
+    var gate_k: c_int = 0;
+    if (gate) |gt| {
+        const wn = mlx.mlx_array_size(gt.w);
+        if (wn == 0 or wn > 65536 or mlx.mlx_array_size(gt.x) != @as(usize, @intCast(rows)) * wn) return null;
+        const xd = mlx.mlx_array_dtype(gt.x);
+        const wd = mlx.mlx_array_dtype(gt.w);
+        if ((xd != .bfloat16 and xd != .float16) or (wd != .bfloat16 and wd != .float16)) return null;
+        gate_k = @intCast(wn);
+    }
 
     const tg = moeRouterThreadGroup(num_experts);
+    // The gate's dot runs on the simdgroups that sit out the selection: with one there is none to run it.
+    if (mode == .softmax_gate and tg < 64) return moeRouterTopK(s, logits, bias, k, .softmax, route_norm, route_scale, out_dtype, n_group, topk_group, null);
 
     // The whole point of the kernel is to spend ONE dispatch where the chain
     // spent a dozen; rebuilding the config every call would just move that cost
@@ -36532,6 +37174,7 @@ fn moeRouterTopK(
         .scale = route_scale,
         .n_group = n_group,
         .topk_group = topk_group,
+        .gate_k = gate_k,
     };
     const slot = &router_cfg_cache[@backingInt(mode)];
     if (slot.cfg.ctx == null or !std.meta.eql(slot.key, key)) {
@@ -36544,6 +37187,11 @@ fn moeRouterTopK(
         out_shape[lsh.len - 1] = k;
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, lsh.len, .uint32));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &out_shape, lsh.len, out_dtype));
+        if (mode == .softmax_gate) {
+            // One logit per router row.
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(config, &[_]c_int{rows}, 1, out_dtype));
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(config, "GK", gate_k));
+        }
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(config, tg, rows, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(config, tg, 1, 1));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(config, "TOUT", out_dtype));
@@ -36561,10 +37209,12 @@ fn moeRouterTopK(
     const config = slot.cfg;
 
     const softmax_inputs = [_]mlx.mlx_array{logits};
+    const gate_inputs = [_]mlx.mlx_array{ logits, if (gate) |gt| gt.x else logits, if (gate) |gt| gt.w else logits };
     const sigmoid_inputs = [_]mlx.mlx_array{ logits, bias, slot.scale_arr };
     const inputs_arr: []const mlx.mlx_array = switch (mode) {
         .softmax => &softmax_inputs,
-        .sigmoid_bias, .sigmoid_bias_grouped => &sigmoid_inputs,
+        .softmax_gate => &gate_inputs,
+        .sigmoid_bias, .sigmoid_bias_grouped, .logit_bias => &sigmoid_inputs,
     };
     const inputs_vec = mlx.mlx_vector_array_new_data(inputs_arr.ptr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -36573,7 +37223,7 @@ fn moeRouterTopK(
     var outputs_vec = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != 2) return error.MetalKernelBadOutputCount;
+    if (mlx.mlx_vector_array_size(outputs_vec) != (if (mode == .softmax_gate) @as(usize, 3) else 2)) return error.MetalKernelBadOutputCount;
 
     var inds = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(inds);
@@ -36581,12 +37231,17 @@ fn moeRouterTopK(
     var scores = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(scores);
     try mlx.check(mlx.mlx_vector_array_get(&scores, outputs_vec, 1));
+    var gate_logit = mlx.mlx_array{ .ctx = null };
+    if (mode == .softmax_gate) {
+        gate_logit = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&gate_logit, outputs_vec, 2));
+    }
 
     if (!moe_router_engaged) {
         moe_router_engaged = true;
         log.info("[moe] fused router kernel engaged: mode={s} E={d} K={d} tg={d}\n", .{ @tagName(mode), num_experts, k, tg });
     }
-    return .{ .inds = inds, .norm_scores = scores };
+    return .{ .inds = inds, .norm_scores = scores, .gate_logit = gate_logit };
 }
 
 // ── Decode sub-block profiler (MLX_SERVE_DECODE_PROFILE=1) ──
@@ -40637,265 +41292,11 @@ fn getGatherQmvGateUpKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-// ── qwen4_exp fused hyper-connection READ at decode width ──
-// Copyright (c) 2026 David Dalcu. Original kernels (mlxserve_hc_read_n/d/u),
-// written for mlx-serve; MIT licensed like the rest of the project — keep
-// this notice when copying.
-// hcRead at B*S == 1 is ~11 dispatches over 10240-wide tensors (group RMS
-// norm, weight multiply, down qmv, silu, up qmv, sigmoid-mix + mean, inject
-// matvec, 2·sigmoid), ×2 per layer. Three kernels: N = stats + normalized
-// stream `xn` + inject gates (one threadgroup), D = down matvec + silu (one
-// simdgroup per output row, gateup-shaped), U = up matvec + sigmoid-mix (one
-// threadgroup per hidden column, one simdgroup per stream). Rounding sites
-// mirror the chain (norm → T, ×w → T, matvec → T); only accumulation order
-// differs, so the bar is per-element parity. A first cut kept `xn` in 20 KB
-// of threadgroup memory inside the down kernel and cost 146 us per call
-// in-situ — the device-memory `xn` is load-bearing.
-const HC_FUSED_N_SOURCE =
-    \\uint tid = thread_index_in_threadgroup;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint h = threadgroup_position_in_grid.x;
-    \\uint row = threadgroup_position_in_grid.y;
-    \\threadgroup float tgs[8];
-    \\threadgroup float tgi[8 * HC];
-    \\const int base = int(h) * H;
-    \\const int PER = H / 256;
-    \\// Rows (batch*seq) are independent: every per-row buffer is offset here once.
-    \\const device T* x = x_in + (size_t)row * (size_t)(HC * H);
-    \\device T* xn = xn_out + (size_t)row * (size_t)(HC * H);
-    \\device T* xs = xs_out + (WR ? (size_t)row * (size_t)(HC * H) : 0);
-    \\device float* ipart = ipart_out + (size_t)row * (size_t)(HC * HC);
-    \\const device T* wo = wo_in + (size_t)row * (size_t)H;
-    \\float xv[PER];
-    \\if (WR) {
-    \\  // Pending hcWrite: stream' = T(stream + T(out * inj)), the chain's two roundings.
-    \\  // (`wi_in` can be < 8 elements and land in `constant`: no pointer rebind.)
-    \\  float g = float(wi_in[(size_t)row * (size_t)HC + h]);
-    \\  for (int i = 0; i < PER; ++i) {
-    \\    int k = base + int(tid) + 256 * i;
-    \\    T v = T(float(x[k]) + float(T(float(wo[k - base]) * g)));
-    \\    xs[k] = v;
-    \\    xv[i] = float(v);
-    \\  }
-    \\} else {
-    \\  for (int i = 0; i < PER; ++i) xv[i] = float(x[base + int(tid) + 256 * i]);
-    \\}
-    \\float a = 0.0f;
-    \\for (int i = 0; i < PER; ++i) a += xv[i] * xv[i];
-    \\a = simd_sum(a);
-    \\if (lane == 0) tgs[sg] = a;
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\float t = 0.0f;
-    \\for (int g = 0; g < 8; ++g) t += tgs[g];
-    \\float rsh = rsqrt(t / float(H) + eps[0]);
-    \\float ip[HC];
-    \\for (int c = 0; c < HC; ++c) ip[c] = 0.0f;
-    \\for (int i = 0; i < PER; ++i) {
-    \\  int k = base + int(tid) + 256 * i;
-    \\  T v = T(float(T(xv[i] * rsh)) * float(nw[k]));
-    \\  xn[k] = v;
-    \\  if (INJ) { for (int c = 0; c < HC; ++c) ip[c] += float(v) * float(iw[(size_t)k * (size_t)HC + (size_t)c]); }
-    \\}
-    \\if (INJ) {
-    \\  for (int c = 0; c < HC; ++c) { float pa = simd_sum(ip[c]); if (lane == 0) tgi[sg * HC + c] = pa; }
-    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\  if (tid < uint(HC)) {
-    \\    float tt = 0.0f;
-    \\    for (int g = 0; g < 8; ++g) tt += tgi[g * HC + tid];
-    \\    ipart[h * HC + tid] = tt;
-    \\  }
-    \\}
-;
-
-// One threadgroup per output row, its 8 simdgroups split K; inject rows
-// (n >= R) just reduce N's partials.
-const HC_FUSED_D_SOURCE =
-    \\uint tid = thread_index_in_threadgroup;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint n = threadgroup_position_in_grid.y;
-    \\uint row = threadgroup_position_in_grid.z;
-    \\threadgroup float part[8];
-    \\const int K = HC * H;
-    \\const device T* xn = xn_in + (size_t)row * (size_t)K;
-    \\const device float* ipart = ipart_in + (size_t)row * (size_t)(HC * HC);
-    \\device T* act = act_out + (size_t)row * (size_t)R;
-    \\device T* inj = inj_out + (size_t)row * (size_t)HC;
-    \\const int VPW = 32 / BITS;
-    \\const int K_by_p = K / VPW;
-    \\const int K_by_gs = K / GS;
-    \\const int SLICE = K_by_p / 8;
-    \\const int ITERS = SLICE / 32;
-    \\uint mask = (1u << BITS) - 1u;
-    \\if (n < uint(R)) {
-    \\  size_t wbase = (size_t)n * (size_t)K_by_p;
-    \\  size_t gbase = (size_t)n * (size_t)K_by_gs;
-    \\  int p0 = int(sg) * SLICE + int(lane);
-    \\  uint32_t pw[ITERS];
-    \\  for (int i = 0; i < ITERS; ++i) pw[i] = dw_q[wbase + (size_t)(p0 + 32 * i)];
-    \\  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    \\  for (int i = 0; i < ITERS; ++i) {
-    \\    int k_base = (p0 + 32 * i) * VPW;
-    \\    int gi = k_base / GS;
-    \\    float sj = float(dw_s[gbase + (size_t)gi]);
-    \\    float bj = float(dw_b[gbase + (size_t)gi]);
-    \\    for (int ki = 0; ki < VPW; ki += 4) {
-    \\      int k = k_base + ki;
-    \\      uint32_t q = pw[i] >> (ki * BITS);
-    \\      a0 += float(xn[k + 0]) * (float((q >> (0 * BITS)) & mask) * sj + bj);
-    \\      a1 += float(xn[k + 1]) * (float((q >> (1 * BITS)) & mask) * sj + bj);
-    \\      a2 += float(xn[k + 2]) * (float((q >> (2 * BITS)) & mask) * sj + bj);
-    \\      a3 += float(xn[k + 3]) * (float((q >> (3 * BITS)) & mask) * sj + bj);
-    \\    }
-    \\  }
-    \\  float acc = simd_sum((a0 + a1) + (a2 + a3));
-    \\  if (lane == 0) part[sg] = acc;
-    \\  threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\  if (tid == 0) {
-    \\    float t = 0.0f;
-    \\    for (int g = 0; g < 8; ++g) t += part[g];
-    \\    T v = T(t);
-    \\    T sig = T(1.0f / (1.0f + metal::exp(-float(v))));
-    \\    act[n] = v * sig;
-    \\  }
-    \\} else if (tid == 0) {
-    \\  int c = int(n) - R;
-    \\  float t = 0.0f;
-    \\  for (int hh = 0; hh < HC; ++hh) t += ipart[hh * HC + c];
-    \\  T v = T(t);
-    \\  T sig = T(1.0f / (1.0f + metal::exp(-float(v))));
-    \\  inj[c] = sig * T(2.0f);
-    \\}
-;
-
-// One simdgroup per hidden column j, the HC streams unrolled.
-const HC_FUSED_U_SOURCE =
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint j = thread_position_in_grid.y;
-    \\uint row = thread_position_in_grid.z;
-    \\const device T* xn = xn_in + (size_t)row * (size_t)(HC * H);
-    \\const device T* act = act_in + (size_t)row * (size_t)R;
-    \\device T* mixed = mixed_out + (size_t)row * (size_t)H;
-    \\const int VPW = 32 / BITS;
-    \\const int R_by_p = R / VPW;
-    \\const int R_by_gs = R / GS;
-    \\const int RIT = (R_by_p + 31) / 32;
-    \\uint mask = (1u << BITS) - 1u;
-    \\float sum = 0.0f;
-    \\for (int h = 0; h < HC; ++h) {
-    \\  size_t row = (size_t)h * (size_t)H + (size_t)j;
-    \\  size_t wbase = row * (size_t)R_by_p;
-    \\  size_t gbase = row * (size_t)R_by_gs;
-    \\  float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-    \\  for (int i = 0; i < RIT; ++i) {
-    \\    int pack = int(lane) + 32 * i;
-    \\    if (pack < R_by_p) {
-    \\      uint32_t pw = uw_q[wbase + (size_t)pack];
-    \\      int k_base = pack * VPW;
-    \\      int gi = k_base / GS;
-    \\      float sj = float(uw_s[gbase + (size_t)gi]);
-    \\      float bj = float(uw_b[gbase + (size_t)gi]);
-    \\      for (int ki = 0; ki < VPW; ki += 4) {
-    \\        int k = k_base + ki;
-    \\        uint32_t q = pw >> (ki * BITS);
-    \\        a0 += float(act[k + 0]) * (float((q >> (0 * BITS)) & mask) * sj + bj);
-    \\        a1 += float(act[k + 1]) * (float((q >> (1 * BITS)) & mask) * sj + bj);
-    \\        a2 += float(act[k + 2]) * (float((q >> (2 * BITS)) & mask) * sj + bj);
-    \\        a3 += float(act[k + 3]) * (float((q >> (3 * BITS)) & mask) * sj + bj);
-    \\      }
-    \\    }
-    \\  }
-    \\  float acc = simd_sum((a0 + a1) + (a2 + a3));
-    \\  T u = T(acc);
-    \\  T sg = T(1.0f / (1.0f + metal::exp(-float(u))));
-    \\  sum += float(T(float(sg) * float(xn[row])));
-    \\}
-    \\if (lane == 0) mixed[j] = T(float(T(sum)) * float(T(1.0f / float(HC))));
-;
-
-// Up/mix kernel for 2..8 rows (HC 4, 8-bit): lanes over weight rows ([part:2][h:2][col:1]), 16-byte weight loads
-// issued before any math, act in threadgroup memory, lane-shuffle reductions. Same rounding sites as
-// HC_FUSED_U_SOURCE but a different f32 summation order, so rare elements differ by a few bf16 ulps.
-const HC_FUSED_UV_SOURCE =
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint tid = thread_index_in_threadgroup;
-    \\uint sgi = simdgroup_index_in_threadgroup;
-    \\uint part = lane & 3u;
-    \\uint h = (lane >> 2) & 3u;
-    \\uint cl = lane >> 4;
-    \\uint j = threadgroup_position_in_grid.x * 16u + sgi * 2u + cl;
-    \\const int VPW = 32 / BITS;
-    \\const int R_by_p = R / VPW;
-    \\const int R_by_gs = R / GS;
-    \\const int PV = R / 4;
-    \\const int PU4 = PV / (4 * VPW);
-    \\threadgroup float act_tg[ROWS * R];
-    \\size_t wrow = (size_t)h * (size_t)H + (size_t)j;
-    \\const device uint4* wq4 = (const device uint4*)(uw_q + wrow * (size_t)R_by_p) + part * PU4;
-    \\float xnv[ROWS];
-    \\for (int r = 0; r < ROWS; ++r) xnv[r] = float(xn_in[(size_t)r * (size_t)(HC * H) + wrow]);
-    \\uint4 wv[PU4];
-    \\for (int i = 0; i < PU4; ++i) wv[i] = wq4[i];
-    \\float sc[PU4], bi[PU4];
-    \\for (int i = 0; i < PU4; ++i) {
-    \\  int k0 = int(part) * PV + i * 4 * VPW;
-    \\  sc[i] = float(uw_s[wrow * (size_t)R_by_gs + (size_t)(k0 / GS)]);
-    \\  bi[i] = float(uw_b[wrow * (size_t)R_by_gs + (size_t)(k0 / GS)]);
-    \\}
-    \\for (uint e = tid; e < uint(ROWS * R); e += 256) act_tg[e] = float(act_in[e]);
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\float acc[ROWS];
-    \\for (int r = 0; r < ROWS; ++r) acc[r] = 0.0f;
-    \\for (int i = 0; i < PU4; ++i) {
-    \\  int k0 = int(part) * PV + i * 4 * VPW;
-    \\  uint words[4] = {wv[i].x, wv[i].y, wv[i].z, wv[i].w};
-    \\  for (int wd = 0; wd < 4; ++wd) {
-    \\    for (int b = 0; b < VPW; ++b) {
-    \\      float wf = float((words[wd] >> (b * BITS)) & ((1u << BITS) - 1u)) * sc[i] + bi[i];
-    \\      int k = k0 + wd * VPW + b;
-    \\      for (int r = 0; r < ROWS; ++r) acc[r] += act_tg[r * R + k] * wf;
-    \\    }
-    \\  }
-    \\}
-    \\float mix[ROWS];
-    \\for (int r = 0; r < ROWS; ++r) {
-    \\  float a = acc[r];
-    \\  a += simd_shuffle_xor(a, 1);
-    \\  a += simd_shuffle_xor(a, 2);
-    \\  T u = T(a);
-    \\  T sgv = T(1.0f / (1.0f + metal::exp(-float(u))));
-    \\  float m = float(T(float(sgv) * xnv[r]));
-    \\  m += simd_shuffle_xor(m, 4);
-    \\  m += simd_shuffle_xor(m, 8);
-    \\  mix[r] = m;
-    \\}
-    \\if ((lane & 15u) == 0) {
-    \\  for (int r = 0; r < ROWS; ++r) mixed_out[(size_t)r * (size_t)H + (size_t)j] = T(float(T(mix[r])) * float(T(1.0f / float(HC))));
-    \\}
-;
-
-/// MLX_SERVE_HC_UV=0 restores the per-row up/mix kernel (HC_FUSED_U_SOURCE, value-identical to before).
-var hc_uv_env: ?bool = null;
-fn hcUvEligible(hc: c_int, r: c_int, bits: u32, group_size: u32, rows: c_int, uw: mlx.mlx_array) bool {
-    if (hc_uv_env == null) hc_uv_env = if (std.c.getenv("MLX_SERVE_HC_UV")) |v| v[0] != '0' else true;
-    if (!hc_uv_env.? or hc != 4 or bits != 8 or rows < 2 or rows > 8) return false;
-    // act_tg holds ROWS * R floats of threadgroup memory; past R = 512 a decline beats a failed forward.
-    if (@rem(r, 64) != 0 or r > 512 or group_size % 16 != 0) return false;
-    // The uint4 loads need a 16-byte-aligned buffer; an unevaluated weight has none yet (its data pointer is null).
-    var avail = false;
-    if (mlx._mlx_array_is_available(&avail, uw) != 0 or !avail) return false;
-    const p = mlx.mlx_array_data_uint32(uw) orelse return false;
-    return @intFromPtr(p) % 16 == 0;
-}
-
-const HcFusedKey = struct { hc: c_int, h: c_int, r: c_int, inj: c_int, wr: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, rows: c_int, uv: bool };
-var hc_fused_kernels: [4]?mlx.mlx_fast_metal_kernel = .{ null, null, null, null };
-var hc_fused_cfgs: [3]?mlx.mlx_fast_metal_kernel_config = .{ null, null, null };
-var hc_fused_key: HcFusedKey = std.mem.zeroes(HcFusedKey);
+// ── qwen4_exp fused hyper-connection READ at decode and verify width ──
+// The read is two launches (down, then up/mix) in hc_decode2.zig for 1..HC_FUSED_MAX_ROWS rows; anything outside its
+// geometry keeps the unfused chain.
 var hc_fused_eps: ?mlx.mlx_array = null;
 var hc_fused_eps_val: f32 = 0;
-var hc_fused_engaged = false;
 var hc_fused_env: ?bool = null;
 pub var hc_fused_override: ?bool = null;
 
@@ -40906,52 +41307,6 @@ fn hcFusedEnabled() bool {
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     hc_fused_env = enabled;
     return enabled;
-}
-
-fn getHcFusedKernel(which: usize) !mlx.mlx_fast_metal_kernel {
-    if (hc_fused_kernels[which]) |k| return k;
-    const n_inputs = [_][*:0]const u8{ "x_in", "nw", "iw", "eps", "wo_in", "wi_in" };
-    const n_outputs = [_][*:0]const u8{ "xn_out", "ipart_out", "xs_out" };
-    const d_inputs = [_][*:0]const u8{ "xn_in", "dw_q", "dw_s", "dw_b", "ipart_in" };
-    const d_outputs = [_][*:0]const u8{ "act_out", "inj_out" };
-    const u_inputs = [_][*:0]const u8{ "xn_in", "act_in", "uw_q", "uw_s", "uw_b" };
-    const u_outputs = [_][*:0]const u8{"mixed_out"};
-    const inputs: []const [*:0]const u8 = switch (which) {
-        0 => &n_inputs,
-        1 => &d_inputs,
-        else => &u_inputs,
-    };
-    const outputs: []const [*:0]const u8 = switch (which) {
-        0 => &n_outputs,
-        1 => &d_outputs,
-        else => &u_outputs,
-    };
-    const in_vec = mlx.mlx_vector_string_new_data(inputs.ptr, inputs.len);
-    defer _ = mlx.mlx_vector_string_free(in_vec);
-    const out_vec = mlx.mlx_vector_string_new_data(outputs.ptr, outputs.len);
-    defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kernel = mlx.mlx_fast_metal_kernel_new(
-        switch (which) {
-            0 => "mlxserve_hc_read_n",
-            1 => "mlxserve_hc_read_d",
-            2 => "mlxserve_hc_read_u",
-            else => "mlxserve_hc_read_u_v",
-        },
-        in_vec,
-        out_vec,
-        switch (which) {
-            0 => HC_FUSED_N_SOURCE,
-            1 => HC_FUSED_D_SOURCE,
-            2 => HC_FUSED_U_SOURCE,
-            else => HC_FUSED_UV_SOURCE,
-        },
-        "",
-        true,
-        false,
-    );
-    if (kernel.ctx == null) return error.MetalKernelCompileFailed;
-    hc_fused_kernels[which] = kernel;
-    return kernel;
 }
 
 pub const HcFusedOut = struct { mixed: mlx.mlx_array, inj: mlx.mlx_array, stream: mlx.mlx_array };
@@ -40977,100 +41332,7 @@ pub const HcPending = struct {
 /// `inj [B,S,hc,1]`, or null when the geometry/quant is outside the kernel
 /// (caller keeps the chain).
 pub const HC_FUSED_MAX_ROWS: c_int = 16;
-const HcPrepared = struct {
-    // Mutable tensors stay explicit inputs so the cached graph can outlive a model.
-    const Key = struct { width: c_int, eps: f32, pending: bool };
-    key: Key = .{ .width = 0, .eps = 0, .pending = false },
-    stream: mlx.mlx_stream = .{},
-    closure: mlx.mlx_closure = .{},
-    traces: usize = 0,
-    stamp: u64 = 0,
-
-    fn callback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
-        const self: *HcPrepared = @ptrCast(@alignCast(payload.?));
-        self.traces += 1;
-        var arrays: [11]mlx.mlx_array = @splat(.{});
-        defer for (arrays) |v| {
-            if (v.ctx != null) _ = mlx.mlx_array_free(v);
-        };
-        const n: usize = if (self.key.pending) 11 else 9;
-        for (arrays[0..n], 0..) |*v, i| {
-            v.* = mlx.mlx_array_new();
-            if (mlx.mlx_vector_array_get(v, input, i) != 0) return -1;
-        }
-        const pd: ?HcPending = if (self.key.pending) .{ .out = arrays[9], .inj = arrays[10] } else null;
-        const result = (hcReadFused(self.stream, arrays[0], 1, self.key.width, arrays[1], arrays[2], arrays[3], arrays[4], arrays[5], arrays[6], arrays[7], arrays[8], self.key.eps, 4, 2560, 8, 64, pd) catch return -1) orelse return -1;
-        defer {
-            _ = mlx.mlx_array_free(result.mixed);
-            _ = mlx.mlx_array_free(result.inj);
-            if (result.stream.ctx != null) _ = mlx.mlx_array_free(result.stream);
-        }
-        const outputs = [_]mlx.mlx_array{ result.mixed, result.inj, result.stream };
-        res.* = mlx.mlx_vector_array_new_data(&outputs, if (self.key.pending) 3 else 2);
-        return 0;
-    }
-};
-var hc_prepared_entries: [8]HcPrepared = @splat(.{});
-var hc_prepared_clock: u64 = 0;
-
-fn hcReadPrepared(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending) !?HcFusedOut {
-    return hcReadPreparedWidth(s, x, w, width, eps, pending, 6);
-}
-
-fn hcReadPreparedWidth(s: mlx.mlx_stream, x: mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?HcPending, max_width: c_int) !?HcFusedOut {
-    if (!hcFusedEnabled() or !mlx.streamIsGpu(s) or !verifySharedHardware() or width < 2 or width > max_width) return null;
-    if (x.ctx == null or mlx.mlx_array_dtype(x) != .bfloat16 or !std.mem.eql(c_int, mlx.getShape(x), &.{ 1, width, 10240 })) return null;
-    const arrays = [_]mlx.mlx_array{ x, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, if (pending) |pd| pd.out else x, if (pending) |pd| pd.inj else x };
-    const shapes = .{ &[_]c_int{ 4, 2560 }, &[_]c_int{ 320, 2560 }, &[_]c_int{ 320, 160 }, &[_]c_int{ 320, 160 }, &[_]c_int{ 10240, 80 }, &[_]c_int{ 10240, 5 }, &[_]c_int{ 10240, 5 }, &[_]c_int{ 10240, 4 } };
-    inline for (shapes, 1..) |shape, i| {
-        if (arrays[i].ctx == null or !std.mem.eql(c_int, mlx.getShape(arrays[i]), shape)) return null;
-        if (mlx.mlx_array_dtype(arrays[i]) != (if (i == 2 or i == 5) mlx.mlx_dtype.uint32 else .bfloat16)) return null;
-    }
-    if (pending) |pd| {
-        if (pd.out.ctx == null or pd.inj.ctx == null or mlx.mlx_array_dtype(pd.out) != .bfloat16 or mlx.mlx_array_dtype(pd.inj) != .bfloat16 or
-            !std.mem.eql(c_int, mlx.getShape(pd.out), &.{ 1, width, 2560 }) or !std.mem.eql(c_int, mlx.getShape(pd.inj), &.{ 1, width, 4, 1 })) return null;
-    }
-    const key = HcPrepared.Key{ .width = width, .eps = eps, .pending = pending != null };
-    var chosen: ?*HcPrepared = null;
-    var victim = &hc_prepared_entries[0];
-    for (&hc_prepared_entries) |*entry| {
-        if (entry.closure.ctx != null and std.meta.eql(entry.key, key) and mlx.mlx_stream_equal(entry.stream, s)) {
-            chosen = entry;
-            break;
-        }
-        if (entry.stamp < victim.stamp) victim = entry;
-    }
-    const entry = chosen orelse blk: {
-        if (victim.closure.ctx != null) _ = mlx.mlx_closure_free(victim.closure);
-        if (victim.stream.ctx != null) _ = mlx.mlx_stream_free(victim.stream);
-        victim.* = .{ .key = key };
-        try mlx.check(mlx.mlx_stream_set(&victim.stream, s));
-        const raw = mlx.mlx_closure_new_func_payload(&HcPrepared.callback, victim, null);
-        defer _ = mlx.mlx_closure_free(raw);
-        try mlx.check(mlx.mlx_compile(&victim.closure, raw, false));
-        break :blk victim;
-    };
-    hc_prepared_clock +%= 1;
-    entry.stamp = hc_prepared_clock;
-    const input = mlx.mlx_vector_array_new_data(&arrays, if (pending != null) 11 else 9);
-    defer _ = mlx.mlx_vector_array_free(input);
-    var output = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(output);
-    try mlx.check(mlx.mlx_closure_apply(&output, entry.closure, input));
-    var result: HcFusedOut = .{ .mixed = .{}, .inj = .{}, .stream = .{} };
-    errdefer inline for (.{ "mixed", "inj", "stream" }) |name| {
-        if (@field(result, name).ctx != null) _ = mlx.mlx_array_free(@field(result, name));
-    };
-    inline for (.{ "mixed", "inj", "stream" }, 0..) |name, i| {
-        if (i < 2 or pending != null) {
-            @field(result, name) = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(&@field(result, name), output, i));
-        }
-    }
-    return result;
-}
-
-fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, pending: ?[]const HcPending) !?[]HcFusedOut {
+fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx_array, w: HcWeights, width: c_int, eps: f32, bits: u32, gs: u32, pending: ?[]const HcPending) !?[]HcFusedOut {
     if (!mlx.streamIsGpu(s) or !verifySharedHardware() or inputs.len < 2 or inputs.len > 8 or width < 2) return null;
     const total = @as(c_int, @intCast(inputs.len)) * width;
     if (total > HC_FUSED_MAX_ROWS or w.inject_flat.ctx == null) return null;
@@ -41112,7 +41374,7 @@ fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx
         errdefer _ = mlx.mlx_array_free(out);
         joined_pending = .{ .out = out, .inj = try Join.array(s, injs[0..values.len]) };
     }
-    const full = (try hcReadPreparedWidth(s, joined, w, total, eps, joined_pending, HC_FUSED_MAX_ROWS)) orelse return null;
+    const full = (try hcReadFused(s, joined, 1, total, w.norm_w, w.down_w, w.down_s, w.down_b, w.up_w, w.up_s, w.up_b, w.inject_flat, eps, 4, 2560, bits, gs, joined_pending)) orelse return null;
     defer inline for (.{ "mixed", "inj", "stream" }) |name| {
         if (@field(full, name).ctx != null) _ = mlx.mlx_array_free(@field(full, name));
     };
@@ -41140,6 +41402,18 @@ fn hcReadJoined(a: std.mem.Allocator, s: mlx.mlx_stream, inputs: []const mlx.mlx
     return result;
 }
 
+/// The epsilon operand the hc kernels bind, cached per value.
+fn hcEpsArray(eps: f32) !mlx.mlx_array {
+    if (hc_fused_eps == null or hc_fused_eps_val != eps) {
+        if (hc_fused_eps) |e| _ = mlx.mlx_array_free(e);
+        const esh = [_]c_int{1};
+        var ev = eps;
+        hc_fused_eps = mlx.mlx_array_new_data(&ev, &esh, 1, .float32);
+        hc_fused_eps_val = eps;
+    }
+    return hc_fused_eps.?;
+}
+
 pub fn hcReadFused(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
@@ -41162,10 +41436,9 @@ pub fn hcReadFused(
 ) !?HcFusedOut {
     if (!hcFusedEnabled()) return null;
     if (!mlx.streamIsGpu(s)) return null;
-    if (bits != 2 and bits != 4 and bits != 8) return null;
+    const vpw = hc_decode2.packValues(bits) orelse return null;
     const rows = batch * seq;
     if (rows < 1 or rows > HC_FUSED_MAX_ROWS) return null;
-    const vpw: c_int = @intCast(32 / bits);
     if (@rem(@as(c_int, @intCast(group_size)), vpw) != 0) return null;
     if (ds.ctx == null or db.ctx == null or us.ctx == null or ub.ctx == null) return null;
     const xd = mlx.mlx_array_dtype(x);
@@ -41178,14 +41451,14 @@ pub fn hcReadFused(
     const ush = mlx.getShape(uw);
     if (dsh.len != 2 or ush.len != 2) return null;
     const R: c_int = dsh[0];
-    if (dsh[1] * vpw != K) return null;
-    if (ush[0] != K or ush[1] * vpw != R) return null;
+    const bi: c_int = @intCast(bits);
+    if (dsh[1] * 32 != K * bi) return null;
+    if (ush[0] != K or ush[1] * 32 != R * bi) return null;
     const gsi: c_int = @intCast(group_size);
     if (@rem(K, gsi) != 0 or @rem(R, gsi) != 0) return null;
-    // N: 256 threads per stream; D: 8 simdgroups × 32 lanes split each row's words.
-    if (@rem(hidden, 256) != 0 or @rem(dsh[1], 256) != 0 or @rem(R, vpw) != 0) return null;
+    // N: 256 threads per stream; D: 8 simdgroups × 32 lanes split each row's packs.
+    if (@rem(hidden, 256) != 0 or @rem(@divTrunc(K, vpw), 256) != 0 or @rem(R, vpw) != 0) return null;
     const inj: c_int = @intFromBool(iw.ctx != null);
-    const wr: c_int = @intFromBool(pend != null);
     if (pend) |pd| {
         if (mlx.mlx_array_dtype(pd.out) != xd or mlx.mlx_array_dtype(pd.inj) != xd) return null;
         if (mlx.mlx_array_size(pd.out) != @as(usize, @intCast(rows * hidden)) or mlx.mlx_array_size(pd.inj) != @as(usize, @intCast(rows * hc))) return null;
@@ -41196,140 +41469,29 @@ pub fn hcReadFused(
         if (ish.len != 2 or ish[0] != K or ish[1] != hc) return null;
     }
 
-    const uv = xd == .bfloat16 and hcUvEligible(hc, R, bits, group_size, rows, uw);
-    const key = HcFusedKey{ .hc = hc, .h = hidden, .r = R, .inj = inj, .wr = wr, .bits = bits, .gs = group_size, .dtype = xd, .rows = rows, .uv = uv };
-    if (hc_fused_cfgs[0] == null or !std.meta.eql(hc_fused_key, key)) {
-        for (&hc_fused_cfgs) |*c| if (c.*) |cfg| {
-            _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-            c.* = null;
-        };
-        const cn = mlx.mlx_fast_metal_kernel_config_new();
-        const k_shape = [_]c_int{rows * K};
-        const hc_shape = [_]c_int{rows * hc};
-        const hchc_shape = [_]c_int{rows * hc * hc};
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cn, &k_shape, 1, xd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cn, &hchc_shape, 1, .float32));
-        const xs_shape = [_]c_int{if (wr == 1) rows * K else 1};
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cn, &xs_shape, 1, xd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cn, 256 * hc, rows, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cn, 256, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cn, "T", xd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "HC", hc));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "H", hidden));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "INJ", inj));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cn, "WR", wr));
-        hc_fused_cfgs[0] = cn;
-        const cd = mlx.mlx_fast_metal_kernel_config_new();
-        const act_shape = [_]c_int{rows * R};
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cd, &act_shape, 1, xd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cd, &hc_shape, 1, xd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cd, 256, R + inj * hc, rows));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cd, 256, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cd, "T", xd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "GS", gsi));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "BITS", @intCast(bits)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "HC", hc));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "H", hidden));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cd, "R", R));
-        hc_fused_cfgs[1] = cd;
-        const cu = mlx.mlx_fast_metal_kernel_config_new();
-        const mixed_shape = [_]c_int{rows * hidden};
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cu, &mixed_shape, 1, xd));
-        if (uv) {
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cu, 256 * @divExact(hidden, 16), 1, 1));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cu, 256, 1, 1));
-        } else {
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cu, 32, hidden, rows));
-            try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cu, 32, 8, 1));
-        }
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cu, "T", xd));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "GS", gsi));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "BITS", @intCast(bits)));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "HC", hc));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "H", hidden));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "R", R));
-        if (uv) try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cu, "ROWS", rows));
-        hc_fused_cfgs[2] = cu;
-        hc_fused_key = key;
-    }
-    if (hc_fused_eps == null or hc_fused_eps_val != eps) {
-        if (hc_fused_eps) |e| _ = mlx.mlx_array_free(e);
-        const esh = [_]c_int{1};
-        var ev = eps;
-        hc_fused_eps = mlx.mlx_array_new_data(&ev, &esh, 1, .float32);
-        hc_fused_eps_val = eps;
-    }
-
-    const apply = struct {
-        fn f(st: mlx.mlx_stream, which: usize, ins: []const mlx.mlx_array, n_out: usize, outs: []mlx.mlx_array) !void {
-            const vec = mlx.mlx_vector_array_new_data(ins.ptr, ins.len);
-            defer _ = mlx.mlx_vector_array_free(vec);
-            var res = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(res);
-            const kidx: usize = if (which == 2 and hc_fused_key.uv) 3 else which;
-            try mlx.check(mlx.mlx_fast_metal_kernel_apply(&res, try getHcFusedKernel(kidx), vec, hc_fused_cfgs[which].?, st));
-            if (mlx.mlx_vector_array_size(res) != n_out) return error.MetalKernelBadOutputCount;
-            var got: usize = 0;
-            errdefer {
-                for (outs[0..got]) |a| _ = mlx.mlx_array_free(a);
+    if (rows <= hc_decode2.maxRows()) {
+        if (try hc_decode2.read(s, x, nw, dw, ds, db, uw, us, ub, iw, try hcEpsArray(eps), rows, hc, hidden, bits, group_size, if (pend) |pd| .{ .out = pd.out, .inj = pd.inj } else null)) |two| {
+            defer inline for (.{ "mixed", "inj", "stream" }) |name| {
+                if (@field(two, name).ctx != null) _ = mlx.mlx_array_free(@field(two, name));
+            };
+            const xsh = mlx.getShape(x);
+            var out: HcFusedOut = .{ .mixed = mlx.mlx_array_new(), .inj = .{ .ctx = null }, .stream = .{ .ctx = null } };
+            errdefer inline for (.{ "mixed", "inj", "stream" }) |name| {
+                if (@field(out, name).ctx != null) _ = mlx.mlx_array_free(@field(out, name));
+            };
+            try mlx.check(mlx.mlx_reshape(&out.mixed, two.mixed, &[_]c_int{ batch, seq, hidden }, 3, s));
+            if (two.inj.ctx != null) {
+                out.inj = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_reshape(&out.inj, two.inj, &[_]c_int{ batch, seq, hc, 1 }, 4, s));
             }
-            for (0..n_out) |i| {
-                outs[i] = mlx.mlx_array_new();
-                got = i + 1;
-                try mlx.check(mlx.mlx_vector_array_get(&outs[i], res, i));
+            if (two.stream.ctx != null) {
+                out.stream = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_reshape(&out.stream, two.stream, xsh.ptr, @intCast(xsh.len), s));
             }
+            return out;
         }
-    }.f;
-
-    var n_out: [3]mlx.mlx_array = undefined;
-    const wo = if (pend) |pd| pd.out else nw;
-    const wi = if (pend) |pd| pd.inj else nw;
-    try apply(s, 0, &.{ x, nw, if (inj == 1) iw else nw, hc_fused_eps.?, wo, wi }, 3, &n_out);
-    const xn = n_out[0];
-    defer _ = mlx.mlx_array_free(xn);
-    const ipart = n_out[1];
-    defer _ = mlx.mlx_array_free(ipart);
-    var stream_out = n_out[2];
-    errdefer if (stream_out.ctx != null) {
-        _ = mlx.mlx_array_free(stream_out);
-    };
-    if (wr == 0) {
-        _ = mlx.mlx_array_free(stream_out);
-        stream_out = .{ .ctx = null };
-    } else {
-        const xsh = mlx.getShape(x);
-        var shaped = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(shaped);
-        try mlx.check(mlx.mlx_reshape(&shaped, stream_out, xsh.ptr, @intCast(xsh.len), s));
-        _ = mlx.mlx_array_free(stream_out);
-        stream_out = shaped;
     }
-    var d_out: [2]mlx.mlx_array = undefined;
-    try apply(s, 1, &.{ xn, dw, ds, db, ipart }, 2, &d_out);
-    const act = d_out[0];
-    defer _ = mlx.mlx_array_free(act);
-    const inj_flat = d_out[1];
-    defer _ = mlx.mlx_array_free(inj_flat);
-    var u_out: [1]mlx.mlx_array = undefined;
-    try apply(s, 2, &.{ xn, act, uw, us, ub }, 1, &u_out);
-    const mixed_flat = u_out[0];
-    defer _ = mlx.mlx_array_free(mixed_flat);
-
-    const mshape = [_]c_int{ batch, seq, hidden };
-    var mixed = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(mixed);
-    try mlx.check(mlx.mlx_reshape(&mixed, mixed_flat, &mshape, 3, s));
-    var inj_out = mlx.mlx_array{ .ctx = null };
-    if (inj == 1) {
-        const ishape = [_]c_int{ batch, seq, hc, 1 };
-        inj_out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_reshape(&inj_out, inj_flat, &ishape, 4, s));
-    }
-    if (!hc_fused_engaged) {
-        hc_fused_engaged = true;
-        log.info("[qwen4] fused hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit g{d} (MLX_SERVE_HC_FUSED=0 restores the chain)\n", .{ hc, hidden, R, bits, group_size });
-    }
-    return .{ .mixed = mixed, .inj = inj_out, .stream = stream_out };
+    return null;
 }
 
 /// One quant group per pack: a word for 2/4/8-bit, a byte triple (8 values) for 3-bit.
@@ -41987,10 +42149,19 @@ fn getGatherQmvDownReduceKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-/// Lanes per output row in the down+reduce kernels; 32/LPR rows per simdgroup.
-/// 4 spills its hoisted packs, 16 measured the same as 8 on the shipped shapes.
-const DOWNRED_LPR: c_int = 8;
-const DownRedCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
+/// Lanes per output row in the down+reduce kernels; 32/LPR rows per simdgroup. The solo and the rows
+/// kernel share it so a row's sum keeps one accumulation order on both paths. 4 spills its hoisted packs.
+/// A generation nobody measured keeps 8; 16 is measured on G17 (M5).
+fn downredLanesFor(gen: u32, phone: bool) c_int {
+    return if (gen == 17 and !phone) 16 else 8;
+}
+
+fn downredLpr() c_int {
+    const g = deviceGeneration();
+    return downredLanesFor(g.gen, g.phone);
+}
+
+const DownRedCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int };
 var downred_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_cfg_key: DownRedCfgKey = std.mem.zeroes(DownRedCfgKey);
 var downred_engaged: bool = false;
@@ -42062,10 +42233,10 @@ pub fn gatherQmvDownReduce(
     var xelems: i64 = 1;
     for (xsh) |d| xelems *= d;
     if (xelems != @as(i64, topk) * K) return null;
-    const rows: c_int = @divExact(32, DOWNRED_LPR);
+    const rows: c_int = @divExact(32, downredLpr());
     if (@rem(N, rows) != 0) return null;
 
-    const key = DownRedCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
+    const key = DownRedCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr() };
     if (downred_cfg == null or !std.meta.eql(downred_cfg_key, key)) {
         if (downred_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -42078,7 +42249,7 @@ pub fn gatherQmvDownReduce(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TOPK", topk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", DOWNRED_LPR));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", downredLpr()));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
         downred_cfg = cfg;
         downred_cfg_key = key;
@@ -42192,7 +42363,7 @@ fn getGatherQmvDownReduceRowsKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
+const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int };
 var downred_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_rows_cfg_key: DownRedRowsCfgKey = std.mem.zeroes(DownRedRowsCfgKey);
 var downred_rows_engaged: bool = false;
@@ -42272,10 +42443,10 @@ pub fn gatherQmvDownReduceRows(
     var xelems: i64 = 1;
     for (xsh) |d| xelems *= d;
     if (xelems != @as(i64, nrows) * topk * K) return null;
-    const rows: c_int = @divExact(32, DOWNRED_LPR);
+    const rows: c_int = @divExact(32, downredLpr());
     if (@rem(N, rows) != 0) return null;
 
-    const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd };
+    const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr() };
     if (downred_rows_cfg == null or !std.meta.eql(downred_rows_cfg_key, key)) {
         if (downred_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -42288,7 +42459,7 @@ pub fn gatherQmvDownReduceRows(
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "TOPK", topk));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "ROWS", rows));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", DOWNRED_LPR));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "LPR", downredLpr()));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KP", affineQmvPackUnits(K, bits)));
         downred_rows_cfg = cfg;
         downred_rows_cfg_key = key;
@@ -42325,8 +42496,8 @@ const MSV_QMV_ROWS_SOURCE =
     \\const int in_vec_size = int(K_size);
     \\const int out_vec_size = int(N_size);
     \\constexpr int packs_per_thread = 2;
-    \\constexpr int pack_factor = BITS == 3 ? 8 : 32 / BITS;
-    \\constexpr int bytes_per_pack = BITS == 3 ? 3 : 4;
+    \\constexpr int pack_factor = (BITS == 3 || BITS == 5) ? 8 : (BITS == 6 ? 4 : 32 / BITS);
+    \\constexpr int bytes_per_pack = (BITS == 3 || BITS == 6) ? 3 : (BITS == 5 ? 5 : 4);
     \\constexpr int values_per_thread = pack_factor * packs_per_thread;
     \\constexpr int block_size = values_per_thread * 32;
     \\constexpr int scale_step_per_thread = GS / values_per_thread;
@@ -42363,6 +42534,26 @@ const MSV_QMV_ROWS_SOURCE =
     \\      x_thread[i + 2] = xp[i + 2] / 256.0f;
     \\      x_thread[i + 3] = xp[i + 3] / 4096.0f;
     \\    }
+    \\  } else if (BITS == 5) {
+    \\    for (int i = 0; i < values_per_thread; i += 8) {
+    \\      sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3] + xp[i + 4] + xp[i + 5] + xp[i + 6] + xp[i + 7];
+    \\      x_thread[i] = xp[i];
+    \\      x_thread[i + 1] = xp[i + 1] / 32.0f;
+    \\      x_thread[i + 2] = xp[i + 2] / 4.0f;
+    \\      x_thread[i + 3] = xp[i + 3] / 128.0f;
+    \\      x_thread[i + 4] = xp[i + 4] / 16.0f;
+    \\      x_thread[i + 5] = xp[i + 5] / 2.0f;
+    \\      x_thread[i + 6] = xp[i + 6] / 64.0f;
+    \\      x_thread[i + 7] = xp[i + 7] / 8.0f;
+    \\    }
+    \\  } else if (BITS == 6) {
+    \\    for (int i = 0; i < values_per_thread; i += 4) {
+    \\      sum += xp[i] + xp[i + 1] + xp[i + 2] + xp[i + 3];
+    \\      x_thread[i] = xp[i];
+    \\      x_thread[i + 1] = xp[i + 1] / 64.0f;
+    \\      x_thread[i + 2] = xp[i + 2] / 16.0f;
+    \\      x_thread[i + 3] = xp[i + 3] / 4.0f;
+    \\    }
     \\  } else {
     \\    for (int i = 0; i < values_per_thread; i++) {
     \\      sum += xp[i];
@@ -42388,6 +42579,34 @@ const MSV_QMV_ROWS_SOURCE =
     \\        accum += (w3[2] & 0x03) * (x3[5] * 256.0f);
     \\        accum += (w3[2] & 0x1c) * x3[6];
     \\        accum += (w3[2] & 0xe0) * x3[7];
+    \\      }
+    \\    } else if (BITS == 5) {
+    \\      for (int i = 0; i < values_per_thread / 8; i++) {
+    \\        const device uint8_t* w5 = wl + 5 * i;
+    \\        thread U* x5 = x_thread + 8 * i;
+    \\        accum += (w5[0] & 0x1f) * x5[0];
+    \\        accum += (w5[0] & 0xe0) * x5[1];
+    \\        accum += (w5[1] & 0x3) * (x5[1] * 256.0f);
+    \\        accum += (w5[1] & 0x7c) * x5[2];
+    \\        accum += (w5[1] & 0x80) * x5[3];
+    \\        accum += (w5[2] & 0xf) * (x5[3] * 256.0f);
+    \\        accum += (w5[2] & 0xf0) * x5[4];
+    \\        accum += (w5[3] & 0x1) * (x5[4] * 256.0f);
+    \\        accum += (w5[3] & 0x3e) * x5[5];
+    \\        accum += (w5[3] & 0xc0) * x5[6];
+    \\        accum += (w5[4] & 0x7) * (x5[6] * 256.0f);
+    \\        accum += (w5[4] & 0xf8) * x5[7];
+    \\      }
+    \\    } else if (BITS == 6) {
+    \\      for (int i = 0; i < values_per_thread / 4; i++) {
+    \\        const device uint8_t* w6 = wl + 3 * i;
+    \\        thread U* x6 = x_thread + 4 * i;
+    \\        accum += (w6[0] & 0x3f) * x6[0];
+    \\        accum += (w6[0] & 0xc0) * x6[1];
+    \\        accum += (w6[1] & 0x0f) * (x6[1] * 256.0f);
+    \\        accum += (w6[1] & 0xf0) * x6[2];
+    \\        accum += (w6[2] & 0x03) * (x6[2] * 256.0f);
+    \\        accum += (w6[2] & 0xfc) * x6[3];
     \\      }
     \\    } else if (BITS == 4) {
     \\      const device uint16_t* w16 = (const device uint16_t*)wl;
@@ -42416,8 +42635,10 @@ const MSV_QMV_ROWS_SOURCE =
 
 var msv_qmv_rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const MsvQmvRowsCfgKey = struct { nrows: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };
-var msv_qmv_rows_cfgs = QsaCfgCache(MsvQmvRowsCfgKey, 1){};
-var msv_qmv_rows_logged = false;
+// One slot per head projection shape and row count a batched round cycles through.
+var msv_qmv_rows_cfgs = KernelCfgCache(MsvQmvRowsCfgKey, 1, 16){};
+/// One engagement line per width.
+var msv_qmv_rows_logged: [9]bool = @splat(false);
 pub var mtp_head_row_dispatches: usize = 0;
 
 fn getMsvQmvRowsKernel() !mlx.mlx_fast_metal_kernel {
@@ -42452,8 +42673,7 @@ pub fn msvQmvRows(
     group_size: u32,
 ) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
-    if (bits != 3 and bits != 4 and bits != 8) return null;
-    if (group_size != 64) return null;
+    if (bits < 3 or bits > 8 or bits == 7) return null;
     if (sc.ctx == null or bi.ctx == null) return null;
     const xd = mlx.mlx_array_dtype(x);
     if (xd != .bfloat16 and xd != .float16) return null;
@@ -42465,9 +42685,16 @@ pub fn msvQmvRows(
     var i: usize = 0;
     while (i + 1 < xsh.len) : (i += 1) nrows *= xsh[i];
     if (nrows < 2 or nrows > 16) return null;
-    const vpt: c_int = if (bits == 3) 16 else @intCast((32 / bits) * 2);
+    // MLX qmv_fast's packs: two per thread, 8 values per 3/5 bytes at 3/5 bits, 4 per 3 at 6.
+    const vpt: c_int = switch (bits) {
+        3, 5 => 16,
+        6 => 8,
+        else => @intCast((32 / bits) * 2),
+    };
     const block: c_int = vpt * 32;
     if (@rem(K, block) != 0) return null;
+    // A thread's values sit inside one group.
+    if (group_size < vpt or @rem(@as(c_int, @intCast(group_size)), vpt) != 0 or @rem(block, @as(c_int, @intCast(group_size))) != 0) return null;
     const wsh = mlx.getShape(w);
     if (wsh.len != 2) return null;
     const Nout = wsh[0];
@@ -42510,8 +42737,8 @@ pub fn msvQmvRows(
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, config, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     mtp_head_row_dispatches += 1;
-    if (!msv_qmv_rows_logged) {
-        msv_qmv_rows_logged = true;
+    if (!msv_qmv_rows_logged[bits]) {
+        msv_qmv_rows_logged[bits] = true;
         log.info("[mtp] row-axis projection engaged: rows={d} K={d} N={d} bits={d} gs={d}\n", .{ nrows, K, Nout, bits, group_size });
     }
     var y2 = mlx.mlx_array_new();
@@ -43613,18 +43840,20 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
         .attention => (k == 2560 and (n == 12288 or n == 512)) or (k == 6144 and n == 2560),
     };
     if (!shape_ok) return null;
-    if (ws[1] != @divExact(k, 4) or ss[0] != n or ss[1] != @divExact(k, 64) or !std.mem.eql(c_int, ss, bs)) return null;
-    // The joined path requires the reference qmv_wide K reduction.
-    if (mixedPlainEnabled(8, 64, n)) return null;
+    const qp = affineParamsFromGeometry(w, sc, @intCast(k)) orelse return null;
+    if (ss[0] != n or !std.mem.eql(c_int, ss, bs)) return null;
+    // Rows must match what each slot computes alone: a slot whose width a verify lane
+    // serves does not take the reference qmv_wide K reduction.
+    if (qp.bits == 4 or mixedPlainEnabled(qp.bits, qp.group_size, n)) return null;
     var total: c_int = 0;
     for (widths) |width| {
         if (width < 2 or width > (if (wide) @as(c_int, 6) else 7)) return null;
         if (wide and verifyQmmEnabled() and naxLaneEnvEnabled() and naxMixedBitsEnvEnabled() and
-            mixedNaxShapeEnabled(8, 64, n) and width >= naxMinMForBits(8) and @mod(k, 256) == 0) return null;
+            mixedNaxShapeEnabled(qp.bits, qp.group_size, n, width) and width >= naxMinMForBits(qp.bits) and @mod(k, 256) == 0) return null;
         total += width;
     }
     if (total != xs[1] or total > (if (wide) @as(c_int, 12) else 24)) return null;
-    if (total == 12 and n >= 2560) {
+    if (total == 12 and n >= 2560 and qp.bits == 8 and qp.group_size == 64) {
         if (try verifyWideProjection(s, x, w, sc, bi, 6)) |value| {
             mtp_verify_kernel_calls[0] +%= 1;
             const Once = struct {
@@ -43637,10 +43866,30 @@ fn verifyJoinedProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array,
             return value;
         }
     }
+    const arch = verifyArch() orelse return null;
+    if (total >= qmvBatchLimit(arch[arch.len - 1] == 'd', k, n)) return null;
     var result = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(result);
-    try mlx.check(mlx.mlx_quantized_matmul(&result, x, w, sc, bi, true, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", s));
+    try mlx.check(mlx.mlx_quantized_matmul(&result, x, w, sc, bi, true, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", s));
     return result;
+}
+
+/// MLX's `get_qmv_batch_limit` (quantized.cpp) on the gen-17 GPUs the joined path runs on:
+/// below it a transposed qmm runs the per-row qmv kernel, so joined rows reduce like each slot's own.
+fn qmvBatchLimit(dual_die: bool, k: c_int, n: c_int) c_int {
+    const small = k <= 2048 and n <= 2048;
+    const mid = k <= 4096 and n <= 4096;
+    if (dual_die) return if (small) 32 else if (mid) 18 else 12;
+    return if (small) 33 else if (mid) 25 else 13;
+}
+
+test "qmvBatchLimit mirrors MLX's qmv/qmm split on single- and dual-die gen-17 GPUs" {
+    try testing.expectEqual(@as(c_int, 25), qmvBatchLimit(false, 2560, 640));
+    try testing.expectEqual(@as(c_int, 18), qmvBatchLimit(true, 2560, 640));
+    try testing.expectEqual(@as(c_int, 33), qmvBatchLimit(false, 2048, 512));
+    try testing.expectEqual(@as(c_int, 32), qmvBatchLimit(true, 2048, 512));
+    try testing.expectEqual(@as(c_int, 13), qmvBatchLimit(false, 2560, 10240));
+    try testing.expectEqual(@as(c_int, 12), qmvBatchLimit(true, 6144, 2560));
 }
 
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -43942,6 +44191,84 @@ test "firstNonTernaryBias: every matmul bias must be -scale; a gather-only embed
     }
 }
 
+test "a quantized block_inject_weight loads as the dense checkpoint holding its dequantized values" {
+    const s = mlx.gpuStream();
+    const alloc = std.testing.allocator;
+    const hc: u32 = 4;
+    const hidden: u32 = 64;
+    const in: c_int = @intCast(hc * hidden);
+    var prng = std.Random.DefaultPrng.init(0x696e6a);
+    const rnd = prng.random();
+    const P = struct {
+        fn put(w: *Weights, name: []const u8, a: mlx.mlx_array) !void {
+            var c = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_array_set(&c, a));
+            try w.map.put(try std.testing.allocator.dupe(u8, name), c);
+        }
+        fn rand(r: std.Random, shape: []const c_int, st: mlx.mlx_stream) !mlx.mlx_array {
+            var host: [8 * 256]f32 = undefined;
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            for (host[0..n]) |*v| v.* = r.floatNorm(f32) * 0.05;
+            const f = mlx.mlx_array_new_data(&host, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(f);
+            var b = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&b, f, .bfloat16, st));
+            try mlx.check(mlx.mlx_array_eval(b));
+            return b;
+        }
+    };
+    const down = try P.rand(rnd, &.{ 8, in }, s);
+    defer _ = mlx.mlx_array_free(down);
+    const up = try P.rand(rnd, &.{ in, 8 }, s);
+    defer _ = mlx.mlx_array_free(up);
+    const norm = try P.rand(rnd, &.{in}, s);
+    defer _ = mlx.mlx_array_free(norm);
+    for ([_]c_int{ 4, 5, 6, 8 }) |bits| for ([_]c_int{ 64, 128 }) |gs| {
+        const inj = try P.rand(rnd, &.{ @intCast(hc), in }, s);
+        defer _ = mlx.mlx_array_free(inj);
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, inj, mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{}, s));
+        var q: [3]mlx.mlx_array = undefined;
+        for (&q, 0..) |*a, i| {
+            a.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(a, triple, i));
+        }
+        defer for (q) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        var deq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(deq);
+        try mlx.check(mlx.mlx_dequantize(&deq, q[0], q[1], q[2], mlx.mlx_optional_int.some(gs), mlx.mlx_optional_int.some(bits), "affine", .{ .ctx = null }, .{ .value = .bfloat16, .has_value = true }, s));
+
+        var flats: [2]mlx.mlx_array = undefined;
+        var owned: std.ArrayList(mlx.mlx_array) = .empty;
+        defer {
+            for (owned.items) |a| _ = mlx.mlx_array_free(a);
+            owned.deinit(alloc);
+        }
+        var wq = Weights.init(alloc);
+        defer wq.deinit();
+        var wd = Weights.init(alloc);
+        defer wd.deinit();
+        for ([_]*Weights{ &wq, &wd }, 0..) |w, arm| {
+            try P.put(w, "hc.input_mix_weight_down.weight", down);
+            try P.put(w, "hc.input_mix_weight_up.weight", up);
+            try P.put(w, "hc.hc_norm.weight", norm);
+            if (arm == 0) {
+                try P.put(w, "hc.block_inject_weight.weight", q[0]);
+                try P.put(w, "hc.block_inject_weight.scales", q[1]);
+                try P.put(w, "hc.block_inject_weight.biases", q[2]);
+            } else try P.put(w, "hc.block_inject_weight.weight", deq);
+            const hw = try loadHcWeights(w, "hc", true, hc, hidden, &owned, alloc, s);
+            try std.testing.expect(hw.inject_s.ctx == null and hw.inject_flat.ctx != null);
+            flats[arm] = hw.inject_flat;
+        }
+        try std.testing.expectEqual(@as(f32, 0), try maxAbsDiffF32(flats[0], flats[1], s));
+    };
+}
+
 test "firstRowExactMiss: 4, 6 and 8-bit trunk projections are inside the row kernels, 3-bit is not; vision and mtp never count" {
     const Q = struct {
         fn put(w: *Weights, base: []const u8, bits: c_int) !void {
@@ -44006,8 +44333,8 @@ test "qmatmul: a ternary 2-bit pack routes through qmv2; without the flag it sta
     defer _ = mlx.mlx_array_free(x);
     try mlx.check(mlx.mlx_astype(&x, x32, .bfloat16, s));
 
-    qmv2.gen_override = .{ .gen = 13, .phone = false };
-    defer qmv2.gen_override = null;
+    device_gen_override = .{ .gen = 13, .phone = false };
+    defer device_gen_override = null;
     var xfm: Transformer = undefined;
     xfm.s = s;
     xfm.rht = null;
@@ -46969,7 +47296,7 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
     const t = std.testing;
     const allocator = t.allocator;
     const s = mlx.gpuStream();
-    const T: usize = 5;
+    const T: usize = 6;
     const D: usize = 64;
     const I: usize = 64;
     const SI: usize = 128;
@@ -47159,6 +47486,20 @@ test "nemotronMoe matches a host reference of NemotronHMoE" {
         var max_err_sorted: f32 = 0;
         for (0..T * D) |i| max_err_sorted = @max(max_err_sorted, @abs(gp[i] - gs_p[i]));
         try t.expect(max_err_sorted < 2e-3 * max_ref);
+
+        // Padded up to 4 rows per expert for the streaming kernel; the pad rows are dropped.
+        try t.expectEqual(@as(c_int, 0), moeStreamPadRows(2 * E - 1, E));
+        try t.expectEqual(@as(c_int, 0), moeStreamPadRows(4 * E, E));
+        try t.expectEqual(@as(c_int, 4 * E - T * K), moeStreamPadRows(T * K, E));
+        const parts = try nemotronMoeExperts(x, &nm, &cfg, true, s);
+        defer parts.deinit();
+        const got_pad = try nemotronMoeCombine(x, &parts, &nm, &cfg, s);
+        defer _ = mlx.mlx_array_free(got_pad);
+        try mlx.check(mlx.mlx_array_eval(got_pad));
+        const gpad = mlx.mlx_array_data_float32(got_pad) orelse return error.MlxArrayDataNull;
+        var max_err_pad: f32 = 0;
+        for (0..T * D) |i| max_err_pad = @max(max_err_pad, @abs(gp[i] - gpad[i]));
+        try t.expect(max_err_pad < 2e-3 * max_ref);
     }
 }
 
@@ -48936,7 +49277,7 @@ test "fused MoE router reproduces the softmax routing chain's top-K and beats it
     defer allocator.free(host);
     try testReadF32(lbf, host, s);
 
-    const fused = (try moeRouterTopK(s, lbf, .{ .ctx = null }, K, .softmax, true, 1.0, .bfloat16, 0, 0)) orelse
+    const fused = (try moeRouterTopK(s, lbf, .{ .ctx = null }, K, .softmax, true, 1.0, .bfloat16, 0, 0, null)) orelse
         return error.FusedRouterDeclined;
     defer _ = mlx.mlx_array_free(fused.inds);
     defer _ = mlx.mlx_array_free(fused.norm_scores);
@@ -49007,6 +49348,107 @@ test "fused MoE router reproduces the softmax routing chain's top-K and beats it
     try testing.expect(fused_err <= chain_err);
 }
 
+test "fused softmax router folds the shared-expert gate's logit: routing unchanged, the logit within a bf16 ulp of the f64 dot" {
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x6A7E10);
+    const rnd = prng.random();
+    moe_router_fused_override = true;
+    defer moe_router_fused_override = null;
+
+    const rows: c_int = 3;
+    const E: c_int = 512;
+    const K: c_int = 10;
+    const GK: c_int = 2560;
+    const randBf = struct {
+        fn f(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, shape: []const c_int, scale: f32) !mlx.mlx_array {
+            var n: usize = 1;
+            for (shape) |d| n *= @intCast(d);
+            const buf = try a.alloc(f32, n);
+            defer a.free(buf);
+            for (buf) |*v| v.* = (r.float(f32) - 0.5) * scale;
+            const a32 = mlx.mlx_array_new_data(buf.ptr, shape.ptr, @intCast(shape.len), .float32);
+            defer _ = mlx.mlx_array_free(a32);
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&out, a32, .bfloat16, st));
+            return out;
+        }
+    }.f;
+    const logits = try randBf(allocator, rnd, s, &.{ rows, E }, 8.0);
+    defer _ = mlx.mlx_array_free(logits);
+    const x = try randBf(allocator, rnd, s, &.{ rows, GK }, 4.0);
+    defer _ = mlx.mlx_array_free(x);
+    const w = try randBf(allocator, rnd, s, &.{GK}, 0.4);
+    defer _ = mlx.mlx_array_free(w);
+
+    const plain = (try moeRouterTopK(s, logits, .{ .ctx = null }, K, .softmax, true, 1.0, .bfloat16, 0, 0, null)) orelse return error.FusedRouterDeclined;
+    defer _ = mlx.mlx_array_free(plain.inds);
+    defer _ = mlx.mlx_array_free(plain.norm_scores);
+    const gated = (try moeRouterTopK(s, logits, .{ .ctx = null }, K, .softmax, true, 1.0, .bfloat16, 0, 0, .{ .x = x, .w = w })) orelse return error.FusedRouterDeclined;
+    defer _ = mlx.mlx_array_free(gated.inds);
+    defer _ = mlx.mlx_array_free(gated.norm_scores);
+    defer _ = mlx.mlx_array_free(gated.gate_logit);
+    try testing.expect(gated.gate_logit.ctx != null);
+
+    const kn: usize = @intCast(rows * K);
+    inline for (.{ "inds", "norm_scores" }) |name| {
+        const a = try allocator.alloc(f32, kn);
+        defer allocator.free(a);
+        const b = try allocator.alloc(f32, kn);
+        defer allocator.free(b);
+        try testReadF32(@field(plain, name), a, s);
+        try testReadF32(@field(gated, name), b, s);
+        try testing.expectEqualSlices(f32, a, b);
+    }
+
+    const xn: usize = @intCast(rows * GK);
+    const xh = try allocator.alloc(f32, xn);
+    defer allocator.free(xh);
+    const wh = try allocator.alloc(f32, @intCast(GK));
+    defer allocator.free(wh);
+    const got = try allocator.alloc(f32, @intCast(rows));
+    defer allocator.free(got);
+    try testReadF32(x, xh, s);
+    try testReadF32(w, wh, s);
+    try testReadF32(gated.gate_logit, got, s);
+    for (0..@intCast(rows)) |r| {
+        var want: f64 = 0;
+        for (wh, 0..) |wv, k| want += @as(f64, wv) * xh[r * @as(usize, @intCast(GK)) + k];
+        try testing.expect(@abs(@as(f64, got[r]) - want) <= 0.004 * @abs(want) + 1e-3);
+    }
+}
+
+test "fused softmax router: a router with no spare simdgroup routes without the gate logit" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x6A7E11);
+    const rnd = prng.random();
+    moe_router_fused_override = true;
+    defer moe_router_fused_override = null;
+
+    // 16 experts is one simdgroup: nothing is left to dot the gate vector, and a zero logit must never ship.
+    const logits = try testRandUniformBf16(rnd, &.{ 2, 16 }, -4.0, 4.0, s);
+    defer _ = mlx.mlx_array_free(logits);
+    const x = try testRandUniformBf16(rnd, &.{ 2, 64 }, -2.0, 2.0, s);
+    defer _ = mlx.mlx_array_free(x);
+    const w = try testRandUniformBf16(rnd, &.{64}, -0.2, 0.2, s);
+    defer _ = mlx.mlx_array_free(w);
+
+    const plain = (try moeRouterTopK(s, logits, .{ .ctx = null }, 4, .softmax, true, 1.0, .bfloat16, 0, 0, null)) orelse return error.FusedRouterDeclined;
+    defer _ = mlx.mlx_array_free(plain.inds);
+    defer _ = mlx.mlx_array_free(plain.norm_scores);
+    const gated = (try moeRouterTopK(s, logits, .{ .ctx = null }, 4, .softmax, true, 1.0, .bfloat16, 0, 0, .{ .x = x, .w = w })) orelse return error.FusedRouterDeclined;
+    defer _ = mlx.mlx_array_free(gated.inds);
+    defer _ = mlx.mlx_array_free(gated.norm_scores);
+    try testing.expect(gated.gate_logit.ctx == null);
+    inline for (.{ "inds", "norm_scores" }) |name| {
+        var a: [8]f32 = undefined;
+        var b: [8]f32 = undefined;
+        try testReadF32(@field(plain, name), &a, s);
+        try testReadF32(@field(gated, name), &b, s);
+        try testing.expectEqualSlices(f32, &a, &b);
+    }
+}
+
 test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512/8/4/8 geometry" {
     // Bit equality with the composed chain is the bar, not "close enough": the
     // first live A/B of the plain fused router computed a cleaner softmax and
@@ -49049,7 +49491,7 @@ test "fused GROUPED MoE router reproduces groupLimitedRouting at the SHIPPED 512
     const bias = mlx.mlx_array_new_data(bbuf.ptr, &bsh, 1, .float32);
     defer _ = mlx.mlx_array_free(bias);
 
-    const fused = (try moeRouterTopK(s, l32, bias, K, .sigmoid_bias_grouped, true, ROUTE_SCALE, .float32, NG, TOPKG)) orelse
+    const fused = (try moeRouterTopK(s, l32, bias, K, .sigmoid_bias_grouped, true, ROUTE_SCALE, .float32, NG, TOPKG, null)) orelse
         return error.FusedRouterDeclined;
     defer _ = mlx.mlx_array_free(fused.inds);
     defer _ = mlx.mlx_array_free(fused.norm_scores);
@@ -49174,7 +49616,7 @@ test "fused MoE router reproduces the hy3 sigmoid+bias routing chain" {
     defer allocator.free(host);
     try testReadF32(lbf, host, s);
 
-    const fused = (try moeRouterTopK(s, lbf, bias, K, .sigmoid_bias, true, ROUTE_SCALE, .bfloat16, 0, 0)) orelse
+    const fused = (try moeRouterTopK(s, lbf, bias, K, .sigmoid_bias, true, ROUTE_SCALE, .bfloat16, 0, 0, null)) orelse
         return error.FusedRouterDeclined;
     defer _ = mlx.mlx_array_free(fused.inds);
     defer _ = mlx.mlx_array_free(fused.norm_scores);
@@ -49237,6 +49679,67 @@ test "fused MoE router reproduces the hy3 sigmoid+bias routing chain" {
     }
     // Both round to bf16 at the end, so the bar is "no worse", not "better".
     try testing.expect(fused_err <= chain_err * 1.0001 + 1e-6);
+}
+
+test "fused MoE router reproduces the kolibri1 logit+bias routing chain" {
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(0x4B011B21);
+    const rnd = prng.random();
+    moe_router_fused_override = true;
+    defer moe_router_fused_override = null;
+
+    const ROWS: c_int = 5;
+    const E: c_int = 384;
+    const K: c_int = 6;
+    const en: usize = @intCast(E);
+    const kn: usize = @intCast(ROWS * K);
+
+    const buf = try allocator.alloc(f32, @intCast(ROWS * E));
+    defer allocator.free(buf);
+    for (buf) |*v| v.* = (rnd.float(f32) - 0.5) * 8.0;
+    const lsh = [_]c_int{ ROWS, E };
+    const logits = mlx.mlx_array_new_data(buf.ptr, &lsh, 2, .float32);
+    defer _ = mlx.mlx_array_free(logits);
+    const bbuf = try allocator.alloc(f32, en);
+    defer allocator.free(bbuf);
+    for (bbuf) |*v| v.* = (rnd.float(f32) - 0.5) * 2.0;
+    const bsh = [_]c_int{E};
+    const bias = mlx.mlx_array_new_data(bbuf.ptr, &bsh, 1, .float32);
+    defer _ = mlx.mlx_array_free(bias);
+
+    const fused = (try moeRouterTopK(s, logits, bias, K, .logit_bias, false, 1.0, .float32, 0, 0, null)) orelse
+        return error.FusedRouterDeclined;
+    defer _ = mlx.mlx_array_free(fused.inds);
+    defer _ = mlx.mlx_array_free(fused.norm_scores);
+    const chain = try kolibriRoutingChain(logits, bias, K, s);
+    defer _ = mlx.mlx_array_free(chain.inds);
+    defer _ = mlx.mlx_array_free(chain.norm_scores);
+
+    const f_ids = try allocator.alloc(f32, kn);
+    defer allocator.free(f_ids);
+    const c_ids = try allocator.alloc(f32, kn);
+    defer allocator.free(c_ids);
+    const f_w = try allocator.alloc(f32, kn);
+    defer allocator.free(f_w);
+    const c_w = try allocator.alloc(f32, kn);
+    defer allocator.free(c_w);
+    try testReadF32(fused.inds, f_ids, s);
+    try testReadF32(chain.inds, c_ids, s);
+    try testReadF32(fused.norm_scores, f_w, s);
+    try testReadF32(chain.norm_scores, c_w, s);
+
+    // Same expert set per row, and each expert carries the chain's exact weight.
+    const k: usize = @intCast(K);
+    for (0..@intCast(ROWS)) |r| {
+        for (0..k) |j| {
+            const id = f_ids[r * k + j];
+            var slot: usize = 0;
+            while (slot < k and c_ids[r * k + slot] != id) : (slot += 1) {}
+            try testing.expect(slot < k);
+            try testing.expectEqual(c_w[r * k + slot], f_w[r * k + j]);
+        }
+    }
 }
 
 test "fused attention output gate is bit-identical to the softplus op chain" {
@@ -50310,7 +50813,11 @@ test "fused residual+RMSNorm declines what it cannot reproduce" {
     try testing.expect((try fusedAddRmsNorm(s, a, small, w, eps)) == null);
 }
 
-test "fused hyper-connection read matches the op chain per element" {
+test "fused hyper-connection read matches the op chain per element, at every packed width" {
+    for ([_]u32{ 4, 5, 6, 8 }) |bits| for ([_]u32{ 64, 128 }) |gs| try hcFusedReadParity(bits, gs);
+}
+
+fn hcFusedReadParity(bits: u32, gs: u32) !void {
     // Reference = the unfused hcRead chain spelled in raw ops (grouped rms
     // norm with a ones weight, ×w, down qmm, silu, up qmm, sigmoid·n4 mean;
     // inject matvec, 2·sigmoid). Accumulation order differs, so the bar is
@@ -50325,14 +50832,12 @@ test "fused hyper-connection read matches the op chain per element" {
     const HC: c_int = 4;
     const H: c_int = 512;
     const K: c_int = HC * H;
-    const R: c_int = 64;
-    const bits: u32 = 4;
-    const gs: u32 = 64;
+    const R: c_int = 128;
     const eps: f32 = 1e-6;
 
     const Q = struct { w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array };
     const quantRandom = struct {
-        fn f(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, rows: c_int, cols: c_int, qbits: u32) !Q {
+        fn f(a: std.mem.Allocator, r: std.Random, st: mlx.mlx_stream, rows: c_int, cols: c_int, qbits: u32, qgs: u32) !Q {
             const buf = try a.alloc(f32, @intCast(rows * cols));
             defer a.free(buf);
             for (buf) |*v| v.* = (r.float(f32) - 0.5) * 0.2;
@@ -50344,7 +50849,7 @@ test "fused hyper-connection read matches the op chain per element" {
             try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, st));
             var triple = mlx.mlx_vector_array_new();
             defer _ = mlx.mlx_vector_array_free(triple);
-            try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(@intCast(qbits)), "affine", .{}, st));
+            try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(@intCast(qgs)), mlx.mlx_optional_int.some(@intCast(qbits)), "affine", .{}, st));
             var q: Q = undefined;
             q.w = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&q.w, triple, 0));
@@ -50370,13 +50875,13 @@ test "fused hyper-connection read matches the op chain per element" {
         }
     }.f;
 
-    const down = try quantRandom(allocator, rnd, s, R, K, bits);
+    const down = try quantRandom(allocator, rnd, s, R, K, bits, gs);
     defer {
         _ = mlx.mlx_array_free(down.w);
         _ = mlx.mlx_array_free(down.sc);
         _ = mlx.mlx_array_free(down.bi);
     }
-    const up = try quantRandom(allocator, rnd, s, K, R, bits);
+    const up = try quantRandom(allocator, rnd, s, K, R, bits, gs);
     defer {
         _ = mlx.mlx_array_free(up.w);
         _ = mlx.mlx_array_free(up.sc);
@@ -50519,8 +51024,7 @@ test "fused hyper-connection read matches the op chain per element" {
 
     // Multi-row arm (verify widths / batched slots): the 3-row read is
     // BIT-identical to the three single-row reads stacked, plain and
-    // pending, so an N>1 forward never changes what the N=1 path computed
-    // (4-bit here; 8-bit HC weights at 2..8 rows take the uv kernel below unless MLX_SERVE_HC_UV=0).
+    // pending, so an N>1 forward never changes what the N=1 path computed.
     const x3 = try bf16Random(allocator, rnd, s, &.{ 1, 3, K }, 4.0, 0.0);
     defer _ = mlx.mlx_array_free(x3);
     const wo3 = try bf16Random(allocator, rnd, s, &.{ 1, 3, H }, 2.0, 0.0);
@@ -50572,46 +51076,61 @@ test "fused hyper-connection read matches the op chain per element" {
     }
     try testing.expect((try hcReadFused(s, x3, 1, 17, nw, down.w, down.sc, down.bi, up.w, up.sc, up.bi, iw, eps, HC, H, bits, gs, null)) == null);
 
-    // hc uv kernel matches the per-row kernel at 2..8 rows (8-bit): engaged at every row count, declined for an
-    // unevaluated up weight (no data pointer to align-check), within the chain's tolerance of MLX_SERVE_HC_UV=0.
-    defer hc_uv_env = null;
+    if (bits != 8 or gs != 64) return;
+    // 8-bit rows take the vectorized up launch at every row count (an evaluated, aligned up weight; a lazy one has no data
+    // pointer and keeps the per-row launch): every row matches the single-row read, bit for bit.
     const R8: c_int = 320; // production width: several uint4 blocks per lane, scale group changing between them
-    const down8 = try quantRandom(allocator, rnd, s, R8, K, 8);
+    const down8 = try quantRandom(allocator, rnd, s, R8, K, 8, 64);
     defer {
         _ = mlx.mlx_array_free(down8.w);
         _ = mlx.mlx_array_free(down8.sc);
         _ = mlx.mlx_array_free(down8.bi);
     }
-    const up8 = try quantRandom(allocator, rnd, s, K, R8, 8);
+    const up8 = try quantRandom(allocator, rnd, s, K, R8, 8, 64);
     defer {
         _ = mlx.mlx_array_free(up8.w);
         _ = mlx.mlx_array_free(up8.sc);
         _ = mlx.mlx_array_free(up8.bi);
     }
-    var uw8 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(uw8);
-    try mlx.check(mlx.mlx_copy(&uw8, up8.w, s));
-    hc_uv_env = true;
-    try testing.expect(!hcUvEligible(HC, R8, 8, gs, 4, uw8));
-    try mlx.check(mlx.mlx_array_eval(uw8));
-    try testing.expect(hcUvEligible(HC, R8, 8, gs, 4, uw8));
-    var rows: c_int = 2;
-    while (rows <= 8) : (rows += 1) {
+    for ([_]c_int{ 2, 6, 9, 16 }) |rows| {
         const x8 = try bf16Random(allocator, rnd, s, &.{ 1, rows, K }, 4.0, 0.0);
         defer _ = mlx.mlx_array_free(x8);
-        var outs: [2]HcFusedOut = undefined;
-        var n_outs: usize = 0;
-        defer for (outs[0..n_outs]) |o| {
-            _ = mlx.mlx_array_free(o.mixed);
-            _ = mlx.mlx_array_free(o.inj);
-        };
-        for ([_]bool{ false, true }, 0..) |on, i| {
-            hc_uv_env = on;
-            outs[i] = (try hcReadFused(s, x8, 1, rows, nw, down8.w, down8.sc, down8.bi, uw8, up8.sc, up8.bi, iw, eps, HC, H, 8, gs, null)) orelse return error.HcFusedDeclined;
-            n_outs = i + 1;
-            try testing.expectEqual(on, hc_fused_key.uv);
+        const served_before = hc_decode2.served_vec;
+        const many = (try hcReadFused(s, x8, 1, rows, nw, down8.w, down8.sc, down8.bi, up8.w, up8.sc, up8.bi, iw, eps, HC, H, 8, gs, null)) orelse return error.HcFusedDeclined;
+        defer {
+            _ = mlx.mlx_array_free(many.mixed);
+            _ = mlx.mlx_array_free(many.inj);
         }
-        try checkClose(allocator, s, outs[0].mixed, outs[1].mixed, @intCast(rows * H));
+        try testing.expectEqual(served_before + 1, hc_decode2.served_vec);
+        var r: c_int = 0;
+        while (r < rows) : (r += 1) {
+            const st3 = [_]c_int{ 1, 1, 1 };
+            var xr = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(xr);
+            try mlx.check(mlx.mlx_slice(&xr, x8, &[_]c_int{ 0, r, 0 }, 3, &[_]c_int{ 1, r + 1, K }, 3, &st3, 3, s));
+            const one = (try hcReadFused(s, xr, 1, 1, nw, down8.w, down8.sc, down8.bi, up8.w, up8.sc, up8.bi, iw, eps, HC, H, 8, gs, null)) orelse return error.HcFusedDeclined;
+            defer {
+                _ = mlx.mlx_array_free(one.mixed);
+                _ = mlx.mlx_array_free(one.inj);
+            }
+            var mrow = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(mrow);
+            try mlx.check(mlx.mlx_slice(&mrow, many.mixed, &[_]c_int{ 0, r, 0 }, 3, &[_]c_int{ 1, r + 1, H }, 3, &st3, 3, s));
+            var irow = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(irow);
+            const st4 = [_]c_int{ 1, 1, 1, 1 };
+            try mlx.check(mlx.mlx_slice(&irow, many.inj, &[_]c_int{ 0, r, 0, 0 }, 4, &[_]c_int{ 1, r + 1, HC, 1 }, 4, &st4, 4, s));
+            inline for (.{ .{ one.mixed, mrow, H }, .{ one.inj, irow, HC } }) |pair| {
+                const n: usize = @intCast(pair[2]);
+                const left = try allocator.alloc(f32, n);
+                defer allocator.free(left);
+                const right = try allocator.alloc(f32, n);
+                defer allocator.free(right);
+                try testReadF32(pair[0], left, s);
+                try testReadF32(pair[1], right, s);
+                try testing.expectEqualSlices(f32, left, right);
+            }
+        }
     }
 }
 
@@ -51050,6 +51569,29 @@ fn moeRowsFusedCase(s: mlx.mlx_stream, rnd: std.Random, E: c_int, hid: c_int, in
     }
 }
 
+test "down+reduce lanes per row: 16 on G17, 8 on every other generation and on phones" {
+    try std.testing.expectEqual(@as(c_int, 16), downredLanesFor(17, false));
+    try std.testing.expectEqual(@as(c_int, 8), downredLanesFor(17, true));
+    for ([_]u32{ 0, 13, 14, 15, 16, 18, 19 }) |g| try std.testing.expectEqual(@as(c_int, 8), downredLanesFor(g, false));
+}
+
+test "moe rows fused: rows match solo calls at 8 and at 16 lanes per down row" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x1A4E);
+    const rnd = prng.random();
+    moe_rows_fused_override = true;
+    defer moe_rows_fused_override = null;
+    gqmv_gateup_override = true;
+    defer gqmv_gateup_override = null;
+    downred_override = true;
+    defer downred_override = null;
+    defer device_gen_override = null;
+    for ([_]u32{ 16, 17 }) |gen| {
+        device_gen_override = .{ .gen = gen, .phone = false };
+        try moeRowsFusedCase(s, rnd, 512, 2560, 640, 10, 8, 4, 64, 4, 64);
+    }
+}
+
 test "fused SwiGLU matches the chain on EVERY finite bf16 gate value" {
     // Random sampling said bit-identical while the live model diverged at
     // token ~55, so the sigmoid is swept exhaustively instead: all 65536 bf16
@@ -51140,18 +51682,22 @@ test "fused SwiGLU declines mismatched shapes rather than reading out of bounds"
     try testing.expect((try fusedSwiGLU(s, g32, g32)) == null);
 }
 
-test "verify shared projection preserves solo qmv values across request widths" {
+test "verify shared projection preserves solo qmv values across request widths, at g64 and g128" {
+    // A two-stream group: dual-die M5 takes the joined kernels only then.
+    const outer_group_rows = verify_group_rows;
+    verify_group_rows = 2;
+    defer verify_group_rows = outer_group_rows;
     if (mlx.noGpuBackend() or !verifySharedHardware()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5A4E);
-    for ([_][2]c_int{ .{ 2560, 640 }, .{ 640, 2560 } }) |shape| {
+    for ([_]u32{ 64, 128 }) |gs| for ([_][2]c_int{ .{ 2560, 640 }, .{ 640, 2560 } }) |shape| {
         const k = shape[0];
         const n = shape[1];
         const weight = try attn256RandBf16(prng.random(), &.{ n, k }, s);
         defer _ = mlx.mlx_array_free(weight);
         var triple = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(triple);
-        try mlx.check(mlx.mlx_quantize(&triple, weight, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(8), "affine", .{}, s));
+        try mlx.check(mlx.mlx_quantize(&triple, weight, mlx.mlx_optional_int.some(@intCast(gs)), mlx.mlx_optional_int.some(8), "affine", .{}, s));
         var w = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(w);
         var sc = mlx.mlx_array_new();
@@ -51166,7 +51712,8 @@ test "verify shared projection preserves solo qmv values across request widths" 
             for (lengths[0..count]) |width| total += width;
             const x = try attn256RandBf16(prng.random(), &.{ 1, total, k }, s);
             defer _ = mlx.mlx_array_free(x);
-            if (total > 24) {
+            const arch = verifyArch().?;
+            if (total > 24 or total >= qmvBatchLimit(arch[arch.len - 1] == 'd', k, n)) {
                 try testing.expect((try verifySharedProjection(s, x, w, sc, bi, lengths[0..count])) == null);
                 continue;
             }
@@ -51177,7 +51724,7 @@ test "verify shared projection preserves solo qmv values across request widths" 
                 var row = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(row);
                 try mlx.check(mlx.mlx_slice(&row, x, &.{ 0, offset, 0 }, 3, &.{ 1, offset + width, k }, 3, &.{ 1, 1, 1 }, 3, s));
-                const expected = try qmatmulBits(row, w, sc, bi, 8, 64, .affine, s);
+                const expected = try qmatmulBits(row, w, sc, bi, 8, gs, .affine, s);
                 defer _ = mlx.mlx_array_free(expected);
                 var actual = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(actual);
@@ -51199,7 +51746,7 @@ test "verify shared projection preserves solo qmv values across request widths" 
         vqmm_mixed_plain_test_force = true;
         defer vqmm_mixed_plain_test_force = old;
         try testing.expect((try verifySharedProjection(s, x, w, sc, bi, &.{ 4, 4 })) == null);
-    }
+    };
 }
 
 test "verify GDN projections preserve solo qmv values across request widths" {
@@ -51424,7 +51971,7 @@ test "qmatmulBits keeps row-axis MTP kernels out of plain batched projections" {
     }
 }
 
-test "msv_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape" {
+test "msv_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape, width and group" {
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     std.debug.print("[msv_qmv_rows] hermetic start\n", .{});
@@ -51438,10 +51985,9 @@ test "msv_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape" {
         .{ 2560, 640 },
         .{ 2560, 248320 },
     };
-    const bitss = [_]u32{ 3, 4, 8 };
+    const bitss = [_]u32{ 3, 4, 5, 6, 8 };
     const ns = [_]c_int{ 2, 4, 8, 16 };
-    const gs: u32 = 64;
-    for (bitss) |bits| {
+    for ([_]u32{ 64, 128 }) |gs| for (bitss) |bits| {
         for (shapes) |kn| {
             const K = kn[0];
             const Nout = kn[1];
@@ -51496,10 +52042,10 @@ test "msv_qmv_rows is mlx_equal per row to stock M=1 qmv at every head shape" {
                     }
                     try testing.expectEqual(@as(f32, 0.0), diff);
                 }
-                std.debug.print("[msv_qmv_rows] eq bits={d} K={d} N={d} rows={d}\n", .{ bits, K, Nout, nrows });
+                std.debug.print("[msv_qmv_rows] eq bits={d} gs={d} K={d} N={d} rows={d}\n", .{ bits, gs, K, Nout, nrows });
             }
         }
-    }
+    };
 }
 
 test "moeRouterThreadGroup keeps a full simdgroup and caps at 256" {
@@ -55237,18 +55783,17 @@ test "mixedPlainShapeEnabled: adoption is what was MEASURED, per width and per s
     // and forcing them on gave back ~10 of the ~20 points.
     try t.expect(!mixedPlainShapeEnabled(6, 64, MIXED_PLAIN_MIN_N - 1));
     try t.expect(!mixedPlainShapeEnabled(6, 64, 1024));
-    // Only gs 64 was measured.
+    // 5-bit and gs 128 measured on the Flash Next oQ4e pack (z, out, o: N 2560/6144).
+    for ([_]u32{ 5, 6 }) |b| for ([_]u32{ 64, 128 }) |g| {
+        try t.expect(mixedPlainShapeEnabled(b, g, 2560));
+        try t.expect(mixedPlainShapeEnabled(b, g, 6144));
+    };
     try t.expect(!mixedPlainShapeEnabled(6, 32, 17408));
-    try t.expect(!mixedPlainShapeEnabled(6, 128, 17408));
 
     // 8-bit HAS a correct kernel arm and a parity test, and is still default
-    // OFF: measured 1.01-1.04x, inside what this harness resolves. 5-bit has
-    // the arm too but no pack on the measuring box, so it does not get to ride
-    // 6-bit's number. Both are one env var from on — an unmeasured default is
-    // the thing this predicate exists to prevent.
-    for ([_]u32{ 5, 8 }) |b| {
-        try t.expect(!mixedPlainShapeEnabled(b, 64, 17408));
-    }
+    // OFF: measured 1.01-1.04x, inside what this harness resolves. One env var
+    // from on — an unmeasured default is the thing this predicate exists to prevent.
+    try t.expect(!mixedPlainShapeEnabled(8, 64, 17408));
     // A width with no unpack arm is never adopted, whatever the shape.
     for ([_]u32{ 2, 3, 7 }) |b| try t.expect(!mixedPlainShapeEnabled(b, 64, 17408));
 }
@@ -55410,11 +55955,13 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
     // 5/6/8-bit weights on the measured wide shape class. Keep this self-gated
     // like the NAX rows above so non-G17 CI never attempts to compile an
     // unavailable MPP kernel.
+    // Forced open: parity at g128 is proven apart from whether the shape is adopted.
     if (verifyQmmNaxEnabled()) {
+        vqmm_mixed_nax_test_force = true;
+        defer vqmm_mixed_nax_test_force = null;
         const k: c_int = 512;
         const n: c_int = 5120;
-        const gs: u32 = 64;
-        for ([_]u32{ 5, 6, 8 }) |bits| {
+        for ([_]u32{ 64, 128 }) |gs| for ([_]u32{ 5, 6, 8 }) |bits| {
             const wb = try testRandWeightBf16(rnd, &[_]c_int{ n, k }, s);
             defer _ = mlx.mlx_array_free(wb);
 
@@ -55492,8 +56039,8 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             );
 
             // Below the NAX takeover row, default adoption remains the measured
-            // width/shape surface: this q6/gs64/N=5120 projection uses the
-            // plain-SIMD lane, while q5 still falls through to stock.
+            // width/shape surface: this q5/q6 gs64 N=5120 projection uses the
+            // plain-SIMD lane, while q8 still falls through to stock.
             const x6buf = try allocator.alloc(f32, 6 * @as(usize, @intCast(k)));
             defer allocator.free(x6buf);
             for (x6buf) |*v| v.* = 0.1;
@@ -55504,15 +56051,15 @@ test "verifyQmm: split-K + msg + NAX verify-width kernels match stock qmm (4-bit
             defer _ = mlx.mlx_array_free(x6);
             try mlx.check(mlx.mlx_astype(&x6, x6f, .bfloat16, s));
             const got6_opt = try verifyQmm(s, x6, wq, wsc, wbi, bits, gs);
-            if (bits == 6) {
+            if (bits != 8) {
                 try testing.expect(got6_opt != null);
                 const got6 = got6_opt.?;
                 defer _ = mlx.mlx_array_free(got6);
-                try expectVerifyQmmNoWorseThanStock(s, x6, wq, wsc, wbi, bits, gs, wdq_t, got6, "plain-SIMD q6");
+                try expectVerifyQmmNoWorseThanStock(s, x6, wq, wsc, wbi, bits, gs, wdq_t, got6, "plain-SIMD q5/q6");
             } else {
                 try testing.expectEqual(@as(?mlx.mlx_array, null), got6_opt);
             }
-        }
+        };
     }
 
     // ── msg wide-tile parity (the huge-N/lm_head arm), called directly with
@@ -55737,16 +56284,26 @@ test "verifyQmm: crossrow M 8/9 lane matches stock qmm (4-bit g64, opt-in)" {
 }
 
 test "mixedNaxShapeEnabled keeps measured q5/q6/q8 wins and rejects narrow regressions" {
-    try testing.expect(mixedNaxShapeEnabled(4, 32, 1024));
-    try testing.expect(mixedNaxShapeEnabled(5, 64, 5120));
-    try testing.expect(mixedNaxShapeEnabled(6, 64, 5120));
-    try testing.expect(mixedNaxShapeEnabled(8, 64, 5120));
-    try testing.expect(!mixedNaxShapeEnabled(5, 64, 1024));
-    try testing.expect(!mixedNaxShapeEnabled(6, 64, 1024));
-    try testing.expect(!mixedNaxShapeEnabled(8, 64, 1024));
-    try testing.expect(!mixedNaxShapeEnabled(5, 32, 5120));
-    try testing.expect(!mixedNaxShapeEnabled(6, 128, 5120));
-    try testing.expect(!mixedNaxShapeEnabled(8, 32, 5120));
+    for ([_]c_int{ 8, 12 }) |m| {
+        try testing.expect(mixedNaxShapeEnabled(4, 32, 1024, m));
+        try testing.expect(mixedNaxShapeEnabled(5, 64, 5120, m));
+        try testing.expect(mixedNaxShapeEnabled(6, 64, 5120, m));
+        try testing.expect(mixedNaxShapeEnabled(8, 64, 5120, m));
+        try testing.expect(!mixedNaxShapeEnabled(5, 64, 1024, m));
+        try testing.expect(!mixedNaxShapeEnabled(6, 64, 1024, m));
+        try testing.expect(!mixedNaxShapeEnabled(8, 64, 1024, m));
+        try testing.expect(!mixedNaxShapeEnabled(5, 32, 5120, m));
+        try testing.expect(!mixedNaxShapeEnabled(8, 32, 5120, m));
+        // 8-bit at N 2560 (our Flash Next pack's o/out projections) loses at M 7-8.
+        try testing.expect(!mixedNaxShapeEnabled(8, 64, 2560, m));
+        try testing.expect(!mixedNaxShapeEnabled(8, 128, 5120, m));
+        try testing.expect(!mixedNaxShapeEnabled(5, 128, 2559, m));
+    }
+    // Flash Next oQ4e's 5/6-bit g128 and 2560-wide projections: a loss at 8 verify rows, a win at 12.
+    for ([_][3]c_int{ .{ 6, 128, 5120 }, .{ 5, 128, 2560 }, .{ 5, 64, 2560 } }) |c| {
+        try testing.expect(!mixedNaxShapeEnabled(@intCast(c[0]), @intCast(c[1]), c[2], 8));
+        try testing.expect(mixedNaxShapeEnabled(@intCast(c[0]), @intCast(c[1]), c[2], 9));
+    }
 }
 
 test "oQ4e layer-role fingerprint pins every mixed override" {
@@ -57263,6 +57820,91 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)
     }
 }
 
+test "verifyQmm Flash Next shapes µbench: stock vs plain vs NAX per width (MLX_SERVE_VQMM_FN_UBENCH=1)" {
+    if (std.c.getenv("MLX_SERVE_VQMM_FN_UBENCH") == null) return error.SkipZigTest;
+    const io_util = @import("io_util");
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xF1A5);
+    const rnd = prng.random();
+    const BATCH = 12;
+    const ITERS = 40;
+    vqmm_mixed_plain_test_force = true;
+    defer vqmm_mixed_plain_test_force = null;
+    vqmm_mixed_nax_test_force = true;
+    defer vqmm_mixed_nax_test_force = null;
+    // Per-forward counts: Jundot oQ4e (mixed) and our iQ pack (non-expert 8-bit g64).
+    const shapes = [_]struct { name: []const u8, bits: u32, gs: u32, k: c_int, n: c_int, per: f64 }{
+        .{ .name = "J gdn_z", .bits = 5, .gs = 128, .k = 2560, .n = 6144, .per = 25 },
+        .{ .name = "J gdn_out", .bits = 5, .gs = 128, .k = 6144, .n = 2560, .per = 36 },
+        .{ .name = "J attn_o5", .bits = 5, .gs = 64, .k = 6144, .n = 2560, .per = 2 },
+        .{ .name = "J attn_o6", .bits = 6, .gs = 64, .k = 6144, .n = 2560, .per = 3 },
+        .{ .name = "J sh_gu", .bits = 8, .gs = 128, .k = 2560, .n = 640, .per = 96 },
+        .{ .name = "J sh_down", .bits = 8, .gs = 128, .k = 640, .n = 2560, .per = 48 },
+        .{ .name = "O gdn_qkv", .bits = 8, .gs = 64, .k = 2560, .n = 10240, .per = 36 },
+        .{ .name = "O gdn_z", .bits = 8, .gs = 64, .k = 2560, .n = 6144, .per = 36 },
+        .{ .name = "O gdn_out", .bits = 8, .gs = 64, .k = 6144, .n = 2560, .per = 36 },
+        .{ .name = "O attn_q", .bits = 8, .gs = 64, .k = 2560, .n = 12288, .per = 12 },
+        .{ .name = "O attn_o", .bits = 8, .gs = 64, .k = 6144, .n = 2560, .per = 12 },
+        .{ .name = "O sh_gu", .bits = 8, .gs = 64, .k = 2560, .n = 640, .per = 96 },
+        .{ .name = "O sh_down", .bits = 8, .gs = 64, .k = 640, .n = 2560, .per = 48 },
+    };
+    const widths = [_]c_int{ 3, 5, 7, 8, 12 };
+    std.debug.print("\n[vqmm-fn] {s:>10} {s:>5} {s:>3} {s:>9} {s:>9} {s:>6} {s:>9}\n", .{ "shape", "q", "M", "stock_us", "lane_us", "ratio", "saved/fwd" });
+    for (shapes) |sh| {
+        const wb = try testRandWeightBf16(rnd, &[_]c_int{ sh.n, sh.k }, s);
+        defer _ = mlx.mlx_array_free(wb);
+        var triple = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(triple);
+        try mlx.check(mlx.mlx_quantize(&triple, wb, mlx.mlx_optional_int.some(@intCast(sh.gs)), mlx.mlx_optional_int.some(@intCast(sh.bits)), "affine", .{}, s));
+        var q: [3]mlx.mlx_array = undefined;
+        for (&q, 0..) |*a, i| {
+            a.* = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_vector_array_get(a, triple, i));
+            try mlx.check(mlx.mlx_array_eval(a.*));
+        }
+        defer for (q) |a| {
+            _ = mlx.mlx_array_free(a);
+        };
+        for (widths) |m| {
+            var xs: [BATCH]mlx.mlx_array = undefined;
+            for (&xs) |*a| {
+                a.* = try testRandWeightBf16(rnd, &[_]c_int{ 1, m, sh.k }, s);
+                try mlx.check(mlx.mlx_array_eval(a.*));
+            }
+            defer for (xs) |a| {
+                _ = mlx.mlx_array_free(a);
+            };
+            var ns: [2]u64 = .{ 0, 0 };
+            var lane_ok = true;
+            for (0..ITERS + 2) |it| for ([_]usize{ it % 2, 1 - it % 2 }) |arm| {
+                var outs: [BATCH]mlx.mlx_array = undefined;
+                var got: usize = 0;
+                var sw = io_util.Stopwatch.init(testing.io);
+                for (&outs, xs) |*o, x| {
+                    if (arm == 0) {
+                        o.* = mlx.mlx_array_new();
+                        try mlx.check(mlx.mlx_quantized_matmul(o, x, q[0], q[1], q[2], true, mlx.mlx_optional_int.some(@intCast(sh.gs)), mlx.mlx_optional_int.some(@intCast(sh.bits)), "affine", s));
+                    } else o.* = (try verifyQmm(s, x, q[0], q[1], q[2], sh.bits, sh.gs)) orelse break;
+                    got += 1;
+                }
+                if (got == BATCH) {
+                    const vec = mlx.mlx_vector_array_new_data(&outs, BATCH);
+                    try mlx.check(mlx.mlx_eval(vec));
+                    _ = mlx.mlx_vector_array_free(vec);
+                } else lane_ok = false;
+                if (it >= 2) ns[arm] += sw.read();
+                for (outs[0..got]) |o| _ = mlx.mlx_array_free(o);
+            };
+            const per_call = 1e3 * @as(f64, ITERS * BATCH);
+            const st = @as(f64, @floatFromInt(ns[0])) / per_call;
+            const ln = @as(f64, @floatFromInt(ns[1])) / per_call;
+            if (lane_ok) {
+                std.debug.print("[vqmm-fn] {s:>10} {d}/{d:>3} {d:>3} {d:>9.1} {d:>9.1} {d:>6.2} {d:>9.1}\n", .{ sh.name, sh.bits, sh.gs, m, st, ln, ln / st, (st - ln) * sh.per });
+            } else std.debug.print("[vqmm-fn] {s:>10} {d}/{d:>3} {d:>3} {d:>9.1} {s:>9}\n", .{ sh.name, sh.bits, sh.gs, m, st, "declined" });
+        }
+    }
+}
+
 test "verifyQmm mixed-width NAX µbench (MLX_SERVE_VQMM_MIXED_UBENCH=1)" {
     if (std.c.getenv("MLX_SERVE_VQMM_MIXED_UBENCH") == null) return error.SkipZigTest;
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
@@ -58028,6 +58670,75 @@ test "fusedSdpa256Masked: QSA bool-mask parity vs composed 'array' SDPA (GQA, ra
     try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, mask)) == null);
 }
 
+/// Materialized `[B,H,T,264]` padded cache sliced on the last axis to
+/// `[lo, lo+256)`: a 256-wide view whose row stride is divisible by 8 elements
+/// (16 bytes) while its base sits `lo*2` bytes into the buffer — the shape the
+/// `uint4` staging loads of the two old kernels must not read.
+fn attn256SliceLastDim(
+    parent: mlx.mlx_array,
+    lo: c_int,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    const ps = mlx.getShape(parent);
+    const one = [_]c_int{ 1, 1, 1, 1 };
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const stop = [_]c_int{ ps[0], ps[1], ps[2], lo + 256 };
+    try mlx.check(mlx.mlx_slice(&out, parent, &[_]c_int{ 0, 0, 0, lo }, 4, &stop, 4, &one, 4, s));
+    try mlx.check(mlx.mlx_array_eval(out));
+    return out;
+}
+
+test "fusedSdpa256Masked: a last-axis slice with an unaligned base declines and the fallback reads exactly" {
+    // `[3,259)` has a 6-byte base: the row stride (264) is divisible by 8 so the
+    // existing stride checks pass, but `msv_attn_p256`'s `uint4` K/V staging
+    // reads wrong values. The gate must decline it and the caller's fallback
+    // (`qsaMaskArm`, the same arm production takes) must serve the shape.
+    // `[0,256)` is the aligned twin: it keeps the fused kernel.
+    const s = mlx.gpuStream();
+    fused256_override = true;
+    defer fused256_override = null;
+    qsa_fused_override = true;
+    defer qsa_fused_override = null;
+    var prng = std.Random.DefaultPrng.init(0x5E7_5E7);
+    const rnd = prng.random();
+
+    const q_shape = [_]c_int{ 1, 6, 70, 256 };
+    const q = try attn256RandBf16(rnd, &q_shape, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 193, 264 }, s);
+    defer _ = mlx.mlx_array_free(k_pad);
+    const v_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, 193, 264 }, s);
+    defer _ = mlx.mlx_array_free(v_pad);
+    try mlx.check(mlx.mlx_array_eval(k_pad));
+    try mlx.check(mlx.mlx_array_eval(v_pad));
+    const mask = try attn256QsaMask(rnd, 70, 193);
+    defer _ = mlx.mlx_array_free(mask);
+    const scale: f32 = 1.0 / 16.0;
+
+    const k = try attn256SliceLastDim(k_pad, 3, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256SliceLastDim(v_pad, 3, s);
+    defer _ = mlx.mlx_array_free(v);
+    try std.testing.expect((try fusedSdpa256Masked(s, q, k, v, scale, mask)) == null);
+    const arm = try qsaMaskArm(s, q, k, v, scale, mask);
+    defer _ = mlx.mlx_array_free(arm);
+    const ref = try attn256Reference(q, k, v, scale, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    try std.testing.expect(try attn256MaxDiff(arm, ref, s) < 0.005);
+
+    // An aligned twin keeps the fast path.
+    const k_al = try attn256SliceLastDim(k_pad, 0, s);
+    defer _ = mlx.mlx_array_free(k_al);
+    const v_al = try attn256SliceLastDim(v_pad, 0, s);
+    defer _ = mlx.mlx_array_free(v_al);
+    const fast = (try fusedSdpa256Masked(s, q, k_al, v_al, scale, mask)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(fast);
+    const ref_al = try attn256Reference(q, k_al, v_al, scale, "array", mask, s);
+    defer _ = mlx.mlx_array_free(ref_al);
+    try std.testing.expect(try attn256MaxDiff(fast, ref_al, s) < 0.005);
+}
+
 /// A sorted qwen4 block selection [1,qL,kb] int32 for rows straddling the
 /// "every block fits" boundary (INT_MAX past each row's count), plus the
 /// equivalent dense [1,1,qL,kL] mask the composed reference consumes.
@@ -58395,6 +59106,65 @@ test "gatherQsa256 NAX: precise sparse attention and stock fallback" {
     const fallback = (try gatherQsa256(s, q, k, v, scale, smaller.blocks, 4)) orelse return error.GatherDeclined;
     defer _ = mlx.mlx_array_free(fallback);
     try std.testing.expect(!qsa_gather_used_nax);
+}
+
+test "gatherQsa256: a last-axis slice with an unaligned base declines and reads the same shape as the fallback" {
+    // The stock `msv_attn_qsa256` kernel stages K/V in `uint4` loads. A
+    // `[3,259)` slice of a padded `[1,2,101,264]` cache has a 16-byte row
+    // stride (264) but a 6-byte base, so the loads read wrong values. The
+    // gate must decline it and the caller's fallback (`qsaMaskArm`) must
+    // serve the same shape. `[0,256)` is the aligned twin: it keeps the
+    // stock kernel.
+    const s = mlx.gpuStream();
+    qsa_gather_override = true;
+    defer qsa_gather_override = null;
+    qsa_nax_override = false;
+    defer qsa_nax_override = null;
+    defer qsa_gather_bk_override = null;
+    var prng = std.Random.DefaultPrng.init(0x0FF_5E7);
+    const rnd = prng.random();
+
+    const qL: c_int = 40;
+    const kL: c_int = 101;
+    const kb: c_int = 512;
+    const q = try attn256RandBf16(rnd, &[_]c_int{ 1, 24, qL, 256 }, s);
+    defer _ = mlx.mlx_array_free(q);
+    const k_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kL, 264 }, s);
+    defer _ = mlx.mlx_array_free(k_pad);
+    const v_pad = try attn256RandBf16(rnd, &[_]c_int{ 1, 2, kL, 264 }, s);
+    defer _ = mlx.mlx_array_free(v_pad);
+    try mlx.check(mlx.mlx_array_eval(k_pad));
+    try mlx.check(mlx.mlx_array_eval(v_pad));
+    var fx = try QsaBlockFixture.build(rnd, qL, kL, kb, 4);
+    defer fx.deinit();
+    const scale: f32 = 1.0 / 16.0;
+
+    const k = try attn256SliceLastDim(k_pad, 3, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try attn256SliceLastDim(v_pad, 3, s);
+    defer _ = mlx.mlx_array_free(v);
+
+    // The unaligned view must not reach the kernel; the fallback arm reads
+    // the same shape and matches the composed reference within the
+    // neighboring tests' bar.
+    try std.testing.expect((try gatherQsa256(s, q, k, v, scale, fx.blocks, 4)) == null);
+    const ref = try attn256Reference(q, k, v, scale, "array", fx.mask, s);
+    defer _ = mlx.mlx_array_free(ref);
+    const arm = try qsaMaskArm(s, q, k, v, scale, fx.mask);
+    defer _ = mlx.mlx_array_free(arm);
+    try std.testing.expect(try attn256MaxDiff(arm, ref, s) < 0.005);
+
+    // An aligned twin keeps the stock (non-NAX) fast path.
+    const k_al = try attn256SliceLastDim(k_pad, 0, s);
+    defer _ = mlx.mlx_array_free(k_al);
+    const v_al = try attn256SliceLastDim(v_pad, 0, s);
+    defer _ = mlx.mlx_array_free(v_al);
+    const fast = (try gatherQsa256(s, q, k_al, v_al, scale, fx.blocks, 4)) orelse return error.GatherDeclined;
+    defer _ = mlx.mlx_array_free(fast);
+    try std.testing.expect(!qsa_gather_used_nax);
+    const ref_al = try attn256Reference(q, k_al, v_al, scale, "array", fx.mask, s);
+    defer _ = mlx.mlx_array_free(ref_al);
+    try std.testing.expect(try attn256MaxDiff(fast, ref_al, s) < 0.005);
 }
 
 test "gatherQsa256 NAX: max error vs f32 gather-softmax is at most 1.5x stock" {
@@ -66624,6 +67394,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             vids_buf[0] = t1;
             for (drafts, 0..) |d, i| vids_buf[1 + i] = d;
             const kv_step_snap = cache.step;
+            const base = off; // the trunk's position; qwen4 never advances `cache.step`
             ctx.capture_ssm_seq = true;
             var vh_all = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(vh_all);
@@ -66633,11 +67404,11 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
             _ = mlx.mlx_array_free(try xfm.forwardWith(&ctx, vids));
             ctx.capture_ssm_seq = false;
             ctx.capture_hidden_all = null;
-            try cache.truncate(kv_step_snap + 1 + acc, s);
+            try cache.truncate(base + 1 + acc, s);
             cache.step = kv_step_snap;
             for (entries) |*e| try ssmRollbackFromCapture(e, acc, @intCast(1 + M), s);
             for (entries) |*e| ssmFreeSpecCapture(e);
-            off = kv_step_snap + 1 + acc;
+            off = base + 1 + acc;
             // Phase 5a stash: ids [t1, drafts[0..acc]], hidden [last_hidden, vh[0..acc]].
             try stash_ids.append(allocator, t1);
             for (drafts[0..acc]) |d| try stash_ids.append(allocator, d);
@@ -71475,7 +72246,7 @@ test "single-stream verify feature selection excludes prefill and ordinary decod
     const old_features = single_verify_test_features;
     defer single_verify_test_features = old_features;
     single_verify_test_features = @splat(true);
-    inline for (.{ SingleVerifyFeature.routing, SingleVerifyFeature.down_reduce, SingleVerifyFeature.hc_graph }) |feature| {
+    inline for (.{ SingleVerifyFeature.routing, SingleVerifyFeature.down_reduce }) |feature| {
         for ([_]bool{ false, true }) |is_qwen4| {
             xfm.qwen4 = if (is_qwen4) &qwen4 else null;
             for ([_]bool{ false, true }) |capture| {
@@ -71552,7 +72323,6 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
     var initialized: usize = 0;
     defer for (slots[0..initialized]) |slot| slot.deinit(a);
     const prefill_routes = mtp_verify_kernel_calls[2];
-    const prefill_hc = mtp_verify_hc_prepared_calls;
     for (&slots, 0..) |*target, arm| {
         single_verify_test_features = @splat(arm == 1);
         target.* = try Qwen4TestSlot.init(a, config.num_hidden_layers);
@@ -71570,7 +72340,6 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         target.*.ctx.skip_lm_head = false;
     }
     try testing.expectEqual(prefill_routes, mtp_verify_kernel_calls[2]);
-    try testing.expectEqual(prefill_hc, mtp_verify_hc_prepared_calls);
     var position = prefix_len;
     for ([_]usize{ 1, 2, 3, 4, 5, 6, 7 }) |width| {
         const input = mlx.mlx_array_new_data(@ptrCast(ids[position..][0..width].ptr), &.{ 1, @as(c_int, @intCast(width)) }, 2, .int32);
@@ -71578,11 +72347,11 @@ test "single-stream verify optimizations preserve native outputs and captures (Q
         single_verify_test_features = @splat(false);
         var reference = try singleVerifyTestRound(&xfm, slots[0], input);
         defer reference.deinit();
-        const before = [_]u64{ mtp_verify_kernel_calls[2], mtp_verify_indexed_input_calls, mtp_verify_expert_pairs_calls, mtp_verify_expert_reduce_calls, mtp_verify_hc_prepared_calls };
+        const before = [_]u64{ mtp_verify_kernel_calls[2], mtp_verify_indexed_input_calls, mtp_verify_expert_pairs_calls, mtp_verify_expert_reduce_calls };
         single_verify_test_features = @splat(true);
         var candidate = try singleVerifyTestRound(&xfm, slots[1], input);
         defer candidate.deinit();
-        const after = [_]u64{ mtp_verify_kernel_calls[2], mtp_verify_indexed_input_calls, mtp_verify_expert_pairs_calls, mtp_verify_expert_reduce_calls, mtp_verify_hc_prepared_calls };
+        const after = [_]u64{ mtp_verify_kernel_calls[2], mtp_verify_indexed_input_calls, mtp_verify_expert_pairs_calls, mtp_verify_expert_reduce_calls };
         inline for (.{ "logits", "last", "all" }) |field| try expectRowsByteEqual(a, xfm.s, @field(reference, field), @field(candidate, field), "single verify " ++ field);
         for (slots[0].entries, slots[1].entries) |*left, *right| {
             inline for (.{ "conv_state", "ssm_state", "aux_state", "qsa_pooled", "spec_conv_input", "spec_ple_input" }) |field| {
@@ -72439,6 +73208,91 @@ test "glm5_next fixture: one-shot and chunked prefill + decode vs mlx-vlm glm5_n
     try testing.expect(worst > 0.995 and misses == 0);
 }
 
+test "glm5_next batched decode: a three-slot tick tracks three serial decodes (GLM5_MODEL, GLM5_FIXTURE)" {
+    const model_dir = std.c.getenv("GLM5_MODEL") orelse return error.SkipZigTest;
+    const fixture_path = std.c.getenv("GLM5_FIXTURE") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.supportsBatchedGdnDecode());
+
+    var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
+    defer fx.deinit();
+    const ids_arr = fx.get("input_ids") orelse return error.MissingFixtureTensor;
+    try mlx.check(mlx.mlx_array_eval(ids_arr));
+    const ids = (mlx.mlx_array_data_int32(ids_arr) orelse return error.Unreadable)[0..mlx.mlx_array_size(ids_arr)];
+    const v: usize = @intCast(config.vocab_size);
+    const ref = try qwen4ReadF32(allocator, fx.get("logits_full") orelse return error.MissingFixtureTensor, s);
+    defer allocator.free(ref);
+
+    // Three slots on shifted windows of the fixture's sequence, each prefilled alone; the second
+    // set of three decodes in one tick. Slot 0 follows the fixture, so it has a reference row.
+    const n_slots = 3;
+    const prompt = 6;
+    const steps = 8;
+    var serial: [n_slots]*Qwen4TestSlot = undefined;
+    var batched: [n_slots]*Qwen4TestSlot = undefined;
+    for (0..n_slots) |i| {
+        serial[i] = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+        batched[i] = try Qwen4TestSlot.init(allocator, config.num_hidden_layers);
+        for ([_]*Qwen4TestSlot{ serial[i], batched[i] }) |sl| _ = mlx.mlx_array_free(try sl.forward(&xfm, ids[i .. i + prompt]));
+    }
+    defer for (0..n_slots) |i| {
+        serial[i].deinit(allocator);
+        batched[i].deinit(allocator);
+    };
+    var ctxs: [n_slots]*ForwardCtx = undefined;
+    for (&ctxs, batched) |*c, sl| c.* = &sl.ctx;
+
+    var cos_vs_serial: f64 = 1.0;
+    var cos_serial_ref: f64 = 1.0;
+    var cos_batched_ref: f64 = 1.0;
+    for (0..steps) |k| {
+        var toks: [n_slots]u32 = undefined;
+        var offs: [n_slots]u32 = undefined;
+        for (0..n_slots) |i| {
+            toks[i] = @intCast(ids[i + prompt + k]);
+            offs[i] = @intCast(batched[i].off);
+        }
+        try testing.expect(xfm.batchedGdnReady(&ctxs));
+        var hidden: ?[]mlx.mlx_array = null;
+        defer if (hidden) |h| {
+            for (h) |a| _ = mlx.mlx_array_free(a);
+            allocator.free(h);
+        };
+        const out = try xfm.forwardMoeBatchedDecode(&toks, &ctxs, &offs, &hidden);
+        defer {
+            for (out) |o| _ = mlx.mlx_array_free(o);
+            allocator.free(out);
+        }
+        try testing.expectEqual(@as(usize, n_slots), hidden.?.len);
+        for (batched) |sl| sl.off += 1; // the scheduler advances each slot after the tick
+        for (0..n_slots) |i| {
+            const alone = try serial[i].forward(&xfm, &.{@intCast(toks[i])});
+            defer _ = mlx.mlx_array_free(alone);
+            const sv = try qwen4ReadF32(allocator, alone, s);
+            defer allocator.free(sv);
+            const bv = try qwen4ReadF32(allocator, out[i], s);
+            defer allocator.free(bv);
+            cos_vs_serial = @min(cos_vs_serial, qwen4CompareRows(bv, sv, 1, v).min_cos);
+            if (i == 0) {
+                const r = ref[(prompt + k) * v ..][0..v];
+                cos_serial_ref = @min(cos_serial_ref, qwen4CompareRows(sv, r, 1, v).min_cos);
+                cos_batched_ref = @min(cos_batched_ref, qwen4CompareRows(bv, r, 1, v).min_cos);
+            }
+        }
+    }
+    std.debug.print("[glm5 batched] {d} ticks x {d} slots: min cos batched-vs-serial {d:.5}; vs fp32 reference serial {d:.5} batched {d:.5}\n", .{ steps, n_slots, cos_vs_serial, cos_serial_ref, cos_batched_ref });
+    try testing.expect(cos_vs_serial > 0.999 and cos_batched_ref > cos_serial_ref - 0.001);
+}
+
 /// Bit equality of two strided views (cache slices are not row-contiguous).
 fn ringViewsEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !bool {
     const ca = try materializedOwnedCopy(s, a);
@@ -72446,6 +73300,32 @@ fn ringViewsEqual(s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array) !bool {
     const cb = try materializedOwnedCopy(s, b);
     defer _ = mlx.mlx_array_free(cb);
     return bf16BitsEqual(ca, cb);
+}
+
+test "KVCache restore: a restored entry exposes its live rows to a read before the first update" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0x7E57);
+    var src = try KVCache.init(testing.allocator, 1);
+    defer src.deinit();
+    const k = try testRandWeightBf16(prng.random(), &.{ 1, 1, 25, 8 }, s);
+    defer _ = mlx.mlx_array_free(k);
+    const v = try testRandWeightBf16(prng.random(), &.{ 1, 1, 25, 4 }, s);
+    defer _ = mlx.mlx_array_free(v);
+    var first = try src.update(0, k, v, s, 0);
+    first.deinit();
+    var snap = try src.snapshot();
+    defer snap.deinit();
+
+    // The GLM DSA layer reads the cached rows BEFORE it appends (the previous indexer rows for pooling).
+    var back = try KVCache.init(testing.allocator, 1);
+    defer back.deinit();
+    try back.restore(&snap);
+    const view = try back.denseView(0, s);
+    try testing.expect(view.k.ctx != null and view.v.ctx != null);
+    try testing.expectEqual(@as(c_int, 25), mlx.getShape(view.k)[2]);
+    try testing.expectEqual(@as(c_int, 25), mlx.getShape(view.v)[2]);
+    try testing.expect(try ringViewsEqual(s, view.k, k));
 }
 
 test "KVCache sliding ring: a sliding layer keeps its newest rows and serves the full buffer's window" {
