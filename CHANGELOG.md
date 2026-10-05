@@ -3,6 +3,7 @@
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
 ### New
+- **ZCode.** `mlx-serve launch zcode` and the app's code launcher point Z.ai's ZCode agent (built from source) at the local server with every served chat model and its advertised context, keeping its data under `~/.mlx-serve/zcode` (#708). Thanks @beamivalice.
 - **oMLX's Qwen3.8 Flash Next packs load.** Packs that ship the n-gram table inside the model files (such as `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp`) now run, MTP included, and `--ple-gpu` copies their table into one GPU buffer at load (#686). Thanks @otarkhan.
 - **Chat keeps answering while media renders.** An agent or chat session no longer freezes while the same server generates an image, speech, music, video or a 3D model: chat runs between generation steps, and the CPU-heavy parts of 3D generation run beside it. Two coding agents on Qwen3.8 27B kept their first token under a second while image, speech, music and a textured 3D model rendered on one M5 Ultra, and the images come out byte-identical to a solo run.
 - **GLM-5.3-Flash.** TensorFold's MLX packs of GLM-5-Next run with text, thinking (with `reasoning_effort`) and tool calls, and the pack's own multi-token-prediction layer drafts ahead of the model (`--no-mtp` turns it off).
@@ -16,6 +17,7 @@
 - **oMLX's Qwen3.8 Flash Next packs run at full speed.** The fast paths built for our own pack now also serve oMLX's per-layer mixed widths. On an M5 Ultra, `Jundot/Qwen3.8-Flash-Next-oQ4e-mtp` decodes at 172 tok/s with MTP (177 with `--ple-gpu`), against 133 for oMLX 0.7.0 on the same pack and 174 for our own pack.
 - **Textured 3D models in about a minute.** The Hunyuan3D texture stage now simplifies the mesh to 40,000 faces before unwrapping it, as the reference pipeline does; a detailed (resolution 320) textured model that ran for more than ten minutes now finishes in about a minute.
 - **MiniMax-H3 video renders start sooner after the first one.** The text encoder, the DiT and the Turbo adapter now stay loaded between requests while the Mac has the memory for all of them, so a short Turbo clip takes about a quarter less time from the second render on; when memory is short the model is freed first and nothing else is affected.
+- Nemotron-3 Nano answers short prompts sooner on M5 Macs.
 
 ### Fixes
 - Homebrew: the app cask is now `mlx-serve` (was `mlx-core`; installs move over on `brew update`), and the install steps add `brew trust ddalcu/mlx-serve`, which Homebrew 7 requires before it installs from our tap.
@@ -27,6 +29,7 @@
 - A streamed reply no longer sends the start of a stop string that spans several tokens before cutting at it; streamed and non-streamed replies now end on the same byte.
 - `frequency_penalty` now applies on `/v1/completions`, as it already did on chat.
 - Deleting a provider in Settings no longer crashes the app.
+- The app no longer stalls window moves and typing while photos or generated media are on screen: pictures are decoded once, downsampled, off the main thread.
 - A speech request whose client disconnects now stops instead of finishing audio nobody will receive.
 - The model browser lists GLM-5.3-Flash and MiMo-V2.6-Flash packs as supported.
 - `mlx-serve launch pi` offers pi's `xhigh` and `max` thinking levels, so a model's maximum effort (GLM-5.3's default) is reachable from pi.

@@ -25,6 +25,7 @@ final class CLILauncher: ObservableObject {
         .aider,
         .fx,
         .grok,
+        .zcode,
     ]
 
     /// Stable id list — pinned against the MAS instructions panel's tabs
@@ -520,6 +521,28 @@ extension LauncherCLI {
             export HERMES_HOME="$HOME/.mlx-serve/hermes"
             \(cdLine)
             hermes "$@"
+            """
+        }
+    )
+
+    /// ZCode (https://github.com/zai-org/ZCode) — env-selected data dir +
+    /// personal provider config file, both under ~/.mlx-serve/zcode.
+    static let zcode = LauncherCLI(
+        id: "zcode", displayName: "ZCode", binaryName: "zcode",
+        iconSystemName: "terminal", useClaudeIcon: false,
+        prepareConfig: { baseURL, model, budget, entries in
+            let dir = NSString(string: "~/.mlx-serve/zcode").expandingTildeInPath
+            try? FileManager.default.createDirectory(atPath: dir, withIntermediateDirectories: true)
+            try? AgentConfigs.zcodeProviderJSON(baseURL: baseURL, model: model, budget: budget, entries: entries)
+                .write(toFile: "\(dir)/provider_config.json", atomically: true, encoding: .utf8)
+        },
+        resumeArgs: "--continue",
+        scriptBody: { _, _, cdLine, _, _ in
+            """
+            \(AgentConfigs.zcodeExports)
+            if ! command -v zcode >/dev/null 2>&1; then echo "zcode is not installed: build or install ZCode (https://github.com/zai-org/ZCode)" >&2; exit 127; fi
+            \(cdLine)
+            zcode "$@"
             """
         }
     )

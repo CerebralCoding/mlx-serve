@@ -174,6 +174,17 @@ enum CLISetupInstructions {
                 export GROK_HOME="$HOME/.mlx-serve/grok"
                 grok
                 """),
+            Tab(id: "zcode",
+                title: "ZCode",
+                installHint: "Build or install ZCode: https://github.com/zai-org/ZCode",
+                command: """
+                mkdir -p ~/.mlx-serve/zcode
+                cat > ~/.mlx-serve/zcode/provider_config.json <<'EOF'
+                \(AgentConfigs.zcodeProviderJSON(baseURL: baseURL, model: servedModelId, budget: budget, entries: []))
+                EOF
+                \(AgentConfigs.zcodeExports)
+                zcode
+                """),
         ]
     }
 }

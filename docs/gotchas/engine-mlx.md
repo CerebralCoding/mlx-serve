@@ -5579,3 +5579,10 @@ What is left in the hyper-connection reads is not a single-kernel job: one read 
   - Serial decode went from 21.7 to 10.4 ms a forward, 9.6 ms with `--ple-gpu`.
 - Attribution trap: a prefill-width fwd-ubench chunk includes the synchronous host n-gram gather and ranked the GDN prefill fusion backwards on this pack. The server-timed `prefill_ab.sh` decides.
 - Guard: run `tests/qwen4_engagement.sh <pack>` on any new layout before measuring speed. Parity tests cover {4,5,6,8} × {g64,g128}, and the tiny `--oq4e-mix --embedded-ngram` pack runs through the `qwen4 fixture` forward oracle.
+
+## A short MoE prefill re-read every expert per row
+
+- Defect: a Nemotron-3 Nano prompt of a few dozen tokens took longer in the MoE than one twice its length.
+- Cause: the sorted expert gather (MLX's `gather_qmm_rhs` and our NAX `sortedGather`, which mirrors its gate) streams each expert once only at `B / E >= 4` sorted rows per expert; below it every row runs a `gather_qmv` that re-reads its expert's weights.
+- Fix: `nemotronMoeExperts` appends pad rows spread over the experts up to 4 per expert once there are 2+ (`moeStreamPadRows`); the pad rows sort past `total_inds`, so slicing `inv_order` drops them. Only on quantized banks with NAX (`moeStreamPadPays`): dense banks run `mlx_gather_mm` unsorted, and non-NAX machines are unmeasured.
+- Guard: `nemotronMoe matches a host reference of NemotronHMoE` (padded arm, forced by the `stream_pad` argument).
