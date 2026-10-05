@@ -2,6 +2,16 @@ import XCTest
 @testable import MLXCore
 
 final class ClefModelTests: XCTestCase {
+    func testChoiceHelpMatchesTheRequestSchema() throws {
+        let choice = LayaDecisionsPane.Question(name: "team", type: .choice, instructions: "Route it", criteria: "billing, sales")
+        for clef in [false, true] {
+            let example = LayaDecisionsPane.Question.choiceCriteriaExample(forClef: clef)
+            let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: Data("{\(example)}".utf8)) as? NSDictionary)
+            let criteria = try XCTUnwrap(choice.json(forClef: clef)?["criteria"])
+            XCTAssertEqual(parsed, ["criteria": criteria] as NSDictionary)
+        }
+    }
+
     func testClefQuestionUsesObjectChoicesAndKeepsScoreLevels() throws {
         let choice = LayaDecisionsPane.Question(name: "route", type: .choice, instructions: "Route it", criteria: "sales, support, sales")
         let options = try XCTUnwrap(choice.json(forClef: true)?["criteria"] as? [String: NSNull])

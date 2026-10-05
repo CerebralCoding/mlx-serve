@@ -54,6 +54,11 @@ struct LayaDecisionsPane: View {
 
         enum Kind: String, CaseIterable { case choice, noul, score }
 
+        static func choiceCriteriaExample(forClef: Bool) -> String {
+            forClef ? #""criteria": {"billing": null, "sales": null}"#
+                : #""criteria": ["billing", "sales"]"#
+        }
+
         var json: [String: Any]? {
             json(forClef: false)
         }
@@ -204,7 +209,7 @@ struct LayaDecisionsPane: View {
                 Text("Laya is not a chat model. It reads a piece of text (the state) and answers typed questions about it in one forward pass, with calibrated probabilities. A few milliseconds per request, so it suits routing, triage, moderation and scoring.")
             }
             Text("Question types").font(.app(.headline))
-            Text("**choice** picks one of your options.\n`\"criteria\": [\"billing\", \"sales\"]`")
+            Text("**choice** picks one of your options.\n`\(Question.choiceCriteriaExample(forClef: isClef))`")
             Text("**noul** is a yes/no; the answer is P(true). Criteria are optional labels for each side.\n`\"criteria\": {\"false\": \"no threat\", \"true\": \"explicit threat\"}`")
             Text("**score** is an ordinal over labelled rungs, low to high; the answer is the expected rung index plus per-rung probabilities.\n`\"criteria\": [\"not urgent\", \"soon\", \"blocking\"]`")
             Text("Every question needs `instructions`. The state can be a string or a JSON object.")
