@@ -44,6 +44,13 @@
 - `mlx-serve launch pi` offers pi's `xhigh` and `max` thinking levels, so a model's maximum effort (GLM-5.3's default) is reachable from pi.
 - `/metrics` and `/metrics.json` now count every request outcome exactly once: a client that disconnects mid-decode shows in `request_cancelled_total`, errors in the new `mlx_serve:request_failed_total`, and requests refused before they start in `mlx_serve:request_rejected_total`.
 - The built-in web console works when the server is reached through a reverse proxy that mounts it under a path (e.g. Tailscale Serve `--set-path`); opened that way it showed "0 models" on a fully loaded server.
+- Llama 3.x models (3.1, 3.2, 3.3) read long prompts correctly: past about 1,000 tokens they answered with empty text, because most layers only looked at the last 1,024 tokens and the models' long-context RoPE schedule was ignored. Output now matches mlx-lm on long prompts.
+- GLM-5.3-Flash GGUFs on the ds4 engine stop at the end of their answer instead of writing the next user turn themselves (#667).
+- `mlx-serve pull` and Ollama `/api/pull` download media models whose weights live in folders (FLUX.2-klein, ACE-Step, LTX, MiniMax Music 3), and a repo with no weights to download fails instead of reporting success (#362).
+- `/v1/completions` accepts token-ID prompts (`[1, 2, 3]`, as lm-eval sends them); a batch of prompts and `echo: true` are refused by name instead of being misread or silently ignored (#659).
+- App: an attached video reaches the model, with Tools on or off, and its frames are saved as files instead of inside the chat history; with Tools on, a message that is only a picture, recording or clip reaches the model too (#429).
+- App: the agent sees a tool result in full until it has answered it, so reading a large file no longer sends it into a loop of ever-smaller re-reads (#605).
+- App: `readFile` and `editFile` count lines ending in CR or CRLF and keep the file's own line endings (#736); an agent's own Apple voice is used in voice mode (#417); Option types characters in the built-in terminal, so `@` works on Swiss and other layouts (#692).
 
 ---
 
