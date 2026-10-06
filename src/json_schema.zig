@@ -122,10 +122,11 @@ fn parseRef(ctx: *Ctx, ref: []const u8) ParseError!*const Node {
     while (target == .object) : (hops += 1) {
         const next = target.object.get("$ref") orelse break;
         if (next != .string) break;
-        if (hops == 16) return error.InvalidSchema; // a ref chain that never reaches a schema
+        if (hops == 16) return anyLeaf(ctx.arena); // a ref chain that never reaches a schema
         target = resolvePointer(ctx.root, next.string) orelse return anyLeaf(ctx.arena);
     }
     const slot = try ctx.arena.create(Node);
+    slot.* = .{ .kind = .any };
     try ctx.refs.put(ctx.arena, ref, slot);
     slot.* = (try parseNode(ctx, target)).*;
     return slot;
@@ -143,7 +144,7 @@ fn resolvePointer(root: std.json.Value, ref: []const u8) ?std.json.Value {
         while (i < escaped.len) : (i += 1) {
             if (len == buf.len) return null;
             buf[len] = escaped[i];
-            if (escaped[i] == '~' and i + 1 < escaped.len) {
+            if (escaped[i] == '~' and i + 1 < escaped.len and (escaped[i + 1] == '0' or escaped[i + 1] == '1')) {
                 buf[len] = if (escaped[i + 1] == '1') '/' else '~';
                 i += 1;
             }
@@ -165,11 +166,7 @@ fn parseNode(ctx: *Ctx, value: std.json.Value) ParseError!*const Node {
     const arena = ctx.arena;
     if (value != .object) {
         // Boolean schema: `true` (any), `false` (none — we don't model "none").
-        if (value == .bool) {
-            const node = try arena.create(Node);
-            node.* = .{ .kind = .any };
-            return node;
-        }
+        if (value == .bool) return anyLeaf(arena);
         return error.InvalidSchema;
     }
     const obj = value.object;
@@ -204,9 +201,7 @@ fn parseNode(ctx: *Ctx, value: std.json.Value) ParseError!*const Node {
     // type — may be a string or an array of strings. Array form compiles to anyOf.
     const type_val = obj.get("type") orelse {
         // Unspecified type — treat as `any`. Consumers will allow any JSON value.
-        const node = try arena.create(Node);
-        node.* = .{ .kind = .any };
-        return node;
+        return anyLeaf(arena);
     };
 
     if (type_val == .array) {
@@ -638,7 +633,24 @@ test "$ref resolves through $defs and definitions; a recursive ref points back a
     try testing.expectEqual(Kind.any, props[2].schema.kind);
     try testing.expectEqual(s.root, props[3].schema);
 
-    try testing.expectError(error.InvalidSchema, parseStr(testing.allocator,
-        \\{"$ref":"#/$defs/A","$defs":{"A":{"$ref":"#/$defs/A"}}}
-    ));
+}
+
+test "a $ref pointer reads ~0 and ~1 and keeps any other ~ literally" {
+    var s = try parseStr(testing.allocator,
+        \\{"properties":{"a":{"$ref":"#/$defs/x~1y"},"b":{"$ref":"#/$defs/x~0y"},"c":{"$ref":"#/$defs/x~2y"}},"type":"object",
+        \\ "$defs":{"x/y":{"type":"string"},"x~y":{"type":"integer"},"x~2y":{"type":"boolean"}}}
+    );
+    defer s.deinit();
+    const props = s.root.obj_properties;
+    try testing.expectEqual(Kind.string, props[0].schema.kind);
+    try testing.expectEqual(Kind.integer, props[1].schema.kind);
+    try testing.expectEqual(Kind.boolean, props[2].schema.kind);
+}
+
+test "a $ref chain that never reaches a schema relaxes to any" {
+    var s = try parseStr(testing.allocator,
+        \\{"$ref":"#/$defs/A","$defs":{"A":{"$ref":"#/$defs/B"},"B":{"$ref":"#/$defs/A"}}}
+    );
+    defer s.deinit();
+    try testing.expectEqual(Kind.any, s.root.kind);
 }

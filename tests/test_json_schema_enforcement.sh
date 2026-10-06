@@ -255,14 +255,14 @@ BODY=$(jq -n --argjson schema "$REF_SCHEMA" '{
     max_tokens:256, temperature:0
 }')
 LOG_MARK=$(wc -l < /tmp/mlx-serve-schema-test.log)
-RESULT=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY")
+RESULT=$(curl -sf "$BASE/v1/chat/completions" -H "Content-Type: application/json" -d "$BODY" || true)
 OK=$(echo "$RESULT" | python3 -c '
 import sys, json
-text = json.loads(sys.stdin.read())["choices"][0]["message"]["content"] or ""
 try:
+    text = json.loads(sys.stdin.read())["choices"][0]["message"]["content"] or ""
     obj = json.loads(text)
 except Exception:
-    print("fail:not_json:" + repr(text[:60])); sys.exit()
+    print("fail:no_json_reply"); sys.exit()
 for f in obj.get("facts", []):
     if not isinstance(f, dict) or set(f) != {"kind", "what"} or f["kind"] != "fact":
         print("fail:item_off_schema:" + repr(f)); sys.exit()
