@@ -194,7 +194,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
               session(sessionId) != nil,
               Self.canRunTurn(serverRunning: server.status == .running, apple: appState.useAppleModel),
               let note = steering.take(for: sessionId) else { return }
-        runTurn(sessionId: sessionId, userText: note, images: nil, audio: nil,
+        runTurn(sessionId: sessionId, userText: note, images: nil, videos: nil, audio: nil,
                 config: config.revokingTools(revoked), approval: approval)
     }
 
@@ -553,7 +553,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     func runTurn(sessionId: UUID,
                  userText: String,
                  images: [ChatImage]?,
-                 videos: [ChatVideo]? = nil,
+                 videos: [ChatVideo]?,
                  audio: [ChatAudio]?,
                  config: TurnConfig,
                  approval: @escaping (APIClient.ToolCall) async -> Bool) {
@@ -598,6 +598,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         else { return }
         let text = msgs[lastUserIdx].content
         let images = msgs[lastUserIdx].images
+        let videos = msgs[lastUserIdx].videos
         let audio = msgs[lastUserIdx].audio
         // The reply about to be destroyed. `truncateMessages` drops everything
         // from the last user turn onward, so this is the only moment it can be
@@ -605,7 +606,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // answer is the whole reason the pager exists.
         let replaced = msgs[(lastUserIdx + 1)...].last { $0.role == .assistant && !$0.content.isEmpty }
         appState.truncateMessages(in: sessionId, keepingFirst: lastUserIdx)
-        runTurn(sessionId: sessionId, userText: text, images: images, audio: audio,
+        runTurn(sessionId: sessionId, userText: text, images: images, videos: videos, audio: audio,
                 config: config, approval: approval)
         // AFTER runTurn, which opens with `stop(sessionId:)` — and stop is a
         // turn exit, so a seed placed before it would be spent immediately.
@@ -945,8 +946,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 messages: session(sessionId)?.messages ?? [],
                 contextLength: contextLength,
                 maxTokens: turnMax,
-                buildMultimodalContent: { text, images in
-                    Self.buildMultimodalContent(text: text, images: images, serverPreprocess: useServerPreprocess)
+                buildMultimodalContent: { text, msg in
+                    Self.buildMultimodalContent(text: text, images: msg.images ?? [], videos: msg.videos ?? [],
+                                                audio: msg.audio ?? [], serverPreprocess: useServerPreprocess)
                 },
                 historyImages: useServerPreprocess
             )
