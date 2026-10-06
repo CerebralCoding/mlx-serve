@@ -506,7 +506,7 @@ Vision:
 
 Media backends:
 - **ACE-Step**: timbre slot = silence latent OR the reference clip's VAE mean (`ref_audio`, #259); a TASK is the context stream + instruction line (`complete`, `cover` with soft clamp THEN hard grid; `fsq.safetensors` separate dense bf16). Guards assert log lines, never output.
-- **`instrumental` reaches the checkpoint only as TEXT** (`[Instrumental]`); flag + lyrics = NAMED 400 (`instrumentalConflicts`).
+- **A condition works only as TRAINING fed it**: `instrumental` as TEXT (`[Instrumental]`; + lyrics = NAMED 400, `instrumentalConflicts`); Stable Audio 3 `seconds_total` as whole seconds >= 1 (`trainedSeconds`; a fraction is noise, reference too).
 - **Music3 is NOT an ACE-Step variant** (timestep TOKEN, reversed SwiGLU, alpha-only Snake, hardcoded DiT RoPE). Probe laps (`MUSIC3_COST_PROBE`) before bandwidth arithmetic.
 - **LTX**: a standalone-frame latent belongs in slot 0 ONLY (#260; `keyframeMask` + `keyframePositions`); the RELEASE is a config field deciding the text encoder (`LtxVersion`; 2.5 runs the real gemma4 via `gemmaCapture4`, `prefill_mask_add`); `keyframes_abs_pos_embedding` parsed, never added.
 - **LTX DiffVAE**: constructor args are not its config (`Sampler`: 1-step x0 at t×1000); tile budget is a per-REQUEST memory decision (`tileTokensForMemory`). 4-bit affine on a video DiT is a QUALITY setting (8-bit mirror).
