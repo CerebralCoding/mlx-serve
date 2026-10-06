@@ -263,7 +263,7 @@ Request parsing + media:
 - **Latest-turn user media on a tower-less model is refused by NAME** (`mediaRejectReason`), older/tool media replaced by a note the agent can read (`dropMedia`); non-text model on a text surface 400s BEFORE prefill (`textGenRejectReason`; new surface → `isTextGenRoute`, new modality → `modalityFromType`).
 - **Every media item renders as the model's OWN template placeholder** (`chat.appendMediaContentParts`), all items encoded in prompt order, the k-th placeholder expanded to item k's run (`expandMediaPlaceholders`); a count/kind mismatch is a NAMED 400, never a shift. Encoder outputs are cached by pixel hash (`VisionEncoder.emb_cache`). Text parts JOIN in order (#195).
 - **A dispatch field must be readable from every body SHAPE** (`parseModelFromRequest(body, content_type)`); header parameter lookups key at a boundary (`name=` vs `filename=`); binary bodies are not logged (`bodyIsText`); request ints clamp (`parseRequestSeed`, `clampJsonI32`).
-- **A client-supplied PATH is proven on OUR side of the mlx boundary** (`lora.loadFile` stat → 400). `/v1/images/edits` forwards the LoRA fields (#268); unhonored = NAMED 400.
+- **A client-supplied PATH is proven on OUR side of the mlx boundary** (`lora.loadFile` stat → 400) and accepted only from LOOPBACK (`parseLoraFields(…, local)` → 403, #540: missing vs not-a-LoRA is a host-file oracle). `/v1/images/edits` forwards the LoRA fields (#268).
 - **Hand-written error text is not JSON**: escape at the SINK (`jsonEscapeMessage`), truncate on a UTF-8 boundary. NO model-byte string is guaranteed UTF-8 — sanitizing lives INSIDE every escaper (`chat.utf8Next`); logprobs `bytes` keeps exact bytes.
 
 Sampling + logprobs + streams:

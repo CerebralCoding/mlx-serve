@@ -12421,7 +12421,7 @@ test "apiKeyGateApplies: strict removes exactly the loopback exemption" {
     try std.testing.expect(apiKeyGateApplies(true, true, false));
 }
 
-fn peerIsLoopback(conn: *const Conn) bool {
+pub fn peerIsLoopback(conn: *const Conn) bool {
     return ipIsLoopback(conn.stream.socket.address);
 }
 

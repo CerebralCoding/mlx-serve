@@ -23,6 +23,7 @@
 
 ### Fixes
 - A streamed tool call whose name the model malformed (a missing `>` after `<function=NAME`) no longer sends a chunk strict clients reject: the name ends at the line break, and every streamed tool-call field is JSON-escaped (#748).
+- `lora_paths` are accepted only from the server's own machine; a LAN or API-key client that sends them gets a 403, so it can no longer probe which files exist on the host (#540).
 - Homebrew: the app cask is now `mlx-serve` (was `mlx-core`; installs move over on `brew update`), and the install steps add `brew trust ddalcu/mlx-serve`, which Homebrew 7 requires before it installs from our tap.
 - Qwen3.8 agents keep their earlier turns' reasoning in the prompt again, as the model was trained to: multi-turn answers improve and a follow-up message no longer re-reads the whole conversation (up to 8 s saved per follow-up on a 120k-token session). `chat_template_kwargs` `preserve_thinking: false` restores the old behaviour.
 - `tool_choice: "required"`, a named function and Anthropic's `any` now always produce a tool call on Qwen 3.5 and later, even when the prompt says not to call one; the choice used to never reach the model. Naming a function the request does not declare is now a 400.
