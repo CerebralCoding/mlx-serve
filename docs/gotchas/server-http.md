@@ -2499,3 +2499,18 @@ chat system prompt hands the model resolve through it.
 Guards: `the path prefix the page was served under is the base of every API path`,
 `app.js resolves through the page's one apiPrefix` (identity, not a source scan),
 `tests/metrics_panel_test.mjs`.
+
+## A GGUF picked by its file 404'd on the first chat (2026-10-06)
+
+Defect: on a fresh app start, the first message to a GGUF quant answered `404 No model is
+registered at that path`; picking the model restarted the server instead of hot-switching,
+and the pill then named the split's file stem ("…1 Of 00002").
+
+Cause: the app names a GGUF quant by its FILE path (a per-quant folder, a split's first
+shard) and loads it with `/v1/load-model` before the turn. `probeModelDir` took folders
+only, so the load 404'd, the app swallowed it, and the chat naming the path found no entry.
+
+Fix: `probeModelDir` accepts a `.gguf` file (refusing mmproj/tokenizer/MTP sidecars and
+embedding GGUFs), and `registerByPath` names it by its stem, as `--model` does; the pill
+counts that stem as the picked model. Guards: `registerByPath takes a .gguf file`,
+`tests/test_llama_gguf.sh` [8], `testAGgufQuantShowsItsOwnLabelNotTheFileStemTheServerNamesItBy`.

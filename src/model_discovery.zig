@@ -1127,6 +1127,15 @@ pub fn probeModelDir(io: std.Io, allocator: std.mem.Allocator, abs_path: []const
     var dir = std.Io.Dir.openDirAbsolute(io, parent, .{}) catch return error.ModelDirNotFound;
     defer dir.close(io);
 
+    // A `.gguf` FILE is a model of its own: the app picks GGUF quants one file
+    // at a time (a per-quant folder, a split's first shard), as `--model` does.
+    if (std.mem.endsWith(u8, base, ".gguf")) {
+        if (isGgufSidecarBasename(base) or gguf_meta.fileDeclaresPooling(io, dir, base)) return error.UnsupportedArch;
+        const st = dir.statFile(io, base, .{}) catch return error.ModelDirNotFound;
+        if (st.kind != .file) return error.ModelDirNotFound;
+        return .{ .model_type = try allocator.dupe(u8, "gguf"), .bytes_on_disk = @intCast(st.size) };
+    }
+
     // GGUF first — same precedence as tryAddModel and `--model` routing.
     gguf: {
         var sub = dir.openDir(io, base, .{ .iterate = true }) catch break :gguf;

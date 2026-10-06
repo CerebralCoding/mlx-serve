@@ -25,6 +25,7 @@
 
 ### Fixes
 - llama.cpp is updated to release v0.6.0, and an `mtp-*.gguf` draft head is no longer listed as a chat model.
+- A GGUF picked in the app answers its first message instead of a 404, switching to one no longer restarts the server, and the model picker names a split GGUF by its model rather than "1 of 00002".
 - A streamed tool call whose name the model malformed (a missing `>` after `<function=NAME`) no longer sends a chunk strict clients reject: the name ends at the line break, and every streamed tool-call field is JSON-escaped (#748).
 - `lora_paths` are accepted only from the server's own machine; a LAN or API-key client that sends them gets a 403, so it can no longer probe which files exist on the host (#540).
 - Split GGUFs (`*-00001-of-0000N.gguf`) now load through llama.cpp instead of silently killing the ds4 engine, and `--engine ds4` on one is refused with a message saying why (#586).

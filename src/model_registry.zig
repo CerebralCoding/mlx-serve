@@ -860,13 +860,15 @@ pub const ModelRegistry = struct {
     /// Exists for models OUTSIDE the --model-dir scan: the app auto-downloads
     /// a small embedding encoder and registers it here no matter which org
     /// dir the chat model (and thus --model-dir) points at. `id` null names
-    /// the entry after the dir's basename.
+    /// the entry after the basename (a `.gguf` file without its extension, as
+    /// `--model` names it).
     pub fn registerByPath(self: *ModelRegistry, io: std.Io, abs_path: []const u8, id: ?[]const u8) ![]const u8 {
         var trimmed = abs_path;
         while (trimmed.len > 0 and trimmed[trimmed.len - 1] == '/') trimmed = trimmed[0 .. trimmed.len - 1];
         const base = std.fs.path.basename(trimmed);
         if (base.len == 0) return error.InvalidModelPath;
-        const reg_id = id orelse base;
+        const stem = if (std.mem.endsWith(u8, base, ".gguf") and base.len > ".gguf".len) base[0 .. base.len - ".gguf".len] else base;
+        const reg_id = id orelse stem;
 
         // Fast path: already registered (discovered, --model, or a previous
         // register-by-path). No filesystem touch.
@@ -1528,6 +1530,32 @@ test "ModelRegistry: registerByPath rejects a nonexistent directory" {
     defer reg.deinit();
     try testing.expectError(error.ModelDirNotFound, reg.registerByPath(io, "/nonexistent/parent/some-model", null));
     try testing.expectError(error.InvalidModelPath, reg.registerByPath(io, "/", null));
+}
+
+test "ModelRegistry: registerByPath takes a .gguf file, named by its stem as --model names it" {
+    // The app picks GGUF quants one FILE at a time (per-quant subfolders, split
+    // shards); a load that only took folders failed, and the first chat 404'd.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "repo/IQ3_S");
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/IQ3_S/Next-IQ3_S-00001-of-00002.gguf", .data = "GGUF" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "repo/IQ3_S/mmproj-F16.gguf", .data = "GGUF" });
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = buf[0..try tmp.dir.realPath(io, &buf)];
+    var reg = try ModelRegistry.init(testing.allocator, io, null, 3, 0, null);
+    defer reg.deinit();
+
+    const file = try std.fmt.allocPrint(testing.allocator, "{s}/repo/IQ3_S/Next-IQ3_S-00001-of-00002.gguf", .{root});
+    defer testing.allocator.free(file);
+    const id = try reg.registerByPath(io, file, null);
+    try testing.expectEqualStrings("Next-IQ3_S-00001-of-00002", id);
+    try testing.expectEqualStrings("gguf", reg.peek(id).?.arch_hint);
+    try testing.expectEqual(reg.peek(id).?, reg.peekByPath(file).?);
+
+    const sidecar = try std.fmt.allocPrint(testing.allocator, "{s}/repo/IQ3_S/mmproj-F16.gguf", .{root});
+    defer testing.allocator.free(sidecar);
+    try testing.expectError(error.UnsupportedArch, reg.registerByPath(io, sidecar, null));
 }
 
 test "LoadedModel: a reload frees the CPU state the previous load left behind" {
