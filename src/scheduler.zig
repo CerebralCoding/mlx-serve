@@ -2905,10 +2905,11 @@ fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []co
         };
         defer info.deinit(allocator);
         const e = gguf_meta.preferredEngine(info);
-        log.info("[gguf] engine: {s} (arch={s}, ds4-lora={})\n", .{
+        log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, shards={d})\n", .{
             @tagName(e),
             info.architecture orelse "?",
             info.has_ds4_lora_rank,
+            info.split_count,
         });
         break :blk e;
     };

@@ -129,7 +129,7 @@ Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -
 
 ## Supported architectures
 
-Dispatch on `config.json` `model_type`. With `--mlx-gguf` (opt-in, experimental; app: Settings → Engines) a GGUF that `mlx_gguf.servablePath` accepts (arch `qwen35`/`qwen35moe`/`gemma4`, every tensor type known) runs on the MLX path as `qwen3_5`/`qwen3_5_moe`/`gemma4`; `--engine ds4|llama` still wins. Every other GGUF bypasses MLX → embedded engine by header (`gguf_meta.preferredEngine`: antirez DSV4-Flash + the ds4-only archs `deepseek41`/`qwen4exp`/`glm-dsa`/`glm5-next` → ds4, else llama.cpp).
+Dispatch on `config.json` `model_type`. With `--mlx-gguf` (opt-in, experimental; app: Settings → Engines) a GGUF that `mlx_gguf.servablePath` accepts (arch `qwen35`/`qwen35moe`/`gemma4`, every tensor type known) runs on the MLX path as `qwen3_5`/`qwen3_5_moe`/`gemma4`; `--engine ds4|llama` still wins. Every other GGUF bypasses MLX → embedded engine by header (`gguf_meta.preferredEngine`: antirez DSV4-Flash + the ds4-only archs `deepseek41`/`qwen4exp`/`glm-dsa`/`glm5-next` → ds4, else llama.cpp); a SPLIT GGUF (`split.count` > 1) always → llama.cpp: ds4 reads one file and `exit()`s on a missing tensor, so `Ds4Engine.open` refuses one by name (#586).
 
 | model_type | Notes |
 |---|---|

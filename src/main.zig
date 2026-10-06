@@ -1709,11 +1709,12 @@ fn chooseGgufEngine(
     defer info.deinit(allocator);
 
     const e = gguf_meta.preferredEngine(info);
-    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, ds4-unloadable={})\n", .{
+    log.info("[gguf] engine: {s} (arch={s}, ds4-lora={}, ds4-unloadable={}, shards={d})\n", .{
         @tagName(e),
         info.architecture orelse "?",
         info.has_ds4_lora_rank,
         info.ds4_unloadable,
+        info.split_count,
     });
     return e;
 }
