@@ -1094,23 +1094,10 @@ test "PldDefaults: ServerConfig built from it reports the CLI values" {
 /// hoarding token buffers across a long session.
 pub var tokenize_cache_entries: u32 = 4;
 
-/// Iteration 3-5 (perf-plan Phase 5 #1): cap on resident llama.cpp KV
-/// sessions per loaded GGUF model. 1 is the legacy single-session
-/// behavior (a flip between two long-doc prompts evicts the other on
-/// every turn — and even sequential shared-prefix requests reported
-/// cached_tokens=0). N > 1 enables the best-prefix-match LRU so
-/// alternating multi-doc / agent workloads stay warm. Sessions are
-/// created lazily, so unused slots cost nothing.
-pub var llama_cache_entries: u32 = 4;
-
-/// Phase 5 (performance-plan) #2: KV-cache quantization for the embedded
-/// llama.cpp engine. `off` = F16 (libllama default); `q8` halves the KV
-/// bytes (Q8_0, near-lossless); `q4` quarters them (Q4_0, some quality
-/// impact). Non-default settings automatically enable flash attention in
-/// the shim because llama.cpp's plain SDPA only supports F16/F32 KV.
-/// Set via `--llama-kv-quant {off,q8,q4}`. Applies to every llama.cpp
-/// session created after this is set (i.e., from the next model load).
-pub var llama_kv_quant: arch_llama.LlamaKvQuant = .off;
+/// Embedded llama.cpp engine settings: `--llama-cache-entries` (sequences per
+/// model), `--llama-kv-quant`, `--llama-ubatch`, `--llama-mtp-drafts`. Read when
+/// a GGUF model loads.
+pub var llama_settings: scheduler_mod.LlamaSettings = .{};
 
 /// Plan 01 — continuous batching: maximum concurrent in-flight requests sharing
 /// the inference thread's batched-decode pass. Set via `--max-concurrent N`.
@@ -6690,7 +6677,7 @@ fn renderModelEntry(
         const arch_label: []const u8 = if (entry.arch_hint.len > 0) entry.arch_hint else config.model_type;
         const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
         const drafter_loaded = entry.drafter != null or entry.dflash != null;
-        const mtp_loaded = entry.mtp != null;
+        const mtp_loaded = entry.mtp != null or if (entry.llama_ctx) |c| c.mtpDrafts() > 0 else false;
         const drafter_path_json = if (drafter_loaded)
             try jsonEscape(allocator, entry.drafter_path)
         else
@@ -7432,6 +7419,8 @@ fn renderPropsBody(
 /// The model-level half of `Scheduler.batchVerdict`: does this loaded model
 /// batch decode at all? Per-slot arms (spec, grammar, logprobs) come later.
 fn batchVerdictFor(entry: *const LoadedModel) scheduler_mod.BatchVerdict {
+    // llama.cpp batches its own sequences (`runLlamaDecodeTick`).
+    if (entry.llama_ctx) |c| return if (c.seqs.len > 1) .ok else .embedded_engine;
     if (entry.ds4_engine != null or entry.llama_engine != null) return .embedded_engine;
     const cfg = entry.config orelse return .arch;
     return if (scheduler_mod.configBatchesDecode(cfg)) .ok else .arch;
@@ -7500,7 +7489,7 @@ fn embeddedEngineSettings(st: PropsSettings, engine: PropsEngine, engine_mtp: bo
 
 fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
     const engine: PropsEngine = if (lm.ds4_engine != null) .ds4 else if (lm.llama_engine != null) .llama else .mlx;
-    const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else false;
+    const engine_mtp = if (lm.ds4_engine) |e| e.mtpDraftTokens() > 1 else if (lm.llama_ctx) |c| c.mtpDrafts() > 0 else false;
     return embeddedEngineSettings(mlxPropsSettings(lm), engine, engine_mtp);
 }
 
@@ -7509,7 +7498,7 @@ fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const kv = configuredKvQuantFor(config);
     return .{
         .engine = "mlx",
-        .kv_quant = if (lm.llama_engine != null) @tagName(llama_kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
+        .kv_quant = if (lm.llama_engine != null) @tagName(llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_attn_mode = server_config.kv_attn_mode,
         .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
@@ -20944,13 +20933,10 @@ test "mlxCacheLimitFromEnv: explicit bytes win, 0 disables, garbage falls throug
 }
 
 test "llama cache default keeps shared prefixes warm" {
-    // With the legacy default of 1, every llama.cpp request evicted the
-    // single KV session — even two SEQUENTIAL requests sharing an 8 KB
-    // prefix reported cached_tokens=0 (caught live by llmprobe
-    // cache-hit-reported on the E4B GGUF, 2026-06-10). 4 sessions keep
-    // interleaved agent roots warm; sessions are created lazily so idle
-    // slots cost nothing.
-    try testing.expect(llama_cache_entries >= 4);
+    // With one sequence, interleaved requests evict each other's prompt KV:
+    // even two SEQUENTIAL requests sharing an 8 KB prefix reported
+    // cached_tokens=0. 4 keep interleaved agent roots warm and decoding together.
+    try testing.expect(llama_settings.seqs >= 4);
 }
 
 test "prefix cache default capacity covers interleaved agent flows" {
