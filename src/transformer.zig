@@ -17293,6 +17293,16 @@ pub const Transformer = struct {
                 try mlx.check(mlx.mlx_reshape(&freqs_arr, base_pow, &freq_shape, 1, s));
             }
             rope_freqs_global = freqs_arr;
+        } else if (config.rope_llama3) |l3| {
+            const half: usize = config.head_dim / 2;
+            const freqs_f64 = try allocator.alloc(f64, half);
+            defer allocator.free(freqs_f64);
+            computeLlama3Freqs(freqs_f64, config.head_dim, config.rope_theta, l3);
+            const freqs_f32 = try allocator.alloc(f32, half);
+            defer allocator.free(freqs_f32);
+            for (freqs_f64, freqs_f32) |v, *o| o.* = @floatCast(v);
+            const fshape = [_]c_int{@intCast(half)};
+            rope_freqs_global = mlx.mlx_array_new_data(freqs_f32.ptr, &fshape, 1, .float32);
         }
 
         // YaRN (laguna: full-attention layers only; qwen4_exp: the trunk's one
@@ -18392,6 +18402,7 @@ pub const Transformer = struct {
         if (self.ones_hidden) |o| _ = mlx.mlx_array_free(o);
         if (self.output_mult) |m| _ = mlx.mlx_array_free(m);
         if (self.rope_freqs_yarn) |f| _ = mlx.mlx_array_free(f);
+        if (self.rope_freqs_global) |f| _ = mlx.mlx_array_free(f);
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
         if (self.yarn_inv_freq) |f| self.allocator.free(f);
         if (self.suppress_mask) |m| _ = mlx.mlx_array_free(m);
@@ -36346,6 +36357,24 @@ fn computeYarnFreqs(
     for (out) |*v| v.* = 1.0 / v.*;
 }
 
+/// HF `_compute_llama3_parameters` as mlx_fast_rope denominators (angle =
+/// position / freqs[i]): low frequencies slow down by `factor`, high ones keep
+/// their rate, the band between is smoothed. `out.len` = head_dim / 2.
+fn computeLlama3Freqs(out: []f64, head_dim: u32, base: f64, l3: model_mod.Llama3Rope) void {
+    const factor: f64 = l3.factor;
+    const low: f64 = l3.low_freq_factor;
+    const high: f64 = l3.high_freq_factor;
+    const window: f64 = l3.original_max_position_embeddings;
+    for (out, 0..) |*o, i| {
+        const period = std.math.pow(f64, base, @as(f64, @floatFromInt(2 * i)) / @as(f64, @floatFromInt(head_dim)));
+        const wavelen = 2.0 * std.math.pi * period;
+        o.* = if (wavelen < window / high) period else if (wavelen > window / low) period * factor else blk: {
+            const smooth = (window / wavelen - low) / (high - low);
+            break :blk period / ((1.0 - smooth) / factor + smooth);
+        };
+    }
+}
+
 /// Hy3 (hy_v3 / DeepSeek-V3-style) sigmoid routing chain — mirrors the
 /// reference `expert_select` (hy_v3.py):
 ///   scores = sigmoid(logits) in FLOAT32 (the fp32-router class: a bf16
@@ -53760,6 +53789,23 @@ test "computeYarnFreqs matches HF _compute_yarn_parameters (Laguna full-attn rop
     try testing.expectApproxEqRel(std.math.pow(f64, 500000.0, 0.0), freqs[0], 1e-9);
     // Above the high correction dim (18): pure interpolation → freqs = factor·base^(2i/64).
     try testing.expectApproxEqRel(32.0 * std.math.pow(f64, 500000.0, @as(f64, 2 * 31) / 64.0), freqs[31], 1e-6);
+}
+
+test "computeLlama3Freqs matches HF _compute_llama3_parameters (Llama 3.2)" {
+    // Golden denominators from HF's inv-freq formulation: head_dim 128, base 5e5,
+    // factor 32, low/high 1/4, window 8192. High frequencies keep their rate, low
+    // ones run 32x slower, the band between is smoothed.
+    var freqs: [64]f64 = undefined;
+    computeLlama3Freqs(&freqs, 128, 500000.0, .{ .factor = 32.0, .low_freq_factor = 1.0, .high_freq_factor = 4.0, .original_max_position_embeddings = 8192.0 });
+    const golden = [_]struct { idx: usize, val: f64 }{
+        .{ .idx = 0, .val = 1.0 },
+        .{ .idx = 20, .val = 60.384868705732515 },
+        .{ .idx = 30, .val = 774.8646742531896 },
+        .{ .idx = 40, .val = 116682.63579547375 },
+        .{ .idx = 45, .val = 325265.6956955225 },
+        .{ .idx = 63, .val = 13033875.741704715 },
+    };
+    for (golden) |g| try testing.expectApproxEqRel(g.val, freqs[g.idx], 1e-9);
 }
 
 test "laguna yarn parity vs modeling_laguna.py (LAGUNA_FIXTURES)" {
