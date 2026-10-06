@@ -17995,8 +17995,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 3);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             if (mlx.mlx_vector_array_size(out_vec) == 1) {
                 var g = mlx.mlx_array_new();
                 try mlx.check(mlx.mlx_vector_array_get(&g, out_vec, 0));
@@ -18102,10 +18102,11 @@ pub const Transformer = struct {
         const in_vec = mlx.mlx_vector_array_new_data(inputs.ptr, inputs.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
         var out_vec = mlx.mlx_vector_array{ .ctx = null };
-        try mlx.check(mlx.mlx_closure_apply(&out_vec, c, in_vec));
         defer _ = mlx.mlx_vector_array_free(out_vec);
+        try mlx.check(mlx.mlx_closure_apply(&out_vec, c, in_vec));
         if (mlx.mlx_vector_array_size(out_vec) != 1) return null;
         var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_vector_array_get(&out, out_vec, 0));
         return out;
     }
@@ -18259,8 +18260,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 2);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
 
             var inds = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(inds);
@@ -18302,8 +18303,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
 
             var inds = mlx.mlx_array_new();
             errdefer _ = mlx.mlx_array_free(inds);
@@ -18339,8 +18340,8 @@ pub const Transformer = struct {
             defer _ = mlx.mlx_vector_array_free(in_vec);
 
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
 
             var result = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
@@ -19554,8 +19555,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             var result = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
@@ -19757,8 +19758,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 2);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             var result = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
@@ -19816,8 +19817,8 @@ pub const Transformer = struct {
             const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
             defer _ = mlx.mlx_vector_array_free(in_vec);
             var out_vec = mlx.mlx_vector_array{ .ctx = null };
-            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             defer _ = mlx.mlx_vector_array_free(out_vec);
+            try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
             var result = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
             return result;
@@ -38765,6 +38766,7 @@ pub fn qsaPoolNormRopeFused(
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
+    errdefer _ = mlx.mlx_array_free(out);
     if (!qsa_pool_rope_engaged) {
         qsa_pool_rope_engaged = true;
         log.info("[qsa] fused pooled-key upkeep engaged (blocks={d} ratio={d} rope={d}) — MLX_SERVE_QSA_IDX_ROPE_FUSED=0 restores the composed chain\n", .{ ksh[1], ksh[2], rope_dims });
@@ -40644,6 +40646,7 @@ fn stridedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array) 
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, strided_sig_gate_kernel.?, inputs_vec, strided_sig_gate_cfg.?, s));
     var y = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
+    errdefer _ = mlx.mlx_array_free(y);
     return y;
 }
 
@@ -43861,6 +43864,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     if (sc.ctx == null) {
         var fp_result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_matmul(&fp_result, x, w, s));
+        errdefer _ = mlx.mlx_array_free(fp_result);
         return fp_result;
     }
 
@@ -43871,6 +43875,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     if (mode != .affine) {
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_quantized_matmul(
+        errdefer _ = mlx.mlx_array_free(result);
             &result,
             x,
             w,
@@ -43905,6 +43910,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
         const null_bi = mlx.mlx_array{ .ctx = null };
         var result = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_quantized_matmul(
+        errdefer _ = mlx.mlx_array_free(result);
             &result,
             x,
             w,
@@ -43930,6 +43936,7 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
 
     var result = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_quantized_matmul(
+    errdefer _ = mlx.mlx_array_free(result);
         &result,
         x,
         w,
