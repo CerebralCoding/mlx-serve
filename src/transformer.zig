@@ -30512,7 +30512,8 @@ pub const Transformer = struct {
 
         // MTP verify rows (spec capture, 2 <= S <= 8): the same kernel over S
         // tokens with the per-step state capture rollback reads, then the norm-gate.
-        if (self.rht == null and batch == 1 and seq_len >= 1 and seq_len <= gdn_decode.MAX_SEQ and projected == null and
+        // A grouped verify's `projected` slices ride it too, or its rows round unlike a solo verify's.
+        if (self.rht == null and batch == 1 and seq_len >= 1 and seq_len <= gdn_decode.MAX_SEQ and
             self.spec_capture_ssm and ssm.initialized and ssm.ssm_state.ctx != null and kernel == 4 and
             !cfg.kda_vector_gate and !cfg.kdaUsesBoundedGate() and gdnDecodeRecurEnabled())
         fast: {
@@ -38765,8 +38766,8 @@ pub fn qsaPoolNormRopeFused(
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, qsa_pool_rope_cfg.?, s));
     if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
     var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     errdefer _ = mlx.mlx_array_free(out);
+    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
     if (!qsa_pool_rope_engaged) {
         qsa_pool_rope_engaged = true;
         log.info("[qsa] fused pooled-key upkeep engaged (blocks={d} ratio={d} rope={d}) — MLX_SERVE_QSA_IDX_ROPE_FUSED=0 restores the composed chain\n", .{ ksh[1], ksh[2], rope_dims });
@@ -40645,8 +40646,8 @@ fn stridedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array) 
     defer _ = mlx.mlx_vector_array_free(outputs_vec);
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, strided_sig_gate_kernel.?, inputs_vec, strided_sig_gate_cfg.?, s));
     var y = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
     errdefer _ = mlx.mlx_array_free(y);
+    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
     return y;
 }
 
@@ -43863,8 +43864,8 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     // load to [in, out] so a single mlx_matmul does the contraction.
     if (sc.ctx == null) {
         var fp_result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_matmul(&fp_result, x, w, s));
         errdefer _ = mlx.mlx_array_free(fp_result);
+        try mlx.check(mlx.mlx_matmul(&fp_result, x, w, s));
         return fp_result;
     }
 
@@ -43874,8 +43875,8 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     // would misroute e.g. an nvfp4 weight to mxfp8.
     if (mode != .affine) {
         var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_quantized_matmul(
         errdefer _ = mlx.mlx_array_free(result);
+        try mlx.check(mlx.mlx_quantized_matmul(
             &result,
             x,
             w,
@@ -43909,8 +43910,8 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
 
         const null_bi = mlx.mlx_array{ .ctx = null };
         var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_quantized_matmul(
         errdefer _ = mlx.mlx_array_free(result);
+        try mlx.check(mlx.mlx_quantized_matmul(
             &result,
             x,
             w,
@@ -43935,8 +43936,8 @@ fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.ml
     if (try prefillDqGemm(x, w, sc, bi, bits, group_size, s)) |py| return py;
 
     var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_quantized_matmul(
     errdefer _ = mlx.mlx_array_free(result);
+    try mlx.check(mlx.mlx_quantized_matmul(
         &result,
         x,
         w,
@@ -70626,7 +70627,19 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
     const shared_gate_before = mtp_verify_shared_gate_rows_calls;
     const grouped_before = mtp_verify_moe_group_graphs;
 
-    for ([_][2]usize{ .{ 2, 2 }, .{ 5, 5 }, .{ 2, 3 }, .{ 3, 2 }, .{ 9, 9 }, .{ 2, 9 }, .{ 9, 3 } }) |S_row| {
+    // A solo verify of up to 8 rows takes the MoE rows arm, a joined group past 8 the sorted
+    // verify kernels, which reduce differently: rows match only while both sides run one arm.
+    const old_rows_arm = moe_verify_rows_override;
+    defer moe_verify_rows_override = old_rows_arm;
+    const Pass = struct { rows_arm: bool, shapes: []const [2]usize };
+    const passes = [_]Pass{
+        .{ .rows_arm = false, .shapes = &.{ .{ 2, 2 }, .{ 5, 5 }, .{ 2, 3 }, .{ 3, 2 }, .{ 9, 9 }, .{ 2, 9 }, .{ 9, 3 } } },
+        .{ .rows_arm = true, .shapes = &.{ .{ 2, 2 }, .{ 2, 3 }, .{ 3, 2 } } },
+    };
+    var group_calls: u64 = 0;
+    for (passes) |pass| for (pass.shapes) |S_row| {
+        moe_verify_rows_override = pass.rows_arm;
+        group_calls += 1;
         var slots = try L10VerifySlots.init(allocator, &xfm, n_layers, prompts);
         defer slots.deinit(allocator);
 
@@ -70671,9 +70684,9 @@ test "row-axis verify: every row of a group verify is byte-identical to its solo
             try testing.expectEqual(prompts[i].len + S_row[i], slots.group[i].off);
             try testing.expectEqual(slots.solo[i].off, slots.group[i].off);
         }
-        std.debug.print("[mtp verify] S={any}: rows equal (logits, hidden_all, hidden_last)\n", .{S_row});
-    }
-    try testing.expectEqual(@as(u64, 7), mtp_verify_moe_group_graphs - grouped_before);
+        std.debug.print("[mtp verify] S={any} rows_arm={}: rows equal (logits, hidden_all, hidden_last)\n", .{ S_row, pass.rows_arm });
+    };
+    try testing.expectEqual(group_calls, mtp_verify_moe_group_graphs - grouped_before);
     try testing.expect(mtp_verify_indexed_input_calls > indexed_before);
     try testing.expect(mtp_verify_expert_reduce_calls > reduce_before);
     try testing.expect(mtp_verify_expert_pairs_calls > expert_before);
