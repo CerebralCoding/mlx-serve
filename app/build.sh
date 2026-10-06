@@ -514,6 +514,10 @@ install_name_tool -change \
     "$(otool -L "$CONTENTS/MacOS/mlx-serve" | grep libmlxc | awk '{print $1}')" \
     "@executable_path/../Frameworks/libmlxc.dylib" \
     "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+# The mlx-stream plugin's C shims link libmlx directly.
+install_name_tool -change @rpath/libmlx.dylib \
+    "@executable_path/../Frameworks/libmlx.dylib" \
+    "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
 
 if [ "$STAGE_FRAMEWORKS" = "1" ]; then
     # Fix libmlxc -> libmlx dependency

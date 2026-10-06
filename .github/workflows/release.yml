@@ -293,6 +293,12 @@ jobs:
             @executable_path/lib/libllama.dylib \
             "$STAGING/mlx-serve" 2>/dev/null || true
 
+          # The mlx-stream plugin's C shims link libmlx directly.
+          install_name_tool -change \
+            @rpath/libmlx.dylib \
+            @executable_path/lib/libmlx.dylib \
+            "$STAGING/mlx-serve" 2>/dev/null || true
+
           install_name_tool -change \
             @rpath/libmlx.dylib \
             @loader_path/libmlx.dylib \
@@ -439,6 +445,12 @@ jobs:
           install_name_tool -change \
             @rpath/libllama.dylib \
             "@executable_path/../Frameworks/libllama.dylib" \
+            "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
+
+          # The mlx-stream plugin's C shims link libmlx directly.
+          install_name_tool -change \
+            @rpath/libmlx.dylib \
+            "@executable_path/../Frameworks/libmlx.dylib" \
             "$CONTENTS/MacOS/mlx-serve" 2>/dev/null || true
 
           install_name_tool -change \
