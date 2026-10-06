@@ -6865,15 +6865,19 @@ fn hermesParamSpanEnclosing(body: []const u8, at: usize) ?usize {
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
     const fn_start_tag = "<function=";
     const fn_start = std.mem.indexOf(u8, block, fn_start_tag) orelse return null;
-    const name_start = fn_start + fn_start_tag.len;
-    const name_end = std.mem.indexOf(u8, block[name_start..], ">") orelse return null;
-    const fn_name = std.mem.trim(u8, block[name_start .. name_start + name_end], " \n");
+    var name_start = fn_start + fn_start_tag.len;
+    while (name_start < block.len and std.ascii.isWhitespace(block[name_start])) name_start += 1;
+    // A name never spans a line or a tag: a newline or `<` before the `>` means
+    // the model dropped the `>`, so the name ends there and the body starts there.
+    const name_end = std.mem.indexOfAnyPos(u8, block, name_start, ">\n\r<") orelse return null;
+    const fn_name = std.mem.trim(u8, block[name_start..name_end], " \t");
+    if (fn_name.len == 0) return null;
 
     var args_map = std.ArrayList(u8).empty;
     defer args_map.deinit(allocator);
     args_map.append(allocator, '{') catch return null;
 
-    const fn_body_start = name_start + name_end + 1;
+    const fn_body_start = if (block[name_end] == '>') name_end + 1 else name_end;
     const fn_end = blk: {
         var from = fn_body_start;
         while (std.mem.indexOfPos(u8, block, from, "</function>")) |found| {
@@ -8076,6 +8080,34 @@ test "parseHermesToolCall never emits invalid JSON on a malformed <parameter=> t
     try testing.expect(parsed.value == .object);
     // The clean sibling parameter is recovered.
     try testing.expectEqualStrings("./parse.py", parsed.value.object.get("path").?.string);
+}
+
+test "parseHermesToolCall ends a function name whose > is missing at the line break (#748)" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { text: []const u8, path: ?[]const u8 }{
+        .{ .text = "<tool_call>\n<function=read_file\n</parameter>\n</function>\n</tool_call>", .path = null },
+        .{ .text = "<tool_call>\n<function=read_file\n<parameter=path>\n./a.txt\n</parameter>\n</function>\n</tool_call>", .path = "./a.txt" },
+        .{ .text = "<tool_call>\n<function=read_file<parameter=path>\n./a.txt\n</parameter>\n</function>\n</tool_call>", .path = "./a.txt" },
+    };
+    for (cases) |case| {
+        const calls = (try parseToolCalls(allocator, case.text)).?;
+        defer {
+            for (calls) |tc| {
+                allocator.free(tc.name);
+                allocator.free(tc.arguments);
+            }
+            allocator.free(calls);
+        }
+        try testing.expectEqual(@as(usize, 1), calls.len);
+        try testing.expectEqualStrings("read_file", calls[0].name);
+        const parsed = try std.json.parseFromSlice(std.json.Value, allocator, calls[0].arguments, .{});
+        defer parsed.deinit();
+        if (case.path) |p| {
+            try testing.expectEqualStrings(p, parsed.value.object.get("path").?.string);
+        } else {
+            try testing.expectEqual(@as(usize, 0), parsed.value.object.count());
+        }
+    }
 }
 
 test "parseHermesToolCall dedups a repeated <parameter=> name (no duplicate JSON key)" {

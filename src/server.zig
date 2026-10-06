@@ -1585,6 +1585,32 @@ fn toolCallFinishReason(pre_parse: []const u8) []const u8 {
     return if (std.mem.eql(u8, pre_parse, "length")) "length" else "tool_calls";
 }
 
+/// The `tool_calls` array of one streamed chat-completions delta: name, id and
+/// the full arguments in ONE delta, every string escaped.
+fn streamToolCallDelta(allocator: std.mem.Allocator, index: usize, id: []const u8, name: []const u8, arguments: []const u8) ![]u8 {
+    const esc_name = try jsonEscape(allocator, name);
+    defer allocator.free(esc_name);
+    const esc_args = try jsonEscape(allocator, arguments);
+    defer allocator.free(esc_args);
+    return std.fmt.allocPrint(allocator,
+        \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":{s},"arguments":{s}}}}}]
+    , .{ index, id, esc_name, esc_args });
+}
+
+test "streamed tool-call delta escapes the name and arguments (#748)" {
+    const allocator = std.testing.allocator;
+    const name = "read_file\n</parameter \"x\" \\";
+    const args = "{\"path\":\"a\\nb\"}";
+    const delta = try streamToolCallDelta(allocator, 0, "call_1_0", name, args);
+    defer allocator.free(delta);
+    try std.testing.expect(std.mem.indexOfScalar(u8, delta, '\n') == null);
+    const parsed = try std.json.parseFromSlice(std.json.Value, allocator, delta, .{});
+    defer parsed.deinit();
+    const function = parsed.value.array.items[0].object.get("function").?.object;
+    try std.testing.expectEqualStrings(name, function.get("name").?.string);
+    try std.testing.expectEqualStrings(args, function.get("arguments").?.string);
+}
+
 /// A repetition-loop cut may land inside an otherwise recognizable tool call.
 /// Never emit that buffer as executable work: unlike a genuine max-token cut,
 /// this intentional stop must not ask clients to recover by compacting/retrying.
@@ -11656,20 +11682,7 @@ fn handleStreamingGeneration(
             for (tool_calls, 0..) |tc, i| {
                 const tc_id = try std.fmt.allocPrint(allocator, "call_{d}_{d}", .{ chat_id, i });
                 defer allocator.free(tc_id);
-
-                // Escape the full arguments string for embedding in JSON
-                const escaped_args = try jsonEscape(allocator, tc.arguments);
-                defer allocator.free(escaped_args);
-                // Strip outer quotes from jsonEscape result (it wraps in "...")
-                const args_inner = if (escaped_args.len >= 2 and escaped_args[0] == '"')
-                    escaped_args[1 .. escaped_args.len - 1]
-                else
-                    escaped_args;
-
-                // First delta: name + id + full arguments (clients accumulate these)
-                const first_delta = try std.fmt.allocPrint(allocator,
-                    \\[{{"index":{d},"id":"{s}","type":"function","function":{{"name":"{s}","arguments":"{s}"}}}}]
-                , .{ i, tc_id, tc.name, args_inner });
+                const first_delta = try streamToolCallDelta(allocator, i, tc_id, tc.name, tc.arguments);
                 defer allocator.free(first_delta);
                 try sendSSEChunk(allocator, stream, chat_id, model_name, .{ .role = null, .content = null, .tool_calls_json = first_delta }, null, null, null, .{ .logprobs_json = try lps.take() });
             }

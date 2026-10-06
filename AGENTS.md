@@ -224,7 +224,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **Types come from the SCHEMA, never the value's spelling** (`coerceToolArgsToSchema`; undecidable → untouched; a `oneOf`/`anyOf` declares a type only when its branches agree, fx `shell.request`). ONE chokepoint `server.parseToolCallsForRequest` — never call `chat.parseToolCalls` from a handler.
 - **Buried required params**: `hoistMisplacedRequiredParams` lifts only on all-schema-read unanimity. Pristine args = the parse layer is innocent.
 - **Heuristic raw-JSON inference must name a DECLARED tool** (`filterInferredBySchema`); explicit tag calls never filtered; new heuristics set `.inferred`; not autocorrect-gated.
-- **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups; coercion never worsens conformance; broken output stays honest. Harness: `src/tool_traffic_replay_test.zig`.
+- **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups (the NAME too, every emitter, #748); a parsed name never spans a line or tag (corpus invariant); coercion never worsens conformance; broken output stays honest. Harness: `src/tool_traffic_replay_test.zig`.
 - **A Hermes param value keeps its own whitespace** (`chat.stripHermesValueFraming`): the template frames it with EXACTLY one newline per side and that is all the parser strips. Padded SCALARS still type from their spelling (`isJsonLiteral` probe).
 - **Gemma dropped `<|"|>`**: rich bare values run to the CONFIRMED closing delimiter or top-level final `}`, never the first `,`/`}` inside markup.
 - **Think-tag leaks**: strip pos-0 unclosed openers; `trimTrailingThinkClosers`; universal no-tag-leak corpus invariant covers new entries.

@@ -806,6 +806,16 @@ const corpus = [_]Expect{
         .tool_arg_key = "command",
         .tool_arg_value = "ls -la",
     },
+    .{
+        // #748: the `>` after the function name is missing, so a `>`-scan ran
+        // into the next tag and shipped the name `read_file\n</parameter`.
+        .family = "hermes",
+        .name = "function name with a missing > ends at the line break",
+        .raw = "<tool_call>\n<function=read_file\n<parameter=path>\n./notes.md\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "read_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "./notes.md",
+    },
     // ── Schema-declared argument types (value-spelling inference class) ──────
     // Class: the tag formats carry NO type information, so the parser infers it
     // from the value's SPELLING (`isJsonLiteral`) — and guesses wrong in both
@@ -1921,6 +1931,10 @@ test "format corpus: recorded model outputs across families" {
                 // own payloads — a self-reinforcing loop the parser started.
                 if (std.mem.indexOf(u8, tc.name, "<|") != null) {
                     try fail(entry, "tool NAME carries a channel marker", tc.name);
+                }
+                // A tool name never spans a line or a tag (#748).
+                if (tc.name.len == 0 or std.mem.indexOfAny(u8, tc.name, "\n\r<>") != null) {
+                    try fail(entry, "tool NAME is empty or carries a line break or markup", tc.name);
                 }
                 const parsed = std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{}) catch {
                     try fail(entry, "tool arguments are not valid JSON", tc.arguments);
