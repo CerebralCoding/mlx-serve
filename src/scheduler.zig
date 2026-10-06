@@ -6289,7 +6289,7 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
     const tok_u32: u32 = @intCast(next_id);
 
     // EOS handling — match the MLX path: do NOT emit the stop token.
-    if (next_id == engine.eosToken() or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
+    if (engine.isStop(next_id) or generate_mod.isEosId(tok_u32, slot.eos_token_ids)) {
         finishSlot(sch, slot, "stop");
         return;
     }
@@ -6316,7 +6316,7 @@ fn runDs4DecodeTick(sch: *Scheduler, slot: *Slot, session: *arch_ds4.Ds4Session)
         for (spec_buf[0..n_usize]) |t| {
             const t_u32: u32 = @intCast(t);
             // EOS may appear mid-batch — stop, and never emit it.
-            if (t == engine.eosToken() or generate_mod.isEosId(t_u32, slot.eos_token_ids)) {
+            if (engine.isStop(t) or generate_mod.isEosId(t_u32, slot.eos_token_ids)) {
                 finishSlot(sch, slot, "stop");
                 return;
             }

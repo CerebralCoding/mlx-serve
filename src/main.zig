@@ -1801,7 +1801,6 @@ fn runDs4Offline(
     const out_w = &stdout.interface;
     try out_w.writeAll("\n");
 
-    const eos = engine.eosToken();
     var generated: u32 = 0;
     while (generated < max_tokens) : (generated += 1) {
         const next_id: i32 = if (temp <= 0.0)
@@ -1809,7 +1808,7 @@ fn runDs4Offline(
         else
             sess.sample(temp, 0, 1.0, 0.05, &rng);
 
-        if (next_id == eos) break;
+        if (engine.isStop(next_id)) break;
 
         const piece = try engine.detokenizeOne(allocator, next_id);
         defer allocator.free(piece);

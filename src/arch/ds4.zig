@@ -359,6 +359,16 @@ pub const Ds4Engine = struct {
         return @intCast(ffi.ds4_token_eos(self.handle));
     }
 
+    /// ds4's own end-of-generation set: EOS, end-of-text and, on GLM, the
+    /// role markers that open the next turn (`<|user|>`, `<|observation|>`).
+    pub fn isStop(self: *Ds4Engine, token: i32) bool {
+        return ffi.ds4_token_is_stop(self.handle, token);
+    }
+
+    pub fn vocabSize(self: *Ds4Engine) u32 {
+        return @intCast(ffi.ds4_engine_vocab_size(self.handle));
+    }
+
     pub fn assistantToken(self: *Ds4Engine) i32 {
         return @intCast(ffi.ds4_token_assistant(self.handle));
     }

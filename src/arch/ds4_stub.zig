@@ -94,6 +94,15 @@ pub const Ds4Engine = struct {
         _ = self;
         @panic(unavailable);
     }
+    pub fn isStop(self: *Ds4Engine, token: i32) bool {
+        _ = self;
+        _ = token;
+        @panic(unavailable);
+    }
+    pub fn vocabSize(self: *Ds4Engine) u32 {
+        _ = self;
+        @panic(unavailable);
+    }
     pub fn assistantToken(self: *Ds4Engine) i32 {
         _ = self;
         @panic(unavailable);
