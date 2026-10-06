@@ -7866,11 +7866,14 @@ fn toolForceTick(sch: *Scheduler, slot: *Slot, gen: *Generator) !bool {
     const tf = gen.sampling.tool_force orelse return false;
     const d = tf.due(gen.generated_ids.items, gen.completion_tokens, gen.max_tokens) orelse return false;
     tf.fired = true;
-    if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, d.tokens.len + 1)) {
+    // The model's own next token is published first: a call it already opened is not opened twice.
+    const tokens = if (try gen.upcomingToken() == d.tokens[0]) d.tokens[1..] else d.tokens;
+    if (tokens.len == 0) return false;
+    if (!generate_mod.forcedBoundaryCanContinue(gen.completion_tokens, gen.max_tokens, tokens.len + 1)) {
         log.warn("[tool-choice] no room to force the call (max_tokens {d})\n", .{gen.max_tokens});
         return false;
     }
-    if (try commitForcedTick(sch, slot, gen, d.tokens, .tool_choice)) {
+    if (try commitForcedTick(sch, slot, gen, tokens, .tool_choice)) {
         log.info("[tool-choice] call opener forced at {d} generated tokens{s}\n", .{ gen.generated_ids.items.len, if (d.closes_thought) " (thought closed for it)" else "" });
     }
     return true;

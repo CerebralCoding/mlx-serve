@@ -7336,7 +7336,8 @@ pub fn forcedToolOpener(allocator: std.mem.Allocator, template: []const u8, forc
     if (std.mem.indexOf(u8, template, "<tool_call>\\n<function=") == null and
         std.mem.indexOf(u8, template, "<tool_call>\n<function=") == null) return null;
     return switch (forced) {
-        .any => try allocator.dupe(u8, "<tool_call>\n<function="),
+        // Not past `=`: the pre-tokenizer joins it to the name (`=get`), so a lone `=` steers the name.
+        .any => try allocator.dupe(u8, "<tool_call>\n<function"),
         .name => |n| try std.fmt.allocPrint(allocator, "<tool_call>\n<function={s}>\n", .{n}),
     };
 }
@@ -10333,7 +10334,7 @@ test "forcedToolOpener: the XML dialect commits a call in the template's own spe
     const qwen = @embedFile("fixtures/qwen38_chat_template.jinja");
     const any = (try forcedToolOpener(allocator, qwen, .any)).?;
     defer allocator.free(any);
-    try testing.expectEqualStrings("<tool_call>\n<function=", any);
+    try testing.expectEqualStrings("<tool_call>\n<function", any);
     const named = (try forcedToolOpener(allocator, qwen, .{ .name = "calculator" })).?;
     defer allocator.free(named);
     try testing.expectEqualStrings("<tool_call>\n<function=calculator>\n", named);
