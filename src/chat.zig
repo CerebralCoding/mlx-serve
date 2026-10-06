@@ -4045,10 +4045,11 @@ fn isScalarJsonType(want: []const u8) bool {
 
 /// The JSON type a property declares. `"type"` may be a union array
 /// (`["string","null"]`) — the first non-null entry wins. Absent/odd → null,
-/// which means "leave the value alone".
+/// which means "leave the value alone". Without a `"type"`, a `oneOf`/`anyOf`
+/// union declares one only when every non-null branch names the same.
 fn declaredJsonType(prop: std.json.Value) ?[]const u8 {
     if (prop != .object) return null;
-    const t = prop.object.get("type") orelse return null;
+    const t = prop.object.get("type") orelse return unionJsonType(prop.object);
     switch (t) {
         .string => |s| return s,
         .array => |arr| {
@@ -4061,6 +4062,20 @@ fn declaredJsonType(prop: std.json.Value) ?[]const u8 {
         },
         else => return null,
     }
+}
+
+fn unionJsonType(prop: std.json.ObjectMap) ?[]const u8 {
+    const branches = (prop.get("oneOf") orelse prop.get("anyOf") orelse return null);
+    if (branches != .array) return null;
+    var agreed: ?[]const u8 = null;
+    for (branches.array.items) |b| {
+        const bt = declaredJsonType(b) orelse return null;
+        if (std.mem.eql(u8, bt, "null")) continue;
+        if (agreed) |a| {
+            if (!std.mem.eql(u8, a, bt)) return null;
+        } else agreed = bt;
+    }
+    return agreed;
 }
 
 /// Tolerant boolean spelling — the union of what weak models actually emit:
@@ -12470,6 +12485,49 @@ test "coerceToolArgsToSchema: nullable union type [\"string\",\"null\"] coerces 
     try testing.expect(parsed.value.object.get("flag").? == .bool);
     try testing.expectEqual(false, parsed.value.object.get("flag").?.bool);
     try testing.expectEqualStrings("hi", parsed.value.object.get("note").?.string);
+}
+
+test "coerceToolArgsToSchema: an object param declared as a oneOf union coerces from its JSON text" {
+    // fx's shell tool: `request` is a discriminated union with no top-level "type".
+    const allocator = testing.allocator;
+    const tools =
+        \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","required":["request"],"properties":{"request":{"oneOf":[{"type":"object","required":["action","command"],"properties":{"action":{"const":"run"},"command":{"type":"string"}}},{"type":"object","required":["action"],"properties":{"action":{"const":"cancel"}}}]}}}}}]
+    ;
+    const raw = "<tool_call>\n<function=shell>\n<parameter=request>\n{\"action\":\"run\",\"command\":\"ls\"}\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)).?;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try coerceToolArgsToSchema(allocator, calls, tools);
+    const parsed = try parseArgsObj(allocator, calls[0].arguments);
+    defer parsed.deinit();
+    const req = parsed.value.object.get("request").?;
+    try testing.expect(req == .object);
+    try testing.expectEqualStrings("ls", req.object.get("command").?.string);
+}
+
+test "declaredJsonType: a oneOf/anyOf union declares a type only when its branches agree" {
+    const allocator = testing.allocator;
+    const cases = [_]struct { schema: []const u8, want: ?[]const u8 }{
+        .{ .schema = "{\"oneOf\":[{\"type\":\"object\"},{\"type\":\"object\"}]}", .want = "object" },
+        .{ .schema = "{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"null\"}]}", .want = "string" },
+        .{ .schema = "{\"anyOf\":[{\"type\":\"string\"},{\"type\":\"object\"}]}", .want = null },
+        .{ .schema = "{\"oneOf\":[{\"type\":\"object\"},{\"const\":1}]}", .want = null },
+    };
+    for (cases) |c| {
+        var doc = try std.json.parseFromSlice(std.json.Value, allocator, c.schema, .{});
+        defer doc.deinit();
+        const got = declaredJsonType(doc.value);
+        if (c.want) |w| {
+            try testing.expectEqualStrings(w, got.?);
+        } else {
+            try testing.expect(got == null);
+        }
+    }
 }
 
 test "coerceToolArgsToSchema: an explicit JSON null satisfies any typed param (not coerced away)" {
