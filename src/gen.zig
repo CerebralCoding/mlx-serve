@@ -3915,7 +3915,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             error.LoraNoMatch => "a LoRA has no modules matching MiniMax-H3's DiT — wrong architecture for this adapter?",
             error.BadLoraPath => "'lora_paths' must be absolute paths to .safetensors files",
             error.TooManyLoras => "too many LoRA adapters (max 8, and turbo takes one of the slots)",
-            error.TurboLoraIncomplete => "turbo_lora.safetensors is incomplete — re-download minimax_h3_turbo_4step_ckpt500.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora",
+            error.TurboLoraIncomplete => "turbo_lora.safetensors ships modules MiniMax-H3's DiT does not have — replace it with minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora",
             else => null,
         };
         if (named) |msg| {
