@@ -47,7 +47,7 @@ CLI flags: `--model --serve --host --port --prompt --max-tokens --temp --top-p -
 
 CLI subcommands (Ollama-grade, `src/cli.zig`): `mlx-serve run <model>` (pull-if-missing + serve + TTY chat REPL), `pull <model>`, `list`, `serve` (headless over `~/.mlx-serve/models`). Short names resolve via the alias table in cli.zig (mirrors `gemmaModelOptions`); `org/repo`, `hf.co/org/repo`, and `:tag` forms accepted everywhere.
 
-Sampling defaults for request fields the client OMITS resolve as: request body > `--temp`/`--top-p`/`--top-k` launch flags (the app passes its Settings values) > the model's `generation_config.json` (Qwen 3.6: top_k 20 / top_p 0.95; Gemma 4: top_k 64 / top_p 0.95) > hardcoded (1.0/1.0/off). Claude Code omits all sampling params, so pre-2026-06 it sampled the full untruncated distribution at temp 1.0.
+Sampling defaults for request fields the client OMITS resolve as: request body > generation-defaults rules (see "Generation defaults") > `--temp`/`--top-p`/`--top-k` launch flags > the model's `generation_config.json` (Qwen 3.6: top_k 20 / top_p 0.95; Gemma 4: top_k 64 / top_p 0.95) > hardcoded (1.0/1.0/off). Claude Code omits all sampling params, so pre-2026-06 it sampled the full untruncated distribution at temp 1.0.
 
 ### Swift macOS app (`app/Sources/MLXServe/`)
 
@@ -216,6 +216,12 @@ Pure data in `responses.zig`; HTTP/orchestration in `server.zig`. Supports `POST
 - **Compliance**: `experiments/openresponses` validates strict schema; currently 17/17. `top_level response_format` accepted as alias for `text.format`.
 - **Compaction (`POST /v1/responses/compact`)**: pure data, no LLM call. Synthesizes opaque base64 `encrypted_content` over `{"v":1,"msgs":[...]}`. `appendCompactionInputItem` reconstitutes on round-trip. `model` required (422 on missing). Drops tool calls + images.
 - **WebSocket transport (`ws[s]://host/v1/responses`)**: same endpoint, opt-in via `Upgrade: websocket`. Each text frame is a `response.create`-shaped JSON; SSE events become single WS text frames via `WsBridge` on `Conn.ws_mode`. **No `[DONE]` on success** (`response.completed`/`.failed`/`.incomplete` is the terminator). Sequence numbers reset per response. `WsLocalCache` holds `store: false` responses for the connection lifetime; failed continuations evict the chain root.
+
+## Generation defaults
+
+`~/.mlx-serve/generation-settings.json` holds global rules, `{"temperature": {"value": 0.8}, "reasoning_budget": {"value": 1024, "ignore_client": true}}`; a model's entry in `model-settings.json` carries the same object under `generation_defaults`, and its `chat_template_kwargs` `enable_thinking`/`reasoning_effort` fill rules it leaves unset. Model rules replace global ones field by field. A rule fills a field the request omits; `ignore_client` makes it replace the request's value. Both files are read per request through `model_settings.Cache` (mtime-checked), so an edit applies to the next request. A malformed profile is logged and ignored, never a refused request.
+
+The `reasoning_budget` rule stands in for `--reasoning-budget`: effort words map against it (`xhigh` is capped by it, `medium` keeps 8192); forced, it replaces the final budget. Enforcement is the ordinary `think_bound`. A forced `enable_thinking`/`reasoning_effort` ignores the request's thinking switches; raw `/v1/completions` has no thinking and ignores those rules. The app migrates only its old server-wide values (`--temp`/`--top-p`/`--top-k`) into the global file, once.
 
 ## Anthropic Messages API (`/v1/messages`)
 
