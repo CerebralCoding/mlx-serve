@@ -19,6 +19,7 @@ const simd_qmm = @import("simd_qmm.zig");
 const row_attn = @import("row_attn.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const sushi_exl3 = @import("sushi_exl3");
+const sushi_pack = @import("sushi_pack.zig");
 const qmv_nax2 = @import("qmv_nax2.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const qmm_int8 = @import("qmm_int8.zig");
@@ -16968,14 +16969,14 @@ pub const Transformer = struct {
         // its scales still crashes honestly.
         const bias_mandatory = config.quant_bits > 0 and config.quant_mode.hasBiases();
         const emb_dense = floatDtypeTable(mlx.mlx_array_dtype(emb_w));
-        const emb_s_arr = if (config.quant_bits == 0 or emb_dense)
+        const emb_s_arr = if (emb_dense)
             mlx.mlx_array_new()
         else
             getNamedWeight(weights, &name_buf, prefix, emb_base, "scales") orelse {
                 log.err("MISSING WEIGHT: {s}.{s}.scales\n", .{ prefix, emb_base });
                 return error.MissingWeight;
             };
-        const emb_b_arr = if (config.quant_bits == 0 or emb_dense)
+        const emb_b_arr = if (emb_dense)
             mlx.mlx_array_new()
         else
             getNamedWeight(weights, &name_buf, prefix, emb_base, "biases") orelse blk: {
@@ -17037,7 +17038,7 @@ pub const Transformer = struct {
                 // projects via a transposed view of the [vocab, hidden] weight.
                 // Per-TENSOR dense detection (float dtype), same as embed_tokens
                 // above — mixed checkpoints may quantize layers but not the head.
-                const head_dense = config.quant_bits == 0 or floatDtypeTable(mlx.mlx_array_dtype(w));
+                const head_dense = floatDtypeTable(mlx.mlx_array_dtype(w));
                 lm_head_s = if (head_dense)
                     mlx.mlx_array_new()
                 else if (is_inkling)
@@ -18517,6 +18518,7 @@ pub const Transformer = struct {
 
     pub inline fn qmatmul(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
         if (mlx_gguf.kernels.infoOf(w, sc)) |info| return mlx_gguf.kernels.linear(info, x, w, self.s);
+        if (sushi_pack.isRowScaledFp8(w, sc)) return sushi_pack.fp8Linear(x, w, sc, self.s);
         // Resolve (bits, group_size, mode) per weight. Most weights inherit the
         // global config; per-weight overrides (mixed-precision checkpoints, e.g.
         // affine 8-bit shared MLP inside an nvfp4 QAT model) are detected on
@@ -32271,6 +32273,23 @@ pub const Transformer = struct {
     }
 
     /// `gate_logit`: the shared-expert gate's logit when the router kernel already computed it.
+    /// `expert_sum` plus the always-on shared expert; consumes `expert_sum`.
+    fn moeAddUngatedShared(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
+        if (mw.shared_gate_w.ctx == null) return expert_sum;
+        defer _ = mlx.mlx_array_free(expert_sum);
+        const sh_gate = try self.qmatmul(expert_x, mw.shared_gate_w, mw.shared_gate_s, mw.shared_gate_b);
+        defer _ = mlx.mlx_array_free(sh_gate);
+        const sh_up = try self.qmatmul(expert_x, mw.shared_up_w, mw.shared_up_s, mw.shared_up_b);
+        defer _ = mlx.mlx_array_free(sh_up);
+        const sh_act = try self.computeGeglu(sh_gate, sh_up);
+        defer _ = mlx.mlx_array_free(sh_act);
+        const sh_down = try self.qmatmul(sh_act, mw.shared_down_w, mw.shared_down_s, mw.shared_down_b);
+        defer _ = mlx.mlx_array_free(sh_down);
+        var result = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&result, expert_sum, sh_down, self.s));
+        return result;
+    }
+
     fn moeAddGatedShared(self: *Transformer, expert_sum: mlx.mlx_array, expert_x: mlx.mlx_array, mw: *const MoeMlpWeights, gate_logit: ?mlx.mlx_array) !mlx.mlx_array {
         const down = (try self.moeSharedDown(.qmatmul, expert_x, mw, &.{})).?;
         defer _ = mlx.mlx_array_free(down);
@@ -32905,7 +32924,7 @@ pub const Transformer = struct {
             norm_scores = scaled_scores;
         }
 
-        if (cfg.isGlm5() and !skip_shared and mlx.mlx_array_size(expert_x) <= @as(usize, glm5.MOE_DECODE_MAX_ROWS) * cfg.hidden_size) {
+        if (cfg.isGlm5() and cfg.exl3 == null and !skip_shared and mlx.mlx_array_size(expert_x) <= @as(usize, glm5.MOE_DECODE_MAX_ROWS) * cfg.hidden_size) {
             if (try self.glmMoeDecode(expert_x, inds, norm_scores, mw, gate_qp, up_qp, down_qp)) |y| return y;
         }
 
@@ -32916,8 +32935,14 @@ pub const Transformer = struct {
                 .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
             };
             const dec: sushi_exl3.format.Decode = .{ .codebook = spec.codebook, .window = spec.window };
-            const y = try sushi_exl3.moe(self.s, expert_x, bank, inds, norm_scores, dec, skip_shared and router_override != null);
-            if (skip_shared or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
+            const clamp = swigluClampLimit(cfg) orelse return error.Exl3SwigluLimitUnsupported;
+            const y = if (clamp > 0)
+                try sushi_exl3.moeClamped(self.s, expert_x, bank, inds, norm_scores, dec, @intCast(clamp))
+            else
+                try sushi_exl3.moe(self.s, expert_x, bank, inds, norm_scores, dec, skip_shared and router_override != null);
+            if (skip_shared) return y;
+            if (mw.shared_ungated) return self.moeAddUngatedShared(y, expert_x, mw);
+            if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
             defer _ = mlx.mlx_array_free(y);
             return self.moeAddGatedShared(y, expert_x, mw, null);
         }
@@ -33321,18 +33346,7 @@ pub const Transformer = struct {
         // `y = y + self.shared_mlp(x)`). shared_gate_w carries a real handle
         // only when the checkpoint shipped mlp.shared_mlp.* weights.
         if (mw.shared_ungated) {
-            if (mw.shared_gate_w.ctx == null) return expert_sum;
-            defer _ = mlx.mlx_array_free(expert_sum);
-            const sh_gate = try self.qmatmul(expert_x, mw.shared_gate_w, mw.shared_gate_s, mw.shared_gate_b);
-            defer _ = mlx.mlx_array_free(sh_gate);
-            const sh_up = try self.qmatmul(expert_x, mw.shared_up_w, mw.shared_up_s, mw.shared_up_b);
-            defer _ = mlx.mlx_array_free(sh_up);
-            const sh_act = try self.computeGeglu(sh_gate, sh_up);
-            defer _ = mlx.mlx_array_free(sh_act);
-            const sh_down = try self.qmatmul(sh_act, mw.shared_down_w, mw.shared_down_s, mw.shared_down_b);
-            defer _ = mlx.mlx_array_free(sh_down);
-            var result = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&result, expert_sum, sh_down, self.s));
+            const result = try self.moeAddUngatedShared(expert_sum, expert_x, mw);
             if (moe_prof) {
                 try mlx.check(mlx.mlx_array_eval(result));
                 decode_prof.moe_shared_ns += mclk.lap();
@@ -34720,20 +34734,22 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             // to plain matmul by maybeTransposeForBf16).
             const rt = lagunaRouterBase(weights, name_buf, prefix, li);
             var rtbuf: [64]u8 = undefined;
+            var exbuf: [64]u8 = undefined;
+            const lf: [3][]const u8 = if (is_mimo and config.exl3 != null) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
             lw.mlp = .{
                 .moe = .{
                     .router_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "weight")),
                     .router_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "scales")) orelse mlx.mlx_array_new(),
                     .router_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&rtbuf, rt, "biases")) orelse mlx.mlx_array_new(),
-                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.weight"),
-                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.scales") orelse mlx.mlx_array_new(),
-                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.gate_proj.biases") orelse mlx.mlx_array_new(),
-                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.weight"),
-                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.scales") orelse mlx.mlx_array_new(),
-                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.up_proj.biases") orelse mlx.mlx_array_new(),
-                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.weight"),
-                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.scales") orelse mlx.mlx_array_new(),
-                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.switch_mlp.down_proj.biases") orelse mlx.mlx_array_new(),
+                    .switch_gate_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.gate_proj", lf[0])),
+                    .switch_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.gate_proj", lf[1])) orelse mlx.mlx_array_new(),
+                    .switch_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.gate_proj", lf[2])) orelse mlx.mlx_array_new(),
+                    .switch_up_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.up_proj", lf[0])),
+                    .switch_up_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.up_proj", lf[1])) orelse mlx.mlx_array_new(),
+                    .switch_up_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.up_proj", lf[2])) orelse mlx.mlx_array_new(),
+                    .switch_down_w = try getLayerWeight(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.down_proj", lf[0])),
+                    .switch_down_s = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.down_proj", lf[1])) orelse mlx.mlx_array_new(),
+                    .switch_down_b = getLayerWeightOpt(weights, name_buf, prefix, li, moeExpertSuffix(&exbuf, "mlp.switch_mlp.down_proj", lf[2])) orelse mlx.mlx_array_new(),
                     .shared_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.weight") orelse mlx.mlx_array_new(),
                     .shared_gate_s = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.scales") orelse mlx.mlx_array_new(),
                     .shared_gate_b = getLayerWeightOpt(weights, name_buf, prefix, li, "mlp.shared_expert.gate_proj.biases") orelse mlx.mlx_array_new(),
@@ -34759,6 +34775,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                     .shared_ungated = true,
                 },
             };
+            if (is_mimo) if (config.exl3) |spec| try checkExl3Bank(&lw.mlp.moe, config, spec);
             {
                 const mw = &lw.mlp.moe;
                 try maybeTransposeForBf16(&mw.router_w, mw.router_s, &owned_bf16, allocator, s);
@@ -43891,6 +43908,7 @@ test "qmvBatchLimit mirrors MLX's qmv/qmm split on single- and dual-die gen-17 G
 
 fn qmatmulBits(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode, s: mlx.mlx_stream) !mlx.mlx_array {
     if (mlx_gguf.kernels.infoOf(w, sc)) |info| return mlx_gguf.kernels.linear(info, x, w, s);
+    if (sushi_pack.isRowScaledFp8(w, sc)) return sushi_pack.fp8Linear(x, w, sc, s);
     // A weight re-ordered in place is read in its tiled layout only.
     if (try lane_qmm.tiledQmm(x, w, s)) |y| return y;
     // Plain BF16 weight: scales array is unset. Used by mixed-precision Unsloth
@@ -44539,19 +44557,21 @@ pub fn loadRoutedMoeAt(weights: *const Weights, name_buf: *[256]u8, base: []cons
     const ex = expertContainerAt(weights, name_buf, base);
     var rtbuf: [64]u8 = undefined;
     var exbuf: [64]u8 = undefined;
+    const exl3 = is_glm and config.exl3 != null;
+    const lf: [3][]const u8 = if (exl3) .{ "trellis", "suh", "svh" } else .{ "weight", "scales", "biases" };
     var mw: MoeMlpWeights = .{
         .router_w = try getWeightAt(weights, name_buf, base, moeExpertSuffix(&rtbuf, rt, "weight")),
         .router_s = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&rtbuf, rt, "scales")) orelse mlx.mlx_array_new(),
         .router_b = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&rtbuf, rt, "biases")) orelse mlx.mlx_array_new(),
-        .switch_gate_w = try getWeightAt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "gate_proj.weight")),
-        .switch_gate_s = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "gate_proj.scales")) orelse mlx.mlx_array_new(),
-        .switch_gate_b = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "gate_proj.biases")) orelse mlx.mlx_array_new(),
-        .switch_up_w = try getWeightAt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "up_proj.weight")),
-        .switch_up_s = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "up_proj.scales")) orelse mlx.mlx_array_new(),
-        .switch_up_b = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "up_proj.biases")) orelse mlx.mlx_array_new(),
-        .switch_down_w = try getWeightAt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "down_proj.weight")),
-        .switch_down_s = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "down_proj.scales")) orelse mlx.mlx_array_new(),
-        .switch_down_b = getWeightAtOpt(weights, name_buf, base, moeExpertSuffix(&exbuf, ex, "down_proj.biases")) orelse mlx.mlx_array_new(),
+        .switch_gate_w = try getWeightAt(weights, name_buf, base, expertLeaf(&exbuf, ex, "gate_proj", lf[0])),
+        .switch_gate_s = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "gate_proj", lf[1])) orelse mlx.mlx_array_new(),
+        .switch_gate_b = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "gate_proj", lf[2])) orelse mlx.mlx_array_new(),
+        .switch_up_w = try getWeightAt(weights, name_buf, base, expertLeaf(&exbuf, ex, "up_proj", lf[0])),
+        .switch_up_s = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "up_proj", lf[1])) orelse mlx.mlx_array_new(),
+        .switch_up_b = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "up_proj", lf[2])) orelse mlx.mlx_array_new(),
+        .switch_down_w = try getWeightAt(weights, name_buf, base, expertLeaf(&exbuf, ex, "down_proj", lf[0])),
+        .switch_down_s = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "down_proj", lf[1])) orelse mlx.mlx_array_new(),
+        .switch_down_b = getWeightAtOpt(weights, name_buf, base, expertLeaf(&exbuf, ex, "down_proj", lf[2])) orelse mlx.mlx_array_new(),
         .shared_gate_w = try getWeightAt(weights, name_buf, base, "mlp.shared_experts.gate_proj.weight"),
         .shared_gate_s = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.gate_proj.scales") orelse mlx.mlx_array_new(),
         .shared_gate_b = getWeightAtOpt(weights, name_buf, base, "mlp.shared_experts.gate_proj.biases") orelse mlx.mlx_array_new(),
@@ -44586,6 +44606,7 @@ pub fn loadRoutedMoeAt(weights: *const Weights, name_buf: *[256]u8, base: []cons
     try maybeTransposeForBf16(&mw.shared_gate_w, mw.shared_gate_s, owned_bf16, allocator, s);
     try maybeTransposeForBf16(&mw.shared_up_w, mw.shared_up_s, owned_bf16, allocator, s);
     try maybeTransposeForBf16(&mw.shared_down_w, mw.shared_down_s, owned_bf16, allocator, s);
+    if (exl3) try checkExl3Bank(&mw, config.*, config.exl3.?);
     return mw;
 }
 
@@ -44630,6 +44651,11 @@ fn checkExl3Bank(mw: *const MoeMlpWeights, config: ModelConfig, spec: sushi_exl3
         if (p.suh.ctx == null or p.svh.ctx == null) return error.MissingWeight;
         if (!sushi_exl3.trellisAdmitted(mlx.getShape(p.w), config.num_experts, p.in, p.out, spec.rate)) return error.Exl3TrellisGeometry;
     }
+}
+
+/// "<container>.<proj>.<leaf>" for an expert bank, built into `buf`.
+fn expertLeaf(buf: []u8, container: []const u8, proj: []const u8, leaf: []const u8) []const u8 {
+    return std.fmt.bufPrint(buf, "{s}.{s}.{s}", .{ container, proj, leaf }) catch unreachable;
 }
 
 /// Build a "<container>.<leaf>" layer-weight suffix into `buf`. Used where the
@@ -44738,7 +44764,8 @@ fn splitFusedQkvRows(arr: mlx.mlx_array, q_rows: u32, kv_rows: u32, transpose: b
 }
 
 fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, config: *const ModelConfig) error{MissingWeight}!mlx.mlx_array {
-    if (config.quant_bits == 0) return mlx.mlx_array_new();
+    // A pack with no `quantization` block (Sushi's) still stores affine trunk linears beside dense ones.
+    if (config.quant_bits == 0) return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
     if (config.quant_mode.hasBiases()) return try getLayerWeight(weights, buf, prefix, layer, suffix);
     return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
 }

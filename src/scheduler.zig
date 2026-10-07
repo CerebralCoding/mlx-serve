@@ -49,6 +49,7 @@ const glm_mtp = @import("glm_mtp.zig");
 const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
+const sushi_pack = @import("sushi_pack.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
@@ -3382,6 +3383,7 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
 }
 
 fn residentModelDiskBytes(io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
+    if (config.exl3 != null and (config.isGlm5() or config.isMimo())) return sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir, config);
     const total = modelDiskBytes(io, model_dir);
     if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
     const info = (try @import("qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
@@ -4021,11 +4023,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 in_dir_drafter = null;
             },
             .refuse => {
-                log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights{s} plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+                log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights{s} plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.{s}\n", .{
                     @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
                     @as(f64, @floatFromInt(weights_bytes)) / gb,
                     if (drafter_bytes > 0) " and drafter" else "",
                     @as(f64, @floatFromInt(avail_bytes)) / gb,
+                    if (params.config.exl3 != null) " This Sushi pack keeps its experts resident here; `sushi` can stream them from SSD." else "",
                 });
                 return error.InsufficientMemory;
             },

@@ -4,6 +4,7 @@ const mlx = @import("mlx.zig");
 const log = @import("log.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const sushi_exl3 = @import("sushi_exl3");
+const sushi_pack = @import("sushi_pack.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
@@ -2032,6 +2033,13 @@ fn refuseUnconvertedMimo(cfg_obj: std.json.ObjectMap) !void {
     }
 }
 
+/// A Sushi pack's `expert_quant` makes its routed experts EXL3 banks.
+fn parseSushiExperts(root: std.json.ObjectMap, config: *ModelConfig) !void {
+    if (jsonField(root, "expert_quant") == null) return;
+    config.exl3 = try sushi_exl3.parseExpertQuant(root);
+    try sushi_exl3.admitTopK(config.num_experts_per_tok);
+}
+
 pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !ModelConfig {
     // The launch-time overrides apply to EVERY parse (primary load, on-demand
     // load, discovery stubs), so the advertised context and the loaded model
@@ -2958,6 +2966,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         if (jsonField(cfg_obj, "hc_eps")) |v| config.dsv4_hc_eps = try jsonFloat(v);
         // The GLM-5-Next vision tower is not wired.
         config.has_vision = false;
+        try parseSushiExperts(root, &config);
     } else if (std.mem.eql(u8, model_type, "mimo_v2") or std.mem.eql(u8, model_type, "mimo_v2_flash")) {
         // Xiaomi MiMo-V2.6-Flash (309B-A15B) in the mlx-lm layout (tests/convert_mimo_v2.py,
         // the community packs); `mimo_v2_flash` is MiMo-V2-Flash and TensorFold's V2.6 label.
@@ -2966,7 +2975,8 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // layers 8 KV heads at theta 1e4 with sinks; K 192 / V 128, RoPE on the
         // first int(192 * 0.334) = 64 channels. Experts: laguna's sigmoid routing
         // with a selection-only bias and no shared expert; dense layers lead.
-        try refuseUnconvertedMimo(cfg_obj);
+        // A Sushi pack's `quant_method: fp8` describes its trunk; its experts are EXL3.
+        if (jsonField(root, "expert_quant") == null) try refuseUnconvertedMimo(cfg_obj);
         config.model_type = "mimo_v2";
         config.weight_prefix = "model";
         config.norm_has_offset = false;
@@ -3033,6 +3043,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         config.rope_scaling_factor = 1.0;
         // The MiMo-ViT tower is not wired: the generic vision_config block must not arm SigLIP.
         config.has_vision = false;
+        try parseSushiExperts(root, &config);
     } else if (std.mem.eql(u8, model_type, "hy_v3")) {
         // Tencent Hunyuan 3 (Hy3, 295B-A21B MoE; July 2026). Pure
         // full-attention MoE that rides the qwen3_moe forward arms: GQA with
@@ -4203,7 +4214,28 @@ pub fn loadWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
 /// How a load treats stored dtypes. `keep_f16`: a pack whose activation dtype
 /// is f16 (Prism Hadamard packs) keeps its f16 side tensors and tables as
 /// stored; narrowing them to bf16 drops 3 mantissa bits of every group scale.
-pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false };
+/// `index_owners`: a tensor two shards carry loads from the shard the index names.
+pub const LoadOpts = struct { vision: bool = false, keep_f16: bool = false, embedded_ple: bool = false, defer_qwen4_norms: bool = false, index_owners: bool = false, shard: []const u8 = "", owners: ?*const Owners = null };
+
+pub const Owners = std.StringHashMapUnmanaged([]const u8);
+
+/// tensor -> shard from the index's `weight_map`, strings owned by `arena`.
+pub fn indexOwners(io: std.Io, arena: std.mem.Allocator, dir: std.Io.Dir) ?Owners {
+    const raw = dir.readFileAlloc(io, "model.safetensors.index.json", arena, .limited(64 * 1024 * 1024)) catch return null;
+    const parsed = std.json.parseFromSliceLeaky(std.json.Value, arena, raw, .{}) catch return null;
+    if (parsed != .object) return null;
+    const wm = parsed.object.get("weight_map") orelse return null;
+    if (wm != .object) return null;
+    var out: Owners = .empty;
+    var it = wm.object.iterator();
+    while (it.next()) |e| {
+        if (e.value_ptr.* != .string) continue;
+        // An owner shard that is not on disk claims nothing.
+        _ = dir.statFile(io, e.value_ptr.string, .{}) catch continue;
+        out.put(arena, e.key_ptr.*, e.value_ptr.string) catch return null;
+    }
+    return out;
+}
 
 /// The text model's weights for `config`.
 pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, config: *ModelConfig, load_vision: bool) !Weights {
@@ -4214,7 +4246,7 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const info = (try qwen4_exp.inspectEmbedded(model_dir, try qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
         if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
     }
-    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4() });
+    var weights = try loadWeightsOpt(io, allocator, model_dir, .{ .vision = load_vision, .keep_f16 = config.actDtype() == .float16, .embedded_ple = config.isQwen4() and config.embedded_ple_payload_bytes != null, .defer_qwen4_norms = config.isQwen4(), .index_owners = config.exl3 != null });
     errdefer weights.deinit();
     if (config.isQwen4()) {
         defer reportF16Narrowing();
@@ -4222,6 +4254,11 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
         const s = mlx.mlx_default_cpu_stream_new();
         defer _ = mlx.mlx_stream_free(s);
         try resolveAndFoldQwen4Norms(config, &weights, s, model_dir);
+    }
+    if (config.exl3 != null) {
+        const s = mlx.mlx_default_cpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        try sushi_pack.adapt(config, &weights, s);
     }
     return weights;
 }
@@ -4275,6 +4312,10 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     var referenced = model_discovery.indexShardSet(io, dir);
     defer if (referenced) |*r| model_discovery.freeShardSet(r);
 
+    var owners_arena = std.heap.ArenaAllocator.init(allocator);
+    defer owners_arena.deinit();
+    var owners: ?Owners = if (opts.index_owners) indexOwners(io, owners_arena.allocator(), dir) else null;
+
     var file_count: u32 = 0;
     var it = dir.iterate();
     while (try it.next(io)) |entry| {
@@ -4294,7 +4335,10 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
         defer allocator.free(path);
 
         log.info("Loading {s}...\n", .{entry.name});
-        try loadSafetensorsFile(allocator, &weights, path, s, opts);
+        var shard_opts = opts;
+        shard_opts.shard = entry.name;
+        if (owners) |*o| shard_opts.owners = o;
+        try loadSafetensorsFile(allocator, &weights, path, s, shard_opts);
         file_count += 1;
     }
 
@@ -4451,7 +4495,8 @@ pub fn loadSafetensorsFile(
 
         const key_str = std.mem.span(key.?);
 
-        if (!shouldKeepWeightKey(key_str, load_vision) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str))) {
+        const foreign = if (opts.owners) |o| (if (o.get(key_str)) |owner| !std.mem.eql(u8, owner, opts.shard) else false) else false;
+        if (foreign or !shouldKeepWeightKey(key_str, load_vision) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str))) {
             _ = mlx.mlx_array_free(value);
             continue;
         }
@@ -5911,6 +5956,41 @@ test "ModelConfig: mimo_v2 source release is refused with the converter's name" 
     );
     defer testing.allocator.free(src);
     try testing.expectError(error.UnconvertedMimoCheckpoint, parseConfigFromJson(testing.allocator, src));
+}
+
+test "ModelConfig: a Sushi pack's expert_quant selects EXL3 experts on mimo_v2 and glm5_next" {
+    const eq = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\",\"window\":14},";
+    const glm = try parseConfigFromJson(testing.allocator, eq ++ glm5_next_pack_json[1..]);
+    try testing.expectEqual(@as(u32, 40), glm.exl3.?.rate.n);
+    try testing.expectEqual(sushi_exl3.format.Window.w14, glm.exl3.?.window);
+    try testing.expect((try parseConfigFromJson(testing.allocator, glm5_next_pack_json)).exl3 == null);
+
+    // The pack's `quant_method: fp8` names its trunk, so the release refusal does not fire.
+    const fp8 = try std.mem.replaceOwned(u8, testing.allocator, mimo_v2_pack_json,
+        \\"quantization_config": {"group_size": 32, "bits": 4, "mode": "mxfp4"}
+    ,
+        \\"quantization_config": {"quant_method": "fp8", "weight_block_size": [128, 128]}
+    );
+    defer testing.allocator.free(fp8);
+    const with_eq = try std.mem.concat(testing.allocator, u8, &.{ eq, fp8[1..] });
+    defer testing.allocator.free(with_eq);
+    const mimo = try parseConfigFromJson(testing.allocator, with_eq);
+    try testing.expect(mimo.isMimo());
+    try testing.expectEqual(sushi_exl3.format.Codebook.mcg, mimo.exl3.?.codebook);
+    try testing.expectError(error.UnconvertedMimoCheckpoint, parseConfigFromJson(testing.allocator, fp8));
+}
+
+test "indexOwners: the index names the shard a duplicated tensor loads from, an absent shard claims nothing" {
+    const io = testing.io;
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "affine.safetensors", .data = "" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{\"lm_head.weight\":\"affine.safetensors\",\"x.weight\":\"gone.safetensors\"}}" });
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const owners = indexOwners(io, arena.allocator(), tmp.dir).?;
+    try testing.expectEqualStrings("affine.safetensors", owners.get("lm_head.weight").?);
+    try testing.expect(owners.get("x.weight") == null);
 }
 
 test "ModelConfig: mimo_v2_flash (MiMo-V2-Flash, TensorFold/Vontra V2.6 packs) parses as mimo_v2" {
