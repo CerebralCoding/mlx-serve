@@ -6,7 +6,7 @@ slow or too unpredictable for: NPC intent, dialogue routing, moderation, "is
 the player stuck", "which quest fits this situation", difficulty scoring. It
 never generates text; pair it with a chat model when you also need words.
 
-Three families share this endpoint (also available as `POST /v1/systemone`):
+Four families share this endpoint (also available as `POST /v1/systemone`):
 
 - **Laya** (model type `laya`, ~0.35 GB): a few milliseconds per request.
   Pick it when you call often and speed matters most.
@@ -14,6 +14,10 @@ Three families share this endpoint (also available as `POST /v1/systemone`):
   and often more accurate on nuanced text (on one 2,394-headline news-labeling
   test: Laya 55%, Kev-4B 79%). Pick it when getting the answer right matters
   more than speed.
+- **D1** (model type `d1`, `LiquidAI/d1-3B` in bf16, ~6 GB): an LFM2.5-VL-3B
+  decision model. This build takes text only (an `images` field is a 400). A
+  choice's or score's `confidence` is the chosen option's probability, which is
+  not Kev's or Clef's. Int8 (torchao) packs are refused by name.
 - **Clef / Clef-Flash** (model type `clef`): jointly score all questions over
   text and optional images. MLX 4-bit and 8-bit packs are supported.
 
@@ -77,7 +81,7 @@ Three families share this endpoint (also available as `POST /v1/systemone`):
   its probability that the answer is safe to act on rather than escalate. Gate
   game behavior on them: act above a threshold you tune, fall back to a default
   below it.
-- Kev and Clef answers have no `action`, and their `noul` answers no `confidence`; gate
+- Kev, D1 and Clef answers have no `action`, and their `noul` answers no `confidence`; gate
   on the probability itself (`noul`, or the chosen label's probability).
 - The numbers are illustrative; always read them from the response.
 

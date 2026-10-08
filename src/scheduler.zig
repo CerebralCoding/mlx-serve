@@ -49,6 +49,7 @@ const glm_mtp = @import("glm_mtp.zig");
 const ane_mod = @import("ane.zig");
 const diffusion_mod = @import("diffusion.zig");
 const model_mod = @import("model.zig");
+const sushi_pack = @import("sushi_pack.zig");
 const vision_mod = @import("vision.zig");
 const chat_mod = @import("chat.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
@@ -66,6 +67,8 @@ const mlx_gguf = @import("arch/mlx_gguf.zig");
 const log = @import("log.zig");
 const io_util = @import("io_util.zig");
 const status = @import("status.zig");
+const dsv41_mod = @import("deepseek_v41.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_stream.zig") else @import("arch/mlx_stream_stub.zig");
 const sleep_inhibit = @import("sleep_inhibit.zig");
 
 const Transformer = transformer_mod.Transformer;
@@ -2010,7 +2013,7 @@ pub const Scheduler = struct {
         const media_peak = self.mediaPeakFor(entry);
         const mlx_text = owned.gguf == null and gen_mod.modalityFromType(owned.config.model_type) == null;
         const validated_model_bytes: ?u64 = if (mlx_text)
-            residentModelDiskBytes(self.io, entry.path, owned.config) catch |err| {
+            residentModelDiskBytes(self.allocator, self.io, entry.path, owned.config) catch |err| {
                 self.registry.mutex.lockUncancelable(self.io);
                 if (entry.state == .unloaded) self.registry.markErrorLocked(entry, @errorName(err));
                 self.registry.mutex.unlock(self.io);
@@ -3381,8 +3384,11 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
     try std.testing.expectEqual(@as(u64, 0), pleTableBill(io, &config));
 }
 
-fn residentModelDiskBytes(io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
+fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
+    if (config.exl3 != null and (config.isGlm5() or config.isMimo())) return sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir, config);
     const total = modelDiskBytes(io, model_dir);
+    if (config.dsv41_stream) return mlx_stream.loadBytes(allocator, io, config);
+    if (config.isDsv41()) return dsv41_mod.residentDiskBytes(allocator, model_dir, config, total);
     if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
     const info = (try @import("qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
     if (info.payload_bytes != config.embedded_ple_payload_bytes.?) return error.EmbeddedNgramTableChanged;
@@ -3435,13 +3441,59 @@ test "validated embedded weight estimate feeds eviction preflight and residency"
         .hidden_size = 64,
     };
     const disk = modelDiskBytes(io, dir);
-    const snapshot = try residentModelDiskBytes(io, dir, &config);
+    const snapshot = try residentModelDiskBytes(std.testing.allocator, io, dir, &config);
     try std.testing.expectEqual(disk - 120, snapshot);
     try std.testing.expectEqual(snapshot, committedTextBytes(snapshot, &config));
     try std.testing.expectEqual(snapshot + snapshot / 10, gateEstimateBytes(0, snapshot, config.num_hidden_layers, config.hidden_size));
     try std.testing.expectEqual(loadRequirementBytes(snapshot), loadRequirementBytes(committedTextBytes(snapshot, &config)));
     config.embedded_ple_payload_bytes = 121;
-    try std.testing.expectError(error.EmbeddedNgramTableChanged, residentModelDiskBytes(io, dir, &config));
+    try std.testing.expectError(error.EmbeddedNgramTableChanged, residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+}
+
+test "residentModelDiskBytes: deepseek_v41 does not bill the Engram tables it preads" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try @import("dsv41_engram.zig").writeAffineFixture(io, td.dir, "");
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    var config: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 1, .dsv41_engram_head_dim = 64 };
+    config.dsv41_engram_layers[0] = 1;
+    config.dsv41_engram_rows[0] = 4;
+    try std.testing.expectEqual(modelDiskBytes(io, dir) - 288, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+}
+
+test "residentModelDiskBytes: deepseek_v41 bills neither the vision tower nor DSpark stages that will not load" {
+    const unsetenv = struct {
+        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+    }.unsetenv;
+    _ = unsetenv("MLX_SERVE_DSV4_DSPARK"); // test-order hygiene: `--dspark` (and tests) force the stages on
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var td = std.testing.tmpDir(.{});
+    defer td.cleanup();
+    try @import("dsv41_engram.zig").writeAffineFixture(io, td.dir, "");
+    const hdr = "{\"layers.0.attn_norm.weight\":{\"dtype\":\"BF16\",\"shape\":[8],\"data_offsets\":[0,16]}," ++
+        "\"vision.patch.weight\":{\"dtype\":\"BF16\",\"shape\":[16],\"data_offsets\":[16,48]}," ++
+        "\"language_model.mtp.0.norm.weight\":{\"dtype\":\"BF16\",\"shape\":[32],\"data_offsets\":[48,112]}}";
+    var shard: [8 + hdr.len + 112]u8 = @splat(0);
+    std.mem.writeInt(u64, shard[0..8], hdr.len, .little);
+    @memcpy(shard[8..][0..hdr.len], hdr);
+    try td.dir.writeFile(io, .{ .sub_path = "model-00002.safetensors", .data = &shard });
+    const e = "layers.1.engram.embed.";
+    try td.dir.writeFile(io, .{ .sub_path = "model.safetensors.index.json", .data = "{\"weight_map\":{" ++
+        "\"" ++ e ++ "weight\":\"model-00001.safetensors\",\"" ++ e ++ "scales\":\"model-00001.safetensors\",\"" ++ e ++ "biases\":\"model-00001.safetensors\"," ++
+        "\"layers.0.attn_norm.weight\":\"model-00002.safetensors\",\"vision.patch.weight\":\"model-00002.safetensors\"," ++
+        "\"language_model.mtp.0.norm.weight\":\"model-00002.safetensors\"}}" });
+    var buf: [512]u8 = undefined;
+    const dir = buf[0..try td.dir.realPath(io, &buf)];
+    var config: model_mod.ModelConfig = .{ .model_type = "deepseek_v41", .dsv41_n_engram_layers = 1, .dsv41_engram_head_dim = 64 };
+    config.dsv41_engram_layers[0] = 1;
+    config.dsv41_engram_rows[0] = 4;
+    const disk = modelDiskBytes(io, dir);
+    // The stages load by default; the tower never does.
+    try std.testing.expectEqual(disk - 288 - 32, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
+    config.mtp_override = false; // --no-mtp, or the model's `mtp` setting
+    try std.testing.expectEqual(disk - 288 - 32 - 64, try residentModelDiskBytes(std.testing.allocator, io, dir, &config));
 }
 
 test "modelDiskBytes follows HF-cache symlinks (a snapshot dir measured ZERO)" {
@@ -3974,7 +4026,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         return;
     }
     const model_bytes = params.resident_model_bytes orelse blk: {
-        const scanned = try residentModelDiskBytes(sch.io, params.model_dir, params.config);
+        const scanned = try residentModelDiskBytes(sch.allocator, sch.io, params.model_dir, params.config);
         break :blk residentGateBytes(scanned, params.entry.bytes_on_disk, true).?;
     };
 
@@ -4021,11 +4073,12 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 in_dir_drafter = null;
             },
             .refuse => {
-                log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights{s} plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.\n", .{
+                log.err("Insufficient memory to load model: needs ~{d:.1} GB free ({d:.1} GB of weights{s} plus headroom for warmup buffers and a baseline KV cache) but only {d:.1} GB is available. Close other models/apps (or wait for a prior mlx-serve to fully exit) and retry; pass --skip-mem-preflight to override.{s}\n", .{
                     @as(f64, @floatFromInt(loadRequirementBytes(weights_bytes))) / gb,
                     @as(f64, @floatFromInt(weights_bytes)) / gb,
                     if (drafter_bytes > 0) " and drafter" else "",
                     @as(f64, @floatFromInt(avail_bytes)) / gb,
+                    if (params.config.exl3 != null) " This Sushi pack keeps its experts resident here; `sushi` can stream them from SSD." else "",
                 });
                 return error.InsufficientMemory;
             },
@@ -5730,6 +5783,44 @@ fn commitDeclinesPadOnly(n_gen: usize, all_pad: bool) bool {
     return n_gen > 0 and all_pad;
 }
 
+/// Snapshot the live SSM state at the committed length so the next turn resumes after this
+/// one's generated tail; prefill snapshots end SSM_SNAPSHOT_BACKOFF tokens before the prompt end.
+/// Exact there because every speculative round rolls the GDN state back before it returns.
+fn appendDecodeEndCheckpoint(
+    slot: *Slot,
+    gen: *Generator,
+    cps: []transformer_mod.SSMCheckpoint,
+    total_len: usize,
+) []transformer_mod.SSMCheckpoint {
+    const entries = slot.ssm_entries orelse return cps;
+    const xfm = slot.model.transformer orelse return cps;
+    const a = gen.ssm_checkpoint_alloc orelse return cps;
+    const newest: ?usize = if (cps.len > 0) cps[cps.len - 1].pos else null;
+    if (!decodeEndCheckpointWanted(slot.full_prompt.len, total_len, slot.moe_seq_offset, newest, slot.media.len > 0)) {
+        if (slot.moe_seq_offset != total_len) log.debug("[hot-cache] decode-end checkpoint skipped: live position {d}, committed {d}\n", .{ slot.moe_seq_offset, total_len });
+        return cps;
+    }
+    var cp = transformer_mod.captureSsmCheckpoint(a, entries, total_len, xfm.s) catch |err| {
+        log.warn("[hot-cache] decode-end checkpoint failed: {s} — the next turn re-forwards this tail\n", .{@errorName(err)});
+        return cps;
+    };
+    const out = a.realloc(cps, cps.len + 1) catch {
+        cp.deinit(a);
+        return cps;
+    };
+    out[out.len - 1] = cp;
+    log.info("  [hot-cache] decode-end checkpoint at {d} ({d} prompt + {d} generated)\n", .{ total_len, slot.full_prompt.len, total_len - slot.full_prompt.len });
+    return out;
+}
+
+/// PURE: the live state must describe exactly the committed tokens, past every prefill snapshot;
+/// media slots are excluded because M-RoPE positions are not token counts.
+fn decodeEndCheckpointWanted(prompt_len: usize, total_len: usize, live_pos: usize, newest_cp: ?usize, has_media: bool) bool {
+    if (has_media or total_len <= prompt_len or live_pos != total_len) return false;
+    if (newest_cp) |pos| return pos < total_len;
+    return true;
+}
+
 /// Phase A6: commit a successfully completed slot's KV cache to the hot
 /// prefix cache. Called from the inference thread BEFORE `markFinished`
 /// broadcasts, so the slot is still alive (the conn thread is blocked in
@@ -5773,7 +5864,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // attn models this returns an empty slice (no allocator hit). Ownership
     // transfers to the cache via `commitWithSsm`; freeing happens on
     // eviction.
-    const ssm_cps_slice = gen_ptr.takeSsmCheckpoints();
+    const ssm_cps_slice = appendDecodeEndCheckpoint(slot, gen_ptr, gen_ptr.takeSsmCheckpoints(), total_len);
     const ssm_cps_opt: ?[]transformer_mod.SSMCheckpoint = if (ssm_cps_slice.len > 0) ssm_cps_slice else null;
     if (ssm_cps_slice.len == 0 and gen_ptr.ssm_checkpoint_alloc != null) {
         // Empty list — free the (zero-length) slice we got back so the
@@ -5811,6 +5902,12 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
     // a runtime disable) is still worth committing. What MUST hold is that
     // only COMMITTED entries are snapshotted: truncate off the speculative
     // draft tail first (offset-only, cheap).
+    // The last committed position's hidden pairs with the next prompt's first token: kept, a
+    // decode-end restore appends the head's missing row instead of drafting blind.
+    var mtp_tail: mlx.mlx_array = .{ .ctx = null };
+    defer if (mtp_tail.ctx != null) {
+        _ = mlx.mlx_array_free(mtp_tail);
+    };
     const mtp_commit: ?prefix_cache_mod.DflashCommit = blk: {
         const mc = if (gen_ptr.mtp_cache) |*m| m else break :blk null;
         // A released module head is another slot's to read now; the history stopped
@@ -5818,6 +5915,9 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
         if (gen_ptr.mtpModuleHeadReleased()) break :blk null;
         const committed = gen_ptr.mtpCommittedHistoryLen();
         if (committed == 0) break :blk null;
+        if (gen_ptr.has_last_hidden and gen_ptr.mtp_position_base + committed + 1 == total_len) {
+            mtp_tail = transformer_mod.materializedOwnedCopy(slot.model.transformer.?.s, gen_ptr.last_hidden) catch .{ .ctx = null };
+        }
         mc.truncate(committed, slot.model.transformer.?.s) catch |err| {
             log.warn("[hot-cache] mtp history trim failed: {s} — not committed\n", .{@errorName(err)});
             break :blk null;
@@ -5840,6 +5940,7 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             .head = if (head) |t| &t.qwen4_mtp.?.entry else null,
             .head_pos_base = if (head) |t| t.qwen4_mtp.?.pos_base else 0,
             .head_marks = if (head) |t| t.qwen4MtpMarks() else &.{},
+            .tail_hidden = if (mtp_tail.ctx != null) mtp_tail else null,
         };
     };
     const finish_st = hc.commitWithMediaState(&slot.cache, total_tokens, slot.has_tools, slot.media, slot.cache_key, ssm_cps_opt, dflash_commit, mtp_commit, slot.full_prompt.len) catch |err| {
@@ -7009,7 +7110,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
-        slot.model.transformer.?.dsv4 != null;
+        (slot.model.transformer.?.dsv4 != null or slot.model.transformer.?.dsv41 != null or slot.model.transformer.?.dsv41_ext != null);
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(
@@ -7065,6 +7166,19 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // slot's LoadedModel. Both stay resident for the slot's lifetime
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
+    // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
+    const resumed: u64 = if (xfm_ptr.dsv41) |mdl|
+        try dsv41_mod.resumePrompt(mdl, slot.full_prompt)
+    else if (xfm_ptr.dsv41_ext) |m|
+        try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
+    else
+        0;
+    if (resumed > 0) {
+        hot_matched = @intCast(resumed);
+        prefill_tokens = slot.full_prompt[resumed..];
+        slot.cache.step = resumed;
+        log.info("[dsv41] resumed {d} of {d} prompt tokens\n", .{ resumed, slot.full_prompt.len });
+    }
     if (slot.model.prefix_cache) |*hc| {
         {
             // Only build a restore target when this request will actually
@@ -7082,6 +7196,10 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 null;
             errdefer if (mtp_target) |*mc| mc.deinit();
             var mtp_base: usize = 0;
+            var mtp_tail: mlx.mlx_array = .{ .ctx = null };
+            defer if (mtp_tail.ctx != null) {
+                _ = mlx.mlx_array_free(mtp_tail);
+            };
             const mtp_kv: ?*KVCache = if (mtp_target) |*mc| mc.kv() else null;
             // qwen4_exp: the head's QSA half travels with its KV; adoption is all-or-nothing.
             const mtp_head: ?*Transformer = if (mtp_target) |*mc| mc.head() else null;
@@ -7096,7 +7214,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 slot.has_tools,
                 slot.media,
                 if (dfl_target) |*dc| .{ .cache = &dc.cache, .base_pos = &dfl_base } else null,
-                if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head } else null,
+                if (mtp_kv) |k| .{ .cache = k, .base_pos = &mtp_base, .head = mtp_head, .tail_hidden = &mtp_tail } else null,
                 @intFromPtr(slot),
                 slot.skip_prefix_cache,
             ) catch |err| blk: {
@@ -7122,6 +7240,12 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 dfl_target = null;
             }
             if (mtp_target) |*mc| {
+                // A decode-end restore lands one row past the history: append that row first.
+                if (lookup.mtp_base != null and mtp_tail.ctx != null and mtp_base + mc.step() + 1 == hot_matched and hot_matched < slot.full_prompt.len) {
+                    slot.mtp.?.appendHistory(xfm_ptr, mc, slot.full_prompt[hot_matched .. hot_matched + 1], mtp_tail, @intCast(mc.step()), null, slot.allocator) catch |err| {
+                        log.warn("[hot-cache] mtp history row append failed: {s} — head starts blind\n", .{@errorName(err)});
+                    };
+                }
                 // Same exact-alignment rule (the Generator asserts
                 // `base + step == ssm_cp_offset` on adoption).
                 if (lookup.mtp_base != null and mtp_base + mc.step() == hot_matched) {
@@ -10822,6 +10946,17 @@ test "prefix-cache commit declines a pad-only generation, never a zero-token one
     try testing.expect(!commitDeclinesPadOnly(0, false));
     try testing.expect(commitDeclinesPadOnly(3, true));
     try testing.expect(!commitDeclinesPadOnly(3, false));
+}
+
+test "decode-end checkpoint: taken only where the live state is the committed prefix" {
+    // Bar: a turn that generated past its prompt-end snapshot gets one at its committed end, nothing else does.
+    try testing.expect(decodeEndCheckpointWanted(1000, 1200, 1200, 970, false));
+    try testing.expect(decodeEndCheckpointWanted(1000, 1200, 1200, null, false));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1000, 1000, 970, false));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1201, 970, false));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1199, 970, false));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1200, 1200, false));
+    try testing.expect(!decodeEndCheckpointWanted(1000, 1200, 1200, 970, true));
 }
 
 test "[short-gen] carries both token counts, the ids and what they decode to" {

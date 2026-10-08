@@ -261,14 +261,15 @@ class DownloadManager: ObservableObject {
         // to load while `mlx-serve pull` (a denylist) got it. Torch/flax shadow
         // weights stay out on both sides — same rule as `cli.shouldDownload`,
         // keep them in sync.
-        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin"]
+        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin", "u32"]
         return entries.compactMap { file -> (String, Int64)? in
             guard let path = file["path"] as? String,
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
             // Depth gate. Variant: exactly the named subfolder's own files
             // (`4bit/config.json`), never anything deeper. Chat default:
             // top-level files + the pack's `drafter/` + the MTP sidecar (native
-            // `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`). Media (recursive): keep nested
+            // `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`) + DeepSeek-V4.1's
+            // `engram/` tables (same list as `cli.shouldDownload`). Media (recursive): keep nested
             // weight subdirs (FLUX's transformer/vae/text_encoder, TTS's
             // speech_tokenizer).
             if let folder = selection.packFolder {
@@ -278,7 +279,7 @@ class DownloadManager: ObservableObject {
                 guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
             } else if !selection.recursive {
                 guard !path.contains("/") || path.hasPrefix("mtp/") || path.hasPrefix(DrafterGems.packFolder + "/")
-                    || path == "optiq/mtp.safetensors" else { return nil }
+                    || path.hasPrefix("engram/") || path == "optiq/mtp.safetensors" else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
             guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }
@@ -387,8 +388,18 @@ class DownloadManager: ObservableObject {
             return "laya"
         }
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
+        if isD1Config(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "d1" }
         if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
         return nil
+    }
+
+    /// A D1 decision checkpoint (LiquidAI/d1-3B): its LFM2-VL config's `auto_map` names the card's own class,
+    /// which is what tells it from a chat LFM2.5-VL. Twin of `model_discovery.isD1Root`.
+    nonisolated static func isD1Config(atPath path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let map = cfg["auto_map"] as? [String: Any] else { return false }
+        return map["AutoModel"] as? String == "modeling_d1.D1Model"
     }
 
     /// A stable-audio-tools inpainting model conditioned on T5Gemma: the

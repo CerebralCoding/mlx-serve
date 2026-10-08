@@ -66,7 +66,7 @@ enum AppActivation {
         case "browser":       return "Browser"
         case "serverLog":     return "Server Log"
         case "benchmarks":    return "Benchmarks"
-        case "layaDecisions": return "Decisions"
+        case "decisions": return "Decisions"
         case "modelSettings": return "Model Settings"
         case "agents":        return "Agents"
         default:              return nil

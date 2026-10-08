@@ -27,6 +27,7 @@ const stable_audio = @import("stable_audio.zig");
 const kokoro = @import("kokoro.zig");
 const laya = @import("laya.zig");
 const kev = @import("kev.zig");
+const d1 = @import("d1.zig");
 const clef = @import("clef.zig");
 const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
@@ -105,7 +106,8 @@ pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
-    "laya",      "kev",        "clef",           "stable_audio3",
+    "laya",      "kev",        "clef",           "d1",
+    "stable_audio3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -121,7 +123,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
-    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef")) return .decision;
+    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
     return null;
 }
 
@@ -187,6 +189,8 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     if (isClefPack(io, model_dir)) return allocator.dupe(u8, "clef") catch null;
     // A Kev pack's root config.json is its qwen3_5 base: the marker is checked first (discovery agrees).
     if (isKevPack(io, model_dir)) return allocator.dupe(u8, "kev") catch null;
+    // A D1 pack's root config.json is LFM2-VL: its auto_map decides, before the model_type reads as chat.
+    if (isD1Pack(io, allocator, model_dir)) return allocator.dupe(u8, "d1") catch null;
     if (readConfigModelType(io, allocator, model_dir)) |mt| return mt;
     // Diffusers-style repos (Mage-Flow) have no root config.json / model_type —
     // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
@@ -224,6 +228,12 @@ fn isKevPack(io: std.Io, model_dir: []const u8) bool {
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
     defer dir.close(io);
     return discovery.peekKevPack(io, dir);
+}
+
+fn isD1Pack(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekD1Pack(io, allocator, dir);
 }
 
 fn isLayaRepo(io: std.Io, model_dir: []const u8) bool {
@@ -979,7 +989,7 @@ pub const DecisionLimits = struct {
     }
 };
 
-/// Decision engine over `POST /v1/decisions`: a Laya encoder or a Kev pack, chosen by the model dir.
+/// Decision engine over `POST /v1/decisions`: a Laya encoder, a Kev pack, a D1 pack or a Clef pack, chosen by the model dir.
 pub const DecisionEngine = struct {
     allocator: std.mem.Allocator,
     backend: Backend,
@@ -990,7 +1000,7 @@ pub const DecisionEngine = struct {
     batch_window_us: u32 = 0,
     limits: DecisionLimits = .{},
 
-    pub const Backend = union(enum) { laya: *laya.Engine, kev: *kev.Engine, clef: *clef.Engine };
+    pub const Backend = union(enum) { laya: *laya.Engine, kev: *kev.Engine, d1: *d1.Engine, clef: *clef.Engine };
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*DecisionEngine {
         const self = try allocator.create(DecisionEngine);
@@ -1002,6 +1012,8 @@ pub const DecisionEngine = struct {
             .{ .clef = try clef.Engine.load(io, allocator, model_dir, self.stream) }
         else if (isKevPack(io, model_dir))
             .{ .kev = try kev.Engine.load(io, allocator, model_dir, self.stream) }
+        else if (isD1Pack(io, allocator, model_dir))
+            .{ .d1 = try d1.Engine.load(io, allocator, model_dir, self.stream) }
         else
             .{ .laya = try laya.Engine.load(io, allocator, model_dir, self.stream) };
         self.limits = DecisionLimits.fromEnv();
@@ -1029,7 +1041,7 @@ pub const DecisionEngine = struct {
         if (self.limits.message(buf, err)) |msg| return msg;
         return switch (self.backend) {
             .laya => |e| e.limitMessage(buf, err),
-            .kev, .clef => null,
+            .kev, .d1, .clef => null,
         };
     }
 };
@@ -1043,7 +1055,7 @@ pub const DecisionRequest = struct {
     truncate: bool = true,
     images: []const @import("chat.zig").ImageData = &.{},
 
-    pub const Questions = union(enum) { laya: laya.Questions, kev: kev.Questions, clef: clef.Questions };
+    pub const Questions = union(enum) { laya: laya.Questions, kev: kev.Questions, d1: d1.Questions, clef: clef.Questions };
 
     pub fn deinit(self: *DecisionRequest, allocator: std.mem.Allocator) void {
         for (self.images) |image| allocator.free(image.pixels);
@@ -1097,6 +1109,10 @@ pub fn prepareDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const
         try sendError(conn, 400, "missing 'questions'");
         return null;
     };
+    if (engine.backend == .d1 and obj.get("images") != null) {
+        try sendError(conn, 400, "D1 decisions are text-only in this build");
+        return null;
+    }
     const images = if (engine.backend == .clef) engine.backend.clef.prepareImages(allocator, parsed.value) catch |err| {
         try sendDecisionError(conn, engine, err);
         return null;
@@ -1111,6 +1127,10 @@ pub fn prepareDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const
             return null;
         } },
         .kev => |e| .{ .kev = e.parseQuestions(allocator, questions, engine.limits.max_questions) catch |err| {
+            try sendDecisionError(conn, engine, err);
+            return null;
+        } },
+        .d1 => |e| .{ .d1 = e.parseQuestions(allocator, questions, engine.limits.max_questions) catch |err| {
             try sendDecisionError(conn, engine, err);
             return null;
         } },
@@ -1129,6 +1149,7 @@ fn sendDecisionError(conn: *Conn, engine: *DecisionEngine, err: anyerror) !void 
     const named = engine.limitMessage(&limit_buf, err) orelse switch (engine.backend) {
         .laya => laya.errorMessage(err),
         .kev => kev.errorMessage(err),
+        .d1 => d1.errorMessage(err),
         .clef => clef.errorMessage(err) orelse laya.errorMessage(err),
     };
     if (named) |msg| return sendError(conn, 400, msg);
@@ -1168,6 +1189,12 @@ pub fn handleDecisions(engine: *DecisionEngine, model_id: []const u8, jobs: []co
         },
         .kev => |e| {
             for (jobs) |j| sendDecision(engine, j, e.predict(j.allocator, model_id, j.req.state, &j.req.questions.kev, engine.limits.max_input_tokens)) catch |err| {
+                log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
+            };
+            logDecisionPass(jobs, nq, t0);
+        },
+        .d1 => |e| {
+            for (jobs) |j| sendDecision(engine, j, e.predict(j.allocator, model_id, j.req.state, &j.req.questions.d1, engine.limits.max_input_tokens)) catch |err| {
                 log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
             };
             logDecisionPass(jobs, nq, t0);
@@ -5292,6 +5319,10 @@ fn jsonUnescape(allocator: std.mem.Allocator, raw: []const u8) ![]u8 {
 // ── Tests ─────────────────────────────────────────────────────────────────
 
 const testing = std.testing;
+
+test "d1 is a decision modality, routed by the model_type discovery gives it" {
+    try testing.expectEqual(Modality.decision, modalityFromType("d1").?);
+}
 
 test "modalityFromType classifies the media archs + markers (incl. krea + hunyuan3d)" {
     try testing.expectEqual(Modality.image, modalityFromType("flux2-klein-4b").?);

@@ -419,6 +419,72 @@ pub fn appendAnswers(a: std.mem.Allocator, out: *std.ArrayList(u8), qs: []const 
 }
 
 
+// ── Shared state ──
+
+/// The state runs once; each branch then runs from a restored snapshot of the state's caches (KV, conv/SSM
+/// entries and position), so no branch sees another. `emit(ctx, i, h)` gets branch i's final-norm hidden
+/// `[1, L, H]`, evaluated; the helper frees it once `emit` returns. Shared by Kev and D1 (`d1.zig`).
+pub fn scoreBranches(
+    a: std.mem.Allocator,
+    xfm: *transformer_mod.Transformer,
+    layers: u32,
+    state_ids: []const u32,
+    branches: []const []const u32,
+    ctx: anytype,
+    comptime emit: fn (@TypeOf(ctx), usize, A) anyerror!void,
+) !void {
+    var cache = try transformer_mod.KVCache.init(a, layers);
+    defer cache.deinit();
+    const entries = try a.alloc(transformer_mod.SSMCacheEntry, layers);
+    for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
+    defer {
+        for (entries) |*e| {
+            free(e.conv_state);
+            free(e.ssm_state);
+            transformer_mod.ssmFreeQsaState(e);
+        }
+        a.free(entries);
+    }
+    var offset: usize = 0;
+    var fwd = xfm.defaultCtx();
+    fwd.cache = &cache;
+    fwd.moe_seq_offset = &offset;
+    fwd.ssm_entries = entries;
+    fwd.capture_hidden = null;
+    fwd.skip_lm_head = true;
+
+    const h_state = try forwardIds(xfm, &fwd, state_ids);
+    free(h_state);
+    var kv_snap = try cache.snapshot();
+    defer kv_snap.deinit();
+    const ssm_snaps = try a.alloc(transformer_mod.SSMCacheEntrySnapshot, entries.len);
+    for (entries, ssm_snaps) |*e, *sn| sn.* = transformer_mod.ssmSnapshot(e);
+    defer {
+        for (ssm_snaps) |*sn| transformer_mod.ssmSnapshotDeinit(sn);
+        a.free(ssm_snaps);
+    }
+    const state_offset = offset;
+
+    for (branches, 0..) |ids, i| {
+        try cache.restore(&kv_snap);
+        for (entries, ssm_snaps) |*e, *sn| try transformer_mod.ssmRestore(e, sn);
+        offset = state_offset;
+        const h = try forwardIds(xfm, &fwd, ids);
+        defer free(h);
+        try emit(ctx, i, h);
+    }
+}
+
+fn forwardIds(xfm: *transformer_mod.Transformer, ctx: *transformer_mod.ForwardCtx, ids: []const u32) !A {
+    const shape = [_]c_int{ 1, @intCast(ids.len) };
+    const arr = mlx.mlx_array_new_data(ids.ptr, &shape, 2, .uint32);
+    defer free(arr);
+    const h = try xfm.forwardWith(ctx, arr);
+    errdefer free(h);
+    try mlx.check(mlx.mlx_array_eval(h));
+    return h;
+}
+
 // ── Engine ──
 
 /// The five delimiters kev reuses from Qwen's vocabulary, in kev.model.SPECIAL order.
@@ -563,7 +629,6 @@ pub const Engine = struct {
     /// Probabilities per question. The state runs once; each question then runs from a restored snapshot of
     /// the state's KV cache, GatedDeltaNet state and position, so questions never see each other.
     fn score(self: *Engine, a: std.mem.Allocator, state_text: []const u8, qs: []const Question, max_input_tokens: usize, input_tokens: *usize) ![][]f64 {
-        const s = self.stream;
         var state_ids: std.ArrayList(u32) = .empty;
         defer state_ids.deinit(a);
         try state_ids.append(a, self.delims.state);
@@ -587,65 +652,32 @@ pub const Engine = struct {
         }
         input_tokens.* = total;
 
-        var cache = try transformer_mod.KVCache.init(a, self.config.num_hidden_layers);
-        defer cache.deinit();
-        const entries = try a.alloc(transformer_mod.SSMCacheEntry, self.config.num_hidden_layers);
-        for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
-        defer {
-            for (entries) |*e| {
-                free(e.conv_state);
-                free(e.ssm_state);
-                transformer_mod.ssmFreeQsaState(e);
-            }
-            a.free(entries);
-        }
-        var offset: usize = 0;
-        var ctx = self.xfm.defaultCtx();
-        ctx.cache = &cache;
-        ctx.moe_seq_offset = &offset;
-        ctx.ssm_entries = entries;
-        ctx.capture_hidden = null;
-        ctx.skip_lm_head = true;
-
-        const h_state = try self.forwardIds(&ctx, state_ids.items);
-        free(h_state);
-        var kv_snap = try cache.snapshot();
-        defer kv_snap.deinit();
-        const ssm_snaps = try a.alloc(transformer_mod.SSMCacheEntrySnapshot, entries.len);
-        for (entries, ssm_snaps) |*e, *sn| sn.* = transformer_mod.ssmSnapshot(e);
-        defer {
-            for (ssm_snaps) |*sn| transformer_mod.ssmSnapshotDeinit(sn);
-            a.free(ssm_snaps);
-        }
-        const state_offset = offset;
-
         const probs = try a.alloc([]f64, qs.len);
-        var done: usize = 0;
+        const ids = try a.alloc([]const u32, qs.len);
+        defer a.free(ids);
+        for (branches, ids) |*b, *id| id.* = b.ids;
+        var emit: ScoreEmit = .{ .eng = self, .a = a, .branches = branches, .probs = probs };
         errdefer {
-            for (probs[0..done]) |p| a.free(p);
+            for (probs[0..emit.done]) |p| a.free(p);
             a.free(probs);
         }
-        for (branches) |*b| {
-            try cache.restore(&kv_snap);
-            for (entries, ssm_snaps) |*e, *sn| try transformer_mod.ssmRestore(e, sn);
-            offset = state_offset;
-            const h = try self.forwardIds(&ctx, b.ids);
-            defer free(h);
-            probs[done] = try self.headProbs(a, h, b, s);
-            done += 1;
-        }
+        try scoreBranches(a, &self.xfm, self.config.num_hidden_layers, state_ids.items, ids, &emit, ScoreEmit.run);
         return probs;
     }
 
-    fn forwardIds(self: *Engine, ctx: *transformer_mod.ForwardCtx, ids: []const u32) !A {
-        const shape = [_]c_int{ 1, @intCast(ids.len) };
-        const arr = mlx.mlx_array_new_data(ids.ptr, &shape, 2, .uint32);
-        defer free(arr);
-        const h = try self.xfm.forwardWith(ctx, arr);
-        errdefer free(h);
-        try mlx.check(mlx.mlx_array_eval(h));
-        return h;
-    }
+    /// Keeps each branch's probabilities as `scoreBranches` finishes it.
+    const ScoreEmit = struct {
+        eng: *Engine,
+        a: std.mem.Allocator,
+        branches: []const Branch,
+        probs: [][]f64,
+        done: usize = 0,
+
+        fn run(self: *ScoreEmit, i: usize, h: A) !void {
+            self.probs[i] = try self.eng.headProbs(self.a, h, &self.branches[i], self.eng.stream);
+            self.done += 1;
+        }
+    };
 
     /// kev.model.PointerHead on one branch: z_i = k(h_close_i) · q(h_decide) / sqrt(P) / T, softmax in f32.
     fn headProbs(self: *Engine, a: std.mem.Allocator, h: A, b: *const Branch, s: S) ![]f64 {
@@ -1135,7 +1167,7 @@ fn rowReadouts(engine: *Engine, a: std.mem.Allocator, state_ids: []const u32, b:
     ctx.ssm_entries = entries;
     ctx.capture_hidden = null;
     ctx.skip_lm_head = true;
-    const h = try engine.forwardIds(&ctx, row);
+    const h = try forwardIds(&engine.xfm, &ctx, row);
     defer free(h);
     const idx_host = try a.alloc(i32, b.closes.len + 1);
     defer a.free(idx_host);

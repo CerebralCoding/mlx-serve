@@ -1,11 +1,11 @@
 import SwiftUI
 
 /// The Decisions window: shows the pane for `appState.decisionsModelPath`.
-struct LayaDecisionsWindow: View {
+struct DecisionsWindow: View {
     @EnvironmentObject var appState: AppState
     var body: some View {
         if let path = appState.decisionsModelPath {
-            LayaDecisionsPane(modelPath: path).id(path)
+            DecisionsPane(modelPath: path).id(path)
         } else {
             Text("Pick a decision model in Models \u{2192} Downloaded and press Use.")
                 .font(.app(.callout))
@@ -14,21 +14,32 @@ struct LayaDecisionsWindow: View {
     }
 }
 
-/// Demo page for a typed-decision model (Laya or Kev): a state, a few
-/// questions, one `POST /v1/decisions`, the answers as probability bars.
-/// Opened by the Use button on a decision row; loads the model the way the
-/// gen panes do. Both take the same request; only the docs differ.
-struct LayaDecisionsPane: View {
+/// Demo page for a typed-decision model (Laya, Kev, D1 or Clef): a state, a few questions, one
+/// `POST /v1/decisions`, the answers as probability bars. Opened by the Use button on a decision row;
+/// loads the model the way the gen panes do. All four take the same request; only the docs differ,
+/// and Clef alone wants the object form of `choice` criteria.
+struct DecisionsPane: View {
     let modelPath: String
     /// Read once from the dir's marker files, the way the browser row was typed.
-    private let isKev: Bool
-    private let isClef: Bool
+    private let family: Family
     @EnvironmentObject var server: ServerManager
+
+    enum Family: String {
+        case laya, kev, d1, clef
+
+        var title: String {
+            switch self {
+            case .laya: return "Laya Decisions"
+            case .kev: return "Kev Decisions"
+            case .d1: return "D1 Decisions"
+            case .clef: return "Clef Decisions"
+            }
+        }
+    }
 
     init(modelPath: String) {
         self.modelPath = modelPath
-        isKev = DownloadManager.markerModelType(inDir: modelPath) == "kev"
-        isClef = DownloadManager.markerModelType(inDir: modelPath) == "clef"
+        family = Family(rawValue: DownloadManager.markerModelType(inDir: modelPath) ?? "") ?? .laya
     }
 
     @State private var state = "Refund me now or I cancel my subscription. Second time this month your app charged me twice."
@@ -84,7 +95,7 @@ struct LayaDecisionsPane: View {
     private var requestBody: [String: Any] {
         var qs: [String: Any] = [:]
         for q in questions where !q.name.isEmpty {
-            if let j = q.json(forClef: isClef) {
+            if let j = q.json(forClef: family == .clef) {
                 qs[q.name] = j
             }
         }
@@ -100,7 +111,7 @@ struct LayaDecisionsPane: View {
         HSplitView {
             ScrollView {
                 VStack(alignment: .leading, spacing: 16) {
-                    Text(isClef ? "Clef Decisions" : isKev ? "Kev Decisions" : "Laya Decisions").font(.app(.title2).bold())
+                    Text(family.title).font(.app(.title2).bold())
                     Text((modelPath as NSString).lastPathComponent).font(.app(.caption)).foregroundStyle(.secondary)
 
                     Text("State").font(.app(.headline))
@@ -201,25 +212,28 @@ struct LayaDecisionsPane: View {
     private var docs: some View {
         VStack(alignment: .leading, spacing: 12) {
             Text("What this is").font(.app(.headline))
-            if isClef {
+            switch family {
+            case .clef:
                 Text("Clef reads the state and all questions together, then scores their allowed options jointly. It returns probabilities for routing, triage, labeling and scoring.")
-            } else if isKev {
+            case .kev:
                 Text("Kev is not a chat model. It reads the state once, then scores every option of each question with a small head on a Qwen3.5 model. About 60 ms per question on an M4 Max: slower than Laya, and often more accurate on nuanced text. Suits triage, routing and labeling where getting it right matters more than speed.")
-            } else {
+            case .d1:
+                Text("D1 is not a chat model. It is LiquidAI's decision model on LFM2.5-VL-3B: it reads the state once and scores each question's options from the next-token distribution at the answer, writing no output tokens. This build takes text only; pictures are refused.")
+            case .laya:
                 Text("Laya is not a chat model. It reads a piece of text (the state) and answers typed questions about it in one forward pass, with calibrated probabilities. A few milliseconds per request, so it suits routing, triage, moderation and scoring.")
             }
             Text("Question types").font(.app(.headline))
-            Text("**choice** picks one of your options.\n`\(Question.choiceCriteriaExample(forClef: isClef))`")
+            Text("**choice** picks one of your options.\n`\(Question.choiceCriteriaExample(forClef: family == .clef))`")
             Text("**noul** is a yes/no; the answer is P(true). Criteria are optional labels for each side.\n`\"criteria\": {\"false\": \"no threat\", \"true\": \"explicit threat\"}`")
             Text("**score** is an ordinal over labelled rungs, low to high; the answer is the expected rung index plus per-rung probabilities.\n`\"criteria\": [\"not urgent\", \"soon\", \"blocking\"]`")
             Text("Every question needs `instructions`. The state can be a string or a JSON object.")
             Text("API").font(.app(.headline))
             Text("`POST /v1/decisions` with `model`, `state` and `questions`. Chat endpoints refuse this model and point here.")
             codeBlock("curl -X POST http://localhost:\(server.port)/v1/decisions \\\n  -H 'content-type: application/json' \\\n  -d '\(requestJSON.replacingOccurrences(of: "\n", with: "").replacingOccurrences(of: "  ", with: ""))'")
-            if isKev || isClef {
-                Text("Answers carry the chosen value and per-option `probabilities`; choice and score add a `confidence`.")
-            } else {
+            if family == .laya {
                 Text("Answers carry the chosen value, per-option `probabilities`, a `confidence` and an `action.act_probability` (how sure the model is that acting on the answer is right).")
+            } else {
+                Text("Answers carry the chosen value and per-option `probabilities`; choice and score add a `confidence`.")
             }
         }
         .font(.app(.callout))

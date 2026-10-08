@@ -1,0 +1,1348 @@
+{
+ "model": "LiquidAI/d1-3B",
+ "revision": "051bcc464b01b9f92942b364d9586b0ef5912432",
+ "precision": "float32 CPU",
+ "cases": [
+  {
+   "name": "demo_default",
+   "state": "Refund me now or I cancel my subscription. Second time this month your app charged me twice.",
+   "questions": {
+    "team": {
+     "type": "choice",
+     "instructions": "Which team should handle this?",
+     "criteria": {
+      "billing": null,
+      "sales": null,
+      "support": null
+     }
+    },
+    "churn": {
+     "type": "noul",
+     "instructions": "Does the customer threaten to cancel?",
+     "criteria": {
+      "false": "no threat",
+      "true": "explicit threat"
+     }
+    },
+    "urgency": {
+     "type": "score",
+     "instructions": "How urgent is this?",
+     "criteria": [
+      "not urgent",
+      "soon",
+      "blocking"
+     ]
+    }
+   },
+   "prefix": "<|startoftext|><|im_start|>user\nRefund me now or I cancel my subscription. Second time this month your app charged me twice.\n\n\nQUESTION:\n",
+   "prefix_ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    9405,
+    855,
+    622,
+    1665,
+    432,
+    358,
+    22995,
+    1226,
+    35074,
+    22,
+    7795,
+    893,
+    532,
+    5304,
+    679,
+    994,
+    14917,
+    622,
+    10625,
+    64673,
+    63509,
+    833
+   ],
+   "per_question": {
+    "team": {
+     "type": "choice",
+     "suffix": "Which team should handle this?\n\nOptions:\nA billing\nB sales\nC support\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n",
+     "suffix_ids": [
+      28327,
+      2909,
+      1252,
+      9435,
+      532,
+      64929,
+      13314,
+      833,
+      41,
+      4862,
+      299,
+      207,
+      42,
+      11098,
+      207,
+      43,
+      1757,
+      8,
+      57922,
+      415,
+      278,
+      7331,
+      4713,
+      1049,
+      22,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+     ],
+     "codes": [
+      [
+       "A",
+       41
+      ],
+      [
+       "B",
+       42
+      ],
+      [
+       "C",
+       43
+      ]
+     ],
+     "groups": [
+      [
+       41,
+       334
+      ],
+      [
+       42,
+       378
+      ],
+      [
+       43,
+       340
+      ]
+     ]
+    },
+    "churn": {
+     "type": "noul",
+     "suffix": "Does the customer threaten to cancel?\nYes: explicit threat\nNo: no threat\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n",
+     "suffix_ids": [
+      29088,
+      278,
+      13107,
+      43590,
+      310,
+      22995,
+      1283,
+      12447,
+      34,
+      13007,
+      5359,
+      207,
+      4547,
+      34,
+      794,
+      5359,
+      8,
+      57922,
+      415,
+      18171,
+      432,
+      794,
+      1049,
+      22,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+     ],
+     "codes": [],
+     "groups": [
+      [
+       11683,
+       12447
+      ],
+      [
+       2243,
+       4547,
+       19598
+      ]
+     ]
+    },
+    "urgency": {
+     "type": "score",
+     "suffix": "How urgent is this?\n\n0 not urgent\n1 soon\n2 blocking\n\nReply with a single digit 0-2 only.<|im_end|>\n<|im_start|>assistant\n",
+     "suffix_ids": [
+      3522,
+      30648,
+      355,
+      532,
+      64929,
+      24,
+      513,
+      30648,
+      207,
+      25,
+      5330,
+      207,
+      26,
+      30491,
+      8,
+      57922,
+      415,
+      267,
+      2936,
+      19763,
+      229,
+      24,
+      21,
+      26,
+      1049,
+      22,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+     ],
+     "codes": [],
+     "groups": [
+      [
+       24
+      ],
+      [
+       25
+      ],
+      [
+       26
+      ]
+     ]
+    }
+   },
+   "input_tokens": 116,
+   "answers": {
+    "team": {
+     "type": "choice",
+     "choice": "billing",
+     "confidence": 0.7818633027409977,
+     "probabilities": {
+      "billing": 0.7818633027409977,
+      "sales": 0.010927189404673241,
+      "support": 0.20720950785432912
+     }
+    },
+    "churn": {
+     "type": "noul",
+     "noul": 0.9920678466769404
+    },
+    "urgency": {
+     "type": "score",
+     "score": 1.181362713032727,
+     "confidence": 0.4751663694955446,
+     "probabilities": {
+      "0": 0.17173545873586404,
+      "1": 0.4751663694955446,
+      "2": 0.3530981717685913
+     },
+     "legend": {
+      "0": "not urgent",
+      "1": "soon",
+      "2": "blocking"
+     }
+    }
+   }
+  },
+  {
+   "name": "described_choice_nested_state",
+   "state": {
+    "ticket": {
+     "id": 1042,
+     "text": "Payouts have failed for three days.\nLine two."
+    },
+    "plan": "pro"
+   },
+   "questions": {
+    "route": {
+     "type": "choice",
+     "instructions": "Which queue?",
+     "criteria": {
+      "billing": "Payments, invoicing, refunds",
+      "technical": "Bugs, outages, integrations",
+      "not_urgent_queue": null
+     }
+    },
+    "is_urgent": {
+     "type": "noul",
+     "instructions": "Does this convey urgency?"
+    },
+    "impact": {
+     "type": "score",
+     "instructions": "Rate the operational impact.",
+     "criteria": [
+      "None",
+      "Limited",
+      "Critical"
+     ]
+    }
+   },
+   "prefix": "<|startoftext|><|im_start|>user\n{\n  \"ticket\": {\n    \"id\": 1042,\n    \"text\": \"Payouts have failed for three days.\\nLine two.\"\n  },\n  \"plan\": \"pro\"\n}\n\n\nQUESTION:\n",
+   "prefix_ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    2718,
+    229,
+    496,
+    99489,
+    6380,
+    827,
+    360,
+    496,
+    332,
+    6380,
+    229,
+    10480,
+    26,
+    920,
+    360,
+    496,
+    1384,
+    6380,
+    496,
+    56,
+    7529,
+    91,
+    551,
+    9078,
+    374,
+    1703,
+    2877,
+    13408,
+    86,
+    10799,
+    1046,
+    1917,
+    229,
+    10016,
+    229,
+    496,
+    12619,
+    6380,
+    496,
+    908,
+    1110,
+    64024,
+    63509,
+    833
+   ],
+   "per_question": {
+    "route": {
+     "type": "choice",
+     "suffix": "Which queue?\n\nOptions:\nA Payments, invoicing, refunds\nB Bugs, outages, integrations\nC not urgent queue\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n",
+     "suffix_ids": [
+      28327,
+      27337,
+      64929,
+      13314,
+      833,
+      41,
+      123419,
+      20,
+      60326,
+      12613,
+      20,
+      52966,
+      91,
+      207,
+      42,
+      378,
+      11434,
+      20,
+      729,
+      1297,
+      20,
+      4091,
+      631,
+      207,
+      43,
+      513,
+      30648,
+      27337,
+      8,
+      57922,
+      415,
+      278,
+      7331,
+      4713,
+      1049,
+      22,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+     ],
+     "codes": [
+      [
+       "A",
+       41
+      ],
+      [
+       "B",
+       42
+      ],
+      [
+       "C",
+       43
+      ]
+     ],
+     "groups": [
+      [
+       41,
+       334
+      ],
+      [
+       42,
+       378
+      ],
+      [
+       43,
+       340
+      ]
+     ]
+    },
+    "is_urgent": {
+     "type": "noul",
+     "suffix": "Does this convey urgency?\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n",
+     "suffix_ids": [
+      29088,
+      532,
+      18960,
+      58311,
+      64929,
+      57922,
+      415,
+      18171,
+      432,
+      794,
+      1049,
+      22,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+     ],
+     "codes": [],
+     "groups": [
+      [
+       11683,
+       12447
+      ],
+      [
+       2243,
+       4547,
+       19598
+      ]
+     ]
+    },
+    "impact": {
+     "type": "score",
+     "suffix": "Rate the operational impact.\n\n0 None\n1 Limited\n2 Critical\n\nReply with a single digit 0-2 only.<|im_end|>\n<|im_start|>assistant\n",
+     "suffix_ids": [
+      42126,
+      278,
+      20751,
+      3115,
+      63908,
+      24,
+      10856,
+      207,
+      25,
+      25238,
+      207,
+      26,
+      33714,
+      8,
+      57922,
+      415,
+      267,
+      2936,
+      19763,
+      229,
+      24,
+      21,
+      26,
+      1049,
+      22,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+     ],
+     "codes": [],
+     "groups": [
+      [
+       24
+      ],
+      [
+       25
+      ],
+      [
+       26
+      ]
+     ]
+    }
+   },
+   "input_tokens": 136,
+   "answers": {
+    "route": {
+     "type": "choice",
+     "choice": "billing",
+     "confidence": 0.8710893004130748,
+     "probabilities": {
+      "billing": 0.8710893004130748,
+      "technical": 0.07969309859194629,
+      "not_urgent_queue": 0.04921760099497898
+     }
+    },
+    "is_urgent": {
+     "type": "noul",
+     "noul": 0.5422104839368395
+    },
+    "impact": {
+     "type": "score",
+     "score": 1.4153628981100568,
+     "confidence": 0.5270104668679124,
+     "probabilities": {
+      "0": 0.11164756875785571,
+      "1": 0.3613419643742319,
+      "2": 0.5270104668679124
+     },
+     "legend": {
+      "0": "None",
+      "1": "Limited",
+      "2": "Critical"
+     }
+    }
+   }
+  },
+  {
+   "name": "pacman_directions",
+   "state": {
+    "map_around_you": [
+     "#####",
+     "#P.o#",
+     "#####"
+    ],
+    "heading": "left",
+    "pellets_left": 12
+   },
+   "questions": {
+    "up": {
+     "type": "score",
+     "instructions": "How good is it for Pac-Man to move up?",
+     "criteria": [
+      "terrible, Pac-Man dies",
+      "poor",
+      "okay",
+      "good, eats a pellet safely"
+     ]
+    },
+    "left": {
+     "type": "score",
+     "instructions": "How good is it for Pac-Man to move left?",
+     "criteria": [
+      "terrible, Pac-Man dies",
+      "poor",
+      "okay",
+      "good, eats a pellet safely"
+     ]
+    }
+   },
+   "prefix": "<|startoftext|><|im_start|>user\n{\n  \"map_around_you\": [\n    \"#####\",\n    \"#P.o#\",\n    \"#####\"\n  ],\n  \"heading\": \"left\",\n  \"pellets_left\": 12\n}\n\n\nQUESTION:\n",
+   "prefix_ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    2718,
+    229,
+    496,
+    9628,
+    71,
+    34290,
+    71,
+    14294,
+    6380,
+    19843,
+    360,
+    496,
+    64795,
+    6107,
+    360,
+    55654,
+    56,
+    36755,
+    11,
+    6107,
+    360,
+    496,
+    64795,
+    1110,
+    229,
+    40439,
+    229,
+    496,
+    4050,
+    299,
+    6380,
+    496,
+    2819,
+    6107,
+    229,
+    496,
+    119031,
+    940,
+    65584,
+    6380,
+    229,
+    873,
+    207,
+    64024,
+    63509,
+    833
+   ],
+   "per_question": {
+    "up": {
+     "type": "score",
+     "suffix": "How good is it for Pac-Man to move up?\n\n0 terrible, Pac-Man dies\n1 poor\n2 okay\n3 good, eats a pellet safely\n\nReply with a single digit 0-3 only.<|im_end|>\n<|im_start|>assistant\n",
+     "suffix_ids": [
+      3522,
+      1683,
+      355,
+      435,
+      374,
+      7820,
+      34323,
+      310,
+      4375,
+      786,
+      64929,
+      24,
+      22896,
+      20,
+      7820,
+      34323,
+      2876,
+      207,
+      25,
+      4833,
+      207,
+      26,
+      28719,
+      207,
+      27,
+      1683,
+      20,
+      50032,
+      267,
+      5303,
+      1161,
+      18915,
+      8,
+      57922,
+      415,
+      267,
+      2936,
+      19763,
+      229,
+      24,
+      21,
+      27,
+      1049,
+      22,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+     ],
+     "codes": [],
+     "groups": [
+      [
+       24
+      ],
+      [
+       25
+      ],
+      [
+       26
+      ],
+      [
+       27
+      ]
+     ]
+    },
+    "left": {
+     "type": "score",
+     "suffix": "How good is it for Pac-Man to move left?\n\n0 terrible, Pac-Man dies\n1 poor\n2 okay\n3 good, eats a pellet safely\n\nReply with a single digit 0-3 only.<|im_end|>\n<|im_start|>assistant\n",
+     "suffix_ids": [
+      3522,
+      1683,
+      355,
+      435,
+      374,
+      7820,
+      34323,
+      310,
+      4375,
+      2690,
+      64929,
+      24,
+      22896,
+      20,
+      7820,
+      34323,
+      2876,
+      207,
+      25,
+      4833,
+      207,
+      26,
+      28719,
+      207,
+      27,
+      1683,
+      20,
+      50032,
+      267,
+      5303,
+      1161,
+      18915,
+      8,
+      57922,
+      415,
+      267,
+      2936,
+      19763,
+      229,
+      24,
+      21,
+      27,
+      1049,
+      22,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+     ],
+     "codes": [],
+     "groups": [
+      [
+       24
+      ],
+      [
+       25
+      ],
+      [
+       26
+      ],
+      [
+       27
+      ]
+     ]
+    }
+   },
+   "input_tokens": 148,
+   "answers": {
+    "up": {
+     "type": "score",
+     "score": 1.5766136725048407,
+     "confidence": 0.2828395378702337,
+     "probabilities": {
+      "0": 0.19752953350952795,
+      "1": 0.27397909454817093,
+      "2": 0.2828395378702337,
+      "3": 0.24565183407206748
+     },
+     "legend": {
+      "0": "terrible, Pac-Man dies",
+      "1": "poor",
+      "2": "okay",
+      "3": "good, eats a pellet safely"
+     }
+    },
+    "left": {
+     "type": "score",
+     "score": 2.160621931735113,
+     "confidence": 0.4789402432792388,
+     "probabilities": {
+      "0": 0.07413561830199836,
+      "1": 0.1700470749401293,
+      "2": 0.2768770634786335,
+      "3": 0.4789402432792388
+     },
+     "legend": {
+      "0": "terrible, Pac-Man dies",
+      "1": "poor",
+      "2": "okay",
+      "3": "good, eats a pellet safely"
+     }
+    }
+   }
+  },
+  {
+   "name": "string_state_many_options",
+   "state": "Café “quoted” \\ tab\tend — 中文",
+   "questions": {
+    "lang": {
+     "type": "choice",
+     "instructions": "Which language is the ticket written in?",
+     "criteria": {
+      "lang_00": null,
+      "lang_01": null,
+      "lang_02": null,
+      "lang_03": null,
+      "lang_04": null,
+      "lang_05": null,
+      "lang_06": null,
+      "lang_07": null,
+      "lang_08": null,
+      "lang_09": null,
+      "lang_10": null,
+      "lang_11": null,
+      "lang_12": null,
+      "lang_13": null,
+      "lang_14": null,
+      "lang_15": null,
+      "lang_16": null,
+      "lang_17": null,
+      "lang_18": null,
+      "lang_19": null,
+      "lang_20": null,
+      "lang_21": null,
+      "lang_22": null,
+      "lang_23": null,
+      "lang_24": null,
+      "lang_25": null,
+      "lang_26": null,
+      "lang_27": null,
+      "lang_28": null,
+      "lang_29": null
+     }
+    },
+    "is_bug": {
+     "type": "noul",
+     "instructions": "Is it a bug?",
+     "criteria": {}
+    }
+   },
+   "prefix": "<|startoftext|><|im_start|>user\nCafé “quoted” \\ tab\tend — 中文\n\n\nQUESTION:\n",
+   "prefix_ids": [
+    124894,
+    124899,
+    5922,
+    207,
+    43,
+    1804,
+    359,
+    870,
+    361,
+    9691,
+    737,
+    577,
+    11383,
+    58279,
+    1679,
+    50525,
+    4966,
+    7,
+    63509,
+    833
+   ],
+   "per_question": {
+    "lang": {
+     "type": "choice",
+     "suffix": "Which language is the ticket written in?\n\nOptions:\n00 lang 00\n01 lang 01\n02 lang 02\n03 lang 03\n04 lang 04\n05 lang 05\n06 lang 06\n07 lang 07\n08 lang 08\n09 lang 09\n10 lang 10\n11 lang 11\n12 lang 12\n13 lang 13\n14 lang 14\n15 lang 15\n16 lang 16\n17 lang 17\n18 lang 18\n19 lang 19\n20 lang 20\n21 lang 21\n22 lang 22\n23 lang 23\n24 lang 24\n25 lang 25\n26 lang 26\n27 lang 27\n28 lang 28\n29 lang 29\n\nReply with the option code only.<|im_end|>\n<|im_start|>assistant\n",
+     "suffix_ids": [
+      28327,
+      3368,
+      355,
+      278,
+      29936,
+      4484,
+      296,
+      64929,
+      13314,
+      833,
+      555,
+      8304,
+      229,
+      555,
+      207,
+      4040,
+      8304,
+      229,
+      4040,
+      207,
+      5342,
+      8304,
+      229,
+      5342,
+      207,
+      5634,
+      8304,
+      229,
+      5634,
+      207,
+      5825,
+      8304,
+      229,
+      5825,
+      207,
+      3153,
+      8304,
+      229,
+      3153,
+      207,
+      5967,
+      8304,
+      229,
+      5967,
+      207,
+      4471,
+      8304,
+      229,
+      4471,
+      207,
+      4027,
+      8304,
+      229,
+      4027,
+      207,
+      4404,
+      8304,
+      229,
+      4404,
+      207,
+      654,
+      8304,
+      229,
+      654,
+      207,
+      1131,
+      8304,
+      229,
+      1131,
+      207,
+      873,
+      8304,
+      229,
+      873,
+      207,
+      1031,
+      8304,
+      229,
+      1031,
+      207,
+      1035,
+      8304,
+      229,
+      1035,
+      207,
+      885,
+      8304,
+      229,
+      885,
+      207,
+      942,
+      8304,
+      229,
+      942,
+      207,
+      916,
+      8304,
+      229,
+      916,
+      207,
+      632,
+      8304,
+      229,
+      632,
+      207,
+      412,
+      8304,
+      229,
+      412,
+      207,
+      397,
+      8304,
+      229,
+      397,
+      207,
+      1696,
+      8304,
+      229,
+      1696,
+      207,
+      1518,
+      8304,
+      229,
+      1518,
+      207,
+      1467,
+      8304,
+      229,
+      1467,
+      207,
+      1325,
+      8304,
+      229,
+      1325,
+      207,
+      1197,
+      8304,
+      229,
+      1197,
+      207,
+      1616,
+      8304,
+      229,
+      1616,
+      207,
+      1641,
+      8304,
+      229,
+      1641,
+      207,
+      1637,
+      8304,
+      229,
+      1637,
+      207,
+      1734,
+      8304,
+      229,
+      1734,
+      8,
+      57922,
+      415,
+      278,
+      7331,
+      4713,
+      1049,
+      22,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+     ],
+     "codes": [
+      [
+       "00",
+       555
+      ],
+      [
+       "01",
+       4040
+      ],
+      [
+       "02",
+       5342
+      ],
+      [
+       "03",
+       5634
+      ],
+      [
+       "04",
+       5825
+      ],
+      [
+       "05",
+       3153
+      ],
+      [
+       "06",
+       5967
+      ],
+      [
+       "07",
+       4471
+      ],
+      [
+       "08",
+       4027
+      ],
+      [
+       "09",
+       4404
+      ],
+      [
+       "10",
+       654
+      ],
+      [
+       "11",
+       1131
+      ],
+      [
+       "12",
+       873
+      ],
+      [
+       "13",
+       1031
+      ],
+      [
+       "14",
+       1035
+      ],
+      [
+       "15",
+       885
+      ],
+      [
+       "16",
+       942
+      ],
+      [
+       "17",
+       916
+      ],
+      [
+       "18",
+       632
+      ],
+      [
+       "19",
+       412
+      ],
+      [
+       "20",
+       397
+      ],
+      [
+       "21",
+       1696
+      ],
+      [
+       "22",
+       1518
+      ],
+      [
+       "23",
+       1467
+      ],
+      [
+       "24",
+       1325
+      ],
+      [
+       "25",
+       1197
+      ],
+      [
+       "26",
+       1616
+      ],
+      [
+       "27",
+       1641
+      ],
+      [
+       "28",
+       1637
+      ],
+      [
+       "29",
+       1734
+      ]
+     ],
+     "groups": [
+      [
+       555
+      ],
+      [
+       4040
+      ],
+      [
+       5342
+      ],
+      [
+       5634
+      ],
+      [
+       5825
+      ],
+      [
+       3153
+      ],
+      [
+       5967
+      ],
+      [
+       4471
+      ],
+      [
+       4027
+      ],
+      [
+       4404
+      ],
+      [
+       654
+      ],
+      [
+       1131
+      ],
+      [
+       873
+      ],
+      [
+       1031
+      ],
+      [
+       1035
+      ],
+      [
+       885
+      ],
+      [
+       942
+      ],
+      [
+       916
+      ],
+      [
+       632
+      ],
+      [
+       412
+      ],
+      [
+       397
+      ],
+      [
+       1696
+      ],
+      [
+       1518
+      ],
+      [
+       1467
+      ],
+      [
+       1325
+      ],
+      [
+       1197
+      ],
+      [
+       1616
+      ],
+      [
+       1641
+      ],
+      [
+       1637
+      ],
+      [
+       1734
+      ]
+     ]
+    },
+    "is_bug": {
+     "type": "noul",
+     "suffix": "Is it a bug?\n\nReply with yes or no only.<|im_end|>\n<|im_start|>assistant\n",
+     "suffix_ids": [
+      4439,
+      435,
+      267,
+      23284,
+      64929,
+      57922,
+      415,
+      18171,
+      432,
+      794,
+      1049,
+      22,
+      124900,
+      207,
+      124899,
+      63514,
+      207
+     ],
+     "codes": [],
+     "groups": [
+      [
+       11683,
+       12447
+      ],
+      [
+       2243,
+       4547,
+       19598
+      ]
+     ]
+    }
+   },
+   "input_tokens": 209,
+   "answers": {
+    "lang": {
+     "type": "choice",
+     "choice": "lang_10",
+     "confidence": 0.050037317633485685,
+     "probabilities": {
+      "lang_00": 0.022655055427868612,
+      "lang_01": 0.04691399138399979,
+      "lang_02": 0.04840103181670637,
+      "lang_03": 0.042791390590280164,
+      "lang_04": 0.041104696676738085,
+      "lang_05": 0.0358218046542299,
+      "lang_06": 0.04333306165007551,
+      "lang_07": 0.032855794901212626,
+      "lang_08": 0.031491337732154255,
+      "lang_09": 0.0331026561037585,
+      "lang_10": 0.050037317633485685,
+      "lang_11": 0.031673891686075845,
+      "lang_12": 0.04355056523984966,
+      "lang_13": 0.029393744790176046,
+      "lang_14": 0.04420391470250298,
+      "lang_15": 0.029906156895329036,
+      "lang_16": 0.03834796930694989,
+      "lang_17": 0.03138056300869768,
+      "lang_18": 0.029179384191648828,
+      "lang_19": 0.02605997296240664,
+      "lang_20": 0.035964751021625545,
+      "lang_21": 0.024988029809698886,
+      "lang_22": 0.026124296515626422,
+      "lang_23": 0.026274936098791453,
+      "lang_24": 0.031055161563916446,
+      "lang_25": 0.025560753575841415,
+      "lang_26": 0.02485242260539974,
+      "lang_27": 0.02212900647105472,
+      "lang_28": 0.027498002867397436,
+      "lang_29": 0.023348338116501895
+     }
+    },
+    "is_bug": {
+     "type": "noul",
+     "noul": 0.5391045466514982
+    }
+   }
+  }
+ ]
+}

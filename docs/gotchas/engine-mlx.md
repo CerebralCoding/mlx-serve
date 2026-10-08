@@ -5614,3 +5614,36 @@ Defect: z-lab's bf16 DFlash2 drafter over the f16 Ternary Bonsai 2 27B pack on a
 Cause: f16 trunk inputs (raw embedding rows, captured hiddens) met bf16 drafter weights, so every drafter op promoted to f32 and `simd_qmm` (bf16 only) declined: assist 40 ms/round. The bf16 draft hidden through the f16 head did the same: head 30 ms. The loader quantized every linear lazily and evaluated once at the end, so the whole bf16 checkpoint (3.85 GB) was resident at once: peak 12.5 GB.
 Fix: `toDrafterDtype` at the drafter's entries, `hadamardLmHead` for the draft logits, per-linear eval + `Weights.replace` in `loadLinear`. Assist 13.5 ms, head 7.4 ms, peak 9.4 GB; with the M4 MMA lane block 8 is the default: 22.5 tok/s mean (code 24.6, math 29.7, prose 13.3).
 Guard: `dflash: a load-time quantized linear no longer pins its bf16 source in the weights map`. Tell: `[dflash-trace]` assist far above the drafter's bytes / bandwidth.
+
+## Every tool round re-forwarded the previous turn's generated tail (2026-10-06)
+
+- Defect: on Qwen3.8 Flash Next behind a coding agent, 98% of tool rounds sent a prompt that
+  matched the previous turn's prompt plus its whole reply, yet each one logged
+  `[hot-cache] reused P-31/...` and re-prefilled the 31-token backoff plus the full reply.
+- Cause: a hybrid restore can only land on an SSM checkpoint, and every checkpoint was a
+  prefill one; the newest sits `SSM_SNAPSHOT_BACKOFF` before the prompt end, and nothing
+  snapshotted the state where decode stopped.
+- Fix: `commitSlotIfApplicable` appends a checkpoint of the live state at the committed
+  length when `decodeEndCheckpointWanted` holds (live position == commit key, no media). It
+  is the newest, so the QSA handoff gives it the history. The MTP head's history ends one row
+  short there (its last row pairs with a token only the next prompt has), so the commit keeps
+  that row's trunk hidden and the restore appends it (`specCarriesOneRow`); without it every
+  such turn drafted blind. The SSD tier does not carry the hidden: a disk restore still does.
+  Only a turn that ends in speculative decode qualifies: serial decode keeps a forwarded
+  lookahead past the key (`live position 98, committed 96`), so it falls back as before.
+- Guard: `scheduler.decode-end checkpoint: taken only where the live state is the committed
+  prefix`, `prefix_cache.spec adoption: a decode-end restore one row past the history carries
+  that row`; `tests/test_cache_reuses_generated_tokens.sh` with a hybrid `CACHE_GEN_TEST_MODEL`.
+## A compiled region re-read its captured weights from disk on every call (2026-10-07)
+
+Defect: DeepSeek-V4.1 on pipenetwork's REAP50 pack (152 GiB of weights) spent five minutes in its warm-up, then ran out of GPU memory at about 200 GiB active.
+Cause: the per-layer decode regions are `mlx_compile`d closures that read their layer's weights from the model instead of taking them as inputs. The weights were still lazy safetensors loads when the first call traced them, so the compiled tape held the `Load` nodes: every call read each weight from disk into a fresh buffer, and the model's own arrays never received data.
+Fix: `deepseek_v41.evalWeights` evaluates every array the model reads at the end of `init`, one layer per eval.
+Guard: `dsv41 init: every weight the model reads is evaluated before a region traces it` (DSV41_TINY). A closure that captures arrays needs them evaluated before its first call.
+
+## A pack near the RAM size was compressed while it loaded, then killed (2026-10-07)
+
+Defect: the full Jundot oQ3e pack (231 GiB resident on a 256 GB Mac, preflight passed) died with `Killed: 9` during its load, and macOS showed "out of application memory".
+Cause: V4.1 evaluates its weights at init, before any GPU work. MLX's own reader left every shard's pages in the file cache beside the buffers, and buffers enter the residency set only once a wired limit is set and become resident (wired) only when a command buffer runs: until then they are ordinary pages, and the kernel compressed them (148 GB) instead of dropping the cache.
+Fix: V4.1 packs load through `nocache_reader` (F_NOCACHE, page-aligned stages), and `deepseek_v41.wireLoaded` applies the residency policy and runs a one-op command buffer after each layer: wired memory climbs with the load (233 GB), nothing is compressed.
+Guard: `nocache reader: tensors load byte-identical to MLX's own reader`; live, `test_dsv41.sh` on the full pack with a compressor watchdog. Tell: `vm_stat` wired flat at a few GB while the footprint climbs.
