@@ -110,7 +110,7 @@
 "(missing command or url)" = "（缺少 command 或 url）";
 "(no arguments)" = "（无参数）";
 "(server has produced no output yet)" = "（服务器尚未产生任何输出）";
-"**choice** picks one of your options.\n`\"criteria\": [\"billing\", \"sales\"]`" = "**choice** 从你的选项中挑一个。\n`\"criteria\": [\"billing\", \"sales\"]`";
+"**choice** picks one of your options.\n`%@`" = "**choice** 从你的选项中挑一个。\n`%@`";
 "**noul** is a yes/no; the answer is P(true). Criteria are optional labels for each side.\n`\"criteria\": {\"false\": \"no threat\", \"true\": \"explicit threat\"}`" = "**noul** 是是非题；答案是 P(true)。criteria 是可选标签，用于标注两侧。\n`\"criteria\": {\"false\": \"no threat\", \"true\": \"explicit threat\"}`";
 "**score** is an ordinal over labelled rungs, low to high; the answer is the expected rung index plus per-rung probabilities.\n`\"criteria\": [\"not urgent\", \"soon\", \"blocking\"]`" = "**score** 是有序评分：在带标签的档位间由低到高；答案是期望的档位序号加上各档概率。\n`\"criteria\": [\"not urgent\", \"soon\", \"blocking\"]`";
 "+%lld other tool" = "+%lld 个其他工具";
@@ -263,7 +263,7 @@
 "Another provider already uses this name" = "另一个提供商已使用此名称";
 "Answer as agent" = "以 Agent 身份回答";
 "Answer in as few words as the question needs — usually one to three sentences. Lead with the answer, skip preamble and sign-offs, and add detail only when asked." = "用回答问题所需的最少字数作答 —— 通常一到三句话。先给出答案，省略开场白和客套结尾，只在被要求时才补充细节。";
-"Answers carry the chosen value and per-option `probabilities`; choice and score add a `confidence`. Kev has no `action` field." = "答案里包含被选中的值和各选项的 `probabilities`；choice 和 score 还带 `confidence`。Kev 没有 `action` 字段。";
+"Answers carry the chosen value and per-option `probabilities`; choice and score add a `confidence`." = "答案里包含被选中的值和各选项的 `probabilities`；choice 和 score 还带 `confidence`。";
 "Answers carry the chosen value, per-option `probabilities`, a `confidence` and an `action.act_probability` (how sure the model is that acting on the answer is right)." = "答案里包含被选中的值、各选项的 `probabilities`、一个 `confidence`，以及 `action.act_probability`（模型对「按此答案行动是正确的」有多大把握）。";
 "Anything you want on the row: your name, a nickname, what else was running." = "想写在这一行的任何内容：你的名字、昵称、当时还在运行什么。";
 "App" = "应用";
@@ -430,6 +430,8 @@
 "Clear the filter" = "清除筛选";
 "Clear the haze" = "去除雾霾";
 "Clear the in-memory log buffer (does not affect the running server)" = "清除内存中的日志缓冲区（不影响正在运行的服务器）";
+"Clef Decisions" = "Clef 决策";
+"Clef reads the state and all questions together, then scores their allowed options jointly. It returns probabilities for routing, triage, labeling and scoring." = "Clef 会把 state 和所有问题一起读取，然后对每个问题允许的选项进行联合打分。它返回用于分流、分诊、标注和打分的概率。";
 "Click Restart Now to apply, or Discard to revert the unsaved server-launch fields." = "点击“立即重启”以应用，或点击“放弃”以还原未保存的服务器启动项。";
 "Clip height" = "片段高度";
 "Clip length" = "片段长度";
@@ -1253,7 +1255,7 @@
 "Personal Access Token (PAT) — optional" = "个人访问令牌（PAT）—— 可选";
 "Photo" = "照片";
 "Photographic portrait" = "摄影人像";
-"Pick a Laya or Kev model in Models → Downloaded and press Use." = "在「模型 → 已下载」中选一个 Laya 或 Kev 模型，然后点「使用」。";
+"Pick a decision model in Models → Downloaded and press Use." = "在「模型 → 已下载」中选一个决策模型，然后点「使用」。";
 "Pick a task to see its runs, or create a new one." = "选择一个任务查看其运行记录，或新建一个。";
 "Pick an agent, or create one from a type." = "选择一个 Agent，或按类型创建一个。";
 "Pick exactly which tools this agent may call. Turning this on freezes the coarse switches above." = "精确指定此 Agent 可以调用哪些工具。开启后会冻结上方的粗粒度开关。";

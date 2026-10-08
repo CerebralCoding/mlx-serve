@@ -666,6 +666,19 @@ final class LocalizationTests: XCTestCase {
         assertResolves(reason, "unreachable model", values: [(pin, "%@")], keys: keys)
     }
 
+    /// The Decisions pane's Clef copy. The choice example is one interpolated
+    /// literal, so its catalog key carries `%@`.
+    func testClefDecisionPaneCopyResolvesInTheCatalog() throws {
+        let keys = Set(try catalog().map(\.key))
+        assertResolves("Clef Decisions", "pane title", keys: keys)
+        assertResolves("Clef reads the state and all questions together, then scores their allowed options jointly. It returns probabilities for routing, triage, labeling and scoring.",
+                       "clef description", keys: keys)
+        assertResolves("Answers carry the chosen value and per-option `probabilities`; choice and score add a `confidence`.",
+                       "answer note", keys: keys)
+        assertResolves("**choice** picks one of your options.\n`%@`", "choice example", keys: keys)
+        assertResolves("Pick a decision model in Models → Downloaded and press Use.", "empty state", keys: keys)
+    }
+
     private static func specs(_ text: String) -> [String] {
         let range = NSRange(text.startIndex..., in: text)
         return specifier.matches(in: text, range: range).compactMap {
