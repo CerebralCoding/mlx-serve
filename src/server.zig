@@ -2303,7 +2303,10 @@ fn handleConnection(
         !apiKeyAuthorized(request[0..header_end_pos], raw_path))
     {
         log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
-        try sendUnauthorized(stream);
+        if (wantsLoginPage(method, path, request[0..header_end_pos]))
+            try sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPage(request[0..header_end_pos], raw_path))
+        else
+            try sendUnauthorized(stream);
         return;
     }
 
@@ -12756,6 +12759,54 @@ fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
     return false;
 }
 
+/// A browser opening the page (`GET /` that accepts HTML) without the key gets
+/// the login form: a Basic prompt is easy to miss and never returns once cancelled.
+fn wantsLoginPage(method: []const u8, path: []const u8, raw_headers: []const u8) bool {
+    if (!std.mem.eql(u8, method, "GET") or !std.mem.eql(u8, path, "/")) return false;
+    const accept = findHeaderValueCI(raw_headers, "accept") orelse return false;
+    return std.mem.indexOf(u8, accept, "text/html") != null;
+}
+
+/// The login form, saying so when a key was offered and refused. Script-free:
+/// a GET form back to the same path sends `?api_key=`, which the page then keeps.
+fn loginPage(raw_headers: []const u8, raw_path: []const u8) []const u8 {
+    const tried = findHeaderValueCI(raw_headers, "authorization") != null or
+        findHeaderValueCI(raw_headers, "x-api-key") != null or
+        queryParamValue(raw_path, "api_key") != null or
+        queryParamValue(raw_path, "key") != null;
+    return if (tried) loginPageHtml("<p class=err>That key was not accepted. Try again.</p>") else loginPageHtml("");
+}
+
+fn loginPageHtml(comptime note: []const u8) []const u8 {
+    return
+    \\<!doctype html>
+    \\<html lang="en"><head><meta charset="utf-8">
+    \\<meta name="viewport" content="width=device-width,initial-scale=1">
+    \\<meta http-equiv="Content-Security-Policy" content="default-src 'none'; style-src 'unsafe-inline'; form-action 'self'; base-uri 'none'">
+    \\<title>MLX Serve · API key required</title>
+    \\<style>
+    \\:root{color-scheme:light dark;font-family:system-ui,sans-serif}
+    \\body{margin:0;min-height:100vh;display:grid;place-items:center;background:Canvas;color:CanvasText}
+    \\main{width:min(22rem,calc(100vw - 2rem));padding:1.75rem;border:1px solid color-mix(in srgb,CanvasText 15%,transparent);border-radius:.75rem}
+    \\h1{font-size:1.15rem;margin:0 0 .5rem}p{margin:0 0 1rem;font-size:.9rem;opacity:.8}
+    \\.err{color:#d33;opacity:1}
+    \\input,button{box-sizing:border-box;width:100%;font:inherit;padding:.6rem .7rem;border-radius:.5rem}
+    \\input{border:1px solid color-mix(in srgb,CanvasText 30%,transparent);background:Canvas;color:CanvasText;margin-bottom:.75rem}
+    \\button{border:0;background:#0a6cff;color:#fff;cursor:pointer}
+    \\</style></head><body><main>
+    \\<h1>API key required</h1>
+    \\<p>This MLX Serve server requires an API key. Enter the key the server was started with.</p>
+    \\
+++ note ++
+    \\<form method="get">
+    \\<input type="password" name="api_key" placeholder="API key" autocomplete="current-password" required autofocus>
+    \\<button type="submit">Continue</button>
+    \\</form>
+    \\</main></body></html>
+    \\
+    ;
+}
+
 /// Send a 401 with a Basic-auth challenge so browsers prompt for the key on the
 /// index + metrics pages; API clients read the JSON error body.
 fn sendUnauthorized(stream: *Conn) !void {
@@ -12795,6 +12846,23 @@ test "apiKeyAuthorized accepts Bearer, x-api-key, Basic, and query param" {
     // No key configured ⇒ always authorized (open mode)
     g_api_key = null;
     try std.testing.expect(apiKeyAuthorized("", "/v1/chat/completions"));
+}
+
+test "a browser opening the page without the key gets a login form; API clients do not" {
+    const html = "Accept: text/html,application/xhtml+xml,*/*;q=0.8\r\n";
+    try std.testing.expect(wantsLoginPage("GET", "/", html));
+    try std.testing.expect(!wantsLoginPage("GET", "/", "Accept: */*\r\n"));
+    try std.testing.expect(!wantsLoginPage("GET", "/v1/models", html));
+    try std.testing.expect(!wantsLoginPage("POST", "/", html));
+
+    const first = loginPage("", "/");
+    try std.testing.expect(std.mem.indexOf(u8, first, "name=\"api_key\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "method=\"get\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "<script") == null);
+    try std.testing.expect(std.mem.indexOf(u8, first, "not accepted") == null);
+    // A key that was tried and failed says so, whichever way it came.
+    try std.testing.expect(std.mem.indexOf(u8, loginPage("", "/?api_key=bad"), "not accepted") != null);
+    try std.testing.expect(std.mem.indexOf(u8, loginPage("Authorization: Basic dTpi\r\n", "/"), "not accepted") != null);
 }
 
 test "resolveRequestModelId: an alias names its model; an id beats it; /api/ strips the tag" {

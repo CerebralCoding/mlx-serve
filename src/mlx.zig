@@ -89,15 +89,48 @@ pub extern "c" fn mlx_default_gpu_stream_new() mlx_stream;
 pub extern "c" fn mlx_stream_get_device(dev: *mlx_device, stream: mlx_stream) c_int;
 pub extern "c" fn mlx_device_get_type(dtype: *mlx_device_type, dev: mlx_device) c_int;
 
-/// True when the stream targets the GPU (custom Metal kernels require it).
+/// True when the stream targets a GPU that runs custom Metal kernels: every
+/// `metal_kernel` helper gates on this, so on CUDA they all take the MLX-op path.
 pub fn streamIsGpu(s: mlx_stream) bool {
     var dev = mlx_device{ .ctx = null };
     if (mlx_stream_get_device(&dev, s) != 0) return false;
     defer _ = mlx_device_free(dev);
     var dt: mlx_device_type = .cpu;
     if (mlx_device_get_type(&dt, dev) != 0) return false;
-    return dt == .gpu;
+    return dt == .gpu and metalKernelsAvailable();
 }
+
+var cuda_cache: ?bool = null;
+
+/// MLX runs on its CUDA backend (NVIDIA): `mlx_fast_cuda_kernel` instead of Metal.
+pub fn cudaAvailable() bool {
+    if (cuda_cache == null) {
+        var cuda = false;
+        if (comptime !builtin.os.tag.isDarwin()) _ = mlx_cuda_is_available(&cuda);
+        cuda_cache = cuda;
+    }
+    return cuda_cache.?;
+}
+
+/// Metal, or mlx-omarchy's Vulkan backend (which translates MSL), runs
+/// `mlx_fast_metal_kernel`; the CUDA backend runs MLX ops only.
+pub fn metalKernelsAvailable() bool {
+    return !cudaAvailable();
+}
+pub extern "c" fn mlx_cuda_is_available(res: *bool) c_int;
+
+pub const mlx_fast_cuda_kernel_config = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_fast_cuda_kernel_config_new() mlx_fast_cuda_kernel_config;
+pub extern "c" fn mlx_fast_cuda_kernel_config_free(cls: mlx_fast_cuda_kernel_config) void;
+pub extern "c" fn mlx_fast_cuda_kernel_config_add_output_arg(cls: mlx_fast_cuda_kernel_config, shape: [*]const c_int, size: usize, dtype: mlx_dtype) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_set_grid(cls: mlx_fast_cuda_kernel_config, g1: c_int, g2: c_int, g3: c_int) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_set_thread_group(cls: mlx_fast_cuda_kernel_config, t1: c_int, t2: c_int, t3: c_int) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_add_template_arg_dtype(cls: mlx_fast_cuda_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
+pub extern "c" fn mlx_fast_cuda_kernel_config_add_template_arg_int(cls: mlx_fast_cuda_kernel_config, name: [*:0]const u8, value: c_int) c_int;
+pub const mlx_fast_cuda_kernel = extern struct { ctx: ?*anyopaque = null };
+pub extern "c" fn mlx_fast_cuda_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, shared_memory: c_int) mlx_fast_cuda_kernel;
+pub extern "c" fn mlx_fast_cuda_kernel_free(cls: mlx_fast_cuda_kernel) void;
+pub extern "c" fn mlx_fast_cuda_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_cuda_kernel, inputs: mlx_vector_array, config: mlx_fast_cuda_kernel_config, s: mlx_stream) c_int;
 pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
 
 // Metal
@@ -723,7 +756,9 @@ pub fn wiredFitTarget(active_bytes: usize, slack_bytes: usize, max_rec: usize) ?
 pub const WiredPolicyResult = struct { mode: WiredMode, target: ?usize };
 
 pub fn maxRecommendedWorkingSet() usize {
-    return defaultDeviceInfoSize("max_recommended_working_set_size");
+    const v = defaultDeviceInfoSize("max_recommended_working_set_size");
+    // CUDA has no working-set key; a discrete GPU's ceiling is its VRAM.
+    return if (v != 0) v else defaultDeviceInfoSize("total_memory");
 }
 
 /// `MTLDevice.maxBufferLength`; 0 when the query fails.

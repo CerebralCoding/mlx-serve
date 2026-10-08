@@ -5696,10 +5696,17 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
             _ = mlx.mlx_set_cache_limit(&tmp, prev_cache_limit);
         }
     }
+    var prev_mem_limit: usize = 0;
+    const gen_mem_limit = genMemoryLimit(mlx.cudaAvailable(), sch.gen_reserve_bytes);
+    if (gen_mem_limit) |lim| _ = mlx.mlx_set_memory_limit(&prev_mem_limit, lim);
     if (reqs.len == 1) req.run(req.ctx) else {
         var ctxs: [MAX_MERGED_WEIGHT]*anyopaque = undefined;
         for (reqs, ctxs[0..reqs.len]) |r, *c| c.* = r.ctx;
         req.merge.?.run_many(ctxs[0..reqs.len]);
+    }
+    if (gen_mem_limit != null) {
+        var tmp: usize = 0;
+        _ = mlx.mlx_set_memory_limit(&tmp, prev_mem_limit);
     }
     if (small_ram) {
         var tmp: usize = 0;
@@ -5720,6 +5727,13 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
         r.done_cond.broadcast(sch.io);
         r.done_mu.unlock(sch.io);
     }
+}
+
+/// MLX memory limit for a media job, null = keep MLX's own. MLX only waits on
+/// in-flight work (whose graphs pin their inputs) once active memory passes this
+/// limit; CUDA's default is 95% of VRAM, so a diffusion step fills the card.
+fn genMemoryLimit(cuda: bool, est_peak: u64) ?usize {
+    return if (cuda) @intCast(est_peak) else null;
 }
 
 /// Clear MLX's allocator cache after a job holding `cached` bytes: always for
@@ -11364,6 +11378,12 @@ test "interleaveTicksFor: decode keeps a quarter of wall time across a slow chun
     try testing.expectEqual(@as(u32, 2), interleaveTicksFor(300 * ms, 50 * ms));
     try testing.expectEqual(@as(u32, 1), interleaveTicksFor(100 * ms, 80 * ms));
     try testing.expectEqual(@as(u32, 1), interleaveTicksFor(8000 * ms, 0));
+}
+
+test "a media job on CUDA throttles MLX at its estimated peak; Metal keeps MLX's limit" {
+    try testing.expectEqual(@as(?usize, 4 << 30), genMemoryLimit(true, 4 << 30));
+    try testing.expectEqual(@as(?usize, 0), genMemoryLimit(true, 0));
+    try testing.expectEqual(@as(?usize, null), genMemoryLimit(false, 4 << 30));
 }
 
 test "a media job always clears the allocator cache, a decision job only from 256 MiB" {

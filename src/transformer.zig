@@ -168,6 +168,312 @@ fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:0]co
     return std.fmt.comptimePrint("{s}", .{body});
 }
 
+const GdnOpsResult = struct { y: mlx.mlx_array, state: mlx.mlx_array, state_seq: mlx.mlx_array };
+
+/// The `gated_delta_step` recurrence as MLX ops, one step per token, for GPUs
+/// that run no Metal kernels (CUDA). Same contract and f32 state math as the
+/// kernel; `state_seq` ([T,B,Hv,Dv,Dk], every step) only when `capture`.
+fn gdnRecurOps(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, vectorized: bool, capture: bool, out_dtype: mlx.mlx_dtype) !GdnOpsResult {
+    const qs = mlx.getShape(q);
+    const vs = mlx.getShape(v);
+    const b = qs[0];
+    const t_len = qs[1];
+    const hk = qs[2];
+    const dk = qs[3];
+    const hv = vs[2];
+    const dv = vs[3];
+    const state_dtype = mlx.mlx_array_dtype(state_in);
+
+    // f32, k/q heads repeated onto the value heads, shaped for per-step matmuls.
+    const Prep = struct {
+        fn run(st: mlx.mlx_stream, a: mlx.mlx_array, rep: c_int, shape: []const c_int) !mlx.mlx_array {
+            var f = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(f);
+            try mlx.check(mlx.mlx_astype(&f, a, .float32, st));
+            var r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(r);
+            if (rep > 1) try mlx.check(mlx.mlx_repeat_axis(&r, f, rep, 2, st)) else try mlx.check(mlx.mlx_copy(&r, f, st));
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_reshape(&out, r, shape.ptr, shape.len, st));
+            return out;
+        }
+        fn step(st: mlx.mlx_stream, a: mlx.mlx_array, t: c_int) !mlx.mlx_array {
+            const sh = mlx.getShape(a);
+            var start = [5]c_int{ 0, 0, 0, 0, 0 };
+            var stop: [5]c_int = undefined;
+            const strides = [5]c_int{ 1, 1, 1, 1, 1 };
+            for (sh, 0..) |d, i| stop[i] = d;
+            start[1] = t;
+            stop[1] = t + 1;
+            var sl = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(sl);
+            try mlx.check(mlx.mlx_slice(&sl, a, &start, sh.len, &stop, sh.len, &strides, sh.len, st));
+            var shape: [4]c_int = undefined;
+            shape[0] = sh[0];
+            for (sh[2..], 1..) |d, i| shape[i] = d;
+            var out = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_reshape(&out, sl, &shape, sh.len - 1, st));
+            return out;
+        }
+    };
+    const rep = @divExact(hv, hk);
+    const q_col = try Prep.run(s, q, rep, &.{ b, t_len, hv, dk, 1 });
+    defer _ = mlx.mlx_array_free(q_col);
+    const k_col = try Prep.run(s, k, rep, &.{ b, t_len, hv, dk, 1 });
+    defer _ = mlx.mlx_array_free(k_col);
+    const k_row = try Prep.run(s, k, rep, &.{ b, t_len, hv, 1, dk });
+    defer _ = mlx.mlx_array_free(k_row);
+    const v_col = try Prep.run(s, v, 1, &.{ b, t_len, hv, dv, 1 });
+    defer _ = mlx.mlx_array_free(v_col);
+    const beta_b = try Prep.run(s, beta, 1, &.{ b, t_len, hv, 1, 1 });
+    defer _ = mlx.mlx_array_free(beta_b);
+    const g_b = try Prep.run(s, g, 1, if (vectorized) &.{ b, t_len, hv, 1, dk } else &.{ b, t_len, hv, 1, 1 });
+    defer _ = mlx.mlx_array_free(g_b);
+
+    var state = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&state, state_in, .float32, s));
+    defer _ = mlx.mlx_array_free(state);
+    const n: usize = @intCast(t_len);
+    const ys = try std.heap.c_allocator.alloc(mlx.mlx_array, n);
+    defer std.heap.c_allocator.free(ys);
+    var n_ys: usize = 0;
+    defer for (ys[0..n_ys]) |y| {
+        _ = mlx.mlx_array_free(y);
+    };
+    const seq = try std.heap.c_allocator.alloc(mlx.mlx_array, if (capture) n else 0);
+    defer std.heap.c_allocator.free(seq);
+    var n_seq: usize = 0;
+    defer for (seq[0..n_seq]) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+
+    var t: c_int = 0;
+    while (t < t_len) : (t += 1) {
+        const gt = try Prep.step(s, g_b, t);
+        defer _ = mlx.mlx_array_free(gt);
+        const kc = try Prep.step(s, k_col, t);
+        defer _ = mlx.mlx_array_free(kc);
+        const kr = try Prep.step(s, k_row, t);
+        defer _ = mlx.mlx_array_free(kr);
+        const qc = try Prep.step(s, q_col, t);
+        defer _ = mlx.mlx_array_free(qc);
+        const vc = try Prep.step(s, v_col, t);
+        defer _ = mlx.mlx_array_free(vc);
+        const bt = try Prep.step(s, beta_b, t);
+        defer _ = mlx.mlx_array_free(bt);
+
+        var decayed = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(decayed);
+        try mlx.check(mlx.mlx_multiply(&decayed, state, gt, s));
+        var kv_mem = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(kv_mem);
+        try mlx.check(mlx.mlx_matmul(&kv_mem, decayed, kc, s));
+        var diff = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(diff);
+        try mlx.check(mlx.mlx_subtract(&diff, vc, kv_mem, s));
+        var delta = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(delta);
+        try mlx.check(mlx.mlx_multiply(&delta, diff, bt, s));
+        var upd = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(upd);
+        try mlx.check(mlx.mlx_matmul(&upd, delta, kr, s));
+        var next = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_add(&next, decayed, upd, s));
+        _ = mlx.mlx_array_free(state);
+        state = next;
+
+        var y = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_matmul(&y, state, qc, s));
+        ys[n_ys] = y;
+        n_ys += 1;
+        if (capture) {
+            var c = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_astype(&c, state, state_dtype, s));
+            seq[n_seq] = c;
+            n_seq += 1;
+        }
+    }
+
+    var y_stack = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_stack);
+    {
+        const vec = mlx.mlx_vector_array_new_data(ys.ptr, n_ys);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        try mlx.check(mlx.mlx_stack_axis(&y_stack, vec, 1, s));
+    }
+    var y_shaped = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(y_shaped);
+    const y_shape = [_]c_int{ b, t_len, hv, dv };
+    try mlx.check(mlx.mlx_reshape(&y_shaped, y_stack, &y_shape, 4, s));
+    var out: GdnOpsResult = .{ .y = mlx.mlx_array_new(), .state = mlx.mlx_array_new(), .state_seq = .{ .ctx = null } };
+    errdefer {
+        _ = mlx.mlx_array_free(out.y);
+        _ = mlx.mlx_array_free(out.state);
+    }
+    try mlx.check(mlx.mlx_astype(&out.y, y_shaped, out_dtype, s));
+    try mlx.check(mlx.mlx_astype(&out.state, state, state_dtype, s));
+    if (capture) {
+        const vec = mlx.mlx_vector_array_new_data(seq.ptr, n_seq);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        out.state_seq = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_stack_axis(&out.state_seq, vec, 0, s));
+    }
+    return out;
+}
+
+const GDN_CUDA_HEADER =
+    \\__device__ __forceinline__ float gdn_warp_sum(float v) {
+    \\  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
+    \\  return v;
+    \\}
+;
+
+/// `gdnKernelSource` for MLX's CUDA backend: one warp per (head, Dv row), the
+/// Dk lanes reduced by shuffle. Scalars arrive as pointers (`T_arr`).
+fn gdnCudaSource(comptime vectorized: bool, comptime capture_seq: bool) [:0]const u8 {
+    const g_setup = if (vectorized) "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;" else "auto g_ = g + b_idx * T * Hv;";
+    const g_access = if (vectorized) "g_[s_idx]" else "g_[hv_idx]";
+    const g_advance = if (vectorized) "  g_ += Hv * Dk;" else "  g_ += Hv;";
+    const seq_write = if (capture_seq)
+        \\  {
+        \\    auto t_state = state_seq + t * seq_stride_arr[0] + (n * Dv + dv_idx) * Dk;
+        \\    for (int i = 0; i < n_per_t; ++i) t_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);
+        \\  }
+        \\
+    else
+        "";
+    const body = "const int n = blockIdx.z * blockDim.z + threadIdx.z;\n" ++
+        "const int b_idx = n / Hv;\n" ++
+        "const int hv_idx = n % Hv;\n" ++
+        "const int hk_idx = hv_idx / (Hv / Hk);\n" ++
+        "constexpr int n_per_t = Dk / 32;\n" ++
+        "const int T = T_arr[0];\n" ++
+        "const int dk_idx = threadIdx.x;\n" ++
+        "const int dv_idx = blockIdx.y * blockDim.y + threadIdx.y;\n" ++
+        "auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;\n" ++
+        "auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;\n" ++
+        "auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;\n" ++
+        "auto y_ = y + b_idx * T * Hv * Dv + hv_idx * Dv;\n" ++
+        "auto i_state = state_in + (n * Dv + dv_idx) * Dk;\n" ++
+        "auto o_state = state_out + (n * Dv + dv_idx) * Dk;\n" ++
+        "float state[n_per_t];\n" ++
+        "for (int i = 0; i < n_per_t; ++i) state[i] = static_cast<float>(i_state[n_per_t * dk_idx + i]);\n" ++
+        g_setup ++ "\n" ++
+        "auto beta_ = beta + b_idx * T * Hv;\n" ++
+        "for (int t = 0; t < T; ++t) {\n" ++
+        "  float kv_mem = 0.0f;\n" ++
+        "  for (int i = 0; i < n_per_t; ++i) {\n" ++
+        "    const int s_idx = n_per_t * dk_idx + i;\n" ++
+        "    state[i] = state[i] * static_cast<float>(" ++ g_access ++ ");\n" ++
+        "    kv_mem += state[i] * static_cast<float>(k_[s_idx]);\n" ++
+        "  }\n" ++
+        "  kv_mem = gdn_warp_sum(kv_mem);\n" ++
+        "  const float delta = (static_cast<float>(v_[dv_idx]) - kv_mem) * static_cast<float>(beta_[hv_idx]);\n" ++
+        "  float out = 0.0f;\n" ++
+        "  for (int i = 0; i < n_per_t; ++i) {\n" ++
+        "    const int s_idx = n_per_t * dk_idx + i;\n" ++
+        "    state[i] = state[i] + static_cast<float>(k_[s_idx]) * delta;\n" ++
+        "    out += state[i] * static_cast<float>(q_[s_idx]);\n" ++
+        "  }\n" ++
+        "  out = gdn_warp_sum(out);\n" ++
+        "  if (dk_idx == 0) y_[dv_idx] = static_cast<OutT>(out);\n" ++
+        seq_write ++
+        "  q_ += Hk * Dk;\n" ++
+        "  k_ += Hk * Dk;\n" ++
+        "  v_ += Hv * Dv;\n" ++
+        "  y_ += Hv * Dv;\n" ++
+        g_advance ++ "\n" ++
+        "  beta_ += Hv;\n" ++
+        "}\n" ++
+        "for (int i = 0; i < n_per_t; ++i) o_state[n_per_t * dk_idx + i] = static_cast<StT>(state[i]);\n";
+    return std.fmt.comptimePrint("{s}", .{body});
+}
+
+fn getGdnCudaKernel(comptime vectorized: bool, comptime capture_seq: bool) !mlx.mlx_fast_cuda_kernel {
+    const Cache = struct {
+        const is_vectorized = vectorized;
+        const is_capture_seq = capture_seq;
+        var kernel: ?mlx.mlx_fast_cuda_kernel = null;
+    };
+    if (Cache.kernel) |k| return k;
+    const input_names = if (capture_seq)
+        [_][*:0]const u8{ "q", "k", "v", "g", "beta", "state_in", "T_arr", "seq_stride_arr" }
+    else
+        [_][*:0]const u8{ "q", "k", "v", "g", "beta", "state_in", "T_arr" };
+    const output_names = if (capture_seq)
+        [_][*:0]const u8{ "y", "state_seq", "state_out" }
+    else
+        [_][*:0]const u8{ "y", "state_out" };
+    const name = "gated_delta_step_cuda" ++ (if (capture_seq) "_seq" else "") ++ (if (vectorized) "_vec" else "");
+    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
+    defer _ = mlx.mlx_vector_string_free(in_vec);
+    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
+    defer _ = mlx.mlx_vector_string_free(out_vec);
+    const k = mlx.mlx_fast_cuda_kernel_new(name, in_vec, out_vec, gdnCudaSource(vectorized, capture_seq), GDN_CUDA_HEADER, true, 0);
+    if (k.ctx == null) return error.CudaKernelCreateFailed;
+    Cache.kernel = k;
+    return k;
+}
+
+/// The GDN recurrence on MLX's CUDA backend, same contract as `gdnRecurOps`;
+/// null when not on CUDA or Dk is not a warp multiple.
+fn gdnRecurCuda(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, vectorized: bool, capture: bool, out_dtype: mlx.mlx_dtype) !?GdnOpsResult {
+    if (!mlx.cudaAvailable()) return null;
+    const qs = mlx.getShape(q);
+    const vs = mlx.getShape(v);
+    const b = qs[0];
+    const t_len = qs[1];
+    const hk = qs[2];
+    const dk = qs[3];
+    const hv = vs[2];
+    const dv = vs[3];
+    if (@rem(dk, 32) != 0 or @rem(hv, hk) != 0) return null;
+    const state_dtype = mlx.mlx_array_dtype(state_in);
+
+    const config = mlx.mlx_fast_cuda_kernel_config_new();
+    defer mlx.mlx_fast_cuda_kernel_config_free(config);
+    const y_shape = [_]c_int{ b, t_len, hv, dv };
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_add_output_arg(config, &y_shape, 4, out_dtype));
+    if (capture) {
+        const seq_shape = [_]c_int{ t_len, b, hv, dv, dk };
+        try mlx.check(mlx.mlx_fast_cuda_kernel_config_add_output_arg(config, &seq_shape, 5, state_dtype));
+    }
+    const state_shape = [_]c_int{ b, hv, dv, dk };
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_add_output_arg(config, &state_shape, 4, state_dtype));
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_set_grid(config, 32, dv, b * hv));
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_set_thread_group(config, 32, 4, 1));
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_add_template_arg_dtype(config, "StT", state_dtype));
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_add_template_arg_dtype(config, "OutT", out_dtype));
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_add_template_arg_int(config, "Dk", dk));
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_add_template_arg_int(config, "Dv", dv));
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_add_template_arg_int(config, "Hk", hk));
+    try mlx.check(mlx.mlx_fast_cuda_kernel_config_add_template_arg_int(config, "Hv", hv));
+
+    const t_arr = mlx.mlx_array_new_int(t_len);
+    defer _ = mlx.mlx_array_free(t_arr);
+    const stride_arr = mlx.mlx_array_new_int(b * hv * dv * dk);
+    defer _ = mlx.mlx_array_free(stride_arr);
+    const ins = [_]mlx.mlx_array{ q, k, v, g, beta, state_in, t_arr, stride_arr };
+    const in_vec = mlx.mlx_vector_array_new_data(&ins, if (capture) 8 else 7);
+    defer _ = mlx.mlx_vector_array_free(in_vec);
+    const kernel = switch (vectorized) {
+        inline else => |vec| switch (capture) {
+            inline else => |cap| try getGdnCudaKernel(vec, cap),
+        },
+    };
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_cuda_kernel_apply(&outs, kernel, in_vec, config, s));
+    var r: GdnOpsResult = .{ .y = mlx.mlx_array_new(), .state = mlx.mlx_array_new(), .state_seq = .{ .ctx = null } };
+    try mlx.check(mlx.mlx_vector_array_get(&r.y, outs, 0));
+    if (capture) {
+        r.state_seq = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_vector_array_get(&r.state_seq, outs, 1));
+    }
+    try mlx.check(mlx.mlx_vector_array_get(&r.state, outs, if (capture) 2 else 1));
+    return r;
+}
+
 /// One compiled kernel per (vectorized, capture_seq) pair. Each comptime
 /// instantiation gets its own cache slot; the Metal name must differ per
 /// variant or MLX hands back the wrong compiled function.
@@ -1490,7 +1796,7 @@ pub fn verifyQmm(
     bits: u32,
     group_size: u32,
 ) !?mlx.mlx_array {
-    if (!verifyQmmEnabled()) return null;
+    if (!verifyQmmEnabled() or !mlx.streamIsGpu(s)) return null;
     // The plain-SIMD split-K/msg kernels carry byte-addressed 5/6/8-bit unpack,
     // but mixed-width adoption remains restricted to measured width/shape
     // combinations. The M5 NAX tile additionally handles eligible mixed-bit
@@ -7420,6 +7726,7 @@ fn fusedSdpa256Impl(
     /// Learned per-head softmax sinks [Hq] (gpt_oss / MiMo), or null.
     sinks: ?mlx.mlx_array,
 ) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
@@ -30908,7 +31215,18 @@ pub const Transformer = struct {
         var y_bthd = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(y_bthd);
 
-        if (self.spec_capture_ssm) {
+        if (!kda_percore and !mlx.streamIsGpu(self.s)) {
+            const r = (try gdnRecurCuda(self.s, q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, vector_gate, self.spec_capture_ssm, gdn_out_dtype)) orelse
+                try gdnRecurOps(self.s, q_scaled, k_scaled, v_heads, g, beta, ssm.ssm_state, vector_gate, self.spec_capture_ssm, gdn_out_dtype);
+            _ = mlx.mlx_array_free(y_bthd);
+            y_bthd = r.y;
+            _ = mlx.mlx_array_free(ssm.ssm_state);
+            ssm.ssm_state = r.state;
+            if (self.spec_capture_ssm) {
+                if (ssm.spec_state_seq.ctx != null) _ = mlx.mlx_array_free(ssm.spec_state_seq);
+                ssm.spec_state_seq = r.state_seq;
+            }
+        } else if (self.spec_capture_ssm) {
             // Spec verify pass: emit per-position states so partial-accept
             // rollback needs no re-forward. state_seq: [T, B, Hv, Dv, Dk]
             // (last row unwritten — capture-tail trim), final state as its
@@ -38004,7 +38322,7 @@ pub fn fusedQkNormRope(
     hk: c_int,
     rd: c_int,
 ) !?[2]mlx.mlx_array {
-    if (!qkNormRopeFusedEnabled()) return null;
+    if (!qkNormRopeFusedEnabled() or !mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(q_flat);
     if (dt != .bfloat16 or mlx.mlx_array_dtype(k_flat) != .bfloat16) return null;
     // rd=32 is the qwen3.5/3.6 partial-rotary geometry (0.25 x 128); the
@@ -38474,7 +38792,7 @@ pub const GdnPreworkArgs = struct {
 /// caller keeps the composed chain. The caller owns all six outputs (and
 /// installs `conv_state` into the SSM cache entry).
 pub fn gdnPreworkFused(s: mlx.mlx_stream, in: GdnPreworkArgs) !?GdnPrework {
-    if (!gdnPreworkEnabled()) return null;
+    if (!gdnPreworkEnabled() or !mlx.streamIsGpu(s)) return null;
     if (!gdnPrefillFusedFor(in.seq, in.batch) and (in.seq < 1 or in.seq > 9 or in.batch < 1 or in.batch * in.seq > GDN_FUSED_MAX_ROWS)) return null;
     if (in.seq < 3 and !gdnDecodeFusedEnabled()) return null;
     if (in.dk != 128 or in.dv != 128) return null;
@@ -38623,7 +38941,7 @@ pub fn gdnNormGateFused(
     batch: c_int,
     seq: c_int,
 ) !?mlx.mlx_array {
-    if (dv != 128) return null;
+    if (dv != 128 or !mlx.streamIsGpu(s)) return null;
     const prefill = gdnPrefillFusedFor(seq, batch);
     if (!prefill and !gdnDecodeFusedEnabled()) return null;
     if (!prefill and (seq < 1 or seq > GDN_FUSED_MAX_ROWS or batch < 1 or batch * seq > GDN_FUSED_MAX_ROWS)) return null;
@@ -38924,7 +39242,7 @@ pub fn fusedQkNormRope256(
     seq: c_int,
     rd: c_int,
 ) !?[3]mlx.mlx_array {
-    if (!qkNormRopeFusedEnabled()) return null;
+    if (!qkNormRopeFusedEnabled() or !mlx.streamIsGpu(s)) return null;
     if (seq < 1 or seq > 32) return null;
     const dt = mlx.mlx_array_dtype(q_in);
     if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(k_in) != dt) return null;
@@ -39995,6 +40313,7 @@ pub const AddNormResult = struct { sum: mlx.mlx_array, normed: mlx.mlx_array, no
 /// `normed2` are null-ctx when their post-norm is off. Null → caller keeps
 /// the composed ops.
 pub fn fusedResidualNorm(s: mlx.mlx_stream, a: mlx.mlx_array, b1: mlx.mlx_array, o: ResidualNormOpts) !?AddNormResult {
+    if (!mlx.streamIsGpu(s)) return null;
     const b2 = o.b2.ctx != null;
     const pre1 = o.w1.ctx != null;
     const pre2 = b2 and o.w2.ctx != null;
@@ -40502,6 +40821,7 @@ fn getGateMulKernel(kind: GateMulKind) !mlx.mlx_fast_metal_kernel {
 /// per-dtype table of MLX's own results; `lim` (0-dim, the tensor dtype) for `.silu_clamp`.
 /// Null → caller keeps the chain.
 fn tableGateMul(s: mlx.mlx_stream, kind: GateMulKind, gate: mlx.mlx_array, up: mlx.mlx_array, table: mlx.mlx_array, lim: ?mlx.mlx_array) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(gate);
     if (dt != mlx.mlx_array_dtype(up)) return null;
     // FLOAT32 IS DECLINED ON PURPOSE. MLX ships its own kernels in a metallib
@@ -40930,6 +41250,7 @@ var swiglu_joined_key: GateMulCfgKey = std.mem.zeroes(GateMulCfgKey);
 
 /// `fusedSwiGLU(gate, up)` for `both` = [..., gate | up] (equal halves), bit-equal to it.
 fn swigluJoined(s: mlx.mlx_stream, both: mlx.mlx_array) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
     if (!swigluFusedEnabled()) return null;
     const dt = mlx.mlx_array_dtype(both);
     if (dt != .bfloat16 and dt != .float16) return null;

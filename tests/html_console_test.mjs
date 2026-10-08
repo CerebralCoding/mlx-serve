@@ -415,6 +415,32 @@ test('tool resolution prefers resident, then healthy complete models without reo
   assert.deepEqual(fleet.map(m => m.id), ['broken', 'incomplete', 'cold', 'resident']);
 });
 
+test('the CSP pins the hash of every inline script exactly as server.zig assembles it', async () => {
+  const { createHash } = await import('node:crypto');
+  const pin = (s) => `'sha256-${createHash('sha256').update(s).digest('base64')}'`;
+  const csp = read('index.html').match(/script-src ([^;]*);/)[1];
+  const scripts = {
+    boot: read('api.js') + '\n;\n' + read('theme.js') + '\n;\n' + read('i18n.js'),
+    app: read('app.js'),
+    metrics: '\n' + read('metrics.js') + '\n'
+  };
+  for (const [name, body] of Object.entries(scripts)) assert.ok(csp.includes(pin(body)), `${name} script hash missing from the CSP`);
+});
+
+test('a page opened with ?api_key= authenticates its own server, never another, and keeps the key off disk', () => {
+  assert.equal(C.pageApiKey('?api_key=123'), '123');
+  assert.equal(C.pageApiKey('?x=1&api_key=a%20b'), 'a b');
+  assert.equal(C.pageApiKey(''), undefined);
+  assert.equal(C.pageApiKey('?api_key='), undefined);
+  const saved = new Map();
+  const storage = { getItem: (k) => saved.get(k) ?? null, setItem: (k, v) => saved.set(k, v) };
+  const conn = new C.Connection('http://lan:11234', storage, {}, '123');
+  assert.equal(conn.active.apiKey, '123');
+  const other = conn.add({ url: 'http://other:1' });
+  assert.equal(conn.store.get(other).apiKey, undefined);
+  assert.doesNotMatch(saved.get('studio.servers'), /apiKey/);
+});
+
 test('tool system prompt carries the real mounted base, inventory, API fields and question rules onto the wire', async () => {
   const baseUrl = C.pageServer({ origin: 'https://inference.example:8443', pathname: '/proxy/mlx/index.html' });
   const options = C.browserTools({ baseUrl }, models, {});

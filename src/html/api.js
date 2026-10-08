@@ -1405,6 +1405,9 @@ function apiPrefix(pathname) {
 /** @param {Pick<Location,'origin'|'pathname'>} location */
 const pageServer = (location) =>
   location.origin + apiPrefix(location.pathname);
+/** The `?api_key=` the page was opened with: the server accepts it for the page, the console sends it on. @param {string} search */
+const pageApiKey = (search) =>
+  new URL(search || "", "http://page").searchParams.get("api_key") || undefined;
 /** @param {string} hash @returns {string|null} */
 const fragmentView = (hash) =>
   ({ "#chat": "chat", "#monitor": "monitoring", "#api": "api" })[hash] ?? null;
@@ -1653,7 +1656,7 @@ const apiReference = [
   },
 ];
 
-return {apiPrefix: apiPrefix, pageServer: pageServer, fragmentView: fragmentView, curlExample: curlExample, apiReference: apiReference};
+return {apiPrefix: apiPrefix, pageServer: pageServer, pageApiKey: pageApiKey, fragmentView: fragmentView, curlExample: curlExample, apiReference: apiReference};
 })();
 // src/core/id.js
 studioModules["src/core/id.js"] = (() => {
@@ -2367,8 +2370,8 @@ class Connection extends EventTarget {
   checks = new Map();
   /** @type {AbortController | undefined} */
   pending;
-  /** @param {string} origin @param {Storage} storage @param {import('../core/client.js').ClientOptions} [options] */
-  constructor(origin, storage, options = {}) {
+  /** @param {string} origin @param {Storage} storage @param {import('../core/client.js').ClientOptions} [options] @param {string} [pageKey] the page's own `?api_key=`, for this origin only */
+  constructor(origin, storage, options = {}, pageKey = undefined) {
     super();
     this.storage = storage;
     this.options = options;
@@ -2387,6 +2390,7 @@ class Connection extends EventTarget {
     const home =
       this.store.list().find((s) => s.url === origin)?.id ??
       this.store.add({ url: origin, name: "This server" });
+    if (pageKey) this.store.update(home, { apiKey: pageKey });
     const saved = storage.getItem("studio.activeServer");
     this.activeId = saved && this.store.get(saved) ? saved : home;
   }

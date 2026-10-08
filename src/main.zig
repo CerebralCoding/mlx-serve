@@ -585,6 +585,7 @@ pub fn main(init: std.process.Init) !void {
     var draft_block_size: u32 = drafter_mod.DEFAULT_BLOCK_SIZE;
     var draft_block_size_explicit: bool = false; // user passed --draft-block-size?
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
+    var mtp_forced = false;
     var mtp_head_kv_quant = false;
     var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
     var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TOKENV3")) |v| std.mem.span(v) else null;
@@ -771,7 +772,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
-            // The default now; still accepted so existing launch lines work.
+            // The default now; still accepted so existing launch lines work,
+            // and the way to opt in on CUDA.
+            mtp_forced = true;
         } else if (std.mem.eql(u8, args[i], "--mtp-head-kv-quant")) {
             mtp_head_kv_quant = true;
         } else if (std.mem.eql(u8, args[i], "--ple-gpu")) {
@@ -1044,6 +1047,9 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         }
     }
+    // MTP verify rounds cost more than they save without the Metal verify
+    // kernels: plain decode is faster on CUDA unless `--mtp` asks for it.
+    if (!mtp_forced and mlx.cudaAvailable()) enable_mtp = false;
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
@@ -1426,16 +1432,7 @@ pub fn main(init: std.process.Init) !void {
         // so the registry's eviction gate stays in sync. 0 disables the cap.
         const effective_max_resident_mem: u64 = if (max_resident_mem_explicit)
             max_resident_mem
-        else blk: {
-            var dev = mlx.mlx_device{ .ctx = null };
-            _ = mlx.mlx_get_default_device(&dev);
-            var info = mlx.mlx_device_info_new();
-            defer _ = mlx.mlx_device_info_free(info);
-            if (mlx.mlx_device_info_get(&info, dev) != 0) break :blk 0;
-            var max_rec: usize = 0;
-            if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) break :blk 0;
-            break :blk @as(u64, max_rec) * 4 / 5;
-        };
+        else @as(u64, mlx.maxRecommendedWorkingSet()) * 4 / 5;
         if (effective_max_resident_mem > 0) {
             log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
                 max_resident_models,
@@ -1830,14 +1827,7 @@ fn runDs4Offline(
 /// unlimited (the count cap still applies).
 fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
     if (explicit) return val;
-    var dev = mlx.mlx_device{ .ctx = null };
-    _ = mlx.mlx_get_default_device(&dev);
-    var info = mlx.mlx_device_info_new();
-    defer _ = mlx.mlx_device_info_free(info);
-    if (mlx.mlx_device_info_get(&info, dev) != 0) return 0;
-    var max_rec: usize = 0;
-    if (mlx.mlx_device_info_get_size(&max_rec, info, "max_recommended_working_set_size") != 0 or max_rec == 0) return 0;
-    return @as(u64, max_rec) * 4 / 5;
+    return @as(u64, mlx.maxRecommendedWorkingSet()) * 4 / 5;
 }
 
 fn dirBasename(path: []const u8) []const u8 {

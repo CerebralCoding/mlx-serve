@@ -16828,6 +16828,8 @@ speechChunks: studioModules["src/ui/chat-voice.js"].speechChunks,
 VoiceLoop: studioModules["src/ui/chat-voice.js"].VoiceLoop,
 apiPrefix: studioModules["src/ui/console.js"].apiPrefix,
 pageServer: studioModules["src/ui/console.js"].pageServer,
+pageApiKey: studioModules["src/ui/console.js"].pageApiKey,
+Connection: studioModules["src/ui/state.js"].Connection,
 makeSample: studioModules["src/core/monitor-history.js"].makeSample,
 liveRates: studioModules["src/core/monitor-history.js"].liveRates,
 rateSeries: studioModules["src/core/monitor-history.js"].rateSeries,
@@ -16843,7 +16845,7 @@ resetBetween: studioModules["src/core/monitor-history.js"].resetBetween
 studioModules["src/ui/app.js"] = (async () => {
 const {displayName, t, th, N, language, setLanguage, languageChoice, applyMarkup} = studioModules["src/ui/i18n.js"];
 // @ts-check
-const {pageServer, fragmentView, apiReference, curlExample} = studioModules["src/ui/console.js"];
+const {pageServer, pageApiKey, fragmentView, apiReference, curlExample} = studioModules["src/ui/console.js"];
 const {MonitoringView} = studioModules["src/ui/monitoring-view.js"];
 const {LibraryView} = studioModules["src/ui/library-view.js"];
 const {VideoView} = studioModules["src/ui/video-view.js"];
@@ -16893,7 +16895,7 @@ const storage = {
   },
 };
 const prefs = readPreferences(storage);
-const connection = new Connection(pageServer(location), storage);
+const connection = new Connection(pageServer(location), storage, {}, pageApiKey(location.search));
 const systemDark = matchMedia("(prefers-color-scheme: dark)");
 const phone = matchMedia("(max-width: 700px)");
 let view = "chat",
