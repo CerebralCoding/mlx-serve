@@ -138,7 +138,8 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
         \\      supportsDeveloperRole: false
         \\      supportsReasoningEffort: true
         \\      maxTokensField: max_tokens
-        \\      thinkingFormat: qwen
+        \\      thinkingFormat: openai
+        \\      reasoningDisableMode: none-effort
         \\    models:
         \\
     , .{base_url});
@@ -147,6 +148,9 @@ pub fn ompModelsYml(allocator: std.mem.Allocator, base_url: []const u8, entries:
             \\      - id: "{s}"
             \\        name: "{s} (mlx-serve)"
             \\        reasoning: true
+            \\        thinking:
+            \\          mode: effort
+            \\          efforts: [minimal, low, medium, high, xhigh]
             \\        input: [{s}]
             \\        cost:
             \\          input: 0
@@ -1422,7 +1426,7 @@ test "budgetForContext mirrors AgentBudget: ctx/2 clamped to [1024, 65536], 0 = 
     try t.expectEqual(Budget{ .context = 1048576, .output = 65536 }, budgetForContext(1048576));
 }
 
-test "omp models.yml: static per-model entries, no discovery, pi-compat vocabulary" {
+test "omp models.yml: static per-model entries, no discovery, thinking level as reasoning_effort" {
     const entries = [_]Entry{
         .{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true },
         .{ .id = "m2", .budget = .{ .context = 262144, .output = 65536 }, .vision = true, .loaded = false },
@@ -1434,7 +1438,10 @@ test "omp models.yml: static per-model entries, no discovery, pi-compat vocabula
     try t.expect(std.mem.indexOf(u8, yml, "contextWindow: 4096") != null);
     try t.expect(std.mem.indexOf(u8, yml, "contextWindow: 262144") != null);
     try t.expect(std.mem.indexOf(u8, yml, "input: [text, image]") != null);
-    try t.expect(std.mem.indexOf(u8, yml, "thinkingFormat: qwen") != null);
+    // thinkingFormat qwen sent only enable_thinking: every omp level ran the server default.
+    try t.expect(std.mem.indexOf(u8, yml, "thinkingFormat: openai") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "reasoningDisableMode: none-effort") != null);
+    try t.expect(std.mem.indexOf(u8, yml, "efforts: [minimal, low, medium, high, xhigh]") != null);
 }
 
 test "codex overrides: responses wire API, keyless, advertised context" {

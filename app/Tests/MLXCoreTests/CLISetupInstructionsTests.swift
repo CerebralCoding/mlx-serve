@@ -510,7 +510,9 @@ final class CLISetupInstructionsTests: XCTestCase {
         XCTAssertTrue(yml.contains("contextWindow: 262144"), yml)
         XCTAssertTrue(yml.contains("maxTokens: 65536"), yml)
         XCTAssertTrue(yml.contains("input: [text, image]"), yml)
-        XCTAssertTrue(yml.contains("thinkingFormat: qwen"), yml)
+        XCTAssertTrue(yml.contains("thinkingFormat: openai"), yml)
+        XCTAssertTrue(yml.contains("reasoningDisableMode: none-effort"), yml)
+        XCTAssertTrue(yml.contains("efforts: [minimal, low, medium, high, xhigh]"), yml)
     }
 
     /// The tab and the launcher carry the SAME override builder and write nothing.

@@ -431,8 +431,9 @@ enum AgentConfigs {
     /// since a media row has no context to advertise). Users who wire omp's
     /// discovery themselves still get real per-model context from the rows'
     /// top-level `max_model_len`/`context_length` twins (issue #188).
-    /// `compat` keys verified against the omp schema (same vocabulary as
-    /// pi's, `thinkingFormat: qwen` included).
+    /// `compat` keys verified against the omp schema. `thinkingFormat: openai`
+    /// sends each level as `reasoning_effort` (off = "none"); the server maps
+    /// the word onto the model's own vocabulary. Twin of launch.zig `ompModelsYml`.
     static func ompModelsYML(baseURL: String, defaultModel: String,
                              entries: [AgentModelEntry],
                              apiKey: String = "mlx-serve") -> String {
@@ -446,6 +447,9 @@ enum AgentConfigs {
                   - id: "\(e.id)"
                     name: "\(e.id) (mlx-serve)"
                     reasoning: true
+                    thinking:
+                      mode: effort
+                      efforts: [minimal, low, medium, high, xhigh]
                     input: [\(e.vision ? "text, image" : "text")]
                     cost:
                       input: 0
@@ -468,7 +472,8 @@ enum AgentConfigs {
               supportsDeveloperRole: false
               supportsReasoningEffort: true
               maxTokensField: max_tokens
-              thinkingFormat: qwen
+              thinkingFormat: openai
+              reasoningDisableMode: none-effort
             models:
         \(models)
         """
