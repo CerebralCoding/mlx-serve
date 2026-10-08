@@ -74,12 +74,12 @@ cat > ~/.mlx-serve/pi/models.json <<'EOF'
       "compat": {
         "supportsDeveloperRole": false,
         "supportsReasoningEffort": true,
-        "maxTokensField": "max_tokens",
-        "thinkingFormat": "qwen"
+        "maxTokensField": "max_tokens"
       },
       "models": [
         {"id": "MODEL_ID", "name": "MODEL_ID (mlx-serve)", "input": ["text"],
-         "contextWindow": CTX, "maxTokens": 8192, "reasoning": true}
+         "contextWindow": CTX, "maxTokens": 8192, "reasoning": true,
+         "thinkingLevelMap": {"off": "none", "xhigh": "xhigh", "max": "max"}}
       ]
     }
   }
@@ -105,12 +105,16 @@ providers:
       supportsDeveloperRole: false
       supportsReasoningEffort: true
       maxTokensField: max_tokens
-      thinkingFormat: qwen
+      thinkingFormat: openai
+      reasoningDisableMode: none-effort
     models:
       - id: "MODEL_ID"
         contextWindow: CTX
         maxTokens: 8192
         reasoning: true
+        thinking:
+          mode: effort
+          efforts: [minimal, low, medium, high, xhigh]
         input: [text]
 EOF
 export PI_CODING_AGENT_DIR="$HOME/.mlx-serve/omp"

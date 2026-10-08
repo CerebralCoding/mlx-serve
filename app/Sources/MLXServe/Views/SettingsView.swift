@@ -2412,6 +2412,30 @@ private struct VoiceCloneSectionContent: View {
                 kokoroBody
             }
         }
+        if appState.serverOptions.voiceEngine == .system {
+            SearchableRow(searchText: ["System voice", "Apple voice"]) {
+                systemVoiceBody
+            }
+        }
+    }
+
+    /// The app-wide Apple voice; an agent with its own voice still overrides it.
+    @ViewBuilder
+    private var systemVoiceBody: some View {
+        VStack(alignment: .leading, spacing: 6) {
+            Text(L10n.text("System voice")).font(.app(.headline).weight(.semibold))
+            HStack(spacing: 8) {
+                Picker("", selection: Binding(get: { appState.voice.selectedVoiceId },
+                                              set: { appState.voice.selectVoice($0) })) {
+                    ForEach(appState.voice.availableVoices) { v in
+                        Text(v.displayName).font(.app(.body)).tag(Optional(v.id))
+                    }
+                }
+                .labelsHidden()
+                .frame(width: 260)
+                Spacer(minLength: 0)
+            }
+        }
     }
 
     @ViewBuilder
