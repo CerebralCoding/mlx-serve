@@ -90,13 +90,15 @@ struct Model3DGenView: View {
             .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
-            Button("Cancel", role: .cancel) { pendingRequest = nil }
-            Button("Generate Anyway", role: .destructive) {
+            Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
+            Button(role: .destructive) {
                 if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
-            }
+            } label: { Text("Generate Anyway")
+                .font(.app(.body)) }
         } message: {
-            Text(L10n.text(ramWarningMessage))
+            Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
     }
 
@@ -150,18 +152,14 @@ struct Model3DGenView: View {
 
     private var photoSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Photo").font(.app(.subheadline).weight(.semibold))
+            Text("Photo").font(.app(.headline).weight(.semibold))
             if let url = photoURL {
                 // Same surface and same floor height as the empty well.
                 MediaDropWellFilled(isTargeted: isDropTargeted) {
                     HStack(spacing: 8) {
-                        if let img = NSImage(contentsOf: url) {
-                            Image(nsImage: img)
-                                .resizable()
-                                .aspectRatio(contentMode: .fill)
-                                .frame(width: 64, height: 48)
-                                .clipShape(RoundedRectangle(cornerRadius: 4))
-                        }
+                        MediaImageView(url: url, maxPixel: 192)
+                            .frame(width: 64, height: 48)
+                            .clipShape(RoundedRectangle(cornerRadius: 4))
                         Text(url.lastPathComponent)
                             .font(.app(.caption)).lineLimit(1).truncationMode(.middle)
                         Spacer()
@@ -196,7 +194,7 @@ struct Model3DGenView: View {
                 intSliderRow("Steps", value: $steps, range: 10...50)
                 sliderRow("Guidance", value: $guidance, range: 1...10, step: 0.5)
                 VStack(alignment: .leading, spacing: 4) {
-                    Text("Mesh resolution").font(.app(.caption))
+                    Text("Mesh resolution").font(.app(.rowTitle))
                     Picker("", selection: $resolution) {
                         Text("128 (fast)").tag(128)
                         Text("256 (balanced)").tag(256)
@@ -218,14 +216,14 @@ struct Model3DGenView: View {
                            step: Double) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.app(.caption))
+                Text(L10n.text(label)).font(.app(.rowTitle))
                 Spacer()
                 Text(String(format: "%.1f", value.wrappedValue))
                     .font(.app(.caption).monospacedDigit())
                     .foregroundStyle(.secondary)
             }
             Slider(value: value, in: range, step: step)
-                .padding(.top, Self.steppedSliderTrackDrop)
+                .padding(.top, Self.steppedSliderTrackDrop).font(.app(.body))
         }
     }
 
@@ -233,7 +231,7 @@ struct Model3DGenView: View {
     private func intSliderRow(_ label: String, value: Binding<Int>, range: ClosedRange<Int>) -> some View {
         VStack(alignment: .leading, spacing: 2) {
             HStack {
-                Text(L10n.text(label)).font(.app(.caption))
+                Text(L10n.text(label)).font(.app(.rowTitle))
                 Spacer()
                 Text("\(value.wrappedValue)")
                     .font(.app(.caption).monospacedDigit())
@@ -247,7 +245,7 @@ struct Model3DGenView: View {
                 in: Double(range.lowerBound)...Double(range.upperBound),
                 step: 1
             )
-            .padding(.top, Self.steppedSliderTrackDrop)
+            .padding(.top, Self.steppedSliderTrackDrop).font(.app(.body))
         }
     }
 
@@ -259,12 +257,12 @@ struct Model3DGenView: View {
         HStack {
             if service.isRunning {
                 Button(role: .destructive) { service.cancel() } label: {
-                    Label("Cancel", systemImage: "stop.circle").frame(maxWidth: .infinity)
+                    Label("Cancel", systemImage: "stop.circle").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
             } else {
                 Button { tryGenerate() } label: {
-                    Label("Generate", systemImage: "cube.transparent").frame(maxWidth: .infinity)
+                    Label("Generate", systemImage: "cube.transparent").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: [.command])
@@ -291,7 +289,7 @@ struct Model3DGenView: View {
                 switch service.phase {
                 case .idle:
                     ContentUnavailableView("No 3D model yet", systemImage: "cube.transparent",
-                                           description: Text("Choose a photo and press Generate."))
+                                           description: Text("Choose a photo and press Generate.").font(.app(.body)))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
                         ProgressView(value: Double(step), total: max(1, Double(total)))
@@ -302,11 +300,12 @@ struct Model3DGenView: View {
                     completedPreview(path: path)
                 case .failed(let msg):
                     ContentUnavailableView {
-                        Label("Failed", systemImage: "exclamationmark.triangle")
+                        Label("Failed", systemImage: "exclamationmark.triangle").font(.app(.body))
                     } description: {
                         Text(msg)
                     } actions: {
-                        Button("Show log") { showLogWindow() }
+                        Button { showLogWindow() } label: { Text("Show log")
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -489,8 +488,9 @@ private struct Model3DHistoryThumb: View {
         .help((path as NSString).lastPathComponent)
         .task(id: path) {
             let thumb = Model3DGenService.thumbnailPath(for: path)
-            if let img = NSImage(contentsOfFile: thumb) {
-                image = img
+            let url = URL(fileURLWithPath: thumb)
+            if let img = await MediaImage.load(url: url, maxPixel: 160) {
+                if !Task.isCancelled { image = img }
                 return
             }
             // Lazy render off the main actor, then re-check.
@@ -498,7 +498,8 @@ private struct Model3DHistoryThumb: View {
                 Model3DThumbnailer.ensure(glbPath: path)
                 return FileManager.default.fileExists(atPath: thumb)
             }.value
-            if rendered { image = NSImage(contentsOfFile: thumb) }
+            if rendered, let img = await MediaImage.load(url: url, maxPixel: 160),
+               !Task.isCancelled { image = img }
         }
     }
 }
@@ -811,12 +812,25 @@ struct Model3DSceneView: NSViewRepresentable {
     }
 
     func updateNSView(_ nsView: SCNView, context: Context) {
+        context.coordinator.animatePref = animate
         if context.coordinator.loadedURL != url {
             context.coordinator.loadedURL = url
-            let scene = url.flatMap { GLBMeshLoader.loadScene(url: $0) }
-            nsView.scene = scene
-            context.coordinator.modelNode = scene.flatMap { GLBMeshLoader.firstGeometryNode(in: $0) }
+            nsView.scene = nil
+            context.coordinator.modelNode = nil
             context.coordinator.animating = nil
+            // Parsing can outlive a later history selection.
+            let token = context.coordinator.nextLoadToken()
+            guard let url else { return }
+            Task { [coordinator = context.coordinator] in
+                let result = await Task.detached(priority: .userInitiated) { () -> (scene: SCNScene, node: SCNNode?)? in
+                    guard let scene = GLBMeshLoader.loadScene(url: url) else { return nil }
+                    return (scene: scene, node: GLBMeshLoader.firstGeometryNode(in: scene))
+                }.value
+                guard coordinator.loadToken == token else { return }
+                nsView.scene = result?.scene
+                coordinator.modelNode = result?.node
+                coordinator.setAnimating(coordinator.animatePref)
+            }
         }
         context.coordinator.setAnimating(animate)
     }
@@ -828,6 +842,11 @@ struct Model3DSceneView: NSViewRepresentable {
         var modelNode: SCNNode?
         /// nil = fresh load (actions must be (re)installed either way).
         var animating: Bool?
+        var animatePref = true
+        /// Identity of the newest in-flight scene load; only it may apply.
+        private(set) var loadToken = 0
+
+        func nextLoadToken() -> Int { loadToken += 1; return loadToken }
 
         func setAnimating(_ on: Bool) {
             guard on != animating, let node = modelNode else { return }

@@ -50,6 +50,7 @@ struct ToolApprovalSheet: View {
         case "generate_image": return "Generate an image"
         case "generate_speech": return "Generate spoken audio"
         case "generate_music": return "Generate a music track"
+        case "generate_sound": return "Generate a sound effect"
         case "generate_video": return "Generate a video"
         default:           return "Run \(request.toolName)"
         }
@@ -125,7 +126,7 @@ struct ToolApprovalSheet: View {
                 Button(role: .destructive) {
                     onDeny()
                 } label: {
-                    Text("Deny").frame(minWidth: 70)
+                    Text("Deny").font(.app(.body)).frame(minWidth: 70)
                 }
                 .keyboardShortcut(.cancelAction)
 
@@ -134,13 +135,13 @@ struct ToolApprovalSheet: View {
                 Button {
                     onAllowAll()
                 } label: {
-                    Text("Allow all tools this session").frame(minWidth: 180)
+                    Text("Allow all tools this session").font(.app(.body)).frame(minWidth: 180)
                 }
 
                 Button {
                     onAllow()
                 } label: {
-                    Text("Allow").frame(minWidth: 70)
+                    Text("Allow").font(.app(.body)).frame(minWidth: 70)
                 }
                 .keyboardShortcut(.defaultAction)
                 .buttonStyle(.borderedProminent)
@@ -238,6 +239,42 @@ private struct AttachmentPreviewRow: View {
             .background(Color.secondary.opacity(0.15))
             .clipShape(RoundedRectangle(cornerRadius: 10))
             removeButton(remove)
+        }
+    }
+}
+
+/// A chat image decoded off-main once, not per bubble redraw.
+private struct AttachmentImageCell: View {
+    let image: ChatImage
+    @State private var decoded: NSImage?
+    @State private var undecodable = false
+
+    var body: some View {
+        Group {
+            if let decoded {
+                // `.fill`: the rounded corners clip the frame,
+                // so a letterboxed picture keeps square corners.
+                Image(nsImage: decoded)
+                    .resizable()
+                    .aspectRatio(contentMode: .fill)
+                    .frame(width: ChatImagePreview.displayWidth(for: decoded),
+                           height: ChatMetrics.attachmentHeight)
+                    .clipShape(RoundedRectangle(cornerRadius: 10))
+                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(image) }
+                    .help("Double-click to open in Preview")
+            } else if !undecodable {
+                // Hold the row's height so the transcript does not jump.
+                Color.clear
+                    .frame(width: ChatMetrics.attachmentHeight,
+                           height: ChatMetrics.attachmentHeight)
+            }
+        }
+        .task(id: image.id) {
+            let loaded = await MediaImage.load(data: image.data,
+                                               id: image.id.uuidString,
+                                               maxPixel: 1536)
+            guard !Task.isCancelled else { return }
+            if let loaded { decoded = loaded } else { undecodable = true }
         }
     }
 }
@@ -378,7 +415,6 @@ enum PasteFileKind: String, Equatable {
 struct ChatView: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
-    @Environment(\.dismissWindow) private var dismissWindow
     /// The two-column (chat) split's visibility.
     @State private var columnVisibility = NavigationSplitViewVisibility.automatic
     /// The three-column (Tasks / Agents) split's visibility. `.all` is the only
@@ -556,6 +592,7 @@ struct ChatView: View {
         case .audio:   AudioGenView()
                            .environmentObject(appState.audioGen)
                            .environmentObject(appState.musicGen)
+                           .environmentObject(appState.soundGen)
         case .model3d: Model3DGenView().environmentObject(appState.model3dGen)
         }
     }
@@ -564,9 +601,10 @@ struct ChatView: View {
     /// are required and the order is load-bearing — a window with an attached
     /// sheet can't be closed, and dismissing to the composer underneath is the
     /// dead end this gate exists to replace.
+    /// Ends the sheet and leaves the window open to look around; it comes back
+    /// the next time the chat window opens with nothing to chat with.
     private func cancelGate() {
         gateCancelled = true
-        DispatchQueue.main.async { dismissWindow(id: "chat") }
     }
 }
 
@@ -1141,19 +1179,21 @@ struct ChatSidebar: View {
                                  set: { if !$0 { appState.pendingChatDeletion = nil } }),
             presenting: appState.pendingChatDeletion
         ) { ids in
-            Button("Delete", role: .destructive) {
+            Button(role: .destructive) {
                 deleteChats(ids)
                 appState.pendingChatDeletion = nil
-            }
+            } label: { Text("Delete")
+                .font(.app(.body)) }
             // Return deletes. The dialog is the second time you have said so
             // (a menu command or a row's Delete raised it), and reaching for
             // the trackpad to confirm a decision already made is the whole
             // reason this asked to be a keyboard app. Escape still cancels —
             // AppKit gives the `.cancel` role that for free.
             .keyboardShortcut(.defaultAction)
-            Button("Cancel", role: .cancel) { appState.pendingChatDeletion = nil }
+            Button(role: .cancel) { appState.pendingChatDeletion = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
         } message: { _ in
-            Text(L10n.text("This can't be undone."))
+            Text(L10n.text("This can't be undone.")).font(.app(.body))
         }
         // ⌘1…⌘9. In the sidebar rather than the window's `.commands` because
         // they address THIS view's conversation list; hidden in a background so
@@ -1459,8 +1499,10 @@ struct ChatSidebar: View {
         .padding(.bottom, 2)
         .onDrop(of: [.text], delegate: groupDrop(group.id))
         .contextMenu {
-            Button("Rename Group…") { groupSheet = .rename(group.id, group.name) }
-            Button("Delete Group", role: .destructive) { appState.sidebarGroups.delete(group.id) }
+            Button { groupSheet = .rename(group.id, group.name) } label: { Text("Rename Group…")
+                .font(.app(.body)) }
+            Button(role: .destructive) { appState.sidebarGroups.delete(group.id) } label: { Text("Delete Group")
+                .font(.app(.body)) }
         }
     }
 
@@ -1473,14 +1515,17 @@ struct ChatSidebar: View {
     private func groupMenu(for ids: Set<UUID>, current: UUID?) -> some View {
         Menu("Move to Group") {
             ForEach(appState.sidebarGroups.groups) { group in
-                Button(group.name) { appState.sidebarGroups.assign(ids, to: group.id) }
+                Button { appState.sidebarGroups.assign(ids, to: group.id) } label: { Text(group.name)
+                    .font(.app(.body)) }
                     .disabled(ids.count == 1 && group.id == current)
             }
             if !appState.sidebarGroups.groups.isEmpty { Divider() }
-            Button("New Group…") { groupSheet = .create(ids) }
+            Button { groupSheet = .create(ids) } label: { Text("New Group…")
+                .font(.app(.body)) }
         }
         if current != nil {
-            Button("Remove from Group") { appState.sidebarGroups.assign(ids, to: nil) }
+            Button { appState.sidebarGroups.assign(ids, to: nil) } label: { Text("Remove from Group")
+                .font(.app(.body)) }
         }
         Divider()
     }
@@ -1517,7 +1562,7 @@ struct ChatSidebar: View {
                 appState.showConversation()
                 appState.sidebarGroups.assign([appState.newChatSession()], to: group)
             } label: {
-                Label("New Chat", systemImage: "square.and.pencil")
+                Label("New Chat", systemImage: "square.and.pencil").font(.app(.body))
             }
             if BuildFeatures.current.cliLauncher {
                 Divider()
@@ -1590,7 +1635,7 @@ struct ChatSidebar: View {
                     let displayTitle = ChatSessionTitle.display(title: session.title,
                                                                 agentName: agent?.name)
                     Text(displayTitle == "New Chat" ? L10n.text(displayTitle) : displayTitle)
-                        .font(.app(.subheadline).weight(isSelected ? .semibold : .regular))
+                        .font(.app(.rowTitle))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                     if let dot = activity.dot(for: session.id, isSelected: isSelected) {
@@ -1678,17 +1723,20 @@ struct ChatSidebar: View {
             // says how many; right-clicking outside one acts on the row.
             let inSelection = appState.sidebarSelection.count > 1
                 && appState.sidebarSelection.contains(session.id)
-            Button("Rename…") { beginRename(session.id, current: session.title) }
+            Button { beginRename(session.id, current: session.title) } label: { Text("Rename…")
+                .font(.app(.body)) }
             groupMenu(for: inSelection ? appState.sidebarSelection : [session.id],
                       current: appState.sidebarGroups.group(of: session.id))
             if inSelection {
-                Button(L10n.format("Delete %lld Chats", Int64(appState.sidebarSelection.count)), role: .destructive) {
+                Button(role: .destructive) {
                     requestDeleteChats(appState.sidebarSelection, keyboard: false)
-                }
+                } label: { Text(L10n.format("Delete %lld Chats", Int64(appState.sidebarSelection.count)))
+                    .font(.app(.body)) }
             } else {
-                Button("Delete", role: .destructive) {
+                Button(role: .destructive) {
                     requestDeleteChats([session.id], keyboard: false)
-                }
+                } label: { Text("Delete")
+                    .font(.app(.body)) }
             }
         }
     }
@@ -1708,7 +1756,7 @@ struct ChatSidebar: View {
                     .foregroundStyle(terminalTint(t.phase))
                 VStack(alignment: .leading, spacing: 2) {
                     Text(L10n.text(t.displayName))
-                        .font(.app(.subheadline).weight(isSelected ? .semibold : .regular))
+                        .font(.app(.rowTitle))
                         .lineLimit(1)
                         .foregroundStyle(.primary)
                     Text((t.workspace as NSString).lastPathComponent)
@@ -1753,12 +1801,15 @@ struct ChatSidebar: View {
             hoveredSessionId = isHovered ? t.id : nil
         }
         .contextMenu {
-            Button("Rename…") { beginRename(t.id, current: t.displayName) }
+            Button { beginRename(t.id, current: t.displayName) } label: { Text("Rename…")
+                .font(.app(.body)) }
             groupMenu(for: [t.id], current: appState.sidebarGroups.group(of: t.id))
             if t.isInOwnWindow {
-                Button("Show Window") { showTerminal(t.id) }
+                Button { showTerminal(t.id) } label: { Text("Show Window")
+                    .font(.app(.body)) }
             } else {
-                Button("Move Tab to New Window") { moveToNewWindow(t.id) }
+                Button { moveToNewWindow(t.id) } label: { Text("Move Tab to New Window")
+                    .font(.app(.body)) }
             }
             Menu("Theme") {
                 Toggle("App Default", isOn: Binding(
@@ -1771,9 +1822,10 @@ struct ChatSidebar: View {
                         set: { _ in terminals.setTheme(t.id, themeId: theme.id) }))
                 }
             }
-            Button(L10n.text(t.isActive ? "End Session" : "Close"), role: .destructive) {
+            Button(role: .destructive) {
                 requestCloseTerminal(t.id)
-            }
+            } label: { Text(L10n.text(t.isActive ? "End Session" : "Close"))
+                .font(.app(.body)) }
         }
         // Per row, so only the row asked presents; a live session's ✕ is a
         // small target and a misclick must not kill a TUI.
@@ -1782,9 +1834,11 @@ struct ChatSidebar: View {
             isPresented: Binding(get: { appState.pendingTerminalClose == t.id },
                                  set: { if !$0 { appState.pendingTerminalClose = nil } })
         ) {
-            Button("End Session", role: .destructive) { appState.closeTerminal(t.id) }
+            Button(role: .destructive) { appState.closeTerminal(t.id) } label: { Text("End Session")
+                .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
-            Button("Cancel", role: .cancel) { appState.pendingTerminalClose = nil }
+            Button(role: .cancel) { appState.pendingTerminalClose = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
         } message: {
             Text(L10n.text("The session running inside the sandbox will be terminated. Files it wrote are kept."))
         }
@@ -1856,14 +1910,16 @@ struct ChatSidebar: View {
                                         set: { if !$0 { appState.pendingRename = nil } }),
                    presenting: appState.pendingRename) { id in
                 TextField("Name", text: $renameDraft)
-                Button("Rename") {
+                Button {
                     appState.renameSession(id, to: renameDraft)
                     appState.pendingRename = nil
-                }
+                } label: { Text("Rename")
+                    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
-                Button("Cancel", role: .cancel) { appState.pendingRename = nil }
+                Button(role: .cancel) { appState.pendingRename = nil } label: { Text("Cancel")
+                    .font(.app(.body)) }
             } message: { _ in
-                Text("Leave it empty to go back to the automatic name.")
+                Text("Leave it empty to go back to the automatic name.").font(.app(.body))
             }
     }
 
@@ -1918,9 +1974,12 @@ struct ChatSidebar: View {
                                   badge: Int = 0) -> some View {
         HStack(spacing: 7) {
             Image(systemName: icon)
-                .font(.app(.callout, weight: .medium))
+                .font(.app(.rowTitle, weight: .medium))
                 .frame(width: 16)
-            Text(L10n.text(title)).font(.app(.subheadline).weight(.medium))
+            // `rowTitle`, regular weight like a native sidebar; the selected
+            // row is marked by its background, not its weight.
+            Text(L10n.text(title))
+                .font(.app(.rowTitle))
             Spacer(minLength: 4)
             if badge > 0 {
                 Text("\(badge)")
@@ -2279,13 +2338,14 @@ struct ChatDetailView: View {
             Text(L10n.format("Not available on %@", AppleFoundationChat.displayName))
         } else {
             Text(L10n.format("Set by %@", agentName))
-            Button("Edit Agent…") {
+            Button {
                 // ON that agent — the window otherwise opens on whoever sorts
                 // first, which is the wrong one every time you got here from a
                 // card that just named a different name.
                 guard let id = activeAgent?.id else { return }
                 appState.openAgentSettings(id, using: openWindow)
-            }
+            } label: { Text("Edit Agent…")
+                .font(.app(.body)) }
         }
     }
 
@@ -2331,10 +2391,10 @@ struct ChatDetailView: View {
     @ViewBuilder private var reasoningEffortMenu: some View {
         Picker("Reasoning", selection: $reasoningEffort) {
             ForEach(ReasoningEffort.allCases) { effort in
-                Text(L10n.text(effort.label)).tag(effort)
+                Text(L10n.text(effort.label)).font(.app(.body)).tag(effort)
             }
         }
-        .pickerStyle(.inline)
+        .pickerStyle(.inline).font(.app(.body))
     }
 
     /// One wrench: CLICK flips the tool loop, secondary-click opens the per-tool
@@ -2383,7 +2443,10 @@ struct ChatDetailView: View {
         // Re-arm the approval gate every time the user re-enters Agent mode.
         // "Always allow this session" decays here — for THIS tab only; other
         // tabs keep their decision.
-        if !on { toolAllowList.rearm(sessionId) }
+        if !on {
+            toolAllowList.rearm(sessionId)
+            chatEngine.revokeTools(sessionId: sessionId)
+        }
     }
 
     // MARK: Per-chat tool switches
@@ -2429,7 +2492,7 @@ struct ChatDetailView: View {
     @ViewBuilder
     private var toolMenuContent: some View {
         if appState.useAppleModel {
-            Text("\(AppleFoundationChat.displayName): browse and search only — its \(AppleFoundationChat.contextTokens)-token window has no room for the rest.")
+            Text("\(AppleFoundationChat.displayName): browse and search only — its \(AppleFoundationChat.contextTokens)-token window has no room for the rest.").font(.app(.body))
         }
         ForEach(AgentToolGroup.allCases, id: \.self) { group in
             let tools = group.tools.filter { !appState.useAppleModel || AppleFoundationChat.allowedTools.contains($0) }
@@ -2458,13 +2521,14 @@ struct ChatDetailView: View {
         }
 
         Divider()
-        Button("Workspace…") {
+        Button {
             if let picked = WorkspacePicker.pickDirectory() {
                 workingDirectoryBinding.wrappedValue = picked
             }
-        }
+        } label: { Text("Workspace…")
+            .font(.app(.body)) }
         .disabled(isExternalBridgeSession)
-        Text(L10n.text(session?.workingDirectory ?? "No workspace set"))
+        Text(L10n.text(session?.workingDirectory ?? "No workspace set")).font(.app(.body))
     }
 
     /// Flip MCP for this chat — the Telegram bridge writes the shared config it
@@ -2508,7 +2572,8 @@ struct ChatDetailView: View {
 
     @ViewBuilder
     private var mcpMenuContent: some View {
-        Button("MCP Marketplace…") { showMCPMarketplace = true }
+        Button { showMCPMarketplace = true } label: { Text("MCP Marketplace…")
+            .font(.app(.body)) }
     }
 
     /// A conversation with nothing in it yet. Rendered instead of an empty
@@ -2722,7 +2787,7 @@ struct ChatDetailView: View {
                     .padding(.horizontal, ChatMetrics.gutter)
                     .padding(.vertical, 20)
                 }
-                .sheet(item: $modelSettings) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
+                .sheet(item: $modelSettings) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server).environmentObject(appState.downloads) }
                 // Transcript text used to run straight into the floating model
                 // picker. The toolbar band's own full-width background stays
                 // hidden (the cluster carries its own material — that's what
@@ -3064,16 +3129,18 @@ struct ChatDetailView: View {
             // suppresses the suggestion for the rest of the chat, which is
             // not something to hand to a reflex.
             .keyboardShortcut(.defaultAction)
-            Button("Send Anyway") {
+            Button {
                 intentSuppress.suppress(prompt, for: sessionId)
                 pendingIntentPrompt = nil
                 proceedSend()
-            }
-            Button("Cancel", role: .cancel) { pendingIntentPrompt = nil }
+            } label: { Text("Send Anyway")
+                .font(.app(.body)) }
+            Button(role: .cancel) { pendingIntentPrompt = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
         } message: { prompt in
             Text(prompt == .mcp
                  ? "This looks like it needs one of your MCP servers, but MCP mode is off. Enable it so those tools are available?"
-                 : "This looks like a task for the agent (creating files, running commands, browsing the web…), but Tools is off. Turn it on so the model can use them?")
+                 : "This looks like a task for the agent (creating files, running commands, browsing the web…), but Tools is off. Turn it on so the model can use them?").font(.app(.body))
         }
         // Persist the toolbar toggles back onto the visible session so each tab
         // remembers its own Think/Agent/MCP choice. Telegram sessions write the
@@ -3516,9 +3583,10 @@ struct ChatDetailView: View {
     private var videoSupported: Bool { server.chatModelInfo?.supportsVideo ?? false }
 
     /// Convert pending videos to a ChatVideo array, clearing the list.
+    /// Written on SEND like the pictures (`AttachmentStore.storedVideo`).
     private func consumePendingVideos() -> [ChatVideo]? {
         guard !pendingVideos.isEmpty else { return nil }
-        let videos = pendingVideos
+        let videos = pendingVideos.map { AttachmentStore.storedVideo($0) }
         pendingVideos = []
         return videos
     }
@@ -3970,7 +4038,7 @@ struct ChatDetailView: View {
         }
 
         chatEngine.runTurn(sessionId: sessionId, userText: text,
-                           images: attachedImages, audio: attachedAudio,
+                           images: attachedImages, videos: attachedVideos, audio: attachedAudio,
                            config: buildTurnConfig(),
                            approval: { await requestToolApproval($0) })
         // Your own message always wins: sending from halfway up the history used
@@ -4549,17 +4617,8 @@ struct MessageBubble: View {
                                     .padding(.vertical, 8)
                                     .background(.quaternary.opacity(0.4))
                                     .clipShape(RoundedRectangle(cornerRadius: 8))
-                            } else if let nsImage = NSImage(data: img.data) {
-                                // `.fill`: the rounded corners clip the frame,
-                                // so a letterboxed picture keeps square corners.
-                                Image(nsImage: nsImage)
-                                    .resizable()
-                                    .aspectRatio(contentMode: .fill)
-                                    .frame(width: ChatImagePreview.displayWidth(for: nsImage),
-                                           height: ChatMetrics.attachmentHeight)
-                                    .clipShape(RoundedRectangle(cornerRadius: 10))
-                                    .onTapGesture(count: 2) { ChatImagePreview.openInPreview(img) }
-                                    .help("Double-click to open in Preview")
+                            } else {
+                                AttachmentImageCell(image: img)
                             }
                         }
                     }
@@ -4647,7 +4706,8 @@ struct MessageBubble: View {
                                             .controlSize(.mini)
                                             .colorScheme(.dark)
                                     } else {
-                                        Button(L10n.text(isFolded ? "Show more" : "Show less")) { toggleLongTurn() }
+                                        Button { toggleLongTurn() } label: { Text(L10n.text(isFolded ? "Show more" : "Show less"))
+                                            .font(.app(.body)) }
                                             .buttonStyle(.plain)
                                             .font(.app(.caption).weight(.medium))
                                             .foregroundStyle(.white.opacity(0.8))
@@ -4730,7 +4790,8 @@ struct MessageBubble: View {
         .onHover { isHovered = $0 }
         .contextMenu {
             if !message.content.isEmpty {
-                Button("Copy Message") { copyMessage() }
+                Button { copyMessage() } label: { Text("Copy Message")
+                    .font(.app(.body)) }
             }
             if onEdit != nil, !message.content.isEmpty {
                 // Named for what it DOES: editing your own message re-asks the
@@ -4738,13 +4799,15 @@ struct MessageBubble: View {
                 Button(message.role == .user ? "Edit & Resend" : "Edit Reply") { startEditing() }
             }
             if onRegenerate != nil {
-                Button("Regenerate") { onRegenerate?() }
+                Button { onRegenerate?() } label: { Text("Regenerate")
+                    .font(.app(.body)) }
             }
             if let onFork {
                 // Between the two destructive answers and Delete: a fork keeps
                 // BOTH branches, so it belongs next to the ones that don't.
                 Divider()
-                Button("Branch Chat From Here", action: onFork)
+                Button(action: onFork, label: { Text("Branch Chat From Here")
+                    .font(.app(.body)) })
             }
             if onDelete != nil {
                 // A reply takes the model's whole turn with it (`ChatTurn`).
@@ -4785,12 +4848,14 @@ struct MessageBubble: View {
                 .shadow(color: Color.black.opacity(0.25), radius: 6, x: 0, y: 3) // Depth
 
             HStack(spacing: 8) {
-                Button("Cancel") { cancelEdit() }
+                Button { cancelEdit() } label: { Text("Cancel")
+                    .font(.app(.body)) }
                     .buttonStyle(.plain)
                     .foregroundStyle(.secondary)
                     .keyboardShortcut(.cancelAction)
 
-                Button("Save") { commitEdit() }
+                Button { commitEdit() } label: { Text("Save")
+                    .font(.app(.body)) }
                     .buttonStyle(.borderedProminent)
                     .disabled(!ComposerKey.editCanSubmit(editDraft))
             }
@@ -5649,10 +5714,11 @@ struct MarkdownText: View {
         }
         .frame(maxWidth: .infinity, alignment: .leading)
         .contextMenu {
-            Button("Copy All") {
+            Button {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(source, forType: .string)
-            }
+            } label: { Text("Copy All")
+                .font(.app(.body)) }
         }
     }
 
@@ -6533,10 +6599,11 @@ fileprivate struct DisplayLaTeXView: View {
             }
             .frame(maxWidth: .infinity, alignment: .leading)
             .contextMenu {
-                Button("Copy Equation") {
+                Button {
                     NSPasteboard.general.clearContents()
                     NSPasteboard.general.setString(raw, forType: .string)
-                }
+                } label: { Text("Copy Equation")
+                    .font(.app(.body)) }
             }
         } else {
             SelectableMarkdownNSText(attributed: NSAttributedString(

@@ -22,6 +22,12 @@ class ServerManager: ObservableObject {
     /// else the local default. Every chat surface reads THIS, never
     /// `modelInfo?.name` directly, so a LAN selection applies everywhere.
     var chatModelId: String? { lanChatModelId ?? residentChatModel?.name }
+    /// The model a chat REQUEST names: the picker's selection, the local pick by
+    /// PATH (the server cold-loads it, or waits out a load in flight). Never the
+    /// bare alias while something is picked: a headless server has no default.
+    func chatRequestModelId(selectedPath: String) -> String? {
+        lanChatModelId ?? (selectedPath.isEmpty ? residentChatModel?.name : selectedPath)
+    }
     /// Metadata for the chat model (context length, vision, architecture):
     /// the LAN entry when one is selected and discovered, else the local
     /// model that can actually hold a conversation.
@@ -29,6 +35,8 @@ class ServerManager: ObservableObject {
         if let lan = lanChatModelId, let info = allModels.first(where: { $0.name == lan }) { return info }
         return residentChatModel
     }
+    /// This server answers the chat (no provider, no LAN peer), so its generation defaults apply.
+    var chatIsLocal: Bool { chatModelInfo?.provider == nil && lanChatModelId == nil }
     /// The local entry that can ANSWER a chat request. Also the benchmark
     /// target: `modelInfo` is whatever loaded first (an image model counts),
     /// and a LAN entry would measure another Mac under this one's hardware row.
@@ -183,6 +191,12 @@ class ServerManager: ObservableObject {
     /// carries `--model`/`--model-dir`; this wires the env, stderr capture,
     /// termination handler, and health polling.
     private func launch(args: [String], options: ServerOptions) {
+        do { try GenerationDefaultsFile.migrate(options) }
+        catch {
+            lastError = "Could not save generation defaults: \(error.localizedDescription)"
+            status = .error(lastError)
+            return
+        }
         port = options.port
         api.host = options.host
         status = .starting
@@ -669,8 +683,8 @@ class ServerManager: ObservableObject {
     /// `setDefault` = a model SWITCH: the server re-points its default, so
     /// the refreshed list sorts the new model first (`modelInfo` follows) and
     /// aliased requests route to it — the parts a restart used to provide.
-    func loadModel(id: String, drafterPath: String? = nil, setDefault: Bool = false) async throws -> ModelInfo {
-        let info = try await api.loadModel(port: port, id: id, drafterPath: drafterPath, setDefault: setDefault)
+    func loadModel(id: String, setDefault: Bool = false) async throws -> ModelInfo {
+        let info = try await api.loadModel(port: port, id: id, setDefault: setDefault)
         // A switch moves what the process is serving without restarting it;
         // keep `currentModelPath` honest for the readers that gate on it
         // (TaskScheduler's pinned-model check, TestServer's status).

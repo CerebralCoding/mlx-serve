@@ -1,25 +1,14 @@
 import SwiftUI
 import AppKit
 
-/// The app's type ladder: macOS's own text styles, each snapped to a whole even
-/// point and never below `floor`.
+/// The app's type ladder: macOS's own text styles, never below `floor`.
 ///
-/// Fixed on purpose, and the reason is measured rather than stylistic. macOS
-/// has no dynamic type: `NSFont.preferredFont(forTextStyle:)` hands the same
-/// numbers to every user, and `.dynamicTypeSize(_:)` does not move a semantic
-/// font here at all — a `Text` at `.body` renders the same height under
-/// `.xSmall` and under `.accessibility4`, because that environment is an iOS
-/// one. Naming a system style therefore buys ONE VOCABULARY, not scaling, and
-/// the numbers below are where that vocabulary comes from: each system size,
-/// taken once, with the odd steps moved up a point and nothing under 10.
-///
-/// Two steps collapse onto each other, and that is the price of even-only:
-/// `body`/`headline` both land on 14, and `subheadline` joins `callout` at 12.
-/// The names still differ because the roles differ — a heading is still a
-/// heading when the system's heading grows.
+/// macOS has no dynamic type (`.dynamicTypeSize` does not move a semantic font
+/// here), so the numbers come from this table. They are the platform's, so the
+/// app sits at the same size as Notes or Finder; only the 10pt steps are raised.
 enum AppType {
     /// No text in the app renders smaller than this.
-    static let floor: CGFloat = 10
+    static let floor: CGFloat = 11
 
     /// Every step, with the macOS size it was derived from. The `system` column
     /// is what the ladder is anchored to: `SystemTypeTests` fails when macOS
@@ -28,15 +17,15 @@ enum AppType {
     static let table: [(style: Font.TextStyle, system: CGFloat, pointSize: CGFloat)] = [
         (.largeTitle,  26, 26),
         (.title,       22, 22),
-        (.title2,      17, 18),
-        (.title3,      15, 16),
-        (.headline,    13, 14),
-        (.body,        13, 14),
+        (.title2,      17, 17),
+        (.title3,      15, 15),
+        (.headline,    13, 13),
+        (.body,        13, 13),
         (.callout,     12, 12),
-        (.subheadline, 11, 12),
-        (.footnote,    10, 10),
-        (.caption,     10, 10),
-        (.caption2,    10, 10),
+        (.subheadline, 11, 11),
+        (.footnote,    10, 11),
+        (.caption,     10, 11),
+        (.caption2,    10, 11),
     ]
 
     /// The point size a step renders at.
@@ -44,10 +33,55 @@ enum AppType {
         table.first { $0.style == style }?.pointSize ?? floor
     }
 
-    /// May the app render text at this size? The two rules the ladder keeps:
-    /// whole even points, and never under `floor`.
+    /// May the app render text at this size? Whole points, never under `floor`.
     static func isLegal(_ size: CGFloat) -> Bool {
-        size >= floor && size.truncatingRemainder(dividingBy: 2) == 0
+        size >= floor && size == size.rounded()
+    }
+
+    /// What a piece of text IS, which is what picks its step. Without this the
+    /// ladder has a floor and a rule and no way to say "an explainer is not a
+    /// caption", and every view picks the smallest step it can — which is how
+    /// the settings prose ended up at 10pt in the first place.
+    ///
+    /// The steps, read as a scale rather than as a menu: page > section > row >
+    /// supporting > annotation. `Font.app(_:)` takes the step directly; this is
+    /// the sentence that says which one a given piece of copy wants.
+    enum Role {
+        /// A window's own name. Once per window.
+        case pageTitle
+        /// A pane or sheet's heading.
+        case sectionTitle
+        /// The name of one setting, row, model or item.
+        case rowTitle
+        /// A sentence under a row that says what it does. The one that was too
+        /// small: prose the user reads on purpose, not a label.
+        case explainer
+        /// A value, a status, a cost, a count.
+        case value
+        /// A badge, a unit, a qualifier next to something bigger.
+        case annotation
+
+        /// The step this role takes.
+        var step: Font.TextStyle {
+            switch self {
+            case .pageTitle:   return .largeTitle
+            // `.title3`, not `.headline`: seventeen sheet and section headings
+            // already sit there, and a pane title cannot be smaller than them.
+            case .sectionTitle: return .title3
+            case .rowTitle:    return .body
+            case .explainer:   return .callout
+            case .value:       return .callout
+            case .annotation:  return .footnote
+            }
+        }
+    }
+}
+
+extension Font {
+    /// The ladder, by role: the step says what the text IS, so two views that
+    /// mean the same thing cannot pick two different sizes.
+    static func app(_ role: AppType.Role, weight: Font.Weight? = nil, design: Font.Design? = nil) -> Font {
+        .app(role.step, weight: weight, design: design)
     }
 }
 

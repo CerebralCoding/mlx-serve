@@ -41,6 +41,38 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 
+test "format corpus: late system notes never vanish or rewrite supported history" {
+    const templates = [_]struct { source: []const u8, in_place: bool }{
+        .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/qwen38_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/inkling_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/muse_chat_template.jinja"), .in_place = true },
+        .{ .source = @embedFile("fixtures/dsv4_chat_template.jinja"), .in_place = true },
+        .{ .source = "{% for m in messages %}{% if m.role == 'system' and not loop.first %}{{ raise_exception('system must be first') }}{% endif %}{{ m.role + ':' + (m.content or '') + ';' }}{% endfor %}", .in_place = false },
+    };
+    for (templates) |template| {
+        const config = chat.ChatConfig{ .chat_template = template.source, .bos_token = "<bos>", .eos_token = "<|im_end|>", .add_bos_token = false, .allocator = testing.allocator };
+        const messages = [_]chat.Message{
+            .{ .role = "system", .content = "stable instructions" },
+            .{ .role = "user", .content = "corpus question marker" },
+            .{ .role = "system", .content = "corpus runtime note marker" },
+            .{ .role = "assistant", .content = "corpus answer marker" },
+            .{ .role = "user", .content = "corpus next question marker" },
+            .{ .role = "system", .content = "corpus newer note marker" },
+        };
+        const first = try chat.renderChatTemplate(testing.allocator, messages[0..3], &config, null, null, true, null, false);
+        defer testing.allocator.free(first);
+        const next = try chat.renderChatTemplate(testing.allocator, &messages, &config, null, null, true, null, false);
+        defer testing.allocator.free(next);
+        const q = std.mem.indexOf(u8, first, "corpus question marker").?;
+        const n = std.mem.indexOf(u8, first, "corpus runtime note marker").?;
+        try testing.expect(std.mem.indexOf(u8, next, "corpus runtime note marker") != null);
+        try testing.expect(std.mem.indexOf(u8, next, "corpus newer note marker") != null);
+        try testing.expectEqual(template.in_place, n > q);
+        if (template.in_place) try testing.expect(std.mem.startsWith(u8, next, first[0 .. n + "corpus runtime note marker".len]));
+    }
+}
+
 test "format corpus: MTP cost profiles classify full target tensor surfaces" {
     const Case = struct {
         bits: u32,
@@ -119,6 +151,8 @@ const Expect = struct {
     /// what it receives — fragmentary content writes a corrupt file
     /// "successfully").
     tool_arg_absent: ?[]const u8 = null,
+    /// Expect this key in the first call's arguments to be a JSON object.
+    tool_object_key: ?[]const u8 = null,
     /// Expected name of the LAST parsed tool call (pins per-call name repair
     /// in multi-call outputs — e.g. the Inkling marker-echoed payload name).
     last_tool_name: ?[]const u8 = null,
@@ -138,6 +172,11 @@ const edit_tool_schema =
 /// oldText/newText — which is what makes a buried `path` provably misplaced.
 const pi_edit_tool_schema =
     \\[{"type":"function","function":{"name":"edit","description":"Edit a file","parameters":{"type":"object","properties":{"path":{"type":"string","description":"Path to the file to edit (relative or absolute)"},"edits":{"type":"array","items":{"type":"object","properties":{"oldText":{"type":"string"},"newText":{"type":"string"}},"required":["oldText","newText"]},"description":"One or more targeted replacements."}},"required":["path","edits"]}}}]
+;
+
+/// fx's shell tool: `request` is a discriminated union (no top-level "type").
+const fx_shell_tool_schema =
+    \\[{"type":"function","function":{"name":"shell","parameters":{"type":"object","properties":{"request":{"oneOf":[{"type":"object","properties":{"action":{"const":"run"},"command":{"type":"string"}},"required":["action","command"]},{"type":"object","properties":{"action":{"const":"cancel"}},"required":["action"]}]}},"required":["request"]}}}]
 ;
 
 /// Weather tool with a boolean arg — used by the LIVE Hy3 capture to pin the
@@ -384,6 +423,22 @@ const corpus = [_]Expect{
         .tool_arg_value = "a.txt",
         .tool_count = 2,
         .last_tool_arg_value = "b.txt",
+    },
+    .{
+        // DeepSeek-V4.1 spells every DSML tag name with a leading space.
+        .family = "dsv41-dsml",
+        .name = "V4.1 spaced DSML tags after thinking",
+        .raw = "The user wants weather.</think>I'll check.\n\n<｜DSML｜ calls>\n" ++
+            "<｜DSML｜ invoke name=\"get_weather\">\n" ++
+            "<｜DSML｜ parameter name=\"city\" string=\"true\">Paris</｜DSML｜ parameter>\n" ++
+            "<｜DSML｜ parameter name=\"days\" string=\"false\">3</｜DSML｜ parameter>\n" ++
+            "</｜DSML｜ invoke>\n</｜DSML｜ calls>",
+        .thinking = true,
+        .opened_by_template = true,
+        .reasoning_contains = "wants weather",
+        .tool_name = "get_weather",
+        .tool_arg_key = "city",
+        .tool_arg_value = "Paris",
     },
     .{
         .family = "dsv4-dsml",
@@ -767,6 +822,16 @@ const corpus = [_]Expect{
         .tool_arg_key = "command",
         .tool_arg_value = "ls -la",
     },
+    .{
+        // #748: the `>` after the function name is missing, so a `>`-scan ran
+        // into the next tag and shipped the name `read_file\n</parameter`.
+        .family = "hermes",
+        .name = "function name with a missing > ends at the line break",
+        .raw = "<tool_call>\n<function=read_file\n<parameter=path>\n./notes.md\n</parameter>\n</function>\n</tool_call>",
+        .tool_name = "read_file",
+        .tool_arg_key = "path",
+        .tool_arg_value = "./notes.md",
+    },
     // ── Schema-declared argument types (value-spelling inference class) ──────
     // Class: the tag formats carry NO type information, so the parser infers it
     // from the value's SPELLING (`isJsonLiteral`) — and guesses wrong in both
@@ -841,6 +906,17 @@ const corpus = [_]Expect{
         .tools_json = edit_tool_schema,
         .tool_bool_key = "replace_all",
         .tool_bool_value = true,
+    },
+    .{
+        // A container param declared as a oneOf union has no top-level "type":
+        // fx's `shell.request` shipped as a JSON STRING and fx refused every call.
+        .family = "qwen",
+        .name = "object param declared as a oneOf union is not left a string",
+        .raw = "<tool_call>\n<function=shell>\n<parameter=request>\n{\"action\": \"run\", \"command\": \"ls\"}\n</parameter>\n" ++
+            "</function>\n</tool_call>",
+        .tool_name = "shell",
+        .tools_json = fx_shell_tool_schema,
+        .tool_object_key = "request",
     },
     // ── Misplaced required param (buried-`path` class) ──────────────────────
     // Class: a weak model that has internalized "the edit object holds everything
@@ -1872,6 +1948,10 @@ test "format corpus: recorded model outputs across families" {
                 if (std.mem.indexOf(u8, tc.name, "<|") != null) {
                     try fail(entry, "tool NAME carries a channel marker", tc.name);
                 }
+                // A tool name never spans a line or a tag (#748).
+                if (tc.name.len == 0 or std.mem.indexOfAny(u8, tc.name, "\n\r<>") != null) {
+                    try fail(entry, "tool NAME is empty or carries a line break or markup", tc.name);
+                }
                 const parsed = std.json.parseFromSlice(std.json.Value, allocator, tc.arguments, .{}) catch {
                     try fail(entry, "tool arguments are not valid JSON", tc.arguments);
                     unreachable;
@@ -1910,6 +1990,12 @@ test "format corpus: recorded model outputs across families" {
                 if (val != .bool or val.bool != entry.tool_bool_value.?) {
                     try fail(entry, "boolean arg is not the expected JSON boolean", cs[0].arguments);
                 }
+            }
+            if (entry.tool_object_key) |key| {
+                const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});
+                defer parsed.deinit();
+                const val = parsed.value.object.get(key);
+                if (val == null or val.? != .object) try fail(entry, "arg is not a JSON object", cs[0].arguments);
             }
             if (entry.tool_arg_absent) |key| {
                 const parsed = try std.json.parseFromSlice(std.json.Value, allocator, cs[0].arguments, .{});
@@ -2095,7 +2181,7 @@ fn specialMarkerLenAt(s: []const u8) ?usize {
 }
 
 test "format corpus: reasoning streamed mid-thought is a prefix of the delivered reasoning" {
-    // Replay of the tools-path stream order both SSE handlers use, byte by byte
+    // Replay of the tools-path stream order every SSE handler uses, byte by byte
     // except `<|…>` markers, which are special tokens and arrive whole:
     // tool hold first, then the think gate; `.hold_thinking` streams the
     // unsent tail of the split so far. A delta cannot be retracted, so every

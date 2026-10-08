@@ -2,14 +2,12 @@ const std = @import("std");
 const builtin = @import("builtin");
 
 comptime {
-    // 0.17.0 isn't tagged stable yet (homebrew still ships 0.16.0) — a nightly
-    // build from ziglang.org/download is required until it is. 0.16.0's
-    // bundled libc++ fails to compile against the macOS 27 beta SDK
+    // 0.16.0's bundled libc++ fails to compile against the macOS 27 SDK
     // (`use of undeclared identifier 'INFINITY'` in its vendored <random>);
-    // fixed upstream by 0.17.0-dev, which is why the floor moved.
+    // fixed in 0.17.0, which is why the floor moved.
     if (builtin.zig_version.major == 0 and builtin.zig_version.minor < 17) {
         @compileError(std.fmt.comptimePrint(
-            "mlx-serve requires Zig 0.17 (nightly until 0.17.0 stable ships) (have {d}.{d}.{d}). Grab a nightly from https://ziglang.org/download/.",
+            "mlx-serve requires Zig 0.17 (have {d}.{d}.{d}). Run ./scripts/fetch-zig.sh or grab it from https://ziglang.org/download/.",
             .{ builtin.zig_version.major, builtin.zig_version.minor, builtin.zig_version.patch },
         ));
     }
@@ -123,12 +121,22 @@ pub fn build(b: *std.Build) void {
     // src/ane_stub.c on Linux. The stub selection reads this option, NOT `ios`
     // — `ios` keeps its own meaning (low-mem policy, sandboxing assumptions).
     build_options.addOption(bool, "macos_engines", true);
+    // DeepSeek-V4.1's EXL3 repack through mlx-stream (macOS only; Linux and iOS build the stub).
+    build_options.addOption(bool, "mlx_stream", true);
+    // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
+    // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
+    build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
 
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
     // named module so src/arch/ds4.zig can import them with `@import("ds4_metal_sources")`
     // without traversing the project root.
     const ds4_metal_sources = b.createModule(.{
         .root_source_file = b.path("lib/ds4_metal_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
+    const mlx_steel_sources = b.createModule(.{
+        .root_source_file = b.path("lib/mlx_steel_sources.zig"),
         .target = target,
         .optimize = optimize,
     });
@@ -151,6 +159,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
@@ -171,11 +180,13 @@ pub fn build(b: *std.Build) void {
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
     mod.addIncludePath(b.path("lib"));
 
-    // xatlas UV unwrapping (MIT, vendored amalgamation) + C shim for the
-    // Hunyuan3D texture paint stage. See lib/xatlas/xatlas_shim.h + src/uvwrap.zig.
+    // xatlas UV unwrapping + FQMS decimation (MIT, vendored) with C shims for the
+    // Hunyuan3D texture paint stage. See lib/{xatlas,fqms} + src/{uvwrap,mesh_simplify}.zig.
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addIncludePath(b.path("lib/xatlas"));
+    mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addIncludePath(b.path("lib/fqms"));
 
     // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
     // `lib/ds4/` submodule pinned at 9139e2a and `src/arch/ds4.zig`. Kernel
@@ -194,6 +205,9 @@ pub fn build(b: *std.Build) void {
     // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained
     // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
     addLlamaLib(b, mod);
+    addGgufModule(b, mod, target, optimize);
+    addExl3Module(b, mod, target, optimize);
+    addMlxStreamModule(b, mod, target, optimize);
 
     // mlx + mlx-c: self-built from the pinned submodules (lib/mlx-src,
     // lib/mlxc-src) into lib/mlx by scripts/build-mlx.sh, with NAX kernels
@@ -240,6 +254,7 @@ pub fn build(b: *std.Build) void {
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
             .{ .name = "ds4_metal_sources", .module = ds4_metal_sources },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
@@ -256,10 +271,15 @@ pub fn build(b: *std.Build) void {
     test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     test_mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     test_mod.addIncludePath(b.path("lib/xatlas"));
+    test_mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    test_mod.addIncludePath(b.path("lib/fqms"));
     addDs4Sources(b, test_mod);
     test_mod.addIncludePath(b.path("lib/ds4"));
     addAneSources(b, test_mod);
     addLlamaLib(b, test_mod);
+    addGgufModule(b, test_mod, target, optimize);
+    addExl3Module(b, test_mod, target, optimize);
+    addMlxStreamModule(b, test_mod, target, optimize);
     test_mod.linkSystemLibrary("c++", .{});
     addMlxLib(b, test_mod);
     test_mod.addIncludePath(.{ .cwd_relative = "/opt/homebrew/include" });
@@ -298,6 +318,18 @@ pub fn build(b: *std.Build) void {
     }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    {
+        const t = addMlxStreamTests(b, target, optimize, test_filter, macos_sdk_frameworks, "src/tests.zig", "mlx-stream-test");
+        test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
+        const run = b.addRunArtifact(t);
+        test_step.dependOn(&run.step);
+        b.step("mlx-stream-test", "Run the mlx-stream plugin's tests").dependOn(&run.step);
+        // Its own binary (the last test checks that nothing in it created a Metal device), outside `zig build test`:
+        // it recompiles every plugin file's tests.
+        const conf = b.addRunArtifact(addMlxStreamTests(b, target, optimize, null, macos_sdk_frameworks, "src/conformance.zig", "mlx-stream-conformance"));
+        conf.setEnvironmentVariable("MLX_DEFAULT_DEVICE", "cpu");
+        b.step("mlx-stream-conformance", "Run the mlx-stream plugin's conformance suite (CPU lane, no device)").dependOn(&conf.step);
+    }
 
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //
@@ -377,6 +409,10 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
     build_options.addOption(bool, "macos_engines", false);
+    build_options.addOption(bool, "mlx_stream", false);
+    // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
+    // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
+    build_options.addOption(bool, "slow_tests", b.option(bool, "slow-tests", "Also run the slow corpus-replay and benchmark tests") orelse false);
 
     const opencode2_plugin = b.createModule(.{
         .root_source_file = b.path("lib/opencode2_plugin.zig"),
@@ -388,6 +424,11 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .target = target,
         .optimize = optimize,
     });
+    const mlx_steel_sources = b.createModule(.{
+        .root_source_file = b.path("lib/mlx_steel_sources.zig"),
+        .target = target,
+        .optimize = optimize,
+    });
 
     const mod = b.createModule(.{
         .root_source_file = b.path("src/main.zig"),
@@ -396,6 +437,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .link_libcpp = true,
         .imports = &.{
             .{ .name = "build_options", .module = build_options.createModule() },
+            .{ .name = "mlx_steel_sources", .module = mlx_steel_sources },
             .{ .name = "opencode2_plugin", .module = opencode2_plugin },
             .{ .name = "agent_skills", .module = agent_skills },
             .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
@@ -406,6 +448,8 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
 
     // Jinja2 template engine — same vendored sources as the macOS graph, built
     // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
+    addGgufModule(b, mod, target, optimize);
+    addExl3Module(b, mod, target, optimize);
     mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
     mod.addIncludePath(b.path("lib/jinja_cpp"));
 
@@ -417,6 +461,8 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addIncludePath(b.path("lib/xatlas"));
+    mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addIncludePath(b.path("lib/fqms"));
 
     // ANE offload C ABI → unavailable stubs on Linux (src/ane_stub.c); ane.zig
     // compiles unchanged and gates itself off via available() == false.
@@ -560,6 +606,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     // member named 'mas'/...").
     ios_options.addOption(bool, "mas", true);
     ios_options.addOption(bool, "macos_engines", false);
+    ios_options.addOption(bool, "mlx_stream", false);
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
     ios_options.addOption([]const u8, "llama_tag", "unknown");
@@ -575,6 +622,8 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
             .{ .name = "build_options", .module = ios_options.createModule() },
         },
     });
+    addGgufModule(b, mod, ios_target, .ReleaseFast);
+    addExl3Module(b, mod, ios_target, .ReleaseFast);
 
     // Apple cross-compiles don't auto-resolve the SDK's libc/frameworks from
     // --sysroot alone, so wire them explicitly (resolved per slice via xcrun).
@@ -611,6 +660,8 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addIncludePath(b.path("lib/xatlas"));
+    mod.addCSourceFile(.{ .file = b.path("lib/fqms/fqms_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
+    mod.addIncludePath(b.path("lib/fqms"));
 
     const lib = b.addLibrary(.{
         .name = "mlxserve",
@@ -737,6 +788,114 @@ fn readLlamaTag(b: *std.Build) ?[]const u8 {
     return if (trimmed.len == 0) null else b.dupe(trimmed);
 }
 
+/// lib/mlx-serve-gguf: GGUF files served on MLX (no llama.cpp). It reaches
+/// MLX through `host.mlx`, so the host root file must expose `pub const mlx`.
+/// `-Dgguf-dir=/abs/path` builds against a checkout instead of the submodule.
+fn addGgufModule(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const gguf = b.createModule(.{
+        .root_source_file = ggufRoot(b),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_host", .module = host }},
+    });
+    host.addImport("mlx_serve_gguf", gguf);
+}
+
+/// `b.option` may be declared once; the graphs share this answer.
+var gguf_root: ?std.Build.LazyPath = null;
+fn ggufRoot(b: *std.Build) std.Build.LazyPath {
+    if (gguf_root) |r| return r;
+    const dir = b.option([]const u8, "gguf-dir", "mlx-serve-gguf checkout to build against (default: lib/mlx-serve-gguf)");
+    gguf_root = if (dir) |d| .{ .cwd_relative = b.pathJoin(&.{ d, "src/root.zig" }) } else b.path("lib/mlx-serve-gguf/src/root.zig");
+    return gguf_root.?;
+}
+
+/// mlx-stream (its own repo, `-Dmlx-stream-dir=/abs/path`): DeepSeek-V4.1's EXL3
+/// streaming repack on the plugin's own arch and kernels (`src/arch/mlx_stream.zig`).
+/// Its contract types are its own `sdk` module; both reach the host through `mlx_host`.
+fn addMlxStreamModule(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    host.addImport("mlx_stream", mlxStreamPkg(b, host, mlxStreamDir(b), "src/root.zig", target, optimize, false));
+}
+
+fn mlxStreamPkg(b: *std.Build, host: *std.Build.Module, dir: []const u8, root: []const u8, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, inject: bool) *std.Build.Module {
+    const sdk = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ dir, "sdk/root.zig" }) },
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_host", .module = host }},
+    });
+    const m = b.createModule(.{
+        .root_source_file = .{ .cwd_relative = b.pathJoin(&.{ dir, root }) },
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{ .{ .name = "mlx_host", .module = host }, .{ .name = "sdk", .module = sdk } },
+    });
+    // The read pool (pthreads, pread into slot rows), its MTLSharedEvent signal (non-ARC objc), and the MLX
+    // event / alloc shims, which include the staged MLX's private headers and link libmlx.
+    const csrc = b.pathJoin(&.{ dir, "csrc" });
+    const c: []const []const u8 = if (inject) &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread", "-DQ3LD_INJECT" } else &.{ "-O2", "-std=c11", "-Wall", "-Wextra", "-Werror", "-pthread" };
+    const cxx: []const []const u8 = &.{ "-std=c++20", "-O2", "-D_METAL_", "-DACCELERATE_NEW_LAPACK", "-fno-sanitize=all", "-Wall", "-Wno-unused-parameter", "-Wno-deprecated-declarations" };
+    m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "q3_lookahead4_exl3.c" }) }, .flags = c });
+    m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "q3_event_shim.mm" }) }, .flags = &.{ "-O2", "-Wall", "-Wextra", "-Werror", "-fno-objc-arc" } });
+    m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "mlx_event_shim.cpp" }) }, .flags = cxx });
+    m.addCSourceFile(.{ .file = .{ .cwd_relative = b.pathJoin(&.{ csrc, "mlx_alloc_shim.cpp" }) }, .flags = cxx });
+    m.addIncludePath(.{ .cwd_relative = csrc });
+    m.addIncludePath(b.path("lib/mlx/include"));
+    m.addIncludePath(b.path("lib/mlx/include/metal_cpp"));
+    m.addIncludePath(b.path("lib/mlxc-src"));
+    m.linkSystemLibrary("mlx", .{ .use_pkg_config = .no });
+    // The shims make the server load @rpath/libmlx.dylib itself: the app bundle keeps it in Contents/Frameworks/, the
+    // CLI zip in lib/ beside the binary.
+    m.addRPath(.{ .cwd_relative = "@executable_path/../Frameworks" });
+    m.addRPath(.{ .cwd_relative = "@executable_path/lib" });
+    return m;
+}
+
+/// One of the plugin's own test roots (src/tests.zig, src/conformance.zig) over the host surface plugins import
+/// (`src/plugin_host.zig`), with the read pool's scripted faults.
+fn addMlxStreamTests(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode, filter: ?[]const u8, frameworks: ?[]const u8, root: []const u8, name: []const u8) *std.Build.Step.Compile {
+    const host = b.createModule(.{ .root_source_file = b.path("src/plugin_host.zig"), .target = target, .optimize = optimize, .link_libc = true, .link_libcpp = true });
+    addMlxLib(b, host);
+    if (frameworks) |fw| host.addFrameworkPath(.{ .cwd_relative = fw });
+    for ([_][]const u8{ "IOKit", "CoreFoundation", "Foundation", "Metal", "IOSurface" }) |f| host.linkFramework(f, .{});
+    const m = mlxStreamPkg(b, host, mlxStreamDir(b), root, target, optimize, true);
+    return b.addTest(.{ .name = name, .root_module = m, .filters = if (filter) |f| &.{f} else &.{} });
+}
+
+/// The plugin checkout: `-Dmlx-stream-dir`, else the `lib/mlx-stream` submodule. `b.option` may be declared
+/// once; the graphs share this answer.
+var mlx_stream_dir: ?[]const u8 = null;
+fn mlxStreamDir(b: *std.Build) []const u8 {
+    if (mlx_stream_dir == null) mlx_stream_dir = b.option([]const u8, "mlx-stream-dir", "mlx-stream checkout to build DeepSeek-V4.1's EXL3 repack from (default: lib/mlx-stream)") orelse
+        b.pathJoin(&.{ b.root.root_dir.path orelse ".", "lib/mlx-stream" });
+    return mlx_stream_dir.?;
+}
+
+/// lib/sushi: EXL3 routed experts, Sushi's `sushi_exl3` module. It reaches
+/// mlx, log and io_util through `mlx_host`, so the host root exposes them.
+/// `-Dsushi-dir=/abs/path` builds against a checkout instead of the submodule.
+fn addExl3Module(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
+    const exl3 = b.createModule(.{
+        .root_source_file = exl3Root(b),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+        .imports = &.{.{ .name = "mlx_host", .module = host }},
+    });
+    host.addImport("sushi_exl3", exl3);
+}
+
+var exl3_root: ?std.Build.LazyPath = null;
+fn exl3Root(b: *std.Build) std.Build.LazyPath {
+    if (exl3_root) |r| return r;
+    const dir = b.option([]const u8, "sushi-dir", "sushi checkout to build against (default: lib/sushi)");
+    exl3_root = if (dir) |d| .{ .cwd_relative = b.pathJoin(&.{ d, "src/exl3/root.zig" }) } else b.path("lib/sushi/src/exl3/root.zig");
+    return exl3_root.?;
+}
+
 fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     // Link the prebuilt libllama staged by scripts/fetch-llama.sh. The dylib's
     // install-name is @rpath/libllama.dylib; we add an rpath to its build-tree
@@ -772,11 +931,11 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/llama/lib" });
 
     // Our clean C shim over llama.h (src/llama_ffi.zig mirrors lib/llama_shim/llama_shim.h).
-    // C11 for pthread_once-based one-time backend init.
+    // C++ for llama.cpp's C++-linked NextN staging calls (MTP).
     module.addIncludePath(b.path("lib/llama_shim"));
     module.addCSourceFile(.{
-        .file = b.path("lib/llama_shim/llama_shim.c"),
-        .flags = &.{ "-O2", "-std=c11", "-Wno-unused-parameter" },
+        .file = b.path("lib/llama_shim/llama_shim.cpp"),
+        .flags = &.{ "-O2", "-std=c++17", "-Wno-unused-parameter" },
     });
 }
 

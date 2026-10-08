@@ -27,14 +27,14 @@ mlx-serve 支持这些标准 API（OpenAI、Anthropic、Ollama、OpenAI Response
 - **`mlx-serve launch <agent>`**：在终端里做同一件事，Ollama 风格：
 
 ```bash
-mlx-serve launch claude              # 可选：claude、pi、omp、opencode、opencode2、codex、hermes、aider
+mlx-serve launch claude              # 可选：claude、pi、omp、opencode、opencode2、codex、hermes、aider、fx、grok
 mlx-serve launch codex --model Qwen3.5-27B-MLX-4bit
 mlx-serve launch codex -- resume     # -- 之后的参数全部传给 agent
 ```
 
 如果没有服务器在运行，`launch` 会启动 MLX Core 应用并等待；没装该应用时它会提示你先运行 `mlx-serve serve`。可用参数：`--model`、`--url`、`--port`、`--print`（只写出配置并打印启动脚本，而不真正运行）、`--no-start`。
 
-两个启动器都会把配置写进专用的 `~/.mlx-serve/<agent>/` 目录，绝不碰你真正的 Agent 配置（`~/.claude`、`~/.pi`、`~/.omp`、`~/.codex`、`~/.hermes` 还是你的）。
+两个启动器都会把配置写进专用的 `~/.mlx-serve/<agent>/` 目录，绝不碰你真正的 Agent 配置（`~/.claude`、`~/.pi`、`~/.omp`、`~/.codex`、`~/.hermes` 还是你的）。Codex 例外：它直接使用你真正的 Codex home，让 MCP 服务器、插件和登录照常工作 —— 见 [Codex](#codex)。
 
 ## 编码 Agent（手动配置）
 
@@ -117,6 +117,8 @@ omp 也支持实时发现，而不必用静态列表：把 `models:` 块换成 `
 
 ### OpenCode
 
+推荐 `mlx-serve launch opencode`：它会运行 `opencode --version`，自动在下面的 v1 或 v2 集成之间选择（可执行文件名已不能代表世代——现在的 Homebrew/npm 发行把 OpenCode 2 也作为 `opencode` 分发）。手动配置 v1 时：
+
 不需要文件。`OPENCODE_CONFIG_CONTENT` 会合并到你自己的配置之上，所以插件和设置照样生效。
 
 ```bash
@@ -126,13 +128,13 @@ opencode --model mlx/MODEL_ID
 
 ### OpenCode 2
 
-`opencode2`（npm 包 `@opencode/cli`）复用同一份 `OPENCODE_CONFIG_CONTENT` 提供商 JSON。启动器还会写出一个专用配置目录，并注册 mlx-serve 监控插件（侧边栏统计 + 底栏轮次计量，读取 `GET /metrics.json`）。
+OpenCode 2 复用同一份 `OPENCODE_CONFIG_CONTENT` 提供商 JSON，启动器还会写出一个专用配置目录，并注册 mlx-serve 监控插件（侧边栏统计 + 底栏轮次计量，读取 `GET /metrics.json`）。`mlx-serve launch opencode` 会把检测到的 major >= 2 路由到这里（更新的 major 同样使用 v2 profile）；`mlx-serve launch opencode2` 作为强制 v2 的后兼容别名保留——若 `opencode` 就是 v2 可执行文件则用它，否则回退到 PATH 上仍存在的旧 `opencode2`。
 
-**要用 `--metrics` 启动服务器**（`mlx-serve serve --metrics`）。CLI 版服务器默认关闭 metrics，对 `/metrics.json` 返回 503；此时插件会显示 `feed --metrics off` 和一块空白面板，而底栏的轮次计量仍能靠流式响应工作。MLX Core 应用默认启用 metrics。`mlx-serve launch opencode2` 会探测该端点，发现它关闭时打印一条警告。
+**要用 `--metrics` 启动服务器**（`mlx-serve serve --metrics`）。CLI 版服务器默认关闭 metrics，对 `/metrics.json` 返回 503；此时插件会显示 `feed --metrics off` 和一块空白面板，而底栏的轮次计量仍能靠流式响应工作。MLX Core 应用默认启用 metrics。v2 启动会探测该端点，发现它关闭时打印一条警告。
 
 ```bash
 export XDG_CONFIG_HOME="$HOME/.mlx-serve/opencode2"
-export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'
+export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "model": "mlx/MODEL_ID", "provider": {"mlx": {"npm": "@ai-sdk/openai-compatible", "name": "MLX Serve (local)", "options": {"baseURL": "http://127.0.0.1:11234/v1"}, "models": {"MODEL_ID": {"name": "MODEL_ID (mlx-serve)", "limit": {"context": CTX, "output": 8192}}}}}}'
 ```
 
 `$XDG_CONFIG_HOME/opencode/cli.json`（插件的 `package` 相对该配置目录）：
@@ -141,34 +143,29 @@ export OPENCODE_CONFIG_CONTENT='{"$schema": "https://opencode.ai/config.json", "
 { "plugins": [ { "package": "./plugins/mlx-serve", "options": { "metricsUrl": "http://127.0.0.1:11234/metrics.json" } } ] }
 ```
 
-回环会省略 `metricsToken`；非回环 URL 则加上 `"metricsToken": "mlx-serve"`（`Authorization: Bearer`）。`mlx-serve launch opencode2` 会把插件复制到 `~/.mlx-serve/opencode2/opencode/plugins/mlx-serve/`，绝不写入 `~/.config/opencode/`。
+回环会省略 `metricsToken`；非回环 URL 则加上 `"metricsToken": "mlx-serve"`（`Authorization: Bearer`）。v2 启动会把插件复制到 `~/.mlx-serve/opencode2/opencode/plugins/mlx-serve/`，绝不写入 `~/.config/opencode/`。
 
 ```bash
-opencode2 --model mlx/MODEL_ID
+# v2 没有根级 --model 参数——模型在上面这份配置里 pin
+opencode --standalone
 ```
 
 ### Codex
 
-当前的 Codex 只支持 OpenAI Responses 协议，mlx-serve 在 `/v1/responses` 提供它。`CODEX_HOME` 会改变它整棵配置树的位置（该文件夹必须在 codex 运行前就存在）。无需配置 key：没有设置 `env_key` 时，codex 会跳过登录界面。
+当前的 Codex 只支持 OpenAI Responses 协议，mlx-serve 在 `/v1/responses` 提供它。mlx-serve 不往你的 Codex home（`${CODEX_HOME:-$HOME/.codex}`）写任何东西：它的设置以 `-c key=value` 覆盖参数传入，由 codex 合并到你自己的 `config.toml` 之上，所以你的 MCP 服务器、插件、登录和项目信任照常工作。无需配置 key：没有设置 `env_key` 时，codex 会跳过登录界面。codex 启动不携带 mlx-serve skill，因为 codex 没有额外 skill 目录的设置项。
 
 PATH 里没有 `codex`，但你有 ChatGPT 桌面应用？它把 CLI 打包在 `/Applications/ChatGPT.app/Contents/Resources/codex`（启动器会自动在那里找到它；`mlx-serve launch chatgpt` 同样可用）。
 
-Codex 每一轮都会打印 `Model metadata for <id> not found. Defaulting to fallback metadata`。那是它内部维护的 OpenAI 模型 id 目录，任何自定义提供商的模型都会触发；这只是表面现象。真正要紧的部分 —— 上下文窗口 —— 来自配置里的 `model_context_window`，它会覆盖那个回退值。
+Codex 每一轮都会打印 `Model metadata for <id> not found. Defaulting to fallback metadata`。那是它内部维护的 OpenAI 模型 id 目录，任何自定义提供商的模型都会触发；这只是表面现象。真正要紧的部分 —— 上下文窗口 —— 来自下面那条 `-c model_context_window=…` 覆盖参数，它会覆盖那个回退值。
 
 ```bash
-mkdir -p ~/.mlx-serve/codex
-cat > ~/.mlx-serve/codex/config.toml <<'EOF'
-model = "MODEL_ID"
-model_provider = "mlx"
-model_context_window = CTX
-
-[model_providers.mlx]
-name = "MLX Serve (local)"
-base_url = "http://127.0.0.1:11234/v1"
-wire_api = "responses"
-EOF
-export CODEX_HOME="$HOME/.mlx-serve/codex"
-codex
+codex \
+  -c 'model="MODEL_ID"' \
+  -c 'model_provider="mlx"' \
+  -c model_context_window=CTX \
+  -c 'model_providers.mlx.name="MLX Serve (local)"' \
+  -c 'model_providers.mlx.base_url="http://127.0.0.1:11234/v1"' \
+  -c 'model_providers.mlx.wire_api="responses"'
 ```
 
 ### Hermes

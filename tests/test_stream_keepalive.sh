@@ -42,7 +42,8 @@ GREEN='\033[0;32m'
 YELLOW='\033[0;33m'
 NC='\033[0m'
 
-MODEL="${KEEPALIVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${KEEPALIVE_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-4bit)}"
 if [ ! -d "$MODEL" ]; then
     echo -e "${YELLOW}SKIP${NC} test_stream_keepalive: model directory not found ($MODEL)."
     exit 0
@@ -61,7 +62,9 @@ MAX_GAP_S=${MAX_GAP_S:-15}
 MIN_BUFFER_S=${MIN_BUFFER_S:-8}
 
 LOG=$(mktemp -t keepalive-server)
-"$BINARY" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 --log-level info >"$LOG" 2>&1 &
+# The probe generates ~2.4k tokens; a pinned context keeps an auto-sized one
+# (small when free memory is low at boot) from cutting the call short.
+"$BINARY" --model "$MODEL" --serve --port "$PORT" --host 127.0.0.1 --log-level info --ctx-size 8192 >"$LOG" 2>&1 &
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null || true; wait $SERVER_PID 2>/dev/null || true; rm -f "$LOG"; }
 trap cleanup EXIT

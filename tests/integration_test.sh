@@ -3,11 +3,12 @@
 # Usage: ./tests/integration_test.sh [model_dir] [port]
 #
 # Requires a model to be available. Defaults to gemma-4-e4b-it-8bit.
-# Builds a debug binary, starts the server, runs tests, then kills it.
+# Builds ReleaseFast (SKIP_BUILD=1 skips), starts the server, runs tests, then kills it.
 
 set -euo pipefail
 
-MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$HOME/.mlx-serve/models/mlx-community/gemma-4-e4b-it-8bit}}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL_DIR="${1:-${MLX_SERVE_TEST_MODEL:-$(find_model mlx-community/gemma-4-e4b-it-8bit)}}"
 PORT="${2:-8095}"
 BASE="http://localhost:$PORT"
 BINARY="./zig-out/bin/mlx-serve"

@@ -3,8 +3,8 @@ import SwiftUI
 import XCTest
 @testable import MLXCore
 
-/// One ladder for the app's text: the system's own styles, snapped to whole
-/// even points, never under 10, reached only through `Font.app(_:)`.
+/// One ladder for the app's text: the system's own styles, never under the
+/// floor, reached only through `Font.app(_:)`.
 ///
 /// Why a ladder and not the system styles themselves: macOS has no dynamic
 /// type. `NSFont.preferredFont(forTextStyle:)` hands every user the same
@@ -22,51 +22,103 @@ final class SystemTypeTests: XCTestCase {
 
     // MARK: - The ladder
 
-    /// The two rules the ladder exists to keep: whole even points, never under
-    /// the floor. Whatever a view renders has to pass both.
-    func testEveryStepIsEvenAndNeverBelowTheFloor() {
+    /// The two rules the ladder exists to keep: whole points, never under the
+    /// floor. Whatever a view renders has to pass both.
+    func testEveryStepIsWholeAndNeverBelowTheFloor() {
         XCTAssertEqual(AppType.table.count, 11, "a step was added without saying so here")
         for step in AppType.table {
             XCTAssertTrue(
                 AppType.isLegal(step.pointSize),
-                "\(step.style) is \(step.pointSize): sizes are whole even points, at least \(AppType.floor)"
+                "\(step.style) is \(step.pointSize): sizes are whole points, at least \(AppType.floor)"
             )
         }
-        // The rule has teeth: an odd size and one under the floor both fail.
-        XCTAssertFalse(AppType.isLegal(11), "odd")
+        XCTAssertFalse(AppType.isLegal(12.5), "fractional")
         XCTAssertFalse(AppType.isLegal(8), "under the floor")
         XCTAssertTrue(AppType.isLegal(AppType.floor), "the floor itself is legal")
     }
 
     /// The ladder is anchored to the platform, not to taste: each step is the
-    /// system's size for the style it names, rounded up to an even point and
-    /// floored. When macOS moves one this fails — which is the signal to
+    /// system's size for the style it names, floored. When macOS moves one this fails — which is the signal to
     /// re-derive `AppType.table`, not to let the app drift on its own.
     func testEveryStepIsTheSystemStyleItNames() {
         for step in AppType.table {
             let live = NSFont.preferredFont(forTextStyle: appKitStyle(for: step.style)).pointSize
             XCTAssertEqual(live, step.system, accuracy: 0.01, """
                 macOS now renders this style at \(live)pt; AppType.table says \(step.system). \
-                Re-derive the ladder: odd steps up one, floor \(AppType.floor).
+                Re-derive the ladder: the system size, floor \(AppType.floor).
                 """)
-
-            var expected = live
-            if expected.truncatingRemainder(dividingBy: 2) != 0 { expected += 1 }
-            expected = max(expected, AppType.floor)
-            XCTAssertEqual(step.pointSize, expected, accuracy: 0.01,
-                           "\(step.style): \(step.pointSize) is not the system's \(live)pt snapped")
+            XCTAssertEqual(step.pointSize, max(live, AppType.floor), accuracy: 0.01,
+                           "\(step.style): \(step.pointSize) is not the system's \(live)pt floored")
         }
     }
 
     /// Every step the app can ask for is on the table, so `pointSize(for:)`
     /// never falls back to the floor for a name the app actually uses.
+    ///
+    /// A call may name a step (`.app(.body)`) or a ROLE (`.app(.rowTitle)`).
+    /// Both are the ladder: a role is the sentence for what a piece of text IS,
+    /// and it resolves to a step that has to be on the table like any other. The
+    /// point of accepting both is that a view states its intent either way, and
+    /// neither spelling can escape the floor.
     func testEveryStepTheAppAsksForIsOnTheTable() throws {
         let used = try usedStyles()
         XCTAssertFalse(used.isEmpty, "the scan found no steps — it is not walking the tree")
         let known = Set(AppType.table.map { "\($0.style)" })
+        let roles: [String: AppType.Role] = [
+            "pageTitle": .pageTitle, "sectionTitle": .sectionTitle, "rowTitle": .rowTitle,
+            "explainer": .explainer, "value": .value, "annotation": .annotation,
+        ]
         for name in used.sorted() {
-            XCTAssertTrue(known.contains(name), "\(name) is not in AppType.table")
+            if let role = roles[name] {
+                XCTAssertTrue(known.contains("\(role.step)"),
+                              "role \(name) asks for \(role.step), which is not in AppType.table")
+                XCTAssertTrue(AppType.isLegal(AppType.pointSize(for: role.step)),
+                              "role \(name) lands on an illegal size")
+            } else {
+                XCTAssertTrue(known.contains(name), "\(name) is neither a step in AppType.table nor a role")
+            }
         }
+    }
+
+    // MARK: - The floor, and the roles that sit on it
+
+    /// macOS's own sizes are the ladder; only what sits under the floor moves.
+    func testTheLadderMatchesMacOSAboveTheFloor() {
+        for step in AppType.table where step.system >= AppType.floor {
+            XCTAssertEqual(step.pointSize, step.system,
+                           "\(step.style) renders \(step.pointSize)pt, macOS says \(step.system)pt")
+        }
+        XCTAssertEqual(AppType.pointSize(for: .body), 13, "body is 13 on macOS, like Notes and Finder")
+    }
+
+    func testTheFloorIsTheSmallestTextTheAppIsAllowedToRender() {
+        XCTAssertEqual(AppType.floor, 11, "10pt captions are raised, nothing else moves")
+        XCTAssertFalse(AppType.isLegal(10))
+        XCTAssertTrue(AppType.isLegal(11))
+        XCTAssertTrue(AppType.isLegal(13))
+    }
+
+    func testEveryRoleLandsOnARealStep() {
+        let roles: [(String, AppType.Role)] = [
+            ("pageTitle", .pageTitle), ("sectionTitle", .sectionTitle),
+            ("rowTitle", .rowTitle), ("explainer", .explainer),
+            ("value", .value), ("annotation", .annotation),
+        ]
+        for (name, role) in roles {
+            XCTAssertTrue(AppType.table.contains { $0.style == role.step },
+                          "\(name) asks for \(role.step), which is not on the ladder")
+            XCTAssertTrue(AppType.isLegal(AppType.pointSize(for: role.step)),
+                          "\(name) lands on an illegal size")
+        }
+    }
+
+    func testTheRolesReadAsAScaleFromBigToSmall() {
+        let sizes = [AppType.Role.pageTitle, .sectionTitle, .rowTitle, .explainer, .value, .annotation]
+            .map { AppType.pointSize(for: $0.step) }
+        for (bigger, smaller) in zip(sizes, sizes.dropFirst()) {
+            XCTAssertGreaterThanOrEqual(bigger, smaller, "the role scale is out of order")
+        }
+        XCTAssertGreaterThan(sizes[0], sizes.last!, "a page title and an annotation should differ")
     }
 
     // MARK: - The call sites
@@ -317,11 +369,39 @@ final class SystemTypeTests: XCTestCase {
                let r = Range(m.range(at: 1), in: text), names.contains(String(text[r])) { return true }
             return false
         }
+        // A surface built as a VALUE names itself on the line the statement
+        // starts, not on any line that opens a brace:
+        //     return Alert(title: Text("Agents"), message: Text(text),
+        //                  dismissButton: .default(Text("OK")))
+        // The walk below only ever visits lines that OPEN a block, and this
+        // expression opens none — so the statement's own first line is checked
+        // directly.
+        var up = index
+        var seen = 0
+        while up >= 0 && seen < 3 {
+            if lineNames(lines[up]) { return true }
+            if up == index || !lines[up].trimmingCharacters(in: .whitespaces).hasSuffix(",") { break }
+            up -= 1; seen += 1
+        }
         var level = depths[index]
         while level > 0 {
             guard let open = (0..<index).reversed().first(where: { depths[$0] == level - 1 && lines[$0].contains("{") })
             else { return false }
             if lineNames(lines[open]) { return true }
+            // A call written across lines puts its name on the line that opens
+            // the paren and its brace on a later one:
+            //     .confirmationDialog(
+            //         "…", isPresented: $x
+            //     ) { … } message: { … }
+            // The `message:` block's brace line names nothing, so without
+            // looking back over the paren continuation an alert's own text reads
+            // as unlabelled — which is the one surface it is allowed to be.
+            var back = open
+            var looked = 0
+            while back > 0 && looked < 4 {
+                back -= 1; looked += 1
+                if lineNames(lines[back]) { return true }
+            }
             level -= 1
         }
         return false
@@ -366,6 +446,19 @@ final class SystemTypeTests: XCTestCase {
            let r = Range(m.range(at: 1), in: lines[index]), surfaces.contains(String(lines[index][r])) {
             return true
         }
+        func names(_ text: String) -> Bool {
+            let range = NSRange(text.startIndex..., in: text)
+            guard let m = call?.firstMatch(in: text, range: range),
+                  let r = Range(m.range(at: 1), in: text) else { return false }
+            return surfaces.contains(String(text[r]))
+        }
+        // A surface built as a VALUE names itself where the statement starts and
+        // opens no brace for the walk below to find:
+        //     return Alert(title: Text("Agents"), message: Text(text),
+        //                  dismissButton: .default(Text("OK")))
+        for back in 1...3 where index - back >= 0 {
+            if names(lines[index - back]) { return true }
+        }
         var level = depths[index]
         while level > 0 {
             guard let open = (0..<index).reversed().first(where: { depths[$0] == level - 1 && lines[$0].contains("{") })
@@ -374,6 +467,17 @@ final class SystemTypeTests: XCTestCase {
             if let m = call?.firstMatch(in: lines[open], range: range),
                let r = Range(m.range(at: 1), in: lines[open]), surfaces.contains(String(lines[open][r])) {
                 return true
+            }
+            // A call written across lines puts its name on the line that opens
+            // the paren and its brace on a later one:
+            //     .confirmationDialog(
+            //         "…", isPresented: $x
+            //     ) { … } message: { … }
+            var back = open
+            var looked = 0
+            while back > 0 && looked < 4 {
+                back -= 1; looked += 1
+                if names(lines[back]) { return true }
             }
             level -= 1
         }
@@ -394,8 +498,14 @@ final class SystemTypeTests: XCTestCase {
             guard let open = (0..<index).reversed().first(where: { depths[$0] == level - 1 && lines[$0].contains("{") })
             else { return false }
             let close = (index..<lines.count).first(where: { depths[$0] < level }) ?? lines.count - 1
-            let window = lines[open...min(close + 2, lines.count - 1)].joined(separator: "\n")
-            if window.contains(".font(") || window.contains(".app(") { return true }
+            // The trailing-modifier idiom only: a font on the block's own last
+            // line or within two lines of its closing brace, which is where a
+            // container carries one. Scanning the WHOLE block let an unrelated
+            // sibling's `.app(…)` vouch for a bare Text elsewhere in the same
+            // body — a false negative, and the reason 62 real offenders sat in
+            // main with the guard green.
+            let tail = lines[max(open, close - 1)...min(close + 2, lines.count - 1)].joined(separator: "\n")
+            if tail.contains(".font(") || tail.contains(".app(") { return true }
             level -= 1
         }
         return false

@@ -125,7 +125,7 @@ struct AgentListPane: View {
                 Button {
                     newAgent(basedOn: starter)
                 } label: {
-                    Label(starter.name, systemImage: starter.symbol)
+                    Label(starter.name, systemImage: starter.symbol).font(.app(.body))
                 }
             }
         }
@@ -133,7 +133,7 @@ struct AgentListPane: View {
         Button {
             newAgent(basedOn: nil)
         } label: {
-            Label("Blank agent", systemImage: "square.dashed")
+            Label("Blank agent", systemImage: "square.dashed").font(.app(.body))
         }
     }
 
@@ -471,6 +471,7 @@ private struct AgentEditor: View {
 
     @EnvironmentObject var appState: AppState
     @State private var showAdvancedTools = false
+    @State private var inheritedSampling = GenerationDefaults()
     /// Collapsed state of Capabilities / Model / Workspace / Sampling. Per-agent
     /// like `showAdvancedTools` — the editor is REUSED across selections, so it
     /// re-syncs on the id change rather than leaking one agent's disclosure into
@@ -507,13 +508,19 @@ private struct AgentEditor: View {
             showAdvancedTools = agent.capabilities.advancedTools != nil
             clips = VoiceClipLibrary.clips()
             ttsDownloaded = VoiceCloneMenuModel.ttsModelDownloaded()
+            refreshInheritedSampling()
         }
         // The editor is REUSED as the selection changes (same class as the chat
         // detail view), so per-agent view state has to re-sync on the id change.
         .onChange(of: agent.id) { _, _ in
             showAdvancedTools = agent.capabilities.advancedTools != nil
             showMoreOptions = false
+            refreshInheritedSampling()
         }
+        .onChange(of: agent.modelPath) { _, _ in refreshInheritedSampling() }
+        .onChange(of: appState.selectedModelPath) { _, _ in refreshInheritedSampling() }
+        .onChange(of: showMoreOptions) { _, expanded in if expanded { refreshInheritedSampling() } }
+        .onReceive(NotificationCenter.default.publisher(for: GenerationDefaultsFile.changed)) { _ in refreshInheritedSampling() }
         .onDisappear { onSave() }
     }
 
@@ -585,7 +592,8 @@ private struct AgentEditor: View {
                     Text("This is one of the built-in agents. Duplicate it to make it yours.")
                         .font(.app(.callout))
                     Spacer(minLength: 8)
-                    Button("Duplicate", action: onDuplicate)
+                    Button(action: onDuplicate, label: { Text("Duplicate")
+                        .font(.app(.body)) })
                 }
             }
         }
@@ -600,7 +608,7 @@ private struct AgentEditor: View {
                   axis: .vertical)
             .textFieldStyle(.plain)
             .lineLimit(1...3)
-            .disabled(readOnly)
+            .disabled(readOnly).font(.app(.body))
     }
 
     /// Duplicate and Delete, as icons. Delete is HIDDEN on a built-in rather
@@ -632,7 +640,7 @@ private struct AgentEditor: View {
     /// primary action is how the wrong one gets clicked.
     private var startChatButton: some View {
         Button(action: onStartChat) {
-            Label("Start Chat with this Agent", systemImage: "bubble.left.and.bubble.right")
+            Label("Start Chat with this Agent", systemImage: "bubble.left.and.bubble.right").font(.app(.body))
                 .frame(maxWidth: AgentEditorMetrics.primaryMaxWidth)
         }
         .buttonStyle(.borderedProminent)
@@ -702,7 +710,7 @@ private struct AgentEditor: View {
                 .textFieldStyle(.plain)
                 .multilineTextAlignment(.trailing)
                 .frame(maxWidth: 220)
-                .disabled(readOnly)
+                .disabled(readOnly).font(.app(.body))
         }
     }
 
@@ -817,7 +825,7 @@ private struct AgentEditor: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .disabled(readOnly || showAdvancedTools)
-                .help("The tool-calling loop: shell, files, search, tasks, media generation.")
+                .help("The tool-calling loop: shell, files, search, tasks, media generation.").font(.app(.body))
         }
         AgentEditorRow("MCP") {
             Toggle("", isOn: Binding(get: { agent.capabilities.mcp },
@@ -825,7 +833,7 @@ private struct AgentEditor: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .disabled(readOnly)
-                .help("Add the tools from every enabled Model Context Protocol server.")
+                .help("Add the tools from every enabled Model Context Protocol server.").font(.app(.body))
         }
         AgentEditorRow("Web") {
             Toggle("", isOn: Binding(get: { agent.capabilities.web },
@@ -833,27 +841,27 @@ private struct AgentEditor: View {
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .disabled(readOnly || showAdvancedTools)
-                .help("Browse pages and search the web (browse + webSearch).")
+                .help("Browse pages and search the web (browse + webSearch).").font(.app(.body))
         }
         AgentEditorRow("Thinking") {
             Picker("", selection: tristate($agent.enableThinking)) {
-                Text("App default").tag(TriChoice.appDefault)
-                Text("On").tag(TriChoice.on)
-                Text("Off").tag(TriChoice.off)
+                Text("App default").font(.app(.body)).tag(TriChoice.appDefault)
+                Text("On").font(.app(.body)).tag(TriChoice.on)
+                Text("Off").font(.app(.body)).tag(TriChoice.off)
             }
             .labelsHidden()
             .frame(width: Self.triPickerWidth)
-            .disabled(readOnly)
+            .disabled(readOnly).font(.app(.body))
         }
         AgentEditorRow("Approve tools") {
             Picker("", selection: tristate($agent.autoApproveTools)) {
-                Text("App default").tag(TriChoice.appDefault)
-                Text("Automatically").tag(TriChoice.on)
-                Text("Ask every time").tag(TriChoice.off)
+                Text("App default").font(.app(.body)).tag(TriChoice.appDefault)
+                Text("Automatically").font(.app(.body)).tag(TriChoice.on)
+                Text("Ask every time").font(.app(.body)).tag(TriChoice.off)
             }
             .labelsHidden()
             .frame(width: Self.triPickerWidth)
-            .disabled(readOnly)
+            .disabled(readOnly).font(.app(.body))
         }
     }
 
@@ -883,7 +891,7 @@ private struct AgentEditor: View {
                                     .kerning(0.5)
                                 ForEach(group.tools, id: \.self) { tool in
                                     Toggle(isOn: toolBinding(tool)) {
-                                        Label(L10n.text(tool.displayName), systemImage: tool.icon)
+                                        Label(L10n.text(tool.displayName), systemImage: tool.icon).font(.app(.body))
                                     }
                                     .disabled(readOnly || !showAdvancedTools)
                                 }
@@ -891,10 +899,11 @@ private struct AgentEditor: View {
                         }
                     }
                     if showAdvancedTools {
-                        Button("Back to the simple switches") {
+                        Button {
                             agent.capabilities.closeAdvanced()
                             showAdvancedTools = false
-                        }
+                        } label: { Text("Back to the simple switches")
+                            .font(.app(.body)) }
                         .disabled(readOnly)
                     }
                 }
@@ -905,7 +914,7 @@ private struct AgentEditor: View {
                 // string label, so the word "Advanced" was dead. The label holds
                 // no buttons of its own, so a tap gesture here is safe (a parent
                 // gesture around embedded Buttons is what swallows child clicks).
-                Text("Advanced")
+                Text("Advanced").font(.app(.body))
                     .frame(maxWidth: .infinity, alignment: .leading)
                     .contentShape(Rectangle())
                     .onTapGesture { showAdvancedTools.toggle() }
@@ -943,12 +952,12 @@ private struct AgentEditor: View {
         AgentEditorRow("Model") {
             Picker("", selection: Binding(get: { agent.modelPath ?? "" },
                                           set: { agent.modelPath = $0.isEmpty ? nil : $0 })) {
-                Text("Current").tag("")
+                Text("Current").font(.app(.body)).tag("")
                 ForEach(appState.localModels.filter(\.isChatPickable), id: \.path) { model in
-                    Text(model.name).tag(model.path)
+                    Text(model.name).font(.app(.body)).tag(model.path)
                 }
                 ForEach(appState.server.lanModels(capability: "chat"), id: \.name) { info in
-                    Text("\(info.name) (network)").tag(info.name)
+                    Text("\(info.name) (network)").font(.app(.body)).tag(info.name)
                 }
             }
             .labelsHidden()
@@ -965,9 +974,10 @@ private struct AgentEditor: View {
                 Label("Not downloaded", systemImage: "exclamationmark.triangle.fill")
                     .foregroundStyle(.orange).font(.app(.subheadline))
                 Spacer(minLength: 8)
-                Button("Open Model Browser") {
+                Button {
                     appState.showModels()
-                }
+                } label: { Text("Open Model Browser")
+                    .font(.app(.body)) }
                 .controlSize(.small)
                 .help(L10n.format("This agent can't answer until %@ is on disk. Nothing is downloaded automatically.",
                                   (path as NSString).lastPathComponent))
@@ -1000,7 +1010,7 @@ private struct AgentEditor: View {
 
     private var workspaceActions: some View {
         HStack(spacing: 8) {
-            Button("Choose…") {
+            Button {
                 guard let picked = WorkspacePicker.pickDirectory() else { return }
                 agent.workingDirectory = picked
                 // Per-agent folders need per-agent bookmarks under the
@@ -1008,14 +1018,16 @@ private struct AgentEditor: View {
                 SecurityScopedBookmark.store(URL(fileURLWithPath: picked),
                                              name: SecurityScopedBookmark.agentWorkspaceName(agent.id))
                 onSave()
-            }
+            } label: { Text("Choose…")
+                .font(.app(.body)) }
             .disabled(readOnly)
             if agent.workingDirectory != nil {
-                Button("Reset") {
+                Button {
                     SecurityScopedBookmark.clear(name: SecurityScopedBookmark.agentWorkspaceName(agent.id))
                     agent.workingDirectory = nil
                     onSave()
-                }
+                } label: { Text("Reset")
+                    .font(.app(.body)) }
                 .disabled(readOnly)
             }
             Spacer(minLength: 0)
@@ -1055,9 +1067,11 @@ private struct AgentEditor: View {
 
     private var voiceActions: some View {
         HStack(spacing: 8) {
-            Button("Preview") { previewVoice() }
+            Button { previewVoice() } label: { Text("Preview")
+                .font(.app(.body)) }
                 .disabled(previewer.active != nil || agent.voice == nil)
-            Button("Add Voice…") { addVoiceClip() }
+            Button { addVoiceClip() } label: { Text("Add Voice…")
+                .font(.app(.body)) }
                 .disabled(readOnly)
                 .help("Add a recording of a voice to clone. It's normalized and kept in ~/.mlx-serve/voice-clips so any agent can use it later.")
             if let error = previewer.error ?? clipError {
@@ -1103,178 +1117,24 @@ private struct AgentEditor: View {
 
     // MARK: Sampling
 
-    // Every row shows its control: on App default it renders the app's saved
-    // value grayed out, so the row says what the agent will actually run with
-    // instead of hiding it. The checkbox sits to the RIGHT of the control.
+    private var samplingProfile: Binding<GenerationDefaults> {
+        Binding(get: { GenerationDefaults(agent: agent) },
+                set: { $0.apply(to: &agent) })
+    }
 
-    private static let topKPresets: [Int] = [0, 5, 10, 20, 40, 64, 100, 200, 500, 1000]
-    /// Same grid as Settings ▸ Max Tokens; 0 = Auto (omit, server pegs to the
-    /// remaining context).
-    private static let maxTokensPresets: [Int] = [
-        0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072, 262144,
-    ]
-
-    /// Merge note: the seven controls are main's (#135 — an agent can pin its
-    /// own sampling); the card and the row grammar are this branch's. They were
-    /// written against a grouped `Form`, so each row moved from
-    /// `LabeledContent` to `AgentEditorRow` — otherwise this card would be the
-    /// one place in the editor where a label sits in a different column from
-    /// every other label.
     private var samplingSection: some View {
         AgentSection("Sampling") {
             AgentCard(spacing: 12) {
-                sliderRow("Temperature", value: $agent.temperature,
-                          seed: appState.serverOptions.defaultTemperature, in: 0...1.5, step: 0.05,
-                          ends: ("Focused", "Creative"))
-                Divider()
-                sliderRow("Top-p", value: $agent.topP,
-                          seed: appState.serverOptions.defaultTopP, in: 0.1...1.0, step: 0.01,
-                          ends: ("Focused", "Varied"))
-                Divider()
-                // 0 omits the field, so the model's own generation_config wins.
-                presetRow("Top-k", value: $agent.topK, seed: appState.serverOptions.defaultTopK,
-                          presets: Self.topKPresets, ends: ("Auto", "Wide"),
-                          label: { $0 == 0 ? "Auto" : "\($0)" })
-                Divider()
-                sliderRow("Repeat penalty", value: $agent.repeatPenalty,
-                          seed: appState.serverOptions.defaultRepeatPenalty, in: 1.0...2.0, step: 0.01,
-                          ends: ("Off", "Strong"))
-                Divider()
-                sliderRow("Presence penalty", value: $agent.presencePenalty,
-                          seed: appState.serverOptions.defaultPresencePenalty, in: 0.0...2.0, step: 0.01,
-                          ends: ("Off", "Strong"))
-                Divider()
-                presetRow("Max tokens", value: $agent.maxTokens, seed: appState.maxTokens,
-                          presets: Self.maxTokensPresets, ends: ("Auto", "Long"),
-                          label: { $0 <= 0 ? "Auto" : Self.formatTokens($0) })
-                Divider()
-                reasoningEffortRow
+                GenerationDefaultsRows(profile: samplingProfile, inheritance: "Server default",
+                                       fields: GenerationField.agentFields, allowsForce: false,
+                                       inherited: inheritedSampling)
+                    .disabled(readOnly)
             }
         }
     }
 
-    private static func formatTokens(_ n: Int) -> String {
-        n >= 1024 ? "\(n / 1024)K" : "\(n)"
-    }
-
-    /// The right-hand "Default" checkbox every sampling row carries: checked =
-    /// nil (follow Settings, control grayed), unchecking seeds from the app's
-    /// saved value so the control picks up exactly where the gray preview was.
-    /// One word on purpose — "App default" wrapped onto two lines beside the
-    /// sliders.
-    private func appDefaultToggle<T>(value: Binding<T?>, seed: T) -> some View {
-        Toggle("Default", isOn: Binding(
-            get: { value.wrappedValue == nil },
-            set: { value.wrappedValue = $0 ? nil : seed }))
-            .toggleStyle(.checkbox)
-            .disabled(readOnly)
-    }
-
-    private func sliderRow(_ title: String, value: Binding<Double?>, seed: Double,
-                           in range: ClosedRange<Double>, step: Double,
-                           ends: (String, String)) -> some View {
-        let isDefault = value.wrappedValue == nil
-        return AgentEditorRow(title, alignment: .center) {
-            HStack(spacing: 10) {
-                VStack(spacing: 1) {
-                    Slider(value: Binding(get: { value.wrappedValue ?? seed },
-                                          set: { value.wrappedValue = $0 }),
-                           in: range, step: step)
-                        .disabled(readOnly || isDefault)
-                    endLabels(ends, dimmed: isDefault)
-                }
-                .frame(width: 160)
-                Text(String(format: "%.2f", value.wrappedValue ?? seed))
-                    .font(.app(.caption).monospaced())
-                    .foregroundStyle(isDefault ? .secondary : .primary)
-                    .frame(width: Self.valueColumnWidth, alignment: .trailing)
-                appDefaultToggle(value: value, seed: seed)
-            }
-        }
-    }
-
-    /// The value readout is a FIXED column: its text changes length while you
-    /// drag ("Auto" → "5" → "1000"), and letting it resize reflows the HStack
-    /// and moves the slider under the pointer mid-drag.
-    private static let valueColumnWidth: CGFloat = 44
-
-    /// Snapping preset slider (the Settings idiom) for values whose useful
-    /// range spans orders of magnitude — a linear slider wastes its whole
-    /// travel on the far end.
-    private func presetRow(_ title: String, value: Binding<Int?>, seed: Int,
-                           presets: [Int], ends: (String, String),
-                           label: @escaping (Int) -> String) -> some View {
-        let isDefault = value.wrappedValue == nil
-        let effective = value.wrappedValue ?? seed
-        return AgentEditorRow(title, alignment: .center) {
-            HStack(spacing: 10) {
-                VStack(spacing: 1) {
-                    Slider(value: Binding(
-                        get: { Double(Self.closestIndex(in: presets, to: effective)) },
-                        set: { value.wrappedValue = presets[max(0, min(Int($0.rounded()), presets.count - 1))] }),
-                           in: 0...Double(presets.count - 1), step: 1)
-                        .disabled(readOnly || isDefault)
-                    endLabels(ends, dimmed: isDefault)
-                }
-                .frame(width: 160)
-                Text(L10n.text(label(effective)))
-                    .font(.app(.caption).monospaced())
-                    .foregroundStyle(isDefault ? .secondary : .primary)
-                    .frame(width: Self.valueColumnWidth, alignment: .trailing)
-                appDefaultToggle(value: value, seed: seed)
-            }
-        }
-    }
-
-    /// The one-word meaning of each end of a slider, tucked under the track.
-    private func endLabels(_ ends: (String, String), dimmed: Bool) -> some View {
-        HStack {
-            Text(L10n.text(ends.0))
-            Spacer()
-            Text(L10n.text(ends.1))
-        }
-        .font(.app(.caption2))
-        .foregroundStyle(dimmed ? .tertiary : .secondary)
-    }
-
-    /// A stored value off the grid still positions the slider sensibly.
-    private static func closestIndex(in presets: [Int], to value: Int) -> Int {
-        presets.enumerated().min { abs($0.element - value) < abs($1.element - value) }?.offset ?? 0
-    }
-
-    /// Effort levels rather than a token field — the levels are the server's
-    /// own `reasoning_effort` budgets (`AgentReasoningEffort`), stored as
-    /// tokens so the wire stays `reasoning_budget`.
-    private var reasoningEffortRow: some View {
-        let isDefault = agent.reasoningBudget == nil
-        let seedTokens = AgentReasoningEffort
-            .nearest(to: appState.serverOptions.defaultReasoningBudget).budgetTokens
-        return AgentEditorRow("Reasoning budget", alignment: .center) {
-            HStack(spacing: 10) {
-                Picker("", selection: Binding(
-                    get: { AgentReasoningEffort.nearest(to: agent.reasoningBudget
-                                                        ?? appState.serverOptions.defaultReasoningBudget) },
-                    set: { agent.reasoningBudget = $0.budgetTokens })) {
-                    ForEach(AgentReasoningEffort.allCases, id: \.self) { level in
-                        Text(L10n.text(level.label)).tag(level)
-                    }
-                }
-                // A MENU picker, like the Model row above it. As a segmented
-                // control this row rendered torn apart — a phantom ~110pt of
-                // claimed height pushed a dead band into the card and the
-                // Default checkbox out of the row, bare box, label gone (live
-                // 2026-08-09 screenshot) — and neither `.fixedSize()`, an
-                // explicit frame, nor sibling order changed it, while the same
-                // segmented style renders fine in every other pane. Whatever
-                // macOS 26 dislikes is specific to this card's subtree; the
-                // menu style is the shape the card already proves out.
-                .pickerStyle(.menu)
-                .labelsHidden()
-                .fixedSize()
-                .disabled(readOnly || isDefault)
-                appDefaultToggle(value: $agent.reasoningBudget, seed: seedTokens)
-            }
-        }
+    private func refreshInheritedSampling() {
+        inheritedSampling = GenerationDefaults.inherited(modelPath: agent.modelPath ?? appState.selectedModelPath)
     }
 
     // MARK: Tri-state helper
@@ -1353,8 +1213,10 @@ private struct AgentVoiceMenu: View {
                         Text(L10n.text(reason))
                     }
                     Divider()
-                    Button("Add Voice…", action: onAddClip)
-                    Button("Open Voices Folder", action: onRevealClips)
+                    Button(action: onAddClip, label: { Text("Add Voice…")
+                        .font(.app(.body)) })
+                    Button(action: onRevealClips, label: { Text("Open Voices Folder")
+                        .font(.app(.body)) })
                 }
                 Menu("System") {
                     ForEach(systemVoices) { v in
@@ -1372,7 +1234,7 @@ private struct AgentVoiceMenu: View {
     @ViewBuilder
     private func choice(_ title: String, isOn: Bool, action: @escaping () -> Void) -> some View {
         Button(action: action) {
-            if isOn { Label(L10n.text(title), systemImage: "checkmark") } else { Text(L10n.text(title)) }
+            if isOn { Label(L10n.text(title), systemImage: "checkmark").font(.app(.body)) } else { Text(L10n.text(title)).font(.app(.body)) }
         }
     }
 

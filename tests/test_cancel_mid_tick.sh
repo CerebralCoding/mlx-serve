@@ -6,7 +6,8 @@
 #
 # Usage: CANCEL_TEST_MODEL=<model with MTP + thinking> ./tests/test_cancel_mid_tick.sh [port]
 set -u
-MODEL="${CANCEL_TEST_MODEL:-/Volumes/G Drive SSD/models-dl/prism-ml/Ternary-Bonsai-2-27B-mlx-2bit}"
+source "$(dirname "$0")/_lib_models.sh"
+MODEL="${CANCEL_TEST_MODEL:-$(find_model prism-ml/Ternary-Bonsai-2-27B-mlx-2bit)}"
 PORT="${1:-11282}"
 BIN="${BINARY:-./zig-out/bin/mlx-serve}"
 N="${CANCELS:-12}"

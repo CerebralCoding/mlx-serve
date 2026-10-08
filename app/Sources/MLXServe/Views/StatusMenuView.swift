@@ -305,42 +305,42 @@ struct StatusMenuView: View {
             if !mlxServe.isEmpty {
                 Section("MLX-Serve Models") {
                     ForEach(mlxServe) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
             if !lmStudio.isEmpty {
                 Section(L10n.text(LocalModelSource.lmStudio.sectionTitle)) {
                     ForEach(lmStudio) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
             if !mtplx.isEmpty {
                 Section(L10n.text(LocalModelSource.mtplx.sectionTitle)) {
                     ForEach(mtplx) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
             if !osaurus.isEmpty {
                 Section(L10n.text(LocalModelSource.osaurus.sectionTitle)) {
                     ForEach(osaurus) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
             if !huggingFace.isEmpty {
                 Section("Hugging Face Cache") {
                     ForEach(huggingFace) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
             if !custom.isEmpty {
                 Section("Custom Folder") {
                     ForEach(custom) { model in
-                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(modelPickerLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                 }
             }
@@ -353,25 +353,25 @@ struct StatusMenuView: View {
             if !network.isEmpty {
                 Section(L10n.text(ModelPalette.networkSection)) {
                     ForEach(network, id: \.name) { m in
-                        Text(L10n.text(m.lanDisplayName)).tag("lan:" + m.name)
+                        Text(L10n.text(m.lanDisplayName)).font(.app(.body)).tag("lan:" + m.name)
                     }
                 }
             }
             if !providers.isEmpty {
                 Section(L10n.text(ModelPalette.providersSection)) {
                     ForEach(providers, id: \.name) { m in
-                        Text(L10n.text(m.lanDisplayName)).tag("lan:" + m.name)
+                        Text(L10n.text(m.lanDisplayName)).font(.app(.body)).tag("lan:" + m.name)
                     }
                 }
             }
             if case .available = AppleFoundationChat.availability {
                 Section(L10n.text(ModelPalette.onDeviceSection)) {
-                    Text(L10n.text(AppleFoundationChat.displayName)).tag(ChatModelSelection.appleTag)
+                    Text(L10n.text(AppleFoundationChat.displayName)).font(.app(.body)).tag(ChatModelSelection.appleTag)
                 }
             }
         }
         .labelsHidden()
-        .pickerStyle(.menu)
+        .pickerStyle(.menu).font(.app(.body))
     }
 
     /// The one state-driven action, plus the log window.
@@ -413,7 +413,7 @@ struct StatusMenuView: View {
                 } else if let systemImageName = control.systemImageName {
                     Image(systemName: systemImageName)
                 }
-                Text(L10n.text(control.title))
+                Text(L10n.text(control.title)).font(.app(.body))
             }
             .frame(maxWidth: .infinity)
         }
@@ -435,13 +435,17 @@ struct StatusMenuView: View {
                 .controlSize(.mini)
                 .help("Start the server when the app launches. Whether that start preloads a model is \"Preload the model when the server starts\" in Settings ▸ Server.")
             Spacer()
-            // Which embedded engine the selected model routes to (MLX
-            // safetensors, llama.cpp GGUF, or ds4 GGUF).
-            if let engine = appState.localModels
+            // The engine the resident chat model runs on, as the SERVER
+            // reports it; before a load, the file-type guess for the
+            // selected model.
+            if let engine = server.residentChatModel?.engine {
+                EngineBadge(text: engine.label, tint: EngineBadge.tint(engine))
+                    .help("Engine the loaded model runs on")
+            } else if let engine = appState.localModels
                 .first(where: { $0.path == appState.selectedModelPath })?.engine
             {
-                Text(L10n.text(engine.displayName))
-                    .help("Engine the selected model runs on")
+                EngineBadge(text: engine.displayName, tint: .secondary)
+                    .help("Engine the selected model will run on")
             }
         }
         .font(.app(.caption))
@@ -671,12 +675,6 @@ struct StatusMenuView: View {
         )
     }
 
-    /// Append a "+ assist" suffix to every model row that *could* use the
-    /// assistant drafter — i.e. drafter is currently enabled overall AND a
-    /// matching `gemma-4-*-it-assistant-bf16` checkpoint is on disk for this
-    /// row. Lets the user see at a glance which models keep the speedup if
-    /// they switch (auto-sync swaps `drafterPath` to the matching one on
-    /// model change). When drafter is off, no badges anywhere.
     private func modelPickerLabel(_ model: LocalModel, dupNames: Set<String>) -> String {
         // `displayLabel`, not `name`: a GGUF repo ships several quants and each
         // is its own row here, so the row has to say WHICH quant it loads
@@ -685,11 +683,7 @@ struct StatusMenuView: View {
         if dupNames.contains(label) {
             label += " · \(model.engine.shortLabel)"
         }
-        guard !appState.serverOptions.drafterPath.isEmpty,
-              downloads.recommendedDrafterFromPath(model.path) != nil else {
-            return label
-        }
-        return "\(label) + assist"
+        return label
     }
 
     /// One resident-model slot: modality icon, name, badges (chat quant /
@@ -717,7 +711,16 @@ struct StatusMenuView: View {
                     .background(.quaternary)
                     .clipShape(Capsule())
             }
-            // Speculative-decoding speedup badge (MTP / drafter).
+            if let kv = info.kvBadge {
+                Text(kv)
+                    .font(.app(.caption2).weight(.semibold))
+                    .padding(.horizontal, 5)
+                    .padding(.vertical, 1)
+                    .background(.quaternary)
+                    .clipShape(Capsule())
+                    .help("KV cache stored at \(info.kvQuant)-bit")
+            }
+            // Speculative-decoding speedup badge (DFlash family / MTP / drafter).
             if let badge = info.specDecodeBadge {
                 Text(L10n.text(badge))
                     .font(.app(.caption2).weight(.semibold))
@@ -726,9 +729,9 @@ struct StatusMenuView: View {
                     .padding(.vertical, 1)
                     .background(Color.green.opacity(0.15))
                     .clipShape(Capsule())
-                    .help(info.mtpLoaded
+                    .help(badge == "+MTP"
                           ? "Native multi-token-prediction head loaded — faster decode via speculative decoding"
-                          : "Assistant drafter loaded — faster decode via speculative decoding")
+                          : "\(info.drafterStone?.label ?? "Assistant drafter") loaded — faster decode via speculative decoding")
             }
             Spacer()
             if info.bytesResident > 0 {
@@ -819,9 +822,10 @@ struct UpdateTrayRow: View {
                         ProgressView()
                             .controlSize(.small)
                     default:
-                        Button("Update") {
+                        Button {
                             Task { await updates.downloadAndInstall() }
-                        }
+                        } label: { Text("Update")
+                            .font(.app(.body)) }
                         .buttonStyle(.borderedProminent)
                         .controlSize(.small)
                         .help("Download v\(update.version), install, and relaunch")
@@ -1155,7 +1159,7 @@ struct ServerLogWindowView: View {
             Text(L10n.text(statusLabel))
                 .font(.app(.caption).weight(.medium))
                 .foregroundStyle(.secondary)
-            Text("·")
+            Text("·").font(.app(.body))
                 .foregroundStyle(.tertiary)
             // Byte counter from the poller mirror — same data the body
             // shows, so the number matches what's on screen rather than
@@ -1167,7 +1171,7 @@ struct ServerLogWindowView: View {
             Spacer()
 
             Toggle(isOn: $autoScroll) {
-                Label("Auto-scroll", systemImage: "arrow.down.to.line")
+                Label("Auto-scroll", systemImage: "arrow.down.to.line").font(.app(.body))
             }
             .toggleStyle(.button)
             .controlSize(.small)
@@ -1179,7 +1183,7 @@ struct ServerLogWindowView: View {
                 copyLog()
             } label: {
                 Label(L10n.text(copied ? "Copied" : "Copy"),
-                      systemImage: copied ? "checkmark" : "doc.on.doc")
+                      systemImage: copied ? "checkmark" : "doc.on.doc").font(.app(.body))
             }
             .controlSize(.small)
             .help("Copy the entire log to the clipboard")
@@ -1187,7 +1191,7 @@ struct ServerLogWindowView: View {
             Button {
                 saveLog()
             } label: {
-                Label("Save…", systemImage: "square.and.arrow.down")
+                Label("Save…", systemImage: "square.and.arrow.down").font(.app(.body))
             }
             .controlSize(.small)
             .help("Save the log to a .log file")
@@ -1195,7 +1199,7 @@ struct ServerLogWindowView: View {
             Button(role: .destructive) {
                 server.clearServerLog()
             } label: {
-                Label("Clear", systemImage: "trash")
+                Label("Clear", systemImage: "trash").font(.app(.body))
             }
             .controlSize(.small)
             .help("Clear the in-memory log buffer (does not affect the running server)")
@@ -1352,3 +1356,26 @@ struct TerminalLogTextView: NSViewRepresentable {
     }
 }
 
+/// The engine name as a tinted capsule, so it reads at a glance.
+struct EngineBadge: View {
+    let text: String
+    let tint: Color
+
+    var body: some View {
+        Text(text)
+            .font(.app(.caption).weight(.semibold))
+            .foregroundStyle(tint)
+            .padding(.horizontal, 8)
+            .padding(.vertical, 3)
+            .background(tint.opacity(0.15), in: Capsule())
+    }
+
+    static func tint(_ engine: ServerEngine) -> Color {
+        switch engine {
+        case .mlx:     return .accentColor
+        case .mlxGguf: return .teal
+        case .llama:   return .orange
+        case .dsv4:    return .purple
+        }
+    }
+}

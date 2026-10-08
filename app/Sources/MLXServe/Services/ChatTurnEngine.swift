@@ -47,6 +47,8 @@ struct TurnLedger {
     struct Turn {
         let token: UUID
         var liveTokens: Int = 0
+        /// The user switched Tools off while this turn ran.
+        var toolsRevoked = false
     }
 
     private(set) var turns: [UUID: Turn] = [:]
@@ -81,6 +83,14 @@ struct TurnLedger {
 
     func liveTokens(session: UUID) -> Int {
         turns[session]?.liveTokens ?? 0
+    }
+
+    mutating func revokeTools(session: UUID) {
+        turns[session]?.toolsRevoked = true
+    }
+
+    func toolsRevoked(session: UUID) -> Bool {
+        turns[session]?.toolsRevoked ?? false
     }
 
     /// Turns whose session no longer exists (the ghost-turn class): deleting
@@ -178,12 +188,14 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// composer.
     private func resumeWithSteeringNote(sessionId: UUID, token: UUID, config: TurnConfig,
                                         approval: @escaping (APIClient.ToolCall) async -> Bool) {
+        // Read before `endTurn` drops the turn that carries it.
+        let revoked = ledger.toolsRevoked(session: sessionId)
         guard endTurn(sessionId: sessionId, token: token),
               session(sessionId) != nil,
               Self.canRunTurn(serverRunning: server.status == .running, apple: appState.useAppleModel),
               let note = steering.take(for: sessionId) else { return }
-        runTurn(sessionId: sessionId, userText: note, images: nil, audio: nil,
-                config: config, approval: approval)
+        runTurn(sessionId: sessionId, userText: note, images: nil, videos: nil, audio: nil,
+                config: config.revokingTools(revoked), approval: approval)
     }
 
     /// The turn table: token-identified turn per session (see `TurnLedger`)
@@ -305,6 +317,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         var reasoningEffort: ReasoningEffort = .low
         /// The agent's own voice for this turn; nil = follow Settings.
         var voice: AgentVoice? = nil
+        /// A surface's own model pin (a scheduled task); nil = the picker's selection.
+        var modelPath: String? = nil
         /// The spoken name this turn answers to (the agent's phrase when it has
         /// one). nil = the app's own phrase.
         var wakePhrase: String? = nil
@@ -346,26 +360,53 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             thinking ? reasoningEffort.rawValue : nil
         }
 
-        /// The per-request defaults for this turn: the user's saved sampling
-        /// with the agent's overrides laid on top. An override REPLACES the
-        /// saved value — including with the canonical "off" (top_k 0, repeat
-        /// 1.0, presence 0.0, budget -1), which clears the global rather than
-        /// leaving it standing, mapped to an omitted field exactly as
-        /// `RequestDefaults.from` maps it.
-        func requestDefaults(from opts: ServerOptions) -> APIClient.RequestDefaults {
-            var d = APIClient.RequestDefaults.from(opts)
+        func thinkingForRequest(_ options: ServerOptions, inheritGeneration: Bool) -> Bool {
+            enableThinking || (!inheritGeneration && options.defaultEnableThinking)
+        }
+
+        /// Local servers resolve inherited generation defaults; explicit agent
+        /// values, including neutral values, stay in the request. Remote clients
+        /// retain their saved sampling behavior.
+        func requestDefaults(from opts: ServerOptions, inheritGeneration: Bool = false) -> APIClient.RequestDefaults {
+            var d = inheritGeneration ? APIClient.RequestDefaults() : APIClient.RequestDefaults.from(opts)
+            d.inheritGeneration = inheritGeneration
+            d.temperatureOverride = temperature
+            d.maxTokensOverride = maxTokens
+            if inheritGeneration {
+                d.enablePLD = opts.perRequestEnablePLD.asOptionalBool
+                d.enableDrafter = opts.perRequestEnableDrafter.asOptionalBool
+                d.topK = topK
+                d.repeatPenalty = repeatPenalty
+                d.presencePenalty = presencePenalty
+                d.reasoningBudget = reasoningBudget
+            } else {
+                if let v = topK { d.topK = v > 0 ? v : nil }
+                if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
+                if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
+                if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
+            }
             if let v = topP { d.topP = v }
-            if let v = topK { d.topK = v > 0 ? v : nil }
-            if let v = repeatPenalty { d.repeatPenalty = v != 1.0 ? v : nil }
-            if let v = presencePenalty { d.presencePenalty = v != 0.0 ? v : nil }
-            if let v = reasoningBudget { d.reasoningBudget = v >= 0 ? v : nil }
             return d
         }
 
-        /// The tools to ADVERTISE: none unless the loop is actually running.
-        /// (`tools` itself stays the dispatch allow-list, which must keep
-        /// `searchDocuments` for docs-only turns.)
+        /// The tools to ADVERTISE: none unless the Tools toggle is on.
         var advertisedTools: Set<AgentToolKind> { agentMode ? tools : [] }
+
+        /// The tools this turn may RUN. With Tools off the loop still runs for
+        /// MCP or an attached folder, and a model re-calls built-ins it saw in
+        /// history — so only the document search survives.
+        var dispatchTools: Set<AgentToolKind> {
+            agentMode ? tools : tools.intersection([.searchDocuments])
+        }
+
+        /// This turn with the Tools switch off; MCP and an attached folder keep
+        /// their say.
+        func revokingTools(_ revoked: Bool) -> TurnConfig {
+            guard revoked else { return self }
+            var c = self
+            c.agentMode = false
+            return c
+        }
     }
 
     // MARK: - Per-turn sampling
@@ -389,6 +430,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     // MARK: - Convenience accessors
 
     private var server: ServerManager { appState.server }
+    private func requestModelId(_ config: TurnConfig) -> String? {
+        server.chatRequestModelId(selectedPath: config.modelPath ?? appState.selectedModelPath)
+    }
     private var mcpManager: MCPManager { appState.mcpManager }
     private func session(_ id: UUID) -> ChatSession? {
         appState.chatSessions.first { $0.id == id }
@@ -463,6 +507,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         for sid in ledger.activeSessionIds { stop(sessionId: sid) }
     }
 
+    /// Tools switched off mid-turn: the running turn's next round and next
+    /// tool call see it (the turn itself keeps going for MCP or a folder).
+    func revokeTools(sessionId: UUID) {
+        ledger.revokeTools(session: sessionId)
+    }
+
     /// Stop one session's in-flight turn; other sessions keep streaming.
     func stop(sessionId: UUID) {
         guard ledger.activeSessionIds.contains(sessionId) else { return }
@@ -516,7 +566,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     func runTurn(sessionId: UUID,
                  userText: String,
                  images: [ChatImage]?,
-                 videos: [ChatVideo]? = nil,
+                 videos: [ChatVideo]?,
                  audio: [ChatAudio]?,
                  config: TurnConfig,
                  approval: @escaping (APIClient.ToolCall) async -> Bool) {
@@ -561,6 +611,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         else { return }
         let text = msgs[lastUserIdx].content
         let images = msgs[lastUserIdx].images
+        let videos = msgs[lastUserIdx].videos
         let audio = msgs[lastUserIdx].audio
         // The reply about to be destroyed. `truncateMessages` drops everything
         // from the last user turn onward, so this is the only moment it can be
@@ -568,7 +619,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // answer is the whole reason the pager exists.
         let replaced = msgs[(lastUserIdx + 1)...].last { $0.role == .assistant && !$0.content.isEmpty }
         appState.truncateMessages(in: sessionId, keepingFirst: lastUserIdx)
-        runTurn(sessionId: sessionId, userText: text, images: images, audio: audio,
+        runTurn(sessionId: sessionId, userText: text, images: images, videos: videos, audio: audio,
                 config: config, approval: approval)
         // AFTER runTurn, which opens with `stop(sessionId:)` — and stop is a
         // turn exit, so a seed placed before it would be spent immediately.
@@ -650,28 +701,24 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         // mode's style guidance (so spoken answers stay short and Markdown-free).
         // They share ONE system message, persona first.
         var messagesArray = history
-        var plainSystemBits: [String] = []
         let persona = config.systemPromptPrefix.trimmingCharacters(in: .whitespacesAndNewlines)
-        if !persona.isEmpty { plainSystemBits.append(persona) }
-        if config.voiceStyle {
-            // `hasPersona`: with an agent above it, the voice guidance must not
-            // name the assistant after the app's wake phrase — it's appended last,
-            // so that name would override the persona (live: an agent said it was
-            // called Jarvis).
-            plainSystemBits.append(VoicePrompt.systemPrompt(
-                phrase: config.wakePhrase ?? appState.serverOptions.wakePhrase,
-                hasPersona: !persona.isEmpty))
-        }
+        // `hasPersona`: with an agent above it, the voice guidance must not
+        // name the assistant after the app's wake phrase — it's appended last,
+        // so that name would override the persona (live: an agent said it was
+        // called Jarvis).
+        let voiceGuidance = config.voiceStyle
+            ? VoicePrompt.systemPrompt(phrase: config.wakePhrase ?? appState.serverOptions.wakePhrase,
+                                       hasPersona: !persona.isEmpty)
+            : ""
         // Third explicit ask: a skill the user invoked by NAME (`/music3 …`).
         // Plain chat builds its own system message, so this is a SECOND
         // construction site — the agent loop's injection does not cover it
         // (live: /music3 with Tools off answered from the model's own head).
         let invokedSkill = AgentPrompt.skillManager.invokedSkill(for: text)
-        if !invokedSkill.isEmpty { plainSystemBits.append(invokedSkill) }
-        if !plainSystemBits.isEmpty {
-            messagesArray.insert(["role": "system",
-                                  "content": plainSystemBits.joined(separator: "\n\n")],
-                                 at: 0)
+        if let system = Self.plainSystemPrompt(persona: persona, voiceGuidance: voiceGuidance,
+                                               invokedSkill: invokedSkill,
+                                               grounding: SystemGrounding.dateLine()) {
+            messagesArray.insert(["role": "system", "content": system], at: 0)
         }
 
         // Streaming placeholder for the UI — appended AFTER the request body is
@@ -702,7 +749,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                      token: UUID, continuing: Bool = false) async {
         var failed = false
         do {
-            let thinking = config.enableThinking || appState.serverOptions.defaultEnableThinking
+            let thinking = config.thinkingForRequest(appState.serverOptions,
+                                                      inheritGeneration: server.chatIsLocal)
             let stream: AsyncThrowingStream<SSEEvent, Error>
             if appState.useAppleModel {
                 // Apple's on-device model needs no server and no load.
@@ -722,8 +770,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 temperature: turnTemperature(config, default: appState.serverOptions.defaultTemperature),
                 enableThinking: thinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: thinking),
-                defaults: config.requestDefaults(from: appState.serverOptions),
-                modelId: server.chatModelId,
+                defaults: config.requestDefaults(from: appState.serverOptions,
+                                                  inheritGeneration: server.chatIsLocal),
+                modelId: requestModelId(config),
                 continueFinalMessage: continuing
             )
             }
@@ -858,7 +907,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
     /// Agent loop: call model with tools (streaming), execute tool calls, feed results back, repeat.
     /// Stops when the model responds with content (no tool calls) or after 150 iterations.
-    private func runAgentLoop(api: APIClient, sessionId: UUID, config: TurnConfig,
+    private func runAgentLoop(api: APIClient, sessionId: UUID, config turnConfig: TurnConfig,
                               workingDirectory initialWorkDir: String?,
                               approval: @escaping (APIClient.ToolCall) async -> Bool) async throws {
         var workingDirectory = initialWorkDir
@@ -890,6 +939,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
 
         for iteration in 0..<maxIterations {
             try Task.checkCancellation()
+            // Tools switched off mid-turn withdraw the OFFER; the system prompt
+            // stays the turn's, so it never claims a folder that is not there.
+            let config = turnConfig.revokingTools(ledger.toolsRevoked(session: sessionId))
 
             // Session deleted mid-turn → the turn is orphaned. Bail before
             // issuing another request: with the session gone every append
@@ -909,8 +961,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 messages: session(sessionId)?.messages ?? [],
                 contextLength: contextLength,
                 maxTokens: turnMax,
-                buildMultimodalContent: { text, images in
-                    Self.buildMultimodalContent(text: text, images: images, serverPreprocess: useServerPreprocess)
+                buildMultimodalContent: { text, msg in
+                    Self.buildMultimodalContent(text: text, images: msg.images ?? [], videos: msg.videos ?? [],
+                                                audio: msg.audio ?? [], serverPreprocess: useServerPreprocess)
                 },
                 historyImages: useServerPreprocess
             )
@@ -921,7 +974,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // Volatile context that changes mid-session — kept OUT of the
             // stable prefix and appended at the very end (see composeSystemPrompt).
             var agentVolatileTail = ""
-            if config.agentMode {
+            if turnConfig.agentMode {
                 let skills = AgentPrompt.skillManager.matchingSkills(for: userMsg)
                 // Stable, cacheable core: base instructions + execution
                 // environment + memory instructions + MCP listing. The model's
@@ -968,12 +1021,12 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             // A skill invoked by NAME (`/music3 …`) works in every mode: the
             // user asked for it explicitly, so it does not wait for the agent
             // loop's trigger matching (which also covers it, above).
-            if !config.agentMode {
+            if !turnConfig.agentMode {
                 agentVolatileTail += AgentPrompt.skillManager.invokedSkill(for: userMsg)
             }
             // Attached-docs section for the modes whose base prompt doesn't
             // already explain the searchDocuments tool.
-            if let index = config.documentIndex, config.agentMode || config.mcpMode {
+            if let index = config.documentIndex, turnConfig.agentMode || turnConfig.mcpMode {
                 systemPrompt += AgentPrompt.attachedDocumentsSection(
                     folderName: index.folderName, fileCount: indexedFileCount(index))
             }
@@ -1050,8 +1103,9 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                 enableThinking: config.enableThinking,
                 reasoningEffort: config.reasoningEffortParam(thinking: config.enableThinking),
                 toolsJSON: combinedToolsJSON,
-                defaults: config.requestDefaults(from: appState.serverOptions),
-                modelId: server.chatModelId
+                defaults: config.requestDefaults(from: appState.serverOptions,
+                                                  inheritGeneration: server.chatIsLocal),
+                modelId: requestModelId(config)
             )
             }
 
@@ -1332,7 +1386,8 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                     },
                     processRegistry: appState.processRegistry,
                     sessionId: sessionId,
-                    allowedTools: config.tools
+                    // Re-read: Tools can go off while this round streamed.
+                    allowedTools: config.revokingTools(ledger.toolsRevoked(session: sessionId)).dispatchTools
                 )
                 roundOutputs.append(result.output)
                 if let handle = result.backgroundHandle { roundHandles.append(handle) }
@@ -1520,6 +1575,7 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
             case .image:  return try await runImageTool(args, onProgress: onProgress)
             case .speech: return try await runSpeechTool(args, onProgress: onProgress)
             case .music:  return try await runMusicTool(args, onProgress: onProgress)
+            case .sound:  return try await runSoundTool(args, onProgress: onProgress)
             case .video:  return try await runVideoTool(args, onProgress: onProgress)
             }
         } catch let missing as MediaToolArgs.MissingArgument {
@@ -1606,6 +1662,21 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
         return "\(caption)\n\(AgentMediaInline.mediaRefLine(kind: .audio, path: path))"
     }
 
+    private func runSoundTool(_ args: [String: String],
+                              onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
+        let s = SoundGenSettings.load()
+        let model = s.resolvedModel(models: appState.server.allModels)
+        let lanId = LanPick.lanId(s.modelId)
+        if let notice = notDownloadedNotice(repo: model.repo, name: model.name,
+                                            approxGB: String(format: "%.1f", model.approxDownloadGB),
+                                            window: "Audio", lanId: lanId) { return notice }
+        let req = try MediaToolArgs.sound(args, model: model, keepResident: s.keepResident, lanId: lanId)
+        let path = try await appState.soundGen.generateForAgent(req, server: appState.server,
+                                                                onProgress: onProgress)
+        let caption = String(format: "Generated a %.1fs sound for: %@. Saved to %@.", req.durationSeconds, req.prompt, path)
+        return "\(caption)\n\(AgentMediaInline.mediaRefLine(kind: .audio, path: path))"
+    }
+
     private func runVideoTool(_ args: [String: String],
                               onProgress: @escaping (MediaGenProgress) -> Void) async throws -> String {
         let s = VideoGenSettings.load()
@@ -1640,16 +1711,17 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
     /// LAN IP) change mid-session, so they go LAST — a change there re-prefills
     /// only the short tail, not the big cached prefix. Pure → unit-tested.
     /// `persona` (the active agent's system prompt) REPLACES the whole
-    /// composition: an agent's prompt is the entire system prompt, so the
-    /// normal instructions never ride along to compete with it. The
+    /// composition but `grounding`, so the normal instructions never ride along
+    /// to compete with it; grounding states facts, not an identity, and is the
+    /// only way a persona learns today's date. The
     /// agent-prompt body opens with its own identity claim ("You are an
     /// autonomous agent…"), which sat right after the persona and overrode it
     /// (live 2026-07-29: Laguna answered "who are you?" with "I'm poolside
     /// Malibu" under an Elon Musk persona) — the composeSystemPrompt instance
     /// of the voice-prompt "Jarvis" class. Tools still ride the request's
     /// tools JSON, so tool dispatch is unaffected; the agent's prompt has to
-    /// carry anything else it needs (matching plain chat, where a persona is
-    /// already the whole system message). Persona is "" when there's no agent,
+    /// carry anything else it needs, as on the plain-chat path
+    /// (`plainSystemPrompt`). Persona is "" when there's no agent,
     /// and the result is then byte-identical to what this produced before
     /// agents existed.
     nonisolated static func composeSystemPrompt(persona: String = "",
@@ -1657,11 +1729,23 @@ final class ChatTurnEngine: ObservableObject, TurnRunning {
                                                 volatileTail: String,
                                                 grounding: String) -> String {
         if !persona.isEmpty {
-            return persona.trimmingCharacters(in: .whitespacesAndNewlines)
+            let p = persona.trimmingCharacters(in: .whitespacesAndNewlines)
+            return grounding.isEmpty ? p : p + "\n\n" + grounding
         }
         var p = stable + volatileTail
         if !grounding.isEmpty { p += "\n\n" + grounding }
         return p
+    }
+
+    /// The one system message a plain turn sends, nil when it needs none: plain
+    /// chat synthesizes nothing of its own. A persona carries `grounding`, as on
+    /// the agent path, unless voice guidance follows: it states date and time itself.
+    nonisolated static func plainSystemPrompt(persona: String, voiceGuidance: String,
+                                              invokedSkill: String, grounding: String) -> String? {
+        let personaGrounding = persona.isEmpty || !voiceGuidance.isEmpty ? "" : grounding
+        let text = [persona, personaGrounding, voiceGuidance, invokedSkill]
+            .filter { !$0.isEmpty }.joined(separator: "\n\n")
+        return text.isEmpty ? nil : text
     }
 
     /// Nudge for a tool call cut off by the token cap (the call was NOT

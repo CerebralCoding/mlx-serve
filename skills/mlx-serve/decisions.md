@@ -1,11 +1,23 @@
-# mlx-serve decisions (Laya): `POST /v1/decisions`
+# mlx-serve decisions (Laya, Kev, Clef): `POST /v1/decisions`
 
-A Laya model (capability `decisions`) answers typed questions about a STATE in
-milliseconds, with calibrated probabilities instead of free text. Use it for game
-logic an LLM is too slow or too unpredictable for: NPC intent, dialogue routing,
-moderation, "is the player stuck", "which quest fits this situation",
-difficulty scoring. It never generates text; pair it with a chat model when you
-also need words.
+A decision model (capability `decisions`) answers typed questions about a STATE
+with probabilities instead of free text. Use it for game logic an LLM is too
+slow or too unpredictable for: NPC intent, dialogue routing, moderation, "is
+the player stuck", "which quest fits this situation", difficulty scoring. It
+never generates text; pair it with a chat model when you also need words.
+
+Three families share this endpoint (also available as `POST /v1/systemone`):
+
+- **Laya** (model type `laya`, ~0.35 GB): a few milliseconds per request.
+  Pick it when you call often and speed matters most.
+- **Kev** (model type `kev`, ~4 GB): about 60 ms per question on an M4 Max,
+  and often more accurate on nuanced text (on one 2,394-headline news-labeling
+  test: Laya 55%, Kev-4B 79%). Pick it when getting the answer right matters
+  more than speed.
+- **Clef / Clef-Flash** (model type `clef`): jointly score all questions over
+  text and optional images. MLX 4-bit and 8-bit packs are supported.
+
+`GET /v1/models` shows which one a model is in `meta.architecture`; use whichever is installed.
 
 ## Request
 
@@ -33,10 +45,16 @@ also need words.
   - `noul`: yes/no. Optional `criteria: {"false": "...", "true": "..."}`
     describing each side.
   - `choice`: pick one label. `criteria` is a list of unique labels, or an
-    object `{label: description}` (descriptions improve accuracy).
+    object `{label: description}` (descriptions improve accuracy). Clef requires
+    the object form; use `null` for labels without descriptions.
   - `score`: ordinal scale. `criteria` is a list from low to high; items may be
     strings or objects.
-- `instructions`: the question, in plain words. Required.
+- `instructions`: the question, in plain words. Required for Laya; Kev
+  and Clef accept a question without it, but always send it.
+- Clef accepts `images`, an array of base64 strings or image data URLs (up to
+  16). Remote image URLs, videos and `media_kwargs` are rejected. Its context
+  limit is 16,384 tokens: the state is truncated by default, preserving the
+  schema. Set `truncate: false` to reject an oversized state instead.
 
 ## Response
 
@@ -59,12 +77,15 @@ also need words.
   its probability that the answer is safe to act on rather than escalate. Gate
   game behavior on them: act above a threshold you tune, fall back to a default
   below it.
+- Kev and Clef answers have no `action`, and their `noul` answers no `confidence`; gate
+  on the probability itself (`noul`, or the chosen label's probability).
 - The numbers are illustrative; always read them from the response.
 
 ## Usage notes
 
 - Fast enough for per-event calls (NPC turn, room enter, chat message), not per
-  frame. Debounce and cache by state hash.
+  frame. Debounce and cache by state hash. Kev answers questions one after
+  another, so its request time grows with the number of questions.
 - Same state + same questions = same answers. Change the wording of
   `instructions` or add criteria descriptions to steer it, then re-test.
 - Errors are 400s naming the problem (`question 'type' must be one of choice,

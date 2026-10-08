@@ -146,9 +146,9 @@ struct SettingsView: View {
         EngineAwareSections()
         SettingsSection(
             category: .requestDefaults,
-            subtitle: "Apply on the next chat request — no restart needed."
+            subtitle: "Server generation defaults for all clients — next request, no restart."
         ) {
-            RequestDefaultsSectionContent()
+            GlobalGenerationDefaultsView()
         }
 
         SettingsSection(
@@ -237,12 +237,12 @@ private struct SettingsSidebar: View {
                 onPick()
             }
         )) {
-            Label("All Settings", systemImage: "square.grid.2x2")
+            Label("All Settings", systemImage: "square.grid.2x2").font(.app(.body))
                 .tag(SettingsSelection.all)
             Section {
                 ForEach(categories) { category in
                     Label(L10n.text(category.sidebarLabel), systemImage: category.icon)
-                        .tag(SettingsSelection.category(category))
+                        .tag(SettingsSelection.category(category)).font(.app(.body))
                 }
             }
         }
@@ -295,7 +295,7 @@ private struct SettingsVisibleRowCountKey: PreferenceKey {
 /// Wraps one row so the filter can hide it, and reports it as visible when it
 /// survives. `searchText` is conventionally `[label, description]` — the same
 /// text the row renders, so what you read is what you can search for.
-private struct SearchableRow<Content: View>: View {
+struct SearchableRow<Content: View>: View {
     let searchText: [String]
     @ViewBuilder var content: Content
 
@@ -317,7 +317,7 @@ private struct SettingsSearchField: View {
             Image(systemName: "magnifyingglass")
                 .foregroundStyle(.secondary)
             TextField("Filter settings", text: $text)
-                .textFieldStyle(.plain)
+                .textFieldStyle(.plain).font(.app(.body))
             if !text.isEmpty {
                 Button {
                     text = ""
@@ -351,7 +351,8 @@ private struct NoSearchResults: View {
             Text(L10n.format("No settings match \"%@\"", query))
                 .font(.app(.subheadline))
                 .foregroundStyle(.secondary)
-            Button(L10n.text("Clear filter"), action: clear)
+            Button(action: clear, label: { Text(L10n.text("Clear filter"))
+                .font(.app(.body)) })
                 .buttonStyle(.bordered)
                 .controlSize(.small)
         }
@@ -368,6 +369,7 @@ private struct ResetDefaultsFooter: View {
     @EnvironmentObject var appState: AppState
     @Environment(\.settingsSelection) private var selection
     @State private var showConfirm = false
+    @State private var resetError: String?
 
     private var label: String { SettingsReset.buttonLabel(selection) }
 
@@ -387,23 +389,34 @@ private struct ResetDefaultsFooter: View {
                     Button(role: .destructive) {
                         showConfirm = true
                     } label: {
-                        Label(L10n.text(label), systemImage: "arrow.uturn.backward.circle")
+                        Label(L10n.text(label), systemImage: "arrow.uturn.backward.circle").font(.app(.body))
                     }
                     .buttonStyle(.bordered)
                     .controlSize(.small)
                     .help(helpText)
                 }
                 .padding(.top, 4)
+                .overlay(alignment: .bottomLeading) {
+                    if let resetError { Text(verbatim: resetError).font(.app(.caption)).foregroundStyle(.red) }
+                }
                 .confirmationDialog(
                     SettingsReset.confirmTitle(selection),
                     isPresented: $showConfirm,
                     titleVisibility: .visible
                 ) {
-                    Button("Reset", role: .destructive) {
-                        appState.serverOptions = SettingsReset.apply(selection, to: appState.serverOptions)
-                    }
+                    Button(role: .destructive) {
+                        do {
+                            if selection == .all || selection == .category(.requestDefaults) {
+                                try GenerationDefaultsFile.save(.init())
+                            }
+                            appState.serverOptions = SettingsReset.apply(selection, to: appState.serverOptions)
+                            resetError = nil
+                        } catch { resetError = "Could not reset generation defaults: \(error.localizedDescription)" }
+                    } label: { Text("Reset")
+                        .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
-                    Button("Cancel", role: .cancel) { }
+                    Button(role: .cancel) { } label: { Text("Cancel")
+                        .font(.app(.body)) }
                 } message: {
                     Text(L10n.text(helpText))
                 }
@@ -431,18 +444,19 @@ private struct RestartBanner: View {
                     .foregroundStyle(.secondary)
             }
             Spacer()
-            Button("Restart Now") {
+            Button {
                 let opts = appState.serverOptions
                 let model = appState.selectedModelPath
                 server.stop()
                 if !model.isEmpty {
                     server.start(modelPath: model, options: opts)
                 }
-            }
+            } label: { Text("Restart Now")
+                .font(.app(.body)) }
             .buttonStyle(.borderedProminent)
             .disabled(appState.selectedModelPath.isEmpty)
 
-            Button("Discard") {
+            Button {
                 if let last = server.lastLaunchedOptions {
                     // Revert every server-launch field to the last-launched
                     // snapshot; per-request defaults are preserved. Start
@@ -463,7 +477,8 @@ private struct RestartBanner: View {
                     reverted.perRequestEnableDrafter = current.perRequestEnableDrafter
                     appState.serverOptions = reverted
                 }
-            }
+            } label: { Text("Discard")
+                .font(.app(.body)) }
             .buttonStyle(.bordered)
             .disabled(server.lastLaunchedOptions == nil)
         }
@@ -478,8 +493,8 @@ private struct RestartBanner: View {
 
 /// Renders the engine-specific section set for the active model:
 ///   - MLX target:   Common Performance + MLX Performance + MLX Spec Decode
-///   - GGUF target:  Common Performance + GGUF Performance
-///   - DSV4 target:  Common Performance + DeepSeek-V4 (ds4) section
+///   - GGUF / DSV4:  Common Performance
+///   Engines (every engine's own flags) always renders.
 ///   - No model yet: All sections shown (so users can pre-tune before
 ///                   loading); a banner clarifies that some controls only
 ///                   apply once a matching engine is loaded.
@@ -496,9 +511,7 @@ private struct EngineAwareSections: View {
     var body: some View {
         // Engine-specific sections. Show all when no model is loaded so
         // the user can pre-tune; otherwise show only the matching set.
-        let showMLX = (engine == nil || engine == .mlx)
-        let showLlama = (engine == nil || engine == .llama)
-        let showDs4 = (engine == nil || engine == .dsv4)
+        let showMLX = engine?.isMlxPath ?? true
 
         if showMLX {
             SettingsSection(
@@ -509,14 +522,21 @@ private struct EngineAwareSections: View {
             }
         }
 
+        SettingsSection(
+            category: .memory,
+            subtitle: "How much memory the engine may use: resident models, the OS reserve, the KV cache and the hot prefix cache. Server-launch flags — restart to apply."
+        ) {
+            MemorySectionContent(showMLX: showMLX)
+        }
+
         // ONE Performance section. The universal rows always apply; the MLX-only
-        // ones (continuous batching, KV-quant, hot prefix cache) join them when
-        // an MLX model is serving — on GGUF/DSV4 they'd silently no-op, so they
-        // stay hidden rather than lie.
+        // ones (continuous batching, attention requant, SSD prefix cache) join
+        // them when an MLX model is serving — on GGUF/DSV4 they'd silently no-op,
+        // so they stay hidden rather than lie.
         SettingsSection(
             category: .performance,
             subtitle: showMLX
-                ? "Continuous batching, KV-cache quantization, and the cross-request hot prefix cache. Server-launch flags — restart to apply."
+                ? "Continuous batching, decode attention requant, and the SSD prefix cache. Server-launch flags — restart to apply."
                 : "Tunables that apply regardless of engine. Server-launch flags — restart to apply."
         ) {
             CommonPerformanceSectionContent()
@@ -534,22 +554,14 @@ private struct EngineAwareSections: View {
             NeuralEngineSectionContent()
         }
 
-        if showLlama {
-            SettingsSection(
-                category: .ggufPerformance,
-                subtitle: "Knobs that apply when an embedded llama.cpp engine is serving a `.gguf` model. Distinct from the MLX Performance section — different kernels, different KV layout."
-            ) {
-                LlamaPerformanceSectionContent()
-            }
-        }
-
-        if showDs4 {
-            SettingsSection(
-                category: .ds4,
-                subtitle: "Knobs for the embedded ds4 engine serving DeepSeek-V4-Flash. Ignored by the MLX and llama.cpp engines."
-            ) {
-                Ds4PerformanceSectionContent()
-            }
+        // Always on screen: these rows configure engines that are NOT loaded
+        // yet, so gating them on the active engine hid the way to opt into
+        // the next one.
+        SettingsSection(
+            category: .engines,
+            subtitle: "Launch flags for each embedded engine. A .gguf file goes to llama.cpp, or to ds4 for DeepSeek-V4-Flash; mlx-serve-gguf can take the ones it supports instead. Restart the server to apply."
+        ) {
+            EnginesSectionContent()
         }
 
         // The pre-tune banner explains why EVERY engine section is on screen —
@@ -658,7 +670,7 @@ private struct SettingsRow<Control: View>: View {
                 HStack(alignment: .firstTextBaseline) {
                     HStack(spacing: 6) {
                         Text(L10n.text(title))
-                            .font(.app(.body))
+                            .font(.app(.rowTitle))
                         if isDirty {
                             Image(systemName: "arrow.clockwise.circle.fill")
                                 .font(.app(.caption))
@@ -671,12 +683,12 @@ private struct SettingsRow<Control: View>: View {
                         .frame(maxWidth: 280, alignment: .trailing)
                 }
             Text(L10n.text(explainer))
-                    .font(.app(.caption2))
+                    .font(.app(.explainer))
                     .foregroundStyle(.secondary)
                     .fixedSize(horizontal: false, vertical: true)
                 if let cost {
                     Text(L10n.text(cost))
-                        .font(.app(.caption))
+                        .font(.app(.value))
                         .fontWeight(costActive ? .semibold : .regular)
                         .foregroundStyle(costActive ? Color.orange : Color.secondary)
                         .fixedSize(horizontal: false, vertical: true)
@@ -746,13 +758,15 @@ private struct ModelFoldersSectionContent: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .frame(maxWidth: 220, alignment: .trailing)
-                        Button("Choose…") { chooseDownloadFolder() }
+                        Button { chooseDownloadFolder() } label: { Text("Choose…")
+                            .font(.app(.body)) }
                             .buttonStyle(.bordered)
-                        Button("Reset") {
+                        Button {
                             SecurityScopedBookmark.clear(name: DownloadManager.downloadFolderBookmarkName)
                             ModelRoots().configuredDownloadRoot = nil
                             applyFolderChange()
-                        }
+                        } label: { Text("Reset")
+                            .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .disabled(configured == nil)
                     }
@@ -818,12 +832,14 @@ private struct ModelFoldersSectionContent: View {
                             .lineLimit(1)
                             .truncationMode(.middle)
                             .frame(maxWidth: 220, alignment: .trailing)
-                        Button("Choose…") { choose() }
+                        Button { choose() } label: { Text("Choose…")
+                            .font(.app(.body)) }
                             .buttonStyle(.bordered)
-                        Button("Clear") {
+                        Button {
                             downloads.customRoot = nil
                             appState.refreshModels()
-                        }
+                        } label: { Text("Clear")
+                            .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .disabled(!hasPath)
                     }
@@ -871,7 +887,7 @@ private struct LanSharingSectionContent: View {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanShareEnabled)) {
                 Toggle("", isOn: $appState.serverOptions.lanShareEnabled)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if appState.serverOptions.lanShareEnabled {
@@ -879,7 +895,7 @@ private struct LanSharingSectionContent: View {
                 SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanShareAll)) {
                     Toggle("", isOn: $appState.serverOptions.lanShareAll)
                         .labelsHidden()
-                        .toggleStyle(.switch)
+                        .toggleStyle(.switch).font(.app(.body))
                 }
             }
             if !appState.serverOptions.lanShareAll {
@@ -894,7 +910,7 @@ private struct LanSharingSectionContent: View {
                     )
                     .textFieldStyle(.roundedBorder)
                     .multilineTextAlignment(.trailing)
-                    .frame(width: 200)
+                    .frame(width: 200).font(.app(.body))
                 }
             }
         }
@@ -902,7 +918,7 @@ private struct LanSharingSectionContent: View {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.lanDiscoverEnabled)) {
                 Toggle("", isOn: $appState.serverOptions.lanDiscoverEnabled)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         // The privacy disclosure — sharing means running other people's
@@ -980,9 +996,8 @@ private struct ProvidersSectionContent: View {
                             serverPort: server.port,
                             status: status.first { $0.name == entry.name },
                             duplicate: ProvidersFile.duplicateNames(formState.providerEntries).contains(entry.name),
-                            onDelete: {
-                                formState.providerEntries.removeAll { $0.id == entry.id }
-                                formState.providerModelText[entry.id] = nil
+                            onDelete: { [id = entry.id] in
+                                formState.removeProvider(id: id)
                                 save()
                             },
                             onCommit: save)
@@ -992,7 +1007,8 @@ private struct ProvidersSectionContent: View {
                 Spacer()
                 // Fields also save on Enter, but an edit followed by a click
                 // elsewhere never submits — this is the button that always writes.
-                Button("Save") { save() }
+                Button { save() } label: { Text("Save")
+                    .font(.app(.body)) }
                 .keyboardShortcut("s", modifiers: .command)
                 .help("Write providers.json and ask the server to re-probe now")
             }
@@ -1070,7 +1086,7 @@ private struct ProviderRow: View {
                 Toggle("", isOn: $entry.enabled)
                     .labelsHidden()
                     .toggleStyle(.switch)
-                    .onChange(of: entry.enabled) { _, _ in onCommit() }
+                    .onChange(of: entry.enabled) { _, _ in onCommit() }.font(.app(.body))
                 Button(role: .destructive, action: onDelete) { Image(systemName: "trash") }
                     .buttonStyle(.borderless)
                     .help("Remove this provider")
@@ -1091,7 +1107,8 @@ private struct ProviderRow: View {
                         entry.models = ProviderEntry.parseModelList(t ?? "")
                     }
                     .onSubmit(onCommit)
-                Button(L10n.text("Pick…")) { picking = true }
+                Button { picking = true } label: { Text(L10n.text("Pick…"))
+                    .font(.app(.body)) }
                     .disabled(entry.problem() != nil)
                     .help(L10n.text("Fetch the provider's model list and tick the ones to expose"))
             }
@@ -1160,13 +1177,16 @@ private struct ProviderModelPickerSheet: View {
             }
             HStack {
                 Text("\(chosen.count) of \(ids.count) selected").font(.app(.caption)).foregroundStyle(.secondary)
-                Button("Clear") { chosen = [] }.disabled(chosen.isEmpty)
+                Button { chosen = [] } label: { Text("Clear")
+                    .font(.app(.body)) }.disabled(chosen.isEmpty)
                 Spacer()
-                Button("Cancel") { dismiss() }.keyboardShortcut(.cancelAction)
-                Button("Done") {
+                Button { dismiss() } label: { Text("Cancel")
+                    .font(.app(.body)) }.keyboardShortcut(.cancelAction)
+                Button {
                     onDone(ids.filter { chosen.contains($0) })
                     dismiss()
-                }
+                } label: { Text("Done")
+                    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
                 .disabled(loading)
             }
@@ -1257,7 +1277,7 @@ private struct ServerSectionContent: View {
         ) {
             Toggle("", isOn: $appState.autoStartServer)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
         SettingsRow(
             title: "Preload the model when the server starts",
@@ -1265,7 +1285,7 @@ private struct ServerSectionContent: View {
         ) {
             Toggle("", isOn: $appState.loadModelAtStart)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
         SettingsRow(
             title: "Which model",
@@ -1278,7 +1298,7 @@ private struct ServerSectionContent: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .disabled(!appState.loadModelAtStart)
+            .disabled(!appState.loadModelAtStart).font(.app(.body))
         }
         SettingsRow(
             title: "Model",
@@ -1288,16 +1308,16 @@ private struct ServerSectionContent: View {
                 Picker("", selection: startupModelDisplay) {
                     let dupNames = LocalModel.duplicateNames(in: pickable)
                     ForEach(pickable) { model in
-                        Text(L10n.text(startupModelLabel(model, dupNames: dupNames))).tag(model.path)
+                        Text(L10n.text(startupModelLabel(model, dupNames: dupNames))).font(.app(.body)).tag(model.path)
                     }
                     // A selection that matches no row renders blank, so empty and
                     // uninstalled selections each get a row of their own.
                     if startupModelDisplay.wrappedValue.isEmpty {
-                        Text(L10n.text("None — starts with no model")).tag("")
+                        Text(L10n.text("None — starts with no model")).font(.app(.body)).tag("")
                     }
                     if !appState.startupModelPinnedPath.isEmpty,
                        !pickable.contains(where: { $0.path == appState.startupModelPinnedPath }) {
-                        Text("\((appState.startupModelPinnedPath as NSString).lastPathComponent) — no longer installed")
+                        Text("\((appState.startupModelPinnedPath as NSString).lastPathComponent) — no longer installed").font(.app(.body))
                             .tag(appState.startupModelPinnedPath)
                     }
                 }
@@ -1345,7 +1365,7 @@ private struct ServerSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.noVision)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["enableMetrics"] {
@@ -1356,7 +1376,7 @@ private struct ServerSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.enableMetrics)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["apiKey"] {
@@ -1374,7 +1394,7 @@ private struct ServerSectionContent: View {
                     prompt: Text("none")
                 )
                 .textFieldStyle(.roundedBorder)
-                .frame(width: 180)
+                .frame(width: 180).font(.app(.body))
             }
         }
         if let m = meta["toolAutocorrect"] {
@@ -1385,7 +1405,7 @@ private struct ServerSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.toolAutocorrect)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["logLevel"] {
@@ -1396,12 +1416,12 @@ private struct ServerSectionContent: View {
             ) {
                 Picker("", selection: $appState.serverOptions.logLevel) {
                     ForEach(ServerOptions.LogLevel.allCases) { lvl in
-                        Text(L10n.text(lvl.label)).tag(lvl)
+                        Text(L10n.text(lvl.label)).font(.app(.body)).tag(lvl)
                     }
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
-                .frame(minWidth: 180)
+                .frame(minWidth: 180).font(.app(.body))
             }
         }
         if let m = meta["logToFile"] {
@@ -1412,72 +1432,7 @@ private struct ServerSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.logToFile)
                     .labelsHidden()
-                    .toggleStyle(.switch)
-            }
-        }
-        if let m = meta["maxResidentMemGB"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.maxResidentMemGB)
-            ) {
-                let gb = appState.serverOptions.maxResidentMemGB
-                snappingSlider(
-                    presets: ServerOptions.residentMemPresets(
-                        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory),
-                    current: gb,
-                    set: { appState.serverOptions.maxResidentMemGB = $0 },
-                    label: gb == 0 ? "Auto" : "\(gb) GB"
-                )
-            }
-        }
-        if let m = meta["maxResidentModels"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.maxResidentModels)
-            ) {
-                Stepper(value: $appState.serverOptions.maxResidentModels, in: 1...8) {
-                    Text("\(appState.serverOptions.maxResidentModels)")
-                        .font(.app(.body).monospacedDigit())
-                }
-            }
-        }
-        if let m = meta["idleEvictSecs"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.idleEvictSecs)
-            ) {
-                let secs = appState.serverOptions.idleEvictSecs
-                snappingSlider(
-                    presets: ServerOptions.idleEvictPresets,
-                    current: secs,
-                    set: { appState.serverOptions.idleEvictSecs = $0 },
-                    label: ServerOptions.idleEvictLabel(secs)
-                )
-            }
-        }
-        if let m = meta["skipMemPreflight"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.skipMemPreflight)
-            ) {
-                Toggle("", isOn: $appState.serverOptions.skipMemPreflight)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-            }
-        }
-        if let m = meta["osMemoryReserve"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.osMemoryReserve)
-            ) {
-                Toggle("", isOn: $appState.serverOptions.osMemoryReserve)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
     }
@@ -1690,20 +1645,18 @@ private struct SpecDecodeSectionContent: View {
         ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
 
-    /// `draftBlockSize` stays CLI-only — `recommendedBlockSize` in drafter.zig
-    /// auto-picks per target (E2B=2, E4B=4, 31B=8, 26B-A4B=4); the field is
-    /// kept in ServerOptions so power users who set it via CLI keep working.
-
     var body: some View {
         let opts = $appState.serverOptions
         // Drafter and PLD are mutually exclusive at the request level
         // (`drafter > PLD > regular` in src/server.zig). When drafter is on
         // we lock the PLD toggles down so users can't accidentally enable a
         // setting that would never apply.
-        let drafterActive = !appState.serverOptions.drafterPath.isEmpty
+        let drafterActive = server.chatModelInfo?.drafterLoaded ?? false
         let pldUsable = appState.serverOptions.enablePLD && !drafterActive
 
-        DrafterRow()
+        Text(L10n.text("Drafters are chosen per model: Model Settings, Speculation."))
+            .font(.app(.caption2))
+            .foregroundStyle(.secondary)
         if let m = meta["enablePLD"] {
             let suffix = drafterActive
                 ? " Locked off while Drafter is on (Drafter takes priority)."
@@ -1716,7 +1669,7 @@ private struct SpecDecodeSectionContent: View {
                 Toggle("", isOn: opts.enablePLD)
                     .labelsHidden()
                     .toggleStyle(.switch)
-                    .disabled(drafterActive)
+                    .disabled(drafterActive).font(.app(.body))
             }
         }
         if let m = meta["pldDraftLen"] {
@@ -1760,7 +1713,7 @@ private struct SpecDecodeSectionContent: View {
             ) {
                 Toggle("", isOn: opts.enableMTP)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["mtpDepth"] {
@@ -1779,30 +1732,18 @@ private struct SpecDecodeSectionContent: View {
                     // without benchmarking. It DISPLAYS what it resolved to
                     // instead (MLX_SERVE_SPEC_COST_PROBE=0 is the A/B arm).
                     if let specCost = server.specCost {
-                        Text(L10n.format("Automatic (measured: %lld tokens)", Int64(specCost.mtpDepthCap))).tag(0)
+                        Text(L10n.format("Automatic (measured: %lld tokens)", Int64(specCost.mtpDepthCap))).font(.app(.body)).tag(0)
                     } else {
-                        Text(L10n.text("Automatic")).tag(0)
+                        Text(L10n.text("Automatic")).font(.app(.body)).tag(0)
                     }
                     ForEach(1...6, id: \.self) { n in
-                        Text("\(n) token\(n == 1 ? "" : "s")").tag(n)
+                        Text("\(n) token\(n == 1 ? "" : "s")").font(.app(.body)).tag(n)
                     }
                 }
                 .labelsHidden()
                 .pickerStyle(.menu)
                 .frame(width: 140)
-                .disabled(!appState.serverOptions.enableMTP)
-            }
-        }
-        if let m = meta["mtpOnMoE"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.mtpOnMoE)
-            ) {
-                Toggle("", isOn: opts.mtpOnMoE)
-                    .labelsHidden()
-                    .toggleStyle(.switch)
-                    .disabled(!appState.serverOptions.enableMTP)
+                .disabled(!appState.serverOptions.enableMTP).font(.app(.body))
             }
         }
         // DSpark is DeepSeek-V4's own draft — independent of the Qwen MTP
@@ -1815,7 +1756,7 @@ private struct SpecDecodeSectionContent: View {
             ) {
                 Toggle("", isOn: opts.enableDSpark)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
     }
@@ -1891,54 +1832,7 @@ private struct PerformanceSectionContent: View {
                     set: { appState.serverOptions.decodeAttnQuantChoice = $0 }
                 ))
                 .labelsHidden()
-                .toggleStyle(.switch)
-            }
-        }
-        if let m = meta["kvQuant"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.kvQuant)
-            ) {
-                Picker("", selection: opts.kvQuant) {
-                    ForEach(ServerOptions.KVQuant.allCases) { q in
-                        Text(L10n.text(q.label)).tag(q)
-                    }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(minWidth: 220)
-            }
-        }
-        if let m = meta["prefixCacheEntries"] {
-            // Surface the RAM clamp so a 16 GB Mac user who sets, say, 8 sees
-            // that the launcher will actually pass 1 (and why).
-            let ram = ProcessInfo.processInfo.physicalMemory
-            let set = appState.serverOptions.prefixCacheEntries
-            let effective = ServerOptions.ramCappedPrefixCacheEntries(set, physicalMemoryBytes: ram)
-            let capNote = effective < set
-                ? "  ·  This Mac (\(MemoryInfo.format(Int64(ram)))) launches with \(effective) to keep cache memory bounded."
-                : ""
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer + capNote,
-                isDirty: dirty.dirty(\.prefixCacheEntries)
-            ) {
-                Stepper(value: opts.prefixCacheEntries, in: 0...16) {
-                    Text("\(appState.serverOptions.prefixCacheEntries)")
-                        .font(.app(.body).monospacedDigit())
-                }
-            }
-        }
-        if let m = meta["prefixCacheMem"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.prefixCacheMem)
-            ) {
-                TextField("", text: opts.prefixCacheMem, prompt: Text("Auto"))
-                    .textFieldStyle(.roundedBorder)
-                    .frame(width: 110)
+                .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["enablePrefixCacheDisk"] {
@@ -1949,7 +1843,7 @@ private struct PerformanceSectionContent: View {
             ) {
                 Toggle("", isOn: opts.enablePrefixCacheDisk)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["prefixCacheDisk"], appState.serverOptions.enablePrefixCacheDisk {
@@ -1961,6 +1855,173 @@ private struct PerformanceSectionContent: View {
                 TextField("", text: opts.prefixCacheDisk, prompt: Text("10GB"))
                     .textFieldStyle(.roundedBorder)
                     .frame(width: 110)
+            }
+        }
+    }
+}
+
+// MARK: - Memory section
+
+/// Every engine memory knob in one place. The resident-model limits, the OS
+/// reserve and the preflight apply to every engine; the KV and prefix-cache rows
+/// and the n-gram table are MLX-only and hide when a GGUF/DSV4 model is serving.
+private struct MemorySectionContent: View {
+    let showMLX: Bool
+    @EnvironmentObject var appState: AppState
+    @EnvironmentObject var server: ServerManager
+
+    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
+    private var dirty: ServerLaunchDirty {
+        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
+    }
+
+    var body: some View {
+        let opts = $appState.serverOptions
+
+        if let m = meta["maxResidentMemGB"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.maxResidentMemGB)
+            ) {
+                let gb = appState.serverOptions.maxResidentMemGB
+                snappingSlider(
+                    presets: ServerOptions.residentMemPresets(
+                        physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory),
+                    current: gb,
+                    set: { appState.serverOptions.maxResidentMemGB = $0 },
+                    label: gb == 0 ? "Auto" : "\(gb) GB"
+                )
+            }
+        }
+        if let m = meta["maxResidentModels"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.maxResidentModels)
+            ) {
+                Stepper(value: opts.maxResidentModels, in: 1...8) {
+                    Text("\(appState.serverOptions.maxResidentModels)")
+                        .font(.app(.body).monospacedDigit())
+                }
+            }
+        }
+        if let m = meta["idleEvictSecs"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.idleEvictSecs)
+            ) {
+                let secs = appState.serverOptions.idleEvictSecs
+                snappingSlider(
+                    presets: ServerOptions.idleEvictPresets,
+                    current: secs,
+                    set: { appState.serverOptions.idleEvictSecs = $0 },
+                    label: ServerOptions.idleEvictLabel(secs)
+                )
+            }
+        }
+        if let m = meta["skipMemPreflight"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.skipMemPreflight)
+            ) {
+                Toggle("", isOn: opts.skipMemPreflight)
+                    .labelsHidden()
+                    .toggleStyle(.switch).font(.app(.body))
+            }
+        }
+        if let m = meta["osReserveGiB"] {
+            SettingsRow(
+                title: m.title,
+                explainer: m.explainer,
+                isDirty: dirty.dirty(\.osReserveGiB)
+            ) {
+                let auto = ServerOptions.autoOsReserveGiB(physicalMemoryBytes: ProcessInfo.processInfo.physicalMemory)
+                Picker("", selection: opts.osReserveGiB) {
+                    Text("Auto (\(auto.formatted(.number.precision(.fractionLength(0...1)))) GB)")
+                        .font(.app(.body)).tag(Int?.none)
+                    ForEach([0, 2, 3, 4, 6, 8], id: \.self) { gib in
+                        Text(gib == 0 ? "Off" : "\(gib) GB").font(.app(.body)).tag(Int?.some(gib))
+                    }
+                }
+                .labelsHidden()
+                .pickerStyle(.menu)
+                .frame(minWidth: 220).font(.app(.body))
+            }
+        }
+        if showMLX {
+            if let m = meta["kvQuant"] {
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer,
+                    isDirty: dirty.dirty(\.kvQuant)
+                ) {
+                    Picker("", selection: opts.kvQuant) {
+                        ForEach(ServerOptions.KVQuant.allCases) { q in
+                            Text(L10n.text(q.label)).font(.app(.body)).tag(q)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(minWidth: 220).font(.app(.body))
+                }
+            }
+            if let m = meta["hotPrefixCacheEnabled"] {
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer,
+                    isDirty: dirty.dirty(\.hotPrefixCacheEnabled)
+                ) {
+                    Toggle("", isOn: opts.hotPrefixCacheEnabled)
+                        .labelsHidden()
+                        .toggleStyle(.switch).font(.app(.body))
+                }
+            }
+            if let m = meta["prefixCacheEntries"], appState.serverOptions.hotPrefixCacheEnabled {
+                // Surface the RAM clamp so a 16 GB Mac user who sets, say, 8 sees
+                // that the launcher will actually pass 1 (and why).
+                let ram = ProcessInfo.processInfo.physicalMemory
+                let set = appState.serverOptions.prefixCacheEntries
+                let effective = ServerOptions.ramCappedPrefixCacheEntries(set, physicalMemoryBytes: ram)
+                let capNote = effective < set
+                    ? "  ·  This Mac (\(MemoryInfo.format(Int64(ram)))) launches with \(effective) to keep cache memory bounded."
+                    : ""
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer + capNote,
+                    isDirty: dirty.dirty(\.prefixCacheEntries)
+                ) {
+                    Stepper(value: opts.prefixCacheEntries, in: 1...16) {
+                        Text("\(appState.serverOptions.prefixCacheEntries)")
+                            .font(.app(.body).monospacedDigit())
+                    }
+                }
+            }
+            if let m = meta["prefixCacheMem"], appState.serverOptions.hotPrefixCacheEnabled {
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer,
+                    isDirty: dirty.dirty(\.prefixCacheMem)
+                ) {
+                    TextField("", text: opts.prefixCacheMem, prompt: Text("Auto"))
+                        .textFieldStyle(.roundedBorder)
+                        .frame(width: 110)
+                }
+            }
+            if let m = meta["pleGpu"] {
+                SettingsRow(
+                    title: m.title,
+                    explainer: m.explainer,
+                    isDirty: dirty.dirty(\.pleGpu),
+                    cost: m.cost,
+                    costActive: appState.serverOptions.pleGpu
+                ) {
+                    Toggle("", isOn: opts.pleGpu)
+                        .labelsHidden()
+                        .toggleStyle(.switch).font(.app(.body))
+                }
             }
         }
     }
@@ -2014,19 +2075,19 @@ private struct NeuralEngineSectionContent: View {
         if let m = meta["aneImage"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneImage),
                         cost: m.cost, costActive: appState.serverOptions.aneImage) {
-                Toggle("", isOn: opts.aneImage).labelsHidden().toggleStyle(.switch)
+                Toggle("", isOn: opts.aneImage).labelsHidden().toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["aneVideo"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneVideo),
                         cost: m.cost, costActive: appState.serverOptions.aneVideo) {
-                Toggle("", isOn: opts.aneVideo).labelsHidden().toggleStyle(.switch)
+                Toggle("", isOn: opts.aneVideo).labelsHidden().toggleStyle(.switch).font(.app(.body))
             }
         }
         if let m = meta["aneAudio"] {
             SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.aneAudio),
                         cost: m.cost, costActive: appState.serverOptions.aneAudio) {
-                Toggle("", isOn: opts.aneAudio).labelsHidden().toggleStyle(.switch)
+                Toggle("", isOn: opts.aneAudio).labelsHidden().toggleStyle(.switch).font(.app(.body))
             }
         }
     }
@@ -2060,250 +2121,111 @@ private struct CommonPerformanceSectionContent: View {
 
 // MARK: - GGUF (llama.cpp) performance section
 
-/// Knobs specific to the embedded llama.cpp engine — surfaced only when
-/// the active model loaded through that path (or pre-load, when no
-/// engine has been chosen yet). MLX's `--kv-quant` and `--prefix-cache-*`
-/// don't apply here; llama.cpp has its own KV scheme and its own
-/// multi-session LRU.
-private struct LlamaPerformanceSectionContent: View {
+/// Every embedded engine's launch flags, grouped by engine.
+private struct EnginesSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @Environment(\.settingsSearchQuery) private var query
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
         ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
     }
+    /// A search narrows to rows, so the engine boxes step aside while one runs.
+    private var grouped: Bool { SettingsSearch.tokens(query).isEmpty }
 
     var body: some View {
         let opts = $appState.serverOptions
-        if let m = meta["llamaKvQuant"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.llamaKvQuant)
-            ) {
-                Picker("", selection: opts.llamaKvQuant) {
-                    ForEach(ServerOptions.LlamaKVQuant.allCases) { q in
-                        Text(L10n.text(q.label)).tag(q)
+        EngineGroup(name: "mlx-serve-gguf", blurb: "GGUF files on MLX itself. Experimental.", boxed: grouped) {
+            if let m = meta["mlxGguf"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.mlxGguf)) {
+                    Toggle("", isOn: opts.mlxGguf)
+                        .labelsHidden()
+                        .toggleStyle(.switch).font(.app(.body))
+                }
+            }
+        }
+        EngineGroup(name: "llama.cpp", blurb: "Serves every other .gguf file. Its own kernels and KV layout, so the MLX rows do not apply.", boxed: grouped) {
+            if let m = meta["llamaKvQuant"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaKvQuant)) {
+                    Picker("", selection: opts.llamaKvQuant) {
+                        ForEach(ServerOptions.LlamaKVQuant.allCases) { q in
+                            Text(L10n.text(q.label)).font(.app(.body)).tag(q)
+                        }
                     }
-                }
-                .labelsHidden()
-                .pickerStyle(.menu)
-                .frame(minWidth: 260)
-            }
-        }
-        if let m = meta["llamaCacheEntries"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.llamaCacheEntries)
-            ) {
-                Stepper(value: opts.llamaCacheEntries, in: 1...8) {
-                    Text("\(appState.serverOptions.llamaCacheEntries)")
-                        .font(.app(.body).monospacedDigit())
-                }
-            }
-        }
-    }
-}
-
-// MARK: - ds4 (DeepSeek-V4-Flash) performance section
-
-/// Knobs specific to the embedded ds4 engine — surfaced only when the active
-/// model loaded through that path (DeepSeek-V4-Flash GGUF), or pre-load when
-/// no engine has been chosen yet. Today this is just SSD weight streaming:
-/// the lever that lets a model larger than RAM load by streaming experts off
-/// disk instead of OOMing at warmup (issue #39).
-private struct Ds4PerformanceSectionContent: View {
-    @EnvironmentObject var appState: AppState
-    @EnvironmentObject var server: ServerManager
-
-    private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
-    private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
-    }
-
-    var body: some View {
-        if let m = meta["ssdStreaming"] {
-            SettingsRow(
-                title: m.title,
-                explainer: m.explainer,
-                isDirty: dirty.dirty(\.ssdStreaming)
-            ) {
-                Toggle("", isOn: $appState.serverOptions.ssdStreaming)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .pickerStyle(.menu)
+                    .frame(minWidth: 260).font(.app(.body))
+                }
+            }
+            if let m = meta["llamaCacheEntries"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaCacheEntries)) {
+                    Stepper(value: opts.llamaCacheEntries, in: 1...8) {
+                        Text("\(appState.serverOptions.llamaCacheEntries)")
+                            .font(.app(.body).monospacedDigit())
+                    }
+                }
+            }
+            if let m = meta["llamaMtpDrafts"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaMtpDrafts)) {
+                    Stepper(value: opts.llamaMtpDrafts, in: 0...8) {
+                        Text(appState.serverOptions.llamaMtpDrafts == 0 ? L10n.text("Off") : "\(appState.serverOptions.llamaMtpDrafts)")
+                            .font(.app(.body).monospacedDigit())
+                    }
+                }
+            }
+            if let m = meta["llamaUbatch"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.llamaUbatch)) {
+                    Picker("", selection: opts.llamaUbatch) {
+                        Text(L10n.text("Default (512)")).font(.app(.body)).tag(0)
+                        ForEach([1024, 2048, 4096], id: \.self) { n in
+                            Text(verbatim: "\(n)").font(.app(.body)).tag(n)
+                        }
+                    }
+                    .labelsHidden()
+                    .pickerStyle(.menu)
+                    .frame(minWidth: 140).font(.app(.body))
+                }
+            }
+        }
+        EngineGroup(name: "ds4", blurb: "Serves DeepSeek-V4-Flash GGUF files.", boxed: grouped) {
+            if let m = meta["ssdStreaming"] {
+                SettingsRow(title: m.title, explainer: m.explainer, isDirty: dirty.dirty(\.ssdStreaming)) {
+                    Toggle("", isOn: opts.ssdStreaming)
+                        .labelsHidden()
+                        .toggleStyle(.switch).font(.app(.body))
+                }
             }
         }
     }
 }
 
-// MARK: - Drafter row
-
-/// Three-state speculative-decoding toggle for the Gemma 4 assistant drafter.
-private struct DrafterRow: View {
-    @EnvironmentObject var appState: AppState
-    @EnvironmentObject var server: ServerManager
-    @EnvironmentObject var downloads: DownloadManager
-
-    private var dirty: ServerLaunchDirty {
-        ServerLaunchDirty(current: appState.serverOptions, last: server.liveLaunchedOptions)
-    }
-
-    /// Drafter the loaded model would pair with — nil for non-Gemma-4 or
-    /// when no matching checkpoint is on disk.
-    private var recommended: LocalDrafter? {
-        guard let info = server.modelInfo else { return nil }
-        return downloads.recommendedDrafterFor(
-            modelPath: appState.selectedModelPath,
-            architecture: info.architecture,
-            isMoE: info.isMoE
-        )
-    }
-
-    /// True when the loaded target is a Gemma 4 model (any size). Tells us
-    /// whether to surface "drafter not found" (worth fixing) vs "drafter is
-    /// Gemma 4 only" (architectural).
-    private var targetIsGemma4: Bool {
-        let arch = server.modelInfo?.architecture ?? ""
-        return arch == "gemma4" || arch == "gemma4_text"
-    }
-
-    private var isMoeTarget: Bool { server.modelInfo?.isMoE ?? false }
-
-    private var explainer: String {
-        if let r = recommended {
-            return "Pairs with the small assistant drafter for +27–40% on code & agents (dense Gemma 4 only). On automatically: \(r.url.lastPathComponent)."
-        }
-        // Server hasn't reported a model yet — either it's not started or
-        // we're mid-handshake. Don't claim the architecture is wrong.
-        if server.modelInfo == nil {
-            if appState.selectedModelPath.isEmpty {
-                return "Select a model to check drafter compatibility."
-            }
-            return "Start the server to check drafter compatibility."
-        }
-        // Server reported a model but didn't include `architecture` in its
-        // /v1/models meta — that field landed in the same release that
-        // unhid this row, so an older bundled binary will leave it empty.
-        if (server.modelInfo?.architecture ?? "").isEmpty {
-            return "Drafter status unavailable (server build pre-dates this UI). Use --drafter via CLI."
-        }
-        if !targetIsGemma4 {
-            return "Drafter is Gemma 4 only."
-        }
-        if isMoeTarget {
-            return "No drafter for the MoE Gemma 4 — it regresses decode there. Use PLD instead."
-        }
-        return "Drafter checkpoint not found. New Gemma 4 downloads bring it automatically."
-    }
-
-    /// The drafter this target would pair with, whether or not it's on disk —
-    /// what the Download button fetches.
-    private var pairedDrafterRepo: String? {
-        DownloadManager.companionDrafterRepo(forRepoId: appState.selectedModelPath)
-    }
-
-    private var toggleEnabled: Bool { recommended != nil }
+/// One engine's rows in a box under its name. Unboxed, the rows sit bare in the
+/// section, so a search that filters every row out leaves no empty box behind.
+private struct EngineGroup<Content: View>: View {
+    let name: String
+    let blurb: String
+    let boxed: Bool
+    @ViewBuilder var content: Content
 
     var body: some View {
-        // `explainer` is state-dependent (names the discovered checkpoint, or
-        // why there isn't one), so the searchable text follows the UI.
-        SearchableRow(searchText: ["Enable Assistant MTP Drafter model", explainer]) {
-            rowBody
+        if boxed {
+            VStack(alignment: .leading, spacing: 14) {
+                VStack(alignment: .leading, spacing: 2) {
+                    Text(name).font(.app(.headline))
+                    Text(L10n.text(blurb)).font(.app(.caption2)).foregroundStyle(.secondary)
+                }
+                VStack(alignment: .leading, spacing: 18) { content }
+            }
+            .padding(12)
+            .frame(maxWidth: .infinity, alignment: .leading)
+            .background(RoundedRectangle(cornerRadius: 8).fill(Color.secondary.opacity(0.08)))
+        } else {
+            content
         }
-    }
-
-    @ViewBuilder
-    private var rowBody: some View {
-        VStack(alignment: .leading, spacing: 4) {
-            HStack(alignment: .firstTextBaseline) {
-                HStack(spacing: 6) {
-                    Text(L10n.text("Enable Assistant MTP Drafter model"))
-                        .font(.app(.body))
-                    if dirty.dirty(\.drafterPath) {
-                        Image(systemName: "arrow.clockwise.circle.fill")
-                            .font(.app(.caption))
-                            .foregroundStyle(.orange)
-                            .help("Restart the server to apply this change")
-                    }
-                }
-                Spacer(minLength: 12)
-                control
-                    .frame(maxWidth: 280, alignment: .trailing)
-            }
-            Text(L10n.text(explainer))
-                .font(.app(.caption2))
-                .foregroundStyle(.secondary)
-                .fixedSize(horizontal: false, vertical: true)
-
-            // Status pill — green for "ready", yellow for the MoE caution.
-            if let r = recommended {
-                HStack(spacing: 8) {
-                    statusPill(
-                        text: "✓ \(r.url.lastPathComponent)",
-                        warn: false
-                    )
-                    if isMoeTarget && !appState.serverOptions.drafterPath.isEmpty {
-                        statusPill(
-                            text: "⚠ Drafter regresses ~30% on MoE — PLD is recommended",
-                            warn: true
-                        )
-                    }
-                }
-                .padding(.top, 2)
-            } else if server.modelInfo != nil, targetIsGemma4, let repo = pairedDrafterRepo {
-                // A dense Gemma 4 is loaded but its drafter isn't on disk —
-                Button(L10n.text(
-                       downloads.downloads[repo]?.status == .downloading
-                       ? "Downloading drafter…" : "Download drafter"
-)) {
-                    downloads.start(repoId: repo) { appState.refreshModels() }
-                }
-                .controlSize(.small)
-                .disabled(downloads.downloads[repo]?.status == .downloading)
-                .padding(.top, 2)
-            }
-        }
-    }
-
-    @ViewBuilder
-    private var control: some View {
-        // Off writes `drafterOptOut` as well as clearing the path: the app pairs
-        // a dense Gemma 4 with its drafter on its own now, so an empty path
-        // alone would read as "not paired yet" and pair itself again at the next
-        // model switch. Turning it back on clears the opt-out.
-        let isOn = Binding<Bool>(
-            get: { !appState.serverOptions.drafterPath.isEmpty },
-            set: { newValue in
-                appState.serverOptions.drafterOptOut = !newValue
-                if newValue {
-                    if let r = recommended {
-                        appState.serverOptions.drafterPath = r.url.path
-                    }
-                } else {
-                    appState.serverOptions.drafterPath = ""
-                }
-            }
-        )
-        Toggle("", isOn: isOn)
-            .labelsHidden()
-            .toggleStyle(.switch)
-            .disabled(!toggleEnabled)
-    }
-
-    @ViewBuilder
-    private func statusPill(text: String, warn: Bool) -> some View {
-        let fg: Color = warn ? .orange : .green
-        Text(text)
-            .font(.app(.caption2).monospacedDigit())
-            .foregroundStyle(fg)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(fg.opacity(0.10))
-            .clipShape(Capsule())
     }
 }
+
 
 // MARK: - Per-request defaults section
 
@@ -2329,25 +2251,25 @@ private struct InterfaceSectionContent: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(width: 180)
+            .frame(width: 180).font(.app(.body))
         }
         SettingsRow(title: "Accent Color", explainer: "Tint for buttons, links and the selected message bubble.") {
             Picker("", selection: $accentColorRaw) {
                 ForEach(AppAccentColor.allCases) { accent in
-                    Text(L10n.text(accent.label)).tag(accent.rawValue)
+                    Text(L10n.text(accent.label)).font(.app(.body)).tag(accent.rawValue)
                 }
             }
             .labelsHidden()
-            .frame(width: 140)
+            .frame(width: 140).font(.app(.body))
         }
         SettingsRow(title: "Text Size", explainer: "Size of the chat transcript's prose and code.") {
             Picker("", selection: $textSizeRaw) {
                 ForEach(ChatTextSize.allCases) { size in
-                    Text(L10n.text(size.label)).tag(size.rawValue)
+                    Text(L10n.text(size.label)).font(.app(.body)).tag(size.rawValue)
                 }
             }
             .labelsHidden()
-            .frame(width: 140)
+            .frame(width: 140).font(.app(.body))
         }
         SettingsRow(title: "Chat Column",
                     explainer: "How wide a conversation reads. Narrow and Medium are fixed widths, so resizing the window moves the margins rather than the text; Wide follows the window. Also on ⌘⌥1-3, under View ▸ Interface.") {
@@ -2358,22 +2280,22 @@ private struct InterfaceSectionContent: View {
             }
             .labelsHidden()
             .pickerStyle(.segmented)
-            .frame(width: 220)
+            .frame(width: 220).font(.app(.body))
         }
         SettingsRow(title: "Compact Mode", explainer: "Tighter spacing between messages — more of the conversation on screen. Also on ⌘⌥C, under View ▸ Interface.") {
             Toggle("", isOn: $compactMode)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
         SettingsRow(title: "Terminal Theme",
                     explainer: "Colors for new sandbox terminals. Right-click a terminal in the sidebar to give one session a different theme.") {
             Picker("", selection: $terminalThemeId) {
                 ForEach(TerminalTheme.all) { theme in
-                    Text(theme.name).tag(theme.id)
+                    Text(theme.name).font(.app(.body)).tag(theme.id)
                 }
             }
             .labelsHidden()
-            .frame(width: 160)
+            .frame(width: 160).font(.app(.body))
         }
         SettingsRow(title: "Terminal Background",
                     explainer: "Ground under the default theme. Reset to use the theme's own.") {
@@ -2381,7 +2303,8 @@ private struct InterfaceSectionContent: View {
                 ColorPicker("", selection: terminalBackground, supportsOpacity: false)
                     .labelsHidden()
                 if !terminalBackgroundHex.isEmpty {
-                    Button("Reset") { terminalBackgroundHex = "" }
+                    Button { terminalBackgroundHex = "" } label: { Text("Reset")
+                        .font(.app(.body)) }
                         .controlSize(.small)
                 }
             }
@@ -2411,163 +2334,6 @@ extension InterfaceSectionContent {
     }
 }
 
-private struct RequestDefaultsSectionContent: View {
-    @EnvironmentObject var appState: AppState
-    @EnvironmentObject var server: ServerManager
-
-    private var meta: [String: ServerOptionField] { ServerOptions.requestDefaultFields }
-
-    /// Snapping presets for Max Tokens. Position 0 is "Auto" (= 0 sentinel):
-    /// the request omits max_tokens and the server pegs generation to the
-    /// remaining context window — the right cap on a small-RAM / small-context
-    /// machine, where a fixed number would over- or under-shoot. The rest are
-    /// powers of 2 from 256 up to 256K plus 1.5× midpoints from 3K up
-    /// (issue #188 — finer steps; every value formats exactly under the
-    /// 1024-division formatter).
-    private static let maxTokensPresets: [Int] = [
-        0, 256, 512, 1024, 2048, 3072, 4096, 6144, 8192, 12288, 16384, 24576,
-        32768, 49152, 65536, 98304, 131072, 196608, 262144,
-    ]
-
-    /// Snapping presets for Reasoning Budget. Position 0 is the special
-    /// "Unlimited" sentinel (-1); the rest are powers of 2 from 256 up to 32K.
-    private static let reasoningPresets: [Int] = [
-        -1, 0, 256, 512, 1024, 2048, 4096, 8192, 16384, 32768,
-    ]
-
-    private static func formatTokens(_ n: Int) -> String {
-        if n >= 1_048_576 { return "\(n / 1_048_576)M" }
-        if n >= 1024 { return "\(n / 1024)K" }
-        return "\(n)"
-    }
-
-    var body: some View {
-        let opts = $appState.serverOptions
-
-        // Max Tokens — snapping slider
-        if let m = meta["defaultMaxTokens"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                snappingSlider(
-                    presets: Self.maxTokensPresets,
-                    current: appState.serverOptions.defaultMaxTokens,
-                    set: { appState.serverOptions.defaultMaxTokens = $0 },
-                    label: appState.serverOptions.defaultMaxTokens <= 0
-                        ? "Auto"
-                        : Self.formatTokens(appState.serverOptions.defaultMaxTokens)
-                )
-            }
-        }
-        if let m = meta["defaultTemperature"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                VStack(alignment: .trailing, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Slider(value: opts.defaultTemperature, in: 0...2, step: 0.05)
-                        Text(String(format: "%.2f", appState.serverOptions.defaultTemperature))
-                            .font(.app(.body).monospacedDigit())
-                            .frame(minWidth: 36, alignment: .trailing)
-                    }
-                    recPill(server.modelInfo?.recTemperature.map { String(format: "%.2f", $0) })
-                }
-            }
-        }
-        if let m = meta["defaultTopP"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                VStack(alignment: .trailing, spacing: 4) {
-                    HStack(spacing: 8) {
-                        Slider(value: opts.defaultTopP, in: 0.1...1.0, step: 0.01)
-                        Text(String(format: "%.2f", appState.serverOptions.defaultTopP))
-                            .font(.app(.body).monospacedDigit())
-                            .frame(minWidth: 36, alignment: .trailing)
-                    }
-                    recPill(server.modelInfo?.recTopP.map { String(format: "%.2f", $0) })
-                }
-            }
-        }
-        if let m = meta["defaultTopK"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                VStack(alignment: .trailing, spacing: 4) {
-                    Stepper(value: opts.defaultTopK, in: 0...1000) {
-                        Text(L10n.text(
-                             appState.serverOptions.defaultTopK == 0
-                             ? "Disabled"
-                             : "\(appState.serverOptions.defaultTopK)"
-))
-                            .font(.app(.body).monospacedDigit())
-                    }
-                    // Top-k is the one sampling field that actually falls
-                    // through to the model's recommendation: when the slider
-                    // reads "Disabled" (0) no `--top-k` flag is sent, so the
-                    // model's own value takes effect. Say so when it's live.
-                    recPill(
-                        server.modelInfo?.recTopK.map { "\($0)" },
-                        active: server.modelInfo?.recTopK != nil
-                            && appState.serverOptions.defaultTopK == 0
-                    )
-                }
-            }
-        }
-        if let m = meta["defaultRepeatPenalty"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                HStack(spacing: 8) {
-                    Slider(value: opts.defaultRepeatPenalty, in: 1.0...2.0, step: 0.01)
-                    Text(String(format: "%.2f", appState.serverOptions.defaultRepeatPenalty))
-                        .font(.app(.body).monospacedDigit())
-                        .frame(minWidth: 40, alignment: .trailing)
-                }
-            }
-        }
-        if let m = meta["defaultPresencePenalty"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                HStack(spacing: 8) {
-                    Slider(value: opts.defaultPresencePenalty, in: 0.0...2.0, step: 0.01)
-                    Text(String(format: "%.2f", appState.serverOptions.defaultPresencePenalty))
-                        .font(.app(.body).monospacedDigit())
-                        .frame(minWidth: 40, alignment: .trailing)
-                }
-            }
-        }
-        // Reasoning Budget — snapping slider; position 0 is the "Unlimited"
-        // sentinel (-1).
-        if let m = meta["defaultReasoningBudget"] {
-            SettingsRow(title: m.title, explainer: m.explainer) {
-                snappingSlider(
-                    presets: Self.reasoningPresets,
-                    current: appState.serverOptions.defaultReasoningBudget,
-                    set: { appState.serverOptions.defaultReasoningBudget = $0 },
-                    label: appState.serverOptions.defaultReasoningBudget < 0
-                        ? "Unlimited"
-                        : Self.formatTokens(appState.serverOptions.defaultReasoningBudget)
-                )
-            }
-        }
-    }
-
-    /// Small "model recommends" hint pill shown under a sampling slider. The
-    /// value comes from the loaded model's `generation_config.json` (surfaced
-    /// over `/v1/models`); nil → nothing rendered (no model loaded, or the
-    /// model ships no recommendation). `active=true` switches the styling to
-    /// green + "(in effect)" for the top-k case, where a Disabled slider
-    /// actually lets the model's value win.
-    @ViewBuilder
-    private func recPill(_ value: String?, active: Bool = false) -> some View {
-        if let value {
-            let color: Color = active ? .green : .secondary
-            HStack(spacing: 4) {
-                Text(L10n.text(active ? "Model default (in effect):" : "Model recommends:"))
-                    .font(.app(.caption2))
-                Text(value)
-                    .font(.app(.caption2).monospacedDigit().weight(.medium))
-            }
-            .foregroundStyle(color)
-            .padding(.horizontal, 6)
-            .padding(.vertical, 2)
-            .background(color.opacity(0.12))
-            .clipShape(Capsule())
-        }
-    }
-
-}
-
 // MARK: - Voice (wake phrase) section
 
 /// The hands-free wake phrase ("Hey Loki" by default). App-side like the
@@ -2583,7 +2349,7 @@ private struct WakePhraseSectionContent: View {
     var body: some View {
         SearchableRow(searchText: ["Wake phrase", "Hey Loki", Self.explainer]) {
             VStack(alignment: .leading, spacing: 6) {
-                Text(L10n.text("Wake phrase")).font(.app(.subheadline).weight(.semibold))
+                Text(L10n.text("Wake phrase")).font(.app(.rowTitle).weight(.semibold))
                 TextField("Hey Loki", text: $appState.serverOptions.wakePhrase)
                     .textFieldStyle(.roundedBorder)
                     .frame(maxWidth: 220)
@@ -2651,7 +2417,7 @@ private struct VoiceCloneSectionContent: View {
     @ViewBuilder
     private var engineBody: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(L10n.text("Voice engine")).font(.app(.subheadline).weight(.semibold))
+            Text(L10n.text("Voice engine")).font(.app(.rowTitle).weight(.semibold))
             Picker("", selection: $appState.serverOptions.voiceEngine) {
                 ForEach(VoiceEngine.allCases, id: \.self) { e in
                     Text(L10n.text(e.label)).tag(e)
@@ -2675,7 +2441,7 @@ private struct VoiceCloneSectionContent: View {
     @ViewBuilder
     private var kokoroBody: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(L10n.text("Kokoro voice")).font(.app(.subheadline).weight(.semibold))
+            Text(L10n.text("Kokoro voice")).font(.app(.headline).weight(.semibold))
             // Selecting the engine has to be able to GET the model — the gen
             // panes have had this bar all along; Settings ▸ Voice was the one
             // place that offered a backend with no way to fetch it. Collapses to
@@ -2691,7 +2457,7 @@ private struct VoiceCloneSectionContent: View {
                     ForEach(KokoroVoiceCatalog.grouped(), id: \.language) { group in
                         Section(L10n.text(group.language)) {
                             ForEach(group.voices, id: \.self) { v in
-                                Text(KokoroVoiceCatalog.displayName(for: v)).tag(v)
+                                Text(KokoroVoiceCatalog.displayName(for: v)).font(.app(.body)).tag(v)
                             }
                         }
                     }
@@ -2705,7 +2471,7 @@ private struct VoiceCloneSectionContent: View {
                     if previewer.isPreviewing(appState.serverOptions.kokoroVoice) {
                         ProgressView().controlSize(.small)
                     } else {
-                        Label("Play", systemImage: "play.circle")
+                        Label("Play", systemImage: "play.circle").font(.app(.body))
                     }
                 }
                 .help(kokoroReady ? "Hear a short sample of this voice"
@@ -2737,7 +2503,7 @@ private struct VoiceCloneSectionContent: View {
     @ViewBuilder
     private var clipBody: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text(L10n.text("Voice clone clip")).font(.app(.subheadline).weight(.semibold))
+            Text(L10n.text("Voice clone clip")).font(.app(.headline).weight(.semibold))
             HStack(spacing: 8) {
                 if !appState.serverOptions.voiceClonePath.isEmpty {
                     Image(systemName: "waveform").foregroundStyle(.secondary)
@@ -2861,7 +2627,7 @@ private struct SandboxSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.toolsOnlyWhenAsked)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -2875,11 +2641,12 @@ private struct SandboxSectionContent: View {
                     .lineLimit(1)
                     .truncationMode(.middle)
                     .help(currentWorkspace)
-                Button("Choose…") {
+                Button {
                     if let picked = WorkspacePicker.pickDirectory() {
                         appState.setDefaultAgentWorkspace(picked)
                     }
-                }
+                } label: { Text("Choose…")
+                    .font(.app(.body)) }
             }
         }
 
@@ -2893,7 +2660,7 @@ private struct SandboxSectionContent: View {
             ) {
                 Toggle("", isOn: $appState.serverOptions.sandbox.enabled)
                     .labelsHidden()
-                    .toggleStyle(.switch)
+                    .toggleStyle(.switch).font(.app(.body))
             }
         }
 
@@ -2903,7 +2670,7 @@ private struct SandboxSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.sandbox.network)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -2916,10 +2683,10 @@ private struct SandboxSectionContent: View {
                 if resetting {
                     HStack(spacing: 6) {
                         ProgressView().controlSize(.small)
-                        Text("Resetting…")
+                        Text("Resetting…").font(.app(.body))
                     }
                 } else {
-                    Label("Reset Sandbox…", systemImage: "trash")
+                    Label("Reset Sandbox…", systemImage: "trash").font(.app(.body))
                         .foregroundStyle(.red)
                 }
             }
@@ -2929,14 +2696,16 @@ private struct SandboxSectionContent: View {
                 isPresented: $showResetConfirm,
                 titleVisibility: .visible
             ) {
-                Button("Delete All Sandbox Data", role: .destructive) {
+                Button(role: .destructive) {
                     resetting = true
                     AgentSandbox.shared.resetAllData {
                         resetting = false
                     }
-                }
+                } label: { Text("Delete All Sandbox Data")
+                    .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
-                Button("Cancel", role: .cancel) {}
+                Button(role: .cancel) {} label: { Text("Cancel")
+                    .font(.app(.body)) }
             } message: {
                 Text("""
                 This permanently deletes everything the sandbox has downloaded and every change made inside it — installed agent CLIs (pi, hermes), their configs and logins, and any files outside the shared workspace. Any running guest and live sessions stop immediately.
@@ -2979,7 +2748,7 @@ private struct MessagingSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.enabled)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -2999,7 +2768,7 @@ private struct MessagingSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.agentMode)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -3008,7 +2777,7 @@ private struct MessagingSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.useMCP)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -3017,7 +2786,7 @@ private struct MessagingSectionContent: View {
         ) {
             Toggle("", isOn: $appState.serverOptions.telegram.enableThinking)
                 .labelsHidden()
-                .toggleStyle(.switch)
+                .toggleStyle(.switch).font(.app(.body))
         }
 
         SettingsRow(
@@ -3025,13 +2794,13 @@ private struct MessagingSectionContent: View {
             explainer: "Reply as one of your agents (Chat window ▸ Agents): its prompt, tools, model and workspace. \"None\" uses the settings above."
         ) {
             Picker("", selection: $appState.serverOptions.telegram.agentId) {
-                Text("None").tag(UUID?.none)
+                Text("None").font(.app(.body)).tag(UUID?.none)
                 ForEach(appState.agents.allAgents) { agent in
-                    Text(agent.name).tag(UUID?.some(agent.id))
+                    Text(agent.name).font(.app(.body)).tag(UUID?.some(agent.id))
                 }
             }
             .labelsHidden()
-            .frame(width: 200)
+            .frame(width: 200).font(.app(.body))
         }
 
         // Allow-list / lock control.
@@ -3045,9 +2814,10 @@ private struct MessagingSectionContent: View {
                         Text(L10n.text(lockLabel))
                             .font(.app(.caption).monospacedDigit())
                             .foregroundStyle(telegram.allowedChatIds.isEmpty ? .secondary : .primary)
-                        Button("Reset lock") {
+                        Button {
                             appState.serverOptions.telegram.allowedChatIds = []
-                        }
+                        } label: { Text("Reset lock")
+                            .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .controlSize(.small)
                         .disabled(telegram.allowedChatIds.isEmpty)
@@ -3143,7 +2913,7 @@ private struct UpdatesSectionContent: View {
                 get: { updates.autoCheckEnabled },
                 set: { updates.autoCheckEnabled = $0 }))
                 .toggleStyle(.switch)
-                .labelsHidden()
+                .labelsHidden().font(.app(.body))
         }
 
         SettingsRow(
@@ -3192,9 +2962,10 @@ private struct UpdatesSectionContent: View {
                 case .installing:
                     ProgressView().controlSize(.small)
                 default:
-                    Button("Download & Install") {
+                    Button {
                         Task { await updates.downloadAndInstall() }
-                    }
+                    } label: { Text("Download & Install")
+                        .font(.app(.body)) }
                     .buttonStyle(.borderedProminent)
                 }
             }

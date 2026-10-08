@@ -11,7 +11,7 @@
 #   ./tests/bench.sh --full                         # median of 3 per rung, to 64k
 #
 # Each cell is mlx-serve at its FASTEST: speculation is forced on where the
-# checkpoint carries an MTP head (it is default-off on MoE targets). The mode
+# checkpoint carries an MTP head (older binaries left it off on MoE). The mode
 # that actually engaged is printed beside the number, from the server's own
 # log — a mode that silently stops engaging shows up as a bare cell.
 #
@@ -56,28 +56,29 @@ done
 OUT="$HOME/claude-tmp/bench-$TAG"
 mkdir -p "$OUT"
 
-# ── Model matrix: logical|path ──
-# A missing path skips the row silently — a bench you can't run on this box
+# ── Model matrix: logical|candidates relative to a model root ──
+# The first candidate found wins (tests/_lib_models.sh). A row with no checkpoint
+# on this box, or one past its GPU budget, skips: a bench you can't run here
 # isn't an error on the box that can.
-MD="$HOME/.mlx-serve/models"
-LMS_DIR="$HOME/.lmstudio/models"
-GD="/Volumes/G Drive SSD"
 # ANE=1 adds --ane-prefill to every boot
 # (a named refusal on non-qwen3_5-dense models, so it is safe matrix-wide);
 # ane-on cells are their own column, never diffed against ane-off ones.
-QWEN38_27B="$MD/ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
+source "$SCRIPT_DIR/_lib_models.sh"
 TARGETS=(
-    "gemma4-e4b-4bit|$MD/mlx-community/gemma-4-e4b-it-4bit"
-    "gemma4-26b-a4b-moe-qat-4bit|$LMS_DIR/mlx-community/gemma-4-26B-A4B-it-qat-4bit"
-    "qwen36-35b-a3b|$GD/models-dl/ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
-    "qwen38-27b|$QWEN38_27B"
-    "qwen38-flash-next|$MD/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
+    "gemma4-e4b-4bit|mlx-community/gemma-4-e4b-it-4bit"
+    "gemma4-26b-a4b-moe-qat-4bit|mlx-community/gemma-4-26B-A4B-it-qat-4bit"
+    "qwen36-35b-a3b|ddalcu/Qwen3.6-35B-A3B-MLX-Serve-4bit"
+    "qwen38-27b|ddalcu/Qwen3.8-27B-MLX-Serve-4bit"
+    "qwen38-27b-iq|ddalcu/Qwen3.8-27B-MLX-Serve-iQ-MLX-3.8bpw"
+    "qwen38-flash-next|ddalcu/Qwen3.8-Flash-Next-MLX-Serve-mixed-4-8bit"
+    "mimo-v26-flash|ddalcu/MiMo-V2.6-Flash-MLX-Serve-MXFP4-Q8"
+    "glm53-flash|TensorFold/GLM-5.3-Flash-MLX-oQ4-MTP"
 )
 
 # Only ever called on the path that STARTED a server: --url may be pointed at
 # a local mlx-serve someone else is using, and a bench must not kill it.
 stop_server() {
-    pkill -f "mlx-serve --serve" 2>/dev/null
+    pkill -f "mlx-serve --serve .*--port $PORT" 2>/dev/null
     for _ in $(seq 1 30); do
         lsof -ti tcp:"$PORT" >/dev/null 2>&1 || return 0
         sleep 1
@@ -93,17 +94,25 @@ probe() { # logical host model_id
         || echo "  llmprobe failed for $1" >&2
 }
 
-# --mtp is forced wherever the checkpoint ships a head: it is default-OFF on
-# MoE targets, which is exactly where it pays most (35B-A3B reads 157 without
-# and 191 with). On a dense MTP checkpoint it restates the default.
-spec_flags() { # model_path
-    local f=""
-    if ls "$1"/*mtp*.safetensors >/dev/null 2>&1 || [ -d "$1/mtp" ] \
-       || grep -qi '"mtp' "$1/config.json" 2>/dev/null; then
-        f=" --mtp"
+# --mtp is a no-op from 26.9.7 (every loaded head drafts, MoE included), but
+# older binaries left MoE heads off without it, and they are benched here too.
+# A pack's own drafter/ loads on its own; a sidecar that ships separately is named here.
+drafter_for() { # logical
+    case "$1" in
+        qwen38-27b) find_model z-lab/Qwen3.8-27B-DFlash2 ;;
+        *) return 1 ;;
+    esac
+}
+
+spec_flags() { # logical model_path -> FLAGS
+    FLAGS=()
+    if ls "$2"/*mtp*.safetensors >/dev/null 2>&1 || [ -d "$2/mtp" ] \
+       || grep -qi '"mtp' "$2/config.json" 2>/dev/null; then
+        FLAGS+=(--mtp)
     fi
-    [[ "${ANE:-0}" == "1" ]] && f+=" --ane-prefill"
-    echo "$f"
+    local d
+    if d=$(drafter_for "$1"); then FLAGS+=(--drafter "$d"); fi
+    if [[ "${ANE:-0}" == "1" ]]; then FLAGS+=(--ane-prefill); fi
 }
 
 # ── Run ──
@@ -117,13 +126,14 @@ else
     trap 'stop_server' EXIT
     stop_server
     for row in "${TARGETS[@]}"; do
-        IFS='|' read -r logical path <<< "$row"
+        IFS='|' read -r logical rest <<< "$row"
         [[ -n "$ONLY" && "$logical" != *"$ONLY"* ]] && continue
-        [[ -e "$path" ]] || { echo "SKIP $logical (no checkpoint at $path)" >&2; continue; }
-        flags="$(spec_flags "$path")"
-        echo; echo ">> $logical$flags"
-        # shellcheck disable=SC2086
-        "$BINARY" --serve --model "$path" --port "$PORT" $flags >"$OUT/$logical.log" 2>&1 &
+        IFS='|' read -r -a cands <<< "$rest"
+        path=$(find_fitting_model "${cands[@]}") || { echo "SKIP $logical (no checkpoint within $(max_model_gb) GB on this box)" >&2; continue; }
+        spec_flags "$logical" "$path"
+        echo; echo ">> $logical ${FLAGS[*]+${FLAGS[*]}}"
+        # Scratch HOME: a saved model-settings.json outranks these flags (a drafter, a KV scheme).
+        HOME="$OUT/home" "$BINARY" --serve --model "$path" --port "$PORT" ${FLAGS[@]+"${FLAGS[@]}"} >"$OUT/$logical.log" 2>&1 &
         pid=$!
         for _ in $(seq 1 300); do
             curl -sf -m 2 "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
@@ -166,8 +176,9 @@ for path in sorted(Path(sys.argv[1]).glob("*.json")):
     if decode is None:
         print(f"| {path.stem} | · |  (no bench block)")
         continue
+    pf = "n/a" if prefill is None else f"{prefill:.0f}"
     print(f"| {path.stem} | {decode:.0f}{mode} |"
-          f"  (prefill {prefill:.0f}, {tps:.2f} tok/step)")
+          f"  (prefill {pf}, {tps:.2f} tok/step)")
 PY
 echo
 echo "=== reports $OUT"

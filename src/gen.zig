@@ -23,12 +23,16 @@ const lora_mod = @import("lora.zig");
 const tts = @import("tts.zig");
 const acestep = @import("acestep.zig");
 const music3 = @import("music3.zig");
+const stable_audio = @import("stable_audio.zig");
 const kokoro = @import("kokoro.zig");
 const laya = @import("laya.zig");
+const kev = @import("kev.zig");
+const clef = @import("clef.zig");
 const ltx = @import("ltx_video.zig");
 const diffvae_fwd = @import("ltx_diffvae_forward.zig");
 const ltx_audio = @import("ltx_audio.zig");
 const minimax_h3 = @import("minimax_h3.zig");
+const ane = @import("ane.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
 const glb_mod = @import("glb.zig");
@@ -55,8 +59,8 @@ pub const Modality = enum {
     audio,
     video,
     mesh,
-    /// Laya typed decisions (`/v1/decisions`): an encoder, not a generator,
-    /// but it rides the media plumbing (engine slot, inference-thread job).
+    /// Typed decisions (`/v1/decisions`, Laya or Kev): scorers, not generators,
+    /// but they ride the media plumbing (engine slot, inference-thread job).
     decision,
 
     pub fn capability(self: Modality) []const u8 {
@@ -100,7 +104,8 @@ pub const Modality = enum {
 pub const media_model_types = [_][]const u8{
     "flux2",     "krea",       "mage_flow",      "mageflow",
     "qwen3_tts", "acestep",    "kokoro",         "AudioVideo",
-    "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image", "laya",
+    "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
+    "laya",      "kev",        "clef",           "stable_audio3",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -112,20 +117,22 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "acestep")) return .audio;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .audio;
     if (std.mem.eql(u8, model_type, "kokoro")) return .audio;
+    if (std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
-    if (std.mem.eql(u8, model_type, "laya")) return .decision;
+    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef")) return .decision;
     return null;
 }
 
-/// Endpoint-level media route. `.speech` and `.music` share the `.audio`
+/// Endpoint-level media route. `.speech`, `.music` and `.sound` share the `.audio`
 /// modality/engine slot — the loaded `AudioBackend` arm decides which endpoint
 /// is valid (wrong pairing → explicit 400, never a silent misinterpretation).
 pub const GenRoute = enum {
     image,
     speech,
     music,
+    sound,
     video,
     mesh,
     decisions,
@@ -133,7 +140,7 @@ pub const GenRoute = enum {
     pub fn modality(self: GenRoute) Modality {
         return switch (self) {
             .image => .image,
-            .speech, .music => .audio,
+            .speech, .music, .sound => .audio,
             .video => .video,
             .mesh => .mesh,
             .decisions => .decision,
@@ -147,6 +154,7 @@ pub fn audioBackendKindForType(model_type: []const u8) AudioBackendKind {
     if (std.mem.eql(u8, model_type, "acestep")) return .music;
     if (std.mem.eql(u8, model_type, "minimax_music3")) return .music3;
     if (std.mem.eql(u8, model_type, "kokoro")) return .kokoro;
+    if (std.mem.eql(u8, model_type, "stable_audio3")) return .sound;
     return .tts;
 }
 
@@ -160,6 +168,8 @@ pub const AudioBackendKind = enum {
     music,
     music3,
     kokoro,
+    /// Stable Audio 3: text-to-audio on /v1/audio/sound-generations ("sound").
+    sound,
 
     /// Music-generation backends serve /v1/audio/music-generations and
     /// advertise "music" beside "audio"; the TTS arms never do.
@@ -174,6 +184,9 @@ pub const AudioBackendKind = enum {
 pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) ?[]u8 {
     // Guard the openFileAbsolute assert (ReleaseFast UB on relative/empty paths).
     if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return null;
+    if (isClefPack(io, model_dir)) return allocator.dupe(u8, "clef") catch null;
+    // A Kev pack's root config.json is its qwen3_5 base: the marker is checked first (discovery agrees).
+    if (isKevPack(io, model_dir)) return allocator.dupe(u8, "kev") catch null;
     if (readConfigModelType(io, allocator, model_dir)) |mt| return mt;
     // Diffusers-style repos (Mage-Flow) have no root config.json / model_type —
     // the pipeline identity lives in model_index.json's `_class_name`. Synthesize
@@ -189,7 +202,28 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // An mlx-community-style Qwen-Image-2.1 repo likewise: no root
     // config.json, model_index.json's `_class_name` the only marker.
     if (isQwenImage21Repo(io, allocator, model_dir)) return allocator.dupe(u8, "qwen_image21") catch null;
+    // Stable Audio 3 as Stability publishes it: stable-audio-tools' model_config.json.
+    if (isStableAudio3Repo(io, allocator, model_dir)) return allocator.dupe(u8, "stable_audio3") catch null;
     return null;
+}
+
+fn isClefPack(io: std.Io, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekClefPack(io, dir);
+}
+
+/// Thin path→Dir wrapper over `model_discovery.peekStableAudio3Config`.
+fn isStableAudio3Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekStableAudio3Config(io, allocator, dir);
+}
+
+fn isKevPack(io: std.Io, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekKevPack(io, dir);
 }
 
 fn isLayaRepo(io: std.Io, model_dir: []const u8) bool {
@@ -573,6 +607,8 @@ pub const ImageGenOpts = struct {
     /// per-call `output_resolution` knob. [256,1024] at the wire; 1024 is
     /// the trained regime, lower trades conditioning fidelity for speed.
     ref_resolution: u32 = 1024,
+    /// Qwen edit cache decision from request memory admission.
+    qwen_edit_prefix_cache: bool = false,
 };
 
 /// Image modality engine. The slot on `LoadedModel` stays modality-named; the
@@ -779,6 +815,8 @@ pub const ImageEngine = struct {
                         .guidance_scale = opts.guidance_scale,
                         .negative_prompt = opts.negative_prompt,
                         .ref_resolution = opts.ref_resolution,
+                        .transparent = opts.transparent,
+                        .prefix_cache = opts.qwen_edit_prefix_cache,
                     }, progress);
                 if (opts.edit_images.len != 0) break :blk error.EditUnsupported;
                 break :blk q.generateImage(allocator, prompt, width, height, seed, steps, .{
@@ -852,6 +890,7 @@ pub const AudioBackend = union(enum) {
     music: *acestep.Engine,
     music3: *music3.Engine,
     kokoro: *kokoro.Engine,
+    sound: *stable_audio.Engine,
 };
 
 /// Audio engine — a tagged-union owner, dispatched on `config.json`'s
@@ -877,6 +916,11 @@ pub const AudioEngine = struct {
             log.info("[audio] MiniMax Music 3 engine ready\n", .{});
             return self;
         }
+        if (mt != null and audioBackendKindForType(mt.?) == .sound) {
+            self.backend = .{ .sound = try stable_audio.Engine.load(io, allocator, model_dir) };
+            log.info("[audio] Stable Audio 3 engine ready\n", .{});
+            return self;
+        }
         if (mt != null and audioBackendKindForType(mt.?) == .kokoro) {
             const ks = mlx.mlx_default_gpu_stream_new();
             self.backend = .{ .kokoro = try kokoro.Engine.load(io, allocator, model_dir, ks) };
@@ -895,20 +939,58 @@ pub const AudioEngine = struct {
             .music => |e| e.deinit(),
             .music3 => |e| e.deinit(),
             .kokoro => |e| e.deinit(),
+            .sound => |e| e.deinit(),
         }
         self.allocator.destroy(self);
     }
 };
 
-/// Decision engine: Laya typed decisions over `POST /v1/decisions`.
+/// Per-request bounds for every decision backend, checked before any forward: one request
+/// holds the inference thread until it is answered.
+pub const DecisionLimits = struct {
+    max_questions: usize = 64,
+    max_input_tokens: usize = 32 * 1024,
+
+    fn fromEnv() DecisionLimits {
+        const d: DecisionLimits = .{};
+        return .{
+            .max_questions = envLimit("MLX_SERVE_LAYA_MAX_QUESTIONS", d.max_questions),
+            .max_input_tokens = envLimit("MLX_SERVE_LAYA_MAX_INPUT_TOKENS", d.max_input_tokens),
+        };
+    }
+
+    fn envLimit(name: [*:0]const u8, default: usize) usize {
+        const raw = std.c.getenv(name) orelse return default;
+        const v = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
+        if (v == 0) {
+            log.warn("[decision] ignoring {s}={s} (want a positive integer)\n", .{ name, raw });
+            return default;
+        }
+        return v;
+    }
+
+    /// 400 text for a limit error, naming the limit in force; null for other errors.
+    fn message(self: DecisionLimits, buf: []u8, err: anyerror) ?[]const u8 {
+        return switch (err) {
+            error.TooManyQuestions => std.fmt.bufPrint(buf, "too many questions in one request (limit {d}, MLX_SERVE_LAYA_MAX_QUESTIONS)", .{self.max_questions}) catch null,
+            error.TooManyInputTokens => std.fmt.bufPrint(buf, "the questions total more than {d} input tokens (MLX_SERVE_LAYA_MAX_INPUT_TOKENS); split them over several requests", .{self.max_input_tokens}) catch null,
+            else => null,
+        };
+    }
+};
+
+/// Decision engine over `POST /v1/decisions`: a Laya encoder or a Kev pack, chosen by the model dir.
 pub const DecisionEngine = struct {
     allocator: std.mem.Allocator,
-    engine: *laya.Engine,
+    backend: Backend,
     stream: mlx.mlx_stream,
     /// How long the inference thread waits for more decision requests to
     /// answer in the same pass (`MLX_SERVE_LAYA_BATCH_WINDOW_US`, default 0:
     /// only requests already queued are merged).
     batch_window_us: u32 = 0,
+    limits: DecisionLimits = .{},
+
+    pub const Backend = union(enum) { laya: *laya.Engine, kev: *kev.Engine, clef: *clef.Engine };
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*DecisionEngine {
         const self = try allocator.create(DecisionEngine);
@@ -916,7 +998,13 @@ pub const DecisionEngine = struct {
         self.allocator = allocator;
         self.stream = mlx.mlx_default_gpu_stream_new();
         errdefer _ = mlx.mlx_stream_free(self.stream);
-        self.engine = try laya.Engine.load(io, allocator, model_dir, self.stream);
+        self.backend = if (isClefPack(io, model_dir))
+            .{ .clef = try clef.Engine.load(io, allocator, model_dir, self.stream) }
+        else if (isKevPack(io, model_dir))
+            .{ .kev = try kev.Engine.load(io, allocator, model_dir, self.stream) }
+        else
+            .{ .laya = try laya.Engine.load(io, allocator, model_dir, self.stream) };
+        self.limits = DecisionLimits.fromEnv();
         self.batch_window_us = if (std.c.getenv("MLX_SERVE_LAYA_BATCH_WINDOW_US")) |raw|
             std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch blk: {
                 log.warn("[decision] ignoring MLX_SERVE_LAYA_BATCH_WINDOW_US={s} (want microseconds)\n", .{raw});
@@ -924,14 +1012,25 @@ pub const DecisionEngine = struct {
             }
         else
             0;
-        log.info("[decision] Laya engine ready\n", .{});
+        log.info("[decision] {s} engine ready\n", .{@tagName(self.backend)});
         return self;
     }
 
     pub fn deinit(self: *DecisionEngine) void {
-        self.engine.deinit();
+        switch (self.backend) {
+            inline else => |e| e.deinit(),
+        }
         _ = mlx.mlx_stream_free(self.stream);
         self.allocator.destroy(self);
+    }
+
+    fn limitMessage(self: *const DecisionEngine, buf: []u8, err: anyerror) ?[]const u8 {
+        if (self.backend == .clef and err == error.TooManyInputTokens) return std.fmt.bufPrint(buf, "Clef schema and state exceed the {d}-token context limit", .{@min(clef.MAX_LENGTH, self.limits.max_input_tokens)}) catch null;
+        if (self.limits.message(buf, err)) |msg| return msg;
+        return switch (self.backend) {
+            .laya => |e| e.limitMessage(buf, err),
+            .kev, .clef => null,
+        };
     }
 };
 
@@ -940,11 +1039,25 @@ pub const DecisionEngine = struct {
 pub const DecisionRequest = struct {
     parsed: std.json.Parsed(std.json.Value),
     state: std.json.Value,
-    questions: laya.Questions,
+    questions: Questions,
+    truncate: bool = true,
+    images: []const @import("chat.zig").ImageData = &.{},
+
+    pub const Questions = union(enum) { laya: laya.Questions, kev: kev.Questions, clef: clef.Questions };
 
     pub fn deinit(self: *DecisionRequest, allocator: std.mem.Allocator) void {
-        self.questions.deinit(allocator);
+        for (self.images) |image| allocator.free(image.pixels);
+        allocator.free(self.images);
+        switch (self.questions) {
+            inline else => |*q| q.deinit(allocator),
+        }
         self.parsed.deinit();
+    }
+
+    pub fn count(self: *const DecisionRequest) usize {
+        return switch (self.questions) {
+            inline else => |q| q.qs.len,
+        };
     }
 };
 
@@ -966,6 +1079,16 @@ pub fn prepareDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const
         return null;
     }
     const obj = parsed.value.object;
+    var truncate = true;
+    if (engine.backend == .clef) {
+        if (obj.get("truncate")) |v| {
+            if (v != .bool) {
+                try sendError(conn, 400, "truncate must be a boolean");
+                return null;
+            }
+            truncate = v.bool;
+        }
+    }
     const state = obj.get("state") orelse {
         try sendError(conn, 400, "missing 'state'");
         return null;
@@ -974,18 +1097,41 @@ pub fn prepareDecisions(allocator: std.mem.Allocator, conn: *Conn, body: []const
         try sendError(conn, 400, "missing 'questions'");
         return null;
     };
-    const qs = engine.engine.parseQuestions(allocator, questions) catch |err| {
+    const images = if (engine.backend == .clef) engine.backend.clef.prepareImages(allocator, parsed.value) catch |err| {
         try sendDecisionError(conn, engine, err);
         return null;
+    } else &.{};
+    defer if (!keep) {
+        for (images) |image| allocator.free(image.pixels);
+        allocator.free(images);
+    };
+    const qs: DecisionRequest.Questions = switch (engine.backend) {
+        .laya => |e| .{ .laya = e.parseQuestions(allocator, questions, engine.limits.max_questions) catch |err| {
+            try sendDecisionError(conn, engine, err);
+            return null;
+        } },
+        .kev => |e| .{ .kev = e.parseQuestions(allocator, questions, engine.limits.max_questions) catch |err| {
+            try sendDecisionError(conn, engine, err);
+            return null;
+        } },
+        .clef => |e| .{ .clef = e.parseQuestions(allocator, questions, engine.limits.max_questions) catch |err| {
+            try sendDecisionError(conn, engine, err);
+            return null;
+        } },
     };
     keep = true;
-    return .{ .parsed = parsed, .state = state, .questions = qs };
+    return .{ .parsed = parsed, .state = state, .questions = qs, .truncate = truncate, .images = images };
 }
 
 /// 400 naming a validation or limit error; 500 for any other.
 fn sendDecisionError(conn: *Conn, engine: *DecisionEngine, err: anyerror) !void {
     var limit_buf: [160]u8 = undefined;
-    if (engine.engine.limitMessage(&limit_buf, err) orelse laya.errorMessage(err)) |msg| return sendError(conn, 400, msg);
+    const named = engine.limitMessage(&limit_buf, err) orelse switch (engine.backend) {
+        .laya => laya.errorMessage(err),
+        .kev => kev.errorMessage(err),
+        .clef => clef.errorMessage(err) orelse laya.errorMessage(err),
+    };
+    if (named) |msg| return sendError(conn, 400, msg);
     log.err("[decision] predict failed: {s}\n", .{@errorName(err)});
     return sendError(conn, 500, "decision forward failed");
 }
@@ -997,31 +1143,50 @@ pub const DecisionJob = struct {
     req: *const DecisionRequest,
 };
 
-/// Laya's `predict` JSON for prepared requests, answered in one pass and sent
-/// to each connection. Runs on the inference thread like every gen job; one
-/// request's error is that request's response only.
+/// The backend's `predict` JSON for prepared requests, sent to each connection.
+/// Runs on the inference thread like every gen job; one request's error is that
+/// request's response only. Laya answers merged requests in one pass; Kev one
+/// request at a time.
 pub fn handleDecisions(engine: *DecisionEngine, model_id: []const u8, jobs: []const DecisionJob) void {
     const t0 = std.Io.Timestamp.now(jobs[0].conn.io, .boot);
-    var buf: [16]laya.Engine.Job = undefined;
-    const pj = if (jobs.len <= buf.len) buf[0..jobs.len] else engine.allocator.alloc(laya.Engine.Job, jobs.len) catch {
-        for (jobs) |j| sendError(j.conn, 500, "out of memory") catch {};
-        return;
-    };
-    defer if (jobs.len > buf.len) engine.allocator.free(pj);
     var nq: usize = 0;
-    for (pj, jobs) |*p, j| {
-        p.* = .{ .a = j.allocator, .model_id = model_id, .state = j.req.state, .questions = &j.req.questions };
-        nq += j.req.questions.qs.len;
+    for (jobs) |j| nq += j.req.count();
+    switch (engine.backend) {
+        .laya => |e| {
+            var buf: [16]laya.Engine.Job = undefined;
+            const pj = if (jobs.len <= buf.len) buf[0..jobs.len] else engine.allocator.alloc(laya.Engine.Job, jobs.len) catch {
+                for (jobs) |j| sendError(j.conn, 500, "out of memory") catch {};
+                return;
+            };
+            defer if (jobs.len > buf.len) engine.allocator.free(pj);
+            for (pj, jobs) |*p, j| p.* = .{ .a = j.allocator, .model_id = model_id, .state = j.req.state, .questions = &j.req.questions.laya, .max_input_tokens = engine.limits.max_input_tokens };
+            e.predictMany(pj);
+            logDecisionPass(jobs, nq, t0);
+            for (pj, jobs) |p, j| sendDecision(engine, j, p.result) catch |err| {
+                log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
+            };
+        },
+        .kev => |e| {
+            for (jobs) |j| sendDecision(engine, j, e.predict(j.allocator, model_id, j.req.state, &j.req.questions.kev, engine.limits.max_input_tokens)) catch |err| {
+                log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
+            };
+            logDecisionPass(jobs, nq, t0);
+        },
+        .clef => |e| {
+            for (jobs) |j| sendDecision(engine, j, e.predict(j.allocator, model_id, j.req.state, &j.req.questions.clef, engine.limits.max_input_tokens, j.req.truncate, j.req.images)) catch |err| {
+                log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
+            };
+            logDecisionPass(jobs, nq, t0);
+        },
     }
-    engine.engine.predictMany(pj);
+}
+
+fn logDecisionPass(jobs: []const DecisionJob, nq: usize, t0: std.Io.Timestamp) void {
     const ms = @as(f64, @floatFromInt(t0.untilNow(jobs[0].conn.io, .boot).nanoseconds)) / 1e6;
     if (jobs.len > 1)
         log.info("[decision] {d} requests merged, {d} question(s) in {d:.1} ms\n", .{ jobs.len, nq, ms })
     else
         log.info("[decision] {d} question(s) in {d:.1} ms\n", .{ nq, ms });
-    for (pj, jobs) |p, j| sendDecision(engine, j, p.result) catch |err| {
-        log.warn("[decision] response not sent: {s}\n", .{@errorName(err)});
-    };
 }
 
 fn sendDecision(engine: *DecisionEngine, job: DecisionJob, result: anyerror![]u8) !void {
@@ -1247,6 +1412,9 @@ pub const H3VideoEngine = struct {
     /// list at load — the file layout is identical either way).
     supports_refs: bool = false,
 
+    /// The text encoder and DiT kept loaded between requests while memory allows.
+    resident: minimax_h3.Resident,
+
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*H3VideoEngine {
         const self = try allocator.create(H3VideoEngine);
         errdefer allocator.destroy(self);
@@ -1254,11 +1422,15 @@ pub const H3VideoEngine = struct {
             .allocator = allocator,
             .model_dir = try allocator.dupe(u8, model_dir),
             .supports_refs = h3DirDeclaresRef2va(io, allocator, model_dir),
+            .resident = minimax_h3.Resident.init(allocator),
         };
+        minimax_h3.registerResident(&self.resident);
         return self;
     }
 
     pub fn deinit(self: *H3VideoEngine) void {
+        minimax_h3.unregisterResident(&self.resident);
+        _ = self.resident.release();
         self.allocator.free(self.model_dir);
         self.allocator.destroy(self);
     }
@@ -1284,6 +1456,41 @@ pub const H3VideoEngine = struct {
         return st.size > 0;
     }
 };
+
+/// Size of one pack file, 0 when it is absent.
+fn packFileBytes(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, name: []const u8) u64 {
+    const p = std.fs.path.join(a, &.{ model_dir, name }) catch return 0;
+    defer a.free(p);
+    const st = std.Io.Dir.cwd().statFile(io, p, .{}) catch return 0;
+    return @intCast(st.size);
+}
+
+/// The cache to hand `generate`, or null for the staged plan. Residency needs the whole set to
+/// fit in the memory that is free right now plus what the cache already holds; when it does not,
+/// whatever was held is released first, so the staged peak starts from a clean slate.
+pub const H3Plan = struct { resident: *minimax_h3.Resident, bytes: u64 };
+
+pub fn h3ResidentFor(engine: *H3VideoEngine, io: std.Io, a: std.mem.Allocator, activations: u64) ?H3Plan {
+    const dir = engine.model_dir;
+    const need = h3ResidentBytes(
+        packFileBytes(io, a, dir, "text_encoder.safetensors"),
+        packFileBytes(io, a, dir, "transformer.safetensors"),
+        packFileBytes(io, a, dir, "video_vae.safetensors") + packFileBytes(io, a, dir, "audio_vae.safetensors"),
+        packFileBytes(io, a, dir, "turbo_lora.safetensors"),
+        activations,
+    );
+    var active: usize = 0;
+    _ = mlx.mlx_get_active_memory(&active);
+    const avail = h3AvailBytes(metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active);
+    const keep = h3ResidentEnabled() and !ane.media_offload.video and
+        h3KeepResident(avail, engine.resident.bytes, need, h3ResidentMargin(metrics.getTotalMemBytes()));
+    if (!keep) {
+        const freed = engine.resident.release();
+        if (freed > 0) log.info("[minimax-h3] residency released ({d:.1} GB): the resident set no longer fits\n", .{@as(f64, @floatFromInt(freed)) / (1024.0 * 1024.0 * 1024.0)});
+        return null;
+    }
+    return .{ .resident = &engine.resident, .bytes = need };
+}
 
 pub const LtxVideoEngine = struct {
     allocator: std.mem.Allocator,
@@ -2123,7 +2330,7 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
         log.warn("[image] requested {d}x{d} resolved to {d}x{d} for this backend\n", .{ req_w, req_h, width, height });
     }
     const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    const steps: u32 = @intCast(extractJsonInt(body, "steps") orelse engine.defaultSteps());
+    var steps: u32 = @intCast(extractJsonInt(body, "steps") orelse engine.defaultSteps());
 
     // Source image: `image` (base64 PNG/JPEG) + `mode` ("variation" default /
     // "edit"). Variation = SDEdit renoise at `strength` (both backends);
@@ -2355,10 +2562,11 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     {
         var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
         var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
-        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales, server_mod.peerIsLoopback(conn)) catch |err| switch (err) {
             error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
             error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
             error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
+            error.LoraPathsLocalOnly => return sendError(conn, 403, LORA_LOCAL_ONLY_MSG),
             error.OutOfMemory => return err,
         };
         defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
@@ -2377,12 +2585,10 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     }
 
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
-    if (want_stream) try conn.writeAll(sse.headers);
 
-    const gen_opts = ImageGenOpts{
+    var gen_opts = ImageGenOpts{
         .transparent = transparent,
         .init_image = init_img, // null in edit mode
         .strength = strength,
@@ -2400,22 +2606,38 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     // and running past the working set hangs the first denoise step with no
     // error — refuse by NAME with the number we compared.
     if (engine.backend == .qwen_image and gen_opts.edit_image_bytes.len != 0) {
-        const bill = qwenImageEditTransientBytes(
-            @intCast(gen_opts.edit_image_bytes.len), gen_opts.ref_resolution, width, height,
+        const cache_enabled = qwen_image.prefixCacheEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_KV_CACHE"));
+        const base_bill = qwenImageEditTransientBytes(
+            @intCast(gen_opts.edit_image_bytes.len),
+            gen_opts.ref_resolution,
+            width,
+            height,
         );
-        if (bill > QWEN_IMAGE_EDIT_TRANSIENT_BYTES) {
-            var active: usize = 0;
-            _ = mlx.mlx_get_active_memory(&active);
-            const headroom: u64 = mlx.maxRecommendedWorkingSet() -| @as(u64, active);
-            const need: u64 = bill - QWEN_IMAGE_EDIT_TRANSIENT_BYTES;
-            if (need > headroom) {
-                log.info("[image] edit bill refused: {d} refs at refres {d} + {d}x{d} target needs {d} MB over the reserve, headroom {d} MB\n", .{
-                    gen_opts.edit_image_bytes.len, gen_opts.ref_resolution, width, height, need >> 20, headroom >> 20,
-                });
-                return sendError(conn, 400, "this edit's working set (references + target) needs more GPU memory than is free — lower 'ref_resolution' or the reference count, or shrink 'size'");
-            }
+        const prefix_bill = qwenImageEditPrefixBytes(
+            @intCast(gen_opts.edit_image_bytes.len),
+            gen_opts.ref_resolution,
+            engine.backend.qwen_image.dit_cfg,
+            if (guidance_scale != 1) 2 else 1,
+        );
+        var active: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active);
+        const headroom: u64 = mlx.maxRecommendedWorkingSet() -| @as(u64, active);
+        const plan = planQwenImageEdit(steps, cache_enabled, base_bill, prefix_bill, headroom) catch {
+            log.info("[image] edit bill refused: {d} refs at refres {d} + {d}x{d} target needs {d} MB over the reserve, headroom {d} MB\n", .{
+                gen_opts.edit_image_bytes.len, gen_opts.ref_resolution, width, height, (base_bill -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES) >> 20, headroom >> 20,
+            });
+            return sendError(conn, 400, "this edit's working set (references + target) needs more GPU memory than is free — lower 'ref_resolution' or the reference count, or shrink 'size'");
+        };
+        steps = plan.steps;
+        gen_opts.qwen_edit_prefix_cache = plan.prefix_cache;
+        if (cache_enabled and steps > 1 and !plan.prefix_cache) {
+            log.info("[image] edit prefix cache does not fit; using uncached forward (cached bill {d} MB over reserve, headroom {d} MB)\n", .{
+                ((base_bill +| prefix_bill) -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES) >> 20, headroom >> 20,
+            });
         }
     }
+    log.info("[image] generating {d}x{d} steps={d} guidance={d:.1} stream={}: {d} chars\n", .{ width, height, steps, guidance_scale, want_stream, prompt.len });
+    if (want_stream) try conn.writeAll(sse.headers);
     const img = engine.generateImage(allocator, prompt, width, height, seed, steps, gen_opts, prog) catch |err| {
         // Client hung up mid-generation — there is nobody to answer, and
         // saying "generation failed" would be a lie about a job we stopped.
@@ -2457,7 +2679,8 @@ pub fn handleImage(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
 pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
     const synth = switch (engine.backend) {
         .tts => |*t| t,
-        .music, .music3 => return sendError(conn, 400, "loaded audio model is a music generator; POST /v1/audio/music-generations"),
+        .music, .music3 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
+        .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
         .kokoro => |k| return handleKokoroSpeech(allocator, conn, body, k),
     };
     // Pre-warm (docs/qwentts-cache.md): `{"warm_only":true,"ref_audio":...}`
@@ -2524,6 +2747,10 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     if (want_stream) try conn.writeAll(sse.headers);
 
     const wav = synth.synthesizeWav(text, 2048, prog, ref_samples) catch |err| {
+        if (err == error.Cancelled) {
+            log.info("[audio] synthesis cancelled — client disconnected\n", .{});
+            return;
+        }
         log.err("[audio] synthesis failed: {}\n", .{err});
         if (want_stream) {
             sse.sendError(conn, "synthesis failed");
@@ -2533,20 +2760,7 @@ pub fn handleAudio(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     };
     defer allocator.free(wav);
     log.info("[audio] -> {d} WAV bytes\n", .{wav.len});
-    if (want_stream) {
-        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
-        const b64 = try allocator.alloc(u8, b64_len);
-        defer allocator.free(b64);
-        _ = std.base64.standard.Encoder.encode(b64, wav);
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(allocator);
-        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
-        try out.appendSlice(allocator, b64);
-        try out.appendSlice(allocator, "\"}\n\n");
-        try conn.writeAll(out.items);
-        return;
-    }
-    return sendBytes(conn, allocator, "audio/wav", wav);
+    return sendWav(allocator, conn, wav, want_stream);
 }
 
 /// `POST /v1/audio/speech` on a Kokoro checkpoint.
@@ -2652,8 +2866,113 @@ pub fn handleMusic(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, 
     switch (engine.backend) {
         .music => |m| return handleMusicAcestep(allocator, conn, body, m),
         .music3 => |m| return handleMusic3(allocator, conn, body, m),
-        .tts, .kokoro => return sendError(conn, 400, "loaded audio model is a TTS voice; POST /v1/audio/speech"),
+        .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
+        .sound => return sendError(conn, 400, SOUND_ROUTE_HINT),
     }
+}
+
+const MUSIC_ROUTE_HINT = "loaded audio model is a music generator; POST /v1/audio/music-generations";
+const TTS_ROUTE_HINT = "loaded audio model is a TTS voice; POST /v1/audio/speech";
+const SOUND_ROUTE_HINT = "loaded audio model is a text-to-audio generator; POST /v1/audio/sound-generations";
+
+/// The numeric fields of a sound-generation body, or the 400 naming the bad one.
+pub const SoundParams = struct { seconds: f32 = 10, steps: u32 = stable_audio.DEFAULT_STEPS, seed: u64 = 42 };
+
+/// Parsed as real JSON: a negative, fractional or quoted value is refused by
+/// name rather than read as a default or truncated.
+pub fn parseSoundParams(a: std.mem.Allocator, body: []const u8) union(enum) { ok: SoundParams, bad: []const u8 } {
+    var parsed = std.json.parseFromSlice(std.json.Value, a, body, .{}) catch return .{ .bad = "invalid JSON body" };
+    defer parsed.deinit();
+    if (parsed.value != .object) return .{ .bad = "invalid JSON body" };
+    const o = parsed.value.object;
+    var p = SoundParams{};
+    if (o.get("duration_seconds")) |v| {
+        const d: f64 = switch (v) {
+            .integer => |i| @floatFromInt(i),
+            .float => |f| f,
+            else => return .{ .bad = "'duration_seconds' must be a number in (0,120]" },
+        };
+        if (!(d > 0 and d <= stable_audio.MAX_SECONDS)) return .{ .bad = "'duration_seconds' must be a number in (0,120]" };
+        p.seconds = @floatCast(d);
+    }
+    if (o.get("steps")) |v| {
+        const n = jsonWholeNumber(v) orelse return .{ .bad = "'steps' must be an integer in [1,50]" };
+        if (n < 1 or n > stable_audio.MAX_STEPS) return .{ .bad = "'steps' must be an integer in [1,50]" };
+        p.steps = @intCast(n);
+    }
+    if (o.get("seed")) |v| {
+        const n = jsonWholeNumber(v) orelse return .{ .bad = "'seed' must be a non-negative integer" };
+        if (n < 0) return .{ .bad = "'seed' must be a non-negative integer" };
+        p.seed = @intCast(n);
+    }
+    return .{ .ok = p };
+}
+
+/// An integer, or a float with no fractional part; null for anything else.
+fn jsonWholeNumber(v: std.json.Value) ?i64 {
+    return switch (v) {
+        .integer => |i| i,
+        .float => |f| if (@trunc(f) == f and @abs(f) < 9e18) @intFromFloat(f) else null,
+        else => null,
+    };
+}
+
+/// `POST /v1/audio/sound-generations` — Stable Audio 3 text-to-audio.
+/// `{"model", "prompt" (REQUIRED, a description of the sound),
+/// "duration_seconds" (default 10, (0,120]), "steps" (ping-pong steps,
+/// default 8, 1-50), "seed" (default 42), "stream"}`. Response mirrors the
+/// music endpoint: raw `audio/wav` (44.1 kHz stereo PCM16) non-stream, SSE
+/// progress + a base64 `complete` event when streaming.
+pub fn handleSound(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *AudioEngine) !void {
+    const sa = switch (engine.backend) {
+        .sound => |e| e,
+        .music, .music3 => return sendError(conn, 400, MUSIC_ROUTE_HINT),
+        .tts, .kokoro => return sendError(conn, 400, TTS_ROUTE_HINT),
+    };
+    const raw_prompt = extractJsonString(body, "prompt") orelse return sendError(conn, 400, "missing 'prompt' (a description of the sound)");
+    const prompt = try jsonUnescape(allocator, raw_prompt);
+    defer allocator.free(prompt);
+    if (prompt.len == 0) return sendError(conn, 400, "empty 'prompt'");
+    const p = switch (parseSoundParams(allocator, body)) {
+        .ok => |v| v,
+        .bad => |m| return sendError(conn, 400, m),
+    };
+    const want_stream = sse.bodyWantsTrue(body, "stream");
+    var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
+    if (want_stream) try conn.writeAll(sse.headers);
+    const wav = sa.generateWav(allocator, .{ .prompt = prompt, .seconds = p.seconds, .steps = p.steps, .seed = p.seed }, sctx.progress()) catch |err| {
+        if (err == error.Cancelled) {
+            log.info("[sa3] generation cancelled by client\n", .{});
+            return;
+        }
+        log.err("[sa3] generation failed: {}\n", .{err});
+        if (want_stream) {
+            sse.sendError(conn, "sound generation failed");
+            return;
+        }
+        return sendError(conn, 500, "sound generation failed");
+    };
+    defer allocator.free(wav);
+    log.info("[sa3] -> {d} WAV bytes\n", .{wav.len});
+    return sendWav(allocator, conn, wav, want_stream);
+}
+
+/// A generated WAV: raw `audio/wav`, or the base64 SSE `complete` event.
+fn sendWav(allocator: std.mem.Allocator, conn: *Conn, wav: []const u8, want_stream: bool) !void {
+    if (want_stream) {
+        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
+        const b64 = try allocator.alloc(u8, b64_len);
+        defer allocator.free(b64);
+        _ = std.base64.standard.Encoder.encode(b64, wav);
+        var out: std.ArrayList(u8) = .empty;
+        defer out.deinit(allocator);
+        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
+        try out.appendSlice(allocator, b64);
+        try out.appendSlice(allocator, "\"}\n\n");
+        try conn.writeAll(out.items);
+        return;
+    }
+    return sendBytes(conn, allocator, "audio/wav", wav);
 }
 
 fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, music: *acestep.Engine) !void {
@@ -2812,20 +3131,7 @@ fn handleMusicAcestep(allocator: std.mem.Allocator, conn: *Conn, body: []const u
     };
     defer allocator.free(wav);
     log.info("[music] -> {d} WAV bytes\n", .{wav.len});
-    if (want_stream) {
-        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
-        const b64 = try allocator.alloc(u8, b64_len);
-        defer allocator.free(b64);
-        _ = std.base64.standard.Encoder.encode(b64, wav);
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(allocator);
-        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
-        try out.appendSlice(allocator, b64);
-        try out.appendSlice(allocator, "\"}\n\n");
-        try conn.writeAll(out.items);
-        return;
-    }
-    return sendBytes(conn, allocator, "audio/wav", wav);
+    return sendWav(allocator, conn, wav, want_stream);
 }
 
 /// `POST /v1/audio/music-generations` — MiniMax Music 3 text2music.
@@ -2951,20 +3257,7 @@ fn handleMusic3(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, m3:
     };
     defer allocator.free(wav);
     log.info("[music3] -> {d} WAV bytes\n", .{wav.len});
-    if (want_stream) {
-        const b64_len = std.base64.standard.Encoder.calcSize(wav.len);
-        const b64 = try allocator.alloc(u8, b64_len);
-        defer allocator.free(b64);
-        _ = std.base64.standard.Encoder.encode(b64, wav);
-        var out: std.ArrayList(u8) = .empty;
-        defer out.deinit(allocator);
-        try out.appendSlice(allocator, "data: {\"type\":\"complete\",\"format\":\"wav\",\"data\":\"");
-        try out.appendSlice(allocator, b64);
-        try out.appendSlice(allocator, "\"}\n\n");
-        try conn.writeAll(out.items);
-        return;
-    }
-    return sendBytes(conn, allocator, "audio/wav", wav);
+    return sendWav(allocator, conn, wav, want_stream);
 }
 
 /// POST /v1/video/generations — base64 RGB8 frames (or SSE progress + complete).
@@ -3431,10 +3724,11 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // the engine sums every attached delta on each linear.
     var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
     var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
-    const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+    const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales, server_mod.peerIsLoopback(conn)) catch |err| switch (err) {
         error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
         error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
         error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
+        error.LoraPathsLocalOnly => return sendError(conn, 403, LORA_LOCAL_ONLY_MSG),
         error.OutOfMemory => return err,
     };
     defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
@@ -3580,6 +3874,41 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     // the GPU running to the end with every queued request behind it.
     var sctx = videoStreamCtx(conn, allocator, body, want_stream);
     const prog: ?sse.Progress = sctx.progress();
+    // The load gate bills the model, not the request: the request's own activations price the
+    // resident plan, and when that does not fit, the staged DiT stage is checked here, before
+    // any stage loads, since the Metal OOM mid-step is uncatchable.
+    const speed = minimax_h3.resolveSpeed(sse.bodyBool(body, "fast"), turbo, minimax_h3.envStr("MINIMAX_H3_STEP_CACHE"), minimax_h3.envStr("MINIMAX_H3_ATTN_BCAST"));
+    const cfg = minimax_h3.Config{};
+    const bcast_row: u64 = if (speed.bcast_k > 0) @as(u64, cfg.num_layers) * cfg.hidden_size * 2 else 0;
+    const rows = h3RequestRows(width, height, shape.frame_count, @intCast(n_kf));
+    const activations = h3ActivationBytes(rows, bcast_row);
+    const plan = h3ResidentFor(engine, io, allocator, activations);
+    if (plan == null) {
+        const dit = h3DitResidentBytes(packFileBytes(io, allocator, engine.model_dir, "transformer.safetensors"), minimax_h3.adalnPrecomputeOn()) +
+            (if (turbo) packFileBytes(io, allocator, engine.model_dir, "turbo_lora.safetensors") else 0);
+        var active: usize = 0;
+        _ = mlx.mlx_get_active_memory(&active);
+        const avail = h3AvailBytes(metrics.getAvailableMemBytes(), mlx.maxRecommendedWorkingSet(), active);
+        if (dit > 0 and avail > 0 and dit + activations > avail) {
+            const gb = 1024.0 * 1024.0 * 1024.0;
+            var buf: [320]u8 = undefined;
+            const with_cache = bcast_row > 0;
+            const msg = std.fmt.bufPrint(&buf, "{d}x{d} x {d} frames needs ~{d:.1} GB ({d:.1} GB DiT + {d:.1} GB for {d} sequence rows{s}) but {d:.1} GB is available: use a smaller canvas or fewer frames{s}", .{
+                width,
+                height,
+                shape.frame_count,
+                @as(f64, @floatFromInt(dit + activations)) / gb,
+                @as(f64, @floatFromInt(dit)) / gb,
+                @as(f64, @floatFromInt(activations)) / gb,
+                rows,
+                if (with_cache) " with the fast recipe's attention cache" else "",
+                @as(f64, @floatFromInt(avail)) / gb,
+                if (with_cache) ", or \"turbo\", which keeps no attention cache" else "",
+            }) catch "the canvas does not fit in memory: use a smaller canvas or fewer frames";
+            return sendError(conn, 400, msg);
+        }
+    }
+
     if (want_stream) try conn.writeAll(sse.headers);
 
     const paths = try engine.paths(allocator);
@@ -3592,13 +3921,15 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
     }
 
     var res = minimax_h3.generate(allocator, io, paths, .{
+        .resident = if (plan) |p| p.resident else null,
+        .resident_bytes = if (plan) |p| p.bytes else 0,
         .prompt = prompt,
         .width = width,
         .height = height,
         .frames = requested_frames,
         .steps = steps,
         .seed = seed,
-        .fast = sse.bodyBool(body, "fast"),
+        .speed = speed,
         .turbo = turbo,
         .lora_paths = lora_paths[0..lora_n],
         .lora_scales = lora_scales[0..lora_n],
@@ -3619,7 +3950,7 @@ fn handleVideoH3(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: []
             error.LoraNoMatch => "a LoRA has no modules matching MiniMax-H3's DiT — wrong architecture for this adapter?",
             error.BadLoraPath => "'lora_paths' must be absolute paths to .safetensors files",
             error.TooManyLoras => "too many LoRA adapters (max 8, and turbo takes one of the slots)",
-            error.TurboLoraIncomplete => "turbo_lora.safetensors is incomplete — re-download minimax_h3_turbo_4step_ckpt500.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora",
+            error.TurboLoraIncomplete => "turbo_lora.safetensors ships modules MiniMax-H3's DiT does not have — replace it with minimax_h3_turbo_4step_ema_ckpt850.safetensors from hf.co/larryvrh/MiniMax-H3-Turbo-Lora",
             else => null,
         };
         if (named) |msg| {
@@ -3689,10 +4020,11 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
     {
         var lora_path_bufs: [lora_mod.MAX_LORAS][]u8 = undefined;
         var lora_scales: [lora_mod.MAX_LORAS]f32 = undefined;
-        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales) catch |err| switch (err) {
+        const lora_n = parseLoraFields(allocator, body, &lora_path_bufs, &lora_scales, server_mod.peerIsLoopback(conn)) catch |err| switch (err) {
             error.TooManyLoraPaths => return sendError(conn, 400, "too many 'lora_paths' (max 8)"),
             error.BadLoraPathsJson => return sendError(conn, 400, "invalid 'lora_paths' (must be a JSON array of strings)"),
             error.BadLoraScalesJson => return sendError(conn, 400, "invalid 'lora_scales' (numbers, comma/space separated, or a JSON array)"),
+            error.LoraPathsLocalOnly => return sendError(conn, 403, LORA_LOCAL_ONLY_MSG),
             error.OutOfMemory => return err,
         };
         defer for (lora_path_bufs[0..lora_n]) |p| allocator.free(p);
@@ -4276,6 +4608,28 @@ pub fn qwenImageEditTransientBytes(refs: u32, ref_resolution: u32, out_w: u32, o
     return scores + persistent;
 }
 
+/// BF16 K/V for all layers coexist with first-step attention. CFG branches
+/// each retain their own text and reference prefix; one-step edits cache none.
+fn qwenImageEditPrefixBytes(refs: u32, ref_resolution: u32, cfg: qwen_image.DitConfig, branches: u32) u64 {
+    const rt: u64 = @as(u64, ref_resolution / 16) * (ref_resolution / 16);
+    const prefix = @as(u64, refs) * rt + QWEN_IMAGE_EDIT_TEXT_TOKENS;
+    return prefix * cfg.layers * cfg.hidden() * 2 * 2 * branches;
+}
+
+const QwenImageEditPlan = struct { steps: u32, prefix_cache: bool };
+
+/// Prefer cached edits, but preserve requests that fit only without the cache.
+fn planQwenImageEdit(steps: u32, cache_enabled: bool, base_bill: u64, prefix_bill: u64, headroom: u64) !QwenImageEditPlan {
+    const resolved_steps = qwen_image.resolveSteps(steps);
+    if (base_bill -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES > headroom)
+        return error.QwenImageEditMemoryBudget;
+    return .{
+        .steps = resolved_steps,
+        .prefix_cache = cache_enabled and resolved_steps > 1 and
+            (base_bill +| prefix_bill) -| QWEN_IMAGE_EDIT_TRANSIENT_BYTES <= headroom,
+    };
+}
+
 /// The edit-capable pack's bill: the SAME staging answer as t2i (the engine
 /// and the residency bill read one `qwenImageStagesTextEncoder`), with the
 /// heavier edit transient whenever the tower is present.
@@ -4356,6 +4710,64 @@ pub fn h3PeakBytes(te: u64, dit_resident: u64, video_vae: u64, audio_vae: u64) u
     const generating = @max(dit_resident, vaes);
     if (te == 0 and generating == 0) return 0; // unknown dir → never block
     return stagedPeakBytes(0, &.{ te, generating + H3_ACTIVATION_BYTES });
+}
+
+/// Sequence rows one window puts through the DiT: video latents on the 32-pixel grid, stereo
+/// audio latents, and a frame of rows per keyframe. Prompt and reference rows ride the margin.
+pub fn h3RequestRows(width: u32, height: u32, frames: u32, keyframes: u32) u64 {
+    const shape = minimax_h3.temporalShape(frames);
+    const frame_rows: u64 = (height / (minimax_h3.VAE_SPATIAL * minimax_h3.PATCH_H)) * (width / (minimax_h3.VAE_SPATIAL * minimax_h3.PATCH_W));
+    return (shape.latent_t + keyframes) * frame_rows + 2 * @as(u64, shape.audio_t);
+}
+
+/// What one denoising run holds above its weights, per sequence row (process footprint on an
+/// M5 Pro, 8.9k-37.7k rows): the per-step transients, plus the fast recipe's per-block attention
+/// cache (`bcast_row_bytes` = layers x hidden x bf16) while that recipe is on.
+pub const H3_ROW_BYTES: u64 = 384 * 1024;
+const H3_REQUEST_BASE_BYTES: u64 = 1 << 30;
+
+pub fn h3ActivationBytes(rows: u64, bcast_row_bytes: u64) u64 {
+    return H3_REQUEST_BASE_BYTES + rows * (H3_ROW_BYTES + bcast_row_bytes);
+}
+
+/// What MiniMax-H3 holds when it keeps every piece loaded between requests: the text encoder, the
+/// WHOLE DiT (the AdaLN weights stay, since they serve any schedule), both VAEs, the LoRA and the
+/// request's activations (`h3ActivationBytes`). Zero when a size is unknown, which never keeps anything.
+pub fn h3ResidentBytes(te: u64, dit_file: u64, vaes: u64, lora: u64, activations: u64) u64 {
+    if (te == 0 or dit_file == 0) return 0;
+    return te + dit_file + vaes + lora + activations;
+}
+
+/// Frees every H3 engine's resident cache; returns the bytes released. For a load that would
+/// otherwise be refused for memory.
+pub fn releaseMediaResidency() u64 {
+    return minimax_h3.releaseAllResidents();
+}
+
+/// Memory the next request can still use: the tighter of host RAM that is free and the GPU
+/// working-set room. Both exclude what the cache already holds. Zero when host RAM is unknown.
+pub fn h3AvailBytes(host_avail: u64, gpu_limit: u64, gpu_active: u64) u64 {
+    if (host_avail == 0) return 0;
+    if (gpu_limit == 0) return host_avail;
+    return @min(host_avail, gpu_limit -| gpu_active);
+}
+
+/// Headroom kept free beyond the resident set: an eighth of the RAM it does not need, floored.
+pub fn h3ResidentMargin(total_ram: u64) u64 {
+    return @max(10 * 1024 * 1024 * 1024, total_ram / 16);
+}
+
+/// `MLX_SERVE_H3_RESIDENT=0` turns residency off (the A/B arm and the kill switch).
+fn h3ResidentEnabled() bool {
+    const raw = std.c.getenv("MLX_SERVE_H3_RESIDENT") orelse return true;
+    return !std.mem.eql(u8, std.mem.span(raw), "0");
+}
+
+/// Keep H3 resident only while it fits: what is free right now plus what the cache already holds
+/// must cover the whole set and a margin. All or nothing, because a half-resident set breaks the
+/// staged plan's disjoint-stage peak. `avail` excludes the cache's own bytes.
+pub fn h3KeepResident(avail: u64, cache_now: u64, need: u64, margin: u64) bool {
+    return need != 0 and avail +| cache_now >= need +| margin;
 }
 
 /// Per-backend generation-peak estimate for the media load preflight. A
@@ -4474,6 +4886,7 @@ fn sendBytesJson(conn: *Conn, allocator: std.mem.Allocator, json: []const u8) !v
     try hdr.appendSlice(allocator, ns);
     try hdr.appendSlice(allocator, "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
     try conn.writeAllNoFlush(hdr.items);
+    conn.length_framed = true;
     try conn.writeAll(json);
 }
 
@@ -4488,6 +4901,7 @@ fn sendBytes(conn: *Conn, allocator: std.mem.Allocator, content_type: []const u8
     try hdr.appendSlice(allocator, ns);
     try hdr.appendSlice(allocator, "\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n");
     try conn.writeAllNoFlush(hdr.items);
+    conn.length_framed = true;
     try conn.writeAll(payload);
 }
 
@@ -4506,6 +4920,7 @@ fn sendError(conn: *Conn, code: u16, msg: []const u8) !void {
     var hdr: [256]u8 = undefined;
     const head = std.fmt.bufPrint(&hdr, "HTTP/1.1 {d} Error\r\nContent-Type: application/json\r\nContent-Length: {d}\r\nConnection: close\r\nAccess-Control-Allow-Origin: *\r\n\r\n", .{ code, body.len }) catch return;
     try conn.writeAllNoFlush(head);
+    conn.length_framed = true;
     try conn.writeAll(body);
 }
 
@@ -4626,7 +5041,12 @@ fn extractLoraScales(body: []const u8, buf: []f32) ?[]f32 {
     return extractFloatArrayField(body, "lora_scales", buf);
 }
 
-const LoraFieldsError = error{ TooManyLoraPaths, BadLoraPathsJson, BadLoraScalesJson, OutOfMemory };
+const LoraFieldsError = error{ TooManyLoraPaths, BadLoraPathsJson, BadLoraScalesJson, LoraPathsLocalOnly, OutOfMemory };
+
+/// A LoRA path names a file on the server's disk, so only a client on this
+/// machine may send one: from anyone else, "missing" vs "not a LoRA" answers
+/// whether a host path exists (#540).
+const LORA_LOCAL_ONLY_MSG = "'lora_paths' name files on the server's disk and are accepted only from the server's own machine";
 
 /// Parse the LoRA fields common to image and video requests: the array form
 /// (`lora_paths` + optional `lora_scales`) or the original single-adapter
@@ -4636,12 +5056,13 @@ const LoraFieldsError = error{ TooManyLoraPaths, BadLoraPathsJson, BadLoraScales
 /// their resolved scales into `scale_buf`. Returns 0 with both buffers
 /// untouched when neither field is present — the "detach whatever was
 /// attached" case. Missing `lora_scales` entries default to 1.0, matching
-/// mflux's `resolve_scales`.
+/// mflux's `resolve_scales`. `local`: the client is on this machine.
 fn parseLoraFields(
     allocator: std.mem.Allocator,
     body: []const u8,
     path_bufs: *[lora_mod.MAX_LORAS][]u8,
     scale_buf: *[lora_mod.MAX_LORAS]f32,
+    local: bool,
 ) LoraFieldsError!usize {
     var n: usize = 0;
     errdefer for (path_bufs[0..n]) |p| allocator.free(p);
@@ -4659,6 +5080,7 @@ fn parseLoraFields(
         n = 1;
     }
     if (n == 0) return 0;
+    if (!local) return error.LoraPathsLocalOnly;
 
     if (std.mem.indexOf(u8, body, "\"lora_scales\"") != null) {
         var sbuf: [lora_mod.MAX_LORAS]f32 = undefined;
@@ -5030,6 +5452,24 @@ test "openaiEditFormToJson: OpenAI multipart becomes our edit request" {
     try testing.expectEqualStrings("blurry", p6.value.object.get("negative_prompt").?.string);
 }
 
+test "parseLoraFields: a LoRA path is accepted only from this machine (#540)" {
+    const a = testing.allocator;
+    var paths: [lora_mod.MAX_LORAS][]u8 = undefined;
+    var scales: [lora_mod.MAX_LORAS]f32 = undefined;
+    const bodies = [_][]const u8{
+        "{\"lora_paths\":[\"/etc/hosts\",\"/x.safetensors\"],\"lora_scales\":[0.5]}",
+        "{\"lora_path\":\"/etc/hosts\"}",
+    };
+    for (bodies) |body| {
+        try testing.expectError(error.LoraPathsLocalOnly, parseLoraFields(a, body, &paths, &scales, false));
+        const n = try parseLoraFields(a, body, &paths, &scales, true);
+        defer for (paths[0..n]) |p| a.free(p);
+        try testing.expectEqualStrings("/etc/hosts", paths[0]);
+    }
+    // No LoRA fields detaches, from anyone.
+    try testing.expectEqual(@as(usize, 0), try parseLoraFields(a, "{\"prompt\":\"p\"}", &paths, &scales, false));
+}
+
 test "openaiEditFormToJson: everything we can't honor is an explicit error" {
     const a = testing.allocator;
     const CT = "multipart/form-data; boundary=X";
@@ -5199,6 +5639,31 @@ test "audioBackendKindForType routes acestep to music, everything else to tts" {
     try testing.expect(AudioBackendKind.music3.servesMusic());
     try testing.expect(!AudioBackendKind.tts.servesMusic());
     try testing.expect(!AudioBackendKind.kokoro.servesMusic());
+}
+
+test "stable_audio3 is a sound backend on its own route, with named bounds" {
+    try testing.expectEqual(Modality.audio, modalityFromType("stable_audio3").?);
+    try testing.expect(audioBackendKindForType("stable_audio3") == .sound);
+    try testing.expect(!AudioBackendKind.sound.servesMusic());
+    try testing.expectEqual(Modality.audio, GenRoute.sound.modality());
+
+    const a = testing.allocator;
+    try testing.expectEqual(SoundParams{}, parseSoundParams(a, "{\"prompt\":\"rain\"}").ok);
+    try testing.expectEqual(SoundParams{ .seconds = 2.5, .steps = 4, .seed = 7 }, parseSoundParams(a, "{\"duration_seconds\":2.5,\"steps\":4,\"seed\":7}").ok);
+    // Real JSON numbers: an exponent is a number, an integral float is an integer.
+    try testing.expectEqual(SoundParams{ .seconds = 15, .steps = 8 }, parseSoundParams(a, "{\"duration_seconds\":1.5e1,\"steps\":8.0}").ok);
+    // Every field the endpoint cannot honor is a 400 naming it, never a silent default.
+    const bad = [_][2][]const u8{
+        .{ "{\"duration_seconds\":0}", "duration_seconds" },   .{ "{\"duration_seconds\":121}", "duration_seconds" },
+        .{ "{\"duration_seconds\":\"10\"}", "duration_seconds" }, .{ "{\"steps\":0}", "steps" },
+        .{ "{\"steps\":51}", "steps" },                     .{ "{\"steps\":-5}", "steps" },
+        .{ "{\"steps\":4.9}", "steps" },                    .{ "{\"seed\":-1}", "seed" },
+        .{ "{\"seed\":\"x\"}", "seed" },                    .{ "not json", "JSON" },
+    };
+    for (bad) |c| {
+        const msg = parseSoundParams(a, c[0]).bad;
+        try testing.expect(std.mem.indexOf(u8, msg, c[1]) != null);
+    }
 }
 
 test "estimatePeakResidentBytes: minimax_music3 bills the sum plus its AR working set" {
@@ -5910,6 +6375,42 @@ test "Qwen-Image edit transient: the request-scope bill scales with refs x ref t
     try testing.expect(half * 2 < ten);
 }
 
+test "Qwen-Image edit admission chooses cached, uncached or refuses using resolved steps" {
+    const GB: u64 = 1 << 30;
+    const base = QWEN_IMAGE_EDIT_TRANSIENT_BYTES + 2 * GB;
+    const prefix = 4 * GB;
+    const cached = try planQwenImageEdit(20, true, base, prefix, 6 * GB);
+    try testing.expect(cached.prefix_cache);
+    try testing.expectEqual(@as(u32, 20), cached.steps);
+    const fallback = try planQwenImageEdit(20, true, base, prefix, 2 * GB);
+    try testing.expect(!fallback.prefix_cache);
+    try testing.expectEqual(@as(u32, 20), fallback.steps);
+    try testing.expectError(error.QwenImageEditMemoryBudget, planQwenImageEdit(20, true, base, prefix, 2 * GB - 1));
+    try testing.expectError(error.QwenImageEditMemoryBudget, planQwenImageEdit(20, false, base, prefix, 0));
+    const zero = try planQwenImageEdit(0, true, base, prefix, 6 * GB);
+    try testing.expectEqual(qwen_image.DEFAULT_STEPS, zero.steps);
+    try testing.expect(zero.prefix_cache);
+    const zero_fallback = try planQwenImageEdit(0, true, base, prefix, 2 * GB);
+    try testing.expectEqual(qwen_image.DEFAULT_STEPS, zero_fallback.steps);
+    try testing.expect(!zero_fallback.prefix_cache);
+    try testing.expect(!(try planQwenImageEdit(1, true, base, prefix, 6 * GB)).prefix_cache);
+    try testing.expect(!(try planQwenImageEdit(20, false, base, prefix, 6 * GB)).prefix_cache);
+    try testing.expect((try planQwenImageEdit(20, true, 1 * GB, 2 * GB, 0)).prefix_cache);
+    try testing.expect(!(try planQwenImageEdit(20, true, base, std.math.maxInt(u64), 6 * GB)).prefix_cache);
+}
+
+test "Qwen-Image edit prefix bill includes every layer and independent CFG branch" {
+    const cfg = qwen_image.DitConfig{};
+    const one = qwenImageEditPrefixBytes(1, 1024, cfg, 1);
+    try testing.expectEqual(@as(u64, (4096 + 2600) * 32 * 4096 * 4), one);
+    try testing.expectEqual(2 * one, qwenImageEditPrefixBytes(1, 1024, cfg, 2));
+    try testing.expectEqual(@as(u64, 0), qwenImageEditPrefixBytes(10, 1024, cfg, 0));
+    try testing.expect(qwenImageEditPrefixBytes(10, 1024, cfg, 2) > 40 << 30);
+    try testing.expect(qwenImageEditPrefixBytes(10, 512, cfg, 1) < qwenImageEditPrefixBytes(10, 1024, cfg, 1));
+    const tiny = qwen_image.DitConfig{ .layers = 2, .heads = 2, .head_dim = 16 };
+    try testing.expectEqual(@as(u64, (4096 + 2600) * 2 * 32 * 4), qwenImageEditPrefixBytes(1, 1024, tiny, 1));
+}
+
 test "LTX bills ONE transformer variant, plus the text encoder its dir cannot see" {
     const MB: u64 = 1024 * 1024;
     // Real dgrauet/ltx-2.3-mlx-q4 sizes. Both transformer variants ship at
@@ -5969,6 +6470,43 @@ test "h3 staged-residency peak bills the BIGGEST stage, never a sum of disjoint 
     );
     try std.testing.expect(real < 29 * GB); // fits the 48 GB Mac's auto cap
     try std.testing.expect(real > 24 * GB); // and stays above the measured peak
+}
+
+test "h3 request rows: latent frames on the 32-pixel grid, stereo audio, one frame of rows per keyframe" {
+    try std.testing.expectEqual(@as(u64, 12846), h3RequestRows(768, 448, 124, 0)); // live: 12854 rows with 8 prompt tokens
+    try std.testing.expectEqual(@as(u64, 37710), h3RequestRows(1344, 768, 124, 0)); // live: 37719 with 9
+    try std.testing.expectEqual(@as(u64, 12846 + 2 * 336), h3RequestRows(768, 448, 124, 2));
+}
+
+test "h3 request bill stays above the measured peaks and refuses the canvas that died (#764)" {
+    const GB: u64 = 1 << 30;
+    const dit = h3DitResidentBytes(18_698_813_290, true); // the 4-bit FL2VA pack
+    const lora: u64 = 779_849_816;
+    const bcast: u64 = 50 * 5376 * 2;
+    // Process peaks measured on an M5 Pro 48 GB at 124 frames.
+    try std.testing.expect(dit + lora + h3ActivationBytes(37718, 0) >= 26 * GB); // 1344x768 turbo: 26 GB
+    try std.testing.expect(dit + lora + h3ActivationBytes(37718, 0) < 28 * GB);
+    try std.testing.expect(dit + h3ActivationBytes(19292, bcast) >= 28 * GB); // 960x544 fast recipe: 28 GB
+    try std.testing.expect(dit + h3ActivationBytes(19292, bcast) < 31 * GB); // and a 48 GB Mac with 31.5 GB free still serves it
+    // 1536x672 with two keyframes under the fast recipe died with 32.58 GB available.
+    try std.testing.expect(dit + h3ActivationBytes(h3RequestRows(1536, 672, 124, 2), bcast) > 33 * GB);
+}
+
+test "h3 residency is priced on the request's activations, so a warm set yields to a big canvas (#764)" {
+    const GB: u64 = 1 << 30;
+    const te: u64 = 15_804_791_921; // the 4-bit FL2VA pack's files
+    const dit_file: u64 = 18_698_813_290;
+    const vaes: u64 = 5_207_808_496 + 605_254_808;
+    const lora: u64 = 779_849_816;
+    const bcast: u64 = 50 * 5376 * 2;
+    const margin = h3ResidentMargin(64 * GB);
+    // A 64 GB Mac with 60 GB free keeps the set warm for a small turbo run...
+    const small = h3ResidentBytes(te, dit_file, vaes, lora, h3ActivationBytes(h3RequestRows(768, 448, 124, 0), 0));
+    try std.testing.expect(h3KeepResident(60 * GB, 0, small, margin));
+    // ...and releases it for a 1344x768 fast-recipe request; the flat term kept it and the run OOMed.
+    const big = h3ResidentBytes(te, dit_file, vaes, lora, h3ActivationBytes(h3RequestRows(1344, 768, 124, 0), bcast));
+    try std.testing.expect(!h3KeepResident(60 * GB, 0, big, margin));
+    try std.testing.expect(h3KeepResident(60 * GB, 0, h3ResidentBytes(te, dit_file, vaes, lora, H3_ACTIVATION_BYTES), margin));
 }
 
 test "h3 DiT term sheds the AdaLN weights precompute frees — unless it is off" {
@@ -6117,4 +6655,42 @@ test "videoRgbTransportReason: chained windows are billed into the response cap 
     try std.testing.expect(videoRgbTransportReason(minimax_h3.chainDeliveredFrames(5, 141), 1056, 864) != null);
     // One window of the same shape fits.
     try std.testing.expect(videoRgbTransportReason(141, 1056, 864) == null);
+}
+
+test "decision limits: one set for every backend, named in the 400 text" {
+    var buf: [160]u8 = undefined;
+    const l: DecisionLimits = .{ .max_questions = 3, .max_input_tokens = 10 };
+    try testing.expect(std.mem.indexOf(u8, l.message(&buf, error.TooManyQuestions).?, "limit 3") != null);
+    try testing.expect(std.mem.indexOf(u8, l.message(&buf, error.TooManyInputTokens).?, "10 input tokens") != null);
+    try testing.expect(l.message(&buf, error.TooManyOptions) == null);
+}
+
+test "h3 residency: keeps the whole set only while it fits, counting what the cache already holds" {
+    const gb: u64 = 1024 * 1024 * 1024;
+    const need = h3ResidentBytes(28 * gb, 35 * gb, 6 * gb, gb, 6 * gb);
+    try std.testing.expectEqual(76 * gb, need); // te + dit + vaes + lora + the 6 GiB activation term
+    const margin = 12 * gb;
+    try std.testing.expect(h3KeepResident(150 * gb, 0, need, margin)); // a big Mac
+    try std.testing.expect(h3KeepResident(88 * gb, 0, need, margin)); // exactly enough
+    try std.testing.expect(!h3KeepResident(80 * gb, 0, need, margin)); // 128 GB class with other models loaded
+    // The cache's own bytes are available to the next request, or a resident set would evict itself.
+    try std.testing.expect(h3KeepResident(20 * gb, 70 * gb, need, margin));
+    // An unknown size never claims residency.
+    try std.testing.expect(!h3KeepResident(500 * gb, 0, h3ResidentBytes(0, 35 * gb, 6 * gb, 0, 6 * gb), margin));
+    try std.testing.expect(!h3KeepResident(500 * gb, 0, h3ResidentBytes(28 * gb, 0, 6 * gb, 0, 6 * gb), margin));
+}
+
+test "h3 residency: free memory is the tighter of host RAM and the GPU working-set room" {
+    const gb: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(100 * gb, h3AvailBytes(100 * gb, 192 * gb, 40 * gb)); // host binds
+    try std.testing.expectEqual(30 * gb, h3AvailBytes(100 * gb, 192 * gb, 162 * gb)); // GPU room binds
+    try std.testing.expectEqual(100 * gb, h3AvailBytes(100 * gb, 0, 40 * gb)); // no GPU limit known
+    try std.testing.expectEqual(@as(u64, 0), h3AvailBytes(0, 192 * gb, 0)); // host unknown never keeps
+    try std.testing.expectEqual(@as(u64, 0), h3AvailBytes(100 * gb, 192 * gb, 200 * gb)); // over the limit
+}
+
+test "h3 residency: the margin scales with RAM and never drops below 10 GiB" {
+    const gb: u64 = 1024 * 1024 * 1024;
+    try std.testing.expectEqual(10 * gb, h3ResidentMargin(64 * gb));
+    try std.testing.expectEqual(16 * gb, h3ResidentMargin(256 * gb));
 }

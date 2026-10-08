@@ -1,7 +1,7 @@
 # mlx-serve media endpoints
 
 All take a JSON body with `"model": "<id>"` (pick it from `/v1/models` by
-capability) and answer JSON, except speech/music which answer raw WAV bytes
+capability) and answer JSON, except speech/music/sound which answer raw WAV bytes
 when not streaming. Binary inputs and outputs are base64 strings. Omit a field
 to get the model's default. Unknown fields are ignored; a field the loaded model
 cannot honor is a 400 that names it.
@@ -17,7 +17,7 @@ data: {"type":"complete", ...same fields as the non-stream JSON body...}
 data: {"type":"error","message":"..."}
 ```
 
-`total: 0` means indeterminate. Speech and music `complete` events carry
+`total: 0` means indeterminate. Speech, music and sound `complete` events carry
 `"format":"wav","data":"<base64 WAV>"`. Closing the connection cancels the job.
 
 ```js
@@ -103,6 +103,22 @@ MiniMax Music 3 needs `lyrics` unless `instrumental` is true, and rejects the
 ACE-Step-only fields by name. Response: raw `audio/wav` bytes or SSE.
 For game loops, generate a track then crossfade the tail yourself; the model does
 not guarantee a seamless loop point.
+
+## Sound effects: `POST /v1/audio/sound-generations`
+
+Stable Audio 3: effects and ambiences from a description (footsteps, rain, a
+door, an engine, impacts, UI blips).
+
+| field | notes |
+|---|---|
+| `prompt` | required: the source, the action and how it ends, the space ("heavy wooden door slamming shut in a stone hall, fast decay"); adding `TrackType: SFX` steers it toward a clean effect |
+| `duration_seconds` | up to 120 (default 10, an ambience length): set it to the sound's real length, 0.3-2 for a click, hit or footstep, 2-5 for a door or explosion, 10+ for ambiences; the WAV is exactly this long |
+| `steps` | 1-50 (default 8, what the model is distilled for) |
+| `seed` | reproducible sound: same seed + prompt + length = same bytes |
+
+Response: raw `audio/wav` bytes (44.1 kHz stereo) or SSE. About a second per
+clip, so a game can generate variations up front (several seeds of one prompt)
+and pick at random at play time.
 
 ## Video: `POST /v1/video/generations`
 

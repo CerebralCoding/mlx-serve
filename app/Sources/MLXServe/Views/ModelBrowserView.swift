@@ -32,6 +32,7 @@ struct ModelBrowserPane: View {
             + readyCount(AudioModelPreset.allIncludingVoiceOnly)
             + readyCount(VideoModelPreset.all)
             + readyCount(MusicModelPreset.all)
+            + readyCount(SoundModelPreset.all)
         return .live(localModelCount: appState.localModels.count,
                      activeDownloadCount: activeDownloads.count,
                      mediaReadyCount: media)
@@ -539,14 +540,16 @@ private struct RecommendedModelTableRow: View {
                 .buttonStyle(.plain)
                 .help("Delete model")
                 .alert("Delete Model", isPresented: $confirmDelete) {
-                    Button("Cancel", role: .cancel) {}
-                    Button("Delete", role: .destructive) {
+                    Button(role: .cancel) {} label: { Text("Cancel")
+                        .font(.app(.body)) }
+                    Button(role: .destructive) {
                         downloads.deleteModel(repoId: pick.repoId)
                         appState.refreshModels()
-                    }
+                    } label: { Text("Delete")
+                        .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                 } message: {
-                    Text(L10n.format("Delete %@? This will remove all downloaded files.", pick.name))
+                    Text(L10n.format("Delete %@? This will remove all downloaded files.", pick.name)).font(.app(.body))
                 }
             }
         } else if let state, state.status == .downloading {
@@ -570,7 +573,8 @@ private struct RecommendedModelTableRow: View {
             }
         } else if let state, state.status == .failed {
             VStack(alignment: .trailing, spacing: 2) {
-                Button(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Retry")) { startDownload() }
+                Button { startDownload() } label: { Text(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Retry"))
+                    .font(.app(.body)) }
                     .controlSize(.small)
                 if let error = state.error {
                     Text(error)
@@ -580,8 +584,9 @@ private struct RecommendedModelTableRow: View {
                 }
             }
         } else {
-            Button(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Download")) { startDownload() }
-                .controlSize(.small)
+            Button { startDownload() } label: { Text(L10n.text(downloads.hasPartialDownload(pick.repoId) ? "Resume" : "Download"))
+                .font(.app(.body)) }
+                .controlSize(.small).font(.app(.body))
         }
     }
 
@@ -623,7 +628,7 @@ private struct DiscoverPane: View {
                         .foregroundStyle(.secondary)
                     TextField("Search models...", text: $searchService.searchQuery)
                         .textFieldStyle(.plain)
-                        .onSubmit { Task { await searchService.search() } }
+                        .onSubmit { Task { await searchService.search() } }.font(.app(.body))
                 }
                 .padding(8)
                 .background(.quaternary.opacity(0.5))
@@ -643,9 +648,10 @@ private struct DiscoverPane: View {
                     Task { await searchService.search() }
                 }
 
-                Button("Search") {
+                Button {
                     Task { await searchService.search() }
-                }
+                } label: { Text("Search")
+                    .font(.app(.body)) }
                 .controlSize(.regular)
             }
             .padding(12)
@@ -683,13 +689,14 @@ private struct DiscoverPane: View {
                     } else if searchService.models.isEmpty {
                         Text(L10n.text("No models found"))
                             .foregroundStyle(.secondary)
-                            .padding(40)
+                            .padding(40).font(.app(.body))
                     }
 
                     if searchService.hasMore && !searchService.models.isEmpty && !searchService.isLoading {
-                        Button("Load More") {
+                        Button {
                             Task { await searchService.loadMore() }
-                        }
+                        } label: { Text("Load More")
+                            .font(.app(.body)) }
                         .buttonStyle(.bordered)
                         .controlSize(.regular)
                         .padding(16)
@@ -740,6 +747,8 @@ private struct MyModelsPane: View {
     @EnvironmentObject var downloads: DownloadManager
 
     @State private var freeDiskSpace: String = ""
+    @State private var sweepItems: [(model: LocalModel, check: UpdateCheck)] = []
+    @State private var showSweepAlert = false
 
     private var groups: [LocalModelGroup] {
         ModelBrowserUse.groupedBySource(appState.localModels, filter: filter)
@@ -753,11 +762,11 @@ private struct MyModelsPane: View {
                 Image(systemName: "magnifyingglass")
                     .foregroundStyle(.secondary)
                 TextField("Filter your models...", text: $filter)
-                    .textFieldStyle(.plain)
+                    .textFieldStyle(.plain).font(.app(.body))
                 if !filter.isEmpty {
                     Button { filter = "" } label: { Image(systemName: "xmark.circle.fill") }
                         .buttonStyle(.plain)
-                        .foregroundStyle(.secondary)
+                        .foregroundStyle(.secondary).font(.app(.body))
                 }
             }
             .padding(8)
@@ -805,7 +814,7 @@ private struct MyModelsPane: View {
                     if groups.isEmpty {
                         Text(L10n.text(filter.isEmpty ? "No models on this Mac yet" : "No models match “\(filter)”"))
                             .foregroundStyle(.secondary)
-                            .padding(40)
+                            .padding(40).font(.app(.body))
                     }
                 }
             }
@@ -816,6 +825,28 @@ private struct MyModelsPane: View {
                 Text(L10n.format(total == 1 ? "%lld model on disk" : "%lld models on disk", Int64(total)))
                     .font(.app(.caption))
                     .foregroundStyle(.secondary)
+                if let (done, count) = downloads.updateSweep {
+                    ProgressView().controlSize(.mini)
+                    Text(L10n.format("Checking %lld/%lld\u{2026}", Int64(done), Int64(count)))
+                        .font(.app(.caption))
+                        .foregroundStyle(.secondary)
+                } else {
+                    Button("Check for Updates") {
+                        Task {
+                            await downloads.checkAllForUpdates(models: appState.localModels)
+                            sweepItems = PackUpdateCheck.available(downloads.updateChecks, models: appState.localModels)
+                            showSweepAlert = true
+                        }
+                    }
+                    .buttonStyle(.link)
+                    .font(.app(.caption))
+                    .help("Compare every model with its Hugging Face repo")
+                    if !downloads.updateChecks.isEmpty {
+                        Text(verbatim: PackUpdateCheck.summary(downloads.updateChecks.values.map(\.result)))
+                            .font(.app(.caption))
+                            .foregroundStyle(.secondary)
+                    }
+                }
                 Spacer()
                 if !freeDiskSpace.isEmpty {
                     Text(L10n.format("%@ available", freeDiskSpace))
@@ -825,6 +856,23 @@ private struct MyModelsPane: View {
             }
             .padding(.horizontal, 12)
             .padding(.vertical, 6)
+            .alert(sweepItems.isEmpty ? "No Updates" : "Updates Available", isPresented: $showSweepAlert) {
+                if sweepItems.isEmpty {
+                    Button("OK", role: .cancel) {}
+                } else {
+                    Button("Update All") {
+                        for item in sweepItems {
+                            downloads.applyUpdate(item.check, for: item.model) { appState.refreshModels() }
+                        }
+                    }
+                    .keyboardShortcut(.defaultAction)
+                    Button("Cancel", role: .cancel) {}
+                }
+            } message: {
+                Text(verbatim: sweepItems.isEmpty
+                     ? PackUpdateCheck.summary(downloads.updateChecks.values.map(\.result))
+                     : PackUpdateCheck.sweepMessage(sweepItems))
+            }
         }
         .navigationTitle("My Models")
         .onAppear {
@@ -928,6 +976,14 @@ private struct MediaPane: View {
                     tint: .orange
                 ) {
                     ForEach(MusicModelPreset.all) { MediaModelRow(preset: $0, modality: .music, physicalMemoryBytes: physicalMemory) }
+                }
+                ModelGroupSection(
+                    title: "Sound Effects",
+                    subtitle: "Text-to-audio: effects and ambiences.",
+                    systemImage: "speaker.wave.3",
+                    tint: .teal
+                ) {
+                    ForEach(SoundModelPreset.all) { MediaModelRow(preset: $0, modality: .sound, physicalMemoryBytes: physicalMemory) }
                 }
             }
             .padding(16)
@@ -1064,14 +1120,16 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
                 .buttonStyle(.plain)
                 .help("Delete model")
                 .alert("Delete Model", isPresented: $confirmDelete) {
-                    Button("Cancel", role: .cancel) {}
-                    Button("Delete", role: .destructive) {
+                    Button(role: .cancel) {} label: { Text("Cancel")
+                        .font(.app(.body)) }
+                    Button(role: .destructive) {
                         downloads.deleteModel(repoId: bundle.primaryRepo)
                         appState.refreshModels()
-                    }
+                    } label: { Text("Delete")
+                        .font(.app(.body)) }
                     .keyboardShortcut(.defaultAction)
                 } message: {
-                    Text(L10n.format("Delete %@? This will remove the downloaded files.", preset.name))
+                    Text(L10n.format("Delete %@? This will remove the downloaded files.", preset.name)).font(.app(.body))
                 }
             }
         } else if let active, active.state.status == .downloading {
@@ -1093,10 +1151,12 @@ private struct MediaModelRow<Preset: MediaModelPreset>: View {
                 .help("Cancel download")
             }
         } else if active?.state.status == .failed {
-            Button("Retry") { startDownload() }
+            Button { startDownload() } label: { Text("Retry")
+                .font(.app(.body)) }
                 .controlSize(.small)
         } else {
-            Button("Download") { startDownload() }
+            Button { startDownload() } label: { Text("Download")
+                .font(.app(.body)) }
                 .controlSize(.small)
         }
     }
@@ -1138,10 +1198,9 @@ private struct UseModelButton: View {
                     .controlSize(.small)
                     .frame(width: 30)
             } else {
-                Text("Use")
+                Text("Use").font(.app(.body))
             }
         }
-        .font(.app(.callout))
         .controlSize(.small)
         .disabled(isLoading)
         .help("Load \(name) as the server's model, then open chat")
@@ -1162,11 +1221,12 @@ private struct UseMediaModelButton: View {
     @AppStorage("audioGenTab") private var audioTab: AudioGenView.Tab = .voice
 
     var body: some View {
-        Button("Use") {
+        Button {
             if let tab = modality.audioTab { audioTab = tab }
             appState.showCreate(modality.experiment)
             AppActivation.openWindow(id: "chat", using: openWindow)
-        }
+        } label: { Text("Use")
+            .font(.app(.body)) }
         .controlSize(.small)
         .help("Open \(name) in \(modality.paneName)")
     }
@@ -1179,12 +1239,13 @@ private struct UseDecisionModelButton: View {
     @Environment(\.openWindow) private var openWindow
 
     var body: some View {
-        Button("Use") {
+        Button {
             appState.decisionsModelPath = path
             AppActivation.openWindow(id: "layaDecisions", using: openWindow)
-        }
+        } label: { Text("Use")
+            .font(.app(.body)) }
         .controlSize(.small)
-        .help("Open \(name) in Laya Decisions")
+        .help("Open \(name) in Decisions")
     }
 }
 
@@ -1311,7 +1372,7 @@ private struct SortableHeader: View {
             .buttonStyle(.plain)
             .foregroundStyle(isActive ? .primary : .secondary)
         } else {
-            Text(L10n.text(title))
+            Text(L10n.text(title)).font(.app(.body))
         }
     }
 }
@@ -1367,7 +1428,7 @@ private struct ModelBrowserRow: View {
                         .background(.quaternary)
                         .cornerRadius(4)
                 } else {
-                    Text("\u{2014}")
+                    Text("\u{2014}").font(.app(.body))
                         .foregroundStyle(.tertiary)
                 }
             }
@@ -1549,16 +1610,18 @@ private struct ModelBrowserRow: View {
                 downloadingCell(progress: progress)
 
             case .failed(let resumable):
-                Button(L10n.text(resumable ? "Resume" : "Retry")) {
+                Button {
                     startDownload()
-                }
+                } label: { Text(L10n.text(resumable ? "Resume" : "Retry"))
+                    .font(.app(.body)) }
                 .font(.app(.callout))
                 .controlSize(.small)
 
             case .notDownloaded(let resumable):
-                Button(L10n.text(resumable ? "Resume" : "Download")) {
+                Button {
                     startDownload()
-                }
+                } label: { Text(L10n.text(resumable ? "Resume" : "Download"))
+                    .font(.app(.body)) }
                 .font(.app(.callout))
                 .controlSize(.small)
             }
@@ -1599,14 +1662,16 @@ private struct ModelBrowserRow: View {
         .font(.app(.callout))
         .help("Delete model")
         .alert("Delete Model", isPresented: $confirmDelete) {
-            Button("Cancel", role: .cancel) {}
-            Button("Delete", role: .destructive) {
+            Button(role: .cancel) {} label: { Text("Cancel")
+                .font(.app(.body)) }
+            Button(role: .destructive) {
                 downloads.deleteModel(repoId: model.id)
                 appState.refreshModels()
-            }
+            } label: { Text("Delete")
+                .font(.app(.body)) }
             .keyboardShortcut(.defaultAction)
         } message: {
-            Text(L10n.format("Delete %@? This will remove all downloaded files.", model.modelName))
+            Text(L10n.format("Delete %@? This will remove all downloaded files.", model.modelName)).font(.app(.body))
         }
     }
 }
@@ -1668,13 +1733,14 @@ private struct GgufQuantMenu: View {
                     Text(L10n.text(m.onDisk.isEmpty ? "No GGUF files found" : "Every quant is downloaded"))
                 } else {
                     ForEach(m.available) { quant in
-                        Button(L10n.text(quant.label)) {
+                        Button {
                             // Pass the whole quant — a sharded one pulls every
                             // shard into `<model>/<quant>/`.
                             downloads.startGguf(repoId: repoId, quant: quant) {
                                 appState.refreshModels()
                             }
-                        }
+                        } label: { Text(L10n.text(quant.label))
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -1684,7 +1750,8 @@ private struct GgufQuantMenu: View {
                 // user didn't ask to delete.
                 Menu("Delete") {
                     ForEach(m.onDisk) { quant in
-                        Button(L10n.text(quant.label), role: .destructive) { pendingDelete = quant }
+                        Button(role: .destructive) { pendingDelete = quant } label: { Text(L10n.text(quant.label))
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -1695,9 +1762,9 @@ private struct GgufQuantMenu: View {
                 failed: state?.status == .failed,
                 hasPartial: downloads.hasPartialDownload(repoId)
             )
-))
+)).font(.app(.body))
         }
-        .font(.app(.callout))
+        .menuStyle(.button)
         .controlSize(.small)
         .fixedSize()
         .task {
@@ -1709,15 +1776,17 @@ private struct GgufQuantMenu: View {
             get: { pendingDelete != nil },
             set: { if !$0 { pendingDelete = nil } }
         ), presenting: pendingDelete) { quant in
-            Button("Cancel", role: .cancel) { pendingDelete = nil }
-            Button("Delete", role: .destructive) {
+            Button(role: .cancel) { pendingDelete = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
+            Button(role: .destructive) {
                 if let p = path(of: quant) { downloads.removeGgufQuant(at: p) }
                 pendingDelete = nil
                 appState.refreshModels()
-            }
+            } label: { Text("Delete")
+                .font(.app(.body)) }
             .keyboardShortcut(.defaultAction)
         } message: { quant in
-            Text(L10n.format("Delete the %@ quant? Other quants of this model stay on disk.", quant.label))
+            Text(L10n.format("Delete the %@ quant? Other quants of this model stay on disk.", quant.label)).font(.app(.body))
         }
     }
 }
@@ -1775,11 +1844,12 @@ private struct MlxVariantMenu: View {
                     Text("Every quantization is downloaded")
                 } else {
                     ForEach(m.available) { v in
-                        Button(L10n.text(title(v))) {
+                        Button {
                             downloads.startMlxVariant(repoId: repoId, variant: v) {
                                 appState.refreshModels()
                             }
-                        }
+                        } label: { Text(L10n.text(title(v)))
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -1789,7 +1859,8 @@ private struct MlxVariantMenu: View {
                 // the user didn't ask to delete.
                 Menu("Delete") {
                     ForEach(m.onDisk) { v in
-                        Button(L10n.text(v.label), role: .destructive) { pendingDelete = v }
+                        Button(role: .destructive) { pendingDelete = v } label: { Text(L10n.text(v.label))
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -1800,24 +1871,26 @@ private struct MlxVariantMenu: View {
                 failed: state?.status == .failed,
                 hasPartial: variants.contains { downloads.hasPartialDownload(localId($0)) }
             )
-))
+)).font(.app(.body))
         }
-        .font(.app(.callout))
+        .menuStyle(.button)
         .controlSize(.small)
         .fixedSize()
         .alert("Delete Quantization", isPresented: .init(
             get: { pendingDelete != nil },
             set: { if !$0 { pendingDelete = nil } }
         ), presenting: pendingDelete) { v in
-            Button("Cancel", role: .cancel) { pendingDelete = nil }
-            Button("Delete", role: .destructive) {
+            Button(role: .cancel) { pendingDelete = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
+            Button(role: .destructive) {
                 downloads.deleteModel(repoId: localId(v))
                 pendingDelete = nil
                 appState.refreshModels()
-            }
+            } label: { Text("Delete")
+                .font(.app(.body)) }
             .keyboardShortcut(.defaultAction)
         } message: { v in
-            Text(L10n.format("Delete the %@ build? Other quantizations of this model stay on disk.", v.label))
+            Text(L10n.format("Delete the %@ build? Other quantizations of this model stay on disk.", v.label)).font(.app(.body))
         }
     }
 }
@@ -1837,6 +1910,8 @@ private struct LocalModelRow: View {
     @State private var card: ModelCardRequest?
     @State private var settings: ModelSettingsRequest?
     @State private var hasOverrides = false
+    @State private var badge = SocketBadge(stone: nil, skull: false)
+    @State private var confirmReplace: UpdateCheck?
 
     private var settingsRequest: ModelSettingsRequest {
         ModelSettingsRequest(path: model.path, title: ModelDisplayName.pretty(model.displayLabel))
@@ -1861,11 +1936,28 @@ private struct LocalModelRow: View {
     /// `activateFileViewerSelecting` selects either — which is the behaviour
     /// you want: a quant row reveals its own file, not its repo folder.
     private func refreshOverrides() {
-        hasOverrides = ModelSettingsFile.load().override(for: model.path)?.hasSettings ?? false
+        let o = ModelSettingsFile.load().override(for: model.path)
+        hasOverrides = o?.hasSettings ?? false
+        guard model.isChatPickable, model.quantFile == nil else { return }
+        badge = DrafterGems.badge(o ?? ModelOverride(), modelDir: model.path, hasMtpHead: model.hasMtpHead,
+                                  options: appState.serverOptions)
     }
 
     private func revealInFinder() {
         NSWorkspace.shared.activateFileViewerSelecting([URL(fileURLWithPath: model.path)])
+    }
+
+    /// The manual check's verdict, else the daily check's pending update.
+    private var updateCheck: UpdateCheck? {
+        if let check = downloads.updateChecks[model.id] { return check }
+        guard let update = downloads.packUpdates[model.name] else { return nil }
+        let drafter = downloads.packListings[model.name]?.keys.contains { $0.hasPrefix(DrafterGems.packFolder + "/") } ?? false
+        let off = ModelSettingsFile.load().override(for: model.path)?.drafter == "off"
+        return UpdateCheck(result: .update(update), repo: model.name, dir: model.path, selection: .chat(drafter: drafter && !off))
+    }
+
+    private func applyUpdate(_ check: UpdateCheck) {
+        downloads.applyUpdate(check, for: model) { appState.refreshModels() }
     }
 
     private func performDelete() {
@@ -1907,6 +1999,18 @@ private struct LocalModelRow: View {
                             .background(Color.purple.opacity(0.15), in: Capsule())
                             .help("Speculative-decoding drafter — pairs with a Gemma 4 base model in Settings, not loadable on its own.")
                     }
+                    if let stone = badge.stone {
+                        HStack(spacing: 3) {
+                            GemIcon(name: "gem-\(stone.rawValue).png")
+                            Text(stone.badge)
+                                .font(.app(.caption2).weight(.semibold))
+                                .foregroundStyle(.green)
+                            if badge.skull { GemIcon(name: "gem-skull.png") }
+                        }
+                        .padding(.leading, 2).padding(.trailing, 5).padding(.vertical, 1)
+                        .background(Color.green.opacity(0.15), in: Capsule())
+                        .help(badge.skull ? "\(stone.label), lossy acceptance (Typical / TokenV3)" : stone.label)
+                    }
                 }
                 // The id itself, under the readable name.
                 Text(L10n.text(model.displayLabel))
@@ -1942,6 +2046,14 @@ private struct LocalModelRow: View {
                     // Only flag genuinely unsupported architectures. Drafters
                     // declare `gemma4_assistant` (not in supportedModelTypes)
                     // intentionally — the badge above already explains them.
+                    if case .localCopy = downloads.updateChecks[model.id]?.result {
+                        Text("Local copy")
+                            .font(.app(.caption2).weight(.medium))
+                            .foregroundStyle(.secondary)
+                            .padding(.horizontal, 5).padding(.vertical, 1)
+                            .background(Color.secondary.opacity(0.12), in: Capsule())
+                            .help("Not on Hugging Face under this name, so there is nothing to update from.")
+                    }
                     if model.kind != .drafter, !model.isSupportedArchitecture {
                         Text("Unsupported")
                             .font(.app(.caption2).weight(.medium))
@@ -1974,7 +2086,7 @@ private struct LocalModelRow: View {
                     } else {
                         ModelUseBadge(state: useState)
                     }
-                } else if model.modelType == "laya" {
+                } else if isDecisionModelType(model.modelType) {
                     UseDecisionModelButton(path: model.path, name: model.name)
                 } else if let modality = MediaModality(modelType: model.modelType) {
                     // A media checkpoint is a real, loadable, servable model —
@@ -1987,6 +2099,18 @@ private struct LocalModelRow: View {
                     // pane load it the way it always has.
                     UseMediaModelButton(modality: modality, name: model.name)
                 }
+                if let check = updateCheck, case .update(let update) = check.result {
+                    Button {
+                        if update.replaces > 0 { confirmReplace = check } else { applyUpdate(check) }
+                    } label: {
+                        Image(systemName: "arrow.down.circle")
+                            .foregroundStyle(.tint)
+                    }
+                    .buttonStyle(.plain)
+                    .font(.app(.callout))
+                    .disabled(downloads.downloads[check.repo]?.status == .downloading)
+                    .help("Update from \(check.repo): \(update.files) file\(update.files == 1 ? "" : "s"), \(ByteCountFormatter.string(fromByteCount: update.bytes, countStyle: .file))")
+                }
                 if model.isChatPickable {
                     Button { settings = settingsRequest } label: {
                         Image(systemName: "slider.horizontal.3")
@@ -1996,7 +2120,28 @@ private struct LocalModelRow: View {
                     .font(.app(.callout))
                     .help(hasOverrides ? "Model settings (this model has its own context / KV settings)" : "Model settings")
                 }
-                if ModelRowActions.showsLock(model, unlocked: unlocked) {
+                if model.isDownloading {
+                    // The trash's slot: deleting files under a live transfer
+                    // breaks it, so the row offers the transfer's own Cancel.
+                    if let live = ModelRowActions.transfer(for: model, in: downloads.downloads) {
+                        ProgressView(value: max(0, min(1, live.state.progress)))
+                            .progressViewStyle(.linear)
+                            .frame(width: 60)
+                            .help(live.state.statusText)
+                        Text(verbatim: live.state.percentFormatted)
+                            .font(.app(.caption).monospacedDigit())
+                            .foregroundStyle(.secondary)
+                        Button { downloads.cancel(live.repoId) } label: {
+                            Image(systemName: "xmark.circle.fill")
+                                .foregroundStyle(.secondary)
+                        }
+                        .buttonStyle(.plain)
+                        .font(.app(.callout))
+                        .help("Cancel download")
+                    } else {
+                        ProgressView().controlSize(.small)
+                    }
+                } else if ModelRowActions.showsLock(model, unlocked: unlocked) {
                     // Locked, not read-only. This slot used to hold an `Image`
                     // of an external-drive/cloud glyph nobody could read, which
                     // did nothing when clicked. It is a Button now, and clicking
@@ -2036,7 +2181,7 @@ private struct LocalModelRow: View {
                 .font(.app(.callout))
                 .help(ModelRowActions.revealHelp(model))
             }
-            .frame(width: 150, alignment: .trailing)
+            .frame(width: 172, alignment: .trailing)
         }
         .padding(.horizontal, 12)
         .padding(.vertical, 6)
@@ -2044,49 +2189,81 @@ private struct LocalModelRow: View {
         // raise the same confirmation — two delete paths with two dialogs is
         // two chances to word the consequence differently.
         .alert(model.quantFile != nil ? "Delete Quant" : "Delete Model", isPresented: $confirmDelete) {
-            Button("Cancel", role: .cancel) {}
-            Button("Delete", role: .destructive) { performDelete() }
+            Button(role: .cancel) {} label: { Text("Cancel")
+                .font(.app(.body)) }
+            Button(role: .destructive) { performDelete() } label: { Text("Delete")
+                .font(.app(.body)) }
                 .keyboardShortcut(.defaultAction)
         } message: {
-            Text(ModelRowActions.deleteMessage(model))
+            Text(ModelRowActions.deleteMessage(model)).font(.app(.body))
+        }
+        .alert("Replace Files?", isPresented: Binding(get: { confirmReplace != nil }, set: { if !$0 { confirmReplace = nil } }), presenting: confirmReplace) { check in
+            Button("Cancel", role: .cancel) {}
+            Button("Replace", role: .destructive) { applyUpdate(check) }
+                .keyboardShortcut(.defaultAction)
+        } message: { check in
+            if case .update(let u) = check.result {
+                Text(L10n.format(u.replaces == 1 ? "%lld file differs from Hugging Face and will be replaced." : "%lld files differ from Hugging Face and will be replaced.", Int64(u.replaces)))
+            }
         }
         .sheet(item: $card) { ModelDetailSheet(request: $0) }
-        .sheet(item: $settings, onDismiss: refreshOverrides) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server) }
+        .sheet(item: $settings, onDismiss: refreshOverrides) { ModelSettingsSheet(request: $0).environmentObject(appState).environmentObject(server).environmentObject(downloads) }
         .onAppear(perform: refreshOverrides)
         .contextMenu {
             if model.isChatPickable, useState == .idle {
-                Button("Use This Model") {
+                Button {
                     appState.selectedModelPath = model.path
-                }
+                } label: { Text("Use This Model")
+                    .font(.app(.body)) }
             }
             if cardRequest != nil {
-                Button("Model Details\u{2026}") { card = cardRequest }
+                Button { card = cardRequest } label: { Text("Model Details\u{2026}")
+                    .font(.app(.body)) }
             }
             if model.isChatPickable {
-                Button("Model Settings\u{2026}") { settings = settingsRequest }
+                Button { settings = settingsRequest } label: { Text("Model Settings\u{2026}")
+                    .font(.app(.body)) }
             }
-            Button("Show in Finder", action: revealInFinder)
-            Button("Copy Path") {
+            Button(action: revealInFinder, label: { Text("Show in Finder")
+                .font(.app(.body)) })
+            Button {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(model.path, forType: .string)
-            }
-            Button("Copy Model ID") {
+            } label: { Text("Copy Path")
+                .font(.app(.body)) }
+            Button {
                 NSPasteboard.general.clearContents()
                 NSPasteboard.general.setString(model.displayLabel, forType: .string)
-            }
+            } label: { Text("Copy Model ID")
+                .font(.app(.body)) }
             Divider()
-            if ModelRowActions.showsTrash(model, unlocked: unlocked) {
-                Button("Delete\u{2026}", role: .destructive) { confirmDelete = true }
-            } else {
+            if let live = ModelRowActions.transfer(for: model, in: downloads.downloads) {
+                Button { downloads.cancel(live.repoId) } label: { Text("Cancel Download")
+                    .font(.app(.body)) }
+            } else if ModelRowActions.showsTrash(model, unlocked: unlocked) {
+                Button(role: .destructive) { confirmDelete = true } label: { Text("Delete\u{2026}")
+                    .font(.app(.body)) }
+            } else if !model.isDownloading {
                 // Same two-step as the lock button: the menu never deletes
                 // another app's model on one click.
-                Button("Unlock to Delete") { unlocked = true }
+                Button { unlocked = true } label: { Text("Unlock to Delete")
+                    .font(.app(.body)) }
             }
         }
     }
 }
 
 // MARK: - Active Download Row
+
+private struct GemIcon: View {
+    let name: String
+
+    var body: some View {
+        if let image = BundledAsset.image(name) {
+            Image(nsImage: image).resizable().frame(width: 16, height: 16)
+        }
+    }
+}
 
 private struct ActiveDownloadRow: View {
     let repoId: String
@@ -2141,9 +2318,10 @@ private struct ActiveDownloadRow: View {
                 }
                 .frame(width: 116, alignment: .trailing)
             } else if state.status == .failed {
-                Button(L10n.text(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry")) {
+                Button {
                     downloads.start(repoId: repoId) { appState.refreshModels() }
-                }
+                } label: { Text(L10n.text(downloads.hasPartialDownload(repoId) ? "Resume" : "Retry"))
+                    .font(.app(.body)) }
                 .font(.app(.callout))
                 .controlSize(.small)
                 .frame(width: 90, alignment: .trailing)

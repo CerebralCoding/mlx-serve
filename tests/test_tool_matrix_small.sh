@@ -37,6 +37,7 @@
 
 set -u
 cd "$(dirname "$0")/.."
+source tests/_lib_models.sh
 
 PORT="${PORT:-11298}"
 BASE="http://127.0.0.1:$PORT"
@@ -45,13 +46,13 @@ PASS=0; FAIL=0; MODEL_FAIL=0; RAN=0
 
 RED='\033[0;31m'; GREEN='\033[0;32m'; YELLOW='\033[0;33m'; BLUE='\033[1;34m'; NC='\033[0m'
 
-# logical|display|path
+# logical|display|candidates relative to a model root (tests/_lib_models.sh), first found wins
 MODELS=(
-    "qwen35-0.8b|Qwen3.5 0.8B 4bit|$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit"
-    "qwen35-2b|Qwen3.5 2B 4bit|$HOME/.lmstudio/models/lmstudio-community/Qwen3.5-2B-MLX-4bit"
-    "qwen35-4b|Qwen3.5 4B 4bit|$HOME/.lmstudio/models/lmstudio-community/Qwen3.5-4B-MLX-4bit"
-    "gemma4-e2b|Gemma 4 E2B it 4bit|$HOME/.lmstudio/models/mlx-community/gemma-4-e2b-it-4bit"
-    "gemma4-e4b|Gemma 4 E4B it 4bit|$HOME/.lmstudio/models/mlx-community/gemma-4-e4b-it-4bit"
+    "qwen35-0.8b|Qwen3.5 0.8B 4bit|mlx-community/Qwen3.5-0.8B-MLX-4bit"
+    "qwen35-2b|Qwen3.5 2B 4bit|lmstudio-community/Qwen3.5-2B-MLX-4bit|mlx-community/Qwen3.5-2B-MLX-4bit"
+    "qwen35-4b|Qwen3.5 4B 4bit|lmstudio-community/Qwen3.5-4B-MLX-4bit|mlx-community/Qwen3.5-4B-MLX-4bit"
+    "gemma4-e2b|Gemma 4 E2B it 4bit|mlx-community/gemma-4-e2b-it-4bit"
+    "gemma4-e4b|Gemma 4 E4B it 4bit|mlx-community/gemma-4-e4b-it-4bit"
 )
 
 if [ -n "${TOOL_MODELS:-}" ]; then
@@ -71,6 +72,12 @@ if [ ! -x "$BINARY" ]; then
     echo "FAIL: $BINARY not found — build first: zig build -Doptimize=ReleaseFast"; exit 1
 fi
 
+# A small model can loop inside the file body until max_tokens: the call is then salvaged
+# as NAME + {} by design, so the size bar only applies to a call the model finished.
+big_content_check() { # mode verdict finish_reason
+    if [ "$3" = "length" ]; then echo "  skip [$logical] big-file write ($1): content >=400 bytes — the model ran to max_tokens"; return; fi
+    check "[$logical] big-file write ($1): content >=400 bytes" "$([ "$(echo "$2"|cut -d'|' -f4)" = 1 ] && echo 1 || echo 0)"
+}
 check() {
     local desc="$1" ok="$2"
     if [ "$ok" = "1" ]; then PASS=$((PASS+1)); echo -e "  ${GREEN}PASS${NC} $desc"
@@ -163,7 +170,7 @@ print(f"{call_ok}|{json_ok}|{path_ok}|{content_ok}|{leak_ok}")
 run_model() {
     local logical="$1" display="$2" path="$3"
     echo -e "${BLUE}=== [$logical] $display ===${NC}"
-    if [ ! -d "$path" ]; then echo -e "${YELLOW}SKIP${NC}: model dir not found: $path"; return 0; fi
+    if [ ! -d "$path" ]; then echo -e "${YELLOW}SKIP${NC}: not on any model root"; return 0; fi
 
     local log="/tmp/test_tool_matrix_$logical.log"
     pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 1
@@ -216,7 +223,7 @@ run_model() {
         | python3 -c "$WRITE_VERDICT" mars.html '-' 400)
     check "[$logical] big-file write (non-stream): call FIRES (not dropped)" "$([ "$(echo "$V"|cut -d'|' -f1)" = 1 ] && echo 1 || echo 0)"
     check "[$logical] big-file write (non-stream): args valid JSON"         "$([ "$(echo "$V"|cut -d'|' -f2)" = 1 ] && echo 1 || echo 0)"
-    check "[$logical] big-file write (non-stream): content >=400 bytes"     "$([ "$(echo "$V"|cut -d'|' -f4)" = 1 ] && echo 1 || echo 0)"
+    big_content_check "non-stream" "$V" "$(jget "$R" "r['choices'][0]['finish_reason']")"
 
     # ── big-file write, STREAM ──
     ACC=$(curl -sN "$BASE/v1/chat/completions" -H 'Content-Type: application/json' \
@@ -225,7 +232,7 @@ run_model() {
         | python3 -c "$WRITE_VERDICT" mars.html '-' 400)
     check "[$logical] big-file write (stream): call FIRES (not dropped)" "$([ "$(echo "$V"|cut -d'|' -f1)" = 1 ] && echo 1 || echo 0)"
     check "[$logical] big-file write (stream): args valid JSON"         "$([ "$(echo "$V"|cut -d'|' -f2)" = 1 ] && echo 1 || echo 0)"
-    check "[$logical] big-file write (stream): content >=400 bytes"     "$([ "$(echo "$V"|cut -d'|' -f4)" = 1 ] && echo 1 || echo 0)"
+    big_content_check "stream" "$V" "$(jget "$ACC" "r['finish']")"
 
     # Informational: did the server-side recovery actually engage for this model?
     local recov
@@ -246,8 +253,9 @@ run_model() {
 trap 'pkill -f "mlx-serve.*--port $PORT" 2>/dev/null' EXIT
 
 for entry in "${MODELS[@]}"; do
-    IFS='|' read -r logical display path <<< "$entry"
-    run_model "$logical" "$display" "$path"
+    IFS='|' read -r logical display rest <<< "$entry"
+    IFS='|' read -r -a cands <<< "$rest"
+    run_model "$logical" "$display" "$(find_model "${cands[@]}")"
     pkill -f "mlx-serve.*--port $PORT" 2>/dev/null; sleep 2
 done
 

@@ -4,6 +4,14 @@ import AppKit
 @MainActor
 class DownloadManager: ObservableObject {
     @Published var downloads: [String: DownloadState] = [:]
+    /// New files per checked pack, keyed by repo (`PackUpdateCheck`).
+    @Published var packUpdates: [String: PackUpdate] = [:]
+    /// Latest HF listing per checked repo (path -> size), read by the socket's gem catalog.
+    @Published var packListings: [String: [String: Int64]] = [:]
+    /// The last manual "Check for Updates", keyed by `LocalModel.id`.
+    @Published var updateChecks: [String: UpdateCheck] = [:]
+    /// (checked, total) while that check runs.
+    @Published var updateSweep: (Int, Int)? = nil
 
     /// In-flight `download`/`downloadGguf` tasks keyed by repoId, so the
     /// Cancel button can interrupt them. Removed in the wrapper's `defer`.
@@ -175,6 +183,7 @@ class DownloadManager: ObservableObject {
         // 0731's replacement for the legacy MTP draft head — same --mtp slot
         // server-side, never a servable chat quant.
         return lower.hasPrefix("mmproj") || lower.contains("tokenizer")
+            || lower.hasPrefix("mtp-") // llama.cpp's head-only `convert --mtp` export
             || lower.contains("-mtp-") || lower.contains("-mtp.")
             || lower.contains("-dspark-") || lower.contains("-dspark.")
     }
@@ -235,8 +244,8 @@ class DownloadManager: ObservableObject {
 
     /// Filter a HuggingFace `/tree/main?recursive=true` listing down to the
     /// files a model download actually needs: top-level config / tokenizer /
-    /// weight files, PLUS the MTP multi-token-prediction sidecar the server
-    /// auto-loads. Two nested sidecar layouts are pulled: `mtp/weights.safetensors`
+    /// weight files, PLUS the speculation sidecars the server auto-loads (the
+    /// pack's `drafter/`, and the MTP head). Two nested sidecar layouts are pulled: `mtp/weights.safetensors`
     /// (mlx-serve native) and `optiq/mtp.safetensors` (oMLX OptiQ). Without them
     /// an MTP model silently loses its speculative-decoding speedup because a
     /// non-recursive listing returns the dir as a bare entry that the
@@ -252,21 +261,25 @@ class DownloadManager: ObservableObject {
         // to load while `mlx-serve pull` (a denylist) got it. Torch/flax shadow
         // weights stay out on both sides — same rule as `cli.shouldDownload`,
         // keep them in sync.
-        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin"]
+        let neededExtensions: Set<String> = ["json", "safetensors", "jinja", "model", "txt", "bin", "u32"]
         return entries.compactMap { file -> (String, Int64)? in
             guard let path = file["path"] as? String,
                   let ftype = file["type"] as? String, ftype == "file" else { return nil }
             // Depth gate. Variant: exactly the named subfolder's own files
             // (`4bit/config.json`), never anything deeper. Chat default:
-            // top-level files + the MTP sidecar (native `mtp/` dir, or OptiQ's
-            // single `optiq/mtp.safetensors`). Media (recursive): keep nested
+            // top-level files + the pack's `drafter/` + the MTP sidecar (native
+            // `mtp/` dir, or OptiQ's single `optiq/mtp.safetensors`) + DeepSeek-V4.1's
+            // `engram/` tables (same list as `cli.shouldDownload`). Media (recursive): keep nested
             // weight subdirs (FLUX's transformer/vae/text_encoder, TTS's
             // speech_tokenizer).
-            if let sub = selection.subfolder {
+            if let folder = selection.packFolder {
+                guard path.hasPrefix(folder + "/") else { return nil }
+            } else if let sub = selection.subfolder {
                 guard path.hasPrefix(sub + "/") else { return nil }
                 guard !path.dropFirst(sub.count + 1).contains("/") else { return nil }
             } else if !selection.recursive {
-                guard !path.contains("/") || path.hasPrefix("mtp/") || path == "optiq/mtp.safetensors" else { return nil }
+                guard !path.contains("/") || path.hasPrefix("mtp/") || path.hasPrefix(DrafterGems.packFolder + "/")
+                    || path.hasPrefix("engram/") || path == "optiq/mtp.safetensors" else { return nil }
             }
             let ext = (path as NSString).pathExtension.lowercased()
             guard neededExtensions.contains(ext) || (path as NSString).lastPathComponent == "chat_template.jinja" else { return nil }
@@ -326,7 +339,7 @@ class DownloadManager: ObservableObject {
         for marker in ["config.json", "model_index.json"] {
             if fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) { return true }
         }
-        if configlessModelType(inDir: dir) != nil { return true }
+        if markerModelType(inDir: dir) != nil { return true }
         // A `transformer/` holding real weights. Deliberately not "has the
         // subdir": a download that got as far as creating the folder must still
         // read as incomplete, and an in-flight transfer's `.partial` is not a
@@ -345,6 +358,7 @@ class DownloadManager: ObservableObject {
         case "minimax_h3": return "transformer.safetensors"
         case "minimax_music3": return "vocoder.safetensors"
         case "acestep": return "text_encoder/model.safetensors"
+        case "stable_audio3": return "t5gemma-b-b-ul2/model.safetensors"
         default: return nil
         }
     }
@@ -353,9 +367,9 @@ class DownloadManager: ObservableObject {
     /// completeness marker is missing.
     nonisolated static func holdsCompleteMediaPack(_ dir: String) -> Bool {
         let fm = FileManager.default
-        guard let data = fm.contents(atPath: (dir as NSString).appendingPathComponent("config.json")),
-              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              let mt = cfg["model_type"] as? String,
+        let cfg = fm.contents(atPath: (dir as NSString).appendingPathComponent("config.json"))
+            .flatMap { try? JSONSerialization.jsonObject(with: $0) as? [String: Any] }
+        guard let mt = cfg?["model_type"] as? String ?? markerModelType(inDir: dir),
               let marker = requiredMediaMarker(modelType: mt) else { return true }
         return fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker))
     }
@@ -364,14 +378,31 @@ class DownloadManager: ObservableObject {
     /// files identify one. Twin of `model_discovery.peekLayaCheckpoint`.
     nonisolated static let layaMarkers = ["rl_agent_config.json", "encoder/config.json"]
 
-    /// The model_type of a checkpoint that has no root config.json to read
-    /// it from, or nil when the dir is not one of those shapes.
-    nonisolated static func configlessModelType(inDir dir: String) -> String? {
+    /// The model_type a marker file decides, or nil. Laya has no root config.json;
+    /// a Kev pack's names its Qwen trunk, so `kev_config.json` wins. Twin of
+    /// `model_discovery.peekKevPack`.
+    nonisolated static func markerModelType(inDir dir: String) -> String? {
         let fm = FileManager.default
+        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("joint_head_config.json")) { return "clef" }
         if layaMarkers.allSatisfy({ fm.fileExists(atPath: (dir as NSString).appendingPathComponent($0)) }) {
             return "laya"
         }
+        if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
+        if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
         return nil
+    }
+
+    /// A stable-audio-tools inpainting model conditioned on T5Gemma: the
+    /// Stable Audio 3 family as Stability publishes it. Twin of
+    /// `model_discovery.peekStableAudio3Config`.
+    nonisolated static func isStableAudio3Config(atPath path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              cfg["model_type"] as? String == "diffusion_cond_inpaint",
+              let model = cfg["model"] as? [String: Any],
+              let cond = model["conditioning"] as? [String: Any],
+              let configs = cond["configs"] as? [[String: Any]] else { return false }
+        return configs.contains { $0["type"] as? String == "t5gemma" }
     }
 
     /// File size in bytes, resolving symlinks first. Hugging Face snapshots
@@ -846,6 +877,7 @@ class DownloadManager: ObservableObject {
                 downloads[repoId]?.progress = totalSize > 0 ? Double(downloadedSize) / Double(totalSize) : 0
             }
 
+            if destDirOverride == nil { PackSource(repo: repoId, subfolder: selection.subfolder).write(dir: destDir) }
             downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete",
                                                fileIndex: neededFiles.count, fileCount: neededFiles.count)
         } catch {
@@ -885,55 +917,136 @@ class DownloadManager: ObservableObject {
         let task = Task { @MainActor [weak self] in
             await self?.download(repoId: repoId)
             self?.finalizeIfCancelled(repoId: repoId)
-            await self?.downloadCompanionDrafterIfNeeded(for: repoId)
+            await self?.autoFillSocket(for: repoId)
             self?.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
         activeTasks[repoId] = task
     }
 
-    // MARK: - Companion drafter
-    //
-    // The Gemma 4 assistant drafter is a DEPENDENCY of the model it pairs with,
-    // not something to shop for: it only ever works alongside one Gemma 4 size,
-    // and picking it yourself means knowing that. It used to have its own Model
-    // Browser destination, which mostly generated the question "which of these
-    // is mine?". Now it rides along with its target, the same way a ds4 GGUF
-    // quant pulls its MTP head (`resolveGgufDownloadFiles`).
+    // MARK: - Speculation gems (the Model Settings socket)
 
-    /// The drafter repo that pairs with `repoId`, or nil when there isn't one.
-    ///
-    /// Dense Gemma 4 only. The MoE target (26B-A4B) is excluded on purpose —
-    /// the drafter REGRESSES decode there (verify pays expert routing, so the
-    /// server defaults it off on MoE targets), and fetching a checkpoint we
-    /// then refuse to use is worse than not having it. GGUF Gemma is excluded
-    /// too: it runs on llama.cpp, which has no drafter path at all.
-    nonisolated static func companionDrafterRepo(forRepoId repoId: String) -> String? {
-        let base = (repoId as NSString).lastPathComponent.lowercased()
-        // Muse-Glimmer pairs with its DFlash assistant (one published size).
-        if base.contains("muse-glimmer"), !base.contains("assistant"), !base.contains("gguf") {
-            return "meta-models/Muse-Glimmer-30B-assistant"
-        }
-        guard base.contains("gemma-4") || base.contains("gemma4") else { return nil }
-        // A drafter must not pull itself — that download is an infinite regress.
-        guard !base.contains("assistant"), !base.contains("gguf") else { return nil }
-        // One parser for "which Gemma size is this?" — `gemmaVariantFor` is the
-        // same one the pairing and auto-sync paths use, so a new size can't be
-        // taught to one of them and not the other.
-        guard let variant = gemmaVariantFor(modelPath: base, isMoE: false), variant != .moe26B else { return nil }
-        return variant.drafterRepoId
+    /// Separate-repo gems live here, outside every model root: a drafter's
+    /// config reads as a chat model to discovery.
+    nonisolated static var draftersRoot: String {
+        NSString(string: "~/.mlx-serve/drafters").expandingTildeInPath
     }
 
-    /// Fetch `repoId`'s drafter after it lands, unless it's already here.
-    /// Failures stay silent (the Downloads pane still shows the failed row):
-    /// an alert naming a repo the user never asked for reads as a bug in the
-    /// download they DID ask for.
-    private func downloadCompanionDrafterIfNeeded(for repoId: String) async {
-        guard !Task.isCancelled,
-              downloads[repoId]?.status == .completed,
-              let drafter = Self.companionDrafterRepo(forRepoId: repoId),
-              !isReady(drafter) else { return }
-        await download(repoId: drafter, alertOnFailure: false)
+    nonisolated static func gemDir(repo: String) -> String {
+        (draftersRoot as NSString).appendingPathComponent(repo)
+    }
+
+    nonisolated static func downloadedGemRepos() -> [String] {
+        let fm = FileManager.default
+        var out: [String] = []
+        for org in (try? fm.contentsOfDirectory(atPath: draftersRoot)) ?? [] {
+            for name in (try? fm.contentsOfDirectory(atPath: (draftersRoot as NSString).appendingPathComponent(org))) ?? [] {
+                let repo = "\(org)/\(name)"
+                if fm.fileExists(atPath: (gemDir(repo: repo) as NSString).appendingPathComponent("config.json")) { out.append(repo) }
+            }
+        }
+        return out
+    }
+
+    /// Where `gem`'s files sit for the model at `modelDir`, nil when not downloaded.
+    /// A Gemma assistant fetched by an older build lives in a model root.
+    func gemPath(_ gem: DrafterGem, modelDir: String) -> String? {
+        guard gem.needsDownload else { return nil }
+        let fm = FileManager.default
+        func ready(_ dir: String) -> Bool { fm.fileExists(atPath: (dir as NSString).appendingPathComponent("config.json")) }
+        if let sub = gem.subfolder {
+            let dir = (modelDir as NSString).appendingPathComponent(sub)
+            return ready(dir) ? dir : nil
+        }
+        let dir = Self.gemDir(repo: gem.repo)
+        if ready(dir) { return dir }
+        return existingModelDir(for: gem.repo).flatMap { ready($0) ? $0 : nil }
+    }
+
+    /// Progress key of a gem fetch: a pack subfolder rides its model's row.
+    nonisolated static func gemKey(_ gem: DrafterGem) -> String { gem.repo }
+
+    func isFetchingGem(_ gem: DrafterGem) -> Bool {
+        gemFetches.contains(Self.gemKey(gem))
+    }
+
+    /// Fetch a gem's files: a pack's `drafter/` into the model dir (prefix kept),
+    /// a separate repo into `draftersRoot`. `onFinish(ok)` runs on the main actor.
+    func startGem(_ gem: DrafterGem, modelDir: String, onFinish: @escaping @MainActor (Bool) -> Void = { _ in }) {
+        let key = Self.gemKey(gem)
+        guard activeTasks[key] == nil else { return }
+        gemFetches.insert(key)
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            let ok = await self.fetchGem(gem, modelDir: modelDir, alertOnFailure: true)
+            if Task.isCancelled { self.removeGemPartials(gem, modelDir: modelDir) }
+            self.gemFetches.remove(key)
+            self.activeTasks.removeValue(forKey: key)
+            onFinish(ok && !Task.isCancelled)
+        }
+        activeTasks[key] = task
+    }
+
+    /// Stop a gem fetch. Never the generic `cancel(_:)`: with no task running it
+    /// wipes the repo's download dir, which for a pack gem is the live model.
+    func cancelGem(_ gem: DrafterGem) {
+        guard gemFetches.contains(Self.gemKey(gem)) else { return }
+        activeTasks[Self.gemKey(gem)]?.cancel()
+    }
+
+    /// Delete a gem's files (the socket's "remove" with delete).
+    func removeGem(_ gem: DrafterGem, modelDir: String) {
+        guard let dir = gemPath(gem, modelDir: modelDir) else { return }
+        try? FileManager.default.removeItem(atPath: dir)
+    }
+
+    private func fetchGem(_ gem: DrafterGem, modelDir: String, alertOnFailure: Bool) async -> Bool {
+        let dest = gem.subfolder != nil ? modelDir : Self.gemDir(repo: gem.repo)
+        await download(repoId: gem.repo,
+                       selection: gem.subfolder.map { .packFolder($0) } ?? .chatDefault,
+                       alertOnFailure: alertOnFailure, destDirOverride: dest)
+        return downloads[gem.repo]?.status == .completed
+    }
+
+    private func removeGemPartials(_ gem: DrafterGem, modelDir: String) {
+        let dir = gem.subfolder.map { (modelDir as NSString).appendingPathComponent($0) } ?? Self.gemDir(repo: gem.repo)
+        let fm = FileManager.default
+        for f in (try? fm.contentsOfDirectory(atPath: dir)) ?? [] where f.hasSuffix(".partial") || f.hasSuffix(".partial.parts") {
+            try? fm.removeItem(atPath: (dir as NSString).appendingPathComponent(f))
+        }
+        downloads.removeValue(forKey: gem.repo)
+    }
+
+    /// The model's own bytes for a gem fit check: `fits` bills the gem, so the
+    /// pack's `drafter/` must not be counted on both sides.
+    nonisolated static func packBytesWithoutDrafter(_ entries: [[String: Any]]) -> Int64 {
+        selectNeededFiles(from: entries, selection: .chatWithoutDrafter).reduce(0) { $0 + $1.1 }
+    }
+
+    /// A fresh download fills its socket with the default gem when it fits in
+    /// RAM and the user has not chosen one. A pack's own `drafter/` stays
+    /// "auto" (the server finds it); a separate repo is written as a path.
+    /// Failures stay silent: the user asked for the model, not the drafter.
+    private func autoFillSocket(for repoId: String) async {
+        guard !Task.isCancelled, downloads[repoId]?.status == .completed,
+              let modelDir = existingModelDir(for: repoId),
+              [nil, "auto"].contains(ModelSettingsFile.load().override(for: modelDir)?.drafter),
+              let entries = await fetchListing(repoId: repoId) else { return }
+        let files = PackUpdateCheck.sizes(entries)
+        packListings[repoId] = files
+        let gems = DrafterGems.gems(forRepoId: repoId, packFiles: files, localDrafter: false, mtpAvailable: false)
+        let modelGB = Double(Self.packBytesWithoutDrafter(entries)) / 1e9
+        guard let gem = DrafterGems.defaultGem(gems),
+              DrafterGems.fits(gem, modelGB: modelGB, memory: .current()) else { return }
+        if gemPath(gem, modelDir: modelDir) == nil {
+            guard await fetchGem(gem, modelDir: modelDir, alertOnFailure: false) else { return }
+        }
+        guard gem.subfolder == nil, let path = gemPath(gem, modelDir: modelDir) else { return }
+        var file = ModelSettingsFile.load()
+        var o = file.override(for: modelDir) ?? ModelOverride()
+        DrafterSocket.gem(gem).write(into: &o, gemPath: path)
+        file.set(o, for: modelDir)
+        try? file.save()
     }
 
     // MARK: - Turbo LoRA (on demand)
@@ -993,10 +1106,70 @@ class DownloadManager: ObservableObject {
         activeTasks[repoId] = task
     }
 
+    /// Apply a checked update in place: fetch only the missing and changed
+    /// files into the model's own dir. A cancel keeps the model and drops only partials.
+    func startUpdate(_ check: UpdateCheck, onFinish: @escaping @MainActor () -> Void) {
+        let repo = check.repo, dir = check.dir
+        guard activeTasks[repo] == nil else { return }
+        let task = Task { @MainActor [weak self] in
+            guard let self else { return }
+            switch check.selection {
+            case .gguf:
+                let files = PackUpdateCheck.wanted(await self.fetchListing(repoId: repo) ?? [], selection: check.selection).map(\.0)
+                if !files.isEmpty { await self.downloadGguf(repoId: repo, files: files, destDirOverride: dir) }
+            default:
+                for sel in Self.fileSelections(check.selection) {
+                    await self.download(repoId: repo, selection: sel, destDirOverride: dir)
+                    if Task.isCancelled || self.downloads[repo]?.status != .completed { break }
+                }
+            }
+            if Task.isCancelled {
+                self.downloads.removeValue(forKey: repo)
+                Self.removePartials(under: dir)
+            }
+            self.activeTasks.removeValue(forKey: repo)
+            onFinish()
+        }
+        activeTasks[repo] = task
+    }
+
+    /// `startUpdate` for one listed model, clearing its update badge once the files landed.
+    func applyUpdate(_ check: UpdateCheck, for model: LocalModel, onFinish: @escaping @MainActor () -> Void) {
+        startUpdate(check) { [weak self] in
+            onFinish()
+            guard let self, self.downloads[check.repo]?.status == .completed else { return }
+            self.updateChecks[model.id] = nil
+            self.packUpdates[model.name] = nil
+        }
+    }
+
+    private static func fileSelections(_ selection: UpdateSelection) -> [FileSelection] {
+        switch selection {
+        case .chat(let drafter): return [drafter ? .chatDefault : .chatWithoutDrafter]
+        case .variant(let sub): return [.mlxVariant(sub)]
+        case .media(let sel): return [sel]
+        case .gguf: return []
+        }
+    }
+
+    private static func removePartials(under dir: String) {
+        let fm = FileManager.default
+        guard let en = fm.enumerator(atPath: dir) else { return }
+        while let f = en.nextObject() as? String {
+            if f.hasSuffix(".partial") || f.hasSuffix(".partial.parts") {
+                try? fm.removeItem(atPath: (dir as NSString).appendingPathComponent(f))
+            }
+        }
+    }
+
     /// Repo ids whose `activeTasks` entry is a SINGLE-FILE fetch into a pack
     /// already on disk (the Turbo adapter, the ACE-Step cover tokenizer), not a
     /// full pack download — `cancelPackFile` must never cancel the latter.
     private(set) var packFileFetches: Set<String> = []
+    /// Keys of in-flight gem fetches (`startGem`).
+    private(set) var gemFetches: Set<String> = []
+    /// One pack-update sweep at a time: model scans run at 1 Hz during a download.
+    var packSweepRunning = false
 
     /// Whether a single-file fetch is in flight for this pack. Panes render
     /// their own progress from it; a full pack download must NOT read as one.
@@ -1093,6 +1266,11 @@ class DownloadManager: ObservableObject {
         let fm = FileManager.default
         for marker in comp.readyMarkers {
             guard fm.fileExists(atPath: (dir as NSString).appendingPathComponent(marker)) else { return false }
+        }
+        // A pack that names its weight index as a marker (Kev) is ready only
+        // with every shard the index declares; its head alone is a .safetensors.
+        if comp.readyMarkers.contains("model.safetensors.index.json"), missingIndexedShards(inDir: dir) != false {
+            return false
         }
         return hasSafetensorsRecursive(dir)
     }
@@ -1400,8 +1578,8 @@ class DownloadManager: ObservableObject {
     /// resume/retry/disk-space shape, looped over each file; progress is
     /// `fileIndex/fileCount` and byte progress spans them all. A nested subfolder
     /// (`<quant>/<quant>-00001-of-…`) is created as needed, mirroring HF's layout.
-    func downloadGguf(repoId: String, files shards: [String]) async {
-        let destDir = newLayoutDir(for: repoId)
+    func downloadGguf(repoId: String, files shards: [String], destDirOverride: String? = nil) async {
+        let destDir = destDirOverride ?? newLayoutDir(for: repoId)
         let primaryName = ((shards.first ?? "") as NSString).lastPathComponent
         downloads[repoId] = DownloadState(status: .downloading, statusText: "Fetching \(primaryName)...")
 
@@ -1501,6 +1679,7 @@ class DownloadManager: ObservableObject {
                 downloads[repoId]?.progress = Double(baseDownloaded) / Double(totalSize)
             }
 
+            if destDirOverride == nil { PackSource(repo: repoId).write(dir: destDir) }
             downloads[repoId] = DownloadState(progress: 1.0, status: .completed, statusText: "Complete", fileIndex: shards.count, fileCount: shards.count)
         } catch {
             if Task.isCancelled { return }
@@ -1654,8 +1833,8 @@ class DownloadManager: ObservableObject {
         }
 
         let configPath = (resolved as NSString).appendingPathComponent("config.json")
-        let configless = configlessModelType(inDir: resolved)
-        guard FileManager.default.fileExists(atPath: configPath) || configless != nil else { return [] }
+        let marked = markerModelType(inDir: resolved)
+        guard FileManager.default.fileExists(atPath: configPath) || marked != nil else { return [] }
 
         // A defect does NOT drop the directory. Dropping it is how two junk
         // folders stayed invisible in the app while the server registered them
@@ -1664,7 +1843,7 @@ class DownloadManager: ObservableObject {
         let defect = weightDefect(inDir: resolved, entries: entries)
 
         var meta = parseConfigMetadata(atPath: configPath)
-        if let configless { meta.modelType = configless }
+        if let marked { meta.modelType = marked }
         let modelType = meta.modelType
 
         let size = directorySize(resolved)
@@ -1693,16 +1872,17 @@ class DownloadManager: ObservableObject {
         )]
     }
 
-    /// A `.partial` beside a moving progress bar is not an interrupted download,
-    /// so a dir that is the destination of a live transfer loses that defect.
-    nonisolated static func clearingInFlightDefects(_ models: [LocalModel], activeDirs: Set<String>) -> [LocalModel] {
+    /// The destination of a live transfer is DOWNLOADING: not broken (its
+    /// `.partial` and missing shards are progress), and not loadable either —
+    /// between two files it can look whole while its tokenizer has yet to land.
+    nonisolated static func markingInFlight(_ models: [LocalModel], activeDirs: Set<String>) -> [LocalModel] {
         guard !activeDirs.isEmpty else { return models }
         return models.map { m in
-            guard m.defect == .interruptedDownload,
-                  activeDirs.contains((m.path as NSString).standardizingPath) else { return m }
-            var fixed = m
-            fixed.defect = nil
-            return fixed
+            guard activeDirs.contains((m.path as NSString).standardizingPath) else { return m }
+            var marked = m
+            marked.defect = nil
+            marked.isDownloading = true
+            return marked
         }
     }
 
@@ -1716,6 +1896,18 @@ class DownloadManager: ObservableObject {
     /// use the floor at all — a shard index is exact.
     nonisolated static let minimumWeightBytes: UInt64 = 1024 * 1024
 
+    /// Whether a shard named by `model.safetensors.index.json` is absent; nil
+    /// when the dir has no usable index to say.
+    nonisolated static func missingIndexedShards(inDir dir: String) -> Bool? {
+        let indexPath = (dir as NSString).appendingPathComponent("model.safetensors.index.json")
+        guard let data = FileManager.default.contents(atPath: indexPath),
+              let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let map = obj["weight_map"] as? [String: String] else { return nil }
+        let declared = Set(map.values)
+        if declared.isEmpty { return nil }
+        return declared.contains { !FileManager.default.fileExists(atPath: (dir as NSString).appendingPathComponent($0)) }
+    }
+
     /// Classify a safetensors directory: nil when it holds a loadable
     /// checkpoint, else why it does not.
     ///
@@ -1728,19 +1920,7 @@ class DownloadManager: ObservableObject {
         }
 
         // Exact path: the index names every shard the checkpoint needs.
-        let indexPath = (dir as NSString).appendingPathComponent("model.safetensors.index.json")
-        if let data = FileManager.default.contents(atPath: indexPath),
-           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-           let map = obj["weight_map"] as? [String: String] {
-            let declared = Set(map.values)
-            if !declared.isEmpty {
-                let missing = declared.contains {
-                    !FileManager.default.fileExists(
-                        atPath: (dir as NSString).appendingPathComponent($0))
-                }
-                return missing ? .missingShards : nil
-            }
-        }
+        if let missing = missingIndexedShards(inDir: dir) { return missing ? .missingShards : nil }
 
         // Inexact path: no index, so all we can say is whether the bytes on
         // disk could possibly be a checkpoint. Media packs (FLUX.2 klein's
@@ -1907,7 +2087,7 @@ class DownloadManager: ObservableObject {
             out.append(contentsOf: Self.dualLayoutModels(atRoot: root, idPrefix: "custom:", source: .custom))
         }
 
-        return Self.clearingInFlightDefects(out, activeDirs: inputs.inFlightDirs)
+        return Self.markingInFlight(out, activeDirs: inputs.inFlightDirs)
             // By label, not name: sibling quants of one repo share a name, and a
             // name-only sort leaves their relative order at the mercy of the
             // filesystem.

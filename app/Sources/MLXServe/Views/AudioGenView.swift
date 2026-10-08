@@ -2,14 +2,16 @@ import SwiftUI
 import AppKit
 import UniformTypeIdentifiers
 
-/// Audio generation window — two tabs over one window: **Voice** (neural TTS
-/// with zero-shot voice cloning, Qwen3-TTS) and **Music** (prompt-driven music
-/// generation, ACE-Step). Each tab is its own self-contained pane; this
-/// container only hosts the segmented switcher.
+/// Audio generation window — three tabs over one window: **Voice** (neural TTS
+/// with zero-shot voice cloning, Qwen3-TTS), **Music** (prompt-driven music
+/// generation, ACE-Step) and **Sound Effects** (text-to-audio, Stable Audio 3).
+/// Each tab is its own self-contained pane; this container only hosts the
+/// segmented switcher.
 struct AudioGenView: View {
     enum Tab: String, CaseIterable {
         case voice = "Voice"
         case music = "Music"
+        case sound = "Sound Effects"
     }
 
     /// The left menu's "Audio & Music" row must reopen on the tab you left it
@@ -29,13 +31,14 @@ struct AudioGenView: View {
             .pickerStyle(.segmented)
             .controlSize(.large)
             .labelsHidden()
-            .frame(width: 280)
+            .frame(width: 400)
             .padding(.top, 10)
-            .padding(.bottom, 14)
+            .padding(.bottom, 14).font(.app(.body))
 
             switch tab {
             case .voice: VoiceGenView()
             case .music: MusicGenView()
+            case .sound: SoundGenView()
             }
         }
     }
@@ -149,8 +152,6 @@ struct VoiceGenView: View {
     @EnvironmentObject var server: ServerManager
     @Environment(\.openWindow) private var openWindow
     @EnvironmentObject var downloads: DownloadManager
-    /// For "Send to Chat" — the hand-off opens a new conversation and switches
-    /// the window to it (`AppState.sendGeneratedMediaToNewChat`).
     @EnvironmentObject var appState: AppState
 
     @StateObject private var recorder = AudioRecorder()
@@ -263,13 +264,15 @@ struct VoiceGenView: View {
             .frame(minWidth: 280)
         }
         .alert("Model exceeds your Mac's RAM", isPresented: $showRAMWarning) {
-            Button("Cancel", role: .cancel) { pendingRequest = nil }
-            Button("Generate Anyway", role: .destructive) {
+            Button(role: .cancel) { pendingRequest = nil } label: { Text("Cancel")
+                .font(.app(.body)) }
+            Button(role: .destructive) {
                 if let req = pendingRequest { service.generate(req, server: server) }
                 pendingRequest = nil
-            }
+            } label: { Text("Generate Anyway")
+                .font(.app(.body)) }
         } message: {
-            Text(L10n.text(ramWarningMessage))
+            Text(L10n.text(ramWarningMessage)).font(.app(.body))
         }
     }
 
@@ -278,7 +281,7 @@ struct VoiceGenView: View {
     private var textSection: some View {
         VStack(alignment: .leading, spacing: 6) {
             HStack {
-                Text("Text to be generated").font(.app(.subheadline).weight(.semibold))
+                Text("Text to be generated").font(.app(.headline).weight(.semibold))
                 Spacer()
                 dictationButton
             }
@@ -414,7 +417,7 @@ struct VoiceGenView: View {
 
     private var referenceSection: some View {
         VStack(alignment: .leading, spacing: 6) {
-            Text("Reference voice").font(.app(.subheadline).weight(.semibold))
+            Text("Reference voice").font(.app(.headline).weight(.semibold))
 
             if let url = refAudioURL {
                 MediaDropWellFilled(isTargeted: isDropTargeted) {
@@ -435,7 +438,7 @@ struct VoiceGenView: View {
                                 .buttonStyle(.borderless).foregroundStyle(.secondary).help("Clear reference")
                         }
                         // In the well with the clip it describes, not under it.
-                        Text("Transcript of reference (optional)").font(.app(.caption))
+                        Text("Transcript of reference (optional)").font(.app(.rowTitle))
                             .padding(.top, 6)
                         TextField("", text: $refText,
                                   prompt: Text("Optional — the reference audio alone clones the voice"))
@@ -457,7 +460,7 @@ struct VoiceGenView: View {
                             .font(.app(.caption).monospacedDigit()).foregroundStyle(.secondary)
                         Spacer()
                         Button { stopRecording() } label: {
-                            Label("Stop", systemImage: "stop.fill")
+                            Label("Stop", systemImage: "stop.fill").font(.app(.body))
                         }
                         .buttonStyle(.bordered)
                     }
@@ -519,12 +522,12 @@ struct VoiceGenView: View {
         HStack {
             if service.isRunning {
                 Button(role: .destructive) { service.cancel() } label: {
-                    Label("Cancel", systemImage: "stop.fill").frame(maxWidth: .infinity)
+                    Label("Cancel", systemImage: "stop.fill").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.bordered)
             } else {
                 Button { tryGenerate() } label: {
-                    Label("Generate", systemImage: "waveform").frame(maxWidth: .infinity)
+                    Label("Generate", systemImage: "waveform").font(.app(.body)).frame(maxWidth: .infinity)
                 }
                 .buttonStyle(.borderedProminent)
                 .keyboardShortcut(.return, modifiers: [.command])
@@ -540,7 +543,7 @@ struct VoiceGenView: View {
                 switch service.phase {
                 case .idle:
                     ContentUnavailableView("No audio yet", systemImage: "waveform",
-                                           description: Text("Enter text, add a reference voice, and press Generate."))
+                                           description: Text("Enter text, add a reference voice, and press Generate.").font(.app(.body)))
                 case .running(let step, let total, let message):
                     VStack(spacing: 12) {
                         // Audio length is unknown until the model stops (total==0)
@@ -557,11 +560,12 @@ struct VoiceGenView: View {
                     completedPreview(path: path)
                 case .failed(let msg):
                     ContentUnavailableView {
-                        Label("Failed", systemImage: "exclamationmark.triangle")
+                        Label("Failed", systemImage: "exclamationmark.triangle").font(.app(.body))
                     } description: {
                         Text(msg)
                     } actions: {
-                        Button("Show log") { showLogWindow() }
+                        Button { showLogWindow() } label: { Text("Show log")
+                            .font(.app(.body)) }
                     }
                 }
             }
@@ -581,7 +585,7 @@ struct VoiceGenView: View {
             Button {
                 playing ? clipPlayer.stop() : clipPlayer.play(path)
             } label: {
-                Label(playing ? "Stop" : "Play", systemImage: playing ? "stop.fill" : "play.fill")
+                Label(playing ? "Stop" : "Play", systemImage: playing ? "stop.fill" : "play.fill").font(.app(.body))
             }
             .buttonStyle(.bordered)
             // The name and the way to reach the file belong together, centred

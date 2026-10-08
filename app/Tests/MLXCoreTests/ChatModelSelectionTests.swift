@@ -85,6 +85,18 @@ final class ChatModelSelectionTests: XCTestCase {
         XCTAssertFalse(state.isLoading)
     }
 
+    func testAGgufQuantShowsItsOwnLabelNotTheFileStemTheServerNamesItBy() {
+        // A `.gguf` file loaded by path is registered under its file stem, so
+        // a split shard read as "…1 Of 00002" in the pill while the tray was right.
+        let m = local("/models/SC117/Next-GGUF/IQ3_S/Next-IQ3_S-00001-of-00002.gguf", "SC117/Next-GGUF")
+        let state = ChatModelSelection.pillState(lanChatModelId: nil,
+                                                 residentName: "Next-IQ3_S-00001-of-00002",
+                                                 loadingPath: nil,
+                                                 selectedPath: m.path,
+                                                 models: [m])
+        XCTAssertEqual(state.name, m.displayLabel)
+    }
+
     func testAResidentModelWeDidNotPickKeepsTheServersOwnName() {
         // Another surface (a gen pane, a task) can leave a different model
         // resident. We have no local label for it, and borrowing the selected
@@ -344,6 +356,22 @@ final class ChatModelResolutionTests: XCTestCase {
         // A LAN selection wins even before discovery lands it in `allModels`.
         mgr.lanChatModelId = "big@studio"
         XCTAssertEqual(mgr.chatModelId, "big@studio")
+    }
+
+    /// A chat turn names what the picker shows, even before the poll sees it
+    /// resident: a headless start answers health before its hot-load lands, and
+    /// the bare alias 503'd "No default model configured".
+    @MainActor
+    func testAChatRequestNamesThePickedModel() {
+        let mgr = ServerManager()
+        defer { mgr.lanChatModelId = nil }
+        let resident = info("mlx-community/gemma-4-e4b-it-4bit", ["chat"])
+        mgr.allModels = [resident]
+        XCTAssertEqual(mgr.chatRequestModelId(selectedPath: "/m/org/picked"), "/m/org/picked")
+        XCTAssertEqual(mgr.chatRequestModelId(selectedPath: ""), resident.name)
+
+        mgr.lanChatModelId = "big@studio"
+        XCTAssertEqual(mgr.chatRequestModelId(selectedPath: "/m/org/picked"), "big@studio")
     }
 
     /// Pre-Phase-G / GGUF entries report no capabilities at all and still chat

@@ -12,7 +12,7 @@ mlx-serve serve             # serve everything you've pulled — models load on 
 mlx-serve launch claude     # configure + launch a coding agent CLI against the local server
 ```
 
-`launch` supports claude, pi, omp, opencode, opencode2, codex, hermes, and aider. It reads the running server's model list and real context window, writes the agent's config into a dedicated `~/.mlx-serve/<agent>/` folder (never your real agent config), and starts the agent. If the server is down it starts the MLX Core app first. `--model <id>` picks a model, `--print` shows the launch script instead of running, and anything after `--` goes to the agent (`mlx-serve launch codex -- resume`). `opencode2` also installs the mlx-serve monitor plugin, which needs the server started with `--metrics`. Full per-agent detail in [integrations.md](integrations.md).
+`launch` supports claude, pi, omp, opencode, opencode2, codex, hermes, and aider. It reads the running server's model list and real context window, writes the agent's config into a dedicated `~/.mlx-serve/<agent>/` folder (never your real agent config), and starts the agent; codex writes nothing and passes its settings as `-c` overrides over your own Codex home. If the server is down it starts the MLX Core app first. `--model <id>` picks a model, `--print` shows the launch script instead of running, and anything after `--` goes to the agent (`mlx-serve launch codex -- resume`). `launch opencode` detects the installed OpenCode's version (even `--print` runs `opencode --version` to route) and picks its v1 or v2 integration automatically; `launch opencode2` stays as a compatibility alias that forces the v2 integration, which also installs the mlx-serve monitor plugin and needs the server started with `--metrics`. Full per-agent detail in [integrations.md](integrations.md).
 
 Short names, `org/repo` HuggingFace ids, and `name:tag` all work. Models land in a shared `~/.mlx-serve/models` store the MLX Core app uses too.
 
@@ -62,17 +62,21 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--drafter DIR` | none | Speculative-decoding drafter checkpoint: a Gemma 4 assistant or a DFlash draft companion. Models that ship a `drafter/` subdir (Muse-Glimmer builds) load theirs automatically |
 | `--no-drafter` | off | Never load a drafter, including one shipped inside the checkpoint |
 | `--draft-block-size N` | auto | Drafts per round for the drafter (auto-sized to what this Mac's verify path can use) |
-| `--no-mtp` / `--mtp` | on when sidecar present | Disable / force the native MTP head (MoE trunks default off) |
-| `--mtp-depth N` | `3` | Max tokens drafted per MTP round (adaptive controller tunes within `[1, N]`) |
+| `--no-mtp` / `--mtp` | on when a head is loaded | Disable the native MTP head; `--mtp` is a no-op kept for old launch lines (dense and MoE both default on) |
+| `--mtp-min-depth N` | `1` | Minimum MTP draft depth (1..8); lifts the automatic cap if needed |
+| `--mtp-max-depth N` | auto | Maximum MTP draft depth (1..8); every planner choice stays within the bounds. Equal min/max pins the depth, replacing `MLX_SERVE_MTP_FORCE_DEPTH`. `--mtp-depth` is the old spelling of this flag. Native head count and remaining tokens can shorten a round. |
+| `--mtp-greedy-tail` | off | Sampled requests draft only the first MTP token by sampling, later ones by argmax; pairs with `--mtp-typical`. A model's `mtp_greedy_tail` in `model-settings.json` outranks it |
 | `--mtp-history-window N` | `0` (full) | Prompts past 16K tokens only build MTP head history for the last N tokens (windowing costs acceptance on stock Qwen heads) |
-| `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model) |
+| `--dspark` | off | DeepSeek V4's own block-parallel draft stages (~11 GB on top of the model). DeepSeek-V4.1 runs the stages its pack ships unless `--no-mtp` |
 | `--ssd-streaming` | off | ds4 / DeepSeek-V4-Flash GGUF only: stream expert weights from SSD instead of holding the whole model in RAM |
 | `--prefill-chunk N` | `8192` | Max tokens forwarded per prefill chunk (auto-capped further per model); lower it to cut prefill peak memory |
 | `--no-decode-attn-quant` | on | Disable the decode-only requant of dense bf16 attention weights (the "Fast decode for bf16-attention models" toggle) |
 | `--kv-quant {off,4,8}` | off | KV-cache quantization scheme (MLX path) |
 | `--kv-attn-mode {auto,dense,fused}` | auto | Decode read path for quantized KV: `fused` reads the packed cache in place, `auto` engages it from 8K prompt tokens (only at `--kv-quant 4/8`; per-request `kv_attn_mode` overrides) |
 | `--llama-kv-quant {off,q8,q4}` | off | KV-cache quantization for GGUF (llama.cpp path) |
-| `--llama-cache-entries N` | `4` | Multi-session LRU for llama.cpp (warm multi-doc agents) |
+| `--llama-cache-entries N` | `4` | llama.cpp sequences per model: requests decoded together in one batch, each keeping its prompt KV warm; each holds a full `--ctx-size` of KV from load |
+| `--llama-mtp-drafts N` | `2` | Draft tokens per MTP round for a GGUF with an MTP head (its own, or an `mtp-*.gguf` beside it); drafts only while one request decodes; `0` = off |
+| `--llama-ubatch N` | libllama's 512 | llama.cpp prefill batch in tokens; 1024-2048 prefill faster, mostly on MoE, for more scratch memory |
 | `--tokenize-cache-entries N` | `4` | Chat-template + tokenize cache size |
 | `--max-concurrent N` | `1` | Continuous-batch decode parallelism |
 | `--prefill-decode-share S` | `0` | Wall-time fraction (0..0.9) decoding streams keep during another request's prefill; the prefill runs 1024-token chunks meanwhile. Env `MLX_SERVE_PREFILL_DECODE_SHARE` |

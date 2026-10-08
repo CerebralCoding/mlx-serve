@@ -55,7 +55,9 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(d.prefixCacheMem, "")          // server.zig prefix_cache_mem_bytes (auto)
         XCTAssertEqual(d.tokenizeCacheEntries, 4)     // server.zig tokenize_cache_entries
         XCTAssertEqual(d.llamaKvQuant, .off)          // server.zig llama_kv_quant
-        XCTAssertEqual(d.llamaCacheEntries, 4)        // server.zig llama_cache_entries
+        XCTAssertEqual(d.llamaCacheEntries, 4)        // scheduler.zig LlamaSettings.seqs
+        XCTAssertEqual(d.llamaMtpDrafts, 2)           // scheduler.zig LlamaSettings.mtp_drafts
+        XCTAssertEqual(d.llamaUbatch, 0)              // scheduler.zig LlamaSettings.ubatch (libllama default)
         XCTAssertEqual(d.skipMemPreflight, false)     // scheduler.zig skip_mem_preflight
         XCTAssertEqual(d.ssdStreaming, false)         // main.zig ds4_ssd_streaming
         // Deliberate divergence from main.zig's metrics_enabled=false: the tray
@@ -70,7 +72,7 @@ final class ServerOptionsTests: XCTestCase {
         for flag in ["--ctx-size", "--timeout", "--no-vision", "--max-concurrent",
                      "--kv-quant", "--prefix-cache-mem", "--tokenize-cache-entries",
                      "--llama-kv-quant", "--llama-cache-entries", "--skip-mem-preflight",
-                     "--ssd-streaming", "--top-k", "--drafter"] {
+                     "--ssd-streaming", "--mlx-gguf", "--top-k", "--drafter"] {
             XCTAssertFalse(args.contains(flag),
                 "\(flag) appeared at default — its Swift default or emit-guard drifted from the server")
         }
@@ -117,172 +119,6 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertFalse(contains(args, flag: "--ctx-size"))
     }
 
-    func testDrafterPathPullsInBlockSize() {
-        var opts = ServerOptions()
-        opts.drafterPath = "/tmp/gemma-4-E4B-it-assistant-bf16"
-        opts.draftBlockSize = 6
-        let args = opts.toCLIArgs()
-        XCTAssertTrue(contains(args, flag: "--drafter", value: "/tmp/gemma-4-E4B-it-assistant-bf16"))
-        XCTAssertTrue(contains(args, flag: "--draft-block-size", value: "6"))
-    }
-
-    func testEmptyDrafterPathOmitsBothFlags() {
-        let opts = ServerOptions()  // drafterPath = ""
-        let args = opts.toCLIArgs()
-        XCTAssertFalse(args.contains("--drafter"))
-        XCTAssertFalse(args.contains("--draft-block-size"))
-    }
-
-    func testCustomTimeoutIsEmittedWhenNonDefault() {
-        var opts = ServerOptions()
-        opts.requestTimeout = 600
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--timeout", value: "600"))
-
-        opts.requestTimeout = 0  // unlimited
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--timeout", value: "0"))
-    }
-
-    // MARK: - Host / port (Settings UI fields)
-
-    /// `parsePort` backs the Settings port text field — it must accept exactly
-    /// what a TCP listen can bind and reject everything else, because an
-    /// invalid value that slipped through would silently launch on a port the
-    /// rest of the app (health checks, chat client) isn't watching.
-    func testParsePortAcceptsValidPorts() {
-        XCTAssertEqual(ServerOptions.parsePort("11234"), 11234)
-        XCTAssertEqual(ServerOptions.parsePort(" 8080 "), 8080)   // trims whitespace
-        XCTAssertEqual(ServerOptions.parsePort("1"), 1)
-        XCTAssertEqual(ServerOptions.parsePort("65535"), 65535)
-    }
-
-    func testParsePortRejectsJunk() {
-        XCTAssertNil(ServerOptions.parsePort(""))
-        XCTAssertNil(ServerOptions.parsePort("0"))      // 0 = kernel-assigned ephemeral; client couldn't find the server
-        XCTAssertNil(ServerOptions.parsePort("65536"))
-        XCTAssertNil(ServerOptions.parsePort("-1"))
-        XCTAssertNil(ServerOptions.parsePort("80x"))
-        XCTAssertNil(ServerOptions.parsePort("abc"))
-        XCTAssertNil(ServerOptions.parsePort("11 234"))
-    }
-
-    /// The host field is free text in Settings; a cleared field must not
-    /// launch `--host ""` (the server would fail to bind).
-    func testEmptyHostFallsBackToBindAll() {
-        var opts = ServerOptions()
-        opts.host = "   "
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--host", value: "0.0.0.0"))
-    }
-
-    func testCustomHostIsEmitted() {
-        var opts = ServerOptions()
-        opts.host = "127.0.0.1"
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--host", value: "127.0.0.1"))
-    }
-
-    func testNoVisionFlag() {
-        var opts = ServerOptions()
-        opts.noVision = true
-        XCTAssertTrue(opts.toCLIArgs().contains("--no-vision"))
-    }
-
-    // MARK: - Observability (--metrics)
-
-    func testMetricsFlagEmittedByDefault() {
-        XCTAssertTrue(ServerOptions().toCLIArgs().contains("--metrics"))
-    }
-
-    func testMetricsFlagOmittedWhenDisabled() {
-        var opts = ServerOptions()
-        opts.enableMetrics = false
-        XCTAssertFalse(opts.toCLIArgs().contains("--metrics"))
-    }
-
-    func testMetricsHasNoAdminKeyFlag() {
-        // The simplified observability layer has no admin/auth surface: even
-        // with metrics on, no `--admin-key` (or any admin flag) is ever emitted.
-        var opts = ServerOptions()
-        opts.enableMetrics = true
-        XCTAssertFalse(opts.toCLIArgs().contains("--admin-key"))
-    }
-
-    func testApiKeyOmittedByDefault() {
-        let opts = ServerOptions()
-        XCTAssertEqual(opts.apiKey, "")
-        XCTAssertFalse(opts.toCLIArgs().contains("--api-key"))
-    }
-
-    func testApiKeyEmittedWhenSet() {
-        var opts = ServerOptions()
-        opts.apiKey = "s3cret"
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--api-key", value: "s3cret"))
-    }
-
-    func testApiKeyWhitespaceOnlyIsOmitted() {
-        var opts = ServerOptions()
-        opts.apiKey = "   "
-        XCTAssertFalse(opts.toCLIArgs().contains("--api-key"))
-    }
-
-    func testApiKeyChangeTriggersRestart() {
-        let a = ServerOptions()
-        var b = ServerOptions()
-        b.apiKey = "s3cret"
-        XCTAssertFalse(a.serverLaunchEquals(b),
-                      "Setting/changing the API key must trigger a server restart")
-    }
-
-    func testEnableMetricsChangeTriggersRestart() {
-        let a = ServerOptions()
-        var b = ServerOptions()
-        b.enableMetrics = false
-        XCTAssertFalse(a.serverLaunchEquals(b),
-                      "Toggling --metrics must trigger a server restart")
-    }
-
-    // MARK: - SSD prefix cache (default off + toggle)
-
-    func testPrefixCacheDiskDefaultsOff() {
-        // OFF by default: the app is authoritative and always emits the flag as
-        // `off` so the SSD tier can't be silently on via a server default.
-        let opts = ServerOptions()
-        XCTAssertFalse(opts.enablePrefixCacheDisk)
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--prefix-cache-disk", value: "off"))
-    }
-
-    func testPrefixCacheDiskEmitsSizeWhenEnabled() {
-        var opts = ServerOptions()
-        opts.enablePrefixCacheDisk = true
-        opts.prefixCacheDisk = "10GB"
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--prefix-cache-disk", value: "10GB"))
-        XCTAssertFalse(contains(opts.toCLIArgs(), flag: "--prefix-cache-disk", value: "off"))
-    }
-
-    func testPrefixCacheDiskToggleTriggersRestart() {
-        let a = ServerOptions()
-        var b = ServerOptions()
-        b.enablePrefixCacheDisk = true
-        XCTAssertFalse(a.serverLaunchEquals(b),
-                      "Toggling the SSD prefix cache must trigger a server restart")
-    }
-
-    func testServerLaunchEqualsIgnoresPerRequestFields() {
-        var a = ServerOptions()
-        var b = ServerOptions()
-        // Still purely per-request: max tokens, penalties, spec-decode
-        // TriStates. (Sampling defaults — temperature/top-p/top-k — became
-        // launch flags in 2026-06 so external clients like Claude Code
-        // inherit them; covered by testSamplingDefaultsAffectRestartDetection.)
-        b.defaultMaxTokens = 8192
-        b.perRequestEnablePLD = .off
-        b.defaultRepeatPenalty = 1.1
-        XCTAssertTrue(a.serverLaunchEquals(b),
-                     "Per-request defaults must NOT trigger restart")
-
-        a.port = 9000
-        XCTAssertFalse(a.serverLaunchEquals(b),
-                      "Server-launch fields MUST trigger restart")
-    }
-
     func testTriStateMaps() {
         XCTAssertNil(ServerOptions.TriState.auto.asOptionalBool)
         XCTAssertEqual(ServerOptions.TriState.on.asOptionalBool, true)
@@ -292,7 +128,6 @@ final class ServerOptionsTests: XCTestCase {
     func testRoundTripCodable() throws {
         var opts = ServerOptions()
         opts.port = 9999
-        opts.drafterPath = "/x/y/z"
         opts.defaultTemperature = 0.42
         opts.perRequestEnableDrafter = .off
 
@@ -375,6 +210,17 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-cache-entries", value: "8"))
     }
 
+    func testLlamaMtpDraftsAndUbatchEmitOnlyOffTheirDefaults() {
+        let args = ServerOptions().toCLIArgs()
+        XCTAssertFalse(args.contains("--llama-mtp-drafts"))
+        XCTAssertFalse(args.contains("--llama-ubatch"))
+        var opts = ServerOptions()
+        opts.llamaMtpDrafts = 0   // off: the server must hear it, its default drafts
+        opts.llamaUbatch = 2048
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-mtp-drafts", value: "0"))
+        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--llama-ubatch", value: "2048"))
+    }
+
     func testTokenizeCacheEntriesOmittedAtDefault() {
         let args = ServerOptions().toCLIArgs()
         XCTAssertFalse(args.contains("--tokenize-cache-entries"),
@@ -397,6 +243,14 @@ final class ServerOptionsTests: XCTestCase {
         opts.prefixCacheMem = "2GB"
         XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB),
                                flag: "--prefix-cache-mem", value: "2GB"))
+    }
+
+    /// The n-gram table stays on disk unless the user opts in, matching the server default.
+    func testPleGpuIsOptIn() {
+        var opts = ServerOptions()
+        XCTAssertFalse(opts.toCLIArgs(physicalMemoryBytes: 128 * Self.GiB).contains("--ple-gpu"))
+        opts.pleGpu = true
+        XCTAssertTrue(opts.toCLIArgs(physicalMemoryBytes: 128 * Self.GiB).contains("--ple-gpu"))
     }
 
     /// A blob saved while "2GB" was the default migrates to Auto once; a later "2GB" stays.
@@ -443,15 +297,45 @@ final class ServerOptionsTests: XCTestCase {
                        "clamp is a ceiling, never raises a smaller request")
         // big RAM → uncapped
         XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(16, physicalMemoryBytes: 128 * Self.GiB), 16)
-        // explicit disable is preserved on every machine
-        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(0, physicalMemoryBytes: 16 * Self.GiB), 0)
+        // Entry count is a RAM-cache size; the separate hot-cache toggle owns disable.
+        XCTAssertEqual(ServerOptions.ramCappedPrefixCacheEntries(0, physicalMemoryBytes: 16 * Self.GiB), 1)
     }
 
-    func testPrefixCacheDisableSurvivesClamp() {
+    func testHotPrefixCacheToggleOwnsDisableInsteadOfTheEntryCount() {
         var opts = ServerOptions()
         opts.prefixCacheEntries = 0
         XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB),
-                               flag: "--prefix-cache-entries", value: "0"))
+                               flag: "--prefix-cache-entries", value: "1"))
+        opts.hotPrefixCacheEnabled = false
+        XCTAssertTrue(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB).contains("--no-prefix-cache-ram"))
+        XCTAssertTrue(contains(opts.toCLIArgs(physicalMemoryBytes: 16 * Self.GiB),
+                               flag: "--prefix-cache-entries", value: "1"))
+    }
+
+    func testHotPrefixCacheCanBeDisabledWithoutDisablingSSD() {
+        var opts = ServerOptions()
+        opts.enablePrefixCacheDisk = true
+        opts.hotPrefixCacheEnabled = false
+        let args = opts.toCLIArgs(physicalMemoryBytes: 64 * Self.GiB)
+        XCTAssertTrue(args.contains("--no-prefix-cache-ram"))
+        XCTAssertTrue(contains(args, flag: "--prefix-cache-entries", value: "8"))
+        XCTAssertTrue(contains(args, flag: "--prefix-cache-disk", value: "10GB"))
+    }
+
+    func testHotPrefixCacheToggleIsMigrationSafeAndRequiresRestart() throws {
+        let legacy = try JSONDecoder().decode(ServerOptions.self, from: Data("{}".utf8))
+        XCTAssertTrue(legacy.hotPrefixCacheEnabled)
+        let disabledBeforeToggle = try JSONDecoder().decode(
+            ServerOptions.self, from: Data(#"{"prefixCacheEntries":0}"#.utf8))
+        XCTAssertFalse(disabledBeforeToggle.hotPrefixCacheEnabled)
+        let disabledWithDisk = try JSONDecoder().decode(
+            ServerOptions.self, from: Data(#"{"prefixCacheEntries":0,"enablePrefixCacheDisk":true}"#.utf8))
+        XCTAssertFalse(disabledWithDisk.enablePrefixCacheDisk)
+
+        let base = ServerOptions()
+        var changed = base
+        changed.hotPrefixCacheEnabled = false
+        XCTAssertFalse(base.serverLaunchEquals(changed))
     }
 
     func testTokenizeCacheEntriesEmitsWhenChanged() {
@@ -544,6 +428,12 @@ final class ServerOptionsTests: XCTestCase {
         XCTAssertEqual(info.engine, .mlx)
         info.architecture = ""  // older server build that omits the field
         XCTAssertEqual(info.engine, .mlx, "empty arch must default to .mlx (the most common path)")
+        // A GGUF on the MLX path is its own engine, and an MLX one for the
+        // settings that key on the forward.
+        info.engineName = "mlx-gguf"
+        XCTAssertEqual(info.engine, .mlxGguf)
+        XCTAssertTrue(info.engine.isMlxPath)
+        XCTAssertFalse(ServerEngine.llama.isMlxPath)
     }
 
     func testEngineFromServerReport() {
@@ -584,32 +474,27 @@ final class ServerOptionsTests: XCTestCase {
 }
 
 extension ServerOptionsTests {
-    /// The Settings temperature must reach third-party clients (Claude Code
-    /// omits sampling params entirely, so the server-launch default is the
-    /// only channel). Top-p rides along; top-k 0 means "no opinion" and must
-    /// be OMITTED so the model's generation_config.json recommendation
-    /// (Qwen 3.6: top_k=20, Gemma 4: 64) stays in effect.
-    func testSamplingDefaultsReachLaunchArgs() {
+    /// Generation profiles are hot-read rather than pinned into launch flags.
+    func testSamplingDefaultsDoNotPinLaunchArgs() {
         var opts = ServerOptions()
         opts.defaultTemperature = 0.7
         opts.defaultTopP = 0.95
         opts.defaultTopK = 0
         let args = opts.toCLIArgs()
-        XCTAssertTrue(contains(args, flag: "--temp", value: "0.7"))
-        XCTAssertTrue(contains(args, flag: "--top-p", value: "0.95"))
+        XCTAssertFalse(args.contains("--temp"))
+        XCTAssertFalse(args.contains("--top-p"))
         XCTAssertFalse(args.contains("--top-k"))
 
         opts.defaultTopK = 40
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--top-k", value: "40"))
+        XCTAssertFalse(opts.toCLIArgs().contains("--top-k"))
     }
 
-    /// Changing a sampling default must trip the restart detector — these now
-    /// affect the launched process, not just the app's own request bodies.
-    func testSamplingDefaultsAffectRestartDetection() {
+    /// Generation settings apply to the next request without restarting.
+    func testSamplingDefaultsDoNotAffectRestartDetection() {
         let base = ServerOptions()
         var changed = base
         changed.defaultTemperature = 0.42
-        XCTAssertFalse(base.serverLaunchEquals(changed))
+        XCTAssertTrue(base.serverLaunchEquals(changed))
     }
 }
 
@@ -631,16 +516,17 @@ extension ServerOptionsTests {
         o.enablePLD = false
         o.pldDraftLen = 7
         o.pldKeyLen = 4
-        o.drafterPath = "/x/y/drafter"
-        o.draftBlockSize = 8
         o.maxConcurrent = 4
         o.kvQuant = .int8
+        o.hotPrefixCacheEnabled = false
         o.prefixCacheEntries = 3   // off the default (8) so the round-trip moves it
         o.prefixCacheMem = "4GB"
         o.skipMemPreflight = true
         o.ssdStreaming = true
         o.llamaKvQuant = .q8
         o.llamaCacheEntries = 2   // off the default (4) so the round-trip moves it
+        o.llamaMtpDrafts = 4
+        o.llamaUbatch = 1024
         o.tokenizeCacheEntries = 16
         o.idleEvictSecs = 1800
         o.defaultMaxTokens = 8192
@@ -663,12 +549,10 @@ extension ServerOptionsTests {
         XCTAssertEqual(o, decoded, "a field missing from the custom init(from:) would revert to its default here")
     }
 
-    /// Slider arithmetic leaves float dirt (0.8 − 0.1 = 0.7000000000000001);
-    /// argv must carry the clean decimal (seen verbatim in `ps` output live).
-    func testSamplingFlagFormattingIsClean() {
+    func testSamplingMigrationKeepsNumericPrecision() {
         var opts = ServerOptions()
         opts.defaultTemperature = 0.8 - 0.1
-        XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--temp", value: "0.7"))
+        XCTAssertEqual(GenerationDefaults.legacy(opts).rules["temperature"]?.value, .number(opts.defaultTemperature))
     }
 }
 
@@ -680,18 +564,38 @@ extension ServerOptionsTests {
     // var) — same shape as every other launch knob, so it shows in --help, in
     // `ps`, and in the launch-command echo at the top of the server log.
 
-    func testOsMemoryReserveOnByDefaultAndOmitted() {
-        XCTAssertTrue(ServerOptions().osMemoryReserve, "the OS memory reserve must stay on by default")
+    func testOsReserveAutoByDefaultAndOmitted() {
+        XCTAssertNil(ServerOptions().osReserveGiB, "the OS memory reserve must stay automatic by default")
         XCTAssertFalse(ServerOptions().toCLIArgs().contains("--os-reserve-gib"),
-                       "default (on) must not emit the flag so the server keeps its automatic reserve")
+                       "Auto must not emit the flag so the server keeps its automatic reserve")
     }
 
-    func testOsMemoryReserveOffEmitsZero() {
+    func testOsReserveExplicitSizeEmitsItsGiB() throws {
         var opts = ServerOptions()
-        opts.osMemoryReserve = false
-        let args = opts.toCLIArgs()
-        guard let i = args.firstIndex(of: "--os-reserve-gib") else { return XCTFail("flag missing") }
-        XCTAssertEqual(args[i + 1], "0")
+        for gib in [0, 2, 12] {
+            opts.osReserveGiB = gib
+            XCTAssertTrue(contains(opts.toCLIArgs(), flag: "--os-reserve-gib", value: "\(gib)"))
+            XCTAssertEqual(try JSONDecoder().decode(ServerOptions.self, from: JSONEncoder().encode(opts)).osReserveGiB, gib)
+        }
+    }
+
+    func testLegacyOsMemoryReserveSwitchMigrates() throws {
+        let on = try JSONDecoder().decode(ServerOptions.self, from: Data(#"{"osMemoryReserve": true}"#.utf8))
+        XCTAssertNil(on.osReserveGiB)
+        let off = try JSONDecoder().decode(ServerOptions.self, from: Data(#"{"osMemoryReserve": false}"#.utf8))
+        XCTAssertEqual(off.osReserveGiB, 0)
+        let newWins = try JSONDecoder().decode(ServerOptions.self,
+                                               from: Data(#"{"osMemoryReserve": false, "osReserveGiB": 3}"#.utf8))
+        XCTAssertEqual(newWins.osReserveGiB, 3)
+    }
+
+    func testAutoOsReserveMatchesTheServer() {
+        let gib: UInt64 = 1 << 30
+        XCTAssertEqual(ServerOptions.autoOsReserveGiB(physicalMemoryBytes: 8 * gib), 2)
+        XCTAssertEqual(ServerOptions.autoOsReserveGiB(physicalMemoryBytes: 16 * gib), 2)
+        XCTAssertEqual(ServerOptions.autoOsReserveGiB(physicalMemoryBytes: 36 * gib), 4.5)
+        XCTAssertEqual(ServerOptions.autoOsReserveGiB(physicalMemoryBytes: 48 * gib), 6)
+        XCTAssertEqual(ServerOptions.autoOsReserveGiB(physicalMemoryBytes: 128 * gib), 8)
     }
 
     func testSkipMemPreflightDefaultsOff() {
@@ -745,6 +649,16 @@ extension ServerOptionsTests {
     // full model resident (skips warmup + residency). ds4-only — the MLX and
     // llama.cpp engines ignore it. Same bare-boolean shape as --skip-mem-preflight,
     // so it shows in --help, in `ps`, and in the launch-command echo.
+
+    func testMlxGgufIsOptIn() {
+        // Mirrors main.zig `mlx_gguf_enabled = false`: the experimental engine
+        // never claims a GGUF unless the user turned it on.
+        XCTAssertFalse(ServerOptions().mlxGguf)
+        XCTAssertFalse(ServerOptions().toCLIArgs().contains("--mlx-gguf"))
+        var opts = ServerOptions()
+        opts.mlxGguf = true
+        XCTAssertTrue(opts.toCLIArgs().contains("--mlx-gguf"))
+    }
 
     func testSsdStreamingDefaultsOff() {
         // Mirrors main.zig `var ds4_ssd_streaming: bool = false` — the Swift

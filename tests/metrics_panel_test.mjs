@@ -1,137 +1,171 @@
-// Unit tests for the index panel's rate math (`src/html/metrics.js`).
-//
-// The panel is an untestable surface (DOM + polling), so the decision logic is
-// factored into a pure `computeRates(now, samples, counters, gauges, psum)` and
-// tested here. Run via `node tests/metrics_panel_test.mjs`; skipped when node
-// is absent.
-//
-// Regression (2026-07-09): `lastPrefillTps` was a module-level `let` that was
-// only ASSIGNED when the 60s window contained prefill work, and never reset. So
-// the Prefill tile kept displaying the last prefill speed for the whole of a
-// long decode — and a page refresh cleared it, which is the signature of state
-// living in a variable rather than being derived from the current data.
+// Monitoring calculations from the shipped bundle; no DOM, GPU or dependencies.
 import { readFileSync } from 'node:fs';
-import { fileURLToPath } from 'node:url';
-import { dirname, join } from 'node:path';
+import vm from 'node:vm';
 import assert from 'node:assert/strict';
-
-const here = dirname(fileURLToPath(import.meta.url));
-const src = readFileSync(join(here, '..', 'src', 'html', 'metrics.js'), 'utf8');
-
-// The file guards its IIFE on `typeof document`, so in node only the top-level
-// helpers evaluate. It hands them back through `globalThis.__mlxPanel`.
-new Function(src)();
-const { computeRates } = globalThis.__mlxPanel ?? {};
-assert.ok(computeRates, 'metrics.js must expose computeRates for tests');
-
-const counters = (over = {}) => ({
-  prompt_tokens_total: 10000,
-  prefill_tokens_total: 4000,
-  prefix_cache_tokens_total: 6000,
-  generation_tokens_total: 500,
-  requests_success_total: 4,
-  requests_cancelled_total: 0,
-  prefix_cache_queries_total: 4,
-  prefix_cache_hits_total: 2,
-  ...over,
+import { test } from 'node:test';
+const context = vm.createContext({ EventTarget, URL, atob });
+for (const file of ['api.js', 'app.js'])
+  vm.runInContext(readFileSync(new URL('../src/html/' + file, import.meta.url), 'utf8'), context);
+const P = context.__mlxConsole;
+assert.ok(P, 'Monitoring uses the console test hook');
+const plain = (v) => JSON.parse(JSON.stringify(v));
+const feed = (n, gauges = {}) => ({
+  counters: { generation_tokens_total: n, requests_success_total: n, prefill_tokens_total: n },
+  gauges: {
+    process_start_time_seconds: 1,
+    generation_tokens_live: n,
+    prefill_tokens_live: 0,
+    requests_running: 1,
+    ...gauges
+  },
+  histograms: { prefill_time_seconds: { sum: 2, count: 1 } },
+  sessions: []
 });
-const gauges = (over = {}) => ({
-  requests_running: 0,
-  requests_waiting: 0,
-  gpu_utilization_pct: 0,
-  memory_mb: 0,
-  generation_tokens_live: 500,
-  prefill_tokens_live: 0,
-  requests_prefilling: 0,
-  ...over,
-});
+const sample = (t, n, g = {}) => P.makeSample(t, feed(n, g));
 
-let failures = 0;
-function test(name, fn) {
-  try { fn(); console.log(`  PASS ${name}`); }
-  catch (e) { failures++; console.log(`  FAIL ${name}\n       ${e.message}`); }
-}
-
-// ── The bug ──────────────────────────────────────────────────────────────────
-test('prefill tok/s is 0 while decoding, with no carry-forward from an earlier prefill', () => {
-  const now0 = 1_000_000;
-  const samples = [];
-
-  // t0: a prefill is running, 8192 tokens forwarded.
-  samples.push({ t: now0, live: 100, pre: 0, pretok: 4000, psum: 5.0, req: 4 });
-  // t1 (+4s): prefill has advanced to 16384.
-  samples.push({ t: now0 + 4000, live: 100, pre: 8192, pretok: 4000, psum: 5.0, req: 4 });
-  const mid = computeRates(now0 + 8000, samples, counters(), gauges({
-    requests_running: 1, requests_prefilling: 1, prefill_tokens_live: 16384,
-  }), 5.0);
-  assert.ok(mid.prefillTps > 0, `expected a live prefill rate, got ${mid.prefillTps}`);
-  assert.equal(mid.prefilling, true);
-
-  // t2 (+10s): prefill ended, the request is now DECODING. The server has
-  // already zeroed both prefill gauges (verified in test_metrics.sh Phase 4).
-  samples.push({ t: now0 + 8000, live: 100, pre: 16384, pretok: 4000, psum: 5.0, req: 4 });
-  const dec = computeRates(now0 + 10000, samples, counters(), gauges({
-    requests_running: 1, requests_prefilling: 0, prefill_tokens_live: 0,
-    generation_tokens_live: 900,
-  }), 5.0);
-
-  assert.equal(dec.prefillTps, 0,
-    `Prefill must read 0 while decoding; got ${dec.prefillTps} (carry-forward)`);
-  assert.equal(dec.prefilling, false);
-  assert.ok(dec.decodeTps > 0, `expected a live decode rate, got ${dec.decodeTps}`);
+test('live rates use elapsed seconds, active counters and completed prefill time', () => {
+  const current = feed(100, { prefill_tokens_live: 300 });
+  assert.deepEqual(plain(P.liveRates([{ t: 0, live: 20, pre: 100, req: 60 }], current, 4000)), {
+    decode: 20,
+    prefill: 50,
+    requests: 10,
+    averagePrefill: 50,
+    live: 100,
+    pre: 300
+  });
 });
 
-test('a page refresh and a live tick agree (no hidden state across ticks)', () => {
-  const now = 2_000_000;
-  const c = counters(), g = gauges({ requests_running: 1, generation_tokens_live: 900 });
-
-  // "Warm" panel: a long history including a finished prefill burst.
-  const warm = [
-    { t: now - 60000, live: 0,   pre: 0,     pretok: 0,    psum: 0.0, req: 0 },
-    { t: now - 30000, live: 100, pre: 8192,  pretok: 2000, psum: 2.0, req: 2 },
-    { t: now - 2000,  live: 500, pre: 0,     pretok: 4000, psum: 5.0, req: 4 },
-  ];
-  // "Fresh" panel, as after F5: only the samples gathered since load.
-  const fresh = [{ t: now - 2000, live: 500, pre: 0, pretok: 4000, psum: 5.0, req: 4 }];
-
-  const a = computeRates(now, warm, c, g, 5.0);
-  const b = computeRates(now, fresh, c, g, 5.0);
-  assert.equal(a.prefillTps, b.prefillTps,
-    `refresh changed the prefill reading (${b.prefillTps}) vs live (${a.prefillTps})`);
-  assert.equal(a.prefillTps, 0);
+test('a page refresh and a live tick agree on idle and prefill completion', () => {
+  const old = [{ t: 0, live: 20, pre: 100, req: 1 }];
+  P.liveRates(old, feed(100, { prefill_tokens_live: 300 }), 4000);
+  const idle = feed(100, { requests_running: 0, prefill_tokens_live: 0 });
+  for (const samples of [old, []]) {
+    const rates = P.liveRates(samples, idle, 5000);
+    assert.equal(rates.decode, 0);
+    assert.equal(rates.prefill, 0);
+    assert.equal(rates.averagePrefill, 50);
+  }
+  // A fresh page has no delta baseline for an active decode; unknown is not a remembered rate.
+  assert.equal(P.liveRates([], feed(100), 5000).decode, null);
+  assert.equal(P.liveRates(old, feed(100), 5000).prefill, 0);
+  const history = [sample(0, 0), sample(1000, 10), sample(4000, 40)];
+  assert.deepEqual(
+    plain(P.rateSeries(JSON.parse(JSON.stringify(history)), 'generation_tokens_total', 0, 4000, 4)),
+    plain(P.rateSeries(history, 'generation_tokens_total', 0, 4000, 4))
+  );
 });
 
-// ── The number that replaces it ──────────────────────────────────────────────
-test('average prefill speed = forwarded tokens / seconds spent prefilling', () => {
-  const r = computeRates(3_000_000, [{ t: 2_999_000, live: 0, pre: 0, pretok: 0, psum: 0, req: 0 }],
-    counters({ prefill_tokens_total: 4000 }), gauges(), 5.0);
-  assert.equal(r.avgPrefillTps, 800);   // 4000 forwarded / 5.0 s
+test('zero work yields zero; missing samples, zero elapsed and counter reset stay unknown', () => {
+  const before = [{ t: 1000, live: 20, pre: 10, req: 5 }];
+  assert.equal(P.liveRates(before, feed(20), 2000).decode, 0);
+  assert.equal(P.liveRates(before, feed(10), 2000).decode, null);
+  assert.equal(P.liveRates(before, feed(30), 1000).decode, null);
+  assert.equal(P.liveRates(before, feed(30), 302000).decode, null);
+  assert.equal(P.liveRates([], feed(30), 2000).decode, null);
 });
 
-test('average prefill speed excludes prefix-cache restores', () => {
-  // 10000 billed, 6000 restored -> only 4000 were forwarded. Using the billed
-  // total would report 2000 tok/s (the 10.6x class of bug).
-  const r = computeRates(3_000_000, [{ t: 2_999_000, live: 0, pre: 0, pretok: 0, psum: 0, req: 0 }],
-    counters(), gauges(), 5.0);
-  assert.equal(r.avgPrefillTps, 800);
-  assert.notEqual(r.avgPrefillTps, 2000);
+test('history buckets never interpolate through gaps, restarts or decreases', () => {
+  const before = sample(0, 10);
+  for (const after of [
+    sample(1000, 20, { process_start_time_seconds: 2 }),
+    sample(1000, 1),
+    sample(301000, 20)
+  ]) {
+    assert.deepEqual(
+      plain(P.rateSeries([before, after], 'generation_tokens_total', 0, after.t, 1)),
+      [null]
+    );
+    assert.equal(P.windowTotals([before, after], 0, after.t).generation_tokens_total, 0);
+  }
+  assert.equal(
+    P.rateSeries([before, sample(300000, 20)], 'generation_tokens_total', 0, 300000, 1)[0],
+    10 / 300
+  );
+  const missing = sample(1000, 20);
+  missing.c.generation_tokens_total = null;
+  assert.deepEqual(plain(P.rateSeries([before, missing], 'generation_tokens_total', 0, 1000, 1)), [
+    null
+  ]);
 });
 
-test('average is null before any request has completed (shows an em dash)', () => {
-  const r = computeRates(4_000_000, [{ t: 3_999_000, live: 0, pre: 0, pretok: 0, psum: 0, req: 0 }],
-    counters({ prefill_tokens_total: 0, requests_success_total: 0 }), gauges(), 0);
-  assert.equal(r.avgPrefillTps, null);
+test('history rates use counter deltas and measured time, not poll counts', () => {
+  const samples = [sample(0, 0), sample(1000, 10), sample(4000, 40)];
+  assert.deepEqual(plain(P.rateSeries(samples, 'generation_tokens_total', 0, 4000, 4)), [
+    10,
+    null,
+    null,
+    10
+  ]);
+  assert.equal(P.windowTotals(samples, 1000, 4000).generation_tokens_total, 30);
 });
 
-test('decode tok/s is 0 when nothing is running', () => {
-  const now = 5_000_000;
+test('merged history deduplicates tabs, retains 24 hours and preserves gap/reset edges', () => {
+  const now = 86400000;
   const samples = [
-    { t: now - 4000, live: 100, pre: 0, pretok: 4000, psum: 5.0, req: 4 },
-    { t: now,        live: 500, pre: 0, pretok: 4000, psum: 5.0, req: 4 },
+    sample(-1000, 0),
+    sample(1000, 1),
+    sample(2000, 2),
+    sample(3000, 0),
+    sample(4000, 1),
+    sample(5000, 2),
+    sample(600000, 3),
+    sample(now - 1000, 4),
+    sample(now, 5)
   ];
-  const r = computeRates(now, samples, counters(), gauges({ requests_running: 0 }), 5.0);
-  assert.equal(r.decodeTps, 0);
+  const merged = P.mergeDocs({ samples, rows: [] }, { samples: [sample(now, 5)], rows: [] }, now);
+  assert.deepEqual(plain(merged.samples.map((s) => s.t)), [
+    1000,
+    2000,
+    3000,
+    5000,
+    600000,
+    now - 1000,
+    now
+  ]);
 });
 
-console.log(failures === 0 ? '\nALL PASS' : `\n${failures} FAILED`);
-process.exit(failures === 0 ? 0 : 1);
+test('Sessions track observed request ids, close departures, and exclude cached slots', () => {
+  const s = {
+    model: 'm',
+    phase: 'prefill',
+    request_id: 9,
+    client: 'codex',
+    context_tokens: 10,
+    context_length: 100,
+    cached_tokens: 0,
+    generated_tokens: 0
+  };
+  let rows = P.trackRequests([], [s, { ...s, request_id: 0, phase: 'cached' }], 1000);
+  rows = P.trackRequests(rows, [{ ...s, phase: 'decode', generated_tokens: 5 }], 2000);
+  assert.equal(rows.length, 1);
+  assert.equal(rows[0].generated, 5);
+  assert.equal(rows[0].endT, null);
+  rows = P.trackRequests(rows, [], 3000);
+  assert.equal(rows[0].endT, 3000);
+  assert.equal(P.rangeRows(rows, 1500, 2500).length, 1);
+  assert.equal(P.rangeRows(rows, 3001, 4000).length, 0);
+});
+
+test('per-model totals attribute completed deltas to the departing model', () => {
+  const a = sample(0, 0),
+    b = sample(1000, 10),
+    c = sample(2000, 20);
+  a.m = 'alpha';
+  c.m = 'beta';
+  assert.equal(P.modelTotals([a, b, c], 0, 2000).alpha.generation_tokens_total, 10);
+  assert.equal(P.modelTotals([a, b, c], 0, 2000).beta.generation_tokens_total, 10);
+});
+
+test('console and Monitoring share mount-prefix resolution, without query keys', () => {
+  for (const [path, prefix] of [
+    ['/', ''],
+    ['/mount', '/mount'],
+    ['/mount/index.html', '/mount']
+  ]) {
+    assert.equal(P.apiPrefix(path), prefix);
+    assert.equal(
+      P.pageServer(new URL('https://host' + path + '?api_key=ignored')),
+      'https://host' + prefix
+    );
+  }
+});

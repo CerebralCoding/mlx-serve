@@ -9,6 +9,8 @@
 //!     can actually load (vanilla llama.cpp deepseek4 quants omit it)
 //!
 //! Routing rule (`preferredEngine`):
+//!   a split GGUF (`split.count` > 1) → llama.cpp, the only engine here that
+//!     reads the sibling shards (ds4 reads one file)
 //!   `general.architecture == "deepseek4"` AND lora-rank key present → ds4
 //!   a ds4-only arch (`deepseek41`, `qwen4exp`, `glm-dsa`, `glm5-next`) → ds4,
 //!     except a qwen4exp file with tensor types ds4 rejects → llama.cpp
@@ -41,6 +43,9 @@ pub const Info = struct {
     /// qwen4exp only: a tensor type ds4 rejects, or a non-BF16 n-gram table
     /// (llama.cpp quants such as GSQ-RCO's Q2_0 experts). ds4 would exit the process.
     ds4_unloadable: bool = false,
+    /// `split.count`: shards of a split GGUF (gguf-split / convert --split-max-size).
+    /// Writers put it after every other key, so the whole KV section is walked.
+    split_count: u32 = 1,
 
     pub fn deinit(self: *Info, allocator: std.mem.Allocator) void {
         if (self.architecture) |a| allocator.free(a);
@@ -58,6 +63,7 @@ const GGML_TYPE_BF16: u32 = 30;
 const GGML_MAX_DIMS: u32 = 4;
 
 pub fn preferredEngine(info: Info) Engine {
+    if (info.split_count > 1) return .llama;
     if (info.architecture) |a| {
         if (std.mem.eql(u8, a, "deepseek4") and info.has_ds4_lora_rank) return .ds4;
         for (ds4_only_archs) |d| if (std.mem.eql(u8, a, d)) return if (info.ds4_unloadable) .llama else .ds4;
@@ -96,8 +102,7 @@ const MAX_KEY_LEN: u64 = 1024;
 const MAX_STR_VALUE_LEN: u64 = 16 * 1024 * 1024;
 
 /// Stream-parse Info from a *Reader. Both runtime (file) and test (fixed
-/// bytes) callers go through here. Short-circuits as soon as both probe
-/// keys have been resolved.
+/// bytes) callers go through here.
 pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     var info: Info = .{};
     errdefer info.deinit(allocator);
@@ -110,7 +115,6 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
     const tensor_count = takeIntT(r, u64) catch return error.Truncated;
     const kv_count = takeIntT(r, u64) catch return error.Truncated;
 
-    var seen_arch = false;
     var i: u64 = 0;
     while (i < kv_count) : (i += 1) {
         // Key.
@@ -124,6 +128,7 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
         const is_arch = std.mem.eql(u8, key_buf, "general.architecture");
         const is_ds4_lora = std.mem.eql(u8, key_buf, "deepseek4.attention.output_lora_rank");
         const is_nextn = std.mem.endsWith(u8, key_buf, ".nextn_predict_layers");
+        const is_split_count = std.mem.eql(u8, key_buf, "split.count");
 
         const value_type = takeIntT(r, u32) catch return error.Truncated;
 
@@ -132,7 +137,6 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
             if (v_len > MAX_STR_VALUE_LEN) return error.Truncated;
             const v_buf = takeBytes(r, @intCast(v_len)) catch return error.Truncated;
             info.architecture = try allocator.dupe(u8, v_buf);
-            seen_arch = true;
         } else if (is_ds4_lora and isNumeric(value_type)) {
             // Presence is what matters; the actual value (rank) isn't used
             // for routing. Skip past the value cleanly.
@@ -140,13 +144,11 @@ pub fn parseInfo(allocator: std.mem.Allocator, r: *std.Io.Reader) Error!Info {
             info.has_ds4_lora_rank = true;
         } else if (is_nextn and isNumeric(value_type)) {
             info.embedded_mtp = (try takeNumeric(r, value_type)) > 0;
+        } else if (is_split_count and isNumeric(value_type)) {
+            info.split_count = @intFromFloat(std.math.clamp(try takeNumeric(r, value_type), 1, std.math.maxInt(u32)));
         } else {
             try skipValue(r, value_type);
         }
-
-        // Short-circuit once the routing keys are resolved — saves walking
-        // the (potentially huge) tokenizer/vocab arrays that come later.
-        if (seen_arch and info.has_ds4_lora_rank) break;
     }
 
     if (info.architecture) |a| {
@@ -172,6 +174,39 @@ fn scanDs4Unloadable(r: *std.Io.Reader, tensor_count: u64) Error!bool {
         if (is_ngrams and ty != GGML_TYPE_BF16) return true;
     }
     return false;
+}
+
+/// True when the header names a pooling type (`<arch>.pooling_type` > 0), llama.cpp's
+/// mark of an embedding or reranker model: no engine here generates text from one.
+/// Stops at the first `tokenizer.` key; converters write the arch keys before it.
+pub fn declaresPooling(r: *std.Io.Reader) Error!bool {
+    const magic = takeBytes(r, 4) catch return error.Truncated;
+    if (!std.mem.eql(u8, magic, "GGUF")) return error.BadMagic;
+    const version = takeIntT(r, u32) catch return error.Truncated;
+    if (version < 2 or version > 3) return error.UnsupportedVersion;
+    _ = takeIntT(r, u64) catch return error.Truncated; // tensor_count
+    const kv_count = takeIntT(r, u64) catch return error.Truncated;
+    var i: u64 = 0;
+    while (i < kv_count) : (i += 1) {
+        const key_len = takeIntT(r, u64) catch return error.Truncated;
+        if (key_len > MAX_KEY_LEN) return error.KeyTooLong;
+        const key = takeBytes(r, @intCast(key_len)) catch return error.Truncated;
+        if (std.mem.startsWith(u8, key, "tokenizer.")) return false;
+        const is_pooling = std.mem.endsWith(u8, key, ".pooling_type");
+        const value_type = takeIntT(r, u32) catch return error.Truncated;
+        if (is_pooling and isNumeric(value_type)) return (try takeNumeric(r, value_type)) > 0;
+        try skipValue(r, value_type);
+    }
+    return false;
+}
+
+/// `declaresPooling` for `sub_path` under `dir`; false when it cannot be read.
+pub fn fileDeclaresPooling(io: std.Io, dir: std.Io.Dir, sub_path: []const u8) bool {
+    var file = dir.openFile(io, sub_path, .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [16 * 1024]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    return declaresPooling(&rs.interface) catch false;
 }
 
 /// Open the GGUF file and parse Info via the file's buffered reader.
@@ -270,14 +305,14 @@ fn takeIntT(r: *std.Io.Reader, comptime T: type) !T {
 
 const testing = std.testing;
 
-const Value = union(enum) {
+pub const Value = union(enum) {
     str: []const u8,
     u32_v: u32,
     u64_v: u64,
     str_array: []const []const u8,
 };
 
-const KV = struct { key: []const u8, value: Value };
+pub const KV = struct { key: []const u8, value: Value };
 
 fn appendU32(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, v: u32) !void {
     var tmp: [4]u8 = undefined;
@@ -299,7 +334,7 @@ fn appendStr(buf: *std.ArrayList(u8), allocator: std.mem.Allocator, s: []const u
 const TensorInfo = struct { name: []const u8, ggml_type: u32 };
 
 /// Build a minimal but valid GGUF v3 header from a KV list, with no tensors.
-fn buildHeader(allocator: std.mem.Allocator, kvs: []const KV) ![]u8 {
+pub fn buildHeader(allocator: std.mem.Allocator, kvs: []const KV) ![]u8 {
     return buildHeaderWithTensors(allocator, kvs, &.{});
 }
 
@@ -483,31 +518,23 @@ test "parseInfo: skips string arrays between probe keys" {
     try testing.expectEqual(Engine.ds4, preferredEngine(info));
 }
 
-test "parseInfo: short-circuits once both keys found" {
-    // Add a malformed KV AFTER the two we care about. parseInfo must NOT
-    // reach it; reaching it would error. This pins the early-return.
-    // Build a header with a deliberately broken 3rd KV after the two we
-    // care about. parseInfo must NOT reach it; reaching it would error.
-    // This pins the early-return.
-    var bad: std.ArrayList(u8) = .empty;
-    defer bad.deinit(testing.allocator);
-    try bad.appendSlice(testing.allocator, "GGUF");
-    try appendU32(&bad, testing.allocator, 3);
-    try appendU64(&bad, testing.allocator, 0);
-    try appendU64(&bad, testing.allocator, 3); // kv_count=3
-    try appendStr(&bad, testing.allocator, "general.architecture");
-    try appendU32(&bad, testing.allocator, TY_STRING);
-    try appendStr(&bad, testing.allocator, "deepseek4");
-    try appendStr(&bad, testing.allocator, "deepseek4.attention.output_lora_rank");
-    try appendU32(&bad, testing.allocator, TY_U32);
-    try appendU32(&bad, testing.allocator, 1024);
-    // Third KV: bogus type 99 — would trip UnsupportedType if reached.
-    try appendStr(&bad, testing.allocator, "junk");
-    try appendU32(&bad, testing.allocator, 99);
-
-    var info = try parseBytes(testing.allocator, bad.items);
-    defer info.deinit(testing.allocator);
-    try testing.expectEqual(Engine.ds4, preferredEngine(info));
+test "preferredEngine: a split GGUF goes to llama.cpp, whatever its arch (#586)" {
+    // Split writers put `split.count` after every other key, the vocab included.
+    const tokens = [_][]const u8{ "<s>", "</s>" };
+    for ([_][]const u8{ "qwen4exp", "deepseek4", "llama" }) |arch| {
+        const bytes = try buildHeader(testing.allocator, &.{
+            .{ .key = "general.architecture", .value = .{ .str = arch } },
+            .{ .key = "deepseek4.attention.output_lora_rank", .value = .{ .u32_v = 1024 } },
+            .{ .key = "tokenizer.ggml.tokens", .value = .{ .str_array = &tokens } },
+            .{ .key = "split.no", .value = .{ .u32_v = 0 } },
+            .{ .key = "split.count", .value = .{ .u32_v = 4 } },
+        });
+        defer testing.allocator.free(bytes);
+        var info = try parseBytes(testing.allocator, bytes);
+        defer info.deinit(testing.allocator);
+        try testing.expectEqual(@as(u32, 4), info.split_count);
+        try testing.expectEqual(Engine.llama, preferredEngine(info));
+    }
 }
 
 test "parseInfo: bad magic → BadMagic" {
@@ -532,4 +559,28 @@ test "parseInfo: truncated mid-KV → Truncated" {
     std.mem.writeInt(u64, bytes[8..16], 0, .little); // tensor_count
     std.mem.writeInt(u64, bytes[16..24], 5, .little); // kv_count
     try testing.expectError(error.Truncated, parseBytes(testing.allocator, &bytes));
+}
+
+test "declaresPooling: an embedding GGUF names a pooling type, a chat GGUF does not" {
+    const cases = [_]struct { kvs: []const KV, want: bool }{
+        .{ .kvs = &.{
+            .{ .key = "general.architecture", .value = .{ .str = "gemma-embedding" } },
+            .{ .key = "gemma-embedding.pooling_type", .value = .{ .u32_v = 1 } },
+        }, .want = true },
+        .{ .kvs = &.{
+            .{ .key = "general.architecture", .value = .{ .str = "qwen35" } },
+            .{ .key = "qwen35.block_count", .value = .{ .u32_v = 32 } },
+            .{ .key = "tokenizer.ggml.model", .value = .{ .str = "gpt2" } },
+        }, .want = false },
+        .{ .kvs = &.{
+            .{ .key = "general.architecture", .value = .{ .str = "llama" } },
+            .{ .key = "llama.pooling_type", .value = .{ .u32_v = 0 } },
+        }, .want = false },
+    };
+    for (cases) |c| {
+        const bytes = try buildHeader(testing.allocator, c.kvs);
+        defer testing.allocator.free(bytes);
+        var r: std.Io.Reader = .fixed(bytes);
+        try testing.expectEqual(c.want, try declaresPooling(&r));
+    }
 }

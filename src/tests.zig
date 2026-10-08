@@ -1,8 +1,15 @@
 // Test root — imports all modules to run their embedded tests.
 // Run with: zig build test
 
+// pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
+pub const mlx = @import("mlx.zig");
+pub const io_util = @import("io_util.zig");
+pub const mtp_acceptance = @import("mtp_acceptance.zig");
+pub const log = @import("log.zig");
+
 test {
     _ = @import("log.zig");
+    _ = @import("arch/mlx_gguf.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
@@ -10,6 +17,7 @@ test {
     _ = @import("mtp_replay_test.zig");
     _ = @import("mtp_lookup.zig");
     _ = @import("server.zig");
+    _ = @import("generation_settings.zig");
     _ = @import("model.zig");
     _ = @import("generate.zig");
     _ = @import("transformer.zig");
@@ -20,6 +28,30 @@ test {
     _ = @import("mrope.zig");
     _ = @import("rht.zig");
     _ = @import("qmv2.zig");
+    _ = @import("moe_gather_ubench.zig");
+    _ = @import("moe_affine4.zig");
+    _ = @import("hc_decode2.zig");
+    _ = @import("qsa_mask.zig");
+    _ = @import("qsa_decode.zig");
+    _ = @import("rowqmv.zig");
+    _ = @import("simd_qmm.zig");
+    _ = @import("lane_qmm.zig");
+    _ = @import("lane_attn.zig");
+    _ = @import("add_norm.zig");
+    _ = @import("moe_fp4.zig");
+    _ = @import("mimo_mtp.zig");
+    _ = @import("glm_mtp.zig");
+    _ = @import("sushi_pack.zig");
+    _ = @import("dec_attn.zig");
+    _ = @import("nax_attention.zig");
+    _ = @import("glm5_next.zig");
+    _ = @import("kda_recurrence.zig");
+    _ = @import("gdn_decode.zig");
+    _ = @import("row_attn.zig");
+    _ = @import("keyed_sample.zig");
+    _ = @import("qmv_nax2.zig");
+    _ = @import("gather_qmm_nax.zig");
+    _ = @import("qmm_int8.zig");
     _ = @import("mtp_graft.zig");
     _ = @import("regex.zig");
     _ = @import("json_schema.zig");
@@ -37,10 +69,16 @@ test {
     _ = @import("mtp_group_planner.zig");
     _ = @import("diffusion.zig");
     _ = @import("deepseek_v4.zig");
+    _ = @import("dsv41_engram.zig");
+    _ = @import("nocache_reader.zig");
+    _ = @import("deepseek_v41.zig");
     _ = @import("qwen4_exp.zig");
     _ = @import("ple_gpu.zig");
     _ = @import("kokoro.zig");
     _ = @import("laya.zig");
+    _ = @import("kev.zig");
+    _ = @import("clef.zig");
+    _ = @import("clef_http_test.zig");
     _ = @import("kokoro_g2p.zig");
     _ = @import("tokenizer.zig");
     _ = @import("prefix_cache.zig");
@@ -84,7 +122,9 @@ test {
     _ = @import("hunyuan3d.zig");
     _ = @import("acestep.zig");
     _ = @import("music3.zig");
+    _ = @import("stable_audio.zig");
     _ = @import("uvwrap.zig");
+    _ = @import("mesh_simplify.zig");
     _ = @import("hunyuan3d_paint.zig");
     _ = @import("hunyuan3d_paint_unet.zig");
     _ = @import("rasterize.zig");

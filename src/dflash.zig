@@ -35,6 +35,8 @@ const transformer_mod = @import("transformer.zig");
 // MTP head — both sidecars shrink the SAME trunk lm_head for drafts only, and
 // one requantizer with one chunking discipline is the point.
 const mtp_mod = @import("mtp.zig");
+const simd_qmm = @import("simd_qmm.zig");
+const lane_qmm = @import("lane_qmm.zig");
 const ane_mod = @import("ane.zig");
 
 const Weights = model_mod.Weights;
@@ -149,6 +151,17 @@ fn dflashContractObject(root: std.json.ObjectMap) ?Contract {
     if (c.get("mask_token_id") == null) return null;
     if (c.get("target_layer_ids") == null) return null;
     return c;
+}
+
+/// The width a DFlash sidecar at `dir` is quantized to at load: 0 when it is
+/// not one, ships packed already (`quantization` in its config) or loads dense.
+pub fn sidecarQuantBits(io: std.Io, allocator: std.mem.Allocator, dir: []const u8) u32 {
+    const content = readConfigFile(io, allocator, dir) catch return 0;
+    defer allocator.free(content);
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return 0;
+    defer parsed.deinit();
+    if (parsed.value != .object or !isDflashConfigJson(parsed.value.object)) return 0;
+    return if (parsed.value.object.get("quantization") != null) 0 else quantBitsFromEnv();
 }
 
 /// Read `<dir>/config.json` and answer whether it declares DFlash. Any
@@ -371,6 +384,9 @@ pub fn validateTargetLayers(ids: []const u32, trunk_num_layers: u32) !void {
 /// drafts against the same mask token at any width. NAX-capable machines
 /// (M5-class) have a real M 8..16 lane and keep the checkpoint's block.
 pub const NO_WIDE_LANE_BLOCK_CAP: u32 = 5;
+pub const TREE_BLOCK_CAP: u32 = 8;
+/// Positions a draft tree's lattice spans on the tensor units.
+pub const TREE_NAX_BLOCK: u32 = 16;
 
 /// A no-wide-lane block cap with the machine row it came from, for the
 /// `DFlash drafter ready` line — a capped block must say WHY in tester logs.
@@ -392,7 +408,10 @@ pub const BlockCap = struct {
 /// silicon rows are one-liners (an M1 row lands when the user measures it).
 /// `chip` is sysctl machdep.cpu.brand_string ("Apple M3 Ultra"); the GPU
 /// arch string cannot tell Ultra from Max, hence the CPU brand.
-pub fn blockCapForMachine(chip: []const u8) BlockCap {
+/// `tree`: a DFlash2 draft-tree round (selector + `specTreeSupported`), whose
+/// wins on the 27B were all measured at block 8.
+pub fn blockCapForMachine(chip: []const u8, tree: bool) BlockCap {
+    if (tree) return .{ .cap = TREE_BLOCK_CAP, .label = "draft tree", .measured = true };
     if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return .{ .cap = 8, .label = "m3-ultra", .measured = true };
     // The DEFAULT VALUE and the M4 ROW are the same number doing two
     // different jobs: on an M4 it is the measured sweep at the top of this
@@ -451,12 +470,22 @@ pub const QUANT_GROUP: u32 = 64;
 /// `MLX_SERVE_DFLASH_QUANT_BITS`: absent → `DEFAULT_QUANT_BITS`, a supported
 /// affine width → that, anything else ("0", "off") → dense bf16.
 pub fn quantBitsFromEnv() u32 {
-    const p = std.c.getenv("MLX_SERVE_DFLASH_QUANT_BITS") orelse return DEFAULT_QUANT_BITS;
+    const p = std.c.getenv("MLX_SERVE_DFLASH_QUANT_BITS") orelse return defaultQuantBits(transformer_mod.verifyQmmNaxAvailable());
     const v = std.fmt.parseInt(u32, std.mem.span(p), 10) catch return 0;
     return switch (v) {
         2, 3, 4, 5, 6, 8 => v,
         else => 0,
     };
+}
+
+/// A NAX chip (M5) drafts faster from a 4-bit assistant; M1-M4 keep 8-bit.
+pub fn defaultQuantBits(nax: bool) u32 {
+    return if (nax) 4 else DEFAULT_QUANT_BITS;
+}
+
+test "defaultQuantBits: 4-bit assistant on NAX, 8-bit elsewhere" {
+    try testing.expectEqual(@as(u32, 4), defaultQuantBits(true));
+    try testing.expectEqual(DEFAULT_QUANT_BITS, defaultQuantBits(false));
 }
 
 /// Widest supported group that divides the contraction dim, or null when the
@@ -495,6 +524,18 @@ pub const DflashLinear = struct {
         if (!self.isQuantized()) {
             try mlx.check(mlx.mlx_matmul(&out, x, self.w, s));
             return out;
+        }
+        // Up to the lane kernels' row cap (a draft block, a round's kept
+        // captures, a window of context rows) they read each weight once for
+        // every row, where MLX's matmul falls off at 4..16 rows; drafts need
+        // speed, not bits.
+        const row = if (transformer_mod.naxAvailable())
+            try lane_qmm.qmm(x, self.w, self.scales, self.biases, self.bits, self.group_size, s)
+        else
+            try simd_qmm.qmm(x, self.w, self.scales, self.biases, self.bits, self.group_size, s);
+        if (row) |y| {
+            _ = mlx.mlx_array_free(out);
+            return y;
         }
         try mlx.check(mlx.mlx_quantized_matmul(
             &out,
@@ -697,6 +738,7 @@ pub const DflashModel = struct {
 
     pub fn deinit(self: *DflashModel) void {
         const allocator = self.allocator;
+        lane_qmm.release(@intFromPtr(self));
         if (self.selector) |*sel| sel.deinit();
         if (self.markov) |*mh| mh.deinit();
         if (self.draft_head) |*dh| dh.deinit();
@@ -706,6 +748,33 @@ pub const DflashModel = struct {
         for (self.layers) |*lw| lw.deinit();
         allocator.free(self.layers);
         self.config.deinit(allocator);
+    }
+
+    /// Re-orders every 4-bit linear into the lane kernel's tiled layout in its
+    /// own buffer (NAX only; no copy stays resident). From then on they are
+    /// read through `lane_qmm` alone, as `DflashLinear.apply` does, and that
+    /// read is bf16-only: a trunk in another activation dtype (`act`) keeps
+    /// MLX's layout.
+    pub fn tileLaneWeights(self: *DflashModel, act: mlx.mlx_dtype, s: mlx.mlx_stream) !u64 {
+        if (!transformer_mod.naxAvailable() or act != .bfloat16) return 0;
+        try mlx.check(mlx.mlx_synchronize(s));
+        const owner = @intFromPtr(self);
+        var bytes: u64 = 0;
+        const Tile = struct {
+            fn one(own: usize, lin: *const DflashLinear, st: mlx.mlx_stream) !u64 {
+                return lane_qmm.tileInPlace(own, lin.w, lin.scales, lin.biases, lin.bits, lin.group_size, &.{}, st);
+            }
+        };
+        bytes += try Tile.one(owner, &self.fc, s);
+        for (self.layers) |*lw| {
+            for ([_]*const DflashLinear{ &lw.q, &lw.k, &lw.v, &lw.o, &lw.gate, &lw.up, &lw.down }) |lin| bytes += try Tile.one(owner, lin, s);
+            inline for (.{ lw.attention_conv, lw.mlp_conv }) |conv| if (conv) |c| {
+                bytes += try Tile.one(owner, &c.kernel_projection, s);
+            };
+        }
+        if (self.selector) |*sel| bytes += try Tile.one(owner, &sel.hidden_projection, s);
+        if (self.markov) |*mh| bytes += try Tile.one(owner, &mh.w2, s);
+        return bytes;
     }
 
     /// Validate compatibility with the target trunk. The assistant borrows
@@ -749,6 +818,7 @@ pub const DflashModel = struct {
             });
             return error.DflashTargetMismatch;
         }
+        target.config.dflash_bound = true;
         self.buildDraftHead(target, draftHeadBitsFromEnv()) catch |err| {
             log.warn("[dflash] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
         };
@@ -854,6 +924,11 @@ pub const DflashModel = struct {
                 "affine",
                 self.s,
             ));
+        } else if (target.config.draftVocab() > 0) {
+            out = try target.lmHeadRowsForDraft(x, target.config.draftVocab());
+        } else if (target.rht != null) {
+            // bf16 drafter over an f16 pack: uncast, the head product runs in f32.
+            out = try target.hadamardLmHead(x);
         } else {
             out = try target.lmHeadForDraft(x);
         }
@@ -927,13 +1002,23 @@ fn ownWeightEither(w: *const Weights, key: []const u8, alt: []const u8) !mlx.mlx
     return ownWeight(w, alt);
 }
 
+/// The selector gathers codebook rows with a dense take, so a table shipped
+/// quantized (packed uint32 rows) is refused here instead of failing every draft.
+fn checkCodebook(arr: mlx.mlx_array, which: []const u8, rank: u32) !void {
+    const sh = mlx.getShape(arr);
+    if (sh.len == 2 and sh[1] == @as(c_int, @intCast(rank))) return;
+    log.err("[dflash] candidate_selector.{s}_codebook is {any} {s}, expected [vocab, {d}]: " ++
+        "re-export the drafter with its codebooks left unquantized (bf16)\n", .{ which, sh, @tagName(mlx.mlx_array_dtype(arr)), rank });
+    return error.InvalidDflashCodebook;
+}
+
 /// Load `<prefix>.weight` as an assistant linear. A checkpoint that already
 /// ships `<prefix>.scales` is served packed as-is (affine only — its true
 /// params are solved from the packed geometry, never assumed); a dense bf16
 /// weight is quantized to `bits` when the contraction dim allows it and
 /// pre-transposed for a plain matmul otherwise.
 fn loadLinear(
-    w: *const Weights,
+    w: *Weights,
     prefix: []const u8,
     in_features: u32,
     bits: u32,
@@ -959,11 +1044,23 @@ fn loadLinear(
     }
 
     var kb: [256]u8 = undefined;
-    const raw = try ownWeight(w, try std.fmt.bufPrint(&kb, "{s}.weight", .{prefix}));
+    const wkey = try std.fmt.bufPrint(&kb, "{s}.weight", .{prefix});
+    const raw = try ownWeight(w, wkey);
     defer _ = mlx.mlx_array_free(raw);
 
     if (bits != 0) {
-        if (quantGroupFor(in_features)) |group| return quantizeDense(raw, bits, group, s);
+        if (quantGroupFor(in_features)) |group| {
+            var q = try quantizeDense(raw, bits, group, s);
+            errdefer q.deinit();
+            // Materialize now and drop the map's handle, so the load peaks at
+            // one bf16 tensor, not the whole checkpoint.
+            const vec = mlx.mlx_vector_array_new();
+            defer _ = mlx.mlx_vector_array_free(vec);
+            q.appendEval(vec);
+            try mlx.check(mlx.mlx_eval(vec));
+            w.replace(wkey, mlx.mlx_array_new());
+            return q;
+        }
     }
     var transposed = mlx.mlx_array_new();
     errdefer _ = mlx.mlx_array_free(transposed);
@@ -1082,6 +1179,8 @@ pub fn loadDflashQuant(
         errdefer _ = mlx.mlx_array_free(pred);
         const succ = try ownWeightEither(&weights, "candidate_selector.successor_codebook", "candidate_selector.successor_codebook.weight");
         errdefer _ = mlx.mlx_array_free(succ);
+        try checkCodebook(pred, "predecessor", cfg.selector_rank);
+        try checkCodebook(succ, "successor", cfg.selector_rank);
         const hp = try loadLinear(&weights, "candidate_selector.hidden_projection", hidden, bits, s);
         selector = .{ .pred_codebook = pred, .succ_codebook = succ, .hidden_projection = hp };
     }
@@ -1115,6 +1214,9 @@ pub fn loadDflashQuant(
         if (markov) |*mh| mh.appendEval(eval_vec);
         _ = mlx.mlx_eval(eval_vec);
     }
+    // Hand the bf16 sources the load-time quantization freed back to the OS
+    // instead of leaving them in MLX's buffer pool.
+    _ = mlx.mlx_clear_cache();
 
     if (fc.isQuantized()) {
         log.info("[dflash] loaded {d} layers, hidden={d}, block_size={d}, targets={any}, weights={d}-bit/gs{d}\n", .{
@@ -1154,7 +1256,7 @@ pub fn loadDflashQuant(
 /// for layer `li`. Both weights are REQUIRED once the config declares
 /// `conv_kernel_size` — a DFlash2 pack missing them is a broken download.
 fn loadDynConv(
-    w: *const Weights,
+    w: *Weights,
     li: u32,
     comptime which: []const u8,
     hidden: u32,
@@ -1370,11 +1472,89 @@ fn buildBlockMask(
 /// block. `base` is per-CHANNEL `[ksize, H]`; `dynamic` is per-GROUP
 /// `[1, L, ksize, groups]`, each coefficient broadcasting over `group_size`
 /// channels. Two separate multiply-adds per tap keep the reference's bf16
-/// rounding order.
+/// rounding order. One kernel on the GPU (`dynConvFused`), the op chain
+/// elsewhere.
 pub fn groupedDynConv(
     hidden: mlx.mlx_array, // [1, L, H]
     dynamic: mlx.mlx_array, // [1, L, ksize, groups]
     base: mlx.mlx_array, // [ksize, H]
+    group_size: u32,
+    s: mlx.mlx_stream,
+) !mlx.mlx_array {
+    if (try dynConvFused(hidden, dynamic, base, group_size, s)) |y| return y;
+    return groupedDynConvOps(hidden, dynamic, base, group_size, s);
+}
+
+// Each tap adds base[tap] * x_{t-tap}, then dyn_t[tap] * x_{t-tap}, every
+// product and sum rounded to T as the op chain's elementwise kernels do.
+const DYN_CONV_SOURCE =
+    \\uint i = thread_position_in_grid.x;
+    \\if (i >= uint(L * H)) return;
+    \\const int t = int(i) / H, c = int(i) % H;
+    \\T acc = T(0);
+    \\for (int tap = 0; tap < KS; ++tap) {
+    \\  const T v = t >= tap ? x[(t - tap) * H + c] : T(0);
+    \\  acc = T(float(acc) + float(T(float(base[tap * H + c]) * float(v))));
+    \\  acc = T(float(acc) + float(T(float(dyn[(t * KS + tap) * (H / GS) + c / GS]) * float(v))));
+    \\}
+    \\y[i] = acc;
+;
+var dyn_conv_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const DynConvKey = struct { l: c_int, h: c_int, ks: c_int, gs: c_int, dt: mlx.mlx_dtype };
+var dyn_conv_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var dyn_conv_key: ?DynConvKey = null;
+
+fn dynConvFused(hidden: mlx.mlx_array, dynamic: mlx.mlx_array, base: mlx.mlx_array, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
+    if (!mlx.streamIsGpu(s)) return null;
+    const dt = mlx.mlx_array_dtype(hidden);
+    if (mlx.mlx_array_dtype(dynamic) != dt or mlx.mlx_array_dtype(base) != dt) return null;
+    const hsh = mlx.getShape(hidden);
+    const bsh = mlx.getShape(base);
+    const dsh = mlx.getShape(dynamic);
+    if (hsh.len != 3 or hsh[0] != 1 or bsh.len != 2 or dsh.len != 4) return null;
+    const gs: c_int = @intCast(group_size);
+    const key = DynConvKey{ .l = hsh[1], .h = hsh[2], .ks = bsh[0], .gs = gs, .dt = dt };
+    if (@rem(key.h, gs) != 0 or bsh[1] != key.h or dsh[0] != 1 or dsh[1] != key.l or dsh[2] != key.ks or dsh[3] != @divExact(key.h, gs)) return null;
+    if (dyn_conv_kernel == null) {
+        const ins = [_][*:0]const u8{ "x", "dyn", "base" };
+        const outs = [_][*:0]const u8{"y"};
+        const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const k = mlx.mlx_fast_metal_kernel_new("msv_dflash_dyn_conv", in_vec, out_vec, DYN_CONV_SOURCE, "", true, false);
+        if (k.ctx == null) return error.MetalKernelCompileFailed;
+        dyn_conv_kernel = k;
+    }
+    if (dyn_conv_key == null or !std.meta.eql(dyn_conv_key.?, key)) {
+        if (dyn_conv_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        dyn_conv_cfg = null;
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.l, key.h }, 3, dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, key.l * key.h, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+        inline for (.{ .{ "L", key.l }, .{ "H", key.h }, .{ "KS", key.ks }, .{ "GS", key.gs } }) |kv|
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, kv[0], kv[1]));
+        dyn_conv_cfg = cfg;
+        dyn_conv_key = key;
+    }
+    const ins = [_]mlx.mlx_array{ hidden, dynamic, base };
+    const vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, dyn_conv_kernel.?, vec, dyn_conv_cfg.?, s));
+    var y = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_vector_array_get(&y, outs, 0));
+    return y;
+}
+
+fn groupedDynConvOps(
+    hidden: mlx.mlx_array,
+    dynamic: mlx.mlx_array,
+    base: mlx.mlx_array,
     group_size: u32,
     s: mlx.mlx_stream,
 ) !mlx.mlx_array {
@@ -1543,6 +1723,7 @@ fn baseKernelHalf(base_kernel: mlx.mlx_array, half: c_int, s: mlx.mlx_stream) !m
 
 // ── DFlash2 path selector (forward + host trace) ──
 
+
 pub const SelectedPath = struct {
     ids: []u32, // [m] chosen draft token ids
     chosen_idx: []u32, // [m] index of the choice within its candidate row
@@ -1560,27 +1741,133 @@ pub const SelectedPath = struct {
     }
 };
 
-/// Reference `CandidateSelector.select`: top-k candidates per position by
-/// draft logit; score adjacent pairs `S_t(a,b) = U_t(b) + <pred(a) ⊙ H(h_t),
-/// succ(b)>`; trace the best (or sampled) path from the anchor. All pairwise
-/// edge scores are precomputed in ONE batched GPU dispatch ([m-1, k, k] +
-/// the anchor row) and the 16-wide trace runs on host — same math as the
-/// reference's sequential loop, chosen path identical, no per-step sync.
-///
-/// `blk_hidden` is the POST-final-norm block hidden `[1, bs, H]` (row 0 =
-/// anchor, dropped here — the reference's `logits_start=1`); `draft_logits`
-/// already has the anchor row dropped (`[1, m, V]`).
-pub fn selectPath(
+/// The selector's candidate lattice on the host: `cands`/`unary` `[m, k]`
+/// (candidate ids and their draft logits per position), `e0` `[k]` the anchor's
+/// edges to position 0, `e` `[m-1, k, k]` edges between adjacent positions.
+pub const Lattice = struct {
+    m: usize,
+    k: usize,
+    cands: []i32,
+    unary: []f32,
+    e0: []f32,
+    e: []f32,
+
+    pub fn deinit(self: *Lattice, allocator: std.mem.Allocator) void {
+        allocator.free(self.cands);
+        if (self.unary.len > 0) allocator.free(self.unary);
+        if (self.e0.len > 0) allocator.free(self.e0);
+        if (self.e.len > 0) allocator.free(self.e);
+    }
+};
+
+// Top K of each row in one threadgroup: every thread keeps its own sorted K
+// (a compare-and-select chain), each simdgroup merges its lanes' lists, then
+// simdgroup 0 merges the NT / 32 lists. Equal values go to the lower index
+// within a thread's own list; across lanes the lower lane wins, so a tie can
+// pick the higher id (drafts only).
+// 256 threads: M1/M2 cap threadgroups below 1024 for kernels this heavy.
+const TOPK_SOURCE =
+    \\constexpr int NT = 256, NSG = NT / 32;
+    \\const uint row = threadgroup_position_in_grid.y;
+    \\const uint tid = thread_position_in_threadgroup.x;
+    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
+    \\const device T* x = logits + size_t(row) * V;
+    \\float v[K];
+    \\int id[K];
+    \\for (int j = 0; j < K; ++j) { v[j] = -INFINITY; id[j] = 0; }
+    \\for (int i = int(tid); i < V; i += NT) {
+    \\  float c = float(x[i]);
+    \\  if (!(c > v[K - 1])) continue;
+    \\  int ci = i;
+    \\  for (int j = 0; j < K; ++j) {
+    \\    const bool gt = c > v[j];
+    \\    const float tv = v[j]; const int ti = id[j];
+    \\    v[j] = gt ? c : tv; id[j] = gt ? ci : ti;
+    \\    c = gt ? tv : c; ci = gt ? ti : ci;
+    \\  }
+    \\}
+    \\threadgroup float sv[NSG * K];
+    \\threadgroup int si[NSG * K];
+    \\for (int r = 0; r < K; ++r) {
+    \\  const float best = simd_max(v[0]);
+    \\  const uint win = simd_min(v[0] == best ? lane : 64u);
+    \\  const int bid = simd_shuffle(id[0], ushort(win));
+    \\  if (lane == 0) { sv[sg * K + r] = best; si[sg * K + r] = bid; }
+    \\  if (lane == win) { for (int j = 0; j + 1 < K; ++j) { v[j] = v[j + 1]; id[j] = id[j + 1]; } v[K - 1] = -INFINITY; }
+    \\}
+    \\threadgroup_barrier(mem_flags::mem_threadgroup);
+    \\if (sg != 0) return;
+    \\for (int j = 0; j < K; ++j) { v[j] = lane < NSG ? sv[lane * K + j] : -INFINITY; id[j] = lane < NSG ? si[lane * K + j] : 0; }
+    \\for (int r = 0; r < K; ++r) {
+    \\  const float best = simd_max(v[0]);
+    \\  const uint win = simd_min(v[0] == best ? lane : 64u);
+    \\  const int bid = simd_shuffle(id[0], ushort(win));
+    \\  if (lane == 0) { idx[row * K + r] = bid; val[row * K + r] = best; }
+    \\  if (lane == win) { for (int j = 0; j + 1 < K; ++j) { v[j] = v[j + 1]; id[j] = id[j + 1]; } v[K - 1] = -INFINITY; }
+    \\}
+;
+var topk_kernel: ?mlx.mlx_fast_metal_kernel = null;
+const TopKKey = struct { m: c_int, v: c_int, k: c_int, dt: mlx.mlx_dtype };
+var topk_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
+var topk_key: ?TopKKey = null;
+
+/// Each row's top `k` of `logits` [1, M, V]: ids [1, M, k] int32 and values
+/// [1, M, k] f32, largest first. Null off the GPU or past 32 per row.
+fn topKRows(logits: mlx.mlx_array, k: usize, s: mlx.mlx_stream) !?[2]mlx.mlx_array {
+    if (!mlx.streamIsGpu(s) or k == 0 or k > 32) return null;
+    const sh = mlx.getShape(logits);
+    const dt = mlx.mlx_array_dtype(logits);
+    if (sh.len != 3 or sh[0] != 1 or sh[2] < 256 * @as(c_int, @intCast(k)) or (dt != .bfloat16 and dt != .float16 and dt != .float32)) return null;
+    const key = TopKKey{ .m = sh[1], .v = sh[2], .k = @intCast(k), .dt = dt };
+    if (topk_kernel == null) {
+        const ins = [_][*:0]const u8{"logits"};
+        const outs = [_][*:0]const u8{ "idx", "val" };
+        const in_vec = mlx.mlx_vector_string_new_data(&ins, ins.len);
+        defer _ = mlx.mlx_vector_string_free(in_vec);
+        const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
+        defer _ = mlx.mlx_vector_string_free(out_vec);
+        const kern = mlx.mlx_fast_metal_kernel_new("msv_dflash_topk_rows", in_vec, out_vec, TOPK_SOURCE, "", true, false);
+        if (kern.ctx == null) return error.MetalKernelCompileFailed;
+        topk_kernel = kern;
+    }
+    if (topk_key == null or !std.meta.eql(topk_key.?, key)) {
+        if (topk_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
+        topk_cfg = null;
+        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.m, key.k }, 3, .int32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &[_]c_int{ 1, key.m, key.k }, 3, .float32));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 256, key.m, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", dt));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "V", key.v));
+        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "K", key.k));
+        topk_cfg = cfg;
+        topk_key = key;
+    }
+    const ins = [_]mlx.mlx_array{logits};
+    const vec = mlx.mlx_vector_array_new_data(&ins, ins.len);
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var outs = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(outs);
+    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, topk_kernel.?, vec, topk_cfg.?, s));
+    var out: [2]mlx.mlx_array = .{ mlx.mlx_array_new(), mlx.mlx_array_new() };
+    errdefer for (out) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&out, 0..) |*a, i| try mlx.check(mlx.mlx_vector_array_get(a, outs, i));
+    return out;
+}
+
+pub fn lattice(
     allocator: std.mem.Allocator,
     sel: *const Selector,
     top_k: u32,
     blk_hidden: mlx.mlx_array,
     draft_logits: mlx.mlx_array,
     anchor_id: u32,
-    temperature: f32,
-    rand: std.Random,
     s: mlx.mlx_stream,
-) !SelectedPath {
+) !Lattice {
     const dl_shape = mlx.getShape(draft_logits);
     const m: usize = @intCast(dl_shape[1]);
     const vocab: c_int = dl_shape[2];
@@ -1593,7 +1880,12 @@ pub fn selectPath(
     defer _ = mlx.mlx_array_free(cands_i32);
     var unary_f32 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(unary_f32);
-    {
+    if (try topKRows(draft_logits, k, s)) |top| {
+        _ = mlx.mlx_array_free(cands_i32);
+        _ = mlx.mlx_array_free(unary_f32);
+        cands_i32 = top[0];
+        unary_f32 = top[1];
+    } else {
         var part = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(part);
         try mlx.check(mlx.mlx_argpartition_axis(&part, draft_logits, vocab - @as(c_int, @intCast(k)), 2, s));
@@ -1754,10 +2046,182 @@ pub fn selectPath(
     const cand_data = mlx.mlx_array_data_int32(cands_i32) orelse return error.MlxArrayDataNull;
     const unary_data = mlx.mlx_array_data_float32(unary_f32) orelse return error.MlxArrayDataNull;
     const e0_data = mlx.mlx_array_data_float32(e0_f32) orelse return error.MlxArrayDataNull;
-    const e_data: ?[*]const f32 = if (e_f32.ctx != null)
-        (mlx.mlx_array_data_float32(e_f32) orelse return error.MlxArrayDataNull)
-    else
-        null;
+    var lat = Lattice{ .m = m, .k = k, .cands = try allocator.dupe(i32, cand_data[0 .. m * k]), .unary = &.{}, .e0 = &.{}, .e = &.{} };
+    errdefer lat.deinit(allocator);
+    lat.unary = try allocator.dupe(f32, unary_data[0 .. m * k]);
+    lat.e0 = try allocator.dupe(f32, e0_data[0..k]);
+    if (e_f32.ctx != null) {
+        const e_data = mlx.mlx_array_data_float32(e_f32) orelse return error.MlxArrayDataNull;
+        lat.e = try allocator.dupe(f32, e_data[0 .. (m - 1) * k * k]);
+    }
+    return lat;
+
+}
+
+/// A best-first draft tree over the lattice: node values are path sums of
+/// log-softmax((unary + edge_w * pairwise) / temperature / tau) over siblings,
+/// the `children` best candidates of each expanded node queued, the best queued
+/// node taken next. Parameters follow TensorFold's fit (MIT): the head's raw
+/// scores are overconfident and its pairwise term too strong.
+pub const TreeParams = struct {
+    max_nodes: usize,
+    children: usize = 4,
+    tau: f32 = 1.5,
+    edge_w: f32 = 0.6,
+    temperature: f32 = 1.0,
+    /// `[m, k]` Gumbel noise the verify rows draw at the candidates, weighted
+    /// into the scores (null for a greedy target).
+    noise: ?[]const f32 = null,
+    noise_w: f32 = 0.7,
+};
+
+/// Nodes in the order taken (a parent always before its children): `tokens`,
+/// `parents` (node index, -1 = under the anchor) and `depth` (0 = position 0).
+pub const DraftTree = struct {
+    tokens: []u32,
+    parents: []i32,
+    depth: []u32,
+
+    pub fn deinit(self: *DraftTree, allocator: std.mem.Allocator) void {
+        allocator.free(self.tokens);
+        allocator.free(self.parents);
+        allocator.free(self.depth);
+    }
+};
+
+pub fn bestFirstTree(allocator: std.mem.Allocator, lat: *const Lattice, p: TreeParams) !DraftTree {
+    const k = lat.k;
+    const Item = struct { value: f32, parent: i32, depth: u32, cand: u32 };
+    var queue: std.ArrayList(Item) = .empty;
+    defer queue.deinit(allocator);
+    var tree = DraftTree{ .tokens = try allocator.alloc(u32, p.max_nodes), .parents = try allocator.alloc(i32, p.max_nodes), .depth = try allocator.alloc(u32, p.max_nodes) };
+    errdefer tree.deinit(allocator);
+    var scores: [64]f32 = undefined;
+    std.debug.assert(k <= scores.len);
+
+    // Children of a node (or the anchor, cand == null) at `depth`, pushed as log-softmax + parent value.
+    const Push = struct {
+        fn run(alloc: std.mem.Allocator, q: *std.ArrayList(Item), l: *const Lattice, sc: []f32, pp: TreeParams, parent: i32, parent_cand: ?u32, depth: u32, base: f32) !void {
+            const kk = l.k;
+            const t = @max(pp.temperature, 1e-6);
+            var mx: f32 = -std.math.inf(f32);
+            for (sc, 0..) |*v, j| {
+                const edge = if (parent_cand) |a| l.e[(@as(usize, depth) - 1) * kk * kk + a * kk + j] else l.e0[j];
+                var raw = (l.unary[@as(usize, depth) * kk + j] + pp.edge_w * edge) / t;
+                if (pp.noise) |nz| raw += pp.noise_w * nz[@as(usize, depth) * kk + j];
+                v.* = raw / pp.tau;
+                mx = @max(mx, v.*);
+            }
+            var total: f32 = 0;
+            for (sc) |v| total += @exp(v - mx);
+            const lse = mx + @log(total);
+            var taken: [64]bool = @splat(false);
+            for (0..@min(pp.children, kk)) |_| {
+                var best: usize = 0;
+                var best_v: f32 = -std.math.inf(f32);
+                for (sc, 0..) |v, j| if (!taken[j] and v > best_v) {
+                    best_v = v;
+                    best = j;
+                };
+                taken[best] = true;
+                try q.append(alloc, .{ .value = base + best_v - lse, .parent = parent, .depth = depth, .cand = @intCast(best) });
+            }
+        }
+    };
+    try Push.run(allocator, &queue, lat, scores[0..k], p, -1, null, 0, 0);
+    var n: usize = 0;
+    while (n < p.max_nodes and queue.items.len > 0) {
+        var bi: usize = 0;
+        for (queue.items, 0..) |it, i| if (it.value > queue.items[bi].value) {
+            bi = i;
+        };
+        const it = queue.swapRemove(bi);
+        tree.tokens[n] = @intCast(lat.cands[@as(usize, it.depth) * k + it.cand]);
+        tree.parents[n] = it.parent;
+        tree.depth[n] = it.depth;
+        if (it.depth + 1 < lat.m) try Push.run(allocator, &queue, lat, scores[0..k], p, @intCast(n), it.cand, it.depth + 1, it.value);
+        n += 1;
+    }
+    if (n < p.max_nodes) {
+        tree.tokens = try allocator.realloc(tree.tokens, n);
+        tree.parents = try allocator.realloc(tree.parents, n);
+        tree.depth = try allocator.realloc(tree.depth, n);
+    }
+    try preorder(allocator, &tree);
+    return tree;
+}
+
+/// Renumber the nodes depth-first, each node's children in the order they
+/// were taken (best first): the likeliest path lands on consecutive rows, so
+/// a round that keeps it moves no KV rows.
+fn preorder(allocator: std.mem.Allocator, t: *DraftTree) !void {
+    const n = t.tokens.len;
+    if (n == 0) return;
+    const order = try allocator.alloc(usize, n);
+    defer allocator.free(order);
+    const new_index = try allocator.alloc(i32, n);
+    defer allocator.free(new_index);
+    var stack: std.ArrayList(i32) = .empty;
+    defer stack.deinit(allocator);
+    var out: usize = 0;
+    // Roots (parent -1) in taken order, visited depth-first.
+    var root_i: usize = n;
+    while (root_i > 0) {
+        root_i -= 1;
+        if (t.parents[root_i] < 0) try stack.append(allocator, @intCast(root_i));
+    }
+    while (stack.pop()) |node| {
+        order[out] = @intCast(node);
+        new_index[@intCast(node)] = @intCast(out);
+        out += 1;
+        var c: usize = n;
+        while (c > 0) {
+            c -= 1;
+            if (t.parents[c] == node) try stack.append(allocator, @intCast(c));
+        }
+    }
+    const tokens = try allocator.dupe(u32, t.tokens);
+    defer allocator.free(tokens);
+    const parents = try allocator.dupe(i32, t.parents);
+    defer allocator.free(parents);
+    const depth = try allocator.dupe(u32, t.depth);
+    defer allocator.free(depth);
+    for (order, 0..) |old, i| {
+        t.tokens[i] = tokens[old];
+        t.depth[i] = depth[old];
+        t.parents[i] = if (parents[old] < 0) -1 else new_index[@intCast(parents[old])];
+    }
+}
+
+/// Reference `CandidateSelector.select`: top-k candidates per position by
+/// draft logit; score adjacent pairs `S_t(a,b) = U_t(b) + <pred(a) ⊙ H(h_t),
+/// succ(b)>`; trace the best (or sampled) path from the anchor. All pairwise
+/// edge scores are precomputed in ONE batched GPU dispatch ([m-1, k, k] +
+/// the anchor row) and the 16-wide trace runs on host — same math as the
+/// reference's sequential loop, chosen path identical, no per-step sync.
+///
+/// `blk_hidden` is the POST-final-norm block hidden `[1, bs, H]` (row 0 =
+/// anchor, dropped here — the reference's `logits_start=1`); `draft_logits`
+/// already has the anchor row dropped (`[1, m, V]`).
+pub fn selectPath(
+    allocator: std.mem.Allocator,
+    sel: *const Selector,
+    top_k: u32,
+    blk_hidden: mlx.mlx_array,
+    draft_logits: mlx.mlx_array,
+    anchor_id: u32,
+    temperature: f32,
+    rand: std.Random,
+    s: mlx.mlx_stream,
+) !SelectedPath {
+    var lat = try lattice(allocator, sel, top_k, blk_hidden, draft_logits, anchor_id, s);
+    defer lat.deinit(allocator);
+    const m = lat.m;
+    const k = lat.k;
+    const cand_data = lat.cands;
+    const unary_data = lat.unary;
+    const e0_data = lat.e0;
+    const e_data: ?[]const f32 = if (lat.e.len > 0) lat.e else null;
 
     const stochastic = temperature > 0;
     var out = SelectedPath{
@@ -1848,6 +2312,20 @@ pub fn appendContext(
     }
 }
 
+/// A copy of `x` in `like`'s dtype. An f16 trunk (Hadamard packs) feeding a
+/// bf16 drafter otherwise promotes every drafter op to f32, off the row lanes.
+fn toDrafterDtype(x: mlx.mlx_array, like: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+    var out = mlx.mlx_array_new();
+    errdefer _ = mlx.mlx_array_free(out);
+    const dt = mlx.mlx_array_dtype(like);
+    if (mlx.mlx_array_dtype(x) == dt) {
+        try mlx.check(mlx.mlx_array_set(&out, x));
+    } else {
+        try mlx.check(mlx.mlx_astype(&out, x, dt, s));
+    }
+    return out;
+}
+
 /// Encoder projection: concatenate the trunk captures on features →
 /// `encoder.fc` → RMS norm. Returns `[1, n, hidden]`, caller frees.
 pub fn encodeContext(model: *const DflashModel, captures: []const mlx.mlx_array) !mlx.mlx_array {
@@ -1861,7 +2339,9 @@ pub fn encodeContext(model: *const DflashModel, captures: []const mlx.mlx_array)
         for (captures) |c| _ = mlx.mlx_vector_array_append_value(vec, c);
         try mlx.check(mlx.mlx_concatenate_axis(&cat, vec, 2, s));
     }
-    const projected = try model.fc.apply(cat, s);
+    const cast = try toDrafterDtype(cat, model.enc_norm, s);
+    defer _ = mlx.mlx_array_free(cast);
+    const projected = try model.fc.apply(cast, s);
     defer _ = mlx.mlx_array_free(projected);
     return rmsNormFn(projected, model.enc_norm, model.config.rms_norm_eps, s);
 }
@@ -1911,8 +2391,7 @@ pub fn forwardBlock(
     const none_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(none_mask);
 
-    var x = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_array_set(&x, noise_embeds));
+    var x = try toDrafterDtype(noise_embeds, model.enc_norm, s);
     errdefer _ = mlx.mlx_array_free(x);
 
     for (model.layers, 0..) |*lw, li| {
@@ -1942,8 +2421,30 @@ pub fn forwardBlock(
 
         // Append block K/V into spare capacity; the view spans ctx + block.
         const view = try ctx.cache.update(@intCast(li), bk, bv, s, 0);
+        // A sliding layer never sees context before the first query's window:
+        // attend over the rest, so the cost stops growing with the context.
+        const skip: usize = if (lw.layer_type == .sliding_attention)
+            @min(ctx_len, (anchor_pos -| (cfg.sliding_window - 1)) -| ctx.base_pos)
+        else
+            0;
+        var kv_k = view.k;
+        var kv_v = view.v;
+        var cut: [2]mlx.mlx_array = .{ .{ .ctx = null }, .{ .ctx = null } };
+        defer for (cut) |a| if (a.ctx != null) {
+            _ = mlx.mlx_array_free(a);
+        };
+        if (skip > 0) {
+            const sh = mlx.getShape(view.k);
+            const lo: c_int = @intCast(skip);
+            for ([_]mlx.mlx_array{ view.k, view.v }, &cut) |src, *dst| {
+                dst.* = mlx.mlx_array_new();
+                try mlx.check(mlx.mlx_slice(dst, src, &[_]c_int{ 0, 0, lo, 0 }, 4, &[_]c_int{ sh[0], sh[1], sh[2], sh[3] }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, s));
+            }
+            kv_k = cut[0];
+            kv_v = cut[1];
+        }
 
-        const mask = try buildBlockMask(lw.layer_type, ctx.base_pos, ctx_len, anchor_pos, q_len, cfg.sliding_window, s);
+        const mask = try buildBlockMask(lw.layer_type, ctx.base_pos + skip, ctx_len - skip, anchor_pos, q_len, cfg.sliding_window, s);
         defer if (mask) |m| {
             _ = mlx.mlx_array_free(m);
         };
@@ -1951,9 +2452,9 @@ pub fn forwardBlock(
         var attn_out = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(attn_out);
         if (mask) |m| {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "array", m, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "array", m, .{ .ctx = null }, false, s));
         } else {
-            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, view.k, view.v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
+            try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q, kv_k, kv_v, attn_scale, "", none_mask, .{ .ctx = null }, false, s));
         }
 
         var attn_t = mlx.mlx_array_new();
@@ -2365,12 +2866,14 @@ test "dflash: per-silicon cap table — M3 Ultra rides oMLX's block-8 evidence" 
     // GPU arch cannot tell Ultra from Max). M3 Ultra -> 8 (oMLX PR #2850:
     // 1.33-1.43x at block 8 on the same pairing); everything else without a
     // wide lane keeps the M4-measured default.
-    const ultra = blockCapForMachine("Apple M3 Ultra");
+    const ultra = blockCapForMachine("Apple M3 Ultra", false);
     try testing.expectEqual(@as(u32, 8), ultra.cap);
     try testing.expectEqualStrings("m3-ultra", ultra.label);
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M4 Max").cap);
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M3 Max").cap);
-    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("").cap);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M4 Max", false).cap);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("Apple M3 Max", false).cap);
+    try testing.expectEqual(NO_WIDE_LANE_BLOCK_CAP, blockCapForMachine("", false).cap);
+    // A draft-tree round on an M4 was measured at 8.
+    try testing.expectEqual(@as(u32, 8), blockCapForMachine("Apple M4 Max", true).cap);
     // Resolution with the M3 Ultra row: a block-16 checkpoint caps at 8, a
     // block-8 one is left alone.
     try testing.expectEqual(@as(u32, 8), resolveBlockSize(16, 4, false, false, ultra.cap));
@@ -2630,7 +3133,9 @@ pub const TinyFix = struct {
         return bf;
     }
 
-    pub fn writeAssistant2(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream) !void {
+    /// `packed_codebooks` writes the selector codebooks 4-bit quantized, the
+    /// shape a generic converter produces.
+    pub fn writeAssistant2(io: std.Io, dir: std.Io.Dir, dir_path: []const u8, s: mlx.mlx_stream, packed_codebooks: bool) !void {
         try dir.writeFile(io, .{ .sub_path = "config.json", .data = ASSISTANT2_CONFIG });
         const st_path = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir_path}, 0);
         defer testing.allocator.free(st_path);
@@ -2641,8 +3146,20 @@ pub const TinyFix = struct {
         try putV1AssistantWeights(map, s, false);
 
         // Selector: codebooks ship SUFFIX-LESS, like the real checkpoint.
-        try putW(map, "candidate_selector.predecessor_codebook", VOCAB, SEL_RANK, 300, s);
-        try putW(map, "candidate_selector.successor_codebook", VOCAB, SEL_RANK, 301, s);
+        if (packed_codebooks) {
+            inline for (.{ "predecessor", "successor" }) |which| {
+                const dense = try bf16Arr(VOCAB, 32, 300, s);
+                defer _ = mlx.mlx_array_free(dense);
+                var lin = try quantizeDense(dense, 4, 32, s);
+                defer lin.deinit();
+                try put(map, "candidate_selector." ++ which ++ "_codebook.weight", lin.w);
+                try put(map, "candidate_selector." ++ which ++ "_codebook.scales", lin.scales);
+                try put(map, "candidate_selector." ++ which ++ "_codebook.biases", lin.biases);
+            }
+        } else {
+            try putW(map, "candidate_selector.predecessor_codebook", VOCAB, SEL_RANK, 300, s);
+            try putW(map, "candidate_selector.successor_codebook", VOCAB, SEL_RANK, 301, s);
+        }
         try putW(map, "candidate_selector.hidden_projection.weight", SEL_RANK, HIDDEN, 302, s);
 
         // Dynamic convs per layer: base [2, ksize, H] + projection
@@ -2845,6 +3362,28 @@ fn tinyBlockHidden(m: *DflashModel, allocator: std.mem.Allocator, s: mlx.mlx_str
     return TinyFix.readF32(hidden, allocator, s);
 }
 
+test "dflash: tiling the 4-bit drafter in place leaves its forward unchanged" {
+    if (mlx.noGpuBackend() or !transformer_mod.naxAvailable()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp_dir = std.testing.tmpDir(.{});
+    defer tmp_dir.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
+    try TinyFix.writeAssistant(io, tmp_dir.dir, path_buf[0..root_len], s);
+    var m = try loadDflashQuant(io, allocator, s, path_buf[0..root_len], 4);
+    defer m.deinit();
+    const before = try tinyBlockHidden(&m, allocator, s);
+    defer allocator.free(before);
+    // The tiled read is bf16-only: an f16-activation trunk keeps MLX's layout.
+    try testing.expectEqual(@as(u64, 0), try m.tileLaneWeights(.float16, s));
+    try testing.expect(try m.tileLaneWeights(.bfloat16, s) > 0);
+    const after = try tinyBlockHidden(&m, allocator, s);
+    defer allocator.free(after);
+    try testing.expectEqualSlices(f32, before, after);
+}
+
 test "dflash: load-time quantization packs every matmul weight and tracks the dense forward" {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -2933,7 +3472,7 @@ test "dflash2: loader picks up selector + dyn convs; v1 assistant loads with nei
     defer tmp.cleanup();
     var path_buf: [512]u8 = undefined;
     const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s);
+    try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s, false);
 
     var m = try loadDflashQuant(io, allocator, s, dir_path, 0);
     defer m.deinit();
@@ -3003,6 +3542,92 @@ test "dflash2: groupedDynConv matches the closed form on a hand-computed case" {
         want[t * 4 + c] = tap0 + tap1;
     };
     for (got, want) |a, b| try testing.expect(@abs(a - b) < 1e-5);
+}
+
+test "dflash2: topKRows picks each row's k largest logits, each id at its value" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const allocator = testing.allocator;
+    const m: c_int = 3;
+    const v: c_int = 98304;
+    const k: usize = 16;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 0x70B));
+    var f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(f);
+    try mlx.check(mlx.mlx_random_normal(&f, &[_]c_int{ 1, m, v }, 3, .float32, 0.0, 4.0, key, s));
+    // Row 0 also holds 20 descending spikes all in one thread's stride.
+    const spikes = try allocator.alloc(f32, @intCast(m * v));
+    defer allocator.free(spikes);
+    @memset(spikes, 0);
+    for (0..20) |j| spikes[j * 1024] = 50.0 - @as(f32, @floatFromInt(j));
+    const sp = mlx.mlx_array_new_data(spikes.ptr, &[_]c_int{ 1, m, v }, 3, .float32);
+    defer _ = mlx.mlx_array_free(sp);
+    var fs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(fs);
+    try mlx.check(mlx.mlx_add(&fs, f, sp, s));
+    var x = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(x);
+    try mlx.check(mlx.mlx_astype(&x, fs, .bfloat16, s));
+    const top = (try topKRows(x, k, s)) orelse return error.TopKDeclined;
+    defer for (top) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    var xf = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(xf);
+    try mlx.check(mlx.mlx_astype(&xf, x, .float32, s));
+    const all = try TinyFix.readF32(xf, allocator, s);
+    defer allocator.free(all);
+    const vals = try TinyFix.readF32(top[1], allocator, s);
+    defer allocator.free(vals);
+    var ids_f = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(ids_f);
+    try mlx.check(mlx.mlx_astype(&ids_f, top[0], .float32, s));
+    const ids = try TinyFix.readF32(ids_f, allocator, s);
+    defer allocator.free(ids);
+    const vu: usize = @intCast(v);
+    for (0..@intCast(m)) |r| {
+        const row = try allocator.dupe(f32, all[r * vu .. (r + 1) * vu]);
+        defer allocator.free(row);
+        std.mem.sort(f32, row, {}, std.sort.desc(f32));
+        for (0..k) |j| {
+            try testing.expectEqual(row[j], vals[r * k + j]);
+            const id: usize = @intFromFloat(ids[r * k + j]);
+            try testing.expectEqual(all[r * vu + id], vals[r * k + j]);
+        }
+    }
+}
+
+test "dflash2: the one-kernel dyn conv equals the op chain bit for bit" {
+    if (mlx.noGpuBackend()) return;
+    const s = mlx.gpuStream();
+    const shapes = [_][]const c_int{ &.{ 1, 16, 5120 }, &.{ 1, 16, 2, 320 }, &.{ 2, 5120 } };
+    var in: [3]mlx.mlx_array = undefined;
+    for (&in, shapes, 0..) |*a, sh, i| {
+        var key = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(key);
+        try mlx.check(mlx.mlx_random_key(&key, 0xD7C + i));
+        var f = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(f);
+        try mlx.check(mlx.mlx_random_normal(&f, sh.ptr, sh.len, .float32, 0.0, 1.0, key, s));
+        a.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(a, f, .bfloat16, s));
+    }
+    defer for (in) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    const fused = (try dynConvFused(in[0], in[1], in[2], 16, s)) orelse return error.FusedDeclined;
+    defer _ = mlx.mlx_array_free(fused);
+    const ops = try groupedDynConvOps(in[0], in[1], in[2], 16, s);
+    defer _ = mlx.mlx_array_free(ops);
+    var eq = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(eq);
+    try mlx.check(mlx.mlx_array_equal(&eq, fused, ops, false, s));
+    var ok: bool = false;
+    try mlx.check(mlx.mlx_array_eval(eq));
+    try mlx.check(mlx.mlx_array_item_bool(&ok, eq));
+    try testing.expect(ok);
 }
 
 test "dflash2: convPrepare taps base_kernel[0], convFinish taps [1], kernels from the INPUT" {
@@ -3190,6 +3815,17 @@ test "dflash: the draft-only lm_head shrinks the draft read and leaves verify al
     try testing.expect(m.draft_head != null);
     try m.bindWithDraftBits(&xfm, 0);
     try testing.expect(m.draft_head == null);
+}
+
+test "dflash: a load-time quantized linear no longer pins its bf16 source in the weights map" {
+    const s = mlx.gpuStream();
+    var weights = Weights.init(testing.allocator);
+    defer weights.deinit();
+    try weights.map.put(try testing.allocator.dupe(u8, "lin.weight"), try TinyFix.bf16Arr(128, 256, 1, s));
+    var lin = try loadLinear(&weights, "lin", 256, 4, s);
+    defer lin.deinit();
+    try testing.expect(lin.isQuantized());
+    try testing.expect(weights.get("lin.weight").?.ctx == null);
 }
 
 test "dflash: quantGroupFor picks the widest divisor, declines what affine cannot pack" {
@@ -3707,4 +4343,50 @@ test "dflash: every server-side drafter-loaded gate also consults lm.dflash (per
     }
     // Zero means the gates were renamed and this guard went vacuous.
     try testing.expect(checked >= 10);
+}
+
+test "bestFirstTree: the confident chain comes first, then its likeliest sibling" {
+    const allocator = std.testing.allocator;
+    // m = 3 positions, k = 3 candidates; candidate 0 dominates, candidate 1 is
+    // a close second at position 0 only; no pairwise preference.
+    var cands = [_]i32{ 10, 11, 12, 20, 21, 22, 30, 31, 32 };
+    var unary = [_]f32{ 5, 4.5, 0, 8, 0, 0, 8, 0, 0 };
+    var e0 = [_]f32{ 0, 0, 0 };
+    var e: [18]f32 = @splat(0);
+    const lat = Lattice{ .m = 3, .k = 3, .cands = &cands, .unary = &unary, .e0 = &e0, .e = &e };
+    var t = try bestFirstTree(allocator, &lat, .{ .max_nodes = 4, .tau = 1.0, .edge_w = 1.0 });
+    defer t.deinit(allocator);
+    // Depth-first rows: the taken chain 10-20-30 first, then the sibling 11.
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20, 30, 11 }, t.tokens);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, 1, -1 }, t.parents);
+    try std.testing.expectEqualSlices(u32, &.{ 0, 1, 2, 0 }, t.depth);
+}
+
+test "bestFirstTree: rows are depth-first, the best child's subtree before its siblings" {
+    const allocator = std.testing.allocator;
+    // Two near-equal candidates at position 0, one clear candidate after each.
+    var cands = [_]i32{ 10, 11, 12, 20, 21, 22 };
+    var unary = [_]f32{ 3, 2.9, -9, 9, -9, -9 };
+    var e0 = [_]f32{ 0, 0, 0 };
+    var e: [9]f32 = @splat(0);
+    const lat = Lattice{ .m = 2, .k = 3, .cands = &cands, .unary = &unary, .e0 = &e0, .e = &e };
+    var t = try bestFirstTree(allocator, &lat, .{ .max_nodes = 4, .tau = 1.0, .edge_w = 1.0, .children = 2 });
+    defer t.deinit(allocator);
+    // Taken: 10, 11, 20 under 10, 20 under 11 -> depth-first: 10, 20, 11, 20.
+    try std.testing.expectEqualSlices(u32, &.{ 10, 20, 11, 20 }, t.tokens);
+    try std.testing.expectEqualSlices(i32, &.{ -1, 0, -1, 2 }, t.parents);
+}
+
+test "dflash2: a quantized selector codebook is refused at load, not at the first draft" {
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var path_buf: [512]u8 = undefined;
+    const dir_path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    try TinyFix.writeAssistant2(io, tmp.dir, dir_path, s, true);
+
+    try testing.expectError(error.InvalidDflashCodebook, loadDflashQuant(io, allocator, s, dir_path, 0));
 }

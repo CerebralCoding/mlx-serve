@@ -11,7 +11,8 @@
 set -uo pipefail
 cd "$(dirname "$0")/.."
 
-MODEL="${1:-${LFM2_VISION_MODEL:-/Volumes/G Drive SSD/models-dl/LiquidAI/LFM2.5-VL-3B-MLX-4bit}}"
+source tests/_lib_models.sh
+MODEL="${1:-${LFM2_VISION_MODEL:-$(find_model LiquidAI/LFM2.5-VL-3B-MLX-4bit)}}"
 PORT="${2:-11388}"
 HOUSE="tests/fixtures/house.jpeg"
 ROBOT="tests/fixtures/robot.png"
