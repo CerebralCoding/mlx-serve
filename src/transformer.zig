@@ -25787,7 +25787,7 @@ pub const Transformer = struct {
             ctx.cache.config.scheme != .off,
         );
         const n_layers = layerCap(cfg.num_hidden_layers);
-        // One token keeps each expand deferred into the next sublayer's `hcPre`.
+        // Each expand stays deferred into the next sublayer's `hcPre` (one dispatch for both).
         var deferred: ?glm5.Deferred = null;
         defer if (deferred) |*df| df.deinit();
         for (ml[0..n_layers], 0..) |*lw, li| {
@@ -25795,6 +25795,19 @@ pub const Transformer = struct {
                 try self.glmSublayer(ctx, &stream, &deferred, lw, attn, li, offset, batch, seq_len, is_prefill);
             }
             dt.layer(stream, li);
+            // DFlash taps the MEAN of the layer's hyper-connection streams (SGLang's `hc_contract`).
+            if (ctx.capture_layers) |cl| for (cl.ids, cl.out) |cid, *slot| if (cid == li) {
+                if (deferred) |*df| {
+                    _ = mlx.mlx_array_free(stream);
+                    stream = try df.materialize(self.s);
+                    df.deinit();
+                    deferred = null;
+                }
+                var mean = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(mean);
+                try mlx.check(mlx.mlx_mean_axis(&mean, stream, 2, false, self.s));
+                _ = mlx.mlx_array_set(slot, mean);
+            };
             if (is_prefill and prefillEvalCadenceApplies(seq_len) and ((li + 1) % eval_cadence == 0 or li + 1 == n_layers)) {
                 try evalCadencePoint(stream, ctx.ssm_entries);
             }
@@ -25834,7 +25847,9 @@ pub const Transformer = struct {
         const cfg = &self.config;
         const w = if (attn) lw.mhc_attn.? else lw.mhc_ffn.?;
         const norm_w = if (attn) lw.input_norm else lw.post_attn_norm;
-        const one = glm5.hcOneServes(self.s, mlx.getShape(stream.*), mlx.mlx_array_dtype(stream.*), w.fn_rows, norm_w);
+        const prof = diagEnvOnCached(&glm_profile_env, "MLX_SERVE_GLM_PROFILE");
+        // A profiled forward evals at each seam, so it keeps the expand apart.
+        const one = !prof and glm5.hcRowsServes(self.s, mlx.getShape(stream.*), mlx.mlx_array_dtype(stream.*), w.fn_rows, norm_w);
         if (!one) if (deferred.*) |*df| {
             _ = mlx.mlx_array_free(stream.*);
             stream.* = try df.materialize(self.s);
@@ -25854,10 +25869,7 @@ pub const Transformer = struct {
             deferred.* = pre.defer_(out, stream.*);
             return;
         }
-        // A verify window (2..8 rows): the fused pre-step takes every row in one dispatch,
-        // the expand kernel already works per row; no deferral past one token.
         // DIAGNOSTIC (MLX_SERVE_GLM_PROFILE): eval at each seam and bill the wall time per kind.
-        const prof = diagEnvOnCached(&glm_profile_env, "MLX_SERVE_GLM_PROFILE");
         if (glm5.hcRowsServes(self.s, mlx.getShape(stream.*), mlx.mlx_array_dtype(stream.*), w.fn_rows, norm_w)) {
             var t0: i128 = if (prof) glmProfNow() else 0;
             var pre = try glm5.hcPre(self.s, stream.*, null, w.fn_rows, w.scale, w.base, norm_w, cfg.dsv4_hc_sinkhorn_iters, cfg.dsv4_hc_eps, cfg.rms_norm_eps, cfg.rms_norm_eps);
@@ -26165,7 +26177,7 @@ pub const Transformer = struct {
         defer for (parts) |a| if (a.ctx != null) {
             _ = mlx.mlx_array_free(a);
         };
-        if (seq_len > 8 and dense_rows > 0) {
+        if (seq_len > glm5.HC_PRE_MAX_ROWS and dense_rows > 0) {
             var kv_rows = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(kv_rows);
             try mlx.check(mlx.mlx_slice(&kv_rows, view.k, &[_]c_int{ 0, 0, 0, 0 }, 4, &[_]c_int{ batch, 1, @as(c_int, @intCast(offset)) + dense_rows, r }, 4, &[_]c_int{ 1, 1, 1, 1 }, 4, self.s));
@@ -26179,7 +26191,7 @@ pub const Transformer = struct {
             parts[0] = mlx.mlx_array_new();
             try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&parts[0], q_rows, keys, values, scale, "causal", none, none, false, self.s));
         }
-        const sparse_from: c_int = if (seq_len > 8) dense_rows else 0;
+        const sparse_from: c_int = if (seq_len > glm5.HC_PRE_MAX_ROWS) dense_rows else 0;
         if (sparse_from < seq_len) {
             const rows = seq_len - sparse_from;
             const Rows = struct {
@@ -30407,8 +30419,8 @@ pub const Transformer = struct {
             z_proj = try standinOnes(&[_]c_int{ batch, seq_len, value_dim }, self.s);
             a_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
             b_proj = try standinOnes(&[_]c_int{ batch, seq_len, num_v_heads }, self.s);
-        } else if (la.in.w.ctx != null and (self.rowGroupServes(batch * seq_len) or (cfg.kda_vector_gate and batch == 1 and seq_len <= 8))) {
-            // A KDA verify window rides the row-joined projection too: the fused step below takes up to 8 rows.
+        } else if (la.in.w.ctx != null and (self.rowGroupServes(batch * seq_len) or (cfg.kda_vector_gate and batch == 1 and seq_len <= kda_recurrence.MAX_WINDOW))) {
+            // A KDA verify window rides the row-joined projection too: the fused step below takes up to 16 rows (two launches).
             const all = try self.qmatmul(x, la.in.w, la.in.s, la.in.b);
             in_all = all;
             qkv = mlx.mlx_array_new();
@@ -30429,7 +30441,7 @@ pub const Transformer = struct {
         // KDA decode: one dispatch per layer over the row-joined projection. A spec verify
         // steps row by row instead, keeping each row's state for the partial-accept rollback
         // (`spec_state_seq`, `spec_conv_input`: the layout `ssmRollbackFromCapture` reads).
-        if (in_all.ctx != null and batch == 1 and seq_len <= 8 and la.a_log_h.ctx != null and
+        if (in_all.ctx != null and batch == 1 and seq_len <= kda_recurrence.MAX_WINDOW and la.a_log_h.ctx != null and
             ssm.initialized and ssm.ssm_state.ctx != null and ssm.conv_state.ctx != null)
         step: {
             const w = la.in.widths;
@@ -73230,6 +73242,207 @@ test "glm5_next fixture: one-shot and chunked prefill + decode vs mlx-vlm glm5_n
     }
     std.debug.print("[glm5 fixture] chunked prefill + {d} decode steps: min cos {d:.5}, decided misses {d}\n", .{ scored - t_pre, worst, misses });
     try testing.expect(worst > 0.995 and misses == 0);
+}
+
+test "glm5_next DFlash capture: the tapped layers' hyper-connection mean tracks the reference, one-shot and per decode step (GLM5_MODEL, GLM5_FIXTURE)" {
+    // `supportsLayerCapture` promises the seam; a drafter fed a forward that ignores it reads nothing. The
+    // tap is the MEAN of the four streams after the layer (SGLang's `hc_contract`): cosine alone cannot see a
+    // sum or a single stream scaled to match, so the RMS ratio is held beside it. The decode steps ride
+    // the one-token path, where the layer's expand is deferred into the next sublayer's read.
+    const model_dir = std.c.getenv("GLM5_MODEL") orelse return error.SkipZigTest;
+    const fixture_path = std.c.getenv("GLM5_FIXTURE") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    try testing.expect(xfm.supportsLayerCapture());
+
+    var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
+    defer fx.deinit();
+    const ids_arr = fx.get("input_ids") orelse return error.MissingFixtureTensor;
+    const cap_ids_arr = fx.get("cap_ids") orelse return error.MissingFixtureTensor;
+    try mlx.check(mlx.mlx_array_eval(ids_arr));
+    try mlx.check(mlx.mlx_array_eval(cap_ids_arr));
+    const T: c_int = @intCast(mlx.mlx_array_size(ids_arr));
+    const h: usize = @intCast(config.hidden_size);
+    const n_cap: usize = mlx.mlx_array_size(cap_ids_arr);
+    const cap_ids = try allocator.alloc(u32, n_cap);
+    defer allocator.free(cap_ids);
+    const cap_raw = mlx.mlx_array_data_int32(cap_ids_arr) orelse return error.MlxArrayDataNull;
+    for (cap_ids, cap_raw[0..n_cap]) |*d, v| d.* = @intCast(v);
+    const refs = try allocator.alloc([]f32, n_cap);
+    defer allocator.free(refs);
+    var made: usize = 0;
+    defer for (refs[0..made]) |r| allocator.free(r);
+    var key_buf: [32]u8 = undefined;
+    for (cap_ids, refs) |id, *r| {
+        const key = try std.fmt.bufPrint(&key_buf, "cap_l{d}", .{id});
+        r.* = try qwen4ReadF32(allocator, fx.get(key) orelse return error.MissingFixtureTensor, s);
+        made += 1;
+    }
+    // Rows before the reference's first pool pick within 10% (the KDA state carries a flipped pick forward).
+    const gap = try qwen4ReadF32(allocator, fx.get("sel_gap") orelse return error.MissingFixtureTensor, s);
+    defer allocator.free(gap);
+    var scored: c_int = 0;
+    while (scored < T and !(gap[@intCast(scored)] < 0.10)) scored += 1;
+    try testing.expect(scored >= 16);
+
+    var flat_ids = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(flat_ids);
+    try mlx.check(mlx.mlx_reshape(&flat_ids, ids_arr, &.{T}, 1, s));
+    const Run = struct {
+        /// Forward rows [from, to) with the capture armed; hands back each tapped layer's `[1, to-from, H]` rows on the host.
+        fn rows(x: *Transformer, a: std.mem.Allocator, ids: mlx.mlx_array, ids_tapped: []const u32, from: c_int, to: c_int, st: mlx.mlx_stream) ![][]f32 {
+            var part = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(part);
+            try mlx.check(mlx.mlx_slice(&part, ids, &.{from}, 1, &.{to}, 1, &.{1}, 1, st));
+            var batched = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(batched);
+            try mlx.check(mlx.mlx_reshape(&batched, part, &.{ 1, to - from }, 2, st));
+            const out = try a.alloc(mlx.mlx_array, ids_tapped.len);
+            defer {
+                for (out) |o| _ = mlx.mlx_array_free(o);
+                a.free(out);
+            }
+            for (out) |*o| o.* = mlx.mlx_array_new();
+            var cl = CaptureLayers{ .ids = ids_tapped, .out = out };
+            var ctx = x.defaultCtx();
+            ctx.capture_layers = &cl;
+            const logits = try x.forwardWith(&ctx, batched);
+            _ = mlx.mlx_array_free(logits);
+            const host = try a.alloc([]f32, ids_tapped.len);
+            var done: usize = 0;
+            errdefer {
+                for (host[0..done]) |r| a.free(r);
+                a.free(host);
+            }
+            for (out, host) |o, *dst| {
+                if (o.ctx == null) return error.DflashCaptureMissing;
+                dst.* = try qwen4ReadF32(a, o, st);
+                done += 1;
+            }
+            return host;
+        }
+        fn free(a: std.mem.Allocator, host: [][]f32) void {
+            for (host) |r| a.free(r);
+            a.free(host);
+        }
+    };
+    const Bar = struct {
+        fn check(label: []const u8, got: []const f32, want: []const f32, n_rows: usize, width: usize) !void {
+            const cmp = qwen4CompareRows(got[0 .. n_rows * width], want[0 .. n_rows * width], n_rows, width);
+            var gg: f64 = 0;
+            var ww: f64 = 0;
+            for (got[0 .. n_rows * width], want[0 .. n_rows * width]) |x, y| {
+                gg += @as(f64, x) * x;
+                ww += @as(f64, y) * y;
+            }
+            const rms_ratio = @sqrt(gg / (ww + 1e-30));
+            std.debug.print("[glm5 dflash capture] {s}: min cos {d:.5}, rms ratio {d:.4}\n", .{ label, cmp.min_cos, rms_ratio });
+            try testing.expect(cmp.min_cos > 0.998);
+            try testing.expect(rms_ratio > 0.97 and rms_ratio < 1.03);
+        }
+    };
+
+    // [a] the whole prefix in one forward.
+    const full = try Run.rows(&xfm, allocator, flat_ids, cap_ids, 0, scored, s);
+    defer Run.free(allocator, full);
+    var label_buf: [48]u8 = undefined;
+    for (cap_ids, full, refs) |id, got, want| {
+        try Bar.check(try std.fmt.bufPrint(&label_buf, "one-shot layer {d}", .{id}), got, want, @intCast(scored), h);
+    }
+
+    // [b] a chunked prefill, then one token at a time (deferred expands materialized at the tap).
+    try xfm.resetCache();
+    const t_pre: c_int = scored - 6;
+    for ([_][2]c_int{ .{ 0, 5 }, .{ 5, t_pre } }) |c| {
+        const part = try Run.rows(&xfm, allocator, flat_ids, cap_ids, c[0], c[1], s);
+        defer Run.free(allocator, part);
+        for (cap_ids, part, refs) |id, got, want| {
+            try Bar.check(try std.fmt.bufPrint(&label_buf, "chunk {d}..{d} layer {d}", .{ c[0], c[1], id }), got, want[@as(usize, @intCast(c[0])) * h ..], @intCast(c[1] - c[0]), h);
+        }
+    }
+    var t = t_pre;
+    while (t < scored) : (t += 1) {
+        const step = try Run.rows(&xfm, allocator, flat_ids, cap_ids, t, t + 1, s);
+        defer Run.free(allocator, step);
+        for (cap_ids, step, refs) |id, got, want| {
+            try Bar.check(try std.fmt.bufPrint(&label_buf, "decode row {d} layer {d}", .{ t, id }), got, want[@as(usize, @intCast(t)) * h ..], 1, h);
+        }
+    }
+}
+
+test "glm5_next verify windows of 2..16 rows track the same rows decoded one at a time (GLM5_REAL_MODEL)" {
+    // The fused row paths (hcPre, routed experts, KDA, latent attention) against the one-row paths on the
+    // real pack: a window's logits are the serial logits to rounding, and its argmax is the serial argmax.
+    const model_dir = std.c.getenv("GLM5_REAL_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
+    defer weights.deinit();
+    model_mod.resolveWeightPrefix(&config, &weights);
+    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer xfm.deinit();
+    const v: usize = @intCast(config.vocab_size);
+
+    var prompt: [48]i32 = undefined;
+    for (&prompt, 0..) |*t, i| t.* = @intCast(1000 + (i * 7919) % 20000);
+    const Run = struct {
+        fn feed(x: *Transformer, ids: []const i32, verify: bool, st: mlx.mlx_stream) !mlx.mlx_array {
+            const input = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{ 1, @intCast(ids.len) }, 2, .int32);
+            defer _ = mlx.mlx_array_free(input);
+            var ctx = x.defaultCtx();
+            ctx.capture_ssm_seq = verify and x.ssm_entries != null;
+            ctx.spec_verify = verify;
+            defer if (ctx.ssm_entries) |entries| for (entries) |*e| ssmFreeSpecCapture(e);
+            const logits = try x.forwardWith(&ctx, input);
+            try mlx.check(mlx.mlx_array_eval(logits));
+            _ = st;
+            return logits;
+        }
+    };
+    // A short tail chunk of a prefix-cache restore is a prefill, not a verify: both modes ride the same rows.
+    for ([_]bool{ true, false }) |mode_verify| {
+    var w: usize = 2;
+    while (w <= 16) : (w += 1) {
+        const window = [_]i32{ 5, 90, 1234, 77, 4096, 300, 12, 8001, 999, 42, 7000, 15, 2500, 63, 18000, 11 };
+        // The window in one forward.
+        try xfm.resetCache();
+        _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
+        const got_arr = try Run.feed(&xfm, window[0..w], mode_verify, s);
+        defer _ = mlx.mlx_array_free(got_arr);
+        const got = try qwen4ReadF32(allocator, got_arr, s);
+        defer allocator.free(got);
+        // The same rows one at a time.
+        try xfm.resetCache();
+        _ = mlx.mlx_array_free(try Run.feed(&xfm, &prompt, false, s));
+        var worst: f64 = 1.0;
+        var misses: usize = 0;
+        for (0..w) |r| {
+            const one = try Run.feed(&xfm, window[r .. r + 1], false, s);
+            defer _ = mlx.mlx_array_free(one);
+            const want = try qwen4ReadF32(allocator, one, s);
+            defer allocator.free(want);
+            const cmp = qwen4CompareRows(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+            worst = @min(worst, cmp.min_cos);
+            misses += mimoDecidedMisses(got[r * v .. (r + 1) * v], want[0..v], 1, v);
+        }
+        std.debug.print("[glm5 window] {d} rows: min cos {d:.5}, decided misses {d}\n", .{ w, worst, misses });
+        // Random ids leave the logits flat and a verify row is never serial's to the bit (0.97 at 4 to 8
+        // rows before the wide windows existed): a broken row path lands far below this.
+        try testing.expect(worst > 0.94);
+    }
+    }
 }
 
 test "glm5_next batched decode: a three-slot tick tracks three serial decodes (GLM5_MODEL, GLM5_FIXTURE)" {
