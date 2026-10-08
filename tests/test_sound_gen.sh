@@ -10,7 +10,7 @@
 # not -> SSE diffuse progress + base64 complete -> unload.
 #
 # Skips when the repo is absent. Download with:
-#   hf download stabilityai/stable-audio-3-small-sfx --local-dir ~/.mlx-serve/models/stabilityai/stable-audio-3-small-sfx
+#   hf download ddalcu/Stable-Audio-3-Small-SFX-MLX-Serve --local-dir ~/.mlx-serve/models/stabilityai/stable-audio-3-small-sfx
 #
 # Usage: SA3_MODEL=<dir> ./tests/test_sound_gen.sh [port]
 set -uo pipefail
