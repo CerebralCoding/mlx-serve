@@ -83,7 +83,7 @@ Estimated from the measured per-step cost:
 - `/v1/completions` accepts token-ID prompts (`[1, 2, 3]`, as lm-eval sends them); a batch of prompts and `echo: true` are refused by name instead of being misread or silently ignored (#659).
 - App: an attached video reaches the model, with Tools on or off, and its frames are saved as files instead of inside the chat history; with Tools on, a message that is only a picture, recording or clip reaches the model too (#429).
 - App: the agent sees a tool result in full until it has answered it, so reading a large file no longer sends it into a loop of ever-smaller re-reads (#605).
-- App: `readFile` and `editFile` count lines ending in CR or CRLF and keep the file's own line endings (#736); an agent's own Apple voice is used in voice mode (#417); Option types characters in the built-in terminal, so `@` works on Swiss and other layouts (#692).
+- App: `readFile` and `editFile` count lines ending in CR or CRLF and keep the file's own line endings (#736); an agent's own Apple voice is used in voice mode, and Settings ▸ Voice picks the app's own Apple voice again (#417); Option types characters in the built-in terminal, so `@` works on Swiss and other layouts (#692).
 
 ---
 
