@@ -713,6 +713,12 @@ and they are listed because they made that work possible.
     at once — summing per-adapter deltas at forward time rather than merging
     them into the base weight, the `lora_paths`/`lora_scales` request shape,
     and splitting a fused QKV up-projection across q/k/v targets.
+  * LiquidAI/d1-3B (LFM Open License v1.0, https://huggingface.co/LiquidAI/d1-3B),
+    the reference for the D1 decision prompt, option codes and readout in
+    `src/d1.zig`: `prompt.py`'s question and state rendering, its single-token
+    alias assignment and readout groups, and `api.py`'s answer shapes. Written
+    in Zig here, not shipped as their source; the checkpoint is downloaded at
+    runtime and not redistributed.
 
 Model weights downloaded at runtime carry their own licenses from their
 publishers. mlx-serve does not redistribute them.

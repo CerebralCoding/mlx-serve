@@ -86,7 +86,7 @@ final class AppActivationTests: XCTestCase {
         XCTAssertEqual(AppActivation.windowTitle(for: "serverLog"), "Server Log")
         XCTAssertEqual(AppActivation.windowTitle(for: "benchmarks"), "Benchmarks")
         XCTAssertEqual(AppActivation.windowTitle(for: "agents"), "Agents")
-        XCTAssertEqual(AppActivation.windowTitle(for: "layaDecisions"), "Decisions")
+        XCTAssertEqual(AppActivation.windowTitle(for: "decisions"), "Decisions")
         XCTAssertEqual(AppActivation.windowTitle(for: "modelSettings"), "Model Settings")
     }
 

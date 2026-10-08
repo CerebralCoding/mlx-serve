@@ -388,8 +388,18 @@ class DownloadManager: ObservableObject {
             return "laya"
         }
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
+        if isD1Config(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "d1" }
         if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
         return nil
+    }
+
+    /// A D1 decision checkpoint (LiquidAI/d1-3B): its LFM2-VL config's `auto_map` names the card's own class,
+    /// which is what tells it from a chat LFM2.5-VL. Twin of `model_discovery.isD1Root`.
+    nonisolated static func isD1Config(atPath path: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: path),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              let map = cfg["auto_map"] as? [String: Any] else { return false }
+        return map["AutoModel"] as? String == "modeling_d1.D1Model"
     }
 
     /// A stable-audio-tools inpainting model conditioned on T5Gemma: the

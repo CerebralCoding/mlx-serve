@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>Kev vs Laya Pac-Man Duel</title>
+<title>Decisions Pac-Man Duel</title>
 <style>
   :root { --bg:#0b0d17; --panel:#151a2e; --fg:#e6e8f2; --dim:#8a90a8; --wall:#2740c9; --p1:#ffd23f; --p2:#3fe0ff; }
   * { box-sizing:border-box; }
@@ -27,13 +27,12 @@
   .err { color:#ff6b6b; }
 </style>
 
-<h1>MLX-Serve - Kev vs Laya Pac-Man Duel</h1>
-<div class="sub">Two Pac-Men and no humans, each driven by its own decision model. The model scores every open direction (typed <code>score</code>, 0 to 3) and the Pac-Man takes the best one via <code>POST /v1/decisions</code>. Same rules and question format for both; only the model differs.</div>
+<h1>MLX-Serve - Decisions Pac-Man Duel</h1>
+<div class="sub">Two Pac-Men and no humans. A decision model (Laya, Kev, D1 or Clef) scores every open direction (typed <code>score</code>, 0 to 3) and each Pac-Man takes the best one via <code>POST /v1/decisions</code>.</div>
 
 <div class="bar">
   <input id="api" size="24" title="mlx-serve base URL">
-  <label>P1 <select id="model0"></select></label>
-  <label>P2 <select id="model1"></select></label>
+  <select id="model"></select>
   <button id="go">Start</button>
   <button id="reset">Reset</button>
   <label><input id="shield" type="checkbox" checked> safety shield</label>
@@ -44,8 +43,8 @@
 <div class="wrap">
   <canvas id="c"></canvas>
   <div class="side">
-    <div class="card p1"><h2><span id="n0">P1 yellow</span><span id="s0"></span></h2><div id="d0"></div><div class="meta" id="m0"></div></div>
-    <div class="card p2"><h2><span id="n1">P2 cyan</span><span id="s1"></span></h2><div id="d1"></div><div class="meta" id="m1"></div></div>
+    <div class="card p1"><h2><span>P1 yellow</span><span id="s0"></span></h2><div id="d0"></div><div class="meta" id="m0"></div></div>
+    <div class="card p2"><h2><span>P2 cyan</span><span id="s1"></span></h2><div id="d1"></div><div class="meta" id="m1"></div></div>
   </div>
 </div>
 
@@ -191,7 +190,7 @@ async function decide(pl, i) {
     [d, { type:"score", instructions:`How good is it for Pac-Man to move ${d}?`, criteria:CRIT }]));
   const t0 = performance.now();
   const r = await fetch(api() + "/v1/decisions", { method:"POST", headers:{ "content-type":"application/json" },
-    body:JSON.stringify({ model:$("model" + i).value, state:{
+    body:JSON.stringify({ model:$("model").value, state:{
       goal: "eat every pellet, keep moving toward areas with many pellets, avoid ghosts, do not wander back and forth",
       map_around_you: localMap(pl, i),
       map_legend: "P = you (center), R = rival, G = hunting ghost, E = edible ghost, . = pellet, o = power pellet, # = wall, blank = empty; up is the row above P",
@@ -286,7 +285,6 @@ function draw() {
 
 function panels() {
   G.players.forEach((pl, i) => {
-    $("n" + i).textContent = `P${i + 1} ${$("model" + i).value.split("/").pop() || ["yellow", "cyan"][i]}`;
     $("s" + i).textContent = `${pl.score} pts  ${"♥".repeat(Math.max(pl.lives, 0))}`;
     const l = pl.last;
     $("d" + i).innerHTML = Object.keys(DIRS).map(d => {
@@ -318,23 +316,18 @@ async function loop() {
 // Server and URL text is shown as text, never parsed as HTML.
 function say(text, err = false) { $("msg").textContent = text; $("msg").classList.toggle("err", err); }
 
-// P1 starts on a Kev model and P2 on a Laya one; either picker takes any decision model.
 async function loadModels() {
+  $("model").innerHTML = "";
   try {
     const j = await (await fetch(api() + "/v1/models")).json();
-    const ms = j.data.filter(m => (m.capabilities || []).includes("decisions"));
-    ["kev", "laya"].forEach((arch, i) => {
-      const ids = ms.map(m => m.id), pref = ms.find(m => m.meta?.architecture === arch)?.id;
-      $("model" + i).replaceChildren(...ids.map(id => new Option(id, id, false, id === pref)));
-    });
-    say(ms.length ? "" : "No decision model (Kev or Laya) found on this server.");
-    panels();
+    const ids = j.data.filter(m => (m.capabilities || []).includes("decisions")).map(m => m.id);
+    $("model").replaceChildren(...ids.map(id => new Option(id, id)));
+    say(ids.length ? "" : "No decision model found on this server.");
   } catch (e) { say(`Cannot reach ${api()}: ${e.message}`, true); }
 }
 
 const qs = new URLSearchParams(location.search);
 $("api").onchange = loadModels;
-$("model0").onchange = $("model1").onchange = panels;
 $("speed").oninput = () => $("speedv").textContent = $("speed").value + " ms";
 $("speed").oninput();
 $("go").onclick = () => {

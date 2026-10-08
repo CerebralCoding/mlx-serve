@@ -1241,7 +1241,7 @@ private struct UseDecisionModelButton: View {
     var body: some View {
         Button {
             appState.decisionsModelPath = path
-            AppActivation.openWindow(id: "layaDecisions", using: openWindow)
+            AppActivation.openWindow(id: "decisions", using: openWindow)
         } label: { Text("Use")
             .font(.app(.body)) }
         .controlSize(.small)

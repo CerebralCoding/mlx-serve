@@ -107,6 +107,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "laya") or
         std.mem.eql(u8, model_type, "kev") or
         std.mem.eql(u8, model_type, "clef") or
+        std.mem.eql(u8, model_type, "d1") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -192,6 +193,7 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
     defer parsed.deinit();
     if (parsed.value != .object) return .missing_or_unparseable;
     const root = parsed.value.object;
+    if (isD1Root(root)) return .{ .supported = allocator.dupe(u8, "d1") catch return .missing_or_unparseable };
     // The DFlash contract outranks model_type: v1 assistants at least carry a
     // `*_assistant` suffix, but a DFlash2 sidecar is config-indistinguishable
     // from its trunk family without this probe (one predicate, shared with
@@ -231,6 +233,27 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
 pub fn peekKevPack(io: std.Io, sub: std.Io.Dir) bool {
     const st = sub.statFile(io, "kev_config.json", .{}) catch return false;
     return st.kind == .file;
+}
+
+/// True for a D1 decision checkpoint (LiquidAI/d1-3B): its LFM2-VL config.json's `auto_map` names the card's own
+/// class, which is what tells it from a chat LFM2.5-VL. Twin of gen.isD1Pack, which delegates here.
+pub fn isD1Root(root: std.json.ObjectMap) bool {
+    const map = root.get("auto_map") orelse return false;
+    if (map != .object) return false;
+    const cls = map.object.get("AutoModel") orelse return false;
+    return cls == .string and std.mem.eql(u8, cls.string, "modeling_d1.D1Model");
+}
+
+pub fn peekD1Pack(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
+    var file = sub.openFile(io, "config.json", .{}) catch return false;
+    defer file.close(io);
+    var rbuf: [4096]u8 = undefined;
+    var rs = file.reader(io, &rbuf);
+    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
+    defer allocator.free(bytes);
+    const parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
+    defer parsed.deinit();
+    return parsed.value == .object and isD1Root(parsed.value.object);
 }
 
 pub fn peekClefPack(io: std.Io, sub: std.Io.Dir) bool {
@@ -606,7 +629,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
         std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
-    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef")) return .decision;
+    if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;
@@ -2437,6 +2460,27 @@ test "a Kev pack is a decision model even though its root config.json is its qwe
     try testing.expectEqualStrings("kev", result.models[0].model_type);
     try testing.expectEqual(ModelKind.decision, modelKindFromType(result.models[0].model_type));
     try testing.expectEqualStrings("qwen3_5", result.models[1].model_type);
+    try testing.expectEqual(ModelKind.chat, modelKindFromType(result.models[1].model_type));
+}
+
+test "a D1 pack is a decision model: its config is LFM2-VL, its auto_map names the card's class" {
+    const io = std.testing.io;
+    const allocator = std.testing.allocator;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+
+    try tmp.dir.createDirPath(io, "org/d1-pack");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/d1-pack/config.json", .data = "{\"model_type\":\"lfm2_vl\",\"auto_map\":{\"AutoModel\":\"modeling_d1.D1Model\"}}" });
+    try tmp.dir.createDirPath(io, "org/plain-lfm2");
+    try tmp.dir.writeFile(io, .{ .sub_path = "org/plain-lfm2/config.json", .data = "{\"model_type\":\"lfm2_vl\"}" });
+
+    var result = try discoverModelsInDir(io, allocator, tmp.dir, "/root");
+    defer result.deinit();
+    try testing.expectEqual(@as(usize, 2), result.models.len);
+    try testing.expectEqualStrings("org/d1-pack", result.models[0].id);
+    try testing.expectEqualStrings("d1", result.models[0].model_type);
+    try testing.expectEqual(ModelKind.decision, modelKindFromType(result.models[0].model_type));
+    try testing.expectEqualStrings("lfm2_vl", result.models[1].model_type);
     try testing.expectEqual(ModelKind.chat, modelKindFromType(result.models[1].model_type));
 }
 

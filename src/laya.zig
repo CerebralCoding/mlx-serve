@@ -263,10 +263,15 @@ fn clampTemperature(name: []const u8, t: *f32) void {
 /// Python would write `Infinity`, which is not JSON.
 /// Nesting past `MAX_JSON_DEPTH` is `error.NestingTooDeep` (one call frame per level).
 pub fn pyJson(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value, ascii: bool) !void {
-    return pyJsonDepth(a, out, v, ascii, 0);
+    return pyJsonDepth(a, out, v, ascii, false, 0);
 }
 
-fn pyJsonDepth(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value, ascii: bool, depth: usize) !void {
+/// Python `json.dumps(v, ensure_ascii=ascii, indent=2)`: one item a line, two spaces a level, empty containers inline.
+pub fn pyJsonIndent(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value, ascii: bool) !void {
+    return pyJsonDepth(a, out, v, ascii, true, 0);
+}
+
+fn pyJsonDepth(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value, ascii: bool, indent: bool, depth: usize) !void {
     if ((v == .array or v == .object) and depth >= MAX_JSON_DEPTH) return error.NestingTooDeep;
     switch (v) {
         .null => try out.appendSlice(a, "null"),
@@ -278,9 +283,11 @@ fn pyJsonDepth(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value,
         .array => |arr| {
             try out.append(a, '[');
             for (arr.items, 0..) |item, i| {
-                if (i > 0) try out.appendSlice(a, ", ");
-                try pyJsonDepth(a, out, item, ascii, depth + 1);
+                if (i > 0) try out.appendSlice(a, if (indent) "," else ", ");
+                if (indent) try newlineIndent(a, out, depth + 1);
+                try pyJsonDepth(a, out, item, ascii, indent, depth + 1);
             }
+            if (indent and arr.items.len > 0) try newlineIndent(a, out, depth);
             try out.append(a, ']');
         },
         .object => |obj| {
@@ -288,14 +295,31 @@ fn pyJsonDepth(a: std.mem.Allocator, out: *std.ArrayList(u8), v: std.json.Value,
             var it = obj.iterator();
             var i: usize = 0;
             while (it.next()) |kv| : (i += 1) {
-                if (i > 0) try out.appendSlice(a, ", ");
+                if (i > 0) try out.appendSlice(a, if (indent) "," else ", ");
+                if (indent) try newlineIndent(a, out, depth + 1);
                 try pyJsonString(a, out, kv.key_ptr.*, ascii);
                 try out.appendSlice(a, ": ");
-                try pyJsonDepth(a, out, kv.value_ptr.*, ascii, depth + 1);
+                try pyJsonDepth(a, out, kv.value_ptr.*, ascii, indent, depth + 1);
             }
+            if (indent and i > 0) try newlineIndent(a, out, depth);
             try out.append(a, '}');
         },
     }
+}
+
+fn newlineIndent(a: std.mem.Allocator, out: *std.ArrayList(u8), depth: usize) !void {
+    try out.append(a, '\n');
+    try out.appendNTimes(a, ' ', 2 * depth);
+}
+
+test "pyJsonIndent: json.dumps(indent=2) layout, empty containers inline" {
+    const a = testing.allocator;
+    const v = try parseRequestJson(a, "{\"a\":[1,\"x\"],\"b\":{}}");
+    defer v.deinit();
+    var out: std.ArrayList(u8) = .empty;
+    defer out.deinit(a);
+    try pyJsonIndent(a, &out, v.value, false);
+    try testing.expectEqualStrings("{\n  \"a\": [\n    1,\n    \"x\"\n  ],\n  \"b\": {}\n}", out.items);
 }
 
 /// A JSON number's text as Python writes the value `json.loads` makes of it (`-0` -> `0`, `1e5` -> `100000.0`).

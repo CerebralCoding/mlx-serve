@@ -3,9 +3,9 @@ import XCTest
 
 final class ClefModelTests: XCTestCase {
     func testChoiceHelpMatchesTheRequestSchema() throws {
-        let choice = LayaDecisionsPane.Question(name: "team", type: .choice, instructions: "Route it", criteria: "billing, sales")
+        let choice = DecisionsPane.Question(name: "team", type: .choice, instructions: "Route it", criteria: "billing, sales")
         for clef in [false, true] {
-            let example = LayaDecisionsPane.Question.choiceCriteriaExample(forClef: clef)
+            let example = DecisionsPane.Question.choiceCriteriaExample(forClef: clef)
             let parsed = try XCTUnwrap(JSONSerialization.jsonObject(with: Data("{\(example)}".utf8)) as? NSDictionary)
             let criteria = try XCTUnwrap(choice.json(forClef: clef)?["criteria"])
             XCTAssertEqual(parsed, ["criteria": criteria] as NSDictionary)
@@ -13,13 +13,13 @@ final class ClefModelTests: XCTestCase {
     }
 
     func testClefQuestionUsesObjectChoicesAndKeepsScoreLevels() throws {
-        let choice = LayaDecisionsPane.Question(name: "route", type: .choice, instructions: "Route it", criteria: "sales, support, sales")
+        let choice = DecisionsPane.Question(name: "route", type: .choice, instructions: "Route it", criteria: "sales, support, sales")
         let options = try XCTUnwrap(choice.json(forClef: true)?["criteria"] as? [String: NSNull])
         XCTAssertEqual(Set(options.keys), ["sales", "support"])
         XCTAssertEqual(choice.json(forClef: false)?["criteria"] as? [String], ["sales", "support", "sales"])
-        let score = LayaDecisionsPane.Question(name: "urgency", type: .score, instructions: "", criteria: "low, high")
+        let score = DecisionsPane.Question(name: "urgency", type: .score, instructions: "", criteria: "low, high")
         XCTAssertEqual(score.json(forClef: true)?["criteria"] as? [String], ["low", "high"])
-        let noul = LayaDecisionsPane.Question(name: "refund", type: .noul, instructions: "", criteria: "denied, allowed")
+        let noul = DecisionsPane.Question(name: "refund", type: .noul, instructions: "", criteria: "denied, allowed")
         XCTAssertEqual(noul.json(forClef: true)?["criteria"] as? [String: String], ["false": "denied", "true": "allowed"])
     }
 
