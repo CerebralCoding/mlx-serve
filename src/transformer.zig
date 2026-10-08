@@ -17083,12 +17083,19 @@ pub const Transformer = struct {
         // EmbeddingGemma sentence-transformers projection head: folded into
         // the main safetensors as root-level dense.0/dense.1 by the
         // mlx-community conversion. Optional — absent on every other model.
-        const dense0_w: mlx.mlx_array = weights.get("dense.0.weight") orelse .{};
-        const dense0_s: mlx.mlx_array = weights.get("dense.0.scales") orelse .{};
-        const dense0_b: mlx.mlx_array = weights.get("dense.0.biases") orelse .{};
+        var dense0_w: mlx.mlx_array = weights.get("dense.0.weight") orelse .{};
+        var dense0_s: mlx.mlx_array = weights.get("dense.0.scales") orelse .{};
+        var dense0_b: mlx.mlx_array = weights.get("dense.0.biases") orelse .{};
         const dense1_w: mlx.mlx_array = weights.get("dense.1.weight") orelse .{};
         const dense1_s: mlx.mlx_array = weights.get("dense.1.scales") orelse .{};
         const dense1_b: mlx.mlx_array = weights.get("dense.1.biases") orelse .{};
+        // EmbeddingGemma 2 projects once: its `embedding_projection` is the whole head.
+        if (config.isEmbeddingGemma2()) {
+            const head = try getQuantTriple(weights, &name_buf, prefix, "embedding_projection", bias_mandatory);
+            dense0_w = head.w;
+            dense0_s = head.s;
+            dense0_b = head.b;
+        }
 
         // Cache for KV (standard models use all entries, MoE only uses full-attn layers)
         const cache = try KVCache.init(allocator, config.num_hidden_layers);
@@ -17161,7 +17168,15 @@ pub const Transformer = struct {
         var ple_proj_b_g = mlx.mlx_array_new();
         var ple_proj_norm = mlx.mlx_array_new();
         var ple_proj_quantized = false;
-        if (config.hidden_size_per_layer_input > 0) {
+        if (config.isEmbeddingGemma2()) {
+            // Per-layer inputs from the embeddings alone: a projection and its norm under `ple.`, no table.
+            const proj = try getQuantTriple(weights, &name_buf, prefix, "ple.per_layer_model_projection", bias_mandatory);
+            ple_proj_w_g = proj.w;
+            ple_proj_s_g = proj.s;
+            ple_proj_b_g = proj.b;
+            ple_proj_quantized = proj.s.ctx != null;
+            ple_proj_norm = try requireNamedWeight(weights, &name_buf, prefix, "ple.per_layer_projection_norm", "weight");
+        } else if (config.hidden_size_per_layer_input > 0) {
             ple_emb_w = try getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.weight", prefix);
             // Dense bf16: no scales/biases → null-ctx; dequantTake takes its dense path.
             ple_emb_s = if (config.quant_bits == 0) mlx.mlx_array_new() else try getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.scales", prefix);
@@ -17394,11 +17409,17 @@ pub const Transformer = struct {
             if (lm_head_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, lm_head_b);
             if (dense0_w.ctx != null) {
                 _ = mlx.mlx_vector_array_append_value(all_vec, dense0_w);
-                _ = mlx.mlx_vector_array_append_value(all_vec, dense1_w);
+                if (dense1_w.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, dense1_w);
                 if (dense0_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, dense0_s);
                 if (dense0_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, dense0_b);
                 if (dense1_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, dense1_s);
                 if (dense1_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, dense1_b);
+            }
+            if (config.isEmbeddingGemma2()) {
+                _ = mlx.mlx_vector_array_append_value(all_vec, ple_proj_w_g);
+                if (ple_proj_s_g.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, ple_proj_s_g);
+                if (ple_proj_b_g.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, ple_proj_b_g);
+                _ = mlx.mlx_vector_array_append_value(all_vec, ple_proj_norm);
             }
 
             if (moe_layers) |ml| {
@@ -20162,8 +20183,8 @@ pub const Transformer = struct {
         if (self.dsv41) |mdl| return forwardDsv41WithImpl(self, ctx, token_ids, mdl);
         if (self.dsv41_ext) |m| return forwardDsv41Stream(self, ctx, token_ids, m);
         if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
-        // Bidirectional embedding models (EmbeddingGemma) load standard gemma3
-        // weights but never run causal decode.
+        // Bidirectional embedding models (EmbeddingGemma 1 on gemma3 weights, 2 on Gemma 4's) never run causal decode.
+        if (self.config.isEmbeddingGemma2()) return self.forwardEmbeddingGemma2With(ctx, token_ids);
         if (self.config.use_bidirectional_attention) return self.forwardGemma3EncoderWith(ctx, token_ids);
         if (self.hybrid_layers != null) return self.forwardHybridWith(ctx, token_ids);
         if (self.qwen4 != null) return self.forwardQwen4With(ctx, token_ids);
@@ -27946,36 +27967,58 @@ pub const Transformer = struct {
     /// Forward pass that returns hidden states (after final_norm, before lm_head).
     /// Output shape: [1, seq_len, hidden_size]. Caller must free.
     pub fn forwardEmbedding(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
-        return self.forwardEmbeddingMasked(token_ids, null);
+        return self.forwardEmbeddingMasked(token_ids, null, null);
     }
 
     /// Embedding forward for a padded [B, T] batch: `key_pad_mask` (additive,
     /// [B, 1, 1, T]) keeps padded positions out of encoder attention. Null
-    /// mask == plain forwardEmbedding.
-    pub fn forwardEmbeddingMasked(self: *Transformer, token_ids: mlx.mlx_array, key_pad_mask: ?mlx.mlx_array) !mlx.mlx_array {
+    /// mask == plain forwardEmbedding. `vision` is one prompt's image/video
+    /// soft-token rows, spliced in at the placeholder ids (EmbeddingGemma 2).
+    pub fn forwardEmbeddingMasked(self: *Transformer, token_ids: mlx.mlx_array, key_pad_mask: ?mlx.mlx_array, vision: ?mlx.mlx_array) !mlx.mlx_array {
         self.embedding_mode = true;
         defer self.embedding_mode = false;
         var ctx = self.defaultCtx();
         ctx.key_pad_mask = key_pad_mask;
+        ctx.vision_embeddings = vision;
         return self.forwardWith(&ctx, token_ids);
     }
 
     /// True when the checkpoint ships a sentence-transformers Dense head
-    /// (EmbeddingGemma dense.0/dense.1), applied between pool and normalize.
+    /// (EmbeddingGemma dense.0/dense.1, EmbeddingGemma 2's embedding_projection
+    /// as the lone dense.0), applied between pool and normalize.
     pub fn hasEmbedProjection(self: *const Transformer) bool {
-        return self.dense0_w.ctx != null and self.dense1_w.ctx != null;
+        return self.dense0_w.ctx != null;
     }
 
-    /// Sentence-transformers Dense head: pooled [B, H] → dense.0 → dense.1
+    /// Sentence-transformers Dense head: pooled [B, H] → dense.0 (→ dense.1)
     /// (identity activations, no layer bias — EmbeddingGemma's config).
     /// Input is cast to bf16 for the quantized matmuls. Caller frees.
     pub fn embedProjection(self: *const Transformer, pooled: mlx.mlx_array) !mlx.mlx_array {
         var x = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(x);
         try mlx.check(mlx.mlx_astype(&x, pooled, .bfloat16, self.s));
-        const mid = try self.qmatmul(x, self.dense0_w, self.dense0_s, self.dense0_b);
-        defer _ = mlx.mlx_array_free(mid);
-        return self.qmatmul(mid, self.dense1_w, self.dense1_s, self.dense1_b);
+        const mid = try self.denseHead(x, self.dense0_w, self.dense0_s, self.dense0_b);
+        const head = if (self.dense1_w.ctx == null) mid else blk: {
+            defer _ = mlx.mlx_array_free(mid);
+            break :blk try self.denseHead(mid, self.dense1_w, self.dense1_s, self.dense1_b);
+        };
+        defer _ = mlx.mlx_array_free(head);
+        // f32 out: the normalization squares and sums it, and a bf16 head output rounds that norm away from 1.
+        var out = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(out);
+        try mlx.check(mlx.mlx_astype(&out, head, .float32, self.s));
+        return out;
+    }
+
+    /// One Dense layer: quantized weights ride `qmatmul`; a dense checkpoint keeps its [out, in] layout
+    /// (nothing pre-transposes the head) and projects through a transposed view.
+    fn denseHead(self: *const Transformer, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array) !mlx.mlx_array {
+        if (sc.ctx != null) return self.qmatmul(x, w, sc, bi);
+        const wt = try transposeBf16Weight(w, self.s);
+        defer _ = mlx.mlx_array_free(wt);
+        var out = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_matmul(&out, x, wt, self.s));
+        return out;
     }
 
     /// Bidirectional batched encoder forward for embedding models built on a
@@ -28130,6 +28173,193 @@ pub const Transformer = struct {
             try mlx.check(mlx.mlx_add(&h_next, h, mlp_normed, self.s));
             _ = mlx.mlx_array_free(h);
             h = h_next;
+            dt.layer(h, layer_idx);
+        }
+        dt.end(h);
+
+        const final = try self.rmsNorm(h, self.final_norm);
+        _ = mlx.mlx_array_free(h);
+        return final;
+    }
+
+    /// EmbeddingGemma 2's per-layer inputs, `rms_norm(project(h) * hidden^-0.5)` as [B, S, n_layers, ple_dim]:
+    /// derived from the embeddings alone, unlike Gemma 4's (`computePLEInput`), which adds a per-token table.
+    fn projectionOnlyPle(self: *Transformer, h: mlx.mlx_array, batch: c_int, seq_len: c_int) !mlx.mlx_array {
+        const cfg = &self.config;
+        const proj_raw = try self.denseHead(h, self.ple_proj_w, self.ple_proj_s, self.ple_proj_b);
+        defer _ = mlx.mlx_array_free(proj_raw);
+        const scale = try scalarOf(1.0 / @sqrt(@as(f32, @floatFromInt(cfg.hidden_size))), mlx.mlx_array_dtype(proj_raw), self.s);
+        defer _ = mlx.mlx_array_free(scale);
+        var scaled = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(scaled);
+        try mlx.check(mlx.mlx_multiply(&scaled, proj_raw, scale, self.s));
+        const shape = [_]c_int{ batch, seq_len, @intCast(cfg.num_hidden_layers), @intCast(cfg.hidden_size_per_layer_input) };
+        var per_layer = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(per_layer);
+        try mlx.check(mlx.mlx_reshape(&per_layer, scaled, &shape, 4, self.s));
+        var normed = mlx.mlx_array_new();
+        errdefer _ = mlx.mlx_array_free(normed);
+        try mlx.check(mlx.mlx_fast_rms_norm(&normed, per_layer, self.ple_proj_norm, cfg.rms_norm_eps, self.s));
+        return normed;
+    }
+
+    /// EmbeddingGemma 2: the Gemma 4 text trunk trained as a bidirectional encoder — no cache, no causality.
+    /// Each layer is sandwich-normed attention (q/k/v norms, unit scale) and a GeGLU MLP, then a per-layer
+    /// input block and the layer scalar. Full-attention layers (head width 512, one KV head) attend over the
+    /// whole unpadded sequence, the rest within the INCLUSIVE band |i-j| <= sliding_window; `ctx.key_pad_mask`
+    /// folds into both. Returns the final-normed hidden [B, L, H]; the projection head runs after pooling
+    /// (a bias-free projection commutes with the mean).
+    fn forwardEmbeddingGemma2With(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
+        const cfg = &self.config;
+        const h_count: c_int = @intCast(cfg.num_attention_heads);
+
+        var h = try self.embedding(token_ids);
+        errdefer _ = mlx.mlx_array_free(h);
+        // Soft tokens enter before the per-layer inputs are derived: those read the merged embeddings.
+        h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
+        const x_shape = mlx.getShape(h);
+        const batch: c_int = x_shape[0];
+        const seq_len: c_int = x_shape[1];
+
+        const ple = try self.projectionOnlyPle(h, batch, seq_len);
+        defer _ = mlx.mlx_array_free(ple);
+
+        const none_mask = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(none_mask);
+        // `encoderBandMask` is exclusive (|i-j| < window): radius + 1 makes the band inclusive. A sequence
+        // inside the band needs none.
+        var band = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(band);
+        if (seq_len > @as(c_int, @intCast(cfg.sliding_window)) + 1) {
+            band = try encoderBandMask(self.allocator, @intCast(seq_len), cfg.sliding_window + 1, self.s);
+        }
+        var band_pad = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(band_pad);
+        if (band.ctx != null) {
+            if (ctx.key_pad_mask) |kp| {
+                // A padded query whose band holds only padding would softmax over -inf, and its NaN row would
+                // reach the real rows through V (0 x NaN) in every later layer: floor the sum at a finite value.
+                var sum = mlx.mlx_array_new();
+                defer _ = mlx.mlx_array_free(sum);
+                try mlx.check(mlx.mlx_add(&sum, band, kp, self.s));
+                const floor = try scalarOf(-1.0e9, mlx.mlx_array_dtype(sum), self.s);
+                defer _ = mlx.mlx_array_free(floor);
+                try mlx.check(mlx.mlx_maximum(&band_pad, sum, floor, self.s));
+            }
+        }
+        const full_mask: mlx.mlx_array = ctx.key_pad_mask orelse none_mask;
+        const sliding_mask: mlx.mlx_array = if (band_pad.ctx != null) band_pad else if (band.ctx != null) band else full_mask;
+
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        var dt = mlx.DtypeTrace.begin("embedding-gemma2", h, if (self.layers.len > 0) self.layers[0].q_w else null);
+
+        for (0..cfg.num_hidden_layers) |layer_idx| {
+            const li: u32 = @intCast(layer_idx);
+            const lw = &self.layers[layer_idx];
+            const is_global = cfg.isGlobalLayer(li);
+            const hd: c_int = @intCast(cfg.layerHeadDim(li));
+            const kv_h: c_int = @intCast(cfg.layerKVHeads(li));
+            const q_shape = [_]c_int{ batch, seq_len, h_count, hd };
+            const kv_shape = [_]c_int{ batch, seq_len, kv_h, hd };
+            const out_shape = [_]c_int{ batch, seq_len, h_count * hd };
+            const rope_base = mlx.mlx_optional_float{ .value = if (is_global) cfg.rope_theta else cfg.rope_local_base_freq, .has_value = true };
+            const no_freqs = mlx.mlx_array{ .ctx = null };
+
+            const normed = try self.rmsNorm(h, lw.input_norm);
+            defer _ = mlx.mlx_array_free(normed);
+
+            // Q, K, V: projection, per-head norm (V's carries no weight), transpose, RoPE at 0..L-1 on Q and K.
+            const q = try self.qmatmul(normed, lw.q_w, lw.q_s, lw.q_b);
+            defer _ = mlx.mlx_array_free(q);
+            var q_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_r);
+            try mlx.check(mlx.mlx_reshape(&q_r, q, &q_shape, 4, self.s));
+            const q_normed = try self.rmsNorm(q_r, lw.q_norm.?);
+            defer _ = mlx.mlx_array_free(q_normed);
+            var q_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_t);
+            try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed, &perm, 4, self.s));
+            var q_rope = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(q_rope);
+            try mlx.check(mlx.mlx_fast_rope(&q_rope, q_t, hd, false, rope_base, 1.0, 0, no_freqs, self.s));
+
+            const k = try self.qmatmul(normed, lw.k_w, lw.k_s, lw.k_b);
+            defer _ = mlx.mlx_array_free(k);
+            var k_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_r);
+            try mlx.check(mlx.mlx_reshape(&k_r, k, &kv_shape, 4, self.s));
+            const k_normed = try self.rmsNorm(k_r, lw.k_norm.?);
+            defer _ = mlx.mlx_array_free(k_normed);
+            var k_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_t);
+            try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, self.s));
+            var k_rope = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(k_rope);
+            try mlx.check(mlx.mlx_fast_rope(&k_rope, k_t, hd, false, rope_base, 1.0, 0, no_freqs, self.s));
+
+            const v = try self.qmatmul(normed, lw.v_w, lw.v_s, lw.v_b);
+            defer _ = mlx.mlx_array_free(v);
+            var v_r = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(v_r);
+            try mlx.check(mlx.mlx_reshape(&v_r, v, &kv_shape, 4, self.s));
+            const v_normed = try self.rmsNorm(v_r, if (is_global) self.v_norm_weight_global orelse self.v_norm_weight.? else self.v_norm_weight.?);
+            defer _ = mlx.mlx_array_free(v_normed);
+            var v_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(v_t);
+            try mlx.check(mlx.mlx_transpose_axes(&v_t, v_normed, &perm, 4, self.s));
+
+            const mask = if (is_global) full_mask else sliding_mask;
+            var attn_out = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_out);
+            if (mask.ctx != null) {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, k_rope, v_t, cfg.attnScale(), "array", mask, .{ .ctx = null }, false, self.s));
+            } else {
+                try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, k_rope, v_t, cfg.attnScale(), "", none_mask, .{ .ctx = null }, false, self.s));
+            }
+            var attn_t = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_t);
+            try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm, 4, self.s));
+            var attn_flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(attn_flat);
+            try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &out_shape, 3, self.s));
+            const o_out = try self.qmatmul(attn_flat, lw.o_w, lw.o_s, lw.o_b);
+            defer _ = mlx.mlx_array_free(o_out);
+
+            const attn_normed = try self.rmsNorm(o_out, lw.post_attn_norm);
+            defer _ = mlx.mlx_array_free(attn_normed);
+            var h_attn = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&h_attn, h, attn_normed, self.s));
+            _ = mlx.mlx_array_free(h);
+            h = h_attn;
+
+            const ff_normed = try self.rmsNorm(h, lw.pre_ff_norm.?);
+            defer _ = mlx.mlx_array_free(ff_normed);
+            const gate_raw = try self.qmatmul(ff_normed, lw.gate_w, lw.gate_s, lw.gate_b);
+            defer _ = mlx.mlx_array_free(gate_raw);
+            const up = try self.qmatmul(ff_normed, lw.up_w, lw.up_s, lw.up_b);
+            defer _ = mlx.mlx_array_free(up);
+            const gate_up = try self.computeGeglu(gate_raw, up);
+            defer _ = mlx.mlx_array_free(gate_up);
+            const down = try self.qmatmul(gate_up, lw.down_w, lw.down_s, lw.down_b);
+            defer _ = mlx.mlx_array_free(down);
+            const mlp_normed = try self.rmsNorm(down, lw.post_ff_norm.?);
+            defer _ = mlx.mlx_array_free(mlp_normed);
+            var h_mlp = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_add(&h_mlp, h, mlp_normed, self.s));
+            _ = mlx.mlx_array_free(h);
+            h = h_mlp;
+
+            // Per-layer input block, then the layer scalar.
+            const projected = try self.pleProject(h, lw, ple, li, batch, seq_len);
+            defer _ = mlx.mlx_array_free(projected);
+            const ple_normed = try self.rmsNorm(projected, lw.ple_norm.?);
+            defer _ = mlx.mlx_array_free(ple_normed);
+            var h_ple = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(h_ple);
+            try mlx.check(mlx.mlx_add(&h_ple, h, ple_normed, self.s));
+            _ = mlx.mlx_array_free(h);
+            h = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_multiply(&h, h_ple, lw.layer_scalar.?, self.s));
             dt.layer(h, layer_idx);
         }
         dt.end(h);
@@ -33713,6 +33943,10 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
 
         // Gemma 4: per-layer scalar
         lw.layer_scalar = getLayerWeightOpt(weights, name_buf, prefix, li, "layer_scalar");
+        if (config.isEmbeddingGemma2() and lw.layer_scalar == null) {
+            log.err("MISSING WEIGHT: {s}.layers.{d}.layer_scalar\n", .{ prefix, li });
+            return error.MissingWeight;
+        }
 
         // Gemma 4: PLE per-layer weights. Must initialize even in the no-PLE case so the
         // optional tags are not read as uninitialized memory later in the eval loop
@@ -33725,16 +33959,23 @@ fn initStandardLayers(allocator: std.mem.Allocator, config: ModelConfig, weights
         lw.ple_proj_b = null;
         lw.ple_norm = null;
         if (config.hidden_size_per_layer_input > 0) {
-            lw.ple_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_input_gate.weight");
+            // EmbeddingGemma 2 keeps the three per-layer tensors in a `ple_block` module.
+            const ple_dir: []const u8 = if (config.isEmbeddingGemma2()) "ple_block" else "";
+            lw.ple_gate_w = getLayerWeightOpt(weights, name_buf, prefix, li, inDir(&sfx, ple_dir, "per_layer_input_gate.weight"));
             // Dense bf16: scales/biases don't exist. The forward unwraps these with
             // `.?` then feeds qmatmul, so supply a null-ctx array (not Zig-null) →
             // qmatmulBits sees the bf16 path.
-            lw.ple_gate_s = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_input_gate.scales", config.quant_bits);
-            lw.ple_gate_b = try getLayerBias(weights, name_buf, prefix, li, "per_layer_input_gate.biases", &config);
-            lw.ple_proj_w = getLayerWeightOpt(weights, name_buf, prefix, li, "per_layer_projection.weight");
-            lw.ple_proj_s = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, "per_layer_projection.scales", config.quant_bits);
-            lw.ple_proj_b = try getLayerBias(weights, name_buf, prefix, li, "per_layer_projection.biases", &config);
-            lw.ple_norm = getLayerWeightOpt(weights, name_buf, prefix, li, "post_per_layer_input_norm.weight");
+            lw.ple_gate_s = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, inDir(&sfx, ple_dir, "per_layer_input_gate.scales"), config.quant_bits);
+            lw.ple_gate_b = try getLayerBias(weights, name_buf, prefix, li, inDir(&sfx, ple_dir, "per_layer_input_gate.biases"), &config);
+            lw.ple_proj_w = getLayerWeightOpt(weights, name_buf, prefix, li, inDir(&sfx, ple_dir, "per_layer_projection.weight"));
+            lw.ple_proj_s = getLayerScaleOrEmptyOpt(weights, name_buf, prefix, li, inDir(&sfx, ple_dir, "per_layer_projection.scales"), config.quant_bits);
+            lw.ple_proj_b = try getLayerBias(weights, name_buf, prefix, li, inDir(&sfx, ple_dir, "per_layer_projection.biases"), &config);
+            lw.ple_norm = getLayerWeightOpt(weights, name_buf, prefix, li, inDir(&sfx, ple_dir, "post_per_layer_input_norm.weight"));
+            // Gemma 4's forward skips a layer without these; EmbeddingGemma 2's needs them in every layer.
+            if (config.isEmbeddingGemma2() and (lw.ple_gate_w == null or lw.ple_proj_w == null or lw.ple_norm == null)) {
+                log.err("MISSING WEIGHT: {s}.layers.{d}.{s}.*\n", .{ prefix, li, ple_dir });
+                return error.MissingWeight;
+            }
             // bf16: pre-transpose the two PLE projections (used via qmatmul).
             if (lw.ple_gate_w) |*w| try maybeTransposeForBf16(w, lw.ple_gate_s.?, &owned_bf16, allocator, s);
             if (lw.ple_proj_w) |*w| try maybeTransposeForBf16(w, lw.ple_proj_s.?, &owned_bf16, allocator, s);
@@ -44107,6 +44348,22 @@ fn sliceTimestep3(arr: mlx.mlx_array, batch: c_int, heads: c_int, t: c_int, s: m
     return result;
 }
 
+/// `<prefix>.<base>` as a (weight, scales, biases) triple. A dense tensor leaves scales and biases empty; a
+/// quantized one with a biased mode must carry its biases.
+fn getQuantTriple(weights: *const Weights, buf: *[256]u8, prefix: []const u8, base: []const u8, bias_mandatory: bool) error{MissingWeight}!struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array } {
+    const w = try requireNamedWeight(weights, buf, prefix, base, "weight");
+    const sc = getNamedWeight(weights, buf, prefix, base, "scales") orelse return .{ .w = w, .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() };
+    const bi = if (bias_mandatory) try requireNamedWeight(weights, buf, prefix, base, "biases") else getNamedWeight(weights, buf, prefix, base, "biases") orelse mlx.mlx_array_new();
+    return .{ .w = w, .s = sc, .b = bi };
+}
+
+fn requireNamedWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, base: []const u8, suffix: []const u8) error{MissingWeight}!mlx.mlx_array {
+    return getNamedWeight(weights, buf, prefix, base, suffix) orelse {
+        log.err("MISSING WEIGHT: {s}.{s}.{s}\n", .{ prefix, base, suffix });
+        return error.MissingWeight;
+    };
+}
+
 fn getWeightFmt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const u8, prefix: []const u8) error{MissingWeight}!mlx.mlx_array {
     const name = std.fmt.bufPrint(buf, fmt, .{prefix}) catch unreachable;
     return weights.get(name) orelse {
@@ -44702,6 +44959,12 @@ fn checkExl3Bank(mw: *const MoeMlpWeights, config: ModelConfig, spec: sushi_exl3
 /// "<container>.<proj>.<leaf>" for an expert bank, built into `buf`.
 fn expertLeaf(buf: []u8, container: []const u8, proj: []const u8, leaf: []const u8) []const u8 {
     return std.fmt.bufPrint(buf, "{s}.{s}.{s}", .{ container, proj, leaf }) catch unreachable;
+}
+
+/// `<dir>.<name>`, or `<name>` for a tensor that sits directly in the layer.
+fn inDir(buf: []u8, dir: []const u8, name: []const u8) []const u8 {
+    if (dir.len == 0) return name;
+    return std.fmt.bufPrint(buf, "{s}.{s}", .{ dir, name }) catch unreachable;
 }
 
 /// Build a "<container>.<leaf>" layer-weight suffix into `buf`. Used where the
@@ -62533,8 +62796,8 @@ test "every transformer forward path is watched by a dtype trace" {
             return error.UnwatchedForwardPath;
         }
     }
-    // standard, MoE, hybrid, BERT, Gemma3 encoder, GLM-5.
-    try std.testing.expectEqual(@as(usize, 7), checked);
+    // standard, MoE, hybrid, BERT, Gemma3 encoder, EmbeddingGemma 2 encoder, GLM-5.
+    try std.testing.expectEqual(@as(usize, 8), checked);
 }
 
 test "the YaRN mscale table never reaches a multiply in its load-time dtype" {
@@ -65481,7 +65744,7 @@ test "every generative forward arm splices vision embeddings" {
     // shapes, the token accounting and the encoder log line are all correct,
     // so it reads as a bad IMAGE rather than a missing splice.
     //
-    // Encoder-only arms are exempt BY NAME: they serve /v1/embeddings, take no
+    // The text-only encoder arms are exempt BY NAME: they serve /v1/embeddings, take no
     // images, and have no image_token_id to splice at. Anything else added to
     // the dispatch is required to splice, so a new arch cannot inherit the hole.
     const src = @embedFile("transformer.zig");

@@ -3,6 +3,7 @@
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
 ### New
+- **EmbeddingGemma 2.** Google's `google/embeddinggemma-2` and its `mlx-community` packs serve text, image and video embeddings on `/v1/embeddings` (768 dimensions, `dimensions` down to 128, inputs up to 8192 tokens, the model card's task prefix goes in the text; images and videos, sent as a list of frames, ride a `messages` request like vLLM's chat embeddings); audio inputs are not wired yet.
 - **Kolibri-1.** Aleph Alpha's 78B-A3.5B MoE runs from the MLX packs already on Hugging Face (such as `here-be-dragons-ai/Kolibri-1-MLX-3bit`), with text, tool calls and thinking set by `reasoning_effort`.
 - **MTP depth bounds.** `--mtp-min-depth` / `--mtp-max-depth` bound every speculative planner choice, equal values pin one depth in place of `MLX_SERVE_MTP_FORCE_DEPTH`, and `--mtp-depth` still works as `--mtp-max-depth`, with a warning (#737).
 - **ZCode.** `mlx-serve launch zcode` and the app's code launcher point Z.ai's ZCode agent (built from source) at the local server with every served chat model and its advertised context, keeping its data under `~/.mlx-serve/zcode` (#708). Thanks @beamivalice.

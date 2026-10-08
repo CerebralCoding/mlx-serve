@@ -61,6 +61,7 @@ let supportedModelTypes: Set<String> = [
     "k2_horizon", // IFM K2-Horizon dense (Llama trunk, grouped RMS norms)
     "prism_hadamard_qwen35", // prism-ml Bonsai 2: qwen3_5 behind block Hadamard rotations
     "bert", // encoder-only; serves /v1/embeddings (GPU document indexing)
+    "embedding_gemma2", // Google EmbeddingGemma 2 (bidirectional Gemma 4 trunk; text, image and video embeddings)
     // GGUF engines: "gguf" = any model via the embedded llama.cpp engine;
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.

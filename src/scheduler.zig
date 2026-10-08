@@ -1136,6 +1136,9 @@ pub const EmbedRequest = struct {
     model: *model_registry_mod.LoadedModel,
     /// Tokenized inputs, one slice per text. Borrowed; must outlive the call.
     token_seqs: []const []const u32,
+    /// The soft-token rows [1, n, hidden] of the ONE prompt's images and video, in prompt order. The request
+    /// owns them: the inference thread frees them when the forward is done.
+    vision_embeddings: ?mlx.mlx_array = null,
     /// Output: one pooled L2-normalized embedding per input on success.
     /// Rows + outer slice owned by `allocator`; caller frees.
     results: ?[][]f32 = null,
@@ -5497,7 +5500,12 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
 /// the global xfm.cache before every sub-batch, and wakes the conn thread.
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
     const xfm_ptr = req.model.transformer.?;
-    const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
+    // Held in a local: the request lives on the waiting thread's stack and is gone once `done` is observed.
+    const vision = req.vision_embeddings;
+    defer if (vision) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    const results = generate_mod.computeEmbeddingsBatchWith(req.allocator, xfm_ptr, req.token_seqs, vision) catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
