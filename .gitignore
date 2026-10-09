@@ -97,3 +97,6 @@ tests/soak_log.csv
 /tests/agent_eval/out/
 runs/*
 data
+
+# Studio web console (app-web/): dev tooling output only
+app-web/node_modules/

@@ -56,7 +56,7 @@ var shutdown_requested = std.atomic.Value(bool).init(false);
 var active_conn_threads = std.atomic.Value(u32).init(0);
 /// Set from main.zig before serve() is called when --metrics is on; null
 /// otherwise. Gates the gauge-sampler thread and the /metrics + /metrics.json
-/// routes. When null, `/metrics*` return 503 and the index page shows no panel.
+/// routes. When null, `/metrics*` return 503, which the console reads as "metrics off".
 pub var g_metrics: ?*instr.Metrics = null;
 /// Optional global API key (`--api-key`). When set, every NON-LOOPBACK request
 /// (i.e. from another machine over the network) except the `/health` probe and
@@ -1170,10 +1170,6 @@ pub fn embedOverflowMessage(buf: []u8, index: usize, tokens: usize, limit: u32) 
 // and `global_model_id` singletons were removed. The `discovered_models`
 // slice was also removed — `/v1/models` iterates `registry.entries` directly.
 
-/// Port the HTTP server is bound to. Used by the landing page's curl
-/// example so users can copy-paste a working command.
-var global_port: u16 = 0;
-
 /// Decode a slice of token IDs to bytes, routing through the ds4 engine when
 /// the loaded model is GGUF-backed (no MLX tokenizer in that case). Used by
 /// the request handlers' streaming + final-decode paths so a single call
@@ -1925,7 +1921,6 @@ pub fn serve(
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
-    global_port = port;
     // Install signal handlers for graceful shutdown
     const sigact = std.posix.Sigaction{
         .handler = .{ .handler = signalHandler },
@@ -2348,7 +2343,7 @@ fn handleConnection(
     // the model it now fetches from /v1/models + /props client-side.
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
         log.debug("GET  / -> 200 (console)\n", .{});
-        try handleStatusPage(allocator, stream);
+        try handleStatusPage(stream);
         return;
     }
     // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
@@ -2365,7 +2360,7 @@ fn handleConnection(
         }
         return;
     }
-    // JSON feed — drives the live metrics panel on the index page. Behind the
+    // JSON feed — drives the console's Monitoring pane. Behind the
     // global API-key gate above when --api-key is set (same-origin browser
     // fetch inherits the page's Basic credentials).
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics.json")) {
@@ -7721,81 +7716,16 @@ fn handlePropsNoModel(allocator: std.mem.Allocator, stream: *Conn) !void {
     try sendResponse(stream, "200 OK", "application/json", body);
 }
 
-/// Render the built-in console at `GET /`: a chat playground, image
-/// generate/edit and audio tools, the live metrics panel, and the full API
-/// reference. Self-contained — no external assets, no CDN.
+/// The built-in console at `GET /`: one self-contained page built from
+/// `app-web/` (never edited by hand), served byte for byte.
 ///
-/// Takes NO model. Everything model-shaped (the picker, capabilities, memory)
-/// is fetched client-side from `/v1/models` + `/props`, which is what lets the
-/// page render on a server with nothing loaded — the default boot mode — and
-/// what makes the picker follow loads/unloads without a refresh.
-fn handleStatusPage(allocator: std.mem.Allocator, stream: *Conn) !void {
-    const version_esc = try htmlEscape(allocator, build_options.version);
-    defer allocator.free(version_esc);
-
-    // Optional live-metrics panel: a mount div + the polling script (which also
-    // carries the panel markup and injects it into the mount). Rendered into
-    // the header's `{s}` slot — but ONLY when --metrics is on; off ⇒ empty
-    // string, so nothing polls a 503 feed.
-    const METRICS_SECTION = "\n<div id=mlx-metrics></div>\n<script>\n" ++ @embedFile("html/metrics.js") ++ "\n</script>\n";
-    const metrics_section: []const u8 = if (g_metrics != null) METRICS_SECTION else "";
-
-    // The page lives in src/html/index.html (@embedFile resolves relative to
-    // this source file, so no build.zig change) and is a std.fmt FORMAT
-    // STRING: every literal `{`/`}` in it must be doubled. That is exactly why
-    // the CSS and JS are separate files injected as RUNTIME `{s}` args —
-    // std.fmt does not re-parse a runtime argument, so app.css/app.js/
-    // metrics.js can be ordinary CSS and JavaScript. Don't inline them back.
-    // The console's three boot scripts share the page's single `<script>{s}`
-    // slot: api.js publishes `apiPrefix` (the mount the page was served under),
-    // which every later script — including the metrics panel rendered into the
-    // header below — resolves its requests through; theme.js sets the stored/OS
-    // theme before the stylesheet paints; i18n.js resolves the language (and
-    // <html lang>) before the body. They are concatenated here rather than given
-    // a second slot because std.fmt does not re-parse a runtime argument, so all
-    // three stay ordinary JavaScript.
-    const boot_script = try std.mem.concat(allocator, u8, &.{
-        @embedFile("html/api.js"),
-        "\n;\n",
-        @embedFile("html/theme.js"),
-        "\n;\n",
-        @embedFile("html/i18n.js"),
-    });
-    defer allocator.free(boot_script);
-    const body = try std.fmt.allocPrint(allocator, @embedFile("html/index.html"), .{
-        // <title> version
-        version_esc,
-        // <script> — src/html/api.js + theme.js + i18n.js (before first paint)
-        boot_script,
-        // <style> — src/html/app.css
-        @embedFile("html/app.css"),
-        // header version
-        version_esc,
-        // optional live-metrics panel (empty when --metrics is off)
-        metrics_section,
-        // curl example port
-        global_port,
-        // <script> — src/html/app.js
-        @embedFile("html/app.js"),
-    });
-    defer allocator.free(body);
-    try sendResponse(stream, "200 OK", "text/html; charset=utf-8", body);
-}
-
-/// Minimal HTML escape — covers the five chars that matter inside element
-/// content + double-quoted attribute values. Caller frees.
-fn htmlEscape(allocator: std.mem.Allocator, input: []const u8) ![]u8 {
-    var buf = std.ArrayList(u8).empty;
-    errdefer buf.deinit(allocator);
-    for (input) |c| switch (c) {
-        '&' => try buf.appendSlice(allocator, "&amp;"),
-        '<' => try buf.appendSlice(allocator, "&lt;"),
-        '>' => try buf.appendSlice(allocator, "&gt;"),
-        '"' => try buf.appendSlice(allocator, "&quot;"),
-        '\'' => try buf.appendSlice(allocator, "&#39;"),
-        else => try buf.append(allocator, c),
-    };
-    return try buf.toOwnedSlice(allocator);
+/// Takes NO model. Everything model-shaped (the picker, capabilities, memory,
+/// version, whether metrics are on) is fetched client-side from `/v1/models`,
+/// `/props`, `/api/version` and `/metrics.json`, which is what lets the page
+/// render on a server with nothing loaded — the default boot mode — and what
+/// makes the picker follow loads/unloads without a refresh.
+fn handleStatusPage(stream: *Conn) !void {
+    try sendResponse(stream, "200 OK", "text/html; charset=utf-8", @embedFile("html/index.html"));
 }
 
 /// `<bos> ids <eos>` for bidirectional embedding models. Either special is
@@ -13324,14 +13254,9 @@ test "every streaming chat emitter carries logprobs (silently-ignored-field guar
 }
 
 test "the index page documents every endpoint the server serves (drift guard)" {
-    // The API reference on `GET /` is hand-written prose, so it drifts the
-    // moment a route ships without someone remembering the page: it documented
-    // 22 of 31 endpoints and had silently omitted the ENTIRE Ollama `/api/*`
-    // surface (nine paths) since that surface was added. "Are we missing
-    // endpoints?" has to be a test, not an inspection.
-    //
-    // Same shape as the ROUTE_PATHS↔dispatch-chain guard above: two lists that
-    // must agree, checked against the file rather than trusted.
+    // The API reference is static data in app-web (`apiReference`); a route
+    // added here and not there is missing from the built page. The finer check
+    // (exact rows, both directions) is app-web's own test, which CI does not run.
     const page = @embedFile("html/index.html");
     for (ROUTE_PATHS) |p| {
         // "/" is the page itself — trivially present and not worth documenting

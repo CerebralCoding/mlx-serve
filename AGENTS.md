@@ -6,7 +6,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 - `docs/reference.md` — deep detail: per-file contracts, media-gen schemas, API surfaces, LAN design, observability, embedded engines, arch numerics (dsv4/inkling/H3, Kokoro, runtime LoRA), website/tier list, licensing. Read its section BEFORE deep work on a subsystem.
 - `docs/gotchas/{tool-calling,server-http,engine-mlx,models-media,app}.md` — full war stories behind every rule in `## Rules`.
-- `tests/CLAUDE.md` — integration-test matrix. `app/CLAUDE.md` — Swift app layout + rules (auto-load in their dirs).
+- `tests/CLAUDE.md` — integration-test matrix. `app/CLAUDE.md` — Swift app layout + rules; `app-web/CLAUDE.md` — console source (auto-load in their dirs).
 - Skills: `/release` (pre-release checklist, CalVer, CHANGELOG), `/bench` (llmprobe methodology + comparison traps).
 - `containers/{agent-shell-mlxserve,guest-kernel}/` — Agent Sandbox guest image + kernel, two pinned artifacts that BUMP TOGETHER. Detail: `docs/reference.md`.
 - `website/` — GitHub Pages site + `llm-tier-list/`. Design: `docs/reference.md`. Guards: `tests/test_website_pages.sh`, `tests/website_tier_list_logic.mjs`.
@@ -32,7 +32,7 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`
 | `chat.zig` | Chat templates (ChatML/Gemma/Llama-3/Jinja2), thinking tags, tool-call parsing/repair/coercion |
 | `vision.zig` / `qwen_vision.zig` + `mrope.zig` | Gemma SigLIP / Qwen3-VL ViT + M-RoPE |
 | `muse_vision.zig` / `lfm2_vision.zig` | Muse-Glimmer ViT / LFM2-VL SigLIP2-NaFlex tower + projector + tiling |
-| `server.zig` | All HTTP: `/v1/*` (chat/completions/messages/responses/embeddings/load/unload/models), media endpoints, `/metrics(.json)`, WS, Ollama glue, `--api-key`, console at `GET /` (`src/html/` as `{s}` args, renders with NO model). Embeddings: BERT + EmbeddingGemma, per-checkpoint pooling, `--embedding-max-length` |
+| `server.zig` | All HTTP: `/v1/*` (chat/completions/messages/responses/embeddings/load/unload/models), media endpoints, `/metrics(.json)`, WS, Ollama glue, `--api-key`, console at `GET /` (embedded `src/html/index.html`, renders with NO model). Embeddings: BERT + EmbeddingGemma, per-checkpoint pooling, `--embedding-max-length` |
 | `lan.zig` | LAN sharing: Bonjour, `SharedSet` + `routeClass` allowlist, `<id>@<peer>` mirroring, streaming proxy. Pure transport |
 | `model_settings.zig` | Per-model settings (`~/.mlx-serve/model-settings.json`, keyed by model path): `alias` (a request NAME, never a load setting), `ctx_size`, `kv_quant`, `mtp`/`mtp_acceptance`/`mtp_greedy_tail`, `int8_prefill` (LOSSY), `chat_template_kwargs`; read at every load site, stamped on `ModelConfig.*_override` + `ChatConfig.chat_template_kwargs`. Detail: reference.md "row detail" |
 | `providers.zig` | Upstream OpenAI-compatible chat providers (`~/.mlx-serve/providers.json`): background `/v1/models` probe, `<id>@<name>` rows (`models` = filter, or the list for a listless provider), curl-backed `/v1/chat/completions` proxy. `GET /v1/providers`, `POST /v1/providers/reload` |
@@ -344,7 +344,7 @@ MLX errors + threads:
 
 LAN + console:
 - **LAN**: per-INTERFACE dns_sd callbacks, loopback-first fetches, eviction via `attemptKnown`; proxying bounded by the TUNNEL MARKER (`isTunneledRequest` at gate AND dispatch, ONE hop, `error.SelfFetch`).
-- **Console**: `index.html` is a std.fmt template; type uses rem, never px. Mic only while listening; escaped Markdown, HTTP(S) links; ONE media attempt per turn; edit tool enum matches edit-capable models. Requests use the selected server/mount. Guards: `tests/html_console_test.mjs`, `tests/metrics_panel_test.mjs`.
+- **Console** (`app-web/`, Svelte): `src/html/index.html` is BUILT, never hand-edited: change the source, `npm run build`, commit both. Rules + guards: `app-web/CLAUDE.md`; `tests/test_index_page.sh` serves it headless. Metrics are on when `GET /metrics.json` is not 503.
 
 ### Engine: KV, spec-decode, kernels, MLX (→ docs/gotchas/engine-mlx.md)
 

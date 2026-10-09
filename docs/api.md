@@ -53,7 +53,7 @@ Stateful chains via `previous_response_id`, full streaming SSE with per-event `s
 
 ## Other endpoints
 
-- `GET /` — built-in web console: chat playground, Monitor, image and audio tools, API reference
+- `GET /` — built-in web console (MLX Serve Studio): chat, image/audio/video generation, Library, Monitoring, API reference
 - `GET /health` — health check
 - `GET /v1/models` — list loaded models with capabilities + engine info
 - `POST /v1/completions` — text completions; `prompt` is a string or token ids (`[1, 2, 3]`, as lm-eval sends them), one prompt per request. `echo: true` is refused: prompt tokens carry no logprobs
