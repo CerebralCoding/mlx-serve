@@ -4593,15 +4593,24 @@ pub fn narrowsLoadedF16(key: []const u8, ndim: usize, dtype: mlx.mlx_dtype) bool
 /// switch is the only way to attribute a future f16-checkpoint regression to
 /// it. The side-tensor arm predates this and is not switchable.
 var narrow_1d_env: ?bool = null;
+
+/// ON for Metal and CUDA: an f16 norm left beside bf16 activations widens the
+/// whole residual to f32. OFF for the Omarchy Vulkan backend, which has no
+/// bf16 GPU kernel.
+fn narrow1dDefault(darwin: bool, cuda: bool) bool {
+    return darwin or cuda;
+}
+
+test "f16 1-D tables narrow to bf16 on Metal and CUDA, not on Vulkan" {
+    try std.testing.expect(narrow1dDefault(true, false));
+    try std.testing.expect(narrow1dDefault(false, true));
+    try std.testing.expect(!narrow1dDefault(false, false));
+}
 fn narrow1dEnabled() bool {
     if (narrow_1d_env) |v| return v;
     const on = blk: {
         const raw = std.c.getenv("MLX_SERVE_F16_NARROW_1D") orelse
-            break :blk builtin.os.tag.isDarwin();
-        // Default ON for Metal (bf16 is the wired-format win there). The
-        // Omarchy Vulkan backend has no bf16 GPU kernel ("No GPU kernel
-        // exists for it"), so off Darwin the default is OFF unless the env
-        // explicitly forces it.
+            break :blk narrow1dDefault(builtin.os.tag.isDarwin(), mlx.cudaAvailable());
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     narrow_1d_env = on;

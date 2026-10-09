@@ -168,6 +168,58 @@ fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:0]co
     return std.fmt.comptimePrint("{s}", .{body});
 }
 
+/// Depthwise conv1d over exactly `kernel` positions (one output row) as
+/// sum_k window[k] * w[k]. MLX's CUDA grouped conv costs ~10 ms of encode per
+/// call at decode width. window [B,K,C], w [C,K,1] -> [B,1,C].
+fn depthwiseConvStep(window: mlx.mlx_array, w: mlx.mlx_array, cdim: c_int, kernel: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
+    var w_ck = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_ck);
+    try mlx.check(mlx.mlx_reshape(&w_ck, w, &[_]c_int{ cdim, kernel }, 2, s));
+    var w_kc = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w_kc);
+    try mlx.check(mlx.mlx_transpose(&w_kc, w_ck, s));
+    var prod = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(prod);
+    try mlx.check(mlx.mlx_multiply(&prod, window, w_kc, s));
+    var out = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_sum_axis(&out, prod, 1, true, s));
+    return out;
+}
+
+test "depthwiseConvStep equals a grouped conv1d over one window" {
+    const s = mlx.gpuStream();
+    const B: c_int = 2;
+    const K: c_int = 3;
+    const C: c_int = 8;
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 7));
+    var window = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(window);
+    try mlx.check(mlx.mlx_random_normal(&window, &[_]c_int{ B, K, C }, 3, .float32, 0, 1, key, s));
+    var w = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(w);
+    try mlx.check(mlx.mlx_random_normal(&w, &[_]c_int{ C, K, 1 }, 3, .float32, 0, 1, key, s));
+    const got = try depthwiseConvStep(window, w, C, K, s);
+    defer _ = mlx.mlx_array_free(got);
+    var want = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(want);
+    try mlx.check(mlx.mlx_conv1d(&want, window, w, 1, 0, 1, C, s));
+    try std.testing.expectEqualSlices(c_int, mlx.getShape(want), mlx.getShape(got));
+    var diff = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(diff);
+    try mlx.check(mlx.mlx_subtract(&diff, got, want, s));
+    var adiff = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(adiff);
+    try mlx.check(mlx.mlx_abs(&adiff, diff, s));
+    var worst = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(worst);
+    try mlx.check(mlx.mlx_max(&worst, adiff, false, s));
+    var v: f32 = 1;
+    try mlx.check(mlx.mlx_array_item_float32(&v, worst));
+    try std.testing.expect(v < 1e-5);
+}
+
 const GdnOpsResult = struct { y: mlx.mlx_array, state: mlx.mlx_array, state_seq: mlx.mlx_array };
 
 /// The `gated_delta_step` recurrence as MLX ops, one step per token, for GPUs
@@ -20044,8 +20096,13 @@ pub const Transformer = struct {
         }
 
         // Depthwise conv1d (groups = cdim)
-        var conv_out = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_conv1d(&conv_out, conv_input, conv_w, 1, 0, 1, cdim, self.s));
+        var conv_out = if (mlx.cudaAvailable() and mlx.getShape(conv_input)[1] == kernel)
+            try depthwiseConvStep(conv_input, conv_w, cdim, kernel, self.s)
+        else blk: {
+            var o = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_conv1d(&o, conv_input, conv_w, 1, 0, 1, cdim, self.s));
+            break :blk o;
+        };
 
         // Optional bias
         if (conv_b) |cb| {
@@ -40916,7 +40973,7 @@ pub const GatedConvStep = struct { gated: mlx.mlx_array, state: mlx.mlx_array };
 /// plus the state slice (pinned by the `fused gated conv step` test). Null →
 /// caller keeps the composed ops.
 pub fn fusedGatedConvStep(s: mlx.mlx_stream, proj: mlx.mlx_array, state: mlx.mlx_array, w: mlx.mlx_array, hidden: c_int, kernel: c_int) !?GatedConvStep {
-    if (kernel < 2) return null;
+    if (kernel < 2 or !mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(proj);
     if (dt != .bfloat16 and dt != .float16) return null;
     if (mlx.mlx_array_dtype(state) != dt or mlx.mlx_array_dtype(w) != dt) return null;
@@ -41058,7 +41115,7 @@ fn stridedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array) 
 }
 
 fn fusedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array, heads: c_int) !?mlx.mlx_array {
-    if (!swigluFusedEnabled()) return null;
+    if (!swigluFusedEnabled() or !mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(x);
     if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(g) != dt) return null;
     const xsh = mlx.getShape(x);
@@ -41172,7 +41229,7 @@ var gelu_ple_engaged: bool = false;
 /// inputs at decode width (the served Gemma 4 geometry); anything else keeps
 /// the composed ops.
 fn fusedGeluPleProj(s: mlx.mlx_stream, g: mlx.mlx_array, ple: mlx.mlx_array, table: mlx.mlx_array, pw: mlx.mlx_array, ps: mlx.mlx_array, pb: mlx.mlx_array, qp: QuantParams) !?mlx.mlx_array {
-    if (!swigluFusedEnabled()) return null;
+    if (!swigluFusedEnabled() or !mlx.streamIsGpu(s)) return null;
     if (qp.mode != .affine or qp.bits != 4 or qp.group_size != 64) return null;
     if (pw.ctx == null or ps.ctx == null or pb.ctx == null) return null;
     const dt = mlx.mlx_array_dtype(g);

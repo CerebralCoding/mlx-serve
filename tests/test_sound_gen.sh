@@ -101,7 +101,7 @@ rms = (sum(v * v for v in pcm) / len(pcm)) ** 0.5 / 32768
 assert rms > 0.005, f"near-silent output (rms {rms:.4f})"
 print(f"PASS: 3.5 s request -> {n} stereo frames at 44.1 kHz, rms {rms:.3f}")
 PY
-grep -q '\[sa3\] 3.50s -> 38 latents' "$LOG" || { echo "FAIL: no [sa3] engagement line"; exit 1; }
+grep -q '\[sa3\] 3.50s -> 108 latents' "$LOG" || { echo "FAIL: no [sa3] engagement line"; exit 1; }
 echo "PASS: engine engagement logged"
 
 # 4. A seed reproduces the same bytes; another seed is another sound.

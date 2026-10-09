@@ -62,6 +62,15 @@ command -v "$ZIG" >/dev/null || { echo "error: zig not on PATH (set ZIG=...)" >&
 command -v cmake >/dev/null || { echo "error: cmake not on PATH" >&2; exit 1; }
 mkdir -p "$WORK"
 
+if [[ "$MLX_BACKEND" == cuda ]]; then
+  echo "== patch mlx: CUDA LRU thrashing check counts consecutive misses"
+  if grep -q 'any hit resets it' "$MLX_SOURCE/mlx/backend/cuda/lru_cache.h"; then
+    echo "   lru cache: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-lru-consecutive-misses.patch"
+  fi
+fi
+
 # ── 1. Build + install libmlx (shared, omarchy Vulkan backend) ──────────
 if [[ -n "${MLX_BUILD_DIR:-}" ]]; then
   echo "== install mlx from existing build: $MLX_BUILD_DIR"
