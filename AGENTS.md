@@ -137,6 +137,7 @@ Dispatch on `config.json` `model_type`. With `--mlx-gguf` (opt-in, experimental)
 | `gemma4`, `gemma4_text` | `language_model.model` prefix; SigLIP vision; clipped linears, PLE |
 | `diffusion_gemma` | Gemma 4 26B-A4B trunk, BLOCK-DIFFUSION (diffusion.zig): ≤48-step canvas denoise; PLD/drafter/MTP/batching/prefix-cache never apply; instruct-only |
 | `gemma3`, `gemma3_text` | + flat text-only sibling; EmbeddingGemma encoder when `use_bidirectional_attention` |
+| `embedding_gemma2` | EmbeddingGemma 2: Gemma 4 trunk trained bidirectional (`forwardEmbeddingGemma2With`), projection-only PLE, INCLUSIVE band, head in the dense0 slot; images (Gemma 4 SigLIP tower, budgeted size) and video FRAMES ride `messages` on `/v1/embeddings`; no audio. Story: `docs/gotchas/models-media.md` |
 | `qwen3` | QK norm |
 | `qwen3_5`, `qwen3_5_moe(_text)` | GatedDeltaNet + optional MoE, shared expert; Qwen3-VL vision. Qwen3.8 packs serve on this arch |
 | `prism_hadamard_qwen35` | prism-ml Bonsai 2 = qwen3_5 behind block-1024 Hadamard rotations (`rht.zig`, `hadamard_block` from `modules[].block`); served in the pack's own numerics: f16 activations over its f16 scales, f32 GDN state (`ModelConfig.actDtype`/`ssmStateDtype`); fused QKV declines; MTP depth 2 |
@@ -373,6 +374,8 @@ Attention + KV:
 
 Spec decode:
 - **Verify invariant** (all drafters): `cache.step = prompt_len + emitted`, t1 NOT in cache on entry, verify input `[t1, draft…]`, partial-accept correction from ORIGINAL `verify_logits[accepted]`.
+- **A capture gate is a promise the forward must keep**: `supportsLayerCapture` said yes while `forwardGlm5With` ignored `capture_layers`, and the first DFlash prefill crashed on an unfilled slot. An arch that passes the gate fills every slot (GLM taps the MEAN of its hyper-connection streams); `dflash.encodeContext` names an unfilled one (`DflashCaptureMissing`). Guard: `glm5_next DFlash capture`.
+- **A sparse target's DFlash is policy-driven** (`dflash_policy.zig`, GLM; `MLX_SERVE_DFLASH_POLICY=0` kills it): rows follow the selector's calibrated confidence, plain ticks ride the serial pipeline with their taps parked (`dflash_pending`), and the plain cost is the REQUEST's own tick interval — the shared round-cost table's plain cell ran stale-high and the policy never stepped back.
 - **A block decoder checks its ENTRY token first** (`generate.tokenStops`, all five); only an ALL-pad generation declines commit (`commitDeclinesPadOnly`); a cancel mid batched tick still RECORDS the row (`batchedTickAction`).
 - **The token budget is a PRE-COMMIT invariant in every block decoder**; blocks publish through ONE `+= 1` loop.
 - **A spec path that refuses a KV scheme must be gated at LOAD, or implemented**: `compactRows` refused quantized KV mid-decode, so a draft tree under `--kv-quant 8` 500'd the second request. Guard: smoke `drafter_kv8`.

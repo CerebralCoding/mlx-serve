@@ -64,6 +64,7 @@ test {
     _ = @import("model_settings.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
+    _ = @import("dflash_policy.zig");
     _ = @import("mtp.zig");
     _ = @import("round_cost.zig");
     _ = @import("mtp_group_planner.zig");

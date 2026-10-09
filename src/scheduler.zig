@@ -1136,6 +1136,9 @@ pub const EmbedRequest = struct {
     model: *model_registry_mod.LoadedModel,
     /// Tokenized inputs, one slice per text. Borrowed; must outlive the call.
     token_seqs: []const []const u32,
+    /// The soft-token rows [1, n, hidden] of the ONE prompt's images and video, in prompt order. The request
+    /// owns them: the inference thread frees them when the forward is done.
+    vision_embeddings: ?mlx.mlx_array = null,
     /// Output: one pooled L2-normalized embedding per input on success.
     /// Rows + outer slice owned by `allocator`; caller frees.
     results: ?[][]f32 = null,
@@ -4403,7 +4406,9 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
                 }
                 log.info("[fwd-ubench] prefilled {d} tokens\n", .{done_pre});
             }
-            ctx.capture_ssm_seq = rows > 1 and rows <= 16 and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
+            // Rows past 16 are a prefill chunk unless `_KV` says a context stands behind them (verify widths up to 32).
+            const prefill_rows = rows > 16 and kv_pre == 0;
+            ctx.capture_ssm_seq = rows > 1 and rows <= 32 and !prefill_rows and ctx.ssm_entries != null; // verify widths capture, prefill chunks do not
             // MLX_SERVE_DECODE_FWD_UBENCH_TREE=1 at 16 rows: verify a fixed draft
             // tree (a 9-row trunk, siblings at depths 1-4, their children), as a round does.
             const tree_parents = [16]i32{ -1, 0, 1, 2, 3, 4, 5, 6, 7, 0, 1, 2, 3, 9, 10, 11 };
@@ -4415,7 +4420,6 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // Prefill widths: every forward starts from an empty cache (else each
             // one attends over the previous ones' rows) and skips the lm_head,
             // which a real intermediate chunk never evaluates.
-            const prefill_rows = rows > 16 and kv_pre == 0;
             ctx.skip_lm_head = prefill_rows;
             log.info("[fwd-ubench] rows={d} capture={} prefill={}\n", .{ tok_slice.len, ctx.capture_ssm_seq, prefill_rows });
             // Warm: first forward pays kernel JIT + lazy weight materialization.
@@ -5496,7 +5500,12 @@ fn finishVisionRequest(sch: *Scheduler, req: *VisionEncodeRequest, err_name: []c
 /// the global xfm.cache before every sub-batch, and wakes the conn thread.
 fn runEmbedRequest(sch: *Scheduler, req: *EmbedRequest) void {
     const xfm_ptr = req.model.transformer.?;
-    const results = generate_mod.computeEmbeddingsBatch(req.allocator, xfm_ptr, req.token_seqs) catch |err| {
+    // Held in a local: the request lives on the waiting thread's stack and is gone once `done` is observed.
+    const vision = req.vision_embeddings;
+    defer if (vision) |v| {
+        _ = mlx.mlx_array_free(v);
+    };
+    const results = generate_mod.computeEmbeddingsBatchWith(req.allocator, xfm_ptr, req.token_seqs, vision) catch |err| {
         finishEmbedRequest(sch, req, @errorName(err));
         return;
     };
@@ -5899,6 +5908,8 @@ fn commitSlotIfApplicable(sch: *Scheduler, slot: *Slot) void {
             }
         }
     }
+    // Plain DFlash rounds park their captures; they join the context before it is paired with the prefix.
+    gen_ptr.dflashSettle(slot.allocator, total_len) catch |err| log.warn("[hot-cache] dflash context settle failed: {s} — not committed\n", .{@errorName(err)});
     // A runtime fallback leaves the dormant assistant context at its last
     // speculative boundary while serial decode continues growing the trunk.
     // Only pair the assistant payload with this prefix when both end at the
@@ -7438,6 +7449,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .drafter_block_size = slot.drafter_block_size,
             .dflash_enabled = use_dflash,
             .dflash = if (use_dflash) slot.dflash else null,
+            .dflash_policy = use_dflash and generate_mod.Generator.dflashPolicyFor(slot.model.config.?),
             // The dflash-resolved block rides the shared drafter_block_size.
             .dflash_block_size = slot.drafter_block_size,
             // Use the resolved thinking mode and normalize the M5/block-16

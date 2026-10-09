@@ -1541,10 +1541,10 @@ struct SoundModelPreset: Identifiable, Hashable {
     static let stableAudio3SmallSFX = SoundModelPreset(
         id: "stable-audio-3-small-sfx",
         name: "Stable Audio 3 Small SFX",
-        repo: "stabilityai/stable-audio-3-small-sfx",
+        repo: "ddalcu/Stable-Audio-3-Small-SFX-MLX-Serve",
         approxRAMGB: 5,
         approxDownloadGB: 3.5,
-        description: "Sound effects and ambiences from a description — footsteps, rain, engines, impacts — up to two minutes, in about a second. Stability AI gates the download: accept its license on Hugging Face and sign in with a token first."
+        description: "Sound effects and ambiences from a description — footsteps, rain, engines, impacts — up to two minutes, in about a second. Mirror of Stability AI's Stable Audio 3 Small SFX (Stability AI Community License), no Hugging Face login needed."
     )
 
     static let all: [SoundModelPreset] = [.stableAudio3SmallSFX]

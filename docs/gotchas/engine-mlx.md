@@ -5647,3 +5647,24 @@ Defect: the full Jundot oQ3e pack (231 GiB resident on a 256 GB Mac, preflight p
 Cause: V4.1 evaluates its weights at init, before any GPU work. MLX's own reader left every shard's pages in the file cache beside the buffers, and buffers enter the residency set only once a wired limit is set and become resident (wired) only when a command buffer runs: until then they are ordinary pages, and the kernel compressed them (148 GB) instead of dropping the cache.
 Fix: V4.1 packs load through `nocache_reader` (F_NOCACHE, page-aligned stages), and `deepseek_v41.wireLoaded` applies the residency policy and runs a one-op command buffer after each layer: wired memory climbs with the load (233 GB), nothing is compressed.
 Guard: `nocache reader: tensors load byte-identical to MLX's own reader`; live, `test_dsv41.sh` on the full pack with a compressor watchdog. Tell: `vm_stat` wired flat at a few GB while the footprint climbs.
+
+## A DFlash drafter was bound to a GLM forward that never filled its taps (2026-10-07)
+
+Defect: binding incoai's DFlash2 drafter to GLM-5.3-Flash passed `supportsLayerCapture` and crashed the first prefill.
+Cause: the gate answers for every non-bidirectional arch, but `forwardGlm5With` never read `ForwardCtx.capture_layers`; the empty slots reached `mlx_concatenate_axis` and aborted the process.
+Fix: the forward fills the slot with the mean of the four hyper-connection streams after each tapped layer (SGLang's `hc_contract`), and `dflash.encodeContext` returns `DflashCaptureMissing` for any unfilled slot.
+Guard: `glm5_next DFlash capture` (env-gated, one-shot, chunked and per decode step against the reference's layer means, cosine plus RMS ratio, red when the tap is removed) and `dflash: a capture the trunk never filled is a named error`.
+
+## The policy's plain cost came from a table that folds outliers (2026-10-07)
+
+Defect: with the round policy on, novel text decoded at 56 tok/s against 62 serial, and `[spec-stats]` showed `skipped=0`: the backoff never engaged although most drafts were wasted.
+Cause: the policy read a plain round's cost from `round_cost.Table` cell 0. That cell takes a stale cell's next sample at half weight, so one slow tick moved it from 16.4 to 27.1 ms; every drafted round then looked like a win against it.
+Fix: `dflash_policy.PlainCost`, learned from the request's own consecutive pipelined ticks, slowly and by at most a quarter per sample.
+Guard: `PlainCost: a stall moves it little, a steady new speed is reached`; live, the probe's novel cell against serial and `skipped=` non-zero on prose.
+
+## A bare `@min` against a constant is a tiny integer (2026-10-08)
+
+Defect: the first copy chain of 15 drafts killed the server with a SIGBUS in the stack guard, no log line.
+Cause: `@min(p.len, MAX_DRAFTS)` with a comptime 15 has type `u4`, so `n + 2` overflowed at 15; ReleaseFast has no overflow check and the fall-through `unreachable` ran off the function.
+Fix: the result is typed (`const n: usize = @min(...)`) in `chooseRows` and `PositionStats.record`, and `chooseRows` ends in a real fallback.
+Guard: `chooseRows: a fifteen-draft chain is priced through its last row` and `PositionStats: the widest copied chain records without overflow`. A silent exit of a ReleaseFast server: read `~/Library/Logs/DiagnosticReports/*.ips` first.
