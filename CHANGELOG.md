@@ -3,6 +3,7 @@
 ## v26.10.2 — Many-User Fix - UNRELEASED - DEV
 
 ### New
+- **YuE2 songs.** m-a-p's YuE2-3B writes a full song with vocals from a style prompt and lyrics (`POST /v1/audio/music-generations`, from the `ahmadw/YuE2-3B-MLX` packs), first planning an ABC score you can read, edit and hand back as `abc`; the Music tab has a score box beside the lyrics, and the weights are non-commercial (CC BY-NC 4.0).
 - **EmbeddingGemma 2.** Google's `google/embeddinggemma-2` and its `mlx-community` packs serve text, image and video embeddings on `/v1/embeddings` (768 dimensions, `dimensions` down to 128, inputs up to 8192 tokens, the model card's task prefix goes in the text; images and videos, sent as a list of frames, ride a `messages` request like vLLM's chat embeddings); audio inputs are not wired yet.
 - **Kolibri-1.** Aleph Alpha's 78B-A3.5B MoE runs from the MLX packs already on Hugging Face (such as `here-be-dragons-ai/Kolibri-1-MLX-3bit`), with text, tool calls and thinking set by `reasoning_effort`.
 - **MTP depth bounds.** `--mtp-min-depth` / `--mtp-max-depth` bound every speculative planner choice, equal values pin one depth in place of `MLX_SERVE_MTP_FORCE_DEPTH`, and `--mtp-depth` still works as `--mtp-max-depth`, with a warning (#737).

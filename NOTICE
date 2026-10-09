@@ -630,6 +630,18 @@ part of mlx-serve: they are the Stability AI Community License
 (https://stability.ai/license), T5Gemma the Gemma Terms of Use.
 
 --------------------------------------------------------------------------------
+YuE2 (m-a-p) and ahmadw/YuE2-3B-MLX
+https://huggingface.co/m-a-p/YuE2-3B
+https://huggingface.co/ahmadw/YuE2-3B-MLX
+Oobleck decoder: Copyright (c) 2023 Stability AI (stable-audio-tools), MIT.
+SnakeBeta: Copyright (c) 2022 NVIDIA CORPORATION (BigVGAN), MIT.
+
+`src/yue2.zig` follows the YuE2 inference protocol and the pack layout of
+ahmadw's MLX port, including the decoder those packs fold in. The model WEIGHTS
+are not part of mlx-serve: they are CC BY-NC 4.0 (non-commercial); credit YuE2,
+its model name and https://huggingface.co/m-a-p/YuE2-3B when you publish output.
+
+--------------------------------------------------------------------------------
 stb_image / stb_image_write
 https://github.com/nothings/stb
 Copyright (c) 2017 Sean Barrett

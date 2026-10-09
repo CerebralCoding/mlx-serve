@@ -6692,7 +6692,7 @@ fn renderModelEntry(
             .has_image_engine = entry.image_engine != null,
             .has_audio_engine = entry.audio_engine != null,
             .has_music_backend = if (entry.audio_engine) |ae| switch (ae.backend) {
-                .music, .music3 => true,
+                .music, .music3, .yue2 => true,
                 else => false,
             } else false,
             .has_sound_backend = if (entry.audio_engine) |ae| ae.backend == .sound else false,

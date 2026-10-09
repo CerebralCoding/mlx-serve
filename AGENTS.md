@@ -47,6 +47,8 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`
 | `acestep.zig` | ACE-Step music (Qwen3 encoder, AdaLN DiT, Euler flow-match, Oobleck VAE 48 kHz; Snake/encode f32) |
 | `music3.zig` | MiniMax Music 3: Qwen3-8B global LLM (batch-2 CFG) + depth decoder → hidden states condition a flow DiT (temb as TOKEN) + Snake/DAC vocoder 44.1 kHz |
 | `stable_audio.zig` | Stable Audio 3 small text-to-audio (`/v1/audio/sound-generations`): T5Gemma + DiT + ping-pong sampler + SAME-S decoder, the official repo as published |
+| `yue2.zig` | YuE2-3B songs (`/v1/audio/music-generations`): ONE Qwen3-shaped trunk with AR and NAR weight sets per layer — ABC score → semantic ids (host sampler, CFG) → flow-matching latents → tiled Oobleck decoder, 48 kHz. Pack = ahmadw/YuE2-3B-MLX's layout (`qwen.tiktoken` via `tokenizer.loadTiktoken`) |
+| `mlx_scope.zig` | `Scope`: the ops of one forward over mlx-c, every intermediate freed together (stable_audio, yue2) |
 | `ltx_video.zig` / `ltx_audio.zig` | LTX video (one/two-stage/HQ, i2v, a2vid) + audio VAE/BigVGAN. `LtxVersion` (from `model_version`) keys 2.3-vs-2.5: text encoder, `ff_bias`, `keyframes_abs_pos_embedding` |
 | `ltx_diffvae*.zig` | LTX-2.5 DiffVAE decoder (`"decoder":"diffusion"`): geometry/tiling, fused 3D NA Metal kernel, MLX pass. Sampler contract is MEASURED (x0, 1 step, timesteps x1000) |
 | `minimax_h3*.zig` | MiniMax-H3 text-to-audio-video (arch row below), staged residency — detail in `docs/reference.md` |
@@ -163,7 +165,7 @@ Dispatch on `config.json` `model_type`. With `--mlx-gguf` (opt-in, experimental)
 | `laya` | Laya typed-decision checkpoints (no root config.json: classified from `encoder/config.json` + `rl_agent_config.json` by `model_discovery.peekLayaCheckpoint`, app twin `DownloadManager.markerModelType`): ModernBERT encoder + 2 head layers + marker scorer + act head, fp16 |
 | `kev` | Kev typed-decision packs: qwen3_5 trunk + pointer head; `kev_config.json` wins over the trunk's config.json (`model_discovery.peekKevPack`, app twin `DownloadManager.markerModelType`); the state runs once, each question from a KV/SSM snapshot (`kev.zig`) |
 | `d1` | LiquidAI D1-3B decision packs (bf16, the card's own layout): LFM2-VL trunk whose root config.json `auto_map` names `modeling_d1.D1Model` (`model_discovery.isD1Root`, app twin `DownloadManager.markerModelType`); the answer is a softmax over each option's token group at the LM head, no new weights (`d1.zig`, state runs once via `kev.scoreBranches`); text only, torchao int8 refused by name. Oracle: `tests/dump_d1_fixtures.py` |
-| media types | `flux2*`/`krea*`/`mage_flow*`/`qwen_image*` (unified t2i+edit)/`qwen3_tts`/`acestep`/`minimax_music3`/`stable_audio3`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow` + the mlx-community qwen21 spelling have NO root config.json — classified from `model_index.json`, `stable_audio3` from `model_config.json`, by `gen.peekModelType` + `model_discovery`, kept in sync) |
+| media types | `flux2*`/`krea*`/`mage_flow*`/`qwen_image*` (unified t2i+edit)/`qwen3_tts`/`acestep`/`minimax_music3`/`stable_audio3`/`yue2`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow` + the mlx-community qwen21 spelling have NO root config.json — classified from `model_index.json`, `stable_audio3` from `model_config.json`, by `gen.peekModelType` + `model_discovery`, kept in sync) |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.
 

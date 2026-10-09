@@ -89,6 +89,8 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     if (std.mem.eql(u8, model_type, "acestep")) return "text_encoder/model.safetensors";
     // Stable Audio 3: same, for its T5Gemma subdir.
     if (std.mem.eql(u8, model_type, "stable_audio3")) return "t5gemma-b-b-ul2/model.safetensors";
+    // YuE2: the upstream repo has no decoder; only a pack with the folded-in VAE can run.
+    if (std.mem.eql(u8, model_type, "yue2")) return "vae.safetensors";
     return null;
 }
 
@@ -105,6 +107,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "minimax_h3") or
         std.mem.eql(u8, model_type, "minimax_music3") or
         std.mem.eql(u8, model_type, "stable_audio3") or
+        std.mem.eql(u8, model_type, "yue2") or
         std.mem.eql(u8, model_type, "laya") or
         std.mem.eql(u8, model_type, "kev") or
         std.mem.eql(u8, model_type, "clef") or
@@ -627,6 +630,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
     if (std.mem.eql(u8, model_type, "qwen3_tts") or
         std.mem.eql(u8, model_type, "acestep") or
         std.mem.eql(u8, model_type, "minimax_music3") or
+        std.mem.eql(u8, model_type, "yue2") or
         std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
@@ -1438,6 +1442,12 @@ test "the audio kind names every audio generation endpoint" {
     const ep = ModelKind.audio.genEndpoint().?;
     for ([_][]const u8{ "/v1/audio/speech", "/v1/audio/music-generations", "/v1/audio/sound-generations" }) |p|
         try testing.expect(std.mem.indexOf(u8, ep, p) != null);
+}
+
+test "yue2 classifies as audio media; a pack without the folded-in VAE is incomplete" {
+    try testing.expect(isMediaModelType("yue2"));
+    try testing.expectEqual(ModelKind.audio, modelKindFromType("yue2"));
+    try testing.expectEqualStrings("vae.safetensors", requiredMediaMarker("yue2").?);
 }
 
 test "minimax_music3 classifies as audio media with the vocoder marker" {
