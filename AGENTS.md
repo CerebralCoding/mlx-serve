@@ -93,6 +93,7 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug 2–4× slower ⇒ fake regressions). `zig build test` does NOT refresh `zig-out/bin/mlx-serve` — rebuild before any live A/B.
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx.zig` externs. Brew: webp ≥ 1.6.0.
+- Linux/CUDA: `MLX_BACKEND=cuda MLX_CUDA_ARCHITECTURES=<sm> ./scripts/build-mlx-linux.sh` (prereqs in its header; applies `patches/mlx-cuda-*.patch`), then `zig build -Doptimize=ReleaseFast`. MLX's kernel JIT needs the toolkit headers via `CUDA_HOME` (`mlx.exportCudaHome` fills in `/opt/cuda`). Run tests with `-Dtest-filter`: the unfiltered suite does not compile on Linux.
 - Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/` and `ar rcs libjinja.a obj/*.o`.
 
 ## Testing — TDD is mandatory
@@ -390,7 +391,7 @@ Spec decode:
 - **The group planner prices each width per row** (`mtp_group_planner.zig`, `MLX_SERVE_MTP_GROUP_PLANNER=0`, per-request `enable_batch_mtp:false`) and falls to plain batched decode at width 0; `[mtp-planner]` names the choice.
 - **A group's sampled accept is ONE filtered block on the group's own eval** (`mtpGroupSampledAccept`; one shared sampler, no seeded row). A padded verify row reads `1+m` rows (`verifyRows2d`, #446).
 - **qwen4 MTP head state is a `Qwen4MtpState` swapped onto the module** (`qwen4MtpActivate` before EVERY head touch); batched verify there is opt-in (`MLX_SERVE_MTP_BATCHED_QWEN4`, `mtpRoundsStaySolo`).
-- **A DFlash sidecar yields to the MTP head when the request has company** (`requestSpecModes(..., has_company)`); a burst's first request goes plain after 2 ticks with company (`dflashYieldTick`, one-way).
+- **A DFlash sidecar yields to the MTP head when the request has company** (`requestSpecModes(..., has_company)`); a burst's first request goes plain after 2 ticks with company (`specYieldTick`, one-way; PLD too on CUDA).
 - **DFlash is a METHOD keyed on the CONFIG CONTRACT** (`block_size` + `mask_token_id` + `target_layer_ids`; `--drafter` the one flag): drafts from ONE assistant forward, anchor row DROPPED, context via `capture_layers`, block K/V never cached.
 - **DFlash2** = v1 + selector + convs on NESTED `dflash_config`; selector codebooks bf16 gather tables NEVER quantized; discovery classifies by contract. `MLX_SERVE_DFLASH_SELECTOR=0`.
 - **DSpark** = DFlash + Markov head (`dflash.Contract`, `MarkovHead`): `block_size` at ROOT; `rope_is_neox_style:false` = MLX `traditional=true`; `w1` DENSE; `MLX_SERVE_DFLASH_MARKOV=0`. Serves SAMPLED requests via one-hot acceptance (`MLX_SERVE_DSV4_DSPARK_STOCH=0`).

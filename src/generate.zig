@@ -119,7 +119,7 @@ pub const SpecDisableReason = enum {
     tool_choice,
     /// The measured round cost more per token than a measured serial token (`MtpAdaptive`).
     adaptive,
-    /// A DFlash slot gained company: it decodes plain so it can join the batched group.
+    /// A speculating slot gained company: it decodes plain so it can join the batched group.
     company,
 };
 
@@ -6457,10 +6457,11 @@ pub const Generator = struct {
         return DrafterStepResult{ .tokens = tokens, .accepted_tokens = accepted };
     }
 
-    /// Sticky like every DFlash serial switch: plain rounds do not extend the assistant context.
-    pub fn dflashYieldToCompany(self: *Generator) void {
-        if (self.dflash == null or self.spec_disabled_runtime) return;
-        log.info("  dflash=disabled (company: decoding plain in the batched group)\n", .{});
+    /// Decode plain in the batched group. Sticky for DFlash (plain rounds do not extend the
+    /// assistant context); PLD's periodic re-enable check resumes once the slot is solo.
+    pub fn yieldSpecToCompany(self: *Generator, mode: []const u8) void {
+        if (self.spec_disabled_runtime) return;
+        log.info("  {s}=disabled (company: decoding plain in the batched group)\n", .{mode});
         self.spec_disabled_runtime = true;
         self.spec_disable_reason = .company;
     }

@@ -14,7 +14,8 @@
 #
 # MLX_BACKEND=cuda instead builds upstream MLX (the pinned lib/mlx-src) with
 # its CUDA backend for NVIDIA GPUs; needs the CUDA toolkit (/opt/cuda or nvcc
-# on PATH), cuDNN and BLAS/LAPACK. MLX_CUDA_ARCHITECTURES (e.g. "120") narrows
+# on PATH), cuDNN and BLAS/LAPACK with the LAPACKE header (Arch: cmake cudnn
+# openblas cblas lapacke). MLX_CUDA_ARCHITECTURES (e.g. "120") narrows
 # the kernel build to one GPU generation.
 #
 # Usage:
@@ -60,6 +61,12 @@ MLXC_SRC="$ROOT/lib/mlxc-src"
 ZIG="${ZIG:-zig}"
 command -v "$ZIG" >/dev/null || { echo "error: zig not on PATH (set ZIG=...)" >&2; exit 1; }
 command -v cmake >/dev/null || { echo "error: cmake not on PATH" >&2; exit 1; }
+# MLX's CPU backend needs lapacke.h; without it cmake fails late with
+# "LAPACK_INCLUDE_DIRS NOTFOUND".
+[[ -f /usr/include/lapacke.h || -f /usr/local/include/lapacke.h || -f /usr/include/openblas/lapacke.h ]] || {
+  echo "error: lapacke.h not found (install LAPACKE: Arch lapacke, Debian/Ubuntu liblapacke-dev)" >&2
+  exit 1
+}
 mkdir -p "$WORK"
 
 if [[ "$MLX_BACKEND" == cuda ]]; then
@@ -68,6 +75,18 @@ if [[ "$MLX_BACKEND" == cuda ]]; then
     echo "   lru cache: already applied"
   else
     git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-lru-consecutive-misses.patch"
+  fi
+  echo "== patch mlx: CUDA fused attention at head dims 256 and 512"
+  if grep -q 'load_lane_row' "$MLX_SOURCE/mlx/backend/cuda/scaled_dot_product_attention.cu"; then
+    echo "   sdpa: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-sdpa-head-dim-256-512.patch"
+  fi
+  echo "== patch mlx: CUDA quantized matmul reads the weights once for all rows and batches"
+  if grep -q 'can_use_qmv && (M \* B == 1)' "$MLX_SOURCE/mlx/backend/cuda/quantized/quantized.cpp"; then
+    echo "   qmm: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-qmm-read-weights-once.patch"
   fi
 fi
 

@@ -550,7 +550,7 @@ pub const Slot = struct {
     planner_price_transition: bool = false,
     planner_last_width: u8 = 255,
     planner_force_plain: bool = false,
-    dflash_company_ticks: u8 = 0,
+    company_ticks: u8 = 0,
     mtp_publish_ns: u64 = 0,
     mtp_publish_gap_ms: f32 = 0,
 
@@ -2360,16 +2360,7 @@ pub const Scheduler = struct {
         // re-enable check resumes the moment concurrency drops back to one.
         // Pinned by `a spec_disabled_runtime slot is batchable, and that is the
         // documented trade` below — flip either half deliberately, not by accident.
-        return gen.spec_disabled_runtime or specTickMode(
-            slot.enable_mtp,
-            gen.mtp != null,
-            slot.enable_drafter,
-            gen.drafter != null,
-            gen.dflash != null,
-            slot.enable_pld,
-            gen.pld_enabled,
-            gen.dspark_enabled,
-        ) == .regular;
+        return gen.spec_disabled_runtime or slotSpecMode(slot, gen) == .regular;
     }
 
     /// Does this slot owe a module-head release? One single-slot tick lands it.
@@ -5297,7 +5288,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
         _ = s.in_pass.fetchSub(1, .acq_rel);
     };
 
-    dflashYieldTick(active.items);
+    specYieldTick(active.items);
 
     // 4. Decode tick. Charge the full wall-clock tick time to each
     //    participating slot — for batched ticks this matches the per-slot
@@ -6765,25 +6756,33 @@ const InterleaveCtx = struct {
     chunk_sw: io_util.Stopwatch,
 };
 
-/// Ticks a DFlash slot must see company before it gives up speculation for the batch.
-const DFLASH_COMPANY_TICKS: u8 = 2;
+/// Ticks a speculating slot must see company before it gives up speculation for the batch.
+const COMPANY_YIELD_TICKS: u8 = 2;
 
 pub fn companyStreak(streak: u8, has_company: bool) u8 {
     return if (has_company) streak +| 1 else 0;
 }
 
-/// The first request of a burst was admitted alone, so it armed DFlash and ticks serial
-/// beside the group; once company is steady it yields.
-fn dflashYieldTick(active: []const *Slot) void {
+/// Spec modes that give way to the batched group once a slot has company: the DFlash
+/// family everywhere, PLD on CUDA, where a batched tick costs about one plain step.
+pub fn yieldsToCompany(mode: SpecTickMode, cuda: bool) bool {
+    return mode == .dflash or mode == .dspark or (mode == .pld and cuda);
+}
+
+/// The first request of a burst was admitted alone, so it armed speculation and ticks
+/// serial beside the group; once company is steady it yields.
+fn specYieldTick(active: []const *Slot) void {
     for (active) |s| {
         const gen = if (s.legacy_gen) |*g| g else continue;
-        if (gen.dflash == null or gen.spec_disabled_runtime) continue;
+        if (gen.spec_disabled_runtime) continue;
+        const mode = slotSpecMode(s, gen);
+        if (!yieldsToCompany(mode, mlx.cudaAvailable())) continue;
         var company = false;
         for (active) |o| {
             if (o != s and o.model == s.model) company = true;
         }
-        s.dflash_company_ticks = companyStreak(s.dflash_company_ticks, company);
-        if (s.dflash_company_ticks >= DFLASH_COMPANY_TICKS) gen.dflashYieldToCompany();
+        s.company_ticks = companyStreak(s.company_ticks, company);
+        if (s.company_ticks >= COMPANY_YIELD_TICKS) gen.yieldSpecToCompany(@tagName(mode));
     }
 }
 
@@ -7889,6 +7888,20 @@ pub fn specTickMode(
     if (slot_enable_drafter and gen_has_drafter) return .drafter;
     if (slot_enable_pld and gen_pld_enabled) return .pld;
     return .regular;
+}
+
+/// `specTickMode` for a slot and its generator.
+fn slotSpecMode(slot: *const Slot, gen: *const Generator) SpecTickMode {
+    return specTickMode(
+        slot.enable_mtp,
+        gen.mtp != null,
+        slot.enable_drafter,
+        gen.drafter != null,
+        gen.dflash != null,
+        slot.enable_pld,
+        gen.pld_enabled,
+        gen.dspark_enabled,
+    );
 }
 
 /// Drive one Generator step (regular / PLD / drafter) and push emitted
@@ -10158,7 +10171,7 @@ test "the batched gate reads DISPATCH, not the armed spec flags" {
     const he = std.mem.indexOfPos(u8, src, hs + 1, "\n    }\n") orelse return error.MissingHelperEnd;
     const hbody = src[hs..he];
     try testing.expect(std.mem.indexOf(u8, hbody, "gen.spec_disabled_runtime") != null);
-    try testing.expect(std.mem.indexOf(u8, hbody, "specTickMode(") != null);
+    try testing.expect(std.mem.indexOf(u8, hbody, "slotSpecMode(") != null);
 
     // The dispatch answer itself: a live MTP slot never ticks regular, an
     // unarmed one always does.
@@ -11302,6 +11315,16 @@ test "transition pricing skips the first realized round after prime or width cha
 test "companyStreak: only consecutive ticks with company count" {
     try testing.expectEqual(@as(u8, 2), companyStreak(companyStreak(0, true), true));
     try testing.expectEqual(@as(u8, 0), companyStreak(1, false));
+}
+
+test "yieldsToCompany: the DFlash family everywhere, PLD only on CUDA" {
+    for ([_]SpecTickMode{ .dflash, .dspark }) |m| {
+        try testing.expect(yieldsToCompany(m, false));
+        try testing.expect(yieldsToCompany(m, true));
+    }
+    try testing.expect(yieldsToCompany(.pld, true));
+    try testing.expect(!yieldsToCompany(.pld, false));
+    for ([_]SpecTickMode{ .mtp, .drafter, .regular }) |m| try testing.expect(!yieldsToCompany(m, true));
 }
 
 test "companyPrefillChunk: a prefill narrows only while someone decodes" {

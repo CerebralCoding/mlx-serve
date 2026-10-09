@@ -463,6 +463,7 @@ pub fn main(init: std.process.Init) !void {
     // (~121 GB on a 128 GB Mac) is no defense.
     server_mod.applyMlxCacheLimit();
     server_mod.applyGpuCeilingEnv();
+    mlx.exportCudaHome();
     // Resolve lazily-cached env reads on the main thread before other threads exist.
     @import("transformer.zig").warmQsaEnvCaches();
     @import("prefix_cache.zig").warmEnvCaches();
@@ -1177,8 +1178,8 @@ pub fn main(init: std.process.Init) !void {
         }
         // Above every serve dispatch (GGUF/headless/media return early below).
         if (server_mod.shouldWarnOpenBind(host_explicit, server_mod.g_lan_share_spec != null, host)) {
-            log.warn("Listening on {s}:{d} — reachable by every device on the network this Mac is on.\n", .{ host, port });
-            log.warn("Restrict to this Mac with --host 127.0.0.1 (a future version will make that the default).\n", .{});
+            log.warn("Listening on {s}:{d} — reachable by every device on the network this machine is on.\n", .{ host, port });
+            log.warn("Restrict to this machine with --host 127.0.0.1 (a future version will make that the default).\n", .{});
         }
     }
 

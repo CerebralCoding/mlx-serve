@@ -100,6 +100,26 @@ pub fn streamIsGpu(s: mlx_stream) bool {
     return dt == .gpu and metalKernelsAvailable();
 }
 
+/// MLX's CUDA JIT looks for the toolkit headers under CUDA_HOME/CUDA_PATH, else only
+/// /usr/local/cuda; Arch installs to /opt/cuda. The root to export as CUDA_HOME, if any.
+pub fn cudaHomeDefault(env_set: bool, usr_local_has_headers: bool, opt_has_headers: bool) ?[:0]const u8 {
+    if (env_set or usr_local_has_headers or !opt_has_headers) return null;
+    return "/opt/cuda";
+}
+
+/// Export CUDA_HOME before MLX compiles its first kernel (see cudaHomeDefault).
+pub fn exportCudaHome() void {
+    if (comptime builtin.os.tag != .linux) return;
+    const env_set = std.c.getenv("CUDA_HOME") != null or std.c.getenv("CUDA_PATH") != null;
+    const has = struct {
+        fn headers(comptime root: []const u8) bool {
+            return std.c.access(root ++ "/include/cuda.h", 0) == 0;
+        }
+    };
+    if (cudaHomeDefault(env_set, has.headers("/usr/local/cuda"), has.headers("/opt/cuda"))) |home| _ = setenv("CUDA_HOME", home, 0);
+}
+extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
+
 var cuda_cache: ?bool = null;
 
 /// MLX runs on its CUDA backend (NVIDIA): `mlx_fast_cuda_kernel` instead of Metal.
@@ -816,6 +836,13 @@ pub fn applyWiredPolicy() WiredPolicyResult {
             return .{ .mode = mode, .target = target };
         },
     }
+}
+
+test "cudaHomeDefault: export /opt/cuda only when nothing else names a toolkit" {
+    try std.testing.expectEqualStrings("/opt/cuda", cudaHomeDefault(false, false, true).?);
+    try std.testing.expect(cudaHomeDefault(true, false, true) == null);
+    try std.testing.expect(cudaHomeDefault(false, true, true) == null);
+    try std.testing.expect(cudaHomeDefault(false, false, false) == null);
 }
 
 test "wired mode from env" {
