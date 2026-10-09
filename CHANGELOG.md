@@ -1,6 +1,6 @@
 # Changelog
 
-## v26.10.2 — Many-User Fix - UNRELEASED - DEV
+## v26.10.2 — Another One - UNRELEASED - DEV
 
 ### New
 - **YuE2 songs.** m-a-p's YuE2-3B writes a full song with vocals from a style prompt and lyrics (`POST /v1/audio/music-generations`, from the `ahmadw/YuE2-3B-MLX` packs), first planning an ABC score you can read, edit and hand back as `abc`; the Music tab has a score box beside the lyrics, and the weights are non-commercial (CC BY-NC 4.0).

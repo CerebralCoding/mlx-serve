@@ -403,8 +403,8 @@ fn printUsage(io: std.Io) void {
         \\                        ensureLoaded evicts LRU before exceeding.
         \\  --max-resident-mem <n>{{KB,MB,GB}}|auto
         \\                      Summed resident-bytes cap across all loaded
-        \\                        models. Default 'auto' = 80% of MLX wired
-        \\                        limit at startup. Pass 0 to disable.
+        \\                        models. Default 'auto' = the GPU working-set
+        \\                        limit. Pass 0 to disable.
         \\  --idle-evict-secs <n>
         \\                      Evict .ready entries with refcount==0 if
         \\                        idle for this many seconds. Default: off.
@@ -603,7 +603,7 @@ pub fn main(init: std.process.Init) !void {
     // 32–64 GB systems running Gemma 4 E4B-class models". Override via the
     // CLI flags below; the Swift app exposes them under Advanced settings.
     var max_resident_models: u32 = 3;
-    var max_resident_mem: u64 = 0; // 0 = auto (80% of wired limit at startup)
+    var max_resident_mem: u64 = 0; // 0 = auto (the GPU working-set limit)
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
     var metrics_enabled = false;
@@ -976,7 +976,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--max-resident-mem") and i + 1 < args.len) {
             // Plan 05 Phase D: cap on summed resident bytes. Accepts the
             // same suffixes as --prefix-cache-mem. Special string "auto"
-            // (or default 0) → 80% of mlx_set_wired_limit at server start.
+            // (or default 0) → the GPU working-set limit.
             i += 1;
             if (std.mem.eql(u8, args[i], "auto")) {
                 max_resident_mem = 0;
@@ -1425,15 +1425,8 @@ pub fn main(init: std.process.Init) !void {
         const discovery_for_registry = discovery_storage;
         discovery_storage = null; // ownership moves to the registry
 
-        // Plan 05 Phase D: compute the effective max_resident_mem. When the
-        // user didn't pass an explicit cap, derive 80% of mlx's wired limit
-        // (mlx_set_wired_limit returns a value the platform considers safe
-        // for sustained GPU work). The wired limit was already applied in
-        // the inference thread's load path; here we mirror that calculation
-        // so the registry's eviction gate stays in sync. 0 disables the cap.
-        const effective_max_resident_mem: u64 = if (max_resident_mem_explicit)
-            max_resident_mem
-        else @as(u64, mlx.maxRecommendedWorkingSet()) * 4 / 5;
+        // Without an explicit cap the registry gate is Metal's working-set limit. 0 disables it.
+        const effective_max_resident_mem = autoResidentMemBytes(max_resident_mem_explicit, max_resident_mem);
         if (effective_max_resident_mem > 0) {
             log.info("[registry] max_resident_models={d}, max_resident_mem={d:.1} GB\n", .{
                 max_resident_models,
@@ -1823,12 +1816,10 @@ fn runDs4Offline(
     log.info("[ds4] generated {d} tokens (max={d})\n", .{ generated, max_tokens });
 }
 
-/// Registry resident-memory cap: the user's explicit value, or 80% of mlx's
-/// wired limit at startup (mirrors the MLX serve block). 0 = query failed →
-/// unlimited (the count cap still applies).
+/// Registry resident-memory cap: the user's explicit value, or Metal's working-set limit.
+/// 0 = query failed → unlimited (the count cap still applies).
 fn autoResidentMemBytes(explicit: bool, val: u64) u64 {
-    if (explicit) return val;
-    return @as(u64, mlx.maxRecommendedWorkingSet()) * 4 / 5;
+    return model_registry_mod.ModelRegistry.residentMemCap(explicit, val, mlx.maxRecommendedWorkingSet());
 }
 
 fn dirBasename(path: []const u8) []const u8 {

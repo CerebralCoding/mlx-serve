@@ -89,7 +89,7 @@ mlx-serve --model /path/to/model --prompt "What is 2+2?"
 | `--lan-discover` | off | Discover models other Macs share: they appear in `/v1/models` as `model@peer` and requests proxy to that Mac |
 | `--lan-name NAME` | hostname | The Bonjour name other Macs see |
 | `--model-dir PATH` | none | Discover and serve every model in a folder (LRU resident set). Repeatable — folders merge first-wins |
-| `--max-resident-mem N{MB,GB}` | auto | Summed memory cap across loaded models; decides whether a model may load at all (auto = 80% of the MLX wired limit, `0` disables) |
+| `--max-resident-mem N{MB,GB}` | auto | Summed memory cap across loaded models; decides whether a model may load at all (auto = the GPU working-set limit, `0` disables) |
 | `--max-resident-models N` | `3` | How many models stay loaded at once (LRU-evicted) |
 | `--idle-evict-secs N` | off | Unload models nobody is using after this many idle seconds |
 | `--no-warmup-eager` | off | Skip the eager warmup at boot (benchmarking / minimal-footprint deployments) |
