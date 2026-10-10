@@ -304,6 +304,8 @@ pub const SubmitParams = struct {
     mrope_total: usize = 0,
     mrope_delta: i32 = 0,
     logprobs_n: u32 = 0,
+    /// `/v1/completions` echo: score every prompt token (cold prefill, no restore).
+    prompt_logprobs: bool = false,
     /// Wave 1.A: per-request override of the process-default KV-cache quant
     /// scheme. When non-null, this slot's KVCache is constructed with this
     /// config instead of `Scheduler.kv_quant_config`. Lets one server host a
@@ -635,6 +637,10 @@ pub const Slot = struct {
     /// `nonStreamingViaScheduler` (or equivalent) at completion; if the
     /// caller doesn't consume, `Slot.deinit` frees the contents.
     logprobs_buf: std.ArrayList(generate_mod.LogprobResult),
+    /// Prompt-token logprobs for an echo request (`SubmitParams.prompt_logprobs`),
+    /// filled by prefill; taken by the conn thread like `logprobs_buf`.
+    prompt_logprobs: bool,
+    prompt_logprobs_buf: std.ArrayList(generate_mod.LogprobResult),
 
     /// Initialize but do NOT take ownership of caches — those are allocated
     /// inside `init` from the slot's allocator.
@@ -783,6 +789,9 @@ pub const Slot = struct {
             .generated_ids = null,
             .was_pad_only = true,
             .logprobs_buf = .empty,
+            .prompt_logprobs = params.prompt_logprobs,
+            .prompt_logprobs_buf = .empty,
+            .skip_prefix_cache = params.prompt_logprobs,
         };
 
         // ForwardCtx points at fields owned by `slot` — must outlive the
@@ -848,8 +857,17 @@ pub const Slot = struct {
         // 0 so this is a no-op on the success path.
         for (self.logprobs_buf.items) |*lp| self.allocator.free(lp.top_logprobs);
         self.logprobs_buf.deinit(self.allocator);
+        for (self.prompt_logprobs_buf.items) |*lp| self.allocator.free(lp.top_logprobs);
+        self.prompt_logprobs_buf.deinit(self.allocator);
         self.out_buf.deinit(self.allocator);
         self.allocator.destroy(self);
+    }
+
+    /// Inference thread: the echo sink, emptied first, since a retried prefill starts over.
+    fn freshPromptLogprobs(self: *Slot) *std.ArrayList(generate_mod.LogprobResult) {
+        for (self.prompt_logprobs_buf.items) |*lp| self.allocator.free(lp.top_logprobs);
+        self.prompt_logprobs_buf.clearRetainingCapacity();
+        return &self.prompt_logprobs_buf;
     }
 
     /// Inference thread: record the reasoning→payload boundary so it is
@@ -6813,6 +6831,16 @@ pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDeco
     return parseDecodeShare(text);
 }
 
+/// An echo prefill ranks every row against the whole vocab: the top-k sort peaks at five
+/// [chunk, vocab] 4-byte arrays (1.25 GiB at 256 rows of Gemma's 262k vocab), beside the
+/// chunk's own bf16 logits (128 MiB).
+const PROMPT_LOGPROBS_CHUNK: u32 = 256;
+
+fn promptLogprobsWidthCap(echo: bool, cap: u32) u32 {
+    if (!echo) return cap;
+    return if (cap == 0) PROMPT_LOGPROBS_CHUNK else @min(cap, PROMPT_LOGPROBS_CHUNK);
+}
+
 /// The width a prefill started beside live decoders may run at, 0 = no cap. Decided when
 /// the prefill starts, after admission, so admission bills the uncapped width. A decoder
 /// that finishes mid-prefill lifts the cap only where the adaptive width hook runs.
@@ -7483,7 +7511,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 0,
             // The width the admission guard billed for this request; the forward can never run wider.
             .pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk, sch.decodingCount()),
-            .decode_share_width_cap = decodeShareAdmissionCap(sch.liveDecodingCount(), prefillDecodeShare()),
+            .decode_share_width_cap = promptLogprobsWidthCap(slot.prompt_logprobs, decodeShareAdmissionCap(sch.liveDecodingCount(), prefillDecodeShare())),
             .dflash_ctx_restored = dflash_pass,
             .mtp_cache_restored = mtp_pass,
             // Abandoned-prefill abort: the conn thread sets slot.cancelled
@@ -7505,7 +7533,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
             else
                 null,
-            .chunk_width_hook = if (prefill_chunk_adapt != null)
+            .chunk_width_hook = if (prefill_chunk_adapt != null and !slot.prompt_logprobs)
                 .{ .ctx = &width_ctx, .call = chunkWidthCb, .confirm = chunkWidenConfirmCb }
             else
                 null,
@@ -7515,6 +7543,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             // prefill final-token forward runs — a post-init field write is
             // too late for the certified lm_head prune.
             .logprobs_n = slot.logprobs_n,
+            .prompt_logprobs = if (slot.prompt_logprobs) slot.freshPromptLogprobs() else null,
         },
     );
     slot.prefill_interleaved_ns = interleave_ctx.decode_ns;
@@ -11332,6 +11361,14 @@ test "companyPrefillChunk: a prefill narrows only while someone decodes" {
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(8192, 1));
     try testing.expectEqual(@as(u32, 1024), companyPrefillChunk(1024, 3));
     try testing.expectEqual(@as(u32, 2048), companyPrefillChunk(0, 1));
+}
+
+test "promptLogprobsWidthCap: an echo prefill narrows to its cap, 0 (uncapped) included" {
+    try testing.expectEqual(@as(u32, 0), promptLogprobsWidthCap(false, 0));
+    try testing.expectEqual(@as(u32, 1024), promptLogprobsWidthCap(false, 1024));
+    try testing.expectEqual(PROMPT_LOGPROBS_CHUNK, promptLogprobsWidthCap(true, 0));
+    try testing.expectEqual(PROMPT_LOGPROBS_CHUNK, promptLogprobsWidthCap(true, 1024));
+    try testing.expectEqual(@as(u32, 128), promptLogprobsWidthCap(true, 128));
 }
 
 test "decode share: a live share caps the width only while someone decodes" {
