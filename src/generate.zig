@@ -2543,6 +2543,11 @@ pub const Generator = struct {
         return if (stoch_enabled) .stochastic else .off;
     }
 
+    /// Shared by dispatch and /props; this disables drafting, not resident stages.
+    pub fn dsparkEnabled() bool {
+        return if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] != '0' else true;
+    }
+
     /// Stochastic-DSpark kill switch — MLX_SERVE_DSV4_DSPARK_STOCH=0
     /// restores the greedy-only chokepoint gate for A/Bs.
     var dspark_stoch_cache: ?bool = null;
@@ -2612,8 +2617,11 @@ pub const Generator = struct {
             // remain hard-off regardless: their verify forwards go through
             // machinery this arch cannot roll back.
             const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.dsv41_ext.?);
-            const dspark_env_off = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] == '0' else false;
-            const arm = dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
+            const dspark_env_off = !dsparkEnabled();
+            const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
+                DsparkArm.off
+            else
+                dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
             // mlx-stream's lane samples a sampled request itself, from the request's own settings.
             const lane_sampling: ?mlx_stream.SamplingParams = if (dspark_env_off or arm == .off) null else .{
                 .temperature = sampling.temperature,
@@ -19689,6 +19697,28 @@ test "EmbeddingGemma 2: a checkpoint missing its head or per-layer-input weights
 
 extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn unsetenv(name: [*:0]const u8) c_int;
+
+test "native speculation: shared DSpark environment policy" {
+    const name = "MLX_SERVE_DSV4_DSPARK";
+    const saved = if (std.c.getenv(name)) |value|
+        try testing.allocator.dupeSentinel(u8, std.mem.span(value), 0)
+    else
+        null;
+    defer {
+        if (saved) |value| {
+            _ = setenv(name, value, 1);
+            testing.allocator.free(value);
+        } else {
+            _ = unsetenv(name);
+        }
+    }
+    try testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    try testing.expect(Generator.dsparkEnabled());
+    for ([_][:0]const u8{ "", "1", "0", "0disabled" }) |value| {
+        try testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
+        try testing.expectEqual(value.len == 0 or value[0] != '0', Generator.dsparkEnabled());
+    }
+}
 
 // ── Allocator-cache clear cadence (issue #110) ───────────────────────────────
 
