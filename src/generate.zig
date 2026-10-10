@@ -2587,7 +2587,7 @@ pub const Generator = struct {
         // inherits the model's mask without per-site wiring.
         var sampling = sampling_in;
         sampling.suppress_mask = xfm.suppress_mask;
-        sampling.keyed = xfm.config.rowExactDecode();
+        sampling.keyed = xfm.config.rowExactDecode() and mlx.metalKernelsAvailable(); // the keyed sampler is a Metal kernel
         sampling.position_base = pickLookupPromptSource(prompt_ids, options_in.lookup_prompt).len;
         // Spec drafts and verify rows share the serial sampler's keys (and
         // mlx-stream's lane draws from the seed), so an unseeded sampled

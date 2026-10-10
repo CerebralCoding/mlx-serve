@@ -17918,7 +17918,7 @@ pub const Transformer = struct {
             log.info("[qwen4] n-gram table {d} rows x {d} ({d}-bit, mmapped), PLE at layer {d}, QSA budget {d}/{d}\n", .{ st.table.rows, st.table.dim, st.table.bits, config.ple_layer_idx, config.indexer_budget, config.indexer_compress_ratio });
         }
 
-        const int8_on = config.int8_prefill_override orelse qmm_int8.enabled();
+        const int8_on = (config.int8_prefill_override orelse qmm_int8.enabled()) and mlx.metalKernelsAvailable();
         var int8_cache: ?*qmm_int8.Cache = null;
         errdefer if (int8_cache) |c| allocator.destroy(c);
         if (int8_on) {
@@ -37795,7 +37795,7 @@ fn moeRouterTopK(
     topk_group: c_int,
     gate: ?RouterGate,
 ) !?Transformer.MoeRouting {
-    if (!moeRouterFusedEnabled()) return null;
+    if (!moeRouterFusedEnabled() or !mlx.streamIsGpu(s)) return null;
     const mode: RouterMode = if (gate != null and mode_in == .softmax) .softmax_gate else mode_in;
     const sigmoid_mode = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped or mode == .logit_bias;
     const lsh = mlx.getShape(logits);
@@ -42222,7 +42222,7 @@ pub fn gatherQmvGateUp(
     limit: u32,
 ) !?mlx.mlx_array {
     if (!gatherQmvGateUpEnabled()) return null;
-    if (envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsGpu(s) or envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -42461,7 +42461,7 @@ pub fn gatherQmvGateUpRows(
 ) !?mlx.mlx_array {
     if (!gatherQmvGateUpEnabled()) return null;
     if (!moeRowsFusedEnabled()) return null;
-    if (envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsGpu(s) or envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -42634,7 +42634,7 @@ pub fn gatherQmvAct(
     x_per_expert: bool,
     act_relu2: bool,
 ) !?mlx.mlx_array {
-    if (envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsGpu(s) or envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
     // Two dequant arithmetics, one kernel shape. Any other mode (mxfp4/mxfp8,
     // whose scales are e8m0 over different group sizes) falls back — running a
     // bank through the wrong dequant is silently wrong, not a crash.
@@ -42874,7 +42874,7 @@ pub fn gatherQmvDownReduce(
     mode: QuantMode,
 ) !?mlx.mlx_array {
     if (!downReduceFusedEnabled()) return null;
-    if (envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsGpu(s) or envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -43086,7 +43086,7 @@ pub fn gatherQmvDownReduceRows(
 ) !?mlx.mlx_array {
     if (!downReduceFusedEnabled()) return null;
     if (!moeRowsFusedEnabled()) return null;
-    if (envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsGpu(s) or envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -74458,4 +74458,27 @@ test "glm5_next MTP fixture: the pack's mtp.0 layer drafts as mlx-vlm's drafter,
     try testing.expectEqual(@as(usize, @intCast(R)), cache2.seqLen(0));
     std.debug.print("[glm5 mtp fixture] history + {d} single rows: min cos {d:.5}, decided misses {d}\n", .{ R - t_pre, worst, misses });
     try testing.expect(one_shot_ok and worst > 0.995 and misses == 0);
+}
+
+test "Metal-only kernels decline on a stream without them, so the MLX-op path runs" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var a = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(a);
+    try mlx.check(mlx.mlx_ones(&a, &[_]c_int{ 1, 1024 }, 2, .float32, s));
+    var signs = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(signs);
+    try mlx.check(mlx.mlx_ones(&signs, &[_]c_int{1024}, 1, .float32, s));
+    const ids = mlx.mlx_array_new_int(0);
+    defer _ = mlx.mlx_array_free(ids);
+    const eps = mlx.mlx_array_new_float(1e-6);
+    defer _ = mlx.mlx_array_free(eps);
+
+    try testing.expect((try moeRouterTopK(s, a, signs, 4, .sigmoid_bias, true, 1.0, .float32, 0, 0, null)) == null);
+    try testing.expect((try gatherQmvAct(s, a, a, a, a, ids, 4, 64, .affine, false, false)) == null);
+    try testing.expect((try qmv2.qmm(a, a, a, a, 2, 128, false, true, s)) == null);
+    try testing.expect((try rht.normRotate(a, null, signs, eps, signs, 1024, false, s)) == null);
+    const rotated = try rht.transform(a, signs, 1024, false, s);
+    defer _ = mlx.mlx_array_free(rotated);
+    try mlx.check(mlx.mlx_array_eval(rotated));
 }
