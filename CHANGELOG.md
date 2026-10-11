@@ -41,6 +41,8 @@
 - **Your defaults, everywhere.** Set temperature, penalties and reasoning budget once, for all models or per model, and lock them if you want them to win over the client (thanks @Cianidos).
 - **More launchers.** ZCode (thanks @beamivalice), fx and Grok join the app's Code menu and `mlx-serve launch`, and the console Monitor keeps 24 hours of history in your browser and names each agent (thanks @STRML).
 - **More decision models.** LiquidAI's D1 and Cloudflare's Clef and Clef-Flash (thanks @CerebralCoding) join Laya and Kev in one Decisions pane.
+- **GLM-5.3 sees.** GLM-5.3-Flash now reads images, so an agent on it can look at its own screenshots.
+- **Agents build better games.** The mlx-serve skill that coding agents get adds a 3D game guide (movement, foliage, lighting) and one script that generates every asset, then makes textures seamless, cuts out sprites and sizes 3D models.
 - **More packs load as they are.** oMLX's Flash Next packs (thanks @otarkhan) and Sushi's GLM-5.3, MiMo and BF16 Flash Next packs (thanks @beamivalice).
 - **For power users.** An SSD-only prompt cache that holds no idle RAM (thanks @Cianidos), DFlash2 drafting for GLM-5.3, MTP depth bounds and greedy tail, DSpark that honors every opt-out (thanks @jasontitus), llama.cpp v0.6.0, and metrics that count every outcome once (thanks @STRML). The Homebrew cask is now `mlx-serve`; run `brew trust ddalcu/mlx-serve` once.
 - **MiniMax-H3 recipes.** Turbo at 4 steps is the fastest; Turbo off at 30 steps gives the cleanest picture (a 10-second 1312x736 clip in about 18 minutes on an M5 Ultra).

@@ -19,6 +19,7 @@ const mlx_stream = if (@import("build_options").mlx_stream) @import("arch/mlx_st
 const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
+const glm_vision = @import("glm_vision.zig");
 const mrope_mod = @import("mrope.zig");
 const vision_mod = @import("vision.zig");
 const log = @import("log.zig");
@@ -14840,6 +14841,14 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
             .pixels_tolerance = config.lv_pixels_tolerance,
         };
     }
+    if (config.glm_vision) return .{
+        .mode = .glm,
+        .patch = config.qv_patch,
+        .tps = config.qv_temporal_patch,
+        .merge = config.qv_merge,
+        .min_tokens = config.glmv_min_image_tokens,
+        .max_tokens = config.glmv_max_image_tokens,
+    };
     if (config.isEmbeddingGemma2()) return .{
         .mode = .gemma_budget,
         .patch = config.vision_patch_size,
@@ -14907,6 +14916,23 @@ test "visionPreprocFromConfig threads each tower's processor bounds" {
     try std.testing.expectEqual(.gemma, visionPreprocFromConfig(&.{}).mode);
 }
 
+test "GLM-5.3-Flash images decode onto the processor's padded canvas" {
+    const glm = visionPreprocFromConfig(&.{ .glm_vision = true, .qv_patch = 14, .qv_temporal_patch = 2, .qv_merge = 2, .glmv_min_image_tokens = 16, .glmv_max_image_tokens = 8000 });
+    try std.testing.expectEqual(.glm, glm.mode);
+    try std.testing.expectEqual(@as(u32, 8000), glm.max_tokens);
+    const a = std.testing.allocator;
+    const jpeg = try @import("clef_http_test.zig").readFile(std.testing.io, "tests/fixtures/house.jpeg");
+    defer a.free(jpeg);
+    const img = decodeImageToPixels(a, jpeg, glm) orelse return error.BadImage;
+    defer a.free(img.pixels);
+    // 730x487 fits the budget: padded to 756x504, never resized (the reference's own numbers).
+    try std.testing.expectEqual(@as(u32, 756), img.width);
+    try std.testing.expectEqual(@as(u32, 504), img.height);
+    try std.testing.expectEqual(@as(u32, 36), img.grid_h);
+    try std.testing.expectEqual(@as(u32, 54), img.grid_w);
+    try std.testing.expectEqual(@as(usize, 36 * 54 * 3 * 2 * 14 * 14 * 4), img.pixels.len);
+}
+
 test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma format)" {
     // Live crash 2026-08-11: the app preprocesses images into Gemma's square
     // `x-mlx-pixels` buffer unless it recognises the arch, so Muse-Glimmer got
@@ -14920,7 +14946,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     try std.testing.expectEqual(@as(u32, 2), gemma.width);
     try std.testing.expectEqual(@as(u32, 0), gemma.grid_h);
 
-    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .gemma_budget } }) |vp| {
+    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .glm }, .{ .mode = .gemma_budget } }) |vp| {
         try std.testing.expect(parseImageUrlContent(std.testing.allocator, url, vp) == null);
     }
 }
@@ -15348,6 +15374,12 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
         const img = vision_mod.budgetPixels(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens) catch return null;
         log.info("  Decoded {d}x{d} image → {d}x{d} float32 CHW ({d} soft tokens)\n", .{ src_w, src_h, img.w, img.h, (img.h / vp.patch / vp.merge) * (img.w / vp.patch / vp.merge) });
         return .{ .pixels = img.pixels, .width = img.w, .height = img.h };
+    }
+
+    if (vp.mode == .glm) {
+        const pv = glm_vision.preprocess(allocator, src.rgb, src_h, src_w, vp.patch, vp.tps, vp.merge, vp.min_tokens, vp.max_tokens) catch return null;
+        log.info("  Decoded {d}x{d} image → glm grid {d}x{d} ({d} tokens, canvas {d}x{d})\n", .{ src_w, src_h, pv.grid_h, pv.grid_w, (pv.grid_h / vp.merge) * (pv.grid_w / vp.merge), pv.w, pv.h });
+        return .{ .pixels = pv.bytes, .width = pv.w, .height = pv.h, .grid_h = pv.grid_h, .grid_w = pv.grid_w };
     }
 
     // Patch-grid towers: smart-resize to a multiple of patch·merge, normalize
