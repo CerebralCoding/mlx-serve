@@ -4696,7 +4696,7 @@ struct MessageBubble: View {
                                          streaming: message.isStreaming)
                                 .textSelection(.enabled)
                                 .environment(\.codeBlockRow, CodeBlockRow(
-                                    willResize: { onWillResize?() }, didResize: { onDidResize?() },
+                                    resize: { resize(animated: false, $0) },
                                     isExpanded: { [foldStore, id = message.id] in foldStore?.isExpanded(id, block: $0) ?? false },
                                     setExpanded: { [foldStore, id = message.id] in foldStore?.set(id, block: $0, expanded: $1) }))
                         } else {

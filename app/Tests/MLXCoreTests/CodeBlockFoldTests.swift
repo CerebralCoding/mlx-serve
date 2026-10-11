@@ -62,8 +62,8 @@ final class CodeBlockFoldTests: XCTestCase {
 
     /// A fresh context per row render must not count as a change, or every block re-lexes per streamed token.
     func testRowContextsAlwaysCompareEqual() {
-        let a = CodeBlockRow(willResize: {}, didResize: {}, isExpanded: { _ in true }, setExpanded: { _, _ in })
-        let b = CodeBlockRow(willResize: {}, didResize: {}, isExpanded: { _ in false }, setExpanded: { _, _ in })
+        let a = CodeBlockRow(resize: { $0() }, isExpanded: { _ in true }, setExpanded: { _, _ in })
+        let b = CodeBlockRow(resize: { _ in }, isExpanded: { _ in false }, setExpanded: { _, _ in })
         XCTAssertEqual(a, b)
     }
 

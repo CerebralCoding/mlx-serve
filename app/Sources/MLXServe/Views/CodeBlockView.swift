@@ -225,14 +225,13 @@ enum CodeBlockStatus: Equatable {
     }
 }
 
-/// What a transcript row hands its code blocks: the bracket around a change
-/// that shortens the row, so the reader keeps their place (`ChatScroll`'s
-/// `rowWillResize` / `rowDidResize`), and fold memory by block index that
-/// outlives a rebuild of the transcript (`FoldStore`). Always equal: a fresh
-/// one per row render must not re-render every block in the row.
+/// What a transcript row hands its code blocks: the row's resize bracket
+/// (`MessageBubble.resize`) for a change that shortens the row, so the reader
+/// keeps their place, and fold memory by block index that outlives a rebuild
+/// of the transcript (`FoldStore`). Always equal: a fresh one per row render
+/// must not re-render every block in the row.
 struct CodeBlockRow: Equatable {
-    let willResize: () -> Void
-    let didResize: () -> Void
+    let resize: (_ change: @escaping () -> Void) -> Void
     let isExpanded: (Int) -> Bool
     let setExpanded: (Int, Bool) -> Void
 
@@ -436,11 +435,8 @@ struct CodeBlockView: View {
     private func toggleFold() {
         row?.setExpanded(index, !expanded)
         guard expanded else { expanded = true; return }
-        // Folding shortens the row under the reader, so it is bracketed; the
-        // end is reported once the shorter layout has landed.
-        row?.willResize()
-        expanded = false
-        DispatchQueue.main.async { DispatchQueue.main.async { row?.didResize() } }
+        // Folding shortens the row under the reader, so it goes through the row's bracket.
+        if let row { row.resize { expanded = false } } else { expanded = false }
     }
 }
 
