@@ -4274,10 +4274,11 @@ const CTX_SIZING_CACHE_RESERVE: u64 = 2 * 1024 * 1024 * 1024;
 
 /// The previous context-sizing cache reserve: the raw `--prefix-cache-mem` ask. Kept for
 /// ungated archs so their advertised `context_length` does not move.
-/// The ungated arm's ask. A sliding-ring entry cannot be trimmed below its ring (`ringFloor`), so
-/// a budget under one session caches nothing for it: it asks for one session at the working context.
+/// The ungated arm's ask. A sliding-ring entry cannot be trimmed below its ring (`ringFloor`) and a
+/// hybrid entry restores only at a checkpoint, so a budget under one session keeps a stale prefix of
+/// the longest conversations: those ask for one session at the working context.
 fn ungatedHotCacheAsk(config: *const model_mod.ModelConfig, requested: u64, explicit: bool, kv_bits: u64, ctx_tokens: u64, chunk: u64) u64 {
-    if (!config.slidingRing()) return requested;
+    if (!config.slidingRing() and !config.hasSsmLayers()) return requested;
     return defaultPrefixCacheAsk(requested, explicit, oneSessionEntryBytes(config, kv_bits, ctx_tokens, chunk));
 }
 
@@ -4331,7 +4332,7 @@ pub fn prefixCacheMemForLoad(config: *model_mod.ModelConfig, requested: u64, rev
         if (ask > 0 and clamped < ask) {
             log.info("[hot-cache] budget clamped {d} -> {d} MB (weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{ ask >> 20, clamped >> 20 });
         } else if (ask != requested) {
-            log.info("[hot-cache] budget {d} MB (one session at the working context: a sliding-ring entry is never trimmed)\n", .{clamped >> 20});
+            log.info("[hot-cache] budget {d} MB (one session at the working context: a sliding-ring or hybrid entry restores whole or at a checkpoint)\n", .{clamped >> 20});
         } else if (requested == 0) {
             log.info("[hot-cache] budget capped at {d} MB (no --prefix-cache-mem; weights + ctx KV + prefill reserve vs GPU ceiling)\n", .{clamped >> 20});
         }
@@ -6037,6 +6038,44 @@ pub const AdmissionBill = struct {
     }
 };
 
+/// Unloads idle resident models, least recently used first, until `fits` holds; false when
+/// nothing idle is left. An idle model is memory its next request reloads.
+pub fn fitAfterUnloadingIdle(ctx: anytype, fits: fn (@TypeOf(ctx)) bool, unloadOne: fn (@TypeOf(ctx)) bool) bool {
+    while (!fits(ctx)) if (!unloadOne(ctx)) return false;
+    return true;
+}
+
+test "a prompt that does not fit unloads idle models, oldest first, until it fits" {
+    const t = std.testing;
+    const Fake = struct {
+        needed: u64,
+        available: u64,
+        idle: []const u64, // resident bytes, least recently used first
+        unloaded: usize = 0,
+        fn fits(f: *@This()) bool {
+            return f.needed <= f.available;
+        }
+        fn unloadOne(f: *@This()) bool {
+            if (f.unloaded == f.idle.len) return false;
+            f.available += f.idle[f.unloaded];
+            f.unloaded += 1;
+            return true;
+        }
+    };
+    // Already fits: nothing is unloaded.
+    var a = Fake{ .needed = 5, .available = 9, .idle = &.{ 15, 3 } };
+    try t.expect(fitAfterUnloadingIdle(&a, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 0), a.unloaded);
+    // The live shape: GLM's prompt needs 10.5 GB beside 9.4 GB free and an idle 14.7 GB image model.
+    var b = Fake{ .needed = 10_558, .available = 9_466, .idle = &.{ 14_730, 8_000 } };
+    try t.expect(fitAfterUnloadingIdle(&b, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 1), b.unloaded);
+    // Nothing idle left to give back: still refused.
+    var c = Fake{ .needed = 50, .available = 9, .idle = &.{ 15, 3 } };
+    try t.expect(!fitAfterUnloadingIdle(&c, Fake.fits, Fake.unloadOne));
+    try t.expectEqual(@as(usize, 2), c.unloaded);
+}
+
 test "a refusal names the credit it COMPARED, never the residency it cannot take" {
     const t = std.testing;
     const mb: u64 = 1024 * 1024;
@@ -6548,9 +6587,36 @@ fn checkAttentionMemory(allocator: std.mem.Allocator, stream: *Conn, prompt_ids:
         });
         return true;
     }
-    if (needed > available) {
-        const needed_mb = needed / (1024 * 1024);
-        const avail_mb = available / (1024 * 1024);
+    if (needed > available) if (global_scheduler) |sch| {
+        const Rebill = struct {
+            sch: *scheduler_mod.Scheduler,
+            keep: []const u8,
+            bill: *AdmissionBill,
+            config: *const model_mod.ModelConfig,
+            prompt_ids: []const u32,
+            max_tokens: u32,
+            kv_override: ?transformer_mod.KVQuantConfig,
+            unchunked: bool,
+            enable_mtp: bool,
+            media_bytes: u64,
+            fn fits(r: *@This()) bool {
+                return r.bill.fits();
+            }
+            fn unloadOne(r: *@This()) bool {
+                const id = r.sch.idleModelToUnload(r.keep) orelse return false;
+                log.info("  prompt {d} tokens does not fit — unloading idle model {s} first\n", .{ r.prompt_ids.len, id });
+                r.sch.unloadModelIfIdle(id, 0) catch return false;
+                r.bill.* = prefillAdmissionBill(r.config, r.prompt_ids.len, r.max_tokens, r.kv_override, r.unchunked, r.prompt_ids, .{ .mtp_on = r.enable_mtp });
+                r.bill.needed += r.media_bytes;
+                return true;
+            }
+        };
+        var rebill = Rebill{ .sch = sch, .keep = lm.id, .bill = &bill, .config = config, .prompt_ids = prompt_ids, .max_tokens = max_tokens, .kv_override = kv_override, .unchunked = unchunked_prefill, .enable_mtp = enable_mtp, .media_bytes = media_bytes };
+        if (fitAfterUnloadingIdle(&rebill, Rebill.fits, Rebill.unloadOne)) return true;
+    };
+    if (bill.needed > bill.available) {
+        const needed_mb = bill.needed / (1024 * 1024);
+        const avail_mb = bill.available / (1024 * 1024);
         log.warn("  prompt {d} tokens needs ~{d}MB (KV+working+margin) at prefill chunk {d}, ~{d}MB available + ~{d}MB reclaimable of ~{d}MB resident hot cache — rejecting\n", .{ prompt_len, needed_mb, bill.chunk, avail_mb, bill.evictionCredit() / (1024 * 1024), bill.evictable / (1024 * 1024) });
         // A refusal quotes the numbers it compared, hot cache included; everything the cache holds
         // is evictable here by construction (the withheld case took the deferral arm).
@@ -23275,7 +23341,7 @@ test "mlxMemoryGuardApplies: embedded engines (ds4/llama) skip the MLX-prefill m
     try t.expect(!mlxMemoryGuardApplies(false, true));
 }
 
-test "ungatedHotCacheAsk: a sliding-ring arch asks for one whole session, every other arch keeps its ask" {
+test "ungatedHotCacheAsk: a sliding-ring or hybrid arch asks for one whole session, every other arch keeps its ask" {
     const t = std.testing;
     const mimo: model_mod.ModelConfig = .{ .model_type = "mimo_v2", .num_hidden_layers = 4, .head_dim = 192, .v_head_dim = 128, .num_key_value_heads = 8, .num_global_key_value_heads = 4, .sliding_window = 128, .sliding_window_pattern = 4 };
     const session = oneSessionEntryBytes(&mimo, 16, 1_000_000, 8192);
@@ -23285,6 +23351,11 @@ test "ungatedHotCacheAsk: a sliding-ring arch asks for one whole session, every 
     try t.expectEqual(@as(u64, 1 << 30), ungatedHotCacheAsk(&mimo, 1 << 30, true, 16, 100_000, 8192));
     const llama: model_mod.ModelConfig = .{ .model_type = "llama" };
     try t.expectEqual(PREFIX_CACHE_MEM_DEFAULT, ungatedHotCacheAsk(&llama, PREFIX_CACHE_MEM_DEFAULT, false, 16, 100_000, 8192));
+    // A hybrid entry restores only at a checkpoint, so a budget under one session keeps a stale prefix.
+    const qwen: model_mod.ModelConfig = .{ .model_type = "qwen3_5", .num_hidden_layers = 64, .head_dim = 256, .num_attention_heads = 24, .num_key_value_heads = 4, .full_attention_interval = 4 };
+    const qwen_session = oneSessionEntryBytes(&qwen, 16, 262_144, 8192);
+    try t.expect(qwen_session > PREFIX_CACHE_MEM_DEFAULT);
+    try t.expectEqual(qwen_session, ungatedHotCacheAsk(&qwen, PREFIX_CACHE_MEM_DEFAULT, false, 16, 262_144, 8192));
 }
 
 test "slotFixedKvBytes: a MiMo slot bills its sliding rings once, at keep + one chunk of rows" {

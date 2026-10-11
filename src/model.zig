@@ -906,6 +906,11 @@ pub const ModelConfig = struct {
     /// (`slidingRing`): spec rollback plus the prefix-cache matches that land near an entry's end.
     pub const SLIDING_RING_SLACK: u32 = 2048;
 
+    /// Recurrent (SSM / conv) layers beside attention: a cached state restores only at a checkpoint.
+    pub fn hasSsmLayers(self: *const ModelConfig) bool {
+        return self.has_hybrid_layers or self.full_attention_interval > 0;
+    }
+
     /// Sliding layers cache a bounded ring of rows, as mlx-lm's `RotatingKVCache`, not every token.
     pub fn slidingRing(self: *const ModelConfig) bool {
         return self.isMimo();

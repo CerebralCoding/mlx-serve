@@ -2645,3 +2645,17 @@ Fix: every non-multipart body (and every Responses WebSocket frame) is scanned o
 `[`/`{` outside strings (`jsonNestingDepth`) and refused past `MAX_JSON_DEPTH` (4096: above the
 3000-deep contract in `test_api_edges.sh`, far below the overflow).
 Guard: `jsonNestingDepth: brackets inside strings never count` (server.zig).
+
+## An idle media model got an agent turn refused (2026-10-11)
+
+Defect: a pi agent on GLM-5.3 (173 GB) generating its own assets got a 400 on a 36.7k-token turn
+("requires ~10558MB … only ~9466MB is available"), and pi ended the session. Krea (14.7 GB) sat
+idle beside it from the agent's image jobs a minute earlier.
+
+Cause: the connection thread's admission credited only the hot prefix cache as reclaimable. An idle
+resident model is memory too, but only a LOAD's eviction planner ever freed one.
+
+Fix: before refusing, `checkAttentionMemory` unloads idle resident models least recently used first
+(`Scheduler.idleModelToUnload` + `unloadModelIfIdle`, never the request's own model) and re-bills
+after each, via `fitAfterUnloadingIdle`.
+Guard: `a prompt that does not fit unloads idle models, oldest first, until it fits` (server.zig).
