@@ -27,7 +27,7 @@ enum InterfacePrefKey {
 /// The look of the player and the history in the Voice, Music and Sound tabs.
 /// Both run the same player and AI Radio; only the drawing differs.
 enum AudioPlayerStyle: String, CaseIterable, Identifiable {
-    case mlxAmp, modern
+    case modern, mlxAmp
     var id: String { rawValue }
     /// What the setting's menu shows. MLX-Amp is a name and stays as written.
     var label: String {
@@ -37,8 +37,8 @@ enum AudioPlayerStyle: String, CaseIterable, Identifiable {
         }
     }
 
-    /// The author's player stays the default; every view reading the setting starts here.
-    static let defaultStyle = AudioPlayerStyle.mlxAmp
+    /// Every view reading the setting starts here.
+    static let defaultStyle = AudioPlayerStyle.modern
 }
 
 /// How wide a conversation reads: fixed points, so resizing the window spends

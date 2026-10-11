@@ -1224,6 +1224,10 @@
 "Plan (%lld steps)" = "计划（%lld 步）";
 "Play" = "播放";
 "Play the next track when one ends" = "一首播完后自动播放下一首";
+"More" = "更多";
+"Today" = "今天";
+"Yesterday" = "昨天";
+"Earlier" = "更早";
 "Playlist" = "播放列表";
 "Pods, deployments, services — uses your local kubeconfig" = "Pod、部署、服务 —— 使用你本地的 kubeconfig";
 "Polish" = "波兰语";

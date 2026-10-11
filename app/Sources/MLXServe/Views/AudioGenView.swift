@@ -85,11 +85,12 @@ struct AudioHistoryShelf: View {
                             MlxAmpPlaylist(width: width, height: MlxAmpPlaylist.minHeight, paths: paths, current: playingPath,
                                            onPlay: onPlay, onStop: onStop)
                         }
+                        .frame(height: MlxAmpPlaylist.minHeight * MlxAmpStyle.scale)
                     case .modern:
                         ModernPlaylist(paths: paths, current: playingPath, paused: paused, onPlay: onPlay, onStop: onStop)
+                            .frame(height: 300)
                     }
                 }
-                .frame(height: MlxAmpPlaylist.minHeight * MlxAmpStyle.scale)
                 .onAppear { AudioClipPlayer.shared.queue = paths }
                 .onChange(of: paths) { _, p in AudioClipPlayer.shared.queue = p }
             }

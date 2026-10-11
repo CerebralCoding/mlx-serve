@@ -20,20 +20,20 @@ final class ModernAudioPlayerTests: XCTestCase {
 
     // MARK: - The setting
 
-    func testMlxAmpIsTheDefault() {
-        XCTAssertEqual(AudioPlayerStyle.defaultStyle, .mlxAmp)
-        XCTAssertEqual(stored().wrappedValue, .mlxAmp)
-    }
-
-    func testTheStoredLookIsTheOneShown() {
-        defaults.set(AudioPlayerStyle.modern.rawValue, forKey: InterfacePrefKey.audioPlayerStyle)
+    func testModernIsTheDefault() {
+        XCTAssertEqual(AudioPlayerStyle.defaultStyle, .modern)
         XCTAssertEqual(stored().wrappedValue, .modern)
     }
 
-    /// A value a later build wrote falls back to the default rather than to nothing.
-    func testAnUnknownValueFallsBackToMlxAmp() {
-        defaults.set("cassette", forKey: InterfacePrefKey.audioPlayerStyle)
+    func testTheStoredLookIsTheOneShown() {
+        defaults.set(AudioPlayerStyle.mlxAmp.rawValue, forKey: InterfacePrefKey.audioPlayerStyle)
         XCTAssertEqual(stored().wrappedValue, .mlxAmp)
+    }
+
+    /// A value a later build wrote falls back to the default rather than to nothing.
+    func testAnUnknownValueFallsBackToTheDefault() {
+        defaults.set("cassette", forKey: InterfacePrefKey.audioPlayerStyle)
+        XCTAssertEqual(stored().wrappedValue, .modern)
     }
 
     /// The setting the way the three views read it.
@@ -58,10 +58,10 @@ final class ModernAudioPlayerTests: XCTestCase {
         XCTAssertEqual(ModernAudioPlayer.volumeSymbol(0.9), "speaker.wave.3.fill")
     }
 
-    func testADeckKeyIsGreyVioletWhenOnAndFaintWhileLocked() {
+    func testADeckKeyIsGreyAccentWhenOnAndFaintWhileLocked() {
         XCTAssertEqual(ModernAudioPlayer.keyInk(enabled: true, lit: false, pressed: false), .secondaryLabelColor)
         XCTAssertEqual(ModernAudioPlayer.keyInk(enabled: true, lit: false, pressed: true), .labelColor)
-        XCTAssertEqual(ModernAudioPlayer.keyInk(enabled: true, lit: true, pressed: false), ModernSpectrum.violetNS)
+        XCTAssertEqual(ModernAudioPlayer.keyInk(enabled: true, lit: true, pressed: false), .controlAccentColor)
         XCTAssertEqual(ModernAudioPlayer.keyInk(enabled: false, lit: false, pressed: false), .quaternaryLabelColor)
         XCTAssertEqual(ModernAudioPlayer.keyInk(enabled: false, lit: true, pressed: false).alphaComponent, 0.4, accuracy: 0.001)
     }
@@ -73,16 +73,20 @@ final class ModernAudioPlayerTests: XCTestCase {
         XCTAssertEqual(ModernAudioPlayer.seekFraction(x: 400, track: track), 1)
     }
 
-    /// A click on the clocks beside the seek bar is not a seek; one on the track (or its thumb's reach) is.
+    /// A click on the clocks under the waveform is not a seek; one anywhere on the waveform is.
     @MainActor
-    func testTheSeekBarTakesClicksOnTheTrackOnly() {
-        let size = CGSize(width: 300, height: 20)
-        let hit = ModernLiveDrawing.seekHitRect(size: size)
-        let track = ModernLiveDrawing.track(width: size.width)
-        XCTAssertFalse(hit.contains(CGPoint(x: 4, y: 10)), "the elapsed clock")
-        XCTAssertFalse(hit.contains(CGPoint(x: 296, y: 10)), "the total clock")
-        XCTAssertTrue(hit.contains(CGPoint(x: track.lowerBound - 4, y: 10)), "the thumb at the start")
-        XCTAssertTrue(hit.contains(CGPoint(x: 150, y: 10)), "the middle of the track")
+    func testTheSeekBarTakesClicksOnTheWaveformOnly() {
+        let size = CGSize(width: 300, height: 30 + ModernDrawing.clockRow)
+        let hit = ModernDrawing.seekHitRect(size: size)
+        XCTAssertTrue(hit.contains(CGPoint(x: 1, y: 15)), "the start of the waveform")
+        XCTAssertTrue(hit.contains(CGPoint(x: 299, y: 15)), "the end of the waveform")
+        XCTAssertFalse(hit.contains(CGPoint(x: 150, y: size.height - 4)), "the clocks")
+    }
+
+    @MainActor
+    func testTheRightClockCountsWhatIsLeft() {
+        XCTAssertEqual(ModernAudioPlayer.remaining(elapsed: 13, total: 32), "-0:19")
+        XCTAssertEqual(ModernAudioPlayer.remaining(elapsed: 40, total: 32), "-0:00")
     }
 
     /// A click outside the canvas's pointer region does nothing, drag included; one inside drags anywhere.
@@ -108,17 +112,33 @@ final class ModernAudioPlayerTests: XCTestCase {
         XCTAssertEqual(hits, [100, 190])
     }
 
-    /// The history row's waveform moves only while its track plays, not while it is paused.
-    func testAHistoryRowMovesOnlyWhileItsTrackPlays() {
-        XCTAssertTrue(ModernPlaylist.moves("a.wav", current: "a.wav", paused: false))
-        XCTAssertFalse(ModernPlaylist.moves("a.wav", current: "a.wav", paused: true))
-        XCTAssertFalse(ModernPlaylist.moves("b.wav", current: "a.wav", paused: false))
+    /// A row's cover says what a click does while hovered; otherwise it moves only while its track plays.
+    func testAHistoryRowCoverGlyph() {
+        let playing = ModernPlaylist.glyph(playing: true, paused: false, hovered: false, locked: false)
+        XCTAssertEqual(playing.symbol, "waveform")
+        XCTAssertTrue(playing.moving)
+        let paused = ModernPlaylist.glyph(playing: true, paused: true, hovered: false, locked: false)
+        XCTAssertEqual(paused.symbol, "pause.fill")
+        XCTAssertFalse(paused.moving)
+        XCTAssertEqual(ModernPlaylist.glyph(playing: true, paused: false, hovered: true, locked: false).symbol, "stop.fill")
+        XCTAssertEqual(ModernPlaylist.glyph(playing: false, paused: false, hovered: true, locked: false).symbol, "play.fill")
+        XCTAssertNil(ModernPlaylist.glyph(playing: false, paused: false, hovered: true, locked: true).symbol, "AI Radio locks the rows")
+        XCTAssertNil(ModernPlaylist.glyph(playing: false, paused: false, hovered: false, locked: false).symbol)
     }
 
-    /// The analyzer's bands, with each neighbour pair's midpoint between them: a wide screen reads as one smooth spectrum.
-    func testTheSpectrumDrawsEachBandAndTheMidpointsBetween() {
-        XCTAssertEqual(ModernSpectrum.bars([0, 1, 0.5]), [0, 0.5, 1, 0.75, 0.5])
-        XCTAssertEqual(ModernSpectrum.bars([0.3]), [0.3])
-        XCTAssertEqual(ModernSpectrum.bars([]), [])
+    // MARK: - The waveform
+
+    func testTheEnvelopeScalesTheLoudestSliceToOne() {
+        XCTAssertEqual(SpectrumAnalyzer.envelope([0, 0.25, -1, 0.5], slices: 4), [0, 0.25, 1, 0.5])
+        XCTAssertEqual(SpectrumAnalyzer.envelope([3, -3, 0, 0], slices: 2), [1, 0], "a slice's loudness, not its sign")
+        XCTAssertEqual(SpectrumAnalyzer.envelope([0, 0], slices: 2), [0, 0])
+        XCTAssertEqual(SpectrumAnalyzer.envelope([], slices: 8), [])
+    }
+
+    /// Fewer bars than slices: each bar keeps the loudest slice it covers, so a hit never vanishes.
+    func testWaveformBarsKeepTheLoudestSlice() {
+        XCTAssertEqual(SpectrumAnalyzer.bars([0.1, 0.9, 0.2, 0.3], count: 2), [0.9, 0.3])
+        XCTAssertEqual(SpectrumAnalyzer.bars([0.4], count: 3), [0.4, 0.4, 0.4])
+        XCTAssertEqual(SpectrumAnalyzer.bars([], count: 3), [])
     }
 }
