@@ -5275,6 +5275,7 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // wired in src/vision.zig (UnifiedEmbedder), so keep them under the same
     // `load_vision` gate as the SigLIP weights (`--no-vision` → text only).
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
+        std.mem.startsWith(u8, key, "vision_model.") or
         std.mem.startsWith(u8, key, "embed_vision.") or
         std.mem.startsWith(u8, key, "vision_embedder.") or
         std.mem.startsWith(u8, key, "embed_audio.") or
@@ -6016,6 +6017,9 @@ test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nesti
     // --no-vision cannot drop it and we hold ~0.9 GB we never read.
     try testing.expect(!shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", false));
     try testing.expect(shouldKeepWeightKey("model.visual.blocks.0.norm1.weight", true));
+    // oMLX 0.7.1's GLM-5.3 oQ packs spell the tower `vision_model.`.
+    try testing.expect(!shouldKeepWeightKey("vision_model.blocks.0.norm1.weight", false));
+    try testing.expect(shouldKeepWeightKey("vision_model.blocks.0.norm1.weight", true));
     // Text weights are never touched either way.
     try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
     try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));

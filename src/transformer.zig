@@ -34753,6 +34753,14 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             var qkv_b: [3]mlx.mlx_array = undefined;
             var conv_w: [3]mlx.mlx_array = undefined;
             var any_scales = false;
+            // oMLX 0.7.1 packs ship the three convs already joined ([C, K, 1]) and
+            // the gate (A_log, dt_bias, f_a/f_b_proj) under `forget_gate.`.
+            const fused_conv = getLayerWeightAtOpt(weights, name_buf, prefix, li, ab, "conv1d.weight");
+            var fg_buf: [64]u8 = undefined;
+            const fg: []const u8 = if (getLayerWeightAtOpt(weights, name_buf, prefix, li, ab, "forget_gate.A_log") != null)
+                std.fmt.bufPrint(&fg_buf, "{s}.forget_gate", .{ab}) catch unreachable
+            else
+                ab;
             for (qkv_names, 0..) |base, n| {
                 var nb: [256]u8 = undefined;
                 qkv_w[n] = try getLayerWeightAt(weights, name_buf, prefix, li, ab, std.fmt.bufPrint(&nb, "{s}.weight", .{base}) catch unreachable);
@@ -34779,7 +34787,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                     1 => "k_conv1d.weight",
                     else => "v_conv1d.weight",
                 };
-                conv_w[n] = getLayerWeightAtOpt(weights, name_buf, prefix, li, ab, conv_nested) orelse
+                if (fused_conv == null) conv_w[n] = getLayerWeightAtOpt(weights, name_buf, prefix, li, ab, conv_nested) orelse
                     try getLayerWeightAt(weights, name_buf, prefix, li, ab, conv_flat);
             }
             // The three projections join only when quantized IDENTICALLY: a q at
@@ -34804,8 +34812,11 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             } else {
                 for (&qkv_parts, 0..) |*q, n| q.* = .{ .w = qkv_w[n], .s = qkv_s[n], .b = qkv_b[n] };
             }
-            var joined_conv = try concatRows(&conv_w, s);
-            try owned_bf16.append(allocator, joined_conv);
+            var joined_conv = fused_conv orelse blk: {
+                const j = try concatRows(&conv_w, s);
+                try owned_bf16.append(allocator, j);
+                break :blk j;
+            };
             // HF-layout packs store the depthwise conv [C, 1, K]; MLX's conv1d reads [C, K, 1].
             const csh = mlx.getShape(joined_conv);
             if (csh.len == 3 and csh[1] == 1 and csh[2] > 1) {
@@ -34830,7 +34841,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             // A_log is [Hv] but the gate is per KEY CHANNEL — expand once here
             // so the hot path stays elementwise over flat [B,S,Hv*Dk] arrays
             // (no reshape, no per-head broadcast, per layer per token).
-            const a_log_raw = try getLayerWeightAt(weights, name_buf, prefix, li, ab, "A_log");
+            const a_log_raw = try getLayerWeightAt(weights, name_buf, prefix, li, fg, "A_log");
             const dk_c: c_int = @intCast(config.linear_key_head_dim);
             const hv_c: c_int = @intCast(config.linear_num_value_heads);
             var a_log_exp = mlx.mlx_array_new();
@@ -34848,7 +34859,7 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
 
             var gb: [64]u8 = undefined;
             const z = try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.{s}", .{ ab, if (is_glm) "g_a_proj" else "g_proj" }) catch unreachable);
-            const f = try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.{s}", .{ ab, if (is_glm) "f_a_proj" else "f_proj" }) catch unreachable);
+            const f = try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.{s}", .{ fg, if (is_glm) "f_a_proj" else "f_proj" }) catch unreachable);
             const bq = try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.b_proj", .{ab}) catch unreachable);
             const oq = try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.o_proj", .{ab}) catch unreachable);
             lw.attn = .{ .linear = .{
@@ -34866,12 +34877,12 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
                 .b_b = bq.b,
                 .conv1d_w = joined_conv,
                 .A_log = a_log_exp,
-                .dt_bias = try getLayerWeightAt(weights, name_buf, prefix, li, ab, "dt_bias"),
+                .dt_bias = try getLayerWeightAt(weights, name_buf, prefix, li, fg, "dt_bias"),
                 .norm_w = try getLayerWeightAt(weights, name_buf, prefix, li, ab, "o_norm.weight"),
                 .out_w = oq.w,
                 .out_s = oq.s,
                 .out_b = oq.b,
-                .a2 = if (is_glm) try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.f_b_proj", .{ab}) catch unreachable) else .{},
+                .a2 = if (is_glm) try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.f_b_proj", .{fg}) catch unreachable) else .{},
                 .z2 = if (is_glm) try loadQW(weights, name_buf, prefix, li, std.fmt.bufPrint(&gb, "{s}.g_b_proj", .{ab}) catch unreachable) else .{},
                 .qkv_parts = qkv_parts,
             } };
@@ -34895,7 +34906,8 @@ fn initMoeLayers(allocator: std.mem.Allocator, config: ModelConfig, weights: *We
             // Decode reads q|k|v and the first gate stages as one row-joined matmul.
             if (is_glm and la.qkv_s.ctx != null) {
                 var parts = [_][3]*mlx.mlx_array{ .{ &la.qkv_w, &la.qkv_s, &la.qkv_b }, .{ &la.z_w, &la.z_s, &la.z_b }, .{ &la.a_w, &la.a_s, &la.a_b }, .{ &la.b_w, &la.b_s, &la.b_b } };
-                const names = [_][]const u8{ "self_attn.g_a_proj", "self_attn.f_a_proj", "self_attn.b_proj" };
+                var fa_buf: [64]u8 = undefined;
+                const names = [_][]const u8{ "self_attn.g_a_proj", std.fmt.bufPrint(&fa_buf, "{s}.f_a_proj", .{fg}) catch unreachable, "self_attn.b_proj" };
                 la.in = try fuseRowsInPlace(&parts, 1, &names, weights, name_buf, prefix, li, &owned_bf16, allocator, s);
             }
         } else if (is_linear) {
@@ -74665,6 +74677,64 @@ test "moe fp4 decode: expert biases or a clamped SwiGLU keep the composed chain"
     try testing.expect(!moeFp4DecodeEligible(1, false, null, .mxfp4, .mxfp4, .mxfp4));
     try testing.expect(!moeFp4DecodeEligible(1, false, 0, .affine, .mxfp4, .mxfp4));
     try testing.expect(!moeFp4DecodeEligible(moe_fp4.MAX_ROWS + 1, false, 0, .mxfp4, .mxfp4, .mxfp4));
+}
+
+test "glm5_next: oMLX 0.7.1's layout (one fused conv1d, forget_gate.*) gives the published layout's logits bit for bit (GLM5_MODEL)" {
+    const model_dir = std.c.getenv("GLM5_MODEL") orelse return error.SkipZigTest;
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const allocator = testing.allocator;
+    const s = mlx.gpuStream();
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+
+    const Logits = struct {
+        fn of(io_: std.Io, alloc: std.mem.Allocator, cfg_in: model_mod.ModelConfig, dir: []const u8, omlx: bool, st: mlx.mlx_stream) ![]f32 {
+            var cfg = cfg_in;
+            var w = try model_mod.loadWeights(io_, alloc, dir);
+            defer w.deinit();
+            model_mod.resolveWeightPrefix(&cfg, &w);
+            if (omlx) for (0..cfg.num_hidden_layers) |li| {
+                var nb: [256]u8 = undefined;
+                var convs: [3]mlx.mlx_array = undefined;
+                const bases = [_][]const u8{ "q", "k", "v" };
+                for (bases, 0..) |b, n| {
+                    const key = try std.fmt.bufPrint(&nb, "{s}.layers.{d}.self_attn.{s}_conv1d.weight", .{ cfg.weight_prefix, li, b });
+                    convs[n] = w.get(key) orelse break;
+                } else {
+                    // oMLX stores the joined conv in MLX's [C, K, 1].
+                    const joined = try concatRows(&convs, st);
+                    defer _ = mlx.mlx_array_free(joined);
+                    var t = mlx.mlx_array_new();
+                    defer _ = mlx.mlx_array_free(t);
+                    try mlx.check(mlx.mlx_swapaxes(&t, joined, 1, 2, st));
+                    const fused = try materializedOwnedCopy(st, t);
+                    try w.map.put(try alloc.dupe(u8, try std.fmt.bufPrint(&nb, "{s}.layers.{d}.self_attn.conv1d.weight", .{ cfg.weight_prefix, li })), fused);
+                    for (bases) |b| w.remove(try std.fmt.bufPrint(&nb, "{s}.layers.{d}.self_attn.{s}_conv1d.weight", .{ cfg.weight_prefix, li, b }));
+                    for ([_][]const u8{ "A_log", "dt_bias", "f_a_proj.weight", "f_a_proj.scales", "f_a_proj.biases", "f_b_proj.weight", "f_b_proj.scales", "f_b_proj.biases" }) |leaf| {
+                        const kv = w.map.fetchRemove(try std.fmt.bufPrint(&nb, "{s}.layers.{d}.self_attn.{s}", .{ cfg.weight_prefix, li, leaf })) orelse continue;
+                        alloc.free(kv.key);
+                        try w.map.put(try alloc.dupe(u8, try std.fmt.bufPrint(&nb, "{s}.layers.{d}.self_attn.forget_gate.{s}", .{ cfg.weight_prefix, li, leaf })), kv.value);
+                    }
+                }
+            };
+            var xfm = try Transformer.init(io_, alloc, cfg, &w);
+            defer xfm.deinit();
+            var ids = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(ids);
+            try mlx.check(mlx.mlx_arange(&ids, 1, 25, 1, .int32, st));
+            var batched = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(batched);
+            try mlx.check(mlx.mlx_reshape(&batched, ids, &.{ 1, 24 }, 2, st));
+            const out = try xfm.forward(batched);
+            defer _ = mlx.mlx_array_free(out);
+            return qwen4ReadF32(alloc, out, st);
+        }
+    };
+    const published = try Logits.of(io, allocator, config, std.mem.span(model_dir), false, s);
+    defer allocator.free(published);
+    const omlx = try Logits.of(io, allocator, config, std.mem.span(model_dir), true, s);
+    defer allocator.free(omlx);
+    try testing.expectEqualSlices(f32, published, omlx);
 }
 
 test "glm5_next MTP fixture: the pack's mtp.0 layer drafts as mlx-vlm's drafter, one-shot and row by row (GLM5_MODEL, GLM5_MTP_FIXTURE)" {
