@@ -3844,7 +3844,7 @@ pub fn prefillTransientReserveAtKv(
         config.prefillAttnKeys(seq),
         prefillStreamBytesPerToken(config),
         prefillDequantWeightBytes(config),
-        .{ .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk), .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits) },
+        .{ .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk), .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits), .dequant_width_per_token = if (config.isGlm5()) glm5DequantWidth(config) else null },
     ) + qsaMaskBytes(config, @min(chunk, @max(seq, 1)), seq);
 }
 
@@ -4606,6 +4606,38 @@ fn qwen4DeployedTestConfig() model_mod.ModelConfig {
     cfg.linear_conv_kernel_dim = 4;
     cfg.quant_group_size = 64;
     cfg.quant_mode = .affine;
+    return cfg;
+}
+
+/// GLM-5.3-Flash pack geometry after `model.zig` parses its nested text config.
+fn glm5TestConfig() model_mod.ModelConfig {
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "glm5_next"; // arch-scan-exempt: test fixture, not a gate
+    cfg.num_hidden_layers = 45;
+    cfg.full_attention_interval = 4; // 11 DSA at idx%4==3, 34 KDA
+    cfg.num_attention_heads = 64;
+    cfg.num_key_value_heads = 64;
+    cfg.head_dim = 256;
+    cfg.hidden_size = 4096;
+    cfg.dsa_kv_lora_rank = 512;
+    cfg.dsa_head_dim = 256;
+    cfg.dsa_index_topk = 2048;
+    cfg.dsa_index_kpool = 4;
+    cfg.dsa_index_head_dim = 128;
+    cfg.dsa_index_heads = 32;
+    cfg.linear_num_key_heads = 64;
+    cfg.linear_key_head_dim = 128;
+    cfg.linear_num_value_heads = 64;
+    cfg.linear_value_head_dim = 128;
+    cfg.linear_conv_kernel_dim = 4;
+    cfg.num_experts = 288;
+    cfg.num_experts_per_tok = 8;
+    cfg.moe_intermediate_size = 2048;
+    cfg.shared_expert_intermediate_size = 2048;
+    cfg.intermediate_size = 12288;
+    cfg.intermediate_size_declared = true;
+    cfg.vocab_size = 154880;
+    cfg.ctx_override = 147456;
     return cfg;
 }
 
@@ -5540,6 +5572,8 @@ fn growCoexistBytes(config: *const model_mod.ModelConfig, warm: WarmPrefix, seq:
 
 /// Per-request bytes that scale with the prompt rather than the chunk.
 pub const PrefillRequestTerms = struct {
+    /// Dense operands of one caching layer; null retains the generic GQA width.
+    dequant_width_per_token: ?u64 = null,
     /// Cache capacity reserved at admission beyond `seq * kv_per_tok`: the generation headroom
     /// plus a chunk of slack, so no buffer grows during the prefill (#353).
     reserved_kv_bytes: u64 = 0,
@@ -5561,6 +5595,12 @@ pub const PrefillRequestTerms = struct {
     dq_min_rows: u64 = transformer_mod.PREFILL_DQ_GEMM_MIN_M,
 };
 
+/// `glmDsaWith` reads the old indexer tail before append, then the new latent + indexer.
+/// The unused old latent is lazy and never materialized. Both indexer views may coexist.
+fn glm5DequantWidth(config: *const model_mod.ModelConfig) u64 {
+    return (@as(u64, config.dsa_kv_lora_rank) + 4 * @as(u64, config.dsa_index_head_dim)) * 2;
+}
+
 pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64, hdim: u64, score_hdim: u64, hidden: u64, ffn: u64, kv_bits: u64, chunk: u64, attn_keys: u64, stream_per_tok: u64, dequant_weights: u64, req: PrefillRequestTerms) u64 {
     // A forward is never wider than the prompt: a prompt shorter than the
     // chunk runs ONE seq-wide forward, so the per-chunk transient envelope
@@ -5570,7 +5610,7 @@ pub fn prefillMemoryNeeded(seq: u64, heads: u64, kv_heads: u64, kv_per_tok: u64,
     const fwd: u64 = @min(chunk, @max(seq, 1));
     const kv_bytes: u64 = seq * kvBytesPerTokenAtBits(kv_per_tok, kv_bits);
     const scores: u64 = if (!transformer_mod.prefillHeadDimFused(@intCast(score_hdim))) heads * fwd * @min(attn_keys, seq) * 2 else 0;
-    const dequant: u64 = if (kv_bits < 16) 2 * seq * kv_heads * hdim * 2 else 0;
+    const dequant: u64 = if (kv_bits < 16) (if (req.dequant_width_per_token) |width| seq * width else 2 * seq * kv_heads * hdim * 2) else 0;
     const mlp: u64 = 8 * fwd * @max(hidden, ffn) * 2;
     // The MLP envelope alone is not the whole per-token working set: an arch
     // with its own prefill streams (linear-attention layers, MoE gather-sort
@@ -5790,11 +5830,46 @@ fn sessionBytesPerToken(config: *const model_mod.ModelConfig, kv_bits: u64) u64 
     return kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits) +| statePerTokenBilled(config) +| head;
 }
 
+/// GLM does not reserve up front: the proportional allocator can hold a rounded,
+/// overallocated destination beside its old buffers, including during output growth.
+fn glm5RequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) PrefillRequestTerms {
+    const ctx: u64 = getEffectiveContextLength(config);
+    const output = @min(max_tokens, if (ctx > 0) ctx -| seq else max_tokens);
+    const end = seq +| output;
+    const needed: usize = @intCast(@max(end, 1));
+    const capacity: u64 = @max(warm.capacity_tokens, transformer_mod.KVCache.nextCapacityPolicy(needed - 1, needed, false));
+    const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
+    const fwd = @min(chunk, @max(seq -| warm.matched_tokens, 1));
+    const pools = end / @max(@as(u64, config.dsa_index_kpool), 1);
+    const nax = transformer_mod.verifyQmmNaxAvailable();
+    const indexed = nax and config.dsa_index_head_dim == 128 and config.hadamard_block == 0;
+    const sparse = nax and config.dsa_kv_lora_rank == 512 and config.num_attention_heads % 32 == 0;
+    // selectRows: f32 scores + negative + argpartition; off NAX, also [S,H,P].
+    const indexer = fwd *| pools *| (12 + if (indexed) @as(u64, 0) else 12 * @as(u64, config.dsa_index_heads));
+    const selected = @min(end, @as(u64, config.dsa_index_topk) +| config.dsa_index_kpool -| 1);
+    // The fallback gathers latent rows per query; indexed NAX never allocates that tensor.
+    const gather = if (sparse) 0 else fwd *| selected *| @as(u64, config.dsa_kv_lora_rank) *| 2;
+    const dequant_output = if (kv_bits < 16) output *| glm5DequantWidth(config) else 0;
+    return .{
+        .dequant_width_per_token = glm5DequantWidth(config),
+        .reserved_kv_bytes = (capacity -| seq) *| kv_per_tok,
+        // Two pipelined lag snapshots, the current state and one advancing/capture state.
+        .state_bytes = 4 * config.ssmCheckpointBytes() +| indexer +| gather +| dequant_output,
+        .checkpoint_bytes = retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk),
+        .shared_resident_bytes = warm.creditedRows(seq) *| kv_per_tok,
+        // A narrow final span/decode can grow without any mid-layer eval barrier.
+        .grow_coexist_bytes = if (end > chunk) (end -| 1) *| kv_per_tok else 0,
+        .slot_fixed_kv_bytes = slotFixedKvBytes(config, kv_bits, chunk),
+        .dq_min_rows = transformer_mod.prefillDqGemmMinRows(config.quant_bits),
+    };
+}
+
 /// The per-request terms of the admission bill, in one place.
 pub fn prefillRequestTerms(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) PrefillRequestTerms {
     // Arch gate for the reservation and state terms (measured on qwen4_exp alone; the
     // reservation's allocator twin is gated too, so an ungated guard billed memory never reserved).
     const dq_min_rows: u64 = transformer_mod.prefillDqGemmMinRows(config.quant_bits);
+    if (config.isGlm5()) return glm5RequestTerms(config, seq, max_tokens, kv_bits, chunk, warm);
     if (!config.longCtxGated()) {
         // A checked-out entry is the slot's own buffer on every arch; both terms are zero for a share.
         const kv_per_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
@@ -25954,6 +26029,112 @@ test "prefillRequestTerms: the reservation terms are qwen4_exp-only, a donated w
     try t.expect(gated.checkpoint_bytes > 0);
     try t.expect(gated.state_bytes > 0);
     try t.expect(gated.shared_resident_bytes > 0);
+}
+
+test "GLM ledger: transient bills latent and both indexer views, not expanded heads" {
+    const t = std.testing;
+    var glm = glm5TestConfig();
+    const seq: u64 = 131072;
+    const dense = prefillTransientReserveAtKv(&glm, 16, 512, seq);
+    const q8 = prefillTransientReserveAtKv(&glm, 8, 512, seq);
+    try t.expectEqual(@as(u64, 11 * 1536), glm.kvBytesPerToken());
+    try t.expectEqual(@as(u64, 8976), kvBytesPerTokenAtBits(glm.kvBytesPerToken(), 8));
+    try t.expectEqual(seq * (1536 + 512) * 5 / 4, q8 - dense);
+}
+
+test "GLM ledger: non-GLM transient widths are unchanged" {
+    const t = std.testing;
+    var llama = model_mod.ModelConfig{ .model_type = "llama" };
+    llama.num_key_value_heads = 8;
+    llama.head_dim = 128;
+    const dense = prefillTransientReserveAtKv(&llama, 16, 512, 131072);
+    const q8 = prefillTransientReserveAtKv(&llama, 8, 512, 131072);
+    try t.expectEqual(@as(u64, 131072 * 2 * 8 * 128 * 2 * 5 / 4), q8 - dense);
+}
+
+test "GLM ledger: f32 checkpoints, live state, capacity growth and output are billed" {
+    const t = std.testing;
+    const saved_stride = ssm_checkpoint_stride;
+    const saved_max = ssm_checkpoint_max;
+    const saved_override = generate_mod.prefill_chunk_override;
+    defer {
+        ssm_checkpoint_stride = saved_stride;
+        ssm_checkpoint_max = saved_max;
+        generate_mod.prefill_chunk_override = saved_override;
+    }
+    ssm_checkpoint_stride = 256;
+    ssm_checkpoint_max = 16;
+    generate_mod.prefill_chunk_override = 0;
+    var glm = glm5TestConfig();
+    // 34 KDA layers x (f32 state 64x128x128 + conv 3 x (2x64x128 + 64x128) x 2).
+    try t.expectEqual(@as(u64, 147_619_840), glm.ssmCheckpointBytes());
+    const seq: u64 = 100_000;
+    const chunk: u64 = 4096;
+    const max_tokens: u64 = 8192;
+    const kv_bits: u64 = 8;
+    const terms = prefillRequestTerms(&glm, seq, max_tokens, kv_bits, chunk, .{});
+    // Effective stride max(256, 4096): 100000/4096 + 1 snapshot, capped at 16.
+    try t.expectEqual(16 * glm.ssmCheckpointBytes(), terms.checkpoint_bytes);
+    const row: u64 = 8976;
+    // Bound every proportional grow, including output longer than the generic 8192 cap.
+    try t.expect(terms.reserved_kv_bytes >= max_tokens * row);
+    try t.expect(terms.grow_coexist_bytes >= (seq - 1) * row);
+    try t.expect(terms.state_bytes >= 4 * glm.ssmCheckpointBytes());
+    // A short sequence isolates the two lag snapshots from long-context indexer scratch.
+    const short = prefillRequestTerms(&glm, 1, 1, kv_bits, 512, .{});
+    try t.expect(short.state_bytes >= 4 * glm.ssmCheckpointBytes());
+    const growth = prefillRequestTerms(&glm, seq, 12288, kv_bits, chunk, .{});
+    try t.expect(growth.reserved_kv_bytes >= terms.reserved_kv_bytes + (12288 - max_tokens) * row);
+    const at_end = prefillRequestTerms(&glm, glm.ctx_override, 12288, kv_bits, chunk, .{});
+    const no_output = prefillRequestTerms(&glm, glm.ctx_override, 0, kv_bits, chunk, .{});
+    try t.expectEqual(no_output.reserved_kv_bytes, at_end.reserved_kv_bytes);
+}
+
+test "GLM ledger: unrelated ungated request terms are unchanged" {
+    const t = std.testing;
+    const seq: u64 = 100_000;
+    const chunk: u64 = 4096;
+    const max_tokens: u64 = 8192;
+    const kv_bits: u64 = 8;
+    for ([_][]const u8{ "qwen3_5", "lfm2", "nemotron_h", "llama" }) |mt| {
+        var cfg = qwen4ExpOomConfig();
+        cfg.model_type = mt;
+        const terms = prefillRequestTerms(&cfg, seq, max_tokens, kv_bits, chunk, .{});
+        try t.expectEqual(@as(u64, 0), terms.checkpoint_bytes);
+        try t.expectEqual(@as(u64, 0), terms.reserved_kv_bytes);
+        try t.expectEqual(@as(u64, 0), terms.state_bytes);
+        try t.expectEqual(@as(u64, 0), terms.shared_resident_bytes);
+        try t.expectEqual(@as(u64, 0), terms.grow_coexist_bytes);
+    }
+}
+
+test "GLM ledger: warm credit requires donation and does not erase checkpoints or growth" {
+    const t = std.testing;
+    const saved_stride = ssm_checkpoint_stride;
+    const saved_max = ssm_checkpoint_max;
+    const saved_override = generate_mod.prefill_chunk_override;
+    defer {
+        ssm_checkpoint_stride = saved_stride;
+        ssm_checkpoint_max = saved_max;
+        generate_mod.prefill_chunk_override = saved_override;
+    }
+    ssm_checkpoint_stride = 256;
+    ssm_checkpoint_max = 16;
+    generate_mod.prefill_chunk_override = 0;
+    var glm = glm5TestConfig();
+    const warm: WarmPrefix = .{ .matched_tokens = 65000, .capacity_tokens = 65536, .will_donate = true };
+    const donated = prefillRequestTerms(&glm, 66000, 12288, 8, 512, warm);
+    var shared = warm;
+    shared.will_donate = false;
+    const copied = prefillRequestTerms(&glm, 66000, 12288, 8, 512, shared);
+    try t.expectEqual(@as(u64, 65000 * 8976), donated.shared_resident_bytes);
+    try t.expectEqual(@as(u64, 0), copied.shared_resident_bytes);
+    try t.expectEqual(donated.checkpoint_bytes, copied.checkpoint_bytes);
+    try t.expect(donated.checkpoint_bytes > 0);
+    try t.expect(donated.grow_coexist_bytes > 0);
+    const warm_bill = prefillNeededAtChunk(&glm, 66000, 12288, 8, 512, warm);
+    const shared_bill = prefillNeededAtChunk(&glm, 66000, 12288, 8, 512, shared);
+    try t.expectEqual(@as(u64, 65000 * 8976 * 5 / 4), shared_bill - warm_bill);
 }
 
 test "prefillRequestTerms: qwen4 MTP head KV is billed when MTP is on and zero when off" {
