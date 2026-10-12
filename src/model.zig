@@ -2878,7 +2878,10 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         std.mem.eql(u8, model_type, "qwen3_5") or
         std.mem.eql(u8, model_type, "qwen3_5_moe_text") or
         std.mem.eql(u8, model_type, "qwen3_5_text") or
-        std.mem.eql(u8, model_type, "prism_hadamard_qwen35"))
+        std.mem.eql(u8, model_type, "prism_hadamard_qwen35") or
+        // MiniCPM-V 4.7: a Qwen3.5 trunk in mlx-vlm's layout; its SigLIP tower
+        // resolves no Qwen3-VL prefix, so vision stays off.
+        std.mem.eql(u8, model_type, "minicpmv4_7"))
     {
         config.model_type = "qwen3_5_moe";
         if (std.mem.eql(u8, model_type, "prism_hadamard_qwen35")) config.hadamard_block = try prismHadamardBlock(root);
@@ -8204,6 +8207,22 @@ test "parseConfigFromJson quantized qwen3_5_moe → quant_bits from key" {
     try testing.expectEqual(@as(u32, 4), config.quant_bits);
     try testing.expectEqual(@as(u32, 64), config.quant_group_size);
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
+}
+
+test "parseConfigFromJson minicpmv4_7 (MiniCPM-V 4.7) serves its Qwen3.5 trunk" {
+    const json =
+        \\{
+        \\  "model_type": "minicpmv4_7",
+        \\  "text_config": {"model_type": "qwen3_5_moe_text", "hidden_size": 2048, "num_experts": 256},
+        \\  "vision_config": {"model_type": "minicpmv4_7_vision", "hidden_size": 1152, "patch_size": 14},
+        \\  "quantization": {"bits": 4, "group_size": 64}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen3_5_moe", config.model_type);
+    try testing.expectEqualStrings("language_model.model", config.weight_prefix);
+    try testing.expect(config.isMoe());
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
 }
 
 test "a qwen3_5_moe trunk batches decode: its only per-slot state is the GDN pair" {

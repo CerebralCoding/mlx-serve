@@ -1252,6 +1252,13 @@ test "qwen vision tower prefix and patch_embed layout are PROBED, not hardcoded"
         try put(&w, allocator, "vision_tower.patch_embed.proj.weight");
         try std.testing.expectEqualStrings("vision_tower.", resolveVisionPrefix(&w).?);
     }
+    // A MiniCPM-V SigLIP tower is not a Qwen3-VL tower: no prefix, vision off.
+    {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        try put(&w, allocator, "vision_tower.embeddings.patch_embedding.weight");
+        try std.testing.expect(resolveVisionPrefix(&w) == null);
+    }
     // avlp12 Alis spelling (live: vision silently disabled, 0.92 GB dead weight).
     {
         var w = Weights.init(allocator);
