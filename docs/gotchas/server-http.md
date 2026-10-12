@@ -2659,3 +2659,16 @@ Fix: before refusing, `checkAttentionMemory` unloads idle resident models least 
 (`Scheduler.idleModelToUnload` + `unloadModelIfIdle`, never the request's own model) and re-bills
 after each, via `fitAfterUnloadingIdle`.
 Guard: `a prompt that does not fit unloads idle models, oldest first, until it fits` (server.zig).
+
+## A 16 GB Mac advertised 870 tokens beside a big model (2026-10-11)
+
+Defect: on an M4 16 GB, Qwen3.5-9B (7.6 GB) auto-sized to 870 tokens, gemma-4-e4b 8-bit to 870 and
+gemma-3-12B to 45; v26.10.1 gave the 9B 10k. The prompt cache beside it kept 2 GB.
+
+Cause: the sizer billed the fixed 2 GB cache reserve before the context, and the honest available
+figure (#776, ~0.5 GB lower) took the last of the room. The 1024 floor applied only at exactly 0,
+so 53 tokens of room advertised 45.
+
+Fix: the reserve is at most half the room beside the weights and the prefill (`ctxCacheShare`, both
+sizer paths); the load-time clamp gives the cache the residual as before. Floor at < 1024.
+Guard: `context sizer: the prompt-cache reserve never takes more than half the room beside the weights`.

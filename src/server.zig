@@ -3768,7 +3768,7 @@ fn safeContextForBudget(
 ) u32 {
     if (per_tok == 0) return 1024;
     const max_seq: u64 = contextForBudget(working_set_limit, active_mem, hot_cache_reserve, per_tok);
-    if (max_seq == 0) return 1024;
+    if (max_seq < 1024) return 1024;
 
     var result: u32 = if (max_seq > std.math.maxInt(u32)) std.math.maxInt(u32) else @intCast(max_seq);
     // Cap at model's max position embeddings.
@@ -4175,6 +4175,12 @@ pub fn ssdFirstPrefixCacheMem(
     return @max(ctx_kv_bytes +| idle, 1);
 }
 
+/// The cache reserve the context sizer bills: at most half the room beside the weights and the
+/// prefill, so a small Mac's context is not starved for a cache the load-time clamp shrinks anyway.
+fn ctxCacheShare(cache_reserve: u64, ceiling: u64, active_mem: u64, transient_reserve: u64) u64 {
+    return @min(cache_reserve, (ceiling -| (active_mem +| transient_reserve)) / 2);
+}
+
 /// The context a load-time bill must use, before `pinAutoContext` has run: on an auto boot
 /// `getEffectiveContextLength` re-derives through `computeMemoryContext`, which reserves the
 /// very ask being resolved and answered a 1024-token placeholder. `cache_reserve` is
@@ -4196,7 +4202,7 @@ pub fn resolvedContextForLoad(
     return autoContextFrom(safeContextForBudget(
         ceiling,
         active_mem,
-        cache_reserve +| transient_reserve,
+        ctxCacheShare(cache_reserve, ceiling, active_mem, transient_reserve) +| transient_reserve,
         per_tok,
         0,
     ), ctx_cap);
@@ -4673,13 +4679,11 @@ test "an auto boot sizes the SAME context whatever the cache ask (live check #6)
     try t.expectEqual(ctx_default, ctx_big_ask);
     try t.expect(ctx_default > 900_000); // a real context, not the floor
 
-    // The defect, both spellings: sizing against the granted budget...
+    // The defect's spellings (the granted budget, the raw ask) take at most half the room, never all of it.
     const vs_granted = resolvedContextForLoad(0, 0, live_ceiling, active, 48_673 * MiB, transient, per_tok, cap);
-    try t.expect(vs_granted <= 1024);
-    // ...and against the raw ask, which saturates usable to zero.
+    try t.expect(vs_granted >= ctx_default / 3);
     const vs_raw_ask = resolvedContextForLoad(0, 0, live_ceiling, active, 60 * 1024 * MiB, transient, per_tok, cap);
-    try t.expect(vs_raw_ask <= 1024);
-    try t.expect(ctx_default > vs_granted * 500);
+    try t.expect(vs_raw_ask >= ctx_default / 3);
 }
 
 test "the clamp bills the context that will be SERVED, not the placeholder" {
@@ -5366,15 +5370,17 @@ fn computeMemoryContext(config: *const model_mod.ModelConfig) u32 {
     var active_mem: usize = 0;
     _ = mlx.mlx_get_active_memory(&active_mem);
 
+    // Real reachable ceiling, so auto-context shrinks under external memory pressure (#64).
+    const ceiling = currentGpuMemoryCeiling(config, active_mem);
+    const transient = prefillTransientReserve(config, kv_bits, chunk);
     return safeContextForBudget(
-        // Real reachable ceiling, so auto-context shrinks under external memory pressure (#64).
-        currentGpuMemoryCeiling(config, active_mem),
+        ceiling,
         active_mem,
         // The hot prefix cache fills to this cap over a session, and a prefill has to land on
         // top of whatever context we report. `CTX_SIZING_CACHE_RESERVE`, not the resolved
         // budget and not the ask: the ask starved the context, the resolved budget was a
         // one-step loop. Gated: off the gate this is the raw ask, so `/v1/models` is unchanged.
-        ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk),
+        ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient,
         per_tok,
         // 0 = do not clamp to the checkpoint's max here; the caller applies it after the margin.
         0,
@@ -20985,6 +20991,24 @@ test "safeContextForBudget floors when memory is exhausted and caps at max_pos" 
     try testing.expectEqual(@as(u32, 4096), safeContextForBudget(256 * GB, 0, 0, per_tok, 4096));
     // Degenerate per_tok never divides by zero.
     try testing.expectEqual(@as(u32, 1024), safeContextForBudget(8 * GB, 0, 0, 0, 0));
+    // A budget that fits a few tokens gets the same floor as one that fits none.
+    try testing.expectEqual(@as(u32, 1024), safeContextForBudget(6 * GB + 100 * per_tok, 6 * GB, 0, per_tok, 0));
+}
+
+test "context sizer: the prompt-cache reserve never takes more than half the room beside the weights" {
+    const t = std.testing;
+    const MiB: u64 = 1 << 20;
+    const per_tok: u64 = 28 * 1024;
+    const transient: u64 = 300 * MiB;
+    const reserve: u64 = 2048 * MiB;
+
+    // 16 GB Mac, 8 GB pack: 1.8 GB beside the weights. A full 2 GB reserve left the context 870 tokens.
+    const small = resolvedContextForLoad(0, 0, 10_200 * MiB, 8_100 * MiB, reserve, transient, per_tok, 262_144);
+    try t.expect(small >= 16_384);
+
+    // 128 GB Mac: the room dwarfs the reserve, which is billed in full as before.
+    const big = resolvedContextForLoad(0, 0, 100_000 * MiB, 60_000 * MiB, reserve, transient, per_tok, 0);
+    try t.expectEqual(autoContextFrom(safeContextForBudget(100_000 * MiB, 60_000 * MiB, reserve +| transient, per_tok, 0), 0), big);
 }
 
 test "kvBytesPerTokenAtBits: the KV bill follows the CONFIGURED quant width" {
@@ -24092,7 +24116,7 @@ test "checkAttentionMemory wires the CONFIG's key bound, not a dense seq" {
     // (`prefillTransientReserve` is the same estimator with the KV term zeroed),
     // never as a per-token multiplier on the context it is solving for.
     // The sizer reserves the constant, not the ask or the resolved budget.
-    try t.expect(std.mem.indexOf(u8, src, "ctxSizingCacheReserve(config) +| prefillTransientReserve(config, kv_bits, chunk)") != null);
+    try t.expect(std.mem.indexOf(u8, src, "ctxCacheShare(ctxSizingCacheReserve(config), ceiling, active_mem, transient) +| transient") != null);
 }
 
 test "osReserveBytes: an eighth of RAM, never under 2 GB or over 8 GB" {
