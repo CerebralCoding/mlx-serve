@@ -64,6 +64,7 @@ pub fn routeClass(method: []const u8, path: []const u8) RouteClass {
             "/v1/video/generations",  "/v1/3d/generations",
             "/api/chat",              "/api/generate",
             "/api/embed",             "/api/embeddings",
+            "/v1/audio/transcriptions",
         }) |p| if (eql(u8, path, p)) return .model_gated;
         return .denied;
     }
@@ -1188,6 +1189,7 @@ test "lan: routeClass allows exactly the shared inference surface" {
         "/v1/video/generations",       "/v1/3d/generations",
         "/api/chat",                   "/api/generate",
         "/api/embed",                  "/api/embeddings",
+        "/v1/audio/transcriptions",
     }) |p| try t.expectEqual(RouteClass.model_gated, routeClass("POST", p));
     // Admin/host-local stays denied.
     try t.expectEqual(RouteClass.denied, routeClass("POST", "/v1/load-model"));

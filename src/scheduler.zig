@@ -2886,7 +2886,7 @@ fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const 
 
     const tok = try allocator.create(Tokenizer);
     errdefer allocator.destroy(tok);
-    tok.* = try tokenizer_mod.loadTokenizer(io, allocator, model_dir);
+    tok.* = try tokenizer_mod.loadTokenizerAny(io, allocator, model_dir);
     errdefer tok.deinit();
 
     const cc = try allocator.create(ChatConfig);
@@ -5657,6 +5657,7 @@ fn encodeVisionItem(req: *VisionEncodeRequest, vision_enc: anytype, item: Vision
             return vision_enc.forwardVideoPatches(pixel_arr, vid.grid_t, vid.grid_h, vid.grid_w);
         },
         .audio => |clip| {
+            if (vision_enc.qwen_audio) |*qa| return qa.forward(clip);
             const cfg = req.model.config orelse return error.NoConfig;
             const spt: usize = if (cfg.audio_samples_per_token > 0) cfg.audio_samples_per_token else 640;
             const n_frames = (clip.len / 4 + spt - 1) / spt;
@@ -8733,7 +8734,7 @@ test "every server scheduler path forwards resolved thinking to the DFlash gate"
         try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
             std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
     }
-    try testing.expectEqual(@as(usize, 4), calls);
+    try testing.expectEqual(@as(usize, 5), calls);
 }
 
 /// Per-slot follow-up to a batched forward: `record` moves the id ledger, `publish` samples and streams.

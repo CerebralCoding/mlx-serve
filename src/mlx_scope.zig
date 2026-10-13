@@ -207,6 +207,28 @@ pub const Scope = struct {
         const none = A{ .ctx = null };
         return sc.res(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, mode, none, none, false, sc.s), &o);
     }
+    /// A boolean (true = attend) or additive `mask`; a null handle is no mask.
+    pub fn sdpaMasked(sc: *Scope, q: A, k: A, v: A, scale: f32, mask: A) !A {
+        var o = mlx.mlx_array_new();
+        const none = A{ .ctx = null };
+        const mode: [*:0]const u8 = if (mask.ctx != null) "array" else "";
+        return sc.res(mlx.mlx_fast_scaled_dot_product_attention(&o, q, k, v, scale, mode, mask, none, false, sc.s), &o);
+    }
+    /// Channels-last 2-D convolution, weight [out, kh, kw, in], square stride and padding.
+    pub fn conv2d(sc: *Scope, x: A, w: A, stride: c_int, padding: c_int) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_conv2d(&o, x, w, stride, stride, padding, padding, 1, 1, 1, sc.s), &o);
+    }
+    pub fn layerNorm(sc: *Scope, x: A, w: A, b: A, eps: f32) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_fast_layer_norm(&o, x, w, b, eps, sc.s), &o);
+    }
+    /// Exact GELU: x * (1 + erf(x / sqrt 2)) / 2.
+    pub fn geluErf(sc: *Scope, x: A) !A {
+        var o = mlx.mlx_array_new();
+        const e = try sc.res(mlx.mlx_erf(&o, try sc.mulLike(x, std.math.sqrt1_2), sc.s), &o);
+        return sc.mul(x, try sc.mulLike(try sc.addS(e, 1.0), 0.5));
+    }
     pub fn fromI32(sc: *Scope, data: []const i32, shape: []const c_int) !A {
         return sc.keep(mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .int32));
     }

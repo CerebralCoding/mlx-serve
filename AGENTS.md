@@ -42,7 +42,8 @@ Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`
 | `gen.zig` | Unified media gen: modality-named engine slots, `detectModality`/`peekModelType`, per-request handlers, img2img/edit/LoRA, residency estimators |
 | `krea.zig` / `flux.zig` | Image backends (Krea-2-Turbo / FLUX.2 klein 4B+9B); `MixedLinear` infers quant geometry |
 | `qwen_image.zig` / `qwen_image_edit.zig` | Qwen-Image-2.1 (`qwen_image21`): block-causal single-stream DiT, 64-ch /16 VAE, 8B `mage_flow.TextEncoder`; 40 steps, real CFG, img2img; text encoder STAGED where the pack crowds the GPU (`gen.qwenImageStagesTextEncoder`); edit = `mode:"edit"` (cap `gen.editRefCap`, tower gate `towerPresentIn`). Detail: reference.md "row detail" |
-| `multipart.zig` | RFC 7578 form parsing, zero-copy `Part` (only non-JSON shape: `POST /v1/images/edits`) |
+| `multipart.zig` | RFC 7578 form parsing, zero-copy `Part` (non-JSON shapes: `POST /v1/images/edits`, `/v1/audio/transcriptions`) |
+| `qwen_audio.zig` / `transcription.zig` | Qwen3-ASR audio tower (Whisper log-mel, chunked convs, windowed encoder; a `VisionEncoder` arm) / `/v1/audio/transcriptions` form, languages, the reference prompt |
 | `mage_flow.zig` | MageFlow Turbo/Edit: flow DiT + DiCo VAE + Qwen3-VL TE; `MfLinear` shared with H3; DiT/TE bf16, VAE f32 (load-bearing) |
 | `hunyuan3d.zig` / `hunyuan3d_paint*.zig` | 3D shape + texture paint; converted layouts BAKE OUT per-head QKV interleaves — never "fix" it |
 | `acestep.zig` | ACE-Step music (Qwen3 encoder, AdaLN DiT, Euler flow-match, Oobleck VAE 48 kHz; Snake/encode f32) |
@@ -167,6 +168,7 @@ Dispatch on `config.json` `model_type`. With `--mlx-gguf` (opt-in, experimental)
 | `laya` | Laya typed-decision checkpoints (no root config.json: classified from `encoder/config.json` + `rl_agent_config.json` by `model_discovery.peekLayaCheckpoint`, app twin `DownloadManager.markerModelType`): ModernBERT encoder + 2 head layers + marker scorer + act head, fp16 |
 | `kev` | Kev typed-decision packs: qwen3_5 trunk + pointer head; `kev_config.json` wins over the trunk's config.json (`model_discovery.peekKevPack`, app twin `DownloadManager.markerModelType`); the state runs once, each question from a KV/SSM snapshot (`kev.zig`) |
 | `d1` | LiquidAI D1-3B decision packs (bf16, the card's own layout): LFM2-VL trunk whose root config.json `auto_map` names `modeling_d1.D1Model` (`model_discovery.isD1Root`, app twin `DownloadManager.markerModelType`); the answer is a softmax over each option's token group at the LM head, no new weights (`d1.zig`, state runs once via `kev.scoreBranches`); text only, torchao int8 refused by name. Oracle: `tests/dump_d1_fixtures.py` |
+| `qwen3_asr` | Qwen3-ASR (mlx-audio layout, `thinker_config` nesting): a plain `qwen3` trunk + audio tower whose rows splice at `<|audio_pad|>`; serves `/v1/audio/transcriptions` only (no chat template, not chat-pickable). Oracle: `tests/dump_qwen3_asr_fixtures.py` |
 | media types | `flux2*`/`krea*`/`mage_flow*`/`qwen_image*` (unified t2i+edit)/`qwen3_tts`/`acestep`/`minimax_music3`/`stable_audio3`/`yue2`/`AudioVideo` (LTX 2.3 + 2.5 by `model_version`)/`hunyuan3d*` → gen.zig slots (`mage_flow` + the mlx-community qwen21 spelling have NO root config.json — classified from `model_index.json`, `stable_audio3` from `model_config.json`, by `gen.peekModelType` + `model_discovery`, kept in sync) |
 
 Models with `vision_config` but no vision weights disable vision. Embedded-engine detail: `docs/reference.md`.
@@ -520,7 +522,7 @@ qwen4_exp:
 Vision:
 - **`x-mlx-pixels` is a GEMMA format** (`wantsServerPreprocess`; server refuses when `vp.mode != .gemma`); `VisionEncoder.forward` returns named errors.
 - **A MiniCPM-V image is SEVERAL encoder calls** (thumbnail + crops, `tile_*` on `ImageData`) laid out as `<image_id>N</image_id><image>…</image><slice>…</slice>` rows; the canvas M-RoPE table is built from the EXPANDED ids (`minicpm_canvas.canvasPositions`), so a changed placeholder run shifts every crop silently. Guard: the `MiniCPM-V 4.7` test in server.zig.
-- **A placeholder id the splice mask does not name never reaches the prompt** (`spliceVisionRows` takes `video_token_id`); a chunked splice resumes its ROW INDEX (#197, `vision_splice_offset`, `tests/test_vision_chunked_prefill.sh`); every generative forward arm splices vision (scan-pinned).
+- **A placeholder id the splice mask does not name never reaches the prompt** (`spliceVisionRows` takes `video_token_id`; an id of 0 is UNSET, never token 0: audio-only Qwen3-ASR heard silence); a chunked splice resumes its ROW INDEX (#197, `vision_splice_offset`, `tests/test_vision_chunked_prefill.sh`); every generative forward arm splices vision (scan-pinned).
 - **Per-arch preprocessing**: patch feature order (LFM2-VL channel INNERMOST); two GELUs in one checkpoint (LFM2-VL); NaFlex resample is `bilinear` WITH antialias and TILING is the resolution; muse = aspect-closest grid, Lanczos, CHANNEL-major shuffle (`VisionPreproc.mode`). Guards: `tests/test_lfm2_vision.sh`, `tests/test_muse_vision.sh`.
 - **A processor pixel bound is not the ENGINE's** (`effectivePixelBounds`, `ENGINE_MAX_PIXELS` 1536²).
 

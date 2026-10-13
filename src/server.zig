@@ -36,6 +36,7 @@ const model_discovery = @import("model_discovery.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
 const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
+const transcription_mod = @import("transcription.zig");
 const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("status.zig");
@@ -816,6 +817,7 @@ const ROUTE_PATHS = [_][]const u8{
     "/v1/audio/music-generations",
     "/v1/audio/sound-generations",
     "/v1/audio/speech",
+    "/v1/audio/transcriptions",
     "/v1/chat/completions",
     "/v1/completions",
     "/v1/decisions",
@@ -2869,6 +2871,14 @@ fn handleConnection(
         };
         defer allocator.free(json);
         try handleGen(allocator, stream, json, lm, .image);
+    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/transcriptions")) {
+        if (text_gen_reject) |reason| {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
+            return;
+        }
+        const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
+        const ct = findHeaderValue(request[0..header_end], "content-type") orelse "";
+        try handleTranscriptions(allocator, stream, request[header_end + 4 .. total_read], ct, lm);
     } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/speech")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
@@ -3186,7 +3196,7 @@ fn handleOllamaShow(allocator: std.mem.Allocator, stream: *Conn, body: []const u
                 .template = template,
                 .has_chat = has_chat,
                 .has_tools = has_chat,
-                .has_vision = e.vision_encoder != null or sm.has_vision,
+                .has_vision = (if (e.vision_encoder) |ve| ve.supportsImages() else false) or sm.has_vision,
                 .has_thinking = has_chat and (model_discovery.templateSupportsThinking(template) or sm.has_thinking),
                 .has_embedding = has_embedding,
             });
@@ -6794,6 +6804,8 @@ const ReadyCaps = struct {
     has_chat: bool = false,
     has_vision: bool = false,
     has_audio: bool = false,
+    /// `/v1/audio/transcriptions` (an audio tower on a text trunk: Qwen3-ASR).
+    has_transcription: bool = false,
     has_reasoning: bool = false,
     /// Encoder-only (BERT/EmbeddingGemma) OR a decoder with a pooling contract
     /// (Qwen3-Embedding) — `config.hasEmbeddingCapability()`. Issue #116.
@@ -6842,6 +6854,7 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_chat) try append_cap(allocator, &caps, &n_caps, "streaming");
     if (c.has_vision) try append_cap(allocator, &caps, &n_caps, "vision");
     if (c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
+    if (c.has_transcription) try append_cap(allocator, &caps, &n_caps, "transcription");
     if (c.has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
     if (c.has_chat) try append_cap(allocator, &caps, &n_caps, "json_schema");
     if (c.has_embedding) try append_cap(allocator, &caps, &n_caps, "embeddings");
@@ -7019,6 +7032,7 @@ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
         const routes = [_][]const u8{
             "/v1/chat/completions", "/v1/completions", "/v1/messages",
             "/v1/responses",        "/api/chat",       "/api/generate",
+            "/v1/audio/transcriptions",
         };
         for (routes) |r| if (std.mem.eql(u8, path, r)) return true;
         return false;
@@ -7053,12 +7067,13 @@ fn renderModelEntry(
             chat_config.chat_template.len,
             entry.ds4_engine != null or entry.llama_engine != null,
         );
-        const has_vision = entry.vision_encoder != null;
+        const has_vision = if (entry.vision_encoder) |ve| ve.supportsImages() else false;
         const has_audio = if (entry.vision_encoder) |ve| ve.supportsAudio() else false;
         var caps = try readyCapsJson(allocator, .{
             .has_chat = has_chat,
             .has_vision = has_vision,
             .has_audio = has_audio,
+            .has_transcription = if (entry.vision_encoder) |ve| ve.qwen_audio != null else false,
             .has_reasoning = has_chat and model_discovery.templateSupportsThinking(chat_config.chat_template),
             .has_embedding = config.hasEmbeddingCapability(),
             .has_image_engine = entry.image_engine != null,
@@ -7219,6 +7234,7 @@ fn renderModelEntry(
         }
         if (is_encoder_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"embeddings\"]");
         if (is_gguf_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"chat\",\"tool_use\",\"streaming\",\"json_schema\"]");
+        if (sm.found and sm.has_transcription) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"transcription\"]");
         if (!sm.found or !(sm.has_chat or sm.has_vision or stub_has_embedding)) break :blk try allocator.dupe(u8, "");
         var b = std.ArrayList(u8).empty;
         errdefer b.deinit(allocator);
@@ -7698,6 +7714,106 @@ fn genJobRunMany(ctxs: []const *anyopaque) void {
 /// already-resolved + refcounted model (so it can't be evicted mid-gen). The
 /// generation runs on the scheduler's inference thread (the sole mlx caller);
 /// the body writes its own response. A wrong-modality target gets a clear 400.
+/// Longest clip one request transcribes: mlx-audio's chunk length, past which
+/// the reference splits the audio.
+const TRANSCRIPTION_MAX_SECONDS = 1200;
+/// The reference's `max_tokens` for one chunk.
+const TRANSCRIPTION_MAX_TOKENS = 8192;
+
+/// `POST /v1/audio/transcriptions`: OpenAI's form over Qwen3-ASR. The reference
+/// prompt's one audio placeholder expands to the tower's rows like any chat
+/// media, then the trunk decodes the transcript.
+fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, content_type: []const u8, lm: *LoadedModel) !void {
+    const hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null else false;
+    if (!hears) {
+        log.warn("POST /v1/audio/transcriptions -> 400 (no audio tower)\n", .{});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "This model does not transcribe audio: target a Qwen3-ASR model (and do not run it with --no-vision, which drops its audio tower)", 400);
+        return;
+    }
+    const form = transcription_mod.parseForm(body, content_type) catch |err| {
+        log.warn("POST /v1/audio/transcriptions -> 400 ({s})\n", .{@errorName(err)});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", transcription_mod.formErrorMessage(err), 400);
+        return;
+    };
+    const pcm = transcription_mod.decodeWav(allocator, form.file) catch |err| {
+        log.warn("POST /v1/audio/transcriptions -> 400 (audio: {s})\n", .{@errorName(err)});
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "`file` must be a WAV file (16- or 24-bit PCM, or 32-bit float)", 400);
+        return;
+    };
+    defer allocator.free(pcm);
+    const seconds = @as(f64, @floatFromInt(pcm.len)) / transcription_mod.SAMPLE_RATE;
+    if (seconds > TRANSCRIPTION_MAX_SECONDS) {
+        var buf: [128]u8 = undefined;
+        const msg = std.fmt.bufPrint(&buf, "audio is {d:.0} s long; one request transcribes at most {d} s", .{ seconds, TRANSCRIPTION_MAX_SECONDS }) catch "audio too long";
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
+        return;
+    }
+    log.info("POST /v1/audio/transcriptions ({d:.1} s, language={s}, format={s}, prompt={d}b)\n", .{ seconds, form.language orelse "auto", @tagName(form.format), if (form.prompt) |p| p.len else 0 });
+
+    const config = lm.config.?;
+    const tok = lm.tokenizer.?;
+    const prompt_text = try transcription_mod.buildPrompt(allocator, form.prompt, form.language);
+    defer allocator.free(prompt_text);
+    var prompt_ids = try encodeText(allocator, lm, tok, prompt_text, false);
+    const audio = chat_mod.AudioData{ .samples = std.mem.sliceAsBytes(pcm) };
+    var mm = prepareMultimodalItems(allocator, lm, config, &[_]MediaItem{.{ .audio = &audio }}, &prompt_ids) catch |err| {
+        allocator.free(prompt_ids);
+        const f = multimodalFailure(err);
+        log.warn("POST /v1/audio/transcriptions -> {d} ({s})\n", .{ f.code, @errorName(err) });
+        try sendErrorResponse(allocator, stream, f.status, f.kind, f.message, f.code);
+        return;
+    };
+    defer mm.deinit(allocator);
+    defer allocator.free(prompt_ids);
+
+    const effective_ctx = getEffectiveContextLength(config);
+    if (prompt_ids.len > effective_ctx) {
+        countRejected();
+        var ovf_buf: [160]u8 = undefined;
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
+        return;
+    }
+    const max_tokens = clampMaxTokens(TRANSCRIPTION_MAX_TOKENS, prompt_ids.len, effective_ctx);
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, max_tokens, config, false, null, lm, generate_mod.visionPrefillUnchunked(true), false, mm.bytes(config))) return;
+
+    // Ownership of the soft tokens moves to the slot. The reference decodes plainly: no thinking, no drafts.
+    const slot_ve = mm.embeddings;
+    mm.embeddings = null;
+    const enable_thinking = false;
+    const spec = false;
+    var timer = Stopwatch.init(stream.io);
+    const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = form.temperature }, config.eosTokenSlice(), 0, false, enable_thinking, spec, spec, spec, spec, getTimeoutNs(), slot_ve, mm.media, 0, .{}, 0, false, null, null, stream) catch |err| {
+        log.err("  -> {s}\n", .{@errorName(err)});
+        sendGenerationError(allocator, stream, err, .openai) catch {};
+        return;
+    };
+    defer allocator.free(result.text);
+    defer allocator.free(result.token_ids);
+    const raw = try decodeTokens(allocator, lm, tok, result.token_ids, false);
+    defer allocator.free(raw);
+    const t = transcription_mod.splitOutput(raw, form.language);
+    log.info("  <- {d}+{d} tokens ({d}ms) [{s}] language={s}\n", .{ result.prompt_tokens, result.completion_tokens, timer.read() / std.time.ns_per_ms, result.finish_reason, t.language orelse "?" });
+
+    if (form.format == .text) return sendResponse(stream, "200 OK", "text/plain; charset=utf-8", t.text);
+    const text = jsonEscapeOrEmpty(allocator, t.text);
+    defer if (text.owned) allocator.free(text.slice);
+    const response = if (form.format == .json)
+        try std.fmt.allocPrint(allocator, "{{\"text\":{s}}}", .{text.slice})
+    else blk: {
+        // OpenAI names the language in lower case ("english"); one segment spans the clip.
+        var lang_buf: [32]u8 = undefined;
+        const name = t.language orelse "";
+        const lang = std.ascii.lowerString(&lang_buf, name[0..@min(name.len, lang_buf.len)]);
+        const lang_json = jsonEscapeOrEmpty(allocator, lang);
+        defer if (lang_json.owned) allocator.free(lang_json.slice);
+        break :blk try std.fmt.allocPrint(allocator,
+            \\{{"task":"transcribe","language":{s},"duration":{d:.3},"text":{s},"segments":[{{"id":0,"seek":0,"start":0.0,"end":{d:.3},"text":{s}}}]}}
+        , .{ lang_json.slice, seconds, text.slice, seconds, text.slice });
+    };
+    defer allocator.free(response);
+    try sendResponse(stream, "200 OK", "application/json", response);
+}
+
 fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, route: media_mod.GenRoute) !void {
     const scheduler = global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
@@ -13701,7 +13817,7 @@ test "routeExists answers endpoint existence without consulting the model" {
     try std.testing.expect(routeExists("/v1/responses/compact"));
 
     try std.testing.expect(!routeExists("/v1/__llmprobe_no_such_endpoint__"));
-    try std.testing.expect(!routeExists("/v1/audio/transcriptions")); // real OpenAI route we don't serve
+    try std.testing.expect(!routeExists("/v1/audio/translations")); // real OpenAI route we don't serve
     try std.testing.expect(!routeExists("/nope"));
     try std.testing.expect(!routeExists(""));
 }
@@ -23467,6 +23583,8 @@ test "isTextGenRoute covers exactly the guarded surfaces" {
     try std.testing.expect(isTextGenRoute("POST", "/api/chat"));
     try std.testing.expect(isTextGenRoute("POST", "/api/generate"));
     try std.testing.expect(isTextGenRoute("GET", "/v1/responses")); // WS upgrade
+    // Transcription decodes text on the LM trunk: a media model is refused before it loads.
+    try std.testing.expect(isTextGenRoute("POST", "/v1/audio/transcriptions"));
     // Media + embedding routes must NOT be gated — they serve these models.
     try std.testing.expect(!isTextGenRoute("POST", "/v1/images/generations"));
     try std.testing.expect(!isTextGenRoute("POST", "/v1/audio/speech"));
@@ -23529,6 +23647,13 @@ test "readyCapsJson: embeddings capability — encoders alone, decoders beside c
     defer both.deinit(a);
     try std.testing.expect(std.mem.indexOf(u8, both.items, "\"chat\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, both.items, "\"embeddings\"") != null);
+}
+
+test "readyCapsJson: an audio tower on a text trunk advertises transcription" {
+    const a = std.testing.allocator;
+    var asr = try readyCapsJson(a, .{ .has_transcription = true });
+    defer asr.deinit(a);
+    try std.testing.expectEqualStrings("[\"transcription\"]", asr.items);
 }
 
 test "readyCapsJson: every resident media engine surfaces its capability (mesh -> 3d)" {

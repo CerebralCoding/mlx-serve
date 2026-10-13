@@ -63,6 +63,7 @@ const supported_model_types = [_][]const u8{
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA inside mHC)
     "embedding_gemma2", // Google EmbeddingGemma 2 (bidirectional Gemma 4 trunk, text/image/video embeddings)
     "minicpmv4_7", // openbmb MiniCPM-V 4.7 (Qwen3.5 trunk + SigLIP2 tower)
+    "qwen3_asr", // Qwen3-ASR speech recognition (qwen3 trunk + audio tower)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -1241,6 +1242,8 @@ pub const StubMeta = struct {
     /// (video piggybacks the vision tower — see src/qwen_vision.zig).
     has_video: bool = false,
     has_chat: bool = false,
+    /// Speech to text on `/v1/audio/transcriptions` (Qwen3-ASR).
+    has_transcription: bool = false,
     /// The chat template can open a reasoning block (`templateSupportsThinking`).
     has_thinking: bool = false,
     /// bert, or a bidirectional embedding model (EmbeddingGemma) — the stub
@@ -1282,7 +1285,9 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // `model.zig parseConfigFromJson` does. Reading the root alone made
     // /v1/models report hidden=0 / layers=0 / ctx=0 / is_moe=false for every
     // unloaded Gemma 3/4 and Qwen-VL model.
-    const text_cfg: ?std.json.ObjectMap = if (root.get("text_config")) |tc|
+    // Qwen3-ASR nests it one level deeper, under `thinker_config`.
+    const thinker: ?std.json.ObjectMap = if (root.get("thinker_config")) |t| (if (t == .object) t.object else null) else null;
+    const text_cfg: ?std.json.ObjectMap = if (root.get("text_config") orelse if (thinker) |t| t.get("text_config") else null) |tc|
         (if (tc == .object) tc.object else null)
     else
         null;
@@ -1314,6 +1319,7 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
     meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0;
+    meta.has_transcription = std.mem.eql(u8, mt, "qwen3_asr");
     const bidirectional = blk: {
         const cfgBool = struct {
             fn get(r: std.json.ObjectMap, tc: ?std.json.ObjectMap, key: []const u8) bool {
@@ -2151,6 +2157,7 @@ test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
     try testing.expect(isSupportedModelType("qwen3_5_moe"));
     try testing.expect(isSupportedModelType("qwen3"));
     try testing.expect(isSupportedModelType("minicpmv4_7"));
+    try testing.expect(isSupportedModelType("qwen3_asr"));
     // A genuinely unknown arch is still rejected.
     try testing.expect(!isSupportedModelType("totally_made_up_arch"));
 }
@@ -2198,6 +2205,19 @@ test "isSupportedQuantMode accepts nvfp4 (issue #24), rejects unknown" {
     try testing.expect(isSupportedQuantMode("mxfp4"));
     try testing.expect(isSupportedQuantMode("mxfp8"));
     try testing.expect(!isSupportedQuantMode("fp99"));
+}
+
+test "parseStubMeta: Qwen3-ASR transcribes, with no vision and no chat" {
+    const json =
+        \\{"model_type":"qwen3_asr","quantization":{"bits":8,"group_size":64},
+        \\"thinker_config":{"model_type":"qwen3_asr","audio_config":{"d_model":896},
+        \\"text_config":{"hidden_size":1024,"num_hidden_layers":28,"max_position_embeddings":65536}}}
+    ;
+    const m = parseStubMeta(testing.allocator, json, false);
+    try testing.expect(m.found and m.has_transcription);
+    try testing.expect(!m.has_vision and !m.has_chat);
+    try testing.expectEqual(@as(u32, 28), m.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 65536), m.max_position_embeddings);
 }
 
 test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
