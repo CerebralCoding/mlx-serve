@@ -2216,3 +2216,11 @@
 "Previous track" = "上一首";
 "Next track" = "下一首";
 "AI Radio picks the next track" = "AI 电台会挑选下一首";
+"Transcript" = "转写";
+"Record, then open as Markdown" = "录音，关闭后以 Markdown 打开";
+"Recording since %@" = "%@ 起录音中";
+"Transcribing…" = "正在转写…";
+"Nothing was heard" = "没有听到任何内容";
+"Needs Qwen3-ASR" = "需要 Qwen3-ASR";
+"Open the transcripts folder" = "打开转写文件夹";
+"Also record desktop audio" = "同时录制桌面音频";

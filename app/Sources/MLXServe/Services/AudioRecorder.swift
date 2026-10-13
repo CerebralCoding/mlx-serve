@@ -11,13 +11,13 @@ final class AudioRecorder: ObservableObject {
     @Published private(set) var level: Float = 0             // 0…1 RMS, for a meter
 
     static let targetSampleRate: Double = 16_000
-
-    private let engine = AVAudioEngine()
-    private var converter: AVAudioConverter?
-    private let targetFormat = AVAudioFormat(
+    static let targetFormat = AVAudioFormat(
         commonFormat: .pcmFormatFloat32, sampleRate: AudioRecorder.targetSampleRate,
         channels: 1, interleaved: false
     )!
+
+    private let engine = AVAudioEngine()
+    private var converter: AVAudioConverter?
     private let lock = NSLock()
     private var samples: [Float] = []   // accumulated 16 kHz mono float32
 
@@ -45,10 +45,10 @@ final class AudioRecorder: ObservableObject {
             throw NSError(domain: "AudioRecorder", code: 1,
                           userInfo: [NSLocalizedDescriptionKey: "No usable audio input device."])
         }
-        converter = AVAudioConverter(from: inFormat, to: targetFormat)
+        converter = AVAudioConverter(from: inFormat, to: Self.targetFormat)
 
         input.installTap(onBus: 0, bufferSize: 4096, format: inFormat) { [weak self] buffer, _ in
-            self?.appendBuffer(buffer, inFormat: inFormat)
+            self?.appendBuffer(buffer)
         }
         engine.prepare()
         try engine.start()
@@ -73,21 +73,8 @@ final class AudioRecorder: ObservableObject {
     func cancel() { _ = stop() }
 
     // Audio render thread: resample → accumulate → publish meter/duration.
-    private func appendBuffer(_ buffer: AVAudioPCMBuffer, inFormat: AVAudioFormat) {
-        guard let converter, buffer.frameLength > 0 else { return }
-        let ratio = Self.targetSampleRate / inFormat.sampleRate
-        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
-        guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return }
-
-        // Streaming convert: feed this buffer once, then report no-data-now so the
-        // stateful converter keeps its resampler continuity across taps.
-        var fed = false
-        var err: NSError?
-        converter.convert(to: out, error: &err) { _, status in
-            if fed { status.pointee = .noDataNow; return nil }
-            fed = true; status.pointee = .haveData; return buffer
-        }
-        guard err == nil, out.frameLength > 0, let ch = out.floatChannelData else { return }
+    private func appendBuffer(_ buffer: AVAudioPCMBuffer) {
+        guard let converter, let out = Self.resample(buffer, with: converter), let ch = out.floatChannelData else { return }
         let n = Int(out.frameLength)
 
         lock.lock()
@@ -102,6 +89,24 @@ final class AudioRecorder: ObservableObject {
             self.level = min(1, rms * 6)
             self.duration = Double(total) / Self.targetSampleRate
         }
+    }
+
+    /// One buffer through `converter` into `targetFormat`; nil when nothing came out.
+    static func resample(_ buffer: AVAudioPCMBuffer, with converter: AVAudioConverter) -> AVAudioPCMBuffer? {
+        guard buffer.frameLength > 0 else { return nil }
+        let ratio = targetSampleRate / buffer.format.sampleRate
+        let capacity = AVAudioFrameCount(Double(buffer.frameLength) * ratio) + 1024
+        guard let out = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: capacity) else { return nil }
+
+        // Streaming convert: feed this buffer once, then report no-data-now so the
+        // stateful converter keeps its resampler continuity across taps.
+        var fed = false
+        var err: NSError?
+        converter.convert(to: out, error: &err) { _, status in
+            if fed { status.pointee = .noDataNow; return nil }
+            fed = true; status.pointee = .haveData; return buffer
+        }
+        return err == nil && out.frameLength > 0 ? out : nil
     }
 
     /// Serialize float samples to little-endian float32 bytes (the wire format).

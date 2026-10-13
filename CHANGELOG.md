@@ -3,6 +3,7 @@
 ## v26.10.3 — Speech to Text - MiniCPM-V Vision - Films - Twice-as-Fast Sushi MiMo
 
 - **Speech to text.** `POST /v1/audio/transcriptions` turns WAV recordings into text in 30 languages with Qwen3-ASR, through the OpenAI SDK's own transcription call, with word and sentence times and SRT/WebVTT subtitles in 11 of them from Qwen3-ForcedAligner, which the app downloads alongside.
+- **Transcripts from the tray.** Switch on Transcript in the menu bar to record your microphone, and optionally what your Mac plays; switch it off and the transcript opens as Markdown.
 - **MiniCPM-V 4.7 sees.** OpenBMB's MiniCPM-V 4.7 reads images, from screenshots to pages of small print: large pictures are cut into crops so fine text stays legible, and a pack without the vision tower still answers text.
 - **Agents make films.** The mlx-serve skill walks a coding agent from a brief to a finished music video, trailer or release film: it writes and sings the song, times every word and beat, renders the shots on your Mac and cuts them to the music. Storyboards in the app join more smoothly too: a shot can end on a picture you choose, and every join fades.
 - **Sushi packs draft.** MiMo-V2.6-Flash Sushi packs draft with their own MTP heads and read their FP8 attention weights in place, about 105 tokens per second instead of 32 on an M5 Ultra, and GLM-5.3-Flash Sushi packs use the DFlash2 drafter they ship with, 94 instead of 66 on code.

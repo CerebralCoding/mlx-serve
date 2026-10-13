@@ -2216,3 +2216,11 @@
 "Previous track" = "이전 곡";
 "Next track" = "다음 곡";
 "AI Radio picks the next track" = "AI 라디오가 다음 곡을 고릅니다";
+"Transcript" = "받아쓰기";
+"Record, then open as Markdown" = "녹음하고, 끄면 Markdown으로 엽니다";
+"Recording since %@" = "%@부터 녹음 중";
+"Transcribing…" = "받아쓰는 중…";
+"Nothing was heard" = "들린 내용이 없습니다";
+"Needs Qwen3-ASR" = "Qwen3-ASR가 필요합니다";
+"Open the transcripts folder" = "받아쓰기 폴더 열기";
+"Also record desktop audio" = "데스크톱 오디오도 녹음";
