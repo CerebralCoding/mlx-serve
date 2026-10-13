@@ -103,9 +103,9 @@ pub fn languageBit(name: []const u8) u32 {
 /// Longest piece the aligner times: the reference's `MAX_FORCE_ALIGN_INPUT_SECONDS`.
 pub const ALIGN_MAX_SECONDS = 180;
 
-/// Ends of the pieces `pcm` is cut into, none longer than `max` samples: each
-/// cut sits in the quietest 100 ms within 5 s of its limit (the reference's
-/// `split_audio_into_chunks`). The last end is `pcm.len`.
+/// Ends of the pieces `pcm` is cut into, each about `max` samples: the cut
+/// sits in the quietest 100 ms within 5 s either side of its limit (the
+/// reference's `split_audio_into_chunks`). The last end is `pcm.len`.
 pub fn splitPoints(a: std.mem.Allocator, pcm: []const f32, max: usize) ![]usize {
     const expand: usize = 5 * SAMPLE_RATE;
     const win: usize = SAMPLE_RATE / 10;

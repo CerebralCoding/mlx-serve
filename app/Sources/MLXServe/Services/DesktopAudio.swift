@@ -14,6 +14,7 @@ final class DesktopAudio {
 
     /// Collect from `offset` samples into the recording; silence fills the gap.
     func start(at offset: Int) throws {
+        stop()
         lock.withLock { samples += repeatElement(0, count: max(0, offset - samples.count)) }
         do {
             let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
@@ -34,6 +35,8 @@ final class DesktopAudio {
             try check(AudioHardwareCreateAggregateDevice(composition as CFDictionary, &device))
             guard let input = AVAudioFormat(streamDescription: &format),
                   let converter = AVAudioConverter(from: input, to: AudioRecorder.targetFormat) else { throw CocoaError(.featureUnsupported) }
+            // Both channels into the mono track, not the left one alone.
+            converter.downmix = true
             try check(AudioDeviceCreateIOProcIDWithBlock(&proc, device, queue) { [weak self] _, data, _, _, _ in
                 guard let self, let buffer = AVAudioPCMBuffer(pcmFormat: input, bufferListNoCopy: data, deallocator: nil),
                       let out = AudioRecorder.resample(buffer, with: converter), let ch = out.floatChannelData else { return }

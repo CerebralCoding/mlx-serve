@@ -395,6 +395,7 @@ class DownloadManager: ObservableObject {
         if fm.fileExists(atPath: (dir as NSString).appendingPathComponent("kev_config.json")) { return "kev" }
         if isD1Config(atPath: (dir as NSString).appendingPathComponent("config.json")) { return "d1" }
         if isStableAudio3Config(atPath: (dir as NSString).appendingPathComponent("model_config.json")) { return "stable_audio3" }
+        if qwen3AsrThinker(dir) == "qwen3_forced_aligner" { return "qwen3_forced_aligner" }
         return nil
     }
 
@@ -1070,12 +1071,13 @@ class DownloadManager: ObservableObject {
     /// The model the server times transcripts with (verbose_json, srt, vtt).
     nonisolated static let alignerRepo = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
 
-    /// A Qwen3-ASR pack. The aligner's root also says `qwen3_asr`; its thinker names it.
-    nonisolated static func isAsrPack(_ dir: String) -> Bool {
+    /// The thinker's model_type in a Qwen3-ASR pack: `qwen3_asr`, or `qwen3_forced_aligner` for its
+    /// aligner, whose root says `qwen3_asr` too. Nil for any other model.
+    nonisolated static func qwen3AsrThinker(_ dir: String) -> String? {
         guard let data = FileManager.default.contents(atPath: (dir as NSString).appendingPathComponent("config.json")),
               let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
-              cfg["model_type"] as? String == "qwen3_asr" else { return false }
-        return (cfg["thinker_config"] as? [String: Any])?["model_type"] as? String != "qwen3_forced_aligner"
+              cfg["model_type"] as? String == "qwen3_asr" else { return nil }
+        return (cfg["thinker_config"] as? [String: Any])?["model_type"] as? String
     }
 
     /// A fresh Qwen3-ASR download brings the aligner beside it, into the same
@@ -1083,7 +1085,7 @@ class DownloadManager: ObservableObject {
     /// for the ASR, which serves without it.
     private func fetchAligner(for repoId: String) async {
         guard !Task.isCancelled, downloads[repoId]?.status == .completed,
-              let dir = existingModelDir(for: repoId), Self.isAsrPack(dir),
+              let dir = existingModelDir(for: repoId), Self.qwen3AsrThinker(dir) == "qwen3_asr",
               existingModelDir(for: Self.alignerRepo) == nil else { return }
         await download(repoId: Self.alignerRepo, alertOnFailure: false)
     }

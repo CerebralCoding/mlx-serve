@@ -7716,7 +7716,7 @@ fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []con
 
     var aligner: ?Aligner = if (transcription_mod.timed(form.format)) try findAligner(allocator) else null;
     if (aligner == null and (form.format == .srt or form.format == .vtt)) {
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "srt and vtt need word times from Qwen3-ForcedAligner: download " ++ ALIGNER_REPO ++ " beside the ASR model", 400);
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "srt and vtt need word times from Qwen3-ForcedAligner, which is not on disk or did not load: download " ++ ALIGNER_REPO ++ " beside the ASR model", 400);
         return;
     }
     const ends = if (aligner != null)
@@ -7737,11 +7737,17 @@ fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []con
         defer if (timed) |*x| x.deinit(allocator);
         if (aligner) |*al| {
             if (t.text.len > 0 and al.languages & transcription_mod.languageBit(t.language orelse "") != 0) {
-                if (al.lm == null) al.lm = global_scheduler.?.ensureLoaded(al.id) catch |err| {
-                    try sendEnsureLoadedError(allocator, stream, global_scheduler.?, al.id, err);
-                    return;
+                if (al.lm == null) al.lm = global_scheduler.?.ensureLoaded(al.id) catch |err| blk: {
+                    // verbose_json still answers without times; srt and vtt cannot.
+                    if (form.format != .verbose_json) {
+                        try sendEnsureLoadedError(allocator, stream, global_scheduler.?, al.id, err);
+                        return;
+                    }
+                    log.warn("  aligner {s} did not load ({s}): segments without word times\n", .{ al.id, @errorName(err) });
+                    al.languages = 0;
+                    break :blk null;
                 };
-                timed = (try alignPiece(allocator, stream, al.lm.?, pcm[start..end], t.text, t.language.?)) orelse return;
+                if (al.lm) |alm| timed = (try alignPiece(allocator, stream, alm, pcm[start..end], t.text, t.language.?)) orelse return;
             }
         }
         const rate: f64 = transcription_mod.SAMPLE_RATE;
@@ -7825,7 +7831,8 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
 /// languages its config lists, and the model once loaded (refcounted).
 const Aligner = struct { id: []const u8, languages: u32, lm: ?*LoadedModel = null };
 
-/// A Qwen3-ForcedAligner the server knows of, the resident one first; null when none is on disk.
+/// A Qwen3-ForcedAligner the server knows of, the resident one first, one
+/// that failed to load never; null when none is on disk.
 fn findAligner(allocator: std.mem.Allocator) !?Aligner {
     const registry = global_registry orelse return null;
     var pick: ?*LoadedModel = null;
@@ -7834,7 +7841,7 @@ fn findAligner(allocator: std.mem.Allocator) !?Aligner {
         defer registry.mutex.unlock(registry.io);
         var it = registry.entries.valueIterator();
         while (it.next()) |e| {
-            if (!std.mem.eql(u8, e.*.arch_hint, "qwen3_forced_aligner")) continue;
+            if (!std.mem.eql(u8, e.*.arch_hint, "qwen3_forced_aligner") or e.*.state == .error_state) continue;
             const p = pick orelse {
                 pick = e.*;
                 continue;
@@ -7937,7 +7944,6 @@ fn alignJobRun(ctx: *anyopaque) void {
 /// already-resolved + refcounted model (so it can't be evicted mid-gen). The
 /// generation runs on the scheduler's inference thread (the sole mlx caller);
 /// the body writes its own response. A wrong-modality target gets a clear 400.
-
 fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, route: media_mod.GenRoute) !void {
     const scheduler = global_scheduler orelse {
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
@@ -14227,9 +14233,6 @@ pub const insufficient_free_memory_message =
     "Not enough free memory to load model: weights + warmup headroom exceed what is currently available. " ++
     "Close other apps or models and retry (the server log names the peak estimate and available memory), or pass --skip-mem-preflight to override.";
 
-/// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for
-/// every on-demand load failure — the inference thread's error name was
-/// dropped at the thread boundary. The registry keeps it; echo it.
 /// The response for a failed `Scheduler.ensureLoaded(id)`.
 fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8, err: anyerror) !void {
     switch (err) {
@@ -14257,6 +14260,9 @@ fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched: *sc
     }
 }
 
+/// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for
+/// every on-demand load failure — the inference thread's error name was
+/// dropped at the thread boundary. The registry keeps it; echo it.
 fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8) !void {
     if (sched.loadErrorName(allocator, id)) |name| {
         defer allocator.free(name);

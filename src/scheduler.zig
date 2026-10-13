@@ -5942,7 +5942,7 @@ fn runGenJobs(reqs: []*GenRequest) void {
 /// in-flight work (whose graphs pin their inputs) once active memory passes this
 /// limit; CUDA's default is 95% of VRAM, so a diffusion step fills the card.
 fn genMemoryLimit(cuda: bool, est_peak: u64) ?usize {
-    return if (cuda) @intCast(est_peak) else null;
+    return if (cuda and est_peak > 0) @intCast(est_peak) else null;
 }
 
 /// Clear MLX's allocator cache after a job holding `cached` bytes: always for
@@ -11666,7 +11666,8 @@ test "interleaveTicksFor: decode keeps a quarter of wall time across a slow chun
 
 test "a media job on CUDA throttles MLX at its estimated peak; Metal keeps MLX's limit" {
     try testing.expectEqual(@as(?usize, 4 << 30), genMemoryLimit(true, 4 << 30));
-    try testing.expectEqual(@as(?usize, 0), genMemoryLimit(true, 0));
+    // No estimate (the forced aligner's pass) keeps MLX's limit: 0 would throttle every allocation.
+    try testing.expectEqual(@as(?usize, null), genMemoryLimit(true, 0));
     try testing.expectEqual(@as(?usize, null), genMemoryLimit(false, 4 << 30));
 }
 

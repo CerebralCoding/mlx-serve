@@ -138,6 +138,17 @@ if [ ! -f "$ALIGNER/config.json" ]; then
   echo "SKIP: word times (no Qwen3-ForcedAligner pack at $ALIGNER; set ALIGNER_MODEL)"
 else
   AID="mlx-community/$(basename "$ALIGNER")"
+  # An aligner that cannot load (its config, no weights): verbose_json still answers, untimed; srt cannot.
+  mkdir -p "$TMP/models/mlx-community/Qwen3-ForcedAligner-broken"
+  cp "$ALIGNER/config.json" "$TMP/models/mlx-community/Qwen3-ForcedAligner-broken/"
+  curl -s -X POST "$(url /v1/models/rescan)" >/dev/null
+  curl -s "$(url $T)" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=verbose_json -F 'timestamp_granularities[]=word' | python3 -c "
+import sys,json
+v=json.load(sys.stdin)
+assert len(v['segments'])==1 and v['words']==[], v" || { echo "FAIL: verbose_json beside a broken aligner"; exit 1; }
+  grep -q "did not load" "$LOG" || { echo "FAIL: no fallback line for the broken aligner"; exit 1; }
+  echo "PASS: a broken aligner leaves verbose_json untimed, not failed"
+  b400 "srt beside a broken aligner" "did not load" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=srt
   ln -s "$ALIGNER" "$TMP/models/mlx-community/$(basename "$ALIGNER")"
   curl -s -X POST "$(url /v1/models/rescan)" >/dev/null
   state() { curl -s "$(url /v1/models)" | python3 -c "

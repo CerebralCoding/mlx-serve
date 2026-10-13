@@ -4,10 +4,9 @@
 //! follows each, ONE trunk pass with the audio rows spliced in classifies every
 //! pair into 80 ms steps, and the reference's monotonic repair mends outliers.
 //!
-//! Japanese and Korean go one character per unit: the reference splits them
-//! with Python segmenters (nagisa, a dictionary). Measured against those, word
-//! times agree within one step (Japanese) and exactly (Korean, whose units are
-//! then joined back into its spaced words).
+//! Japanese and Korean go one character per unit, Korean's joined back into
+//! its spaced words: the reference splits them with Python segmenters
+//! (nagisa, a dictionary), and per-character units time the same words.
 
 const std = @import("std");
 const mlx = @import("mlx.zig");

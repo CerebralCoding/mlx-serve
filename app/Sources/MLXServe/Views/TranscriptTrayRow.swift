@@ -9,7 +9,8 @@ final class TrayTranscript: ObservableObject {
     static let asrRepo = "mlx-community/Qwen3-ASR-0.6B-8bit"
     static let folder = URL(fileURLWithPath: NSString(string: "~/.mlx-serve/transcripts").expandingTildeInPath)
 
-    enum Phase: Equatable { case idle, recording(since: Date), transcribing, note(String) }
+    /// `model` is the ASR chosen when recording began, so a change to the model list cannot strand the stop.
+    enum Phase: Equatable { case idle, starting, recording(since: Date, model: String), transcribing, note(String) }
     @Published private(set) var phase = Phase.idle
     /// Not observed: its meter would redraw the tray many times a second.
     private let recorder = AudioRecorder()
@@ -19,18 +20,20 @@ final class TrayTranscript: ObservableObject {
     @Published var desktop = UserDefaults.standard.bool(forKey: "transcriptDesktopAudio") {
         didSet {
             UserDefaults.standard.set(desktop, forKey: "transcriptDesktopAudio")
-            if case .recording(let since) = phase { desktop ? startDesktop(since) : desktopAudio.stop() }
+            if case .recording(let since, _) = phase { desktop ? startDesktop(since) : desktopAudio.stop() }
         }
     }
 
-    func start(voice: VoiceModeController) async {
+    func start(voice: VoiceModeController, model: String) async {
+        // A second click while the microphone prompt is up must not start a second recording.
+        switch phase { case .idle, .note: phase = .starting; default: return }
         guard await AudioRecorder.requestPermission() else { phase = .note("Microphone access is off"); return }
         // Voice mode would hear, and answer, what is being transcribed.
         if voice.isActive { voice.end() }
         do {
             try recorder.start()
             let since = Date()
-            phase = .recording(since: since)
+            phase = .recording(since: since, model: model)
             if desktop { startDesktop(since) }
         } catch {
             phase = .note(error.localizedDescription)
@@ -46,12 +49,10 @@ final class TrayTranscript: ObservableObject {
         }
     }
 
-    func stop(server: String, model: String) async {
+    func stop(server: String) async {
         let desk = desktopAudio.take()
-        guard case .recording(let since) = phase, let pcm = recorder.stop() else { phase = .idle; return }
+        guard case .recording(let since, let model) = phase, let pcm = recorder.stop() else { phase = .idle; return }
         phase = .transcribing
-        let samples = Self.mix(AudioReference.floatSamples(from: pcm), desk)
-        let rate = Int(AudioRecorder.targetSampleRate)
         let stamp = DateFormatter()
         stamp.locale = Locale(identifier: "en_US_POSIX")
         stamp.dateFormat = "yyyy-MM-dd HH:mm:ss"
@@ -59,23 +60,38 @@ final class TrayTranscript: ObservableObject {
         let file = Self.folder.appendingPathComponent(title.replacingOccurrences(of: ":", with: "."))
         try? FileManager.default.createDirectory(at: Self.folder, withIntermediateDirectories: true)
         do {
-            var segments: [(start: Double, text: String)] = []
-            var start = 0
-            for end in Self.pieceEnds(samples, rate: rate) {
-                let wav = AudioReference.wavData(fromMonoFloat: Array(samples[start..<end]), sampleRate: rate)
-                let offset = Double(start) / Double(rate)
-                segments += try await Self.transcribe(wav, model: model, server: server).map { (offset + $0.start, $0.text) }
-                start = end
-            }
-            segments.removeAll { $0.text.isEmpty }
+            let segments = try await Self.transcribeRecording(pcm, desk, model: model, server: server, keep: file.appendingPathExtension("wav"))
             guard !segments.isEmpty else { phase = .note("Nothing was heard"); return }
             try Self.markdown(title: title, segments: segments).write(to: file.appendingPathExtension("md"), atomically: true, encoding: .utf8)
             NSWorkspace.shared.open(file.appendingPathExtension("md"))
             phase = .idle
         } catch {
-            // The recording stays beside the transcripts, so a failure loses nothing.
-            try? AudioReference.wavData(fromMonoFloat: samples, sampleRate: rate).write(to: file.appendingPathExtension("wav"))
             phase = .note(error.localizedDescription)
+        }
+    }
+
+    /// Off the main actor: the mix, the cuts and one request per piece. On a
+    /// failure the recording is written to `keep`, so nothing is lost.
+    nonisolated static func transcribeRecording(_ pcm: Data, _ desktop: [Float], model: String, server: String, keep: URL) async throws -> [(start: Double, text: String)] {
+        let samples = mix(AudioReference.floatSamples(from: pcm), desktop)
+        let rate = Int(AudioRecorder.targetSampleRate)
+        do {
+            // Models downloaded since the server started (this ASR, its aligner) register first.
+            var rescan = URLRequest(url: URL(string: server + "/v1/models/rescan")!)
+            rescan.httpMethod = "POST"
+            _ = try? await URLSession.shared.data(for: rescan)
+            var segments: [(start: Double, text: String)] = []
+            var start = 0
+            for end in pieceEnds(samples, rate: rate) {
+                let wav = AudioReference.wavData(fromMonoFloat: Array(samples[start..<end]), sampleRate: rate)
+                let offset = Double(start) / Double(rate)
+                segments += try await transcribe(wav, model: model, server: server).map { (offset + $0.start, $0.text) }
+                start = end
+            }
+            return segments.filter { !$0.text.isEmpty }
+        } catch {
+            try? AudioReference.wavData(fromMonoFloat: samples, sampleRate: rate).write(to: keep)
+            throw error
         }
     }
 
@@ -162,8 +178,7 @@ struct TranscriptTrayRow: View {
     }
 
     private var row: some View {
-        // The aligner's config says qwen3_asr too.
-        let asr = appState.localModels.first { $0.modelType == "qwen3_asr" && DownloadManager.isAsrPack($0.path) }
+        let asr = appState.localModels.first { $0.modelType == "qwen3_asr" }
         return TrayFeatureRow(icon: "record.circle", title: "Transcript", subtitle: subtitle(asr != nil), isOn: recording, tint: .red) {
             Button {
                 try? FileManager.default.createDirectory(at: TrayTranscript.folder, withIntermediateDirectories: true)
@@ -173,22 +188,23 @@ struct TranscriptTrayRow: View {
             }
             .buttonStyle(.plain)
             .help("Open the transcripts folder")
-            if let asr {
+            if asr != nil || recording {
                 Toggle("", isOn: Binding(get: { recording }, set: { on in
                     Task {
-                        if on { await transcript.start(voice: appState.voice) }
-                        else { await transcript.stop(server: appState.server.baseURL, model: asr.path) }
+                        if !on { await transcript.stop(server: appState.server.baseURL) }
+                        else if let asr { await transcript.start(voice: appState.voice, model: asr.path) }
                     }
                 }))
                 .labelsHidden()
                 .toggleStyle(.switch)
                 .controlSize(.small)
                 // Stopping always works; starting needs the server.
-                .disabled(transcript.phase == .transcribing || !recording && appState.server.status != .running)
+                .disabled(transcript.phase == .transcribing || transcript.phase == .starting || !recording && appState.server.status != .running)
             } else {
+                // The aligner follows the ASR in the same download.
                 Button("Download") { downloads.start(repoId: TrayTranscript.asrRepo) { appState.refreshModels() } }
                     .controlSize(.small)
-                    .disabled(downloads.downloads[TrayTranscript.asrRepo]?.status == .downloading)
+                    .disabled([TrayTranscript.asrRepo, DownloadManager.alignerRepo].contains { downloads.downloads[$0]?.status == .downloading })
             }
         }
     }
@@ -200,8 +216,8 @@ struct TranscriptTrayRow: View {
 
     private func subtitle(_ hasAsr: Bool) -> String {
         switch transcript.phase {
-        case .idle: return hasAsr ? "Record, then open as Markdown" : "Needs Qwen3-ASR"
-        case .recording(let since): return L10n.format("Recording since %@", since.formatted(date: .omitted, time: .shortened))
+        case .idle, .starting: return hasAsr ? "Record, then open as Markdown" : "Needs Qwen3-ASR"
+        case .recording(let since, _): return L10n.format("Recording since %@", since.formatted(date: .omitted, time: .shortened))
         case .transcribing: return "Transcribing…"
         case .note(let note): return note
         }

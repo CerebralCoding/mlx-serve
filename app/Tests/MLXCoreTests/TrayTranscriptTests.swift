@@ -1,3 +1,4 @@
+import AVFoundation
 import XCTest
 @testable import MLXCore
 
@@ -28,14 +29,19 @@ final class TrayTranscriptTests: XCTestCase {
         XCTAssertEqual(TrayTranscript.markdown(title: "t", segments: [(0, "Only one.")]), "# t\n\nOnly one.\n")
     }
 
-    /// Live: TRANSCRIPT_SERVER=http://127.0.0.1:<port> TRANSCRIPT_MODEL=<Qwen3-ASR dir> TRANSCRIPT_WAV=<wav>.
+    /// Live: TRANSCRIPT_SERVER=http://127.0.0.1:<port> TRANSCRIPT_MODEL=<Qwen3-ASR dir> TRANSCRIPT_WAV=<16 kHz mono wav>.
+    /// The ASR may land on disk after the server started: the stop registers it first.
     func testARecordingRoundTripsThroughTheServer() async throws {
         let env = ProcessInfo.processInfo.environment
         guard let server = env["TRANSCRIPT_SERVER"], let model = env["TRANSCRIPT_MODEL"], let wav = env["TRANSCRIPT_WAV"] else {
             throw XCTSkip("set TRANSCRIPT_SERVER, TRANSCRIPT_MODEL and TRANSCRIPT_WAV")
         }
-        let segments = try await TrayTranscript.transcribe(try Data(contentsOf: URL(fileURLWithPath: wav)), model: model, server: server)
-        XCTAssertFalse(segments.isEmpty)
+        let file = try AVAudioFile(forReading: URL(fileURLWithPath: wav))
+        let buffer = try XCTUnwrap(AVAudioPCMBuffer(pcmFormat: file.processingFormat, frameCapacity: AVAudioFrameCount(file.length)))
+        try file.read(into: buffer)
+        let pcm = AudioRecorder.pcmData(from: Array(UnsafeBufferPointer(start: buffer.floatChannelData![0], count: Int(buffer.frameLength))))
+        let keep = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".wav")
+        let segments = try await TrayTranscript.transcribeRecording(pcm, [], model: model, server: server, keep: keep)
         XCTAssertTrue(segments.map(\.text).joined(separator: " ").lowercased().contains("fox"), "\(segments)")
     }
 }

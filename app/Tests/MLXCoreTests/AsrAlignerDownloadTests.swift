@@ -12,11 +12,15 @@ final class AsrAlignerDownloadTests: XCTestCase {
     }
 
     /// Both packs say `qwen3_asr` at the root; only the aligner's thinker tells them apart.
-    func testOnlyAnAsrPackCallsForTheAligner() throws {
-        XCTAssertTrue(DownloadManager.isAsrPack(try pack(#"{"model_type":"qwen3_asr","thinker_config":{"model_type":"qwen3_asr"}}"#)))
-        XCTAssertFalse(DownloadManager.isAsrPack(try pack(#"{"model_type":"qwen3_asr","thinker_config":{"model_type":"qwen3_forced_aligner"}}"#)))
-        XCTAssertFalse(DownloadManager.isAsrPack(try pack(#"{"model_type":"qwen3"}"#)))
-        XCTAssertFalse(DownloadManager.isAsrPack(try pack(nil)))
+    func testTheThinkerTellsTheAsrFromItsAligner() throws {
+        let asr = try pack(#"{"model_type":"qwen3_asr","thinker_config":{"model_type":"qwen3_asr"}}"#)
+        let aligner = try pack(#"{"model_type":"qwen3_asr","thinker_config":{"model_type":"qwen3_forced_aligner"}}"#)
+        XCTAssertEqual(DownloadManager.qwen3AsrThinker(asr), "qwen3_asr")
+        XCTAssertNil(DownloadManager.qwen3AsrThinker(try pack(#"{"model_type":"qwen3"}"#)))
+        XCTAssertNil(DownloadManager.qwen3AsrThinker(try pack(nil)))
+        // The scan lists the aligner under its own type, which no chat picker offers.
+        XCTAssertNil(DownloadManager.markerModelType(inDir: asr))
+        XCTAssertEqual(DownloadManager.markerModelType(inDir: aligner), "qwen3_forced_aligner")
         XCTAssertEqual(DownloadManager.alignerRepo, "mlx-community/Qwen3-ForcedAligner-0.6B-8bit")
     }
 }
