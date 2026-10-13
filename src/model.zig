@@ -800,6 +800,11 @@ pub const ModelConfig = struct {
         return @min(seq, window + widest + 1);
     }
 
+    pub fn firstSlidingLayer(self: ModelConfig) ?u32 {
+        for (0..self.num_hidden_layers) |i| if (!self.isGlobalLayer(@intCast(i))) return @intCast(i);
+        return null;
+    }
+
     pub fn isGlobalLayer(self: ModelConfig, layer_idx: u32) bool {
         if (!self.has_sliding_window) return true;
         if (self.has_explicit_layer_types and layer_idx < 128) {

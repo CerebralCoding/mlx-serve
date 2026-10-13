@@ -913,10 +913,14 @@ fn fileStamp(path: [*:0]const u8) i64 {
     return @as(i64, @intCast(m.sec)) * 1_000_000_000 + @as(i64, @intCast(m.nsec));
 }
 
+/// Regular files only, opened non-blocking: a FIFO at the path would park the
+/// browser thread in `open` until a writer came, and discovery with it.
 fn readSmallFile(alloc: std.mem.Allocator, path: [*:0]const u8) ?[]u8 {
-    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY }, @as(std.c.mode_t, 0));
+    const fd = std.c.open(path, .{ .ACCMODE = .RDONLY, .NONBLOCK = true }, @as(std.c.mode_t, 0));
     if (fd < 0) return null;
     defer _ = std.c.close(fd);
+    var st: std.c.Stat = undefined;
+    if (std.c.fstat(fd, &st) != 0 or st.mode & std.c.S.IFMT != std.c.S.IFREG) return null;
     var buf: std.ArrayList(u8) = .empty;
     var chunk: [4096]u8 = undefined;
     while (buf.items.len < 64 * 1024) {
@@ -1354,6 +1358,19 @@ test "lan: peerKeyFromJson reads one peer's key and refuses header-breaking valu
     try t.expect(peerKeyFromJson(a, json, "Num") == null);
     try t.expect(peerKeyFromJson(a, json, "Evil") == null);
     try t.expect(peerKeyFromJson(a, "not json", "Studio") == null);
+}
+
+test "lan: a keys path that is not a regular file reads as absent without blocking" {
+    var buf: [64]u8 = undefined;
+    const path = try std.fmt.bufPrintSentinel(&buf, "/tmp/mlx-serve-lan-fifo-{d}", .{std.c.getpid()}, 0);
+    const C = struct {
+        extern "c" fn mkfifo(path: [*:0]const u8, mode: std.c.mode_t) c_int;
+    };
+    _ = std.c.unlink(path);
+    try t.expect(C.mkfifo(path, 0o600) == 0);
+    defer _ = std.c.unlink(path);
+    try t.expect(readSmallFile(t.allocator, path) == null);
+    try t.expect(readSmallFile(t.allocator, "/tmp") == null);
 }
 
 test "lan: a peer that answered 401 is listed as needing a key" {

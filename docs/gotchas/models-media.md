@@ -2102,3 +2102,12 @@ Not fixed: the NFC normalizer (U+2000 -> U+2002); DeepSeek's main regex reads ze
 ## A placeholder id of 0 is UNSET, not token 0: an audio-only model heard silence (Qwen3-ASR, 2026-10-13)
 
 **Defect.** Qwen3-ASR's first live transcription answered `language None<asr_text>` (no speech) with the tower matching mlx-audio at cos 1.000000. **Cause.** Three splice sites treated `image_token_id` as always set: `applyVisionEmbeddingsWith` returned early when it was 0 (an audio-only model has none, so its rows were never spliced), `spliceVisionRows` matched `token_ids == 0`, and `countSpliceRows` counted it, so a text `!` (Qwen id 0) would have taken an audio row and shifted every later one. **Fix.** All three skip a 0 id, like the audio and video ids already did. **Guards.** `spliceVisionRows: an unset placeholder id (0) never claims token 0`, the `countSpliceRows` case, and `tests/test_transcriptions.sh` (word recall 0.0 on revert).
+
+## A Sushi MiMo pack drafted nothing: its MTP heads kept the source layout (2026-10-13)
+
+Every boot of `beamster/MiMo-V2.6-Flash-Sushi-*` logged `[mimo-mtp] missing model.mtp.layers.0.self_attn.q_proj.weight — MTP off`: the pack stores its three heads like its trunk (fused e4m3 QKV with 128-tile scales, e4m3 MLP), and `sushi_pack` only converted the trunk while billing the heads as unserved. `dequantFp8Trunk` now runs the same QKV split and MLP decode over `model.mtp.layers.N`, in a sliding layer's geometry (`ModelConfig.firstSlidingLayer`, which `mimo_mtp` reads too). Guard: `sushi pack: the MiMo MTP heads get the trunk's split QKV and decoded MLP` + the smoke `mimo_v2_sushi.mtp` cell.
+
+
+## MiMo's own DFlash drafter loaded, drafted garbage and outranked MTP (2026-10-13)
+
+`--drafter <MiMo Sushi pack>/dflash` (Xiaomi's drafter) loaded clean and accepted 2-4% of its drafts, so the gate turned it off and the request ran serial: 32 tok/s against 67 with the pack's MTP heads, because DFlash outranks MTP. Its config declares `partial_rotary_factor` 0.5, `attention_value_scale` and attention-sink biases, and the block forward has no arm for any of them. `parseConfigFromJson` now refuses such a drafter by name (`UnsupportedDflashAttention`), like the unported Markov heads. Guard: `dflash: a drafter whose attention needs unported arms is refused by name`.

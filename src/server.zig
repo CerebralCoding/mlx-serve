@@ -6957,6 +6957,35 @@ test "mediaRejectReason: media on a tower-less model is refused by name, text pa
     try t.expect(mediaRejectReason(&prefill, true) != null);
 }
 
+/// The URL of an OpenAI `image_url` part: `{"url": ...}`, or the bare string
+/// some clients send. Null for any other shape, which the caller refuses by
+/// name: a dropped image leaves the model describing a picture it never saw.
+fn imageUrlOfPart(part: std.json.ObjectMap) ?[]const u8 {
+    return switch (part.get("image_url") orelse return null) {
+        .string => |s| s,
+        .object => |o| if (o.get("url")) |u| (if (u == .string) u.string else null) else null,
+        else => null,
+    };
+}
+
+test "imageUrlOfPart: the object and bare-string shapes name the URL, any other shape is refused" {
+    const t = std.testing;
+    const cases = [_]struct { json: []const u8, url: ?[]const u8 }{
+        .{ .json = "{\"type\":\"image_url\",\"image_url\":{\"url\":\"data:a\"}}", .url = "data:a" },
+        .{ .json = "{\"type\":\"image_url\",\"image_url\":\"data:b\"}", .url = "data:b" },
+        .{ .json = "{\"type\":\"image_url\",\"image_url\":{\"href\":\"data:c\"}}", .url = null },
+        .{ .json = "{\"type\":\"image_url\",\"image_url\":{\"url\":7}}", .url = null },
+        .{ .json = "{\"type\":\"image_url\",\"image_url\":null}", .url = null },
+        .{ .json = "{\"type\":\"image_url\"}", .url = null },
+    };
+    for (cases) |c| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, t.allocator, c.json, .{});
+        defer parsed.deinit();
+        const got = imageUrlOfPart(parsed.value.object);
+        if (c.url) |want| try t.expectEqualStrings(want, got.?) else try t.expect(got == null);
+    }
+}
+
 test "dropMedia tells the model an attachment it cannot see was there" {
     var owned = std.ArrayList([]const u8).empty;
     defer {
@@ -9321,12 +9350,11 @@ fn handleChatCompletions(
                     const ptype = part.object.get("type") orelse continue;
                     if (ptype != .string) continue;
                     if (std.mem.eql(u8, ptype.string, "image_url")) {
-                        // Parse image_url content block
-                        const img_obj = part.object.get("image_url") orelse continue;
-                        if (img_obj != .object) continue;
-                        const url_val = img_obj.object.get("url") orelse continue;
-                        if (url_val != .string) continue;
-                        if (!appendImageUrlContent(allocator, media.images(img_slot), url_val.string, visionPreprocFromConfig(config))) image_decode_failed = true;
+                        const url = imageUrlOfPart(part.object) orelse {
+                            image_decode_failed = true;
+                            continue;
+                        };
+                        if (!appendImageUrlContent(allocator, media.images(img_slot), url, visionPreprocFromConfig(config))) image_decode_failed = true;
                     } else if (std.mem.eql(u8, ptype.string, "video_url")) {
                         // A video is, on the wire, an ordered array of already-
                         // decoded frame images — no video codec exists anywhere
@@ -15910,11 +15938,9 @@ fn embeddingPrompt(
                 try appendEmbeddingText(allocator, tok, &ids, text.string);
             } else if (std.mem.eql(u8, kind, "image_url")) {
                 if (!can_see) return .{ .reject = EMBED_NO_VISION_REJECT };
-                const holder = part.object.get("image_url") orelse return .{ .reject = IMAGE_DECODE_REJECT };
-                const url = if (holder == .object) holder.object.get("url") else null;
-                if (url == null or url.? != .string) return .{ .reject = IMAGE_DECODE_REJECT };
+                const url = imageUrlOfPart(part.object) orelse return .{ .reject = IMAGE_DECODE_REJECT };
                 const slot = try media.openImages();
-                if (!appendImageUrlContent(allocator, media.images(slot), url.?.string, image_vp)) return .{ .reject = IMAGE_DECODE_REJECT };
+                if (!appendImageUrlContent(allocator, media.images(slot), url, image_vp)) return .{ .reject = IMAGE_DECODE_REJECT };
                 try items.append(allocator, .{ .image = media.imagesSlice(slot).? });
                 try ids.append(allocator, config.image_token_id);
             } else if (std.mem.eql(u8, kind, "video_url")) {
