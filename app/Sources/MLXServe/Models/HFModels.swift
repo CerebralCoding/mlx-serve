@@ -48,10 +48,11 @@ let supportedModelTypes: Set<String> = [
     "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "qwen2",
     "llama", "mistral",
-    "lfm2", "lfm2_vl", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
+    "lfm2", "lfm2_vl", "lfm2_moe", // Liquid LFM2.5; the VL tag adds a SigLIP2-NaFlex tower
     "nemotron_h",
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
+    "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)
     "mimo_v2", "mimo_v2_flash", // Xiaomi MiMo-V2.6-Flash (309B-A15B MoE, mlx-lm layout packs)
     "glm5_next", "glm5_next_text", // Z.ai GLM-5.3-Flash (KDA + DSA hybrid MoE, text + vision)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
