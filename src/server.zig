@@ -2029,11 +2029,14 @@ pub fn serve(
     //    advertised port is always the bound port. Bonjour being unavailable
     //    degrades to a warning; it must never kill the server.
     if (g_lan_share_spec != null or g_lan_discover) {
+        var keys_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
         g_lan = lan_mod.Lan.start(allocator, .{
             .port = port,
             .share_spec = g_lan_share_spec,
             .name = g_lan_name,
             .discover = g_lan_discover,
+            .keys_path = std.fmt.bufPrint(&keys_buf, "{s}/.mlx-serve/lan-keys.json", .{home}) catch null,
         }) catch |err| blk: {
             log.warn("[lan] failed to start ({s}); LAN sharing disabled\n", .{@errorName(err)});
             break :blk null;
@@ -7414,6 +7417,14 @@ fn renderModelsBody(allocator: std.mem.Allocator, io: std.Io, lan_filtered: bool
     // local clients; neither is re-exported to the LAN.
     if (!lan_filtered) if (g_lan) |l| try l.appendRemoteEntries(allocator, &entries_buf);
     if (!lan_filtered) if (g_providers) |p| try p.appendEntries(allocator, &entries_buf);
+
+    // Keyed peers we hold no working key for, so the app can ask for one.
+    var locked = std.ArrayList(u8).empty;
+    defer locked.deinit(allocator);
+    if (!lan_filtered) if (g_lan) |l| try l.appendPeersNeedingKey(allocator, &locked);
+    if (locked.items.len > 0) return std.fmt.allocPrint(allocator,
+        \\{{"object":"list","data":[{s}],"lan_needs_key":[{s}]}}
+    , .{ entries_buf.items, locked.items });
 
     return std.fmt.allocPrint(allocator,
         \\{{"object":"list","data":[{s}]}}
@@ -13206,8 +13217,10 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
     };
     const rewritten = try lan_mod.rewriteModelValue(allocator, body, full_id, rid.bare);
     defer allocator.free(rewritten);
+    const key = l.peerKey(allocator, rid.peer);
+    defer if (key) |k| allocator.free(k);
     log.info("[lan] proxy {s} {s} -> \"{s}\" @ {d}.{d}.{d}.{d}:{d}\n", .{ method, raw_path, rid.peer, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port });
-    lan_mod.tunnel(remote, method, raw_path, rewritten, stream) catch {
+    lan_mod.tunnel(remote, method, raw_path, rewritten, key, stream) catch {
         try sendErrorResponse(allocator, stream, "502 Bad Gateway", "lan_peer_unreachable", "LAN peer did not accept the connection", 502);
     };
 }

@@ -202,6 +202,7 @@
 "A well-rounded Qwen model — good at chatting, coding help, and following instructions, while staying quick to respond. A solid alternative to Gemma if you want to compare styles." = "一款均衡的 Qwen 模型 —— 擅长聊天、编码辅助和指令遵循，同时保持快速响应。如果你想比较不同风格，它是 Gemma 之外可靠的选择。";
 "API" = "API 接口";
 "API key" = "API 密钥";
+"Needs key" = "需要密钥";
 "About MLX-Serve" = "关于 MLX-Serve";
 "About mlx-serve" = "关于 mlx-serve";
 "About to send…" = "即将发送…";

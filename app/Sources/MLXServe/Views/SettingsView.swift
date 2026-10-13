@@ -935,6 +935,7 @@ private struct ModelFoldersSectionContent: View {
 private struct LanSharingSectionContent: View {
     @EnvironmentObject var appState: AppState
     @EnvironmentObject var server: ServerManager
+    @State private var peerKeys: [String: String] = [:]
 
     private var meta: [String: ServerOptionField] { ServerOptions.serverFlagFields }
     private var dirty: ServerLaunchDirty {
@@ -979,6 +980,13 @@ private struct LanSharingSectionContent: View {
                     .labelsHidden()
                     .toggleStyle(.switch).font(.app(.body))
             }
+            .task {
+                peerKeys = LanPeerKeys.load()
+                await server.refreshModels()
+            }
+        }
+        if appState.serverOptions.lanDiscoverEnabled {
+            LanPeerKeyRows(keys: $peerKeys)
         }
         // The privacy disclosure — sharing means running other people's
         // prompts, and using a network model means the host reads yours.
@@ -1021,6 +1029,62 @@ private struct LanSharingSectionContent: View {
         }
         .padding(.leading, 8)
         .padding(.vertical, 2)
+    }
+}
+
+/// A key field per LAN peer that runs with --api-key. Saving writes
+/// lan-keys.json, which the server picks up on its own.
+private struct LanPeerKeyRows: View {
+    @EnvironmentObject var server: ServerManager
+    @Binding var keys: [String: String]
+    @State private var saveError: String?
+
+    var body: some View {
+        let names = LanPeerKeys.rows(needingKey: server.lanPeersNeedingKey, saved: keys)
+        if !names.isEmpty {
+            SearchableRow(searchText: ["API key", "LAN peer"] + names) {
+                VStack(alignment: .leading, spacing: 6) {
+                    ForEach(names, id: \.self) { name in
+                        HStack(spacing: 8) {
+                            Text(verbatim: name).font(.app(.body))
+                            if server.lanPeersNeedingKey.contains(name) {
+                                Text(L10n.text("Needs key")).font(.app(.caption)).foregroundStyle(.orange)
+                            }
+                            Spacer()
+                            SecureField("api key", text: Binding(
+                                get: { keys[name] ?? "" },
+                                set: { keys[name] = $0 }
+                            ), prompt: Text(L10n.text("API key")))
+                            .textFieldStyle(.roundedBorder)
+                            .frame(width: 200)
+                            .onSubmit(save)
+                        }
+                    }
+                    HStack {
+                        Spacer()
+                        Button { save() } label: { Text("Save").font(.app(.body)) }
+                    }
+                    if let saveError {
+                        Text(verbatim: saveError).font(.app(.caption)).foregroundStyle(.red)
+                    }
+                }
+            }
+        }
+    }
+
+    private func save() {
+        do {
+            try LanPeerKeys.save(keys)
+            saveError = nil
+        } catch {
+            saveError = error.localizedDescription
+            return
+        }
+        Task {
+            // The server retries the peer within a second of the file changing.
+            try? await Task.sleep(for: .seconds(3))
+            await server.refreshModels()
+        }
     }
 }
 

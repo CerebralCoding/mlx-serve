@@ -42,6 +42,7 @@
 - **More launchers.** ZCode (thanks @beamivalice), fx and Grok join the app's Code menu and `mlx-serve launch`, and the console Monitor keeps 24 hours of history in your browser and names each agent (thanks @STRML).
 - **More decision models.** LiquidAI's D1 and Cloudflare's Clef and Clef-Flash (thanks @CerebralCoding) join Laya and Kev in one Decisions pane.
 - **MiniCPM-V 4.7 sees.** OpenBMB's MiniCPM-V 4.7 reads images, from screenshots to pages of small print: large pictures are cut into crops so fine text stays legible, and a pack without the vision tower still answers text.
+- **Use a Mac that shares with a key.** When another Mac shares its models behind an API key, it shows up in Settings > LAN Sharing as needing a key; enter it there and its models appear in your pickers. Headless: `~/.mlx-serve/lan-keys.json`.
 - **GLM-5.3 sees.** GLM-5.3-Flash now reads images, so an agent on it can look at its own screenshots.
 - **Agents build better games.** The mlx-serve skill that coding agents get adds a 3D game guide (movement, foliage, lighting) and one script that generates every asset, then makes textures seamless, cuts out sprites and sizes 3D models.
 - **More packs load as they are.** oMLX's Flash Next packs (thanks @otarkhan) and Sushi's GLM-5.3, MiMo and BF16 Flash Next packs (thanks @beamivalice).

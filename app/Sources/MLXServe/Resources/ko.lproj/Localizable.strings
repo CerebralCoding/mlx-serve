@@ -1823,6 +1823,7 @@
 "Gemma 3 12B (4-bit)" = "Gemma 3 12B(4비트)";
 "Auto (server default)" = "자동(서버 기본값)";
 "API key" = "API 키";
+"Needs key" = "키 필요";
 "On battery" = "배터리 사용 중";
 "%lld windows joined end to end — about %lld frames, and roughly %lldx the time of a single window." = "윈도우 %lld개를 이어 붙임 — 약 %lld프레임이며, 단일 윈도우 대비 약 %lld배의 시간이 걸립니다.";
 "%lld tok/sec" = "%lld 토큰/초";
