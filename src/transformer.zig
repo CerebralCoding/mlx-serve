@@ -21871,7 +21871,7 @@ pub const Transformer = struct {
             _ = mlx.mlx_array_set(target_all, final_normed);
         }
 
-        if (self.embedding_mode) return final_normed;
+        if (self.embedding_mode or ctx.skip_lm_head) return final_normed;
         var logits = try self.lmHeadProject(final_normed, ctx.argmax_only);
         _ = mlx.mlx_array_free(final_normed);
 

@@ -7,6 +7,7 @@ const sushi_exl3 = @import("sushi_exl3");
 const sushi_pack = @import("sushi_pack.zig");
 const model_discovery = @import("model_discovery.zig");
 const tokenizer_mod = @import("tokenizer.zig");
+const transcription = @import("transcription.zig");
 const qwen4_exp = @import("qwen4_exp.zig");
 const qwen4_ple = @import("qwen4_ple.zig");
 const kv_quant_mod = @import("kv_quant.zig");
@@ -158,6 +159,15 @@ pub const QwenAudioConfig = struct {
     /// Attention window in mel frames.
     n_window_infer: u32 = 800,
     output_dim: u32 = 2048,
+};
+
+/// Qwen3-ForcedAligner: the trunk's head classifies each `<timestamp>` row
+/// into steps of `step_ms` (src/forced_align.zig).
+pub const ForcedAlignerConfig = struct {
+    timestamp_token_id: u32 = 151705,
+    step_ms: f32 = 80,
+    /// `support_languages`, as `transcription.languageBit`s.
+    languages: u32 = 0,
 };
 
 pub const ModelConfig = struct {
@@ -630,6 +640,8 @@ pub const ModelConfig = struct {
     audio_samples_per_token: u32 = 640, // 40ms @ 16kHz
     /// Qwen3-ASR's audio tower (src/qwen_audio.zig); the trunk is a plain qwen3.
     qwen_audio: ?QwenAudioConfig = null,
+    /// Set on Qwen3-ForcedAligner, the ASR shape with a timestamp head.
+    forced_aligner: ?ForcedAlignerConfig = null,
 
     // Qwen3.5/3.6 vision (Qwen3-VL ViT). Distinct from the Gemma SigLIP fields
     // above: Qwen ships a fused-qkv ViT with a patch merger, and the text trunk
@@ -4362,10 +4374,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // Llama-family defaults (qwen3, llama, mistral, etc.)
         if (std.mem.eql(u8, model_type, "qwen3")) {
             config.model_type = "qwen3";
-        } else if (std.mem.eql(u8, model_type, "qwen3_asr")) {
+        } else if (std.mem.eql(u8, model_type, "qwen3_asr") or std.mem.eql(u8, model_type, "qwen3_forced_aligner")) {
             config.model_type = "qwen3";
             config.qwen_audio = try parseQwenAudioConfig(root);
             config.has_vision = true;
+            if (std.mem.eql(u8, model_type, "qwen3_forced_aligner")) config.forced_aligner = try parseForcedAligner(outer);
         } else if (std.mem.eql(u8, model_type, "qwen2")) {
             // Qwen2.5 family: dense Llama-style attention, NO QK-norm (left
             // false below), additive qkv-projection biases applied in the
@@ -4551,6 +4564,18 @@ fn parseQwenAudioConfig(root: std.json.ObjectMap) !QwenAudioConfig {
     if (qa.heads == 0 or qa.d_model % qa.heads != 0 or qa.n_window == 0 or qa.n_window_infer < 2 * qa.n_window or qa.downsample == 0)
         return error.InvalidConfigField;
     return qa;
+}
+
+/// The aligner's timestamp fields sit at the pack's root, beside `thinker_config`.
+fn parseForcedAligner(outer: std.json.ObjectMap) !ForcedAlignerConfig {
+    var fa = ForcedAlignerConfig{};
+    if (jsonField(outer, "timestamp_token_id")) |v| fa.timestamp_token_id = try jsonU32(v);
+    if (jsonField(outer, "timestamp_segment_time")) |v| fa.step_ms = try jsonFloat(v);
+    if (jsonField(outer, "support_languages")) |v| {
+        for ((try jsonValue(.array, v)).items) |l| fa.languages |= transcription.languageBit(try jsonValue(.string, l));
+    }
+    if (fa.step_ms <= 0) return error.InvalidConfigField;
+    return fa;
 }
 
 /// Qwen3-ASR nests the whole model under `thinker_config`; the pack's quantization stays outside it.
@@ -8156,6 +8181,43 @@ test "ModelConfig parses Qwen3-ASR: a qwen3 trunk and an audio tower under think
     try testing.expectEqual(@as(u32, 50), qa.n_window);
     try testing.expectEqual(@as(u32, 800), qa.n_window_infer);
     try testing.expectEqual(@as(u32, 1024), qa.output_dim);
+    try testing.expect(config.forced_aligner == null);
+}
+
+test "ModelConfig parses Qwen3-ForcedAligner: the ASR shape plus its timestamp head" {
+    // mlx-community/Qwen3-ForcedAligner-0.6B-8bit, abridged: a `qwen3_forced_aligner`
+    // thinker in a `qwen3_asr` pack, the timestamp fields at the root.
+    const json =
+        \\{
+        \\  "model_type": "qwen3_asr",
+        \\  "quantization": {"group_size": 64, "bits": 8, "mode": "affine"},
+        \\  "support_languages": ["Chinese", "Cantonese", "English", "German", "Spanish", "French", "Italian", "Portuguese", "Russian", "Korean", "Japanese"],
+        \\  "timestamp_segment_time": 80,
+        \\  "timestamp_token_id": 151705,
+        \\  "thinker_config": {
+        \\    "model_type": "qwen3_forced_aligner",
+        \\    "audio_token_id": 151676,
+        \\    "classify_num": 5000,
+        \\    "audio_config": {"d_model": 1024, "encoder_layers": 24, "encoder_attention_heads": 16,
+        \\      "encoder_ffn_dim": 4096, "num_mel_bins": 128, "downsample_hidden_size": 480, "n_window": 50,
+        \\      "n_window_infer": 800, "output_dim": 1024},
+        \\    "text_config": {"model_type": "qwen3", "hidden_size": 1024, "intermediate_size": 3072,
+        \\      "num_hidden_layers": 28, "num_attention_heads": 16, "num_key_value_heads": 8, "head_dim": 128,
+        \\      "max_position_embeddings": 8192, "rms_norm_eps": 1e-06, "rope_theta": 1000000,
+        \\      "tie_word_embeddings": false, "vocab_size": 152064}
+        \\  }
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, json);
+    try testing.expectEqualStrings("qwen3", config.model_type);
+    try testing.expect(!config.tie_word_embeddings and config.has_vision);
+    try testing.expectEqual(@as(u32, 8192), config.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 24), config.qwen_audio.?.layers);
+    const fa = config.forced_aligner.?;
+    try testing.expectEqual(@as(u32, 151705), fa.timestamp_token_id);
+    try testing.expectEqual(@as(f32, 80), fa.step_ms);
+    for ([_][]const u8{ "English", "Chinese", "Korean", "Japanese", "Cantonese" }) |l| try testing.expect(fa.languages & transcription.languageBit(l) != 0);
+    try testing.expect(fa.languages & transcription.languageBit("Arabic") == 0);
 }
 
 test "a Qwen3-ASR load keeps its audio tower; every other audio tower stays dropped" {

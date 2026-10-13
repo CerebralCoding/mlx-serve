@@ -83,10 +83,17 @@ test("alignLyrics places a line nobody heard between its neighbours", () => {
   assert.ok(b.start > a.end && b.end < c.start, JSON.stringify([a, b, c]));
 });
 
+test("transcriptWords leaves words untimed when one segment spans the clip (Qwen3-ASR), however short", () => {
+  for (const end of [148.4, 6]) {
+    const words = transcriptWords({ text: "light on the water", segments: [{ id: 0, start: 0, end, text: "light on the water" }] });
+    assert.deepEqual(words.map((w) => [w.word, w.start]), [["light", null], ["on", null], ["the", null], ["water", null]]);
+  }
+});
+
 test("transcriptWords prefers word times and splits segments evenly without them", () => {
   assert.deepEqual(transcriptWords({ words: [{ word: " hi ", start: 1, end: 1.5 }] }), [{ word: "hi", start: 1, end: 1.5 }]);
-  assert.deepEqual(transcriptWords({ segments: [{ start: 2, end: 4, text: " good night " }] }), [
-    { word: "good", start: 2, end: 3 }, { word: "night", start: 3, end: 4 },
+  assert.deepEqual(transcriptWords({ segments: [{ start: 2, end: 4, text: " good night " }, { start: 5, end: 6, text: "sleep" }] }), [
+    { word: "good", start: 2, end: 3 }, { word: "night", start: 3, end: 4 }, { word: "sleep", start: 5, end: 6 },
   ]);
 });
 
@@ -197,7 +204,7 @@ const sse = (res, ...events) => {
 const LYRICS = "[Verse]\nLight on the water\nStay with me\n\n[Chorus]\nTurn the lights on\n";
 const SUNG = [["Light", 2], ["on", 2.4], ["the", 2.7], ["water", 3], ["Stay", 4.2], ["with", 4.6], ["me", 5], ["Turn", 7], ["the", 7.3], ["lights", 7.6], ["on", 8]];
 
-async function songServer({ transcription = true } = {}) {
+async function songServer({ transcription = true, wholeClip = false } = {}) {
   const tracks = { 7: clickTrack(grid(1, 11, 0.6), 12), 108: clickTrack(grid(1, 29, 0.6), 30) };
   return mockServer(
     [
@@ -217,6 +224,8 @@ async function songServer({ transcription = true } = {}) {
           const form = body.toString("latin1");
           assert.match(form, /name="timestamp_granularities\[\]"\r\n\r\nword/);
           const words = form.includes('filename="take-7.wav"') ? SUNG : [["Like", 2], ["a", 2.5], ["daughter", 3], ["turn", 7]];
+          const text = words.map(([w]) => w).join(" ");
+          if (wholeClip) return res.end(JSON.stringify({ task: "transcribe", language: "english", duration: 12, text, segments: [{ id: 0, seek: 0, start: 0, end: 12, text }] }));
           res.end(JSON.stringify({ text: "", words: words.map(([word, start]) => ({ word, start, end: start + 0.3 })) }));
         },
       } : {}),
@@ -268,6 +277,24 @@ test("film.mjs song without a transcription endpoint still picks a song and its 
     const song = JSON.parse(readFileSync(join(dir, "film", "song.json"), "utf8"));
     assert.deepEqual([song.lines, song.words], [[], []]);
     assert.ok(song.beats.length > 10);
+  } finally {
+    await srv.close();
+  }
+});
+
+test("film.mjs song on a transcript without word times scores the takes but writes no line times", async () => {
+  const srv = await songServer({ wholeClip: true });
+  try {
+    const dir = tmp(), lyrics = join(dir, "lyrics.txt");
+    writeFileSync(lyrics, LYRICS);
+    const { stderr } = await run("node", [join(SKILL, "film.mjs"), "song", join(dir, "film"), "--lyrics", lyrics, "--style", "pop", "--takes", "2", "--max", "30"], { env: { ...process.env, MLX_SERVE_URL: srv.url } });
+    assert.match(stderr, /no word times/);
+    const song = JSON.parse(readFileSync(join(dir, "film", "song.json"), "utf8"));
+    assert.equal(song.from, "takes/take-7.wav");
+    assert.ok(song.takes.find((t) => t.seed === 7).similarity > song.takes.find((t) => t.seed === 108).similarity);
+    assert.deepEqual([song.lines, song.words], [[], []]);
+    assert.ok(song.beats.length > 10);
+    await assert.rejects(run("node", [join(SKILL, "film.mjs"), "words", join(dir, "film")]), (e) => /no line times/.test(e.stderr) && /film\.mjs beats/.test(e.stderr));
   } finally {
     await srv.close();
   }

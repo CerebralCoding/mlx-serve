@@ -1238,7 +1238,7 @@ fn matchWhitespaceRun(text: []const u8, start: usize) ?usize {
 
 /// `\s` in HF `tokenizers`' regex engine (Oniguruma) is Unicode White_Space:
 /// the full-width U+3000 and NBSP U+00A0 are whitespace, not punctuation.
-fn isWhitespaceCp(cp: u21) bool {
+pub fn isWhitespaceCp(cp: u21) bool {
     return switch (cp) {
         0x09...0x0D, 0x20, 0x85, 0xA0, 0x1680, 0x2000...0x200A, 0x2028, 0x2029, 0x202F, 0x205F, 0x3000 => true,
         else => false,
@@ -1285,7 +1285,7 @@ fn decodeCodepoint(text: []const u8, pos: usize) ?CpInfo {
     return CpInfo{ .cp = cp, .len = end - pos };
 }
 
-fn isLetter(cp: u21) bool {
+pub fn isLetter(cp: u21) bool {
     // The script ranges below are whole blocks; their digits are \p{N}, not letters.
     if (cp >= 0x80 and isDigit(cp)) return false;
     // ASCII letters
@@ -1342,7 +1342,7 @@ const NUMBER_RANGES = [_][2]u21{
 };
 
 /// `\p{N}`: every script's digits, superscripts, fractions and numerals, not just ASCII.
-fn isDigit(cp: u21) bool {
+pub fn isDigit(cp: u21) bool {
     if (cp < 0x80) return cp >= '0' and cp <= '9';
     var lo: usize = 0;
     var hi: usize = NUMBER_RANGES.len;

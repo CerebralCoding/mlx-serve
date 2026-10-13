@@ -16,7 +16,8 @@ const HELP = `film.mjs: plan, check and render a video made on mlx-serve (server
   node film.mjs init <dir> [--no-install]     project: src/index.tsx (film.tsx), timeline.json, public/, Remotion
   node film.mjs song <dir> --lyrics lyrics.txt --style "<tags>" [--takes 3] [--seed 7] [--max 240] [--model id]
                                               YuE2 sings takes -> transcribed -> scored -> the best becomes public/song.wav;
-                                              song.json = every sung line and word with its time, the tempo, the beats
+                                              song.json = the tempo, the beats, and every sung line and word with its
+                                              time when the server gives word times
   node film.mjs song <dir> --file mine.wav [--lyrics lyrics.txt]   the same analysis for a song you already have
   node film.mjs words <dir> [--words]         the sung lines (and words) with their song times
   node film.mjs beats <dir> [--from s] [--to s] [--div 2]   beat-grid times to cut on
@@ -43,13 +44,18 @@ async function transcribe(file, model) {
   return transcriptWords(await res.json());
 }
 
-/** Words with times from a verbose_json transcript; segments without word times are split evenly. */
+// A segment longer than this cannot place a word.
+const SEGMENT_TIMING_MAX = 15;
+
+/** Words from a verbose_json transcript: its word times, else each segment's words spread over the segment. A lone
+ * segment (Qwen3-ASR answers one for the whole clip) or a long one leaves its words untimed (start null). */
 export function transcriptWords(j) {
   if (Array.isArray(j.words) && j.words.length) return j.words.map((w) => ({ word: String(w.word).trim(), start: w.start, end: w.end }));
   const out = [];
   for (const s of j.segments || []) {
     const ws = String(s.text || "").trim().split(/\s+/).filter(Boolean);
-    ws.forEach((w, i) => out.push({ word: w, start: s.start + ((s.end - s.start) * i) / ws.length, end: s.start + ((s.end - s.start) * (i + 1)) / ws.length }));
+    const step = (s.end - s.start) / ws.length, timed = j.segments.length > 1 && s.end - s.start <= SEGMENT_TIMING_MAX;
+    ws.forEach((w, i) => out.push(timed ? { word: w, start: s.start + step * i, end: s.start + step * (i + 1) } : { word: w, start: null, end: null }));
   }
   return out;
 }
@@ -284,7 +290,7 @@ export function validateTimeline(t, { exists = () => true, songDuration = null, 
     }
     const files = [b.src, ...(b.items || []), b.icon, b.wordmark, typeof b.bg === "string" ? b.bg : b.bg?.src].filter((f) => typeof f === "string");
     for (const f of files) if (!exists(f)) errors.push(`${at}: ${f} is not in public/`);
-    if (b.type === "lyrics" && lines && !lines.length) warnings.push(`${at}: song.json has no timed lines (run film.mjs song, or the server has no transcriptions)`);
+    if (b.type === "lyrics" && lines && !lines.length) warnings.push(`${at}: song.json has no line times (the server gave no word times), so this block shows nothing`);
   });
   return { errors, warnings, duration };
 }
@@ -394,11 +400,14 @@ async function song(dir, opt) {
     const heard = heardAny || !results.length ? await transcribe(t.file, asr) : null;
     if (heard === null && !results.length) console.error("warning: this server has no /v1/audio/transcriptions: no word times; takes are scored by sound only");
     heardAny ||= heard !== null;
+    // without word times the transcript still says which take sang the lyrics, but not when
+    const timed = heard?.length > 0 && heard.every((w) => w.start != null);
+    if (heard?.length && !timed && !results.length) console.error("warning: the transcription has no word times (one segment for the whole song): takes are scored on the lyrics, cut on beats. The server times words once mlx-community/Qwen3-ForcedAligner-0.6B-8bit is on disk beside the ASR");
     const aligned = heard && lines.length ? alignLyrics(lines, heard) : { similarity: null, lines: [] };
     const r = {
       file: `takes/${basename(t.file)}`, seed: t.seed, duration: round2(wav.duration), similarity: aligned.similarity, spread: dynamics(env),
-      scoreBpm: existsSync(abc) ? abcTempo(readFileSync(abc, "utf8")) : null, lines: aligned.lines,
-      words: (heard || []).map((w) => ({ word: w.word, start: round2(w.start), end: round2(w.end) })), env, wav,
+      scoreBpm: existsSync(abc) ? abcTempo(readFileSync(abc, "utf8")) : null, lines: timed ? aligned.lines : [],
+      words: timed ? heard.map((w) => ({ word: w.word, start: round2(w.start), end: round2(w.end) })) : [], env, wav,
     };
     r.score = scoreTake({ ...r, bound: opt.file ? null : bound });
     results.push(r);
@@ -422,7 +431,8 @@ async function song(dir, opt) {
 
 function words(dir, opt) {
   const s = readJson(join(dir, "song.json"));
-  if (!s?.lines?.length && !s?.words?.length) throw new Error("song.json has no sung words: run node film.mjs song first (needs /v1/audio/transcriptions)");
+  if (!s) throw new Error("no song.json: run node film.mjs song first");
+  if (!s.lines?.length && !s.words?.length) throw new Error(`song.json has no line times (the server gave no word times): cut on beats, node film.mjs beats ${dir}`);
   console.log(`${s.file} ${s.duration} s, ${s.bpm ?? "?"} bpm, first vocal ${s.firstVocal} s`);
   if (!s.lines?.length) return console.log(s.words.map((w) => `${w.word}@${w.start}`).join(" "));
   for (const l of s.lines) {

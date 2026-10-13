@@ -933,6 +933,7 @@ class DownloadManager: ObservableObject {
             await self?.download(repoId: repoId)
             self?.finalizeIfCancelled(repoId: repoId)
             await self?.autoFillSocket(for: repoId)
+            await self?.fetchAligner(for: repoId)
             self?.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
@@ -1062,6 +1063,29 @@ class DownloadManager: ObservableObject {
         DrafterSocket.gem(gem).write(into: &o, gemPath: path)
         file.set(o, for: modelDir)
         try? file.save()
+    }
+
+    // MARK: - Qwen3-ASR's forced aligner
+
+    /// The model the server times transcripts with (verbose_json, srt, vtt).
+    nonisolated static let alignerRepo = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
+
+    /// A Qwen3-ASR pack. The aligner's root also says `qwen3_asr`; its thinker names it.
+    nonisolated static func isAsrPack(_ dir: String) -> Bool {
+        guard let data = FileManager.default.contents(atPath: (dir as NSString).appendingPathComponent("config.json")),
+              let cfg = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+              cfg["model_type"] as? String == "qwen3_asr" else { return false }
+        return (cfg["thinker_config"] as? [String: Any])?["model_type"] as? String != "qwen3_forced_aligner"
+    }
+
+    /// A fresh Qwen3-ASR download brings the aligner beside it, into the same
+    /// root the server discovers it in. Failures stay silent: the user asked
+    /// for the ASR, which serves without it.
+    private func fetchAligner(for repoId: String) async {
+        guard !Task.isCancelled, downloads[repoId]?.status == .completed,
+              let dir = existingModelDir(for: repoId), Self.isAsrPack(dir),
+              existingModelDir(for: Self.alignerRepo) == nil else { return }
+        await download(repoId: Self.alignerRepo, alertOnFailure: false)
     }
 
     // MARK: - Turbo LoRA (on demand)

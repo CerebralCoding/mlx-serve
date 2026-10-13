@@ -11,7 +11,7 @@ Tools next to this file (Node 18+):
   needs something no block below does.
 
 Needs the server with a `music` model (YuE2) and an `image` model (Krea); `video` (MiniMax-H3) and `sound`
-(Stable Audio 3) models for clips and effects; a `transcription` model for word timing. ffmpeg
+(Stable Audio 3) models for clips and effects; a `transcription` model to hear the takes. ffmpeg
 (`brew install ffmpeg`) for clips and the final master. About 1 GB of disk for Remotion and its Chrome.
 
 ## The process
@@ -27,12 +27,14 @@ lyrics, the chosen take's line times, the contact sheets): they direct, you prod
    `node film.mjs song film --lyrics lyrics.txt --style "<tags>" --takes 3`.
    It sings the takes, transcribes them, scores each (how well it sang the lyrics, loud choruses over
    quiet verses, an ending of its own), copies the best to `film/public/song.wav` and writes
-   `film/song.json`: every sung line and word with its time, the tempo and the beats. It prints the
+   `film/song.json`: the tempo, the beats and, when the server gives word times (see "Timing comes
+   from the server"), every sung line and word with its time. It prints the
    `song` range to put in the timeline. You cannot listen: tell the user the takes are in
    `film/public/takes/` and switch on their pick with `--file film/public/takes/<take>.wav --lyrics
    lyrics.txt`. A song made in the app's Music tab works the same way.
 3. **Shot list.** `node film.mjs words film` prints each sung line with its time (`--words` adds every
-   word). One shot per line, two per line in a chorus; instrumental stretches cut on beats
+   word), or says there are none, and then every shot cuts on beats. One shot per line, two per line
+   in a chorus; instrumental stretches cut on beats
    (`node film.mjs beats film --from 0 --to 14 --div 2` prints half-beats). Write the list: time range,
    what we see, which file.
 4. **Assets.** One `assets.json` for every picture, clip and effect (below), run from the project:
@@ -178,8 +180,12 @@ out numbers and private data nobody should read.
 `film.mjs song` transcribes with `POST /v1/audio/transcriptions`, OpenAI's multipart shape: `file`
 (WAV), `model` (the first model listing the `transcription` capability, when there is one),
 `response_format=verbose_json`, `timestamp_granularities[]=word` and `=segment`. It reads
-`words: [{word, start, end}]` in seconds, else `segments: [{start, end, text}]`. On a 404 the server has
-no transcription: song.json gets no line times, `lyrics` blocks stay empty, and cuts go on `beats`.
+`words: [{word, start, end}]` in seconds, else `segments: [{start, end, text}]` when there are several,
+each short enough to place a word. mlx-serve times words with its forced aligner (an `alignment`
+model; the app downloads it with the ASR). Without one, or for a language it does not time, the
+transcript is one segment for the whole song: it still picks the take that sang the lyrics, but
+song.json gets no line times; on a 404 the takes are scored by sound alone. Either way the `lyrics`
+blocks stay empty and cuts go on `beats`.
 
 ## Gotchas
 

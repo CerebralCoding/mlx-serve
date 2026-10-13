@@ -6,11 +6,15 @@
 # --no-vision boot that refuses by name. Transcripts are checked by WORD RECALL
 # against the script `say` spoke: an audio tower whose rows never reach the
 # trunk answers "" (the model hears silence), which no other check can see.
+# With Qwen3-ForcedAligner on disk, section 6 rescans it in and checks word and
+# segment times, srt/vtt, other scripts, a clip cut past 180 s, and that the
+# aligner serves nothing itself (skipped without the aligner pack).
 #
 # Skips without the pack or without macOS `say`. Download with:
 #   hf download mlx-community/Qwen3-ASR-0.6B-8bit --local-dir ~/.mlx-serve/models/mlx-community/Qwen3-ASR-0.6B-8bit
+#   hf download mlx-community/Qwen3-ForcedAligner-0.6B-8bit --local-dir ~/.mlx-serve/models/mlx-community/Qwen3-ForcedAligner-0.6B-8bit
 #
-# Usage: ASR_MODEL=<dir> BINARY=<mlx-serve> ./tests/test_transcriptions.sh [port]
+# Usage: ASR_MODEL=<dir> ALIGNER_MODEL=<dir> BINARY=<mlx-serve> ./tests/test_transcriptions.sh [port]
 set -uo pipefail
 PORT="${1:-11443}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -122,13 +126,120 @@ b400() { # label needle curl-args...
 printf 'ID3\x04\x00 not a wav' >"$TMP/fake.mp3"
 b400 "no file" "file" -F model="$ID"
 b400 "not a WAV" "WAV" -F file=@"$TMP/fake.mp3" -F model="$ID"
-b400 "srt" "srt" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=srt
+b400 "srt without an aligner" "ForcedAligner" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=srt
 b400 "stream" "stream" -F file=@"$TMP/short.wav" -F model="$ID" -F stream=true
 b400 "unknown language" "language" -F file=@"$TMP/short.wav" -F model="$ID" -F language=xx
 b400 "JSON body" "multipart" -H 'Content-Type: application/json' -d "{\"model\":\"$ID\"}"
 grep -q "\[mlx\]" "$LOG" && { echo "FAIL: MLX error in the log"; grep "\[mlx\]" "$LOG" | head -3; exit 1; }
 
-# 6. Without its tower the model cannot transcribe, and says why.
+# 6. Word times from the forced aligner, rescanned in beside the ASR.
+ALIGNER="${ALIGNER_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3-ForcedAligner-0.6B-8bit}"
+if [ ! -f "$ALIGNER/config.json" ]; then
+  echo "SKIP: word times (no Qwen3-ForcedAligner pack at $ALIGNER; set ALIGNER_MODEL)"
+else
+  AID="mlx-community/$(basename "$ALIGNER")"
+  ln -s "$ALIGNER" "$TMP/models/mlx-community/$(basename "$ALIGNER")"
+  curl -s -X POST "$(url /v1/models/rescan)" >/dev/null
+  state() { curl -s "$(url /v1/models)" | python3 -c "
+import sys,json
+m=[x for x in json.load(sys.stdin)['data'] if x['id']=='$AID']
+assert m, 'aligner not discovered'
+c=m[0].get('capabilities',[])
+assert c==['alignment'], c
+print(m[0]['state'])"; }
+  s=$(state) || { echo "FAIL: the aligner stub must advertise only alignment"; exit 1; }
+  curl -s "$(url $T)" -F file=@"$TMP/short.wav" -F model="$ID" >/dev/null
+  [ "$(state)" = "unloaded" ] || { echo "FAIL: a json transcription loaded the aligner"; exit 1; }
+  echo "PASS: the aligner stub advertises alignment and json leaves it unloaded"
+
+  V=$(curl -s "$(url $T)" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=verbose_json -F 'timestamp_granularities[]=word')
+  echo "$V" | python3 -c "
+import sys,json
+v=json.load(sys.stdin); s=v['segments']; w=v['words']; d=v['duration']
+assert len(s)>=2 and s[0]['text'].endswith('.'), s
+assert all(0<=x['start']<=x['end']<=d for x in s+w), 'a time outside the clip'
+assert all(a['end']<=b['start'] for a,b in zip(s,s[1:])), 'segments overlap'
+assert all(a['start']<=b['start'] for a,b in zip(w,w[1:])), 'words go back in time'
+assert w[0]['word']=='The' and w[-1]['word'] in ('Zig','zig'), w
+assert len(w)==len(v['text'].split()), (len(w), v['text'])
+" || { echo "FAIL: verbose_json word times: $V"; exit 1; }
+  echo "PASS: verbose_json times every word and splits segments at sentences"
+  curl -s "$(url $T)" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=verbose_json -F 'timestamp_granularities[]=segment' | grep -q '"words"' && { echo "FAIL: words without asking"; exit 1; }
+  [ "$(state)" = "ready" ] || { echo "FAIL: the aligner is not resident after timing"; exit 1; }
+  echo "PASS: segment granularity carries no words; the aligner loaded on demand"
+
+  SRT=$(curl -s "$(url $T)" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=srt)
+  VTT=$(curl -s "$(url $T)" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=vtt)
+  python3 - "$V" "$SRT" "$VTT" <<'EOF' || { echo "FAIL: subtitles disagree with the segments:"; echo "$SRT"; echo "$VTT"; exit 1; }
+import json, re, sys
+segs = json.loads(sys.argv[1])["segments"]
+srt, vtt = sys.argv[2], sys.argv[3]
+def cues(text, sep):
+    t = re.findall(r"(\d\d):(\d\d):(\d\d)" + sep + r"(\d{3}) --> (\d\d):(\d\d):(\d\d)" + sep + r"(\d{3})\n(.+)", text)
+    return [(int(a) * 3600 + int(b) * 60 + int(c) + int(d) / 1000, int(e) * 3600 + int(f) * 60 + int(g) + int(h) / 1000, x) for a, b, c, d, e, f, g, h, x in t]
+assert vtt.startswith("WEBVTT\n\n") and srt.startswith("1\n")
+for got in (cues(srt, ","), cues(vtt, r"\.")):
+    assert len(got) == len(segs), got
+    for (s, e, x), seg in zip(got, segs):
+        assert abs(s - seg["start"]) < 0.002 and abs(e - seg["end"]) < 0.002 and x == seg["text"], (s, e, x, seg)
+EOF
+  echo "PASS: srt and vtt cues are the verbose_json segments"
+
+  voice() { say -v '?' | sed -n "s/^\(.*[^ ]\)  *$1 .*/\1/p" | head -1; }
+  ZH=$(voice zh_CN); KO=$(voice ko_KR); AR=$(voice ar_001)
+  words() { curl -s "$(url $T)" -F file=@"$1" -F model="$ID" -F response_format=verbose_json -F 'timestamp_granularities[]=word'; }
+  if [ -n "$ZH" ]; then
+    say -v "$ZH" -o "$TMP/zh.wav" --data-format=LEI16@16000 "今天天气很好，我们一起去公园散步吧。"
+    words "$TMP/zh.wav" | python3 -c "
+import sys,json
+v=json.load(sys.stdin); w=[x['word'] for x in v['words']]
+han=[c for c in v['text'] if '一'<=c<='鿿']
+assert v['language']=='chinese' and w==han, (w, v['text'])" || { echo "FAIL: Chinese is timed one character at a time"; exit 1; }
+    echo "PASS: Chinese words are its characters"
+  fi
+  if [ -n "$KO" ]; then
+    say -v "$KO" -o "$TMP/ko.wav" --data-format=LEI16@16000 "오늘은 날씨가 정말 좋네요. 친구와 함께 공원을 산책했습니다."
+    words "$TMP/ko.wav" | python3 -c "
+import sys,json,re
+v=json.load(sys.stdin); w=[x['word'] for x in v['words']]
+assert v['language']=='korean' and w==[re.sub(r'[.,!?]','',t) for t in v['text'].split()], (w, v['text'])" || { echo "FAIL: Korean is timed by spaced word"; exit 1; }
+    echo "PASS: Korean words are its spaced words"
+  fi
+  if [ -n "$AR" ]; then
+    say -v "$AR" -o "$TMP/ar.wav" --data-format=LEI16@16000 "مرحبا، الطقس جميل اليوم."
+    words "$TMP/ar.wav" | python3 -c "
+import sys,json
+v=json.load(sys.stdin)
+assert v['language']=='arabic' and len(v['segments'])==1 and v['words']==[], v
+assert v['segments'][0]['start']==0 and v['segments'][0]['end']==v['duration']" || { echo "FAIL: a language the aligner lacks is one segment"; exit 1; }
+    echo "PASS: Arabic (no aligner support) is one segment with no words"
+  fi
+
+  # Past 180 s the clip is cut where it is quietest, each piece transcribed and timed.
+  LONG10=""; for i in 1 2 3 4 5 6 7 8 9 10; do LONG10="$LONG10 $LONG"; done
+  say -o "$TMP/long10.wav" --data-format=LEI16@16000 "$LONG10"
+  before=$(grep -c "  aligned " "$LOG")
+  curl -s "$(url $T)" -F file=@"$TMP/long10.wav" -F model="$ID" -F response_format=verbose_json -F 'timestamp_granularities[]=word' | python3 -c "
+import sys,json
+v=json.load(sys.stdin); w=v['words']; d=v['duration']
+assert d>180, d
+assert all(a['start']<=b['start'] for a,b in zip(w,w[1:])), 'words go back in time across the cut'
+assert w[-1]['end']>d-10 and all(x['end']<=d for x in w), (w[-1], d)" || { echo "FAIL: a clip past 180 s"; exit 1; }
+  [ $(( $(grep -c "  aligned " "$LOG") - before )) -eq 2 ] || { echo "FAIL: a 210 s clip is not two pieces"; exit 1; }
+  echo "PASS: a 210 s clip is two pieces, timed end to end"
+
+  code=$(curl -s -o "$TMP/err.txt" -w "%{http_code}" "$(url /v1/chat/completions)" -H 'Content-Type: application/json' -d "{\"model\":\"$AID\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+  [ "$code" = "400" ] && grep -q "Qwen3-ASR" "$TMP/err.txt" || { echo "FAIL: chat on the aligner returned $code"; cat "$TMP/err.txt"; exit 1; }
+  echo "PASS: chat on the aligner -> 400"
+  b400 "transcribing with the aligner" "Qwen3-ASR" -F file=@"$TMP/short.wav" -F model="$AID"
+  code=$(curl -s -o /dev/null -w "%{http_code}" "$(url /v1/chat/completions)" -H 'Content-Type: application/json' -d '{"messages":[{"role":"user","content":"hi"}],"max_tokens":4}')
+  [ "$code" = "503" ] || { echo "FAIL: a model-less chat answered $code: an audio model became the default"; exit 1; }
+  echo "PASS: neither audio model became the default chat model"
+  grep -q "\[mlx\]" "$LOG" && { echo "FAIL: MLX error in the log"; grep "\[mlx\]" "$LOG" | head -3; exit 1; }
+  rm "$TMP/models/mlx-community/$(basename "$ALIGNER")"
+fi
+
+# 7. Without its tower the model cannot transcribe, and says why.
 kill $SRV; wait $SRV 2>/dev/null
 boot --no-vision
 b400 "--no-vision" "Qwen3-ASR" -F file=@"$TMP/short.wav" -F model="$ID"

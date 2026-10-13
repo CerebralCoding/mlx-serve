@@ -37,6 +37,7 @@ Each row has `id` (like `org/name`), `capabilities`, `state` (`ready`,
 | `audio` without `music` or `sound` | `POST /v1/audio/speech` (TTS) | media.md |
 | `music` | `POST /v1/audio/music-generations` | media.md |
 | `sound` | `POST /v1/audio/sound-generations` (sound effects) | media.md |
+| `transcription` | `POST /v1/audio/transcriptions` (speech to text, word times, subtitles) | media.md |
 | `video` | `POST /v1/video/generations` | media.md |
 | `3d` | `POST /v1/3d/generations` | media.md |
 | `decisions` | `POST /v1/decisions`, `POST /v1/systemone` | decisions.md |

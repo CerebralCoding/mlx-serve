@@ -43,13 +43,14 @@ const supported_model_types = [_][]const u8{
     "qwen3_moe_text",   "qwen3_next",
     "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "llama",     "mistral",
-    "lfm2", // also matches any "lfm2*" prefix (lfm2_vl etc. when added)
+    "lfm2", "lfm2_vl", "lfm2_moe", // any other "lfm2*" passes by prefix, as model.zig parses it
     "nemotron_h",
     "bert",
     "deepseek_v4",
     "deepseek_v41", // DeepSeek-V4.1-Flash (src/deepseek_v41.zig; the EXL3 repack on mlx-stream)
     "hy_v3", // Tencent Hunyuan 3 (295B-A21B MoE)
     "laguna", // poolside Laguna S 2.1 (117.6B-A8.5B MoE coder)
+    "kolibri1", // Aleph Alpha Kolibri-1 (78B-A3.5B MoE)
     "inkling_mm_model", // Thinking Machines Inkling Small (276B-A12B MoE)
     "muse_glimmer", // meta-models Muse-Glimmer-30B (dense VL; text served, vision pending)
     "muse_glimmer_text",
@@ -64,6 +65,7 @@ const supported_model_types = [_][]const u8{
     "embedding_gemma2", // Google EmbeddingGemma 2 (bidirectional Gemma 4 trunk, text/image/video embeddings)
     "minicpmv4_7", // openbmb MiniCPM-V 4.7 (Qwen3.5 trunk + SigLIP2 tower)
     "qwen3_asr", // Qwen3-ASR speech recognition (qwen3 trunk + audio tower)
+    "qwen3_forced_aligner", // Qwen3-ForcedAligner word times (the ASR shape, a timestamp head)
 };
 
 /// Native media-generation archs (image / audio / video / 3D), served by the
@@ -230,7 +232,16 @@ fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_n
             }
         }
     }
-    return .{ .supported = allocator.dupe(u8, mt_val.string) catch return .missing_or_unparseable };
+    const mt = if (isForcedAligner(root)) "qwen3_forced_aligner" else mt_val.string;
+    return .{ .supported = allocator.dupe(u8, mt) catch return .missing_or_unparseable };
+}
+
+/// A Qwen3-ForcedAligner pack: its root says `qwen3_asr`, only the thinker tells.
+pub fn isForcedAligner(root: std.json.ObjectMap) bool {
+    const t = root.get("thinker_config") orelse return false;
+    if (t != .object) return false;
+    const mt = t.object.get("model_type") orelse return false;
+    return mt == .string and std.mem.eql(u8, mt.string, "qwen3_forced_aligner");
 }
 
 /// True when `sub` holds a Kev typed-decision pack (tests/convert_kev_weights.py). The marker alone decides,
@@ -1244,6 +1255,8 @@ pub const StubMeta = struct {
     has_chat: bool = false,
     /// Speech to text on `/v1/audio/transcriptions` (Qwen3-ASR).
     has_transcription: bool = false,
+    /// Qwen3-ForcedAligner: times the words of a transcript, serves no route of its own.
+    is_aligner: bool = false,
     /// The chat template can open a reasoning block (`templateSupportsThinking`).
     has_thinking: bool = false,
     /// bert, or a bidirectional embedding model (EmbeddingGemma) — the stub
@@ -1319,7 +1332,8 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
     meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0;
-    meta.has_transcription = std.mem.eql(u8, mt, "qwen3_asr");
+    meta.is_aligner = isForcedAligner(root);
+    meta.has_transcription = std.mem.eql(u8, mt, "qwen3_asr") and !meta.is_aligner;
     const bidirectional = blk: {
         const cfgBool = struct {
             fn get(r: std.json.ObjectMap, tc: ?std.json.ObjectMap, key: []const u8) bool {
@@ -2158,6 +2172,8 @@ test "isSupportedModelType accepts qwen3_moe (Qwen3-30B-A3B)" {
     try testing.expect(isSupportedModelType("qwen3"));
     try testing.expect(isSupportedModelType("minicpmv4_7"));
     try testing.expect(isSupportedModelType("qwen3_asr"));
+    try testing.expect(isSupportedModelType("kolibri1"));
+    try testing.expect(isSupportedModelType("lfm2_moe"));
     // A genuinely unknown arch is still rejected.
     try testing.expect(!isSupportedModelType("totally_made_up_arch"));
 }
@@ -2218,6 +2234,28 @@ test "parseStubMeta: Qwen3-ASR transcribes, with no vision and no chat" {
     try testing.expect(!m.has_vision and !m.has_chat);
     try testing.expectEqual(@as(u32, 28), m.num_hidden_layers);
     try testing.expectEqual(@as(u32, 65536), m.max_position_embeddings);
+}
+
+const aligner_config_json =
+    \\{"model_type":"qwen3_asr","timestamp_token_id":151705,"timestamp_segment_time":80,
+    \\"thinker_config":{"model_type":"qwen3_forced_aligner","classify_num":5000,"audio_config":{"d_model":1024},
+    \\"text_config":{"hidden_size":1024,"num_hidden_layers":28,"max_position_embeddings":8192}}}
+;
+
+test "a Qwen3-ForcedAligner pack is discovered as the aligner, never as an ASR" {
+    const io = testing.io;
+    const a = testing.allocator;
+    const m = parseStubMeta(a, aligner_config_json, false);
+    try testing.expect(m.found and m.is_aligner and !m.has_transcription and !m.has_chat);
+
+    var tmp = testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "aligner");
+    try tmp.dir.writeFile(io, .{ .sub_path = "aligner/config.json", .data = aligner_config_json });
+    const peek = peekConfig(io, a, tmp.dir, "aligner");
+    defer if (peek == .supported) a.free(peek.supported);
+    try testing.expect(peek == .supported);
+    try testing.expectEqualStrings("qwen3_forced_aligner", peek.supported);
 }
 
 test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {

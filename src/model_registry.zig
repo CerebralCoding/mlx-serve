@@ -1276,10 +1276,10 @@ pub const ModelRegistry = struct {
 
     /// Can this READY entry serve chat/completions? Media models (image/
     /// audio/video/mesh — identified by model_type, so no engine pointers
-    /// are needed) and embedding encoders cannot.
+    /// are needed), embedding encoders and audio-tower trunks cannot.
     fn chatCapable(entry: *const LoadedModel) bool {
         const cfg = entry.config orelse return false;
-        if (cfg.is_encoder_only) return false;
+        if (cfg.is_encoder_only or cfg.qwen_audio != null) return false;
         if (model_discovery.isMediaModelType(cfg.model_type)) return false;
         return true;
     }
@@ -2211,6 +2211,17 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     reg.mutex.unlock(reg.io);
     try testing.expectEqualStrings("", reg.default_id);
 
+    // Nor a qwen3 trunk behind an audio tower (Qwen3-ASR, its forced aligner).
+    const asr = try reg.registerStub("asr", "/m/asr", 64);
+    var asr_cfg = model_mod.ModelConfig{};
+    asr_cfg.model_type = "qwen3";
+    asr_cfg.qwen_audio = .{};
+    asr.config = &asr_cfg;
+    reg.mutex.lockUncancelable(reg.io);
+    reg.markReadyLocked(asr, 64);
+    reg.mutex.unlock(reg.io);
+    try testing.expectEqualStrings("", reg.default_id);
+
     // The first chat-capable load IS promoted...
     const chat = try reg.registerStub("gemma", "/m/gemma", 64);
     var chat_cfg = model_mod.ModelConfig{};
@@ -2247,6 +2258,7 @@ test "ModelRegistry: first chat-capable ready load becomes the default on a head
     // registry deinit tries to free entry-owned configs.
     mesh.config = null;
     bge.config = null;
+    asr.config = null;
     chat.config = null;
     chat2.config = null;
 }

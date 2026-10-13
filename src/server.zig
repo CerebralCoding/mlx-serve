@@ -37,6 +37,7 @@ const mlx_gguf = @import("arch/mlx_gguf.zig");
 const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
 const transcription_mod = @import("transcription.zig");
+const forced_align_mod = @import("forced_align.zig");
 const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("status.zig");
@@ -2724,57 +2725,16 @@ fn handleConnection(
             return;
         }
     }
-    const lm = scheduler.ensureLoaded(requested_model_id) catch |err| switch (err) {
-        error.UnknownModelId => {
-            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
+    const lm = scheduler.ensureLoaded(requested_model_id) catch |err| {
+        // Headless gen-only boot (media models resident, no default chat
+        // model): /props keeps answering with the live memory counters —
+        // the app's tray polls it, and a 503 here read as "0 MB".
+        if (err == error.NoDefaultModel and std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+            try handlePropsNoModel(allocator, stream);
             return;
-        },
-        error.NotLoaded => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", "Requested model is not currently loaded", 503);
-            return;
-        },
-        error.NoDefaultModel => {
-            // Headless gen-only boot (media models resident, no default chat
-            // model): /props keeps answering with the live memory counters —
-            // the app's tray polls it, and a 503 here read as "0 MB".
-            if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
-                try handlePropsNoModel(allocator, stream);
-                return;
-            }
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
-            return;
-        },
-        error.NotEnoughMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503);
-            return;
-        },
-        error.InsufficientMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503);
-            return;
-        },
-        error.LoadFailed => {
-            try sendLoadFailedResponse(allocator, stream, scheduler, requested_model_id);
-            return;
-        },
-        error.Shutdown => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
-            return;
-        },
-        // Other errors (CPU-side preload failures like FileNotFound on a
-        // missing tokenizer.json, JSON parse errors on a malformed
-        // config.json, etc.) bubble out of `preloadCpuState`. Surface a
-        // 500 with the error name so the client gets a clean failure
-        // instead of a hung connection.
-        else => {
-            log.warn("  -> 500 ({s}) while resolving model\n", .{@errorName(err)});
-            const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
-                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
-                return;
-            };
-            defer allocator.free(msg);
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
-            return;
-        },
+        }
+        try sendEnsureLoadedError(allocator, stream, scheduler, requested_model_id, err);
+        return;
     };
     // A status read must not look like use — see `isStatusRoute`.
     const status_read = isStatusRoute(method, path);
@@ -6806,6 +6766,8 @@ const ReadyCaps = struct {
     has_audio: bool = false,
     /// `/v1/audio/transcriptions` (an audio tower on a text trunk: Qwen3-ASR).
     has_transcription: bool = false,
+    /// Qwen3-ForcedAligner, which times those transcripts.
+    has_alignment: bool = false,
     has_reasoning: bool = false,
     /// Encoder-only (BERT/EmbeddingGemma) OR a decoder with a pooling contract
     /// (Qwen3-Embedding) — `config.hasEmbeddingCapability()`. Issue #116.
@@ -6855,6 +6817,7 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_vision) try append_cap(allocator, &caps, &n_caps, "vision");
     if (c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
     if (c.has_transcription) try append_cap(allocator, &caps, &n_caps, "transcription");
+    if (c.has_alignment) try append_cap(allocator, &caps, &n_caps, "alignment");
     if (c.has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
     if (c.has_chat) try append_cap(allocator, &caps, &n_caps, "json_schema");
     if (c.has_embedding) try append_cap(allocator, &caps, &n_caps, "embeddings");
@@ -7005,6 +6968,7 @@ test "dropMedia tells the model an attachment it cannot see was there" {
 
 fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
     if (t.is_encoder_only) return "Encoder-only models do not support text generation. Use /v1/embeddings instead.";
+    if (std.mem.eql(u8, t.arch_hint, "qwen3_forced_aligner")) return "This is a forced aligner: it times the words of a transcript and serves no request itself. Target a Qwen3-ASR model on /v1/audio/transcriptions; verbose_json, srt and vtt use the aligner.";
     const modality: ?media_mod.Modality = blk: {
         if (t.has_image_engine) break :blk .image;
         if (t.has_video_engine) break :blk .video;
@@ -7102,7 +7066,8 @@ fn renderModelEntry(
             .has_chat = has_chat,
             .has_vision = has_vision,
             .has_audio = has_audio,
-            .has_transcription = if (entry.vision_encoder) |ve| ve.qwen_audio != null else false,
+            .has_transcription = config.forced_aligner == null and if (entry.vision_encoder) |ve| ve.qwen_audio != null else false,
+            .has_alignment = config.forced_aligner != null,
             .has_reasoning = has_chat and model_discovery.templateSupportsThinking(chat_config.chat_template),
             .has_embedding = config.hasEmbeddingCapability(),
             .has_image_engine = entry.image_engine != null,
@@ -7264,6 +7229,7 @@ fn renderModelEntry(
         if (is_encoder_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"embeddings\"]");
         if (is_gguf_stub) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"chat\",\"tool_use\",\"streaming\",\"json_schema\"]");
         if (sm.found and sm.has_transcription) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"transcription\"]");
+        if (sm.found and sm.is_aligner) break :blk try allocator.dupe(u8, ",\"capabilities\":[\"alignment\"]");
         if (!sm.found or !(sm.has_chat or sm.has_vision or stub_has_embedding)) break :blk try allocator.dupe(u8, "");
         var b = std.ArrayList(u8).empty;
         errdefer b.deinit(allocator);
@@ -7616,41 +7582,9 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         .id => |id| requested_id = id,
         else => {},
     };
-    const lm = scheduler.ensureLoaded(requested_id) catch |err| switch (err) {
-        error.UnknownModelId => {
-            try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404);
-            return;
-        },
-        error.NotLoaded => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", "Requested model is not currently loaded", 503);
-            return;
-        },
-        error.NoDefaultModel => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503);
-            return;
-        },
-        error.NotEnoughMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503);
-            return;
-        },
-        error.InsufficientMemory => {
-            try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503);
-            return;
-        },
-        error.LoadFailed => {
-            try sendLoadFailedResponse(allocator, stream, scheduler, requested_id);
-            return;
-        },
-        else => {
-            log.warn("  -> 500 ({s}) on /v1/load-model\n", .{@errorName(err)});
-            const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
-                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
-                return;
-            };
-            defer allocator.free(msg);
-            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
-            return;
-        },
+    const lm = scheduler.ensureLoaded(requested_id) catch |err| {
+        try sendEnsureLoadedError(allocator, stream, scheduler, requested_id, err);
+        return;
     };
     defer scheduler.release(lm);
     // Promotion happens only past ensureLoaded's error switch: a load that
@@ -7739,19 +7673,20 @@ fn genJobRunMany(ctxs: []const *anyopaque) void {
     media_mod.handleDecisions(e, first.lm.id, buf[0..ctxs.len]);
 }
 
-/// Dispatch a media-generation request to the inference thread. `lm` is the
-/// already-resolved + refcounted model (so it can't be evicted mid-gen). The
-/// generation runs on the scheduler's inference thread (the sole mlx caller);
-/// the body writes its own response. A wrong-modality target gets a clear 400.
 /// Longest clip one request transcribes: mlx-audio's chunk length, past which
 /// the reference splits the audio.
 const TRANSCRIPTION_MAX_SECONDS = 1200;
 /// The reference's `max_tokens` for one chunk.
 const TRANSCRIPTION_MAX_TOKENS = 8192;
+/// The aligner the app downloads beside a Qwen3-ASR model.
+const ALIGNER_REPO = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit";
 
 /// `POST /v1/audio/transcriptions`: OpenAI's form over Qwen3-ASR. The reference
 /// prompt's one audio placeholder expands to the tower's rows like any chat
-/// media, then the trunk decodes the transcript.
+/// media, then the trunk decodes the transcript. verbose_json, srt and vtt time
+/// it with Qwen3-ForcedAligner when one is on disk, cutting the clip into pieces
+/// the aligner can time as the official toolkit does; a piece in a language the
+/// aligner lacks is one segment.
 fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, content_type: []const u8, lm: *LoadedModel) !void {
     const hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null else false;
     if (!hears) {
@@ -7779,6 +7714,68 @@ fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []con
     }
     log.info("POST /v1/audio/transcriptions ({d:.1} s, language={s}, format={s}, prompt={d}b)\n", .{ seconds, form.language orelse "auto", @tagName(form.format), if (form.prompt) |p| p.len else 0 });
 
+    var aligner: ?Aligner = if (transcription_mod.timed(form.format)) try findAligner(allocator) else null;
+    if (aligner == null and (form.format == .srt or form.format == .vtt)) {
+        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "srt and vtt need word times from Qwen3-ForcedAligner: download " ++ ALIGNER_REPO ++ " beside the ASR model", 400);
+        return;
+    }
+    const ends = if (aligner != null)
+        try transcription_mod.splitPoints(allocator, pcm, transcription_mod.ALIGN_MAX_SECONDS * transcription_mod.SAMPLE_RATE)
+    else
+        try allocator.dupe(usize, &.{pcm.len});
+    defer allocator.free(ends);
+
+    var tl = transcription_mod.Timeline{};
+    defer tl.deinit(allocator);
+    defer if (aligner) |al| if (al.lm) |m| global_scheduler.?.release(m);
+    var start: usize = 0;
+    for (ends) |end| {
+        const heard = (try transcribeClip(allocator, stream, lm, form, pcm[start..end])) orelse return;
+        defer allocator.free(heard.raw);
+        const t = heard.t;
+        var timed: ?Aligned = null;
+        defer if (timed) |*x| x.deinit(allocator);
+        if (aligner) |*al| {
+            if (t.text.len > 0 and al.languages & transcription_mod.languageBit(t.language orelse "") != 0) {
+                if (al.lm == null) al.lm = global_scheduler.?.ensureLoaded(al.id) catch |err| {
+                    try sendEnsureLoadedError(allocator, stream, global_scheduler.?, al.id, err);
+                    return;
+                };
+                timed = (try alignPiece(allocator, stream, al.lm.?, pcm[start..end], t.text, t.language.?)) orelse return;
+            }
+        }
+        const rate: f64 = transcription_mod.SAMPLE_RATE;
+        try tl.add(allocator, t.text, t.language, @as(f64, @floatFromInt(start)) / rate, @as(f64, @floatFromInt(end - start)) / rate, if (timed) |x| x.words else null, if (timed) |x| x.segments else null);
+        start = end;
+    }
+
+    switch (form.format) {
+        .text => try sendResponse(stream, "200 OK", "text/plain; charset=utf-8", tl.text.items),
+        .json => {
+            const text = jsonEscapeOrEmpty(allocator, tl.text.items);
+            defer if (text.owned) allocator.free(text.slice);
+            const response = try std.fmt.allocPrint(allocator, "{{\"text\":{s}}}", .{text.slice});
+            defer allocator.free(response);
+            try sendResponse(stream, "200 OK", "application/json", response);
+        },
+        .verbose_json => {
+            const response = try tl.verboseJson(allocator, seconds, form.words);
+            defer allocator.free(response);
+            try sendResponse(stream, "200 OK", "application/json", response);
+        },
+        .srt, .vtt => {
+            const response = try tl.subtitles(allocator, form.format);
+            defer allocator.free(response);
+            try sendResponse(stream, "200 OK", "text/plain; charset=utf-8", response);
+        },
+    }
+}
+
+/// The transcript of one clip and the bytes it points into.
+const Heard = struct { raw: []u8, t: transcription_mod.Transcript };
+
+/// One pass of the ASR over `pcm`; null when it already sent the error.
+fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, form: transcription_mod.Form, pcm: []const f32) !?Heard {
     const config = lm.config.?;
     const tok = lm.tokenizer.?;
     const prompt_text = try transcription_mod.buildPrompt(allocator, form.prompt, form.language);
@@ -7790,7 +7787,7 @@ fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []con
         const f = multimodalFailure(err);
         log.warn("POST /v1/audio/transcriptions -> {d} ({s})\n", .{ f.code, @errorName(err) });
         try sendErrorResponse(allocator, stream, f.status, f.kind, f.message, f.code);
-        return;
+        return null;
     };
     defer mm.deinit(allocator);
     defer allocator.free(prompt_ids);
@@ -7800,10 +7797,10 @@ fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []con
         countRejected();
         var ovf_buf: [160]u8 = undefined;
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", contextOverflowMessage(&ovf_buf, prompt_ids.len, effective_ctx), 400);
-        return;
+        return null;
     }
     const max_tokens = clampMaxTokens(TRANSCRIPTION_MAX_TOKENS, prompt_ids.len, effective_ctx);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, max_tokens, config, false, null, lm, generate_mod.visionPrefillUnchunked(true), false, mm.bytes(config))) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, max_tokens, config, false, null, lm, generate_mod.visionPrefillUnchunked(true), false, mm.bytes(config))) return null;
 
     // Ownership of the soft tokens moves to the slot. The reference decodes plainly: no thinking, no drafts.
     const slot_ve = mm.embeddings;
@@ -7814,34 +7811,132 @@ fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []con
     const result = nonStreamingViaScheduler(allocator, global_scheduler.?, lm, tok, prompt_ids, prompt_ids, max_tokens, .{ .temperature = form.temperature }, config.eosTokenSlice(), 0, false, enable_thinking, spec, spec, spec, spec, getTimeoutNs(), slot_ve, mm.media, 0, .{}, 0, false, null, null, stream) catch |err| {
         log.err("  -> {s}\n", .{@errorName(err)});
         sendGenerationError(allocator, stream, err, .openai) catch {};
-        return;
+        return null;
     };
     defer allocator.free(result.text);
     defer allocator.free(result.token_ids);
     const raw = try decodeTokens(allocator, lm, tok, result.token_ids, false);
-    defer allocator.free(raw);
     const t = transcription_mod.splitOutput(raw, form.language);
     log.info("  <- {d}+{d} tokens ({d}ms) [{s}] language={s}\n", .{ result.prompt_tokens, result.completion_tokens, timer.read() / std.time.ns_per_ms, result.finish_reason, t.language orelse "?" });
-
-    if (form.format == .text) return sendResponse(stream, "200 OK", "text/plain; charset=utf-8", t.text);
-    const text = jsonEscapeOrEmpty(allocator, t.text);
-    defer if (text.owned) allocator.free(text.slice);
-    const response = if (form.format == .json)
-        try std.fmt.allocPrint(allocator, "{{\"text\":{s}}}", .{text.slice})
-    else blk: {
-        // OpenAI names the language in lower case ("english"); one segment spans the clip.
-        var lang_buf: [32]u8 = undefined;
-        const name = t.language orelse "";
-        const lang = std.ascii.lowerString(&lang_buf, name[0..@min(name.len, lang_buf.len)]);
-        const lang_json = jsonEscapeOrEmpty(allocator, lang);
-        defer if (lang_json.owned) allocator.free(lang_json.slice);
-        break :blk try std.fmt.allocPrint(allocator,
-            \\{{"task":"transcribe","language":{s},"duration":{d:.3},"text":{s},"segments":[{{"id":0,"seek":0,"start":0.0,"end":{d:.3},"text":{s}}}]}}
-        , .{ lang_json.slice, seconds, text.slice, seconds, text.slice });
-    };
-    defer allocator.free(response);
-    try sendResponse(stream, "200 OK", "application/json", response);
+    return .{ .raw = raw, .t = t };
 }
+
+/// The forced aligner a timed transcription uses: its registry id, the
+/// languages its config lists, and the model once loaded (refcounted).
+const Aligner = struct { id: []const u8, languages: u32, lm: ?*LoadedModel = null };
+
+/// A Qwen3-ForcedAligner the server knows of, the resident one first; null when none is on disk.
+fn findAligner(allocator: std.mem.Allocator) !?Aligner {
+    const registry = global_registry orelse return null;
+    var pick: ?*LoadedModel = null;
+    {
+        registry.mutex.lockUncancelable(registry.io);
+        defer registry.mutex.unlock(registry.io);
+        var it = registry.entries.valueIterator();
+        while (it.next()) |e| {
+            if (!std.mem.eql(u8, e.*.arch_hint, "qwen3_forced_aligner")) continue;
+            const p = pick orelse {
+                pick = e.*;
+                continue;
+            };
+            const ready = e.*.state == .ready;
+            if (ready != (p.state == .ready)) {
+                if (ready) pick = e.*;
+            } else if (std.mem.lessThan(u8, e.*.id, p.id)) pick = e.*;
+        }
+    }
+    const entry = pick orelse return null;
+    var config = model_mod.parseConfig(registry.io, allocator, entry.path) catch return null;
+    defer config.deinit(allocator);
+    const fa = config.forced_aligner orelse return null;
+    return .{ .id = entry.id, .languages = fa.languages };
+}
+
+/// A piece's words and segments, spans of its transcript.
+const Aligned = struct {
+    words: []const forced_align_mod.Timed,
+    segments: []const forced_align_mod.Segment,
+    fn deinit(self: *Aligned, allocator: std.mem.Allocator) void {
+        allocator.free(self.words);
+        allocator.free(self.segments);
+    }
+};
+
+/// Time the words of `text` (the transcript of `pcm`) with the aligner `lm`.
+/// Null when it already sent the error.
+fn alignPiece(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm: []const f32, text: []const u8, language: []const u8) !?Aligned {
+    const config = lm.config.?;
+    const fa = config.forced_aligner.?;
+    const script = forced_align_mod.scriptFor(language);
+    const units = try forced_align_mod.units(allocator, text, script);
+    defer forced_align_mod.freeUnits(allocator, units);
+    if (units.len == 0) return .{ .words = &.{}, .segments = &.{} };
+    const prompt_text = try forced_align_mod.promptText(allocator, units);
+    defer allocator.free(prompt_text);
+    var ids = try encodeText(allocator, lm, lm.tokenizer.?, prompt_text, false);
+    const audio = chat_mod.AudioData{ .samples = std.mem.sliceAsBytes(pcm) };
+    var mm = prepareMultimodalItems(allocator, lm, config, &[_]MediaItem{.{ .audio = &audio }}, &ids) catch |err| {
+        allocator.free(ids);
+        const f = multimodalFailure(err);
+        log.warn("  aligner -> {d} ({s})\n", .{ f.code, @errorName(err) });
+        try sendErrorResponse(allocator, stream, f.status, f.kind, f.message, f.code);
+        return null;
+    };
+    defer mm.deinit(allocator);
+    defer allocator.free(ids);
+
+    // The job frees the audio rows on the inference thread.
+    var job = AlignJob{ .allocator = allocator, .lm = lm, .ids = ids, .rows = mm.embeddings.?, .timestamp_token = fa.timestamp_token_id };
+    mm.embeddings = null;
+    var timer = Stopwatch.init(stream.io);
+    var req = scheduler_mod.GenRequest{ .ctx = &job, .run = alignJobRun, .model = lm };
+    global_scheduler.?.runGeneration(&req) catch |err| {
+        _ = mlx.mlx_array_free(job.rows);
+        if (err != error.Shutdown) return err;
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+        return null;
+    };
+    const classes = job.classes orelse {
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "word alignment failed", 500);
+        return null;
+    };
+    defer allocator.free(classes);
+    const ms = try forced_align_mod.fixTimestamps(allocator, classes, fa.step_ms);
+    defer allocator.free(ms);
+    if (ms.len != 2 * units.len) {
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "word alignment returned a time for each <timestamp> it read, not two per word", 500);
+        return null;
+    }
+    const words = try forced_align_mod.timedWords(allocator, units, ms, script);
+    errdefer allocator.free(words);
+    const segments = try forced_align_mod.segments(allocator, text, words);
+    log.info("  aligned {d} words into {d} segments ({d} tokens, {d}ms)\n", .{ words.len, segments.len, ids.len, timer.read() / std.time.ns_per_ms });
+    return .{ .words = words, .segments = segments };
+}
+
+/// One aligner pass, run on the inference thread (the sole mlx caller).
+const AlignJob = struct {
+    allocator: std.mem.Allocator,
+    lm: *LoadedModel,
+    ids: []const u32,
+    rows: mlx.mlx_array,
+    timestamp_token: u32,
+    classes: ?[]u32 = null,
+};
+
+fn alignJobRun(ctx: *anyopaque) void {
+    const job: *AlignJob = @ptrCast(@alignCast(ctx));
+    defer _ = mlx.mlx_array_free(job.rows);
+    job.classes = forced_align_mod.timestampClasses(job.allocator, job.lm.transformer.?, job.ids, job.rows, job.timestamp_token) catch |err| {
+        log.err("  alignment failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+}
+
+/// Dispatch a media-generation request to the inference thread. `lm` is the
+/// already-resolved + refcounted model (so it can't be evicted mid-gen). The
+/// generation runs on the scheduler's inference thread (the sole mlx caller);
+/// the body writes its own response. A wrong-modality target gets a clear 400.
 
 fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: *model_registry_mod.LoadedModel, route: media_mod.GenRoute) !void {
     const scheduler = global_scheduler orelse {
@@ -14135,6 +14230,33 @@ pub const insufficient_free_memory_message =
 /// #144: `error.LoadFailed` used to surface as a bare "Model load failed" for
 /// every on-demand load failure — the inference thread's error name was
 /// dropped at the thread boundary. The registry keeps it; echo it.
+/// The response for a failed `Scheduler.ensureLoaded(id)`.
+fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8, err: anyerror) !void {
+    switch (err) {
+        error.UnknownModelId => try sendErrorResponse(allocator, stream, "404 Not Found", "model_not_found", "Unknown model id", 404),
+        error.NotLoaded => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_not_loaded", "Requested model is not currently loaded", 503),
+        error.NoDefaultModel => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "no_model", "No default model configured", 503),
+        error.NotEnoughMemory => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", not_enough_memory_message, 503),
+        error.InsufficientMemory => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503),
+        error.LoadFailed => try sendLoadFailedResponse(allocator, stream, sched, id),
+        error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503),
+        // Other errors (CPU-side preload failures like FileNotFound on a
+        // missing tokenizer.json, JSON parse errors on a malformed
+        // config.json, etc.) bubble out of `preloadCpuState`. Surface a
+        // 500 with the error name so the client gets a clean failure
+        // instead of a hung connection.
+        else => {
+            log.warn("  -> 500 ({s}) while loading {s}\n", .{ @errorName(err), id });
+            const msg = std.fmt.allocPrint(allocator, "Failed to load model: {s}", .{@errorName(err)}) catch {
+                try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", "Failed to load model", 500);
+                return;
+            };
+            defer allocator.free(msg);
+            try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_load_failed", msg, 500);
+        },
+    }
+}
+
 fn sendLoadFailedResponse(allocator: std.mem.Allocator, stream: *Conn, sched: *scheduler_mod.Scheduler, id: []const u8) !void {
     if (sched.loadErrorName(allocator, id)) |name| {
         defer allocator.free(name);
@@ -23595,6 +23717,8 @@ test "textGenRejectReason: media + encoder models rejected, chat models pass (SI
     // Encoder-only keeps its dedicated message (pre-existing guard, now
     // routed through the same decision).
     try std.testing.expect(std.mem.indexOf(u8, textGenRejectReason(.{ .is_encoder_only = true }).?, "/v1/embeddings") != null);
+    // The forced aligner serves nothing itself: it points at the ASR that uses it.
+    try std.testing.expect(std.mem.indexOf(u8, textGenRejectReason(.{ .arch_hint = "qwen3_forced_aligner" }).?, "Qwen3-ASR") != null);
 
     // Catch-all: a READY entry with no LM and no engines (future modality)
     // still rejects instead of crashing.
@@ -23680,6 +23804,9 @@ test "readyCapsJson: an audio tower on a text trunk advertises transcription" {
     var asr = try readyCapsJson(a, .{ .has_transcription = true });
     defer asr.deinit(a);
     try std.testing.expectEqualStrings("[\"transcription\"]", asr.items);
+    var aligner = try readyCapsJson(a, .{ .has_alignment = true });
+    defer aligner.deinit(a);
+    try std.testing.expectEqualStrings("[\"alignment\"]", aligner.items);
 }
 
 test "readyCapsJson: every resident media engine surfaces its capability (mesh -> 3d)" {
@@ -24874,12 +25001,12 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     const src = @embedFile("server.zig");
     const stale = "\"Not enough memory to load model; retry " ++ "after current requests complete\"";
     try testing.expect(std.mem.indexOf(u8, src, stale) == null);
-    // Both dispatch arms must use the constant — a second literal is the drift.
+    // Every ensureLoaded failure answers through `sendEnsureLoadedError`, the one site.
     var n: usize = 0;
     var i: usize = 0;
     const needle = "\"out_of_memory\", not_enough_memory" ++ "_message,";
     while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
-    try testing.expectEqual(@as(usize, 2), n);
+    try testing.expectEqual(@as(usize, 1), n);
 }
 
 test "PrefillDoesNotFit quotes the figures the inference thread refused on, once" {
