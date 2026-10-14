@@ -3,9 +3,68 @@
 
 const std = @import("std");
 const mlx = @import("mlx.zig");
+const log = @import("log.zig");
+const model_mod = @import("model.zig");
+const transformer_mod = @import("transformer.zig");
 
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
+const Weights = model_mod.Weights;
+
+/// A projection resolved once at load: affine-quantized (width solved from the packed
+/// geometry, never a literal) or dense, with an optional bias. Handles are borrowed from `Weights`.
+pub const Linear = struct {
+    w: A,
+    scales: ?A = null,
+    biases: A = .{ .ctx = null },
+    bias: ?A = null,
+    bits: u32 = 0,
+    group_size: u32 = 0,
+
+    pub fn forward(self: *const Linear, sc: *Scope, x: A) !A {
+        const y = if (self.scales) |sca|
+            try sc.qmm(x, self.w, sca, self.biases, self.group_size, self.bits)
+        else
+            try sc.matmul(x, try sc.transpose(self.w, &.{ 1, 0 }));
+        return if (self.bias) |b| sc.add(y, b) else y;
+    }
+};
+
+pub fn getW(w: *const Weights, comptime fmt: []const u8, args: anytype) !A {
+    var buf: [160]u8 = undefined;
+    const key = try std.fmt.bufPrint(&buf, fmt, args);
+    return w.get(key) orelse {
+        log.err("MISSING WEIGHT: {s}\n", .{key});
+        return error.MissingWeight;
+    };
+}
+
+pub fn linear(w: *const Weights, comptime fmt: []const u8, args: anytype, in_dim: u32) !Linear {
+    var buf: [160]u8 = undefined;
+    const prefix = try std.fmt.bufPrint(&buf, fmt, args);
+    var l = Linear{ .w = try getW(w, "{s}.weight", .{prefix}) };
+    if (w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.scales", .{prefix}))) |sca| {
+        l.scales = sca;
+        l.biases = try getW(w, "{s}.biases", .{prefix});
+        const qp = transformer_mod.affineParamsFromGeometry(l.w, sca, in_dim) orelse {
+            log.err("unsolvable quant geometry for {s}\n", .{prefix});
+            return error.BadQuantGeometry;
+        };
+        l.bits = qp.bits;
+        l.group_size = qp.group_size;
+    }
+    l.bias = w.get(try std.fmt.bufPrint(buf[prefix.len..], "{s}.bias", .{prefix}));
+    return l;
+}
+
+/// Evaluate every array once so no weight stays a lazy file read.
+pub fn evalAll(w: *const Weights) !void {
+    const vec = mlx.mlx_vector_array_new();
+    defer _ = mlx.mlx_vector_array_free(vec);
+    var it = w.map.valueIterator();
+    while (it.next()) |v| _ = mlx.mlx_vector_array_append_value(vec, v.*);
+    try mlx.check(mlx.mlx_eval(vec));
+}
 
 pub const Scope = struct {
     a: std.mem.Allocator,
@@ -76,6 +135,10 @@ pub const Scope = struct {
     }
     pub fn silu(sc: *Scope, x: A) !A {
         return sc.mul(x, try sc.sigmoid(x));
+    }
+    pub fn relu(sc: *Scope, x: A) !A {
+        var o = mlx.mlx_array_new();
+        return sc.res(mlx.mlx_maximum(&o, x, try sc.scalarLike(x, 0), sc.s), &o);
     }
     pub fn astype(sc: *Scope, x: A, dt: mlx.mlx_dtype) !A {
         var o = mlx.mlx_array_new();
@@ -227,7 +290,7 @@ pub const Scope = struct {
     pub fn geluErf(sc: *Scope, x: A) !A {
         var o = mlx.mlx_array_new();
         const e = try sc.res(mlx.mlx_erf(&o, try sc.mulLike(x, std.math.sqrt1_2), sc.s), &o);
-        return sc.mul(x, try sc.mulLike(try sc.addS(e, 1.0), 0.5));
+        return sc.mul(x, try sc.mulLike(try sc.add(e, try sc.scalarLike(e, 1.0)), 0.5));
     }
     pub fn fromI32(sc: *Scope, data: []const i32, shape: []const c_int) !A {
         return sc.keep(mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .int32));

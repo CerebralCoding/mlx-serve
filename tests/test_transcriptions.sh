@@ -8,13 +8,15 @@
 # trunk answers "" (the model hears silence), which no other check can see.
 # With Qwen3-ForcedAligner on disk, section 6 rescans it in and checks word and
 # segment times, srt/vtt, other scripts, a clip cut past 180 s, and that the
-# aligner serves nothing itself (skipped without the aligner pack).
+# aligner serves nothing itself (skipped without the aligner pack); with
+# Nemotron 3 Diarization too, diarized_json labels three voices taking turns.
 #
 # Skips without the pack or without macOS `say`. Download with:
 #   hf download mlx-community/Qwen3-ASR-0.6B-8bit --local-dir ~/.mlx-serve/models/mlx-community/Qwen3-ASR-0.6B-8bit
 #   hf download mlx-community/Qwen3-ForcedAligner-0.6B-8bit --local-dir ~/.mlx-serve/models/mlx-community/Qwen3-ForcedAligner-0.6B-8bit
+#   hf download mlx-community/Nemotron-3-Diarization-8bit --local-dir ~/.mlx-serve/models/mlx-community/Nemotron-3-Diarization-8bit
 #
-# Usage: ASR_MODEL=<dir> ALIGNER_MODEL=<dir> BINARY=<mlx-serve> ./tests/test_transcriptions.sh [port]
+# Usage: ASR_MODEL=<dir> ALIGNER_MODEL=<dir> DIARIZER_MODEL=<dir> BINARY=<mlx-serve> ./tests/test_transcriptions.sh [port]
 set -uo pipefail
 PORT="${1:-11443}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
@@ -238,6 +240,101 @@ assert all(a['start']<=b['start'] for a,b in zip(w,w[1:])), 'words go back in ti
 assert w[-1]['end']>d-10 and all(x['end']<=d for x in w), (w[-1], d)" || { echo "FAIL: a clip past 180 s"; exit 1; }
   [ $(( $(grep -c "  aligned " "$LOG") - before )) -eq 2 ] || { echo "FAIL: a 210 s clip is not two pieces"; exit 1; }
   echo "PASS: a 210 s clip is two pieces, timed end to end"
+
+  # 6b. Speakers from Nemotron 3 Diarization, rescanned in beside the aligner.
+  DIARIZER="${DIARIZER_MODEL:-$HOME/.mlx-serve/models/mlx-community/Nemotron-3-Diarization-8bit}"
+  pick_voice() { # preferred name, else the first voice of a locale
+    say -v '?' | grep -q "^$1 " && { echo "$1"; return; }
+    say -v '?' | sed -n "s/^\(.*[^ ]\)  *$2 .*/\1/p" | head -1
+  }
+  V1=$(pick_voice Daniel en_GB); V2=$(pick_voice "Samantha (English (US))" en_US); V3=$(pick_voice Rishi en_IN)
+  if [ ! -f "$DIARIZER/config.json" ]; then
+    echo "SKIP: speakers (no Nemotron 3 Diarization pack at $DIARIZER; set DIARIZER_MODEL)"
+  elif [ -z "$V1" ] || [ -z "$V2" ] || [ -z "$V3" ]; then
+    echo "SKIP: speakers (needs an en_GB, an en_US and an en_IN voice for say)"
+  else
+    b400 "diarized_json without a diarizer" "Nemotron-3-Diarization" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=diarized_json
+    b400 "known speakers" "known speakers" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=diarized_json -F 'known_speaker_names[]=agent'
+    # A diarizer that cannot load (its config, no weights): one speaker, not a failure.
+    mkdir -p "$TMP/models/mlx-community/Nemotron-3-Diarization-broken"
+    cp "$DIARIZER/config.json" "$TMP/models/mlx-community/Nemotron-3-Diarization-broken/"
+    curl -s -X POST "$(url /v1/models/rescan)" >/dev/null
+    curl -s "$(url $T)" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=diarized_json | python3 -c "
+import sys,json
+v=json.load(sys.stdin)
+assert v['segments'] and {s['speaker'] for s in v['segments']}=={'A'}, v" || { echo "FAIL: diarized_json beside a broken diarizer"; exit 1; }
+    grep -q "diarizer .* did not load" "$LOG" || { echo "FAIL: no fallback line for the broken diarizer"; exit 1; }
+    echo "PASS: a broken diarizer leaves one speaker, not a failure"
+    DID="mlx-community/$(basename "$DIARIZER")"
+    ln -s "$DIARIZER" "$TMP/models/mlx-community/$(basename "$DIARIZER")"
+    curl -s -X POST "$(url /v1/models/rescan)" >/dev/null
+    dstate() { curl -s "$(url /v1/models)" | python3 -c "
+import sys,json
+m=[x for x in json.load(sys.stdin)['data'] if x['id']=='$DID']
+assert m, 'diarizer not discovered'
+assert m[0].get('capabilities')==['diarization'], m[0].get('capabilities')
+print(m[0]['state'])"; }
+    s=$(dstate) || { echo "FAIL: the diarizer stub must advertise only diarization"; exit 1; }
+    curl -s "$(url $T)" -F file=@"$TMP/short.wav" -F model="$ID" -F response_format=verbose_json >/dev/null
+    [ "$(dstate)" = "unloaded" ] || { echo "FAIL: verbose_json loaded the diarizer"; exit 1; }
+    echo "PASS: the diarizer stub advertises diarization and verbose_json leaves it unloaded"
+
+    # Three voices taking turns, two of them twice; where each turn falls is known.
+    python3 - "$TMP" "$V1" "$V2" "$V3" <<'EOF' || { echo "FAIL: could not build the conversation"; exit 1; }
+import json, subprocess, sys, wave
+tmp, voices = sys.argv[1], sys.argv[2:]
+turns = [(0, "Good morning everyone, let's go through the release plan for this week."),
+         (1, "Morning. The beta build is ready, and the installer is finally signed."),
+         (2, "Great news. Did the crash on older machines get fixed before the build?"),
+         (0, "It did. Let's ship it to the testers on Thursday afternoon."),
+         (1, "I will send the notes to the support team tomorrow morning."),
+         (2, "Perfect, then the documentation review can happen on Friday.")]
+pcm, truth, rate = b"", [], 16000
+for i, (who, text) in enumerate(turns):
+    out = f"{tmp}/turn{i}.wav"
+    subprocess.run(["say", "-v", voices[who], "-o", out, "--data-format=LEI16@16000", text], check=True)
+    with wave.open(out) as w:
+        frames = w.readframes(w.getnframes())
+    pcm += b"\0\0" * int(0.6 * rate)
+    start = len(pcm) // 2 / rate
+    pcm += frames
+    truth.append({"voice": who, "start": start, "end": len(pcm) // 2 / rate})
+pcm += b"\0\0" * int(0.6 * rate)
+with wave.open(f"{tmp}/conv.wav", "wb") as w:
+    w.setnchannels(1); w.setsampwidth(2); w.setframerate(rate); w.writeframes(pcm)
+json.dump(truth, open(f"{tmp}/conv_truth.json", "w"))
+EOF
+    before=$(grep -c "  diarized " "$LOG")
+    D=$(curl -s "$(url $T)" -F file=@"$TMP/conv.wav" -F model="$ID" -F response_format=diarized_json)
+    echo "$D" | python3 -c "
+import sys,json
+v=json.load(sys.stdin); s=v['segments']; truth=json.load(open('$TMP/conv_truth.json'))
+assert v['task']=='transcribe' and v['duration']>truth[-1]['end'] and v['text'], v
+assert [x['id'] for x in s]==['seg_%03d'%(i+1) for i in range(len(s))] and all(x['type']=='transcript.text.segment' for x in s), s
+assert all(a['start']<=b['start'] and x['start']<=x['end'] for a,b,x in zip(s,s[1:],s)), 'segments out of order'
+seen=[]
+for x in s:
+    if x['speaker'] not in seen: seen.append(x['speaker'])
+assert seen==[chr(65+i) for i in range(len(seen))], ('letters not in order of first speech', seen)
+pairs=[]
+for x in s:
+    mid=(x['start']+x['end'])/2
+    t=[u['voice'] for u in truth if u['start']-0.3<=mid<=u['end']+0.3]
+    if t: pairs.append((t[0], x['speaker']))
+best={vo: max(set(l for w,l in pairs if w==vo), key=[l for w,l in pairs if w==vo].count) for vo in {w for w,_ in pairs}}
+assert len(set(best.values()))==3, ('three voices, three letters', best, pairs)
+right=sum(best[w]==l for w,l in pairs)/len(pairs)
+assert right>=0.9, (right, pairs)
+print(len(s), 'segments', seen, right)
+" || { echo "FAIL: diarized_json speakers: $D"; exit 1; }
+    [ $(( $(grep -c "  diarized " "$LOG") - before )) -eq 1 ] || { echo "FAIL: the clip was not diarized once"; exit 1; }
+    [ "$(dstate)" = "ready" ] || { echo "FAIL: the diarizer is not resident after labelling"; exit 1; }
+    echo "PASS: three voices get three letters, in order of first speech, on their own turns"
+    code=$(curl -s -o "$TMP/err.txt" -w "%{http_code}" "$(url /v1/chat/completions)" -H 'Content-Type: application/json' -d "{\"model\":\"$DID\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
+    [ "$code" = "400" ] && grep -q "diarized_json" "$TMP/err.txt" || { echo "FAIL: chat on the diarizer returned $code"; cat "$TMP/err.txt"; exit 1; }
+    echo "PASS: chat on the diarizer -> 400"
+    b400 "transcribing with the diarizer" "diarized_json" -F file=@"$TMP/short.wav" -F model="$DID"
+  fi
 
   code=$(curl -s -o "$TMP/err.txt" -w "%{http_code}" "$(url /v1/chat/completions)" -H 'Content-Type: application/json' -d "{\"model\":\"$AID\",\"messages\":[{\"role\":\"user\",\"content\":\"hi\"}]}")
   [ "$code" = "400" ] && grep -q "Qwen3-ASR" "$TMP/err.txt" || { echo "FAIL: chat on the aligner returned $code"; cat "$TMP/err.txt"; exit 1; }

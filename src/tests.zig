@@ -30,6 +30,7 @@ test {
     _ = @import("minicpm_canvas.zig");
     _ = @import("qwen_audio.zig");
     _ = @import("forced_align.zig");
+    _ = @import("nemotron_diarization.zig");
     _ = @import("transcription.zig");
     _ = @import("mrope.zig");
     _ = @import("rht.zig");

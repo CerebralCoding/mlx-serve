@@ -11,11 +11,11 @@ const forced_align = @import("forced_align.zig");
 
 pub const SAMPLE_RATE: u32 = 16000;
 
-pub const Format = enum { json, text, verbose_json, srt, vtt };
+pub const Format = enum { json, text, verbose_json, srt, vtt, diarized_json };
 
 /// Formats that carry times.
 pub fn timed(f: Format) bool {
-    return f == .verbose_json or f == .srt or f == .vtt;
+    return f == .verbose_json or f == .srt or f == .vtt or f == .diarized_json;
 }
 
 pub const Form = struct {
@@ -30,16 +30,17 @@ pub const Form = struct {
     words: bool = false,
 };
 
-pub const FormError = error{ NotMultipart, MissingFile, UnsupportedResponseFormat, StreamUnsupported, BadTemperature, UnsupportedLanguage };
+pub const FormError = error{ NotMultipart, MissingFile, UnsupportedResponseFormat, StreamUnsupported, BadTemperature, UnsupportedLanguage, KnownSpeakersUnsupported };
 
 pub fn formErrorMessage(err: FormError) []const u8 {
     return switch (err) {
         error.NotMultipart => "send the audio as multipart/form-data with a `file` field",
         error.MissingFile => "`file` is required",
-        error.UnsupportedResponseFormat => "response_format must be json, text, verbose_json, srt or vtt",
+        error.UnsupportedResponseFormat => "response_format must be json, text, verbose_json, srt, vtt or diarized_json",
         error.StreamUnsupported => "stream is not supported on /v1/audio/transcriptions",
         error.BadTemperature => "temperature must be a number in [0, 1]",
         error.UnsupportedLanguage => "language is not one Qwen3-ASR transcribes; omit it to detect the language",
+        error.KnownSpeakersUnsupported => "known speakers are not supported: diarized_json labels speakers A, B, ... in the order they first speak",
     };
 }
 
@@ -67,6 +68,8 @@ pub fn parseForm(body: []const u8, content_type: []const u8) FormError!Form {
             if (std.mem.eql(u8, v, "true")) return error.StreamUnsupported;
         } else if (std.mem.eql(u8, part.name, "timestamp_granularities[]")) {
             if (std.mem.eql(u8, v, "word")) form.words = true;
+        } else if (std.mem.eql(u8, part.name, "known_speaker_names[]") or std.mem.eql(u8, part.name, "known_speaker_references[]")) {
+            return error.KnownSpeakersUnsupported;
         }
     }
     if (form.file.len == 0) return error.MissingFile;
@@ -144,8 +147,45 @@ pub fn splitPoints(a: std.mem.Allocator, pcm: []const f32, max: usize) ![]usize 
     return ends.toOwnedSlice(a);
 }
 
-/// A timed span of `Timeline.text`, in seconds.
-pub const Span = struct { start: f64, end: f64, lo: usize, hi: usize };
+/// A timed span of `Timeline.text`, in seconds, and its speaker.
+pub const Span = struct { start: f64, end: f64, lo: usize, hi: usize, speaker: u8 = 0 };
+
+/// Speaker activity at 10 ms over a whole clip: `speakers` probabilities a frame.
+pub const Activity = struct {
+    probs: []const f32,
+    speakers: usize,
+
+    /// The speaker most active over `[start_ms, end_ms)` of the clip (at least
+    /// its first frame); `fallback` when nobody is.
+    pub fn speakerOver(self: Activity, start_ms: u64, end_ms: u64, fallback: u8) u8 {
+        const frames = self.probs.len / self.speakers;
+        const lo = @min(start_ms / 10, frames);
+        const hi = @min(@max(end_ms / 10, lo + 1), frames);
+        var best = fallback;
+        var best_sum: f32 = 0;
+        for (0..self.speakers) |s| {
+            var sum: f32 = 0;
+            for (lo..hi) |t| sum += self.probs[t * self.speakers + s];
+            if (sum > best_sum) {
+                best_sum = sum;
+                best = @intCast(s);
+            }
+        }
+        return best;
+    }
+
+    /// Each word's speaker, its times the piece's from `offset_ms` into the
+    /// clip; a word nobody is heard saying keeps the previous word's.
+    pub fn wordSpeakers(self: Activity, a: std.mem.Allocator, words: []const forced_align.Timed, offset_ms: u64) ![]u8 {
+        const out = try a.alloc(u8, words.len);
+        var last: u8 = 0;
+        for (words, out) |w, *o| {
+            o.* = self.speakerOver(offset_ms + w.start_ms, offset_ms + w.end_ms, last);
+            last = o.*;
+        }
+        return out;
+    }
+};
 
 /// A transcript put together from pieces of audio, with its segments and words.
 pub const Timeline = struct {
@@ -164,9 +204,9 @@ pub const Timeline = struct {
 
     /// Append the transcript of the piece `offset .. offset + duration` seconds:
     /// its aligned words and segments (spans of `piece`), or, without any, one
-    /// segment over the whole piece. Chinese, Cantonese and Japanese join
-    /// without a space.
-    pub fn add(self: *Timeline, a: std.mem.Allocator, piece: []const u8, language: ?[]const u8, offset: f64, duration: f64, words: ?[]const forced_align.Timed, segs: ?[]const forced_align.Segment) !void {
+    /// segment over the whole piece said by `speaker`. Chinese, Cantonese and
+    /// Japanese join without a space.
+    pub fn add(self: *Timeline, a: std.mem.Allocator, piece: []const u8, language: ?[]const u8, offset: f64, duration: f64, words: ?[]const forced_align.Timed, segs: ?[]const forced_align.Segment, speaker: u8) !void {
         if (language) |l| if (self.language == null or (self.segments.items.len == 0 and piece.len > 0)) {
             const owned = try a.dupe(u8, l);
             if (self.language) |old| a.free(old);
@@ -179,12 +219,12 @@ pub const Timeline = struct {
         const base = self.text.items.len;
         try self.text.appendSlice(a, piece);
         const at = struct {
-            fn span(t: forced_align.Timed, b: usize, o: f64) Span {
-                return .{ .start = o + @as(f64, @floatFromInt(t.start_ms)) / 1000, .end = o + @as(f64, @floatFromInt(t.end_ms)) / 1000, .lo = b + t.start, .hi = b + t.end };
+            fn span(t: anytype, b: usize, o: f64) Span {
+                return .{ .start = o + @as(f64, @floatFromInt(t.start_ms)) / 1000, .end = o + @as(f64, @floatFromInt(t.end_ms)) / 1000, .lo = b + t.start, .hi = b + t.end, .speaker = if (@hasField(@TypeOf(t), "speaker")) t.speaker else 0 };
             }
         }.span;
         const ss = segs orelse &.{};
-        if (ss.len == 0) return self.segments.append(a, .{ .start = offset, .end = offset + duration, .lo = base, .hi = base + piece.len });
+        if (ss.len == 0) return self.segments.append(a, .{ .start = offset, .end = offset + duration, .lo = base, .hi = base + piece.len, .speaker = speaker });
         for (ss) |s| try self.segments.append(a, at(s, base, offset));
         for (words orelse &.{}) |w| try self.words.append(a, at(w, base, offset));
     }
@@ -219,6 +259,30 @@ pub const Timeline = struct {
             try out.append(a, ']');
         }
         try out.append(a, '}');
+        return out.toOwnedSlice(a);
+    }
+
+    /// OpenAI's `diarized_json`: the segments with their speakers, lettered in
+    /// the order they first speak.
+    pub fn diarizedJson(self: *const Timeline, a: std.mem.Allocator, duration: f64) ![]u8 {
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(a);
+        try out.print(a, "{{\"task\":\"transcribe\",\"duration\":{d:.3},\"text\":", .{duration});
+        try chat.appendJsonString(a, &out, self.text.items);
+        try out.appendSlice(a, ",\"segments\":[");
+        var letters: [256]u8 = @splat(0);
+        var next: u8 = 'A';
+        for (self.segments.items, 1..) |s, n| {
+            if (letters[s.speaker] == 0) {
+                letters[s.speaker] = next;
+                next += 1;
+            }
+            if (n > 1) try out.append(a, ',');
+            try out.print(a, "{{\"type\":\"transcript.text.segment\",\"id\":\"seg_{d:0>3}\",\"start\":{d:.3},\"end\":{d:.3},\"text\":", .{ n, s.start, s.end });
+            try chat.appendJsonString(a, &out, self.text.items[s.lo..s.hi]);
+            try out.print(a, ",\"speaker\":\"{c}\"}}", .{letters[s.speaker]});
+        }
+        try out.appendSlice(a, "]}");
         return out.toOwnedSlice(a);
     }
 
@@ -327,12 +391,32 @@ test "parseForm takes subtitles and word times" {
     try testing.expect(w.words and timed(w.format));
     const seg = try parseForm(formBody(&.{ .{ "file", "x" }, .{ "timestamp_granularities[]", "segment" } }), CT);
     try testing.expect(!seg.words and !timed(seg.format));
+    const d = try parseForm(formBody(&.{ .{ "file", "x" }, .{ "response_format", "diarized_json" }, .{ "chunking_strategy", "auto" } }), CT);
+    try testing.expect(d.format == .diarized_json and timed(d.format));
+}
+
+test "Activity names the speaker most active over a span" {
+    // 10 ms frames of two speakers: 0 talks for 50 ms, then 1, then nobody.
+    const probs = [_]f32{ 0.9, 0.1, 0.9, 0.1, 0.8, 0.3, 0.7, 0.4, 0.6, 0.2, 0.2, 0.9, 0.1, 0.9, 0.1, 0.8, 0, 0, 0, 0 };
+    const act = Activity{ .probs = &probs, .speakers = 2 };
+    try testing.expectEqual(@as(u8, 0), act.speakerOver(0, 50, 1));
+    try testing.expectEqual(@as(u8, 1), act.speakerOver(50, 80, 0));
+    // A span shorter than a frame reads its frame; a silent or past-the-end span keeps the fallback.
+    try testing.expectEqual(@as(u8, 1), act.speakerOver(61, 62, 0));
+    try testing.expectEqual(@as(u8, 1), act.speakerOver(80, 100, 1));
+    try testing.expectEqual(@as(u8, 0), act.speakerOver(500, 600, 0));
+    // A piece's words: their times are the piece's, the activity the clip's.
+    const words = [_]forced_align.Timed{ .{ .start_ms = 0, .end_ms = 20, .start = 0, .end = 1 }, .{ .start_ms = 30, .end_ms = 40, .start = 2, .end = 3 }, .{ .start_ms = 50, .end_ms = 60, .start = 4, .end = 5 } };
+    const who = try act.wordSpeakers(testing.allocator, &words, 20);
+    defer testing.allocator.free(who);
+    try testing.expectEqualSlices(u8, &.{ 0, 1, 1 }, who);
 }
 
 test "parseForm refuses by name what it cannot honour" {
     try testing.expectError(error.NotMultipart, parseForm("{}", "application/json"));
     try testing.expectError(error.MissingFile, parseForm(formBody(&.{.{ "model", "m" }}), CT));
-    try testing.expectError(error.UnsupportedResponseFormat, parseForm(formBody(&.{ .{ "file", "x" }, .{ "response_format", "diarized_json" } }), CT));
+    try testing.expectError(error.UnsupportedResponseFormat, parseForm(formBody(&.{ .{ "file", "x" }, .{ "response_format", "url" } }), CT));
+    try testing.expectError(error.KnownSpeakersUnsupported, parseForm(formBody(&.{ .{ "file", "x" }, .{ "known_speaker_names[]", "agent" } }), CT));
     try testing.expectError(error.StreamUnsupported, parseForm(formBody(&.{ .{ "file", "x" }, .{ "stream", "true" } }), CT));
     try testing.expectError(error.BadTemperature, parseForm(formBody(&.{ .{ "file", "x" }, .{ "temperature", "2" } }), CT));
     try testing.expectError(error.UnsupportedLanguage, parseForm(formBody(&.{ .{ "file", "x" }, .{ "language", "xx" } }), CT));
@@ -413,8 +497,8 @@ test "Timeline renders verbose_json, srt and vtt from timed pieces" {
         .{ .start_ms = 2400, .end_ms = 2800, .start = 14, .end = 17 },
     };
     const segs = [_]forced_align.Segment{ .{ .start_ms = 0, .end_ms = 900, .start = 0, .end = 12 }, .{ .start_ms = 2400, .end_ms = 2800, .start = 13, .end = 18 } };
-    try tl.add(a, first, "English", 0, 3, &words, &segs);
-    try tl.add(a, "Hallo", "German", 3.5, 2, null, null);
+    try tl.add(a, first, "English", 0, 3, &words, &segs, 0);
+    try tl.add(a, "Hallo", "German", 3.5, 2, null, null, 0);
     try testing.expectEqualStrings("Hello there. \"Bye\" Hallo", tl.text.items);
 
     const v = try tl.verboseJson(a, 5.5, true);
@@ -434,13 +518,33 @@ test "Timeline renders verbose_json, srt and vtt from timed pieces" {
     try testing.expectEqualStrings("WEBVTT\n\n00:00:00.000 --> 00:00:00.900\nHello there.\n\n00:00:02.400 --> 00:00:02.800\n\"Bye\"\n\n00:00:03.500 --> 00:00:05.500\nHallo\n\n", vtt);
 }
 
+test "Timeline renders diarized_json, its speakers lettered in the order they first speak" {
+    const a = testing.allocator;
+    var tl = Timeline{};
+    defer tl.deinit(a);
+    const text = "Hi. Hello. Bye.";
+    const segs = [_]forced_align.Segment{
+        .{ .start_ms = 0, .end_ms = 500, .start = 0, .end = 3, .speaker = 2 },
+        .{ .start_ms = 600, .end_ms = 1200, .start = 4, .end = 10, .speaker = 0 },
+        .{ .start_ms = 1300, .end_ms = 1700, .start = 11, .end = 15, .speaker = 2 },
+    };
+    try tl.add(a, text, "English", 0, 2, &.{}, &segs, 0);
+    // A piece without word times is one segment, its main speaker given.
+    try tl.add(a, "Ciao", "Italian", 2, 1, null, null, 0);
+    const d = try tl.diarizedJson(a, 3);
+    defer a.free(d);
+    try testing.expectEqualStrings(
+        \\{"task":"transcribe","duration":3.000,"text":"Hi. Hello. Bye. Ciao","segments":[{"type":"transcript.text.segment","id":"seg_001","start":0.000,"end":0.500,"text":"Hi.","speaker":"A"},{"type":"transcript.text.segment","id":"seg_002","start":0.600,"end":1.200,"text":"Hello.","speaker":"B"},{"type":"transcript.text.segment","id":"seg_003","start":1.300,"end":1.700,"text":"Bye.","speaker":"A"},{"type":"transcript.text.segment","id":"seg_004","start":2.000,"end":3.000,"text":"Ciao","speaker":"B"}]}
+    , d);
+}
+
 test "Timeline: Chinese and Japanese pieces join without a space, silence adds no segment" {
     const a = testing.allocator;
     var tl = Timeline{};
     defer tl.deinit(a);
-    try tl.add(a, "你好。", "Chinese", 0, 1, null, null);
-    try tl.add(a, "", "None", 1, 1, null, null);
-    try tl.add(a, "再见。", "Chinese", 2, 1, null, null);
+    try tl.add(a, "你好。", "Chinese", 0, 1, null, null, 0);
+    try tl.add(a, "", "None", 1, 1, null, null, 0);
+    try tl.add(a, "再见。", "Chinese", 2, 1, null, null, 0);
     try testing.expectEqualStrings("你好。再见。", tl.text.items);
     try testing.expectEqual(@as(usize, 2), tl.segments.items.len);
     // An hour-long timestamp keeps its hours.

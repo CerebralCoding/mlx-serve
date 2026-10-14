@@ -38,6 +38,7 @@ const arch_llama = if (@import("build_options").embedded_engines) @import("arch/
 const media_mod = @import("gen.zig");
 const transcription_mod = @import("transcription.zig");
 const forced_align_mod = @import("forced_align.zig");
+const diarization_mod = @import("nemotron_diarization.zig");
 const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("status.zig");
@@ -6768,6 +6769,8 @@ const ReadyCaps = struct {
     has_transcription: bool = false,
     /// Qwen3-ForcedAligner, which times those transcripts.
     has_alignment: bool = false,
+    /// Nemotron 3 Diarization, which labels their speakers.
+    has_diarization: bool = false,
     has_reasoning: bool = false,
     /// Encoder-only (BERT/EmbeddingGemma) OR a decoder with a pooling contract
     /// (Qwen3-Embedding) — `config.hasEmbeddingCapability()`. Issue #116.
@@ -6818,6 +6821,7 @@ fn readyCapsJson(allocator: std.mem.Allocator, c: ReadyCaps) !std.ArrayList(u8) 
     if (c.has_audio) try append_cap(allocator, &caps, &n_caps, "audio");
     if (c.has_transcription) try append_cap(allocator, &caps, &n_caps, "transcription");
     if (c.has_alignment) try append_cap(allocator, &caps, &n_caps, "alignment");
+    if (c.has_diarization) try append_cap(allocator, &caps, &n_caps, "diarization");
     if (c.has_reasoning) try append_cap(allocator, &caps, &n_caps, "reasoning");
     if (c.has_chat) try append_cap(allocator, &caps, &n_caps, "json_schema");
     if (c.has_embedding) try append_cap(allocator, &caps, &n_caps, "embeddings");
@@ -6983,6 +6987,7 @@ fn textGenRejectReason(t: TextGenTarget) ?[]const u8 {
         .video => "This is a video generation model; it cannot serve chat/text requests. Use POST /v1/video/generations instead.",
         .mesh => "This is a 3D generation model; it cannot serve chat/text requests. Use POST /v1/3d/generations instead.",
         .decision => "This is a typed-decision model; it cannot serve chat/text requests. Use POST /v1/decisions instead.",
+        .diarization => "This is a speaker diarizer: it labels the speakers of a transcript and serves no request itself. Target a Qwen3-ASR model on /v1/audio/transcriptions with response_format=diarized_json.",
     };
     if (!t.has_text_lm) return "This model cannot serve text generation (no language model resident).";
     return null;
@@ -7080,6 +7085,7 @@ fn renderModelEntry(
             .has_video_engine = entry.video_engine != null,
             .has_mesh_engine = entry.mesh_engine != null,
             .has_decision_engine = entry.decision_engine != null,
+            .has_diarization = entry.diarization_engine != null,
         });
         defer caps.deinit(allocator);
 
@@ -7673,20 +7679,23 @@ fn genJobRunMany(ctxs: []const *anyopaque) void {
     media_mod.handleDecisions(e, first.lm.id, buf[0..ctxs.len]);
 }
 
-/// Longest clip one request transcribes: mlx-audio's chunk length, past which
-/// the reference splits the audio.
+/// Longest piece one pass of the ASR transcribes: mlx-audio's chunk length,
+/// past which the reference splits the audio.
 const TRANSCRIPTION_MAX_SECONDS = 1200;
 /// The reference's `max_tokens` for one chunk.
 const TRANSCRIPTION_MAX_TOKENS = 8192;
 /// The aligner the app downloads beside a Qwen3-ASR model.
 const ALIGNER_REPO = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit";
+/// The diarizer the app downloads beside it.
+const DIARIZER_REPO = "mlx-community/Nemotron-3-Diarization-8bit";
 
 /// `POST /v1/audio/transcriptions`: OpenAI's form over Qwen3-ASR. The reference
 /// prompt's one audio placeholder expands to the tower's rows like any chat
-/// media, then the trunk decodes the transcript. verbose_json, srt and vtt time
-/// it with Qwen3-ForcedAligner when one is on disk, cutting the clip into pieces
-/// the aligner can time as the official toolkit does; a piece in a language the
-/// aligner lacks is one segment.
+/// media, then the trunk decodes the transcript. verbose_json, srt, vtt and
+/// diarized_json time it with Qwen3-ForcedAligner when one is on disk, cutting
+/// the clip into pieces the aligner can time as the official toolkit does; a
+/// piece in a language the aligner lacks is one segment. diarized_json labels
+/// each word with the speaker Nemotron 3 Diarization hears over the whole clip.
 fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, content_type: []const u8, lm: *LoadedModel) !void {
     const hears = if (lm.vision_encoder) |ve| ve.qwen_audio != null else false;
     if (!hears) {
@@ -7706,12 +7715,6 @@ fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []con
     };
     defer allocator.free(pcm);
     const seconds = @as(f64, @floatFromInt(pcm.len)) / transcription_mod.SAMPLE_RATE;
-    if (seconds > TRANSCRIPTION_MAX_SECONDS) {
-        var buf: [128]u8 = undefined;
-        const msg = std.fmt.bufPrint(&buf, "audio is {d:.0} s long; one request transcribes at most {d} s", .{ seconds, TRANSCRIPTION_MAX_SECONDS }) catch "audio too long";
-        try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", msg, 400);
-        return;
-    }
     log.info("POST /v1/audio/transcriptions ({d:.1} s, language={s}, format={s}, prompt={d}b)\n", .{ seconds, form.language orelse "auto", @tagName(form.format), if (form.prompt) |p| p.len else 0 });
 
     var aligner: ?Aligner = if (transcription_mod.timed(form.format)) try findAligner(allocator) else null;
@@ -7719,10 +7722,26 @@ fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []con
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "srt and vtt need word times from Qwen3-ForcedAligner, which is not on disk or did not load: download " ++ ALIGNER_REPO ++ " beside the ASR model", 400);
         return;
     }
-    const ends = if (aligner != null)
-        try transcription_mod.splitPoints(allocator, pcm, transcription_mod.ALIGN_MAX_SECONDS * transcription_mod.SAMPLE_RATE)
-    else
-        try allocator.dupe(usize, &.{pcm.len});
+    // Speakers are heard over the whole clip, so a voice keeps its letter across pieces.
+    var speaker_probs: ?[]f32 = null;
+    defer if (speaker_probs) |p| allocator.free(p);
+    var diarizer: ?*LoadedModel = null;
+    defer if (diarizer) |m| global_scheduler.?.release(m);
+    if (form.format == .diarized_json) {
+        const id = (findCompanion("nemotron_diarization") orelse {
+            try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "diarized_json needs Nemotron 3 Diarization, which is not on disk or did not load: download " ++ DIARIZER_REPO ++ " beside the ASR model", 400);
+            return;
+        }).id;
+        diarizer = global_scheduler.?.ensureLoaded(id) catch |err| blk: {
+            log.warn("  diarizer {s} did not load ({s}): one speaker\n", .{ id, @errorName(err) });
+            break :blk null;
+        };
+        if (diarizer) |m| speaker_probs = (try diarizeClip(allocator, stream, m, pcm)) orelse return;
+    }
+    const who: ?transcription_mod.Activity = if (speaker_probs) |p| .{ .probs = p, .speakers = diarizer.?.diarization_engine.?.cfg.speakers } else null;
+
+    const piece_seconds: usize = if (aligner != null) transcription_mod.ALIGN_MAX_SECONDS else TRANSCRIPTION_MAX_SECONDS;
+    const ends = try transcription_mod.splitPoints(allocator, pcm, piece_seconds * transcription_mod.SAMPLE_RATE);
     defer allocator.free(ends);
 
     var tl = transcription_mod.Timeline{};
@@ -7747,11 +7766,12 @@ fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []con
                     al.languages = 0;
                     break :blk null;
                 };
-                if (al.lm) |alm| timed = (try alignPiece(allocator, stream, alm, pcm[start..end], t.text, t.language.?)) orelse return;
+                if (al.lm) |alm| timed = (try alignPiece(allocator, stream, alm, pcm[start..end], t.text, t.language.?, who, start * 1000 / transcription_mod.SAMPLE_RATE)) orelse return;
             }
         }
         const rate: f64 = transcription_mod.SAMPLE_RATE;
-        try tl.add(allocator, t.text, t.language, @as(f64, @floatFromInt(start)) / rate, @as(f64, @floatFromInt(end - start)) / rate, if (timed) |x| x.words else null, if (timed) |x| x.segments else null);
+        const speaker = if (who) |w| w.speakerOver(start * 1000 / transcription_mod.SAMPLE_RATE, end * 1000 / transcription_mod.SAMPLE_RATE, 0) else 0;
+        try tl.add(allocator, t.text, t.language, @as(f64, @floatFromInt(start)) / rate, @as(f64, @floatFromInt(end - start)) / rate, if (timed) |x| x.words else null, if (timed) |x| x.segments else null, speaker);
         start = end;
     }
 
@@ -7773,6 +7793,11 @@ fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: []con
             const response = try tl.subtitles(allocator, form.format);
             defer allocator.free(response);
             try sendResponse(stream, "200 OK", "text/plain; charset=utf-8", response);
+        },
+        .diarized_json => {
+            const response = try tl.diarizedJson(allocator, seconds);
+            defer allocator.free(response);
+            try sendResponse(stream, "200 OK", "application/json", response);
         },
     }
 }
@@ -7831,29 +7856,32 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
 /// languages its config lists, and the model once loaded (refcounted).
 const Aligner = struct { id: []const u8, languages: u32, lm: ?*LoadedModel = null };
 
-/// A Qwen3-ForcedAligner the server knows of, the resident one first, one
-/// that failed to load never; null when none is on disk.
-fn findAligner(allocator: std.mem.Allocator) !?Aligner {
+/// The model of one `arch_hint` a transcription leans on (the aligner, the
+/// diarizer): the resident one first, one that failed to load never; null
+/// when none is on disk.
+fn findCompanion(arch_hint: []const u8) ?*LoadedModel {
     const registry = global_registry orelse return null;
+    registry.mutex.lockUncancelable(registry.io);
+    defer registry.mutex.unlock(registry.io);
     var pick: ?*LoadedModel = null;
-    {
-        registry.mutex.lockUncancelable(registry.io);
-        defer registry.mutex.unlock(registry.io);
-        var it = registry.entries.valueIterator();
-        while (it.next()) |e| {
-            if (!std.mem.eql(u8, e.*.arch_hint, "qwen3_forced_aligner") or e.*.state == .error_state) continue;
-            const p = pick orelse {
-                pick = e.*;
-                continue;
-            };
-            const ready = e.*.state == .ready;
-            if (ready != (p.state == .ready)) {
-                if (ready) pick = e.*;
-            } else if (std.mem.lessThan(u8, e.*.id, p.id)) pick = e.*;
-        }
+    var it = registry.entries.valueIterator();
+    while (it.next()) |e| {
+        if (!std.mem.eql(u8, e.*.arch_hint, arch_hint) or e.*.state == .error_state) continue;
+        const p = pick orelse {
+            pick = e.*;
+            continue;
+        };
+        const ready = e.*.state == .ready;
+        if (ready != (p.state == .ready)) {
+            if (ready) pick = e.*;
+        } else if (std.mem.lessThan(u8, e.*.id, p.id)) pick = e.*;
     }
-    const entry = pick orelse return null;
-    var config = model_mod.parseConfig(registry.io, allocator, entry.path) catch return null;
+    return pick;
+}
+
+fn findAligner(allocator: std.mem.Allocator) !?Aligner {
+    const entry = findCompanion("qwen3_forced_aligner") orelse return null;
+    var config = model_mod.parseConfig(global_registry.?.io, allocator, entry.path) catch return null;
     defer config.deinit(allocator);
     const fa = config.forced_aligner orelse return null;
     return .{ .id = entry.id, .languages = fa.languages };
@@ -7869,9 +7897,10 @@ const Aligned = struct {
     }
 };
 
-/// Time the words of `text` (the transcript of `pcm`) with the aligner `lm`.
-/// Null when it already sent the error.
-fn alignPiece(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm: []const f32, text: []const u8, language: []const u8) !?Aligned {
+/// Time the words of `text` (the transcript of `pcm`, `offset_ms` into the
+/// clip) with the aligner `lm`, a segment closing where `who` hears the
+/// speaker change. Null when it already sent the error.
+fn alignPiece(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm: []const f32, text: []const u8, language: []const u8, who: ?transcription_mod.Activity, offset_ms: u64) !?Aligned {
     const config = lm.config.?;
     const fa = config.forced_aligner.?;
     const script = forced_align_mod.scriptFor(language);
@@ -7916,7 +7945,9 @@ fn alignPiece(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm
     }
     const words = try forced_align_mod.timedWords(allocator, units, ms, script);
     errdefer allocator.free(words);
-    const segments = try forced_align_mod.segments(allocator, text, words);
+    const said_by = if (who) |w| try w.wordSpeakers(allocator, words, offset_ms) else null;
+    defer if (said_by) |x| allocator.free(x);
+    const segments = try forced_align_mod.segments(allocator, text, words, said_by);
     log.info("  aligned {d} words into {d} segments ({d} tokens, {d}ms)\n", .{ words.len, segments.len, ids.len, timer.read() / std.time.ns_per_ms });
     return .{ .words = words, .segments = segments };
 }
@@ -7940,6 +7971,40 @@ fn alignJobRun(ctx: *anyopaque) void {
     };
 }
 
+/// Speaker activity over `pcm` from the diarizer `lm`, on the inference thread.
+/// Null when it already sent the error.
+fn diarizeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm: []const f32) !?[]f32 {
+    var job = DiarizeJob{ .allocator = allocator, .engine = lm.diarization_engine.?, .pcm = pcm };
+    var timer = Stopwatch.init(stream.io);
+    var req = scheduler_mod.GenRequest{ .ctx = &job, .run = diarizeJobRun, .model = lm };
+    global_scheduler.?.runGeneration(&req) catch |err| {
+        if (err != error.Shutdown) return err;
+        try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503);
+        return null;
+    };
+    const probs = job.probs orelse {
+        try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "speaker diarization failed", 500);
+        return null;
+    };
+    log.info("  diarized {d:.1} s ({d}ms)\n", .{ @as(f64, @floatFromInt(pcm.len)) / transcription_mod.SAMPLE_RATE, timer.read() / std.time.ns_per_ms });
+    return probs;
+}
+
+const DiarizeJob = struct {
+    allocator: std.mem.Allocator,
+    engine: *diarization_mod.Engine,
+    pcm: []const f32,
+    probs: ?[]f32 = null,
+};
+
+fn diarizeJobRun(ctx: *anyopaque) void {
+    const job: *DiarizeJob = @ptrCast(@alignCast(ctx));
+    job.probs = job.engine.diarize(job.allocator, job.pcm) catch |err| {
+        log.err("  diarization failed: {s}\n", .{@errorName(err)});
+        return;
+    };
+}
+
 /// Dispatch a media-generation request to the inference thread. `lm` is the
 /// already-resolved + refcounted model (so it can't be evicted mid-gen). The
 /// generation runs on the scheduler's inference thread (the sole mlx caller);
@@ -7955,6 +8020,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
         .video => lm.video_engine != null,
         .mesh => lm.mesh_engine != null,
         .decision => lm.decision_engine != null,
+        .diarization => lm.diarization_engine != null,
     };
     if (!ok) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this modality. Load the matching image/audio/video/3D/decision model and target it by id.", 400);

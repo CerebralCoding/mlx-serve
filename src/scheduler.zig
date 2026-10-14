@@ -40,6 +40,7 @@ const tokenizer_mod = @import("tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("reasoning_protocol.zig");
 const gen_mod = @import("gen.zig");
+const diarization_mod = @import("nemotron_diarization.zig");
 const gen_sse = @import("gen_sse.zig");
 const drafter_mod = @import("drafter.zig");
 const mtp_graft = @import("mtp_graft.zig");
@@ -2317,7 +2318,7 @@ pub const Scheduler = struct {
     pub fn idleModelToUnload(self: *Scheduler, keep: []const u8) ?[]const u8 {
         self.registry.mutex.lockUncancelable(self.io);
         defer self.registry.mutex.unlock(self.io);
-        const entry = self.registry.pickLruEvictable(keep) orelse return null;
+        const entry = self.registry.pickLruEvictable(keep, false) orelse return null;
         return entry.id;
     }
 
@@ -3328,6 +3329,7 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
         .video => entry.video_engine = try gen_mod.VideoEngine.load(sch.io, sch.allocator, params.model_dir),
         .mesh => entry.mesh_engine = try gen_mod.MeshEngine.load(sch.io, sch.allocator, params.model_dir),
         .decision => entry.decision_engine = try gen_mod.DecisionEngine.load(sch.io, sch.allocator, params.model_dir),
+        .diarization => entry.diarization_engine = try diarization_mod.Engine.load(sch.io, sch.allocator, params.model_dir),
     }
 
     // Install stub CPU state (infallible from here, mirroring the ds4 path).

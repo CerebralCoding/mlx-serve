@@ -98,6 +98,12 @@ pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
     return null;
 }
 
+/// Models a transcription leans on that serve no request of their own: the
+/// forced aligner and the speaker diarizer.
+pub fn isTranscriptionCompanion(model_type: []const u8) bool {
+    return std.mem.eql(u8, model_type, "qwen3_forced_aligner") or std.mem.eql(u8, model_type, "nemotron_diarization");
+}
+
 pub fn isMediaModelType(model_type: []const u8) bool {
     return std.mem.startsWith(u8, model_type, "flux2") or
         std.mem.startsWith(u8, model_type, "krea") or
@@ -116,6 +122,7 @@ pub fn isMediaModelType(model_type: []const u8) bool {
         std.mem.eql(u8, model_type, "kev") or
         std.mem.eql(u8, model_type, "clef") or
         std.mem.eql(u8, model_type, "d1") or
+        std.mem.eql(u8, model_type, "nemotron_diarization") or
         std.mem.startsWith(u8, model_type, "hunyuan3d");
 }
 
@@ -583,6 +590,7 @@ pub const ModelKind = enum {
     video,
     mesh,
     decision,
+    diarization,
     embed,
     drafter,
     unsupported,
@@ -596,6 +604,7 @@ pub const ModelKind = enum {
             .video => "video",
             .mesh => "3d",
             .decision => "decision",
+            .diarization => "diarizer",
             .embed => "embed",
             .drafter => "drafter",
             .unsupported => "unsupported",
@@ -611,6 +620,7 @@ pub const ModelKind = enum {
             .video => "a video generation model",
             .mesh => "a 3D generation model",
             .decision => "a typed-decision model (use /v1/decisions)",
+            .diarization => "a speaker diarizer (it labels the speakers of /v1/audio/transcriptions with response_format=diarized_json)",
             .embed => "an embedding encoder (use /v1/embeddings)",
             .drafter => "a speculative-decoding drafter sidecar, not a standalone model (load it via --drafter beside a Gemma 4 target)",
             .unsupported => "an architecture mlx-serve does not support",
@@ -648,6 +658,7 @@ pub fn modelKindFromType(model_type: []const u8) ModelKind {
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
+    if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
     if (std.mem.eql(u8, model_type, "gguf")) return .chat;
     if (isSupportedModelType(model_type)) return .chat;
     return .unsupported;

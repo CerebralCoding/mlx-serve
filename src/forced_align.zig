@@ -209,42 +209,46 @@ pub fn timedWords(a: std.mem.Allocator, us: []const Unit, ms: []const u32, scrip
     return out.toOwnedSlice(a);
 }
 
-/// Words shown together, `start..end` their text with its punctuation.
-pub const Segment = Timed;
+/// Words shown together, `start..end` their text with its punctuation, and
+/// who said them when the speakers are known.
+pub const Segment = struct { start_ms: u32, end_ms: u32, start: usize, end: usize, speaker: u8 = 0 };
 
 const PAUSE_MS = 1000;
 const MAX_SEGMENT_MS = 10_000;
 
 /// Words into segments: one closes after a word whose trailing punctuation ends
-/// a sentence, before a pause of a second, or before it would pass ten seconds.
-/// Each runs to the next, so every character of `text` lands in one.
-pub fn segments(a: std.mem.Allocator, text: []const u8, words: []const Timed) ![]Segment {
+/// a sentence, before a pause of a second, before it would pass ten seconds, or
+/// where the speaker changes (`speakers`, one per word). Each runs to the next,
+/// so every character of `text` lands in one.
+pub fn segments(a: std.mem.Allocator, text: []const u8, words: []const Timed, speakers: ?[]const u8) ![]Segment {
     var out = std.ArrayList(Segment).empty;
     errdefer out.deinit(a);
     var first: usize = 0;
     var lo: usize = 0;
     for (words, 0..) |w, k| {
-        if (k > first and (w.start_ms -| words[k - 1].end_ms >= PAUSE_MS or w.end_ms -| words[first].start_ms > MAX_SEGMENT_MS)) {
-            lo = try close(a, &out, text, words[first..k], lo, punctuationEnd(text, words[k - 1].end));
+        const turn = if (speakers) |who| who[k] != who[k - @intFromBool(k > 0)] else false;
+        if (k > first and (turn or w.start_ms -| words[k - 1].end_ms >= PAUSE_MS or w.end_ms -| words[first].start_ms > MAX_SEGMENT_MS)) {
+            lo = try close(a, &out, text, words[first..k], lo, punctuationEnd(text, words[k - 1].end), speakers, first);
             first = k;
         }
         const tail = punctuationEnd(text, w.end);
         if (std.mem.indexOfAny(u8, text[w.end..tail], ".!?") != null or containsAny(text[w.end..tail], &.{ "…", "。", "！", "？" })) {
-            lo = try close(a, &out, text, words[first .. k + 1], lo, tail);
+            lo = try close(a, &out, text, words[first .. k + 1], lo, tail, speakers, first);
             first = k + 1;
         }
     }
-    if (first < words.len) _ = try close(a, &out, text, words[first..], lo, text.len);
+    if (first < words.len) _ = try close(a, &out, text, words[first..], lo, text.len, speakers, first);
     return out.toOwnedSlice(a);
 }
 
-/// Append the segment of `ws` spanning `text[lo..hi]` (trimmed); returns `hi`.
-fn close(a: std.mem.Allocator, out: *std.ArrayList(Segment), text: []const u8, ws: []const Timed, lo: usize, hi: usize) !usize {
+/// Append the segment of `ws` (from word `first`) spanning `text[lo..hi]`
+/// (trimmed); returns `hi`.
+fn close(a: std.mem.Allocator, out: *std.ArrayList(Segment), text: []const u8, ws: []const Timed, lo: usize, hi: usize, speakers: ?[]const u8, first: usize) !usize {
     var s = lo;
     var e = hi;
     while (s < e and std.ascii.isWhitespace(text[s])) s += 1;
     while (e > s and std.ascii.isWhitespace(text[e - 1])) e -= 1;
-    try out.append(a, .{ .start_ms = ws[0].start_ms, .end_ms = ws[ws.len - 1].end_ms, .start = s, .end = e });
+    try out.append(a, .{ .start_ms = ws[0].start_ms, .end_ms = ws[ws.len - 1].end_ms, .start = s, .end = e, .speaker = if (speakers) |who| who[first] else 0 });
     return hi;
 }
 
@@ -384,7 +388,7 @@ test "segments: a sentence end, a pause or ten seconds closes one, punctuation k
     const ms = [_]u32{ 0, 100, 100, 200, 200, 400, 500, 600, 600, 700, 2000, 2200, 2200, 2400, 2500, 2700 };
     const words = try timedWords(testing.allocator, us, &ms, .spaced);
     defer testing.allocator.free(words);
-    const segs = try segments(testing.allocator, text, words);
+    const segs = try segments(testing.allocator, text, words, null);
     defer testing.allocator.free(segs);
     const want = [_]struct { []const u8, u32, u32 }{ .{ "The quick fox.", 0, 400 }, .{ "It ran", 500, 700 }, .{ "away, fast!", 2000, 2400 }, .{ "¿Qué?", 2500, 2700 } };
     try testing.expectEqual(want.len, segs.len);
@@ -405,12 +409,29 @@ test "segments: a sentence end, a pause or ten seconds closes one, punctuation k
     }
     const lw = try timedWords(testing.allocator, lu, &lms, .spaced);
     defer testing.allocator.free(lw);
-    const ls = try segments(testing.allocator, long, lw);
+    const ls = try segments(testing.allocator, long, lw, null);
     defer testing.allocator.free(ls);
     try testing.expectEqual(@as(usize, 2), ls.len);
     try testing.expectEqualStrings("a b c d e f g h i j", long[ls[0].start..ls[0].end]);
     try testing.expectEqual(@as(u32, 10_000), ls[0].end_ms);
     try testing.expectEqualStrings("k l", long[ls[1].start..ls[1].end]);
+}
+
+test "segments: a change of speaker closes one too, and names its speaker" {
+    const text = "Okay, so we start now";
+    const us = try units(testing.allocator, text, .spaced);
+    defer freeUnits(testing.allocator, us);
+    const ms = [_]u32{ 0, 300, 300, 500, 600, 800, 800, 1000, 1000, 1200 };
+    const words = try timedWords(testing.allocator, us, &ms, .spaced);
+    defer testing.allocator.free(words);
+    const segs = try segments(testing.allocator, text, words, &.{ 1, 1, 0, 0, 0 });
+    defer testing.allocator.free(segs);
+    try testing.expectEqual(@as(usize, 2), segs.len);
+    try testing.expectEqualStrings("Okay, so", text[segs[0].start..segs[0].end]);
+    try testing.expectEqual(@as(u8, 1), segs[0].speaker);
+    try testing.expectEqualStrings("we start now", text[segs[1].start..segs[1].end]);
+    try testing.expectEqual(@as(u8, 0), segs[1].speaker);
+    try testing.expectEqual(@as(u32, 600), segs[1].start_ms);
 }
 
 // Parity vs the EXECUTED reference: mlx-audio's aligner on the pack's own
