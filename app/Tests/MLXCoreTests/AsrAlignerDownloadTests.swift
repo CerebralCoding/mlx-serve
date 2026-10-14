@@ -1,7 +1,7 @@
 import XCTest
 @testable import MLXCore
 
-/// A Qwen3-ASR download brings the forced aligner the server times words with.
+/// A Qwen3-ASR download brings the forced aligner the server times words with, and the diarizer it labels speakers with.
 final class AsrAlignerDownloadTests: XCTestCase {
     private func pack(_ config: String?) throws -> String {
         let dir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString).path
@@ -22,5 +22,6 @@ final class AsrAlignerDownloadTests: XCTestCase {
         XCTAssertNil(DownloadManager.markerModelType(inDir: asr))
         XCTAssertEqual(DownloadManager.markerModelType(inDir: aligner), "qwen3_forced_aligner")
         XCTAssertEqual(DownloadManager.alignerRepo, "mlx-community/Qwen3-ForcedAligner-0.6B-8bit")
+        XCTAssertEqual(DownloadManager.diarizerRepo, "mlx-community/Nemotron-3-Diarization-8bit")
     }
 }

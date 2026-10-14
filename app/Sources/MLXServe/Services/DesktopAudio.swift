@@ -1,21 +1,21 @@
 import AVFoundation
 import CoreAudio
 
-/// Everything the Mac plays, through a Core Audio process tap, collected as
+/// Everything the Mac plays, through a Core Audio process tap, written as
 /// 16 kHz mono like `AudioRecorder`. macOS asks for System Audio Recording
 /// the first time it starts.
 final class DesktopAudio {
-    private let lock = NSLock()
     private let queue = DispatchQueue(label: "mlx-serve.desktop-audio")
-    private var samples: [Float] = []
     private var tap = AudioObjectID(kAudioObjectUnknown)
     private var device = AudioObjectID(kAudioObjectUnknown)
     private var proc: AudioDeviceIOProcID?
+    /// Where the next samples land, read and cleared on `queue`.
+    private var offset: Int?
 
-    /// Collect from `offset` samples into the recording; silence fills the gap.
-    func start(at offset: Int) throws {
+    /// Write into `file` from sample `offset` of the recording; silence fills the gap.
+    func start(at offset: Int, into file: RecordingFile) throws {
         stop()
-        lock.withLock { samples += repeatElement(0, count: max(0, offset - samples.count)) }
+        self.offset = offset
         do {
             let description = CATapDescription(stereoGlobalTapButExcludeProcesses: [])
             description.uuid = UUID()
@@ -40,7 +40,8 @@ final class DesktopAudio {
             try check(AudioDeviceCreateIOProcIDWithBlock(&proc, device, queue) { [weak self] _, data, _, _, _ in
                 guard let self, let buffer = AVAudioPCMBuffer(pcmFormat: input, bufferListNoCopy: data, deallocator: nil),
                       let out = AudioRecorder.resample(buffer, with: converter), let ch = out.floatChannelData else { return }
-                lock.withLock { self.samples.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength))) }
+                file.write(UnsafeBufferPointer(start: ch[0], count: Int(out.frameLength)), at: self.offset)
+                self.offset = nil
             })
             try check(AudioDeviceStart(device, proc))
         } catch {
@@ -49,7 +50,6 @@ final class DesktopAudio {
         }
     }
 
-    /// Stop collecting; what was collected stays for `take()`.
     func stop() {
         if let proc {
             AudioDeviceStop(device, proc)
@@ -58,15 +58,6 @@ final class DesktopAudio {
         if device != kAudioObjectUnknown { AudioHardwareDestroyAggregateDevice(device) }
         if tap != kAudioObjectUnknown { AudioHardwareDestroyProcessTap(tap) }
         (proc, device, tap) = (nil, AudioObjectID(kAudioObjectUnknown), AudioObjectID(kAudioObjectUnknown))
-    }
-
-    /// Stop, and hand over everything collected.
-    func take() -> [Float] {
-        stop()
-        return lock.withLock {
-            defer { samples = [] }
-            return samples
-        }
     }
 
     private func check(_ status: OSStatus) throws {

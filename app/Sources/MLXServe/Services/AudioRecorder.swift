@@ -20,6 +20,10 @@ final class AudioRecorder: ObservableObject {
     private var converter: AVAudioConverter?
     private let lock = NSLock()
     private var samples: [Float] = []   // accumulated 16 kHz mono float32
+    private var captured = 0
+    /// When set before `start()`, samples go here instead of into memory, and
+    /// `stop()` returns nil: a long recording that streams to disk.
+    var sink: ((UnsafeBufferPointer<Float>) -> Void)?
 
     /// Ask for mic permission (returns the granted state). Safe to call repeatedly.
     static func requestPermission() async -> Bool {
@@ -36,7 +40,7 @@ final class AudioRecorder: ObservableObject {
     /// Begin capturing. Throws if the engine can't start (no input device, etc.).
     func start() throws {
         guard !isRecording else { return }
-        lock.lock(); samples.removeAll(keepingCapacity: true); lock.unlock()
+        lock.lock(); samples.removeAll(keepingCapacity: true); captured = 0; lock.unlock()
         DispatchQueue.main.async { self.duration = 0; self.level = 0 }
 
         let input = engine.inputNode
@@ -78,8 +82,10 @@ final class AudioRecorder: ObservableObject {
         let n = Int(out.frameLength)
 
         lock.lock()
-        samples.append(contentsOf: UnsafeBufferPointer(start: ch[0], count: n))
-        let total = samples.count
+        let chunk = UnsafeBufferPointer(start: ch[0], count: n)
+        if let sink { sink(chunk) } else { samples.append(contentsOf: chunk) }
+        captured += n
+        let total = captured
         lock.unlock()
 
         var sumSq: Float = 0

@@ -98,7 +98,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
-    "stable_audio3", "clef", "d1", "yue2",
+    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {

@@ -163,10 +163,11 @@ struct SettingsView: View {
 
         SettingsSection(
             category: .voice,
-            subtitle: "Your wake phrase for hands-free mode and an optional voice clip it answers in."
+            subtitle: "Your wake phrase and voice for hands-free mode, and how meeting transcripts start, stop and get their notes."
         ) {
             WakePhraseSectionContent()
             VoiceCloneSectionContent()
+            TranscribeSectionContent()
         }
 
         SettingsSection(
@@ -2482,6 +2483,54 @@ private struct WakePhraseSectionContent: View {
                 Text(L10n.text(Self.explainer))
                     .font(.app(.caption2)).foregroundStyle(.secondary)
             }
+        }
+    }
+}
+
+// MARK: - Transcribe section
+
+/// The tray Transcript's settings: which model writes the meeting notes, when a
+/// recording stops by itself and when one starts by itself. App-side like the
+/// voice fields, so never a restart.
+private struct TranscribeSectionContent: View {
+    @EnvironmentObject var appState: AppState
+
+    private var pickable: [LocalModel] { appState.localModels.filter(\.isChatPickable) }
+
+    /// A chosen model that is gone shows as the fallback it gets: the chat model in use.
+    private var notesModel: Binding<String> {
+        Binding(get: {
+            let v = appState.serverOptions.transcriptNotesModel
+            return v == ServerOptions.notesOff || pickable.contains(where: { $0.path == v }) ? v : ""
+        }, set: { appState.serverOptions.transcriptNotesModel = $0 })
+    }
+
+    var body: some View {
+        SettingsRow(title: "Meeting notes", explainer: "The model that writes a title, summary, decisions and action items above each transcript.") {
+            Picker("", selection: notesModel) {
+                Text(L10n.text("Chat model in use")).font(.app(.body)).tag("")
+                Text(L10n.text("Off")).font(.app(.body)).tag(ServerOptions.notesOff)
+                ForEach(pickable) { model in
+                    Text(model.displayLabel).font(.app(.body)).tag(model.path)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 220).font(.app(.body))
+        }
+        SettingsRow(title: "Stop after silence", explainer: "Ends a recording when nothing has been heard for this long, then transcribes it.") {
+            Picker("", selection: $appState.serverOptions.transcriptAutoStopMinutes) {
+                Text(L10n.text("Never")).font(.app(.body)).tag(0)
+                ForEach([5, 10, 15, 30, 60], id: \.self) { minutes in
+                    Text(L10n.format("%d minutes", minutes)).font(.app(.body)).tag(minutes)
+                }
+            }
+            .labelsHidden()
+            .frame(width: 140).font(.app(.body))
+        }
+        SettingsRow(title: "Start when the camera turns on", explainer: "Starts a transcript when an app such as Zoom, Teams or FaceTime turns on your camera.") {
+            Toggle("", isOn: $appState.serverOptions.transcriptAutoStartCamera)
+                .labelsHidden()
+                .toggleStyle(.switch).font(.app(.body))
         }
     }
 }

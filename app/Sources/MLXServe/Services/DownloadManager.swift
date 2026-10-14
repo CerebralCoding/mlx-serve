@@ -934,7 +934,7 @@ class DownloadManager: ObservableObject {
             await self?.download(repoId: repoId)
             self?.finalizeIfCancelled(repoId: repoId)
             await self?.autoFillSocket(for: repoId)
-            await self?.fetchAligner(for: repoId)
+            await self?.fetchCompanions(for: repoId)
             self?.activeTasks.removeValue(forKey: repoId)
             onFinish()
         }
@@ -1066,10 +1066,12 @@ class DownloadManager: ObservableObject {
         try? file.save()
     }
 
-    // MARK: - Qwen3-ASR's forced aligner
+    // MARK: - Qwen3-ASR's companions
 
     /// The model the server times transcripts with (verbose_json, srt, vtt).
     nonisolated static let alignerRepo = "mlx-community/Qwen3-ForcedAligner-0.6B-8bit"
+    /// The model it labels their speakers with (diarized_json).
+    nonisolated static let diarizerRepo = "mlx-community/Nemotron-3-Diarization-8bit"
 
     /// The thinker's model_type in a Qwen3-ASR pack: `qwen3_asr`, or `qwen3_forced_aligner` for its
     /// aligner, whose root says `qwen3_asr` too. Nil for any other model.
@@ -1080,14 +1082,15 @@ class DownloadManager: ObservableObject {
         return (cfg["thinker_config"] as? [String: Any])?["model_type"] as? String
     }
 
-    /// A fresh Qwen3-ASR download brings the aligner beside it, into the same
-    /// root the server discovers it in. Failures stay silent: the user asked
-    /// for the ASR, which serves without it.
-    private func fetchAligner(for repoId: String) async {
+    /// A fresh Qwen3-ASR download brings the aligner and the diarizer beside
+    /// it, into the same root the server discovers them in. Failures stay
+    /// silent: the user asked for the ASR, which serves without them.
+    private func fetchCompanions(for repoId: String) async {
         guard !Task.isCancelled, downloads[repoId]?.status == .completed,
-              let dir = existingModelDir(for: repoId), Self.qwen3AsrThinker(dir) == "qwen3_asr",
-              existingModelDir(for: Self.alignerRepo) == nil else { return }
-        await download(repoId: Self.alignerRepo, alertOnFailure: false)
+              let dir = existingModelDir(for: repoId), Self.qwen3AsrThinker(dir) == "qwen3_asr" else { return }
+        for repo in [Self.alignerRepo, Self.diarizerRepo] where existingModelDir(for: repo) == nil {
+            await download(repoId: repo, alertOnFailure: false)
+        }
     }
 
     // MARK: - Turbo LoRA (on demand)
