@@ -648,6 +648,12 @@ pub fn defaultEnableMtp(mtp_loaded: bool, dsv4_stages: bool) bool {
     return mtp_loaded or dsv4_stages;
 }
 
+/// MTP verify rounds cost more than they save without the Metal verify
+/// kernels: plain decode is faster on CUDA and Vulkan unless `--mtp` asks for it.
+pub fn mtpAllowedByDefault(mtp_forced: bool) bool {
+    return mtp_forced or mlx.metalKernelsAvailable();
+}
+
 /// Does this model serve DeepSeek-V4 or V4.1 with DSpark draft stages loaded?
 fn dsv4DraftStages(lm: *LoadedModel) bool {
     if (lm.config) |cfg| if (cfg.mtp_override == false) return false;
@@ -24904,6 +24910,11 @@ test "resolveKvAttnFusedPure: explicit > mode; auto keys on scheme + crossover" 
     try t.expect(!resolveKvAttnFusedPure(.auto, null, KV_ATTN_AUTO_CROSSOVER_TOKENS - 1, .affine));
     // Auto never engages off (no triples to consume).
     try t.expect(!resolveKvAttnFusedPure(.auto, null, 1 << 20, .off));
+}
+
+test "MTP is off by default where the Metal verify kernels cannot run" {
+    try std.testing.expectEqual(mlx.metalKernelsAvailable(), mtpAllowedByDefault(false));
+    try std.testing.expect(mtpAllowedByDefault(true));
 }
 
 test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {
