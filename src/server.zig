@@ -2144,7 +2144,7 @@ pub fn serve(
     const pinned = pinAutoContext(@constCast(config));
     if (manualContext(config) > 0) {
         log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
-    } else if (config.dsv41_stream) {
+    } else if (config.mlxStream()) {
         log.info("Context size: {d} tokens (the streaming pack's standard request; --ctx-size widens it)\n", .{getEffectiveContextLength(config)});
     } else {
         const memory_ctx = computeMemoryContext(config);
@@ -3555,7 +3555,7 @@ fn liveSessions(registry: *ModelRegistry, buf: *[2 * instr.MAX_SESSIONS]instr.Se
 }
 
 fn getEffectiveContextLength(config: *const model_mod.ModelConfig) u32 {
-    if (config.dsv41_stream) return mlx_stream.contextLength(config);
+    if (config.mlxStream()) return mlx_stream.contextLength(config);
     if (manualContext(config) > 0) return manualContext(config);
     if (config.pinned_context > 0) return config.pinned_context;
     // Not pinned yet (a discovery stub that was never loaded): compute from
@@ -6271,7 +6271,7 @@ pub fn prefillNeededAtChunk(
     const hidden: u64 = config.hidden_size;
     const ffn: u64 = prefillFfnWidth(config);
     if (is_dsv4) return dsv4PrefillMemoryNeeded(seq, layers, kv_heads * hdim, hidden, ffn, dsv4_mod.prefillSub(), config.prefillAttnKeys(seq));
-    if (config.dsv41_stream) return 0; // billed at construction (`mlx_stream.loadBytes`)
+    if (config.mlxStream()) return 0; // billed at construction (`mlx_stream.loadBytes`)
     if (config.isDsv41()) return dsv41PrefillMemoryNeeded(config, seq, chunk);
     const drafter: u64 = (seq +| @min(@as(u64, max_tokens), transformer_mod.KVCache.RESERVE_GEN_HEADROOM)) *| config.drafter_ctx_bytes_per_token;
     if (config.isGlm5()) return glm5PrefillMemoryNeeded(config, seq, max_tokens, kv_bits, chunk, warm) +| drafter;
@@ -8410,7 +8410,7 @@ fn propsSettingsFor(lm: *LoadedModel) PropsSettings {
 fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
     const config = lm.config.?;
     const kv = configuredKvQuantFor(config);
-    const native = if (lm.transformer) |x| x.dsv41_ext else null;
+    const native = if (lm.transformer) |x| x.mlx_stream_ext else null;
     return .{
         .engine = "mlx",
         .kv_quant = if (lm.llama_engine != null) @tagName(llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
@@ -25102,7 +25102,7 @@ test "native speculation: resolved opt-out gates capability and API defaults" {
     xfm.config = cfg;
     xfm.dsv4 = null;
     xfm.dsv41 = &native;
-    xfm.dsv41_ext = null;
+    xfm.mlx_stream_ext = null;
     xfm.dense_attn_proj = false;
     var lm: LoadedModel = undefined;
     lm.config = &cfg;

@@ -3724,7 +3724,7 @@ test "pleTableBill: the GPU arm bills the n-gram table, embedded shards included
 fn residentModelDiskBytes(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, config: *const model_mod.ModelConfig) !u64 {
     if (config.exl3 != null and (config.isGlm5() or config.isMimo())) return sushi_pack.residentBytes(io, std.heap.page_allocator, model_dir, config);
     const total = modelDiskBytes(io, model_dir);
-    if (config.dsv41_stream) return mlx_stream.loadBytes(allocator, io, config);
+    if (config.mlxStream()) return mlx_stream.loadBytes(allocator, io, config);
     if (config.isDsv41()) return dsv41_mod.residentDiskBytes(allocator, model_dir, config, total);
     if (!config.isQwen4() or config.embedded_ple_payload_bytes == null) return total;
     const info = (try @import("qwen4_exp.zig").inspectEmbedded(model_dir, try model_mod.qwen4EmbeddedSpec(config))) orelse return error.MissingEmbeddedNgramTable;
@@ -7739,7 +7739,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
-        (slot.model.transformer.?.dsv4 != null or slot.model.transformer.?.dsv41 != null or slot.model.transformer.?.dsv41_ext != null);
+        (slot.model.transformer.?.dsv4 != null or slot.model.transformer.?.dsv41 != null or slot.model.transformer.?.mlx_stream_ext != null);
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(
@@ -7798,7 +7798,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
     const resumed: u64 = if (xfm_ptr.dsv41) |mdl|
         try dsv41_mod.resumePrompt(mdl, slot.full_prompt)
-    else if (xfm_ptr.dsv41_ext) |m|
+    else if (xfm_ptr.mlx_stream_ext) |m|
         try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
     else
         0;

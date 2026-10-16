@@ -1214,8 +1214,9 @@ pub const ModelRegistry = struct {
         mlx_stream.setForeignBytes(self.streamForeignBytesLocked());
     }
 
-    /// What every ready model except a streaming pack holds: the plugin bills only its own bytes, and its
-    /// footprint reads are the whole process's. Caller holds `mutex`.
+    /// What every ready model except the DeepSeek-V4.1 stream pack holds: the plugin bills only its own bytes, and its
+    /// footprint reads are the whole process's. Only DeepSeek-V4.1's module reads the value, so only its own pack is
+    /// left out; a MiMo stream pack's bytes are foreign to it. Caller holds `mutex`.
     pub fn streamForeignBytesLocked(self: *ModelRegistry) u64 {
         var sum: u64 = 0;
         var it = self.entries.valueIterator();
@@ -1923,10 +1924,16 @@ test "ModelRegistry: the streaming pack's foreign bytes are every other ready mo
     defer stream.config = null; // borrowed: the registry frees the configs it owns
     _ = try makeReadyStub(reg, "krea", 14_730_000_000);
     _ = try reg.registerStub("yue2", "yue2", 4_000_000_000); // discovered, never loaded
+    // A second stream pack (MiMo) is foreign to DeepSeek-V4.1's module, the only reader of the value.
+    var mimo_cfg = ModelConfig{};
+    mimo_cfg.mimo_stream = true;
+    const mimo = try makeReadyStub(reg, "mimo", 9_000_000_000);
+    mimo.config = &mimo_cfg;
+    defer mimo.config = null;
 
     reg.mutex.lockUncancelable(reg.io);
     defer reg.mutex.unlock(reg.io);
-    try testing.expectEqual(@as(u64, 14_730_000_000), reg.streamForeignBytesLocked());
+    try testing.expectEqual(@as(u64, 14_730_000_000 + 9_000_000_000), reg.streamForeignBytesLocked());
 }
 
 test "ModelRegistry: ensureLoaded fails on unloaded stub" {
