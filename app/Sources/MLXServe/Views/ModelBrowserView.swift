@@ -1538,18 +1538,18 @@ private struct ModelBrowserRow: View {
         return CustomMediaModels.bundle(arch: arch, repoId: model.id)
     }
 
-    /// Start (or resume) this row's download. The media arm also asks the
-    /// running server to rescan afterward — boot-time discovery can't see a
-    /// model downloaded mid-session, and the media panes' "On This Mac" rows
-    /// read `/v1/models`.
+    /// Start (or resume) this row's download, then ask the running server to
+    /// rescan: boot-time discovery can't see a model downloaded mid-session,
+    /// and `/v1/models` is what the media panes and API clients read.
     private func startDownload() {
+        let finished: @MainActor () -> Void = {
+            appState.refreshModels()
+            server.rescanModels()
+        }
         if let b = mediaBundle {
-            downloads.startBundle(b) {
-                appState.refreshModels()
-                server.rescanModels()
-            }
+            downloads.startBundle(b, onFinish: finished)
         } else {
-            downloads.start(repoId: model.id) { appState.refreshModels() }
+            downloads.start(repoId: model.id, onFinish: finished)
         }
     }
 
