@@ -402,5 +402,11 @@ bruns = " ".join(str(s.get("run", "")) for s in bsteps)
 for f in ("Formula/mlx-serve.rb", "Casks/mlx-serve.rb"):
     check(f in bruns, f"homebrew.yml updates {f}")
 
+# ── The formula moves lib/* into libexec/, so every library the binary links
+# through its rpaths must be repointed there; the server links libmlx directly.
+formula = open("Formula/mlx-serve.rb").read()
+check(re.search(r'"@rpath/libmlx\.dylib",\s*"#\{libexec\}/libmlx\.dylib",\s*"#\{bin\}/mlx-serve"', formula),
+      "formula repoints the binary's @rpath/libmlx.dylib into libexec")
+
 sys.exit(FAIL)
 EOF

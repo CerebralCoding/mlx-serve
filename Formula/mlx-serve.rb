@@ -30,6 +30,12 @@ class MlxServe < Formula
            "#{libexec}/libmlx.dylib",
            "#{libexec}/libmlxc.dylib"
 
+    # The server also links libmlx directly, through rpaths that reach neither bin/ nor libexec/.
+    system "install_name_tool", "-change",
+           "@rpath/libmlx.dylib",
+           "#{libexec}/libmlx.dylib",
+           "#{bin}/mlx-serve"
+
     # libwebp ships bundled with install_name @executable_path/lib/libwebp.dylib;
     # repoint to libexec since Homebrew splits bin/ and libexec/.
     if File.exist?("#{libexec}/libwebp.dylib")
