@@ -3180,7 +3180,6 @@ fn doLoadDs4OnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.vision_encoder = null;
     sch.drafter = null;
     sch.dflash = null;
-    sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
     if (hot_cache_budget_invalidate) |f| f();
 }
@@ -3270,7 +3269,6 @@ fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.vision_encoder = null;
     sch.drafter = null;
     sch.dflash = null;
-    sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
     if (hot_cache_budget_invalidate) |f| f();
 }
@@ -3649,7 +3647,6 @@ fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mo
     sch.vision_encoder = null;
     sch.drafter = null;
     sch.dflash = null;
-    sch.hot_prefix_cache = null;
     publishHotCacheResidency(sch);
     if (hot_cache_budget_invalidate) |f| f();
 }
@@ -5305,7 +5302,10 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     sch.vision_encoder = vision_ptr;
     sch.drafter = drafter_ptr;
     sch.dflash = dflash_ptr;
-    if (entry.prefix_cache) |*hc| sch.hot_prefix_cache = hc;
+    // The connection thread bills chat against the view, so a model that cannot chat never takes it.
+    if (entry.prefix_cache) |*hc| {
+        if (ModelRegistry.chatCapable(entry)) sch.hot_prefix_cache = hc;
+    }
     publishHotCacheResidency(sch);
 }
 
@@ -5321,7 +5321,9 @@ pub const BudgetRevise = struct { exclude_bytes: u64 = 0, quiet: bool = false };
 /// load-time clamp read the machine with the other models on it and was never revisited, so
 /// a model loaded beside a large one kept a ~0 budget for life. Each cache's own resident
 /// entries are excluded from the read so a full cache cannot ratchet itself down.
-fn reviseHotCacheBudgets(sch: *Scheduler) void {
+/// `grow_only`: the free figure lags an unload's freed pages, so a revise that follows one may
+/// raise a budget but never lower it; lowering evicts entries the settled figure would keep.
+fn reviseHotCacheBudgets(sch: *Scheduler, grow_only: bool) void {
     const resolve = sch.prefix_cache_mem_resolver orelse return;
     sch.registry.mutex.lockUncancelable(sch.io);
     // The resolver publishes the process-global budget the admission guard reads, so the
@@ -5336,12 +5338,32 @@ fn reviseHotCacheBudgets(sch: *Scheduler) void {
             if (!hc.ram_enabled) continue;
             const config = entry.config orelse continue;
             var idle: u64 = 0;
-            hc.setBudget(resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle));
+            const budget = resolve(config, sch.prefix_cache_mem_bytes, .{ .exclude_bytes = hc.residentBytes(), .quiet = true }, &idle);
+            if (grow_only and prefix_cache_mod.HotPrefixCache.budgetShrinks(hc.max_kv_bytes, budget)) continue;
+            hc.setBudget(budget);
             hc.ssd_idle_mem = idle;
         }
     }
     sch.registry.mutex.unlock(sch.io);
     publishHotCacheResidency(sch);
+}
+
+/// The view must not outlive its cache: before `leaving`'s cache is freed, hand the view to
+/// another resident chat model's, the default's when it has one, or to none.
+fn moveHotCacheViewOff(sch: *Scheduler, leaving: *LoadedModel) void {
+    const view = sch.hot_prefix_cache orelse return;
+    if (leaving.prefix_cache == null or view != &leaving.prefix_cache.?) return;
+    sch.hot_prefix_cache = null;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (entry == leaving or entry.state != .ready or !ModelRegistry.chatCapable(entry)) continue;
+        const hc = if (entry.prefix_cache) |*h| h else continue;
+        sch.hot_prefix_cache = hc;
+        if (std.mem.eql(u8, sch.registry.default_id, entry.id)) break;
+    }
 }
 
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
@@ -5543,7 +5565,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         _ = drainSideQueues(sch);
         if (load_req) |req| runLoadRequest(sch, req);
         if (unload_req) |req| runUnloadRequest(sch, req);
-        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch);
+        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch, load_req == null);
         if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
         if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
         if (chatPass(sch, .main) == .shutdown) break;
@@ -5692,7 +5714,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
 
     if (sch.budget_revise_sw) |sw| {
         if (sw.read() > BUDGET_REVISE_WINDOW_NS) sch.budget_revise_sw = null;
-        if (n_prefill > 0) reviseHotCacheBudgets(sch);
+        if (n_prefill > 0) reviseHotCacheBudgets(sch, true);
     }
 
     // 2. Prefill each pending slot (heavy; mlx ops on this thread).
@@ -6057,6 +6079,7 @@ fn evictResident(sch: *Scheduler, victims: []const *LoadedModel) void {
             victim.id,
             @as(f64, @floatFromInt(victim_bytes)) / 1_073_741_824.0,
         });
+        moveHotCacheViewOff(sch, victim);
         victim.unloadResident();
         sch.registry.mutex.lockUncancelable(sch.io);
         sch.registry.accountEvictedLocked(victim_bytes);
@@ -6339,6 +6362,7 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         entry.id,
         @as(f64, @floatFromInt(bytes)) / 1_073_741_824.0,
     });
+    moveHotCacheViewOff(sch, entry);
     entry.unloadResident();
     // unloadResident freed the arrays into MLX's allocator cache — clear it
     // so the unload actually returns the memory to the OS (the whole point
@@ -6354,10 +6378,9 @@ fn runUnloadRequest(sch: *Scheduler, req: *UnloadRequest) void {
         sch.vision_encoder = null;
         sch.drafter = null;
         sch.dflash = null;
-        sch.hot_prefix_cache = null;
-        publishHotCacheResidency(sch);
         if (hot_cache_budget_invalidate) |f| f();
     }
+    publishHotCacheResidency(sch);
     sch.registry.mutex.lockUncancelable(sch.io);
     sch.registry.accountEvictedLocked(bytes);
     sch.registry.finalizeEvictionLocked(entry);
@@ -12239,3 +12262,86 @@ test "aneServes: plain sampling only; a grammar, a penalty, logprobs or a forced
     // A thinking budget is not enforced, but the answer is still the model's own.
     try testing.expect(aneServes(.{ .think_bound = @ptrFromInt(8) }, 0, false));
 }
+
+test "hot-cache view: a model's cache leaving takes the view with it, to the default chat model first" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    var chat_cfg = model_mod.ModelConfig{};
+    chat_cfg.model_type = "qwen3_5";
+    var tts_cfg = model_mod.ModelConfig{};
+    tts_cfg.model_type = "kokoro";
+    const a = try reg.registerStub("a", "/m/a", 64);
+    const b = try reg.registerStub("b", "/m/b", 64);
+    const c = try reg.registerStub("c", "/m/c", 64);
+    const tts = try reg.registerStub("tts", "/m/tts", 64);
+    defer for ([_]*LoadedModel{ a, b, c, tts }) |e| {
+        e.config = null;
+    };
+    for ([_]*LoadedModel{ a, b, c, tts }) |e| {
+        e.config = &chat_cfg;
+        e.state = .ready;
+        e.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    }
+    tts.config = &tts_cfg;
+    reg.default_id = "c";
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = reg.io;
+
+    // Another model leaving does not touch the view.
+    sch.hot_prefix_cache = &a.prefix_cache.?;
+    moveHotCacheViewOff(&sch, b);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, &a.prefix_cache.?), sch.hot_prefix_cache);
+    // The owner leaving hands it to the default chat model, never to a media model.
+    moveHotCacheViewOff(&sch, a);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, &c.prefix_cache.?), sch.hot_prefix_cache);
+    // With no other chat model resident, the view is dropped, never left on a freed cache.
+    b.state = .unloaded;
+    a.state = .unloaded;
+    moveHotCacheViewOff(&sch, c);
+    try testing.expectEqual(@as(?*prefix_cache_mod.HotPrefixCache, null), sch.hot_prefix_cache);
+}
+
+fn budget200Mb(_: *model_mod.ModelConfig, _: u64, _: BudgetRevise, idle: *u64) u64 {
+    idle.* = 0;
+    return 200 << 20;
+}
+
+test "hot-cache view: a revise that follows an unload raises a budget but never lowers it" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 4, 0, null);
+    defer reg.deinit();
+    var cfg = model_mod.ModelConfig{};
+    cfg.model_type = "qwen3_5";
+    const m = try reg.registerStub("m", "/m/m", 64);
+    defer m.config = null;
+    m.config = &cfg;
+    m.state = .ready;
+    m.prefix_cache = prefix_cache_mod.HotPrefixCache.init(testing.allocator, 4);
+    const hc = &m.prefix_cache.?;
+    var sch: Scheduler = undefined;
+    sch.registry = reg;
+    sch.io = reg.io;
+    sch.allocator = testing.allocator;
+    sch.current_model = null;
+    sch.hot_prefix_cache = null;
+    sch.prefix_cache_mem_resolver = budget200Mb;
+    sch.prefix_cache_mem_bytes = 0;
+    sch.metrics = null;
+    sch.digest_mu = .init;
+    sch.hot_cache_digests = &.{};
+    sch.digest_residency = 0;
+    sch.resident_hot_cache_bytes = std.atomic.Value(u64).init(0);
+    sch.reclaimable_hot_cache_bytes = std.atomic.Value(u64).init(0);
+
+    hc.max_kv_bytes = 600 << 20;
+    reviseHotCacheBudgets(&sch, true);
+    try testing.expectEqual(@as(u64, 600 << 20), hc.max_kv_bytes);
+    hc.max_kv_bytes = 100 << 20;
+    reviseHotCacheBudgets(&sch, true);
+    try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
+    // A load's revise is honest both ways.
+    hc.max_kv_bytes = 600 << 20;
+    reviseHotCacheBudgets(&sch, false);
+    try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
+}
+

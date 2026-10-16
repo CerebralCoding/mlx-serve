@@ -2687,6 +2687,23 @@ Fix: before refusing, `checkAttentionMemory` unloads idle resident models least 
 after each, via `fitAfterUnloadingIdle`.
 Guard: `a prompt that does not fit unloads idle models, oldest first, until it fits` (server.zig).
 
+## An embedding model's load hid the chat model's warm cache (#854)
+
+Defect: with bge-small loaded beside a chat model, the next agent turn was refused right after the
+previous one ended (`~0MB resident hot cache`), then the make-room unload emptied the chat model's
+cache, the conversation's checkpoint included.
+
+Cause: every load pointed `sch.hot_prefix_cache` at the loaded model's cache (an encoder's, a TTS
+model's), and the gen, ds4 and llama.cpp loaders cleared it. The connection thread bills residency
+and digests from that view, so the chat model's warm entry read as 0 and the turn billed cold. The
+revise after the unload then lowered the budget on a free figure read mid-unload.
+
+Fix: only a chat-capable MLX load takes the view; before a model's cache is freed (unload or
+load-time eviction) `moveHotCacheViewOff` hands it to the default chat model's cache, or any resident
+one, or none; a revise that follows an unload only raises budgets (`budgetShrinks`).
+Guard: `hot-cache view: a model's cache leaving takes the view with it, to the default chat model first`
+and `hot-cache view: a revise that follows an unload raises a budget but never lowers it` (scheduler.zig).
+
 ## A 16 GB Mac advertised 870 tokens beside a big model (2026-10-11)
 
 Defect: on an M4 16 GB, Qwen3.5-9B (7.6 GB) auto-sized to 870 tokens, gemma-4-e4b 8-bit to 870 and

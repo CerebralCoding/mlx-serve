@@ -1350,7 +1350,7 @@ pub const ModelRegistry = struct {
     /// Can this READY entry serve chat/completions? Media models (image/
     /// audio/video/mesh — identified by model_type, so no engine pointers
     /// are needed), embedding encoders and audio-tower trunks cannot.
-    fn chatCapable(entry: *const LoadedModel) bool {
+    pub fn chatCapable(entry: *const LoadedModel) bool {
         const cfg = entry.config orelse return false;
         if (cfg.is_encoder_only or cfg.qwen_audio != null) return false;
         if (model_discovery.isMediaModelType(cfg.model_type)) return false;
