@@ -596,6 +596,10 @@ else
         summary=$(grep -E '\[disk-cache\] shutdown persist:' "$LOGFILE" || true)
         if [ -n "$summary" ]; then
             echo -e "${GREEN}PASS${NC} $1: summary logged:$(echo "$summary" | sed 's/.*shutdown persist://')"
+            # The idle flush can finish both sessions before the signal; then SIGTERM wrote nothing.
+            if [ "$whole" = 2 ] && echo "$summary" | grep -qE 'persist: 0 written'; then
+                echo -e "${YELLOW}WARN${NC} $1: both sessions were whole before SIGTERM, so its write path did not run"
+            fi
         else
             echo -e "${RED}FAIL${NC} $1: no 'shutdown persist:' summary line"; FAIL=1
         fi
