@@ -114,10 +114,16 @@ if [[ "$MLX_BACKEND" == cuda ]]; then
     git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-sdpa-head-dim-256-512.patch"
   fi
   echo "== patch mlx: CUDA quantized matmul reads the weights once for all rows and batches"
-  if grep -q 'can_use_qmv && (M \* B == 1)' "$MLX_SOURCE/mlx/backend/cuda/quantized/quantized.cpp"; then
+  if grep -q 'fold the batches into rows' "$MLX_SOURCE/mlx/backend/cuda/quantized/quantized.cpp"; then
     echo "   qmm: already applied"
   else
     git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-qmm-read-weights-once.patch"
+  fi
+  echo "== patch mlx: CUDA mat-vec rows kernel (GB10 default, MLX_CUDA_QMV_MAX_ROWS)"
+  if grep -q 'qmv_rows_kernel' "$MLX_SOURCE/mlx/backend/cuda/quantized/qmm/qmv.cu"; then
+    echo "   qmv rows: already applied"
+  else
+    git -C "$MLX_SOURCE" apply -p1 "$ROOT/patches/mlx-cuda-qmv-rows.patch"
   fi
 fi
 
