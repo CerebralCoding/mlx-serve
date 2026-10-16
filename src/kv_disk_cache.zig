@@ -76,6 +76,13 @@ pub fn mediaSharedBound(a: []const MediaSpan, b: []const MediaSpan) usize {
     return std.math.maxInt(usize);
 }
 
+/// The spans whose rows lie inside `[0, len)`.
+pub fn spansBelow(spans: []const MediaSpan, len: usize) []const MediaSpan {
+    var n: usize = 0;
+    while (n < spans.len and spans[n].start < len) n += 1;
+    return spans[0..n];
+}
+
 /// Restoring from disk only happens when it beats the best RAM match by at
 /// least this many tokens — a disk read + rebuild is only worth it when it
 /// replaces a meaningful amount of prefill.
@@ -507,7 +514,8 @@ pub const DiskTier = struct {
         self.space_probe = testSpaceProbe;
     }
 
-    /// Arm the background writer (SSD-first only). A spawn failure keeps the synchronous path.
+    /// Arm the background writer (both arms; set `ssd_first` first). A spawn failure keeps the
+    /// synchronous path.
     pub fn enableBackgroundWriter(self: *DiskTier) void {
         if (self.writer != null) return;
         const w = self.allocator.create(disk_writer.Writer) catch return;
@@ -519,8 +527,9 @@ pub const DiskTier = struct {
         };
         self.writer = w;
         // With the write off-thread the only inference-thread cost is the readback, and the
-        // bound is no longer a correctness cliff (checkpoints ride outside it).
-        self.max_flush_bytes = SSD_FIRST_READBACK_BYTES;
+        // bound is no longer a correctness cliff (checkpoints ride outside it). RAM-first keeps
+        // its bound: an idle slice is what a request arriving mid-flush waits for.
+        if (self.ssd_first) self.max_flush_bytes = SSD_FIRST_READBACK_BYTES;
         log.info("[disk-cache] background writer armed (permit {d} MB, readback bound {d} MB/flush)\n", .{
             w.permit_bytes / (1024 * 1024),
             self.max_flush_bytes / (1024 * 1024),
@@ -595,6 +604,19 @@ pub const DiskTier = struct {
             if (e.id != id) continue;
             if (!e.poisoned) self.poisonEntry(e, err_name);
             return true;
+        }
+        return false;
+    }
+
+    /// Would a commit of this record resume an entry a failed write invalidated? Attributes the
+    /// writer's failures first. A flush gives such a record up instead of rewriting it in a loop.
+    pub fn resumesPoisoned(self: *DiskTier, tokens: []const u32, has_tools: bool, media: []const MediaSpan, config: kv_quant.KVQuantConfig) bool {
+        _ = self.harvestWriteFailures();
+        const media_in = spansBelow(media, tokens.len);
+        for (self.entries.items) |*e| {
+            if (!e.poisoned or e.has_tools != has_tools or !std.meta.eql(e.quant, config)) continue;
+            const n = @min(e.tokens.len, tokens.len);
+            if (mediaSharedBound(e.media, media_in) >= n and std.mem.eql(u32, e.tokens[0..n], tokens[0..n])) return true;
         }
         return false;
     }
@@ -1432,7 +1454,7 @@ pub const DiskTier = struct {
         //
         // A fresh entry may inherit its leading whole chunks from a resident entry that shares a
         // prefix, by hard link: a persisted entry's tokens are `prompt ++ generated`, so the next
-        // turn diverges inside the generated span and used to rewrite every chunk. SSD-first only.
+        // turn diverges inside the generated span and used to rewrite every chunk. Off on a synchronous RAM-first tier.
         const old_kv: u32 = if (extend_idx) |i| self.entries.items[i].kv_len else 0;
         const donor = if (extend_idx == null) self.chunkShareDonor(tokens, kv_target, has_tools, config, media) else null;
         var inherited: u32 = if (extend_idx) |i| self.entries.items[i].inherited_chunks else if (donor) |d| d.chunks else 0;
@@ -2777,9 +2799,9 @@ pub const DiskTier = struct {
 
     /// The resident entry whose leading chunk files a new entry for `tokens` may hard-link:
     /// same tool flag and kv-quant config, most whole chunks below the common prefix. Null on
-    /// the legacy arm or under `MLX_SERVE_SSD_CHUNK_SHARE=0`.
+    /// a synchronous RAM-first tier or under `MLX_SERVE_SSD_CHUNK_SHARE=0`.
     fn chunkShareDonor(self: *DiskTier, tokens: []const u32, kv_target: u32, has_tools: bool, config: kv_quant.KVQuantConfig, media: []const MediaSpan) ?ChunkDonor {
-        if (!self.ssd_first or !chunkShareEnabled()) return null;
+        if (!(self.ssd_first or self.writer != null) or !chunkShareEnabled()) return null;
         // `media` (v9): chunks may only be linked below the point where the two
         // span lists can diverge — above it the donor's rows describe different
         // pixels, not this commit's state.
@@ -7528,26 +7550,32 @@ test "DiskTier v9: a bounded write-through commit keeps its spans, so a restore 
 
     var tier = try DiskTier.init(testing.allocator, io, base, "fp-wt-media", 0, 128);
     defer tier.deinit();
+    // The write-through hook runs only on an SSD-first tier with its background writer.
+    tier.ssd_first = true;
+    tier.armTestSpace(1024 * 1024 * 1024 * 1024, 2048 * 1024 * 1024 * 1024);
+    tier.enableBackgroundWriter();
+    try testing.expect(tier.writer != null);
     var cache = try KVCache.init(testing.allocator, 3);
     defer cache.deinit();
-    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
-    var tokens: [600]u32 = undefined;
+    try fillCache(&cache, s, 3, 700, 8, 0.0, .float32);
+    var tokens: [700]u32 = undefined;
     for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
-    const spans = [_]MediaSpan{.{ .start = 100, .key = 0xA0 }};
+    const spans = [_]MediaSpan{.{ .start = 200, .key = 0xA0 }};
 
     // The write-through hook's form: one chunk per call, the spans below the chunk boundary.
-    for ([_]usize{ 128, 256 }) |boundary| {
+    for ([_]usize{ 512, 640 }) |boundary| {
         _ = try tier.appendCommitBounded(cache.entries, boundary, cache.config, tokens[0..boundary], false, &spans, null, s, 1);
+        tier.drainWriter();
     }
     var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-wt-media", 0, 128);
     defer tier2.deinit();
     try testing.expectEqual(@as(usize, 1), tier2.entryCount());
     try testing.expectEqualSlices(MediaSpan, &spans, tier2.entries.items[0].media);
     const kv = tier2.entries.items[0].kv_len;
-    try testing.expect(kv > 100);
+    try testing.expect(kv > 200);
     const dense = kv_quant.KVQuantConfig.dense;
     try testing.expectEqual(kv, tier2.bestMatch(&tokens, false, dense, &spans).?.usable);
-    try testing.expectEqual(@as(u32, 100), tier2.bestMatch(&tokens, false, dense, &.{.{ .start = 100, .key = 0xB1 }}).?.usable);
+    try testing.expectEqual(@as(u32, 200), tier2.bestMatch(&tokens, false, dense, &.{.{ .start = 200, .key = 0xB1 }}).?.usable);
 }
 
 test "DiskTier v9: supersede and extend are media-gated; chunk share clamps at divergence" {
