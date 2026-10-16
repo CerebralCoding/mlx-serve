@@ -46,7 +46,7 @@ pub const VisionPreproc = struct {
     /// `gemma_budget` (Gemma 4's own processor, as EmbeddingGemma 2 uses it: a CHW image of any
     /// aspect ratio sized to `max_tokens` soft tokens), or one of the patch-grid towers
     /// (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget, radio } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
@@ -77,14 +77,13 @@ pub const AudioData = struct {
     samples: []const u8, // Raw float32-LE bytes (n_samples * 4)
 };
 
-/// Qwen3-VL video: pre-patchified pixel_values for ALL `grid_t` temporal-patch
-/// groups, concatenated (see `qwen_vision.buildPixelValuesVideo` /
-/// `QwenVision.forwardVideo`) — the video-equivalent of `ImageData.pixels`'s
-/// Qwen merge-order layout. `grid_t` is a TEMPORAL PATCH count (raw sampled
-/// frames grouped `tps`-at-a-time), not a raw frame count; `grid_h`/`grid_w`
-/// are the shared per-frame patch grid every frame in the video was resized to.
+/// Qwen3-VL stores pre-patchified pixel values for every temporal-patch group.
+/// `grid_t` is that group count and `grid_h` / `grid_w` are the shared patch grid.
+/// RADIO stores concatenated float32 CHW frames. `grid_t` is the raw frame count
+/// (the encoder repeats a short last tubelet) and `grid_h` / `grid_w` are the
+/// shared pixel size.
 pub const VideoData = struct {
-    pixels: []const u8, // merge-order patches [grid_t*(grid_h*grid_w)*feat*4]
+    pixels: []const u8,
     grid_t: u32,
     grid_h: u32,
     grid_w: u32,
@@ -163,6 +162,8 @@ pub const ChatConfig = struct {
     /// `templateRendersToolTurn` for this template, probed ONCE at load (a probe render
     /// per request is a second parse of a multi-KB template); null = unknown, probe.
     renders_tool_turn: ?bool = null,
+    /// A model-specific video atom emitted only for an attached media part.
+    video_placeholder: ?[]const u8 = null,
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
@@ -603,6 +604,65 @@ pub fn decodeViaLlama(
         try out.appendSlice(allocator, piece);
     }
     return out.toOwnedSlice(allocator);
+}
+
+fn radioTestTokenizer(allocator: std.mem.Allocator) !Tokenizer {
+    var tok = Tokenizer.initEmptyForTests(allocator, .byte_level_bpe);
+    errdefer tok.deinit();
+    for (tok.byte_to_unicode, 0..) |cp, byte| {
+        var buf: [4]u8 = undefined;
+        const n = try std.unicode.utf8Encode(cp, &buf);
+        const text = try allocator.dupe(u8, buf[0..n]);
+        try tok.vocab.put(text, @intCast(byte));
+        try tok.id_to_token.put(@intCast(byte), text);
+        try tok.unicode_to_byte.put(cp, @intCast(byte));
+    }
+    for ([_][]const u8{ "<image>", "<img>", "</img>" }, 1000..) |name, id| {
+        const text = try allocator.dupe(u8, name);
+        try tok.special_tokens.put(text, @intCast(id));
+        try tok.id_to_token.put(@intCast(id), text);
+    }
+    return tok;
+}
+
+test "RADIO video placeholders: literal HTML stays text in every role" {
+    const a = std.testing.allocator;
+    var tok = try radioTestTokenizer(a);
+    defer tok.deinit();
+    const config = ChatConfig{
+        .chat_template = "{% for m in messages %}{{ m.role + ':' }}{% if m.content is string %}{{ m.content }}{% else %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'video' %}{{ '<video>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endif %}{% endfor %}",
+        .bos_token = null, .eos_token = null, .add_bos_token = false,
+        .allocator = a, .renders_tool_turn = true, .video_placeholder = "<img>",
+    };
+    for ([_][]const u8{ "system", "user", "assistant", "tool" }) |role| {
+        const messages = [_]Message{.{ .role = role, .content = "How do I autoplay a <video> element?" }};
+        const ids = try formatChat(a, &tok, &messages, &config, null, null, true, null, false);
+        defer a.free(ids);
+        try std.testing.expectEqual(@as(usize, 0), std.mem.count(u32, ids, &.{1001}));
+        const text = try tok.decode(a, ids, false);
+        defer a.free(text);
+        try std.testing.expect(std.mem.indexOf(u8, text, "<video>") != null);
+    }
+}
+
+test "RADIO video placeholders: only attached clips create video atoms" {
+    const a = std.testing.allocator;
+    var tok = try radioTestTokenizer(a);
+    defer tok.deinit();
+    const config = ChatConfig{
+        .chat_template = "{% for m in messages %}{% for p in m.content %}{% if p.type == 'image' %}{{ '<image>' }}{% elif p.type == 'video' %}{{ '<video>' }}{% elif p.type == 'text' %}{{ p.text }}{% endif %}{% endfor %}{% endfor %}",
+        .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .video_placeholder = "<img>",
+    };
+    const clips = [_]VideoData{.{ .pixels = "", .grid_t = 128, .grid_h = 32, .grid_w = 32 }};
+    const images = [_]ImageData{.{ .pixels = "", .width = 32, .height = 32 }};
+    const messages = [_]Message{.{ .role = "user", .content = "Explain this <video> element and the clip.", .images = &images, .videos = &clips }};
+    const ids = try formatChat(a, &tok, &messages, &config, null, null, true, null, false);
+    defer a.free(ids);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{1001}));
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{1000}));
+    const text = try tok.decode(a, ids, false);
+    defer a.free(text);
+    try std.testing.expect(std.mem.indexOf(u8, text, "<video>") != null);
 }
 
 /// Render the Jinja chat template with the given messages.
@@ -1088,7 +1148,7 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
 }
 
 pub fn serializeMessagesJsonOpts(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, false);
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, false, null);
 }
 
 /// K2-Horizon's template raises on an assistant turn with NO thinking field,
@@ -1099,7 +1159,7 @@ fn templateRequiresReasoningField(tpl: []const u8) bool {
 }
 
 pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, chat_config: *const ChatConfig) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template));
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.video_placeholder);
 }
 
 pub fn messageHasMedia(msg: Message) bool {
@@ -1117,7 +1177,7 @@ pub fn isImageItemStart(img: ImageData) bool {
 /// Media as content parts, so the model's own template renders one
 /// placeholder per item where the message sits: images, videos, audio (the
 /// order the server encodes them), then the text.
-fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), msg: Message) !void {
+fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), msg: Message, video_placeholder: ?[]const u8) !void {
     try buf.append(allocator, '[');
     var first = true;
     for (msg.images orelse &[_]ImageData{}) |img| {
@@ -1129,7 +1189,11 @@ fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8)
     for (msg.videos orelse &[_]VideoData{}) |_| {
         if (!first) try buf.append(allocator, ',');
         first = false;
-        try buf.appendSlice(allocator, "{\"type\":\"video\"}");
+        if (video_placeholder) |atom| {
+            try buf.appendSlice(allocator, "{\"type\":\"text\",\"text\":");
+            try appendJsonString(allocator, buf, atom);
+            try buf.append(allocator, '}');
+        } else try buf.appendSlice(allocator, "{\"type\":\"video\"}");
     }
     for (msg.audio orelse &[_]AudioData{}) |_| {
         if (!first) try buf.append(allocator, ',');
@@ -1144,7 +1208,7 @@ fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8)
     try buf.append(allocator, ']');
 }
 
-fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool) ![]const u8 {
+fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool, video_placeholder: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -1156,7 +1220,7 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
 
         try buf.appendSlice(allocator, ",\"content\":");
         if (messageHasMedia(msg)) {
-            try appendMediaContentParts(allocator, &buf, msg);
+            try appendMediaContentParts(allocator, &buf, msg, video_placeholder);
         } else if (msg.content.len > 0) {
             try appendJsonString(allocator, &buf, msg.content);
         } else switch (empty_content) {

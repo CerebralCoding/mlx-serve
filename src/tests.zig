@@ -33,6 +33,7 @@ test {
     _ = @import("transformer.zig");
     _ = @import("vision.zig");
     _ = @import("qwen_vision.zig");
+    _ = @import("radio_vision.zig");
     _ = @import("muse_vision.zig");
     _ = @import("lfm2_vision.zig");
     _ = @import("glm_vision.zig");
@@ -83,6 +84,7 @@ test {
     _ = @import("load_progress.zig");
     _ = @import("drafter.zig");
     _ = @import("dflash.zig");
+    _ = @import("lilicorr.zig");
     _ = @import("dflash_policy.zig");
     _ = @import("mtp.zig");
     _ = @import("round_cost.zig");

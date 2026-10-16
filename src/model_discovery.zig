@@ -43,8 +43,10 @@ const supported_model_types = [_][]const u8{
     "qwen3_moe_text",   "qwen3_next",
     "qwen4_exp", "qwen4_exp_text", // Qwen3.8-Flash-Next (GDN + QSA + n-gram PLE MoE)
     "llama",     "mistral",
-    "lfm2", "lfm2_vl", "lfm2_moe", // any other "lfm2*" passes by prefix, as model.zig parses it
+    "lfm2",       "lfm2_vl", "lfm2_moe", // any other "lfm2*" passes by prefix, as model.zig parses it
     "nemotron_h",
+    "nemotron_h_puzzle", // Nemotron 3.5 Bolt language tower (latent heterogeneous MoE)
+    "nemotron_h_omni", // Bolt omni wrapper; language config is llm_config
     "bert",
     "deepseek_v4",
     "deepseek_v41", // DeepSeek-V4.1-Flash (src/deepseek_v41.zig; the EXL3 repack on mlx-stream)
@@ -1289,6 +1291,14 @@ fn jsonU32(obj: std.json.ObjectMap, key: []const u8) u32 {
     return 0;
 }
 
+/// RADIO's native checkpoint discriminator, shared by discovery and the model loader.
+pub fn hasRadioVision(root: std.json.ObjectMap) bool {
+    const vc = root.get("vision_config") orelse return false;
+    if (vc != .object) return false;
+    const mt = vc.object.get("model_type") orelse return false;
+    return mt == .string and std.mem.eql(u8, mt.string, "radio");
+}
+
 /// Pure: extract `StubMeta` from raw config.json bytes. `has_chat_template` is
 /// supplied by the caller (the template lives outside config.json), and
 /// determines chat/tool capabilities — gated off for encoder-only (`bert`)
@@ -1310,9 +1320,9 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // `model.zig parseConfigFromJson` does. Reading the root alone made
     // /v1/models report hidden=0 / layers=0 / ctx=0 / is_moe=false for every
     // unloaded Gemma 3/4 and Qwen-VL model.
-    // Qwen3-ASR nests it one level deeper, under `thinker_config`.
+    // Qwen3-ASR nests under `thinker_config`; Nemotron omni uses `llm_config`.
     const thinker: ?std.json.ObjectMap = if (root.get("thinker_config")) |t| (if (t == .object) t.object else null) else null;
-    const text_cfg: ?std.json.ObjectMap = if (root.get("text_config") orelse if (thinker) |t| t.get("text_config") else null) |tc|
+    const text_cfg: ?std.json.ObjectMap = if (root.get("text_config") orelse root.get("llm_config") orelse if (thinker) |t| t.get("text_config") else null) |tc|
         (if (tc == .object) tc.object else null)
     else
         null;
@@ -1329,6 +1339,17 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     meta.vocab_size = cfgU32(root, text_cfg, "vocab_size");
     meta.hidden_size = cfgU32(root, text_cfg, "hidden_size");
     meta.num_hidden_layers = cfgU32(root, text_cfg, "num_hidden_layers");
+    if (meta.num_hidden_layers == 0) {
+        const tc = text_cfg orelse root;
+        if (tc.get("layers_block_type") orelse tc.get("block_configs") orelse tc.get("hybrid_override_pattern")) |layers| {
+            const count = switch (layers) {
+                .array => |arr| arr.items.len,
+                .string => |str| str.len,
+                else => 0,
+            };
+            meta.num_hidden_layers = std.math.cast(u32, count) orelse 0;
+        }
+    }
     meta.max_position_embeddings = cfgU32(root, text_cfg, "max_position_embeddings");
     if (root.get("quantization")) |q| {
         if (q == .object) meta.quant_bits = jsonU32(q.object, "bits");
@@ -1343,7 +1364,10 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     // Vision: a `vision_config` block on a non-`_text` arch (the `_text` guard
     // skips text-only quantized checkpoints with a vestigial block).
     meta.has_vision = root.get("vision_config") != null and !std.mem.endsWith(u8, mt, "_text");
-    meta.has_video = meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0;
+    const nemotron = std.mem.eql(u8, mt, "nemotron_h") or std.mem.eql(u8, mt, "nemotron_h_puzzle") or std.mem.eql(u8, mt, "nemotron_h_omni");
+    const radio = nemotron and hasRadioVision(root);
+    if (nemotron) meta.has_vision = radio;
+    meta.has_video = (meta.has_vision and cfgU32(root, text_cfg, "video_token_id") > 0) or radio;
     meta.is_aligner = isForcedAligner(root);
     meta.has_transcription = std.mem.eql(u8, mt, "qwen3_asr") and !meta.is_aligner;
     const bidirectional = blk: {
@@ -2272,6 +2296,20 @@ test "a Qwen3-ForcedAligner pack is discovered as the aligner, never as an ASR" 
     try testing.expectEqualStrings("qwen3_forced_aligner", peek.supported);
 }
 
+test "parseStubMeta reads the native Nemotron omni language config" {
+    const m = parseStubMeta(testing.allocator,
+        \\{"model_type":"nemotron_h_omni","vision_config":{"model_type":"radio"},
+        \\"llm_config":{"model_type":"nemotron_h_puzzle","hidden_size":4096,
+        \\"vocab_size":131072,"max_position_embeddings":262144,"num_experts":496,
+        \\"layers_block_type":["mamba","moe","attention"]}}
+    , true);
+    try testing.expect(m.found and m.has_vision and m.has_video and m.is_moe);
+    try testing.expectEqual(@as(u32, 4096), m.hidden_size);
+    try testing.expectEqual(@as(u32, 131072), m.vocab_size);
+    try testing.expectEqual(@as(u32, 262144), m.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 3), m.num_hidden_layers);
+}
+
 test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
     const a = testing.allocator;
     // MoE chat model (Qwen3-Coder-30B-A3B shape), chat template present.
@@ -2375,6 +2413,16 @@ test "parseStubMeta extracts dims/ctx/quant/MoE + chat/vision capabilities" {
         // The trained window the loaded row reports (model.zig), not the trunk's 262144.
         try testing.expectEqual(@as(u32, 8192), m.max_position_embeddings);
         try testing.expect(isSupportedModelType("embedding_gemma2"));
+    }
+    // RADIO video has no video_token_id; its native tower discriminator supplies the capability.
+    {
+        const on = parseStubMeta(a, "{\"model_type\":\"nemotron_h_omni\",\"vision_config\":{\"model_type\":\"radio\"}}", true);
+        try testing.expect(on.has_vision);
+        try testing.expect(on.has_video);
+        const off = parseStubMeta(a, "{\"model_type\":\"nemotron_h\",\"vision_config\":{}}", true);
+        try testing.expect(!off.has_vision and !off.has_video);
+        const flag = parseStubMeta(a, "{\"model_type\":\"nemotron_h\",\"radio_vision\":true}", true);
+        try testing.expect(!flag.has_vision and !flag.has_video);
     }
     // A MULTIMODAL checkpoint keeps every text dim under `text_config` — the
     // root carries only model_type / vision_config / quantization. Reading the

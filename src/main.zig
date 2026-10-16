@@ -1454,6 +1454,7 @@ pub fn main(init: std.process.Init) !void {
         scheduler_mod.applyModelSettings(config, chat_config, &settings, enable_mtp);
     }
     config.applyTokenizer(tok, chat_config.eos_token);
+    if (config.radio_vision) chat_config.video_placeholder = "<img>";
 
     const load_vision = config.has_vision and !no_vision;
 

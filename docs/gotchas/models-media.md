@@ -2,6 +2,18 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+### RADIO configuration and numerics must follow the checkpoint
+
+Defect: native omni packs loaded text-only. Cause: vision keyed on a private `radio_vision` flag instead of `vision_config.model_type: "radio"`. Fix: loader and discovery share `model_discovery.hasRadioVision`; preprocessing follows the official float32 antialiased bicubic and float32 CPE (PIL's uint8 step moved pixels). Guards: native RADIO config tests, format corpus, the executed fp32 fixtures (cosine plus RMS ratio).
+
+### Native Nemotron wrappers retain more than an architecture tag
+
+Defect: Super's `nemotron_h_omni` pack was hidden in the app and failed to load. Cause: exact type lists and flat `backbone`/`mlp1` names. Fix: the language wrapper and `mlp1.layers` projector resolve from the checkpoint's names, quantization per linear; the native config's final vision LayerNorm before pixel shuffle is required. Guards: picker/type parity tests, nested/flat forwards, Super RADIO fixtures.
+
+### A LiLiCorr drafter can own its output head
+
+Defect: Super's drafter proposed through the target's head. Cause: DFlash ignored `has_own_lm_head`. Fix: a declared head is loaded and validated (geometry, token space) and used only for proposals; verify keeps the target head. Separately, `/v1/messages` dropped DFlash because it checked only the Gemma slot: all four surfaces now share `requestEnableDrafter`. Guards: native config corpus, head forwards, malformed-head tests, HTTP defaults on all four APIs.
+
 ### Metaspace `prepend_scheme: "first"` read as "always" (Mistral v0.3)
 The laya port added HF `Metaspace` support and treated every scheme except `never` as `always`, so Mistral's SentencePiece tokenizer got a ▁ after every special token (`[INST]Use` -> `▁Use`; HF gives `Use`). HF's `first` only prepends to text at original offset 0, and `always` does it per segment after added-token extraction.
 - Found by the smoke matrix: every Mistral cell's prompt grew 11 tokens. Part of that was CORRECT: 26.9.5 dropped every `\n` on byte-fallback tokenizers (no `<0x0A>`), which the same port fixed.

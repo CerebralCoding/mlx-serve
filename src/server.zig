@@ -22,6 +22,7 @@ const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const glm_vision = @import("glm_vision.zig");
+const radio_vision = @import("radio_vision.zig");
 const minicpm_vision = @import("minicpm_vision.zig");
 const minicpm_canvas = @import("minicpm_canvas.zig");
 const mrope_mod = @import("mrope.zig");
@@ -5776,8 +5777,11 @@ fn prefillStreamBytesPerTokenOn(config: *const model_mod.ModelConfig, nax: bool)
     }
     if (config.isMoe()) {
         const top_k: u64 = @max(@as(u64, config.num_experts_per_tok), 1);
+        // Puzzle experts contract in the latent width. The router and the
+        // shared expert stay on hidden_size and are not this replica.
+        const expert_in: u64 = if (config.moe_latent_size > 0) config.moe_latent_size else config.hidden_size;
         per_tok += MOE_PREFILL_COEXIST * top_k * 2 *
-            (@as(u64, config.hidden_size) + config.moe_intermediate_size) * 2;
+            (expert_in + config.moe_intermediate_size) * 2;
     }
     return per_tok;
 }
@@ -7143,6 +7147,12 @@ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
     return std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses");
 }
 
+fn loadedSupportsVideo(entry: *const LoadedModel, config: *const model_mod.ModelConfig) bool {
+    const ve = entry.vision_encoder orelse return false;
+    if (ve.radio) |radio| return radio.video_w.ctx != null;
+    return ve.supportsImages() and config.video_token_id != 0;
+}
+
 /// pulls full capabilities/dimensions off the resident config/chat_config;
 /// for non-ready entries renders a lightweight stub with state +
 /// bytes_on_disk only. Returns an allocator-owned string; caller frees.
@@ -7197,7 +7207,7 @@ fn renderModelEntry(
         defer mods.deinit(allocator);
         try mods.appendSlice(allocator, "[\"text\"");
         if (has_vision) try mods.appendSlice(allocator, ",\"image\"");
-        if (has_vision and config.video_token_id != 0) try mods.appendSlice(allocator, ",\"video\"");
+        if (loadedSupportsVideo(entry, config)) try mods.appendSlice(allocator, ",\"video\"");
         if (has_audio) try mods.appendSlice(allocator, ",\"audio\"");
         try mods.append(allocator, ']');
 
@@ -10066,35 +10076,11 @@ fn handleChatCompletions(
     // `ssmSnapshot`/`ssmRestore` in transformer.zig.
     if (enable_pld) log.info("  pld=enabled (draft_len={d}, key_len={d})\n", .{ server_config.default_pld_draft_len, server_config.default_pld_key_len });
 
-    // Parse enable_drafter: per-request override of the --drafter default.
-    // Auto-disabled when:
-    //   - the server didn't load a drafter (`default_drafter == null`)
-    //   - logprobs are requested (drafter doesn't expose realized log-probs)
-    //   - hybrid SSM architecture (same SSM-state issue as PLD; drafter would
-    //     hit it on the verify forward).
-    // Tools do NOT disable the drafter (same reasoning as PLD above);
-    // equivalence with tools is pinned by tests/test_drafter_tools.sh.
-    // Priority: drafter > PLD > regular. When drafter wins, force PLD off
-    // so logs / state stay consistent.
+    // Tools do not disable the drafter; logprobs require the target's plain path.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    // Plan 05: per-model drafter — when a drafter is loaded for this model,
-    // requests default to ON unless the target is MoE (where verify-forward
-    // routing penalty overwhelms the win). Per-request `enable_drafter` JSON
-    // overrides either way.
-    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter;
-    if (enable_drafter and lm.drafter == null and lm.dflash == null) {
-        enable_drafter = false; // no drafter loaded; quietly fall through
-    }
+    var enable_drafter = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
     if (enable_drafter and logprobs_n > 0) {
         log.info("  drafter=disabled (logprobs requested)\n", .{});
-        enable_drafter = false;
-    }
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) {
-        log.info("  drafter=disabled (hybrid SSM architecture not yet supported for multi-token verify)\n", .{});
         enable_drafter = false;
     }
     // Qwen native MTP head: defaults ON whenever the model loaded one (the
@@ -10499,12 +10485,7 @@ fn handleCompletions(
     const pld_explicit_in_json: bool = root.get("enable_pld") != null;
     var enable_pld: bool = requestPld(root, lm);
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    if (enable_drafter and lm.drafter == null and lm.dflash == null) enable_drafter = false;
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
+    var enable_drafter = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
     if (enable_drafter and enable_pld) enable_pld = false;
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
@@ -11943,6 +11924,65 @@ const StreamingTokenStream = struct {
 /// missed site decodes serial with everything else looking healthy.
 pub fn archBlocksAssistantSidecar(has_hybrid_layers: bool, dflash_loaded: bool) bool {
     return has_hybrid_layers and !dflash_loaded;
+}
+
+/// Resolve sidecar admission before the request's logprobs, grammar and yield gates.
+fn requestEnableDrafter(explicit: ?std.json.Value, gemma_loaded: bool, dflash_loaded: bool, is_moe: bool, has_hybrid_layers: bool) bool {
+    const enabled = if (explicit) |v| v == .bool and v.bool else (gemma_loaded and !is_moe) or dflash_loaded;
+    if (!enabled or (!gemma_loaded and !dflash_loaded)) return false;
+    return !archBlocksAssistantSidecar(has_hybrid_layers, dflash_loaded);
+}
+
+test "drafter admission: defaults and explicit opt-in cover every sidecar and architecture" {
+    const Case = struct {
+        gemma: bool,
+        dflash: bool,
+        moe: bool,
+        hybrid: bool,
+        default: bool,
+        explicit: bool,
+    };
+    const cases = [_]Case{
+        .{ .gemma = false, .dflash = false, .moe = false, .hybrid = false, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = false, .moe = true, .hybrid = false, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = false, .moe = false, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = false, .moe = true, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = true, .dflash = false, .moe = false, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = false, .moe = true, .hybrid = false, .default = false, .explicit = true },
+        .{ .gemma = true, .dflash = false, .moe = false, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = true, .dflash = false, .moe = true, .hybrid = true, .default = false, .explicit = false },
+        .{ .gemma = false, .dflash = true, .moe = false, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = false, .dflash = true, .moe = true, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = false, .dflash = true, .moe = false, .hybrid = true, .default = true, .explicit = true },
+        .{ .gemma = false, .dflash = true, .moe = true, .hybrid = true, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = false, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = true, .hybrid = false, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = false, .hybrid = true, .default = true, .explicit = true },
+        .{ .gemma = true, .dflash = true, .moe = true, .hybrid = true, .default = true, .explicit = true },
+    };
+    for (cases) |c| {
+        const default = requestEnableDrafter(null, c.gemma, c.dflash, c.moe, c.hybrid);
+        const explicit = requestEnableDrafter(.{ .bool = true }, c.gemma, c.dflash, c.moe, c.hybrid);
+        try testing.expectEqual(c.default, default);
+        try testing.expectEqual(c.explicit, explicit);
+        try testing.expect(!requestEnableDrafter(.{ .bool = false }, c.gemma, c.dflash, c.moe, c.hybrid));
+        for ([_]bool{ default, explicit }) |enabled| {
+            const spec = requestSpecModes(false, enabled, false, c.gemma, c.dflash, false, false, 0, false);
+            try testing.expectEqual(enabled, spec.use_drafter);
+            try testing.expect(!spec.use_mtp and !spec.use_pld);
+            try testing.expectEqual(if (enabled) StreamMode.drafter else .regular, pickStreamMode(false, enabled, false, c.gemma, c.dflash, false, false, 0, false));
+        }
+    }
+}
+
+test "drafter admission: present non-boolean overrides disable either sidecar" {
+    for ([_][]const u8{ "null", "\"true\"", "1", "1.0", "[]", "{}" }) |json| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+        defer parsed.deinit();
+        try testing.expect(!requestEnableDrafter(parsed.value, true, false, false, false));
+        try testing.expect(!requestEnableDrafter(parsed.value, false, true, false, false));
+        try testing.expect(!requestEnableDrafter(parsed.value, false, true, true, true));
+    }
 }
 
 pub const RequestSpec = struct { use_mtp: bool, use_drafter: bool, use_pld: bool };
@@ -14160,24 +14200,60 @@ test "every continuation surface consults continuationRejectReason before render
     try std.testing.expectEqual(@as(usize, 2), count);
 }
 
-test "every input_modalities gate that advertises image beside a video-capable model also advertises video" {
-    // Video piggybacks the SAME "does this model take image input?" signal —
-    // Qwen3-VL-family checkpoints declare `video_token_id` alongside
-    // `vision_config`/`vision_encoder` — so a future edit to either the READY
-    // (live config) or STUB (unloaded, config.json-only) input_modalities
-    // builder that touches the image gate but forgets video would silently
-    // under-report every video-capable model to the app forever (the attach
-    // menu's video option reads exactly this field). Two independent checks:
-    // the two sites read DIFFERENT underlying signals (config.video_token_id
-    // vs StubMeta.has_video) and must each carry their own gate.
-    const src = @embedFile("server.zig");
-
-    const ready_anchor = "if (has_vision) try mods.appendSlice(allocator, ";
-    const ready_at = std.mem.indexOf(u8, src, ready_anchor) orelse return error.ReadyImageGateMissing;
-    const ready_window = src[ready_at .. ready_at + 260];
-    try std.testing.expect(std.mem.indexOf(u8, ready_window, "video_token_id") != null);
-
-    try std.testing.expect(std.mem.indexOf(u8, src, "sm.found and sm.has_vision and sm.has_video") != null);
+test "input_modalities renders resident video weights and native unloaded capabilities" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const native = "{\"model_type\":\"nemotron_h_omni\",\"vision_config\":{\"model_type\":\"radio\",\"num_attention_heads\":16},\"llm_config\":{\"model_type\":\"nemotron_h_puzzle\"}}";
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = native });
+    var path_buf: [512]u8 = undefined;
+    const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
+    const reg = try model_registry_mod.ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const entry = try reg.registerStub("video", path, 0);
+    defer {
+        entry.config = null;
+        entry.chat_config = null;
+        entry.vision_encoder = null;
+        entry.state = .unloaded;
+    }
+    var qwen_config = model_mod.ModelConfig{ .qwen_vision = true, .video_token_id = 7 };
+    var radio_config = try model_mod.parseConfigFromJson(a, native);
+    defer radio_config.deinit(a);
+    var chat_config = chat_mod.ChatConfig{
+        .chat_template = "template", .bos_token = null, .eos_token = null,
+        .add_bos_token = false, .allocator = a,
+    };
+    var encoder = std.mem.zeroInit(vision_mod.VisionEncoder, .{ .allocator = a, .config = qwen_config });
+    var radio = std.mem.zeroInit(radio_vision.RadioVision, .{ .allocator = a });
+    const video_weight = mlx.mlx_array_new_float(1);
+    defer _ = mlx.mlx_array_free(video_weight);
+    entry.config = &qwen_config;
+    entry.chat_config = &chat_config;
+    entry.vision_encoder = &encoder;
+    entry.state = .ready;
+    const expect_modalities = struct {
+        fn check(alloc: std.mem.Allocator, runtime_io: std.Io, model: *LoadedModel, want: []const []const u8) !void {
+            const json = try renderModelEntry(alloc, runtime_io, model);
+            defer alloc.free(json);
+            const parsed = try std.json.parseFromSlice(std.json.Value, alloc, json, .{});
+            defer parsed.deinit();
+            const modalities = parsed.value.object.get("input_modalities").?.array.items;
+            try testing.expectEqual(want.len, modalities.len);
+            for (want, modalities) |expected, actual| try testing.expectEqualStrings(expected, actual.string);
+        }
+    }.check;
+    try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
+    entry.config = &radio_config;
+    encoder.config = radio_config;
+    radio.video_w = video_weight;
+    encoder.radio = radio;
+    try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
+    encoder.radio.?.video_w = .{ .ctx = null };
+    try expect_modalities(a, io, entry, &.{ "text", "image" });
+    entry.state = .unloaded;
+    try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
 }
 
 test "routeExists answers endpoint existence without consulting the model" {
@@ -15090,25 +15166,42 @@ fn collectMediaItems(allocator: std.mem.Allocator, messages: []const chat_mod.Me
     return items.toOwnedSlice(allocator);
 }
 
-fn placeholderKind(token: u32, config: *const model_mod.ModelConfig) ?std.meta.Tag(MediaItem) {
+const MediaTokens = struct {
+    config: *const model_mod.ModelConfig,
+    /// `<img>`, emitted for each RADIO video part. Distinct from the image token.
+    video_sentinel: u32 = 0,
+    /// `</img>`, closing each tubelet's kept `<image>` run.
+    img_end: u32 = 0,
+};
+
+fn placeholderKindOf(token: u32, mt: MediaTokens) ?std.meta.Tag(MediaItem) {
     if (token == 0) return null;
-    if (token == config.image_token_id) return .image;
-    if (token == config.video_token_id) return .video;
-    if (token == config.audio_token_id) return .audio;
+    if (token == mt.config.image_token_id) return .image;
+    if (mt.video_sentinel != 0 and token == mt.video_sentinel) return .video;
+    if (token == mt.config.video_token_id) return .video;
+    if (token == mt.config.audio_token_id) return .audio;
     return null;
+}
+
+fn placeholderKind(token: u32, config: *const model_mod.ModelConfig) ?std.meta.Tag(MediaItem) {
+    return placeholderKindOf(token, .{ .config = config });
 }
 
 const MEDIA_PLACEHOLDER_REJECT = "the rendered prompt does not carry one media placeholder per attached item: the chat template failed to render (see the server log), cannot place media in this message, or the text contains a literal media token";
 
 /// The k-th placeholder the template rendered must be item k, by kind.
-fn placeholdersMatch(prompt_ids: []const u32, items: []const MediaItem, config: *const model_mod.ModelConfig) bool {
+fn placeholdersMatchOf(prompt_ids: []const u32, items: []const MediaItem, mt: MediaTokens) bool {
     var k: usize = 0;
     for (prompt_ids) |t| {
-        const kind = placeholderKind(t, config) orelse continue;
+        const kind = placeholderKindOf(t, mt) orelse continue;
         if (k == items.len or std.meta.activeTag(items[k]) != kind) return false;
         k += 1;
     }
     return k == items.len;
+}
+
+fn placeholdersMatch(prompt_ids: []const u32, items: []const MediaItem, config: *const model_mod.ModelConfig) bool {
+    return placeholdersMatchOf(prompt_ids, items, .{ .config = config });
 }
 
 const ExpandedPrompt = struct { ids: []u32, media: []prefix_cache_mod.MediaSpan };
@@ -15123,7 +15216,22 @@ fn expandMediaPlaceholders(
     item_keys: []const u64,
     config: *const model_mod.ModelConfig,
 ) !ExpandedPrompt {
-    if (!placeholdersMatch(prompt_ids, items, config)) return error.MediaPlaceholderMismatch;
+    return expandMedia(allocator, prompt_ids, items, item_tokens, item_keys, .{ .config = config }, ByteTokenizer{}, &.{});
+}
+
+/// `item_keep[k]`, when set, is the pre-EVS mask for a RADIO video. Null keeps
+/// the tower's own run (Qwen, Gemma, still images).
+fn expandMedia(
+    allocator: std.mem.Allocator,
+    prompt_ids: []const u32,
+    items: []const MediaItem,
+    item_tokens: []const usize,
+    item_keys: []const u64,
+    mt: MediaTokens,
+    tok: anytype,
+    item_keep: []const ?[]const bool,
+) !ExpandedPrompt {
+    if (!placeholdersMatchOf(prompt_ids, items, mt)) return error.MediaPlaceholderMismatch;
     var ids = std.ArrayList(u32).empty;
     errdefer ids.deinit(allocator);
     const media = try allocator.alloc(prefix_cache_mod.MediaSpan, items.len);
@@ -15131,15 +15239,20 @@ fn expandMediaPlaceholders(
     var k: usize = 0;
     var images_before: usize = 0;
     for (prompt_ids) |t| {
-        if (placeholderKind(t, config) == null) {
+        if (placeholderKindOf(t, mt) == null) {
             try ids.append(allocator, t);
             continue;
         }
         const run_start = ids.items.len;
-        try appendMediaRun(allocator, &ids, items[k], item_tokens[k], images_before, config);
+        if (items[k] == .video and mt.config.radio_vision) {
+            const mask: ?[]const bool = if (k < item_keep.len) item_keep[k] else null;
+            try appendRadioVideoRun(allocator, &ids, items[k].video, item_tokens[k], mask, mt, tok);
+        } else {
+            try appendMediaRun(allocator, &ids, items[k], item_tokens[k], images_before, mt.config);
+        }
         images_before += @intFromBool(items[k] == .image);
         var first = run_start;
-        while (first < ids.items.len and placeholderKind(ids.items[first], config) == null) first += 1;
+        while (first < ids.items.len and placeholderKindOf(ids.items[first], mt) == null) first += 1;
         media[k] = .{ .start = @intCast(first), .key = item_keys[k] };
         k += 1;
     }
@@ -15176,7 +15289,7 @@ fn appendMediaRun(allocator: std.mem.Allocator, ids: *std.ArrayList(u32), item: 
         }
         return;
     }
-    const wrap = !config.qwen_vision;
+    const wrap = !config.qwen_vision and !config.radio_vision;
     const open: u32, const pad: u32, const close: u32 = switch (item) {
         .image => |pieces| blk: {
             if (config.lfm2_vision) return appendLfm2ImageRun(allocator, ids, pieces, config);
@@ -15188,6 +15301,47 @@ fn appendMediaRun(allocator: std.mem.Allocator, ids: *std.ArrayList(u32), item: 
     if (open > 0) try ids.append(allocator, open);
     try ids.appendNTimes(allocator, pad, n);
     if (close > 0) try ids.append(allocator, close);
+}
+
+/// One RADIO clip: each tubelet is its label, `<img>`, the kept `<image>` ids, `</img>`.
+/// The label is tokenized alone so the specials stay atoms. A short last group
+/// omits the frame the encoder repeats. Dropped positions are absent, which is
+/// the sequence EVS leaves after it prunes the full run.
+fn appendRadioVideoRun(
+    allocator: std.mem.Allocator,
+    ids: *std.ArrayList(u32),
+    vid: *const chat_mod.VideoData,
+    kept: usize,
+    mask: ?[]const bool,
+    mt: MediaTokens,
+    tok: anytype,
+) !void {
+    const geom = radio_vision.videoGeometry(vid.grid_t, vid.grid_h, vid.grid_w) orelse return error.InvalidVisionInput;
+    const full: usize = @as(usize, geom.groups) * geom.spatial;
+    const bits = mask orelse return error.InvalidVisionInput;
+    if (bits.len != full) return error.InvalidVisionInput;
+    if (mt.config.image_token_id == 0 or mt.video_sentinel == 0 or mt.img_end == 0) return error.InvalidVisionInput;
+    if (mt.video_sentinel == mt.config.image_token_id) return error.InvalidVisionInput;
+    var seen: usize = 0;
+    var g: u32 = 0;
+    while (g < geom.groups) : (g += 1) {
+        var buf: [96]u8 = undefined;
+        const label = radio_vision.videoGroupSegment(&buf, g, geom.frames);
+        if (label.len == 0) return error.InvalidVisionInput;
+        const label_ids = try tok.encode(allocator, label);
+        defer allocator.free(label_ids);
+        try ids.appendSlice(allocator, label_ids);
+        try ids.append(allocator, mt.video_sentinel);
+        const base: usize = @as(usize, g) * geom.spatial;
+        var i: usize = 0;
+        while (i < geom.spatial) : (i += 1) {
+            if (!bits[base + i]) continue;
+            try ids.append(allocator, mt.config.image_token_id);
+            seen += 1;
+        }
+        try ids.append(allocator, mt.img_end);
+    }
+    if (seen != kept) return error.InvalidVisionInput;
 }
 
 /// Soft tokens one MiniCPM-V piece contributes: its patch grid after both 2x2 merges (`16x`) or the last (`4x`).
@@ -15322,10 +15476,22 @@ fn pieceKey(piece: scheduler_mod.VisionItem) u64 {
     return h.final();
 }
 
+const EncodedMedia = struct {
+    rows: mlx.mlx_array,
+    /// Parallel to encoder pieces. Empty when nothing was pruned. A mask is the
+    /// full pre-EVS length. Owned by the caller when `len != 0`.
+    item_keep: []?[]bool = &.{},
+};
+
+fn freeKeepMasks(allocator: std.mem.Allocator, keeps: []?[]bool) void {
+    for (keeps) |m| if (m) |s| allocator.free(s);
+    if (keeps.len != 0) allocator.free(keeps);
+}
+
 /// Encode `mp` on the inference thread (the sole mlx caller) and return every
 /// item's soft tokens concatenated in prompt order; `item_tokens[k]` receives
-/// item k's row count.
-fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !mlx.mlx_array {
+/// item k's row count. RADIO video rows are already the EVS keep.
+fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []const MediaItem, mp: MediaPieces, item_tokens: []usize) !EncodedMedia {
     const sch = global_scheduler orelse return error.NoScheduler;
     const piece_tokens = try allocator.alloc(usize, mp.pieces.len);
     defer allocator.free(piece_tokens);
@@ -15337,6 +15503,7 @@ fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []con
         .allocator = allocator,
     };
     const arr = sch.encodeVision(&req) catch |err| {
+        if (req.item_keep) |keeps| freeKeepMasks(allocator, keeps);
         if (req.error_name) |e| {
             log.err("Vision encode (via scheduler) failed: {s}\n", .{e});
             allocator.free(e);
@@ -15350,7 +15517,7 @@ fn encodeMediaItems(allocator: std.mem.Allocator, lm: *LoadedModel, items: []con
         for (piece_tokens[p .. p + count]) |t| n.* += t;
         p += count;
     }
-    return arr;
+    return .{ .rows = arr, .item_keep = req.item_keep orelse &.{} };
 }
 
 /// Qwen3-VL interleaved M-RoPE position-id table for a request. `pos` (owned) is
@@ -15450,13 +15617,31 @@ fn prepareMultimodalPrompt(allocator: std.mem.Allocator, lm: *LoadedModel, confi
     return prepareMultimodalItems(allocator, lm, config, items, prompt_ids);
 }
 
+fn radioMediaTokens(lm: *LoadedModel, config: *const model_mod.ModelConfig) MediaTokens {
+    if (!config.radio_vision) return .{ .config = config };
+    const tok = lm.tokenizer orelse return .{ .config = config };
+    return .{
+        .config = config,
+        .video_sentinel = tok.specialTokenId("<img>") orelse 0,
+        .img_end = tok.specialTokenId("</img>") orelse 0,
+    };
+}
+
 /// `prepareMultimodalPrompt` for items a caller already put in placeholder order.
 fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config: *const model_mod.ModelConfig, items: []const MediaItem, prompt_ids: *[]u32) !MultimodalPrompt {
     if (items.len == 0) return .{};
+    var videos: usize = 0;
+    for (items) |it| videos += @intFromBool(it == .video);
+    if (videos > 0 and !loadedSupportsVideo(lm, config)) return error.VideoUnsupported;
+    const mt = radioMediaTokens(lm, config);
+    if (config.radio_vision and videos > 0 and (mt.video_sentinel == 0 or mt.img_end == 0 or mt.video_sentinel == config.image_token_id)) {
+        log.warn("  media: RADIO video needs distinct <img> and </img> special tokens\n", .{});
+        return error.MediaPlaceholderMismatch;
+    }
     // Before the encode: a mismatch is the client's, and cheap to refuse.
-    if (!placeholdersMatch(prompt_ids.*, items, config)) {
+    if (!placeholdersMatchOf(prompt_ids.*, items, mt)) {
         var rendered: usize = 0;
-        for (prompt_ids.*) |t| rendered += @intFromBool(placeholderKind(t, config) != null);
+        for (prompt_ids.*) |t| rendered += @intFromBool(placeholderKindOf(t, mt) != null);
         log.warn("  media: the prompt renders {d} placeholder(s) for {d} item(s); a `jinja render failed` line above means the generic fallback rendered none\n", .{ rendered, items.len });
         return error.MediaPlaceholderMismatch;
     }
@@ -15468,8 +15653,21 @@ fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config
 
     var out: MultimodalPrompt = .{};
     errdefer out.deinit(allocator);
-    out.embeddings = try encodeMediaItems(allocator, lm, items, mp, item_tokens);
-    const expanded = try expandMediaPlaceholders(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, config);
+    const encoded = try encodeMediaItems(allocator, lm, items, mp, item_tokens);
+    defer freeKeepMasks(allocator, encoded.item_keep);
+    out.embeddings = encoded.rows;
+    const item_keep = try allocator.alloc(?[]const bool, items.len);
+    defer allocator.free(item_keep);
+    var piece_at: usize = 0;
+    for (items, item_keep) |item, *slot| {
+        const n = piecesOf(item);
+        slot.* = if (item == .video and piece_at < encoded.item_keep.len) encoded.item_keep[piece_at] else null;
+        piece_at += n;
+    }
+    const expanded = if (lm.tokenizer) |tok|
+        try expandMedia(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, mt, tok, item_keep)
+    else
+        try expandMedia(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, mt, ByteTokenizer{}, item_keep);
     out.media = expanded.media;
     var soft = std.enums.EnumArray(std.meta.Tag(MediaItem), usize).initFill(0);
     for (items, item_tokens) |item, n| {
@@ -15490,6 +15688,7 @@ fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config
 
 /// The error response for a failed `prepareMultimodalPrompt`.
 fn multimodalFailure(err: anyerror) struct { status: []const u8, code: u16, kind: []const u8, message: []const u8 } {
+    if (err == error.VideoUnsupported) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = "video input is not supported by this model's loaded vision tower" };
     if (err == error.MediaPlaceholderMismatch) return .{ .status = "400 Bad Request", .code = 400, .kind = "invalid_request_error", .message = MEDIA_PLACEHOLDER_REJECT };
     return .{ .status = "500 Internal Server Error", .code = 500, .kind = "server_error", .message = "media encoding failed" };
 }
@@ -15519,6 +15718,7 @@ fn parseAudioContent(allocator: std.mem.Allocator, data: []const u8) ?chat_mod.A
 /// Returns null on any decode failure (caller treats as missing image).
 /// Derive per-request image preprocessing params from the loaded model config.
 pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.VisionPreproc {
+    if (config.radio_vision) return .{ .mode = .radio, .patch = radio_vision.PATCH, .merge = radio_vision.DOWNSAMPLE };
     if (config.lfm2_vision) {
         // NaFlex: no temporal axis and no merge-block patch order — the
         // projector unshuffles AFTER the tower, so the grid stays plain
@@ -16097,6 +16297,12 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
     const src_w: u32 = src.w;
     const src_h: u32 = src.h;
 
+    if (vp.mode == .radio) {
+        const img = radio_vision.prepareImage(allocator, src.rgb, src_h, src_w) catch return null;
+        log.info("  Decoded {d}x{d} image → RADIO {d}x{d} float32 CHW ({d} tokens, PIL bicubic)\n", .{ src_w, src_h, img.w, img.h, img.tokens });
+        return .{ .pixels = img.pixels, .width = img.w, .height = img.h };
+    }
+
     if (vp.mode == .gemma_budget) {
         const img = vision_mod.budgetPixels(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens) catch return null;
         log.info("  Decoded {d}x{d} image → {d}x{d} float32 CHW ({d} soft tokens)\n", .{ src_w, src_h, img.w, img.h, (img.h / vp.patch / vp.merge) * (img.w / vp.patch / vp.merge) });
@@ -16370,6 +16576,7 @@ fn appendEmbeddingText(allocator: std.mem.Allocator, tok: anytype, ids: *std.Arr
 /// HF's video processor. Qwen's clips; EmbeddingGemma 2's (`.gemma_budget`) are `decodeBudgetVideo`'s.
 fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []const u8, vp: chat_mod.VisionPreproc) ?chat_mod.VideoData {
     if (vp.mode == .gemma_budget) return decodeBudgetVideo(allocator, frame_urls, vp);
+    if (vp.mode == .radio) return decodeRadioVideo(allocator, frame_urls);
     if (vp.mode != .qwen or frame_urls.len == 0) return null;
     const factor = std.math.mul(u32, vp.patch, vp.merge) catch return null;
     if (factor == 0 or vp.tps == 0 or vp.tps > 8) return null;
@@ -16444,6 +16651,30 @@ fn decodeVideoUrlContent(allocator: std.mem.Allocator, frame_urls: []const []con
         frame_urls.len, grid_t, gh, gw, grid_t * n_per_group / (@as(usize, vp.merge) * vp.merge), rw, rh,
     });
     return .{ .pixels = pv_bytes, .grid_t = @intCast(grid_t), .grid_h = gh, .grid_w = gw };
+}
+
+/// RADIO video: every frame resized to frame 0's patch grid, CLIP-normalized,
+/// concatenated as float32 CHW. `grid_h` / `grid_w` are pixels, `grid_t` is the
+/// raw frame count. Null when any frame is not a decodable image.
+fn decodeRadioVideo(allocator: std.mem.Allocator, frame_urls: []const []const u8) ?chat_mod.VideoData {
+    if (frame_urls.len == 0) return null;
+    var vb: ?radio_vision.VideoBuilder = null;
+    for (frame_urls, 0..) |url, i| {
+        const frame = decodeFrameUrl(allocator, url, true) orelse return cancelRadioVideo(allocator, vb);
+        defer frame.deinit(allocator);
+        if (vb == null) vb = radio_vision.VideoBuilder.init(allocator, frame_urls.len, frame.h, frame.w) catch return null;
+        vb.?.add(allocator, i, frame.rgb, frame.h, frame.w) catch return cancelRadioVideo(allocator, vb);
+    }
+    const prepared = vb.?.finish() catch return cancelRadioVideo(allocator, vb);
+    log.info("  Decoded {d} frames → RADIO video {d}x{d} ({d} tubelets x {d} tokens)\n", .{
+        frame_urls.len, prepared.w, prepared.h, prepared.groups, prepared.tokens,
+    });
+    return .{ .pixels = prepared.pixels, .grid_t = prepared.frames, .grid_h = prepared.h, .grid_w = prepared.w };
+}
+
+fn cancelRadioVideo(allocator: std.mem.Allocator, vb: ?radio_vision.VideoBuilder) ?chat_mod.VideoData {
+    if (vb) |v| allocator.free(v.buf);
+    return null;
 }
 
 /// Decode a `video_url` block's `frames` array into `list`, mirroring
@@ -17111,13 +17342,7 @@ fn handleAnthropicMessages(
 
     // Drafter: same disable rules as chat-completions parse site.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    var enable_drafter: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter;
-    if (enable_drafter and lm.drafter == null) enable_drafter = false;
-    if (enable_drafter and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter = false;
+    var enable_drafter = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
     const allow_batch_mtp = if (root.get("enable_batch_mtp")) |v| v != .bool or v.bool else true;
     var enable_mtp: bool = if (root.get("enable_mtp")) |v|
         (v == .bool and v.bool)
@@ -19247,13 +19472,7 @@ fn handleResponsesInner(
     // Drafter (Responses-side parsing). Same disable rules as the chat
     // and Anthropic parse sites.
     const drafter_explicit_in_json: bool = root.get("enable_drafter") != null;
-    const lm_default_enable_drafter_resp: bool = (lm.drafter != null and !config.isMoe()) or lm.dflash != null;
-    var enable_drafter_resp: bool = if (root.get("enable_drafter")) |v|
-        (v == .bool and v.bool)
-    else
-        lm_default_enable_drafter_resp;
-    if (enable_drafter_resp and lm.drafter == null and lm.dflash == null) enable_drafter_resp = false;
-    if (enable_drafter_resp and archBlocksAssistantSidecar(config.has_hybrid_layers, lm.dflash != null)) enable_drafter_resp = false;
+    var enable_drafter_resp = requestEnableDrafter(root.get("enable_drafter"), lm.drafter != null, lm.dflash != null, config.isMoe(), config.has_hybrid_layers);
 
     // Adaptive spec-decode gate (Responses path; mirrors chat-completions and
     // Anthropic). Score the full prompt's 3-gram repetition; novel content
@@ -22517,6 +22736,128 @@ const ByteTokenizer = struct {
         return out;
     }
 };
+
+test "RADIO video availability follows loaded embedder weights" {
+    var radio: radio_vision.RadioVision = undefined;
+    radio.video_w = .{ .ctx = null };
+    var encoder: vision_mod.VisionEncoder = undefined;
+    encoder.radio = radio;
+    encoder.qwen_audio = null;
+    var entry: LoadedModel = undefined;
+    entry.vision_encoder = &encoder;
+    var config = model_mod.ModelConfig{ .radio_vision = true };
+    try testing.expect(encoder.supportsImages());
+    try testing.expect(!loadedSupportsVideo(&entry, &config));
+    encoder.radio.?.video_w.ctx = @ptrCast(&radio);
+    try testing.expect(loadedSupportsVideo(&entry, &config));
+    encoder.radio = null;
+    config.radio_vision = false;
+    config.video_token_id = 7;
+    try testing.expect(loadedSupportsVideo(&entry, &config));
+    config.video_token_id = 0;
+    try testing.expect(!loadedSupportsVideo(&entry, &config));
+    entry.vision_encoder = null;
+    try testing.expect(!loadedSupportsVideo(&entry, &config));
+}
+
+test "RADIO video availability rejects a forced clip before encoding with a named 400" {
+    const a = testing.allocator;
+    var radio: radio_vision.RadioVision = undefined;
+    radio.video_w = .{ .ctx = null };
+    var encoder: vision_mod.VisionEncoder = undefined;
+    encoder.radio = radio;
+    encoder.qwen_audio = null;
+    var entry: LoadedModel = undefined;
+    entry.vision_encoder = &encoder;
+    entry.tokenizer = null;
+    const config = model_mod.ModelConfig{ .radio_vision = true, .image_token_id = 18 };
+    const clip = chat_mod.VideoData{ .pixels = "", .grid_t = 3, .grid_h = 64, .grid_w = 64 };
+    const items = [_]MediaItem{.{ .video = &clip }};
+    var ids = try a.dupe(u32, &.{19});
+    defer a.free(ids);
+    try testing.expectError(error.VideoUnsupported, prepareMultimodalItems(a, &entry, &config, &items, &ids));
+    const failure = multimodalFailure(error.VideoUnsupported);
+    try testing.expectEqual(@as(u16, 400), failure.code);
+    try testing.expect(std.mem.indexOf(u8, failure.message, "video") != null);
+}
+
+test "radio prompt: a video sentinel expands into labeled tubelets and the keep mask" {
+    const a = testing.allocator;
+    var config = model_mod.ModelConfig{};
+    config.radio_vision = true;
+    config.image_token_id = 18;
+    const mt = MediaTokens{ .config = &config, .video_sentinel = 19, .img_end = 20 };
+    const img = [_]chat_mod.ImageData{.{ .pixels = "", .width = 64, .height = 64 }};
+
+    // A still image stays a bare run of `<image>`. The tubelet wrap is video-only.
+    const image_items = [_]MediaItem{.{ .image = &img }};
+    const image_out = try expandMedia(a, &.{ 1, 18, 2 }, &image_items, &.{4}, &.{11}, mt, ByteTokenizer{}, &.{});
+    defer a.free(image_out.ids);
+    defer a.free(image_out.media);
+    try testing.expectEqualSlices(u32, &.{ 1, 18, 18, 18, 18, 2 }, image_out.ids);
+    try testing.expectEqual(@as(u32, 1), image_out.media[0].start);
+
+    // 64×64 is a 4×4 patch grid and 2×2 tokens after the shuffle. Three frames
+    // are two tubelets; the second keeps only its first and third token.
+    const clip = chat_mod.VideoData{ .pixels = "", .grid_t = 3, .grid_h = 64, .grid_w = 64 };
+    const items = [_]MediaItem{ .{ .image = &img }, .{ .video = &clip } };
+    const mask = [_]bool{ true, true, true, true, true, false, true, false };
+    const keeps = [_]?[]const bool{ null, &mask };
+    const out = try expandMedia(a, &.{ 1, 18, 19, 2 }, &items, &.{ 2, 6 }, &.{ 11, 12 }, mt, ByteTokenizer{}, &keeps);
+    defer a.free(out.ids);
+    defer a.free(out.media);
+
+    var want: std.ArrayList(u32) = .empty;
+    defer want.deinit(a);
+    try want.append(a, 1);
+    try want.appendNTimes(a, 18, 2);
+    var buf: [96]u8 = undefined;
+    const lab0 = radio_vision.videoGroupSegment(&buf, 0, 3);
+    var lab0_owned: [96]u8 = undefined;
+    @memcpy(lab0_owned[0..lab0.len], lab0);
+    const ids0 = try ByteTokenizer.encode(.{}, a, lab0_owned[0..lab0.len]);
+    defer a.free(ids0);
+    try want.appendSlice(a, ids0);
+    try want.append(a, 19);
+    try want.appendNTimes(a, 18, 4);
+    try want.append(a, 20);
+    const lab1 = radio_vision.videoGroupSegment(&buf, 1, 3);
+    const ids1 = try ByteTokenizer.encode(.{}, a, lab1);
+    defer a.free(ids1);
+    try want.appendSlice(a, ids1);
+    try want.append(a, 19);
+    try want.appendNTimes(a, 18, 2);
+    try want.append(a, 20);
+    try want.append(a, 2);
+    try testing.expectEqualSlices(u32, want.items, out.ids);
+    try testing.expectEqual(@as(u32, 1), out.media[0].start);
+    try testing.expectEqual(@as(u32, @intCast(3 + lab0.len)), out.media[1].start);
+
+    const bad = [_]bool{true};
+    const bad_keeps = [_]?[]const bool{&bad};
+    const only = [_]MediaItem{.{ .video = &clip }};
+    try testing.expectError(error.InvalidVisionInput, expandMedia(a, &.{ 1, 19, 2 }, &only, &.{6}, &.{1}, mt, ByteTokenizer{}, &bad_keeps));
+}
+
+test "radio video frames share frame 0's patch grid" {
+    const a = testing.allocator;
+    var config = model_mod.ModelConfig{};
+    config.radio_vision = true;
+    const vp = visionPreprocFromConfig(&config);
+    try testing.expectEqual(.radio, vp.mode);
+    // 32×24 is the same 4:3 as a 640×480 frame, so the grid is the clip's grid.
+    const url = try solidPngUrl(a, 32, 24, .{ 10, 20, 30, 255 });
+    defer a.free(url);
+    const frames = [_][]const u8{ url, url };
+    const vid = decodeVideoUrlContent(a, &frames, vp) orelse return error.Undecoded;
+    defer a.free(vid.pixels);
+    try testing.expectEqual(@as(u32, 2), vid.grid_t);
+    try testing.expectEqual(@as(u32, 576), vid.grid_w);
+    try testing.expectEqual(@as(u32, 448), vid.grid_h);
+    try testing.expectEqual(@as(usize, 2 * 3 * 576 * 448 * 4), vid.pixels.len);
+    const broken = [_][]const u8{ url, "data:image/png;base64,AAAA" };
+    try testing.expect(decodeVideoUrlContent(a, &broken, vp) == null);
+}
 
 fn promptFor(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, body: []const u8, media: *RequestMedia, can_see: bool) !EmbeddingPromptResult {
     const parsed = try std.json.parseFromSlice(std.json.Value, allocator, body, .{});

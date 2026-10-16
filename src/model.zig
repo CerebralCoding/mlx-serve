@@ -26,6 +26,9 @@ pub const MAX_VISION_LAYERS = 64;
 /// `MuseGlimmerImageProcessor.max_image_tokens` — MERGED tokens, not pixels.
 pub const MUSE_MAX_IMAGE_TOKENS = 4096;
 
+/// Default fraction of RADIO video tokens removed by EVS.
+pub const RADIO_VIDEO_PRUNING_RATE_DEFAULT: f64 = 0.7;
+
 pub const QuantMode = enum {
     affine,
     nvfp4,
@@ -246,6 +249,9 @@ pub const ModelConfig = struct {
     num_experts: u32 = 0,
     num_experts_per_tok: u32 = 0,
     moe_intermediate_size: u32 = 0,
+    /// Nemotron-H Puzzle: routed experts run in this width, not `hidden_size`.
+    /// 0 means the uniform trunk (no fc1/fc2_latent_proj).
+    moe_latent_size: u32 = 0,
     shared_expert_intermediate_size: u32 = 0,
     // DeepSeek-V3-style sigmoid routing (hy_v3): scores = sigmoid(logits) in
     // f32; top-k SELECTED on scores + expert_bias but WEIGHTED by the unbiased
@@ -661,6 +667,14 @@ pub const ModelConfig = struct {
     // uses INTERLEAVED M-RoPE (image tokens get 2D grid positions). Populated in
     // the qwen3_5 arm below. Encoder: src/qwen_vision.zig; M-RoPE: src/mrope.zig.
     qwen_vision: bool = false,
+    /// Nemotron RADIO tower, selected by `vision_config.model_type`.
+    radio_vision: bool = false,
+    radio_num_heads: u32 = 0,
+    radio_final_layernorm: bool = false,
+    radio_ln_eps: f32 = 1e-6,
+    /// RADIO video EVS drop fraction. 0 keeps every tubelet token. The Bolt
+    /// checkpoint uses 0.7; other models leave this at 0.
+    video_pruning_rate: f64 = 0,
     qv_depth: u32 = 0, // ViT transformer blocks
     qv_hidden: u32 = 0, // ViT hidden size
     qv_heads: u32 = 0, // ViT attention heads
@@ -1618,6 +1632,9 @@ pub const ModelConfig = struct {
         }
         self.populateLfm2ImageTokens(tok);
         self.populateMiniCpmImageTokens(tok);
+        if (self.radio_vision and self.image_token_id == 0) {
+            if (tok.special_tokens.get("<image>")) |id| self.image_token_id = id;
+        }
     }
 
     /// MiniCPM-V's `<image_id>N</image_id>` tags and the digits of N are tokenizer-only ids.
@@ -2442,10 +2459,22 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
     var config = ModelConfig{};
 
     // Detect model_type from top-level (always present)
-    const model_type = if (jsonField(root, "model_type")) |v| try jsonValue(.string, v) else "gemma3";
+    var model_type: []const u8 = if (jsonField(root, "model_type")) |v| try jsonValue(.string, v) else "gemma3";
 
-    // Determine which object to read config from: text_config (nested) or root (flat)
-    const cfg_obj = if (jsonField(root, "text_config")) |tc_val| try jsonValue(.object, tc_val) else root;
+    // Determine which object to read config from: text_config (nested) or root (flat).
+    // Nemotron omni wraps the language tower in llm_config; the outer object has
+    // no hidden size or layer list.
+    var cfg_obj: std.json.ObjectMap = if (jsonField(root, "text_config")) |tc_val| try jsonValue(.object, tc_val) else root;
+    if (std.mem.eql(u8, model_type, "nemotron_h_omni")) {
+        if (jsonField(root, "llm_config")) |lc| {
+            if (lc == .object) {
+                cfg_obj = lc.object;
+                if (jsonField(lc.object, "model_type")) |mt| {
+                    if (mt == .string) model_type = mt.string;
+                }
+            }
+        }
+    }
 
     // Parse common fields
     if (jsonField(cfg_obj, "vocab_size")) |v| config.vocab_size = try jsonU32(v);
@@ -4283,9 +4312,27 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 config.has_vision = false;
             }
         }
-    } else if (std.mem.eql(u8, model_type, "nemotron_h")) {
+    } else if (std.mem.eql(u8, model_type, "nemotron_h") or std.mem.eql(u8, model_type, "nemotron_h_puzzle")) {
+        // Puzzle is the heterogeneous latent-MoE trunk. The runtime still
+        // keys every kernel and weight prefix on "nemotron_h".
         config.model_type = "nemotron_h";
         config.weight_prefix = "backbone";
+        config.radio_vision = model_discovery.hasRadioVision(root);
+        config.has_vision = config.radio_vision;
+        if (config.radio_vision) {
+            const vc = jsonField(root, "vision_config").?.object;
+            if (jsonField(vc, "num_attention_heads")) |v| config.radio_num_heads = try jsonU32(v);
+            if (jsonField(cfg_obj, "num_nextn_predict_layers")) |v| config.radio_final_layernorm = (try jsonU32(v)) > 0;
+            if (jsonField(vc, "layer_norm_eps")) |v| config.radio_ln_eps = try jsonFloat(v);
+            if (config.radio_ln_eps <= 0) return error.InvalidConfigField;
+            config.video_pruning_rate = RADIO_VIDEO_PRUNING_RATE_DEFAULT;
+            if (jsonField(root, "video_pruning_rate")) |v| {
+                config.video_pruning_rate = try jsonFloat64(v);
+            } else if (jsonField(vc, "video_pruning_rate")) |v| {
+                config.video_pruning_rate = try jsonFloat64(v);
+            }
+            if (config.video_pruning_rate < 0 or config.video_pruning_rate > 1) return error.InvalidConfigField;
+        }
         config.hidden_act = .silu;
         config.mamba_mlp_act = .relu_sq;
         config.norm_has_offset = false;
@@ -4301,6 +4348,19 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // NoPE: the reference attention never rotates q/k, whatever
         // rope_theta the config carries. Covers the MTP head's layer too.
         config.layer_no_rope = @splat(true);
+        // Bolt's llm_config omits num_hidden_layers; the block list is the depth.
+        if (jsonField(cfg_obj, "num_hidden_layers") == null) {
+            const listed: usize = if (jsonField(cfg_obj, "layers_block_type")) |v|
+                (if (v == .array) v.array.items.len else 0)
+            else if (jsonField(cfg_obj, "block_configs")) |v|
+                (if (v == .array) v.array.items.len else 0)
+            else if (jsonField(cfg_obj, "hybrid_override_pattern")) |v|
+                (if (v == .string) v.string.len else 0)
+            else
+                0;
+            if (listed > config.layer_block_types.len) return error.UnsupportedLayerGeometry;
+            if (listed > 0) config.num_hidden_layers = @intCast(listed);
+        }
         if (jsonField(cfg_obj, "rms_norm_eps")) |v| {
             config.rms_norm_eps = try jsonFloat(v);
         } else if (jsonField(cfg_obj, "layer_norm_epsilon")) |v| {
@@ -4335,13 +4395,11 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         // config.json may have time_step_min/time_step_max fields but Python ignores them
         // for SSM clipping — only time_step_limit (a 2-element array) is used.
         if (jsonField(cfg_obj, "time_step_limit")) |v| {
-            if (v == .array) {
-                const items = v.array.items;
-                if (items.len >= 2) {
-                    config.time_step_min = try jsonFloat(items[0]);
-                    config.time_step_max = try jsonFloat(items[1]);
-                }
-            }
+            if (v != .array or v.array.items.len != 2) return error.InvalidConfigField;
+            const items = v.array.items;
+            config.time_step_min = try jsonSsmBound(items[0], false);
+            config.time_step_max = try jsonSsmBound(items[1], true);
+            if (config.time_step_min < 0 or config.time_step_max < config.time_step_min) return error.InvalidConfigField;
         }
         if (jsonField(cfg_obj, "chunk_size")) |v| config.mamba_chunk_size = switch (v) {
             .integer => |i| std.math.cast(u32, i) orelse return error.InvalidConfigField,
@@ -4400,7 +4458,29 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
         if (jsonField(cfg_obj, "routed_scaling_factor")) |v| config.router_scaling_factor = try jsonFloat(v);
         if (jsonField(cfg_obj, "moe_latent_size")) |v| {
-            if (v == .integer) return error.UnsupportedNemotronLatentMoe;
+            if (v == .integer) config.moe_latent_size = try jsonU32(v);
+        }
+        // Per-layer expert banks. The forward reads each tensor's own shape;
+        // these scalars are the maxima, for memory billing.
+        if (jsonField(cfg_obj, "block_configs")) |v| {
+            if (v == .array) {
+                var max_experts: u32 = 0;
+                var max_inter: u32 = 0;
+                for (v.array.items) |item| {
+                    if (item != .object) continue;
+                    if (jsonField(item.object, "n_routed_experts")) |e| {
+                        if (e == .integer) max_experts = @max(max_experts, try jsonU32(e));
+                    }
+                    if (jsonField(item.object, "moe_intermediate_size")) |e| {
+                        if (e == .integer) max_inter = @max(max_inter, try jsonU32(e));
+                    }
+                    if (jsonField(item.object, "num_experts_per_tok")) |e| {
+                        if (e == .integer) config.num_experts_per_tok = try jsonU32(e);
+                    }
+                }
+                if (max_experts > 0) config.num_experts = max_experts;
+                if (max_inter > 0) config.moe_intermediate_size = max_inter;
+            }
         }
         if (config.num_eos_tokens == 0) {
             if (jsonField(cfg_obj, "eos_token_id")) |v| {
@@ -4678,6 +4758,32 @@ fn parseLlama3Rope(cfg_obj: std.json.ObjectMap) !?Llama3Rope {
     return r;
 }
 
+fn jsonSsmBound(v: std.json.Value, allow_infinity: bool) !f32 {
+    switch (v) {
+        .integer, .float => return jsonFloat(v),
+        .string => |name| if (allow_infinity and std.mem.eql(u8, name, "Infinity")) return std.math.inf(f32),
+        .object => |obj| {
+            if (allow_infinity and obj.count() == 1) {
+                if (obj.get("__float__")) |value| {
+                    if (value == .string and std.mem.eql(u8, value.string, "Infinity")) return std.math.inf(f32);
+                }
+            }
+        },
+        else => {},
+    }
+    return error.InvalidConfigField;
+}
+
+fn jsonFloat64(v: std.json.Value) !f64 {
+    const value: f64 = switch (v) {
+        .integer => |i| @floatFromInt(i),
+        .float => |f| f,
+        else => return error.InvalidConfigField,
+    };
+    if (!std.math.isFinite(value)) return error.InvalidConfigField;
+    return value;
+}
+
 fn jsonFloat(v: std.json.Value) !f32 {
     const f: f32 = switch (v) {
         .integer => |i| @floatFromInt(i),
@@ -4752,7 +4858,7 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
 
 /// Re-point `config.weight_prefix` at the nesting the CHECKPOINT actually uses.
 ///
-/// Which of the two a converter emits is not reliably declared in config.json,
+/// Which nesting a converter emits is not reliably declared in config.json,
 /// so `parseConfigFromJson` guesses from `text_config` presence — wrong for any
 /// checkpoint that nests without declaring one (mlx-community LFM2.5-2.6B:
 /// `Lfm2ForCausalLM`, an EMPTY `vision_config`, every weight under
@@ -4760,8 +4866,8 @@ fn hasWeightsUnder(weights: *const Weights, prefix: []const u8) bool {
 /// `MISSING WEIGHT: model.embed_tokens.weight`). The class has now shipped in
 /// both directions, so the weights get the last word.
 ///
-/// Conservative by construction: only the generic spellings participate
-/// (never an arch with its own — `backbone`, `model.llm`, `""`), and a swap
+/// Conservative by construction: generic trunks share one spelling set;
+/// Nemotron's `backbone` has its own flat/nested pair. A swap
 /// happens only when the configured one holds NOTHING, so every checkpoint
 /// that already loaded binds byte-identically. Scan order puts the most
 /// specific spelling first: a `model.language_model.*` checkpoint also
@@ -4785,7 +4891,12 @@ pub fn narrowHadamardPackTables(config: *const ModelConfig, weights: *Weights, s
 }
 
 pub fn resolveWeightPrefix(config: *ModelConfig, weights: *const Weights) void {
-    const candidates = [_][]const u8{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX };
+    const nemotron_backbone = std.mem.eql(u8, config.model_type, "nemotron_h") and
+        (std.mem.eql(u8, config.weight_prefix, "backbone") or std.mem.eql(u8, config.weight_prefix, "language_model.backbone"));
+    const candidates: []const []const u8 = if (nemotron_backbone)
+        &.{ "backbone", "language_model.backbone" }
+    else
+        &.{ NESTED_PREFIX, VL_NESTED_PREFIX, FLAT_PREFIX };
     var known = false;
     for (candidates) |p| {
         if (std.mem.eql(u8, config.weight_prefix, p)) known = true;
@@ -5518,6 +5629,8 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // `load_vision` gate as the SigLIP weights (`--no-vision` → text only).
     const is_vision = std.mem.startsWith(u8, key, "vision_tower.") or
         std.mem.startsWith(u8, key, "vision_model.") or
+        std.mem.startsWith(u8, key, "vision_projector.") or
+        std.mem.startsWith(u8, key, "mlp1.") or
         std.mem.startsWith(u8, key, "embed_vision.") or
         std.mem.startsWith(u8, key, "merger.") or
         std.mem.startsWith(u8, key, "vit_merger.") or
@@ -5749,6 +5862,22 @@ test "resolveWeightPrefix: the CHECKPOINT decides the nesting, not the config ke
         var config = ModelConfig{ .model_type = "nemotron_h", .weight_prefix = "backbone" };
         resolveWeightPrefix(&config, &w);
         try testing.expectEqualStrings("backbone", config.weight_prefix);
+    }
+    // Native Nemotron converters may retain the language wrapper. Either
+    // spelling is selected from weights; an already-populated prefix stands.
+    for ([_][]const u8{ "backbone", "language_model.backbone" }) |prefix| {
+        var w = Weights.init(allocator);
+        defer w.deinit();
+        const key = try std.fmt.allocPrint(allocator, "{s}.embeddings.weight", .{prefix});
+        defer allocator.free(key);
+        try put(&w, allocator, key);
+        var config = ModelConfig{ .model_type = "nemotron_h", .weight_prefix = if (std.mem.eql(u8, prefix, "backbone")) "language_model.backbone" else "backbone" };
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings(prefix, config.weight_prefix);
+        const other = if (std.mem.eql(u8, prefix, "backbone")) "language_model.backbone.embeddings.weight" else "backbone.embeddings.weight";
+        try put(&w, allocator, other);
+        resolveWeightPrefix(&config, &w);
+        try testing.expectEqualStrings(prefix, config.weight_prefix);
     }
     // A prefix that is a strict PREFIX of the key's first segment must not
     // count as a hit ("model" vs "model_extra.*").
@@ -6229,6 +6358,23 @@ test "shouldKeepWeightKey filters audio and gated vision weights" {
     try testing.expect(shouldKeepWeightKey("language_model.model.layers.0.self_attn.q_proj.weight", false));
 }
 
+test "shouldKeepWeightKey: Super projector follows the global vision gate" {
+    for ([_][]const u8{
+        "vision_model.radio_model.model.blocks.0.norm1.weight",
+        "vision_projector.mlp1.norm.weight",
+        "vision_projector.mlp1.linear1.weight",
+        "vision_projector.mlp1.linear1.scales",
+        "vision_projector.mlp1.linear2.biases",
+        "vision_projector.vision_final_layernorm.weight",
+        "vision_projector.vision_final_layernorm.bias",
+    }) |name| {
+        try testing.expect(!shouldKeepWeightKey(name, false));
+        try testing.expect(shouldKeepWeightKey(name, true));
+    }
+    try testing.expect(shouldKeepWeightKey("vision_projector_extra.weight", false));
+    try testing.expect(shouldKeepWeightKey("language_model.backbone.layers.0.norm.weight", false));
+}
+
 test "shouldKeepWeightKey keeps Gemma 4 12B unified embedder weights when vision enabled" {
     // gemma4_unified is encoder-free: vision_embedder.* (patch embedder),
     // embed_vision.* and embed_audio.* (raw projections) ARE wired in
@@ -6272,6 +6418,8 @@ test "shouldKeepWeightKey gates Muse-Glimmer vision on load_vision in both nesti
     // oMLX 0.7.1's GLM-5.3 oQ packs spell the tower `vision_model.`.
     try testing.expect(!shouldKeepWeightKey("vision_model.blocks.0.norm1.weight", false));
     try testing.expect(shouldKeepWeightKey("vision_model.blocks.0.norm1.weight", true));
+    try testing.expect(!shouldKeepWeightKey("mlp1.1.weight", false));
+    try testing.expect(shouldKeepWeightKey("mlp1.1.weight", true));
     // Text weights are never touched either way.
     try testing.expect(shouldKeepWeightKey("model.language_model.embed_tokens.weight", false));
     try testing.expect(shouldKeepWeightKey("language_model.model.embed_tokens.weight", false));
@@ -9278,7 +9426,7 @@ test "nemotron_h: attention is NoPE in every trunk layer and the MTP head" {
     for (0..cfg.num_hidden_layers + 1) |i| try testing.expect(cfg.layerSkipsRope(@intCast(i)));
 }
 
-test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {
+test "nemotron_h: MoE routing fields parse; a latent MoE is accepted" {
     // Nemotron-3.5-Lightning-30B-A3B's shipped values.
     const json =
         \\{
@@ -9305,8 +9453,6 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {
     try testing.expect(cfg.isMoe());
     try testing.expect(cfg.has_hybrid_layers);
 
-    // The latent variant projects into a smaller expert space
-    // (fc1/fc2_latent_proj) that the hybrid MoE op does not carry.
     const latent =
         \\{
         \\  "model_type": "nemotron_h",
@@ -9316,7 +9462,157 @@ test "nemotron_h: MoE routing fields parse; a latent MoE is refused by name" {
         \\  "n_routed_experts": 512, "num_experts_per_tok": 22, "moe_latent_size": 1024
         \\}
     ;
-    try testing.expectError(error.UnsupportedNemotronLatentMoe, parseConfigFromJson(testing.allocator, latent));
+    const lat = try parseConfigFromJson(testing.allocator, latent);
+    try testing.expectEqual(@as(u32, 1024), lat.moe_latent_size);
+    try testing.expectEqual(@as(u32, 512), lat.num_experts);
+    try testing.expect(std.mem.eql(u8, lat.model_type, "nemotron_h"));
+
+    // Bolt ships as an omni wrapper around a puzzle tower. Expert counts differ
+    // per layer; the top-level num_experts (512) is not the bank width.
+    const omni =
+        \\{
+        \\  "model_type": "nemotron_h_omni",
+        \\  "vision_config": {"model_type": "radio", "hidden_size": 1280, "num_attention_heads": 16},
+        \\  "llm_config": {
+        \\    "model_type": "nemotron_h_puzzle",
+        \\    "hidden_size": 4096,
+        \\    "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\    "vocab_size": 131072, "max_position_embeddings": 262144,
+        \\    "layers_block_type": ["mamba", "moe", "attention"],
+        \\    "block_configs": [
+        \\      {"block_type": "mamba"},
+        \\      {"block_type": "moe", "moe_intermediate_size": 1536, "n_routed_experts": 240, "num_experts_per_tok": 9},
+        \\      {"block_type": "attention"}
+        \\    ],
+        \\    "moe_latent_size": 1024,
+        \\    "moe_shared_expert_intermediate_size": 5376,
+        \\    "routed_scaling_factor": 5.0,
+        \\    "norm_topk_prob": true,
+        \\    "num_experts": 512,
+        \\    "time_step_limit": [0.0, {"__float__": "Infinity"}]
+        \\  }
+        \\}
+    ;
+    const bolt = try parseConfigFromJson(testing.allocator, omni);
+    try testing.expect(std.mem.eql(u8, bolt.model_type, "nemotron_h"));
+    try testing.expectEqual(@as(u32, 3), bolt.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 4096), bolt.hidden_size);
+    try testing.expectEqual(@as(u32, 262144), bolt.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 240), bolt.num_experts);
+    try testing.expectEqual(@as(u32, 9), bolt.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 1536), bolt.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 1024), bolt.moe_latent_size);
+    try testing.expectEqual(@as(u32, 5376), bolt.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(f32, 5.0), bolt.router_scaling_factor);
+    try testing.expect(std.math.isInf(bolt.time_step_max));
+    try testing.expectEqual(LayerBlockType.mamba2, bolt.layer_block_types[0]);
+    try testing.expectEqual(LayerBlockType.moe, bolt.layer_block_types[1]);
+    try testing.expectEqual(LayerBlockType.attention, bolt.layer_block_types[2]);
+    try testing.expectEqualStrings("backbone", bolt.weight_prefix);
+    try testing.expect(bolt.has_vision and bolt.radio_vision);
+    try testing.expect(!bolt.radio_final_layernorm);
+    try testing.expectEqual(@as(u32, 16), bolt.radio_num_heads);
+    try testing.expectEqual(@as(f64, 0.7), bolt.video_pruning_rate);
+
+    const flagged =
+        \\{
+        \\  "model_type": "nemotron_h",
+        \\  "hidden_size": 4096, "num_hidden_layers": 2,
+        \\  "num_attention_heads": 32, "num_key_value_heads": 2, "head_dim": 128,
+        \\  "vocab_size": 131072, "layers_block_type": ["mamba", "moe"],
+        \\  "radio_vision": true, "image_token_id": 18
+        \\}
+    ;
+    const radio = try parseConfigFromJson(testing.allocator, flagged);
+    try testing.expect(!radio.radio_vision and !radio.has_vision);
+    try testing.expectEqual(@as(u32, 18), radio.image_token_id);
+    try testing.expectEqual(@as(f64, 0), radio.video_pruning_rate);
+
+    const rated =
+        \\{"model_type":"nemotron_h","hidden_size":4096,"num_hidden_layers":2,
+        \\"num_attention_heads":32,"num_key_value_heads":2,"head_dim":128,
+        \\"vocab_size":131072,"layers_block_type":["mamba","moe"],
+        \\"vision_config":{"model_type":"radio","num_attention_heads":8,"video_pruning_rate":0.5}}
+    ;
+    const custom = try parseConfigFromJson(testing.allocator, rated);
+    try testing.expectEqual(@as(f64, 0.5), custom.video_pruning_rate);
+    try testing.expectEqual(@as(u32, 8), custom.radio_num_heads);
+}
+
+test "nemotron_h: Super checkpoint config preserves native language geometry" {
+    var config = try parseConfigFromJson(testing.allocator, @embedFile("fixtures/model-configs/nemotron_h_super_omni.json"));
+    defer config.deinit(testing.allocator);
+    try testing.expectEqualStrings("nemotron_h", config.model_type);
+    try testing.expectEqual(@as(u32, 88), config.num_hidden_layers);
+    try testing.expectEqual(@as(u32, 4096), config.hidden_size);
+    try testing.expectEqual(@as(u32, 1048576), config.max_position_embeddings);
+    try testing.expectEqual(@as(u32, 512), config.num_experts);
+    try testing.expectEqual(@as(u32, 22), config.num_experts_per_tok);
+    try testing.expectEqual(@as(u32, 1024), config.moe_latent_size);
+    try testing.expectEqual(@as(u32, 2688), config.moe_intermediate_size);
+    try testing.expectEqual(@as(u32, 5376), config.shared_expert_intermediate_size);
+    try testing.expectEqual(@as(f32, 5), config.router_scaling_factor);
+    try testing.expect(config.moe_route_norm);
+    try testing.expectEqual(@as(u32, 128), config.mamba_num_heads);
+    try testing.expectEqual(@as(u32, 64), config.mamba_head_dim);
+    try testing.expectEqual(@as(u32, 8), config.mamba_n_groups);
+    try testing.expectEqual(@as(u32, 128), config.ssm_state_size);
+    try testing.expectEqual(@as(u32, 128), config.mamba_chunk_size);
+    try testing.expectEqual(@as(u32, 4), config.quant_bits);
+    try testing.expectEqual(@as(u32, 64), config.quant_group_size);
+    try testing.expect(config.radio_vision and config.has_vision);
+    try testing.expect(config.radio_final_layernorm);
+    try testing.expectEqual(@as(f32, 1e-6), config.radio_ln_eps);
+    var blocks: [3]u32 = @splat(0);
+    for (config.layer_block_types[0..config.num_hidden_layers], config.layer_no_rope[0..config.num_hidden_layers]) |kind, no_rope| {
+        try testing.expect(no_rope);
+        switch (kind) {
+            .mamba2 => blocks[0] += 1,
+            .moe => blocks[1] += 1,
+            .attention => blocks[2] += 1,
+            else => return error.UnexpectedSuperBlock,
+        }
+    }
+    try testing.expectEqualSlices(u32, &.{ 40, 40, 8 }, &blocks);
+}
+
+test "nemotron_h: RADIO final LayerNorm epsilon is positive and finite" {
+    const prefix = "{\"model_type\":\"nemotron_h\",\"num_nextn_predict_layers\":1,\"vision_config\":{\"model_type\":\"radio\",\"layer_norm_eps\":";
+    inline for (.{ "0", "-0.01", "1e100", "\"nan\"" }) |epsilon| {
+        try testing.expectError(error.InvalidConfigField, parseConfigFromJson(testing.allocator, prefix ++ epsilon ++ "}}"));
+    }
+    var custom = try parseConfigFromJson(testing.allocator, prefix ++ "0.00001}}");
+    defer custom.deinit(testing.allocator);
+    try testing.expect(custom.radio_final_layernorm);
+    try testing.expectEqual(@as(f32, 0.00001), custom.radio_ln_eps);
+    var optional_null = try parseConfigFromJson(testing.allocator, prefix ++ "null}}");
+    defer optional_null.deinit(testing.allocator);
+    try testing.expect(optional_null.radio_final_layernorm);
+    try testing.expectEqual(@as(f32, 1e-6), optional_null.radio_ln_eps);
+}
+
+test "nemotron_h: RADIO pruning preserves checkpoint decimal precision" {
+    inline for (.{ "0.1", "0.3" }) |rate| {
+        const root_rate = try parseConfigFromJson(testing.allocator, "{\"model_type\":\"nemotron_h\",\"vision_config\":{\"model_type\":\"radio\"},\"video_pruning_rate\":" ++ rate ++ "}");
+        const nested_rate = try parseConfigFromJson(testing.allocator, "{\"model_type\":\"nemotron_h\",\"vision_config\":{\"model_type\":\"radio\",\"video_pruning_rate\":" ++ rate ++ "}}");
+        const expected = try std.fmt.parseFloat(f64, rate);
+        try testing.expectEqual(expected, @as(f64, root_rate.video_pruning_rate));
+        try testing.expectEqual(expected, @as(f64, nested_rate.video_pruning_rate));
+    }
+}
+
+test "nemotron_h: time_step_limit accepts only numeric bounds and positive infinity" {
+    const prefix = "{\"model_type\":\"nemotron_h\",\"time_step_limit\":[0,";
+    inline for (.{ "{\"__float__\":\"Infinity\"}", "\"Infinity\"" }) |bound| {
+        const cfg = try parseConfigFromJson(testing.allocator, prefix ++ bound ++ "]}");
+        try testing.expectEqual(std.math.inf(f32), cfg.time_step_max);
+    }
+    const finite = try parseConfigFromJson(testing.allocator, prefix ++ "0.125]}");
+    try testing.expectEqual(@as(f32, 0.125), finite.time_step_max);
+    inline for (.{ "{\"__float__\":\"-Infinity\"}", "{\"__float__\":\"NaN\"}", "{\"other\":\"Infinity\"}", "\"NaN\"", "\"-Infinity\"", "{}", "null", "true" }) |bound| {
+        try testing.expectError(error.InvalidConfigField, parseConfigFromJson(testing.allocator, prefix ++ bound ++ "]}"));
+    }
+    try testing.expectError(error.InvalidConfigField, parseConfigFromJson(testing.allocator, "{\"model_type\":\"nemotron_h\",\"time_step_limit\":[0.5,0.25]}"));
 }
 
 test "bailing_hybrid: a null q_lora_rank is the direct-q_proj arm, not a refusal" {

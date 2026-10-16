@@ -41,6 +41,80 @@ const testing = std.testing;
 const chat = @import("chat.zig");
 const mtp = @import("mtp.zig");
 
+test "format corpus: video atoms come only from media parts and preserve text" {
+    const clips = [_]chat.VideoData{.{ .pixels = "", .grid_t = 128, .grid_h = 32, .grid_w = 32 }};
+    for ([_][]const u8{ "system", "user", "assistant", "tool" }) |role| {
+        for ([_]?[]const u8{ null, "<img>" }) |video_atom| {
+            const config = chat.ChatConfig{
+                .chat_template = "",
+                .bos_token = null,
+                .eos_token = null,
+                .add_bos_token = false,
+                .allocator = testing.allocator,
+                .video_placeholder = video_atom,
+            };
+            const text = "HTML <video> is text; tool results may also contain <video>.";
+            const messages = [_]chat.Message{.{ .role = role, .content = text, .videos = &clips }};
+            const json = try chat.serializeMessagesJsonFor(testing.allocator, &messages, .null_literal, &config);
+            defer testing.allocator.free(json);
+            const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, json, .{});
+            defer parsed.deinit();
+            const parts = parsed.value.array.items[0].object.get("content").?.array.items;
+            try testing.expectEqual(@as(usize, 2), parts.len);
+            const media = parts[0].object;
+            if (video_atom) |atom| {
+                try testing.expectEqualStrings("text", media.get("type").?.string);
+                try testing.expectEqualStrings(atom, media.get("text").?.string);
+            } else try testing.expectEqualStrings("video", media.get("type").?.string);
+            try testing.expectEqualStrings(text, parts[1].object.get("text").?.string);
+        }
+    }
+}
+
+test "format corpus: native RADIO capabilities agree before and after load" {
+    const model = @import("model.zig");
+    const discovery = @import("model_discovery.zig");
+    const cases = [_]struct { source: []const u8, radio: bool, final_norm: bool = false }{
+        .{ .source = @embedFile("fixtures/model-configs/nemotron_h_super_omni.json"), .radio = true, .final_norm = true },
+        .{ .source = "{\"model_type\":\"nemotron_h_omni\",\"vision_config\":{\"model_type\":\"radio\",\"num_attention_heads\":16},\"llm_config\":{\"model_type\":\"nemotron_h_puzzle\",\"hidden_size\":4096,\"max_position_embeddings\":262144,\"layers_block_type\":[\"mamba\",\"moe\",\"attention\"]}}", .radio = true },
+        .{ .source = "{\"model_type\":\"nemotron_h\",\"radio_vision\":true}", .radio = false },
+        .{ .source = "{\"model_type\":\"nemotron_h\",\"vision_config\":{}}", .radio = false },
+        .{ .source = "{\"model_type\":\"nemotron_h\",\"vision_config\":{\"model_type\":\"other\"}}", .radio = false },
+    };
+    for (cases) |case| {
+        const parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.source, .{});
+        defer parsed.deinit();
+        try testing.expectEqual(case.radio, discovery.hasRadioVision(parsed.value.object));
+        var config = try model.parseConfigFromJson(testing.allocator, case.source);
+        defer config.deinit(testing.allocator);
+        try testing.expectEqual(case.radio, config.radio_vision);
+        try testing.expectEqual(case.radio, config.has_vision);
+        try testing.expectEqual(case.final_norm, config.radio_final_layernorm);
+        const stub = discovery.parseStubMeta(testing.allocator, case.source, true);
+        try testing.expectEqual(case.radio, stub.has_vision);
+        try testing.expectEqual(case.radio, stub.has_video);
+        if (case.radio) {
+            try testing.expectEqual(config.hidden_size, stub.hidden_size);
+            try testing.expectEqual(config.num_hidden_layers, stub.num_hidden_layers);
+            try testing.expectEqual(config.max_position_embeddings, stub.max_position_embeddings);
+        }
+    }
+}
+
+test "format corpus: Nemotron SSM bounds reject nonnumeric sentinel values" {
+    const model = @import("model.zig");
+    for ([_][]const u8{ "nemotron_h", "nemotron_h_puzzle", "nemotron_h_omni" }) |model_type| {
+        for ([_][]const u8{ "\"NaN\"", "\"-Infinity\"", "{\"__float__\":\"-Infinity\"}", "{\"__float__\":\"NaN\"}", "{}", "true" }) |bound| {
+            const source = if (std.mem.eql(u8, model_type, "nemotron_h_omni"))
+                try std.fmt.allocPrint(testing.allocator, "{{\"model_type\":\"nemotron_h_omni\",\"llm_config\":{{\"model_type\":\"nemotron_h_puzzle\",\"time_step_limit\":[0,{s}]}}}}", .{bound})
+            else
+                try std.fmt.allocPrint(testing.allocator, "{{\"model_type\":\"{s}\",\"time_step_limit\":[0,{s}]}}", .{ model_type, bound });
+            defer testing.allocator.free(source);
+            try testing.expectError(error.InvalidConfigField, model.parseConfigFromJson(testing.allocator, source));
+        }
+    }
+}
+
 test "format corpus: late system notes never vanish or rewrite supported history" {
     const templates = [_]struct { source: []const u8, in_place: bool }{
         .{ .source = @embedFile("fixtures/qwen38_27b_chat_template.jinja"), .in_place = true },
@@ -2393,7 +2467,9 @@ test "format corpus: no flush boundary lands inside a tool-call opener, any fami
     //     prose word `<functional`, which must FLUSH — asserting over
     //     no_tool_calls entries would demand the gate suppress ordinary text.
     const gate_split_markers = [_][]const u8{
-        "<tool_call", "<|tool_call", "<atem:", "<｜DSML｜", "<function",
+        "<tool_call", "<|tool_call", "<atem:",
+        "<｜DSML｜",
+        "<function",
     };
     var checked: usize = 0;
     for (corpus) |entry| {
@@ -2778,5 +2854,24 @@ test "format corpus: constrained JSON marker strings are data on every protocol"
             try output.appendSlice(testing.allocator, delivery.content.items);
         }
         try testing.expectEqualStrings(json, output.items);
+    }
+}
+
+test "format corpus: native LiLiCorr configs preserve borrowed and own output heads" {
+    const dflash = @import("dflash.zig");
+    const cases = [_]struct { source: []const u8, own_head: bool, captures: []const u32 }{
+        .{ .source = @embedFile("fixtures/lilicorr_config.json"), .own_head = false, .captures = &.{ 0, 17, 34, 50, 67, 84 } },
+        .{ .source = @embedFile("fixtures/model-configs/nemotron_h_super_drafter.json"), .own_head = true, .captures = &.{ 0, 21, 42, 63, 84 } },
+    };
+    for (cases) |case| {
+        var parsed = try std.json.parseFromSlice(std.json.Value, testing.allocator, case.source, .{});
+        defer parsed.deinit();
+        try testing.expect(dflash.isDflashConfigJson(parsed.value.object));
+        var config = try dflash.parseConfigFromJson(testing.allocator, case.source);
+        defer config.deinit(testing.allocator);
+        try testing.expect(config.lilicorr);
+        try testing.expectEqual(case.own_head, config.has_own_lm_head);
+        if (case.own_head) try testing.expectEqual(@as(u32, 131072), config.draft_vocab_size);
+        try testing.expectEqualSlices(u32, case.captures, config.captureIds());
     }
 }
