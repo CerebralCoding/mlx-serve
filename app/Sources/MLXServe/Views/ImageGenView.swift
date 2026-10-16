@@ -43,9 +43,9 @@ struct ImageGenView: View {
     @State private var initImageURL: URL? = nil
     /// Its pixel size, read from the file header when it is set.
     @State private var sourceSize: (width: Int, height: Int)? = nil
-    /// Extra in-context references for edit mode (FLUX.2 multi-reference):
-    /// "replace the face in image 1 with the face from image 2". The server
-    /// takes at most 3 beside the source.
+    /// Extra in-context references for edit mode (multi-reference):
+    /// "replace the face in image 1 with the face from image 2". Capped per
+    /// model by `maxReferenceImages`.
     @State private var refImageURLs: [URL] = []
     /// img2img renoise strength: low = stay close to the source, high = mostly prompt.
     @State private var strength: Double = 0.6
@@ -868,7 +868,7 @@ struct ImageGenView: View {
     /// Max simultaneously-attached LoRAs — mirrors the server's `lora.MAX_LORAS`.
     private let maxLoras = 8
     /// Reference images an edit takes beside the source.
-    private let maxRefImages = 3
+    private var maxRefImages: Int { model.maxReferenceImages }
 
     /// Routing lives in `ImageDropPlacement` — one drop can carry several
     /// files, so this is the whole placement (source, then references) applied
@@ -1082,6 +1082,8 @@ struct ImageGenView: View {
     // MARK: - Actions
 
     private func applyModelDefaults() {
+        // A smaller model takes fewer references than the one before it.
+        refImageURLs = Array(refImageURLs.prefix(model.maxReferenceImages))
         quality = model.defaultQuality
         // Grids are per-model (Mage-Flow offers 2048 and 4:1 shapes FLUX
         // doesn't), so the canvas restarts from the model's default; an edit

@@ -1071,7 +1071,9 @@ final class MediaGenServiceTests: XCTestCase {
             XCTAssertTrue(p.supportsImg2Img, "\(p.id): VAE encoder loads on first use")
             XCTAssertTrue(p.supportsLoRA, "\(p.id): block linears take stacked adapters")
             XCTAssertTrue(p.supportsGuidance, "\(p.id): undistilled, real CFG")
-            XCTAssertFalse(p.supportsReferenceEdit)
+            XCTAssertTrue(p.supportsReferenceEdit, "\(p.id): unified t2i + edit checkpoint")
+            XCTAssertEqual(p.maxReferenceImages, 9, "gen.editRefCap: 10 total beside the source")
+            XCTAssertEqual(p.capabilityLabel, "Best for creating images")
             XCTAssertEqual(p.condWeightCount, 0)
             XCTAssertFalse(p.stepsAreFixed)
             XCTAssertEqual(p.settings(.quality).steps, 40, "\(p.id): the checkpoint's own default")
@@ -1083,6 +1085,9 @@ final class MediaGenServiceTests: XCTestCase {
             XCTAssertTrue(ImageModelPreset.all.contains(p))
             XCTAssertTrue(p.bundle.components[0].readyMarkers.contains("processor"))
         }
+        XCTAssertTrue(ImageModelPreset.qwenImage21Turbo_8bit.supportsReferenceEdit)
+        XCTAssertEqual(ImageModelPreset.flux2Klein4B_Q4.maxReferenceImages, 3)
+        XCTAssertEqual(ImageModelPreset.mageFlowEditTurbo.maxReferenceImages, 3)
     }
 
     /// Turbo ships its own 8-sigma grid and the server runs it whatever `steps`

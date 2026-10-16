@@ -2179,7 +2179,7 @@ struct ImageGenRequest {
     /// Extra in-context reference images for edit mode (FLUX.2
     /// multi-reference): "replace the face in image 1 with the face from
     /// image 2". Sent as `ref_images` beside the primary source; the server
-    /// takes at most 3.
+    /// takes at most `ImageModelPreset.maxReferenceImages`.
     var refImagePaths: [String] = []
     /// Conditioning rebalance (Advanced): global multiplier on the prompt
     /// embeddings. 1.0 = off.
@@ -2230,10 +2230,26 @@ extension ImageModelPreset {
     }
 
     /// Instruction editing (in-context reference conditioning) is a trained
-    /// capability: FLUX.2-klein, and the Mage-Flow-Edit checkpoint. Krea and
-    /// Mage-Flow Turbo (txt2img) can only do renoise variations.
+    /// capability: FLUX.2-klein, the Mage-Flow-Edit checkpoint, and
+    /// Qwen-Image-2.1 (a unified t2i + edit checkpoint). Krea and Mage-Flow
+    /// Turbo (txt2img) can only do renoise variations.
     var supportsReferenceEdit: Bool {
-        variant == .flux2Klein4B || variant == .flux2Klein9B || variant == .flux2Klein9BBase || variant == .mageFlowEditTurbo
+        switch variant {
+        case .flux2Klein4B, .flux2Klein9B, .flux2Klein9BBase, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo:
+            return true
+        case .krea2Turbo, .mageFlowTurbo:
+            return false
+        }
+    }
+
+    /// Reference images an edit takes beside the source — the server's
+    /// `gen.editRefCap` minus the source itself (10 total for Qwen-Image, 4
+    /// for the other editors).
+    var maxReferenceImages: Int {
+        switch variant {
+        case .qwenImage21, .qwenImage21Turbo: return 9
+        default: return 3
+        }
     }
 
     /// Real classifier-free guidance (`guidance_scale` + negative prompt) —
