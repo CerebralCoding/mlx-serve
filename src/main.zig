@@ -12,6 +12,13 @@ const transformer_mod = @import("transformer.zig");
 const round_cost_mod = @import("round_cost.zig");
 const generate_mod = @import("generate.zig");
 pub const mtp_acceptance = @import("mtp_acceptance.zig");
+/// Sushi's EXL3 routed experts, for the plugins that reach them through their host root (`mlx_host`).
+pub const sushi_exl3 = @import("sushi_exl3");
+pub const dsa_nax = @import("dsa_nax.zig");
+comptime {
+    // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
+    @import("plugin_host_check.zig").reexports(@This());
+}
 const model_discovery = @import("model_discovery.zig");
 const gguf_meta = @import("gguf_meta.zig");
 const model_registry_mod = @import("model_registry.zig");
@@ -49,6 +56,8 @@ const ane_mod = @import("ane.zig");
 const ple_gpu = @import("ple_gpu.zig");
 
 pub const VERSION: []const u8 = build_options.version;
+/// `-Dplugin-profile`: the mlx-stream plugin's sdk reads this (`mlx_host.plugin_profile`) to compile its profile probes in.
+pub const plugin_profile: bool = build_options.plugin_profile;
 
 // ggml runtime version (llama.cpp), linked into the macOS exe. Referenced only
 // by the `--version` report, which runs before any engine init.

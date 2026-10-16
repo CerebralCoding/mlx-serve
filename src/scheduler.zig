@@ -2136,6 +2136,9 @@ pub const Scheduler = struct {
                 }
             }
 
+            // One stream pack at a time reads the process's foreign-bytes value (DeepSeek-V4.1, GLM-5.3).
+            const foreign_reader = try self.registry.foreignReaderVictimLocked(entry.id, owned.config);
+
             // Claim the slot.
             std.debug.assert(self.registry.tryBeginLoadLocked(entry));
             // From the claim: while victims unload or the queue waits, not the last load's numbers.
@@ -2159,7 +2162,7 @@ pub const Scheduler = struct {
             // (multi-victim). On failure — every other resident model is pinned
             // by an in-flight request — roll back and surface a 503 instead of
             // loading anyway and crashing.
-            const n = self.registry.planEvictionsLocked(entry.id, &victims_buf, mlxActiveBytes()) orelse {
+            const n = self.registry.planEvictionsLocked(entry.id, foreign_reader, &victims_buf, mlxActiveBytes()) orelse {
                 // Name the numbers. A refusal that logs NOTHING sends the user
                 // hunting for a concurrent request that does not exist: on an
                 // idle server the cause is always the static cap (#126), and
@@ -5570,6 +5573,23 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
         if (chatPass(sch, .main) == .shutdown) break;
     }
+    closeGlmModels(sch);
+}
+
+/// At shutdown, on the inference thread: GLM-5.3's module synchronizes its stream as it frees, and MLX finds that
+/// stream only on this thread, not on the one that joins it (`Scheduler.deinit`, where every other model unloads as
+/// before; "There is no Stream(gpu, 0) in current thread", mlx-c stream.cpp).
+fn closeGlmModels(sch: *Scheduler) void {
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry| {
+        const x = entry.*.transformer orelse continue;
+        if (!x.config.glm_stream) continue;
+        const m = x.mlx_stream_ext orelse continue;
+        mlx_stream.close(m);
+        x.mlx_stream_ext = null;
+    }
 }
 
 /// Cleanup, vision and embed work, drained on the inference thread. Returns
@@ -6882,6 +6902,8 @@ fn finishSlot(sch: *Scheduler, slot: *Slot, reason: []const u8) void {
     // captured exactly at prefill completion); recordRequest derives
     // e2e = first_token_ns + decode_ns.
     recordSlotEnd(sch.metrics, slot, finishOutcome(reason, latched));
+    // mlx-stream: the arch's request end (GLM-5.3's decode line), before the terminator.
+    if (slot.model.transformer) |x| if (x.mlx_stream_ext) |m| mlx_stream.end(m);
     publishSlotTerminator(slot, reason, latched);
     if (hc_opt) |hc| {
         if (stream_opt) |s| {

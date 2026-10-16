@@ -2171,7 +2171,9 @@ pub fn serve(
     // (pi/opencode bake it into a config file) and budget against it for the
     // whole session, so it must not drift with system load. `--ctx-size` wins.
     const pinned = pinAutoContext(@constCast(config));
-    if (manualContext(config) > 0) {
+    if (config.glm_stream) {
+        log.info("Context size: {d} tokens (mlx-stream: the prompts this load billed and the generation past them)\n", .{mlx_stream.contextLength(config)});
+    } else if (manualContext(config) > 0) {
         log.info("Context size: {d} tokens (manual)\n", .{manualContext(config)});
     } else if (config.mlxStream()) {
         log.info("Context size: {d} tokens (the streaming pack's standard request; --ctx-size widens it)\n", .{getEffectiveContextLength(config)});
@@ -4150,9 +4152,10 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         }
         // Say it once per model, wherever the model was pinned from (startup
         // primary or on-demand load) — a narrowed prefill otherwise reads as an
-        // unexplained slowdown.
+        // unexplained slowdown. mlx-stream takes GLM-5.3's whole prompt in one
+        // forward and chunks it itself.
         if (config.pinned_prefill_chunk < generate_mod.prefill_chunk_override and
-            !generate_mod.prefill_chunk_explicit)
+            !generate_mod.prefill_chunk_explicit and !config.glm_stream)
         {
             log.info("Prefill chunk: {d} tokens (memory-sized down from {d}; --prefill-chunk overrides)\n", .{ config.pinned_prefill_chunk, generate_mod.prefill_chunk_override });
         }
@@ -14491,6 +14494,7 @@ fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched: *sc
         error.InsufficientMemory => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503),
         error.LoadFailed => try sendLoadFailedResponse(allocator, stream, sched, id),
         error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503),
+        error.ForeignBytesReaderBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another DeepSeek-V4.1 or GLM-5.3 stream pack is in use; retry when its request finishes", 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
         // config.json, etc.) bubble out of `preloadCpuState`. Surface a
@@ -21524,6 +21528,15 @@ test "clampMaxTokens honors the effective context (auto-pinned, not just --ctx-s
     try testing.expectEqual(@as(u32, 1), clampMaxTokens(8192, 9000, 4096));
     // ctx 0 (unknown) = no limit.
     try testing.expectEqual(@as(u32, 8192), clampMaxTokens(8192, 4000, 0));
+}
+
+test "a GLM-5.3 request of 16,387 prompt tokens asking max_tokens 131,072 keeps all of it: the arch's maxOutput, not the plugin's 8,192" {
+    if (comptime !mlx_stream.built) return error.SkipZigTest;
+    // The pack's parse records its arch's maxOutput (GLM-5.3's default, 131,072) beside its billed context.
+    mlx_stream.noteMaxOutput("/packs/glm-5.3-clamp", 131072);
+    var config: model_mod.ModelConfig = .{ .model_type = "glm_moe_dsa", .pack_dir = "/packs/glm-5.3-clamp", .glm_stream = true, .ctx_override = 16448 };
+    try testing.expectEqual(@as(u32, 16448 + 131072), getEffectiveContextLength(&config));
+    try testing.expectEqual(@as(u32, 131072), clampMaxTokens(131072, 16387, getEffectiveContextLength(&config)));
 }
 
 test "getEffectiveContextLength uses ctx_size override" {

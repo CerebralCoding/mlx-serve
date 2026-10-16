@@ -1211,19 +1211,49 @@ pub const ModelRegistry = struct {
         mlx_stream.setForeignBytes(self.streamForeignBytesLocked());
     }
 
-    /// What every ready model except the DeepSeek-V4.1 stream pack holds: the plugin bills only its own bytes, and its
-    /// footprint reads are the whole process's. Only DeepSeek-V4.1's module reads the value, so only its own pack is
-    /// left out; a MiMo stream pack's bytes are foreign to it. Caller holds `mutex`.
+    /// A stream pack whose plugin module reads the process's foreign-bytes value (`mlx_stream.setForeignBytes`):
+    /// DeepSeek-V4.1's and GLM-5.3's. The value is one number for the process, so it is correct for one such pack at a
+    /// time: a load of a second unloads the first (`foreignReaderVictimLocked`).
+    pub fn readsForeignBytes(c: *const ModelConfig) bool {
+        return c.dsv41_stream or c.glm_stream;
+    }
+
+    /// What every ready model except a stream pack whose module reads the value holds: the plugin bills only its own
+    /// bytes, and its footprint reads are the whole process's. DeepSeek-V4.1's and GLM-5.3's modules read it, so their
+    /// packs are left out; a MiMo or GLM-5.3-Flash stream pack's bytes are foreign to them. One reader pack at a time
+    /// (`foreignReaderVictimLocked`): with two, each one's bound would leave out the other's residents. Caller holds
+    /// `mutex`.
     pub fn streamForeignBytesLocked(self: *ModelRegistry) u64 {
         var sum: u64 = 0;
         var it = self.entries.valueIterator();
         while (it.next()) |entry_ptr| {
             const entry = entry_ptr.*;
             if (entry.state != .ready) continue;
-            if (entry.config) |c| if (c.dsv41_stream) continue;
+            if (entry.config) |c| if (readsForeignBytes(c)) continue;
             sum +|= entry.bytes_resident;
         }
         return sum;
+    }
+
+    /// The entry a load of `incoming` unloads first: another resident stream pack that reads the foreign-bytes value,
+    /// when `incoming` reads it too; else null. One in use, loading or evicting is `error.ForeignBytesReaderBusy`.
+    /// Caller holds `mutex`.
+    pub fn foreignReaderVictimLocked(self: *ModelRegistry, exclude_id: []const u8, incoming: *const ModelConfig) error{ForeignBytesReaderBusy}!?*LoadedModel {
+        if (!readsForeignBytes(incoming)) return null;
+        var it = self.entries.valueIterator();
+        while (it.next()) |entry_ptr| {
+            const entry = entry_ptr.*;
+            if (std.mem.eql(u8, entry.id, exclude_id)) continue;
+            if (entry.state != .ready and entry.state != .loading and entry.state != .evicting) continue;
+            const c = entry.config orelse continue;
+            if (!readsForeignBytes(c)) continue;
+            if (entry.state != .ready or entry.refcount.load(.acquire) != 0) {
+                log.err("{s}: refused: {s} is busy, and both stream packs read the one process foreign-bytes value\n", .{ exclude_id, entry.id });
+                return error.ForeignBytesReaderBusy;
+            }
+            return entry;
+        }
+        return null;
     }
 
     /// Release a borrowed pointer obtained from `ensureLoaded`. Decrements
@@ -1396,12 +1426,20 @@ pub const ModelRegistry = struct {
     /// chosen victim `.evicting` and writes it into `out`; returns the count,
     /// or null if the caps can't be met (no more evictable victims, or `out`
     /// too small) — in which case any victims marked here are rolled back so
-    /// the registry is left untouched. Caller holds `mutex` and must drain each
+    /// the registry is left untouched. `forced` (idle, `.ready`) is the first
+    /// victim whatever the caps say. Caller holds `mutex` and must drain each
     /// returned victim's refcount, then hand them to the load request to free.
-    pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, out: []*LoadedModel, live_bytes: u64) ?usize {
+    pub fn planEvictionsLocked(self: *ModelRegistry, exclude_id: []const u8, forced: ?*LoadedModel, out: []*LoadedModel, live_bytes: u64) ?usize {
         var n: usize = 0;
         var freed: u64 = 0;
         var freed_slots: u32 = 0;
+        if (forced) |v| {
+            self.markEvictingLocked(v);
+            out[0] = v;
+            n = 1;
+            freed = v.bytes_resident;
+            freed_slots = @intFromBool(takesSlot(v));
+        }
         const loading_slot: u32 = if (self.entries.get(exclude_id)) |e| @intFromBool(takesSlot(e)) else 1;
         while (true) {
             // Resident-after-plan = current minus what these victims free, plus
@@ -1921,7 +1959,7 @@ test "ModelRegistry: the streaming pack's foreign bytes are every other ready mo
     defer stream.config = null; // borrowed: the registry frees the configs it owns
     _ = try makeReadyStub(reg, "krea", 14_730_000_000);
     _ = try reg.registerStub("yue2", "yue2", 4_000_000_000); // discovered, never loaded
-    // A second stream pack (MiMo) is foreign to DeepSeek-V4.1's module, the only reader of the value.
+    // A second stream pack (MiMo) is foreign: its module does not read the value.
     var mimo_cfg = ModelConfig{};
     mimo_cfg.mimo_stream = true;
     const mimo = try makeReadyStub(reg, "mimo", 9_000_000_000);
@@ -2226,7 +2264,7 @@ test "planEvictions: evicts one LRU victim to fit the memory budget" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(c.id, &buf, 0).?;
+    const n = reg.planEvictionsLocked(c.id, null, &buf, 0).?;
     try testing.expectEqual(@as(usize, 1), n);
     try testing.expectEqualStrings("a", buf[0].id); // LRU victim
     try testing.expectEqual(LoadState.evicting, buf[0].state);
@@ -2243,9 +2281,9 @@ test "planEvictions: live memory above the billed weights forces an eviction" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(c.id, null, &buf, 0));
     // KV, caches and a wired table put 95 bytes live: 95 + 10 > 100.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 95));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, null, &buf, 95));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2261,7 +2299,7 @@ test "planEvictions: multi-victim — evicts as many as needed to fit" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    const n = reg.planEvictionsLocked(d.id, &buf, 0).?;
+    const n = reg.planEvictionsLocked(d.id, null, &buf, 0).?;
     try testing.expectEqual(@as(usize, 2), n); // a and b (the two oldest)
 }
 
@@ -2275,7 +2313,7 @@ test "planEvictions: returns null and rolls back when every victim is pinned" {
     const b = try beginLoad(reg, "b", 80); // 80 + 80 = 160 > 100 → must evict a
     reg.mutex.lockUncancelable(io);
     var buf: [16]*LoadedModel = undefined;
-    const plan = reg.planEvictionsLocked(b.id, &buf, 0);
+    const plan = reg.planEvictionsLocked(b.id, null, &buf, 0);
     try testing.expectEqual(@as(?usize, null), plan); // can't evict the pinned victim
     try testing.expectEqual(LoadState.ready, a.state); // rolled back, not left .evicting
     // Scheduler then rolls back the load → releases the reservation.
@@ -2339,7 +2377,7 @@ test "reservation: concurrent in-flight load is visible in the budget gate" {
     reg.mutex.lockUncancelable(io);
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
-    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, null), reg.planEvictionsLocked(c.id, null, &buf, 0));
 }
 
 test "planEvictions: a transcription's aligner and diarizer take no model slot" {
@@ -2358,12 +2396,12 @@ test "planEvictions: a transcription's aligner and diarizer take no model slot" 
     reg.reserveLoadLocked(diarizer, 10);
     var buf: [16]*LoadedModel = undefined;
     // chat and asr fill the two slots; the companions sit beside them.
-    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 0), reg.planEvictionsLocked(diarizer.id, null, &buf, 0));
     reg.markReadyLocked(diarizer, 10);
     // A third model that takes a slot evicts the oldest that holds one, never a companion.
     try testing.expect(reg.tryBeginLoadLocked(image));
     reg.reserveLoadLocked(image, 10);
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(image.id, null, &buf, 0));
     try testing.expectEqual(chat, buf[0]);
 }
 
@@ -2378,7 +2416,7 @@ test "planEvictions: another model still loading counts against the model cap" {
     defer reg.mutex.unlock(io);
     var buf: [16]*LoadedModel = undefined;
     // a + b + c would be three models under a cap of two: `a` has to go.
-    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, &buf, 0));
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(c.id, null, &buf, 0));
     try testing.expectEqualStrings("a", buf[0].id);
 }
 
@@ -2564,4 +2602,39 @@ test "ModelRegistry: registerByPath registers under the caller's org/name id" {
     try testing.expect(reg.peek("org/name") != null);
     try testing.expectEqualStrings(id, try reg.registerByPath(io, path, "org/name"));
     try testing.expectEqual(@as(usize, 1), reg.entries.count());
+}
+
+test "ModelRegistry: a second stream pack that reads the foreign bytes unloads an idle one and is refused by a busy one" {
+    var reg = try ModelRegistry.init(testing.allocator, std.Io.Threaded.global_single_threaded.io(), null, 3, 0, null);
+    defer reg.deinit();
+    var dsv41_cfg = ModelConfig{};
+    dsv41_cfg.dsv41_stream = true;
+    const dsv41 = try makeReadyStub(reg, "deepseek", 180_000_000_000);
+    dsv41.config = &dsv41_cfg;
+    defer dsv41.config = null;
+    var glm_cfg = ModelConfig{};
+    glm_cfg.glm_stream = true;
+    var mimo_cfg = ModelConfig{};
+    mimo_cfg.mimo_stream = true;
+    const plain = ModelConfig{};
+    const glm = try beginLoad(reg, "glm", 100);
+
+    reg.mutex.lockUncancelable(reg.io);
+    defer reg.mutex.unlock(reg.io);
+    // MiMo and a model without a stream pack do not read the value; a reload of the same id is not a second reader.
+    try testing.expect(try reg.foreignReaderVictimLocked("mimo", &mimo_cfg) == null);
+    try testing.expect(try reg.foreignReaderVictimLocked("plain", &plain) == null);
+    try testing.expect(try reg.foreignReaderVictimLocked("deepseek", &dsv41_cfg) == null);
+    // Busy: refused by name, nothing marked.
+    _ = dsv41.refcount.fetchAdd(1, .acq_rel);
+    try testing.expectError(error.ForeignBytesReaderBusy, reg.foreignReaderVictimLocked("glm", &glm_cfg));
+    dsv41.refcount.store(0, .release);
+    // Idle: the plan evicts it although both caps hold.
+    const victim = (try reg.foreignReaderVictimLocked("glm", &glm_cfg)).?;
+    try testing.expectEqualStrings("deepseek", victim.id);
+    var buf: [16]*LoadedModel = undefined;
+    try testing.expectEqual(@as(?usize, 1), reg.planEvictionsLocked(glm.id, victim, &buf, 0));
+    try testing.expectEqual(LoadState.evicting, dsv41.state);
+    reg.unmarkEvictingLocked(dsv41);
+    reg.markUnloadedLocked(glm);
 }

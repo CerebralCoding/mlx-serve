@@ -6,6 +6,12 @@ pub const mlx = @import("mlx.zig");
 pub const io_util = @import("io_util.zig");
 pub const mtp_acceptance = @import("mtp_acceptance.zig");
 pub const log = @import("log.zig");
+pub const dsa_nax = @import("dsa_nax.zig");
+pub const sushi_exl3 = @import("sushi_exl3");
+comptime {
+    // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
+    @import("plugin_host_check.zig").reexports(@This());
+}
 
 test {
     _ = @import("log.zig");
@@ -13,6 +19,7 @@ test {
     _ = @import("crt.zig");
     _ = @import("win_io.zig");
     _ = @import("arch/mlx_gguf.zig");
+    if (@import("build_options").mlx_stream) _ = @import("arch/mlx_stream.zig");
     _ = @import("version.zig");
     _ = @import("chat.zig");
     _ = @import("format_corpus_test.zig");
@@ -55,6 +62,7 @@ test {
     _ = @import("dec_attn.zig");
     _ = @import("nax_attention.zig");
     _ = @import("glm5_next.zig");
+    _ = @import("dsa_nax.zig");
     _ = @import("kda_recurrence.zig");
     _ = @import("gdn_decode.zig");
     _ = @import("row_attn.zig");

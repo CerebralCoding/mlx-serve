@@ -1,5 +1,9 @@
 # Changelog
 
+## Unreleased
+
+- **GLM-5.3.** Z.ai's 744B MoE runs from an mlx-stream pack on a 256 GB Mac, with its experts streamed from SSD; text, thinking (with `reasoning_effort`) and tool calls. It reads its own keys from `model-settings.json`.
+
 ## v26.10.3 — Speech to Text - MiniCPM-V Vision - Films - Twice-as-Fast Sushi MiMo
 
 - **Speech to text.** `POST /v1/audio/transcriptions` turns WAV recordings into text in 30 languages with Qwen3-ASR, through the OpenAI SDK's own transcription call, with word and sentence times and SRT/WebVTT subtitles in 11 of them from Qwen3-ForcedAligner, and who said what (`diarized_json`, up to eight speakers) from NVIDIA's Nemotron 3 Diarization; the app downloads both alongside.
