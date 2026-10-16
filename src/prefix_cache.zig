@@ -52,7 +52,7 @@ pub const MediaSpan = kv_disk_cache.MediaSpan;
 pub const mediaSharedBound = kv_disk_cache.mediaSharedBound;
 
 /// The spans whose rows lie inside `[0, len)`.
-fn spansBelow(spans: []const MediaSpan, len: usize) []const MediaSpan {
+pub fn spansBelow(spans: []const MediaSpan, len: usize) []const MediaSpan {
     var n: usize = 0;
     while (n < spans.len and spans[n].start < len) n += 1;
     return spans[0..n];

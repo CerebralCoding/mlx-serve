@@ -1271,11 +1271,12 @@ pub const DiskTier = struct {
         config: kv_quant.KVQuantConfig,
         tokens: []const u32,
         has_tools: bool,
+        media: []const MediaSpan,
         ssm_checkpoints: ?[]const transformer_mod.SSMCheckpoint,
         s: mlx.mlx_stream,
         flush_bound: u64,
     ) !PersistOutcome {
-        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, &.{}, ssm_checkpoints, null, null, s, flush_bound);
+        return self.appendCommitWithSpecBounded(kv_entries, step, config, tokens, has_tools, media, ssm_checkpoints, null, null, s, flush_bound);
     }
 
     /// `appendCommit` plus the v4 spec snapshots (dflash assistant context /
@@ -7246,14 +7247,14 @@ test "DiskTier chunk share: an heir links ONLY the donor's landed chunks; the do
     const donor_bound: u64 = 1;
 
     // Donor: chunks 0 and 1 landed, chunk 2 queued (writer paused).
-    _ = try tier.appendCommitBounded(cache.entries, cache.step, cache.config, &toks.a, false, null, s, donor_bound);
+    _ = try tier.appendCommitBounded(cache.entries, cache.step, cache.config, &toks.a, false, &.{}, null, s, donor_bound);
     tier.drainWriter();
-    _ = try tier.appendCommitBounded(cache.entries, cache.step, cache.config, &toks.a, false, null, s, donor_bound);
+    _ = try tier.appendCommitBounded(cache.entries, cache.step, cache.config, &toks.a, false, &.{}, null, s, donor_bound);
     tier.drainWriter();
     try testing.expectEqual(@as(u32, 256), tier.entries.items[0].kv_len);
     tier.writer.?.setPaused(true);
     defer tier.writer.?.setPaused(false);
-    _ = try tier.appendCommitBounded(cache.entries, cache.step, cache.config, &toks.a, false, null, s, donor_bound);
+    _ = try tier.appendCommitBounded(cache.entries, cache.step, cache.config, &toks.a, false, &.{}, null, s, donor_bound);
     try testing.expectEqual(@as(u32, 384), tier.entries.items[0].kv_len);
     const donor_id = tier.entries.items[0].id;
     try testing.expect(chunkStat(io, base, "fp-landed", donor_id, 2) == null); // still queued
@@ -7515,6 +7516,38 @@ test "DiskTier v9: media spans round-trip through meta and clamp matching per en
         const got = try cacheValueAt(&cache2, 1, pos, 5, s);
         try testing.expectEqual(want, got);
     }
+}
+
+test "DiskTier v9: a bounded write-through commit keeps its spans, so a restore past the image needs its pixels" {
+    const io = std.testing.io;
+    const s = mlx.gpuStream();
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    var buf: [512]u8 = undefined;
+    const base = try tmpRoot(&tmp, io, &buf);
+
+    var tier = try DiskTier.init(testing.allocator, io, base, "fp-wt-media", 0, 128);
+    defer tier.deinit();
+    var cache = try KVCache.init(testing.allocator, 3);
+    defer cache.deinit();
+    try fillCache(&cache, s, 3, 600, 8, 0.0, .float32);
+    var tokens: [600]u32 = undefined;
+    for (&tokens, 0..) |*t, i| t.* = @intCast(i + 7);
+    const spans = [_]MediaSpan{.{ .start = 100, .key = 0xA0 }};
+
+    // The write-through hook's form: one chunk per call, the spans below the chunk boundary.
+    for ([_]usize{ 128, 256 }) |boundary| {
+        _ = try tier.appendCommitBounded(cache.entries, boundary, cache.config, tokens[0..boundary], false, &spans, null, s, 1);
+    }
+    var tier2 = try DiskTier.init(testing.allocator, io, base, "fp-wt-media", 0, 128);
+    defer tier2.deinit();
+    try testing.expectEqual(@as(usize, 1), tier2.entryCount());
+    try testing.expectEqualSlices(MediaSpan, &spans, tier2.entries.items[0].media);
+    const kv = tier2.entries.items[0].kv_len;
+    try testing.expect(kv > 100);
+    const dense = kv_quant.KVQuantConfig.dense;
+    try testing.expectEqual(kv, tier2.bestMatch(&tokens, false, dense, &spans).?.usable);
+    try testing.expectEqual(@as(u32, 100), tier2.bestMatch(&tokens, false, dense, &.{.{ .start = 100, .key = 0xB1 }}).?.usable);
 }
 
 test "DiskTier v9: supersede and extend are media-gated; chunk share clamps at divergence" {
