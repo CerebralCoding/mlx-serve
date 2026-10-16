@@ -2262,11 +2262,11 @@ extension ImageModelPreset {
         }
     }
 
-    /// Runtime LoRA adapters attach to the DiT (`gen.ImageEngine.setLora`).
+    /// Runtime LoRA adapters attach to the DiT (`gen.ImageEngine.setLoras`).
     /// Mage-Flow has no LoRA path, so a picked adapter matches 0 modules → 400.
     var supportsLoRA: Bool {
         switch variant {
-        case .mageFlowTurbo, .mageFlowEditTurbo, .qwenImage21, .qwenImage21Turbo: return false
+        case .mageFlowTurbo, .mageFlowEditTurbo: return false
         default: return true
         }
     }

@@ -1069,8 +1069,8 @@ final class MediaGenServiceTests: XCTestCase {
     func testQwenImagePresetsOfferOnlyWhatTheBackendHonors() {
         for p in [ImageModelPreset.qwenImage21_8bit, .qwenImage21_4bit] {
             XCTAssertTrue(p.supportsImg2Img, "\(p.id): VAE encoder loads on first use")
+            XCTAssertTrue(p.supportsLoRA, "\(p.id): block linears take stacked adapters")
             XCTAssertTrue(p.supportsGuidance, "\(p.id): undistilled, real CFG")
-            XCTAssertFalse(p.supportsLoRA, "\(p.id): 0 matched modules -> 400")
             XCTAssertFalse(p.supportsReferenceEdit)
             XCTAssertEqual(p.condWeightCount, 0)
             XCTAssertFalse(p.stepsAreFixed)
@@ -1094,7 +1094,7 @@ final class MediaGenServiceTests: XCTestCase {
             XCTAssertEqual(p.fixedSteps, 8)
             for q in QualityPreset.allCases { XCTAssertEqual(p.settings(q).steps, 8) }
             XCTAssertTrue(p.supportsImg2Img)
-            XCTAssertFalse(p.supportsLoRA)
+            XCTAssertTrue(p.supportsLoRA, "\(p.id): Turbo shares the base DiT's linears")
             XCTAssertEqual(p.condWeightCount, 0)
             XCTAssertEqual(p.resolutionGrid.alignment, 16)
             XCTAssertEqual(p.configName, "qwen_image21")
@@ -1370,6 +1370,17 @@ final class MediaGenServiceTests: XCTestCase {
         let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
         XCTAssertEqual(json["lora_paths"] as? [String], ["/tmp/ok.safetensors"])
         XCTAssertEqual(json["lora_scales"] as? [Double], [0.9])
+    }
+
+    func testNegativeAndLargeLoraScalesReachTheServerUnchanged() {
+        var req = ImageGenRequest(model: .krea2Turbo, prompt: "x", width: 1024, height: 1024, steps: 8)
+        req.loras = [
+            LoraAdapter(path: "/tmp/slider.safetensors", scale: -0.75),
+            LoraAdapter(path: "/tmp/pornmaster.safetensors", scale: 20),
+            LoraAdapter(path: "/tmp/other.safetensors", scale: -20),
+        ]
+        let json = ImageGenService.requestJson(for: req, modelName: "m", seed: 1)
+        XCTAssertEqual(json["lora_scales"] as? [Double], [-0.75, 20, -20])
     }
 
     func testImageRequestJsonOmitsGuidanceFieldsAtDefaults() {

@@ -772,7 +772,8 @@ pub const ImageEngine = struct {
             const arch: lora_mod.Arch = switch (self.backend) {
                 .flux => .flux2,
                 .krea => .krea2,
-                .mage_flow, .qwen_image => .generic,
+                .mage_flow => .generic,
+                .qwen_image => .qwen_image21,
             };
             const lf = try lora_mod.loadFile(self.allocator, p, arch);
             stack.files[stack.count] = lf;
@@ -784,8 +785,10 @@ pub const ImageEngine = struct {
             .flux => |*f| flux.attachLora(&f.dit, &stack),
             .krea => |k| krea.attachLora(&k.dit, &stack),
             .mage_flow => 0, // MageFlow does not support LoRA (matches mflux)
-            .qwen_image => 0, // no LoRA key mapping yet (matches mflux)
+            .qwen_image => |q| q.dit.attachLora(&stack),
         };
+        if (matched != 0 and matched != stack.entryCount())
+            log.warn("[lora] attached {d} of {d} adapter module(s); the rest target modules this model does not have\n", .{ matched, stack.entryCount() });
         if (matched == 0) {
             stack.deinit();
             return error.LoraNoMatch;
@@ -799,7 +802,8 @@ pub const ImageEngine = struct {
         switch (self.backend) {
             .flux => |*f| flux.detachLora(&f.dit),
             .krea => |k| krea.detachLora(&k.dit),
-            .mage_flow, .qwen_image => {}, // no LoRA attached
+            .qwen_image => |q| q.dit.detachLora(),
+            .mage_flow => {}, // no LoRA attached
         }
         if (self.lora_stack) |*st| st.deinit();
         self.lora_stack = null;
@@ -5739,6 +5743,23 @@ test "parseLoraFields: a LoRA path is accepted only from this machine (#540)" {
     }
     // No LoRA fields detaches, from anyone.
     try testing.expectEqual(@as(usize, 0), try parseLoraFields(a, "{\"prompt\":\"p\"}", &paths, &scales, false));
+}
+
+test "parseLoraFields: scales may be negative or far beyond 1, in every request shape" {
+    const a = testing.allocator;
+    var paths: [lora_mod.MAX_LORAS][]u8 = undefined;
+    var scales: [lora_mod.MAX_LORAS]f32 = undefined;
+    const Case = struct { body: []const u8, want: []const f32 };
+    const cases = [_]Case{
+        .{ .body = "{\"lora_paths\":[\"/a\",\"/b\"],\"lora_scales\":[-1, 20]}", .want = &.{ -1, 20 } },
+        .{ .body = "{\"lora_paths\":[\"/a\",\"/b\"],\"lora_scales\":\"-20 12.5\"}", .want = &.{ -20, 12.5 } },
+        .{ .body = "{\"lora_path\":\"/a\",\"lora_scale\":-12.5}", .want = &.{-12.5} },
+    };
+    for (cases) |c| {
+        const n = try parseLoraFields(a, c.body, &paths, &scales, true);
+        defer for (paths[0..n]) |p| a.free(p);
+        try testing.expectEqualSlices(f32, c.want, scales[0..n]);
+    }
 }
 
 test "openaiEditFormToJson: everything we can't honor is an explicit error" {
