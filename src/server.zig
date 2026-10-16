@@ -1055,6 +1055,10 @@ pub fn clearResolvedPrefixCacheMem() void {
 /// value). The Swift app exposes this as a Settings toggle, default off.
 pub var prefix_cache_disk_bytes: u64 = 0;
 
+/// `--shutdown-persist-secs`: on SIGTERM, finish the SSD slices the idle flush has not landed,
+/// for at most this long after the signal. 0 turns it off.
+pub var shutdown_persist_secs: u32 = 45;
+
 /// Phase 1 (performance-plan): SSM/conv state snapshot stride during prefill,
 /// in tokens. Non-zero values enable multi-turn warm reuse on hybrid SSM
 /// architectures (Qwen3.5/3.6 GatedDeltaNet, Nemotron-H Mamba2, LFM2.5
@@ -2307,7 +2311,13 @@ pub fn serve(
     // in-flight `complete()` is still touching. The inference thread is still
     // alive here (deinit joins it only after we return), so cancelled slots
     // settle promptly. Bounded so a wedged thread can't hang shutdown forever.
-    if (global_scheduler) |sch| sch.cancelAllInFlight();
+    // The SSD flush's deadline starts here, once. The drain keeps its own bound: cutting it short
+    // saves nothing (the join below waits out the inference thread's current chunk anyway) and
+    // lets a late `complete()` race the queues `deinit` frees.
+    if (global_scheduler) |sch| {
+        scheduler_mod.armShutdownDeadline(&sch.shutdown_deadline_ms, nowMsMonotonic(io), shutdown_persist_secs);
+        sch.cancelAllInFlight();
+    }
     {
         var waited_ms: u64 = 0;
         while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
@@ -15669,6 +15679,8 @@ fn prepareMultimodalItems(allocator: std.mem.Allocator, lm: *LoadedModel, config
     else
         try expandMedia(allocator, prompt_ids.*, items, item_tokens, mp.item_keys, mt, ByteTokenizer{}, item_keep);
     out.media = expanded.media;
+    // The rows the prefix-cache tiers key on this item's pixels; a restore past one needs the same key.
+    for (out.media, 0..) |m, k| log.debug("  media: item {d} at row {d} (key {x:0>16})\n", .{ k, m.start, m.key });
     var soft = std.enums.EnumArray(std.meta.Tag(MediaItem), usize).initFill(0);
     for (items, item_tokens) |item, n| {
         soft.getPtr(std.meta.activeTag(item)).* += n;

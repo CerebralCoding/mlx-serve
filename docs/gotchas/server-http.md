@@ -2495,9 +2495,12 @@ keyed on each item's pixel key — and the clamp moved from commit time to match
 (`mediaSharedBound` per entry): a re-sent turn with agreeing spans reads its media rows back
 near the prompt tail, a divergent span list stops below the first item whose start or pixel
 key differs, and a text turn stops at the entry's first item — exactly where the old commit
-floor sat. Spec payloads (dflash/MTP) still ride text-only turns. The AGENTS.md SSD-tier rule
+floor sat. Spec payloads (dflash/MTP) still ride text-only turns. The SSD-first prefill
+write-through persists image slots too, each chunk boundary with the spans below it, so a killed
+image prefill restores past its image under the same pixels. The AGENTS.md SSD-tier rule
 carries the v9 wording.
-Guard: `an image turn persists its full media-keyed prefix to the SSD tier`.
+Guards: `an image turn persists its full media-keyed prefix to the SSD tier`, `DiskTier v9: a
+bounded write-through commit keeps its spans`, section 9 of `tests/test_prefix_cache_disk.sh`.
 
 ## A streamed Responses turn reported no prompt-cache hit
 

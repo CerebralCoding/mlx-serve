@@ -1574,6 +1574,14 @@ pub const Scheduler = struct {
 
     inference_thread: ?std.Thread,
     shutdown: std.atomic.Value(bool),
+    /// The shutdown flush's deadline on the `nowMsMonotonic` clock; 0 = off. Set before `shutdown`.
+    shutdown_deadline_ms: std.atomic.Value(i64) = .init(0),
+    /// The batch the inference thread took out of `pending` and is prefilling (`queue_mu`): in
+    /// neither queue, so `cancelAllInFlight` reads it here or SIGTERM waits out the whole prefill.
+    /// Live entries are `[prefilling_from, n_prefilling)`; each holds `in_pass` while listed.
+    prefilling: [16]*Slot = undefined,
+    prefilling_from: usize = 0,
+    n_prefilling: usize = 0,
     started: std.atomic.Value(bool),
     started_mu: std.Io.Mutex,
     started_cond: std.Io.Condition,
@@ -2004,6 +2012,9 @@ pub const Scheduler = struct {
         self.queue_mu.lockUncancelable(self.io);
         defer self.queue_mu.unlock(self.io);
         for (self.pending.items) |slot| slot.cancel();
+        if (self.prefilling_from < self.n_prefilling) {
+            for (self.prefilling[self.prefilling_from..self.n_prefilling]) |slot| slot.cancel();
+        }
         for (self.decoding.items) |slot| slot.cancel();
         for (self.offloaded.items) |slot| slot.cancel();
     }
@@ -5262,17 +5273,7 @@ fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
         // SSD-first: arch + env switch + a live disk tier. Below the attach because the tier
         // is part of the answer; without `--prefix-cache-disk` qwen4_exp takes the RAM arm.
-        entry.prefix_cache.?.ssd_first = prefix_cache_mod.ssdFirstActive(
-            params.config,
-            entry.prefix_cache.?.disk != null,
-            ram_prefix_cache,
-        );
-        if (entry.prefix_cache.?.ssd_first) {
-            entry.prefix_cache.?.disk.?.ssd_first = true;
-            entry.prefix_cache.?.disk.?.enableBackgroundWriter();
-            // Startup sweep of strays + root-wide LRU across sibling fingerprints.
-            entry.prefix_cache.?.disk.?.sweepSiblings();
-        }
+        entry.prefix_cache.?.armDiskTier(params.config);
         entry.ssm_checkpoint_stride = params.ssm_checkpoint_stride;
         entry.ssm_checkpoint_max = params.ssm_checkpoint_max;
         // The cache re-applies the cap after a replace-path merge; without this
@@ -5440,28 +5441,14 @@ pub fn reclaimableHotCacheBytesFor(sch: *Scheduler, prompt_tokens: []const u32) 
 }
 
 /// Caller holds `queue_mu`. Shared with the wait condition below.
-/// One bounded SSD flush per resident model that still owes one; returns whether any still does.
+/// One bounded SSD slice per resident model that still owes one (its oldest owed session first);
+/// returns whether any still does. The caller re-checks for work between calls.
 /// Inference thread only: unloads run here too, so the collected pointers stay valid.
 fn flushOwedDiskSlices(sch: *Scheduler) bool {
-    var owed: [16]struct { hc: *prefix_cache_mod.HotPrefixCache, s: mlx.mlx_stream } = undefined;
-    var n: usize = 0;
-    sch.registry.mutex.lockUncancelable(sch.io);
-    var it = sch.registry.entries.valueIterator();
-    while (it.next()) |entry_ptr| {
-        if (n == owed.len) break;
-        const entry = entry_ptr.*;
-        if (entry.state != .ready) continue;
-        const hc = if (entry.prefix_cache) |*h| h else continue;
-        if (!hc.disk_dirty or hc.disk == null) continue;
-        const xf = entry.transformer orelse continue;
-        owed[n] = .{ .hc = hc, .s = xf.s };
-        n += 1;
-    }
-    sch.registry.mutex.unlock(sch.io);
+    var owed: [16]prefix_cache_mod.FlushTarget = undefined;
     var still = false;
-    for (owed[0..n]) |o| {
-        o.hc.flushPendingDisk(o.s);
-        still = still or o.hc.disk_dirty;
+    for (owed[0..diskCaches(sch, &owed, true)]) |o| {
+        if (o.hc.flushOwedSlice(o.s)) still = true;
     }
     return still;
 }
@@ -5469,6 +5456,59 @@ fn flushOwedDiskSlices(sch: *Scheduler) bool {
 /// Neural Engine requests run on their workers while this thread parks, and still keep the Mac awake.
 fn holdsSleepWhileParked(sch: *const Scheduler) bool {
     return sch.offloaded.items.len > 0;
+}
+
+/// The hot caches of ready models with a disk tier (only those owing a slice when `owed_only`).
+/// Inference thread only: unloads run here too, so the collected pointers stay valid.
+fn diskCaches(sch: *Scheduler, out: []prefix_cache_mod.FlushTarget, owed_only: bool) usize {
+    var n: usize = 0;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        if (n == out.len) break;
+        const entry = entry_ptr.*;
+        if (entry.state != .ready) continue;
+        const hc = if (entry.prefix_cache) |*h| h else continue;
+        if (hc.disk == null or (owed_only and !hc.disk_dirty)) continue;
+        const xf = entry.transformer orelse continue;
+        out[n] = .{ .hc = hc, .s = xf.s };
+        n += 1;
+    }
+    return n;
+}
+
+/// SIGTERM's bounded SSD flush (`--shutdown-persist-secs`), on this thread once the loop has
+/// stopped: what the idle flush has not landed, until the deadline `serve` armed. Off when unarmed.
+fn persistAtShutdown(sch: *Scheduler) void {
+    const deadline_ms = sch.shutdown_deadline_ms.load(.acquire);
+    if (deadline_ms == 0) return;
+    // A slot cancelled as `shutdown` flipped can still sit in the cleanup queue: commit it and
+    // return its checkout, or its session reads as checked out.
+    _ = drainSideQueues(sch);
+    var targets: [16]prefix_cache_mod.FlushTarget = undefined;
+    const n = diskCaches(sch, &targets, false);
+    if (n == 0) return;
+    const sw = io_util.Stopwatch.init(sch.io);
+    const t = prefix_cache_mod.shutdownPersist(targets[0..n], io_util.MonotonicClock{ .io = sch.io }, deadline_ms);
+    const mb = 1024.0 * 1024.0;
+    log.info("[disk-cache] shutdown persist: {d} written ({d:.1} MB), {d} left (deadline), {d} left (store declined), {d} skipped checked-out, {d} failures, {d:.1} MB dropped at the deadline, {d:.1} s\n", .{
+        t.written,
+        @as(f64, @floatFromInt(t.bytes)) / mb,
+        t.left_deadline,
+        t.left_declined,
+        t.checked_out,
+        t.failures,
+        @as(f64, @floatFromInt(t.dropped_bytes)) / mb,
+        @as(f64, @floatFromInt(sw.read())) / std.time.ns_per_s,
+    });
+}
+
+/// Arm the shutdown flush's deadline `secs` after the first call; a later call (a second
+/// SIGTERM) never moves it. 0 seconds leaves it unarmed, which turns the flush off.
+pub fn armShutdownDeadline(slot: *std.atomic.Value(i64), now_ms: i64, secs: u32) void {
+    if (secs == 0) return;
+    _ = slot.cmpxchgStrong(0, now_ms + @as(i64, secs) * 1000, .acq_rel, .acquire);
 }
 
 fn hasWorkPendingLocked(sch: *const Scheduler) bool {
@@ -5577,6 +5617,7 @@ fn inferenceLoop(ctx: ThreadCtx) void {
         if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
         if (chatPass(sch, .main) == .shutdown) break;
     }
+    persistAtShutdown(sch);
     closeGlmModels(sch);
 }
 
@@ -5734,6 +5775,9 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             r -= 1;
             _ = sch.pending.orderedRemove(admit_idx[r]);
         }
+        @memcpy(sch.prefilling[0..n_prefill], to_prefill[0..n_prefill]);
+        sch.prefilling_from = 0;
+        sch.n_prefilling = n_prefill;
     }
 
     if (sch.budget_revise_sw) |sw| {
@@ -5745,8 +5789,21 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
     //    The inference thread is the sole mlx caller post-cleanup, so
     //    no per-tick stream rebind / mutex coexistence is needed.
     if (n_prefill > 0) {
+        defer {
+            sch.queue_mu.lockUncancelable(sch.io);
+            sch.prefilling_from = 0;
+            sch.n_prefilling = 0;
+            sch.queue_mu.unlock(sch.io);
+        }
         for (to_prefill[0..n_prefill], 0..) |slot, pi| {
             defer _ = slot.in_pass.fetchSub(1, .acq_rel);
+            // Unlisted BEFORE its pass ends: `complete()` (which may free the slot) waits on
+            // `in_pass`, so a listed slot is always alive for `cancelAllInFlight`.
+            defer {
+                sch.queue_mu.lockUncancelable(sch.io);
+                sch.prefilling_from = @max(sch.prefilling_from, pi + 1);
+                sch.queue_mu.unlock(sch.io);
+            }
             // Between the slots of one admitted batch, tick the streams
             // that just started decoding — a single-chunk prefill exposes
             // no chunk-boundary yield, so without this every slot's first
@@ -5765,6 +5822,7 @@ fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
                 // Back to the head of `pending`, in order; the decode tick below runs first.
                 sch.queue_mu.lockUncancelable(sch.io);
                 defer sch.queue_mu.unlock(sch.io);
+                sch.n_prefilling = pi; // back in `pending`, which `cancelAllInFlight` walks
                 var r = n_prefill;
                 while (r > pi) {
                     r -= 1;
@@ -7638,7 +7696,6 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
     if (!hc.ssd_first) return;
     const d = if (hc.disk) |*dd| dd else return;
     if (d.writer == null) return;
-    if (slot.media.len != 0) return;
     if (abs_kv_pos == 0 or abs_kv_pos > slot.full_prompt.len) return;
     const s = if (slot.model.transformer) |x| x.s else return;
     wc.chunks += 1;
@@ -7650,6 +7707,8 @@ fn prefillWriteThroughCb(opaque_ctx: *anyopaque, abs_kv_pos: usize, cps: []const
         slot.cache.config,
         slot.full_prompt[0..abs_kv_pos],
         slot.has_tools,
+        // The items whose rows this chunk boundary covers; their keys travel with the rows.
+        prefix_cache_mod.spansBelow(slot.media, abs_kv_pos),
         if (cps.len > 0) cps else null,
         s,
         if (hc.ram_enabled) WRITE_THROUGH_FLUSH_BOUND_BYTES else std.math.maxInt(u64),
@@ -7709,7 +7768,7 @@ fn writeThroughArmed(slot: *Slot, new_span: usize) bool {
     if (!hc.ssd_first) return false;
     const d = if (hc.disk) |*dd| dd else return false;
     const writer_up = d.writer != null;
-    if (!writer_up or slot.media.len != 0) return false;
+    if (!writer_up) return false;
     if (!writeThroughSpanReached(new_span, d.chunk_tokens)) {
         if (!write_through_span_declined_logged.swap(true, .monotonic)) {
             log.info("  [disk-cache] prefill write-through declined: {d} new tokens is under one chunk ({d}) — the end-of-request commit persists this turn\n", .{ new_span, d.chunk_tokens });
@@ -9113,6 +9172,17 @@ test "the cleanup drain commits a cancelled slot before deinit" {
     // The SSD tier has no finishSlot flush on this path — the drain must
     // flush what it just committed itself.
     try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+}
+
+test "armShutdownDeadline: the first SIGTERM sets the deadline and a second never moves it" {
+    var slot = std.atomic.Value(i64).init(0);
+    armShutdownDeadline(&slot, 5_000, 45);
+    try testing.expectEqual(@as(i64, 50_000), slot.load(.acquire));
+    armShutdownDeadline(&slot, 9_000, 45);
+    try testing.expectEqual(@as(i64, 50_000), slot.load(.acquire));
+    var off = std.atomic.Value(i64).init(0);
+    armShutdownDeadline(&off, 5_000, 0);
+    try testing.expectEqual(@as(i64, 0), off.load(.acquire));
 }
 
 test "idleEvictTickMs: sweeps well inside the window without spinning" {
