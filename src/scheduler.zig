@@ -8330,9 +8330,8 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 null,
             // The install above is process-wide, so it is not the arch gate.
             .adaptive_chunk_width = adaptiveChunkWidthFor(width_ctx.cfg),
-            // Init's argmax-only gate must see logprobs BEFORE the split-
-            // prefill final-token forward runs — a post-init field write is
-            // too late for the certified lm_head prune.
+            // Init reads logprobs in the split-prefill final-token forward,
+            // before any post-init field write.
             .logprobs_n = slot.logprobs_n,
             .prompt_logprobs = if (slot.prompt_logprobs) slot.freshPromptLogprobs() else null,
         },
