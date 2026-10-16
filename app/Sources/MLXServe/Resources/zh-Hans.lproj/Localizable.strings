@@ -2226,6 +2226,9 @@
 "Next" = "下一首";
 "Web UI" = "网页界面";
 "Open the web UI in your browser" = "在浏览器中打开网页界面";
+"Language" = "语言";
+"System Default" = "跟随系统设置";
+"\"System Default\" follows the Mac. The app relaunches to apply the change." = "「跟随系统设置」跟随这台 Mac 的语言。更改后应用会重新启动。";
 "Open the Music tab" = "打开音乐标签页";
 "Previous track" = "上一首";
 "Next track" = "下一首";

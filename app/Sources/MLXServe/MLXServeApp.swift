@@ -12,6 +12,10 @@ import AppKit
 @main
 struct MLXCoreEntryPoint {
     static func main() {
+        // Before anything localizes a string: a catalog is read per process.
+        AppLanguageOverride.install(
+            preference: UserDefaults.standard.string(forKey: InterfacePrefKey.language),
+            localizations: Bundle.main.localizations)
         let args = CommandLine.arguments.dropFirst()
         if args.first == "bench" { BenchmarkCLI.main(Array(args.dropFirst())) }
         let env = ProcessInfo.processInfo.environment
