@@ -5692,6 +5692,20 @@ Cause: `ForwardCtx.skip_lm_head` promises the post-final-norm hidden, and the mo
 Fix: the standard path returns `final_normed` under either flag.
 Guard: `standard forward: skip_lm_head hands back the hidden the head reads, never logits` (dflash.zig, the tiny llama trunk).
 
+## Weights on the CPU stream lived in host memory on Windows (2026-10-14)
+
+Defect: on Windows (and WSL) Qwen3-0.6B decoded at 28 tok/s against mlx-lm's 130 on the same GPU; FLUX and ACE-Step ran 3-5x slow. The same quantized matmul kernel took 270 us per call against mlx-lm's 10 (nsys).
+Cause: every loader read safetensors on MLX's CPU stream. A stream-less allocation is managed memory, which native Linux migrates to the GPU, but without concurrent managed access MLX backs it with `cudaMallocHost`, which never moves: each token re-read the weights over PCIe. mlx-lm loads on the GPU stream.
+Fix: `mlx.weightLoadStream()` is the GPU stream on CUDA where unified memory is limited (Windows at compile time, WSL by kernel release), else the CPU stream (Metal has no GPU `Load`); every weight loader and the SSD KV restore take it, and there `status.get{Available,Total}MemBytes` report VRAM, so every gate bills the pool the weights live in.
+Guard: `weight loads go to the GPU on CUDA only where host memory never migrates there`, `memoryPool: ...`; live, 145 tok/s.
+
+## Two cuBLAS copies left llama.cpp on the CPU (2026-10-14)
+
+Defect: in one Windows server, a GGUF decoded at 7.6 tok/s when an MLX model had loaded first, 80 when it loaded first itself; no error anywhere.
+Cause: MLX loaded `cublasLt64_13.dll` from its build toolkit; `ggml-cuda.dll`, built against a newer one, then failed to load beside it and llama.cpp quietly fell back to its CPU backend.
+Fix: no CUDA DLL ships: `patches/mlx-cuda-windows-toolkit-dirs.patch` resolves MLX's DLL folders from the installed toolkit (`CUDA_PATH`, `CUDNN_PATH`; cuDNN's folder also goes on PATH for its sub-libraries), and `mlx.exportCudaHome` puts the same folder first on PATH, so both engines bind one copy.
+Guard: `cudaDllSearchPath: ...`; live, both load orders on the GPU with one `cublas64_13.dll` loaded.
+
 ## A rebuild recompiled every cached Neural Engine program (2026-10-15)
 
 Defect: after a new build, a cached Qwen3.8-27B recompiled for minutes on the Neural Engine instead of restoring in seconds.

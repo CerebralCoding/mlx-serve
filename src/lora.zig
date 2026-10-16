@@ -720,7 +720,7 @@ pub fn loadFile(allocator: std.mem.Allocator, path: []const u8, arch: Arch) !Fil
     try validatePath(path);
     const pathz = try allocator.dupeSentinel(u8, path, 0);
     defer allocator.free(pathz);
-    const s = mlx.mlx_default_cpu_stream_new();
+    const s = mlx.weightLoadStream();
     defer _ = mlx.mlx_stream_free(s);
 
     var tensor_map = mlx.mlx_map_string_to_array_new();

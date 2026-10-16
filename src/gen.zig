@@ -1592,14 +1592,14 @@ pub const LtxVideoEngine = struct {
         self.model_dir = try allocator.dupe(u8, model_dir);
         errdefer allocator.free(self.model_dir);
 
-        const cpu_s = mlx.mlx_default_cpu_stream_new();
+        const load_s = mlx.weightLoadStream();
         self.s = mlx.mlx_default_gpu_stream_new();
 
         // Initial transformer: prefer DISTILLED (the correct one-stage default —
         // the dev model without CFG produces visibly worse output); fall back to
         // dev for bundles downloaded before transformer-distilled shipped.
         const initial: TransformerVariant = if (self.hasVariant(io, .distilled)) .distilled else .dev;
-        self.transformer = try loadTransformerVariant(allocator, model_dir, initial, cpu_s);
+        self.transformer = try loadTransformerVariant(allocator, model_dir, initial, load_s);
         self.transformer_variant = initial;
         errdefer self.transformer.deinit();
         if (initial == .dev)
@@ -1607,23 +1607,23 @@ pub const LtxVideoEngine = struct {
 
         const cp = try std.fmt.allocPrintSentinel(allocator, "{s}/connector.safetensors", .{model_dir}, 0);
         defer allocator.free(cp);
-        self.connector = try ltx.loadComponent(allocator, cp, cpu_s);
+        self.connector = try ltx.loadComponent(allocator, cp, load_s);
         errdefer self.connector.deinit();
         const vp = try std.fmt.allocPrintSentinel(allocator, "{s}/vae_decoder.safetensors", .{model_dir}, 0);
         defer allocator.free(vp);
-        self.vae = try ltx.loadComponent(allocator, vp, cpu_s);
+        self.vae = try ltx.loadComponent(allocator, vp, load_s);
         errdefer self.vae.deinit();
         var it = self.vae.map.iterator();
         while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*); // VAE conv graph wants materialized weights
 
         // Optional audio VAE + vocoder → the generated video gets a sound track.
         // Absent (video-only checkpoints, or not yet downloaded) is graceful.
-        self.audio = loadAudioVae(io, allocator, model_dir, cpu_s);
+        self.audio = loadAudioVae(io, allocator, model_dir, load_s);
         errdefer if (self.audio) |*a| a.deinit();
 
         // Optional VAE encoder → image-to-video (first-frame conditioning) and
         // the two-stage latent (de)normalization. Absent is graceful → t2v only.
-        self.vae_encoder = loadVaeEncoder(io, allocator, model_dir, cpu_s);
+        self.vae_encoder = loadVaeEncoder(io, allocator, model_dir, load_s);
         errdefer if (self.vae_encoder) |*e| e.deinit();
 
         self.tok = try tok_mod.loadTokenizerAny(io, allocator, self.gemma_dir);
@@ -1644,8 +1644,8 @@ pub const LtxVideoEngine = struct {
         if (self.transformer_variant == want) return;
         log.info("[video] swapping transformer: {s} -> {s}\n", .{ @tagName(self.transformer_variant), @tagName(want) });
         self.transformer.deinit();
-        const cpu_s = mlx.mlx_default_cpu_stream_new();
-        self.transformer = try loadTransformerVariant(self.allocator, self.model_dir, want, cpu_s);
+        const load_s = mlx.weightLoadStream();
+        self.transformer = try loadTransformerVariant(self.allocator, self.model_dir, want, load_s);
         self.transformer_variant = want;
         // The fresh Component boots with `lora = null` — re-install the
         // attached adapter so a mid-pipeline swap (Stage2Swap) keeps it.
@@ -1706,8 +1706,8 @@ pub const LtxVideoEngine = struct {
         var buf: [1024]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}.safetensors", .{ self.model_dir, ltx.UPSAMPLER_PREFIX }, 0) catch return error.MissingUpsampler;
         if (!fileExists(io, p)) return error.MissingUpsampler;
-        const cpu_s = mlx.mlx_default_cpu_stream_new();
-        var comp = try ltx.loadComponent(self.allocator, p, cpu_s);
+        const load_s = mlx.weightLoadStream();
+        var comp = try ltx.loadComponent(self.allocator, p, load_s);
         var it = comp.map.iterator();
         while (it.next()) |e| _ = mlx.mlx_array_eval(e.value_ptr.*); // conv graph wants materialized weights
         self.upsampler = comp;
@@ -1723,8 +1723,8 @@ pub const LtxVideoEngine = struct {
         var buf: [1024]u8 = undefined;
         const p = std.fmt.bufPrintSentinel(&buf, "{s}/{s}", .{ self.model_dir, diffvae_fwd.FILE_NAME }, 0) catch return error.MissingDiffusionDecoder;
         if (!fileExists(io, p)) return error.MissingDiffusionDecoder;
-        const cpu_s = mlx.mlx_default_cpu_stream_new();
-        self.diffusion_decoder = try diffvae_fwd.load(self.allocator, p, cpu_s);
+        const load_s = mlx.weightLoadStream();
+        self.diffusion_decoder = try diffvae_fwd.load(self.allocator, p, load_s);
         return &self.diffusion_decoder.?;
     }
 
@@ -1744,23 +1744,23 @@ pub const LtxVideoEngine = struct {
     }
 };
 
-fn loadTransformerVariant(allocator: std.mem.Allocator, model_dir: []const u8, variant: TransformerVariant, cpu_s: mlx.mlx_stream) !ltx.Component {
+fn loadTransformerVariant(allocator: std.mem.Allocator, model_dir: []const u8, variant: TransformerVariant, load_s: mlx.mlx_stream) !ltx.Component {
     const tp = try std.fmt.allocPrintSentinel(allocator, "{s}/{s}", .{ model_dir, variant.fileName() }, 0);
     defer allocator.free(tp);
-    return ltx.loadComponent(allocator, tp, cpu_s);
+    return ltx.loadComponent(allocator, tp, load_s);
 }
 
 /// Load the LTX VAE encoder (`vae_encoder.safetensors`, ~0.6 GB, MLX-layout
 /// bf16) from the model dir for image-to-video. Absent → null (I2V disabled,
 /// text-to-video unaffected). Mirrors `loadAudioVae`.
-fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, cpu_s: mlx.mlx_stream) ?ltx.Component {
+fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, load_s: mlx.mlx_stream) ?ltx.Component {
     var p: [1024]u8 = undefined;
     const path = std.fmt.bufPrintSentinel(&p, "{s}/vae_encoder.safetensors", .{model_dir}, 0) catch return null;
     if (!fileExists(io, path)) {
         log.info("[video] no vae_encoder.safetensors in {s} — image-to-video disabled (text-to-video only)\n", .{model_dir});
         return null;
     }
-    var comp = ltx.loadComponent(allocator, path, cpu_s) catch |e| {
+    var comp = ltx.loadComponent(allocator, path, load_s) catch |e| {
         log.warn("[video] vae_encoder load failed ({}) — image-to-video disabled\n", .{e});
         return null;
     };
@@ -2232,7 +2232,7 @@ fn decodeImageToBCHW(allocator: std.mem.Allocator, encoded: []const u8, target_h
 /// Load the LTX audio VAE + vocoder (`audio_vae.safetensors` + `vocoder.safetensors`,
 /// the q4 MLX-layout files from `dgrauet/ltx-2.3-mlx-q4`) from the model dir, or
 /// from `$LTX_AUDIO_DIR`. Both files absent → null (the video stays silent).
-fn loadAudioVae(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, cpu_s: mlx.mlx_stream) ?ltx.Component {
+fn loadAudioVae(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, load_s: mlx.mlx_stream) ?ltx.Component {
     // The directory holding the two audio files: model dir, or an override.
     const dir: []const u8 = if (std.c.getenv("LTX_AUDIO_DIR")) |env| blk: {
         const e = std.mem.span(env);
@@ -2246,7 +2246,7 @@ fn loadAudioVae(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8,
         log.info("[video] no audio VAE/vocoder in {s} — generated video will be silent\n", .{dir});
         return null;
     }
-    var comp = ltx_audio.loadAudioComponents(allocator, audio_path, voc_path, cpu_s) catch |e| {
+    var comp = ltx_audio.loadAudioComponents(allocator, audio_path, voc_path, load_s) catch |e| {
         log.warn("[video] audio VAE load failed ({}) — video will be silent\n", .{e});
         return null;
     };
@@ -4674,7 +4674,7 @@ pub fn freeStubCpuState(allocator: std.mem.Allocator, s: *StubCpuState) void {
 /// transformer/, vae/, text_encoder/; LTX keeps them top-level). Returns 0 on
 /// any read failure (treated as "unknown" → the registry skips the byte cap).
 pub fn estimateResidentBytes(io: std.Io, model_dir: []const u8) u64 {
-    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return 0; // openDirAbsolute UB class
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
     return sumSafetensorsIn(io, dir);
@@ -5045,7 +5045,7 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
 /// Sum of the `.safetensors` under an absolute path, or 0 if it is not
 /// readable — 0 means "unknown", which every caller treats as "do not block".
 pub fn sumSafetensorsAt(io: std.Io, path: []const u8) u64 {
-    if (path.len == 0 or path[0] != '/') return 0; // openDirAbsolute UB class
+    if (path.len == 0 or !std.fs.path.isAbsolute(path)) return 0; // openDirAbsolute UB class
     var d = std.Io.Dir.openDirAbsolute(io, path, .{ .iterate = true }) catch return 0;
     defer d.close(io);
     return sumSafetensorsIn(io, d);
@@ -5069,7 +5069,7 @@ fn ltxTextEncoderBytes(io: std.Io) u64 {
 }
 
 pub fn estimatePeakResidentBytes(io: std.Io, model_dir: []const u8, model_type: []const u8) u64 {
-    if (model_dir.len == 0 or model_dir[0] != '/') return 0; // openDirAbsolute UB class
+    if (model_dir.len == 0 or !std.fs.path.isAbsolute(model_dir)) return 0; // openDirAbsolute UB class
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{ .iterate = true }) catch return 0;
     defer dir.close(io);
     const in_dir = estimatePeakResidentBytesInDir(io, dir, model_type, model_dir);

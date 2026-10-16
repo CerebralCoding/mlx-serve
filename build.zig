@@ -71,7 +71,7 @@ pub fn build(b: *std.Build) void {
     // mlx-c staged from the Linux Vulkan fork by scripts/build-mlx-linux.sh.
     // Gated on the TARGET so the Linux exe can be built on any host zig can
     // target; the host gate below still guards the macOS graph.
-    if (target.result.os.tag == .linux) {
+    if (target.result.os.tag == .linux or target.result.os.tag == .windows) {
         addLinuxServe(b, target, optimize);
         return;
     }
@@ -121,7 +121,8 @@ pub fn build(b: *std.Build) void {
     // gets compile-time stubs (src/arch/*_stub.zig, src/ds4_ffi_stub.zig).
     // The stub selection reads this option, NOT `ios` — `ios` keeps its own
     // meaning (low-mem policy, sandboxing assumptions).
-    build_options.addOption(bool, "embedded_engines", true);
+    build_options.addOption(bool, "ds4_engine", true);
+    build_options.addOption(bool, "llama_engine", true);
     // DeepSeek-V4.1's EXL3 repack through mlx-stream (macOS only; Linux and iOS build the stub).
     build_options.addOption(bool, "mlx_stream", true);
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
@@ -398,7 +399,10 @@ fn addPreviewTest(b: *std.Build, target: std.Build.ResolvedTarget) void {
 ///   - libjinja built for the host by the same staging script (the committed
 ///     libjinja.a holds Mach-O objects).
 fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
-    verifyMlxStageLinux(b);
+    // Windows reuses this graph without ds4, libwebp or Bonjour (src/windows_stubs.c), linking the
+    // MSVC-built mlx + mlx-c staged in lib/mlx-win/{include,lib} and llama.cpp's release DLLs.
+    const windows = target.result.os.tag == .windows;
+    if (!windows) verifyMlxStageLinux(b);
 
     const version = b.option([]const u8, "version", "Version string") orelse readAppVersion(b) orelse "0.0.0-dev";
     const mlx_c_version = b.option([]const u8, "mlx-c-version", "Pinned mlx-c version") orelse readMlxcPin(b) orelse "unknown";
@@ -411,7 +415,8 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     build_options.addOption([]const u8, "llama_tag", readLlamaTag(b) orelse "unknown");
     build_options.addOption([]const u8, "git_sha", "");
     build_options.addOption(bool, "ios", false);
-    build_options.addOption(bool, "embedded_engines", true);
+    build_options.addOption(bool, "ds4_engine", !windows);
+    build_options.addOption(bool, "llama_engine", true);
     build_options.addOption(bool, "mlx_stream", false);
     // The corpus replay and benchmark tests run tens of seconds in Debug (#639), so
     // `zig build test` skips them and `zig build test -Dslow-tests` runs them.
@@ -448,7 +453,10 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
                 .{ .name = "agent_skills", .module = agent_skills },
                 .{ .name = "jinja_c", .module = addCHeaderModule(b, b.path("lib/jinja_cpp/jinja_wrapper.h"), b.path("lib/jinja_cpp"), target, optimize, "") },
                 .{ .name = "stb", .module = addCHeaderModule(b, b.path("lib/stb_image.h"), b.path("lib"), target, optimize, "") },
-                .{ .name = "webp", .module = addCHeaderModule(b, .{ .cwd_relative = "/usr/include/webp/decode.h" }, .{ .cwd_relative = "/usr/include" }, target, optimize, "") },
+                .{ .name = "webp", .module = if (windows)
+                    addCHeaderModule(b, b.path("src/webp_stub.h"), b.path("src"), target, optimize, "")
+                else
+                    addCHeaderModule(b, .{ .cwd_relative = "/usr/include/webp/decode.h" }, .{ .cwd_relative = "/usr/include" }, target, optimize, "") },
             },
         });
 
@@ -456,7 +464,13 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         // as an ELF static lib by scripts/build-mlx-linux.sh (zig c++).
         addGgufModule(b, mod, target, optimize);
         addExl3Module(b, mod, target, optimize);
-        mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
+        if (windows) {
+            mod.addCSourceFiles(.{
+                .root = b.path("lib/jinja_cpp"),
+                .files = &.{ "caps.cpp", "jinja_string.cpp", "jinja_wrapper.cpp", "lexer.cpp", "parser.cpp", "runtime.cpp", "value.cpp" },
+                .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" },
+            });
+        } else mod.addObjectFile(b.path("lib/jinja_cpp/libjinja-linux.a"));
         mod.addIncludePath(b.path("lib/jinja_cpp"));
 
         // stb_image (JPEG/PNG decode) + stb_image_write (PNG encode), xatlas
@@ -475,6 +489,15 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         mod.addCSourceFile(.{ .file = b.path("src/ane_stub.c"), .flags = &.{"-O2"} });
 
         // mlx (Vulkan fork) + mlx-c, staged in lib/mlx — same link shape as macOS.
+        if (windows) {
+            mod.addIncludePath(b.path("lib/mlx-win/include"));
+            mod.addLibraryPath(b.path("lib/mlx-win/lib"));
+            mod.linkSystemLibrary("mlxc", .{ .use_pkg_config = .no });
+            mod.addCSourceFile(.{ .file = b.path("src/windows_stubs.c"), .flags = &.{"-O2"} });
+            addLlamaLib(b, mod);
+            slot.* = mod;
+            continue;
+        }
         addMlxLib(b, mod);
         addDs4LinuxLib(b, mod);
         addLlamaLib(b, mod);
@@ -497,6 +520,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
     const exe = b.addExecutable(.{
         .name = "mlx-serve",
         .root_module = mods[0],
+        .win32_manifest = if (windows) b.path("src/windows/mlx-serve.manifest") else null,
     });
     b.installArtifact(exe);
 
@@ -638,7 +662,8 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     // unreported. Without these the iOS lib fails to compile ("options has no
     // member named 'mas'/...").
     ios_options.addOption(bool, "mas", true);
-    ios_options.addOption(bool, "embedded_engines", false);
+    ios_options.addOption(bool, "ds4_engine", false);
+    ios_options.addOption(bool, "llama_engine", false);
     ios_options.addOption(bool, "mlx_stream", false);
     ios_options.addOption([]const u8, "mlx_c_version", "unknown");
     ios_options.addOption([]const u8, "ds4_commit", "unknown");
@@ -944,14 +969,18 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     // location so `zig build run` / unit tests resolve it in dev. The app bundle
     // and CLI tarball rewrite that reference to @executable_path/... and re-sign
     // with the Developer ID (see release.yml / app/build.sh).
-    module.addIncludePath(b.path("lib/llama/include"));
-    module.addLibraryPath(b.path("lib/llama/lib"));
+    // Windows: the release's DLLs through import libraries, staged by
+    // `LLAMA_TARGET=windows scripts/fetch-llama.sh`; no rpaths (DLLs ship beside the exe).
+    const os = module.resolved_target.?.result.os.tag;
+    const stage = if (os == .windows) "lib/llama-win" else "lib/llama";
+    module.addIncludePath(b.path(b.fmt("{s}/include", .{stage})));
+    module.addLibraryPath(b.path(b.fmt("{s}/lib", .{stage})));
     // use_pkg_config = .no: a Homebrew `llama.cpp` install ships a llama.pc that
     // would otherwise hijack this link (pulling in /opt/homebrew's version + its
     // separate libggml). We want exactly the pinned dylib staged in lib/llama/lib.
     module.linkSystemLibrary("llama", .{ .use_pkg_config = .no });
-    // The macOS dylib merges ggml in; the Linux release keeps it separate.
-    if (module.resolved_target.?.result.os.tag == .linux) {
+    // The macOS dylib merges ggml in; the Linux and Windows releases keep it separate.
+    if (os == .linux or os == .windows) {
         module.linkSystemLibrary("ggml", .{ .use_pkg_config = .no });
         module.linkSystemLibrary("ggml-base", .{ .use_pkg_config = .no });
     }
@@ -974,8 +1003,10 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
     // root). dyld tries every LC_RPATH entry in order and silently skips
     // ones that don't resolve, so listing both depths here is safe — each
     // binary finds its own and ignores the other.
-    module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/llama/lib" });
-    module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/llama/lib" });
+    if (os != .windows) {
+        module.addRPath(.{ .cwd_relative = "@loader_path/../../lib/llama/lib" });
+        module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/llama/lib" });
+    }
 
     // Our clean C shim over llama.h (src/llama_ffi.zig mirrors lib/llama_shim/llama_shim.h).
     // C++ for llama.cpp's C++-linked NextN staging calls (MTP).

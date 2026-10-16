@@ -7,8 +7,10 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <stdio.h>
+#ifndef _WIN32
 #include <netdb.h>
 #include <sys/socket.h>
+#endif
 
 typedef struct MsvAneMlp MsvAneMlp;
 typedef struct MsvAneBank MsvAneBank;
@@ -169,6 +171,7 @@ uint64_t msv_volume_free_for_use(const char *path) {
     return 0;
 }
 
+#ifndef _WIN32
 // Avahi's libdns_sd compat layer (Linux Bonjour) does not implement
 // DNSServiceGetAddrInfo, so resolve the peer's host with getaddrinfo (nss-mdns /
 // systemd-resolved answer .local) and deliver every IPv4 answer synchronously:
@@ -193,3 +196,4 @@ int DNSServiceGetAddrInfo(void **ref, unsigned int flags, unsigned int interface
     freeaddrinfo(res);
     return 0;
 }
+#endif

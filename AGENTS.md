@@ -100,6 +100,7 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx.zig` externs. Brew: webp ≥ 1.6.0.
 - Linux/CUDA: `./scripts/build-linux.sh` from a fresh checkout (checks prereqs, submodules, Zig; detects the GPU arch, `CUDA_ARCH="75;86;120"` for RTX 20-50; aarch64 too: GH200, Thor, DGX Spark) runs `build-mlx-linux.sh` (applies `patches/mlx-cuda-*.patch`), `build-ds4-linux.sh`, `fetch-llama.sh`, then `zig build -Doptimize=ReleaseFast`. MLX's kernel JIT needs the toolkit headers via `CUDA_HOME` (`mlx.exportCudaHome` fills in `/opt/cuda`; tests need it exported by hand). On CUDA the Metal-kernel tests fail by design.
+- Windows/CUDA: `powershell -File scripts\build-windows.ps1` (MLX + mlx-c by MSVC with CUDA 13.0 + cuDNN in `build-mlx-windows.ps1`, llama.cpp's release, `zig build -Dtarget=x86_64-windows-gnu`, also cross from Linux with `lib/mlx-win` staged). Users install CUDA 13 + cuDNN 9 (`CUDA_PATH`, `CUDNN_PATH`); no CUDA DLL ships. No ds4, LAN or WebP there.
 - **Custom MSL kernels run on Metal only** (`mlx.metalKernelsAvailable`): mlx-omarchy translates a subset of MSL and refuses the rest at EVAL, failing the request; Vulkan and CUDA run MLX ops.
 - **On CUDA a Mac-tuned fast path is re-measured before it stays on**: `prefillDqGemm` ran 13% slower there and stacked ~5 GB into the prefill peak (default off on CUDA), and a chunk past 2048 bought no speed for GBs of peak (`autoPrefillChunkCap`).
 - Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/` and `ar rcs libjinja.a obj/*.o`.
@@ -353,6 +354,7 @@ MLX errors + threads:
 - **Threads**: detach every conn thread; drain (`active_conn_threads` + `cancelAllInFlight`) BEFORE `scheduler.deinit`; handler sampling state outlives every pass (`Slot.in_pass`); an adopted spec cache has ONE owner (#266); sleep inhibition follows the inference-thread wait (#251, `tests/test_sleep_inhibit.sh`).
 - **On Linux a thread's static TLS comes out of its stack**: std's 256 KiB thread-local signal stack made a 64 KiB `stack_size` an EINVAL that Zig treats as `unreachable`; explicit stacks are 1 MiB.
 - **A weight is LAZY until evaluated**: force-eval at init; `mlx_compile` re-runs a CAPTURED lazy load per call.
+- **Where CUDA has no concurrent managed access (Windows, WSL) a CPU-stream buffer is pinned HOST memory the GPU reads over PCIe** (decode ran 4.6x slower): every weight loader takes `mlx.weightLoadStream()`. One process loads ONE CUDA runtime: a second cuBLAS left llama.cpp silently on CPU.
 - **Ownership by PROVENANCE, never content** (`{slice, owned}`).
 
 LAN + console:

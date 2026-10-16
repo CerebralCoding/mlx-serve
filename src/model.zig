@@ -4863,7 +4863,7 @@ pub fn loadWeightsSingleFile(allocator: std.mem.Allocator, abs_path: []const u8)
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
-    const s = mlx.mlx_default_cpu_stream_new();
+    const s = mlx.weightLoadStream();
     defer _ = mlx.mlx_stream_free(s);
 
     const pathz = try allocator.dupeSentinel(u8, abs_path, 0);
@@ -4896,7 +4896,7 @@ fn loadWeightsFromOpenDir(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.
     var weights = Weights.init(allocator);
     errdefer weights.deinit();
 
-    const s = mlx.mlx_default_cpu_stream_new();
+    const s = mlx.weightLoadStream();
     defer _ = mlx.mlx_stream_free(s);
 
     // The index names the shards; anything else is dead weight (issue #274:
@@ -5026,9 +5026,8 @@ pub fn reportF16Narrowing() void {
     narrowed_1d = 0;
 }
 
-/// Load ONE safetensors file into a Weights map, tensors as stored (lazy).
-/// Safetensors load runs on a CPU stream (Load::eval_gpu is Not Implemented —
-/// the GPU-stream path kills the whole server). The iterator hands a +1
+/// Load ONE safetensors file into a Weights map, tensors as stored (lazy), on
+/// `mlx.weightLoadStream()` (Metal has no GPU `Load`). The iterator hands a +1
 /// reference in `value`; it transfers straight into the map.
 pub fn loadWeightsFile(allocator: std.mem.Allocator, model_dir: []const u8, file: []const u8) !Weights {
     var w = Weights.init(allocator);
@@ -5040,7 +5039,9 @@ pub fn loadWeightsFile(allocator: std.mem.Allocator, model_dir: []const u8, file
     defer _ = mlx.mlx_map_string_to_array_free(tensor_map);
     var meta_map = mlx.mlx_map_string_to_string_new();
     defer _ = mlx.mlx_map_string_to_string_free(meta_map);
-    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, mlx.mlx_default_cpu_stream_new()));
+    const s = mlx.weightLoadStream();
+    defer _ = mlx.mlx_stream_free(s);
+    try mlx.check(mlx.mlx_load_safetensors(&tensor_map, &meta_map, path, s));
 
     const iter = mlx.mlx_map_string_to_array_iterator_new(tensor_map);
     defer _ = mlx.mlx_map_string_to_array_iterator_free(iter);

@@ -1,4 +1,5 @@
 const std = @import("std");
+const crt = @import("crt.zig");
 const builtin = @import("builtin");
 const dsv4_mod = @import("deepseek_v4.zig");
 const dsv41_mod = @import("deepseek_v41.zig");
@@ -5228,16 +5229,12 @@ fn qsaDumpQsaBlocks(layer: u32, row0: c_int, rows: c_int, kb: c_int, blocks: mlx
     if (path.len == 0 or path.len >= path_z.len) return;
     @memcpy(path_z[0..path.len], path);
     path_z[path.len] = 0;
-    const fd = std.c.open(@ptrCast(&path_z), .{
-        .ACCMODE = .WRONLY,
-        .CREAT = true,
-        .APPEND = true,
-    }, @as(std.c.mode_t, 0o644));
+    const fd = crt.openWrite(@ptrCast(&path_z), false);
     if (fd < 0) return;
-    defer _ = std.c.close(fd);
+    defer crt.close(fd);
     var hdr: [128]u8 = undefined;
     const header = std.fmt.bufPrint(&hdr, "layer={d} row0={d} rows={d} kb={d}\n", .{ layer, row0, rows, kb }) catch return;
-    _ = std.c.write(fd, header.ptr, header.len);
+    _ = crt.write(fd, header);
     var buf: [32]u8 = undefined;
     var i: usize = 0;
     while (i < n) : (i += 1) {
@@ -5245,9 +5242,9 @@ fn qsaDumpQsaBlocks(layer: u32, row0: c_int, rows: c_int, kb: c_int, blocks: mlx
             std.fmt.bufPrint(&buf, "{d}", .{data[i]}) catch return
         else
             std.fmt.bufPrint(&buf, " {d}", .{data[i]}) catch return;
-        _ = std.c.write(fd, piece.ptr, piece.len);
+        _ = crt.write(fd, piece);
     }
-    _ = std.c.write(fd, "\n", 1);
+    _ = crt.write(fd, "\n");
 }
 
 // ── The composed selection arm (the kernel's reference) ──

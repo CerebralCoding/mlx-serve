@@ -1,4 +1,6 @@
 const std = @import("std");
+const crt = @import("crt.zig");
+const win_io = @import("win_io.zig");
 const builtin = @import("builtin");
 const mlx = @import("mlx.zig");
 const transformer_mod = @import("transformer.zig");
@@ -30,11 +32,11 @@ const pld_index = @import("pld_index.zig");
 const prefix_cache_mod = @import("prefix_cache.zig");
 const tokenize_cache_mod = @import("tokenize_cache.zig");
 const scheduler_mod = @import("scheduler.zig");
-const ds4_ffi = if (@import("build_options").embedded_engines) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
+const ds4_ffi = if (@import("build_options").ds4_engine) @import("ds4_ffi.zig") else @import("ds4_ffi_stub.zig");
 const model_registry_mod = @import("model_registry.zig");
 const model_discovery = @import("model_discovery.zig");
 const mlx_gguf = @import("arch/mlx_gguf.zig");
-const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_llama = if (@import("build_options").llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const media_mod = @import("gen.zig");
 const transcription_mod = @import("transcription.zig");
 const forced_align_mod = @import("forced_align.zig");
@@ -407,9 +409,7 @@ pub const Conn = struct {
     fn awaitReadable(c: *Conn, ms: i64) bool {
         if (c.reader().bufferedLen() > 0) return true;
         if (ms <= 0) return false;
-        var fds = [_]std.posix.pollfd{.{ .fd = c.stream.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
-        const n = std.posix.poll(&fds, @intCast(@min(ms, std.math.maxInt(i32)))) catch return true;
-        return n > 0;
+        return socketReadable(c.stream.socket.handle, @intCast(@min(ms, std.math.maxInt(i32)))) catch true;
     }
 
     /// Longest `close` waits for the peer to hang up before releasing the socket anyway.
@@ -423,6 +423,7 @@ pub const Conn = struct {
     pub fn close(c: *Conn) void {
         c.flush() catch {};
         if (c.length_framed) return c.stream.close(c.io);
+        if (comptime builtin.os.tag == .windows) return c.closeAfterPeerWindows();
         const fd = c.stream.socket.handle;
         _ = std.posix.system.shutdown(fd, std.posix.SHUT.WR);
         const deadline = nowMsMonotonic(c.io) + CLOSE_WAIT_MS;
@@ -454,7 +455,23 @@ pub const Conn = struct {
     /// never hit stream-idle timeouts; tiny traffic cost.
     pub const STREAM_KEEPALIVE_MS: i64 = 5000;
 
+    /// `close`'s peer-hangup wait over AFD readiness (Windows sockets take no poll(2)).
+    fn closeAfterPeerWindows(c: *Conn) void {
+        const h = c.stream.socket.handle;
+        c.stream.shutdown(c.io, .send) catch {};
+        const deadline = nowMsMonotonic(c.io) + CLOSE_WAIT_MS;
+        while (nowMsMonotonic(c.io) < deadline and !shutdown_requested.load(.acquire)) {
+            const ev = win_io.poll(h, win_io.RECEIVE | win_io.GONE, 500) catch break;
+            if (ev & win_io.GONE != 0) break;
+            // A byte from a pipelining client is dropped.
+            if (ev != 0) _ = c.reader().discard(.limited(256)) catch break;
+        }
+        c.stream.close(c.io);
+    }
+
     pub fn peerClosed(c: *Conn) bool {
+        if (comptime builtin.os.tag == .windows)
+            return (win_io.poll(c.stream.socket.handle, win_io.GONE, 0) catch return false) != 0;
         const fd = c.stream.socket.handle;
         var fds = [_]std.posix.pollfd{.{
             .fd = fd,
@@ -1717,16 +1734,16 @@ fn appendRawToolDump(path: []const u8, tools_json: ?[]const u8, text: []const u8
     path_buf[path.len] = 0;
     const path_z: [*:0]const u8 = @ptrCast(&path_buf);
 
-    const fd = std.c.open(path_z, .{ .ACCMODE = .WRONLY, .CREAT = true, .APPEND = true }, @as(std.c.mode_t, 0o644));
+    const fd = crt.openWrite(path_z, false);
     if (fd < 0) return;
-    defer _ = std.c.close(fd);
+    defer crt.close(fd);
 
     const tools = tools_json orelse "";
     var hdr: [96]u8 = undefined;
     const h = std.fmt.bufPrint(&hdr, "\n===MLX_RAW_DUMP tools={d} raw={d}===\n", .{ tools.len, text.len }) catch return;
-    _ = std.c.write(fd, h.ptr, h.len);
-    if (tools.len > 0) _ = std.c.write(fd, tools.ptr, tools.len);
-    if (text.len > 0) _ = std.c.write(fd, text.ptr, text.len);
+    _ = crt.write(fd, h);
+    if (tools.len > 0) _ = crt.write(fd, tools);
+    if (text.len > 0) _ = crt.write(fd, text);
 }
 
 /// The ONE tool-call extraction path for every HTTP surface: parse, fall back to
@@ -1809,10 +1826,21 @@ fn deinitGlobalResponseStore() void {
 /// the socket already bound, so clearing it after bind is enough.
 fn listenExclusive(io: std.Io, addr: std.Io.net.IpAddress) !std.Io.net.Server {
     if (comptime builtin.os.tag == .linux) return listenExclusiveLinux(addr);
+    // Windows' SO_REUSEADDR lets another socket bind over a live listener, so it stays off. std.Io binds
+    // inside listen, so SO_EXCLUSIVEADDRUSE cannot be set first: a process that sets SO_REUSEADDR can still share the port.
+    if (comptime builtin.os.tag == .windows) return addr.listen(io, .{});
     var server = try addr.listen(io, .{ .reuse_address = true });
     errdefer server.deinit(io);
     try std.posix.setsockopt(server.socket.handle, std.posix.SOL.SOCKET, std.posix.SO.REUSEPORT, &std.mem.toBytes(@as(c_int, 0)));
     return server;
+}
+
+/// Whether `handle` turns readable (a connection to accept, bytes, or EOF) within `timeout_ms`.
+fn socketReadable(handle: std.Io.net.Socket.Handle, timeout_ms: i32) !bool {
+    if (comptime builtin.os.tag == .windows)
+        return try win_io.poll(handle, win_io.RECEIVE | win_io.ACCEPT | win_io.GONE, timeout_ms) != 0;
+    var fds = [_]std.posix.pollfd{.{ .fd = handle, .events = std.posix.POLL.IN, .revents = 0 }};
+    return try std.posix.poll(&fds, timeout_ms) > 0;
 }
 
 /// Linux joins a socket to its SO_REUSEPORT group at bind, so clearing the flag afterwards still
@@ -1896,11 +1924,10 @@ const StartupResponder = struct {
     }
 
     fn run(self: *StartupResponder) void {
-        var fds = [_]std.posix.pollfd{.{ .fd = self.server.socket.handle, .events = std.posix.POLL.IN, .revents = 0 }};
         while (!self.done.load(.acquire)) {
-            const ready = std.posix.poll(&fds, 100) catch continue;
+            const ready = socketReadable(self.server.socket.handle, 100) catch continue;
             // Once done, a waiting connection is the accept loop's.
-            if (ready == 0 or self.done.load(.acquire)) continue;
+            if (!ready or self.done.load(.acquire)) continue;
             const accepted = self.server.accept(self.io) catch continue;
             var conn: Conn = undefined;
             Conn.init(&conn, accepted, self.io);
@@ -2087,14 +2114,16 @@ pub fn serve(
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
-    // Install signal handlers for graceful shutdown
-    const sigact = std.posix.Sigaction{
-        .handler = .{ .handler = signalHandler },
-        .mask = std.posix.sigemptyset(),
-        .flags = 0,
-    };
-    std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
-    std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
+    // Install signal handlers for graceful shutdown (POSIX; on Windows Ctrl+C ends the process).
+    if (comptime builtin.os.tag != .windows) {
+        const sigact = std.posix.Sigaction{
+            .handler = .{ .handler = signalHandler },
+            .mask = std.posix.sigemptyset(),
+            .flags = 0,
+        };
+        std.posix.sigaction(std.posix.SIG.INT, &sigact, null);
+        std.posix.sigaction(std.posix.SIG.TERM, &sigact, null);
+    }
 
 
     // ── LAN sharing/discovery (src/lan.zig): started HERE — the one chokepoint
@@ -2221,20 +2250,14 @@ pub fn serve(
         });
     }
 
-    var poll_fds = [_]std.posix.pollfd{.{
-        .fd = server.socket.handle,
-        .events = std.posix.POLL.IN,
-        .revents = 0,
-    }};
-
     while (!shutdown_requested.load(.acquire)) {
         // Poll with 1-second timeout so we can check shutdown flag
-        const poll_result = std.posix.poll(&poll_fds, 1000) catch |err| {
+        const ready = socketReadable(server.socket.handle, 1000) catch |err| {
             if (shutdown_requested.load(.acquire)) break;
             log.err("poll error: {}\n", .{err});
             continue;
         };
-        if (poll_result == 0) continue; // timeout, re-check shutdown flag
+        if (!ready) continue; // timeout, re-check shutdown flag
         if (shutdown_requested.load(.acquire)) break;
 
         const accepted_stream = server.accept(io) catch |err| {
@@ -2284,9 +2307,8 @@ pub fn serve(
     if (global_scheduler) |sch| sch.cancelAllInFlight();
     {
         var waited_ms: u64 = 0;
-        var idle_fds = [_]std.posix.pollfd{};
         while (active_conn_threads.load(.acquire) > 0 and waited_ms < 30_000) {
-            _ = std.posix.poll(&idle_fds, 20) catch {}; // empty fd set → 20ms sleep
+            crt.sleepMs(20);
             waited_ms += 20;
         }
         const remaining = active_conn_threads.load(.acquire);
@@ -3776,7 +3798,7 @@ fn currentGpuMemoryCeiling(config: ?*const model_mod.ModelConfig, active_mem: u6
     return gpuCeilingWithWiredFloor(
         getGpuWorkingSetLimit(),
         active_mem +| @as(u64, cache_mem),
-        (metrics.getAvailableMemBytes() -| metrics.osReserveBytes(metrics.getTotalMemBytes())) +| ane_bytes,
+        (metrics.getAvailableMemBytes() -| metrics.osReserveBytes(metrics.getTotalMemBytes(), mlx.weightsInDeviceMemory())) +| ane_bytes,
         wiredCeilingFloorFor(config),
     ) -| ane_bytes;
 }
@@ -7180,7 +7202,8 @@ fn renderModelEntry(
         // registry's arch hint (the pack's real model_type), never the stub
         // config's modality marker ("flux2" for every image backend).
         const arch_label: []const u8 = if (entry.arch_hint.len > 0) entry.arch_hint else config.model_type;
-        const model_id: []const u8 = if (entry.id.len > 0) entry.id else config.model_type;
+        const model_id_json = try jsonEscape(allocator, if (entry.id.len > 0) entry.id else config.model_type);
+        defer allocator.free(model_id_json);
         const drafter_loaded = entry.hasDrafter();
         const mtp_loaded = entry.mtp != null or if (entry.llama_ctx) |c| c.mtpDrafts() > 0 else false;
         const drafter_path_json = if (drafter_loaded)
@@ -7215,9 +7238,9 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":"{s}","object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
-            model_id,
+            model_id_json,
             nowSecs(io),
             entry.bytes_resident,
             bytes_on_disk_str,
@@ -7392,9 +7415,42 @@ fn renderModelEntry(
     } else &[_]u8{};
     defer if (dims_part.len > 0) allocator.free(dims_part);
 
+    const id_json = try jsonEscape(allocator, entry.id);
+    defer allocator.free(id_json);
     return std.fmt.allocPrint(allocator,
-        \\{{"id":"{s}","object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ entry.id, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":{s},"object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ id_json, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+}
+
+test "renderModelEntry: a Windows path id stays valid JSON" {
+    const a = std.testing.allocator;
+    var e = model_registry_mod.LoadedModel{
+        .allocator = a,
+        .id = "C:\\Users\\d\\.mlx-serve\\models\\org\\m",
+        .path = "C:\\Users\\d\\.mlx-serve\\models\\org\\m",
+        .bytes_on_disk = null,
+        .arch_hint = "",
+        .config = null,
+        .weights = null,
+        .transformer = null,
+        .tokenizer = null,
+        .chat_config = null,
+        .vision_encoder = null,
+        .drafter = null,
+        .drafter_path = "",
+        .drafter_block_size = 0,
+        .prefix_cache = null,
+        .refcount = std.atomic.Value(u32).init(0),
+        .last_used_ns = 0,
+        .bytes_resident = 0,
+        .state = .unloaded,
+        .error_name = null,
+    };
+    const row = try renderModelEntry(a, std.testing.io, &e);
+    defer a.free(row);
+    const parsed = try std.json.parseFromSlice(std.json.Value, a, row, .{});
+    defer parsed.deinit();
+    try std.testing.expectEqualStrings(e.id, parsed.value.object.get("id").?.string);
 }
 
 fn handleModels(
@@ -7720,7 +7776,8 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "model_not_ready", "Loaded model has no parsed config", 500);
         return;
     };
-    const model_id: []const u8 = if (lm.id.len > 0) lm.id else config.model_type;
+    const model_id_json = try jsonEscape(allocator, if (lm.id.len > 0) lm.id else config.model_type);
+    defer allocator.free(model_id_json);
     const bytes_resident = lm.bytes_resident;
     const bytes_on_disk_str = if (lm.bytes_on_disk) |b|
         try std.fmt.allocPrint(allocator, "{d}", .{b})
@@ -7735,9 +7792,9 @@ fn handleLoadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_bo
     defer allocator.free(drafter_path_json);
 
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"model":{{"id":"{s}","object":"model","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"drafter_loaded":{s},"drafter_path":{s}}}}}
+        \\{{"model":{{"id":{s},"object":"model","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"drafter_loaded":{s},"drafter_path":{s}}}}}
     , .{
-        model_id,
+        model_id_json,
         bytes_resident,
         bytes_on_disk_str,
         if (drafter_loaded) "true" else "false",
@@ -8267,9 +8324,10 @@ fn handleUnloadModelStrict(allocator: std.mem.Allocator, stream: *Conn, request_
         },
     };
 
-    const id_for_body = if (requested_id.len > 0) requested_id else "mlx-serve";
+    const id_for_body = try jsonEscape(allocator, if (requested_id.len > 0) requested_id else "mlx-serve");
+    defer allocator.free(id_for_body);
     const body = try std.fmt.allocPrint(allocator,
-        \\{{"model":{{"id":"{s}","object":"model","loaded":false,"state":"unloaded"}}}}
+        \\{{"model":{{"id":{s},"object":"model","loaded":false,"state":"unloaded"}}}}
     , .{id_for_body});
     defer allocator.free(body);
     try sendResponse(stream, "200 OK", "application/json", body);
@@ -13403,13 +13461,12 @@ fn idleEvictLoop(ctx: IdleEvictCtx) void {
     const sch = ctx.scheduler;
     const tick_ms = scheduler_mod.idleEvictTickMs(ctx.window_ms);
     // Wake every 500 ms to check the stop flag; sweep once per tick interval.
-    // `std.c.nanosleep` for the same reason as the gauge sampler: `std.time.sleep`
-    // is gone in Zig 0.16, and a blocking Io timer here could outlive the stop.
-    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
+    // `crt.sleepMs` for the same reason as the gauge sampler: a blocking Io timer
+    // here could outlive the stop.
     const ticks_per_sweep: u64 = @max(1, @as(u64, @intCast(@divTrunc(tick_ms, 500))));
     var tick: u64 = 0;
     while (!ctx.stop.load(.monotonic)) {
-        _ = std.c.nanosleep(&poll_ts, null);
+        crt.sleepMs(500);
         tick += 1;
         if (tick < ticks_per_sweep) continue;
         tick = 0;
@@ -13445,16 +13502,14 @@ fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
     // Wake every 500 ms to check the stop flag; sample system state once per
     // 2-second interval. The 2 s cadence is what makes generation_tokens_live a
     // real-time tok/s source — the panel windows over a few of these samples.
-    // Uses std.c.nanosleep (POSIX) because std.time.sleep was removed in Zig
-    // 0.16 — this thread has no Io handle.
+    // `crt.sleepMs`: this thread has no Io handle.
     const SAMPLE_INTERVAL_TICKS: u64 = 4; // 4 × 500 ms = 2 s
-    const poll_ts = std.c.timespec{ .sec = 0, .nsec = 500_000_000 };
     // Sample once immediately so the panel / Grafana show real values from the
     // first scrape instead of zeros for the first interval.
     sampleGauges(ctx);
     var tick: u64 = 0;
     while (!ctx.stop.load(.monotonic)) {
-        _ = std.c.nanosleep(&poll_ts, null);
+        crt.sleepMs(500);
         tick += 1;
         if (tick < SAMPLE_INTERVAL_TICKS) continue;
         tick = 0;
@@ -13642,8 +13697,7 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
                 }
                 if (stream.peerClosed()) return; // client gave up while we waited
                 l.pokeDiscovery();
-                const ts = std.c.timespec{ .sec = 0, .nsec = 250_000_000 };
-                _ = std.c.nanosleep(&ts, null);
+                crt.sleepMs(250);
             },
         }
     };
@@ -13664,7 +13718,9 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
 /// wrote it (a slice of `body`); a model named in the query string leaves the body as is.
 fn proxiedBody(allocator: std.mem.Allocator, body: []const u8, raw: ?[]const u8, bare: []const u8) ![]u8 {
     const r = raw orelse return allocator.dupe(u8, body);
-    return lan_mod.rewriteModelValue(allocator, body, r, bare);
+    const bare_json = try jsonEscape(allocator, bare); // canonical again, so a backslash is re-escaped
+    defer allocator.free(bare_json);
+    return lan_mod.rewriteModelValue(allocator, body, r, bare_json[1 .. bare_json.len - 1]);
 }
 
 fn handleProviderProxy(allocator: std.mem.Allocator, stream: *Conn, prov: *providers_mod.Providers, path: []const u8, body: []const u8, raw_model: ?[]const u8, full_id: []const u8) !void {
@@ -27419,4 +27475,13 @@ test "MiniCPM-V 4.7: expanded image runs and canvas positions equal the processo
             try t.expectEqual(@as(i32, @intCast(w.integer)), mrope.pos.?[row * out.ids.len + k]);
         };
     }
+}
+
+test "proxiedBody: a Windows path id is spliced back escaped, so the forwarded body stays JSON" {
+    const a = std.testing.allocator;
+    const body = "{\"model\":\"C:\\\\m@local\"}";
+    const raw = body[10 .. body.len - 2];
+    const out = try proxiedBody(a, body, raw, "C:\\m");
+    defer a.free(out);
+    try std.testing.expectEqualStrings("{\"model\":\"C:\\\\m\"}", out);
 }

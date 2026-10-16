@@ -1,5 +1,6 @@
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const std = @import("std");
+const crt = @import("crt.zig");
 const build_options = @import("build_options");
 // pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
 pub const mlx = @import("mlx.zig");
@@ -24,8 +25,8 @@ const ane_lm = @import("arch/ane_lm.zig");
 const status = @import("status.zig");
 const model_settings_mod = @import("model_settings.zig");
 const vision_mod = @import("vision.zig");
-const ds4_arch = if (build_options.embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const llama_arch = if (build_options.embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const ds4_arch = if (build_options.ds4_engine) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const llama_arch = if (build_options.llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const gen_mod = @import("gen.zig");
 const cli_mod = @import("cli.zig");
 
@@ -54,18 +55,17 @@ pub const VERSION: []const u8 = build_options.version;
 extern "c" fn ggml_version() [*:0]const u8;
 extern "c" fn ggml_commit() [*:0]const u8;
 
-// The embedded llama.cpp engine links on macOS and Linux builds (embedded_engines);
+// The embedded llama.cpp engine links on macOS, Linux and Windows builds (llama_engine);
 // elsewhere the stub engine replaces it, so the libllama symbols above are
 // not referenced and `--version` reports these placeholders instead.
 fn ggmlEngineVersion() []const u8 {
-    if (comptime !build_options.embedded_engines) return "unavailable (no embedded llama.cpp)";
+    if (comptime !build_options.llama_engine) return "unavailable (no embedded llama.cpp)";
     return std.mem.span(ggml_version());
 }
 fn ggmlEngineCommit() []const u8 {
-    if (comptime !build_options.embedded_engines) return "";
+    if (comptime !build_options.llama_engine) return "";
     return std.mem.span(ggml_commit());
 }
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 
 // GGUF file-format version — the compiled `GGUF_VERSION` in
 // lib/llama/include/gguf.h. Keep in sync if a llama.cpp bump changes it.
@@ -109,6 +109,7 @@ fn replThreadMain(allocator: std.mem.Allocator, io: std.Io, port: u16) void {
     cli_mod.runRepl(allocator, io, port) catch |err| {
         log.warn("chat REPL exited: {s}\n", .{@errorName(err)});
     };
+    if (comptime @import("builtin").os.tag == .windows) std.process.exit(0);
     std.posix.raise(std.posix.SIG.TERM) catch {};
 }
 
@@ -481,6 +482,7 @@ fn printUsage(io: std.Io) void {
 }
 
 pub fn main(init: std.process.Init) !void {
+    crt.exportHomeDefault();
     // Referenced, or the linker strips the unreferenced section.
     if (@import("builtin").os.tag == .macos) std.mem.doNotOptimizeAway(&info_plist);
     const allocator = init.gpa;
@@ -842,7 +844,7 @@ pub fn main(init: std.process.Init) !void {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
             // serial. deepseek_v4.initModel reads the env at model load.
-            _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
+            crt.setEnv("MLX_SERVE_DSV4_DSPARK", "1");
             // Same flag, embedded engine: arm ds4's DSpark runtime when a
             // DSpark support GGUF sits beside a served .gguf model.
             ds4_dspark = true;

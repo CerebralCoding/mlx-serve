@@ -17,6 +17,7 @@
 //! broadcasts on `state_cond` so blocked callers wake.
 
 const std = @import("std");
+const crt = @import("crt.zig");
 const model_mod = @import("model.zig");
 const transformer_mod = @import("transformer.zig");
 const tokenizer_mod = @import("tokenizer.zig");
@@ -30,8 +31,8 @@ const rp_mod = @import("reasoning_protocol.zig");
 const model_discovery = @import("model_discovery.zig");
 const io_util = @import("io_util.zig");
 const load_progress = @import("load_progress.zig");
-const arch_ds4 = if (@import("build_options").embedded_engines) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const arch_llama = if (@import("build_options").embedded_engines) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
+const arch_ds4 = if (@import("build_options").ds4_engine) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
+const arch_llama = if (@import("build_options").llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
 const arch_ane = @import("arch/ane_lm.zig");
 const gen_mod = @import("gen.zig");
 const diarization_mod = @import("nemotron_diarization.zig");
@@ -54,11 +55,7 @@ pub const UnloadMark = struct {
 };
 pub var last_unload: UnloadMark = .{};
 
-pub fn monotonicMs() i64 {
-    var ts: std.c.timespec = undefined;
-    _ = std.c.clock_gettime(.MONOTONIC, &ts);
-    return @as(i64, ts.sec) * 1000 + @divTrunc(@as(i64, ts.nsec), 1_000_000);
-}
+pub const monotonicMs = crt.monotonicMs;
 
 const Transformer = transformer_mod.Transformer;
 const Weights = model_mod.Weights;
