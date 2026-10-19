@@ -2716,6 +2716,18 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
                 };
             }
         }
+        // Per-weight overrides carry their own mode. An unknown one (EigenLabs' `iq2_xxs` experts) was read
+        // as the top-level affine layout and failed at the FIRST request's matmul; refuse it here, by name.
+        var overrides = q.iterator();
+        while (overrides.next()) |kv| {
+            if (kv.value_ptr.* != .object) continue;
+            const mode = kv.value_ptr.object.get("mode") orelse continue;
+            if (mode != .string) continue;
+            if (QuantMode.fromString(mode.string) == null) {
+                log.err("unsupported quantization mode '{s}' on '{s}' (supported: affine, nvfp4, mxfp4, mxfp8)\n", .{ mode.string, kv.key_ptr.* });
+                return error.UnsupportedQuantMode;
+            }
+        }
         // MLX ships affine kernels only for bits {2,3,4,5,6,8} (ops.cpp
         // rejects the rest at quantize() time, but an ALREADY-quantized
         // checkpoint skips that check and dies at Metal kernel load during
@@ -9120,6 +9132,31 @@ test "parseConfigFromJson explicit affine mode keeps biases" {
     const config = try parseConfigFromJson(testing.allocator, json);
     try testing.expectEqual(QuantMode.affine, config.quant_mode);
     try testing.expect(config.quant_mode.hasBiases());
+}
+
+test "parseConfigFromJson refuses an unknown PER-WEIGHT quantization mode by name" {
+    // EigenLabs' Nemotron 3.5 Bolt IQ2: affine at the top, `iq2_xxs` experts underneath. Read as affine the
+    // first request's matmul failed; the load refuses instead.
+    const json =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "quantization": {"group_size": 32, "bits": 8, "mode": "affine",
+        \\    "layers.0.mlp.switch_mlp.fc1": {"group_size": 256, "bits": 2, "mode": "iq2_xxs"}}
+        \\}
+    ;
+    try testing.expectError(error.UnsupportedQuantMode, parseConfigFromJson(testing.allocator, json));
+    // A known per-weight mode beside the top-level one still parses.
+    const ok =
+        \\{
+        \\  "model_type": "qwen3",
+        \\  "hidden_size": 1024,
+        \\  "quantization": {"group_size": 32, "bits": 8, "mode": "affine",
+        \\    "layers.0.mlp.switch_mlp.fc1": {"group_size": 16, "bits": 4, "mode": "nvfp4"}}
+        \\}
+    ;
+    const config = try parseConfigFromJson(testing.allocator, ok);
+    try testing.expectEqual(QuantMode.affine, config.quant_mode);
 }
 
 test "parseConfigFromJson unknown quantization mode → error" {

@@ -3872,8 +3872,11 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
         // "Tool voxel-pagoda-garden not found" and the model looped on it).
         // The JSON shapes below can never contain that opener, so this only
         // reorders the case that was being read wrong.
-        if (std.mem.indexOf(u8, content, "<function=") != null) {
-            if (parseHermesToolCall(allocator, content)) |tc| {
+        const repaired_opener = try hermesSpecialOpenerRepair(allocator, content);
+        defer if (repaired_opener) |r| allocator.free(r);
+        const body = repaired_opener orelse content;
+        if (std.mem.indexOf(u8, body, "<function=") != null) {
+            if (parseHermesToolCall(allocator, body)) |tc| {
                 try calls.append(allocator, tc);
                 parsed_ok = true;
             }
@@ -6957,6 +6960,23 @@ fn hermesParamSpanEnclosing(body: []const u8, at: usize) ?usize {
     const end = hermesValueEnd(body, gt + 1) orelse return null;
     if (end <= at) return null;
     return end + "</parameter>".len;
+}
+
+/// A `<tool_call>` body whose `<function=` opener lost its `<` to a sampled special token
+/// (`<|im_start|>function=read_file>`, live on Qwen3.8-27B under MTP): one mangled delimiter,
+/// name and arguments intact. Returns the body with that special spelled as `<`, null when the
+/// body already has a `<function=` or no `<|…|>function=` run; the caller owns the copy.
+fn hermesSpecialOpenerRepair(allocator: std.mem.Allocator, body: []const u8) !?[]u8 {
+    if (std.mem.indexOf(u8, body, "<function=") != null) return null;
+    const fn_at = std.mem.indexOf(u8, body, "function=") orelse return null;
+    if (fn_at < 4 or !std.mem.endsWith(u8, body[0..fn_at], "|>")) return null;
+    const open = std.mem.lastIndexOf(u8, body[0..fn_at], "<|") orelse return null;
+    if (std.mem.indexOfAny(u8, body[open + 2 .. fn_at - 2], " \t\r\n<>") != null) return null;
+    const out = try allocator.alloc(u8, body.len - (fn_at - open) + 1);
+    @memcpy(out[0..open], body[0..open]);
+    out[open] = '<';
+    @memcpy(out[open + 1 ..], body[fn_at..]);
+    return out;
 }
 
 fn parseHermesToolCall(allocator: std.mem.Allocator, block: []const u8) ?ParsedToolCall {
@@ -15746,4 +15766,23 @@ test "renderChatTemplate: REAL MiniCPM-V 4.7 chat_template.jinja renders without
     defer allocator.free(off);
     try testing.expect(std.mem.endsWith(u8, off, "<|im_start|>assistant\n<think>\n\n</think>\n\n"));
     try testing.expect(!promptTailOpensThink(off));
+}
+
+test "a sampled special token where <function='s `<` belongs still names the call" {
+    const allocator = std.testing.allocator;
+    const raw = "<tool_call>\n<|im_start|>function=read_file>\n<parameter=path>\nsrc/game.js\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, raw)) orelse return error.TestUnexpectedResult;
+    defer {
+        for (calls) |tc| {
+            allocator.free(tc.name);
+            allocator.free(tc.arguments);
+        }
+        allocator.free(calls);
+    }
+    try std.testing.expectEqual(@as(usize, 1), calls.len);
+    try std.testing.expectEqualStrings("read_file", calls[0].name);
+    try std.testing.expectEqualStrings("{\"path\":\"src/game.js\"}", calls[0].arguments);
+    // A body with its real opener is left alone; a special that is not glued to `function=` is not touched.
+    try std.testing.expect((try hermesSpecialOpenerRepair(allocator, "<function=x>\n</function>")) == null);
+    try std.testing.expect((try hermesSpecialOpenerRepair(allocator, "<|im_start|>\nfunction=x>")) == null);
 }

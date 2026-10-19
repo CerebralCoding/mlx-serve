@@ -5502,7 +5502,9 @@ test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores
         const ws: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(ihd * ih)));
         const want_a = try indexScoresScalar(&sc, &m, q, t[1], t[2], ws, p0, ratio);
         const got_a = try indexScoresTiled(&sc, &m, q, t[1], t[2], ws, p0, ratio);
-        // The folded weight scale is the product the indexer used to make first, bit for bit.
+        // The folded weight scale is the product the indexer used to make first. Not bit for bit:
+        // whether the kernel contracts `float(w) * scale * q` into an FMA is the Metal compiler's
+        // call per GPU (bit-equal on M5, one rounding apart on the macos-26 CI runner).
         const wb = try sc.astype(t[2], .bfloat16);
         for ([2]bool{ false, true }) |tiled| {
             const f = if (tiled) &indexScoresTiled else &indexScoresScalar;
@@ -5510,7 +5512,9 @@ test "dsv41 index scores: the matrix kernel scores what the scalar kernel scores
             defer gpa.free(pre);
             const fold = try hostF32(try f(&sc, &m, q, t[1], wb, ws, p0, ratio));
             defer gpa.free(fold);
-            for (pre, fold) |a, b| try testing.expectEqual(@as(u32, @bitCast(a)), @as(u32, @bitCast(b)));
+            for (pre, fold) |a, b| {
+                if (std.math.isInf(a)) try testing.expectEqual(a, b) else try testing.expectApproxEqAbs(a, b, 1e-5 * @max(1.0, @abs(a)));
+            }
         }
         const want = try hostF32(want_a);
         defer gpa.free(want);
@@ -5893,6 +5897,7 @@ test "dsv41 router: the wide f32 matmul gives the logits the decode kernel gives
 }
 
 test "dsv41 kv row: a head-width row launches and is normed by its own rms on this GPU" {
+    if (!mlx.metalKernelsAvailable()) return error.SkipZigTest;
     const gpa = testing.allocator;
     var sc = Scope.init(gpa, mlx.gpuStream());
     defer sc.deinit();

@@ -1,6 +1,6 @@
 # Changelog
 
-## v26.10.2 — New Models, Transcripts, RDMA, Faster
+## v26.10.3 — New Models, Transcripts, RDMA, Faster
 
 ### Highlights
 
@@ -28,9 +28,9 @@
 
 - **Saved conversations stay saved.** Conversations with images pick up from the SSD cache even after they leave memory (thanks @GGGBB). Every long session is saved to the SSD, not just the newest, and quitting the server stops a long prompt right away and takes up to 45 seconds to finish saving (thanks @STRML, @Dankpaws). A failed save no longer throws away what was already saved (thanks @kmahara).
 - **Models load.** Homebrew's command-line server starts again (thanks @yGuy), DeepSeek-V4-Flash GGUFs open with default settings (thanks @nothinglimited), a model you download shows up in the server right away (thanks @Salingo), downloads fetch every file a model lists so OptiQ packs no longer show "Missing shards", Bonsai 2 2B, 4B and 9B load, and LFM2.5-8B-A1B, LFM2.5-24B-A2B and Kolibri-1 are no longer marked unsupported.
-- **Answers come out right.** Loading an embedding model no longer makes the next chat turn fail (thanks @alexborhani), GLM-5.3 answers as it should when several chats share it or it drafts ahead, Nemotron-H packs that write their step limit as infinity answer properly, a picture sent as a plain image URL reaches the model instead of being dropped, Claude Code gets the same drafting speed-up as other clients, and DeepSeek-V4.1-Flash keeps answering while an image model is loaded beside it.
+- **Answers come out right.** Loading an embedding model no longer makes the next chat turn fail (thanks @alexborhani), GLM-5.3 answers as it should when several chats share it or it drafts ahead, Nemotron-H packs that write their step limit as infinity answer properly, a picture sent as a plain image URL reaches the model instead of being dropped, Claude Code gets the same drafting speed-up as other clients, DeepSeek-V4.1-Flash keeps answering while an image model is loaded beside it, and a 3D job that fails on the GPU says so instead of returning a broken mesh.
 - **NVIDIA, Linux and Windows.** Models paired with a drafter no longer stop after the first word on NVIDIA GPUs (thanks @Weschera), long prompts to NVIDIA's Flash Next pack no longer fail past 6,500 tokens at a time, image and video jobs on Windows respect the memory limit (thanks @alexborhani), and Linux machines on MLX's Vulkan backend answer instead of failing every request.
-- **A smoother app.** Agents started from the web console's Code Launcher no longer quit on launch, the downloaded app ships the mlx-serve agent skill and the OpenCode 2 plugin again, Agent > Update System Prompt and Skills to Latest… works again, the "/" menu opens above the text field, pickers no longer flicker and placeholder text no longer runs under the scroll bar while a pane scrolls (thanks @lborloz), and a damaged LAN key file no longer stops your Mac from finding the others.
+- **A smoother app.** Agents started from the web console's Code Launcher no longer quit on launch, the downloaded app ships the mlx-serve agent skill and the OpenCode 2 plugin again, Agent > Update System Prompt and Skills to Latest… works again, the "/" menu opens above the text field, pickers no longer flicker and placeholder text no longer runs under the scroll bar while a pane scrolls (thanks @lborloz), a damaged LAN key file no longer stops your Mac from finding the others, the model memory cap gains a 224 GB step, and the agent skill loads one media model at a time and waits for its assets instead of generating beside your chat.
 
 ### Also new
 

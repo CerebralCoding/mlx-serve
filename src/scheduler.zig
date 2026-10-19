@@ -2069,6 +2069,8 @@ pub const Scheduler = struct {
     ///   error.LoadFailed        — inference thread reported a load failure.
     ///   error.Shutdown          — scheduler is shutting down.
     pub fn ensureLoaded(self: *Scheduler, id_or_empty: []const u8) !*LoadedModel {
+        // A lost GPU context fails every MLX call: nothing is loaded or served until a restart.
+        if (mlx.gpuContextLost()) return error.GpuContextLost;
         // Fast path: ready entries. registry.ensureLoaded handles waiting
         // out .loading / .evicting transitions by other callers.
         const fast_result = self.registry.ensureLoaded(id_or_empty);
@@ -6584,6 +6586,20 @@ const GenYield = struct {
     }
 };
 
+/// Chat interleaves with a running media job (GenYield) except on CUDA: there a decode that ran
+/// inside one image job left state the next job's first step faulted on once that chat model
+/// was evicted (an illegal memory access). Set at boot by `server.serve`.
+pub var gen_yield_enabled = true;
+
+/// `MLX_SERVE_GEN_YIELD=1` forces interleaving on, `=0` off; otherwise on except on CUDA.
+pub fn genYieldEnabled(cuda: bool, env: ?[]const u8) bool {
+    if (env) |e| {
+        if (std.mem.eql(u8, e, "1")) return true;
+        if (std.mem.eql(u8, e, "0")) return false;
+    }
+    return !cuda;
+}
+
 /// Run one media-generation job on the inference thread. The job body
 /// (`req.run`) does all mlx work + writes the HTTP/SSE response to the parked
 /// connection. We bracket it with the model's `gen_busy` flag for visibility
@@ -6594,7 +6610,7 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
     req.model.gen_busy = true;
     var gy = GenYield{ .sch = sch, .step_sw = io_util.Stopwatch.init(sch.io) };
     const hook = gen_sse.Yield{ .ctx = &gy, .step = GenYield.step, .serve_until = GenYield.serveUntil, .wake = GenYield.wake };
-    gen_sse.gen_yield = &hook;
+    if (gen_yield_enabled) gen_sse.gen_yield = &hook;
     // The whole estimated peak, though live memory already holds part of it: the side that
     // cannot OOM.
     sch.gen_reserve_bytes = sch.mediaPeakFor(req.model);
@@ -7768,8 +7784,13 @@ pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
 }
 
 /// The flag's text if given, else the env's, else 0.
+/// The decode share a server runs with when nothing names one: the boundary admission and the
+/// smallest-tail-first batch only engage under a share, and without it a quick question waited
+/// 90-120 s behind a 90k prefill (26.10.3 validation). `--prefill-decode-share 0` restores the old schedule.
+pub const DEFAULT_DECODE_SHARE: f32 = 0.25;
+
 pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDecodeShare}!f32 {
-    const text = flag orelse env orelse return 0;
+    const text = flag orelse env orelse return DEFAULT_DECODE_SHARE;
     return parseDecodeShare(text);
 }
 
@@ -12594,7 +12615,8 @@ test "decode share: parse clamps above 0.9 and rejects anything that is not a sh
     // The flag outranks the env; neither set is 0; a bad env is an error, not 0.
     try testing.expectEqual(@as(f32, 0.3), try resolveDecodeShare("0.3", "0.5"));
     try testing.expectEqual(@as(f32, 0.5), try resolveDecodeShare(null, "0.5"));
-    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare(null, null));
+    try testing.expectEqual(DEFAULT_DECODE_SHARE, try resolveDecodeShare(null, null));
+    try testing.expectEqual(@as(f32, 0), try resolveDecodeShare("0", null));
     try testing.expectError(error.InvalidDecodeShare, resolveDecodeShare(null, "abc"));
 }
 
@@ -12941,3 +12963,10 @@ test "hot-cache view: a revise that follows an unload raises a budget but never 
     try testing.expectEqual(@as(u64, 200 << 20), hc.max_kv_bytes);
 }
 
+test "genYieldEnabled: off on CUDA unless asked for, on elsewhere" {
+    try std.testing.expect(!genYieldEnabled(true, null));
+    try std.testing.expect(genYieldEnabled(true, "1"));
+    try std.testing.expect(genYieldEnabled(false, null));
+    try std.testing.expect(!genYieldEnabled(false, "0"));
+    try std.testing.expect(!genYieldEnabled(true, ""));
+}
