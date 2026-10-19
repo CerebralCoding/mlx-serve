@@ -46,7 +46,7 @@ pub const VisionPreproc = struct {
     /// `gemma_budget` (Gemma 4's own processor, as EmbeddingGemma 2 uses it: a CHW image of any
     /// aspect ratio sized to `max_tokens` soft tokens), or one of the patch-grid towers
     /// (each with its own resize + patch order).
-    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget, radio } = .gemma,
+    mode: enum { gemma, qwen, muse, lfm2, glm, minicpm, gemma_budget, radio, dsv41 } = .gemma,
     patch: u32 = 16,
     tps: u32 = 2,
     merge: u32 = 2,
@@ -68,6 +68,8 @@ pub const VisionPreproc = struct {
     pixels_tolerance: f32 = 0,
     /// gemma_budget video: the most frames kept from a client's list.
     max_frames: u32 = 0,
+    /// dsv41: an image wider than this many heights is stretched into the capped canvas (0 = no cap).
+    max_wh_ratio: u32 = 0,
 };
 
 /// Raw mono 16 kHz audio samples for the Gemma 4 12B unified audio embedder.
@@ -164,6 +166,9 @@ pub const ChatConfig = struct {
     renders_tool_turn: ?bool = null,
     /// A model-specific video atom emitted only for an attached media part.
     video_placeholder: ?[]const u8 = null,
+    /// A template that reads `content` as a STRING (DeepSeek-V4.1): each attached image becomes this
+    /// atom, joined to the text by blank lines, the way the release's encoder renders image blocks.
+    image_placeholder: ?[]const u8 = null,
 
     pub fn deinit(self: *ChatConfig) void {
         self.allocator.free(self.chat_template);
@@ -389,6 +394,7 @@ pub fn loadChatConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []con
         .add_bos_token = add_bos_token,
         .allocator = allocator,
         .renders_tool_turn = renders_tool_turn,
+        .image_placeholder = if (dsv41) "<\xef\xbd\x9cdeepseek_image\xef\xbd\x9c>" else null,
     };
 }
 
@@ -1148,7 +1154,7 @@ pub fn serializeMessagesJson(allocator: std.mem.Allocator, messages: []const Mes
 }
 
 pub fn serializeMessagesJsonOpts(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, false, null);
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, false, null, null);
 }
 
 /// K2-Horizon's template raises on an assistant turn with NO thinking field,
@@ -1159,7 +1165,7 @@ fn templateRequiresReasoningField(tpl: []const u8) bool {
 }
 
 pub fn serializeMessagesJsonFor(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, chat_config: *const ChatConfig) ![]const u8 {
-    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.video_placeholder);
+    return serializeMessagesJsonImpl(allocator, messages, empty_content, templateRequiresReasoningField(chat_config.chat_template), chat_config.video_placeholder, chat_config.image_placeholder);
 }
 
 pub fn messageHasMedia(msg: Message) bool {
@@ -1177,6 +1183,23 @@ pub fn isImageItemStart(img: ImageData) bool {
 /// Media as content parts, so the model's own template renders one
 /// placeholder per item where the message sits: images, videos, audio (the
 /// order the server encodes them), then the text.
+/// `content` as one string: an `atom` per image, then the text, all joined by blank lines (DeepSeek's
+/// `process_image_messages`). Video and audio have no atom on such a template.
+fn appendImageAtomsText(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), msg: Message, atom: []const u8) !void {
+    var text = std.ArrayList(u8).empty;
+    defer text.deinit(allocator);
+    for (msg.images orelse &[_]ImageData{}) |img| {
+        if (!isImageItemStart(img)) continue;
+        if (text.items.len > 0) try text.appendSlice(allocator, "\n\n");
+        try text.appendSlice(allocator, atom);
+    }
+    if (msg.content.len > 0) {
+        if (text.items.len > 0) try text.appendSlice(allocator, "\n\n");
+        try text.appendSlice(allocator, msg.content);
+    }
+    try appendJsonString(allocator, buf, text.items);
+}
+
 fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8), msg: Message, video_placeholder: ?[]const u8) !void {
     try buf.append(allocator, '[');
     var first = true;
@@ -1208,7 +1231,7 @@ fn appendMediaContentParts(allocator: std.mem.Allocator, buf: *std.ArrayList(u8)
     try buf.append(allocator, ']');
 }
 
-fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool, video_placeholder: ?[]const u8) ![]const u8 {
+fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Message, empty_content: EmptyContent, reasoning_required: bool, video_placeholder: ?[]const u8, image_placeholder: ?[]const u8) ![]const u8 {
     var buf = std.ArrayList(u8).empty;
     errdefer buf.deinit(allocator);
 
@@ -1220,7 +1243,7 @@ fn serializeMessagesJsonImpl(allocator: std.mem.Allocator, messages: []const Mes
 
         try buf.appendSlice(allocator, ",\"content\":");
         if (messageHasMedia(msg)) {
-            try appendMediaContentParts(allocator, &buf, msg, video_placeholder);
+            if (image_placeholder) |atom| try appendImageAtomsText(allocator, &buf, msg, atom) else try appendMediaContentParts(allocator, &buf, msg, video_placeholder);
         } else if (msg.content.len > 0) {
             try appendJsonString(allocator, &buf, msg.content);
         } else switch (empty_content) {
@@ -10731,6 +10754,21 @@ test "serializeMessagesJson basic" {
     try testing.expectEqual(@as(usize, 2), parsed.value.array.items.len);
     try testing.expectEqualStrings("user", parsed.value.array.items[0].object.get("role").?.string);
     try testing.expectEqualStrings("Hello", parsed.value.array.items[0].object.get("content").?.string);
+}
+
+test "serializeMessagesJson: a string-content template gets each image as its atom before the text" {
+    const a = std.testing.allocator;
+    var imgs = [_]ImageData{ .{ .pixels = &.{}, .width = 1, .height = 1 }, .{ .pixels = &.{}, .width = 1, .height = 1 } };
+    const msgs = [_]Message{.{ .role = "user", .content = "What differs?", .images = &imgs }};
+    var cfg = ChatConfig{ .chat_template = "", .bos_token = null, .eos_token = null, .add_bos_token = false, .allocator = a, .image_placeholder = "<IMG>" };
+    const json = try serializeMessagesJsonFor(a, &msgs, .null_literal, &cfg);
+    defer a.free(json);
+    try std.testing.expectEqualStrings("[{\"role\":\"user\",\"content\":\"<IMG>\\n\\n<IMG>\\n\\nWhat differs?\"}]", json);
+    // Without the atom the same message renders as content parts.
+    cfg.image_placeholder = null;
+    const parts = try serializeMessagesJsonFor(a, &msgs, .null_literal, &cfg);
+    defer a.free(parts);
+    try std.testing.expect(std.mem.indexOf(u8, parts, "{\"type\":\"image\"}") != null);
 }
 
 test "serializeMessagesJson with tool_calls" {

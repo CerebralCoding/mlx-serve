@@ -741,6 +741,14 @@ pub const ModelConfig = struct {
     glmv_swiglu_limit: f32 = 10.0,
     glmv_min_image_tokens: u32 = 16,
     glmv_max_image_tokens: u32 = 8000,
+
+    // DeepSeek-V4.1 vision tower (src/dsv41_vision.zig): the release's `vision_config`, on top of the
+    // generic vision_* geometry. `dv_max_wh_ratio` 0 = no cap (the release's null).
+    dsv41_vision: bool = false,
+    dv_downsample: u32 = 3,
+    dv_max_image_tokens: u32 = 1024,
+    dv_min_pixels: u32 = 295936,
+    dv_max_wh_ratio: u32 = 0,
     // MiniCPM-V 4.7 vision (src/minicpm_vision.zig): the SigLIP2 geometry rides the vision_*
     // fields; these are its window merger, slicing and placeholder tokens. The token ids
     // that are not in config.json come from the tokenizer (`populateMiniCpmImageTokens`).
@@ -4235,8 +4243,25 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
             return if (is_v41) error.UnsupportedDsv41Config else error.UnsupportedDsv4Config;
         }
         if (is_v41) {
-            // Text-only: the vision tower is never loaded.
-            config.has_vision = false;
+            // The release's tower (src/dsv41_vision.zig) splices at `<｜deepseek_image｜>`: a pack
+            // without `vision_config` or the image token serves text.
+            config.dsv41_vision = config.has_vision and config.image_token_id != 0;
+            config.has_vision = config.dsv41_vision;
+            if (config.dsv41_vision) {
+                const vc = jsonField(root, "vision_config").?.object;
+                config.vision_rope_theta = 10000.0;
+                if (jsonField(vc, "rope_theta")) |v| config.vision_rope_theta = try jsonFloat(v);
+                if (jsonField(vc, "downsample_ratio")) |v| config.dv_downsample = try jsonU32(v);
+                if (jsonField(vc, "max_image_tokens")) |v| config.dv_max_image_tokens = try jsonU32(v);
+                if (jsonField(vc, "min_pixels")) |v| config.dv_min_pixels = try jsonU32(v);
+                if (jsonField(vc, "max_wh_ratio")) |v| {
+                    if (v == .integer) config.dv_max_wh_ratio = try jsonU32(v);
+                }
+                // The 2-D rotary splits a head into h and w halves of rotate_half pairs.
+                if (config.vision_num_heads == 0 or config.vision_hidden_size % config.vision_num_heads != 0 or
+                    (config.vision_hidden_size / config.vision_num_heads) % 4 != 0 or config.vision_patch_size == 0 or
+                    config.dv_downsample == 0 or config.dv_max_image_tokens < 4) return error.InvalidConfigField;
+            }
             try parseDsv41Fields(cfg_obj, &config);
         }
     } else if (std.mem.eql(u8, model_type, "glm_moe_dsa")) {
@@ -5193,11 +5218,10 @@ pub fn loadModelWeights(io: std.Io, allocator: std.mem.Allocator, model_dir: []c
     return weights;
 }
 
-/// deepseek_v41 serves text only and reads its Engram tables from disk per
-/// lookup (~100 GB a layer), so neither the vision tower nor those tables
-/// enter the weight map.
-fn dsv41DropsKey(key: []const u8) bool {
-    return dsv41VisionKey(key) or std.mem.indexOf(u8, key, ".engram.embed.") != null;
+/// deepseek_v41 reads its Engram tables from disk per lookup (~100 GB a layer), so they never enter
+/// the weight map; the vision tower only when the load asks for it.
+fn dsv41DropsKey(key: []const u8, vision: bool) bool {
+    return (!vision and dsv41VisionKey(key)) or std.mem.indexOf(u8, key, ".engram.embed.") != null;
 }
 
 pub fn dsv41VisionKey(key: []const u8) bool {
@@ -5486,7 +5510,7 @@ pub fn loadSafetensorsFile(
 
         const foreign = if (opts.owners) |o| (if (o.get(key_str)) |owner| !std.mem.eql(u8, owner, opts.shard) else false) else false;
         if (foreign or !keepsTensor(key_str, opts) or (opts.embedded_ple and qwen4_exp.embeddedTensorName(key_str)) or
-            (opts.dsv41 and dsv41DropsKey(key_str)))
+            (opts.dsv41 and dsv41DropsKey(key_str, opts.vision)))
         {
             _ = mlx.mlx_array_free(value);
             continue;
@@ -7714,14 +7738,28 @@ pub const dsv41_release_config =
     \\  "num_nextn_predict_layers": 3, "dspark_block_size": 5, "dspark_noise_token_id": 128799,
     \\  "dspark_target_layer_ids": [37, 38, 39], "dspark_markov_rank": 256,
     \\  "dspark_n_routed_experts": 128, "dspark_num_experts_per_tok": 3},
-    \\ "vision_config": {"model_type": "deepseek_v41_vision", "num_hidden_layers": 32}}
+    \\ "image_token_id": 129264,
+    \\ "vision_config": {"model_type": "deepseek_v41_vision", "num_hidden_layers": 32, "hidden_size": 1024,
+    \\  "num_attention_heads": 16, "intermediate_size": 2816, "patch_size": 14, "rope_theta": 10000,
+    \\  "downsample_ratio": 3, "max_image_tokens": 1024, "min_pixels": 295936, "max_wh_ratio": null}}
 ;
 
 test "ModelConfig parses deepseek_v41 (DeepSeek-V4.1-Flash release)" {
     const config = try parseConfigFromJson(testing.allocator, dsv41_release_config);
     try testing.expectEqualStrings("deepseek_v41", config.model_type);
     try testing.expectEqualStrings("", config.weight_prefix);
-    try testing.expect(!config.has_vision); // the tower is not served
+    try testing.expect(config.has_vision and config.dsv41_vision); // the release's tower, at its own geometry
+    try testing.expectEqual(@as(u32, 129264), config.image_token_id);
+    try testing.expectEqual(@as(u32, 32), config.vision_num_layers);
+    try testing.expectEqual(@as(u32, 1024), config.vision_hidden_size);
+    try testing.expectEqual(@as(u32, 16), config.vision_num_heads);
+    try testing.expectEqual(@as(u32, 2816), config.vision_intermediate_size);
+    try testing.expectEqual(@as(u32, 14), config.vision_patch_size);
+    try testing.expectEqual(@as(u32, 3), config.dv_downsample);
+    try testing.expectEqual(@as(u32, 1024), config.dv_max_image_tokens);
+    try testing.expectEqual(@as(u32, 295936), config.dv_min_pixels);
+    try testing.expectEqual(@as(u32, 0), config.dv_max_wh_ratio);
+    try testing.expectApproxEqAbs(@as(f32, 10000.0), config.vision_rope_theta, 1e-3);
     try testing.expectEqual(@as(u32, 5120), config.hidden_size);
     try testing.expectEqual(@as(u32, 40), config.num_hidden_layers);
     try testing.expectEqual(@as(u32, 512), config.head_dim);

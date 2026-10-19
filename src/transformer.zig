@@ -45660,10 +45660,12 @@ fn forwardDsv41WithImpl(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx
     else blk: {
         const ids = try hostIds(self, token_ids);
         defer self.allocator.free(ids);
+        // The module splices the image rows itself (its embedding never leaves it).
+        const vision: ?dsv41_mod.VisionRows = if (ctx.vision_embeddings) |ve| .{ .rows = ve, .offset = ctx.vision_splice_offset } else null;
         break :blk if (ctx.cache.step == 0 or mdl.dec_state == null)
-            try dsv41_mod.prefill(mdl, self.allocator, ids)
+            try dsv41_mod.prefill(mdl, self.allocator, ids, vision)
         else
-            try dsv41_mod.extendResumable(mdl, self.allocator, ids);
+            try dsv41_mod.extendResumable(mdl, self.allocator, ids, vision);
     };
     defer _ = mlx.mlx_array_free(logits);
     ctx.cache.step += n;

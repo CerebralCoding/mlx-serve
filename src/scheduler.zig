@@ -5477,6 +5477,25 @@ fn reviseHotCacheBudgets(sch: *Scheduler, grow_only: bool) void {
     publishHotCacheResidency(sch);
 }
 
+/// What the module-owned archs retain between requests: DeepSeek-V4.1 keeps one conversation's decode
+/// state (window rings, compressed rows) in the module, outside every KVCache, so the KV figures would
+/// read 0 with 200 GB of weights resident. Inference thread only (the module replaces those buffers).
+fn moduleStateBytes(sch: *Scheduler) u64 {
+    var bytes: u64 = 0;
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry_ptr| {
+        const entry = entry_ptr.*;
+        if (entry.state != .ready) continue;
+        const t = entry.transformer orelse continue;
+        if (t.dsv41) |m| if (m.dec_state) |*st| {
+            bytes += dsv41_mod.stateBytes(st);
+        };
+    }
+    return bytes;
+}
+
 /// The view must not outlive its cache: before `leaving`'s cache is freed, hand the view to
 /// another resident chat model's, the default's when it has one, or to none.
 fn moveHotCacheViewOff(sch: *Scheduler, leaving: *LoadedModel) void {
@@ -5496,7 +5515,8 @@ fn moveHotCacheViewOff(sch: *Scheduler, leaving: *LoadedModel) void {
 }
 
 pub fn publishHotCacheResidency(sch: *Scheduler) void {
-    const bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    var bytes: u64 = if (sch.hot_prefix_cache) |hc| hc.residentBytes() else 0;
+    bytes += moduleStateBytes(sch);
     sch.resident_hot_cache_bytes.store(bytes, .monotonic);
     const reclaimable: u64 = if (sch.hot_prefix_cache) |hc| hc.reclaimableBytes() else 0;
     sch.reclaimable_hot_cache_bytes.store(reclaimable, .monotonic);
@@ -8370,7 +8390,7 @@ fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
     const resumed: u64 = if (xfm_ptr.dsv41) |mdl|
-        try dsv41_mod.resumePrompt(mdl, slot.full_prompt)
+        try dsv41_mod.resumePrompt(mdl, slot.full_prompt, slot.vision_embeddings)
     else if (xfm_ptr.mlx_stream_ext) |m|
         try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
     else
