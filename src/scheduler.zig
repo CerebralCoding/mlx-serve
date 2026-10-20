@@ -1319,6 +1319,9 @@ pub const GenRequest = struct {
     /// Set on jobs that can share one pass (decision requests): jobs queued
     /// back to back for the same model and `run_many` run as one call.
     merge: ?Merge = null,
+    /// This job's own MLX peak when the request moves it (a 1536 cascade peaks 12 GB above a 1024 one);
+    /// 0 bills the model's resident estimate.
+    peak_bytes: u64 = 0,
     done: bool = false,
     done_mu: std.Io.Mutex = .init,
     done_cond: std.Io.Condition = .init,
@@ -4206,7 +4209,7 @@ fn availForLoad(io: std.Io, need: u64) u64 {
     if (memInsufficientForLoad(need, avail)) {
         const released = gen_mod.releaseMediaResidency();
         if (released > 0) {
-            model_registry_mod.last_unload = .{ .at_ms = model_registry_mod.monotonicMs(), .bytes = released };
+            model_registry_mod.last_unload.record(model_registry_mod.monotonicMs(), released);
             avail = loadAvail(io);
         }
     }
@@ -6662,9 +6665,10 @@ fn runGenRequests(sch: *Scheduler, reqs: []*GenRequest) void {
     if (gen_yield_enabled) gen_sse.gen_yield = &hook;
     // The whole estimated peak, though live memory already holds part of it: the side that
     // cannot OOM.
-    sch.gen_reserve_bytes = sch.mediaPeakFor(req.model);
+    sch.gen_reserve_bytes = if (req.peak_bytes > 0) req.peak_bytes else sch.mediaPeakFor(req.model);
     defer {
         gen_sse.gen_yield = null;
+        gen_sse.stream_conn = null;
         sch.gen_reserve_bytes = 0;
         sch.queue_mu.lockUncancelable(sch.io);
         invalidateDecodeClocks(sch.decoding.items);

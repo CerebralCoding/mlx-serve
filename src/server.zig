@@ -873,16 +873,17 @@ fn routeExists(path: []const u8) bool {
     return false;
 }
 
-pub const max_request_bytes: usize = 64 * 1024 * 1024;
 pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
+/// A coding agent keeps its screenshots in the history, as base64: chat takes what media takes.
+pub const max_request_bytes: usize = max_media_request_bytes;
 /// A decision prompt keeps at most `max_len` state tokens, so a larger body only
 /// buys tokenizer work on the inference thread.
 pub const max_decision_request_bytes: usize = 4 * 1024 * 1024;
 
 /// Per-route request-body cap. Media bodies are base64 payloads — a single
 /// ref2va reference video is ~100 MB of JPEG frames, three plus full-res
-/// reference images approach 500 MB (issue #151) — while no JSON chat body
-/// has any business near 64 MB.
+/// reference images approach 500 MB (issue #151) — and a vision agent's chat
+/// history carries its screenshots the same way. Only a decision prompt is small.
 pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
@@ -8308,6 +8309,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     }
     var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route, .decision = if (decision) |*d| d else null };
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
+    if (lm.mesh_engine) |e| req.peak_bytes = media_mod.meshRequestPeakBytes(body, e.backend);
     if (decision) |*d| req.merge = .{
         .run_many = genJobRunMany,
         .weight = @max(1, d.count()),
@@ -13503,20 +13505,74 @@ fn bodyPreview(out: []u8, body: []const u8) []const u8 {
     return out[0..n];
 }
 
+/// A run of base64 this long is an embedded image or clip, not text anyone reads out of a log.
+const LOG_BASE64_RUN: usize = 4096;
+
+fn isBase64Byte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '+' or c == '/' or c == '=' or c == '-' or c == '_';
+}
+
+/// `body` with every base64 run of `LOG_BASE64_RUN` bytes or more replaced by `<N base64 chars>`.
+fn elideLongBase64(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var out = try std.ArrayList(u8).initCapacity(allocator, @min(body.len, 1 << 20));
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < body.len) {
+        var j = i;
+        while (j < body.len and isBase64Byte(body[j])) j += 1;
+        if (j - i >= LOG_BASE64_RUN) {
+            try out.print(allocator, "<{d} base64 chars>", .{j - i});
+        } else {
+            try out.appendSlice(allocator, body[i..j]);
+        }
+        if (j < body.len) {
+            try out.append(allocator, body[j]);
+            j += 1;
+        }
+        i = j;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn logHttpBody(label: []const u8, body: []const u8) void {
     if (body.len == 0) return;
     // Text bodies go out WHOLE — reading a full request body out of the debug
-    // log is the documented way to reproduce a tool-calling bug.
+    // log is the documented way to reproduce a tool-calling bug — minus embedded
+    // images: a vision agent's history is megabytes of base64 per request.
     if (bodyIsText(body)) {
+        if (body.len > LOG_BASE64_RUN) if (elideLongBase64(std.heap.page_allocator, body)) |shown| {
+            defer std.heap.page_allocator.free(shown);
+            log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, shown });
+            return;
+        } else |_| {};
         log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, body });
         return;
     }
     // Binary is a different story. `/v1/images/edits` is multipart, so one image
-    // upload wrote raw PNG bytes into the log, and a body near the 64 MB request
+    // upload wrote raw PNG bytes into the log, and a body near the request
     // cap blew through the 32 MB rotation — taking the post-mortem file with it.
     var buf: [BODY_LOG_LIMIT]u8 = undefined;
     const preview = bodyPreview(&buf, body);
     log.debug("{s} ({d}b binary, first {d} sanitized):\n{s}…\n", .{ label, body.len, preview.len, preview });
+}
+
+test "debug body log: an embedded image is elided and the text around it is kept whole" {
+    const gpa = std.testing.allocator;
+    var b64: [5000]u8 = undefined;
+    @memset(&b64, 'A');
+    const body = try std.fmt.allocPrint(gpa, "{{\"role\":\"user\",\"image\":\"data:image/png;base64,{s}\",\"text\":\"keep this\"}}", .{&b64});
+    defer gpa.free(body);
+    const out = try elideLongBase64(gpa, body);
+    defer gpa.free(out);
+    try std.testing.expect(out.len < 200);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<5000 base64 chars>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "keep this") != null);
+    // A short run (a token, a hash, a small id) is ordinary text.
+    const short = "{\"id\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}";
+    const kept = try elideLongBase64(gpa, short);
+    defer gpa.free(kept);
+    try std.testing.expectEqualStrings(short, kept);
 }
 
 const GaugeSamplerCtx = struct {
@@ -21578,7 +21634,7 @@ test "findContentLength returns null when missing" {
 test "debug body log bounds BINARY but never truncates text (multipart PNG class)" {
     // `/v1/images/edits` is the first binary body we serve. `logHttpBody` dumped
     // whatever it got verbatim, so at --log-level debug one image upload wrote
-    // raw PNG bytes into the log — and a body near the 64 MB request cap blew
+    // raw PNG bytes into the log — and a body near the request cap blew
     // straight through the 32 MB rotation, taking the post-mortem file with it.
     //
     // Text bodies must stay WHOLE: reading a full request body out of the debug
@@ -26208,8 +26264,7 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
 
 test "request body cap is per route: media bodies are base64 frame payloads" {
     // Issue #151: ONE ref2va reference video is ~100 MB of base64 JPEG frames,
-    // three of them plus full-res ref images can approach 500 MB — while no
-    // JSON chat body has any business near 64 MB.
+    // three of them plus full-res ref images can approach 500 MB.
     for ([_][]const u8{
         "/v1/images/generations",
         "/v1/images/edits",
@@ -26222,6 +26277,14 @@ test "request body cap is per route: media bodies are base64 frame payloads" {
         try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
     try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions"));
     try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions?x=1"));
+}
+
+test "the chat body cap admits an agent session that keeps its screenshots" {
+    // 100 screenshots at 4 MiB of base64 each.
+    const screenshots = 100;
+    const base64_png = 4 * 1024 * 1024;
+    for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/v1/responses" }) |p|
+        try std.testing.expect(maxRequestBytesFor(p) >= screenshots * base64_png);
 }
 
 test "the 413 names both counts it compared" {

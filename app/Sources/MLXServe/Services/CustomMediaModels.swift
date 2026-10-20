@@ -78,7 +78,12 @@ enum CustomMediaModels {
     }
 
     private static func meshFamily(arch: String) -> Model3DModelPreset? {
-        arch.hasPrefix("hunyuan3d") ? .hunyuan3d21_8bit : nil
+        if arch.hasPrefix("hunyuan3d") { return .hunyuan3d21_8bit }
+        switch arch {
+        case "trellis2": return .trellis2Family
+        case "pixal3d": return .pixal3dFamily
+        default: return nil
+        }
     }
 
     /// The family download bundle for a declared media arch — the exact

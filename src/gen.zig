@@ -39,6 +39,8 @@ const minimax_h3 = @import("minimax_h3.zig");
 const ane = @import("ane.zig");
 const hy3d = @import("hunyuan3d.zig");
 const hy3d_paint = @import("hunyuan3d_paint.zig");
+const trellis2_pipeline = @import("trellis2_pipeline.zig");
+const pixal3d = @import("pixal3d.zig");
 const glb_mod = @import("glb.zig");
 const wav_mod = @import("wav.zig");
 const png_mod = @import("png.zig");
@@ -117,6 +119,7 @@ pub const media_model_types = [_][]const u8{
     "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image",
     "laya",      "kev",        "clef",           "d1",
     "stable_audio3", "yue2",      "nemotron_diarization", "moss_image",
+    "trellis2",  "pixal3d",
 };
 
 pub fn modalityFromType(model_type: []const u8) ?Modality {
@@ -133,7 +136,7 @@ pub fn modalityFromType(model_type: []const u8) ?Modality {
     if (std.mem.eql(u8, model_type, "stable_audio3")) return .audio;
     if (std.mem.eql(u8, model_type, "AudioVideo")) return .video;
     if (std.mem.eql(u8, model_type, "minimax_h3")) return .video;
-    if (std.mem.startsWith(u8, model_type, "hunyuan3d")) return .mesh;
+    if (std.mem.startsWith(u8, model_type, "hunyuan3d") or std.mem.eql(u8, model_type, "trellis2") or std.mem.eql(u8, model_type, "pixal3d")) return .mesh;
     if (std.mem.eql(u8, model_type, "laya") or std.mem.eql(u8, model_type, "kev") or std.mem.eql(u8, model_type, "clef") or std.mem.eql(u8, model_type, "d1")) return .decision;
     if (std.mem.eql(u8, model_type, "nemotron_diarization")) return .diarization;
     return null;
@@ -221,6 +224,8 @@ pub fn peekModelType(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     // config.json, model_index.json's `_class_name` the only marker.
     if (isQwenImage21Repo(io, allocator, model_dir)) return allocator.dupe(u8, "qwen_image21") catch null;
     if (isMossImageRepo(io, allocator, model_dir)) return allocator.dupe(u8, "moss_image") catch null;
+    if (isPixal3dPack(io, allocator, model_dir)) return allocator.dupe(u8, "pixal3d") catch null;
+    if (isTrellis2Pack(io, allocator, model_dir)) return allocator.dupe(u8, "trellis2") catch null;
     // Stable Audio 3 as Stability publishes it: stable-audio-tools' model_config.json.
     if (isStableAudio3Repo(io, allocator, model_dir)) return allocator.dupe(u8, "stable_audio3") catch null;
     return null;
@@ -264,6 +269,20 @@ fn isQwenImage21Repo(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
     var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
     defer dir.close(io);
     return discovery.peekQwenImage21Index(io, allocator, dir);
+}
+
+/// Thin path→Dir wrapper over `model_discovery.peekTrellis2Pipeline`.
+fn isTrellis2Pack(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekTrellis2Pipeline(io, allocator, dir);
+}
+
+/// Thin path→Dir wrapper over `model_discovery.peekPixal3dPipeline`.
+fn isPixal3dPack(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) bool {
+    var dir = std.Io.Dir.openDirAbsolute(io, model_dir, .{}) catch return false;
+    defer dir.close(io);
+    return discovery.peekPixal3dPipeline(io, allocator, dir);
 }
 
 /// Thin path→Dir wrapper over `model_discovery.peekMossImageIndex`.
@@ -1290,14 +1309,13 @@ fn sendDecision(engine: *DecisionEngine, job: DecisionJob, result: anyerror![]u8
     try sendBytesJson(job.conn, job.allocator, out);
 }
 
-/// Mesh backend (currently Hunyuan3D-2.1 shape). Thin owner of the hunyuan3d
-/// engine — the DINO conditioner, DiT, and ShapeVAE decoder live in
-/// `src/hunyuan3d.zig` (mirrors `AudioEngine` over `tts.Synthesizer`). When a
-/// second 3D arch arrives this becomes an `ImageBackend`-style tagged union.
+/// Mesh backends: Hunyuan3D-2.1 (shape + optional paint stage), TRELLIS.2 (textured PBR in one pass) and Pixal3D
+/// (TRELLIS.2's cascade read pixel by pixel, one view or several). Each lives in its own file (`src/hunyuan3d.zig`,
+/// `src/trellis2_pipeline.zig`, `src/pixal3d.zig`); this is the engine slot.
 pub const MeshEngine = struct {
     allocator: std.mem.Allocator,
-    engine: *hy3d.Engine,
-    /// P2 paint (texture) stage dir, discovered lazily beside the shape model
+    backend: Backend,
+    /// Hunyuan P2 paint (texture) stage dir, discovered lazily beside the shape model
     /// (SIBLING dir `<models root>/local/hunyuan3d-2-1-paint-8bit` or the
     /// `HY3D_PAINT_DIR` override). Null → `"texture": true` requests get a 400.
     /// The paint engine itself loads per-request and frees after (memory
@@ -1305,12 +1323,26 @@ pub const MeshEngine = struct {
     /// the shape stage completes before the paint stage starts).
     paint_dir: ?[]u8 = null,
 
+    pub const Backend = union(enum) {
+        hunyuan: *hy3d.Engine,
+        trellis2: *trellis2_pipeline.Engine,
+        pixal3d: *pixal3d.Engine,
+    };
+
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*MeshEngine {
         const self = try allocator.create(MeshEngine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.paint_dir = null;
-        self.engine = try hy3d.Engine.load(io, allocator, model_dir);
+        if (isPixal3dPack(io, allocator, model_dir)) {
+            self.backend = .{ .pixal3d = try pixal3d.Engine.load(io, allocator, model_dir) };
+            return self;
+        }
+        if (isTrellis2Pack(io, allocator, model_dir)) {
+            self.backend = .{ .trellis2 = try trellis2_pipeline.Engine.load(io, allocator, model_dir) };
+            return self;
+        }
+        self.backend = .{ .hunyuan = try hy3d.Engine.load(io, allocator, model_dir) };
         self.paint_dir = findPaintDir(allocator, model_dir);
         if (self.paint_dir) |p| log.info("[mesh] paint (texture) weights available: {s}\n", .{p});
         log.info("[mesh] Hunyuan3D shape engine ready\n", .{});
@@ -1319,7 +1351,11 @@ pub const MeshEngine = struct {
 
     pub fn deinit(self: *MeshEngine) void {
         if (self.paint_dir) |p| self.allocator.free(p);
-        self.engine.deinit();
+        switch (self.backend) {
+            .hunyuan => |e| e.deinit(),
+            .trellis2 => |e| e.deinit(),
+            .pixal3d => |e| e.deinit(),
+        }
         self.allocator.destroy(self);
     }
 };
@@ -4471,7 +4507,7 @@ fn handleVideoLtx(io: std.Io, allocator: std.mem.Allocator, conn: *Conn, body: [
 /// loads lazily per request and frees before returning.
 fn paintedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u8, w: u32, h: u32, shape_opts: hy3d.MeshOpts, body: []const u8, prog: ?sse.Progress) ![]u8 {
     const paint_dir = engine.paint_dir orelse return error.PaintUnavailable; // guarded at parse
-    var mesh = try engine.engine.generateMeshRaw(allocator, rgba, w, h, shape_opts, prog);
+    var mesh = try engine.backend.hunyuan.generateMeshRaw(allocator, rgba, w, h, shape_opts, prog);
     defer mesh.deinit(allocator);
     try latchedJobFailure(); // a failed shape stage is not worth minutes of paint
 
@@ -4486,15 +4522,108 @@ fn paintedGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u
     return paint.paintMeshToGlb(allocator, &mesh, rgba, w, h, popts, prog);
 }
 
+/// One validated 3D request, per backend.
+const MeshJob = union(enum) {
+    hunyuan: struct { opts: hy3d.MeshOpts, texture: bool },
+    trellis2: trellis2_pipeline.Opts,
+    /// `cameras` is owned (freed by `deinit`).
+    pixal3d: pixal3d.Opts,
+
+    fn deinit(self: MeshJob, allocator: std.mem.Allocator) void {
+        if (self == .pixal3d) allocator.free(self.pixal3d.cameras);
+    }
+};
+
+/// A decoded request photo: straight-alpha RGBA8.
+const MeshView = struct { pix: []u8, w: u32, h: u32 };
+
+fn freeViews(allocator: std.mem.Allocator, views: []MeshView) void {
+    for (views) |v| allocator.free(v.pix);
+    allocator.free(views);
+}
+
+const MeshViews = union(enum) { ok: []MeshView, bad: []const u8 };
+
+const BAD_IMAGES = "'images' must be an array of base64 PNG/JPEG views of one object";
+
+/// The request's photos: one `image`, or `images` (several posed views of one object, Pixal3D only), counted
+/// and refused by name before any of them decodes. Caller frees `ok` with `freeViews`.
+fn meshViews(allocator: std.mem.Allocator, body: []const u8, engine: *const MeshEngine) !MeshViews {
+    if (!jsonFieldSet(body, "images")) {
+        const raw = extractJsonString(body, "image") orelse return .{ .bad = "missing 'image' (base64 PNG/JPEG of the subject)" };
+        const one = try allocator.alloc(MeshView, 1);
+        errdefer allocator.free(one);
+        one[0] = switch (try decodeMeshView(allocator, raw, "'image'")) {
+            .ok => |v| v,
+            .bad => |m| {
+                allocator.free(one);
+                return .{ .bad = m };
+            },
+        };
+        return .{ .ok = one };
+    }
+    if (jsonFieldSet(body, "image")) return .{ .bad = "send 'image' or 'images', not both" };
+    if (engine.backend != .pixal3d) return .{ .bad = "'images' (several views of one object) is served by Pixal3D; this model takes one 'image'" };
+    var count: usize = 0;
+    {
+        var it = iterJsonStringArray(body, "images") orelse return .{ .bad = BAD_IMAGES };
+        while (it.next()) |_| count += 1;
+        if (it.bad) return .{ .bad = BAD_IMAGES };
+    }
+    if (count < 2) return .{ .bad = "'images' needs at least 2 views (send a single view as 'image')" };
+    if (count > pixal3d.MAX_VIEWS) return .{ .bad = std.fmt.comptimePrint("'images' takes at most {d} views", .{pixal3d.MAX_VIEWS}) };
+    const views = try allocator.alloc(MeshView, count);
+    var done: usize = 0;
+    errdefer {
+        for (views[0..done]) |v| allocator.free(v.pix);
+        allocator.free(views);
+    }
+    var it = iterJsonStringArray(body, "images").?;
+    while (it.next()) |raw| : (done += 1) {
+        views[done] = switch (try decodeMeshView(allocator, raw, "an 'images' entry")) {
+            .ok => |v| v,
+            .bad => |m| {
+                for (views[0..done]) |v| allocator.free(v.pix);
+                allocator.free(views);
+                return .{ .bad = m };
+            },
+        };
+    }
+    return .{ .ok = views };
+}
+
+const MeshViewDecode = union(enum) { ok: MeshView, bad: []const u8 };
+
+fn decodeMeshView(allocator: std.mem.Allocator, raw: []const u8, comptime what: []const u8) !MeshViewDecode {
+    const b64 = try jsonUnescape(allocator, raw); // handles \/ from Swift JSONSerialization
+    defer allocator.free(b64);
+    if (b64.len == 0) return .{ .bad = "empty " ++ what };
+    const bytes = imageB64Alloc(allocator, b64) catch return .{ .bad = "invalid base64 in " ++ what };
+    defer allocator.free(bytes);
+    const img = decodeImageRgba(allocator, bytes) orelse return .{ .bad = "could not decode " ++ what ++ " (PNG/JPEG supported)" };
+    return .{ .ok = .{ .pix = img.pix, .w = img.w, .h = img.h } };
+}
+
 /// The whole 3D job, then the latch: the shape and paint stages read their results on the host,
 /// so a Metal failure inside them hands back bytes (zeros) with no error to catch.
-fn meshJobGlb(allocator: std.mem.Allocator, engine: *MeshEngine, rgba: []const u8, w: u32, h: u32, opts: hy3d.MeshOpts, body: []const u8, prog: ?sse.Progress, textured: bool) ![]u8 {
-    // Texture path: shape → raw mesh → paint stage (loaded per request, freed after — the paint
-    // UNet+DINO+VAE ride ~4.6 GB beside the 3.5 GB shape engine only for the duration of this request).
-    const glb = if (textured)
-        try paintedGlb(allocator, engine, rgba, w, h, opts, body, prog)
-    else
-        try engine.engine.generateGlb(allocator, rgba, w, h, opts, prog);
+fn meshJobGlb(allocator: std.mem.Allocator, engine: *MeshEngine, views: []const MeshView, job: MeshJob, body: []const u8, prog: ?sse.Progress) ![]u8 {
+    const rgba = views[0].pix;
+    const w = views[0].w;
+    const h = views[0].h;
+    const glb = switch (job) {
+        // Texture path: shape → raw mesh → paint stage (loaded per request, freed after — the paint
+        // UNet+DINO+VAE ride ~4.6 GB beside the 3.5 GB shape engine only for the duration of this request).
+        .hunyuan => |j| if (j.texture)
+            try paintedGlb(allocator, engine, rgba, w, h, j.opts, body, prog)
+        else
+            try engine.backend.hunyuan.generateGlb(allocator, rgba, w, h, j.opts, prog),
+        .trellis2 => |o| try engine.backend.trellis2.generateGlb(allocator, rgba, w, h, o, prog),
+        .pixal3d => |o| blk: {
+            var photos: [pixal3d.MAX_VIEWS]pixal3d.Photo = undefined;
+            for (views, 0..) |v, i| photos[i] = .{ .rgba = v.pix, .w = v.w, .h = v.h };
+            break :blk try engine.backend.pixal3d.generateGlb(allocator, photos[0..views.len], o, prog);
+        },
+    };
     errdefer allocator.free(glb);
     try latchedJobFailure();
     return glb;
@@ -4507,48 +4636,147 @@ fn latchedJobFailure() !void {
     return if (std.mem.eql(u8, name, "OutOfMemory")) error.OutOfMemory else error.MlxFailure;
 }
 
+const MeshJobParse = union(enum) { ok: MeshJob, bad: []const u8 };
+
+/// The validated job for a request body over `views` photos, or the 400 message naming the field that is wrong.
+fn meshJobFromBody(allocator: std.mem.Allocator, body: []const u8, engine: *const MeshEngine, views: usize) !MeshJobParse {
+    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
+    switch (engine.backend) {
+        .hunyuan => {
+            if (jsonFieldSet(body, "roughness_scale") or jsonFieldSet(body, "clearcoat"))
+                return .{ .bad = "'roughness_scale' and 'clearcoat' are TRELLIS.2 and Pixal3D fields (a Hunyuan3D texture's finish comes from its paint)" };
+            const steps = stepsRequest(extractJsonInt(body, "steps"), 30, 1, 100) catch
+                return .{ .bad = "'steps' must be in [1,100]" };
+            const res: u32 = extractJsonU32(body, "octree_resolution") orelse 256;
+            if (res < 64 or res > 512) return .{ .bad = "'octree_resolution' must be in [64,512]" };
+            var guidance: f32 = 5.0;
+            if (extractJsonFloat(body, "guidance_scale")) |g| {
+                if (!(g >= 0.0 and g <= 20.0)) return .{ .bad = "'guidance_scale' must be in [0,20]" };
+                guidance = @floatCast(g);
+            }
+            // P2 texture stage (opt-in): requires the converted paint weights. The
+            // 400 here is explicit — never a silent untextured downgrade (the a2vid
+            // precedent: the user asked for THIS output).
+            const want_texture = sse.bodyWantsTrue(body, "texture");
+            if (want_texture and engine.paint_dir == null)
+                return .{ .bad = "texture requested but the paint weights are not installed (run tests/convert_hunyuan3d_paint_weights.py, or set HY3D_PAINT_DIR)" };
+            return .{ .ok = .{ .hunyuan = .{ .opts = .{ .steps = steps, .guidance = guidance, .seed = seed, .octree_resolution = res }, .texture = want_texture } } };
+        },
+        .trellis2 => |t| return switch (parseTrellis2Opts(body, t.hasResolution512())) {
+            .ok => |o| .{ .ok = .{ .trellis2 = o } },
+            .bad => |m| .{ .bad = m },
+        },
+        .pixal3d => |p| return switch (try parsePixal3dOpts(allocator, body, views, p.mv != null)) {
+            .ok => |o| .{ .ok = .{ .pixal3d = o } },
+            .bad => |m| .{ .bad = m },
+        },
+    }
+}
+
+const Pixal3dParse = union(enum) { ok: pixal3d.Opts, bad: []const u8 };
+
+/// Pixal3D request fields: TRELLIS.2's (no 512 pipeline), `fov` (horizontal, degrees, every view; the reference
+/// default when omitted) and, with `images`, `cameras` (one 4x4 camera-to-world per view; the shipped rig when
+/// omitted). `ok.cameras` is the caller's to free.
+fn parsePixal3dOpts(allocator: std.mem.Allocator, body: []const u8, views: usize, has_mv: bool) !Pixal3dParse {
+    var o = pixal3d.Opts{};
+    o.base = switch (parseTrellis2Opts(body, false)) {
+        .ok => |b| b,
+        .bad => |m| return .{ .bad = m },
+    };
+    o.base.pixal3d_axes = true;
+    if (extractJsonFloat(body, "fov")) |f| {
+        if (!(f >= 1 and f <= 120)) return .{ .bad = "'fov' is the horizontal field of view in degrees, in [1,120]" };
+        o.fov = std.math.degreesToRadians(@as(f32, @floatCast(f)));
+    }
+    if (jsonFieldSet(body, "cameras")) {
+        if (views < 2) return .{ .bad = "'cameras' goes with 'images' (several views)" };
+        const raw = extractJsonArrayRaw(body, "cameras") orelse return .{ .bad = pixal3d.BAD_CAMERAS };
+        var parsed = std.json.parseFromSlice(std.json.Value, allocator, raw, .{}) catch return .{ .bad = pixal3d.BAD_CAMERAS };
+        defer parsed.deinit();
+        o.cameras = switch (try pixal3d.parseCameras(allocator, parsed.value)) {
+            .ok => |c| c,
+            .bad => |m| return .{ .bad = m },
+        };
+    }
+    if (pixal3d.viewsRefusal(views, o.cameras.len, has_mv)) |m| {
+        allocator.free(o.cameras);
+        return .{ .bad = m };
+    }
+    return .{ .ok = o };
+}
+
+const Trellis2Parse = union(enum) { ok: trellis2_pipeline.Opts, bad: []const u8 };
+
+/// TRELLIS.2 request fields: `resolution` (512 only where the pack ships its 512 texture flow, else 1024 or 1536),
+/// `steps` (omitted keeps the published 12), `seed`, `decimation_target` (faces), `texture_size`, and the finish:
+/// `roughness_scale` and `clearcoat`.
+fn parseTrellis2Opts(body: []const u8, has_512: bool) Trellis2Parse {
+    var o = trellis2_pipeline.Opts{ .seed = extractJsonInt(body, "seed") orelse 42 };
+    if (extractJsonU32(body, "resolution")) |r| {
+        if (!trellis2_pipeline.resolutionServed(r, has_512)) return .{ .bad = if (has_512) "'resolution' must be 512, 1024 or 1536" else "'resolution' must be 1024 or 1536 (this pack has no 512 texture model)" };
+        o.resolution = r;
+    }
+    if (extractJsonInt(body, "steps")) |n| {
+        if (n < 1 or n > 50) return .{ .bad = "'steps' must be in [1,50]" };
+        o.steps = @intCast(n);
+    }
+    if (extractJsonU32(body, "decimation_target")) |f| {
+        if (f < 10_000 or f > 2_000_000) return .{ .bad = "'decimation_target' must be in [10000,2000000] faces" };
+        o.decimation_target = f;
+    }
+    if (extractJsonU32(body, "texture_size")) |t| {
+        if (t != 512 and t != 1024 and t != 2048 and t != 4096) return .{ .bad = "'texture_size' must be 512, 1024, 2048 or 4096" };
+        o.texture_size = t;
+    }
+    if (extractJsonFloat(body, "roughness_scale")) |r| {
+        if (!(r >= 0.05 and r <= 2)) return .{ .bad = "'roughness_scale' multiplies the model's roughness and must be in [0.05,2]" };
+        o.roughness_scale = @floatCast(r);
+    }
+    if (extractJsonFloat(body, "clearcoat")) |c| {
+        if (!(c >= 0 and c <= 1)) return .{ .bad = "'clearcoat' must be in [0,1]" };
+        o.clearcoat = @floatCast(c);
+    }
+    return .{ .ok = o };
+}
+
 /// POST /v1/3d/generations — base64 GLB (or SSE progress + complete).
 /// The engine takes straight-alpha RGBA8 (its preprocess recenters the subject
 /// via the alpha bbox and composites on white — so an app-side cutout with real
 /// alpha conditions best, and an opaque photo still works as a fallback).
 pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, engine: *MeshEngine) !void {
-    const raw_img = extractJsonString(body, "image") orelse return sendError(conn, 400, "missing 'image' (base64 PNG/JPEG of the subject)");
-    const b64 = try jsonUnescape(allocator, raw_img); // handles \/ from Swift JSONSerialization
-    defer allocator.free(b64);
-    if (b64.len == 0) return sendError(conn, 400, "empty 'image'");
-    const img_bytes = imageB64Alloc(allocator, b64) catch
-        return sendError(conn, 400, "invalid base64 in 'image'");
-    defer allocator.free(img_bytes);
-    const img = decodeImageRgba(allocator, img_bytes) orelse
-        return sendError(conn, 400, "could not decode 'image' (PNG/JPEG supported)");
-    defer allocator.free(img.pix);
+    const views = switch (try meshViews(allocator, body, engine)) {
+        .ok => |v| v,
+        .bad => |msg| return sendError(conn, 400, msg),
+    };
+    defer freeViews(allocator, views);
+    const img = views[0];
 
-    const steps = stepsRequest(extractJsonInt(body, "steps"), 30, 1, 100) catch
-        return sendError(conn, 400, "'steps' must be in [1,100]");
-    const res: u32 = extractJsonU32(body, "octree_resolution") orelse 256;
-    if (res < 64 or res > 512) return sendError(conn, 400, "'octree_resolution' must be in [64,512]");
-    const seed: u64 = extractJsonInt(body, "seed") orelse 42;
-    var guidance: f32 = 5.0;
-    if (extractJsonFloat(body, "guidance_scale")) |g| {
-        if (!(g >= 0.0 and g <= 20.0)) return sendError(conn, 400, "'guidance_scale' must be in [0,20]");
-        guidance = @floatCast(g);
+    const job = switch (try meshJobFromBody(allocator, body, engine, views.len)) {
+        .ok => |j| j,
+        .bad => |msg| return sendError(conn, 400, msg),
+    };
+    defer job.deinit(allocator);
+    const cascade_res: ?u32 = switch (job) {
+        .trellis2 => |o| o.resolution,
+        .pixal3d => |o| o.base.resolution,
+        .hunyuan => null,
+    };
+    if (cascade_res) |r| {
+        var rbuf: [192]u8 = undefined;
+        if (trellis2Refusal(&rbuf, r, gpuHeadroomBytes())) |msg| return sendError(conn, 400, msg);
     }
-
-    // P2 texture stage (opt-in): requires the converted paint weights. The
-    // 400 here is explicit — never a silent untextured downgrade (the a2vid
-    // precedent: the user asked for THIS output).
-    const want_texture = sse.bodyWantsTrue(body, "texture");
-    if (want_texture and engine.paint_dir == null)
-        return sendError(conn, 400, "texture requested but the paint weights are not installed (run tests/convert_hunyuan3d_paint_weights.py, or set HY3D_PAINT_DIR)");
-
     const want_stream = sse.bodyWantsTrue(body, "stream");
-    log.info("[mesh] generating steps={d} res={d} guidance={d:.1} seed={d} texture={} stream={} from {d}x{d} image\n", .{ steps, res, guidance, seed, want_texture, want_stream, img.w, img.h });
+    switch (job) {
+        .hunyuan => |j| log.info("[mesh] generating steps={d} res={d} guidance={d:.1} seed={d} texture={} stream={} from {d}x{d} image\n", .{ j.opts.steps, j.opts.octree_resolution, j.opts.guidance, j.opts.seed, j.texture, want_stream, img.w, img.h }),
+        .trellis2 => |o| log.info("[mesh] generating TRELLIS.2 res={d} steps={d} faces={d} tex={d} seed={d} stream={} from {d}x{d} image\n", .{ o.resolution, o.steps, o.decimation_target, o.texture_size, o.seed, want_stream, img.w, img.h }),
+        .pixal3d => |o| log.info("[mesh] generating Pixal3D res={d} views={d} cameras={s} fov={d:.1}deg steps={d} faces={d} tex={d} seed={d} stream={}\n", .{ o.base.resolution, views.len, if (o.cameras.len > 0) "given" else "default", std.math.radiansToDegrees(o.fov orelse (if (views.len > 1) pixal3d.RIG_FOV else pixal3d.DEFAULT_FOV)), o.base.steps, o.base.decimation_target, o.base.texture_size, o.base.seed, want_stream }),
+    }
     var sctx = sse.StreamCtx{ .conn = conn, .stream = want_stream };
     const prog: ?sse.Progress = sctx.progress();
     if (want_stream) try conn.writeAll(sse.headers);
 
-    const opts = hy3d.MeshOpts{ .steps = steps, .guidance = guidance, .seed = seed, .octree_resolution = res };
-    const glb_bytes = meshJobGlb(allocator, engine, img.pix, img.w, img.h, opts, body, prog, want_texture) catch |err| {
+    const glb_bytes = meshJobGlb(allocator, engine, views, job, body, prog) catch |err| {
         if (err == error.Cancelled) {
             // Client hung up mid-generation (progress write failed) — nothing
             // to write, the socket is dead.
@@ -4556,6 +4784,13 @@ pub fn handleMesh(allocator: std.mem.Allocator, conn: *Conn, body: []const u8, e
             return;
         }
         log.err("[mesh] generation failed: {}\n", .{err});
+        if (meshJobRefusal(err)) |msg| {
+            if (want_stream) {
+                sse.sendError(conn, msg);
+                return;
+            }
+            return sendError(conn, 400, msg);
+        }
         if (want_stream) {
             sse.sendError(conn, "generation failed");
             return;
@@ -4702,7 +4937,7 @@ fn residentWeightBytes(io: std.Io, dir: std.Io.Dir, model_type: []const u8) u64 
 /// Metal OOM; the test below refuses an unclassified entry of `media_model_types`.
 fn convertsW8a8(model_type: []const u8) ?bool {
     const converts = [_][]const u8{ "flux2", "krea", "mage_flow", "mageflow", "acestep", "AudioVideo", "hunyuan3d", "minimax_h3", "minimax_music3", "qwen_image" };
-    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization", "moss_image" };
+    const packed_only = [_][]const u8{ "qwen3_tts", "kokoro", "laya", "kev", "clef", "d1", "stable_audio3", "yue2", "nemotron_diarization", "moss_image", "trellis2", "pixal3d" };
     for (converts) |p| if (std.mem.startsWith(u8, model_type, p)) return true;
     for (packed_only) |p| if (std.mem.startsWith(u8, model_type, p)) return false;
     return null;
@@ -4820,6 +5055,36 @@ const MOSS_IMAGE_GEN_PROMPT_BYTES: u64 = 3 << 30;
 pub fn mossImageGenTransientBytes(width: u32, height: u32) u64 {
     const latents: u64 = @as(u64, width / moss_image.VAE_DOWNSAMPLE) * (height / moss_image.VAE_DOWNSAMPLE);
     return @max(MOSS_IMAGE_GEN_PROMPT_BYTES, MOSS_IMAGE_GEN_BASE_BYTES + latents * MOSS_IMAGE_GEN_TOKEN_BYTES);
+}
+
+/// TRELLIS.2's and Pixal3D's whole-request MLX peak at each served resolution, for a car-sized subject (the
+/// same cascade and decoders): 512 skips the 1024 cascade, and above that the decoders' per-voxel features grow
+/// with the surface.
+pub fn trellis2PeakBytes(resolution: u32) u64 {
+    const mib: u64 = switch (resolution) {
+        512 => 5800,
+        1024 => 23000,
+        else => 35800,
+    };
+    return mib << 20;
+}
+
+/// The MLX peak one mesh request reaches, for the scheduler's reserve: the cascade resolution moves it by
+/// 12 GB. 0 keeps the model's own resident estimate (Hunyuan). An unservable `resolution` bills the largest
+/// cascade; the handler's 400 follows.
+pub fn meshRequestPeakBytes(body: []const u8, backend: std.meta.Tag(MeshEngine.Backend)) u64 {
+    if (backend == .hunyuan) return 0;
+    return trellis2PeakBytes(extractJsonU32(body, "resolution") orelse (trellis2_pipeline.Opts{}).resolution);
+}
+
+/// The 400 text for a request whose peak exceeds what the GPU can still take, else null.
+fn trellis2Refusal(buf: []u8, resolution: u32, headroom: u64) ?[]const u8 {
+    const need = trellis2PeakBytes(resolution);
+    if (need <= headroom) return null;
+    const gb: f64 = 1 << 30;
+    return std.fmt.bufPrint(buf, "resolution {d} needs ~{d:.1} GB of free GPU memory but {d:.1} GB is free: send a lower 'resolution' (1024 needs ~{d:.0} GB)", .{
+        resolution, @as(f64, @floatFromInt(need)) / gb, @as(f64, @floatFromInt(headroom)) / gb, @as(f64, @floatFromInt(trellis2PeakBytes(1024))) / gb,
+    }) catch "this resolution needs more GPU memory than is free: send a lower 'resolution'";
 }
 
 /// What the GPU can still take: Metal's working set less live MLX memory.
@@ -5097,6 +5362,11 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         const tower = if (model_dir) |md| qwen_image.towerPresentIn(io, std.heap.page_allocator, md) else false;
         return if (tower) qwenImageEditPeakBytes(te, rest, mlx.maxRecommendedWorkingSet(), true) else qwenImagePeakBytes(te, rest, mlx.maxRecommendedWorkingSet());
     }
+    if (std.mem.eql(u8, model_type, "trellis2") or std.mem.eql(u8, model_type, "pixal3d")) {
+        // Every stage loads its own weights and frees them, so the bill is a request's peak, not the dir sum.
+        _ = dir.statFile(io, "pipeline.json", .{}) catch return 0; // unknown dir -> never block
+        return trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution);
+    }
     if (std.mem.eql(u8, model_type, "moss_image")) {
         // Everything stays resident (the Qwen3.5 encoder too), plus a default-size request.
         const sum = residentWeightBytes(io, dir, model_type);
@@ -5225,6 +5495,15 @@ fn imageJobFailed(conn: *Conn, want_stream: bool, err: anyerror) !void {
         return;
     }
     return sendError(conn, jobFailureStatus(err), "generation failed");
+}
+
+/// The 400 text for a mesh job that failed on the request itself, else null (a server fault stays a 500/503).
+fn meshJobRefusal(err: anyerror) ?[]const u8 {
+    return switch (err) {
+        error.EmptySubject => "the image has no subject: its alpha channel is empty (send a cutout on a transparent background, or a photo whose background can be cut away)",
+        error.EmptyStructure => "no occupied voxels came out of this image: try another seed or a clearer, larger subject",
+        else => null,
+    };
 }
 
 /// A media or decision job that ran out of memory hit the machine's capacity, not a server fault: 503, like chat.
@@ -5569,6 +5848,36 @@ fn iterJsonStringArray(body: []const u8, key: []const u8) ?JsonStringArrayIter {
     while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t')) i += 1;
     if (i >= body.len or body[i] != '[') return null;
     return .{ .rest = body[i + 1 ..] };
+}
+
+/// The raw `[...]` text of the `key` JSON array, bracket-balanced and string-aware, or null.
+fn extractJsonArrayRaw(body: []const u8, key: []const u8) ?[]const u8 {
+    var key_pat_buf: [64]u8 = undefined;
+    const key_pat = std.fmt.bufPrint(&key_pat_buf, "\"{s}\"", .{key}) catch return null;
+    const ki = std.mem.indexOf(u8, body, key_pat) orelse return null;
+    var i = ki + key_pat.len;
+    while (i < body.len and (body[i] == ' ' or body[i] == ':' or body[i] == '\t' or body[i] == '\n' or body[i] == '\r')) i += 1;
+    if (i >= body.len or body[i] != '[') return null;
+    const start = i;
+    var depth: usize = 0;
+    var in_str = false;
+    while (i < body.len) : (i += 1) {
+        const c = body[i];
+        if (in_str) {
+            if (c == '\\') i += 1 else if (c == '"') in_str = false;
+            continue;
+        }
+        switch (c) {
+            '"' => in_str = true,
+            '[', '{' => depth += 1,
+            ']', '}' => {
+                depth -= 1;
+                if (depth == 0) return body[start .. i + 1];
+            },
+            else => {},
+        }
+    }
+    return null;
 }
 
 /// Base64-decode (standard alphabet) into an owned buffer.
@@ -6006,6 +6315,188 @@ test "peekModelType classifies a model_index-only Qwen-Image-2.1 repo" {
     try testing.expect(peekModelType(io, a, dir20) == null);
 }
 
+test "TRELLIS.2: a pipeline.json-only pack routes to the mesh slot" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/pipeline.json", .data = "{\"name\":\"Trellis2ImageTo3DPipeline\",\"args\":{}}" });
+    const dir = try std.fmt.allocPrint(a, "{s}/m", .{root});
+    defer a.free(dir);
+    const mt = peekModelType(io, a, dir) orelse return error.TestUnexpectedResult;
+    defer a.free(mt);
+    try testing.expectEqualStrings("trellis2", mt);
+    try testing.expectEqual(Modality.mesh, modalityFromType(mt).?);
+}
+
+test "Pixal3D: a TRELLIS.2-layout pack whose flows read proj routes to the mesh slot as pixal3d" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const a = testing.allocator;
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    try tmp.dir.createDirPath(io, "m/ckpts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/pipeline.json", .data = "{\"name\":\"Trellis2ImageTo3DPipeline\",\"args\":{\"models\":{\"sparse_structure_flow_model\":\"ckpts/ss\"}}}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "m/ckpts/ss.json", .data = "{\"args\":{\"image_attn_mode\":\"proj\"}}" });
+    const dir = try std.fmt.allocPrint(a, "{s}/m", .{root});
+    defer a.free(dir);
+    const mt = peekModelType(io, a, dir) orelse return error.TestUnexpectedResult;
+    defer a.free(mt);
+    try testing.expectEqualStrings("pixal3d", mt);
+    try testing.expectEqual(Modality.mesh, modalityFromType(mt).?);
+}
+
+test "Pixal3D request fields: FOV in degrees, a camera per view, and every bad value names its field" {
+    const a = testing.allocator;
+    const ok = struct {
+        fn of(body: []const u8, views: usize) !pixal3d.Opts {
+            return switch (try parsePixal3dOpts(testing.allocator, body, views, true)) {
+                .ok => |o| o,
+                .bad => error.TestUnexpectedResult,
+            };
+        }
+        fn bad(body: []const u8, views: usize, has_mv: bool) ![]const u8 {
+            return switch (try parsePixal3dOpts(testing.allocator, body, views, has_mv)) {
+                .ok => |o| blk: {
+                    testing.allocator.free(o.cameras);
+                    break :blk error.TestUnexpectedResult;
+                },
+                .bad => |m| m,
+            };
+        }
+    };
+    const d = try ok.of("{}", 1);
+    try testing.expectEqual(@as(u32, 1024), d.base.resolution);
+    try testing.expect(d.base.pixal3d_axes);
+    try testing.expect(d.fov == null);
+    try testing.expectEqual(@as(usize, 0), d.cameras.len);
+    const f = try ok.of("{\"fov\":30,\"resolution\":1536,\"seed\":3}", 1);
+    try testing.expectApproxEqAbs(std.math.degreesToRadians(@as(f32, 30)), f.fov.?, 1e-6);
+    try testing.expectEqual(@as(u32, 1536), f.base.resolution);
+    const cams = "{\"cameras\":[[[1,0,0,0],[0,0,-1,-3],[0,1,0,0],[0,0,0,1]],[[0,0,1,3],[1,0,0,0],[0,1,0,0],[0,0,0,1]]]}";
+    const c = try ok.of(cams, 2);
+    defer a.free(c.cameras);
+    try testing.expectEqual(@as(usize, 2), c.cameras.len);
+    try testing.expectEqual(@as(f32, 3), c.cameras[1][0][3]);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"fov\":0.4}", 1, true), "'fov'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"fov\":150}", 1, true), "'fov'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"resolution\":512}", 1, true), "'resolution'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad(cams, 1, true), "'cameras'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad(cams, 3, true), "'cameras'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"cameras\":[[1,2]]}", 2, true), "'cameras'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{}", 5, true), "'cameras'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{}", 2, false), "multi-view") != null);
+}
+
+test "mesh views: one 'image', or 'images' on Pixal3D only, counted before anything decodes" {
+    const a = testing.allocator;
+    var tr = MeshEngine{ .allocator = a, .backend = .{ .trellis2 = undefined } };
+    var px = MeshEngine{ .allocator = a, .backend = .{ .pixal3d = undefined } };
+    const cases = [_]struct { body: []const u8, engine: *MeshEngine, want: []const u8 }{
+        .{ .body = "{}", .engine = &tr, .want = "missing 'image'" },
+        .{ .body = "{\"image\":\"AAAA\",\"images\":[\"AAAA\",\"AAAA\"]}", .engine = &px, .want = "not both" },
+        .{ .body = "{\"images\":[\"AAAA\",\"AAAA\"]}", .engine = &tr, .want = "Pixal3D" },
+        .{ .body = "{\"images\":[\"AAAA\"]}", .engine = &px, .want = "at least 2" },
+        .{ .body = "{\"images\":[\"A\",\"A\",\"A\",\"A\",\"A\",\"A\",\"A\",\"A\",\"A\"]}", .engine = &px, .want = "at most 8" },
+        .{ .body = "{\"images\":\"AAAA\"}", .engine = &px, .want = "'images'" },
+        .{ .body = "{\"images\":[\"!!\",\"!!\"]}", .engine = &px, .want = "base64" },
+    };
+    for (cases) |cs| {
+        const r = try meshViews(a, cs.body, cs.engine);
+        switch (r) {
+            .ok => |v| {
+                freeViews(a, v);
+                return error.TestUnexpectedResult;
+            },
+            .bad => |m| if (std.mem.indexOf(u8, m, cs.want) == null) {
+                std.debug.print("{s}: {s}\n", .{ cs.body, m });
+                return error.TestUnexpectedResult;
+            },
+        }
+    }
+}
+
+test "TRELLIS.2 request fields: defaults, and every bad value names its field" {
+    const ok = struct {
+        fn of(body: []const u8, has_512: bool) !trellis2_pipeline.Opts {
+            return switch (parseTrellis2Opts(body, has_512)) {
+                .ok => |o| o,
+                .bad => error.TestUnexpectedResult,
+            };
+        }
+        fn bad(body: []const u8, has_512: bool) ![]const u8 {
+            return switch (parseTrellis2Opts(body, has_512)) {
+                .ok => error.TestUnexpectedResult,
+                .bad => |m| m,
+            };
+        }
+    };
+    const d = try ok.of("{}", true);
+    try testing.expectEqual(@as(u32, 1024), d.resolution);
+    try testing.expectEqual(@as(u32, 0), d.steps); // the published 12
+    try testing.expectEqual(@as(u64, 42), d.seed);
+    const o = try ok.of("{\"resolution\":1536,\"steps\":8,\"seed\":7,\"decimation_target\":50000,\"texture_size\":4096}", false);
+    try testing.expectEqual(@as(u32, 1536), o.resolution);
+    try testing.expectEqual(@as(u32, 8), o.steps);
+    try testing.expectEqual(@as(u32, 50000), o.decimation_target);
+    try testing.expectEqual(@as(u32, 4096), o.texture_size);
+    try testing.expectEqual(@as(u32, 512), (try ok.of("{\"resolution\":512}", true)).resolution);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"resolution\":512}", false), "no 512 texture model") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"resolution\":768}", true), "'resolution'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"steps\":0}", true), "'steps'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"steps\":51}", true), "'steps'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"decimation_target\":10}", true), "'decimation_target'") != null);
+    try testing.expect(std.mem.indexOf(u8, try ok.bad("{\"texture_size\":1000}", true), "'texture_size'") != null);
+}
+
+test "3D request finish: roughness_scale and clearcoat default to the model's own, bound, and reach Pixal3D" {
+    const a = testing.allocator;
+    const parse = struct {
+        fn of(body: []const u8) !trellis2_pipeline.Opts {
+            return switch (parseTrellis2Opts(body, false)) {
+                .ok => |o| o,
+                .bad => error.TestUnexpectedResult,
+            };
+        }
+        fn bad(body: []const u8) ![]const u8 {
+            return switch (parseTrellis2Opts(body, false)) {
+                .ok => error.TestUnexpectedResult,
+                .bad => |m| m,
+            };
+        }
+    };
+    const d = try parse.of("{}");
+    try testing.expectEqual(@as(f32, 1.0), d.roughness_scale);
+    try testing.expectEqual(@as(f32, 0.0), d.clearcoat);
+    const o = try parse.of("{\"roughness_scale\":0.4,\"clearcoat\":1}");
+    try testing.expectApproxEqAbs(@as(f32, 0.4), o.roughness_scale, 1e-6);
+    try testing.expectEqual(@as(f32, 1.0), o.clearcoat);
+    try testing.expect(std.mem.indexOf(u8, try parse.bad("{\"roughness_scale\":0}"), "'roughness_scale'") != null);
+    try testing.expect(std.mem.indexOf(u8, try parse.bad("{\"roughness_scale\":2.5}"), "'roughness_scale'") != null);
+    try testing.expect(std.mem.indexOf(u8, try parse.bad("{\"clearcoat\":1.5}"), "'clearcoat'") != null);
+    try testing.expect(std.mem.indexOf(u8, try parse.bad("{\"clearcoat\":-0.1}"), "'clearcoat'") != null);
+
+    const px = switch (try parsePixal3dOpts(a, "{\"roughness_scale\":0.5,\"clearcoat\":0.6}", 1, false)) {
+        .ok => |p| p,
+        .bad => return error.TestUnexpectedResult,
+    };
+    defer a.free(px.cameras);
+    try testing.expectApproxEqAbs(@as(f32, 0.5), px.base.roughness_scale, 1e-6);
+    try testing.expectApproxEqAbs(@as(f32, 0.6), px.base.clearcoat, 1e-6);
+
+    // Hunyuan3D's paint has no such knob: the field is refused by name, never dropped.
+    const hy = MeshEngine{ .allocator = a, .backend = .{ .hunyuan = undefined } };
+    const r = try meshJobFromBody(a, "{\"clearcoat\":1}", &hy, 1);
+    switch (r) {
+        .ok => return error.TestUnexpectedResult,
+        .bad => |m| try testing.expect(std.mem.indexOf(u8, m, "'clearcoat'") != null),
+    }
+}
+
 test "MOSS-Image: a model_index-only repo routes to the image slot with CFG 3 by default" {
     const io = std.Io.Threaded.global_single_threaded.io();
     const a = testing.allocator;
@@ -6045,6 +6536,101 @@ test "MOSS-Image text-to-image bill covers the measured peak at every canvas" {
         try testing.expect(bill >= m.peak);
         try testing.expect(bill < m.peak * 1.1);
     }
+}
+
+test "TRELLIS.2 and Pixal3D bill covers the measured peak at every resolution" {
+    const MiB: u64 = 1 << 20;
+    // MLX peaks of one car cutout (M5 Ultra): 1.3M, 5.1M and 11.8M decoded voxels.
+    const measured = [_]struct { res: u32, peak_mib: u64 }{
+        .{ .res = 512, .peak_mib = 5654 },
+        .{ .res = 1024, .peak_mib = 21557 },
+        .{ .res = 1536, .peak_mib = 34903 },
+        // Pixal3D on the same cutout: the same cascade and decoders, 4.9M and 10.9M voxels.
+        .{ .res = 1024, .peak_mib = 22414 },
+        .{ .res = 1536, .peak_mib = 32145 },
+    };
+    for (measured) |m| {
+        var worst: u64 = 0;
+        for (measured) |o| if (o.res == m.res) {
+            worst = @max(worst, o.peak_mib);
+        };
+        try testing.expect(trellis2PeakBytes(m.res) >= m.peak_mib * MiB);
+        try testing.expect(trellis2PeakBytes(m.res) < worst * MiB * 11 / 10);
+    }
+    try testing.expect(trellis2PeakBytes(512) < trellis2PeakBytes(1024));
+}
+
+test "TRELLIS.2 load estimate is the default-resolution peak and an unreadable dir never blocks" {
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try testing.expectEqual(@as(u64, 0), estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
+    try tmp.dir.writeFile(io, .{ .sub_path = "pipeline.json", .data = "{\"name\":\"Trellis2ImageTo3DPipeline\"}" });
+    try testing.expectEqual(trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution), estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
+    try testing.expectEqual(trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution), estimatePeakResidentBytesIn(io, tmp.dir, "pixal3d"));
+}
+
+test "TRELLIS.2 request is refused by name when its peak does not fit the free GPU memory" {
+    const GiB: u64 = 1 << 30;
+    var buf: [192]u8 = undefined;
+    try testing.expect(trellis2Refusal(&buf, 1536, 80 * GiB) == null);
+    const msg = trellis2Refusal(&buf, 1536, 20 * GiB) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, msg, "resolution") != null);
+    // An agent told to unload "another model" unloads its own chat model.
+    try testing.expect(std.mem.indexOf(u8, msg, "unload") == null);
+}
+
+test "meshViews: an allocation failing after the first view decoded frees every allocation exactly once" {
+    const gpa = testing.allocator;
+    var rgb: [2 * 2 * 3]u8 = undefined;
+    @memset(&rgb, 128);
+    const png_bytes = try @import("png.zig").encodeRgb(gpa, &rgb, 2, 2);
+    defer gpa.free(png_bytes);
+    const b64 = try gpa.alloc(u8, std.base64.standard.Encoder.calcSize(png_bytes.len));
+    defer gpa.free(b64);
+    _ = std.base64.standard.Encoder.encode(b64, png_bytes);
+    const body = try std.fmt.allocPrint(gpa, "{{\"images\":[\"{s}\",\"{s}\"]}}", .{ b64, b64 });
+    defer gpa.free(body);
+    var engine = MeshEngine{ .allocator = gpa, .backend = .{ .pixal3d = undefined } };
+    var fail_at: usize = 0;
+    while (fail_at < 64) : (fail_at += 1) {
+        var failing = std.testing.FailingAllocator.init(gpa, .{ .fail_index = fail_at });
+        const got = meshViews(failing.allocator(), body, &engine) catch continue;
+        switch (got) {
+            .ok => |views| {
+                try testing.expectEqual(@as(usize, 2), views.len);
+                freeViews(failing.allocator(), views);
+                return;
+            },
+            .bad => continue, // the decoder names a failed allocation as a refusal; the bar is no leak and no wrong-sized free
+        }
+    }
+    return error.TestUnexpectedResult;
+}
+
+test "mesh job failures a client can fix are named 400s, not a generic 500" {
+    const empty = meshJobRefusal(error.EmptySubject) orelse return error.TestUnexpectedResult;
+    try testing.expect(std.mem.indexOf(u8, empty, "alpha") != null);
+    try testing.expect(meshJobRefusal(error.EmptyStructure) != null);
+    try testing.expect(meshJobRefusal(error.OutOfMemory) == null);
+    try testing.expect(meshJobRefusal(error.MlxFailure) == null);
+}
+
+test "a mesh request is billed at its own resolution's peak, not the model's default" {
+    const peak = struct {
+        fn of(body: []const u8, backend: std.meta.Tag(MeshEngine.Backend)) u64 {
+            return meshRequestPeakBytes(body, backend);
+        }
+    }.of;
+    try testing.expectEqual(trellis2PeakBytes(1536), peak("{\"resolution\":1536}", .trellis2));
+    try testing.expectEqual(trellis2PeakBytes(1536), peak("{\"resolution\":1536,\"images\":[]}", .pixal3d));
+    try testing.expectEqual(trellis2PeakBytes(512), peak("{\"resolution\":512}", .trellis2));
+    try testing.expectEqual(trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution), peak("{}", .trellis2));
+    // An unservable value is billed as the largest cascade; the handler's 400 follows.
+    try testing.expectEqual(trellis2PeakBytes(1536), peak("{\"resolution\":9999}", .trellis2));
+    // Hunyuan keeps the model's resident estimate.
+    try testing.expectEqual(@as(u64, 0), peak("{\"resolution\":1536}", .hunyuan));
+    try testing.expect(trellis2PeakBytes(1536) > trellis2PeakBytes(1024));
 }
 
 test "Modality.mesh advertises the 3d capability" {

@@ -241,6 +241,16 @@ Modifications by mlx-serve: `value.cpp` and `value.h` were changed to add
 additions providing the C interface the Zig side calls.
 
 
+--------------------------------------------------------------------------------
+NAF (valeoai)
+https://github.com/valeoai/NAF
+Licensed under the Apache License, Version 2.0.
+
+`src/naf.zig` reimplements the released NAF feature upsampler operation for
+operation; Pixal3D conditions its voxels on DINOv3 features upsampled by it.
+The Pixal3D pack we publish on Hugging Face carries the released NAF weights
+with NAF's license beside them.
+
 ================================================================================
 MIT License
 ================================================================================
@@ -545,6 +555,33 @@ host dispatch; `simd_qmm` gains a 2-3 row `rows` kind; draft trees verify
 through our GDN fold kernel and path attention.
 
 
+--------------------------------------------------------------------------------
+TRELLIS.2 and TRELLIS (Microsoft)
+https://github.com/microsoft/TRELLIS.2
+https://huggingface.co/microsoft/TRELLIS.2-4B
+https://huggingface.co/microsoft/TRELLIS-image-large
+Copyright (c) Microsoft Corporation.
+Licensed under the MIT License.
+
+`src/trellis2*.zig` port the TRELLIS.2 image-to-3D pipeline: the sparse-structure,
+shape and texture flow transformers with their sampler recipes, the sparse
+SC-VAE decoders, the dual-grid mesh extraction and the PBR attribute layout;
+the TRELLIS v1 sparse-structure decoder is ported alongside. Written in Zig
+against mlx-c, not shipped as their source. The 8-bit packs we publish on
+Hugging Face repackage the released weights.
+
+--------------------------------------------------------------------------------
+Pixal3D (TencentARC)
+https://github.com/TencentARC/Pixal3D
+https://huggingface.co/TencentARC/Pixal3D
+Copyright (c) 2026 Tencent.
+Licensed under the MIT License.
+
+`src/pixal3d.zig` ports the pixel-aligned conditioning (each voxel projected
+through the camera into the DINOv3 features), the multi-view averaging and the
+per-block feature projection of the Pixal3D flows. The 8-bit pack we publish on
+Hugging Face repackages the released weights.
+
 ================================================================================
 Other licenses
 ================================================================================
@@ -581,6 +618,19 @@ OR TORT (INCLUDING NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE
 OF THIS SOFTWARE, EVEN IF ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
 
 --------------------------------------------------------------------------------
+DINOv3 (Meta)
+https://github.com/facebookresearch/dinov3
+https://huggingface.co/facebook/dinov3-vitl16-pretrain-lvd1689m
+Copyright (c) Meta Platforms, Inc. and affiliates.
+Licensed under the DINOv3 License (Meta's own agreement, neither MIT nor Apache).
+
+`src/dinov3.zig` implements the ViT-L/16 image encoder the TRELLIS.2 and Pixal3D
+pipelines condition on. The packs we publish on Hugging Face include its weights
+in float16 under that agreement, with its text as `dinov3/LICENSE.md`; mlx-serve
+itself does not redistribute them. The agreement must travel with any copy of
+the weights and restricts some uses (trade-control and military end uses).
+
+--------------------------------------------------------------------------------
 Fast-Quadric-Mesh-Simplification
 https://github.com/sp4cerat/Fast-Quadric-Mesh-Simplification
 Copyright (c) 2015-2019 Spacerat and contributors
@@ -589,6 +639,16 @@ Licensed under the MIT License (see lib/fqms/LICENSE).
 `Simplify.h` at 65df07dc, vendored unmodified under `lib/fqms/` with a C shim
 and compiled into the mlx-serve binary: the quadric decimation the Hunyuan3D
 texture stage runs before its UV unwrap.
+
+--------------------------------------------------------------------------------
+xatlas
+https://github.com/jpcy/xatlas
+Copyright (c) 2018-2020 Jonathan Young
+Licensed under the MIT License (see lib/xatlas/LICENSE).
+
+Vendored under `lib/xatlas/` with a C shim and compiled into the mlx-serve
+binary: the UV unwrap of the Hunyuan3D paint stage and of the TRELLIS.2 and
+Pixal3D texture bake.
 
 --------------------------------------------------------------------------------
 Stable Audio 3 (MLX reference implementation)

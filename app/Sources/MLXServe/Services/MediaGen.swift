@@ -1479,9 +1479,18 @@ struct Model3DModelPreset: Identifiable, Hashable {
     let approxRAMGB: Int
     /// Full bundle download size, GB (shape + paint).
     let approxDownloadGB: Double
+    /// Which backend answers `/v1/3d/generations` for this checkpoint; it decides the request fields,
+    /// the pane's controls and how the photo is cut out.
+    var family: Model3DFamily = .hunyuan3d
 
     static func == (lhs: Self, rhs: Self) -> Bool { lhs.id == rhs.id }
     func hash(into hasher: inout Hasher) { hasher.combine(id) }
+
+    /// The 1536 cascade peaks well above the 1024 one. Pixal3D shares the cascade; its peak is TRELLIS.2's, not
+    /// separately measured.
+    func approxRAMGB(trellisResolution: Int) -> Int {
+        family.hasCascadeControls && trellisResolution >= 1536 ? 35 : approxRAMGB
+    }
 
     /// True when the model has no published HF repo yet and must be converted
     /// locally — the pane shows a "convert locally" hint instead of a download
@@ -1497,8 +1506,74 @@ struct Model3DModelPreset: Identifiable, Hashable {
         approxDownloadGB: 8.5
     )
 
-    /// Catalog. One entry today; grows as more 3D checkpoints convert.
-    static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit]
+    /// TRELLIS.2-4B, 8-bit. The pane downloads the single-view set: 8.2 GB of the repo's 9.6.
+    static let trellis2_8bit = Model3DModelPreset(
+        id: "trellis2-8bit", name: "TRELLIS.2 (8-bit)", repo: "ddalcu/TRELLIS.2-4B-MLX-Serve-8bit",
+        approxRAMGB: 22, approxDownloadGB: 8.2, family: .trellis2)
+
+    /// Pixal3D, 8-bit. The pane downloads the single-view set: 8.7 GB of the repo's 14.8 (the rest is multi-view).
+    static let pixal3d_8bit = Model3DModelPreset(
+        id: "pixal3d-8bit", name: "Pixal3D (8-bit)", repo: "ddalcu/Pixal3D-MLX-Serve-8bit",
+        approxRAMGB: 22, approxDownloadGB: 8.7, family: .pixal3d)
+
+    /// Family templates for a pack on disk: it joins the picker through `CustomMediaModels`, synthesized from these.
+    static let trellis2Family = Model3DModelPreset(
+        id: "trellis2", name: "TRELLIS.2", repo: "", approxRAMGB: 22, approxDownloadGB: 0, family: .trellis2)
+    static let pixal3dFamily = Model3DModelPreset(
+        id: "pixal3d", name: "Pixal3D", repo: "", approxRAMGB: 22, approxDownloadGB: 0, family: .pixal3d)
+
+    /// Catalog. Order matters: the picker leads with the first of the largest that fits (`MediaModelPicks.featured`).
+    static let all: [Model3DModelPreset] = [.hunyuan3d21_8bit, .trellis2_8bit, .pixal3d_8bit]
+}
+
+/// The 3D backends behind one endpoint. They share `image` and `seed` and nothing else.
+enum Model3DFamily: Hashable {
+    case hunyuan3d, trellis2, pixal3d
+
+    /// Hunyuan3D textures in a separate paint pass; TRELLIS.2 and Pixal3D always texture.
+    var hasPaintStage: Bool { self == .hunyuan3d }
+
+    /// TRELLIS.2 and Pixal3D read the cutout's alpha as the subject (a white background would become part of
+    /// the object); Hunyuan3D composites on white itself.
+    var cutoutKeepsAlpha: Bool { self != .hunyuan3d }
+
+    /// TRELLIS.2 and Pixal3D share one cascade and its request fields: resolution, faces, texture size, finish.
+    var hasCascadeControls: Bool { self != .hunyuan3d }
+}
+
+/// How shiny a TRELLIS.2 or Pixal3D model looks. The model predicts one roughness per texel and its map is
+/// nearly flat (paint, trim and wheels all about 0.58), so a finish scales the whole map and adds a clearcoat
+/// rather than guessing which part is paint. Raw values are what the pane persists.
+enum Model3DFinish: String, CaseIterable, Codable {
+    case model, satin, glossy, carPaint
+
+    /// The server's `roughness_scale`: 1 keeps the model's roughness, below 1 is glossier.
+    var roughnessScale: Double {
+        switch self {
+        case .model: 1.0
+        case .satin: 0.7
+        case .glossy: 0.5
+        case .carPaint: 0.4
+        }
+    }
+
+    /// The server's `clearcoat` strength, 0 for none.
+    var clearcoat: Double {
+        switch self {
+        case .model, .satin: 0
+        case .glossy: 0.5
+        case .carPaint: 1.0
+        }
+    }
+
+    var title: String {
+        switch self {
+        case .model: "As generated"
+        case .satin: "Satin"
+        case .glossy: "Glossy"
+        case .carPaint: "Car paint"
+        }
+    }
 }
 
 /// Which music ENGINE a checkpoint drives. The families share the
@@ -2673,6 +2748,14 @@ struct Model3DGenRequest {
     /// Run the P2 paint stage (full PBR texture) after shape generation.
     /// Off by default until the paint port is validated end to end.
     var texture: Bool = false
+    /// TRELLIS.2 only: the cascade resolution (1024, or 1536 for a finer mesh).
+    var trellisResolution: Int = 1024
+    /// TRELLIS.2 only: faces kept after decimation.
+    var decimationTarget: Int = 300_000
+    /// TRELLIS.2 only: side of the baked texture, pixels.
+    var textureSize: Int = 2048
+    /// TRELLIS.2 and Pixal3D: how shiny the model looks (`.model` sends nothing).
+    var finish: Model3DFinish = .model
 }
 
 // MARK: - RAM checks

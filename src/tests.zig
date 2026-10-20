@@ -171,6 +171,14 @@ test {
     _ = @import("music3.zig");
     _ = @import("stable_audio.zig");
     _ = @import("yue2.zig");
+    _ = @import("trellis2_sparse.zig");
+    _ = @import("trellis2.zig");
+    _ = @import("dinov3.zig");
+    _ = @import("trellis2_mesh.zig");
+    _ = @import("trellis2_remesh.zig");
+    _ = @import("trellis2_pipeline.zig");
+    _ = @import("naf.zig");
+    _ = @import("pixal3d.zig");
     _ = @import("uvwrap.zig");
     _ = @import("mesh_simplify.zig");
     _ = @import("hunyuan3d_paint.zig");
