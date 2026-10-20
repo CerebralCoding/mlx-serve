@@ -22,6 +22,7 @@ const qwen_vision = @import("qwen_vision.zig");
 const muse_vision = @import("muse_vision.zig");
 const lfm2_vision = @import("lfm2_vision.zig");
 const glm_vision = @import("glm_vision.zig");
+const dsv41_vision = @import("dsv41_vision.zig");
 const radio_vision = @import("radio_vision.zig");
 const minicpm_vision = @import("minicpm_vision.zig");
 const minicpm_canvas = @import("minicpm_canvas.zig");
@@ -872,16 +873,17 @@ fn routeExists(path: []const u8) bool {
     return false;
 }
 
-pub const max_request_bytes: usize = 64 * 1024 * 1024;
 pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
+/// A coding agent keeps its screenshots in the history, as base64: chat takes what media takes.
+pub const max_request_bytes: usize = max_media_request_bytes;
 /// A decision prompt keeps at most `max_len` state tokens, so a larger body only
 /// buys tokenizer work on the inference thread.
 pub const max_decision_request_bytes: usize = 4 * 1024 * 1024;
 
 /// Per-route request-body cap. Media bodies are base64 payloads — a single
 /// ref2va reference video is ~100 MB of JPEG frames, three plus full-res
-/// reference images approach 500 MB (issue #151) — while no JSON chat body
-/// has any business near 64 MB.
+/// reference images approach 500 MB (issue #151) — and a vision agent's chat
+/// history carries its screenshots the same way. Only a decision prompt is small.
 pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
@@ -2119,6 +2121,10 @@ pub fn serve(
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
+    const gen_yield_env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_GEN_YIELD")) |p| std.mem.span(p) else null;
+    scheduler_mod.gen_yield_enabled = scheduler_mod.genYieldEnabled(mlx.cudaAvailable(), gen_yield_env);
+    if (!scheduler_mod.gen_yield_enabled and mlx.cudaAvailable())
+        log.info("chat does not interleave with media jobs on CUDA: a chat waits for the running image/audio job (MLX_SERVE_GEN_YIELD=1 interleaves)\n", .{});
     // Install signal handlers for graceful shutdown (POSIX; on Windows Ctrl+C ends the process).
     if (comptime builtin.os.tag != .windows) {
         const sigact = std.posix.Sigaction{
@@ -2587,6 +2593,7 @@ fn handleConnection(
         return;
     }
     if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
+        if (mlx.gpuContextLost()) return sendResponse(stream, "503 Service Unavailable", "application/json", "{\"status\":\"cuda context lost\"}");
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
         return;
@@ -3067,7 +3074,7 @@ fn handleOllamaEarly(allocator: std.mem.Allocator, stream: *Conn, method: []cons
     for (unsupported) |prefix| {
         if (std.mem.startsWith(u8, path, prefix)) {
             log.warn("{s} {s} -> 501 (unsupported ollama endpoint)\n", .{ method, path });
-            try sendOllamaError(allocator, stream, "501 Not Implemented", "this Ollama endpoint is not supported by mlx-serve; manage models via /v1/load-model, /api/pull, or the MLX Core app");
+            try sendOllamaError(allocator, stream, "501 Not Implemented", "this Ollama endpoint is not supported by mlx-serve; manage models via /v1/load-model, /api/pull, or the MLX-Serve app");
             return true;
         }
     }
@@ -5940,7 +5947,10 @@ const GLM5_INDEXER_BYTES_PER_POOL: u64 = 12;
 /// two are a max, not a sum.
 pub fn glm5PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, max_tokens: u64, kv_bits: u64, chunk: u64, warm: WarmPrefix) u64 {
     const ctx: u64 = getEffectiveContextLength(config);
-    const output = @min(max_tokens, if (ctx > 0) ctx -| seq else max_tokens);
+    // Generation growth is billed to the KV reserve's headroom, as the drafter term is: an omitted
+    // max_tokens is the rest of the window (1M here), and pricing that answer's KV refused a
+    // 431-token prompt at 43 GB beside 36 GB free.
+    const output = @min(max_tokens, transformer_mod.KVCache.RESERVE_GEN_HEADROOM, if (ctx > 0) ctx -| seq else max_tokens);
     const end = seq +| output;
     const kv_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     const view_tok: u64 = if (kv_bits < 16) glm5DequantWidth(config) else 0;
@@ -6071,6 +6081,14 @@ pub const GenErrorWire = struct {
 /// non-streaming arms; streaming arms wrote a bare `server_error` into an SSE frame, so agents
 /// never saw the actionable 400/503. The unknown arm keeps the error name at a mapped 500.
 pub fn mapGenerationError(err: anyerror, buf: []u8) GenErrorWire {
+    // Whatever the request saw, a lost context is the cause and a restart the remedy.
+    if (mlx.gpuContextLost()) return .{
+        .status_line = "503 Service Unavailable",
+        .code = 503,
+        .openai_type = "server_error",
+        .anthropic_type = "api_error",
+        .message = gpu_context_lost_message,
+    };
     return switch (err) {
         // The MLX working-set latch (#353): a memory 503.
         error.GenerationOutOfMemory, error.OutOfMemory => .{
@@ -8291,6 +8309,7 @@ fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, lm: 
     }
     var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route, .decision = if (decision) |*d| d else null };
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
+    if (lm.mesh_engine) |e| req.peak_bytes = media_mod.meshRequestPeakBytes(body, e.backend);
     if (decision) |*d| req.merge = .{
         .run_many = genJobRunMany,
         .weight = @max(1, d.count()),
@@ -13486,20 +13505,74 @@ fn bodyPreview(out: []u8, body: []const u8) []const u8 {
     return out[0..n];
 }
 
+/// A run of base64 this long is an embedded image or clip, not text anyone reads out of a log.
+const LOG_BASE64_RUN: usize = 4096;
+
+fn isBase64Byte(c: u8) bool {
+    return std.ascii.isAlphanumeric(c) or c == '+' or c == '/' or c == '=' or c == '-' or c == '_';
+}
+
+/// `body` with every base64 run of `LOG_BASE64_RUN` bytes or more replaced by `<N base64 chars>`.
+fn elideLongBase64(allocator: std.mem.Allocator, body: []const u8) ![]u8 {
+    var out = try std.ArrayList(u8).initCapacity(allocator, @min(body.len, 1 << 20));
+    errdefer out.deinit(allocator);
+    var i: usize = 0;
+    while (i < body.len) {
+        var j = i;
+        while (j < body.len and isBase64Byte(body[j])) j += 1;
+        if (j - i >= LOG_BASE64_RUN) {
+            try out.print(allocator, "<{d} base64 chars>", .{j - i});
+        } else {
+            try out.appendSlice(allocator, body[i..j]);
+        }
+        if (j < body.len) {
+            try out.append(allocator, body[j]);
+            j += 1;
+        }
+        i = j;
+    }
+    return out.toOwnedSlice(allocator);
+}
+
 fn logHttpBody(label: []const u8, body: []const u8) void {
     if (body.len == 0) return;
     // Text bodies go out WHOLE — reading a full request body out of the debug
-    // log is the documented way to reproduce a tool-calling bug.
+    // log is the documented way to reproduce a tool-calling bug — minus embedded
+    // images: a vision agent's history is megabytes of base64 per request.
     if (bodyIsText(body)) {
+        if (body.len > LOG_BASE64_RUN) if (elideLongBase64(std.heap.page_allocator, body)) |shown| {
+            defer std.heap.page_allocator.free(shown);
+            log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, shown });
+            return;
+        } else |_| {};
         log.debug("{s} ({d}b):\n{s}\n", .{ label, body.len, body });
         return;
     }
     // Binary is a different story. `/v1/images/edits` is multipart, so one image
-    // upload wrote raw PNG bytes into the log, and a body near the 64 MB request
+    // upload wrote raw PNG bytes into the log, and a body near the request
     // cap blew through the 32 MB rotation — taking the post-mortem file with it.
     var buf: [BODY_LOG_LIMIT]u8 = undefined;
     const preview = bodyPreview(&buf, body);
     log.debug("{s} ({d}b binary, first {d} sanitized):\n{s}…\n", .{ label, body.len, preview.len, preview });
+}
+
+test "debug body log: an embedded image is elided and the text around it is kept whole" {
+    const gpa = std.testing.allocator;
+    var b64: [5000]u8 = undefined;
+    @memset(&b64, 'A');
+    const body = try std.fmt.allocPrint(gpa, "{{\"role\":\"user\",\"image\":\"data:image/png;base64,{s}\",\"text\":\"keep this\"}}", .{&b64});
+    defer gpa.free(body);
+    const out = try elideLongBase64(gpa, body);
+    defer gpa.free(out);
+    try std.testing.expect(out.len < 200);
+    try std.testing.expect(std.mem.indexOf(u8, out, "<5000 base64 chars>") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "\"role\":\"user\"") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "keep this") != null);
+    // A short run (a token, a hash, a small id) is ordinary text.
+    const short = "{\"id\":\"AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"}";
+    const kept = try elideLongBase64(gpa, short);
+    defer gpa.free(kept);
+    try std.testing.expectEqualStrings(short, kept);
 }
 
 const GaugeSamplerCtx = struct {
@@ -14599,6 +14672,9 @@ fn extractJsonField(body: []const u8, field: []const u8) ?[]const u8 {
     return null;
 }
 
+pub const gpu_context_lost_message =
+    "The GPU context was lost (a CUDA kernel faulted) and every GPU call now fails. Restart the server; the server log names the first error.";
+
 /// Body text for a context-overflow 400, in a caller-owned buffer.
 ///
 /// The COUNTS are the point. "Prompt exceeds maximum context length" tells a
@@ -14649,6 +14725,7 @@ fn sendEnsureLoadedError(allocator: std.mem.Allocator, stream: *Conn, sched: *sc
         error.InsufficientMemory => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "out_of_memory", insufficient_free_memory_message, 503),
         error.LoadFailed => try sendLoadFailedResponse(allocator, stream, sched, id),
         error.Shutdown => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "shutting_down", "Server is shutting down", 503),
+        error.GpuContextLost => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "gpu_context_lost", gpu_context_lost_message, 503),
         error.ForeignBytesReaderBusy => try sendErrorResponse(allocator, stream, "503 Service Unavailable", "model_busy", "Another DeepSeek-V4.1 or GLM-5.3 stream pack is in use; retry when its request finishes", 503),
         // Other errors (CPU-side preload failures like FileNotFound on a
         // missing tokenizer.json, JSON parse errors on a malformed
@@ -15823,6 +15900,14 @@ pub fn visionPreprocFromConfig(config: *const model_mod.ModelConfig) chat_mod.Vi
         .patch = config.vision_patch_size,
         .max_slices = config.mcv_max_slice_nums,
     };
+    if (config.dsv41_vision) return .{
+        .mode = .dsv41,
+        .patch = config.vision_patch_size,
+        .merge = config.dv_downsample,
+        .max_tokens = config.dv_max_image_tokens,
+        .min_pixels = config.dv_min_pixels,
+        .max_wh_ratio = config.dv_max_wh_ratio,
+    };
     if (config.glm_vision) return .{
         .mode = .glm,
         .patch = config.qv_patch,
@@ -15928,7 +16013,7 @@ test "an x-mlx-pixels payload is refused by a patch-grid tower (it is a Gemma fo
     try std.testing.expectEqual(@as(u32, 2), gemma.width);
     try std.testing.expectEqual(@as(u32, 0), gemma.grid_h);
 
-    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .glm }, .{ .mode = .minicpm }, .{ .mode = .gemma_budget } }) |vp| {
+    for ([_]chat_mod.VisionPreproc{ .{ .mode = .muse }, .{ .mode = .qwen }, .{ .mode = .glm }, .{ .mode = .minicpm }, .{ .mode = .gemma_budget }, .{ .mode = .dsv41 } }) |vp| {
         try std.testing.expect(parseImageUrlContent(std.testing.allocator, url, vp) == null);
     }
 }
@@ -16165,7 +16250,7 @@ fn appendAnthropicImageBlock(allocator: std.mem.Allocator, list: *std.ArrayList(
     return appendImageUrlContent(allocator, list, url, vp);
 }
 
-const IMAGE_DECODE_REJECT = "image could not be decoded: send a base64 data URL (data:image/jpeg|png|webp;base64,...) with a readable payload; remote URLs are not fetched";
+const IMAGE_DECODE_REJECT = "image could not be decoded: send a base64 data URL (data:image/jpeg|png|webp|gif|bmp;base64,...) with a readable payload; remote URLs are not fetched";
 
 /// `Lfm2VlImageProcessor.resize_and_split`: a source inside the budget is one
 /// resized image; past it, the WHOLE image is resized onto a `cols`x`rows`
@@ -16340,11 +16425,25 @@ const DecodedRgb = struct {
     }
 };
 
+test "decodeRgbOwned reads a GIF's first frame and a BMP, the formats the Anthropic and OpenAI image blocks allow beside JPEG/PNG/WebP" {
+    // 2x2: red, green / blue, white (Pillow-written).
+    const gif = "\x47\x49\x46\x38\x37\x61\x02\x00\x02\x00\x81\x00\x00\xff\xff\xff\x00\xff\x00\xff\x00\x00\x00\x00\xff\x2c\x00\x00\x00\x00\x02\x00\x02\x00\x00\x08\x07\x00\x05\x04\x18\x00\x20\x20\x00\x3b";
+    const bmp = "\x42\x4d\x46\x00\x00\x00\x00\x00\x00\x00\x36\x00\x00\x00\x28\x00\x00\x00\x02\x00\x00\x00\x02\x00\x00\x00\x01\x00\x18\x00\x00\x00\x00\x00\x10\x00\x00\x00\xc4\x0e\x00\x00\xc4\x0e\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\xff\x00\x00\xff\xff\xff\x00\x00\x00\x00\xff\x00\xff\x00\x00\x00";
+    for ([_][]const u8{ gif, bmp }) |bytes| {
+        const d = decodeRgbOwned(std.testing.allocator, bytes, true) orelse return error.TestUnexpectedResult;
+        defer std.testing.allocator.free(d.rgb);
+        try std.testing.expectEqual(@as(u32, 2), d.w);
+        try std.testing.expectEqual(@as(u32, 2), d.h);
+        try std.testing.expectEqualSlices(u8, &.{ 255, 0, 0, 0, 255, 0, 0, 0, 255, 255, 255, 255 }, d.rgb);
+    }
+    try std.testing.expect(decodeRgbOwned(std.testing.allocator, "II*\x00not a tiff we read", true) == null);
+}
+
 fn decodeRgbOwned(allocator: std.mem.Allocator, encoded: []const u8, composite_alpha: bool) ?DecodedRgb {
     var w: c_int = 0;
     var h: c_int = 0;
     var channels: c_int = 0;
-    // stb first (JPEG/PNG) — 4 channels so transparency composites onto white.
+    // stb first (JPEG/PNG/GIF first frame/BMP) — 4 channels so transparency composites onto white.
     if (stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &channels, 4)) |rgba| {
         defer stb.stbi_image_free(rgba);
         const total_px: usize = @intCast(w * h);
@@ -16392,6 +16491,12 @@ pub fn decodeImageToPixels(allocator: std.mem.Allocator, encoded: []const u8, vp
 
     // MiniCPM-V images are several pieces: `appendImageUrlContent` makes them.
     if (vp.mode == .minicpm) return null;
+
+    if (vp.mode == .dsv41) {
+        const pv = dsv41_vision.preprocess(allocator, src.rgb, src_h, src_w, vp.patch, vp.merge, vp.max_tokens, vp.min_pixels, vp.max_wh_ratio) catch return null;
+        log.info("  Decoded {d}x{d} image → deepseek grid {d}x{d} ({d} tokens, canvas {d}x{d})\n", .{ src_w, src_h, pv.grid_h, pv.grid_w, dsv41_vision.spanTokens((pv.grid_h + vp.merge - 1) / vp.merge, (pv.grid_w + vp.merge - 1) / vp.merge), pv.w, pv.h });
+        return .{ .pixels = pv.bytes, .width = pv.w, .height = pv.h, .grid_h = pv.grid_h, .grid_w = pv.grid_w };
+    }
 
     if (vp.mode == .glm) {
         const pv = glm_vision.preprocess(allocator, src.rgb, src_h, src_w, vp.patch, vp.tps, vp.merge, vp.min_tokens, vp.max_tokens) catch return null;
@@ -16557,7 +16662,7 @@ const EMBED_PART_REJECT = "content parts must be text, image_url or video_url ob
 const EMBED_NO_VISION_REJECT = "image and video parts need a model with a vision encoder: this one has none loaded (a text-only pack, or --no-vision)";
 const EMBED_AUDIO_REJECT = "audio parts are not served: this model's audio tower is not loaded";
 const EMBED_EMPTY_REJECT = "'messages' carry nothing to embed: add a text part, an image or a video";
-const VIDEO_DECODE_REJECT = "video could not be decoded: send 'frames', a non-empty array of base64 image data URLs (data:image/jpeg|png|webp;base64,...) with readable payloads; remote URLs are not fetched";
+const VIDEO_DECODE_REJECT = "video could not be decoded: send 'frames', a non-empty array of base64 image data URLs (data:image/jpeg|png|webp|gif|bmp;base64,...) with readable payloads; remote URLs are not fetched";
 
 /// `messages` the way the model's own chat template reads them for an embedding (EmbeddingGemma 2's is a bare
 /// concatenation): system turns first, then the rest in order; text parts verbatim, no separator invented; an
@@ -21529,7 +21634,7 @@ test "findContentLength returns null when missing" {
 test "debug body log bounds BINARY but never truncates text (multipart PNG class)" {
     // `/v1/images/edits` is the first binary body we serve. `logHttpBody` dumped
     // whatever it got verbatim, so at --log-level debug one image upload wrote
-    // raw PNG bytes into the log — and a body near the 64 MB request cap blew
+    // raw PNG bytes into the log — and a body near the request cap blew
     // straight through the 32 MB rotation, taking the post-mortem file with it.
     //
     // Text bodies must stay WHOLE: reading a full request body out of the debug
@@ -25754,6 +25859,20 @@ test "PrefillDoesNotFit quotes the figures the inference thread refused on, once
     try t.expectEqualStrings(PREFILL_NOFIT_MSG, mapGenerationError(error.PrefillDoesNotFit, &buf).message);
 }
 
+test "mapGenerationError: after a lost GPU context any failure is the named 503" {
+    const t = std.testing;
+    var stale: [512]u8 = undefined;
+    _ = mlx.takeError(&stale);
+    defer mlx.resetGpuContextLostForTest();
+    var buf: [192]u8 = undefined;
+    try t.expectEqual(@as(u32, 500), mapGenerationError(error.GenerationFailed, &buf).code);
+    mlx.latchErrorForTest("cudaGraphLaunch(graph_exec, stream_) failed: an illegal memory access was encountered");
+    _ = mlx.takeError(&stale);
+    const w = mapGenerationError(error.GenerationFailed, &buf);
+    try t.expectEqual(@as(u32, 503), w.code);
+    try t.expectEqualStrings(gpu_context_lost_message, w.message);
+}
+
 test "a streaming fault answers with the SAME mapped error a non-streaming one does" {
     // The 400/503 mapping existed only on the non-streaming arms; streaming arms wrote a bare `server_error` frame.
     const t = std.testing;
@@ -26145,8 +26264,7 @@ test "contentTokenRange: logprobs cover the CONTENT, not the reasoning we stripp
 
 test "request body cap is per route: media bodies are base64 frame payloads" {
     // Issue #151: ONE ref2va reference video is ~100 MB of base64 JPEG frames,
-    // three of them plus full-res ref images can approach 500 MB — while no
-    // JSON chat body has any business near 64 MB.
+    // three of them plus full-res ref images can approach 500 MB.
     for ([_][]const u8{
         "/v1/images/generations",
         "/v1/images/edits",
@@ -26159,6 +26277,14 @@ test "request body cap is per route: media bodies are base64 frame payloads" {
         try std.testing.expectEqual(max_request_bytes, maxRequestBytesFor(p));
     try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions"));
     try std.testing.expectEqual(max_decision_request_bytes, maxRequestBytesFor("/v1/decisions?x=1"));
+}
+
+test "the chat body cap admits an agent session that keeps its screenshots" {
+    // 100 screenshots at 4 MiB of base64 each.
+    const screenshots = 100;
+    const base64_png = 4 * 1024 * 1024;
+    for ([_][]const u8{ "/v1/chat/completions", "/v1/messages", "/v1/responses" }) |p|
+        try std.testing.expect(maxRequestBytesFor(p) >= screenshots * base64_png);
 }
 
 test "the 413 names both counts it compared" {
@@ -27236,21 +27362,24 @@ test "GLM bill: f32 checkpoints and the live state are billed" {
     try t.expect(glm5PrefillMemoryNeeded(&glm, 1, 1, 8, 512, .{}) >= 4 * glm.ssmCheckpointBytes() * 5 / 4);
 }
 
-test "GLM bill: prefill scratch and decode growth are a max, not a sum" {
+test "GLM bill: decode growth is billed to the generation headroom, never the auto budget's whole window" {
     const t = std.testing;
     const saved = GlmBillGlobals.pin();
     defer saved.restore();
     var glm = glm5TestConfig();
-    glm.ctx_override = 1 << 23;
+    glm.ctx_override = 1 << 20;
+    const headroom = transformer_mod.KVCache.RESERVE_GEN_HEADROOM;
     const kv_tok = glm.kvBytesPerToken();
-    const base = glm5PrefillMemoryNeeded(&glm, 100_000, 64, 16, 4096, .{});
-    // Below the crossover the prefill scratch is the peak, and its prompt-only indexer does not move.
-    try t.expectEqual(base, glm5PrefillMemoryNeeded(&glm, 100_000, 20_000, 16, 4096, .{}));
-    // Above it decode growth is the peak: each output token adds its row and its old row.
-    const long = glm5PrefillMemoryNeeded(&glm, 100_000, 4_000_000, 16, 4096, .{});
-    const longer = glm5PrefillMemoryNeeded(&glm, 100_000, 4_100_000, 16, 4096, .{});
-    try t.expect(long > base);
-    try t.expectEqual(100_000 * 2 * kv_tok * 5 / 4, longer - long);
+    // A client that sets no max_tokens gets the rest of the window: that answer is billed like one of
+    // `headroom` tokens, so a short prompt's bill does not depend on the window it was pegged to.
+    const auto = glm5PrefillMemoryNeeded(&glm, 431, (1 << 20) - 431, 16, 4096, .{});
+    try t.expectEqual(glm5PrefillMemoryNeeded(&glm, 431, headroom, 16, 4096, .{}), auto);
+    try t.expectEqual(auto, glm5PrefillMemoryNeeded(&glm, 431, 4_000_000, 16, 4096, .{}));
+    // Below the headroom the growth term still prices each output token's row and its old row,
+    // and it stays a max against the prefill scratch, never a sum.
+    const short = glm5PrefillMemoryNeeded(&glm, 431, 64, 16, 4096, .{});
+    try t.expect(auto >= short);
+    try t.expect(auto - short <= headroom * 2 * kv_tok * 5 / 4);
 }
 
 test "GLM bill: a prompt token costs its KV, one layer's grow copy and its indexer pools" {

@@ -104,7 +104,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
-    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization",
+    "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d",
 ]
 
 func isMediaModelType(_ modelType: String) -> Bool {
@@ -148,7 +148,7 @@ enum MediaModality: CaseIterable {
         if modelType.hasPrefix("flux2") || modelType.hasPrefix("krea")
             || modelType.hasPrefix("mage_flow") || modelType == "mageflow"
             || modelType.hasPrefix("qwen_image") || modelType == "moss_image" { self = .image; return }
-        if modelType.hasPrefix("hunyuan3d") { self = .mesh; return }
+        if modelType.hasPrefix("hunyuan3d") || modelType == "trellis2" || modelType == "pixal3d" { self = .mesh; return }
         switch modelType {
         case "qwen3_tts", "kokoro": self = .voice
         case "acestep", "minimax_music3", "yue2": self = .music

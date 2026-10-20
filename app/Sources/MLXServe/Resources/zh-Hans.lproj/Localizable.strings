@@ -989,6 +989,17 @@
 "Memory: about 1 GB more for a small model, up to 11 GB for a 27B. Disk: roughly as much again for its compiled copy." = "内存：小模型约多占 1 GB，27B 模型最多多占 11 GB。磁盘：编译副本大致再占同样多的空间。";
 "Menu bar" = "菜单栏";
 "Mesh resolution" = "网格分辨率";
+"Faces" = "面数";
+"Texture size" = "贴图尺寸";
+"1536 gives a finer mesh and needs about 35 GB of memory." = "1536 的网格更精细，需要约 35 GB 内存。";
+"More faces keep more detail. At 1M faces and above the file passes 60 MB." = "面数越多，细节越多。1M 面及以上时文件超过 60 MB。";
+"Finish" = "表面质感";
+"As generated" = "模型原样";
+"Satin" = "缎面";
+"Glossy" = "高光";
+"Car paint" = "车漆";
+"The model decides what is shiny; a finish scales it. A glossier finish shows every bump in the surface." = "光泽由模型决定，质感只是整体缩放。越光滑，表面的每个凹凸越明显。";
+"A single, well-lit photo of one object works best. A cutout with a transparent background is used as is; otherwise the subject is auto-cut." = "单张光线良好的单物体照片效果最佳。带透明背景的抠图将原样使用，否则会自动抠出主体。";
 "Messaging" = "消息";
 "Messaging — Telegram bot" = "消息 —— Telegram 机器人";
 "Metrics panel" = "指标面板";

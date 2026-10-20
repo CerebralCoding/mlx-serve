@@ -37,6 +37,7 @@ test {
     _ = @import("muse_vision.zig");
     _ = @import("lfm2_vision.zig");
     _ = @import("glm_vision.zig");
+    _ = @import("dsv41_vision.zig");
     _ = @import("minicpm_vision.zig");
     _ = @import("minicpm_canvas.zig");
     _ = @import("qwen_audio.zig");
@@ -50,6 +51,10 @@ test {
     _ = @import("moe_gather_ubench.zig");
     _ = @import("moe_affine4.zig");
     _ = @import("hc_decode2.zig");
+    _ = @import("hc_cuda.zig");
+    _ = @import("moe_cuda.zig");
+    _ = @import("moe_prefill_cuda.zig");
+    _ = @import("qsa_decode_cuda.zig");
     _ = @import("qsa_mask.zig");
     _ = @import("qsa_decode.zig");
     _ = @import("rowqmv.zig");
@@ -166,6 +171,14 @@ test {
     _ = @import("music3.zig");
     _ = @import("stable_audio.zig");
     _ = @import("yue2.zig");
+    _ = @import("trellis2_sparse.zig");
+    _ = @import("trellis2.zig");
+    _ = @import("dinov3.zig");
+    _ = @import("trellis2_mesh.zig");
+    _ = @import("trellis2_remesh.zig");
+    _ = @import("trellis2_pipeline.zig");
+    _ = @import("naf.zig");
+    _ = @import("pixal3d.zig");
     _ = @import("uvwrap.zig");
     _ = @import("mesh_simplify.zig");
     _ = @import("hunyuan3d_paint.zig");
