@@ -5713,3 +5713,9 @@ Cause: the tuned sorted expert kernel (`gather_qmm_nax`, the oMLX port) took aff
 Fix: `Fp4Q` decodes e4m3 scales at group 16 (`QuantMode.isFp4` at the three call sites), the paired SwiGLU kernel declines when per-expert scales exist (it ignores them), and `prefillDqGemm` takes the mode and serves MXFP8. 4600 -> 5340 tok/s.
 Guards: `segmented NAX sorted gather matches stock bit for bit on FP4 banks` (Flash Next shapes), the paired row-map case at group 16, `qmatmulBits: prefill-width MXFP8 calls take the dequant+GEMM route`. The expert kernel is exact (323 of 323 scored rows bit-identical); the MXFP8 route reorders sums, so judge it by `MLX_SERVE_PREFILL_DQ_GEMM=0` A/Bs.
 
+## DSV4.1's tiled indexer scored differently run to run on M1 (2026-10-20)
+
+Defect: `dsv41 index scores: the matrix kernel …` failed on every CI run since #911 with a different wrong value each time, at a fixed seed; it passed on M5.
+Cause: `IDX_TILE_SOURCE` reduces each 8x8 accumulator tile through per-simdgroup scratch (`simdgroup_store`, then every lane reads other lanes' entries) with only `simdgroup_barrier(mem_threadgroup)` between. On M1 that does not order the scratch: ~1% of scores (odd tile columns, the second element of each lane's pair) read a stale value, so the indexer's block picks moved between runs. The test blamed FMA contraction.
+Fix: both barriers in that loop are `threadgroup_barrier` (the loop is uniform across the threadgroup).
+Guard: the same test, red on M1 without the fix.

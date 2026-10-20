@@ -1184,6 +1184,7 @@ const IDX_TILE_SOURCE =
     \\    for (int c = 0; c < CT; ++c) metal::simdgroup_multiply_accumulate(acc[r][c], a[r], b[c], acc[r][c]);
     \\}
     \\// A finished tile's rows are heads: relu, weight and sum them through this simdgroup's scratch.
+    \\// Threadgroup barriers: on M1 a simdgroup barrier let lanes read the scratch before the store landed.
     \\const int col = lane & 7, row = (lane >> 3) * 2;
     \\float s[CT];
     \\#pragma clang loop unroll(full)
@@ -1193,12 +1194,12 @@ const IDX_TILE_SOURCE =
     \\  #pragma clang loop unroll(full)
     \\  for (int c = 0; c < CT; ++c) {
     \\    metal::simdgroup_store(acc[r][c], red[sg], 8);
-    \\    metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\    float p = metal::max(red[sg][row * 8 + col], 0.0f) * wt[r * 8 + row] + metal::max(red[sg][(row + 1) * 8 + col], 0.0f) * wt[r * 8 + row + 1];
     \\    p += metal::simd_shuffle_xor(p, 8);
     \\    p += metal::simd_shuffle_xor(p, 16);
     \\    s[c] += p;
-    \\    metal::simdgroup_barrier(metal::mem_flags::mem_threadgroup);
+    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
     \\  }
     \\if (lane < 8)
     \\  for (int c = 0; c < CT; ++c) {
