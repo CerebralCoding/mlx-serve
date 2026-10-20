@@ -10,6 +10,7 @@
 #   ./tests/test_launch_cmd.sh [model_dir] [port]   # any small chat model (default Qwen3.5-0.8B); SKIPs without one
 #
 # Hermetic twins: builder/budget/arg-parse tests in host/launch/launch.zig; Swift twin CLISetupInstructionsTests.
+# codex's own home stays untouched: CODEX_HOME points at an empty temp dir that must stay empty.
 
 set -u
 source "$(dirname "$0")/lib/server.sh"
@@ -94,6 +95,10 @@ echo "$OUT" | grep -q -- "-c 'model_providers.mlx.base_url=\"$BASE/v1\"'" || OK=
 # desktop-app fallback: the ChatGPT/Codex app bundles the CLI off PATH
 echo "$OUT" | grep -q '/Applications/ChatGPT.app' || OK=0
 echo "$OUT" | grep -q 'Contents/Resources/codex' || OK=0
+# the instructions override is gated at exec time and only used when the file exists
+echo "$OUT" | grep -q 'MLX_SERVE_CODEX_MODEL_INSTRUCTIONS' || OK=0
+echo "$OUT" | grep -q 'model_instructions_file' || OK=0
+echo "$OUT" | grep -qF '[ -f "$HOME/.mlx-serve/codex/model-instructions.md" ]' || OK=0
 [ -z "$(ls -A "$CODEX_HOME")" ] || OK=0
 if [ "$OK" = 1 ]; then
     run_test "codex -c overrides target /v1/responses with the advertised context" PASS
@@ -119,7 +124,7 @@ fi
 
 # ── [6] passthrough args ──
 OUT=$("$BIN" launch codex --print --url "$BASE" -- resume 2>&1)
-if echo "$OUT" | grep -q -- "-c 'model_providers.mlx.wire_api=\"responses\"' 'resume'"; then
+if echo "$OUT" | grep -q -- "codex_launch 'resume'"; then
     run_test "extra args after -- ride the agent invocation" PASS
 else
     run_test "extra args after -- ride the agent invocation" FAIL "$OUT"
