@@ -105,7 +105,7 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug 2–4× slower ⇒ fake regressions). `zig build test` does NOT refresh `zig-out/bin/mlx-serve` — rebuild before any live A/B.
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
 - mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx.zig` externs. Brew: webp ≥ 1.6.0.
-- **Linux/Windows CUDA**: build with `./scripts/build-linux.sh` / `scripts\build-windows.ps1`; MLX's JIT needs `CUDA_HOME`; custom MSL runs on Metal only. Kernels, per-device defaults, memory, measuring: `docs/CUDA.md`.
+- **Linux/Windows CUDA**: build with `./scripts/build-linux.sh` / `scripts\build-windows.ps1`; MLX's JIT needs `CUDA_HOME`; custom MSL runs on Metal only. Kernels, per-device defaults, memory, measuring, and its rules (GPU-pool loads, graphs, kernel cache, matching MLX's bits): `docs/CUDA.md`.
 - Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/` and `ar rcs libjinja.a obj/*.o`.
 
 ## Testing — TDD is mandatory
