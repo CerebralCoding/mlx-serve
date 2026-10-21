@@ -2208,10 +2208,12 @@ pub const Scheduler = struct {
                         @as(f64, @floatFromInt(estimated)) / gb,
                         @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,
                     });
-                } else log.err("Refusing to load {s}: needs ~{d:.2} GB with {d:.2} GB resident across {d} model(s), none evictable, against --max-resident-models {d} and --max-resident-mem {d:.2} GB (0 = off). Unload a model or raise a cap.\n", .{
+                } else log.err("Refusing to load {s}: needs ~{d:.2} GB with {d:.2} GB resident ({d:.2} GB live, {d:.2} GB reserved by loads in flight, this one included) across {d} model(s), and unloading the idle ones does not fit it under --max-resident-models {d} and --max-resident-mem {d:.2} GB (0 = off). Unload a model or raise a cap.\n", .{
                     entry.id,
                     @as(f64, @floatFromInt(estimated)) / gb,
                     @as(f64, @floatFromInt(self.registry.current_resident_bytes)) / gb,
+                    @as(f64, @floatFromInt(mlxActiveBytes())) / gb,
+                    @as(f64, @floatFromInt(self.registry.reserved_bytes)) / gb,
                     self.registry.countLoadedLocked(),
                     self.registry.max_resident_models,
                     @as(f64, @floatFromInt(self.registry.max_resident_mem)) / gb,

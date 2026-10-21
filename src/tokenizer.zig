@@ -112,6 +112,9 @@ pub const Tokenizer = struct {
     /// tokens decode as the bytes they spell (U+FFFD per byte when the run
     /// is not valid UTF-8).
     byte_fallback_decode: bool = false,
+    /// The special a `TemplateProcessing` post-processor appends after a single sequence
+    /// (Qwen3-Embedding's `<|endoftext|>`); `encode` never adds it, a last-token pooler must.
+    appended_special: ?u32 = null,
     /// Decode-only marker aliases (K2-Horizon): the `<ifm|…>` think and tool
     /// markers decode as the canonical `<think>` / GLM tag spellings every
     /// downstream parser reads. Encoding keeps the checkpoint's own bytes.
@@ -1730,6 +1733,7 @@ fn parseTokenizerContent(io: std.Io, allocator: std.mem.Allocator, content: []co
         .fuse_unk = if (model_obj.get("fuse_unk")) |v| v == .bool and v.bool else false,
         .unk_id = if (model_obj.get("unk_token")) |v| (if (v == .string) vocab.get(v.string) else null) else null,
         .byte_fallback_decode = if (root.get("decoder")) |d| decoderHasByteFallback(d) else false,
+        .appended_special = if (root.get("post_processor")) |pp| appendedSpecialId(pp, &special_tokens) else null,
         .byte_to_unicode = byte_to_unicode,
         .unicode_to_byte = unicode_to_byte,
         .bos_id = bos_id,
@@ -1897,6 +1901,29 @@ fn decoderHasByteFallback(dec: std.json.Value) bool {
         for (subs.array.items) |sub| if (decoderHasByteFallback(sub)) return true;
     }
     return false;
+}
+
+/// The id of the `SpecialToken` a `TemplateProcessing` (top-level or inside a `Sequence`) puts
+/// LAST in its `single` template, or null when nothing is appended.
+fn appendedSpecialId(pp: std.json.Value, specials: *const std.StringHashMap(u32)) ?u32 {
+    if (pp != .object) return null;
+    const t = pp.object.get("type") orelse return null;
+    if (t != .string) return null;
+    if (std.mem.eql(u8, t.string, "Sequence")) {
+        const subs = pp.object.get("processors") orelse return null;
+        if (subs != .array) return null;
+        for (subs.array.items) |sub| if (appendedSpecialId(sub, specials)) |id| return id;
+        return null;
+    }
+    if (!std.mem.eql(u8, t.string, "TemplateProcessing")) return null;
+    const single = pp.object.get("single") orelse return null;
+    if (single != .array or single.array.items.len == 0) return null;
+    const last = single.array.items[single.array.items.len - 1];
+    if (last != .object) return null;
+    const st = last.object.get("SpecialToken") orelse return null;
+    if (st != .object) return null;
+    const name = st.object.get("id") orelse return null;
+    return if (name == .string) specials.get(name.string) else null;
 }
 
 fn metaspaceFromPreTokenizer(pt: std.json.Value) MetaspaceOpts {
@@ -3004,6 +3031,29 @@ test "decoderHasByteFallback: Sequence containing ByteFallback, bare ByteFallbac
     const bl = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"ByteLevel\"}", .{});
     defer bl.deinit();
     try testing.expect(!decoderHasByteFallback(bl.value));
+}
+
+test "appendedSpecialId: the special a TemplateProcessing appends after a single sequence" {
+    const allocator = testing.allocator;
+    var specials = std.StringHashMap(u32).init(allocator);
+    defer specials.deinit();
+    try specials.put("<|endoftext|>", 151643);
+    try specials.put("[CLS]", 101);
+    // Qwen3-Embedding: ByteLevel + TemplateProcessing inside a Sequence.
+    const qwen = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"type":"Sequence","processors":[{"type":"ByteLevel"},{"type":"TemplateProcessing","single":[{"Sequence":{"id":"A","type_id":0}},{"SpecialToken":{"id":"<|endoftext|>","type_id":0}}]}]}
+    , .{});
+    defer qwen.deinit();
+    try testing.expectEqual(@as(?u32, 151643), appendedSpecialId(qwen.value, &specials));
+    // A template that only PREPENDS appends nothing.
+    const pre = try std.json.parseFromSlice(std.json.Value, allocator,
+        \\{"type":"TemplateProcessing","single":[{"SpecialToken":{"id":"[CLS]","type_id":0}},{"Sequence":{"id":"A","type_id":0}}]}
+    , .{});
+    defer pre.deinit();
+    try testing.expectEqual(@as(?u32, null), appendedSpecialId(pre.value, &specials));
+    const bl = try std.json.parseFromSlice(std.json.Value, allocator, "{\"type\":\"ByteLevel\"}", .{});
+    defer bl.deinit();
+    try testing.expectEqual(@as(?u32, null), appendedSpecialId(bl.value, &specials));
 }
 
 test "byte_fallback: real Laya tokenizer matches HF `tokenizers` on out-of-vocab scripts (LAYA_TEST_MODEL)" {

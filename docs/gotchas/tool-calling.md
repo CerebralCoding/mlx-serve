@@ -921,3 +921,10 @@ Defect: DeepSeek's `chat_template.jinja` failed on every request in jinja.cpp (`
 Cause: it builds tool schemas with `dict(schema.d, **{k: v})`; jinja.cpp has no `**` unpacking, and `dict(d, key=v)` and chained comparisons also fail there. It also drops a newline right after a block tag where jinja2 keeps it.
 Fix: V4.1 always renders OUR transcription of `encoding/encoding.py` (`src/fixtures/dsv41_chat_template.jinja`), newlines after tags spelled out; V4.1 also spaces its DSML tag names (`<｜DSML｜ invoke`), so the parser accepts both spellings.
 Guard: `tests/dsv41_template_ab.py` (byte-exact vs the encoder) dumps the cases `chat: the embedded V4.1 template renders through jinja.cpp byte-exact` replays; corpus family `dsv41-dsml`.
+
+## Qwen3.8 Flash Next wrote Claude's tool markup, and the agent's turn ended (#928)
+
+Defect: in long pi sessions the iQ-MLX-4.7bpw pack sometimes answered with a complete `<invoke name="bash"><parameter name="command">…</parameter></invoke>` block as plain content, `finish_reason: "stop"`, no `tool_calls`. The agent took it as a final answer and stopped.
+Cause: the checkpoint has seen Claude transcripts and samples their dialect in place of its own `<tool_call>`. No parser knew a bare `<invoke` (only ATEM's `<atem:invoke` and DSML's), and neither the stream gate nor the scrubber held or cut it.
+Fix: `BARE_INVOKE` is ATEM's grammar without the namespace, parsed when no other family matched, as `.inferred` so an undeclared name stays prose; `invokeOpenerHoldsForTools` holds `<function_calls>` and `<invoke …` with every growing prefix; `bareInvokeMarkupCut` cuts it only beside a `<parameter ` or `</invoke>`.
+Guard: corpus family `qwen4_exp` (call, undeclared name, prose), `parseToolCalls: Anthropic-style bare <invoke> markup…` and the derived-prefix gate test in `chat.zig`.

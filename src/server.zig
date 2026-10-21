@@ -959,15 +959,24 @@ fn queryModel(buf: []u8, raw_path: []const u8) ?[]const u8 {
 /// A non-empty query parameter, percent-decoded into `buf`.
 fn queryDecoded(buf: []u8, raw_path: []const u8, name: []const u8) ?[]const u8 {
     const q = raw_path[(std.mem.indexOfScalar(u8, raw_path, '?') orelse return null) + 1 ..];
-    var it = std.mem.splitScalar(u8, q, '&');
-    while (it.next()) |kv| {
+    return percentDecoded(buf, pairValue(q, '&', name) orelse return null);
+}
+
+/// The raw value of `name=` in a `sep`-separated list: a query string, a form body, a Cookie header.
+fn pairValue(list: []const u8, sep: u8, name: []const u8) ?[]const u8 {
+    var it = std.mem.splitScalar(u8, list, sep);
+    while (it.next()) |raw| {
+        const kv = std.mem.trim(u8, raw, " ");
         if (kv.len <= name.len + 1 or !std.mem.startsWith(u8, kv, name) or kv[name.len] != '=') continue;
-        const v = kv[name.len + 1 ..];
-        if (v.len > buf.len) return null;
-        @memcpy(buf[0..v.len], v);
-        return std.Uri.percentDecodeInPlace(buf[0..v.len]);
+        return kv[name.len + 1 ..];
     }
     return null;
+}
+
+fn percentDecoded(buf: []u8, v: []const u8) ?[]const u8 {
+    if (v.len > buf.len) return null;
+    @memcpy(buf[0..v.len], v);
+    return std.Uri.percentDecodeInPlace(buf[0..v.len]);
 }
 
 pub fn parseModelFromRequest(body: []const u8, content_type: []const u8) ?[]const u8 {
@@ -2557,15 +2566,27 @@ fn handleConnection(
     //    pass Bearer / x-api-key. null key ⇒ fully open. See `apiKeyAuthorized`.
     if (apiKeyGateApplies(g_api_key != null, g_api_key_strict, peerIsLoopback(stream)) and
         !std.mem.eql(u8, method, "OPTIONS") and
-        !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) and
-        !apiKeyAuthorized(request[0..header_end_pos], raw_path))
+        !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")))
     {
-        log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
-        if (wantsLoginPage(method, path, request[0..header_end_pos]))
-            try sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPage(request[0..header_end_pos], raw_path))
-        else
-            try sendUnauthorized(stream);
-        return;
+        const raw_headers = request[0..header_end_pos];
+        if (loginFormKey(method, path, request_content_type, request_body)) |k| {
+            if (encodedKeyMatches(k, g_api_key.?)) return sendKeyCookie(stream, k);
+            return sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPageHtml("<p class=err>That key was not accepted. Try again.</p>"));
+        }
+        if (!apiKeyAuthorized(raw_headers, raw_path)) {
+            log.debug("{s} {s} -> 401 (missing/invalid API key)\n", .{ method, path });
+            if (wantsLoginPage(method, path, raw_headers))
+                try sendResponse(stream, "401 Unauthorized", "text/html; charset=utf-8", loginPage(raw_headers, raw_path))
+            else
+                try sendUnauthorized(stream);
+            return;
+        }
+        // A page opened with `?api_key=` trades it for the cookie, so the key leaves the address bar.
+        if (wantsLoginPage(method, path, raw_headers)) {
+            if (queryParamValue(raw_path, "api_key") orelse queryParamValue(raw_path, "key")) |k| {
+                if (cookieSafe(k) and encodedKeyMatches(k, g_api_key.?)) return sendKeyCookie(stream, k);
+            }
+        }
     }
 
     // ── LAN sharing gate. With sharing ON and no --api-key set, a non-loopback
@@ -8841,6 +8862,21 @@ test "wrapEncoderIds: <bos> … <eos> wrapping for embedding models" {
     try testing.expectEqualSlices(u32, &.{ 2, 1 }, empty);
 }
 
+test "wrapEmbeddingIds: a last-token pooler appends its tokenizer's terminator, not config.json's eos (#909)" {
+    const a = testing.allocator;
+    // Qwen3-Embedding-4B: config eos <|im_end|> 151645, post-processor appends <|endoftext|> 151643.
+    var cfg = model_mod.ModelConfig{};
+    cfg.pooling_mode = .last_token;
+    cfg.addEosToken(151645);
+    const ids = try wrapEmbeddingIds(a, &cfg, 151643, try a.dupe(u32, &.{ 10, 11 }));
+    defer a.free(ids);
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 151643 }, ids);
+    // No post-processor terminator: config eos.
+    const fallback = try wrapEmbeddingIds(a, &cfg, null, try a.dupe(u32, &.{ 10, 11 }));
+    defer a.free(fallback);
+    try testing.expectEqualSlices(u32, &.{ 10, 11, 151645 }, fallback);
+}
+
 fn handleEmbeddings(
     allocator: std.mem.Allocator,
     stream: *Conn,
@@ -8938,7 +8974,7 @@ fn handleEmbeddings(
             return;
         }
         const raw_ids = try tok.encode(allocator, text);
-        const ids = try wrapEmbeddingIds(allocator, config, raw_ids);
+        const ids = try wrapEmbeddingIds(allocator, config, tok.appended_special, raw_ids);
         total_tokens += ids.len;
         try seqs.append(allocator, ids);
     }
@@ -8965,7 +9001,9 @@ fn handleEmbeddings(
 /// [CLS]/[SEP] come from WordPiece itself); a last-token pooler (Qwen3-Embedding) pools an APPENDED terminator,
 /// which its tokenizer's TemplateProcessing adds to every encode and the reference pools THAT position — without
 /// it we'd pool the final text token and quietly diverge from the model card. Frees `raw_ids`.
-fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, raw_ids: []u32) ![]u32 {
+/// `appended`: the tokenizer's post-processor terminator (`Tokenizer.appended_special`), which can differ from
+/// config.json's eos (Qwen3-Embedding-4B: `<|im_end|>` there, `<|endoftext|>` pooled).
+fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.ModelConfig, appended: ?u32, raw_ids: []u32) ![]u32 {
     const eos: ?u32 = if (config.num_eos_tokens > 0) config.eos_token_ids[0] else null;
     if (config.use_bidirectional_attention) {
         defer allocator.free(raw_ids);
@@ -8973,7 +9011,7 @@ fn wrapEmbeddingIds(allocator: std.mem.Allocator, config: *const model_mod.Model
     }
     if (config.effectivePooling() == .last_token) {
         defer allocator.free(raw_ids);
-        return wrapEncoderIds(allocator, raw_ids, null, eos);
+        return wrapEncoderIds(allocator, raw_ids, null, appended orelse eos);
     }
     return raw_ids;
 }
@@ -9125,7 +9163,7 @@ fn handleMessagesEmbedding(
     };
 
     // Wrapped, with the placeholders still one id each; the expansion below replaces them with the soft-token runs.
-    var ids = try wrapEmbeddingIds(allocator, config, try allocator.dupe(u32, prompt.ids));
+    var ids = try wrapEmbeddingIds(allocator, config, lm.tokenizer.?.appended_special, try allocator.dupe(u32, prompt.ids));
     defer allocator.free(ids);
     log.info("POST /v1/embeddings (messages: {d} media items)\n", .{prompt.items.len});
 
@@ -14020,12 +14058,48 @@ fn apiKeyAuthorized(raw_headers: []const u8, raw_path: []const u8) bool {
     if (findHeaderValueCI(raw_headers, "x-api-key")) |xk| {
         if (constTimeEql(xk, key)) return true;
     }
-    // Percent-decoded: the login form sends the key back URL-encoded.
+    if (findHeaderValueCI(raw_headers, "cookie")) |c| {
+        if (pairValue(c, ';', KEY_COOKIE)) |v| if (encodedKeyMatches(v, key)) return true;
+    }
     var qbuf: [512]u8 = undefined;
     inline for (.{ "api_key", "key" }) |name| {
         if (queryDecoded(&qbuf, raw_path, name)) |q| if (constTimeEql(q, key)) return true;
     }
     return false;
+}
+
+/// The console's login cookie: the key as the form percent-encoded it. HttpOnly, so page
+/// scripts never read it; the browser sends it on the page load and on the console's own calls.
+const KEY_COOKIE = "mlx_serve_key";
+
+fn encodedKeyMatches(encoded: []const u8, key: []const u8) bool {
+    var buf: [512]u8 = undefined;
+    return constTimeEql(percentDecoded(&buf, encoded) orelse return false, key);
+}
+
+/// Form encoding's own alphabet: nothing that could end a header or a cookie.
+fn cookieSafe(v: []const u8) bool {
+    if (v.len == 0 or v.len > 512) return false;
+    for (v) |c| if (!std.ascii.isAlphanumeric(c) and std.mem.indexOfScalar(u8, "%+-._*~", c) == null) return false;
+    return true;
+}
+
+/// The still-encoded `api_key` of the login form's POST, or null when this is not that POST.
+fn loginFormKey(method: []const u8, path: []const u8, content_type: []const u8, body: []const u8) ?[]const u8 {
+    if (!std.mem.eql(u8, method, "POST") or !std.mem.eql(u8, path, "/")) return null;
+    if (!std.mem.startsWith(u8, content_type, "application/x-www-form-urlencoded")) return null;
+    const v = pairValue(body, '&', "api_key") orelse return null;
+    return if (cookieSafe(v)) v else null;
+}
+
+/// Trade an accepted key for the cookie and send the browser to the bare page, so the key
+/// never sits in the URL (`./` keeps a reverse proxy's path prefix).
+fn sendKeyCookie(stream: *Conn, encoded: []const u8) !void {
+    logHttpResponse("303 See Other", "", "");
+    var hdr_buf: [1024]u8 = undefined;
+    const hdr = std.fmt.bufPrint(&hdr_buf, "HTTP/1.1 303 See Other\r\nLocation: ./\r\nSet-Cookie: " ++ KEY_COOKIE ++ "={s}; Path=/; HttpOnly; SameSite=Strict\r\nContent-Length: 0\r\nConnection: close\r\n\r\n", .{encoded}) catch return error.Overflow;
+    try stream.writeAll(hdr);
+    stream.length_framed = true;
 }
 
 /// A browser opening the page (`GET /` that accepts HTML) without the key gets
@@ -14037,10 +14111,12 @@ fn wantsLoginPage(method: []const u8, path: []const u8, raw_headers: []const u8)
 }
 
 /// The login form, saying so when a key was offered and refused. Script-free:
-/// a GET form back to the same path sends `?api_key=`, which the page then keeps.
+/// it POSTs the key back to `/` (`loginFormKey`), which answers with the cookie.
 fn loginPage(raw_headers: []const u8, raw_path: []const u8) []const u8 {
+    const cookie_key = if (findHeaderValueCI(raw_headers, "cookie")) |c| pairValue(c, ';', KEY_COOKIE) else null;
     const tried = findHeaderValueCI(raw_headers, "authorization") != null or
         findHeaderValueCI(raw_headers, "x-api-key") != null or
+        cookie_key != null or
         queryParamValue(raw_path, "api_key") != null or
         queryParamValue(raw_path, "key") != null;
     return if (tried) loginPageHtml("<p class=err>That key was not accepted. Try again.</p>") else loginPageHtml("");
@@ -14067,7 +14143,7 @@ fn loginPageHtml(comptime note: []const u8) []const u8 {
     \\<p>This MLX Serve server requires an API key. Enter the key the server was started with.</p>
     \\
 ++ note ++
-    \\<form method="get">
+    \\<form method="post">
     \\<input type="password" name="api_key" placeholder="API key" autocomplete="current-password" required autofocus>
     \\<button type="submit">Continue</button>
     \\</form>
@@ -14131,12 +14207,27 @@ test "a browser opening the page without the key gets a login form; API clients 
 
     const first = loginPage("", "/");
     try std.testing.expect(std.mem.indexOf(u8, first, "name=\"api_key\"") != null);
-    try std.testing.expect(std.mem.indexOf(u8, first, "method=\"get\"") != null);
+    // POST, so the key never lands in the URL, history or a Referer (#887).
+    try std.testing.expect(std.mem.indexOf(u8, first, "method=\"post\"") != null);
     try std.testing.expect(std.mem.indexOf(u8, first, "<script") == null);
     try std.testing.expect(std.mem.indexOf(u8, first, "not accepted") == null);
     // A key that was tried and failed says so, whichever way it came.
     try std.testing.expect(std.mem.indexOf(u8, loginPage("", "/?api_key=bad"), "not accepted") != null);
     try std.testing.expect(std.mem.indexOf(u8, loginPage("Authorization: Basic dTpi\r\n", "/"), "not accepted") != null);
+}
+
+test "the login form's key comes back as a cookie that authorizes the page and its API calls (#887)" {
+    const prev = g_api_key;
+    defer g_api_key = prev;
+    g_api_key = "a+b/c=";
+    // The form body is percent-encoded; its value is what the cookie stores.
+    try std.testing.expectEqualStrings("a%2Bb%2Fc%3D", loginFormKey("POST", "/", "application/x-www-form-urlencoded", "api_key=a%2Bb%2Fc%3D").?);
+    try std.testing.expect(loginFormKey("GET", "/", "application/x-www-form-urlencoded", "api_key=x") == null);
+    try std.testing.expect(loginFormKey("POST", "/v1/models", "application/x-www-form-urlencoded", "api_key=x") == null);
+    try std.testing.expect(loginFormKey("POST", "/", "application/json", "{}") == null);
+    try std.testing.expect(apiKeyAuthorized("Cookie: theme=dark; " ++ KEY_COOKIE ++ "=a%2Bb%2Fc%3D\r\n", "/v1/models"));
+    try std.testing.expect(!apiKeyAuthorized("Cookie: " ++ KEY_COOKIE ++ "=a%2Bb\r\n", "/v1/models"));
+    try std.testing.expect(!apiKeyAuthorized("Cookie: x" ++ KEY_COOKIE ++ "=a%2Bb%2Fc%3D\r\n", "/"));
 }
 
 test "resolveRequestModelId: an alias names its model; an id beats it; /api/ strips the tag" {
