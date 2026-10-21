@@ -19953,15 +19953,17 @@ pub const Transformer = struct {
         return (self.rht != null or self.ternary_2bit) and qmv2.deviceMmaVerifiesWide();
     }
 
-    /// Hadamard packs: the trunk's lm_head for a caller holding another
-    /// model's activation (an MTP head): cast to the trunk dtype, then the
-    /// rotated projection every trunk matmul takes.
-    pub fn hadamardLmHead(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
-        if (mlx.mlx_array_dtype(x) == self.actDtype()) return self.qmatmul(x, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+    /// The trunk's lm_head for a caller holding another model's activation
+    /// (an MTP head, a drafter): cast to the trunk's activation dtype, as the
+    /// trunk feeds its own head, then the trunk's own head dispatch
+    /// (`lmHeadProject`: Hadamard signs, row-scaled FP8, per-weight quant
+    /// params, dense bf16). A new head format needs no branch at the caller.
+    pub fn lmHeadForeign(self: *const Transformer, x: mlx.mlx_array) !mlx.mlx_array {
+        if (mlx.mlx_array_dtype(x) == self.actDtype()) return self.lmHeadProject(x);
         var xc = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(xc);
         try mlx.check(mlx.mlx_astype(&xc, x, self.actDtype(), self.s));
-        return self.qmatmul(xc, self.lm_head_w, self.lm_head_s, self.lm_head_b);
+        return self.lmHeadProject(xc);
     }
 
     /// Hadamard packs: gathered embedding rows back to the residual basis.

@@ -1092,7 +1092,7 @@ pub const DflashModel = struct {
             out = try target.lmHeadRowsForDraft(x, target.config.draftVocab());
         } else if (target.rht != null) {
             // bf16 drafter over an f16 pack: uncast, the head product runs in f32.
-            out = try target.hadamardLmHead(x);
+            out = try target.lmHeadForeign(x);
         } else {
             out = try target.lmHeadForDraft(x);
         }
