@@ -477,9 +477,10 @@ pub const Dsv41Model = struct {
         return if (self.cfg.image_token_id == 0) 0 else std.mem.count(u32, ids, &.{self.cfg.image_token_id});
     }
 
-    /// A token's Engram id; an image span's positions take no part in an n-gram.
-    fn compressedId(self: *const Dsv41Model, t: u32) u32 {
-        if (self.cfg.image_token_id != 0 and t == self.cfg.image_token_id) return engram.Hash.DEAD;
+    /// A token's Engram id; an image span's positions take no part in an n-gram. Without the request's image
+    /// rows the image token is text, as in the reference's text-only forward.
+    fn compressedId(self: *const Dsv41Model, t: u32, images: bool) u32 {
+        if (images and self.cfg.image_token_id != 0 and t == self.cfg.image_token_id) return engram.Hash.DEAD;
         return if (t < self.token_map.len) self.token_map[t] else 0;
     }
 
@@ -3647,11 +3648,11 @@ pub fn extend(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u
 pub const Ids = union(enum) { host: []const u32, gpu: A };
 
 /// The Engram row ids of `ids` (host hash) for the chunk, appended to the history; caller frees.
-fn engramIds(m: *const Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32) ![]u32 {
+fn engramIds(m: *const Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []const u32, images: bool) ![]u32 {
     const hs = &(m.hash orelse return &.{});
     const comp_ids = try gpa.alloc(u32, ids.len);
     defer gpa.free(comp_ids);
-    for (ids, comp_ids) |t, *o| o.* = m.compressedId(t);
+    for (ids, comp_ids) |t, *o| o.* = m.compressedId(t, images);
     const out = try gpa.alloc(u32, ids.len * hs.n_layers * hs.cols());
     errdefer gpa.free(out);
     hs.rows(st.hist.items, comp_ids, out);
@@ -3662,7 +3663,7 @@ fn engramIds(m: *const Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: []co
 /// The Engram rows of `ids` (the chunk at `st.n - ids.len`, whose hash is `rows`) as a prefetch: the one the
 /// previous chunk started for it, or a new one; either way the prompt's next chunk is read behind. `m.ahead`
 /// keeps a prefetch that still has a chunk to hand over; the caller finishes the other.
-fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []const *const engram.Table, ids: []const u32, rows: []const u32, span: usize) !*engram.Prefetch {
+fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []const *const engram.Table, ids: []const u32, rows: []const u32, span: usize, images: bool) !*engram.Prefetch {
     const hs = &m.hash.?;
     const p0 = st.n;
     const L = ids.len;
@@ -3680,7 +3681,7 @@ fn engramPrefetch(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, tables: []
     if (next.len > 0) {
         const comp = try gpa.alloc(u32, w);
         defer gpa.free(comp);
-        for (m.prompt[p1..][0..w], comp) |t, *o| o.* = m.compressedId(t);
+        for (m.prompt[p1..][0..w], comp) |t, *o| o.* = m.compressedId(t, images);
         hs.rows(st.hist.items, comp, next);
     }
     const ahead_spec: engram.Prefetch.Spec = .{ .at = p1, .len = w, .ids = next };
@@ -3719,7 +3720,8 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
 
     // Engram row ids for the whole chunk (host hash); the rows themselves are
     // read span by span at their layer.
-    var eng_ids: []u32 = if (ids == .host) try engramIds(m, gpa, st, ids.host) else &.{};
+    const images = vision != null;
+    var eng_ids: []u32 = if (ids == .host) try engramIds(m, gpa, st, ids.host, images) else &.{};
     defer gpa.free(eng_ids);
     const ncols: usize = if (m.hash) |*hs| hs.cols() else 0;
 
@@ -3754,10 +3756,9 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
             .gpu => |t| try sc.reshape(t, &.{1}),
         };
         var emb = try m.embed.rows(&sc, id_arr, m.act);
-        if (ids == .host and c.image_token_id != 0 and std.mem.indexOfScalar(u32, ids.host, c.image_token_id) != null) {
+        if (vision) |vr| if (ids == .host and c.image_token_id != 0 and std.mem.indexOfScalar(u32, ids.host, c.image_token_id) != null) {
             // The span's positions take the encoder's rows (delimiters included) in order, and are marked
             // for the VL routing bias and the Engram pass-through.
-            const vr = vision orelse return error.Dsv41VisionRowsMissing;
             const idx = try gpa.alloc(i32, L);
             defer gpa.free(idx);
             var k = vr.offset;
@@ -3771,7 +3772,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
             sp.img = img_mask;
             const picked = try sc.astype(try sc.take(try sc.reshape(vr.rows, &.{ -1, ci(d) }), try sc.ints(idx, &.{ci(L)}), 0), m.act);
             emb = try sc.where(try sc.expand(img_mask, -1), picked, emb);
-        }
+        };
         for (0..n_spans) |k| {
             const lo, const hi = sp.bounds(k);
             hold(&sp.xs[k], try sc.broadcast(try sc.expand(try sc.slice(emb, 0, lo, hi), 1), &.{ ci(hi - lo), ci(hc), ci(d) }));
@@ -3788,7 +3789,7 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
     for (eng_tables, m.engrams[0..eng_tables.len]) |*t, *e| t.* = &e.table;
     var prefetch: ?*engram.Prefetch = null;
     defer if (prefetch) |pf| if (m.ahead != pf) pf.finish();
-    if (eng_on and ids == .host) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span);
+    if (eng_on and ids == .host) prefetch = try engramPrefetch(m, gpa, st, eng_tables, ids.host, eng_ids, span, images);
     sp.prefetch = prefetch;
 
     var from: usize = 0;
@@ -3804,9 +3805,9 @@ fn extendIds(m: *Dsv41Model, gpa: std.mem.Allocator, st: *State, ids: Ids, want:
         defer _ = mlx.mlx_vector_array_free(vec);
         try mlx.check(mlx.mlx_async_eval(vec));
         const tok = try hostToken(ids.gpu);
-        eng_ids = try engramIds(m, gpa, st, &.{tok});
+        eng_ids = try engramIds(m, gpa, st, &.{tok}, images);
         sp.eng_ids = eng_ids;
-        prefetch = try engramPrefetch(m, gpa, st, eng_tables, &.{tok}, eng_ids, span);
+        prefetch = try engramPrefetch(m, gpa, st, eng_tables, &.{tok}, eng_ids, span, images);
         sp.prefetch = prefetch;
         from = first;
     }
@@ -4309,10 +4310,11 @@ pub fn resumePrompt(m: *Dsv41Model, prompt: []const u32, vision_rows: ?A) !usize
 }
 
 /// What a snapshot keys its images by: a hash of the first `n` soft-token rows (0 for none), `n` being the image
-/// positions inside the ids it covers, so the rows of an image after them do not enter.
+/// positions inside the ids it covers, so the rows of an image after them do not enter. Without rows the image
+/// token is text.
 pub fn visionKey(rows: ?A, n: usize) !u64 {
     if (n == 0) return 0;
-    const r = rows orelse return error.Dsv41VisionRowsMissing;
+    const r = rows orelse return 0;
     const d = mlx.getShape(r)[mlx.getShape(r).len - 1];
     if (n * @as(usize, @intCast(d)) > mlx.mlx_array_size(r)) return error.Dsv41VisionRowsShort;
     var f = mlx.mlx_array_new();
@@ -6376,7 +6378,40 @@ test "dsv41 resume: a prompt that extends the last one resumes its state and mat
     }
 }
 
-test "dsv41 CED split: the decoder starts at the last KV source when everything after it reads its ratio-1 rows" {
+test "dsv41 image token: without image rows it is text, as in the reference's text-only forward; resume included (DSV41_TINY)" {
+    const root = std.mem.span(std.c.getenv("DSV41_TINY") orelse return error.SkipZigTest);
+    const gpa = testing.allocator;
+    var t = try Tiny.open(root, "repack", "fixture.safetensors");
+    defer t.deinit();
+    const a = try t.ids();
+    defer gpa.free(a);
+    const m = t.m;
+    const b = try gpa.alloc(u32, a.len + 3);
+    defer gpa.free(b);
+    @memcpy(b[0..a.len], a);
+    @memcpy(b[a.len..], &[_]u32{ 5, 9, 2 });
+    // The logits with no image token, then with a prompt id named the image token.
+    var want: ?[]f32 = null;
+    defer if (want) |w| gpa.free(w);
+    for ([_]u32{ 0, a[1] }) |img| {
+        m.cfg.image_token_id = img;
+        if (m.snap) |*sn| sn.deinit(gpa);
+        m.snap = null;
+        try testing.expectEqual(@as(usize, 0), try resumePrompt(m, a, null));
+        _ = mlx.mlx_array_free(try prefill(m, gpa, a, null));
+        const n = try resumePrompt(m, b, null);
+        try testing.expectEqual(a.len - 1, n);
+        const l = try extendResumable(m, gpa, b[n..], null);
+        defer _ = mlx.mlx_array_free(l);
+        const got = try hostF32(l);
+        if (want) |w| {
+            defer gpa.free(got);
+            try testing.expectEqualSlices(f32, w, got);
+        } else want = got;
+    }
+}
+
+test "dsv41 CED split:the decoder starts at the last KV source when everything after it reads its ratio-1 rows" {
     var c: ModelConfig = .{ .model_type = "deepseek_v41", .num_hidden_layers = 40, .sliding_window = 128 };
     for (0..40) |l| c.dsv4_compress_ratios[l] = if (l < 2) 0 else if (l < 20) 2 else 1;
     c.dsv41_kv_sources = (1 << 2) | (1 << 8) | (1 << 14) | (1 << 20);

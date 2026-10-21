@@ -350,6 +350,17 @@ pub fn build(b: *std.Build) void {
         b.step("mlx-stream-conformance", "Run the mlx-stream plugin's conformance suite (CPU lane, no device)").dependOn(&conf.step);
     }
 
+    // `zig build check`: type-check the engine and its tests without generating
+    // code. The build system passes `-fno-emit-bin` when no step asks for the
+    // binary, so this is AstGen + Sema alone — the whole tree in seconds, where
+    // emitting it costs minutes (LLVM, single-threaded, ~4x more again at
+    // ReleaseFast). For the edit loop; a real build still gates every change.
+    {
+        const check = b.step("check", "Type-check everything, emitting no binary");
+        check.dependOn(&b.addExecutable(.{ .name = "mlx-serve", .root_module = mod }).step);
+        check.dependOn(&b.addTest(.{ .root_module = test_mod }).step);
+    }
+
     // ── vz-agent: the Agent Sandbox's guest-side binary.
     //
     // A standalone static aarch64-linux-musl ELF (~200 KB) that the app injects
