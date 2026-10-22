@@ -1,8 +1,6 @@
-//! Special-token-aware encoding and `fallbackFormatChat`, the generic prompt format.
+//! `fallbackFormatChat`, the generic prompt format.
 
 const std = @import("std");
-const tokenizer_mod = @import("../../sdk/tokenizer/tokenizer.zig");
-const Tokenizer = tokenizer_mod.Tokenizer;
 const testing = std.testing;
 
 const ToolCall = @import("types.zig").ToolCall;
@@ -12,24 +10,6 @@ const ChatConfig = @import("types.zig").ChatConfig;
 const hasExtraSystemMessages = @import("render.zig").hasExtraSystemMessages;
 const appendToolSystemPrompt = @import("tools/tool_choice.zig").appendToolSystemPrompt;
 
-/// Encode text that may contain special tokens (like <|im_start|>, <bos>, etc.).
-pub fn encodeWithSpecialTokens(
-    allocator: std.mem.Allocator,
-    tok: *const Tokenizer,
-    text: []const u8,
-    ids: *std.ArrayList(u32),
-) !void {
-    // `Tokenizer.encode` already splits around special tokens (earliest
-    // occurrence, longest at a position) with an O(text) first-byte-bucketed
-    // scan. This wrapper used to duplicate that split with its own
-    // O(specials x text) re-search per segment — ~11 s per 66 KB rendered
-    // prompt on gemma-3's 6415-special vocabulary (the tokenizer-side twin
-    // of the same class was fixed in tokenizer.zig; keep both on the shared
-    // fast path so they can't drift apart again).
-    const segment_ids = try tok.encode(allocator, text);
-    defer allocator.free(segment_ids);
-    try ids.appendSlice(allocator, segment_ids);
-}
 
 /// Fallback chat formatting for when Jinja rendering fails.
 pub fn fallbackFormatChat(

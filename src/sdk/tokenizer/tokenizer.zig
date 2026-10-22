@@ -71,6 +71,15 @@ pub fn reservedOutputIds(
     return out.toOwnedSlice(allocator);
 }
 
+fn isAllWhitespace(bytes: []const u8) bool {
+    const view = std.unicode.Utf8View.init(bytes) catch return false;
+    var it = view.iterator();
+    while (it.nextCodepoint()) |cp| {
+        if (!isWhitespaceCp(cp)) return false;
+    }
+    return true;
+}
+
 /// BPE tokenizer supporting both SentencePiece (Gemma) and byte-level (GPT-2/Qwen3) modes.
 /// `.llama3` is Muse-Glimmer's CASED Llama-3 variant; the plain Llama-3 regex is `.gpt2`.
 /// `.cased` is Flint's: the same word branches, a punctuation tail of newlines only (no `/`).
@@ -194,6 +203,11 @@ pub const Tokenizer = struct {
         pub fn deinit(self: *SpecialIndex, allocator: std.mem.Allocator) void {
             allocator.free(self.cands);
         }
+
+        /// The specials starting with byte `b`, longest first.
+        pub fn candidates(self: *const SpecialIndex, b: u8) []const Cand {
+            return self.cands[self.start[b]..self.start[@as(usize, b) + 1]];
+        }
     };
 
     pub const MergePair = struct {
@@ -275,6 +289,11 @@ pub const Tokenizer = struct {
 
     /// Encode text to token IDs (no BOS/EOS added, except WordPiece adds [CLS]/[SEP]).
     pub fn encode(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        return self.encodeFrom(allocator, text, true);
+    }
+
+    /// `encode`; `at_start` false for a piece in the middle of a text (SentencePiece adds no start prefix).
+    fn encodeFrom(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, at_start: bool) ![]u32 {
         // Split text around special tokens, encode segments with BPE, insert special token IDs
         var result = std.ArrayList(u32).empty;
         errdefer result.deinit(allocator);
@@ -289,42 +308,21 @@ pub const Tokenizer = struct {
             return result.toOwnedSlice(allocator);
         }
 
-        // Special-token splitter. The old scan re-searched the ENTIRE
-        // remaining text for EVERY special token per segment
-        // (O(specials × text) — ~12 s per 66 KB prompt on gemma-3's
-        // 6415-special vocabulary; gemma-4's 24 specials never noticed).
-        // Instead: specials bucketed by first byte (`SpecialIndex`, built
-        // once at load), then a single left-to-right pass tries only the
-        // candidates whose first byte matches. Semantics unchanged — earliest
-        // occurrence wins, longest special wins at the same position
-        // (buckets are sorted by descending length, so the first hit is the longest).
+        // Special-token splitter: specials bucketed by first byte (`SpecialIndex`, built once at load), one
+        // left-to-right pass; earliest occurrence wins, longest special at the same position.
         var local_index: ?SpecialIndex = null;
         defer if (local_index) |*x| x.deinit(allocator);
-        const index = if (self.special_index) |*x| x else blk: {
-            local_index = try SpecialIndex.init(allocator, &self.special_tokens);
-            break :blk &local_index.?;
-        };
-        const cands = index.cands;
-        const bucket_start = &index.start;
-        const Cand = SpecialIndex.Cand;
+        const index = try self.specialIndex(allocator, &local_index);
 
         var pos: usize = 0;
         var seg_start: usize = 0;
         while (pos < text.len) {
-            const b = text[pos];
-            var ci = bucket_start[b];
-            const cend = bucket_start[@as(usize, b) + 1];
-            var matched: ?Cand = null;
-            while (ci < cend) : (ci += 1) {
-                const c = cands[ci];
-                if (c.bytes.len <= text.len - pos and std.mem.startsWith(u8, text[pos..], c.bytes)) {
-                    matched = c;
-                    break;
-                }
-            }
+            const matched: ?SpecialIndex.Cand = for (index.candidates(text[pos])) |c| {
+                if (std.mem.startsWith(u8, text[pos..], c.bytes)) break c;
+            } else null;
             if (matched) |m| {
                 if (pos > seg_start) {
-                    const ids = try self.encodeSegment(allocator, text[seg_start..pos], seg_start == 0);
+                    const ids = try self.encodeSegment(allocator, text[seg_start..pos], at_start and seg_start == 0);
                     defer allocator.free(ids);
                     try result.appendSlice(allocator, ids);
                 }
@@ -336,12 +334,103 @@ pub const Tokenizer = struct {
             }
         }
         if (seg_start < text.len) {
-            const ids = try self.encodeSegment(allocator, text[seg_start..], seg_start == 0);
+            const ids = try self.encodeSegment(allocator, text[seg_start..], at_start and seg_start == 0);
             defer allocator.free(ids);
             try result.appendSlice(allocator, ids);
         }
 
         return result.toOwnedSlice(allocator);
+    }
+
+    fn specialIndex(self: *const Tokenizer, allocator: std.mem.Allocator, local: *?SpecialIndex) !*const SpecialIndex {
+        if (self.special_index) |*x| return x;
+        local.* = try SpecialIndex.init(allocator, &self.special_tokens);
+        return &local.*.?;
+    }
+
+    /// Plane-15 private-use code points `markControlTokens` wraps around a control token in message content:
+    /// transformers' `mark_control_tokens` markers (`apply_chat_template(sanitize_control_tokens=True)`).
+    pub const CONTROL_START = "\u{F0000}";
+    pub const CONTROL_END = "\u{F0001}";
+
+    /// A control token: flagged `special: true`, or an added token the chat template writes itself, unless it
+    /// is all whitespace (Gemma's "\n" runs are ordinary text). Transformers' `_get_control_tokens` default.
+    fn isControlToken(self: *const Tokenizer, token: SpecialIndex.Cand, template: []const u8) bool {
+        for (self.flagged_specials) |f| {
+            if (f.id == token.id) return true;
+        }
+        return !isAllWhitespace(token.bytes) and std.mem.indexOf(u8, template, token.bytes) != null;
+    }
+
+    /// `text` with every control token wrapped in CONTROL_START/CONTROL_END for `encodeMarked`, and the markers
+    /// already in it dropped so content cannot forge a pair; null when that changes nothing.
+    pub fn markControlTokens(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8, template: []const u8) !?[]u8 {
+        var local_index: ?SpecialIndex = null;
+        defer if (local_index) |*x| x.deinit(allocator);
+        const index = try self.specialIndex(allocator, &local_index);
+        var out = std.ArrayList(u8).empty;
+        errdefer out.deinit(allocator);
+        var copied: usize = 0;
+        var pos: usize = 0;
+        scan: while (pos < text.len) {
+            if (std.mem.startsWith(u8, text[pos..], CONTROL_START) or std.mem.startsWith(u8, text[pos..], CONTROL_END)) {
+                try out.appendSlice(allocator, text[copied..pos]);
+                pos += CONTROL_START.len;
+                copied = pos;
+                continue;
+            }
+            for (index.candidates(text[pos])) |c| {
+                if (!std.mem.startsWith(u8, text[pos..], c.bytes) or !self.isControlToken(c, template)) continue;
+                try out.appendSlice(allocator, text[copied..pos]);
+                try out.appendSlice(allocator, CONTROL_START);
+                try out.appendSlice(allocator, c.bytes);
+                try out.appendSlice(allocator, CONTROL_END);
+                pos += c.bytes.len;
+                copied = pos;
+                continue :scan;
+            }
+            pos += 1;
+        }
+        if (copied == 0) return null;
+        try out.appendSlice(allocator, text[copied..]);
+        return try out.toOwnedSlice(allocator);
+    }
+
+    /// `encode` of a chat rendered from `markControlTokens` content (transformers' `encode_marked_chat`): a
+    /// marked token encodes as plain text, piece by piece; a lone marker (a template string op split the pair)
+    /// is dropped but still ends the piece, so text on either side cannot join into a special.
+    pub fn encodeMarked(self: *const Tokenizer, allocator: std.mem.Allocator, text: []const u8) ![]u32 {
+        const prefix = CONTROL_START[0..3]; // both markers share it; the 4th byte tells them apart
+        var local_index: ?SpecialIndex = null;
+        defer if (local_index) |*x| x.deinit(allocator);
+        const index = try self.specialIndex(allocator, &local_index);
+        var out = std.ArrayList(u32).empty;
+        errdefer out.deinit(allocator);
+        var piece: usize = 0;
+        var pos: usize = 0;
+        while (std.mem.indexOfPos(u8, text, pos, prefix)) |at| {
+            pos = at + 1;
+            if (at + CONTROL_START.len > text.len or (text[at + 3] != CONTROL_START[3] and text[at + 3] != CONTROL_END[3])) continue;
+            try self.appendEncoded(allocator, &out, text[piece..at], piece == 0, false);
+            pos = at + CONTROL_START.len;
+            piece = pos;
+            if (text[at + 3] != CONTROL_START[3] or pos == text.len) continue;
+            const len = for (index.candidates(text[pos])) |c| {
+                if (std.mem.startsWith(u8, text[pos..], c.bytes) and std.mem.startsWith(u8, text[pos + c.bytes.len ..], CONTROL_END)) break c.bytes.len;
+            } else continue;
+            try self.appendEncoded(allocator, &out, text[pos..][0..len], false, true);
+            pos += len + CONTROL_END.len;
+            piece = pos;
+        }
+        try self.appendEncoded(allocator, &out, text[piece..], piece == 0, false);
+        return out.toOwnedSlice(allocator);
+    }
+
+    fn appendEncoded(self: *const Tokenizer, allocator: std.mem.Allocator, out: *std.ArrayList(u32), text: []const u8, at_start: bool, as_text: bool) !void {
+        if (text.len == 0) return;
+        const ids = if (as_text) try self.encodeSegment(allocator, text, at_start) else try self.encodeFrom(allocator, text, at_start);
+        defer allocator.free(ids);
+        try out.appendSlice(allocator, ids);
     }
 
     /// Encode a text segment (no special tokens) using the appropriate method.

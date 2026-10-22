@@ -13,7 +13,6 @@ const Message = @import("types.zig").Message;
 const ChatConfig = @import("types.zig").ChatConfig;
 const renderChatTemplate = @import("render.zig").renderChatTemplate;
 const templateRendersToolTurn = @import("render.zig").templateRendersToolTurn;
-const encodeWithSpecialTokens = @import("fallback.zig").encodeWithSpecialTokens;
 
 /// True when `<model_dir>/config.json` declares the given model_type. Any
 /// read/parse failure is false — this only ARMS a family fallback, never
@@ -178,7 +177,10 @@ pub fn formatChat(
     /// Extend the trailing assistant message instead of answering after it.
     continue_final: bool,
 ) ![]u32 {
-    const rendered = try renderChatTemplate(allocator, messages, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
+    var arena = std.heap.ArenaAllocator.init(allocator);
+    defer arena.deinit();
+    const marked = try markUntrustedContent(arena.allocator(), tok, messages, chat_config.chat_template);
+    const rendered = try renderChatTemplate(allocator, marked, chat_config, tools_json, tool_choice_instruction, enable_thinking, effort, continue_final);
     defer allocator.free(rendered);
 
     var ids = std.ArrayList(u32).empty;
@@ -190,10 +192,26 @@ pub fn formatChat(
         }
     }
 
-    try encodeWithSpecialTokens(allocator, tok, rendered, &ids);
+    const body = try tok.encodeMarked(allocator, rendered);
+    defer allocator.free(body);
+    try ids.appendSlice(allocator, body);
     log.debug("  prompt: {d} chars -> {d} tokens\n", .{ rendered.len, ids.items.len });
 
     return ids.toOwnedSlice(allocator);
+}
+
+/// A control token inside a user, system or tool turn is TEXT, never a turn marker (transformers'
+/// `sanitize_control_tokens`). Assistant turns are the model's own output, and the server writes their
+/// think tags itself (the Responses history), so they keep their specials.
+fn markUntrustedContent(arena: std.mem.Allocator, tok: *const Tokenizer, messages: []const Message, template: []const u8) ![]const Message {
+    var out: ?[]Message = null;
+    for (messages, 0..) |m, i| {
+        if (std.mem.eql(u8, m.role, "assistant")) continue;
+        const marked = try tok.markControlTokens(arena, m.content, template) orelse continue;
+        if (out == null) out = try arena.dupe(Message, messages);
+        out.?[i].content = marked;
+    }
+    return out orelse messages;
 }
 
 fn radioTestTokenizer(allocator: std.mem.Allocator) !Tokenizer {

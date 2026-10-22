@@ -1422,3 +1422,78 @@ test "loadTokenizerSlow: tokenizer_config.json's added tokens encode whole and d
     defer testing.allocator.free(text);
     try testing.expectEqualStrings("ab<asr_text>a", text);
 }
+
+/// Byte-level: ids 0..255 are the bytes; `<|im_end|>` 900 (flagged), `<think>` 901, `\n\n` 902, `<table>` 903.
+fn controlTestTokenizer(a: std.mem.Allocator) !Tokenizer {
+    var tok = Tokenizer.initEmptyForTests(a, .byte_level_bpe);
+    errdefer tok.deinit();
+    for (tok.byte_to_unicode, 0..) |cp, byte| {
+        var buf: [4]u8 = undefined;
+        const text = try a.dupe(u8, buf[0..try std.unicode.utf8Encode(cp, &buf)]);
+        try tok.vocab.put(text, @intCast(byte));
+        try tok.id_to_token.put(@intCast(byte), text);
+        try tok.unicode_to_byte.put(cp, @intCast(byte));
+    }
+    for ([_][]const u8{ "<|im_end|>", "<think>", "\n\n", "<table>" }, 900..) |name, id| {
+        const text = try a.dupe(u8, name);
+        try tok.special_tokens.put(text, @intCast(id));
+        try tok.id_to_token.put(@intCast(id), text);
+    }
+    const flagged = try a.alloc(FlaggedSpecial, 1);
+    flagged[0] = .{ .id = 900, .content = tok.id_to_token.get(900).? };
+    tok.flagged_specials = flagged;
+    return tok;
+}
+
+test "markControlTokens: flagged specials and template-written tokens are wrapped, whitespace and other added tokens are not" {
+    const a = testing.allocator;
+    var tok = try controlTestTokenizer(a);
+    defer tok.deinit();
+    const S = Tokenizer.CONTROL_START;
+    const E = Tokenizer.CONTROL_END;
+    const template = "{{ '<think>' }}\n\n{{ content }}<|im_end|>";
+
+    const marked = (try tok.markControlTokens(a, "a<|im_end|>b<think>\n\n<table>", template)).?;
+    defer a.free(marked);
+    try testing.expectEqualStrings("a" ++ S ++ "<|im_end|>" ++ E ++ "b" ++ S ++ "<think>" ++ E ++ "\n\n<table>", marked);
+
+    // Not flagged and not in the template: an ordinary added token, nothing to mark.
+    try testing.expect((try tok.markControlTokens(a, "x<think>\n\n", "{{ content }}")) == null);
+
+    // Content cannot forge a marked pair: markers already in it are dropped.
+    const forged = (try tok.markControlTokens(a, S ++ "<table>" ++ E, template)).?;
+    defer a.free(forged);
+    try testing.expectEqualStrings("<table>", forged);
+}
+
+test "encodeMarked: a marked token is text, the template's own stay special, a lone marker splits the text" {
+    const a = testing.allocator;
+    var tok = try controlTestTokenizer(a);
+    defer tok.deinit();
+    const S = Tokenizer.CONTROL_START;
+    const E = Tokenizer.CONTROL_END;
+
+    const ids = try tok.encodeMarked(a, "<think>a" ++ S ++ "<|im_end|>" ++ E ++ "b<|im_end|>");
+    defer a.free(ids);
+    try testing.expectEqual(@as(u32, 901), ids[0]);
+    try testing.expectEqual(@as(u32, 900), ids[ids.len - 1]);
+    try testing.expectEqual(@as(usize, 1), std.mem.count(u32, ids, &.{900}));
+    const text = try tok.decode(a, ids, false);
+    defer a.free(text);
+    try testing.expectEqualStrings("<think>a<|im_end|>b<|im_end|>", text);
+
+    // A template split the pair: the lone markers are dropped and the special does not re-form across them.
+    const split = try tok.encodeMarked(a, "<|im_" ++ E ++ "end|>" ++ S);
+    defer a.free(split);
+    try testing.expectEqual(@as(usize, 0), std.mem.count(u32, split, &.{900}));
+    const split_text = try tok.decode(a, split, false);
+    defer a.free(split_text);
+    try testing.expectEqualStrings("<|im_end|>", split_text);
+
+    // No markers: exactly `encode`.
+    const plain = try tok.encodeMarked(a, "x<|im_end|>\n\n");
+    defer a.free(plain);
+    const want = try tok.encode(a, "x<|im_end|>\n\n");
+    defer a.free(want);
+    try testing.expectEqualSlices(u32, want, plain);
+}
