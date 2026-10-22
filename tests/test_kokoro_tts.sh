@@ -4,7 +4,7 @@
 #   KOKORO_MODEL=<dir> ./tests/test_kokoro_tts.sh [port]
 #
 # SKIPs without a converted checkpoint (tests/convert_kokoro_weights.py).
-# Hermetic counterparts: the ~30 unit tests in src/kokoro.zig + src/kokoro_g2p.zig,
+# Hermetic counterparts: the ~30 unit tests in src/plugins/kokoro/kokoro.zig + src/plugins/kokoro/g2p.zig,
 # and the KOKORO_FIXTURES parity oracles (durations exact, f0/n/asr cos 1.000000,
 # audio cos 0.9968 vs a reference self-similarity floor of 0.9941-0.9960).
 set -uo pipefail

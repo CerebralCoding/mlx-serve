@@ -20,7 +20,7 @@
 #                     under Sandisk; pass another to exercise lfm2/qwen3_next/etc.
 #   PORT              Server port. Default 19077.
 #
-# Reverting Phase 1 (in src/prefix_cache.zig or src/generate.zig) must
+# Reverting Phase 1 (in src/engines/mlx/cache/prefix_cache.zig or src/engines/mlx/generate.zig) must
 # turn this test red.
 
 set -uo pipefail

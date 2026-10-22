@@ -1,5 +1,5 @@
 #!/bin/bash
-# DeepSeek-V4.1-Flash (deepseek_v41: src/deepseek_v41.zig, the EXL3 repack on
+# DeepSeek-V4.1-Flash (deepseek_v41: src/plugins/deepseek_v41/deepseek_v41.zig, the EXL3 repack on
 # mlx-stream) live end-to-end, env-gated on a pack (loading takes minutes and
 # wants the machine otherwise idle; DSV41_TEST_FLAGS adds server flags, e.g.
 # --no-mtp to disable drafting, without unloading mlx-stream's stages):

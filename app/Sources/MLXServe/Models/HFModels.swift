@@ -77,7 +77,7 @@ let supportedModelTypes: Set<String> = [
     // "deepseek_v4" = DeepSeek-V4-Flash via the ds4 engine. Both are served, so
     // neither should be flagged "unsupported architecture" in the model browser.
     "gguf", "deepseek_v4",
-    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/deepseek_v41.zig), the EXL3 repack on mlx-stream
+    "deepseek_v41", // DeepSeek-V4.1-Flash: MLX packs (src/plugins/deepseek_v41/deepseek_v41.zig), the EXL3 repack on mlx-stream
     "gpt_oss",
 ]
 
@@ -100,7 +100,7 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // architecture" are different decisions, and it was getting both. Exclusion
 // from pickers is `isChatPickable`'s job, which reads this same list. #228.
 //
-// `MediaModalityParityTests` reads `media_model_types` out of src/gen.zig and
+// `MediaModalityParityTests` reads `media_model_types` out of src/host/media_jobs/gen.zig and
 // asserts this agrees. Zig already pinned its own two copies against each
 // other; nothing pinned Swift, which is why this drifted unnoticed.
 private let mediaModelTypeExactValues: Set<String> = [

@@ -32,7 +32,7 @@ enum MtpAcceptanceChoice: String, CaseIterable {
 }
 
 /// One model's entry in `~/.mlx-serve/model-settings.json` — the file the
-/// SERVER reads (`src/model_settings.zig`) at every load of that model, so the
+/// SERVER reads (`src/host/registry/model_settings.zig`) at every load of that model, so the
 /// keys are its keys. nil = the process default. Unknown keys are kept in
 /// `extra` so a future server field survives an app-side edit.
 struct ModelOverride: Equatable {

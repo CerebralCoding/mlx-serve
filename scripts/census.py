@@ -102,8 +102,8 @@ def kernel_lines(lines, is_test):
 
 
 def model_config():
-    """(field names, predicate names) of `ModelConfig` in src/model.zig. A predicate is a method that mutates nothing."""
-    lines = open("src/model.zig").read().split("\n")
+    """(field names, predicate names) of `ModelConfig` in src/engines/mlx/model.zig. A predicate is a method that mutates nothing."""
+    lines = open("src/engines/mlx/model.zig").read().split("\n")
     s = lines.index("pub const ModelConfig = struct {")
     e = next(i for i in range(s, len(lines)) if lines[i] == "};")
     body = lines[s + 1:e]
@@ -127,7 +127,7 @@ def identity(title, prod, every):
     for p in sorted(every, key=lambda k: (-prod[k], -every[k], k)):
         if every[p]:
             print(f"{prod[p]:8d} {every[p]:8d}  {p}")
-    for label, keep in (("total", lambda k: True), ("outside src/model.zig", lambda k: k != "src/model.zig")):
+    for label, keep in (("total", lambda k: True), ("outside src/engines/mlx/model.zig", lambda k: k != "src/engines/mlx/model.zig")):
         a = sum(v for k, v in prod.items() if keep(k)); b = sum(v for k, v in every.items() if keep(k))
         fa = sum(1 for k, v in prod.items() if keep(k) and v); fb = sum(1 for k, v in every.items() if keep(k) and v)
         print(f"{a:8d} {b:8d}  {label} ({fa} / {fb} files)")

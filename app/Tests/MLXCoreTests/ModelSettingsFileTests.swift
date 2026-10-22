@@ -1,7 +1,7 @@
 import XCTest
 @testable import MLXCore
 
-/// `~/.mlx-serve/model-settings.json` is the SERVER's file (`src/model_settings.zig`);
+/// `~/.mlx-serve/model-settings.json` is the SERVER's file (`src/host/registry/model_settings.zig`);
 /// the app only edits it, so it must write exactly the server's keys and never
 /// drop a key it does not know.
 final class ModelSettingsFileTests: XCTestCase {

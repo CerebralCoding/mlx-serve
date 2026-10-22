@@ -123,7 +123,7 @@ pub fn build(b: *std.Build) void {
     build_options.addOption(bool, "ios", false);
     // True when the embedded engines (ds4, libllama) are actually linked:
     // macOS (Metal) and Linux (CUDA) exe = yes; the iOS static lib = no, it
-    // gets compile-time stubs (src/arch/*_stub.zig, src/ds4_ffi_stub.zig).
+    // gets compile-time stubs (src/arch/*_stub.zig, src/engines/ds4/ffi_stub.zig).
     // The stub selection reads this option, NOT `ios` — `ios` keeps its own
     // meaning (low-mem policy, sandboxing assumptions).
     build_options.addOption(bool, "ds4_engine", true);
@@ -138,7 +138,7 @@ pub fn build(b: *std.Build) void {
 
     const mlx_stamp = mlxStampModule(b, "lib/mlx/.version");
     // ds4 Metal kernel sources embedded via @embedFile and exposed as a
-    // named module so src/arch/ds4.zig can import them with `@import("ds4_metal_sources")`
+    // named module so src/engines/ds4/bridge.zig can import them with `@import("ds4_metal_sources")`
     // without traversing the project root.
     const ds4_metal_sources = b.createModule(.{
         .root_source_file = b.path("lib/ds4_metal_sources.zig"),
@@ -200,7 +200,7 @@ pub fn build(b: *std.Build) void {
     mod.addIncludePath(b.path("lib/fqms"));
 
     // ds4 inference engine for DSV4-Flash (Metal backend, macOS only). See
-    // `lib/ds4/` submodule pinned at 9139e2a and `src/arch/ds4.zig`. Kernel
+    // `lib/ds4/` submodule pinned at 9139e2a and `src/engines/ds4/bridge.zig`. Kernel
     // sources are embedded via `lib/ds4_metal_sources.zig` and extracted at
     // runtime to ~/.mlx-serve/ds4-metal/<hash>/.
     addDs4Sources(b, mod);
@@ -209,12 +209,12 @@ pub fn build(b: *std.Build) void {
     // ANE prefill-MLP offload (perf-plan-aug-17 P5): objc bridge to the
     // private AppleNeuralEngine framework (dlopen'd at runtime — the probe
     // returns unavailable on machines/OSes without it) + the per-layer MLP
-    // MIL program builder. See lib/ane/ + src/ane.zig; provenance in NOTICE.
+    // MIL program builder. See lib/ane/ + src/sdk/ane/offload.zig; provenance in NOTICE.
     addAneSources(b, mod);
 
     // llama.cpp libllama for generic GGUF models (Metal backend, macOS only).
     // Staged by `scripts/fetch-llama.sh` into lib/llama/ (a single self-contained
-    // dylib + headers extracted from the pinned XCFramework). See src/arch/llama.zig.
+    // dylib + headers extracted from the pinned XCFramework). See src/engines/llama/bridge.zig.
     addLlamaLib(b, mod);
     addGgufModule(b, mod, target, optimize);
     addExl3Module(b, mod, target, optimize);
@@ -365,7 +365,7 @@ pub fn build(b: *std.Build) void {
     //
     // A standalone static aarch64-linux-musl ELF (~200 KB) that the app injects
     // into the guest rootfs before boot, exactly like `/.vz-init`. It serves the
-    // vsock exec protocol (`src/vz_agent.zig`), replacing the hvc1 console shell.
+    // vsock exec protocol (`src/host/sandbox/vz_agent.zig`), replacing the hvc1 console shell.
     //
     // It is NOT imported by main.zig — it links nothing but libc and never runs
     // on macOS. Its tests do, though: `serveConnection` is OS-agnostic, so the
@@ -395,7 +395,7 @@ pub fn build(b: *std.Build) void {
 /// before this builds. UBSan is off for stb (its bit shifts trip the sanitizer).
 fn addPreviewTest(b: *std.Build, target: std.Build.ResolvedTarget) void {
     const mod = b.createModule(.{
-        .root_source_file = b.path("src/preview.zig"),
+        .root_source_file = b.path("src/host/media_jobs/preview.zig"),
         .target = target,
         .optimize = .ReleaseFast,
         .link_libc = true,
@@ -539,7 +539,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         // System libwebp for the vision pipeline (pkg-config resolves -lwebp).
         mod.linkSystemLibrary("webp", .{});
 
-        // Bonjour/mDNS peer discovery (src/lan.zig) via Avahi's dns_sd compat lib
+        // Bonjour/mDNS peer discovery (src/host/lan/lan.zig) via Avahi's dns_sd compat lib
         // (Arch: avahi ships /usr/lib/libdns_sd.so; Debian: libavahi-compat-libdnssd-dev).
         mod.linkSystemLibrary("dns_sd", .{ .use_pkg_config = .no });
         slot.* = mod;
@@ -628,7 +628,7 @@ fn addVzAgent(
     const guest = b.addExecutable(.{
         .name = "vz-agent",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/vz_agent.zig"),
+            .root_source_file = b.path("src/host/sandbox/vz_agent.zig"),
             .target = guest_target,
             // Size, not speed: it shuttles bytes between a socket and a pipe.
             .optimize = .ReleaseSmall,
@@ -644,7 +644,7 @@ fn addVzAgent(
     // Host-side tests of the same source.
     const tests = b.addTest(.{
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/vz_agent.zig"),
+            .root_source_file = b.path("src/host/sandbox/vz_agent.zig"),
             .target = host_target,
             .optimize = host_optimize,
             .link_libc = true,
@@ -659,7 +659,7 @@ fn addVzAgent(
     const host_agent = b.addExecutable(.{
         .name = "vz-agent-host",
         .root_module = b.createModule(.{
-            .root_source_file = b.path("src/vz_agent.zig"),
+            .root_source_file = b.path("src/host/sandbox/vz_agent.zig"),
             .target = host_target,
             .optimize = host_optimize,
             .link_libc = true,
@@ -743,7 +743,7 @@ fn addIosLib(b: *std.Build, version: []const u8, ios_include: []const u8, slice:
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_impl.c"), .flags = &.{"-O2"} });
     mod.addCSourceFile(.{ .file = b.path("lib/stb_image_write_impl.c"), .flags = stb_write_flags });
     // xatlas UV unwrapping (C++), used by the Hunyuan3D texture paint stage via
-    // src/uvwrap.zig extern decls — compiled into the lib like the macOS exe.
+    // src/sdk/mesh/uvwrap.zig extern decls — compiled into the lib like the macOS exe.
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addCSourceFile(.{ .file = b.path("lib/xatlas/xatlas_shim.cpp"), .flags = &.{ "-std=c++17", "-O2", "-DNDEBUG" } });
     mod.addIncludePath(b.path("lib/xatlas"));
@@ -908,7 +908,7 @@ fn ggufRoot(b: *std.Build) std.Build.LazyPath {
 }
 
 /// mlx-stream (its own repo, `-Dmlx-stream-dir=/abs/path`): DeepSeek-V4.1's EXL3
-/// streaming repack on the plugin's own arch and kernels (`src/arch/mlx_stream.zig`).
+/// streaming repack on the plugin's own arch and kernels (`src/sdk/weights/streamed/glue.zig`).
 /// Its contract types are its own `sdk` module; both reach the host through `mlx_host`.
 fn addMlxStreamModule(b: *std.Build, host: *std.Build.Module, target: std.Build.ResolvedTarget, optimize: std.builtin.OptimizeMode) void {
     host.addImport("mlx_stream", mlxStreamPkg(b, host, mlxStreamDir(b), "src/root.zig", target, optimize, false));
@@ -1060,7 +1060,7 @@ fn addLlamaLib(b: *std.Build, module: *std.Build.Module) void {
         module.addRPath(.{ .cwd_relative = "@loader_path/../../../lib/llama/lib" });
     }
 
-    // Our clean C shim over llama.h (src/llama_ffi.zig mirrors lib/llama_shim/llama_shim.h).
+    // Our clean C shim over llama.h (src/engines/llama/ffi.zig mirrors lib/llama_shim/llama_shim.h).
     // C++ for llama.cpp's C++-linked NextN staging calls (MTP).
     module.addIncludePath(b.path("lib/llama_shim"));
     module.addCSourceFile(.{

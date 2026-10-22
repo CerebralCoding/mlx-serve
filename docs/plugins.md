@@ -24,7 +24,7 @@ every plugin. A plugin reads only the declarations those roots re-export for it:
 
 | Declaration | What | Used by |
 |---|---|---|
-| `mlx_host.mlx` | the mlx-c FFI (`src/mlx.zig`), with our error latch | mlx-serve-gguf, sushi, mlx-stream |
+| `mlx_host.mlx` | the mlx-c FFI (`src/mlx/ffi.zig`), with our error latch | mlx-serve-gguf, sushi, mlx-stream |
 | `mlx_host.log` | leveled logging and the log file | sushi, mlx-stream |
 | `mlx_host.io_util` | timers and the I/O helpers | sushi |
 | `mlx_host.mtp_acceptance` | the draft acceptance modes the host serves | mlx-stream |
@@ -36,7 +36,7 @@ every plugin. A plugin reads only the declarations those roots re-export for it:
 - The three roots carry the same list, and so does `src/plugin_host.zig`, the root a plugin's own test build imports
   as `mlx_host`. A missing declaration is a compile error in the graph that lacks it.
 - **MLX through mlx-c, with one exception.** A plugin calls MLX through `mlx_host.mlx` (missing mlx-c declarations
-  are added to `src/mlx.zig`). A plugin that needs an MLX internal (a GPU wait on an event, an allocation without a
+  are added to `src/mlx/ffi.zig`). A plugin that needs an MLX internal (a GPU wait on an event, an allocation without a
   fill) keeps its own C++ shim, compiled by our build against the staged MLX headers (mlx-stream's `csrc/`). An MLX
   bump can break such a shim; the plugin's repository fixes it and the pin moves.
 
@@ -50,7 +50,7 @@ The deeper the seam, the less of our stack the model gets for free. Use the shal
 | Weight encoding | config parse and load checks, the matmul over its weights | the arch and everything above it | EXL3 (from sushi) |
 | Arch | a model's forward, its kernels and decode state, its weight loading and memory bill | HTTP, the template, tool calls, sampling, stops, scheduling, admission | mlx-stream (DeepSeek-V4.1's EXL3 repack, MiMo-V2.6-Flash, GLM-5.3) |
 
-Not a seam: **opaque engines.** ds4 and llama.cpp keep their bridges (`src/arch/ds4.zig`, `src/arch/llama.zig`).
+Not a seam: **opaque engines.** ds4 and llama.cpp keep their bridges (`src/engines/ds4/bridge.zig`, `src/engines/llama/bridge.zig`).
 
 A seam is added with its first consumer and generalized with its second.
 
@@ -82,7 +82,7 @@ A seam is added with its first consumer and generalized with its second.
    `ForwardCtx`) into the plugin's plain arguments: slices, integers, `mlx_array`.
 4. **Platforms.** Pure Zig over `mlx_host.mlx` compiles on every graph. macOS-only code (Objective-C, Metal events)
    gets a stub glue file chosen by a build option (`build_options.mlx_stream`, as `macos_engines` picks
-   `src/arch/ds4_stub.zig`). The stub refuses the model by name.
+   `src/engines/ds4/stub.zig`). The stub refuses the model by name.
 5. **Tests.** The plugin's own suite runs in its own repository (see below). Its root also runs as a test artifact in
    our `zig build test` (one `b.addTest` per plugin), so a host change that breaks it fails here. The glue's tests live
    in the glue file.
@@ -92,7 +92,7 @@ A seam is added with its first consumer and generalized with its second.
 ## Developing a plugin on its own
 
 The plugin's `build.zig` builds against an mlx-serve checkout (`-Dmlx-serve=../mlx-serve`). A three-line
-`standalone/mlx_host.zig` re-exports the host's `src/mlx.zig` (plus `log.zig` and `io_util.zig` if it uses them).
+`standalone/mlx_host.zig` re-exports the host's `src/mlx/ffi.zig` (plus `log.zig` and `io_util.zig` if it uses them).
 mlx-serve-gguf works exactly this way:
 
 - `zig build test-core`: the format reader and reference dequant, with no MLX and no GPU.
@@ -108,7 +108,7 @@ its `mlx-stream-conformance` step).
 
 - **Module.** `src/root.zig` exports the reader (`gguf`), the metadata-to-HF translation (`meta`), `weights` and
   `kernels`. It reads `mlx_host.mlx` only.
-- **Glue.** `src/arch/mlx_gguf.zig` holds four entry points:
+- **Glue.** `src/sdk/quant/gguf/claim.zig` holds four entry points:
   - `servablePath` takes a `.gguf` only when its arch, tokenizer, tensor types and tensor names are all known.
     Anything else stays with llama.cpp or ds4.
   - `sidecar(which)` returns the `config.json` / `tokenizer.json` / `tokenizer_config.json` /
@@ -145,7 +145,7 @@ prepared MXFP4 pack (the release's experts in `experts.bin`, its config declarin
 GLM-5.3 (`glm_moe_dsa`, the trunk beside an `experts.bin` bank). It owns the model: the arch, its Metal
 kernels, its EXL3, the SSD expert streamer (lookahead reads, event gates), DSpark with typical acceptance, the prefix
 resume of one conversation, its weight loading past the page cache and its memory bill. Its `sdk` module (`sdk/`)
-holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepseek_v41.zig`).
+holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/plugins/deepseek_v41/deepseek_v41.zig`).
 
 - **Dispatch.** `parseConfig` marks a `deepseek_v41` directory with `experts.bin` (`ModelConfig.dsv41_stream`), a
   `mimo_v2` config that declares `expert_streaming` (`ModelConfig.mimo_stream`) and a `glm_moe_dsa` directory with
@@ -153,7 +153,7 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
   in-tree arch serves it); `ModelConfig.mlxStream()` is any of them, and `loadModelWeights` loads nothing for it. The
   glue holds one arch per model (`plugin.arch` for V4.1, `plugin.mimo.arch` for MiMo, `plugin.glm.arch` for GLM-5.3)
   and leaves out at comptime the entry points an arch does not declare.
-- **Glue** (`src/arch/mlx_stream.zig`):
+- **Glue** (`src/sdk/weights/streamed/glue.zig`):
   - settings (GLM-5.3): after the parse, the arch's `applySettings` receives the model's `model-settings.json` entry
     (`.null` without one), then the manual context (`ctx_size`, else `--ctx-size`), which wins;
   - `loadBytes`: the preflight's bill, from the GPU ceiling, the wired margin and the memory in use before the load
@@ -176,7 +176,7 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/deepse
 - **Build.** The `lib/mlx-stream` submodule, or `-Dmlx-stream-dir=/abs/path`: two modules (`sdk`, `mlx_stream`), its
   C sources against the staged MLX, its suite in `zig build test`, its conformance suite (a CPU-lane binary of its
   own, which checks the plugin against the linked MLX) as `zig build mlx-stream-conformance`. macOS only; the
-  Linux and iOS graphs build `src/arch/mlx_stream_stub.zig`, which refuses these packs by name.
+  Linux and iOS graphs build `src/sdk/weights/streamed/stub.zig`, which refuses these packs by name.
 
 ## Rules for plugin code
 

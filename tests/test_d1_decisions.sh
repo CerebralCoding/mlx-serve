@@ -8,7 +8,7 @@
 # an LFM2-VL config) and the on-demand load are exercised, not just the forward. Answers are compared against the
 # card's own package on CPU in float32 (tests/fixtures/d1/cases.json, from tests/dump_d1_fixtures.py): bf16 Metal
 # agrees to 0.02 on probabilities, and input token counts must match exactly.
-# Hermetic counterparts: the unit tests in src/d1.zig and the D1 discovery test in src/model_discovery.zig.
+# Hermetic counterparts: the unit tests in src/plugins/d1/d1.zig and the D1 discovery test in src/host/registry/discovery.zig.
 set -uo pipefail
 
 PORT="${1:-11445}"

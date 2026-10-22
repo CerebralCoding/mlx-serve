@@ -2374,7 +2374,7 @@ private struct SpecDecodeSectionContent: View {
     var body: some View {
         let opts = $appState.serverOptions
         // Drafter and PLD are mutually exclusive at the request level
-        // (`drafter > PLD > regular` in src/server.zig). When drafter is on
+        // (`drafter > PLD > regular` in src/host/http/server.zig). When drafter is on
         // we lock the PLD toggles down so users can't accidentally enable a
         // setting that would never apply.
         let drafterActive = server.chatModelInfo?.drafterLoaded ?? false

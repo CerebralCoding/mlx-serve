@@ -1,5 +1,5 @@
 #!/bin/bash
-# SSD prefix-cache persistence (`--prefix-cache-disk`, src/kv_disk_cache.zig).
+# SSD prefix-cache persistence (`--prefix-cache-disk`, src/engines/mlx/cache/ssd/disk_tier.zig).
 #
 # End-to-end restart round-trip:
 #   1. Boot with an isolated HOME, fire a long-prompt request (cold prefill),

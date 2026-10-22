@@ -577,7 +577,7 @@ final class HFModelQuantGateTests: XCTestCase {
         // is served by the canvas-denoising loop since v26.6.10 — the browser
         // must not flag mlx-community/diffusiongemma-* as unsupported.
         XCTAssertTrue(supportedModelTypes.contains("diffusion_gemma"),
-                      "diffusion_gemma checkpoints are served (src/diffusion.zig) and must not be flagged unsupported")
+                      "diffusion_gemma checkpoints are served (src/plugins/diffusion_gemma/runner.zig) and must not be flagged unsupported")
     }
 
     func testNvfp4_servedSinceV26_6_10_notFlagged() {
@@ -1032,7 +1032,7 @@ final class HFModelIsDrafterTests: XCTestCase {
 
 // MARK: - Zig <-> Swift supported model_type sync
 
-/// The server's `supported_model_types` (src/model_discovery.zig) and the
+/// The server's `supported_model_types` (src/host/registry/discovery.zig) and the
 /// app's `supportedModelTypes` are the same list spelled twice. Every new
 /// arch has been added to one and forgotten on the other at least once, so
 /// this reads the Zig list and asserts the app knows every entry.
@@ -1041,7 +1041,7 @@ final class SupportedModelTypeSyncTests: XCTestCase {
         let zig = URL(fileURLWithPath: #filePath)
             .deletingLastPathComponent().deletingLastPathComponent()
             .deletingLastPathComponent().deletingLastPathComponent()
-            .appendingPathComponent("src/model_discovery.zig")
+            .appendingPathComponent("src/host/registry/discovery.zig")
         let src = try String(contentsOf: zig, encoding: .utf8)
         guard let start = src.range(of: "const supported_model_types = [_][]const u8{"),
               let end = src.range(of: "};", range: start.upperBound..<src.endIndex) else {

@@ -33,20 +33,20 @@ const build_options = @import("build_options");
 // anyway; this only governs how an unexpected panic terminates.
 pub const panic = std.debug.simple_panic;
 // pub: lib/mlx-serve-gguf and lib/sushi reach mlx, log and io_util through their host root (`mlx_host`). iOS builds
-// no mlx-stream plugin (src/arch/mlx_stream_stub.zig refuses its packs), so this root does not carry the plugin's names
+// no mlx-stream plugin (src/sdk/weights/streamed/stub.zig refuses its packs), so this root does not carry the plugin's names
 // of plugin_host.zig (sushi_exl3, dsa_nax), and plugin_host_check.zig does not check it; mtp_acceptance is the plugin
 // SDK's too (`sdk.acceptance`), kept as main.zig has it, and nothing on iOS reads it.
-pub const mlx = @import("mlx.zig");
-pub const io_util = @import("io_util.zig");
-pub const mtp_acceptance = @import("mtp_acceptance.zig");
-const model_mod = @import("model.zig");
-const transformer_mod = @import("transformer.zig");
-const model_discovery = @import("model_discovery.zig");
-const model_registry_mod = @import("model_registry.zig");
-const scheduler_mod = @import("scheduler.zig");
-const server_mod = @import("server.zig");
-const gen_mod = @import("gen.zig");
-pub const log = @import("log.zig");
+pub const mlx = @import("mlx/ffi.zig");
+pub const io_util = @import("sdk/util/io_util.zig");
+pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
+const model_mod = @import("engines/mlx/model.zig");
+const transformer_mod = @import("engines/mlx/transformer.zig");
+const model_discovery = @import("host/registry/discovery.zig");
+const model_registry_mod = @import("host/registry/registry.zig");
+const scheduler_mod = @import("engines/mlx/scheduler.zig");
+const server_mod = @import("host/http/server.zig");
+const gen_mod = @import("host/media_jobs/gen.zig");
+pub const log = @import("host/log.zig");
 
 /// Returns the engine version string (NUL-terminated, static lifetime).
 export fn mlxserve_version() [*:0]const u8 {

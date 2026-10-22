@@ -4,7 +4,7 @@
 # (templated + raw), embed (new + legacy), name resolution ("qwen3.5:latest"
 # style), pull fast-path (already on disk -> success, no network), and the
 # `mlx-serve list` CLI. Complements the hermetic translation/sink tests in
-# src/ollama.zig — this pins the routing + Conn-sink plumbing live.
+# src/host/api/ollama/translate.zig — this pins the routing + Conn-sink plumbing live.
 #
 # Usage: [OLLAMA_CHAT_MODEL=<dir>] [OLLAMA_EMBED_ID=<id>] ./tests/test_ollama_api.sh [port]
 set -uo pipefail

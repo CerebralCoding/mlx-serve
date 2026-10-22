@@ -15,7 +15,7 @@ Native Zig server running MLX-format LMs on Apple Silicon; OpenAI/Anthropic/Olla
 
 ## Stack
 
-Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF). `lib/sushi` (our fork of beamivalice/sushi, module `sushi_exl3`, `-Dsushi-dir`) serves Sushi packs' EXL3 routed experts on qwen4_exp (`ModelConfig.exl3`). `lib/mlx-stream` (davidtai, pinned from our fork `ddalcu/mlx-stream`): V4.1's EXL3 repack.
+Zig 0.17.0 (pinned via `scripts/fetch-zig.sh`); mlx + mlx-c PINNED SUBMODULES (`lib/mlx-src` v0.32.3, `lib/mlxc-src` 56b2d39 = PR #127 + `patches/mlxc-gather-qmm-global-scale.patch`, applied by the build scripts) self-built NAX-enabled by `scripts/build-mlx.sh` into `lib/mlx/` (FFI `src/mlx/ffi.zig`); jinja.cpp (wangzhaode, Apache-2.0, NOT llama.cpp's) as `lib/jinja_cpp/libjinja.a`; stb_image + libwebp; safetensors; BPE. Embedded engines: ds4 (`lib/ds4`, DSV4-Flash GGUF) + libllama (`lib/llama`, generic GGUF). `lib/sushi` (our fork of beamivalice/sushi, module `sushi_exl3`, `-Dsushi-dir`) serves Sushi packs' EXL3 routed experts on qwen4_exp (`ModelConfig.exl3`). `lib/mlx-stream` (davidtai, pinned from our fork `ddalcu/mlx-stream`): V4.1's EXL3 repack.
 
 ## Layout (`src/`)
 
@@ -107,7 +107,7 @@ Generation defaults for omitted fields: body > model `generation_defaults` > glo
 - **ALWAYS `zig build -Doptimize=ReleaseFast`, never bare `zig build`** (Debug 2–4× slower ⇒ fake regressions). `zig build test` does NOT refresh `zig-out/bin/mlx-serve` — rebuild before any live A/B.
 - **Edit loop: `zig build check`** (35 s, `-fno-emit-bin`: Sema over both roots, no codegen) → `zig build test` for behaviour (52 s Debug compile) → ReleaseFast only to RUN or MEASURE. A ReleaseFast rebuild is 3.5 min, 96% LLVM `-O3` on ONE thread (link 0.2 s), and nothing tunes it: no `-mllvm` or codegen-thread knob, `-fstrip` 3%, `-fincremental` panics, ReleaseSafe 10%. Only less code helps — media engines are 15% of `__text`, `Writer.print` monomorphization 15%.
 - Swift app: `bash app/build.sh`. The two bundle binaries move together.
-- mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx.zig` externs. Brew: webp ≥ 1.6.0.
+- mlx + mlx-c: submodules built by `scripts/build-mlx.sh` (deployment target 26.2 → NAX kernels; script + `tests/test_mlx_staged_nax.sh` ASSERT `*_nax` in the metallib). Min macOS 26.2. Bump = checkout tag → rerun → re-diff `src/mlx/ffi.zig` externs. Brew: webp ≥ 1.6.0.
 - **Linux/Windows CUDA**: build with `./scripts/build-linux.sh` / `scripts\build-windows.ps1`; MLX's JIT needs `CUDA_HOME`; custom MSL runs on Metal only. Kernels, per-device defaults, memory, measuring, and its rules (GPU-pool loads, graphs, kernel cache, matching MLX's bits): `docs/CUDA.md`.
 - Rebuild Jinja after `lib/jinja_cpp/*.cpp` changes: compile the 7 `.cpp` (`clang++ -std=c++17 -O2 -DNDEBUG -I .`) into `obj/` and `ar rcs libjinja.a obj/*.o`.
 
@@ -117,7 +117,7 @@ Order: (1) failing test FIRST, for the right reason; (2) minimum code to green; 
 
 Feature = unit test that fails without it (+ integration script if HTTP-observable). Bug fix = regression test red→fix→green, red-on-revert. Cross-arch = cover every touched arch. Refactor = characterization test first. UI/build scripts = factor a pure helper and test that.
 
-**Class bugs get class guards.** A live failure revealing a CLASS ships: the instance regression test; a corpus entry or universal invariant in `src/format_corpus_test.zig`; a rule here + story in `docs/gotchas/`.
+**Class bugs get class guards.** A live failure revealing a CLASS ships: the instance regression test; a corpus entry or universal invariant in `src/host/chat/format_corpus_test.zig`; a rule here + story in `docs/gotchas/`.
 
 Hermetic suites: `zig build test -Dtest-filter="format corpus"`, `-Dslow-tests -Dtest-filter="tool traffic"` (the replay is gated behind `-Dslow-tests`; the bare filter compiles and reports success without running it). Full suite: `zig build test -Dslow-tests`. Full matrix: `tests/CLAUDE.md`.
 
@@ -253,7 +253,7 @@ With `tools`, tokens buffer for detection (all tag families + raw JSON); thinkin
 - **Types come from the SCHEMA, never the value's spelling** (`coerceToolArgsToSchema`; undecidable → untouched; a `oneOf`/`anyOf` declares a type only when its branches agree, fx `shell.request`). ONE chokepoint `server.parseToolCallsForRequest` — never call `chat.parseToolCalls` from a handler.
 - **Buried required params**: `hoistMisplacedRequiredParams` lifts only on all-schema-read unanimity. Pristine args = the parse layer is innocent.
 - **Heuristic raw-JSON inference must name a DECLARED tool** (`filterInferredBySchema`); explicit tag calls never filtered; new heuristics set `.inferred`; not autocorrect-gated.
-- **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups (the NAME too, every emitter, #748); a parsed name never spans a line or tag (corpus invariant); coercion never worsens conformance; broken output stays honest. Harness: `src/tool_traffic_replay_test.zig`.
+- **Hard invariants (replay-pinned)**: emitted args ALWAYS valid JSON; every converter escapes + dedups (the NAME too, every emitter, #748); a parsed name never spans a line or tag (corpus invariant); coercion never worsens conformance; broken output stays honest. Harness: `src/host/chat/tool_traffic_replay_test.zig`.
 - **A Hermes param value keeps its own whitespace** (`chat.stripHermesValueFraming`): the template frames it with EXACTLY one newline per side and that is all the parser strips. Padded SCALARS still type from their spelling (`isJsonLiteral` probe).
 - **Gemma dropped `<|"|>`**: rich bare values run to the CONFIRMED closing delimiter or top-level final `}`, never the first `,`/`}` inside markup.
 - **Think-tag leaks**: strip pos-0 unclosed openers; `trimTrailingThinkClosers`; universal no-tag-leak corpus invariant covers new entries.
@@ -450,7 +450,7 @@ Spec decode:
 - **Round cost is MEASURED** (`round_cost.zig`, `MLX_SERVE_MTP_COST_TABLE=0`): per model/width/KV bucket from solo SINGLE-CHUNK rounds; `tok` is a workload MIXTURE (plan on `planTok`); per-silicon rows are COLD-START caps (`mtp_depth_free`), never deleted.
 - **Table hygiene**: interleaved prefill drops the round clock; refuse past `IMPLAUSIBLE_STEP` 1.5x / `SELF_SPIKE` 3x at fold AND load; load sweep also `IMPLAUSIBLE_WIDER` 1.25x (#382). Persistence OPT-IN (`MLX_SERVE_ROUND_COST_PERSIST=1`), keyed on chip/model/quant/OS/engine build.
 - **Width trials** (`mtpWidthTrialTarget`): m_lo then m_lo+1, NEVER m_lo−1; `[spec-stats]` carries `width_trials= table=`.
-- **Auto MTP depth**: below 8192 KV plan tokens from acceptance EMAs + table round TIME in ONE chunk (`MtpDepthPolicy.accept`, `MLX_SERVE_MTP_DEPTH_POLICY=legacy`); past 8k legacy. Rank policies in `src/mtp_replay_test.zig`, never live tok/s.
+- **Auto MTP depth**: below 8192 KV plan tokens from acceptance EMAs + table round TIME in ONE chunk (`MtpDepthPolicy.accept`, `MLX_SERVE_MTP_DEPTH_POLICY=legacy`); past 8k legacy. Rank policies in `src/engines/mlx/spec/mtp_replay_test.zig`, never live tok/s.
 - **The adaptive serial switch serves sidecar heads too** (`mtpSerialProbeEarned`: 16 rounds, EMA < 2.0, floor 32k KV).
 - **Auto-mode MTP output is NOT byte-reproducible**; byte bar = `--mtp-min-depth n --mtp-max-depth n`. Acceptance is a PROMPT-TYPE property — measure per index (`acc_idx=`) before touching round cost.
 - **EV cost tables are refit whenever the verify forward changes** (`MTP_EV_DEFAULT_COSTS`); `MtpCostProfile` comes from the runtime fingerprint, never the sidecar; qwen4 has its own G17 surface (`MLX_SERVE_MTP_QWEN4_PROFILE=0`). A/B profiles with persistence OFF on both arms.
@@ -511,7 +511,7 @@ Kernels + numerics:
 - **A per-block temporary of GBs is a FRESH allocation in the server** (8 GB pool cap, `applyMlxCacheLimit`; the test binary has none): FastH3 VSA lost to dense in situ while its ubench won, until pooling and assembly became kernels (`h3_vsa`). Price media-DiT changes by the server's step log.
 - **Memory**: RSS is blind to Metal (`/props` `active_bytes`); a live handle pins its buffer through the eval, so free a step's intermediates BEFORE evaluating it; a weights MAP outliving the model pins every buffer; `iterator_next` hands a +1; `mlx_array_new_data` COPIES shape-worth of bytes; Metal at the working-set edge returns ZEROS before it aborts.
 - **Tokenizer**: special-token splitting only in `Tokenizer.encode` (first-byte buckets); any per-position loop over a vocab-derived collection needs an index.
-- **Upgrades**: mlx-c → diff `lib/mlxc-src/mlx/c/*.h` vs `src/mlx.zig`; ds4 → re-sync `ds4_ffi.zig` EngineOptions + CORE_OBJS; NAX presence asserted, never assumed.
+- **Upgrades**: mlx-c → diff `lib/mlxc-src/mlx/c/*.h` vs `src/mlx/ffi.zig`; ds4 → re-sync `ds4_ffi.zig` EngineOptions + CORE_OBJS; NAX presence asserted, never assumed.
 - **Kokoro**: safetensors READ on CPU stream; depthwise `ConvTranspose1d` transposes `{0,2,1}`; `AdaIN1d` is pure instance norm; `Vocab.encode` DROPS unknowns; reproducing an upstream NO-OP means NOT doing it (SineGen).
 - **ANE prefill (opt-in, M4-and-below, LOSSY)**: rules in `docs/reference.md` "ANE prefill rules"; parity = per-program cos/rms + perceived-content equivalence; `ready: N/M` under-count = silent partial coverage. Guard: `tests/test_ane_prefill.sh`.
 

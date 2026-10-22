@@ -338,7 +338,7 @@ for entry in "${ARCHES[@]}"; do
         if [[ "$cfg" == drafter* ]]; then
             check "drafter: engaged in the log" "$(grep -q 'spec-stats\] mode=dflash' "$OUT/$CELL.server.log" && echo 0 || echo 1)"
             # Past 2k KV tokens, with packed-KV reads forced: drafted bytes == serial bytes on one load.
-            long=$(python3 -c "print(open('src/rowqmv.zig').read()[:12000])" | python3 -c 'import sys,json; print(json.dumps("Here is a file:\n"+sys.stdin.read()+"\nList its public functions."))')
+            long=$(python3 -c "print(open('src/sdk/blocks/qmm/rowqmv.zig').read()[:12000])" | python3 -c 'import sys,json; print(json.dumps("Here is a file:\n"+sys.stdin.read()+"\nList its public functions."))')
             a=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$long}],\"max_tokens\":160,\"temperature\":0,\"enable_thinking\":false,\"kv_attn_mode\":\"fused\",\"enable_drafter\":false,\"enable_mtp\":false,\"enable_pld\":false}" | J '(d["choices"][0]["message"].get("reasoning_content") or "") + (d["choices"][0]["message"]["content"] or "")')
             b=$(post /v1/chat/completions "{\"model\":\"m\",\"messages\":[{\"role\":\"user\",\"content\":$long}],\"max_tokens\":160,\"temperature\":0,\"enable_thinking\":false,\"kv_attn_mode\":\"fused\",\"enable_drafter\":true}" | J '(d["choices"][0]["message"].get("reasoning_content") or "") + (d["choices"][0]["message"]["content"] or "")')
             # The whole reply (a model can think with thinking off). Bytes match only on the row-exact

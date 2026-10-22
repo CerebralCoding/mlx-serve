@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# `GET /v1/load-progress` (`src/load_progress.zig`): a headless server answers an empty list; a
+# `GET /v1/load-progress` (`src/host/registry/load_progress.zig`): a headless server answers an empty list; a
 # GPU load shows `reading_weights` (bytes) and a Neural Engine load `ane_programs` (programs), each
 # with a total and progress that moves, and the list is empty once the model is ready. `/props`
 # `registry_generation` moves with the load, so a client knows to re-read `/v1/models`. A POST

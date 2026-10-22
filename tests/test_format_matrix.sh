@@ -2,7 +2,7 @@
 # test_format_matrix.sh — cross-model-family format-correctness matrix.
 #
 # Live layer of the format test suite (the hermetic layer is
-# src/format_corpus_test.zig — run `zig build test -Dtest-filter="format corpus"`).
+# src/host/chat/format_corpus_test.zig — run `zig build test -Dtest-filter="format corpus"`).
 # Boots ~6 format-class representatives one at a time and asserts, per model:
 #
 #   1. Thinking OFF baseline: answer in content, no control-tag leak
@@ -19,7 +19,7 @@
 #
 # Servers boot with --log-level debug; on any FAIL the model's raw-output dump
 # lines ("raw generated text before tool parse") are echoed for instant
-# harvesting into src/format_corpus_test.zig.
+# harvesting into src/host/chat/format_corpus_test.zig.
 #
 # Usage: ./tests/test_format_matrix.sh
 #   FORMAT_MODELS=qwen36,gemma4-e4b  — csv filter of logical names

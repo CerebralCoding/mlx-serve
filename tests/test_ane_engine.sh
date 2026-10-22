@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# The Neural Engine engine over HTTP (`src/arch/ane_lm.zig`). A dense qwen3_5 pack opted in per
+# The Neural Engine engine over HTTP (`src/engines/ane/lm.zig`). A dense qwen3_5 pack opted in per
 # model (`"ane": true` in model-settings.json) serves on the ANE: engine "ane" with the 64K ladder,
 # stream and non-stream deliver the same bytes, what it cannot serve is refused by name, a prompt
 # grows past the first context, a repeat restores a checkpoint. `--ane` on a pack the engine cannot

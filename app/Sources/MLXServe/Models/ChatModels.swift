@@ -529,7 +529,7 @@ struct ModelInfo {
     /// `<model>@<peer>` and requests are proxied to that host). nil = local.
     var lanPeer: String? = nil
     /// Set when this entry is a configured upstream provider (`provider`
-    /// badge, `src/providers.zig`). Routing is identical to a LAN peer — the
+    /// badge, `src/host/api/providers.zig`). Routing is identical to a LAN peer — the
     /// id is `<model>@<name>` and the server proxies — so `lanPeer` is set
     /// too; this field only decides the picker heading and the label.
     var provider: String? = nil
@@ -546,7 +546,7 @@ struct ModelInfo {
         guard lanPeer != nil else { return false }
         // "audio" is the MODALITY, and the server advertises a music backend
         // ADDITIVELY as ["audio","music"] on both the ready and stub paths
-        // (src/server.zig) — so a peer running ACE-Step or MiniMax Music 3
+        // (src/host/http/server.zig) — so a peer running ACE-Step or MiniMax Music 3
         // matched the Voice pane's "audio" ask and offered itself as a TTS
         // voice. Speech is audio-and-not-music; the Music pane's own "music"
         // ask was already exact, because no TTS backend advertises it.

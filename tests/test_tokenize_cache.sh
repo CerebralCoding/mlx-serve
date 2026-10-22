@@ -7,8 +7,8 @@
 # Metal prefill time on a KV-cache hit. A per-LoadedModel tokenize cache
 # makes the second hit on an identical prompt drop tokenize_ms to ≤ 1ms.
 #
-# This is the regression test. Reverting the cache in src/chat.zig (or the
-# handler plumbing in src/server.zig) MUST flip this test red.
+# This is the regression test. Reverting the cache in src/host/chat/chat.zig (or the
+# handler plumbing in src/host/http/server.zig) MUST flip this test red.
 #
 # Env:
 #   MODEL    Any MLX model. Default: Gemma 4 E4B 4-bit under Sandisk.

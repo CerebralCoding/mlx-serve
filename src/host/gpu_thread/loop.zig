@@ -1,0 +1,274 @@
+//! The inference loop: work-pending checks, side-queue drains, the main loop.
+
+const std = @import("std");
+const log = @import("../log.zig");
+const io_util = @import("../../sdk/util/io_util.zig");
+const mlx_stream = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
+const sleep_inhibit = @import("sleep_inhibit.zig");
+const testing = std.testing;
+
+const reviseHotCacheBudgets = @import("../../engines/mlx/cache/budget.zig").reviseHotCacheBudgets;
+const persistAtShutdown = @import("../../engines/mlx/cache/budget.zig").persistAtShutdown;
+const commitSlotIfApplicable = @import("../../engines/mlx/commit.zig").commitSlotIfApplicable;
+const recordSlotCleanup = @import("../../engines/mlx/finish.zig").recordSlotCleanup;
+const doLoadOnInferenceThread = @import("../../engines/mlx/load.zig").doLoadOnInferenceThread;
+const VisionEncodeRequest = @import("../../engines/mlx/media_encode.zig").VisionEncodeRequest;
+const EmbedRequest = @import("../../engines/mlx/media_encode.zig").EmbedRequest;
+const runVisionEncode = @import("../../engines/mlx/media_encode.zig").runVisionEncode;
+const runEmbedRequest = @import("../../engines/mlx/media_encode.zig").runEmbedRequest;
+const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
+const Slot = @import("../../engines/mlx/slot.zig").Slot;
+const chatPass = @import("../../engines/mlx/step.zig").chatPass;
+const runLoadRequest = @import("load_requests.zig").runLoadRequest;
+const runUnloadRequest = @import("load_requests.zig").runUnloadRequest;
+const LoadRequest = @import("requests.zig").LoadRequest;
+const GenRequest = @import("requests.zig").GenRequest;
+const MAX_MERGED_WEIGHT = @import("requests.zig").MAX_MERGED_WEIGHT;
+const takeMergeable = @import("requests.zig").takeMergeable;
+const UnloadRequest = @import("requests.zig").UnloadRequest;
+const ThreadCtx = @import("thread.zig").ThreadCtx;
+const signalStarted = @import("thread.zig").signalStarted;
+const recordLoadError = @import("thread.zig").recordLoadError;
+const runGenRequests = @import("../media_jobs/runner.zig").runGenRequests;
+
+pub fn hasWorkPendingLocked(sch: *const Scheduler) bool {
+    return sch.pending.items.len > 0 or
+        sch.decoding.items.len > 0 or
+        sch.vision_queue.items.len > 0 or
+        sch.embed_queue.items.len > 0 or
+        sch.cleanup_queue.items.len > 0 or
+        sch.load_queue.items.len > 0 or
+        sch.gen_queue.items.len > 0 or
+        sch.unload_queue.items.len > 0;
+}
+
+/// Poll interval for the idle-eviction sweep, given the configured window.
+///
+/// A quarter of the window, so a model is evicted within ~1.25x the configured
+/// idle time rather than up to 2x it. Floored at a second so `--idle-evict-secs 1`
+/// does not spin, capped at 30s so a long window still costs ~nothing.
+pub fn idleEvictTickMs(window_ms: i64) i64 {
+    return @max(1000, @min(@divTrunc(window_ms, 4), 30_000));
+}
+
+pub fn inferenceLoop(ctx: ThreadCtx) void {
+    const sch = ctx.scheduler;
+    const params = ctx.params;
+    // Covers shutdown and startup-load failure.
+    defer sleep_inhibit.release();
+
+    // ── Phase A1 → Plan 05: load runs on this thread (mlx GPU stream
+    //    binding). On failure, mark the entry `.error_state` in the
+    //    registry AND set load_failed so `Scheduler.init`'s parent sees
+    //    the same shape it always has.
+    //
+    // Headless boot (`no_initial_load`): start with NO primary model. The
+    // server runs idle until a chat or media model is loaded on demand via
+    // `/v1/load-model` (or a request targeting a discovered id). Used by the
+    // app's "start headless, load gen on demand" flow.
+    if (params.no_initial_load) {
+        log.info("Headless: no primary model loaded; models load on demand.\n", .{});
+        signalStarted(sch);
+    } else {
+        // Startup load runs before the wait loop can acquire.
+        sleep_inhibit.setActive(true);
+        // `.loading` while it runs, so the startup responder's `/v1/load-progress` lists it.
+        sch.registry.mutex.lockUncancelable(sch.io);
+        _ = sch.registry.tryBeginLoadLocked(params.entry);
+        sch.registry.mutex.unlock(sch.io);
+        if (doLoadOnInferenceThread(sch, params)) |_| {
+            log.info("Model ready (loaded on inference thread).\n", .{});
+            signalStarted(sch);
+        } else |err| {
+            recordLoadError(sch, @errorName(err));
+            sch.registry.mutex.lockUncancelable(sch.io);
+            sch.registry.markErrorLocked(params.entry, @errorName(err));
+            sch.registry.mutex.unlock(sch.io);
+            signalStarted(sch);
+            return;
+        }
+    }
+
+    while (!sch.shutdown.load(.acquire)) {
+        // Phase D: cold-load drain. Process ONE load per tick — loading a
+        // model is heavy (~seconds; weight read + JIT compile + warmup)
+        // and we want the rest of the inference loop to stay responsive.
+        // Other pending loads wait in queue and get picked up next tick.
+        var load_req: ?*LoadRequest = null;
+        // Media-gen + unload work items (one per tick, like load — both are
+        // heavy and we re-check the loop between them). A gen job owns the
+        // loop until it returns; chat runs between its steps (`GenYield`).
+        // Decision jobs queued back to back for one model run as one pass
+        // (`takeMergeable`).
+        var gen_batch: [MAX_MERGED_WEIGHT]*GenRequest = undefined;
+        var gen_n: usize = 0;
+        var unload_req: ?*UnloadRequest = null;
+        {
+            sch.queue_mu.lockUncancelable(sch.io);
+            defer sch.queue_mu.unlock(sch.io);
+            if (sch.load_queue.items.len > 0) {
+                load_req = sch.load_queue.orderedRemove(0);
+            }
+            if (sch.unload_queue.items.len > 0) {
+                unload_req = sch.unload_queue.orderedRemove(0);
+            }
+            if (sch.gen_queue.items.len > 0) {
+                gen_batch[0] = sch.gen_queue.orderedRemove(0);
+                gen_n = takeMergeable(&sch.gen_queue, &gen_batch, 1);
+                const window_us = if (gen_batch[0].merge) |m| m.window_us else 0;
+                if (window_us > 0 and gen_n < gen_batch.len) {
+                    const deadline = (std.Io.Timeout{ .duration = .{
+                        .raw = .fromMicroseconds(window_us),
+                        .clock = .awake,
+                    } }).toDeadline(sch.io);
+                    while (!sch.shutdown.load(.acquire)) {
+                        sch.queue_cond.waitTimeout(sch.io, &sch.queue_mu, deadline) catch break;
+                        gen_n = takeMergeable(&sch.gen_queue, &gen_batch, gen_n);
+                    }
+                    gen_n = takeMergeable(&sch.gen_queue, &gen_batch, gen_n);
+                }
+            }
+        }
+        _ = drainSideQueues(sch);
+        if (load_req) |req| runLoadRequest(sch, req);
+        if (unload_req) |req| runUnloadRequest(sch, req);
+        if (load_req != null or unload_req != null) reviseHotCacheBudgets(sch, load_req == null);
+        if (unload_req != null) sch.budget_revise_sw = io_util.Stopwatch.init(sch.io);
+        if (gen_n > 0) runGenRequests(sch, gen_batch[0..gen_n]);
+        if (chatPass(sch, .main) == .shutdown) break;
+    }
+    persistAtShutdown(sch);
+    closeGlmModels(sch);
+}
+
+/// At shutdown, on the inference thread: GLM-5.3's module synchronizes its stream as it frees, and MLX finds that
+/// stream only on this thread, not on the one that joins it (`Scheduler.deinit`, where every other model unloads as
+/// before; "There is no Stream(gpu, 0) in current thread", mlx-c stream.cpp).
+fn closeGlmModels(sch: *Scheduler) void {
+    sch.registry.mutex.lockUncancelable(sch.io);
+    defer sch.registry.mutex.unlock(sch.io);
+    var it = sch.registry.entries.valueIterator();
+    while (it.next()) |entry| {
+        const x = entry.*.transformer orelse continue;
+        if (!x.config.glm_stream) continue;
+        const m = x.mlx_stream_ext orelse continue;
+        mlx_stream.close(m);
+        x.mlx_stream_ext = null;
+    }
+}
+
+/// Cleanup, vision and embed work, drained on the inference thread. Returns
+/// whether there was any.
+pub fn drainSideQueues(sch: *Scheduler) bool {
+    // 0a. Drain slots queued for cleanup. Conn threads hand finished
+    //     slots here in `complete()` — we own the mlx stream binding,
+    //     so freeing per-slot KVCache + vision_embeddings + ssm_entries
+    //     is safe here even though those slots' arrays might trigger
+    //     real GPU memory release on refcount-zero.
+    var cleanup_batch: [16]*Slot = undefined;
+    var cleanup_n: usize = 0;
+    // 0b. Drain any pending vision/embed work. These run synchronously on
+    //     behalf of conn threads waiting in `encodeVision` /
+    //     `computeEmbedding`. Processed here (not concurrently with decode
+    //     ticks) so they share the inference thread's mlx stream cleanly.
+    var vision_batch: [4]*VisionEncodeRequest = undefined;
+    var vision_n: usize = 0;
+    var embed_batch: [4]*EmbedRequest = undefined;
+    var embed_n: usize = 0;
+    {
+        sch.queue_mu.lockUncancelable(sch.io);
+        defer sch.queue_mu.unlock(sch.io);
+        while (cleanup_n < cleanup_batch.len and sch.cleanup_queue.items.len > 0) {
+            cleanup_batch[cleanup_n] = sch.cleanup_queue.orderedRemove(0);
+            cleanup_n += 1;
+        }
+        while (vision_n < vision_batch.len and sch.vision_queue.items.len > 0) {
+            vision_batch[vision_n] = sch.vision_queue.orderedRemove(0);
+            vision_n += 1;
+        }
+        while (embed_n < embed_batch.len and sch.embed_queue.items.len > 0) {
+            embed_batch[embed_n] = sch.embed_queue.orderedRemove(0);
+            embed_n += 1;
+        }
+    }
+    for (cleanup_batch[0..cleanup_n]) |s| {
+        // Decode-phase cancel: `complete()` pulled this slot straight
+        // into the cleanup queue, so it never went through finishSlot
+        // and its committed KV (prompt + every emitted token) would die
+        // right here with the slot. Commit it first — the same guards
+        // as a normal finish apply inside (pad-only / error / vision /
+        // empty all decline) — then flush what was committed to the
+        // SSD tier, since no finishSlot will. Normally-finished slots
+        // arrive here with `finished` already set (finishSlot committed
+        // them) and skip; errored slots decline via the error guard.
+        // Runs on the inference thread — the sole mlx caller — which is
+        // what makes the refcount-sharing snapshot legal here.
+        if (s.cancelled.load(.acquire) and !s.finished and s.error_code == null) {
+            commitSlotIfApplicable(sch, s);
+            if (s.model.prefix_cache) |*hc| {
+                if (s.model.transformer) |xf| hc.flushPendingDisk(xf.s);
+            }
+        }
+        recordSlotCleanup(sch.metrics, s);
+        // Second slot-end path (a decode-phase cancel never reaches finishSlot); the
+        // record must not outlive the bytes `s.deinit()` frees.
+        if (s.model.prefix_cache) |*hc| hc.releaseCheckout(@intFromPtr(s), "slot cleanup");
+        if (s.model.transformer) |xfm| xfm.resetQsaPooledRope();
+        s.deinit();
+    }
+    for (vision_batch[0..vision_n]) |req| runVisionEncode(sch, req);
+    for (embed_batch[0..embed_n]) |req| runEmbedRequest(sch, req);
+    return cleanup_n + vision_n + embed_n > 0;
+}
+
+// ── tests ──
+
+test "the cleanup drain commits a cancelled slot before deinit" {
+    // Class guard: a decode-phase cancel is pulled straight into the cleanup
+    // queue by `complete()` and NEVER passes through finishSlot — without a
+    // commit in the drain, its prompt+generated KV dies with the slot. The
+    // commit must run BEFORE deinit (the snapshot refcount-shares live
+    // buffers; after deinit they are freed).
+    const source = @embedFile("loop.zig");
+    const drain_start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse return error.MissingCleanupDrain;
+    const region = source[drain_start..@min(drain_start + 1600, source.len)];
+    const commit_pos = std.mem.indexOf(u8, region, "commitSlotIfApplicable") orelse return error.DrainDoesNotCommit;
+    const deinit_pos = std.mem.indexOf(u8, region, ".deinit()") orelse return error.MissingDeinit;
+    try testing.expect(commit_pos < deinit_pos);
+    // The SSD tier has no finishSlot flush on this path — the drain must
+    // flush what it just committed itself.
+    try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
+}
+
+test "idleEvictTickMs: sweeps well inside the window without spinning" {
+    // Bar: a quarter of the window, clamped to [1s, 30s] — eviction lands near
+    // the configured time without the sweep becoming a busy loop.
+    try testing.expectEqual(@as(i64, 5_000), idleEvictTickMs(20_000));
+    try testing.expectEqual(@as(i64, 15_000), idleEvictTickMs(60_000));
+    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(900_000));
+    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(1000));
+    try testing.expectEqual(@as(i64, 1000), idleEvictTickMs(2000));
+    try testing.expectEqual(@as(i64, 30_000), idleEvictTickMs(28_800_000));
+    try testing.expect(idleEvictTickMs(0) >= 1000);
+}
+
+test "the inference loop parks without holding the sleep-inhibition assertion" {
+    // Pin release < park < acquire and startup acquire < load.
+    const source = @embedFile("../../engines/mlx/step.zig") ++ @embedFile("loop.zig");
+    const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
+    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
+    const body = source[start..end];
+    const pass_start = std.mem.indexOf(u8, source, "fn chatPass(") orelse return error.MissingChatPass;
+    const pass_end = std.mem.indexOfPos(u8, source, pass_start + 1, "\nfn ") orelse return error.MissingChatPassEnd;
+    const pass = source[pass_start..pass_end];
+    const drop = std.mem.indexOf(u8, pass, "sleep_inhibit.setActive(holdsSleepWhileParked(sch));") orelse return error.MissingSleepRelease;
+    const park = std.mem.indexOf(u8, pass, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
+    const hold = std.mem.indexOfPos(u8, pass, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+    try testing.expect(drop < park);
+    try testing.expect(park < hold);
+    try testing.expect(std.mem.indexOf(u8, pass, "while (!hasWorkPendingLocked(sch)") != null);
+    const boot_load = std.mem.indexOf(u8, body, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingStartupLoad;
+    const boot_arm = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
+    try testing.expect(boot_arm < boot_load);
+    try testing.expect(std.mem.indexOf(u8, body, "defer sleep_inhibit.release();") != null);
+}

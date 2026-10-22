@@ -309,7 +309,7 @@ Why the existing "Serial (isMoe)" protection didn't cover it: `modelBatchable=fa
 
 Where to block, and where NOT to: `submit()` already single-flights llama (`llama_session_busy`, claimed in submit, released in `complete`) — but submit blocks the conn thread BEFORE any response bytes, and a dsv4 wait can be minutes, which lands squarely in the streaming-keepalive class (undici kills silent sockets at ~300 s). Holding the slot in `pending` instead keeps the conn thread in its existing `waitNextTimeout(STREAM_KEEPALIVE_MS)` loop, where SSE keepalives already flow. StallClock can't fire during the wait — it lives on the Generator, which is only created at prefill. So the second dsv4 request QUEUES (FIFO) until the active one finishes, same UX as queueing behind `--max-concurrent`.
 
-Fix shape (`src/scheduler.zig`): pure `admitPendingTick(cands, active, out)` (the `specTickMode` pattern — contract-tested decision fn + a source-scan pinning the call site) gates the pending drain in `inferenceLoop` step 1, under `queue_mu`. An exclusive candidate admits only if its model is neither among live decoding slots nor claimed by an earlier admitted exclusive candidate this tick (same-tick siblings aren't in `decoding` yet — the claim covers the window). `modelExclusiveDecode` keys on the transformer's dsv4 pointer, mirroring `runPrefill`'s `is_dsv4` — NOT on `!modelBatchable` (would wrongly serialize laguna/hy3) and NOT on a model_type string. Non-exclusive candidates always admit, and a candidate for another model behind a held exclusive one still admits — no head-of-line blocking. No release bookkeeping: the busy signal IS presence in `decoding`; step-5 culls finished slots under the same mutex, and the loop never blocks while `pending` is non-empty, so a held slot admits on the first tick after the active one is culled.
+Fix shape (`src/engines/mlx/scheduler.zig`): pure `admitPendingTick(cands, active, out)` (the `specTickMode` pattern — contract-tested decision fn + a source-scan pinning the call site) gates the pending drain in `inferenceLoop` step 1, under `queue_mu`. An exclusive candidate admits only if its model is neither among live decoding slots nor claimed by an earlier admitted exclusive candidate this tick (same-tick siblings aren't in `decoding` yet — the claim covers the window). `modelExclusiveDecode` keys on the transformer's dsv4 pointer, mirroring `runPrefill`'s `is_dsv4` — NOT on `!modelBatchable` (would wrongly serialize laguna/hy3) and NOT on a model_type string. Non-exclusive candidates always admit, and a candidate for another model behind a held exclusive one still admits — no head-of-line blocking. No release bookkeeping: the busy signal IS presence in `decoding`; step-5 culls finished slots under the same mutex, and the loop never blocks while `pending` is non-empty, so a held slot admits on the first tick after the active one is culled.
 
 Repro/guard: `tests/test_dsv4.sh` [7] — greedy solo baseline, then the same request with a short marker chat ("Reply with exactly: Kangaroo") fired mid-generation. Pre-fix RED reproduced the exact incident signature: the concurrent long output truncated and LITERALLY contained "Kangaroo" (`… 2, 3, 5, 7, "Kangaroo`). Post-fix: byte-equal to solo, marker answered after queueing, no leak — 17/17.
 
@@ -884,7 +884,7 @@ H3, LTX, hunyuan3d, acestep. The image backends never poll it, so a FLUX/Krea
 generation still runs to completion. Those are seconds to a minute; the class is
 the same and the fix would be per-backend loop wiring.
 
-The audit turned up a second thing: `src/gen_sse.zig` was never listed in
+The audit turned up a second thing: `src/host/media_jobs/sse.zig` was never listed in
 `src/tests.zig`, so its tests had never run. A filter that matches no test still
 reports "1/1 tests passed" (the other test step's), which is why nobody noticed —
 when checking that a new test is red, check it against a deliberately bogus
@@ -2168,7 +2168,7 @@ deinitializing that router at the closing brace caused invalid UTF-8 in the late
 text block. The live marker regression caught it even though the protocol tests
 passed. Guards: `tests/test_json_schema_protocol_routing.py` (all three APIs,
 streaming and non-streaming), the constrained JSON format-corpus invariant, and
-the split/UTF-8/stop tests in `src/reasoning_protocol.zig`.
+the split/UTF-8/stop tests in `src/host/chat/reasoning/protocol.zig`.
 ## Qwen3-Embedding sub-batches shared one KV cache (2026-09-10)
 
 A `/v1/embeddings` request splits into sub-batches once rows x longest input passes

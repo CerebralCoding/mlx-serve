@@ -1,5 +1,5 @@
 #!/bin/bash
-# LAN model sharing (src/lan.zig): two servers on ONE machine.
+# LAN model sharing (src/host/lan/lan.zig): two servers on ONE machine.
 #
 #   A  --model <dir> --lan-share all --lan-name lantest-a --lan-discover
 #   B  headless (--model-dir <empty>) --lan-discover

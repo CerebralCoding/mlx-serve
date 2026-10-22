@@ -8,8 +8,8 @@
 # kev_config.json must win over its qwen3_5 config.json) and on-demand load are exercised, not just the forward.
 # Answers are compared against kev's own MLX backend (tests/fixtures/kev/cases.json, tolerance 0.01).
 #
-# Hermetic counterparts: the unit tests in src/kev.zig (KEV_TEST_MODEL + KEV_FIXTURES pin token ids and
-# probabilities) and the Kev discovery test in src/model_discovery.zig.
+# Hermetic counterparts: the unit tests in src/plugins/kev/kev.zig (KEV_TEST_MODEL + KEV_FIXTURES pin token ids and
+# probabilities) and the Kev discovery test in src/host/registry/discovery.zig.
 set -uo pipefail
 
 PORT="${1:-11443}"

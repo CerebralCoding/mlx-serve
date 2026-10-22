@@ -2,7 +2,7 @@
 """Repackage `microsoft/TRELLIS.2-4B` or `TencentARC/Pixal3D` as an 8-bit mlx-serve pack.
 
 USER-RUN (needs mlx + the official weights + the DINOv3 checkpoint). One file at a time. The pack keeps
-the release's layout and key names (what src/trellis2.zig and src/pixal3d.zig load) with these changes:
+the release's layout and key names (what src/plugins/trellis2/trellis2.zig and src/plugins/pixal3d/pixal3d.zig load) with these changes:
 
   (a) the DiT block projections (`blocks.N.*.weight`, 2-D, input width a multiple of the group) are
       affine-quantized (group 64). The loaders decide dense-vs-quantized PER TENSOR from a `.scales`

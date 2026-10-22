@@ -10,7 +10,7 @@
 # fixtures in tests/fixtures/laya/cases.json (tolerance 0.01), then the
 # request latency (3 questions) is measured as the median of 30.
 #
-# Hermetic counterparts: the unit tests in src/laya.zig (LAYA_TEST_MODEL +
+# Hermetic counterparts: the unit tests in src/plugins/laya/laya.zig (LAYA_TEST_MODEL +
 # LAYA_FIXTURES) pin token ids, hidden states and probabilities.
 set -uo pipefail
 

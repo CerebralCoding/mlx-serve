@@ -18,7 +18,7 @@ p.add_argument('--log', type=Path, required=True)
 p.add_argument('--nax', choices=('on', 'off'), required=True)
 args = p.parse_args()
 log_offset = args.log.stat().st_size if args.log.exists() else 0
-source = (Path(__file__).resolve().parents[1] / 'src/transformer.zig').read_text()
+source = (Path(__file__).resolve().parents[1] / 'src/engines/mlx/transformer.zig').read_text()
 corpus = '\n'.join(source.splitlines()[100:900])
 for nonce in ('81492017', '52839106', '90371648'):
     prompt = (f'Nonce {nonce}. Remember the passphrase MAGNOLIA-7731.\n'

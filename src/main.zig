@@ -1,41 +1,41 @@
-const depth_bounds = @import("mtp_depth_bounds.zig");
+const depth_bounds = @import("engines/mlx/spec/mtp_depth_bounds.zig");
 const std = @import("std");
-const crt = @import("crt.zig");
+const crt = @import("sdk/util/crt.zig");
 const build_options = @import("build_options");
 // pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
-pub const mlx = @import("mlx.zig");
-pub const io_util = @import("io_util.zig");
-const mlx_gguf = @import("arch/mlx_gguf.zig");
-const model_mod = @import("model.zig");
-const tokenizer_mod = @import("tokenizer.zig");
-const transformer_mod = @import("transformer.zig");
-const round_cost_mod = @import("round_cost.zig");
-const generate_mod = @import("generate.zig");
-pub const mtp_acceptance = @import("mtp_acceptance.zig");
+pub const mlx = @import("mlx/ffi.zig");
+pub const io_util = @import("sdk/util/io_util.zig");
+const mlx_gguf = @import("sdk/quant/gguf/claim.zig");
+const model_mod = @import("engines/mlx/model.zig");
+const tokenizer_mod = @import("host/tokenizer/tokenizer.zig");
+const transformer_mod = @import("engines/mlx/transformer.zig");
+const round_cost_mod = @import("engines/mlx/spec/round_cost.zig");
+const generate_mod = @import("engines/mlx/generate.zig");
+pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
 /// Sushi's EXL3 routed experts, for the plugins that reach them through their host root (`mlx_host`).
 pub const sushi_exl3 = @import("sushi_exl3");
-pub const dsa_nax = @import("dsa_nax.zig");
+pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
 comptime {
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
     @import("plugin_host_check.zig").reexports(@This());
 }
-const model_discovery = @import("model_discovery.zig");
-const gguf_meta = @import("gguf_meta.zig");
-const model_registry_mod = @import("model_registry.zig");
-const drafter_mod = @import("drafter.zig");
-const mtp_graft = @import("mtp_graft.zig");
-const mtp_mod = @import("mtp.zig");
-const chat_mod = @import("chat.zig");
-const server_mod = @import("server.zig");
-const scheduler_mod = @import("scheduler.zig");
-const ane_lm = @import("arch/ane_lm.zig");
-const status = @import("status.zig");
-const model_settings_mod = @import("model_settings.zig");
-const vision_mod = @import("vision.zig");
-const ds4_arch = if (build_options.ds4_engine) @import("arch/ds4.zig") else @import("arch/ds4_stub.zig");
-const llama_arch = if (build_options.llama_engine) @import("arch/llama.zig") else @import("arch/llama_stub.zig");
-const gen_mod = @import("gen.zig");
-const cli_mod = @import("cli.zig");
+const model_discovery = @import("host/registry/discovery.zig");
+const gguf_meta = @import("host/registry/engine_pick.zig");
+const model_registry_mod = @import("host/registry/registry.zig");
+const drafter_mod = @import("plugins/gemma4/assistant_drafter.zig");
+const mtp_graft = @import("plugins/prism_hadamard_qwen35/mtp_graft.zig");
+const mtp_mod = @import("sdk/spec/mtp/mtp.zig");
+const chat_mod = @import("host/chat/chat.zig");
+const server_mod = @import("host/http/server.zig");
+const scheduler_mod = @import("engines/mlx/scheduler.zig");
+const ane_lm = @import("engines/ane/lm.zig");
+const status = @import("host/status.zig");
+const model_settings_mod = @import("host/registry/model_settings.zig");
+const vision_mod = @import("sdk/vision/encoder.zig");
+const ds4_arch = if (build_options.ds4_engine) @import("engines/ds4/bridge.zig") else @import("engines/ds4/stub.zig");
+const llama_arch = if (build_options.llama_engine) @import("engines/llama/bridge.zig") else @import("engines/llama/stub.zig");
+const gen_mod = @import("host/media_jobs/gen.zig");
+const cli_mod = @import("host/cli/cli.zig");
 
 // codesign names an executable after its embedded Info.plist; without one it makes up a new name for
 // every build, and the Neural Engine keeps compiled programs per signing name: each app update
@@ -47,13 +47,13 @@ const info_plist = ("<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n" ++
 comptime {
     if (@import("builtin").os.tag == .macos) @export(&info_plist, .{ .name = "mlx_serve_info_plist", .section = "__TEXT,__info_plist" });
 }
-const launch_mod = @import("launch.zig");
-pub const log = @import("log.zig");
-const metrics_mod = @import("metrics.zig");
-const sleep_inhibit_mod = @import("sleep_inhibit.zig");
+const launch_mod = @import("host/launch/launch.zig");
+pub const log = @import("host/log.zig");
+const metrics_mod = @import("host/metrics/metrics.zig");
+const sleep_inhibit_mod = @import("host/gpu_thread/sleep_inhibit.zig");
 const version_mod = @import("version.zig");
-const ane_mod = @import("ane.zig");
-const ple_gpu = @import("ple_gpu.zig");
+const ane_mod = @import("sdk/ane/offload.zig");
+const ple_gpu = @import("plugins/qwen4_exp/ple_gpu.zig");
 
 pub const VERSION: []const u8 = build_options.version;
 /// `-Dplugin-profile`: the mlx-stream plugin's sdk reads this (`mlx_host.plugin_profile`) to compile its profile probes in.
@@ -541,8 +541,8 @@ pub fn main(init: std.process.Init) !void {
     mlx.exportCudaHome();
     mlx.exportPtxCacheDir(@import("mlx_stamp").bytes);
     // Resolve lazily-cached env reads on the main thread before other threads exist.
-    @import("transformer.zig").warmQsaEnvCaches();
-    @import("prefix_cache.zig").warmEnvCaches();
+    @import("engines/mlx/transformer.zig").warmQsaEnvCaches();
+    @import("engines/mlx/cache/prefix_cache.zig").warmEnvCaches();
 
     // mlx-c's default handler exits the process; latch MLX failures instead (#353).
     mlx.installErrorHandler();
@@ -615,10 +615,10 @@ pub fn main(init: std.process.Init) !void {
             arg_start = 2;
             use_default_models_root = true;
         } else if (std.mem.eql(u8, cmd, "worker")) {
-            @import("distributed.zig").cmdWorker(io, allocator, args[2..]) catch std.process.exit(1);
+            @import("engines/mlx/cluster/distributed.zig").cmdWorker(io, allocator, args[2..]) catch std.process.exit(1);
             return;
         } else if (std.mem.eql(u8, cmd, "dist-probe")) {
-            @import("distributed.zig").cmdProbe(io, args[2..]) catch std.process.exit(1);
+            @import("engines/mlx/cluster/distributed.zig").cmdProbe(io, args[2..]) catch std.process.exit(1);
             return;
         } else if (std.mem.eql(u8, cmd, "launch")) {
             if (args.len < 3) {
@@ -659,7 +659,7 @@ pub fn main(init: std.process.Init) !void {
     var top_k_flag: ?u32 = null;
     var ctx_size: u32 = 0; // 0 = use model default
     // `--dist pipeline`: this server is rank 0 of a multi-Mac group (see distributed.zig).
-    var dist_mode: ?@import("distributed.zig").Mode = null;
+    var dist_mode: ?@import("engines/mlx/cluster/distributed.zig").Mode = null;
     var dist_coordinator: ?[]const u8 = null;
     var dist_device: ?[]const u8 = null;
     var dist_split: ?u32 = null;
@@ -696,7 +696,7 @@ pub fn main(init: std.process.Init) !void {
     var max_resident_mem_explicit: bool = false;
     var idle_evict_secs: ?u32 = null;
     var metrics_enabled = false;
-    @import("w8a8.zig").enabled = @import("w8a8.zig").defaultOn(transformer_mod.naxAvailable(), ane_mod.totalMemBytes());
+    @import("sdk/blocks/dit/w8a8.zig").enabled = @import("sdk/blocks/dit/w8a8.zig").defaultOn(transformer_mod.naxAvailable(), ane_mod.totalMemBytes());
     // GGUF engine routing override. null → auto (decided by gguf_meta on
     // file inspection); set explicitly via --engine to force ds4 or llama.
     var engine_override: ?gguf_meta.Engine = null;
@@ -765,7 +765,7 @@ pub fn main(init: std.process.Init) !void {
             top_k_flag = try std.fmt.parseInt(u32, args[i], 10);
         } else if (std.mem.eql(u8, args[i], "--dist") and i + 1 < args.len) {
             i += 1;
-            dist_mode = @import("distributed.zig").Mode.parse(args[i]) orelse {
+            dist_mode = @import("engines/mlx/cluster/distributed.zig").Mode.parse(args[i]) orelse {
                 log.err("--dist takes pipeline or tensor, got '{s}'\n", .{args[i]});
                 std.process.exit(1);
             };
@@ -870,7 +870,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--lan-share") and i + 1 < args.len) {
             i += 1;
             // Borrowed from argv, like --api-key. serve() starts the LAN
-            // subsystem (src/lan.zig) once the listener is bound.
+            // subsystem (src/host/lan/lan.zig) once the listener is bound.
             if (args[i].len > 0) server_mod.g_lan_share_spec = args[i];
         } else if (std.mem.eql(u8, args[i], "--lan-name") and i + 1 < args.len) {
             i += 1;
@@ -904,15 +904,15 @@ pub fn main(init: std.process.Init) !void {
                 std.process.exit(1);
             };
         } else if (std.mem.eql(u8, args[i], "--w8a8")) {
-            @import("w8a8.zig").enabled = true;
+            @import("sdk/blocks/dit/w8a8.zig").enabled = true;
         } else if (std.mem.eql(u8, args[i], "--no-w8a8")) {
-            @import("w8a8.zig").enabled = false;
+            @import("sdk/blocks/dit/w8a8.zig").enabled = false;
         } else if (std.mem.eql(u8, args[i], "--int8-qk")) {
-            @import("nax_attention.zig").int8_qk_cli = true;
+            @import("sdk/blocks/attention/nax_attention.zig").int8_qk_cli = true;
         } else if (std.mem.eql(u8, args[i], "--lm-head-mxfp8")) {
-            @import("transformer.zig").lm_head_mxfp8_cli = true;
+            @import("engines/mlx/transformer.zig").lm_head_mxfp8_cli = true;
         } else if (std.mem.eql(u8, args[i], "--no-lm-head-mxfp8")) {
-            @import("transformer.zig").lm_head_mxfp8_cli = false;
+            @import("engines/mlx/transformer.zig").lm_head_mxfp8_cli = false;
         } else if (std.mem.eql(u8, args[i], "--ane-image")) {
             ane_media.image = true;
         } else if (std.mem.eql(u8, args[i], "--ane-video")) {
@@ -1352,7 +1352,7 @@ pub fn main(init: std.process.Init) !void {
     // backend is picked at load time by file extension + family: DeepSeek-V4-Flash
     // goes to `lib/ds4/` (antirez/ds4, a bespoke engine for that architecture);
     // every other `.gguf` goes to the embedded llama.cpp engine (`lib/llama_shim/`
-    // + `src/arch/llama.zig`). Any path ending in `.gguf` (or a directory
+    // + `src/engines/llama/bridge.zig`). Any path ending in `.gguf` (or a directory
     // containing one) bypasses the MLX safetensors path entirely. Both offline
     // (`--prompt`) and serve (`--serve`) modes are wired; serve constructs a stub
     // LoadedModel whose request handlers route through the engine.
@@ -1450,7 +1450,7 @@ pub fn main(init: std.process.Init) !void {
             std.process.exit(1);
         };
         log.info("[dist] cluster host at {s}: the worker can join any time\n", .{coordinator});
-        try @import("distributed.zig").connect(io, allocator, .{ .rank = 0, .coordinator = coordinator, .device = device }, mode, group_model, dist_split);
+        try @import("engines/mlx/cluster/distributed.zig").connect(io, allocator, .{ .rank = 0, .coordinator = coordinator, .device = device }, mode, group_model, dist_split);
     }
 
     if (serve_mode) {
@@ -1836,7 +1836,7 @@ const logResolveGgufError = model_discovery.logResolveGgufError;
 /// `deepseek4` + the antirez-style MLA key, or a ds4-only arch (V4.1, Qwen3.8
 /// Flash Next, GLM 5.x) → ds4; everything else → llama.cpp.
 /// Issue #15 — the previous basename heuristic mis-routed two real-world
-/// files; see `src/gguf_meta.zig` for the rule.
+/// files; see `src/host/registry/engine_pick.zig` for the rule.
 ///
 /// On any inspection failure (file unreadable, malformed header, etc.) we
 /// default to llama.cpp and log the reason. Caller still gets a sane attempt
@@ -2764,5 +2764,5 @@ fn parseSizeArg(s: []const u8) !u64 {
 
 // Tests for the GGUF path helpers (`isMmprojGgufBasename`,
 // `isGgufModelPath`, `resolveGgufFile`) live with the implementations in
-// `src/model_discovery.zig` (where they get picked up by `zig build test`);
+// `src/host/registry/discovery.zig` (where they get picked up by `zig build test`);
 // main.zig itself is the executable root and is not in the test pool.

@@ -1,5 +1,5 @@
 #!/bin/bash
-# Guard: upstream chat providers (~/.mlx-serve/providers.json, src/providers.zig).
+# Guard: upstream chat providers (~/.mlx-serve/providers.json, src/host/api/providers.zig).
 #
 # Two Python stubs stand in for providers: one lists models on /v1/models,
 # one has no model list at all (404) and relies on the declared `models`.

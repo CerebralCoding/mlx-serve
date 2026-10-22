@@ -3,7 +3,7 @@
 
 USER-RUN (needs torch + safetensors + numpy + huggingface_hub, ~330 MB
 download; safetensors serialises through numpy, so it is NOT optional). Not
-run in CI. Produces the dir `src/kokoro.zig` loads:
+run in CI. Produces the dir `src/plugins/kokoro/kokoro.zig` loads:
 
     <out>/config.json            upstream config + "model_type": "kokoro"
     <out>/model.safetensors      f32 trunk, weight-norm FOLDED
