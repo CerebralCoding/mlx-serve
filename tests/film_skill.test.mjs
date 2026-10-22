@@ -419,6 +419,12 @@ test("gen.mjs 3d sends the finish only when asked, so the model keeps its own ro
   assert.equal(painted.body.clearcoat, 1);
 });
 
+test("gen.mjs 3d sends --resolution, so a GPU short of the 1024 peak can ask for 512", async () => {
+  const png = encodePng({ w: 8, h: 8, data: new Uint8Array(8 * 8 * 4).fill(255) });
+  assert.equal((await threeDRun({ ref: png })).body.resolution, undefined);
+  assert.equal((await threeDRun({ ref: png, args: ["--resolution", "512"] })).body.resolution, 512);
+});
+
 test("gen.mjs 3d cuts the plain background off the reference image, because TRELLIS.2 and Pixal3D read the alpha as the subject", async () => {
   const w = 32, h = 32, data = new Uint8Array(w * h * 4).fill(255);
   for (let y = 12; y < 20; y++) for (let x = 12; x < 20; x++) data.set([200, 30, 30, 255], (y * w + x) * 4);

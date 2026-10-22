@@ -201,7 +201,7 @@ minutes and hold a lot of memory: one at a time, unload the model after.
 | `fov` | Pixal3D: horizontal field of view of the picture(s) in degrees (1-120). For `image` that is the cutout as cropped to its subject; the reference estimates it with MoGe-2, which is not shipped, so the default is 49.1. With `images` the default is the rig's 20 |
 | `texture` | Hunyuan3D only: `true` = paint PBR textures too (slower; 400 if the pack has no paint weights). TRELLIS.2 and Pixal3D are always textured |
 | `octree_resolution` | Hunyuan3D: 64-512, default 256; higher = finer mesh, slower |
-| `resolution` | TRELLIS.2 and Pixal3D: 1024 (default, about 23 GB of free GPU memory) or 1536 (about 36 GB; a 400 names the shortfall); 512 only on TRELLIS.2 packs that ship the 512 texture model |
+| `resolution` | TRELLIS.2 and Pixal3D: 1024 (default, about 23 GB of free GPU memory) or 1536 (about 36 GB; a 400 names the shortfall); 512 only on packs that ship the 512 texture model (about 6 GB; `gen.mjs 3d --resolution 512`) |
 | `decimation_target`, `texture_size` | TRELLIS.2 and Pixal3D: faces kept (10000-2000000, default 300000) and texture side (512/1024/2048/4096, default 2048) |
 | `roughness_scale`, `clearcoat` | TRELLIS.2 and Pixal3D, the GLB's finish: `roughness_scale` (0.05-2) multiplies the model's roughness map, below 1 is glossier; `clearcoat` (0-1) adds a clear layer. Omitted = what the model predicted. Hunyuan3D refuses both by name |
 | `steps`, `guidance_scale`, `seed`, `texture_steps` | Hunyuan3D defaults 30 / 5.0 / 42 / 30; TRELLIS.2 and Pixal3D `steps` omitted = the published 12 |

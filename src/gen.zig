@@ -5363,9 +5363,10 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         return if (tower) qwenImageEditPeakBytes(te, rest, mlx.maxRecommendedWorkingSet(), true) else qwenImagePeakBytes(te, rest, mlx.maxRecommendedWorkingSet());
     }
     if (std.mem.eql(u8, model_type, "trellis2") or std.mem.eql(u8, model_type, "pixal3d")) {
-        // Every stage loads its own weights and frees them, so the bill is a request's peak, not the dir sum.
+        // Every stage loads its own weights and frees them, so the bill is the smallest servable request's
+        // peak, not the dir sum; each request is refused by name past its own resolution's peak.
         _ = dir.statFile(io, "pipeline.json", .{}) catch return 0; // unknown dir -> never block
-        return trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution);
+        return trellis2PeakBytes(if (trellis2_pipeline.packServes512(io, std.heap.page_allocator, dir)) 512 else 1024);
     }
     if (std.mem.eql(u8, model_type, "moss_image")) {
         // Everything stays resident (the Qwen3.5 encoder too), plus a default-size request.
@@ -6560,14 +6561,18 @@ test "TRELLIS.2 and Pixal3D bill covers the measured peak at every resolution" {
     try testing.expect(trellis2PeakBytes(512) < trellis2PeakBytes(1024));
 }
 
-test "TRELLIS.2 load estimate is the default-resolution peak and an unreadable dir never blocks" {
+test "TRELLIS.2 load estimate is the smallest served resolution's peak and an unreadable dir never blocks" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
     try testing.expectEqual(@as(u64, 0), estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
-    try tmp.dir.writeFile(io, .{ .sub_path = "pipeline.json", .data = "{\"name\":\"Trellis2ImageTo3DPipeline\"}" });
-    try testing.expectEqual(trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution), estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
-    try testing.expectEqual(trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution), estimatePeakResidentBytesIn(io, tmp.dir, "pixal3d"));
+    const pj = "{\"args\":{\"models\":{\"tex_slat_flow_model_512\":\"ckpts/tex512\"}}}";
+    try tmp.dir.writeFile(io, .{ .sub_path = "pipeline.json", .data = pj });
+    try testing.expectEqual(trellis2PeakBytes(1024), estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
+    try tmp.dir.createDirPath(io, "ckpts");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ckpts/tex512.safetensors", .data = "x" });
+    try testing.expectEqual(trellis2PeakBytes(512), estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
+    try testing.expectEqual(trellis2PeakBytes(512), estimatePeakResidentBytesIn(io, tmp.dir, "pixal3d"));
 }
 
 test "TRELLIS.2 request is refused by name when its peak does not fit the free GPU memory" {

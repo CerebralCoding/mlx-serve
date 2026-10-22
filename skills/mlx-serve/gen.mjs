@@ -23,7 +23,7 @@ Generate (picks the model by capability from /v1/models; --model <id> overrides)
   node gen.mjs speech "<text>" -o line.wav [--voice af_heart]
   node gen.mjs music "<prompt>" -o theme.wav [--lyrics lyrics.txt] [--duration 90]
   node gen.mjs sound "<prompt>" -o door.wav [--duration 2]
-  node gen.mjs 3d "<object prompt>" -o lantern.glb [--height 1.6] [--max-tris 8000] [--max-texture 2048] [--quantize] [--vehicle] [--roughness-scale 0.5 --clearcoat 0.6]
+  node gen.mjs 3d "<object prompt>" -o lantern.glb [--height 1.6] [--max-tris 8000] [--max-texture 2048] [--quantize] [--vehicle] [--roughness-scale 0.5 --clearcoat 0.6] [--resolution 512]
   node gen.mjs 3d ref.png -o lantern.glb          (from an image of one object)
   node gen.mjs batch assets.json [--force] [--keep-loaded]
   node gen.mjs models
@@ -1016,7 +1016,7 @@ async function main() {
       if (opt.duration) job.duration_seconds = num(opt.duration);
       if (opt.lyrics) job.lyrics = existsSync(opt.lyrics) ? readFileSync(opt.lyrics, "utf8") : opt.lyrics;
       Object.assign(job, { tile: opt.tile, maps: opt.maps, cutout: opt.cutout, trim: opt.trim, holes: opt.holes, height_m: num(opt.height), size_m: num(opt.size_m), max_tris: num(opt["max-tris"]), max_texture: num(opt["max-texture"]), quantize: opt.quantize, vehicle: opt.vehicle,
-        roughness_scale: num(opt["roughness-scale"]), clearcoat: num(opt.clearcoat) });
+        roughness_scale: num(opt["roughness-scale"]), clearcoat: num(opt.clearcoat), resolution: num(opt.resolution) });
       job.file ||= { image: "image.png", "3d": "model.glb" }[cmd] || cmd + ".wav";
       for (const k of Object.keys(job)) if (job[k] === undefined) delete job[k];
       const r = await runJob(job, ".");

@@ -103,6 +103,21 @@ pub fn resolutionServed(res: u32, has_512: bool) bool {
     };
 }
 
+/// Whether the pack in `dir` serves 512: its pipeline.json names a 512 texture flow that is on disk.
+pub fn packServes512(io: std.Io, gpa: std.mem.Allocator, dir: std.Io.Dir) bool {
+    var arena = std.heap.ArenaAllocator.init(gpa);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const bytes = dir.readFileAlloc(io, "pipeline.json", a, .limited(1 << 20)) catch return false;
+    const P = struct { args: struct { models: struct { tex_slat_flow_model_512: []const u8 = "" } } };
+    const p = std.json.parseFromSliceLeaky(P, a, bytes, .{ .ignore_unknown_fields = true }) catch return false;
+    const rel = p.args.models.tex_slat_flow_model_512;
+    if (rel.len == 0) return false;
+    const path = std.fmt.allocPrint(a, "{s}.safetensors", .{rel}) catch return false;
+    dir.access(io, path, .{}) catch return false;
+    return true;
+}
+
 /// Each flow stage draws its own noise: the request's seed offset by the stage, wrapping at the top of u64.
 pub fn stageSeed(seed: u64, stage: u64) u64 {
     return seed +% stage;
