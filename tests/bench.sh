@@ -125,6 +125,7 @@ if [[ -n "$URL" ]]; then
     probe "$(echo "$URL_MODEL" | tr '/ ' '__')" "$URL" "$URL_MODEL"
 else
     [[ -x "$BINARY" ]] || { echo "no $BINARY — build ReleaseFast first" >&2; exit 1; }
+    [[ "$("$BINARY" --version 2>/dev/null | head -1)" != *"(Debug)"* ]] || { echo "$BINARY is a Debug build (2-4x slower) — build ReleaseFast first" >&2; exit 1; }
     echo "=== bench: mlx-serve, tag=$TAG, reports → $OUT ==="
     trap 'stop_server' EXIT
     stop_server

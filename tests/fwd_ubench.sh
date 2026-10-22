@@ -13,6 +13,7 @@ shift 2 2>/dev/null || shift 1
 PORT="${PORT:-8099}"
 BIN="${BIN:-./zig-out/bin/mlx-serve}"
 LOG="${LOG:-/tmp/fwd-ubench-$PORT.log}"
+[[ "$("$BIN" --version 2>/dev/null | head -1)" != *"(Debug)"* ]] || { echo "$BIN is a Debug build (2-4x slower) — build ReleaseFast first" >&2; exit 1; }
 
 pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 1

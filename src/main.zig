@@ -713,7 +713,8 @@ pub fn main(init: std.process.Init) !void {
             defer _ = mlx.mlx_string_free(mlx_ver);
             _ = mlx.mlx_version(&mlx_ver);
             const info = version_mod.Info{
-                .app = VERSION,
+                // The build mode rides the app line: the bench scripts refuse a Debug binary by it.
+                .app = VERSION ++ " (" ++ @tagName(@import("builtin").mode) ++ ")",
                 .mlx = std.mem.span(mlx.mlx_string_data(mlx_ver)),
                 .mlx_c = build_options.mlx_c_version,
                 .nax = transformer_mod.naxStatus(),
