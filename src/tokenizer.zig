@@ -1021,6 +1021,7 @@ fn gpt2PreTokenize(allocator: std.mem.Allocator, text: []const u8, digit_group: 
 /// is one piece, as HF keeps an unmatched span.
 fn llama3PreTokenize(allocator: std.mem.Allocator, text: []const u8, strict_punct: bool, words: *std.ArrayList([]const u8)) !void {
     var i: usize = 0;
+    var gap_end: ?usize = null;
     while (i < text.len) {
         const start = i;
 
@@ -1072,11 +1073,19 @@ fn llama3PreTokenize(allocator: std.mem.Allocator, text: []const u8, strict_punc
         }
 
         if (strict_punct) {
-            while (decodeCodepoint(text, i)) |c| {
-                if (i > start and !isOtherCp(c.cp)) break;
-                i += c.len;
+            // HF keeps the run of positions no branch matches as one piece: extend the last one.
+            i += if (decodeCodepoint(text, i)) |c| c.len else 1;
+            var span_start = start;
+            if (gap_end == start) {
+                const prev = words.pop().?;
+                span_start = start - prev.len;
+                allocator.free(prev);
             }
-        } else i += 1;
+            gap_end = i;
+            try words.append(allocator, try allocator.dupe(u8, text[span_start..i]));
+            continue;
+        }
+        i += 1;
         try words.append(allocator, try allocator.dupe(u8, text[start..i]));
     }
 }
@@ -2577,6 +2586,20 @@ test "Flint's pre-tokenizer: the cased grammar over isolated digit and CJK runs,
     const fuzz = [_][]const u8{ "  \u{2028}", "\u{2003}", "\u{200b}", "(don't", ":}?]", "Z", "\u{2028}", "\u{1680}", ":", "\u{2003}" };
     try testing.expectEqual(fuzz.len, words.items.len);
     for (fuzz, words.items) |w, got| try testing.expectEqualStrings(w, got);
+    // The unmatched span ends where any branch matches again, never at the next non-`\p{C}` character.
+    const gaps = [_]struct { in: []const u8, want: []const []const u8 }{
+        .{ .in = "\u{200b}\tfoo", .want = &.{ "\u{200b}", "\tfoo" } },
+        .{ .in = "\u{200b}\u{200b}Hello", .want = &.{ "\u{200b}", "\u{200b}Hello" } },
+        .{ .in = "\u{feff}\nimport", .want = &.{ "\u{feff}", "\n", "import" } },
+        .{ .in = "a\u{200b}\u{200b}", .want = &.{ "a", "\u{200b}\u{200b}" } },
+    };
+    for (gaps) |g| {
+        for (words.items) |w| testing.allocator.free(w);
+        words.clearRetainingCapacity();
+        try isolatedRunsPreTokenize(testing.allocator, g.in, style, 3, runs, &words);
+        try testing.expectEqual(g.want.len, words.items.len);
+        for (g.want, words.items) |w, got| try testing.expectEqualStrings(w, got);
+    }
 }
 
 test "the plain Llama-3 regex is the gpt2 grammar with 3-digit groups, never the cased one" {

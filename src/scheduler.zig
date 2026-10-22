@@ -4248,14 +4248,14 @@ fn pauseLoadAvail(io: std.Io) void {
 }
 
 /// Memory an unload just freed reaches the OS over a second or two (150 GB of wired weights on an
-/// M5 Ultra): a reading too low for the load is re-read every pause while it still climbs, for at
-/// most 5 s; five readings without growth leave the refusal standing.
+/// M5 Ultra), or all at once ~700 ms late (16 GB M4): a reading too low for the load is re-read
+/// every pause, for at most 5 s; two seconds without growth leave the refusal standing.
 fn settledAvail(need: u64, first: u64, ctx: anytype, comptime measure: fn (@TypeOf(ctx)) u64, comptime pause: fn (@TypeOf(ctx)) void) u64 {
     const step: u64 = 64 << 20; // below this the reading is noise, not memory coming back
     var avail = first;
     var flat: u32 = 0;
     var reads: u32 = 0;
-    while (memInsufficientForLoad(need, avail) and flat < 5 and reads < 50) : (reads += 1) {
+    while (memInsufficientForLoad(need, avail) and flat < 20 and reads < 50) : (reads += 1) {
         pause(ctx);
         const next = measure(ctx);
         if (next > avail +| step) {
@@ -4293,10 +4293,13 @@ test "settledAvail: a refused reading waits while freed memory still reaches the
     // An unload's 150 GB unwires over a few readings: the load fits once it lands.
     var climbing = Seq{ .vals = &.{ 80 * GB, 140 * GB, 200 * GB, 230 * GB } };
     try std.testing.expectEqual(200 * GB, settledAvail(180 * GB, 66 * GB, &climbing, Seq.measure, Seq.pause));
-    // Nothing being freed: the refusal stands after five flat readings, not five seconds.
+    // A 16 GB M4 unloading 7.3 GB: flat for ~700 ms, then the whole release lands at once.
+    var stepped = Seq{ .vals = &.{ 5 * GB, 5 * GB, 5 * GB, 5 * GB, 5 * GB, 5 * GB, 5 * GB, 11 * GB } };
+    try std.testing.expectEqual(11 * GB, settledAvail(6 * GB, 5 * GB, &stepped, Seq.measure, Seq.pause));
+    // Nothing being freed: the refusal stands after two seconds of flat readings, not five.
     var flat = Seq{ .vals = &.{66 * GB} };
     try std.testing.expectEqual(66 * GB, settledAvail(180 * GB, 66 * GB, &flat, Seq.measure, Seq.pause));
-    try std.testing.expectEqual(@as(usize, 5), flat.i);
+    try std.testing.expectEqual(@as(usize, 20), flat.i);
     // A load that already fits never waits.
     var fits = Seq{ .vals = &.{0} };
     try std.testing.expectEqual(200 * GB, settledAvail(10 * GB, 200 * GB, &fits, Seq.measure, Seq.pause));

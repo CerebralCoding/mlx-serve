@@ -381,11 +381,12 @@ else
 fi
 
 # [11b] The first request of a burst is admitted alone and arms DFlash; once the
-# others arrive it must yield and decode in the batched group, not tick serial beside it.
+# others reach the crowd threshold (`mtpCrowdThresholdFor`: up to 9 on a dense target)
+# it must yield and decode in the batched group, not tick serial beside it.
 gen "Write a long story about a lighthouse keeper and the winter storms." 200 ", \"enable_drafter\": true" > /dev/null &
 BURST_PIDS="$!"
 sleep 1
-for i in 2 3 4; do
+for i in $(seq 2 10); do
     gen "Write a long story about harbour pilot number $i and the fog." 120 "" > /dev/null &
     BURST_PIDS="$BURST_PIDS $!"
 done

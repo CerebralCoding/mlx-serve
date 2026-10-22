@@ -2019,7 +2019,7 @@
 "The stored generation policy contains invalid or unsupported fields. It is preserved; correct model-settings.json before editing it here." = "저장된 생성 정책에 잘못되었거나 지원하지 않는 필드가 있습니다. 내용은 그대로 보존됩니다. 여기서 편집하기 전에 model-settings.json을 수정하세요.";
 "Keeps only the k most likely next tokens. Lower values narrow choices; 0 disables this filter." = "다음에 올 가능성이 가장 높은 k개의 토큰만 남깁니다. 값이 낮을수록 선택 폭이 좁아지며, 0이면 이 필터를 끕니다.";
 "1 disables repetition penalty. Nonneutral penalties can disable speculative and batched decoding." = "1이면 반복 페널티를 끕니다. 중립값이 아닌 페널티는 추측 디코딩과 배치 디코딩을 비활성화할 수 있습니다.";
-"Uses this engine's existing frequency-penalty mapping. Repetition and frequency penalties share one sampler control." = "이 엔진의 기존 빈도 페널티 매핑을 사용합니다. 반복 페널티와 빈도 페널티는 하나의 샘플러 설정을 공유합니다.";
+"Discourage tokens in proportion to how often they already appeared. 0 disables the penalty." = "이미 등장한 횟수에 비례해 토큰을 덜 고르게 합니다. 0이면 페널티를 끕니다.";
 "0 uses remaining context. Context and memory limits still apply." = "0이면 남은 컨텍스트를 사용합니다. 컨텍스트와 메모리 한도는 그대로 적용됩니다.";
 "API: reasoning_budget_tokens. -1 is unlimited; 0 closes thinking immediately. Effort words map against this budget." = "API: reasoning_budget_tokens. -1은 무제한, 0은 생각을 즉시 끝냅니다. 추론 강도 단어는 이 예산을 기준으로 환산됩니다.";
 "Explicit client thinking or effort wins unless locked." = "잠그지 않으면 클라이언트가 명시한 생각 또는 추론 강도가 우선합니다.";

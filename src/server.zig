@@ -2477,7 +2477,7 @@ fn readRequestWithin(allocator: std.mem.Allocator, stream: *Conn, limit_ms: i64)
     if (total_size > max_request_size) {
         var msg_buf: [128]u8 = undefined;
         const msg = payloadTooLargeMessage(&msg_buf, total_size, max_request_size);
-        log.warn("[http] 413 {s}: {s}\n", .{ req_path, msg });
+        log.warn("[http] 413 {s}: {s}\n", .{ logSafePath(req_path), msg });
         try sendErrorResponse(allocator, stream, "413 Payload Too Large", "invalid_request_error", msg, 413);
         // Closing with body bytes unread resets the connection, and the client
         // can lose the 413 before reading it: read what is left, up to the chat cap.
@@ -2549,7 +2549,7 @@ fn handleConnection(
     // carries its model in a multipart FIELD, which only the content-type's
     // boundary lets us find (`parseModelFromRequest`).
     const request_content_type = findHeaderValue(request[0..header_end_pos], "content-type") orelse "";
-    logHttpRequest(method, raw_path, request_body);
+    logHttpRequest(method, logSafePath(raw_path), logSafeBody(method, path, request_content_type, request_body));
     if (multipart.boundaryFromContentType(request_content_type) == null and jsonNestingDepth(request_body) > MAX_JSON_DEPTH) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Request JSON nests deeper than 4096 levels", 400);
         return;
@@ -13475,6 +13475,68 @@ fn logHttpResponse(status: []const u8, content_type: []const u8, body: []const u
     if (responseBodyLogged(content_type)) logHttpBody("[http] response body", body);
 }
 
+/// The path as logged: a query carrying the API key is dropped.
+fn logSafePath(raw_path: []const u8) []const u8 {
+    if (queryParamValue(raw_path, "api_key") == null and queryParamValue(raw_path, "key") == null) return raw_path;
+    return raw_path[0 .. std.mem.indexOfScalar(u8, raw_path, '?') orelse raw_path.len];
+}
+
+/// The body as logged: the login form's POST carries the API key.
+fn logSafeBody(method: []const u8, path: []const u8, content_type: []const u8, body: []const u8) []const u8 {
+    return if (loginFormKey(method, path, content_type, body) != null) "" else body;
+}
+
+test "a logged request never carries the API key" {
+    try testing.expectEqualStrings("/metrics", logSafePath("/metrics?api_key=s3cret"));
+    try testing.expectEqualStrings("/v1/models", logSafePath("/v1/models?x=1&key=s3cret"));
+    try testing.expectEqualStrings("/v1/messages?beta=true", logSafePath("/v1/messages?beta=true"));
+    const ct = "application/x-www-form-urlencoded";
+    try testing.expectEqualStrings("", logSafeBody("POST", "/", ct, "api_key=s3cret"));
+    try testing.expectEqualStrings("{\"a\":1}", logSafeBody("POST", "/v1/chat/completions", "application/json", "{\"a\":1}"));
+}
+
+test "the default-level log lines never carry the API key either" {
+    var tmp = std.testing.tmpDir(.{});
+    defer tmp.cleanup();
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(std.Io.Threaded.global_single_threaded.io(), &root_buf)];
+    var path_buf: [600]u8 = undefined;
+    const path = try std.fmt.bufPrint(&path_buf, "{s}/s.log", .{root});
+    try log.openFile(path, 0);
+    defer log.closeFile();
+
+    // The 413 for an oversized body (warn).
+    var body_buf: [64]u8 = undefined;
+    var reply_buf: [1024]u8 = undefined;
+    _ = try readRequestOver("POST /v1/chat/completions?api_key=s3cret HTTP/1.1\r\nContent-Length: 18446744073709551615\r\n\r\n{}", &body_buf, &reply_buf);
+
+    // The LAN proxy line (info), to a peer that accepts nothing.
+    const a = testing.allocator;
+    var l = lan_mod.Lan{ .alloc = a, .port = 0, .discover = true, .peers = .init(a), .known = .init(a) };
+    defer {
+        var it = l.peers.valueIterator();
+        while (it.next()) |p| p.deinit(a);
+        l.peers.deinit();
+        l.known.deinit();
+    }
+    const models = try a.alloc(lan_mod.PeerModel, 1);
+    models[0] = .{ .id = try a.dupe(u8, "gemma"), .entry_json = try a.dupe(u8, "{}") };
+    l.installPeer("studio", .{ 127, 0, 0, 1 }, 1, models, false, .{});
+    var sv: [2]std.posix.fd_t = undefined;
+    try testing.expect(std.c.socketpair(1, 1, 0, &sv) == 0);
+    var conn: Conn = undefined;
+    Conn.init(&conn, .{ .socket = .{ .handle = sv[0], .address = undefined } }, testing.io);
+    defer conn.close();
+    defer _ = std.c.close(sv[1]);
+    try handleLanProxy(a, &conn, &l, "POST", "/v1/chat/completions?key=s3cret", "{\"model\":\"gemma@studio\"}", null, "gemma@studio");
+
+    const logged = try tmp.dir.readFileAlloc(std.Io.Threaded.global_single_threaded.io(), "s.log", a, .limited(1 << 20));
+    defer a.free(logged);
+    try testing.expect(std.mem.indexOf(u8, logged, "[lan] proxy") != null); // both lines were written
+    try testing.expect(std.mem.indexOf(u8, logged, "413") != null);
+    try testing.expect(std.mem.indexOf(u8, logged, "s3cret") == null);
+}
+
 /// The console page is half a megabyte of our own HTML and says nothing about a request;
 /// API responses (JSON, text) are what a post-mortem reads.
 fn responseBodyLogged(content_type: []const u8) bool {
@@ -13941,7 +14003,7 @@ fn handleLanProxy(allocator: std.mem.Allocator, stream: *Conn, l: *lan_mod.Lan, 
     defer allocator.free(rewritten);
     const key = l.peerKey(allocator, rid.peer);
     defer if (key) |k| allocator.free(k);
-    log.info("[lan] proxy {s} {s} -> \"{s}\" @ {d}.{d}.{d}.{d}:{d}\n", .{ method, raw_path, rid.peer, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port });
+    log.info("[lan] proxy {s} {s} -> \"{s}\" @ {d}.{d}.{d}.{d}:{d}\n", .{ method, logSafePath(raw_path), rid.peer, remote.ip4[0], remote.ip4[1], remote.ip4[2], remote.ip4[3], remote.port });
     lan_mod.tunnel(remote, method, raw_path, rewritten, key, stream) catch {
         try sendErrorResponse(allocator, stream, "502 Bad Gateway", "lan_peer_unreachable", "LAN peer did not accept the connection", 502);
     };

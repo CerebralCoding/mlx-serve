@@ -5097,6 +5097,14 @@ pub fn trellis2PeakBytes(resolution: u32) u64 {
     return mib << 20;
 }
 
+/// The load bill: the default request's peak, so a load evicts idle models for it; a GPU whose ceiling
+/// cannot pass that peak through the load preflight bills 512 when the pack serves it, and each request
+/// is still refused by name past its own peak.
+fn trellis2LoadBillBytes(serves512: bool, gpu_ceiling: u64) u64 {
+    const def = trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution);
+    return if (@import("scheduler.zig").loadRequirementBytes(def) > gpu_ceiling and serves512) trellis2PeakBytes(512) else def;
+}
+
 /// The MLX peak one mesh request reaches, for the scheduler's reserve: the cascade resolution moves it by
 /// 12 GB. 0 keeps the model's own resident estimate (Hunyuan). An unservable `resolution` bills the largest
 /// cascade; the handler's 400 follows.
@@ -5394,7 +5402,7 @@ fn estimatePeakResidentBytesInDir(io: std.Io, dir: std.Io.Dir, model_type: []con
         // Every stage loads its own weights and frees them, so the bill is the smallest servable request's
         // peak, not the dir sum; each request is refused by name past its own resolution's peak.
         _ = dir.statFile(io, "pipeline.json", .{}) catch return 0; // unknown dir -> never block
-        return trellis2PeakBytes(if (trellis2_pipeline.packServes512(io, std.heap.page_allocator, dir)) 512 else 1024);
+        return trellis2LoadBillBytes(trellis2_pipeline.packServes512(io, std.heap.page_allocator, dir), mlx.maxRecommendedWorkingSet());
     }
     if (std.mem.eql(u8, model_type, "moss_image")) {
         // Everything stays resident (the Qwen3.5 encoder too), plus a default-size request.
@@ -6593,7 +6601,7 @@ test "TRELLIS.2 and Pixal3D bill covers the measured peak at every resolution" {
     try testing.expect(trellis2PeakBytes(512) < trellis2PeakBytes(1024));
 }
 
-test "TRELLIS.2 load estimate is the smallest served resolution's peak and an unreadable dir never blocks" {
+test "TRELLIS.2 load estimate reads whether the pack serves 512 and an unreadable dir never blocks" {
     const io = std.Io.Threaded.global_single_threaded.io();
     var tmp = std.testing.tmpDir(.{});
     defer tmp.cleanup();
@@ -6603,8 +6611,19 @@ test "TRELLIS.2 load estimate is the smallest served resolution's peak and an un
     try testing.expectEqual(trellis2PeakBytes(1024), estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
     try tmp.dir.createDirPath(io, "ckpts");
     try tmp.dir.writeFile(io, .{ .sub_path = "ckpts/tex512.safetensors", .data = "x" });
-    try testing.expectEqual(trellis2PeakBytes(512), estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
-    try testing.expectEqual(trellis2PeakBytes(512), estimatePeakResidentBytesIn(io, tmp.dir, "pixal3d"));
+    const served = trellis2LoadBillBytes(true, mlx.maxRecommendedWorkingSet());
+    try testing.expectEqual(served, estimatePeakResidentBytesIn(io, tmp.dir, "trellis2"));
+    try testing.expectEqual(served, estimatePeakResidentBytesIn(io, tmp.dir, "pixal3d"));
+}
+
+test "TRELLIS.2 load bill is the default request's peak wherever the GPU can take it" {
+    const def = trellis2PeakBytes((trellis2_pipeline.Opts{}).resolution);
+    // A big GPU keeps billing the default request, so the load evicts idle models for it.
+    try testing.expectEqual(def, trellis2LoadBillBytes(true, 128 << 30));
+    // A GPU short of it, warmup headroom included, loads the pack for 512 requests when the pack serves them.
+    try testing.expectEqual(trellis2PeakBytes(512), trellis2LoadBillBytes(true, 16 << 30));
+    try testing.expectEqual(trellis2PeakBytes(512), trellis2LoadBillBytes(true, 25 << 30));
+    try testing.expectEqual(def, trellis2LoadBillBytes(false, 16 << 30));
 }
 
 test "TRELLIS.2 request is refused by name when its peak does not fit the free GPU memory" {

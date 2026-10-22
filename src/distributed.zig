@@ -704,7 +704,13 @@ pub fn noteJob(split: [2]u32, comptime fmt: []const u8, args: anytype) void {
 pub fn shutdown() void {
     const p = peer() orelse return;
     if (!p.ready) return;
-    sendMsg(&p.link, .{ OP_STOP, 0, 0, 0, 0, 0, 0, 0 }, 1) catch return;
+    // The stopped worker posts no more receives: a later message (the model's unload) would wait forever.
+    p.ready = false;
+    sendMsg(&p.link, .{ OP_STOP, 0, 0, 0, 0, 0, 0, 0 }, 1) catch |err| {
+        var eb: [512]u8 = undefined;
+        log.warn("[dist] the stop did not reach the worker ({s}: {s})\n", .{ @errorName(err), mlx.takeError(&eb) orelse "" });
+        return;
+    };
     log.info("[dist] worker released\n", .{});
 }
 
@@ -1737,4 +1743,15 @@ test "the leader bills only the layers it keeps of a model its pair splits" {
     try std.testing.expectEqual(@as(u64, 500), shareFor(g, &c, 800, 60, 40));
     // A worker that has not said how much it has: the whole model.
     try std.testing.expectEqual(@as(u64, 800), shareFor(g, &c, 800, 60, 0));
+}
+
+test "after the stop message rank 0 sends the worker nothing more" {
+    if (comptime builtin.os.tag != .macos) return error.SkipZigTest; // a cluster exists only on macOS
+    // A read-only bell fails to ring, so no message reaches the (absent) RDMA link.
+    const fd = std.c.open("/dev/null", .{ .ACCMODE = .RDONLY });
+    defer _ = std.c.close(fd);
+    peer_slot = .{ .link = .{ .group = undefined, .rank = 0, .size = 2, .bell = .{ .fd = fd } }, .mode = .pipeline, .model = "/m/H3", .split = null, .worker = undefined, .ready = true };
+    defer peer_slot = null;
+    shutdown();
+    try std.testing.expect(!peer().?.ready); // the model's unload at teardown must not message a stopped worker
 }

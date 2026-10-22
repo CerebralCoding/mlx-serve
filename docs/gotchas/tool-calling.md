@@ -934,4 +934,11 @@ Guard: `tests/dsv41_template_ab.py` (byte-exact vs the encoder) dumps the cases 
 Defect: in long pi sessions the iQ-MLX-4.7bpw pack sometimes answered with a complete `<invoke name="bash"><parameter name="command">…</parameter></invoke>` block as plain content, `finish_reason: "stop"`, no `tool_calls`. The agent took it as a final answer and stopped.
 Cause: the checkpoint has seen Claude transcripts and samples their dialect in place of its own `<tool_call>`. No parser knew a bare `<invoke` (only ATEM's `<atem:invoke` and DSML's), and neither the stream gate nor the scrubber held or cut it.
 Fix: `BARE_INVOKE` is ATEM's grammar without the namespace, parsed when no other family matched, as `.inferred` so an undeclared name stays prose; `invokeOpenerHoldsForTools` holds `<function_calls>` and `<invoke …` with every growing prefix; `bareInvokeMarkupCut` cuts it only beside a `<parameter ` or `</invoke>`.
-Guard: corpus family `qwen4_exp` (call, undeclared name, prose), `parseToolCalls: Anthropic-style bare <invoke> markup…` and the derived-prefix gate test in `chat.zig`.
+Guard: corpus family `qwen4_exp` (call, undeclared name, prose), `parseToolCalls: Anthropic-style bare <invoke> markup…`, `…a bare <invoke> in prose or inside another dialect's value is not a call` (it once ran before the `<tool` scan, so an echoed `<invoke>` inside a native call's value replaced the call) and the derived-prefix gate test in `chat.zig`.
+
+## Flint doubled its key opener, and Claude Code saw the key `<arg_key>file_path` (2026-10-22)
+
+Defect: in a Claude Code session on Flint (release agent run) an `Edit` call arrived with the argument key `<arg_key>file_path`; Claude Code rejected it as an unexpected parameter and the agent spent a turn retrying.
+Cause: the GLM pair loop takes the key as everything between the `<arg_key>` opener and the next close, so a doubled opener (`<arg_key><arg_key>file_path</arg_key>`) kept the inner opener in the key.
+Fix: the key starts after the LAST opener before its close (`parseHy3ToolCalls`).
+Guard: corpus family `flint`, "a doubled <arg_key> opener keeps the key", and the universal invariant that no parsed argument KEY carries a line break or markup.

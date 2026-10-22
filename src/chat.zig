@@ -3681,7 +3681,6 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
     // arg_key/arg_value body. When it matched, the generic scans are skipped
     // but the shared safety net at the bottom still runs.
     try parseHy3ToolCalls(allocator, effective_text, &calls);
-    if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
     var search_pos: usize = if (calls.items.len > 0) effective_text.len else 0;
     while (search_pos < effective_text.len) {
         const rel = std.mem.indexOf(u8, effective_text[search_pos..], "<tool") orelse break;
@@ -4057,6 +4056,10 @@ pub fn parseToolCalls(allocator: std.mem.Allocator, text: []const u8) !?[]Parsed
             try parseMiniCpm5ToolCalls(allocator, effective_text, &calls);
         }
     }
+
+    // Anthropic's `<invoke>` is another family's dialect, so it runs after every native one:
+    // inside one of their parameter values it is payload, never the call.
+    if (calls.items.len == 0) try parseInvokeToolCalls(allocator, effective_text, &calls, BARE_INVOKE);
 
     // If no <tool_call> tags, try to find raw JSON tool call(s). Never on
     // text carrying the Inkling invoke marker: that format OWNED the parse,
@@ -5574,12 +5577,18 @@ fn parseInvokeToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *
         if (std.mem.indexOfScalar(u8, seg, '>')) |te| {
             const body_all = seg[te + 1 ..];
             const body_end = std.mem.indexOf(u8, body_all, d.invoke_close) orelse body_all.len;
+            // An inferred opener with no parameter and no close is prose, as `bareInvokeMarkupCut` reads it.
+            if (d.inferred and body_end == body_all.len and std.mem.indexOf(u8, body_all, d.param) == null) {
+                pos = after_tag;
+                continue;
+            }
             args_json = try invokeParamsToJson(allocator, body_all[0..body_end], d);
             pos = if (body_end < body_all.len)
                 after_tag + te + 1 + body_end + d.invoke_close.len
             else
                 text.len; // truncated body — completed params already salvaged
         } else {
+            if (d.inferred) break; // an unclosed opener alone is prose
             pos = text.len; // truncated inside the opening tag: NAME + {}
         }
 
@@ -5955,7 +5964,12 @@ fn parseHy3ToolCalls(allocator: std.mem.Allocator, text: []const u8, calls: *std
             const ak_close = earliestIndexOfAny(text, key_start, &.{ "</arg_key", "</arg_value" }) orelse break;
             const ak_close_len = suffixedTagLenAt(text[ak_close..], "</arg_key") orelse
                 suffixedTagLenAt(text[ak_close..], "</arg_value") orelse break;
-            const key = std.mem.trim(u8, text[key_start..ak_close], " \t\n\r");
+            // A doubled opener (`<arg_key><arg_key>K`, Flint) keeps the key after the last one.
+            var key_from = key_start;
+            if (std.mem.lastIndexOf(u8, text[key_start..ak_close], "<arg_key")) |rel| {
+                if (suffixedTagLenAt(text[key_start + rel ..], "<arg_key")) |l| key_from = key_start + rel + l;
+            }
+            const key = std.mem.trim(u8, text[key_from..ak_close], " \t\n\r");
             i = ak_close + ak_close_len;
             while (i < text.len and std.ascii.isWhitespace(text[i])) i += 1;
             const av_len = suffixedTagLenAt(text[i..], "<arg_value") orelse break;
@@ -14135,6 +14149,19 @@ test "parseToolCalls: Anthropic-style bare <invoke> markup is an inferred call (
     try testing.expectEqualStrings("Done.", trimLeakedToolMarkup("Done.\n<function_calls>\n<invoke name=\"bash\">\n<parameter name=\"command\">ls"));
     const prose = "Claude's format wraps each call in <invoke name=\"x\"> tags.";
     try testing.expectEqualStrings(prose, trimLeakedToolMarkup(prose));
+}
+
+test "parseToolCalls: a bare <invoke> in prose or inside another dialect's value is not a call" {
+    const allocator = testing.allocator;
+    // The opener alone is prose, as the scrubber reads it.
+    try testing.expect((try parseToolCalls(allocator, "Claude's format wraps each call in <invoke name=\"bash\"> tags.")) == null);
+    // A Hermes parameter VALUE carrying invoke markup never decides the call.
+    const text = "<tool_call>\n<function=write>\n<parameter=content>\nrun <invoke name=\"bash\"><parameter name=\"command\">ls</parameter></invoke>\n</parameter>\n</function>\n</tool_call>";
+    const calls = (try parseToolCalls(allocator, text)).?;
+    defer freeParsedCalls(calls);
+    try testing.expectEqual(@as(usize, 1), calls.len);
+    try testing.expectEqualStrings("write", calls[0].name);
+    try testing.expect(!calls[0].inferred);
 }
 
 test "streamShouldBufferForTools: every prefix of a bare <invoke> call holds; prose releases" {

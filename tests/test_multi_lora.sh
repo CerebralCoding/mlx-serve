@@ -192,12 +192,10 @@ run_matrix() { # <label> <endpoint> <model> <module> <out> <in> <extra-json> [le
   fi
 
   # [5] THE STACKING CLAIM: two identical adapters at 1.0 == one at 2.0,
-  # byte for byte (d+d is exactly 2d). MiniMax-H3 adds each adapter as its own fused
-  # multiply-add (`lora.addTo`), so there A@1+B@1 and A@2 differ by rounding: the bar is
-  # closeness (mean abs pixel diff under 1/255 on the middle frame), accepted 2026-10-19.
+  # byte for byte (d+d is exactly 2d).
   code=$(post "$ep" "$TMP/$label.stack.json" "$base,\"lora_paths\":[\"$A\",\"$B\"],\"lora_scales\":[1.0,1.0]}")
-  if [ "$code" = "200" ] && { cmp -s "$TMP/$label.two.json" "$TMP/$label.stack.json" || { [ "$label" = minimax-h3 ] && python3 "$ROOT/tests/lora_close.py" "$TMP/$label.two.json" "$TMP/$label.stack.json" >/dev/null; }; }; then
-    ok "$label" "TWO adapters SUM (A@1+B@1 == A@2, byte-identical; H3 within 1/255)"
+  if [ "$code" = "200" ] && cmp -s "$TMP/$label.two.json" "$TMP/$label.stack.json"; then
+    ok "$label" "TWO adapters SUM (A@1+B@1 == A@2, byte-identical)"
     # Covers the scale-2.0 render above too — it is byte-identical to this one.
     not_noise "$label" "$TMP/$label.stack.json" "stacked pair"
   else

@@ -1293,6 +1293,17 @@ const corpus = [_]Expect{
         .tool_arg_key = "path",
         .tool_arg_value = "hello.py",
     },
+    .{
+        // Claude Code on Flint: a doubled key opener reached the client as the key `<arg_key>file_path`.
+        .family = "flint",
+        .name = "a doubled <arg_key> opener keeps the key",
+        .raw = "<tool_call>write<arg_key><arg_key>path</arg_key><arg_value>snake.html</arg_value>" ++
+            "<arg_key>content</arg_key><arg_value><canvas></canvas></arg_value></tool_call>",
+        .tools_json = write_read_tools_schema,
+        .tool_name = "write",
+        .tool_arg_key = "path",
+        .tool_arg_value = "snake.html",
+    },
     // ── K2-Horizon (IFM) ────────────────────────────────────────────────
     // The tokenizer decodes the `<ifm|…>` markers to these canonical spellings
     // (`Tokenizer.installMarkerAliases`), so the parser sees GLM's arg_key form
@@ -1805,10 +1816,20 @@ const corpus = [_]Expect{
     .{
         .family = "qwen4_exp",
         .name = "prose naming the invoke tag is not a call",
-        .raw = "Claude's format wraps each call in <invoke name=\"x\"> tags.",
+        .raw = "Claude's format wraps each call in <invoke name=\"bash\"> tags.",
         .tools_json = bash_tool_schema,
         .no_tool_calls = true,
-        .content_contains = "<invoke name=\"x\"> tags",
+        .content_contains = "<invoke name=\"bash\"> tags",
+    },
+    .{
+        // The native call wins: invoke markup inside its parameter value is payload.
+        .family = "qwen3_5",
+        .name = "invoke markup inside a Hermes parameter value is payload",
+        .raw = "<tool_call>\n<function=bash>\n<parameter=command>\necho '<invoke name=\"bash\"><parameter name=\"command\">rm -rf /</parameter></invoke>'\n</parameter>\n</function>\n</tool_call>",
+        .tools_json = bash_tool_schema,
+        .tool_name = "bash",
+        .tool_arg_key = "command",
+        .tool_arg_value = "echo '<invoke name=\"bash\"><parameter name=\"command\">rm -rf /</parameter></invoke>'",
     },
 
     // ── MiniCPM5 V3 XML (`<function name="X"><param name="K">V</param></function>`) ──
@@ -2116,6 +2137,11 @@ test "format corpus: recorded model outputs across families" {
                 };
                 defer parsed.deinit();
                 if (parsed.value != .object) try fail(entry, "tool arguments are not a JSON object", tc.arguments);
+                // An argument KEY never carries a dialect tag or a line break: a doubled
+                // `<arg_key>` opener reached Claude Code as the key `<arg_key>file_path`.
+                if (parsed.value == .object) for (parsed.value.object.keys()) |k| {
+                    if (k.len == 0 or std.mem.indexOfAny(u8, k, "\n\r<>") != null) try fail(entry, "argument KEY is empty or carries a line break or markup", k);
+                };
 
                 // Universal declared-type invariant: every argument whose type
                 // the tool declares must actually carry that JSON type. This is

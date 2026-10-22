@@ -962,6 +962,7 @@ pub fn cudaComputeCapability(part: enum { major, minor }) usize {
 fn defaultDeviceInfoSize(key: [*:0]const u8) usize {
     var dev = mlx_device{ .ctx = null };
     _ = mlx_get_default_device(&dev);
+    defer _ = mlx_device_free(dev);
     var info = mlx_device_info_new();
     defer _ = mlx_device_info_free(info);
     if (mlx_device_info_get(&info, dev) != 0) return 0;
@@ -1639,4 +1640,15 @@ test "fp quantized matmul on GB10: 8 rows equal each row alone, bit for bit, and
     };
     std.debug.print("[fp qmv 8 rows] rms err rows/tiled = {d:.4}\n", .{@sqrt(sse_rows / sse_tiled)});
     try std.testing.expect(sse_rows <= sse_tiled);
+}
+
+test "device info queries free the device handle they take" {
+    if (comptime !builtin.os.tag.isDarwin()) return error.SkipZigTest;
+    const MStats = extern struct { bytes_total: usize, chunks_used: usize, bytes_used: usize, chunks_free: usize, bytes_free: usize };
+    const mstats = @extern(*const fn () callconv(.c) MStats, .{ .name = "mstats" });
+    _ = maxRecommendedWorkingSet();
+    const before = mstats().bytes_used;
+    for (0..4096) |_| _ = maxRecommendedWorkingSet();
+    // Every admission bill reads it; a 16-byte handle per call is 64 KB here.
+    try std.testing.expect(mstats().bytes_used -| before < 16 << 10);
 }
