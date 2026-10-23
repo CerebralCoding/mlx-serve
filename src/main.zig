@@ -270,7 +270,7 @@ fn printUsage(io: std.Io) void {
         \\                        packs half). On by default only on an M5-class
         \\                        GPU with 64 GiB of RAM; --w8a8 opts in below that.
         \\  --ane-split <f>     Force the media offload's ANE share (0..1) instead
-        \\                        of calibrating it per model (MLX_SERVE_ANE_SPLIT is the same).
+        \\                        of calibrating it per model.
         \\  --mtp               Draft with a loaded MTP head, dense or MoE. The default
         \\                        on Metal and CUDA; Vulkan needs it (--no-mtp turns it off).
         \\  --mtp-head-kv-quant Quantize the qwen4 MTP head's own KV with
@@ -688,8 +688,8 @@ pub fn main(init: std.process.Init) !void {
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
     var mtp_forced = false;
     var mtp_head_kv_quant = false;
-    var mtp_typical_raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_TYPICAL);
-    var mtp_tokenv3_raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_TOKENV3);
+    var mtp_typical_raw: ?[]const u8 = null;
+    var mtp_tokenv3_raw: ?[]const u8 = null;
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
@@ -1215,7 +1215,6 @@ pub fn main(init: std.process.Init) !void {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
         std.process.exit(1);
     };
-    if (env.get(.MLX_SERVE_MTP_FORCE_DEPTH) != null) log.warn("MLX_SERVE_MTP_FORCE_DEPTH no longer does anything: pin a depth with --mtp-min-depth n --mtp-max-depth n\n", .{});
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models

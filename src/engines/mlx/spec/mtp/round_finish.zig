@@ -14,7 +14,6 @@ const MtpRoundState = @import("round.zig").MtpRoundState;
 const SubLap = @import("trace.zig").SubLap;
 const capAcceptedForTokenBudget = @import("../verify.zig").capAcceptedForTokenBudget;
 const mtpAcceptRowGreedy = @import("round.zig").mtpAcceptRowGreedy;
-const mtpBatchCorrEnabled = @import("serial.zig").mtpBatchCorrEnabled;
 const mtpEmaMs = @import("regime.zig").mtpEmaMs;
 const mtpFullAccept = @import("round.zig").mtpFullAccept;
 const mtpGreedyPrefix = @import("round.zig").mtpGreedyPrefix;
@@ -132,7 +131,7 @@ pub fn mtpRoundFinish(self: *Generator, allocator: std.mem.Allocator, st: *MtpRo
         st.accept_q = .{ .ctx = null };
         st.accept_defer = .{ .ctx = null };
         st.corr = .{ .ctx = null };
-    } else if (stochastic and mtpBatchCorrEnabled()) {
+    } else if (stochastic) {
         // A group-padded row filters only the 1+m positions it reads.
         var live_logits = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(live_logits);

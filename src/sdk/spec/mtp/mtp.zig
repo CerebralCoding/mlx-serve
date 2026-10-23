@@ -291,7 +291,6 @@ test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" 
 
 var qwen4_g17_profile_logged: bool = false;
 var qwen4_mixed_profile_logged: bool = false;
-var qwen4_g17_env_cache: ?bool = null;
 
 fn qwen4MixedHcMatches(hc: anytype) bool {
     return qwen4MixedPackMatches(hc.down_w, hc.down_s, hc.down_b, &.{ 320, 10240 }, 8) and
@@ -349,20 +348,6 @@ fn qwen4MixedModelPacksMatch(target: *const Transformer) bool {
     return true;
 }
 
-/// Profile-only revocation (MLX_SERVE_MTP_QWEN4_PROFILE=0): planning falls
-/// back to `generic` while every compute lane stays exactly as shipped —
-/// the isolation arm for cost-surface A/Bs, where killing the vqmm NAX lane
-/// would change the very costs under test.
-fn qwen4G17EnvEnabled() bool {
-    if (qwen4_g17_env_cache) |v| return v;
-    var on = true;
-    if (env.get(.MLX_SERVE_MTP_QWEN4_PROFILE)) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') on = false;
-    }
-    qwen4_g17_env_cache = on;
-    return on;
-}
 
 /// Live resolver for the qwen4_exp head: validates the runtime fingerprint
 /// the G17 surface was measured on — uniform affine-4/gs-64 config and both
@@ -377,7 +362,6 @@ pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
 /// Mixed-pack prices use the request's actual KV format, including a slot
 /// override. The original all-4-bit classifier retains its existing scope.
 pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.KVQuantConfig) MtpCostProfile {
-    if (!qwen4G17EnvEnabled()) return .generic;
     const head = if (target.qwen4_mtp) |*h| h else return .generic;
     const cfg = &target.config;
     const geometry = Qwen4MixedGeometry{
@@ -416,7 +400,7 @@ pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.
     );
     if (profile != .generic and !qwen4_g17_profile_logged) {
         qwen4_g17_profile_logged = true;
-        log.info("[mtp] cost profile g17-nax-qwen4-q4-gs64 engaged (MLX_SERVE_VERIFY_QMM_NAX=0 restores generic)\n", .{});
+        log.info("[mtp] cost profile g17-nax-qwen4-q4-gs64 engaged\n", .{});
     }
     return profile;
 }
@@ -636,7 +620,7 @@ pub const MtpModel = struct {
     layout: Layout = .qwen,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
-    /// bind time (MLX_SERVE_MTP_DRAFT_HEAD_BITS, default 3, 0 disables).
+    /// bind time (`DRAFT_HEAD_BITS`).
     /// Only draft steps project through it — VERIFICATION always uses the
     /// trunk head, so the output distribution is untouched; drafts just read
     /// ~40% fewer bytes per full-vocab projection (the dominant draft cost).
@@ -644,7 +628,7 @@ pub const MtpModel = struct {
     draft_head_bits: u32 = 0,
     draft_head_group: u32 = 0,
 
-    /// Draft-rerank scheme (MLX_SERVE_MTP_DRAFT_RERANK): a coarse 2-bit/gs64
+    /// Draft-rerank scheme: a coarse 2-bit/gs64
     /// requant of the trunk lm_head; greedy drafts shortlist its top-32 and
     /// re-score them through the trunk head's own rows (`draftSelect`). When
     /// built, the 3-bit draft head is dropped — non-greedy draft paths fall
@@ -842,20 +826,8 @@ pub const MtpModel = struct {
         // step's halves factored if a future backend changes the calculus.
     }
 
-    /// MLX_SERVE_MTP_DRAFT_HEAD_BITS: absent → 3 (default on)
-    /// a supported bit width → that; anything else ("0", "off") → disabled.
-    fn draftHeadBitsFromEnv() u32 {
-        const p = env.get(.MLX_SERVE_MTP_DRAFT_HEAD_BITS) orelse return 3;
-        const raw = std.mem.span(p);
-        const v = std.fmt.parseInt(u32, raw, 10) catch return 0;
-        return switch (v) {
-            2, 3, 4, 6, 8 => v,
-            else => 0,
-        };
-    }
-
     pub fn buildDraftHead(self: anytype, target: *Transformer) !void {
-        const bits = draftHeadBitsFromEnv();
+        const bits = DRAFT_HEAD_BITS;
         if (bits == 0) return;
         if (target.lm_head_s.ctx == null) return; // dense bf16 head — nothing to shrink
         if (target.rht != null) return; // a requantized copy would need the rotated input at every draft site
@@ -897,30 +869,17 @@ pub const MtpModel = struct {
         log.info("[mtp] draft-only lm_head requantized to {d}-bit/gs{d}\n", .{ bits, group });
     }
 
-    /// MLX_SERVE_MTP_DRAFT_RERANK: "0" off, "1" force-on, absent/other →
-    /// auto (on where the cost surface is generic; the calibrated G17 NAX
-    /// surfaces keep the 3-bit draft head they were measured with).
-    pub fn draftRerankMode() enum { auto, on, off } {
-        const p = env.get(.MLX_SERVE_MTP_DRAFT_RERANK) orelse return .auto;
-        const raw = std.mem.span(p);
-        if (std.mem.eql(u8, raw, "0")) return .off;
-        if (std.mem.eql(u8, raw, "1")) return .on;
-        return .auto;
-    }
-
     /// Build the coarse 2-bit rerank head (see the draft-rerank section
     /// below). Infallible by design: any refusal keeps the draft-head path.
     pub fn maybeBuildDraftRerank(self: anytype, target: *Transformer) void {
-        const mode = draftRerankMode();
-        if (mode == .off) return;
         if (sushi_pack.isRowScaledFp8(target.lm_head_w, target.lm_head_s)) return; // e4m3 head: no affine rows to gather
-        if (mode == .auto and self.m5NaxCostProfile(target) != .generic) return;
+        if (self.m5NaxCostProfile(target) != .generic) return;
         const w_shape = mlx.getShape(target.lm_head_w);
         if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return;
         if (target.lm_head_s.ctx != null and headQuantParams(&target.config, target.lm_head_w, target.lm_head_s).bits <= 2) return; // nothing coarser to gain
 
-        // The ONE env read: the built head carries its width from here on.
-        const rc = buildRerankCoarse(self.s, target, rerankCoarseBits()) orelse return;
+        // The built head carries its width from here on.
+        const rc = buildRerankCoarse(self.s, target, DRAFT_HEAD_BITS) orelse return;
 
         if (self.draft_head) |*dh| {
             dh.deinit();
@@ -1010,19 +969,11 @@ pub const MtpModel = struct {
 // the MIXER output, NOT the pre-mixer stream the head hands back as
 // `hidden_next`.
 
-/// Coarse-head width AT BUILD TIME. The default is `draftHeadBitsFromEnv` (3),
-/// so MLX_SERVE_MTP_DRAFT_HEAD_BITS retunes it and "0"/"off" disables the build
-/// entirely. 2 is what the sidecar scheme was measured at and is the obvious
-/// second A/B arm; a coarser head is fewer bytes and a longer tail of
-/// shortlist misses, and a miss costs acceptance, never output.
-///
-/// Read exactly ONCE, where a head is built. The width a head is READ at is a
-/// property of its packed weights (`RerankCoarse.bits`), never of the
-/// environment at draft time — packed geometry implies K, so a re-read that
-/// disagrees with the build reads a different vocab entirely.
-pub fn rerankCoarseBits() u32 {
-    return MtpModel.draftHeadBitsFromEnv();
-}
+/// Coarse-head width AT BUILD TIME (0 disables the build). A coarser head is fewer bytes and a longer tail of
+/// shortlist misses, and a miss costs acceptance, never output. The width a head is READ at is a property of its
+/// packed weights (`RerankCoarse.bits`): packed geometry implies K, so a read at another width reads a different
+/// vocab entirely.
+pub const DRAFT_HEAD_BITS: u32 = 3;
 
 /// Group size every coarse head is packed at.
 pub const RERANK_COARSE_GROUP: u32 = 64;
@@ -1299,7 +1250,7 @@ fn rerankCoarseFlat(
         rc.q.b,
         true,
         mlx.mlx_optional_int.some(@intCast(rc.group_size)),
-        // The BUILT width and group, never `rerankCoarseBits()`: the packed
+        // The BUILT width and group, never `DRAFT_HEAD_BITS`: the packed
         // geometry implies K, so a per-step env re-read that disagrees with the
         // build does not read a coarser vocab - it reads a different one.
         mlx.mlx_optional_int.some(@intCast(rc.bits)),
@@ -1869,7 +1820,7 @@ fn ownAndTranspose2D(w: *const Weights, key: []const u8, s: mlx.mlx_stream) !mlx
     return t;
 }
 
-/// Head-trunk requantization width (`MLX_SERVE_MTP_HEAD_QUANT_BITS`): dense
+/// Head-trunk requantization width: dense
 /// bf16 trunk weights (q/k/v/o, gate/up/down) are affine-quantized to this
 /// width at group 64 during load — the head only PROPOSES tokens (verify
 /// corrects), so the cost is acceptance, never output. 0 disables. Idea from
@@ -1879,13 +1830,7 @@ pub const DEFAULT_HEAD_QUANT_BITS: u32 = 4;
 pub const HEAD_QUANT_GROUP: u32 = 64;
 pub var head_quant_override: ?u32 = null;
 fn headQuantBits() u32 {
-    if (head_quant_override) |v| return v;
-    const p = env.get(.MLX_SERVE_MTP_HEAD_QUANT_BITS) orelse return DEFAULT_HEAD_QUANT_BITS;
-    const v = std.fmt.parseInt(u32, std.mem.sliceTo(p, 0), 10) catch return DEFAULT_HEAD_QUANT_BITS;
-    return switch (v) {
-        0, 2, 3, 4, 5, 6, 8 => v,
-        else => DEFAULT_HEAD_QUANT_BITS,
-    };
+    return head_quant_override orelse DEFAULT_HEAD_QUANT_BITS;
 }
 
 /// Per-load accounting for the head-trunk requant log line.
@@ -5743,14 +5688,10 @@ test "mtp: draft rerank returns the exact argmax whenever it is inside the coars
     try testing.expect(decisive > 0);
 }
 
-test "mtp: the coarse rerank head drafts at its BUILT width, not the env's current one" {
-    // The width a coarse head is READ at is a property of the BUILT weights.
-    // `rerankCoarseBits()` is the env-backed BUILD default; re-reading it per
-    // draft step means a head packed at one width gets dispatched at another
-    // the moment the variable moves — a retune between build and draft, or any
-    // caller passing `buildRerankCoarse` an explicit width, which both the
-    // sidecar and the qwen4 arm do. Packed geometry implies K, so a mismatched
-    // width does not degrade gracefully: it reads a different vocab entirely.
+test "mtp: the coarse rerank head drafts at its BUILT width" {
+    // The width a coarse head is READ at is a property of the BUILT weights: callers pass `buildRerankCoarse` an
+    // explicit width (the sidecar and the qwen4 arm do), and packed geometry implies K, so a mismatched width reads
+    // a different vocab entirely.
     if (mlx.noGpuBackend()) return;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
@@ -5766,12 +5707,6 @@ test "mtp: the coarse rerank head drafts at its BUILT width, not the env's curre
     try testing.expectEqual(@as(u32, 3), slot.?.bits);
     try testing.expectEqual(@as(u32, 64), slot.?.group_size);
     try testing.expectEqual(fx.vocab, slot.?.rows);
-
-    // ...while the environment now says 2. Every draft below must still be
-    // dispatched at 3.
-    env.set(.MLX_SERVE_MTP_DRAFT_HEAD_BITS, "2");
-    defer env.unset(.MLX_SERVE_MTP_DRAFT_HEAD_BITS);
-    try testing.expectEqual(@as(u32, 2), rerankCoarseBits());
 
     var logged = false;
     const eps: f32 = 1e-3;

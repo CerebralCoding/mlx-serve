@@ -40,7 +40,6 @@ const effectivePrefillChunk = @import("prefill_chunk.zig").effectivePrefillChunk
 const effectiveSsmCheckpointStride = @import("prefill_chunk.zig").effectiveSsmCheckpointStride;
 const firstTokenLogprobs = @import("../sampling/logprobs.zig").firstTokenLogprobs;
 const lazyForward = @import("step.zig").lazyForward;
-const mtpBatchCorrEnabled = @import("../spec/mtp/serial.zig").mtpBatchCorrEnabled;
 const mtpBatchedExactGraph = @import("../spec/mtp/batched_graph.zig").mtpBatchedExactGraph;
 const mtpBatchedTokenV3Graph = @import("../spec/mtp/batched_graph.zig").mtpBatchedTokenV3Graph;
 const mtpBatchedTypicalGraph = @import("../spec/mtp/batched_graph.zig").mtpBatchedTypicalGraph;
@@ -280,7 +279,6 @@ pub fn initWithOptions(
         .tokenv3 => |alpha| .{ .graph = mtpBatchedTokenV3Graph, .prefix = mtp_acceptance.tokenV3Prefix, .param = alpha },
     };
     if (mtp_active and std.meta.activeTag(options.mtp_acceptance) != .exact) {
-        if (!mtpBatchCorrEnabled()) return error.MtpLossyRequiresBatchedCorrections;
         switch (options.mtp_acceptance) {
             .typical => |cfg| log.info("  [mtp-accept] typical delta={d:.3} eps={d:.3} NOT distribution-exact\n", .{ cfg.delta, cfg.eps }),
             .tokenv3 => |alpha| log.info("  [mtp-accept] TokenV3 alpha={d:.3} NOT distribution-exact\n", .{alpha}),

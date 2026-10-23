@@ -1,6 +1,7 @@
 //! The MTP round: begin, chain, verify, group accept.
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const std = @import("std");
+const MtpAdaptive = @import("adaptive.zig").MtpAdaptive;
 const env = @import("../../../../env.zig");
 const mlx = @import("../../../../mlx/ffi.zig");
 const transformer_mod = @import("../../transformer.zig");
@@ -37,9 +38,6 @@ const deinit = @import("../../generate/generator.zig").Generator.deinit;
 const groupProbsBlock = @import("../../sampling/spec_sampling.zig").groupProbsBlock;
 const groupProbsRow = @import("../../sampling/spec_sampling.zig").groupProbsRow;
 const isEosId = @import("../../generate/stops.zig").isEosId;
-const mtpAdaptiveReentryTokens = @import("adaptive.zig").mtpAdaptiveReentryTokens;
-const mtpAdaptiveSerialEnabled = @import("adaptive.zig").mtpAdaptiveSerialEnabled;
-const mtpBatchCorrEnabled = @import("serial.zig").mtpBatchCorrEnabled;
 const mtpChainDispatch = @import("chain_build.zig").mtpChainDispatch;
 const mtpEmaMs = @import("regime.zig").mtpEmaMs;
 const mtpPinnedDepth = @import("regime.zig").mtpPinnedDepth;
@@ -198,12 +196,12 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
     // Adaptive serial re-entry: sticky, except when the request crossed into a different KV
     // bucket. `--max-mtp-ctx` (`.max_ctx`) never re-enters.
     if (self.spec_disabled_runtime and self.spec_disable_reason == .adaptive and
-        mtpAdaptiveSerialEnabled() and self.mtpAdaptiveHeadMayResume())
+        self.mtpAdaptiveHeadMayResume())
     {
         const b = self.mtpAdaptiveBucket(self.mtpKvLen());
         const prev_bucket = self.mtp_adaptive.bucket;
         const prev_arm = self.mtp_adaptive.arm;
-        const action = self.mtp_adaptive.serialTick(b, mtpAdaptiveReentryTokens());
+        const action = self.mtp_adaptive.serialTick(b, MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
         self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
         // Re-entry only when the head can prove it is in sync (else `qwen4MtpForward` returns
         // `error.MtpPositionGap`). A decline latches: the drift cannot shrink on its own.
@@ -624,7 +622,6 @@ pub fn mtpGroupSampledAccept(
     eval_vec: mlx.mlx_vector_array,
     s: mlx.mlx_stream,
 ) !void {
-    if (!mtpBatchCorrEnabled()) return;
     var rows: [MTP_GROUP_ROWS_MAX]usize = undefined;
     var params: [MTP_GROUP_ROWS_MAX]SamplingParams = undefined;
     var k: usize = 0;

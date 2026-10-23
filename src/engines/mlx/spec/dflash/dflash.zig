@@ -601,8 +601,7 @@ pub const DEFAULT_QUANT_BITS: u32 = 8;
 ///   trunk head:       57.8 tok/s, 2.37 accepted/round
 /// The lever was defaulted on at block 16, where the head was 10 ms of a
 /// 175 ms round; at block 5 it is under 2 ms of ~60 and the acceptance it
-/// costs is worth more than the bytes it saves. `MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`
-/// still selects a width for the A/B.
+/// costs is worth more than the bytes it saves; `bindWithDraftBits` selects a width for an A/B.
 pub const DEFAULT_DRAFT_HEAD_BITS: u32 = 0;
 /// Preferred affine group size, narrowed to 32 when 64 does not divide the
 /// contraction dim, dense when neither does.
@@ -869,7 +868,7 @@ pub const DflashModel = struct {
     layers: []DflashLayer,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
-    /// bind time (`MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`, default 0 disables).
+    /// bind time (`DEFAULT_DRAFT_HEAD_BITS`, 0 disables).
     /// Only the block's draft argmax projects through it — VERIFICATION is a
     /// trunk forward and never touches it, so the emitted distribution is
     /// untouched; drafts just read ~⅓ of the bytes of a full-vocab head.
@@ -982,7 +981,7 @@ pub const DflashModel = struct {
             return error.DflashTargetMismatch;
         }
         target.config.dflash_bound = true;
-        self.buildDraftHead(target, draftHeadBitsFromEnv()) catch |err| {
+        self.buildDraftHead(target, DEFAULT_DRAFT_HEAD_BITS) catch |err| {
             log.warn("[dflash] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});
         };
     }
@@ -999,18 +998,7 @@ pub const DflashModel = struct {
         try self.buildDraftHead(target, bits);
     }
 
-    /// `MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`: absent → DEFAULT_DRAFT_HEAD_BITS,
-    /// a supported affine width → that, anything else ("0", "off") → disabled.
-    pub fn draftHeadBitsFromEnv() u32 {
-        const p = env.get(.MLX_SERVE_DFLASH_DRAFT_HEAD_BITS) orelse return DEFAULT_DRAFT_HEAD_BITS;
-        const v = std.fmt.parseInt(u32, std.mem.span(p), 10) catch return 0;
-        return switch (v) {
-            2, 3, 4, 6, 8 => v,
-            else => 0,
-        };
-    }
-
-    /// Requantize the trunk lm_head down to `draftHeadBitsFromEnv()` for the
+    /// Requantize the trunk lm_head down to `DEFAULT_DRAFT_HEAD_BITS` for the
     /// draft projection only. A quantized trunk head is re-encoded from its
     /// TRUE per-weight params (a mixed checkpoint's head routinely differs
     /// from the trunk global); a dense bf16 head is quantized outright. Never

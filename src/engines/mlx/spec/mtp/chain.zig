@@ -266,14 +266,7 @@ pub fn acceptPrefixFor(self: *const Generator, lookup: bool) mtp_acceptance.Pref
 /// Prompt lookup may stand in for the MTP chain unless `MLX_SERVE_MTP_LOOKUP=0`.
 pub var mtp_lookup_override: ?bool = null;
 pub fn mtpLookupEnabled() bool {
-    const Cache = struct {
-        var v: ?bool = null;
-    };
-    if (mtp_lookup_override) |v| return v;
-    if (Cache.v) |v| return v;
-    const raw = env.get(.MLX_SERVE_MTP_LOOKUP);
-    Cache.v = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    return Cache.v.?;
+    return mtp_lookup_override orelse true;
 }
 
 /// End a round that stays out of the cost table. The regime clock runs from
@@ -495,14 +488,9 @@ pub fn mtpLazyPredraftAllowedFor(g: LazyGate) bool {
 
 /// `MLX_SERVE_MTP_LAZY_PREDRAFT=0` keeps the pre-draft at the round's tail, after the host read.
 pub var mtp_lazy_predraft_override: ?bool = null;
-var mtp_lazy_predraft_cache: ?bool = null;
 pub fn mtpLazyPredraftEnabled() bool {
     if (!mtpPredraftEnabled()) return false;
-    if (mtp_lazy_predraft_override) |v| return v;
-    if (mtp_lazy_predraft_cache) |v| return v;
-    const raw = env.get(.MLX_SERVE_MTP_LAZY_PREDRAFT);
-    mtp_lazy_predraft_cache = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    return mtp_lazy_predraft_cache.?;
+    return mtp_lazy_predraft_override orelse true;
 }
 
 /// The gate for building round N+1's chain from round N's lazy results, read before any host read.
@@ -567,7 +555,7 @@ pub fn mtpLazyPreDraft(self: *Generator, allocator: std.mem.Allocator, chain: *c
     };
     if (!Once.logged) {
         Once.logged = true;
-        log.info("[mtp] lazy predraft engaged (MLX_SERVE_MTP_LAZY_PREDRAFT=0 restores the tail pre-draft)\n", .{});
+        log.info("[mtp] lazy predraft engaged\n", .{});
     }
     return upcoming;
 }
@@ -613,13 +601,8 @@ pub var mtp_lazy_fail_after_dispatch: bool = false;
 
 /// `MLX_SERVE_MTP_PADDED_HEAD=0` keeps the merged `1 + accepted` history step.
 pub var mtp_padded_head_override: ?bool = null;
-var mtp_padded_head_cache: ?bool = null;
 pub fn mtpPaddedHeadEnabled() bool {
-    if (mtp_padded_head_override) |v| return v;
-    if (mtp_padded_head_cache) |v| return v;
-    const raw = env.get(.MLX_SERVE_MTP_PADDED_HEAD);
-    mtp_padded_head_cache = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    return mtp_padded_head_cache.?;
+    return mtp_padded_head_override orelse true;
 }
 
 /// Does this request's head append the whole verify row as history and draft past its
@@ -655,7 +638,7 @@ pub fn mtpPaddedAppend(self: *Generator, chain: *MtpPreDraft, off0: usize, ids: 
     };
     if (!Once.logged) {
         Once.logged = true;
-        log.info("[mtp] padded head history engaged (MLX_SERVE_MTP_PADDED_HEAD=0 restores the merged step)\n", .{});
+        log.info("[mtp] padded head history engaged\n", .{});
     }
 }
 

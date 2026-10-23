@@ -304,7 +304,7 @@ pub const Generator = struct {
     /// per round, so `attempts x depth` no longer measures proposals — this
     /// is the honest per_draft_pct denominator.
     mtp_drafted_tokens: u64 = 0,
-    /// Prompt-lookup rounds (`MLX_SERVE_MTP_LOOKUP`), kept apart from the MTP
+    /// Prompt-lookup rounds, kept apart from the MTP
     /// counters so the head's acceptance stats stay the head's.
     mtp_lookup_rounds: u64 = 0,
     mtp_lookup_drafted: u64 = 0,
@@ -773,8 +773,6 @@ pub const Generator = struct {
     pub const mtpBatchedTypicalGraph = @import("../spec/mtp/batched_graph.zig").mtpBatchedTypicalGraph;
     pub const mtpBatchedTokenV3Graph = @import("../spec/mtp/batched_graph.zig").mtpBatchedTokenV3Graph;
     const mtpBatchedLossyGraph = @import("../spec/mtp/batched_graph.zig").mtpBatchedLossyGraph;
-    pub const mtpBatchCorrEnabledFromEnv = @import("../spec/mtp/serial.zig").mtpBatchCorrEnabledFromEnv;
-    const mtpBatchCorrEnabled = @import("../spec/mtp/serial.zig").mtpBatchCorrEnabled;
     pub const mtpMaybePreDraft = @import("../spec/mtp/serial.zig").mtpMaybePreDraft;
     pub const mtpPreDraftOpenAllows = @import("../spec/mtp/serial.zig").mtpPreDraftOpenAllows;
     pub const mtpPreDraftOpen = @import("../spec/mtp/serial.zig").mtpPreDraftOpen;
@@ -829,7 +827,6 @@ pub const Generator = struct {
     pub const MTP_DRAFT_TOP_P = @import("../spec/mtp/depth.zig").MTP_DRAFT_TOP_P;
     pub const MTP_DRAFT_TOP_K = @import("../spec/mtp/depth.zig").MTP_DRAFT_TOP_K;
     pub const MTP_DRAFT_TEMP_QWEN4 = @import("../spec/mtp/depth.zig").MTP_DRAFT_TEMP_QWEN4;
-    const mtpDraftTempEnv = @import("../spec/mtp/depth.zig").mtpDraftTempEnv;
     pub const mtpDraftTempFor = @import("../spec/mtp/depth.zig").mtpDraftTempFor;
     pub const mtpDraftSamplingFor = @import("../spec/mtp/depth.zig").mtpDraftSamplingFor;
     pub const mtpDraftSampling = @import("../spec/mtp/depth.zig").mtpDraftSampling;
@@ -949,12 +946,6 @@ pub const Generator = struct {
     pub const mtpSerialProbeUseful = @import("../spec/mtp/adaptive.zig").mtpSerialProbeUseful;
     pub const mtpSerialProbeArm = @import("../spec/mtp/adaptive.zig").mtpSerialProbeArm;
     pub const MtpAdaptive = @import("../spec/mtp/adaptive.zig").MtpAdaptive;
-    pub const mtpAdaptiveSerialEnabledFromEnv = @import("../spec/mtp/adaptive.zig").mtpAdaptiveSerialEnabledFromEnv;
-    const mtpAdaptiveSerialEnabled = @import("../spec/mtp/adaptive.zig").mtpAdaptiveSerialEnabled;
-    const mtpAdaptiveMargin = @import("../spec/mtp/adaptive.zig").mtpAdaptiveMargin;
-    const mtpAdaptiveReentryTokens = @import("../spec/mtp/adaptive.zig").mtpAdaptiveReentryTokens;
-    const mtpAdaptiveMinKv = @import("../spec/mtp/adaptive.zig").mtpAdaptiveMinKv;
-    const mtpAdaptiveConfirm = @import("../spec/mtp/adaptive.zig").mtpAdaptiveConfirm;
     pub const mtpHeadPositionDrift = @import("../spec/mtp/adaptive.zig").mtpHeadPositionDrift;
     pub const mtpHeadDriftNow = @import("../spec/mtp/adaptive.zig").mtpHeadDriftNow;
     pub const mtpAdaptiveHeadMayResume = @import("../spec/mtp/adaptive.zig").mtpAdaptiveHeadMayResume;

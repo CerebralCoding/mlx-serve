@@ -292,5 +292,5 @@ pub fn mtpEvCostsFor(nax_profile: bool, override: ?[]const u8) MtpEvCosts {
 }
 
 pub fn mtpEvCosts(profile: mtp_mod.MtpCostProfile) MtpEvCosts {
-    return mtpEvCostsForProfile(profile, env.span(.MLX_SERVE_MTP_EV_COSTS));
+    return mtpEvCostsForProfile(profile, null);
 }

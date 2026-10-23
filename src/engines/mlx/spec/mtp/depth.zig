@@ -79,25 +79,9 @@ pub const MTP_DRAFT_TOP_K: u32 = 20;
 
 /// Draft temperature is per FAMILY: the sidecar head's 0.6 does not carry
 /// over, and Flash Next drafts best at the target's own temperature.
-/// MLX_SERVE_MTP_DRAFT_TEMP is the sweep lever for the next head.
 pub const MTP_DRAFT_TEMP_QWEN4: f32 = 1.0;
 
-/// Only the ENV read is cached; the value is per loaded model.
-var mtp_draft_temp_env: ??f32 = null;
-pub fn mtpDraftTempEnv() ?f32 {
-    if (mtp_draft_temp_env) |v| return v;
-    var parsed: ?f32 = null;
-    if (env.get(.MLX_SERVE_MTP_DRAFT_TEMP)) |p| {
-        if (std.fmt.parseFloat(f32, std.mem.span(p)) catch null) |v| {
-            if (v > 0.01 and v <= 4.0) parsed = v;
-        }
-    }
-    mtp_draft_temp_env = parsed;
-    return parsed;
-}
-
 pub fn mtpDraftTempFor(config: *const model_mod.ModelConfig) f32 {
-    if (mtpDraftTempEnv()) |v| return v;
     return if (std.mem.eql(u8, config.model_type, "qwen4_exp")) MTP_DRAFT_TEMP_QWEN4 else MTP_DRAFT_TEMP;
 }
 

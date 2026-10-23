@@ -163,7 +163,7 @@ pub fn load(io: std.Io, a: std.mem.Allocator, xfm: *Transformer, model_dir: []co
     const had_err = mlx.errorPending();
     if (h.heads > 1) {
         // Per-depth heads read out as MiMo's legacy arm does: the trunk head, shortlisted on a coarse copy.
-        if (MtpModel.draftRerankMode() != .off and xfm.lm_head_s.ctx != null) h.rerank_coarse = mtp_mod.buildRerankCoarse(h.s, xfm, mtp_mod.rerankCoarseBits());
+        if (xfm.lm_head_s.ctx != null) h.rerank_coarse = mtp_mod.buildRerankCoarse(h.s, xfm, mtp_mod.DRAFT_HEAD_BITS);
     } else {
         MtpModel.buildDraftHead(h, xfm) catch |err| {
             log.warn("[mtp] draft lm_head build failed ({s}) — drafts use the trunk head\n", .{@errorName(err)});

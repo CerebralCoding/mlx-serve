@@ -244,59 +244,6 @@ pub const MtpAdaptive = struct {
     }
 };
 
-/// Whole-mechanism kill switch (`MLX_SERVE_MTP_ADAPTIVE_SERIAL=0`): no vote, no probe, no
-/// serial fold. Independent of `MLX_SERVE_MTP_ADAPTIVE` (the depth controller's lever).
-var mtp_adaptive_serial_cache: ?bool = null;
-/// Default on; only an exact "0" turns it off.
-pub fn mtpAdaptiveSerialEnabledFromEnv(raw: ?[]const u8) bool {
-    const value = raw orelse return true;
-    return !std.mem.eql(u8, value, "0");
-}
-
-pub fn mtpAdaptiveSerialEnabled() bool {
-    if (mtp_adaptive_serial_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_ADAPTIVE_SERIAL);
-    const on = mtpAdaptiveSerialEnabledFromEnv(raw);
-    mtp_adaptive_serial_cache = on;
-    return on;
-}
-
-var mtp_adaptive_margin_cache: ?f32 = null;
-pub fn mtpAdaptiveMargin() f32 {
-    if (mtp_adaptive_margin_cache) |v| return v;
-    const v = env.float(.MLX_SERVE_MTP_ADAPTIVE_MARGIN, MTP_ADAPTIVE_MARGIN);
-    mtp_adaptive_margin_cache = v;
-    return v;
-}
-
-var mtp_reentry_tokens_cache: ?u32 = null;
-/// `MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS`: 0 / unset = crossing-only; a bare `1` selects 512.
-pub fn mtpAdaptiveReentryTokens() u32 {
-    if (mtp_reentry_tokens_cache) |v| return v;
-    const n = env.int(.MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS, usize, MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
-    const v: u32 = if (n == 1) MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON else @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
-    mtp_reentry_tokens_cache = v;
-    return v;
-}
-
-var mtp_adaptive_min_kv_cache: ?u32 = null;
-pub fn mtpAdaptiveMinKv() u32 {
-    if (mtp_adaptive_min_kv_cache) |v| return v;
-    const n = env.int(.MLX_SERVE_MTP_ADAPTIVE_MIN_KV, usize, MTP_ADAPTIVE_MIN_KV);
-    const v: u32 = @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
-    mtp_adaptive_min_kv_cache = v;
-    return v;
-}
-
-var mtp_adaptive_confirm_cache: ?u32 = null;
-pub fn mtpAdaptiveConfirm() u32 {
-    if (mtp_adaptive_confirm_cache) |v| return v;
-    const n = env.int(.MLX_SERVE_MTP_ADAPTIVE_CONFIRM, usize, MTP_ADAPTIVE_CONFIRM);
-    const v: u32 = @intCast(@max(@as(usize, 1), @min(n, 64)));
-    mtp_adaptive_confirm_cache = v;
-    return v;
-}
-
 /// Drift between the head's position bookkeeping and what its next forward demands
 /// (`pos_offset == pos_base + seq_offset`; `seq_offset == 0` re-seeds). 0 = in sync.
 pub fn mtpHeadPositionDrift(pos_base: i64, seq_offset: usize, next_pos_offset: i64) i64 {
@@ -383,19 +330,18 @@ pub fn mtpSerialProbeEarned(module_head: bool, low_streak: u32) bool {
 
 pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
     // Read after the plan (m_lo is the width it prices) and before the width trial.
-    if (mtpAdaptiveSerialEnabled() and
-        self.mtpAdaptiveArchEligible() and
-        mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKv()))
+    if (        self.mtpAdaptiveArchEligible() and
+        mtpAdaptiveKvEligible(kv_len, MTP_ADAPTIVE_MIN_KV))
     {
         const t = &self.xfm.round_cost;
         const b = self.mtpAdaptiveBucket(kv_len);
         const table_ms_tok = t.msPerTok(m_lo, b);
         const window_ms_tok = self.mtp_price.msPerTok();
         const serial_ms = t.serialMsPerTok(b);
-        const vote = mtpAdaptiveVoteFor(table_ms_tok, window_ms_tok, serial_ms, mtpAdaptiveMargin());
+        const vote = mtpAdaptiveVoteFor(table_ms_tok, window_ms_tok, serial_ms, MTP_ADAPTIVE_MARGIN);
         const prev_bucket = self.mtp_adaptive.bucket;
         const prev_arm = self.mtp_adaptive.arm;
-        const action = self.mtp_adaptive.round(self.mtp_ev_rounds, b, vote, mtpAdaptiveConfirm());
+        const action = self.mtp_adaptive.round(self.mtp_ev_rounds, b, vote, MTP_ADAPTIVE_CONFIRM);
         self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
         if (action == .to_serial) {
             // The round under construction still runs; the switch takes effect next tick.
@@ -794,15 +740,6 @@ test "S21: a KV-only sidecar head keeps its re-arm, and nothing about it changes
     try testing.expect(!b.sticky_serial);
     try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, b.serialTick(4, 0));
     try testing.expectEqual(G.MtpAdaptiveArm.undecided, b.arm);
-
-    try testing.expect(!Generator.mtpAdaptiveSerialEnabledFromEnv("0"));
-}
-
-test "mtpAdaptiveSerialEnabledFromEnv: the mechanism is on unless the lever says 0" {
-    try testing.expect(Generator.mtpAdaptiveSerialEnabledFromEnv(null));
-    try testing.expect(Generator.mtpAdaptiveSerialEnabledFromEnv(""));
-    try testing.expect(Generator.mtpAdaptiveSerialEnabledFromEnv("1"));
-    try testing.expect(!Generator.mtpAdaptiveSerialEnabledFromEnv("0"));
 }
 
 test "mtpSerialCaptureReady: the capture step's entry invariant is a RUNTIME check, not an assert" {
