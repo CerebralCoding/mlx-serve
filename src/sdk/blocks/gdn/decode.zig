@@ -6,18 +6,12 @@
 //! the per-head gated RMS norm over one Hadamard block of heads and rotates it
 //! for out_proj. Bit-identical to the composed chain.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const rht = @import("../../quant/hadamard/rht.zig");
 
-const HEADER =
-    \\inline float msv_log1p(float x) {
-    \\    float xp1 = 1.0f + x;
-    \\    if (xp1 == metal::numeric_limits<float>::max()) { return metal::numeric_limits<float>::max(); }
-    \\    if (xp1 == 1.0f) { return x; }
-    \\    return x * (metal::log(xp1) / (xp1 - 1.0f));
-    \\}
-;
+const HEADER = kernelSource("kernels/gdn/log1p.metal");
 
 /// The dtype every kernel here (GT) rounds the decay gate a + dt_bias -> g to. Under bf16
 /// activations it is the state's: a bf16 gate near one is exactly 1.0 and that head never
@@ -26,268 +20,23 @@ pub fn gateDtype(act: mlx.mlx_dtype, state: mlx.mlx_dtype) mlx.mlx_dtype {
     return if (act == .bfloat16) state else act;
 }
 
-const K1_SOURCE =
-    \\constexpr int NSG = NT / 32;
-    \\constexpr int RB = DV / SPLIT;       // dv rows per threadgroup
-    \\constexpr int R = RB / NSG;          // dv rows per simdgroup
-    \\constexpr int GRP = HV / HK;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint hv = threadgroup_position_in_grid.x / SPLIT;
-    \\uint part = threadgroup_position_in_grid.x % SPLIT;
-    \\uint hk = hv / GRP;
-    \\threadgroup float qs[DK], ks[DK], vs[DV];
-    \\threadgroup float gb[2];
-    \\uint row0 = part * RB + sg * R;
-    \\float st[R][4];
-    \\for (int j = 0; j < R; ++j) {
-    \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
-    \\  for (int i = 0; i < 4; ++i) st[j][i] = float(state_in[base + i]);
-    \\}
-    \\if (sg < 3) {
-    \\  uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
-    \\  T act[4];
-    \\  float sumsq = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    uint ch = cb + lane * 4 + i;
-    \\    float acc = 0.0f;
-    \\    for (int tap = 0; tap < 3; ++tap) acc += float(conv_state[tap * C + ch]) * float(conv_w[ch * 4 + tap]);
-    \\    acc += float(qkv[ch]) * float(conv_w[ch * 4 + 3]);
-    \\    const T conv = T(acc);
-    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(conv))); T sig = conv < T(0) ? sy : T(1) - sy;
-    \\    act[i] = conv * sig;
-    \\    float v = float(act[i]);
-    \\    sumsq += v * v;
-    \\  }
-    \\  if (sg < 2) {
-    \\    sumsq = simd_sum(sumsq);
-    \\    float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
-    \\    const T scale = sg == 0 ? q_scale : k_scale;
-    \\    threadgroup float* dst = sg == 0 ? qs : ks;
-    \\    for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = float(scale * T(1) * T(float(act[i]) * inv));
-    \\  } else {
-    \\    for (int i = 0; i < 4; ++i) vs[lane * 4 + i] = float(act[i]);
-    \\  }
-    \\  if (part == 0 && (sg == 2 || hv % GRP == 0)) {
-    \\    for (int i = 0; i < 4; ++i) {
-    \\      uint ch = cb + lane * 4 + i;
-    \\      conv_out[ch] = conv_state[C + ch];
-    \\      conv_out[C + ch] = conv_state[2 * C + ch];
-    \\      conv_out[2 * C + ch] = qkv[ch];
-    \\    }
-    \\  }
-    \\}
-    \\if (sg == (NSG > 3 ? 3 : 0) && lane == 31) {
-    \\  const T bv = b_in[hv];
-    \\  T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
-    \\  gb[1] = float(bsig);
-    \\  const GT apd = GT(float(a_in[hv]) + float(dt_bias[hv]));
-    \\  float sp = msv_log1p(metal::precise::exp(float(apd)));
-    \\  float ea = metal::precise::exp(float(A_log[hv]));
-    \\  gb[0] = float(GT(metal::precise::exp(-(ea * sp))));
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\float kk[4], qq[4];
-    \\for (int i = 0; i < 4; ++i) { kk[i] = ks[lane * 4 + i]; qq[i] = qs[lane * 4 + i]; }
-    \\const float g = gb[0], beta = gb[1];
-    \\for (int j = 0; j < R; ++j) {
-    \\  uint dv = row0 + j;
-    \\  float kv_mem = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] * g; kv_mem += st[j][i] * kk[i]; }
-    \\  kv_mem = simd_sum(kv_mem);
-    \\  float delta = (vs[dv] - kv_mem) * beta;
-    \\  float out = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] + kk[i] * delta; out += st[j][i] * qq[i]; }
-    \\  out = simd_sum(out);
-    \\  uint base = (hv * DV + dv) * DK + lane * 4;
-    \\  for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<StT>(st[j][i]);
-    \\  if (lane == 0) y[hv * DV + dv] = static_cast<T>(out);
-    \\}
-;
+const K1_SOURCE = kernelSource("kernels/gdn/decode_k1.metal");
 
-const K2_SOURCE =
-    \\constexpr int S = 4, P = J / S, HPS = J * 32 / (DV * S);
-    \\threadgroup float tg[J * 32];
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint base = threadgroup_position_in_grid.x * (J * 32);
-    \\for (int hh = 0; hh < HPS; ++hh) {
-    \\  uint hb = base + (sg * HPS + hh) * DV;
-    \\  float xs[4];
-    \\  float sumsq = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) { xs[i] = float(y[hb + lane * 4 + i]); sumsq += xs[i] * xs[i]; }
-    \\  sumsq = simd_sum(sumsq);
-    \\  float inv = metal::precise::rsqrt(sumsq / float(DV) + eps);
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
-    \\    const T zv = z[hb + lane * 4 + i];
-    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); T sig = zv < T(0) ? sy : T(1) - sy;
-    \\    tg[hb - base + lane * 4 + i] = float((zv * sig) * normed) * signs[hb + lane * 4 + i];
-    \\  }
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\float v[P];
-    \\for (int p = 0; p < P; ++p) v[p] = tg[(sg * P + p) * 32 + lane];
-    \\for (int h = 1; h < P; h <<= 1)
-    \\  for (int p = 0; p < P; ++p)
-    \\    if ((p & h) == 0) { float a = v[p], b = v[p + h]; v[p] = a + b; v[p + h] = a - b; }
-    \\for (uint m = 1; m < 32; m <<= 1) {
-    \\  float sgn = (lane & m) ? -1.0f : 1.0f;
-    \\  for (int p = 0; p < P; ++p) v[p] = fma(sgn, v[p], simd_shuffle_xor(v[p], m));
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\for (int p = 0; p < P; ++p) tg[(sg * P + p) * 32 + lane] = v[p];
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const float scale = rsqrt(float(J * 32));
-    \\for (uint p = sg; p < P; p += S) {
-    \\  float w[S];
-    \\  for (int q = 0; q < S; ++q) w[q] = tg[(q * P + p) * 32 + lane];
-    \\  float a0 = w[0] + w[1], a1 = w[0] - w[1], a2 = w[2] + w[3], a3 = w[2] - w[3];
-    \\  w[0] = a0 + a2; w[2] = a0 - a2; w[1] = a1 + a3; w[3] = a1 - a3;
-    \\  for (int q = 0; q < S; ++q) rot[base + (q * P + p) * 32 + lane] = static_cast<T>(w[q] * scale);
-    \\}
-;
+const K2_SOURCE = kernelSource("kernels/gdn/decode_k2.metal");
 
 // K1 over TL tokens (verify widths): the same per-token prework and recurrence,
 // token after token, plus the per-step state capture MTP rollback reads
 // (state_seq[TL-1] is never written, as in the stock capture kernel).
-const K1S_HEAD =
-    \\constexpr int NSG = NT / 32;
-    \\constexpr int RB = DV / SPLIT;
-    \\constexpr int R = RB / NSG;
-    \\constexpr int GRP = HV / HK;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint hv = threadgroup_position_in_grid.x / SPLIT;
-    \\uint part = threadgroup_position_in_grid.x % SPLIT;
-    \\uint hk = hv / GRP;
-    \\threadgroup float qs[TL][DK], ks[TL][DK], vs[TL][DV];
-    \\threadgroup float gb[TL][2];
-    \\uint row0 = part * RB + sg * R;
-    \\float st[R][4];
-    \\for (int j = 0; j < R; ++j) {
-    \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
-    \\  for (int i = 0; i < 4; ++i) st[j][i] = float(state_in[base + i]);
-    \\}
-    \\// one (q | k | v, token) pair per simdgroup at a time: a pair's arithmetic does not depend on which one runs it
-    \\for (int pw = int(sg); pw < 3 * TL; pw += NSG) {
-    \\  const int comp = pw % 3, t = pw / 3;
-    \\  uint cb = comp == 0 ? hk * DK : (comp == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
-    \\  {
-    \\    T act[4];
-    \\    float sumsq = 0.0f;
-    \\    for (int i = 0; i < 4; ++i) {
-    \\      uint ch = cb + lane * 4 + i;
-    \\      float acc = 0.0f;
-    \\      for (int tap = 0; tap < 4; ++tap) {
-    \\        const int w = t + tap;
-    \\        const T xv = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
-    \\        acc += float(xv) * float(conv_w[ch * 4 + tap]);
-    \\      }
-    \\      const T conv = T(acc);
-    \\      T sy = T(1) / (T(1) + metal::exp(metal::abs(conv))); T sig = conv < T(0) ? sy : T(1) - sy;
-    \\      act[i] = conv * sig;
-    \\      float v = float(act[i]);
-    \\      sumsq += v * v;
-    \\    }
-    \\    if (comp < 2) {
-    \\      sumsq = simd_sum(sumsq);
-    \\      float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
-    \\      const T scale = comp == 0 ? q_scale : k_scale;
-    \\      threadgroup float* dst = comp == 0 ? qs[t] : ks[t];
-    \\      for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = float(scale * T(1) * T(float(act[i]) * inv));
-    \\    } else {
-    \\      for (int i = 0; i < 4; ++i) vs[t][lane * 4 + i] = float(act[i]);
-    \\    }
-    \\  }
-    \\}
-    \\if (sg < 3) {
-    \\  uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
-    \\  if (part == 0 && (sg == 2 || hv % GRP == 0)) {
-    \\    for (int i = 0; i < 4; ++i) {
-    \\      uint ch = cb + lane * 4 + i;
-    \\      for (int j = 0; j < 3; ++j) {
-    \\        int w = TL + j;
-    \\        conv_out[j * C + ch] = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
-    \\      }
-    \\    }
-    \\  }
-    \\}
-    \\if (sg == (NSG > 3 ? 3 : 0) && lane == 31) {
-    \\  float ea = metal::precise::exp(float(A_log[hv]));
-    \\  for (int t = 0; t < TL; ++t) {
-    \\    const T bv = b_in[t * HV + hv];
-    \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
-    \\    gb[t][1] = float(bsig);
-    \\    const GT apd = GT(float(a_in[t * HV + hv]) + float(dt_bias[hv]));
-    \\    float sp = msv_log1p(metal::precise::exp(float(apd)));
-    \\    gb[t][0] = float(GT(metal::precise::exp(-(ea * sp))));
-    \\  }
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\for (int t = 0; t < TL; ++t) {
-    \\  float kk[4], qq[4];
-    \\  for (int i = 0; i < 4; ++i) { kk[i] = ks[t][lane * 4 + i]; qq[i] = qs[t][lane * 4 + i]; }
-    \\  const float g = gb[t][0], beta = gb[t][1];
-    \\  for (int j = 0; j < R; ++j) {
-    \\    uint dv = row0 + j;
-    \\    float kv_mem = 0.0f;
-    \\    for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] * g; kv_mem += st[j][i] * kk[i]; }
-    \\    kv_mem = simd_sum(kv_mem);
-    \\    float delta = (vs[t][dv] - kv_mem) * beta;
-    \\    float out = 0.0f;
-    \\    for (int i = 0; i < 4; ++i) { st[j][i] = st[j][i] + kk[i] * delta; out += st[j][i] * qq[i]; }
-    \\    out = simd_sum(out);
-;
-const K1S_TAIL =
-    \\    // The next token reads the state serial decoding stored (StT), not the f32.
-    \\    for (int i = 0; i < 4; ++i) st[j][i] = float(static_cast<StT>(st[j][i]));
-    \\    if (t + 1 < TL) {
-    \\      uint sbase = t * (HV * DV * DK) + (hv * DV + dv) * DK + lane * 4;
-    \\      for (int i = 0; i < 4; ++i) state_seq[sbase + i] = static_cast<StT>(st[j][i]);
-    \\    }
-    \\  }
-    \\}
-    \\for (int j = 0; j < R; ++j) {
-    \\  uint base = (hv * DV + row0 + j) * DK + lane * 4;
-    \\  for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<StT>(st[j][i]);
-    \\}
-;
-const K1S_SOURCE = K1S_HEAD ++ "\n" ++
-    \\    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
-++ "\n" ++ K1S_TAIL;
+const K1S_HEAD = kernelSource("kernels/gdn/decode_k1s_head.metal");
+const K1S_TAIL = kernelSource("kernels/gdn/decode_k1s_tail.metal");
+const K1S_SOURCE = K1S_HEAD ++ "\n    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);\n" ++ K1S_TAIL;
 
 // K1S at one threadgroup per head (NT=1024, SPLIT=1: the same 4 rows per
 // simdgroup, so each row's recurrence is unchanged) with the verify epilogues
 // folded in. A head's 128 y values stay in threadgroup
 // memory, rounded to T as the stored y was, and simdgroup t runs the norm-gate
 // kernel's exact reduction for token t. The conv-input rows rollback slices are copied out as well.
-const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
-    \\    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));
-++ "\n" ++ K1S_TAIL ++ "\n" ++
-    \\if (sg < 3 && (sg == 2 || hv % GRP == 0)) {
-    \\  uint cb = sg == 0 ? hk * DK : (sg == 1 ? HK * DK + hk * DK : 2 * HK * DK + hv * DV);
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    uint ch = cb + lane * 4 + i;
-    \\    for (int w = 0; w < 3 + TL; ++w) conv_in[w * C + ch] = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * C + ch];
-    \\  }
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (sg < TL) {
-    \\  float xs[4];
-    \\  float sumsq = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) { xs[i] = ys[sg][lane * 4 + i]; sumsq += xs[i] * xs[i]; }
-    \\  sumsq = simd_sum(sumsq);
-    \\  float inv = metal::precise::rsqrt(sumsq / float(DV) + eps);
-    \\  uint base = (sg * HV + hv) * DV + lane * 4;
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    const T normed = norm_w[lane * 4 + i] * T(xs[i] * inv);
-    \\    const T zv = z[base + i];
-    \\    T sy = T(1) / (T(1) + metal::exp(metal::abs(zv))); T sig = zv < T(0) ? sy : T(1) - sy;
-    \\    gated[base + i] = SWISH ? (zv * sig) * normed : normed * sig;
-    \\  }
-    \\}
-;
+const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));\n" ++ K1S_TAIL ++ "\n" ++ kernelSource("kernels/gdn/decode_k1s_fold_epilogue.metal");
 
 // A draft tree runs in two launches, one simdgroup per job: K1P does each
 // row's conv/silu/q-k norm prework once per head (K1S's arithmetic), reading
@@ -295,120 +44,16 @@ const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n" ++
 // the columns of the joined in-projection need no copies. Then K1TR
 // walks the rows parents first, one dv row per simdgroup in 128-thread
 // threadgroups, a restart row's state kept in registers.
-const K1P_SOURCE =
-    \\constexpr int GRP = HV / HK;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint head = threadgroup_position_in_grid.y;
-    \\uint t = threadgroup_position_in_grid.z;
-    \\const int comp = head < HK ? 0 : (head < 2 * HK ? 1 : 2);
-    \\uint h = comp == 0 ? head : (comp == 1 ? head - HK : head - 2 * HK);
-    \\uint cb = comp == 0 ? h * DK : (comp == 1 ? HK * DK + h * DK : 2 * HK * DK + h * DV);
-    \\T act[4];
-    \\float sumsq = 0.0f;
-    \\for (int i = 0; i < 4; ++i) {
-    \\  uint ch = cb + lane * 4 + i;
-    \\  float acc = 0.0f;
-    \\  for (int tap = 0; tap < 4; ++tap) {
-    \\    const int w = parents[TL + t * 4 + tap];
-    \\    const T xv = w < 3 ? conv_state[w * C + ch] : qkv[(w - 3) * QS + ch];
-    \\    acc += float(xv) * float(conv_w[ch * 4 + tap]);
-    \\  }
-    \\  const T conv = T(acc);
-    \\  T sy = T(1) / (T(1) + metal::exp(metal::abs(conv))); T sig = conv < T(0) ? sy : T(1) - sy;
-    \\  act[i] = conv * sig;
-    \\  float v = float(act[i]);
-    \\  sumsq += v * v;
-    \\  conv_in[(3 + t) * C + ch] = qkv[t * QS + ch];
-    \\  for (int r = t; r < 3; r += TL) conv_in[r * C + ch] = conv_state[r * C + ch];
-    \\}
-    \\if (comp < 2) {
-    \\  sumsq = simd_sum(sumsq);
-    \\  float inv = metal::precise::rsqrt(sumsq / float(DK) + 1e-6f);
-    \\  const T scale = comp == 0 ? q_scale : k_scale;
-    \\  device float* dst = (comp == 0 ? pq : pk) + (t * HK + h) * DK;
-    \\  for (int i = 0; i < 4; ++i) dst[lane * 4 + i] = float(scale * T(1) * T(float(act[i]) * inv));
-    \\} else {
-    \\  for (int i = 0; i < 4; ++i) pv[(t * HV + h) * DV + lane * 4 + i] = float(act[i]);
-    \\  if (lane == 0) {
-    \\    float ea = metal::precise::exp(float(A_log[h]));
-    \\    const T bv = b_in[t * ABS + BOFF + h];
-    \\    T by = T(1) / (T(1) + metal::exp(metal::abs(bv))); T bsig = bv < T(0) ? by : T(1) - by;
-    \\    pg[(t * HV + h) * 2 + 1] = float(bsig);
-    \\    const GT apd = GT(float(a_in[t * ABS + AOFF + h]) + float(dt_bias[h]));
-    \\    float sp = msv_log1p(metal::precise::exp(float(apd)));
-    \\    pg[(t * HV + h) * 2] = float(GT(metal::precise::exp(-(ea * sp))));
-    \\  }
-    \\}
-;
+const K1P_SOURCE = kernelSource("kernels/gdn/decode_k1p.metal");
 
 // Row t restarts from its parent's state unless the parent is row t - 1.
-const K1TR_SOURCE =
-    \\constexpr int GRP = HV / HK;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint dv = thread_position_in_grid.y;
-    \\uint hv = thread_position_in_grid.z;
-    \\uint hk = hv / GRP;
-    \\float st[4];
-    \\float kept[TL][4];
-    \\uint base = (hv * DV + dv) * DK + lane * 4;
-    \\for (int i = 0; i < 4; ++i) st[i] = float(state_in[base + i]);
-    \\// Row t + 1's inputs load while row t reduces.
-    \\float4 kn = *(const device float4*)(pk + hk * DK + lane * 4), qn = *(const device float4*)(pq + hk * DK + lane * 4);
-    \\float gn = pg[hv * 2], bn = pg[hv * 2 + 1], vn = pv[hv * DV + dv];
-    \\for (int t = 0; t < TL; ++t) {
-    \\  const float4 kk = kn, qq = qn;
-    \\  const float g = gn, beta = bn, vt = vn;
-    \\  if (t + 1 < TL) {
-    \\    kn = *(const device float4*)(pk + ((t + 1) * HK + hk) * DK + lane * 4);
-    \\    qn = *(const device float4*)(pq + ((t + 1) * HK + hk) * DK + lane * 4);
-    \\    gn = pg[((t + 1) * HV + hv) * 2]; bn = pg[((t + 1) * HV + hv) * 2 + 1];
-    \\    vn = pv[((t + 1) * HV + hv) * DV + dv];
-    \\  }
-    \\  const int p = parents[t];
-    \\  if (t > 0 && p != t - 1) for (int i = 0; i < 4; ++i) st[i] = kept[p][i];
-    \\  float kv_mem = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) { st[i] = st[i] * g; kv_mem += st[i] * kk[i]; }
-    \\  kv_mem = simd_sum(kv_mem);
-    \\  float delta = (vt - kv_mem) * beta;
-    \\  float out = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) { st[i] = st[i] + kk[i] * delta; out += st[i] * qq[i]; }
-    \\  out = simd_sum(out);
-    \\  if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);
-    \\  // The next token reads the state serial decoding stored (StT), not the f32.
-    \\  for (int i = 0; i < 4; ++i) st[i] = float(static_cast<StT>(st[i]));
-    \\  if (parents[5 * TL + t] != 0) for (int i = 0; i < 4; ++i) kept[t][i] = st[i];
-    \\}
-;
+const K1TR_SOURCE = kernelSource("kernels/gdn/decode_k1tr.metal");
 
 // The recurrence along `path` (window rows, oldest first) from the round's
 // input state, the tree kernel's ops and per-token rounding: the state serial
 // decoding holds after the path's last row. K1TR's grid. The same launch
 // copies the kept conv window: rows `conv_rows` of the conv input.
-const K1R_SOURCE =
-    \\constexpr int GRP = HV / HK;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint dv = thread_position_in_grid.y;
-    \\uint hv = thread_position_in_grid.z;
-    \\uint hk = hv / GRP;
-    \\const uint tid = (hv * DV + dv) * 32 + lane;
-    \\if (tid < uint(3 * C)) conv_out[tid] = conv_in[conv_rows[tid / C] * C + tid % C];
-    \\float st[4];
-    \\uint base = (hv * DV + dv) * DK + lane * 4;
-    \\for (int i = 0; i < 4; ++i) st[i] = float(state_in[base + i]);
-    \\for (int p = 0; p < int(n_path[0]); ++p) {
-    \\  const int t = path[p];
-    \\  float kk[4];
-    \\  for (int i = 0; i < 4; ++i) kk[i] = pk[(t * HK + hk) * DK + lane * 4 + i];
-    \\  const float g = pg[(t * HV + hv) * 2], beta = pg[(t * HV + hv) * 2 + 1];
-    \\  float kv_mem = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) { st[i] = st[i] * g; kv_mem += st[i] * kk[i]; }
-    \\  kv_mem = simd_sum(kv_mem);
-    \\  float delta = (pv[(t * HV + hv) * DV + dv] - kv_mem) * beta;
-    \\  for (int i = 0; i < 4; ++i) st[i] = st[i] + kk[i] * delta;
-    \\  for (int i = 0; i < 4; ++i) st[i] = float(static_cast<StT>(st[i]));
-    \\}
-    \\for (int i = 0; i < 4; ++i) state_out[base + i] = static_cast<StT>(st[i]);
-;
+const K1R_SOURCE = kernelSource("kernels/gdn/decode_k1r.metal");
 
 const SPLIT: c_int = 4;
 const NT: c_int = 256; // 4 dv rows per simdgroup

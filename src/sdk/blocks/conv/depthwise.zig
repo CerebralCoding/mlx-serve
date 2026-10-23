@@ -2,6 +2,7 @@
 //! Owns depthwiseConvStep, DWCONV_CUDA_SOURCE, dwconv_cuda_kernel, depthwiseConvCuda.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const hostF32 = @import("../../testing/parity.zig").hostF32;
 const rmsVsTruth = @import("../../testing/parity.zig").rmsVsTruth;
@@ -25,20 +26,7 @@ pub fn depthwiseConvStep(window: mlx.mlx_array, w: mlx.mlx_array, cdim: c_int, k
     return out;
 }
 
-const DWCONV_CUDA_SOURCE =
-    \\const long idx = (long)blockIdx.x * blockDim.x + threadIdx.x;
-    \\const int lin = x_shape[1];
-    \\const int l = lin - K + 1;
-    \\if (idx >= (long)x_shape[0] * l * C) return;
-    \\const int c = idx % C;
-    \\const long bt = idx / C;
-    \\const long t = bt % l;
-    \\const long b = bt / l;
-    \\const auto* xp = x + (b * lin + t) * C + c;
-    \\float acc = 0.0f;
-    \\for (int j = 0; j < K; ++j) acc += static_cast<float>(xp[(long)j * C]) * static_cast<float>(w[c * K + j]);
-    \\y[idx] = static_cast<OutT>(acc);
-;
+const DWCONV_CUDA_SOURCE = kernelSource("kernels/conv/dwconv.cu");
 
 var dwconv_cuda_kernel: ?mlx.mlx_fast_cuda_kernel = null;
 

@@ -2,6 +2,7 @@
 //! Owns gatherQmvSource, GQMV_BODY_AFFINE, GQMV_BODY_NVFP4, GQMV_AFFINE_HEADER, GQMV_NVFP4_HEADER, gatherQmvGateUpSource, and 28 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
@@ -54,40 +55,7 @@ fn gatherQmvSource(comptime nvfp4: bool, comptime x_per_expert: bool) [:0]const 
     // A uint4 (128-bit) load variant was measured and is NOT kept: 38.9 us vs
     // 37.3 for the scalar form. At ~5 ALU ops per dequantized value this loop
     // is ALU-bound, not load-width bound, so widening the loads only adds code.
-    return std.fmt.comptimePrint(
-        \\auto lane = thread_index_in_simdgroup;
-        \\uint n = thread_position_in_grid.y;      // output row within the expert
-        \\uint e = thread_position_in_grid.z;      // top-K slot
-        \\
-        \\int K = int(K_size);
-        \\int N = int(N_size);
-        \\constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;  // values per pack: a word, or 3 bytes at 3-bit
-        \\int K_by_p = K / VPW;                    // packs per row
-        \\int K_by_w = K * BITS / 32;              // words per row
-        \\int K_by_gs = K / GS;                    // quant groups per row
-        \\uint mask = (1u << BITS) - 1u;
-        \\
-        \\uint eid = inds[e];                      // bank row for this slot
-        \\size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_w + (size_t)n * (size_t)K_by_w;
-        \\size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
-        \\size_t xoff = {s};
-        \\
-        \\// Four independent accumulators so the per-lane FMA chain is not one
-        \\// serial dependency; VPW is 16/8/4 for bits 2/4/8, always a multiple of 4.
-        \\float a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
-        \\for (int pack = int(lane); pack < K_by_p; pack += 32) {{
-        \\  uint32_t packed = mlxserve_qpack<BITS>(w_q, wbase, pack);
-        \\  int k_base = pack * VPW;
-        \\  int gi = k_base / GS;                  // GS >= VPW, so one group per word
-        \\{s}
-        \\}}
-        \\float acc = simd_sum((a0 + a1) + (a2 + a3)){s};
-        \\if (lane == 0) {{
-        \\  float o = float(T(acc));
-        \\  if (ACT2) {{ o = metal::max(o, 0.0f); o = o * o; }}
-        \\  y[(size_t)e * (size_t)N + (size_t)n] = T(o);
-        \\}}
-    , .{
+    return std.fmt.comptimePrint(kernelSource("kernels/moe/gather_qmv.fmt.metal"), .{
         if (x_per_expert) "(size_t)e * (size_t)K" else "0",
         if (nvfp4) GQMV_BODY_NVFP4 else GQMV_BODY_AFFINE,
         // NVFP4 decodes both halves scaled down by a power of two (2^14 for the
@@ -98,33 +66,12 @@ fn gatherQmvSource(comptime nvfp4: bool, comptime x_per_expert: bool) [:0]const 
     });
 }
 
-pub const GQMV_BODY_AFFINE =
-    \\  float sj = float(scales[gbase + (size_t)gi]);
-    \\  float bj = float(biases[gbase + (size_t)gi]);
-    \\  for (int ki = 0; ki < VPW; ki += 4) {
-    \\    size_t xi = xoff + (size_t)(k_base + ki);
-    \\    uint32_t q = packed >> (ki * BITS);
-    \\    a0 += float(x[xi + 0]) * (float((q >> (0 * BITS)) & mask) * sj + bj);
-    \\    a1 += float(x[xi + 1]) * (float((q >> (1 * BITS)) & mask) * sj + bj);
-    \\    a2 += float(x[xi + 2]) * (float((q >> (2 * BITS)) & mask) * sj + bj);
-    \\    a3 += float(x[xi + 3]) * (float((q >> (3 * BITS)) & mask) * sj + bj);
-    \\  }
-;
+pub const GQMV_BODY_AFFINE = kernelSource("kernels/moe/gqmv_body_affine.metal");
 
 // The group scale is constant across a whole packed word (GS 16 >= VPW 8), so
 // the word's four partial dot products are summed unscaled and the scale is
 // applied once per word rather than once per value.
-pub const GQMV_BODY_NVFP4 =
-    \\  float sj = mlxserve_e4m3(uint(scales[gbase + (size_t)gi]));
-    \\  size_t xi = xoff + (size_t)k_base;
-    \\  float2 p0 = mlxserve_e2m1x2(packed, 0), p1 = mlxserve_e2m1x2(packed, 1);
-    \\  float2 p2 = mlxserve_e2m1x2(packed, 2), p3 = mlxserve_e2m1x2(packed, 3);
-    \\  float d0 = float(x[xi + 0]) * p0.x + float(x[xi + 4]) * p0.y;
-    \\  float d1 = float(x[xi + 1]) * p1.x + float(x[xi + 5]) * p1.y;
-    \\  float d2 = float(x[xi + 2]) * p2.x + float(x[xi + 6]) * p2.y;
-    \\  float d3 = float(x[xi + 3]) * p3.x + float(x[xi + 7]) * p3.y;
-    \\  a0 += d0 * sj; a1 += d1 * sj; a2 += d2 * sj; a3 += d3 * sj;
-;
+pub const GQMV_BODY_NVFP4 = kernelSource("kernels/moe/gqmv_body_nvfp4.metal");
 
 // An e2m1 nibble and an e4m3 byte each become a `half` by shifting their bits
 // straight into the half exponent/mantissa/sign fields — no LUT, no branches,
@@ -137,22 +84,9 @@ pub const GQMV_BODY_NVFP4 =
 // One packed unit of quantized values as a uint32: a word for 2/4/8-bit; at
 // 3-bit, mx.quantize packs 8 values into 3 bytes (value i at bit 3i), so the
 // unit is a byte triple and the body's `>> (i * BITS)` walk is unchanged.
-pub const GQMV_AFFINE_HEADER =
-    \\template <int B>
-    \\inline uint32_t mlxserve_qpack(const device uint32_t* w, size_t wbase_words, int pack) {
-    \\  if (B == 3) {
-    \\    const device uchar* wb = (const device uchar*)w + wbase_words * 4 + (size_t)pack * 3;
-    \\    return uint32_t(wb[0]) | (uint32_t(wb[1]) << 8) | (uint32_t(wb[2]) << 16);
-    \\  }
-    \\  return w[wbase_words + (size_t)pack];
-    \\}
-;
+pub const GQMV_AFFINE_HEADER = kernelSource("kernels/moe/gqmv_affine_header.metal");
 
-pub const GQMV_NVFP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++ moe_fp4.E2M1X2_HEADER ++
-    \\inline float mlxserve_e4m3(uint b) {
-    \\  return float(as_type<half>(ushort(((b & 0x7Fu) << 7) | ((b & 0x80u) << 8))));
-    \\}
-;
+pub const GQMV_NVFP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++ moe_fp4.E2M1X2_HEADER ++ kernelSource("kernels/moe/gqmv_nvfp4_header.metal");
 
 // ── Fused routed gate+up+SwiGLU (one kernel for what was three) ──
 //
@@ -170,111 +104,16 @@ pub const GQMV_NVFP4_HEADER = GQMV_AFFINE_HEADER ++ moe_fp4.E2M1_HEADER ++ moe_f
 // `gatherQmv` writes `T(acc)` — and then running the same table-lookup SwiGLU
 // `fusedSwiGLU` does. No f32 shortcut through the activation.
 fn gatherQmvGateUpSource(comptime nvfp4: bool) [:0]const u8 {
-    return std.fmt.comptimePrint(
-        \\auto lane = thread_index_in_simdgroup;
-        \\uint n = thread_position_in_grid.y;      // output row within the expert
-        \\uint e = thread_position_in_grid.z;      // top-K slot
-        \\
-        \\int K = int(K_size);
-        \\int N = int(N_size);
-        \\constexpr int VPW = (BITS == 3) ? 8 : 32 / BITS;
-        \\int K_by_p = K / VPW;
-        \\int K_by_w = K * BITS / 32;
-        \\int K_by_gs = K / GS;
-        \\uint mask = (1u << BITS) - 1u;
-        \\
-        \\uint eid = inds[e];
-        \\size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_w + (size_t)n * (size_t)K_by_w;
-        \\size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
-        \\size_t xrow = 0;
-        \\
-        \\// Every lane's packed words are issued up front (KP = K_by_p is a
-        \\// template constant): −0.7% per forward in idle same-boot pairs vs
-        \\// the runtime-count loop. Same per-lane accumulation order.
-        \\constexpr int IT = (KP + 31) / 32;
-        \\uint32_t pg[IT];
-        \\uint32_t pu[IT];
-        \\for (int i = 0; i < IT; ++i) {{
-        \\  int pack = int(lane) + 32 * i;
-        \\  pg[i] = (pack < KP) ? mlxserve_qpack<BITS>(wg_q, wbase, pack) : 0u;
-        \\  pu[i] = (pack < KP) ? mlxserve_qpack<BITS>(wu_q, wbase, pack) : 0u;
-        \\}}
-        \\// Two independent 4-way accumulator sets: the gate chain and the up
-        \\// chain never wait on each other.
-        \\float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
-        \\float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
-        \\for (int i = 0; i < IT; ++i) {{
-        \\  int pack = int(lane) + 32 * i;
-        \\  if (pack >= KP) break;
-        \\  uint32_t packed_g = pg[i];
-        \\  uint32_t packed_u = pu[i];
-        \\  int k_base = pack * VPW;
-        \\  int gi = k_base / GS;
-        \\{s}
-        \\}}
-        \\float acc_g = simd_sum((g0 + g1) + (g2 + g3)){s};
-        \\float acc_u = simd_sum((u0 + u1) + (u2 + u3)){s};
-        \\if (lane == 0) {{
-        \\  // Round exactly where the unfused path's two kernels wrote T(acc),
-        \\  // then the same table-lookup SwiGLU.
-        \\  T gt = T(acc_g);
-        \\  T ut = T(acc_u);
-        \\  if constexpr (LIMIT > 0) {{ // a swiglu_limit: clampedSwiGLU's clamps on the rounded values
-        \\    gt = metal::min(gt, T(LIMIT));
-        \\    ut = metal::max(metal::min(ut, T(LIMIT)), T(-LIMIT));
-        \\  }}
-        \\  T sig = sigtab[as_type<ushort>(gt)];
-        \\  y[(size_t)e * (size_t)N + (size_t)n] = (gt * sig) * ut;
-        \\}}
-    , .{
+    return std.fmt.comptimePrint(kernelSource("kernels/moe/gather_qmv_gateup.fmt.metal"), .{
         if (nvfp4) GQMV_GATEUP_BODY_NVFP4 else GQMV_GATEUP_BODY_AFFINE,
         if (nvfp4) " * 4194304.0f" else "",
         if (nvfp4) " * 4194304.0f" else "",
     });
 }
 
-pub const GQMV_GATEUP_BODY_AFFINE =
-    \\  float sjg = float(g_scales[gbase + (size_t)gi]);
-    \\  float bjg = float(g_biases[gbase + (size_t)gi]);
-    \\  float sju = float(u_scales[gbase + (size_t)gi]);
-    \\  float bju = float(u_biases[gbase + (size_t)gi]);
-    \\  for (int ki = 0; ki < VPW; ki += 4) {
-    \\    size_t xi = xrow + (size_t)(k_base + ki);
-    \\    uint32_t qg = packed_g >> (ki * BITS);
-    \\    uint32_t qu = packed_u >> (ki * BITS);
-    \\    float x0 = float(x[xi + 0]);
-    \\    float x1 = float(x[xi + 1]);
-    \\    float x2 = float(x[xi + 2]);
-    \\    float x3 = float(x[xi + 3]);
-    \\    g0 += x0 * (float((qg >> (0 * BITS)) & mask) * sjg + bjg);
-    \\    g1 += x1 * (float((qg >> (1 * BITS)) & mask) * sjg + bjg);
-    \\    g2 += x2 * (float((qg >> (2 * BITS)) & mask) * sjg + bjg);
-    \\    g3 += x3 * (float((qg >> (3 * BITS)) & mask) * sjg + bjg);
-    \\    u0 += x0 * (float((qu >> (0 * BITS)) & mask) * sju + bju);
-    \\    u1 += x1 * (float((qu >> (1 * BITS)) & mask) * sju + bju);
-    \\    u2 += x2 * (float((qu >> (2 * BITS)) & mask) * sju + bju);
-    \\    u3 += x3 * (float((qu >> (3 * BITS)) & mask) * sju + bju);
-    \\  }
-;
+pub const GQMV_GATEUP_BODY_AFFINE = kernelSource("kernels/moe/gqmv_gateup_body_affine.metal");
 
-pub const GQMV_GATEUP_BODY_NVFP4 =
-    \\  float sjg = mlxserve_e4m3(uint(g_scales[gbase + (size_t)gi]));
-    \\  float sju = mlxserve_e4m3(uint(u_scales[gbase + (size_t)gi]));
-    \\  float dg[4], du[4];
-    \\  size_t xi = xrow + (size_t)k_base;
-    \\  for (int j = 0; j < 4; ++j) {
-    \\    const float xa = float(x[xi + j]);
-    \\    const float xb = float(x[xi + j + 4]);
-    \\    const float2 pg2 = mlxserve_e2m1x2(packed_g, j);
-    \\    const float2 pu2 = mlxserve_e2m1x2(packed_u, j);
-    \\    dg[j] = xa * pg2.x + xb * pg2.y;
-    \\    du[j] = xa * pu2.x + xb * pu2.y;
-    \\  }
-    \\  float dg0 = dg[0], dg1 = dg[1], dg2 = dg[2], dg3 = dg[3];
-    \\  float du0 = du[0], du1 = du[1], du2 = du[2], du3 = du[3];
-    \\  g0 += dg0 * sjg; g1 += dg1 * sjg; g2 += dg2 * sjg; g3 += dg3 * sjg;
-    \\  u0 += du0 * sju; u1 += du1 * sju; u2 += du2 * sju; u3 += du3 * sju;
-;
+pub const GQMV_GATEUP_BODY_NVFP4 = kernelSource("kernels/moe/gqmv_gateup_body_nvfp4.metal");
 
 const GQMV_GATEUP_SOURCES = [2][:0]const u8{ gatherQmvGateUpSource(false), gatherQmvGateUpSource(true) };
 const GQMV_GATEUP_NAMES = [2][*:0]const u8{ "mlxserve_moe_gather_qmv_gateup", "mlxserve_moe_gather_qmv_gateup_nvfp4" };

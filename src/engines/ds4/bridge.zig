@@ -210,7 +210,8 @@ pub fn ensureMetalKernels(allocator: std.mem.Allocator) Error!void {
 }
 
 pub const OpenOptions = struct {
-    backend: ffi.Backend = if (builtin.os.tag == .macos) .metal else .cuda,
+    pub const default_backend: ffi.Backend = if (builtin.os.tag == .macos) .metal else .cuda;
+    backend: ffi.Backend = default_backend,
     n_threads: c_int = 0,
     warm_weights: bool = true,
     quality: bool = false,
@@ -264,6 +265,13 @@ fn refuseSplitGguf(allocator: std.mem.Allocator, path: []const u8) Error!void {
     if (info.split_count <= 1) return;
     log.err("[ds4] {s} is one shard of a {d}-file split GGUF, and the ds4 engine reads one file: serve it with --engine llama, or merge the shards (llama-gguf-split --merge)\n", .{ path, info.split_count });
     return Error.SplitGgufUnsupported;
+}
+
+pub const ThinkMode = ffi.ThinkMode;
+
+/// ds4's KV and scratch for a session of `ctx` tokens (its own estimate, before any session exists).
+pub fn contextBytes(ctx: u32) u64 {
+    return ffi.ds4_context_memory_estimate(OpenOptions.default_backend, @intCast(ctx)).total_bytes;
 }
 
 pub fn dsparkEffective(requested: bool, has_support_gguf: bool) bool {
@@ -461,6 +469,7 @@ pub const Ds4Engine = struct {
     pub fn detokenizeOne(self: *Ds4Engine, allocator: std.mem.Allocator, token_id: i32) Error![]u8 {
         var len_out: usize = 0;
         const raw = ffi.ds4_token_text(self.handle, @intCast(token_id), &len_out);
+        defer if (raw) |r| std.c.free(r); // ds4 mallocs every answer
         if (raw == null or len_out == 0) {
             return allocator.dupe(u8, "") catch Error.OutOfMemory;
         }
@@ -569,6 +578,16 @@ pub const Ds4Session = struct {
 
     pub fn sample(self: *Ds4Session, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: *u64) i32 {
         return @intCast(ffi.ds4_session_sample(self.handle, temperature, @intCast(top_k), top_p, min_p, rng));
+    }
+
+    /// The logits the next draw reads, copied into `out` (one per vocabulary id); the count copied, 0 when short.
+    pub fn copyLogits(self: *Ds4Session, out: []f32) usize {
+        return @intCast(ffi.ds4_session_copy_logits(self.handle, out.ptr, @intCast(out.len)));
+    }
+
+    /// Replace the logits the next draw reads (one per vocabulary id).
+    pub fn setLogits(self: *Ds4Session, logits: []const f32) Error!void {
+        if (ffi.ds4_session_set_logits(self.handle, logits.ptr, @intCast(logits.len)) != 0) return Error.SessionEvalFailed;
     }
 
     /// MTP-driven speculative decode. Returns total tokens emitted into

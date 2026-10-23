@@ -1,6 +1,7 @@
 // SPDX-License-Identifier: Apache-2.0
 // Ported from oMLX (jundot/omlx) omlx/patches/m5_gather_qmm_nax.py @ d6b2b92.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
@@ -78,9 +79,9 @@ fn kernel(scan: bool) !mlx.mlx_fast_metal_kernel {
     const out_vec = if (scan) mlx.mlx_vector_string_new_data(&out_names_scan, out_names_scan.len) else mlx.mlx_vector_string_new_data(&out_names_mm, out_names_mm.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
     const value = if (scan)
-        mlx.mlx_fast_metal_kernel_new("msv_gqmm_tile_scan", in_vec, out_vec, @embedFile("../../../kernels/moe/gather_qmm_nax_scan.metal"), @embedFile("../../../kernels/moe/gather_qmm_nax_header.metal"), true, false)
+        mlx.mlx_fast_metal_kernel_new("msv_gqmm_tile_scan", in_vec, out_vec, kernelSource("kernels/moe/gather_qmm_nax_scan.metal"), kernelSource("kernels/moe/gather_qmm_nax_header.metal"), true, false)
     else
-        mlx.mlx_fast_metal_kernel_new("msv_gqmm_affine", in_vec, out_vec, @embedFile("../../../kernels/moe/gather_qmm_nax.metal"), @embedFile("../../../kernels/moe/gather_qmm_nax_header.metal"), true, false);
+        mlx.mlx_fast_metal_kernel_new("msv_gqmm_affine", in_vec, out_vec, kernelSource("kernels/moe/gather_qmm_nax.metal"), kernelSource("kernels/moe/gather_qmm_nax_header.metal"), true, false);
     if (value.ctx == null) return error.MetalKernelCompileFailed;
     if (scan) scan_kernel = value else mm_kernel = value;
     return value;
@@ -95,8 +96,8 @@ fn mapKernel(paired: bool) !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(ins_vec);
     const outs_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(outs_vec);
-    const header = @embedFile("../../../kernels/moe/gather_qmm_nax_header.metal") ++ @embedFile("../../../kernels/moe/gather_qmm_nax_mapped_header.metal");
-    const value = mlx.mlx_fast_metal_kernel_new(if (paired) "msv_gqmm_affine_pair" else "msv_gqmm_affine_map", ins_vec, outs_vec, @embedFile("../../../kernels/moe/gather_qmm_nax_mapped.metal"), header, true, false);
+    const header = kernelSource("kernels/moe/gather_qmm_nax_header.metal") ++ kernelSource("kernels/moe/gather_qmm_nax_mapped_header.metal");
+    const value = mlx.mlx_fast_metal_kernel_new(if (paired) "msv_gqmm_affine_pair" else "msv_gqmm_affine_map", ins_vec, outs_vec, kernelSource("kernels/moe/gather_qmm_nax_mapped.metal"), header, true, false);
     if (value.ctx == null) return error.MetalKernelCompileFailed;
     slot.* = value;
     return value;

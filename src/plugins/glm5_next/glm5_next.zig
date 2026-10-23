@@ -4,6 +4,7 @@
 //! Numerics follow mlx-vlm's `glm5_next` (the reference this port is held to); the
 //! fused Sinkhorn-collapse kernel is mlx-vlm's `hc_sinkhorn_collapse`.
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const dsa = @import("dsa_nax.zig");
 const Scope = @import("../../mlx/scope.zig").Scope;
@@ -16,129 +17,10 @@ const MIX: c_int = (2 + HC) * HC;
 /// mlx-vlm `deepseek_v4/hyper_connection.py` `_make_hc_sinkhorn_collapse_kernel`
 /// (Copyright (c) 2026 Apple Inc., MIT): sigmoid pre/post gates and the Sinkhorn-normalized
 /// comb from one row's mixes, on simdgroup 0.
-const GATES_HEADER =
-    \\template <int HC, int ITERS, typename M, typename B, typename PO, typename CO>
-    \\inline void msv_hc_gates(M mix, B base, float pre_scale, float post_scale, float comb_scale,
-    \\                         float EPS, uint lane, threadgroup float* pre_shared,
-    \\                         PO post_out, CO comb_out) {
-    \\    constexpr int BASE_OFF = 2 * HC;
-    \\    const float active = (lane < (uint)HC) ? 1.0f : 0.0f;
-    \\    const uint  llane  = metal::min(lane, (uint)(HC - 1));
-    \\    float pre_z  = mix[llane]      * pre_scale  + base[llane];
-    \\    float post_z = mix[HC + llane] * post_scale + base[HC + llane];
-    \\    float pre_v  = 1.0f / (1.0f + metal::fast::exp(-pre_z)) + EPS;
-    \\    float post_v = 2.0f / (1.0f + metal::fast::exp(-post_z));
-    \\    if (lane < (uint)HC) {
-    \\        pre_shared[lane] = pre_v;
-    \\        post_out[lane]   = post_v;
-    \\    }
-    \\    const int o = BASE_OFF + int(llane) * HC;
-    \\    float4 v = (float4(mix[o], mix[o + 1], mix[o + 2], mix[o + 3]) * comb_scale
-    \\              + float4(base[o], base[o + 1], base[o + 2], base[o + 3])) * active;
-    \\    float row_max = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
-    \\    float4 e = metal::fast::exp(v - row_max) * active;
-    \\    float4 r = e * (1.0f / (e.x + e.y + e.z + e.w + EPS)) + EPS * active;
-    \\    float4 col_inv = 1.0f / (float4(simd_sum(r.x), simd_sum(r.y), simd_sum(r.z), simd_sum(r.w)) + EPS);
-    \\    r *= col_inv;
-    \\    for (int iter = 1; iter < ITERS; ++iter) {
-    \\        r *= (1.0f / (r.x + r.y + r.z + r.w + EPS)) * active;
-    \\        col_inv = 1.0f / (float4(simd_sum(r.x), simd_sum(r.y), simd_sum(r.z), simd_sum(r.w)) + EPS);
-    \\        r *= col_inv;
-    \\    }
-    \\    if (lane < (uint)HC) {
-    \\        comb_out[lane * HC] = r.x;
-    \\        comb_out[lane * HC + 1] = r.y;
-    \\        comb_out[lane * HC + 2] = r.z;
-    \\        comb_out[lane * HC + 3] = r.w;
-    \\    }
-    \\}
-    \\
-    \\// msv_hc_gates' post and comb on one thread (HC == 4): no cross-lane sums per iteration.
-    \\template <int ITERS, typename M, typename B, typename PO, typename CO>
-    \\inline void msv_hc_gates1(M mix, B base, float post_scale, float comb_scale, float EPS,
-    \\                          PO post_out, CO comb_out) {
-    \\    for (int i = 0; i < 4; ++i)
-    \\        post_out[i] = 2.0f / (1.0f + metal::fast::exp(-(mix[4 + i] * post_scale + base[4 + i])));
-    \\    float4 r[4];
-    \\    for (int i = 0; i < 4; ++i) {
-    \\        const int o = 8 + 4 * i;
-    \\        const float4 v = float4(mix[o], mix[o + 1], mix[o + 2], mix[o + 3]) * comb_scale
-    \\                       + float4(base[o], base[o + 1], base[o + 2], base[o + 3]);
-    \\        const float row_max = metal::max(metal::max(v.x, v.y), metal::max(v.z, v.w));
-    \\        const float4 e = metal::fast::exp(v - row_max);
-    \\        r[i] = e * (metal::fast::divide(1.0f, e.x + e.y + e.z + e.w + EPS)) + EPS;
-    \\    }
-    \\    float4 ci = metal::fast::divide(1.0f, (r[0] + r[1]) + (r[2] + r[3]) + EPS);
-    \\    for (int i = 0; i < 4; ++i) r[i] *= ci;
-    \\    for (int iter = 1; iter < ITERS; ++iter) {
-    \\        for (int i = 0; i < 4; ++i) r[i] *= metal::fast::divide(1.0f, r[i].x + r[i].y + r[i].z + r[i].w + EPS);
-    \\        ci = metal::fast::divide(1.0f, (r[0] + r[1]) + (r[2] + r[3]) + EPS);
-    \\        for (int i = 0; i < 4; ++i) r[i] *= ci;
-    \\    }
-    \\    for (int i = 0; i < 4; ++i) {
-    \\        comb_out[4 * i] = r[i].x;
-    \\        comb_out[4 * i + 1] = r[i].y;
-    \\        comb_out[4 * i + 2] = r[i].z;
-    \\        comb_out[4 * i + 3] = r[i].w;
-    \\    }
-    \\}
-    \\
-    \\template <typename T>
-    \\inline float4 msv_hc_load4(device T* h, int k) {
-    \\    device atomic_uint* w = (device atomic_uint*)(h + k);
-    \\    const uint a = atomic_load_explicit(w, memory_order_relaxed);
-    \\    const uint b = atomic_load_explicit(w + 1, memory_order_relaxed);
-    \\    return float4(float2(as_type<vec<T, 2>>(a)), float2(as_type<vec<T, 2>>(b)));
-    \\}
-    \\
-    \\// Stream element k of `expand(y, h)`, rounded where `expand` rounds it.
-    \\template <typename T, int HC, int D, typename Y, typename P, typename C, typename H>
-    \\inline float msv_hc_hval(int k, Y y, P post, C comb, H h) {
-    \\    const int i = k / D;
-    \\    const int d = k - i * D;
-    \\    float acc = 0.0f;
-    \\    for (int j = 0; j < HC; ++j) acc = fma(comb[j * HC + i], float(h[j * D + d]), acc);
-    \\    return float(T(fma(post[i], float(y[d]), acc)));
-    \\}
-;
+const GATES_HEADER = kernelSource("plugins/glm5_next/kernels/gates_header.metal");
 
 /// The gates, then the pre-weighted collapse of the 4 streams, one row per threadgroup.
-const COLLAPSE_SOURCE =
-    \\uint tid  = thread_position_in_threadgroup.x;
-    \\uint row  = threadgroup_position_in_grid.x;
-    \\uint lane = tid % 32;
-    \\uint sg   = tid / 32;
-    \\constexpr int MIX = (2 + HC) * HC;
-    \\constexpr float EPS = EPS_INT * 1e-9;
-    \\threadgroup float pre_shared[HC];
-    \\if (sg == 0) {
-    \\    msv_hc_gates<HC, ITERS>(mixes + row * MIX, base, scale[0], scale[1], scale[2], EPS, lane,
-    \\                           pre_shared, post + row * HC, comb + row * HC * HC);
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const float p0 = pre_shared[0];
-    \\const float p1 = pre_shared[1];
-    \\const float p2 = pre_shared[2];
-    \\const float p3 = pre_shared[3];
-    \\const device T* x_row  = (const device T*)x_in + row * (HC * D);
-    \\device U*       out_row = (device U*)collapsed + row * D;
-    \\using T4 = vec<T, 4>;
-    \\using U4 = vec<U, 4>;
-    \\const device T4* x_row0 = (const device T4*)(x_row + 0*D);
-    \\const device T4* x_row1 = (const device T4*)(x_row + 1*D);
-    \\const device T4* x_row2 = (const device T4*)(x_row + 2*D);
-    \\const device T4* x_row3 = (const device T4*)(x_row + 3*D);
-    \\device U4*       out4   = (device U4*)out_row;
-    \\constexpr uint D4 = (uint)D / 4;
-    \\for (uint d4 = tid; d4 < D4; d4 += 256) {
-    \\    float4 x0 = float4(x_row0[d4]);
-    \\    float4 x1 = float4(x_row1[d4]);
-    \\    float4 x2 = float4(x_row2[d4]);
-    \\    float4 x3 = float4(x_row3[d4]);
-    \\    float4 result = fma(float4(p0), x0, fma(float4(p1), x1, fma(float4(p2), x2, float4(p3) * x3)));
-    \\    out4[d4] = U4(result);
-    \\}
-;
+const COLLAPSE_SOURCE = kernelSource("plugins/glm5_next/kernels/collapse.metal");
 
 var collapse_kernel: ?mlx.mlx_fast_metal_kernel = null;
 pub const Collapsed = struct {
@@ -157,66 +39,7 @@ pub const Collapsed = struct {
 /// `rms_norm(flatten(stream)) @ fn^T` per row, straight from the bf16 stream: 8 rows per
 /// threadgroup on simdgroup matrices, SG simdgroups splitting K = HC*D, the RMS scale applied
 /// after the dot products.
-const MIXES_SOURCE =
-    \\const uint tg = threadgroup_position_in_grid.x;
-    \\const uint sg = simdgroup_index_in_threadgroup;
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const uint tid = sg * 32 + lane;
-    \\constexpr int K = HC * D;
-    \\constexpr int MIX = (2 + HC) * HC;
-    \\constexpr int KS = K / SG;
-    \\const int rows = params;
-    \\const short qid = short(lane / 4);
-    \\const short mr = (qid & 4) + short((lane / 2) % 4);
-    \\const short mc = (qid & 2) * 2 + short(lane % 2) * 2;
-    \\const int r = int(tg) * 8 + mr;
-    \\const bool rv = r < rows;
-    \\const device T* xrow = stream + (size_t)(rv ? r : 0) * K;
-    \\simdgroup_matrix<float, 8, 8> a, b;
-    \\simdgroup_matrix<float, 8, 8> c[MIX / 8];
-    \\for (int t = 0; t < MIX / 8; ++t) c[t] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\float ss = 0.0f;
-    \\for (int k0 = int(sg) * KS; k0 < int(sg + 1) * KS; k0 += 8) {
-    \\    const float2 av = rv ? float2(float(xrow[k0 + mc]), float(xrow[k0 + mc + 1])) : float2(0.0f);
-    \\    ss = fma(av.x, av.x, fma(av.y, av.y, ss));
-    \\    reinterpret_cast<thread float2&>(a.thread_elements()) = av;
-    \\    const device float* wcol = fn + (size_t)mc * K + k0 + mr;
-    \\    for (int t = 0; t < MIX / 8; ++t) {
-    \\        reinterpret_cast<thread float2&>(b.thread_elements()) = float2(wcol[t * 8 * K], wcol[(t * 8 + 1) * K]);
-    \\        simdgroup_multiply_accumulate(c[t], a, b, c[t]);
-    \\    }
-    \\}
-    \\threadgroup float part[SG][8][MIX];
-    \\threadgroup float ssp[SG][32];
-    \\threadgroup float rowss[8];
-    \\for (int t = 0; t < MIX / 8; ++t) {
-    \\    const float2 cv = reinterpret_cast<thread float2&>(c[t].thread_elements());
-    \\    part[sg][mr][t * 8 + mc] = cv.x;
-    \\    part[sg][mr][t * 8 + mc + 1] = cv.y;
-    \\}
-    \\ssp[sg][lane] = ss;
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (tid < 8) {
-    \\    float acc = 0.0f;
-    \\    for (uint g = 0; g < SG; ++g)
-    \\        for (uint l = 0; l < 32; ++l) {
-    \\            const short q = short(l / 4);
-    \\            if ((q & 4) + short((l / 2) % 4) == short(tid)) acc += ssp[g][l];
-    \\        }
-    \\    rowss[tid] = acc;
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (tid < 8 * MIX) {
-    \\    const int row = int(tid) / MIX;
-    \\    const int col = int(tid) % MIX;
-    \\    const int gr = int(tg) * 8 + row;
-    \\    if (gr < rows) {
-    \\        float acc = 0.0f;
-    \\        for (uint g = 0; g < SG; ++g) acc += part[g][row][col];
-    \\        mixes[(size_t)gr * MIX + col] = acc * metal::precise::rsqrt(rowss[row] / float(K) + eps[0]);
-    \\    }
-    \\}
-;
+const MIXES_SOURCE = kernelSource("plugins/glm5_next/kernels/mixes.metal");
 const MIXES_SG: c_int = 8;
 const MIXES_KERNEL_MIN_ROWS: c_int = 512;
 var mixes_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -378,103 +201,13 @@ pub const HC_PRE_MAX_ROWS: c_int = 16;
 /// kernel by register use (M1/M2 below 1024), so the first eval probes and halves.
 var hc_pre_tpg: c_int = HC_PRE_TPG;
 var hc_pre_probed = [2]bool{ false, false };
-const HC_PRE_BODY =
-    \\constexpr int K = HC * D;
-    \\constexpr int MIX = (2 + HC) * HC;
-    \\constexpr int SL = K / NT;
-    \\constexpr float EPS = EPS_INT * 1e-9;
-    \\const uint g = threadgroup_position_in_grid.x;
-    \\const uint row = threadgroup_position_in_grid.y;
-    \\const uint tid = thread_position_in_threadgroup.x;
-    \\const uint lane = tid % 32;
-    \\const uint sg = tid / 32;
-    \\float acc[MIX + 1];
-    \\for (int r = 0; r <= MIX; ++r) acc[r] = 0.0f;
-    \\for (int k = int(g) * SL + int(tid); k < int(g + 1) * SL; k += TPG) {
-    \\    const float hv = HVAL(k);
-    \\    STORE_H(k, hv);
-    \\    acc[MIX] = fma(hv, hv, acc[MIX]);
-    \\    for (int r = 0; r < MIX; ++r) acc[r] = fma(hv, fn[r * K + k], acc[r]);
-    \\}
-    \\constexpr int NSG = TPG / 32;
-    \\threadgroup float red[NSG][MIX + 1];
-    \\threadgroup float tot[MIX + 1];
-    \\threadgroup bool last;
-    \\for (int r = 0; r <= MIX; ++r) {
-    \\    const float v = simd_sum(acc[r]);
-    \\    if (lane == 0) red[sg][r] = v;
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\// Partials cross threadgroups through L2: plain loads can hit another core's stale L1.
-    \\if (tid <= uint(MIX)) {
-    \\    float t = 0.0f;
-    \\    for (int q = 0; q < NSG; ++q) t += red[q][tid];
-    \\    atomic_store_explicit((device atomic_float*)parts + (row * NT + g) * (MIX + 1) + tid, t, memory_order_relaxed);
-    \\}
-    \\atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    \\threadgroup_barrier(mem_flags::mem_device);
-    \\if (tid == 0) {
-    \\    const uint old = atomic_fetch_add_explicit((device atomic_uint*)counter + row, 1u, memory_order_relaxed);
-    \\    last = ((old + 1u) % uint(NT)) == 0u;
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (!last) return;
-    \\atomic_thread_fence(mem_flags::mem_device, memory_order_seq_cst, thread_scope_device);
-    \\threadgroup float all[NT * (MIX + 1)];
-    \\for (uint q = tid; q < uint(NT * (MIX + 1)); q += TPG) all[q] = atomic_load_explicit((device atomic_float*)parts + row * NT * (MIX + 1) + q, memory_order_relaxed);
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (tid <= uint(MIX)) {
-    \\    float t = 0.0f;
-    \\    for (int q = 0; q < NT; ++q) t += all[q * (MIX + 1) + tid];
-    \\    tot[tid] = t;
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const float inv = metal::precise::rsqrt(tot[MIX] / float(K) + eps[0]);
-    \\threadgroup float mix_n[MIX];
-    \\if (tid < uint(MIX)) mix_n[tid] = tot[tid] * inv;
-    \\float p[HC];
-    \\for (int j = 0; j < HC; ++j) {
-    \\    const float z = tot[j] * inv * scale[0] + base[j];
-    \\    p[j] = 1.0f / (1.0f + metal::fast::exp(-z)) + EPS;
-    \\}
-    \\constexpr int D4 = D / 4;
-    \\constexpr int CPT = (D4 + TPG - 1) / TPG;
-    \\float4 cf[CPT];
-    \\float s2 = 0.0f;
-    \\for (int u = 0; u < CPT; ++u) {
-    \\    cf[u] = 0.0f;
-    \\    const int d4 = u * TPG + int(tid);
-    \\    if (d4 < D4) {
-    \\        const int d = 4 * d4;
-    \\        float4 xs[HC];
-    \\        for (int j = 0; j < HC; ++j) xs[j] = TAIL4(j * D + d);
-    \\        const float4 c = fma(float4(p[0]), xs[0], fma(float4(p[1]), xs[1], fma(float4(p[2]), xs[2], float4(p[3]) * xs[3])));
-    \\        cf[u] = float4(vec<T, 4>(c));
-    \\        s2 += dot(cf[u], cf[u]);
-    \\    }
-    \\}
-    \\s2 = simd_sum(s2);
-    \\threadgroup float red2[NSG];
-    \\if (lane == 0) red2[sg] = s2;
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (sg == 0) {
-    \\    const float t = simd_sum(lane < uint(NSG) ? red2[lane] : 0.0f);
-    \\    if (lane == 0) red2[0] = t;
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const float inv2 = metal::precise::rsqrt(red2[0] / float(D) + eps[1]);
-    \\for (int u = 0; u < CPT; ++u) {
-    \\    const int d4 = u * TPG + int(tid);
-    \\    if (d4 < D4) ((device vec<T, 4>*)(normed + row * D))[d4] = ((const device vec<T, 4>*)nw)[d4] * vec<T, 4>(cf[u] * inv2);
-    \\}
-    \\if (tid == 0) msv_hc_gates1<ITERS>((threadgroup const float*)mix_n, base, scale[1], scale[2], EPS, post + row * HC, comb + row * HC * HC);
-;
+const HC_PRE_BODY = kernelSource("plugins/glm5_next/kernels/hc_pre_body.metal");
 const HC_DEFER_HVAL = "#define HVAL(k) msv_hc_hval<T, HC, D>((k), y + row * D, post_in + row * HC, comb_in + row * HC * HC, h_in + row * HC * D)\n";
-const HC_PRE_SOURCE = "#define HVAL(k) float(x[row * K + (k)])\n#define STORE_H(k, v)\n#define TAIL4(k) float4(*(const device vec<T, 4>*)(x + row * K + (k)))\n" ++ HC_PRE_BODY;
+const HC_PRE_SOURCE = kernelSource("plugins/glm5_next/kernels/hc_pre_direct_defines.metal") ++ HC_PRE_BODY;
 // Stream pairs cross threadgroups as 32-bit atomics: the even lane stores its odd neighbour's
 // element with its own, and the tail loads two elements per atomic.
-const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ "#define STORE_H(k, v) { static_assert(SL % 2 == 0 && TPG % 2 == 0, \"pairs need even k on even lanes\"); const float v1 = simd_shuffle_down((v), 1u); if (((k) & 1) == 0) atomic_store_explicit((device atomic_uint*)(h + row * K + (k)), as_type<uint>(vec<T, 2>(T(v), T(v1))), memory_order_relaxed); }\n#define TAIL4(k) msv_hc_load4<T>(h + row * K, (k))\n" ++ HC_PRE_BODY;
-const HC_MATERIALIZE_SOURCE = HC_DEFER_HVAL ++ "const int k = int(thread_position_in_grid.x);\nconst uint row = thread_position_in_grid.y;\nh[row * HC * D + k] = T(HVAL(k));\n";
+const HC_PRE_DEFER_SOURCE = HC_DEFER_HVAL ++ kernelSource("plugins/glm5_next/kernels/hc_pre_defer_defines.metal") ++ HC_PRE_BODY;
+const HC_MATERIALIZE_SOURCE = HC_DEFER_HVAL ++ kernelSource("plugins/glm5_next/kernels/hc_materialize.metal");
 var hc_pre_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var hc_pre_defer_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var hc_materialize_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -641,22 +374,7 @@ pub fn hcPre(s: mlx.mlx_stream, x: ?mlx.mlx_array, deferred: ?*const Deferred, f
 }
 
 /// `post * x + comb^T @ stream` in f32, one thread per 4 columns of a row (all HC streams).
-const EXPAND_SOURCE =
-    \\const uint d4 = thread_position_in_grid.x;
-    \\const uint row = thread_position_in_grid.y;
-    \\if (d4 >= uint(D / 4)) return;
-    \\const auto pr = post + row * HC;
-    \\const auto cb = comb + row * HC * HC;
-    \\const float4 xv = float4(*(const device vec<T, 4>*)(x + (size_t)row * D + 4 * d4));
-    \\float4 sv[HC];
-    \\for (int j = 0; j < HC; ++j)
-    \\    sv[j] = float4(*(const device vec<T, 4>*)(res + ((size_t)row * HC + j) * D + 4 * d4));
-    \\for (int i = 0; i < HC; ++i) {
-    \\    float4 acc = 0.0f;
-    \\    for (int j = 0; j < HC; ++j) acc = fma(float4(cb[j * HC + i]), sv[j], acc);
-    \\    *(device vec<T, 4>*)(out + ((size_t)row * HC + i) * D + 4 * d4) = vec<T, 4>(fma(float4(pr[i]), xv, acc));
-    \\}
-;
+const EXPAND_SOURCE = kernelSource("plugins/glm5_next/kernels/expand.metal");
 var expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 /// `post * x + comb^T @ stream`, in f32, back to the stream's dtype: the new stream.
@@ -745,38 +463,7 @@ fn indexerScoresNax(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, p
 /// pool (position % kpool == kpool - 1) carries the pool's key in its gate half, the gates'
 /// softmax-weighted keys (only pooled keys are read once a pool is whole). One thread per
 /// (row, channel); `prev` holds the up-to kpool - 1 cached rows before the forward.
-const POOLED_ROWS_SOURCE =
-    \\const uint d = thread_position_in_grid.x;
-    \\const int r = int(thread_position_in_grid.y);
-    \\const int b = int(thread_position_in_grid.z);
-    \\const int S = int(threads_per_grid.y);
-    \\const int pos0 = dims[0];
-    \\const int prev_len = dims[1];
-    \\const device T* crow = chunk + (size_t(b) * S + r) * (2 * DH);
-    \\device T* orow = out + (size_t(b) * S + r) * (2 * DH);
-    \\orow[d] = crow[d];
-    \\const int pos = pos0 + r;
-    \\if ((pos + 1) % KPOOL != 0) {
-    \\    orow[DH + d] = crow[DH + d];
-    \\    return;
-    \\}
-    \\float lg[KPOOL];
-    \\T kv[KPOOL];
-    \\float mx = -INFINITY;
-    \\for (int j = 0; j < KPOOL; ++j) {
-    \\    const int q = pos - KPOOL + 1 + j;
-    \\    const device T* row = q >= pos0 ? chunk + (size_t(b) * S + (q - pos0)) * (2 * DH)
-    \\                                    : prev + (size_t(b) * prev_len + (q - pos0 + prev_len)) * (2 * DH);
-    \\    kv[j] = row[d];
-    \\    lg[j] = float(row[DH + d]) + ape[j * DH + d];
-    \\    mx = metal::max(mx, lg[j]);
-    \\}
-    \\float sum = 0.0f;
-    \\for (int j = 0; j < KPOOL; ++j) { lg[j] = metal::precise::exp(lg[j] - mx); sum += lg[j]; }
-    \\float acc = 0.0f;
-    \\for (int j = 0; j < KPOOL; ++j) acc += float(T(T(lg[j] / sum) * kv[j]));
-    \\orow[DH + d] = T(acc);
-;
+const POOLED_ROWS_SOURCE = kernelSource("plugins/glm5_next/kernels/pooled_rows.metal");
 var pooled_rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 /// `chunk` [B, S, 2*Dh] (rows at positions `pos0..`) with each completed pool's key in its
@@ -854,30 +541,7 @@ fn storedPoolKeys(s: mlx.mlx_stream, idx_cache: mlx.mlx_array, p: c_int, ix: Ind
 /// oMLX `decode_kernels.py` `_DSA_EXPAND_SOURCE` (Apache-2.0, see NOTICE): the selected pools
 /// [S, SEL_K] of queries at `qpos..` to their token indices, the query's partial tail pool
 /// after them, -1 for an unusable slot or the padding up to the output width.
-const EXPAND_SEL_SOURCE =
-    \\const int col = int(thread_position_in_grid.x);
-    \\const int row = int(thread_position_in_grid.y);
-    \\if (col >= OUT_W) {
-    \\  return;
-    \\}
-    \\const int qp = int(qpos[0]) + row;
-    \\const int pool_len = int(qpos[1]);
-    \\int v = -1;
-    \\if (col < SEL_K * KPOOL) {
-    \\  const int s = int(selected[row * SEL_K + col / KPOOL]);
-    \\  const bool valid = s < pool_len && (s + 1) * KPOOL - 1 <= qp;
-    \\  if (valid) {
-    \\    v = s * KPOOL + (col % KPOOL);
-    \\  }
-    \\} else if (col >= TOPK_W && col < TOPK_W + TAIL_W) {
-    \\  const int t = col - TOPK_W;
-    \\  const int tail_count = (qp + 1) % KPOOL;
-    \\  if (t < tail_count) {
-    \\    v = qp + 1 - tail_count + t;
-    \\  }
-    \\}
-    \\out[row * OUT_W + col] = v;
-;
+const EXPAND_SEL_SOURCE = kernelSource("plugins/glm5_next/kernels/expand_sel.metal");
 var expand_sel_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 /// int32 [B, S, topk + kpool - 1] token indices from the selected pools `sel` [B, S, select_k].
@@ -1030,122 +694,14 @@ pub fn selectTokens(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, i
 /// pool's score, -FLT_MAX for a pool the query cannot see.
 const DEC_SCORE_SGS: c_int = 8;
 const DEC_SCORE_PPS: c_int = 4;
-const DEC_SCORE_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const uint sg = simdgroup_index_in_threadgroup;
-    \\const uint tid = sg * 32 + lane;
-    \\const int q_pos = dims[0];
-    \\const int P = dims[1];
-    \\threadgroup float qT[DH * 32];
-    \\threadgroup float kp[SGS][DH];
-    \\for (uint i = tid; i < uint(32 * DH); i += SGS * 32) qT[(i % DH) * 32 + i / DH] = float(q[i]);
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\for (int pp = 0; pp < PPS; ++pp) {
-    \\const int p = (int(threadgroup_position_in_grid.y) * SGS + int(sg)) * PPS + pp;
-    \\if (p >= P) return;
-    \\// The pool's key: its completing row's gate half; lane l loads channels 4l..4l+3 (DH == 128).
-    \\const device vec<T, 4>* pooled = (const device vec<T, 4>*)(cache + (size_t(p) * KPOOL + KPOOL - 1) * (2 * DH) + DH);
-    \\((threadgroup float4*)kp[sg])[lane] = float4(pooled[lane]);
-    \\simdgroup_barrier(mem_flags::mem_threadgroup);
-    \\float dot = 0.0f;
-    \\for (int d = 0; d < DH; ++d) dot = fma(qT[d * 32 + lane], kp[sg][d], dot);
-    \\const float sc = simd_sum(w[lane] * metal::max(dot, 0.0f));
-    \\if (lane == 0) out[p] = (p * KPOOL + KPOOL - 1 <= q_pos) ? sc : -FLT_MAX;
-    \\simdgroup_barrier(mem_flags::mem_threadgroup);
-    \\}
-;
+const DEC_SCORE_SOURCE = kernelSource("plugins/glm5_next/kernels/dec_score.metal");
 var dec_score_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 /// The top SEL_K of one query's pool scores as token indices in `expandSelection`'s layout,
 /// in one threadgroup: a 4-pass 8-bit radix select finds the SEL_K-th largest score, then an
 /// ordered compaction (ties to the lower index) writes the pools chronologically.
-const TOPK_EXPAND_SOURCE =
-    \\const uint tid = thread_position_in_threadgroup.x;
-    \\const uint lane = tid % 32;
-    \\const uint sg = tid / 32;
-    \\const int q_pos = dims[0];
-    \\const int P = dims[1];
-    \\threadgroup atomic_uint hist[256];
-    \\threadgroup uint st[3];
-    \\threadgroup uint part_g[32];
-    \\threadgroup uint part_e[32];
-    \\if (tid == 0) { st[0] = 0u; st[1] = 0u; st[2] = uint(SEL_K); }
-    \\for (int pass = 0; pass < 4; ++pass) {
-    \\    const uint shift = uint(24 - 8 * pass);
-    \\    if (tid < 256u) atomic_store_explicit(&hist[tid], 0u, memory_order_relaxed);
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    const uint prefix = st[0];
-    \\    const uint pmask = st[1];
-    \\    for (int i = int(tid); i < P; i += 1024) {
-    \\        const uint k = msv_score_key(scores[i]);
-    \\        if ((k & pmask) == prefix) atomic_fetch_add_explicit(&hist[(k >> shift) & 255u], 1u, memory_order_relaxed);
-    \\    }
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    if (tid == 0) {
-    \\        const uint need = st[2];
-    \\        uint cum = 0u;
-    \\        int bin = 255;
-    \\        for (; bin > 0; --bin) {
-    \\            const uint c = atomic_load_explicit(&hist[bin], memory_order_relaxed);
-    \\            if (cum + c >= need) break;
-    \\            cum += c;
-    \\        }
-    \\        st[2] = need - cum;
-    \\        st[0] = prefix | (uint(bin) << shift);
-    \\        st[1] = pmask | (255u << shift);
-    \\    }
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\}
-    \\const uint thr = st[0];
-    \\const uint need = st[2];
-    \\const int seg = (P + 1023) / 1024;
-    \\const int s0 = int(tid) * seg;
-    \\const int s1 = metal::min(s0 + seg, P);
-    \\uint g = 0u, e = 0u;
-    \\for (int i = s0; i < s1; ++i) {
-    \\    const uint k = msv_score_key(scores[i]);
-    \\    g += k > thr ? 1u : 0u;
-    \\    e += k == thr ? 1u : 0u;
-    \\}
-    \\const uint pg = simd_prefix_exclusive_sum(g);
-    \\const uint pe = simd_prefix_exclusive_sum(e);
-    \\if (lane == 31) { part_g[sg] = pg + g; part_e[sg] = pe + e; }
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (sg == 0) {
-    \\    const uint a = part_g[lane];
-    \\    const uint c = part_e[lane];
-    \\    part_g[lane] = simd_prefix_exclusive_sum(a);
-    \\    part_e[lane] = simd_prefix_exclusive_sum(c);
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\uint er = part_e[sg] + pe;
-    \\uint pos = part_g[sg] + pg + metal::min(er, need);
-    \\for (int i = s0; i < s1; ++i) {
-    \\    const uint k = msv_score_key(scores[i]);
-    \\    bool take = k > thr;
-    \\    if (k == thr) { take = er < need; ++er; }
-    \\    if (take) {
-    \\        const bool valid = (i + 1) * KPOOL - 1 <= q_pos;
-    \\        for (int c = 0; c < KPOOL; ++c) out[int(pos) * KPOOL + c] = valid ? i * KPOOL + c : -1;
-    \\        ++pos;
-    \\    }
-    \\}
-    \\for (int col = SEL_K * KPOOL + int(tid); col < OUT_W; col += 1024) {
-    \\    int v = -1;
-    \\    if (col >= TOPK_W && col < TOPK_W + TAIL_W) {
-    \\        const int t = col - TOPK_W;
-    \\        const int tail_count = (q_pos + 1) % KPOOL;
-    \\        if (t < tail_count) v = q_pos + 1 - tail_count + t;
-    \\    }
-    \\    out[col] = v;
-    \\}
-;
-const TOPK_EXPAND_HEADER =
-    \\inline uint msv_score_key(float x) {
-    \\    const uint u = as_type<uint>(x);
-    \\    return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-    \\}
-;
+const TOPK_EXPAND_SOURCE = kernelSource("plugins/glm5_next/kernels/topk_expand.metal");
+const TOPK_EXPAND_HEADER = kernelSource("plugins/glm5_next/kernels/topk_expand_header.metal");
 var topk_expand_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 fn decodeKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []const [*:0]const u8, src: [:0]const u8, header: [:0]const u8) !mlx.mlx_fast_metal_kernel {
@@ -1571,24 +1127,7 @@ fn qmvFastOk(bank: QBank, n: c_int, k: c_int) bool {
 /// oMLX `decode_kernels.py` `_MH_QMV_SOURCE` (Apache-2.0, see NOTICE): the MLA per-head
 /// projections for one token, `x[h] @ w[h]^T`, as qmv_fast rows (4 per simdgroup, NSG
 /// simdgroups per threadgroup); MLX's batched qmv runs one 64-thread threadgroup per 8 rows.
-const HEAD_QMV_SOURCE =
-    \\  const uint lane = thread_index_in_simdgroup;
-    \\  const int sg = int(simdgroup_index_in_threadgroup);
-    \\  const int h = int(threadgroup_position_in_grid.z);
-    \\  const int r0 = (int(threadgroup_position_in_grid.y) * NSG + sg) * 4;
-    \\  constexpr int WB = K * glm_bytes_per_pack<BITS>() / glm_pack_factor<BITS>();
-    \\  constexpr int G = K / GS;
-    \\  const device uint8_t* wh = (const device uint8_t*)w + (size_t(h) * N + r0) * WB;
-    \\  const device T* sh = scales + (size_t(h) * N + r0) * G;
-    \\  const device T* bh = biases + (size_t(h) * N + r0) * G;
-    \\  const device T* xh = x + size_t(h) * K;
-    \\  float result[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    \\  glm_qmv_rows<T, K, GS, BITS, 4>(wh, sh, bh, xh, lane, result);
-    \\  for (int r = 0; r < 4; r++) {
-    \\    const float v = simd_sum(result[r]);
-    \\    if (lane == 0) out[size_t(h) * N + r0 + r] = static_cast<T>(v * scale[0]);
-    \\  }
-;
+const HEAD_QMV_SOURCE = kernelSource("plugins/glm5_next/kernels/head_qmv.metal");
 var head_qmv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
 /// One token's per-head projection: x [1, H, 1, K] by w [H, N, K] (affine, transposed) ->
@@ -1619,7 +1158,7 @@ pub fn headQmv(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, scales: ml
         defer _ = mlx.mlx_vector_string_free(iv);
         const ov = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(ov);
-        const kn = mlx.mlx_fast_metal_kernel_new("msv_glm5_head_qmv", iv, ov, HEAD_QMV_SOURCE, @embedFile("kernels/qmv_header.metal"), true, false);
+        const kn = mlx.mlx_fast_metal_kernel_new("msv_glm5_head_qmv", iv, ov, HEAD_QMV_SOURCE, kernelSource("plugins/glm5_next/kernels/qmv_header.metal"), true, false);
         if (kn.ctx == null) return error.MetalKernelCompileFailed;
         head_qmv_kernel = kn;
         break :blk kn;
@@ -1644,7 +1183,7 @@ fn moeKernel(slot: *?mlx.mlx_fast_metal_kernel, name: [*:0]const u8, ins: []cons
     defer _ = mlx.mlx_vector_string_free(iv);
     const ov = mlx.mlx_vector_string_new_data(outs.ptr, outs.len);
     defer _ = mlx.mlx_vector_string_free(ov);
-    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, source, @embedFile("kernels/qmv_header.metal"), true, false);
+    const k = mlx.mlx_fast_metal_kernel_new(name, iv, ov, source, kernelSource("plugins/glm5_next/kernels/qmv_header.metal"), true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     slot.* = k;
     return k;
@@ -1718,7 +1257,7 @@ pub fn moeDecode(s: mlx.mlx_stream, x: mlx.mlx_array, inds: mlx.mlx_array, score
         try mlx.check(mlx.mlx_argsort_axis(&sorted, inds, 0, s));
         try mlx.check(mlx.mlx_astype(&order, sorted, .uint32, s));
     } else _ = mlx.mlx_array_set(&order, inds);
-    const gu = try moeKernel(&moe_gate_up_kernel, "msv_glm5_moe_gate_up", &.{ "x", "indices", "order", "limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b", "sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b" }, &.{"out"}, @embedFile("kernels/moe_gate_up.metal"));
+    const gu = try moeKernel(&moe_gate_up_kernel, "msv_glm5_moe_gate_up", &.{ "x", "indices", "order", "limit", "gate_w", "gate_s", "gate_b", "up_w", "up_s", "up_b", "sh_gate_w", "sh_gate_s", "sh_gate_b", "sh_up_w", "sh_up_s", "sh_up_b" }, &.{"out"}, kernelSource("plugins/glm5_next/kernels/moe_gate_up.metal"));
     var act = [1]mlx.mlx_array{undefined};
     try moeLaunch(s, gu, &.{ x, inds, order, lim, gate.w, gate.s, gate.b, up.w, up.s, up.b, sh_gate.w, sh_gate.s, sh_gate.b, sh_up.w, sh_up.s, sh_up.b }, &.{.{ .shape = &.{ rows, topk + 1, inter }, .dt = dt }}, &act, @divExact(inter, MOE_RPS * MOE_NSG), rows * (topk + 1), many, &.{
         .{ "K", hidden },                 .{ "N", inter },     .{ "TOPK", topk },     .{ "NTOK", rows },                 .{ "RBITS", @intCast(gate.bits) }, .{ "RGS", @intCast(gate.gs) },
@@ -1726,7 +1265,7 @@ pub fn moeDecode(s: mlx.mlx_stream, x: mlx.mlx_array, inds: mlx.mlx_array, score
         .{ "SGS", @intCast(sh_gate.gs) },
     });
     defer _ = mlx.mlx_array_free(act[0]);
-    const dn = try moeKernel(&moe_down_kernel, "msv_glm5_moe_down", &.{ "act", "indices", "scores", "down_w", "down_s", "down_b", "sh_down_w", "sh_down_s", "sh_down_b" }, &.{"out"}, @embedFile("kernels/moe_down.metal"));
+    const dn = try moeKernel(&moe_down_kernel, "msv_glm5_moe_down", &.{ "act", "indices", "scores", "down_w", "down_s", "down_b", "sh_down_w", "sh_down_s", "sh_down_b" }, &.{"out"}, kernelSource("plugins/glm5_next/kernels/moe_down.metal"));
     var out = [1]mlx.mlx_array{undefined};
     try moeLaunch(s, dn, &.{ act[0], inds, scores, down.w, down.s, down.b, sh_down.w, sh_down.s, sh_down.b }, &.{.{ .shape = &.{ rows, hidden }, .dt = dt }}, &out, @divExact(hidden, MOE_RPS * MOE_NSG), rows, many, &.{
         .{ "K", inter },     .{ "N", hidden },    .{ "TOPK", topk },                    .{ "RBITS", @intCast(down.bits) }, .{ "RGS", @intCast(down.gs) },

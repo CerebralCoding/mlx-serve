@@ -6,6 +6,7 @@
 //! (bit-identical to one dispatch), so a pass's K/V stays in the on-chip caches;
 //! those passes also split the head dims over simdgroup pairs.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const Scope = @import("../../../mlx/scope.zig").Scope;
 
@@ -16,20 +17,7 @@ const PASS_KEYS: c_int = 8192;
 const PASS_MIN_GROUPS: c_int = 512;
 const MAX_PASSES = 64;
 
-const SOURCE =
-    \\  threadgroup float xchg[WN == 2 ? WM * 2 * 16 * 32 : 1];
-    \\  omlx_nax::attention_nax_bdv<
-    \\      T, 16 * WM, 32, DK, 128, WM, WN,
-    \\      ALIGN_Q, ALIGN_K, true, WINDOW, HAS_SINKS,
-    \\      FIRST, LAST, float>(
-    \\      q, k, v, out,
-    \\      reinterpret_cast<const device omlx_nax::AttnParams*>(params),
-    \\      q_strides, k_strides, v_strides,
-    \\      sinks, state, state_out, xchg,
-    \\      simdgroup_index_in_threadgroup,
-    \\      thread_index_in_simdgroup,
-    \\      threadgroup_position_in_grid);
-;
+const SOURCE = kernelSource("kernels/attention/nax_attention_entry.metal");
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
@@ -42,7 +30,7 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const header = @embedFile("../../../kernels/attention/nax_tiles.metal") ++ @embedFile("../../../kernels/attention/nax_attention.metal");
+    const header = kernelSource("kernels/attention/nax_tiles.metal") ++ kernelSource("kernels/attention/nax_attention.metal");
     // Q/K/V are read through their strides (cache views, transposed projections).
     const k = mlx.mlx_fast_metal_kernel_new("msv_nax_attn_dk_128", in_vec, out_vec, SOURCE, header, false, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
@@ -174,21 +162,7 @@ fn dispatch(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_ar
 /// 32-key block after removing each KV head's mean key (a constant offset on
 /// every key moves each score row by a constant, which softmax ignores).
 /// P and V stay in the activation dtype. Opt-in and lossy (`MLX_SERVE_INT8_QK`).
-const SOURCE_256Q8 =
-    \\  threadgroup float xchg[WM * 2 * 16 * 32];
-    \\  omlx_nax::attention_nax_bdv_qt<
-    \\      T, 16 * WM, 32, 256, 256, WM, 2,
-    \\      ALIGN_Q, ALIGN_K, true, 0, false,
-    \\      true, true, float, int8_t>(
-    \\      q, k, v, out,
-    \\      reinterpret_cast<const device omlx_nax::AttnParams*>(params),
-    \\      q_strides, k_strides, v_strides,
-    \\      sinks, state, state_out, xchg,
-    \\      simdgroup_index_in_threadgroup,
-    \\      thread_index_in_simdgroup,
-    \\      threadgroup_position_in_grid,
-    \\      qi, ki, qs, ks);
-;
+const SOURCE_256Q8 = kernelSource("kernels/attention/nax_attention_256q8_entry.metal");
 const Q8_WM: c_int = 4;
 const Q8_BQ: c_int = 16 * Q8_WM;
 
@@ -221,7 +195,7 @@ fn getKernel256Q8() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const header = @embedFile("../../../kernels/attention/nax_tiles.metal") ++ @embedFile("../../../kernels/attention/nax_attention.metal");
+    const header = kernelSource("kernels/attention/nax_tiles.metal") ++ kernelSource("kernels/attention/nax_attention.metal");
     const k = mlx.mlx_fast_metal_kernel_new("msv_nax_attn_256_q8", in_vec, out_vec, SOURCE_256Q8, header, false, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     kernel_256q8 = k;

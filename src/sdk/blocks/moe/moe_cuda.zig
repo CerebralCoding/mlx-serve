@@ -4,6 +4,7 @@
 //! which serves these gathers on the composed chain), and the activation and weighted sum use MLX's
 //! own functors in the chain's order, so a decode row reproduces the chain's rounding sites.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
@@ -12,78 +13,14 @@ pub const Format = enum(c_int) { mxfp8 = 1, mxfp4 = 2, nvfp4 = 3 };
 /// The banks of one projection: packed codes [E, N, K*bits/32] and uint8 scales [E, N, K/group].
 pub const Bank = struct { w: mlx.mlx_array, s: mlx.mlx_array };
 
-const HEADER =
-    \\#include "mlx/backend/cuda/device/binary_ops.cuh"
-    \\#include "mlx/backend/cuda/device/unary_ops.cuh"
-    \\// row_dot's arithmetic, which the decode rows must match bit for bit.
-    \\#include "mlx/backend/cuda/device/row_dot_ops.cuh"
-    \\
-;
+const HEADER = kernelSource("kernels/moe/moe_cuda_header.cu");
 
 // Grid (I/8 blocks, B*TOPK): one warp per intermediate row, gate and up rows of one expert.
-const GU_SOURCE =
-    \\using namespace mlx::core::cu;
-    \\constexpr int BITS = FMT == 1 ? 8 : 4;
-    \\constexpr int GROUP = FMT == 3 ? 16 : 32;
-    \\constexpr int CH = D * BITS / 128;
-    \\const int lane = threadIdx.x & 31;
-    \\const int n = blockIdx.x * 8 + (threadIdx.x >> 5);
-    \\const int bk = blockIdx.y;
-    \\const int b = bk / TOPK;
-    \\const uint32_t e = inds[bk];
-    \\const T* xr = x + (long)b * D;
-    \\const long row = (long)e * I + n;
-    \\const uint4* gp = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(gw) + row * (D * BITS / 8));
-    \\const uint4* upw = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(uw) + row * (D * BITS / 8));
-    \\float ag = 0.f, au = 0.f;
-    \\row_dot_lane<FMT, 1>(gp, gs + row * (D / GROUP), xr, 0, 1, CH, lane, 32, &ag);
-    \\row_dot_lane<FMT, 1>(upw, us + row * (D / GROUP), xr, 0, 1, CH, lane, 32, &au);
-    \\for (int off = 16; off > 0; off /= 2) {
-    \\  ag += __shfl_xor_sync(0xffffffff, ag, off);
-    \\  au += __shfl_xor_sync(0xffffffff, au, off);
-    \\}
-    \\if (lane == 0) {
-    \\  T g = static_cast<T>(ag);
-    \\  const T u = static_cast<T>(au);
-    \\  if (GSCALE) g = Multiply{}(g, gscale[e]);
-    \\  const T sl = Multiply{}(g, Sigmoid{}(g));
-    \\  act[(long)bk * I + n] = Multiply{}(sl, u);
-    \\}
-;
+const GU_SOURCE = kernelSource("kernels/moe/moe_cuda_gu.cu");
 
 // Grid (D/DPB blocks, B): 8-lane groups own one (output, expert) down dot; the weighted sum over
 // experts is the chain's: Multiply by the routing weight, then a sequential Sum in T.
-const DR_SOURCE =
-    \\using namespace mlx::core::cu;
-    \\constexpr int BITS = FMT == 1 ? 8 : 4;
-    \\constexpr int GROUP = FMT == 3 ? 16 : 32;
-    \\constexpr int CH = I * BITS / 128;
-    \\constexpr int DPB = 32 / TOPK;
-    \\const int grp = threadIdx.x >> 3;
-    \\const int l = threadIdx.x & 7;
-    \\const int b = blockIdx.y;
-    \\const int dl = grp / TOPK;
-    \\const int k = grp % TOPK;
-    \\const int d = blockIdx.x * DPB + dl;
-    \\float acc = 0.f;
-    \\if (dl < DPB && d < D) {
-    \\  const uint32_t e = inds[b * TOPK + k];
-    \\  const long row = (long)e * D + d;
-    \\  const uint4* wp = reinterpret_cast<const uint4*>(reinterpret_cast<const uint8_t*>(dw) + row * (I * BITS / 8));
-    \\  row_dot_lane<FMT, 1>(wp, ds + row * (I / GROUP), act + (long)(b * TOPK + k) * I, 0, 1, CH, l, 8, &acc);
-    \\}
-    \\for (int off = 4; off > 0; off /= 2) acc += __shfl_xor_sync(0xffffffff, acc, off);
-    \\__shared__ T part[32];
-    \\if (l == 0) part[grp] = static_cast<T>(acc);
-    \\__syncthreads();
-    \\const int dd = blockIdx.x * DPB + (int)threadIdx.x;
-    \\if ((int)threadIdx.x < DPB && dd < D) {
-    \\  T sum = static_cast<T>(0.0f);
-    \\  // MLX's reduce Sum: a correctly rounded add in T per expert, k in order.
-    \\  for (int j = 0; j < TOPK; ++j) sum = static_cast<T>(static_cast<float>(sum) + static_cast<float>(Multiply{}(part[threadIdx.x * TOPK + j], scores[b * TOPK + j])));
-    \\  y[(long)b * D + dd] = sum;
-    \\}
-;
+const DR_SOURCE = kernelSource("kernels/moe/moe_cuda_dr.cu");
 
 var gu_kernel: ?mlx.mlx_fast_cuda_kernel = null;
 var dr_kernel: ?mlx.mlx_fast_cuda_kernel = null;

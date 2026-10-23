@@ -9,6 +9,7 @@
 //! One scale per row keeps the integer accumulation free of per-group
 //! epilogues, which is what cost a per-group arm all of its speed.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
@@ -471,122 +472,25 @@ fn splitmix64(i: usize) u64 {
 
 // ── kernels ──
 
-const HEADER =
-    \\#include <metal_tensor>
-    \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-    \\using namespace mpp::tensor_ops;
-    \\
-;
+const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
 
 /// One threadgroup (8 simdgroups) per row; lane l of a simdgroup holds elements
 /// l*8 .. l*8+7 of each 256-block, so the 256-point transform is three
 /// in-register butterfly stages and five shuffle stages. The row's amax reduces
 /// across the threadgroup before anything is written.
-const RQ_SOURCE =
-    \\const int K = x_shape[1];
-    \\const uint row = threadgroup_position_in_grid.y;
-    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int nch = K / 256;
-    \\threadgroup float red[8];
-    \\float v[CH][8];
-    \\float amax = 0.0f;
-    \\const device T* xr = x + (size_t)row * K;
-    \\for (int c = 0; c < CH; c++) {
-    \\  const int ch = int(sg) + 8 * c;
-    \\  if (ch >= nch) break;
-    \\  const int base = ch * 256 + int(lane) * 8;
-    \\  for (int p = 0; p < 8; p++) v[c][p] = float(xr[base + p]) * float(signs[base + p]);
-    \\  for (int h = 1; h < 8; h <<= 1)
-    \\    for (int p = 0; p < 8; p++) if ((p & h) == 0) { float a = v[c][p], b = v[c][p + h]; v[c][p] = a + b; v[c][p + h] = a - b; }
-    \\  for (uint m = 1; m < 32; m <<= 1) {
-    \\    const float sgn = (lane & m) ? -1.0f : 1.0f;
-    \\    for (int p = 0; p < 8; p++) v[c][p] = fma(sgn, v[c][p], simd_shuffle_xor(v[c][p], m));
-    \\  }
-    \\  for (int p = 0; p < 8; p++) { v[c][p] *= 0.0625f; amax = max(amax, abs(v[c][p])); }
-    \\}
-    \\amax = simd_max(amax);
-    \\if (lane == 0) red[sg] = amax;
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\amax = red[0];
-    \\for (int i = 1; i < 8; i++) amax = max(amax, red[i]);
-    \\const float sc = max(amax / 127.0f, 1.0e-20f);
-    \\const float inv = 1.0f / sc;
-    \\device int8_t* qr = xq + (size_t)row * K;
-    \\for (int c = 0; c < CH; c++) {
-    \\  const int ch = int(sg) + 8 * c;
-    \\  if (ch >= nch) break;
-    \\  const int base = ch * 256 + int(lane) * 8;
-    \\  char4 lo, hi;
-    \\  for (int p = 0; p < 4; p++) {
-    \\    lo[p] = char(clamp(rint(v[c][p] * inv), -127.0f, 127.0f));
-    \\    hi[p] = char(clamp(rint(v[c][p + 4] * inv), -127.0f, 127.0f));
-    \\  }
-    \\  *(device char4*)(qr + base) = lo;
-    \\  *(device char4*)(qr + base + 4) = hi;
-    \\}
-    \\if (sg == 0 && lane == 0) xs[row] = sc;
-;
+const RQ_SOURCE = kernelSource("kernels/dit/w8a8_rq.metal");
 
 /// A BM x BN output tile per threadgroup (four simdgroups share one tensor op),
 /// K stepped by 64, tiles row-major. The epilogue follows (`EPI_*`).
-const GEMM_BODY =
-    \\const int K = xq_shape[1];
-    \\const int M = xq_shape[0];
-    \\const int N = wq_shape[0];
-    \\const int m0 = int(threadgroup_position_in_grid.y) * BM;
-    \\const int n0 = int(threadgroup_position_in_grid.x) * BN;
-    \\constexpr auto desc = matmul2d_descriptor(BM, BN, 64, false, true, false, matmul2d_descriptor::mode::multiply_accumulate);
-    \\matmul2d<desc, execution_simdgroups<4>> op;
-    \\tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, M));
-    \\tensor<device int8_t, dextents<int, 2>, tensor_inline> B((device int8_t*)wq, dextents<int, 2>(K, N));
-    \\auto a0 = A.template slice<64, BM>(0, m0);
-    \\auto b0 = B.template slice<64, BN>(0, n0);
-    \\auto cT = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), int32_t>();
-    \\for (uint16_t i = 0; i < cT.get_capacity(); ++i) cT[i] = 0;
-    \\for (int k0 = 0; k0 < K; k0 += 64) {
-    \\  auto a = A.template slice<64, BM>(k0, m0);
-    \\  auto b = B.template slice<64, BN>(k0, n0);
-    \\  op.run(a, b, cT);
-    \\}
-    \\
-;
+const GEMM_BODY = kernelSource("kernels/dit/w8a8_gemm_body.metal");
 
 /// Full tiles store through the destination tensor; an edge tile stores
 /// element by element, since the tensor store does not clip.
-const EPI_PLAIN =
-    \\auto dT = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), T>();
-    \\for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
-    \\  auto ids = cT.get_multidimensional_index(i);
-    \\  const int n = min(n0 + ids[0], N - 1), m = min(m0 + ids[1], M - 1);
-    \\  dT[i] = T(float(cT[i]) * xs[m] * ws[n]);
-    \\}
-    \\if (m0 + BM <= M && n0 + BN <= N) {
-    \\  tensor<device T, dextents<int, 2>, tensor_inline> D((device T*)y, dextents<int, 2>(N, M));
-    \\  auto dS = D.template slice<BN, BM>(n0, m0);
-    \\  dT.store(dS);
-    \\} else {
-    \\  for (uint16_t i = 0; i < cT.get_capacity(); ++i) {
-    \\    auto ids = cT.get_multidimensional_index(i);
-    \\    const int n = n0 + ids[0], m = m0 + ids[1];
-    \\    if (m < M && n < N) y[(size_t)m * N + n] = dT[i];
-    \\  }
-    \\}
-;
+const EPI_PLAIN = kernelSource("kernels/dit/w8a8_epi_plain.metal");
 
 /// `silu(gate) * up` on a weight whose rows interleave (gate j, up j): a thread
 /// holds runs of four consecutive columns of one row, i.e. two whole pairs.
-const EPI_SWIGLU =
-    \\const int NO = N / 2;
-    \\for (uint16_t i = 0; i < cT.get_capacity(); i += 4) {
-    \\  auto ids = cT.get_multidimensional_index(i);
-    \\  const int n = n0 + ids[0], m = m0 + ids[1];
-    \\  if (m >= M || n >= N) continue;
-    \\  const float xsm = xs[m];
-    \\  const float g0 = float(cT[i]) * xsm * ws[n], u0 = float(cT[i + 1]) * xsm * ws[n + 1];
-    \\  const float g1 = float(cT[i + 2]) * xsm * ws[n + 2], u1 = float(cT[i + 3]) * xsm * ws[n + 3];
-    \\  *(device vec<T, 2>*)(y + (size_t)m * NO + n / 2) = vec<T, 2>(T(g0 / (1.0f + exp(-g0)) * u0), T(g1 / (1.0f + exp(-g1)) * u1));
-    \\}
-;
+const EPI_SWIGLU = kernelSource("kernels/dit/w8a8_epi_swiglu.metal");
 
 var rq_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gemm_kernel: ?mlx.mlx_fast_metal_kernel = null;

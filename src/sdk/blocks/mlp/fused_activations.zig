@@ -2,6 +2,7 @@
 //! Owns SWIGLU_SOURCE, SWIGLU_CLAMP_SOURCE, swiglu_sig_tables, sigmoidTableFor, swigluSigTable, swiglu_engaged, and 27 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
@@ -51,27 +52,11 @@ const gptOssSwiGLU = @import("activations.zig").gptOssSwiGLU;
 // in the hot loop, 128 KB resident. The two multiplies need no such care: a
 // bf16/f16 product is exact in float, so one rounding is one rounding on any
 // compiler.
-const SWIGLU_SOURCE =
-    \\uint i = thread_position_in_grid.x;
-    \\if (i >= uint(N_size)) return;
-    \\T g = gate[i];
-    \\T sig = sigtab[as_type<ushort>(g)];
-    \\// mlx Multiply (binary_ops.h), twice: silu(g) = g * sigmoid(g), then * up.
-    \\T act = g * sig;
-    \\y[i] = act * up[i];
-;
+const SWIGLU_SOURCE = kernelSource("kernels/mlp/swiglu.metal");
 
 // SWIGLU_SOURCE behind the clamps of a `swiglu_limit` (GLM-5-Next): mlx Minimum on the gate,
 // Clip on the up branch (exact in the tensor dtype), then the same chain.
-const SWIGLU_CLAMP_SOURCE =
-    \\uint i = thread_position_in_grid.x;
-    \\if (i >= uint(N_size)) return;
-    \\T g = metal::min(gate[i], lim);
-    \\T u = metal::max(metal::min(up[i], lim), T(-lim));
-    \\T sig = sigtab[as_type<ushort>(g)];
-    \\T act = g * sig;
-    \\y[i] = act * u;
-;
+const SWIGLU_CLAMP_SOURCE = kernelSource("kernels/mlp/swiglu_clamp.metal");
 
 /// `mlx_sigmoid` tabulated over every 16-bit float pattern, indexed [bf16, f16].
 var swiglu_sig_tables: [2]?mlx.mlx_array = @splat(null);
@@ -116,12 +101,7 @@ pub fn swigluFusedEnabled() bool {
 
 /// `table[gate] * up`: an activation that is unary in x, tabulated over every
 /// 16-bit pattern by running MLX's own op chain once, then one multiply.
-const TABLE_MUL_SOURCE =
-    \\uint i = thread_position_in_grid.x;
-    \\if (i >= uint(N_size)) return;
-    \\T act = sigtab[as_type<ushort>(gate[i])];
-    \\y[i] = act * up[i];
-;
+const TABLE_MUL_SOURCE = kernelSource("kernels/mlp/table_mul.metal");
 
 /// `x * c -> erf -> 1 + -> x * -> * half`, five ops in the activation dtype.
 pub fn geluErfChain(x: mlx.mlx_array, one: mlx.mlx_array, half: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -295,15 +275,7 @@ pub fn tableGateMul(s: mlx.mlx_stream, kind: GateMulKind, gate: mlx.mlx_array, u
 /// second kernel.
 // SWIGLU_SOURCE over a joined gate|up projection row (gate the first F
 // columns): the two halves are read in place instead of copied out.
-const SWIGLU_JOINED_SOURCE =
-    \\const uint i = thread_position_in_grid.x;
-    \\if (i >= uint(N_size)) return;
-    \\const uint r = i / uint(F), c = i % uint(F);
-    \\T g = both[r * uint(2 * F) + c];
-    \\T sig = sigtab[as_type<ushort>(g)];
-    \\T act = g * sig;
-    \\y[i] = act * both[r * uint(2 * F) + uint(F) + c];
-;
+const SWIGLU_JOINED_SOURCE = kernelSource("kernels/mlp/swiglu_joined.metal");
 var swiglu_joined_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var swiglu_joined_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var swiglu_joined_key: GateMulCfgKey = std.mem.zeroes(GateMulCfgKey);

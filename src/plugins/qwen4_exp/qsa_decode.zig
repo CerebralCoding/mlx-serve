@@ -6,172 +6,18 @@
 //! key `lane >> 2` on lanes `4k..4k+3` (9 shuffles, not 8 x 5). More heads per simdgroup lose to
 //! register pressure.
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 
 const CH: c_int = 32; // visible keys per simdgroup, a multiple of 8 and of RATIO
 const BD: c_int = 256;
 
-const HEADER =
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\inline float msv_bf_lo(uint w) { return as_type<float>(w << 16); }
-    \\inline float msv_bf_hi(uint w) { return as_type<float>(w & 0xffff0000u); }
-    \\inline void msv_unpack8(uint4 r, thread float* f) {
-    \\  f[0] = msv_bf_lo(r.x); f[1] = msv_bf_hi(r.x); f[2] = msv_bf_lo(r.y); f[3] = msv_bf_hi(r.y);
-    \\  f[4] = msv_bf_lo(r.z); f[5] = msv_bf_hi(r.z); f[6] = msv_bf_lo(r.w); f[7] = msv_bf_hi(r.w);
-    \\}
-    \\// v[i] is this lane's partial dot for key i. Each stage keeps half of the keys on the lane
-    \\// and trades the other half with the partner; the key left on lane l is l >> 2.
-    \\inline float msv_reduce8(thread float* v, ushort lane) {
-    \\  const bool b4 = (lane & 16) != 0, b3 = (lane & 8) != 0, b2 = (lane & 4) != 0;
-    \\  float w[4];
-    \\  #pragma unroll
-    \\  for (int i = 0; i < 4; ++i) w[i] = (b4 ? v[i + 4] : v[i]) + simd_shuffle_xor(b4 ? v[i] : v[i + 4], 16);
-    \\  float x[2];
-    \\  #pragma unroll
-    \\  for (int i = 0; i < 2; ++i) x[i] = (b3 ? w[i + 2] : w[i]) + simd_shuffle_xor(b3 ? w[i] : w[i + 2], 8);
-    \\  float y = (b2 ? x[1] : x[0]) + simd_shuffle_xor(b2 ? x[0] : x[1], 4);
-    \\  y += simd_shuffle_xor(y, 1);
-    \\  return y + simd_shuffle_xor(y, 2);
-    \\}
-    \\inline int msv_dec_pos(const device int* blk, int j, int sel_len, int tail_start, int ratio) {
-    \\  const int b = j / ratio;
-    \\  return (j < sel_len) ? (blk[b] * ratio + (j - b * ratio)) : (tail_start + (j - sel_len));
-    \\}
-    \\
-;
+const HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_header.metal");
 
-const PARTS_SOURCE =
-    \\const int kL = k_shape[2];
-    \\const int split = int(threadgroup_position_in_grid.x);
-    \\const int hk = int(threadgroup_position_in_grid.y);
-    \\const ushort lane = ushort(thread_index_in_simdgroup);
-    \\const int head = hk * GQA + int(simdgroup_index_in_threadgroup);
-    \\
-    \\const int nb = kL / RATIO;
-    \\const int sel_len = metal::min(nb, KB) * RATIO;
-    \\const int tail_start = nb * RATIO;
-    \\const int L = sel_len + (kL - tail_start);
-    \\const int j_lo = split * CH;
-    \\const int j_hi = metal::min(j_lo + CH, L);
-    \\const float scale_log2e = scl[0] * 1.44269504088896340736f;
-    \\
-    \\const device T* Kp = k + (long)hk * k_strides[1];
-    \\const device T* Vp = v + (long)hk * v_strides[1];
-    \\
-    \\// The chunk's block bases, loaded up front so no key waits on a block id.
-    \\int bp[CH / RATIO];
-    \\#pragma unroll
-    \\for (int i = 0; i < CH / RATIO; ++i) {
-    \\  const int b = j_lo / RATIO + i;
-    \\  bp[i] = (b * RATIO < sel_len) ? blocks[b] * RATIO : 0;
-    \\}
-    \\float qf[8];
-    \\msv_unpack8(*((const device uint4*)(q + (long)head * q_strides[1]) + lane), qf);
-    \\#pragma unroll
-    \\for (int d = 0; d < 8; ++d) qf[d] *= scale_log2e;
-    \\float m = -3.0e38f, l = 0.0f, acc[8];
-    \\#pragma unroll
-    \\for (int d = 0; d < 8; ++d) acc[d] = 0.0f;
-    \\
-    \\#pragma unroll
-    \\for (int bi = 0; bi < CH / 8; ++bi) {
-    \\  const int jb = j_lo + bi * 8;
-    \\  if (jb < j_hi) {
-    \\    uint4 kr[8], vr[8];
-    \\    #pragma unroll
-    \\    for (int i = 0; i < 8; ++i) {
-    \\      const int jj = bi * 8 + i;
-    \\      const int j = j_lo + jj;
-    \\      const int pos = (j >= j_hi) ? 0 : ((j < sel_len) ? bp[jj / RATIO] + jj % RATIO : tail_start + (j - sel_len));
-    \\      kr[i] = *((const device uint4*)(Kp + (long)pos * k_strides[2]) + lane);
-    \\      vr[i] = *((const device uint4*)(Vp + (long)pos * v_strides[2]) + lane);
-    \\    }
-    \\    float part[8];
-    \\    #pragma unroll
-    \\    for (int i = 0; i < 8; ++i) {
-    \\      float kf[8];
-    \\      msv_unpack8(kr[i], kf);
-    \\      float a0 = qf[0] * kf[0], a1 = qf[1] * kf[1];
-    \\      a0 = fma(qf[2], kf[2], a0); a1 = fma(qf[3], kf[3], a1);
-    \\      a0 = fma(qf[4], kf[4], a0); a1 = fma(qf[5], kf[5], a1);
-    \\      a0 = fma(qf[6], kf[6], a0); a1 = fma(qf[7], kf[7], a1);
-    \\      part[i] = a0 + a1;
-    \\    }
-    \\    const float total = msv_reduce8(part, lane);
-    \\    const float y = (jb + int(lane >> 2) < j_hi) ? total : -INFINITY;
-    \\    float bm = metal::max(y, simd_shuffle_xor(y, 4));
-    \\    bm = metal::max(bm, simd_shuffle_xor(bm, 8));
-    \\    bm = metal::max(bm, simd_shuffle_xor(bm, 16));
-    \\    const float m_new = metal::max(m, bm);
-    \\    const float factor = metal::exp2(m - m_new);
-    \\    const float p = metal::exp2(y - m_new);
-    \\    float lb = p + simd_shuffle_xor(p, 4);
-    \\    lb += simd_shuffle_xor(lb, 8);
-    \\    lb += simd_shuffle_xor(lb, 16);
-    \\    l = l * factor + lb;
-    \\    m = m_new;
-    \\    #pragma unroll
-    \\    for (int d = 0; d < 8; ++d) acc[d] *= factor;
-    \\    #pragma unroll
-    \\    for (int i = 0; i < 8; ++i) {
-    \\      float vf[8];
-    \\      msv_unpack8(vr[i], vf);
-    \\      const float pi = simd_shuffle(p, ushort(4 * i));
-    \\      #pragma unroll
-    \\      for (int d = 0; d < 8; ++d) acc[d] = fma(pi, vf[d], acc[d]);
-    \\    }
-    \\  }
-    \\}
-    \\
-    \\const long row = (long)head * NS + split;
-    \\device float* pa = pacc + row * 256 + lane * 8;
-    \\*((device float4*)pa) = float4(acc[0], acc[1], acc[2], acc[3]);
-    \\*((device float4*)(pa + 4)) = float4(acc[4], acc[5], acc[6], acc[7]);
-    \\if (lane == 0) {
-    \\  pml[row * 2] = m;
-    \\  pml[row * 2 + 1] = l;
-    \\}
-;
+const PARTS_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_parts.metal");
 
 // One threadgroup a head. An empty split writes l = 0, the skip flag.
-const MERGE_SOURCE =
-    \\const int head = int(threadgroup_position_in_grid.x);
-    \\const int d = int(thread_position_in_threadgroup.x);
-    \\const ushort lane = ushort(thread_index_in_simdgroup);
-    \\threadgroup float wts[NS];
-    \\threadgroup float zsum[1];
-    \\if (simdgroup_index_in_threadgroup == 0) {
-    \\  constexpr int SLOTS = (NS + 31) / 32;
-    \\  float ms[SLOTS], ls[SLOTS];
-    \\  float M = -3.0e38f;
-    \\  #pragma unroll
-    \\  for (int s = 0; s < SLOTS; ++s) {
-    \\    const int j = lane + s * 32;
-    \\    const long r = (long)head * NS + j;
-    \\    ms[s] = (j < NS) ? pml[r * 2] : -3.0e38f;
-    \\    ls[s] = (j < NS) ? pml[r * 2 + 1] : 0.0f;
-    \\    if (ls[s] > 0.0f) M = metal::max(M, ms[s]);
-    \\  }
-    \\  M = simd_max(M);
-    \\  float Z = 0.0f;
-    \\  #pragma unroll
-    \\  for (int s = 0; s < SLOTS; ++s) {
-    \\    const int j = lane + s * 32;
-    \\    const float w = (ls[s] > 0.0f) ? metal::exp2(ms[s] - M) : 0.0f;
-    \\    if (j < NS) wts[j] = w;
-    \\    Z += w * ls[s];
-    \\  }
-    \\  Z = simd_sum(Z);
-    \\  if (lane == 0) zsum[0] = Z;
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\const device float* pa = pacc + (long)head * NS * 256 + d;
-    \\float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    \\#pragma unroll
-    \\for (int j = 0; j < NS; ++j) a[j & 3] = fma(wts[j], pa[(long)j * 256], a[j & 3]);
-    \\out[(long)head * 256 + d] = T(((a[0] + a[1]) + (a[2] + a[3])) / zsum[0]);
-;
+const MERGE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_merge.metal");
 
 var parts_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;

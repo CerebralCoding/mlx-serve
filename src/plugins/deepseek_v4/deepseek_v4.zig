@@ -24,6 +24,7 @@
 //! cache, no batched decode.
 
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const model = @import("../../engines/mlx/model.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
@@ -1987,66 +1988,7 @@ fn clippedSwigluG(gate_in: mlx.mlx_array, up_in: mlx.mlx_array, limit: f32, s: m
 /// wrote T(acc), then the f32 clip chain with the sigmoid read from an exact
 /// bf16-indexed table of mlx_sigmoid values (the swigluSigTable rule — a
 /// metal::exp transcendental is a rounding apart from the metallib).
-const MOE_GATEUP_KERNEL_SOURCE =
-    \\auto lane = thread_index_in_simdgroup;
-    \\uint n = thread_position_in_grid.y;      // output row within the expert
-    \\uint e = thread_position_in_grid.z;      // top-K slot
-    \\
-    \\int K = KS;
-    \\int N = NS;
-    \\int VPW = 32 / BITS;
-    \\int K_by_p = K / VPW;
-    \\int K_by_gs = K / GS;
-    \\uint mask = (1u << BITS) - 1u;
-    \\
-    \\uint eid = uint(inds[e]);
-    \\size_t wbase = (size_t)eid * (size_t)N * (size_t)K_by_p + (size_t)n * (size_t)K_by_p;
-    \\size_t gbase = (size_t)eid * (size_t)N * (size_t)K_by_gs + (size_t)n * (size_t)K_by_gs;
-    \\
-    \\float g0 = 0.0f, g1 = 0.0f, g2 = 0.0f, g3 = 0.0f;
-    \\float u0 = 0.0f, u1 = 0.0f, u2 = 0.0f, u3 = 0.0f;
-    \\for (int pack = int(lane); pack < K_by_p; pack += 32) {
-    \\  uint32_t packed_g = wg_q[wbase + (size_t)pack];
-    \\  uint32_t packed_u = wu_q[wbase + (size_t)pack];
-    \\  int k_base = pack * VPW;
-    \\  int gi = k_base / GS;
-    \\  float sjg = float(g_scales[gbase + (size_t)gi]);
-    \\  float bjg = float(g_biases[gbase + (size_t)gi]);
-    \\  float sju = float(u_scales[gbase + (size_t)gi]);
-    \\  float bju = float(u_biases[gbase + (size_t)gi]);
-    \\  for (int ki = 0; ki < VPW; ki += 4) {
-    \\    size_t xi = (size_t)(k_base + ki);
-    \\    uint32_t qg = packed_g >> (ki * BITS);
-    \\    uint32_t qu = packed_u >> (ki * BITS);
-    \\    float x0 = float(x[xi + 0]);
-    \\    float x1 = float(x[xi + 1]);
-    \\    float x2 = float(x[xi + 2]);
-    \\    float x3 = float(x[xi + 3]);
-    \\    g0 += x0 * (float((qg >> (0 * BITS)) & mask) * sjg + bjg);
-    \\    g1 += x1 * (float((qg >> (1 * BITS)) & mask) * sjg + bjg);
-    \\    g2 += x2 * (float((qg >> (2 * BITS)) & mask) * sjg + bjg);
-    \\    g3 += x3 * (float((qg >> (3 * BITS)) & mask) * sjg + bjg);
-    \\    u0 += x0 * (float((qu >> (0 * BITS)) & mask) * sju + bju);
-    \\    u1 += x1 * (float((qu >> (1 * BITS)) & mask) * sju + bju);
-    \\    u2 += x2 * (float((qu >> (2 * BITS)) & mask) * sju + bju);
-    \\    u3 += x3 * (float((qu >> (3 * BITS)) & mask) * sju + bju);
-    \\  }
-    \\}
-    \\float acc_g = simd_sum((g0 + g1) + (g2 + g3));
-    \\float acc_u = simd_sum((u0 + u1) + (u2 + u3));
-    \\if (lane == 0) {
-    \\  // Round exactly where the composed pair wrote T(acc), then the f32
-    \\  // clip chain: gate clips HIGH only, up clips both sides (reference).
-    \\  T gt = T(acc_g);
-    \\  T ut = T(acc_u);
-    \\  float g32 = float(gt);
-    \\  float u32 = float(ut);
-    \\  float gc = metal::min(g32, consts[0]);
-    \\  float uc = metal::clamp(u32, -consts[0], consts[0]);
-    \\  float sig = sigtab[as_type<ushort>(T(gc))];
-    \\  y[(size_t)e * (size_t)N + (size_t)n] = T((gc * sig) * uc);
-    \\}
-;
+const MOE_GATEUP_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/moe_gateup.metal");
 
 var moe_gateup_obj: ?mlx.mlx_fast_metal_kernel = null;
 var moe_gateup_build_failed: bool = false;
@@ -4950,141 +4892,14 @@ fn gpuRms(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.
 /// y[t, j] = Σ_c pre[c]·stream[t, c, j] — ascending c, product rounded per
 /// step, matching the composed multiply+sum reduction. `out` (pre|post|combT
 /// pack) is written by the j==0 threadgroup only.
-const SINKHORN_Y_KERNEL_SOURCE =
-    \\int t = thread_position_in_grid.x;
-    \\int j = thread_position_in_grid.y;
-    \\if (t >= S || j >= D) return;
-    \\const int PACK = 2 * HC + HC * HC;
-    \\const int MIX = (2 + HC) * HC;
-    \\threadgroup float tg_pre[HC];
-    \\if (thread_position_in_threadgroup.y == 0) {
-    \\  float rsq = metal::rsqrt(ssq[t] / consts[0] + consts[1]);
-    \\  const float heps = consts[2];
-    \\  float pre_v[HC];
-    \\  float post_v[HC];
-    \\  float comb[HC * HC];
-    \\  for (int c = 0; c < HC; ++c) {
-    \\    float mj = mixes[t * MIX + c] * rsq;
-    \\    pre_v[c] = 1.0f / (1.0f + metal::exp(-(mj * scale[0] + base[c]))) + heps;
-    \\    float mp = mixes[t * MIX + HC + c] * rsq;
-    \\    post_v[c] = 2.0f / (1.0f + metal::exp(-(mp * scale[1] + base[HC + c])));
-    \\  }
-    \\  for (int c = 0; c < HC * HC; ++c) {
-    \\    comb[c] = mixes[t * MIX + 2 * HC + c] * rsq * scale[2] + base[2 * HC + c];
-    \\  }
-    \\  for (int c = 0; c < HC; ++c) {
-    \\    float mx = comb[c * HC];
-    \\    for (int q = 1; q < HC; ++q) mx = metal::max(mx, comb[c * HC + q]);
-    \\    float sum = 0.0f;
-    \\    for (int q = 0; q < HC; ++q) {
-    \\      comb[c * HC + q] = metal::exp(comb[c * HC + q] - mx);
-    \\      sum += comb[c * HC + q];
-    \\    }
-    \\    for (int q = 0; q < HC; ++q) comb[c * HC + q] = comb[c * HC + q] / sum + heps;
-    \\  }
-    \\  for (int it = 0; it < ITERS; ++it) {
-    \\    if (it > 0) {
-    \\      for (int c = 0; c < HC; ++c) {
-    \\        float sum = 0.0f;
-    \\        for (int q = 0; q < HC; ++q) sum += comb[c * HC + q];
-    \\        for (int q = 0; q < HC; ++q) comb[c * HC + q] /= (sum + heps);
-    \\      }
-    \\    }
-    \\    for (int q = 0; q < HC; ++q) {
-    \\      float sum = 0.0f;
-    \\      for (int c = 0; c < HC; ++c) sum += comb[c * HC + q];
-    \\      for (int c = 0; c < HC; ++c) comb[c * HC + q] /= (sum + heps);
-    \\    }
-    \\  }
-    \\  for (int c = 0; c < HC; ++c) tg_pre[c] = pre_v[c];
-    \\  if (j == 0) {
-    \\    for (int c = 0; c < HC; ++c) {
-    \\      out[t * PACK + c] = pre_v[c];
-    \\      out[t * PACK + HC + c] = post_v[c];
-    \\    }
-    \\    for (int c = 0; c < HC; ++c) {
-    \\      for (int q = 0; q < HC; ++q) out[t * PACK + 2 * HC + q * HC + c] = comb[c * HC + q];
-    \\    }
-    \\  }
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\float acc = 0.0f;
-    \\for (int c = 0; c < HC; ++c) {
-    \\  float p = tg_pre[c] * stream_in[(t * HC + c) * D + j];
-    \\  acc = acc + p;
-    \\}
-    \\y[t * D + j] = acc;
-;
+const SINKHORN_Y_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/sinkhorn_y.metal");
 
 /// hc_post in one dispatch: ns[t,c,j] = Σ_q combT[t,c,q]·stream[t,q,j] +
 /// post[t,c]·out[t,j], reading post/combT straight from the sinkhorn pack —
 /// replaces the per-sublayer slice/reshape/matmul/multiply/add tail.
-const HCPOST_KERNEL_SOURCE =
-    \\int t = thread_position_in_grid.x;
-    \\int c = thread_position_in_grid.y;
-    \\int j = thread_position_in_grid.z;
-    \\if (t >= S || c >= HC || j >= D) return;
-    \\const int PACK = 2 * HC + HC * HC;
-    \\float acc = 0.0f;
-    \\for (int q = 0; q < HC; ++q) {
-    \\  float p = pk[t * PACK + 2 * HC + c * HC + q] * stream_in[(t * HC + q) * D + j];
-    \\  acc = acc + p;
-    \\}
-    \\acc = acc + pk[t * PACK + HC + c] * out_v[t * D + j];
-    \\ns[(t * HC + c) * D + j] = acc;
-;
+const HCPOST_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/hcpost.metal");
 
-const SINKHORN_KERNEL_SOURCE =
-    \\int t = thread_position_in_grid.x;
-    \\if (t >= S) return;
-    \\const int PACK = 2 * HC + HC * HC;
-    \\const int MIX = (2 + HC) * HC;
-    \\float rsq = metal::rsqrt(ssq[t] / consts[0] + consts[1]);
-    \\const float heps = consts[2];
-    \\float pre_v[HC];
-    \\float post_v[HC];
-    \\float comb[HC * HC];
-    \\for (int j = 0; j < HC; ++j) {
-    \\  float mj = mixes[t * MIX + j] * rsq;
-    \\  pre_v[j] = 1.0f / (1.0f + metal::exp(-(mj * scale[0] + base[j]))) + heps;
-    \\  float mp = mixes[t * MIX + HC + j] * rsq;
-    \\  post_v[j] = 2.0f / (1.0f + metal::exp(-(mp * scale[1] + base[HC + j])));
-    \\}
-    \\for (int j = 0; j < HC * HC; ++j) {
-    \\  comb[j] = mixes[t * MIX + 2 * HC + j] * rsq * scale[2] + base[2 * HC + j];
-    \\}
-    \\for (int j = 0; j < HC; ++j) {
-    \\  float mx = comb[j * HC];
-    \\  for (int q = 1; q < HC; ++q) mx = metal::max(mx, comb[j * HC + q]);
-    \\  float sum = 0.0f;
-    \\  for (int q = 0; q < HC; ++q) {
-    \\    comb[j * HC + q] = metal::exp(comb[j * HC + q] - mx);
-    \\    sum += comb[j * HC + q];
-    \\  }
-    \\  for (int q = 0; q < HC; ++q) comb[j * HC + q] = comb[j * HC + q] / sum + heps;
-    \\}
-    \\for (int it = 0; it < ITERS; ++it) {
-    \\  if (it > 0) {
-    \\    for (int j = 0; j < HC; ++j) {
-    \\      float sum = 0.0f;
-    \\      for (int q = 0; q < HC; ++q) sum += comb[j * HC + q];
-    \\      for (int q = 0; q < HC; ++q) comb[j * HC + q] /= (sum + heps);
-    \\    }
-    \\  }
-    \\  for (int q = 0; q < HC; ++q) {
-    \\    float sum = 0.0f;
-    \\    for (int j = 0; j < HC; ++j) sum += comb[j * HC + q];
-    \\    for (int j = 0; j < HC; ++j) comb[j * HC + q] /= (sum + heps);
-    \\  }
-    \\}
-    \\for (int j = 0; j < HC; ++j) {
-    \\  out[t * PACK + j] = pre_v[j];
-    \\  out[t * PACK + HC + j] = post_v[j];
-    \\}
-    \\for (int j = 0; j < HC; ++j) {
-    \\  for (int q = 0; q < HC; ++q) out[t * PACK + 2 * HC + q * HC + j] = comb[j * HC + q];
-    \\}
-;
+const SINKHORN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/sinkhorn.metal");
 
 const SinkhornK = struct { kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config };
 
@@ -6783,125 +6598,7 @@ fn winStack(ext: mlx.mlx_array, off: usize, n_win: usize, r: usize, cd: usize, s
 /// sinkhorn-kernel precedent); the QAT sim's scale/grid exponents use
 /// frexp/ldexp bit arithmetic — EXACT, matching the host f64 semantics rather
 /// than the composed chain's f32 log2/ceil approximations.
-const EMIT_WIN_KERNEL_SOURCE =
-    \\int w = thread_position_in_grid.y;
-    \\int lane = thread_position_in_threadgroup.x;
-    \\if (w >= NWIN) return; // uniform per threadgroup (grid.y == NWIN)
-    \\const int CD = (OVERLAP != 0 ? 2 : 1) * D;
-    \\const int ROWS = (OVERLAP != 0 ? 2 : 1) * R;
-    \\const int HALF = RD / 2;
-    \\const int QW = (ROTATE != 0) ? D : (D - RD);
-    \\const int NG = QW / GROUP;
-    \\const float CODE_MAX = (ROTATE != 0) ? 6.0f : 448.0f;
-    \\const float AMAX_FLOOR = (ROTATE != 0) ? metal::ldexp(6.0f, -126) : 1e-4f;
-    \\const int MANT_BITS = (ROTATE != 0) ? 1 : 3;
-    \\const int MIN_EXP = (ROTATE != 0) ? 0 : -6;
-    \\const float MIN_SUB = metal::ldexp(1.0f, MIN_EXP);
-    \\threadgroup float row[D];
-    \\threadgroup float row2[(ROTATE != 0) ? D : 1];
-    \\threadgroup float red[TG];
-    \\threadgroup float gsc[(QW / GROUP) > 0 ? (QW / GROUP) : 1];
-    \\// phase 1: per-feature masked-softmax combine over the window rows.
-    \\// 3 passes (max / exp-sum / weighted acc) re-reading the sources — the
-    \\// composed chain's softmax→multiply→sum rounding order, no register
-    \\// caching so ratio-128 windows (ROWS 128) don't spill.
-    \\for (int j = lane; j < D; j += TG) {
-    \\  float mx = -INFINITY;
-    \\  float sum = 0.0f;
-    \\  float acc = 0.0f;
-    \\  float inv = 0.0f;
-    \\  for (int pass = 0; pass < 3; ++pass) {
-    \\    if (pass == 2) inv = 1.0f / sum;
-    \\    for (int i = 0; i < ROWS; ++i) {
-    \\      int ext; int col;
-    \\      if (OVERLAP != 0) {
-    \\        if (i < R) { ext = w * R + i; col = j; }
-    \\        else { ext = R + w * R + (i - R); col = D + j; }
-    \\      } else { ext = w * R + i; col = j; }
-    \\      float kv; float sc;
-    \\      if (ext < PRE_N) {
-    \\        kv = pre_kv[ext * CD + col];
-    \\        sc = pre_sc[ext * CD + col];
-    \\      } else {
-    \\        int cr = ext - PRE_N;
-    \\        kv = cin[cr * CIN_W + COL_OFF + col];
-    \\        sc = cin[cr * CIN_W + COL_OFF + CD + col] + ape[((BASE_MOD + cr) % R) * CD + col];
-    \\      }
-    \\      if (pass == 0) mx = metal::max(mx, sc);
-    \\      else if (pass == 1) sum += metal::exp(sc - mx);
-    \\      else acc += (metal::exp(sc - mx) * inv) * kv;
-    \\    }
-    \\  }
-    \\  row[j] = acc;
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\// phase 2: RMSNorm (tree-reduced sum of squares, weight applied)
-    \\float ss = 0.0f;
-    \\for (int j = lane; j < D; j += TG) ss += row[j] * row[j];
-    \\red[lane] = ss;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\for (int off = TG / 2; off > 0; off >>= 1) {
-    \\  if (lane < off) red[lane] += red[lane + off];
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\}
-    \\float rinv = metal::rsqrt(red[0] / (float)D + consts[0]);
-    \\for (int j = lane; j < D; j += TG) row[j] = row[j] * rinv * nw[j];
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\// phase 3: interleaved-pair rope on the tail RD dims at the block start
-    \\for (int p = lane; p < HALF; p += TG) {
-    \\  float a = row[D - RD + 2 * p];
-    \\  float b = row[D - RD + 2 * p + 1];
-    \\  float cv = cosr[w * HALF + p];
-    \\  float sv = sinr[w * HALF + p];
-    \\  row[D - RD + 2 * p] = a * cv - b * sv;
-    \\  row[D - RD + 2 * p + 1] = a * sv + b * cv;
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\// phase 4 (indexer only): Hadamard rotate = row @ hada
-    \\if (ROTATE != 0) {
-    \\  for (int j = lane; j < D; j += TG) {
-    \\    float hacc = 0.0f;
-    \\    for (int kk = 0; kk < D; ++kk) hacc += row[kk] * hada[kk * D + j];
-    \\    row2[j] = hacc;
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\}
-    \\// phase 5: ue8m0 per-group scales — 2^ceil(log2(amax/code_max)), exact
-    \\for (int g = lane; g < NG; g += TG) {
-    \\  float amax = AMAX_FLOOR;
-    \\  for (int e = 0; e < GROUP; ++e) {
-    \\    float v = (ROTATE != 0) ? row2[g * GROUP + e] : row[g * GROUP + e];
-    \\    amax = metal::max(amax, metal::abs(v));
-    \\  }
-    \\  float q = amax / CODE_MAX;
-    \\  int ee = 0;
-    \\  float mm = metal::frexp(q, ee);
-    \\  int ce = (mm == 0.5f) ? (ee - 1) : ee;
-    \\  gsc[g] = metal::ldexp(1.0f, ce);
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\// phase 6: quant-dequant (rope tail stays raw on the fp8 path) + write
-    \\for (int j = lane; j < D; j += TG) {
-    \\  float v = (ROTATE != 0) ? row2[j] : row[j];
-    \\  float res = v;
-    \\  if (ROTATE != 0 || j < D - RD) {
-    \\    float scale = gsc[j / GROUP];
-    \\    float y = metal::clamp(v / scale, -CODE_MAX, CODE_MAX);
-    \\    float a = metal::abs(y);
-    \\    float af = metal::max(a, MIN_SUB);
-    \\    int ee2 = 0;
-    \\    float mm2 = metal::frexp(af, ee2);
-    \\    int e2 = ee2 - 1; // floor(log2(af)): mm2 in [0.5, 1)
-    \\    (void)mm2;
-    \\    if (e2 < MIN_EXP) e2 = MIN_EXP;
-    \\    float quantum = metal::ldexp(1.0f, e2 - MANT_BITS);
-    \\    float qv = metal::min(metal::rint(a / quantum) * quantum, CODE_MAX);
-    \\    float sq = (y < 0.0f) ? -qv : ((y > 0.0f) ? qv : 0.0f);
-    \\    res = sq * scale;
-    \\  }
-    \\  outw[w * D + j] = res;
-    \\}
-;
+const EMIT_WIN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/emit_win.metal");
 
 var emit_kernel_obj: ?mlx.mlx_fast_metal_kernel = null;
 var emit_kernel_build_failed: bool = false;
@@ -7139,39 +6836,7 @@ fn emitWindowsKernel(
 /// column dropped at the write — one threadgroup per head, tree reductions.
 /// exp/reduction-tree drift vs the composed mlx softmax is the sanctioned
 /// sinkhorn-kernel class (continuous path, decode-equivalence arbitrates).
-const SINK_SOFTMAX_KERNEL_SOURCE =
-    \\int h = thread_position_in_grid.y;
-    \\int lane = thread_position_in_threadgroup.x;
-    \\if (h >= H) return; // uniform per threadgroup (grid.y == H)
-    \\// TK is an INPUT, not a template arg: it changes every token during the
-    \\// context ramp, and a template value would JIT a fresh Metal kernel per
-    \\// tk (measured: first request 19 tok/s vs 29.7 warm).
-    \\int TK = int(tk_size[0]);
-    \\threadgroup float red[TG];
-    \\float sk = sink[h];
-    \\float mx = sk;
-    \\for (int j = lane; j < TK; j += TG) mx = metal::max(mx, scores[h * TK + j] * consts[0]);
-    \\red[lane] = mx;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\for (int off = TG / 2; off > 0; off >>= 1) {
-    \\  if (lane < off) red[lane] = metal::max(red[lane], red[lane + off]);
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\}
-    \\float m = red[0];
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\float sum = 0.0f;
-    \\for (int j = lane; j < TK; j += TG) sum += metal::exp(scores[h * TK + j] * consts[0] - m);
-    \\red[lane] = sum;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\for (int off = TG / 2; off > 0; off >>= 1) {
-    \\  if (lane < off) red[lane] += red[lane + off];
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\}
-    \\float inv = 1.0f / (red[0] + metal::exp(sk - m));
-    \\for (int j = lane; j < TK; j += TG) {
-    \\  y[h * TK + j] = metal::exp(scores[h * TK + j] * consts[0] - m) * inv;
-    \\}
-;
+const SINK_SOFTMAX_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/sink_softmax.metal");
 
 var sink_softmax_obj: ?mlx.mlx_fast_metal_kernel = null;
 var sink_softmax_build_failed: bool = false;
@@ -7266,93 +6931,7 @@ fn sinkSoftmaxKernel(m: *const Dsv4Model, scores0: mlx.mlx_array, sink: mlx.mlx_
     return out;
 }
 
-const DEC_CHAIN_KERNEL_SOURCE =
-    \\int h = thread_position_in_grid.y;
-    \\int lane = thread_position_in_threadgroup.x;
-    \\if (h >= H) return; // uniform per threadgroup (grid.y == H)
-    \\const int HALF = RD / 2;
-    \\const int QW = (POST == 1) ? (D - RD) : ((POST == 2) ? D : 0);
-    \\const int GROUP = (POST == 2) ? 32 : 64;
-    \\const float CODE_MAX = (POST == 2) ? 6.0f : 448.0f;
-    \\const float AMAX_FLOOR = (POST == 2) ? metal::ldexp(6.0f, -126) : 1e-4f;
-    \\const int MANT_BITS = (POST == 2) ? 1 : 3;
-    \\const int MIN_EXP = (POST == 2) ? 0 : -6;
-    \\const float MIN_SUB = metal::ldexp(1.0f, MIN_EXP);
-    \\threadgroup float row[D];
-    \\threadgroup float row2[(POST == 2) ? D : 1];
-    \\threadgroup float red[TG];
-    \\threadgroup float gsc[(QW > 0) ? (QW / GROUP) : 1];
-    \\// load (+ per-head RMSNorm)
-    \\if (RMS != 0) {
-    \\  float ss = 0.0f;
-    \\  for (int j = lane; j < D; j += TG) { float v = x[h * D + j]; ss += v * v; }
-    \\  red[lane] = ss;
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int off = TG / 2; off > 0; off >>= 1) {
-    \\    if (lane < off) red[lane] += red[lane + off];
-    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  }
-    \\  float rinv = metal::rsqrt(red[0] / (float)D + consts[0]);
-    \\  for (int j = lane; j < D; j += TG) row[j] = x[h * D + j] * rinv * w[j];
-    \\} else {
-    \\  for (int j = lane; j < D; j += TG) row[j] = x[h * D + j];
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\// interleaved-pair rope on the tail RD dims (INV = conjugate rotation)
-    \\for (int p = lane; p < HALF; p += TG) {
-    \\  float a = row[D - RD + 2 * p];
-    \\  float b = row[D - RD + 2 * p + 1];
-    \\  float cv = cosr[p];
-    \\  float sv = (INV != 0) ? -sinr[p] : sinr[p];
-    \\  row[D - RD + 2 * p] = a * cv - b * sv;
-    \\  row[D - RD + 2 * p + 1] = a * sv + b * cv;
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (POST == 2) {
-    \\  for (int j = lane; j < D; j += TG) {
-    \\    float hacc = 0.0f;
-    \\    for (int kk = 0; kk < D; ++kk) hacc += row[kk] * hada[kk * D + j];
-    \\    row2[j] = hacc;
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\}
-    \\if (QW > 0) {
-    \\  const int NG = QW / GROUP;
-    \\  for (int g = lane; g < NG; g += TG) {
-    \\    float amax = AMAX_FLOOR;
-    \\    for (int e = 0; e < GROUP; ++e) {
-    \\      float v = (POST == 2) ? row2[g * GROUP + e] : row[g * GROUP + e];
-    \\      amax = metal::max(amax, metal::abs(v));
-    \\    }
-    \\    float q = amax / CODE_MAX;
-    \\    int ee = 0;
-    \\    float mm = metal::frexp(q, ee);
-    \\    int ce = (mm == 0.5f) ? (ee - 1) : ee;
-    \\    gsc[g] = metal::ldexp(1.0f, ce);
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\}
-    \\for (int j = lane; j < D; j += TG) {
-    \\  float v = (POST == 2) ? row2[j] : row[j];
-    \\  float res = v;
-    \\  if (POST == 2 || (POST == 1 && j < D - RD)) {
-    \\    float scale = gsc[j / GROUP];
-    \\    float y = metal::clamp(v / scale, -CODE_MAX, CODE_MAX);
-    \\    float a = metal::abs(y);
-    \\    float af = metal::max(a, MIN_SUB);
-    \\    int ee2 = 0;
-    \\    float mm2 = metal::frexp(af, ee2);
-    \\    int e2 = ee2 - 1; // floor(log2(af)): mm2 in [0.5, 1)
-    \\    (void)mm2;
-    \\    if (e2 < MIN_EXP) e2 = MIN_EXP;
-    \\    float quantum = metal::ldexp(1.0f, e2 - MANT_BITS);
-    \\    float qv = metal::min(metal::rint(a / quantum) * quantum, CODE_MAX);
-    \\    float sq = (y < 0.0f) ? -qv : ((y > 0.0f) ? qv : 0.0f);
-    \\    res = sq * scale;
-    \\  }
-    \\  y_out[h * D + j] = res;
-    \\}
-;
+const DEC_CHAIN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/dec_chain.metal");
 
 var dec_chain_obj: ?mlx.mlx_fast_metal_kernel = null;
 var dec_chain_build_failed: bool = false;

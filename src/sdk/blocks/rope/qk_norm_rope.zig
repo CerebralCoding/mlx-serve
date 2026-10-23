@@ -2,6 +2,7 @@
 //! Owns QkAngleSlot, qk_fused_kernel, qk_fused_engaged, qk_fused_override, qk_fused_env, qkNormRopeFusedEnabled, and 18 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
@@ -54,47 +55,7 @@ pub fn qkNormRopeFusedEnabled() bool {
 // apart), f32 arithmetic, one T rounding — then the optional mscale multiply
 // reproduces the composed path's separate broadcast multiply (one more T
 // rounding, table value 1.0 on the pass-through tail).
-const QK_NORM_ROPE_SOURCE =
-    \\constexpr uint HD = 128;
-    \\uint head = threadgroup_position_in_grid.x;
-    \\uint lane = thread_position_in_threadgroup.x;
-    \\bool is_q = head < uint(HQ);
-    \\const device T* src = is_q ? (q + head * HD) : (k + (head - uint(HQ)) * HD);
-    \\const device T* w = is_q ? qw : kw;
-    \\device T* dst = is_q ? (oq + head * HD) : (ok + (head - uint(HQ)) * HD);
-    \\uint base = lane * 4;
-    \\float acc = 0.0f;
-    \\for (uint i = 0; i < 4; ++i) {
-    \\    float v = float(src[base + i]);
-    \\    acc += v * v;
-    \\}
-    \\acc = simd_sum(acc);
-    \\float inv = metal::precise::rsqrt(acc / float(HD) + float(eps));
-    \\T nrm[4];
-    \\for (uint i = 0; i < 4; ++i) {
-    \\    nrm[i] = w[base + i] * T(float(src[base + i]) * inv);
-    \\}
-    \\constexpr uint half_rd = uint(RD) / 2;
-    \\float partner[4];
-    \\for (uint i = 0; i < 4; ++i) {
-    \\    partner[i] = simd_shuffle(float(nrm[i]), lane ^ (half_rd / 4));
-    \\}
-    \\for (uint i = 0; i < 4; ++i) {
-    \\    uint j = base + i;
-    \\    T r;
-    \\    if (j < half_rd) {
-    \\        r = T(float(nrm[i]) * angles[j] - partner[i] * angles[half_rd + j]);
-    \\    } else if (j < uint(RD)) {
-    \\        r = T(partner[i] * angles[j] + float(nrm[i]) * angles[j - half_rd]);
-    \\    } else {
-    \\        r = nrm[i];
-    \\    }
-    \\    if (SCALED != 0) {
-    \\        r = r * ms[j];
-    \\    }
-    \\    dst[j] = r;
-    \\}
-;
+const QK_NORM_ROPE_SOURCE = kernelSource("kernels/rope/qk_norm_rope.metal");
 
 fn getQkNormRopeKernel() !mlx.mlx_fast_metal_kernel {
     if (qk_fused_kernel) |k| return k;
@@ -286,71 +247,7 @@ pub fn ropeAngleRows(
 // gate 16 -> 32 in 033f622).
 // Bit-identity with the composed chain is the acceptance bar; same kill
 // switch as the 128 kernel (MLX_SERVE_QK_NORM_ROPE_FUSED=0).
-const QK_NORM_ROPE_256_SOURCE =
-    \\constexpr uint HD = 256;
-    \\constexpr uint half_rd = uint(RD) / 2;
-    \\uint row = threadgroup_position_in_grid.x;
-    \\uint tid = thread_position_in_threadgroup.x;
-    \\uint simd_lane = thread_index_in_simdgroup;
-    \\uint simd_group = simdgroup_index_in_threadgroup;
-    \\uint q_rows = uint(HQ) * uint(S);
-    \\uint k_rows = uint(HK) * uint(S);
-    \\bool is_q = row < q_rows;
-    \\bool is_k = !is_q && row < q_rows + k_rows;
-    \\bool is_v = !is_q && !is_k;   // v rows (HV > 0): norm only, no rotation
-    \\uint local_row = is_q ? row : (is_k ? row - q_rows : row - q_rows - k_rows);
-    \\uint head = local_row / uint(S);
-    \\uint seq = local_row % uint(S);
-    \\// Inputs are row-contiguous [1, S, H, 256]; outputs head-major [1, H, S, 256].
-    \\const device T* src = is_q ? (q + (seq * uint(HQ) + head) * HD)
-    \\                    : (is_k ? (k + (seq * uint(HK) + head) * HD)
-    \\                            : (v + (seq * uint(HV) + head) * HD));
-    \\const device T* w = is_q ? qw : (is_k ? kw : vw);
-    \\device T* dst = is_q ? (oq + local_row * HD) : (is_k ? (ok + local_row * HD) : (ov + local_row * HD));
-    \\uint base = tid * 4;
-    \\threadgroup float local_sums[32];
-    \\threadgroup float local_inv[1];
-    \\threadgroup T nrm[HD];
-    \\float acc = 0.0f;
-    \\for (uint i = 0; i < 4; ++i) {
-    \\    float v = float(src[base + i]);
-    \\    acc += v * v;
-    \\}
-    \\acc = simd_sum(acc);
-    \\if (simd_group == 0) {
-    \\    local_sums[simd_lane] = 0.0f;
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (simd_lane == 0) {
-    \\    local_sums[simd_group] = acc;
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (simd_group == 0) {
-    \\    acc = simd_sum(local_sums[simd_lane]);
-    \\    if (simd_lane == 0) {
-    \\        local_inv[0] = metal::precise::rsqrt(acc / float(HD) + float(eps));
-    \\    }
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\float inv = local_inv[0];
-    \\for (uint i = 0; i < 4; ++i) {
-    \\    nrm[base + i] = NORM ? T(w[base + i] * T(float(src[base + i]) * inv)) : src[base + i];
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const device float* arow = angles + seq * uint(RD);
-    \\for (uint i = 0; i < 4; ++i) {
-    \\    uint j = base + i;
-    \\    T r;
-    \\    if (is_v || j >= uint(RD)) {
-    \\        r = nrm[j];
-    \\    } else if (j < half_rd) {
-    \\        r = T(float(nrm[j]) * arow[j] - float(nrm[j + half_rd]) * arow[half_rd + j]);
-    \\    } else {
-    \\        r = T(float(nrm[j - half_rd]) * arow[j] + float(nrm[j]) * arow[j - half_rd]);
-    \\    }
-    \\    dst[j] = r;
-    \\}
-;
+const QK_NORM_ROPE_256_SOURCE = kernelSource("kernels/rope/qk_norm_rope_256.metal");
 
 var qk256_fused_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qk256_fused_engaged: bool = false;

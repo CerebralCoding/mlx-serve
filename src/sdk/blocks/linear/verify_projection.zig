@@ -2,6 +2,7 @@
 //! Owns SingleVerifyFeature, single_verify_test_features, mtp_verify_shared_rows_calls, mtp_verify_shared_gate_rows_calls, mtp_verify_gdn_rows_calls, mtp_verify_gdn_output_calls, and 36 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mtp_mod = @import("../../spec/mtp/mtp.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
@@ -118,67 +119,7 @@ var verify_arch_read = false;
 pub var verify_group_rows: usize = 0;
 
 // MLX affine qmv-fast reduction, with one 3-bit weight read serving two rows.
-const MTP_COARSE_PAIRS_SOURCE =
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sg = simdgroup_index_in_threadgroup;
-    \\auto tg = threadgroup_position_in_grid;
-    \\int K = int(K_size), N = int(N_size);
-    \\uint row = tg.z * 2;
-    \\bool pair = row + 1 < uint(x_shape[0]);
-    \\uint out_row = tg.y * 8 + sg * 4;
-    \\const device uint8_t* w8 = (const device uint8_t*)w;
-    \\float2 result[4] = {float2(0), float2(0), float2(0), float2(0)};
-    \\for (int k = 0; k < K; k += 512) {
-    \\  float2 xt[16];
-    \\  float2 sum = float2(0);
-    \\  for (uint i = 0; i < 16; i += 8) {
-    \\    size_t at = size_t(row) * K + k + lane * 16 + i;
-    \\    const device T* a = x + at;
-    \\    sum.x += a[0] + a[1] + a[2] + a[3] + a[4] + a[5] + a[6] + a[7];
-    \\    float b[8] = {0,0,0,0,0,0,0,0};
-    \\    if (pair) {
-    \\      const device T* v = a + K;
-    \\      sum.y += v[0] + v[1] + v[2] + v[3] + v[4] + v[5] + v[6] + v[7];
-    \\      for (uint j = 0; j < 8; ++j) b[j] = float(v[j]);
-    \\    }
-    \\    xt[i] = float2(float(a[0]), b[0]);
-    \\    xt[i+1] = float2(float(a[1]), b[1]) / 8.0f;
-    \\    xt[i+2] = float2(float(a[2]), b[2]) / 64.0f;
-    \\    xt[i+3] = float2(float(a[3]), b[3]) / 2.0f;
-    \\    xt[i+4] = float2(float(a[4]), b[4]) / 16.0f;
-    \\    xt[i+5] = float2(float(a[5]), b[5]) / 128.0f;
-    \\    xt[i+6] = float2(float(a[6]), b[6]) / 4.0f;
-    \\    xt[i+7] = float2(float(a[7]), b[7]) / 32.0f;
-    \\  }
-    \\  for (uint r = 0; r < 4; ++r) {
-    \\    const device uint8_t* packed = w8 + size_t(out_row+r) * (K*3/8) + k*3/8 + lane*6;
-    \\    float scale = float(sc[size_t(out_row+r) * (K/64) + k/64 + lane/4]);
-    \\    float bias = float(bi[size_t(out_row+r) * (K/64) + k/64 + lane/4]);
-    \\    float2 accum = float2(0);
-    \\    for (uint i = 0; i < 2; ++i) {
-    \\      uint a = packed[3*i], b = packed[3*i+1], c = packed[3*i+2];
-    \\      accum += float(a & 0x07) * xt[8*i];
-    \\      accum += float(a & 0x38) * xt[8*i+1];
-    \\      accum += float(a & 0xc0) * xt[8*i+2];
-    \\      accum += float(b & 0x01) * (xt[8*i+2] * 256.0f);
-    \\      accum += float(b & 0x0e) * xt[8*i+3];
-    \\      accum += float(b & 0x70) * xt[8*i+4];
-    \\      accum += float(b & 0x80) * xt[8*i+5];
-    \\      accum += float(c & 0x03) * (xt[8*i+5] * 256.0f);
-    \\      accum += float(c & 0x1c) * xt[8*i+6];
-    \\      accum += float(c & 0xe0) * xt[8*i+7];
-    \\    }
-    \\    result[r] += scale * accum + sum * bias;
-    \\  }
-    \\}
-    \\for (uint r = 0; r < 4; ++r) {
-    \\  float a = simd_sum(result[r].x), b = simd_sum(result[r].y);
-    \\  if (lane == 0) {
-    \\    y[size_t(row)*N + out_row+r] = T(a);
-    \\    if (pair) y[size_t(row+1)*N + out_row+r] = T(b);
-    \\  }
-    \\}
-;
+const MTP_COARSE_PAIRS_SOURCE = kernelSource("kernels/linear/mtp_coarse_pairs.metal");
 var mtp_coarse_pairs_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mtp_coarse_pairs_cfgs = QsaCfgCache(c_int, 1){};
 
@@ -268,43 +209,7 @@ pub fn verifySharedHardware() bool {
 }
 
 // Same subchunk and shuffle reduction as Apple's MLX qmv_wide_impl (MIT).
-const VERIFY_WIDE_SOURCE =
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint kl = lane % 8, r = threadgroup_position_in_grid.y * 8 + sg * 4 + lane / 8;
-    \\uint v0 = threadgroup_position_in_grid.x * NV;
-    \\uint row = min(r, uint(N - 1));
-    \\device const uchar* wr = reinterpret_cast<device const uchar*>(w) + size_t(row) * K;
-    \\float result[NV] = {0};
-    \\for (uint g = kl; g < K / 64; g += 8) {
-    \\    float scale = float(sc[size_t(row) * (K / 64) + g]);
-    \\    float bias = float(bi[size_t(row) * (K / 64) + g]);
-    \\    #pragma unroll
-    \\    for (uint chunk = 0; chunk < 8; ++chunk) {
-    \\        uint k0 = g * 64 + chunk * 8;
-    \\        float dq[8];
-    \\        #pragma unroll
-    \\        for (uint i = 0; i < 8; ++i) dq[i] = scale * float(wr[k0 + i]) + bias;
-    \\        #pragma unroll
-    \\        for (uint v = 0; v < NV; ++v) {
-    \\            uint input_row = min(v0 + v, uint(M - 1));
-    \\            float acc = 0;
-    \\            #pragma unroll
-    \\            for (uint i = 0; i < 8; ++i) acc += float(x[size_t(input_row) * K + k0 + i]) * dq[i];
-    \\            result[v] += acc;
-    \\        }
-    \\    }
-    \\}
-    \\for (uint v = 0; v < NV; ++v) {
-    \\    result[v] += simd_shuffle_down(result[v], 4);
-    \\    result[v] += simd_shuffle_down(result[v], 2);
-    \\    result[v] += simd_shuffle_down(result[v], 1);
-    \\}
-    \\if (kl == 0 && r < N) {
-    \\    for (uint v = 0; v < NV; ++v)
-    \\        if (v0 + v < M) y[size_t(v0 + v) * N + r] = T(result[v]);
-    \\}
-;
+const VERIFY_WIDE_SOURCE = kernelSource("kernels/linear/verify_wide.metal");
 var verify_wide_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const VerifyWideKey = struct { m: c_int, n: c_int, k: c_int, nv: c_int };
 var verify_wide_configs = QsaCfgCache(VerifyWideKey, 1){};

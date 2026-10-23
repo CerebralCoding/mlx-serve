@@ -2,6 +2,7 @@
 //! Every input row is its own simdgroup running one row's loop, so a row's bits never
 //! depend on how many rows share the call: serial decode and a verify window agree.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 
 pub const MAX_ROWS = 16;
@@ -14,94 +15,11 @@ const RPS = 4;
 /// MLX does on bfloat16_t, the 8-bit one adds each input in float. The tail of
 /// a K that is not a multiple of the 32 * VPL block runs one more chunk on the
 /// lanes below (K % block) / VPL. Reads nothing but its own row of x.
-pub const HEADER =
-    \\template <int BITS>
-    \\inline float rq_load(const device bfloat* x, thread float* xt) {
-    \\  float sum = 0.0f;
-    \\  if (BITS == 8) {
-    \\    for (int i = 0; i < 8; i++) { sum += float(x[i]); xt[i] = float(x[i]); }
-    \\  } else {
-    \\    constexpr float d1 = BITS == 4 ? 16.0f : 64.0f, d2 = BITS == 4 ? 256.0f : 16.0f, d3 = BITS == 4 ? 4096.0f : 4.0f;
-    \\    for (int i = 0; i < (BITS == 4 ? 16 : 8); i += 4) {
-    \\      const bfloat a = x[i], b = x[i + 1], c = x[i + 2], d = x[i + 3];
-    \\      sum += float(bfloat(float(bfloat(float(bfloat(float(a) + float(b))) + float(c))) + float(d)));
-    \\      xt[i] = float(a); xt[i + 1] = float(b) / d1; xt[i + 2] = float(c) / d2; xt[i + 3] = float(d) / d3;
-    \\    }
-    \\  }
-    \\  return sum;
-    \\}
-    \\template <int BITS>
-    \\inline float rq_qdot(const device uint8_t* w, const thread float* xt, float scale, float bias, float sum) {
-    \\  float accum = 0.0f;
-    \\  if (BITS == 4) {
-    \\    const device uint16_t* ws = (const device uint16_t*)w;
-    \\    for (int i = 0; i < 4; i++)
-    \\      accum += (xt[4 * i] * (ws[i] & 0x000f) + xt[4 * i + 1] * (ws[i] & 0x00f0) +
-    \\                xt[4 * i + 2] * (ws[i] & 0x0f00) + xt[4 * i + 3] * (ws[i] & 0xf000));
-    \\  } else if (BITS == 6) {
-    \\    for (int i = 0; i < 2; i++) {
-    \\      const device uint8_t* b = w + 3 * i;
-    \\      const thread float* v = xt + 4 * i;
-    \\      accum += (b[0] & 0x3f) * v[0];
-    \\      accum += (b[0] & 0xc0) * v[1];
-    \\      accum += (b[1] & 0x0f) * (v[1] * 256.0f);
-    \\      accum += (b[1] & 0xf0) * v[2];
-    \\      accum += (b[2] & 0x03) * (v[2] * 256.0f);
-    \\      accum += (b[2] & 0xfc) * v[3];
-    \\    }
-    \\  } else {
-    \\    for (int i = 0; i < 8; i++) accum += xt[i] * w[i];
-    \\  }
-    \\  return scale * accum + sum * bias;
-    \\}
-    \\template <int K, int GS, int RPS, int BITS>
-    \\inline void rq_rowdot(const device uint8_t* w, const device bfloat* sc, const device bfloat* bi,
-    \\                      const device bfloat* x, uint lane, thread float* acc) {
-    \\  constexpr int VPL = BITS == 4 ? 16 : 8;
-    \\  constexpr int BPL = VPL * BITS / 8;
-    \\  constexpr int BLOCK = 32 * VPL;
-    \\  constexpr int KB = K * BITS / 8;
-    \\  constexpr int KG = K / GS;
-    \\  constexpr int FULL = K / BLOCK * BLOCK;
-    \\  w += lane * BPL;
-    \\  sc += lane / (GS / VPL);
-    \\  bi += lane / (GS / VPL);
-    \\  x += lane * VPL;
-    \\  for (int j = 0; j < RPS; j++) acc[j] = 0.0f;
-    \\  for (int k0 = 0; k0 < FULL; k0 += BLOCK) {
-    \\    float xt[VPL];
-    \\    const float sum = rq_load<BITS>(x, xt);
-    \\    for (int j = 0; j < RPS; j++) acc[j] += rq_qdot<BITS>(w + j * KB, xt, float(sc[j * KG]), float(bi[j * KG]), sum);
-    \\    w += 32 * BPL; sc += BLOCK / GS; bi += BLOCK / GS; x += BLOCK;
-    \\  }
-    \\  if (FULL < K && int(lane) < (K - FULL) / VPL) {
-    \\    float xt[VPL];
-    \\    const float sum = rq_load<BITS>(x, xt);
-    \\    for (int j = 0; j < RPS; j++) acc[j] += rq_qdot<BITS>(w + j * KB, xt, float(sc[j * KG]), float(bi[j * KG]), sum);
-    \\  }
-    \\  for (int j = 0; j < RPS; j++) acc[j] = simd_sum(acc[j]);
-    \\}
-;
+pub const HEADER = kernelSource("kernels/qmm/rowqmv_header.metal");
 
 /// One simdgroup per input row, each over BLK blocks of RPS output rows; the
 /// row count is a launch dimension only.
-const QMV_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int r = int(thread_position_in_threadgroup.x) / 32;
-    \\const int row0 = int(thread_position_in_grid.y) * RPS;
-    \\float acc[RPS];
-    \\rq_rowdot<K, GS, RPS, BITS>((const device uint8_t*)w + size_t(row0) * (K * BITS / 8), scales + size_t(row0) * (K / GS),
-    \\                      biases + size_t(row0) * (K / GS), x + size_t(r) * K, lane, acc);
-    \\if (lane == 0)
-    \\  for (int j = 0; j < RPS; j++) {
-    \\    if (RELU2) {
-    \\      const float h = metal::max(float(bfloat(acc[j])), 0.0f);
-    \\      y[size_t(r) * N + row0 + j] = bfloat(h * h);
-    \\    } else {
-    \\      y[size_t(r) * N + row0 + j] = bfloat(acc[j]);
-    \\    }
-    \\  }
-;
+const QMV_SOURCE = kernelSource("kernels/qmm/rowqmv_qmv.metal");
 
 var qmv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const CfgKey = struct { rows: c_int, n: c_int, k: c_int, bits: u32, gs: u32, relu2: bool };
@@ -196,35 +114,10 @@ pub fn qmvAct(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx
 /// p / TOPK's slot p % TOPK and reads expert IDS[p]; simdgroup g of
 /// threadgroup (b, p) takes the expert's output rows RPS (SG b + g) ..
 /// fc1 applies mlx-lm's relu2 on its bf16 output: bf16(max(bf16(sum), 0)^2).
-const EXPERT_UP_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int p = int(threadgroup_position_in_grid.z);
-    \\const size_t e = size_t(ids[p]);
-    \\const int row0 = (int(threadgroup_position_in_grid.y) * SG + int(simdgroup_index_in_threadgroup)) * RPS;
-    \\const size_t at = e * N + size_t(row0);
-    \\float acc[RPS];
-    \\rq_rowdot<K, GS, RPS, BITS>((const device uint8_t*)w + at * (K * BITS / 8), scales + at * (K / GS), biases + at * (K / GS),
-    \\                      x + size_t(p / TOPK) * K, lane, acc);
-    \\if (lane == 0)
-    \\  for (int j = 0; j < RPS; j++) {
-    \\    const float h = metal::max(float(bfloat(acc[j])), 0.0f);
-    \\    y[size_t(p) * N + row0 + j] = bfloat(h * h);
-    \\  }
-;
+const EXPERT_UP_SOURCE = kernelSource("kernels/qmm/rowqmv_expert_up.metal");
 
 /// fc2 over each pair's own activation row.
-const EXPERT_DOWN_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int p = int(threadgroup_position_in_grid.z);
-    \\const size_t e = size_t(ids[p]);
-    \\const int row0 = (int(threadgroup_position_in_grid.y) * SG + int(simdgroup_index_in_threadgroup)) * RPS;
-    \\const size_t at = e * N + size_t(row0);
-    \\float acc[RPS];
-    \\rq_rowdot<K, GS, RPS, BITS>((const device uint8_t*)w + at * (K * BITS / 8), scales + at * (K / GS), biases + at * (K / GS),
-    \\                      x + size_t(p) * K, lane, acc);
-    \\if (lane == 0)
-    \\  for (int j = 0; j < RPS; j++) y[size_t(p) * N + row0 + j] = bfloat(acc[j]);
-;
+const EXPERT_DOWN_SOURCE = kernelSource("kernels/qmm/rowqmv_expert_down.metal");
 
 const EXPERT_SG = 2;
 var up_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -292,37 +185,7 @@ pub fn experts(x: mlx.mlx_array, ids: mlx.mlx_array, topk: c_int, fc1: [3]mlx.ml
 /// simdgroups per expert; simdgroup g sums its D / SG inputs (lane l takes 4
 /// consecutive inputs at a time, 128 apart), then the simdgroup sums add in
 /// order. The row count is a runtime value, so a row's bits never depend on it.
-const ROUTER_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const uint g = simdgroup_index_in_threadgroup;
-    \\const int e = int(threadgroup_position_in_grid.y);
-    \\const int R = rows;
-    \\constexpr int PART = D / SG;
-    \\threadgroup float part[MAX_ROWS][SG];
-    \\float acc[MAX_ROWS];
-    \\for (int r = 0; r < MAX_ROWS; r++) acc[r] = 0.0f;
-    \\const int begin = int(g) * PART;
-    \\for (int c = begin + 4 * int(lane); c < begin + PART; c += 128) {
-    \\  const float w0 = float(w[size_t(e) * D + c]), w1 = float(w[size_t(e) * D + c + 1]);
-    \\  const float w2 = float(w[size_t(e) * D + c + 2]), w3 = float(w[size_t(e) * D + c + 3]);
-    \\  for (int r = 0; r < MAX_ROWS; r++) {
-    \\    if (r >= R) break;
-    \\    const device bfloat* xr = x + r * D + c;
-    \\    acc[r] = fma(float(xr[3]), w3, fma(float(xr[2]), w2, fma(float(xr[1]), w1, fma(float(xr[0]), w0, acc[r]))));
-    \\  }
-    \\}
-    \\for (int r = 0; r < MAX_ROWS; r++) {
-    \\  if (r >= R) break;
-    \\  const float total = simd_sum(acc[r]);
-    \\  if (lane == 0) part[r][g] = total;
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (g == 0 && int(lane) < R) {
-    \\  float total = 0.0f;
-    \\  for (int k = 0; k < SG; k++) total += part[lane][k];
-    \\  y[int(lane) * E + e] = bfloat(total);
-    \\}
-;
+const ROUTER_SOURCE = kernelSource("kernels/qmm/rowqmv_router.metal");
 
 const ROUTER_SG = 8;
 var router_kernel: ?mlx.mlx_fast_metal_kernel = null;

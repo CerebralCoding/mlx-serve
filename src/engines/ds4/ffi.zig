@@ -246,6 +246,8 @@ pub extern fn ds4_session_sample(
 ) c_int;
 pub extern fn ds4_session_top_logprobs(s: *Session, out: [*]TokenScore, k: c_int) c_int;
 pub extern fn ds4_session_token_logprob(s: *Session, token: c_int, out: *TokenScore) c_int;
+pub extern fn ds4_session_copy_logits(s: *Session, out: [*]f32, cap: c_int) c_int;
+pub extern fn ds4_session_set_logits(s: *Session, logits: [*]const f32, n: c_int) c_int;
 pub extern fn ds4_session_eval(s: *Session, token: c_int, err: ?[*]u8, errlen: usize) c_int;
 pub extern fn ds4_session_eval_speculative(
     s: *Session,

@@ -2,6 +2,7 @@
 //! Owns attnOutGate, ATTN_GATE_SOURCE, attn_gate_kernel, attn_gate_engaged, attn_gate_fused_override, attn_gate_fused_env, and 18 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const fused_activations = @import("../mlp/fused_activations.zig");
@@ -82,28 +83,7 @@ pub fn attnOutGate(self: *const Transformer, normed: mlx.mlx_array, attn_flat: m
 // the whole device, and it measured 2.3% SLOWER than the four-dispatch chain
 // on three consecutive pairs. Recomputing softplus once per element is ~10 ALU
 // ops against a value that is in cache — far cheaper than serializing.
-const ATTN_GATE_SOURCE =
-    \\uint i = thread_position_in_grid.x;
-    \\uint row = thread_position_in_grid.y;
-    \\if (i >= uint(NH * HD)) return;
-    \\
-    \\// softplus = logaddexp(0, g), computed in f32 and rounded to the
-    \\// activation dtype exactly where mlx_astype would round it.
-    \\float g = float(glogits[(size_t)row * NH + i / HD]);
-    \\float mx = metal::max(0.0f, g);
-    \\float mn = metal::min(0.0f, g);
-    \\float sp;
-    \\if (metal::isnan(g)) {
-    \\  sp = NAN;
-    \\} else if (metal::isinf(mx)) {
-    \\  sp = mx;
-    \\} else {
-    \\  sp = mx + log1p(metal::exp(mn - mx));
-    \\}
-    \\
-    \\size_t base = (size_t)row * (size_t)(NH * HD);
-    \\y[base + i] = T(float(attn[base + i]) * float(T(sp)));
-;
+const ATTN_GATE_SOURCE = kernelSource("kernels/attention/attn_gate.metal");
 
 var attn_gate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var attn_gate_engaged: bool = false;
@@ -202,12 +182,7 @@ pub fn fusedAttnGate(
 /// `x * sigmoid(g)`: the sigmoid from the per-dtype table (mlx_sigmoid's own
 /// values), one multiply. With GROUP > 1 each gate value covers GROUP
 /// consecutive x elements (Spark's per-head gate).
-const SIGMOID_GATE_MUL_SOURCE =
-    \\uint i = thread_position_in_grid.x;
-    \\if (i >= uint(N_size)) return;
-    \\T sig = sigtab[as_type<ushort>(gate[i / uint(GROUP)])];
-    \\y[i] = x[i] * sig;
-;
+const SIGMOID_GATE_MUL_SOURCE = kernelSource("kernels/attention/sigmoid_gate_mul.metal");
 
 var sig_gate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const SigGateCfgKey = struct { shape: ShapeKey, group: c_int, dtype: mlx.mlx_dtype };
@@ -222,15 +197,7 @@ var sig_gate_engaged: bool = false;
 // `x * sigmoid(gate)` over two equal-shape 4-D views read through their own
 // strides (a transposed attention output, a split q|gate projection), written
 // contiguous [B, S, H, D]; sigmoid from MLX's own table, so bit-equal to the pair.
-const STRIDED_SIGMOID_GATE_MUL_SOURCE =
-    \\uint i = thread_position_in_grid.x;
-    \\if (i >= uint(N_size)) return;
-    \\const uint D = x_shape[3], H = x_shape[2], S = x_shape[1];
-    \\const uint d = i % D, h = (i / D) % H, sq = (i / (D * H)) % S, b = i / (D * H * S);
-    \\const T xv = x[b * x_strides[0] + sq * x_strides[1] + h * x_strides[2] + d * x_strides[3]];
-    \\const T gv = gate[b * gate_strides[0] + sq * gate_strides[1] + h * gate_strides[2] + d * gate_strides[3]];
-    \\y[i] = xv * sigtab[as_type<ushort>(gv)];
-;
+const STRIDED_SIGMOID_GATE_MUL_SOURCE = kernelSource("kernels/attention/strided_sigmoid_gate_mul.metal");
 
 var strided_sig_gate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var strided_sig_gate_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
@@ -281,7 +248,7 @@ pub fn stridedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_arr
     return y;
 }
 
-fn fusedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array, heads: c_int) !?mlx.mlx_array {
+pub fn fusedSigmoidGateMul(s: mlx.mlx_stream, x: mlx.mlx_array, g: mlx.mlx_array, heads: c_int) !?mlx.mlx_array {
     if (!swigluFusedEnabled() or !mlx.streamIsGpu(s)) return null;
     const dt = mlx.mlx_array_dtype(x);
     if ((dt != .bfloat16 and dt != .float16) or mlx.mlx_array_dtype(g) != dt) return null;

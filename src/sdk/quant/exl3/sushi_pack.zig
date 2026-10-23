@@ -1,6 +1,7 @@
 //! Sushi packs keep the source checkpoint's tensor layout beside their EXL3 experts. These steps
 //! move the tensors to where the GLM-5-Next and MiMo loaders read them, once, right after load.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
@@ -502,63 +503,8 @@ pub fn fp8Linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.m
 // e4m3 GEMV ported from sushi's fp8_block.zig (beamivalice/sushi, MIT): each simdgroup owns NR
 // weight rows for all M input rows, lanes stride a row in 16-byte chunks, products sum in f32.
 // The e4m3 decode is bit-exact: the code's low 7 bits as a half, times 256.
-const GEMV_HEADER =
-    \\static inline float4 msv_e4m3_decode4(uint w) {
-    \\    uint lo = ((w & 0x007F007Fu) << 7) | ((w & 0x00800080u) << 8);
-    \\    uint hs = w >> 8;
-    \\    uint hi = ((hs & 0x007F007Fu) << 7) | ((hs & 0x00800080u) << 8);
-    \\    half2 h02 = as_type<half2>(lo) * half2((half)256.0f);
-    \\    half2 h13 = as_type<half2>(hi) * half2((half)256.0f);
-    \\    return float4(float(h02.x), float(h13.x), float(h02.y), float(h13.y));
-    \\}
-;
-const GEMV_SOURCE =
-    \\constexpr uint KC = uint(K) / 16u;
-    \\constexpr uint KB = uint(K) / 128u;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint row0 = (threadgroup_position_in_grid.x * uint(SGS) + simdgroup_index_in_threadgroup) * uint(NR);
-    \\const device uint4* wp[NR];
-    \\uint srow[NR];
-    \\float acc[M][NR];
-    \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < NR; ++r) {
-    \\  uint o = metal::min(row0 + uint(r), uint(N) - 1u);
-    \\  srow[r] = o * KB;
-    \\  wp[r] = (const device uint4*)(w + (size_t)o * (size_t)K);
-    \\  #pragma clang loop unroll(full)
-    \\  for (int m = 0; m < M; ++m) acc[m][r] = 0.0f;
-    \\}
-    \\for (uint c = lane; c < KC; c += 32u) {
-    \\  uint4 wr[NR];
-    \\  float sc[NR];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < NR; ++r) {
-    \\    wr[r] = wp[r][c];
-    \\    sc[r] = scales[srow[r] + (c >> 3)];
-    \\  }
-    \\  #pragma clang loop unroll(full)
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    float4 wv[NR];
-    \\    #pragma clang loop unroll(full)
-    \\    for (int r = 0; r < NR; ++r) wv[r] = msv_e4m3_decode4(wr[r][i]) * sc[r];
-    \\    #pragma clang loop unroll(full)
-    \\    for (int m = 0; m < M; ++m) {
-    \\      float4 xv = float4(*((const device vec<T, 4>*)(x + (size_t)m * (size_t)K + c * 16u + uint(i) * 4u)));
-    \\      #pragma clang loop unroll(full)
-    \\      for (int r = 0; r < NR; ++r) acc[m][r] += dot(xv, wv[r]);
-    \\    }
-    \\  }
-    \\}
-    \\#pragma clang loop unroll(full)
-    \\for (int m = 0; m < M; ++m) {
-    \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < NR; ++r) {
-    \\    float total = simd_sum(acc[m][r]);
-    \\    uint o = row0 + uint(r);
-    \\    if (lane == 0u && o < uint(N)) y[(size_t)m * uint(N) + o] = T(total);
-    \\  }
-    \\}
-;
+const GEMV_HEADER = kernelSource("kernels/quant/sushi_gemv_header.metal");
+const GEMV_SOURCE = kernelSource("kernels/quant/sushi_gemv.metal");
 const GEMV_MAX_ROWS = 8;
 const GemvKey = struct { m: c_int, n: c_int, k: c_int, dt: mlx.mlx_dtype };
 var gemv_kernel: ?mlx.mlx_fast_metal_kernel = null;

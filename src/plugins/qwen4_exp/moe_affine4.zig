@@ -5,6 +5,7 @@
 //! memory, and the down kernel accumulates every expert of a token in registers. The affine
 //! bias rides a per-group sum of x: `sum((s*q + b) * x) = s * dot(q, x) + b * sum(x)`.
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 
@@ -12,123 +13,18 @@ const log = @import("../../host/log.zig");
 const ROWS: c_int = 1;
 const SGS: c_int = 2;
 
-const DOT16 =
-    \\inline float mlxserve_a4_dot16(uint2 w, thread const float* x) {
-    \\  float a = 0.0f, b = 0.0f;
-    \\  for (int j = 0; j < 8; ++j) {
-    \\    a += x[j] * float((w.x >> (4 * j)) & 0xFu);
-    \\    b += x[8 + j] * float((w.y >> (4 * j)) & 0xFu);
-    \\  }
-    \\  return a + b;
-    \\}
-;
+const DOT16 = kernelSource("plugins/qwen4_exp/kernels/moe_affine4_dot16.metal");
 
 // grid (32, N/ROWS, TOPK + SE), threadgroup (32, SGS, 1): one token, slot e = its e-th expert;
 // slots past TOPK are N-row slices of the ungated shared expert (`sg_*`/`su_*`, SE = its rows / N).
 // GS >= 16 and 16 | GS, so a lane's 16 values share one scale and bias.
-const GATEUP_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int row0 = int(thread_position_in_grid.y) * ROWS;
-    \\const uint e = thread_position_in_grid.z;
-    \\constexpr int KW2 = K / 16;
-    \\constexpr int KG = K / GS;
-    \\const bool sh = int(e) >= TOPK;
-    \\const size_t row = sh ? size_t(int(e) - TOPK) * N + row0 : size_t(inds[e]) * N + row0;
-    \\const device uint2* gw = (const device uint2*)(sh ? sg_q : wg_q) + row * KW2 + lane;
-    \\const device uint2* uw = (const device uint2*)(sh ? su_q : wu_q) + row * KW2 + lane;
-    \\const device T* gsc = sh ? sg_scales : g_scales;
-    \\const device T* gbi = sh ? sg_biases : g_biases;
-    \\const device T* usc = sh ? su_scales : u_scales;
-    \\const device T* ubi = sh ? su_biases : u_biases;
-    \\float ag[ROWS] = {0.0f};
-    \\float au[ROWS] = {0.0f};
-    \\for (int k = 0; k < K; k += 512) {
-    \\  const int kk = k + int(lane) * 16;
-    \\  if (kk < K) {
-    \\    float xr[16];
-    \\    float xs = 0.0f;
-    \\    for (int i = 0; i < 16; ++i) { xr[i] = float(x[kk + i]); xs += xr[i]; }
-    \\    const int gi = kk / GS;
-    \\    for (int r = 0; r < ROWS; ++r) {
-    \\      const size_t sg = (row + r) * KG + gi;
-    \\      ag[r] += float(gsc[sg]) * mlxserve_a4_dot16(gw[r * KW2 + k / 16], xr) + float(gbi[sg]) * xs;
-    \\      au[r] += float(usc[sg]) * mlxserve_a4_dot16(uw[r * KW2 + k / 16], xr) + float(ubi[sg]) * xs;
-    \\    }
-    \\  }
-    \\}
-    \\for (int r = 0; r < ROWS; ++r) {
-    \\  const float g = simd_sum(ag[r]);
-    \\  const float u = simd_sum(au[r]);
-    \\  if (lane == 0) {
-    \\    const T gt = T(g);
-    \\    y[size_t(e) * N + row0 + r] = (gt * sigtab[as_type<ushort>(gt)]) * T(u);
-    \\  }
-    \\}
-;
+const GATEUP_SOURCE = kernelSource("plugins/qwen4_exp/kernels/moe_affine4_gateup.metal");
 
 // grid (32, H/ROWS, 1), threadgroup (32, SGS, 1): every expert's down row, weighted by its
 // routing score, accumulated in the same registers. SHARED: the gated shared expert's output
 // (`sdown`, gate logit `glog`) is added in the epilogue. SI > 0: the ungated shared expert's
 // down row (`sd_*`, SI inputs after the routed activations) joins the sum at weight 1.
-const DOWNRED_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int row0 = int(thread_position_in_grid.y) * ROWS;
-    \\constexpr int KW2 = I / 16;
-    \\constexpr int KG = I / GS;
-    \\float acc[ROWS] = {0.0f};
-    \\for (int e = 0; e < TOPK; ++e) {
-    \\  const size_t row = size_t(inds[e]) * H + row0;
-    \\  const device uint2* dw = (const device uint2*)wd_q + row * KW2 + lane;
-    \\  const float sc = float(scores[e]);
-    \\  for (int k = 0; k < I; k += 512) {
-    \\    const int kk = k + int(lane) * 16;
-    \\    if (kk < I) {
-    \\      float xr[16];
-    \\      float xs = 0.0f;
-    \\      for (int i = 0; i < 16; ++i) { xr[i] = float(act[size_t(e) * I + kk + i]); xs += xr[i]; }
-    \\      const int gi = kk / GS;
-    \\      for (int r = 0; r < ROWS; ++r) {
-    \\        const size_t sg = (row + r) * KG + gi;
-    \\        acc[r] += sc * (float(d_scales[sg]) * mlxserve_a4_dot16(dw[r * KW2 + k / 16], xr) + float(d_biases[sg]) * xs);
-    \\      }
-    \\    }
-    \\  }
-    \\}
-    \\if (SI > 0) {
-    \\  constexpr int SW2 = SI / 16;
-    \\  constexpr int SG = SI / GS;
-    \\  const device uint2* sw = (const device uint2*)sd_q + size_t(row0) * SW2 + lane;
-    \\  for (int k = 0; k < SI; k += 512) {
-    \\    const int kk = k + int(lane) * 16;
-    \\    if (kk < SI) {
-    \\      float xr[16];
-    \\      float xs = 0.0f;
-    \\      for (int i = 0; i < 16; ++i) { xr[i] = float(act[size_t(TOPK) * I + kk + i]); xs += xr[i]; }
-    \\      const int gi = kk / GS;
-    \\      for (int r = 0; r < ROWS; ++r) {
-    \\        const size_t sg = size_t(row0 + r) * SG + gi;
-    \\        acc[r] += float(sd_scales[sg]) * mlxserve_a4_dot16(sw[r * SW2 + k / 16], xr) + float(sd_biases[sg]) * xs;
-    \\      }
-    \\    }
-    \\  }
-    \\}
-    \\for (int r = 0; r < ROWS; ++r) {
-    \\  const float v = simd_sum(acc[r]);
-    \\  if (lane == 0) {
-    \\    T out = T(v);
-    \\    if (SHARED != 0) {
-    \\      // The gated shared expert joins as the chain does it: sigmoid in T (MLX's Sigmoid op), the
-    \\      // product rounded to T, the sum rounded to T.
-    \\      const T gl = glog[0];
-    \\      auto sy = 1 / (1 + metal::precise::exp(metal::abs(gl)));
-    \\      const T sig = (gl < 0) ? sy : 1 - sy;
-    \\      const T gated = T(float(sig) * float(sdown[row0 + r]));
-    \\      out = T(float(out) + float(gated));
-    \\    }
-    \\    y[row0 + r] = out;
-    \\  }
-    \\}
-;
+const DOWNRED_SOURCE = kernelSource("plugins/qwen4_exp/kernels/moe_affine4_downred.metal");
 
 var gateup_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var downred_kernel: ?mlx.mlx_fast_metal_kernel = null;

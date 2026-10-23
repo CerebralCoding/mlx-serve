@@ -5,6 +5,7 @@
 //!   MOE_UBENCH=1 zig build test -Doptimize=ReleaseFast -Dtest-filter="moe gather kernels"
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const xfm = @import("../../../engines/mlx/transformer.zig");
 const io_util = @import("../../util/io_util.zig");
@@ -566,31 +567,7 @@ test "moe verify rows kernels: microbench at S rows (MOE_UBENCH=1)" {
 // The read ceiling with wide loads: one simdgroup streams its own 64 KiB span with 16-byte loads, UNROLL
 // loads in flight per lane, and folds what it read into one word so nothing is dead code. A DRAM rate here
 // that beats the reduction above says the reduction was the limit, not the memory.
-const STREAM_WIDE_SOURCE =
-    \\uint sg = thread_position_in_grid.x / 32;
-    \\auto lane = thread_index_in_simdgroup;
-    \\const device uint4* p = (const device uint4*)a + (size_t)sg * (size_t)SPAN4;
-    \\uint acc = 0;
-    \\if (STRIDED) {
-    \\  // grid-stride: at each step the whole GPU reads one contiguous slab
-    \\  const device uint4* q = (const device uint4*)a;
-    \\  size_t gid = thread_position_in_grid.x;
-    \\  size_t nth = (size_t)NSG * 32;
-    \\  for (size_t i = gid; i < nth * (size_t)SPAN4 / 32 ; i += nth * (size_t)UNROLL) {
-    \\    uint4 v[UNROLL];
-    \\    for (int u = 0; u < UNROLL; ++u) v[u] = q[i + nth * (size_t)u];
-    \\    for (int u = 0; u < UNROLL; ++u) acc ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
-    \\  }
-    \\  out[sg] = simd_sum(acc);
-    \\  return;
-    \\}
-    \\for (size_t i = lane; i < (size_t)SPAN4; i += (size_t)(32 * UNROLL)) {
-    \\  uint4 v[UNROLL];
-    \\  for (int u = 0; u < UNROLL; ++u) v[u] = p[i + (size_t)(32 * u)];
-    \\  for (int u = 0; u < UNROLL; ++u) acc ^= v[u].x ^ v[u].y ^ v[u].z ^ v[u].w;
-    \\}
-    \\out[sg] = simd_sum(acc);
-;
+const STREAM_WIDE_SOURCE = kernelSource("kernels/moe/ubench_stream_wide.metal");
 
 test "stream read peak: wide loads over 2 GiB (MOE_UBENCH=1)" {
     if (std.c.getenv("MOE_UBENCH") == null) return error.SkipZigTest;

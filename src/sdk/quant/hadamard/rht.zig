@@ -7,6 +7,7 @@
 //! `rawEmbedding` apply them. The input transform is memoized on (x, signs):
 //! q/k/v, gate/up and the GDN qkv/z share one normed activation.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 
 pub const SIGNS_SUFFIX = ".signs";
@@ -14,45 +15,7 @@ pub const SIGNS_SUFFIX = ".signs";
 /// One 128-thread group per `block`-wide stripe, element `(sg*P + p)*32 + lane`
 /// (P = J/4): lane bits butterfly via `simd_shuffle_xor`, p bits in registers,
 /// the two simdgroup bits through one threadgroup exchange.
-const KERNEL_SOURCE =
-    \\constexpr int S = 4;
-    \\constexpr int P = J / S;
-    \\threadgroup float tg[J * 32];
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint base = threadgroup_position_in_grid.x * (J * 32);
-    \\uint col = base % x_shape[x_ndim - 1];
-    \\float v[P];
-    \\for (int p = 0; p < P; ++p) {
-    \\  uint i = (sg * P + p) * 32 + lane;
-    \\  float e = float(x[base + i]);
-    \\  v[p] = INV ? e : e * signs[col + i];
-    \\}
-    \\for (int h = 1; h < P; h <<= 1) {
-    \\  for (int p = 0; p < P; ++p) {
-    \\    if ((p & h) == 0) { float a = v[p], b = v[p + h]; v[p] = a + b; v[p + h] = a - b; }
-    \\  }
-    \\}
-    \\for (uint m = 1; m < 32; m <<= 1) {
-    \\  float sgn = (lane & m) ? -1.0f : 1.0f;
-    \\  for (int p = 0; p < P; ++p) v[p] = fma(sgn, v[p], simd_shuffle_xor(v[p], m));
-    \\}
-    \\for (int p = 0; p < P; ++p) tg[(sg * P + p) * 32 + lane] = v[p];
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const float scale = rsqrt(float(J * 32));
-    \\for (uint p = sg; p < P; p += S) {
-    \\  float w[S];
-    \\  for (int q = 0; q < S; ++q) w[q] = tg[(q * P + p) * 32 + lane];
-    \\  float a0 = w[0] + w[1], a1 = w[0] - w[1], a2 = w[2] + w[3], a3 = w[2] - w[3];
-    \\  w[0] = a0 + a2; w[2] = a0 - a2; w[1] = a1 + a3; w[3] = a1 - a3;
-    \\  for (int q = 0; q < S; ++q) {
-    \\    uint i = (q * P + p) * 32 + lane;
-    \\    float e = w[q] * scale;
-    \\    if (INV) e *= signs[col + i];
-    \\    y[base + i] = static_cast<T>(e);
-    \\  }
-    \\}
-;
+const KERNEL_SOURCE = kernelSource("kernels/quant/hadamard_block.metal");
 
 var kernel_cache: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -156,66 +119,7 @@ fn transformComposed(x: mlx.mlx_array, signs: mlx.mlx_array, block: c_int, inver
 /// `rot = H(signs * normed)`. One 128-thread group per 1024 block; each group
 /// re-reads the whole row for the sum of squares instead of syncing with the
 /// others. Rounds through T exactly where the composed ops would.
-const NORM_ROTATE_SOURCE =
-    \\constexpr int BLK = 1024;
-    \\constexpr int H = NB * BLK;
-    \\threadgroup float tg[BLK];
-    \\threadgroup float red[4];
-    \\uint t = thread_position_in_threadgroup.x;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sgb = t / 32;
-    \\uint blk = threadgroup_position_in_grid.x;
-    \\uint row = threadgroup_position_in_grid.y;
-    \\const device uint4* a4 = (const device uint4*)(a + row * H);
-    \\const device uint4* b4 = (const device uint4*)(b + row * H);
-    \\float own[8];
-    \\float ss = 0.f;
-    \\for (int k = 0; k < NB; ++k) {
-    \\  uint4 av = a4[k * 128 + t];
-    \\  uint4 bv = HAS_ADD ? b4[k * 128 + t] : uint4(0);
-    \\  thread const T* ae = (thread const T*)&av;
-    \\  thread const T* be = (thread const T*)&bv;
-    \\  for (int q = 0; q < 8; ++q) {
-    \\    float e = float(ae[q]);
-    \\    if (HAS_ADD) e = float(static_cast<T>(e + float(be[q])));
-    \\    ss += e * e;
-    \\    if (k == int(blk)) own[q] = e;
-    \\  }
-    \\}
-    \\ss = simd_sum(ss);
-    \\if (lane == 0) red[sgb] = ss;
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\float inv = metal::precise::rsqrt((red[0] + red[1] + red[2] + red[3]) / H + eps);
-    \\uint cb = blk * BLK + 8 * t;
-    \\uint rb = row * H + cb;
-    \\if (HAS_ADD) { T sv[8]; for (int q = 0; q < 8; ++q) sv[q] = static_cast<T>(own[q]); *(device uint4*)(sum + rb) = *(thread uint4*)sv; }
-    \\uint4 wv = *(const device uint4*)(w + cb);
-    \\thread const T* we = (thread const T*)&wv;
-    \\float4 s0 = *(const device float4*)(signs + cb), s1 = *(const device float4*)(signs + cb + 4);
-    \\float sgn8[8] = {s0.x, s0.y, s0.z, s0.w, s1.x, s1.y, s1.z, s1.w};
-    \\float v[8];
-    \\T nv[8];
-    \\for (int q = 0; q < 8; ++q) { nv[q] = we[q] * static_cast<T>(own[q] * inv); v[q] = float(nv[q]) * sgn8[q]; }
-    \\if (WRITE_NORMED) *(device uint4*)(normed + rb) = *(thread uint4*)nv;
-    \\for (int h = 1; h < 8; h <<= 1)
-    \\  for (int q = 0; q < 8; ++q) if ((q & h) == 0) { float x0 = v[q], x1 = v[q + h]; v[q] = x0 + x1; v[q + h] = x0 - x1; }
-    \\for (uint m = 1; m < 32; m <<= 1) {
-    \\  float sgn = (lane & m) ? -1.0f : 1.0f;
-    \\  for (int q = 0; q < 8; ++q) v[q] = fma(sgn, v[q], simd_shuffle_xor(v[q], m));
-    \\}
-    \\for (int q = 0; q < 8; ++q) tg[8 * t + q] = v[q];
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const float scale = 1.0f / 32.0f;
-    \\for (uint base = t; base < 256; base += 128) {
-    \\  float q0 = tg[base], q1 = tg[base + 256], q2 = tg[base + 512], q3 = tg[base + 768];
-    \\  float a0 = q0 + q1, a1 = q0 - q1, a2 = q2 + q3, a3 = q2 - q3;
-    \\  uint ob = row * H + blk * BLK + base;
-    \\  rot[ob] = static_cast<T>((a0 + a2) * scale);
-    \\  rot[ob + 256] = static_cast<T>((a1 + a3) * scale);
-    \\  rot[ob + 512] = static_cast<T>((a0 - a2) * scale);
-    \\  rot[ob + 768] = static_cast<T>((a1 - a3) * scale);
-    \\}
-;
+const NORM_ROTATE_SOURCE = kernelSource("kernels/quant/norm_rotate.metal");
 
 var norm_rotate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 

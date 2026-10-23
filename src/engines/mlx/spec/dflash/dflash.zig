@@ -27,6 +27,7 @@
 //!      truncate back — same math, no copy).
 
 const std = @import("std");
+const kernelSource = @import("../../../../mlx/kernels.zig").source;
 const mlx = @import("../../../../mlx/ffi.zig");
 const log = @import("../../../../host/log.zig");
 const model_mod = @import("../../model.zig");
@@ -1716,18 +1717,7 @@ pub fn groupedDynConv(
 
 // Each tap adds base[tap] * x_{t-tap}, then dyn_t[tap] * x_{t-tap}, every
 // product and sum rounded to T as the op chain's elementwise kernels do.
-const DYN_CONV_SOURCE =
-    \\uint i = thread_position_in_grid.x;
-    \\if (i >= uint(L * H)) return;
-    \\const int t = int(i) / H, c = int(i) % H;
-    \\T acc = T(0);
-    \\for (int tap = 0; tap < KS; ++tap) {
-    \\  const T v = t >= tap ? x[(t - tap) * H + c] : T(0);
-    \\  acc = T(float(acc) + float(T(float(base[tap * H + c]) * float(v))));
-    \\  acc = T(float(acc) + float(T(float(dyn[(t * KS + tap) * (H / GS) + c / GS]) * float(v))));
-    \\}
-    \\y[i] = acc;
-;
+const DYN_CONV_SOURCE = kernelSource("kernels/spec/dflash_dyn_conv.metal");
 var dyn_conv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const DynConvKey = struct { l: c_int, h: c_int, ks: c_int, gs: c_int, dt: mlx.mlx_dtype };
 var dyn_conv_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
@@ -1998,46 +1988,7 @@ pub const Lattice = struct {
 // within a thread's own list; across lanes the lower lane wins, so a tie can
 // pick the higher id (drafts only).
 // 256 threads: M1/M2 cap threadgroups below 1024 for kernels this heavy.
-const TOPK_SOURCE =
-    \\constexpr int NT = 256, NSG = NT / 32;
-    \\const uint row = threadgroup_position_in_grid.y;
-    \\const uint tid = thread_position_in_threadgroup.x;
-    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const device T* x = logits + size_t(row) * V;
-    \\float v[K];
-    \\int id[K];
-    \\for (int j = 0; j < K; ++j) { v[j] = -INFINITY; id[j] = 0; }
-    \\for (int i = int(tid); i < V; i += NT) {
-    \\  float c = float(x[i]);
-    \\  if (!(c > v[K - 1])) continue;
-    \\  int ci = i;
-    \\  for (int j = 0; j < K; ++j) {
-    \\    const bool gt = c > v[j];
-    \\    const float tv = v[j]; const int ti = id[j];
-    \\    v[j] = gt ? c : tv; id[j] = gt ? ci : ti;
-    \\    c = gt ? tv : c; ci = gt ? ti : ci;
-    \\  }
-    \\}
-    \\threadgroup float sv[NSG * K];
-    \\threadgroup int si[NSG * K];
-    \\for (int r = 0; r < K; ++r) {
-    \\  const float best = simd_max(v[0]);
-    \\  const uint win = simd_min(v[0] == best ? lane : 64u);
-    \\  const int bid = simd_shuffle(id[0], ushort(win));
-    \\  if (lane == 0) { sv[sg * K + r] = best; si[sg * K + r] = bid; }
-    \\  if (lane == win) { for (int j = 0; j + 1 < K; ++j) { v[j] = v[j + 1]; id[j] = id[j + 1]; } v[K - 1] = -INFINITY; }
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (sg != 0) return;
-    \\for (int j = 0; j < K; ++j) { v[j] = lane < NSG ? sv[lane * K + j] : -INFINITY; id[j] = lane < NSG ? si[lane * K + j] : 0; }
-    \\for (int r = 0; r < K; ++r) {
-    \\  const float best = simd_max(v[0]);
-    \\  const uint win = simd_min(v[0] == best ? lane : 64u);
-    \\  const int bid = simd_shuffle(id[0], ushort(win));
-    \\  if (lane == 0) { idx[row * K + r] = bid; val[row * K + r] = best; }
-    \\  if (lane == win) { for (int j = 0; j + 1 < K; ++j) { v[j] = v[j + 1]; id[j] = id[j + 1]; } v[K - 1] = -INFINITY; }
-    \\}
-;
+const TOPK_SOURCE = kernelSource("kernels/spec/dflash_topk.metal");
 var topk_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const TopKKey = struct { m: c_int, v: c_int, k: c_int, dt: mlx.mlx_dtype };
 var topk_cfg: ?mlx.mlx_fast_metal_kernel_config = null;

@@ -5,6 +5,7 @@
 //! the value sum stay in f32. Not MLX's summation order: held to no more error than the masked SDPA
 //! against an f64 truth.
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 
 const CH: c_int = 32; // visible keys per warp, a multiple of 8 and of RATIO
@@ -12,169 +13,15 @@ const BD: c_int = 256;
 /// Verify widths the row grid serves (the dense mask arm takes wider blocks).
 pub const MAX_ROWS: c_int = 16;
 
-const HEADER =
-    \\__device__ __forceinline__ float msv_bf_lo(uint32_t w) { return __uint_as_float(w << 16); }
-    \\__device__ __forceinline__ float msv_bf_hi(uint32_t w) { return __uint_as_float(w & 0xffff0000u); }
-    \\__device__ __forceinline__ void msv_unpack8(uint4 r, float* f) {
-    \\  f[0] = msv_bf_lo(r.x); f[1] = msv_bf_hi(r.x); f[2] = msv_bf_lo(r.y); f[3] = msv_bf_hi(r.y);
-    \\  f[4] = msv_bf_lo(r.z); f[5] = msv_bf_hi(r.z); f[6] = msv_bf_lo(r.w); f[7] = msv_bf_hi(r.w);
-    \\}
-    \\// v[i] is this lane's partial dot for key i; each stage keeps half of the keys on the lane and
-    \\// trades the other half with the partner, leaving key lane >> 2 on the lane.
-    \\__device__ __forceinline__ float msv_reduce8(const float* v, int lane) {
-    \\  const bool b4 = (lane & 16) != 0, b3 = (lane & 8) != 0, b2 = (lane & 4) != 0;
-    \\  float w[4];
-    \\  #pragma unroll
-    \\  for (int i = 0; i < 4; ++i) w[i] = (b4 ? v[i + 4] : v[i]) + __shfl_xor_sync(0xffffffffu, b4 ? v[i] : v[i + 4], 16);
-    \\  float x[2];
-    \\  #pragma unroll
-    \\  for (int i = 0; i < 2; ++i) x[i] = (b3 ? w[i + 2] : w[i]) + __shfl_xor_sync(0xffffffffu, b3 ? w[i] : w[i + 2], 8);
-    \\  float y = (b2 ? x[1] : x[0]) + __shfl_xor_sync(0xffffffffu, b2 ? x[0] : x[1], 4);
-    \\  y += __shfl_xor_sync(0xffffffffu, y, 1);
-    \\  return y + __shfl_xor_sync(0xffffffffu, y, 2);
-    \\}
-    \\
-;
+const HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_header.cu");
 
 // Grid (NS splits, Hk, rows): a block of GQA warps, warp w the q head hk * GQA + w. Row r is the
 // cache position kv - rows + r: it sees its own picks that are complete blocks before it, and its
 // own incomplete tail.
-const PARTS_SOURCE =
-    \\const int r = blockIdx.z;
-    \\const int kL = k_shape[2] - ((int)gridDim.z - 1) + r;
-    \\const int split = blockIdx.x;
-    \\const int hk = blockIdx.y;
-    \\const int lane = threadIdx.x & 31;
-    \\const int head = hk * GQA + (threadIdx.x >> 5);
-    \\const int nb = kL / RATIO;
-    \\const int sel_len = min(nb, KB) * RATIO;
-    \\const int tail_start = nb * RATIO;
-    \\const int L = sel_len + (kL - tail_start);
-    \\const int j_lo = split * CH;
-    \\const int j_hi = min(j_lo + CH, L);
-    \\const float scale_log2e = scl[0] * 1.44269504088896340736f;
-    \\const T* Kp = k + (long)hk * k_strides[1];
-    \\const T* Vp = v + (long)hk * v_strides[1];
-    \\const int* rb = blocks + (long)r * blocks_strides[1];
-    \\// A pick that is not a complete block before this row (a later row's block) adds no key: the
-    \\// tail covers its visible tokens.
-    \\int bp[CH / RATIO];
-    \\unsigned bad = 0u;
-    \\#pragma unroll
-    \\for (int i = 0; i < CH / RATIO; ++i) {
-    \\  const int b = j_lo / RATIO + i;
-    \\  const bool sel = b * RATIO < sel_len;
-    \\  const int pick = sel ? rb[b] : 0;
-    \\  bp[i] = (sel && pick < nb) ? pick * RATIO : 0;
-    \\  if (sel && pick >= nb) bad |= ((1u << RATIO) - 1u) << (i * RATIO);
-    \\}
-    \\float qf[8];
-    \\msv_unpack8(*((const uint4*)(q + (long)head * q_strides[1] + (long)r * q_strides[2]) + lane), qf);
-    \\#pragma unroll
-    \\for (int d = 0; d < 8; ++d) qf[d] *= scale_log2e;
-    \\float m = -3.0e38f, l = 0.0f, acc[8];
-    \\#pragma unroll
-    \\for (int d = 0; d < 8; ++d) acc[d] = 0.0f;
-    \\#pragma unroll
-    \\for (int bi = 0; bi < CH / 8; ++bi) {
-    \\  const int jb = j_lo + bi * 8;
-    \\  if (jb < j_hi) {
-    \\    uint4 kr[8], vr[8];
-    \\    #pragma unroll
-    \\    for (int i = 0; i < 8; ++i) {
-    \\      const int jj = bi * 8 + i;
-    \\      const int j = j_lo + jj;
-    \\      const int pos = (j >= j_hi) ? 0 : ((j < sel_len) ? bp[jj / RATIO] + jj % RATIO : tail_start + (j - sel_len));
-    \\      kr[i] = *((const uint4*)(Kp + (long)pos * k_strides[2]) + lane);
-    \\      vr[i] = *((const uint4*)(Vp + (long)pos * v_strides[2]) + lane);
-    \\    }
-    \\    float part[8];
-    \\    #pragma unroll
-    \\    for (int i = 0; i < 8; ++i) {
-    \\      float kf[8];
-    \\      msv_unpack8(kr[i], kf);
-    \\      float a0 = qf[0] * kf[0], a1 = qf[1] * kf[1];
-    \\      a0 = fmaf(qf[2], kf[2], a0); a1 = fmaf(qf[3], kf[3], a1);
-    \\      a0 = fmaf(qf[4], kf[4], a0); a1 = fmaf(qf[5], kf[5], a1);
-    \\      a0 = fmaf(qf[6], kf[6], a0); a1 = fmaf(qf[7], kf[7], a1);
-    \\      part[i] = a0 + a1;
-    \\    }
-    \\    const float total = msv_reduce8(part, lane);
-    \\    const int jk = bi * 8 + (lane >> 2);
-    \\    const float y = (jb + (lane >> 2) < j_hi && !((bad >> jk) & 1u)) ? total : -INFINITY;
-    \\    float bm = fmaxf(y, __shfl_xor_sync(0xffffffffu, y, 4));
-    \\    bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, 8));
-    \\    bm = fmaxf(bm, __shfl_xor_sync(0xffffffffu, bm, 16));
-    \\    const float m_new = fmaxf(m, bm);
-    \\    const float factor = exp2f(m - m_new);
-    \\    const float p = exp2f(y - m_new);
-    \\    float lb = p + __shfl_xor_sync(0xffffffffu, p, 4);
-    \\    lb += __shfl_xor_sync(0xffffffffu, lb, 8);
-    \\    lb += __shfl_xor_sync(0xffffffffu, lb, 16);
-    \\    l = l * factor + lb;
-    \\    m = m_new;
-    \\    #pragma unroll
-    \\    for (int d = 0; d < 8; ++d) acc[d] *= factor;
-    \\    #pragma unroll
-    \\    for (int i = 0; i < 8; ++i) {
-    \\      float vf[8];
-    \\      msv_unpack8(vr[i], vf);
-    \\      const float pi = __shfl_sync(0xffffffffu, p, 4 * i);
-    \\      #pragma unroll
-    \\      for (int d = 0; d < 8; ++d) acc[d] = fmaf(pi, vf[d], acc[d]);
-    \\    }
-    \\  }
-    \\}
-    \\const long row = ((long)r * gridDim.y * GQA + head) * NS + split;
-    \\float* pa = pacc + row * 256 + lane * 8;
-    \\*((float4*)pa) = make_float4(acc[0], acc[1], acc[2], acc[3]);
-    \\*((float4*)(pa + 4)) = make_float4(acc[4], acc[5], acc[6], acc[7]);
-    \\if (lane == 0) {
-    \\  pml[row * 2] = m;
-    \\  pml[row * 2 + 1] = l;
-    \\}
-;
+const PARTS_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_parts.cu");
 
 // Block per (head, row), thread per dim. An empty split writes l = 0, the skip flag.
-const MERGE_SOURCE =
-    \\const int head = blockIdx.x;
-    \\const int r = blockIdx.y;
-    \\const long hrow = (long)r * gridDim.x + head;
-    \\const int d = threadIdx.x;
-    \\const int lane = threadIdx.x & 31;
-    \\__shared__ float wts[NS];
-    \\__shared__ float zsum[1];
-    \\if ((threadIdx.x >> 5) == 0) {
-    \\  constexpr int SLOTS = (NS + 31) / 32;
-    \\  float ms[SLOTS], ls[SLOTS];
-    \\  float M = -3.0e38f;
-    \\  #pragma unroll
-    \\  for (int s = 0; s < SLOTS; ++s) {
-    \\    const int j = lane + s * 32;
-    \\    const long pr = hrow * NS + j;
-    \\    ms[s] = (j < NS) ? pml[pr * 2] : -3.0e38f;
-    \\    ls[s] = (j < NS) ? pml[pr * 2 + 1] : 0.0f;
-    \\    if (ls[s] > 0.0f) M = fmaxf(M, ms[s]);
-    \\  }
-    \\  for (int o = 16; o > 0; o >>= 1) M = fmaxf(M, __shfl_xor_sync(0xffffffffu, M, o));
-    \\  float Z = 0.0f;
-    \\  #pragma unroll
-    \\  for (int s = 0; s < SLOTS; ++s) {
-    \\    const int j = lane + s * 32;
-    \\    const float w = (ls[s] > 0.0f) ? exp2f(ms[s] - M) : 0.0f;
-    \\    if (j < NS) wts[j] = w;
-    \\    Z += w * ls[s];
-    \\  }
-    \\  for (int o = 16; o > 0; o >>= 1) Z += __shfl_xor_sync(0xffffffffu, Z, o);
-    \\  if (lane == 0) zsum[0] = Z;
-    \\}
-    \\__syncthreads();
-    \\const float* pa = pacc + hrow * NS * 256 + d;
-    \\float a[4] = {0.0f, 0.0f, 0.0f, 0.0f};
-    \\#pragma unroll
-    \\for (int j = 0; j < NS; ++j) a[j & 3] = fmaf(wts[j], pa[(long)j * 256], a[j & 3]);
-    \\out[((long)head * gridDim.y + r) * 256 + d] = static_cast<T>(((a[0] + a[1]) + (a[2] + a[3])) / zsum[0]);
-;
+const MERGE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_merge.cu");
 
 var parts_kernel: ?mlx.mlx_fast_cuda_kernel = null;
 var merge_kernel: ?mlx.mlx_fast_cuda_kernel = null;

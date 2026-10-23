@@ -2,6 +2,7 @@
 //! Owns RouterMode, ROUTER_MAX_EXPERTS, moeRouterSource, ROUTER_SOURCES, ROUTER_NAMES, router_kernels, and 13 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
@@ -65,69 +66,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
     const sigmoid = mode == .sigmoid_bias or mode == .sigmoid_bias_grouped or logit_sel;
     const grouped = mode == .sigmoid_bias_grouped;
     const gate = mode == .softmax_gate;
-    return std.fmt.comptimePrint(
-        \\uint row = thread_position_in_grid.y;
-        \\uint tid = thread_position_in_threadgroup.x;
-        \\uint lane = thread_index_in_simdgroup;
-        \\
-        \\threadgroup float rk[NE];
-        \\{s}
-        \\threadgroup uint sel[NK];
-        \\{s}
-        \\size_t rbase = (size_t)row * (size_t)NE;
-        \\for (uint e = tid; e < NE; e += TG) {{
-        \\{s}
-        \\}}
-        \\threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\{s}
-        \\// Selection runs on simdgroup 0 only: K rounds of "max, then mask".
-        \\// simd_min over the candidate indices makes the tie-break the LOWEST
-        \\// expert id, so the pick is a pure function of the keys.
-        \\if (tid < 32) {{
-        \\{s}
-        \\{s}
-        \\  // The lane's strided slice of the keys lives in registers for the K rounds: a round is
-        \\  // a register max, two simd reductions and a register mask, no threadgroup traffic.
-        \\  constexpr uint EPL = (NE + 31) / 32;
-        \\  float mine[EPL];
-        \\  for (uint i = 0; i < EPL; ++i) {{
-        \\    uint e = lane + 32 * i;
-        \\    mine[i] = (e < NE) ? rk[e] : -INFINITY;
-        \\  }}
-        \\  for (uint r = 0; r < NK; ++r) {{
-        \\    float best = -INFINITY;
-        \\    uint bslot = 0xFFFFFFFFu;
-        \\    for (uint i = 0; i < EPL; ++i) {{
-        \\      if (mine[i] > best) {{ best = mine[i]; bslot = i; }}
-        \\    }}
-        \\    float gmax = simd_max(best);
-        \\    uint cand = (best == gmax) ? lane + 32 * bslot : 0xFFFFFFFFu;
-        \\    uint gidx = metal::min(simd_min(cand), uint(NE - 1));
-        \\    if (gidx % 32 == lane) mine[gidx / 32] = -INFINITY;
-        \\    if (lane == 0) sel[r] = gidx;
-        \\  }}
-        \\  simdgroup_barrier(mem_flags::mem_threadgroup);
-        \\
-        \\  float w = 0.0f;
-        \\  uint myidx = 0;
-        \\  if (lane < NK) {{
-        \\    myidx = sel[lane];
-        \\{s}
-        \\  }}
-        \\  // MLX's `row_reduce_small` owns an 8-wide row in ONE thread and
-        \\  // folds it in ASCENDING order in the reduce's accumulator type —
-        \\  // which for a bf16 input is bf16, rounding after every add. A simd
-        \\  // butterfly over the same values is a different number.
-        \\  float tot = 0.0f;
-        \\{s}
-        \\{s}
-        \\  if (lane < NK) {{
-        \\    inds[(size_t)row * (size_t)NK + lane] = myidx;
-        \\    scores[(size_t)row * (size_t)NK + lane] = TOUT(w);
-        \\  }}
-        \\}}
-        \\{s}
-    , .{
+    return std.fmt.comptimePrint(kernelSource("kernels/moe/router.fmt.metal"), .{
         if (grouped)
             "threadgroup float rw[NE];\nthreadgroup float gs[NG];"
         else if (sigmoid)
@@ -135,7 +74,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
         else
             "",
         if (gate)
-            \\threadgroup float gp[TG / 32];
+            "threadgroup float gp[TG / 32];"
         else
             "",
         if (sigmoid)
@@ -151,22 +90,13 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             // below spells `fast::exp` for the mirror-image reason (softmax.h
             // asks for fast explicitly). Costs ~1% of the kernel at an 8192-row
             // prefill width and nothing measurable at decode.
-            \\  float l = float(logits[rbase + e]);
-            \\  float sy = 1.0f / (1.0f + metal::precise::exp(metal::abs(l)));
-            \\  float sg = (l < 0.0f) ? sy : (1.0f - sy);
-            ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
+            kernelSource("kernels/moe/router_sigmoid_score.metal") ++ "\n  // kolibri1 selects on the raw logit + bias; the others on sigmoid + bias.\n  rk[e] = " ++ (if (logit_sel) "l" else "sg") ++ " + float(bias[e]);\n  rw[e] = sg;"
         else
-            \\  rk[e] = float(logits[rbase + e]);
-        ,
+            "  rk[e] = float(logits[rbase + e]);",
         if (gate)
             // Simdgroups 1.. take the shared-expert gate's dot while simdgroup 0 selects; their partials
             // meet after the selection, so the dot never waits on it nor the selection on the dot.
-            \\if (tid >= 32) {
-            \\  float ga = 0.0f;
-            \\  for (uint k = tid - 32; k < uint(GK); k += TG - 32) ga += float(gx[(size_t)row * (size_t)GK + k]) * float(gw[k]);
-            \\  ga = simd_sum(ga);
-            \\  if (lane == 0) gp[tid / 32] = ga;
-            \\}
+            kernelSource("kernels/moe/router_gate_dot.metal")
         else
             "",
         if (grouped)
@@ -179,34 +109,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             // non-finite sentinel in a tensor that feeds selection is how the
             // composed causal-mask arm once shipped an all-NaN path that scored a
             // perfect parity max_err of 0.
-            \\  for (uint g = lane; g < NG; g += 32) {
-            \\    float m1 = -INFINITY, m2 = -INFINITY;
-            \\    for (uint j = 0; j < GSZ; ++j) {
-            \\      float v = rk[g * GSZ + j];
-            \\      if (v > m1) { m2 = m1; m1 = v; } else if (v > m2) { m2 = v; }
-            \\    }
-            \\    gs[g] = m1 + m2;
-            \\  }
-            \\  simdgroup_barrier(mem_flags::mem_threadgroup);
-            \\  uint keep_mask = 0u;
-            \\  for (uint r = 0; r < TOPKG; ++r) {
-            \\    float best = -INFINITY;
-            \\    uint bidx = 0xFFFFFFFFu;
-            \\    for (uint g = lane; g < NG; g += 32) {
-            \\      float v = gs[g];
-            \\      if (v > best) { best = v; bidx = g; }
-            \\    }
-            \\    float gmax = simd_max(best);
-            \\    uint cand = (best == gmax) ? bidx : 0xFFFFFFFFu;
-            \\    uint gidx = metal::min(simd_min(cand), uint(NG - 1));
-            \\    keep_mask |= (1u << gidx);
-            \\    if (lane == 0) gs[gidx] = -INFINITY;
-            \\    simdgroup_barrier(mem_flags::mem_threadgroup);
-            \\  }
-            \\  for (uint e = lane; e < NE; e += 32) {
-            \\    if ((keep_mask & (1u << (e / GSZ))) == 0u) rk[e] = -1.0e4f;
-            \\  }
-            \\  simdgroup_barrier(mem_flags::mem_threadgroup);
+            kernelSource("kernels/moe/router_group_limit.metal")
         else
             "",
         if (sigmoid)
@@ -220,66 +123,27 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
             // reproduces the identical butterfly on identical values, which is
             // what makes the rounded bf16 probability bit-equal; a plain
             // strided sum over the same data was 1 ulp off on real inputs.
-            \\  constexpr int VT = (NE + 3) / 4;
-            \\  constexpr int SIMDS = (VT + 31) / 32;
-            \\  float lane_max = -INFINITY;
-            \\  for (int g = 0; g < SIMDS; ++g) {
-            \\    int vt = g * 32 + int(lane);
-            \\    float m = -INFINITY;
-            \\    for (int i = 0; i < 4; ++i) {
-            \\      int e = vt * 4 + i;
-            \\      if (e < NE) m = metal::max(m, rk[e]);
-            \\    }
-            \\    float mg = simd_max(m);
-            \\    if (int(lane) == g) lane_max = mg;
-            \\  }
-            \\  float smax = simd_max(lane_max);
-            \\  float lane_sum = 0.0f;
-            \\  for (int g = 0; g < SIMDS; ++g) {
-            \\    int vt = g * 32 + int(lane);
-            \\    float acc = 0.0f;
-            \\    for (int i = 0; i < 4; ++i) {
-            \\      int e = vt * 4 + i;
-            \\      acc += (e < NE) ? fast::exp(rk[e] - smax) : 0.0f;
-            \\    }
-            \\    float pg = simd_sum(acc);
-            \\    if (int(lane) == g) lane_sum = pg;
-            \\  }
-            \\  float snorm = 1.0f / simd_sum(lane_sum);
-        ,
+            kernelSource("kernels/moe/router_softmax_sum.metal"),
         if (sigmoid)
-            \\    w = rw[myidx];
+            "    w = rw[myidx];"
         else
             // softmax(...) writes probabilities in the OUTPUT dtype, so the
             // per-expert rounding happens here, before the top-K sum.
-            \\    w = float(TOUT(fast::exp(float(logits[rbase + myidx]) - smax) * snorm));
-        ,
+            "    w = float(TOUT(fast::exp(float(logits[rbase + myidx]) - smax) * snorm));",
         if (sigmoid)
             // The hy3 chain sums FLOAT32 sigmoid scores, so the accumulator is
             // float — but still ascending, still sequential.
-            \\  for (int j = 0; j < NK; ++j) tot += simd_shuffle(w, ushort(j));
+            "  for (int j = 0; j < NK; ++j) tot += simd_shuffle(w, ushort(j));"
         else
-            \\  for (int j = 0; j < NK; ++j) tot = float(TOUT(simd_shuffle(w, ushort(j)) + tot));
-        ,
+            "  for (int j = 0; j < NK; ++j) tot = float(TOUT(simd_shuffle(w, ushort(j)) + tot));",
         if (sigmoid)
-            \\  if (NORM != 0 && NK > 1) {
-            \\    w = w / (tot + 1e-20f);
-            \\  }
-            \\  // `scale` is a 0-dim array, which MLX binds as `const constant
-            \\  // float&` — a reference, not a subscriptable pointer.
-            \\  w = w * scale;
+            kernelSource("kernels/moe/router_sigmoid_norm.metal")
         else
             // `sum` over the K probabilities lands back in the output dtype
             // before the divide, exactly as mlx_sum_axis + mlx_divide do.
-            \\  w = w / float(TOUT(tot));
-        ,
+            "  w = w / float(TOUT(tot));",
         if (gate)
-            \\threadgroup_barrier(mem_flags::mem_threadgroup);
-            \\if (tid == 0) {
-            \\  float gt = 0.0f;
-            \\  for (uint g = 1; g < TG / 32; ++g) gt += gp[g];
-            \\  glogit[row] = TOUT(gt);
-            \\}
+            kernelSource("kernels/moe/router_gate_store.metal")
         else
             "",
     });

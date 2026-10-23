@@ -8,6 +8,7 @@
 //! q.k. Every row then adds the trained `to_gate_compress` branch: softmax over all pooled tile
 //! scores times the pooled values, scaled per row by the gate projection.
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const h3_glue = @import("glue.zig");
@@ -367,39 +368,11 @@ pub fn attend(p: *const Plan, q: A, k: A, v: A, gate: A, scale: f32, s: S) !A {
 }
 
 /// Per-tile f32 mean of tiled x [1, H, n_tiles * TILE, 128] over its valid rows: [H, n_tiles, 128].
-const POOL_SOURCE =
-    \\const uint d = thread_position_in_grid.x;
-    \\const uint t = thread_position_in_grid.y;
-    \\const uint h = thread_position_in_grid.z;
-    \\const int n_tiles = meta[3];
-    \\const int n = vbs[t];
-    \\const device T* src = x + (size_t(h) * n_tiles + t) * TILE * 128 + d;
-    \\float acc = 0.0f;
-    \\for (int j = 0; j < n; j++) acc += float(src[size_t(j) * 128]);
-    \\out[(size_t(h) * n_tiles + t) * 128 + d] = acc / float(n);
-;
+const POOL_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa_pool.metal");
 
 /// Each row's output, token-major [S, H*128]: its dense or video attention row plus the gate term
 /// rounded to T first, as the op chain rounds it (`out + T(comp * gate)`).
-const ASSEMBLE_SOURCE =
-    \\const uint c = thread_position_in_grid.x * 4;
-    \\const uint r = thread_position_in_grid.y;
-    \\const int n_dense = shape[0];
-    \\const int n_tiles = shape[1];
-    \\const int n_video_rows = shape[2];
-    \\const int hd = shape[3];
-    \\const uint h = c / 128;
-    \\const uint dd = c % 128;
-    \\const int src = out_src[r];
-    \\const device T* a = src < n_dense ? dense + (size_t(h) * n_dense + src) * 128 + dd
-    \\    : video + (size_t(h) * n_video_rows + (src - n_dense)) * 128 + dd;
-    \\const device float* m = comp + (size_t(h) * n_tiles + row_tile[r]) * 128 + dd;
-    \\const device T* g = gate + size_t(r) * hd + c;
-    \\for (int i = 0; i < 4; i++) {
-    \\    const T gv = static_cast<T>(m[i] * float(g[i]));
-    \\    out[size_t(r) * hd + c + i] = static_cast<T>(float(a[i]) + float(gv));
-    \\}
-;
+const ASSEMBLE_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa_assemble.metal");
 
 var pool_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var assemble_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -480,128 +453,10 @@ fn gatherAttend(sc: *Scope, p: *const Plan, tiled: [3]A, sel: A, scale: f32) !A 
 // staged in threadgroup memory and consumed with 8x8 simdgroup MMAs and an f32 online softmax.
 // Only a ragged key tile's valid rows are scored; rows past a query tile's valid count are never
 // written (no reader looks at them).
-const KERNEL_SOURCE =
-    \\constexpr int D = 128;
-    \\constexpr int NSG = 4;
-    \\constexpr int NT = NSG * 32;
-    \\constexpr int BK = 16;
-    \\constexpr int NKB = BK / 8;
-    \\constexpr int LD = D + 8;
-    \\constexpr float NEG = -3.0e38f;
-    \\threadgroup T ksm[BK * LD];
-    \\threadgroup T vsm[BK * LD];
-    \\const uint tid = thread_position_in_threadgroup.x;
-    \\const uint sid = simdgroup_index_in_threadgroup;
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int qsub = int(threadgroup_position_in_grid.x);
-    \\const int q_tile = int(threadgroup_position_in_grid.y);
-    \\const int head = int(threadgroup_position_in_grid.z);
-    \\const int n_prefix = meta[0];
-    \\const int n_video = meta[1];
-    \\const int k_sel = meta[2];
-    \\const int n_tiles = meta[3];
-    \\const float scale_log2 = scale * 1.44269504088896341f;
-    \\const int qt = n_prefix + q_tile;
-    \\const int q_valid = vbs[qt];
-    \\const int row_base = qsub * NSG * 8;
-    \\if (row_base >= q_valid) return;
-    \\const long plane = long(head) * n_tiles * TILE;
-    \\const int srow0 = row_base + int(sid) * 8;
-    \\const int fm = int(((lane / 4) & 4) + ((lane / 2) % 4));
-    \\const int fn = int(((lane / 4) & 2) * 2 + (lane % 2) * 2);
-    \\simdgroup_matrix<T, 8, 8> qf[16];
-    \\simdgroup_matrix<float, 8, 8> acc[16];
-    \\const device T* qp = q + (plane + long(qt) * TILE + srow0) * D;
-    \\for (int kk = 0; kk < 16; kk++) {
-    \\    simdgroup_load(qf[kk], qp + kk * 8, D);
-    \\    acc[kk] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\}
-    \\float row_m = NEG;
-    \\float row_l = 0.0f;
-    \\const device int* picks = sel + (long(head) * n_video + q_tile) * k_sel;
-    \\for (int s = 0; s < k_sel; s++) {
-    \\    const int kt = picks[s];
-    \\    const int k_valid = vbs[kt];
-    \\    const long kv0 = plane + long(kt) * TILE;
-    \\    for (int j0 = 0; j0 < k_valid; j0 += BK) {
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        for (int i = int(tid); i < BK * (D / 4); i += NT) {
-    \\            const int r = i / (D / 4);
-    \\            const int c4 = i - r * (D / 4);
-    \\            const long src = (kv0 + j0 + r) * D + c4 * 4;
-    \\            *(threadgroup vec<T, 4>*)(ksm + r * LD + c4 * 4) = *(const device vec<T, 4>*)(k + src);
-    \\            *(threadgroup vec<T, 4>*)(vsm + r * LD + c4 * 4) = *(const device vec<T, 4>*)(v + src);
-    \\        }
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        simdgroup_matrix<float, 8, 8> sf[NKB];
-    \\        for (int c = 0; c < NKB; c++) sf[c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\        for (int kk = 0; kk < 16; kk++) {
-    \\            for (int c = 0; c < NKB; c++) {
-    \\                simdgroup_matrix<T, 8, 8> km;
-    \\                simdgroup_load(km, (const threadgroup T*)(ksm + c * 8 * LD + kk * 8), LD, ulong2(0, 0), true);
-    \\                simdgroup_multiply_accumulate(sf[c], qf[kk], km, sf[c]);
-    \\            }
-    \\        }
-    \\        simdgroup_matrix<T, 8, 8> pf[NKB];
-    \\        float cmax = NEG;
-    \\        for (int c = 0; c < NKB; c++) {
-    \\            for (int e = 0; e < 2; e++) {
-    \\                const int col = j0 + c * 8 + fn + e;
-    \\                const float sv = col < k_valid ? sf[c].thread_elements()[e] * scale_log2 : NEG;
-    \\                sf[c].thread_elements()[e] = sv;
-    \\                cmax = metal::max(cmax, sv);
-    \\            }
-    \\        }
-    \\        cmax = metal::max(cmax, simd_shuffle_xor(cmax, ushort(1)));
-    \\        cmax = metal::max(cmax, simd_shuffle_xor(cmax, ushort(8)));
-    \\        const float m_new = metal::max(row_m, cmax);
-    \\        const float alpha = metal::fast::exp2(row_m - m_new);
-    \\        row_m = m_new;
-    \\        row_l *= alpha;
-    \\        for (int c = 0; c < NKB; c++) {
-    \\            for (int e = 0; e < 2; e++) {
-    \\                const float pv = metal::fast::exp2(sf[c].thread_elements()[e] - m_new);
-    \\                row_l += pv;
-    \\                pf[c].thread_elements()[e] = static_cast<T>(pv);
-    \\            }
-    \\        }
-    \\        for (int kk = 0; kk < 16; kk++) {
-    \\            acc[kk].thread_elements()[0] *= alpha;
-    \\            acc[kk].thread_elements()[1] *= alpha;
-    \\        }
-    \\        for (int kk = 0; kk < 16; kk++) {
-    \\            for (int c = 0; c < NKB; c++) {
-    \\                simdgroup_matrix<T, 8, 8> vm;
-    \\                simdgroup_load(vm, (const threadgroup T*)(vsm + c * 8 * LD + kk * 8), LD);
-    \\                simdgroup_multiply_accumulate(acc[kk], pf[c], vm, acc[kk]);
-    \\            }
-    \\        }
-    \\    }
-    \\}
-    \\float l = row_l;
-    \\l += simd_shuffle_xor(l, ushort(1));
-    \\l += simd_shuffle_xor(l, ushort(8));
-    \\const float inv = l > 0.0f ? 1.0f / l : 0.0f;
-    \\const int orow = srow0 + fm;
-    \\if (orow < q_valid) {
-    \\    device T* op = out + ((long(head) * n_video + q_tile) * TILE + orow) * D + fn;
-    \\    for (int kk = 0; kk < 16; kk++) {
-    \\        op[kk * 8] = static_cast<T>(acc[kk].thread_elements()[0] * inv);
-    \\        op[kk * 8 + 1] = static_cast<T>(acc[kk].thread_elements()[1] * inv);
-    \\    }
-    \\}
-;
-const KERNEL_HEADER =
-    \\#include <metal_stdlib>
-    \\#include <metal_simdgroup>
-    \\#include <metal_simdgroup_matrix>
-    \\using namespace metal;
-;
+const KERNEL_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa.metal");
+const KERNEL_HEADER = kernelSource("plugins/minimax_h3/kernels/vsa_header.metal");
 
-const NAX_SOURCE =
-    \\omlx_nax::h3_vsa_nax<T, 4, TILE>(q, k, v, out, sel, vbs, meta, scale,
-    \\    simdgroup_index_in_threadgroup, thread_index_in_simdgroup, threadgroup_position_in_grid);
-;
+const NAX_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa_nax_entry.metal");
 
 /// One compiled kernel and its launch config, cached per shape.
 const Launch = struct {
@@ -621,7 +476,7 @@ fn kernelAttend(sc: *Scope, p: *const Plan, tiled: [3]A, sel: A, scale: f32) !A 
     const l = &launches[@intFromBool(is_nax)];
     const ins = [_][*:0]const u8{ "q", "k", "v", "sel", "vbs", "meta", "scale" };
     if (l.handle == null) l.handle = if (is_nax)
-        try h3_glue.makeKernel("msv_h3_vsa_nax", &ins, &.{"out"}, NAX_SOURCE, @embedFile("../../kernels/attention/nax_tiles.metal") ++ @embedFile("../../kernels/attention/nax_attention.metal") ++ @embedFile("kernels/vsa_nax.metal"))
+        try h3_glue.makeKernel("msv_h3_vsa_nax", &ins, &.{"out"}, NAX_SOURCE, kernelSource("kernels/attention/nax_tiles.metal") ++ kernelSource("kernels/attention/nax_attention.metal") ++ kernelSource("plugins/minimax_h3/kernels/vsa_nax.metal"))
     else
         try h3_glue.makeKernel("msv_h3_vsa", &ins, &.{"out"}, KERNEL_SOURCE, KERNEL_HEADER);
     if (l.key == null or l.key.?.h != sh[1] or l.key.?.nv != nv or l.key.?.dt != dt) {

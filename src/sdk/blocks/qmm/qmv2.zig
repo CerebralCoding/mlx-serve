@@ -7,58 +7,14 @@
 //! picks its geometry per GPU generation. Decoding once for every row follows
 //! @sudoingX's CUDA small-batch PTQ1_0 kernels (PrismML-Eng/llama.cpp#218).
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
 /// Codes (j, j+8) of `u` as exact half2 integers, minus `o`.
-const DECODE =
-    \\inline void h2dec(uint u, thread half2* q, half o) {
-    \\  uint u6 = u >> 6;
-    \\  q[0] = as_type<half2>((u  & 0x00030003u) | 0x64006400u) - half2(1024.0h + o);
-    \\  q[1] = as_type<half2>((u  & 0x000C000Cu) | 0x5C005C00u) - half2(256.0h + o);
-    \\  q[2] = as_type<half2>((u  & 0x00300030u) | 0x54005400u) - half2(64.0h + o);
-    \\  q[3] = as_type<half2>((u  & 0x00C000C0u) | 0x4C004C00u) - half2(16.0h + o);
-    \\  q[4] = as_type<half2>((u  & 0x03000300u) | 0x44004400u) - half2(4.0h + o);
-    \\  q[5] = as_type<half2>((u6 & 0x00300030u) | 0x54005400u) - half2(64.0h + o);
-    \\  q[6] = as_type<half2>((u6 & 0x00C000C0u) | 0x4C004C00u) - half2(16.0h + o);
-    \\  q[7] = as_type<half2>((u6 & 0x03000300u) | 0x44004400u) - half2(4.0h + o);
-    \\}
-    \\inline float f2dot(thread const half2* q, thread const float2* xf) {
-    \\  float2 acc = float2(0);
-    \\  for (int j = 0; j < 8; ++j) acc = fma(float2(q[j]), xf[j], acc);
-    \\  return acc.x + acc.y;
-    \\}
-;
+const DECODE = kernelSource("kernels/qmm/qmv2_decode.metal");
 
-const SOURCE =
-    \\const int K = x_shape[x_ndim - 1];
-    \\const int KW = K / 16, KG = K / 128;
-    \\uint lane = thread_index_in_simdgroup;
-    \\int row0 = (threadgroup_position_in_grid.y * 2 + simdgroup_index_in_threadgroup) * 4;
-    \\const device T* xp = x + lane * 16;
-    \\const device uint* wq = w + row0 * KW + lane;
-    \\const device T* sp = scales + row0 * KG + lane / 8;
-    \\const device T* bp = biases + row0 * KG + lane / 8;
-    \\float res[4] = {0.f, 0.f, 0.f, 0.f};
-    \\for (int k = 0; k < K; k += 512) {
-    \\  float2 xf[8];
-    \\  float sm = 0.f;
-    \\  for (int i = 0; i < 8; ++i) {
-    \\    xf[i] = float2(float(xp[i]), float(xp[i + 8]));
-    \\    sm += xf[i].x + xf[i].y;
-    \\  }
-    \\  for (int r = 0; r < 4; ++r) {
-    \\    half2 q[8];
-    \\    h2dec(wq[r * KW], q, 0.0h);
-    \\    res[r] += float(sp[r * KG]) * f2dot(q, xf) + float(bp[r * KG]) * sm;
-    \\  }
-    \\  wq += 32; sp += 4; bp += 4; xp += 512;
-    \\}
-    \\for (int r = 0; r < 4; ++r) {
-    \\  float v = simd_sum(res[r]);
-    \\  if (lane == 0) y[row0 + r] = static_cast<T>(v);
-    \\}
-;
+const SOURCE = kernelSource("kernels/qmm/qmv2.metal");
 
 var kernel_cache: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -150,40 +106,7 @@ fn launch(k: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, x: mlx.ml
 /// decode ONCE and serve every row; R weight rows per simdgroup, G simdgroups
 /// per threadgroup. Codes stay half2 and x its own width (half2 for f16, float2
 /// for bf16), widened at the FMA, so the math is f32 FMAs over exact inputs.
-const ROWS_SOURCE =
-    \\using XV = metal::conditional_t<metal::is_same_v<T, half>, half2, float2>;
-    \\const int K = x_shape[x_ndim - 1];
-    \\const int N = w_shape[0];
-    \\const int KW = K / 16, KG = K / 128;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint sgi = simdgroup_index_in_threadgroup;
-    \\int grow = (threadgroup_position_in_grid.y * G + sgi) * R;
-    \\const device uint* wq = w + grow * KW + lane;
-    \\const device T* sp = scales + grow * KG + lane / 8;
-    \\float res[R][M];
-    \\for (int r = 0; r < R; ++r) for (int m = 0; m < M; ++m) res[r][m] = 0;
-    \\for (int k = 0; k < K; k += 512) {
-    \\  uint wv[R]; float sc[R];
-    \\  for (int r = 0; r < R; ++r) { wv[r] = wq[r * KW]; sc[r] = float(sp[r * KG]); }
-    \\  half2 q[R][8];
-    \\  for (int r = 0; r < R; ++r) h2dec(wv[r], q[r], 1.0h);
-    \\  for (int m = 0; m < M; ++m) {
-    \\    const device T* xr = x + m * K + k + lane * 16;
-    \\    XV xh[8];
-    \\    for (int j = 0; j < 8; ++j) xh[j] = XV(xr[j], xr[j + 8]);
-    \\    for (int r = 0; r < R; ++r) {
-    \\      float2 acc = float2(q[r][0]) * float2(xh[0]);
-    \\      for (int j = 1; j < 8; ++j) acc = fma(float2(q[r][j]), float2(xh[j]), acc);
-    \\      res[r][m] += sc[r] * (acc.x + acc.y);
-    \\    }
-    \\  }
-    \\  wq += 32; sp += 4;
-    \\}
-    \\for (int r = 0; r < R; ++r) for (int m = 0; m < M; ++m) {
-    \\  float v = simd_sum(res[r][m]);
-    \\  if (lane == 0) y[m * N + grow + r] = static_cast<T>(v);
-    \\}
-;
+const ROWS_SOURCE = kernelSource("kernels/qmm/qmv2_rows.metal");
 
 pub const MAX_ROWS = 8;
 
@@ -325,57 +248,7 @@ pub fn qmvRowsAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
 /// every fragment multiplies all rows, so 8 rows cost what 1 does. Partials
 /// per 128-group are scaled in f32. RB 8-row weight blocks per simdgroup,
 /// SGS simdgroups, K split SPLIT ways (f32 partials summed by the caller).
-const MMA_SOURCE =
-    \\using BT = metal::conditional_t<metal::is_same_v<T, half>, half, float>;
-    \\constexpr uint CH = 32, TK = 128, KW = K / 16, G = K / 128, KS = K / SPLIT;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint qid = lane / 4;
-    \\uint fm = (qid & 4) + ((lane / 2) % 4);
-    \\uint fn = (qid & 2) * 2 + (lane % 2) * 2;
-    \\uint row_base = (threadgroup_position_in_grid.x * SGS + simdgroup_index_in_threadgroup) * 8 * RB;
-    \\simdgroup_float8x8 acc[RB][NB];
-    \\for (uint b = 0; b < RB; ++b) for (uint c = 0; c < NB; ++c) acc[b][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\uint kl = (fn / 2) * CH;
-    \\uint kb = (fm / 2) * CH + (fm % 2) * 8;
-    \\uint split = threadgroup_position_in_grid.y;
-    \\for (uint k0 = split * KS; k0 < (split + 1) * KS; k0 += TK) {
-    \\  uint2 words[RB];
-    \\  for (uint b = 0; b < RB; ++b) words[b] = *(const device uint2*)(w + (row_base + b * 8 + fm) * KW + (k0 + kl) / 16);
-    \\  simdgroup_float8x8 part[RB][NB];
-    \\  for (uint b = 0; b < RB; ++b) for (uint c = 0; c < NB; ++c) part[b][c] = make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\  for (uint j = 0; j < CH / 2; ++j) {
-    \\    uint k = k0 + kb + (j % 8) + 16 * (j / 8);
-    \\    simdgroup_matrix<BT, 8, 8> bx[NB];
-    \\    for (uint c = 0; c < NB; ++c) {
-    \\      bx[c].thread_elements()[0] = BT(x[min(fn + 8 * c, uint(M) - 1) * K + k]);
-    \\      bx[c].thread_elements()[1] = BT(x[min(fn + 8 * c + 1, uint(M) - 1) * K + k]);
-    \\    }
-    \\    for (uint b = 0; b < RB; ++b) {
-    \\      uint u = ((j < 8 ? words[b].x : words[b].y) >> (2 * (j % 8))) & 0x00030003u;
-    \\      half2 q = as_type<half2>(u | 0x64006400u) - half2(1025.0h);
-    \\      simdgroup_half8x8 a;
-    \\      a.thread_elements()[0] = q.x;
-    \\      a.thread_elements()[1] = q.y;
-    \\      for (uint c = 0; c < NB; ++c) simdgroup_multiply_accumulate(part[b][c], a, bx[c], part[b][c]);
-    \\    }
-    \\  }
-    \\  for (uint b = 0; b < RB; ++b) {
-    \\    float sc = float(scales[(row_base + b * 8 + fm) * G + k0 / 128]);
-    \\    for (uint c = 0; c < NB; ++c) {
-    \\      acc[b][c].thread_elements()[0] += sc * part[b][c].thread_elements()[0];
-    \\      acc[b][c].thread_elements()[1] += sc * part[b][c].thread_elements()[1];
-    \\    }
-    \\  }
-    \\}
-    \\for (uint b = 0; b < RB; ++b) {
-    \\  uint row = row_base + b * 8 + fm;
-    \\  for (uint c = 0; c < NB; ++c) {
-    \\    uint m0 = fn + 8 * c;
-    \\    if (m0 < uint(M)) y[(split * M + m0) * N + row] = static_cast<OT>(acc[b][c].thread_elements()[0]);
-    \\    if (m0 + 1 < uint(M)) y[(split * M + m0 + 1) * N + row] = static_cast<OT>(acc[b][c].thread_elements()[1]);
-    \\  }
-    \\}
-;
+const MMA_SOURCE = kernelSource("kernels/qmm/qmv2_mma.metal");
 
 pub const MMA_MAX_ROWS = 16;
 /// 8-row weight blocks per simdgroup (rb), simdgroups (sgs), K splits (split).

@@ -3,28 +3,13 @@
 //! launches per attention layer; the mask is just "this token's block is in the sorted selection, or
 //! the token is in the incomplete tail" (every key of a one-row step is causal-visible).
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 
 // grid (kv), one thread a token. `blocks` is sorted ascending with INT_MAX sentinels, so a binary
 // search finds a token's block; a sentinel never equals a block id.
-const SOURCE =
-    \\const uint t = thread_position_in_grid.x;
-    \\const int kv = int(threads_per_grid.x);
-    \\const int blk = int(t) / RATIO;
-    \\bool visible = int(t) >= (kv / RATIO) * RATIO;
-    \\if (!visible) {
-    \\  int lo = 0;
-    \\  int hi = KB - 1;
-    \\  while (lo <= hi) {
-    \\    const int mid = (lo + hi) >> 1;
-    \\    const int v = blocks[mid];
-    \\    if (v == blk) { visible = true; break; }
-    \\    if (v < blk) lo = mid + 1; else hi = mid - 1;
-    \\  }
-    \\}
-    \\mask[t] = visible;
-;
+const SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_mask.metal");
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;

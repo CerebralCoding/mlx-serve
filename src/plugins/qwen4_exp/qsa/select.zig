@@ -2,6 +2,7 @@
 //! Owns QSA_SELECT_KERNEL_HEADER, QSA_SELECT_SHARED, QSA_SELECT_RADIX_BODY, QSA_SELECT_SINGLE_SETUP, QSA_SELECT_SLICE_SETUP, QSA_SELECT_MERGE_SETUP, and 46 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const mtp = @import("../mtp.zig");
@@ -24,18 +25,7 @@ const qsaSelectComposedOps = @import("score.zig").qsaSelectComposedOps;
 // `qsaChunkSelect`'s: top-K visible blocks per row, ties to the LOWER index (torch.topk),
 // emitted ascending, INT_MAX past the row's count. The tie rule is exact where the composed
 // arm's `b * 1e-7` bias only approximates it.
-const QSA_SELECT_KERNEL_HEADER =
-    \\// Monotone f32 -> uint32: ascending order preserved, NaN above every
-    \\// number, -0.0 and +0.0 the SAME key (torch compares them equal, and a
-    \\// relu sum can produce either).
-    \\inline uint msv_qsa_ord(float v) {
-    \\  if (metal::isnan(v)) { return 0xFFFFFFFFu; }
-    \\  if (v == 0.0f) { return 0x80000000u; }
-    \\  uint u = as_type<uint>(v);
-    \\  return (u & 0x80000000u) ? (~u) : (u | 0x80000000u);
-    \\}
-    \\
-;
+const QSA_SELECT_KERNEL_HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_select_header.metal");
 
 /// One threadgroup per query row. 1. MSD radix select over the 32-bit ordinal (the DIGITS
 /// template picks 11/11/10-bit digits at prefill widths or four 8-bit digits at decode widths,
@@ -45,253 +35,20 @@ const QSA_SELECT_KERNEL_HEADER =
 /// selected elements with a smaller index (a simd prefix scan per chunk), so the output is
 /// born sorted. 3. Rows with `bounds[row] <= K` are `0 .. bounds-1` then INT_MAX.
 /// Threadgroup memory ~8.3 KiB at 2048 bins, ~1.3 KiB at 256.
-const QSA_SELECT_SHARED =
-    \\constexpr uint TGN   = (uint)TGS;
-    \\constexpr uint SIMDW = 32u;
-    \\constexpr uint NSIMD = TGN / SIMDW;
-    \\constexpr uint BINS  = (DIGITS == 8) ? 256u : 2048u;
-    \\constexpr uint NLEV  = (DIGITS == 8) ? 4u : 3u;
-    \\constexpr uint KTOP  = (uint)K;
-    \\constexpr int  SENTINEL = 2147483647;
-    \\static_assert(NSIMD <= SIMDW);
-    \\
-    \\threadgroup metal::atomic_uint hist[BINS];
-    \\threadgroup uint sgs[2u * NSIMD];
-    \\threadgroup uint sh[4];
-    \\
-    \\const uint row  = threadgroup_position_in_grid.y;
-    \\const uint tid  = thread_position_in_threadgroup.x;
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const uint sg   = simdgroup_index_in_threadgroup;
-    \\
-;
+const QSA_SELECT_SHARED = kernelSource("plugins/qwen4_exp/kernels/qsa_select_shared.metal");
 
 // One radix-select body composed into three kernels (single row, row slice, merge) so a
 // fix to the digit walk or the tie rule lands once; the kernels differ only in setup.
-const QSA_SELECT_RADIX_BODY =
-    \\uint pref = 0u;
-    \\uint fixed = 0u;
-    \\uint need = KTOP;
-    \\uint T = 0u;
-    \\uint need_eq = 0u;
-    \\
-    \\for (uint lv = 0u; lv < NLEV; ++lv) {
-    \\  const uint width = (DIGITS == 8) ? 8u : ((lv == 2u) ? 10u : 11u);
-    \\  const uint nbins = 1u << width;
-    \\  const uint shift = 32u - fixed - width;
-    \\  const uint hi_b  = (fixed == 0u) ? 31u : (32u - fixed);
-    \\
-    \\  for (uint b = tid; b < nbins; b += TGN) metal::atomic_store_explicit(&hist[b], 0u, metal::memory_order_relaxed);
-    \\  if (tid == 0u) { sh[0] = 0u; sh[1] = 0u; sh[2] = 0u; }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\
-    \\  uint last_d = 0xFFFFFFFFu;
-    \\  uint run = 0u;
-    \\  for (uint base = SEL_LO; base < SEL_HI; base += TGN) {
-    \\    const uint i = base + tid;
-    \\    uint u = 0u;
-    \\    int out_idx = SENTINEL;
-    \\    uint ok = 0u;
-    \\    SEL_LOAD(i, u, out_idx, ok)
-    \\    if (ok != 0u) {
-    \\      if (!(fixed != 0u && (u >> hi_b) != pref)) {
-    \\        const uint d = (u >> shift) & (nbins - 1u);
-    \\        if (d == last_d) { run += 1u; }
-    \\        else {
-    \\          if (run != 0u) metal::atomic_fetch_add_explicit(&hist[last_d], run, metal::memory_order_relaxed);
-    \\          last_d = d;
-    \\          run = 1u;
-    \\        }
-    \\      }
-    \\    }
-    \\  }
-    \\  if (run != 0u) metal::atomic_fetch_add_explicit(&hist[last_d], run, metal::memory_order_relaxed);
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\
-    \\  if (sg == 0u) {
-    \\    const uint chunk = nbins / SIMDW;
-    \\    const uint base  = nbins - (lane + 1u) * chunk;
-    \\    uint tot = 0u;
-    \\    for (uint j = 0u; j < chunk; ++j) tot += metal::atomic_load_explicit(&hist[base + j], metal::memory_order_relaxed);
-    \\    const uint pre = metal::simd_prefix_exclusive_sum(tot);
-    \\    if (pre < need && need <= pre + tot) {
-    \\      uint acc = pre;
-    \\      for (uint jj = chunk; jj > 0u; --jj) {
-    \\        const uint bidx = base + jj - 1u;
-    \\        const uint c = metal::atomic_load_explicit(&hist[bidx], metal::memory_order_relaxed);
-    \\        if (acc + c >= need) { sh[0] = bidx; sh[1] = acc; sh[2] = c; break; }
-    \\        acc += c;
-    \\      }
-    \\    }
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  const uint d_sel   = sh[0];
-    \\  const uint above_w = sh[1];
-    \\  const uint cnt_d   = sh[2];
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\
-    \\  need = need - above_w;
-    \\  pref = (pref << width) | d_sel;
-    \\  fixed += width;
-    \\  if (cnt_d == need || fixed >= 32u) {
-    \\    T = (fixed >= 32u) ? pref : (pref << (32u - fixed));
-    \\    need_eq = need;
-    \\    break;
-    \\  }
-    \\}
-    \\
-    \\for (uint base = 0u; base < KTOP; base += TGN) {
-    \\  const uint i = base + tid;
-    \\  if (i < KTOP) outp[i] = SENTINEL;
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_device);
-    \\
-    \\uint run_gt = 0u;
-    \\uint run_eq = 0u;
-    \\for (uint base = SEL_LO; base < SEL_HI; base += TGN) {
-    \\  const uint i = base + tid;
-    \\  uint gtf = 0u;
-    \\  uint e = 0u;
-    \\  int out_idx = SENTINEL;
-    \\  uint u = 0u;
-    \\  uint ok = 0u;
-    \\  SEL_LOAD(i, u, out_idx, ok)
-    \\  if (ok != 0u) {
-    \\    gtf = (u > T) ? 1u : 0u;
-    \\    e = (u == T) ? 1u : 0u;
-    \\  }
-    \\  const uint pg = metal::simd_prefix_exclusive_sum(gtf);
-    \\  const uint pe = metal::simd_prefix_exclusive_sum(e);
-    \\  const uint sg_g = metal::simd_sum(gtf);
-    \\  const uint sg_e = metal::simd_sum(e);
-    \\  if (lane == 0u) { sgs[sg] = sg_g; sgs[NSIMD + sg] = sg_e; }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  uint off_g = 0u, off_e = 0u, tot_g = 0u, tot_e = 0u;
-    \\  {
-    \\    const uint a = (lane < NSIMD) ? sgs[lane] : 0u;
-    \\    const uint b = (lane < NSIMD) ? sgs[NSIMD + lane] : 0u;
-    \\    const uint pa = metal::simd_prefix_exclusive_sum(a);
-    \\    const uint pb = metal::simd_prefix_exclusive_sum(b);
-    \\    off_g = metal::simd_shuffle(pa, sg);
-    \\    off_e = metal::simd_shuffle(pb, sg);
-    \\    tot_g = metal::simd_sum(a);
-    \\    tot_e = metal::simd_sum(b);
-    \\  }
-    \\  const uint gb = run_gt + off_g + pg;
-    \\  const uint eb = run_eq + off_e + pe;
-    \\  if (ok != 0u) {
-    \\    if (gtf != 0u) {
-    \\      const uint pos = gb + metal::min(eb, need_eq);
-    \\      if (pos < KTOP) outp[pos] = out_idx;
-    \\    } else if (e != 0u && eb < need_eq) {
-    \\      const uint pos = gb + eb;
-    \\      if (pos < KTOP) outp[pos] = out_idx;
-    \\    }
-    \\  }
-    \\  run_gt += tot_g;
-    \\  run_eq += tot_e;
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (run_gt + metal::min(run_eq, need_eq) >= KTOP) break;
-    \\}
-;
+const QSA_SELECT_RADIX_BODY = kernelSource("plugins/qwen4_exp/kernels/qsa_select_radix_body.metal");
 
-const QSA_SELECT_SINGLE_SETUP =
-    \\const uint nb = (uint)scores_shape[2];
-    \\const int  vbi = bounds[row];
-    \\const uint vb  = (vbi > 0) ? (uint)vbi : 0u;
-    \\const auto sc = scores + (ulong)row * (ulong)nb; // `constant` under 8 elements
-    \\device int* outp = ids + (ulong)row * (ulong)KTOP;
-    \\if (vb <= KTOP) {
-    \\  for (uint i = tid; i < KTOP; i += TGN) outp[i] = (i < vb) ? int(i) : SENTINEL;
-    \\  return;
-    \\}
-    \\#define SEL_LO 0u
-    \\#define SEL_HI vb
-    \\#define SEL_LOAD(i, u, out_idx, ok) { ok = 0u; out_idx = SENTINEL; if ((i) < SEL_HI) { out_idx = int(i); u = msv_qsa_ord(sc[i]); ok = 1u; } }
-    \\
-;
+const QSA_SELECT_SINGLE_SETUP = kernelSource("plugins/qwen4_exp/kernels/qsa_select_single_setup.metal");
 
-const QSA_SELECT_SLICE_SETUP =
-    \\const uint g    = threadgroup_position_in_grid.x;
-    \\const uint G    = threadgroups_per_grid.x;
-    \\const uint nb = (uint)scores_shape[2];
-    \\const int  vbi = bounds[row];
-    \\const uint vb  = (vbi > 0) ? (uint)vbi : 0u;
-    \\const uint lo  = (uint)(((ulong)g * (ulong)vb) / (ulong)G);
-    \\const uint hi  = (uint)(((ulong)(g + 1u) * (ulong)vb) / (ulong)G);
-    \\const uint nsl = hi - lo;
-    \\const auto sc = scores + (ulong)row * (ulong)nb; // `constant` under 8 elements
-    \\device int* outp = ids + (((ulong)row * (ulong)G) + (ulong)g) * (ulong)KTOP;
-    \\if (nsl <= KTOP) {
-    \\  for (uint i = tid; i < KTOP; i += TGN) outp[i] = (i < nsl) ? int(lo + i) : SENTINEL;
-    \\  return;
-    \\}
-    \\#define SEL_LO lo
-    \\#define SEL_HI hi
-    \\#define SEL_LOAD(i, u, out_idx, ok) { ok = 0u; out_idx = SENTINEL; if ((i) < SEL_HI) { out_idx = int(i); u = msv_qsa_ord(sc[i]); ok = 1u; } }
-    \\
-;
+const QSA_SELECT_SLICE_SETUP = kernelSource("plugins/qwen4_exp/kernels/qsa_select_slice_setup.metal");
 
 // Candidates arrive ascending by ORIGINAL index with SENTINEL slots skipped, never sorted
 // in; that is what resolves a cross-slice tie at the K-th ordinal to the lowest index. Every
 // simd reduction below runs in a uniform base-stepped loop: a divergent simd_sum is undefined.
-const QSA_SELECT_MERGE_SETUP =
-    \\const uint nb = (uint)scores_shape[2];
-    \\const uint nc = (uint)local_ids_shape[2];
-    \\const auto sc = scores + (ulong)row * (ulong)nb; // `constant` under 8 elements
-    \\const auto loc = local_ids + (ulong)row * (ulong)nc;
-    \\device int* outp = ids + (ulong)row * (ulong)KTOP;
-    \\
-    \\uint nvalid = 0u;
-    \\for (uint base = 0u; base < nc; base += TGN) {
-    \\  const uint i = base + tid;
-    \\  uint v = 0u;
-    \\  if (i < nc) v = (loc[i] != SENTINEL) ? 1u : 0u;
-    \\  nvalid += metal::simd_sum(v);
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (lane == 0u) sgs[sg] = nvalid;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\{
-    \\  const uint a = (lane < NSIMD) ? sgs[lane] : 0u;
-    \\  nvalid = metal::simd_sum(a);
-    \\}
-    \\
-    \\if (nvalid <= KTOP) {
-    \\  for (uint i = tid; i < KTOP; i += TGN) outp[i] = SENTINEL;
-    \\  threadgroup_barrier(metal::mem_flags::mem_device);
-    \\  uint run = 0u;
-    \\  for (uint base = 0u; base < nc; base += TGN) {
-    \\    const uint i = base + tid;
-    \\    uint gtf = 0u;
-    \\    int idx = SENTINEL;
-    \\    if (i < nc) {
-    \\      idx = loc[i];
-    \\      gtf = (idx != SENTINEL) ? 1u : 0u;
-    \\    }
-    \\    const uint pg = metal::simd_prefix_exclusive_sum(gtf);
-    \\    const uint sg_g = metal::simd_sum(gtf);
-    \\    if (lane == 0u) sgs[sg] = sg_g;
-    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\    uint off_g = 0u, tot_g = 0u;
-    \\    {
-    \\      const uint a = (lane < NSIMD) ? sgs[lane] : 0u;
-    \\      const uint pa = metal::simd_prefix_exclusive_sum(a);
-    \\      off_g = metal::simd_shuffle(pa, sg);
-    \\      tot_g = metal::simd_sum(a);
-    \\    }
-    \\    const uint pos = run + off_g + pg;
-    \\    if (gtf != 0u && pos < KTOP) outp[pos] = idx;
-    \\    run += tot_g;
-    \\    threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  }
-    \\  return;
-    \\}
-    \\#define SEL_LO 0u
-    \\#define SEL_HI nc
-    \\#define SEL_LOAD(i, u, out_idx, ok) { ok = 0u; out_idx = SENTINEL; if ((i) < SEL_HI) { out_idx = loc[i]; if (out_idx != SENTINEL) { u = msv_qsa_ord(sc[out_idx]); ok = 1u; } } }
-    \\
-;
+const QSA_SELECT_MERGE_SETUP = kernelSource("plugins/qwen4_exp/kernels/qsa_select_merge_setup.metal");
 
 const QSA_SELECT_KERNEL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SINGLE_SETUP, QSA_SELECT_RADIX_BODY });
 const QSA_SELECT_SPLIT_LOCAL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SLICE_SETUP, QSA_SELECT_RADIX_BODY });

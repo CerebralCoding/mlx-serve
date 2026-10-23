@@ -6,6 +6,7 @@
 //! points), so the chain stays both the fallback and the oracle. `MINIMAX_H3_GLUE_FUSED=0`
 //! turns every kernel here off.
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 
@@ -62,54 +63,7 @@ pub fn apply(kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_c
 // (x1*cos, x2*sin, subtract, x1*sin, x2*cos, add), each product rounded to T. Pair p couples
 // elements p and p+HALF, so the partner lane is HALF/4 away; the tail past 2*HALF passes through.
 // v is only transposed. Output [1, H, S, 128] for q, k and v.
-const QKV_SOURCE =
-    \\constexpr uint HD = 128;
-    \\const uint slot = threadgroup_position_in_grid.x;
-    \\const uint row = threadgroup_position_in_grid.y;
-    \\const uint lane = thread_position_in_threadgroup.x;
-    \\const uint which = slot / uint(H);
-    \\const uint head = slot - which * uint(H);
-    \\const uint seq = uint(COS_shape[0]);
-    \\const device T* src = QKV + size_t(row) * (3 * uint(H) * HD) + size_t(slot) * HD;
-    \\const size_t o = (size_t(head) * seq + row) * HD;
-    \\const uint base = lane * 4;
-    \\if (which == 2) {
-    \\    for (uint i = 0; i < 4; ++i) OV[o + base + i] = src[base + i];
-    \\    return;
-    \\}
-    \\float acc = 0.0f;
-    \\for (uint i = 0; i < 4; ++i) {
-    \\    float v = float(src[base + i]);
-    \\    acc += v * v;
-    \\}
-    \\acc = simd_sum(acc);
-    \\const float inv = metal::precise::rsqrt(acc / float(HD) + eps);
-    \\const device T* w = which == 0 ? QW : KW;
-    \\T nrm[4];
-    \\for (uint i = 0; i < 4; ++i) nrm[i] = w[base + i] * T(float(src[base + i]) * inv);
-    \\constexpr uint QL = uint(HALF) / 4;
-    \\const uint pl = lane < QL ? lane + QL : (lane < 2 * QL ? lane - QL : lane);
-    \\device T* dst = which == 0 ? OQ : OK;
-    \\const size_t tab = size_t(row) * uint(HALF);
-    \\for (uint i = 0; i < 4; ++i) {
-    \\    const uint j = base + i;
-    \\    const float pv = simd_shuffle(float(nrm[i]), pl);
-    \\    T res;
-    \\    if (j < uint(HALF)) {
-    \\        const T a1 = T(float(nrm[i]) * float(COS[tab + j]));
-    \\        const T a2 = T(pv * float(SIN[tab + j]));
-    \\        res = T(float(a1) - float(a2));
-    \\    } else if (j < 2 * uint(HALF)) {
-    \\        const uint jj = j - uint(HALF);
-    \\        const T b1 = T(pv * float(SIN[tab + jj]));
-    \\        const T b2 = T(float(nrm[i]) * float(COS[tab + jj]));
-    \\        res = T(float(b1) + float(b2));
-    \\    } else {
-    \\        res = nrm[i];
-    \\    }
-    \\    dst[o + j] = res;
-    \\}
-;
+const QKV_SOURCE = kernelSource("plugins/minimax_h3/kernels/qkv_prep.metal");
 
 var qkv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const QkvKey = struct { h: c_int, half: c_int, seq: c_int, dt: mlx.mlx_dtype };
@@ -172,27 +126,8 @@ pub fn qkvPrep(qkv: mlx.mlx_array, q_w: mlx.mlx_array, k_w: mlx.mlx_array, cos: 
 //
 // y [S, 2F] = gate | up; out = silu(gate) * up, with silu = x * sigmoid(x) rounded like the chain's
 // sigmoid -> multiply -> multiply (each result rounded to T). `sigm` is MLX's own expression.
-const SWIGLU_HEADER =
-    \\template <typename T>
-    \\T msv_sigmoid(T x) {
-    \\    auto y = 1 / (1 + metal::precise::exp(metal::abs(x)));
-    \\    return (x < 0) ? y : 1 - y;
-    \\}
-;
-const SWIGLU_SOURCE =
-    \\const uint idx = thread_position_in_grid.x;
-    \\const uint f4 = uint(F) / 4;
-    \\const uint row = idx / f4;
-    \\const uint c = (idx - row * f4) * 4;
-    \\const size_t g0 = size_t(row) * (2 * uint(F)) + c;
-    \\for (uint i = 0; i < 4; ++i) {
-    \\    const T g = Y[g0 + i];
-    \\    const T u = Y[g0 + uint(F) + i];
-    \\    const T sg = msv_sigmoid<T>(g);
-    \\    const T gs = g * sg;
-    \\    OUT[size_t(row) * uint(F) + c + i] = gs * u;
-    \\}
-;
+const SWIGLU_HEADER = kernelSource("plugins/minimax_h3/kernels/swiglu_header.metal");
+const SWIGLU_SOURCE = kernelSource("plugins/minimax_h3/kernels/swiglu.metal");
 
 var swiglu_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const SwigluKey = struct { rows: c_int, f: c_int, dt: mlx.mlx_dtype };

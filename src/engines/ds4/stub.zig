@@ -34,6 +34,12 @@ pub fn ggufDeclaresEmbeddedMtp(io: std.Io, allocator: std.mem.Allocator, path: [
     return false;
 }
 
+pub const ThinkMode = ffi.ThinkMode;
+
+pub fn contextBytes(ctx: u32) u64 {
+    return ffi.ds4_context_memory_estimate(.metal, @intCast(ctx)).total_bytes;
+}
+
 pub fn clampSessionCtx(requested: u32) u32 {
     if (requested == 0) return ds4_default_ctx;
     return @max(requested, ds4_prefill_chunk);
@@ -216,6 +222,16 @@ pub const Ds4Session = struct {
     pub fn argmaxExcluding(self: *Ds4Session, excluded_id: i32) i32 {
         _ = self;
         _ = excluded_id;
+        @panic(unavailable);
+    }
+    pub fn copyLogits(self: *Ds4Session, out: []f32) usize {
+        _ = self;
+        _ = out;
+        @panic(unavailable);
+    }
+    pub fn setLogits(self: *Ds4Session, logits: []const f32) Error!void {
+        _ = self;
+        _ = logits;
         @panic(unavailable);
     }
     pub fn sample(self: *Ds4Session, temperature: f32, top_k: i32, top_p: f32, min_p: f32, rng: *u64) i32 {

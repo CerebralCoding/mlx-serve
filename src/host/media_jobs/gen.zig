@@ -18,6 +18,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const flux = @import("../../plugins/flux2/flux.zig");
 const krea = @import("../../plugins/krea/krea.zig");
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
+const low_mem = @import("low_mem.zig");
 const mage_flow_mod = @import("../../plugins/mage_flow/mage_flow.zig");
 const qwen_image = @import("../../plugins/qwen_image/qwen_image.zig");
 const moss_image = @import("../../plugins/moss_image/moss_image.zig");
@@ -422,19 +423,8 @@ const FluxImpl = struct {
     /// ≤ 16 GB of RAM — measured cost is ~0.1–0.3 s per image (the encoder
     /// mmap-reloads from page cache) vs ~1.8 GB lower peak, a clear win when
     /// the Metal working-set ceiling is ~12 GB (16 GB mini class).
-    fn lowMemFromInputs(is_ios: bool, env: ?[]const u8, total_ram_bytes: u64) bool {
-        if (is_ios) return true;
-        if (env) |e| {
-            if (std.mem.eql(u8, e, "1")) return true;
-            if (std.mem.eql(u8, e, "0")) return false;
-        }
-        return total_ram_bytes > 0 and total_ram_bytes <= 17 * 1024 * 1024 * 1024;
-    }
-
-    fn lowMemDefault() bool {
-        const env: ?[]const u8 = if (std.c.getenv("MLXSERVE_LOWMEM")) |v| std.mem.sliceTo(v, 0) else null;
-        return lowMemFromInputs(@import("build_options").ios, env, metrics.getTotalMemBytes());
-    }
+    const lowMemFromInputs = low_mem.fromInputs;
+    const lowMemDefault = low_mem.default;
 
     fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !FluxImpl {
         var self: FluxImpl = undefined;

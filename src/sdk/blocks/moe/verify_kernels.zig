@@ -2,6 +2,7 @@
 //! Owns VERIFY_EXPERT_REUSE_SOURCE, verify_expert_reuse_kernel, VERIFY_PAIRED_GU_HEADER, VERIFY_PAIRED_GU_SOURCE, verify_paired_gu_kernel, verify_paired_gu_config, and 31 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
 const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
@@ -26,59 +27,7 @@ const swigluSigTable = @import("../mlp/fused_activations.zig").swigluSigTable;
 const gatherExpertMm = @import("experts.zig").gatherExpertMm;
 
 // Preserve MLX's affine qmv K reduction while sharing each packed word across a pair.
-const VERIFY_EXPERT_REUSE_SOURCE =
-    \\auto lane = thread_index_in_simdgroup;
-    \\auto sg = simdgroup_index_in_threadgroup;
-    \\auto tg = threadgroup_position_in_grid;
-    \\uint row = tg.z;
-    \\uint eid = ids[row];
-    \\uint first = row;
-    \\while (first > 0 && ids[first - 1] == eid) --first;
-    \\if ((row - first) % 2 != 0) return;
-    \\bool pair = row + 1 < uint(ids_shape[0]) && ids[row + 1] == eid;
-    \\uint out_row = tg.y * 8 + sg * 4;
-    \\float2 result[4] = {float2(0), float2(0), float2(0), float2(0)};
-    \\constexpr uint VPT = 8;
-    \\for (uint k = 0; k < K; k += VPT * 32) {
-    \\  uint offset = k + lane * VPT;
-    \\  if (offset >= K) continue;
-    \\  float2 xt[VPT];
-    \\  float2 sum = float2(0);
-    \\  for (uint i = 0; i < VPT; i += 4) {
-    \\    size_t p = size_t(row) * K + offset + i;
-    \\    T a0 = x[p], a1 = x[p+1], a2 = x[p+2], a3 = x[p+3];
-    \\    T b0 = T(0), b1 = T(0), b2 = T(0), b3 = T(0);
-    \\    if (pair) { b0 = x[p+K]; b1 = x[p+K+1]; b2 = x[p+K+2]; b3 = x[p+K+3]; }
-    \\    sum.x += a0 + a1 + a2 + a3;
-    \\    sum.y += b0 + b1 + b2 + b3;
-    \\    xt[i] = float2(float(a0), float(b0));
-    \\    xt[i+1] = float2(float(a1), float(b1)) / 16.0f;
-    \\    xt[i+2] = float2(float(a2), float(b2)) / 256.0f;
-    \\    xt[i+3] = float2(float(a3), float(b3)) / 4096.0f;
-    \\  }
-    \\  for (uint r = 0; r < 4; ++r) {
-    \\    size_t wr = size_t(eid) * N + out_row + r;
-    \\    uint packed[VPT/8];
-    \\    for (uint i = 0; i < VPT/8; ++i) packed[i] = w[wr * (K/8) + offset/8 + i];
-    \\    float scale = float(sc[wr * (K/64) + offset/64]);
-    \\    float bias = float(bi[wr * (K/64) + offset/64]);
-    \\    float2 accum = float2(0);
-    \\    for (uint i = 0; i < VPT/4; ++i) {
-    \\      uint ws = (packed[i/2] >> (16*(i%2))) & 65535;
-    \\      accum += (xt[4*i] * float(ws & 0x000f) + xt[4*i+1] * float(ws & 0x00f0) + xt[4*i+2] * float(ws & 0x0f00) + xt[4*i+3] * float(ws & 0xf000));
-    \\    }
-    \\    result[r] += scale * accum + sum * bias;
-    \\  }
-    \\}
-    \\for (uint r = 0; r < 4; ++r) {
-    \\  float a = simd_sum(result[r].x);
-    \\  float b = simd_sum(result[r].y);
-    \\  if (lane == 0) {
-    \\    y[size_t(row) * N + out_row + r] = T(a);
-    \\    if (pair) y[size_t(row+1) * N + out_row + r] = T(b);
-    \\  }
-    \\}
-;
+const VERIFY_EXPERT_REUSE_SOURCE = kernelSource("kernels/moe/verify_expert_reuse.metal");
 
 var verify_expert_reuse_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -88,89 +37,9 @@ var verify_expert_reuse_kernel: ?mlx.mlx_fast_metal_kernel = null;
 // One 64-thread group owns eight gate/up output rows for one routed assignment.
 // The BF16 sigmoid lookup is the same table used by fusedSwiGLU; the JIT's
 // metal::exp rounding is not identical to MLX's metallib for every BF16 input.
-const VERIFY_PAIRED_GU_HEADER =
-    \\#include <metal_simdgroup>
-    \\#include <metal_stdlib>
-    \\using namespace metal;
-    \\constant constexpr uint PGU_H = 2560;
-    \\constant constexpr uint PGU_N = 640;
-    \\constant constexpr uint PGU_GS = 64;
-    \\constant constexpr uint PGU_VPT = 16;
-    \\constant constexpr uint PGU_BLOCK = PGU_VPT * 32;
-    \\constant constexpr uint PGU_BYTES_PER_ROW = PGU_H / 2;
-    \\constant constexpr uint PGU_GROUPS_PER_ROW = PGU_H / PGU_GS;
-    \\inline float pgu_load(const device bfloat* x, thread float* xt) {
-    \\  float sum = 0.0f;
-    \\  for (int i = 0; i < 16; i += 4) {
-    \\    sum += x[i] + x[i + 1] + x[i + 2] + x[i + 3];
-    \\    xt[i] = x[i];
-    \\    xt[i + 1] = x[i + 1] / 16.0f;
-    \\    xt[i + 2] = x[i + 2] / 256.0f;
-    \\    xt[i + 3] = x[i + 3] / 4096.0f;
-    \\  }
-    \\  return sum;
-    \\}
-    \\inline float pgu_qdot(const device uchar* w, const thread float* xt, float scale, float bias, float sum) {
-    \\  float accum = 0.0f;
-    \\  const device ushort* ws = (const device ushort*)w;
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    accum += (xt[4*i] * (ws[i] & 0x000f) + xt[4*i+1] * (ws[i] & 0x00f0)
-    \\        + xt[4*i+2] * (ws[i] & 0x0f00) + xt[4*i+3] * (ws[i] & 0xf000));
-    \\  }
-    \\  return scale * accum + sum * bias;
-    \\}
-;
+const VERIFY_PAIRED_GU_HEADER = kernelSource("kernels/moe/verify_paired_gu_header.metal");
 
-const VERIFY_PAIRED_GU_SOURCE =
-    \\uint tile = threadgroup_position_in_grid.x;
-    \\uint selected = threadgroup_position_in_grid.y;
-    \\uint sg = simdgroup_index_in_threadgroup;
-    \\uint lane = thread_index_in_simdgroup;
-    \\uint out_base = tile * 8 + sg * 4;
-    \\uint row = lhs[selected];
-    \\uint expert = ids[selected];
-    \\const device bfloat* xv = x + row * PGU_H + lane * PGU_VPT;
-    \\size_t weight_offset = ((size_t)expert * PGU_N + out_base) * PGU_BYTES_PER_ROW + lane * 8;
-    \\size_t meta_offset = ((size_t)expert * PGU_N + out_base) * PGU_GROUPS_PER_ROW + lane / 4;
-    \\const device uchar* gwp = (const device uchar*)gw + weight_offset;
-    \\const device uchar* uwp = (const device uchar*)uw + weight_offset;
-    \\const device bfloat* gsp = gsc + meta_offset;
-    \\const device bfloat* gbp = gb + meta_offset;
-    \\const device bfloat* usp = usc + meta_offset;
-    \\const device bfloat* ubp = ub + meta_offset;
-    \\float gr[4] = {0.0f};
-    \\float ur[4] = {0.0f};
-    \\for (uint k = 0; k < PGU_H; k += PGU_BLOCK) {
-    \\  float xt[16];
-    \\  float sum = pgu_load(xv, xt);
-    \\  for (uint o = 0; o < 4; ++o) {
-    \\    gr[o] += pgu_qdot(gwp + o * PGU_BYTES_PER_ROW, xt,
-    \\        float(gsp[o * PGU_GROUPS_PER_ROW]), float(gbp[o * PGU_GROUPS_PER_ROW]), sum);
-    \\    ur[o] += pgu_qdot(uwp + o * PGU_BYTES_PER_ROW, xt,
-    \\        float(usp[o * PGU_GROUPS_PER_ROW]), float(ubp[o * PGU_GROUPS_PER_ROW]), sum);
-    \\  }
-    \\  xv += PGU_BLOCK;
-    \\  gwp += PGU_BLOCK / 2;
-    \\  uwp += PGU_BLOCK / 2;
-    \\  gsp += PGU_BLOCK / PGU_GS;
-    \\  gbp += PGU_BLOCK / PGU_GS;
-    \\  usp += PGU_BLOCK / PGU_GS;
-    \\  ubp += PGU_BLOCK / PGU_GS;
-    \\}
-    \\for (uint o = 0; o < 4; ++o) {
-    \\  gr[o] = simd_sum(gr[o]);
-    \\  ur[o] = simd_sum(ur[o]);
-    \\}
-    \\if (lane == 0) {
-    \\  for (uint o = 0; o < 4; ++o) {
-    \\    bfloat gt = bfloat(gr[o]);
-    \\    bfloat ut = bfloat(ur[o]);
-    \\    bfloat sig = sigtab[as_type<ushort>(gt)];
-    \\    bfloat act = gt * sig;
-    \\    y[(size_t)selected * PGU_N + out_base + o] = act * ut;
-    \\  }
-    \\}
-;
+const VERIFY_PAIRED_GU_SOURCE = kernelSource("kernels/moe/verify_paired_gu.metal");
 
 var verify_paired_gu_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var verify_paired_gu_config: ?mlx.mlx_fast_metal_kernel_config = null;
@@ -364,24 +233,7 @@ pub fn verifyExpertReuse(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, 
 }
 
 // Match the eight bf16 partial sums used by MLX col_reduce_small (top-k rows, hidden H).
-const VERIFY_EXPERT_REDUCE_SOURCE =
-    \\uint p = thread_position_in_grid.x;
-    \\uint row = p / H;
-    \\uint col = p % H;
-    \\T partial[8];
-    \\#pragma unroll
-    \\for (uint i = 0; i < 8; ++i) partial[i] = T(0);
-    \\#pragma unroll
-    \\for (uint e = 0; e < TOPK; ++e) {
-    \\  uint at = row * TOPK + e;
-    \\  T product = down[size_t(inverse[at]) * H + col] * scores[at];
-    \\  partial[e % 8] = product + partial[e % 8];
-    \\}
-    \\T total = partial[0];
-    \\#pragma unroll
-    \\for (uint i = 1; i < 8; ++i) total = partial[i] + total;
-    \\y[p] = total;
-;
+const VERIFY_EXPERT_REDUCE_SOURCE = kernelSource("kernels/moe/verify_expert_reduce.metal");
 var verify_expert_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const ExpertReduceCfgs = QsaCfgCache([3]c_int, 1);
 var verify_expert_reduce_cfgs = ExpertReduceCfgs{};
@@ -460,24 +312,7 @@ fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_ar
 }
 
 // Preserve input order on ties so routing and the inverse permutation stay stable.
-const VERIFY_ROUTE_PACK_SOURCE =
-    \\threadgroup uint values[320];
-    \\const uint n = uint(ids_shape[0]);
-    \\const uint lane = thread_index_in_threadgroup;
-    \\for (uint i = lane; i < n; i += 128) values[i] = ids[i];
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\for (uint i = lane; i < n; i += 128) {
-    \\  const uint key = values[i];
-    \\  uint rank = 0;
-    \\  for (uint j = 0; j < n; ++j) {
-    \\    const uint other = values[j];
-    \\    rank += uint(other < key || (other == key && j < i));
-    \\  }
-    \\  inverse[i] = rank;
-    \\  sorted[rank] = key;
-    \\  lhs[rank] = i / 10;
-    \\}
-;
+const VERIFY_ROUTE_PACK_SOURCE = kernelSource("kernels/moe/verify_route_pack.metal");
 var verify_route_pack_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var verify_route_pack_configs = QsaCfgCache(c_int, 1){};
 const VerifyRoutePack = struct {
@@ -536,53 +371,9 @@ pub fn verifyRoutePack(s: mlx.mlx_stream, ids: mlx.mlx_array, top_k: c_int) !?Ve
 // dispatches over 256-id blocks: per-block histograms, one scan to (expert,
 // block) offsets, and a scatter that ranks ties by position within the block.
 const PREFILL_ROUTE_BLOCK: c_int = 256;
-const PREFILL_ROUTE_HIST_SOURCE =
-    \\threadgroup atomic_uint hist[E];
-    \\const uint lane = thread_index_in_threadgroup;
-    \\const uint block = threadgroup_position_in_grid.x;
-    \\for (uint e = lane; e < E; e += 256) atomic_store_explicit(&hist[e], 0u, memory_order_relaxed);
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const uint i = block * 256 + lane;
-    \\if (i < uint(ids_shape[0]) && ids[i] < E) atomic_fetch_add_explicit(&hist[ids[i]], 1u, memory_order_relaxed);
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\for (uint e = lane; e < E; e += 256) counts[block * E + e] = atomic_load_explicit(&hist[e], memory_order_relaxed);
-;
-const PREFILL_ROUTE_SCAN_SOURCE =
-    \\threadgroup uint totals[E];
-    \\const uint lane = thread_index_in_threadgroup;
-    \\const uint nb = uint(counts_shape[0]) / E;
-    \\for (uint e = lane; e < E; e += 256) {
-    \\  uint total = 0;
-    \\  for (uint b = 0; b < nb; ++b) total += counts[b * E + e];
-    \\  totals[e] = total;
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\for (uint e = lane; e < E; e += 256) {
-    \\  uint run = 0;
-    \\  for (uint j = 0; j < e; ++j) run += totals[j];
-    \\  for (uint b = 0; b < nb; ++b) {
-    \\    offsets[b * E + e] = run;
-    \\    run += counts[b * E + e];
-    \\  }
-    \\}
-;
-const PREFILL_ROUTE_SCATTER_SOURCE =
-    \\threadgroup uint keys[256];
-    \\const uint lane = thread_index_in_threadgroup;
-    \\const uint block = threadgroup_position_in_grid.x;
-    \\const uint i = block * 256 + lane;
-    \\const bool live = i < uint(ids_shape[0]);
-    \\const uint key = live ? ids[i] : 0xffffffffu;
-    \\keys[lane] = key;
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\if (!live || key >= E) return;
-    \\uint rank = 0;
-    \\for (uint j = 0; j < lane; ++j) rank += uint(keys[j] == key);
-    \\const uint pos = offsets[block * E + key] + rank;
-    \\inverse[i] = pos;
-    \\sorted[pos] = key;
-    \\lhs[pos] = i / TOPK;
-;
+const PREFILL_ROUTE_HIST_SOURCE = kernelSource("kernels/moe/prefill_route_hist.metal");
+const PREFILL_ROUTE_SCAN_SOURCE = kernelSource("kernels/moe/prefill_route_scan.metal");
+const PREFILL_ROUTE_SCATTER_SOURCE = kernelSource("kernels/moe/prefill_route_scatter.metal");
 var prefill_route_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
 var prefill_route_configs = QsaCfgCache([3]c_int, 3){};
 

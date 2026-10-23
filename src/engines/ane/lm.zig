@@ -2097,34 +2097,70 @@ const Hist = struct {
 
 pub const CacheLimits = struct { max_bytes: u64, max_states: u32, stride: u32 };
 
-/// The model at `dir` built and loaded once with `opts.slots` engines on it behind one worker,
-/// sharing one prefix cache (none without `limits`; `max_bytes` 0 is no byte cap).
+/// The model at `dir` built and loaded once with `opts.slots` engines on it, sharing one prefix cache (none
+/// without `limits`; `max_bytes` 0 is no byte cap). The scheduler arm runs it behind a `Worker`, the engine
+/// adapter on threads of its own.
+pub const Pool = struct {
+    model: *Model,
+    cache: ?*prefix.Cache,
+    engines: []*Engine,
+
+    pub fn open(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, arch: Arch, opts: Options, limits: ?CacheLimits) !Pool {
+        const model = try Model.open(allocator, io, dir, arch, opts);
+        errdefer model.deinit();
+        // Before the engines: an engine's deinit still reads the cache it follows.
+        const cache: ?*prefix.Cache = if (limits) |l| blk: {
+            const c = try allocator.create(prefix.Cache);
+            c.* = .init(allocator, if (l.max_bytes == 0) std.math.maxInt(u64) else l.max_bytes, l.max_states);
+            break :blk c;
+        } else null;
+        errdefer if (cache) |c| {
+            c.deinit();
+            allocator.destroy(c);
+        };
+        const engines = try allocator.alloc(*Engine, model.instances);
+        var opened: usize = 0;
+        errdefer {
+            var i = opened;
+            while (i > 0) : (i -= 1) engines[i - 1].deinit();
+            allocator.free(engines);
+        }
+        for (engines, 0..) |*e, i| {
+            e.* = try Engine.open(model, io, @intCast(i));
+            opened += 1;
+            if (cache) |c| e.*.useCache(c, limits.?.stride);
+        }
+        return .{ .model = model, .cache = cache, .engines = engines };
+    }
+
+    /// The engines, their shared cache, the engine list and the model.
+    pub fn close(self: Pool, allocator: std.mem.Allocator) void {
+        var i = self.engines.len;
+        while (i > 0) : (i -= 1) self.engines[i - 1].deinit();
+        if (self.cache) |c| {
+            c.deinit();
+            allocator.destroy(c);
+        }
+        allocator.free(self.engines);
+        self.model.deinit();
+    }
+
+    /// What the pool holds beside the weights: every slot's buffers and the prefix cache's byte cap.
+    pub fn stateBytes(self: Pool) u64 {
+        var n: u64 = 0;
+        for (self.engines) |e| n += e.bufferBytes();
+        if (self.cache) |c| if (c.max_bytes != std.math.maxInt(u64)) {
+            n += c.max_bytes;
+        };
+        return n;
+    }
+};
+
+/// `Pool.open` behind one worker.
 pub fn openPool(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, arch: Arch, opts: Options, limits: ?CacheLimits, ctx: *anyopaque, runFn: *const fn (*anyopaque, *Engine, *anyopaque) void) !*Worker {
-    const model = try Model.open(allocator, io, dir, arch, opts);
-    errdefer model.deinit();
-    // Before the engines: an engine's deinit still reads the cache it follows.
-    const cache: ?*prefix.Cache = if (limits) |l| blk: {
-        const c = try allocator.create(prefix.Cache);
-        c.* = .init(allocator, if (l.max_bytes == 0) std.math.maxInt(u64) else l.max_bytes, l.max_states);
-        break :blk c;
-    } else null;
-    errdefer if (cache) |c| {
-        c.deinit();
-        allocator.destroy(c);
-    };
-    const engines = try allocator.alloc(*Engine, model.instances);
-    var opened: usize = 0;
-    errdefer {
-        var i = opened;
-        while (i > 0) : (i -= 1) engines[i - 1].deinit();
-        allocator.free(engines);
-    }
-    for (engines, 0..) |*e, i| {
-        e.* = try Engine.open(model, io, @intCast(i));
-        opened += 1;
-        if (cache) |c| e.*.useCache(c, limits.?.stride);
-    }
-    return Worker.start(allocator, io, model, engines, ctx, runFn);
+    const pool = try Pool.open(allocator, io, dir, arch, opts, limits);
+    errdefer pool.close(allocator);
+    return Worker.start(allocator, io, pool.model, pool.engines, ctx, runFn);
 }
 
 /// One thread per engine, all taking jobs from one queue, in order. The ANE never touches MLX, so
@@ -2132,7 +2168,7 @@ pub fn openPool(allocator: std.mem.Allocator, io: std.Io, dir: []const u8, arch:
 pub const Worker = struct {
     allocator: std.mem.Allocator,
     io: std.Io,
-    model: ?*Model,
+    model: *Model,
     engines: []*Engine,
     threads: []std.Thread = &.{},
     ctx: *anyopaque,
@@ -2142,7 +2178,7 @@ pub const Worker = struct {
     queue: std.ArrayList(*anyopaque) = .empty,
     stopping: bool = false,
 
-    pub fn start(allocator: std.mem.Allocator, io: std.Io, model: ?*Model, engines: []*Engine, ctx: *anyopaque, runFn: *const fn (*anyopaque, *Engine, *anyopaque) void) !*Worker {
+    pub fn start(allocator: std.mem.Allocator, io: std.Io, model: *Model, engines: []*Engine, ctx: *anyopaque, runFn: *const fn (*anyopaque, *Engine, *anyopaque) void) !*Worker {
         const w = try allocator.create(Worker);
         errdefer allocator.destroy(w);
         w.* = .{ .allocator = allocator, .io = io, .model = model, .engines = engines, .ctx = ctx, .run = runFn };
@@ -2172,31 +2208,21 @@ pub const Worker = struct {
         self.allocator.destroy(self);
     }
 
-    /// What the pool holds beside the weights: every slot's buffers and the prefix cache's byte cap.
-    pub fn stateBytes(self: *const Worker) u64 {
-        var n: u64 = 0;
-        for (self.engines) |e| n += e.bufferBytes();
-        if (self.engines[0].cache) |c| if (c.max_bytes != std.math.maxInt(u64)) {
-            n += c.max_bytes;
-        };
-        return n;
+    fn pool(self: *const Worker) Pool {
+        return .{ .model = self.model, .cache = self.engines[0].cache, .engines = self.engines };
     }
 
-    /// `deinit`, then the engines, their shared cache, the engine list and the model: an `openPool` worker.
+    /// What the pool holds beside the weights: every slot's buffers and the prefix cache's byte cap.
+    pub fn stateBytes(self: *const Worker) u64 {
+        return self.pool().stateBytes();
+    }
+
+    /// `deinit`, then the pool: an `openPool` worker.
     pub fn close(self: *Worker) void {
         const a = self.allocator;
-        const engines = self.engines;
-        const cache = engines[0].cache;
-        const model = self.model;
+        const p = self.pool();
         self.deinit();
-        var i = engines.len;
-        while (i > 0) : (i -= 1) engines[i - 1].deinit();
-        if (cache) |c| {
-            c.deinit();
-            a.destroy(c);
-        }
-        a.free(engines);
-        if (model) |m| m.deinit();
+        p.close(a);
     }
 
     fn stop(self: *Worker) void {

@@ -20,6 +20,7 @@
 //! so the 2-bit codes are expanded to int8 straight into the tensor op's right
 //! operand in registers, as their register-staged form does.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = std.log.scoped(.qmm_int8);
 
@@ -36,11 +37,7 @@ pub fn enabled() bool {
     return env_enabled.?;
 }
 
-pub const HEADER =
-    \\#include <metal_tensor>
-    \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-    \\
-;
+pub const HEADER = kernelSource("kernels/common/mpp_tensor.metal");
 
 /// Four simdgroups, each one 32x32x128 int8 multiply per 128-group over a
 /// 32-row x 32-column tile. The right operand is built in REGISTERS from the
@@ -48,203 +45,17 @@ pub const HEADER =
 /// the plane `(w >> 2kq) & 0x03030303` (codes kq, kq+4, kq+8, kq+12). That is a
 /// fixed 4x4 transpose of K inside each 16-block, which the quantizer applies
 /// to the activation too, so the integer products are unchanged.
-pub const SOURCE =
-    \\const int K = xq_shape[xq_ndim - 1];
-    \\const int N = w_shape[0];
-    \\const int Kg = K / 128;
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const uint sg = simdgroup_index_in_threadgroup;
-    \\const int ms = int(threadgroup_position_in_grid.y) * 32;
-    \\const int ns = int(threadgroup_position_in_grid.x) * 128 + 32 * int(sg);
-    \\constexpr auto desc = mpp::tensor_ops::matmul2d_descriptor(
-    \\    32, 32, 128, false, true, false,
-    \\    mpp::tensor_ops::matmul2d_descriptor::mode::multiply);
-    \\mpp::tensor_ops::matmul2d<desc, metal::execution_simdgroup> op;
-    \\tensor<device int8_t, dextents<int, 2>, tensor_inline> A((device int8_t*)xq, dextents<int, 2>(K, MPAD));
-    \\auto bT = op.template get_right_input_cooperative_tensor<int8_t, int8_t, int32_t>();
-    \\thread uint32_t* bw = (thread uint32_t*)&bT;
-    \\auto tA0 = A.template slice<128, 32>(0, ms);
-    \\auto cT = op.template get_destination_cooperative_tensor<
-    \\    metal::remove_addrspace_t<decltype(tA0)>, metal::remove_addrspace_t<decltype(bT)>, int32_t>();
-    \\constexpr int CAP = 32;
-    \\const int fm = int(((lane >> 4) & 1) * 4 + ((lane >> 1) & 3));
-    \\const int fn = int((((lane >> 3) & 1) * 2 + (lane & 1)) * 4);
-    \\const int nb = ns + fn;
-    \\const int mb = ms + fm;
-    \\float acc[CAP];
-    \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < CAP; i++) acc[i] = 0.0f;
-    \\const int nl = int(((lane >> 1) & 3) + 4 * ((lane >> 4) & 1));
-    \\const uint sh = 2 * ((lane & 1) + 2 * ((lane >> 3) & 1));
-    \\const device uint4* wc[4];
-    \\#pragma clang loop unroll(full)
-    \\for (int c = 0; c < 4; c++) wc[c] = (const device uint4*)(w + (size_t)min(ns + nl + 8 * c, N - 1) * (K / 16));
-    \\const int mrow[4] = {mb, mb + 8, mb + 16, mb + 24};
-    \\for (int g = 0; g < Kg; g++) {
-    \\  uint4 wv[8];
-    \\#pragma clang loop unroll(full)
-    \\  for (int c = 0; c < 4; c++) { wv[2 * c] = wc[c][2 * g]; wv[2 * c + 1] = wc[c][2 * g + 1]; }
-    \\#pragma clang loop unroll(full)
-    \\  for (int c = 0; c < 4; c++) {
-    \\    const uint s2 = sh;
-    \\    const uint4 lo = wv[2 * c];
-    \\    const uint4 hi = wv[2 * c + 1];
-    \\    bw[c + 0] = (lo.x >> s2) & 0x03030303u; bw[c + 4] = (lo.y >> s2) & 0x03030303u;
-    \\    bw[c + 8] = (lo.z >> s2) & 0x03030303u; bw[c + 12] = (lo.w >> s2) & 0x03030303u;
-    \\    bw[c + 16] = (hi.x >> s2) & 0x03030303u; bw[c + 20] = (hi.y >> s2) & 0x03030303u;
-    \\    bw[c + 24] = (hi.z >> s2) & 0x03030303u; bw[c + 28] = (hi.w >> s2) & 0x03030303u;
-    \\  }
-    \\  auto tA = A.template slice<128, 32>(g * 128, ms);
-    \\  op.run(tA, bT, cT);
-    \\  float4 sv[2], bv[2];
-    \\  float av[4], rv[4];
-    \\#pragma clang loop unroll(full)
-    \\  for (int h = 0; h < 2; h++) {
-    \\    if (FULL) {
-    \\      sv[h] = float4(*(const device vec<ST, 4>*)(scales + (size_t)g * N + nb + 16 * h));
-    \\      bv[h] = NEG ? float4(0.0f) : float4(*(const device vec<ST, 4>*)(biases + (size_t)g * N + nb + 16 * h));
-    \\    } else {
-    \\#pragma clang loop unroll(full)
-    \\      for (int c = 0; c < 4; c++) {
-    \\        const size_t e = (size_t)g * N + min(nb + c + 16 * h, N - 1);
-    \\        sv[h][c] = float(scales[e]);
-    \\        bv[h][c] = NEG ? 0.0f : float(biases[e]);
-    \\      }
-    \\    }
-    \\  }
-    \\#pragma clang loop unroll(full)
-    \\  for (int q = 0; q < 4; q++) {
-    \\    av[q] = ascale[(size_t)mrow[q] * Kg + g];
-    \\    rv[q] = rsum[(size_t)mrow[q] * Kg + g];
-    \\    if (NEG) rv[q] *= av[q];
-    \\  }
-    \\  // Ternary packs (bias == -scale): acc += s * (as * C - as * rs).
-    \\#pragma clang loop unroll(full)
-    \\  for (int i = 0; i < CAP; i++) {
-    \\    const int c = i & 3;
-    \\    const int nh = (i >> 3) & 1;
-    \\    const int mh = ((i >> 2) & 1) | (((i >> 4) & 1) << 1);
-    \\    if (NEG) {
-    \\      acc[i] = fma(sv[nh][c], fma(av[mh], float(cT[i]), -rv[mh]), acc[i]);
-    \\    } else {
-    \\      const float t = fma(sv[nh][c], float(cT[i]), bv[nh][c] * rv[mh]);
-    \\      acc[i] = fma(av[mh], t, acc[i]);
-    \\    }
-    \\  }
-    \\}
-    \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < CAP; i += 4) {
-    \\  const int nn = nb + 16 * ((i >> 3) & 1);
-    \\  const int mm = mb + 8 * ((i >> 2) & 1) + 16 * ((i >> 4) & 1);
-    \\  if (FULL) {
-    \\    *(device vec<T, 4>*)(y + (size_t)mm * N + nn) = vec<T, 4>(acc[i], acc[i + 1], acc[i + 2], acc[i + 3]);
-    \\  } else {
-    \\#pragma clang loop unroll(full)
-    \\    for (int c = 0; c < 4; c++) if (nn + c < N) y[(size_t)mm * N + nn + c] = static_cast<T>(acc[i + c]);
-    \\  }
-    \\}
-;
+pub const SOURCE = kernelSource("kernels/qmm/qmm_int8.metal");
 
 /// amax, scale, quantize and code-sum for one 128-group in ONE pass. Eight
 /// composed MLX ops each re-read and re-wrote the whole activation in f32,
 /// which MEASURED at ~2-3 ms/call at prompt width.
-pub const QUANT_SOURCE =
-    \\const int K = x_shape[1];
-    \\const int Kg = K / 128;
-    \\const uint row = threadgroup_position_in_grid.y;
-    \\const uint g = threadgroup_position_in_grid.x;
-    \\const uint lane = thread_index_in_simdgroup;
-    \\// Rows past the input's are the tile's padding: they quantize as zeros.
-    \\const bool live = int(row) < x_shape[0];
-    \\const device T* xr = x + (size_t)(live ? row : 0) * K + g * 128;
-    \\float v[4];
-    \\float a = 0.0f;
-    \\for (int i = 0; i < 4; ++i) { v[i] = live ? float(xr[lane * 4 + i]) : 0.0f; a = max(a, abs(v[i])); }
-    \\a = simd_max(a);
-    \\const float sc = max(a / 127.0f, 1.0e-20f);
-    \\float rs = 0.0f;
-    \\for (int i = 0; i < 4; ++i) {
-    \\  const float q = clamp(rint(v[i] / sc), -127.0f, 127.0f);
-    \\  rs += q;
-    \\  // Kernel K order: position 4b + kq of a 16-block is stored at 4kq + b.
-    \\  const uint p = lane * 4 + i;
-    \\  xq[(size_t)row * K + g * 128 + (p & ~15u) + (p & 3u) * 4 + ((p >> 2) & 3u)] = (int8_t)q;
-    \\}
-    \\rs = simd_sum(rs);
-    \\if (lane == 0) {
-    \\  ascale[(size_t)row * Kg + g] = sc;
-    \\  rsum[(size_t)row * Kg + g] = rs;
-    \\}
-;
+pub const QUANT_SOURCE = kernelSource("kernels/qmm/qmm_int8_quant.metal");
 
 /// `H(signs * x)` over one 1024 block (rht.zig's butterfly, rounded through T
 /// where the unfused route stores it), then `QUANT_SOURCE` on its eight
 /// 128-groups: the int8 route's input without the rotated activation in memory.
-pub const ROTQ_SOURCE =
-    \\constexpr int S = 4;
-    \\constexpr int P = 8;
-    \\threadgroup float tg[1024];
-    \\const int K = x_shape[1];
-    \\const int Kg = K / 128;
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const uint sg = simdgroup_index_in_threadgroup;
-    \\const uint col = threadgroup_position_in_grid.x * 1024;
-    \\const uint row = threadgroup_position_in_grid.y;
-    \\const bool live = int(row) < x_shape[0];
-    \\const device T* xr = x + (size_t)(live ? row : 0) * K + col;
-    \\float v[P];
-    \\for (int p = 0; p < P; ++p) {
-    \\  const uint i = (sg * P + p) * 32 + lane;
-    \\  v[p] = live ? float(xr[i]) * float(signs[col + i]) : 0.0f;
-    \\}
-    \\for (int h = 1; h < P; h <<= 1) {
-    \\  for (int p = 0; p < P; ++p) {
-    \\    if ((p & h) == 0) { float a = v[p], b = v[p + h]; v[p] = a + b; v[p + h] = a - b; }
-    \\  }
-    \\}
-    \\for (uint m = 1; m < 32; m <<= 1) {
-    \\  float sgn = (lane & m) ? -1.0f : 1.0f;
-    \\  for (int p = 0; p < P; ++p) v[p] = fma(sgn, v[p], simd_shuffle_xor(v[p], m));
-    \\}
-    \\for (int p = 0; p < P; ++p) tg[(sg * P + p) * 32 + lane] = v[p];
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\const float scale = rsqrt(1024.0f);
-    \\float o[2][S];
-    \\for (int t = 0; t < 2; ++t) {
-    \\  const uint p = sg + S * t;
-    \\  float w[S];
-    \\  for (int q = 0; q < S; ++q) w[q] = tg[(q * P + p) * 32 + lane];
-    \\  float a0 = w[0] + w[1], a1 = w[0] - w[1], a2 = w[2] + w[3], a3 = w[2] - w[3];
-    \\  w[0] = a0 + a2; w[2] = a0 - a2; w[1] = a1 + a3; w[3] = a1 - a3;
-    \\  for (int q = 0; q < S; ++q) o[t][q] = float(static_cast<T>(w[q] * scale));
-    \\}
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\for (int t = 0; t < 2; ++t)
-    \\  for (int q = 0; q < S; ++q) tg[(q * P + sg + S * t) * 32 + lane] = o[t][q];
-    \\threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\for (int gg = 0; gg < 2; ++gg) {
-    \\  const uint gl = sg * 2 + gg;
-    \\  float e[4];
-    \\  float a = 0.0f;
-    \\  for (int i = 0; i < 4; ++i) { e[i] = tg[gl * 128 + lane * 4 + i]; a = max(a, abs(e[i])); }
-    \\  a = simd_max(a);
-    \\  const float sc = max(a / 127.0f, 1.0e-20f);
-    \\  float rs = 0.0f;
-    \\  const size_t gb = (size_t)row * K + col + gl * 128;
-    \\  for (int i = 0; i < 4; ++i) {
-    \\    const float q = clamp(rint(e[i] / sc), -127.0f, 127.0f);
-    \\    rs += q;
-    \\    const uint p = lane * 4 + i;
-    \\    xq[gb + (p & ~15u) + (p & 3u) * 4 + ((p >> 2) & 3u)] = (int8_t)q;
-    \\  }
-    \\  rs = simd_sum(rs);
-    \\  if (lane == 0) {
-    \\    const size_t gi = (size_t)row * Kg + col / 128 + gl;
-    \\    ascale[gi] = sc;
-    \\    rsum[gi] = rs;
-    \\  }
-    \\}
-;
+pub const ROTQ_SOURCE = kernelSource("kernels/qmm/qmm_int8_rotq.metal");
 
 var quant_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const QKey = struct { m: c_int, k: c_int, dt: mlx.mlx_dtype };

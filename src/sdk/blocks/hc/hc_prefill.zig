@@ -1,4 +1,5 @@
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
@@ -50,7 +51,7 @@ fn getKernel(which: usize) !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(ins);
     const outs = if (which == 0) mlx.mlx_vector_string_new_data(&no, no.len) else mlx.mlx_vector_string_new_data(&mo, mo.len);
     defer _ = mlx.mlx_vector_string_free(outs);
-    const k = mlx.mlx_fast_metal_kernel_new(if (which == 0) "msv_hc_prefill_norm" else "msv_hc_prefill_mix", ins, outs, if (which == 0) @embedFile("../../../kernels/hc/hc_prefill_norm.metal") else @embedFile("../../../kernels/hc/hc_prefill_mix.metal"), "", true, false);
+    const k = mlx.mlx_fast_metal_kernel_new(if (which == 0) "msv_hc_prefill_norm" else "msv_hc_prefill_mix", ins, outs, if (which == 0) kernelSource("kernels/hc/hc_prefill_norm.metal") else kernelSource("kernels/hc/hc_prefill_mix.metal"), "", true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     kernels[which] = k;
     return k;

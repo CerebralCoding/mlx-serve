@@ -14,14 +14,23 @@ comptime {
 }
 
 test {
+    _ = @import("engines/ds4/engine.zig");
+    _ = @import("plugins/registry.zig");
     _ = @import("host/log.zig");
+    _ = @import("host/plugin_host_impl.zig");
     _ = @import("sdk/util/os_mutex.zig");
     _ = @import("sdk/util/crt.zig");
     _ = @import("sdk/util/win_io.zig");
     _ = @import("sdk/quant/gguf/claim.zig");
     if (@import("build_options").mlx_stream) _ = @import("sdk/weights/streamed/glue.zig");
     _ = @import("version.zig");
+    _ = @import("mlx/ops.zig");
+    _ = @import("mlx/kernels.zig");
+    _ = @import("sdk/bases/bases.zig");
+    _ = @import("sdk/testing/kernel_contract/registry.zig");
+    _ = @import("sdk/bases/proof/mixers.zig");
     _ = @import("host/chat/chat.zig");
+    _ = @import("engines/llama/engine.zig");
     _ = @import("host/chat/format_corpus_test.zig");
     _ = @import("host/chat/tool_traffic_replay_test.zig");
     _ = @import("engines/mlx/spec/mtp_replay_test.zig");
@@ -45,6 +54,7 @@ test {
     _ = @import("plugins/nemotron_diarization/diarization.zig");
     _ = @import("host/api/audio/transcription.zig");
     _ = @import("sdk/vision/mrope.zig");
+    _ = @import("engines/ane/engine.zig");
     _ = @import("sdk/quant/hadamard/rht.zig");
     _ = @import("sdk/blocks/qmm/qmv2.zig");
     _ = @import("sdk/blocks/qmm/qmv_cuda.zig");
@@ -67,6 +77,7 @@ test {
     _ = @import("plugins/glm5_next/mtp.zig");
     _ = @import("sdk/quant/exl3/sushi_pack.zig");
     _ = @import("sdk/quant/nvfp4/modelopt_pack.zig");
+    _ = @import("sdk/quant/formats.zig");
     _ = @import("sdk/blocks/qmm/mxfp8_qmv.zig");
     _ = @import("plugins/mimo_v2/dec_attn.zig");
     _ = @import("sdk/blocks/attention/nax_attention.zig");
@@ -122,6 +133,7 @@ test {
     _ = @import("engines/mlx/cache/ssd/disk_tier.zig");
     _ = @import("engines/mlx/cache/ssd/writer.zig");
     _ = @import("host/registry/discovery.zig");
+    _ = @import("host/registry/pack_dir.zig");
     _ = @import("host/registry/engine_pick.zig");
     _ = @import("host/registry/registry.zig");
     _ = @import("engines/mlx/scheduler.zig");
@@ -134,6 +146,8 @@ test {
         _ = @import("engines/llama/bridge.zig");
     }
     _ = @import("sdk/media/wav.zig");
+    _ = @import("sdk/media/bill.zig");
+    _ = @import("host/media_jobs/plugin_job.zig");
     _ = @import("plugins/qwen3_tts/tts.zig");
     _ = @import("plugins/flux2/flux.zig");
     _ = @import("plugins/krea/krea.zig");
@@ -172,6 +186,7 @@ test {
     _ = @import("plugins/music3/music3.zig");
     _ = @import("plugins/stable_audio3/stable_audio.zig");
     _ = @import("plugins/yue2/yue2.zig");
+    _ = @import("sdk/bases/dit.zig");
     _ = @import("plugins/trellis2/sparse.zig");
     _ = @import("plugins/trellis2/trellis2.zig");
     _ = @import("sdk/vision/dinov3.zig");
@@ -196,4 +211,6 @@ test {
     _ = @import("host/lan/lan.zig");
     _ = @import("host/api/providers.zig");
     _ = @import("mlx/ffi.zig");
+    _ = @import("testing/fake_engine.zig"); // the engine contract suite against the fake engines
+    _ = @import("abi/exactness_test.zig"); // the exactness contracts (run on the fakes from fake_engine.zig)
 }

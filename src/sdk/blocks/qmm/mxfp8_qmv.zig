@@ -2,6 +2,7 @@
 //! once and applied to every activation row. MLX's fp kernel decodes e4m3 per element; here two
 //! bytes become a half2 by bit placement.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
@@ -9,13 +10,7 @@ pub const MAX_ROWS: c_int = 8;
 const SGS: c_int = 4;
 
 /// Bytes 0 and 2 of `w` as a half2 (value x 2^-8), the e4m3 fields shifted into half's.
-pub const HEADER =
-    \\inline float2 mlxserve_e4m3x2(uint w) {
-    \\  const uint v = w & 0x00FF00FFu;
-    \\  return float2(as_type<half2>(((v & 0x007F007Fu) << 7) | ((v & 0x00800080u) << 8)));
-    \\}
-    \\
-;
+pub const HEADER = kernelSource("kernels/qmm/mxfp8_qmv_header.metal");
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
@@ -48,7 +43,7 @@ pub fn linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_
         defer _ = mlx.mlx_vector_string_free(in_vec);
         const out_vec = mlx.mlx_vector_string_new_data(&outs, outs.len);
         defer _ = mlx.mlx_vector_string_free(out_vec);
-        const k = mlx.mlx_fast_metal_kernel_new("mlxserve_mxfp8_qmv", in_vec, out_vec, @embedFile("../../../kernels/qmm/mxfp8_qmv.metal"), HEADER, true, false);
+        const k = mlx.mlx_fast_metal_kernel_new("mlxserve_mxfp8_qmv", in_vec, out_vec, kernelSource("kernels/qmm/mxfp8_qmv.metal"), HEADER, true, false);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         kernel = k;
     }

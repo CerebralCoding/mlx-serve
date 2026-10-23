@@ -9,6 +9,7 @@
 //! both looked up through the same row table). Every op rounds to T exactly where the unfused
 //! chain did, so it is bit-equal to it.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
@@ -23,77 +24,23 @@ const Kind = enum { plain, moe, mod };
 fn source(comptime kind: Kind) [:0]const u8 {
     const write_h = if (kind == .mod) "if (HAS_ADD) H_NEW[at] = hn;" else "H_NEW[at] = hn;";
     const out = switch (kind) {
-        .mod =>
-        \\{
-        \\    const T n = T(float(W[c]) * float(T(hv[p * 4 + i] * inv)));
-        \\    const size_t mi = size_t(ROWMOD[r]) * D + c;
-        \\    const T sc1 = T(float(SC[mi]) + 1.0f);
-        \\    const T mm = T(float(n) * float(sc1));
-        \\    HN[size_t(r) * D + c] = T(float(mm) + float(SH[mi]));
-        \\}
-        ,
+        .mod => kernelSource("kernels/norms/add_norm_mod_store.metal"),
         else => "HN[size_t(r) * D + c] = T(float(W[c]) * float(T(hv[p * 4 + i] * inv)));",
     };
-    return std.fmt.comptimePrint(
-        \\const uint t = thread_position_in_threadgroup.x;
-        \\const uint r = threadgroup_position_in_grid.x;
-        \\const uint lane = thread_index_in_simdgroup;
-        \\const uint sg = simdgroup_index_in_threadgroup;
-        \\constexpr int NC = (D + TN * 4 - 1) / (TN * 4);
-        \\threadgroup float local_sums[32];
-        \\float hv[NC * 4];
-        \\float acc = 0.0f;
-        \\for (int p = 0; p < NC; p++)
-        \\for (int i = 0; i < 4; i++) {{
-        \\    const int c = p * TN * 4 + int(t) * 4 + i;
-        \\    hv[p * 4 + i] = 0.0f;
-        \\    if (c < D) {{
-        \\        const size_t at = size_t(r) * D + c;
-        \\        float delta;
-        \\        {s}
-        \\        const T hn = T(float(H[at]) + delta);
-        \\        {s}
-        \\        hv[p * 4 + i] = float(hn);
-        \\    }}
-        \\    acc += hv[p * 4 + i] * hv[p * 4 + i];
-        \\}}
-        \\acc = simd_sum(acc);
-        \\if (sg == 0) local_sums[lane] = 0.0f;
-        \\threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\if (lane == 0) local_sums[sg] = acc;
-        \\threadgroup_barrier(mem_flags::mem_threadgroup);
-        \\const float total = simd_sum(local_sums[lane]);
-        \\const float inv = metal::precise::rsqrt(total / float(D) + eps);
-        \\for (int p = 0; p < NC; p++)
-        \\for (int i = 0; i < 4; i++) {{
-        \\    const int c = p * TN * 4 + int(t) * 4 + i;
-        \\    if (c < D) {s}
-        \\}}
-    , .{ switch (kind) {
-        .mod =>
+    const delta = switch (kind) {
         // Gated residual: the product rounds to T before the add, like the chain's mul then add.
-        \\{
-        \\    delta = 0.0f;
-        \\    if (HAS_ADD) delta = float(T(float(X[at]) * float(G[size_t(ROWMOD[r]) * D + c])));
-        \\}
-        ,
-        .moe =>
+        .mod => kernelSource("kernels/norms/add_norm_mod_delta.metal"),
         // The chain's own rounding points: f32 multiply-adds over the K slots
         // in slot order, `.astype` to T, the shared expert added in T.
-        \\{
-        \\    float routed = 0.0f;
-        \\    for (int e = 0; e < K; e++) routed += float(Y[(size_t(r) * K + e) * D + c]) * WT[r * K + e];
-        \\    delta = float(T(routed));
-        \\    if (SHARED) delta = float(T(delta + float(XS[at])));
-        \\}
-        ,
+        .moe => kernelSource("kernels/norms/add_norm_moe_delta.metal"),
         .plain => "delta = float(X[at]);",
-    }, write_h, out });
+    };
+    return std.fmt.comptimePrint(kernelSource("kernels/norms/add_norm.fmt.metal"), .{ delta, write_h, out });
 }
 
-const PLAIN_SOURCE = source(.plain);
-const MOE_SOURCE = source(.moe);
-const MOD_SOURCE = source(.mod);
+pub const PLAIN_SOURCE = source(.plain);
+pub const MOE_SOURCE = source(.moe);
+pub const MOD_SOURCE = source(.mod);
 
 var plain_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var moe_kernel: ?mlx.mlx_fast_metal_kernel = null;

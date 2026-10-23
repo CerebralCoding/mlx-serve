@@ -4,6 +4,7 @@
 //! slice load contiguously); the dot product is the same under that k permutation as long as
 //! A and B use it alike. Story and measurements: docs/CUDA.md.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const errVsTruth = @import("qmv2.zig").errVsTruth;
@@ -12,94 +13,12 @@ pub const MAX_ROWS = 8;
 /// Warps of a block split K over the same 16 weight rows, then reduce through shared memory.
 const SPLIT_K = 16;
 
-const HEADER =
-    \\__device__ __forceinline__ uint32_t msv_pack2(float a, float b, __nv_bfloat16*) {
-    \\  __nv_bfloat162 v = __floats2bfloat162_rn(a, b);
-    \\  return *reinterpret_cast<uint32_t*>(&v);
-    \\}
-    \\__device__ __forceinline__ uint32_t msv_pack2(float a, float b, __half*) {
-    \\  __half2 v = __floats2half2_rn(a, b);
-    \\  return *reinterpret_cast<uint32_t*>(&v);
-    \\}
-    \\// A view's data offset can leave x or w off a 16-byte boundary: those calls read bytewise.
-    \\__device__ __forceinline__ uint4 msv_ld16(const void* p, bool aligned) {
-    \\  if (aligned) return *reinterpret_cast<const uint4*>(p);
-    \\  uint4 v;
-    \\  memcpy(&v, p, 16);
-    \\  return v;
-    \\}
-    \\__device__ __forceinline__ void msv_mma(float* c, const uint32_t* a, const uint32_t* b, __nv_bfloat16*) {
-    \\  asm("mma.sync.aligned.m16n8k16.row.col.f32.bf16.bf16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-    \\      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-    \\      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-    \\}
-    \\__device__ __forceinline__ void msv_mma(float* c, const uint32_t* a, const uint32_t* b, __half*) {
-    \\  asm("mma.sync.aligned.m16n8k16.row.col.f32.f16.f16.f32 {%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%0,%1,%2,%3};\n"
-    \\      : "+f"(c[0]), "+f"(c[1]), "+f"(c[2]), "+f"(c[3])
-    \\      : "r"(a[0]), "r"(a[1]), "r"(a[2]), "r"(a[3]), "r"(b[0]), "r"(b[1]));
-    \\}
-    \\
-;
+const HEADER = kernelSource("kernels/qmm/qmv_cuda_header.cu");
 
 // Lane (gid = lane/4, tig = lane%4) owns k = blk*128 + tig*32 .. +31 of weight rows gid and
 // gid+8 and of x row gid. Mma step s feeds k offsets s*4+{0,1} as the fragment's tig*2+{0,1}
 // and s*4+{2,3} as its tig*2+8+{0,1}.
-const SOURCE =
-    \\__shared__ float red[SK][32][4];
-    \\const int lane = threadIdx.x, warp = threadIdx.y;
-    \\const int gid = lane >> 2, tig = lane & 3;
-    \\const int m = x_shape[0], k = x_shape[1], n = w_shape[0];
-    \\const int r0 = blockIdx.z * 16 + gid, r1 = r0 + 8;
-    \\const int groups = k / GROUP, nblk = k / 128;
-    \\const int b0 = warp * nblk / SK, b1 = (warp + 1) * nblk / SK;
-    \\T* tag = nullptr;
-    \\float c[4] = {0.f, 0.f, 0.f, 0.f};
-    \\const bool xrow = gid < m;
-    \\const T* xr = x + (size_t)(xrow ? gid : 0) * k;
-    \\const uint4 zero = make_uint4(0, 0, 0, 0);
-    \\const bool al = ((reinterpret_cast<uintptr_t>(x) | reinterpret_cast<uintptr_t>(w)) & 15) == 0;
-    \\for (int blk = b0; blk < b1; ++blk) {
-    \\  const int kb = blk * 128 + tig * 32;
-    \\  const int g = kb / GROUP;
-    \\  uint4 xv[4];
-    \\  for (int j = 0; j < 4; ++j) xv[j] = xrow ? msv_ld16(xr + kb + j * 8, al) : zero;
-    \\  const uint4 q0 = r0 < n ? msv_ld16(w + ((size_t)r0 * k + kb) / 8, al) : zero;
-    \\  const uint4 q1 = r1 < n ? msv_ld16(w + ((size_t)r1 * k + kb) / 8, al) : zero;
-    \\  const float s0 = r0 < n ? static_cast<float>(scales[(size_t)r0 * groups + g]) : 0.f;
-    \\  const float c0 = r0 < n ? static_cast<float>(biases[(size_t)r0 * groups + g]) : 0.f;
-    \\  const float s1 = r1 < n ? static_cast<float>(scales[(size_t)r1 * groups + g]) : 0.f;
-    \\  const float c1 = r1 < n ? static_cast<float>(biases[(size_t)r1 * groups + g]) : 0.f;
-    \\  const uint32_t* xp = reinterpret_cast<const uint32_t*>(xv);
-    \\  const uint32_t* p0 = reinterpret_cast<const uint32_t*>(&q0);
-    \\  const uint32_t* p1 = reinterpret_cast<const uint32_t*>(&q1);
-    \\#pragma unroll
-    \\  for (int s = 0; s < 8; ++s) {
-    \\    const uint32_t w0 = p0[s / 2] >> ((s & 1) * 16), w1 = p1[s / 2] >> ((s & 1) * 16);
-    \\    float f0[4], f1[4];
-    \\#pragma unroll
-    \\    for (int i = 0; i < 4; ++i) {
-    \\      f0[i] = float((w0 >> (4 * i)) & 0xF) * s0 + c0;
-    \\      f1[i] = float((w1 >> (4 * i)) & 0xF) * s1 + c1;
-    \\    }
-    \\    const uint32_t a[4] = {msv_pack2(f0[0], f0[1], tag), msv_pack2(f1[0], f1[1], tag),
-    \\                           msv_pack2(f0[2], f0[3], tag), msv_pack2(f1[2], f1[3], tag)};
-    \\    const uint32_t b[2] = {xp[s * 2], xp[s * 2 + 1]};
-    \\    msv_mma(c, a, b, tag);
-    \\  }
-    \\}
-    \\for (int i = 0; i < 4; ++i) red[warp][lane][i] = c[i];
-    \\__syncthreads();
-    \\if (warp != 0) return;
-    \\float v[4] = {0.f, 0.f, 0.f, 0.f};
-    \\for (int sw = 0; sw < SK; ++sw)
-    \\  for (int i = 0; i < 4; ++i) v[i] += red[sw][lane][i];
-    \\const int col = tig * 2;
-    \\for (int e = 0; e < 2; ++e) {
-    \\  if (col + e >= m) continue;
-    \\  if (r0 < n) out[(size_t)(col + e) * n + r0] = static_cast<T>(v[e]);
-    \\  if (r1 < n) out[(size_t)(col + e) * n + r1] = static_cast<T>(v[2 + e]);
-    \\}
-;
+const SOURCE = kernelSource("kernels/qmm/qmv_cuda.cu");
 
 /// Measured on sm_120 (RTX 5060 Ti); every other device keeps MLX's own kernels unless
 /// `MLX_SERVE_CUDA_QMV_TC=1`. `=0` turns it off everywhere. The bf16/f16 mma needs sm_80.

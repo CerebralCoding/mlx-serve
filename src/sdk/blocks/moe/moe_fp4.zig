@@ -5,6 +5,7 @@
 //! read once per row group rather than once per row. ModelOpt NVFP4 banks add a
 //! per-expert gate scale (before the SiLU); their up x down scales ride the scores.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const xfm = @import("../../../engines/mlx/transformer.zig");
 const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
@@ -16,134 +17,27 @@ const SGS: c_int = 2;
 pub const MAX_ROWS: c_int = 2;
 
 /// e2m1 nibble -> its value times 2^-14, by bit placement into a half.
-pub const E2M1_HEADER =
-    \\inline float mlxserve_e2m1(uint c) {
-    \\  return float(as_type<half>(ushort(((c & 0x7u) << 9) | ((c & 0x8u) << 12))));
-    \\}
-    \\
-;
+pub const E2M1_HEADER = kernelSource("kernels/moe/moe_fp4_e2m1_header.metal");
 /// Group scale -> its value times 2^-8: e4m3 (NVFP4) by bit placement into a
 /// half, e8m0 (MXFP4) as MLX's `fp8_e8m0` reads it (the byte is a float
 /// exponent, 0 is 2^-127). With the e2m1 2^-14, one 2^22 multiply restores both.
-const NV_SCALE =
-    \\inline float mlxserve_fp4_scale(uint b) {
-    \\  return float(as_type<half>(ushort(((b & 0x7Fu) << 7) | ((b & 0x80u) << 8))));
-    \\}
-    \\
-;
-const MX_SCALE =
-    \\inline float mlxserve_fp4_scale(uint b) {
-    \\  return as_type<float>(b == 0u ? 0x400000u : (b << 23)) * 0.00390625f;
-    \\}
-    \\
-;
+const NV_SCALE = kernelSource("kernels/moe/moe_fp4_nv_scale.metal");
+const MX_SCALE = kernelSource("kernels/moe/moe_fp4_mx_scale.metal");
 
 /// Nibbles j and j+4 of a word decode together: one shift puts them in the two halves of a
 /// half2, then the e2m1 bit placement serves both lanes.
-pub const E2M1X2_HEADER =
-    \\inline float2 mlxserve_e2m1x2(uint w, int j) {
-    \\  const uint v = w >> (4 * j);
-    \\  return float2(as_type<half2>(((v & 0x70007u) << 9) | ((v & 0x80008u) << 12)));
-    \\}
-    \\
-;
+pub const E2M1X2_HEADER = kernelSource("kernels/moe/moe_fp4_e2m1x2_header.metal");
 
-const DOT16 = E2M1X2_HEADER ++
-    \\inline float mlxserve_fp4_dot16(uint2 w, thread const float* x) {
-    \\  float a = 0.0f, b = 0.0f;
-    \\  for (int j = 0; j < 4; ++j) {
-    \\    const float2 p = mlxserve_e2m1x2(w.x, j);
-    \\    const float2 q = mlxserve_e2m1x2(w.y, j);
-    \\    a += x[j] * p.x + x[j + 4] * p.y;
-    \\    b += x[8 + j] * q.x + x[12 + j] * q.y;
-    \\  }
-    \\  return a + b;
-    \\}
-;
+const DOT16 = E2M1X2_HEADER ++ kernelSource("kernels/moe/moe_fp4_dot16.metal");
 
 // grid (32, N/ROWS, R*TOPK), threadgroup (32, SGS, 1): slot e is token e / TOPK's
 // e % TOPK-th expert. USCALE and CLAMP are the per-expert up scale and GLM's whole-number SwiGLU clamp. The e2m1 and scale decodes each scale by a power of two;
 // 2^22 folds both back once per row.
-const GATEUP_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int row0 = int(thread_position_in_grid.y) * ROWS;
-    \\const uint e = thread_position_in_grid.z;
-    \\const device auto* xt = x + size_t(e / TOPK) * K;
-    \\constexpr int KW2 = K / 16;
-    \\constexpr int KG = K / GS;
-    \\const size_t row = size_t(inds[e]) * N + row0;
-    \\const device uint2* gw = (const device uint2*)wg_q + row * KW2 + lane;
-    \\const device uint2* uw = (const device uint2*)wu_q + row * KW2 + lane;
-    \\float ag[ROWS] = {0.0f};
-    \\float au[ROWS] = {0.0f};
-    \\for (int k = 0; k < K; k += 512) {
-    \\  const int kk = k + int(lane) * 16;
-    \\  if (kk < K) {
-    \\    float xr[16];
-    \\    for (int i = 0; i < 16; ++i) xr[i] = float(xt[kk + i]);
-    \\    const int gi = kk / GS;
-    \\    for (int r = 0; r < ROWS; ++r) {
-    \\      const size_t sg = (row + r) * KG + gi;
-    \\      ag[r] += mlxserve_fp4_dot16(gw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale(uint(g_scales[sg]));
-    \\      au[r] += mlxserve_fp4_dot16(uw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale(uint(u_scales[sg]));
-    \\    }
-    \\  }
-    \\}
-    \\for (int r = 0; r < ROWS; ++r) {
-    \\  const float g = simd_sum(ag[r]) * 4194304.0f;
-    \\  const float u = simd_sum(au[r]) * 4194304.0f;
-    \\  if (lane == 0) {
-    \\    T gt = GSCALE != 0 ? T(T(g) * gsc[inds[e]]) : T(g);
-    \\    T ut = USCALE != 0 ? T(T(u) * usc[inds[e]]) : T(u);
-    \\    if (CLAMP != 0) {
-    \\      const float hi = float(T(float(CLAMP)));
-    \\      gt = T(min(float(gt), hi));
-    \\      ut = T(clamp(float(ut), -hi, hi));
-    \\    }
-    \\    y[size_t(e) * N + row0 + r] = (gt * sigtab[as_type<ushort>(gt)]) * ut;
-    \\  }
-    \\}
-;
+const GATEUP_SOURCE = kernelSource("kernels/moe/moe_fp4_gateup.metal");
 
 // grid (32, H/ROWS, R), threadgroup (32, SGS, 1): every expert's down row for
 // token tok, weighted by its routing score, accumulated in the same registers.
-const DOWNRED_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int row0 = int(thread_position_in_grid.y) * ROWS;
-    \\const int tok = int(thread_position_in_grid.z);
-    \\constexpr int KW2 = I / 16;
-    \\constexpr int KG = I / GS;
-    \\float acc[ROWS] = {0.0f};
-    \\for (int e = tok * TOPK; e < (tok + 1) * TOPK; ++e) {
-    \\  const size_t row = size_t(inds[e]) * H + row0;
-    \\  const device uint2* dw = (const device uint2*)wd_q + row * KW2 + lane;
-    \\  const float sc = float(scores[e]);
-    \\  for (int k = 0; k < I; k += 512) {
-    \\    const int kk = k + int(lane) * 16;
-    \\    if (kk < I) {
-    \\      float xr[16];
-    \\      for (int i = 0; i < 16; ++i) xr[i] = float(act[size_t(e) * I + kk + i]);
-    \\      const int gi = kk / GS;
-    \\      for (int r = 0; r < ROWS; ++r)
-    \\        acc[r] += sc * mlxserve_fp4_dot16(dw[r * KW2 + k / 16], xr) * mlxserve_fp4_scale(uint(d_scales[(row + r) * KG + gi]));
-    \\    }
-    \\  }
-    \\}
-    \\for (int r = 0; r < ROWS; ++r) {
-    \\  const float v = simd_sum(acc[r]) * 4194304.0f;
-    \\  if (lane == 0) {
-    \\    T out = T(v);
-    \\    if (SHARED != 0) {
-    \\      // The gated shared expert joins as `moe_affine4` adds it: sigmoid in T, product and sum rounded to T.
-    \\      const T gl = glog[0];
-    \\      auto sy = 1 / (1 + metal::precise::exp(metal::abs(gl)));
-    \\      const T sig = (gl < 0) ? sy : 1 - sy;
-    \\      out = T(float(out) + float(T(float(sig) * float(sdown[row0 + r]))));
-    \\    }
-    \\    y[size_t(tok) * H + row0 + r] = out;
-    \\  }
-    \\}
-;
+const DOWNRED_SOURCE = kernelSource("kernels/moe/moe_fp4_downred.metal");
 
 const Kernels = struct { gateup: ?mlx.mlx_fast_metal_kernel = null, downred: ?mlx.mlx_fast_metal_kernel = null };
 /// Indexed by format: nvfp4, mxfp4.

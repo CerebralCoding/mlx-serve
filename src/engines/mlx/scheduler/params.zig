@@ -11,7 +11,6 @@ const chat_mod = @import("../../../host/chat/chat.zig");
 const prefix_cache_mod = @import("../cache/prefix_cache.zig");
 const metrics_mod = @import("../../../host/metrics/metrics.zig");
 const model_registry_mod = @import("../../../host/registry/registry.zig");
-const arch_llama = if (@import("build_options").llama_engine) @import("../../llama/bridge.zig") else @import("../../llama/stub.zig");
 const ModelConfig = model_mod.ModelConfig;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const SamplingParams = generate_mod.SamplingParams;
@@ -26,17 +25,7 @@ const testing = std.testing;
 const BudgetRevise = @import("../cache/budget.zig").BudgetRevise;
 const scheduler_mod = @import("../scheduler.zig");
 
-/// Launch settings of the embedded llama.cpp engine (`--llama-*`).
-pub const LlamaSettings = struct {
-    /// Sequences per model: requests decoded together in one batch, each
-    /// keeping its own prompt KV for prefix reuse.
-    seqs: u32 = 4,
-    kv_quant: arch_llama.LlamaKvQuant = .off,
-    /// Physical prefill batch; 0 = libllama's default.
-    ubatch: u32 = 0,
-    /// Draft tokens per MTP round when the model ships a head; 0 = off.
-    mtp_drafts: u32 = 2,
-};
+pub const LlamaSettings = @import("../../llama/load.zig").Settings;
 
 /// Phase A1: model-load plan executed on the scheduler's inference thread.
 ///

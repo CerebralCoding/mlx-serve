@@ -2,6 +2,7 @@
 //! Owns QSA_ATTN_CONSTS, QSA_ATTN_Q_CONSTS, QSA_ATTN_ROW_GRID, QSA_ATTN_Q_STRIDES, QSA_ATTN_D_STRIDES, QSA_ATTN_ROW, and 67 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const kv_quant = @import("../../../engines/mlx/cache/kv_quant.zig");
 const log = @import("../../../host/log.zig");
@@ -60,357 +61,53 @@ const qsaVerifyGatherMinKvFor = @import("verify_gather.zig").qsaVerifyGatherMinK
 // cache runs the same split pass with `msv_attn_qsa256`'s plain uint4 loads: the source is
 // built from shared pieces, and only the prologue, the K/V loads and their bases differ per variant.
 /// Shared by every variant of the split pass: tile constants.
-const QSA_ATTN_CONSTS =
-    \\constexpr int BD = 256;
-    \\constexpr int LDK = BK + 8;
-    \\constexpr int LDV = BD + 8;
-    \\constexpr int NT = 32 * NSG;
-    \\constexpr int KT = BK / 8;
-    \\
-;
+const QSA_ATTN_CONSTS = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_consts.metal");
 
 /// Quantized variant: unpack constants (BITS is its template).
-const QSA_ATTN_Q_CONSTS =
-    \\constexpr int VPW = 32 / BITS;
-    \\constexpr int NW = 8 / VPW;
-    \\constexpr uint MASKB = (1u << BITS) - 1u;
-    \\
-;
+const QSA_ATTN_Q_CONSTS = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_q_consts.metal");
 
 /// Shared: the row's geometry and grid position. Both variants name their K/V inputs
 /// `kq`/`vq`, so `kq_shape` is the key count in either.
-const QSA_ATTN_ROW_GRID =
-    \\
-    \\const int qL = q_shape[2];
-    \\const int kL = kq_shape[2];
-    \\const int Hq = q_shape[1];
-    \\const int Hk = kq_shape[1];
-    \\const int gqa = Hq / Hk;
-    \\const int KB = blocks_shape[2];
-    \\
-    \\const int s = int(threadgroup_position_in_grid.x);
-    \\const int hk = int(threadgroup_position_in_grid.y);
-    \\// One view pins batch to 1 (qs[0] != n declines), so the grid's z is
-    \\// free to carry the split index instead of the batch index.
-    \\const int bb = 0;
-    \\const int jsp = int(threadgroup_position_in_grid.z);
-    \\
-;
+const QSA_ATTN_ROW_GRID = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_row_grid.metal");
 
 /// The shared fragments read strides only through `qS`/`blS`/`kqS`/..., which each kernel's prologue
 /// defines from its own inputs (these two copy the bound strides; the slot kernel derives them from `meta`).
-const QSA_ATTN_Q_STRIDES =
-    \\const long qS[3] = {q_strides[0], q_strides[1], q_strides[2]};
-    \\const long blS[2] = {blocks_strides[0], blocks_strides[1]};
-    \\const long kqS[3] = {kq_strides[0], kq_strides[1], kq_strides[2]};
-    \\const long kscS[3] = {ksc_strides[0], ksc_strides[1], ksc_strides[2]};
-    \\const long kbiS[3] = {kbi_strides[0], kbi_strides[1], kbi_strides[2]};
-    \\const long vqS[3] = {vq_strides[0], vq_strides[1], vq_strides[2]};
-    \\const long vscS[3] = {vsc_strides[0], vsc_strides[1], vsc_strides[2]};
-    \\const long vbiS[3] = {vbi_strides[0], vbi_strides[1], vbi_strides[2]};
-    \\
-;
+const QSA_ATTN_Q_STRIDES = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_q_strides.metal");
 
-const QSA_ATTN_D_STRIDES =
-    \\const long qS[3] = {q_strides[0], q_strides[1], q_strides[2]};
-    \\const long blS[2] = {blocks_strides[0], blocks_strides[1]};
-    \\const long kqS[4] = {kq_strides[0], kq_strides[1], kq_strides[2], kq_strides[3]};
-    \\const long vqS[4] = {vq_strides[0], vq_strides[1], vq_strides[2], vq_strides[3]};
-    \\
-;
+const QSA_ATTN_D_STRIDES = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_d_strides.metal");
 
 /// Shared: the row's visible range, its split and its block list.
-const QSA_ATTN_ROW =
-    \\const ushort lane = ushort(thread_index_in_simdgroup);
-    \\const ushort warp = ushort(simdgroup_index_in_threadgroup);
-    \\const int tix = int(thread_index_in_threadgroup);
-    \\
-    \\const float scale_log2e = scl[0] * 1.44269504088896340736f;
-    \\// Query s sits at absolute key position p (bottom-right aligned). Its
-    \\// visible keys: `count` complete blocks, then the tail [tail_start, p].
-    \\const int p = (kL - qL) + s;
-    \\const int complete = (p + 1) / RATIO;
-    \\const int count = metal::min(complete, KB);
-    \\const int sel_len = count * RATIO;
-    \\const int tail_start = complete * RATIO;
-    \\const int L = sel_len + (p + 1 - tail_start);
-    \\// Split-K. This threadgroup owns virtual keys [t_lo, t_hi) of the row's
-    \\// own range [0, L). The virtual index already concatenates the row's
-    \\// selected blocks and THEN its ragged tail, so a contiguous virtual
-    \\// range is exactly a contiguous block range — plus, for the last
-    \\// non-empty split, the tail. Boundaries are BK-aligned so every tile
-    \\// but a split's last is full. A split starting past L is EMPTY and
-    \\// writes the merge's identity.
-    \\const int tiles = (L + BK - 1) / BK;
-    \\// BALANCED=0 (default, MEASURED): ceil(tiles/NSPLIT) per split, so the
-    \\// last splits can be short or empty — at the swept shape 129 tiles over
-    \\// 16 splits is 14 full, 1 partial, 1 empty. BALANCED=1 spreads the
-    \\// remainder one tile per split instead. Strictly better load balance on
-    \\// paper; NOT the default because the sweep that chose NSPLIT=16 ran on
-    \\// the ceil distribution, and changing how work is divided invalidates
-    \\// it. Same outputs either way — the split boundaries move, the merge is
-    \\// exact over whatever they are.
-    \\int t_lo, t_hi;
-    \\if (BALANCED) {
-    \\  const int base_t = tiles / NSPLIT;
-    \\  const int rem_t = tiles % NSPLIT;
-    \\  const int start_t = jsp * base_t + metal::min(jsp, rem_t);
-    \\  const int cnt_t = base_t + ((jsp < rem_t) ? 1 : 0);
-    \\  t_lo = start_t * BK;
-    \\  t_hi = metal::min(L, (start_t + cnt_t) * BK);
-    \\} else {
-    \\  const int tiles_per = (tiles + NSPLIT - 1) / NSPLIT;
-    \\  t_lo = jsp * tiles_per * BK;
-    \\  t_hi = metal::min(L, t_lo + tiles_per * BK);
-    \\}
-    \\
-    \\const device int* blk = blocks + (long)bb * blS[0] + (long)s * blS[1];
-    \\
-;
+const QSA_ATTN_ROW = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_row.metal");
 
 /// Quantized variant: per-head bases of the six packed arrays.
-const QSA_ATTN_Q_BASES =
-    \\const long kq_base  = (long)bb * kqS[0]  + (long)hk * kqS[1];
-    \\const long ksc_base = (long)bb * kscS[0] + (long)hk * kscS[1];
-    \\const long kbi_base = (long)bb * kbiS[0] + (long)hk * kbiS[1];
-    \\const long vq_base  = (long)bb * vqS[0]  + (long)hk * vqS[1];
-    \\const long vsc_base = (long)bb * vscS[0] + (long)hk * vscS[1];
-    \\const long vbi_base = (long)bb * vbiS[0] + (long)hk * vbiS[1];
-    \\
-;
+const QSA_ATTN_Q_BASES = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_q_bases.metal");
 
 /// Dense variant: per-head bases of the bf16 K and V, and whether each can take uint4
 /// loads. A uint4 needs a 16-byte address: the bound pointer (which carries the view's data
 /// offset, invisible to the host) and every row start. Anything else — an offset slice, a
 /// padded or non-unit innermost layout — reads element by element through its strides.
-const QSA_ATTN_D_BASES =
-    \\const long kq_base = (long)bb * kqS[0] + (long)hk * kqS[1];
-    \\const long vq_base = (long)bb * vqS[0] + (long)hk * vqS[1];
-    \\const bool k_vec = (reinterpret_cast<ulong>(kq) & 15ul) == 0 && kqS[3] == 1 &&
-    \\    (kqS[2] & 7) == 0 && (kqS[1] & 7) == 0;
-    \\const bool v_vec = (reinterpret_cast<ulong>(vq) & 15ul) == 0 && vqS[3] == 1 &&
-    \\    (vqS[2] & 7) == 0 && (vqS[1] & 7) == 0;
-    \\
-;
+const QSA_ATTN_D_BASES = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_d_bases.metal");
 
 /// Shared: staging, Q fragments, and the head of the key-tile loop.
-const QSA_ATTN_TILE_OPEN =
-    \\
-    \\threadgroup T KVs[LDK * BD];
-    \\threadgroup T* Ks = KVs;
-    \\threadgroup T* Vs = KVs;
-    \\
-    \\const short2 sc = msv_coord(lane);
-    \\const short sn = sc.x;
-    \\const short sm = sc.y;
-    \\const short tm = 8 * short(warp);
-    \\const int Ks_off = sm * LDK + sn;
-    \\const int Vs_off = sm * LDV + sn;
-    \\const int row = tm + sm;
-    \\const bool row_ok = row < gqa;
-    \\
-    \\float2 Qfrag[BD / 8];
-    \\if (row_ok) {
-    \\  const device T* Qrow = q + bb * qS[0] + (long)(hk * gqa + row) * qS[1] + (long)s * qS[2];
-    \\  for (int dd = 0; dd < BD / 8; ++dd) {
-    \\    const vec<T, 2> pr = *((const device vec<T, 2>*)(Qrow + dd * 8 + sn));
-    \\    Qfrag[dd] = float2(float(pr.x), float(pr.y));
-    \\  }
-    \\} else {
-    \\  for (int dd = 0; dd < BD / 8; ++dd) Qfrag[dd] = float2(0.0f);
-    \\}
-    \\float2 Ofrag[BD / 8];
-    \\for (int i = 0; i < BD / 8; ++i) Ofrag[i] = float2(0.0f);
-    \\float max_score = -3.0e38f;
-    \\float sum_score = 0.0f;
-    \\
-    \\for (int t0 = t_lo; t0 < t_hi; t0 += BK) {
-    \\  const int rows_k = metal::min(BK, t_hi - t0);
-    \\
-    \\
-;
+const QSA_ATTN_TILE_OPEN = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_tile_open.metal");
 
 /// Quantized variant: K tile, unpacked in-kernel.
-const QSA_ATTN_Q_KLOAD =
-    \\  // K tile: dequantize into the SAME transposed staging the dense
-    \\  // kernel fills, so the fragment math below is untouched. The 8 dims of
-    \\  // one chunk share a quant group (GS is a multiple of 8), so the
-    \\  // scale/bias pair is read once per chunk, not per element.
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
-    \\    const int r = i >> 5;
-    \\    const int c8 = i & 31;
-    \\    const int cb = c8 * 8;
-    \\    T ev[8];
-    \\    if (r < rows_k) {
-    \\      const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
-    \\      const long wrow = kq_base + (long)pos * kqS[2];
-    \\      const int g = cb / GS;
-    \\      const float sj = float(ksc[ksc_base + (long)pos * kscS[2] + (long)g]);
-    \\      const float bj = float(kbi[kbi_base + (long)pos * kbiS[2] + (long)g]);
-    \\      for (int wj = 0; wj < NW; ++wj) {
-    \\        const uint w = uint(kq[wrow + (long)(cb / VPW + wj)]);
-    \\        for (int u = 0; u < VPW; ++u) ev[wj * VPW + u] = T(float((w >> (u * BITS)) & MASKB) * sj + bj);
-    \\      }
-    \\    } else {
-    \\      for (int j = 0; j < 8; ++j) ev[j] = T(0.0f);
-    \\    }
-    \\    for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = ev[j];
-    \\  }
-    \\
-;
+const QSA_ATTN_Q_KLOAD = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_q_kload.metal");
 
 /// Dense variant: K tile, read straight from the bf16 cache.
-const QSA_ATTN_D_KLOAD =
-    \\  // K tile: `msv_attn_qsa256`'s load, eight elements per uint4 (element
-    \\  // loads when `k_vec` is false), into the transposed staging.
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
-    \\    const int r = i >> 5;
-    \\    const int c8 = i & 31;
-    \\    uint4 w = uint4(0);
-    \\    thread T* e = (thread T*)&w;
-    \\    if (r < rows_k) {
-    \\      const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
-    \\      const long rb = kq_base + (long)pos * kqS[2];
-    \\      if (k_vec) {
-    \\        w = *((const device uint4*)(kq + rb) + c8);
-    \\      } else {
-    \\        for (int j = 0; j < 8; ++j) e[j] = kq[rb + (long)(c8 * 8 + j) * kqS[3]];
-    \\      }
-    \\    }
-    \\    const int cb = c8 * 8;
-    \\    for (int j = 0; j < 8; ++j) Ks[(cb + j) * LDK + r] = e[j];
-    \\  }
-    \\
-;
+const QSA_ATTN_D_KLOAD = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_d_kload.metal");
 
 /// Shared: scores and the ragged-tile mask.
-const QSA_ATTN_SCORES =
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\
-    \\  float2 Sfrag[KT];
-    \\  for (int i = 0; i < KT; ++i) Sfrag[i] = float2(0.0f);
-    \\  for (int dd = 0; dd < BD / 8; ++dd) {
-    \\    const float2 qf = Qfrag[dd];
-    \\    const int kbase = Ks_off + dd * 8 * LDK;
-    \\    for (int kt = 0; kt < KT; ++kt) {
-    \\      const float2 kf = float2(float(Ks[kbase + kt * 8]), float(Ks[kbase + kt * 8 + 1]));
-    \\      msv_mma(Sfrag[kt], qf, kf);
-    \\    }
-    \\  }
-    \\  for (int kt = 0; kt < KT; ++kt) Sfrag[kt] *= scale_log2e;
-    \\  if (rows_k < BK) {
-    \\    for (int kt = 0; kt < KT; ++kt) {
-    \\      if (kt * 8 + sn >= rows_k) Sfrag[kt].x = -INFINITY;
-    \\      if (kt * 8 + sn + 1 >= rows_k) Sfrag[kt].y = -INFINITY;
-    \\    }
-    \\  }
-    \\
-    \\
-;
+const QSA_ATTN_SCORES = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_scores.metal");
 
 /// Quantized variant: V tile, unpacked in-kernel.
-const QSA_ATTN_Q_VLOAD =
-    \\  // V tile: dequantize straight into the row-major staging.
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
-    \\    const int r = i >> 5;
-    \\    const int c8 = i & 31;
-    \\    const int cb = c8 * 8;
-    \\    T ev[8];
-    \\    if (r < rows_k) {
-    \\      const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
-    \\      const long wrow = vq_base + (long)pos * vqS[2];
-    \\      const int g = cb / GS;
-    \\      const float sj = float(vsc[vsc_base + (long)pos * vscS[2] + (long)g]);
-    \\      const float bj = float(vbi[vbi_base + (long)pos * vbiS[2] + (long)g]);
-    \\      for (int wj = 0; wj < NW; ++wj) {
-    \\        const uint w = uint(vq[wrow + (long)(cb / VPW + wj)]);
-    \\        for (int u = 0; u < VPW; ++u) ev[wj * VPW + u] = T(float((w >> (u * BITS)) & MASKB) * sj + bj);
-    \\      }
-    \\    } else {
-    \\      for (int j = 0; j < 8; ++j) ev[j] = T(0.0f);
-    \\    }
-    \\    for (int j = 0; j < 8; ++j) Vs[r * LDV + cb + j] = ev[j];
-    \\  }
-    \\
-;
+const QSA_ATTN_Q_VLOAD = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_q_vload.metal");
 
 /// Dense variant: V tile, read straight from the bf16 cache.
-const QSA_ATTN_D_VLOAD =
-    \\  // V tile: uint4 copies (element loads when `v_vec` is false) straight
-    \\  // into the row-major staging.
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = tix; i < BK * (BD / 8); i += NT) {
-    \\    const int r = i >> 5;
-    \\    const int c8 = i & 31;
-    \\    uint4 w = uint4(0);
-    \\    if (r < rows_k) {
-    \\      const int pos = msv_qsa_pos(blk, t0 + r, sel_len, tail_start, RATIO);
-    \\      const long rb = vq_base + (long)pos * vqS[2];
-    \\      if (v_vec) {
-    \\        w = *((const device uint4*)(vq + rb) + c8);
-    \\      } else {
-    \\        thread T* e = (thread T*)&w;
-    \\        for (int j = 0; j < 8; ++j) e[j] = vq[rb + (long)(c8 * 8 + j) * vqS[3]];
-    \\      }
-    \\    }
-    \\    *((threadgroup uint4*)(Vs + r * LDV) + c8) = w;
-    \\  }
-    \\
-;
+const QSA_ATTN_D_VLOAD = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_d_vload.metal");
 
 /// Shared: online softmax, P@V, and the partials for the merge.
-const QSA_ATTN_TILE_CLOSE =
-    \\
-    \\  float new_max = max_score;
-    \\  for (int kt = 0; kt < KT; ++kt) new_max = metal::max(new_max, msv_row_max(Sfrag[kt]));
-    \\  float rowsum = 0.0f;
-    \\  for (int kt = 0; kt < KT; ++kt) {
-    \\    Sfrag[kt] = metal::exp2(Sfrag[kt] - new_max);
-    \\    rowsum += msv_row_sum(Sfrag[kt]);
-    \\  }
-    \\  const float factor = metal::exp2(max_score - new_max);
-    \\  max_score = new_max;
-    \\  sum_score = sum_score * factor + rowsum;
-    \\  for (int i = 0; i < BD / 8; ++i) Ofrag[i] *= factor;
-    \\
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int id = 0; id < BD / 8; ++id) {
-    \\    const int vbase = Vs_off + id * 8;
-    \\    for (int kt = 0; kt < KT; ++kt) {
-    \\      const float2 vf = float2(float(Vs[vbase + kt * 8 * LDV]), float(Vs[vbase + kt * 8 * LDV + 1]));
-    \\      msv_mma(Ofrag[id], Sfrag[kt], vf);
-    \\    }
-    \\  }
-    \\}
-    \\
-    \\// Partials for the merge pass, UNNORMALIZED: the running max and the
-    \\// running sum belong to this split alone, and only the merge knows the
-    \\// row's global max. `msv_row_max`/`msv_row_sum` reduce across the four
-    \\// lanes holding a row, so every lane of the row carries the same m/l
-    \\// and exactly one of them (sn == 0) writes the pair.
-    \\//
-    \\// An empty split writes l = 0, which is the merge's skip flag: a
-    \\// NON-empty split always has l >= 1, because its own maximum element
-    \\// contributes exp2(max - max) = 1. So l == 0 identifies emptiness
-    \\// exactly, and the merge never evaluates (-inf) - (-inf).
-    \\if (row_ok) {
-    \\  const int hq = hk * gqa + row;
-    \\  const long pidx = ((long)hq * (long)qL + (long)s) * NSPLIT + jsp;
-    \\  device float* Aptr = pacc + pidx * BD + sn;
-    \\  for (int id = 0; id < BD / 8; ++id) {
-    \\    Aptr[id * 8] = Ofrag[id].x;
-    \\    Aptr[id * 8 + 1] = Ofrag[id].y;
-    \\  }
-    \\  if (sn == 0) {
-    \\    const bool empty = (t_lo >= t_hi);
-    \\    pml[pidx * 2] = empty ? -INFINITY : max_score;
-    \\    pml[pidx * 2 + 1] = empty ? 0.0f : sum_score;
-    \\  }
-    \\}
-;
+const QSA_ATTN_TILE_CLOSE = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_tile_close.metal");
 
 const QSA_ATTN_Q_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_Q_CONSTS ++ QSA_ATTN_ROW_GRID ++ QSA_ATTN_Q_STRIDES ++ QSA_ATTN_ROW ++
     QSA_ATTN_Q_BASES ++ QSA_ATTN_TILE_OPEN ++ QSA_ATTN_Q_KLOAD ++ QSA_ATTN_SCORES ++ QSA_ATTN_Q_VLOAD ++ QSA_ATTN_TILE_CLOSE;
@@ -422,36 +119,7 @@ const QSA_ATTN_D_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_ROW_GRID ++ QSA_ATTN_D_STR
 
 /// The slot-batched quantized split pass: slot `bb` on grid z, `meta` = {Hq, Hk, KB, then kv length and
 /// parent capacity per slot}.
-const QSA_ATTN_SLOTS_GRID =
-    \\const int bb = int(threadgroup_position_in_grid.z) / NSPLIT;
-    \\const int jsp = int(threadgroup_position_in_grid.z) - bb * NSPLIT;
-    \\const int s = int(threadgroup_position_in_grid.x);
-    \\const int hk = int(threadgroup_position_in_grid.y);
-    \\const int qL = 1;
-    \\const int Hq = meta[0];
-    \\const int Hk = meta[1];
-    \\const int gqa = Hq / Hk;
-    \\const int KB = meta[2];
-    \\const int kL = meta[3 + 2 * bb];
-    \\const long cap = meta[4 + 2 * bb];
-    \\const device auto* kq = bb == 1 ? kq1 : bb == 2 ? kq2 : bb == 3 ? kq3 : kq0;
-    \\const device auto* ksc = bb == 1 ? ksc1 : bb == 2 ? ksc2 : bb == 3 ? ksc3 : ksc0;
-    \\const device auto* kbi = bb == 1 ? kbi1 : bb == 2 ? kbi2 : bb == 3 ? kbi3 : kbi0;
-    \\const device auto* vq = bb == 1 ? vq1 : bb == 2 ? vq2 : bb == 3 ? vq3 : vq0;
-    \\const device auto* vsc = bb == 1 ? vsc1 : bb == 2 ? vsc2 : bb == 3 ? vsc3 : vsc0;
-    \\const device auto* vbi = bb == 1 ? vbi1 : bb == 2 ? vbi2 : bb == 3 ? vbi3 : vbi0;
-    \\const long qS[3] = {(long)Hq * qL * BD, (long)qL * BD, BD};
-    \\const long blS[2] = {(long)qL * KB, KB};
-    \\const long kqS[3] = {0, cap * (BD / VPW), BD / VPW};
-    \\const long kscS[3] = {0, cap * (BD / GS), BD / GS};
-    \\const long kbiS[3] = {0, cap * (BD / GS), BD / GS};
-    \\const long vqS[3] = {0, cap * (BD / VPW), BD / VPW};
-    \\const long vscS[3] = {0, cap * (BD / GS), BD / GS};
-    \\const long vbiS[3] = {0, cap * (BD / GS), BD / GS};
-    \\pacc += (long)bb * Hq * qL * NSPLIT * BD;
-    \\pml += (long)bb * Hq * qL * NSPLIT * 2;
-    \\
-;
+const QSA_ATTN_SLOTS_GRID = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_slots_grid.metal");
 
 const QSA_ATTN_SLOTS_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_Q_CONSTS ++ QSA_ATTN_SLOTS_GRID ++ QSA_ATTN_ROW ++ QSA_ATTN_Q_BASES ++
     QSA_ATTN_TILE_OPEN ++ QSA_ATTN_Q_KLOAD ++ QSA_ATTN_SCORES ++ QSA_ATTN_Q_VLOAD ++ QSA_ATTN_TILE_CLOSE;
@@ -459,33 +127,7 @@ const QSA_ATTN_SLOTS_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_Q_CONSTS ++ QSA_ATTN_S
 /// msv_attn_qsa256_qmerge: the split-K reduction, one threadgroup per (q head, query row).
 /// Standard flash-decoding merge in the log2 domain; `l_j == 0` marks an empty split and is
 /// skipped. NSPLIT and qL ride `pacc_shape`, so the config depends on nothing per token.
-const QSA_ATTN_MERGE_SOURCE =
-    \\constexpr int BD = 256;
-    \\const int d = int(thread_index_in_threadgroup);
-    \\const int s = int(threadgroup_position_in_grid.y);
-    \\const int hq = int(threadgroup_position_in_grid.z);
-    \\const int qL = pacc_shape[1];
-    \\const int NS = pacc_shape[2];
-    \\const long pbase = ((long)hq * (long)qL + (long)s) * NS;
-    \\
-    \\// Every thread reads all NS (m, l) pairs. NS <= 64 and the pairs land in
-    \\// cache after the first thread of the threadgroup touches them, which is
-    \\// cheaper than a barrier plus threadgroup storage for two floats.
-    \\float M = -INFINITY;
-    \\for (int j = 0; j < NS; ++j) {
-    \\  if (pml[(pbase + j) * 2 + 1] > 0.0f) M = metal::max(M, pml[(pbase + j) * 2]);
-    \\}
-    \\float Z = 0.0f;
-    \\float acc = 0.0f;
-    \\for (int j = 0; j < NS; ++j) {
-    \\  const float lj = pml[(pbase + j) * 2 + 1];
-    \\  if (lj <= 0.0f) continue;
-    \\  const float w = metal::exp2(pml[(pbase + j) * 2] - M);
-    \\  Z += w * lj;
-    \\  acc += w * pacc[(pbase + j) * BD + d];
-    \\}
-    \\out[((long)hq * (long)qL + (long)s) * BD + d] = T(acc / Z);
-;
+const QSA_ATTN_MERGE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_merge.metal");
 
 /// Measured split count (M5 Max, qwen4_exp, kv 62k, 8-bit KV, 12 counterbalanced boots):
 /// every count 8..64 beats the union gather by 5-13%, only S=6's 16-vs-32 clears the noise

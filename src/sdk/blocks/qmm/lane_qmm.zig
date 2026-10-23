@@ -14,315 +14,32 @@
 //! is read by nothing else: past MAX_ROWS rows (a prompt) it takes `PREFILL`,
 //! MLX's NAX qmm with the tiled addressing.
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const steel = @import("mlx_steel_sources");
 
 pub const MAX_ROWS = 128;
 
-const HEADER =
-    \\#include <metal_tensor>
-    \\#include <MetalPerformancePrimitives/MetalPerformancePrimitives.h>
-    \\using namespace mpp::tensor_ops;
-    \\
-;
+const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
 
 // XS (a row's sum over a group) is summed in the kernel in a fixed order per
 // row: lane 2r + h adds half h of row r, and the two halves join low + high.
-const ROW_SUMS =
-    \\  const int xr = lane >> 1, xh = lane & 1;
-    \\  bool xlive[TMR];
-    \\  const device bfloat* xp[TMR];
-    \\  for (int t = 0; t < TMR; t++) {
-    \\    xlive[t] = rb + t * 16 + xr < M;
-    \\    xp[t] = X + size_t(xlive[t] ? rb + t * 16 + xr : 0) * K + xh * (GS / 2);
-    \\  }
-    \\
-;
-const ROW_SUM_G =
-    \\    float row_sum[TMR];
-    \\    for (int t = 0; t < TMR; t++) {
-    \\      float half_sum = 0.0f;
-    \\      if (xlive[t]) for (int i = 0; i < GS / 2; i++) half_sum += float(xp[t][g * GS + i]);
-    \\      const float other = simd_shuffle_xor(half_sum, ushort(1));
-    \\      row_sum[t] = xh ? other + half_sum : half_sum + other;
-    \\    }
-    \\
-;
+const ROW_SUMS = kernelSource("kernels/qmm/lane_qmm_row_sums.metal");
+const ROW_SUM_G = kernelSource("kernels/qmm/lane_qmm_row_sum_g.metal");
 
 // 32 output columns a simdgroup; SBt holds (s, b) bf16 pairs group-major [K/GS][N][2].
 // A threadgroup covers 16 x TMR rows from `rb` with one op per group; every row
 // gets the 16-row op's bits.
-const NARROW =
-    \\  const ushort lane = thread_index_in_simdgroup;
-    \\  const ushort sg = simdgroup_index_in_threadgroup;     // K slice
-    \\  const short qid = lane >> 2;
-    \\  const short fm = (qid & 4) | ((lane >> 1) & 3);       // fragment row of this lane (and fm + 8)
-    \\  const short fn = ((qid & 2) | (lane & 1)) * 4;        // first of its four fragment columns
-    \\  const int M = mdims[0];
-    \\  constexpr int KG = K / GS;
-    \\  constexpr int NF = 2;
-    \\  const int n0 = threadgroup_position_in_grid.x * 32;
-    \\  const int rb = threadgroup_position_in_grid.y * 16 * TMR;
-    \\  const int g_begin = (sg * KG) / SK;
-    \\  const int g_end = ((sg + 1) * KG) / SK;
-    \\  constexpr auto desc = matmul2d_descriptor(16 * TMR, 32, GS, false, true, false, matmul2d_descriptor::mode::multiply);
-    \\  matmul2d<desc, execution_simdgroup> op;
-    \\  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA((device bfloat*)X + (int64_t)rb * K, dextents<int32_t, 2>(K, M - rb));
-    \\#if BITS == 4
-    \\  tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tB((device uchar*)W, dextents<int32_t, 2>(K, N));
-    \\#elif BITS == 8 && !TILED
-    \\  tensor<device uint8_t, dextents<int32_t, 2>, tensor_inline> tB((device uint8_t*)W, dextents<int32_t, 2>(K, N));
-    \\#elif BITS == 8
-    \\#else
-    \\  // 5- and 6-bit: lane l widens column n0 + l's group into bytes for the bf16 x uint8 op.
-    \\  constexpr int WPG = GS * BITS / 32;
-    \\  threadgroup uint stage_all[SK * 32 * (GS / 4)];
-    \\  threadgroup uint* stage = stage_all + sg * 32 * (GS / 4);
-    \\  tensor<threadgroup uint8_t, dextents<int32_t, 2>, tensor_inline> b((threadgroup uint8_t*)stage, dextents<int32_t, 2>(GS, 32));
-    \\  const device uint* wcol = TILED ? (const device uint*)W + (int64_t)(R0 / 32 + threadgroup_position_in_grid.x) * KG * 32 * WPG + lane * WPG
-    \\                                  : (const device uint*)W + (int64_t)(n0 + lane) * (K * BITS / 32);
-    \\#endif
-    \\  float C[TMR][NF * 8];
-    \\  for (int t = 0; t < TMR; t++) for (int i = 0; i < NF * 8; i++) C[t][i] = 0.0f;
-    \\#if !TILED
-    \\  const device uint4* sbv = (const device uint4*)SBt;
-    \\#endif
-    \\  bool colok[NF];
-    \\  for (int f = 0; f < NF; f++) colok[f] = n0 + f * 16 + fn < N;
-++ "\n" ++ ROW_SUMS ++
-    \\  for (int g = g_begin; g < g_end; g++) {
-++ "\n" ++ ROW_SUM_G ++
-    \\    float s[NF][4], bb[NF][4];
-    \\    for (int f = 0; f < NF; f++) {
-    \\#if TILED
-    \\      const device uint4* sbv = (const device uint4*)(g < KG / 2 ? ST : BT);
-    \\      const uint4 q = colok[f] ? sbv[(size_t(g % (KG / 2)) * NTOT + R0 + n0 + f * 16 + fn) / 4] : uint4(0);
-    \\#else
-    \\      const uint4 q = colok[f] ? sbv[(size_t(g) * N + n0 + f * 16 + fn) / 4] : uint4(0);
-    \\#endif
-    \\      const vec<bfloat, 8> v = as_type<vec<bfloat, 8>>(q);
-    \\      for (int j = 0; j < 4; j++) { s[f][j] = float(v[2 * j]); bb[f][j] = float(v[2 * j + 1]); }
-    \\    }
-    \\    auto a = tA.slice(g * GS, 0);
-    \\#if BITS != 4 && BITS != 8
-    \\    {
-    \\      // A group is one little-endian bit stream; each word takes 4 values.
-    \\      uint w[WPG + 1];
-    \\      for (int i = 0; i <= WPG; i++) w[i] = 0;
-    \\      if (n0 + lane < N) for (int i = 0; i < WPG; i++) w[i] = wcol[g * (TILED ? 32 * WPG : WPG) + i];
-    \\      for (int c = 0; c < GS / 4; c++) {
-    \\        const int bit = 4 * BITS * c, i = bit >> 5, sh = bit & 31;
-    \\        uint word = w[i] >> sh;
-    \\        if (sh + 4 * BITS > 32) word |= w[i + 1] << (32 - sh);
-    \\        word = (word & ((1u << (2 * BITS)) - 1u)) | (((word >> (2 * BITS)) & ((1u << (2 * BITS)) - 1u)) << 16);
-    \\        word = (word & ((0x10001u << BITS) - 0x10001u)) | (((word >> BITS) & ((0x10001u << BITS) - 0x10001u)) << 8);
-    \\        stage[lane * (GS / 4) + c] = word;
-    \\      }
-    \\    }
-    \\    simdgroup_barrier(mem_flags::mem_threadgroup);
-    \\#elif TILED && BITS == 4
-    \\    tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> b(
-    \\        (device uchar*)W + (int64_t)((R0 / 32 + threadgroup_position_in_grid.x) * KG + g) * (32 * GS / 2), dextents<int32_t, 2>(GS, 32));
-    \\#elif TILED
-    \\    tensor<device uint8_t, dextents<int32_t, 2>, tensor_inline> b(
-    \\        (device uint8_t*)W + (int64_t)((R0 / 32 + threadgroup_position_in_grid.x) * KG + g) * (32 * GS), dextents<int32_t, 2>(GS, 32));
-    \\#else
-    \\    auto b = tB.slice(g * GS, n0);
-    \\#endif
-    \\    auto P = op.template get_destination_cooperative_tensor<decltype(a), decltype(b), float>();
-    \\    op.run(a, b, P);
-    \\#if BITS != 4 && BITS != 8
-    \\    simdgroup_barrier(mem_flags::mem_threadgroup); // the op has read the stage
-    \\#endif
-    \\    for (int t = 0; t < TMR; t++) {
-    \\      const float xs0 = simd_shuffle(row_sum[t], ushort(2 * fm));
-    \\      const float xs1 = simd_shuffle(row_sum[t], ushort(2 * (fm + 8)));
-    \\      for (int f = 0; f < NF; f++)
-    \\        for (int r = 0; r < 2; r++)
-    \\          for (int j = 0; j < 4; j++) {
-    \\            const int i = f * 8 + r * 4 + j;
-    \\            C[t][i] = fma(s[f][j], P[t * NF * 8 + i], fma(bb[f][j], r ? xs1 : xs0, C[t][i]));
-    \\          }
-    \\    }
-    \\  }
-    \\  // K slices are added in slice order, one 16-row block at a time
-    \\  threadgroup float part[(SK > 1 ? SK - 1 : 1) * NF * 8 * 32];
-    \\  for (int t = 0; t < TMR; t++) {
-    \\    if (SK > 1) {
-    \\      if (sg > 0) for (int i = 0; i < NF * 8; i++) part[((sg - 1) * NF * 8 + i) * 32 + lane] = C[t][i];
-    \\      threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\      if (sg == 0)
-    \\        for (int s2 = 1; s2 < SK; s2++) for (int i = 0; i < NF * 8; i++) C[t][i] += part[((s2 - 1) * NF * 8 + i) * 32 + lane];
-    \\      if (TMR > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    }
-    \\    if (sg == 0)
-    \\      for (int f = 0; f < NF; f++)
-    \\        for (int r = 0; r < 2; r++) {
-    \\          const int m = rb + t * 16 + fm + 8 * r;
-    \\          const int n = n0 + f * 16 + fn;
-    \\          if (m < M && n < N)
-    \\            for (int j = 0; j < 4; j++) Y[m * N + n + j] = static_cast<bfloat>(C[t][f * 8 + r * 4 + j]);
-    \\        }
-    \\  }
-    \\
-;
+const NARROW = kernelSource("kernels/qmm/lane_qmm_narrow_head.metal") ++ "\n" ++ ROW_SUMS ++ "  for (int g = g_begin; g < g_end; g++) {\n" ++ ROW_SUM_G ++ kernelSource("kernels/qmm/lane_qmm_narrow_body.metal");
 
 // 64 output columns run by two simdgroups together (N % 64 == 0); a pair per K slice.
-const COOP =
-    \\  const ushort sg = simdgroup_index_in_threadgroup;
-    \\  const ushort lane = thread_index_in_simdgroup;
-    \\  const ushort slice = sg >> 1;
-    \\  const int M = mdims[0];
-    \\  constexpr int KG = K / GS;
-    \\  const int n0 = threadgroup_position_in_grid.x * 64;
-    \\  const int rb = threadgroup_position_in_grid.y * 16 * TMR;
-    \\  const int g_begin = (slice * KG) / SK;
-    \\  const int g_end = ((slice + 1) * KG) / SK;
-    \\  constexpr auto desc = matmul2d_descriptor(16 * TMR, 64, GS, false, true, false, matmul2d_descriptor::mode::multiply);
-    \\  matmul2d<desc, execution_simdgroups<2>> op;
-    \\  tensor<device bfloat, dextents<int32_t, 2>, tensor_inline> tA((device bfloat*)X + (int64_t)rb * K, dextents<int32_t, 2>(K, M - rb));
-    \\  tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> tB((device uchar*)W, dextents<int32_t, 2>(K, N));
-    \\  auto a0 = tA.slice(0, 0);
-    \\  auto b0 = tB.slice(0, 0);
-    \\  auto P = op.template get_destination_cooperative_tensor<decltype(a0), decltype(b0), float>();
-    \\  constexpr int CAP = 16 * TMR;                             // 16 TMR x 64 outputs over 64 threads
-    \\  short ecol[CAP], erow[CAP];
-    \\  for (int i = 0; i < CAP; i++) { auto ids = P.get_multidimensional_index(i); ecol[i] = ids[0]; erow[i] = ids[1]; }
-    \\  float C[CAP];
-    \\  for (int i = 0; i < CAP; i++) C[i] = 0.0f;
-    \\#if !TILED
-    \\  const device uint* sbw = (const device uint*)SBt;
-    \\#endif
-++ "\n" ++ ROW_SUMS ++
-    \\  for (int g = g_begin; g < g_end; g++) {
-++ "\n" ++ ROW_SUM_G ++
-    \\    auto a = tA.slice(g * GS, 0);
-    \\#if TILED
-    \\    tensor<device uint4b_format, dextents<int32_t, 2>, tensor_inline> b(
-    \\        (device uchar*)W + (int64_t)((R0 / 64 + threadgroup_position_in_grid.x) * KG + g) * (64 * GS / 2), dextents<int32_t, 2>(GS, 64));
-    \\#else
-    \\    auto b = tB.slice(g * GS, n0);
-    \\#endif
-    \\    op.run(a, b, P);
-    \\    for (int i = 0; i < CAP; i++) {
-    \\#if TILED
-    \\      const vec<bfloat, 2> sb = as_type<vec<bfloat, 2>>(((const device uint*)(g < KG / 2 ? ST : BT))[size_t(g % (KG / 2)) * NTOT + R0 + n0 + ecol[i]]);
-    \\#else
-    \\      const vec<bfloat, 2> sb = as_type<vec<bfloat, 2>>(sbw[size_t(g) * N + n0 + ecol[i]]);
-    \\#endif
-    \\      const float sv = float(sb[0]), bv = float(sb[1]);
-    \\      const float xs = simd_shuffle(row_sum[erow[i] >> 4], ushort(2 * (erow[i] & 15)));
-    \\      C[i] = fma(sv, P[i], fma(bv, xs, C[i]));
-    \\    }
-    \\  }
-    \\  // K slices are added in slice order, 16 outputs a thread at a time
-    \\  threadgroup float part[(SK > 1 ? SK - 1 : 1) * 16 * 64];
-    \\  const ushort tip = ushort(thread_position_in_threadgroup.x) - slice * 64;
-    \\  if (SK > 1)
-    \\    for (int c0 = 0; c0 < CAP; c0 += 16) {
-    \\      if (slice > 0) for (int i = 0; i < 16; i++) part[((slice - 1) * 16 + i) * 64 + tip] = C[c0 + i];
-    \\      threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\      if (slice == 0)
-    \\        for (int s2 = 1; s2 < SK; s2++) for (int i = 0; i < 16; i++) C[c0 + i] += part[((s2 - 1) * 16 + i) * 64 + tip];
-    \\      if (TMR > 1) threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\    }
-    \\  if (slice == 0)
-    \\    for (int i = 0; i < CAP; i++) {
-    \\      const int m = rb + erow[i], n = n0 + ecol[i];
-    \\      if (m < M) Y[m * N + n] = static_cast<bfloat>(C[i]);
-    \\    }
-    \\
-;
+const COOP = kernelSource("kernels/qmm/lane_qmm_coop_head.metal") ++ "\n" ++ ROW_SUMS ++ "  for (int g = g_begin; g < g_end; g++) {\n" ++ ROW_SUM_G ++ kernelSource("kernels/qmm/lane_qmm_coop_body.metal");
 
 // MLX's affine `qmm_t_nax` (lib/mlx-src/.../quantized_nax.h, MIT) for a tiled
 // weight: the same BM x 64 x 64 blocks over 2 x 2 simdgroups, the same
 // dequantization into threadgroup memory and the same NAX tile matmuls; only
 // the weight and scale addresses differ (and rows past N load zeros).
-const PREFILL =
-    \\  const ushort simd_gid = simdgroup_index_in_threadgroup;
-    \\  const ushort simd_lid = thread_index_in_simdgroup;
-    \\  const int M = mdims[0];
-    \\  constexpr int BK = 64, BN = 64, WM = 2, WN = 2, KG = K / BK;
-    \\  constexpr int BK_padded = BK + 8;
-    \\  threadgroup bfloat Ws[BN * BK_padded];
-    \\  const int y_row = threadgroup_position_in_grid.y * BM;
-    \\  const int y_col = threadgroup_position_in_grid.x * BN;
-    \\  // thread t dequantizes 32 codes (4 * BITS bytes) of weight row t / 2 per group
-    \\  constexpr int GB = 8 * BITS; // bytes per column per group
-    \\  const short tidx = simd_gid * 32 + simd_lid;
-    \\  const short bi = tidx / 2, bj = (tidx % 2) * (GB / 2);
-    \\  const bool row_ok = y_col + bi < N;
-    \\  const int nrow = R0 + y_col + bi;
-    \\  const device uint8_t* wsrc = (const device uint8_t*)W + ((int64_t)(nrow / NT) * KG * (NT * GB) + (nrow % NT) * GB + bj);
-    \\  threadgroup bfloat* wdst = Ws + bi * BK_padded + (tidx % 2) * 32;
-    \\  constexpr short SM = BM / WM, SN = BN / WN, SKK = 32;
-    \\  constexpr short TM = SM / 16, TN = SN / 16, TK = SKK / 16;
-    \\  const short tm = SM * (simd_gid / WN);
-    \\  const short tn = SN * (simd_gid % WN);
-    \\  const short sgp_sm = min(int(SM), M - (y_row + tm));
-    \\  const bool is_unaligned_sm = (sgp_sm != SM);
-    \\  const short sgp_sn = ALIGNED_N ? SN : min(int(SN), N - (y_col + tn));
-    \\  const short tgp_bn = ALIGNED_N ? BN : min(BN, int(N - y_col));
-    \\  const bool is_unaligned_bn = ALIGNED_N ? false : (tgp_bn != BN);
-    \\  device bfloat* y = Y + (int64_t)y_row * N + y_col;
-    \\  const device bfloat* x = X + (int64_t)(y_row + tm) * K;
-    \\  NAXTile<float, TM, TN> Dtile;
-    \\  Dtile.clear();
-    \\  dispatch_bool(!is_unaligned_sm, [&](auto kAlignedM) {
-    \\    dispatch_bool(ALIGNED_N || !is_unaligned_bn, [&](auto kAlignedN) {
-    \\      for (int g = 0; g < KG; g++) {
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        if (row_ok) {
-    \\          const device bfloat* sb = (g < KG / 2 ? ST : BT) + (size_t(g % (KG / 2)) * NTOT + nrow) * 2;
-    \\          const float s = float(sb[0]), b = float(sb[1]);
-    \\          const device uint8_t* w = wsrc + (int64_t)g * (NT * GB);
-    \\#if BITS == 4
-    \\          const float sc[2] = {s, s / 16.0f};
-    \\          for (int i = 0; i < 16; i++) {
-    \\            wdst[2 * i] = static_cast<bfloat>(sc[0] * (w[i] & 0x0f) + b);
-    \\            wdst[2 * i + 1] = static_cast<bfloat>(sc[1] * (w[i] & 0xf0) + b);
-    \\          }
-    \\#else
-    \\          // code i sits at bit i * BITS of the little-endian stream (MLX's `code * s + b`)
-    \\          for (int i = 0; i < 32; i++) {
-    \\            const int bit = i * BITS, by = bit >> 3, sh = bit & 7;
-    \\            const uint hi = sh + BITS > 8 ? uint(w[by + 1]) << 8 : 0u;
-    \\            const uint code = ((uint(w[by]) | hi) >> sh) & ((1u << BITS) - 1u);
-    \\            wdst[i] = static_cast<bfloat>(code * s + b);
-    \\          }
-    \\#endif
-    \\        } else {
-    \\          for (int i = 0; i < 32; i++) wdst[i] = bfloat(0);
-    \\        }
-    \\        threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\        STEEL_PRAGMA_NO_UNROLL
-    \\        for (int kk1 = 0; kk1 < BK; kk1 += SKK) {
-    \\          NAXTile<bfloat, TM, TK> Atile;
-    \\          NAXTile<bfloat, TN, TK> Btile;
-    \\          volatile int compiler_barrier;
-    \\          if constexpr (kAlignedM.value) {
-    \\            Atile.load(x + kk1, K);
-    \\          } else {
-    \\            Atile.load_safe(x + kk1, K, short2(SKK, sgp_sm));
-    \\          }
-    \\          Btile.template load<bfloat, BK_padded, 1>(Ws + tn * BK_padded + kk1);
-    \\          tile_matmad_nax(Dtile, Atile, metal::bool_constant<false>{}, Btile, metal::bool_constant<true>{});
-    \\          (void)compiler_barrier;
-    \\        }
-    \\        x += BK;
-    \\      }
-    \\      threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\      if constexpr (kAlignedM.value && kAlignedN.value) {
-    \\        Dtile.store(y + tm * N + tn, N);
-    \\      } else if (kAlignedM.value && sgp_sn == SN) {
-    \\        Dtile.store(y + tm * N + tn, N);
-    \\      } else {
-    \\        Dtile.store_safe(y + tm * N + tn, N, short2(sgp_sn, sgp_sm));
-    \\      }
-    \\    });
-    \\  });
-    \\
-;
+const PREFILL = kernelSource("kernels/qmm/lane_qmm_prefill.metal");
 
 /// MLX's steel NAX headers in include order, their own includes and
 /// include guards dropped: they sit inline in one `metal_kernel` header.

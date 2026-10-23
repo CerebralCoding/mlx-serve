@@ -3,7 +3,8 @@
 const std = @import("std");
 const generate_mod = @import("../mlx/generate.zig");
 const tokenize_cache_mod = @import("../../host/tokenizer/cache.zig");
-const model_discovery = @import("../../host/registry/discovery.zig");
+const load = @import("load.zig");
+const policy = @import("policy.zig");
 const arch_llama = if (@import("build_options").llama_engine) @import("bridge.zig") else @import("stub.zig");
 const log = @import("../../host/log.zig");
 
@@ -11,7 +12,6 @@ const MAX_BATCH_GROUP = @import("../mlx/batching/verdict.zig").MAX_BATCH_GROUP;
 const publishHotCacheResidency = @import("../mlx/cache/budget.zig").publishHotCacheResidency;
 const finishSlot = @import("../mlx/finish.zig").finishSlot;
 const Scheduler = @import("../mlx/scheduler.zig").Scheduler;
-const LlamaSettings = @import("../mlx/scheduler/params.zig").LlamaSettings;
 const Slot = @import("../mlx/slot.zig").Slot;
 const scheduler_mod = @import("../mlx/scheduler.zig");
 
@@ -21,32 +21,12 @@ const scheduler_mod = @import("../mlx/scheduler.zig");
 /// and mark ready. The stub config carries the effective context length so the
 /// server's memory estimate and `runPrefillLlama` size the session correctly.
 pub fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
-    const ls: LlamaSettings = params.llama;
-    log.info("[llama] opening engine: {s}\n", .{params.llama_path});
-    // An `mtp-*.gguf` head beside the model wins over the trunk's own NextN heads.
-    const mtp_path: ?[]u8 = if (ls.mtp_drafts > 0) model_discovery.findLlamaMtpSidecar(sch.io, sch.allocator, params.llama_path) else null;
-    defer if (mtp_path) |p| sch.allocator.free(p);
-    if (mtp_path) |p| log.info("[llama] MTP draft head: {s}\n", .{p});
-    const engine = try arch_llama.LlamaEngine.open(sch.allocator, params.llama_path, .{
-        .mtp_path = mtp_path,
-        .load_mtp = ls.mtp_drafts > 0,
-    });
-    errdefer engine.close();
-    log.info("[llama] engine ready (EOS={d}, n_vocab={d})\n", .{ engine.eosToken(), engine.nVocab() });
-
     // The stub config carries the per-sequence context (--ctx-size or 8192).
-    const llama_ctx = try engine.createContext(.{
-        .ctx_size = @intCast(params.config.max_position_embeddings),
-        .n_seq = ls.seqs,
-        .type_k = ls.kv_quant.ggmlType(),
-        .type_v = ls.kv_quant.ggmlType(),
-        .ubatch = ls.ubatch,
-        .mtp_drafts = ls.mtp_drafts,
-    });
+    const opened = try load.open(arch_llama, sch.io, sch.allocator, params.llama_path, params.llama, params.config.max_position_embeddings);
+    const engine = opened.engine;
+    errdefer engine.close();
+    const llama_ctx = opened.ctx;
     errdefer llama_ctx.free();
-    log.info("[llama] context: {d} sequences x {d} tokens, KV {s}, MTP drafts {d}\n", .{
-        llama_ctx.seqs.len, params.config.max_position_embeddings, ls.kv_quant.label(), llama_ctx.mtpDrafts(),
-    });
 
     // Make sure the stub config's EOS set includes the engine's EOS so the
     // streaming/non-streaming stop checks fire.
@@ -104,29 +84,7 @@ pub fn doLoadLlamaOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     if (scheduler_mod.hot_cache_budget_invalidate) |f| f();
 }
 
-/// Chat templates open every prompt with a fixed prologue (system header, BOS,
-/// role markers: Gemma 12 tokens, Qwen 8, Llama 4). A shared prefix this short
-/// is not worth taking another conversation's sequence for.
-const LLAMA_MIN_PREFIX_TO_CLAIM: usize = 16;
-
-/// The free sequence a prompt should decode on: the one sharing the longest
-/// prefix past the chat-template prologue, else the least recently used. Null
-/// only when every sequence is busy, which the submit-time claim rules out.
-pub fn pickLlamaSeq(seqs: []const arch_llama.LlamaSeq, prompt: []const i32) ?usize {
-    var best: ?usize = null;
-    var best_shared: usize = LLAMA_MIN_PREFIX_TO_CLAIM - 1;
-    var lru: ?usize = null;
-    for (seqs, 0..) |*seq, i| {
-        if (seq.busy) continue;
-        const shared = arch_llama.commonPrefixLen(seq.resident.items, prompt);
-        if (shared > best_shared) {
-            best_shared = shared;
-            best = i;
-        }
-        if (lru == null or seq.last_used_ns < seqs[lru.?].last_used_ns) lru = i;
-    }
-    return best orelse lru;
-}
+pub const pickLlamaSeq = policy.pickSeq;
 
 /// llama.cpp prefill: claim a sequence of the model's context, sync it to the
 /// prompt (reusing the KV prefix a previous request left there), and sample the
@@ -257,54 +215,11 @@ pub fn runLlamaDecodeTick(sch: *Scheduler, slots: []*Slot) !void {
 
 var llama_batched_logged = false;
 
-/// Draft tokens one MTP round can carry (`--llama-mtp-drafts` is clamped to it).
-pub const MAX_LLAMA_DRAFTS = 8;
-
-/// Draft tokens a llama.cpp MTP round takes this tick, 0 = plain decode. Only a
-/// slot decoding alone drafts (with company, the drafts' extra batch rows cost
-/// more than they save), and never past its token budget.
-pub fn llamaDraftsThisTick(live: usize, mtp_drafts: u32, remaining: u32) u32 {
-    if (live != 1) return 0;
-    return @min(mtp_drafts, remaining, MAX_LLAMA_DRAFTS);
-}
+pub const MAX_LLAMA_DRAFTS = policy.max_drafts;
+pub const llamaDraftsThisTick = policy.draftsThisTick;
 
 // ── tests ──
 
-test "llamaDraftsThisTick: a solo slot drafts within its budget, company decodes plain" {
-    try std.testing.expectEqual(@as(u32, 2), llamaDraftsThisTick(1, 2, 100));
-    try std.testing.expectEqual(@as(u32, 1), llamaDraftsThisTick(1, 2, 1));
-    try std.testing.expectEqual(@as(u32, 0), llamaDraftsThisTick(2, 2, 100));
-    try std.testing.expectEqual(@as(u32, 0), llamaDraftsThisTick(1, 0, 100));
-    try std.testing.expectEqual(@as(u32, MAX_LLAMA_DRAFTS), llamaDraftsThisTick(1, 64, 100));
-}
-
-test "pickLlamaSeq: longest shared prefix past the prologue, else least recently used, never a busy one" {
-    const gpa = std.testing.allocator;
-    var seqs: [3]arch_llama.LlamaSeq = undefined;
-    for (&seqs, 0..) |*q, i| q.* = .{ .ctx = undefined, .id = @intCast(i) };
-    defer for (&seqs) |*q| q.resident.deinit(gpa);
-    var prompt: [40]i32 = undefined;
-    for (&prompt, 0..) |*t, i| t.* = @intCast(i);
-
-    // Every sequence empty: the least recently used one.
-    seqs[0].last_used_ns = 30;
-    seqs[1].last_used_ns = 10;
-    seqs[2].last_used_ns = 20;
-    try std.testing.expectEqual(@as(?usize, 1), pickLlamaSeq(&seqs, &prompt));
-
-    // A template-prologue-sized overlap does not claim another conversation's KV.
-    try seqs[2].resident.appendSlice(gpa, prompt[0 .. LLAMA_MIN_PREFIX_TO_CLAIM - 1]);
-    try std.testing.expectEqual(@as(?usize, 1), pickLlamaSeq(&seqs, &prompt));
-
-    // A real shared prefix does, and the longest wins.
-    try seqs[0].resident.appendSlice(gpa, prompt[0..20]);
-    try seqs[2].resident.appendSlice(gpa, prompt[LLAMA_MIN_PREFIX_TO_CLAIM - 1 .. 30]);
-    try std.testing.expectEqual(@as(?usize, 2), pickLlamaSeq(&seqs, &prompt));
-
-    // A busy sequence is never picked, however well it matches.
-    seqs[2].busy = true;
-    try std.testing.expectEqual(@as(?usize, 0), pickLlamaSeq(&seqs, &prompt));
-    seqs[0].busy = true;
-    seqs[1].busy = true;
-    try std.testing.expectEqual(@as(?usize, null), pickLlamaSeq(&seqs, &prompt));
+test {
+    _ = policy;
 }

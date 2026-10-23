@@ -106,3 +106,6 @@ data
 
 # Studio web console (app-web/): dev tooling output only
 app-web/node_modules/
+
+# Generated at configure time by build/plugins.zig
+/src/plugins/registry.zig

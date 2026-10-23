@@ -2,6 +2,7 @@
 //! Owns GatedConvWeights, gatedConv, GATED_CONV_STEP_SOURCE, gated_conv_kernel, GatedConvCfgKey, gated_conv_cfg, and 4 more.
 
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const testing = @import("../../engines/mlx/kv/cache.zig").testing;
@@ -92,22 +93,7 @@ pub fn gatedConv(
 ///   y   = C[c] * T(acc)                      (mlx_multiply)
 ///   state' = [state rows 1.., g]
 /// `proj` is [B, 1, 3H] laid out B | C | x; `state` [B, K-1, H]; `w` [H, K, 1].
-const GATED_CONV_STEP_SOURCE =
-    \\uint c = thread_position_in_grid.x;
-    \\uint b = thread_position_in_grid.y;
-    \\if (c >= uint(H)) return;
-    \\size_t pbase = (size_t)b * 3 * H;
-    \\T g = proj[pbase + 2 * H + c] * proj[pbase + c];
-    \\float acc = 0.0;
-    \\size_t sbase = (size_t)b * (KS - 1) * H;
-    \\for (int i = 0; i < KS - 1; i++) {
-    \\  acc += static_cast<float>(state[sbase + i * H + c]) * w[c * KS + i];
-    \\  if (i + 1 < KS - 1) nstate[sbase + i * H + c] = state[sbase + (i + 1) * H + c];
-    \\}
-    \\acc += static_cast<float>(g) * w[c * KS + KS - 1];
-    \\nstate[sbase + (KS - 2) * H + c] = g;
-    \\y[(size_t)b * H + c] = proj[pbase + H + c] * static_cast<T>(acc);
-;
+const GATED_CONV_STEP_SOURCE = kernelSource("plugins/lfm2/kernels/gated_conv_step.metal");
 
 var gated_conv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const GatedConvCfgKey = struct { batch: c_int, hidden: c_int, kernel: c_int, dtype: mlx.mlx_dtype };

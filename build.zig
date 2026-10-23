@@ -1,5 +1,6 @@
 const std = @import("std");
 const builtin = @import("builtin");
+const plugins = @import("build/plugins.zig");
 
 comptime {
     // 0.16.0's bundled libc++ fails to compile against the macOS 27 SDK
@@ -36,6 +37,24 @@ pub fn build(b: *std.Build) void {
         } else .{},
     });
     const optimize = b.standardOptimizeOption(.{});
+
+    // A plugin registers by its folder: the scan writes src/plugins/registry.zig, every graph compiles it.
+    plugins.generate(b);
+
+    // `zig build lint`: the house rules over src/ (scripts/lint.py), no Zig compile. Report-only unless
+    // -Dlint-strict, which fails on the rules listed in scripts/lint_enforced.txt. `--all`: run the script directly.
+    {
+        const lint = b.addSystemCommand(&.{ "python3", "scripts/lint.py" });
+        lint.setCwd(b.path("."));
+        lint.has_side_effects = true;
+        if (b.option(bool, "lint-strict", "zig build lint: fail on violations of the enforced rules") orelse false) lint.addArg("--strict");
+        if (b.option([]const u8, "lint-json", "zig build lint: also write the JSON summary to this path")) |p| lint.addArgs(&.{ "--json", p });
+        b.step("lint", "House-rule lint over src/ (report-only unless -Dlint-strict)").dependOn(&lint.step);
+        const lint_test = b.addSystemCommand(&.{ "python3", "scripts/lint_test.py" });
+        lint_test.setCwd(b.path("."));
+        lint_test.has_side_effects = true;
+        b.step("lint-test", "Run the lint's own tests").dependOn(&lint_test.step);
+    }
 
     // Setting any non-default target field disables Zig's native macOS SDK detection,
     // so we resolve the SDK path ourselves and surface its frameworks dir.
@@ -337,6 +356,8 @@ pub fn build(b: *std.Build) void {
     }
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_unit_tests.step);
+    plugins.addTests(b, test_step);
+    test_step.dependOn(&b.top_level_steps.get("lint-test").?.step);
     {
         const t = addMlxStreamTests(b, target, optimize, test_filter, macos_sdk_frameworks, "src/tests.zig", "mlx-stream-test");
         test_build.dependOn(&b.addInstallArtifact(t, .{ .dest_dir = .{ .override = .{ .custom = "tests" } } }).step);
@@ -395,7 +416,7 @@ pub fn build(b: *std.Build) void {
 /// before this builds. UBSan is off for stb (its bit shifts trip the sanitizer).
 fn addPreviewTest(b: *std.Build, target: std.Build.ResolvedTarget) void {
     const mod = b.createModule(.{
-        .root_source_file = b.path("src/host/media_jobs/preview.zig"),
+        .root_source_file = b.path("src/preview_tests.zig"),
         .target = target,
         .optimize = .ReleaseFast,
         .link_libc = true,
@@ -564,6 +585,7 @@ fn addLinuxServe(b: *std.Build, target: std.Build.ResolvedTarget, optimize: std.
         .filters = if (test_filter) |f| &.{f} else &.{},
     });
     const test_step = b.step("test", "Run unit tests");
+    if (builtin.os.tag != .windows) test_step.dependOn(&b.top_level_steps.get("lint-test").?.step); // no python3 there
     const run_unit_tests = b.addRunArtifact(unit_tests);
     // Rerun every time when filtered, as on macOS (env-gated tests).
     if (test_filter != null) run_unit_tests.has_side_effects = true;

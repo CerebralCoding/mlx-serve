@@ -2,6 +2,7 @@
 //! Owns vqmmAccLines, vqmmColumnLoad, vqmmColumnChain, verifyQmmSource, verifyQmmMsgSource, vqmmMsgBn, and 63 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
@@ -115,26 +116,7 @@ fn vqmmAccLines(comptime m: usize, comptime j: usize, comptime idx: []const u8) 
 fn vqmmColumnLoad(comptime j: usize) []const u8 {
     comptime {
         @setEvalBranchQuota(200_000);
-        return std.fmt.comptimePrint(
-            \\  uint32_t p{d}; ulong r{d}; uint32_t a{d}0; uint32_t a{d}1;
-            \\  if constexpr (BITS == 4) {{ p{d} = w_q[(n0 + {d}) * K_by_p + pack]; }}
-            \\  else {{
-            \\    const device uchar* wp = ((const device uchar*)w_q) + (n0 + {d}) * K_bytes + pack * BITS;
-            \\    if constexpr (BITS == 8) {{
-            \\      const device uint* wu = (const device uint*)wp;
-            \\      r{d} = ulong(wu[0]) | (ulong(wu[1]) << 32);
-            \\    }} else if constexpr (BITS == 5) {{
-            \\      r{d} = ulong(wp[0]) | (ulong(wp[1]) << 8) | (ulong(wp[2]) << 16) |
-            \\             (ulong(wp[3]) << 24) | (ulong(wp[4]) << 32);
-            \\    }} else {{
-            \\      const device ushort* wh = (const device ushort*)wp;
-            \\      uint32_t h0 = uint32_t(wh[0]); uint32_t h1 = uint32_t(wh[1]); uint32_t h2 = uint32_t(wh[2]);
-            \\      a{d}0 = h0 | ((h1 & 0xFFu) << 16);
-            \\      a{d}1 = (h1 >> 8) | (h2 << 8);
-            \\    }}
-            \\  }}
-            \\
-        , .{ j, j, j, j, j, j, j, j, j, j, j });
+        return std.fmt.comptimePrint(kernelSource("kernels/linear/vqmm_column_load.fmt.metal"), .{ j, j, j, j, j, j, j, j, j, j, j });
     }
 }
 
@@ -147,32 +129,7 @@ fn vqmmColumnChain(comptime m: usize, comptime j: usize) []const u8 {
         @setEvalBranchQuota(200_000);
         const acc_ki = vqmmAccLines(m, j, "ki");
         const acc_hi = vqmmAccLines(m, j, "4 + ki");
-        return std.fmt.comptimePrint(
-            \\  {{
-            \\    float sj = s{d}; float bj = b{d};
-            \\    if constexpr (BITS == 4) {{
-            \\      for (int ki = 0; ki < 8; ++ki) {{
-            \\        float wv = float((p{d} >> (ki * 4)) & 0xFu) * sj + bj;
-            \\{s}      }}
-            \\    }} else if constexpr (BITS == 8) {{
-            \\      for (int ki = 0; ki < 8; ++ki) {{
-            \\        float wv = float(uint32_t((r{d} >> (ki * 8)) & 0xFFul)) * sj + bj;
-            \\{s}      }}
-            \\    }} else if constexpr (BITS == 5) {{
-            \\      for (int ki = 0; ki < 8; ++ki) {{
-            \\        float wv = float(uint32_t((r{d} >> (ki * 5)) & 0x1Ful)) * sj + bj;
-            \\{s}      }}
-            \\    }} else {{
-            \\      for (int ki = 0; ki < 4; ++ki) {{
-            \\        float wv = float((a{d}0 >> (ki * 6)) & 0x3Fu) * sj + bj;
-            \\{s}      }}
-            \\      for (int ki = 0; ki < 4; ++ki) {{
-            \\        float wv = float((a{d}1 >> (ki * 6)) & 0x3Fu) * sj + bj;
-            \\{s}      }}
-            \\    }}
-            \\  }}
-            \\
-        , .{ j, j, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_hi });
+        return std.fmt.comptimePrint(kernelSource("kernels/linear/vqmm_column_chain.fmt.metal"), .{ j, j, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_ki, j, acc_hi });
     }
 }
 
@@ -206,57 +163,7 @@ fn verifyQmmSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
         for (0..nacc) |i| {
             acc_sum = acc_sum ++ std.fmt.comptimePrint("acc[{d}] = simd_sum(acc[{d}]); ", .{ i, i });
         }
-        return std.fmt.comptimePrint(
-            \\auto part = simdgroup_index_in_threadgroup;
-            \\auto lane = thread_index_in_simdgroup;
-            \\auto tg_n = threadgroup_position_in_grid.y;
-            \\
-            \\int K = int(K_size);
-            \\int N = int(N_size);
-            \\int K_by_p = K / 8;
-            \\int K_bytes = (K * BITS) / 8;
-            \\int K_by_gs = K / GS;
-            \\int per_part = K_by_p / K_PARTS;
-            \\int n0 = int(tg_n) * {d};
-            \\int p_start = int(part) * per_part;
-            \\int p_end = (int(part) == K_PARTS - 1) ? K_by_p : p_start + per_part;
-            \\
-            \\float acc[{d}];
-            \\{s}
-            \\
-            \\using Vec8 = vec<T, 8>;
-            \\const device Vec8 *xv = (const device Vec8*)x;
-            \\
-            \\for (int pack = p_start + int(lane); pack < p_end; pack += 32) {{
-            \\  int k_base = pack * 8;
-            \\  int gi = k_base / GS;
-            \\{s}
-            \\}}
-            \\
-            \\{s}
-            \\
-            \\threadgroup float partials[K_PARTS * {d}];
-            \\if (lane == 0) {{
-            \\  _Pragma("unroll")
-            \\  for (int i = 0; i < {d}; ++i) {{
-            \\    partials[int(part) * {d} + i] = acc[i];
-            \\  }}
-            \\}}
-            \\threadgroup_barrier(mem_flags::mem_threadgroup);
-            \\
-            \\if (part == 0) {{
-            \\  for (int i = int(lane); i < {d}; i += 32) {{
-            \\    float total = 0.0f;
-            \\    _Pragma("unroll")
-            \\    for (int p = 0; p < K_PARTS; ++p) {{
-            \\      total += partials[p * {d} + i];
-            \\    }}
-            \\    int j = i / {d};
-            \\    int row = i - j * {d};
-            \\    y[row * N + n0 + j] = T(total);
-            \\  }}
-            \\}}
-        , .{ bn, nacc, acc_init, body, acc_sum, nacc, nacc, nacc, nacc, nacc, m, m });
+        return std.fmt.comptimePrint(kernelSource("kernels/linear/vqmm.fmt.metal"), .{ bn, nacc, acc_init, body, acc_sum, nacc, nacc, nacc, nacc, nacc, m, m });
     }
 }
 
@@ -291,39 +198,7 @@ fn verifyQmmMsgSource(comptime m: usize, comptime bn: usize) [:0]const u8 {
         for (0..nacc) |i| {
             acc_sum = acc_sum ++ std.fmt.comptimePrint("acc[{d}] = simd_sum(acc[{d}]); ", .{ i, i });
         }
-        return std.fmt.comptimePrint(
-            \\auto sg = simdgroup_index_in_threadgroup;
-            \\auto lane = thread_index_in_simdgroup;
-            \\auto tg_n = threadgroup_position_in_grid.y;
-            \\
-            \\int K = int(K_size);
-            \\int N = int(N_size);
-            \\int K_by_p = K / 8;
-            \\int K_bytes = (K * BITS) / 8;
-            \\int K_by_gs = K / GS;
-            \\int n0 = (int(tg_n) * NSG + int(sg)) * {d};
-            \\if (n0 + {d} >= N) {{ return; }}
-            \\
-            \\float acc[{d}];
-            \\{s}
-            \\
-            \\using Vec8 = vec<T, 8>;
-            \\const device Vec8 *xv = (const device Vec8*)x;
-            \\
-            \\for (int pack = int(lane); pack < K_by_p; pack += 32) {{
-            \\  int k_base = pack * 8;
-            \\  int gi = k_base / GS;
-            \\{s}
-            \\}}
-            \\
-            \\{s}
-            \\
-            \\if (lane < {d}) {{
-            \\  int j = int(lane) / {d};
-            \\  int row = int(lane) - j * {d};
-            \\  y[row * N + n0 + j] = T(acc[int(lane)]);
-            \\}}
-        , .{ bn, bn - 1, nacc, acc_init, body, acc_sum, nacc, m, m });
+        return std.fmt.comptimePrint(kernelSource("kernels/linear/vqmm_msg.fmt.metal"), .{ bn, bn - 1, nacc, acc_init, body, acc_sum, nacc, m, m });
     }
 }
 
@@ -388,86 +263,7 @@ fn getVerifyQmmMsgKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
 fn verifyQmmCrossrowSource(comptime m: usize) [:0]const u8 {
     comptime {
         @setEvalBranchQuota(400_000);
-        return std.fmt.comptimePrint(
-            \\auto sg = simdgroup_index_in_threadgroup;
-            \\auto lane = thread_index_in_simdgroup;
-            \\auto tgp = threadgroup_position_in_grid;
-            \\
-            \\int K = int(K_size);
-            \\int N = int(N_size);
-            \\const int first_m = int(tgp.x) * 2;
-            \\const int out_row = int(tgp.y) * 8 + int(sg) * 4;
-            \\const int K_bytes = K / 2;
-            \\const int K_groups = K / 64;
-            \\const bool has_pair = (first_m + 1) < {d};
-            \\
-            \\const device uint8_t* wq8 = (const device uint8_t*)w_q;
-            \\float2 pres[4];
-            \\_Pragma("unroll")
-            \\for (int r = 0; r < 4; ++r) {{ pres[r] = float2(0.0f); }}
-            \\
-            \\for (int k = 0; k < K; k += 512) {{
-            \\  ushort pk[4][4];
-            \\  float sl[4]; float bl[4];
-            \\  _Pragma("unroll")
-            \\  for (int r = 0; r < 4; ++r) {{
-            \\    const int row = out_row + r;
-            \\    const device uint16_t* ws = (const device uint16_t*)(wq8 + row * K_bytes + (k >> 1) + int(lane) * 8);
-            \\    _Pragma("unroll")
-            \\    for (int i = 0; i < 4; ++i) {{ pk[r][i] = ws[i]; }}
-            \\    const int gi = row * K_groups + (k >> 6) + int(lane) / 4;
-            \\    sl[r] = float(scales[gi]);
-            \\    bl[r] = float(biases[gi]);
-            \\  }}
-            \\  const device T* xm0 = x + first_m * K + k + int(lane) * 16;
-            \\  float x0[16]; float x1[16];
-            \\  float sum0 = 0.0f; float sum1 = 0.0f;
-            \\  _Pragma("unroll")
-            \\  for (int i = 0; i < 16; i += 4) {{
-            \\    sum0 += float(xm0[i]) + float(xm0[i+1]) + float(xm0[i+2]) + float(xm0[i+3]);
-            \\    x0[i] = float(xm0[i]);
-            \\    x0[i+1] = float(xm0[i+1]) / 16.0f;
-            \\    x0[i+2] = float(xm0[i+2]) / 256.0f;
-            \\    x0[i+3] = float(xm0[i+3]) / 4096.0f;
-            \\  }}
-            \\  if (has_pair) {{
-            \\    const device T* xm1 = xm0 + K;
-            \\    _Pragma("unroll")
-            \\    for (int i = 0; i < 16; i += 4) {{
-            \\      sum1 += float(xm1[i]) + float(xm1[i+1]) + float(xm1[i+2]) + float(xm1[i+3]);
-            \\      x1[i] = float(xm1[i]);
-            \\      x1[i+1] = float(xm1[i+1]) / 16.0f;
-            \\      x1[i+2] = float(xm1[i+2]) / 256.0f;
-            \\      x1[i+3] = float(xm1[i+3]) / 4096.0f;
-            \\    }}
-            \\  }} else {{
-            \\    _Pragma("unroll")
-            \\    for (int i = 0; i < 16; ++i) {{ x1[i] = 0.0f; }}
-            \\  }}
-            \\  _Pragma("unroll")
-            \\  for (int r = 0; r < 4; ++r) {{
-            \\    float2 acc = float2(0.0f);
-            \\    _Pragma("unroll")
-            \\    for (int i = 0; i < 4; ++i) {{
-            \\      acc += float2(x0[4*i],   x1[4*i])   * float(pk[r][i] & 0x000f);
-            \\      acc += float2(x0[4*i+1], x1[4*i+1]) * float(pk[r][i] & 0x00f0);
-            \\      acc += float2(x0[4*i+2], x1[4*i+2]) * float(pk[r][i] & 0x0f00);
-            \\      acc += float2(x0[4*i+3], x1[4*i+3]) * float(pk[r][i] & 0xf000);
-            \\    }}
-            \\    pres[r] += sl[r] * acc + float2(sum0, sum1) * bl[r];
-            \\  }}
-            \\}}
-            \\
-            \\_Pragma("unroll")
-            \\for (int r = 0; r < 4; ++r) {{
-            \\  float r0 = simd_sum(pres[r].x);
-            \\  float r1 = simd_sum(pres[r].y);
-            \\  if (lane == 0) {{
-            \\    y[first_m * N + out_row + r] = T(r0);
-            \\    if (has_pair) {{ y[(first_m + 1) * N + out_row + r] = T(r1); }}
-            \\  }}
-            \\}}
-        , .{m});
+        return std.fmt.comptimePrint(kernelSource("kernels/linear/vqmm_crossrow.fmt.metal"), .{m});
     }
 }
 

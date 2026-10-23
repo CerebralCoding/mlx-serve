@@ -2,6 +2,7 @@
 //! Owns qsaIdxBitMismatches, qsaIdxTestKeys, qsaIdxRopeCase, qsaIdxRopeTestXfm, qsaIdxCancelKeys, QsaPooledRope, and 22 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const mrope = @import("../../../sdk/vision/mrope.zig");
 const log = @import("../../../host/log.zig");
@@ -143,38 +144,7 @@ pub fn qsaIdxRopeFusedEnabled() bool {
 // `nblk` varies per call (1 at decode, up to 512 per prefill chunk), so it is a
 // scalar INPUT; the templates (T, R, RD, HALF) are fixed per model and name the
 // one pipeline MLX compiles.
-const QSA_POOL_ROPE_SOURCE =
-    \\uint lane = thread_position_in_threadgroup.x;
-    \\uint row = threadgroup_position_in_grid.y;
-    \\uint blk = row % uint(nblk);
-    \\uint kbase = row * uint(R * 128) + lane * 4;
-    \\float xs[4];
-    \\float sumsq = 0.0f;
-    \\for (uint j = 0; j < 4; ++j) {
-    \\    float acc = 0.0f;
-    \\    for (uint r = 0; r < uint(R); ++r) acc = float(kb[kbase + r * 128 + j]) + acc;
-    \\    const T pooled = T(acc * inv_r);
-    \\    xs[j] = float(pooled);
-    \\    sumsq += xs[j] * xs[j];
-    \\}
-    \\sumsq = simd_sum(sumsq);
-    \\float inv = metal::precise::rsqrt(sumsq / 128.0f + eps);
-    \\for (uint j = 0; j < 4; ++j) {
-    \\    const T nv = norm_w[lane * 4 + j] * T(xs[j] * inv);
-    \\    const float nf = float(nv);
-    \\    const float up = simd_shuffle_down(nf, ushort(HALF / 4));
-    \\    const float dn = simd_shuffle_up(nf, ushort(HALF / 4));
-    \\    uint d = lane * 4 + j;
-    \\    T o = nv;
-    \\    if (d < uint(RD)) {
-    \\        const T rot = d < uint(HALF) ? T(-up) : T(dn);
-    \\        const T a = T(nf * float(cosv[blk * RD + d]));
-    \\        const T b = T(float(rot) * float(sinv[blk * RD + d]));
-    \\        o = T(float(a) + float(b));
-    \\    }
-    \\    out[row * 128 + d] = o;
-    \\}
-;
+const QSA_POOL_ROPE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_pool_rope.metal");
 
 /// Largest block ratio whose f32 block sum MLX folds in row order 0..R-1, the
 /// order the kernel uses. The mean over axis 2 of `[B, nb, R, 128]` is a strided

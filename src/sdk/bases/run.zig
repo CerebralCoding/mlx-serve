@@ -1,0 +1,132 @@
+//! What the bases share around their layer loops: one forward's arguments (`Run`), its results (`Out`), the head and
+//! the logits rows, layer capture, and the model table's `forward` over any base (`tableForward`).
+
+const std = @import("std");
+const ops = @import("../../mlx/ops.zig");
+const abi = @import("../../abi/plugin.zig");
+const block = @import("block.zig");
+
+const Array = ops.Array;
+const Graph = ops.Graph;
+const Ctx = block.Ctx;
+
+/// One forward's arguments.
+pub const Run = struct {
+    mode: abi.Mode,
+    /// Tokens per slot.
+    rows: c_int,
+    slots: c_int = 1,
+    /// Each slot's first position.
+    positions: []const u32,
+    caches: []const abi.Handle = &.{},
+    cache_ops: ?*const abi.CacheOps = null,
+    logits: abi.Logits = .last_row,
+    /// Return the final-normed hidden rows too.
+    want_hidden: bool = false,
+    /// Layers whose output rows the forward publishes into `captured` (owned by the forward's graph).
+    capture_layers: []const u32 = &.{},
+    captured: []Array = &.{},
+    /// An encoder batch's additive key mask; null = none.
+    mask: Array = .{},
+
+    pub fn ctx(r: *const Run, g: *Graph, shared: *const block.Shared) Ctx {
+        return .{ .g = g, .mode = r.mode, .rows = r.rows, .slots = r.slots, .positions = r.positions, .caches = r.caches, .cache_ops = r.cache_ops, .shared = shared, .mask = r.mask };
+    }
+
+    /// Publishes `h`, layer `layer`'s output, where it was asked for.
+    pub fn capture(r: *const Run, g: *Graph, layer: u32, h: Array) !void {
+        for (r.capture_layers, 0..) |id, k| if (id == layer) {
+            r.captured[k] = try g.keep(h);
+        };
+    }
+
+    /// The head over every row (a row's logits must not depend on how many rows ride with it), then the rows asked for.
+    pub fn finish(r: *const Run, g: *Graph, c: *Ctx, final: Array, comptime Head: type, head: *const Head.Weights) !Out {
+        var out: Out = .{};
+        if (r.want_hidden) out.hidden = final;
+        if (r.logits == .none) return out;
+        const logits = try Head.forward(head, c, final);
+        const sh = ops.shape(logits);
+        out.logits = switch (r.logits) {
+            .last_row => try g.reshape(try g.sliceAxis(logits, 1, sh[1] - 1, sh[1]), &.{ sh[0], sh[2] }),
+            .all_rows => try g.reshape(logits, &.{ sh[0] * sh[1], sh[2] }),
+            .none => unreachable,
+        };
+        return out;
+    }
+};
+
+/// A forward's results, owned by its graph: logits `[slots, vocab]` (last row) or `[slots * rows, vocab]`, and the
+/// final-normed hidden `[slots, rows, hidden]` when asked.
+pub const Out = struct {
+    logits: Array = .{},
+    hidden: Array = .{},
+};
+
+/// A loaded model of base `Base`: its weights, the shared values, and where its forwards run.
+pub fn Model(comptime Base: type) type {
+    return struct {
+        weights: Base.Weights,
+        shared: block.Shared,
+        a: std.mem.Allocator,
+        s: ops.Stream,
+
+        pub fn of(m: *anyopaque) *@This() {
+            return @ptrCast(@alignCast(m));
+        }
+    };
+}
+
+fn failed(e: anyerror) abi.Verdict {
+    return .{ .code = .failed, .why = abi.Str.of(@errorName(e)) };
+}
+
+/// The modes `Base` serves.
+pub fn declares(comptime Base: type, mode: abi.Mode) bool {
+    return abi.declaresMode(.{ .batches_decode = Base.batches_decode }, mode);
+}
+
+/// `ModelTable.forward` over a model of `Base`: checks the mode and the shapes, runs the forward in its own graph and
+/// hands every result out as a new reference.
+pub fn tableForward(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.ForwardOut) abi.Verdict {
+    if (!declares(Base, f.mode)) return abi.Verdict.refuse(.unsupported, "forward mode not declared");
+    const slots: usize = if (f.mode == .batched_rows) f.caches.len else 1;
+    const tokens = f.tokens.slice();
+    if (f.rows == 0 or tokens.len != slots * f.rows or f.positions.len < slots) return abi.Verdict.refuse(.failed, "tokens, rows and positions disagree");
+    if (f.mode == .decode and f.rows != 1) return abi.Verdict.refuse(.failed, "a decode step is one row");
+    run(Base, m, f, out, slots) catch |e| return failed(e);
+    return .ok;
+}
+
+fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.ForwardOut, slots: usize) !void {
+    var g = Graph.init(m.a, m.s);
+    defer g.deinit();
+    const tokens = f.tokens.slice();
+    const ids_buf = try m.a.alloc(i32, tokens.len);
+    defer m.a.free(ids_buf);
+    for (tokens, ids_buf) |t, *i| i.* = @intCast(t);
+    const ids = try g.fromSlice(i32, ids_buf, &.{ @intCast(slots), @intCast(f.rows) });
+    const caps = f.capture_layers.slice();
+    const captured = try m.a.alloc(Array, caps.len);
+    defer m.a.free(captured);
+    @memset(captured, .{});
+    const r: Run = .{
+        .mode = f.mode,
+        .rows = @intCast(f.rows),
+        .slots = @intCast(slots),
+        .positions = f.positions.slice()[0..slots],
+        .caches = f.caches.slice(),
+        .cache_ops = f.cache_ops,
+        .logits = f.logits,
+        .want_hidden = f.want_hidden,
+        .capture_layers = caps,
+        .captured = captured,
+    };
+    const res = try Base.forward(&m.weights, &m.shared, &g, ids, r);
+    if (caps.len > 0) {
+        const dst = out.captured orelse return error.NoCaptureBuffer;
+        for (captured, 0..) |x, k| dst[k] = if (x.ctx != null) .{ .ctx = g.escape(x).ctx } else .{};
+    }
+    out.logits = if (res.logits.ctx != null) .{ .ctx = g.escape(res.logits).ctx } else .{};
+    out.hidden = if (res.hidden.ctx != null) .{ .ctx = g.escape(res.hidden).ctx } else .{};
+}

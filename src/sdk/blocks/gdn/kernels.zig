@@ -2,6 +2,7 @@
 //! Owns gdnKernelSource, GdnOpsResult, gdnRecurOps, GDN_CUDA_HEADER, gdnCudaSource, getGdnCudaKernel, and 41 more.
 
 const std = @import("std");
+const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const gdn_decode = @import("decode.zig");
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
@@ -47,92 +48,20 @@ const gdnGateChain = @import("gate.zig").gdnGateChain;
 //     VIEW pinning the whole [T,...] capture buffer across rounds.
 fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:0]const u8 {
     const g_setup = if (vectorized)
-        \\auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;
+        "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
     else
-        \\auto g_ = g + b_idx * T * Hv;
-    ;
+        "auto g_ = g + b_idx * T * Hv;";
     const g_access = if (vectorized) "g_[s_idx]" else "g_[hv_idx]";
     const g_advance = if (vectorized) "  g_ += Hv * Dk;" else "  g_ += Hv;";
     const seq_base = if (capture_seq)
-        \\auto seq_base = (n * Dv + dv_idx) * Dk;
-        \\
+        "auto seq_base = (n * Dv + dv_idx) * Dk;\n"
     else
         "";
     const seq_write = if (capture_seq)
-        \\  if (t + 1 < T) {
-        \\    auto t_state = state_seq + t * seq_stride + seq_base;
-        \\    for (int i = 0; i < n_per_t; ++i) {
-        \\      auto s_idx = n_per_t * dk_idx + i;
-        \\      t_state[s_idx] = static_cast<StT>(state[i]);
-        \\    }
-        \\  }
-        \\
+        kernelSource("kernels/gdn/gated_delta_seq_write.metal")
     else
         "";
-    // comptimePrint re-terminates the concatenation: the `if` expressions above
-    // are slices, so `++` alone would drop the NUL the mlx-c entry point needs.
-    const body = "auto n = thread_position_in_grid.z;\n" ++
-        "auto b_idx = n / Hv;\n" ++
-        "auto hv_idx = n % Hv;\n" ++
-        "auto hk_idx = hv_idx / (Hv / Hk);\n" ++
-        "constexpr int n_per_t = Dk / 32;\n" ++
-        "\n" ++
-        "auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;\n" ++
-        "auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;\n" ++
-        "\n" ++
-        "auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;\n" ++
-        "y += b_idx * T * Hv * Dv + hv_idx * Dv;\n" ++
-        "\n" ++
-        "auto dk_idx = thread_position_in_threadgroup.x;\n" ++
-        "auto dv_idx = thread_position_in_grid.y;\n" ++
-        "\n" ++
-        "auto i_state = state_in + (n * Dv + dv_idx) * Dk;\n" ++
-        "auto o_state = state_out + (n * Dv + dv_idx) * Dk;\n" ++
-        seq_base ++
-        "\n" ++
-        "float state[n_per_t];\n" ++
-        "for (int i = 0; i < n_per_t; ++i) {\n" ++
-        "  auto s_idx = n_per_t * dk_idx + i;\n" ++
-        "  state[i] = static_cast<float>(i_state[s_idx]);\n" ++
-        "}\n" ++
-        "\n" ++
-        g_setup ++ "\n" ++
-        "auto beta_ = beta + b_idx * T * Hv;\n" ++
-        "\n" ++
-        "for (int t = 0; t < T; ++t) {\n" ++
-        "  float kv_mem = 0.0f;\n" ++
-        "  for (int i = 0; i < n_per_t; ++i) {\n" ++
-        "    auto s_idx = n_per_t * dk_idx + i;\n" ++
-        "    state[i] = state[i] * " ++ g_access ++ ";\n" ++
-        "    kv_mem += state[i] * k_[s_idx];\n" ++
-        "  }\n" ++
-        "  kv_mem = simd_sum(kv_mem);\n" ++
-        "\n" ++
-        "  auto delta = (v_[dv_idx] - kv_mem) * beta_[hv_idx];\n" ++
-        "\n" ++
-        "  float out = 0.0f;\n" ++
-        "  for (int i = 0; i < n_per_t; ++i) {\n" ++
-        "    auto s_idx = n_per_t * dk_idx + i;\n" ++
-        "    state[i] = state[i] + k_[s_idx] * delta;\n" ++
-        "    out += state[i] * q_[s_idx];\n" ++
-        "  }\n" ++
-        "  out = simd_sum(out);\n" ++
-        "  if (thread_index_in_simdgroup == 0) {\n" ++
-        "    y[dv_idx] = static_cast<OutT>(out);\n" ++
-        "  }\n" ++
-        seq_write ++
-        "  q_ += Hk * Dk;\n" ++
-        "  k_ += Hk * Dk;\n" ++
-        "  v_ += Hv * Dv;\n" ++
-        "  y += Hv * Dv;\n" ++
-        g_advance ++ "\n" ++
-        "  beta_ += Hv;\n" ++
-        "}\n" ++
-        "for (int i = 0; i < n_per_t; ++i) {\n" ++
-        "  auto s_idx = n_per_t * dk_idx + i;\n" ++
-        "  o_state[s_idx] = static_cast<StT>(state[i]);\n" ++
-        "}\n";
-    return std.fmt.comptimePrint("{s}", .{body});
+    return std.fmt.comptimePrint(kernelSource("kernels/gdn/gated_delta.fmt.metal"), .{ seq_base, g_setup, g_access, seq_write, g_advance });
 }
 
 const GdnOpsResult = struct { y: mlx.mlx_array, state: mlx.mlx_array, state_seq: mlx.mlx_array };
@@ -288,12 +217,7 @@ pub fn gdnRecurOps(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx
     return out;
 }
 
-const GDN_CUDA_HEADER =
-    \\__device__ __forceinline__ float gdn_warp_sum(float v) {
-    \\  for (int o = 16; o > 0; o >>= 1) v += __shfl_xor_sync(0xffffffff, v, o);
-    \\  return v;
-    \\}
-;
+const GDN_CUDA_HEADER = kernelSource("kernels/gdn/gated_delta_header.cu");
 
 /// `gdnKernelSource` for MLX's CUDA backend: one warp per (head, RPW Dv rows), the Dk lanes reduced
 /// by shuffle. A row's arithmetic does not depend on RPW; rows of one head share the step's loads.
@@ -305,78 +229,10 @@ fn gdnCudaSource(comptime vectorized: bool, comptime capture_seq: bool) [:0]cons
     const g_use = if (vectorized) "gc[i]" else "gc[0]";
     const g_setup = if (vectorized) "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;" else "auto g_ = g + b_idx * T * Hv;";
     const seq_write = if (capture_seq)
-        \\  for (int r = 0; r < RPW; ++r) {
-        \\    auto t_state = state_seq + t * seq_stride_arr[0] + (n * Dv + dv0 + r) * Dk;
-        \\    for (int i = 0; i < n_per_t; ++i) t_state[n_per_t * dk_idx + i] = static_cast<StT>(state[r][i]);
-        \\  }
-        \\
+        kernelSource("kernels/gdn/gated_delta_seq_write.cu")
     else
         "";
-    const body = "const int n = blockIdx.z * blockDim.z + threadIdx.z;\n" ++
-        "const int b_idx = n / Hv;\n" ++
-        "const int hv_idx = n % Hv;\n" ++
-        "const int hk_idx = hv_idx / (Hv / Hk);\n" ++
-        "constexpr int n_per_t = Dk / 32;\n" ++
-        "const int T = T_arr[0];\n" ++
-        "const int dk_idx = threadIdx.x;\n" ++
-        "const int dv0 = (blockIdx.y * blockDim.y + threadIdx.y) * RPW;\n" ++
-        "auto q_ = q + b_idx * T * Hk * Dk + hk_idx * Dk;\n" ++
-        "auto k_ = k + b_idx * T * Hk * Dk + hk_idx * Dk;\n" ++
-        "auto v_ = v + b_idx * T * Hv * Dv + hv_idx * Dv;\n" ++
-        "auto y_ = y + b_idx * T * Hv * Dv + hv_idx * Dv;\n" ++
-        "auto i_state = state_in + (n * Dv + dv0) * Dk;\n" ++
-        "auto o_state = state_out + (n * Dv + dv0) * Dk;\n" ++
-        "float state[RPW][n_per_t];\n" ++
-        "for (int r = 0; r < RPW; ++r)\n" ++
-        "  for (int i = 0; i < n_per_t; ++i) state[r][i] = static_cast<float>(i_state[r * Dk + n_per_t * dk_idx + i]);\n" ++
-        g_setup ++ "\n" ++
-        "auto beta_ = beta + b_idx * T * Hv;\n" ++
-        "float kn[n_per_t], qn[n_per_t], gn[" ++ ng ++ "], vn[RPW], bn;\n" ++
-        "auto load = [&](int tt) {\n" ++
-        "  for (int i = 0; i < n_per_t; ++i) {\n" ++
-        "    const int s_idx = n_per_t * dk_idx + i;\n" ++
-        "    kn[i] = static_cast<float>(k_[(long)tt * Hk * Dk + s_idx]);\n" ++
-        "    qn[i] = static_cast<float>(q_[(long)tt * Hk * Dk + s_idx]);\n" ++
-        "    " ++ g_load ++ "\n" ++
-        "  }\n" ++
-        "  for (int r = 0; r < RPW; ++r) vn[r] = static_cast<float>(v_[(long)tt * Hv * Dv + dv0 + r]);\n" ++
-        "  bn = static_cast<float>(beta_[(long)tt * Hv + hv_idx]);\n" ++
-        "};\n" ++
-        "if (T > 0) load(0);\n" ++
-        "for (int t = 0; t < T; ++t) {\n" ++
-        "  float kc[n_per_t], qc[n_per_t], gc[" ++ ng ++ "], vc[RPW];\n" ++
-        "  for (int i = 0; i < n_per_t; ++i) { kc[i] = kn[i]; qc[i] = qn[i]; }\n" ++
-        "  for (int i = 0; i < " ++ ng ++ "; ++i) gc[i] = gn[i];\n" ++
-        "  for (int r = 0; r < RPW; ++r) vc[r] = vn[r];\n" ++
-        "  const float bc = bn;\n" ++
-        "  if (t + 1 < T) load(t + 1);\n" ++
-        "  float kv_mem[RPW];\n" ++
-        "  for (int r = 0; r < RPW; ++r) kv_mem[r] = 0.0f;\n" ++
-        "  for (int i = 0; i < n_per_t; ++i) {\n" ++
-        "    for (int r = 0; r < RPW; ++r) {\n" ++
-        "      state[r][i] = state[r][i] * " ++ g_use ++ ";\n" ++
-        "      kv_mem[r] += state[r][i] * kc[i];\n" ++
-        "    }\n" ++
-        "  }\n" ++
-        "  for (int r = 0; r < RPW; ++r) kv_mem[r] = gdn_warp_sum(kv_mem[r]);\n" ++
-        "  float delta[RPW];\n" ++
-        "  for (int r = 0; r < RPW; ++r) delta[r] = (vc[r] - kv_mem[r]) * bc;\n" ++
-        "  float out[RPW];\n" ++
-        "  for (int r = 0; r < RPW; ++r) out[r] = 0.0f;\n" ++
-        "  for (int i = 0; i < n_per_t; ++i) {\n" ++
-        "    for (int r = 0; r < RPW; ++r) {\n" ++
-        "      state[r][i] = state[r][i] + kc[i] * delta[r];\n" ++
-        "      out[r] += state[r][i] * qc[i];\n" ++
-        "    }\n" ++
-        "  }\n" ++
-        "  for (int r = 0; r < RPW; ++r) out[r] = gdn_warp_sum(out[r]);\n" ++
-        "  if (dk_idx == 0)\n" ++
-        "    for (int r = 0; r < RPW; ++r) y_[(long)t * Hv * Dv + dv0 + r] = static_cast<OutT>(out[r]);\n" ++
-        seq_write ++
-        "}\n" ++
-        "for (int r = 0; r < RPW; ++r)\n" ++
-        "  for (int i = 0; i < n_per_t; ++i) o_state[r * Dk + n_per_t * dk_idx + i] = static_cast<StT>(state[r][i]);\n";
-    return std.fmt.comptimePrint("{s}", .{body});
+    return std.fmt.comptimePrint(kernelSource("kernels/gdn/gated_delta.fmt.cu"), .{ g_setup, ng, g_load, ng, ng, g_use, seq_write });
 }
 
 fn getGdnCudaKernel(comptime vectorized: bool, comptime capture_seq: bool) !mlx.mlx_fast_cuda_kernel {
@@ -636,105 +492,7 @@ pub fn gdnBlockT() u32 {
 // state loads/stores go through vec<StT,4> (theirs hard-codes float4 — their
 // state is fp32, ours rides the ssm_state buffer's own dtype exactly like the
 // stock kernel, so cross-chunk behavior is unchanged).
-const GDN_KERNEL_BLOCKED_BODY =
-    \\constexpr int DB = 32;                             // dv rows per threadgroup
-    \\const int tid = thread_position_in_threadgroup.x;  // 0..255
-    \\const int blk = threadgroup_position_in_grid.x;    // Dv/DB block
-    \\const int hv  = threadgroup_position_in_grid.y;
-    \\const int b   = threadgroup_position_in_grid.z;
-    \\const int hk  = hv / (Hv / Hk);
-    \\const int dv0 = blk * DB;
-    \\
-    \\// thread -> (dv row, 16-wide d segment); 8 threads per dv row, all in
-    \\// the same simdgroup (lane = (dvr%4)*8 + seg).
-    \\const int dvr = tid / 8;            // 0..31
-    \\const int seg = tid % 8;            // 0..7
-    \\const int d0  = seg * 16;
-    \\
-    \\threadgroup InT k_s[TB][Dk + 8];
-    \\threadgroup InT q_s[TB][Dk + 8];
-    \\threadgroup InT v_s[TB][DB + 8];
-    \\threadgroup float g_s[TB];
-    \\threadgroup float b_s[TB];
-    \\
-    \\auto k_base = k + ((size_t)b * T * Hk + hk) * Dk;
-    \\auto q_base = q + ((size_t)b * T * Hk + hk) * Dk;
-    \\auto v_base = v + ((size_t)b * T * Hv + hv) * Dv + dv0;
-    \\const size_t krow = (size_t)Hk * Dk;
-    \\
-    \\// state fragment in registers: [dv0+dvr][d0..d0+16]
-    \\float4 st[4];
-    \\{
-    \\    const device vec<StT,4>* S_in = (const device vec<StT,4>*)(
-    \\        state_in + (((size_t)b * Hv + hv) * Dv + dv0 + dvr) * Dk + d0);
-    \\    for (int i = 0; i < 4; ++i) st[i] = float4(S_in[i]);
-    \\}
-    \\
-    \\device OutT* y_base = y + ((size_t)b * T * Hv + hv) * Dv + dv0;
-    \\
-    \\for (int t0 = 0; t0 < T; t0 += TB) {
-    \\    const int tt = min(TB, T - t0);
-    \\    // cooperative staging (coalesced): k/q rows, v slice, g/beta
-    \\    for (int p = tid; p < tt * Dk; p += 256) {
-    \\        const int r = p / Dk, d = p % Dk;
-    \\        k_s[r][d] = static_cast<InT>(k_base[(size_t)(t0 + r) * krow + d]);
-    \\        q_s[r][d] = static_cast<InT>(q_base[(size_t)(t0 + r) * krow + d]);
-    \\    }
-    \\    for (int p = tid; p < tt * DB; p += 256) {
-    \\        const int r = p / DB, d = p % DB;
-    \\        v_s[r][d] = static_cast<InT>(v_base[(size_t)(t0 + r) * Hv * Dv + d]);
-    \\    }
-    \\    for (int p = tid; p < tt; p += 256) {
-    \\        g_s[p] = (float)g[((size_t)b * T + t0 + p) * Hv + hv];
-    \\        b_s[p] = (float)beta[((size_t)b * T + t0 + p) * Hv + hv];
-    \\    }
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\
-    \\    for (int t = 0; t < tt; ++t) {
-    \\        const float gt = g_s[t];
-    \\        const float bt = b_s[t];
-    \\        const threadgroup vec<InT,4>* k4 =
-    \\            (const threadgroup vec<InT,4>*)&k_s[t][d0];
-    \\        const threadgroup vec<InT,4>* q4 =
-    \\            (const threadgroup vec<InT,4>*)&q_s[t][d0];
-    \\        float4 kf[4];
-    \\        for (int i = 0; i < 4; ++i) kf[i] = float4(k4[i]);
-    \\        // kv_mem = (g*state) . k ; decay applied to state first
-    \\        float4 p4 = 0.0f;
-    \\        for (int i = 0; i < 4; ++i) {
-    \\            st[i] *= gt;
-    \\            p4 += st[i] * kf[i];
-    \\        }
-    \\        float part = p4.x + p4.y + p4.z + p4.w;
-    \\        // reduce across the 8 segment-threads of this dv row
-    \\        part += simd_shuffle_down(part, 4);
-    \\        part += simd_shuffle_down(part, 2);
-    \\        part += simd_shuffle_down(part, 1);
-    \\        const float kv_mem = simd_shuffle(part, (tid % 32) / 8 * 8);
-    \\        const float delta = ((float)v_s[t][dvr] - kv_mem) * bt;
-    \\
-    \\        float4 o4 = 0.0f;
-    \\        for (int i = 0; i < 4; ++i) {
-    \\            st[i] += kf[i] * delta;
-    \\            o4 += st[i] * float4(q4[i]);
-    \\        }
-    \\        float out = o4.x + o4.y + o4.z + o4.w;
-    \\        out += simd_shuffle_down(out, 4);
-    \\        out += simd_shuffle_down(out, 2);
-    \\        out += simd_shuffle_down(out, 1);
-    \\        if (seg == 0) {
-    \\            y_base[(size_t)(t0 + t) * Hv * Dv + dvr] = static_cast<OutT>(out);
-    \\        }
-    \\    }
-    \\    threadgroup_barrier(mem_flags::mem_threadgroup);
-    \\}
-    \\
-    \\{
-    \\    device vec<StT,4>* S_out = (device vec<StT,4>*)(
-    \\        state_out + (((size_t)b * Hv + hv) * Dv + dv0 + dvr) * Dk + d0);
-    \\    for (int i = 0; i < 4; ++i) S_out[i] = vec<StT,4>(st[i]);
-    \\}
-;
+const GDN_KERNEL_BLOCKED_BODY = kernelSource("kernels/gdn/gated_delta_blocked_body.metal");
 
 fn gdnBlockedSource(comptime tb: u32) [:0]const u8 {
     return std.fmt.comptimePrint("constexpr int TB = {d};\n", .{tb}) ++ GDN_KERNEL_BLOCKED_BODY;
@@ -814,7 +572,7 @@ fn getGdnKernelPipelined() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(in_vec);
     const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
     defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kernel = mlx.mlx_fast_metal_kernel_new("gated_delta_pipelined_tb12", in_vec, out_vec, @embedFile("../../../kernels/gdn/gdn_pipelined.metal"), "", true, false);
+    const kernel = mlx.mlx_fast_metal_kernel_new("gated_delta_pipelined_tb12", in_vec, out_vec, kernelSource("kernels/gdn/gdn_pipelined.metal"), "", true, false);
     if (kernel.ctx == null) return error.MetalKernelCompileFailed;
     gdn_pipelined_cached = kernel;
     return kernel;

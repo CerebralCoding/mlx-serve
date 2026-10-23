@@ -563,6 +563,9 @@ Ported into mlx-serve:
     `gpu_sampling.py` (Metal source reproduced unchanged).
   - `src/engines/mlx/spec/dflash/dflash.zig`: the best-first draft-tree parameters and the
     lattice/tree construction scheme.
+  - `src/sdk/testing/kernel_contract/`: the kernel contract of `docs/kernel-contract.md` (the
+    spec and its float64 bound, the edge shapes, the five gates, the planted controls, the
+    M1/M2 thread limits from `metal-tt` builds).
 
 Modifications by mlx-serve: reimplemented in Zig against mlx-c with our own
 host dispatch; `simd_qmm` gains a 2-3 row `rows` kind; draft trees verify

@@ -10,6 +10,7 @@
 //! A chunk runs one layer at a time over all of its spans: each layer's
 //! experts are read once per chunk.
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const model = @import("../../engines/mlx/model.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
@@ -979,107 +980,23 @@ fn buildRope(m: *Dsv41Model, base: f64, orig: u32, factor: f64, beta_fast: f64, 
 /// query sees (read from the ring after this step's write) then its selected
 /// compressed rows, f32 online softmax split over NSG simdgroups, the sink in
 /// the denominator only. meta = {p0, L, K, window, cap, n_comp}.
-const ATTN_DEC_BODY =
-    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int i = threadgroup_position_in_grid.y, h = threadgroup_position_in_grid.x;
-    \\const int p0 = meta[0], K = meta[2], window = meta[3], cap = meta[4], nc = meta[5];
-    \\const int H = q_shape[1];
-    \\constexpr int V = D / 32;
-    \\const int pos = p0 + i;
-    \\const int lo = metal::max(0, pos - window + 1);
-    \\const int nw = pos - lo + 1;
-    \\float qv[V], acc[V];
-    \\for (int v = 0; v < V; ++v) { qv[v] = float(q[(i * H + h) * D + lane * V + v]); acc[v] = 0.0f; }
-    \\float mx = -INFINITY, den = 0.0f;
-    \\const float scale = scal[0];
-    \\// Split sp of S takes rows [t_lo, t_hi) of the window + selected list.
-    \\const int sp = threadgroup_position_in_grid.z, chunk = (nw + K + S - 1) / S;
-    \\const int t_lo = sp * chunk, t_hi = metal::min(nw + K, t_lo + chunk);
-    \\for (int t = t_lo + sg; t < t_hi; t += NSG) {
-    \\  const device KT* row;
-    \\  if (t < nw) row = ring + size_t((lo + t) % cap) * D;
-    \\  else {
-    \\    const int c = topk[i * K + t - nw];
-    \\    if (c < 0 || c >= nc) continue;
-    \\    row = comp + size_t(c) * D;
-    \\  }
-    \\  float kv[V], dot = 0.0f;
-    \\  for (int v = 0; v < V; ++v) { kv[v] = float(row[lane * V + v]); dot += qv[v] * kv[v]; }
-    \\  const float s = metal::simd_sum(dot) * scale;
-    \\  const float nm = metal::max(mx, s);
-    \\  const float corr = metal::exp(mx - nm), p = metal::exp(s - nm);
-    \\  den = den * corr + p;
-    \\  for (int v = 0; v < V; ++v) acc[v] = acc[v] * corr + p * kv[v];
-    \\  mx = nm;
-    \\}
-    \\threadgroup float t_acc[NSG * D];
-    \\threadgroup float t_mx[NSG], t_den[NSG];
-    \\for (int v = 0; v < V; ++v) t_acc[sg * D + lane * V + v] = acc[v];
-    \\if (lane == 0) { t_mx[sg] = mx; t_den[sg] = den; }
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-;
-const ATTN_DEC_SOURCE = ATTN_DEC_BODY ++
-    \\float M = sink[h];
-    \\for (int g = 0; g < NSG; ++g) M = metal::max(M, t_mx[g]);
-    \\float total = metal::exp(sink[h] - M);
-    \\float w[NSG];
-    \\for (int g = 0; g < NSG; ++g) { w[g] = t_den[g] > 0.0f ? metal::exp(t_mx[g] - M) : 0.0f; total += t_den[g] * w[g]; }
-    \\for (int d = sg * 32 + lane; d < D; d += NSG * 32) {
-    \\  float o = 0.0f;
-    \\  for (int g = 0; g < NSG; ++g) o += t_acc[g * D + d] * w[g];
-    \\  out[(i * H + h) * D + d] = dsv41_unrope<OT, RD, D>(OT(o / total), d, p0 + i, periods);
-    \\}
-;
+const ATTN_DEC_BODY = kernelSource("plugins/deepseek_v41/kernels/attn_dec_body.metal");
+const ATTN_DEC_SOURCE = ATTN_DEC_BODY ++ kernelSource("plugins/deepseek_v41/kernels/attn_dec_epilogue.metal");
 
 /// `ropeTail` with `attnOut`'s inverse periods on a head channel the attention
 /// just wrote (`v`, at position `pos`): pairs are adjacent lanes, so every lane
 /// of the simdgroup must call it. `P`: MLX passes `periods` as a constant
 /// pointer under 8 elements, else a device one.
-const UNROPE_HEADER =
-    \\template <typename OT, int RD, int D, typename P>
-    \\inline OT dsv41_unrope(OT v, int d, int pos, P periods) {
-    \\  const float pv = metal::simd_shuffle_xor(float(v), ushort(1));
-    \\  if (RD == 0 || d < D - RD) return v;
-    \\  const bool even = (d - (D - RD)) % 2 == 0;
-    \\  const float x1 = even ? float(v) : pv, x2 = even ? pv : float(v);
-    \\  const float theta = float(pos) * (1.0f / periods[(d - (D - RD)) / 2]);
-    \\  const float cs = metal::fast::cos(theta), sn = metal::fast::sin(theta);
-    \\  return OT(even ? x1 * cs - x2 * sn : x1 * sn + x2 * cs);
-    \\}
-;
+const UNROPE_HEADER = kernelSource("plugins/deepseek_v41/kernels/unrope_header.metal");
 
 /// `ATTN_DEC_SOURCE` over one of S splits of its rows: the split's max, sum and
 /// unnormalized output (`ATTN_MERGE_SOURCE` finishes it).
-const ATTN_SPLIT_SOURCE = ATTN_DEC_BODY ++
-    \\float M = -INFINITY, l = 0.0f, w[NSG];
-    \\for (int g = 0; g < NSG; ++g) M = metal::max(M, t_mx[g]);
-    \\for (int g = 0; g < NSG; ++g) { w[g] = t_den[g] > 0.0f ? metal::exp(t_mx[g] - M) : 0.0f; l += t_den[g] * w[g]; }
-    \\const size_t base = (size_t(i) * H + h) * S + sp;
-    \\for (int d = sg * 32 + lane; d < D; d += NSG * 32) {
-    \\  float o = 0.0f;
-    \\  for (int g = 0; g < NSG; ++g) o += t_acc[g * D + d] * w[g];
-    \\  pacc[base * D + d] = o;
-    \\}
-    \\if (sg == 0 && lane == 0) { pm[base] = M; pl[base] = l; }
-;
+const ATTN_SPLIT_SOURCE = ATTN_DEC_BODY ++ kernelSource("plugins/deepseek_v41/kernels/attn_split_epilogue.metal");
 
 /// The S partials of one (row, head) `ATTN_SPLIT_SOURCE` wrote, merged with
 /// the sink in the denominator, then `attnOut`'s inverse rope (as
 /// `ATTN_DEC_SOURCE` ends); one thread a channel.
-const ATTN_MERGE_SOURCE =
-    \\const int d = thread_position_in_threadgroup.x, h = threadgroup_position_in_grid.y, i = threadgroup_position_in_grid.z;
-    \\const int H = pm_shape[1];
-    \\const size_t base = (size_t(i) * H + h) * S;
-    \\float M = sink[h];
-    \\for (int j = 0; j < S; ++j) M = metal::max(M, pm[base + j]);
-    \\float total = metal::exp(sink[h] - M), o = 0.0f;
-    \\for (int j = 0; j < S; ++j) {
-    \\  const float w = pl[base + j] > 0.0f ? metal::exp(pm[base + j] - M) : 0.0f;
-    \\  total += pl[base + j] * w;
-    \\  o += pacc[(base + j) * D + d] * w;
-    \\}
-    \\out[(size_t(i) * H + h) * D + d] = dsv41_unrope<OT, RD, D>(OT(o / total), d, meta[0] + i, periods);
-;
+const ATTN_MERGE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/attn_merge.metal");
 
 /// Swept on M5 Ultra over 4..8 simdgroups and 1..4 rows a pass: 8 x 1.
 const ATTN_DEC_NSG = 8;
@@ -1090,37 +1007,7 @@ const ATTN_DEC_NSG = 8;
 /// `scal` here in f32, max and sum in f32 with the sink in the denominator
 /// only, the normalized probabilities written in `OT`. NJ columns a lane.
 /// meta = {wp, window, Wk, K}.
-const ATTN_SOFTMAX_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int h = thread_position_in_grid.x / 32, l = thread_position_in_grid.y;
-    \\const int H = sink_shape[1];
-    \\const int wp = meta[0], window = meta[1], Wk = meta[2], K = meta[3];
-    \\const int N = Wk + K;
-    \\const float scale = scal[0];
-    \\const size_t rw = size_t(l) * H + h;
-    \\float s[NJ];
-    \\float mx = -INFINITY;
-    \\for (int j = 0; j < NJ; ++j) {
-    \\  const int c = lane + 32 * j;
-    \\  float v = -INFINITY;
-    \\  if (c < Wk) { if (c <= wp + l && c + window > wp + l) v = scale * float(lw[rw * Wk + c]); }
-    \\  else if (c < N) { if (topk[size_t(l) * K + c - Wk] >= 0) v = scale * float(lc[rw * K + c - Wk]); }
-    \\  s[j] = v;
-    \\  mx = metal::max(mx, v);
-    \\}
-    \\mx = metal::simd_max(mx);
-    \\const float sk = sink[h];
-    \\const float M = metal::max(mx, sk);
-    \\float den = 0.0f;
-    \\for (int j = 0; j < NJ; ++j) { const float p = metal::exp(s[j] - M); s[j] = p; den += p; }
-    \\den = metal::simd_sum(den) + metal::exp(sk - M);
-    \\const float inv = 1.0f / den;
-    \\for (int j = 0; j < NJ; ++j) {
-    \\  const int c = lane + 32 * j;
-    \\  if (c < Wk) pw[rw * Wk + c] = OT(s[j] * inv);
-    \\  else if (c < N) pc[rw * K + c - Wk] = OT(s[j] * inv);
-    \\}
-;
+const ATTN_SOFTMAX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/attn_softmax.metal");
 
 /// The most window + selected columns `attnWide` scores (NJ <= 32 floats a lane); wider spans keep the f32 chain.
 const ATTN_SOFTMAX_MAX_COLS = 1024;
@@ -1129,253 +1016,36 @@ const ATTN_SOFTMAX_MAX_COLS = 1024;
 /// a weight being its projection in f32 times `wsc`, keys read in their cached
 /// dtype, -inf past the groups row l's query sees ((p0 + l + 1) / ratio).
 /// meta = {p0, ratio}.
-const IDX_SCORE_SOURCE =
-    \\const int n = thread_position_in_grid.x, l = thread_position_in_grid.y;
-    \\const uint tid = thread_index_in_threadgroup, tgn = threads_per_threadgroup.x;
-    \\const int nb = keys_shape[0];
-    \\threadgroup float qs[IH * IHD];
-    \\for (uint k = tid; k < IH * IHD; k += tgn) qs[k] = float(q[l * IH * IHD + k]);
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (n >= nb) return;
-    \\float dots[IH];
-    \\for (int h = 0; h < IH; ++h) dots[h] = 0.0f;
-    \\const device KT* kr = keys + size_t(n) * IHD;
-    \\for (int j = 0; j < IHD; ++j) {
-    \\  const float kv = float(kr[j]);
-    \\  for (int h = 0; h < IH; ++h) dots[h] += qs[h * IHD + j] * kv;
-    \\}
-    \\float s = 0.0f;
-    \\for (int h = 0; h < IH; ++h) s += (float(w[l * IH + h]) * wsc[0]) * metal::max(dots[h], 0.0f);
-    \\const int seen = (meta[0] + l + 1) / meta[1];
-    \\scores[size_t(l) * nb + n] = n < seen ? s : -INFINITY;
-;
+const IDX_SCORE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_score.metal");
 
 /// `IDX_SCORE_SOURCE` for a wide block: one threadgroup a (query, KT-key tile), its four simdgroups
 /// each KT/4 keys x every head on 8x8 matrix ops over the keys staged in threadgroup memory; a head
 /// tile is relu'd, weighted and summed as it completes, so no [L, IH, nb] scratch. A tile the query
 /// cannot see is -inf without the work. `q` arrives in the keys' dtype: the rope kernel rounded it
 /// to that dtype before widening, so the cast is exact.
-const IDX_TILE_SOURCE =
-    \\const int l = threadgroup_position_in_grid.y, n0 = threadgroup_position_in_grid.x * KT;
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int nb = keys_shape[0];
-    \\const int seen = (meta[0] + l + 1) / meta[1];
-    \\const int end = metal::min(nb, n0 + KT);
-    \\if (n0 >= seen) {
-    \\  for (int n = n0 + int(tid); n < end; n += 128) scores[size_t(l) * nb + n] = -INFINITY;
-    \\  return;
-    \\}
-    \\constexpr int RT = IH / 8, CT = KT / 32, C4 = IHD / 4;
-    \\using T4 = metal::vec<T, 4>;
-    \\threadgroup T kt[KT * IHD];
-    \\threadgroup float wt[IH], red[4][64];
-    \\for (uint i = tid; i < KT * C4; i += 128) {
-    \\  const int n = n0 + int(i / C4);
-    \\  ((threadgroup T4*)kt)[i] = n < nb ? ((const device T4*)keys)[size_t(n) * C4 + i % C4] : T4(0);
-    \\}
-    \\if (tid < IH) wt[tid] = float(w[size_t(l) * IH + tid]) * wsc[0];
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\const device T* qr = q + size_t(l) * IH * IHD;
-    \\const threadgroup T* kr = kt + sg * (KT / 4) * IHD;
-    \\metal::simdgroup_matrix<float, 8, 8> acc[RT][CT];
-    \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < RT; ++r)
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < CT; ++c) acc[r][c] = metal::make_filled_simdgroup_matrix<float, 8, 8>(0.0f);
-    \\for (int d = 0; d < IHD; d += 8) {
-    \\  metal::simdgroup_matrix<T, 8, 8> a[RT], b[CT];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r) metal::simdgroup_load(a[r], qr + r * 8 * IHD + d, IHD);
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < CT; ++c) metal::simdgroup_load(b[c], kr + c * 8 * IHD + d, IHD, metal::ulong2(0, 0), true);
-    \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < RT; ++r)
-    \\    #pragma clang loop unroll(full)
-    \\    for (int c = 0; c < CT; ++c) metal::simdgroup_multiply_accumulate(acc[r][c], a[r], b[c], acc[r][c]);
-    \\}
-    \\// A finished tile's rows are heads: relu, weight and sum them through this simdgroup's scratch.
-    \\// Threadgroup barriers: on M1 a simdgroup barrier let lanes read the scratch before the store landed.
-    \\const int col = lane & 7, row = (lane >> 3) * 2;
-    \\float s[CT];
-    \\#pragma clang loop unroll(full)
-    \\for (int c = 0; c < CT; ++c) s[c] = 0.0f;
-    \\#pragma clang loop unroll(full)
-    \\for (int r = 0; r < RT; ++r)
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < CT; ++c) {
-    \\    metal::simdgroup_store(acc[r][c], red[sg], 8);
-    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\    float p = metal::max(red[sg][row * 8 + col], 0.0f) * wt[r * 8 + row] + metal::max(red[sg][(row + 1) * 8 + col], 0.0f) * wt[r * 8 + row + 1];
-    \\    p += metal::simd_shuffle_xor(p, 8);
-    \\    p += metal::simd_shuffle_xor(p, 16);
-    \\    s[c] += p;
-    \\    metal::threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  }
-    \\if (lane < 8)
-    \\  for (int c = 0; c < CT; ++c) {
-    \\    const int n = n0 + int(sg) * (KT / 4) + c * 8 + col;
-    \\    if (n < nb) scores[size_t(l) * nb + n] = n < seen ? s[c] : -INFINITY;
-    \\  }
-;
+const IDX_TILE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/idx_tile.metal");
 
 /// Router logits `[L, E]` in f32 from bf16 rows: one simdgroup an expert,
 /// 8 inputs a lane per step.
-const GATE_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int e = threadgroup_position_in_grid.x * SGS + simdgroup_index_in_threadgroup;
-    \\const int l = threadgroup_position_in_grid.y;
-    \\const int E = w_shape[0], D = w_shape[1];
-    \\if (e >= E) return;
-    \\const device auto* wr = w + size_t(e) * D;
-    \\const device auto* xr = x + size_t(l) * D;
-    \\float acc = 0.0f;
-    \\for (int k = lane * 8; k < D; k += 256)
-    \\  for (int j = 0; j < 8; ++j) acc += float(xr[k + j]) * float(wr[k + j]);
-    \\acc = metal::simd_sum(acc);
-    \\if (lane == 0) logits[size_t(l) * E + e] = acc;
-;
+const GATE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/gate.metal");
 
 /// One row a threadgroup, one expert a thread: sqrt-softplus scores, the
 /// bias-picked top K (lowest index on ties), their scores normalized
 /// (NORM) and scaled.
-const ROUTE_SOURCE =
-    \\const int e = thread_position_in_threadgroup.x, l = threadgroup_position_in_grid.y;
-    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int E = logits_shape[1];
-    \\threadgroup float t_s[1024], t_v[32];
-    \\threadgroup int t_i[32], t_pick[K];
-    \\float s = 0.0f, v = -INFINITY;
-    \\if (e < E) {
-    \\  const float z = logits[size_t(l) * E + e];
-    \\  const float y = metal::exp(-metal::abs(z));
-    \\  const float lp = y < 1e-4f ? y * (1.0f - y * (0.5f - y / 3.0f)) : metal::log(1.0f + y);
-    \\  s = metal::sqrt(metal::max(z, 0.0f) + lp);
-    \\  v = s + bias[(bias_shape[0] == 1 ? 0 : l) * E + e];
-    \\  t_s[e] = s;
-    \\}
-    \\for (int r = 0; r < K; ++r) {
-    \\  const float bv = metal::simd_max(v);
-    \\  const int bi = metal::simd_min(v == bv && e < E ? e : 0x7fffffff);
-    \\  if (lane == 0) { t_v[sg] = bv; t_i[sg] = bi; }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (e == 0) {
-    \\    const int nsg = (threads_per_threadgroup.x + 31) / 32;
-    \\    float best = t_v[0]; int at = t_i[0];
-    \\    for (int g = 1; g < nsg; ++g) if (t_v[g] > best || (t_v[g] == best && t_i[g] < at)) { best = t_v[g]; at = t_i[g]; }
-    \\    t_pick[r] = at;
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (e == t_pick[r]) v = -INFINITY;
-    \\}
-    \\if (e == 0) {
-    \\  float sum = 0.0f;
-    \\  for (int r = 0; r < K; ++r) sum += t_s[t_pick[r]];
-    \\  const float div = NORM ? sum + 1e-20f : 1.0f;
-    \\  for (int r = 0; r < K; ++r) {
-    \\    idx[l * K + r] = uint(t_pick[r]);
-    \\    wts[l * K + r] = t_s[t_pick[r]] / div * scal[0];
-    \\  }
-    \\}
-;
+const ROUTE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/route.metal");
 
 /// `x` [L, K] f32 times dense rows `w` [N, K] (any float dtype) in f32,
 /// RPS rows a simdgroup: the product the reference computes after widening w.
-const DENSE_F32X_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const int n0 = thread_position_in_grid.y * RPS, l = thread_position_in_grid.z;
-    \\const int K = x_shape[1], N = w_shape[0];
-    \\float acc[RPS];
-    \\for (int r = 0; r < RPS; ++r) acc[r] = 0.0f;
-    \\const device float* xr = x + size_t(l) * K;
-    \\for (int k = int(lane) * 4; k < K; k += 128) {
-    \\  const float4 xv = *(const device float4*)(xr + k);
-    \\  for (int r = 0; r < RPS; ++r) {
-    \\    const device auto* wr = w + size_t(n0 + r) * K + k;
-    \\    acc[r] += xv.x * float(wr[0]) + xv.y * float(wr[1]) + xv.z * float(wr[2]) + xv.w * float(wr[3]);
-    \\  }
-    \\}
-    \\for (int r = 0; r < RPS; ++r) {
-    \\  const float v = metal::simd_sum(acc[r]);
-    \\  if (lane == 0 && n0 + r < N) out[size_t(l) * N + n0 + r] = v;
-    \\}
-;
+const DENSE_F32X_SOURCE = kernelSource("plugins/deepseek_v41/kernels/dense_f32x.metal");
 const dense_f32x_rps = 4;
 
 /// The K largest of each row of `x` [L, n] f32 (K <= n), as their indices in
 /// ascending order, ties to the lower index: a radix select of the order-
 /// preserving uint keys, 8 bits a pass, then one pass writing every key above
 /// the threshold and the first ties. One threadgroup a row.
-const TOPK_SOURCE =
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int l = threadgroup_position_in_grid.y, n = x_shape[1];
-    \\const auto xr = x + size_t(l) * n;
-    \\threadgroup atomic_uint hist[256];
-    \\threadgroup uint t_sel[2], t_part[TG / 32];
-    \\uint prefix = 0, krem = K;
-    \\for (int pass = 0; pass < 4; ++pass) {
-    \\  const int shift = 24 - 8 * pass;
-    \\  const uint hmask = pass == 0 ? 0u : (0xFFFFFFFFu << (shift + 8));
-    \\  for (uint b = tid; b < 256; b += TG) atomic_store_explicit(&hist[b], 0u, metal::memory_order_relaxed);
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  for (int i = int(tid); i < n; i += TG) {
-    \\    const uint key = dsv41_key(xr[i]);
-    \\    if ((key & hmask) == prefix) atomic_fetch_add_explicit(&hist[(key >> shift) & 255u], 1u, metal::memory_order_relaxed);
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  if (sg == 0) {
-    \\    // Bins 255..0 in lane order of 8 bins each: the digit where the count from the top reaches krem.
-    \\    uint c[8], tot = 0;
-    \\    for (int j = 0; j < 8; ++j) { c[j] = atomic_load_explicit(&hist[255 - (lane * 8 + j)], metal::memory_order_relaxed); tot += c[j]; }
-    \\    const uint before = metal::simd_prefix_exclusive_sum(tot);
-    \\    const bool mine = before < krem && before + tot >= krem;
-    \\    if (mine) {
-    \\      uint acc = before;
-    \\      int j = 0;
-    \\      for (; j < 8; ++j) { if (acc + c[j] >= krem) break; acc += c[j]; }
-    \\      t_sel[0] = prefix | (uint(255 - (lane * 8 + j)) << shift);
-    \\      t_sel[1] = krem - acc;
-    \\    }
-    \\  }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  prefix = t_sel[0];
-    \\  krem = t_sel[1];
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\}
-    \\// Contiguous index chunks a thread, so the output keeps index order.
-    \\const int C = (n + TG - 1) / TG, i0 = int(tid) * C, i1 = metal::min(n, i0 + C);
-    \\uint gt = 0, eq = 0;
-    \\for (int i = i0; i < i1; ++i) { const uint key = dsv41_key(xr[i]); gt += key > prefix; eq += key == prefix; }
-    \\// Exclusive scans across the threadgroup: ties before this chunk, then picks before it.
-    \\uint s = metal::simd_prefix_exclusive_sum(eq);
-    \\if (lane == 31) t_part[sg] = s + eq;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\uint off = 0;
-    \\for (uint g = 0; g < sg; ++g) off += t_part[g];
-    \\const uint eq_before = s + off;
-    \\const uint take = eq_before >= krem ? 0u : metal::min(eq, krem - eq_before);
-    \\const uint sel = gt + take;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\s = metal::simd_prefix_exclusive_sum(sel);
-    \\if (lane == 31) t_part[sg] = s + sel;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\off = 0;
-    \\for (uint g = 0; g < sg; ++g) off += t_part[g];
-    \\uint pos = s + off, taken = 0;
-    \\for (int i = i0; i < i1; ++i) {
-    \\  const uint key = dsv41_key(xr[i]);
-    \\  if (key > prefix || (key == prefix && taken < take)) {
-    \\    taken += key == prefix;
-    \\    out[size_t(l) * K + pos++] = i;
-    \\  }
-    \\}
-;
+const TOPK_SOURCE = kernelSource("plugins/deepseek_v41/kernels/topk.metal");
 
-const TOPK_HEADER =
-    \\inline uint dsv41_key(float f) {
-    \\  const uint u = as_type<uint>(f);
-    \\  return (u & 0x80000000u) ? ~u : (u | 0x80000000u);
-    \\}
-;
+const TOPK_HEADER = kernelSource("plugins/deepseek_v41/kernels/topk_header.metal");
 const topk_tg = 1024;
 
 /// `hcSplit`'s projection: per row, the 24 mixing logits of the flattened
@@ -1383,38 +1053,7 @@ const topk_tg = 1024;
 /// tile, so each fn and stream load serves the tile; every (row, mix) dot keeps
 /// `HC_STAGE_SOURCE`'s order (thread tid the terms k = tid + c * TG in c order,
 /// one simd sum, the simdgroups in order), which is what makes the two bit-equal.
-const HC_MIX_SOURCE =
-    \\const int m0 = threadgroup_position_in_grid.x * M, l0 = threadgroup_position_in_grid.y * R;
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int N = fn_shape[1], MIX = fn_shape[0], L = x_shape[0];
-    \\float d[R][M], ss[R];
-    \\for (int r = 0; r < R; ++r) { ss[r] = 0.0f; for (int j = 0; j < M; ++j) d[r][j] = 0.0f; }
-    \\for (int k = tid; k < N; k += TG) {
-    \\  float fv[M];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int j = 0; j < M; ++j) fv[j] = fn[size_t(m0 + j) * N + k];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int r = 0; r < R; ++r) {
-    \\    const float v = l0 + r < L ? float(x[size_t(l0 + r) * N + k]) : 0.0f;
-    \\    #pragma clang loop unroll(full)
-    \\    for (int j = 0; j < M; ++j) d[r][j] += v * fv[j];
-    \\    ss[r] += v * v;
-    \\  }
-    \\}
-    \\threadgroup float t_d[R][M][TG / 32], t_s[R][TG / 32];
-    \\for (int r = 0; r < R; ++r) {
-    \\  for (int j = 0; j < M; ++j) { const float v = metal::simd_sum(d[r][j]); if (lane == 0) t_d[r][j][sg] = v; }
-    \\  const float v = metal::simd_sum(ss[r]);
-    \\  if (lane == 0) t_s[r][sg] = v;
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (tid < R * M) {
-    \\  const int r = tid / M, j = tid % M;
-    \\  float a = 0.0f, b = 0.0f;
-    \\  for (int g = 0; g < TG / 32; ++g) { a += t_d[r][j][g]; b += t_s[r][g]; }
-    \\  if (l0 + r < L) z[(l0 + r) * MIX + m0 + j] = a * metal::precise::rsqrt(b / float(N) + eps[0]) * scale[m0 + j] + base[m0 + j];
-    \\}
-;
+const HC_MIX_SOURCE = kernelSource("plugins/deepseek_v41/kernels/hc_mix.metal");
 
 /// `HC_MIX_SOURCE`'s tile: rows a threadgroup, and the mixes a threadgroup
 /// (the largest of these that divides the mix count).
@@ -1426,121 +1065,18 @@ const hc_mix_cols = [_]usize{ 6, 4, 3, 2, 1 };
 /// mixes, while threadgroups 1..MIX each take one mix's dot; the FFN side rebuilds the stream from the
 /// block output in every threadgroup and threadgroup 0 stores it. The split (`HC_SPLIT_SOURCE`) is read
 /// only later, so the next matmul runs beside it.
-const HC_STAGE_HEAD =
-    \\const uint role = threadgroup_position_in_grid.x;
-    \\const int l = threadgroup_position_in_grid.y;
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int D = x_shape[2], N = fn_shape[1];
-    \\threadgroup float t_a[TG / 32], t_b[TG / 32];
-    \\const device auto* xr = x + size_t(l) * HC * D;
-    \\float v[HC][ND];
-    \\for (int c = 0; c < ND; ++c) {
-    \\  const int d = int(tid) + c * TG;
-    \\  for (int i = 0; i < HC; ++i) v[i][c] = 0.0f;
-;
+const HC_STAGE_HEAD = kernelSource("plugins/deepseek_v41/kernels/hc_stage_head.metal");
 
 /// The stream is `x` itself.
-const HC_STAGE_LOAD_PLAIN =
-    \\  if (d < D) for (int i = 0; i < HC; ++i) v[i][c] = float(xr[i * D + d]);
-    \\}
-;
+const HC_STAGE_LOAD_PLAIN = kernelSource("plugins/deepseek_v41/kernels/hc_stage_load_plain.metal");
 
 /// The stream is `hcExpand(x, y, previous split)`, rounded to T where the expand rounds it.
-const HC_STAGE_LOAD_EXPAND =
-    \\  if (d < D) {
-    \\    const auto pr = spost + l * HC;
-    \\    const auto cb = scomb + l * HC * HC;
-    \\    float sv[HC];
-    \\    for (int j = 0; j < HC; ++j) sv[j] = float(xr[j * D + d]);
-    \\    const float yv = float(y[size_t(l) * D + d]);
-    \\    for (int i = 0; i < HC; ++i) {
-    \\      float acc = 0.0f;
-    \\      for (int j = 0; j < HC; ++j) acc = metal::fma(cb[j * HC + i], sv[j], acc);
-    \\      const T o = T(metal::fma(pr[i], yv, acc));
-    \\      v[i][c] = float(o);
-    \\      if (role == 0) x1[(size_t(l) * HC + i) * D + d] = o;
-    \\    }
-    \\  }
-    \\}
-;
+const HC_STAGE_LOAD_EXPAND = kernelSource("plugins/deepseek_v41/kernels/hc_stage_load_expand.metal");
 
-const HC_STAGE_TAIL =
-    \\if (role == 0) {
-    \\  float cp[HC];
-    \\  for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
-    \\  float ss = 0.0f;
-    \\  T hv[ND];
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < ND; ++c) {
-    \\    float h = 0.0f;
-    \\    for (int j = 0; j < HC; ++j) h += cp[j] * v[j][c];
-    \\    hv[c] = T(h);
-    \\    ss += float(hv[c]) * float(hv[c]);
-    \\  }
-    \\  ss = metal::simd_sum(ss);
-    \\  if (lane == 0) t_a[sg] = ss;
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  float tot = 0.0f;
-    \\  for (int g = 0; g < TG / 32; ++g) tot += t_a[g];
-    \\  const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < ND; ++c) {
-    \\    const int d = int(tid) + c * TG;
-    \\    if (d < D) h_out[size_t(l) * D + d] = w[d] * T(float(hv[c]) * inv);
-    \\  }
-    \\  return;
-    \\}
-    \\const int m = int(role) - 1;
-    \\const device float* fr = fn + size_t(m) * N;
-    \\float dd = 0.0f, sq = 0.0f;
-    \\#pragma clang loop unroll(full)
-    \\for (int i = 0; i < HC; ++i)
-    \\  #pragma clang loop unroll(full)
-    \\  for (int c = 0; c < ND; ++c) {
-    \\    const int d = int(tid) + c * TG;
-    \\    const float u = v[i][c];
-    \\    if (d < D) dd += u * fr[i * D + d];
-    \\    sq += u * u;
-    \\  }
-    \\dd = metal::simd_sum(dd); sq = metal::simd_sum(sq);
-    \\if (lane == 0) { t_a[sg] = dd; t_b[sg] = sq; }
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\if (tid == 0) {
-    \\  float a = 0.0f, b = 0.0f;
-    \\  for (int g = 0; g < TG / 32; ++g) { a += t_a[g]; b += t_b[g]; }
-    \\  z[l * ((2 + HC) * HC) + m] = a * metal::precise::rsqrt(b / float(N) + eps[0]) * scale[m] + base[m];
-    \\}
-;
+const HC_STAGE_TAIL = kernelSource("plugins/deepseek_v41/kernels/hc_stage_tail.metal");
 
 /// The hc split of the mixes `z` (pre = sigmoid + eps, post = 2 sigmoid, Sinkhorn comb); one simdgroup a row.
-const HC_SPLIT_SOURCE =
-    \\const int l = threadgroup_position_in_grid.y;
-    \\const uint lane = thread_index_in_threadgroup;
-    \\constexpr int MIX = (2 + HC) * HC;
-    \\const float e = eps[1];
-    \\const device float* zr = z + l * MIX;
-    \\if (lane < HC) {
-    \\  pre[l * HC + lane] = 1.0f / (1.0f + metal::exp(-zr[lane])) + e;
-    \\  post[l * HC + lane] = 2.0f / (1.0f + metal::exp(-zr[HC + lane]));
-    \\}
-    \\// Lane a * HC + b holds comb[a][b]; each sum gathers its HC terms in the serial order.
-    \\const bool act = lane < HC * HC;
-    \\const ushort a = act ? lane / HC : 0, b = act ? lane % HC : 0;
-    \\float v = zr[2 * HC + a * HC + b];
-    \\float mx = metal::simd_shuffle(v, a * HC);
-    \\for (ushort k = 1; k < HC; ++k) mx = metal::max(mx, metal::simd_shuffle(v, a * HC + k));
-    \\v = metal::exp(v - mx);
-    \\float sm = 0.0f;
-    \\for (ushort k = 0; k < HC; ++k) sm += metal::simd_shuffle(v, a * HC + k);
-    \\v = v / sm + e;
-    \\for (int t = 0; t < 2 * ITERS - 1; ++t) {
-    \\  const bool rows = t % 2 == 1;
-    \\  sm = 0.0f;
-    \\  for (ushort k = 0; k < HC; ++k) sm += metal::simd_shuffle(v, rows ? a * HC + k : k * HC + b);
-    \\  v = v / (sm + e);
-    \\}
-    \\if (act) comb[l * HC * HC + lane] = v;
-;
+const HC_SPLIT_SOURCE = kernelSource("plugins/deepseek_v41/kernels/hc_split.metal");
 
 const HC_STAGE_SOURCE = HC_STAGE_HEAD ++ HC_STAGE_LOAD_PLAIN ++ HC_STAGE_TAIL;
 const HC_STAGE_X_SOURCE = HC_STAGE_HEAD ++ HC_STAGE_LOAD_EXPAND ++ HC_STAGE_TAIL;
@@ -1552,168 +1088,35 @@ const HC_STAGE_X_OUTS = [_][*:0]const u8{ "h_out", "z", "x1" };
 /// The hc split (pre = sigmoid + eps, post = 2 sigmoid, Sinkhorn comb; one simdgroup), then the stream collapsed with
 /// `cpre` (f32, rounded to T like `hcCollapse`) and rms-normed like MLX's
 /// `rms_norm`. One threadgroup a row.
-const HC_NORM_SOURCE =
-    \\const int l = threadgroup_position_in_grid.y;
-    \\const uint tid = thread_index_in_threadgroup, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int D = x_shape[2];
-    \\constexpr int MIX = (2 + HC) * HC;
-    \\const float e = eps[1];
-    \\if (sg == 0) {
-    \\  // Lane a * HC + b holds comb[a][b]; each sum gathers its HC terms in the serial order.
-    \\  const device float* zr = z + l * MIX;
-    \\  if (lane < HC) {
-    \\    pre[l * HC + lane] = 1.0f / (1.0f + metal::exp(-zr[lane])) + e;
-    \\    post[l * HC + lane] = 2.0f / (1.0f + metal::exp(-zr[HC + lane]));
-    \\  }
-    \\  const bool act = lane < HC * HC;
-    \\  const ushort a = act ? lane / HC : 0, b = act ? lane % HC : 0;
-    \\  float v = zr[2 * HC + a * HC + b];
-    \\  float mx = metal::simd_shuffle(v, a * HC);
-    \\  for (ushort k = 1; k < HC; ++k) mx = metal::max(mx, metal::simd_shuffle(v, a * HC + k));
-    \\  v = metal::exp(v - mx);
-    \\  float sm = 0.0f;
-    \\  for (ushort k = 0; k < HC; ++k) sm += metal::simd_shuffle(v, a * HC + k);
-    \\  v = v / sm + e;
-    \\  for (int t = 0; t < 2 * ITERS - 1; ++t) {
-    \\    const bool rows = t % 2 == 1;
-    \\    sm = 0.0f;
-    \\    for (ushort k = 0; k < HC; ++k) sm += metal::simd_shuffle(v, rows ? a * HC + k : k * HC + b);
-    \\    v = v / (sm + e);
-    \\  }
-    \\  if (act) comb[l * HC * HC + lane] = v;
-    \\}
-    \\float cp[HC];
-    \\for (int j = 0; j < HC; ++j) cp[j] = cpre[l * HC + j];
-    \\float ss = 0.0f;
-    \\for (int d = tid; d < D; d += TG) {
-    \\  float h = 0.0f;
-    \\  for (int j = 0; j < HC; ++j) h += cp[j] * float(x[(size_t(l) * HC + j) * D + d]);
-    \\  const T hb = T(h);
-    \\  h_out[size_t(l) * D + d] = hb;
-    \\  ss += float(hb) * float(hb);
-    \\}
-    \\threadgroup float t_s[TG / 32];
-    \\ss = metal::simd_sum(ss);
-    \\if (lane == 0) t_s[sg] = ss;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\float tot = 0.0f;
-    \\for (int g = 0; g < TG / 32; ++g) tot += t_s[g];
-    \\const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
-    \\for (int d = tid; d < D; d += TG) {
-    \\  const size_t o = size_t(l) * D + d;
-    \\  h_out[o] = w[d] * T(float(h_out[o]) * inv);
-    \\}
-;
+const HC_NORM_SOURCE = kernelSource("plugins/deepseek_v41/kernels/hc_norm.metal");
 
 /// R affine rows of one bank against `x` (K wide), across one simdgroup:
 /// a lane's x chunk is prescaled by 2^-(BITS i) so a packed value is masked,
 /// never shifted, and each group adds scale * sum(x q) + bias * sum(x).
 /// MX: mxfp8 rows (BITS 8, GS 32: e4m3 bytes, an e8m0 exponent a group, `bi` unread).
-const MOE_HEADER = transformer.GQMV_AFFINE_HEADER ++ mxfp8_qmv.HEADER ++
-    \\template <int BITS, int GS, int K, int R, bool MX, typename X, typename S>
-    \\inline void dsv41_dots(const device uint32_t* w, const device S* sc, const device S* bi, thread const size_t* rows,
-    \\                       const device X* x, uint lane, thread float* acc) {
-    \\  constexpr int VPW = BITS == 3 ? 8 : 32 / BITS;
-    \\  constexpr int KW = K * BITS / 32, KG = K / GS, KP = K / VPW;
-    \\  constexpr uint MASK = (1u << BITS) - 1u;
-    \\  for (int r = 0; r < R; ++r) acc[r] = 0.0f;
-    \\  for (int pk = int(lane); pk < KP; pk += 32) {
-    \\    const int kb = pk * VPW, gi = kb / GS;
-    \\    float xp[VPW], xs = 0.0f;
-    \\    for (int i = 0; i < VPW; ++i) { const float v = float(x[kb + i]); xs += v; xp[i] = MX ? v : v * (1.0f / float(1u << (BITS * i))); }
-    \\    for (int r = 0; r < R; ++r) {
-    \\      const uint32_t q = mlxserve_qpack<BITS>(w, rows[r] * KW, pk);
-    \\      if (MX) {
-    \\        // e8m0 as 2^(e - 127), times the 2^8 the e4m3 bit placement leaves out.
-    \\        const uint e = uint(sc[rows[r] * KG + gi]);
-    \\        const float2 lo = mlxserve_e4m3x2(q), hi = mlxserve_e4m3x2(q >> 8);
-    \\        acc[r] += as_type<float>(e == 0u ? 0x400000u : (e << 23)) * 256.0f * (xp[0] * lo.x + xp[1] * hi.x + xp[2] * lo.y + xp[3] * hi.y);
-    \\      } else {
-    \\        float dq = 0.0f;
-    \\        for (int i = 0; i < VPW; ++i) dq += xp[i] * float(q & (MASK << (BITS * i)));
-    \\        acc[r] += float(sc[rows[r] * KG + gi]) * dq + float(bi[rows[r] * KG + gi]) * xs;
-    \\      }
-    \\    }
-    \\  }
-    \\  for (int r = 0; r < R; ++r) acc[r] = metal::simd_sum(acc[r]);
-    \\}
-;
+const MOE_HEADER = transformer.GQMV_AFFINE_HEADER ++ mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/moe_header.metal");
 
 /// One token's routed gate+up (the fused bank: expert e's up rows sit N rows
 /// after its gate rows) and, as slot TOPK, the shared expert's; RPS rows a
 /// simdgroup. Each accumulator rounds to T where `gather_qmm` writes it, then
 /// `clampedSwiglu` times the slot's routing weight (1 for the shared) in f32.
-const MOE_GU_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const uint n0 = thread_position_in_grid.y * RPS, e = thread_position_in_grid.z;
-    \\float a[2 * RPS];
-    \\size_t rows[2 * RPS];
-    \\const size_t eb = e < TOPK ? size_t(inds[e]) * 2 * N + n0 : n0;
-    \\for (int r = 0; r < RPS; ++r) { rows[r] = eb + r; rows[RPS + r] = eb + N + r; }
-    \\if (e < TOPK) dsv41_dots<BITS, GS, K, 2 * RPS, false>(w, scales, biases, rows, x, lane, a);
-    \\else dsv41_dots<SBITS, SGS, K, 2 * RPS, SMX>(sw, sscales, sbiases, rows, x, lane, a);
-    \\const float wt = e < TOPK ? wts[e] : 1.0f;
-    \\if (lane == 0) for (int r = 0; r < RPS; ++r) {
-    \\  float g = float(T(a[r])), u = float(T(a[RPS + r]));
-    \\  if (lim[0] > 0.0f) { g = metal::min(g, lim[0]); u = metal::clamp(u, -lim[0], lim[0]); }
-    \\  const float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(g)));
-    \\  out[size_t(e) * N + n0 + r] = T((g * (g < 0.0f ? y : 1.0f - y)) * u * wt);
-    \\}
-;
+const MOE_GU_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_gu.metal");
 
 /// One token's routed down projections summed in f32 in slot order, plus the
 /// shared expert's (`withShared`), then the hc expand (`hcExpand`) into the
 /// new stream; RPS rows a simdgroup. Every rounding where the composed path
 /// takes it.
-const MOE_DN_SOURCE =
-    \\const uint lane = thread_index_in_simdgroup;
-    \\const uint n0 = thread_position_in_grid.y * RPS;
-    \\float tot[RPS], a[RPS];
-    \\size_t rows[RPS];
-    \\for (int r = 0; r < RPS; ++r) tot[r] = 0.0f;
-    \\for (int e = 0; e < TOPK; ++e) {
-    \\  for (int r = 0; r < RPS; ++r) rows[r] = size_t(inds[e]) * N + n0 + r;
-    \\  dsv41_dots<BITS, GS, K, RPS, false>(w, scales, biases, rows, x + size_t(e) * K, lane, a);
-    \\  for (int r = 0; r < RPS; ++r) tot[r] += float(T(a[r]));
-    \\}
-    \\for (int r = 0; r < RPS; ++r) rows[r] = n0 + r;
-    \\dsv41_dots<SBITS, SGS, K, RPS, SMX>(sw, sscales, sbiases, rows, x + size_t(TOPK) * K, lane, a);
-    \\if (lane == 0) for (int r = 0; r < RPS; ++r) {
-    \\  const uint d = n0 + r;
-    \\  const float y = float(T(tot[r] + float(T(a[r]))));
-    \\  for (int i = 0; i < HC; ++i) {
-    \\    float acc = 0.0f;
-    \\    for (int j = 0; j < HC; ++j) acc = metal::fma(comb[j * HC + i], float(res[j * N + d]), acc);
-    \\    out[i * N + d] = T(metal::fma(post[i], y, acc));
-    \\  }
-    \\}
-;
+const MOE_DN_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_dn.metal");
 
 /// A prefill MoE call's SwiGLU, one element a thread: row `r` of the fused
 /// gate+up gather `y` (`[n, 2N]`, gate then up) times its routing weight, the
 /// f32 math of `clampedSwiglu` in its order, rounded once to T.
-const MOE_ACT_SOURCE =
-    \\const uint i = thread_position_in_grid.x;
-    \\const uint row = i / N, c = i % N;
-    \\if (row >= uint(y_shape[0])) return;
-    \\const device T* yr = y + size_t(row) * 2 * N;
-    \\float g = float(yr[c]), u = float(yr[N + c]);
-    \\if (lim[0] > 0.0f) { g = metal::min(g, lim[0]); u = metal::clamp(u, -lim[0], lim[0]); }
-    \\const float s = 1.0f / (1.0f + metal::precise::exp(metal::abs(g)));
-    \\out[i] = T(g * (g < 0.0f ? s : 1.0f - s) * u * wts[row]);
-;
+const MOE_ACT_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_act.metal");
 
 /// A prefill MoE call's combine, one element a thread: the row's K sorted down
 /// rows (`inv` names them) summed in f32 plus the shared expert, rounded once to
 /// T; what unsort, the f32 sum over K and `addShared` did in five passes.
-const MOE_COMBINE_SOURCE =
-    \\const uint i = thread_position_in_grid.x;
-    \\const uint row = i / D, c = i % D;
-    \\if (row >= uint(sh_shape[0])) return;
-    \\float acc = 0.0f;
-    \\for (int j = 0; j < K; ++j) acc += float(dn[size_t(inv[row * K + j]) * D + c]);
-    \\out[i] = T(acc + float(sh[i]));
-;
+const MOE_COMBINE_SOURCE = kernelSource("plugins/deepseek_v41/kernels/moe_combine.metal");
 
 const MOE_ACT_INS = [_][*:0]const u8{ "y", "wts", "lim" };
 const MOE_COMBINE_INS = [_][*:0]const u8{ "dn", "inv", "sh" };
@@ -1723,102 +1126,15 @@ const MOE_COMBINE_INS = [_][*:0]const u8{ "dn", "inv", "sh" };
 /// QK's activation round trip over blocks inside one simdgroup (`Qat`:
 /// 1 fp8 / 32 / ue8m0, 2 fp4 / 32 / ue8m0, 3 fp4 / 16 / e4m3), rounded to
 /// T, written as OT.
-const ROPE_TAIL_SOURCE =
-    \\const uint i = thread_position_in_grid.x;
-    \\const int D = x_shape[x_ndim - 1];
-    \\const int c = i % D, row = i / ROW;
-    \\const int head = D - RD;
-    \\float r = float(x[i]);
-    \\if (c >= head) {
-    \\  const int p = (c - head) / 2;
-    \\  const size_t b = i - (c - head) % 2;
-    \\  const float x1 = float(x[b]), x2 = float(x[b + 1]);
-    \\  const float theta = scal[0] * float(row + off) * (1.0f / periods[p]);
-    \\  const float cs = metal::fast::cos(theta), sn = metal::fast::sin(theta);
-    \\  r = float(T((c - head) % 2 == 0 ? x1 * cs - x2 * sn : x1 * sn + x2 * cs));
-    \\}
-    \\if (QK != 0) {
-    \\  float amax = metal::abs(r);
-    \\  for (ushort m = (QK == 3 ? 8 : 16); m > 0; m >>= 1) amax = metal::max(amax, metal::simd_shuffle_xor(amax, m));
-    \\  float scale;
-    \\  if (QK == 1) scale = dsv41_pow2ceil(metal::max(amax, 1e-4f) * (1.0f / 448.0f));
-    \\  else if (QK == 2) scale = dsv41_pow2ceil(metal::max(amax, 6.0f * 1.17549435e-38f) * (1.0f / 6.0f));
-    \\  else scale = dsv41_fp8_roundtrip(metal::max(amax, 6.0f * 0.001953125f) / 6.0f);
-    \\  r = QK == 1 ? dsv41_fp8_roundtrip(metal::clamp(r / scale, -448.0f, 448.0f)) * scale
-    \\             : dsv41_e2m1(metal::clamp(r / scale, -6.0f, 6.0f)) * scale;
-    \\}
-    \\out[i] = OT(T(r));
-;
+const ROPE_TAIL_SOURCE = kernelSource("plugins/deepseek_v41/kernels/rope_tail.metal");
 
 /// e4m3 encode/decode exactly as MLX's `fp8_e4m3` (which takes it from
 /// PyTorch's `Float8_e4m3fn`): saturating, round to nearest even.
-const FP8_HEADER =
-    \\inline float dsv41_fp8_roundtrip(float f) {
-    \\  uint fb = as_type<uint>(f);
-    \\  const uint sign = fb & 0x80000000u;
-    \\  fb ^= sign;
-    \\  uchar bits;
-    \\  if (fb >= (543u << 21)) bits = 0x7E;
-    \\  else if (fb < (121u << 23)) {
-    \\    const uint dm = 141u << 23;
-    \\    bits = uchar(as_type<uint>(as_type<float>(fb) + as_type<float>(dm)) - dm);
-    \\  } else {
-    \\    const uint odd = (fb >> 20) & 1u;
-    \\    fb += (uint(7 - 127) << 23) + 0x7FFFFu;
-    \\    fb += odd;
-    \\    bits = uchar(fb >> 20);
-    \\  }
-    \\  bits |= uchar(sign >> 24);
-    \\  const ushort v = bits & 127;
-    \\  const ushort u = (v << 7) | (((v + 1) >> 7) << 14) | (ushort((bits >> 7) & 1) << 15);
-    \\  return float(as_type<half>(u)) * 256.0f;
-    \\}
-    \\inline float dsv41_pow2ceil(float a) {
-    \\  const uint ab = as_type<uint>(a);
-    \\  return as_type<float>((((ab >> 23) & 0xFFu) + ((ab & 0x7FFFFFu) != 0u ? 1u : 0u)) << 23);
-    \\}
-    \\inline float dsv41_e2m1(float v) {
-    \\  const float m = metal::abs(v);
-    \\  const int k = int(m > 0.25f) + int(m > 1.25f) + int(m > 2.5f) + int(m > 5.0f) + int(m >= 0.75f) + int(m >= 1.75f) + int(m >= 3.5f);
-    \\  const float lut[8] = {0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f};
-    \\  return metal::sign(v) * lut[k];
-    \\}
-;
+const FP8_HEADER = kernelSource("plugins/deepseek_v41/kernels/fp8_header.metal");
 
 /// `kvRow` after its projection, one threadgroup (D threads) a row: MLX's
 /// rms_norm, the tail rope, then (QAT) the fp8 / 32 / ue8m0 round trip.
-const KV_ROW_SOURCE =
-    \\const int l = threadgroup_position_in_grid.y, d = thread_position_in_threadgroup.x;
-    \\const uint lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int D = x_shape[1];
-    \\const size_t o = size_t(l) * D + d;
-    \\const float xv = float(x[o]);
-    \\threadgroup float t_s[32];
-    \\threadgroup float t_y[1024];
-    \\const float ss = metal::simd_sum(xv * xv);
-    \\if (lane == 0) t_s[sg] = ss;
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\float tot = 0.0f;
-    \\for (int g = 0; g < D / 32; ++g) tot += t_s[g];
-    \\const float inv = metal::precise::rsqrt(tot / float(D) + eps[0]);
-    \\const T y = w[d] * T(xv * inv);
-    \\t_y[d] = float(y);
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\float r = float(y);
-    \\const int head = D - RD;
-    \\if (d >= head) {
-    \\  const int p = (d - head) / 2, b = d - (d - head) % 2;
-    \\  const float x1 = t_y[b], x2 = t_y[b + 1];
-    \\  const float theta = float(l + off) * (1.0f / periods[p]);
-    \\  const float cs = metal::fast::cos(theta), sn = metal::fast::sin(theta);
-    \\  r = float(T((d - head) % 2 == 0 ? x1 * cs - x2 * sn : x1 * sn + x2 * cs));
-    \\}
-    \\if (QAT) {
-    \\  const float scale = dsv41_pow2ceil(metal::max(metal::simd_max(metal::abs(r)), 1e-4f) * (1.0f / 448.0f));
-    \\  r = dsv41_fp8_roundtrip(metal::clamp(r / scale, -448.0f, 448.0f)) * scale;
-    \\}
-    \\out[o] = T(r);
-;
+const KV_ROW_SOURCE = kernelSource("plugins/deepseek_v41/kernels/kv_row.metal");
 
 fn buildKernel(name: [*:0]const u8, ins: []const [*:0]const u8, outs: []const [*:0]const u8, src: [*:0]const u8, header: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
     const iv = mlx.mlx_vector_string_new_data(ins.ptr, ins.len);
@@ -3511,61 +2827,7 @@ fn mlxRowReduceThreads(n: usize) usize {
 /// [L, (hc + 1) * D]: the three row sums in MLX's order (`mlxRowReduceThreads`: each thread its
 /// 4-wide blocks then its tail, simd sums, then the simdgroup partials), then every op of the
 /// chain in its order, uncontracted, so the bits are the chain's. cst = {1 / D, eps, 1 / sqrt(D)}.
-const ENGRAM_SOURCE =
-    \\#pragma clang fp contract(off)
-    \\const uint t = thread_position_in_threadgroup.x, lane = thread_index_in_simdgroup, sg = simdgroup_index_in_threadgroup;
-    \\const int TG = threads_per_threadgroup.x, j = threadgroup_position_in_grid.y, l = threadgroup_position_in_grid.z;
-    \\const int HC = qk_shape[0], D = qk_shape[1];
-    \\const size_t xo = (size_t(l) * HC + j) * D, ko = size_t(l) * (HC + 1) * D + size_t(j) * D, vo = size_t(l) * (HC + 1) * D + size_t(HC) * D;
-    \\threadgroup float part[3][32];
-    \\threadgroup float gate_s;
-    \\float sh = 0.0f, sk = 0.0f, sd = 0.0f;
-    \\const int blocks = D / (TG * 4), extra = D - blocks * TG * 4;
-    \\for (int b = 0; b <= blocks; ++b) {
-    \\  const int c0 = b * TG * 4 + int(t) * 4;
-    \\  const int n = b < blocks ? 4 : metal::clamp(extra - int(t) * 4, 0, 4);
-    \\  for (int i = 0; i < n; ++i) {
-    \\    const float hv = float(x[xo + c0 + i]), kk = float(kv[ko + c0 + i]);
-    \\    const float h2 = hv * hv, k2 = kk * kk, hq = hv * qk[size_t(j) * D + c0 + i];
-    \\    const float p = hq * kk;
-    \\    sh = h2 + sh;
-    \\    sk = k2 + sk;
-    \\    sd = p + sd;
-    \\  }
-    \\}
-    \\if (TG > 1) {
-    \\  sh = metal::simd_sum(sh);
-    \\  sk = metal::simd_sum(sk);
-    \\  sd = metal::simd_sum(sd);
-    \\}
-    \\if (TG > 32) {
-    \\  if (lane == 0) { part[0][sg] = sh; part[1][sg] = sk; part[2][sg] = sd; }
-    \\  threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\  const bool own = int(t) < TG / 32;
-    \\  sh = metal::simd_sum(own ? part[0][t] : 0.0f);
-    \\  sk = metal::simd_sum(own ? part[1][t] : 0.0f);
-    \\  sd = metal::simd_sum(own ? part[2][t] : 0.0f);
-    \\}
-    \\if (t == 0) {
-    \\  const float mh = sh * cst[0], mk = sk * cst[0];
-    \\  const float eh = mh + cst[1], ek = mk + cst[1];
-    \\  const float rh = metal::precise::rsqrt(eh), rk = metal::precise::rsqrt(ek);
-    \\  const float rr = rh * rk;
-    \\  const float d1 = sd * rr;
-    \\  const float dot = d1 * cst[2];
-    \\  const float ad = metal::abs(dot);
-    \\  const float mg = metal::precise::sqrt(metal::isnan(ad) || ad > 1e-6f ? ad : 1e-6f);
-    \\  const float s = dot < 0.0f ? -mg : mg;
-    \\  const float y = 1.0f / (1.0f + metal::precise::exp(metal::abs(s)));
-    \\  gate_s = s < 0.0f ? y : 1.0f - y;
-    \\}
-    \\threadgroup_barrier(metal::mem_flags::mem_threadgroup);
-    \\const float g = gate_s;
-    \\for (int c = t; c < D; c += TG) {
-    \\  const float gv = g * float(kv[vo + c]);
-    \\  out[xo + c] = OT(float(x[xo + c]) + gv);
-    \\}
-;
+const ENGRAM_SOURCE = kernelSource("plugins/deepseek_v41/kernels/engram.metal");
 
 const ENGRAM_INS = [_][*:0]const u8{ "x", "kv", "qk", "cst" };
 

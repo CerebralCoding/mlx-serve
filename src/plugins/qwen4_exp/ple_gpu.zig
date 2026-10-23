@@ -4,6 +4,7 @@
 //! ids on the GPU, so a forward built on lazy ids needs no host read before it runs.
 
 const std = @import("std");
+const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const qwen4 = @import("qwen4_exp.zig");
@@ -181,7 +182,7 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(ins);
     const outs = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
     defer _ = mlx.mlx_vector_string_free(outs);
-    const k = mlx.mlx_fast_metal_kernel_new("msv_ple_gather", ins, outs, @embedFile("kernels/ple_gather.metal"), @embedFile("kernels/ple_gather_header.metal"), true, false);
+    const k = mlx.mlx_fast_metal_kernel_new("msv_ple_gather", ins, outs, kernelSource("plugins/qwen4_exp/kernels/ple_gather.metal"), kernelSource("plugins/qwen4_exp/kernels/ple_gather_header.metal"), true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     kernel = k;
     return k;

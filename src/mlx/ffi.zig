@@ -7,6 +7,7 @@ const crt = @import("../sdk/util/crt.zig");
 const os_mutex = @import("../sdk/util/os_mutex.zig");
 const builtin = @import("builtin");
 const log = @import("../host/log.zig");
+const kernels = @import("kernels.zig");
 
 // ── Opaque handle types ──
 pub const mlx_array = extern struct { ctx: ?*anyopaque = null };
@@ -296,7 +297,11 @@ pub extern "c" fn mlx_fast_cuda_kernel_config_set_thread_group(cls: mlx_fast_cud
 pub extern "c" fn mlx_fast_cuda_kernel_config_add_template_arg_dtype(cls: mlx_fast_cuda_kernel_config, name: [*:0]const u8, dtype: mlx_dtype) c_int;
 pub extern "c" fn mlx_fast_cuda_kernel_config_add_template_arg_int(cls: mlx_fast_cuda_kernel_config, name: [*:0]const u8, value: c_int) c_int;
 pub const mlx_fast_cuda_kernel = extern struct { ctx: ?*anyopaque = null };
-pub extern "c" fn mlx_fast_cuda_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, shared_memory: c_int) mlx_fast_cuda_kernel;
+/// Every CUDA kernel's source and header pass through `kernels.resolve` (the `MLX_SERVE_KERNEL_DIR` override).
+pub fn mlx_fast_cuda_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, shared_memory: c_int) mlx_fast_cuda_kernel {
+    return c_cuda_kernel_new(name, input_names, output_names, kernels.resolve(source), kernels.resolve(header), ensure_row_contiguous, shared_memory);
+}
+const c_cuda_kernel_new = @extern(*const fn ([*:0]const u8, mlx_vector_string, mlx_vector_string, [*:0]const u8, [*:0]const u8, bool, c_int) callconv(.c) mlx_fast_cuda_kernel, .{ .name = "mlx_fast_cuda_kernel_new" });
 pub extern "c" fn mlx_fast_cuda_kernel_free(cls: mlx_fast_cuda_kernel) void;
 pub extern "c" fn mlx_fast_cuda_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_cuda_kernel, inputs: mlx_vector_array, config: mlx_fast_cuda_kernel_config, s: mlx_stream) c_int;
 pub extern "c" fn mlx_synchronize(s: mlx_stream) c_int;
@@ -605,7 +610,11 @@ pub extern "c" fn mlx_fast_metal_kernel_config_add_template_arg_bool(cls: mlx_fa
 pub extern "c" fn mlx_fast_metal_kernel_config_set_verbose(cls: mlx_fast_metal_kernel_config, verbose: bool) c_int;
 
 pub const mlx_fast_metal_kernel = extern struct { ctx: ?*anyopaque = null };
-pub extern "c" fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel;
+/// Every Metal kernel's source and header pass through `kernels.resolve` (the `MLX_SERVE_KERNEL_DIR` override).
+pub fn mlx_fast_metal_kernel_new(name: [*:0]const u8, input_names: mlx_vector_string, output_names: mlx_vector_string, source: [*:0]const u8, header: [*:0]const u8, ensure_row_contiguous: bool, atomic_outputs: bool) mlx_fast_metal_kernel {
+    return c_metal_kernel_new(name, input_names, output_names, kernels.resolve(source), kernels.resolve(header), ensure_row_contiguous, atomic_outputs);
+}
+const c_metal_kernel_new = @extern(*const fn ([*:0]const u8, mlx_vector_string, mlx_vector_string, [*:0]const u8, [*:0]const u8, bool, bool) callconv(.c) mlx_fast_metal_kernel, .{ .name = "mlx_fast_metal_kernel_new" });
 pub extern "c" fn mlx_fast_metal_kernel_free(cls: mlx_fast_metal_kernel) c_int;
 pub extern "c" fn mlx_fast_metal_kernel_apply(outputs: *mlx_vector_array, cls: mlx_fast_metal_kernel, inputs: mlx_vector_array, config: mlx_fast_metal_kernel_config, s: mlx_stream) c_int;
 

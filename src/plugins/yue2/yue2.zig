@@ -22,8 +22,9 @@ const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
 const wav_mod = @import("../../sdk/media/wav.zig");
 const sse = @import("../../host/media_jobs/sse.zig");
+const ops = @import("../../mlx/ops.zig");
+const Graph = ops.Graph;
 const scope_mod = @import("../../mlx/scope.zig");
-const Scope = scope_mod.Scope;
 const Linear = scope_mod.Linear;
 const getW = scope_mod.getW;
 const linear = scope_mod.linear;
@@ -388,7 +389,7 @@ const Path = struct {
 
 const Layer = struct { ar: Path, nar: Path };
 
-/// A layer's K/V for the NAR queries to attend over (owned handles).
+/// A layer's K/V for the NAR queries to attend over.
 const ArKv = struct { k: A, v: A };
 
 fn resolvePath(w: *const Weights, li: usize, comptime ln: []const u8, comptime attn: []const u8, comptime mlp_ln: []const u8, comptime mlp: []const u8, hidden: u32, q_out: u32, ffn_in: u32) !Path {
@@ -408,44 +409,57 @@ fn resolvePath(w: *const Weights, li: usize, comptime ln: []const u8, comptime a
     };
 }
 
+/// `l` over the last axis of `x`: the affine-quantized matmul when `l` is packed.
+fn project(parent: *Graph, l: *const Linear, x: A) !A {
+    var g = parent.scope();
+    defer g.deinit();
+    const y = if (l.scales) |sca|
+        try g.qmm(x, l.w, sca, l.biases, @intCast(l.group_size), @intCast(l.bits))
+    else
+        try g.matmul(x, try g.transpose(l.w, &.{ 1, 0 }));
+    return parent.keep(if (l.bias) |b| try g.add(y, b) else y);
+}
+
 // ════════════════════════════════════════════════════════════════════════
 // Engine
 // ════════════════════════════════════════════════════════════════════════
 
 /// Per-layer K/V buffers for one AR sequence, written in place.
 const Kv = struct {
+    g: Graph,
     ks: []A,
     vs: []A,
     len: c_int = 0,
 
-    fn init(a: std.mem.Allocator, sc: *Scope, cfg: Cfg, cap: usize) !Kv {
+    /// The zero buffers are made in `parent`, which holds them too.
+    fn init(parent: *Graph, cfg: Cfg, cap: usize) !Kv {
+        const a = parent.a;
         const ks = try a.alloc(A, cfg.layers);
         errdefer a.free(ks);
         const vs = try a.alloc(A, cfg.layers);
         errdefer a.free(vs);
+        var g = parent.scope();
+        errdefer g.deinit();
         const shape = [_]c_int{ 1, cfg.kv_heads, @intCast(cap), cfg.hd };
         for (ks, vs) |*k, *v| {
-            k.* = sc.out(try sc.zeros(&shape, .bfloat16));
-            v.* = sc.out(try sc.zeros(&shape, .bfloat16));
+            k.* = try g.keep(try parent.zeros(&shape, .bfloat16));
+            v.* = try g.keep(try parent.zeros(&shape, .bfloat16));
         }
-        return .{ .ks = ks, .vs = vs };
+        return .{ .g = g, .ks = ks, .vs = vs };
     }
 
-    fn deinit(self: *Kv, a: std.mem.Allocator) void {
-        for (self.ks) |k| _ = mlx.mlx_array_free(k);
-        for (self.vs) |v| _ = mlx.mlx_array_free(v);
-        a.free(self.ks);
-        a.free(self.vs);
+    fn deinit(self: *Kv) void {
+        self.g.deinit();
+        self.g.a.free(self.ks);
+        self.g.a.free(self.vs);
     }
 
     /// Write [1,KV,T,hd] at `len`; the old buffer is released so the update donates in place.
-    fn write(self: *Kv, sc: *Scope, buf: *A, new: A) !void {
-        const sh = mlx.getShape(buf.*);
-        const t = mlx.getShape(new)[2];
-        const start = [_]c_int{ 0, 0, self.len, 0 };
-        const stop = [_]c_int{ sh[0], sh[1], self.len + t, sh[3] };
-        const o = sc.out(try sc.sliceUpdate(buf.*, new, &start, &stop));
-        _ = mlx.mlx_array_free(buf.*);
+    fn write(self: *Kv, buf: *A, new: A) !void {
+        const sh = ops.shape(buf.*);
+        const t = ops.shape(new)[2];
+        const o = try self.g.sliceUpdate(buf.*, new, &.{ 0, 0, self.len, 0 }, &.{ sh[0], sh[1], self.len + t, sh[3] });
+        self.g.drop(buf.*);
         buf.* = o;
     }
 };
@@ -582,63 +596,66 @@ pub const Engine = struct {
 
     // ── AR path ──────────────────────────────────────────────────────────
 
-    fn qkv(self: *const Engine, sc: *Scope, p: *const Path, x: A, offset: c_int) !struct { q: A, k: A, v: A } {
+    fn qkv(self: *const Engine, g: *Graph, p: *const Path, x: A, offset: c_int) !struct { q: A, k: A, v: A } {
         const c = self.cfg;
-        const h = try sc.rms(x, p.ln, c.eps);
-        const q = try sc.rms(try sc.heads(try p.q.forward(sc, h), c.heads, c.hd), p.qn, c.eps);
-        const k = try sc.rms(try sc.heads(try p.k.forward(sc, h), c.kv_heads, c.hd), p.kn, c.eps);
+        const h = try g.rmsNorm(x, p.ln, c.eps);
+        const q = try g.rmsNorm(try g.splitHeads(try project(g, &p.q, h), c.heads, c.hd), p.qn, c.eps);
+        const k = try g.rmsNorm(try g.splitHeads(try project(g, &p.k, h), c.kv_heads, c.hd), p.kn, c.eps);
         return .{
-            .q = try sc.ropeAt(q, c.hd, c.rope_theta, offset),
-            .k = try sc.ropeAt(k, c.hd, c.rope_theta, offset),
-            .v = try sc.heads(try p.v.forward(sc, h), c.kv_heads, c.hd),
+            .q = try g.rope(q, c.hd, c.rope_theta, offset),
+            .k = try g.rope(k, c.hd, c.rope_theta, offset),
+            .v = try g.splitHeads(try project(g, &p.v, h), c.kv_heads, c.hd),
         };
     }
 
     /// x + o(attn), then + the path's SwiGLU MLP.
-    fn finish(self: *const Engine, sc: *Scope, p: *const Path, x: A, attn: A) !A {
-        const h = try sc.add(x, try p.o.forward(sc, try sc.merge(attn)));
-        const m = try sc.rms(h, p.mlp_ln, self.cfg.eps);
-        const gu = try sc.mul(try sc.silu(try p.gate.forward(sc, m)), try p.up.forward(sc, m));
-        return sc.add(h, try p.down.forward(sc, gu));
+    fn finish(self: *const Engine, parent: *Graph, p: *const Path, x: A, attn: A) !A {
+        var g = parent.scope();
+        defer g.deinit();
+        const h = try g.add(x, try project(&g, &p.o, try g.mergeHeads(attn)));
+        const m = try g.rmsNorm(h, p.mlp_ln, self.cfg.eps);
+        const gu = try g.mul(try g.silu(try project(&g, &p.gate, m)), try project(&g, &p.up, m));
+        return parent.keep(try g.add(h, try project(&g, &p.down, gu)));
     }
 
     fn scale(self: *const Engine) f32 {
         return 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.hd)));
     }
 
-    fn embedIds(self: *const Engine, sc: *Scope, ids: []const u32) !A {
-        const i32s = try sc.a.alloc(i32, ids.len);
-        defer sc.a.free(i32s);
+    fn embedIds(self: *const Engine, parent: *Graph, ids: []const u32) !A {
+        var g = parent.scope();
+        defer g.deinit();
+        const i32s = try g.a.alloc(i32, ids.len);
+        defer g.a.free(i32s);
         for (ids, i32s) |id, *o| o.* = @intCast(id);
-        const rows = try sc.take(self.embed, try sc.fromI32(i32s, &.{@intCast(ids.len)}));
-        return sc.reshape(rows, &.{ 1, @intCast(ids.len), self.cfg.hidden });
+        const rows = try g.take(self.embed, try g.fromSlice(i32, i32s, &.{@intCast(ids.len)}), 0);
+        return parent.keep(try g.reshape(rows, &.{ 1, @intCast(ids.len), self.cfg.hidden }));
     }
 
     /// Append `ids` to `kv` and return the last position's logits [V] (bf16, lazy).
-    fn arForward(self: *Engine, a: std.mem.Allocator, ids: []const u32, kv: *Kv) !A {
-        var sc0 = Scope.init(a, self.s);
-        defer sc0.deinit();
-        var x = sc0.out(try self.embedIds(&sc0, ids));
-        defer _ = mlx.mlx_array_free(x);
+    fn arForward(self: *Engine, parent: *Graph, ids: []const u32, kv: *Kv) !A {
+        var g0 = parent.scope();
+        defer g0.deinit();
+        var x = try self.embedIds(&g0, ids);
         const t: c_int = @intCast(ids.len);
         const prefill = t > 1;
         for (self.layers, 0..) |*l, li| {
-            var sc = Scope.init(a, self.s);
-            defer sc.deinit();
-            const r = try self.qkv(&sc, &l.ar, x, kv.len);
-            try kv.write(&sc, &kv.ks[li], r.k);
-            try kv.write(&sc, &kv.vs[li], r.v);
-            const kview = try sc.slice(kv.ks[li], 2, 0, kv.len + t);
-            const vview = try sc.slice(kv.vs[li], 2, 0, kv.len + t);
-            const attn = try sc.sdpaMode(r.q, kview, vview, self.scale(), if (prefill) "causal" else "");
-            const next = sc.out(try self.finish(&sc, &l.ar, x, attn));
-            _ = mlx.mlx_array_free(x);
+            var g = g0.scope();
+            defer g.deinit();
+            const r = try self.qkv(&g, &l.ar, x, kv.len);
+            try kv.write(&kv.ks[li], r.k);
+            try kv.write(&kv.vs[li], r.v);
+            const kview = try g.sliceAxis(kv.ks[li], 2, 0, kv.len + t);
+            const vview = try g.sliceAxis(kv.vs[li], 2, 0, kv.len + t);
+            const attn = try g.sdpa(r.q, kview, vview, self.scale(), if (prefill) .causal else .none);
+            const next = try g0.keep(try self.finish(&g, &l.ar, x, attn));
+            g0.drop(x);
             x = next;
-            if (prefill) try mlx.check(mlx.mlx_array_eval(x));
+            if (prefill) try ops.eval(x);
         }
         kv.len += t;
-        const last = try sc0.rms(try sc0.slice(x, 1, t - 1, t), self.norm, self.cfg.eps);
-        return sc0.out(try sc0.reshape(try self.lm_head.forward(&sc0, last), &.{@intCast(VOCAB)}));
+        const last = try g0.rmsNorm(try g0.sliceAxis(x, 1, t - 1, t), self.norm, self.cfg.eps);
+        return parent.keep(try g0.reshape(try project(&g0, &self.lm_head, last), &.{@intCast(VOCAB)}));
     }
 
     const Generated = struct { ids: []u32, truncated: bool };
@@ -647,15 +664,15 @@ pub const Engine = struct {
     /// its own cache: `uncond + g * (cond - uncond)` in the logits' dtype.
     fn generateTokens(self: *Engine, a: std.mem.Allocator, prefix: []const u32, negative: ?[]const u32, cfg_scale: f32, s: Sampling, phase: Phase, seed: u64, top_p_floor: usize, progress: ?sse.Progress) !Generated {
         const stage = @tagName(phase);
-        var sc = Scope.init(a, self.s);
-        defer sc.deinit();
+        var g = Graph.init(a, self.s);
+        defer g.deinit();
         var kvs: [2]Kv = undefined;
         const n_kv: usize = if (negative != null) 2 else 1;
         const lens = [2]usize{ prefix.len, if (negative) |n| n.len else 0 };
         var made: usize = 0;
-        defer for (kvs[0..made]) |*k| k.deinit(a);
+        defer for (kvs[0..made]) |*k| k.deinit();
         for (0..n_kv) |i| {
-            kvs[i] = try Kv.init(a, &sc, self.cfg, lens[i] + s.max_tokens);
+            kvs[i] = try Kv.init(&g, self.cfg, lens[i] + s.max_tokens);
             made += 1;
         }
         var sampler = Sampler.init(a, seed);
@@ -673,16 +690,16 @@ pub const Engine = struct {
                 if (p.boundary()) return error.Cancelled;
                 if (step % FRAME_RATE == 0) p.emit(stage, step, 0);
             }
-            var step_sc = Scope.init(a, self.s);
-            defer step_sc.deinit();
-            const cond = try step_sc.keep(try self.arForward(a, feed[0], &kvs[0]));
+            var sg = g.scope();
+            defer sg.deinit();
+            const cond = try self.arForward(&sg, feed[0], &kvs[0]);
             var logits = cond;
             if (n_kv == 2) {
-                const uncond = try step_sc.keep(try self.arForward(a, feed[1], &kvs[1]));
-                logits = try step_sc.add(uncond, try step_sc.mulLike(try step_sc.sub(cond, uncond), cfg_scale));
+                const uncond = try self.arForward(&sg, feed[1], &kvs[1]);
+                logits = try sg.add(uncond, try sg.mulScalar(try sg.sub(cond, uncond), cfg_scale));
             }
-            const f = try step_sc.astype(logits, .float32);
-            try mlx.check(mlx.mlx_array_eval(f));
+            const f = try sg.astype(logits, .float32);
+            try ops.eval(f);
             @memcpy(host, (mlx.mlx_array_data_float32(f) orelse return error.NoData)[0..VOCAB]);
             const token = try sampler.pick(host, s, history.items, step, phase, top_p_floor);
             if (token == phase.end()) {
@@ -698,84 +715,75 @@ pub const Engine = struct {
 
     // ── NAR path ─────────────────────────────────────────────────────────
 
-    /// The AR path over `ids` once (causal), keeping each layer's K/V for the NAR queries.
-    fn arPrefillKv(self: *Engine, a: std.mem.Allocator, ids: []const u32, out: []ArKv) !usize {
-        var sc0 = Scope.init(a, self.s);
-        defer sc0.deinit();
-        var x = sc0.out(try self.embedIds(&sc0, ids));
-        defer _ = mlx.mlx_array_free(x);
+    /// The AR path over `ids` once (causal), keeping each layer's K/V in `parent` for the NAR queries.
+    fn arPrefillKv(self: *Engine, parent: *Graph, ids: []const u32, out: []ArKv) !usize {
+        var g0 = parent.scope();
+        defer g0.deinit();
+        var x = try self.embedIds(&g0, ids);
         var made: usize = 0;
-        errdefer for (out[0..made]) |kv| {
-            _ = mlx.mlx_array_free(kv.k);
-            _ = mlx.mlx_array_free(kv.v);
-        };
         for (self.layers, out) |*l, *slot| {
-            var sc = Scope.init(a, self.s);
-            defer sc.deinit();
-            const r = try self.qkv(&sc, &l.ar, x, 0);
-            const attn = try sc.sdpaMode(r.q, r.k, r.v, self.scale(), "causal");
-            const next = sc.out(try self.finish(&sc, &l.ar, x, attn));
-            slot.* = .{ .k = sc.out(r.k), .v = sc.out(r.v) };
+            var g = g0.scope();
+            defer g.deinit();
+            const r = try self.qkv(&g, &l.ar, x, 0);
+            const attn = try g.sdpa(r.q, r.k, r.v, self.scale(), .causal);
+            const next = try g0.keep(try self.finish(&g, &l.ar, x, attn));
+            slot.* = .{ .k = try parent.keep(r.k), .v = try parent.keep(r.v) };
             made += 1;
-            _ = mlx.mlx_array_free(x);
+            g0.drop(x);
             x = next;
-            try mlx.check(mlx.mlx_array_eval(x));
-            try mlx.check(mlx.mlx_array_eval(slot.k));
-            try mlx.check(mlx.mlx_array_eval(slot.v));
+            try ops.eval(x);
+            try ops.eval(slot.k);
+            try ops.eval(slot.v);
         }
         return made;
     }
 
     /// Flow-matching velocity [T,64] for `state` [T,64] at logit-time `raw_t`, as one bidirectional
     /// canvas of LATENT_START + frames + LATENT_END rows after the AR prefix.
-    fn velocity(self: *Engine, a: std.mem.Allocator, state: A, raw_t: f32, ar_kv: []const ArKv, ar_len: c_int) !A {
-        var sc0 = Scope.init(a, self.s);
-        defer sc0.deinit();
-        const frames = mlx.getShape(state)[0];
+    fn velocity(self: *Engine, parent: *Graph, state: A, raw_t: f32, ar_kv: []const ArKv, ar_len: c_int) !A {
+        var g0 = parent.scope();
+        defer g0.deinit();
+        const frames = ops.shape(state)[0];
         const n = frames + 2;
         // t is rounded through the state's dtype, as the reference's weak-typed scalar is.
-        const t = try sc0.sigmoid(try sc0.astype(try sc0.scalar(raw_t), mlx.mlx_array_dtype(state)));
-        const x0 = try self.vae2llm.forward(&sc0, try sc0.reshape(try sc0.padAxis(state, 0, 1, 1), &.{ 1, n, LATENT_DIM }));
-        const temb = try self.timeEmbedding(&sc0, t, mlx.mlx_array_dtype(state));
-        var x = sc0.out(try sc0.add(try sc0.add(x0, temb), try sc0.slice(self.pos_embed, 0, 0, n)));
-        defer _ = mlx.mlx_array_free(x);
+        const t = try g0.sigmoid(try g0.astype(try g0.scalar(raw_t, .float32), ops.dtype(state)));
+        const x0 = try project(&g0, &self.vae2llm, try g0.reshape(try g0.padAxis(state, 0, 1, 1), &.{ 1, n, LATENT_DIM }));
+        const temb = try self.timeEmbedding(&g0, t, ops.dtype(state));
+        var x = try g0.add(try g0.add(x0, temb), try g0.sliceAxis(self.pos_embed, 0, 0, n));
         for (self.layers, ar_kv) |*l, kv| {
-            var sc = Scope.init(a, self.s);
-            defer sc.deinit();
-            const r = try self.qkv(&sc, &l.nar, x, ar_len);
-            const attn = try sc.sdpaMode(r.q, try sc.concat(&.{ kv.k, r.k }, 2), try sc.concat(&.{ kv.v, r.v }, 2), self.scale(), "");
-            const next = sc.out(try self.finish(&sc, &l.nar, x, attn));
-            _ = mlx.mlx_array_free(x);
+            var g = g0.scope();
+            defer g.deinit();
+            const r = try self.qkv(&g, &l.nar, x, ar_len);
+            const attn = try g.sdpa(r.q, try g.concat(&.{ kv.k, r.k }, 2), try g.concat(&.{ kv.v, r.v }, 2), self.scale(), .none);
+            const next = try g0.keep(try self.finish(&g, &l.nar, x, attn));
+            g0.drop(x);
             x = next;
-            try mlx.check(mlx.mlx_array_eval(x));
+            try ops.eval(x);
         }
-        const v = try self.llm2vae.forward(&sc0, try sc0.rms(x, self.norm, self.cfg.eps));
-        return sc0.out(try sc0.reshape(try sc0.slice(v, 1, 1, n - 1), &.{ frames, LATENT_DIM }));
+        const v = try project(&g0, &self.llm2vae, try g0.rmsNorm(x, self.norm, self.cfg.eps));
+        return parent.keep(try g0.reshape(try g0.sliceAxis(v, 1, 1, n - 1), &.{ frames, LATENT_DIM }));
     }
 
     /// Sinusoidal embedding of the scalar `t` → MLP → [1,1,hidden].
-    fn timeEmbedding(self: *Engine, sc: *Scope, t: A, dt: mlx.mlx_dtype) !A {
+    fn timeEmbedding(self: *Engine, parent: *Graph, t: A, dt: mlx.mlx_dtype) !A {
+        var g = parent.scope();
+        defer g.deinit();
         var freqs: [TIME_FREQ / 2]f32 = undefined;
         for (&freqs, 0..) |*f, i| f.* = @exp(-@log(@as(f32, 10000)) * @as(f32, @floatFromInt(i)) / (TIME_FREQ / 2));
-        const args = try sc.mul(try sc.reshape(try sc.astype(t, .float32), &.{ 1, 1 }), try sc.fromF32(&freqs, &.{ 1, TIME_FREQ / 2 }));
-        const emb = try sc.astype(try sc.concat(&.{ try sc.cos(args), try sc.sin(args) }, -1), dt);
-        const h = try self.time_fc2.forward(sc, try sc.silu(try self.time_fc1.forward(sc, emb)));
-        return sc.reshape(h, &.{ 1, 1, self.cfg.hidden });
+        const args = try g.mul(try g.reshape(try g.astype(t, .float32), &.{ 1, 1 }), try g.fromSlice(f32, &freqs, &.{ 1, TIME_FREQ / 2 }));
+        const emb = try g.astype(try g.concat(&.{ try g.cos(args), try g.sin(args) }, -1), dt);
+        const h = try project(&g, &self.time_fc2, try g.silu(try project(&g, &self.time_fc1, emb)));
+        return parent.keep(try g.reshape(h, &.{ 1, 1, self.cfg.hidden }));
     }
 
     /// Latents [frames,64] f32: midpoint ODE from noise at t=1 to 0, one context chunk at a time.
-    fn synthesize(self: *Engine, a: std.mem.Allocator, prefix: []const u32, codec: []const u32, seed: u64, steps: u32, progress: ?sse.Progress) !A {
-        var sc = Scope.init(a, self.s);
-        defer sc.deinit();
-        const key = try sc.keep(blk: {
-            var k = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_random_key(&k, seed));
-            break :blk k;
-        });
+    fn synthesize(self: *Engine, parent: *Graph, prefix: []const u32, codec: []const u32, seed: u64, steps: u32, progress: ?sse.Progress) !A {
+        var g = parent.scope();
+        defer g.deinit();
+        const a = g.a;
+        const key = try g.call(mlx.mlx_random_key, .{seed});
         const frames: c_int = @intCast(codec.len);
-        var noise = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_random_normal(&noise, &[_]c_int{ frames, LATENT_DIM }, 2, .float32, 0, 1, key, self.s));
-        _ = try sc.keep(noise);
+        const noise = try g.call(mlx.mlx_random_normal, .{ &[_]c_int{ frames, LATENT_DIM }, 2, .float32, 0, 1, key });
 
         const size = chunkSize(prefix.len);
         if (codec.len == 0 or size == 0) return error.NoAcousticContext;
@@ -783,9 +791,6 @@ pub const Engine = struct {
         var pieces = try a.alloc(A, n_chunks);
         defer a.free(pieces);
         var made: usize = 0;
-        defer for (pieces[0..made]) |p| {
-            _ = mlx.mlx_array_free(p);
-        };
 
         const dt = 1.0 / @as(f32, @floatFromInt(steps));
         var start: usize = 0;
@@ -797,38 +802,36 @@ pub const Engine = struct {
             for (codec[start..stop], ar_ids[prefix.len..][0 .. stop - start]) |c, *o| o.* = c + CODEC_OFFSET;
             ar_ids[ar_ids.len - 1] = MUSIC_END;
 
+            // The chunk's K/V and solver state go when the chunk is done.
+            var cg = g.scope();
+            defer cg.deinit();
             const ar_kv = try a.alloc(ArKv, self.cfg.layers);
             defer a.free(ar_kv);
-            const built = try self.arPrefillKv(a, ar_ids, ar_kv);
-            defer for (ar_kv[0..built]) |kv| {
-                _ = mlx.mlx_array_free(kv.k);
-                _ = mlx.mlx_array_free(kv.v);
-            };
+            const built = try self.arPrefillKv(&cg, ar_ids, ar_kv);
             _ = mlx.mlx_clear_cache();
 
-            var state = sc.out(try sc.astype(try sc.slice(noise, 0, @intCast(start), @intCast(stop)), .bfloat16));
-            defer _ = mlx.mlx_array_free(state);
+            var state = try cg.astype(try cg.sliceAxis(noise, 0, @intCast(start), @intCast(stop)), .bfloat16);
             const ar_len: c_int = @intCast(ar_ids.len);
             for (0..steps) |si| {
                 if (progress) |p| {
                     if (p.boundary()) return error.Cancelled;
                     p.emit("nar", @intCast((start / size) * steps + si), @intCast(n_chunks * steps));
                 }
-                var st = Scope.init(a, self.s);
+                var st = cg.scope();
                 defer st.deinit();
                 const t = flowTime(@intCast(si), steps);
-                const v1 = try st.keep(try self.velocity(a, state, logitTime(t), ar_kv[0..built], ar_len));
-                const mid = try st.sub(state, try st.mulLike(v1, dt / 2));
-                const v2 = try st.keep(try self.velocity(a, mid, logitTime(t - dt / 2), ar_kv[0..built], ar_len));
-                const next = st.out(try st.sub(state, try st.mulLike(v2, dt)));
-                try mlx.check(mlx.mlx_array_eval(next));
-                _ = mlx.mlx_array_free(state);
+                const v1 = try self.velocity(&st, state, logitTime(t), ar_kv[0..built], ar_len);
+                const mid = try st.sub(state, try st.mulScalar(v1, dt / 2));
+                const v2 = try self.velocity(&st, mid, logitTime(t - dt / 2), ar_kv[0..built], ar_len);
+                const next = try cg.keep(try st.sub(state, try st.mulScalar(v2, dt)));
+                try ops.eval(next);
+                cg.drop(state);
                 state = next;
             }
-            pieces[made] = sc.out(try sc.astype(state, .float32));
+            pieces[made] = try g.astype(state, .float32);
             made += 1;
         }
-        return sc.out(try sc.concat(pieces[0..made], 0));
+        return parent.keep(try g.concat(pieces[0..made], 0));
     }
 
     // ── VAE ──────────────────────────────────────────────────────────────
@@ -839,67 +842,68 @@ pub const Engine = struct {
 
     /// x + (1/exp(beta)) sin^2(exp(alpha) x); both parameters are stored as logs. The temporaries
     /// live in their own scope: at a 1056-frame tile each is half a gigabyte.
-    fn snake(self: *const Engine, sc: *Scope, x: A, comptime fmt: []const u8, args: anytype) !A {
-        var t = Scope.init(sc.a, sc.s);
-        defer t.deinit();
-        const alpha = try t.exp(try self.vaeW(fmt ++ ".alpha", args));
-        const beta = try t.exp(try self.vaeW(fmt ++ ".beta", args));
-        const sn = try t.sin(try t.mul(x, alpha));
-        return sc.keep(t.out(try t.add(x, try t.div(try t.mul(sn, sn), try t.addS(beta, 1e-9)))));
+    fn snake(self: *const Engine, parent: *Graph, x: A, comptime fmt: []const u8, args: anytype) !A {
+        var g = parent.scope();
+        defer g.deinit();
+        const alpha = try g.exp(try self.vaeW(fmt ++ ".alpha", args));
+        const beta = try g.exp(try self.vaeW(fmt ++ ".beta", args));
+        const sn = try g.sin(try g.mul(x, alpha));
+        // An f32 epsilon, whatever the weights' dtype.
+        return parent.keep(try g.add(x, try g.div(try g.mul(sn, sn), try g.add(beta, try g.scalar(1e-9, .float32)))));
     }
 
-    fn conv(self: *const Engine, sc: *Scope, x: A, comptime fmt: []const u8, args: anytype, padding: c_int, dilation: c_int) !A {
-        const y = try sc.conv1d(x, try self.vaeW(fmt ++ ".weight", args), 1, padding, dilation);
+    fn conv(self: *const Engine, parent: *Graph, x: A, comptime fmt: []const u8, args: anytype, padding: c_int, dilation: c_int) !A {
+        var g = parent.scope();
+        defer g.deinit();
+        const y = try g.conv1d(x, try self.vaeW(fmt ++ ".weight", args), 1, padding, dilation, 1);
         var buf: [160]u8 = undefined;
-        const bias = self.vw.get(try std.fmt.bufPrint(&buf, fmt ++ ".bias", args)) orelse return y;
-        return sc.add(y, bias);
+        const bias = self.vw.get(try std.fmt.bufPrint(&buf, fmt ++ ".bias", args));
+        return parent.keep(if (bias) |b| try g.add(y, b) else y);
     }
 
-    fn resUnit(self: *const Engine, sc: *Scope, x: A, block: usize, unit: usize, dilation: c_int) !A {
-        var t = Scope.init(sc.a, sc.s);
-        defer t.deinit();
-        const a1 = try self.snake(&t, x, "layers.{d}.layers.{d}.layers.0", .{ block, unit });
-        const c1 = try self.conv(&t, a1, "layers.{d}.layers.{d}.layers.1", .{ block, unit }, 3 * dilation, dilation);
-        const a2 = try self.snake(&t, c1, "layers.{d}.layers.{d}.layers.2", .{ block, unit });
-        return sc.keep(t.out(try t.add(x, try self.conv(&t, a2, "layers.{d}.layers.{d}.layers.3", .{ block, unit }, 0, 1))));
+    fn resUnit(self: *const Engine, parent: *Graph, x: A, block: usize, unit: usize, dilation: c_int) !A {
+        var g = parent.scope();
+        defer g.deinit();
+        const a1 = try self.snake(&g, x, "layers.{d}.layers.{d}.layers.0", .{ block, unit });
+        const c1 = try self.conv(&g, a1, "layers.{d}.layers.{d}.layers.1", .{ block, unit }, 3 * dilation, dilation);
+        const a2 = try self.snake(&g, c1, "layers.{d}.layers.{d}.layers.2", .{ block, unit });
+        return parent.keep(try g.add(x, try self.conv(&g, a2, "layers.{d}.layers.{d}.layers.3", .{ block, unit }, 0, 1)));
     }
 
-    /// Evaluates `next`, frees `prev` and hands the freed buffers back.
-    fn advance(prev: A, next: A) !A {
-        errdefer _ = mlx.mlx_array_free(next);
-        try mlx.check(mlx.mlx_array_eval(next));
-        _ = mlx.mlx_array_free(prev);
+    /// Evaluates `next`, frees `prev` (both `g`'s) and hands the freed buffers back.
+    fn advance(g: *Graph, prev: A, next: A) !A {
+        try ops.eval(next);
+        g.drop(prev);
         _ = mlx.mlx_clear_cache();
         return next;
     }
 
     /// Latents [1,L,64] f32 → audio [1,decodedLen(L),2] f32. One eval per block keeps the
     /// transient at a single block's activations.
-    fn decodeWindow(self: *const Engine, a: std.mem.Allocator, z: A) !A {
+    fn decodeWindow(self: *const Engine, parent: *Graph, z: A) !A {
         const d = self.vae_parsed.value.decoder_config;
-        var sc0 = Scope.init(a, self.s);
-        defer sc0.deinit();
-        var h = sc0.out(try self.conv(&sc0, z, "layers.0", .{}, 3, 1));
-        defer _ = mlx.mlx_array_free(h);
+        var g0 = parent.scope();
+        defer g0.deinit();
+        var h = try self.conv(&g0, z, "layers.0", .{}, 3, 1);
         const n = d.strides.len;
         for (0..n) |bi| {
             const stride = d.strides[n - 1 - bi];
             const li = bi + 1;
             {
-                var sc = Scope.init(a, self.s);
-                defer sc.deinit();
-                const y = try self.snake(&sc, h, "layers.{d}.layers.0", .{li});
-                const up = try sc.convT1d(y, try self.vaeW("layers.{d}.layers.1.weight", .{li}), stride, @divTrunc(stride + 1, 2));
-                h = try advance(h, sc.out(try sc.add(up, try self.vaeW("layers.{d}.layers.1.bias", .{li}))));
+                var g = g0.scope();
+                defer g.deinit();
+                const y = try self.snake(&g, h, "layers.{d}.layers.0", .{li});
+                const up = try g.convTranspose1d(y, try self.vaeW("layers.{d}.layers.1.weight", .{li}), stride, @divTrunc(stride + 1, 2), 1, 0, 1);
+                h = try advance(&g0, h, try g0.keep(try g.add(up, try self.vaeW("layers.{d}.layers.1.bias", .{li}))));
             }
             inline for (.{ .{ 2, 1 }, .{ 3, 3 }, .{ 4, 9 } }) |u| {
-                var sc = Scope.init(a, self.s);
-                defer sc.deinit();
-                h = try advance(h, sc.out(try self.resUnit(&sc, h, li, u[0], u[1])));
+                var g = g0.scope();
+                defer g.deinit();
+                h = try advance(&g0, h, try g0.keep(try self.resUnit(&g, h, li, u[0], u[1])));
             }
         }
-        const a1 = try self.snake(&sc0, h, "layers.{d}", .{n + 1});
-        return sc0.out(try self.conv(&sc0, a1, "layers.{d}", .{n + 2}, 3, 1));
+        const a1 = try self.snake(&g0, h, "layers.{d}", .{n + 1});
+        return parent.keep(try self.conv(&g0, a1, "layers.{d}", .{n + 2}, 3, 1));
     }
 
     fn decodeCore(self: *const Engine) usize {
@@ -911,7 +915,7 @@ pub const Engine = struct {
     fn decodeLatents(self: *const Engine, a: std.mem.Allocator, latents: A, core: usize, progress: ?sse.Progress) ![]f32 {
         const d = self.vae_parsed.value.decoder_config;
         const vf = self.vae_parsed.value;
-        const frames: usize = @intCast(mlx.getShape(latents)[0]);
+        const frames: usize = @intCast(ops.shape(latents)[0]);
         const hop = hopOf(d.strides);
         const total = decodedLen(d.strides, frames);
         const out = try a.alloc(f32, total * 2);
@@ -929,15 +933,11 @@ pub const Engine = struct {
             const end = @min(frames, start + core);
             const left = start -| vf.decode_halo_frames;
             const right = @min(frames, end + vf.decode_halo_frames);
-            var sc = Scope.init(a, self.s);
-            defer sc.deinit();
-            const z = try sc.reshape(try sc.slice(latents, 0, @intCast(left), @intCast(right)), &.{ 1, @intCast(right - left), LATENT_DIM });
-            const audio = try self.decodeWindow(a, z);
-            defer _ = mlx.mlx_array_free(audio);
-            var flat = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(flat);
-            try mlx.check(mlx.mlx_contiguous(&flat, audio, false, self.s));
-            try mlx.check(mlx.mlx_array_eval(flat));
+            var g = Graph.init(a, self.s);
+            defer g.deinit();
+            const z = try g.reshape(try g.sliceAxis(latents, 0, @intCast(left), @intCast(right)), &.{ 1, @intCast(right - left), LATENT_DIM });
+            const flat = try g.contiguous(try self.decodeWindow(&g, z));
+            try ops.eval(flat);
             const data = mlx.mlx_array_data_float32(flat) orelse return error.NoData;
             const crop = (start - left) * hop;
             const take = @min(end * hop, total) - start * hop;
@@ -1004,8 +1004,9 @@ pub const Engine = struct {
         _ = mlx.mlx_clear_cache();
 
         log.info("[yue2] nar: {d} frames ({d:.1}s), {d} midpoint steps\n", .{ codec.len, @as(f32, @floatFromInt(codec.len)) / FRAME_RATE, steps });
-        const latents = try self.synthesize(allocator, prefix, codec, req.seed, steps, progress);
-        defer _ = mlx.mlx_array_free(latents);
+        var nar = Graph.init(allocator, self.s);
+        defer nar.deinit();
+        const latents = try self.synthesize(&nar, prefix, codec, req.seed, steps, progress);
         _ = mlx.mlx_clear_cache();
 
         const pcm = try self.decodeLatents(allocator, latents, self.decodeCore(), progress);
@@ -1027,10 +1028,8 @@ fn readFile(io: std.Io, a: std.mem.Allocator, dir: []const u8, name: []const u8)
     return rs.interface.allocRemaining(a, .limited(16 * 1024 * 1024));
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// Tests — hermetic first, then env-gated oracles (YUE2_TEST_MODEL + YUE2_*,
-// fed by tests/dump_yue2_fixtures.py).
-// ════════════════════════════════════════════════════════════════════════
+// ── tests ──
+// Hermetic first, then env-gated oracles (YUE2_TEST_MODEL + YUE2_*, fed by tests/dump_yue2_fixtures.py).
 
 const testing = std.testing;
 
@@ -1271,14 +1270,10 @@ fn toIds(a: std.mem.Allocator, raw: []const i32) ![]u32 {
 /// A logit row matters through its softmax, which a constant shift (bf16 rounding moves the whole
 /// background by an ulp) does not change: same argmax and a small KL from the reference.
 fn expectLogits(arr: A, ref: []const f32, label: []const u8) !void {
-    var flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(flat);
-    var f32a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f32a);
-    const s = mlx.mlx_default_gpu_stream_new();
-    try mlx.check(mlx.mlx_astype(&f32a, arr, .float32, s));
-    try mlx.check(mlx.mlx_contiguous(&flat, f32a, false, s));
-    try mlx.check(mlx.mlx_array_eval(flat));
+    var g = Graph.init(testing.allocator, mlx.mlx_default_gpu_stream_new());
+    defer g.deinit();
+    const flat = try g.contiguous(try g.astype(arr, .float32));
+    try ops.eval(flat);
     try testing.expectEqual(ref.len, mlx.mlx_array_size(flat));
     const d = mlx.mlx_array_data_float32(flat) orelse return error.NoData;
     var lse_r: f64 = 0;
@@ -1306,14 +1301,10 @@ fn expectLogits(arr: A, ref: []const f32, label: []const u8) !void {
 
 /// Cosine AND scale: a concatenated tensor can match in direction while off in norm.
 fn expectParity(arr: A, ref: []const f32, min_cos: f64, label: []const u8) !void {
-    var flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(flat);
-    var f32a = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(f32a);
-    const s = mlx.mlx_default_gpu_stream_new();
-    try mlx.check(mlx.mlx_astype(&f32a, arr, .float32, s));
-    try mlx.check(mlx.mlx_contiguous(&flat, f32a, false, s));
-    try mlx.check(mlx.mlx_array_eval(flat));
+    var g = Graph.init(testing.allocator, mlx.mlx_default_gpu_stream_new());
+    defer g.deinit();
+    const flat = try g.contiguous(try g.astype(arr, .float32));
+    try ops.eval(flat);
     try testing.expectEqual(ref.len, mlx.mlx_array_size(flat));
     const d = mlx.mlx_array_data_float32(flat) orelse return error.NoData;
     var dot: f64 = 0;
@@ -1363,13 +1354,13 @@ test "yue2 AR path: prefill and a cached decode step match the reference logits"
     const ref1 = try readRaw(f32, a, "YUE2_AR_LOGITS1");
     defer a.free(ref1);
 
-    var sc = Scope.init(a, e.s);
-    defer sc.deinit();
-    var kv = try Kv.init(a, &sc, e.cfg, prefix.len + 4);
-    defer kv.deinit(a);
-    const l0 = try sc.keep(try e.arForward(a, prefix, &kv));
+    var g = Graph.init(a, e.s);
+    defer g.deinit();
+    var kv = try Kv.init(&g, e.cfg, prefix.len + 4);
+    defer kv.deinit();
+    const l0 = try e.arForward(&g, prefix, &kv);
     try expectLogits(l0, ref0, "ar prefill logits");
-    const l1 = try sc.keep(try e.arForward(a, &.{@intCast(nxt_raw[0])}, &kv));
+    const l1 = try e.arForward(&g, &.{@intCast(nxt_raw[0])}, &kv);
     try expectLogits(l1, ref1, "ar cached decode logits");
 }
 
@@ -1386,17 +1377,13 @@ test "yue2 NAR path: velocity and the seeded 4-step solve match the reference" {
     const ref_v = try readRaw(f32, a, "YUE2_NAR_V");
     defer a.free(ref_v);
 
+    var g = Graph.init(a, e.s);
+    defer g.deinit();
     const ar_kv = try a.alloc(ArKv, e.cfg.layers);
     defer a.free(ar_kv);
-    const built = try e.arPrefillKv(a, ar_ids, ar_kv);
-    defer for (ar_kv[0..built]) |kv| {
-        _ = mlx.mlx_array_free(kv.k);
-        _ = mlx.mlx_array_free(kv.v);
-    };
-    var sc = Scope.init(a, e.s);
-    defer sc.deinit();
-    const state = try sc.astype(try sc.fromF32(state_f, &.{ 24, LATENT_DIM }), .bfloat16);
-    const v = try sc.keep(try e.velocity(a, state, 1.0986123, ar_kv[0..built], @intCast(ar_ids.len)));
+    const built = try e.arPrefillKv(&g, ar_ids, ar_kv);
+    const state = try g.astype(try g.fromSlice(f32, state_f, &.{ 24, LATENT_DIM }), .bfloat16);
+    const v = try e.velocity(&g, state, 1.0986123, ar_kv[0..built], @intCast(ar_ids.len));
     try expectParity(v, ref_v, 0.998, "nar velocity");
 
     const plen = try readRaw(i32, a, "YUE2_NAR_PREFIX_LEN");
@@ -1407,7 +1394,7 @@ test "yue2 NAR path: velocity and the seeded 4-step solve match the reference" {
     defer a.free(codec);
     const ref_lat = try readRaw(f32, a, "YUE2_NAR_LAT");
     defer a.free(ref_lat);
-    const lat = try sc.keep(try e.synthesize(a, ar_ids[0..@intCast(plen[0])], codec, 7, 4, null));
+    const lat = try e.synthesize(&g, ar_ids[0..@intCast(plen[0])], codec, 7, 4, null);
     try expectParity(lat, ref_lat, 0.995, "nar 4-step latents");
 }
 
@@ -1419,9 +1406,9 @@ test "yue2 VAE: two tiles of random latents decode like the reference" {
     defer a.free(lat_f);
     const ref = try readRaw(f32, a, "YUE2_VAE_AUDIO");
     defer a.free(ref);
-    var sc = Scope.init(a, e.s);
-    defer sc.deinit();
-    const z = try sc.fromF32(lat_f, &.{ @intCast(lat_f.len / @as(usize, LATENT_DIM)), LATENT_DIM });
+    var g = Graph.init(a, e.s);
+    defer g.deinit();
+    const z = try g.fromSlice(f32, lat_f, &.{ @intCast(lat_f.len / @as(usize, LATENT_DIM)), LATENT_DIM });
     const pcm = try e.decodeLatents(a, z, e.decodeCore(), null);
     defer a.free(pcm);
     try testing.expectEqual(ref.len, pcm.len);
@@ -1452,10 +1439,10 @@ test "yue2 VAE: a 44 s decode stays under 2 GiB of transient and hands its buffe
     defer a.free(lat);
     var prng = std.Random.DefaultPrng.init(7);
     for (lat) |*v| v.* = prng.random().floatNorm(f32);
-    var sc = Scope.init(a, e.s);
-    defer sc.deinit();
-    const z = try sc.fromF32(lat, &.{ frames, LATENT_DIM });
-    try mlx.check(mlx.mlx_array_eval(z));
+    var g = Graph.init(a, e.s);
+    defer g.deinit();
+    const z = try g.fromSlice(f32, lat, &.{ frames, LATENT_DIM });
+    try ops.eval(z);
     _ = mlx.mlx_clear_cache();
     _ = mlx.mlx_reset_peak_memory();
     var before: usize = 0;
@@ -1480,9 +1467,9 @@ test "yue2 VAE: the decode tile size never changes the audio" {
     defer a.free(lat);
     var prng = std.Random.DefaultPrng.init(11);
     for (lat) |*v| v.* = prng.random().floatNorm(f32);
-    var sc = Scope.init(a, e.s);
-    defer sc.deinit();
-    const z = try sc.fromF32(lat, &.{ frames, LATENT_DIM });
+    var g = Graph.init(a, e.s);
+    defer g.deinit();
+    const z = try g.fromSlice(f32, lat, &.{ frames, LATENT_DIM });
     const pack = try e.decodeLatents(a, z, e.vae_parsed.value.decode_core_frames, null);
     defer a.free(pack);
     const ours = try e.decodeLatents(a, z, e.decodeCore(), null);
@@ -1497,4 +1484,553 @@ test "yue2 VAE: the decode tile size never changes the audio" {
     }
     std.debug.print("[yue2-test] vae tile size: max |diff| {e} of peak {d:.3}\n", .{ worst, peak });
     try testing.expect(worst <= peak * 1e-4);
+}
+
+// The Scope forwards the Graph port must equal bit for bit (they go when Scope does).
+
+const Scope = scope_mod.Scope;
+
+const legacy = struct {
+    const ScopeKv = struct {
+        ks: []A,
+        vs: []A,
+        len: c_int = 0,
+
+        fn init(a: std.mem.Allocator, sc: *Scope, cfg: Cfg, cap: usize) !ScopeKv {
+            const ks = try a.alloc(A, cfg.layers);
+            errdefer a.free(ks);
+            const vs = try a.alloc(A, cfg.layers);
+            errdefer a.free(vs);
+            const shape = [_]c_int{ 1, cfg.kv_heads, @intCast(cap), cfg.hd };
+            for (ks, vs) |*k, *v| {
+                k.* = sc.out(try sc.zeros(&shape, .bfloat16));
+                v.* = sc.out(try sc.zeros(&shape, .bfloat16));
+            }
+            return .{ .ks = ks, .vs = vs };
+        }
+
+        fn deinit(self: *ScopeKv, a: std.mem.Allocator) void {
+            for (self.ks) |k| _ = mlx.mlx_array_free(k);
+            for (self.vs) |v| _ = mlx.mlx_array_free(v);
+            a.free(self.ks);
+            a.free(self.vs);
+        }
+
+        fn write(self: *ScopeKv, sc: *Scope, buf: *A, new: A) !void {
+            const sh = mlx.getShape(buf.*);
+            const t = mlx.getShape(new)[2];
+            const start = [_]c_int{ 0, 0, self.len, 0 };
+            const stop = [_]c_int{ sh[0], sh[1], self.len + t, sh[3] };
+            const o = sc.out(try sc.sliceUpdate(buf.*, new, &start, &stop));
+            _ = mlx.mlx_array_free(buf.*);
+            buf.* = o;
+        }
+    };
+
+    fn qkv(self: *const Engine, sc: *Scope, p: *const Path, x: A, offset: c_int) !struct { q: A, k: A, v: A } {
+        const c = self.cfg;
+        const h = try sc.rms(x, p.ln, c.eps);
+        const q = try sc.rms(try sc.heads(try p.q.forward(sc, h), c.heads, c.hd), p.qn, c.eps);
+        const k = try sc.rms(try sc.heads(try p.k.forward(sc, h), c.kv_heads, c.hd), p.kn, c.eps);
+        return .{
+            .q = try sc.ropeAt(q, c.hd, c.rope_theta, offset),
+            .k = try sc.ropeAt(k, c.hd, c.rope_theta, offset),
+            .v = try sc.heads(try p.v.forward(sc, h), c.kv_heads, c.hd),
+        };
+    }
+
+    fn finish(self: *const Engine, sc: *Scope, p: *const Path, x: A, attn: A) !A {
+        const h = try sc.add(x, try p.o.forward(sc, try sc.merge(attn)));
+        const m = try sc.rms(h, p.mlp_ln, self.cfg.eps);
+        const gu = try sc.mul(try sc.silu(try p.gate.forward(sc, m)), try p.up.forward(sc, m));
+        return sc.add(h, try p.down.forward(sc, gu));
+    }
+
+    fn embedIds(self: *const Engine, sc: *Scope, ids: []const u32) !A {
+        const i32s = try sc.a.alloc(i32, ids.len);
+        defer sc.a.free(i32s);
+        for (ids, i32s) |id, *o| o.* = @intCast(id);
+        const rows = try sc.take(self.embed, try sc.fromI32(i32s, &.{@intCast(ids.len)}));
+        return sc.reshape(rows, &.{ 1, @intCast(ids.len), self.cfg.hidden });
+    }
+
+    fn arForward(self: *Engine, a: std.mem.Allocator, ids: []const u32, kv: *ScopeKv) !A {
+        var sc0 = Scope.init(a, self.s);
+        defer sc0.deinit();
+        var x = sc0.out(try embedIds(self, &sc0, ids));
+        defer _ = mlx.mlx_array_free(x);
+        const t: c_int = @intCast(ids.len);
+        const prefill = t > 1;
+        for (self.layers, 0..) |*l, li| {
+            var sc = Scope.init(a, self.s);
+            defer sc.deinit();
+            const r = try qkv(self, &sc, &l.ar, x, kv.len);
+            try kv.write(&sc, &kv.ks[li], r.k);
+            try kv.write(&sc, &kv.vs[li], r.v);
+            const kview = try sc.slice(kv.ks[li], 2, 0, kv.len + t);
+            const vview = try sc.slice(kv.vs[li], 2, 0, kv.len + t);
+            const attn = try sc.sdpaMode(r.q, kview, vview, self.scale(), if (prefill) "causal" else "");
+            const next = sc.out(try finish(self, &sc, &l.ar, x, attn));
+            _ = mlx.mlx_array_free(x);
+            x = next;
+            if (prefill) try mlx.check(mlx.mlx_array_eval(x));
+        }
+        kv.len += t;
+        const last = try sc0.rms(try sc0.slice(x, 1, t - 1, t), self.norm, self.cfg.eps);
+        return sc0.out(try sc0.reshape(try self.lm_head.forward(&sc0, last), &.{@intCast(VOCAB)}));
+    }
+
+    fn generateTokens(self: *Engine, a: std.mem.Allocator, prefix: []const u32, negative: ?[]const u32, cfg_scale: f32, s: Sampling, phase: Phase, seed: u64, top_p_floor: usize) !Engine.Generated {
+        var sc = Scope.init(a, self.s);
+        defer sc.deinit();
+        var kvs: [2]ScopeKv = undefined;
+        const n_kv: usize = if (negative != null) 2 else 1;
+        const lens = [2]usize{ prefix.len, if (negative) |n| n.len else 0 };
+        var made: usize = 0;
+        defer for (kvs[0..made]) |*k| k.deinit(a);
+        for (0..n_kv) |i| {
+            kvs[i] = try ScopeKv.init(a, &sc, self.cfg, lens[i] + s.max_tokens);
+            made += 1;
+        }
+        var sampler = Sampler.init(a, seed);
+        defer sampler.deinit();
+        var history: std.ArrayList(u32) = .empty;
+        errdefer history.deinit(a);
+        const host = try a.alloc(f32, VOCAB);
+        defer a.free(host);
+        var feed: [2][]const u32 = .{ prefix, negative orelse &.{} };
+        var eos = false;
+        var step: u32 = 0;
+        while (step < s.max_tokens) : (step += 1) {
+            var step_sc = Scope.init(a, self.s);
+            defer step_sc.deinit();
+            const cond = try step_sc.keep(try arForward(self, a, feed[0], &kvs[0]));
+            var logits = cond;
+            if (n_kv == 2) {
+                const uncond = try step_sc.keep(try arForward(self, a, feed[1], &kvs[1]));
+                logits = try step_sc.add(uncond, try step_sc.mulLike(try step_sc.sub(cond, uncond), cfg_scale));
+            }
+            const f = try step_sc.astype(logits, .float32);
+            try mlx.check(mlx.mlx_array_eval(f));
+            @memcpy(host, (mlx.mlx_array_data_float32(f) orelse return error.NoData)[0..VOCAB]);
+            const token = try sampler.pick(host, s, history.items, step, phase, top_p_floor);
+            if (token == phase.end()) {
+                eos = true;
+                break;
+            }
+            try history.append(a, token);
+            feed = .{ history.items[history.items.len - 1 ..], history.items[history.items.len - 1 ..] };
+        }
+        return .{ .ids = try history.toOwnedSlice(a), .truncated = !eos };
+    }
+
+    fn arPrefillKv(self: *Engine, a: std.mem.Allocator, ids: []const u32, out: []ArKv) !usize {
+        var sc0 = Scope.init(a, self.s);
+        defer sc0.deinit();
+        var x = sc0.out(try embedIds(self, &sc0, ids));
+        defer _ = mlx.mlx_array_free(x);
+        var made: usize = 0;
+        errdefer for (out[0..made]) |kv| {
+            _ = mlx.mlx_array_free(kv.k);
+            _ = mlx.mlx_array_free(kv.v);
+        };
+        for (self.layers, out) |*l, *slot| {
+            var sc = Scope.init(a, self.s);
+            defer sc.deinit();
+            const r = try qkv(self, &sc, &l.ar, x, 0);
+            const attn = try sc.sdpaMode(r.q, r.k, r.v, self.scale(), "causal");
+            const next = sc.out(try finish(self, &sc, &l.ar, x, attn));
+            slot.* = .{ .k = sc.out(r.k), .v = sc.out(r.v) };
+            made += 1;
+            _ = mlx.mlx_array_free(x);
+            x = next;
+            try mlx.check(mlx.mlx_array_eval(x));
+            try mlx.check(mlx.mlx_array_eval(slot.k));
+            try mlx.check(mlx.mlx_array_eval(slot.v));
+        }
+        return made;
+    }
+
+    fn velocity(self: *Engine, a: std.mem.Allocator, state: A, raw_t: f32, ar_kv: []const ArKv, ar_len: c_int) !A {
+        var sc0 = Scope.init(a, self.s);
+        defer sc0.deinit();
+        const frames = mlx.getShape(state)[0];
+        const n = frames + 2;
+        const t = try sc0.sigmoid(try sc0.astype(try sc0.scalar(raw_t), mlx.mlx_array_dtype(state)));
+        const x0 = try self.vae2llm.forward(&sc0, try sc0.reshape(try sc0.padAxis(state, 0, 1, 1), &.{ 1, n, LATENT_DIM }));
+        const temb = try timeEmbedding(self, &sc0, t, mlx.mlx_array_dtype(state));
+        var x = sc0.out(try sc0.add(try sc0.add(x0, temb), try sc0.slice(self.pos_embed, 0, 0, n)));
+        defer _ = mlx.mlx_array_free(x);
+        for (self.layers, ar_kv) |*l, kv| {
+            var sc = Scope.init(a, self.s);
+            defer sc.deinit();
+            const r = try qkv(self, &sc, &l.nar, x, ar_len);
+            const attn = try sc.sdpaMode(r.q, try sc.concat(&.{ kv.k, r.k }, 2), try sc.concat(&.{ kv.v, r.v }, 2), self.scale(), "");
+            const next = sc.out(try finish(self, &sc, &l.nar, x, attn));
+            _ = mlx.mlx_array_free(x);
+            x = next;
+            try mlx.check(mlx.mlx_array_eval(x));
+        }
+        const v = try self.llm2vae.forward(&sc0, try sc0.rms(x, self.norm, self.cfg.eps));
+        return sc0.out(try sc0.reshape(try sc0.slice(v, 1, 1, n - 1), &.{ frames, LATENT_DIM }));
+    }
+
+    fn timeEmbedding(self: *Engine, sc: *Scope, t: A, dt: mlx.mlx_dtype) !A {
+        var freqs: [TIME_FREQ / 2]f32 = undefined;
+        for (&freqs, 0..) |*f, i| f.* = @exp(-@log(@as(f32, 10000)) * @as(f32, @floatFromInt(i)) / (TIME_FREQ / 2));
+        const args = try sc.mul(try sc.reshape(try sc.astype(t, .float32), &.{ 1, 1 }), try sc.fromF32(&freqs, &.{ 1, TIME_FREQ / 2 }));
+        const emb = try sc.astype(try sc.concat(&.{ try sc.cos(args), try sc.sin(args) }, -1), dt);
+        const h = try self.time_fc2.forward(sc, try sc.silu(try self.time_fc1.forward(sc, emb)));
+        return sc.reshape(h, &.{ 1, 1, self.cfg.hidden });
+    }
+
+    fn synthesize(self: *Engine, a: std.mem.Allocator, prefix: []const u32, codec: []const u32, seed: u64, steps: u32) !A {
+        var sc = Scope.init(a, self.s);
+        defer sc.deinit();
+        const key = try sc.keep(blk: {
+            var k = mlx.mlx_array_new();
+            try mlx.check(mlx.mlx_random_key(&k, seed));
+            break :blk k;
+        });
+        const frames: c_int = @intCast(codec.len);
+        var noise = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_random_normal(&noise, &[_]c_int{ frames, LATENT_DIM }, 2, .float32, 0, 1, key, self.s));
+        _ = try sc.keep(noise);
+        const size = chunkSize(prefix.len);
+        if (codec.len == 0 or size == 0) return error.NoAcousticContext;
+        const n_chunks = (codec.len + size - 1) / size;
+        var pieces = try a.alloc(A, n_chunks);
+        defer a.free(pieces);
+        var made: usize = 0;
+        defer for (pieces[0..made]) |p| {
+            _ = mlx.mlx_array_free(p);
+        };
+        const dt = 1.0 / @as(f32, @floatFromInt(steps));
+        var start: usize = 0;
+        while (start < codec.len) : (start += size) {
+            const stop = @min(start + size, codec.len);
+            const ar_ids = try a.alloc(u32, prefix.len + (stop - start) + 1);
+            defer a.free(ar_ids);
+            @memcpy(ar_ids[0..prefix.len], prefix);
+            for (codec[start..stop], ar_ids[prefix.len..][0 .. stop - start]) |c, *o| o.* = c + CODEC_OFFSET;
+            ar_ids[ar_ids.len - 1] = MUSIC_END;
+            const ar_kv = try a.alloc(ArKv, self.cfg.layers);
+            defer a.free(ar_kv);
+            const built = try arPrefillKv(self, a, ar_ids, ar_kv);
+            defer for (ar_kv[0..built]) |kv| {
+                _ = mlx.mlx_array_free(kv.k);
+                _ = mlx.mlx_array_free(kv.v);
+            };
+            _ = mlx.mlx_clear_cache();
+            var state = sc.out(try sc.astype(try sc.slice(noise, 0, @intCast(start), @intCast(stop)), .bfloat16));
+            defer _ = mlx.mlx_array_free(state);
+            const ar_len: c_int = @intCast(ar_ids.len);
+            for (0..steps) |si| {
+                var st = Scope.init(a, self.s);
+                defer st.deinit();
+                const t = flowTime(@intCast(si), steps);
+                const v1 = try st.keep(try velocity(self, a, state, logitTime(t), ar_kv[0..built], ar_len));
+                const mid = try st.sub(state, try st.mulLike(v1, dt / 2));
+                const v2 = try st.keep(try velocity(self, a, mid, logitTime(t - dt / 2), ar_kv[0..built], ar_len));
+                const next = st.out(try st.sub(state, try st.mulLike(v2, dt)));
+                try mlx.check(mlx.mlx_array_eval(next));
+                _ = mlx.mlx_array_free(state);
+                state = next;
+            }
+            pieces[made] = sc.out(try sc.astype(state, .float32));
+            made += 1;
+        }
+        return sc.out(try sc.concat(pieces[0..made], 0));
+    }
+
+    fn snake(self: *const Engine, sc: *Scope, x: A, comptime fmt: []const u8, args: anytype) !A {
+        var t = Scope.init(sc.a, sc.s);
+        defer t.deinit();
+        const alpha = try t.exp(try self.vaeW(fmt ++ ".alpha", args));
+        const beta = try t.exp(try self.vaeW(fmt ++ ".beta", args));
+        const sn = try t.sin(try t.mul(x, alpha));
+        return sc.keep(t.out(try t.add(x, try t.div(try t.mul(sn, sn), try t.addS(beta, 1e-9)))));
+    }
+
+    fn conv(self: *const Engine, sc: *Scope, x: A, comptime fmt: []const u8, args: anytype, padding: c_int, dilation: c_int) !A {
+        const y = try sc.conv1d(x, try self.vaeW(fmt ++ ".weight", args), 1, padding, dilation);
+        var buf: [160]u8 = undefined;
+        const bias = self.vw.get(try std.fmt.bufPrint(&buf, fmt ++ ".bias", args)) orelse return y;
+        return sc.add(y, bias);
+    }
+
+    fn resUnit(self: *const Engine, sc: *Scope, x: A, block: usize, unit: usize, dilation: c_int) !A {
+        var t = Scope.init(sc.a, sc.s);
+        defer t.deinit();
+        const a1 = try snake(self, &t, x, "layers.{d}.layers.{d}.layers.0", .{ block, unit });
+        const c1 = try conv(self, &t, a1, "layers.{d}.layers.{d}.layers.1", .{ block, unit }, 3 * dilation, dilation);
+        const a2 = try snake(self, &t, c1, "layers.{d}.layers.{d}.layers.2", .{ block, unit });
+        return sc.keep(t.out(try t.add(x, try conv(self, &t, a2, "layers.{d}.layers.{d}.layers.3", .{ block, unit }, 0, 1))));
+    }
+
+    fn advance(prev: A, next: A) !A {
+        errdefer _ = mlx.mlx_array_free(next);
+        try mlx.check(mlx.mlx_array_eval(next));
+        _ = mlx.mlx_array_free(prev);
+        _ = mlx.mlx_clear_cache();
+        return next;
+    }
+
+    fn decodeWindow(self: *const Engine, a: std.mem.Allocator, z: A) !A {
+        const d = self.vae_parsed.value.decoder_config;
+        var sc0 = Scope.init(a, self.s);
+        defer sc0.deinit();
+        var h = sc0.out(try conv(self, &sc0, z, "layers.0", .{}, 3, 1));
+        defer _ = mlx.mlx_array_free(h);
+        const n = d.strides.len;
+        for (0..n) |bi| {
+            const stride = d.strides[n - 1 - bi];
+            const li = bi + 1;
+            {
+                var sc = Scope.init(a, self.s);
+                defer sc.deinit();
+                const y = try snake(self, &sc, h, "layers.{d}.layers.0", .{li});
+                const up = try sc.convT1d(y, try self.vaeW("layers.{d}.layers.1.weight", .{li}), stride, @divTrunc(stride + 1, 2));
+                h = try advance(h, sc.out(try sc.add(up, try self.vaeW("layers.{d}.layers.1.bias", .{li}))));
+            }
+            inline for (.{ .{ 2, 1 }, .{ 3, 3 }, .{ 4, 9 } }) |u| {
+                var sc = Scope.init(a, self.s);
+                defer sc.deinit();
+                h = try advance(h, sc.out(try resUnit(self, &sc, h, li, u[0], u[1])));
+            }
+        }
+        const a1 = try snake(self, &sc0, h, "layers.{d}", .{n + 1});
+        return sc0.out(try conv(self, &sc0, a1, "layers.{d}", .{n + 2}, 3, 1));
+    }
+
+    fn decodeLatents(self: *const Engine, a: std.mem.Allocator, latents: A, core: usize) ![]f32 {
+        const d = self.vae_parsed.value.decoder_config;
+        const vf = self.vae_parsed.value;
+        const frames: usize = @intCast(mlx.getShape(latents)[0]);
+        const hop = hopOf(d.strides);
+        const total = decodedLen(d.strides, frames);
+        const out = try a.alloc(f32, total * 2);
+        errdefer a.free(out);
+        var start: usize = 0;
+        while (start < frames) : (start += core) {
+            defer _ = mlx.mlx_clear_cache();
+            const end = @min(frames, start + core);
+            const left = start -| vf.decode_halo_frames;
+            const right = @min(frames, end + vf.decode_halo_frames);
+            var sc = Scope.init(a, self.s);
+            defer sc.deinit();
+            const z = try sc.reshape(try sc.slice(latents, 0, @intCast(left), @intCast(right)), &.{ 1, @intCast(right - left), LATENT_DIM });
+            const audio = try decodeWindow(self, a, z);
+            defer _ = mlx.mlx_array_free(audio);
+            var flat = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(flat);
+            try mlx.check(mlx.mlx_contiguous(&flat, audio, false, self.s));
+            try mlx.check(mlx.mlx_array_eval(flat));
+            const data = mlx.mlx_array_data_float32(flat) orelse return error.NoData;
+            const crop = (start - left) * hop;
+            const take = @min(end * hop, total) - start * hop;
+            @memcpy(out[start * hop * 2 ..][0 .. take * 2], data[crop * 2 ..][0 .. take * 2]);
+        }
+        return out;
+    }
+};
+
+const expectBitEqual = ops.expectBitEqual;
+
+/// A tiny random-weight engine on the CPU stream: bf16 trunk with a 4-bit q_proj and lm_head,
+/// bf16 snake parameters, f32 convs.
+const Fixture = struct {
+    e: *Engine,
+    src: Graph,
+    rng: u64 = 1,
+
+    const VAE_JSON =
+        \\{"decoder_config":{"strides":[2,3],"latent_dim":64},"decode_core_frames":4,"decode_halo_frames":2}
+    ;
+
+    fn init(a: std.mem.Allocator) !Fixture {
+        const s = mlx.mlx_default_cpu_stream_new();
+        const e = try a.create(Engine);
+        e.allocator = a;
+        e.s = s;
+        e.cfg = .{ .hidden = 64, .layers = 2, .heads = 2, .kv_heads = 1, .hd = 32, .ffn = 96, .eps = 1e-6, .rope_theta = 1e6, .max_latent_frames = 64 };
+        e.gen = .{};
+        e.vae_parsed = try std.json.parseFromSlice(VaeFile, a, VAE_JSON, .{ .ignore_unknown_fields = true });
+        e.w = Weights.init(a);
+        e.vw = Weights.init(a);
+        e.layers = try a.alloc(Layer, e.cfg.layers);
+        var fx = Fixture{ .e = e, .src = .init(a, s) };
+        try fx.fill();
+        try e.resolve();
+        return fx;
+    }
+
+    fn deinit(fx: *Fixture) void {
+        const e = fx.e;
+        e.allocator.free(e.layers);
+        e.w.deinit();
+        e.vw.deinit();
+        e.vae_parsed.deinit();
+        fx.src.deinit();
+        e.allocator.destroy(e);
+    }
+
+    fn rand(fx: *Fixture, sh: []const c_int, dt: mlx.mlx_dtype, scale_: f32) !A {
+        fx.rng += 1;
+        const key = try fx.src.call(mlx.mlx_random_key, .{fx.rng});
+        const x = try fx.src.astype(try fx.src.call(mlx.mlx_random_normal, .{ sh.ptr, sh.len, mlx.mlx_dtype.float32, 0, scale_, key }), dt);
+        try ops.eval(x);
+        return x;
+    }
+
+    fn put(fx: *Fixture, w: *Weights, key: []const u8, x: A) !void {
+        try w.map.put(try fx.e.allocator.dupe(u8, key), fx.src.escape(x));
+    }
+
+    /// `name`.weight (+ `.scales`/`.biases` when `bits` > 0) for an [out, in] projection.
+    fn proj(fx: *Fixture, w: *Weights, name: []const u8, out: c_int, in: c_int, bits: c_int) !void {
+        var buf: [160]u8 = undefined;
+        const dense = try fx.rand(&.{ out, in }, .bfloat16, 0.1);
+        if (bits == 0) return fx.put(w, try std.fmt.bufPrint(&buf, "{s}.weight", .{name}), dense);
+        var qv = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(qv);
+        try mlx.check(mlx.mlx_quantize(&qv, dense, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(bits), "affine", .{}, fx.e.s));
+        inline for (.{ "weight", "scales", "biases" }, 0..) |part, i| {
+            var x = mlx.mlx_array_new();
+            _ = mlx.mlx_vector_array_get(&x, qv, i);
+            const owned = try fx.src.adopt(x);
+            try ops.eval(owned);
+            try fx.put(w, try std.fmt.bufPrint(&buf, "{s}." ++ part, .{name}), owned);
+        }
+    }
+
+    fn fill(fx: *Fixture) !void {
+        const c = fx.e.cfg;
+        const w = &fx.e.w;
+        const bf = mlx.mlx_dtype.bfloat16;
+        var buf: [160]u8 = undefined;
+        const paths = .{
+            .{ "input_layernorm", "self_attn", "post_attention_layernorm", "mlp", 4 },
+            .{ "nar_input_layernorm", "nar_self_attn", "nar_pre_mlp_layernorm", "nar_mlp", 0 },
+        };
+        for (0..c.layers) |li| inline for (paths) |p| {
+            try fx.put(w, try std.fmt.bufPrint(&buf, "model.layers.{d}." ++ p[0] ++ ".weight", .{li}), try fx.rand(&.{c.hidden}, bf, 1));
+            try fx.put(w, try std.fmt.bufPrint(&buf, "model.layers.{d}." ++ p[2] ++ ".weight", .{li}), try fx.rand(&.{c.hidden}, bf, 1));
+            const at = "model.layers.{d}." ++ p[1];
+            try fx.proj(w, try std.fmt.bufPrint(&buf, at ++ ".q_proj", .{li}), c.heads * c.hd, c.hidden, p[4]);
+            try fx.proj(w, try std.fmt.bufPrint(&buf, at ++ ".k_proj", .{li}), c.kv_heads * c.hd, c.hidden, 0);
+            try fx.proj(w, try std.fmt.bufPrint(&buf, at ++ ".v_proj", .{li}), c.kv_heads * c.hd, c.hidden, 0);
+            try fx.proj(w, try std.fmt.bufPrint(&buf, at ++ ".o_proj", .{li}), c.hidden, c.heads * c.hd, 0);
+            try fx.put(w, try std.fmt.bufPrint(&buf, at ++ ".q_norm.weight", .{li}), try fx.rand(&.{c.hd}, bf, 1));
+            try fx.put(w, try std.fmt.bufPrint(&buf, at ++ ".k_norm.weight", .{li}), try fx.rand(&.{c.hd}, bf, 1));
+            const mp = "model.layers.{d}." ++ p[3];
+            const ffn: c_int = @intCast(c.ffn);
+            try fx.proj(w, try std.fmt.bufPrint(&buf, mp ++ ".gate_proj", .{li}), ffn, c.hidden, 0);
+            try fx.proj(w, try std.fmt.bufPrint(&buf, mp ++ ".up_proj", .{li}), ffn, c.hidden, 0);
+            try fx.proj(w, try std.fmt.bufPrint(&buf, mp ++ ".down_proj", .{li}), c.hidden, ffn, 0);
+        };
+        try fx.put(w, "model.embed_tokens.weight", try fx.rand(&.{ @intCast(VOCAB), c.hidden }, bf, 1));
+        try fx.put(w, "model.norm.weight", try fx.rand(&.{c.hidden}, bf, 1));
+        try fx.proj(w, "lm_head", @intCast(VOCAB), c.hidden, 4);
+        try fx.proj(w, "llm2vae", LATENT_DIM, c.hidden, 0);
+        try fx.put(w, "llm2vae.bias", try fx.rand(&.{LATENT_DIM}, bf, 0.1));
+        try fx.proj(w, "vae2llm", c.hidden, LATENT_DIM, 0);
+        try fx.proj(w, "time_embedder.fc1", c.hidden, TIME_FREQ, 0);
+        try fx.proj(w, "time_embedder.fc2", c.hidden, c.hidden, 0);
+        try fx.put(w, "latent_pos_embed.pe", try fx.rand(&.{ c.max_latent_frames, c.hidden }, bf, 1));
+
+        // VAE: strides [2, 3] → channels 16 → 8 → 8 → stereo.
+        const v = &fx.e.vw;
+        const f = mlx.mlx_dtype.float32;
+        try fx.put(v, "layers.0.weight", try fx.rand(&.{ 16, 7, LATENT_DIM }, f, 0.05));
+        const ch = [_]c_int{ 16, 8, 8 };
+        const strides = [_]c_int{ 3, 2 };
+        for (1..3) |li| {
+            const cin = ch[li - 1];
+            const cout = ch[li];
+            try fx.snakeParams(try std.fmt.bufPrint(&buf, "layers.{d}.layers.0", .{li}), cin);
+            try fx.put(v, try std.fmt.bufPrint(&buf, "layers.{d}.layers.1.weight", .{li}), try fx.rand(&.{ cout, 2 * strides[li - 1], cin }, f, 0.2));
+            try fx.put(v, try std.fmt.bufPrint(&buf, "layers.{d}.layers.1.bias", .{li}), try fx.rand(&.{cout}, f, 0.1));
+            for (2..5) |u| {
+                try fx.snakeParams(try std.fmt.bufPrint(&buf, "layers.{d}.layers.{d}.layers.0", .{ li, u }), cout);
+                try fx.put(v, try std.fmt.bufPrint(&buf, "layers.{d}.layers.{d}.layers.1.weight", .{ li, u }), try fx.rand(&.{ cout, 7, cout }, f, 0.15));
+                try fx.put(v, try std.fmt.bufPrint(&buf, "layers.{d}.layers.{d}.layers.1.bias", .{ li, u }), try fx.rand(&.{cout}, f, 0.1));
+                try fx.snakeParams(try std.fmt.bufPrint(&buf, "layers.{d}.layers.{d}.layers.2", .{ li, u }), cout);
+                try fx.put(v, try std.fmt.bufPrint(&buf, "layers.{d}.layers.{d}.layers.3.weight", .{ li, u }), try fx.rand(&.{ cout, 1, cout }, f, 0.3));
+                try fx.put(v, try std.fmt.bufPrint(&buf, "layers.{d}.layers.{d}.layers.3.bias", .{ li, u }), try fx.rand(&.{cout}, f, 0.1));
+            }
+        }
+        try fx.snakeParams("layers.3", 8);
+        try fx.put(v, "layers.4.weight", try fx.rand(&.{ 2, 7, 8 }, f, 0.15));
+        try fx.put(v, "layers.4.bias", try fx.rand(&.{2}, f, 0.1));
+    }
+
+    fn snakeParams(fx: *Fixture, prefix: []const u8, ch: c_int) !void {
+        var buf: [160]u8 = undefined;
+        try fx.put(&fx.e.vw, try std.fmt.bufPrint(&buf, "{s}.alpha", .{prefix}), try fx.rand(&.{ch}, .bfloat16, 0.3));
+        try fx.put(&fx.e.vw, try std.fmt.bufPrint(&buf, "{s}.beta", .{prefix}), try fx.rand(&.{ch}, .bfloat16, 0.3));
+    }
+};
+
+test "yue2 Graph port: AR, NAR and VAE forwards are bit-identical to the Scope code" {
+    const a = testing.allocator;
+    var fx = try Fixture.init(a);
+    defer fx.deinit();
+    const e = fx.e;
+    var g = Graph.init(a, e.s);
+    defer g.deinit();
+    var sc = Scope.init(a, e.s);
+    defer sc.deinit();
+
+    const prefix = [_]u32{ EOD, 11, 12, 13, ABC_START, ABC_END, MUSIC_START };
+    var kv = try Kv.init(&g, e.cfg, prefix.len + 4);
+    defer kv.deinit();
+    var okv = try legacy.ScopeKv.init(a, &sc, e.cfg, prefix.len + 4);
+    defer okv.deinit(a);
+    try expectBitEqual(try e.arForward(&g, &prefix, &kv), try sc.keep(try legacy.arForward(e, a, &prefix, &okv)));
+    const next = [_]u32{CODEC_OFFSET + 5};
+    try expectBitEqual(try e.arForward(&g, &next, &kv), try sc.keep(try legacy.arForward(e, a, &next, &okv)));
+    for (kv.ks, okv.ks, kv.vs, okv.vs) |k, ko, v, vo| {
+        try expectBitEqual(k, ko);
+        try expectBitEqual(v, vo);
+    }
+
+    const negative = [_]u32{ EOD, 21, MUSIC_START };
+    const smp = Sampling{ .temperature = 1, .top_p = 0.9, .top_k = 5, .min_tokens = 0, .max_tokens = 3 };
+    const got = try e.generateTokens(a, &prefix, &negative, 1.5, smp, .semantic, 9, 1, null);
+    defer a.free(got.ids);
+    const want = try legacy.generateTokens(e, a, &prefix, &negative, 1.5, smp, .semantic, 9, 1);
+    defer a.free(want.ids);
+    try testing.expectEqualSlices(u32, want.ids, got.ids);
+    try testing.expectEqual(want.truncated, got.truncated);
+
+    const codec = [_]u32{ 3, 1, 4, 1, 5 };
+    var ar_ids: [prefix.len + codec.len + 1]u32 = undefined;
+    @memcpy(ar_ids[0..prefix.len], &prefix);
+    for (codec, ar_ids[prefix.len..][0..codec.len]) |c, *o| o.* = c + CODEC_OFFSET;
+    ar_ids[ar_ids.len - 1] = MUSIC_END;
+    var ar_kv: [2]ArKv = undefined;
+    var oar_kv: [2]ArKv = undefined;
+    try testing.expectEqual(@as(usize, 2), try e.arPrefillKv(&g, &ar_ids, &ar_kv));
+    const built = try legacy.arPrefillKv(e, a, &ar_ids, &oar_kv);
+    defer for (oar_kv[0..built]) |x| {
+        _ = mlx.mlx_array_free(x.k);
+        _ = mlx.mlx_array_free(x.v);
+    };
+    for (ar_kv, oar_kv) |x, y| {
+        try expectBitEqual(x.k, y.k);
+        try expectBitEqual(x.v, y.v);
+    }
+    const state = try g.astype(try fx.rand(&.{ codec.len, LATENT_DIM }, .float32, 1), .bfloat16);
+    try expectBitEqual(try e.velocity(&g, state, 1.0986123, &ar_kv, ar_ids.len), try sc.keep(try legacy.velocity(e, a, state, 1.0986123, &oar_kv, ar_ids.len)));
+    try expectBitEqual(try e.synthesize(&g, &prefix, &codec, 7, 2, null), try sc.keep(try legacy.synthesize(e, a, &prefix, &codec, 7, 2)));
+
+    // 10 frames in cores of 4 with a halo of 2: three tiles, both edges cropped.
+    const z = try fx.rand(&.{ 10, LATENT_DIM }, .float32, 1);
+    const pcm = try e.decodeLatents(a, z, 4, null);
+    defer a.free(pcm);
+    const old_pcm = try legacy.decodeLatents(e, a, z, 4);
+    defer a.free(old_pcm);
+    try testing.expectEqualSlices(u8, std.mem.sliceAsBytes(old_pcm), std.mem.sliceAsBytes(pcm));
+    for (pcm) |x| try testing.expect(std.math.isFinite(x));
 }
