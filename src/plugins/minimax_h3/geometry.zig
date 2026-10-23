@@ -99,24 +99,19 @@ pub const SpeedConfig = struct { step_cache: f64, bcast_k: u32 };
 /// The 2026-08-03 eyeball verdict on the same-seed capstone pair made the
 /// fast recipe (velocity cache 0.05 + attention broadcast k=2 — 2.83x at the
 /// trained config) DEFAULT-ON, with `"fast": false` on the request as the
-/// off switch for final renders ("non fast just a smidge better"). Env vars
-/// stay the STRONGEST knob — set means set, including "0" — so every A/B
-/// harness keeps its arms.
+/// off switch for final renders ("non fast just a smidge better").
 ///
 /// Turbo and the fast recipe are ALTERNATIVES, not a stack: at 4-8 steps the
 /// velocity cache's slow-drift premise is false (every step is a giant leap)
 /// and the broadcast gates cover most of the schedule anyway, so `turbo`
-/// forces both off regardless of `fast` — env still wins for A/B harnesses.
+/// forces both off regardless of `fast`.
 /// A PDD student is `distilled` the same way.
-pub fn resolveSpeed(fast: ?bool, distilled: bool, env_sc: ?[]const u8, env_bk: ?[]const u8) SpeedConfig {
+pub fn resolveSpeed(fast: ?bool, distilled: bool) SpeedConfig {
     const want_fast = !distilled and (fast orelse true);
-    var out = SpeedConfig{
+    return .{
         .step_cache = if (want_fast) 0.05 else 0,
         .bcast_k = if (want_fast) 2 else 0,
     };
-    if (env_sc) |raw| out.step_cache = std.fmt.parseFloat(f64, raw) catch out.step_cache;
-    if (env_bk) |raw| out.bcast_k = std.fmt.parseInt(u32, raw, 10) catch out.bcast_k;
-    return out;
 }
 
 /// libc getenv, matching generate.zig's allocator-free env idiom.
@@ -124,14 +119,6 @@ pub fn envStr(name: [:0]const u8) ?[]const u8 {
     const raw = std.c.getenv(name.ptr) orelse return null;
     const slice = std.mem.sliceTo(raw, 0);
     return if (slice.len == 0) null else slice;
-}
-
-/// Whether `generate` will table and free the DiT's AdaLN weights. Shared with
-/// `gen.estimatePeakResidentBytes`: a residency bill computed against the OTHER
-/// answer is either an OOM (billed shed, ran full) or a refused load.
-pub fn adalnPrecomputeOn() bool {
-    const raw = envStr("MINIMAX_H3_ADALN_PRECOMPUTE") orelse return true;
-    return !std.mem.eql(u8, raw, "0");
 }
 
 /// Decoder geometry (ViT3DDecoder defaults, confirmed against the checkpoint).

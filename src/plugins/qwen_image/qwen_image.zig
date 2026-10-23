@@ -1999,9 +1999,9 @@ pub fn cfgActive(opts: GenOpts) bool {
     return opts.guidance_scale != 1.0;
 }
 
-fn defaultDqGemmFloor(first: ?*const MfLinear, explicit_env: bool) ?usize {
+fn defaultDqGemmFloor(first: ?*const MfLinear) ?usize {
     const q = first orelse return null;
-    return if (!explicit_env and q.quantized and q.bits == 4) 1024 else null;
+    return if (q.quantized and q.bits == 4) 1024 else null;
 }
 
 pub const EditOpts = struct {
@@ -2257,7 +2257,7 @@ pub const Engine = struct {
         // The Q4 DiT's wide image rows favor dequantized GEMM over quantized matmul.
         const dq_override_prev = mage_flow.mf_dq_gemm_override;
         const first: ?*const MfLinear = if (self.dit.blocks.len != 0) &self.dit.blocks[0].q else null;
-        if (defaultDqGemmFloor(first, std.c.getenv("MLX_SERVE_MF_DQ_GEMM") != null)) |floor|
+        if (defaultDqGemmFloor(first)) |floor|
             mage_flow.mf_dq_gemm_override = @as(?usize, floor);
         defer mage_flow.mf_dq_gemm_override = dq_override_prev;
 
@@ -2619,11 +2619,10 @@ test "QwenImage enables wide GEMM for Q4 unless explicitly overridden" {
     const q4 = MfLinear{ .quantized = true, .w = .{ .ctx = null }, .dtype = .bfloat16, .bits = 4 };
     const q8 = MfLinear{ .quantized = true, .w = .{ .ctx = null }, .dtype = .bfloat16, .bits = 8 };
     const dense = MfLinear{ .quantized = false, .w = .{ .ctx = null }, .dtype = .bfloat16 };
-    try testing.expectEqual(@as(?usize, 1024), defaultDqGemmFloor(&q4, false));
-    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(&q4, true));
-    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(&q8, false));
-    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(&dense, false));
-    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(null, false));
+    try testing.expectEqual(@as(?usize, 1024), defaultDqGemmFloor(&q4));
+    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(&q8));
+    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(&dense));
+    try testing.expectEqual(@as(?usize, null), defaultDqGemmFloor(null));
 }
 
 test "QwenImage sigmas match the reference schedule" {

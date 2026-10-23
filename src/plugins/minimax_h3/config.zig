@@ -154,7 +154,7 @@ pub fn ditFileBytes(dir: *const abi.PackDir, m: *const abi.Machine) u64 {
 
 /// The staged plan's peak; the Turbo LoRA (when shipped) rides the DiT term at full size.
 pub fn billLoad(dir: *const abi.PackDir, m: *const abi.Machine) callconv(.c) u64 {
-    const dit = ditResidentBytes(ditFileBytes(dir, m), h3.adalnPrecomputeOn()) + dir.fileBytes("turbo_lora.safetensors");
+    const dit = ditResidentBytes(ditFileBytes(dir, m), true) + dir.fileBytes("turbo_lora.safetensors");
     return peakBytes(dir.fileBytes("text_encoder.safetensors"), dit, dir.fileBytes("video_vae.safetensors"), dir.fileBytes("audio_vae.safetensors"));
 }
 
