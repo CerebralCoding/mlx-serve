@@ -55,7 +55,6 @@ pub const GDN_BLOCKED_MIN_T = @import("../../sdk/blocks/gdn/kernels.zig").GDN_BL
 pub const gdnBlockedEligible = @import("../../sdk/blocks/gdn/kernels.zig").gdnBlockedEligible;
 pub const gdnBlockedTgBytes = @import("../../sdk/blocks/gdn/kernels.zig").gdnBlockedTgBytes;
 pub const gdnBlockTFor = @import("../../sdk/blocks/gdn/kernels.zig").gdnBlockTFor;
-pub const gdnBlockT = @import("../../sdk/blocks/gdn/kernels.zig").gdnBlockT;
 pub const GdnRoute = @import("../../sdk/blocks/gdn/kernels.zig").GdnRoute;
 pub const gdnPipelinedFor = @import("../../sdk/blocks/gdn/kernels.zig").gdnPipelinedFor;
 // sdk/testing/parity.zig

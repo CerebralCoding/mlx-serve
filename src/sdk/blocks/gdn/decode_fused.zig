@@ -73,36 +73,23 @@ pub fn gdnDecodeFusedEnabled() bool {
     return gdn_decode_fused_override orelse true;
 }
 
-var gdn_decode_recur_env: ?bool = null;
 pub var gdn_decode_recur_engaged: bool = false;
 pub var gdn_verify_recur_engaged: bool = false;
 pub var gdn_verify_tree_engaged: bool = false;
 pub var attn_qkv_joined_engaged: bool = false;
-var gdn_verify_fold_env: ?bool = null;
 pub var gdn_verify_fold_engaged: bool = false;
 
-/// Chain verify rows: gdn_decode.recurSeqFold (recurrence + norm-gate + conv
-/// input in one dispatch). MLX_SERVE_GDN_VERIFY_FOLD=0 restores recurSeq ->
-/// norm-gate -> concat.
+
+/// Chain verify rows: gdn_decode.recurSeqFold (recurrence + norm-gate + conv input in one dispatch); the test seam
+/// false keeps recurSeq -> norm-gate -> concat, the arm a declined fold falls back to.
+pub var gdn_verify_fold_override: ?bool = null;
 pub fn gdnVerifyFoldEnabled() bool {
-    return gdn_verify_fold_env orelse blk: {
-        const raw = env.get(.MLX_SERVE_GDN_VERIFY_FOLD);
-        const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-        gdn_verify_fold_env = enabled;
-        break :blk enabled;
-    };
+    return gdn_verify_fold_override orelse true;
 }
 
-/// S=1 decode on packs without a Hadamard rotation: gdn_decode.recur then the
-/// norm-gate. MLX_SERVE_GDN_DECODE_RECUR=0 restores prework -> recurrence -> norm-gate.
+/// S=1 decode on packs without a Hadamard rotation: gdn_decode.recur then the norm-gate.
 pub fn gdnDecodeRecurEnabled() bool {
-    const on = gdn_decode_recur_env orelse blk: {
-        const raw = env.get(.MLX_SERVE_GDN_DECODE_RECUR);
-        const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-        gdn_decode_recur_env = enabled;
-        break :blk enabled;
-    };
-    return on and gdnDecodeFusedEnabled();
+    return gdnDecodeFusedEnabled();
 }
 
 fn getGdnPreworkKernel() !mlx.mlx_fast_metal_kernel {
@@ -143,17 +130,11 @@ pub const GdnPrework = struct {
 pub const GDN_FUSED_MAX_ROWS: c_int = 16;
 
 var gdn_prefill_fused_override: ?bool = null;
-var gdn_prefill_fused_env: ?bool = null;
 pub var gdn_prefill_engaged = false;
 
 pub fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
     if (seq < 17 or batch < 1 or batch > 2 or seq > @divTrunc(@import("../hc/hc_prefill.zig").max_seq, batch)) return false;
-    if (gdn_prefill_fused_override) |on| return on;
-    if (gdn_prefill_fused_env) |on| return on;
-    const raw = env.get(.MLX_SERVE_GDN_PREFILL_FUSED);
-    const on = raw == null or !std.mem.eql(u8, std.mem.span(raw.?), "0");
-    gdn_prefill_fused_env = on;
-    return on;
+    return gdn_prefill_fused_override orelse true;
 }
 
 /// Inputs of the packed prework. `qkv`/`b`/`a` are read at `(off, stride)`
@@ -1479,8 +1460,8 @@ const Qwen4GdnRig = struct {
             else => false,
         };
         defer rig.xfm.spec_capture_ssm = false;
-        if (arm == .recur_seq) gdn_verify_fold_env = false;
-        defer gdn_verify_fold_env = null;
+        if (arm == .recur_seq) gdn_verify_fold_override = false;
+        defer gdn_verify_fold_override = null;
         if (arm == .prefill_composed) gdn_prework_override = false;
         defer gdn_prework_override = null;
         // A chain of 8 as a draft tree, committed whole.

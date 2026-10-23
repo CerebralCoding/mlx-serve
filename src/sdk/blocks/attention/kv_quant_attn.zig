@@ -260,7 +260,7 @@ pub fn qkvAttnDecodeKernel(
     try mlx.check(mlx.mlx_reshape(&out, o_t, &out_shape, 4, s));
     if (!qkv_dec_engaged) {
         qkv_dec_engaged = true;
-        log.info("[kv-attn] decode kernel engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} mask={} (MLX_SERVE_KV_ATTN_KERNEL=0 restores composed)\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, block, has_mask });
+        log.info("[kv-attn] decode kernel engaged: bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} mask={}\n", .{ view.bits, view.group_size, dk, dv, h_q, h_kv, block, has_mask });
     }
     return out;
 }
@@ -369,12 +369,10 @@ fn getQkvVerifyKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 pub var qkv_ver_override: ?bool = null; // test seam
-var qkv_ver_env: ?bool = null;
-fn qkvVerifyKernelEnabledFrom(nax_available: bool, raw: ?[]const u8) bool {
-    if (raw) |v| return !std.mem.eql(u8, v, "0");
+fn qkvVerifyKernelEnabledFrom(nax_available: bool) bool {
     // The dk<=256 adoption set was calibrated on M4. The M5/G17 round found
     // it slower at 9K KV for q4/q6/q8 targets, so G17 keeps dense verify
-    // attention by default while retaining the explicit force-on QA lever.
+    // attention.
     return !nax_available;
 }
 
@@ -385,30 +383,19 @@ fn qkvVerifyRowsPay(gqa: c_int, t_q: c_int) bool {
     return gqa * t_q <= QKV_VERIFY_MAX_ROWS;
 }
 
-/// `MLX_SERVE_KV_ATTN_VERIFY=0` still kills the whole verify width class.
+/// The test seam false kills the whole verify width class.
 fn qkvVerifyEnvAllows() bool {
-    if (qkv_ver_override) |v| return v;
-    const raw = env.get(.MLX_SERVE_KV_ATTN_VERIFY) orelse return true;
-    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    return qkv_ver_override orelse true;
 }
 
-/// MLX_SERVE_KV_ATTN_VERIFY=1 (and the test seam) keeps every width on the kernel.
+/// The test seam keeps every width on the kernel.
 fn qkvVerifyForced() bool {
-    if (qkv_ver_override) |v| return v;
-    const raw = env.get(.MLX_SERVE_KV_ATTN_VERIFY) orelse return false;
-    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+    return qkv_ver_override orelse false;
 }
 
 fn qkvVerifyKernelEnabled() bool {
     if (qkv_ver_override) |v| return v;
-    if (qkv_ver_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_KV_ATTN_VERIFY);
-    const enabled = qkvVerifyKernelEnabledFrom(
-        verifyQmmNaxAvailable(),
-        if (raw) |v| std.mem.sliceTo(v, 0) else null,
-    );
-    qkv_ver_env = enabled;
-    return enabled;
+    return qkvVerifyKernelEnabledFrom(verifyQmmNaxAvailable());
 }
 
 /// Threadgroup budget for the verify kernel: scores only (q is device-read).
@@ -573,7 +560,7 @@ pub fn qkvAttnVerifyKernel(
     const bit: u16 = @as(u16, 1) << @intCast(t_q);
     if (qkv_ver_engaged_mask & bit == 0) {
         qkv_ver_engaged_mask |= bit;
-        log.info("[kv-attn] verify kernel engaged: Tq={d} bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} (G17 defaults dense; MLX_SERVE_KV_ATTN_VERIFY=1 forces this arm, =0 forces dense)\n", .{ t_q, view.bits, view.group_size, dk, dv, h_q, h_kv, block });
+        log.info("[kv-attn] verify kernel engaged: Tq={d} bits={d} gs={d} DK={d} DV={d} Hq={d} Hkv={d} block={d} (G17 reads dense)\n", .{ t_q, view.bits, view.group_size, dk, dv, h_q, h_kv, block });
     }
     return out;
 }
@@ -764,16 +751,6 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
 /// short prompts still exercise the fused paths; the default is a PERF
 /// gate, not a correctness gate).
 pub const KV_ATTN_FUSED_MIN_TK: c_int = 2048;
-var kv_attn_min_tk_env: ?c_int = null;
-fn kvAttnFusedMinTk() c_int {
-    if (kv_attn_min_tk_env) |v| return v;
-    const v: c_int = blk: {
-        const raw = env.get(.MLX_SERVE_KV_ATTN_MIN_TK) orelse break :blk KV_ATTN_FUSED_MIN_TK;
-        break :blk std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch KV_ATTN_FUSED_MIN_TK;
-    };
-    kv_attn_min_tk_env = v;
-    return v;
-}
 
 /// The ONE eligibility gate every fused quant-attention call site reads
 /// (`forwardStandardWith`, `gatedFullAttnWith`, `lagunaAttnWith`).
@@ -792,7 +769,7 @@ pub fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {
     if (!(view.has_quant_triple and t_q == 1)) return false;
     const ks = mlx.getShape(view.k_triple_q);
     if (ks.len < 4) return false;
-    return ks[2] >= kvAttnFusedMinTk();
+    return ks[2] >= KV_ATTN_FUSED_MIN_TK;
 }
 
 /// Verify-width packed-attention gate (Phase 2): T_q 2..8 served by
@@ -804,7 +781,7 @@ pub fn kvAttnVerifyEligible(view: *const DenseKVView, t_q: c_int) bool {
     if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_VERIFY_MAX_TQ and qkvVerifyEnvAllows())) return false;
     const ks = mlx.getShape(view.k_triple_q);
     if (ks.len < 4) return false;
-    return ks[2] >= kvAttnFusedMinTk();
+    return ks[2] >= KV_ATTN_FUSED_MIN_TK;
 }
 
 var kv_attn_fused_engaged: bool = false; // one-shot log guard
@@ -815,7 +792,7 @@ pub fn logKvAttnFusedEngaged(view: *const DenseKVView, q: mlx.mlx_array, t_q: c_
     const h_q: c_int = if (q_shape.len >= 4) q_shape[1] else 0;
     const k_shape = mlx.getShape(view.k_triple_q);
     const h_kv: c_int = if (k_shape.len >= 4) k_shape[1] else 0;
-    log.info("[kv-attn] fused engaged: bits={d} gs={d} Hq={d} Hkv={d} Tq={d} (MLX_SERVE_KV_ATTN_FUSED=0 or --kv-attn-mode dense restores dense reads)\n", .{ view.bits, view.group_size, h_q, h_kv, t_q });
+    log.info("[kv-attn] fused engaged: bits={d} gs={d} Hq={d} Hkv={d} Tq={d} (--kv-attn-mode dense restores dense reads)\n", .{ view.bits, view.group_size, h_q, h_kv, t_q });
 }
 
 // ── tests ──
@@ -1146,11 +1123,9 @@ test "qkv verify kernel serves by default only the row counts that stay in regis
     try testing.expect(!qkvVerifyRowsPay(2, 8));
 }
 
-test "qkv verify kernel defaults off on G17 but an explicit env value wins" {
-    try testing.expect(qkvVerifyKernelEnabledFrom(false, null));
-    try testing.expect(!qkvVerifyKernelEnabledFrom(true, null));
-    try testing.expect(qkvVerifyKernelEnabledFrom(true, "1"));
-    try testing.expect(!qkvVerifyKernelEnabledFrom(false, "0"));
+test "qkv verify kernel is off on G17" {
+    try testing.expect(qkvVerifyKernelEnabledFrom(false));
+    try testing.expect(!qkvVerifyKernelEnabledFrom(true));
 }
 
 test "qkv verify kernel parity: multi-block split-KV merge (T_k > BLOCK)" {
