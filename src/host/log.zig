@@ -14,6 +14,7 @@
 const std = @import("std");
 const os_mutex = @import("../sdk/util/os_mutex.zig");
 const crt = @import("../sdk/util/crt.zig");
+const rtfmt = @import("../sdk/util/rtfmt.zig");
 const builtin = @import("builtin");
 
 pub const Level = enum {
@@ -48,7 +49,7 @@ pub fn isDebug() bool {
 /// workload writes a few MB an hour, so this holds days of history.
 pub const default_max_bytes: u64 = 32 * 1024 * 1024;
 
-/// Longest single log line written to the sink. The biggest real line is the
+/// Longest single log line written to stderr and the sink. The biggest real line is the
 /// debug raw-tool-parse dump (4 KB of model output plus a prefix); anything
 /// past this is truncated with a visible marker so a clipped line can never be
 /// mistaken for what the model actually emitted.
@@ -207,23 +208,29 @@ pub fn enableStderr() void {
     stderr_enabled = true;
 }
 
-/// Format once, fan out to stderr and (when open) the file.
+/// Format once, fan out to stderr and (when open) the file. A format `rtfmt` accepts is walked at run time, so a
+/// call site costs its packed arguments, not its own instance of the formatter.
 fn emit(comptime fmt: []const u8, args: anytype) void {
-    if (stderr_enabled) std.debug.print(fmt, args);
-    if (!@atomicLoad(bool, &sink_active, .acquire)) return;
-
+    if (!stderr_enabled and !@atomicLoad(bool, &sink_active, .acquire)) return;
     var buf: [line_buf_len]u8 = undefined;
-    // Format into everything but the marker's reserved tail, so an overlong
-    // line stays ONE `write(2)` — two writes could interleave with another
-    // thread's line between them.
+    // Format into everything but the marker's reserved tail, so an overlong line stays ONE `write(2)`: two writes
+    // could interleave with another thread's line between them.
     var w = std.Io.Writer.fixed(buf[0 .. buf.len - truncation_marker.len]);
-    if (w.print(fmt, args)) |_| {
-        writeToSink(w.buffered());
-    } else |_| {
-        const kept = w.buffered().len;
-        @memcpy(buf[kept..][0..truncation_marker.len], truncation_marker);
-        writeToSink(buf[0 .. kept + truncation_marker.len]);
+    const whole = if (comptime rtfmt.supported(fmt, @TypeOf(args))) blk: {
+        const packed_args = rtfmt.pack(args);
+        break :blk if (rtfmt.print(&w, fmt, &packed_args)) |_| true else |_| false;
+    } else if (w.print(fmt, args)) |_| true else |_| false;
+    writeLine(&buf, w.buffered().len, whole);
+}
+
+fn writeLine(buf: *[line_buf_len]u8, len: usize, whole: bool) void {
+    var n = len;
+    if (!whole) {
+        @memcpy(buf[n..][0..truncation_marker.len], truncation_marker);
+        n += truncation_marker.len;
     }
+    if (stderr_enabled) std.debug.print("{s}", .{buf[0..n]});
+    if (@atomicLoad(bool, &sink_active, .acquire)) writeToSink(buf[0..n]);
 }
 
 pub fn info(comptime fmt: []const u8, args: anytype) void {

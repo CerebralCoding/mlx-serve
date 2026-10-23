@@ -22,6 +22,7 @@ test {
     _ = @import("host/plugin_host_impl.zig");
     _ = @import("sdk/util/os_mutex.zig");
     _ = @import("sdk/util/crt.zig");
+    _ = @import("sdk/util/rtfmt.zig");
     _ = @import("env.zig");
     _ = @import("sdk/util/win_io.zig");
     _ = @import("sdk/quant/gguf/claim.zig");
