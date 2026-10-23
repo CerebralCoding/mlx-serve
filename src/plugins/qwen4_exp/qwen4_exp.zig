@@ -22,7 +22,6 @@ pub const EmbeddedInfo = embedded_ple.EmbeddedInfo;
 pub const inspectEmbedded = embedded_ple.inspectEmbedded;
 pub const embeddedTensorName = embedded_ple.embeddedTensorName;
 
-const MASK64: u64 = 0xFFFF_FFFF_FFFF_FFFF;
 const SPLITMIX_GAMMA: u64 = 0x9E3779B97F4A7C15;
 const SPLITMIX_M1: u64 = 0xBF58476D1CE4E5B9;
 const SPLITMIX_M2: u64 = 0x94D049BB133111EB;
@@ -458,8 +457,7 @@ pub const NgramTable = struct {
 
     /// Read the whole table through its fds once, in the background, so the
     /// first prompt's PLE gathers hit a warm page cache. Call only once the
-    /// table sits at its final address (the thread holds `self`). Off via
-    /// MLX_SERVE_NGRAM_WARM=0.
+    /// table sits at its final address (the thread holds `self`).
     pub fn startWarm(self: *NgramTable) void {
         if (self.warmRegion(0) == null or self.warm_thread != null) return;
         // The off arm says so: a cold first request faults rows off the SSD (38k prompt: 174 s vs 55 s).

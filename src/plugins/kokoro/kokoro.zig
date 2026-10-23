@@ -35,6 +35,7 @@
 //! way ACE-Step's Snake/encode path is.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 
@@ -2177,10 +2178,6 @@ pub const Engine = struct {
         self.allocator.destroy(self);
     }
 
-    pub fn sampleRate(self: *const Engine) u32 {
-        return self.model.cfg.sample_rate;
-    }
-
     pub fn hasVoice(self: *const Engine, spec: []const u8) bool {
         // A blend is valid only if EVERY named voice is.
         var it = std.mem.splitScalar(u8, spec, ',');
@@ -2553,7 +2550,7 @@ test "kokoro: BiLSTM reverse half reads the sequence backwards" {
 // Weights come from `tests/convert_kokoro_weights.py`.
 
 fn liveModelDir() ?[]const u8 {
-    const p = std.c.getenv("KOKORO_TEST_MODEL") orelse return null;
+    const p = env.get(.KOKORO_TEST_MODEL) orelse return null;
     return std.mem.span(p);
 }
 
@@ -2641,7 +2638,7 @@ test "kokoro: live voice blending averages the packs" {
 //   KOKORO_TEST_MODEL=<converted dir> KOKORO_FIXTURES=<dump dir>
 
 fn fixturesDir() ?[]const u8 {
-    const p = std.c.getenv("KOKORO_FIXTURES") orelse return null;
+    const p = env.get(.KOKORO_FIXTURES) orelse return null;
     return std.mem.span(p);
 }
 

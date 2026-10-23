@@ -192,7 +192,7 @@ pub fn sideCopy(o: *Owned, l: Linear, layer: u32, layers: u32, s: mlx.mlx_stream
     if (l.s.ctx != null and l.mode == .affine and l.bits == 8) dense = try daq.denseFromAffine8(s, l.w, l.s, l.b, l.group_size);
     const src = if (dense.ctx != null) dense else l.w;
     if (!daq.decodeAttnQuantEligible(mlx.getShape(src), mlx.mlx_array_dtype(src), l.s.ctx != null and dense.ctx == null)) return .{};
-    const nvfp4 = dense.ctx != null or daq.attnDqUseNvfp4(layer, layers, daq.attnDqNvfp4FromEnv());
+    const nvfp4 = dense.ctx != null or daq.attnDqUseNvfp4(layer, layers);
     const copy = (try daq.buildAttnDqCopy(s, src, nvfp4)) orelse return .{};
     const out: Linear = .{ .w = copy.w, .s = copy.s, .b = copy.b, .bits = copy.bits, .group_size = copy.group_size, .mode = copy.mode };
     try o.linear(out);

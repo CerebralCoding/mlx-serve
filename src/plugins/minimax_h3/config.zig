@@ -74,7 +74,7 @@ pub const DIT_RESIDENT_PCT: u64 = 65;
 pub const ROW_BYTES: u64 = 384 * 1024;
 pub const REQUEST_BASE_BYTES: u64 = 1 << 30;
 
-/// The DiT term. `precompute` mirrors MINIMAX_H3_ADALN_PRECOMPUTE: with it off the modulation weights are never freed
+/// The DiT term. `precompute` is false for a resident DiT, whose modulation weights are never freed
 /// and the whole file stays resident, so the shed size would under-bill by ~12 GiB into an uncatchable Metal OOM.
 pub fn ditResidentBytes(dit_file: u64, precompute: bool) u64 {
     if (!precompute) return dit_file;
@@ -246,7 +246,7 @@ test "h3 DiT term sheds the AdaLN weights precompute frees — unless it is off"
     const eight_bit: u64 = 32 * GB;
     try std.testing.expect(ditResidentBytes(eight_bit, true) < eight_bit);
     try std.testing.expect(ditResidentBytes(eight_bit, true) >= 20 * GB);
-    // MINIMAX_H3_ADALN_PRECOMPUTE=0 never frees them, so the whole file stays
+    // A resident DiT never frees them, so the whole file stays
     // resident and billing the shed size would be an uncatchable OOM.
     try std.testing.expectEqual(eight_bit, ditResidentBytes(eight_bit, false));
 }

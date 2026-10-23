@@ -1,6 +1,7 @@
 //! The QSA block score sheet: the fused NAX kernel (`msv_qsa_score`), its layouts and arms, and the composed chain.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const crt = @import("../../../sdk/util/crt.zig");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -97,7 +98,7 @@ fn qsaScoreTf32Enabled() bool {
     if (qsa_score_tf32_override) |v| return v;
     if (qsa_score_tf32_env) |v| return v;
     const v = blk: {
-        const raw = std.c.getenv("MLX_ENABLE_TF32") orelse break :blk true;
+        const raw = env.get(.MLX_ENABLE_TF32) orelse break :blk true;
         break :blk qsaScoreTf32ValueOn(std.mem.sliceTo(raw, 0));
     };
     qsa_score_tf32_env = v;
@@ -336,7 +337,7 @@ fn qsaDumpBlocksPath() ?[]const u8 {
     }
     if (qsa_dump_blocks_read) return qsa_dump_blocks_cached;
     qsa_dump_blocks_read = true;
-    const raw = std.c.getenv("QWEN4_DUMP_QSA_BLOCKS") orelse return null;
+    const raw = env.get(.QWEN4_DUMP_QSA_BLOCKS) orelse return null;
     if (!diagEnvValueOn(raw)) return null;
     const s = std.mem.sliceTo(raw, 0);
     qsa_dump_blocks_cached = s;
@@ -438,9 +439,9 @@ pub fn qsaSelectComposedOps(s: mlx.mlx_stream, scores: mlx.mlx_array, vis3: mlx.
 /// prefill selection runs in row chunks so 4096 rows x 64k blocks x 4 heads
 /// (4.3 GB at 256k) never materializes at once.
 ///
-/// A lever because at long context it decides the prefill's row chunk: at kv 383k (nb ~95.8k)
-/// 256 MB leaves room for ~171 rows, so a 4096-token chunk is re-split into 24 indexer passes.
-/// `MLX_SERVE_QSA_SCORE_SHEET_MB` moves it; the forward and the memory bill both read it
+/// At long context it decides the prefill's row chunk: at kv 383k (nb ~95.8k) 256 MB leaves room
+/// for ~171 rows, so a 4096-token chunk is re-split into 24 indexer passes. The forward and the
+/// memory bill both read it
 /// through `qsaScoreRowsPerChunk`, so a wider sheet is billed, never just spent.
 pub const QSA_SCORE_SHEET_BUDGET_MB_DEFAULT: u64 = 256;
 

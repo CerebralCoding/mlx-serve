@@ -2,6 +2,8 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+An env lever a story names that `src/env.zig` no longer lists was retired once its arm was decided: the default it measured stays, the opt-in that lost was deleted.
+
 ### A restored LiLiCorr context had no correlation anchor
 
 Defect: a request restored from the prefix cache failed under LiLiCorr. Cause: snapshots keep the drafter K/V but not the latest target feature. Fix: take one plain round to capture it, then resume speculation; layout unchanged. Guard: `lilicorr missing restored anchor takes a plain round and recovers it`.
@@ -2304,10 +2306,8 @@ offset.** Chunk 1 has `total_kv == seq_len`, which the span always covers, so
 nothing is trimmed. With the default 8192 chunk a serial arch needs a prompt
 past ~16k before any chunk trims — an 8k prompt prefills in ONE chunk and the
 trim-on/trim-off arms agree for the wrong reason. `slidingViewFor` therefore
-logs a one-shot `[sliding] block trim engaged` line, and
-`tests/test_sliding_window_trim.sh` asserts its presence in the ON arm's log and
-its ABSENCE in the OFF arm's — an A/B arm is proven by an engagement line in its
-own log, never by the env it was launched with.
+logs a one-shot `[sliding] block trim engaged` line: an A/B arm is proven by an
+engagement line in its own log, never by the env it was launched with.
 
 **Not covered here.** The diffusion canvas path uses a different convention
 (`sliding_window - 1`, plus the whole canvas, which is not a causal tail), and

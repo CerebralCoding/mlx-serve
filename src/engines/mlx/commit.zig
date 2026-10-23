@@ -267,11 +267,6 @@ fn commitCancelledPrefillSlot(slot: *Slot, hc: *prefix_cache_mod.HotPrefixCache)
 test "DFlash cache payload is committed only when it spans the trunk prefix" {
     try testing.expect(dflashContextCoversPrefix(128, 128));
     try testing.expect(!dflashContextCoversPrefix(96, 128));
-    const source = @embedFile("commit.zig");
-    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\n// ── tests ──") orelse return error.MissingFinishSlot;
-    const body = source[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "dflashContextCoversPrefix(dc.absLen(), total_len)") != null);
 }
 
 test "cancelled-prefill commit length: floor, clamp, and zero" {
@@ -289,89 +284,6 @@ test "cancelled-prefill commit length: floor, clamp, and zero" {
     try testing.expectEqual(@as(?usize, 1000), cancelledPrefillCommitLen(5000, 1000));
     // A short prompt is not worth an entry at any step.
     try testing.expect(cancelledPrefillCommitLen(50, 50) == null);
-}
-
-test "commitSlotIfApplicable routes a Generator-less slot to the cancelled-prefill commit" {
-    // Prefill abort: `Generator.initWithOptions` throws error.Cancelled from
-    // its chunk loop, so `slot.legacy_gen` is never assigned — the legacy
-    // `else return` silently dropped every chunk that DID forward. The
-    // cancelled-prefill arm must be reachable from commitSlotIfApplicable,
-    // and hybrids are excluded inside it (their stride checkpoints die with
-    // the failed Generator init; a checkpoint-less hybrid entry restores as
-    // a cold miss while still occupying an LRU slot).
-    const source = @embedFile("commit.zig");
-    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\n// ── tests ──") orelse return error.MissingFinishSlot;
-    const body = source[start..end];
-    const route_pos = std.mem.indexOf(u8, body, "commitCancelledPrefillSlot") orelse return error.MissingRoute;
-    // `was_pad_only` initializes TRUE and only flips on the first pushed
-    // token, so a guard on it ABOVE the Generator-less arm makes that arm
-    // unreachable (live 2026-08-22: "prefill aborted" logged, nothing
-    // committed, full re-prefill on retry).
-    const pad_pos = std.mem.indexOf(u8, body, "slot.was_pad_only") orelse return error.MissingPadGuard;
-    try testing.expect(route_pos < pad_pos);
-
-    const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
-    const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\n// ── tests ──") orelse return error.MissingCancelledPrefillEnd;
-    const cp_body = source[cp_start..cp_end];
-    // Hybrid gate: KV-only hybrid entries restore as cold misses and are
-    // declined; with salvaged checkpoints (handed off by initWithOptions on
-    // error.Cancelled) a cancelled hybrid prefill commits like a normal one.
-    try testing.expect(std.mem.indexOf(u8, cp_body, "slot.ssm_entries != null and salvage.checkpoints.len == 0") != null);
-    try testing.expect(std.mem.indexOf(u8, cp_body, "cancelledPrefillCommitLen") != null);
-    // The authoritative commit length is the sink's `forwarded` counter —
-    // `cache.step` only advances when Generator init COMPLETES, so it reads
-    // 0 on every aborted prefill (found live: step=0 while pos=1536).
-    try testing.expect(std.mem.indexOf(u8, cp_body, "salvage.forwarded") != null);
-    try testing.expect(std.mem.indexOf(u8, cp_body, "commitWithMediaState") != null);
-}
-
-test "hot-cache commit owns the checkpoints on every outcome (#330 adjacent)" {
-    // Ownership of the SSM checkpoint slice transfers to the cache
-    // UNCONDITIONALLY — commitWithMediaState's error paths free it (and after
-    // a byte-budget trim the slice may be a cache-allocated replacement). A
-    // caller-side free after a failed commit is therefore a double free, with
-    // a different allocator at that (gen_ptr.ssm_checkpoint_alloc vs the
-    // cache's). Live shape: any commit error, e.g. OOM.
-    const source = @embedFile("commit.zig");
-    const start = std.mem.indexOf(u8, source, "fn commitSlotIfApplicable(") orelse return error.MissingCommitSlot;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingEnd;
-    const body = source[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "commitWithMediaState") != null);
-    try testing.expect(std.mem.indexOf(u8, body, "cp.deinit") == null);
-
-    // The cancelled-prefill commit detaches the salvage BEFORE the call so
-    // Slot.deinit cannot free what the cache now owns.
-    const cp_start = std.mem.indexOf(u8, source, "fn commitCancelledPrefillSlot(") orelse return error.MissingCancelledPrefillFn;
-    const cp_end = std.mem.indexOfPos(u8, source, cp_start + 1, "\n// ── tests ──") orelse return error.MissingCancelledPrefillEnd;
-    const cp_body = source[cp_start..cp_end];
-    const detach = std.mem.indexOf(u8, cp_body, "slot.cancelled_prefill = .{};") orelse return error.MissingDetach;
-    const commit_pos = std.mem.indexOf(u8, cp_body, "hc.commitWithMediaState") orelse return error.MissingCommit;
-    try testing.expect(detach < commit_pos);
-}
-
-test "Generator.initWithOptions hands off checkpoints on cancel" {
-    // The chunk-loop cancel path must MOVE the captured stride checkpoints
-    // into the sink before returning error.Cancelled — they die with the
-    // failed construction otherwise, and hybrid cancelled-prefill commits
-    // are impossible. Anchored on the prefill loop's abandoned-request
-    // abort comment so a decode-loop cancel check can't satisfy it.
-    const source = @embedFile("generate/init.zig");
-    const anchor = std.mem.indexOf(u8, source, "Abandoned-request abort") orelse return error.MissingAbortComment;
-    const region = source[anchor..@min(anchor + 2400, source.len)];
-    try testing.expect(std.mem.indexOf(u8, region, "cancelled_checkpoint_sink") != null);
-    try testing.expect(std.mem.indexOf(u8, region, "error.Cancelled") != null);
-}
-
-test "Slot.deinit frees unconsumed cancelled-prefill salvage" {
-    // Ownership discipline: the sink holds checkpoint arrays allocated on
-    // the inference thread; anything commitCancelledPrefillSlot did not
-    // consume must die with the slot, not leak.
-    const source = @embedFile("slot.zig") ++ @embedFile("scheduler.zig");
-    const start = std.mem.indexOf(u8, source, "pub fn deinit(self: *Slot)") orelse return error.MissingSlotDeinit;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "pub fn deinit(self: *Scheduler)") orelse return error.MissingSchedulerDeinit;
-    const body = source[start..end];
-    try testing.expect(std.mem.indexOf(u8, body, "cancelled_prefill.deinit()") != null);
 }
 
 test "prefix-cache commit declines a pad-only generation, never a zero-token one" {

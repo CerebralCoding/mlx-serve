@@ -337,38 +337,6 @@ if [ -n "$EXPECT_AUTO_DEPTH" ]; then
 fi
 stop_server
 
-echo "── fixed-depth server (MLX_SERVE_MTP_ADAPTIVE=0) ──"
-# The env kill switch must fully revert: legacy cap 3 (not the adaptive auto
-# cap) and zero chunk-B extensions on the same echo workload.
-pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
-sleep 1
-MLX_SERVE_MTP_ADAPTIVE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" --no-pld --no-drafter --log-level info >"$LOG" 2>&1 &
-SERVER_PID=$!
-srv_wait_health "http://127.0.0.1:$PORT" 120 1 || true
-# Same readiness rule as start_server: /health is up before the load ends.
-MODEL_MB=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
-READY_SECS=$(( 300 + ${MODEL_MB:-0} / 100 ))
-for _ in $(seq 1 $((READY_SECS / 3)) ); do
-    grep -q "Model ready (loaded on inference thread)" "$LOG" && break
-    kill -0 "$SERVER_PID" 2>/dev/null || break
-    sleep 3
-done
-curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' -d "{
-    $OPTIN\"model\":\"default\",\"stream\":false,\"temperature\":0,\"max_tokens\":160,
-    \"messages\":[{\"role\":\"user\",\"content\":\"$ECHO_PROMPT\"}]}" >/dev/null
-FIXED_STATS=$(grep -o '\[spec-stats\] mode=mtp.*' "$LOG" | tail -1)
-FIXED_EXT=$(echo "$FIXED_STATS" | grep -o 'ext_rounds=[0-9]*' | cut -d= -f2)
-FIXED_DEPTH=$(echo "$FIXED_STATS" | grep -o ' depth=[0-9]*' | grep -o '[0-9]*')
-# The cap the server resolved (3 by default; a Hadamard pack pins 2).
-CAP_DEPTH=$(grep -o 'MTP head ready (depth=[0-9]*' "$LOG" | tail -1 | grep -o '[0-9]*$')
-if [ "${FIXED_EXT:-1}" = "0" ] && [ "${FIXED_DEPTH:-0}" = "${CAP_DEPTH:-3}" ]; then
-    echo "PASS [MLX_SERVE_MTP_ADAPTIVE=0 reverts to fixed depth ${CAP_DEPTH:-3}, no extension]"; PASS=$((PASS+1))
-else
-    echo "FAIL [adaptive kill switch]: depth=${FIXED_DEPTH:-none} ext_rounds=${FIXED_EXT:-none} (want depth=${CAP_DEPTH:-3} ext_rounds=0)"
-    FAIL=$((FAIL+1))
-fi
-stop_server
-
 echo
 echo "RESULT: $PASS passed, $FAIL failed"
 [ "$FAIL" -eq 0 ] || exit 1

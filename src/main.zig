@@ -240,7 +240,7 @@ fn printUsage(io: std.Io) void {
         \\  --ane-prefill       Offload a share of each prefill chunk's dense
         \\                        MLP rows to the Neural Engine (qwen3_5-family
         \\                        only; int8/fp16, lossy; needs >= 96 GB RAM).
-        \\                        MLX_SERVE_ANE_SPLIT tunes the share (0.40).
+        \\                        The share is measured per silicon.
         \\  --int8-qk           Run the hd-256 prefill attention of dense Qwen
         \\                        models with int8 Q/K (NAX GPUs, lossy, wins
         \\                        from ~32k tokens). Also MLX_SERVE_INT8_QK=1.
@@ -297,10 +297,8 @@ fn printUsage(io: std.Io) void {
         \\                      LOSSY: a real requantization, applied to
         \\                      decode/verify steps only; prefill keeps the
         \\                      dense weights. Default ON; --no-… restores
-        \\                      exact dense decode. Env tuning:
-        \\                      MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM=<layer>
-        \\                      moves the 4-bit boundary, =off keeps the whole
-        \\                      stack INT8.
+        \\                      exact dense decode. The last fifth of the
+        \\                      layers reads 4-bit, the rest INT8.
         \\  --mtp-min-depth <n> Fewest tokens an MTP round drafts, 1..8
         \\                        (default 1). Every depth the planner picks
         \\                        stays inside --mtp-min-depth..--mtp-max-depth;
@@ -309,9 +307,7 @@ fn printUsage(io: std.Io) void {
         \\                        adaptive — the EV controller plans depth
         \\                        per round up to 8 on eligible M5 NAX targets,
         \\                        otherwise 6, lower on silicon with a measured
-        \\                        verify-width cliff; MLX_SERVE_MTP_ADAPTIVE=0
-        \\                        reverts to the fixed windowed controller,
-        \\                        cap 3). A --mtp-min-depth above that default
+        \\                        verify-width cliff). A --mtp-min-depth above that default
         \\                        lifts it. --mtp-depth is the old spelling.
         \\                        Each machine finds its own range.
         \\  --mtp-typical <d>  Opt-in lossy typical MTP acceptance (d > 0).
@@ -903,8 +899,7 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, args[i], "--ane-prefill")) {
             // ANE prefill-MLP offload (perf-plan-aug-17 P5): opt-in, lossy
             // by design (int8 fp16 datapath). Eligibility + machine gates
-            // are named [ane] log lines at load; MLX_SERVE_ANE_SPLIT tunes
-            // the row share.
+            // are named [ane] log lines at load.
             ane_prefill = true;
         } else if (std.mem.eql(u8, args[i], "--ane")) {
             ane_serve = true;

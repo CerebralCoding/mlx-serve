@@ -3,6 +3,7 @@
 //! the conformance suite; the model example's KV cache is read and written across the dylib boundary.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const loader = @import("loader.zig");
 const cli = @import("cli.zig");
 const conformance = @import("../../sdk/testing/conformance.zig");
@@ -20,7 +21,7 @@ const Installed = struct {
     set: loader.Set,
 
     fn init() !Installed {
-        const built = std.mem.span(std.c.getenv("MLX_SERVE_KIT_PLUGINS") orelse return error.SkipZigTest);
+        const built = std.mem.span(env.get(.MLX_SERVE_KIT_PLUGINS) orelse return error.SkipZigTest);
         var tmp = testing.tmpDir(.{});
         errdefer tmp.cleanup();
         var buf: [std.fs.max_path_bytes]u8 = undefined;

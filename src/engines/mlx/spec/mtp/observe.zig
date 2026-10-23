@@ -7,7 +7,6 @@ const group_planner = @import("../mtp_group_planner.zig");
 const Generator = @import("../../generate/generator.zig").Generator;
 const MTP_EV_WARMUP_ROUNDS = @import("depth.zig").MTP_EV_WARMUP_ROUNDS;
 const MtpCostSource = @import("ev_plan.zig").MtpCostSource;
-const dflashAcceptWidth = @import("ev_plan.zig").dflashAcceptWidth;
 const mtpLowAcceptStreak = @import("adaptive.zig").mtpLowAcceptStreak;
 const mtpProbePeriod = @import("planner.zig").mtpProbePeriod;
 const mtpRegimeObserve = @import("regime.zig").mtpRegimeObserve;
@@ -97,19 +96,6 @@ pub fn mtpRoundEndObserve(self: *Generator, m: u32, tokens: u32, two_chunk: bool
         self.mtp_low_accept = mtpLowAcceptStreak(self.mtp_low_accept, self.mtp_tok_ema);
     }
     self.specObserveRound(m, wall, tok, ev_planned and !two_chunk, shape_changed);
-}
-
-pub fn dflashAcceptChoose(self: *Generator, ch: *round_cost.WidthChooser) round_cost.WidthChooser.Decision {
-    const t = &self.xfm.round_cost;
-    const src = MtpCostSource.init(self.mtp_ev_costs, self.mtpKvLen(), t);
-    const a = ch.accept[0..ch.max_width];
-    ch.current = dflashAcceptWidth(a, ch.max_width, src, ch.current);
-    const up = ch.current + 1;
-    if (ch.current == 0 or up > ch.max_width or !src.fromTable()) return .{ .width = ch.current, .trial = false };
-    // The probe is what refreshes a[current]; a width nobody has timed is learned at once.
-    if (t.rawMs(up, src.bucket) == null) ch.trial.startAt(ch.rounds);
-    const probe = ch.trial.force(ch.rounds, mtpProbePeriod(a, src, ch.current), round_cost.schedulePeriodReread(t.layout));
-    return .{ .width = if (probe) up else ch.current, .trial = probe };
 }
 
 /// Feed the model's round-cost table (`Transformer.round_cost`, shared

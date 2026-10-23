@@ -6,6 +6,7 @@
 //! the head's tensors). Best effort: any failure logs and the model serves
 //! without MTP.
 const std = @import("std");
+const env = @import("../../env.zig");
 const crt = @import("../../sdk/util/crt.zig");
 const build_options = @import("build_options");
 const model_mod = @import("../../engines/mlx/model.zig");
@@ -116,7 +117,7 @@ fn localDonor(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8) ?
     if (std.fs.path.dirname(model_dir)) |org| if (std.fs.path.dirname(org)) |root| {
         candidates[0] = std.fs.path.join(allocator, &.{ root, DONOR_REPO }) catch null;
     };
-    if (std.c.getenv("HOME")) |home| {
+    if (env.get(.HOME)) |home| {
         candidates[1] = std.fmt.allocPrint(allocator, "{s}/.mlx-serve/models/{s}", .{ std.mem.span(home), DONOR_REPO }) catch null;
     }
     var found: ?[]u8 = null;

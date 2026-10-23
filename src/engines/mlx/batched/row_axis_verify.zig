@@ -252,8 +252,6 @@ pub fn takeJoinedVerifyLogits(self: *Transformer) mlx.mlx_array {
     return out;
 }
 
-const VerifyRetentionResult = struct { logits: []mlx.mlx_array, build_ms: f64, eval_ms: f64 };
-
 // ── tests ──
 
 pub fn expectRowsByteEqual(alloc: std.mem.Allocator, s: mlx.mlx_stream, a: mlx.mlx_array, b: mlx.mlx_array, tag: []const u8) !void {

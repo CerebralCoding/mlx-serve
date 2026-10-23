@@ -2,6 +2,8 @@
 
 Full histories: live failures, measurements, diagnosis ladders, dead ends. The distilled RULES live in the root CLAUDE.md "Rules" section — when a rule changes, update the story here too. New gotchas in this domain: add the 1-3 line rule to root, the full story here.
 
+An env lever a story names that `src/env.zig` no longer lists was retired once its arm was decided: the default it measured stays, the opt-in that lost was deleted.
+
 ### Literal HTML became a RADIO video attachment
 
 Defect: a `<video>` in message text became a media placeholder (400 on text-only requests, an extra atom beside a real clip). Cause: the rendered prompt was rewritten `<video>` → `<img>`. Fix: the sentinel is emitted only when serializing an attached video part (`ChatConfig.video_placeholder`). Guards: `RADIO video placeholders` tests, media-atom corpus, `tests/test_nemotron_bolt.py`.

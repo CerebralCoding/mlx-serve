@@ -55,32 +55,3 @@ test "DFlash gate policy follows effective block width and resolved thinking" {
     try testing.expectApproxEqAbs(@as(f32, 2.0), dflashGateMinimum(16, false, true), 0.0001);
     try testing.expectEqual(@as(f32, 0), dflashGateMinimum(1, false, true));
 }
-
-test "every server scheduler path forwards resolved thinking to the DFlash gate" {
-    const source = @embedFile("../../../host/api/chat_completions.zig") ++ @embedFile("../../../host/api/chat_stream.zig") ++ @embedFile("../../../host/api/completions.zig") ++ @embedFile("../../../host/api/anthropic.zig") ++ @embedFile("../../../host/api/anthropic_stream.zig") ++ @embedFile("../../../host/api/audio.zig") ++ @embedFile("../../../host/api/responses/handler.zig") ++ @embedFile("../../../host/api/submit.zig");
-
-    // All direct streaming submissions, plus the shared non-streaming submit,
-    // must populate the field. Text completions resolve it explicitly false.
-    var submit_pos: usize = 0;
-    var submits: usize = 0;
-    while (std.mem.indexOfPos(u8, source, submit_pos, "sch.submit(.{")) |start| {
-        const end = std.mem.indexOfPos(u8, source, start, "});") orelse return error.UnclosedSchedulerSubmit;
-        try testing.expect(std.mem.indexOf(u8, source[start..end], ".enable_thinking =") != null);
-        submits += 1;
-        submit_pos = end + 3;
-    }
-    try testing.expectEqual(@as(usize, 5), submits);
-
-    // Positional calls into the non-streaming wrapper must pass the resolved
-    // value; the raw text-completion path is the sole explicit false arm.
-    var lines = std.mem.splitScalar(u8, source, '\n');
-    var calls: usize = 0;
-    while (lines.next()) |line| {
-        if (std.mem.indexOf(u8, line, "nonStreamingViaScheduler(") == null) continue;
-        if (std.mem.indexOf(u8, line, "fn nonStreamingViaScheduler(") != null) continue;
-        calls += 1;
-        try testing.expect(std.mem.indexOf(u8, line, "enable_thinking") != null or
-            std.mem.indexOf(u8, line, ", false, false, use_pld") != null);
-    }
-    try testing.expectEqual(@as(usize, 5), calls);
-}

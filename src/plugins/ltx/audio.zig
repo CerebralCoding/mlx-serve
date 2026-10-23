@@ -20,6 +20,7 @@
 //! layout at use (see `conv1d`/`conv2d`/`convTranspose1d`).
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const ltx = @import("video.zig");
@@ -325,7 +326,7 @@ fn freeReplace(x: *mlx.mlx_array, new: mlx.mlx_array) void {
 }
 
 fn dbg(tag: []const u8, x: mlx.mlx_array) void {
-    if (std.c.getenv("LTX_AUDIO_TRACE") == null) return;
+    if (env.get(.LTX_AUDIO_TRACE) == null) return;
     const sh = mlx.getShape(x);
     std.debug.print("[ltx-audio-trace] {s}: ndim={d} shape=", .{ tag, sh.len });
     for (sh) |d| std.debug.print("{d},", .{d});
@@ -1104,7 +1105,7 @@ test "antiAliasSnakeBeta is length-preserving" {
 // LTX_AUDIO_TEST_MODEL at the q4 model dir (with audio_vae.safetensors +
 // vocoder.safetensors).
 fn loadAudioComp(alloc: std.mem.Allocator) !?ltx.Component {
-    const raw = std.c.getenv("LTX_AUDIO_TEST_MODEL") orelse return null;
+    const raw = env.get(.LTX_AUDIO_TEST_MODEL) orelse return null;
     const dir = std.mem.span(raw);
     var ap: [1024]u8 = undefined;
     var vp: [1024]u8 = undefined;

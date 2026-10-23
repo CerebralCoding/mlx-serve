@@ -4,6 +4,7 @@
 //! are the decoder base with a bidirectional mixer and no head.
 
 const std = @import("std");
+const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const abi = @import("../../abi/plugin.zig");
 const block = @import("block.zig");
@@ -50,6 +51,7 @@ pub fn Encoder(comptime spec: anytype) type {
             if (run.mode != .prefill) return error.EncoderPrefillOnly;
             var c = run.ctx(g, shared);
             var h = try Embed.forward(&w.embed, &c, ids);
+            var dt = mlx.DtypeTrace.begin("encoder", h, null);
             for (w.layers, 0..) |*L, i| {
                 var lg = g.scope();
                 defer lg.deinit();
@@ -61,9 +63,11 @@ pub fn Encoder(comptime spec: anytype) type {
                 const old = h;
                 h = try g.keep(m);
                 g.drop(old);
+                dt.layer(h, i);
                 try run.capture(g, @intCast(i), h);
                 try run.cadence(i, w.layers.len, h);
             }
+            dt.end(h);
             return .{ .hidden = h };
         }
 

@@ -32,7 +32,6 @@ pub const HOP_LENGTH: u32 = 800;
 pub const LATENTS_PER_SECOND: u32 = SAMPLE_RATE / HOP_LENGTH; // 40
 pub const VAE_LATENT_CHANNELS: u32 = 32;
 pub const LATENT_DIM: u32 = 2048;
-pub const DECODER_DIM: u32 = 1024;
 
 /// BigVGAN upsample rates; product 800 takes 40 Hz latents to 32 kHz.
 pub const UP_RATES = [_]c_int{ 5, 5, 2, 2, 2, 2, 2 };

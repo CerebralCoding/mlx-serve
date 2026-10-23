@@ -37,8 +37,7 @@ const moeRowsFusedEnabled = @import("gather_qmv_rows.zig").moeRowsFusedEnabled;
 // replaces three, and the [K, hidden] round-trip never happens.
 //
 // Each simdgroup owns one top-K slot and computes ROWS consecutive output
-// rows for it (mlxfast tuned 1-vs-4 rows per simd; 4 won). Kill switch
-// MLX_SERVE_MOE_DOWN_REDUCE_FUSED=0; bit-identity pinned by the
+// rows for it (mlxfast tuned 1-vs-4 rows per simd; 4 won). Bit-identity pinned by the
 // "down+reduce" parity tests.
 fn gatherQmvDownReduceSource(comptime nvfp4: bool) [:0]const u8 {
     // LPR lanes share one output row and ROWS = 32 / LPR rows ride one simdgroup

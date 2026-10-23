@@ -50,9 +50,7 @@ const getGdnKernelSeq = @import("kernels.zig").getGdnKernelSeq;
 // S < 3 rows of the next conv state come from the OLD state (row r reads
 // concat(conv_state, qkv)[r + S]); before this generalization the kernel
 // was gated to S >= 3 and decode ran the composed chain. Bit-identity with
-// the composed chain is the acceptance bar; kill switches
-// MLX_SERVE_GDN_PREWORK=0 (whole kernel) and MLX_SERVE_GDN_DECODE_FUSED=0
-// (S < 3, in-kernel gate, norm-gate: the pre-fusion decode path).
+// the composed chain is the acceptance bar.
 const GDN_KERNEL_HEADER = kernelSource("kernels/gdn/log1p.metal");
 
 const GDN_PREWORK_SOURCE = kernelSource("kernels/gdn/gdn_prework.metal");

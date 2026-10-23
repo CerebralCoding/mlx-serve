@@ -1260,8 +1260,8 @@ const AdalnW = struct {
     modalities: u32,
     /// Turbo delta on the projection. Input is silu(t_emb) — exactly what the
     /// reference node re-injects on pruned bases — so hooking `forward` covers
-    /// BOTH the precompute path and the per-step MINIMAX_H3_ADALN_PRECOMPUTE=0
-    /// path, and the pair is freed with the weight after precompute.
+    /// BOTH the precompute path and the per-step path a resident DiT takes,
+    /// and the pair is freed with the weight after precompute.
     lora: lora_mod.Slot = .{},
 
     fn load(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, cfg: Config, expand: u32, modalities: u32, dt: mlx.mlx_dtype, s: S) !AdalnW {
@@ -2056,8 +2056,6 @@ pub const Model = struct {
     /// Profiling arm for the NEXT forward; `.none` in production (the field is
     /// only ever set by the profile ladder in `generate`).
     ablate: Ablate,
-    /// Sparse-attention layer policy (`MINIMAX_H3_SPARSE_ATTN`); `.off` until
-    /// `generate` opts in.
     /// Set for a job whose steps are split with a cluster worker (`h3_split`).
     split: ?*const h3_split.RowSplit = null,
     /// A VSA student's tile plan for the current run (`h3_vsa`).
@@ -2403,7 +2401,7 @@ pub const Model = struct {
     ///
     /// NOT bit-identical to per-step modulation: the AdaLN GEMM runs at
     /// M = n_ts instead of M = 2-3, and kernel selection differs by shape
-    /// (the sanctioned qmv-vs-qmm class). Kill: MINIMAX_H3_ADALN_PRECOMPUTE=0.
+    /// (the sanctioned qmv-vs-qmm class).
     pub fn precomputeAdaln(self: *Model, ts: []const f64, s: S) !void {
         std.debug.assert(self.adaln_tables == null);
         const a = self.allocator;
@@ -3494,9 +3492,8 @@ pub const GenRequest = struct {
     /// latents as cond rows.
     ///
     /// The reference ALSO splices each into the Qwen encoding as a
-    /// `<Picture i>: <vision block>`. That path is built and parity-tested but
-    /// DEFAULT-OFF here: it measured worse on this checkpoint (see the A/B
-    /// table in `generate`). `MINIMAX_H3_VISION_BLOCKS=1` turns it on.
+    /// `<Picture i>: <vision block>`. We do not: it measured worse on this
+    /// checkpoint.
     keyframes: []const Keyframe = &.{},
     /// ref2va references in `resolveRefs` order, already decoded at the
     /// canvases it resolved. Unlike the fl2va keyframes these DO carry vision
@@ -4290,8 +4287,8 @@ fn generateOne(
         try mlx.check(mlx.mlx_array_eval(refined));
         log.info("[minimax-h3] dit loaded in {d} ms, text refined in {d} ms\n", .{ load_ms, phase_timer.lapMs() });
 
-        // ── attention broadcast (PAB-style, OPT-IN) ──
-        // MINIMAX_H3_ATTN_BCAST=<k> recomputes every block's attention branch
+        // ── attention broadcast (PAB-style, the fast recipe) ──
+        // `speed.bcast_k` = k recomputes every block's attention branch
         // only on every k-th mid-schedule step and reuses the cached output
         // between — the branch is ~70% of a 768p step. Cache cost: one
         // [S, hidden] bf16 per block (~20 GB at 768p, ~1.4 GB at 256px).
@@ -4332,8 +4329,7 @@ fn generateOne(
         // under the threshold, reuse the previous velocity instead of running
         // the 50-block DiT. The audio velocity is re-scaled to the current
         // sigma's slope so the reuse stays on the audio stream's true ODE.
-        // MINIMAX_H3_STEP_CACHE=<thresh> opts in (0.08 is a sane start);
-        // never skips the first two or the last step, caps consecutive skips.
+        // `speed.step_cache` is the threshold; never skips the first two or the last step, caps consecutive skips.
         const sc_thresh: f64 = speed.step_cache;
         var sc_v_video: ?mlx.mlx_array = null;
         defer if (sc_v_video) |x| {
@@ -5038,7 +5034,7 @@ test "minimax h3 live: generates a clip" {
 }
 
 
-fn envU32(name: [:0]const u8, dflt: u32) u32 {
+fn envU32(comptime name: []const u8, dflt: u32) u32 {
     const v = envStr(name) orelse return dflt;
     return std.fmt.parseInt(u32, v, 10) catch dflt;
 }

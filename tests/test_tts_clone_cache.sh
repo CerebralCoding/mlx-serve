@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # test_tts_clone_cache.sh — the speaker-embedding cache (voice-clone path) never changes a voice. [1] same clip + text
 # twice -> byte-identical WAVs and a `speaker embedding: cache hit` line (equality alone cannot see a silent uncached
-# fallback); [2] a different clip -> a different WAV (no key collision); [3] a MLX_SERVE_TTS_SPK_CACHE=0 boot ->
-# byte-identical to cache-on with no hit line; [4] cache-on and -off agree on the different clip; [5] `warm_only`
-# pre-warm: miss then hit, the first synthesis after a warm is a hit with a byte-identical WAV, and warm_only without
+# fallback; the first request is the uncached miss); [2] a different clip -> a different WAV (no key collision);
+# [3] `warm_only` pre-warm: miss then hit, the first synthesis after a warm is a hit with a byte-identical WAV, and warm_only without
 # ref_audio is a named 400. Synthetic deterministic clips.
 #
 #   TTS_MODEL=<Qwen3-TTS -Base dir> ./tests/test_tts_clone_cache.sh [port]   # SKIPs without one
@@ -66,42 +65,25 @@ speak "$TMP/req_a.json" "$TMP/on_a2.wav"
 speak "$TMP/req_b.json" "$TMP/on_b.wav"
 kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true; SRV=""
 
-cmp -s "$TMP/on_a1.wav" "$TMP/on_a2.wav" || { echo "FAIL: [1/4] same clip twice -> WAVs differ"; exit 1; }
-grep -q "speaker embedding: cache hit" "$LOG_ON" || { echo "FAIL: [1/4] no cache-hit engagement line"; exit 1; }
-echo "PASS: [1/4] same clip -> byte-identical WAV + cache hit engaged"
-cmp -s "$TMP/on_a1.wav" "$TMP/on_b.wav" && { echo "FAIL: [2/4] different clip -> identical WAV"; exit 1; }
-echo "PASS: [2/4] different clip -> different WAV"
+cmp -s "$TMP/on_a1.wav" "$TMP/on_a2.wav" || { echo "FAIL: [1/3] same clip twice -> WAVs differ"; exit 1; }
+grep -q "speaker embedding: cache hit" "$LOG_ON" || { echo "FAIL: [1/3] no cache-hit engagement line"; exit 1; }
+echo "PASS: [1/3] same clip -> byte-identical WAV + cache hit engaged"
+cmp -s "$TMP/on_a1.wav" "$TMP/on_b.wav" && { echo "FAIL: [2/3] different clip -> identical WAV"; exit 1; }
+echo "PASS: [2/3] different clip -> different WAV"
 
-# ── Boot 2: kill switch ──
-LOG_OFF="$TMP/server_off.log"
-MLX_SERVE_TTS_SPK_CACHE=0 "$BIN" --model "$MODEL" --serve --port "$PORT" >"$LOG_OFF" 2>&1 &
-SRV=$!
-wait_up "$LOG_OFF"
-speak "$TMP/req_a.json" "$TMP/off_a1.wav"
-speak "$TMP/req_a.json" "$TMP/off_a2.wav"
-speak "$TMP/req_b.json" "$TMP/off_b.wav"
-kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true; SRV=""
-
-grep -q "speaker embedding: cache hit" "$LOG_OFF" && { echo "FAIL: [3/4] kill switch set but cache still engaged"; exit 1; }
-cmp -s "$TMP/on_a1.wav" "$TMP/off_a1.wav" || { echo "FAIL: [3/4] cache-on WAV differs from cache-off WAV"; exit 1; }
-cmp -s "$TMP/off_a1.wav" "$TMP/off_a2.wav" || { echo "FAIL: [3/4] uncached path not deterministic"; exit 1; }
-echo "PASS: [3/4] kill switch: uncached path engaged, output byte-identical to cached"
-cmp -s "$TMP/on_b.wav" "$TMP/off_b.wav" || { echo "FAIL: [4/4] different-clip WAV disagrees across cache modes"; exit 1; }
-echo "PASS: [4/4] cache modes agree on the second voice too"
-
-# ── Boot 3: warm_only pre-warm ──
+# ── Boot 2: warm_only pre-warm ──
 LOG_WARM="$TMP/server_warm.log"
 "$BIN" --model "$MODEL" --serve --port "$PORT" >"$LOG_WARM" 2>&1 &
 SRV=$!
 wait_up "$LOG_WARM"
 W1=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/audio/speech" -H 'Content-Type: application/json' --data @"$TMP/warm_b.json")
-echo "$W1" | grep -q '"cache":"miss"' || { echo "FAIL: [5/5] first warm did not report miss: $W1"; exit 1; }
+echo "$W1" | grep -q '"cache":"miss"' || { echo "FAIL: [3/3] first warm did not report miss: $W1"; exit 1; }
 W2=$(curl -s -X POST "http://127.0.0.1:$PORT/v1/audio/speech" -H 'Content-Type: application/json' --data @"$TMP/warm_b.json")
-echo "$W2" | grep -q '"cache":"hit"' || { echo "FAIL: [5/5] second warm did not report hit: $W2"; exit 1; }
+echo "$W2" | grep -q '"cache":"hit"' || { echo "FAIL: [3/3] second warm did not report hit: $W2"; exit 1; }
 speak "$TMP/req_b.json" "$TMP/warm_b1.wav"
-grep -q "speaker embedding: cache hit" "$LOG_WARM" || { echo "FAIL: [5/5] first synthesis after warm was not a cache hit"; exit 1; }
-cmp -s "$TMP/warm_b1.wav" "$TMP/on_b.wav" || { echo "FAIL: [5/5] warmed WAV differs from unwarmed boot's"; exit 1; }
+grep -q "speaker embedding: cache hit" "$LOG_WARM" || { echo "FAIL: [3/3] first synthesis after warm was not a cache hit"; exit 1; }
+cmp -s "$TMP/warm_b1.wav" "$TMP/on_b.wav" || { echo "FAIL: [3/3] warmed WAV differs from unwarmed boot's"; exit 1; }
 CODE=$(curl -s -o "$TMP/warm_err.json" -w "%{http_code}" -X POST "http://127.0.0.1:$PORT/v1/audio/speech" -H 'Content-Type: application/json' --data @"$TMP/warm_noref.json")
-[ "$CODE" = "400" ] || { echo "FAIL: [5/5] warm_only without ref_audio -> $CODE (want 400)"; exit 1; }
+[ "$CODE" = "400" ] || { echo "FAIL: [3/3] warm_only without ref_audio -> $CODE (want 400)"; exit 1; }
 kill $SRV 2>/dev/null || true; wait $SRV 2>/dev/null || true; SRV=""
-echo "PASS: [5/5] warm_only: miss then hit, first synthesis hits, named 400 without ref"
+echo "PASS: [3/3] warm_only: miss then hit, first synthesis hits, named 400 without ref"

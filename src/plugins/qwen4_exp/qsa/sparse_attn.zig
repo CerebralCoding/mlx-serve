@@ -135,12 +135,11 @@ pub const QSA_ATTN_NSPLIT_DEFAULT: c_int = 16;
 /// Ceiling on the split count; past it the f32 partial buffer costs more traffic than it buys.
 pub const QSA_ATTN_MAX_NSPLIT: c_int = 64;
 
-/// Default lower width bound for the fused kernel. `MLX_SERVE_QSA_ATTN_MIN_S=1` is the S=1 measurement's lever.
+/// Default lower width bound for the fused kernel.
 pub const QSA_ATTN_MIN_S_DEFAULT: c_int = 2;
 
 /// Width floor for a batched decode step of two or more slots: its S=1 rows take the fused kernel,
 /// which beats the per-slot decode gather there (a lone stream keeps the decode gather).
-/// `MLX_SERVE_QSA_ATTN_BATCHED_MIN_S=2` hands batched S=1 rows back to the decode gather.
 pub const QSA_ATTN_BATCHED_MIN_S_DEFAULT: c_int = 1;
 
 pub var qsa_attn_nsplit_override: ?c_int = null;
@@ -308,16 +307,15 @@ fn getQsaAttnSlotsKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 
-/// Fused QSA sparse attention at verify widths and batched decode (default on).
-/// `MLX_SERVE_QSA_ATTN_KERNEL=0` restores the gather arms.
+/// Fused QSA sparse attention at verify widths and batched decode; the test seam's false runs the gather arms.
 pub fn qsaAttnKernelEnabled() bool {
     return transformer.qsa_attn_kernel_override orelse true;
 }
 
 pub var qsa_attn_dense_override: ?bool = null;
 
-/// The fused kernel's bf16 (dense KV) variant (default on). `MLX_SERVE_QSA_ATTN_DENSE=0`
-/// hands dense KV back to the mask arm and the union gather.
+/// The fused kernel's bf16 (dense KV) variant; the test seam's false hands dense KV back to the mask arm and the
+/// union gather.
 pub fn qsaAttnDenseEnabled() bool {
     return qsa_attn_dense_override orelse true;
 }
@@ -439,7 +437,7 @@ pub fn qsaSparseAttnFloor(
     const qs = mlx.getShape(q_rope);
     const seq_len = qs[2];
     // `min_s` keeps a lone decode row on `qsaDecodeGatherAttn` (a batched step lowers it);
-    // prefill keeps `gatherQsa256`; a dense cache follows `MLX_SERVE_QSA_ATTN_DENSE`.
+    // prefill keeps `gatherQsa256`; a dense cache follows `qsaAttnDenseEnabled`.
     if (!qsaSparseAttnServes(kv_view.has_quant_triple, seq_len, min_s)) return null;
     if (qs[0] != n or qs[3] != 256 or (n > 1 and seq_len != 1)) return null;
     if (mlx.mlx_array_dtype(q_rope) != .bfloat16) return null;
@@ -948,7 +946,7 @@ test "qsa sparse attn: NSPLIT is one MEASURED constant, and the width floor bind
 }
 
 test "qsa dispatch: each arm's width floor is its own (MIN_S never moves the union gather)" {
-    // `MLX_SERVE_QSA_ATTN_MIN_S` narrows the fused kernel and must not decide what serves the
+    // `qsa_attn_min_s_override` narrows the fused kernel and must not decide what serves the
     // widths it gives up. Modelled as the dispatch's own predicates.
     const Arm = enum { fused, decode_gather, union_gather, dense_mask };
     const pick = struct {
@@ -980,7 +978,7 @@ test "qsa dispatch: a DENSE KV cache at a verify width takes the split-K verify 
     // `--kv-quant off` at 16k decoded 77.7 tok/s against 93.6 at the same acceptance: on a
     // dense cache `qsaSparseAttn`'s arm was `gatherQsa256`, the prefill kernel (8 threadgroups
     // at S=4). The dense arm now keeps the verify kernel's split-K grid, and
-    // `MLX_SERVE_QSA_ATTN_DENSE=0` hands dense KV back to the mask / union gather arms.
+    // the seam's false hands dense KV back to the mask / union gather arms.
     // Hermetic: the arm choice is a pure predicate.
     defer qsa_attn_dense_override = null;
     qsa_attn_dense_override = null;

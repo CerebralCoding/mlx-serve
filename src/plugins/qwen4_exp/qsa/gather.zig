@@ -29,15 +29,15 @@ const qsaVerifyGatherEnabled = @import("verify_gather.zig").qsaVerifyGatherEnabl
 const qsaVerifyGatherMinKvFor = @import("verify_gather.zig").qsaVerifyGatherMinKvFor;
 
 
-/// MLX_SERVE_QSA_GATHER=0 restores the dense [S, kv] mask arm for the
-/// qwen4_exp QSA prefill (the block-gather kernel is the default).
+/// The block-gather kernel serves the qwen4_exp QSA prefill; the test seam's false
+/// runs the dense [S, kv] mask arm.
 pub fn qsaGatherEnabled() bool {
     return transformer.qsa_gather_override orelse true;
 }
 
 /// Below this many keys the mask arm wins: it reads at most kv rows per
 /// 64-row tile, the gather reads 2051 rows per token unshared (ladder: 8k
-/// -3%, 16k +4%, 32k +19%, 64k +42%). MLX_SERVE_QSA_GATHER_MIN_KV.
+/// -3%, 16k +4%, 32k +19%, 64k +42%).
 pub const QSA_GATHER_MIN_KV_DEFAULT: c_int = 8192;
 
 pub fn qsaGatherMinKv() c_int {
@@ -69,8 +69,8 @@ pub fn qsaGatherBk() c_int {
 
 /// Decode-width QSA gather (S==1): reuse the sorted block selection and read
 /// only the selected blocks + incomplete tail instead of the full KV — O(topk)
-/// per step, never O(kv). MLX_SERVE_QSA_DECODE_GATHER=0 restores the dense
-/// bool-mask arm (same selection, full-KV SDPA).
+/// per step, never O(kv). The test seam's false runs the dense bool-mask arm
+/// (same selection, full-KV SDPA).
 pub fn qsaDecodeGatherEnabled() bool {
     return transformer.qsa_decode_gather_override orelse true;
 }
@@ -103,8 +103,7 @@ pub fn qsaBatchedGatherFloor(seq_len: c_int, quantized: bool) c_int {
 }
 
 
-/// `MLX_SERVE_QSA_HISTORY_SHARE=0` restores the end-of-prefill materialized copy of the QSA
-/// indexer history. On (default) the newest SSM checkpoint takes a view of the slot's live
+/// The newest SSM checkpoint takes a view of the slot's live
 /// history at commit (`handoffQsaHistoryToLatest`): one copy per (slot ∪ entry).
 pub fn qsaHistoryShareEnabled() bool {
     return transformer.qsa_history_share_override orelse true;

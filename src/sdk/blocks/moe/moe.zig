@@ -39,7 +39,6 @@ const moePrefillRoutePack = @import("verify_kernels.zig").moePrefillRoutePack;
 const verifyExpertReduce = @import("verify_kernels.zig").verifyExpertReduce;
 const verifyExpertReuse = @import("verify_kernels.zig").verifyExpertReuse;
 const verifyIndexedExpertInput = @import("verify_kernels.zig").verifyIndexedExpertInput;
-const verifyPairedGateUp = @import("verify_kernels.zig").verifyPairedGateUp;
 const verifyRoutePack = @import("verify_kernels.zig").verifyRoutePack;
 const MoeMlpWeights = @import("weights.zig").MoeMlpWeights;
 
@@ -666,10 +665,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             }
         }
 
-        const expert_act = if (fused_act) |act| act else if (!has_gate_scale and self.verify_paired_gu_installed and B == 1 and S == 4 and
-            self.verifyFeatureEnabled(.routing, skip_shared, B, S))
-            try verifyPairedGateUp(self.s, x_flat, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, lhs_idx, sorted_inds)
-        else blk: {
+        const expert_act = if (fused_act) |act| act else blk: {
             const use_mapped_gate = mapped_gate != null;
             var gate_out_3d = mapped_gate orelse mlx.mlx_array_new();
             mapped_gate = null;

@@ -315,12 +315,6 @@ pub fn vertexNormals(gpa: std.mem.Allocator, verts: []const f32, tris: []const u
     return n;
 }
 
-/// The marching-cubes mesh type the decimator and GLB writer take; takes ownership of `m`'s arrays.
-pub fn toMcMesh(gpa: std.mem.Allocator, m: TriMesh) !mc.Mesh {
-    const normals = try vertexNormals(gpa, m.verts, m.tris);
-    return .{ .vertices = m.verts, .normals = normals, .indices = m.tris };
-}
-
 // ── Volume sampling and bake ─────────────────────────────────────────────────
 
 /// A sparse attribute volume (`coords` `[M, 4]`, `attrs` `[M, C]`) over `res`^3 voxels of the world box.

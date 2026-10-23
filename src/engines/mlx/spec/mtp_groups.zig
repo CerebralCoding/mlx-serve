@@ -469,8 +469,6 @@ pub fn verifyShapeFor(rows: usize, has_qwen4: bool, width: u32) VerifyShape {
     return .merged;
 }
 
-var merged_verify_decline_logged: bool = false;
-
 fn mtpRoundsStaySolo(slot: *const Slot) bool {
     const t = slot.model.transformer orelse return true;
     // A stateless trunk (MiMo) has no grouped verify: its MTP rounds run alone.

@@ -4,6 +4,7 @@
 //! reason; the server serves on without it. A dylib is never unloaded (it may hold MLX arrays and threads).
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const common = @import("../../abi/common.zig");
 const dylib_abi = @import("../../abi/dylib.zig");
@@ -212,7 +213,7 @@ pub fn entries() []const sdk_plugin.Entry {
 
 /// `~/.mlx-serve/<rel>`.
 pub fn homePath(a: Allocator, rel: []const u8) ![]u8 {
-    const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoHome);
+    const home = std.mem.span(env.get(.HOME) orelse return error.NoHome);
     return std.fs.path.join(a, &.{ home, ".mlx-serve", rel });
 }
 

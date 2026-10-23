@@ -2,6 +2,7 @@
 //! Owns gemma4MoeLayerTail, trace_tail_once.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const debugTraceHead = @import("../../engines/mlx/diag/profile.zig").debugTraceHead;
 const MoeLayerWeights = @import("../../engines/mlx/forward/layered.zig").MoeLayerWeights;
@@ -91,7 +92,7 @@ pub fn gemma4MoeLayerTail(self: *Transformer, h_in: mlx.mlx_array, attn_out: mlx
     const expert_normed = try self.rmsNorm(expert_out, lw.post_ff_norm_2.?);
     defer _ = mlx.mlx_array_free(expert_normed);
 
-    if (std.c.getenv("MLX_SERVE_DIFFUSION_TRACE") != null and trace_tail_once) {
+    if (env.get(.MLX_SERVE_DIFFUSION_TRACE) != null and trace_tail_once) {
         trace_tail_once = false;
         debugTraceHead("tail residual", h, self.s);
         debugTraceHead("tail shared_normed", shared_normed, self.s);

@@ -11,7 +11,6 @@ const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
 const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;
 const ropeAngleRows = @import("../rope/qk_norm_rope.zig").ropeAngleRows;
 const AttnDqCopy = @import("decode_attn_quant.zig").AttnDqCopy;
-const attnDqNvfp4FromEnv = @import("decode_attn_quant.zig").attnDqNvfp4FromEnv;
 const attnDqRequantEnabled = @import("decode_attn_quant.zig").attnDqRequantEnabled;
 const attnDqUseNvfp4 = @import("decode_attn_quant.zig").attnDqUseNvfp4;
 const buildAttnDqCopy = @import("decode_attn_quant.zig").buildAttnDqCopy;
@@ -83,7 +82,7 @@ pub fn attnDqFor(self: *Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
         log.debug("[decode-attn-quant] declined a projection: shape/dtype ineligible\n", .{});
         return null;
     }
-    const nvfp4 = dense.ctx != null or attnDqUseNvfp4(layer, @intCast(self.config.num_hidden_layers), attnDqNvfp4FromEnv());
+    const nvfp4 = dense.ctx != null or attnDqUseNvfp4(layer, @intCast(self.config.num_hidden_layers));
     const copy = (try buildAttnDqCopy(self.s, src, nvfp4)) orelse {
         try self.attn_dq.put(self.allocator, key, null);
         return null;
@@ -96,8 +95,7 @@ pub fn attnDqFor(self: *Transformer, w: mlx.mlx_array, sc: mlx.mlx_array, bi: ml
     if (nvfp4 and !decode_attn_quant.attn_dq_nvfp4_engaged) {
         decode_attn_quant.attn_dq_nvfp4_engaged = true;
         const nl: u32 = @intCast(self.config.num_hidden_layers);
-        const from: i64 = attnDqNvfp4FromEnv() orelse @intCast((nl * 4) / 5);
-        log.info("[decode-attn-quant] nvfp4-g16 tail engaged from layer {d}/{d} (MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM=off restores int8-only)\n", .{ from, nl });
+        log.info("[decode-attn-quant] nvfp4-g16 tail engaged from layer {d}/{d}\n", .{ decode_attn_quant.attnDqNvfp4From(nl), nl });
     }
     return copy;
 }

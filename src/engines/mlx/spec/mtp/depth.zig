@@ -199,8 +199,6 @@ pub fn updateMtpDepth(self: *Generator, drafted: u32, accepted: u32) void {
 // CONSIDER extension pay the one bounded chunk-A sync; when the plan
 // collapses to m_lo == m_hi the round is byte-identical in shape to the
 // fixed-depth path (no confidence graph, no sync).
-// Disable via MLX_SERVE_MTP_ADAPTIVE=0 (reverts to the windowed
-// fixed-depth controller above).
 
 /// Default depth cap when `--mtp-max-depth` is not passed (0 = auto) and the
 /// EV controller is active. 6 keeps the verify forward at seq 1+6 = 7,

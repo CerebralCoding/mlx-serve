@@ -6,6 +6,7 @@
 //! points), so the chain stays both the fallback and the oracle. `MINIMAX_H3_GLUE_FUSED=0`
 //! turns every kernel here off.
 const std = @import("std");
+const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
@@ -16,7 +17,7 @@ pub var disabled_for_test = false; // lets a test run the chain these kernels re
 pub fn enabled() bool {
     if (disabled_for_test) return false;
     if (enabled_cache) |v| return v;
-    const raw = std.c.getenv("MINIMAX_H3_GLUE_FUSED");
+    const raw = env.get(.MINIMAX_H3_GLUE_FUSED);
     const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     enabled_cache = on;
     return on;

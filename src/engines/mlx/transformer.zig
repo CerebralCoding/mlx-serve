@@ -32,7 +32,6 @@ const add_norm = @import("../../sdk/blocks/norms/add_norm.zig");
 const kv_quant = @import("cache/kv_quant.zig");
 
 pub const KVQuantConfig = kv_quant.KVQuantConfig;
-pub const KVQuantScheme = kv_quant.Scheme;
 
 /// `std.meta.fields` was replaced by parallel `fieldNames`/`fieldTypes`
 /// arrays — zip them into the `.name`/`.type` shape every call site below
@@ -537,11 +536,9 @@ pub const Transformer = struct {
     owns_norms: bool,
     embedding_mode: bool = false,
 
-    /// Layer stride for the decode async-eval ladder (0 = off). Resolved once
-    /// at construction from `MLX_SERVE_DECODE_ASYNC_LADDER` — a per-layer
-    /// getenv would cost more than the overlap it buys.
+    /// Layer stride for the decode async-eval ladder (0 = off; tests set it).
     decode_async_ladder: u32 = 0,
-    /// The qwen4_exp batched-decode ladder stride, resolved the same way (`qwen4DecodeLadderStride`).
+    /// The qwen4_exp batched-decode ladder stride (`QWEN4_DECODE_ASYNC_LADDER_DEFAULT`).
     decode_async_ladder_qwen4: u32 = 0,
 
     gelu_coeff: ?mlx.mlx_array,
@@ -692,7 +689,6 @@ pub const Transformer = struct {
     // MoE-specific (null/empty for standard models)
     moe_layers: ?[]MoeLayerWeights,
     /// Construction-validated q4/g64 S=4 routed gate/up verifier lane.
-    verify_paired_gu_installed: bool = false,
     ssm_entries: ?[]SSMCacheEntry,
     moe_seq_offset: usize,
     // Pre-transposed plain-bf16 linear_attn weights owned by the Transformer
@@ -721,7 +717,6 @@ pub const Transformer = struct {
     prompt_cache: ?PrefillCache,
 
     // Compiled forward pass closure (JIT-compiled for Metal kernel fusion)
-    compiled_forward: ?mlx.mlx_closure = null,
 
     // Vision: set before prefill when images are present, cleared after.
     // Shape: [B, num_image_tokens, hidden_size]. Spliced at image_token_id positions.
@@ -929,7 +924,6 @@ pub const Transformer = struct {
     // engines/mlx/load/init.zig
     pub const init = @import("load/init.zig").init;
     // engines/mlx/compiled.zig
-    pub const compileForward = @import("compiled.zig").compileForward;
     pub const compileGelu = @import("compiled.zig").compileGelu;
     pub const compileGeglu = @import("compiled.zig").compileGeglu;
     const gegluClosureCallback = @import("compiled.zig").gegluClosureCallback;
@@ -939,8 +933,6 @@ pub const Transformer = struct {
     pub const closureIn = @import("compiled.zig").closureIn;
     pub const closureOut = @import("compiled.zig").closureOut;
     pub const applyClosure = @import("compiled.zig").applyClosure;
-    const forwardClosureCallback = @import("compiled.zig").forwardClosureCallback;
-    pub const forwardCompiled = @import("compiled.zig").forwardCompiled;
     pub const clearCompiledClosures = @import("compiled.zig").clearCompiledClosures;
     // sdk/blocks/gdn/gate.zig
     pub const compileGdnGate = @import("../../sdk/blocks/gdn/gate.zig").compileGdnGate;
@@ -1030,14 +1022,11 @@ pub const Transformer = struct {
     pub const PREFILL_EVAL_MIN_SEQ = @import("eval_cadence.zig").PREFILL_EVAL_MIN_SEQ;
     pub const prefillEvalCadenceApplies = @import("eval_cadence.zig").prefillEvalCadenceApplies;
     pub const evalCadencePoint = @import("eval_cadence.zig").evalCadencePoint;
-    pub const decodeAsyncLadderStride = @import("eval_cadence.zig").decodeAsyncLadderStride;
-    const DECODE_ASYNC_LADDER_AUTO = @import("eval_cadence.zig").DECODE_ASYNC_LADDER_AUTO;
     pub const ladderStep = @import("eval_cadence.zig").ladderStep;
     pub const ladderStepMulti = @import("eval_cadence.zig").ladderStepMulti;
     pub const prefillEvalCadence = @import("eval_cadence.zig").prefillEvalCadence;
     pub const prefillEvalCadenceFor = @import("eval_cadence.zig").prefillEvalCadenceFor;
     // plugins/qwen4_exp/forward.zig
-    pub const qwen4DecodeLadderStride = @import("../../plugins/qwen4_exp/forward.zig").qwen4DecodeLadderStride;
     const QWEN4_DECODE_ASYNC_LADDER_DEFAULT = @import("../../plugins/qwen4_exp/forward.zig").QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
     pub const qwen4VerifyRowsEligible = @import("../../plugins/qwen4_exp/forward.zig").qwen4VerifyRowsEligible;
     pub const forwardQwen4VerifyRows = @import("../../plugins/qwen4_exp/forward.zig").forwardQwen4VerifyRows;
@@ -1231,7 +1220,6 @@ pub const Transformer = struct {
             self.allocator.destroy(c);
             self.int8_cache = null;
         }
-        if (self.compiled_forward) |cf| _ = mlx.mlx_closure_free(cf);
         if (self.compiled_gelu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_geglu) |cg| _ = mlx.mlx_closure_free(cg);
         if (self.compiled_softcap) |cs| _ = mlx.mlx_closure_free(cs);

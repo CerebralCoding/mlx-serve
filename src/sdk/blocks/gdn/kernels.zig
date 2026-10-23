@@ -401,13 +401,12 @@ pub fn getGdnKernelSeq(vector_gate: bool) !mlx.mlx_fast_metal_kernel {
 // (8 threads x 16-wide fragments), Dv % 32 == 0 (DB=32 dv rows per
 // threadgroup). Anything else — and decode (T==1), PLD/MTP verify, and the
 // per-position-state capture path — stays on the stock kernels.
-// Kill switch: MLX_SERVE_GDN_BLOCKED=0; block size: MLX_SERVE_GDN_BLOCK_T
-// (16|32|48, default 32 for bf16 — Metal's 32 KiB threadgroup limit governs,
+// Block size 32 for bf16 (Metal's 32 KiB threadgroup limit governs,
 // and it is a function of the INPUT WIDTH, not a constant: fp32 activations
 // stage twice the bytes and clamp to 16 via gdnBlockTFor. GDN inputs are NOT
 // always bf16 — an f16 checkpoint promotes its activations to f32).
 
-/// Test seam: forces the blocked-prefill route on/off without the environment.
+/// Test seam: forces the blocked-prefill route on/off.
 pub var gdn_blocked_override: ?bool = null;
 
 pub fn gdnBlockedEnabled() bool {

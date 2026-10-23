@@ -466,16 +466,6 @@ fn gatherQmvDecode(w: *const Moe.Weights, g: *Graph, out: *Array, reduced: *bool
     return true;
 }
 
-fn takeMm(parent: *Graph, x: Array, bank: *const Bank, flat: Array) !Array {
-    var t = parent.scope();
-    defer t.deinit();
-    const g = &t;
-    const wk = try g.take(bank.w, flat, 0);
-    const sk = try g.take(bank.s, flat, 0);
-    const bk: Array = if (bank.b.ctx != null) try g.take(bank.b, flat, 0) else .{ .ctx = null };
-    return parent.keep(try g.call(mlx.mlx_quantized_matmul, .{ x, wk, sk, bk, true, mlx.mlx_optional_int.some(@intCast(bank.qp.group_size)), mlx.mlx_optional_int.some(@intCast(bank.qp.bits)), bank.qp.mode.cstr() }));
-}
-
 /// `w`'s per-expert scale on `y`'s rows (by `sel`), as `scaleExperts`.
 fn scaleExperts(parent: *Graph, y: Array, scale: Array, sel: Array) !Array {
     if (scale.ctx == null) return y;

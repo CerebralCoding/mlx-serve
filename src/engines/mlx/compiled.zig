@@ -1,27 +1,9 @@
 //! engines/mlx/compiled, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns compileForward, compileGelu, compileGeglu, gegluClosureCallback, compileSoftcap, softcapClosureCallback, and 7 more.
+//! Owns compileGelu, compileGeglu, gegluClosureCallback, compileSoftcap, softcapClosureCallback, and 7 more.
 
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const Transformer = @import("transformer.zig").Transformer;
-
-/// Create a compiled version of the forward pass for faster decode.
-pub fn compileForward(self: *Transformer) void {
-    const raw_closure = mlx.mlx_closure_new_func_payload(
-        &forwardClosureCallback,
-        @ptrCast(self),
-        null,
-    );
-    var compiled = mlx.mlx_closure{ .ctx = null };
-    const rc = mlx.mlx_compile(&compiled, raw_closure, false);
-    _ = mlx.mlx_closure_free(raw_closure);
-    if (rc == 0 and compiled.ctx != null) {
-        self.compiled_forward = compiled;
-        log.info("Forward pass compiled (Metal kernel fusion enabled)\n", .{});
-    } else {
-        log.warn("Forward compilation failed, using uncompiled path\n", .{});
-    }
-}
 
 /// Compile GELU activation for kernel fusion.
 /// Fuses 8 separate ops into 1 GPU kernel, matching mlx-lm's @mx.compile behavior.
@@ -167,40 +149,7 @@ pub fn applyClosure(compiled: ?mlx.mlx_closure, inputs: []const mlx.mlx_array) !
     return out;
 }
 
-pub fn forwardClosureCallback(res: *mlx.mlx_vector_array, input: mlx.mlx_vector_array, payload: ?*anyopaque) callconv(.c) c_int {
-    const self: *Transformer = @ptrCast(@alignCast(payload.?));
-    var token_ids = mlx.mlx_array_new();
-    const get_rc = mlx.mlx_vector_array_get(&token_ids, input, 0);
-    if (get_rc != 0) return get_rc;
-    defer _ = mlx.mlx_array_free(token_ids);
-
-    const logits = self.forward(token_ids) catch return -1;
-
-    const out_arr = [_]mlx.mlx_array{logits};
-    res.* = mlx.mlx_vector_array_new_data(&out_arr, 1);
-    _ = mlx.mlx_array_free(logits);
-    return 0;
-}
-
-/// Forward pass using compiled closure if available, falling back to regular.
-pub fn forwardCompiled(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
-    if (self.compiled_forward) |compiled| {
-        const in_arr = [_]mlx.mlx_array{token_ids};
-        const in_vec = mlx.mlx_vector_array_new_data(&in_arr, 1);
-        defer _ = mlx.mlx_vector_array_free(in_vec);
-
-        var out_vec = mlx.mlx_vector_array{ .ctx = null };
-        defer _ = mlx.mlx_vector_array_free(out_vec);
-        try mlx.check(mlx.mlx_closure_apply(&out_vec, compiled, in_vec));
-
-        var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_vector_array_get(&result, out_vec, 0));
-        return result;
-    }
-    return self.forward(token_ids);
-}
-
-/// Free compiled JIT closures (compiled_forward / compiled_gelu /
+/// Free compiled JIT closures (compiled_gelu /
 /// compiled_geglu / compiled_softcap / compiled_moe_routing). They get
 /// bound to the calling thread's mlx GPU stream at compile time; once
 /// inference moves to a different thread (Phase 2 scheduler) calls
@@ -209,10 +158,6 @@ pub fn forwardCompiled(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_ar
 /// then optionally re-warm on the new thread to recompile against its
 /// own stream.
 pub fn clearCompiledClosures(self: *Transformer) void {
-    if (self.compiled_forward) |c| {
-        _ = mlx.mlx_closure_free(c);
-        self.compiled_forward = null;
-    }
     if (self.compiled_gelu) |c| {
         _ = mlx.mlx_closure_free(c);
         self.compiled_gelu = null;

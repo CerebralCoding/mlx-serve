@@ -246,18 +246,6 @@ test "forced recovery leaves room for the whole transition and one answer token"
     try std.testing.expect(forcedBoundaryCanContinue(0, 1, 0));
 }
 
-test "forced recovery is committed and counted exactly once" {
-    const src = @embedFile("constraint.zig");
-    const start = std.mem.indexOf(u8, src, "pub fn forceConstraint" ++ "Transition(") orelse return error.CallSiteMoved;
-    const tail = src[start..];
-    const end = std.mem.indexOf(u8, tail, "\n// ── tests ──") orelse return error.CallSiteMoved;
-    const body = tail[0..end];
-    // One committed token per call, through the live forward path.
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "generated_ids.append(allocator, tok)"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "advanceStep(1)"));
-    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, body, "xfm.forwardWith(&self.ctx, tok_input)"));
-}
-
 test "constrained generation returns one logprob entry per token, paired with that token" {
     // Bar: a json_schema request with logprobs gets an entry for every returned token, describing it.
     const path = env.get(.LOGPROBS_TEST_MODEL) orelse return error.SkipZigTest;

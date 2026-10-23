@@ -26,6 +26,7 @@
 //! Parity: env-gated MUSIC3_* oracles fed by tests/dump_music3_fixtures.py.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
@@ -134,27 +135,8 @@ const VOC_HOP: u32 = 512; // samples per latent frame (8*8*4*2)
 /// So this is a best-effort mapping, not a verified contract. `[Instrumental]`
 /// wins the default because it is the card for the checkpoint we actually run
 /// — and it is ALSO ACE-Step's existing marker, so one spelling serves both
-/// backends. `MLX_SERVE_MUSIC3_INST_TAG` overrides it so the alternative can be
-/// A/B'd by ear without a rebuild; the honest test is listening, not a fixture.
+/// backends.
 pub const INSTRUMENTAL_LYRICS = "[Instrumental]";
-
-/// The marker actually sent, honoring the env override.
-pub fn instrumentalMarker() []const u8 {
-    const raw = std.c.getenv("MLX_SERVE_MUSIC3_INST_TAG") orelse return markerFromEnvValue(null);
-    return markerFromEnvValue(std.mem.span(raw));
-}
-
-/// Split out so the override's three arms are testable without an environment.
-/// `none` sends an EMPTY lyric body — the hosted api makes `lyrics` optional
-/// under `is_instrumental`, and `[start]` alone is the closest this prompt
-/// template gets to sending nothing. Unset or blank keeps the default: an
-/// override that emptied the block by accident would read as a broken flag.
-pub fn markerFromEnvValue(raw: ?[]const u8) []const u8 {
-    const v = std.mem.trim(u8, raw orelse return INSTRUMENTAL_LYRICS, " \t\r\n");
-    if (v.len == 0) return INSTRUMENTAL_LYRICS;
-    if (std.ascii.eqlIgnoreCase(v, "none")) return "";
-    return v;
-}
 
 /// The clause appended to an instrumental request's caption.
 ///
@@ -181,13 +163,6 @@ pub const INSTRUMENTAL_CAPTION_CLAUSE = "Instrumental only: no vocals, no singin
 /// may even help. Duplicating our exact sentence is the only real waste.
 pub fn captionMentionsNoVocals(caption: []const u8) bool {
     return captionContainsAny(caption, &.{INSTRUMENTAL_CAPTION_CLAUSE});
-}
-
-/// Default ON. `MLX_SERVE_MUSIC3_INST_CAPTION=0` sends the tag alone, which is
-/// the arm that was measured to leave vocal texture in.
-pub fn instrumentalCaptionEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_MUSIC3_INST_CAPTION") orelse return true;
-    return raw[0] != '0';
 }
 
 fn captionContainsAny(caption: []const u8, needles: []const []const u8) bool {
@@ -252,7 +227,7 @@ pub fn captionWithFacts(
 /// 400s on those, so a client that simply forgot the field never gets a
 /// wordless track it did not ask for.
 pub fn resolveLyrics(instrumental: bool, lyrics: []const u8) []const u8 {
-    return if (instrumental) instrumentalMarker() else lyrics;
+    return if (instrumental) INSTRUMENTAL_LYRICS else lyrics;
 }
 
 pub const DEFAULT_STEPS: u32 = 30;
@@ -1249,12 +1224,8 @@ fn pruneHeadRows(src: mlx.mlx_array, lo: c_int, hi: c_int, end_row: c_int, s: S)
 }
 
 /// Build the pruned head at load. Null (= full-vocab + mask path) when the
-/// kill switch MLX_SERVE_MUSIC3_LMHEAD_PRUNE=0 is set or the head is not
-/// affine-quantized.
+/// head is not affine-quantized.
 fn buildPrunedHead(cfg: Cfg, lm_w: *const Weights, s: S) !?PrunedHead {
-    if (std.c.getenv("MLX_SERVE_MUSIC3_LMHEAD_PRUNE")) |v| {
-        if (v[0] == '0') return null;
-    }
     const wq = lm_w.get("lm_head.weight") orelse return null;
     const sc = lm_w.get("lm_head.scales") orelse return null;
     const bi = lm_w.get("lm_head.biases") orelse return null;
@@ -1269,83 +1240,6 @@ fn buildPrunedHead(cfg: Cfg, lm_w: *const Weights, s: S) !?PrunedHead {
     const rows = cfg.semantic_vocab + 1;
     log.info("[music3] lm-head prune engaged ({d} rows)\n", .{rows});
     return .{ .w = pw, .sc = psc, .bi = pbi, .bits = qp.bits, .gs = qp.group_size, .rows = rows };
-}
-
-/// MLX_SERVE_MUSIC3_DEPTH_BITS=<2..6>: re-quantize the depth-decoder LAYER
-/// linears from the 8-bit pack at load (the dflash load-time-requant
-/// precedent). Experiment, default OFF — UNLIKE dflash this is a QUALITY
-/// lever (depth codes are output, not verified drafts): adopt only if greedy
-/// replay agreement vs the 8-bit arm AND listening both hold.
-fn maybeRequantDepth(w: *Weights, cfg: Cfg, s: S) !void {
-    const raw = std.c.getenv("MLX_SERVE_MUSIC3_DEPTH_BITS") orelse return;
-    const bits = std.fmt.parseInt(u32, std.mem.span(raw), 10) catch return;
-    if (bits == 8) return; // the pack width — nothing to do
-    switch (bits) {
-        2, 3, 4, 5, 6 => {},
-        else => return,
-    }
-
-    var bases: std.ArrayList([]u8) = .empty;
-    defer {
-        for (bases.items) |b| w.allocator.free(b);
-        bases.deinit(w.allocator);
-    }
-    var it = w.map.keyIterator();
-    while (it.next()) |kp| {
-        const key = kp.*;
-        if (!std.mem.startsWith(u8, key, "layers.")) continue;
-        if (!std.mem.endsWith(u8, key, ".weight")) continue;
-        try bases.append(w.allocator, try w.allocator.dupe(u8, key[0 .. key.len - ".weight".len]));
-    }
-
-    var count: u32 = 0;
-    for (bases.items) |base| {
-        var kb1: [256]u8 = undefined;
-        const wk = try std.fmt.bufPrint(&kb1, "{s}.weight", .{base});
-        var kb2: [256]u8 = undefined;
-        const sk = try std.fmt.bufPrint(&kb2, "{s}.scales", .{base});
-        var kb3: [256]u8 = undefined;
-        const bk = try std.fmt.bufPrint(&kb3, "{s}.biases", .{base});
-        const wq = try getW(w, wk);
-        const sc = w.get(sk) orelse continue; // norms + dense stay
-        const bi = try getW(w, bk);
-        // in_features = contraction width: lm_hidden everywhere except
-        // down_proj (rows of the sibling up_proj).
-        const in_features: u32 = blk: {
-            if (std.mem.endsWith(u8, base, "down_proj")) {
-                var kb4: [256]u8 = undefined;
-                const upk = try std.fmt.bufPrint(&kb4, "{s}up_proj.weight", .{base[0 .. base.len - "down_proj".len]});
-                break :blk rowsOf(try getW(w, upk));
-            }
-            break :blk cfg.lm_hidden;
-        };
-        const qp = transformer_mod.affineParamsFromGeometry(wq, sc, in_features) orelse continue;
-        if (qp.bits <= bits) continue; // only ever narrow
-        var dense = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(dense);
-        try mlx.check(mlx.mlx_dequantize(&dense, wq, sc, bi, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), "affine", .{}, mlx.mlx_optional_dtype{}, s));
-        var triple = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(triple);
-        try mlx.check(mlx.mlx_quantize(&triple, dense, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(bits)), "affine", .{}, s));
-        if (mlx.mlx_vector_array_size(triple) != 3) return error.UnexpectedQuantizeOutput;
-        var nw = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(nw);
-        var nsc = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(nsc);
-        var nbi = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(nbi);
-        try mlx.check(mlx.mlx_vector_array_get(&nw, triple, 0));
-        try mlx.check(mlx.mlx_vector_array_get(&nsc, triple, 1));
-        try mlx.check(mlx.mlx_vector_array_get(&nbi, triple, 2));
-        evalA(nw);
-        evalA(nsc);
-        evalA(nbi);
-        try putWeight(w, wk, nw);
-        try putWeight(w, sk, nsc);
-        try putWeight(w, bk, nbi);
-        count += 1;
-    }
-    log.info("[music3] depth requant engaged: {d}-bit ({d} weights)\n", .{ bits, count });
 }
 
 /// Pruned-head logits [2, rows] f32.
@@ -1533,7 +1427,7 @@ fn generateDepthCodes(
     smp: *Sampler,
     force: ?[]const i32,
     agree: ?*u32,
-    dkv: ?*LmKv,
+    dkv: *LmKv,
 ) !DepthResult {
     const s = e.s;
     const dim: c_int = @intCast(e.cfg.lm_hidden);
@@ -1559,22 +1453,17 @@ fn generateDepthCodes(
         _ = mlx.mlx_array_free(hidden_parts[i]);
     };
 
-    if (dkv) |c| c.len = 0; // fresh cache per frame (buffer reused)
+    dkv.len = 0; // fresh cache per frame (buffer reused)
     var index: u32 = 1;
     while (index < e.cfg.num_codebooks) : (index += 1) {
         // Cached path: forward only the not-yet-fed tail (2 rows on the first
         // step, the single new projected embed after).
         const h_last = blk: {
-            if (dkv) |c| {
-                const fresh = seq.items[@intCast(c.len)..];
-                if (fresh.len == 1) break :blk try depthForward(e, fresh[0], c);
-                const cat = try concatN(fresh, 1, s);
-                defer _ = mlx.mlx_array_free(cat);
-                break :blk try depthForward(e, cat, c);
-            }
-            const cat = try concatN(seq.items, 1, s);
+            const fresh = seq.items[@intCast(dkv.len)..];
+            if (fresh.len == 1) break :blk try depthForward(e, fresh[0], dkv);
+            const cat = try concatN(fresh, 1, s);
             defer _ = mlx.mlx_array_free(cat);
-            break :blk try depthForward(e, cat, null);
+            break :blk try depthForward(e, cat, dkv);
         }; // [2,4096]
         defer _ = mlx.mlx_array_free(h_last);
         const cond_h = try sliceA(h_last, &[_]c_int{ 0, 0 }, &[_]c_int{ 1, dim }, s);
@@ -1952,14 +1841,7 @@ const LapClock = struct {
 /// the schedule, so probe numbers are for ATTRIBUTION; A/B arms must both run
 /// with the probe on (symmetric overhead).
 fn costProbeEnabled() bool {
-    return std.c.getenv("MUSIC3_COST_PROBE") != null;
-}
-
-/// Depth-decoder KV cache (default ON). MLX_SERVE_MUSIC3_DEPTH_KV=0 keeps
-/// the naive full-re-forward path — it IS the reference shape.
-fn depthKvEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_MUSIC3_DEPTH_KV") orelse return true;
-    return raw[0] != '0';
+    return env.get(.MUSIC3_COST_PROBE) != null;
 }
 
 pub const MusicRequest = struct {
@@ -2029,7 +1911,6 @@ pub const Engine = struct {
             const n = try self.dit_w.w8.convert(allocator, &self.dit_w.map, .{ .base = "transformer_blocks.0.attn.to_q", .in_features = self.cfg.dit_hidden }, self.s);
             log.info("[music3] int8: {d} DiT linears\n", .{n});
         }
-        try maybeRequantDepth(&self.dd_w, self.cfg, self.s);
         self.pruned_head = try buildPrunedHead(self.cfg, &self.lm_w, self.s);
         errdefer if (self.pruned_head) |*ph| ph.deinit();
         try self.buildResolved();
@@ -2228,12 +2109,8 @@ pub const Engine = struct {
             _ = mlx.mlx_array_free(m);
         };
 
-        var dkv: ?LmKv = if (depthKvEnabled())
-            try LmKv.initShape(allocator, cfg.dd_layers, cfg.dd_heads, cfg.num_codebooks, @divExact(cfg.lm_hidden, cfg.dd_heads), s)
-        else
-            null;
-        defer if (dkv) |*c| c.deinit(allocator);
-        if (dkv != null) log.info("[music3] depth-kv engaged\n", .{});
+        var dkv = try LmKv.initShape(allocator, cfg.dd_layers, cfg.dd_heads, cfg.num_codebooks, @divExact(cfg.lm_hidden, cfg.dd_heads), s);
+        defer dkv.deinit(allocator);
 
         const hidden_w: c_int = @intCast(cfg.num_codebooks * cfg.lm_hidden);
         var frame_buf = try zerosA(&[_]c_int{ @intCast(opts.max_frames), hidden_w }, .bfloat16, s);
@@ -2294,7 +2171,7 @@ pub const Engine = struct {
                 result.forced_total += 7;
                 agree_ptr = &result.agree;
             }
-            var depth = try generateDepthCodes(self, allocator, last_hidden, sem_arr, frame_smp, if (force_frame) |f| f[1..8] else null, agree_ptr, if (dkv) |*c| c else null);
+            var depth = try generateDepthCodes(self, allocator, last_hidden, sem_arr, frame_smp, if (force_frame) |f| f[1..8] else null, agree_ptr, &dkv);
             defer depth.deinit();
             if (probe) {
                 evalA(depth.depth_hidden);
@@ -2875,12 +2752,12 @@ fn assertParity(arr: mlx.mlx_array, ref: []const f32, label: []const u8, min_cos
 }
 
 fn testEngine(io: std.Io, a: std.mem.Allocator) !*Engine {
-    const model_dir = std.mem.span(std.c.getenv("MUSIC3_TEST_MODEL") orelse return error.SkipZigTest);
+    const model_dir = std.mem.span(env.get(.MUSIC3_TEST_MODEL) orelse return error.SkipZigTest);
     return Engine.load(io, a, model_dir);
 }
 
 fn fixturesDir() ![]const u8 {
-    return std.mem.span(std.c.getenv("MUSIC3_FIXTURES") orelse return error.SkipZigTest);
+    return std.mem.span(env.get(.MUSIC3_FIXTURES) orelse return error.SkipZigTest);
 }
 
 test "music3 load: shapes match the checkpoint contract" {
@@ -2911,17 +2788,11 @@ test "music3 load: shapes match the checkpoint contract" {
     const n1 = try getW(&e.dit_w, "transformer_blocks.0.norm1.weight");
     try testing.expectEqual(mlx.mlx_dtype.bfloat16, mlx.mlx_array_dtype(n1));
     // pruned head: 16385 rows sliced from the full head, same packed geometry
-    // (kill switch MLX_SERVE_MUSIC3_LMHEAD_PRUNE=0 must leave it unbuilt)
-    const prune_killed = if (std.c.getenv("MLX_SERVE_MUSIC3_LMHEAD_PRUNE")) |v| v[0] == '0' else false;
-    if (prune_killed) {
-        try testing.expect(e.pruned_head == null);
-    } else {
-        const full = try getW(&e.lm_w, "lm_head.weight");
-        const ph = e.pruned_head orelse return error.TestUnexpectedResult;
-        try testing.expectEqual(@as(u32, 16385), ph.rows);
-        try testing.expectEqual(mlx.getShape(full)[1], mlx.getShape(ph.w)[1]);
-        try testing.expectEqualSlices(c_int, &[_]c_int{ 16385, mlx.getShape(full)[1] }, mlx.getShape(ph.w));
-    }
+    const full = try getW(&e.lm_w, "lm_head.weight");
+    const ph = e.pruned_head orelse return error.TestUnexpectedResult;
+    try testing.expectEqual(@as(u32, 16385), ph.rows);
+    try testing.expectEqual(mlx.getShape(full)[1], mlx.getShape(ph.w)[1]);
+    try testing.expectEqualSlices(c_int, &[_]c_int{ 16385, mlx.getShape(full)[1] }, mlx.getShape(ph.w));
 }
 
 test "music3 oracle: prompt token ids byte-exact" {
@@ -3166,10 +3037,9 @@ test "music3 instrumental lyrics resolve from the flag, never from an empty stri
     // The flag is the ONLY way in: an empty `lyrics` stays empty (the handler
     // 400s on it) so a client that forgot the field cannot silently get an
     // instrumental it did not ask for.
-    try std.testing.expectEqualStrings(instrumentalMarker(), resolveLyrics(true, ""));
-    try std.testing.expectEqualStrings(instrumentalMarker(), resolveLyrics(true, "   \n\t "));
+    try std.testing.expectEqualStrings(INSTRUMENTAL_LYRICS, resolveLyrics(true, ""));
+    try std.testing.expectEqualStrings(INSTRUMENTAL_LYRICS, resolveLyrics(true, "   \n\t "));
     // Unset in the test environment, so the override resolves to the default.
-    try std.testing.expectEqualStrings(INSTRUMENTAL_LYRICS, instrumentalMarker());
     try std.testing.expectEqualStrings("", resolveLyrics(false, ""));
     try std.testing.expectEqualStrings("[verse]\nhello", resolveLyrics(false, "[verse]\nhello"));
 }
@@ -3188,20 +3058,6 @@ test "music3 instrumental caption: the clause is appended only when the user did
     try std.testing.expect(!captionMentionsNoVocals("lo-fi piano, no vocals"));
     // Only our own sentence, so a re-render cannot stack it twice.
     try std.testing.expect(captionMentionsNoVocals("lo-fi. " ++ INSTRUMENTAL_CAPTION_CLAUSE));
-}
-
-test "music3 instrumental tag override: a spelling, or 'none' for a bare lyric block" {
-    // The two MiniMax sources disagree on the tag and neither documents a
-    // track-level one, so the spelling is a lever, not a contract. `none` is
-    // the third arm: the hosted api says lyrics are NOT REQUIRED under
-    // `is_instrumental`, and the closest local equivalent to sending nothing is
-    // an EMPTY lyric body — `[start]` on its own.
-    try std.testing.expectEqualStrings("", markerFromEnvValue("none"));
-    try std.testing.expectEqualStrings("", markerFromEnvValue("NONE"));
-    try std.testing.expectEqualStrings("[Inst]", markerFromEnvValue("[Inst]"));
-    // Unset or blank keeps the default rather than silently emptying the block.
-    try std.testing.expectEqualStrings(INSTRUMENTAL_LYRICS, markerFromEnvValue(null));
-    try std.testing.expectEqualStrings(INSTRUMENTAL_LYRICS, markerFromEnvValue("   "));
 }
 
 test "music3 instrumental with an empty marker still assembles a legal lyric block" {

@@ -1,9 +1,11 @@
 #!/bin/bash
 # test_kv_quant_fused_equivalence.sh — packed quantized-KV reads at --kv-quant 4: dense vs fused agree on the first
 # KV_FUSED_FIRST_N (25) greedy tokens AND engage both ways (fused logs `[kv-attn] fused engaged` + `decode kernel
-# engaged`, dense neither). Boots MLX_SERVE_KV_ATTN_MIN_TK=1 so a short prompt reaches the fused paths. The spec-on arm
+# engaged`, dense neither). Both prompts carry a filler preamble past the 2048-token KV floor of the fused paths. The
+# spec-on arm
 # (PLD, echo prompt) pins the decode kernel to t_q == 1 (`Tq=1`) and greedy equivalence; the third arm
-# (KV_VERIFY_SPEC_MODEL, default Qwen3.5-0.8B, hd 256) asserts `[kv-attn] verify kernel engaged` + PLD engagement.
+# (KV_VERIFY_SPEC_MODEL, default Qwen3.5-0.8B, hd 256) asserts `[kv-attn] verify kernel engaged` + PLD engagement
+# (off NAX GPUs, where dense verify attention wins).
 # Rates are never asserted (one-run spec cells are variance).
 #
 #   ./tests/test_kv_quant_fused_equivalence.sh [/path/to/model] [port]
@@ -39,12 +41,14 @@ fi
 
 # Long-greedy memorized prompt (same as test_kv_quant_equivalence.sh).
 PROMPT='Recite the first paragraph of "A Tale of Two Cities" by Charles Dickens.'
+# Past the fused paths' 2048-token KV floor.
+FILLER=$(python3 -c "print('Reference notes, ignore them: ' + ' '.join(f'note{i}.' for i in range(900)))")
 
 JSON_PAYLOAD=$(python3 -c "
 import json
 print(json.dumps({
     'model': 'mlx-serve',
-    'messages': [{'role': 'user', 'content': '''$PROMPT'''}],
+    'messages': [{'role': 'user', 'content': '''$FILLER''' + '\\n\\n' + '''$PROMPT'''}],
     'max_tokens': 200,
     'temperature': 0.0,
     'stream': False,
@@ -61,9 +65,7 @@ run_and_tokenize() {
     echo "  starting server ($label)..." >&2
     local logfile
     logfile=$(mktemp)
-    # MIN_TK=1: the per-layer kv floor is a PERF gate; this test's short
-    # prompt must still exercise the fused read paths for correctness.
-    MLX_SERVE_KV_ATTN_MIN_TK=1 "$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant 4 $extra ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$logfile" 2>&1 &
+    "$BINARY" --model "$MODEL" --serve --port "$PORT" --kv-quant 4 $extra ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$logfile" 2>&1 &
     local pid=$!
     local up=0 i
     for i in $(seq 1 60); do
@@ -212,7 +214,7 @@ SPEC_PAYLOAD=$(python3 -c "
 import json
 print(json.dumps({
     'model': 'mlx-serve',
-    'messages': [{'role': 'user', 'content': '''$SPEC_PROMPT'''}],
+    'messages': [{'role': 'user', 'content': '''$FILLER''' + '\\n\\n' + '''$SPEC_PROMPT'''}],
     'max_tokens': 96,
     'temperature': 0.0,
     'stream': False,
@@ -262,7 +264,7 @@ a='$3'.split(','); b='$4'.split(',')
 print(next(i for i,(x,y) in enumerate(zip(a,b)) if x!=y))")
     lp_payload=$(echo "$SPEC_PAYLOAD" | python3 -c "import sys,json; d=json.load(sys.stdin); d.update(max_tokens=$idx+1, logprobs=True, top_logprobs=2); print(json.dumps(d))")
     echo "  starting server (tie probe)..." >&2
-    MLX_SERVE_KV_ATTN_MIN_TK=1 "$BINARY" --model "$2" --serve --port "$PORT" --kv-quant 4 --kv-attn-mode dense --no-pld > /dev/null 2>&1 &
+    "$BINARY" --model "$2" --serve --port "$PORT" --kv-quant 4 --kv-attn-mode dense --no-pld > /dev/null 2>&1 &
     tp_pid=$!
     srv_wait_health "$BASE" 60 1 || true
     gap=$(echo "$lp_payload" | curl -s -X POST -H "Content-Type: application/json" -d @- "$BASE/v1/chat/completions" | python3 -c "
@@ -306,14 +308,15 @@ fi
 sleep 2
 VER_FUSED_COMPL=""
 VER_FUSED_TOK=""
-# =1 keeps every width on the kernel (the default declines past 12 q rows).
-MLX_SERVE_KV_ATTN_VERIFY=1 run_and_tokenize "verify fused" "--kv-attn-mode fused --pld --no-drafter" VER_FUSED_COMPL VER_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
+run_and_tokenize "verify fused" "--kv-attn-mode fused --pld --no-drafter" VER_FUSED_COMPL VER_FUSED_TOK "$SPEC_PAYLOAD" || exit 1
 MODEL="$SAVED_MODEL"
 if [ "${ENGAGED_SPEC:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} verify-arm fused boot never engaged PLD — the arm proves nothing."
     exit 1
 fi
-if [ "${ENGAGED_VERIFY:-0}" = "0" ]; then
+if [ "${ENGAGED_VERIFY:-0}" = "0" ] && sysctl -n machdep.cpu.brand_string 2>/dev/null | grep -q "M5"; then
+    echo -e "${YELLOW}SKIP${NC} verify kernel declined: a NAX GPU keeps dense verify attention."
+elif [ "${ENGAGED_VERIFY:-0}" = "0" ]; then
     echo -e "${RED}FAIL${NC} fused arm never logged '[kv-attn] verify kernel engaged' — verify widths silently fell to dense (dispatch hole; output equality cannot see it)."
     exit 1
 fi

@@ -181,7 +181,7 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .native_speculation = if (native) |m| .{
             .lane = mlx_stream.laneName(m),
             .block_size = mlx_stream.blockSize(m),
-            .sampled = generate_mod.Generator.dsparkStochEnabledFromEnv(env.span(.MLX_SERVE_DSV4_DSPARK_STOCH)),
+            .sampled = true,
         } else null,
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",

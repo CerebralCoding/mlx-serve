@@ -201,7 +201,7 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
         const b = self.mtpAdaptiveBucket(self.mtpKvLen());
         const prev_bucket = self.mtp_adaptive.bucket;
         const prev_arm = self.mtp_adaptive.arm;
-        const action = self.mtp_adaptive.serialTick(b, MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
+        const action = self.mtp_adaptive.serialTick(b);
         self.mtpAdaptiveSyncWindow(prev_bucket, prev_arm);
         // Re-entry only when the head can prove it is in sync (else `qwen4MtpForward` returns
         // `error.MtpPositionGap`). A decline latches: the drift cannot shrink on its own.
@@ -280,7 +280,7 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
     // Either the PREVIOUS round built + dispatched chunk A at its tail
     // (cross-round pipelining, `mtpMaybePreDraft` — the drafts are
     // already materializing on the GPU) or we build it here (round 1,
-    // MLX_SERVE_MTP_PREDRAFT=0, or a round with no successor state).
+    // pre-draft off, or a round with no successor state).
     //
     // No head-cache snapshot in either case: a snapshot refcount-shares
     // the head's KV buffer, which forces every draft append's

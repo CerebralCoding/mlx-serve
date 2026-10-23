@@ -42,7 +42,7 @@ const moeRoutingChain = @import("routing.zig").moeRoutingChain;
 // differs (a simd tree vs MLX's N_READS blocking), which cannot move a bf16
 // result except at an exact rounding boundary.
 //
-// Kill switch: MLX_SERVE_MOE_ROUTER_FUSED=0. Engagement is LOGGED, never
+// Engagement is LOGGED, never
 // inferred — a declined kernel is output-identical to the chain.
 /// `sigmoid_bias_grouped` is `sigmoid_bias` with a GROUP LIMIT spliced
 /// between the bias and the top-k: the experts are split into NG equal groups,

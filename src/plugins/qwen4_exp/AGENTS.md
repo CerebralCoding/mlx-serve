@@ -52,7 +52,7 @@ an in-checkpoint MTP layer, a Qwen3-VL tower. Packs, oracle: `docs/reference.md`
   streams at 0.999. GDN state + gate in f32 (`MLX_SERVE_GDN_STATE_F32=0` = bf16), its own SSD namespace.
 - Tiny MoE oracles tie everywhere: fixtures dump the reference's own margins; `Qwen4Ties` acquits by those.
 - MTP head state is a `Qwen4MtpState` swapped onto the module (`qwen4MtpActivate` before EVERY head touch); the head
-  projects only the consumed row; batched verify is opt-in (`MLX_SERVE_MTP_BATCHED_QWEN4`).
+  projects only the consumed row; its rounds stay solo (`mtpRoundsStaySolo`).
 - A fast path keyed on one pack's quant layout is silent on another's: new pack layout => `tests/qwen4_engagement.sh`.
 - Decode is kernel-time and dispatch bound: a kernel that replaces ONE dispatch loses to MLX's qmv; rows per simdgroup
   is an occupancy decision (sweep in situ). Meters: `fwd-ubench`, `MLX_SERVE_STEP_TRACE=1`.

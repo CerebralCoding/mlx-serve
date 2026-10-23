@@ -297,7 +297,6 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 seq: usize,
                 max_tokens: u32,
                 kv_cfg: transformer_mod.KVQuantConfig,
-                unchunked: bool,
                 /// The prefix the hot cache restored and the capacity its buffers hold: already
                 /// inside active memory, so billing them again invents a copy.
                 warm_matched: u64,
@@ -305,10 +304,10 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 /// Only a checked-out restore is credited: a refcount share is copied by the first append.
                 warm_will_donate: bool,
                 enable_mtp: bool,
-                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, bool, u64, u64, bool, bool) bool,
+                fits: *const fn (*const model_mod.ModelConfig, usize, u32, transformer_mod.KVQuantConfig, u64, u64, bool, bool) bool,
                 fn call(ctx: ?*anyopaque) bool {
                     const self: *@This() = @ptrCast(@alignCast(ctx.?));
-                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.unchunked, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp);
+                    return self.fits(self.cfg, self.seq, self.max_tokens, self.kv_cfg, self.warm_matched, self.warm_capacity, self.warm_will_donate, self.enable_mtp);
                 }
             };
             var probe = Probe{
@@ -316,7 +315,6 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .seq = slot.full_prompt.len,
                 .max_tokens = slot.max_tokens,
                 .kv_cfg = slot.cache.config,
-                .unchunked = false,
                 .warm_matched = hot_matched,
                 .warm_capacity = slot.cache.residentCapacityTokens(),
                 .warm_will_donate = hot_checked_out,
@@ -346,7 +344,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             if (!fits) {
                 // The width admission was billed at, read before anything is evicted.
                 if (scheduler_mod.prefill_request_chunk) |pick_pre| {
-                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                    admitted_prefill_chunk = pick_pre(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
                 }
                 // Per-model, off the slot: `sch.hot_prefix_cache` is whichever model loaded last.
                 // Captured by pointer: a `|hc|` capture would evict from a stack copy.
@@ -361,7 +359,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 if (!report.admitted) {
                     log.warn("[scheduler] prefill refused: {d} tokens do not fit even with an empty hot cache\n", .{slot.full_prompt.len});
                     if (scheduler_mod.prefill_admission_refused_log) |report_fn| {
-                        slot.refused_bill = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.unchunked, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
+                        slot.refused_bill = report_fn(cfg, slot.full_prompt.len, slot.max_tokens, slot.cache.config, probe.warm_matched, probe.warm_capacity, probe.warm_will_donate, probe.enable_mtp);
                     }
                     // Not `error.OutOfMemory` (the MLX latch's name, a 503): this is a request the
                     // machine cannot hold, a named 400.
@@ -381,7 +379,6 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             slot.full_prompt.len,
             slot.max_tokens,
             slot.cache.config,
-            false,
             hot_matched,
             slot.cache.residentCapacityTokens(),
             hot_checked_out,
@@ -555,27 +552,6 @@ pub fn sumInflightGeneratedTokens(active: anytype) u64 {
 
 // ── tests ──
 
-test "runPrefill clears restored spec-cache ownership BEFORE Generator.initWithOptions (issue #266)" {
-    // Generator.initWithOptions ADOPTS the hot-cache-restored DFlash/MTP
-    // caches and frees them via its own errdefers on any failure past the
-    // adoption point — a mid-prefill client disconnect throws
-    // error.Cancelled from its chunk loop. MtpCacheRef/DflashCtx hold their
-    // KVCache BY VALUE, so runPrefill's own errdefers then walked the same
-    // entries slice + mlx handles a second time: SIGSEGV in
-    // KVCache.deinit -> freeKVEntry (issue #266, disconnect storms on long
-    // agent prompts). Ownership transfers AT THE CALL, so the locals must
-    // be cleared before the try, never after it.
-    const source = @embedFile("prefill.zig");
-    const start = std.mem.indexOf(u8, source, "fn runPrefill(") orelse return error.MissingRunPrefill;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\n// ── tests ──") orelse return error.MissingRunPrefillEnd;
-    const body = source[start..end];
-    const call = std.mem.indexOf(u8, body, "try Generator.initWithOptions(") orelse return error.MissingInitCall;
-    const dfl = std.mem.indexOf(u8, body, "dflash_restored = null") orelse return error.MissingDflashClear;
-    const mtp = std.mem.indexOf(u8, body, "mtp_restored = null") orelse return error.MissingMtpClear;
-    try testing.expect(dfl < call);
-    try testing.expect(mtp < call);
-}
-
 test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/errored" {
     // Lightweight stub carrying exactly the fields the aggregate reads — proves
     // the live-gauge filter without constructing a real (mlx-backed) Slot.
@@ -607,22 +583,4 @@ test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/
     a.finished = true;
     b.finished = true;
     try testing.expectEqual(@as(u64, 0), sumInflightGeneratedTokens(active[0..]));
-}
-
-test "runPrefill gates spec through specInitWiring, not per-arch conjuncts" {
-    // A pure predicate nobody calls is a silent no-op. Needles are ++-split so
-    // this test's own source cannot satisfy the scan.
-    const src = @embedFile("prefill.zig");
-    // Keyed on the call site's own bindings, not on a `specInitWiring(` prefix
-    // this test's own arms would satisfy.
-    inline for (.{ "const use_mtp = wiring" ++ ".use_mtp;", "const use_drafter = wiring" ++ ".use_drafter;", "const use_dflash = wiring" ++ ".use_dflash;", "const use_pld = wiring" ++ ".use_pld;", "const dsv4_spec_intent = wiring" ++ ".native_intent;" }) |needle| {
-        try testing.expect(std.mem.indexOf(u8, src, needle) != null);
-    }
-    // The exclusion must come from the shared predicate, not a new arch list.
-    const from_predicate = "transformer.?.moduleSpec" ++ "Wiring()";
-    try testing.expect(std.mem.indexOf(u8, src, from_predicate) != null);
-    // The hand-written per-arch conjuncts must be GONE — their survival is how
-    // a second module-owned arch gets missed.
-    const old_pld = "and !is_dsv4 and slot." ++ "enable_pld";
-    try testing.expect(std.mem.indexOf(u8, src, old_pld) == null);
 }

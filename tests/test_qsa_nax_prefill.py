@@ -1,10 +1,10 @@
 #!/usr/bin/env python3
 """HTTP correctness and engagement guard; point at a disposable server with cache off.
 
-MLX_SERVE_QSA_NAX=1 MLX_SERVE_PREFILL_CHUNK=4096 zig-out/bin/mlx-serve serve \
+zig-out/bin/mlx-serve serve --prefill-chunk 4096 \
   --port 18765 --ctx-size 131072 --prefix-cache-entries 0 > /tmp/qsa-server.log 2>&1
 python3 tests/test_qsa_nax_prefill.py --log /tmp/qsa-server.log --nax on
-Repeat with MLX_SERVE_QSA_NAX=0 and --nax off for the stock arm.
+On a GPU without NAX, pass --nax off for the stock arm.
 """
 import argparse
 import json

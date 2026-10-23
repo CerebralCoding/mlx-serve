@@ -437,15 +437,6 @@ pub const State = struct {
         return .{ .phase = .choice };
     }
 
-    fn pushTail(self: *State, byte: u8) void {
-        if (self.tail_len < MAX_MARKER_BYTES) {
-            self.tail[self.tail_len] = byte;
-            self.tail_len += 1;
-        } else {
-            std.mem.copyForwards(u8, self.tail[0 .. MAX_MARKER_BYTES - 1], self.tail[1..]);
-            self.tail[MAX_MARKER_BYTES - 1] = byte;
-        }
-    }
 };
 
 // ── Choice-phase opener predicates ───────────────────────────────────────────

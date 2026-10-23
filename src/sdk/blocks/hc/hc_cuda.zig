@@ -138,7 +138,7 @@ pub fn read(
     }
     if (!engaged) {
         engaged = true;
-        log.info("[qwen4] CUDA two-launch hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit (MLX_SERVE_HC_FUSED=0 restores the unfused chain)\n", .{ hc, hidden, R, bits });
+        log.info("[qwen4] CUDA two-launch hyper-connection read engaged: hc={d} hidden={d} lowrank={d} {d}-bit\n", .{ hc, hidden, R, bits });
     }
     served += 1;
     return .{ .mixed = upmix[0], .inj = inj_out, .stream = stream };

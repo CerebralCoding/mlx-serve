@@ -424,8 +424,7 @@ gc = gradient(a, conv["width"], conv["height"], conv["frames"])
 gd = gradient(b, diff["width"], diff["height"], diff["frames"])
 print(f"adjacent-pixel gradient: conv {gc:.2f}  diffusion {gd:.2f}  ratio {gd / max(gc, 1e-6):.2f}")
 if gd > gc * 2.0 + 2.0:
-    print("FAIL: decoder=diffusion decoded to STATIC — check the sampler contract "
-          "(MLX_SERVE_DIFFVAE_OUTPUT/STEPS/TSCALE)"); sys.exit(1)
+    print("FAIL: decoder=diffusion decoded to STATIC — check the sampler contract (diffvae Sampler.default)"); sys.exit(1)
 print(f"PASS: decoder=diffusion decoded {diff['frames']}f, real picture, differs from conv")
 PYEOF
   fi

@@ -59,7 +59,7 @@ pub fn slidingViewFor(cfg: *const ModelConfig, total_kv: c_int, seq_len: c_int) 
     // trim did something — decode has always trimmed to the window.
     if (!sliding_block_trim_logged and span > cfg.sliding_window and kv_len < total_kv) {
         sliding_block_trim_logged = true;
-        log.info("[sliding] block trim engaged: window={d} q_len={d} span={d} kv={d} of {d} (MLX_SERVE_SLIDING_BLOCK_TRIM=0 restores the untrimmed view)\n", .{ cfg.sliding_window, seq_len, span, kv_len, total_kv });
+        log.info("[sliding] block trim engaged: window={d} q_len={d} span={d} kv={d} of {d}\n", .{ cfg.sliding_window, seq_len, span, kv_len, total_kv });
     }
     return .{ .span = span, .kv_len = kv_len, .band_in_kernel = band };
 }

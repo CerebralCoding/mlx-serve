@@ -352,9 +352,7 @@ fn qwen4MixedModelPacksMatch(target: *const Transformer) bool {
 /// Live resolver for the qwen4_exp head: validates the runtime fingerprint
 /// the G17 surface was measured on — uniform affine-4/gs-64 config and both
 /// head fc packs at that width (K derived from the scales, so no input-dim
-/// formula is assumed). Revoked by MLX_SERVE_VERIFY_QMM_NAX=0 like the
-/// sidecar profiles: auto depth never assumes a lane the environment
-/// disabled.
+/// formula is assumed).
 pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
     return qwen4G17CostProfileForKv(target, target.cache.config);
 }
@@ -642,8 +640,7 @@ pub const MtpModel = struct {
     /// first `nextMtp` round of the next request. A fresh controller burns
     /// ~10 legacy-warmup rounds plus a +1/round base climb per request —
     /// a third of a short protocol-style generation; seeding restores the
-    /// learned surface from round 1. Never written by disabled/short runs;
-    /// set MLX_SERVE_MTP_EV_SEED=0 to opt into request isolation.
+    /// learned surface from round 1. Never written by disabled/short runs.
     ev_seed_accept: ?[MAX_DEPTH]f32 = null,
     ev_seed_m_lo: u32 = 1,
 
@@ -771,12 +768,6 @@ pub const MtpModel = struct {
             cfg.hidden_size,
             cfg.vocab_size,
         )) profile else .generic;
-    }
-
-    /// Legacy q8 boolean view retained for source compatibility. New callers
-    /// should use `m5NaxCostProfile` to distinguish q8 and q4 surfaces.
-    pub fn m5NaxCostProfileEnabled(self: *const MtpModel, target: *const Transformer) bool {
-        return self.m5NaxCostProfile(target) == .g17_nax_q8_gs32;
     }
 
     /// Validate the head against the target trunk: dims must line up and the
@@ -1217,19 +1208,6 @@ pub fn shortlistArgmax(s: mlx.mlx_stream, sl: Shortlist) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&out, picked, .int32, s));
     return out;
-}
-
-fn rerankRescoreRow(
-    s: mlx.mlx_stream,
-    target: *Transformer,
-    coarse: *?RerankCoarse,
-    flat: mlx.mlx_array,
-    rows: c_int,
-    x_row: mlx.mlx_array,
-) !?mlx.mlx_array {
-    var sl = (try rerankShortlistRow(s, target, coarse, flat, rows, x_row)) orelse return null;
-    defer sl.deinit();
-    return try shortlistArgmax(s, sl);
 }
 
 /// The coarse full-vocab readout of one row as a flat `[rows]` array, reserved
@@ -2561,13 +2539,6 @@ inline fn headSkipsRope(cfg: *const model_mod.ModelConfig) bool {
     return cfg.layerSkipsRope(cfg.num_hidden_layers);
 }
 
-/// A second owned handle to the same array (refcount share, no copy).
-inline fn shareArr(x: mlx.mlx_array) !mlx.mlx_array {
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_array_set(&out, x));
-    return out;
-}
-
 inline fn rmsNormFn(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_fast_rms_norm(&out, x, w, eps, s));
@@ -3005,7 +2976,6 @@ pub var mtp_kv_only_override: ?bool = null; // test seam
 /// class): a committed-history row's layer OUTPUT has no consumer — only its
 /// K/V entries matter — so the q(+gate) projection, the attention, and the
 /// whole post-attention half are dead work for every row but the last.
-/// MLX_SERVE_MTP_KV_ONLY=0 restores the full-forward history path.
 fn mtpKvOnlyEnabled() bool {
     return mtp_kv_only_override orelse true;
 }

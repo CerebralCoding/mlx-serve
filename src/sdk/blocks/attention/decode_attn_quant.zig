@@ -1,5 +1,5 @@
 //! sdk/blocks/attention/decode_attn_quant, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns AttnDqCopy, attnDqUseNvfp4, attn_dq_nvfp4_from_env, attnDqNvfp4FromEnv, attn_dq_engaged, attn_dq_nvfp4_engaged, and 11 more.
+//! Owns AttnDqCopy, attnDqUseNvfp4, attn_dq_engaged, attn_dq_nvfp4_engaged, and 11 more.
 
 const std = @import("std");
 const env = @import("../../../env.zig");
@@ -38,32 +38,18 @@ pub const AttnDqCopy = struct {
 /// layers amplify quantization error far less (mlxfast measured ~15x lower on
 /// layers >= 32 of 40), so the tail can afford real nvfp4-g16 (half the int8
 /// bytes) while early layers keep int8-g32. Default tail = the last 20% of
-/// layers; MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM=<n> moves the boundary,
-/// `off` keeps the whole stack int8.
-pub fn attnDqUseNvfp4(layer: u32, num_layers: u32, from_override: ?i64) bool {
+/// layers (`attnDqNvfp4From`).
+pub fn attnDqUseNvfp4(layer: u32, num_layers: u32) bool {
     if (num_layers == 0) return false;
-    const from: i64 = from_override orelse @intCast((num_layers * 4) / 5);
-    if (from < 0) return false; // "off"
-    return @as(i64, layer) >= from;
+    return layer >= attnDqNvfp4From(num_layers);
 }
 
-var attn_dq_nvfp4_from_env: ??i64 = null; // outer null = unread; inner null = env unset
-pub fn attnDqNvfp4FromEnv() ?i64 {
-    if (attn_dq_nvfp4_from_env) |v| return v;
-    const parsed: ?i64 = blk: {
-        const raw = env.get(.MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM) orelse break :blk null;
-        const s = std.mem.sliceTo(raw, 0);
-        if (std.mem.eql(u8, s, "off")) break :blk -1;
-        break :blk std.fmt.parseInt(i64, s, 10) catch null;
-    };
-    attn_dq_nvfp4_from_env = parsed;
-    return parsed;
+pub fn attnDqNvfp4From(num_layers: u32) u32 {
+    return (num_layers * 4) / 5;
 }
 
 pub var attn_dq_engaged: bool = false;
 pub var attn_dq_nvfp4_engaged: bool = false;
-
-var decode_attn_quant_cached: ?bool = null;
 
 /// Default ON (2026-07-29 characterization on Laguna XS: decode forward
 /// 13.285 -> 10.205 ms median, 3/3 paired boots both orders; greedy outputs
@@ -73,15 +59,12 @@ var decode_attn_quant_cached: ?bool = null;
 pub const DECODE_ATTN_QUANT_DEFAULT = true;
 
 /// Whether the user EXPLICITLY asked for --decode-attn-quant (CLI flag, app
-/// toggle, or env "1") as opposed to riding the silent default. Archs whose
+/// toggle) as opposed to riding the silent default. Archs whose
 /// characterization showed ANSWER MOVEMENT under the requant gate on this
 /// form (dsv4 comp_in: one duplicated paragraph on 1/7 greedy prompts,
 /// 2026-08-01); laguna's clean characterization keeps the plain default.
 pub fn decodeAttnQuantExplicit() bool {
     if (transformer.decode_attn_quant_override) |v| return v; // test seam counts as explicit
-    if (env.get(.MLX_SERVE_DECODE_ATTN_QUANT)) |raw| {
-        return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
-    }
     return transformer.decode_attn_quant_flag orelse false;
 }
 
@@ -94,17 +77,7 @@ pub fn attnDqRequantEnabled() bool {
 
 pub fn decodeAttnQuantEnabled() bool {
     if (transformer.decode_attn_quant_override) |v| return v;
-    if (decode_attn_quant_cached) |v| return v;
-    const enabled = blk: {
-        // Env wins over the flag: it is the bench scripts' A/B hand
-        // (fwd_ubench/prefill_ab pass env, not flags).
-        if (env.get(.MLX_SERVE_DECODE_ATTN_QUANT)) |raw| {
-            break :blk std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
-        }
-        break :blk transformer.decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;
-    };
-    decode_attn_quant_cached = enabled;
-    return enabled;
+    return transformer.decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;
 }
 
 /// `attnProj` is reached only from the MoE/qwen4 forward, and not by its MLA or Gemma 4 arms.
@@ -302,19 +275,14 @@ test "decode-attn-quant: an 8-bit affine weight's nvfp4 copy tracks its own proj
     try std.testing.expect(max_diff < 0.6 and max_diff > 0.0);
 }
 
-test "decode-attn-quant: nvfp4 tail boundary is the last 20% of layers; env moves or kills it" {
+test "decode-attn-quant: nvfp4 tail boundary is the last 20% of layers" {
     const t = std.testing;
     // Laguna XS: 40 layers -> nvfp4 from layer 32 (mlxfast's measured split).
-    try t.expect(!attnDqUseNvfp4(31, 40, null));
-    try t.expect(attnDqUseNvfp4(32, 40, null));
-    try t.expect(attnDqUseNvfp4(39, 40, null));
-    // Explicit boundary wins.
-    try t.expect(attnDqUseNvfp4(10, 40, 10));
-    try t.expect(!attnDqUseNvfp4(9, 40, 10));
-    // "off" (-1 sentinel): int8 everywhere.
-    try t.expect(!attnDqUseNvfp4(39, 40, -1));
+    try t.expect(!attnDqUseNvfp4(31, 40));
+    try t.expect(attnDqUseNvfp4(32, 40));
+    try t.expect(attnDqUseNvfp4(39, 40));
     // Degenerate layer count never divides by zero or engages.
-    try t.expect(!attnDqUseNvfp4(0, 0, null));
+    try t.expect(!attnDqUseNvfp4(0, 0));
 }
 
 test "weightsHaveDenseAttnProj: decode-attn-quant applies only to a dense text attention projection" {

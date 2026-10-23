@@ -708,16 +708,6 @@ pub fn gpuStream() mlx_stream {
     return if (noGpuBackend()) mlx_default_cpu_stream_new() else mlx_default_gpu_stream_new();
 }
 
-/// Print an array for debugging
-pub fn printArray(label: []const u8, arr: mlx_array) void {
-    _ = mlx_array_eval(arr);
-    var str = mlx_string_new();
-    _ = mlx_array_tostring(&str, arr);
-    const data = mlx_string_data(str);
-    log.debug("{s}: {s}\n", .{ label, data });
-    _ = mlx_string_free(str);
-}
-
 /// Get array shape as a Zig slice
 pub fn getShape(arr: mlx_array) []const c_int {
     const ndim = mlx_array_ndim(arr);
@@ -987,6 +977,9 @@ fn defaultDeviceInfoSize(key: [*:0]const u8) usize {
     return v;
 }
 
+/// Headroom the wired fit leaves above active memory for scratch.
+const WIRED_SLACK_BYTES: usize = 64 << 20;
+
 /// Apply the wired-residency policy. Call on the inference thread AFTER a
 /// model load or unload completes (and from the offline run path after load)
 /// so `fit` capacity tracks the live set. The caller logs the result.
@@ -1012,12 +1005,7 @@ pub fn applyWiredPolicy() WiredPolicyResult {
             const max_rec = maxRecommendedWorkingSet();
             var active: usize = 0;
             _ = mlx_get_active_memory(&active);
-            const slack_mb: usize = blk: {
-                const raw_c = env.get(.MLX_SERVE_WIRED_SLACK_MB) orelse break :blk 64;
-                const raw = std.mem.span(raw_c);
-                break :blk std.fmt.parseInt(usize, raw, 10) catch 64;
-            };
-            const target = wiredFitTarget(active, slack_mb << 20, max_rec) orelse
+            const target = wiredFitTarget(active, WIRED_SLACK_BYTES, max_rec) orelse
                 return .{ .mode = mode, .target = null };
             // Shrink-then-grow forces ResidencySet::resize to re-walk, pulling
             // buffers allocated since the last apply out of the unwired set.
@@ -1318,15 +1306,8 @@ fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
     log.err("[mlx] {s}\n", .{span});
 }
 
-/// Install the latching handler. Called once from `main()`. `MLX_SERVE_MLX_ERROR_LATCH=0`
-/// restores mlx-c's `exit(-1)` handler.
+/// Install the latching handler. Called once from `main()`.
 pub fn installErrorHandler() void {
-    if (env.get(.MLX_SERVE_MLX_ERROR_LATCH)) |p| {
-        if (std.mem.eql(u8, std.mem.span(p), "0")) {
-            log.info("[mlx] error latch disabled — an MLX error will exit the process\n", .{});
-            return;
-        }
-    }
     mlx_set_error_handler(latchMlxError, null, null);
 }
 

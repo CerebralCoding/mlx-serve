@@ -3,6 +3,7 @@
 //! folder and freed after.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const abi = @import("../../abi/media.zig");
 const sdk = @import("../../sdk/root.zig");
 const job = @import("../../host/media_jobs/plugin_job.zig");
@@ -60,7 +61,7 @@ fn hasConfig(io: std.Io, dir: []const u8) bool {
 /// The paint stage's folder: `HY3D_PAINT_DIR` (the only candidate when set), else `<pack>/paint` (one download),
 /// else the converter's sibling `<parent>/hunyuan3d-2-1-paint-8bit`. Caller frees.
 pub fn paintDir(io: std.Io, a: std.mem.Allocator, shape_dir: []const u8) ?[]u8 {
-    if (std.c.getenv("HY3D_PAINT_DIR")) |v| {
+    if (env.get(.HY3D_PAINT_DIR)) |v| {
         const p = std.mem.span(v);
         return if (hasConfig(io, p)) a.dupe(u8, p) catch null else null;
     }

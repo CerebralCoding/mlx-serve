@@ -148,22 +148,11 @@ pub fn chipBrandString(buf: []u8) []const u8 {
     return buf[0..len];
 }
 
-/// Per-(mode, silicon) default share. Every row is a MEASURED optimum of its
-/// own sweep — never interpolated (a share change needs its own A/B):
-///   channel / M4 Max: 0.45 (2026-08-18, Qwen3.8-27B oQ4e: 0.40/0.45/0.50
-///     ranked 305/311/297 at 16k — rollover at 0.50).
-///   channel / M3 Ultra: 0.35 (PR #223 tester, 2026-08-19, same pack 4-bit:
-///     0.45 ≈ +1% at 32k — nothing; sweep 0.45/0.40/0.35/0.30 ranked
-///     398/421/440/438 at 32k; clean post-reboot 0.35 A/B +0.2%/+8.5%/+13.7%
-///     at 8k/16k/32k, reproduced 3x incl. across a reboot — and the smaller
-///     share also drops the int8 copy 9.47 → 7.30 GB).
-///   row / M4 Max: 0.40 (2026-08-17: 0.30 +10/+14%, 0.40 +12/+18%, 0.50
-///     regresses). Row is unmeasured elsewhere and keeps the M4 row.
-/// The DUAL default is deliberately the same number: MLX_SERVE_ANE_SPLIT is
-/// the TOTAL ANE share either way, halved across the units, so every
-/// measurement above carries over unchanged — and the dual optimum is
-/// EXPECTED to sit higher (halving the ANE critical path is the whole
-/// point), which is a re-sweep, not an interpolation.
+/// Per-silicon default share. Every row is a MEASURED optimum of its own sweep, never interpolated (a share change
+/// needs its own A/B):
+///   M4 Max: 0.45 (2026-08-18, Qwen3.8-27B oQ4e: 0.40/0.45/0.50 ranked 305/311/297 at 16k — rollover at 0.50).
+///   M3 Ultra: 0.35 (PR #223 tester, 2026-08-19: 0.45/0.40/0.35/0.30 ranked 398/421/440/438 at 32k; the smaller share
+///     also drops the int8 copy 9.47 → 7.30 GB); dual 0.50. The share is the TOTAL ANE share, halved across units.
 pub fn defaultShare(chip: []const u8) f32 {
     return defaultShareFor(chip, dualDefault(chip));
 }
@@ -194,8 +183,7 @@ pub fn splitShare() f32 {
 // ── Media offload (image / video / audio DiTs) ──
 
 /// The three media seams' switches and the explicit share, set ONCE in
-/// `main()` from `--ane-image/--ane-video/--ane-audio` + `--ane-split` (or
-/// MLX_SERVE_ANE_SPLIT). The seams sit under gen.zig with no server config
+/// `main()` from `--ane-image/--ane-video/--ane-audio` + `--ane-split`. The seams sit under gen.zig with no server config
 /// in reach, so this is process-global like `applyMlxCacheLimit`.
 pub const MediaOffload = struct {
     image: bool = false,
@@ -780,8 +768,6 @@ pub const Unit = struct {
     gdn_layers: []?ProgramRef,
     banks: std.ArrayList(*MsvAneMlp) = .empty,
     plane_in: ?*MsvAnePlane = null,
-    /// False when this unit borrows unit 0's input plane
-    /// (MLX_SERVE_ANE_DUAL_SHARE_INPUT=1).
     plane_mlp_out: ?*MsvAnePlane = null,
     plane_gdn_out: ?*MsvAnePlane = null,
 
@@ -1179,10 +1165,6 @@ pub const AnePrefill = struct {
         return n;
     }
 
-    pub fn numLayers(self: *const AnePrefill) usize {
-        return self.units[0].layers.len;
-    }
-
     pub fn mlpReady(self: *const AnePrefill, layer: usize) bool {
         if (layer >= self.units[0].layers.len) return false;
         for (self.units) |*u| {
@@ -1278,7 +1260,7 @@ pub const AnePrefill = struct {
     /// check (`macpow --dump | grep ANE0_` must move BOTH counters).
     pub fn logDualReady(self: *AnePrefill) void {
         if (self.units.len < 2) return;
-        log.info("[ane] dual engaged: {d} units pinned to instances {d}..{d}, {d} channels each of mlp / {d}+{d} of gdn (verify BOTH IOReport ANE0_ counters move; MLX_SERVE_ANE_DUAL=0 restores single-ANE)\n", .{
+        log.info("[ane] dual engaged: {d} units pinned to instances {d}..{d}, {d} channels each of mlp / {d}+{d} of gdn (verify BOTH IOReport ANE0_ counters move)\n", .{
             self.units.len,
             self.units[0].instance,
             self.units[self.units.len - 1].instance,
@@ -1405,8 +1387,7 @@ pub fn dequantToHostF32(
 
 /// Fill every unit's input plane with the same packed activation. The pack is
 /// done ONCE and memcpy'd into the other units (~1.7 ms on the 27B against a
-/// ~20 ms eval); MLX_SERVE_ANE_DUAL_SHARE_INPUT=1 shares one surface and skips
-/// the copy. The wait stays BLOCKING and on this thread: oMLX measured that
+/// ~20 ms eval). The wait stays BLOCKING and on this thread: oMLX measured that
 /// moving it to a worker, or launching the ANE from the Metal completion
 /// callback, destroyed device overlap (a fused layer 47.5 -> 71.0 ms).
 pub fn packUnitPlanes(s: mlx.mlx_stream, eng: *AnePrefill, x: mlx.mlx_array) !void {
@@ -1416,7 +1397,6 @@ pub fn packUnitPlanes(s: mlx.mlx_stream, eng: *AnePrefill, x: mlx.mlx_array) !vo
     const count: usize = @as(usize, eng.hidden) * eng.rows;
     for (eng.units[1..]) |*u| {
         const plane = u.inputBase() orelse return error.AnePlaneMissing;
-        if (plane == first) continue; // shared surface
         @memcpy(plane[0..count], first[0..count]);
     }
 }
@@ -1803,8 +1783,7 @@ test "channelSliceWidth: 128-aligned slice, GPU remainder, degenerate shares" {
 }
 
 test "channelSliceWidthUnits: the share is TOTAL, halved across units, GPU keeps a slice" {
-    // MLX_SERVE_ANE_SPLIT keeps meaning the total fraction taken off the
-    // GPU, so every single-ANE measurement carries over: two units at 0.40
+    // The share is the total fraction taken off the GPU, so every single-ANE measurement carries over: two units at 0.40
     // take the same 40% of channels one unit at 0.40 does.
     const k1 = channelSliceWidthUnits(17408, 0.40, 1);
     const k2 = channelSliceWidthUnits(17408, 0.40, 2);

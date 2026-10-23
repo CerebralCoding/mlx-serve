@@ -7,7 +7,6 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
-const gather_qmv_mod = @import("gather_qmv.zig");
 const standin = @import("../../diag/standin.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;

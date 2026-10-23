@@ -29,4 +29,4 @@ answers `{"warmed":true,"cache":"hit"|"miss"}`). Generation stops at codec EOS o
 ## Fixtures
 - `conformanceFixture`: talker + predictor at hidden 32 (one layer each), byte-level tokenizer, decoder at latent
   16 / decoder 32; the codec head's EOS bias keeps a seeded job to a few frames.
-- Live: `tests/test_tts.sh`, `test_tts_quant.sh`, `test_tts_clone_cache.sh`, `test_tts_fastpath_equivalence.sh`.
+- Live: `tests/test_tts.sh`, `test_tts_quant.sh`, `test_tts_clone_cache.sh`.

@@ -698,7 +698,7 @@ fn handleResponsesInner(
     enable_mtp_resp = admitMtpForCtx(enable_mtp_resp, prompt_ids.len);
 
     // Check if attention computation would exceed GPU memory.
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, false, enable_mtp_resp, mm.bytes(config))) return;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, effective_max_tokens, config, false, kv_quant_override, lm, enable_mtp_resp, mm.bytes(config))) return;
 
     // ── sampling ──
     var sampling = generate_mod.SamplingParams{

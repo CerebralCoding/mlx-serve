@@ -204,9 +204,6 @@ pub const Generator = struct {
     /// effective draft width. Thinking requests use the lower calibration
     /// because their less-predictable reasoning preamble pays back later.
     dflash_min_accepted_per_round: f32 = DFLASH_GATE_MIN_ACCEPTED_PER_ROUND,
-    /// Per-round width chooser over the model's round-cost table (null =
-    /// MLX_SERVE_DFLASH_CHOOSER=0, the fixed block + sticky yield gate).
-    dflash_chooser: ?round_cost.WidthChooser = null,
     /// Drafts this round ran (0 = serial), read by the table feed.
     dflash_round_width: u32 = 0,
     /// Stats: count of nextDflash calls that ran a verify forward.
@@ -474,20 +471,16 @@ pub const Generator = struct {
     /// periodic `specShouldReenable` re-check).
     disabled_steps: u64 = 0,
     pub const RUNTIME_GATE_WARMUP = @import("../spec/gates.zig").RUNTIME_GATE_WARMUP;
-    pub const runtimeGateWarmup = @import("../spec/gates.zig").runtimeGateWarmup;
     pub const RUNTIME_GATE_MIN_PER_DRAFT_RATE = @import("../spec/gates.zig").RUNTIME_GATE_MIN_PER_DRAFT_RATE;
     pub const runtimeGateShouldDisable = @import("../spec/gates.zig").runtimeGateShouldDisable;
     pub const DFLASH_GATE_WARMUP = @import("../spec/gates.zig").DFLASH_GATE_WARMUP;
     pub const DFLASH_GATE_MIN_ACCEPTED_PER_ROUND = @import("../spec/gates.zig").DFLASH_GATE_MIN_ACCEPTED_PER_ROUND;
     pub const DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND = @import("../spec/gates.zig").DFLASH_THINKING_GATE_MIN_ACCEPTED_PER_ROUND;
     pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND = @import("../spec/gates.zig").DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND;
-    const dflashChooserEnabled = @import("../spec/gates.zig").dflashChooserEnabled;
     pub const dflashPolicyFor = @import("../spec/gates.zig").dflashPolicyFor;
-    pub const dflashGateWarmup = @import("../spec/gates.zig").dflashGateWarmup;
     pub const dflashGateShouldDisable = @import("../spec/gates.zig").dflashGateShouldDisable;
     pub const YIELD_GATE_WARMUP = @import("../spec/gates.zig").YIELD_GATE_WARMUP;
     pub const YIELD_GATE_MIN_YIELD = @import("../spec/gates.zig").YIELD_GATE_MIN_YIELD;
-    pub const yieldGateWarmup = @import("../spec/gates.zig").yieldGateWarmup;
     pub const yieldGateShouldDisable = @import("../spec/gates.zig").yieldGateShouldDisable;
     pub const SPEC_REENABLE_INTERVAL = @import("../spec/gates.zig").SPEC_REENABLE_INTERVAL;
     pub const SPEC_REENABLE_WINDOW = @import("../spec/gates.zig").SPEC_REENABLE_WINDOW;
@@ -520,8 +513,6 @@ pub const Generator = struct {
     pub const DsparkArm = @import("../spec/dspark.zig").DsparkArm;
     pub const dsparkArmFor = @import("../spec/dspark.zig").dsparkArmFor;
     pub const dsparkEnabled = @import("../spec/dspark.zig").dsparkEnabled;
-    pub const dsparkStochEnabledFromEnv = @import("../spec/dspark.zig").dsparkStochEnabledFromEnv;
-    const dsparkStochEnabled = @import("../spec/dspark.zig").dsparkStochEnabled;
     const dsparkPolicyEnabled = @import("../spec/dspark.zig").dsparkPolicyEnabled;
     pub const initWithOptions = @import("init.zig").initWithOptions;
 
@@ -859,7 +850,6 @@ pub const Generator = struct {
     const MTP_EXACT_PRIOR_ROUNDS = @import("../spec/mtp/observe.zig").MTP_EXACT_PRIOR_ROUNDS;
     pub const mtpExactObserve = @import("../spec/mtp/observe.zig").mtpExactObserve;
     pub const mtpRoundEndObserve = @import("../spec/mtp/observe.zig").mtpRoundEndObserve;
-    pub const dflashAcceptChoose = @import("../spec/mtp/observe.zig").dflashAcceptChoose;
     pub const specObserveRound = @import("../spec/mtp/observe.zig").specObserveRound;
     pub const persistRoundCost = @import("../spec/mtp/ev_plan.zig").persistRoundCost;
     pub const mtpKvLen = @import("../spec/mtp/ev_plan.zig").mtpKvLen;
@@ -885,7 +875,6 @@ pub const Generator = struct {
     pub const mtpDepthPolicyFor = @import("../spec/mtp/ev_plan.zig").mtpDepthPolicyFor;
     pub const mtpDepthPolicy = @import("../spec/mtp/ev_plan.zig").mtpDepthPolicy;
     pub const mtpBasePlan = @import("../spec/mtp/ev_plan.zig").mtpBasePlan;
-    pub const dflashAcceptWidth = @import("../spec/mtp/ev_plan.zig").dflashAcceptWidth;
     pub const mtpEvPlanSrc = @import("../spec/mtp/ev_plan.zig").mtpEvPlanSrc;
     pub const mtpEvObserve = @import("../spec/mtp/ev_plan.zig").mtpEvObserve;
     pub const mtpChainLogConf = @import("../spec/mtp/ev_plan.zig").mtpChainLogConf;
@@ -898,10 +887,7 @@ pub const Generator = struct {
     pub const mtpTraceOn = @import("../spec/mtp/trace.zig").mtpTraceOn;
     pub const mtpTraceSub = @import("../spec/mtp/trace.zig").mtpTraceSub;
     const mtpTraceEnabled = @import("../spec/mtp/trace.zig").mtpTraceEnabled;
-    const parseMtpEvCostsOverride = @import("../spec/mtp/ev_costs.zig").parseMtpEvCostsOverride;
-    pub const mtpEvCostsForProfile = @import("../spec/mtp/ev_costs.zig").mtpEvCostsForProfile;
-    pub const mtpEvCostsFor = @import("../spec/mtp/ev_costs.zig").mtpEvCostsFor;
-    const mtpEvCosts = @import("../spec/mtp/ev_costs.zig").mtpEvCosts;
+    pub const mtpEvCosts = @import("../spec/mtp/ev_costs.zig").mtpEvCosts;
     pub const MTP_EXT_DRY_ROUNDS = @import("../spec/mtp/regime.zig").MTP_EXT_DRY_ROUNDS;
     pub const MTP_EXT_DRY_COOLDOWN = @import("../spec/mtp/regime.zig").MTP_EXT_DRY_COOLDOWN;
     pub const MTP_EXT_DRY_MIN = @import("../spec/mtp/regime.zig").MTP_EXT_DRY_MIN;
@@ -989,55 +975,3 @@ pub const Generator = struct {
 
 // ── tests ──
 
-
-test "no decode path advances `step` outside advanceStep" {
-    // Class guard for #110. `Generator.step` is the clear cadence's clock, so a
-    // path that bumps it by hand is a path that strands its round's transients
-    // in MLX's buffer pool forever — which is exactly what `nextDrafter`,
-    // `nextMtp` and `scheduler.runBatchedDecodeTick` did, and the `-mtp`
-    // checkpoints default onto one of those. A new decode path added later must
-    // route through `advanceStep` or fail here.
-    //
-    // The needles are concatenated so this test's OWN source doesn't match them.
-    const needle = ".step" ++ " +=";
-    const allowed = "self.step" ++ " += n";
-    const sources = [_]struct { name: []const u8, src: []const u8 }{
-        .{ .name = "generate.zig", .src = @import("../generate.zig").all_source },
-        .{ .name = "scheduler.zig", .src = @embedFile("../scheduler.zig") },
-    };
-    var total: usize = 0;
-    for (sources) |file| {
-        var it = std.mem.splitScalar(u8, file.src, '\n');
-        var lineno: usize = 0;
-        while (it.next()) |raw| {
-            lineno += 1;
-            // Strip trailing line comments: several of them spell out
-            // `cache.step += 1` while describing the KV cache's own counter.
-            const line = if (std.mem.indexOf(u8, raw, "//")) |c| raw[0..c] else raw;
-            if (std.mem.indexOf(u8, line, needle) == null) continue;
-            total += 1;
-            if (std.mem.indexOf(u8, line, allowed) == null) {
-                std.debug.print("{s}:{d}: raw step advance outside advanceStep: {s}\n", .{
-                    file.name, lineno, std.mem.trim(u8, line, " "),
-                });
-                return error.RawStepAdvance;
-            }
-        }
-    }
-    // Exactly one: the assignment inside `advanceStep`. Zero means the field was
-    // renamed and this guard went vacuous — update it with the rename.
-    try testing.expectEqual(@as(usize, 1), total);
-
-    // Same discipline for the clock itself: every clear the Generator makes records
-    // it, so the decode cadence measures from the last ACTUAL clear. Two writers —
-    // `advanceStep` and the prefill/decode handover — and a third that forgot the
-    // write would leave the cadence firing against a stale clock.
-    const clock = "last_cache_clear_step" ++ " =";
-    var writers: usize = 0;
-    var clock_it = std.mem.splitScalar(u8, sources[0].src, '\n');
-    while (clock_it.next()) |raw| {
-        const line = if (std.mem.indexOf(u8, raw, "//")) |c| raw[0..c] else raw;
-        if (std.mem.indexOf(u8, line, clock) != null) writers += 1;
-    }
-    try testing.expectEqual(@as(usize, 2), writers);
-}

@@ -25,8 +25,7 @@ const verifyArch = @import("verify_projection.zig").verifyArch;
 // steel GEMM. The transient repeats identical sizes per layer, so the MLX
 // allocator cache recycles it; numerics differ from in-kernel dequant only
 // by the bf16 rounding of w = s*q + b (pinned no-worse-than-stock by test).
-// Decode (M=1) and spec-verify widths never route. Kill switch:
-// MLX_SERVE_PREFILL_DQ_GEMM=0.
+// Decode (M=1) and spec-verify widths never route.
 pub const PREFILL_DQ_GEMM_MIN_M: usize = 2048;
 
 /// Rows from which `prefillDqGemm` takes over from stock qmm. 2-bit qmm loses
@@ -57,17 +56,10 @@ fn prefillDqGemmRowFloorNow(bits: u32, n: usize, k: usize) usize {
     return prefillDqGemmRowFloor(bits, ultra_nax, n, k);
 }
 
-var prefill_dq_gemm_env_cached: ?bool = null;
-
+/// Off on CUDA: there it measured slower than stock qmm (3845 vs 4400 tok/s, Llama 3.2 3B, RTX 5060 Ti) and its
+/// bf16 weight transients stacked ~5 GB into the prefill peak.
 pub fn prefillDqGemmEnabled() bool {
-    if (transformer.prefill_dq_gemm_override) |v| return v;
-    if (prefill_dq_gemm_env_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_PREFILL_DQ_GEMM);
-    // Off by default on CUDA: there it measured slower than stock qmm (3845 vs 4400 tok/s,
-    // Llama 3.2 3B, RTX 5060 Ti) and its bf16 weight transients stacked ~5 GB into the prefill peak.
-    const enabled = if (raw) |r| !std.mem.eql(u8, std.mem.sliceTo(r, 0), "0") else !mlx.cudaAvailable();
-    prefill_dq_gemm_env_cached = enabled;
-    return enabled;
+    return transformer.prefill_dq_gemm_override orelse !mlx.cudaAvailable();
 }
 
 /// Test seam: engagement is counted, never inferred from output equality.
@@ -125,14 +117,9 @@ test "prefillDqGemmRowFloor: on the Ultra the floor follows min(N, K) from 4096,
 }
 
 test "prefillDqGemm defaults on where it was measured a win, off on CUDA" {
-    const saved = .{ transformer.prefill_dq_gemm_override, prefill_dq_gemm_env_cached };
-    defer {
-        transformer.prefill_dq_gemm_override = saved[0];
-        prefill_dq_gemm_env_cached = saved[1];
-    }
+    const saved = transformer.prefill_dq_gemm_override;
+    defer transformer.prefill_dq_gemm_override = saved;
     transformer.prefill_dq_gemm_override = null;
-    prefill_dq_gemm_env_cached = null;
-    if (env.get(.MLX_SERVE_PREFILL_DQ_GEMM) != null) return error.SkipZigTest;
     try std.testing.expectEqual(!mlx.cudaAvailable(), prefillDqGemmEnabled());
 }
 

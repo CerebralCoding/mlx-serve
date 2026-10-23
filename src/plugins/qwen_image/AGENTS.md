@@ -14,7 +14,6 @@ the Qwen3-VL tower in `text_encoder/`; mlx-community's spelling ships no root co
 | `plugin.zig` | the media table: the job (`sdk/media/image_request`), the edit's memory check, PNG, the tiny pack |
 | `qwen_image.zig` | DiT (blocks on `sdk/bases/dit.adaLnBlock`, `.scale_only`), prefix cache, VAE, engine |
 | `edit.zig` | ti2i prompt, image-pad expansion, tower preprocessing, the joint VLM encode |
-| `kernels.zig` + `kernels/rope.metal` | the fused pair RoPE (opt-in `MLX_SERVE_QWEN_IMAGE_FUSED_ROPE=1`), its contract in `contract.zig` |
 
 ## Rules
 

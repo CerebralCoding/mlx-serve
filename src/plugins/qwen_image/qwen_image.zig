@@ -27,7 +27,6 @@ const sse = @import("../../host/media_jobs/sse.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
 const mage_flow = @import("../mage_flow/mage_flow.zig");
-const qwen_kernels = @import("kernels.zig");
 const qwen_image_edit = @import("edit.zig");
 const model_discovery = @import("../../host/registry/discovery.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
@@ -67,14 +66,6 @@ pub const VAE_DOWNSAMPLE: u32 = 16;
 const COMPUTE: mlx.mlx_dtype = .bfloat16;
 /// Experimental DiT-only dtype override. Unrecognized values preserve the
 /// checkpoint's default; text encoding and VAE decoding keep their own dtypes.
-fn ditDtype(value: ?[*:0]const u8) mlx.mlx_dtype {
-    return if (value) |v| if (std.mem.eql(u8, std.mem.span(v), "fp16")) .float16 else COMPUTE else COMPUTE;
-}
-
-fn fusedRopeEnabled(value: ?[*:0]const u8) bool {
-    return if (value) |v| std.mem.eql(u8, std.mem.span(v), "1") else false;
-}
-
 pub const MAX_PROMPT_TOKENS: usize = 2048;
 
 // Raw template string, not the chat template: the checkpoint was trained on it.
@@ -516,10 +507,6 @@ const PrefixCache = struct {
     }
 };
 
-pub fn prefixCacheEnabled(value: ?[*:0]const u8) bool {
-    return if (value) |v| !std.mem.eql(u8, std.mem.span(v), "0") else true;
-}
-
 // ── Edit (ti2i) geometry ──
 
 /// One run of the edit joint prefix: a text run or a whole image block.
@@ -821,7 +808,6 @@ pub const Dit = struct {
     s: S,
     cfg: DitConfig,
     dtype: mlx.mlx_dtype,
-    fused_rope: bool = false,
     img_in: MfLinear,
     txt_norm: A, // f32, stored zero-centred: holds weight + 1
     txt_in: MfLinear,
@@ -846,7 +832,6 @@ pub const Dit = struct {
         self.s = s;
         self.cfg = cfg;
         self.dtype = dtype;
-        self.fused_rope = fusedRopeEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_FUSED_ROPE"));
         self.img_in = try loadLinear(&w, a, cfg.in_ch, dtype, s, "img_in", .{});
         const tn = try loadVecF32(&w, a, "txt_in.text_norm.weight", .{}, s);
         defer free(tn);
@@ -953,9 +938,8 @@ pub const Dit = struct {
 
     /// Rotate interleaved pairs (2k, 2k+1) of x [1, L, heads, hd] in f32, cast to the compute dtype; tables
     /// [1, L, 1, hd/2, 1] f32. `fused` takes the Metal kernel (same bits).
-    fn applyRope(self: *const Dit, x: A, geo: *const Geometry, fused: bool) !A {
+    fn applyRope(self: *const Dit, x: A, geo: *const Geometry) !A {
         const s = self.s;
-        if (fused) return qwen_kernels.applyRope(x, geo.cos, geo.sin, self.dtype, s);
         const sh = mlx.getShape(geo.cos);
         const table = [_]c_int{ sh[0], sh[1], sh[2], sh[3] };
         const cos = try reshape(geo.cos, &table, s);
@@ -966,7 +950,7 @@ pub const Dit = struct {
     }
 
     /// Project → per-head RMS norm → RoPE → [1, heads, L, hd].
-    fn headsOf(self: *const Dit, lin: *const MfLinear, slot: *const lora_mod.Slot, norm: ?A, x: A, geo: *const Geometry, fused: bool) !A {
+    fn headsOf(self: *const Dit, lin: *const MfLinear, slot: *const lora_mod.Slot, norm: ?A, x: A, geo: *const Geometry) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
         const y = try linForward(lin, slot, x, s);
@@ -977,7 +961,7 @@ pub const Dit = struct {
         const nw = norm orelse return transpose(y4, &perm, s);
         const yn = try rmsNorm(y4, nw, self.cfg.eps, s);
         defer free(yn);
-        const yr = try self.applyRope(yn, geo, fused);
+        const yr = try self.applyRope(yn, geo);
         defer free(yr);
         return transpose(yr, &perm, s);
     }
@@ -1007,11 +991,11 @@ pub const Dit = struct {
         const sh = mlx.getShape(x);
         const T = geo.text_len;
         const fused = try self.fusedHeads(b, x, geo);
-        const q = if (fused) |f| f.q else try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, geo, self.fused_rope);
+        const q = if (fused) |f| f.q else try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, geo);
         defer free(q);
-        const k = if (fused) |f| f.k else try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, geo, self.fused_rope);
+        const k = if (fused) |f| f.k else try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, geo);
         defer free(k);
-        const v = if (fused) |f| f.v else try self.headsOf(&b.v, &b.lora.v, null, x, geo, self.fused_rope);
+        const v = if (fused) |f| f.v else try self.headsOf(&b.v, &b.lora.v, null, x, geo);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
 
@@ -1197,11 +1181,11 @@ pub const Dit = struct {
     fn editAttention(self: *const Dit, b: *const Block, x: A, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const q = try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, rope, false);
+        const q = try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, rope);
         defer free(q);
-        const k = try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, rope, false);
+        const k = try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, rope);
         defer free(k);
-        const v = try self.headsOf(&b.v, &b.lora.v, null, x, rope, false);
+        const v = try self.headsOf(&b.v, &b.lora.v, null, x, rope);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
         const attn = if (cached) blk: {
@@ -2109,7 +2093,7 @@ pub const Engine = struct {
         self.drop_tokens = prefix_ids.len;
         allocator.free(prefix_ids);
 
-        self.dit = try Dit.load(io, allocator, self.s, model_dir, self.dit_cfg, ditDtype(std.c.getenv("MLX_SERVE_QWEN_IMAGE_DTYPE")));
+        self.dit = try Dit.load(io, allocator, self.s, model_dir, self.dit_cfg, COMPUTE);
         errdefer self.dit.deinit();
         self.vae = try VaeDecoder.load(io, allocator, self.s, model_dir, self.vae_cfg);
         errdefer self.vae.deinit();
@@ -2119,8 +2103,8 @@ pub const Engine = struct {
         try mlx.evalFields(.{ self.dit, self.vae, self.te });
         logMemory("load");
 
-        log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, fused_rope={}, VAE {d}ch /{d}, text encoder {s}, {d} steps{s})\n", .{
-            self.dit_cfg.layers, self.dit_cfg.hidden(), @tagName(self.dit.dtype),                         self.dit.fused_rope,
+        log.info("[image] Qwen-Image-2.1 ready (DiT {d}×{d} {s}, VAE {d}ch /{d}, text encoder {s}, {d} steps{s})\n", .{
+            self.dit_cfg.layers, self.dit_cfg.hidden(), @tagName(self.dit.dtype),
             self.vae_cfg.z_dim,  VAE_DOWNSAMPLE,        if (staged) "staged per request" else "resident",
             self.stepsFor(0),    if (self.sample_sigmas != null) " from sample_sigmas" else "",
         });
@@ -2264,7 +2248,7 @@ pub const Engine = struct {
         const run = n_steps - start;
         {
             // Request-local lifetime also covers cancellation and failed forwards.
-            const use_prefix_cache = run > 1 and prefixCacheEnabled(std.c.getenv("MLX_SERVE_QWEN_IMAGE_KV_CACHE"));
+            const use_prefix_cache = run > 1;
             var pos_cache: ?PrefixCache = if (use_prefix_cache) try PrefixCache.init(allocator, self.dit.blocks.len, &geo, s) else null;
             defer if (pos_cache) |*c| c.deinit();
             var neg_cache: ?PrefixCache = if (use_prefix_cache and neg_geo != null) try PrefixCache.init(allocator, self.dit.blocks.len, &neg_geo.?, s) else null;
@@ -2924,23 +2908,6 @@ const Fixture = struct {
     }
 };
 
-test "QwenImage experimental dtype and fused RoPE defaults are conservative" {
-    try testing.expectEqual(COMPUTE, ditDtype(null));
-    try testing.expectEqual(COMPUTE, ditDtype("bf16"));
-    try testing.expectEqual(COMPUTE, ditDtype("unknown"));
-    try testing.expectEqual(mlx.mlx_dtype.float16, ditDtype("fp16"));
-    try testing.expect(!fusedRopeEnabled(null));
-    try testing.expect(!fusedRopeEnabled("0"));
-    try testing.expect(!fusedRopeEnabled("invalid"));
-    try testing.expect(fusedRopeEnabled("1"));
-}
-
-test "QwenImage prefix cache is enabled unless explicitly disabled" {
-    try testing.expect(prefixCacheEnabled(null));
-    try testing.expect(prefixCacheEnabled("1"));
-    try testing.expect(!prefixCacheEnabled("0"));
-}
-
 // Small deterministic nonzero weights exercise the actual full DiT without a
 // downloaded fixture, including time modulation, causal attention and RoPE.
 const TinyPrefixModel = struct {
@@ -3012,15 +2979,12 @@ test "QwenImage prefix cache matches full forwards across timesteps and conditio
             defer cache.deinit();
             const head_input = try TinyPrefixModel.tensor(&.{ 1, text_len + 6, @intCast(dit.cfg.hidden()) }, 0.7, 1);
             defer free(head_input);
-            // Per-head norm's f32 weights promote the intermediate to f32.
-            // Both RoPE implementations must cast Q/K back to compute dtype.
-            for ([_]bool{ false, true }) |fused| {
-                dit.fused_rope = fused;
-                const heads = try dit.headsOf(&dit.blocks[0].q, &dit.blocks[0].lora.q, dit.blocks[0].norm_q, head_input, &geo, dit.fused_rope);
+            // Per-head norm's f32 weights promote the intermediate to f32; RoPE casts Q/K back to compute dtype.
+            {
+                const heads = try dit.headsOf(&dit.blocks[0].q, &dit.blocks[0].lora.q, dit.blocks[0].norm_q, head_input, &geo);
                 defer free(heads);
                 try testing.expectEqual(dtype, mlx.mlx_array_dtype(heads));
             }
-            dit.fused_rope = false;
             for ([_]f32{ 0.9, 0.5, 0.02 }, 0..) |t, step| {
                 const img = try TinyPrefixModel.tensor(&.{ 1, 6, 8 }, t + 0.2, 1);
                 defer free(img);
@@ -3028,12 +2992,9 @@ test "QwenImage prefix cache matches full forwards across timesteps and conditio
                 defer free(want);
                 const want32 = try astype(want, .float32, s);
                 defer free(want32);
-                // Compare the primitive reference against fused RoPE with
-                // both full first-step and cached later-step attention.
-                dit.fused_rope = true;
+                // Compare the primitive reference against both full first-step and cached later-step attention.
                 const got = try dit.forwardCached(img, txt, t, &geo, &cache);
                 defer free(got);
-                dit.fused_rope = false;
                 const got32 = try astype(got, .float32, s);
                 defer free(got32);
                 try mlx.check(mlx.mlx_array_eval(got32));

@@ -2,6 +2,7 @@
 //! the DiT / text-encoder / video-VAE geometry, the speed recipe.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 
 pub const FPS: u32 = 24;
 pub const AUDIO_LATENT_FPS: u32 = 40;
@@ -114,9 +115,9 @@ pub fn resolveSpeed(fast: ?bool, distilled: bool) SpeedConfig {
     };
 }
 
-/// libc getenv, matching generate.zig's allocator-free env idiom.
-pub fn envStr(name: [:0]const u8) ?[]const u8 {
-    const raw = std.c.getenv(name.ptr) orelse return null;
+/// A registered variable's value; unset and empty both read as null.
+pub fn envStr(comptime name: []const u8) ?[]const u8 {
+    const raw = env.named(name) orelse return null;
     const slice = std.mem.sliceTo(raw, 0);
     return if (slice.len == 0) null else slice;
 }

@@ -30,11 +30,9 @@ const chunkNeedsMtpHistory = @import("prefill_chunk.zig").chunkNeedsMtpHistory;
 const commitAdaptiveWidth = @import("prefill_chunk.zig").commitAdaptiveWidth;
 const countSpliceRows = @import("prefill_chunk.zig").countSpliceRows;
 const decodeShareCapped = @import("prefill_chunk.zig").decodeShareCapped;
-const dflashChooserEnabled = @import("../spec/gates.zig").dflashChooserEnabled;
 const dsparkArmFor = @import("../spec/dspark.zig").dsparkArmFor;
 const dsparkEnabled = @import("../spec/dspark.zig").dsparkEnabled;
 const dsparkPolicyEnabled = @import("../spec/dspark.zig").dsparkPolicyEnabled;
-const dsparkStochEnabled = @import("../spec/dspark.zig").dsparkStochEnabled;
 const effectiveMtpHistoryWindow = @import("prefill_chunk.zig").effectiveMtpHistoryWindow;
 const effectivePrefillChunk = @import("prefill_chunk.zig").effectivePrefillChunk;
 const effectiveSsmCheckpointStride = @import("prefill_chunk.zig").effectiveSsmCheckpointStride;
@@ -106,8 +104,7 @@ pub fn initWithOptions(
         // the raw argmax-equality accept; sampled requests get the
         // stochastic arm (MTP one-hot Leviathan acceptance over the
         // request's own filtered probs — the agent-default temp 0.6
-        // traffic that otherwise always ran serial), env-killable via
-        // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
+        // traffic that otherwise always ran serial). PLD / drafter / qwen-MTP
         // remain hard-off regardless: their verify forwards go through
         // machinery this arch cannot roll back.
         const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
@@ -115,7 +112,7 @@ pub fn initWithOptions(
         const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
             DsparkArm.off
         else
-            dsparkArmFor(sampling, options.logprobs_n, dsparkStochEnabled());
+            dsparkArmFor(sampling, options.logprobs_n);
         // mlx-stream's lane samples a sampled request itself, from the request's own settings.
         const lane_sampling: ?mlx_stream.SamplingParams = if (dspark_env_off or arm == .off) null else .{
             .temperature = sampling.temperature,
@@ -181,12 +178,9 @@ pub fn initWithOptions(
     // positions, gets eval'd, and intermediates are freed before the next chunk.
     // Without chunking, Gemma-4 MoE's 2 MLPs × 4 stacked layers can spike to
     // ~20 GB of activations alone on a 50k-token prompt, causing Metal OOM.
-    // Vision requests skip chunking since image token positions must be visible
-    // in a single forward pass for spliceVisionEmbeddings to work correctly.
-    // PREFILL_CHUNK overridable via env MLX_SERVE_PREFILL_CHUNK for tuning,
-    // or via the module-level `prefill_chunk_override` (set by --prefill-chunk
-    // CLI flag in main.zig). Env var wins if both are set (and skips the
-    // safety cap below — it's the explicit escape hatch).
+    // Vision requests chunk too: the splice resumes its row index across
+    // chunks (#197). An explicit `--prefill-chunk` outranks the machine pin;
+    // the safety cap below still applies.
     //
     // Safety cap: on unfused head dims (>128 — every Gemma-4/Qwen3.5/3.6)
     // the composed SDPA materializes [heads, chunk, total_kv] scores per
@@ -448,27 +442,7 @@ pub fn initWithOptions(
             defer _ = mlx.mlx_array_free(chunk_input);
 
             const chunk_start_ns = if (trace_enabled) prefill_sw.read() else 0;
-            // Phase 2 experiment: when MLX_SERVE_COMPILE_FORWARD=1 wired a
-            // compiled closure at load time, route this chunk through it.
-            // The compiled closure uses xfm.defaultCtx (xfm.cache + xfm.ssm_entries),
-            // which matches the prefill `ctx` when the scheduler has swapped
-            // the slot's cache onto the Transformer (the single-slot legacy
-            // and Phase-2-swapped path both satisfy this). Hidden-capture
-            // and vision splice paths don't pass through this chunk loop
-            // (they take the last_input branch), so they're already safe.
-            // Optional-slice equality: same-ness here means both null or
-            // both point at the same backing memory. We accept ssm_entries
-            // null↔null too because plain-attn models legitimately have
-            // both ctx and xfm carry null.
-            const ssm_match = blk: {
-                if (ctx.ssm_entries == null and xfm.ssm_entries == null) break :blk true;
-                if (ctx.ssm_entries == null or xfm.ssm_entries == null) break :blk false;
-                break :blk ctx.ssm_entries.?.ptr == xfm.ssm_entries.?.ptr and
-                    ctx.ssm_entries.?.len == xfm.ssm_entries.?.len;
-            };
-            // History windowing: a chunk before the window needs no
-            // capture, which ALSO re-qualifies it for the compiled
-            // trunk forward (capture is what disqualifies MTP chunks).
+            // History windowing: a chunk before the window needs no capture.
             const mtp_capture = mtp_active and chunkNeedsMtpHistory(pos, end, prefix_len, mtp_hist_window);
             var chunk_hidden_all = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(chunk_hidden_all);
@@ -479,15 +453,7 @@ pub fn initWithOptions(
             errdefer if (dflash_active) {
                 for (dfl_out_buf) |a| _ = mlx.mlx_array_free(a);
             };
-            const chunk_logits = if (xfm.compiled_forward != null and
-                !mtp_capture and
-                !dflash_active and
-                ctx.cache == &xfm.cache and
-                ssm_match and
-                ctx.capture_hidden == null and
-                ctx.vision_embeddings == null)
-                try xfm.forwardCompiled(chunk_input)
-            else if (mtp_capture) blk: {
+            const chunk_logits = if (mtp_capture) blk: {
                 var last_unused = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(last_unused);
                 break :blk try xfm.forwardWithCaptureAll(&ctx, chunk_input, &last_unused, &chunk_hidden_all);
@@ -1002,10 +968,6 @@ pub fn initWithOptions(
             .dflash_ctx = dflash_ctx,
             .dflash_block_size = dflash_bs,
             .dflash_pol = if (dflash_active and options.dflash_policy) .{ .pin_rows = @intCast(@min(env.int(.MLX_SERVE_DFLASH_ROWS, usize, 0), dflash_policy.MAX_ROWS)) } else null,
-            .dflash_chooser = if (dflash_active and dflashChooserEnabled() and !options.dflash_policy)
-                round_cost.WidthChooser.init(@max(dflash_bs, 2) - 1, options.dflash.?.config.block_size -| 1)
-            else
-                null,
             .dflash_min_accepted_per_round = options.dflash_min_accepted_per_round,
             .mtp = if (mtp_active) options.mtp else null,
             .mtp_accept_graph = accept_route.graph,

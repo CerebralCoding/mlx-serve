@@ -36,10 +36,6 @@ const splitCausalSdpa = @import("sdpa.zig").splitCausalSdpa;
 // (q*scale+bias per GS-group, f32 accumulate). NOT bit-identical to dense
 // SDPA (different reduction order + f32 dequant vs bf16-rounded dense
 // views) — sanctioned qmv-vs-qmm class, pinned no-worse-than-reference.
-//
-// Kill switches: MLX_SERVE_KV_ATTN_KERNEL=0 drops just this kernel (fused
-// requests fall back to the composed path); MLX_SERVE_KV_ATTN_FUSED=0 kills
-// the whole fused route (dense reads everywhere).
 const QKV_DEC_NT = 128; // threads per threadgroup
 
 /// Threadgroup block length along the kv axis, chosen so the score buffer
@@ -431,8 +427,7 @@ var qkv_ver_engaged_mask: u16 = 0; // one-shot log per TQ
 
 /// Try the verify-width packed-KV attention kernel (T_q 2..8, causal only).
 /// Returns null when a precondition or machine adoption gate doesn't hold —
-/// the caller falls back to dense SDPA. G17 defaults dense after its q4/q6/q8
-/// A/B; MLX_SERVE_KV_ATTN_VERIFY=1 retains an explicit force-on QA arm.
+/// the caller falls back to dense SDPA. G17 keeps dense after its q4/q6/q8 A/B.
 pub fn qkvAttnVerifyKernel(
     s: mlx.mlx_stream,
     q: mlx.mlx_array,
@@ -747,9 +742,7 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
 /// 1024-window sliding layers sat exactly AT the old 1024 floor and measured
 /// a ~4 tok/s decode loss fused (masked kernel at ~1k KV vs near-free dense
 /// SDPA, 2026-08-15). Short-KV layers keep dense reads even inside a fused
-/// request. MLX_SERVE_KV_ATTN_MIN_TK overrides (correctness tests set 1 so
-/// short prompts still exercise the fused paths; the default is a PERF
-/// gate, not a correctness gate).
+/// request (a PERF gate, not a correctness gate).
 pub const KV_ATTN_FUSED_MIN_TK: c_int = 2048;
 
 /// The ONE eligibility gate every fused quant-attention call site reads
@@ -775,8 +768,7 @@ pub fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {
 /// Verify-width packed-attention gate (Phase 2): T_q 2..8 served by
 /// `qkvAttnVerifyKernel`, same triple + per-layer kv floor as decode.
 /// Wider multi-token forwards (real prefill chunks) stay on dense SDPA;
-/// G17 defaults dense; MLX_SERVE_KV_ATTN_VERIFY=1 forces the kernel and =0
-/// kills the whole width class on every machine.
+/// G17 keeps dense; the test seam forces the kernel or kills the width class.
 pub fn kvAttnVerifyEligible(view: *const DenseKVView, t_q: c_int) bool {
     if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_VERIFY_MAX_TQ and qkvVerifyEnvAllows())) return false;
     const ks = mlx.getShape(view.k_triple_q);
@@ -1301,22 +1293,6 @@ test "composed quantAttention is correct on STRIDED cache views" {
     try composedStridedCase(8, 2, 256, 4, 0, 15, "causal");
     try composedStridedCase(8, 2, 256, 4, 0, 15, "array");
     try composedStridedCase(8, 2, 256, 4, 20, 15, "array");
-}
-
-test "fused kv-quant serving arms are kernel-or-DENSE — composed attention never serves" {
-    // gemma4-12B measured (2026-08-15, kv8, 11k ctx): composed reads at
-    // t_q == 1 cost −17% decode on the full-attention layers where
-    // `qkvAttnDecodeKernel` declines (gqa 16 x dk 512 overflows the
-    // threadgroup q-staging budget), and Phase 1 already routes every other
-    // width dense. So a declined kernel falls through to the dense SDPA
-    // arms; the composed helper remains ONLY as the strided-view parity
-    // reference (`composedStridedCase`).
-    const src = @embedFile("kv_quant_attn.zig");
-    const needle = "kv_quant.quant" ++ "Attention(";
-    try testing.expectEqual(@as(usize, 1), std.mem.count(u8, src, needle));
-    const only = std.mem.indexOf(u8, src, needle).?;
-    const helper = std.mem.indexOf(u8, src, "fn composedStridedCase(").?;
-    try testing.expect(only > helper);
 }
 
 test "qkv decode kernel declines non-decode widths and missing triples" {

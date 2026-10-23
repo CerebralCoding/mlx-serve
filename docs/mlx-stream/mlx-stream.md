@@ -251,9 +251,8 @@ The migration changes these behaviors; each fails with a named error:
 
 1. A registered arch's prompt pass needs the request's shape (`sdk.RequestShape`). A forward that does not start a
    request fails with `RequestShapeMissing`. On a registered arch, this covers `/v1/embeddings` (which returned the
-   module's last-row logits), the `MLX_SERVE_DECODE_FWD_UBENCH` scheduler diagnostic (it stops at the arch's first
-   forward) and `MLX_SERVE_COMPILE_FORWARD=1` (an arch's forward reads its token ids on the host, which a compile
-   trace cannot do).
+   module's last-row logits), and the `MLX_SERVE_DECODE_FWD_UBENCH` scheduler diagnostic (it stops at the arch's first
+   forward).
 2. A bill term flagged `measured` is checked once at construction against its bound. DeepSeek-V4.1 bills its host
    side this way (`measured_host_side_bytes`): a load whose host side exceeds it fails with `ConstructionOverBill`.
 3. The load fails with `QuantNotClaimed` when its bound quant does not claim the bank. The claim reads the bank's

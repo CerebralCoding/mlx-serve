@@ -50,8 +50,7 @@ pub fn sdpaForceFused(q: mlx.mlx_array, k: mlx.mlx_array) bool {
 }
 var nax_sdpa_dispatch_logged = false;
 
-/// Kill switch (MLX_SERVE_SDPA_SPLIT=0). Test seam: `sdpa_split_override`
-/// forces the arm on/off without the environment.
+/// Test seam: `sdpa_split_override` forces the arm on/off.
 pub var sdpa_split_override: ?bool = null;
 fn sdpaSplitEnabled() bool {
     return sdpa_split_override orelse true;
@@ -162,7 +161,7 @@ var sdpa_mask_split_logged = false;
 /// vector kernel serves `qL * gqa <= 32` rows, anything wider (S >= 3 at
 /// gqa 12) and every array-masked qL 9..15 is the unfused fallback. Rows are
 /// independent under a per-row mask, so slice the block into vector-sized row
-/// groups. Kill switch shared with the causal split (MLX_SERVE_SDPA_SPLIT=0).
+/// groups. The test seam is shared with the causal split.
 pub fn splitMaskedSdpa256(
     s: mlx.mlx_stream,
     q: mlx.mlx_array,

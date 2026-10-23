@@ -13,8 +13,7 @@
 //! SwiGLU and the scales' roundings priced. The fused router replaces its routing chains: the same expert set and,
 //! per expert, the chain's weight bits (the shared-expert gate's logit, which no chain computes, to float64); its NaN
 //! rule is stated, and gate 4 is not asked of it (compares, and outputs holding uint32 ids). The verify kernels
-//! replace MLX's: gather_qmm row by row (`verify_expert_reuse`, N cut to 256 from 2560, `verify_paired_gu` with its
-//! SwiGLU), the unsort-weight-sum (`verify_expert_reduce`, summing in bf16 as MLX does), the stable argsort
+//! replace MLX's: gather_qmm row by row (`verify_expert_reuse`, N cut to 256 from 2560), the unsort-weight-sum (`verify_expert_reduce`, summing in bf16 as MLX does), the stable argsort
 //! (`verify_route_pack`, `prefill_route_scatter`); the prefill histogram and its scan are held exact.
 //! The NAX sorted gather (prefill; NAX GPUs only, no pre-NAX skip) replaces MLX's sorted gather_qmm bit for bit at
 //! one shape per plan, its mapped arm the row take first, its paired arm also MLX's SwiGLU; its tile scan is held
@@ -1778,169 +1777,6 @@ fn plantRows(v: []f64, k: usize) void {
     };
 }
 
-const paired_launch = metal.Launch{ .name = "verify_paired_gateup_q4g64", .inputs = &.{ "x", "gw", "gsc", "gb", "uw", "usc", "ub", "lhs", "ids", "sigtab" }, .outputs = &.{"y"}, .source = vk.VERIFY_PAIRED_GU_SOURCE, .header = vk.VERIFY_PAIRED_GU_HEADER, .tg_bytes = 0, .m1 = 704, .m2 = 704 };
-
-/// `verify_paired_gu`: Flash Next's routed gate and up at 4-bit g64 over hidden 2560 into 640 (both baked into its
-/// header), then the table SwiGLU. Rows are routed assignments (four tokens' top-10), n = 640, k = 2560.
-const PairedGu = struct {
-    rig: metal.Rig,
-    launch: *const metal.Launch = &paired_launch,
-    banks: [2]Bank = .{ Bank.init(.affine, 4, 64), Bank.init(.affine, 4, 64) },
-    shape: Shape = undefined,
-    x: []f64 = &.{},
-    lhs: []f64 = &.{},
-    ids: []f64 = &.{},
-    table: []f64 = &.{},
-    dv: []f64 = &.{},
-    dm: []f64 = &.{},
-    args: [10]mlx.mlx_array = undefined,
-    msg: [256]u8 = undefined,
-
-    const NE: usize = 4;
-    const TOKENS: usize = 4;
-
-    fn init(a: std.mem.Allocator) PairedGu {
-        return .{ .rig = metal.Rig.init(a) };
-    }
-
-    pub fn deinit(self: *PairedGu) void {
-        const a = self.rig.a;
-        self.rig.deinit();
-        for (&self.banks) |*b| b.deinit(a);
-        for ([_][]f64{ self.x, self.lhs, self.ids, self.table, self.dv, self.dm }) |s| a.free(s);
-    }
-
-    pub fn geometry(_: *const PairedGu, shape: Shape) ?metal.Geometry {
-        if (shape.rows == 0 or shape.n != 640 or shape.k != 2560) return null;
-        var g = metal.Geometry{ .grid = .{ 80 * 64, @intCast(shape.rows), 1 }, .tg = .{ 64, 1, 1 } };
-        g.out(&.{ @intCast(shape.rows), 640 }, .bfloat16);
-        return g;
-    }
-
-    pub fn prepare(self: *PairedGu, shape: Shape, fill: spec.Fill, seed: u64) !bool {
-        if (self.geometry(shape) == null) return false;
-        const a = self.rig.a;
-        self.shape = shape;
-        for ([_]*[]f64{ &self.x, &self.lhs, &self.ids, &self.dv, &self.dm }) |p| {
-            a.free(p.*);
-            p.* = &.{};
-        }
-        if (self.table.len == 0) self.table = try hostq.values(a, try fa.swigluSigTable(self.rig.stream(), .bfloat16, std.heap.c_allocator));
-        var prng = std.Random.DefaultPrng.init(seed);
-        const rng = prng.random();
-        for (&self.banks) |*b| try b.fill(a, rng, NE * 640, 2560, .bfloat16, fill == .stress);
-        self.x = try a.alloc(f64, TOKENS * 2560);
-        if (fill == .stress) stressX(rng, self.x, 2560) else hostq.uniform(rng, self.x, -2, 2, .bfloat16);
-        if (fill == .nonfinite) plantRows(self.x, 2560);
-        // As the verifier sorts them: assignments by expert, each naming its token.
-        self.lhs = try a.alloc(f64, shape.rows);
-        self.ids = try a.alloc(f64, shape.rows);
-        for (self.lhs, self.ids, 0..) |*l, *e, i| {
-            l.* = @floatFromInt(i % TOKENS);
-            e.* = @floatFromInt(i * NE / shape.rows);
-        }
-        const rig = &self.rig;
-        rig.reset();
-        var b: [2][3]mlx.mlx_array = undefined;
-        for (&b, &self.banks) |*o, *bank| o.* = try bank.bind(rig, .bfloat16, NE, 640, 2560);
-        self.args = .{
-            try rig.input(.bfloat16, &.{ TOKENS, 2560 }, self.x),
-            b[0][0],
-            b[0][1],
-            b[0][2],
-            b[1][0],
-            b[1][1],
-            b[1][2],
-            try rig.input(.uint32, &.{@intCast(shape.rows)}, self.lhs),
-            try rig.input(.uint32, &.{@intCast(shape.rows)}, self.ids),
-            try rig.input(.bfloat16, &.{65536}, self.table),
-        };
-        return true;
-    }
-
-    pub fn run(self: *PairedGu) !void {
-        try self.rig.launch(self.launch, self.geometry(self.shape).?, &self.args);
-    }
-
-    pub fn count(self: *const PairedGu) usize {
-        return self.shape.rows * 640;
-    }
-
-    fn dots(self: *PairedGu) !void {
-        if (self.dv.len > 0) return;
-        const a = self.rig.a;
-        const n = self.count();
-        self.dv = try a.alloc(f64, 2 * n);
-        self.dm = try a.alloc(f64, 2 * n);
-        for (0..2) |bi| for (0..self.shape.rows) |r| for (0..640) |j| {
-            const e: usize = @intFromFloat(self.ids[r]);
-            const t: usize = @intFromFloat(self.lhs[r]);
-            const d = factoredDot(&self.banks[bi], e * 640 + j, self.x[t * 2560 ..][0..2560]);
-            self.dv[bi * n + r * 640 + j] = d[0];
-            self.dm[bi * n + r * 640 + j] = d[1];
-        };
-    }
-
-    fn epilogue(self: *const PairedGu, dv: []const f64, want: []f64) void {
-        const n = self.count();
-        for (want, 0..) |*y, i| {
-            const gt = hostq.round(.bfloat16, dv[i]);
-            const ut = hostq.round(.bfloat16, dv[n + i]);
-            y.* = hostq.round(.bfloat16, gt * self.table[spec.toBf16(@floatCast(gt))]) * ut;
-        }
-    }
-
-    pub fn reference(self: *PairedGu, want: []f64, mag: []f64) !void {
-        try self.dots();
-        self.epilogue(self.dv, want);
-        @memset(mag, 0);
-    }
-
-    pub fn simulate(self: *PairedGu, acc: spec.Accum, order: spec.Order, out: []f64) !void {
-        try self.dots();
-        if (acc == .f32) {
-            for (self.dm) |m| if (m >= 0x1p24) return error.StressPastExact;
-            return self.epilogue(self.dv, out);
-        }
-        const a = self.rig.a;
-        const n = self.count();
-        const dv = try a.dupe(f64, self.dv);
-        defer a.free(dv);
-        const t = try a.alloc(f64, 2560);
-        defer a.free(t);
-        for (0..2) |bi| for (0..self.shape.rows) |r| for (0..32) |j| {
-            const e: usize = @intFromFloat(self.ids[r]);
-            const tok: usize = @intFromFloat(self.lhs[r]);
-            dv[bi * n + r * 640 + j] = simDot(&self.banks[bi], e * 640 + j, self.x[tok * 2560 ..][0..2560], acc, order, t);
-        };
-        self.epilogue(dv, out);
-    }
-
-    /// The two gathers (MLX gather_qmm, explicit row and expert indices) and MLX's SwiGLU chain.
-    pub fn replaced(self: *PairedGu) ![]const u8 {
-        const s = self.rig.stream();
-        const x = self.args;
-        var g = ops.Graph.init(self.rig.a, s);
-        defer g.deinit();
-        const x3 = try g.reshape(x[0], &.{ TOKENS, 1, 2560 });
-        var pair: [2]mlx.mlx_array = undefined;
-        for (&pair, 0..) |*p, bi| {
-            var y = mlx.mlx_array_new();
-            errdefer _ = mlx.mlx_array_free(y);
-            try experts.gatherExpertMm(&y, x3, x[1 + 3 * bi], x[2 + 3 * bi], x[3 + 3 * bi], x[7], x[8], 4, 64, .affine, true, s);
-            p.* = try g.adopt(y);
-        }
-        return self.rig.bytesOf(&.{try g.mul(try g.mul(pair[0], try g.sigmoid(pair[0])), pair[1])});
-    }
-
-    fn wrapper(self: *PairedGu) ![]const u8 {
-        const x = self.args;
-        const y = try vk.verifyPairedGateUp(self.rig.stream(), x[0], x[1], x[2], x[3], x[4], x[5], x[6], x[7], x[8]);
-        defer _ = mlx.mlx_array_free(y);
-        return self.rig.bytesOf(&.{y});
-    }
-};
-
 const reduce_launch = metal.Launch{ .name = "verify_expert_reduce", .inputs = &.{ "down", "inverse", "scores" }, .outputs = &.{"y"}, .source = vk.VERIFY_EXPERT_REDUCE_SOURCE, .tg_bytes = 0, .m1 = 928, .m2 = 928 };
 
 /// `verify_expert_reduce`: the routed down rows unsorted, weighted and summed over the top-k in bf16, MLX's eight
@@ -2293,7 +2129,6 @@ fn registerVerify(set: *kc.Set) !void {
     // Flash Next's verify widths: 2..8 tokens of top-10 routed rows; N cut to 256 (a template argument; the drift
     // guard runs the wrapper's 2560).
     try set.add(Reuse, .init(a), .{ .name = "verify_expert_reuse bf16 (4-bit g64, K 640)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = gather, .tiles = .{ .{}, .{ .size = 16, .step = 8, .min = 8 }, .{} }, .served = &.{ .{ .rows = 20, .n = 256, .k = 640 }, .{ .rows = 80, .n = 256, .k = 640 } } }, null);
-    try set.add(PairedGu, .init(a), .{ .name = "verify_paired_gu bf16 (4-bit g64, 2560 -> 640)", .accum = .f32, .depth = gqDepth, .out = .bf16, .replaces = "MLX gather_qmm for gate and up -> sigmoid -> multiply -> multiply", .served = &.{.{ .rows = 40, .n = 640, .k = 2560 }} }, null);
     const reduce_chain = "take -> multiply -> sum (MLX col_reduce_small, bf16)";
     // Verify (2..32 tokens) and prefill chunks, at the two (top-k, hidden) pairs whose partial-sum tree it copies.
     try set.add(Reduce, .init(a), .{ .name = "verify_expert_reduce bf16 (top-10, hidden 2560)", .accum = .bf16, .depth = routeDepth, .out = .bf16, .replaces = reduce_chain, .served = &.{ .{ .rows = 4, .n = 2560, .k = 10 }, .{ .rows = 32, .n = 2560, .k = 10 }, .{ .rows = 1024, .n = 2560, .k = 10 } } }, null);
@@ -3078,15 +2913,6 @@ test "kernel contract moe: each verify launch is its wrapper's bytes, the prefil
         var t = Reuse.init(a);
         defer t.deinit();
         try std.testing.expect(try t.prepare(.{ .rows = 20, .n = 2560, .k = 640 }, .random, 7));
-        try t.run();
-        const ours = try a.dupe(u8, t.rig.outputBytes());
-        defer a.free(ours);
-        try std.testing.expectEqualSlices(u8, try t.wrapper(), ours);
-    }
-    {
-        var t = PairedGu.init(a);
-        defer t.deinit();
-        try std.testing.expect(try t.prepare(.{ .rows = 40, .n = 640, .k = 2560 }, .random, 7));
         try t.run();
         const ours = try a.dupe(u8, t.rig.outputBytes());
         defer a.free(ours);

@@ -81,34 +81,6 @@ pub fn concatRows(parts: []const mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_arra
     return out;
 }
 
-/// Extract timestep t from a [B, T, H, D] tensor → [B, H, D]
-fn sliceTimestep4(arr: mlx.mlx_array, batch: c_int, heads: c_int, dim: c_int, t: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const start = [_]c_int{ 0, t, 0, 0 };
-    const stop = [_]c_int{ batch, t + 1, heads, dim };
-    const strides = [_]c_int{ 1, 1, 1, 1 };
-    var sliced = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sliced);
-    try mlx.check(mlx.mlx_slice(&sliced, arr, &start, 4, &stop, 4, &strides, 4, s));
-    const out_shape = [_]c_int{ batch, heads, dim };
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&result, sliced, &out_shape, 3, s));
-    return result;
-}
-
-/// Extract timestep t from a [B, T, H] tensor → [B, H]
-fn sliceTimestep3(arr: mlx.mlx_array, batch: c_int, heads: c_int, t: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
-    const start = [_]c_int{ 0, t, 0 };
-    const stop = [_]c_int{ batch, t + 1, heads };
-    const strides = [_]c_int{ 1, 1, 1 };
-    var sliced = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sliced);
-    try mlx.check(mlx.mlx_slice(&sliced, arr, &start, 3, &stop, 3, &strides, 3, s));
-    const out_shape = [_]c_int{ batch, heads };
-    var result = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&result, sliced, &out_shape, 2, s));
-    return result;
-}
-
 /// A module arch's token ids on the host.
 pub fn hostIds(self: *Transformer, token_ids: mlx.mlx_array) ![]u32 {
     var ids32 = mlx.mlx_array_new();

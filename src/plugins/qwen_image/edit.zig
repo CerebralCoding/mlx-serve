@@ -825,10 +825,6 @@ test "QwenImage edit preprocessing (env-gated)" {
     try testing.expectEqualSlices(f32, rgb1, rgb1d);
 }
 
-fn slotsRow(grids: []const [3]i64, i: usize) usize {
-    return @intCast(@divTrunc(grids[i][0] * grids[i][1] * grids[i][2], 4));
-}
-
 test "QwenImage edit tower bisect (env-gated)" {
     var f = try Fixture.open();
     defer f.fx.deinit();

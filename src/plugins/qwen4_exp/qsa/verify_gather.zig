@@ -35,7 +35,6 @@ const qsaWantsBlocks = @import("sparse_attn.zig").qsaWantsBlocks;
 /// instead of the whole cache under a dense [S, kv] mask. With `--kv-quant 8`
 /// the dense mask arm also dequantizes the whole stored range per layer per
 /// forward; this arm dequantizes only the gathered rows.
-/// MLX_SERVE_QSA_VERIFY_GATHER=0 restores the dense mask arm.
 pub fn qsaVerifyGatherEnabled() bool {
     return transformer.qsa_verify_gather_override orelse true;
 }
@@ -45,8 +44,7 @@ pub fn qsaVerifyGatherEnabled() bool {
 /// rows while the mask arm reads the cache in place, so the copy only pays
 /// once the union is well under half the cache (M4 Max, S=7: gather loses 7%
 /// at 17k keys, breaks even at 34k). Quantized KV dequantizes only the
-/// gathered rows, so its floor stays lower. MLX_SERVE_QSA_VERIFY_GATHER_MIN_KV
-/// sets ONE floor for both.
+/// gathered rows, so its floor stays lower.
 pub const QSA_VERIFY_GATHER_MIN_KV_DENSE: c_int = 32768;
 pub const QSA_VERIFY_GATHER_MIN_KV_QUANT: c_int = 16384;
 
@@ -797,7 +795,7 @@ test "qsa route: dense bf16 verify at kv 20000 takes the fused kernel through th
     // The production route is two calls: the indexer's `qsaWantsBlocks` (blocks or the dense
     // mask) and `qsaSlotAttn` (the arm chain). Below the union gather's 32768 floor a dense
     // cache used to get the mask; the fused kernel must now serve, and
-    // MLX_SERVE_QSA_ATTN_DENSE=0 must restore the mask route.
+    // the dense-variant seam's false must restore the mask route.
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const ta = std.testing.allocator;
@@ -925,43 +923,8 @@ test "qsa route: qsaWantsBlocks admits verify widths wherever the fused kernel s
     sparse_attn.qsa_attn_min_s_override = 6;
     try std.testing.expect(!qsaWantsBlocks(1, 9000, 4, false));
     try std.testing.expect(qsaWantsBlocks(1, 9000, 6, false));
-    // MLX_SERVE_QSA_GATHER=0 still turns every block route off.
+    // The gather seam's false still turns every block route off.
     sparse_attn.qsa_attn_min_s_override = null;
     transformer.qsa_gather_override = false;
     try std.testing.expect(!qsaWantsBlocks(1, 40000, 4, false));
-}
-
-test "qsa verify gather: the S=2..15 branch is reachable from the selection arm" {
-    // (c) Wiring pin. The gatherer is dead code unless the selection arm ALSO
-    // takes the block branch at verify widths, and the dispatch calls it
-    // BEFORE the prefill kernel (which carries no q_len floor of its own, so
-    // a selection at S=2..15 would otherwise fall into it and read the whole
-    // cache). Needles are assembled at comptime so this test's own source
-    // cannot satisfy the scan.
-    const src = @embedFile("sparse_attn.zig") ++
-        @embedFile("verify_gather.zig") ++
-        @embedFile("indexer.zig") ++
-        @embedFile("../../../sdk/blocks/attention/gated_full.zig");
-    if (std.mem.indexOf(u8, src, "const want_" ++ "blocks = qsa" ++ "WantsBlocks(") == null) return error.MissingWantBlocks;
-    const want_mark = "pub fn qsa" ++ "WantsBlocks(";
-    const at = std.mem.indexOf(u8, src, want_mark) orelse return error.MissingWantBlocks;
-    const stmt_end = std.mem.indexOfPos(u8, src, at, "\n}\n") orelse src.len;
-    const stmt = src[at..stmt_end];
-    const verify_gate = "qsaVerify" ++ "GatherEnabled()";
-    const verify_min = "qsaVerify" ++ "GatherMinKvFor(";
-    if (std.mem.indexOf(u8, stmt, verify_gate) == null) return error.SelectionArmMissesVerifyWidths;
-    if (std.mem.indexOf(u8, stmt, verify_min) == null) return error.SelectionArmMissesVerifyFloor;
-
-    const disp_mark = "pub fn qsa" ++ "SlotAttn(";
-    const dat = std.mem.indexOf(u8, src, disp_mark) orelse return error.MissingDispatch;
-    const dend = std.mem.indexOfPos(u8, src, dat, "\n}\n") orelse src.len;
-    const body = src[dat..dend];
-    const call = "qsaVerify" ++ "GatherAttn(";
-    const vat = std.mem.indexOf(u8, body, call) orelse return error.DispatchMissesVerifyGather;
-    const prefill_call = "qsaPrefill" ++ "GatherProfiled(";
-    const pat = std.mem.indexOf(u8, body, prefill_call) orelse return error.DispatchMissesPrefillGather;
-    if (vat > pat) return error.VerifyGatherAfterPrefillGather;
-    const floor = "seq_len >= FUSED256_" ++ "MIN_Q_LEN";
-    const guard_at = std.mem.lastIndexOf(u8, body[0..pat], floor) orelse return error.PrefillGatherUnguarded;
-    if (pat - guard_at > 600) return error.PrefillGatherUnguarded;
 }

@@ -98,7 +98,7 @@ pub const HOT_CACHE_FLOOR_BYTES: u64 = 1024 * 1024 * 1024;
 /// is the KV a pinned context has already spoken for (0 under auto-context).
 /// The byte cap one prefill forward's transient may claim, and the one place the sizer's two
 /// changes (dropping the ask, adding the ctx bar) are gated by arch; every other arch keeps
-/// the previous arithmetic. `MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0` drops the ctx bar inside the gate.
+/// the previous arithmetic.
 pub fn prefillChunkCap(
     config: *const model_mod.ModelConfig,
     ceiling: u64,
@@ -142,10 +142,6 @@ pub fn resolvePrefillChunk(
 /// The width `--prefill-chunk` asked for, or 0. The bill must let it outrank the pin as the
 /// forward does: `--prefill-chunk 4096` used to run against a 512-token reserve.
 pub fn explicitPrefillChunk() u32 {
-    // `MLX_SERVE_PREFILL_CHUNK` outranks everything in `generate.effectivePrefillChunk`, so the
-    // bill must see it too. Clamped: the env value is unbounded at its source.
-    const env_w: usize = @min(generate_mod.envPrefillChunk(), @as(usize, std.math.maxInt(u32)));
-    if (env_w > 0) return @intCast(env_w);
     if (!generate_mod.prefill_chunk_explicit) return 0;
     const raw: usize = @min(generate_mod.prefill_chunk_override, @as(usize, std.math.maxInt(u32)));
     return @intCast(raw);
@@ -211,7 +207,7 @@ pub fn pinPrefillChunk(config: *model_mod.ModelConfig) u32 {
         if (config.longCtxGated() and explicitPrefillChunk() == 0) {
             const share_only = resolvePrefillChunk(config, kv_bits, currentGpuMemoryCeiling(config, active_mem), active_mem, 0, hot_cache_ask);
             if (share_only > config.pinned_prefill_chunk) {
-                log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d}; MLX_SERVE_PREFILL_CHUNK_CTX_BAR=0 restores)\n", .{ config.pinned_prefill_chunk, share_only });
+                log.info("[prefill] chunk {d} (ctx bar: the --ctx-size KV bill; share-only would allow {d})\n", .{ config.pinned_prefill_chunk, share_only });
             }
         }
         // Say it once per model, wherever the model was pinned from (startup
@@ -270,12 +266,10 @@ pub const PREFILL_WIDE_RUNG_MARGIN_PCT: u64 = 22;
 /// Test hook for `perRequestPrefillChunkEnabled`'s kill switch.
 pub var per_request_chunk_override: ?bool = null;
 
-/// The arch capability AND the kill switch (`MLX_SERVE_PREFILL_CHUNK_PER_REQUEST=0` restores the load-time pin).
+/// The arch capability; the override is a test seam.
 pub fn perRequestPrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
     if (!config.perRequestPrefillChunk()) return false;
-    if (per_request_chunk_override) |v| return v;
-    const raw = env.get(.MLX_SERVE_PREFILL_CHUNK_PER_REQUEST) orelse return true;
-    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    return per_request_chunk_override orelse true;
 }
 
 /// The widest ladder rung this request can afford, priced by the same estimator that admits
@@ -310,7 +304,7 @@ pub fn chooseRequestPrefillChunk(
 /// The width one ladder rung forwards at. `long_ctx_gated = false` asks what the rung would be
 /// without the long-context gate, i.e. the width the load-time machine cap still bounds.
 fn rungWidth(config: *const model_mod.ModelConfig, seq: u64, rung: u32, long_ctx_gated: bool) u64 {
-    // `effectivePrefillChunk` can return `MLX_SERVE_PREFILL_CHUNK` verbatim; clamp before narrowing.
+    // `effectivePrefillChunk` can return an explicit `--prefill-chunk` verbatim; clamp before narrowing.
     return @min(
         @as(u64, generate_mod.effectivePrefillChunk(
             config.prefillScoreHeadDim(),
@@ -332,7 +326,6 @@ pub fn requestPrefillChunkNow(
     prompt_len: usize,
     max_tokens: u32,
     kv_cfg: transformer_mod.KVQuantConfig,
-    unchunked_prefill: bool,
     warm_matched: u64,
     warm_capacity: u64,
     warm_will_donate: bool,
@@ -341,8 +334,6 @@ pub fn requestPrefillChunkNow(
     const pin: u32 = config.pinned_prefill_chunk;
     const explicit: u32 = explicitPrefillChunk();
     if (explicit > 0) return explicit;
-    // The vision kill switch forwards the whole prompt; there is no chunk to choose.
-    if (unchunked_prefill) return pin;
     if (!perRequestPrefillChunkEnabled(config)) return pin;
 
     const seq: u64 = @intCast(prompt_len);
@@ -364,17 +355,13 @@ pub fn requestPrefillChunkNow(
 /// Test hook for `adaptivePrefillChunkEnabled`'s kill switch.
 pub var adaptive_chunk_override: ?bool = null;
 
-/// The per-chunk adaptive width: subordinate to the per-request gate, plus
-/// `MLX_SERVE_PREFILL_CHUNK_ADAPTIVE=0`, plus "no operator pinned a width".
+/// The per-chunk adaptive width: subordinate to the per-request gate, plus "no operator pinned a width".
 pub fn adaptivePrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
     // Arch first: the cheapest and most selective, and this runs once per chunk boundary.
     if (!config.perRequestPrefillChunk()) return false;
     if (explicitPrefillChunk() > 0) return false;
-    if (generate_mod.envPrefillChunk() > 0) return false;
     if (!perRequestPrefillChunkEnabled(config)) return false;
-    if (adaptive_chunk_override) |v| return v;
-    const raw = env.get(.MLX_SERVE_PREFILL_CHUNK_ADAPTIVE) orelse return true;
-    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
+    return adaptive_chunk_override orelse true;
 }
 
 /// Consecutive supporting probes a widening needs: the probe is taken after `mlx_clear_cache`
@@ -383,7 +370,7 @@ pub const PREFILL_WIDEN_PROBES: u8 = 2;
 
 /// What one chunk of `width` costs beyond what is already resident: its transient envelope
 /// plus the per-token state the chunk is about to write. The growth term is billed even under
-/// the default reservation (`MLX_SERVE_KV_RESERVE=0` and short prompts do grow per chunk).
+/// the reservation (short prompts do grow per chunk).
 pub fn prefillChunkCost(
     config: *const model_mod.ModelConfig,
     kv_bits: u64,
@@ -1321,74 +1308,6 @@ test "resolvePrefillChunk: a squeezed box steps the chunk down; a roomy one keep
     }
 }
 
-test "the chunk the guard BILLS is the chunk the forward will RUN" {
-    // Fatal-class drift: the bill is linear in the chunk, so a guard that
-    // models 512 while `generate` forwards 8192 admits a prefill that dies in
-    // an uncatchable Metal completion-handler throw. `effectivePrefillChunk`
-    // is the single resolver and every call site must hand it the model's
-    // pinned width — the sizer, the admission guard, and the prefill loop.
-    const t = std.testing;
-    const srcs = [_][]const u8{ @embedFile("context.zig") ++ @embedFile("admit.zig") ++ @embedFile("prefill_chunk.zig") ++ @embedFile("bills_test.zig"), @embedFile("../generate.zig") };
-    var sites: usize = 0;
-    for (srcs) |src| {
-        var i: usize = 0;
-        // Needle split so this scan's own source cannot satisfy it.
-        const needle = "effectivePrefill" ++ "Chunk(";
-        while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
-            i = at + 1;
-            // Skip the declaration itself.
-            if (at >= 3 and std.mem.eql(u8, src[at - 3 .. at], "fn ")) continue;
-            // Skip test call sites: a hit belongs to a test when the nearest `test "` above it is
-            // nearer than the nearest function header.
-            const before = src[0..at];
-            const last_test = std.mem.lastIndexOf(u8, before, "\ntest \"");
-            const last_fn = std.mem.lastIndexOf(u8, before, "\nfn ") orelse 0;
-            const last_pub_fn = std.mem.lastIndexOf(u8, before, "\npub fn ") orelse 0;
-            if (last_test) |lt| {
-                if (lt > @max(last_fn, last_pub_fn)) continue;
-            }
-            const tail = src[at..@min(src.len, at + 512)];
-            const end = std.mem.indexOf(u8, tail, "));") orelse
-                std.mem.indexOf(u8, tail, ");") orelse return error.CallSiteMoved;
-            // `rung` is a candidate being priced and `chosen`/the ladder floor becomes the pin; all
-            // are billed by `prefillNeededAtChunk`. A bare launch-width argument still fails.
-            const args = tail[0..end];
-            try t.expect(std.mem.indexOf(u8, args, "pinned_prefill_chunk") != null or
-                std.mem.indexOf(u8, args, "rung") != null or
-                std.mem.indexOf(u8, args, "chosen") != null or
-                std.mem.indexOf(u8, args, "PREFILL_CHUNK_LADDER[PREFILL_CHUNK_LADDER.len - 1]") != null);
-            sites += 1;
-        }
-    }
-    try t.expect(sites >= 3);
-
-    // The prefill loop's copy arrives through `InitOptions`, NOT off
-    // `xfm.config`: the Transformer holds a COPY of the config taken when it
-    // was built and the pin is written afterwards, so reading it there is a
-    // silent no-op (live 2026-08-14: pinned 4096, prefilled at 8192). The
-    // scheduler sources it from `slot.model.config` — the same object the
-    // guard bills against.
-    const sched = @embedFile("../prefill.zig");
-    // The width is chosen per request (`req_prefill_chunk`) and falls back to `cfg.pinned_prefill_chunk`.
-    // `companyPrefillChunk` only narrows it, so the bill stays an upper bound.
-    try t.expect(std.mem.indexOf(u8, sched, ".pinned_prefill_chunk = companyPrefillChunk(req_prefill_chunk,") != null);
-    try t.expect(std.mem.indexOf(u8, sched, "const req_prefill_chunk: u32 = if (slot.model.config) |cfg| blk: {") != null);
-    try t.expect(std.mem.indexOf(u8, sched, "const pin = cfg.pinned_prefill_chunk;") != null);
-    try t.expect(std.mem.indexOf(u8, srcs[1], "xfm.config.pinned_prefill_chunk") == null);
-
-    // And the width has to be frozen BEFORE anything is computed from it:
-    // `pinPrefillChunk` runs at the top of `pinAutoContext`, above the
-    // `--ctx-size` early-out, because the guard reads it on every request.
-    const server_src = srcs[0];
-    const pin = std.mem.indexOf(u8, server_src, "fn pinAutoContext(") orelse return error.CallSiteMoved;
-    const body = server_src[pin..@min(server_src.len, pin + 800)];
-    const chunk_at = std.mem.indexOf(u8, body, "pinPrefillChunk(config)") orelse return error.PinMissing;
-    const ctx_at = std.mem.indexOf(u8, body, "autoContextFor(config)") orelse return error.CallSiteMoved;
-    const ctxsize_at = std.mem.indexOf(u8, body, "manualContext(config) > 0") orelse return error.CallSiteMoved;
-    try t.expect(chunk_at < ctx_at);
-    try t.expect(chunk_at < ctxsize_at);
-}
-
 test "a loaded DFlash drafter's context K/V is billed per prompt row" {
     var cfg = qwen4ExpOomConfig();
     const base = prefillNeededAtChunk(&cfg, 32768, 1024, 16, 2048, .{});
@@ -1538,7 +1457,7 @@ test "the tail-merge gate reads the ARCH, not the installed hook (serve installs
     defer per_request_chunk_override = null;
     adaptive_chunk_override = true;
     defer adaptive_chunk_override = null;
-    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    const unpinned = explicitPrefillChunk() == 0;
     try t.expectEqual(unpinned, scheduler_mod.adaptiveChunkWidthFor(&cfg));
     if (unpinned) {
         try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, scheduler_mod.adaptiveChunkWidthFor(&cfg)));
@@ -1571,7 +1490,7 @@ test "the tail-merge bound scales ONLY where the per-chunk adaptive width is liv
     defer per_request_chunk_override = null;
     adaptive_chunk_override = true;
     defer adaptive_chunk_override = null;
-    const unpinned = explicitPrefillChunk() == 0 and generate_mod.envPrefillChunk() == 0;
+    const unpinned = explicitPrefillChunk() == 0;
     try t.expectEqual(unpinned, adaptivePrefillChunkEnabled(&cfg));
     try t.expectEqual(@as(usize, 64), generate_mod.tailMergeMaxFor(512, true));
     try t.expectEqual(@as(usize, 512), generate_mod.nextChunkEnd(0, 812, 512, false, 0, 0, true, false));
@@ -1606,7 +1525,7 @@ test "adaptivePrefillWidth: the ratchet is one-way, and the cap is a ceiling" {
     while (i < 8) : (i += 1) {
         try t.expectEqual(cap, adaptivePrefillWidth(&cfg, kv_bits, kv, std.math.maxInt(u64) / 2, cap, cap, &st2));
     }
-    // A cap of 0 (the unchunked vision arm) is "do not touch the width".
+    // A cap of 0 is "do not touch the width".
     var st3: generate_mod.AdaptiveWidthState = .{};
     try t.expectEqual(@as(u32, 2048), adaptivePrefillWidth(&cfg, kv_bits, kv, 0, 2048, 0, &st3));
 }

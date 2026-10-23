@@ -16,7 +16,6 @@ const layerCap = @import("../../engines/mlx/diag/profile.zig").layerCap;
 const diagEnvOn = @import("../../engines/mlx/env_transformer.zig").diagEnvOn;
 const envFlagCached = @import("../../engines/mlx/env_transformer.zig").envFlagCached;
 const PREFILL_EVAL_CADENCE_DEFAULT = @import("../../engines/mlx/eval_cadence.zig").PREFILL_EVAL_CADENCE_DEFAULT;
-const decodeAsyncLadderStride = @import("../../engines/mlx/eval_cadence.zig").decodeAsyncLadderStride;
 const evalCadencePoint = @import("../../engines/mlx/eval_cadence.zig").evalCadencePoint;
 const ladderStepMulti = @import("../../engines/mlx/eval_cadence.zig").ladderStepMulti;
 const prefillEvalCadenceApplies = @import("../../engines/mlx/eval_cadence.zig").prefillEvalCadenceApplies;
@@ -54,13 +53,8 @@ const Qwen4AttnProf = @import("prof.zig").Qwen4AttnProf;
 const Qwen4FwdProf = @import("prof.zig").Qwen4FwdProf;
 const ssmFreeQsaState = @import("qsa/history.zig").ssmFreeQsaState;
 
-/// qwen4_exp's batched decode builds each step's graph while the GPU idles, so its ladder ships ON at this stride;
-/// an explicit `MLX_SERVE_DECODE_ASYNC_LADDER` (including "0"/"off") still wins. Serial decode and other arches
-/// keep `decode_async_ladder`.
-pub fn qwen4DecodeLadderStride(raw: ?[]const u8) u32 {
-    return if (raw == null) QWEN4_DECODE_ASYNC_LADDER_DEFAULT else decodeAsyncLadderStride(raw);
-}
-
+/// qwen4_exp's batched decode builds each step's graph while the GPU idles, so its ladder ships ON at this stride.
+/// Serial decode and other arches keep `decode_async_ladder`.
 pub const QWEN4_DECODE_ASYNC_LADDER_DEFAULT: u32 = 4;
 
 pub fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_array, ctxs: []const *ForwardCtx) bool {
@@ -1904,7 +1898,7 @@ test "qwen4 fixture: full prefill, chunked prefill + decode past the QSA budget 
 
 /// A decode-width `forwardQwen4With` over dense synthetic weights with every block a stand-in: the graph is the
 /// embedding, one host-gathered PLE layer, the final mixer and the lm_head. Ladder strides start at the shipped
-/// defaults (serial off, batched `qwen4DecodeLadderStride(null)`).
+/// defaults (serial off, batched `QWEN4_DECODE_ASYNC_LADDER_DEFAULT`).
 const Qwen4LadderRig = struct {
     fx: PleArmFixture,
     layer_bytes: [LAYERS * @sizeOf(MoeLayerWeights)]u8 align(@alignOf(MoeLayerWeights)),
@@ -1981,7 +1975,7 @@ const Qwen4LadderRig = struct {
         };
         x.moe_layers = layers[0..LAYERS];
         x.decode_async_ladder = 0;
-        x.decode_async_ladder_qwen4 = Transformer.qwen4DecodeLadderStride(null);
+        x.decode_async_ladder_qwen4 = QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
     }
 
     fn deinit(self: *Qwen4LadderRig) void {
@@ -2027,7 +2021,7 @@ const Qwen4LadderRig = struct {
     fn batchedStep(self: *Qwen4LadderRig, slots: []const *Qwen4TestSlot, ids: []const i32, ladder: u32, fill: bool) !Step {
         const x = self.fx.xfm();
         x.decode_async_ladder_qwen4 = ladder;
-        defer x.decode_async_ladder_qwen4 = Transformer.qwen4DecodeLadderStride(null);
+        defer x.decode_async_ladder_qwen4 = QWEN4_DECODE_ASYNC_LADDER_DEFAULT;
         const run = try qwen4BatchedPleForward(x, slots, ids, 1, false, true, fill);
         defer _ = mlx.mlx_array_free(run.logits);
         return .{ .logits = try qwen4ReadF32(testing.allocator, run.logits, x.s), .pending = run.pending };
@@ -2046,16 +2040,6 @@ fn expectLogitBitsEqual(want: []const f32, got: []const f32) !void {
     }
     std.debug.print("logits differ in {d}/{d} entries, max |diff| {d}\n", .{ n, want.len, max });
     return error.TestExpectedEqual;
-}
-
-test "qwen4 decode ladder: stride resolution keeps an explicit off and leaves other arches off" {
-    try testing.expectEqual(@as(u32, 4), Transformer.qwen4DecodeLadderStride(null));
-    try testing.expectEqual(@as(u32, 0), Transformer.qwen4DecodeLadderStride("0"));
-    try testing.expectEqual(@as(u32, 0), Transformer.qwen4DecodeLadderStride("off"));
-    try testing.expectEqual(@as(u32, 0), Transformer.qwen4DecodeLadderStride(""));
-    try testing.expectEqual(@as(u32, 2), Transformer.qwen4DecodeLadderStride("2"));
-    try testing.expectEqual(@as(u32, 8), Transformer.qwen4DecodeLadderStride("auto"));
-    try testing.expectEqual(@as(u32, 0), Transformer.decodeAsyncLadderStride(null));
 }
 
 test "qwen4 decode ladder: serial decode keeps the default off; an explicit stride fills host ids first, skips lazy ones" {
@@ -2118,7 +2102,7 @@ test "qwen4 decode ladder: batched N=2 decode fills the PLE leaf first, logits a
     defer rig.deinit();
     const alloc = testing.allocator;
     // Arms: off, on at stride 1, on at the shipped stride, and an unfilled leaf.
-    const strides = [_]u32{ 0, 1, Transformer.qwen4DecodeLadderStride(null) };
+    const strides = [_]u32{ 0, 1, QWEN4_DECODE_ASYNC_LADDER_DEFAULT };
     const prompts = [2][]const i32{ &.{ 5, 17, 42, 9 }, &.{ 11, 4, 19 } };
     var slots: [strides.len + 1][2]*Qwen4TestSlot = undefined;
     var made: usize = 0;

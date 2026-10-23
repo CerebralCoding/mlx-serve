@@ -22,14 +22,6 @@ var kernel_cache: ?mlx.mlx_fast_metal_kernel = null;
 const CfgKey = struct { n: c_int, k: c_int, dt: mlx.mlx_dtype };
 var cfg_cache: std.AutoHashMapUnmanaged(CfgKey, mlx.mlx_fast_metal_kernel_config) = .{};
 
-var env_enabled: ?bool = null;
-fn enabled() bool {
-    if (env_enabled) |v| return v;
-    const raw = env.get(.MLX_SERVE_QMV_H2);
-    env_enabled = raw == null or raw.?[0] != '0';
-    return env_enabled.?;
-}
-
 fn kernel() !mlx.mlx_fast_metal_kernel {
     if (kernel_cache) |k| return k;
     const in_names = [_][*:0]const u8{ "x", "w", "scales", "biases" };
@@ -71,7 +63,7 @@ fn supportedDtypes(dt: mlx.mlx_dtype, sc: mlx.mlx_array, bi: mlx.mlx_array) bool
 }
 
 fn eligible(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32) ?[2]c_int {
-    if (bits != 2 or group_size != 128 or bi.ctx == null or !enabled()) return null;
+    if (bits != 2 or group_size != 128 or bi.ctx == null) return null;
     if (!supportedDtypes(mlx.mlx_array_dtype(x), sc, bi)) return null;
     const xs = mlx.getShape(x);
     const ws = mlx.getShape(w);
@@ -204,7 +196,7 @@ fn rowsConfig(key: RowsKey) !mlx.mlx_fast_metal_kernel_config {
 /// `x @ w.T` for 1..8 activation rows over a 2-bit group-128 weight whose
 /// biases are exactly -scales (`bneg`) at geometry `geom`, or null.
 pub fn qmvRowsAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, bneg: bool, geom: Geom, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!bneg or bits != 2 or group_size != 128 or bi.ctx == null or !enabled()) return null;
+    if (!bneg or bits != 2 or group_size != 128 or bi.ctx == null) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (!supportedDtypes(dt, sc, bi)) return null;
     const xs = mlx.getShape(x);
@@ -281,7 +273,7 @@ fn mmaConfig(key: MmaKey) !mlx.mlx_fast_metal_kernel_config {
 /// `x @ w.T` for 1..MMA_MAX_ROWS rows over a ternary 2-bit group-128 weight
 /// (biases == -scales) on simdgroup MMAs at geometry `geom`, or null.
 pub fn qmmMmaAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, bneg: bool, geom: MmaGeom, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (!bneg or bits != 2 or group_size != 128 or bi.ctx == null or !enabled()) return null;
+    if (!bneg or bits != 2 or group_size != 128 or bi.ctx == null) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (!supportedDtypes(dt, sc, bi)) return null;
     const xs = mlx.getShape(x);
@@ -310,7 +302,7 @@ pub fn qmmMmaAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.m
     defer _ = mlx.mlx_vector_array_free(outs);
     if (!mma_logged) {
         mma_logged = true;
-        log.info("[qmv2] MMA verify lane engaged: M={d} N={d} K={d} (MLX_SERVE_QMV_H2=0 restores stock)\n", .{ m, n, k });
+        log.info("[qmv2] MMA verify lane engaged: M={d} N={d} K={d} \n", .{ m, n, k });
     }
     const cfg = try mmaConfig(.{ .n = n, .k = k, .m = m, .dt = dt, .geom = geom });
     try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outs, mma_kernel.?, in_vec, cfg, s));
@@ -343,7 +335,7 @@ pub fn qmmMmaAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.m
 /// or null (caller keeps stock qmm). `legacy_ok` = a Hadamard pack, the only
 /// packs the pre-plan kernels were measured on.
 pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, bneg: bool, legacy_ok: bool, s: mlx.mlx_stream) !?mlx.mlx_array {
-    if (bits != 2 or group_size != 128 or !enabled() or !mlx.streamIsGpu(s)) return null;
+    if (bits != 2 or group_size != 128 or !mlx.streamIsGpu(s)) return null;
     const xs = mlx.getShape(x);
     if (xs.len == 0) return null;
     var m: c_int = 1;

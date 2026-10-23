@@ -1650,32 +1650,6 @@ pub const VisionEncoder = struct {
 
     // ── Cycle Fill ──
 
-    fn cycleFill(self: *VisionEncoder, src: mlx.mlx_array, batch: c_int, n_src: c_int, n_target: c_int) !mlx.mlx_array {
-        // Tile the source to fill target length: repeat src ceil(n_target/n_src) times, then slice
-        const repeats = @divTrunc(n_target + n_src - 1, n_src);
-        _ = batch;
-
-        // Use tile along seq dim
-        var parts: [16]mlx.mlx_array = undefined;
-        const r: usize = @intCast(@min(repeats, 16));
-        for (0..r) |i| {
-            parts[i] = src;
-        }
-        const cat_vec = mlx.mlx_vector_array_new_data(&parts, r);
-        defer _ = mlx.mlx_vector_array_free(cat_vec);
-        var tiled = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(tiled);
-        try mlx.check(mlx.mlx_concatenate_axis(&tiled, cat_vec, 1, self.s));
-
-        // Slice to target length
-        const t_shape = mlx.getShape(tiled);
-        const sl_start = [_]c_int{ 0, 0, 0 };
-        const sl_stop = [_]c_int{ t_shape[0], n_target, t_shape[2] };
-        const sl_strides = [_]c_int{ 1, 1, 1 };
-        var result = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_slice(&result, tiled, &sl_start, 3, &sl_stop, 3, &sl_strides, 3, self.s));
-        return result;
-    }
 };
 
 // ── Soft-token-budget processor (EmbeddingGemma 2) ──

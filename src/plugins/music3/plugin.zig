@@ -94,7 +94,7 @@ fn parse(b: *const job.Body) union(enum) { ok: Parsed, bad: Verdict } {
         if (v.integer < 4 or v.integer > 100) return .{ .bad = bad("'steps' must be in [4,100]") };
         steps = @intCast(v.integer);
     };
-    const caption = music3.captionWithFacts(gpa, prompt, bpm, b.str("keyscale") orelse "", instrumental and music3.instrumentalCaptionEnabled()) catch
+    const caption = music3.captionWithFacts(gpa, prompt, bpm, b.str("keyscale") orelse "", instrumental) catch
         return .{ .bad = job.failure(error.OutOfMemory, "music generation failed") };
     return .{ .ok = .{ .caption = caption, .req = .{
         .caption = caption,

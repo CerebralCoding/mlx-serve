@@ -118,7 +118,7 @@ pub fn markQsaPooledRopeStale(self: *Transformer) void {
 // ── Fused QSA pooled-key upkeep ──
 pub var qsa_idx_rope_fused_override: ?bool = null;
 
-/// `MLX_SERVE_QSA_IDX_ROPE_FUSED=0` restores the composed pooled-key chain.
+/// The test seam's false runs the composed pooled-key chain.
 pub fn qsaIdxRopeFusedEnabled() bool {
     return qsa_idx_rope_fused_override orelse true;
 }

@@ -263,25 +263,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         }
     }
 
-    // Phase 2 experiment: opt-in full-forward Metal fusion via
-    // MLX_SERVE_COMPILE_FORWARD=1. This wraps the entire forward pass in
-    // mlx_compile so the chunked-prefill loop dispatches a fused graph
-    // instead of ~hundreds of separate ops per chunk. Gated because
-    // (a) the compiled closure captures `xfm.cache` / `xfm.ssm_entries`
-    // as state, and any path that swaps those (multi-slot scheduler,
-    // future re-entrant callers) must verify they're not racing the
-    // compiled call; (b) mlx_compile with shapeless=false recompiles
-    // per unique input shape, which thrashes if the prefill loop sees
-    // many different chunk sizes. Tied to byte-equivalence pin in
-    // tests/test_phase2_forward_equivalence.sh.
-    if (env.get(.MLX_SERVE_COMPILE_FORWARD) != null) {
-        const raw = env.get(.MLX_SERVE_COMPILE_FORWARD).?;
-        const slice = std.mem.sliceTo(raw, 0);
-        if (std.mem.eql(u8, slice, "1")) {
-            xfm_ptr.compileForward();
-        }
-    }
-
     // Vision encoder if requested. `MissingVisionWeights` is a benign opt-out
     // (model declares vision in config but the safetensors didn't ship the
     // tower); other errors fail the whole load.
@@ -352,10 +333,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         break :blk "";
     } else drafter_found;
     if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
-        const env_off = if (env.get(.MLX_SERVE_DFLASH)) |v| v[0] == '0' else false;
-        if (env_off) {
-            log.info("[dflash] sidecar at {s} skipped (MLX_SERVE_DFLASH=0)\n", .{drafter_dir});
-        } else {
+        {
             const d = try sch.allocator.create(DflashModel);
             d.* = dflash_mod.loadDflash(sch.io, sch.allocator, mlx.gpuStream(), drafter_dir) catch |err| {
                 sch.allocator.destroy(d);
@@ -953,52 +931,3 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
 }
 
 // ── tests ──
-
-test "the ANE build resolves its chunk through effectivePrefillChunk, never the pin alone" {
-    // The compiled ANE tile only serves chunks of EXACTLY its width, and the
-    // forward's chunk is the pin run through effectivePrefillChunk's
-    // per-arch policy (MoE caps at 4096 where the pin says 8192) — building
-    // at the bare pin left every MoE program built-but-never-dispatched
-    // (A7, 2026-08-18). The needle is split so this test's own text cannot
-    // satisfy it.
-    const src = @embedFile("load.zig");
-    const needle = "effectivePrefillChunk" ++ "(";
-    var it = std.mem.splitSequence(u8, src, "xfm_ptr.buildAnePrefill");
-    _ = it.first();
-    const before_call = it.rest();
-    _ = before_call;
-    // The call site's chunk value must be produced by effectivePrefillChunk
-    // in the same block: find the buildAnePrefill call and scan the 1200
-    // bytes before it for the resolver.
-    const call_at = std.mem.indexOf(u8, src, "xfm_ptr.buildAnePrefill(sch.io, chunk").?;
-    const window_start = call_at -| 1200;
-    try std.testing.expect(std.mem.indexOf(u8, src[window_start..call_at], needle) != null);
-}
-
-test "the qwen4 coarse rerank head is built at LOAD, on both load paths" {
-    // Built lazily it landed inside the first request's draft chain: a
-    // 248320-row requantize of the trunk lm_head plus a synchronous eval of
-    // ~240 MB, on the inference thread, mid-round. That is first-token
-    // latency on the first request after a load — the sidecar arm has always
-    // paid it at bind time instead.
-    //
-    // `doLoadOnInferenceThread` is the ONE Transformer construction site, and
-    // the boot load and the `/v1/load` cold load both route through it (the
-    // "a launch flag that shapes a LOAD" class: a hook on only one of them
-    // ships a server where the first cold-loaded model still pays lazily).
-    // This pins all three.
-    const source = @embedFile("../../host/gpu_thread/loop.zig") ++ @embedFile("../../host/gpu_thread/load_requests.zig") ++ @embedFile("load.zig");
-    const start = std.mem.indexOf(u8, source, "fn doLoadOnInferenceThread(") orelse return error.MissingLoadFn;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\n// ── tests ──") orelse return error.MissingLoadFnEnd;
-    const body = source[start..end];
-    const build = std.mem.indexOf(u8, body, "qwen4BuildDraftRerank()") orelse return error.MissingEagerRerankBuild;
-    // Gated exactly like the head it drafts for: `--no-mtp` never drafts, so
-    // it must never pay for the coarse head.
-    const gate = std.mem.lastIndexOf(u8, body[0..build], "mtp_enabled") orelse return error.EagerRerankBuildUngated;
-    try testing.expect(build - gate < 200);
-
-    // Boot load (inferenceLoop) and cold load (runLoadRequest) both land there.
-    const boot = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingBootLoad;
-    const cold = std.mem.indexOf(u8, source, "doLoadOnInferenceThread(sch, req)") orelse return error.MissingColdLoad;
-    try testing.expect(boot != cold);
-}

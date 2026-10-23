@@ -24,6 +24,7 @@
 //! cache, no batched decode.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const model = @import("../../engines/mlx/model.zig");
@@ -485,16 +486,6 @@ fn qmmHost(alloc: std.mem.Allocator, q: *const Q, x: []const f32, m: usize, in_d
     return toHostF32(alloc, y, m * out_dim, s);
 }
 
-/// Dequantize q to host f32 [out, in] (transient use only — wo_a einsum).
-fn dequantHost(alloc: std.mem.Allocator, q: *const Q, len: usize, s: mlx.mlx_stream) ![]f32 {
-    var d = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(d);
-    const empty = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(empty);
-    try mlx.check(mlx.mlx_dequantize(&d, q.w, q.s, q.b, mlx.mlx_optional_int.some(@intCast(q.qp.group_size)), mlx.mlx_optional_int.some(@intCast(q.qp.bits)), "affine", empty, mlx.mlx_optional_dtype{}, s));
-    return toHostF32(alloc, d, len, s);
-}
-
 /// out[m, n] = x[m, k] @ w[n, k]ᵀ — naive host matmul (correctness mode).
 fn matHost(out: []f32, x: []const f32, w: []const f32, m: usize, k: usize, n: usize) void {
     for (0..m) |i| {
@@ -646,8 +637,7 @@ pub const Dsv4Model = struct {
     wo_a_deq: []mlx.mlx_array,
     // per-layer wo_a quantized triples reshaped to per-group slabs
     // [og, ol, ·] (pure views of the checkpoint arrays — batched
-    // quantized_matmul reads the 8-bit weight in place). Empty when
-    // `MLX_SERVE_DSV4_WO_QMM=0` restores the dequantized operands.
+    // quantized_matmul reads the 8-bit weight in place).
     wo_a_q3: []Q3,
     // per-layer int8-g32 side copies of comp_in_t served at decode/verify
     // widths (C ≤ 32) under the user-facing --decode-attn-quant flag; big
@@ -667,12 +657,12 @@ pub const Dsv4Model = struct {
     hada_g: ?mlx.mlx_array, // [ihd, ihd] f32 Hadamard matrix (x @ H == FWHT)
     // fused Sinkhorn kernel (GPU streams; null → host-sync fallback)
     sink_k: ?SinkhornK = null,
-    // fused Sinkhorn + y-collapse kernel (`MLX_SERVE_DSV4_SINKY=0` kills;
-    // falls back to sink_k + the composed multiply/sum tail)
+    // fused Sinkhorn + y-collapse kernel (null: sink_k + the composed
+    // multiply/sum tail)
     sink_y_k: ?SinkhornK = null,
     sink_y_logged: bool = false,
-    // fused hc_post kernel (`MLX_SERVE_DSV4_HCPOST=0` kills; needs sink_y_k
-    // for the pack input — falls back to the composed matmul/multiply/add)
+    // fused hc_post kernel (needs sink_y_k for the pack input; null: the
+    // composed matmul/multiply/add)
     hc_post_k: ?SinkhornK = null,
     hc_post_logged: bool = false,
     sink_consts: mlx.mlx_array, // [hd_full, rms_eps, hc_eps] f32
@@ -1024,9 +1014,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
     }
     // wo_a: per-group slabs for the grouped low-rank O. Default = quantized
     // VIEWS [og, ol, ·] read in place by batched quantized_matmul (the bf16
-    // wo_a_deq slabs were 2.9 GB of the ~7.8 GB read per serial token);
-    // `MLX_SERVE_DSV4_WO_QMM=0` restores the dequantized [og, gin, ol]
-    // operands (dense matmul reads strided views fine).
+    // wo_a_deq slabs were 2.9 GB of the ~7.8 GB read per serial token).
     const og: c_int = @intCast(cfg.dsv4_o_groups);
     const ol: c_int = @intCast(cfg.dsv4_o_lora_rank);
     const gin: c_int = @intCast(cfg.num_attention_heads * cfg.head_dim / cfg.dsv4_o_groups);
@@ -1169,7 +1157,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
     // them (logical bytes need no eval), and either pay the true footprint
     // here in one batched eval or disable with an honest log. Default OFF:
     // untouched lazy stages cost nothing and the model serves serial.
-    const ds_env = std.c.getenv("MLX_SERVE_DSV4_DSPARK");
+    const ds_env = env.get(.MLX_SERVE_DSV4_DSPARK);
     const ds_opt_in = if (ds_env) |v| (v[0] == '1' or v[0] == 'f') else false;
     const ds_force = if (ds_env) |v| v[0] == 'f' else false;
     const has_stages = dw.dspark != null and dw.layers.len > n_layers;
@@ -1268,7 +1256,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
         .ds_conf_proj_t = if (dspark_on) try transposedF32(dw.dspark.?.conf_proj, s) else null,
         .ds_hc_head_base = if (dspark_on) try toHostF32(a, dw.dspark.?.hc_head_base, hc, s) else &.{},
         .ds_hc_head_scale = if (dspark_on) try toHostF32(a, dw.dspark.?.hc_head_scale, 1, s) else &.{},
-        .ds_prof = if (dspark_on and std.c.getenv("MLX_SERVE_DSPARK_PROFILE") != null) DsparkProfile{} else null,
+        .ds_prof = if (dspark_on and env.get(.MLX_SERVE_DSPARK_PROFILE) != null) DsparkProfile{} else null,
     };
 }
 
@@ -1626,8 +1614,7 @@ fn gpuEmitActive(m: *const Dsv4Model) bool {
     return mlx.streamIsGpu(m.s);
 }
 
-/// Fused window-emission kernel kill switch (`MLX_SERVE_DSV4_EMIT_KERNEL=0`
-/// → the composed ~60-op emission graph, the pre-kernel behavior). Cached.
+/// Fused window-emission kernel; the test hook's false runs the composed ~60-op emission graph.
 var emit_kernel_state: ?bool = null;
 var emit_kernel_logged: bool = false;
 /// Engagement counter (tests assert the kernel actually ran — a silent
@@ -1641,8 +1628,7 @@ fn emitKernelSetForTest(v: ?bool) void {
     emit_kernel_state = v;
 }
 
-/// Fused decode-chain kernel kill switch (`MLX_SERVE_DSV4_DEC_CHAIN=0` → the
-/// composed per-head RMS/rope/sim op chains, the pre-kernel behavior). Cached.
+/// Fused decode-chain kernel; the test hook's false runs the composed per-head RMS/rope/sim op chains.
 var dec_chain_state: ?bool = null;
 var dec_chain_logged: bool = false;
 var dec_chain_hits: usize = 0;
@@ -1693,7 +1679,7 @@ var lazy_decode_logged: bool = false;
 var dsv4_trace_state: ?bool = null;
 fn dsv4TraceEnabled() bool {
     if (dsv4_trace_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_TRACE")) |e| e[0] == '1' else false;
+    const v = if (env.get(.MLX_SERVE_DSV4_TRACE)) |e| e[0] == '1' else false;
     dsv4_trace_state = v;
     return v;
 }
@@ -4570,7 +4556,7 @@ fn gpuRms(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.
 // a 4×4 matrix, so occupancy is irrelevant and one thread is the right shape.
 // Reference = hcSplitSinkhorn (golden-tested); metal::exp differs from libm
 // by ~1 ulp — the comb path is continuous (no quantizer downstream), and the
-// decode-equivalence gate arbitrates. Kill: MLX_SERVE_DSV4_SINKHORN=0.
+// decode-equivalence gate arbitrates.
 /// SINKHORN + y-collapse in one dispatch: the composed tail (pre slice →
 /// reshape → multiply → sum) was 4 strictly-serial dispatches per sublayer,
 /// ~350/token at hc-chain depth. Grid (S, D); each threadgroup's lane-0
@@ -4930,8 +4916,7 @@ fn hcPostGpu(m: *Dsv4Model, stream_g: mlx.mlx_array, out_g: mlx.mlx_array, pre: 
 /// MoE call — at decode that was ~43 blocking round-trips per token. Hash
 /// layers never read scores for selection (pure token-id table, host-known),
 /// so their index rows are an UPLOAD, not a sync; their weights ride the
-/// same GPU gather. `MLX_SERVE_DSV4_MOE_ROUTE_GPU=0` restores the host sync
-/// (routeToken, f64 normalize) for A/B.
+/// same GPU gather.
 fn traceMemMb(comptime which: enum { active, cache, peak }) usize {
     var v: usize = 0;
     _ = switch (which) {

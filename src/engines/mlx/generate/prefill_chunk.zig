@@ -20,11 +20,6 @@ pub fn mtpGreedyTailFor(override: ?bool) bool {
     return override orelse generate_mod.mtp_greedy_tail_default;
 }
 
-/// The width `MLX_SERVE_PREFILL_CHUNK` asked for, or 0. A pinned width also turns the per-chunk adaptive width off.
-pub fn envPrefillChunk() usize {
-    return env.int(.MLX_SERVE_PREFILL_CHUNK, usize, 0);
-}
-
 /// Per-prefill state for the adaptive width; lives on `runPrefill`'s stack. The policy is
 /// `server.adaptivePrefillWidth`.
 /// The one place a chosen width becomes the running width.
@@ -139,7 +134,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
         // (+8% prefill for +3 GB peak here); every other MoE keeps the measured 4096 cap.
         return @min(base_chunk, if (is_moe and !long_ctx_gated) @as(usize, 4096) else @as(usize, 8192));
     }
-    // Composed-causal fallback (MLX_SERVE_FUSED_256_CAUSAL=0): SMALL chunks
+    // Composed-causal fallback (no fused causal kernel): SMALL chunks
     // measured strictly faster AND lighter on the 27B (2026-07-12 ladder,
     // M4 Max): 8K 225 -> 235.8 tok/s and peak 28.9 -> 19.8 GB at chunk
     // 2048; 32K 205.4 -> 209.3. Chunk boundaries ARE block-level causal
@@ -159,14 +154,11 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
 }
 
 /// The prefill chunk `initWithOptions` will actually use for a request:
-/// MLX_SERVE_PREFILL_CHUNK env (explicit tuning knob — honored verbatim,
-/// never safety-capped) > --prefill-chunk / default, capped by
+/// --prefill-chunk / default, capped by
 /// boundedPrefillChunk. Exported so server.zig's admission guard
 /// (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
 pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_chunk: usize) usize {
-    const env_chunk = env.int(.MLX_SERVE_PREFILL_CHUNK, usize, 0);
-    if (env_chunk > 0) return env_chunk;
     // `pinned_chunk` is the machine-sized cap frozen at load
     // (`ModelConfig.pinned_prefill_chunk`, from `server.resolvePrefillChunk`):
     // the widest chunk whose one-off transient reserve still leaves this box a
@@ -363,8 +355,7 @@ pub fn effectiveSsmCheckpointStride(base: usize, prefill_chunk: usize) usize {
 
 /// Tokens of KV capacity this prefill reserves up front (#353). A multi-chunk prompt reserves
 /// itself plus one chunk of slack on every arch, since each chunk-by-chunk grow copies the whole
-/// cache; generation headroom is pre-bought only under `longCtxGated`. `MLX_SERVE_KV_RESERVE=0`
-/// turns it off.
+/// cache; generation headroom is pre-bought only under `longCtxGated`.
 pub fn reservedPrefillTokens(
     config: *const model_mod.ModelConfig,
     seq: u64,
@@ -462,13 +453,6 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     try std.testing.expectEqual(@as(usize, 8192), explicit);
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(explicit, 1024));
     try std.testing.expectEqual(@as(usize, 8192), decodeShareCapped(explicit, 0));
-
-    env.set(.MLX_SERVE_PREFILL_CHUNK, "8192");
-    defer env.unset(.MLX_SERVE_PREFILL_CHUNK);
-    generate_mod.prefill_chunk_explicit = false;
-    const from_env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
-    try std.testing.expectEqual(@as(usize, 8192), from_env);
-    try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(from_env, 1024));
 }
 
 test "effectivePrefillChunk: the machine cap bounds every auto width, an explicit width passes" {
@@ -927,8 +911,8 @@ test "boundedPrefillChunk: a long-context-gated MoE hd-256 arch offers the 8192 
     try testing.expectEqual(@as(usize, 8192), boundedPrefillChunk(8192, 256, 24, 140_000, false, false, true));
 }
 
-test "boundedPrefillChunk: composed-causal (kill switch) keeps the 2048 cap + score formula" {
-    // MLX_SERVE_FUSED_256_CAUSAL=0 restores composed causal, where SMALLER
+test "boundedPrefillChunk: composed-causal keeps the 2048 cap + score formula" {
+    // Composed causal, where SMALLER
     // chunks measured faster on the 27B ladder (2026-07-12, M4 Max): 8K
     // prompt 225 -> 235.8 tok/s at chunk 2048 (peak 28.9 -> 19.8 GB).
     // Chunking IS block-level causal skipping for composed attention, and

@@ -2498,7 +2498,7 @@ const NaxAttn = struct {
     }
 
     pub fn run(self: *NaxAttn) !void {
-        try self.rig.launch(self.launch, self.geometry(self.shape).?, self.args[0..4]);
+        try self.rig.launch(self.launch, self.geometry(self.shape).?, self.args[0..self.nargs()]);
     }
 
     pub fn count(self: *const NaxAttn) usize {

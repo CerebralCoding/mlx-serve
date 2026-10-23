@@ -79,10 +79,9 @@ pub fn aneBuild(sch: *Scheduler, params: anytype, arch: arch_ane.Arch) !bool {
     defer if (in_dir_drafter) |d| sch.allocator.free(d);
     const drafter: ?[]const u8 = if (chosen_drafter) |d| (if (d.len > 0) d else null) else in_dir_drafter;
     // The GPU's sampling rule (`installSuppressMask`): reserved specials and padding rows are never drawn.
-    const off = generate_mod.suppressionDisabled();
-    const suppress_ids: []u32 = if (off) &.{} else tokenizer_mod.reservedOutputIds(sch.allocator, params.tok.flagged_specials, params.chat_config.chat_template, params.config.eosTokenSlice()) catch &.{};
+    const suppress_ids: []u32 = tokenizer_mod.reservedOutputIds(sch.allocator, params.tok.flagged_specials, params.chat_config.chat_template, params.config.eosTokenSlice()) catch &.{};
     defer sch.allocator.free(suppress_ids);
-    const defined_vocab: u32 = if (off) 0 else if (params.config.unpadded_vocab_size > 0) params.config.unpadded_vocab_size else @intCast(params.tok.definedVocabSize());
+    const defined_vocab: u32 = if (params.config.unpadded_vocab_size > 0) params.config.unpadded_vocab_size else @intCast(params.tok.definedVocabSize());
     const worker = arch_ane.openPool(sch.allocator, sch.io, params.model_dir, arch, .{
         .slots = params.ane_slots,
         .drafter = drafter,

@@ -7,6 +7,7 @@
 //! `<root>/<path>` at `Both.close`.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const device = @import("../../../mlx/device.zig");
 
@@ -22,7 +23,7 @@ pub fn deviceName(buf: []u8) []const u8 {
 
 /// The repo root to record under, when recording.
 pub fn recordRoot() ?[]const u8 {
-    const v = std.c.getenv("MLX_SERVE_PROOF_RECORD") orelse return null;
+    const v = env.get(.MLX_SERVE_PROOF_RECORD) orelse return null;
     return std.mem.span(v);
 }
 

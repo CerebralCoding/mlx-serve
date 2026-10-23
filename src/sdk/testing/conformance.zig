@@ -4,6 +4,7 @@
 //! `expectExactness` runs a plugin's declared exactness contracts on an engine serving it.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const common = @import("../../abi/common.zig");
 const model_abi = @import("../../abi/plugin.zig");
 const media_abi = @import("../../abi/media.zig");
@@ -95,7 +96,7 @@ const Staged = struct {
     fn init(io: std.Io, a: Allocator, fx: fixture.Fixture) !Staged {
         var rnd: [8]u8 = undefined;
         io.random(&rnd);
-        const base = std.mem.trimEnd(u8, if (std.c.getenv("TMPDIR")) |t| std.mem.span(t) else "/tmp", "/");
+        const base = std.mem.trimEnd(u8, if (env.get(.TMPDIR)) |t| std.mem.span(t) else "/tmp", "/");
         const path = try std.fmt.allocPrint(a, "{s}/mlx-serve-conformance-{x}", .{ base, std.mem.readInt(u64, &rnd, .little) });
         var dir = try std.Io.Dir.cwd().createDirPathOpen(io, path, .{});
         defer dir.close(io);

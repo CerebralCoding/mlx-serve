@@ -331,10 +331,6 @@ pub fn runOwedDecodeTicks(share: f32, chunk_ns: u64, first_ns: u64, ctx: *anyopa
     return r;
 }
 
-fn interleaveDecodeTickOpaque(ctx: *anyopaque) u64 {
-    return interleaveDecodeTick(@ptrCast(@alignCast(ctx)));
-}
-
 const INTERLEAVE_MAX_TICKS: u32 = 8;
 
 /// Decode ticks owed at a chunk boundary: enough to keep the decoding streams at a quarter

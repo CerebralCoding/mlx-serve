@@ -31,11 +31,6 @@ pub fn encodeWithSpecialTokens(
     try ids.appendSlice(allocator, segment_ids);
 }
 
-const SpecialEntry = struct {
-    text: []const u8,
-    id: u32,
-};
-
 /// Fallback chat formatting for when Jinja rendering fails.
 pub fn fallbackFormatChat(
     allocator: std.mem.Allocator,

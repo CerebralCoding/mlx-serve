@@ -153,8 +153,6 @@ pub const MtpAdaptive = struct {
     arm: MtpAdaptiveArm = .undecided,
     confirm: u32 = 0,
     bucket: ?usize = null,
-    /// Serial ticks since the arm went serial (or the last re-decision).
-    serial_ticks: u32 = 0,
     /// A re-entry was refused because the head's position bookkeeping is out of sync; latched.
     reentry_declined: bool = false,
     /// The switch left MTP on a module-owned head, so the arm is sticky: no re-entry, probe
@@ -190,54 +188,38 @@ pub const MtpAdaptive = struct {
                 if (self.confirm < @max(@as(u32, 1), need)) return .none;
                 self.confirm = 0;
                 self.arm = .serial;
-                self.serial_ticks = 0;
                 self.switches += 1;
                 return .to_serial;
             },
         }
     }
 
-    /// Serial tokens after which the decision is re-opened inside the same bucket. Default
-    /// OFF: a re-entry resumes a head whose history did not grow across the block.
-    /// `MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS` turns it on.
-    pub const REDECIDE_SERIAL_TOKENS_DEFAULT: u32 = 0;
-    /// The value the lever selects when it is enabled without a number.
-    pub const REDECIDE_SERIAL_TOKENS_ON: u32 = 512;
-
     /// Latch a refused re-entry: back to the serial arm, never ask again for this request.
     pub fn declineReentry(self: *MtpAdaptive) void {
         self.arm = .serial;
-        self.serial_ticks = 0;
         self.reentry_declined = true;
     }
 
     /// Make the serial arm permanent for this request (a `to_serial` on a module-owned head).
     pub fn stickSerial(self: *MtpAdaptive) void {
         self.arm = .serial;
-        self.serial_ticks = 0;
         self.sticky_serial = true;
     }
 
-    pub fn serialTick(self: *MtpAdaptive, bucket: usize, redecide_tokens: u32) MtpAdaptiveAction {
-        // Sticky outranks both re-entry triggers, the bucket crossing included.
+    /// Re-open the decision once the context crosses into another bucket; never inside one: a
+    /// re-entry there resumes a head whose history did not grow across the serial block.
+    pub fn serialTick(self: *MtpAdaptive, bucket: usize) MtpAdaptiveAction {
+        // Sticky outranks the bucket crossing.
         if (self.sticky_serial) return .none;
         if (self.reentry_declined) return .none;
         if (self.arm != .serial) return .none;
-        if (self.bucket) |b| {
-            if (b == bucket) {
-                if (redecide_tokens == 0) return .none; // crossing-only
-                self.serial_ticks +|= 1;
-                if (self.serial_ticks < redecide_tokens) return .none;
-                return self.reopen(bucket);
-            }
-        }
+        if (self.bucket) |b| if (b == bucket) return .none;
         return self.reopen(bucket);
     }
 
     fn reopen(self: *MtpAdaptive, bucket: usize) MtpAdaptiveAction {
         self.bucket = bucket;
         self.confirm = 0;
-        self.serial_ticks = 0;
         self.arm = .undecided;
         self.switches += 1;
         return .to_mtp;
@@ -452,14 +434,14 @@ test "mtpAdaptiveBucketOf: the decision and the re-entry resolve ONE bucket (H6 
     var osc = G.MtpAdaptive{};
     _ = osc.round(0, G.mtpAdaptiveBucketOf(own + 1, kv, .long), .serial, 1);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, osc.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv), 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, osc.serialTick(round_cost.bucketFor(kv)));
 
     var ok = G.MtpAdaptive{};
     const b = G.mtpAdaptiveBucketOf(own + 1, kv, .long);
     _ = ok.round(0, b, .serial, 1);
     var i: u32 = 0;
     while (i < 50) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv, .long), 0));
+        try testing.expectEqual(G.MtpAdaptiveAction.none, ok.serialTick(G.mtpAdaptiveBucketOf(own + 1, kv, .long)));
     }
     try testing.expectEqual(G.MtpAdaptiveArm.serial, ok.arm);
 }
@@ -483,12 +465,12 @@ test "mtpAdaptiveRegimeMoved: a switch either way, or a crossing, drops the pric
     try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
     pb = a.bucket;
     pa = a.arm;
-    _ = a.serialTick(6, 0); // crossing: re-opens the decision
+    _ = a.serialTick(6); // crossing: re-opens the decision
     try testing.expect(G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
     // A tick that changes nothing must not drop the window, or it can never fill.
     pb = a.bucket;
     pa = a.arm;
-    _ = a.serialTick(6, 0);
+    _ = a.serialTick(6);
     try testing.expect(!G.mtpAdaptiveRegimeMoved(pb, pa, a.bucket, a.arm));
 }
 
@@ -605,49 +587,17 @@ test "MtpAdaptive: the switch needs CONFIRM consecutive rounds, counted once per
     try testing.expectEqual(G.MtpAdaptiveAction.to_serial, f.round(0, 3, .serial, 0));
 }
 
-test "MtpAdaptive: crossing always re-opens; the periodic re-open is OFF by default" {
+test "MtpAdaptive: crossing re-opens, staying in the bucket never does" {
     const G = Generator;
-    const N = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON;
-    try testing.expectEqual(@as(u32, 0), G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
-
     var off = G.MtpAdaptive{};
     _ = off.round(0, 3, .serial, 1);
     var i: u32 = 0;
-    while (i < N * 2) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, off.serialTick(3, 0));
+    while (i < 1024) : (i += 1) {
+        try testing.expectEqual(G.MtpAdaptiveAction.none, off.serialTick(3));
     }
     try testing.expectEqual(G.MtpAdaptiveArm.serial, off.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, off.serialTick(4, 0));
-
-    var a = G.MtpAdaptive{};
-    _ = a.round(0, 3, .serial, 1);
-    i = 0;
-    while (i < N - 1) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, N));
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, a.serialTick(3, N));
-    try testing.expectEqual(G.MtpAdaptiveArm.undecided, a.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, N)); // not twice
-
-    var top = G.MtpAdaptive{};
-    const b_top = round_cost.bucketFor(300_000);
-    try testing.expectEqual(b_top, round_cost.bucketFor(900_000));
-    _ = top.round(0, b_top, .serial, 1);
-    var fired: u32 = 0;
-    i = 0;
-    while (i < N * 3) : (i += 1) {
-        if (top.serialTick(b_top, N) == .to_mtp) {
-            fired += 1;
-            _ = top.round(i, b_top, .serial, 1);
-        }
-    }
-    try testing.expectEqual(@as(u32, 3), fired);
-
-    var d = G.MtpAdaptive{};
-    _ = d.round(0, 3, .serial, 1);
-    i = 0;
-    while (i < N / 2) : (i += 1) _ = d.serialTick(3, N);
-    _ = d.round(1, 3, .mtp, 1);
-    _ = d.round(2, 3, .serial, 1);
-    try testing.expectEqual(@as(u32, 0), d.serial_ticks);
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, off.serialTick(4));
+    try testing.expectEqual(G.MtpAdaptiveArm.undecided, off.arm);
 }
 
 test "mtpHeadPositionDrift: re-entry may only resume a head that is provably in sync" {
@@ -663,9 +613,9 @@ test "mtpHeadPositionDrift: re-entry may only resume a head that is provably in 
     a.declineReentry();
     try testing.expect(a.reentry_declined);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4, 512)); // crossing
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4)); // crossing
     var i: u32 = 0;
-    while (i < 2000) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, 512));
+    while (i < 2000) : (i += 1) try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3));
 }
 
 test "mtpSerialProbeArm: bounded RETRIES per bucket, and none once the cell is trusted" {
@@ -713,13 +663,8 @@ test "S21: a to_serial on a per-request head is not sticky; the release stays a 
     try testing.expect(a.sticky_serial);
     try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
 
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4, 0));
-    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(5, 0));
-    const on = G.MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON;
-    var i: u32 = 0;
-    while (i < on * 2) : (i += 1) {
-        try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(3, on));
-    }
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(4));
+    try testing.expectEqual(G.MtpAdaptiveAction.none, a.serialTick(5));
     try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(1, 3, .mtp, 1));
     try testing.expectEqual(G.MtpAdaptiveAction.none, a.round(2, 4, .serial, 1));
     try testing.expectEqual(G.MtpAdaptiveArm.serial, a.arm);
@@ -738,7 +683,7 @@ test "S21: a KV-only sidecar head keeps its re-arm, and nothing about it changes
     var b = G.MtpAdaptive{};
     try testing.expectEqual(G.MtpAdaptiveAction.to_serial, b.round(0, 3, .serial, 1));
     try testing.expect(!b.sticky_serial);
-    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, b.serialTick(4, 0));
+    try testing.expectEqual(G.MtpAdaptiveAction.to_mtp, b.serialTick(4));
     try testing.expectEqual(G.MtpAdaptiveArm.undecided, b.arm);
 }
 

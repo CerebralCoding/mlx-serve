@@ -111,7 +111,7 @@ pub fn aneReadPlane(self: *Transformer, plane: [*]f16, width: c_int, rows: c_int
     return ane_offload.readPlane(self.s, plane, width, rows, dtype);
 }
 
-// ── ANE channel-split (A1, MLX_SERVE_ANE_MODE=channel) ──
+// ── ANE channel split ──
 
 /// Channel-mode dense MLP: both units see ALL chunk rows — the ANE
 /// computes output channels [0..k) of gate/up and the matching down
@@ -357,8 +357,7 @@ pub fn buildAnePrefill(
         }
     }
     // GDN input projections (v2): separate-proj GDN layers only
-    // (qwen3_next's combined arm stays GPU). MLX_SERVE_ANE_GDN=0 keeps
-    // the offload MLP-only for attribution A/Bs.
+    // (qwen3_next's combined arm stays GPU).
     const gdn_qkv_out: u32 = @intCast(2 * cfg.linear_num_key_heads * cfg.linear_key_head_dim + cfg.linear_num_value_heads * cfg.linear_value_head_dim);
     const gdn_z_out: u32 = @intCast(cfg.linear_num_value_heads * cfg.linear_value_head_dim);
     var gdn_target_layers: u64 = if (gdn_qkv_out > 0 and gdn_z_out > 0) blk: {

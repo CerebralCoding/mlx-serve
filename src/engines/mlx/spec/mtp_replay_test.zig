@@ -300,7 +300,7 @@ fn report(comptime fmt: []const u8, args: anytype) void {
     if (reportEnabled()) std.debug.print(fmt, args);
 }
 
-/// Live decode tok/s under `MLX_SERVE_MTP_FORCE_DEPTH` 1..6, the 8 code prompts, one boot each
+/// Live decode tok/s at pinned depths 1..6, the 8 code prompts, one boot each
 /// (the run `M4_MAX_27B.round_ms` came from).
 const LIVE_CODE_FIXED = [_]f32{ 52.31, 64.78, 68.71, 68.23, 65.60, 57.29 };
 

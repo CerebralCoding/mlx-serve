@@ -22,10 +22,6 @@ const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 /// The old linear ~1.5 ms/pos model came from a depth-6 run whose
 /// windowed controller was silently demoting underneath — never fit
 /// costs from a run whose realized m_avg you didn't check.
-/// Override for live tuning (an explicit override selects the generic
-/// two-region surface even on M5, so all four values remain the
-/// complete backwards-compatible contract):
-/// MLX_SERVE_MTP_EV_COSTS="draft,per_pos_lo,per_pos_hi,sync".
 pub const MtpEvCosts = struct {
     draft: f32, // one sequential MTP-head step (fwd + draft lm_head)
     per_pos_lo: f32, // marginal verify+capture per position, flat region
@@ -64,8 +60,7 @@ pub const MtpEvCosts = struct {
 /// (`splitCausalSdpa` — dense verify q 6..9 now rides the vector path,
 /// invalidating the ramp the old hi partially priced): same-session
 /// saturated ECHO sweep, Jundot oQ4e 27B @8K cold reps
-/// (--prefix-cache-entries 0), M4 Max, MLX_SERVE_MTP_ADAPTIVE=0 forced
-/// depths, saturated (m_avg==N) trace windows only — T(1)=44.6,
+/// (--prefix-cache-entries 0), M4 Max, forced depths, saturated (m_avg==N) trace windows only — T(1)=44.6,
 /// T(2)=51.0, T(3)=59.2, T(4)=68.2, T(6)=95.4, T(8)=142.3 ms → floor
 /// ≈ 38.2 ms. Composite marginals in floor units: k<=4 ≈ 0.20 (6.4-9.0
 /// ms/pos — flat_max moves 3 → 4, the old hi over-priced k4 at 0.34 and
@@ -236,39 +231,9 @@ pub const MTP_EV_G17_NAX_QWEN4_MIXED_4_8_GS64_COSTS: MtpEvCosts = .{
     .per_pos_nax = 0.232929,
 };
 
-pub fn parseMtpEvCostsOverride(raw: []const u8) ?MtpEvCosts {
-    var values: [4]f32 = undefined;
-    var it = std.mem.splitScalar(u8, raw, ',');
-    var i: usize = 0;
-    while (i < values.len) : (i += 1) {
-        const part = it.next() orelse return null;
-        const value = std.fmt.parseFloat(f32, std.mem.trim(u8, part, " ")) catch return null;
-        if (!std.math.isFinite(value)) return null;
-        values[i] = value;
-    }
-    if (it.next() != null) return null;
-    if (values[0] <= 0.0 or values[1] <= 0.0 or values[2] <= 0.0 or values[3] < 0.0) return null;
-
-    var c = MTP_EV_DEFAULT_COSTS;
-    c.draft = values[0];
-    c.per_pos_lo = values[1];
-    c.per_pos_hi = values[2];
-    c.sync = values[3];
-    // The override contract is the two-region surface: never inherit a
-    // third region (M5 NAX or the generic k>=7 cliff) the four values
-    // can't express.
-    c.nax_from = 0;
-    c.per_pos_nax = 0.0;
-    return c;
-}
-
-/// Pure profile/override selector. A valid explicit four-value override
-/// starts from DEFAULT (rather than silently inheriting the hardware
-/// profile), so a value copied from an M1-M4 tuning run means the same
-/// thing on M5. Empty/partial/malformed values are ignored atomically;
-/// they must not silently leave an auto-cap-8 target on generic costs.
-pub fn mtpEvCostsForProfile(profile: mtp_mod.MtpCostProfile, override: ?[]const u8) MtpEvCosts {
-    const selected = switch (profile) {
+/// The cost surface measured for this runtime profile.
+pub fn mtpEvCosts(profile: mtp_mod.MtpCostProfile) MtpEvCosts {
+    return switch (profile) {
         .generic => MTP_EV_DEFAULT_COSTS,
         .g17_nax_q8_gs32 => MTP_EV_G17_NAX_COSTS,
         .g17_nax_q4_gs32 => MTP_EV_G17_NAX_Q4_GS32_COSTS,
@@ -279,18 +244,4 @@ pub fn mtpEvCostsForProfile(profile: mtp_mod.MtpCostProfile, override: ?[]const 
         .g17_nax_qwen4_q4_gs64 => MTP_EV_G17_NAX_QWEN4_Q4_GS64_COSTS,
         .g17_nax_qwen4_mixed_4_8_gs64 => MTP_EV_G17_NAX_QWEN4_MIXED_4_8_GS64_COSTS,
     };
-    if (override) |raw| {
-        return parseMtpEvCostsOverride(raw) orelse selected;
-    }
-    return selected;
-}
-
-/// Legacy q8 boolean selector retained for source compatibility.
-pub fn mtpEvCostsFor(nax_profile: bool, override: ?[]const u8) MtpEvCosts {
-    const profile: mtp_mod.MtpCostProfile = if (nax_profile) .g17_nax_q8_gs32 else .generic;
-    return mtpEvCostsForProfile(profile, override);
-}
-
-pub fn mtpEvCosts(profile: mtp_mod.MtpCostProfile) MtpEvCosts {
-    return mtpEvCostsForProfile(profile, null);
 }

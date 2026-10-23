@@ -5,6 +5,7 @@
 //! memory, and the down kernel accumulates every expert of a token in registers. The affine
 //! bias rides a per-group sum of x: `sum((s*q + b) * x) = s * dot(q, x) + b * sum(x)`.
 const std = @import("std");
+const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
@@ -36,7 +37,7 @@ pub var override: ?bool = null;
 fn enabled() bool {
     if (override) |v| return v;
     if (env_enabled) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MOE_AFFINE4");
+    const raw = env.get(.MLX_SERVE_MOE_AFFINE4);
     env_enabled = raw == null or raw.?[0] != '0';
     return env_enabled.?;
 }
@@ -84,7 +85,7 @@ var views_enabled: ?bool = null;
 /// `MLX_SERVE_MOE_BANK_VIEWS=0` binds the whole banks.
 fn viewsOn() bool {
     if (views_enabled) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MOE_BANK_VIEWS");
+    const raw = env.get(.MLX_SERVE_MOE_BANK_VIEWS);
     views_enabled = raw == null or raw.?[0] != '0';
     return views_enabled.?;
 }

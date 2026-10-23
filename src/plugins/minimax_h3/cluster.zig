@@ -3,6 +3,7 @@
 //! its attention reads every row's keys and values, swapped once per block.
 //! Worth it only between Macs of similar speed: `chooseCut` decides per job.
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
@@ -233,7 +234,7 @@ pub fn begin(pack_dir: []const u8, io: std.Io, model: *h3.Model, turbo: bool, us
     if (need_mib > free_mib) return alone("{d}-row steps need {d} MiB on the worker, which has {d} MiB free", .{ rows, need_mib, free_mib });
     const kv_row: u64 = 2 * @as(u64, model.cfg.num_attention_heads) * model.cfg.attention_head_dim * 2;
     // Diagnostic: MLX_SERVE_H3_SPLIT_SHARE=<0..1> keeps that share of the rows here, paying or not.
-    const forced: ?u32 = if (h3.envStr("MLX_SERVE_H3_SPLIT_SHARE")) |v| if (std.fmt.parseFloat(f64, v)) |f|
+    const forced: ?u32 = if (env.span(.MLX_SERVE_H3_SPLIT_SHARE)) |v| if (std.fmt.parseFloat(f64, v)) |f|
         std.math.clamp(@as(u32, @intFromFloat(@as(f64, @floatFromInt(rows)) * f)), 1, rows - 1)
     else |_| null else null;
     const cut = forced orelse chooseCut(rows, p.host_calib_us, p.worker_calib_us, p.link_bytes_per_us, kv_row, @intCast(model.blocks.len)) orelse

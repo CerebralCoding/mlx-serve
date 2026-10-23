@@ -263,7 +263,7 @@ pub fn acceptPrefixFor(self: *const Generator, lookup: bool) mtp_acceptance.Pref
     return if (lookup) mtp_acceptance.exactPrefix else self.mtp_accept_prefix;
 }
 
-/// Prompt lookup may stand in for the MTP chain unless `MLX_SERVE_MTP_LOOKUP=0`.
+/// Prompt lookup may stand in for the MTP chain (the test seam's false keeps the chain).
 pub var mtp_lookup_override: ?bool = null;
 pub fn mtpLookupEnabled() bool {
     return mtp_lookup_override orelse true;
@@ -486,7 +486,7 @@ pub fn mtpLazyPredraftAllowedFor(g: LazyGate) bool {
     return !g.lookup_round and !g.planner_owned;
 }
 
-/// `MLX_SERVE_MTP_LAZY_PREDRAFT=0` keeps the pre-draft at the round's tail, after the host read.
+/// The test seam's false keeps the pre-draft at the round's tail, after the host read.
 pub var mtp_lazy_predraft_override: ?bool = null;
 pub fn mtpLazyPredraftEnabled() bool {
     if (!mtpPredraftEnabled()) return false;
@@ -599,7 +599,7 @@ pub var mtp_lazy_force_discard: bool = false;
 /// Test seam: fail the round right after its lazy chain is dispatched.
 pub var mtp_lazy_fail_after_dispatch: bool = false;
 
-/// `MLX_SERVE_MTP_PADDED_HEAD=0` keeps the merged `1 + accepted` history step.
+/// The test seam's false keeps the merged `1 + accepted` history step.
 pub var mtp_padded_head_override: ?bool = null;
 pub fn mtpPaddedHeadEnabled() bool {
     return mtp_padded_head_override orelse true;

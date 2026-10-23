@@ -10,6 +10,7 @@
 //! (valeoai's `naf_release.pth` as safetensors). Parity: `pixal3d oracle` tests (tests/dump_pixal3d_fixtures.py).
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
@@ -730,8 +731,8 @@ test "pixal3d multi-view: a pack with pipeline_mv.json but no _mv weights serves
 
 // ── oracles (tests/dump_pixal3d_fixtures.py) ────────────────────────────────
 
-fn envDir(name: [*:0]const u8) ![]const u8 {
-    return std.mem.span(std.c.getenv(name) orelse return error.SkipZigTest);
+fn envDir(comptime name: []const u8) ![]const u8 {
+    return std.mem.span(env.named(name) orelse return error.SkipZigTest);
 }
 
 fn loadPng(io: std.Io, gpa: std.mem.Allocator, path: []const u8) !struct { px: []u8, w: u32, h: u32 } {

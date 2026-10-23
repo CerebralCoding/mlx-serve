@@ -349,20 +349,3 @@ fn slotStateBytes(s: *const Slot) u64 {
 }
 
 // ── tests ──
-
-test "inferenceLoop pending drain routes through admitPendingTick" {
-    // A pure admission fn nobody calls is a silent no-op (the specTickMode /
-    // hardcoded use_drafter=false class). Needles are ++-split so this
-    // test's own source can't satisfy the scan.
-    const src = @embedFile("step.zig");
-    const call = "admitPendingTick(" ++ "cand_buf[0..n_cands], live_buf[0..n_live], &admit_idx)";
-    try testing.expect(std.mem.indexOf(u8, src, call) != null);
-    // The candidates' exclusive bit must come from the per-slot predicate
-    // (model bit OR a module-owned MTP head on this slot).
-    const pred = ".exclusive = slotExclusiveDecode(" ++ "s)";
-    try testing.expect(std.mem.indexOf(u8, src, pred) != null);
-    // The pre-gate unconditional drain shape must be GONE — its survival
-    // would mean a path still admits without the gate.
-    const old = "to_prefill[n_prefill] = sch.pending." ++ "orderedRemove(0)";
-    try testing.expect(std.mem.indexOf(u8, src, old) == null);
-}

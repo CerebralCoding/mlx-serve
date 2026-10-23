@@ -10,6 +10,7 @@
 //! A chunk runs one layer at a time over all of its spans: each layer's
 //! experts are read once per chunk.
 const std = @import("std");
+const env = @import("../../env.zig");
 const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const model = @import("../../engines/mlx/model.zig");
@@ -538,7 +539,7 @@ pub fn cedSplit(c: *const ModelConfig) ?usize {
 
 /// `MLX_SERVE_DSV41_HEAD8=0` serves a dense LM head as the pack ships it instead of requantizing it to 8-bit.
 pub fn head8Wanted() bool {
-    return head8From(std.c.getenv("MLX_SERVE_DSV41_HEAD8"));
+    return head8From(env.get(.MLX_SERVE_DSV41_HEAD8));
 }
 
 fn head8From(v: ?[*:0]const u8) bool {
@@ -549,7 +550,7 @@ var ced_env: ?bool = null;
 /// `MLX_SERVE_DSV41_CED=0` keeps every prefill chunk on the full forward.
 fn cedEnabled() bool {
     if (ced_env == null) {
-        const v = std.c.getenv("MLX_SERVE_DSV41_CED");
+        const v = env.get(.MLX_SERVE_DSV41_CED);
         ced_env = v == null or v.?[0] != '0';
     }
     return ced_env.?;
@@ -1265,7 +1266,7 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
         .attn_split_kernel = try buildKernel("dsv41_attn_split", &ATTN_INS, &.{ "pacc", "pm", "pl" }, ATTN_SPLIT_SOURCE, ""),
         .attn_merge_kernel = try buildKernel("dsv41_attn_merge", &ATTN_MERGE_INS, &.{"out"}, ATTN_MERGE_SOURCE, UNROPE_HEADER),
         .attn_softmax_kernel = try buildKernel("dsv41_attn_softmax", &ATTN_SOFTMAX_INS, &.{ "pw", "pc" }, ATTN_SOFTMAX_SOURCE, ""),
-        .attn_f16 = if (std.c.getenv("MLX_SERVE_DSV41_ATTN_F16")) |v| v[0] != '0' else true,
+        .attn_f16 = if (env.get(.MLX_SERVE_DSV41_ATTN_F16)) |v| v[0] != '0' else true,
         .idx_score_kernel = try buildIdxScoreKernel(),
         .idx_tile_kernel = try buildKernel("dsv41_index_tile", &IDX_INS, &.{"scores"}, IDX_TILE_SOURCE, ""),
         .gate_kernel = try buildKernel("dsv41_gate", &.{ "x", "w" }, &.{"logits"}, GATE_SOURCE, ""),
@@ -1444,8 +1445,8 @@ pub fn dsparkWanted(cfg: *const ModelConfig) bool {
         if (p.worker) return false;
         for (cfg.dsv4_dspark_target_layers[0..cfg.dsv4_n_dspark_target_layers]) |t| if (t >= p.lo and t < p.hi) return false;
     }
-    const env = std.c.getenv("MLX_SERVE_DSV4_DSPARK");
-    return (cfg.mtp_override orelse true) or (env != null and env.?[0] != '0');
+    const ds = env.get(.MLX_SERVE_DSV4_DSPARK);
+    return (cfg.mtp_override orelse true) or (ds != null and ds.?[0] != '0');
 }
 
 /// What a load holds of the pack: its safetensors bytes less the Engram tables it preads and the tensors it

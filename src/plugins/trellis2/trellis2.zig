@@ -12,6 +12,7 @@
 //! Parity: env-gated `TRELLIS2_*` oracles fed by tests/dump_trellis2_fixtures.py.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
@@ -969,8 +970,8 @@ test "trellis2 dit: an allocation failing anywhere in Dit.load leaves nothing le
 const OracleEnv = struct { ckpts: []const u8, fixtures: []const u8 };
 
 fn oracleEnv() !OracleEnv {
-    const w = std.c.getenv("TRELLIS2_WEIGHTS") orelse return error.SkipZigTest;
-    const f = std.c.getenv("TRELLIS2_FIXTURES") orelse return error.SkipZigTest;
+    const w = env.get(.TRELLIS2_WEIGHTS) orelse return error.SkipZigTest;
+    const f = env.get(.TRELLIS2_FIXTURES) orelse return error.SkipZigTest;
     return .{ .ckpts = std.fmt.allocPrint(testing.allocator, "{s}/ckpts", .{std.mem.span(w)}) catch return error.OutOfMemory, .fixtures = std.mem.span(f) };
 }
 
@@ -1007,12 +1008,12 @@ pub fn expectClose(label: []const u8, sc: *Scope, got: A, want: A, min_cos: f64,
 /// Runs one flow fixture (`stem` the checkpoint, `fixture` its file) at `act` and compares every tap.
 fn flowOracle(stem: []const u8, fixture: []const u8, dense: bool, concat_key: ?[]const u8, act: mlx.mlx_dtype, min_cos: f64, tol_ratio: f64) !void {
     const gpa = testing.allocator;
-    const env = try oracleEnv();
-    defer gpa.free(env.ckpts);
+    const oracle = try oracleEnv();
+    defer gpa.free(oracle.ckpts);
     const io = std.Io.Threaded.global_single_threaded.io();
-    var fx = try model_mod.loadWeightsFile(gpa, env.fixtures, fixture);
+    var fx = try model_mod.loadWeightsFile(gpa, oracle.fixtures, fixture);
     defer fx.deinit();
-    var od = try openDit(io, gpa, env.ckpts, stem, act);
+    var od = try openDit(io, gpa, oracle.ckpts, stem, act);
     defer od.deinit();
 
     const s = mlx.gpuStream();

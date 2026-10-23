@@ -54,7 +54,7 @@ pub const QSA_SELECT_KERNEL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_S
 pub const QSA_SELECT_SPLIT_LOCAL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SLICE_SETUP, QSA_SELECT_RADIX_BODY });
 pub const QSA_SELECT_SPLIT_MERGE_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_MERGE_SETUP, QSA_SELECT_RADIX_BODY });
 
-/// Threads per row-threadgroup. `MLX_SERVE_QSA_SELECT_TG=256|512|1024` is the A/B. Read once.
+/// Threads per row-threadgroup.
 pub const QSA_SELECT_TG_DEFAULT: c_int = 1024;
 pub var qsa_select_tg_override: ?c_int = null;
 
@@ -101,7 +101,7 @@ var qsa_select_engaged_bits: OneShotBits = .{};
 
 pub var qsa_select_kernel_override: ?bool = null;
 
-/// Fused QSA block select (default on). `MLX_SERVE_QSA_SELECT_KERNEL=0` restores the argpartition chain.
+/// Fused QSA block select; the test seam's false runs the argpartition chain.
 pub fn qsaSelectKernelEnabled() bool {
     return qsa_select_kernel_override orelse true;
 }

@@ -6,14 +6,13 @@
 #   MTP_ADAPTIVE_MODEL=<long-context MTP pack> ./tests/test_mtp_adaptive.sh [port]   # SKIPs without one
 #
 # Pins the invariant, never the model's choice: the switch line or a measured serial cell with the switch on,
-# speculation still engaging, no `-> serial` on a short-request burst, nothing at all with
-# MLX_SERVE_MTP_ADAPTIVE_SERIAL=0, and an empty round-cost dir after a --no-mtp boot.
+# speculation still engaging, no `-> serial` on a short-request burst, and an empty round-cost dir after a --no-mtp
+# boot.
 
 set -u
 PORT="${1:-11316}"
 BIN="${MLX_SERVE_BIN:-./zig-out/bin/mlx-serve}"
 LOG_A=/tmp/mtp_adaptive_on.log
-LOG_B=/tmp/mtp_adaptive_off.log
 WORK=$(mktemp -d /tmp/mtp_adaptive.XXXXXX)
 trap 'rm -rf "$WORK"' EXIT
 
@@ -107,8 +106,8 @@ PY
 ISO_HOME="$WORK/home"
 RC_DIR="$ISO_HOME/.mlx-serve/round-cost"
 
-start_server() { # $1 = log path, $2 = value for MLX_SERVE_MTP_ADAPTIVE_SERIAL ("" = unset)
-    local log="$1" adapt="$2"
+start_server() { # $1 = log path
+    local log="$1"
     pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
     for _ in $(seq 1 30); do
         lsof -nP -iTCP:"$PORT" -sTCP:LISTEN >/dev/null 2>&1 || break
@@ -116,18 +115,10 @@ start_server() { # $1 = log path, $2 = value for MLX_SERVE_MTP_ADAPTIVE_SERIAL (
     done
     : > "$log"
     # Never read or write the user's round-cost table; the boots must stay independent.
-    if [ -n "$adapt" ]; then
-        MLX_SERVE_ROUND_COST_PERSIST=0 MLX_SERVE_MTP_TRACE=1 \
-        MLX_SERVE_MTP_ADAPTIVE_SERIAL="$adapt" \
-        "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
-            --prefix-cache-entries 2 --log-level info >"$log" 2>&1 &
-    else
-        MLX_SERVE_ROUND_COST_PERSIST=0 MLX_SERVE_MTP_TRACE=1 \
-        "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
-            --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
-            --prefix-cache-entries 2 --log-level info >"$log" 2>&1 &
-    fi
+    MLX_SERVE_ROUND_COST_PERSIST=0 MLX_SERVE_MTP_TRACE=1 \
+    "$BIN" --model "$MODEL" --serve --host 127.0.0.1 --port "$PORT" \
+        --mtp --kv-quant 8 --ctx-size "$CTX_SIZE" --no-pld \
+        --prefix-cache-entries 2 --log-level info >"$log" 2>&1 &
     SERVER_PID=$!
     local model_mb ready_secs
     model_mb=$(du -sm "$MODEL" 2>/dev/null | awk '{print $1}')
@@ -180,7 +171,7 @@ gt_zero() { python3 -c "import sys; sys.exit(0 if float(sys.argv[1] or 0) > 0 el
 
 # ── Boot A: the switch ON (default; the env var is simply not set) ────────
 echo "== boot A: adaptive serial ON (model $MODEL) =="
-start_server "$LOG_A" ""
+start_server "$LOG_A"
 
 # The serial request first: a bucket with no measured plain token cannot be decided.
 A_SERIAL=$(req "$WORK/long_serial.json" "$LOG_A" "$WORK/a_serial.slice") ||
@@ -266,66 +257,6 @@ else
     ok "$SHORT_BURST-request short burst: zero switches (kv floor holds)"
 fi
 
-# ── Boot B: the kill switch ───────────────────────────────────────────────
-echo "== boot B: MLX_SERVE_MTP_ADAPTIVE_SERIAL=0 =="
-start_server "$LOG_B" "0"
-
-req "$WORK/long_serial.json" "$LOG_B" "$WORK/b_serial.slice" >/dev/null ||
-    { echo "FAIL: boot B long serial request failed"; stop_server; exit 1; }
-B_LONG=$(req "$WORK/long_mtp.json" "$LOG_B" "$WORK/b_long.slice") ||
-    { echo "FAIL: boot B long MTP request failed"; stop_server; exit 1; }
-echo "  long mtp:    prompt_tokens=$(echo "$B_LONG" | awk '{print $1}') completion=$(echo "$B_LONG" | awk '{print $2}')"
-stop_server
-
-# [4] Nothing switches, and nothing probes, anywhere in the boot.
-if grep -q "\[mtp\] adaptive:" "$LOG_B"; then
-    bad "kill switch" "'[mtp] adaptive:' appeared with MLX_SERVE_MTP_ADAPTIVE_SERIAL=0"
-    grep "\[mtp\] adaptive:" "$LOG_B" | head -5 | sed 's/^/      /'
-else
-    ok "kill switch: no adaptive decision or probe line in the whole boot"
-fi
-if grep -q "adaptive=serial" "$LOG_B"; then
-    bad "kill switch" "a request reported adaptive=serial with the switch off"
-else
-    ok "kill switch: every request's arm stayed off the serial arm"
-fi
-
-# [5] The off arm costs nothing; `serial_cell` is reported for information only.
-B_CELL=$(max_serial_cell "$LOG_B")
-if grep -q "probing .* serial tokens" "$LOG_B"; then
-    bad "kill switch" "a serial probe ran with MLX_SERVE_MTP_ADAPTIVE_SERIAL=0"
-else
-    ok "kill switch: no probe ran (serial_cell=$B_CELL, informational)"
-fi
-
-# Boot R: re-entry, only when `MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS` is set (default off). A
-# switch followed by a re-entry must come back cleanly or decline in the log, never `MtpPositionGap`.
-if [ -n "${MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS:-}" ] &&
-   [ "${MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS:-0}" != "0" ]; then
-    echo "== boot R: re-entry enabled (REENTRY_TOKENS=$MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS) =="
-    LOG_R=/tmp/mtp_adaptive_reentry.log
-    start_server "$LOG_R" "" || bad "re-entry boot" "server did not become ready"
-    # Teach the bucket a serial cell, then a long MTP reply with room to
-    # switch AND to re-enter at least once.
-    req "$WORK/long_serial.json" "$LOG_R" "$WORK/r_serial.slice" >/dev/null ||
-        bad "re-entry boot" "serial request failed"
-    req "$WORK/long_mtp.json" "$LOG_R" "$WORK/r_long.slice" >/dev/null ||
-        bad "re-entry boot" "long MTP request failed"
-    stop_server
-    if grep -q "MtpPositionGap" "$LOG_R"; then
-        bad "re-entry" "error.MtpPositionGap surfaced — the head resumed out of sync"
-        grep -n "MtpPositionGap" "$LOG_R" | head -3 | sed 's/^/      /'
-    else
-        ok "re-entry produced no MtpPositionGap"
-    fi
-    if grep -q "re-entry declined" "$LOG_R"; then
-        echo "      (re-entry was DECLINED — head out of sync, which is the safe arm)"
-        grep -- "re-entry declined" "$LOG_R" | head -2 | sed 's/^/      /'
-    fi
-else
-    echo "== boot R: SKIPPED (set MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS to exercise re-entry) =="
-fi
-
 # Boot C: a model that never speculates must not write a round-cost table.
 echo "== boot C: --no-mtp, persistence ON, isolated HOME =="
 LOG_C=/tmp/mtp_adaptive_nomtp.log
@@ -374,5 +305,5 @@ else
 fi
 
 echo
-echo "── $PASS passed, $FAIL failed ── (logs: $LOG_A, $LOG_B, $LOG_C${LOG_R:+, $LOG_R})"
+echo "── $PASS passed, $FAIL failed ── (logs: $LOG_A, $LOG_C)"
 [ "$FAIL" -eq 0 ] || exit 1

@@ -2088,12 +2088,6 @@ pub const Engine = struct {
         return self.generateWithOpts(allocator, pr.ids, pr.mask, seed, steps, width, height, opts, progress);
     }
 
-    /// Tokenize, run the pipeline, return PNG bytes (caller frees).
-    pub fn generatePng(self: *Engine, allocator: std.mem.Allocator, prompt: []const u8, width: u32, height: u32, seed: u64, steps: u32, progress: ?sse.Progress) ![]u8 {
-        const img = try self.generateImage(allocator, prompt, width, height, seed, steps, progress);
-        defer _ = mlx.mlx_array_free(img);
-        return imageToPng(allocator, img, self.s);
-    }
 };
 
 /// [1,3/4,H,W] f32 [0,1] → RGB/RGBA8 PNG bytes (caller frees).

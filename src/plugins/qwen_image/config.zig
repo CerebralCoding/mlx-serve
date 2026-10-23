@@ -72,14 +72,8 @@ const EDIT_ENCODE_WS_BYTES: u64 = 2 << 30;
 
 /// The text encoder is half the pack and idle for the whole denoise, so a machine the full set would crowd (past
 /// 3/4 of the GPU working set) loads it per request and frees it before the first DiT forward. The engine and the
-/// bill read this ONE answer; MLX_SERVE_QWEN_IMAGE_LOW_MEMORY=1 forces it.
+/// bill read this ONE answer.
 pub fn stagesTextEncoder(weights: u64, working_set: u64) bool {
-    const low: ?[]const u8 = if (std.c.getenv("MLX_SERVE_QWEN_IMAGE_LOW_MEMORY")) |v| std.mem.span(v) else null;
-    return stagesFromInputs(weights, working_set, low);
-}
-
-fn stagesFromInputs(weights: u64, working_set: u64, low_memory: ?[]const u8) bool {
-    if (low_memory) |v| if (std.mem.eql(u8, v, "1")) return true;
     if (working_set == 0) return false;
     return (weights + GEN_TRANSIENT_BYTES) / 3 > working_set / 4;
 }
@@ -144,9 +138,9 @@ pub fn editPrefixBytes(refs: u32, ref_resolution: u32, layers: u64, hidden: u64,
 }
 
 /// Prefer the cached edit, but run uncached when only that fits; null when neither does.
-pub fn editPlan(steps: u32, cache_enabled: bool, base_bill: u64, prefix_bill: u64, headroom: u64) ?bool {
+pub fn editPlan(steps: u32, base_bill: u64, prefix_bill: u64, headroom: u64) ?bool {
     if (base_bill -| EDIT_TRANSIENT_BYTES > headroom) return null;
-    return cache_enabled and steps > 1 and (base_bill +| prefix_bill) -| EDIT_TRANSIENT_BYTES <= headroom;
+    return steps > 1 and (base_bill +| prefix_bill) -| EDIT_TRANSIENT_BYTES <= headroom;
 }
 
 /// An edit's output. A size FLOORS to the DiT's /32 grid (a ceiling, never an upscale); none = the LAST condition
@@ -219,18 +213,17 @@ test "qwen_image config: the load bill covers every request; canvas and edit are
     const d = mem.packDir();
     const m: abi.Machine = .{};
     try testing.expectEqual(@as(u64, 0), billRequest(&d, &m, .of("{\"size\":\"2048x2048\"}")));
-    try testing.expectEqual(@as(?bool, null), editPlan(4, true, EDIT_TRANSIENT_BYTES + 2, 0, 1));
-    try testing.expectEqual(@as(?bool, false), editPlan(4, true, EDIT_TRANSIENT_BYTES + 1, 2, 2));
-    try testing.expectEqual(@as(?bool, true), editPlan(4, true, EDIT_TRANSIENT_BYTES + 1, 1, 2));
-    try testing.expectEqual(@as(?bool, false), editPlan(1, true, EDIT_TRANSIENT_BYTES, 0, 0));
+    try testing.expectEqual(@as(?bool, null), editPlan(4, EDIT_TRANSIENT_BYTES + 2, 0, 1));
+    try testing.expectEqual(@as(?bool, false), editPlan(4, EDIT_TRANSIENT_BYTES + 1, 2, 2));
+    try testing.expectEqual(@as(?bool, true), editPlan(4, EDIT_TRANSIENT_BYTES + 1, 1, 2));
+    try testing.expectEqual(@as(?bool, false), editPlan(1, EDIT_TRANSIENT_BYTES, 0, 0));
 }
 
 test "qwen_image config: the encoder stages past three quarters of the working set, or when forced" {
     const gb: u64 = 1 << 30;
-    try testing.expect(!stagesFromInputs(10 * gb, 0, null));
-    try testing.expect(stagesFromInputs(10 * gb, 0, "1"));
-    try testing.expect(!stagesFromInputs(10 * gb, 64 * gb, "0"));
-    try testing.expect(stagesFromInputs(40 * gb, 48 * gb, null));
+    try testing.expect(!stagesTextEncoder(10 * gb, 0));
+    try testing.expect(!stagesTextEncoder(10 * gb, 64 * gb));
+    try testing.expect(stagesTextEncoder(40 * gb, 48 * gb));
     // Staged, the encoder and the denoise are stages beside the resident DiT and VAE.
     try testing.expectEqual(15 * gb + GEN_TRANSIENT_BYTES, peakBytes(5 * gb, 10 * gb, 0, false));
     try testing.expectEqual(15 * gb, peakBytes(5 * gb, 10 * gb, 8 * gb, false));
@@ -277,13 +270,12 @@ test "qwen_image config: the edit transient scales with refs x ref tokens; the p
     try testing.expect(editTransientBytes(10, 512, 2048, 2048) * 2 < ten);
     const base = EDIT_TRANSIENT_BYTES + 2 * GB;
     const prefix = 4 * GB;
-    try testing.expectEqual(@as(?bool, true), editPlan(20, true, base, prefix, 6 * GB));
-    try testing.expectEqual(@as(?bool, false), editPlan(20, true, base, prefix, 2 * GB));
-    try testing.expectEqual(@as(?bool, null), editPlan(20, true, base, prefix, 2 * GB - 1));
-    try testing.expectEqual(@as(?bool, null), editPlan(20, false, base, prefix, 0));
-    try testing.expectEqual(@as(?bool, false), editPlan(20, false, base, prefix, 6 * GB));
-    try testing.expectEqual(@as(?bool, true), editPlan(20, true, 1 * GB, 2 * GB, 0));
-    try testing.expectEqual(@as(?bool, false), editPlan(20, true, base, std.math.maxInt(u64), 6 * GB));
+    try testing.expectEqual(@as(?bool, true), editPlan(20, base, prefix, 6 * GB));
+    try testing.expectEqual(@as(?bool, false), editPlan(20, base, prefix, 2 * GB));
+    try testing.expectEqual(@as(?bool, null), editPlan(20, base, prefix, 2 * GB - 1));
+    try testing.expectEqual(@as(?bool, null), editPlan(20, base, prefix, 0));
+    try testing.expectEqual(@as(?bool, true), editPlan(20, 1 * GB, 2 * GB, 0));
+    try testing.expectEqual(@as(?bool, false), editPlan(20, base, std.math.maxInt(u64), 6 * GB));
 }
 
 

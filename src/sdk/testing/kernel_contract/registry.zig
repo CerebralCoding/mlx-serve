@@ -33,7 +33,6 @@ const areas = .{
     @import("../../blocks/dit/contract.zig"),
     @import("../../blocks/linear/contract.zig"),
     @import("../../blocks/moe/contract.zig"),
-    @import("../../../plugins/qwen_image/contract.zig"),
     @import("../../../plugins/deepseek_v4/contract.zig"),
     @import("../../../plugins/deepseek_v41/contract.zig"),
 };
