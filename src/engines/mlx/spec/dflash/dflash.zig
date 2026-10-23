@@ -581,7 +581,7 @@ pub fn resolveBlockSize(config_block: u32, cli_block: u32, cli_explicit: bool, w
 /// True when this machine has a verify lane for widths past the split-K
 /// ceiling (the NAX m16 tile, M5-class + macOS >= 26.2).
 pub fn wideVerifyLaneAvailable() bool {
-    return transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable();
+    return transformer_mod.verifyQmmNaxAvailable();
 }
 
 // ── Weight precision ──

@@ -34,9 +34,8 @@ pub fn verifyQmmNaxAvailable() bool {
 
 var vqmm_tile_cache: ?VqmmTile = null;
 
-/// The matmul2d tile this process dispatches (lane kill switch included).
+/// The matmul2d tile this process dispatches.
 pub fn verifyQmmTile() VqmmTile {
-    if (!naxLaneEnvEnabled()) return .off;
     if (transformer.vqmm_nax_probe_override) |v| return if (v) .nax else .off;
     if (vqmm_tile_cache) |v| return v;
     var arch_buf: [128]u8 = undefined;
@@ -48,63 +47,10 @@ pub fn verifyQmmTile() VqmmTile {
     return tile;
 }
 
-var vqmm_nax_env_cache: ?bool = null;
-/// Lane kill switch: MLX_SERVE_VERIFY_QMM_NAX=0 (the family-wide
-/// MLX_SERVE_VERIFY_QMM=0 also covers it via verifyQmm's entry gate).
-pub fn naxLaneEnvEnabled() bool {
-    if (vqmm_nax_env_cache) |v| return v;
-    var on = true;
-    if (env.get(.MLX_SERVE_VERIFY_QMM_NAX)) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') on = false;
-    }
-    vqmm_nax_env_cache = on;
-    return on;
-}
-
-var vqmm_nax_mixed_env_cache: ?bool = null;
-/// Mixed-width NAX A/B seam: keep the q4 NAX lane live while routing affine
-/// q5/q6/q8 back through stock qmm. This isolates the byte-unpack kernel
-/// contribution without changing controller state or disabling q4 NAX.
-pub fn naxMixedBitsEnvEnabled() bool {
-    if (vqmm_nax_mixed_env_cache) |v| return v;
-    var on = true;
-    if (env.get(.MLX_SERVE_VERIFY_QMM_NAX_MIXED)) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') on = false;
-    }
-    vqmm_nax_mixed_env_cache = on;
-    return on;
-}
-
-/// MLX_SERVE_VERIFY_QMM_NAX_MIN_M parse: explicit M width where the NAX tile
-/// takes over from the plain-SIMD lanes. Without an override q4/q6 start at
-/// M=8 and q8 at its measured M=7. Clamped to [2,16]; disabling is the lane
-/// kill switch's job.
-fn naxMinMOverrideFrom(val: ?[]const u8) ?c_int {
-    const v = val orelse return null;
-    const parsed = std.fmt.parseInt(c_int, v, 10) catch return null;
-    return @min(16, @max(2, parsed));
-}
-
-pub fn naxMinMForBitsFrom(bits: u32, val: ?[]const u8) c_int {
-    if (naxMinMOverrideFrom(val)) |m| return m;
-    // The byte-per-value q8 NAX tile wins already at M=7 (+6.09% over the
-    // plain lane, five thermally-settled counterbalanced pairs). Packed q4/q6
-    // still lose there, so their measured takeover remains M=8.
-    return if (bits == 8) 7 else 8;
-}
-
-var vqmm_nax_min_m_cache: ?c_int = null;
-var vqmm_nax_min_m_env_checked = false;
+/// Where the NAX tile takes over from the plain-SIMD lanes: the byte-per-value q8 tile wins already at M=7 (+6.09%
+/// over the plain lane, five thermally-settled counterbalanced pairs); packed q4/q6 still lose there, so M=8.
 pub fn naxMinMForBits(bits: u32) c_int {
-    if (!vqmm_nax_min_m_env_checked) {
-        vqmm_nax_min_m_cache = naxMinMOverrideFrom(
-            env.span(.MLX_SERVE_VERIFY_QMM_NAX_MIN_M),
-        );
-        vqmm_nax_min_m_env_checked = true;
-    }
-    return vqmm_nax_min_m_cache orelse naxMinMForBitsFrom(bits, null);
+    return if (bits == 8) 7 else 8;
 }
 
 fn naxMinM() c_int {
@@ -112,19 +58,18 @@ fn naxMinM() c_int {
 }
 
 /// Exact NAX-dispatch predicate, pure over the runtime gates and shape. Keep
-/// controller policy behind this seam so a kill switch, takeover-width tweak,
-/// or ineligible projection geometry can never advertise a NAX cost profile
-/// while verifyQmm would actually fall through to stock qmm.
+/// controller policy behind this seam so a takeover-width tweak or ineligible
+/// projection geometry can never advertise a NAX cost profile while verifyQmm
+/// would actually fall through to stock qmm.
 pub fn verifyQmmNaxEnabledForMFrom(
     m: c_int,
     K: c_int,
     N: c_int,
     verify_on: bool,
-    lane_on: bool,
     available: bool,
     min_m: c_int,
 ) bool {
-    return verify_on and vqmmLaneFor(m, K, N, lane_on and available, min_m, false) == .nax;
+    return verify_on and vqmmLaneFor(m, K, N, available, min_m) == .nax;
 }
 
 /// Runtime form of verifyQmmNaxEnabledForMFrom.
@@ -134,7 +79,6 @@ pub fn verifyQmmNaxEnabledForM(m: c_int, K: c_int, N: c_int) bool {
         K,
         N,
         verifyQmmEnabled(),
-        naxLaneEnvEnabled(),
         verifyQmmNaxAvailable(),
         naxMinM(),
     );
@@ -246,7 +190,7 @@ pub fn runVerifyQmmNax(
 ) !?mlx.mlx_array {
     if (!verify_qmm.vqmm_nax_engaged) {
         verify_qmm.vqmm_nax_engaged = true;
-        log.info("[vqmm] NAX verify lane engaged at {d}-bit ({s} tile, {d} rows): M={d} K={d} N={d} gs={d} (MLX_SERVE_VERIFY_QMM_NAX=0 restores stock)\n", .{ bits, @tagName(verifyQmmTile()), tile, m, K, N, group_size });
+        log.info("[vqmm] NAX verify lane engaged at {d}-bit ({s} tile, {d} rows): M={d} K={d} N={d} gs={d}\n", .{ bits, @tagName(verifyQmmTile()), tile, m, K, N, group_size });
     }
     const x16 = try naxPadRows(s, x, m, tile, K, xd);
     defer _ = mlx.mlx_array_free(x16);
@@ -295,13 +239,9 @@ pub fn runVerifyQmmNax(
 
 // ── tests ──
 
-/// Family-wide NAX readiness: family kill switch, lane kill switch, and the
-/// hardware probe all pass. This intentionally says nothing about a specific
+/// Family-wide NAX readiness: the verify family is on and the hardware probe passes. This intentionally says nothing about a specific
 /// M/K/N dispatch; controller decisions use verifyQmmNaxEnabledForM instead.
 pub fn verifyQmmNaxEnabled() bool {
-    return verifyQmmEnabled() and naxLaneEnvEnabled() and verifyQmmNaxAvailable();
+    return verifyQmmEnabled() and verifyQmmNaxAvailable();
 }
 
-pub fn naxMinMFrom(val: ?[]const u8) c_int {
-    return naxMinMForBitsFrom(4, val);
-}

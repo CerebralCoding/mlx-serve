@@ -1526,13 +1526,13 @@ test "qwen4 MTP head: truncating to the live end after placed drafts leaves the 
 
 test "MTP head row widths pick the verify lane, the MoE arm and the QSA score kernel" {
     const t = std.testing;
-    try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 248320, false, 8, false));
-    try t.expectEqual(VqmmLane.msg, vqmmLaneFor(2, 5120, 248320, false, 8, false));
-    try t.expectEqual(VqmmLane.msg, vqmmLaneFor(4, 5120, 248320, false, 8, false));
-    try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, false, 8, false));
-    try t.expectEqual(VqmmLane.splitk, vqmmLaneFor(2, 5120, 17408, false, 8, false));
-    try t.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, false, 8, false));
-    try t.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, false, 8, false));
+    try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 248320, false, 8));
+    try t.expectEqual(VqmmLane.msg, vqmmLaneFor(2, 5120, 248320, false, 8));
+    try t.expectEqual(VqmmLane.msg, vqmmLaneFor(4, 5120, 248320, false, 8));
+    try t.expectEqual(VqmmLane.none, vqmmLaneFor(1, 5120, 17408, false, 8));
+    try t.expectEqual(VqmmLane.splitk, vqmmLaneFor(2, 5120, 17408, false, 8));
+    try t.expectEqual(VqmmLane.splitk, vqmmLaneFor(4, 5120, 17408, false, 8));
+    try t.expectEqual(VqmmLane.none, vqmmLaneFor(8, 5120, 17408, false, 8));
 
     transformer.moe_rows_fused_override = true;
     defer transformer.moe_rows_fused_override = null;

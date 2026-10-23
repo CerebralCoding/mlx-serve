@@ -90,9 +90,7 @@ pub const naxAvailable = @import("../../mlx/device.zig").naxAvailable;
 // sdk/blocks/linear/verify_qmm_nax.zig
 pub const verifyQmmNaxAvailable = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
 pub const verifyQmmTile = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmTile;
-pub const naxLaneEnvEnabled = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").naxLaneEnvEnabled;
 pub const verifyQmmNaxEnabled = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxEnabled;
-pub const naxMinMForBitsFrom = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").naxMinMForBitsFrom;
 pub const naxMinMFrom = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").naxMinMFrom;
 pub const verifyQmmNaxEnabledForMFrom = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxEnabledForMFrom;
 pub const verifyQmmNaxEnabledForM = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxEnabledForM;

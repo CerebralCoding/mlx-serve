@@ -395,7 +395,7 @@ pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.
         .head_kv_group = head.cache.config.group_size,
     };
     const rerank_ready = if (head.rerank) |r| r.bits == 3 and r.group_size == 64 and r.rows == 248320 else false;
-    const mixed = qwen4MixedCostProfileForFingerprint(geometry, std.meta.eql(geometry, Qwen4MixedGeometry{}) and qwen4MixedModelPacksMatch(target), rerank_ready, mlx.streamIsGpu(target.s) and transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable());
+    const mixed = qwen4MixedCostProfileForFingerprint(geometry, std.meta.eql(geometry, Qwen4MixedGeometry{}) and qwen4MixedModelPacksMatch(target), rerank_ready, mlx.streamIsGpu(target.s) and transformer_mod.verifyQmmNaxAvailable());
     if (mixed != .generic) {
         if (!qwen4_mixed_profile_logged) {
             qwen4_mixed_profile_logged = true;
@@ -412,7 +412,7 @@ pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.
         cfg.quant_bits,
         cfg.quant_group_size,
         packs,
-        transformer_mod.naxLaneEnvEnabled() and transformer_mod.verifyQmmNaxAvailable(),
+        transformer_mod.verifyQmmNaxAvailable(),
     );
     if (profile != .generic and !qwen4_g17_profile_logged) {
         qwen4_g17_profile_logged = true;

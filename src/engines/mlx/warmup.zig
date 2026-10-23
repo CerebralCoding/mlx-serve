@@ -9,7 +9,6 @@ const log = @import("../../host/log.zig");
 const io_util_mod = @import("../../sdk/util/io_util.zig");
 const Qwen4MtpProject = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4MtpProject;
 const ssmFreeQsaState = @import("../../plugins/qwen4_exp/qsa/history.zig").ssmFreeQsaState;
-const naxLaneEnvEnabled = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").naxLaneEnvEnabled;
 const verifyQmmNaxAvailable = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
 const MAX_BATCH_ROWS = @import("batched/layered.zig").MAX_BATCH_ROWS;
 const ForwardCtx = @import("forward_ctx.zig").ForwardCtx;
@@ -166,7 +165,7 @@ pub fn warmupSpecVerify(self: *Transformer, max_width: u32, kv_config: KVQuantCo
     if (self.qwen4 == null or self.qwen4_mtp == null) return;
     var lap = io_util_mod.Stopwatch.init(std.Io.Threaded.global_single_threaded.io());
     const width_cap: usize = @min(@max(max_width, 1), MAX_WIDTH_WARM);
-    const group_cap: usize = if (naxLaneEnvEnabled() and verifyQmmNaxAvailable()) 16 else 7;
+    const group_cap: usize = if (verifyQmmNaxAvailable()) 16 else 7;
     const max_rows: usize = @min(specWarmGroupRows(group_cap), MAX_BATCH_ROWS);
 
     var slots: [MAX_BATCH_ROWS]*SpecWarmSlot = undefined;
