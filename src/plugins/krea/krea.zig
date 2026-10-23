@@ -1125,7 +1125,7 @@ pub const Dit = struct {
     /// Builds blocks [0, n); fewer than all is the calibration build.
     fn aneBuild(self: *Dit, rows: u32, k: u32, units: u32, feat: u32, mlpdim: u32, share: f32, s: S, n: usize) !void {
         const a = self.allocator;
-        const eng = try ane.AnePrefill.init(a, self.io, self.blocks.len, feat, k, rows, rows, 0, 0, .channel, units);
+        const eng = try ane.AnePrefill.init(a, self.io, self.blocks.len, feat, k, rows, rows, 0, 0, units);
         errdefer eng.deinit();
         const rests = try a.alloc(SwiGLU, n);
         errdefer a.free(rests);

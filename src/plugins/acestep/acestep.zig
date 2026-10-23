@@ -2102,7 +2102,7 @@ pub const Engine = struct {
         const s = self.s;
         const hidden = self.cfg.hidden;
         const ffn = self.cfg.intermediate;
-        const eng = try ane.AnePrefill.init(a, self.io, self.cfg.layers, hidden, k, rows, rows, 0, 0, .channel, units);
+        const eng = try ane.AnePrefill.init(a, self.io, self.cfg.layers, hidden, k, rows, rows, 0, 0, units);
         errdefer eng.deinit();
         const rests = try a.alloc(AceRest, n);
         errdefer a.free(rests);

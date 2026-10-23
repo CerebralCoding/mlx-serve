@@ -311,7 +311,7 @@ pub fn handleProps(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel
                     .evals = u.evals_ok.load(.monotonic),
                     .eval_failures = u.evals_failed.load(.monotonic),
                 };
-                break :blk try anePropsJson(allocator, @tagName(eng.mode), eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, stats[0..eng.units.len]);
+                break :blk try anePropsJson(allocator, "channel", eng.coveredLayers(), eng.coveredGdnLayers(), eng.rows, eng.chunk_rows, eng.share, eng.int8_bytes, stats[0..eng.units.len]);
             }
         }
         break :blk try allocator.dupe(u8, "");

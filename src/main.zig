@@ -1197,7 +1197,6 @@ pub fn main(init: std.process.Init) !void {
 
     // One value for the three media seams (they run under gen.zig with no
     // server config in reach); the env stays the benching override.
-    if (ane_media.share == null) ane_media.share = ane_mod.explicitShareEnv();
     ane_mod.media_offload = ane_media;
 
     const decode_share_env: ?[]const u8 = env.span(.MLX_SERVE_PREFILL_DECODE_SHARE);

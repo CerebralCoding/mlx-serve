@@ -2203,7 +2203,7 @@ pub const Model = struct {
         const a = self.allocator;
         const hidden = self.cfg.hidden_size;
         const ffn = self.cfg.ffn_hidden_size;
-        const eng = try ane.AnePrefill.init(a, io, self.blocks.len, hidden, k, rows, rows, 0, 0, .channel, units);
+        const eng = try ane.AnePrefill.init(a, io, self.blocks.len, hidden, k, rows, rows, 0, 0, units);
         errdefer eng.deinit();
         const rests = try a.alloc(AneRestMlp, n);
         errdefer a.free(rests);

@@ -102,27 +102,6 @@ pub fn available() bool {
 /// bound — Stage A measured flat TFLOPS down to 512 rows).
 pub const ANE_MIN_ROWS: u32 = 256;
 
-/// Rows the ANE takes out of a fixed `chunk_rows`-wide prefill chunk at
-/// `share` (0..1): floored to a multiple of 32, clamped so the GPU keeps at
-/// least 16 rows, 0 when the tile would be below ANE_MIN_ROWS or the share
-/// is degenerate. The 32-row quantum is a measured plane-pitch contract,
-/// not a preference: an fp16 plane's per-channel pitch is rows x 2 bytes,
-/// and a pitch off the 64-byte grid compiles fine but fails EVERY eval
-/// ("Program Inference error") — the v2 share-0.35 collapse was rows
-/// 2864 = 16 mod 32 falling back to a full GPU recompute per chunk (A3
-/// probe 2026-08-18: 2864/2896 dead, 2880/2912/3264/3680 all ~11.8 TFLOPS,
-/// no rate cliff among legal tiles).
-pub fn aneShareRows(chunk_rows: u32, share: f32) u32 {
-    if (chunk_rows < ANE_MIN_ROWS + 16 or !(share > 0)) return 0;
-    const raw: f32 = @as(f32, @floatFromInt(chunk_rows)) * share;
-    if (!(raw > 0) or raw != raw) return 0;
-    var rows: u32 = @intFromFloat(raw);
-    rows -= rows % 32;
-    if (rows > chunk_rows - 16) rows = (chunk_rows - 16) - (chunk_rows - 16) % 32;
-    if (rows < ANE_MIN_ROWS) return 0;
-    return rows;
-}
-
 /// Total physical RAM (`hw.memsize` on Darwin, `/proc/meminfo` on Linux);
 /// 0 when the read fails (gates that consume this must treat 0 as "unknown",
 /// never as "tiny machine").
@@ -185,16 +164,15 @@ pub fn chipBrandString(buf: []u8) []const u8 {
 /// measurement above carries over unchanged — and the dual optimum is
 /// EXPECTED to sit higher (halving the ANE critical path is the whole
 /// point), which is a re-sweep, not an interpolation.
-pub fn defaultShare(mode: Mode, chip: []const u8) f32 {
-    return defaultShareFor(mode, chip, dualDefault(chip));
+pub fn defaultShare(chip: []const u8) f32 {
+    return defaultShareFor(chip, dualDefault(chip));
 }
 
 /// M3 Ultra: 0.35 on one ANE (PR #223 tester: 0.45 was nothing, 0.35
 /// +8.5%/+13.7% at 16k/32k); with BOTH ANEs 0.50 (2026-08-22 sweep, 16k
 /// prefill: single 0.35 465 tok/s, dual 0.35 471, 0.45 482-492, 0.50 498,
 /// 0.55 490, 0.65 466 — the rollover is one notch past 0.50).
-pub fn defaultShareFor(mode: Mode, chip: []const u8, dual: bool) f32 {
-    if (mode == .row) return 0.40;
+pub fn defaultShareFor(chip: []const u8, dual: bool) f32 {
     if (std.mem.indexOf(u8, chip, "M3 Ultra") != null) return if (dual) 0.50 else 0.35;
     return 0.45;
 }
@@ -208,10 +186,9 @@ pub fn dualDefault(chip: []const u8) bool {
 
 /// The ANE's TOTAL share of each covered projection (channel mode: fraction
 /// of output channels, split evenly across the units; row mode: fraction of
-/// chunk token rows). MLX_SERVE_ANE_SPLIT overrides; the default is per
-/// (mode, silicon) — see `defaultShare`.
+/// chunk token rows), per (mode, silicon) — see `defaultShare`. Prefill runs channel mode.
 pub fn splitShare() f32 {
-    return explicitShareEnv() orelse defaultShare(splitMode(), chipBrand());
+    return defaultShare(chipBrand());
 }
 
 // ── Media offload (image / video / audio DiTs) ──
@@ -227,14 +204,6 @@ pub const MediaOffload = struct {
     share: ?f32 = null,
 };
 pub var media_offload: MediaOffload = .{};
-
-/// MLX_SERVE_ANE_SPLIT parsed; null when unset or outside (0, 1].
-pub fn explicitShareEnv() ?f32 {
-    const raw = env.get(.MLX_SERVE_ANE_SPLIT) orelse return null;
-    const v = std.fmt.parseFloat(f32, std.mem.sliceTo(raw, 0)) catch return null;
-    if (!(v > 0) or v > 1) return null;
-    return v;
-}
 
 /// The share a media seam falls back to when nothing can be solved.
 pub const DEFAULT_MEDIA_SHARE: f32 = 0.45;
@@ -444,7 +413,7 @@ pub const MediaPlan = struct { share: f32, units: u32, k: u32 };
 pub fn planMediaOffload(io: std.Io, s: mlx.mlx_stream, what: []const u8, layers: usize, hidden: u32, ffn: u32, rows: u32, probe: QuantWeight, calib: anytype) ?MediaPlan {
     var gb: [96]u8 = undefined;
     const group = lineageGroup(&gb, what, layers, hidden, ffn) catch return null;
-    const units = unitCount(.channel, chipBrand(), dualEnabled());
+    const units = unitCount(chipBrand(), dualEnabled());
     const fixed: ?f32 = if (media_offload.share) |v| blk: {
         log.info("[ane] {s} offload share {d:.2} (explicit)\n", .{ what, v });
         break :blk v;
@@ -548,56 +517,17 @@ pub fn anePrefillAllowed(nax_available: bool, force_env: ?[]const u8) bool {
     return false;
 }
 
-/// GDN input-projection offload beside the MLP one (v2). MLX_SERVE_ANE_GDN=0
-/// keeps `--ane-prefill` MLP-only — the attribution lever for A/Bs.
-pub fn gdnEnabled() bool {
-    const raw = env.get(.MLX_SERVE_ANE_GDN) orelse return true;
-    return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-}
-
-/// How each projection splits between ANE and GPU (A1, ane-plan-aug-18).
-/// `row`: the ANE takes the first `aneShareRows` token rows through the
-/// FULL weights (v1/v2 shipped design; int8 copy = 100% of covered
-/// weights). `channel`: both units see ALL chunk tokens through sliced
-/// weights — the ANE holds output channels [0..k) of gate/up (and qkv/z),
-/// the GPU the rest; the down projection contributes PARTIAL sums added at
-/// the seam — so the resident int8 copy scales with the share. Channel is
-/// the DEFAULT since the 2026-08-18 counterbalanced A/B (27B oQ4e, M4 Max,
-/// medians): channel-0.45 306.4/301.1 vs row-0.40 300.7/294.3 vs off
-/// 258.2/239.0 at 16k/32k — +18.7%/+26.0% over off at 9.3 GB ANE bytes
-/// against row's 20.4. MLX_SERVE_ANE_MODE=row restores the row split.
-pub const Mode = enum { row, channel };
-
-pub fn splitMode() Mode {
-    const raw = env.get(.MLX_SERVE_ANE_MODE) orelse return .channel;
-    if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "row")) return .row;
-    return .channel;
-}
+/// Every projection splits by output CHANNEL: all units see ALL chunk tokens through sliced weights — the ANE holds
+/// output channels [0..k) of gate/up (and qkv/z), the GPU the rest; the down projection contributes PARTIAL sums
+/// added at the seam, so the resident int8 copy scales with the share. Measured 2026-08-18 (27B oQ4e, M4 Max,
+/// medians): channel-0.45 306.4/301.1 vs a token-row split at 0.40 300.7/294.3 vs off 258.2/239.0 at 16k/32k, at
+/// 9.3 GB ANE bytes against the row split's 20.4.
 
 /// Dual-ANE split: two pinned units computing disjoint channel slices
 /// concurrently. Default ON where it was measured (M3 Ultra), off elsewhere
 /// (unmeasurable on single-ANE silicon; private API on top of private API).
 pub fn dualEnabled() bool {
-    return dualEnabledFrom(env.span(.MLX_SERVE_ANE_DUAL), chipBrand());
-}
-
-/// MLX_SERVE_ANE_DUAL=1 forces it on, =0 off; unset = the chip default.
-pub fn dualEnabledFrom(raw: ?[]const u8, chip: []const u8) bool {
-    if (raw) |v| {
-        if (std.mem.eql(u8, v, "1")) return true;
-        if (std.mem.eql(u8, v, "0")) return false;
-    }
-    return dualDefault(chip);
-}
-
-/// Whether concurrent units share ONE input surface instead of getting a
-/// memcpy'd copy each. Default OFF: a shared input across two LIVE evals is
-/// an unproven read-concurrency assumption on private API whose failure
-/// mode is silently wrong numbers, and the copy is ~1.7 ms on the 27B
-/// against a ~20 ms eval. Flip it once dual is proven.
-pub fn dualShareInput() bool {
-    const raw = env.get(.MLX_SERVE_ANE_DUAL_SHARE_INPUT) orelse return false;
-    return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
+    return dualDefault(chipBrand());
 }
 
 /// Neural Engine instances a chip carries. Ultra parts fuse two dies and
@@ -613,12 +543,10 @@ pub fn aneInstanceCount(chip: []const u8) u32 {
 /// no shipping silicon exposes more than two Neural Engines.
 pub const MAX_UNITS: usize = 2;
 
-/// Units the engine builds. Dual is CHANNEL-mode only (row mode is not the
-/// default and is unmeasured), and only on silicon that has a second
-/// instance to pin to — a dual request on a single-ANE machine self-
-/// disables rather than failing the boot.
-pub fn unitCount(mode: Mode, chip: []const u8, dual: bool) u32 {
-    if (!dual or mode != .channel) return 1;
+/// Units the engine builds: two only on silicon that has a second instance to pin to — a dual request on a
+/// single-ANE machine self-disables rather than failing the boot.
+pub fn unitCount(chip: []const u8, dual: bool) u32 {
+    if (!dual) return 1;
     return aneInstanceCount(chip);
 }
 
@@ -731,14 +659,7 @@ pub const BUILD_DISK_FLOOR_BYTES: u64 = 1 << 30;
 /// peak (2x). Under the cap a model banks monolithically — which is what
 /// oMLX measured bit-stable across five greedy runs, against split banks
 /// that were ~1% faster but occasionally diverged at a tie.
-/// MLX_SERVE_ANE_BANK_MAX_BYTES overrides (the split-ladder test lever).
 pub const DEFAULT_BANK_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
-
-pub fn bankMaxBytes() u64 {
-    const raw = env.get(.MLX_SERVE_ANE_BANK_MAX_BYTES) orelse return DEFAULT_BANK_MAX_BYTES;
-    const v = std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 10) catch return DEFAULT_BANK_MAX_BYTES;
-    return if (v == 0) DEFAULT_BANK_MAX_BYTES else v;
-}
 
 /// Programs the next bank takes from `sizes[start..]`: at least one (a
 /// single program over the cap still has to be its own bank — refusing it
@@ -861,7 +782,6 @@ pub const Unit = struct {
     plane_in: ?*MsvAnePlane = null,
     /// False when this unit borrows unit 0's input plane
     /// (MLX_SERVE_ANE_DUAL_SHARE_INPUT=1).
-    owns_plane_in: bool = true,
     plane_mlp_out: ?*MsvAnePlane = null,
     plane_gdn_out: ?*MsvAnePlane = null,
 
@@ -1017,7 +937,7 @@ pub const Unit = struct {
         // Bound the builder's transient host peak: the queue holds the
         // quantized payloads and the flush assembles a blob of the same
         // size beside them, so the cap governs both.
-        const cap = bankMaxBytes();
+        const cap = DEFAULT_BANK_MAX_BYTES;
         if (self.pending.items.len > 0 and self.pending_bytes + p.bytes() > cap) self.flushPending();
         try self.pending.append(self.allocator(), p);
         self.pending_gdn = p.gdn;
@@ -1085,7 +1005,7 @@ pub const Unit = struct {
         defer alloc.free(sizes);
         for (self.pending.items, 0..) |*p, i| sizes[i] = p.bytes();
 
-        const cap = bankMaxBytes();
+        const cap = DEFAULT_BANK_MAX_BYTES;
         var start: usize = 0;
         var group: usize = self.pending.items.len;
         while (start < self.pending.items.len) {
@@ -1121,7 +1041,7 @@ pub const Unit = struct {
         self.banks.deinit(alloc);
         alloc.free(self.layers);
         alloc.free(self.gdn_layers);
-        if (self.owns_plane_in) msv_ane_plane_free(self.plane_in);
+        msv_ane_plane_free(self.plane_in);
         msv_ane_plane_free(self.plane_mlp_out);
         msv_ane_plane_free(self.plane_gdn_out);
     }
@@ -1155,7 +1075,6 @@ pub const AnePrefill = struct {
     chunk_rows: u32,
     /// row = token-row split through full weights; channel = output-channel
     /// split through sliced weights (partial-sum down join).
-    mode: Mode = .row,
     /// The TOTAL share the engine was built at and the int8 bytes it holds
     /// — set by the builder after the layer loop, read by /props and the
     /// metrics gauges. 0 until publishLive.
@@ -1169,7 +1088,7 @@ pub const AnePrefill = struct {
     /// engine); non-zero sizes it for the fused qkv+z programs. In channel
     /// mode `ffn`/`gdn_*_out` are the PER-UNIT sliced widths and
     /// rows == chunk_rows. `units` > 1 pins unit u to ANE instance u+1.
-    pub fn init(allocator: std.mem.Allocator, io: std.Io, num_layers: usize, hidden: u32, ffn: u32, rows: u32, chunk_rows: u32, gdn_qkv_out: u32, gdn_z_out: u32, mode: Mode, units: u32) !*AnePrefill {
+    pub fn init(allocator: std.mem.Allocator, io: std.Io, num_layers: usize, hidden: u32, ffn: u32, rows: u32, chunk_rows: u32, gdn_qkv_out: u32, gdn_z_out: u32, units: u32) !*AnePrefill {
         std.debug.assert(units >= 1 and units <= MAX_UNITS);
         const self = try allocator.create(AnePrefill);
         errdefer allocator.destroy(self);
@@ -1186,11 +1105,9 @@ pub const AnePrefill = struct {
             .gdn_z_out = gdn_z_out,
             .rows = rows,
             .chunk_rows = chunk_rows,
-            .mode = mode,
         };
         errdefer for (self.units) |*u| u.deinit();
         const io_bytes = @as(usize, hidden) * rows * 2;
-        const share_input = units > 1 and dualShareInput();
         for (0..units) |u| {
             const layers = try allocator.alloc(?ProgramRef, num_layers);
             @memset(layers, null);
@@ -1208,12 +1125,7 @@ pub const AnePrefill = struct {
             // The unit is live in `units` before any fallible plane alloc,
             // so errdefer self.deinit() frees what it already owns.
             self.units = unit_slice[0 .. u + 1];
-            if (share_input and u > 0) {
-                unit_slice[u].plane_in = unit_slice[0].plane_in;
-                unit_slice[u].owns_plane_in = false;
-            } else {
-                unit_slice[u].plane_in = msv_ane_plane_create(io_bytes) orelse return error.AnePlaneAlloc;
-            }
+            unit_slice[u].plane_in = msv_ane_plane_create(io_bytes) orelse return error.AnePlaneAlloc;
             unit_slice[u].plane_mlp_out = msv_ane_plane_create(io_bytes) orelse return error.AnePlaneAlloc;
             if (gdn_qkv_out > 0 and gdn_z_out > 0)
                 unit_slice[u].plane_gdn_out = msv_ane_plane_create(@as(usize, gdn_qkv_out + gdn_z_out) * rows * 2) orelse return error.AnePlaneAlloc;
@@ -1350,13 +1262,13 @@ pub const AnePrefill = struct {
     pub fn logEngagedOnce(self: *AnePrefill, what: []const u8) void {
         if (self.engaged_logged) return;
         self.engaged_logged = true;
-        log.info("[ane] {s} offload engaged: mode={s} units={d} mlp={d} rows={d}/{d} (MLX_SERVE_ANE_SPLIT sets the share)\n", .{ what, @tagName(self.mode), self.units.len, self.coveredLayers(), self.rows, self.chunk_rows });
+        log.info("[ane] {s} offload engaged: units={d} mlp={d} rows={d}/{d}\n", .{ what, self.units.len, self.coveredLayers(), self.rows, self.chunk_rows });
     }
 
     pub fn logGdnEngagedOnce(self: *AnePrefill) void {
         if (self.gdn_engaged_logged) return;
         self.gdn_engaged_logged = true;
-        log.info("[ane] gdn offload engaged: mode={s} units={d} {d} layers, rows={d}/{d} (MLX_SERVE_ANE_GDN=0 restores MLP-only)\n", .{ @tagName(self.mode), self.units.len, self.coveredGdnLayers(), self.rows, self.chunk_rows });
+        log.info("[ane] gdn offload engaged: units={d} {d} layers, rows={d}/{d}\n", .{ self.units.len, self.coveredGdnLayers(), self.rows, self.chunk_rows });
     }
 
     /// The dual-ANE proof line: which instances the units were pinned to
@@ -1752,18 +1664,14 @@ test "defaultShare: per-silicon channel rows, row mode keeps its M4 optimum" {
     // M3 Ultra channel row (PR #223 tester): 0.45 measured ≈ nothing, 0.35
     // measured +8.5%/+13.7% at 16k/32k — the default must be the measured
     // optimum for the machine, never one machine's number everywhere.
-    try std.testing.expectEqual(@as(f32, 0.50), defaultShare(.channel, "Apple M3 Ultra")); // dual by default
-    try std.testing.expectEqual(@as(f32, 0.35), defaultShareFor(.channel, "Apple M3 Ultra", false));
-    try std.testing.expect(dualEnabledFrom(null, "Apple M3 Ultra"));
-    try std.testing.expect(!dualEnabledFrom("0", "Apple M3 Ultra"));
-    try std.testing.expect(!dualEnabledFrom(null, "Apple M4 Max"));
-    try std.testing.expect(dualEnabledFrom("1", "Apple M4 Max"));
-    try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, "Apple M4 Max"));
-    try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, "Apple M3 Max"));
-    try std.testing.expectEqual(@as(f32, 0.45), defaultShare(.channel, ""));
+    try std.testing.expectEqual(@as(f32, 0.50), defaultShare("Apple M3 Ultra")); // dual by default
+    try std.testing.expectEqual(@as(f32, 0.35), defaultShareFor("Apple M3 Ultra", false));
+    try std.testing.expect(dualDefault("Apple M3 Ultra"));
+    try std.testing.expect(!dualDefault("Apple M4 Max"));
+    try std.testing.expectEqual(@as(f32, 0.45), defaultShare("Apple M4 Max"));
+    try std.testing.expectEqual(@as(f32, 0.45), defaultShare("Apple M3 Max"));
+    try std.testing.expectEqual(@as(f32, 0.45), defaultShare(""));
     // Row mode is only measured on M4; every chip keeps that row.
-    try std.testing.expectEqual(@as(f32, 0.40), defaultShare(.row, "Apple M3 Ultra"));
-    try std.testing.expectEqual(@as(f32, 0.40), defaultShare(.row, "Apple M4 Max"));
 }
 
 test "anePrefillAllowed: NAX-class GPUs refuse the seam unless forced" {
@@ -1785,14 +1693,13 @@ test "unitCount: dual is channel-mode on two-instance silicon, self-disabling el
     try testing.expectEqual(@as(u32, 1), aneInstanceCount("Apple M4 Max"));
     try testing.expectEqual(@as(u32, 1), aneInstanceCount(""));
     // Off by default, whatever the machine.
-    try testing.expectEqual(@as(u32, 1), unitCount(.channel, "Apple M3 Ultra", false));
+    try testing.expectEqual(@as(u32, 1), unitCount("Apple M3 Ultra", false));
     // On, and the machine has a second die: two units.
-    try testing.expectEqual(@as(u32, 2), unitCount(.channel, "Apple M3 Ultra", true));
+    try testing.expectEqual(@as(u32, 2), unitCount("Apple M3 Ultra", true));
     // A dual request on a single-ANE machine must self-disable, never fail
     // the boot.
-    try testing.expectEqual(@as(u32, 1), unitCount(.channel, "Apple M4 Max", true));
+    try testing.expectEqual(@as(u32, 1), unitCount("Apple M4 Max", true));
     // Row mode is not the default and is unmeasured under dual: refused.
-    try testing.expectEqual(@as(u32, 1), unitCount(.row, "Apple M3 Ultra", true));
 }
 
 test "engineBillBytes: int8 weights + per-unit fp16 planes (A9 sharing within a unit)" {
@@ -1848,23 +1755,6 @@ test "gateAllows: per-model bill vs total RAM, unknown total allows" {
 
     // Saturating: an absurd headroom refuses rather than wrapping to allow.
     try testing.expect(!gateAllows(32 * gib, resident, bill, std.math.maxInt(u64)));
-}
-
-test "aneShareRows: 32-row floor, GPU remainder, engagement minimum" {
-    // 32-row quantum: an fp16 plane's per-channel pitch is rows x 2 bytes,
-    // and a pitch off the 64-byte grid fails EVERY eval of the compiled
-    // program (the v2 share-0.35 collapse: rows 2864 = 16 mod 32).
-    try testing.expectEqual(@as(u32, 2432), aneShareRows(8192, 0.30));
-    try testing.expectEqual(@as(u32, 2848), aneShareRows(8192, 0.35)); // was 2864, the live cliff
-    try testing.expectEqual(@as(u32, 3264), aneShareRows(8192, 0.40)); // default share unchanged
-    try testing.expectEqual(@as(u32, 1216), aneShareRows(4096, 0.30));
-    try testing.expectEqual(@as(u32, 0), aneShareRows(8192, 0.0)); // no share
-    try testing.expectEqual(@as(u32, 0), aneShareRows(8192, -1.0));
-    try testing.expectEqual(@as(u32, 0), aneShareRows(512, 0.30)); // 144 < ANE_MIN_ROWS
-    try testing.expectEqual(@as(u32, 0), aneShareRows(64, 0.9)); // chunk too small
-    // Oversized share clamps so the GPU keeps >= 16 rows.
-    const clamped = aneShareRows(8192, 1.5);
-    try testing.expect(clamped <= 8192 - 16 and clamped % 32 == 0 and clamped > 0);
 }
 
 test "calibratedShare: balanced timings keep the seed, a slower GPU hands the ANE more" {
