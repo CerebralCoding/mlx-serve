@@ -20,7 +20,7 @@ const steel = @import("mlx_steel_sources");
 
 pub const MAX_ROWS = 128;
 
-const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
+pub const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
 
 // XS (a row's sum over a group) is summed in the kernel in a fixed order per
 // row: lane 2r + h adds half h of row r, and the two halves join low + high.
@@ -30,20 +30,20 @@ const ROW_SUM_G = kernelSource("kernels/qmm/lane_qmm_row_sum_g.metal");
 // 32 output columns a simdgroup; SBt holds (s, b) bf16 pairs group-major [K/GS][N][2].
 // A threadgroup covers 16 x TMR rows from `rb` with one op per group; every row
 // gets the 16-row op's bits.
-const NARROW = kernelSource("kernels/qmm/lane_qmm_narrow_head.metal") ++ "\n" ++ ROW_SUMS ++ "  for (int g = g_begin; g < g_end; g++) {\n" ++ ROW_SUM_G ++ kernelSource("kernels/qmm/lane_qmm_narrow_body.metal");
+pub const NARROW = kernelSource("kernels/qmm/lane_qmm_narrow_head.metal") ++ "\n" ++ ROW_SUMS ++ "  for (int g = g_begin; g < g_end; g++) {\n" ++ ROW_SUM_G ++ kernelSource("kernels/qmm/lane_qmm_narrow_body.metal");
 
 // 64 output columns run by two simdgroups together (N % 64 == 0); a pair per K slice.
-const COOP = kernelSource("kernels/qmm/lane_qmm_coop_head.metal") ++ "\n" ++ ROW_SUMS ++ "  for (int g = g_begin; g < g_end; g++) {\n" ++ ROW_SUM_G ++ kernelSource("kernels/qmm/lane_qmm_coop_body.metal");
+pub const COOP = kernelSource("kernels/qmm/lane_qmm_coop_head.metal") ++ "\n" ++ ROW_SUMS ++ "  for (int g = g_begin; g < g_end; g++) {\n" ++ ROW_SUM_G ++ kernelSource("kernels/qmm/lane_qmm_coop_body.metal");
 
 // MLX's affine `qmm_t_nax` (lib/mlx-src/.../quantized_nax.h, MIT) for a tiled
 // weight: the same BM x 64 x 64 blocks over 2 x 2 simdgroups, the same
 // dequantization into threadgroup memory and the same NAX tile matmuls; only
 // the weight and scale addresses differ (and rows past N load zeros).
-const PREFILL = kernelSource("kernels/qmm/lane_qmm_prefill.metal");
+pub const PREFILL = kernelSource("kernels/qmm/lane_qmm_prefill.metal");
 
 /// MLX's steel NAX headers in include order, their own includes and
 /// include guards dropped: they sit inline in one `metal_kernel` header.
-fn prefillHeader() ![:0]const u8 {
+pub fn prefillHeader() ![:0]const u8 {
     if (prefill_header) |h| return h;
     const a = std.heap.c_allocator;
     var out: std.ArrayList(u8) = .empty;

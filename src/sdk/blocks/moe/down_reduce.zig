@@ -2,13 +2,13 @@
 //! Owns gatherQmvDownReduceSource, GQMV_DOWNRED_SOURCES, GQMV_DOWNRED_NAMES, gqmv_downred_kernels, getGatherQmvDownReduceKernel, downredLanesFor, and 20 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
 const gather_qmv = @import("gather_qmv.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
-const envFlagCached = @import("../../../engines/mlx/env_transformer.zig").envFlagCached;
 const deviceGeneration = @import("../../../mlx/device.zig").deviceGeneration;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;
@@ -52,7 +52,7 @@ fn gatherQmvDownReduceSource(comptime nvfp4: bool) [:0]const u8 {
     });
 }
 
-const GQMV_DOWNRED_SOURCES = [2][:0]const u8{ gatherQmvDownReduceSource(false), gatherQmvDownReduceSource(true) };
+pub const GQMV_DOWNRED_SOURCES = [2][:0]const u8{ gatherQmvDownReduceSource(false), gatherQmvDownReduceSource(true) };
 const GQMV_DOWNRED_NAMES = [2][*:0]const u8{ "mlxserve_moe_gather_qmv_downred", "mlxserve_moe_gather_qmv_downred_nvfp4" };
 var gqmv_downred_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 
@@ -88,12 +88,12 @@ fn downredLanesFor(gen: u32, phone: bool) c_int {
     return if (gen == 17 and !phone) 16 else 8;
 }
 
-fn downredLpr() c_int {
+pub fn downredLpr() c_int {
     const g = deviceGeneration();
     return downredLanesFor(g.gen, g.phone);
 }
 
-const DownRedCfgKey = struct { topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int };
+const DownRedCfgKey = struct { topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int };
 var downred_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_cfg_key: DownRedCfgKey = std.mem.zeroes(DownRedCfgKey);
 pub var downred_engaged: bool = false;
@@ -103,7 +103,7 @@ var downred_env: ?bool = null;
 fn downReduceFusedEnabled() bool {
     if (transformer.downred_override) |v| return v;
     if (downred_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MOE_DOWN_REDUCE_FUSED");
+    const raw = env.get(.MLX_SERVE_MOE_DOWN_REDUCE_FUSED);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     downred_env = enabled;
     return enabled;
@@ -127,7 +127,7 @@ pub fn gatherQmvDownReduce(
     mode: QuantMode,
 ) !?mlx.mlx_array {
     if (!downReduceFusedEnabled()) return null;
-    if (!mlx.streamIsGpu(s) or envFlagCached(&gather_qmv.gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsGpu(s) or env.presentCached(&gather_qmv.gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -168,7 +168,7 @@ pub fn gatherQmvDownReduce(
     const rows: c_int = @divExact(32, downredLpr());
     if (@rem(N, rows) != 0) return null;
 
-    const key = DownRedCfgKey{ .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr() };
+    const key = DownRedCfgKey{ .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr() };
     if (downred_cfg == null or !std.meta.eql(downred_cfg_key, key)) {
         if (downred_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -215,7 +215,7 @@ fn gatherQmvDownReduceRowsSource(comptime nvfp4: bool) [:0]const u8 {
     });
 }
 
-const GQMV_DOWNRED_ROWS_SOURCES = [2][:0]const u8{ gatherQmvDownReduceRowsSource(false), gatherQmvDownReduceRowsSource(true) };
+pub const GQMV_DOWNRED_ROWS_SOURCES = [2][:0]const u8{ gatherQmvDownReduceRowsSource(false), gatherQmvDownReduceRowsSource(true) };
 const GQMV_DOWNRED_ROWS_NAMES = [2][*:0]const u8{ "mlxserve_moe_gather_qmv_downred_rows", "mlxserve_moe_gather_qmv_downred_rows_nvfp4" };
 var gqmv_downred_rows_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 
@@ -244,7 +244,7 @@ fn getGatherQmvDownReduceRowsKernel(nvfp4: bool) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int };
+const DownRedRowsCfgKey = struct { nrows: c_int, topk: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype, lpr: c_int };
 var downred_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_rows_cfg_key: DownRedRowsCfgKey = std.mem.zeroes(DownRedRowsCfgKey);
 var downred_rows_engaged: bool = false;
@@ -254,7 +254,7 @@ var downred_rows_engaged: bool = false;
 pub fn gatherQmvDownReduceRowsEligible(hidden_act: anytype, gate_qp: anytype, up_qp: anytype, down_qp: anytype, N: c_int) bool {
     if (!downReduceFusedEnabled()) return false;
     if (!moeRowsFusedEnabled()) return false;
-    if (envFlagCached(&gather_qmv.gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return false;
+    if (env.presentCached(&gather_qmv.gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return false;
     if (hidden_act != .silu) return false;
     if (gate_qp.bits != up_qp.bits or gate_qp.group_size != up_qp.group_size or gate_qp.mode != up_qp.mode) return false;
     switch (down_qp.mode) {
@@ -288,7 +288,7 @@ pub fn gatherQmvDownReduceRows(
 ) !?mlx.mlx_array {
     if (!downReduceFusedEnabled()) return null;
     if (!moeRowsFusedEnabled()) return null;
-    if (!mlx.streamIsGpu(s) or envFlagCached(&gather_qmv.gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsGpu(s) or env.presentCached(&gather_qmv.gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -327,7 +327,7 @@ pub fn gatherQmvDownReduceRows(
     const rows: c_int = @divExact(32, downredLpr());
     if (@rem(N, rows) != 0) return null;
 
-    const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr() };
+    const key = DownRedRowsCfgKey{ .nrows = nrows, .topk = topk, .n = N, .k = K, .bits = bits, .gs = group_size, .dtype = xd, .lpr = downredLpr() };
     if (downred_rows_cfg == null or !std.meta.eql(downred_rows_cfg_key, key)) {
         if (downred_rows_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
@@ -397,16 +397,31 @@ test "moe down+reduce fused: no worse than gatherQmv + multiply + sum vs fp32 tr
         const TOPK: c_int = geom[1];
         const KIN: c_int = geom[2];
         const N: c_int = geom[3];
-        try moeDownReduceParityCase(s, rnd, t, E, TOPK, KIN, N);
+        try moeDownReduceParityCase(s, rnd, t, E, TOPK, KIN, N, &parity_quants);
     }
 }
 
-fn moeDownReduceParityCase(s: mlx.mlx_stream, rnd: std.Random, t: anytype, E: usize, TOPK: c_int, KIN: c_int, N: c_int) !void {
-    for ([_]struct { nvfp4: bool, bits: u32, gs: u32 }{
-        .{ .nvfp4 = true, .bits = 4, .gs = 16 },
-        .{ .nvfp4 = false, .bits = 4, .gs = 32 },
-        .{ .nvfp4 = false, .bits = 3, .gs = 64 },
-    }) |cfg| {
+// Bar: one process serving two expert widths at the same top-k and N (two models, or a trunk and its MTP head) gets
+// each width's own kernel, never the first width's.
+test "moe down+reduce fused: a second expert width at the same top-k and N runs its own width" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xD0A1);
+    transformer.downred_override = true;
+    defer transformer.downred_override = null;
+    const affine4 = [_]ParityQuant{.{ .nvfp4 = false, .bits = 4, .gs = 32 }};
+    try moeDownReduceParityCase(s, prng.random(), std.testing, 16, 8, 64, 32, &affine4);
+    try moeDownReduceParityCase(s, prng.random(), std.testing, 16, 8, 128, 32, &affine4);
+}
+
+const ParityQuant = struct { nvfp4: bool, bits: u32, gs: u32 };
+const parity_quants = [_]ParityQuant{
+    .{ .nvfp4 = true, .bits = 4, .gs = 16 },
+    .{ .nvfp4 = false, .bits = 4, .gs = 32 },
+    .{ .nvfp4 = false, .bits = 3, .gs = 64 },
+};
+
+fn moeDownReduceParityCase(s: mlx.mlx_stream, rnd: std.Random, t: anytype, E: usize, TOPK: c_int, KIN: c_int, N: c_int, quants: []const ParityQuant) !void {
+    for (quants) |cfg| {
         const nvfp4 = cfg.nvfp4;
         const bits = cfg.bits;
         const gs = cfg.gs;

@@ -18,6 +18,7 @@
 //! token per bucket. Kept out of the width grid (a serial tick is not a round), it answers
 //! the one question no width can: is speculation worth running here at all?
 const std = @import("std");
+const env = @import("../../../env.zig");
 const crt = @import("../../../sdk/util/crt.zig");
 const os_mutex = @import("../../../sdk/util/os_mutex.zig");
 const builtin = @import("builtin");
@@ -858,7 +859,7 @@ pub fn persistEnabledFrom(raw: ?[]const u8) bool {
 }
 
 pub fn persistEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_ROUND_COST_PERSIST");
+    const raw = env.get(.MLX_SERVE_ROUND_COST_PERSIST);
     return persistEnabledFrom(if (raw) |r| std.mem.span(r) else null);
 }
 
@@ -870,21 +871,13 @@ pub fn persistDiagArmedFrom(raws: []const ?[*:0]const u8) bool {
 }
 
 fn qwen4ProfileArmed() bool {
-    if (comptime @import("builtin").os.tag == .windows) return false; // no `environ` in the Windows CRT; Qwen4 never runs there
-    var i: usize = 0;
-    while (std.c.environ[i]) |entry| : (i += 1) {
-        const s = std.mem.span(entry);
-        if (!std.mem.startsWith(u8, s, "QWEN4_PROFILE_")) continue;
-        const eq = std.mem.indexOfScalar(u8, s, '=') orelse continue;
-        if (transformer_mod.diagEnvValueOn(@ptrCast(s[eq + 1 ..].ptr))) return true;
-    }
-    return false;
+    return env.anyOnWithPrefix("QWEN4_PROFILE_");
 }
 
 pub fn persistDiagArmed() bool {
     return qwen4ProfileArmed() or @import("mtp_depth_bounds.zig").active.pinned() != null or
         persistDiagArmedFrom(&.{
-            std.c.getenv("MLX_SERVE_MTP_TRACE"),
+            env.get(.MLX_SERVE_MTP_TRACE),
         });
 }
 
@@ -1104,7 +1097,7 @@ pub fn parse(text: []const u8, layout: Layout) ?Table {
 }
 
 fn homeDir() []const u8 {
-    return std.mem.span(std.c.getenv("HOME") orelse return "/tmp");
+    return std.mem.span(env.get(.HOME) orelse return "/tmp");
 }
 
 fn cachePath(buf: []u8, key: []const u8) ?[]const u8 {

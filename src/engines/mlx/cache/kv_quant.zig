@@ -16,6 +16,7 @@
 // quantized-attention kernels key on the affine triple (`transformer.zig`).
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 
 /// KV-cache storage scheme.
@@ -977,7 +978,7 @@ test "kv-quant decode µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" {
     // mode (full-cache dequant + SDPA, what --kv-quant users get today),
     // (c) kv-quant off (SDPA over resident dense K/V). µbench wins can lose
     // live — this SCOPES the work; the live A/B decides defaults.
-    const raw = std.c.getenv("MLX_SERVE_KVQ_UBENCH");
+    const raw = env.get(.MLX_SERVE_KVQ_UBENCH);
     if (raw == null or std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0")) return;
 
     const s = mlx.gpuStream();

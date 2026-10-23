@@ -232,7 +232,10 @@ class APIClient {
             recTopP: meta["gen_top_p"] as? Double,
             recTopK: meta["gen_top_k"] as? Int,
             lanPeer: (first["lan_peer"] as? String) ?? (first["provider"] as? String),
-            provider: first["provider"] as? String
+            provider: first["provider"] as? String,
+            agentBudget: AgentBudget.parse(first["agent_budget"]),
+            modality: first["modality"] as? String,
+            engines: first["engines"] as? [String] ?? []
         )
     }
 

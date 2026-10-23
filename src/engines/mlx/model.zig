@@ -1,9 +1,11 @@
 const std = @import("std");
+const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
+const plugin_config = @import("plugin/config.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
-const sushi_exl3 = @import("sushi_exl3");
+const exl3 = @import("../../sdk/quant/exl3/format.zig");
 const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 const modelopt_pack = @import("../../sdk/quant/nvfp4/modelopt_pack.zig");
 const model_discovery = @import("../../host/registry/discovery.zig");
@@ -36,7 +38,7 @@ pub const QuantMode = enum {
     nvfp4,
     mxfp4,
     mxfp8,
-    /// Raw ggml blocks (lib/mlx-serve-gguf). Never reaches an MLX quantized op:
+    /// Raw ggml blocks (src/sdk/quant/gguf). Never reaches an MLX quantized op:
     /// the per-tensor type rides on the weight, see `mlx_gguf.kernels.Info`.
     gguf,
 
@@ -371,8 +373,8 @@ pub const ModelConfig = struct {
     indexer_budget: u32 = 0,
     indexer_compress_ratio: u32 = 0,
     /// Routed experts in EXL3 (Sushi packs, `expert_quant` in config.json),
-    /// served by lib/sushi; null = the pack's own affine banks.
-    exl3: ?sushi_exl3.Spec = null,
+    /// served by src/sdk/quant/exl3; null = the pack's own affine banks.
+    exl3: ?exl3.Spec = null,
     /// An NVIDIA ModelOpt checkpoint served as published (`modelopt_pack`).
     modelopt: bool = false,
     /// The TEXT config's own eos (its first entry): the n-gram hash's segment
@@ -593,6 +595,8 @@ pub const ModelConfig = struct {
     drafter_ctx_bytes_per_token: u64 = 0,
     /// `drafter` setting: null or "auto" = the in-dir probe, "off", or a path. Owned.
     drafter_override: ?[]const u8 = null,
+    /// The plugin serving this pack and its parse (`engines/mlx/plugin/config.zig`); null = the legacy path.
+    plugin: ?*plugin_config.Binding = null,
     /// Every quantized projection fits the row-exact kernels (`Transformer.init`).
     row_exact_covered: bool = false,
     /// A DFlash drafter is bound (`DflashModel.bind`): its block tree needs exact verify rows.
@@ -993,6 +997,7 @@ pub const ModelConfig = struct {
     /// factor` — the window HF and vLLM both derive `max_model_len` from — since
     /// a position past it aliases back inside the ramp. 0 = no rope-derived cap.
     pub fn contextCap(self: *const ModelConfig) u32 {
+        if (self.plugin) |b| return std.math.cast(u32, b.parsed.shell.context_cap) orelse std.math.maxInt(u32);
         const declared = self.max_position_embeddings;
         if (!self.rope_yarn) return declared;
         const orig: f64 = @floatFromInt(self.yarn_orig_max_pos);
@@ -1193,11 +1198,8 @@ pub const ModelConfig = struct {
     /// Configured MTP depth (0 = auto). Hadamard packs run a grafted head that
     /// over-speculates in auto mode; 2 measured best (code 71 vs 58 tok/s).
     pub fn mtpDepth(self: *const ModelConfig, configured: u32) u32 {
+        if (self.plugin) |b| if (configured == 0 and b.parsed.spec.mtp_default_depth > 0) return b.parsed.spec.mtp_default_depth;
         if (configured == 0 and self.hadamard_block > 0) return 2;
-        // Nemotron-H MoE: every verify row routes to more experts, so the
-        // round cost climbs with depth while the head's acceptance decays;
-        // depth 2 beats both 1 and 3+, the adaptive default cap (6) loses.
-        if (configured == 0 and std.mem.eql(u8, self.model_type, "nemotron_h")) return 2;
         // glm5_next: the head's acceptance decays past three drafts while every verify row
         // costs a MoE expert read; the adaptive default settled at one draft and lost.
         if (configured == 0 and self.isGlm5()) return 3;
@@ -1208,6 +1210,7 @@ pub const ModelConfig = struct {
     /// Nemotron-H keys were RoPE-rotated before its attention became NoPE; the
     /// marker gives it a fresh root. Null keeps every other arch's root.
     pub fn cacheLayoutNamespace(self: *const ModelConfig) ?[]const u8 {
+        if (self.plugin) |b| return if (b.parsed.cache.layout_namespace.len > 0) b.parsed.cache.layout_namespace.slice() else null;
         if (std.mem.eql(u8, self.model_type, "nemotron_h")) return "nemotron-h-nope-v1";
         if (self.rope_llama3 != null) return "llama3-rope-v1";
         // A pool's completing indexer row stores the pool's key in its gate half; v2: the KDA q/k norm epsilon.
@@ -1233,20 +1236,22 @@ pub const ModelConfig = struct {
     }
 
     pub fn rowExactArch(self: *const ModelConfig) bool {
-        if (std.mem.eql(u8, self.model_type, "nemotron_h")) return true;
+        if (self.plugin) |b| if (b.parsed.caps.exact_drafted) return true;
         return std.mem.startsWith(u8, self.model_type, "qwen3_5") and !self.isMoe() and self.hadamard_block == 0;
     }
 
     /// The MTP head's hidden input is the trunk's final-normed hidden, not the
     /// residual (Nemotron-H: more drafts kept at depth 1 and 2).
     pub fn mtpReadsFinalNorm(self: *const ModelConfig) bool {
-        return std.mem.eql(u8, self.model_type, "nemotron_h") or self.isMimo();
+        if (self.plugin) |b| if (b.parsed.spec.head_reads_final_norm) return true;
+        return self.isMimo();
     }
 
     /// Vocab rows a spec drafter proposes from (0 = all): Qwen3.8's tokenizer
     /// puts 99.64% of committed tokens below id 98304, so a draft reads 40% of
     /// the head. A token past it is never drafted: speed only, never output.
     pub fn draftVocab(self: *const ModelConfig) c_int {
+        if (self.plugin) |b| if (b.parsed.spec.draft_vocab > 0) return if (self.rowExactDecode()) std.math.cast(c_int, b.parsed.spec.draft_vocab) orelse 0 else 0;
         if (self.rowExactDecode() and std.mem.startsWith(u8, self.model_type, "qwen3_5") and self.vocab_size >= 248320) return 98304;
         return 0;
     }
@@ -1274,6 +1279,7 @@ pub const ModelConfig = struct {
     }
 
     pub fn isMoe(self: *const ModelConfig) bool {
+        if (self.plugin) |b| if (b.parsed.caps.moe) return true;
         return self.num_experts > 0;
     }
 
@@ -1351,6 +1357,7 @@ pub const ModelConfig = struct {
     /// reservation, pad-waste cap, checkpoint thinning, admission terms, chunk bar) was
     /// measured on qwen4_exp only, so they are opt-in by arch. Never hand-roll it at a site.
     pub fn longCtxGated(self: *const ModelConfig) bool {
+        if (self.plugin) |b| if (b.parsed.caps.long_ctx) return true;
         return self.isQwen4();
     }
 
@@ -1398,13 +1405,13 @@ pub const ModelConfig = struct {
     /// Says nothing about MoE/hybrid archs that merely share the same
     /// forward — those stay serial, by name, in both callers.
     pub fn supportsBatchedGdnDecode(self: *const ModelConfig) bool {
+        // A served model says so itself; its recurrent state rides the row-axis tick.
+        if (self.plugin) |b| return b.parsed.caps.batches_decode and b.parsed.cache.ssm_state.entries > 0;
         // MiMo: attention + row-generic MoE with no per-slot recurrent state to merge.
         if (self.isMimo()) return true;
         // GLM-5-Next: a batched tick's tokens ride as rows of one window; each slot's KDA state and
         // DSA cache are advanced by its own call (`Transformer.forwardGlmBatchedDecode`).
         if (self.isGlm5()) return true;
-        // Flint: MiMo's shape (sinks, sliding + full attention, row-generic MoE), per-slot views in `lagunaAttnWith`.
-        if (std.mem.eql(u8, self.model_type, "flint")) return true;
         if (self.full_attention_interval == 0) return false; // not a GDN trunk
         if (self.has_hybrid_layers) return false; // lfm2 / nemotron_h
         if (self.is_encoder_only) return false;
@@ -1414,7 +1421,6 @@ pub const ModelConfig = struct {
         if (self.isInkling() or self.isMla() or self.isGemma4Layers()) return false;
         if (self.isDiffusion()) return false;
         if (self.kda_vector_gate) return false; // bailing KDA: its own gate shape
-        if (std.mem.eql(u8, self.model_type, "laguna")) return false;
         if (std.mem.eql(u8, self.model_type, "deepseek_v4")) return false;
         return true;
     }
@@ -1560,6 +1566,12 @@ pub const ModelConfig = struct {
         // The checkpoint's own declared default outranks the arch allowlist:
         // it is the model author speaking, not our guess about the family.
         if (self.gen_enable_thinking) |v| return v;
+        if (self.plugin) |b| switch (b.parsed.chat.thinking_default) {
+            .unset => {},
+            .off => return false,
+            .on => return true,
+            .on_with_tools => return has_tools,
+        };
         // muse_glimmer: tool turns keep thinking (a tool call is a `to=<fn>`
         // header, so the recipient must stay free and the reasoning is
         // delivered rather than paid-and-dropped). A plain chat request
@@ -1751,6 +1763,8 @@ pub const ModelConfig = struct {
         self.pack_dir = null;
         if (self.drafter_override) |p| allocator.free(p);
         self.drafter_override = null;
+        if (self.plugin) |b| b.destroy(allocator);
+        self.plugin = null;
     }
 };
 
@@ -1765,6 +1779,15 @@ fn declaresExpertStreaming(allocator: std.mem.Allocator, content: []const u8) bo
 }
 
 pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
+    return parseConfigWith(io, allocator, model_dir, true);
+}
+
+/// The legacy parse alone, for an engine that runs its own forward over the config's every field (the ANE).
+pub fn parseConfigLegacy(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !ModelConfig {
+    return parseConfigWith(io, allocator, model_dir, false);
+}
+
+fn parseConfigWith(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, served: bool) !ModelConfig {
     const content = (try mlx_gguf.sidecar(io, allocator, model_dir, .config)) orelse blk: {
         const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{model_dir});
         defer allocator.free(path);
@@ -1778,7 +1801,16 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
     };
     defer allocator.free(content);
 
-    var config = try parseConfigFromJson(allocator, content);
+    // A served pack's engine config is the legacy parse with the plugin's binding attached, so every engine read
+    // (bills, cache sizing, batching, sampling and thinking defaults) stays as it was; the plugin's facts alone
+    // only for a type the legacy parse cannot read.
+    const binding = if (served) try plugin_config.bindServed(io, allocator, model_dir, content) else null;
+    errdefer if (binding) |b| b.destroy(allocator);
+    var config = parseConfigFromJson(allocator, content) catch |e| {
+        const b = binding orelse return e;
+        log.info("[plugin] {s}: the legacy parse refused {s} ({s}); the engine config is the plugin's facts\n", .{ b.table.name.slice(), b.parsed.shell.model_type.slice(), @errorName(e) });
+        return plugin_config.adapted(b);
+    };
     errdefer config.deinit(allocator);
     if (config.isDsv41()) {
         config.pack_dir = try allocator.dupe(u8, model_dir);
@@ -1945,6 +1977,7 @@ pub fn parseConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []const 
         log.info("[vision] EmbeddingGemma 2 processors: {d} soft tokens per image, {d} per video frame, at most {d} frames\n", .{ config.gv_image_tokens, config.gv_video_tokens, config.gv_video_frames });
     }
 
+    config.plugin = binding;
     return config;
 }
 
@@ -2152,7 +2185,7 @@ var gdn_state_f32_env: ?bool = null;
 fn gdnStateF32Enabled() bool {
     if (gdn_state_f32_override) |v| return v;
     if (gdn_state_f32_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_GDN_STATE_F32");
+    const raw = env.get(.MLX_SERVE_GDN_STATE_F32);
     const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     gdn_state_f32_env = on;
     return on;
@@ -2425,7 +2458,7 @@ pub fn getConfigOverrides() ?[]const u8 {
 /// `_apply_dict_overrides` — and anything else replaces. The whole merge lives
 /// in an arena that dies before this returns; only the re-serialized bytes (in
 /// `allocator`) escape.
-fn mergeConfigJson(allocator: std.mem.Allocator, base: []const u8, overrides: []const u8) ![]const u8 {
+pub fn mergeConfigJson(allocator: std.mem.Allocator, base: []const u8, overrides: []const u8) ![]const u8 {
     var arena = std.heap.ArenaAllocator.init(allocator);
     defer arena.deinit();
     const a = arena.allocator();
@@ -2508,8 +2541,7 @@ fn refuseUnconvertedMimo(cfg_obj: std.json.ObjectMap) !void {
 /// A Sushi pack's `expert_quant` makes its routed experts EXL3 banks.
 fn parseSushiExperts(root: std.json.ObjectMap, config: *ModelConfig) !void {
     if (jsonField(root, "expert_quant") == null) return;
-    config.exl3 = try sushi_exl3.parseExpertQuant(root);
-    try sushi_exl3.admitTopK(config.num_experts_per_tok);
+    config.exl3 = try exl3.parse(root, config.num_experts_per_tok);
 }
 
 pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !ModelConfig {
@@ -3269,8 +3301,7 @@ pub fn parseConfigFromJson(allocator: std.mem.Allocator, content: []const u8) !M
         }
         try validateQwen4Config(&config);
         if (jsonField(root, "expert_quant") != null) {
-            config.exl3 = try sushi_exl3.parseExpertQuant(root);
-            try sushi_exl3.admitTopK(config.num_experts_per_tok);
+            config.exl3 = try exl3.parse(root, config.num_experts_per_tok);
         }
     } else if (std.mem.eql(u8, model_type, "qwen3_moe") or
         std.mem.eql(u8, model_type, "qwen3_moe_text"))
@@ -5471,7 +5502,7 @@ test "f16 1-D tables narrow to bf16 on Metal and CUDA, not on Vulkan" {
 fn narrow1dEnabled() bool {
     if (narrow_1d_env) |v| return v;
     const on = blk: {
-        const raw = std.c.getenv("MLX_SERVE_F16_NARROW_1D") orelse
+        const raw = env.get(.MLX_SERVE_F16_NARROW_1D) orelse
             break :blk narrow1dDefault(builtin.os.tag.isDarwin(), mlx.cudaAvailable());
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
@@ -5970,6 +6001,8 @@ pub fn shouldKeepWeightKey(key: []const u8, load_vision: bool) bool {
     // mlx-community re-nest drops that prefix (its bare "vision_tower." already
     // rides the is_vision gate above). Both follow --no-vision.
     if (!load_vision and (std.mem.startsWith(u8, key, "model.vision_tower.") or
+        // LFM2-VL's HF nesting puts the projector one level above its tower.
+        std.mem.startsWith(u8, key, "model.multi_modal_projector.") or
         std.mem.startsWith(u8, key, "model.vision_adapter.") or
         std.mem.startsWith(u8, key, "model.vision_projection.") or
         std.mem.startsWith(u8, key, "vision_adapter.") or
@@ -7220,7 +7253,7 @@ test "ModelConfig: a Sushi pack's expert_quant selects EXL3 experts on mimo_v2 a
     const eq = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\",\"window\":14},";
     const glm = try parseConfigFromJson(testing.allocator, eq ++ glm5_next_pack_json[1..]);
     try testing.expectEqual(@as(u32, 40), glm.exl3.?.rate.n);
-    try testing.expectEqual(sushi_exl3.format.Window.w14, glm.exl3.?.window);
+    try testing.expectEqual(exl3.Window.w14, glm.exl3.?.window);
     try testing.expect((try parseConfigFromJson(testing.allocator, glm5_next_pack_json)).exl3 == null);
 
     // The pack's `quant_method: fp8` names its trunk, so the release refusal does not fire.
@@ -7234,7 +7267,7 @@ test "ModelConfig: a Sushi pack's expert_quant selects EXL3 experts on mimo_v2 a
     defer testing.allocator.free(with_eq);
     const mimo = try parseConfigFromJson(testing.allocator, with_eq);
     try testing.expect(mimo.isMimo());
-    try testing.expectEqual(sushi_exl3.format.Codebook.mcg, mimo.exl3.?.codebook);
+    try testing.expectEqual(exl3.Codebook.mcg, mimo.exl3.?.codebook);
     try testing.expectError(error.UnconvertedMimoCheckpoint, parseConfigFromJson(testing.allocator, fp8));
 }
 
@@ -8429,7 +8462,8 @@ test "parseConfig: an EmbeddingGemma 2 directory's processor_config.json sets th
     });
     var path_buf: [512]u8 = undefined;
     const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-    const config = try parseConfig(io, testing.allocator, path);
+    var config = try parseConfig(io, testing.allocator, path);
+    defer config.deinit(testing.allocator);
     try testing.expectEqual(@as(u32, 560), config.gv_image_tokens);
     try testing.expectEqual(@as(u32, 140), config.gv_video_tokens);
     try testing.expectEqual(@as(u32, 16), config.gv_video_frames);
@@ -10327,7 +10361,7 @@ test "parseConfigFromJson: a Sushi qwen4_exp pack's expert_quant selects EXL3 ba
     const c = try parseConfigFromJson(testing.allocator, eq ++ QWEN4_SHIPPED[1..]);
     try testing.expect(c.exl3 != null);
     try testing.expectEqual(@as(u32, 32), c.exl3.?.rate.n);
-    try testing.expectEqual(sushi_exl3.format.Codebook.mcg, c.exl3.?.codebook);
+    try testing.expectEqual(exl3.Codebook.mcg, c.exl3.?.codebook);
     try testing.expect((try parseConfigFromJson(testing.allocator, QWEN4_SHIPPED)).exl3 == null);
     const bad = "{\"expert_quant\":{\"format\":\"exl3\",\"k\":2,\"codebook\":\"mul2\"},";
     try testing.expectError(error.ExpertLayoutUnsupported, parseConfigFromJson(testing.allocator, bad ++ QWEN4_SHIPPED[1..]));
@@ -10698,7 +10732,7 @@ test "unmarked embedded qwen4 defers norm convention until weights load" {
 }
 
 test "local oQ Qwen4 metadata defers convention until loaded weights" {
-    const raw = std.c.getenv("QWEN4_EMBEDDED_TEST_MODEL") orelse return error.SkipZigTest;
+    const raw = env.get(.QWEN4_EMBEDDED_TEST_MODEL) orelse return error.SkipZigTest;
     const path = std.mem.span(raw);
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try parseConfig(io, testing.allocator, path);
@@ -10716,7 +10750,7 @@ test "Qwen4 norm global override is rejected independently of the checkpoint mar
 }
 
 test "local legacy Qwen4 metadata keeps external folded default" {
-    const raw = std.c.getenv("QWEN4_EXTERNAL_TEST_MODEL") orelse return error.SkipZigTest;
+    const raw = env.get(.QWEN4_EXTERNAL_TEST_MODEL) orelse return error.SkipZigTest;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try parseConfig(io, testing.allocator, std.mem.span(raw));
     defer config.deinit(testing.allocator);
@@ -10726,8 +10760,8 @@ test "local legacy Qwen4 metadata keeps external folded default" {
 }
 
 test "Qwen4 norm selection stays checkpoint-local across mixed model loads" {
-    const raw = std.c.getenv("QWEN4_EMBEDDED_TEST_MODEL") orelse return error.SkipZigTest;
-    const legacy = std.c.getenv("QWEN4_EXTERNAL_TEST_MODEL") orelse return error.SkipZigTest;
+    const raw = env.get(.QWEN4_EMBEDDED_TEST_MODEL) orelse return error.SkipZigTest;
+    const legacy = env.get(.QWEN4_EXTERNAL_TEST_MODEL) orelse return error.SkipZigTest;
     const paths = [_][]const u8{ std.mem.span(raw), std.mem.span(legacy) };
     const io = std.Io.Threaded.global_single_threaded.io();
     for ([_]usize{ 0, 1, 1, 0 }) |i| {

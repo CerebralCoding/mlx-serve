@@ -2,6 +2,7 @@
 //! Owns qmatmul, lmHeadProject, quantParamsFor, quantParamsHinted, qmatmulAddBias, qmatmulMaybeBias, and 8 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const qmv2 = @import("../qmm/qmv2.zig");
 const qmv_cuda = @import("../qmm/qmv_cuda.zig");
@@ -188,7 +189,7 @@ var simd_qmm_decode_env: ?c_int = null;
 /// bound (batched decode widths). N comes from `simdQmmDecodeMinRows`.
 fn simdQmmDecode(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) !?mlx.mlx_array {
     const min_rows = simd_qmm_decode_env orelse blk: {
-        const v = simdQmmDecodeMinRows(std.c.getenv("MLX_SERVE_SIMD_QMM_DECODE"), verifyQmmTile());
+        const v = simdQmmDecodeMinRows(env.get(.MLX_SERVE_SIMD_QMM_DECODE), verifyQmmTile());
         simd_qmm_decode_env = v;
         if (v > 0) log.info("[simd_qmm] batched projections of {d}..{d} rows\n", .{ v, simd_qmm.MAX_ROWS });
         break :blk v;
@@ -691,7 +692,7 @@ test "spec-verify width sweep µbench (MLX_SERVE_VERIFY_WIDTH_UBENCH=1)" {
     // above it the 32x32-tiled qmm_splitk runs (compute-bound, and a width of
     // 16 wastes half the 32-row tile). The limit is a per-shape number, so the
     // cliff is what this prints — a whole-model per-round estimate at each M.
-    if (std.c.getenv("MLX_SERVE_VERIFY_WIDTH_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MLX_SERVE_VERIFY_WIDTH_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();

@@ -1,5 +1,5 @@
 //! MiniMax Music 3 — hierarchical autoregressive text-to-music engine
-//! (`.audio` modality, `music3` arm of gen.AudioBackend).
+//! (`.audio` modality, served by plugin.zig).
 //!
 //! NOT an ACE-Step variant: the LLM's HIDDEN STATES (not tokens) drive a
 //! flow-matching decoder. Pipeline (minimax_music_engine_plan.md; reference =
@@ -34,6 +34,9 @@ const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
 const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
 const wav_mod = @import("../../sdk/media/wav.zig");
 const sse = @import("../../host/media_jobs/sse.zig");
+const config_fields = @import("../../sdk/media/config_fields.zig");
+const ops = @import("../../mlx/ops.zig");
+const snake_block = @import("../../sdk/blocks/vae/snake.zig");
 
 const S = mlx.mlx_stream;
 const Weights = model_mod.Weights;
@@ -71,6 +74,32 @@ pub const Cfg = struct {
     dit_fourier: u32 = 256,
     dit_rope_theta: f32 = 10000.0,
 };
+
+/// config.json sections and keys → `Cfg` fields; an omitted key keeps the published value.
+const cfg_keys = .{
+    .{ "", .{ .{ "max_frames", "max_frames_cap" }, .{ "max_text_tokens", "max_text_tokens" }, .{ "num_codebooks", "num_codebooks" }, .{ "semantic_vocab_size", "semantic_vocab" }, .{ "audio_vocab_size", "audio_vocab" }, .{ "sample_rate", "sample_rate" } } },
+    .{ "language_model", .{ .{ "hidden_size", "lm_hidden" }, .{ "num_hidden_layers", "lm_layers" }, .{ "num_attention_heads", "lm_heads" }, .{ "num_key_value_heads", "lm_kv_heads" }, .{ "head_dim", "lm_head_dim" }, .{ "vocab_size", "lm_vocab" }, .{ "rms_norm_eps", "eps" }, .{ "rope_theta", "lm_rope_theta" } } },
+    .{ "rvq_depth_decoder", .{ .{ "num_attention_heads", "dd_heads" }, .{ "num_layers", "dd_layers" } } },
+    .{ "transformer", .{ .{ "num_layers", "dit_layers" }, .{ "num_attention_heads", "dit_heads" }, .{ "attention_head_dim", "dit_head_dim" }, .{ "hidden_size", "dit_hidden" }, .{ "in_channels", "dit_in_ch" }, .{ "condition_dim", "dit_cond" }, .{ "fourier_embedding_dim", "dit_fourier" }, .{ "rotary_dim", "dit_rotary" } } },
+};
+
+/// The pipeline geometry from config.json. Fixed by the engine: 8 codebooks, 128 latent channels (the vocoder folds
+/// them into two 64-channel streams), 256 Fourier features; the vocabulary must hold the semantic codes past
+/// `CODE_OFFSET`, and both code books must be at least the sampler's top-k.
+pub fn parseCfg(allocator: std.mem.Allocator, json_text: []const u8) !Cfg {
+    var c = Cfg{};
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return error.BadPackConfig;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadPackConfig;
+    inline for (cfg_keys) |sec| {
+        const obj = if (sec[0].len == 0) parsed.value.object else try config_fields.section(parsed.value.object, sec[0]);
+        try config_fields.fill(Cfg, sec[1], obj, &c);
+    }
+    if (c.num_codebooks != 8 or c.dit_in_ch != 128 or c.dit_fourier != 256 or c.lm_heads % c.lm_kv_heads != 0 or
+        c.lm_hidden % c.dd_heads != 0 or c.dit_rotary > c.dit_head_dim or @as(u64, c.lm_vocab) < CODE_OFFSET + @as(u64, c.semantic_vocab) or
+        c.semantic_vocab < TOP_K or c.audio_vocab < TOP_K) return error.BadPackConfig;
+    return c;
+}
 
 pub const AUDIO_END: i32 = 151670;
 pub const AUDIO_CFG_TOKEN: i32 = 151654;
@@ -1730,8 +1759,8 @@ fn ditForward(e: *const Engine, allocator: std.mem.Allocator, lats: mlx.mlx_arra
     const nh: c_int = @intCast(cfg.dit_heads);
     const hd: c_int = @intCast(cfg.dit_head_dim);
     const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.dit_head_dim)));
-    const ff: c_int = 8192;
     for (e.dit_bw, 0..) |*bw, li| {
+        const ff: c_int = @intCast(bw.ff_in.rows() / 2);
         const n1 = try layerNorm(h, bw.n1w, bw.n1b, 1e-5, s);
         defer _ = mlx.mlx_array_free(n1);
         const q = try bw.q.forward(n1, s);
@@ -1827,23 +1856,12 @@ fn ditVelocity(e: *const Engine, allocator: std.mem.Allocator, latents: mlx.mlx_
 // All f32.
 // ════════════════════════════════════════════════════════════════════════
 
-/// x + 1/(alpha + 1e-9) * sin(alpha*x)^2, alpha [C] over NLC channels-last.
+/// sdk's alpha-only `snake` (epsilon in α's dtype), alpha [C] over NLC channels-last.
 fn snakeA(e: *const Engine, a: std.mem.Allocator, x: mlx.mlx_array, prefix: []const u8, s: S) !mlx.mlx_array {
     const alpha = try getW(&e.voc_w, try std.fmt.allocPrint(a, "{s}.alpha", .{prefix}));
-    const ax = try mulA(x, alpha, s);
-    defer _ = mlx.mlx_array_free(ax);
-    var sn = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sn);
-    try mlx.check(mlx.mlx_sin(&sn, ax, s));
-    const sq = try mulA(sn, sn, s);
-    defer _ = mlx.mlx_array_free(sq);
-    const eps_c = try scalarLike(alpha, 1e-9, s);
-    defer _ = mlx.mlx_array_free(eps_c);
-    const aeps = try addA(alpha, eps_c, s);
-    defer _ = mlx.mlx_array_free(aeps);
-    const frac = try divA(sq, aeps, s);
-    defer _ = mlx.mlx_array_free(frac);
-    return addA(x, frac, s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    return g.escape(try snake_block.snake(&g, x, alpha, mlx.mlx_array_dtype(alpha)));
 }
 
 fn vocResUnit(e: *const Engine, a: std.mem.Allocator, x: mlx.mlx_array, prefix: []const u8, dilation: c_int, s: S) !mlx.mlx_array {
@@ -1987,7 +2005,8 @@ pub const Engine = struct {
         self.allocator = allocator;
         self.io = io;
         self.s = mlx.mlx_default_gpu_stream_new();
-        self.cfg = Cfg{}; // single-member family; converted config mirrors these
+        var cfg_buf: [64 * 1024]u8 = undefined;
+        self.cfg = try parseCfg(allocator, try config_fields.read(io, &cfg_buf, model_dir, "config.json"));
 
         self.lm_w = try loadFileWeights(allocator, model_dir, "language_model.safetensors");
         errdefer self.lm_w.deinit();
@@ -2358,6 +2377,7 @@ pub const Engine = struct {
         defer allocator.free(starts);
         const n_chunks: u32 = @intCast(starts.len);
         const hidden_w: c_int = @intCast(self.cfg.num_codebooks * self.cfg.lm_hidden);
+        const cd: c_int = @intCast(self.cfg.dit_cond);
 
         var samples: std.ArrayList(f32) = .empty;
         errdefer samples.deinit(allocator);
@@ -2386,9 +2406,9 @@ pub const Engine = struct {
             var overlap: c_int = 0;
             if (prev_latent) |pl| {
                 overlap = @min(mlx.getShape(pl)[1], l_len);
-                const pc_slice = try sliceA(prev_cond.?, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ 1, overlap, 2048 }, s);
+                const pc_slice = try sliceA(prev_cond.?, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ 1, overlap, cd }, s);
                 defer _ = mlx.mlx_array_free(pc_slice);
-                const spliced = try sliceUpdateA(cond, pc_slice, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ 1, overlap, 2048 }, s);
+                const spliced = try sliceUpdateA(cond, pc_slice, &[_]c_int{ 0, 0, 0 }, &[_]c_int{ 1, overlap, cd }, s);
                 _ = mlx.mlx_array_free(cond);
                 cond = spliced;
             }
@@ -2461,7 +2481,7 @@ pub const Engine = struct {
                 const pl_view = try sliceA(latents, &[_]c_int{ 0, c_start, 0 }, &[_]c_int{ 1, c_end, 128 }, s);
                 defer _ = mlx.mlx_array_free(pl_view);
                 prev_latent = try materialize(pl_view, s);
-                const pc_view = try sliceA(cond, &[_]c_int{ 0, c_start, 0 }, &[_]c_int{ 1, c_end, 2048 }, s);
+                const pc_view = try sliceA(cond, &[_]c_int{ 0, c_start, 0 }, &[_]c_int{ 1, c_end, cd }, s);
                 defer _ = mlx.mlx_array_free(pc_view);
                 prev_cond = try materialize(pc_view, s);
             }
@@ -3294,4 +3314,25 @@ test "music3 DiT: the w8a8 route stays within its bar of the packed forward" {
     try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.02);
     const dir = std.mem.span(std.c.getenv("MUSIC3_TEST_MODEL").?);
     try w8a8.expectBilled(packed_bytes, int8_bytes, try w8a8.billedDelta(io, dir, &.{"transformer.safetensors"}));
+}
+
+test "music3 config: the published config.json is the default geometry; a fixed dimension is refused" {
+    const a = testing.allocator;
+    const published =
+        \\{"model_type":"minimax_music3","quant":"8bit","group_size":64,"frame_rate":25.0,"latent_rate":86.1328125,
+        \\ "sample_rate":44100,"max_frames":9000,"max_text_tokens":5000,"num_codebooks":8,"semantic_vocab_size":16384,
+        \\ "audio_vocab_size":1024,
+        \\ "language_model":{"hidden_size":4096,"num_hidden_layers":36,"num_attention_heads":32,"num_key_value_heads":8,
+        \\   "head_dim":128,"intermediate_size":12288,"vocab_size":200000,"rms_norm_eps":1e-06,"rope_theta":1000000,
+        \\   "max_position_embeddings":10240},
+        \\ "rvq_depth_decoder":{"hidden_size":4096,"intermediate_size":6144,"num_attention_heads":16,"num_layers":4,
+        \\   "max_position_embeddings":16},
+        \\ "transformer":{"num_layers":36,"num_attention_heads":32,"attention_head_dim":64,"hidden_size":2048,
+        \\   "ff_inner_dim":8192,"in_channels":128,"condition_dim":2048,"fourier_embedding_dim":256,"rotary_dim":32},
+        \\ "condition_encoder":{"condition_hidden_dim":4096,"out_dim":2048,"num_condition_layers":8},
+        \\ "vocoder":{"latent_channels":128,"decoder_input_dim":1024,"decoder_hidden_dim":1536,"upsampling_ratios":[8,8,4,2]}}
+    ;
+    try testing.expectEqualDeep(Cfg{}, try parseCfg(a, published));
+    try testing.expectError(error.BadPackConfig, parseCfg(a, "{\"num_codebooks\":4}"));
+    try testing.expectError(error.BadPackConfig, parseCfg(a, "{\"transformer\":{\"in_channels\":64}}"));
 }

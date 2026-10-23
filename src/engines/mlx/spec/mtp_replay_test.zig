@@ -7,6 +7,7 @@
 //! index than the trace did lands it with the probabilities in `hitProb`.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const testing = std.testing;
 const generate = @import("../generate.zig");
 const round_cost = @import("round_cost.zig");
@@ -292,7 +293,7 @@ pub const Controller = struct {
 };
 
 fn reportEnabled() bool {
-    return std.c.getenv("MTP_REPLAY_REPORT") != null;
+    return env.get(.MTP_REPLAY_REPORT) != null;
 }
 
 fn report(comptime fmt: []const u8, args: anytype) void {

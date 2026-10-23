@@ -12,6 +12,9 @@ const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
+const bill = @import("w8a8_bill.zig");
+
+pub const converted = bill.converted;
 
 pub const BLOCK: c_int = 256;
 
@@ -40,13 +43,8 @@ pub fn nax() bool {
 /// rotation block, N a multiple of the store tile's width.
 pub fn eligible(k: u32, n: u32) bool {
     if (!enabled) return false;
-    if (k % @as(u32, @intCast(BLOCK)) != 0 or n % 64 != 0) return false;
-    return nax();
+    return bill.shapeEligible(k, n) and nax();
 }
-
-/// Group size read for quantized weights when billing: every shipped media pack is g64
-/// (another group mis-bills K by the ratio).
-const BILL_GROUP: u64 = 64;
 
 /// Bytes a DiT shard holds once resident under this route: the file's, with each
 /// linear the loaders convert (`converted`, and `eligible`) re-billed at its int8
@@ -65,65 +63,7 @@ pub fn residentBytes(io: std.Io, dir: std.Io.Dir, name: []const u8) ?u64 {
     if (len > 64 << 20) return null;
     const hdr = a.alloc(u8, @intCast(len)) catch return null;
     rs.interface.readSliceAll(hdr) catch return null;
-    const h = std.json.parseFromSliceLeaky(std.json.Value, a, hdr, .{}) catch return null;
-    if (h != .object) return null;
-    var total: u64 = 8 + len;
-    var it = h.object.iterator();
-    while (it.next()) |e| {
-        const key = e.key_ptr.*;
-        if (std.mem.eql(u8, key, "__metadata__")) continue;
-        if (std.mem.endsWith(u8, key, ".weight")) {
-            total += int8Bytes(h.object, key, a) orelse tensorBytes(e.value_ptr.*);
-        } else if (std.mem.endsWith(u8, key, ".scales") or std.mem.endsWith(u8, key, ".biases")) {
-            const base = std.fmt.allocPrint(a, "{s}.weight", .{key[0 .. key.len - 7]}) catch return null;
-            if (int8Bytes(h.object, base, a) == null) total += tensorBytes(e.value_ptr.*);
-        } else total += tensorBytes(e.value_ptr.*);
-    }
-    return total;
-}
-
-/// The block attention and MLP linears of every DiT the loaders convert (Krea `blocks.N.attn.wq`,
-/// Qwen-Image and MageFlow `transformer_blocks.N.img_mlp...`, H3 `blocks.N.mlp.fc1` and its token
-/// refiner, FLUX.2 `transformer_blocks.N.ff.linear_in` and `single_transformer_blocks.N.attn.to_out`,
-/// LTX `transformer.transformer_blocks.N.audio_attn1.to_q`);
-/// modulation, embedders and Krea's text-fusion stack stay packed.
-pub fn converted(name: []const u8) bool {
-    const stacks = [_][]const u8{ "blocks.", "transformer_blocks.", "single_transformer_blocks.", "transformer.transformer_blocks.", "token_refiner.blocks.", "decoder.layers." };
-    const in_stack = for (stacks) |p| {
-        if (std.mem.startsWith(u8, name, p)) break true;
-    } else false;
-    if (!in_stack) return false;
-    const stems = [_][]const u8{ "attn", ".mlp.", ".img_mlp.", ".txt_mlp.", ".ff.", "_ff.", ".ff_context.", ".ff_", ".shared.", ".skip." };
-    for (stems) |t| if (std.mem.indexOf(u8, name, t) != null) return true;
-    return false;
-}
-
-fn tensorBytes(v: std.json.Value) u64 {
-    const off = (if (v == .object) v.object.get("data_offsets") else null) orelse return 0;
-    if (off != .array or off.array.items.len != 2 or off.array.items[0] != .integer or off.array.items[1] != .integer) return 0;
-    return @intCast(@max(off.array.items[1].integer - off.array.items[0].integer, 0));
-}
-
-fn shape2(v: std.json.Value) ?[2]u64 {
-    const sh = (if (v == .object) v.object.get("shape") else null) orelse return null;
-    if (sh != .array or sh.array.items.len != 2) return null;
-    for (sh.array.items) |d| if (d != .integer or d.integer <= 0) return null;
-    return .{ @intCast(sh.array.items[0].integer), @intCast(sh.array.items[1].integer) };
-}
-
-/// The int8 copy's bytes for the 2-D weight `wkey` when the loaders would convert it.
-fn int8Bytes(h: std.json.ObjectMap, wkey: []const u8, a: std.mem.Allocator) ?u64 {
-    if (!converted(wkey)) return null;
-    const w = h.get(wkey) orelse return null;
-    const wsh = shape2(w) orelse return null;
-    const skey = std.fmt.allocPrint(a, "{s}.scales", .{wkey[0 .. wkey.len - 7]}) catch return null;
-    const k: u64 = if (h.get(skey)) |sc| (shape2(sc) orelse return null)[1] * BILL_GROUP else blk: {
-        const dt = (if (w == .object) w.object.get("dtype") else null) orelse return null;
-        if (dt != .string or !(std.mem.eql(u8, dt.string, "BF16") or std.mem.eql(u8, dt.string, "F16") or std.mem.eql(u8, dt.string, "F32"))) return null;
-        break :blk wsh[1];
-    };
-    if (!eligible(@intCast(k), @intCast(wsh[0]))) return null;
-    return wsh[0] * k + 4 * wsh[0];
+    return bill.residentFromHeader(a, hdr, eligible);
 }
 
 pub const Weight = struct {
@@ -447,7 +387,7 @@ var signs_cache: std.AutoHashMapUnmanaged(SignsKey, mlx.mlx_array) = .{};
 /// The fixed ±1 vector of length `k` both sides of a linear are rotated with.
 /// Deterministic (splitmix64 of the index) so a weight converted at load and an
 /// activation rotated at run time always agree.
-fn signsFor(k: c_int, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn signsFor(k: c_int, dt: mlx.mlx_dtype, s: mlx.mlx_stream) !mlx.mlx_array {
     const key = SignsKey{ .k = k, .dt = dt };
     if (signs_cache.get(key)) |a| return a;
     const buf = try std.heap.c_allocator.alloc(f32, @intCast(k));
@@ -472,25 +412,25 @@ fn splitmix64(i: usize) u64 {
 
 // ── kernels ──
 
-const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
+pub const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
 
 /// One threadgroup (8 simdgroups) per row; lane l of a simdgroup holds elements
 /// l*8 .. l*8+7 of each 256-block, so the 256-point transform is three
 /// in-register butterfly stages and five shuffle stages. The row's amax reduces
 /// across the threadgroup before anything is written.
-const RQ_SOURCE = kernelSource("kernels/dit/w8a8_rq.metal");
+pub const RQ_SOURCE = kernelSource("kernels/dit/w8a8_rq.metal");
 
 /// A BM x BN output tile per threadgroup (four simdgroups share one tensor op),
 /// K stepped by 64, tiles row-major. The epilogue follows (`EPI_*`).
-const GEMM_BODY = kernelSource("kernels/dit/w8a8_gemm_body.metal");
+pub const GEMM_BODY = kernelSource("kernels/dit/w8a8_gemm_body.metal");
 
 /// Full tiles store through the destination tensor; an edge tile stores
 /// element by element, since the tensor store does not clip.
-const EPI_PLAIN = kernelSource("kernels/dit/w8a8_epi_plain.metal");
+pub const EPI_PLAIN = kernelSource("kernels/dit/w8a8_epi_plain.metal");
 
 /// `silu(gate) * up` on a weight whose rows interleave (gate j, up j): a thread
 /// holds runs of four consecutive columns of one row, i.e. two whole pairs.
-const EPI_SWIGLU = kernelSource("kernels/dit/w8a8_epi_swiglu.metal");
+pub const EPI_SWIGLU = kernelSource("kernels/dit/w8a8_epi_swiglu.metal");
 
 var rq_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gemm_kernel: ?mlx.mlx_fast_metal_kernel = null;

@@ -3,6 +3,7 @@
 // potential issues with C++ headers and keep the dependency surface explicit.
 
 const std = @import("std");
+const env = @import("../env.zig");
 const crt = @import("../sdk/util/crt.zig");
 const os_mutex = @import("../sdk/util/os_mutex.zig");
 const builtin = @import("builtin");
@@ -119,12 +120,12 @@ pub fn cudaDllSearchPath(buf: []u8, cuda_path: []const u8, path: []const u8) ?[:
 /// Windows: the installed toolkit's DLLs (CUDA_PATH) go first on PATH before any CUDA DLL loads, so
 /// llama.cpp's ggml-cuda binds the cuBLAS MLX uses: two copies in one process leave one engine on CPU.
 fn exportCudaDllPath() void {
-    const cuda = std.c.getenv("CUDA_PATH") orelse return;
+    const cuda = env.get(.CUDA_PATH) orelse return;
     if (cuda[0] == 0) return; // an empty value would put the drive root's \bin first on PATH
-    const path = std.c.getenv("PATH") orelse "";
+    const path = env.get(.PATH) orelse "";
     const buf = std.heap.page_allocator.alloc(u8, 64 * 1024) catch return;
     defer std.heap.page_allocator.free(buf);
-    if (cudaDllSearchPath(buf, std.mem.span(cuda), std.mem.span(path))) |p| crt.setEnv("PATH", p.ptr);
+    if (cudaDllSearchPath(buf, std.mem.span(cuda), std.mem.span(path))) |p| env.set(.PATH, p.ptr);
 }
 
 /// Export CUDA_HOME before MLX compiles its first kernel (see cudaHomeDefault); on Windows the
@@ -132,13 +133,13 @@ fn exportCudaDllPath() void {
 pub fn exportCudaHome() void {
     if (comptime builtin.os.tag == .windows) return exportCudaDllPath();
     if (comptime builtin.os.tag != .linux) return;
-    const env_set = std.c.getenv("CUDA_HOME") != null or std.c.getenv("CUDA_PATH") != null;
+    const env_set = env.get(.CUDA_HOME) != null or env.get(.CUDA_PATH) != null;
     const has = struct {
         fn headers(comptime root: []const u8) bool {
             return std.c.access(root ++ "/include/cuda.h", 0) == 0;
         }
     };
-    if (cudaHomeDefault(env_set, has.headers("/usr/local/cuda"), has.headers("/opt/cuda"))) |home| crt.setEnv("CUDA_HOME", home);
+    if (cudaHomeDefault(env_set, has.headers("/usr/local/cuda"), has.headers("/opt/cuda"))) |home| env.set(.CUDA_HOME, home);
 }
 
 /// The CUDA kernel cache for one staged MLX build. MLX keys its PTX cache by module name under
@@ -160,12 +161,12 @@ pub fn stampId(buf: *[16]u8, stamp: []const u8) []const u8 {
 /// compiles its first kernel, unless set.
 pub fn exportPtxCacheDir(stamp: []const u8) void {
     if (comptime builtin.os.tag != .linux and builtin.os.tag != .windows) return;
-    if (std.c.getenv("MLX_PTX_CACHE_DIR") != null) return;
-    const tmp_env = if (comptime builtin.os.tag == .windows) std.c.getenv("TEMP") else std.c.getenv("TMPDIR");
+    if (env.get(.MLX_PTX_CACHE_DIR) != null) return;
+    const tmp_env = if (comptime builtin.os.tag == .windows) env.get(.TEMP) else env.get(.TMPDIR);
     const tmp = if (tmp_env) |t| std.mem.span(t) else "/tmp";
     var id_buf: [16]u8 = undefined;
     var buf: [4096]u8 = undefined;
-    if (ptxCacheDir(&buf, tmp, stampId(&id_buf, stamp))) |dir| crt.setEnv("MLX_PTX_CACHE_DIR", dir.ptr);
+    if (ptxCacheDir(&buf, tmp, stampId(&id_buf, stamp))) |dir| env.set(.MLX_PTX_CACHE_DIR, dir.ptr);
 }
 
 var cuda_cache: ?bool = null;
@@ -873,6 +874,7 @@ pub const fault = struct {
 const LATCH_FAULT_MSG = "injected latching mlx-c raise (test only)";
 var latch_remaining: u64 = 0;
 var latch_fired = false;
+var latch_msg: [:0]const u8 = LATCH_FAULT_MSG;
 
 fn latchFaultHit() bool {
     if (latch_remaining == 0) return false;
@@ -883,8 +885,13 @@ fn latchFaultHit() bool {
 }
 
 pub fn armLatchingFaultForTest(k: u64) void {
+    armLatchingFaultWithForTest(k, LATCH_FAULT_MSG);
+}
+/// The same, latching `msg` (a Metal OOM's text, to exercise the memory class).
+pub fn armLatchingFaultWithForTest(k: u64, msg: [:0]const u8) void {
     latch_remaining = k;
     latch_fired = false;
+    latch_msg = msg;
 }
 pub fn latchingFaultFiredForTest() bool {
     return latch_fired;
@@ -896,7 +903,7 @@ pub fn check(ret: c_int) !void {
     if (comptime builtin.is_test) {
         if (fault.hit()) return error.MlxError;
         if (latchFaultHit()) {
-            latchMlxError(LATCH_FAULT_MSG.ptr, null);
+            latchMlxError(latch_msg.ptr, null);
             return error.MlxError;
         }
     }
@@ -984,7 +991,7 @@ fn defaultDeviceInfoSize(key: [*:0]const u8) usize {
 /// model load or unload completes (and from the offline run path after load)
 /// so `fit` capacity tracks the live set. The caller logs the result.
 pub fn applyWiredPolicy() WiredPolicyResult {
-    const mode = WiredMode.fromEnv(if (std.c.getenv("MLX_SERVE_WIRED")) |p| std.mem.span(p) else null);
+    const mode = WiredMode.fromEnv(env.span(.MLX_SERVE_WIRED));
     if (noGpuBackend()) return .{ .mode = mode, .target = null };
     var prev: usize = 0;
     switch (mode) {
@@ -1006,7 +1013,7 @@ pub fn applyWiredPolicy() WiredPolicyResult {
             var active: usize = 0;
             _ = mlx_get_active_memory(&active);
             const slack_mb: usize = blk: {
-                const raw_c = std.c.getenv("MLX_SERVE_WIRED_SLACK_MB") orelse break :blk 64;
+                const raw_c = env.get(.MLX_SERVE_WIRED_SLACK_MB) orelse break :blk 64;
                 const raw = std.mem.span(raw_c);
                 break :blk std.fmt.parseInt(usize, raw, 10) catch 64;
             };
@@ -1135,8 +1142,8 @@ test "a custom CUDA kernel is written to MLX's kernel cache, so the next process
     defer _ = mlx_string_free(ver);
     try check(mlx_version(&ver));
     var dir_buf: [1024]u8 = undefined;
-    const dir_path = if (std.c.getenv("MLX_PTX_CACHE_DIR")) |d| std.mem.span(d) else try std.fmt.bufPrint(&dir_buf, "{s}/mlx/{s}/ptx", .{
-        if (std.c.getenv("TMPDIR")) |t| std.mem.span(t) else "/tmp", std.mem.span(mlx_string_data(ver)),
+    const dir_path = if (env.get(.MLX_PTX_CACHE_DIR)) |d| std.mem.span(d) else try std.fmt.bufPrint(&dir_buf, "{s}/mlx/{s}/ptx", .{
+        if (env.get(.TMPDIR)) |t| std.mem.span(t) else "/tmp", std.mem.span(mlx_string_data(ver)),
     });
     var dir = try std.Io.Dir.openDirAbsolute(io, dir_path, .{ .iterate = true });
     defer dir.close(io);
@@ -1314,7 +1321,7 @@ fn latchMlxError(msg: [*:0]const u8, data: ?*anyopaque) callconv(.c) void {
 /// Install the latching handler. Called once from `main()`. `MLX_SERVE_MLX_ERROR_LATCH=0`
 /// restores mlx-c's `exit(-1)` handler.
 pub fn installErrorHandler() void {
-    if (std.c.getenv("MLX_SERVE_MLX_ERROR_LATCH")) |p| {
+    if (env.get(.MLX_SERVE_MLX_ERROR_LATCH)) |p| {
         if (std.mem.eql(u8, std.mem.span(p), "0")) {
             log.info("[mlx] error latch disabled — an MLX error will exit the process\n", .{});
             return;
@@ -1389,7 +1396,7 @@ const FaultSite = struct {
     fn target(self: *FaultSite) u64 {
         if (self.at) |v| return v;
         var v: u64 = 0;
-        if (std.c.getenv(self.env.ptr)) |pz| {
+        if (env.byName(self.env.ptr)) |pz| {
             v = std.fmt.parseInt(u64, std.mem.span(pz), 10) catch 0;
         }
         self.at = v;
@@ -1403,7 +1410,7 @@ const FaultSite = struct {
         self.seen += 1;
         if (self.seen != t) return;
         self.at = 0;
-        const kind: []const u8 = if (std.c.getenv("MLX_SERVE_MLX_FAULT_KIND")) |p| std.mem.span(p) else "";
+        const kind: []const u8 = if (env.get(.MLX_SERVE_MLX_FAULT_KIND)) |p| std.mem.span(p) else "";
         latchErrorForTest(if (std.mem.eql(u8, kind, "cuda_lost")) FAULT_CUDA_LOST_MSG else self.msg);
     }
 
@@ -1566,7 +1573,7 @@ test "a sticky CUDA error marks the GPU context lost; any other error does not" 
 }
 
 test "fp quantized matmul on GB10: 8 rows equal each row alone, bit for bit, and no worse than the tiled kernel against f64 truth" {
-    if (!cudaAvailable() or std.c.getenv("MLX_CUDA_QMV_MAX_ROWS") != null) return error.SkipZigTest;
+    if (!cudaAvailable() or env.get(.MLX_CUDA_QMV_MAX_ROWS) != null) return error.SkipZigTest;
     if (cudaComputeCapability(.major) != 12 or cudaComputeCapability(.minor) != 1) return error.SkipZigTest;
     const s = gpuStream();
     const a = std.testing.allocator;

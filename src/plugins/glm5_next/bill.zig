@@ -1,4 +1,6 @@
-//! glm5PrefillMemoryNeeded
+//! GLM-5.3-Flash's prefill bill (`glm5PrefillMemoryNeeded`): prompt KV, the f32 KDA checkpoints and live state, one
+//! DSA layer's scratch and indexer pools, decode growth on the KV reserve's headroom. The engine's admission calls it
+//! until `Bill.prefill_bytes` carries max_tokens and the warm prefix.
 
 const std = @import("std");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");

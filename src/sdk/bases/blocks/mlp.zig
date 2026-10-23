@@ -6,6 +6,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
 const block = @import("../block.zig");
 const linear = @import("linear.zig");
+const row_exact = @import("row_exact.zig");
 const fused_act = @import("../../blocks/mlp/fused_activations.zig");
 const FUSED_ROWS_MAX_M = @import("../../blocks/linear/fused_rows.zig").FUSED_ROWS_MAX_M;
 
@@ -16,7 +17,7 @@ const Linear = linear.Linear;
 const Joined = linear.Joined;
 
 /// `silu(gate) * up`: one exact fused dispatch where it serves, else the two ops.
-fn swiglu(g: *Graph, gate: Array, up: Array) !Array {
+pub fn swiglu(g: *Graph, gate: Array, up: Array) !Array {
     if (try fused_act.fusedSwiGLU(g.s, gate, up)) |y| return g.adopt(y);
     var t = g.scope();
     defer t.deinit();
@@ -75,14 +76,15 @@ pub const GatedMlp = struct {
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
         const g = c.g;
-        if (w.gu.built() and rowsOf(x) <= FUSED_ROWS_MAX_M) {
-            const both = try w.gu.lin.forward(g, x);
+        const lane = c.row_exact;
+        if (w.gu.built() and row_exact.groupServes(lane, rowsOf(x))) {
+            const both = try row_exact.linear(lane, g, &w.gu.lin, x);
             if (w.gu.widths[0] == w.gu.widths[1]) {
-                if (try fused_act.swigluJoined(g.s, both)) |act| return w.down.forward(g, try g.adopt(act));
+                if (try fused_act.swigluJoined(g.s, both)) |act| return row_exact.linear(lane, g, &w.down, try g.adopt(act));
             }
-            return w.down.forward(g, try swiglu(g, try w.gu.part(g, both, 0), try w.gu.part(g, both, 1)));
+            return row_exact.linear(lane, g, &w.down, try swiglu(g, try w.gu.part(g, both, 0), try w.gu.part(g, both, 1)));
         }
-        return w.down.forward(g, try swiglu(g, try w.gate.forward(g, x), try w.up.forward(g, x)));
+        return row_exact.linear(lane, g, &w.down, try swiglu(g, try row_exact.linear(lane, g, &w.gate, x), try row_exact.linear(lane, g, &w.up, x)));
     }
 };
 
@@ -94,9 +96,9 @@ pub const ReluSq = struct {
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
         const g = c.g;
-        const up = try w.up.forward(g, x);
+        const up = try row_exact.linear(c.row_exact, g, &w.up, x);
         const relu = try g.maximum(up, try g.scalar(0, .bfloat16));
-        return w.down.forward(g, try g.square(relu));
+        return row_exact.linear(c.row_exact, g, &w.down, try g.square(relu));
     }
 };
 

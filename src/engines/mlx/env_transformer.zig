@@ -1,26 +1,23 @@
-//! engines/mlx/env_transformer, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns envFlagCached, diagEnvValueOn, diagEnvOn, diagEnvOnCached.
+//! Environment switches read by a run-time name, for the plugins that have not moved to `src/env.zig`'s
+//! accessors yet; each forwards to `env.byName`.
 
-const std = @import("std");
+const env = @import("../../env.zig");
 const testing = @import("kv/cache.zig").testing;
 
 /// PRESENCE semantics: `FOO=0` reads as ON. Never substitute this for
 /// `diagEnvOnCached` — a harness exporting `FOO=0` would arm the switch.
 pub fn envFlagCached(cache: *?bool, name: [*:0]const u8) bool {
     if (cache.*) |v| return v;
-    const v = std.c.getenv(name) != null;
+    const v = env.byName(name) != null;
     cache.* = v;
     return v;
 }
-/// The diagnostic-switch decision, split from the `getenv` so it is testable.
-pub fn diagEnvValueOn(raw: ?[*:0]const u8) bool {
-    const v = raw orelse return false;
-    return v[0] != '0';
-}
+/// The diagnostic-switch decision, split from the read so it is testable.
+pub const diagEnvValueOn = env.onValue;
 /// Diagnostic env switch: set and not `0`. `FOO=0` exported by a harness must
 /// never arm a sync profiler (the qwen4 MTP verify once measured 70 ms).
 pub fn diagEnvOn(name: [*:0]const u8) bool {
-    return diagEnvValueOn(std.c.getenv(name));
+    return diagEnvValueOn(env.byName(name));
 }
 /// `diagEnvOn` for a hot path: same semantics (absent or `0` = off), asked once.
 pub fn diagEnvOnCached(cache: *?bool, name: [*:0]const u8) bool {
@@ -41,8 +38,8 @@ test "diagEnvValueOn: absent or 0 is off" {
 
 test "diagEnvOnCached answers once and latches" {
     var cache: ?bool = null;
-    try testing.expectEqual(false, diagEnvOnCached(&cache, "MLX_SERVE_NO_SUCH_DIAG_SWITCH_PROBE"));
+    try testing.expectEqual(false, diagEnvOnCached(&cache, "NO_SUCH_DIAG_SWITCH_PROBE"));
     try testing.expectEqual(@as(?bool, false), cache);
     cache = true;
-    try testing.expectEqual(true, diagEnvOnCached(&cache, "MLX_SERVE_NO_SUCH_DIAG_SWITCH_PROBE"));
+    try testing.expectEqual(true, diagEnvOnCached(&cache, "NO_SUCH_DIAG_SWITCH_PROBE"));
 }

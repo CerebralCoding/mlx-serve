@@ -2,6 +2,7 @@
 //! Owns FusedQkv, fused_qkv_engaged, fused_qkv_override, fused_qkv_env, fusedQkvEnabled, FusedRows, and 7 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const Weights = @import("../../../engines/mlx/model.zig").Weights;
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
@@ -50,7 +51,7 @@ var fused_qkv_env: ?bool = null;
 pub fn fusedQkvEnabled() bool {
     if (fused_qkv_override) |v| return v;
     if (fused_qkv_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_FUSED_QKV");
+    const raw = env.get(.MLX_SERVE_FUSED_QKV);
     const enabled = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
     fused_qkv_env = enabled;
     return enabled;
@@ -94,7 +95,7 @@ pub var fused_row_groups: usize = 0;
 /// shares one packed geometry: same packed width and dtype, same scales
 /// width and dtype, same bias presence — the single matmul must dequantize
 /// them all the same way.
-fn fuseRowGroup(parts: []const [3]*mlx.mlx_array, s: mlx.mlx_stream) !?FusedRows {
+pub fn fuseRowGroup(parts: []const [3]*mlx.mlx_array, s: mlx.mlx_stream) !?FusedRows {
     if (parts.len < 2 or parts.len > 4) return null;
     const w0 = parts[0][0].*;
     const s0 = parts[0][1].*;

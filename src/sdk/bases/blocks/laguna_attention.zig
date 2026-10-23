@@ -14,13 +14,14 @@ const kv = @import("../kv.zig");
 const linear = @import("linear.zig");
 const sliding = @import("sliding.zig");
 const da = @import("decoder_attention.zig");
+const qk_rope = @import("qk_rope.zig");
 const attn256 = @import("../../blocks/attention/attn256.zig");
 const sdpa = @import("../../blocks/attention/sdpa.zig");
 const kvq = @import("../../blocks/attention/kv_quant_attn.zig");
 const gates = @import("../../blocks/attention/gates.zig");
 const nax_attention = @import("../../blocks/attention/nax_attention.zig");
 const qk_norm_rope = @import("../../blocks/rope/qk_norm_rope.zig");
-const dec_attn = @import("../../../plugins/mimo_v2/dec_attn.zig");
+const dec_attn = @import("../../blocks/attention/dec_attn.zig");
 const DenseKVView = @import("../../blocks/attention/kv_view.zig").DenseKVView;
 
 const Array = ops.Array;
@@ -30,7 +31,7 @@ const Linear = linear.Linear;
 const Geo = da.Geo;
 
 const perm = [_]c_int{ 0, 2, 1, 3 };
-const MAX_SLOTS = @import("attention.zig").MAX_SLOTS;
+const MAX_SLOTS = @import("slot_reads.zig").MAX_SLOTS;
 
 pub const Options = struct {
     /// `softplus(gate(x))` per head multiplies the attention output before o_proj.
@@ -88,9 +89,9 @@ pub fn LagunaAttention(comptime opts: Options) type {
             const q_proj = try w.q.forward(g, x);
             if (c.mode != .batched_rows and s == 1 and geo.head_dim == 128 and qk_norm_rope.qkNormRopeFusedEnabled()) fused: {
                 const k_proj = try w.k.forward(g, x);
-                const ms: ?Array = if (yarn) try g.astype(if (w.mscale.ctx != null) w.mscale else break :fused, ops.dtype(q_proj)) else null;
+                const ms: ?Array = if (yarn) try c.castOnce(if (w.mscale.ctx != null) w.mscale else break :fused, ops.dtype(q_proj)) else null;
                 // A NoPE layer runs the norm alone at rd 0; q_norm stands in for the unread angles.
-                const angles = if (geo.nope) w.q_norm else try g.adopt(qk_norm_rope.ropeAngleRows(g.s, geo.rope_dims, ropeBase(geo), geo.freqs, @intCast(c.offset()), 1, g.a, 1.0, 1.0) catch break :fused);
+                const angles = if (geo.nope) w.q_norm else qk_rope.angles(c, null, 0, geo.rope_dims, ropeBase(geo), geo.freqs, @intCast(c.offset()), 1, 1.0, 1.0) catch break :fused;
                 const pair = (qk_norm_rope.fusedQkNormRope(g.s, q_proj, k_proj, w.q_norm, w.k_norm, angles, if (geo.nope) null else ms, c.shared.eps_arr, geo.heads, geo.kv_heads, if (geo.nope) 0 else geo.rope_dims) catch null) orelse break :fused;
                 const q = g.adopt(pair[0]) catch |e| {
                     _ = mlx.mlx_array_free(pair[1]);
@@ -103,7 +104,7 @@ pub fn LagunaAttention(comptime opts: Options) type {
             var k = try headsRoped(c, k_proj, w.k_norm, geo.kv_heads, geo);
             // YaRN mscale on the rotated slice, cast to q/k's dtype so the product stays narrow.
             if (yarn and w.mscale.ctx != null) {
-                const ms = try g.astype(w.mscale, ops.dtype(q));
+                const ms = try c.castOnce(w.mscale, ops.dtype(q));
                 q = try g.mul(q, ms);
                 k = try g.mul(k, ms);
             }
@@ -144,7 +145,7 @@ pub fn LagunaAttention(comptime opts: Options) type {
                     mode = "causal";
                 } else if (c.wide()) {
                     mode = "array";
-                    mask = try sliding.bandMask(g, s, sv.kv_len, w_c);
+                    mask = try sliding.bandOnce(c, s, sv.kv_len, w_c);
                 }
                 if (try da.own(g, try kvq.qkvAttnDecodeKernel(g.s, q, &dv, geo.scale, mode, mask))) |o| {
                     kvq.logKvAttnFusedEngaged(&dv, q, s);
@@ -156,7 +157,7 @@ pub fn LagunaAttention(comptime opts: Options) type {
             }
             if (!c.wide()) return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "", .{}, sinks, false);
             if (short) return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "causal", .{}, sinks, sinks.ctx == null and sdpa.sdpaForceFused(q, dv.k));
-            return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "array", try sliding.bandMask(g, s, sv.kv_len, w_c), sinks, false);
+            return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "array", try sliding.bandOnce(c, s, sv.kv_len, w_c), sinks, false);
         }
 
         /// Each batched slot's row of q/k/v appended at the slot's own length and read through its own view.
@@ -196,7 +197,7 @@ pub fn LagunaAttention(comptime opts: Options) type {
             const w_c: c_int = @intCast(w.window);
             if (full or !prefill or offset + s <= w_c)
                 return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, if (prefill) "causal" else "", .{}, sinks, false);
-            return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "array", try sliding.bandMask(g, s, kv_len, w_c), sinks, false);
+            return da.sdpaSinks(g, q, dv.k, dv.v, geo.scale, "array", try sliding.bandOnce(c, s, kv_len, w_c), sinks, false);
         }
 
         /// Appends to `h` at the current layer: a sliding layer with a ring keeps only its ring.

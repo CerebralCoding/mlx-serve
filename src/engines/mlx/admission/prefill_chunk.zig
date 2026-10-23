@@ -2,6 +2,7 @@
 //! and adaptive chunk
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const generate_mod = @import("../generate.zig");
@@ -64,7 +65,7 @@ var ctx_bar_cached: ?bool = null;
 pub fn ctxBarEnabled() bool {
     if (ctx_bar_cached) |v| return v;
     const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_CTX_BAR") orelse break :blk true;
+        const raw = env.get(.MLX_SERVE_PREFILL_CHUNK_CTX_BAR) orelse break :blk true;
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     ctx_bar_cached = v;
@@ -285,7 +286,7 @@ pub var per_request_chunk_override: ?bool = null;
 pub fn perRequestPrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
     if (!config.perRequestPrefillChunk()) return false;
     if (per_request_chunk_override) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_PER_REQUEST") orelse return true;
+    const raw = env.get(.MLX_SERVE_PREFILL_CHUNK_PER_REQUEST) orelse return true;
     return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
 }
 
@@ -384,7 +385,7 @@ pub fn adaptivePrefillChunkEnabled(config: *const model_mod.ModelConfig) bool {
     if (generate_mod.envPrefillChunk() > 0) return false;
     if (!perRequestPrefillChunkEnabled(config)) return false;
     if (adaptive_chunk_override) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_PREFILL_CHUNK_ADAPTIVE") orelse return true;
+    const raw = env.get(.MLX_SERVE_PREFILL_CHUNK_ADAPTIVE) orelse return true;
     return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
 }
 

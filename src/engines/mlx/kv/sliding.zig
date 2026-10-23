@@ -2,6 +2,7 @@
 //! Owns SLIDING_TRIM_UNBOUNDED, slidingTailSpan, sliding_block_trim_cached, slidingBlockTrimEnabled, sliding_block_trim_logged, sliding_ring_off_for_test, and 1 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const log = @import("../../../host/log.zig");
 const ModelConfig = @import("../model.zig").ModelConfig;
 const FUSED256_MIN_Q_LEN = @import("../../../sdk/blocks/attention/attn256.zig").FUSED256_MIN_Q_LEN;
@@ -39,7 +40,7 @@ pub fn slidingTailSpan(window: u32, q_len: usize, max_width: usize) u32 {
 var sliding_block_trim_cached: ?bool = null;
 pub fn slidingBlockTrimEnabled() bool {
     if (sliding_block_trim_cached) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_SLIDING_BLOCK_TRIM");
+    const raw = env.get(.MLX_SERVE_SLIDING_BLOCK_TRIM);
     const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     sliding_block_trim_cached = on;
     return on;

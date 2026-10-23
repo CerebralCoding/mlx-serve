@@ -806,7 +806,7 @@ fn actByKey(comp: *const ltx.Component, base: []const u8, x: mlx.mlx_array, s: S
     var db: [256]u8 = undefined;
     // A wrong-keyed but loadable checkpoint must surface as an error the
     // caller downgrades to "video stays silent" — never a `.?` panic that
-    // kills the whole unified server (handleVideo catches errors, not panics).
+    // kills the whole unified server (the plugin step catches errors, not panics).
     const alpha = comp.get(key(&ab, "{s}.act.alpha", .{base})) orelse return error.MissingAudioWeight;
     const beta = comp.get(key(&bb, "{s}.act.beta", .{base})) orelse return error.MissingAudioWeight;
     const uf = comp.get(key(&ub, "{s}.upsample.filter", .{base})) orelse return error.MissingAudioWeight;
@@ -1390,7 +1390,7 @@ test "audioVaeEncode surfaces MissingAudioWeight on a wrong-keyed checkpoint" {
 
 test "audioVaeDecode surfaces MissingAudioWeight instead of panicking on a wrong-keyed checkpoint" {
     // A loadable-but-foreign safetensors passes gen.zig's load gate; request-time
-    // lookups must ERROR (handleVideo downgrades to a silent video), never `.?`.
+    // lookups must ERROR (the plugin downgrades to a silent video), never `.?`.
     const allocator = std.testing.allocator;
     var comp = ltx.Component{ .map = std.StringHashMap(mlx.mlx_array).init(allocator), .allocator = allocator };
     defer comp.deinit();

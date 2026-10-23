@@ -136,6 +136,7 @@ fn onDiskOrEmpty(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, rel: []con
 pub const Engine = struct {
     gpa: std.mem.Allocator,
     io: std.Io,
+    /// The caller's stream (borrowed).
     s: S,
     root: []u8,
     dino_dir: []u8,
@@ -144,7 +145,7 @@ pub const Engine = struct {
     shape_norm: Norm,
     tex_norm: Norm,
 
-    pub fn load(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) !*Engine {
+    pub fn loadOn(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, s: S) !*Engine {
         const self = try gpa.create(Engine);
         errdefer gpa.destroy(self);
         self.gpa = gpa;
@@ -164,8 +165,7 @@ pub const Engine = struct {
         self.tex_norm = parsed.args.tex_slat_normalization;
         self.dino_dir = try std.fmt.allocPrint(gpa, "{s}/dinov3", .{dir});
         errdefer gpa.free(self.dino_dir);
-        self.s = mlx.mlx_default_gpu_stream_new();
-        errdefer _ = mlx.mlx_stream_free(self.s);
+        self.s = s;
         self.models.tex_slat_flow_model_512 = try onDiskOrEmpty(io, gpa, dir, self.models.tex_slat_flow_model_512);
         for ([_][]const u8{ self.models.sparse_structure_decoder, self.models.sparse_structure_flow_model, self.models.shape_slat_decoder, self.models.shape_slat_flow_model_512, self.models.shape_slat_flow_model_1024, self.models.tex_slat_decoder, self.models.tex_slat_flow_model_1024 }) |rel| {
             const p = try std.fmt.allocPrint(gpa, "{s}/{s}.safetensors", .{ dir, rel });
@@ -186,7 +186,6 @@ pub const Engine = struct {
     }
 
     pub fn deinit(self: *Engine) void {
-        _ = mlx.mlx_stream_free(self.s);
         self.gpa.free(self.root);
         self.gpa.free(self.dino_dir);
         self.arena.deinit();
@@ -848,7 +847,9 @@ test "trellis2 end to end: an RGBA cutout becomes a textured GLB (TRELLIS2_PACK,
         var ch: c_int = 0;
         const px = stb.stbi_load_from_memory(encoded.ptr, @intCast(encoded.len), &w, &h, &ch, 4) orelse return error.BadImage;
         defer stb.stbi_image_free(px);
-        var eng = try Engine.load(io, gpa, pack);
+        const s = mlx.mlx_default_gpu_stream_new();
+        defer _ = mlx.mlx_stream_free(s);
+        var eng = try Engine.loadOn(io, gpa, pack, s);
         defer eng.deinit();
         _ = mlx.mlx_reset_peak_memory();
         vox = try eng.generateVoxels(gpa, px[0..@intCast(w * h * 4)], @intCast(w), @intCast(h), opts, prog);

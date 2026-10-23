@@ -1,31 +1,17 @@
 #!/bin/bash
-# The degenerate-tail guard's WIRE contract, on every surface that can emit it.
+# test_loop_stop_signal.sh — the degenerate-tail guard's WIRE contract on every surface that can emit it: a loop cut
+# reports `finish_reason: "stop"` (never "length": agents compacted on it) with `finish_details:{"type":
+# "repetition_loop"}` beside it, on chat and completions, stream and non-stream; tool-call parsing is suppressed for
+# that cause. [1/6] a non-streaming body is TRIMMED to the span start (an agent resends the cut turn and resumes its
+# own loop); with thinking on the same holds for reasoning_content. [6/6] boots MLX_SERVE_LOOP_TRIM=0 so the trim's
+# own red-on-revert runs every time. Streaming keeps the tail (a delta cannot be retracted).
 #
-# Live 2026-08-05 (under pi): five loop-stops in a row, each
-# firing sooner than the last, surfaced to the user as "Model stopped because
-# it reached the maximum output token limit" while the session's own status
-# bar read 32.4%/66k. The mismatch came from `finish_reason: "length"`: pi
-# treated the loop guard as context/output exhaustion and compacted at 18% of
-# a 256k window. A loop guard now reports "stop" and carries the specific cause
-# beside it as `finish_details`. Tool-call parsing is suppressed for that cause
-# so a cut fragment cannot become an executable `tool_calls` response.
+#   LOOP_TEST_MODEL=<small chat model> ./tests/test_loop_stop_signal.sh [port]   # SKIPs without one
 #
-# Two things are asserted, because either alone can silently regress:
-#   1. the SIGNAL — `finish_details.type == "repetition_loop"` on chat
-#      (stream + non-stream) and completions (stream + non-stream). A missing
-#      field is invisible to any output-equality test.
-#   2. the TRIM — a non-streaming response must NOT carry the degenerate tail
-#      back to the client. An agent re-sends the cut turn as history, the
-#      model reads its own loop and resumes it; that is the death spiral.
-#      Streaming deliberately keeps the tail: a delta cannot be retracted.
-#
-# Needs any chat model — the prompt loops on all of them. Point LOOP_TEST_MODEL
-# at a small one to keep this cheap.
-#
-# Usage: LOOP_TEST_MODEL=~/.mlx-serve/models/mlx-community/gemma-4-e4b-it-4bit \
-#          ./tests/test_loop_stop_signal.sh [port]
+# Hermetic twins: degenerateTail, loopStopDecision, shouldParseToolCalls, finishDetailsField, loopTrimmedIds.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11266}"
 BINARY="${BINARY:-./zig-out/bin/mlx-serve}"
@@ -60,11 +46,7 @@ pkill -f "mlx-serve.*--port $PORT" 2>/dev/null
 sleep 0.5
 "$BINARY" --model "$MODEL" --serve --port "$PORT" --log-file off --log-level info > "$LOG" 2>&1 &
 SRV=$!
-for _ in $(seq 1 240); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    sleep 1
-    kill -0 "$SRV" 2>/dev/null || break
-done
+srv_wait_health "http://127.0.0.1:$PORT" 240 1 "$SRV" || true
 curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 || {
     echo "[fail] server did not come up"; tail -20 "$LOG"; exit 1
 }
@@ -204,11 +186,7 @@ kill "$SRV" 2>/dev/null; wait "$SRV" 2>/dev/null
 sleep 1
 MLX_SERVE_LOOP_TRIM=0 "$BINARY" --model "$MODEL" --serve --port "$PORT" --log-file off > "$LOG.off" 2>&1 &
 SRV=$!
-for _ in $(seq 1 240); do
-    curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-    sleep 1
-    kill -0 "$SRV" 2>/dev/null || break
-done
+srv_wait_health "http://127.0.0.1:$PORT" 240 1 "$SRV" || true
 OFF=$(curl -s "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
   -d "{\"model\":\"$MODEL_ID\",\"messages\":[{\"role\":\"user\",\"content\":\"$LOOP_PROMPT\"}],\"max_tokens\":3000,\"temperature\":0,\"enable_thinking\":false}")
 python3 - "$OFF" <<'PY' > "$LOG.off2"

@@ -8,8 +8,11 @@ const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
 const qk_norm_rope = @import("../../blocks/rope/qk_norm_rope.zig");
 
+const block = @import("../block.zig");
+
 const Array = ops.Array;
 const Graph = ops.Graph;
+const Ctx = block.Ctx;
 
 /// One table per rope family (0 = base theta, 1 = the scaled spectrum: YaRN, a global layer), rebuilt when its key
 /// moves. Owned by the model; free with `deinit`.
@@ -37,10 +40,14 @@ pub const AngleCache = struct {
     }
 };
 
-/// The angle rows from `cache`, or built for this call (owned by `g`) when the model keeps none.
-pub fn angles(g: *Graph, cache: ?*AngleCache, family: usize, rd: c_int, base: mlx.mlx_optional_float, freqs: Array, offset: c_int, rows: c_int, mscale: f32, scale: f32) !Array {
+/// The angle rows from `cache`, or built once per forward when the model keeps none.
+pub fn angles(c: *const Ctx, cache: ?*AngleCache, family: usize, rd: c_int, base: mlx.mlx_optional_float, freqs: Array, offset: c_int, rows: c_int, mscale: f32, scale: f32) !Array {
+    const g = c.g;
     if (cache) |ac| return ac.rowsFor(g.s, family, rd, base, freqs, offset, rows, mscale, scale);
-    return g.adopt(try qk_norm_rope.ropeAngleRows(g.s, rd, base, freqs, offset, rows, std.heap.c_allocator, mscale, scale));
+    const theta: i64 = if (base.has_value) @as(u32, @bitCast(base.value)) else -1;
+    const key: block.Memo.Key = .{ .what = .angles, .n = .{ rd, theta, @intCast(@intFromPtr(freqs.ctx)), offset, rows, @as(u32, @bitCast(mscale)), @as(u32, @bitCast(scale)) } };
+    if (c.recall(key)) |m| return m;
+    return c.remember(key, try g.adopt(try qk_norm_rope.ropeAngleRows(g.s, rd, base, freqs, offset, rows, std.heap.c_allocator, mscale, scale)));
 }
 
 /// q, k (and a normed v) normed, transposed to `[1, H, S, 256]` and rotated in one dispatch; null when the kernel

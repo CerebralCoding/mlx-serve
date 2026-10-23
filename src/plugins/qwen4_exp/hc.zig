@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/hc, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns compileQwen4Hc, hcSiluCallback, hcMixCallback, hcInjCallback, hcWriteCallback, HcRead, and 11 more.
+//! Hyper-connection streams: the compiled read/write callbacks (`compileQwen4Hc`), the stand-ins, `HcRead`, and the
+//! grouped RMS norm over the `hc` streams.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");

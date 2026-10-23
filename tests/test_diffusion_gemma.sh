@@ -1,25 +1,12 @@
 #!/bin/bash
-# DiffusionGemma (block diffusion) end-to-end test.
+# test_diffusion_gemma.sh — DiffusionGemma block diffusion end to end: load (model_type diffusion_gemma), greedy chat
+# with finish "stop" and no EOS leak, the loop engaged (`[diffusion] canvas=`) and early-stopped (steps < max),
+# block-wise SSE, /v1/messages, a tool call with JSON arguments, thinking, a long answer over more than one canvas.
 #
-# Boots a server on the DiffusionGemma checkpoint and asserts the canvas-
-# denoising generation path works across the HTTP surfaces:
-#   1. model loads + /v1/models reports model_type diffusion_gemma
-#   2. chat non-stream: coherent greedy answer, finish_reason "stop",
-#      EOS never leaks into content
-#   3. the diffusion loop actually engaged (log: "[diffusion] canvas=")
-#      and early-stopped (steps < max — convergence, not 48/48 churn)
-#   4. chat streaming: block-wise SSE deltas + [DONE]
-#   5. /v1/messages (Anthropic): text block + end_turn
-#   6. tools: emits a valid tool_call with JSON args
-#   7. thinking (/v1/messages with thinking): thinking + text blocks
-#   8. multi-canvas: a long answer spans >1 canvas
+#   DIFFUSION_TEST_MODEL=<dir> ./tests/test_diffusion_gemma.sh [port]   # default diffusiongemma-26B-A4B-it-4bit
 #
-# Requires:
-#   - A built mlx-serve binary (zig build -Doptimize=ReleaseFast)
-#   - DIFFUSION_TEST_MODEL or
-#     ~/.mlx-serve/models/mlx-community/diffusiongemma-26B-A4B-it-4bit
-#
-# Usage: ./tests/test_diffusion_gemma.sh [port]
+# Hermetic twins: src/plugins/diffusion_gemma/runner.zig. Live parity: `DIFFUSION_TEST_MODEL=<dir> zig build test` runs the
+# converged-canvas self-consistency test, the one that catches the lazy-slice expert-zeros class.
 
 set -e
 

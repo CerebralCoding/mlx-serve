@@ -1,0 +1,6 @@
+{{"format":"mtplx-engram-manifest-v1","manifest_sha256":"{s}",
+"layers":[{{"layer_id":1,"file":"engram-L1.bin","rows":97,"record_bytes":33,
+"quant":{{"bits":8,"group_size":32,"mode":"{s}","head_dim":32}}}}],
+"hashing":{{"layer_ids":[1],"max_ngram_size":3,"n_heads":2,"head_dim":32,"compressed_vocab_size":50,
+"pad_id":2,"n_hash_cols":4,"hash_multipliers":[[3,5,7]],
+"per_layer":[{{"layer_id":1,"primes":[[11,13],[17,19]],"flat_offsets":[0,11,24,41],"total_rows":97}}]}}}}

@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/qsa/checkpoint, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns ssmAuxIsQsaHistory, qsaHistoryRows, snapshotHasQsaHistory, checkpointHasQsaHistory, checkpointHasQsaPooled, checkpointQsaAuxRows, and 21 more.
+//! QSA indexer state inside SSM checkpoints and snapshots: whether an entry's aux holds the key history, how many
+//! rows it covers, and the capture, trim and restore of the pooled blocks.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");

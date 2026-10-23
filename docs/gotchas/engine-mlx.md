@@ -703,8 +703,8 @@ The Laguna YaRN-mscale bug (above) was found by luck: the MoE forward happened t
 `[dtype-trace]` log and the other five forward paths had none. So the follow-up was to
 generalize the trace and sweep every arch on disk — `DtypeTrace` in `src/mlx/ffi.zig`, armed by
 all five `forward*With` paths plus batched-decode, the diffusion decoder and both vision
-towers, with a class guard (`every transformer forward path is watched by a dtype trace`)
-that keys on the forward-path SIGNATURE rather than on the shape of its layer loop. That
+towers, with a class guard (a `scripts/lint_pins.txt` pin on `DtypeTrace.begin(` in each forward
+file) keyed on the forward path rather than on the shape of its layer loop. That
 distinction is load-bearing: BERT iterates its layer slice directly while every other path
 counts to `num_hidden_layers`, and a rule that keyed on the loop form would have skipped it
 silently.
@@ -5732,3 +5732,14 @@ Defect: Flint's prefill slowed as prompts grew past one chunk, and `--prefill-ch
 Cause: its 35 sliding layers (window 513) ran MLX's fused SDPA with an `[chunk, chunk + 513]` array mask. The kernel computes every key block and masks after, so at a wide chunk a sliding layer pays the whole chunk instead of its band. `msv_attn_p256` skips out-of-band blocks, but only at hd 256; Flint is 128.
 Fix: `nax_attention`'s kernel takes q/k 128 as well as 192 (the `DK` template) and serves Flint's sliding prefill with its sinks. Its full layers keep MLX's causal kernel, which was faster there.
 Guards: `nax attention q/k 192 (MiMo) or 128 (Flint), v 128` (fp32 truth, incl. a 32/4-head window-513 case); `flint fixture` runs the arm against rec_mlx's model.
+
+## An A/B arm that silently ran the other arm's config
+
+Defect: a TTS fast-path A/B reported the "composed" arm as fast as the fast path. Cause: the harness passed the kill switches as `env $VAR "$BIN" …`; zsh does not word-split an unquoted `$VAR`, so the whole list reached `env` as one malformed assignment and the server ran with every lever on. Fix: kill switches go in front of the command as literal assignments, and every lever asserts its engagement line on its own boot and its absence under its kill switch, which is what caught it. Guard: `tests/test_tts_fastpath_equivalence.sh` (both directions per lever).
+
+## A CPU caller cached the sigmoid table every GPU kernel reads
+
+Defect: after the Qwen3-TTS flip test, the qwen family's proofs disagreed with their recorded tapes (legacy and plugin still agreed with each other), so a tape recorded in isolation failed in a suite that ran TTS first.
+Cause: `swigluSigTable` (and hc_prefill's bf16 twin) tabulates MLX's sigmoid over every 16-bit pattern once, on the stream of its first caller. TTS's CPU synth asked first, so every later fused SwiGLU, GDN prework and router kernel on the GPU read CPU sigmoid bits.
+Fix: one table per device, each built on the stream of that device (`swiglu_sig_tables[cpu|gpu][dtype]`); the bf16 copy in hc_prefill is the same table.
+Guard: `the SwiGLU sigmoid table is MLX's sigmoid on the device that asks for it` (CPU, GPU, CPU, compared as raw words).

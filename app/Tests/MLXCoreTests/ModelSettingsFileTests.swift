@@ -76,6 +76,19 @@ final class ModelSettingsFileTests: XCTestCase {
         XCTAssertTrue(o.changesLoad(from: ModelOverride()), "the engine is chosen at load")
     }
 
+    func testTheEnginePickerWritesEngineAndRetiresTheAneSwitch() throws {
+        var o = ModelOverride(json: ["ane": true])
+        XCTAssertEqual(o.engineChoice, "ane", "an older file's switch reads as the engine")
+        XCTAssertEqual(ModelOverride(json: ["ane": false]).engineChoice, "mlx")
+        o.engineChoice = "mlx"
+        XCTAssertEqual(o.json["engine"] as? String, "mlx")
+        XCTAssertNil(o.json["ane"], "one key decides")
+        o.engineChoice = nil
+        XCTAssertTrue(o.isEmpty)
+        XCTAssertEqual(ModelOverride(json: ["engine": "llama"]).engineChoice, "llama")
+        XCTAssertTrue(ModelOverride(json: ["engine": "ds4"]).changesLoad(from: ModelOverride()))
+    }
+
     /// `chat_template_kwargs` round-trips as one object: the rows the sheet
     /// edits are exactly what the server reads, typed values kept.
     func testChatTemplateKwargsRoundTripAsOneObject() throws {

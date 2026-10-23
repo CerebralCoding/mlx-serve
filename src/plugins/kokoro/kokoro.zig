@@ -2148,14 +2148,14 @@ pub const Model = struct {
 };
 
 // ════════════════════════════════════════════════════════════════════════
-// Engine — the `gen.AudioBackend` arm
+// Engine — served by plugin.zig
 // ════════════════════════════════════════════════════════════════════════
 
 const g2p = @import("g2p.zig");
 const wav = @import("../../sdk/media/wav.zig");
 
-/// Model + phonemizer, so `/v1/audio/speech` can take TEXT. Owned by
-/// `gen.AudioEngine`.
+/// Model + phonemizer, so `/v1/audio/speech` can take TEXT. Owned by the
+/// plugin.
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     model: Model,

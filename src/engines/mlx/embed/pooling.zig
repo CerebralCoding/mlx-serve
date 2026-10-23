@@ -4,6 +4,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const model_mod = @import("../model.zig");
 const Transformer = transformer_mod.Transformer;
+const plugin_driver = @import("../plugin/driver.zig");
 const testing = std.testing;
 
 
@@ -253,12 +254,13 @@ pub fn computeEmbeddingsBatchWith(
         for (results[0..filled]) |r| allocator.free(r);
         allocator.free(results);
     }
+    const max_items: usize = if (plugin_driver.batchesEmbeddings(&xfm.config)) EMBED_MAX_BATCH else 1;
     var start: usize = 0;
     while (start < seqs.len) {
         // A decoder-arch embedder (Qwen3-Embedding) forwards through the KV
         // cache: without a reset, a sub-batch attends to earlier sub-batches' rows.
         try xfm.resetCache();
-        const sub = seqs[start..embedSubBatchEnd(seqs, start, EMBED_MAX_BATCH, EMBED_TOKEN_BUDGET)];
+        const sub = seqs[start..embedSubBatchEnd(seqs, start, max_items, EMBED_TOKEN_BUDGET)];
         var pb = try buildPaddedBatch(allocator, sub);
         defer pb.deinit(allocator);
 

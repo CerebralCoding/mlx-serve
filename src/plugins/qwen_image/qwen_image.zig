@@ -42,6 +42,15 @@ const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
 const TextEncoder = mage_flow.TextEncoder;
 const VisionTower = mage_flow.VisionTower;
 const stb = @import("stb");
+const ops = @import("../../mlx/ops.zig");
+const graph_call = @import("../../sdk/media/graph_call.zig").call;
+const gelu_blk = @import("../../sdk/blocks/mlp/gelu.zig");
+const conv_blk = @import("../../sdk/blocks/vae/conv.zig");
+const resnet_blk = @import("../../sdk/blocks/vae/resnet.zig");
+const rope_blk = @import("../../sdk/blocks/dit/rope.zig");
+const timestep = @import("../../sdk/blocks/dit/timestep.zig");
+const flow_match = @import("../../sdk/blocks/schedulers/flow_match.zig");
+const dit_base = @import("../../sdk/bases/dit.zig");
 
 /// The reference's recommended sampling: 40 steps, no guidance.
 pub const DEFAULT_STEPS: u32 = 40;
@@ -167,25 +176,9 @@ fn tanhA(x: A, s: S) !A {
     try mlx.check(mlx.mlx_tanh(&o, x, s));
     return o;
 }
-/// `nn.gelu_approx`: 0.5·x·(1 + tanh(√(2/π)·(x + 0.044715·x³))).
+/// `nn.gelu_approx`, its constants in x's dtype.
 fn geluApprox(x: A, s: S) !A {
-    const x2 = try mulA(x, x, s);
-    defer free(x2);
-    const x3 = try mulA(x2, x, s);
-    defer free(x3);
-    const kx3 = try mulScalar(x3, 0.044715, s);
-    defer free(kx3);
-    const inner = try addA(x, kx3, s);
-    defer free(inner);
-    const scaled = try mulScalar(inner, 0.7978845608028654, s);
-    defer free(scaled);
-    const t = try tanhA(scaled, s);
-    defer free(t);
-    const opt = try addScalar(t, 1.0, s);
-    defer free(opt);
-    const hx = try mulScalar(x, 0.5, s);
-    defer free(hx);
-    return mulA(hx, opt, s);
+    return graph_call(s, gelu_blk.geluTanh, .{ x, mlx.mlx_array_dtype(x), gelu_blk.SQRT_2_PI });
 }
 fn rmsNorm(x: A, w: A, eps: f32, s: S) !A {
     var o = mlx.mlx_array_new();
@@ -243,6 +236,9 @@ fn jsonArray(v: std.json.Value, key: []const u8) ?[]const std.json.Value {
     };
 }
 
+/// No config moves it.
+const DIT_EPS: f32 = 1e-6;
+
 pub const DitConfig = struct {
     layers: u32 = 32,
     heads: u32 = 32,
@@ -252,7 +248,7 @@ pub const DitConfig = struct {
     context: u32 = 4096,
     mlp_ratio: u32 = 3,
     axes: [3]u32 = .{ 16, 56, 56 },
-    eps: f32 = 1e-6,
+    eps: f32 = DIT_EPS,
 
     pub fn hidden(self: DitConfig) u32 {
         return self.heads * self.head_dim;
@@ -345,29 +341,15 @@ pub const VaeConfig = struct {
 /// shift with mu linear in the image sequence length, then stretched so the
 /// last step lands on `shift_terminal`; a trailing 0 closes the schedule.
 pub fn computeSigmas(a: std.mem.Allocator, steps: u32, image_seq_len: u32) ![]f32 {
-    const base_shift: f64 = 0.5;
-    const max_shift: f64 = 0.9;
-    const base_seq: f64 = 256;
-    const max_seq: f64 = 8192;
-    const terminal: f64 = 0.02;
     const out = try a.alloc(f32, steps + 1);
     if (steps == 1) {
         out[0] = 1;
         out[1] = 0;
         return out;
     }
-    const m = (max_shift - base_shift) / (max_seq - base_seq);
-    const mu = m * @as(f64, @floatFromInt(image_seq_len)) + (base_shift - m * base_seq);
-    const emu = @exp(mu);
-    const n: f64 = @floatFromInt(steps);
-    const shifted = struct {
-        fn at(e: f64, steps_f: f64, i: f64) f64 {
-            const sigma = if (steps_f <= 1) 1.0 else 1.0 + i * (1.0 / steps_f - 1.0) / (steps_f - 1.0);
-            return e / (e + (1.0 / sigma - 1.0));
-        }
-    }.at;
-    const scale = (1.0 - shifted(emu, n, n - 1)) / (1.0 - terminal);
-    for (0..steps) |i| out[i] = @floatCast(1.0 - (1.0 - shifted(emu, n, @floatFromInt(i))) / scale);
+    const e = @exp(flow_match.muLinear(@floatFromInt(image_seq_len), 256, 0.5, 8192, 0.9));
+    const last = flow_match.timeShiftExp(e, flow_match.gridToInvN(steps - 1, steps));
+    for (0..steps) |i| out[i] = @floatCast(flow_match.stretchToTerminal(flow_match.timeShiftExp(e, flow_match.gridToInvN(i, steps)), last, 0.02));
     out[steps] = 0;
     return out;
 }
@@ -956,14 +938,7 @@ pub const Dit = struct {
     fn timeEmbed(self: *const Dit, t: f32) !A {
         const s = self.s;
         var buf: [2 * 256]f32 = undefined;
-        for ([_]f32{ t, 0 }, 0..) |tv, row| {
-            for (0..128) |k| {
-                const freq: f32 = @exp(-@log(@as(f32, 10000.0)) * @as(f32, @floatFromInt(k)) / 128.0);
-                const arg = tv * 1000.0 * freq;
-                buf[row * 256 + k] = @cos(arg);
-                buf[row * 256 + 128 + k] = @sin(arg);
-            }
-        }
+        for ([_]f32{ t, 0 }, 0..) |tv, row| timestep.sinusoid(f32, buf[row * 256 ..][0..256], tv * 1000.0, .cos_first);
         const sh = [_]c_int{ 2, 256 };
         const raw = mlx.mlx_array_new_data(&buf, &sh, 2, .float32);
         defer free(raw);
@@ -976,64 +951,22 @@ pub const Dit = struct {
         return self.t2.forward(act, null, s);
     }
 
-    fn stepMod(self: *const Dit, temb_act: A, geo: *const Geometry) !StepMod {
+    /// Rotate interleaved pairs (2k, 2k+1) of x [1, L, heads, hd] in f32, cast to the compute dtype; tables
+    /// [1, L, 1, hd/2, 1] f32. `fused` takes the Metal kernel (same bits).
+    fn applyRope(self: *const Dit, x: A, geo: *const Geometry, fused: bool) !A {
         const s = self.s;
-        const H: c_int = @intCast(self.cfg.hidden());
-        const mod = try self.modulation.forward(temb_act, null, s); // [2, 4H]: scale1 gate1 scale2 gate2
-        defer free(mod);
-        const opm = try addScalar(mod, 1.0, s);
-        defer free(opm);
-        const th = try tanhA(mod, s);
-        defer free(th);
-        var out: [4]A = undefined;
-        for (&out, 0..) |*o, i| {
-            const src = if (i % 2 == 0) opm else th;
-            const lo: c_int = @as(c_int, @intCast(i)) * H;
-            const part = try sliceAxis(src, 1, lo, lo + H, s); // [2, H]
-            defer free(part);
-            var rows = mlx.mlx_array_new();
-            defer free(rows);
-            try mlx.check(mlx.mlx_take_axis(&rows, part, geo.mod_row, 0, s)); // [L, H]
-            o.* = try reshape(rows, &[_]c_int{ 1, -1, H }, s);
-        }
-        return .{ .scale1 = out[0], .gate1 = out[1], .scale2 = out[2], .gate2 = out[3] };
-    }
-
-    /// Rotate interleaved pairs (2k, 2k+1) of x [1, L, heads, hd] in f32.
-    fn applyRope(self: *const Dit, x: A, geo: *const Geometry) !A {
-        const s = self.s;
-        if (self.fused_rope) return qwen_kernels.applyRope(x, geo.cos, geo.sin, self.dtype, s);
-        const sh = mlx.getShape(x);
-        const half = @divExact(sh[3], 2);
-        const xf = try astype(x, .float32, s);
-        defer free(xf);
-        const pairs = try reshape(xf, &[_]c_int{ sh[0], sh[1], sh[2], half, 2 }, s);
-        defer free(pairs);
-        const re = try sliceAxis(pairs, 4, 0, 1, s);
-        defer free(re);
-        const im = try sliceAxis(pairs, 4, 1, 2, s);
-        defer free(im);
-        const rc = try mulA(re, geo.cos, s);
-        defer free(rc);
-        const is = try mulA(im, geo.sin, s);
-        defer free(is);
-        const o_re = try subA(rc, is, s);
-        defer free(o_re);
-        const rs = try mulA(re, geo.sin, s);
-        defer free(rs);
-        const ic = try mulA(im, geo.cos, s);
-        defer free(ic);
-        const o_im = try addA(rs, ic, s);
-        defer free(o_im);
-        const joined = try concat(&.{ o_re, o_im }, 4, s);
-        defer free(joined);
-        const flat = try reshape(joined, &[_]c_int{ sh[0], sh[1], sh[2], sh[3] }, s);
-        defer free(flat);
-        return astype(flat, self.dtype, s);
+        if (fused) return qwen_kernels.applyRope(x, geo.cos, geo.sin, self.dtype, s);
+        const sh = mlx.getShape(geo.cos);
+        const table = [_]c_int{ sh[0], sh[1], sh[2], sh[3] };
+        const cos = try reshape(geo.cos, &table, s);
+        defer free(cos);
+        const sin = try reshape(geo.sin, &table, s);
+        defer free(sin);
+        return graph_call(s, rope_blk.ropePairs, .{ x, cos, sin, self.dtype });
     }
 
     /// Project → per-head RMS norm → RoPE → [1, heads, L, hd].
-    fn headsOf(self: *const Dit, lin: *const MfLinear, slot: *const lora_mod.Slot, norm: ?A, x: A, geo: *const Geometry) !A {
+    fn headsOf(self: *const Dit, lin: *const MfLinear, slot: *const lora_mod.Slot, norm: ?A, x: A, geo: *const Geometry, fused: bool) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
         const y = try linForward(lin, slot, x, s);
@@ -1044,7 +977,7 @@ pub const Dit = struct {
         const nw = norm orelse return transpose(y4, &perm, s);
         const yn = try rmsNorm(y4, nw, self.cfg.eps, s);
         defer free(yn);
-        const yr = try self.applyRope(yn, geo);
+        const yr = try self.applyRope(yn, geo, fused);
         defer free(yr);
         return transpose(yr, &perm, s);
     }
@@ -1074,11 +1007,11 @@ pub const Dit = struct {
         const sh = mlx.getShape(x);
         const T = geo.text_len;
         const fused = try self.fusedHeads(b, x, geo);
-        const q = if (fused) |f| f.q else try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, geo);
+        const q = if (fused) |f| f.q else try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, geo, self.fused_rope);
         defer free(q);
-        const k = if (fused) |f| f.k else try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, geo);
+        const k = if (fused) |f| f.k else try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, geo, self.fused_rope);
         defer free(k);
-        const v = if (fused) |f| f.v else try self.headsOf(&b.v, &b.lora.v, null, x, geo);
+        const v = if (fused) |f| f.v else try self.headsOf(&b.v, &b.lora.v, null, x, geo, self.fused_rope);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
 
@@ -1161,30 +1094,11 @@ pub const Dit = struct {
         return gluMul(g, p, s);
     }
 
-    fn blockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const Geometry, cache: ?*?PrefixKV, cached: bool) !A {
-        const s = self.s;
-        const n1 = try layerNorm(x, self.cfg.eps, s);
-        defer free(n1);
-        const a_in = try mulA(n1, mod.scale1, s);
-        defer free(a_in);
-        const attn = try self.attention(b, a_in, geo, cache, cached);
-        defer free(attn);
-        const ga = try mulA(attn, mod.gate1, s);
-        defer free(ga);
-        const h = try addA(x, ga, s);
-        defer free(h);
-
-        const n2 = try layerNorm(h, self.cfg.eps, s);
-        defer free(n2);
-        const m_in = try mulA(n2, mod.scale2, s);
-        defer free(m_in);
-        const gp = try self.swiglu(b, m_in);
-        defer free(gp);
-        const mlp = try linForward(&b.out, &b.lora.out, gp, s);
-        defer free(mlp);
-        const gm = try mulA(mlp, mod.gate2, s);
-        defer free(gm);
-        return addA(h, gm, s);
+    /// One block: sdk pre-norm adaLN (no-affine LayerNorm, scale-only modulation, tanh gates), the attention arm
+    /// the caller's.
+    fn block(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, attend: Attend) !A {
+        const m: dit_base.Mods = .{ .scale_a = mod.scale1, .gate_a = mod.gate1, .scale_f = mod.scale2, .gate_f = mod.gate2 };
+        return graph_call(self.s, BlockHooks.forward, .{ b, x, m, BlockHooks.Ctx{ .dit = self, .attend = attend } });
     }
 
     fn textIn(self: *const Dit, txt: A) !A {
@@ -1214,7 +1128,7 @@ pub const Dit = struct {
         defer free(temb);
         const temb_act = try silu(temb, s);
         defer free(temb_act);
-        var mod = try self.stepMod(temb_act, geo);
+        var mod = try self.modRows(temb_act, geo.mod_row);
         defer mod.deinit();
 
         const ih = try self.img_in.forward(img, null, s);
@@ -1227,7 +1141,7 @@ pub const Dit = struct {
         defer free(x);
         for (self.blocks, 0..) |*b, i| {
             const slot = if (cache) |c| &c.layers[i] else null;
-            const nx = try self.blockForward(b, x, &mod, geo, slot, cached);
+            const nx = try self.block(b, x, &mod, .{ .t2i = .{ .geo = geo, .cache = slot, .cached = cached } });
             free(x);
             x = nx;
         }
@@ -1255,9 +1169,9 @@ pub const Dit = struct {
 
     // ── Edit (ti2i) forward ──
 
-    /// `stepMod` with the edit row selection: target tokens read the sampled-t
-    /// row, text and condition-image tokens the t=0 row.
-    fn editStepMod(self: *const Dit, temb_act: A, mod_row: A) !StepMod {
+    /// The step's modulation per token: `mod_row` picks the sampled-t row (image or target tokens) or the t=0 row
+    /// (text, and an edit's condition images).
+    fn modRows(self: *const Dit, temb_act: A, mod_row: A) !StepMod {
         const s = self.s;
         const H: c_int = @intCast(self.cfg.hidden());
         const mod = try self.modulation.forward(temb_act, null, s);
@@ -1280,63 +1194,14 @@ pub const Dit = struct {
         return .{ .scale1 = out[0], .gate1 = out[1], .scale2 = out[2], .gate2 = out[3] };
     }
 
-    /// `applyRope` over the edit tables (same layout as the t2i ones).
-    fn editApplyRope(self: *const Dit, x: A, cos: A, sin: A) !A {
-        const s = self.s;
-        const sh = mlx.getShape(x);
-        const half = @divExact(sh[3], 2);
-        const xf = try astype(x, .float32, s);
-        defer free(xf);
-        const pairs = try reshape(xf, &[_]c_int{ sh[0], sh[1], sh[2], half, 2 }, s);
-        defer free(pairs);
-        const re = try sliceAxis(pairs, 4, 0, 1, s);
-        defer free(re);
-        const im = try sliceAxis(pairs, 4, 1, 2, s);
-        defer free(im);
-        const rc = try mulA(re, cos, s);
-        defer free(rc);
-        const is_ = try mulA(im, sin, s);
-        defer free(is_);
-        const o_re = try subA(rc, is_, s);
-        defer free(o_re);
-        const rs = try mulA(re, sin, s);
-        defer free(rs);
-        const ic = try mulA(im, cos, s);
-        defer free(ic);
-        const o_im = try addA(rs, ic, s);
-        defer free(o_im);
-        const joined = try concat(&.{ o_re, o_im }, 4, s);
-        defer free(joined);
-        const flat = try reshape(joined, &[_]c_int{ sh[0], sh[1], sh[2], sh[3] }, s);
-        defer free(flat);
-        return astype(flat, self.dtype, s);
-    }
-
-    /// Project → per-head RMS norm → RoPE → [1, heads, L, hd], edit tables.
-    fn editHeadsOf(self: *const Dit, lin: *const MfLinear, slot: *const lora_mod.Slot, norm: ?A, x: A, geo: *const Geometry) !A {
-        const s = self.s;
-        const sh = mlx.getShape(x);
-        const y = try linForward(lin, slot, x, s);
-        defer free(y);
-        const y4 = try reshape(y, &[_]c_int{ sh[0], sh[1], @intCast(self.cfg.heads), @intCast(self.cfg.head_dim) }, s);
-        defer free(y4);
-        const perm = [_]c_int{ 0, 2, 1, 3 };
-        const nw = norm orelse return transpose(y4, &perm, s);
-        const yn = try rmsNorm(y4, nw, self.cfg.eps, s);
-        defer free(yn);
-        const yr = try self.editApplyRope(yn, geo.cos, geo.sin);
-        defer free(yr);
-        return transpose(yr, &perm, s);
-    }
-
     fn editAttention(self: *const Dit, b: *const Block, x: A, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
         const s = self.s;
         const sh = mlx.getShape(x);
-        const q = try self.editHeadsOf(&b.q, &b.lora.q, b.norm_q, x, rope);
+        const q = try self.headsOf(&b.q, &b.lora.q, b.norm_q, x, rope, false);
         defer free(q);
-        const k = try self.editHeadsOf(&b.k, &b.lora.k, b.norm_k, x, rope);
+        const k = try self.headsOf(&b.k, &b.lora.k, b.norm_k, x, rope, false);
         defer free(k);
-        const v = try self.editHeadsOf(&b.v, &b.lora.v, null, x, rope);
+        const v = try self.headsOf(&b.v, &b.lora.v, null, x, rope, false);
         defer free(v);
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.head_dim)));
         const attn = if (cached) blk: {
@@ -1356,32 +1221,6 @@ pub const Dit = struct {
         const flat = try reshape(back, &[_]c_int{ sh[0], sh[1], sh[2] }, s);
         defer free(flat);
         return linForward(&b.o, &b.lora.o, flat, s);
-    }
-
-    fn editBlockForward(self: *const Dit, b: *const Block, x: A, mod: *const StepMod, geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool) !A {
-        const s = self.s;
-        const n1 = try layerNorm(x, self.cfg.eps, s);
-        defer free(n1);
-        const a_in = try mulA(n1, mod.scale1, s);
-        defer free(a_in);
-        const attn = try self.editAttention(b, a_in, geo, rope, slot, cached);
-        defer free(attn);
-        const ga = try mulA(attn, mod.gate1, s);
-        defer free(ga);
-        const h = try addA(x, ga, s);
-        defer free(h);
-
-        const n2 = try layerNorm(h, self.cfg.eps, s);
-        defer free(n2);
-        const m_in = try mulA(n2, mod.scale2, s);
-        defer free(m_in);
-        const gp = try self.swiglu(b, m_in);
-        defer free(gp);
-        const mlp = try linForward(&b.out, &b.lora.out, gp, s);
-        defer free(mlp);
-        const gm = try mulA(mlp, mod.gate2, s);
-        defer free(gm);
-        return addA(h, gm, s);
     }
 
     /// Velocity for one edit flow step: `latents` are the PACKED [refs |
@@ -1405,7 +1244,7 @@ pub const Dit = struct {
         defer free(temb);
         const temb_act = try silu(temb, s);
         defer free(temb_act);
-        var mod = try self.editStepMod(temb_act, rope.mod_row);
+        var mod = try self.modRows(temb_act, rope.mod_row);
         defer mod.deinit();
 
         const H: c_int = @intCast(self.cfg.hidden());
@@ -1434,7 +1273,7 @@ pub const Dit = struct {
         defer free(x);
         for (self.blocks, 0..) |*b, i| {
             const slot = if (cache) |c| &c.layers[i] else null;
-            const nx = try self.editBlockForward(b, x, &mod, geo, rope, slot, cached);
+            const nx = try self.block(b, x, &mod, .{ .edit = .{ .geo = geo, .rope = rope, .slot = slot, .cached = cached } });
             free(x);
             x = nx;
         }
@@ -1458,6 +1297,41 @@ pub const Dit = struct {
         errdefer free(result);
         if (cache) |c| if (!cached) try c.materialize(result);
         return result;
+    }
+};
+
+/// A block's attention: the t2i joint sequence, or an edit's segments.
+const Attend = union(enum) {
+    t2i: struct { geo: *const Geometry, cache: ?*?PrefixKV, cached: bool },
+    edit: struct { geo: *const EditGeometry, rope: *const Geometry, slot: ?*?PrefixKV, cached: bool },
+};
+
+/// `sdk/bases/dit`'s adaLN hooks over the engine's raw-array attention and SwiGLU.
+const BlockHooks = struct {
+    pub const Layer = Block;
+    pub const Ctx = struct { dit: *const Dit, attend: Attend };
+    pub const mod: dit_base.Modulation = .scale_only;
+
+    fn forward(g: *ops.Graph, b: *const Block, x: ops.Array, m: dit_base.Mods, ctx: Ctx) !ops.Array {
+        return dit_base.adaLnBlock(BlockHooks, g, b, x, m, ctx);
+    }
+
+    pub fn norm1(g: *ops.Graph, _: *const Block, x: ops.Array) !ops.Array {
+        return g.layerNorm(x, .{ .ctx = null }, .{ .ctx = null }, DIT_EPS);
+    }
+    pub const norm2 = norm1;
+
+    pub fn attention(g: *ops.Graph, b: *const Block, y: ops.Array, ctx: Ctx) !ops.Array {
+        return g.adopt(switch (ctx.attend) {
+            .t2i => |t| try ctx.dit.attention(b, y, t.geo, t.cache, t.cached),
+            .edit => |e| try ctx.dit.editAttention(b, y, e.geo, e.rope, e.slot, e.cached),
+        });
+    }
+
+    pub fn ffn(g: *ops.Graph, b: *const Block, y: ops.Array, ctx: Ctx) !ops.Array {
+        const gp = try ctx.dit.swiglu(b, y);
+        defer free(gp);
+        return g.adopt(try linForward(&b.out, &b.lora.out, gp, ctx.dit.s));
     }
 };
 
@@ -1541,14 +1415,11 @@ const Conv = struct {
     }
 
     fn forward(self: *const Conv, x: A, stride: c_int, pad: c_int, s: S) !A {
+        const strips = stripCount(mlx.getShape(x), mlx.getShape(self.w), stride);
+        if (strips <= 1) return graph_call(s, conv_blk.conv2d, .{ x, self.w, self.b, stride, pad, 1 });
         const xc = try contig(x, s);
         defer free(xc);
-        const strips = stripCount(mlx.getShape(xc), mlx.getShape(self.w), stride);
-        if (strips > 1) return self.forwardStrips(xc, strips, s);
-        var o = mlx.mlx_array_new();
-        defer free(o);
-        try mlx.check(mlx.mlx_conv2d(&o, xc, self.w, stride, stride, pad, pad, 1, 1, 1, s));
-        return addA(o, self.b, s);
+        return self.forwardStrips(xc, strips, s);
     }
 
     /// A stride-1 3x3 conv in horizontal strips: rows are padded ONCE, each
@@ -1697,25 +1568,7 @@ const Mid = struct {
 
     /// Single-head self-attention over the flattened spatial axis.
     fn attn(self: *const Mid, x: A, s: S) !A {
-        const sh = mlx.getShape(x); // [B,H,W,C]
-        const C = sh[3];
-        const n = try vaeNorm(x, self.norm, s);
-        defer free(n);
-        const qkv = try self.qkv.forward(n, 1, 0, s);
-        defer free(qkv);
-        const flat = try reshape(qkv, &[_]c_int{ sh[0], 1, sh[1] * sh[2], 3 * C }, s);
-        defer free(flat);
-        var parts: [3]A = undefined;
-        for (&parts, 0..) |*p, i| p.* = try sliceAxis(flat, 3, @as(c_int, @intCast(i)) * C, @as(c_int, @intCast(i + 1)) * C, s);
-        defer for (parts) |p| free(p);
-        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(C)));
-        const o = try sdpa(parts[0], parts[1], parts[2], scale, "", s);
-        defer free(o);
-        const grid = try reshape(o, &[_]c_int{ sh[0], sh[1], sh[2], C }, s);
-        defer free(grid);
-        const proj = try self.proj.forward(grid, 1, 0, s);
-        defer free(proj);
-        return addA(proj, x, s);
+        return graph_call(s, resnet_blk.midAttentionQkv, .{ resnet_blk.Norm{ .rms = 1e-12 }, x, self.norm, null, self.qkv.w, self.qkv.b, self.proj.w, self.proj.b });
     }
 
     fn forward(self: *const Mid, x: A, s: S) !A {
@@ -2224,14 +2077,14 @@ pub const Engine = struct {
     /// `model_index.json` `sample_sigmas` (Turbo's distilled grid), owned.
     sample_sigmas: ?[]f32 = null,
 
-    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, staged: bool) !*Engine {
+    pub fn loadOn(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, staged: bool, s: S) !*Engine {
         const dit_cfg = try DitConfig.parse(io, allocator, model_dir);
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
         self.* = .{
             .allocator = allocator,
             .io = io,
-            .s = mlx.mlx_default_gpu_stream_new(),
+            .s = s,
             .model_dir = try allocator.dupe(u8, model_dir),
             .dit_cfg = dit_cfg,
             .vae_cfg = undefined,
@@ -2424,17 +2277,11 @@ pub const Engine = struct {
                     // uncond + scale·(cond − uncond)
                     const vn = try self.dit.forwardCached(img, neg, sigmas[i], &neg_geo.?, if (neg_cache) |*c| c else null);
                     defer free(vn);
-                    const diff = try subA(v, vn, s);
-                    defer free(diff);
-                    const scaled = try mulScalar(diff, opts.guidance_scale, s);
-                    defer free(scaled);
-                    const blended = try addA(vn, scaled, s);
+                    const blended = try cfgBlend(v, vn, opts.guidance_scale, s);
                     free(v);
                     v = blended;
                 }
-                const dv = try mulScalar(v, sigmas[i + 1] - sigmas[i], s);
-                defer free(dv);
-                const next = try addA(img, dv, s);
+                const next = try eulerStep(img, v, sigmas[i + 1] - sigmas[i], s);
                 free(img);
                 img = next;
                 try mlx.check(mlx.mlx_array_eval(img));
@@ -2662,17 +2509,11 @@ pub const Engine = struct {
                     // uncond + scale·(cond − uncond)
                     const vn = try self.dit.forwardEditCached(model_input, nc.hidden, mask_neg.?, sigmas[i], &neg_geo.?, if (neg_cache) |*c| c else null);
                     defer free(vn);
-                    const diff = try subA(v, vn, s);
-                    defer free(diff);
-                    const scaled = try mulScalar(diff, opts.guidance_scale, s);
-                    defer free(scaled);
-                    const blended = try addA(vn, scaled, s);
+                    const blended = try cfgBlend(v, vn, opts.guidance_scale, s);
                     free(v);
                     v = blended;
                 }
-                const dv = try mulScalar(v, sigmas[i + 1] - sigmas[i], s);
-                defer free(dv);
-                const next = try addA(target, dv, s);
+                const next = try eulerStep(target, v, sigmas[i + 1] - sigmas[i], s);
                 free(target);
                 target = next;
                 try mlx.check(mlx.mlx_array_eval(target));
@@ -2736,6 +2577,20 @@ fn towerShardHasVisual(io: anytype, allocator: std.mem.Allocator, dir: std.Io.Di
     rs.interface.readSliceAll(header) catch return false;
     return std.mem.indexOf(u8, header, "model.visual.") != null or
         std.mem.indexOf(u8, header, "\"vision_tower.") != null;
+}
+
+/// Real CFG: uncond + scale·(cond − uncond).
+fn cfgBlend(cond: A, uncond: A, scale: f32, s: S) !A {
+    const diff = try subA(cond, uncond, s);
+    defer free(diff);
+    const scaled = try mulScalar(diff, scale, s);
+    defer free(scaled);
+    return addA(uncond, scaled, s);
+}
+
+/// One Euler step x + v·dt, dt in v's dtype.
+fn eulerStep(x: A, v: A, dt: f32, s: S) !A {
+    return graph_call(s, flow_match.eulerStep, .{ x, v, dt, mlx.mlx_array_dtype(v) });
 }
 
 /// [-1,1] → clip(x·0.5 + 0.5, 0, 1).
@@ -3162,7 +3017,7 @@ test "QwenImage prefix cache matches full forwards across timesteps and conditio
             // Both RoPE implementations must cast Q/K back to compute dtype.
             for ([_]bool{ false, true }) |fused| {
                 dit.fused_rope = fused;
-                const heads = try dit.headsOf(&dit.blocks[0].q, &dit.blocks[0].lora.q, dit.blocks[0].norm_q, head_input, &geo);
+                const heads = try dit.headsOf(&dit.blocks[0].q, &dit.blocks[0].lora.q, dit.blocks[0].norm_q, head_input, &geo, dit.fused_rope);
                 defer free(heads);
                 try testing.expectEqual(dtype, mlx.mlx_array_dtype(heads));
             }
@@ -3271,6 +3126,27 @@ test "QwenImage edit prefix cache matches block-causal forwards across steps and
             }
         }
     }
+}
+
+test "QwenImage edit forward on the tiny DiT is bit-equal to its golden run" {
+    const a = testing.allocator;
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var dit = try TinyPrefixModel.init(.bfloat16, s);
+    defer dit.deinit();
+    // Two references (4 and 2 slots) between text runs, then the 4-slot target.
+    const mask = [_]i32{ 0, 0, 0, 1, 1, 0, 1, 0, 1, 1 };
+    const shapes = [_][3]u32{ .{ 1, 2, 4 }, .{ 1, 2, 2 }, .{ 1, 2, 4 } };
+    var geo = try EditGeometry.init(a, dit.cfg, 8, &mask, &shapes);
+    defer geo.deinit();
+    const hidden = try TinyPrefixModel.tensor(&.{ 1, 8, 24 }, 0.3, 1);
+    defer free(hidden);
+    const latents = try TinyPrefixModel.tensor(&.{ 1, 20, 8 }, 0.9, 1);
+    defer free(latents);
+    const v = try dit.forwardEdit(latents, hidden, &mask, 0.6, &geo);
+    defer free(v);
+    try mlx.check(mlx.mlx_array_eval(v));
+    try @import("../../sdk/testing/golden.zig").expect("qwen_image_edit_forward", &.{.{ .name = "v", .array = v }});
 }
 
 test "QwenImage DiT parity (env-gated)" {
@@ -3751,7 +3627,7 @@ test "QwenImage edit segment walk: adjacent image blocks stay separate" {
 test "QwenImage load leaves the DiT and VAE resident (env-gated)" {
     const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_E2E_MODEL") orelse return error.SkipZigTest);
     const io = std.Io.Threaded.global_single_threaded.io();
-    const engine = try Engine.load(io, testing.allocator, dir, true);
+    const engine = try Engine.loadOn(io, testing.allocator, dir, true, mlx.mlx_default_gpu_stream_new());
     defer engine.deinit();
     const last_stage = engine.vae.h.stages[engine.vae.h.stages.len - 1];
     for ([_]A{ engine.dit.img_in.w, engine.dit.blocks[engine.dit.blocks.len - 1].out.w, last_stage.res[0].c1.w }) |w| {
@@ -3779,7 +3655,7 @@ test "QwenImage e2e on a real pack (env-gated)" {
     var prev_cap: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev_cap, 1 << 30);
     defer _ = mlx.mlx_set_cache_limit(&prev_cap, prev_cap);
-    const engine = try Engine.load(io, a, dir, true);
+    const engine = try Engine.loadOn(io, a, dir, true, mlx.mlx_default_gpu_stream_new());
     defer engine.deinit();
     const gb = 1024.0 * 1024.0 * 1024.0;
     var load_peak: usize = 0;
@@ -3884,7 +3760,7 @@ test "QwenImage edit e2e (env-gated)" {
     var prev_cap: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev_cap, 1 << 30);
     defer _ = mlx.mlx_set_cache_limit(&prev_cap, prev_cap);
-    const engine = try Engine.load(io, a, dir, true);
+    const engine = try Engine.loadOn(io, a, dir, true, mlx.mlx_default_gpu_stream_new());
     defer engine.deinit();
     try testing.expect(engine.supportsEdit());
 
@@ -3921,7 +3797,7 @@ test "QwenImage edit e2e CFG (env-gated)" {
     var prev_cap: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev_cap, 1 << 30);
     defer _ = mlx.mlx_set_cache_limit(&prev_cap, prev_cap);
-    const engine = try Engine.load(io, a, dir, true);
+    const engine = try Engine.loadOn(io, a, dir, true, mlx.mlx_default_gpu_stream_new());
     defer engine.deinit();
 
     const refs = try editE2eRefs(a);
@@ -3950,7 +3826,7 @@ test "QwenImage edit e2e transparent keeps alpha (env-gated)" {
     var prev_cap: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev_cap, 1 << 30);
     defer _ = mlx.mlx_set_cache_limit(&prev_cap, prev_cap);
-    const engine = try Engine.load(io, a, dir, true);
+    const engine = try Engine.loadOn(io, a, dir, true, mlx.mlx_default_gpu_stream_new());
     defer engine.deinit();
 
     const refs = try editE2eRefs(a);
@@ -3970,7 +3846,7 @@ test "QwenImage edit e2e towerless refuses (env-gated)" {
     var d = std.Io.Dir.openDirAbsolute(io, notower, .{}) catch return error.SkipZigTest;
     d.close(io);
 
-    const engine = try Engine.load(io, a, notower, true);
+    const engine = try Engine.loadOn(io, a, notower, true, mlx.mlx_default_gpu_stream_new());
     defer engine.deinit();
     try testing.expect(!engine.supportsEdit());
     const refs = try editE2eRefs(a);
@@ -3991,7 +3867,7 @@ test "QwenImage flattened DiT keys load (env-gated)" {
     var d = std.Io.Dir.openDirAbsolute(io, flat, .{}) catch return error.SkipZigTest;
     d.close(io);
 
-    const engine = try Engine.load(io, a, flat, true);
+    const engine = try Engine.loadOn(io, a, flat, true, mlx.mlx_default_gpu_stream_new());
     defer engine.deinit();
     try testing.expect(engine.supportsEdit());
 }

@@ -17,6 +17,9 @@ const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
 const ssmFreeSpecCapture = @import("../../../engines/mlx/ssm/entry.zig").ssmFreeSpecCapture;
 
+const gguf_kernels = @import("../../quant/gguf/kernels.zig");
+const gguf_quants = @import("../../quant/gguf/quants.zig");
+
 const testing = std.testing;
 const Array = mlx.mlx_array;
 
@@ -38,7 +41,8 @@ pub const Pack = struct {
         _ = mlx.mlx_map_string_to_array_free(p.map);
     }
 
-    fn put(p: *Pack, name: []const u8, arr: Array) !void {
+    /// `arr` under `name` (the map takes its own reference).
+    pub fn put(p: *Pack, name: []const u8, arr: Array) !void {
         const z = try std.fmt.allocPrintSentinel(testing.allocator, "{s}", .{name}, 0);
         defer testing.allocator.free(z);
         try mlx.check(mlx.mlx_map_string_to_array_insert(p.map, z.ptr, arr));
@@ -85,18 +89,79 @@ pub const Pack = struct {
         var buf: [192]u8 = undefined;
         const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(shape[shape.len - 1])));
         if (!quantized) return p.dense(try std.fmt.bufPrint(&buf, "{s}.weight", .{base}), shape, scale, 0);
+        return p.affine(base, shape, 4, 64);
+    }
+
+    /// As `tensor`, 2-bit at `group` with every bias exactly -scale (a ternary pack's layout).
+    pub fn ternary(p: *Pack, base: []const u8, shape: []const c_int, group: c_int) !void {
+        try p.affine(base, shape, 2, group);
+        var nb: [192]u8 = undefined;
+        var sc = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(sc);
+        try mlx.check(mlx.mlx_map_string_to_array_get(&sc, p.map, (try std.fmt.bufPrintSentinel(&nb, "{s}.scales", .{base}, 0)).ptr));
+        var neg = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(neg);
+        try mlx.check(mlx.mlx_negative(&neg, sc, p.s));
+        try mlx.check(mlx.mlx_array_eval(neg));
+        try p.put(try std.fmt.bufPrint(&nb, "{s}.biases", .{base}), neg);
+    }
+
+    /// As `tensor`, affine at `bits` / `group`.
+    pub fn affine(p: *Pack, base: []const u8, shape: []const c_int, bits: c_int, group: c_int) !void {
+        return p.quantize(base, shape, "affine", bits, group);
+    }
+
+    /// As `tensor`, in MLX's `mode` ("affine", "mxfp4", "nvfp4", "mxfp8") at `bits` / `group`.
+    pub fn quantize(p: *Pack, base: []const u8, shape: []const c_int, mode: [*:0]const u8, bits: c_int, group: c_int) !void {
+        var buf: [192]u8 = undefined;
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(shape[shape.len - 1])));
         const d = try p.random(shape, scale, 0, .bfloat16);
         defer _ = mlx.mlx_array_free(d);
         var triple = mlx.mlx_vector_array_new();
         defer _ = mlx.mlx_vector_array_free(triple);
-        try mlx.check(mlx.mlx_quantize(&triple, d, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, p.s));
-        for ([_][]const u8{ ".weight", ".scales", ".biases" }, 0..) |suffix, i| {
+        try mlx.check(mlx.mlx_quantize(&triple, d, mlx.mlx_optional_int.some(group), mlx.mlx_optional_int.some(bits), mode, .{}, p.s));
+        const suffixes = [_][]const u8{ ".weight", ".scales", ".biases" };
+        for (suffixes[0..mlx.mlx_vector_array_size(triple)], 0..) |suffix, i| {
             var a = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(a);
             try mlx.check(mlx.mlx_vector_array_get(&a, triple, i));
             try mlx.check(mlx.mlx_array_eval(a));
             try p.put(try std.fmt.bufPrint(&buf, "{s}{s}", .{ base, suffix }), a);
         }
+    }
+
+    /// `<base>.weight` and its sentinel as the GGUF loader leaves a block-quantized tensor (`sdk/quant/gguf/weights.zig`):
+    /// `ggufBlocks`, split rows packed as the kernels read them. `shape` is `[..., rows, in]`.
+    pub fn gguf(p: *Pack, base: []const u8, shape: []const c_int, comptime ty: gguf_quants.GgmlType) !void {
+        const a = testing.allocator;
+        const in: usize = @intCast(shape[shape.len - 1]);
+        var rows: usize = 1;
+        for (shape[0 .. shape.len - 1]) |d| rows *= @intCast(d);
+        const raw = try ggufBlocks(p.rnd.random(), ty, rows * (in / ty.blockElems()));
+        defer a.free(raw);
+        const rb = gguf_kernels.rowBytes(ty, in);
+        const packed_rows = try a.alloc(u8, rows * rb);
+        defer a.free(packed_rows);
+        if (gguf_kernels.isSplit(ty, in)) gguf_kernels.packRows(ty, in, packed_rows, raw) else @memcpy(packed_rows, raw);
+        var sh: [4]c_int = undefined;
+        @memcpy(sh[0..shape.len], shape);
+        sh[shape.len - 1] = @intCast(rb);
+        var nb: [192]u8 = undefined;
+        const w = mlx.mlx_array_new_data(packed_rows.ptr, &sh, @intCast(shape.len), .uint8);
+        defer _ = mlx.mlx_array_free(w);
+        try p.put(try std.fmt.bufPrint(&nb, "{s}.weight", .{base}), w);
+        const sc = try gguf_kernels.sentinel(.{ .ty = ty }, p.s);
+        defer _ = mlx.mlx_array_free(sc);
+        try p.put(try std.fmt.bufPrint(&nb, "{s}.scales", .{base}), sc);
+    }
+
+    /// Writes the pack as `<dir>/model.safetensors`.
+    pub fn save(p: *const Pack, dir: []const u8) !void {
+        const file = try std.fmt.allocPrintSentinel(testing.allocator, "{s}/model.safetensors", .{dir}, 0);
+        defer testing.allocator.free(file);
+        const meta = mlx.mlx_map_string_to_string_new();
+        defer _ = mlx.mlx_map_string_to_string_free(meta);
+        try mlx.check(mlx.mlx_save_safetensors(file.ptr, p.map, meta));
     }
 
     /// Writes the pack and loads it through the legacy path.
@@ -110,16 +175,13 @@ pub const Pack = struct {
         var path_buf: [512]u8 = undefined;
         const n = try lg.tmp.dir.realPath(io, &path_buf);
         const dir = path_buf[0..n];
-        const file = try std.fmt.allocPrintSentinel(a, "{s}/model.safetensors", .{dir}, 0);
-        defer a.free(file);
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try mlx.check(mlx.mlx_save_safetensors(file.ptr, p.map, meta));
+        try p.save(dir);
         lg.config = try model.parseConfigFromJson(a, config_json);
         errdefer lg.config.deinit(a);
         lg.weights = try model.loadModelWeights(io, a, dir, &lg.config, false);
         errdefer lg.weights.deinit();
         model.resolveWeightPrefix(&lg.config, &lg.weights);
+        try model.narrowHadamardPackTables(&lg.config, &lg.weights, stream());
         lg.xfm = try Transformer.init(io, a, lg.config, &lg.weights);
         return lg;
     }
@@ -155,6 +217,28 @@ pub const Legacy = struct {
 };
 
 /// `ids` `[1, n]` int32.
+/// `n` ggml blocks of `ty` as a GGUF file stores them: drawn at random from the type's reference blocks, their f16
+/// scales redrawn so every weight stays under ~0.1. Caller frees (testing allocator).
+pub fn ggufBlocks(r: std.Random, comptime ty: gguf_quants.GgmlType, n: usize) ![]u8 {
+    const ref = @embedFile("../../quant/gguf/fixtures/" ++ @tagName(ty) ++ ".bin")[0 .. 4 * ty.blockBytes()];
+    // Byte offsets of the block's f16 scales, and the largest |scale| keeping a weight under ~0.1.
+    const scales: struct { at: []const usize, max: f32 } = comptime switch (ty) {
+        .q8_0 => .{ .at = &.{0}, .max = 0.0008 },
+        .q5_0 => .{ .at = &.{0}, .max = 0.006 },
+        .q4_k, .q5_k => .{ .at = &.{ 0, 2 }, .max = 0.0001 },
+        .q6_k => .{ .at = &.{208}, .max = 0.00002 },
+        .iq4_xs => .{ .at = &.{0}, .max = 0.00002 },
+        else => @compileError("fixture.ggufBlocks: no scale layout for " ++ @tagName(ty)),
+    };
+    const raw = try testing.allocator.alloc(u8, n * ty.blockBytes());
+    for (0..n) |i| {
+        const blk = raw[i * ty.blockBytes() ..][0..ty.blockBytes()];
+        @memcpy(blk, ref[r.uintLessThan(usize, 4) * ty.blockBytes() ..][0..ty.blockBytes()]);
+        for (scales.at) |o| std.mem.writeInt(u16, blk[o..][0..2], @bitCast(@as(f16, @floatCast(scales.max * (r.float(f32) * 2 - 1)))), .little);
+    }
+    return raw;
+}
+
 pub fn tokens(g: *ops.Graph, ids: []const i32) !Array {
     return g.fromSlice(i32, ids, &.{ 1, @intCast(ids.len) });
 }
@@ -193,7 +277,31 @@ pub fn freeEntries(es: []SSMCacheEntry) void {
     testing.allocator.free(es);
 }
 
-/// Runs `steps` through the legacy forward and base `M` on caches of their own, each step's logits bit-equal.
+/// Every recurrent state and spec capture of `got` bit-equal to `want`'s.
+pub fn expectEntries(want: []const SSMCacheEntry, got: []const SSMCacheEntry) !void {
+    for (want, got) |*w, *g| {
+        try testing.expectEqual(w.initialized, g.initialized);
+        inline for (.{ "conv_state", "ssm_state", "spec_conv_input", "spec_state_seq" }) |f| {
+            const wa = @field(w, f);
+            const ga = @field(g, f);
+            try testing.expectEqual(wa.ctx == null, ga.ctx == null);
+            if (wa.ctx != null) try expectStateEqual(ga, wa);
+        }
+    }
+}
+
+/// Bit-equal, except a state sequence's last row: the GDN verify kernels never write it (a rollback never reads it).
+fn expectStateEqual(got: Array, want: Array) !void {
+    var g = ops.Graph.init(testing.allocator, stream());
+    defer g.deinit();
+    const sh = ops.shape(want);
+    if (sh.len == 5 and sh[0] > 1 and ops.shape(got).len == 5)
+        return ops.expectBitEqual(try g.sliceAxis(got, 0, 0, sh[0] - 1), try g.sliceAxis(want, 0, 0, sh[0] - 1));
+    return ops.expectBitEqual(got, want);
+}
+
+/// Runs `steps` through the legacy forward and base `M` on caches of their own, each step's logits bit-equal, and
+/// on a recurrent trunk every state and verify capture too.
 pub fn expectSteps(comptime M: type, lg: *Legacy, w: *const M.Weights) !void {
     return expectStepsOf(M, lg, w, &steps);
 }
@@ -215,7 +323,10 @@ pub fn expectStepsOf(comptime M: type, lg: *Legacy, w: *const M.Weights, seq: []
         var g = ops.Graph.init(a, lg.xfm.s);
         defer g.deinit();
         const ids = try tokens(&g, st.ids);
-        const want = try rows2(&g, try g.adopt(try lg.xfm.forward(ids)));
+        var ctx = lg.xfm.defaultCtx();
+        const capture = st.mode == .verify;
+        ctx.capture_ssm_seq = capture and ctx.ssm_entries != null;
+        const want = try rows2(&g, try g.adopt(try lg.xfm.forwardWith(&ctx, ids)));
         const got = try M.forward(w, &shared, &g, ids, .{
             .mode = st.mode,
             .rows = @intCast(st.ids.len),
@@ -223,8 +334,10 @@ pub fn expectStepsOf(comptime M: type, lg: *Legacy, w: *const M.Weights, seq: []
             .caches = &handles,
             .cache_ops = &cache_ops.ops,
             .logits = .all_rows,
+            .capture_spec = capture,
         });
         try ops.expectBitEqual(got.logits, want);
+        if (lg.xfm.ssm_entries) |legacy| try expectEntries(legacy, entries);
         pos += @intCast(st.ids.len);
     }
 }

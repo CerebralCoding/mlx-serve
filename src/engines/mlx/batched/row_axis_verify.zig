@@ -2,6 +2,7 @@
 //! Owns VerifyLaps, VerifyRollback, forwardRowAxisVerify, releaseJoinedVerifyLogits, takeJoinedVerifyLogits, expectRowsByteEqual, and 9 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const distributed_mod = @import("../cluster/distributed.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const KVQuantConfig = @import("../cache/kv_quant.zig").KVQuantConfig;
@@ -10,6 +11,7 @@ const log = @import("../../../host/log.zig");
 const io_util_mod = @import("../../../sdk/util/io_util.zig");
 const gather_qmv_rows = @import("../../../sdk/blocks/moe/gather_qmv_rows.zig");
 const layered = @import("layered.zig");
+const intree = @import("../plugin/intree.zig");
 const mtp = @import("../../../plugins/qwen4_exp/mtp.zig");
 const verify_projection = @import("../../../sdk/blocks/linear/verify_projection.zig");
 const Qwen4TestSlot = @import("../../../plugins/qwen4_exp/forward.zig").Qwen4TestSlot;
@@ -124,6 +126,11 @@ pub fn forwardRowAxisVerify(
 ) !void {
     std.debug.assert(token_rows.len == ctxs.len);
     std.debug.assert(out_logits.len >= token_rows.len and out_last.len >= token_rows.len and out_all.len >= token_rows.len);
+    // P8 debt (`plugin/intree.zig`): a served qwen4_exp's grouped verify runs on its inner trunk, owed PLE work first.
+    if (token_rows.len > 1) if (intree.inner(self)) |t| {
+        try self.flushDeferredPleGroup(ctxs);
+        return t.forwardRowAxisVerify(token_rows, ctxs, out_logits, out_last, out_all, row_ns, rollback_out);
+    };
     const outer_group_rows = verify_projection.verify_group_rows;
     verify_projection.verify_group_rows = token_rows.len;
     defer verify_projection.verify_group_rows = outer_group_rows;
@@ -319,7 +326,7 @@ pub fn logicalSsmCapture(s: mlx.mlx_stream, entry: *const SSMCacheEntry) !mlx.ml
 }
 
 test "row-axis verify: every row of a group verify is byte-identical to its solo verify" {
-    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    const model_dir = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -482,7 +489,7 @@ fn expectSlotStateEqual(alloc: std.mem.Allocator, s: mlx.mlx_stream, a: *Qwen4Te
 }
 
 test "per-row rollback: different accept counts across rows restore exactly the solo states" {
-    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    const model_dir = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -585,7 +592,7 @@ test "per-row rollback: different accept counts across rows restore exactly the 
 }
 
 test "a tensor-parallel rank 0 never takes the grouped verify, whose MoE skips the exchange" {
-    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    const model_dir = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -621,7 +628,7 @@ test "a tensor-parallel rank 0 never takes the grouped verify, whose MoE skips t
 
 test "group round: a row's own argmax and budget decide it, and nothing else does" {
     const gen_mod = @import("../generate.zig");
-    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    const model_dir = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -737,7 +744,7 @@ test "head row coverage declines virtual widths before any stacked dispatch" {
 }
 
 test "N=4 rollback: rejects, partial accepts and full accept restore solo states" {
-    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    const model_dir = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const allocator = testing.allocator;
     const s = mlx.gpuStream();

@@ -406,12 +406,13 @@ pub const Engine = struct {
     mv: ?Flows,
     arena: std.heap.ArenaAllocator,
 
-    pub fn load(io: std.Io, gpa: std.mem.Allocator, dir: []const u8) !*Engine {
+    /// On the caller's stream (borrowed).
+    pub fn loadOn(io: std.Io, gpa: std.mem.Allocator, dir: []const u8, s: S) !*Engine {
         const self = try gpa.create(Engine);
         errdefer gpa.destroy(self);
         self.* = .{ .gpa = gpa, .io = io, .base = undefined, .naf_dir = undefined, .mv = null, .arena = std.heap.ArenaAllocator.init(gpa) };
         errdefer self.arena.deinit();
-        self.base = try tp.Engine.load(io, gpa, dir);
+        self.base = try tp.Engine.loadOn(io, gpa, dir, s);
         errdefer self.base.deinit();
         self.naf_dir = try std.fmt.allocPrint(gpa, "{s}/naf", .{dir});
         errdefer gpa.free(self.naf_dir);
@@ -1001,7 +1002,9 @@ test "pixal3d end to end: a cutout (PIXAL3D_IMAGE) or posed views (PIXAL3D_VIEWS
         const im = try loadPng(io, gpa, try envDir("PIXAL3D_IMAGE"));
         try photos.append(gpa, .{ .rgba = im.px, .w = im.w, .h = im.h });
     }
-    var eng = try Engine.load(io, gpa, pack);
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var eng = try Engine.loadOn(io, gpa, pack, s);
     defer eng.deinit();
     _ = mlx.mlx_reset_peak_memory();
     var vox = try eng.generateVoxels(gpa, photos.items, opts, prog);

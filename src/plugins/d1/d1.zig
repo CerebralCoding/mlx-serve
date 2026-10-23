@@ -8,6 +8,10 @@ const kev = @import("../kev/kev.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const tokenizer_mod = @import("../../host/tokenizer/tokenizer.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const plugin_config = @import("../../engines/mlx/plugin/config.zig");
+const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
+const lfm2 = @import("../lfm2/plugin.zig");
+const FsPackDir = @import("../../host/registry/pack_dir.zig").FsPackDir;
 const testing = std.testing;
 
 const A = mlx.mlx_array;
@@ -488,11 +492,29 @@ fn argmax(p: []const f64) usize {
     return best;
 }
 
+/// The LFM2 trunk through the lfm2 plugin's table, as the engine serves an LFM2 pack; the D1 marker keeps the
+/// registry's claim off the pack, so the binding is made here.
+fn bindTrunk(io: std.Io, a: std.mem.Allocator, dir: []const u8) !*plugin_config.Binding {
+    var fs = try FsPackDir.open(io, dir);
+    defer fs.close();
+    const pd = fs.packDir();
+    const buf = try a.alloc(u8, 1 << 20);
+    defer a.free(buf);
+    var why: @import("../../abi/plugin.zig").Verdict = .{};
+    const cfg = pd.readFile("config.json", buf, &why) orelse return error.D1ConfigUnreadable;
+    const b = try a.create(plugin_config.Binding);
+    b.* = .{ .table = &lfm2.table };
+    if (!lfm2.table.parse(&pd, .of(cfg), .{}, null, false, &b.parsed).isOk()) {
+        a.destroy(b);
+        return error.D1UnsupportedBase;
+    }
+    return b;
+}
+
 pub const Engine = struct {
     allocator: std.mem.Allocator,
     stream: S,
     config: model_mod.ModelConfig,
-    weights: model_mod.Weights,
     xfm: transformer_mod.Transformer,
     tok: tokenizer_mod.Tokenizer,
 
@@ -503,21 +525,20 @@ pub const Engine = struct {
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.stream = s;
-        self.config = try model_mod.parseConfig(io, allocator, dir);
+        // The legacy parse alone: the trunk's binding is made here (`bindTrunk`), never by the LM's served path.
+        self.config = try model_mod.parseConfigLegacy(io, allocator, dir);
         errdefer self.config.deinit(allocator);
         if (!std.mem.startsWith(u8, self.config.model_type, "lfm2")) return error.D1UnsupportedBase;
         self.tok = try tokenizer_mod.loadTokenizer(io, allocator, dir);
         errdefer self.tok.deinit();
-        self.weights = try model_mod.loadModelWeights(io, allocator, dir, &self.config, false);
-        errdefer self.weights.deinit();
-        model_mod.resolveWeightPrefix(&self.config, &self.weights);
-        self.xfm = try transformer_mod.Transformer.init(io, allocator, self.config, &self.weights);
+        self.config.plugin = try bindTrunk(io, allocator, dir);
+        // The shell owns its stream: the thread's default GPU stream, as the engine's own load takes.
+        self.xfm = try plugin_driver.load(io, allocator, &self.config, dir, mlx.gpuStream());
         return self;
     }
 
     pub fn deinit(self: *Engine) void {
         self.xfm.deinit();
-        self.weights.deinit();
         self.tok.deinit();
         self.config.deinit(self.allocator);
         self.allocator.destroy(self);

@@ -2,6 +2,7 @@
 //! Owns add_norm_max_rows, RESIDUAL_NORM_HEADER, RESIDUAL_NORM_SOURCE, residual_norm_kernel, residual_norm_engaged, add_rmsnorm_override, and 12 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const mamba2_decode = @import("../ssm/mamba2_decode.zig");
@@ -38,7 +39,7 @@ var add_rmsnorm_env: ?bool = null;
 fn addRmsNormFusedEnabled() bool {
     if (add_rmsnorm_override) |v| return v;
     if (add_rmsnorm_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_ADD_RMSNORM_FUSED");
+    const raw = env.get(.MLX_SERVE_ADD_RMSNORM_FUSED);
     const enabled = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
     add_rmsnorm_env = enabled;
     return enabled;

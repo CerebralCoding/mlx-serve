@@ -2,17 +2,16 @@
 //! Owns defaultCtx, module_owned_state_fields, module_shared_readonly_fields, ownsModuleDecodeState, sharesModuleReadonlyState, moduleSpecWiring, and 7 more.
 
 const std = @import("std");
-const dsv4_mod = @import("../../plugins/deepseek_v4/deepseek_v4.zig");
-const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
 const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
 const distributed_mod = @import("cluster/distributed.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const forwardDsv4WithImpl = @import("../../plugins/deepseek_v4/bridge.zig").forwardDsv4WithImpl;
-const forwardDsv41WithImpl = @import("../../plugins/deepseek_v41/bridge.zig").forwardDsv41WithImpl;
+const abi = @import("../../abi/plugin.zig");
 const ForwardCtx = @import("forward_ctx.zig").ForwardCtx;
 const testing = @import("kv/cache.zig").testing;
 const forwardMlxStream = @import("modules/mlx_stream.zig").forwardMlxStream;
 const Transformer = @import("transformer.zig").Transformer;
+const plugin_driver = @import("plugin/driver.zig");
+const intree = @import("plugin/intree.zig");
 
 /// Default forward context, routing through the Transformer's own state.
 /// Used by the single-slot legacy path and by Phase-2 prefill on a slot
@@ -35,7 +34,7 @@ pub fn defaultCtx(self: *Transformer) ForwardCtx {
 /// slot deinits and rebuilds the live request's state and both then append
 /// to the ONE state. Add a new arm here the moment its pointer field is
 /// added above, or the arch serves two clients one mangled stream.
-pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_stream_ext", "dist_peer" };
+pub const module_owned_state_fields = [_][]const u8{ "mlx_stream_ext", "dist_peer" };
 
 /// Module pointer fields that hold READ-ONLY per-model state (qwen4: the
 /// n-gram hash + mmapped table). Every per-request thing lives on the
@@ -45,7 +44,14 @@ pub const module_owned_state_fields = [_][]const u8{ "dsv4", "dsv41", "mlx_strea
 /// scheduler makes the SLOT that uses it exclusive (`slotExclusiveDecode`).
 pub const module_shared_readonly_fields = [_][]const u8{ "qwen4", "dist_tp" };
 
+/// A served model's caps; null on the legacy path.
+fn servedCaps(self: *const Transformer) ?abi.Caps {
+    if (self.plugin == null) return null;
+    return self.config.plugin.?.parsed.caps;
+}
+
 pub fn ownsModuleDecodeState(self: *const Transformer) bool {
+    if (servedCaps(self)) |c| if (c.owns_decode_state) return true;
     inline for (module_owned_state_fields) |f| {
         if (@field(self, f) != null) return true;
     }
@@ -53,6 +59,7 @@ pub fn ownsModuleDecodeState(self: *const Transformer) bool {
 }
 
 pub fn sharesModuleReadonlyState(self: *const Transformer) bool {
+    if (servedCaps(self)) |c| if (c.shared_readonly_state) return true;
     inline for (module_shared_readonly_fields) |f| {
         if (@field(self, f) != null) return true;
     }
@@ -79,18 +86,20 @@ pub fn moduleSpecWiring(self: *const Transformer) bool {
 /// has DSpark for drafting anyway.
 /// mlx-stream runs its own prompt pass: the generator hands it the whole prompt in one forward.
 pub fn prefillsWholePrompt(self: *const Transformer) bool {
+    if (servedCaps(self)) |c| if (c.whole_prompt_prefill) return true;
     return self.mlx_stream_ext != null;
 }
 
 /// DeepSeek's own DSpark draft stages (V4 or V4.1) loaded on this model.
 pub fn dsparkStages(self: *const Transformer) usize {
-    if (self.dsv4) |m| return m.n_mtp;
-    if (self.dsv41) |m| return m.n_mtp;
+    if (intree.dsv4(self)) |m| return m.n_mtp;
+    if (intree.dsv41(self)) |m| return m.n_mtp;
     if (self.mlx_stream_ext) |m| return @intFromBool(mlx_stream_mod.blockSize(m) > 0);
     return 0;
 }
 
 pub fn moduleStateSpecRollback(self: *const Transformer) bool {
+    if (servedCaps(self)) |c| if (c.spec_rollback) return true;
     // qwen4_exp: GDN per-position capture + PLE window/token capture +
     // positional QSA key histories (`ssmRollbackFromCapture`), so the MTP
     // head's verify can rewind. dsv4 cannot.
@@ -115,14 +124,10 @@ pub fn forward(self: *Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
 
 pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_array) !mlx.mlx_array {
     if (ctx.batch_slots == null) try self.ssmGroupRelease(ctx);
-    if (self.dsv4) |mdl| return forwardDsv4WithImpl(self, ctx, token_ids, mdl);
-    if (self.dsv41) |mdl| return forwardDsv41WithImpl(self, ctx, token_ids, mdl);
+    if (self.plugin) |b| return plugin_driver.forward(self, b, ctx, token_ids);
     if (self.mlx_stream_ext) |m| return forwardMlxStream(self, ctx, token_ids, m);
-    if (self.bert_layers != null) return self.forwardBertWith(ctx, token_ids);
-    // Bidirectional embedding models (EmbeddingGemma 1 on gemma3 weights, 2 on Gemma 4's) never run causal decode.
-    if (self.config.isEmbeddingGemma2()) return self.forwardEmbeddingGemma2With(ctx, token_ids);
+    // EmbeddingGemma (a bidirectional gemma3 trunk) never runs causal decode.
     if (self.config.use_bidirectional_attention) return self.forwardGemma3EncoderWith(ctx, token_ids);
-    if (self.hybrid_layers != null) return self.forwardHybridWith(ctx, token_ids);
     if (self.qwen4 != null) return self.forwardQwen4With(ctx, token_ids);
     if (self.config.isGlm5()) return self.forwardGlm5With(ctx, token_ids);
     if (self.moe_layers != null) return self.forwardMoeWith(ctx, token_ids);
@@ -132,10 +137,8 @@ pub fn forwardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_arra
 /// Does `forwardWith` route this model through `forwardStandardWith`?
 /// Mirrors the dispatch chain above IN ORDER.
 pub fn usesStandardForward(self: *const Transformer) bool {
-    return self.dsv4 == null and self.dsv41 == null and self.mlx_stream_ext == null and
-        self.bert_layers == null and
+    return self.plugin == null and self.mlx_stream_ext == null and
         !self.config.use_bidirectional_attention and
-        self.hybrid_layers == null and
         self.moe_layers == null;
 }
 
@@ -145,8 +148,9 @@ pub fn usesStandardForward(self: *const Transformer) bool {
 /// `DflashModel.bind` gates on this predicate. Mirrors the dispatch chain
 /// above IN ORDER.
 pub fn supportsLayerCapture(self: *const Transformer) bool {
-    return self.dsv4 == null and self.dsv41 == null and self.mlx_stream_ext == null and
-        self.bert_layers == null and
+    // A served plugin captures layers; a drafter also reads the trunk's embedding and head (`Bound.drafters`).
+    if (self.plugin) |b| return b.drafters;
+    return self.mlx_stream_ext == null and
         !self.config.use_bidirectional_attention;
 }
 
@@ -159,23 +163,14 @@ test "ownsModuleDecodeState covers every module-owned arch" {
     // clobber, verbatim. The predicate reads a NAMED LIST so it cannot
     // drift from itself; this test pins the list against the struct.
     var t: Transformer = undefined;
+    t.plugin = null;
     t.rht = null;
-    t.dsv4 = null;
-    t.dsv41 = null;
     t.mlx_stream_ext = null;
     t.qwen4 = null;
     t.dist_peer = null;
     t.dist_tp = null;
     try testing.expect(!t.ownsModuleDecodeState());
 
-    var fake_dsv4: dsv4_mod.Dsv4Model = undefined;
-    t.dsv4 = &fake_dsv4;
-    try testing.expect(t.ownsModuleDecodeState());
-    t.dsv4 = null;
-    var fake_dsv41: dsv41_mod.Dsv41Model = undefined;
-    t.dsv41 = &fake_dsv41;
-    try testing.expect(t.ownsModuleDecodeState());
-    t.dsv41 = null;
     var fake_ext: mlx_stream_mod.Model = undefined;
     t.mlx_stream_ext = &fake_ext;
     try testing.expect(t.ownsModuleDecodeState());

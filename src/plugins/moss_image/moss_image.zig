@@ -27,20 +27,29 @@ const model_mod = @import("../../engines/mlx/model.zig");
 const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const scope_mod = @import("../../mlx/scope.zig");
+const ops = @import("../../mlx/ops.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
+const dit_base = @import("../../sdk/bases/dit.zig");
+const rope_blk = @import("../../sdk/blocks/dit/rope.zig");
+const Linear = @import("../../sdk/blocks/dit/linear.zig").Linear;
+const resnet_blk = @import("../../sdk/blocks/vae/resnet.zig");
+const conv_blk = @import("../../sdk/blocks/vae/conv.zig");
+const flow_match = @import("../../sdk/blocks/schedulers/flow_match.zig");
 
 const Weights = model_mod.Weights;
 const Scope = scope_mod.Scope;
-const Lin = scope_mod.Linear;
+const Graph = ops.Graph;
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
 
+const config = @import("config.zig");
+
 pub const DEFAULT_STEPS: u32 = 50;
-pub const DEFAULT_GUIDANCE: f32 = 3.0;
+pub const DEFAULT_GUIDANCE = config.DEFAULT_GUIDANCE;
 /// Zero-based block the negative branch skips (README: 22, 24 and 26 all help).
 const UNCOND_SKIP_LAYER: u32 = 22;
 pub const MAX_PROMPT_TOKENS: usize = 4096;
-pub const VAE_DOWNSAMPLE: u32 = 16;
+pub const VAE_DOWNSAMPLE = config.VAE_DOWNSAMPLE;
 const TRAIN_STEPS: usize = 1000;
 const EPS: f32 = 1e-6;
 /// Four RoPE axes of `head_dim / 8` bands each, built on the stack.
@@ -143,7 +152,7 @@ fn linspaceTorch(out: []f32, start: f32, end: f32) void {
 fn shiftedGrid(out: []f32, shift: f32) void {
     const lower: f64 = @as(f64, shift) / (@as(f64, TRAIN_STEPS) + @as(f64, shift) - 1.0);
     linspaceTorch(out, 1.0, @floatCast(lower));
-    for (out) |*v| v.* = shift * v.* / (1.0 + (shift - 1.0) * v.*);
+    for (out) |*v| v.* = flow_match.timeShift(f32, shift, v.*);
 }
 
 /// The release's sigmas for `steps`: the shifted grid snapped to the nearest
@@ -290,12 +299,12 @@ const Block = struct {
     norm2: A,
     q_norm: A,
     k_norm: A,
-    q: Lin,
-    k: Lin,
-    v: Lin,
-    o: Lin,
-    up_gate: Lin,
-    down: Lin,
+    q: Linear,
+    k: Linear,
+    v: Linear,
+    o: Linear,
+    up_gate: Linear,
+    down: Linear,
     lora: BlockLora = .{},
 };
 
@@ -304,34 +313,53 @@ const TextBlock = struct {
     norm2: A,
     q_norm: A,
     k_norm: A,
-    qkv: Lin,
-    proj: Lin,
-    ffn_gate: Lin,
-    ffn_up: Lin,
-    ffn_down: Lin,
+    qkv: Linear,
+    proj: Linear,
+    ffn_gate: Linear,
+    ffn_up: Linear,
+    ffn_down: Linear,
 };
 
+/// A checkpoint linear (dense or affine-quantized, optional bias) as the op layer's `Linear`.
+fn linear(w: *const Weights, comptime fmt: []const u8, args: anytype, in_dim: u32) !Linear {
+    const l = try scope_mod.linear(w, fmt, args, in_dim);
+    return .{ .w = l.w, .scales = l.scales, .biases = l.biases, .bias = l.bias, .bits = l.bits, .group_size = l.group_size };
+}
+
 /// `lin(x)` plus every adapter attached to it.
-fn linL(sc: *Scope, l: *const Lin, slot: *const lora_mod.Slot, x: A) !A {
-    const y = try l.forward(sc, x);
-    if (slot.count == 0) return y;
-    return sc.keep(try lora_mod.addTo(y, x, slot.active(), sc.s));
+fn linL(g: *Graph, l: *const Linear, slot: *const lora_mod.Slot, x: A) !A {
+    var c = g.scope();
+    defer c.deinit();
+    const y = try l.forward(&c, x);
+    if (slot.count == 0) return g.keep(y);
+    return g.adopt(try lora_mod.addTo(y, x, slot.active(), g.s));
 }
 
-fn situ(sc: *Scope, hidden: A, gate: A) !A {
-    const g = try sc.mul(try sc.mulLike(try sc.tanh(try sc.mulLike(gate, 0.25)), 4.0), try sc.sigmoid(gate));
-    const h = try sc.mulLike(try sc.tanh(try sc.div(hidden, try sc.scalarLike(hidden, 25.0))), 25.0);
-    return sc.mul(g, h);
+/// SiTU-GLU: (4·tanh(g/4)·σ(g)) · (25·tanh(h/25)), in the activation's dtype.
+fn situ(g: *Graph, hidden: A, gate: A) !A {
+    var c = g.scope();
+    defer c.deinit();
+    const gg = try c.mul(try c.mulScalar(try c.tanh(try c.mulScalar(gate, 0.25)), 4.0), try c.sigmoid(gate));
+    const hh = try c.mulScalar(try c.tanh(try c.div(hidden, try c.scalarLike(hidden, 25.0))), 25.0);
+    return g.keep(try c.mul(gg, hh));
 }
 
-/// Rotate-half RoPE on x [1, L, H, D] with per-pair angles: cos/sin [1, L, 1, D/2].
-fn rotate(sc: *Scope, x: A, cos: A, sin: A) !A {
-    const d = mlx.getShape(x)[3];
-    const x1 = try sc.slice(x, 3, 0, @divExact(d, 2));
-    const x2 = try sc.slice(x, 3, @divExact(d, 2), d);
-    const lo = try sc.sub(try sc.mul(x1, cos), try sc.mul(x2, sin));
-    const hi = try sc.add(try sc.mul(x2, cos), try sc.mul(x1, sin));
-    return sc.concat(&.{ lo, hi }, 3);
+/// [1, L, H·D] → per-head RMS norm and rotate-half RoPE (q, k) → [1, H, L, D]; cos/sin [1, L, 1, D/2].
+fn heads(g: *Graph, y: A, n_heads: u32, norm: ?A, cos: A, sin: A) !A {
+    var c = g.scope();
+    defer c.deinit();
+    const sh = ops.shape(y);
+    const h: c_int = @intCast(n_heads);
+    const x4 = try c.reshape(y, &.{ sh[0], sh[1], h, @divExact(sh[2], h) });
+    const r = if (norm) |nw| try rope_blk.ropeSplitHalf(&c, try c.rmsNorm(x4, nw, EPS), cos, sin, @divExact(sh[2], 2 * h)) else x4;
+    return g.keep(try c.transpose(r, &.{ 0, 2, 1, 3 }));
+}
+
+fn attend(g: *Graph, cfg: DitConfig, q: A, k: A, v: A) !A {
+    var c = g.scope();
+    defer c.deinit();
+    const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.headDim())));
+    return g.keep(try c.mergeHeads(try c.sdpa(q, k, v, scale, .none)));
 }
 
 /// One joint sequence's RoPE table (image rows then text rows), in the compute dtype.
@@ -400,20 +428,76 @@ const Mod = struct {
     }
 };
 
+/// What MOSS-Image hands the sdk DiT skeleton: pre-norm adaLN blocks over one shared modulation (`folded`), its
+/// SiTU-GLU and 4-axis rotate-half RoPE.
+const Hooks = struct {
+    pub const Layer = Block;
+    pub const Model = Dit;
+    pub const Input = struct { latents: A, text: A };
+    pub const Ctx = struct { mod: *const Mod, rope: *const Rope, cfg: DitConfig };
+    pub const mod: dit_base.Modulation = .folded;
+
+    pub fn embed(g: *Graph, m: *const Dit, in: Input, _: Ctx) !A {
+        var c = g.scope();
+        defer c.deinit();
+        return g.keep(try c.concat(&.{ try m.video_embedder.forward(&c, try c.astype(in.latents, COMPUTE)), in.text }, 1));
+    }
+    pub fn layers(m: *const Dit) usize {
+        return m.blocks.len;
+    }
+    pub fn layer(m: *const Dit, i: usize) *const Block {
+        return &m.blocks[i];
+    }
+    pub fn mods(ctx: Ctx, _: usize) dit_base.Mods {
+        const r = ctx.mod.rows;
+        return .{ .shift_a = r[0], .scale_a = r[1], .gate_a = r[2], .shift_f = r[3], .scale_f = r[4], .gate_f = r[5] };
+    }
+    pub fn norm1(g: *Graph, b: *const Block, x: A) !A {
+        return g.rmsNorm(x, b.norm1, EPS);
+    }
+    pub fn norm2(g: *Graph, b: *const Block, x: A) !A {
+        return g.rmsNorm(x, b.norm2, EPS);
+    }
+    pub fn attention(g: *Graph, b: *const Block, y: A, ctx: Ctx) !A {
+        var c = g.scope();
+        defer c.deinit();
+        const cfg = ctx.cfg;
+        const q = try heads(&c, try linL(&c, &b.q, &b.lora.q, y), cfg.heads, b.q_norm, ctx.rope.cos, ctx.rope.sin);
+        const k = try heads(&c, try linL(&c, &b.k, &b.lora.k, y), cfg.heads, b.k_norm, ctx.rope.cos, ctx.rope.sin);
+        const v = try heads(&c, try linL(&c, &b.v, &b.lora.v, y), cfg.heads, null, ctx.rope.cos, ctx.rope.sin);
+        return g.keep(try linL(&c, &b.o, &b.lora.o, try attend(&c, cfg, q, k, v)));
+    }
+    pub fn ffn(g: *Graph, b: *const Block, y: A, ctx: Ctx) !A {
+        var c = g.scope();
+        defer c.deinit();
+        const f: c_int = @intCast(ctx.cfg.ffn_dim);
+        const hg = try linL(&c, &b.up_gate, &b.lora.up_gate, y);
+        return g.keep(try linL(&c, &b.down, &b.lora.down, try situ(&c, try c.sliceAxis(hg, 2, 0, f), try c.sliceAxis(hg, 2, f, 2 * f))));
+    }
+    pub fn final(g: *Graph, m: *const Dit, x: A, ctx: Ctx) !A {
+        var c = g.scope();
+        defer c.deinit();
+        const img = try c.sliceAxis(x, 1, 0, ctx.rope.n_img);
+        const r = ctx.mod.rows;
+        const y = try mod.apply(&c, try c.rmsNorm(img, m.final_norm, EPS), r[7], r[6]);
+        return g.keep(try c.astype(try m.final_linear.forward(&c, y), .float32));
+    }
+};
+
 pub const Dit = struct {
     allocator: std.mem.Allocator,
     s: S,
     cfg: DitConfig,
     w: Weights,
-    video_embedder: Lin,
-    text_proj: Lin,
+    video_embedder: Linear,
+    text_proj: Linear,
     text_blocks: [2]TextBlock,
-    t1: Lin,
-    t2: Lin,
-    block_mod: Lin,
-    head_mod: Lin,
+    t1: Linear,
+    t2: Linear,
+    block_mod: Linear,
+    head_mod: Linear,
     final_norm: A,
-    final_linear: Lin,
+    final_linear: Linear,
     blocks: []Block,
 
     pub fn load(io: std.Io, a: std.mem.Allocator, s: S, model_dir: []const u8, cfg: DitConfig) !Dit {
@@ -427,25 +511,25 @@ pub const Dit = struct {
         errdefer self.w.deinit();
         const w = &self.w;
         const d = cfg.dim;
-        self.video_embedder = try scope_mod.linear(w, "video_embedder", .{}, cfg.latent_channels);
-        self.text_proj = try scope_mod.linear(w, "text_embedder.proj", .{}, cfg.text_dim);
+        self.video_embedder = try linear(w, "video_embedder", .{}, cfg.latent_channels);
+        self.text_proj = try linear(w, "text_embedder.proj", .{}, cfg.text_dim);
         for (&self.text_blocks, 0..) |*b, i| b.* = .{
             .norm1 = try scope_mod.getW(w, "text_embedder.blocks.{d}.norm1.weight", .{i}),
             .norm2 = try scope_mod.getW(w, "text_embedder.blocks.{d}.norm2.weight", .{i}),
             .q_norm = try scope_mod.getW(w, "text_embedder.blocks.{d}.q_norm.weight", .{i}),
             .k_norm = try scope_mod.getW(w, "text_embedder.blocks.{d}.k_norm.weight", .{i}),
-            .qkv = try scope_mod.linear(w, "text_embedder.blocks.{d}.qkv", .{i}, d),
-            .proj = try scope_mod.linear(w, "text_embedder.blocks.{d}.proj", .{i}, d),
-            .ffn_gate = try scope_mod.linear(w, "text_embedder.blocks.{d}.ffn_gate", .{i}, d),
-            .ffn_up = try scope_mod.linear(w, "text_embedder.blocks.{d}.ffn_up", .{i}, d),
-            .ffn_down = try scope_mod.linear(w, "text_embedder.blocks.{d}.ffn_down", .{i}, cfg.ffn_dim),
+            .qkv = try linear(w, "text_embedder.blocks.{d}.qkv", .{i}, d),
+            .proj = try linear(w, "text_embedder.blocks.{d}.proj", .{i}, d),
+            .ffn_gate = try linear(w, "text_embedder.blocks.{d}.ffn_gate", .{i}, d),
+            .ffn_up = try linear(w, "text_embedder.blocks.{d}.ffn_up", .{i}, d),
+            .ffn_down = try linear(w, "text_embedder.blocks.{d}.ffn_down", .{i}, cfg.ffn_dim),
         };
-        self.t1 = try scope_mod.linear(w, "time_embedding.0", .{}, 256);
-        self.t2 = try scope_mod.linear(w, "time_embedding.2", .{}, d);
-        self.block_mod = try scope_mod.linear(w, "shared_block_modulation", .{}, d);
-        self.head_mod = try scope_mod.linear(w, "video_head_modulation", .{}, d);
+        self.t1 = try linear(w, "time_embedding.0", .{}, 256);
+        self.t2 = try linear(w, "time_embedding.2", .{}, d);
+        self.block_mod = try linear(w, "shared_block_modulation", .{}, d);
+        self.head_mod = try linear(w, "video_head_modulation", .{}, d);
         self.final_norm = try scope_mod.getW(w, "final_norm_video.weight", .{});
-        self.final_linear = try scope_mod.linear(w, "final_linear_video", .{}, d);
+        self.final_linear = try linear(w, "final_linear_video", .{}, d);
         if (countLayers(w) != cfg.layers) return error.MossImageBadConfig;
         self.blocks = try a.alloc(Block, cfg.layers);
         errdefer a.free(self.blocks);
@@ -454,12 +538,12 @@ pub const Dit = struct {
             .norm2 = try scope_mod.getW(w, "layers.{d}.norm2.weight", .{i}),
             .q_norm = try scope_mod.getW(w, "layers.{d}.q_norm.weight", .{i}),
             .k_norm = try scope_mod.getW(w, "layers.{d}.k_norm.weight", .{i}),
-            .q = try scope_mod.linear(w, "layers.{d}.proj.q", .{i}, d),
-            .k = try scope_mod.linear(w, "layers.{d}.proj.k", .{i}, d),
-            .v = try scope_mod.linear(w, "layers.{d}.proj.v", .{i}, d),
-            .o = try scope_mod.linear(w, "layers.{d}.proj.o", .{i}, d),
-            .up_gate = try scope_mod.linear(w, "layers.{d}.proj.ffn_up_gate", .{i}, d),
-            .down = try scope_mod.linear(w, "layers.{d}.proj.ffn_down", .{i}, cfg.ffn_dim),
+            .q = try linear(w, "layers.{d}.proj.q", .{i}, d),
+            .k = try linear(w, "layers.{d}.proj.k", .{i}, d),
+            .v = try linear(w, "layers.{d}.proj.v", .{i}, d),
+            .o = try linear(w, "layers.{d}.proj.o", .{i}, d),
+            .up_gate = try linear(w, "layers.{d}.proj.ffn_up_gate", .{i}, d),
+            .down = try linear(w, "layers.{d}.proj.ffn_down", .{i}, cfg.ffn_dim),
         };
         return self;
     }
@@ -493,39 +577,25 @@ pub const Dit = struct {
         for (self.blocks) |*b| b.lora = .{};
     }
 
-    /// Project → per-head RMS norm → RoPE → [1, H, L, D].
-    fn heads(self: *const Dit, sc: *Scope, y: A, norm: ?A, cos: A, sin: A) !A {
-        const sh = mlx.getShape(y);
-        const h: c_int = @intCast(self.cfg.heads);
-        const x4 = try sc.reshape(y, &.{ sh[0], sh[1], h, @divExact(sh[2], h) });
-        const r = if (norm) |nw| try rotate(sc, try sc.rms(x4, nw, EPS), cos, sin) else x4;
-        return sc.transpose(r, &.{ 0, 2, 1, 3 });
-    }
-
-    fn attend(self: *const Dit, sc: *Scope, q: A, k: A, v: A) !A {
-        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(self.cfg.headDim())));
-        return sc.merge(try sc.sdpa(q, k, v, scale));
-    }
-
     /// The prompt's two refiner blocks, once per request: hidden [1, T, text_dim] → [1, T, dim].
     pub fn embedText(self: *const Dit, hidden: A, rope: *const Rope) !A {
-        var sc = Scope.init(self.allocator, self.s);
-        defer sc.deinit();
-        const n_all = mlx.getShape(rope.cos)[1];
-        const cos = try sc.slice(rope.cos, 1, rope.n_img, n_all);
-        const sin = try sc.slice(rope.sin, 1, rope.n_img, n_all);
-        var x = try self.text_proj.forward(&sc, try sc.astype(hidden, COMPUTE));
+        var g = Graph.init(self.allocator, self.s);
+        defer g.deinit();
+        const n_all = ops.shape(rope.cos)[1];
+        const cos = try g.sliceAxis(rope.cos, 1, rope.n_img, n_all);
+        const sin = try g.sliceAxis(rope.sin, 1, rope.n_img, n_all);
+        var x = try self.text_proj.forward(&g, try g.astype(hidden, COMPUTE));
         const d: c_int = @intCast(self.cfg.dim);
         for (&self.text_blocks) |*b| {
-            const qkv = try b.qkv.forward(&sc, try sc.rms(x, b.norm1, EPS));
-            const q = try self.heads(&sc, try sc.slice(qkv, 2, 0, d), b.q_norm, cos, sin);
-            const k = try self.heads(&sc, try sc.slice(qkv, 2, d, 2 * d), b.k_norm, cos, sin);
-            const v = try self.heads(&sc, try sc.slice(qkv, 2, 2 * d, 3 * d), null, cos, sin);
-            x = try sc.add(x, try b.proj.forward(&sc, try self.attend(&sc, q, k, v)));
-            const y = try sc.rms(x, b.norm2, EPS);
-            x = try sc.add(x, try b.ffn_down.forward(&sc, try situ(&sc, try b.ffn_up.forward(&sc, y), try b.ffn_gate.forward(&sc, y))));
+            const qkv = try b.qkv.forward(&g, try g.rmsNorm(x, b.norm1, EPS));
+            const q = try heads(&g, try g.sliceAxis(qkv, 2, 0, d), self.cfg.heads, b.q_norm, cos, sin);
+            const k = try heads(&g, try g.sliceAxis(qkv, 2, d, 2 * d), self.cfg.heads, b.k_norm, cos, sin);
+            const v = try heads(&g, try g.sliceAxis(qkv, 2, 2 * d, 3 * d), self.cfg.heads, null, cos, sin);
+            x = try g.add(x, try b.proj.forward(&g, try attend(&g, self.cfg, q, k, v)));
+            const y = try g.rmsNorm(x, b.norm2, EPS);
+            x = try g.add(x, try b.ffn_down.forward(&g, try situ(&g, try b.ffn_up.forward(&g, y), try b.ffn_gate.forward(&g, y))));
         }
-        const out = sc.out(x);
+        const out = g.escape(x);
         errdefer _ = mlx.mlx_array_free(out);
         try mlx.check(mlx.mlx_array_eval(out));
         return out;
@@ -533,8 +603,8 @@ pub const Dit = struct {
 
     /// One step's modulation from the sampler timestep `t` (sigma x 1000).
     fn modulation(self: *const Dit, t: f32) !Mod {
-        var sc = Scope.init(self.allocator, self.s);
-        defer sc.deinit();
+        var g = Graph.init(self.allocator, self.s);
+        defer g.deinit();
         // The reference computes the sinusoid in f64 and feeds f32 to the MLP.
         var buf: [256]f32 = undefined;
         for (0..128) |k| {
@@ -543,61 +613,30 @@ pub const Dit = struct {
             buf[k] = @floatCast(@cos(phase));
             buf[128 + k] = @floatCast(@sin(phase));
         }
-        const emb = try sc.astype(try sc.fromF32(&buf, &.{ 1, 256 }), COMPUTE);
-        const time = try self.t2.forward(&sc, try sc.silu(try self.t1.forward(&sc, emb)));
+        const emb = try g.astype(try g.fromSlice(f32, &buf, &.{ 1, 256 }), COMPUTE);
+        const time = try self.t2.forward(&g, try g.silu(try self.t1.forward(&g, emb)));
         const d: c_int = @intCast(self.cfg.dim);
-        const bm = try self.block_mod.forward(&sc, time);
-        const hm = try self.head_mod.forward(&sc, time);
+        const bm = try self.block_mod.forward(&g, time);
+        const hm = try self.head_mod.forward(&g, time);
         var rows: [8]A = undefined;
         for (&rows, 0..) |*r, i| {
             const j: c_int = @intCast(if (i < 6) i else i - 6);
-            r.* = try sc.reshape(try sc.slice(if (i < 6) bm else hm, 1, j * d, (j + 1) * d), &.{ 1, 1, d });
-            if (i == 1 or i == 4 or i == 7) r.* = try sc.add(r.*, try sc.scalarLike(r.*, 1.0));
+            r.* = try g.reshape(try g.sliceAxis(if (i < 6) bm else hm, 1, j * d, (j + 1) * d), &.{ 1, 1, d });
+            if (i == 1 or i == 4 or i == 7) r.* = try g.add(r.*, try g.scalarLike(r.*, 1.0));
         }
-        const all = try sc.concat(&rows, 0);
-        try mlx.check(mlx.mlx_array_eval(all));
+        try ops.eval(try g.concat(&rows, 0));
         var m: Mod = undefined;
-        for (&m.rows, rows) |*o, r| o.* = sc.out(r);
+        for (&m.rows, rows) |*o, r| o.* = g.escape(r);
         return m;
-    }
-
-    fn block(self: *const Dit, b: *const Block, x: A, m: *const Mod, rope: *const Rope) !A {
-        var sc = Scope.init(self.allocator, self.s);
-        defer sc.deinit();
-        const y = try sc.add(try sc.mul(try sc.rms(x, b.norm1, EPS), m.rows[1]), m.rows[0]);
-        const q = try self.heads(&sc, try linL(&sc, &b.q, &b.lora.q, y), b.q_norm, rope.cos, rope.sin);
-        const k = try self.heads(&sc, try linL(&sc, &b.k, &b.lora.k, y), b.k_norm, rope.cos, rope.sin);
-        const v = try self.heads(&sc, try linL(&sc, &b.v, &b.lora.v, y), null, rope.cos, rope.sin);
-        const attn = try linL(&sc, &b.o, &b.lora.o, try self.attend(&sc, q, k, v));
-        const h = try sc.add(x, try sc.mul(attn, m.rows[2]));
-        const y2 = try sc.add(try sc.mul(try sc.rms(h, b.norm2, EPS), m.rows[4]), m.rows[3]);
-        const hg = try linL(&sc, &b.up_gate, &b.lora.up_gate, y2);
-        const f: c_int = @intCast(self.cfg.ffn_dim);
-        const ffn = try linL(&sc, &b.down, &b.lora.down, try situ(&sc, try sc.slice(hg, 2, 0, f), try sc.slice(hg, 2, f, 2 * f)));
-        return sc.out(try sc.add(h, try sc.mul(ffn, m.rows[5])));
     }
 
     /// Velocity [1, HW, 128] f32 for latents [1, HW, 128] against a refined prompt
     /// `text` [1, T, dim], optionally skipping one block (the negative branch).
     pub fn forward(self: *const Dit, latents: A, text: A, m: *const Mod, rope: *const Rope, skip: ?u32) !A {
-        var x = blk: {
-            var sc = Scope.init(self.allocator, self.s);
-            defer sc.deinit();
-            const video = try self.video_embedder.forward(&sc, try sc.astype(latents, COMPUTE));
-            break :blk sc.out(try sc.concat(&.{ video, text }, 1));
-        };
-        defer _ = mlx.mlx_array_free(x);
-        for (self.blocks, 0..) |*b, i| {
-            if (skip != null and skip.? == i) continue;
-            const next = try self.block(b, x, m, rope);
-            _ = mlx.mlx_array_free(x);
-            x = next;
-        }
-        var sc = Scope.init(self.allocator, self.s);
-        defer sc.deinit();
-        const img = try sc.slice(x, 1, 0, rope.n_img);
-        const y = try sc.add(try sc.mul(try sc.rms(img, self.final_norm, EPS), m.rows[7]), m.rows[6]);
-        return sc.out(try sc.astype(try self.final_linear.forward(&sc, y), .float32));
+        var g = Graph.init(self.allocator, self.s);
+        defer g.deinit();
+        const ctx: Hooks.Ctx = .{ .mod = m, .rope = rope, .cfg = self.cfg };
+        return g.escape(try dit_base.Dit(Hooks).forward(&g, self, .{ .latents = latents, .text = text }, ctx, if (skip) |k| k else null));
     }
 };
 
@@ -610,7 +649,8 @@ fn countLayers(w: *const Weights) usize {
 
 // ── VAE decoder (FLUX.2 small decoder, diffusers layout, f32) ──
 
-const Res = struct { n1w: A, n1b: A, c1w: A, c1b: A, n2w: A, n2b: A, c2w: A, c2b: A, sw: ?A, sb: ?A };
+const Res = resnet_blk.Resnet;
+const vae_norm: resnet_blk.Norm = .{ .axes = .{ .eps = 1e-6 } };
 
 const Vae = struct {
     allocator: std.mem.Allocator,
@@ -626,7 +666,7 @@ const Vae = struct {
     conv_in_b: A,
     mid: [2]Res,
     attn_gn: [2]A,
-    attn: [4]Lin, // q, k, v, out
+    attn: struct { q: Linear, k: Linear, v: Linear, o: Linear },
     up: [8][4]Res,
     up_res: [8]usize,
     up_conv: [8]?[2]A,
@@ -665,8 +705,8 @@ const Vae = struct {
         self.conv_in_b = try self.vec("decoder.conv_in.bias", .{});
         for (&self.mid, 0..) |*r, i| r.* = try self.resnet("decoder.mid_block.resnets.{d}", .{i});
         self.attn_gn = .{ try self.vec("decoder.mid_block.attentions.0.group_norm.weight", .{}), try self.vec("decoder.mid_block.attentions.0.group_norm.bias", .{}) };
-        inline for (.{ "to_q", "to_k", "to_v" }, 0..) |n, i| self.attn[i] = try self.dense("decoder.mid_block.attentions.0." ++ n);
-        self.attn[3] = if (self.w.get("decoder.mid_block.attentions.0.to_out.0.weight") != null)
+        inline for (.{ "to_q", "to_k", "to_v" }, .{ "q", "k", "v" }) |n, f| @field(self.attn, f) = try self.dense("decoder.mid_block.attentions.0." ++ n);
+        self.attn.o = if (self.w.get("decoder.mid_block.attentions.0.to_out.0.weight") != null)
             try self.dense("decoder.mid_block.attentions.0.to_out.0")
         else
             try self.dense("decoder.mid_block.attentions.0.to_out");
@@ -722,7 +762,7 @@ const Vae = struct {
         return self.own(sc.out(c));
     }
 
-    fn dense(self: *Vae, comptime prefix: []const u8) !Lin {
+    fn dense(self: *Vae, comptime prefix: []const u8) !Linear {
         return .{ .w = try self.vec(prefix ++ ".weight", .{}), .bias = try self.vec(prefix ++ ".bias", .{}) };
     }
 
@@ -745,88 +785,46 @@ const Vae = struct {
         };
     }
 
-    /// PyTorch GroupNorm(32, eps 1e-6) on NHWC.
-    fn groupNorm(sc: *Scope, x: A, w: A, b: A) !A {
-        const sh = mlx.getShape(x);
-        const g = try sc.reshape(x, &.{ sh[0], sh[1] * sh[2], 32, @divExact(sh[3], 32) });
-        const axes = [_]c_int{ 1, 3 };
-        var om = mlx.mlx_array_new();
-        const mean = try sc.res(mlx.mlx_mean_axes(&om, g, &axes, 2, true, sc.s), &om);
-        const xc = try sc.sub(g, mean);
-        var ov = mlx.mlx_array_new();
-        const variance = try sc.res(mlx.mlx_mean_axes(&ov, try sc.mul(xc, xc), &axes, 2, true, sc.s), &ov);
-        var orr = mlx.mlx_array_new();
-        const inv = try sc.res(mlx.mlx_rsqrt(&orr, try sc.addS(variance, 1e-6), sc.s), &orr);
-        return sc.add(try sc.mul(try sc.reshape(try sc.mul(xc, inv), sh), w), b);
-    }
-
-    fn convB(sc: *Scope, x: A, w: A, b: A) !A {
-        const pad: c_int = @divExact(mlx.getShape(w)[1] - 1, 2);
-        return sc.add(try sc.conv2d(x, w, 1, pad), b);
-    }
-
-    fn resForward(sc: *Scope, r: *const Res, x: A) !A {
-        const h = try convB(sc, try sc.silu(try groupNorm(sc, x, r.n1w, r.n1b)), r.c1w, r.c1b);
-        const h2 = try convB(sc, try sc.silu(try groupNorm(sc, h, r.n2w, r.n2b)), r.c2w, r.c2b);
-        const skip = if (r.sw) |sw| try convB(sc, x, sw, r.sb.?) else x;
-        return sc.add(h2, skip);
-    }
-
     /// Packed latents [1, h, w, 128] (token layout, channel = c·4 + ph·2 + pw) →
     /// image [1, 3, 16h, 16w] f32 in [0, 1].
     fn decode(self: *const Vae, packed_lat: A) !A {
         const a = self.allocator;
         const s = self.s;
         var x = blk: {
-            var sc = Scope.init(a, s);
-            defer sc.deinit();
-            const sh = mlx.getShape(packed_lat);
-            const z = try sc.add(try sc.mul(try sc.astype(packed_lat, .float32), self.bn_std), self.bn_mean);
-            const u = try sc.reshape(try sc.transpose(try sc.reshape(z, &.{ 1, sh[1], sh[2], 32, 2, 2 }), &.{ 0, 1, 4, 2, 5, 3 }), &.{ 1, sh[1] * 2, sh[2] * 2, 32 });
-            const h = try convB(&sc, try convB(&sc, u, self.pq_w, self.pq_b), self.conv_in_w, self.conv_in_b);
-            const m0 = try resForward(&sc, &self.mid[0], h);
-            const hs = mlx.getShape(m0);
-            const c = hs[3];
-            const n = try groupNorm(&sc, m0, self.attn_gn[0], self.attn_gn[1]);
-            const flat = try sc.reshape(n, &.{ 1, 1, hs[1] * hs[2], c });
-            const q = try self.attn[0].forward(&sc, flat);
-            const k = try self.attn[1].forward(&sc, flat);
-            const v = try self.attn[2].forward(&sc, flat);
-            const at = try sc.sdpa(q, k, v, 1.0 / @sqrt(@as(f32, @floatFromInt(c))));
-            const m1 = try sc.add(m0, try sc.reshape(try self.attn[3].forward(&sc, at), hs));
-            break :blk sc.out(try resForward(&sc, &self.mid[1], m1));
+            var g = Graph.init(a, s);
+            defer g.deinit();
+            const sh = ops.shape(packed_lat);
+            const z = try g.add(try g.mul(try g.astype(packed_lat, .float32), self.bn_std), self.bn_mean);
+            const u = try g.reshape(try g.transpose(try g.reshape(z, &.{ 1, sh[1], sh[2], 32, 2, 2 }), &.{ 0, 1, 4, 2, 5, 3 }), &.{ 1, sh[1] * 2, sh[2] * 2, 32 });
+            const h = try conv_blk.conv2d(&g, try conv_blk.conv2d(&g, u, self.pq_w, self.pq_b, 1, 0, 1), self.conv_in_w, self.conv_in_b, 1, 1, 1);
+            const m0 = try self.mid[0].forward(&g, vae_norm, h);
+            const m1 = try resnet_blk.midAttention(&g, vae_norm, m0, self.attn_gn[0], self.attn_gn[1], self.attn);
+            break :blk g.escape(try self.mid[1].forward(&g, vae_norm, m1));
         };
         defer _ = mlx.mlx_array_free(x);
         try mlx.check(mlx.mlx_array_eval(x));
         for (0..self.n_up) |bi| {
-            // The scope ends before the eval: a live handle would pin every full-resolution intermediate.
+            // The graph ends before the eval: a live handle would pin every full-resolution intermediate.
             const next = blk: {
-                var sc = Scope.init(a, s);
-                defer sc.deinit();
+                var g = Graph.init(a, s);
+                defer g.deinit();
                 var h = x;
-                for (self.up[bi][0..self.up_res[bi]]) |*r| h = try resForward(&sc, r, h);
-                if (self.up_conv[bi]) |uc| {
-                    var o1 = mlx.mlx_array_new();
-                    const r1 = try sc.res(mlx.mlx_repeat_axis(&o1, h, 2, 1, s), &o1);
-                    var o2 = mlx.mlx_array_new();
-                    const r2 = try sc.res(mlx.mlx_repeat_axis(&o2, r1, 2, 2, s), &o2);
-                    h = try convB(&sc, r2, uc[0], uc[1]);
-                }
-                break :blk sc.out(h);
+                for (self.up[bi][0..self.up_res[bi]]) |*r| h = try r.forward(&g, vae_norm, h);
+                if (self.up_conv[bi]) |uc| h = try conv_blk.upsample2x(&g, h, uc[0], uc[1]);
+                break :blk g.escape(h);
             };
             _ = mlx.mlx_array_free(x);
             x = next;
             try mlx.check(mlx.mlx_array_eval(x));
         }
-        var sc = Scope.init(a, s);
-        defer sc.deinit();
-        const img = try convB(&sc, try sc.silu(try groupNorm(&sc, x, self.norm_out[0], self.norm_out[1])), self.conv_out_w, self.conv_out_b);
-        var oc = mlx.mlx_array_new();
-        const clipped = try sc.res(mlx.mlx_clip(&oc, try sc.mulS(try sc.addS(img, 1.0), 0.5), try sc.scalar(0), try sc.scalar(1), s), &oc);
-        var ct = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(ct);
-        try mlx.check(mlx.mlx_contiguous(&ct, try sc.transpose(clipped, &.{ 0, 3, 1, 2 }), false, s));
-        return ct;
+        var g = Graph.init(a, s);
+        defer g.deinit();
+        const n = try vae_norm.apply(&g, x, self.norm_out[0], self.norm_out[1]);
+        const img = try conv_blk.conv2d(&g, try g.silu(n), self.conv_out_w, self.conv_out_b, 1, 1, 1);
+        const unit = try g.mul(try g.add(img, try g.scalar(1.0, .float32)), try g.scalar(0.5, .float32));
+        const clipped = try g.call(mlx.mlx_clip, .{ unit, try g.scalar(0, .float32), try g.scalar(1, .float32) });
+        const out = g.escape(try g.contiguous(try g.transpose(clipped, &.{ 0, 3, 1, 2 })));
+        return out;
     }
 };
 
@@ -855,12 +853,13 @@ pub const Engine = struct {
     /// The block the negative branch skips; a pack shallower than the default has none.
     uncond_skip: ?u32,
 
-    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Engine {
+    /// Every array of the engine lives and runs on `s`.
+    pub fn loadOn(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !*Engine {
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
         self.io = io;
-        self.s = mlx.mlx_default_gpu_stream_new();
+        self.s = s;
         self.cfg = try DitConfig.parse(io, allocator, model_dir);
         self.uncond_skip = if (self.cfg.layers > UNCOND_SKIP_LAYER) UNCOND_SKIP_LAYER else null;
         const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{model_dir});
@@ -980,7 +979,9 @@ pub const Engine = struct {
                 const vn = try sc.keep(try self.dit.forward(lat, n.text, &m, &n.rope, skip));
                 v = try sc.add(vn, try sc.mulS(try sc.sub(v, vn), opts.guidance_scale));
             }
-            const next = sc.out(try sc.add(lat, try sc.mulS(v, sigmas[i + 1] - sigmas[i])));
+            var g = Graph.init(self.allocator, s);
+            defer g.deinit();
+            const next = g.escape(try flow_match.eulerStep(&g, lat, v, sigmas[i + 1] - sigmas[i], .float32));
             _ = mlx.mlx_array_free(lat);
             lat = next;
             try mlx.check(mlx.mlx_array_eval(lat));
@@ -1100,7 +1101,7 @@ test "MOSS-Image: text encoder, DiT, VAE and the whole pipeline match the refere
     const io = std.Io.Threaded.global_single_threaded.io();
     var fx = try Fixture.open(a);
     defer fx.w.deinit();
-    const eng = try Engine.load(io, a, fx.model);
+    const eng = try Engine.loadOn(io, a, fx.model, mlx.mlx_default_gpu_stream_new());
     defer eng.deinit();
     const s = eng.s;
     var sc = Scope.init(a, s);

@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/qsa/decode_gather, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns qsaDecodeGatherAttn, qsaBatchedGatherAttn, qsaBatchedAttn.
+//! QSA attention at decode and in a batched tick over the indexer's gathered blocks (`qsaDecodeGatherAttn`,
+//! `qsaBatchedGatherAttn`).
 
 const std = @import("std");
 const qwen4_mod = @import("../qwen4_exp.zig");

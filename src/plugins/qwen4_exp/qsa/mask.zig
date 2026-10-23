@@ -1,5 +1,4 @@
-//! plugins/qwen4_exp/qsa/mask, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns qsaMaskFromBlocks, headPlaceRopePos, headPlaceScores, headPlaceVisibility, qsaMaskFromBlockSel.
+//! The dense QSA visibility mask from block picks, and the MTP head's placed-row positions and visibility.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");

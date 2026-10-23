@@ -20,6 +20,7 @@
 //! so the 2-bit codes are expanded to int8 straight into the tensor op's right
 //! operand in registers, as their register-staged form does.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = std.log.scoped(.qmm_int8);
@@ -32,7 +33,7 @@ var env_enabled: ?bool = null;
 /// DEFAULT OFF: this route changes numerics.
 pub fn enabled() bool {
     if (env_enabled) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_BONSAI_INT8_PREFILL");
+    const raw = env.get(.MLX_SERVE_BONSAI_INT8_PREFILL);
     env_enabled = raw != null and raw.?[0] != '0';
     return env_enabled.?;
 }

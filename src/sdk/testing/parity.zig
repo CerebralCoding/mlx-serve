@@ -2,8 +2,8 @@
 //! Owns hostF32, rmsVsTruth, testReadF32, jsonF64, jsonToMlxArray, maxAbsDiffF32, and 12 more.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const diagEnvOn = @import("../../engines/mlx/env_transformer.zig").diagEnvOn;
 const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
 const Qwen4RowCmp = @import("../../plugins/qwen4_exp/forward.zig").Qwen4RowCmp;
 const Qwen4Ties = @import("../../plugins/qwen4_exp/forward.zig").Qwen4Ties;
@@ -184,7 +184,7 @@ pub fn qwen4CompareTied(tag: []const u8, a: []const f32, b: []const f32, rows: u
             continue;
         }
         if (rc.min_cos < out.min_cos) out.min_cos = rc.min_cos;
-        if (diagEnvOn("QWEN4_FIXTURE_ROWS")) std.debug.print("    {s} row {d}: cos {d:.4} margin {d:.4}\n", .{ tag, row0 + r, rc.min_cos, ties.margin(row0 + r) });
+        if (env.on(.QWEN4_FIXTURE_ROWS)) std.debug.print("    {s} row {d}: cos {d:.4} margin {d:.4}\n", .{ tag, row0 + r, rc.min_cos, ties.margin(row0 + r) });
         if (ties.argmaxTied(row0 + r, ref_row)) {
             std.debug.print("    {s} row {d}: argmax acquitted (reference top-2 margin {d:.4})\n", .{ tag, row0 + r, ties.logit_margin.?[row0 + r] });
             continue;

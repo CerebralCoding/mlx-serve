@@ -1,6 +1,7 @@
 //! /props, batching, settings, ANE stats, status page
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
@@ -180,7 +181,7 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .native_speculation = if (native) |m| .{
             .lane = mlx_stream.laneName(m),
             .block_size = mlx_stream.blockSize(m),
-            .sampled = generate_mod.Generator.dsparkStochEnabledFromEnv(if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_STOCH")) |v| std.mem.span(v) else null),
+            .sampled = generate_mod.Generator.dsparkStochEnabledFromEnv(env.span(.MLX_SERVE_DSV4_DSPARK_STOCH)),
         } else null,
         .max_mtp_ctx = generate_mod.max_mtp_ctx,
         .drafter = if (lm.dflash != null) "dflash" else if (lm.drafter != null) "assistant" else "none",

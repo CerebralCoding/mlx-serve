@@ -1,5 +1,5 @@
 //! ACE-Step v1.5 XL Turbo — native text-to-music engine (`.audio` modality,
-//! second backend beside Qwen3-TTS in gen.AudioBackend).
+//! served by plugin.zig).
 //!
 //! Pipeline (music-dossier.md is the BINDING reference; verified against the
 //! upstream repo's own MLX implementation acestep/models/mlx/*):
@@ -43,6 +43,12 @@ const S = mlx.mlx_stream;
 const Weights = model_mod.Weights;
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
 const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
+const ops = @import("../../mlx/ops.zig");
+const snake_block = @import("../../sdk/blocks/vae/snake.zig");
+const timestep = @import("../../sdk/blocks/dit/timestep.zig");
+const flow_match = @import("../../sdk/blocks/schedulers/flow_match.zig");
+const qwen3 = @import("../../sdk/blocks/text_encoders/qwen3.zig");
+const config_fields = @import("../../sdk/media/config_fields.zig");
 
 // ── architecture facts (converted config.json mirrors these; the checkpoint
 // family has exactly one member so they double as defaults) ─────────────────
@@ -87,6 +93,52 @@ const QwenCfg = struct {
     rope_theta: f32 = 1_000_000.0,
 };
 
+/// config.json keys → `Cfg` fields; an omitted key keeps the published value.
+const cfg_keys = .{
+    .{ "hidden_size", "hidden" },                                .{ "num_hidden_layers", "layers" },
+    .{ "num_attention_heads", "heads" },                         .{ "num_key_value_heads", "kv_heads" },
+    .{ "head_dim", "head_dim" },                                 .{ "intermediate_size", "intermediate" },
+    .{ "encoder_hidden_size", "enc_hidden" },                    .{ "encoder_intermediate_size", "enc_intermediate" },
+    .{ "encoder_num_attention_heads", "enc_heads" },             .{ "encoder_num_key_value_heads", "enc_kv_heads" },
+    .{ "num_lyric_encoder_hidden_layers", "lyric_layers" },      .{ "num_timbre_encoder_hidden_layers", "timbre_layers" },
+    .{ "text_hidden_dim", "text_hidden" },                       .{ "audio_acoustic_hidden_dim", "acoustic_dim" },
+    .{ "in_channels", "in_channels" },                           .{ "patch_size", "patch_size" },
+    .{ "sliding_window", "sliding_window" },                     .{ "rope_theta", "rope_theta" },
+    .{ "rms_norm_eps", "eps" },                                  .{ "timbre_fix_frame", "timbre_fix_frame" },
+    .{ "sample_rate", "sample_rate" },                           .{ "vae_hop", "vae_hop" },
+};
+
+/// text_encoder/config.json keys → `QwenCfg` fields.
+const qwen_keys = .{
+    .{ "hidden_size", "hidden" },          .{ "num_hidden_layers", "layers" }, .{ "num_attention_heads", "heads" },
+    .{ "num_key_value_heads", "kv_heads" }, .{ "head_dim", "head_dim" },     .{ "rms_norm_eps", "eps" },
+    .{ "rope_theta", "rope_theta" },
+};
+
+fn parseInto(comptime T: type, comptime keys: anytype, allocator: std.mem.Allocator, json_text: []const u8) !T {
+    var out = T{};
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return error.BadPackConfig;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadPackConfig;
+    try config_fields.fill(T, keys, parsed.value.object, &out);
+    return out;
+}
+
+/// The DiT + condition encoder geometry from config.json. The VAE's strides are fixed, so its hop must be 1920.
+pub fn parseCfg(allocator: std.mem.Allocator, json_text: []const u8) !Cfg {
+    const c = try parseInto(Cfg, cfg_keys, allocator, json_text);
+    if (c.vae_hop != 1920 or c.heads % c.kv_heads != 0 or c.enc_heads % c.enc_kv_heads != 0 or c.in_channels != 3 * c.acoustic_dim)
+        return error.BadPackConfig;
+    return c;
+}
+
+/// The prompt encoder's geometry from text_encoder/config.json.
+fn parseQwenCfg(allocator: std.mem.Allocator, json_text: []const u8) !QwenCfg {
+    const c = try parseInto(QwenCfg, qwen_keys, allocator, json_text);
+    if (c.heads % c.kv_heads != 0) return error.BadPackConfig;
+    return c;
+}
+
 pub const NUM_STEPS: u32 = 8; // turbo is distillation-fixed
 pub const SHIFT: f32 = 3.0; // turbo UI default (yields the SHIFT_TIMESTEPS[3.0] table)
 const DCW_LOW: f32 = 0.05; // DCW "double" defaults (reference GenerationParams)
@@ -128,9 +180,8 @@ test "low-mem shrinks the VAE decode window but never below the overlap" {
 pub fn timestepSchedule(buf: []f32, shift: f32) void {
     const n = buf.len;
     for (0..n) |i| {
-        var t: f32 = 1.0 - @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(n));
-        if (shift != 1.0) t = shift * t / (1.0 + (shift - 1.0) * t);
-        buf[i] = t;
+        const t = flow_match.gridToZero(f32, i, n);
+        buf[i] = if (shift != 1.0) flow_match.timeShift(f32, shift, t) else t;
     }
 }
 
@@ -646,8 +697,7 @@ fn qwenEmbedLookup(w: *const Weights, ids: []const i32, s: S) !mlx.mlx_array {
 
 /// Full causal forward → post-final-norm hidden states [1,T,1024] bf16
 /// (= HF last_hidden_state; the reference passes no attention mask).
-fn qwenForward(w: *const Weights, allocator: std.mem.Allocator, ids: []const i32, s: S) !mlx.mlx_array {
-    const cfg = QwenCfg{};
+fn qwenForward(w: *const Weights, cfg: QwenCfg, allocator: std.mem.Allocator, ids: []const i32, s: S) !mlx.mlx_array {
     var arena_inst = std.heap.ArenaAllocator.init(allocator);
     defer arena_inst.deinit();
     const a = arena_inst.allocator();
@@ -734,69 +784,41 @@ fn qwenForward(w: *const Weights, allocator: std.mem.Allocator, ids: []const i32
 // server traffic carries no padding).
 // ════════════════════════════════════════════════════════════════════════
 
+/// A projection of the encoder layer by weight name (dense, quantized or the int8 copy, through `lin`).
+const EncLin = struct {
+    w: *const Weights,
+    name: []const u8,
+    pub fn forward(self: EncLin, g: *ops.Graph, x: ops.Array) !ops.Array {
+        return g.adopt(try lin(self.w, g.a, x, self.name, g.s));
+    }
+};
+
 fn encoderLayer(e: *const Engine, a: std.mem.Allocator, w: *const Weights, prefix: []const u8, h_in: mlx.mlx_array, sliding_mask: ?mlx.mlx_array, s: S) !mlx.mlx_array {
-    const cfg = e.cfg;
-    const nh: c_int = @intCast(cfg.enc_heads);
-    const nkv: c_int = @intCast(cfg.enc_kv_heads);
-    const hd: c_int = @intCast(cfg.head_dim);
-    const scale = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-
-    const in_ln = try getW(w, try std.fmt.allocPrint(a, "{s}.input_layernorm.weight", .{prefix}));
-    const x = try rmsNorm(h_in, in_ln, cfg.eps, s);
-    defer _ = mlx.mlx_array_free(x);
-
-    const q = try lin(w, a, x, try std.fmt.allocPrint(a, "{s}.self_attn.q_proj", .{prefix}), s);
-    defer _ = mlx.mlx_array_free(q);
-    const k = try lin(w, a, x, try std.fmt.allocPrint(a, "{s}.self_attn.k_proj", .{prefix}), s);
-    defer _ = mlx.mlx_array_free(k);
-    const v = try lin(w, a, x, try std.fmt.allocPrint(a, "{s}.self_attn.v_proj", .{prefix}), s);
-    defer _ = mlx.mlx_array_free(v);
-
-    const qh = try splitHeads(q, nh, hd, s);
-    defer _ = mlx.mlx_array_free(qh);
-    const kh = try splitHeads(k, nkv, hd, s);
-    defer _ = mlx.mlx_array_free(kh);
-    const vh = try splitHeads(v, nkv, hd, s);
-    defer _ = mlx.mlx_array_free(vh);
-
-    const qn_w = try getW(w, try std.fmt.allocPrint(a, "{s}.self_attn.q_norm.weight", .{prefix}));
-    const qn = try rmsNorm(qh, qn_w, cfg.eps, s);
-    defer _ = mlx.mlx_array_free(qn);
-    const kn_w = try getW(w, try std.fmt.allocPrint(a, "{s}.self_attn.k_norm.weight", .{prefix}));
-    const kn = try rmsNorm(kh, kn_w, cfg.eps, s);
-    defer _ = mlx.mlx_array_free(kn);
-
-    const qr = try ropeInPlace(qn, hd, cfg.rope_theta, s);
-    defer _ = mlx.mlx_array_free(qr);
-    const kr = try ropeInPlace(kn, hd, cfg.rope_theta, s);
-    defer _ = mlx.mlx_array_free(kr);
-
-    const attn = if (sliding_mask) |m|
-        try sdpa(qr, kr, vh, scale, m, "array", s)
-    else
-        try sdpa(qr, kr, vh, scale, null, "", s);
-    defer _ = mlx.mlx_array_free(attn);
-    const merged = try mergeHeads(attn, s);
-    defer _ = mlx.mlx_array_free(merged);
-    const o = try lin(w, a, merged, try std.fmt.allocPrint(a, "{s}.self_attn.o_proj", .{prefix}), s);
-    defer _ = mlx.mlx_array_free(o);
-    const h1 = try addA(h_in, o, s);
-    defer _ = mlx.mlx_array_free(h1);
-
-    const pa_ln = try getW(w, try std.fmt.allocPrint(a, "{s}.post_attention_layernorm.weight", .{prefix}));
-    const xm = try rmsNorm(h1, pa_ln, cfg.eps, s);
-    defer _ = mlx.mlx_array_free(xm);
-    const gate = try lin(w, a, xm, try std.fmt.allocPrint(a, "{s}.mlp.gate_proj", .{prefix}), s);
-    defer _ = mlx.mlx_array_free(gate);
-    const up = try lin(w, a, xm, try std.fmt.allocPrint(a, "{s}.mlp.up_proj", .{prefix}), s);
-    defer _ = mlx.mlx_array_free(up);
-    const gact = try silu(gate, s);
-    defer _ = mlx.mlx_array_free(gact);
-    const gu = try mulA(gact, up, s);
-    defer _ = mlx.mlx_array_free(gu);
-    const down = try lin(w, a, gu, try std.fmt.allocPrint(a, "{s}.mlp.down_proj", .{prefix}), s);
-    defer _ = mlx.mlx_array_free(down);
-    return addA(h1, down, s);
+    const P = struct {
+        fn lin_(ww: *const Weights, aa: std.mem.Allocator, p: []const u8, comptime n: []const u8) !EncLin {
+            return .{ .w = ww, .name = try std.fmt.allocPrint(aa, "{s}." ++ n, .{p}) };
+        }
+        fn norm(ww: *const Weights, aa: std.mem.Allocator, p: []const u8, comptime n: []const u8) !mlx.mlx_array {
+            return getW(ww, try std.fmt.allocPrint(aa, "{s}." ++ n ++ ".weight", .{p}));
+        }
+    };
+    const layer = .{
+        .input_ln = try P.norm(w, a, prefix, "input_layernorm"),
+        .post_ln = try P.norm(w, a, prefix, "post_attention_layernorm"),
+        .q_norm = try P.norm(w, a, prefix, "self_attn.q_norm"),
+        .k_norm = try P.norm(w, a, prefix, "self_attn.k_norm"),
+        .q = try P.lin_(w, a, prefix, "self_attn.q_proj"),
+        .k = try P.lin_(w, a, prefix, "self_attn.k_proj"),
+        .v = try P.lin_(w, a, prefix, "self_attn.v_proj"),
+        .o = try P.lin_(w, a, prefix, "self_attn.o_proj"),
+        .gate = try P.lin_(w, a, prefix, "mlp.gate_proj"),
+        .up = try P.lin_(w, a, prefix, "mlp.up_proj"),
+        .down = try P.lin_(w, a, prefix, "mlp.down_proj"),
+    };
+    const cfg = qwen3.Cfg{ .heads = @intCast(e.cfg.enc_heads), .kv_heads = @intCast(e.cfg.enc_kv_heads), .head_dim = @intCast(e.cfg.head_dim), .eps = e.cfg.eps };
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    return g.escape(try qwen3.layerForward(&g, layer, cfg, .{ .fast = .{ .theta = e.cfg.rope_theta } }, h_in, sliding_mask));
 }
 
 /// Run an encoder stack (`encoder.lyric_encoder` / `encoder.timbre_encoder` /
@@ -876,14 +898,7 @@ fn buildConditioning(e: *const Engine, allocator: std.mem.Allocator, text_hidden
 /// linear_2 = temb [1,D]; time_proj(SiLU(temb)) → [1,6,D]. Both bf16.
 fn timestepEmbed(e: *const Engine, a: std.mem.Allocator, name: []const u8, t_val: f32, s: S) !struct { temb: mlx.mlx_array, proj: mlx.mlx_array } {
     var sin_buf: [256]f32 = undefined;
-    const half = 128;
-    const ts = t_val * 1000.0;
-    for (0..half) |i| {
-        const freq = @exp(-@log(@as(f32, 10000.0)) * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(half)));
-        const arg = ts * freq;
-        sin_buf[i] = @cos(arg);
-        sin_buf[half + i] = @sin(arg);
-    }
+    timestep.sinusoid(f32, &sin_buf, t_val * 1000.0, .cos_first);
     const sshape = [_]c_int{ 1, 256 };
     const sin_f32 = mlx.mlx_array_new_data(&sin_buf, &sshape, 2, .float32);
     defer _ = mlx.mlx_array_free(sin_f32);
@@ -1287,37 +1302,15 @@ fn applyDcwDouble(x_next: mlx.mlx_array, denoised: mlx.mlx_array, t_curr: f32, s
 const VAE_STRIDES_DOWN = [_]u32{ 2, 4, 4, 6, 10 };
 const VAE_CM = [_]u32{ 1, 1, 2, 4, 8, 16 }; // [1] ++ channel_multiples
 
-/// Snake: x + (1/exp(β))·sin²(exp(α)·x), computed f32 (exp headroom), result
-/// cast back to x's dtype. α/β stored [C] f32 by the converter.
+/// Snake with log-stored α/β (sdk's `snakeBetaLog`), computed f32 (exp headroom) and cast back to x's dtype. α/β
+/// stored [C] f32 by the converter.
 fn snake(e: *const Engine, a: std.mem.Allocator, x: mlx.mlx_array, prefix: []const u8, s: S) !mlx.mlx_array {
     const alpha = try getW(&e.vae_w, try std.fmt.allocPrint(a, "{s}.alpha", .{prefix}));
     const beta = try getW(&e.vae_w, try std.fmt.allocPrint(a, "{s}.beta", .{prefix}));
-    const in_dtype = mlx.mlx_array_dtype(x);
-    const xf = try astype(x, .float32, s);
-    defer _ = mlx.mlx_array_free(xf);
-    var ea = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ea);
-    try mlx.check(mlx.mlx_exp(&ea, alpha, s));
-    var eb = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eb);
-    try mlx.check(mlx.mlx_exp(&eb, beta, s));
-    const ax = try mulA(xf, ea, s);
-    defer _ = mlx.mlx_array_free(ax);
-    var sn = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sn);
-    try mlx.check(mlx.mlx_sin(&sn, ax, s));
-    const sq = try mulA(sn, sn, s);
-    defer _ = mlx.mlx_array_free(sq);
-    const eps_c = mlx.mlx_array_new_float(1e-9);
-    defer _ = mlx.mlx_array_free(eps_c);
-    const beps = try addA(eb, eps_c, s);
-    defer _ = mlx.mlx_array_free(beps);
-    var recip = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(recip);
-    try mlx.check(mlx.mlx_divide(&recip, sq, beps, s));
-    const out_f = try addA(xf, recip, s);
-    defer _ = mlx.mlx_array_free(out_f);
-    return astype(out_f, in_dtype, s);
+    var g = ops.Graph.init(a, s);
+    defer g.deinit();
+    const y = try snake_block.snakeBetaLog(&g, try g.astype(x, .float32), alpha, beta);
+    return g.escape(try g.astype(y, mlx.mlx_array_dtype(x)));
 }
 
 fn vaeConv(e: *const Engine, a: std.mem.Allocator, x: mlx.mlx_array, prefix: []const u8, stride: c_int, padding: c_int, dilation: c_int, s: S) !mlx.mlx_array {
@@ -1847,6 +1840,7 @@ pub const Engine = struct {
     io: std.Io,
     s: S,
     cfg: Cfg,
+    te_cfg: QwenCfg,
     w: Weights, // model.safetensors (DiT + condition encoder + silence_latent)
     vae_w: Weights, // vae.safetensors
     fsq_w: ?Weights, // fsq.safetensors (cover mode), loaded on first use
@@ -1866,6 +1860,7 @@ pub const Engine = struct {
     ane_rest: []AceRest = &.{},
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, low_mem: bool) !*Engine {
+        var cfg_buf: [64 * 1024]u8 = undefined;
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
@@ -1873,7 +1868,8 @@ pub const Engine = struct {
         self.ane_eng = null;
         self.ane_rest = &.{};
         self.s = mlx.mlx_default_gpu_stream_new();
-        self.cfg = Cfg{}; // single-member family; converted config mirrors these
+        self.cfg = try parseCfg(allocator, try config_fields.read(io, &cfg_buf, model_dir, "config.json"));
+        self.te_cfg = try parseQwenCfg(allocator, try config_fields.read(io, &cfg_buf, model_dir, "text_encoder/config.json"));
         self.low_mem = low_mem;
 
         self.w = try loadFileWeights(allocator, model_dir, "model.safetensors");
@@ -2059,7 +2055,7 @@ pub const Engine = struct {
         defer allocator.free(prompt);
         const text_ids = try self.tokenize(allocator, prompt, MAX_PROMPT_TOKENS);
         defer allocator.free(text_ids);
-        return qwenForward(te, allocator, text_ids, s);
+        return qwenForward(te, self.te_cfg, allocator, text_ids, s);
     }
 
     /// prompt/lyrics (+ source clip for cover/complete) → 48 kHz stereo PCM16
@@ -2686,7 +2682,7 @@ test "acestep oracle: text encoder hidden states match reference" {
     defer a.free(ref);
     var e = try testEngine(io, a);
     defer e.deinit();
-    const hidden = try qwenForward(&e.te_w.?, a, ids, e.s);
+    const hidden = try qwenForward(&e.te_w.?, e.te_cfg, a, ids, e.s);
     defer _ = mlx.mlx_array_free(hidden);
     const corr = try arrayCosine(hidden, ref, e.s);
     std.debug.print("[acestep-text] corr={d:.6}\n", .{corr});
@@ -3353,4 +3349,23 @@ test "ACE-Step DiT: the w8a8 route stays within its bar of the packed forward" {
     try testing.expect(g.cos > 0.997);
     try testing.expectApproxEqAbs(@as(f64, 1.0), g.rms_ratio, 0.02);
     try w8a8.expectBilled(packed_bytes, int8_bytes, try w8a8.billedDelta(io, model_dir, &.{"model.safetensors"}));
+}
+
+test "acestep config: the published config.json and text encoder config are the default geometry" {
+    const a = std.testing.allocator;
+    const published =
+        \\{"model_type":"acestep","model_version":"turbo","quant":"4bit","hidden_size":2560,"num_hidden_layers":32,
+        \\ "num_attention_heads":32,"num_key_value_heads":8,"head_dim":128,"intermediate_size":9728,"encoder_hidden_size":2048,
+        \\ "encoder_intermediate_size":6144,"encoder_num_attention_heads":16,"encoder_num_key_value_heads":8,
+        \\ "num_lyric_encoder_hidden_layers":8,"num_timbre_encoder_hidden_layers":4,"text_hidden_dim":1024,
+        \\ "audio_acoustic_hidden_dim":64,"in_channels":192,"patch_size":2,"sliding_window":128,"rope_theta":1000000.0,
+        \\ "rms_norm_eps":1e-06,"timbre_fix_frame":750,"sample_rate":48000,"vae_hop":1920,"vae_downsampling_ratios":[2,4,4,6,10]}
+    ;
+    try std.testing.expectEqualDeep(Cfg{}, try parseCfg(a, published));
+    try std.testing.expectEqualDeep(QwenCfg{}, try parseQwenCfg(a,
+        \\{"hidden_size":1024,"num_hidden_layers":28,"num_attention_heads":16,"num_key_value_heads":8,"head_dim":128,
+        \\ "rms_norm_eps":1e-06,"rope_theta":1000000}
+    ));
+    try std.testing.expectError(error.BadPackConfig, parseCfg(a, "{\"vae_hop\":960}"));
+    try std.testing.expectError(error.BadPackConfig, parseCfg(a, "{\"num_key_value_heads\":0}"));
 }

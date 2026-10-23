@@ -1,5 +1,6 @@
-//! plugins/qwen4_exp/forward, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns qwen4DecodeLadderStride, QWEN4_DECODE_ASYNC_LADDER_DEFAULT, qwen4VerifyRowsEligible, forwardQwen4VerifyRows, forwardQwen4Stream, forwardQwen4With, and 9 more.
+//! The qwen4_exp trunk forward (`forwardQwen4With`): embeddings tiled into hyper-connection streams, the n-gram PLE,
+//! GDN and QSA attention layers under hc reads and writes, the final mixer; also the grouped verify rows and a
+//! pipeline rank's stream forward. Env-gated fixture tests against the HF reference live here.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -76,7 +77,7 @@ pub fn qwen4VerifyRowsEligible(self: *Transformer, token_rows: []const mlx.mlx_a
     const si = qwen4Standin();
     if (si.gdn or si.attn or si.mlp or si.gdn_recur or si.gdn_proj or si.attn_qsa or si.attn_sdpa or si.hc or si.moe_shared or si.moe_router or si.moe_gateup or si.moe_down) return false;
     for (self.moe_layers.?) |lw| switch (lw.mlp) {
-        .moe => |mw| if (mw.expert_bias != null or mw.router_scale != null or mw.per_expert_scale != null or mw.router_bias.ctx != null) return false,
+        .moe => |mw| if (mw.expert_bias != null or mw.router_scale != null or mw.per_expert_scale != null) return false,
         else => return false,
     };
     var total_tokens: u64 = 0;

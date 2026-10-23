@@ -8,6 +8,7 @@
 //! budget and the tool gate are refused by name.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const build_options = @import("build_options");
 const abi = @import("../../abi/engine.zig");
 const engine_pick = @import("../../host/registry/engine_pick.zig");
@@ -31,7 +32,7 @@ pub const table = Adapter(bridge, std.heap.smp_allocator).table;
 pub const default_context: u32 = 8192;
 
 /// Every GGUF whose header does not route to ds4 (`engine_pick.preferredEngine`).
-fn probe(model_dir: abi.Str, _: abi.Str, out: *abi.Verdict) callconv(.c) bool {
+pub fn probe(model_dir: abi.Str, _: abi.Str, out: *abi.Verdict) callconv(.c) bool {
     var info = engine_pick.readFromFile(io, std.heap.smp_allocator, abi.items(u8, model_dir)) catch {
         out.* = abi.Verdict.refuse(.unsupported, "not a GGUF file: the llama.cpp engine opens a .gguf");
         return false;
@@ -527,7 +528,7 @@ test "llama adapter: an EOG id ends a request unemitted; a follow-up reuses its 
 // ── against a real GGUF (`MLX_SERVE_TEST_LLAMA_GGUF`; skipped without it)
 
 fn realGguf() ?[]const u8 {
-    const raw = std.c.getenv("MLX_SERVE_TEST_LLAMA_GGUF") orelse return null;
+    const raw = env.get(.MLX_SERVE_TEST_LLAMA_GGUF) orelse return null;
     const s = std.mem.sliceTo(raw, 0);
     return if (s.len == 0) null else s;
 }

@@ -1,212 +1,7 @@
-//! plugins/inkling/moe, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns inklingExpertsApply, inklingMoeMlp, InkgroupLimitedRouting, inklingRouterChain.
+//! Inkling's routed + shared-expert MoE block and its router chain (`InklingTopkRouter`).
 
 const mlx = @import("../../mlx/ffi.zig");
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const gatherExpertMm = @import("../../sdk/blocks/moe/experts.zig").gatherExpertMm;
-const MoeMlpWeights = @import("../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
-
-// ── Sparse MoE MLP ──
-
-/// Inkling expert application: x_flat [T, D] rows through the selected
-/// experts of a stacked quantized bank via the sorted gather_qmm path
-/// (moeMLP2's global-sort pattern). inds [T, K] (uint32). Returns
-/// [T, K, hidden]; caller owns. Serves both the routed bank (K = top_k)
-/// and the shared bank (K = n_shared, fixed indices).
-pub fn inklingExpertsApply(
-    self: *Transformer,
-    x_flat: mlx.mlx_array,
-    inds: mlx.mlx_array,
-    gate_w: mlx.mlx_array,
-    gate_s: mlx.mlx_array,
-    gate_b: mlx.mlx_array,
-    up_w: mlx.mlx_array,
-    up_s: mlx.mlx_array,
-    up_b: mlx.mlx_array,
-    down_w: mlx.mlx_array,
-    down_s: mlx.mlx_array,
-    down_b: mlx.mlx_array,
-) !mlx.mlx_array {
-    const cfg = &self.config;
-    const x_shape = mlx.getShape(x_flat); // [T, D]
-    const t_count = x_shape[0];
-    const d_dim = x_shape[1];
-    const k_count = mlx.getShape(inds)[1];
-    const total_inds: c_int = t_count * k_count;
-    const no_idx = mlx.mlx_array{ .ctx = null };
-
-    const gate_qp = self.quantParamsHinted(gate_w, gate_s, @intCast(d_dim));
-    const up_qp = self.quantParamsHinted(up_w, up_s, @intCast(d_dim));
-    const down_qp = self.quantParamsHinted(down_w, down_s, if (cfg.moe_intermediate_size > 0) cfg.moe_intermediate_size else null);
-
-    // Flatten + global sort so gather_qmm streams each expert's rows once.
-    const flat_shape = [_]c_int{total_inds};
-    var flat_inds = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(flat_inds);
-    try mlx.check(mlx.mlx_reshape(&flat_inds, inds, &flat_shape, 1, self.s));
-    var order = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(order);
-    try mlx.check(mlx.mlx_argsort_axis(&order, flat_inds, 0, self.s));
-    var inv_order = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(inv_order);
-    try mlx.check(mlx.mlx_argsort_axis(&inv_order, order, 0, self.s));
-    var sorted_inds = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sorted_inds);
-    try mlx.check(mlx.mlx_take_axis(&sorted_inds, flat_inds, order, 0, self.s));
-
-    const k_arr = mlx.mlx_array_new_int(k_count);
-    defer _ = mlx.mlx_array_free(k_arr);
-    var lhs_idx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(lhs_idx);
-    try mlx.check(mlx.mlx_floor_divide(&lhs_idx, order, k_arr, self.s));
-
-    var x_gathered = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x_gathered);
-    try mlx.check(mlx.mlx_take_axis(&x_gathered, x_flat, lhs_idx, 0, self.s));
-    const n1d_shape = [_]c_int{ total_inds, 1, d_dim };
-    var x_rep = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x_rep);
-    try mlx.check(mlx.mlx_reshape(&x_rep, x_gathered, &n1d_shape, 3, self.s));
-
-    var gate_out_3d = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gate_out_3d);
-    try gatherExpertMm(&gate_out_3d, x_rep, gate_w, gate_s, gate_b, no_idx, sorted_inds, gate_qp.bits, gate_qp.group_size, gate_qp.mode, true, self.s);
-    var gate_out = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gate_out);
-    try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
-
-    var up_out_3d = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(up_out_3d);
-    try gatherExpertMm(&up_out_3d, x_rep, up_w, up_s, up_b, no_idx, sorted_inds, up_qp.bits, up_qp.group_size, up_qp.mode, true, self.s);
-    var up_out = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(up_out);
-    try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
-
-    const expert_act = try self.computeGeglu(gate_out, up_out);
-    defer _ = mlx.mlx_array_free(expert_act);
-
-    var act_exp = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(act_exp);
-    try mlx.check(mlx.mlx_expand_dims(&act_exp, expert_act, -2, self.s));
-    var down_3d = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(down_3d);
-    try gatherExpertMm(&down_3d, act_exp, down_w, down_s, down_b, no_idx, sorted_inds, down_qp.bits, down_qp.group_size, down_qp.mode, true, self.s);
-    var down_squeezed = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(down_squeezed);
-    try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s));
-
-    var down_unsorted = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(down_unsorted);
-    try mlx.check(mlx.mlx_take_axis(&down_unsorted, down_squeezed, inv_order, 0, self.s));
-    const hidden = mlx.getShape(down_unsorted)[1];
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    const tkh_shape = [_]c_int{ t_count, k_count, hidden };
-    try mlx.check(mlx.mlx_reshape(&out, down_unsorted, &tkh_shape, 3, self.s));
-    return out;
-}
-
-/// Inkling MoE block (`InklingMoE`): fp32 router (mlp.gate, [E+ns, H] —
-/// shared rows included; gate.global_scale pre-folded into mw.route_scale
-/// at load), routed top-k + the router-gated shared experts (the sink).
-/// Expert math runs in the stream's dtype; the routing weights are cast to
-/// it before weighting (reference semantics — bf16 on shipped builds).
-pub fn inklingMoeMlp(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
-    const cfg = &self.config;
-    const x_shape = mlx.getShape(x); // [B, S, D]
-    const batch = x_shape[0];
-    const seq = x_shape[1];
-    const d_dim = x_shape[2];
-    const t_count: c_int = batch * seq;
-    const top_k: c_int = @intCast(cfg.num_experts_per_tok);
-    const n_shared: c_int = @intCast(cfg.inkling_n_shared_experts);
-
-    var x_flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x_flat);
-    const flat_shape = [_]c_int{ t_count, d_dim };
-    try mlx.check(mlx.mlx_reshape(&x_flat, x, &flat_shape, 2, self.s));
-
-    // Router in f32: router_w is bf16 pre-transposed [D, E+ns].
-    var x32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(x32);
-    try mlx.check(mlx.mlx_astype(&x32, x_flat, .float32, self.s));
-    var rw32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rw32);
-    try mlx.check(mlx.mlx_astype(&rw32, mw.router_w, .float32, self.s));
-    var logits = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(logits);
-    try mlx.check(mlx.mlx_matmul(&logits, x32, rw32, self.s));
-
-    const routing = try inklingRouterChain(self.s, logits, mw.expert_bias.?, top_k, n_shared, mw.route_scale, 1.0);
-    defer _ = mlx.mlx_array_free(routing.topk_weights);
-    defer _ = mlx.mlx_array_free(routing.topk_idx);
-    defer _ = mlx.mlx_array_free(routing.shared_gammas);
-
-    // Routed experts, weighted sum over K. The reference casts the f32
-    // routing weights to x's dtype BEFORE the multiply (bf16 stream on the
-    // shipped checkpoints — the sum then accumulates in bf16 like mx.sum).
-    const x_dtype = mlx.mlx_array_dtype(x_flat);
-    const routed = try self.inklingExpertsApply(x_flat, routing.topk_idx, mw.switch_gate_w, mw.switch_gate_s, mw.switch_gate_b, mw.switch_up_w, mw.switch_up_s, mw.switch_up_b, mw.switch_down_w, mw.switch_down_s, mw.switch_down_b);
-    defer _ = mlx.mlx_array_free(routed);
-    var tw_x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(tw_x);
-    try mlx.check(mlx.mlx_astype(&tw_x, routing.topk_weights, x_dtype, self.s));
-    var tw_exp = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(tw_exp);
-    try mlx.check(mlx.mlx_expand_dims(&tw_exp, tw_x, -1, self.s));
-    var routed_w = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(routed_w);
-    try mlx.check(mlx.mlx_multiply(&routed_w, routed, tw_exp, self.s));
-    var routed_sum = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(routed_sum);
-    try mlx.check(mlx.mlx_sum_axis(&routed_sum, routed_w, 1, false, self.s));
-
-    // Shared experts: fixed indices [T, ns], gamma-weighted f32 sum.
-    var sh_arange = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sh_arange);
-    try mlx.check(mlx.mlx_arange(&sh_arange, 0, @floatFromInt(n_shared), 1, .uint32, self.s));
-    var sh_row = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sh_row);
-    try mlx.check(mlx.mlx_reshape(&sh_row, sh_arange, &[_]c_int{ 1, n_shared }, 2, self.s));
-    var sh_idx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sh_idx);
-    try mlx.check(mlx.mlx_broadcast_to(&sh_idx, sh_row, &[_]c_int{ t_count, n_shared }, 2, self.s));
-
-    const shared = try self.inklingExpertsApply(x_flat, sh_idx, mw.shared_gate_w, mw.shared_gate_s, mw.shared_gate_b, mw.shared_up_w, mw.shared_up_s, mw.shared_up_b, mw.shared_down_w, mw.shared_down_s, mw.shared_down_b);
-    defer _ = mlx.mlx_array_free(shared);
-    // Reference: gammas are ROUNDED to x's dtype first (astype(x.dtype)),
-    // then the shared sum is computed in f32 and cast to the routed dtype.
-    var sh32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sh32);
-    try mlx.check(mlx.mlx_astype(&sh32, shared, .float32, self.s));
-    var sg_x = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sg_x);
-    try mlx.check(mlx.mlx_astype(&sg_x, routing.shared_gammas, x_dtype, self.s));
-    var sg32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sg32);
-    try mlx.check(mlx.mlx_astype(&sg32, sg_x, .float32, self.s));
-    var sg_exp = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sg_exp);
-    try mlx.check(mlx.mlx_expand_dims(&sg_exp, sg32, -1, self.s));
-    var shared_w = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(shared_w);
-    try mlx.check(mlx.mlx_multiply(&shared_w, sh32, sg_exp, self.s));
-    var shared_sum32 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(shared_sum32);
-    try mlx.check(mlx.mlx_sum_axis(&shared_sum32, shared_w, 1, false, self.s));
-    var shared_sum = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(shared_sum);
-    try mlx.check(mlx.mlx_astype(&shared_sum, shared_sum32, mlx.mlx_array_dtype(routed_sum), self.s));
-
-    var combined = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(combined);
-    try mlx.check(mlx.mlx_add(&combined, routed_sum, shared_sum, self.s));
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    const out_shape = [_]c_int{ batch, seq, d_dim };
-    try mlx.check(mlx.mlx_reshape(&out, combined, &out_shape, 3, self.s));
-    return out;
-}
 
 const InkgroupLimitedRouting = struct { topk_weights: mlx.mlx_array, topk_idx: mlx.mlx_array, shared_gammas: mlx.mlx_array };
 
@@ -292,3 +87,100 @@ pub fn inklingRouterChain(s: mlx.mlx_stream, logits: mlx.mlx_array, bias: mlx.ml
 
     return .{ .topk_weights = topk_weights, .topk_idx = topk_idx, .shared_gammas = shared_gammas };
 }
+
+// ── the plugin's block ──
+
+const ops = @import("../../mlx/ops.zig");
+const block = @import("../../sdk/bases/block.zig");
+const Bank = @import("../../sdk/bases/blocks/moe.zig").Bank;
+const swiglu = @import("../../sdk/bases/blocks/mlp.zig").swiglu;
+
+const Graph = ops.Graph;
+const Array = ops.Array;
+
+/// `InklingMoE`: the f32 router over the routed AND shared experts' rows, routed top-k plus the router-gated shared
+/// experts (the sink) in one softmax (`inklingRouterChain`). Expert math in the stream's dtype; the shared sum in f32.
+pub const Moe = struct {
+    pub const kind: block.Kind = .mlp;
+    pub const supports_batched_rows = false;
+    pub const Weights = struct {
+        /// `[hidden, experts + n_shared]` f32.
+        router: Array,
+        /// The selection bias `[experts]` f32 (zeros where the pack has none).
+        bias: Array,
+        /// gate, up, down.
+        routed: [3]Bank,
+        shared: [3]Bank,
+        top_k: c_int,
+        n_shared: c_int,
+        /// `route_scale × gate.global_scale`.
+        scale: f32,
+    };
+
+    pub fn forward(w: *const Weights, c: *block.Ctx, x: Array) !Array {
+        const g = c.g;
+        const sh = ops.shape(x);
+        const t = sh[0] * sh[1];
+        const x_flat = try g.reshape(x, &.{ t, sh[2] });
+        const logits = try g.matmul(try g.astype(x_flat, .float32), w.router);
+        const r = try inklingRouterChain(g.s, logits, w.bias, w.top_k, w.n_shared, w.scale, 1.0);
+        const idx = g.adopt(r.topk_idx) catch |e| {
+            _ = mlx.mlx_array_free(r.topk_weights);
+            _ = mlx.mlx_array_free(r.shared_gammas);
+            return e;
+        };
+        const tw = g.adopt(r.topk_weights) catch |e| {
+            _ = mlx.mlx_array_free(r.shared_gammas);
+            return e;
+        };
+        const gammas = try g.adopt(r.shared_gammas);
+
+        // The reference casts the routing weights to x's dtype before the multiply; the sum accumulates there.
+        const dt = ops.dtype(x_flat);
+        const routed = try experts(g, x_flat, idx, &w.routed);
+        const routed_sum = try g.call(mlx.mlx_sum_axis, .{ try g.mul(routed, try g.call(mlx.mlx_expand_dims, .{ try g.astype(tw, dt), @as(c_int, -1) })), @as(c_int, 1), false });
+
+        // Gammas rounded to x's dtype, then the shared sum in f32 cast to the routed sum's dtype.
+        const row = try g.reshape(try g.arange(0, @floatFromInt(w.n_shared), 1, .uint32), &.{ 1, w.n_shared });
+        const sh_idx = try g.call(mlx.mlx_broadcast_to, .{ row, &[_]c_int{ t, w.n_shared }, @as(usize, 2) });
+        const shared = try g.astype(try experts(g, x_flat, sh_idx, &w.shared), .float32);
+        const sg = try g.call(mlx.mlx_expand_dims, .{ try g.astype(try g.astype(gammas, dt), .float32), @as(c_int, -1) });
+        const shared_sum = try g.astype(try g.call(mlx.mlx_sum_axis, .{ try g.mul(shared, sg), @as(c_int, 1), false }), ops.dtype(routed_sum));
+        return g.reshape(try g.add(routed_sum, shared_sum), sh);
+    }
+
+    /// `x_flat` `[T, D]` through the experts `inds` `[T, K]` names, sorted so each expert streams its rows once:
+    /// `[T, K, hidden]`.
+    fn experts(g: *Graph, x_flat: Array, inds: Array, banks: *const [3]Bank) !Array {
+        const d = ops.shape(x_flat)[1];
+        const t = ops.shape(inds)[0];
+        const k = ops.shape(inds)[1];
+        const flat = try g.reshape(inds, &.{t * k});
+        const order = try g.call(mlx.mlx_argsort_axis, .{ flat, @as(c_int, 0) });
+        const inv = try g.call(mlx.mlx_argsort_axis, .{ order, @as(c_int, 0) });
+        const sorted = try g.call(mlx.mlx_take_axis, .{ flat, order, @as(c_int, 0) });
+        const lhs = try g.call(mlx.mlx_floor_divide, .{ order, try g.adopt(mlx.mlx_array_new_int(k)) });
+        const x_rep = try g.reshape(try g.call(mlx.mlx_take_axis, .{ x_flat, lhs, @as(c_int, 0) }), &.{ t * k, 1, d });
+        const gate = try rows(g, try gather(g, x_rep, &banks[0], sorted));
+        const up = try rows(g, try gather(g, x_rep, &banks[1], sorted));
+        const act = try g.call(mlx.mlx_expand_dims, .{ try swiglu(g, gate, up), @as(c_int, -2) });
+        const down = try rows(g, try gather(g, act, &banks[2], sorted));
+        const back = try g.call(mlx.mlx_take_axis, .{ down, inv, @as(c_int, 0) });
+        return g.reshape(back, &.{ t, k, ops.shape(back)[1] });
+    }
+
+    /// `[n, 1, w]` as `[n, w]` (the legacy's squeeze, which also dropped `n` at one row).
+    fn rows(g: *Graph, y: Array) !Array {
+        const sh = ops.shape(y);
+        return g.reshape(y, &.{ sh[0], sh[2] });
+    }
+
+    fn gather(g: *Graph, x: Array, bank: *const Bank, rhs: Array) !Array {
+        var y = mlx.mlx_array_new();
+        gatherExpertMm(&y, x, bank.w, bank.s, bank.b, .{ .ctx = null }, rhs, bank.qp.bits, bank.qp.group_size, bank.qp.mode, true, g.s) catch |e| {
+            _ = mlx.mlx_array_free(y);
+            return e;
+        };
+        return g.adopt(y);
+    }
+};

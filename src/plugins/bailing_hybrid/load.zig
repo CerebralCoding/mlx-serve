@@ -1,5 +1,4 @@
-//! plugins/bailing_hybrid/load, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns bailingRouterBaseAt.
+//! Ling 3.0's load-time probe: the MoE router's base name (`mlp.gate`, or mlx-lm's quantized `mlp.gate.gate_proj`).
 
 const Weights = @import("../../engines/mlx/model.zig").Weights;
 const getWeightAtOpt = @import("../../engines/mlx/load/weights.zig").getWeightAtOpt;

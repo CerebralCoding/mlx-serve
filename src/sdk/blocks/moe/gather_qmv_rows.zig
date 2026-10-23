@@ -2,6 +2,7 @@
 //! Owns gatherQmvGateUpRowsSource, GQMV_GATEUP_ROWS_SOURCES, GQMV_GATEUP_ROWS_NAMES, gqmv_gateup_rows_kernels, getGatherQmvGateUpRowsKernel, GateUpRowsCfgKey, and 19 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -9,7 +10,6 @@ const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
 const gather_qmv_mod = @import("gather_qmv.zig");
 const standin = @import("../../diag/standin.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
-const envFlagCached = @import("../../../engines/mlx/env_transformer.zig").envFlagCached;
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
 const qwen4Standin = @import("../../diag/standin.zig").qwen4Standin;
 const testRandUniformBf16 = @import("../../testing/parity.zig").testRandUniformBf16;
@@ -38,7 +38,7 @@ fn gatherQmvGateUpRowsSource(comptime nvfp4: bool) [:0]const u8 {
     });
 }
 
-const GQMV_GATEUP_ROWS_SOURCES = [2][:0]const u8{ gatherQmvGateUpRowsSource(false), gatherQmvGateUpRowsSource(true) };
+pub const GQMV_GATEUP_ROWS_SOURCES = [2][:0]const u8{ gatherQmvGateUpRowsSource(false), gatherQmvGateUpRowsSource(true) };
 const GQMV_GATEUP_ROWS_NAMES = [2][*:0]const u8{ "mlxserve_moe_gather_qmv_gateup_rows", "mlxserve_moe_gather_qmv_gateup_rows_nvfp4" };
 var gqmv_gateup_rows_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 
@@ -79,7 +79,7 @@ pub var moe_sorted_layers: u32 = 0;
 pub fn moeRowsFusedEnabled() bool {
     if (transformer.moe_rows_fused_override) |v| return v;
     if (moe_rows_fused_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MOE_ROWS_FUSED");
+    const raw = env.get(.MLX_SERVE_MOE_ROWS_FUSED);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     moe_rows_fused_env = enabled;
     return enabled;
@@ -94,14 +94,14 @@ pub var moe_verify_rows_logged: bool = false;
 fn moeVerifyRowsEnabled() bool {
     if (moe_verify_rows_override) |v| return v;
     if (moe_verify_rows_cached) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MOE_VERIFY_ROWS");
+    const raw = env.get(.MLX_SERVE_MOE_VERIFY_ROWS);
     const on = moeVerifyRowsFor(if (raw) |r| std.mem.sliceTo(r, 0) else null);
     moe_verify_rows_cached = on;
     return on;
 }
 
-fn moeVerifyRowsFor(env: ?[]const u8) bool {
-    if (env) |e| return !std.mem.eql(u8, e, "0");
+fn moeVerifyRowsFor(raw: ?[]const u8) bool {
+    if (raw) |e| return !std.mem.eql(u8, e, "0");
     return true;
 }
 
@@ -158,7 +158,7 @@ pub fn gatherQmvGateUpRows(
     if (!gatherQmvGateUpEnabled()) return null;
     if (!moeRowsFusedEnabled()) return null;
     if (gate_scale != null and mode != .nvfp4) return null;
-    if (!mlx.streamIsGpu(s) or envFlagCached(&gather_qmv_mod.gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsGpu(s) or env.presentCached(&gather_qmv_mod.gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -455,6 +455,19 @@ test "moe rows fused: N=8 K=10 gate/up and down/reduce match N solo calls" {
         .{ .bits = 4, .gs = 64, .dbits = 8, .dgs = 32 },
         .{ .bits = 3, .gs = 128, .dbits = 3, .dgs = 64 },
     }) |cfg| try moeRowsFusedCase(s, rnd, E, hid, inter, topk, nrows, cfg.bits, cfg.gs, cfg.dbits, cfg.dgs);
+}
+
+// Bar: the rows kernel at a second down width equals the single-row kernel at that width, never the first width's.
+test "moe rows fused: a second down width at the same rows, top-k and N runs its own width" {
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xC0DF);
+    transformer.moe_rows_fused_override = true;
+    defer transformer.moe_rows_fused_override = null;
+    transformer.gqmv_gateup_override = true;
+    defer transformer.gqmv_gateup_override = null;
+    transformer.downred_override = true;
+    defer transformer.downred_override = null;
+    for ([_]c_int{ 640, 320 }) |inter| try moeRowsFusedCase(s, prng.random(), 512, 2560, inter, 10, 8, 4, 64, 8, 32);
 }
 
 fn moeRowsFusedCase(s: mlx.mlx_stream, rnd: std.Random, E: c_int, hid: c_int, inter: c_int, topk: c_int, nrows: c_int, bits: u32, gs: u32, dbits: u32, dgs: u32) !void {

@@ -46,6 +46,22 @@ const gen_sse = @import("../../host/media_jobs/sse.zig");
 /// ComfyUI's own output by `fixtures/minimax_h3_vision.json`.
 pub const h3v = @import("vision.zig");
 pub const audio_mod = @import("audio.zig");
+const ops = @import("../../mlx/ops.zig");
+const qwen3_te = @import("../../sdk/blocks/text_encoders/qwen3.zig");
+const rope_blk = @import("../../sdk/blocks/dit/rope.zig");
+const timestep_blk = @import("../../sdk/blocks/dit/timestep.zig");
+pub const geometry = @import("geometry.zig");
+pub const alignFrameCount = geometry.alignFrameCount;
+pub const videoLatentT = geometry.videoLatentT;
+pub const TemporalShape = geometry.TemporalShape;
+pub const temporalShape = geometry.temporalShape;
+pub const Config = geometry.Config;
+pub const TeConfig = geometry.TeConfig;
+pub const Geometry = geometry.Geometry;
+pub const SpeedConfig = geometry.SpeedConfig;
+pub const resolveSpeed = geometry.resolveSpeed;
+pub const envStr = geometry.envStr;
+pub const adalnPrecomputeOn = geometry.adalnPrecomputeOn;
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
@@ -65,25 +81,20 @@ pub const AUDIO_COND_TIMESTEP: f64 = 1.0;
 pub const CANVAS_MULTIPLE: u32 = 32;
 pub const BASE_SHORT_EDGE: u32 = 768;
 pub const MAX_PIXELS: u32 = 768 * 1344;
-pub const FPS: u32 = 24;
-pub const AUDIO_LATENT_FPS: u32 = 40;
+pub const FPS = geometry.FPS;
+pub const AUDIO_LATENT_FPS = geometry.AUDIO_LATENT_FPS;
 
 /// Defaults from the checkpoint's `model_index.json` `sigma_shift_scales`.
 pub const SIGMA_SHIFT_VIDEO: f64 = 12.0;
 pub const SIGMA_SHIFT_AUDIO: f64 = 3.0;
 
 /// Spatial compression: VAE 16x, then the DiT's 2x2 patch → 32x effective.
-pub const VAE_SPATIAL: u32 = 16;
-pub const PATCH_H: u32 = 2;
-pub const PATCH_W: u32 = 2;
+pub const VAE_SPATIAL = geometry.VAE_SPATIAL;
+pub const PATCH_H = geometry.PATCH_H;
+pub const PATCH_W = geometry.PATCH_W;
 
 // ── Frame ladder ────────────────────────────────────────────────────────────
 
-/// Snap UP to the model's 17k+5 grid. 40 -> 56, 200 -> 209, 363 -> 379.
-pub fn alignFrameCount(n: u32) u32 {
-    // Saturates near the u32 limit, where no ladder rung exists; the transport cap refuses it.
-    return n +| (22 - n % 17) % 17;
-}
 
 /// Snap DOWN to the same ladder, with the model's 5-frame floor. A ref2va
 /// reference video is TRIMMED rather than padded — the reference node drops
@@ -96,30 +107,8 @@ pub fn alignRefFrameCount(n: u32) u32 {
     return v;
 }
 
-/// Latent frames for an aligned source-frame count.
-pub fn videoLatentT(frame_count: u32) u32 {
-    if (frame_count <= 5) return 2;
-    return ((frame_count - 5) / 17) * 5 + 2;
-}
 
-pub const TemporalShape = struct { frame_count: u32, latent_t: u32, audio_t: u32 };
 
-/// Aligned frame count + its latent-frame and audio-latent counts.
-pub fn temporalShape(length: u32) TemporalShape {
-    // 2^24 frames is past what the transport cap admits at any canvas, and keeps audio_t in range.
-    const frame_count = alignFrameCount(std.math.clamp(length, 5, 1 << 24));
-    const fc: f64 = @floatFromInt(frame_count);
-    // audio_t = round(frame_count / 24 * 40) = round(frame_count * 5 / 3). The
-    // reference uses Python's banker's rounding, but frame_count*5/3 can only
-    // have fraction 0, 1/3 or 2/3 — never exactly 1/2 — so the two agree and
-    // plain rounding is safe here. adaptCanvas is NOT so lucky; see below.
-    const audio_t = @round(fc / @as(f64, @floatFromInt(FPS)) * @as(f64, @floatFromInt(AUDIO_LATENT_FPS)));
-    return .{
-        .frame_count = frame_count,
-        .latent_t = videoLatentT(frame_count),
-        .audio_t = @intFromFloat(audio_t),
-    };
-}
 
 // ── Canvas ──────────────────────────────────────────────────────────────────
 
@@ -1049,36 +1038,6 @@ fn denseLinear(x: mlx.mlx_array, w: mlx.mlx_array, bias: ?mlx.mlx_array, s: S) !
 
 // ── Model config ────────────────────────────────────────────────────────────
 
-pub const Config = struct {
-    hidden_size: u32 = 5376,
-    num_layers: u32 = 50,
-    token_refiner_num_layers: u32 = 2,
-    num_attention_heads: u32 = 56,
-    attention_head_dim: u32 = 128,
-    ffn_hidden_size: u32 = 14336,
-    latents_dim: u32 = 24,
-    audio_latents_dim: u32 = 32,
-    text_dim: u32 = 5120,
-    timestep_input_dim: u32 = 256,
-    time_embed_hidden_size: u32 = 5376,
-    time_embed_dim: u32 = 2688,
-    rope_inv_freq_len: u32 = 16,
-    norm_eps: f32 = 1e-5,
-    qk_norm_eps: f32 = 1e-5,
-    final_norm_eps: f32 = 1e-5,
-
-    pub fn innerDim(self: Config) u32 {
-        return self.num_attention_heads * self.attention_head_dim;
-    }
-    /// Rotary width: 3 axes x inv_freq_len, doubled by the split-half pairing.
-    /// 96 of head_dim 128 — the remaining 32 dims per head pass through.
-    pub fn rotDim(self: Config) u32 {
-        return self.rope_inv_freq_len * 3 * 2;
-    }
-    pub fn videoPatchDim(self: Config) u32 {
-        return self.latents_dim * PATCH_H * PATCH_W;
-    }
-};
 
 // ── Weights ─────────────────────────────────────────────────────────────────
 
@@ -1486,30 +1445,10 @@ pub fn buildRope(
 /// [48,96); dims [96,128) pass through UNROTATED. Getting the pass-through
 /// wrong (rotating the full head) is silent — the model still runs.
 pub fn applyRopePub(x: mlx.mlx_array, rope: RopeTables, half: c_int, head_dim: c_int, s: S) !mlx.mlx_array {
-    const x1 = try sliceLast4(x, 0, half, s);
-    defer _ = mlx.mlx_array_free(x1);
-    const x2 = try sliceLast4(x, half, half * 2, s);
-    defer _ = mlx.mlx_array_free(x2);
-
-    const a1 = try mulA(x1, rope.cos, s);
-    defer _ = mlx.mlx_array_free(a1);
-    const a2 = try mulA(x2, rope.sin, s);
-    defer _ = mlx.mlx_array_free(a2);
-    var o1 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(o1);
-    try mlx.check(mlx.mlx_subtract(&o1, a1, a2, s));
-
-    const b1 = try mulA(x1, rope.sin, s);
-    defer _ = mlx.mlx_array_free(b1);
-    const b2 = try mulA(x2, rope.cos, s);
-    defer _ = mlx.mlx_array_free(b2);
-    const o2 = try addA(b1, b2, s);
-    defer _ = mlx.mlx_array_free(o2);
-
-    if (half * 2 == head_dim) return concat(&[_]mlx.mlx_array{ o1, o2 }, 3, s);
-    const tail = try sliceLast4(x, half * 2, head_dim, s);
-    defer _ = mlx.mlx_array_free(tail);
-    return concat(&[_]mlx.mlx_array{ o1, o2, tail }, 3, s);
+    _ = head_dim;
+    var g = ops.Graph.init(std.heap.c_allocator, s);
+    defer g.deinit();
+    return g.escape(try rope_blk.ropeSplitHalf(&g, x, rope.cos, rope.sin, half));
 }
 
 /// Sparse attention core over post-rope [1, H, S, hd] q/k/v.
@@ -2693,15 +2632,7 @@ pub const Model = struct {
         const m = t_vals.len;
         const buf = try self.allocator.alloc(f32, m * @as(usize, half) * 2);
         defer self.allocator.free(buf);
-        const log10k = @log(10000.0);
-        for (t_vals, 0..) |t, i| {
-            for (0..half) |j| {
-                const freq = @exp(-log10k * @as(f64, @floatFromInt(j)) / @as(f64, @floatFromInt(half)));
-                const arg = t * freq;
-                buf[i * half * 2 + j] = @floatCast(@cos(arg));
-                buf[i * half * 2 + half + j] = @floatCast(@sin(arg));
-            }
-        }
+        for (t_vals, 0..) |t, i| timestep_blk.sinusoid(f64, buf[i * half * 2 ..][0 .. half * 2], t, .cos_first);
         const shape = [_]c_int{ @intCast(m), @intCast(half * 2) };
         const emb = mlx.mlx_array_new_data(buf.ptr, &shape, 2, mlx.mlx_dtype.float32);
         defer _ = mlx.mlx_array_free(emb);
@@ -3048,15 +2979,13 @@ pub const Model = struct {
 // For text-only input Qwen3-VL's M-RoPE (mrope_section [24,20,20]) collapses to
 // plain 1-D rotate-half RoPE, because all three axes share the running position.
 
-pub const TeConfig = struct {
-    hidden: c_int = 5120,
-    heads: c_int = 64,
-    kv_heads: c_int = 8,
-    head_dim: c_int = 128,
-    intermediate: c_int = 25600,
-    layers: u32 = 50,
-    theta: f64 = 5_000_000.0,
-    eps: f32 = 1e-6,
+
+/// An encoder projection as the shared Qwen3 layer calls it.
+const TeProj = struct {
+    l: *const MfLinear,
+    pub fn forward(self: TeProj, g: *ops.Graph, x: ops.Array) !ops.Array {
+        return g.adopt(try self.l.forward(x, null, g.s));
+    }
 };
 
 const TeLayerW = struct {
@@ -3426,64 +3355,17 @@ pub const TextEncoder = struct {
     }
 
     fn layerForward(self: *const TextEncoder, layer: *const TeLayerW, x: mlx.mlx_array, mask: mlx.mlx_array, rope: RopeTables, seq: c_int, s: S) !mlx.mlx_array {
+        _ = seq;
         const cfg = self.cfg;
-        const xn = try rmsNormLast(x, layer.input_ln, cfg.eps, s);
-        defer _ = mlx.mlx_array_free(xn);
-
-        var qkv: [3]mlx.mlx_array = undefined;
-        const heads = [3]c_int{ cfg.heads, cfg.kv_heads, cfg.kv_heads };
-        inline for (.{ &layer.qw, &layer.kw, &layer.vw }, 0..) |lw, i| {
-            const p = try lw.forward(xn, null, s);
-            defer _ = mlx.mlx_array_free(p);
-            const r4 = try reshape(p, &[_]c_int{ 1, seq, heads[i], cfg.head_dim }, s);
-            if (i == 2) {
-                defer _ = mlx.mlx_array_free(r4);
-                const t = try transpose(r4, &[_]c_int{ 0, 2, 1, 3 }, s);
-                defer _ = mlx.mlx_array_free(t);
-                qkv[i] = try contig(t, s);
-            } else {
-                defer _ = mlx.mlx_array_free(r4);
-                const nw = if (i == 0) layer.q_norm else layer.k_norm;
-                const nn = try rmsNormLast(r4, nw, cfg.eps, s);
-                defer _ = mlx.mlx_array_free(nn);
-                const t = try transpose(nn, &[_]c_int{ 0, 2, 1, 3 }, s);
-                defer _ = mlx.mlx_array_free(t);
-                const tc = try contig(t, s);
-                defer _ = mlx.mlx_array_free(tc);
-                qkv[i] = try ropeHalf(tc, rope, cfg.head_dim, s);
-            }
-        }
-        defer for (&qkv) |*p| {
-            _ = mlx.mlx_array_free(p.*);
+        var g = ops.Graph.init(self.allocator, s);
+        defer g.deinit();
+        const w = .{
+            .input_ln = layer.input_ln, .post_ln = layer.post_ln, .q_norm = layer.q_norm, .k_norm = layer.k_norm,
+            .q = TeProj{ .l = &layer.qw }, .k = TeProj{ .l = &layer.kw }, .v = TeProj{ .l = &layer.vw }, .o = TeProj{ .l = &layer.ow },
+            .gate = TeProj{ .l = &layer.gate_w }, .up = TeProj{ .l = &layer.up_w }, .down = TeProj{ .l = &layer.down_w },
         };
-
-        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
-        var attn = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(attn);
-        const null_sink = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qkv[0], qkv[1], qkv[2], scale, "array", mask, null_sink, false, s));
-        const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s);
-        defer _ = mlx.mlx_array_free(at);
-        const af = try reshape(at, &[_]c_int{ 1, seq, cfg.heads * cfg.head_dim }, s);
-        defer _ = mlx.mlx_array_free(af);
-        const o = try layer.ow.forward(af, null, s);
-        defer _ = mlx.mlx_array_free(o);
-        const h1 = try addA(x, o, s);
-        defer _ = mlx.mlx_array_free(h1);
-
-        const hn = try rmsNormLast(h1, layer.post_ln, cfg.eps, s);
-        defer _ = mlx.mlx_array_free(hn);
-        const g = try layer.gate_w.forward(hn, null, s);
-        defer _ = mlx.mlx_array_free(g);
-        const sg = try siluA(g, s);
-        defer _ = mlx.mlx_array_free(sg);
-        const u = try layer.up_w.forward(hn, null, s);
-        defer _ = mlx.mlx_array_free(u);
-        const gu = try mulA(sg, u, s);
-        defer _ = mlx.mlx_array_free(gu);
-        const d = try layer.down_w.forward(gu, null, s);
-        defer _ = mlx.mlx_array_free(d);
-        return addA(h1, d, s);
+        const out = try qwen3_te.layerForward(&g, w, .{ .heads = cfg.heads, .kv_heads = cfg.kv_heads, .head_dim = cfg.head_dim, .eps = cfg.eps }, .{ .half = .{ .cos = rope.cos, .sin = rope.sin } }, x, mask);
+        return g.escape(out);
     }
 };
 
@@ -3553,29 +3435,6 @@ pub fn stillAsFramePair(img: mlx.mlx_array, s: S) !mlx.mlx_array {
     const one = try reshape(img, &[_]c_int{ 1, 3, h, w }, s);
     defer _ = mlx.mlx_array_free(one);
     return concat(&[_]mlx.mlx_array{ one, one }, 0, s);
-}
-
-/// Standard rotate-half RoPE on [1, H, seq, head_dim].
-fn ropeHalf(x: mlx.mlx_array, rope: RopeTables, head_dim: c_int, s: S) !mlx.mlx_array {
-    const half = @divExact(head_dim, 2);
-    const x1 = try sliceLast4(x, 0, half, s);
-    defer _ = mlx.mlx_array_free(x1);
-    const x2 = try sliceLast4(x, half, head_dim, s);
-    defer _ = mlx.mlx_array_free(x2);
-    const a1 = try mulA(x1, rope.cos, s);
-    defer _ = mlx.mlx_array_free(a1);
-    const a2 = try mulA(x2, rope.sin, s);
-    defer _ = mlx.mlx_array_free(a2);
-    var o1 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(o1);
-    try mlx.check(mlx.mlx_subtract(&o1, a1, a2, s));
-    const b1 = try mulA(x2, rope.cos, s);
-    defer _ = mlx.mlx_array_free(b1);
-    const b2 = try mulA(x1, rope.sin, s);
-    defer _ = mlx.mlx_array_free(b2);
-    const o2 = try addA(b1, b2, s);
-    defer _ = mlx.mlx_array_free(o2);
-    return concat(&[_]mlx.mlx_array{ o1, o2 }, 3, s);
 }
 
 /// Additive causal mask [1, 1, seq, seq]. Built with `where`, never by
@@ -3784,7 +3643,9 @@ pub const RefMedia = struct {
     }
 };
 
+
 pub const GenRequest = struct {
+    geometry: Geometry = .{},
     /// Keep the text encoder and DiT loaded in this cache between requests (null = the staged
     /// plan: load, run, free). `resident_bytes` is what the cache reports holding.
     resident: ?*Resident = null,
@@ -3845,30 +3706,7 @@ pub const GenRequest = struct {
     refs: []const RefMedia = &.{},
 };
 
-pub const SpeedConfig = struct { step_cache: f64, bcast_k: u32 };
 
-/// The 2026-08-03 eyeball verdict on the same-seed capstone pair made the
-/// fast recipe (velocity cache 0.05 + attention broadcast k=2 — 2.83x at the
-/// trained config) DEFAULT-ON, with `"fast": false` on the request as the
-/// off switch for final renders ("non fast just a smidge better"). Env vars
-/// stay the STRONGEST knob — set means set, including "0" — so every A/B
-/// harness keeps its arms.
-///
-/// Turbo and the fast recipe are ALTERNATIVES, not a stack: at 4-8 steps the
-/// velocity cache's slow-drift premise is false (every step is a giant leap)
-/// and the broadcast gates cover most of the schedule anyway, so `turbo`
-/// forces both off regardless of `fast` — env still wins for A/B harnesses.
-/// A PDD student is `distilled` the same way.
-pub fn resolveSpeed(fast: ?bool, distilled: bool, env_sc: ?[]const u8, env_bk: ?[]const u8) SpeedConfig {
-    const want_fast = !distilled and (fast orelse true);
-    var out = SpeedConfig{
-        .step_cache = if (want_fast) 0.05 else 0,
-        .bcast_k = if (want_fast) 2 else 0,
-    };
-    if (env_sc) |raw| out.step_cache = std.fmt.parseFloat(f64, raw) catch out.step_cache;
-    if (env_bk) |raw| out.bcast_k = std.fmt.parseInt(u32, raw, 10) catch out.bcast_k;
-    return out;
-}
 
 /// What the audio latent is advanced by this step, per unit of the
 /// slope-scaled velocity the forward returns (`Output.audio` carries
@@ -3908,7 +3746,7 @@ pub fn cachedAudioAdvance(distilled: bool, stored_slope: f64, sigma: f64, sigma_
 }
 
 /// The text encoder and the whole DiT, kept loaded between requests while the engine stays loaded
-/// and `gen.h3KeepResident` says memory allows. The DiT keeps its AdaLN weights (no per-schedule
+/// and `config.keepResident` says memory allows. The DiT keeps its AdaLN weights (no per-schedule
 /// precompute) so it serves any request. Inference thread only: every free is an MLX free.
 pub const Resident = struct {
     allocator: std.mem.Allocator,
@@ -4236,10 +4074,10 @@ pub fn bindLoras(allocator: std.mem.Allocator, stack: *lora_mod.Stack, model: *M
 /// The DiT, with its weights map freed as soon as the model owns the arrays: a map that outlived
 /// `Model.load` would hold +1 refs on every raw file-backed array, so anything the model later
 /// frees (the 13 GB of AdaLN under precompute) would stay resident.
-pub fn loadDit(allocator: std.mem.Allocator, path: []const u8, dt: mlx.mlx_dtype, s: S) !Model {
+pub fn loadDit(allocator: std.mem.Allocator, path: []const u8, cfg: Config, dt: mlx.mlx_dtype, s: S) !Model {
     var dw = try model_mod.loadWeightsSingleFile(allocator, path);
     defer dw.deinit();
-    return Model.load(allocator, &dw, .{}, dt, s);
+    return Model.load(allocator, &dw, cfg, dt, s);
 }
 
 /// One window, with STAGED residency: the 50-layer text encoder (~48 GB bf16)
@@ -4559,10 +4397,10 @@ fn generateOne(
         var te_local: ?TextEncoder = null;
         defer if (te_local) |*t| t.deinit();
         const te: *TextEncoder = if (req.resident) |r| rb: {
-            if (r.te == null) r.te = try TextEncoder.load(allocator, &tw.?, .{}, dt, s) else log.info("[minimax-h3] text encoder: resident hit\n", .{});
+            if (r.te == null) r.te = try TextEncoder.load(allocator, &tw.?, req.geometry.te, dt, s) else log.info("[minimax-h3] text encoder: resident hit\n", .{});
             break :rb &r.te.?;
         } else lb: {
-            te_local = try TextEncoder.load(allocator, &tw.?, .{}, dt, s);
+            te_local = try TextEncoder.load(allocator, &tw.?, req.geometry.te, dt, s);
             break :lb &te_local.?;
         };
         // The tower is 1.2 GB and only the presentation knows whether anything
@@ -4573,7 +4411,7 @@ fn generateOne(
         errdefer e.deinit();
         try mlx.check(mlx.mlx_array_eval(e.hidden));
         // Read while the encoder is still resident: this stage is one term of
-        // `gen.h3PeakBytes`, and a bill nobody can check against the running
+        // `config.peakBytes`, and a bill nobody can check against the running
         // process is how the DiT term stayed 12 GiB wrong for months.
         _ = mlx.mlx_get_active_memory(&te_active);
         break :blk e;
@@ -4601,10 +4439,10 @@ fn generateOne(
     const n_video_rows: c_int = @intCast(shape.latent_t * (lat_h / PATCH_H) * (lat_w / PATCH_W));
     const n_audio_rows: c_int = @intCast(shape.audio_t * 2);
 
-    const vpatch: c_int = @intCast((Config{}).videoPatchDim());
+    const vpatch: c_int = @intCast(req.geometry.dit.videoPatchDim());
     var video_x = try randomNormal(&[_]c_int{ n_video_rows, vpatch }, req.seed, mlx.mlx_dtype.float32, s);
     defer _ = mlx.mlx_array_free(video_x);
-    var audio_x = try randomNormal(&[_]c_int{ n_audio_rows, 32 }, req.seed +% 1, mlx.mlx_dtype.float32, s);
+    var audio_x = try randomNormal(&[_]c_int{ n_audio_rows, @intCast(req.geometry.dit.audio_latents_dim) }, req.seed +% 1, mlx.mlx_dtype.float32, s);
     defer _ = mlx.mlx_array_free(audio_x);
 
     const max_t: f64 = if (req.pdd) |p| p.max_t else 1.0;
@@ -4647,11 +4485,11 @@ fn generateOne(
         var model_local: ?Model = null;
         defer if (model_local) |*m| m.deinit();
         const model: *Model = if (req.resident) |r| rb: {
-            if (r.dit == null) r.dit = try loadDit(allocator, paths.dit, dt, s) else log.info("[minimax-h3] dit: resident hit\n", .{});
+            if (r.dit == null) r.dit = try loadDit(allocator, paths.dit, req.geometry.dit, dt, s) else log.info("[minimax-h3] dit: resident hit\n", .{});
             r.bytes = req.resident_bytes;
             break :rb &r.dit.?;
         } else lb: {
-            model_local = try loadDit(allocator, paths.dit, dt, s);
+            model_local = try loadDit(allocator, paths.dit, req.geometry.dit, dt, s);
             break :lb &model_local.?;
         };
         if (req.resident) |r| {
@@ -4927,7 +4765,7 @@ fn generateOne(
     _ = phase_timer.lapMs();
     var vw = try model_mod.loadWeightsSingleFile(allocator, paths.vae);
     defer vw.deinit();
-    var dec = try vae_mod.Decoder.load(allocator, &vw, .{}, dt, s);
+    var dec = try vae_mod.Decoder.load(allocator, &vw, req.geometry.vae, dt, s);
     defer dec.deinit();
     const pixels = try vae_mod.decode(&dec, zlat, allocator, s);
     errdefer _ = mlx.mlx_array_free(pixels);
@@ -5445,25 +5283,12 @@ test "minimax h3 live: generates a clip" {
     std.debug.print("[minimax-h3] wrote {d} frames {d}x{d} to {s}\n", .{ res.frame_count, res.width, res.height, out_dir });
 }
 
-/// libc getenv, matching generate.zig's allocator-free env idiom.
-pub fn envStr(name: [:0]const u8) ?[]const u8 {
-    const raw = std.c.getenv(name.ptr) orelse return null;
-    const slice = std.mem.sliceTo(raw, 0);
-    return if (slice.len == 0) null else slice;
-}
 
 fn envU32(name: [:0]const u8, dflt: u32) u32 {
     const v = envStr(name) orelse return dflt;
     return std.fmt.parseInt(u32, v, 10) catch dflt;
 }
 
-/// Whether `generate` will table and free the DiT's AdaLN weights. Shared with
-/// `gen.estimatePeakResidentBytes`: a residency bill computed against the OTHER
-/// answer is either an OOM (billed shed, ran full) or a refused load.
-pub fn adalnPrecomputeOn() bool {
-    const raw = envStr("MINIMAX_H3_ADALN_PRECOMPUTE") orelse return true;
-    return !std.mem.eql(u8, raw, "0");
-}
 
 fn allFinite(x: mlx.mlx_array, s: S) !bool {
     var isf = mlx.mlx_array_new();

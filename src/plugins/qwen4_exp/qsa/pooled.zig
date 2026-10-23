@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/qsa/pooled, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns qsaIdxBitMismatches, qsaIdxTestKeys, qsaIdxRopeCase, qsaIdxRopeTestXfm, qsaIdxCancelKeys, QsaPooledRope, and 22 more.
+//! The pooled indexer keys: their rope (`QsaPooledRope`, the pool-rope kernel) and the pointer-keyed cache invalidated
+//! by an atomic mark.
 
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
@@ -144,7 +144,7 @@ pub fn qsaIdxRopeFusedEnabled() bool {
 // `nblk` varies per call (1 at decode, up to 512 per prefill chunk), so it is a
 // scalar INPUT; the templates (T, R, RD, HALF) are fixed per model and name the
 // one pipeline MLX compiles.
-const QSA_POOL_ROPE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_pool_rope.metal");
+pub const QSA_POOL_ROPE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_pool_rope.metal");
 
 /// Largest block ratio whose f32 block sum MLX folds in row order 0..R-1, the
 /// order the kernel uses. The mean over axis 2 of `[B, nb, R, 128]` is a strided

@@ -2,6 +2,7 @@
 //! Owns nax_sdpa_avail_cache, nax_sdpa_override, nax_sdpa_env, naxSdpaPreferredFrom, naxSdpaPreferred, sdpaForceFusedFor, and 15 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
@@ -30,7 +31,7 @@ pub fn naxSdpaPreferred() bool {
     if (nax_sdpa_override) |v| return v;
     if (nax_sdpa_env) |v| return v;
     if (nax_sdpa_avail_cache == null) nax_sdpa_avail_cache = computeNaxAvailable();
-    const raw = std.c.getenv("MLX_SERVE_NAX_SDPA");
+    const raw = env.get(.MLX_SERVE_NAX_SDPA);
     const on = naxSdpaPreferredFrom(nax_sdpa_avail_cache.?, if (raw) |v| std.mem.sliceTo(v, 0) else null);
     nax_sdpa_env = on;
     if (on) log.info("[nax-sdpa] engaged: stock fused sdpa (force_fused) serves hd-256 causal prefill and verify blocks > 8 rows; msv_attn_p256 causal arm declined (MLX_SERVE_NAX_SDPA=0 restores)\n", .{});
@@ -67,7 +68,7 @@ fn sdpaSplitEnabled() bool {
     if (sdpa_split_override) |v| return v;
     if (sdpa_split_env_cached) |v| return v;
     const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_SDPA_SPLIT") orelse break :blk true;
+        const raw = env.get(.MLX_SERVE_SDPA_SPLIT) orelse break :blk true;
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     sdpa_split_env_cached = v;

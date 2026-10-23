@@ -1,28 +1,13 @@
 #!/bin/bash
-# Plan 01 — A8 24h concurrent soak test.
+# test_soak_24h.sh — 4-way concurrent soak (`--max-concurrent 4 --kv-quant 4`): plain chat, an agent loop with
+# thinking, /v1/messages and a tool round trip run in parallel for SOAK_DURATION_HOURS (default 24). RSS/VSZ every
+# 5 min to tests/soak_log.csv, /health within 5 s every 30 min; FAIL when RSS drifts > 5% from the first 5-minute
+# sample (> 10% in the 1-hour variant, where allocator warm-up dominates).
 #
-# Spins up the server with `--max-concurrent 4 --kv-quant 4` and pounds it
-# with four parallel workloads for `SOAK_DURATION_HOURS` hours (default 24,
-# override via env). The workloads exercise distinct code paths so a leak
-# or crash in any of them surfaces:
-#
-#   1. Plain chat completions  — varied prompts, 50-500 max_tokens.
-#   2. Agent-loop style        — multi-turn fact recall (think tag enabled).
-#   3. Anthropic /v1/messages  — exercises the parallel API.
-#   4. Tool-calling round-trip — invokes a tool, feeds the result back.
-#
-# Every 5 minutes: record RSS / VSZ via `ps -o rss,vsz` to `tests/soak_log.csv`.
-# Every 30 minutes: assert /health returns 200 within 5s.
-# On exit: compute RSS drift = (rss_last_sample - rss_first_5min_sample) /
-#          rss_first_5min_sample. FAIL if drift > 5% (or > 10% in the 1-hour
-#          CI smoke variant, where transient allocator warm-up dominates).
-#
-# Usage:
-#   SOAK_DURATION_HOURS=1 ./tests/test_soak_24h.sh                 # CI smoke
-#   SOAK_DURATION_HOURS=24 ./tests/test_soak_24h.sh                # full
-#   SOAK_DURATION_HOURS=2 SOAK_MODEL=/path/to/model ./tests/test_soak_24h.sh
+#   SOAK_DURATION_HOURS=1 [SOAK_MODEL=<dir>] ./tests/test_soak_24h.sh
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 SOAK_DURATION_HOURS="${SOAK_DURATION_HOURS:-24}"
 PORT="${PORT:-8095}"
@@ -103,10 +88,7 @@ cleanup() {
 trap cleanup EXIT INT TERM
 
 up=0
-for i in $(seq 1 120); do
-    if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 120 1 && up=1
 if [ "$up" != "1" ]; then
     echo -e "${RED}FAIL${NC} server did not become healthy within 120s"
     tail -50 "$SERVER_LOG"

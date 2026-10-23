@@ -1,0 +1,2 @@
+{"format": "mlx-serve-expert-subset-v1", "kind": "test", "n_experts": 8, "note": "any field documents",
+ "selected": [[1, 4, 6], [0, 7]]}

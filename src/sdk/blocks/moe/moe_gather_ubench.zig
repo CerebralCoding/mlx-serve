@@ -5,6 +5,7 @@
 //!   MOE_UBENCH=1 zig build test -Doptimize=ReleaseFast -Dtest-filter="moe gather kernels"
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const xfm = @import("../../../engines/mlx/transformer.zig");
@@ -204,7 +205,7 @@ fn bench(in: *const Inputs, arm: Arm, label: []const u8, bytes_per_call: f64) !v
 
 // Bar: both fused kernels run at the Flash Next shapes and return finite outputs; timings are printed.
 test "moe gather kernels: microbench (MOE_UBENCH=1)" {
-    if (std.c.getenv("MOE_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MOE_UBENCH) == null) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     mlx.installErrorHandler();
     var trash: [512]u8 = undefined;
@@ -469,7 +470,7 @@ fn benchChain(in: *const RowsIn, mode: ChainMode, label: []const u8, bytes_per_c
 }
 
 test "moe verify rows kernels: microbench at S rows (MOE_UBENCH=1)" {
-    if (std.c.getenv("MOE_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MOE_UBENCH) == null) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     mlx.installErrorHandler();
     var trash: [512]u8 = undefined;
@@ -567,10 +568,25 @@ test "moe verify rows kernels: microbench at S rows (MOE_UBENCH=1)" {
 // The read ceiling with wide loads: one simdgroup streams its own 64 KiB span with 16-byte loads, UNROLL
 // loads in flight per lane, and folds what it read into one word so nothing is dead code. A DRAM rate here
 // that beats the reduction above says the reduction was the limit, not the memory.
-const STREAM_WIDE_SOURCE = kernelSource("kernels/moe/ubench_stream_wide.metal");
+pub const STREAM_WIDE_SOURCE = kernelSource("kernels/moe/ubench_stream_wide.metal");
+
+/// The stream-wide launch: `nsg` simdgroups over 64 KiB spans, `unroll` loads in flight, grid-stride when `strided`.
+pub fn streamWideConfig(nsg: c_int, unroll: c_int, strided: c_int) !mlx.mlx_fast_metal_kernel_config {
+    const cfg = mlx.mlx_fast_metal_kernel_config_new();
+    errdefer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
+    const oshape = [_]c_int{nsg};
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &oshape, 1, .uint32));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, nsg * 32, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SPAN4", 4096));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "UNROLL", unroll));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "STRIDED", strided));
+    try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NSG", nsg));
+    return cfg;
+}
 
 test "stream read peak: wide loads over 2 GiB (MOE_UBENCH=1)" {
-    if (std.c.getenv("MOE_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MOE_UBENCH) == null) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     mlx.installErrorHandler();
     var trash: [512]u8 = undefined;
@@ -587,7 +603,7 @@ test "stream read peak: wide loads over 2 GiB (MOE_UBENCH=1)" {
     defer _ = mlx.mlx_array_free(a);
     try mlx.check(mlx.mlx_array_eval(a));
     const bytes = @as(f64, @floatFromInt(rows)) * @as(f64, @floatFromInt(cols)) * 2.0;
-    const span4: c_int = 4096; // uint4 per simdgroup: 64 KiB
+    const span4: c_int = 4096; // uint4 per simdgroup: 64 KiB, `streamWideConfig`'s
     const nsg: c_int = @intCast(@divExact(@as(i64, rows) * cols * 2, @as(i64, span4) * 16));
     const io = std.Io.Threaded.global_single_threaded.io();
     const ins = [_][*:0]const u8{"a"};
@@ -601,16 +617,8 @@ test "stream read peak: wide loads over 2 GiB (MOE_UBENCH=1)" {
     for ([_]c_int{ 1, 2, 4, 8, 11, 12, 14 }) |unroll_code| {
         const strided: c_int = if (unroll_code > 10) 1 else 0;
         const unroll: c_int = if (unroll_code > 10) unroll_code - 10 else unroll_code;
-        const cfg = mlx.mlx_fast_metal_kernel_config_new();
+        const cfg = try streamWideConfig(nsg, unroll, strided);
         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-        const oshape = [_]c_int{nsg};
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &oshape, 1, .uint32));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, nsg * 32, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "SPAN4", span4));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "UNROLL", unroll));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "STRIDED", strided));
-        try mlx.check(mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NSG", nsg));
         const in_arr = [_]mlx.mlx_array{a};
         const in_vec = mlx.mlx_vector_array_new_data(&in_arr, in_arr.len);
         defer _ = mlx.mlx_vector_array_free(in_vec);
@@ -635,7 +643,7 @@ test "stream read peak: wide loads over 2 GiB (MOE_UBENCH=1)" {
 }
 
 test "stream read peak: reduction over 2 GiB (MOE_UBENCH=1)" {
-    if (std.c.getenv("MOE_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MOE_UBENCH) == null) return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     mlx.installErrorHandler();
     var trash: [512]u8 = undefined;

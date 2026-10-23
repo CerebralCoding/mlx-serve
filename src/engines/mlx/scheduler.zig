@@ -32,6 +32,7 @@
 //! plus a cv broadcast.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const depth_bounds = @import("spec/mtp_depth_bounds.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const ple_gpu = @import("../../plugins/qwen4_exp/ple_gpu.zig");
@@ -40,7 +41,6 @@ const tokenizer_mod = @import("../../host/tokenizer/tokenizer.zig");
 const generate_mod = @import("generate.zig");
 const rp_mod = @import("../../host/chat/reasoning/protocol.zig");
 const gen_mod = @import("../../host/media_jobs/gen.zig");
-const diarization_mod = @import("../../plugins/nemotron_diarization/diarization.zig");
 const gen_sse = @import("../../host/media_jobs/sse.zig");
 const drafter_mod = @import("../../plugins/gemma4/assistant_drafter.zig");
 const mtp_graft = @import("../../plugins/prism_hadamard_qwen35/mtp_graft.zig");
@@ -479,7 +479,7 @@ pub const Scheduler = struct {
         // output matches the single-slot path token-for-token at temp=0,
         // single client. Uses libc getenv to stay allocator-free.
         const force_batched = blk: {
-            const raw = std.c.getenv("MLX_SERVE_FORCE_BATCHED");
+            const raw = env.get(.MLX_SERVE_FORCE_BATCHED);
             if (raw == null) break :blk false;
             const slice = std.mem.sliceTo(raw.?, 0);
             break :blk std.mem.eql(u8, slice, "1");
@@ -947,7 +947,7 @@ pub const Scheduler = struct {
         // same parse error). FileNotFound / parse errors land here.
         var settings = model_settings.overrideFor(self.allocator, self.io, entry.path);
         defer settings.deinit(self.allocator);
-        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, settings.ctx_size orelse self.gguf_ctx_size) catch |err| {
+        const cpu_state = preloadCpuState(self.allocator, self.io, entry.path, settings.ctx_size orelse self.gguf_ctx_size, settings.ggufEngine()) catch |err| {
             self.registry.mutex.lockUncancelable(self.io);
             self.registry.markErrorLocked(entry, @errorName(err));
             self.registry.mutex.unlock(self.io);

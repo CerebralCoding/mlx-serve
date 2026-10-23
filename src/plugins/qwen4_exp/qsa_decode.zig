@@ -12,12 +12,12 @@ const mlx = @import("../../mlx/ffi.zig");
 const CH: c_int = 32; // visible keys per simdgroup, a multiple of 8 and of RATIO
 const BD: c_int = 256;
 
-const HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_header.metal");
+pub const HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_header.metal");
 
-const PARTS_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_parts.metal");
+pub const PARTS_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_parts.metal");
 
 // One threadgroup a head. An empty split writes l = 0, the skip flag.
-const MERGE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_merge.metal");
+pub const MERGE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_decode_merge.metal");
 
 var parts_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;

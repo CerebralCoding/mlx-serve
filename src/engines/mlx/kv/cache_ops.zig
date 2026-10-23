@@ -34,7 +34,11 @@ pub const ops: abi.CacheOps = .{
     .append_rows = appendRows,
     .state = state,
     .set_state = setState,
+    .state_rows = Rows.stateRows,
+    .set_state_rows = Rows.setStateRows,
 };
+
+const Rows = @import("../../../sdk/util/state_rows.zig").Rows(state, setState);
 
 fn slotOf(h: abi.Handle) *Slot {
     return @ptrCast(@alignCast(h.?));

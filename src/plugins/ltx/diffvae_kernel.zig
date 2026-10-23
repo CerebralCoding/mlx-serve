@@ -40,7 +40,7 @@ pub const VARIANTS = [_]geom.Kernel{
 var cached: [VARIANTS.len]?mlx.mlx_fast_metal_kernel = @splat(null);
 var engaged_logged: [VARIANTS.len]bool = @splat(false);
 
-const HEADER = kernelSource("plugins/ltx/kernels/diffvae_header.metal");
+pub const HEADER = kernelSource("plugins/ltx/kernels/diffvae_header.metal");
 
 // One thread = one (t, h, w, head) query. Q/K/V arrive [1,T,H,W,NH,HD], already
 // q/k-normed, Q pre-scaled by HD^-0.5 and RoPE'd; the output is [1,T,H,W,NH*HD].
@@ -48,7 +48,7 @@ const HEADER = kernelSource("plugins/ltx/kernels/diffvae_header.metal");
 // The online-softmax rescale is BRANCHED on a new maximum instead of applied
 // every key: the correction is 1.0 for all but O(log n) of the ~147 keys, and
 // the unconditional form spends a second 64-wide pass per key doing nothing.
-const SOURCE = kernelSource("plugins/ltx/kernels/diffvae.metal");
+pub const SOURCE = kernelSource("plugins/ltx/kernels/diffvae.metal");
 
 fn variantIndex(kern: geom.Kernel) ?usize {
     for (VARIANTS, 0..) |v, i| {

@@ -6,8 +6,10 @@ const abi = @import("../../abi/quant.zig");
 const block = @import("block.zig");
 const native = @import("native.zig");
 const hadamard = @import("hadamard/format.zig");
+const exl3 = @import("exl3/format.zig");
+const gguf = @import("gguf/format.zig");
 
-pub const tables = [_]*const abi.QuantTable{ &native.affine, &native.fp8, &native.mxfp8, &native.nvfp4, &hadamard.table };
+pub const tables = [_]*const abi.QuantTable{ &native.affine, &native.fp8, &native.mxfp8, &native.nvfp4, &hadamard.table, &exl3.table, &gguf.table };
 
 /// The table serving `block_json` of `config_json`; null when no built-in claims it.
 pub fn claimant(block_json: []const u8, config_json: []const u8) error{Ambiguous}!?*const abi.QuantTable {
@@ -49,12 +51,17 @@ test "quant formats: every built-in format passes the quant plugin conformance" 
     try conformance.expectPlugin(Builtin(2, "{\"bits\":8,\"group_size\":32,\"mode\":\"mxfp8\"}", "{}"));
     try conformance.expectPlugin(Builtin(3, "{\"bits\":4,\"group_size\":16,\"mode\":\"nvfp4\"}", "{}"));
     try conformance.expectPlugin(Builtin(4, "{\"bits\":2,\"group_size\":128}", "{\"modules\":[{\"path\":\"lm_head\",\"block\":1024}]}"));
+    try conformance.expectPlugin(Builtin(5, "{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\",\"window\":14}", "{}"));
+    try conformance.expectPlugin(Builtin(6, "{\"group_size\":32,\"bits\":4,\"mode\":\"gguf\"}", "{}"));
 }
 
 test {
     _ = block;
     _ = native;
     _ = hadamard;
+    _ = exl3;
+    _ = gguf;
     _ = @import("../weights/resident.zig");
     _ = @import("../weights/streamed.zig");
+    _ = @import("fp8_block128.zig");
 }

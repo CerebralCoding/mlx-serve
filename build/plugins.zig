@@ -23,6 +23,8 @@ pub fn generate(b: *std.Build) void {
     var names: std.ArrayList([]const u8) = .empty;
     for (folders) |f| {
         b.dependOnDirectoryContents(b.path(b.fmt("{s}/{s}", .{ plugins_dir, f })));
+        // A folder with its own build.zig is an outside plugin built from the kit (build/kit.zig), never compiled in.
+        if (root.access(io, b.fmt("{s}/{s}/build.zig", .{ plugins_dir, f }), .{})) |_| continue else |_| {}
         root.access(io, b.fmt("{s}/{s}/plugin.zig", .{ plugins_dir, f }), .{}) catch continue;
         const cfg = b.fmt("{s}/{s}/config.zig", .{ plugins_dir, f });
         root.access(io, cfg, .{}) catch std.process.fatal("plugin {s}: plugin.zig without the MLX-free config.zig", .{f});
@@ -92,7 +94,7 @@ fn importsOf(a: std.mem.Allocator, src: []const u8) ![]const []const u8 {
 }
 
 /// Reads a source for the closure check and declares it a configure input.
-const FsReader = struct {
+pub const FsReader = struct {
     b: *std.Build,
     dir: std.Io.Dir,
     io: std.Io,
@@ -105,6 +107,16 @@ const FsReader = struct {
 
 /// The first import in `start`'s closure that leaves the MLX-free set, as the chain that reaches it; null = clean.
 fn firstViolation(a: std.mem.Allocator, reader: anytype, start: []const u8) !?[]const u8 {
+    return switch (try closure(a, reader, start)) {
+        .files => null,
+        .violation => |v| v,
+    };
+}
+
+pub const Closure = union(enum) { files: []const []const u8, violation: []const u8 };
+
+/// `start`'s import closure (itself included, sorted), or the first import that leaves the MLX-free set.
+pub fn closure(a: std.mem.Allocator, reader: anytype, start: []const u8) !Closure {
     var parent: std.StringHashMapUnmanaged([]const u8) = .empty;
     var queue: std.ArrayList([]const u8) = .empty;
     try parent.put(a, start, "");
@@ -114,17 +126,21 @@ fn firstViolation(a: std.mem.Allocator, reader: anytype, start: []const u8) !?[]
             if (std.mem.eql(u8, imp, "std") or std.mem.eql(u8, imp, "builtin")) continue;
             if (std.mem.endsWith(u8, imp, ".zon")) continue;
             if (!std.mem.endsWith(u8, imp, ".zig"))
-                return try std.fmt.allocPrint(a, "{s} imports the module \"{s}\" (a config.zig reaches std and src/ files only)", .{ try chain(a, &parent, path), imp });
+                return .{ .violation = try std.fmt.allocPrint(a, "{s} imports the module \"{s}\" (a config.zig reaches std and src/ files only)", .{ try chain(a, &parent, path), imp }) };
             const next = try std.fs.path.resolveAllocPosix(a, &.{ std.fs.path.dirnamePosix(path) orelse ".", imp });
             if (deniedPath(next))
-                return try std.fmt.allocPrint(a, "{s} -> {s}: a config.zig must not reach MLX", .{ try chain(a, &parent, path), next });
+                return .{ .violation = try std.fmt.allocPrint(a, "{s} -> {s}: a config.zig must not reach MLX", .{ try chain(a, &parent, path), next }) };
             const gop = try parent.getOrPut(a, next);
             if (gop.found_existing) continue;
             gop.value_ptr.* = path;
             try queue.append(a, next);
         }
     }
-    return null;
+    var files: std.ArrayList([]const u8) = .empty;
+    var it = parent.keyIterator();
+    while (it.next()) |k| try files.append(a, k.*);
+    std.mem.sort([]const u8, files.items, {}, lessThan);
+    return .{ .files = files.items };
 }
 
 fn deniedPath(path: []const u8) bool {
@@ -243,6 +259,21 @@ test "build plugins: a config.zig whose closure reaches MLX or a module is refus
     try testing.expect(std.mem.indexOf(u8, (try firstViolation(a, module, "src/plugins/fx/config.zig")).?, "the module \"mlx_stream\"") != null);
     const outside: MapReader = .{ .files = &.{.{ "src/plugins/fx/config.zig", "const m = @import(\"../../../lib/x.zig\");" }} };
     try testing.expect((try firstViolation(a, outside, "src/plugins/fx/config.zig")) != null);
+}
+
+test "build plugins: the closure lists every file an MLX-free root reaches" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const r: MapReader = .{ .files = &.{
+        .{ "src/kit.zig", "const a = @import(\"abi/plugin.zig\");\nconst s = @import(\"sdk/root.zig\");" },
+        .{ "src/abi/plugin.zig", "const c = @import(\"common.zig\");" },
+        .{ "src/abi/common.zig", "const std = @import(\"std\");" },
+        .{ "src/sdk/root.zig", "const p = @import(\"../abi/plugin.zig\");" },
+    } };
+    const got = (try closure(arena.allocator(), r, "src/kit.zig")).files;
+    try testing.expectEqual(@as(usize, 4), got.len);
+    try testing.expectEqualStrings("src/abi/common.zig", got[0]);
+    try testing.expectEqualStrings("src/sdk/root.zig", got[3]);
 }
 
 test "build plugins: templates compile beside the registry but are never registered or exported" {

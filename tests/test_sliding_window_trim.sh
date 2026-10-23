@@ -1,35 +1,16 @@
 #!/bin/bash
-# Sliding-window BLOCK trim byte-equivalence, per arch.
+# test_sliding_window_trim.sh — sliding-window BLOCK trim byte-equivalence per arch (gemma4 MoE with --pld, laguna,
+# inkling, gpt-oss): greedy output with MLX_SERVE_SLIDING_BLOCK_TRIM=1 must equal =0 at a context past the window.
 #
-# A sliding layer only needs the tail its queries can reach: `window` for a
-# decode step, `window + q_len - 1` for a block-wide forward. Decode has always
-# trimmed; the block half used to fall through and read the ENTIRE cache on
-# every sliding layer (see CLAUDE.md, docs/gotchas/engine-mlx.md).
+#   SLIDING_GEMMA4_MOE_MODEL=<dir> SLIDING_LAGUNA_MODEL=<dir> SLIDING_INKLING_MODEL=<dir> SLIDING_GPT_OSS_MODEL=<dir> \
+#       ./tests/test_sliding_window_trim.sh [port]      # each arch SKIPs when absent
 #
-# Trimming the K/V view is only correct if every consumer of that view derives
-# its query offset RELATIVELY. This test is the proof: greedy (temperature 0)
-# output with MLX_SERVE_SLIDING_BLOCK_TRIM=1 must be BYTE-IDENTICAL to the same
-# request with =0, at a context well past the window. A diff means that arch's
-# mask or bias reads absolute positions and is not view-relative — report it,
-# don't ship it.
-#
-# Each arm asserts an `[sliding] block trim engaged` line in its OWN log (the
-# =0 arm asserts its ABSENCE), so a silently-declined trim reads as a failure
-# rather than a pass.
-#
-# The prompt is sized past window + prefill chunk on purpose: below that the
-# span covers the whole cache and no trim happens, so the two arms would agree
-# for the wrong reason.
-#
-# Requires a built binary (`zig build -Doptimize=ReleaseFast`) and at least one
-# checkpoint. Every arch is env-gated and skipped when absent.
-#
-# Usage:
-#   SLIDING_GEMMA4_MOE_MODEL=/path SLIDING_LAGUNA_MODEL=/path \
-#   SLIDING_INKLING_MODEL=/path SLIDING_GPT_OSS_MODEL=/path \
-#   ./tests/test_sliding_window_trim.sh [port]
+# Each arm's own log must show (=1) or lack (=0) `[sliding] block trim engaged`: a chunk trims only at a non-zero
+# offset, so prompts run past window + prefill chunk (~20k tokens for laguna/inkling) or both arms agree for the wrong
+# reason. A byte diff means that arch's mask or bias reads ABSOLUTE positions, not view-relative ones: report it.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 PORT=${1:-8098}
 BASE="http://127.0.0.1:$PORT"
@@ -88,11 +69,7 @@ run_arm() {
         --prefix-cache-entries 0 $extra > "$logfile" 2>&1 &
     local pid=$!
     local up=0
-    for _ in $(seq 1 300); do
-        if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-        if ! kill -0 $pid 2>/dev/null; then break; fi
-        sleep 1
-    done
+    srv_wait_health "$BASE" 300 1 "$pid" && up=1
     if [ "$up" != "1" ]; then
         echo -e "    ${RED}FAIL${NC} server did not become healthy" >&2
         tail -20 "$logfile" >&2

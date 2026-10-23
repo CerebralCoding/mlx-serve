@@ -1,20 +1,15 @@
 #!/usr/bin/env bash
-# Speaker-embedding cache (voice-clone path) guard: the cache must never change
-# what a voice sounds like.
-#   [1/4] same clip + text twice -> byte-identical WAVs, second request logs a
-#         cache hit (engagement — output equality alone can't see a silent
-#         fallback to the uncached path)
-#   [2/4] a different clip -> a different WAV (no key-collision wrong-voice hit)
-#   [3/4] MLX_SERVE_TTS_SPK_CACHE=0 boot -> byte-identical to the cache-on
-#         output (the kill switch restores the uncached path exactly) and no
-#         cache-hit line ever appears
-#   [4/4] cache-on and cache-off never disagree on the different-clip output
-#   [5/5] warm_only pre-warm (docs/qwentts-cache.md): warm b -> {"cache":"miss"},
-#         warm b again -> {"cache":"hit"}, the FIRST synthesis after the warm
-#         logs a cache hit (the first-sentence win the endpoint exists for),
-#         its WAV is byte-identical to the unwarmed boot's, and warm_only
-#         without ref_audio is a named 400
-# Usage: TTS_MODEL=<dir> ./tests/test_tts_clone_cache.sh [port]
+# test_tts_clone_cache.sh — the speaker-embedding cache (voice-clone path) never changes a voice. [1] same clip + text
+# twice -> byte-identical WAVs and a `speaker embedding: cache hit` line (equality alone cannot see a silent uncached
+# fallback); [2] a different clip -> a different WAV (no key collision); [3] a MLX_SERVE_TTS_SPK_CACHE=0 boot ->
+# byte-identical to cache-on with no hit line; [4] cache-on and -off agree on the different clip; [5] `warm_only`
+# pre-warm: miss then hit, the first synthesis after a warm is a hit with a byte-identical WAV, and warm_only without
+# ref_audio is a named 400. Synthetic deterministic clips.
+#
+#   TTS_MODEL=<Qwen3-TTS -Base dir> ./tests/test_tts_clone_cache.sh [port]   # SKIPs without one
+#
+# Hermetic twins: the `spk cache` tests in src/plugins/qwen3_tts/tts.zig (+ the TTS_TEST_MODEL-gated identity test).
+
 set -euo pipefail
 PORT="${1:-11378}"
 MODEL="${TTS_MODEL:-$(ls -d ~/.mlx-serve/models/mlx-community/Qwen3-TTS-12Hz-*-Base-* 2>/dev/null | head -1 || true)}"

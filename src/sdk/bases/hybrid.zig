@@ -63,7 +63,9 @@ pub fn Hybrid(comptime spec: anytype) type {
         pub fn forward(w: *const Weights, shared: *const block.Shared, g: *Graph, ids: Array, run: Run) !Out {
             if (run.mode == .batched_rows and !batches_decode) return error.BatchedRowsUnsupported;
             var c = run.ctx(g, shared);
-            var h = try Embed.forward(&w.embed, &c, ids);
+            var memo: block.Memo = .{ .g = g };
+            c.memo = &memo;
+            var h = try run.splice(g, try Embed.forward(&w.embed, &c, ids), ids);
             if (@hasDecl(Hooks, "afterEmbed")) h = try Hooks.afterEmbed(&w.extra, &c, h);
 
             var carried: ?Array = null;
@@ -84,11 +86,16 @@ pub fn Hybrid(comptime spec: anytype) type {
                 if (carried) |old| g.drop(old);
                 carried = if (end.normed) |n| try g.keep(n) else null;
                 try run.capture(g, @intCast(i), h);
+                try run.cadence(i, w.layers.len, h);
             }
             c.g = g;
             var final = if (w.final_norm) |*f| (carried orelse try Norm.forward(f, &c, h)) else h;
             if (@hasDecl(Hooks, "beforeHead")) final = try Hooks.beforeHead(&w.extra, &c, final);
-            return run.finish(g, &c, final, Head, &w.head);
+            var out = try run.finish(g, &c, final, Head, &w.head);
+            // `Hooks.residual_hidden`: a hidden captured beside the logits is the residual before the final norm; one
+            // that replaces them (`logits = .none`) stays final-normed.
+            if (@hasDecl(Hooks, "residual_hidden") and run.want_hidden and run.logits != .none) out.hidden = h;
+            return out;
         }
 
         fn closeLayer(L: *const Layer, c: *Ctx, normed: Array, h: Array, next: ?*const Norm.Weights) !block.End {

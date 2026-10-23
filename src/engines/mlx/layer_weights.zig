@@ -54,13 +54,7 @@ pub const LayerWeights = struct {
     kv_source: ?u32 = null,
     // Gemma 4 (31B): V aliases K projection within this layer (no v_proj weight loaded)
     k_eq_v: bool = false,
-    // MuseGlimmer: elementwise sigmoid attention output gate
-    // (self_attn.gate_proj, read off the post-input-norm hidden). Null ag_w
-    // on every other arch.
-    ag_w: ?mlx.mlx_array = null,
-    ag_s: mlx.mlx_array = .{ .ctx = null },
-    ag_b: mlx.mlx_array = .{ .ctx = null },
-    // Row-joined [q | k | v (| ag)] and [gate | up] for decode widths; the
+    // Row-joined [q | k | v] and [gate | up] for decode widths; the
     // separate fields above are views into these once built (fuseRowGroup).
     qkv: FusedRows = .{},
     gu: FusedRows = .{},
@@ -118,17 +112,6 @@ pub const FullAttnWeights = struct {
     mla_kv_b_w: mlx.mlx_array = .{ .ctx = null },
     mla_kv_b_s: mlx.mlx_array = .{ .ctx = null },
     mla_kv_b_b: mlx.mlx_array = .{ .ctx = null },
-    // Inkling (inkling_mm_model): the relative-logits projection (attn.wr_du
-    // → per-head d_rel "relative states"), the learned bias-vs-distance bank
-    // (attn.rel_logits_proj.proj [d_rel, extent]), and the k/v depthwise
-    // causal short-convolution taps (attn.{k,v}_sconv.weight [C, k, 1], fp32
-    // compute). Null-ctx on every other arch.
-    rel_w: mlx.mlx_array = .{ .ctx = null },
-    rel_s: mlx.mlx_array = .{ .ctx = null },
-    rel_b: mlx.mlx_array = .{ .ctx = null },
-    rel_proj: mlx.mlx_array = .{ .ctx = null },
-    k_sconv_w: mlx.mlx_array = .{ .ctx = null },
-    v_sconv_w: mlx.mlx_array = .{ .ctx = null },
     // qwen4_exp QSA indexer: one projection for the index queries + the
     // single shared key head, and their per-head RMS norms. Null-ctx on
     // every other arch.

@@ -27,6 +27,7 @@
 //!      truncate back — same math, no copy).
 
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const kernelSource = @import("../../../../mlx/kernels.zig").source;
 const mlx = @import("../../../../mlx/ffi.zig");
 const log = @import("../../../../host/log.zig");
@@ -610,7 +611,7 @@ pub const QUANT_GROUP: u32 = 64;
 /// `MLX_SERVE_DFLASH_QUANT_BITS`: absent → `DEFAULT_QUANT_BITS`, a supported
 /// affine width → that, anything else ("0", "off") → dense bf16.
 pub fn quantBitsFromEnv() u32 {
-    const p = std.c.getenv("MLX_SERVE_DFLASH_QUANT_BITS") orelse return defaultQuantBits(transformer_mod.verifyQmmNaxAvailable());
+    const p = env.get(.MLX_SERVE_DFLASH_QUANT_BITS) orelse return defaultQuantBits(transformer_mod.verifyQmmNaxAvailable());
     const v = std.fmt.parseInt(u32, std.mem.span(p), 10) catch return 0;
     return switch (v) {
         2, 3, 4, 5, 6, 8 => v,
@@ -1001,7 +1002,7 @@ pub const DflashModel = struct {
     /// `MLX_SERVE_DFLASH_DRAFT_HEAD_BITS`: absent → DEFAULT_DRAFT_HEAD_BITS,
     /// a supported affine width → that, anything else ("0", "off") → disabled.
     pub fn draftHeadBitsFromEnv() u32 {
-        const p = std.c.getenv("MLX_SERVE_DFLASH_DRAFT_HEAD_BITS") orelse return DEFAULT_DRAFT_HEAD_BITS;
+        const p = env.get(.MLX_SERVE_DFLASH_DRAFT_HEAD_BITS) orelse return DEFAULT_DRAFT_HEAD_BITS;
         const v = std.fmt.parseInt(u32, std.mem.span(p), 10) catch return 0;
         return switch (v) {
             2, 3, 4, 6, 8 => v,
@@ -1770,7 +1771,7 @@ fn dynConvFused(hidden: mlx.mlx_array, dynamic: mlx.mlx_array, base: mlx.mlx_arr
     return y;
 }
 
-fn groupedDynConvOps(
+pub fn groupedDynConvOps(
     hidden: mlx.mlx_array,
     dynamic: mlx.mlx_array,
     base: mlx.mlx_array,
@@ -1996,7 +1997,7 @@ var topk_key: ?TopKKey = null;
 
 /// Each row's top `k` of `logits` [1, M, V]: ids [1, M, k] int32 and values
 /// [1, M, k] f32, largest first. Null off the GPU or past 32 per row.
-fn topKRows(logits: mlx.mlx_array, k: usize, s: mlx.mlx_stream) !?[2]mlx.mlx_array {
+pub fn topKRows(logits: mlx.mlx_array, k: usize, s: mlx.mlx_stream) !?[2]mlx.mlx_array {
     if (!mlx.streamIsGpu(s) or k == 0 or k > 32) return null;
     const sh = mlx.getShape(logits);
     const dt = mlx.mlx_array_dtype(logits);
@@ -4488,7 +4489,7 @@ test "dflash: trunk capture_layers = hidden_states[i+1], consistent across chunk
     for (full1, chunk_vals2.items) |x, y| try testing.expect(@abs(x - y) < 0.05);
 }
 
-test "dflash: trunk rawEmbedding is the bare table row; embedding layers norm on top" {
+test "dflash: trunk rawEmbedding is the bare table row" {
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -4520,23 +4521,6 @@ test "dflash: trunk rawEmbedding is the bare table row; embedding layers norm on
     for (0..TinyFix.HIDDEN) |c| {
         try testing.expect(@abs(raw_vals[c] - TinyFix.val(4 * TinyFix.HIDDEN + c, 1)) < 0.01);
     }
-
-    // Simulate a normed-embeddings trunk (the muse shape): embedding() must
-    // now be rms_norm(raw) while rawEmbedding stays the bare row — this is
-    // the DFlash noise-embed contract ("embed without the norm").
-    var ones = mlx.mlx_array_new();
-    const one_scalar = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(one_scalar);
-    const ones_shape = [_]c_int{TinyFix.HIDDEN};
-    try mlx.check(mlx.mlx_full(&ones, &ones_shape, 1, one_scalar, .bfloat16, s));
-    xfm.config.normed_embeddings = true;
-    std.debug.assert(xfm.ones_hidden == null);
-    xfm.ones_hidden = ones; // freed by xfm.deinit
-    const normed = try xfm.rawEmbedding(input); // still raw
-    defer _ = mlx.mlx_array_free(normed);
-    const still_raw = try TinyFix.readF32(normed, allocator, s);
-    defer allocator.free(still_raw);
-    for (raw_vals, still_raw) |x, y| try testing.expectEqual(x, y);
 }
 
 test "dflash: sliding window hides out-of-window context from the block, in-window reaches it" {
@@ -4677,8 +4661,8 @@ fn parityVs(got: mlx.mlx_array, want: []const f32, allocator: std.mem.Allocator,
 }
 
 test "dflash fixture parity: encoder + two draft rounds vs transformers reference" {
-    const fixtures_path = std.c.getenv("DFLASH_FIXTURES") orelse return;
-    const assistant_dir = std.c.getenv("DFLASH_ASSISTANT_DIR") orelse return;
+    const fixtures_path = env.get(.DFLASH_FIXTURES) orelse return;
+    const assistant_dir = env.get(.DFLASH_ASSISTANT_DIR) orelse return;
     if (mlx.noGpuBackend()) return;
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
@@ -4778,8 +4762,8 @@ test "dflash2 fixture parity: conv block forward + greedy selector path vs z-lab
     // scale rule), and the selector path ids EXACTLY — both sides read the
     // identical sparse logits and the identical bf16 hidden, so the trace is
     // a pure-math question.
-    const fixtures_path = std.c.getenv("DFLASH2_FIXTURES") orelse return;
-    const assistant_dir = std.c.getenv("DFLASH2_ASSISTANT_DIR") orelse return;
+    const fixtures_path = env.get(.DFLASH2_FIXTURES) orelse return;
+    const assistant_dir = env.get(.DFLASH2_ASSISTANT_DIR) orelse return;
     if (mlx.noGpuBackend()) return;
     const allocator = testing.allocator;
     const s = mlx.gpuStream();

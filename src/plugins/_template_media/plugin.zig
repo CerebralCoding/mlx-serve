@@ -74,7 +74,8 @@ fn unload(ep: *anyopaque) callconv(.c) void {
 
 fn step(ep: *anyopaque, req: *const abi.Request, progress: *const abi.Progress) callconv(.c) Verdict {
     const e: *Engine = @ptrCast(@alignCast(ep));
-    const body = config.Body.parse(req.body.slice()) orelse return Verdict.refuse(.failed, "_template_media: bad request body");
+    const body = config.Body.parse(req.body.slice()) orelse
+        return req.refuseFmt(.unsupported, "_template_media: bad request body", "'size' must be in [1,{d}] and 'steps' in [1,{d}]", .{ config.max_dim, config.max_steps });
     const image = run(e, body, progress) catch |err| return switch (err) {
         error.ClientLeft => Verdict.refuse(.failed, "_template_media: the client left"),
         else => Verdict.refuse(.failed, "_template_media: the job failed"),

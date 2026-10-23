@@ -1,5 +1,5 @@
-//! plugins/mimo_v2/attention, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns MIMO_DECIDED_MARGIN, mimoDecidedMisses.
+//! The legacy MiMo forward's model-gated tests (ring vs full buffer, batched decode and the fixture oracle against
+//! modeling_mimo_v2.py) and their decided-miss count (`mimoDecidedMisses`).
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");

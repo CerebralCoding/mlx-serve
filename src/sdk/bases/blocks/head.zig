@@ -4,6 +4,7 @@
 const ops = @import("../../../mlx/ops.zig");
 const block = @import("../block.zig");
 const Linear = @import("linear.zig").Linear;
+const row_exact = @import("row_exact.zig");
 
 const Array = ops.Array;
 const Graph = ops.Graph;
@@ -30,6 +31,7 @@ pub const LmHead = struct {
     pub const Weights = Linear;
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
+        if (w.s.ctx != null) return row_exact.linear(c.row_exact, c.g, w, x);
         return project(c.g, w, x);
     }
 };

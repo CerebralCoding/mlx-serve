@@ -44,26 +44,10 @@ pub const MoeMlpWeights = struct {
     // scores for top-k SELECTION only (weights come from the unbiased scores).
     // Non-null expert_bias routes moeMLP2 through hy3RoutingChain.
     expert_bias: ?mlx.mlx_array = null,
-    // gpt_oss ADDITIVE biases. `router_bias` ([num_experts]) is a plain Linear
-    // bias added to the router logits BEFORE top-k — unlike hy3's
-    // `expert_bias`, which is a selection-only score correction that never
-    // reaches the weights. The switch_* biases are the SwitchGLU per-expert
-    // biases ([num_experts, out]), gathered by expert index and added after
-    // each gather_qmm. All null-ctx on every other arch.
-    router_bias: mlx.mlx_array = .{ .ctx = null },
-    switch_gate_bias: mlx.mlx_array = .{ .ctx = null },
-    switch_up_bias: mlx.mlx_array = .{ .ctx = null },
-    switch_down_bias: mlx.mlx_array = .{ .ctx = null },
     route_norm: bool = true,
     route_scale: f32 = 1.0,
     // Hy3 shared expert is ALWAYS added, with no shared_expert_gate.
     shared_ungated: bool = false,
-    // Inkling: f32 [1] router output scale (mlp.gate.global_scale). When set,
-    // the shared_* fields hold STACKED [n_shared, out, in] banks whose
-    // per-token weights come from the SAME softmax as the routed top-k (the
-    // shared-expert "sink") — not qwen's gated single expert, not hy3's
-    // ungated add. Read only by the inkling forward arm.
-    router_global_scale: ?mlx.mlx_array = null,
     // One-expert views of the affine-4 banks the decode kernels bind (`moe_affine4.bindViews`).
     bank_views: ?moe_affine4.Views = null,
 };

@@ -1,10 +1,13 @@
 #!/usr/bin/env bash
-# Boot one model, fire the decode forward micro-bench at load, print the lines,
-# shut down. Diagnostic helper for decode-perf work — NOT a test.
+# fwd_ubench.sh — diagnostic, NOT a test: boot one model, fire MLX_SERVE_DECODE_FWD_UBENCH at load, print ms/forward,
+# the CPU graph-build vs GPU eval split, ops/forward and a terminal lm_head ablation, shut down.
 #
 #   tests/fwd_ubench.sh <model-dir> [iters] [extra mlx-serve flags...]
 #
-# Env passthrough: any MLX_SERVE_* already exported reaches the server.
+# The unit of every decode-perf A/B here: one run per boot per arm, ALTERNATING arms per boot (a block-of-N schedule
+# reads drift as an effect). Exported MLX_SERVE_* reach the server: MLX_SERVE_LAYER_CAP=N (slope vs fixed cost),
+# MLX_SERVE_DISPATCH_PROBE=N (prices one dispatch with N exact-1.0 multiplies per MoE layer).
+
 set -uo pipefail
 
 MODEL="${1:?usage: fwd_ubench.sh <model-dir> [iters] [flags...]}"

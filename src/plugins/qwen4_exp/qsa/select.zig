@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/qsa/select, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns QSA_SELECT_KERNEL_HEADER, QSA_SELECT_SHARED, QSA_SELECT_RADIX_BODY, QSA_SELECT_SINGLE_SETUP, QSA_SELECT_SLICE_SETUP, QSA_SELECT_MERGE_SETUP, and 46 more.
+//! Exact top-k block selection (`msv_qsa_select`: radix select, single, sliced and merged setups) and its 16-way split
+//! at decode.
 
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
@@ -25,7 +25,7 @@ const qsaSelectComposedOps = @import("score.zig").qsaSelectComposedOps;
 // `qsaChunkSelect`'s: top-K visible blocks per row, ties to the LOWER index (torch.topk),
 // emitted ascending, INT_MAX past the row's count. The tie rule is exact where the composed
 // arm's `b * 1e-7` bias only approximates it.
-const QSA_SELECT_KERNEL_HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_select_header.metal");
+pub const QSA_SELECT_KERNEL_HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_select_header.metal");
 
 /// One threadgroup per query row. 1. MSD radix select over the 32-bit ordinal (the DIGITS
 /// template picks 11/11/10-bit digits at prefill widths or four 8-bit digits at decode widths,
@@ -50,12 +50,12 @@ const QSA_SELECT_SLICE_SETUP = kernelSource("plugins/qwen4_exp/kernels/qsa_selec
 // simd reduction below runs in a uniform base-stepped loop: a divergent simd_sum is undefined.
 const QSA_SELECT_MERGE_SETUP = kernelSource("plugins/qwen4_exp/kernels/qsa_select_merge_setup.metal");
 
-const QSA_SELECT_KERNEL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SINGLE_SETUP, QSA_SELECT_RADIX_BODY });
-const QSA_SELECT_SPLIT_LOCAL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SLICE_SETUP, QSA_SELECT_RADIX_BODY });
-const QSA_SELECT_SPLIT_MERGE_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_MERGE_SETUP, QSA_SELECT_RADIX_BODY });
+pub const QSA_SELECT_KERNEL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SINGLE_SETUP, QSA_SELECT_RADIX_BODY });
+pub const QSA_SELECT_SPLIT_LOCAL_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_SLICE_SETUP, QSA_SELECT_RADIX_BODY });
+pub const QSA_SELECT_SPLIT_MERGE_SOURCE = std.fmt.comptimePrint("{s}{s}{s}", .{ QSA_SELECT_SHARED, QSA_SELECT_MERGE_SETUP, QSA_SELECT_RADIX_BODY });
 
 /// Threads per row-threadgroup. `MLX_SERVE_QSA_SELECT_TG=256|512|1024` is the A/B. Read once.
-const QSA_SELECT_TG_DEFAULT: c_int = 1024;
+pub const QSA_SELECT_TG_DEFAULT: c_int = 1024;
 pub var qsa_select_tg_override: ?c_int = null;
 var qsa_select_tg_cached: ?c_int = null;
 

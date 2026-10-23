@@ -25,6 +25,7 @@ const sse = @import("../../host/media_jobs/sse.zig");
 const ops = @import("../../mlx/ops.zig");
 const Graph = ops.Graph;
 const scope_mod = @import("../../mlx/scope.zig");
+const snake_block = @import("../../sdk/blocks/vae/snake.zig");
 const Linear = scope_mod.Linear;
 const getW = scope_mod.getW;
 const linear = scope_mod.linear;
@@ -840,16 +841,10 @@ pub const Engine = struct {
         return getW(&self.vw, fmt, args);
     }
 
-    /// x + (1/exp(beta)) sin^2(exp(alpha) x); both parameters are stored as logs. The temporaries
-    /// live in their own scope: at a 1056-frame tile each is half a gigabyte.
+    /// Snake with log-stored alpha/beta; the block's own scope frees the temporaries (half a gigabyte each at a
+    /// 1056-frame tile).
     fn snake(self: *const Engine, parent: *Graph, x: A, comptime fmt: []const u8, args: anytype) !A {
-        var g = parent.scope();
-        defer g.deinit();
-        const alpha = try g.exp(try self.vaeW(fmt ++ ".alpha", args));
-        const beta = try g.exp(try self.vaeW(fmt ++ ".beta", args));
-        const sn = try g.sin(try g.mul(x, alpha));
-        // An f32 epsilon, whatever the weights' dtype.
-        return parent.keep(try g.add(x, try g.div(try g.mul(sn, sn), try g.add(beta, try g.scalar(1e-9, .float32)))));
+        return snake_block.snakeBetaLog(parent, x, try self.vaeW(fmt ++ ".alpha", args), try self.vaeW(fmt ++ ".beta", args));
     }
 
     fn conv(self: *const Engine, parent: *Graph, x: A, comptime fmt: []const u8, args: anytype, padding: c_int, dilation: c_int) !A {

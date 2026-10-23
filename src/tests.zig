@@ -1,13 +1,14 @@
 // Test root — imports all modules to run their embedded tests.
 // Run with: zig build test
 
-// pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
+// pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) and mlx-stream reach these through their host root.
 pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
 pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
 pub const log = @import("host/log.zig");
 pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
-pub const sushi_exl3 = @import("sushi_exl3");
+pub const exl3 = @import("sdk/quant/exl3/format.zig");
+pub const env = @import("env.zig");
 comptime {
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
     @import("plugin_host_check.zig").reexports(@This());
@@ -16,17 +17,27 @@ comptime {
 test {
     _ = @import("engines/ds4/engine.zig");
     _ = @import("plugins/registry.zig");
+    _ = @import("host/plugins/loader.zig");
     _ = @import("host/log.zig");
     _ = @import("host/plugin_host_impl.zig");
     _ = @import("sdk/util/os_mutex.zig");
     _ = @import("sdk/util/crt.zig");
+    _ = @import("env.zig");
     _ = @import("sdk/util/win_io.zig");
     _ = @import("sdk/quant/gguf/claim.zig");
     if (@import("build_options").mlx_stream) _ = @import("sdk/weights/streamed/glue.zig");
+    _ = @import("sdk/weights/streamed/dupes_test.zig");
+    _ = @import("plugins/deepseek_v41/stream/dupes_test.zig");
     _ = @import("version.zig");
     _ = @import("mlx/ops.zig");
     _ = @import("mlx/kernels.zig");
     _ = @import("sdk/bases/bases.zig");
+    _ = @import("engines/mlx/plugin/proof.zig");
+    _ = @import("engines/mlx/plugin/audit.zig");
+    _ = @import("plugins/qwen3/plugin.zig");
+    _ = @import("plugins/qwen3_5/plugin.zig");
+    _ = @import("plugins/qwen3_next/plugin.zig");
+    _ = @import("plugins/qwen3_asr/plugin.zig");
     _ = @import("sdk/testing/kernel_contract/registry.zig");
     _ = @import("sdk/bases/proof/mixers.zig");
     _ = @import("host/chat/chat.zig");
@@ -79,7 +90,8 @@ test {
     _ = @import("sdk/quant/nvfp4/modelopt_pack.zig");
     _ = @import("sdk/quant/formats.zig");
     _ = @import("sdk/blocks/qmm/mxfp8_qmv.zig");
-    _ = @import("plugins/mimo_v2/dec_attn.zig");
+    _ = @import("sdk/blocks/attention/dec_attn.zig");
+    _ = @import("sdk/blocks/conv/gated_conv_step.zig");
     _ = @import("sdk/blocks/attention/nax_attention.zig");
     _ = @import("plugins/glm5_next/glm5_next.zig");
     _ = @import("plugins/glm5_next/dsa_nax.zig");
@@ -147,7 +159,19 @@ test {
     }
     _ = @import("sdk/media/wav.zig");
     _ = @import("sdk/media/bill.zig");
+    _ = @import("sdk/media/video_out.zig");
+    _ = @import("sdk/media/image_pixels.zig");
+    _ = @import("sdk/media/config_fields.zig");
+    _ = @import("sdk/media/pack_bytes.zig");
+    _ = @import("sdk/media/image_pixels.zig");
+    _ = @import("sdk/media/lora_set.zig");
+    _ = @import("sdk/blocks/dit/w8a8_bill.zig");
     _ = @import("host/media_jobs/plugin_job.zig");
+    _ = @import("sdk/media/image_request.zig");
+    _ = @import("sdk/media/image_pixels.zig");
+    _ = @import("sdk/media/mesh_request.zig");
+    _ = @import("sdk/media/pack_claims.zig");
+    _ = @import("sdk/media/graph_call.zig");
     _ = @import("plugins/qwen3_tts/tts.zig");
     _ = @import("plugins/flux2/flux.zig");
     _ = @import("plugins/krea/krea.zig");
@@ -185,6 +209,7 @@ test {
     _ = @import("plugins/acestep/acestep.zig");
     _ = @import("plugins/music3/music3.zig");
     _ = @import("plugins/stable_audio3/stable_audio.zig");
+    _ = @import("host/media_jobs/plugin/http.zig");
     _ = @import("plugins/yue2/yue2.zig");
     _ = @import("sdk/bases/dit.zig");
     _ = @import("plugins/trellis2/sparse.zig");
@@ -210,6 +235,9 @@ test {
     _ = @import("host/launch/launch.zig");
     _ = @import("host/lan/lan.zig");
     _ = @import("host/api/providers.zig");
+    _ = @import("host/launch/budget.zig");
+    _ = @import("host/registry/modality.zig");
+    _ = @import("host/api/model_row_facts.zig");
     _ = @import("mlx/ffi.zig");
     _ = @import("testing/fake_engine.zig"); // the engine contract suite against the fake engines
     _ = @import("abi/exactness_test.zig"); // the exactness contracts (run on the fakes from fake_engine.zig)

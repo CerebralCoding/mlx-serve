@@ -174,6 +174,9 @@ pub fn load(table: *qwen4.NgramTable, on: bool, model_bytes: u64) ?Table {
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 
+pub const SOURCE = kernelSource("plugins/qwen4_exp/kernels/ple_gather.metal");
+pub const HEADER = kernelSource("plugins/qwen4_exp/kernels/ple_gather_header.metal");
+
 fn getKernel() !mlx.mlx_fast_metal_kernel {
     if (kernel) |k| return k;
     const in_names = [_][*:0]const u8{ "table", "ids", "prev", "params" };
@@ -182,7 +185,7 @@ fn getKernel() !mlx.mlx_fast_metal_kernel {
     defer _ = mlx.mlx_vector_string_free(ins);
     const outs = mlx.mlx_vector_string_new_data(&out_names, out_names.len);
     defer _ = mlx.mlx_vector_string_free(outs);
-    const k = mlx.mlx_fast_metal_kernel_new("msv_ple_gather", ins, outs, kernelSource("plugins/qwen4_exp/kernels/ple_gather.metal"), kernelSource("plugins/qwen4_exp/kernels/ple_gather_header.metal"), true, false);
+    const k = mlx.mlx_fast_metal_kernel_new("msv_ple_gather", ins, outs, SOURCE, HEADER, true, false);
     if (k.ctx == null) return error.MetalKernelCompileFailed;
     kernel = k;
     return k;
@@ -194,10 +197,23 @@ const P_VOCAB = P_MULT + qwen4.MAX_NGRAM_SIZE;
 const P_OFFSETS = P_VOCAB + qwen4.MAX_HEADS;
 const P_SCALE = P_OFFSETS + qwen4.MAX_HEADS;
 const P_NVFP4 = P_SCALE + 1;
-const P_LEN = P_NVFP4 + 1;
+pub const P_LEN = P_NVFP4 + 1;
 comptime {
     // ple_gather.metal reads these slots by literal.
     std.debug.assert(P_VOCAB == 21 and P_OFFSETS == 53 and P_SCALE == 85 and P_NVFP4 == 86);
+}
+
+/// The kernel's `params` for `n` ids.
+pub fn params(tbl: Table, h: *const qwen4.NgramHash, t: *const qwen4.NgramTable, n: usize) [P_LEN]i64 {
+    var p: [P_LEN]i64 = @splat(0);
+    const head = [_]i64{ @intCast(n), h.n_heads, h.heads_per_ngram, h.ngram_size, h.eos, t.dim, t.bits, t.group_size, t.wcols, t.scols, @intCast(tbl.w_off), @intCast(tbl.s_off), @intCast(tbl.b_off) };
+    @memcpy(p[0..P_MULT], &head);
+    @memcpy(p[P_MULT..P_VOCAB], &h.multipliers);
+    @memcpy(p[P_VOCAB..P_OFFSETS], &h.vocab);
+    @memcpy(p[P_OFFSETS..P_SCALE], &h.offsets);
+    p[P_SCALE] = @as(u32, @bitCast(tbl.scale));
+    p[P_NVFP4] = @intFromBool(t.fmt == .nvfp4);
+    return p;
 }
 
 /// bf16 `[S, n_heads * dim]` for the `S` ids of `ids` (any integer dtype, may be lazy),
@@ -207,16 +223,9 @@ pub fn embed(s: mlx.mlx_stream, tbl: Table, h: *const qwen4.NgramHash, t: *const
     const n: usize = mlx.mlx_array_size(ids);
     const width: usize = @as(usize, h.n_heads) * t.dim;
     if (n * width > std.math.maxInt(c_int)) return error.PleChunkTooWide;
-    var p: [P_LEN]i64 = @splat(0);
-    const head = [_]i64{ @intCast(n), h.n_heads, h.heads_per_ngram, h.ngram_size, h.eos, t.dim, t.bits, t.group_size, t.wcols, t.scols, @intCast(tbl.w_off), @intCast(tbl.s_off), @intCast(tbl.b_off) };
-    @memcpy(p[0..P_MULT], &head);
-    @memcpy(p[P_MULT..P_VOCAB], &h.multipliers);
-    @memcpy(p[P_VOCAB..P_OFFSETS], &h.vocab);
-    @memcpy(p[P_OFFSETS..P_SCALE], &h.offsets);
-    p[P_SCALE] = @as(u32, @bitCast(tbl.scale));
-    p[P_NVFP4] = @intFromBool(t.fmt == .nvfp4);
-    const params = mlx.mlx_array_new_data(&p, &[_]c_int{P_LEN}, 1, .int64);
-    defer _ = mlx.mlx_array_free(params);
+    const p = params(tbl, h, t, n);
+    const params_arr = mlx.mlx_array_new_data(&p, &[_]c_int{P_LEN}, 1, .int64);
+    defer _ = mlx.mlx_array_free(params_arr);
     var prev_i: [qwen4.MAX_NGRAM_SIZE]i32 = undefined;
     for (prev, 0..) |v, k| prev_i[k] = @intCast(v);
     const prev_arr = mlx.mlx_array_new_data(&prev_i, &[_]c_int{@intCast(prev.len)}, 1, .int32);
@@ -231,7 +240,7 @@ pub fn embed(s: mlx.mlx_stream, tbl: Table, h: *const qwen4.NgramHash, t: *const
     try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &shape, 2, .bfloat16));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, @intCast(n * width), 1, 1));
     try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 256, 1, 1));
-    const ins = mlx.mlx_vector_array_new_data(&.{ tbl.arr, ids_i, prev_arr, params }, 4);
+    const ins = mlx.mlx_vector_array_new_data(&.{ tbl.arr, ids_i, prev_arr, params_arr }, 4);
     defer _ = mlx.mlx_vector_array_free(ins);
     var outs = mlx.mlx_vector_array_new();
     defer _ = mlx.mlx_vector_array_free(outs);
@@ -307,7 +316,7 @@ pub fn writeFixture(bits: u32, rows: u64, dim: u32, gs: u32, seed: u64) !Fixture
     return .{ .td = td, .table = try qwen4.NgramTable.open(path) };
 }
 
-fn cpuRows(h: *const qwen4.NgramHash, t: *const qwen4.NgramTable, prev: []const u32, ids: []const u32) ![]u16 {
+pub fn cpuRows(h: *const qwen4.NgramHash, t: *const qwen4.NgramTable, prev: []const u32, ids: []const u32) ![]u16 {
     const a = testing.allocator;
     const rows = try a.alloc(i64, ids.len * h.n_heads);
     defer a.free(rows);

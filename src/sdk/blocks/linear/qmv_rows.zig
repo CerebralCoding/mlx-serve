@@ -17,7 +17,7 @@ const attn256RandBf16 = @import("../attention/attn256.zig").attn256RandBf16;
 const moeRowsSliceRow = @import("../moe/gather_qmv_rows.zig").moeRowsSliceRow;
 const cachedScalarInt = @import("verify_qmm.zig").cachedScalarInt;
 
-const MSV_QMV_ROWS_SOURCE = kernelSource("kernels/linear/qmv_rows.metal");
+pub const MSV_QMV_ROWS_SOURCE = kernelSource("kernels/linear/qmv_rows.metal");
 
 pub var msv_qmv_rows_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const MsvQmvRowsCfgKey = struct { nrows: c_int, n: c_int, k: c_int, bits: u32, gs: u32, dtype: mlx.mlx_dtype };

@@ -1,6 +1,7 @@
 //! Tests of the tokenizer: encode/decode, pre-tokenizers, loading.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const testing = std.testing;
 
 const FlaggedSpecial = @import("tokenizer.zig").FlaggedSpecial;
@@ -812,8 +813,8 @@ test "pre-tokenize: DeepSeek's digit and CJK Splits run first, so a whitespace r
 
 test "tokenizer parity: encode() matches HF `tokenizers` ids (TOKENIZER_PARITY_MODEL)" {
     // Bar: encode() returns HF `tokenizers`' ids for every case tests/dump_tokenizer_parity_fixtures.py wrote.
-    const model = std.c.getenv("TOKENIZER_PARITY_MODEL") orelse return error.SkipZigTest;
-    const cases_path = std.c.getenv("TOKENIZER_PARITY_CASES") orelse return error.SkipZigTest;
+    const model = env.get(.TOKENIZER_PARITY_MODEL) orelse return error.SkipZigTest;
+    const cases_path = env.get(.TOKENIZER_PARITY_CASES) orelse return error.SkipZigTest;
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var tok = try loadTokenizer(io, allocator, std.mem.span(model));
@@ -1181,8 +1182,8 @@ test "appendedSpecialId: the special a TemplateProcessing appends after a single
 test "byte_fallback: real Laya tokenizer matches HF `tokenizers` on out-of-vocab scripts (LAYA_TEST_MODEL)" {
     // tests/fixtures/laya/tokenizer_cases.json is dumped by
     // tests/dump_laya_fixtures.py from the Python `tokenizers` library.
-    const model = std.c.getenv("LAYA_TEST_MODEL") orelse return error.SkipZigTest;
-    const fx = std.c.getenv("LAYA_FIXTURES") orelse return error.SkipZigTest;
+    const model = env.get(.LAYA_TEST_MODEL) orelse return error.SkipZigTest;
+    const fx = env.get(.LAYA_FIXTURES) orelse return error.SkipZigTest;
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     const tok_dir = try std.fmt.allocPrint(allocator, "{s}/tokenizer", .{std.mem.span(model)});

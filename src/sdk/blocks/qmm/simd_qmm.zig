@@ -15,13 +15,13 @@ const SGS = 2;
 const NR = 2;
 const XB = 32;
 
-const HEADER = kernelSource("kernels/qmm/simd_qmm_header.metal");
+pub const HEADER = kernelSource("kernels/qmm/simd_qmm_header.metal");
 
-const LOAD8 = "  #define LOAD8(r, j) ((((const device uint4*)X)[size_t(r) * (K / 8) + (j)]))\n";
+pub const LOAD8 = "  #define LOAD8(r, j) ((((const device uint4*)X)[size_t(r) * (K / 8) + (j)]))\n";
 
-const SCALAR = kernelSource("kernels/qmm/simd_qmm_scalar.metal");
+pub const SCALAR = kernelSource("kernels/qmm/simd_qmm_scalar.metal");
 
-const SCALAR_ROWS = kernelSource("kernels/qmm/simd_qmm_scalar_rows.metal");
+pub const SCALAR_ROWS = kernelSource("kernels/qmm/simd_qmm_scalar_rows.metal");
 
 // `mma` is split where the fragment variant differs: how R is read, and
 // where each group's input values and sums come from.
@@ -29,19 +29,19 @@ const MMA_HEAD = kernelSource("kernels/qmm/simd_qmm_mma_head.metal");
 const MMA_MID = kernelSource("kernels/qmm/simd_qmm_mma_mid.metal");
 const MMA_BM = kernelSource("kernels/qmm/simd_qmm_mma_bm.metal");
 const MMA_TAIL = kernelSource("kernels/qmm/simd_qmm_mma_tail.metal");
-const MMA = MMA_HEAD ++ "\n  const int R = X_shape[0];\n" ++ MMA_MID ++ "\n" ++ kernelSource("kernels/qmm/simd_qmm_mma_xsums.metal") ++ "\n" ++ MMA_BM ++ "\n" ++ kernelSource("kernels/qmm/simd_qmm_mma_bfrag.metal") ++ "\n" ++ MMA_TAIL;
+pub const MMA = MMA_HEAD ++ "\n  const int R = X_shape[0];\n" ++ MMA_MID ++ "\n" ++ kernelSource("kernels/qmm/simd_qmm_mma_xsums.metal") ++ "\n" ++ MMA_BM ++ "\n" ++ kernelSource("kernels/qmm/simd_qmm_mma_bfrag.metal") ++ "\n" ++ MMA_TAIL;
 
 /// `mma` over pre-scaled input fragments (`PREP`): the same values from the
 /// same float ops, read instead of rebuilt by every threadgroup.
-const MMA_FRAG = MMA_HEAD ++ "\n" ++ kernelSource("kernels/qmm/simd_qmm_frag_rows.metal") ++ "\n" ++ MMA_MID ++ "\n" ++ kernelSource("kernels/qmm/simd_qmm_frag_xsums.metal") ++ "\n" ++ MMA_BM ++ "\n" ++ kernelSource("kernels/qmm/simd_qmm_frag_bfrag.metal") ++ "\n" ++ MMA_TAIL;
+pub const MMA_FRAG = MMA_HEAD ++ "\n" ++ kernelSource("kernels/qmm/simd_qmm_frag_rows.metal") ++ "\n" ++ MMA_MID ++ "\n" ++ kernelSource("kernels/qmm/simd_qmm_frag_xsums.metal") ++ "\n" ++ MMA_BM ++ "\n" ++ kernelSource("kernels/qmm/simd_qmm_frag_bfrag.metal") ++ "\n" ++ MMA_TAIL;
 
 /// One simdgroup a (row tile, group): the `mma` fragments of x pre-scaled by
 /// wpre (XF[tile][g][s][lane]; rows past R copy row R - 1) and each row's
 /// group sum by the kernels' tree (XS[r][g]).
-const PREP = kernelSource("kernels/qmm/simd_qmm_prep.metal");
+pub const PREP = kernelSource("kernels/qmm/simd_qmm_prep.metal");
 
 /// `frag` is `mma` over inputs `prep` wrote once; only 2..FRAGMENT_ROWS rows take it.
-const Kind = enum { scalar, rows, mma, frag, prep };
+pub const Kind = enum { scalar, rows, mma, frag, prep };
 pub const FRAGMENT_ROWS = 8;
 /// Widest window `rows` serves: past it `mma` is cheaper. At 6 and 8 bits
 /// `mma` is cheaper from two rows.
@@ -241,7 +241,7 @@ pub fn qmm(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_ar
     return qmmKind(null, x, w, sc, bi, bits, group_size, s);
 }
 
-fn qmmKind(force: ?Kind, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) anyerror!?mlx.mlx_array {
+pub fn qmmKind(force: ?Kind, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, bits: u32, group_size: u32, s: mlx.mlx_stream) anyerror!?mlx.mlx_array {
     if (!mlx.streamIsGpu(s) or !fits(w, sc, bi, bits, group_size) or mlx.mlx_array_dtype(x) != .bfloat16) return null;
     const xs = mlx.getShape(x);
     if (xs.len == 0 or xs.len > 8) return null;

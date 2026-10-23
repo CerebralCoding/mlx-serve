@@ -1,14 +1,16 @@
 #!/usr/bin/env bash
-# Chat keeps flowing while a media job runs (`GenYield`). One server, a small
-# chat model + FLUX klein:
-#   [1] a chat sent mid-gen finishes BEFORE the gen does,
-#   [2] the gen's image is byte-identical to a solo run of the same seed,
-#   [3] the log carries `[gen-yield] engaged` (an arm that never yields is a silent no-op),
-#   [4] a gen whose client hangs up frees the server: the next chat answers within a step.
-#   [5] (Hunyuan3D + paint present) every chat sent while a textured res=320 job
-#       runs answers promptly (its CPU stages run on a worker).
-# Usage: CHAT_MODEL=<dir> FLUX_MODEL=<dir> [HY3D_MODEL=<dir>] ./tests/test_gen_chat_interleave.sh [port]
+# test_gen_chat_interleave.sh — chat keeps flowing while a media job owns the inference thread (GenYield). One server,
+# a small chat model + FLUX klein: [1] a chat sent mid-gen finishes BEFORE the gen; [2] the gen's image is
+# byte-identical to a solo run of the same seed; [3] `[gen-yield] engaged` in the log (a silent no-op otherwise);
+# [4] a gen whose client hangs up mid-denoise frees the server within a step; [5] with Hunyuan3D + paint/, every chat
+# during a textured res-320 job answers in < 30 s (its CPU stages run on a worker).
+#
+#   CHAT_MODEL=<dir> FLUX_MODEL=<dir> [HY3D_MODEL=<dir>] ./tests/test_gen_chat_interleave.sh [port]
+#
+# Boots MLX_SERVE_GEN_YIELD=1 (off by default on CUDA, genYieldEnabled). Hermetic twins: Progress.boundary, offload.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11461}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -26,11 +28,7 @@ LOG="$TMP/server.log"
 MLX_SERVE_GEN_YIELD=1 "$BIN" --serve --port "$PORT" --log-level debug >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $SRV 2>/dev/null; wait $SRV 2>/dev/null' EXIT
-for i in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 api() { curl -s -m 1800 "http://127.0.0.1:$PORT$1" "${@:2}"; }
 now() { python3 -c 'import time; print(time.time())'; }
 load() {

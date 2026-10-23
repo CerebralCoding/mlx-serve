@@ -15,6 +15,7 @@
 //! `HotPrefixCache.shouldUse(config)` returns false for those archs.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const model_mod = @import("../model.zig");
@@ -285,7 +286,7 @@ pub fn ssdFirstEnabled() bool {
     if (ssd_first_override) |v| return v;
     if (ssd_first_env_cached) |v| return v;
     const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_PREFIX_SSD_FIRST") orelse break :blk true;
+        const raw = env.get(.MLX_SERVE_PREFIX_SSD_FIRST) orelse break :blk true;
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     ssd_first_env_cached = v;
@@ -303,7 +304,7 @@ pub fn restoreMoveEnabled() bool {
     if (restore_move_override) |v| return v;
     if (restore_move_env_cached) |v| return v;
     const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_RESTORE_MOVE") orelse break :blk true;
+        const raw = env.get(.MLX_SERVE_RESTORE_MOVE) orelse break :blk true;
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     restore_move_env_cached = v;
@@ -774,13 +775,10 @@ pub const HotPrefixCache = struct {
         config: *const model_mod.ModelConfig,
         enable_ssm_checkpoints: bool,
     ) bool {
-        // dsv4 keeps its per-request state (raw-kv rings, compressed caches,
-        // compressor pending windows) on the module-owned Dsv4Model, not in
-        // the KVCache — a snapshot restore would advance cache.step without
-        // rebuilding that state. Off until dsv4 state rides the ssm-entry
-        // machinery (needsSsmEntries class).
-        // GLM-5.3 on mlx-stream keeps its decode state on the plugin's module the same way.
-        if (std.mem.eql(u8, config.model_type, "deepseek_v4") or config.isDsv41() or config.glm_stream) return false;
+        // Module-owned request state (a served pack's caps; DeepSeek-V4.1 and GLM-5.3 on mlx-stream) is not in the
+        // KVCache: a snapshot restore would advance cache.step without rebuilding it.
+        if (config.plugin) |b| if (!b.parsed.caps.prefix_cache) return false;
+        if (config.isDsv41() or config.glm_stream) return false;
         // A pipeline worker holds the later layers' state at the live position only: a restore
         // here would rewind this rank and not the worker.
         if (config.dist_span != null) return false;
@@ -3235,15 +3233,10 @@ test "HotPrefixCache: shouldUse gates hybrid by enable_ssm_checkpoints" {
     try testing.expect(HotPrefixCache.shouldUse(&cfg, true));
 }
 
-test "HotPrefixCache: shouldUse rejects deepseek_v4 (module-owned decode state)" {
-    // dsv4's per-request state (raw-kv rings, compressed caches, compressor
-    // pending windows) lives on the Dsv4Model, NOT in the 0-entry KVCache
-    // shell — a snapshot restore would set cache.step without rebuilding that
-    // state, silently serving a stale ring (or crashing on a null dec_state).
+test "HotPrefixCache: shouldUse rejects a streamed pack's module-owned decode state" {
+    // The state lives on the module, NOT in the 0-entry KVCache shell: a snapshot restore would set cache.step
+    // without rebuilding it. A served DeepSeek pack says so in its caps (`plugins/deepseek_v4/served_test.zig`).
     var cfg = model_mod.ModelConfig{};
-    cfg.model_type = "deepseek_v4";
-    try testing.expect(!HotPrefixCache.shouldUse(&cfg, false));
-    try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
     cfg.model_type = "deepseek_v41";
     try testing.expect(!HotPrefixCache.shouldUse(&cfg, true));
     // A GLM-5.3 pack on mlx-stream keeps its decode state on the plugin's module.

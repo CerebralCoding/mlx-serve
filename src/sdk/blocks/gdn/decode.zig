@@ -11,7 +11,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const rht = @import("../../quant/hadamard/rht.zig");
 
-const HEADER = kernelSource("kernels/gdn/log1p.metal");
+pub const HEADER = kernelSource("kernels/gdn/log1p.metal");
 
 /// The dtype every kernel here (GT) rounds the decay gate a + dt_bias -> g to. Under bf16
 /// activations it is the state's: a bf16 gate near one is exactly 1.0 and that head never
@@ -20,23 +20,23 @@ pub fn gateDtype(act: mlx.mlx_dtype, state: mlx.mlx_dtype) mlx.mlx_dtype {
     return if (act == .bfloat16) state else act;
 }
 
-const K1_SOURCE = kernelSource("kernels/gdn/decode_k1.metal");
+pub const K1_SOURCE = kernelSource("kernels/gdn/decode_k1.metal");
 
-const K2_SOURCE = kernelSource("kernels/gdn/decode_k2.metal");
+pub const K2_SOURCE = kernelSource("kernels/gdn/decode_k2.metal");
 
 // K1 over TL tokens (verify widths): the same per-token prework and recurrence,
 // token after token, plus the per-step state capture MTP rollback reads
 // (state_seq[TL-1] is never written, as in the stock capture kernel).
 const K1S_HEAD = kernelSource("kernels/gdn/decode_k1s_head.metal");
 const K1S_TAIL = kernelSource("kernels/gdn/decode_k1s_tail.metal");
-const K1S_SOURCE = K1S_HEAD ++ "\n    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);\n" ++ K1S_TAIL;
+pub const K1S_SOURCE = K1S_HEAD ++ "\n    if (lane == 0) y[(t * HV + hv) * DV + dv] = static_cast<T>(out);\n" ++ K1S_TAIL;
 
 // K1S at one threadgroup per head (NT=1024, SPLIT=1: the same 4 rows per
 // simdgroup, so each row's recurrence is unchanged) with the verify epilogues
 // folded in. A head's 128 y values stay in threadgroup
 // memory, rounded to T as the stored y was, and simdgroup t runs the norm-gate
 // kernel's exact reduction for token t. The conv-input rows rollback slices are copied out as well.
-const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));\n" ++ K1S_TAIL ++ "\n" ++ kernelSource("kernels/gdn/decode_k1s_fold_epilogue.metal");
+pub const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n    if (lane == 0) ys[t][dv] = float(static_cast<T>(out));\n" ++ K1S_TAIL ++ "\n" ++ kernelSource("kernels/gdn/decode_k1s_fold_epilogue.metal");
 
 // A draft tree runs in two launches, one simdgroup per job: K1P does each
 // row's conv/silu/q-k norm prework once per head (K1S's arithmetic), reading
@@ -44,16 +44,16 @@ const K1S_FOLD_SOURCE = "threadgroup float ys[TL][DV];\n" ++ K1S_HEAD ++ "\n    
 // the columns of the joined in-projection need no copies. Then K1TR
 // walks the rows parents first, one dv row per simdgroup in 128-thread
 // threadgroups, a restart row's state kept in registers.
-const K1P_SOURCE = kernelSource("kernels/gdn/decode_k1p.metal");
+pub const K1P_SOURCE = kernelSource("kernels/gdn/decode_k1p.metal");
 
 // Row t restarts from its parent's state unless the parent is row t - 1.
-const K1TR_SOURCE = kernelSource("kernels/gdn/decode_k1tr.metal");
+pub const K1TR_SOURCE = kernelSource("kernels/gdn/decode_k1tr.metal");
 
 // The recurrence along `path` (window rows, oldest first) from the round's
 // input state, the tree kernel's ops and per-token rounding: the state serial
 // decoding holds after the path's last row. K1TR's grid. The same launch
 // copies the kept conv window: rows `conv_rows` of the conv input.
-const K1R_SOURCE = kernelSource("kernels/gdn/decode_k1r.metal");
+pub const K1R_SOURCE = kernelSource("kernels/gdn/decode_k1r.metal");
 
 const SPLIT: c_int = 4;
 const NT: c_int = 256; // 4 dv rows per simdgroup

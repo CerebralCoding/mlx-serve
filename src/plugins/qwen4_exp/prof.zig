@@ -1,5 +1,4 @@
-//! plugins/qwen4_exp/prof, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns Qwen4FwdProf, Qwen4AttnProf, qwen4_no_pooled_env, qwen4_debug_scores_env, qwen4_profile_fwd_env, qwen4_profile_qsa_env.
+//! qwen4_exp forward diagnostics: per-block GPU laps (`QWEN4_PROFILE_FWD`) and the QSA attention profile.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");

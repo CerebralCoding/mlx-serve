@@ -1,5 +1,5 @@
 //! sdk/blocks/mlp/dense, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns DenseMlpWeights, SimpleMlpWeights, simpleMLP, residualTail, standardMlp, rowGroupServes, and 1 more.
+//! Owns DenseMlpWeights, residualTail, standardMlp, rowGroupServes, and 1 more.
 
 const mlx = @import("../../../mlx/ffi.zig");
 const lane_qmm = @import("../qmm/lane_qmm.zig");
@@ -26,25 +26,6 @@ pub const DenseMlpWeights = struct {
     /// built (fuseRowGroup).
     gu: FusedRows = .{},
 };
-
-pub const SimpleMlpWeights = struct {
-    up_w: mlx.mlx_array,
-    up_s: mlx.mlx_array,
-    up_b: mlx.mlx_array,
-    down_w: mlx.mlx_array,
-    down_s: mlx.mlx_array,
-    down_b: mlx.mlx_array,
-};
-
-// ── Simple (ungated) MLP with ReLU^2 (Nemotron-H) ──
-
-pub fn simpleMLP(self: *Transformer, x: mlx.mlx_array, sw: *const SimpleMlpWeights) !mlx.mlx_array {
-    const up = try self.qmatmul(x, sw.up_w, sw.up_s, sw.up_b);
-    defer _ = mlx.mlx_array_free(up);
-    const activated = try self.reluSquared(up);
-    defer _ = mlx.mlx_array_free(activated);
-    return self.qmatmul(activated, sw.down_w, sw.down_s, sw.down_b);
-}
 
 // ── Dense MLP (SwiGLU: SiLU(gate(x)) * up(x) -> down) ──
 

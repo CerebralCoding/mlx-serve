@@ -10,6 +10,7 @@
 //! Gemma 4's fixed 280.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const ModelConfig = model_mod.ModelConfig;
@@ -1607,7 +1608,7 @@ fn readBinU8(io: std.Io, alloc: std.mem.Allocator, path: []const u8, max_bytes: 
 }
 
 test "qwen preprocessing parity vs reference pixel_values (QWEN_PREPROCESS_FIXTURE)" {
-    const fixture_raw = std.c.getenv("QWEN_PREPROCESS_FIXTURE") orelse return error.SkipZigTest;
+    const fixture_raw = env.get(.QWEN_PREPROCESS_FIXTURE) orelse return error.SkipZigTest;
     const fixture = std.mem.span(fixture_raw);
     const io = std.testing.io;
     const allocator = std.testing.allocator;
@@ -1684,10 +1685,10 @@ test "qwen preprocessing parity vs reference pixel_values (QWEN_PREPROCESS_FIXTU
 //   python3 tests/build_qwen_vision_fixture.py --model <dir> --image <img> --out <fix>
 // then run via tests/test_qwen_vision_parity.sh (sets the env vars below).
 test "qwen vision parity vs reference embeddings (QWEN_VISION_TEST_MODEL)" {
-    const model_raw = std.c.getenv("QWEN_VISION_TEST_MODEL") orelse return error.SkipZigTest;
-    const fix_raw = std.c.getenv("QWEN_VISION_FIXTURE") orelse return error.SkipZigTest;
-    const gh_raw = std.c.getenv("QV_GH") orelse return error.SkipZigTest;
-    const gw_raw = std.c.getenv("QV_GW") orelse return error.SkipZigTest;
+    const model_raw = env.get(.QWEN_VISION_TEST_MODEL) orelse return error.SkipZigTest;
+    const fix_raw = env.get(.QWEN_VISION_FIXTURE) orelse return error.SkipZigTest;
+    const gh_raw = env.get(.QV_GH) orelse return error.SkipZigTest;
+    const gw_raw = env.get(.QV_GW) orelse return error.SkipZigTest;
     const dir = std.mem.sliceTo(model_raw, 0);
     const fix = std.mem.sliceTo(fix_raw, 0);
     if (dir.len == 0 or fix.len == 0) return error.SkipZigTest;

@@ -2,6 +2,7 @@
 //! Owns vqmm_nax_avail_cache, verifyQmmNaxAvailable, vqmm_tile_cache, verifyQmmTile, vqmm_nax_env_cache, naxLaneEnvEnabled, and 19 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -53,7 +54,7 @@ var vqmm_nax_env_cache: ?bool = null;
 pub fn naxLaneEnvEnabled() bool {
     if (vqmm_nax_env_cache) |v| return v;
     var on = true;
-    if (std.c.getenv("MLX_SERVE_VERIFY_QMM_NAX")) |p| {
+    if (env.get(.MLX_SERVE_VERIFY_QMM_NAX)) |p| {
         const val = std.mem.span(p);
         if (val.len > 0 and val[0] == '0') on = false;
     }
@@ -68,7 +69,7 @@ var vqmm_nax_mixed_env_cache: ?bool = null;
 pub fn naxMixedBitsEnvEnabled() bool {
     if (vqmm_nax_mixed_env_cache) |v| return v;
     var on = true;
-    if (std.c.getenv("MLX_SERVE_VERIFY_QMM_NAX_MIXED")) |p| {
+    if (env.get(.MLX_SERVE_VERIFY_QMM_NAX_MIXED)) |p| {
         const val = std.mem.span(p);
         if (val.len > 0 and val[0] == '0') on = false;
     }
@@ -99,7 +100,7 @@ var vqmm_nax_min_m_env_checked = false;
 pub fn naxMinMForBits(bits: u32) c_int {
     if (!vqmm_nax_min_m_env_checked) {
         vqmm_nax_min_m_cache = naxMinMOverrideFrom(
-            if (std.c.getenv("MLX_SERVE_VERIFY_QMM_NAX_MIN_M")) |p| std.mem.span(p) else null,
+            env.span(.MLX_SERVE_VERIFY_QMM_NAX_MIN_M),
         );
         vqmm_nax_min_m_env_checked = true;
     }
@@ -139,7 +140,7 @@ pub fn verifyQmmNaxEnabledForM(m: c_int, K: c_int, N: c_int) bool {
     );
 }
 
-const VQMM_NAX_HEADER: [:0]const u8 = kernelSource("kernels/linear/vqmm_nax_header.metal");
+pub const VQMM_NAX_HEADER: [:0]const u8 = kernelSource("kernels/linear/vqmm_nax_header.metal");
 
 /// MTPLX's _build_kernel_m16_nax_ktmpl body VERBATIM (nax_verify.py,
 /// Apache-2.0; single-brace form of their f-string). The tensor
@@ -154,7 +155,7 @@ const VQMM_NAX_HEADER: [:0]const u8 = kernelSource("kernels/linear/vqmm_nax_head
 /// the threadgroup. T/GS/KCONST arrive as template args (MLX name-mangles
 /// template values into the host_name, so one kernel object serves every
 /// specialization — the GDN Dk/Dv precedent).
-const VQMM_NAX_SOURCE: [:0]const u8 = kernelSource("kernels/linear/vqmm_nax.metal");
+pub const VQMM_NAX_SOURCE: [:0]const u8 = kernelSource("kernels/linear/vqmm_nax.metal");
 
 var vqmm_nax_kernel: ?mlx.mlx_fast_metal_kernel = null;
 

@@ -2,12 +2,12 @@
 //! Owns AttnDqCopy, attnDqUseNvfp4, attn_dq_nvfp4_from_env, attnDqNvfp4FromEnv, attn_dq_engaged, attn_dq_nvfp4_engaged, and 11 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
 const Weights = @import("../../../engines/mlx/model.zig").Weights;
 const transformer = @import("../../../engines/mlx/transformer.zig");
-const diagEnvOnCached = @import("../../../engines/mlx/env_transformer.zig").diagEnvOnCached;
 const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;
 const attn256MaxDiff = @import("attn256.zig").attn256MaxDiff;
 const attn256RandBf16 = @import("attn256.zig").attn256RandBf16;
@@ -51,7 +51,7 @@ var attn_dq_nvfp4_from_env: ??i64 = null; // outer null = unread; inner null = e
 pub fn attnDqNvfp4FromEnv() ?i64 {
     if (attn_dq_nvfp4_from_env) |v| return v;
     const parsed: ?i64 = blk: {
-        const raw = std.c.getenv("MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM") orelse break :blk null;
+        const raw = env.get(.MLX_SERVE_DECODE_ATTN_QUANT_NVFP4_FROM) orelse break :blk null;
         const s = std.mem.sliceTo(raw, 0);
         if (std.mem.eql(u8, s, "off")) break :blk -1;
         break :blk std.fmt.parseInt(i64, s, 10) catch null;
@@ -79,7 +79,7 @@ pub const DECODE_ATTN_QUANT_DEFAULT = true;
 /// 2026-08-01); laguna's clean characterization keeps the plain default.
 pub fn decodeAttnQuantExplicit() bool {
     if (transformer.decode_attn_quant_override) |v| return v; // test seam counts as explicit
-    if (std.c.getenv("MLX_SERVE_DECODE_ATTN_QUANT")) |raw| {
+    if (env.get(.MLX_SERVE_DECODE_ATTN_QUANT)) |raw| {
         return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
     }
     return transformer.decode_attn_quant_flag orelse false;
@@ -89,7 +89,7 @@ pub fn decodeAttnQuantExplicit() bool {
 /// attention weights get nvfp4 decode copies too, halving their per-token read.
 var attn_dq_requant_cached: ?bool = null;
 pub fn attnDqRequantEnabled() bool {
-    return diagEnvOnCached(&attn_dq_requant_cached, "MLX_SERVE_DECODE_ATTN_QUANT_REQUANT");
+    return env.onCached(&attn_dq_requant_cached, .MLX_SERVE_DECODE_ATTN_QUANT_REQUANT);
 }
 
 pub fn decodeAttnQuantEnabled() bool {
@@ -98,7 +98,7 @@ pub fn decodeAttnQuantEnabled() bool {
     const enabled = blk: {
         // Env wins over the flag: it is the bench scripts' A/B hand
         // (fwd_ubench/prefill_ab pass env, not flags).
-        if (std.c.getenv("MLX_SERVE_DECODE_ATTN_QUANT")) |raw| {
+        if (env.get(.MLX_SERVE_DECODE_ATTN_QUANT)) |raw| {
             break :blk std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
         }
         break :blk transformer.decode_attn_quant_flag orelse DECODE_ATTN_QUANT_DEFAULT;

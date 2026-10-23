@@ -1,10 +1,15 @@
-//! qsaMaskBytes
+//! qwen4_exp's memory terms: the QSA indexer's per-slot ring, per-token history and score bank, the prefill's QSA
+//! transient, the batched tick's effective KV and the SSM checkpoint, each the engine's own arithmetic.
 
 const std = @import("std");
+const abi = @import("../../abi/plugin.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
+const qconfig = @import("config.zig");
+const toModelConfig = @import("model_config.zig").toModelConfig;
 
-const prefillTransientReserve = @import("../../engines/mlx/admission/bills.zig").prefillTransientReserve;
+const bills = @import("../../engines/mlx/admission/bills.zig");
+const prefillTransientReserve = bills.prefillTransientReserve;
 const resolvePrefillChunk = @import("../../engines/mlx/admission/prefill_chunk.zig").resolvePrefillChunk;
 
 /// Bytes per (query, key) the QSA prefill holds for ONE live layer past the
@@ -26,7 +31,56 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
     return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
+/// The engine's config of a parsed pack (no folder: nothing allocated).
+fn engineConfig(p: *const abi.Parsed) model_mod.ModelConfig {
+    return toModelConfig(std.heap.c_allocator, qconfig.of(p), null) catch unreachable;
+}
+
+pub fn bill(p: *const abi.Parsed, _: *const abi.Shape, out: *abi.Bill) callconv(.c) void {
+    const cfg = engineConfig(p);
+    out.* = .{
+        .fixed_slot_bytes = cfg.qsaRingBytes(),
+        .state_per_token = bills.statePerTokenBilled(&cfg),
+        .ssm_checkpoint = cfg.ssmCheckpointBytes(),
+        .prefill_bytes = &prefillBytes,
+        .batched_kv_len = &batchedKvLen,
+    };
+}
+
+/// The QSA transient a prefill chunk adds beside the dense terms, at the real prompt length.
+fn prefillBytes(p: *const abi.Parsed, seq: u64, chunk: u32, _: u8, _: u64) callconv(.c) u64 {
+    const cfg = engineConfig(p);
+    return qsaMaskBytes(&cfg, @min(chunk, @max(seq, 1)), seq);
+}
+
+fn batchedKvLen(p: *const abi.Parsed, kv: u32, gather_on: bool, min: u32) callconv(.c) u32 {
+    const cfg = engineConfig(p);
+    return cfg.batchedEffectiveKvLen(kv, gather_on, min);
+}
+
 // ── tests ──
+
+test "qwen4_exp bill: every term is the engine's arithmetic on the shipped pack" {
+    const t = std.testing;
+    const fixture = @import("../../sdk/testing/fixture.zig");
+    const json = @embedFile("../../fixtures/model-configs/qwen4_exp-iq-mlx-4.7bpw.json");
+    var want = try model_mod.parseConfigFromJson(t.allocator, json);
+    defer want.deinit(t.allocator);
+    const mem: fixture.MemDir = .{ .files = &.{.{ .name = "config.json", .bytes = json }} };
+    const dir = mem.packDir();
+    var p: abi.Parsed = .{};
+    try t.expect(qconfig.parse(&dir, .of(json), .{}, null, true, &p).isOk());
+    defer qconfig.freeParsed(&p);
+    var b: abi.Bill = .{};
+    bill(&p, &.{ .context = 65536 }, &b);
+    try t.expectEqual(want.qsaRingBytes(), b.fixed_slot_bytes);
+    try t.expect(b.fixed_slot_bytes > 0);
+    try t.expectEqual(bills.statePerTokenBilled(&want), b.state_per_token);
+    try t.expectEqual(want.ssmCheckpointBytes(), b.ssm_checkpoint);
+    try t.expectEqual(qsaMaskBytes(&want, 4096, 100_000), b.prefill_bytes.?(&p, 100_000, 4096, 0, 0));
+    try t.expectEqual(want.batchedEffectiveKvLen(50_000, true, 4096), b.batched_kv_len.?(&p, 50_000, true, 4096));
+    try t.expectEqual(@as(u32, 2048 + 4), b.batched_kv_len.?(&p, 50_000, true, 4096));
+}
 
 test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwen3_5 twin keeps" {
     const t = std.testing;

@@ -1,6 +1,7 @@
 //! Batched MTP groups: planner, sub-groups and the merged verify.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const depth_bounds = @import("mtp_depth_bounds.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
@@ -79,7 +80,7 @@ pub fn plannerShape(slots: []const *Slot, widths: []const u8) group_cost_mod.Gro
         } else {
             const off = Generator.mtpRoundOff0(gen.mtp_hist_stash, gen.mtp_cache.?.step());
             const history = 1 + if (gen.mtp_hist_stash) |stash| stash.n else @as(usize, 0);
-            shape.head_format = cacheCostFormat(xfm.qwen4_mtp.?.cache.config);
+            shape.head_format = cacheCostFormat(xfm.qwen4Host().qwen4_mtp.?.cache.config);
             shape.rows[i] = group_cost_mod.GroupShape.row(width, width, width, kv, @intCast(xfm.round_cost.bucketOf(@intCast(off))), @intCast(@min(history, round_cost_mod.MAX_WIDTH + 2)), gen.mtpPlannerMode());
         }
     }
@@ -311,7 +312,7 @@ fn planProbe(
 pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
     if (!Planner.enabled() or active.len == 0 or active.len > Planner.MAX_ROWS) return false;
     const xfm = active[0].model.transformer orelse return false;
-    if (xfm.qwen4 == null or xfm.qwen4_mtp == null) return false;
+    if (xfm.qwen4Host().qwen4 == null or xfm.qwen4Host().qwen4_mtp == null) return false;
     if (active.len == 1) {
         const gen = if (active[0].legacy_gen) |*g| g else return false;
         if (!gen.mtp_planner_owned) return false;
@@ -456,7 +457,7 @@ pub fn tryPlannerTick(sch: *Scheduler, active: []*Slot) anyerror!bool {
 var mtp_group_env: ?bool = null;
 fn mtpGroupEnabled() bool {
     if (mtp_group_env) |v| return v;
-    const on = if (std.c.getenv("MLX_SERVE_MTP_BATCHED")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else true;
+    const on = if (env.get(.MLX_SERVE_MTP_BATCHED)) |p| !std.mem.eql(u8, std.mem.span(p), "0") else true;
     mtp_group_env = on;
     return on;
 }
@@ -466,7 +467,7 @@ fn mtpGroupEnabled() bool {
 var mtp_batched_qwen4_env: ?bool = null;
 fn mtpBatchedQwen4Enabled() bool {
     if (mtp_batched_qwen4_env) |v| return v;
-    const on = if (std.c.getenv("MLX_SERVE_MTP_BATCHED_QWEN4")) |p| !std.mem.eql(u8, std.mem.span(p), "0") else false;
+    const on = if (env.get(.MLX_SERVE_MTP_BATCHED_QWEN4)) |p| !std.mem.eql(u8, std.mem.span(p), "0") else false;
     mtp_batched_qwen4_env = on;
     return on;
 }
@@ -498,7 +499,7 @@ fn mtpRoundsStaySolo(slot: *const Slot) bool {
     if (!t.hasRecurrentLayers()) return true;
     // GLM-5-Next likewise: its head drafts one slot at a time.
     if (t.config.isGlm5()) return true;
-    return mtpQwen4StaySolo(t.qwen4 != null, mtpBatchedQwen4Enabled());
+    return mtpQwen4StaySolo(t.qwen4Host().qwen4 != null, mtpBatchedQwen4Enabled());
 }
 
 pub fn mtpCrowdThresholdFor(slot: *const Slot) usize {
@@ -510,7 +511,7 @@ pub fn mtpCrowdThresholdFor(slot: *const Slot) usize {
 
 fn runBatchedMtpHeadTick(sch: *Scheduler, group: []*Slot) !void {
     const cost_xfm = group[0].model.transformer.?;
-    cost_xfm.cost_trace_active = cost_xfm.qwen4 != null;
+    cost_xfm.cost_trace_active = cost_xfm.qwen4Host().qwen4 != null;
     cost_xfm.cost_attention = 0;
     cost_xfm.cost_moe = 0;
     const head_calls_before = transformer_mod.mtp_head_row_dispatches;
@@ -979,7 +980,7 @@ fn observeGroupRound(live: []*Slot, states: []const Generator.MtpRoundState, exp
     var key = group_cost_mod.GroupShape{
         .n = @intCast(live.len),
         .kv_format = cacheCostFormat(live[0].cache.config),
-        .head_format = if (xfm.qwen4_mtp) |head| cacheCostFormat(head.cache.config) else 0,
+        .head_format = if (xfm.qwen4Host().qwen4_mtp) |head| cacheCostFormat(head.cache.config) else 0,
         .attention = xfm.cost_attention,
         .moe = xfm.cost_moe,
         .head_calls = @intCast(@min(std.math.maxInt(u16), transformer_mod.mtp_head_row_dispatches -% head_calls_before)),

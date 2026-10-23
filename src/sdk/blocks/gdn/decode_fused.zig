@@ -2,6 +2,7 @@
 //! Owns GDN_KERNEL_HEADER, GDN_PREWORK_SOURCE, gdn_prework_kernel, gdn_prework_engaged, gdn_prework_override, gdn_prework_env, and 41 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const rht = @import("../../quant/hadamard/rht.zig");
@@ -64,7 +65,7 @@ var gdn_prework_env: ?bool = null;
 fn gdnPreworkEnabled() bool {
     if (gdn_prework_override) |v| return v;
     if (gdn_prework_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_GDN_PREWORK");
+    const raw = env.get(.MLX_SERVE_GDN_PREWORK);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     gdn_prework_env = enabled;
     return enabled;
@@ -78,7 +79,7 @@ var gdn_decode_fused_env: ?bool = null;
 pub fn gdnDecodeFusedEnabled() bool {
     if (gdn_decode_fused_override) |v| return v;
     if (gdn_decode_fused_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_GDN_DECODE_FUSED");
+    const raw = env.get(.MLX_SERVE_GDN_DECODE_FUSED);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     gdn_decode_fused_env = enabled;
     return enabled;
@@ -97,7 +98,7 @@ pub var gdn_verify_fold_engaged: bool = false;
 /// norm-gate -> concat.
 pub fn gdnVerifyFoldEnabled() bool {
     return gdn_verify_fold_env orelse blk: {
-        const raw = std.c.getenv("MLX_SERVE_GDN_VERIFY_FOLD");
+        const raw = env.get(.MLX_SERVE_GDN_VERIFY_FOLD);
         const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
         gdn_verify_fold_env = enabled;
         break :blk enabled;
@@ -108,7 +109,7 @@ pub fn gdnVerifyFoldEnabled() bool {
 /// norm-gate. MLX_SERVE_GDN_DECODE_RECUR=0 restores prework -> recurrence -> norm-gate.
 pub fn gdnDecodeRecurEnabled() bool {
     const on = gdn_decode_recur_env orelse blk: {
-        const raw = std.c.getenv("MLX_SERVE_GDN_DECODE_RECUR");
+        const raw = env.get(.MLX_SERVE_GDN_DECODE_RECUR);
         const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
         gdn_decode_recur_env = enabled;
         break :blk enabled;
@@ -161,7 +162,7 @@ pub fn gdnPrefillFusedFor(seq: c_int, batch: c_int) bool {
     if (seq < 17 or batch < 1 or batch > 2 or seq > @divTrunc(@import("../hc/hc_prefill.zig").max_seq, batch)) return false;
     if (gdn_prefill_fused_override) |on| return on;
     if (gdn_prefill_fused_env) |on| return on;
-    const raw = std.c.getenv("MLX_SERVE_GDN_PREFILL_FUSED");
+    const raw = env.get(.MLX_SERVE_GDN_PREFILL_FUSED);
     const on = raw == null or !std.mem.eql(u8, std.mem.span(raw.?), "0");
     gdn_prefill_fused_env = on;
     return on;

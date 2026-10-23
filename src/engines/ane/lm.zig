@@ -11,6 +11,7 @@
 //! `v<j>_new` outputs.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const log = @import("../../host/log.zig");
 const rt = @import("rt.zig");
 const q35 = @import("qwen35.zig");
@@ -152,7 +153,7 @@ var trace_env: ?bool = null;
 
 /// `MLX_SERVE_ANE_TRACE` (set and not `0`, as `transformer.diagEnvValueOn`): per-call timings in the log.
 fn trace() bool {
-    if (trace_env == null) trace_env = if (std.c.getenv("MLX_SERVE_ANE_TRACE")) |v| v[0] != '0' else false;
+    if (trace_env == null) trace_env = if (env.get(.MLX_SERVE_ANE_TRACE)) |v| v[0] != '0' else false;
     return trace_env.?;
 }
 
@@ -2472,16 +2473,16 @@ test "KV history: positions [a, b) out and back across tiles and padded rows, th
 const model_mod = @import("../mlx/model.zig");
 
 fn testModel(io: std.Io, slots: u32) !?*Model {
-    const dir = std.c.getenv("ANE_TEST_PACK") orelse return null;
+    const dir = env.get(.ANE_TEST_PACK) orelse return null;
     const drafter = try std.fs.path.join(testing.allocator, &.{ std.mem.span(dir), "drafter" });
     defer testing.allocator.free(drafter);
     // ANE_TEST_LANES=1 runs the one-engine path on an Ultra.
-    const lanes: u32 = if (std.c.getenv("ANE_TEST_LANES")) |l| std.fmt.parseInt(u32, std.mem.span(l), 10) catch 0 else 0;
+    const lanes: u32 = if (env.get(.ANE_TEST_LANES)) |l| std.fmt.parseInt(u32, std.mem.span(l), 10) catch 0 else 0;
     return testModelWith(io, .{ .slots = slots, .drafter = drafter, .lanes = lanes });
 }
 
 fn testModelWith(io: std.Io, opts: Options) !?*Model {
-    const dir = std.c.getenv("ANE_TEST_PACK") orelse return null;
+    const dir = env.get(.ANE_TEST_PACK) orelse return null;
     var cfg = try model_mod.parseConfig(io, testing.allocator, std.mem.span(dir));
     defer cfg.deinit(testing.allocator);
     return try Model.open(testing.allocator, io, std.mem.span(dir), try archOf(&cfg), opts);

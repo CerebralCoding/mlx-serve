@@ -1,5 +1,4 @@
-//! plugins/qwen4_exp/qsa/history, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns QSA_RING_ROWS, QSA_MAX_COMPRESS_RATIO, checkQsaCompressRatio, QsaHeadMark, QSA_HEAD_MARKS_MAX, markPosOf, and 19 more.
+//! The per-slot QSA key ring and pooled-block history (`QSA_RING_ROWS`), head marks, and `ssmFreeQsaState`.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");

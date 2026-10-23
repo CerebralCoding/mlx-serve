@@ -19,12 +19,12 @@ final class MediaModalityParityTests: XCTestCase {
             .deletingLastPathComponent()  // repo root
     }
 
-    /// `media_model_types` out of src/host/media_jobs/gen.zig, which is the source of truth.
+    /// `media_model_types` out of src/host/registry/modality.zig, which is the source of truth.
     private func zigMediaModelTypes() throws -> Set<String> {
-        let text = try String(contentsOf: repoRoot.appendingPathComponent("src/host/media_jobs/gen.zig"), encoding: .utf8)
+        let text = try String(contentsOf: repoRoot.appendingPathComponent("src/host/registry/modality.zig"), encoding: .utf8)
         guard let start = text.range(of: "pub const media_model_types = [_][]const u8{"),
               let end = text.range(of: "};", range: start.upperBound..<text.endIndex) else {
-            XCTFail("could not find media_model_types in src/host/media_jobs/gen.zig")
+            XCTFail("could not find media_model_types in src/host/registry/modality.zig")
             return []
         }
         let body = text[start.upperBound..<end.lowerBound]

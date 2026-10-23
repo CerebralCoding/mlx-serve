@@ -8,8 +8,7 @@ Run from the repo root. A test line is inside a `test ... {` block or after a `/
 """
 import os, re, sys, collections
 
-ROOTS = {"src": "src", "lib/mlx-stream": "lib/mlx-stream", "lib/sushi/src/exl3": "lib/sushi/src/exl3",
-         "lib/mlx-serve-gguf": "lib/mlx-serve-gguf/src"}
+ROOTS = {"src": "src"}
 SOFT_CAP = 1500
 TEST_OPEN = re.compile(r'^(\s*)test( "([^"]*)"| \{| ([A-Za-z_][\w.]*) \{)')
 TESTS_MARKER = re.compile(r'^// ── [Tt]ests\b')

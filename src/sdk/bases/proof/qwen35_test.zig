@@ -125,19 +125,19 @@ pub fn writePack(p: *fixture.Pack, comptime moe_pack: bool, q: bool, experts: c_
 // ── the base's weights over the legacy model's loaded arrays ──
 
 /// What a model of these blocks holds beside its layers: the shared GDN constants, the angle rows, the closures.
-const Model = struct {
+pub const Model = struct {
     geo: gdn.Geo,
     angles: qk_rope.AngleCache = .{},
     route_fns: [LAYERS]@import("../blocks/compiled.zig").Closure = @splat(.{ .ctx = null }),
 
-    fn deinit(m: *Model) void {
+    pub fn deinit(m: *Model) void {
         gdn.freeConsts(&m.geo);
         m.angles.deinit();
         for (&m.route_fns) |*c| @import("../blocks/compiled.zig").free(c);
     }
 };
 
-fn gdnGeo(lg: *fixture.Legacy) !gdn.Geo {
+pub fn gdnGeo(lg: *fixture.Legacy) !gdn.Geo {
     const cfg = &lg.xfm.config;
     var geo: gdn.Geo = .{
         .hk = @intCast(cfg.linear_num_key_heads),
@@ -248,7 +248,7 @@ pub fn moeWeights(lg: *fixture.Legacy, mw: *const MoeMlpWeights, route_fn: *@imp
     return w;
 }
 
-fn baseWeights(comptime D: type, lg: *fixture.Legacy, m: *Model, layers: []D.Layer) !D.Weights {
+pub fn baseWeights(comptime D: type, lg: *fixture.Legacy, m: *Model, layers: []D.Layer) !D.Weights {
     const x = &lg.xfm;
     const hidden = lg.config.hidden_size;
     const none = Array{};
@@ -305,30 +305,7 @@ const Lane = struct {
         fixture.freeEntries(lane.legacy_ssm);
         fixture.freeEntries(lane.base_ssm);
     }
-
-    /// Every recurrent state and verify capture equal to the legacy forward's.
-    fn expectStates(lane: *const Lane) !void {
-        for (lane.legacy_ssm, lane.base_ssm) |*want, *got| {
-            try testing.expectEqual(want.initialized, got.initialized);
-            inline for (.{ "conv_state", "ssm_state", "spec_conv_input", "spec_state_seq" }) |f| {
-                const wa = @field(want, f);
-                const ga = @field(got, f);
-                try testing.expectEqual(wa.ctx == null, ga.ctx == null);
-                if (wa.ctx != null) try expectBitsEqual(ga, wa);
-            }
-        }
-    }
 };
-
-/// Bit-equal, except a state sequence's last row: the verify kernels never write it (a rollback never reads it).
-fn expectBitsEqual(got: Array, want: Array) !void {
-    var g = ops.Graph.init(testing.allocator, fixture.stream());
-    defer g.deinit();
-    const sh = ops.shape(want);
-    if (sh.len == 5 and sh[0] > 1 and ops.shape(got).len == 5)
-        return ops.expectBitEqual(try g.sliceAxis(got, 0, 0, sh[0] - 1), try g.sliceAxis(want, 0, 0, sh[0] - 1));
-    return ops.expectBitEqual(got, want);
-}
 
 const Step = struct { mode: abi.Mode, ids: []const i32 };
 
@@ -364,9 +341,9 @@ fn soloStep(comptime D: type, lg: *fixture.Legacy, w: *const D.Weights, shared: 
     lane.ctx.capture_ssm_seq = st.mode == .verify;
     const want = try fixture.rows2(&g, try g.adopt(try lg.xfm.forwardWith(&lane.ctx, t)));
     const handles = [_]abi.Handle{lane.slot.handle()};
-    const got = try D.forward(w, shared, &g, t, .{ .mode = st.mode, .rows = @intCast(st.ids.len), .positions = &.{pos}, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows });
+    const got = try D.forward(w, shared, &g, t, .{ .mode = st.mode, .rows = @intCast(st.ids.len), .positions = &.{pos}, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows, .capture_spec = st.mode == .verify });
     try ops.expectBitEqual(got.logits, want);
-    try lane.expectStates();
+    try fixture.expectEntries(lane.legacy_ssm, lane.base_ssm);
 }
 
 const Opts = struct { f32_state: bool = false, quantized: bool = true, experts: c_int = 8 };
@@ -450,11 +427,11 @@ fn batchedCase(comptime D: type, comptime moe_pack: bool, seed: u64) !void {
             _ = try g.adopt(ha);
             want = try fixture.rows2(&g, try g.reshape(try g.adopt(logits), &.{ 1, 2 * @as(c_int, @intCast(rows)), VOCAB }));
         }
-        const got = try D.forward(&w, &shared, &g, t, .{ .mode = .batched_rows, .rows = @intCast(rows), .slots = 2, .positions = &positions, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows });
+        const got = try D.forward(&w, &shared, &g, t, .{ .mode = .batched_rows, .rows = @intCast(rows), .slots = 2, .positions = &positions, .caches = &handles, .cache_ops = &cache_ops.ops, .logits = .all_rows, .capture_spec = rows > 1 });
         try ops.expectBitEqual(got.logits, want);
         for (&lanes) |*l| {
             l.offset += rows;
-            try l.expectStates();
+            try fixture.expectEntries(l.legacy_ssm, l.base_ssm);
         }
     }
 }

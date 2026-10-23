@@ -2,8 +2,8 @@
 //! written through `CacheOps`: prefill (composed chain, blocked/pipelined recurrence, the wide fused prework where a
 //! pack asks), the fused one-dispatch decode, verify rows with the per-row state capture a partial accept rolls back
 //! to, and batched rows (every slot's state stacked on the batch axis).
-//! copied_from: sdk/blocks/gdn/gated_delta_net.zig (`gatedDeltaNetProjected` without the Hadamard, KDA, low-rank
-//! gate, ANE, spec-tree, grouped-verify and diagnostic arms), sdk/blocks/gdn/gate.zig (`computeGdnGate`).
+//! copied_from: sdk/blocks/gdn/gated_delta_net.zig (`gatedDeltaNetProjected` without the KDA, low-rank gate, ANE,
+//! spec-tree, grouped-verify and diagnostic arms), sdk/blocks/gdn/gate.zig (`computeGdnGate`).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -18,7 +18,7 @@ const gdn_decode = @import("../../blocks/gdn/decode.zig");
 const fused = @import("../../blocks/gdn/decode_fused.zig");
 const kernels = @import("../../blocks/gdn/kernels.zig");
 const gate_mod = @import("../../blocks/gdn/gate.zig");
-const FUSED_ROWS_MAX_M = @import("../../blocks/linear/fused_rows.zig").FUSED_ROWS_MAX_M;
+const row_exact = @import("row_exact.zig");
 
 const Array = ops.Array;
 const Graph = ops.Graph;
@@ -125,19 +125,19 @@ pub const Gdn = struct {
 /// The four projections in `[B, S, ...]`, each owned by `g`; `all` is the joined matmul's output when one ran.
 const Proj = struct { qkv: Array, z: Array, a: Array, b: Array, all: ?Array = null };
 
-fn project(w: *const Gdn.Weights, g: *Graph, x: Array, batch: c_int, seq: c_int) !Proj {
+fn project(w: *const Gdn.Weights, lane: row_exact.Lane, g: *Graph, x: Array, batch: c_int, seq: c_int) !Proj {
     if (w.combined) return projectCombined(w, g, x, batch, seq);
-    if (w.in.built() and batch * seq <= FUSED_ROWS_MAX_M) {
-        const all = try w.in.lin.forward(g, x);
+    if (w.in.built() and row_exact.groupServes(lane, batch * seq)) {
+        const all = try row_exact.linear(lane, g, &w.in.lin, x);
         return .{ .qkv = try w.in.part(g, all, 0), .z = try w.in.part(g, all, 1), .a = try w.in.part(g, all, 2), .b = try w.in.part(g, all, 3), .all = all };
     }
-    const qkv = if (w.qkv.w.ctx != null) try w.qkv.forward(g, x) else blk: {
+    const qkv = if (w.qkv.w.ctx != null) try row_exact.linear(lane, g, &w.qkv, x) else blk: {
         var parts: [3]Array = undefined;
-        for (&parts, w.qkv_parts) |*p, l| p.* = try l.forward(g, x);
+        for (&parts, &w.qkv_parts) |*p, *l| p.* = try row_exact.linear(lane, g, l, x);
         break :blk try g.concat(&parts, -1);
     };
-    const z = try w.z.forward(g, x);
-    return .{ .qkv = qkv, .z = z, .a = try w.a.forward(g, x), .b = try w.b.forward(g, x) };
+    const z = try row_exact.linear(lane, g, &w.z, x);
+    return .{ .qkv = qkv, .z = z, .a = try row_exact.linear(lane, g, &w.a, x), .b = try row_exact.linear(lane, g, &w.b, x) };
 }
 
 /// qwen3_next's interleaved q|k|v|z and b|a projections, split per key head and flattened.
@@ -194,18 +194,31 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
     const geo = &w.geo;
     const batch: c_int = if (c.mode == .batched_rows) c.slots else 1;
     const seq = c.rows;
-    const capture = c.mode == .verify or (c.mode == .batched_rows and seq > 1);
+    const capture = c.capture_spec;
     const value_dim = geo.valueDim();
     const conv_dim = geo.convDim();
     const eps = c.shared.eps_arr;
     const swish = !geo.sigmoid_gate;
 
-    const p = try project(w, g, x, batch, seq);
+    const p = try project(w, c.row_exact, g, x, batch, seq);
     var conv = try state.get(c, .conv);
     var ssm: ?Array = if (conv != null) try state.get(c, .ssm) else null;
 
+    // A Hadamard pack, one decode token: prework, recurrence, norm-gate and the out projection's input rotation in two
+    // dispatches, the rotation seeded so the projection reads it as rotated.
+    if (w.out.rht) |reg| if (batch == 1 and seq == 1 and !capture and conv != null and ssm != null and geo.kernel == 4 and w.out.signs.ctx != null) fast: {
+        var ins = gdnInputs(w, p, conv.?, ssm.?, eps);
+        ins.signs = w.out.signs;
+        const r = (try gdn_decode.step(geo.dec(), reg.block, ins, g.s)) orelse break :fast;
+        try adopt3(g, .{ r.rot, r.conv_state, r.ssm_state });
+        try state.put(c, .conv, r.conv_state);
+        try state.put(c, .ssm, r.ssm_state);
+        try reg.seed(r.rot, w.out.signs, r.rot);
+        return w.out.forward(g, r.rot);
+    };
+
     // One decode token: prework and recurrence in one dispatch, then the norm-gate.
-    if (batch == 1 and seq == 1 and !capture and conv != null and ssm != null and geo.kernel == 4 and fused.gdnDecodeRecurEnabled()) fast: {
+    if (w.out.rht == null and batch == 1 and seq == 1 and !capture and conv != null and ssm != null and geo.kernel == 4 and fused.gdnDecodeRecurEnabled()) fast: {
         const r = (try gdn_decode.recur(geo.dec(), gdnInputs(w, p, conv.?, ssm.?, eps), g.s)) orelse break :fast;
         try adopt3(g, .{ r.y, r.conv_state, r.ssm_state });
         const flat = (try fused.gdnNormGateFused(g.s, r.y, p.z, 0, value_dim, w.norm_w, eps, swish, geo.hv, geo.dv, 1, 1)) orelse break :fast;
@@ -215,11 +228,11 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
             fused.gdn_decode_recur_engaged = true;
             log.info("[gdn] decode recur engaged: Hk={d} Hv={d} gate={s}\n", .{ geo.hk, geo.hv, if (geo.sigmoid_gate) "sigmoid" else "swish" });
         }
-        return w.out.forward(g, try g.adopt(flat));
+        return row_exact.linear(c.row_exact, g, &w.out, try g.adopt(flat));
     }
 
     // Verify rows: the same kernel over S tokens, keeping every row's state for the rollback.
-    if (batch == 1 and seq >= 1 and seq <= gdn_decode.MAX_SEQ and capture and conv != null and ssm != null and geo.kernel == 4 and fused.gdnDecodeRecurEnabled()) fast: {
+    if (w.out.rht == null and batch == 1 and seq >= 1 and seq <= gdn_decode.MAX_SEQ and capture and conv != null and ssm != null and geo.kernel == 4 and fused.gdnDecodeRecurEnabled()) fast: {
         const ins = gdnInputs(w, p, conv.?, ssm.?, eps);
         if (fused.gdnVerifyFoldEnabled()) fold: {
             const f = (try gdn_decode.recurSeqFold(geo.dec(), seq, ins, swish, g.s)) orelse break :fold;
@@ -232,7 +245,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
                 fused.gdn_verify_fold_engaged = true;
                 log.info("[gdn] verify fold engaged: S={d} Hk={d} Hv={d}\n", .{ seq, geo.hk, geo.hv });
             }
-            return w.out.forward(g, f.gated);
+            return row_exact.linear(c.row_exact, g, &w.out, f.gated);
         }
         const r = (try gdn_decode.recurSeq(geo.dec(), seq, ins, g.s)) orelse break :fast;
         try adopt3(g, .{ r.y, r.conv_state, r.ssm_state, r.state_seq });
@@ -246,7 +259,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
             fused.gdn_verify_recur_engaged = true;
             log.info("[gdn] verify recur engaged: S={d} Hk={d} Hv={d}\n", .{ seq, geo.hk, geo.hv });
         }
-        return w.out.forward(g, try g.adopt(flat));
+        return row_exact.linear(c.row_exact, g, &w.out, try g.adopt(flat));
     }
 
     var q_scaled: Array = undefined;
@@ -355,7 +368,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
     // Fused epilogue: rms_norm(y) * act(z) straight to the out projection's input.
     if (fused_prework) {
         if (try fused.gdnNormGateFused(g.s, y, p.z, 0, value_dim, w.norm_w, eps, swish, geo.hv, geo.dv, batch, seq)) |flat|
-            return w.out.forward(g, try g.adopt(flat));
+            return row_exact.linear(c.row_exact, g, &w.out, try g.adopt(flat));
     }
     const z_heads = try g.reshape(p.z, &.{ batch, seq, geo.hv, geo.dv });
     const y_normed = try g.rmsNorm(y, w.norm_w, c.shared.eps);
@@ -363,7 +376,7 @@ fn mix(w: *const Gdn.Weights, c: *Ctx, x: Array) !Array {
         try g.mul(y_normed, try g.sigmoid(z_heads))
     else
         try g.mul(try g.mul(z_heads, try g.sigmoid(z_heads)), y_normed);
-    return w.out.forward(g, try g.reshape(gated, &.{ batch, seq, value_dim }));
+    return row_exact.linear(c.row_exact, g, &w.out, try g.reshape(gated, &.{ batch, seq, value_dim }));
 }
 
 /// The decay gate `[B, S, Hv]`: the compiled closure where one was built, else the chain.

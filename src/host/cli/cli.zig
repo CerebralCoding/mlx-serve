@@ -19,6 +19,7 @@
 //! here; only the thin curl/spawn wrappers need a live network.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const build_options = @import("build_options");
 const ollama = @import("../api/ollama/translate.zig");
 const model_discovery = @import("../registry/discovery.zig");
@@ -206,7 +207,7 @@ pub fn shouldDefaultModelsRoot(in: RootDefaulting) bool {
 }
 
 fn homeDir() []const u8 {
-    return std.mem.span(std.c.getenv("HOME") orelse return "/tmp");
+    return std.mem.span(env.get(.HOME) orelse return "/tmp");
 }
 
 // ── HF tree listing ─────────────────────────────────────────────────────
@@ -319,7 +320,7 @@ pub const Reporter = struct {
 /// header string when HF_TOKEN is set (caller frees).
 fn curlBaseArgs(list: *std.ArrayList([]const u8), allocator: std.mem.Allocator) !?[]u8 {
     try list.appendSlice(allocator, &.{ "curl", "-fL", "--retry", "3", "--retry-delay", "2" });
-    if (std.c.getenv("HF_TOKEN")) |tok| {
+    if (env.get(.HF_TOKEN)) |tok| {
         const header = try std.fmt.allocPrint(allocator, "Authorization: Bearer {s}", .{std.mem.span(tok)});
         try list.appendSlice(allocator, &.{ "-H", header });
         return header;
@@ -700,6 +701,13 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
     defer dir.close(io);
 
     try w.print("{s: <56} {s: <12} {s: >10}\n", .{ "NAME", "TYPE", "SIZE" });
+    if (try listTree(io, allocator, w, &dir, root) == 0) {
+        try w.print("(none) — try: mlx-serve pull gemma4\n", .{});
+    }
+}
+
+/// One row per model dir under `dir`, at the top level or one org level down; returns the row count.
+fn listTree(io: std.Io, allocator: std.mem.Allocator, w: *std.Io.Writer, dir: *std.Io.Dir, root: []const u8) !usize {
     var count: usize = 0;
     var it = dir.iterate();
     while (it.next(io) catch null) |entry| {
@@ -725,9 +733,7 @@ pub fn cmdList(allocator: std.mem.Allocator, io: std.Io) !void {
             count += 1;
         }
     }
-    if (count == 0) {
-        try w.print("(none) — try: mlx-serve pull gemma4\n", .{});
-    }
+    return count;
 }
 
 /// A tree-walk entry worth descending into: a real directory OR a symlink
@@ -1398,30 +1404,26 @@ test "cli: an unparsed argument is classified, never silently ignored" {
     try testing.expect(std.mem.indexOf(u8, ArgReject.equals_form.hint(), "separate argument") != null);
 }
 
-test "cli: list tree walk descends into symlinked model dirs" {
-    // Moving a big checkpoint to an external drive and symlinking it back is
-    // a supported layout (the H3 mirrors live that way): model_discovery's
-    // walk accepts .sym_link entries, but `list` had its own private walk
-    // that silently skipped them — both MiniMax mirrors vanished from `list`
-    // while the server kept serving them. Both loops route through ONE
-    // predicate now.
-    try testing.expect(treeEntryDescends(.directory));
-    try testing.expect(treeEntryDescends(.sym_link));
-    try testing.expect(!treeEntryDescends(.file));
+test "cli: list walks symlinked model dirs at the top, org and leaf level" {
+    // A checkpoint moved to an external drive and linked back must stay listed, like discovery serves it.
+    const io = std.testing.io;
+    var tmp = std.testing.tmpDir(.{ .iterate = true });
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "ext/org/m");
+    try tmp.dir.writeFile(io, .{ .sub_path = "ext/org/m/config.json", .data = "{}" });
+    try tmp.dir.createDirPath(io, "root/org");
+    try tmp.dir.symLink(io, "../ext/org/m", "root/top", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "../../ext/org/m", "root/org/leaf", .{ .is_directory = true });
+    try tmp.dir.symLink(io, "../ext/org", "root/linked_org", .{ .is_directory = true });
+    var root = try tmp.dir.openDir(io, "root", .{ .iterate = true });
+    defer root.close(io);
 
-    // Source scan: the org-level and leaf-level loops in listModels must both
-    // consult the predicate — a reintroduced raw `!= .directory` check is the
-    // regression this pins. Needle split so the scan cannot match itself.
-    const src = @embedFile("cli.zig");
-    const needle = "treeEntry" ++ "Descends(";
-    var found: usize = 0;
-    var idx: usize = 0;
-    while (std.mem.indexOfPos(u8, src, idx, needle)) |p| {
-        found += 1;
-        idx = p + needle.len;
+    var buf: [4096]u8 = undefined;
+    var w = std.Io.Writer.fixed(&buf);
+    try testing.expectEqual(@as(usize, 3), try listTree(io, testing.allocator, &w, &root, "/nonexistent"));
+    for ([_][]const u8{ "top ", "org/leaf ", "linked_org/m " }) |name| {
+        try testing.expect(std.mem.indexOf(u8, w.buffered(), name) != null);
     }
-    // 1 definition + 3 in this test + at least 2 call sites in the walk.
-    try testing.expect(found >= 6);
 }
 
 test "ggufGroup: split parts group together, quants apart, mmproj never" {

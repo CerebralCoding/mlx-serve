@@ -1,0 +1,2 @@
+const int krow = p * KPOOL + KPOOL - 1;
+const device vec<T, 4>* pooled = (const device vec<T, 4>*)((krow < lane_rows ? cache + size_t(krow) * (2 * DH) : side + size_t(krow - lane_rows) * (2 * DH)) + DH);

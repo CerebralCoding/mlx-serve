@@ -135,7 +135,8 @@ fn small(s: c.Spec, lo: usize, hi: usize) c.Shape {
 /// Gate 1: NaN and both infinities at known inputs; every output's class equals the float64 reference's.
 pub fn nonfinite(a: std.mem.Allocator, k: Kernel, seed: u64) !Verdict {
     const name = k.spec.name;
-    if (!try k.vt.prepare(k.ctx, small(k.spec, 5, 8), .nonfinite, seed)) return say(.fail, .nonfinite, name, "refused a served shape", .{});
+    const at = small(k.spec, 5, 8);
+    if (!try k.vt.prepare(k.ctx, at, .nonfinite, seed)) return say(.fail, .nonfinite, name, "refused a served shape", .{});
     try k.vt.run(k.ctx);
     if (k.vt.check) |own| {
         if (try own(k.ctx, .nonfinite)) |why| return say(.fail, .nonfinite, name, "{s}", .{why});
@@ -155,13 +156,13 @@ pub fn nonfinite(a: std.mem.Allocator, k: Kernel, seed: u64) !Verdict {
     var first: usize = n;
     for (want[0..n], 0..) |w, i| {
         if (c.classOf(w) != .finite) planted += 1;
-        if (c.classOf(c.read(k.spec.out, out, i)) != c.classOf(w)) {
+        if (c.classOf(c.readOut(k.spec, at, out, i).v) != c.classOf(w)) {
             differ += 1;
             if (first == n) first = i;
         }
     }
     if (planted == 0 or planted == n) return say(.fail, .nonfinite, name, "the planted values make {d} of {d} reference outputs non-finite: no proof", .{ planted, n });
-    if (differ > 0) return say(.fail, .nonfinite, name, "{d} of {d} outputs differ in class; first at {d}: {t} where float64 gives {t}", .{ differ, n, first, c.classOf(c.read(k.spec.out, out, first)), c.classOf(want[first]) });
+    if (differ > 0) return say(.fail, .nonfinite, name, "{d} of {d} outputs differ in class; first at {d}: {t} where float64 gives {t}", .{ differ, n, first, c.classOf(c.readOut(k.spec, at, out, first).v), c.classOf(want[first]) });
     return say(.pass, .nonfinite, name, "{d} non-finite and {d} finite outputs match the float64 classes", .{ planted, n - planted });
 }
 
@@ -185,6 +186,14 @@ pub fn repeat(a: std.mem.Allocator, k: Kernel, seed: u64) !Verdict {
         }
     }
     if (differ > 0) return say(.fail, .repeat, name, "{d} of 4 repeats differ from the first run's bytes, first at byte {d}", .{ differ, at });
+    // A bool output's poison reads as NaN: an element no run wrote, whatever its answer would be.
+    var bools = k.spec.out == .bool;
+    for (k.spec.outs) |p| bools = bools or p.elem == .bool;
+    const shape = small(k.spec, 1, 64);
+    if (bools) for (0..k.vt.count(k.ctx)) |i| {
+        const o = c.readOut(k.spec, shape, first, i);
+        if (o.elem == .bool and std.math.isNan(o.v)) return say(.fail, .repeat, name, "output {d} still holds the poison: never written", .{i});
+    };
     if (!k.spec.in_place and !std.mem.eql(u8, before, try k.vt.inputs(k.ctx))) return say(.fail, .repeat, name, "a run changed its inputs and the spec does not declare in place", .{});
     if (!try k.vt.intact(k.ctx)) return say(.fail, .repeat, name, "a run wrote outside its buffers (guard bytes changed)", .{});
     return say(.pass, .repeat, name, "five runs byte-identical ({d} bytes), inputs and guards untouched", .{first.len});
@@ -224,8 +233,9 @@ pub fn shapes(a: std.mem.Allocator, k: Kernel, seed: u64) !Verdict {
         const mag = buf[n..];
         try k.vt.reference(k.ctx, want, mag);
         for (want, mag, 0..) |w, m, i| {
-            const got = c.read(k.spec.out, out, i);
-            const q = if (got == w) 0 else @abs(got - w) / c.bound(k.spec, shape, w, m);
+            const o = c.readOut(k.spec, shape, out, i);
+            const got = o.v;
+            const q = if (got == w) 0 else @abs(got - w) / c.bound(k.spec, o.elem, shape, w, m);
             if (!(q <= 1)) return say(.fail, .shapes, name, "at {d}x{d}x{d} output {d} is {e:.6} where float64 gives {e:.6}: {d:.2} of its bound", .{ shape.rows, shape.n, shape.k, i, got, w, q });
             worst = @max(worst, q);
         }
@@ -259,8 +269,14 @@ pub fn sums(a: std.mem.Allocator, k: Kernel, seed: u64) !Verdict {
     const allow = buf[n .. 2 * n];
     const got = buf[2 * n .. 3 * n];
     const mag = buf[3 * n ..];
+    try k.vt.run(k.ctx);
+    const out = try a.dupe(u8, try k.vt.output(k.ctx));
+    defer a.free(out);
     try k.vt.reference(k.ctx, want, mag);
-    for (allow, want, mag) |*l, w, m| l.* = if (s.sums.exact) c.boundExact(s, w) else c.bound(s, shape, w, m);
+    for (allow, want, mag, 0..) |*l, w, m, i| {
+        const e = c.readOut(s, shape, out, i).elem;
+        l.* = if (s.sums.exact) c.boundExact(s, e, w) else c.bound(s, e, shape, w, m);
+    }
     var margin = [2]f64{ std.math.inf(f64), std.math.inf(f64) };
     for ([_]Order{ .sequential, .pairwise, .strided }) |o| {
         try sim(k.ctx, .f32, o, got);
@@ -273,9 +289,7 @@ pub fn sums(a: std.mem.Allocator, k: Kernel, seed: u64) !Verdict {
     const need = [2]f64{ s.sums.f16, s.sums.bf16 };
     for (margin, need, [_][]const u8{ "fp16", "bf16" }) |m, r, what| if (m < r)
         return say(.fail, .sums, s.name, "its stress inputs make {s} sums miss by only {d:.1}x (needs {d:.0}x)", .{ what, m, r });
-    try k.vt.run(k.ctx);
-    const out = try k.vt.output(k.ctx);
-    for (got, 0..) |*g, i| g.* = c.read(s.out, out, i);
+    for (got, 0..) |*g, i| g.* = c.readOut(s, shape, out, i).v;
     const q = misses(got, want, allow);
     if (!(q <= 1)) return say(.fail, .sums, s.name, "{d:.1}x over its exact-sum bound at k {d}: not fp32 sums (fp16 would miss {d:.0}x, bf16 {d:.0}x)", .{ q, shape.k, margin[0], margin[1] });
     if (need[0] == 0 or need[1] == 0) return say(.pass, .sums, s.name, "within its bound at k {d}; fp16 sums would miss {d:.0}x, bf16 {d:.1}x ({s})", .{ shape.k, margin[0], margin[1], s.sums.why });
@@ -309,8 +323,9 @@ pub const Tally = struct {
 
 /// Gates 1-4 on each kernel, and each control at its own gate (which must fail).
 pub fn runAll(a: std.mem.Allocator, kernels: []const Kernel, seed: u64, t: *Tally) !void {
-    for (kernels, 0..) |k, i| {
-        const s = seed +% 0x9e37 *% i;
+    for (kernels) |k| {
+        // Seeded by name, so a registration added elsewhere never reshuffles another kernel's inputs.
+        const s = seed +% std.hash.Wyhash.hash(0, k.spec.name);
         if (k.control) |g| {
             if (g == .limits) continue; // gate 5's controls are checked by `limits.zig` with no device
             t.controls += 1;

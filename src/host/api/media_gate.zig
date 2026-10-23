@@ -6,6 +6,7 @@ const model_mod = @import("../../engines/mlx/model.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const media_mod = @import("../media_jobs/gen.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
+const PluginEngine = @import("../media_jobs/plugin/engine.zig").Engine;
 
 /// Facts about a request's target model that decide whether a TEXT-
 /// GENERATION route (/v1/chat/completions, /v1/completions, /v1/messages,
@@ -121,11 +122,11 @@ pub fn textGenTargetOf(lm: *LoadedModel) TextGenTarget {
     return .{
         .is_encoder_only = cpu_state_stable and lm.config != null and lm.config.?.is_encoder_only,
         .arch_hint = lm.arch_hint,
-        .has_image_engine = lm.image_engine != null,
-        .has_audio_engine = lm.audio_engine != null,
-        .has_video_engine = lm.video_engine != null,
-        .has_mesh_engine = lm.mesh_engine != null,
-        .has_decision_engine = lm.decision_engine != null,
+        .has_image_engine = PluginEngine.serves(lm.media_plugin, media_mod.Modality.image),
+        .has_audio_engine = PluginEngine.serves(lm.media_plugin, media_mod.Modality.audio),
+        .has_video_engine = PluginEngine.serves(lm.media_plugin, media_mod.Modality.video),
+        .has_mesh_engine = PluginEngine.serves(lm.media_plugin, media_mod.Modality.mesh),
+        .has_decision_engine = PluginEngine.serves(lm.media_plugin, media_mod.Modality.decision),
         .has_text_lm = lm.state != .ready or lm.transformer != null or lm.engineBacked(),
     };
 }

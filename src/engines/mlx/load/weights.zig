@@ -18,7 +18,7 @@ const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeigh
 const checkExl3Bank = @import("../../../sdk/quant/exl3.zig").checkExl3Bank;
 const affineParamsFromGeometry = @import("../../../sdk/quant/params.zig").affineParamsFromGeometry;
 const maxAbsDiffF32 = @import("../../../sdk/testing/parity.zig").maxAbsDiffF32;
-const HybridMlpWeights = @import("../forward/hybrid.zig").HybridMlpWeights;
+const HybridMlpWeights = @import("../forward/layered.zig").HybridMlpWeights;
 const testing = @import("../kv/cache.zig").testing;
 const FullAttnWeights = @import("../layer_weights.zig").FullAttnWeights;
 const QW = @import("../layer_weights.zig").QW;
@@ -212,15 +212,6 @@ pub fn scaleTriple(w: *mlx.mlx_array, sc: *mlx.mlx_array, bi: *mlx.mlx_array, k:
     }
 }
 
-/// Scales fetch for a layer weight that may be plain bf16. Absent ⇒ null-ctx,
-/// which `qmatmulBits` reads as "dense, already pre-transposed". Dense
-/// checkpoints (mlx-community/LFM2.5-2.6B-bf16) ship none at all; mixed
-/// checkpoints leave a subset of layers unquantized. Same contract as the
-/// standard/MoE layer-init paths.
-pub fn getLayerScaleOpt(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8) mlx.mlx_array {
-    return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
-}
-
 /// Append every non-null mlx_array field of a plain weight struct.
 pub fn appendStructArrays(vec: mlx.mlx_vector_array, w: anytype) void {
     inline for (comptime structFields(@TypeOf(w.*))) |field| {
@@ -366,22 +357,6 @@ pub fn splitPackedGateUp(arr: mlx.mlx_array, s: mlx.mlx_stream) !struct { gate: 
     try mlx.check(mlx.mlx_contiguous(&up, up_view, false, s));
 
     return .{ .gate = gate, .up = up };
-}
-
-/// `<prefix>.<base>` as a (weight, scales, biases) triple. A dense tensor leaves scales and biases empty; a
-/// quantized one with a biased mode must carry its biases.
-pub fn getQuantTriple(weights: *const Weights, buf: *[256]u8, prefix: []const u8, base: []const u8, bias_mandatory: bool) error{MissingWeight}!struct { w: mlx.mlx_array, s: mlx.mlx_array, b: mlx.mlx_array } {
-    const w = try requireNamedWeight(weights, buf, prefix, base, "weight");
-    const sc = getNamedWeight(weights, buf, prefix, base, "scales") orelse return .{ .w = w, .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() };
-    const bi = if (bias_mandatory) try requireNamedWeight(weights, buf, prefix, base, "biases") else getNamedWeight(weights, buf, prefix, base, "biases") orelse mlx.mlx_array_new();
-    return .{ .w = w, .s = sc, .b = bi };
-}
-
-pub fn requireNamedWeight(weights: *const Weights, buf: *[256]u8, prefix: []const u8, base: []const u8, suffix: []const u8) error{MissingWeight}!mlx.mlx_array {
-    return getNamedWeight(weights, buf, prefix, base, suffix) orelse {
-        log.err("MISSING WEIGHT: {s}.{s}.{s}\n", .{ prefix, base, suffix });
-        return error.MissingWeight;
-    };
 }
 
 pub fn getWeightFmt(weights: *const Weights, buf: *[256]u8, comptime fmt: []const u8, prefix: []const u8) error{MissingWeight}!mlx.mlx_array {
@@ -556,12 +531,6 @@ fn expertLeaf(buf: []u8, container: []const u8, proj: []const u8, leaf: []const 
     return std.fmt.bufPrint(buf, "{s}.{s}.{s}", .{ container, proj, leaf }) catch unreachable;
 }
 
-/// `<dir>.<name>`, or `<name>` for a tensor that sits directly in the layer.
-pub fn inDir(buf: []u8, dir: []const u8, name: []const u8) []const u8 {
-    if (dir.len == 0) return name;
-    return std.fmt.bufPrint(buf, "{s}.{s}", .{ dir, name }) catch unreachable;
-}
-
 /// Build a "<container>.<leaf>" layer-weight suffix into `buf`. Used where the
 /// stacked-MoE-expert container is named differently across converters — hy_v3
 /// experts are `mlp.experts.*` in ox-ox-style MLX builds and `mlp.switch_mlp.*`
@@ -590,36 +559,6 @@ pub fn getLayerScaleOrEmpty(weights: *const Weights, buf: *[256]u8, prefix: []co
 ///   tensors ship no biases, but mixed QAT checkpoints override some layers
 ///   to affine (e.g. shared MLP at 8-bit/gs64) and those overrides DO carry
 ///   biases that the affine matmul needs.
-/// Row-slice a fused [q | k | v] tensor (weight, scales or biases — all are
-/// [rows, ...]) into three materialized arrays owned by `owned`. A dense
-/// weight (`transpose`) is stored pre-transposed like every other bf16
-/// projection, so the caller must not run maybeTransposeForBf16 on it. An
-/// empty (null-ctx) input yields three empty arrays.
-pub fn splitFusedQkvRows(arr: mlx.mlx_array, q_rows: u32, kv_rows: u32, transpose: bool, owned: *std.ArrayList(mlx.mlx_array), allocator: std.mem.Allocator, s: mlx.mlx_stream) ![3]mlx.mlx_array {
-    if (arr.ctx == null) return .{ mlx.mlx_array_new(), mlx.mlx_array_new(), mlx.mlx_array_new() };
-    const shape = mlx.getShape(arr);
-    if (shape.len != 2 or shape[0] != @as(c_int, @intCast(q_rows + 2 * kv_rows))) return error.BadFusedQkvShape;
-    const bounds = [_]c_int{ 0, @intCast(q_rows), @intCast(q_rows + kv_rows), shape[0] };
-    var out: [3]mlx.mlx_array = undefined;
-    for (0..3) |i| {
-        const start = [_]c_int{ bounds[i], 0 };
-        const stop = [_]c_int{ bounds[i + 1], shape[1] };
-        const strides = [_]c_int{ 1, 1 };
-        var view = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(view);
-        try mlx.check(mlx.mlx_slice(&view, arr, &start, 2, &stop, 2, &strides, 2, s));
-        var part = mlx.mlx_array_new();
-        if (transpose) {
-            part = try transposeBf16Weight(view, s);
-        } else {
-            try mlx.check(mlx.mlx_contiguous(&part, view, false, s));
-        }
-        try owned.append(allocator, part);
-        out[i] = part;
-    }
-    return out;
-}
-
 pub fn getLayerBias(weights: *const Weights, buf: *[256]u8, prefix: []const u8, layer: u32, suffix: []const u8, config: *const ModelConfig) error{MissingWeight}!mlx.mlx_array {
     // A pack with no `quantization` block (Sushi's) still stores affine trunk linears beside dense ones.
     if (config.quant_bits == 0) return getLayerWeightOpt(weights, buf, prefix, layer, suffix) orelse mlx.mlx_array_new();
@@ -939,11 +878,9 @@ test "no layer-init path DEMANDS quantization scales" {
         @embedFile("layers_dense.zig") ++
         @embedFile("../../../sdk/quant/mxfp8.zig") ++
         @embedFile("layers_layered.zig") ++
-        @embedFile("layers_hybrid.zig") ++
-        @embedFile("../../../plugins/hy_v3/load.zig") ++
-        @embedFile("../../../plugins/bert/load.zig");
+        @embedFile("../../../plugins/hy_v3/load.zig");
     const mandatory = "getLayer" ++ "Weight(weights,";
-    const optional = "getLayer" ++ "ScaleOpt(weights,";
+    const optional = "getWeight" ++ "AtOpt(weights,";
     const scales = ".scales" ++ "\")";
     try std.testing.expect(std.mem.indexOf(u8, src, optional) != null); // the scan can see a hit
 

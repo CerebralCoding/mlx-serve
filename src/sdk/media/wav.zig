@@ -78,9 +78,34 @@ pub fn encodePcm16(
     return buf;
 }
 
+/// Decode a 16-bit PCM mono WAV → f32 samples in [-1, 1]. Scans the RIFF
+/// chunks for `data` (so a non-canonical header with extra chunks still works);
+/// assumes mono (the app normalizes reference audio to 24 kHz mono int16).
+pub fn decodePcm16Mono(allocator: std.mem.Allocator, wav: []const u8) ![]f32 {
+    if (wav.len < 44 or !std.mem.eql(u8, wav[0..4], "RIFF") or !std.mem.eql(u8, wav[8..12], "WAVE")) return error.BadWav;
+    var pos: usize = 12;
+    while (pos + 8 <= wav.len) {
+        const cid = wav[pos .. pos + 4];
+        const csize: usize = std.mem.readInt(u32, wav[pos + 4 ..][0..4], .little);
+        if (std.mem.eql(u8, cid, "data")) {
+            const start = pos + 8;
+            const end = @min(start + csize, wav.len);
+            const n = (end - start) / 2;
+            const out = try allocator.alloc(f32, n);
+            for (0..n) |i| {
+                const v = std.mem.readInt(i16, wav[start + i * 2 ..][0..2], .little);
+                out[i] = @as(f32, @floatFromInt(v)) / 32768.0;
+            }
+            return out;
+        }
+        pos += 8 + csize + (csize & 1); // chunks are word-aligned
+    }
+    return error.NoDataChunk;
+}
+
 /// A decoded WAV: interleaved f32 samples in [-1, 1] plus the file's real
-/// format metadata (unlike the legacy mono-PCM16 fast path in gen.zig, which
-/// assumes the app pre-normalized the clip).
+/// format metadata (unlike `decodePcm16Mono`, which assumes the app
+/// pre-normalized the clip).
 pub const Decoded = struct {
     pcm: []f32,
     channels: u16,

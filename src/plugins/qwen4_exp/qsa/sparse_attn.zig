@@ -1,5 +1,4 @@
-//! plugins/qwen4_exp/qsa/sparse_attn, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns QSA_ATTN_CONSTS, QSA_ATTN_Q_CONSTS, QSA_ATTN_ROW_GRID, QSA_ATTN_Q_STRIDES, QSA_ATTN_D_STRIDES, QSA_ATTN_ROW, and 67 more.
+//! QSA sparse attention over the selected blocks (`qsaSparseAttn`): the tile, row and slot kernels and their merge.
 
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
@@ -109,25 +108,25 @@ const QSA_ATTN_D_VLOAD = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_d_vloa
 /// Shared: online softmax, P@V, and the partials for the merge.
 const QSA_ATTN_TILE_CLOSE = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_tile_close.metal");
 
-const QSA_ATTN_Q_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_Q_CONSTS ++ QSA_ATTN_ROW_GRID ++ QSA_ATTN_Q_STRIDES ++ QSA_ATTN_ROW ++
+pub const QSA_ATTN_Q_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_Q_CONSTS ++ QSA_ATTN_ROW_GRID ++ QSA_ATTN_Q_STRIDES ++ QSA_ATTN_ROW ++
     QSA_ATTN_Q_BASES ++ QSA_ATTN_TILE_OPEN ++ QSA_ATTN_Q_KLOAD ++ QSA_ATTN_SCORES ++ QSA_ATTN_Q_VLOAD ++ QSA_ATTN_TILE_CLOSE;
 
 /// The dense (bf16 KV) variant: the same split pass with plain device loads, so a dense
 /// cache keeps the verify kernel's split-K grid (never `gatherQsa256`'s prefill grid).
-const QSA_ATTN_D_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_ROW_GRID ++ QSA_ATTN_D_STRIDES ++ QSA_ATTN_ROW ++
+pub const QSA_ATTN_D_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_ROW_GRID ++ QSA_ATTN_D_STRIDES ++ QSA_ATTN_ROW ++
     QSA_ATTN_D_BASES ++ QSA_ATTN_TILE_OPEN ++ QSA_ATTN_D_KLOAD ++ QSA_ATTN_SCORES ++ QSA_ATTN_D_VLOAD ++ QSA_ATTN_TILE_CLOSE;
 
 /// The slot-batched quantized split pass: slot `bb` on grid z, `meta` = {Hq, Hk, KB, then kv length and
 /// parent capacity per slot}.
 const QSA_ATTN_SLOTS_GRID = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_slots_grid.metal");
 
-const QSA_ATTN_SLOTS_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_Q_CONSTS ++ QSA_ATTN_SLOTS_GRID ++ QSA_ATTN_ROW ++ QSA_ATTN_Q_BASES ++
+pub const QSA_ATTN_SLOTS_SOURCE = QSA_ATTN_CONSTS ++ QSA_ATTN_Q_CONSTS ++ QSA_ATTN_SLOTS_GRID ++ QSA_ATTN_ROW ++ QSA_ATTN_Q_BASES ++
     QSA_ATTN_TILE_OPEN ++ QSA_ATTN_Q_KLOAD ++ QSA_ATTN_SCORES ++ QSA_ATTN_Q_VLOAD ++ QSA_ATTN_TILE_CLOSE;
 
 /// msv_attn_qsa256_qmerge: the split-K reduction, one threadgroup per (q head, query row).
 /// Standard flash-decoding merge in the log2 domain; `l_j == 0` marks an empty split and is
 /// skipped. NSPLIT and qL ride `pacc_shape`, so the config depends on nothing per token.
-const QSA_ATTN_MERGE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_merge.metal");
+pub const QSA_ATTN_MERGE_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_attn_merge.metal");
 
 /// Measured split count (M5 Max, qwen4_exp, kv 62k, 8-bit KV, 12 counterbalanced boots):
 /// every count 8..64 beats the union gather by 5-13%, only S=6's 16-vs-32 clears the noise

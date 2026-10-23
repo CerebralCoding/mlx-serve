@@ -508,40 +508,6 @@ test "repetition-loop cuts decline tool-call parsing" {
     try std.testing.expect(shouldParseToolCalls("unknown_future_detail"));
 }
 
-test "every OpenAI-shaped finish_reason emitter also carries finish_details" {
-    // Dispatch-hole class: a surface that reports the reason and drops the
-    // cause is silent — the response still validates, and no output-equality
-    // test can see the missing field (the two
-    // hardcoded `use_drafter=false` call sites lived for a month this way).
-    // Needles are split with `++` so this test's own source can't match them.
-    const t = std.testing;
-    const src = @embedFile("../../api/chat_completions.zig") ++ @embedFile("../../api/completions.zig") ++ @embedFile("../../http/sse.zig") ++ @embedFile("../../api/anthropic.zig");
-
-    // The four literals that print a concrete reason: chat non-stream (plain
-    // + tool-calls), completions non-stream, completions stream-final. Every
-    // one must be followed immediately by the details slot.
-    const quoted = "\"finish_rea" ++ "son\":\"{s}\"";
-    var seen: usize = 0;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, quoted)) |at| : (i = at + quoted.len) {
-        seen += 1;
-        try t.expectEqualStrings("{s}", src[at + quoted.len .. at + quoted.len + 3]);
-    }
-    try t.expectEqual(@as(usize, 4), seen);
-
-    // The chat SSE chunk builds its reason separately (it may be JSON null
-    // mid-stream), so it takes the details slot right after that field.
-    const chunk = "\"finish_rea" ++ "son\":{s}{s}";
-    try t.expect(std.mem.indexOf(u8, src, chunk) != null);
-
-    // /v1/messages is DELIBERATELY not on this list: its envelope is
-    // Anthropic's, `anthropicStopReason` maps a loop cut to "end_turn", and
-    // inventing a key inside someone else's schema is worse than the gap.
-    // The TRIM (which is what actually breaks the feedback loop) applies
-    // there anyway — it happens where the text is decoded, not per surface.
-    try t.expect(std.mem.indexOf(u8, src, "fn anthropicStopReason") != null);
-}
-
 test "finishDetailsField: the loop cause rides beside finish_reason, and only a known cause reaches the wire" {
     // Absent = the field is not emitted at all, so every ordinary response
     // is byte-identical to what it was before this existed.

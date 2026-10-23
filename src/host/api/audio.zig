@@ -10,8 +10,9 @@ const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const transcription_mod = @import("audio/transcription.zig");
 const forced_align_mod = @import("../../plugins/qwen3_asr/forced_align.zig");
-const diarization_mod = @import("../../plugins/nemotron_diarization/diarization.zig");
 const LoadedModel = model_registry_mod.LoadedModel;
+const PluginEngine = @import("../media_jobs/plugin/engine.zig").Engine;
+const plugin_http = @import("../media_jobs/plugin/http.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const Stopwatch = io_util.Stopwatch;
 const http_server = @import("../http/server.zig");
@@ -86,6 +87,7 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
     defer if (speaker_probs) |p| allocator.free(p);
     var diarizer: ?*LoadedModel = null;
     defer if (diarizer) |m| http_server.global_scheduler.?.release(m);
+    var speakers: u32 = 0;
     if (form.format == .diarized_json) {
         const id = (findCompanion("nemotron_diarization") orelse {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "diarized_json needs Nemotron 3 Diarization, which is not on disk or did not load: download " ++ DIARIZER_REPO ++ " beside the ASR model", 400);
@@ -95,9 +97,9 @@ pub fn handleTranscriptions(allocator: std.mem.Allocator, stream: *Conn, body: [
             log.warn("  diarizer {s} did not load ({s}): one speaker\n", .{ id, @errorName(err) });
             break :blk null;
         };
-        if (diarizer) |m| speaker_probs = (try diarizeClip(allocator, stream, m, pcm)) orelse return;
+        if (diarizer) |m| speaker_probs = (try diarizeClip(allocator, stream, m, pcm, &speakers)) orelse return;
     }
-    const who: ?transcription_mod.Activity = if (speaker_probs) |p| .{ .probs = p, .speakers = diarizer.?.diarization_engine.?.cfg.speakers } else null;
+    const who: ?transcription_mod.Activity = if (speaker_probs) |p| .{ .probs = p, .speakers = speakers } else null;
 
     const piece_seconds: usize = if (aligner != null) transcription_mod.ALIGN_MAX_SECONDS else TRANSCRIPTION_MAX_SECONDS;
     const ends = try transcription_mod.splitPoints(allocator, pcm, piece_seconds * transcription_mod.SAMPLE_RATE);
@@ -332,8 +334,8 @@ fn alignJobRun(ctx: *anyopaque) void {
 
 /// Speaker activity over `pcm` from the diarizer `lm`, on the inference thread.
 /// Null when it already sent the error.
-fn diarizeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm: []const f32) !?[]f32 {
-    var job = DiarizeJob{ .allocator = allocator, .engine = lm.diarization_engine.?, .pcm = pcm };
+fn diarizeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pcm: []const f32, speakers: *u32) !?[]f32 {
+    var job = DiarizeJob{ .allocator = allocator, .plugin = lm.media_plugin, .pcm = pcm };
     var timer = Stopwatch.init(stream.io);
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = diarizeJobRun, .model = lm };
     http_server.global_scheduler.?.runGeneration(&req) catch |err| {
@@ -345,21 +347,24 @@ fn diarizeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel, pc
         try sendErrorResponse(allocator, stream, "500 Internal Server Error", "server_error", "speaker diarization failed", 500);
         return null;
     };
+    speakers.* = job.speakers;
     log.info("  diarized {d:.1} s ({d}ms)\n", .{ @as(f64, @floatFromInt(pcm.len)) / transcription_mod.SAMPLE_RATE, timer.read() / std.time.ns_per_ms });
     return probs;
 }
 
 const DiarizeJob = struct {
     allocator: std.mem.Allocator,
-    engine: *diarization_mod.Engine,
+    /// The diarizer's plugin (`media_plugin`).
+    plugin: ?*PluginEngine,
     pcm: []const f32,
     probs: ?[]f32 = null,
+    speakers: u32 = 0,
 };
 
 fn diarizeJobRun(ctx: *anyopaque) void {
     const job: *DiarizeJob = @ptrCast(@alignCast(ctx));
-    job.probs = job.engine.diarize(job.allocator, job.pcm) catch |err| {
-        log.err("  diarization failed: {s}\n", .{@errorName(err)});
-        return;
-    };
+    const p = job.plugin orelse return;
+    const r = plugin_http.diarize(p, job.allocator, job.pcm) orelse return;
+    job.probs = r.probs;
+    job.speakers = r.speakers;
 }

@@ -47,7 +47,7 @@ fn naxHere() bool {
 
 /// `#include` for the tensor-op primitives; the JIT compiles at Metal 4 on a
 /// macOS 26 host, which is the only place `formFor` lets this route run.
-const HEADER = kernelSource("kernels/common/mpp_tensor.metal");
+pub const HEADER = kernelSource("kernels/common/mpp_tensor.metal");
 
 /// 9..16 activation rows, one 64-column block per threadgroup: simdgroups
 /// (0, 1) take its low 32 columns and (2, 3) its high 32, each pair splitting
@@ -59,7 +59,7 @@ const HEADER = kernelSource("kernels/common/mpp_tensor.metal");
 /// being consumed. Every 16-k step dequantizes into the tensor unit's right
 /// operand and runs a 16x32x16 multiply-accumulate, so the codes never land in
 /// memory and the affine scale is already in the product.
-const NARROW_SOURCE = kernelSource("kernels/qmm/qmv_nax2_narrow.metal");
+pub const NARROW_SOURCE = kernelSource("kernels/qmm/qmv_nax2_narrow.metal");
 
 var narrow_kernel: ?mlx.mlx_fast_metal_kernel = null;
 

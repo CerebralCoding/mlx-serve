@@ -1,0 +1,36 @@
+# bailing_hybrid plugin
+
+Owns `bailing_hybrid` (Ling 3.0, BailingMoeV3: tiny and flash packs, mlx-lm's layout and oMLX's). Reads its config
+with GLM-5.3-Flash's readers and loads through `glm5_next/host.zig`; its own parse arm, forward and MLA.
+
+- Parse (`config.zig`, MLX-free): `layer_group_size` -> `full_attention_interval`, KDA heads = attention heads, the
+  bounded-sigmoid gate (`kda_lower_bound` < 0 REPLACES softplus), `no_kda_lora`/`use_kda_lora`, MLA geometry
+  (`qk_head_dim` must equal nope + rope), head-wise sigmoid out gate, `rope_interleave`, grouped sigmoid routing
+  (`n_group`/`topk_group`), one ungated shared expert. Equal to the engine's parse on both Ling fixtures
+  (`glm5_next/model_config.zig`). Refuses (as the engine does): KDA LoRA gates, a lower bound >= 0, `use_mla_nope`,
+  value/up-proj norms and nGPT, a non-sigmoid score, a gate granularity other than head-wise, no `kv_lora_rank`.
+- Forward (`table_forward.zig`, a copy of `forwardMoeWith`'s bailing arms): KDA through `slots.kda`, naive MLA
+  (`mla.zig`, a copy of `sdk/blocks/attention/mla.zig`) appending `[B, H, S, nope+rope]` keys and `[B, H, S, v]`
+  values per head through `CacheOps`, the residual + norm fusions in the legacy order, captures = the layer output.
+  One slot at a time (the engine never batches it: `kda_vector_gate`).
+- Proof: `glm5_next/proof_test.zig` (`expectSteps` on `fixture.lingFiles`): logits, captures, KDA states and verify
+  captures bit-equal to the legacy forward. Conformance passes on the same pack.
+- Bill: `kv_per_token` per attention head (MLA expands the latent before the write), bf16 `ssm_checkpoint`,
+  `prefill_score_width` = nope + rope.
+
+Served (`engines/mlx/plugin/served.zig`; `glm5_next/served_test.zig`: steps and greedy through the driver). DFlash via
+`trunk_weight` + captures. No MTP head: the legacy path serves none (a NextN `eh_proj` head binds to hy_v3/nemotron_h
+only, `MtpModel.bind`), so a Ling-flash head is a new feature with no oracle yet.
+
+## Rules (from root AGENTS.md)
+- KDA = GDN with a PER-CHANNEL gate (the `_vec` kernel); per-head vs per-channel gating is an INDEXING contract.
+- A lower bound may REPLACE the formula (`kdaUsesBoundedGate`).
+- MLA = naive DeepSeek-V3 with an ASYMMETRIC K192/V128 cache; `--kv-quant 4|8` serve it.
+- The depthwise convs ship flat (`<x>_conv1d.weight`) in the public MLX packs, nested in the reference: both bind.
+- Thinking ON; GLM tool tags.
+
+## Known issues
+- A capturing verify leaves the last row of `spec_state_seq` unwritten by design (the final state is its own output):
+  the proof compares the rows rollback reads.
+- No `[dtype-trace]`, ladder or ANE-prefill diagnostics on the table forward (the dense layer still asks
+  `denseMLPMaybeAne`, so `--ane-prefill` behaves as legacy).

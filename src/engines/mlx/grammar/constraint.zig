@@ -1,5 +1,6 @@
 //! Grammar constraints on generation: schema state, forced transitions and their commit.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const tokenizer_mod = @import("../../../host/tokenizer/tokenizer.zig");
@@ -259,7 +260,7 @@ test "forced recovery is committed and counted exactly once" {
 
 test "constrained generation returns one logprob entry per token, paired with that token" {
     // Bar: a json_schema request with logprobs gets an entry for every returned token, describing it.
-    const path = std.c.getenv("LOGPROBS_TEST_MODEL") orelse return error.SkipZigTest;
+    const path = env.get(.LOGPROBS_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

@@ -1,4 +1,5 @@
 const std = @import("std");
+const env = @import("../../../env.zig");
 const testing = std.testing;
 
 pub const MAX_ROWS = 8;
@@ -428,7 +429,7 @@ pub fn enabledFromEnv(raw: ?[*:0]const u8) bool {
 pub fn enabled() bool {
     if (enabled_override) |value| return value;
     if (enabled_cache) |value| return value;
-    const value = enabledFromEnv(std.c.getenv("MLX_SERVE_MTP_GROUP_PLANNER"));
+    const value = enabledFromEnv(env.get(.MLX_SERVE_MTP_GROUP_PLANNER));
     enabled_cache = value;
     return value;
 }

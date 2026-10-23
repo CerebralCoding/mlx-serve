@@ -6,6 +6,7 @@
 //! (bit-identical to one dispatch), so a pass's K/V stays in the on-chip caches;
 //! those passes also split the head dims over simdgroup pairs.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const Scope = @import("../../../mlx/scope.zig").Scope;
@@ -17,7 +18,7 @@ const PASS_KEYS: c_int = 8192;
 const PASS_MIN_GROUPS: c_int = 512;
 const MAX_PASSES = 64;
 
-const SOURCE = kernelSource("kernels/attention/nax_attention_entry.metal");
+pub const SOURCE = kernelSource("kernels/attention/nax_attention_entry.metal");
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;
@@ -78,7 +79,7 @@ pub fn attention(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.m
 }
 
 /// The passes between consecutive `edges` (key blocks) at head-dim split `wn`.
-fn dispatch(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, window: c_int, sinks: ?mlx.mlx_array, edges: []const c_int, wn: c_int) !mlx.mlx_array {
+pub fn dispatch(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, window: c_int, sinks: ?mlx.mlx_array, edges: []const c_int, wn: c_int) !mlx.mlx_array {
     const kern = try getKernel();
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
@@ -162,7 +163,7 @@ fn dispatch(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_ar
 /// 32-key block after removing each KV head's mean key (a constant offset on
 /// every key moves each score row by a constant, which softmax ignores).
 /// P and V stay in the activation dtype. Opt-in and lossy (`MLX_SERVE_INT8_QK`).
-const SOURCE_256Q8 = kernelSource("kernels/attention/nax_attention_256q8_entry.metal");
+pub const SOURCE_256Q8 = kernelSource("kernels/attention/nax_attention_256q8_entry.metal");
 const Q8_WM: c_int = 4;
 const Q8_BQ: c_int = 16 * Q8_WM;
 
@@ -183,7 +184,7 @@ pub fn int8QkOn(cli: bool, raw: ?[*:0]const u8) bool {
 }
 
 fn int8QkEnabled() bool {
-    if (int8_qk_env == null) int8_qk_env = int8QkOn(int8_qk_cli, std.c.getenv("MLX_SERVE_INT8_QK"));
+    if (int8_qk_env == null) int8_qk_env = int8QkOn(int8_qk_cli, env.get(.MLX_SERVE_INT8_QK));
     return int8_qk_env.?;
 }
 
@@ -215,7 +216,7 @@ pub fn attention256Int8(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v
     return out;
 }
 
-fn attention256Int8Impl(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
+pub fn attention256Int8Impl(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s) or !@import("../../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return null;
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
     const qs = mlx.getShape(q);

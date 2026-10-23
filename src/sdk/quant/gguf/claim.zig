@@ -1,11 +1,12 @@
-//! Bridge to lib/mlx-serve-gguf: GGUF files served on the regular MLX path.
+//! GGUF files served on the regular MLX path.
 //! The file stands in for a model dir: config.json, tokenizer.json,
 //! tokenizer_config.json and generation_config.json are rebuilt from its
 //! metadata, and its tensors load as raw ggml blocks that
 //! `Transformer.qmatmul` runs through custom kernels.
 //! Anything the module can't serve stays with the embedded engines.
 const std = @import("std");
-const gguf = @import("mlx_serve_gguf");
+const env = @import("../../../env.zig");
+const gguf = @import("root.zig");
 const log = @import("../../../host/log.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const model_discovery = @import("../../../host/registry/discovery.zig");
@@ -100,8 +101,8 @@ test "declines everything that is not a servable GGUF" {
     }
 }
 
-test "real GGUF: stands in for a model dir, and --engine turns it off (set MLX_SERVE_GGUF_TEST_MODEL)" {
-    const model = std.mem.span(std.c.getenv("MLX_SERVE_GGUF_TEST_MODEL") orelse return error.SkipZigTest);
+test "real GGUF: stands in for a model dir, and --engine turns it off (a real GGUF, env-gated)" {
+    const model = std.mem.span(env.get(.MLX_SERVE_GGUF_TEST_MODEL) orelse return error.SkipZigTest);
     const io = std.testing.io;
     const allocator = std.testing.allocator;
     const model_mod = @import("../../../engines/mlx/model.zig");
@@ -128,4 +129,8 @@ test "real GGUF: stands in for a model dir, and --engine turns it off (set MLX_S
     try std.testing.expect(weightBytes(io, model).? > 1 << 20);
     enabled = false;
     try std.testing.expectEqual(@as(?[]u8, null), servablePath(io, allocator, model));
+}
+
+test {
+    _ = gguf;
 }

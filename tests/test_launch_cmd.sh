@@ -1,37 +1,18 @@
 #!/bin/bash
-# Integration test: `mlx-serve launch <agent>` (issue #188) — configures and
-# launches a third-party coding agent against the local server, ollama-style.
+# test_launch_cmd.sh — `mlx-serve launch <agent>`: an unknown agent errors naming the choices; no server + --no-start
+# prints how to start one (exit 1, never a hang); against a live server `--print` for omp, codex, claude, opencode2,
+# opencode (2.x detected by `--version`) and zcode writes configs that carry the server's ADVERTISED context, never a
+# hardcoded one (omp contextWindow + PI_CODING_AGENT_DIR; codex `-c model_context_window` + wire_api "responses" on
+# the launch line, nothing in CODEX_HOME; claude CLAUDE_CODE_MAX_CONTEXT_TOKENS + the derived output budget; zcode
+# provider_config.json contextWindow + baseUrl); extras after `--` ride the invocation line shell-quoted. Configs land
+# in ~/.mlx-serve/<agent>/, never a user's real agent config.
 #
-# Pins:
-#   [1] unknown agent → error naming the choices
-#   [2] no server + --no-start → instructions to start one, exit 1
-#   [3] launch omp --print against a live server: script exports the pi-spelled
-#       agent dir var, targets the served model, and the written models.yml
-#       carries the server's ADVERTISED context (never a hardcoded one)
-#   [4] launch codex --print: the launch line rides -c key=value overrides
-#       (model_providers.mlx.* → /v1/responses, wire_api = "responses") with
-#       the advertised context, and NOTHING is written into CODEX_HOME
-#   [5] launch claude --print: env-only script, no config file, ADVERTISED
-#       context declared verbatim (CLAUDE_CODE_MAX_CONTEXT_TOKENS — without it
-#       Claude Code assumes 200k and auto-compacts there) + the derived output
-#       budget
-#   [6] extra args after -- ride the agent invocation line
-#   [7] launch opencode2 --print (compatibility alias): XDG_CONFIG_HOME under
-#       the dedicated dir, standalone invocation of the RESOLVED binary
-#       (v2 `opencode` when installed, else legacy `opencode2`), cli.json
-#       carries metricsUrl = base + /metrics.json, plugin has tui.tsx
-#   [8] launch opencode --print detects `opencode --version` and routes: a
-#       2.x install gets the v2 arm (standalone + model pinned in the config)
-#       and names the detected version on stderr
-#   [9] launch zcode --print: script exports the dedicated data dir + provider
-#       config file and invokes zcode; provider_config.json targets base + /v1
-#       with the ADVERTISED context for the served model
+#   ./tests/test_launch_cmd.sh [model_dir] [port]   # any small chat model (default Qwen3.5-0.8B); SKIPs without one
 #
-# Most configs land in the same dedicated ~/.mlx-serve/<agent>/ dirs the app's
-# launcher writes (never a user's real agent config) — asserted per agent.
-# codex writes nothing: CODEX_HOME points at an empty temp dir that must stay empty.
+# Hermetic twins: builder/budget/arg-parse tests in launch.zig; Swift twin CLISetupInstructionsTests.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 
 CODEX_HOME=$(mktemp -d)
 export CODEX_HOME
@@ -81,11 +62,7 @@ mkdir -p "${TMPDIR:?set TMPDIR to a workspace scratch directory}"
 SERVER_PID=$!
 cleanup() { kill $SERVER_PID 2>/dev/null; wait $SERVER_PID 2>/dev/null; rm -rf "$CODEX_HOME"; }
 trap cleanup EXIT
-for i in $(seq 1 40); do
-    curl -sf "$BASE/health" >/dev/null 2>&1 && break
-    [ "$i" -eq 40 ] && { echo "FAIL: server did not start"; exit 1; }
-    sleep 1
-done
+srv_wait_health "$BASE" 40 1 || { echo "FAIL: server did not start"; exit 1; }
 
 MODEL_ID=$(basename "$MODEL_DIR")
 ADV_CTX=$(curl -s "$BASE/v1/models" | python3 -c '

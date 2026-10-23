@@ -1,6 +1,7 @@
 //! Ollama sink, early routes, quantization json; tags, show, pull, chat, generate, embed
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const log = @import("../log.zig");
 const model_registry_mod = @import("../registry/registry.zig");
@@ -17,6 +18,7 @@ const http_server = @import("../http/server.zig");
 const request_model = @import("request_model.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
+const isRoute = @import("../http/router.zig").isRoute;
 const resolveRequestModelId = @import("request_model.zig").resolveRequestModelId;
 const getEffectiveContextLength = @import("../../engines/mlx/admission/context.zig").getEffectiveContextLength;
 const handleEmbeddings = @import("embeddings.zig").handleEmbeddings;
@@ -51,28 +53,28 @@ pub fn sendOllamaError(allocator: std.mem.Allocator, stream: *Conn, status: []co
 pub fn handleOllamaEarly(allocator: std.mem.Allocator, stream: *Conn, method: []const u8, path: []const u8, body: []const u8) !bool {
     const is_get = std.mem.eql(u8, method, "GET");
     const is_post = std.mem.eql(u8, method, "POST");
-    if ((is_get or std.mem.eql(u8, method, "HEAD")) and std.mem.eql(u8, path, "/api/version")) {
+    if ((is_get or std.mem.eql(u8, method, "HEAD")) and isRoute(path, "/api/version")) {
         log.debug("{s} /api/version -> 200\n", .{method});
         const vbody = try std.fmt.allocPrint(allocator, "{{\"version\":\"{s}\"}}", .{build_options.version});
         defer allocator.free(vbody);
         try sendResponse(stream, "200 OK", "application/json", if (is_get) vbody else "");
         return true;
     }
-    if (is_get and std.mem.eql(u8, path, "/api/tags")) {
+    if (is_get and isRoute(path, "/api/tags")) {
         log.debug("GET  /api/tags -> 200\n", .{});
         try handleOllamaTags(allocator, stream, false);
         return true;
     }
-    if (is_get and std.mem.eql(u8, path, "/api/ps")) {
+    if (is_get and isRoute(path, "/api/ps")) {
         log.debug("GET  /api/ps -> 200\n", .{});
         try handleOllamaTags(allocator, stream, true);
         return true;
     }
-    if (is_post and std.mem.eql(u8, path, "/api/show")) {
+    if (is_post and isRoute(path, "/api/show")) {
         try handleOllamaShow(allocator, stream, body);
         return true;
     }
-    if (is_post and std.mem.eql(u8, path, "/api/pull")) {
+    if (is_post and isRoute(path, "/api/pull")) {
         try handleOllamaPull(allocator, stream, body);
         return true;
     }
@@ -348,7 +350,7 @@ fn handleOllamaPull(allocator: std.mem.Allocator, stream: *Conn, body: []const u
         try sendOllamaError(allocator, stream, "404 Not Found", "unknown model name; use a known short name or a HuggingFace 'org/repo' id");
         return;
     };
-    const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+    const home = std.mem.span(env.get(.HOME) orelse "/tmp");
     const dest = try cli_mod.modelDestPath(allocator, home, resolved.repo);
     defer allocator.free(dest);
 

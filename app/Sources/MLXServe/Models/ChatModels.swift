@@ -533,6 +533,15 @@ struct ModelInfo {
     /// id is `<model>@<name>` and the server proxies — so `lanPeer` is set
     /// too; this field only decides the picker heading and the label.
     var provider: String? = nil
+    /// `agent_budget`: what an agent CLI declares for this model, as the server
+    /// computes it (`src/host/launch/budget.zig`). nil on a non-chat row or an older server.
+    var agentBudget: AgentBudget.Budget? = nil
+    /// `modality`: a media row's create pane ("image", "speech", "music", "sound",
+    /// "video", "3d", "decisions", "diarization"); nil for a language model.
+    var modality: String? = nil
+    /// `engines`: what can serve this pack ("mlx", "ane", "ds4", "llama") — the
+    /// Model Settings engine picker's choices. Empty on older servers.
+    var engines: [String] = []
 
     /// Whether this LAN-mirrored entry serves `capability` — the tray
     /// empty-state and the "On Your Network" pickers count through this, not

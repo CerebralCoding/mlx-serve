@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/load, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns loadHcWeights, loadPleWeights.
+//! Loads one hyper-connection block (`loadHcWeights`, its 1/hc fold into the down and inject projections) and the
+//! PLE layer's weights (`loadPleWeights`).
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");

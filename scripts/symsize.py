@@ -10,7 +10,7 @@ than FLAG instances is flagged (plan L12).
 import collections, json, os, re, subprocess, sys
 
 FLAG = 50
-TOPS = ["src", "lib/mlx-stream/src", "lib/mlx-stream/sdk", "lib/sushi/src", "lib/mlx-serve-gguf/src"]
+TOPS = ["src"]
 SUFFIX = re.compile(r"__(func|anon|struct|union|enum|opaque)_\d+")
 
 

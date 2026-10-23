@@ -2,11 +2,11 @@
 //! Owns QKV_DEC_NT, qkvDecBlockFor, QKV_DEC_KERNEL_SOURCE, qkv_dec_kernel_cached, getQkvDecKernel, qkv_dec_override, and 52 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const kv_quant = @import("../../../engines/mlx/cache/kv_quant.zig");
 const log = @import("../../../host/log.zig");
-const diagEnvOn = @import("../../../engines/mlx/env_transformer.zig").diagEnvOn;
 const KVCache = @import("../../../engines/mlx/kv/cache.zig").KVCache;
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
 const QSA_SCORE_KERNEL_HEADER = @import("../../../plugins/qwen4_exp/qsa/score.zig").QSA_SCORE_KERNEL_HEADER;
@@ -78,7 +78,7 @@ fn qkvDecBlockFor(gqa: c_int, dk: c_int) ?c_int {
 // flash-attention split-KV carry — merged by a handful of KB-scale mlx ops
 // in the dispatch wrapper. A fully-masked block clamps its max to -1e30 so
 // exp never sees (-inf) - (-inf); its l = 0 partial merges to zero weight.
-const QKV_DEC_KERNEL_SOURCE = kernelSource("kernels/attention/qkv_dec.metal");
+pub const QKV_DEC_KERNEL_SOURCE = kernelSource("kernels/attention/qkv_dec.metal");
 
 var qkv_dec_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -110,7 +110,7 @@ var qkv_dec_env: ?bool = null;
 fn qkvDecKernelEnabled() bool {
     if (qkv_dec_override) |v| return v;
     if (qkv_dec_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_KV_ATTN_KERNEL");
+    const raw = env.get(.MLX_SERVE_KV_ATTN_KERNEL);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     qkv_dec_env = enabled;
     return enabled;
@@ -295,7 +295,7 @@ fn qkvMergePartials(s: mlx.mlx_stream, outputs_vec: mlx.mlx_vector_array, qdt: m
     return qkvMergeArrays(s, m_b, l_b, o_b, qdt);
 }
 
-fn qkvMergeArrays(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array, o_b: mlx.mlx_array, qdt: mlx.mlx_dtype) !mlx.mlx_array {
+pub fn qkvMergeArrays(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array, o_b: mlx.mlx_array, qdt: mlx.mlx_dtype) !mlx.mlx_array {
     var m_max = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(m_max);
     try mlx.check(mlx.mlx_max_axis(&m_max, m_b, 1, true, s));
@@ -348,7 +348,7 @@ fn qkvMergeArrays(s: mlx.mlx_stream, m_b: mlx.mlx_array, l_b: mlx.mlx_array, o_b
 // [1, Hq, TQ, DV].
 pub const QKV_VERIFY_MAX_TQ: c_int = 8;
 
-const QKV_VERIFY_KERNEL_SOURCE = kernelSource("kernels/attention/qkv_verify.metal");
+pub const QKV_VERIFY_KERNEL_SOURCE = kernelSource("kernels/attention/qkv_verify.metal");
 
 var qkv_ver_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -394,21 +394,21 @@ fn qkvVerifyRowsPay(gqa: c_int, t_q: c_int) bool {
 /// `MLX_SERVE_KV_ATTN_VERIFY=0` still kills the whole verify width class.
 fn qkvVerifyEnvAllows() bool {
     if (qkv_ver_override) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_KV_ATTN_VERIFY") orelse return true;
+    const raw = env.get(.MLX_SERVE_KV_ATTN_VERIFY) orelse return true;
     return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
 }
 
 /// MLX_SERVE_KV_ATTN_VERIFY=1 (and the test seam) keeps every width on the kernel.
 fn qkvVerifyForced() bool {
     if (qkv_ver_override) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_KV_ATTN_VERIFY") orelse return false;
+    const raw = env.get(.MLX_SERVE_KV_ATTN_VERIFY) orelse return false;
     return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
 }
 
 fn qkvVerifyKernelEnabled() bool {
     if (qkv_ver_override) |v| return v;
     if (qkv_ver_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_KV_ATTN_VERIFY");
+    const raw = env.get(.MLX_SERVE_KV_ATTN_VERIFY);
     const enabled = qkvVerifyKernelEnabledFrom(
         verifyQmmNaxAvailable(),
         if (raw) |v| std.mem.sliceTo(v, 0) else null,
@@ -596,7 +596,7 @@ const QKV_MPP_PAGE: c_int = 32;
 const QKV_MPP_MAX_SPLITS: c_int = 128;
 const QKV_MPP_PAGES_PER_SPLIT: c_int = 8;
 
-const QKV_MPP_KERNEL_SOURCE = kernelSource("kernels/attention/qkv_mpp.metal");
+pub const QKV_MPP_KERNEL_SOURCE = kernelSource("kernels/attention/qkv_mpp.metal");
 
 var qkv_mpp_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 const QkvMppCfgKey = struct { hq: c_int, dk: c_int, bits: u8, gs: u32, gqa: c_int, tq: c_int, nsplit: c_int, dtype: mlx.mlx_dtype };
@@ -762,7 +762,7 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
 var kv_attn_fused_env: ?bool = null;
 fn kvAttnFusedEnvEnabled() bool {
     if (kv_attn_fused_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_KV_ATTN_FUSED");
+    const raw = env.get(.MLX_SERVE_KV_ATTN_FUSED);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     kv_attn_fused_env = enabled;
     return enabled;
@@ -782,7 +782,7 @@ var kv_attn_min_tk_env: ?c_int = null;
 fn kvAttnFusedMinTk() c_int {
     if (kv_attn_min_tk_env) |v| return v;
     const v: c_int = blk: {
-        const raw = std.c.getenv("MLX_SERVE_KV_ATTN_MIN_TK") orelse break :blk KV_ATTN_FUSED_MIN_TK;
+        const raw = env.get(.MLX_SERVE_KV_ATTN_MIN_TK) orelse break :blk KV_ATTN_FUSED_MIN_TK;
         break :blk std.fmt.parseInt(c_int, std.mem.sliceTo(raw, 0), 10) catch KV_ATTN_FUSED_MIN_TK;
     };
     kv_attn_min_tk_env = v;
@@ -791,10 +791,9 @@ fn kvAttnFusedMinTk() c_int {
 
 /// The ONE eligibility gate every fused quant-attention call site reads
 /// (`forwardStandardWith`, `gatedFullAttnWith`, `lagunaAttnWith`).
-/// `forwardBatchedDecode` and `diffusionDecoderAttn` deliberately keep
-/// dense-mode reads: batched decode is the packed-words-to-SDPA server-kill
-/// class (guarded by tests/test_batched_equivalence.sh), and diffusion
-/// canvas forwards are prefill-width by construction.
+/// `forwardBatchedDecode` deliberately keeps dense-mode reads: batched decode
+/// is the packed-words-to-SDPA server-kill class (guarded by
+/// tests/test_batched_equivalence.sh).
 ///
 /// Decode width (t_q == 1) ONLY: that is the width `qkvAttnDecodeKernel`
 /// serves (the measured +10..+56% serial win). Verify widths (T_q 2..32
@@ -1376,7 +1375,7 @@ test "qkv packed-attention surface µbench (env-gated: MLX_SERVE_KVQ_UBENCH=1)" 
     // sdpa with no dequant. Arms interleave in one process and the cell order
     // reverses per pass; BATCH launches share one eval so the sync barrier
     // does not price the cell.
-    if (!diagEnvOn("MLX_SERVE_KVQ_UBENCH")) return;
+    if (!env.on(.MLX_SERVE_KVQ_UBENCH)) return;
     const old_ver = qkv_ver_override;
     qkv_ver_override = true;
     defer qkv_ver_override = old_ver;

@@ -36,7 +36,6 @@ const arch_ds4 = if (@import("build_options").ds4_engine) @import("../../engines
 const arch_llama = if (@import("build_options").llama_engine) @import("../../engines/llama/bridge.zig") else @import("../../engines/llama/stub.zig");
 const arch_ane = @import("../../engines/ane/lm.zig");
 const gen_mod = @import("../media_jobs/gen.zig");
-const diarization_mod = @import("../../plugins/nemotron_diarization/diarization.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const log = @import("../log.zig");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
@@ -260,22 +259,16 @@ pub const LoadedModel = struct {
     /// An MLX pack served on the Neural Engine on its own threads (`arch/ane_lm.zig`): like the
     /// embedded engines, the MLX fields stay null; the tokenizer and chat template are MLX-serve's.
     ane: ?*arch_ane.Worker = null,
-    /// Whether lib/mlx-serve-gguf would claim this (unloaded) entry; answered
+    /// Whether src/sdk/quant/gguf would claim this (unloaded) entry; answered
     /// once, on the first `/v1/models` render.
     mlx_gguf_claim: ?bool = null,
+    /// The engines whose probe accepts this pack (`model_row_facts.Engines` bits); answered once, like the claim.
+    engines: ?u8 = null,
 
-    /// Native media-generation engines, named by MODALITY (not by the FLUX/
-    /// Qwen3-TTS/LTX implementations, which are swappable internals). When one
-    /// is non-null the entry is a media model: the MLX/ds4/llama fields stay
-    /// null and the server routes the matching gen endpoint through this slot.
-    /// Mutually exclusive with each other and with the LM engine fields. Freed
-    /// FIRST in deinit/unloadResident (they own the bulk of the GPU memory).
-    image_engine: ?*gen_mod.ImageEngine = null,
-    audio_engine: ?*gen_mod.AudioEngine = null,
-    video_engine: ?*gen_mod.VideoEngine = null,
-    mesh_engine: ?*gen_mod.MeshEngine = null,
-    decision_engine: ?*gen_mod.DecisionEngine = null,
-    diarization_engine: ?*diarization_mod.Engine = null,
+    /// A media pack served through its plugin table (`media_jobs/plugin/served.zig`), whatever its modality. When
+    /// non-null the MLX/ds4/llama fields stay null; freed FIRST in deinit/unloadResident (it owns the bulk of the GPU
+    /// memory).
+    media_plugin: ?*@import("../media_jobs/plugin/engine.zig").Engine = null,
     /// Model-wide serialization gate for media generation. A gen runs to completion on the inference thread
     /// (the sole mlx caller), so gen-vs-gen is already serial; this flag makes
     /// the in-flight state visible (set around the gen job).
@@ -420,29 +413,9 @@ pub const LoadedModel = struct {
             self.llama_engine = null;
         }
         self.closeAne();
-        if (self.image_engine) |e| {
+        if (self.media_plugin) |e| {
             e.deinit();
-            self.image_engine = null;
-        }
-        if (self.audio_engine) |e| {
-            e.deinit();
-            self.audio_engine = null;
-        }
-        if (self.video_engine) |e| {
-            e.deinit();
-            self.video_engine = null;
-        }
-        if (self.mesh_engine) |e| {
-            e.deinit();
-            self.mesh_engine = null;
-        }
-        if (self.decision_engine) |e| {
-            e.deinit();
-            self.decision_engine = null;
-        }
-        if (self.diarization_engine) |e| {
-            e.deinit();
-            self.diarization_engine = null;
+            self.media_plugin = null;
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
@@ -460,6 +433,10 @@ pub const LoadedModel = struct {
                     self.allocator.destroy(m);
                 },
                 .glm => |m| {
+                    m.deinit();
+                    self.allocator.destroy(m);
+                },
+                .plugin => |m| {
                     m.deinit();
                     self.allocator.destroy(m);
                 },
@@ -607,29 +584,9 @@ pub const LoadedModel = struct {
             self.llama_engine = null;
         }
         self.closeAne();
-        if (self.image_engine) |e| {
+        if (self.media_plugin) |e| {
             e.deinit();
-            self.image_engine = null;
-        }
-        if (self.audio_engine) |e| {
-            e.deinit();
-            self.audio_engine = null;
-        }
-        if (self.video_engine) |e| {
-            e.deinit();
-            self.video_engine = null;
-        }
-        if (self.mesh_engine) |e| {
-            e.deinit();
-            self.mesh_engine = null;
-        }
-        if (self.decision_engine) |e| {
-            e.deinit();
-            self.decision_engine = null;
-        }
-        if (self.diarization_engine) |e| {
-            e.deinit();
-            self.diarization_engine = null;
+            self.media_plugin = null;
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
@@ -647,6 +604,10 @@ pub const LoadedModel = struct {
                     self.allocator.destroy(m);
                 },
                 .glm => |m| {
+                    m.deinit();
+                    self.allocator.destroy(m);
+                },
+                .plugin => |m| {
                     m.deinit();
                     self.allocator.destroy(m);
                 },

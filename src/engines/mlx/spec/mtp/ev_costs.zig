@@ -1,5 +1,6 @@
 //! MTP expected-value cost tables per profile.
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 
 
@@ -291,5 +292,5 @@ pub fn mtpEvCostsFor(nax_profile: bool, override: ?[]const u8) MtpEvCosts {
 }
 
 pub fn mtpEvCosts(profile: mtp_mod.MtpCostProfile) MtpEvCosts {
-    return mtpEvCostsForProfile(profile, if (std.c.getenv("MLX_SERVE_MTP_EV_COSTS")) |p| std.mem.span(p) else null);
+    return mtpEvCostsForProfile(profile, env.span(.MLX_SERVE_MTP_EV_COSTS));
 }

@@ -22,7 +22,7 @@ const fusedResidualNorm = @import("../../sdk/blocks/norms/residual_norm.zig").fu
 /// input norms, and the feed-forward seam folds the two post-norms, the
 /// combine norm, the scalar and `next_norm` — handed back through
 /// `carried` so the next layer skips its input norm.
-pub fn gemma4MoeLayerTail(self: *Transformer, h_in: mlx.mlx_array, attn_out: mlx.mlx_array, lw: *const MoeLayerWeights, use_encoder_scalar: bool, next_norm: mlx.mlx_array, carried: *?mlx.mlx_array, fused: bool) !mlx.mlx_array {
+pub fn gemma4MoeLayerTail(self: *Transformer, h_in: mlx.mlx_array, attn_out: mlx.mlx_array, lw: *const MoeLayerWeights, next_norm: mlx.mlx_array, carried: *?mlx.mlx_array, fused: bool) !mlx.mlx_array {
     var h = h_in;
     const none = mlx.mlx_array{ .ctx = null };
     const eps = self.rms_eps_arr;
@@ -66,13 +66,7 @@ pub fn gemma4MoeLayerTail(self: *Transformer, h_in: mlx.mlx_array, attn_out: mlx
     };
     defer _ = mlx.mlx_array_free(expert_out);
 
-    // Layer scalar. DiffusionGemma's causal encoder pass uses its own
-    // per-layer scalar (the only untied encoder text params); every
-    // other caller uses the decoder/trunk scalar.
-    const scalar = if (use_encoder_scalar and lw.encoder_layer_scalar != null)
-        lw.encoder_layer_scalar
-    else
-        lw.layer_scalar;
+    const scalar = lw.layer_scalar;
 
     const seam2 = if (fused) try fusedResidualNorm(self.s, h, shared_out, .{
         .b2 = expert_out,

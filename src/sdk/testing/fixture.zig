@@ -15,6 +15,8 @@ pub const Fixture = struct {
     files: []const File,
     /// A media plugin's request body.
     body: []const u8 = "{}",
+    /// A media plugin's request inputs (`media.Request.inputs`), in order.
+    inputs: []const []const u8 = &.{},
     /// A quant plugin's claimed block (JSON).
     block: []const u8 = "",
 

@@ -2,6 +2,7 @@
 const std = @import("std");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("../../../sdk/weights/streamed/glue.zig") else @import("../../../sdk/weights/streamed/stub.zig");
 const log = @import("../../../host/log.zig");
+const plugin_settle = @import("../plugin/settle.zig");
 const round_cost = @import("round_cost.zig");
 const Generator = @import("../generate/generator.zig").Generator;
 const StepTrace = @import("../generate/step.zig").StepTrace;
@@ -43,6 +44,7 @@ pub fn logQsaArms(self: *Generator) void {
     // of this slot was handed. A Transformer-level counter printed the
     // union of every slot that decoded or prefilled since the last
     // finisher reset it.
+    plugin_settle.logMeters(self.xfm, &self.ctx);
     const c = self.ctx.qsa_arms.take() orelse return;
     const arm = c.majority() orelse return;
     log.info(

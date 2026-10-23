@@ -11,7 +11,7 @@ const mlx = @import("../../../mlx/ffi.zig");
 /// before RoPE, as an unfused chain in that dtype does.
 pub const QkvHeads = struct { q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array };
 
-const QKV_SOURCE = kernelSource("kernels/dit/dit_qkv.metal");
+pub const QKV_SOURCE = kernelSource("kernels/dit/dit_qkv.metal");
 
 var qkv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 

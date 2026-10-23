@@ -1,34 +1,20 @@
 #!/usr/bin/env bash
-# Release battery: an agent keeps working while every media modality runs on the
-# same server. The 2026-10-03 incident (a pi session "hung" for 10+ minutes while
-# its own asset script ran a textured Hunyuan3D job) plus the rest of the media
-# set, against a real agent-sized chat model with its DFlash drafter.
+# test_gen_chat_mix.sh — release battery: two agents keep working while every media modality runs on one server
+# (scratch HOME, --max-resident-models = the set size, MLX_SERVE_GEN_YIELD=1). Chat: Qwen3.8-27B 4-bit + its DFlash2
+# drafter, two pi-shaped agents (streaming, tools, low effort; one alternating with plain turns). Media: FLUX klein,
+# Qwen3-TTS, ACE-Step, and a textured res-320 Hunyuan3D job when the pack + paint/ exist.
+# [1] every model loads eviction-free, the drafter binds; [2] solo references (a dflash-engaged agent turn, a seeded
+# image); [3] all media queued at once beside both agents: valid PNG/WAV/GLB, the image byte-identical to solo, >=
+# MIX_MIN_CHATS clean turns from both agents, slowest first token < MIX_MAX_TTFT (30 s), `[gen-yield] engaged`;
+# [4] streamed music and speech cancelled mid-generation each free the server; [5] alive, no `[mlx]` error.
 #
-# One server, scratch HOME, `--log-level debug`:
-#   chat  Qwen3.8-27B 4-bit + its shipped DFlash2 drafter, TWO concurrent agents
-#         (pi-shaped turns: streaming, tools, low reasoning effort; one of them
-#         alternating with plain turns), so batched decode runs beside media
-#   media FLUX klein image, Qwen3-TTS speech, ACE-Step music, Hunyuan3D textured
-#         res-320 mesh (optional, the incident's job)
-# Asserts:
-#   [1] every model loads, the drafter binds (`DFlash drafter ready`)
-#   [2] solo references: one agent turn (dflash must engage), one seeded image
-#   [3] the mix: all media jobs queued at once while both agents run turns back to back.
-#       Every media request answers 200 with a valid payload, the image is
-#       byte-identical to the solo one, at least MIX_MIN_CHATS turns finish
-#       while media is running, every turn is clean (stream ends, tool args are
-#       JSON, no markup in content), both agents land turns, the slowest first
-#       token stays under MIX_MAX_TTFT, and the log shows `[gen-yield] engaged`
-#   [4] cancel: a music client and a speech client hanging up mid-generation
-#       each free the server
-#   [5] alive: a final turn answers, no MLX error in the log
+#   ./tests/test_gen_chat_mix.sh [port]   # MIX_CHAT_MODEL, MIX_IMAGE_MODEL, MIX_TTS_MODEL, MIX_MUSIC_MODEL,
+#                                         # MIX_MESH_MODEL ("" skips), MIX_MAX_TTFT, MIX_MIN_CHATS
 #
-# Needs every pack below on a model root and the set inside this box's GPU
-# budget; SKIPs otherwise. Overrides: MIX_CHAT_MODEL, MIX_IMAGE_MODEL,
-# MIX_TTS_MODEL, MIX_MUSIC_MODEL, MIX_MESH_MODEL ("" skips the mesh job),
-# MIX_MAX_TTFT (seconds, default 30), MIX_MIN_CHATS (default 3).
-# Usage: ./tests/test_gen_chat_mix.sh [port]
+# SKIPs when a pack is missing or the set exceeds the box's budget (~45 GB).
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11463}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -61,11 +47,7 @@ mkdir -p "$TMP/home"
 HOME="$TMP/home" MLX_SERVE_GEN_YIELD=1 "$BIN" --serve --port "$PORT" --log-level debug --max-resident-models "${#MODELS[@]}" >"$LOG" 2>&1 &
 SRV=$!
 trap 'kill $(jobs -p) 2>/dev/null; wait $SRV 2>/dev/null' EXIT
-for i in $(seq 1 60); do
-  curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "http://127.0.0.1:$PORT" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 URL="http://127.0.0.1:$PORT"
 api() { curl -s -m 1800 "$URL$1" "${@:2}"; }
 now() { python3 -c 'import time; print(time.time())'; }

@@ -1,6 +1,7 @@
 //! handleAnthropicStreaming, delta/thinking emitters
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
@@ -720,7 +721,7 @@ pub fn handleAnthropicStreaming(
     if (gated_stream and !client_gone) {
         if (log.isDebug() and text_buf.items.len > 0) {
             log.debug("  raw generated text before tool parse ({d}b): {s}\n", .{ text_buf.items.len, text_buf.items[0..@min(text_buf.items.len, 4000)] });
-            if (std.c.getenv("MLX_SERVE_RAW_DUMP_FILE")) |dump_path| {
+            if (env.get(.MLX_SERVE_RAW_DUMP_FILE)) |dump_path| {
                 appendRawToolDump(std.mem.span(dump_path), tools_json, text_buf.items);
             }
         }

@@ -85,7 +85,7 @@ const handleResponsesWebSocket = @import("../api/responses/ws.zig").handleRespon
 /// Resolution runs ahead of dispatch, so without this an unknown path on a
 /// server with no default model returned 503 "No default model configured"
 /// instead of 404 — and a path's existence has nothing to do with model state.
-/// The drift guard is a test that reads the dispatch chain out of this file.
+/// Every dispatch compare goes through `isRoute`, which refuses to compile a path missing here.
 const ROUTE_PATHS = [_][]const u8{
     "/",
     "/api/chat",
@@ -137,6 +137,15 @@ fn routeExists(path: []const u8) bool {
     return false;
 }
 
+/// `path == p` for a dispatched literal `p`; a `p` missing from ROUTE_PATHS does not compile.
+pub fn isRoute(path: []const u8, comptime p: []const u8) bool {
+    comptime {
+        @setEvalBranchQuota(20_000);
+        if (!routeExists(p)) @compileError("dispatched path missing from ROUTE_PATHS: " ++ p);
+    }
+    return std.mem.eql(u8, path, p);
+}
+
 pub const max_media_request_bytes: usize = 512 * 1024 * 1024;
 
 /// A coding agent keeps its screenshots in the history, as base64: chat takes what media takes.
@@ -154,7 +163,7 @@ pub fn maxRequestBytesFor(target: []const u8) usize {
     const path = target[0 .. std.mem.indexOfScalar(u8, target, '?') orelse target.len];
     for ([_][]const u8{ "/v1/images/", "/v1/video/", "/v1/audio/", "/v1/3d/" }) |p|
         if (std.mem.startsWith(u8, path, p)) return max_media_request_bytes;
-    if (std.mem.eql(u8, path, "/v1/decisions") or std.mem.eql(u8, path, "/v1/systemone")) return max_decision_request_bytes;
+    if (isRoute(path, "/v1/decisions") or isRoute(path, "/v1/systemone")) return max_decision_request_bytes;
     return max_request_bytes;
 }
 
@@ -216,7 +225,7 @@ pub fn handleConnection(
     //    pass Bearer / x-api-key. null key ⇒ fully open. See `apiKeyAuthorized`.
     if (apiKeyGateApplies(http_server.g_api_key != null, http_server.g_api_key_strict, peerIsLoopback(stream)) and
         !std.mem.eql(u8, method, "OPTIONS") and
-        !(std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")))
+        !(std.mem.eql(u8, method, "GET") and isRoute(path, "/health")))
     {
         const raw_headers = request[0..header_end_pos];
         if (loginFormKey(method, path, request_content_type, request_body)) |k| {
@@ -258,12 +267,12 @@ pub fn handleConnection(
     //    default model just to read metadata. `/v1/models` and the GET-side
     //    of the Responses API are pure registry/store reads — no model
     //    needed.
-    if (std.mem.eql(u8, method, "HEAD") and std.mem.eql(u8, path, "/")) {
+    if (std.mem.eql(u8, method, "HEAD") and isRoute(path, "/")) {
         log.debug("HEAD / -> 200\n", .{});
         try sendResponse(stream, "200 OK", "text/plain", "");
         return;
     }
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/health")) {
+    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/health")) {
         if (mlx.gpuContextLost()) return sendResponse(stream, "503 Service Unavailable", "application/json", "{\"status\":\"cuda context lost\"}");
         log.debug("GET  /health -> 200\n", .{});
         try sendResponse(stream, "200 OK", "application/json", "{\"status\":\"ok\"}");
@@ -276,14 +285,14 @@ pub fn handleConnection(
     // app-launched server) answered 503 "No default model configured" at the
     // root — the first page a person opens. Everything it used to render from
     // the model it now fetches from /v1/models + /props client-side.
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/")) {
+    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/")) {
         log.debug("GET  / -> 200 (console)\n", .{});
         try handleStatusPage(stream);
         return;
     }
     // Prometheus scrape endpoint. 503 when --metrics is off. Behind the global
     // API-key gate above when --api-key is set (auth already enforced here).
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics")) {
+    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/metrics")) {
         if (http_server.g_metrics) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
@@ -298,7 +307,7 @@ pub fn handleConnection(
     // JSON feed — drives the console's Monitoring pane. Behind the
     // global API-key gate above when --api-key is set (same-origin browser
     // fetch inherits the page's Basic credentials).
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/metrics.json")) {
+    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/metrics.json")) {
         if (http_server.g_metrics) |m| {
             var out: std.Io.Writer.Allocating = .init(allocator);
             defer out.deinit();
@@ -316,7 +325,7 @@ pub fn handleConnection(
         try sendResponse(stream, "204 No Content", "text/plain", "");
         return;
     }
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/models")) {
+    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/v1/models")) {
         log.debug("GET  /v1/models -> 200\n", .{});
         // A keyless LAN peer sees only shared models and never the remote
         // stubs (a mirrored entry would invite multi-hop loops). Peer
@@ -328,7 +337,7 @@ pub fn handleConnection(
             (http_server.g_lan != null and isTunneledRequest(request[0..header_end_pos])));
         return;
     }
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/launch")) {
+    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/launch")) {
         try handleLaunchScript(allocator, stream, raw_path, request[0..header_end_pos], lanGateApplies(stream));
         return;
     }
@@ -342,14 +351,14 @@ pub fn handleConnection(
         try handleResponsesDelete(allocator, stream, id);
         return;
     }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses/compact")) {
+    if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/responses/compact")) {
         // Compaction is a pure data transformation — no model load needed.
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleResponsesCompact(allocator, stream, body);
         return;
     }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/load-model")) {
+    if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/load-model")) {
         // Phase E: explicit cold-load. Keep strict semantics — unknown ids
         // get a 404 here even though the main dispatch path below falls
         // back to default for SDK compatibility.
@@ -358,7 +367,7 @@ pub fn handleConnection(
         return;
     }
     // Any method: a status route never reaches `ensureLoaded`, whatever its body names.
-    if (std.mem.eql(u8, path, "/v1/load-progress")) {
+    if (isRoute(path, "/v1/load-progress")) {
         const body = renderLoadProgressBody(allocator, stream.io) catch |err| switch (err) {
             error.RegistryNotReady => return sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Registry not ready", 503),
             else => return err,
@@ -367,24 +376,24 @@ pub fn handleConnection(
         try sendResponse(stream, "200 OK", "application/json", body);
         return;
     }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/unload-model")) {
+    if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/unload-model")) {
         // Free a model's resident GPU state (the app's load→generate→unload
         // default). The stub stays registered so it can reload. Idempotent.
         log.debug("POST /v1/unload-model -> 200\n", .{});
         try handleUnloadModelStrict(allocator, stream, request_body);
         return;
     }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/providers/reload")) {
+    if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/providers/reload")) {
         try handleProvidersReload(allocator, stream);
         return;
     }
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/providers")) {
+    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/v1/providers")) {
         const body = if (http_server.g_providers) |p| try p.statusJson(allocator) else try allocator.dupe(u8, "{\"providers\":[]}");
         defer allocator.free(body);
         try sendResponse(stream, "200 OK", "application/json", body);
         return;
     }
-    if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/models/rescan")) {
+    if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/models/rescan")) {
         // Absorb models downloaded AFTER boot (the Model Browser pulls while
         // the server runs; discovery only walks the roots at startup).
         try handleModelsRescan(allocator, stream);
@@ -483,7 +492,7 @@ pub fn handleConnection(
         };
         if (target) |t| {
             if (textGenRejectReason(t)) |reason| {
-                if (std.mem.eql(u8, path, "/v1/messages")) {
+                if (isRoute(path, "/v1/messages")) {
                     try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
                 } else if (std.mem.startsWith(u8, path, "/api/")) {
                     try sendOllamaError(allocator, stream, "400 Bad Request", reason);
@@ -511,7 +520,7 @@ pub fn handleConnection(
     // hands the memory back and the next poll takes it straight again (the app's
     // tray polls every 3s). Nothing resident means nothing to report — the same
     // body the `NoDefaultModel` arm below already sends.
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/props")) {
         const resident = if (registry.resolveEntry(requested_model_id)) |e| blk: {
             registry.mutex.lockUncancelable(stream.io);
             defer registry.mutex.unlock(stream.io);
@@ -526,7 +535,7 @@ pub fn handleConnection(
         // Headless gen-only boot (media models resident, no default chat
         // model): /props keeps answering with the live memory counters —
         // the app's tray polls it, and a 503 here read as "0 MB".
-        if (err == error.NoDefaultModel and std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+        if (err == error.NoDefaultModel and std.mem.eql(u8, method, "GET") and isRoute(path, "/props")) {
             try handlePropsNoModel(allocator, stream);
             return;
         }
@@ -555,7 +564,7 @@ pub fn handleConnection(
     // Detect Upgrade: websocket BEFORE the regular route dispatch so the
     // GET method (used for the upgrade handshake) doesn't fall through to
     // the 404 branch.
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses") and ws_mod.isUpgrade(request[0..header_end_pos])) {
+    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/v1/responses") and ws_mod.isUpgrade(request[0..header_end_pos])) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
@@ -564,10 +573,10 @@ pub fn handleConnection(
         return;
     }
 
-    if (std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props")) {
+    if (std.mem.eql(u8, method, "GET") and isRoute(path, "/props")) {
         log.debug("GET  /props -> 200\n", .{});
         try handleProps(allocator, stream, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/chat/completions")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/chat/completions")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
@@ -575,7 +584,7 @@ pub fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleChatCompletions(allocator, stream, body, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/completions")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/completions")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
@@ -583,11 +592,11 @@ pub fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleCompletions(allocator, stream, body, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/embeddings")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/embeddings")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleEmbeddings(allocator, stream, body, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/messages")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/messages")) {
         if (text_gen_reject) |reason| {
             try sendAnthropicError(allocator, stream, "invalid_request_error", reason, 400);
             return;
@@ -595,7 +604,7 @@ pub fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleAnthropicMessages(allocator, stream, body, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/responses")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/responses")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
@@ -603,19 +612,19 @@ pub fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleResponses(allocator, stream, body, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/tokenize")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/tokenize")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleTokenize(allocator, stream, body, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/detokenize")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/detokenize")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleDetokenize(allocator, stream, body, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/generations")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/images/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .image);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/images/edits")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/images/edits")) {
         // OpenAI's image-EDIT surface: multipart/form-data, not JSON. Translated
         // into the `/v1/images/generations` edit body (gen.openaiEditFormToJson)
         // and served by the identical path — no second inference route.
@@ -628,7 +637,7 @@ pub fn handleConnection(
         };
         defer allocator.free(json);
         try handleGen(allocator, stream, json, lm, .image);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/transcriptions")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/audio/transcriptions")) {
         if (text_gen_reject) |reason| {
             try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", reason, 400);
             return;
@@ -636,44 +645,44 @@ pub fn handleConnection(
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const ct = findHeaderValue(request[0..header_end], "content-type") orelse "";
         try handleTranscriptions(allocator, stream, request[header_end + 4 .. total_read], ct, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/speech")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/audio/speech")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .speech);
-    } else if (std.mem.eql(u8, method, "POST") and (std.mem.eql(u8, path, "/v1/decisions") or std.mem.eql(u8, path, "/v1/systemone"))) {
+    } else if (std.mem.eql(u8, method, "POST") and (isRoute(path, "/v1/decisions") or isRoute(path, "/v1/systemone"))) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .decisions);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/music-generations")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/audio/music-generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .music);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/audio/sound-generations")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/audio/sound-generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .sound);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/video/generations")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/video/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .video);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/v1/3d/generations")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/v1/3d/generations")) {
         const header_end = std.mem.indexOf(u8, request, "\r\n\r\n") orelse return;
         const body = request[header_end + 4 .. total_read];
         try handleGen(allocator, stream, body, lm, .mesh);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/chat")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/api/chat")) {
         if (text_gen_reject) |reason| {
             try sendOllamaError(allocator, stream, "400 Bad Request", reason);
             return;
         }
         try handleOllamaChat(allocator, stream, request_body, lm);
-    } else if (std.mem.eql(u8, method, "POST") and std.mem.eql(u8, path, "/api/generate")) {
+    } else if (std.mem.eql(u8, method, "POST") and isRoute(path, "/api/generate")) {
         if (text_gen_reject) |reason| {
             try sendOllamaError(allocator, stream, "400 Bad Request", reason);
             return;
         }
         try handleOllamaGenerate(allocator, stream, request_body, lm);
-    } else if (std.mem.eql(u8, method, "POST") and (std.mem.eql(u8, path, "/api/embed") or std.mem.eql(u8, path, "/api/embeddings"))) {
-        try handleOllamaEmbed(allocator, stream, request_body, lm, std.mem.eql(u8, path, "/api/embeddings"));
+    } else if (std.mem.eql(u8, method, "POST") and (isRoute(path, "/api/embed") or isRoute(path, "/api/embeddings"))) {
+        try handleOllamaEmbed(allocator, stream, request_body, lm, isRoute(path, "/api/embeddings"));
     } else {
         log.warn("{s} {s} -> 404\n", .{ method, path });
         try sendErrorResponse(allocator, stream, "404 Not Found", "not_found", "The requested endpoint does not exist", null);
@@ -700,7 +709,7 @@ pub fn handleConnection(
 /// `ensureLoaded`/release pair, so without this a poll stamps `last_used_ms`
 /// and a client polling faster than `--idle-evict-secs` pins every model.
 fn isStatusRoute(method: []const u8, path: []const u8) bool {
-    return std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/props");
+    return std.mem.eql(u8, method, "GET") and isRoute(path, "/props");
 }
 
 /// True for the routes textGenRejectReason protects — used for the
@@ -717,27 +726,10 @@ fn isTextGenRoute(method: []const u8, path: []const u8) bool {
         return false;
     }
     // WebSocket upgrade handshake for /v1/responses.
-    return std.mem.eql(u8, method, "GET") and std.mem.eql(u8, path, "/v1/responses");
+    return std.mem.eql(u8, method, "GET") and isRoute(path, "/v1/responses");
 }
 
 // ── tests ──
-
-test "the route-existence 404 is answered BEFORE the model is resolved" {
-    // A path we do not serve must cost nothing. Resolution ran first, so
-    // `POST /v1/load` (the real route is /v1/load-model) with a `model` field
-    // cold-loaded that model and THEN 404'd — 2m42s and 121 GB resident for a
-    // typo, and a one-line way for any client to pin the box. The existence
-    // answer has to precede `ensureLoaded`, not sit in one of its error arms.
-    const src = @embedFile("router.zig");
-    const gate = "if (!routeExists(" ++ "path)) {";
-    const resolve = "scheduler.ensureLoaded(" ++ "requested_model_id)";
-    const gate_at = std.mem.indexOf(u8, src, gate) orelse return error.GateMissing;
-    const resolve_at = std.mem.indexOf(u8, src, resolve) orelse return error.ResolveMissing;
-    try std.testing.expect(gate_at < resolve_at);
-    // Exactly one gate — a second copy in an error arm is a second answer to
-    // a question that has one.
-    try std.testing.expect(std.mem.indexOf(u8, src[gate_at + gate.len ..], gate) == null);
-}
 
 test "routeExists answers endpoint existence without consulting the model" {
     // Whether a path EXISTS has nothing to do with which models are loaded, but
@@ -759,32 +751,6 @@ test "routeExists answers endpoint existence without consulting the model" {
     try std.testing.expect(!routeExists("/v1/audio/translations")); // real OpenAI route we don't serve
     try std.testing.expect(!routeExists("/nope"));
     try std.testing.expect(!routeExists(""));
-}
-
-test "ROUTE_PATHS covers every path the dispatch chain compares (drift guard)" {
-    // Two lists that must agree is the drift class this file already warns about
-    // elsewhere. Rather than trust a comment, read the dispatch chain itself: a
-    // new path-equality arm that nobody adds to ROUTE_PATHS makes that endpoint
-    // a 404 on a headless server — the exact failure this table exists to
-    // prevent, inverted. (This test scans for the literal call form, so don't
-    // write one inside a comment: it would be scanned like real code.)
-    const src = @embedFile("router.zig") ++ @embedFile("auth.zig") ++ @embedFile("listen.zig") ++ @embedFile("../api/ollama_routes.zig") ++ @embedFile("../lan/http.zig");
-    const needle = "std.mem.eql(u8, path, \"";
-    var i: usize = 0;
-    var checked: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, needle)) |at| {
-        const start = at + needle.len;
-        const end = std.mem.indexOfScalarPos(u8, src, start, '"') orelse break;
-        const literal = src[start..end];
-        i = end;
-        checked += 1;
-        if (!routeExists(literal)) {
-            std.debug.print("dispatched path missing from ROUTE_PATHS: {s}\n", .{literal});
-            return error.RoutePathNotRegistered;
-        }
-    }
-    // The scan itself must not silently find nothing.
-    try std.testing.expect(checked >= 30);
 }
 
 test "the index page documents every endpoint the server serves (drift guard)" {

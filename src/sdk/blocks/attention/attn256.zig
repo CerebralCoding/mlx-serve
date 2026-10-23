@@ -2,6 +2,7 @@
 //! Owns ATTN256_KERNEL_HEADER, ATTN256_KERNEL_SOURCE, attn256_kernel_cached, getAttn256Kernel, fused256_env_cached, fused256_causal_env_cached, and 29 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -51,7 +52,7 @@ pub const ATTN256_KERNEL_HEADER = kernelSource("kernels/attention/attn256_header
 // ping-pong (per-block rescale doubles), V-from-global fragments (device
 // loads too slow), K-only double-buffer (barrier structure unchanged),
 // Q-smem BQ=32 with 2 threadgroups/core (SLC thrash at long kL).
-const ATTN256_KERNEL_SOURCE = kernelSource("kernels/attention/attn256.metal");
+pub const ATTN256_KERNEL_SOURCE = kernelSource("kernels/attention/attn256.metal");
 
 var attn256_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -84,7 +85,7 @@ var fused256_causal_env_cached: ?Fused256CausalMode = null;
 pub fn fused256Enabled() bool {
     if (transformer.fused256_override) |v| return v;
     if (fused256_env_cached) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_FUSED_256");
+    const raw = env.get(.MLX_SERVE_FUSED_256);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     fused256_env_cached = enabled;
     return enabled;
@@ -132,7 +133,7 @@ pub fn fused256DispatchBudget() i64 {
     if (fused256_budget_override) |v| return v;
     if (fused256_budget_env_cached) |v| return v;
     const v: i64 = blk: {
-        const raw = std.c.getenv("MLX_SERVE_FUSED_256_BUDGET") orelse break :blk FUSED256_DEFAULT_DISPATCH_BUDGET;
+        const raw = env.get(.MLX_SERVE_FUSED_256_BUDGET) orelse break :blk FUSED256_DEFAULT_DISPATCH_BUDGET;
         break :blk std.fmt.parseInt(i64, std.mem.sliceTo(raw, 0), 10) catch FUSED256_DEFAULT_DISPATCH_BUDGET;
     };
     fused256_budget_env_cached = v;
@@ -161,7 +162,7 @@ pub fn fused256CausalMode() Fused256CausalMode {
     if (!fused256Enabled()) return .off;
     if (fused256_causal_env_cached) |v| return v;
     const mode: Fused256CausalMode = blk: {
-        const raw = std.c.getenv("MLX_SERVE_FUSED_256_CAUSAL") orelse break :blk .all;
+        const raw = env.get(.MLX_SERVE_FUSED_256_CAUSAL) orelse break :blk .all;
         if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0")) break :blk .off;
         break :blk .all;
     };
@@ -256,7 +257,7 @@ pub fn qsaFusedEnabled() bool {
     if (qsa_fused_override) |v| return v;
     if (qsa_fused_env_cached) |v| return v;
     const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_QSA_FUSED") orelse break :blk true;
+        const raw = env.get(.MLX_SERVE_QSA_FUSED) orelse break :blk true;
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     qsa_fused_env_cached = v;
@@ -314,7 +315,7 @@ fn qsaSkipTable(s: mlx.mlx_stream, mask: mlx.mlx_array) !mlx.mlx_array {
     return out;
 }
 
-fn fusedSdpa256Impl(
+pub fn fusedSdpa256Impl(
     s: mlx.mlx_stream,
     q: mlx.mlx_array,
     k: mlx.mlx_array,

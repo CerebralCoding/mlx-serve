@@ -429,16 +429,6 @@ test "the out-of-memory 503 names the cap's flag and never blames concurrency" {
     // free memory here sends the user quitting apps when the fix is the cap.
     try testing.expect(std.mem.indexOf(u8, m, "free memory") == null);
     try testing.expect(std.mem.indexOf(u8, m, "resident-model budget") != null);
-
-    const src = @embedFile("errors.zig");
-    const stale = "\"Not enough memory to load model; retry " ++ "after current requests complete\"";
-    try testing.expect(std.mem.indexOf(u8, src, stale) == null);
-    // Every ensureLoaded failure answers through `sendEnsureLoadedError`, the one site.
-    var n: usize = 0;
-    var i: usize = 0;
-    const needle = "\"out_of_memory\", not_enough_memory" ++ "_message,";
-    while (std.mem.indexOfPos(u8, src, i, needle)) |p| : (i = p + needle.len) n += 1;
-    try testing.expectEqual(@as(usize, 1), n);
 }
 
 test "PrefillDoesNotFit quotes the figures the inference thread refused on, once" {

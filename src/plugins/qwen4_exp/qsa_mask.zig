@@ -9,7 +9,7 @@ const log = @import("../../host/log.zig");
 
 // grid (kv), one thread a token. `blocks` is sorted ascending with INT_MAX sentinels, so a binary
 // search finds a token's block; a sentinel never equals a block id.
-const SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_mask.metal");
+pub const SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_mask.metal");
 
 var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var engaged = false;

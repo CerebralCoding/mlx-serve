@@ -1,10 +1,12 @@
-//! copied_from: sdk/blocks/embedding.zig (`rawEmbedding`, `embedding` without the normed-embedding and Hadamard
-//! arms; `dequantTake`). Token embeddings: a table gather, dequantized per row, optionally scaled.
+//! copied_from: sdk/blocks/embedding.zig (`rawEmbedding`, `embedding` without the normed-embedding arm; `dequantTake`;
+//! sdk/quant/hadamard.zig `unrotateEmbedding`). Token embeddings: a table gather, dequantized per row, optionally
+//! scaled.
 
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
 const block = @import("../block.zig");
 const mlx_gguf = @import("../../quant/gguf/claim.zig");
+const rht = @import("../../quant/hadamard/rht.zig");
 const Linear = @import("linear.zig").Linear;
 
 const Array = ops.Array;
@@ -34,6 +36,13 @@ pub fn gatherRows(parent: *Graph, table: *const Linear, ids: Array, dt: mlx.mlx_
     }));
 }
 
+/// A Hadamard pack's gathered rows back to the residual basis (`signs * H(x)`); other tables' rows as they are.
+pub fn unrotate(g: *Graph, table: *const Linear, rows: Array) !Array {
+    const reg = table.rht orelse return rows;
+    if (table.signs.ctx == null) return rows;
+    return g.adopt(try rht.transform(rows, table.signs, reg.block, true, g.s));
+}
+
 /// A decoder's token embedding: `[slots, rows]` ids to `[slots, rows, hidden]`.
 pub const TableEmbed = struct {
     pub const kind: block.Kind = .embed;
@@ -55,7 +64,7 @@ pub const TableEmbed = struct {
             try gatherRows(g, &w.table, flat, .bfloat16)
         else
             try gatherRows(g, &w.table, flat, w.act);
-        const emb = try g.reshape(rows, &.{ sh[0], sh[1], w.hidden });
+        const emb = try unrotate(g, &w.table, try g.reshape(rows, &.{ sh[0], sh[1], w.hidden }));
         return if (w.scale.ctx != null) g.mul(emb, w.scale) else emb;
     }
 };

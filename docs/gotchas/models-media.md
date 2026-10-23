@@ -1974,7 +1974,7 @@ Cause 2: `initHybridLayers`' `.moe` arm was an `unreachable` TODO. In ReleaseFas
 
 Fix: parse both spellings; `HybridOp.nemotron_moe` + `nemotronMoe` (mlx-lm `NemotronHMoE`): `groupLimitedRouting` (sigmoid, selection-only `e_score_correction_bias`, renorm, x `routed_scaling_factor`, f32 weights until after the K-sum), ReLU^2 `switch_mlp.fc1/fc2` through the sorted gather_qmm path at prefill and in-place `gatherQmv` reads at one token (`nemotronMoeDecodeExperts`), shared expert always added. `moe_latent_size` packs are refused by name. The Mamba2 decode step is one fused dispatch (`mamba2_decode.zig`); the op chain serves prefill.
 
-Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), `nemotronMoe matches a host reference of NemotronHMoE` (T=5 sorted path and each token alone, kernel engaged), `mamba2Mixer: three single-token fused steps match one three-token chain prefill` (transformer.zig).
+Guards: `nemotron_h: a layers_block_type LIST ...`, `nemotron_h: MoE routing fields parse ...` (model.zig), the nemotron_h plugin's recorded proofs (`proof_test.zig`, the legacy `nemotronMoe` having matched a host reference of NemotronHMoE), `nemotron_h served: the fused Mamba2 step matches the op chain`.
 
 ## Nemotron-H: attention ran with RoPE the model never had
 
@@ -1984,7 +1984,7 @@ Cause: `hybridAttnWith` serves LFM2 and Nemotron-H, and applied RoPE for both. N
 
 Fix: the `nemotron_h` parse sets `layer_no_rope` for every layer, and the index past the last trunk layer covers the MTP head. `hybridAttnWith` and the head's three RoPE sites skip rotation on it. All three needle prompts answer exactly; the head's acceptance rose to about 1.5 tokens per round. `ModelConfig.cacheLayoutNamespace` gives Nemotron-H a fresh SSD prefix-cache root, because the fingerprint hashes only the model dir, the config's stat and the overrides: keys persisted by the RoPE build would otherwise restore into the NoPE model.
 
-Guards: `nemotron_h: attention is NoPE in every trunk layer and the MTP head` (parse), `hybrid attention: a NoPE layer ignores the order of earlier tokens` (trunk), the cached-key check in `mtp: nextMtp on a Nemotron-H trunk emits the serial greedy stream` (head), `modelFingerprint: the Nemotron-H NoPE layout gets its own SSD root`.
+Guards: `nemotron_h: attention is NoPE in every trunk layer and the MTP head` (parse), `nemotron_h served: a NoPE attention layer ignores the order of earlier tokens` (trunk), the head's recorded proofs (`mtp_head_test.zig`), `modelFingerprint: the Nemotron-H NoPE layout gets its own SSD root`.
 
 ## Nemotron-H: the MTP head's input, and why depth must stay shallow on a MoE trunk
 
@@ -2004,7 +2004,7 @@ Cause: `add_norm.moeCombineAddNorm` (residual add + next norm with the MoE K-sum
 
 Fix: the kernel takes the shared expert's output as an input (`XS`, `SHARED` template flag) and mirrors MLX's single-row `rms_norm` reduction exactly, so the fused step is bit-equal to the composed ops. Rule: a fused path that replaces a chain carries every term of the chain, and a forward-level test compares the two.
 
-Guards: `hybrid decode: the fused add+norm path equals the unfused blocks (Nemotron-H)` (tiny Mamba2 + MoE-with-shared trunk, fused vs `add_norm_max_rows = 0`, tolerance 0), `add_norm: plain and MoE-combine arms match the composed ops` (tolerance 0, with and without a shared expert).
+Guards: `nemotron_h served: the fused add+norm decode path equals the unfused blocks` (the 4-bit Mamba2 + MoE-with-shared trunk, fused vs `add_norm_max_rows = 0`, tolerance 0), `add_norm: plain and MoE-combine arms match the composed ops` (tolerance 0, with and without a shared expert).
 
 ## Nemotron-H: a single routing group ran the composed router chain
 
@@ -2022,7 +2022,7 @@ Cause: `mamba2Mixer` keeps the SSM state in f32 (correct — `mamba_ssm_cache_dt
 
 Fix: cast `y` to the SSM input's dtype before the gated norm. Greedy text diverges after a few words (bf16 vs f32 near-tie); both fluent.
 
-Guard: `mamba2Mixer keeps a bf16 residual stream bf16` (one bf16 Mamba2 layer through `forward`, asserts a bf16 result). Hybrid test setup is shared in `testHybridXfm`.
+Guard: the nemotron_h plugin's recorded proofs (bit-equal to the bf16-preserving legacy forward; a widened stream changes the bits).
 
 ## Malformed model configs reached unchecked reads and casts
 

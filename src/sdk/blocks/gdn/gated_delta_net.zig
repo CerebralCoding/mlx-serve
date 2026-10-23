@@ -6,7 +6,7 @@ const gdn_decode = @import("decode.zig");
 const log = @import("../../../host/log.zig");
 const kda_recurrence = @import("../kda/recurrence.zig");
 const decode_fused = @import("decode_fused.zig");
-const diagEnvOn = @import("../../../engines/mlx/env_transformer.zig").diagEnvOn;
+const env = @import("../../../env.zig");
 const QW = @import("../../../engines/mlx/layer_weights.zig").QW;
 const scalarOf = @import("../../../engines/mlx/load/weights.zig").scalarOf;
 const SSMCacheEntry = @import("../../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
@@ -553,7 +553,7 @@ pub fn gatedDeltaNetProjected(
                 break :blk;
             };
         }
-        if (diagEnvOn("QWEN4_GDN_CHECK")) self.gdnCheckFused(la, qkv, incoming_conv, b_proj, a_proj, &pre, layer_idx, num_k_heads, num_v_heads, dk, dv, batch, seq_len) catch |e| log.warn("[gdn-check] failed: {s}\n", .{@errorName(e)});
+        if (env.on(.QWEN4_GDN_CHECK)) self.gdnCheckFused(la, qkv, incoming_conv, b_proj, a_proj, &pre, layer_idx, num_k_heads, num_v_heads, dk, dv, batch, seq_len) catch |e| log.warn("[gdn-check] failed: {s}\n", .{@errorName(e)});
         _ = mlx.mlx_array_free(ssm.conv_state);
         ssm.conv_state = pre.conv_state;
         ssm.initialized = true;

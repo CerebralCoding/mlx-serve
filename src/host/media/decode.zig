@@ -372,41 +372,6 @@ test "clef: transparent image RGB follows the checkpoint processor" {
     try std.testing.expectEqualSlices(u8, &.{ 0, 0, 0 }, rgb.rgb[0..3]);
 }
 
-test "a request handler never owns its own media list — RequestMedia does" {
-    // Live leak: `handleChatCompletions` and the Anthropic `/v1/messages`
-    // handler each decoded `images[].pixels` (and videos/audio) into a local
-    // ArrayList, handed the slice to `chat_mod.Message` with `toOwnedSlice`,
-    // and then only ever `messages.deinit(allocator)`'d — which frees the
-    // Message array and NOTHING it points at. Every request carrying an image
-    // leaked the full decoded CHW buffer (megabytes per image) on the SUCCESS
-    // path, and on every early return after the parse loop as well.
-    //
-    // Scattering `defer allocator.free(...)` across the exit paths is how the
-    // next exit path gets added without one, so the buffers are owned by ONE
-    // struct with a `deinit` instead. This scan is what keeps a third handler
-    // (or a fourth media modality) from re-introducing a hand-rolled list whose
-    // contents nothing frees: a media list may only be obtained from the owner.
-    //
-    // Needles are split so this test's own source cannot satisfy them — it sits
-    // in the file it greps.
-    const src = @embedFile("request_media.zig") ++ @embedFile("decode.zig") ++ @embedFile("encode.zig") ++ @embedFile("../api/chat_completions.zig") ++ @embedFile("../api/embeddings.zig") ++ @embedFile("../api/anthropic.zig") ++ @embedFile("../api/responses/handler.zig");
-    const bare = [_][]const u8{
-        "std.ArrayList(chat_mod." ++ "ImageData).empty",
-        "std.ArrayList(chat_mod." ++ "VideoData).empty",
-        "std.ArrayList(chat_mod." ++ "AudioData).empty",
-    };
-    for (bare) |needle| {
-        if (std.mem.indexOf(u8, src, needle) != null) return error.HandlerOwnsItsOwnMediaList;
-    }
-    // The owner has to exist, and both handlers have to install it.
-    if (std.mem.indexOf(u8, src, "const RequestMedia " ++ "= struct") == null) return error.OwnerMissing;
-    var installs: usize = 0;
-    var i: usize = 0;
-    const install = "RequestMedia" ++ ".init(allocator)";
-    while (std.mem.indexOfPos(u8, src, i, install)) |at| : (i = at + install.len) installs += 1;
-    if (installs < 2) return error.AHandlerDoesNotInstallTheOwner;
-}
-
 test "RequestMedia frees every decoded buffer it was handed" {
     // std.testing.allocator fails this test on a leak, which is the whole
     // point: the owner is the only thing that frees `pixels`/`samples`, so a

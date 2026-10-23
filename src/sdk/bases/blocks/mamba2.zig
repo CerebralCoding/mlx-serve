@@ -1,21 +1,25 @@
 //! The Mamba2 mixer (Nemotron-H): in-projection, then conv + SSM + SiLU gate as one fused dispatch over any window
 //! the kernel serves (the op chain otherwise), the grouped RMS norm, the out-projection. Conv window and f32 scan
-//! state live in the slot's cache (`CacheOps.state`). copied_from: sdk/blocks/ssm/mamba2.zig (`mamba2Mixer`,
-//! `mamba2GroupNorm`, without the spec capture).
+//! state live in the slot's cache (`CacheOps.state`); a spec verify also leaves the conv input and the state after
+//! every row. copied_from: sdk/blocks/ssm/mamba2.zig (`mamba2Mixer`, `mamba2GroupNorm`).
 
+const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
 const block = @import("../block.zig");
 const kv = @import("../kv.zig");
 const Linear = @import("linear.zig").Linear;
+const row_exact = @import("row_exact.zig");
 const conv_window = @import("conv_window.zig");
 const mamba2_decode = @import("../../blocks/ssm/mamba2_decode.zig");
-const legacy = @import("../../blocks/ssm/mamba2.zig");
 const RECURRENCE_EVAL_INTERVAL = @import("../../../engines/mlx/eval_cadence.zig").RECURRENCE_EVAL_INTERVAL;
 
 const Array = ops.Array;
 const Graph = ops.Graph;
 const Ctx = block.Ctx;
+
+/// Widest window the fused Mamba2 step serves; tests lower it to force the op chain.
+pub var fused_max_rows: c_int = std.math.maxInt(c_int);
 
 pub const Mamba2 = struct {
     pub const kind: block.Kind = .mixer;
@@ -56,13 +60,13 @@ pub const Mamba2 = struct {
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
         if (c.mode == .batched_rows) return error.BatchedRowsUnsupported;
         const g = c.g;
-        const proj = try w.in_proj.forward(g, x);
+        const proj = try row_exact.linear(c.row_exact, g, &w.in_proj, x);
         // The test seam the legacy reads, so both arms are reachable from one proof.
-        const y = if (c.rows <= legacy.mamba2_fused_max_rows and w.conv_b.ctx != null)
+        const y = if (c.rows <= fused_max_rows and w.conv_b.ctx != null)
             (try fused(w, c, proj)) orelse try chain(w, c, proj)
         else
             try chain(w, c, proj);
-        return w.out_proj.forward(g, try groupNorm(w, c, y));
+        return row_exact.linear(c.row_exact, g, &w.out_proj, try groupNorm(w, c, y));
     }
 
     /// The gated `y` from the one-dispatch step, or null where the kernel declines.
@@ -73,7 +77,7 @@ pub const Mamba2 = struct {
         const scan = (try kv.state(c, .ssm)) orelse try g.zeros(&.{ 1, geo.heads, geo.head_dim, geo.state }, .float32);
         const out = (try mamba2_decode.step(
             .{ .batch = 1, .rows = c.rows, .heads = geo.heads, .groups = geo.groups, .head_dim = geo.head_dim, .state = geo.state, .conv_kernel = geo.kernel, .proj = ops.shape(proj)[2] },
-            .{ .proj = proj, .conv_state = conv_in, .ssm_state = scan, .conv_w = w.conv_w, .conv_b = w.conv_b, .A_log = w.A_log, .dt_bias = w.dt_bias, .D = w.D, .dt_lo = try g.scalar(geo.dt_min, .float32), .dt_hi = try g.scalar(geo.dt_max, .float32), .rows = try g.adopt(mlx.mlx_array_new_int(c.rows)), .all_rows = false },
+            .{ .proj = proj, .conv_state = conv_in, .ssm_state = scan, .conv_w = w.conv_w, .conv_b = w.conv_b, .A_log = w.A_log, .dt_bias = w.dt_bias, .D = w.D, .dt_lo = try g.scalar(geo.dt_min, .float32), .dt_hi = try g.scalar(geo.dt_max, .float32), .rows = try g.adopt(mlx.mlx_array_new_int(c.rows)), .all_rows = c.capture_spec },
             g.s,
         )) orelse return null;
         const y = g.adopt(out.y) catch |e| {
@@ -86,6 +90,11 @@ pub const Mamba2 = struct {
             return e;
         };
         const window = try g.adopt(out.conv_state);
+        if (c.capture_spec) {
+            const x_conv = try g.sliceAxis(proj, 2, geo.inner(), geo.inner() + geo.convDim());
+            try kv.setState(c, .conv_input, try g.concat(&.{ conv_in, x_conv }, 1));
+            try kv.setState(c, .state_seq, states);
+        }
         const srows = ops.shape(states)[0];
         const last = try g.reshape(try g.sliceAxis(states, 0, srows - 1, srows), &.{ 1, geo.heads, geo.head_dim, geo.state });
         try kv.setState(c, .ssm, last);
@@ -122,6 +131,8 @@ pub const Mamba2 = struct {
         const T: usize = @intCast(s);
         const ys = try g.a.alloc(Array, T);
         defer g.a.free(ys);
+        const seq = try g.a.alloc(Array, if (c.capture_spec) T else 0);
+        defer g.a.free(seq);
         for (0..T) |t| {
             var tg = g.scope();
             defer tg.deinit();
@@ -138,17 +149,22 @@ pub const Mamba2 = struct {
             ys[t] = try g.keep(try tg.add(y_state, try tg.mul(x_t, D)));
             const prev = scan;
             scan = try g.keep(next);
-            if (t > 0) g.drop(prev);
+            if (c.capture_spec) seq[t] = scan else if (t > 0) g.drop(prev);
             if ((t + 1) % RECURRENCE_EVAL_INTERVAL == 0) try ops.eval(scan);
         }
         try kv.setState(c, .ssm, scan);
+        if (c.capture_spec) try kv.setState(c, .state_seq, try stack(g, seq));
 
-        const rows = mlx.mlx_vector_array_new_data(ys.ptr, ys.len);
-        defer _ = mlx.mlx_vector_array_free(rows);
-        const stacked = try g.call(mlx.mlx_stack_axis, .{ rows, @as(c_int, 0) });
+        const stacked = try stack(g, ys);
         const y_f32 = try g.reshape(try g.transpose(stacked, &.{ 1, 0, 2, 3 }), &.{ 1, s, inner });
         const y = try g.astype(y_f32, ops.dtype(x_h));
         return g.mul(try g.mul(gate, try g.sigmoid(gate)), y);
+    }
+
+    fn stack(g: *Graph, xs: []const Array) !Array {
+        const v = mlx.mlx_vector_array_new_data(xs.ptr, xs.len);
+        defer _ = mlx.mlx_vector_array_free(v);
+        return g.call(mlx.mlx_stack_axis, .{ v, @as(c_int, 0) });
     }
 
     /// Row `t` of `[1, S, groups, state]`, repeated per head: `[1, heads, state]`.

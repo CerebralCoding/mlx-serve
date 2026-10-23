@@ -1,5 +1,7 @@
 //! The serial decode step: next / reasoning / choice / constrained steps, stop checks, lazy forward.
 const std = @import("std");
+const env = @import("../../../env.zig");
+const plugin_settle = @import("../plugin/settle.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const log = @import("../../../host/log.zig");
@@ -626,7 +628,7 @@ pub const StepTrace = struct {
 
     fn enabled() bool {
         if (on) |v| return v;
-        const raw = std.c.getenv("MLX_SERVE_STEP_TRACE");
+        const raw = env.get(.MLX_SERVE_STEP_TRACE);
         const v = raw != null and raw.?[0] != '0';
         on = v;
         return v;
@@ -665,7 +667,7 @@ pub fn lazyForward(xfm: *Transformer, ctx: *ForwardCtx, lazy_token: mlx.mlx_arra
     // Every array of an async batch carries that batch's END event, so the GPU PLE arm sends
     // the sampled token out as its own batch: its deferred history settle then waits on the
     // sampler, not on the forward built on it.
-    if (xfm.qwen4 != null and !pleLazySettleOff()) {
+    if (plugin_settle.defersHost(xfm) and !pleLazySettleOff()) {
         const tv = mlx.mlx_vector_array_new_value(reshaped);
         defer _ = mlx.mlx_vector_array_free(tv);
         try mlx.check(mlx.mlx_async_eval(tv));

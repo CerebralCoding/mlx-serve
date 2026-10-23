@@ -1,3 +1,5 @@
+//! The n-gram table embedded in the pack's own shards (oMLX's affine, NVIDIA's NVFP4): index and header reading,
+//! geometry and overlap checks, the payload it bills, and the region reads the gather uses.
 const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
 

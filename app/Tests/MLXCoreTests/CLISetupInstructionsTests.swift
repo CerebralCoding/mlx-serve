@@ -3,7 +3,7 @@ import XCTest
 
 final class CLISetupInstructionsTests: XCTestCase {
 
-    private let budget = AgentBudget.Budget(context: 90112, output: 16384)
+    private let budget = AgentBudget.Budget(context: 90112, output: 16384, compactionReserve: 20000)
     private var tabs: [CLISetupInstructions.Tab] {
         CLISetupInstructions.tabs(baseURL: "http://localhost:11234",
                                   servedModelId: "gemma-4-e4b-it-4bit",
@@ -131,7 +131,7 @@ final class CLISetupInstructionsTests: XCTestCase {
 
     func testZCodeConfigForceIncludesTheServedModelWithItsBudget() throws {
         let served = "served/model\"with-quote"
-        let other = AgentModelEntry(id: "other", budget: AgentBudget.Budget(context: 8192, output: 4096), vision: true)
+        let other = AgentModelEntry(id: "other", budget: AgentBudget.Budget(context: 8192, output: 4096, compactionReserve: 2048), vision: true)
         let json = AgentConfigs.zcodeProviderJSON(baseURL: "http://localhost:11234", model: served,
                                                  budget: budget, entries: [other])
         let root = try XCTUnwrap(JSONSerialization.jsonObject(with: Data(json.utf8)) as? [String: Any])
@@ -498,8 +498,8 @@ final class CLISetupInstructionsTests: XCTestCase {
     /// carries its own budget.
     func testOmpConfigBakesTheChatEntriesStatically() {
         let entries = [
-            AgentModelEntry(id: "m1", budget: .init(context: 4096, output: 1024), vision: false),
-            AgentModelEntry(id: "m2", budget: .init(context: 262144, output: 65536), vision: true),
+            AgentModelEntry(id: "m1", budget: .init(context: 4096, output: 1024, compactionReserve: 1024), vision: false),
+            AgentModelEntry(id: "m2", budget: .init(context: 262144, output: 65536, compactionReserve: 20000), vision: true),
         ]
         let yml = AgentConfigs.ompModelsYML(
             baseURL: "http://localhost:11234", defaultModel: "m1", entries: entries)
@@ -532,7 +532,7 @@ final class CLISetupInstructionsTests: XCTestCase {
 
     func testCodexConfigArgsOmitsTheContextWhenUnknown() {
         let zero = AgentConfigs.codexConfigArgs(baseURL: "http://x:1", model: "m1",
-                                                budget: AgentBudget.Budget(context: 0, output: 0))
+                                                budget: AgentBudget.Budget(context: 0, output: 0, compactionReserve: 1024))
         XCTAssertFalse(zero.contains("model_context_window"), zero)
         XCTAssertTrue(zero.contains(#"-c 'model_providers.mlx.base_url="http://x:1/v1"'"#), zero)
     }
@@ -540,7 +540,7 @@ final class CLISetupInstructionsTests: XCTestCase {
     /// Byte-identical to launch.zig's "codex overrides escape a model id" test.
     func testCodexConfigArgsEscapeForTOMLThenShell() {
         let args = AgentConfigs.codexConfigArgs(baseURL: "http://x:1", model: #"o'ne"il\m"#,
-                                                budget: AgentBudget.Budget(context: 0, output: 0))
+                                                budget: AgentBudget.Budget(context: 0, output: 0, compactionReserve: 1024))
         XCTAssertTrue(args.hasPrefix(#"-c 'model="o'\''ne\"il\\m"' -c 'model_provider="mlx"'"#), args)
     }
 
@@ -627,11 +627,11 @@ final class CLISetupInstructionsTests: XCTestCase {
 
     func testAiderMetadataDeclaresEveryChatEntryWithItsOwnBudget() throws {
         let entries = [
-            AgentModelEntry(id: "m1", budget: .init(context: 4096, output: 1024), vision: false),
-            AgentModelEntry(id: "m2", budget: .init(context: 262144, output: 65536), vision: true),
+            AgentModelEntry(id: "m1", budget: .init(context: 4096, output: 1024, compactionReserve: 1024), vision: false),
+            AgentModelEntry(id: "m2", budget: .init(context: 262144, output: 65536, compactionReserve: 20000), vision: true),
         ]
         let json = AgentConfigs.aiderModelMetadataJSON(
-            model: "m1", budget: .init(context: 4096, output: 1024), entries: entries)
+            model: "m1", budget: .init(context: 4096, output: 1024, compactionReserve: 1024), entries: entries)
         let obj = try XCTUnwrap(JSONSerialization.jsonObject(
             with: Data(json.utf8)) as? [String: [String: Any]])
         XCTAssertEqual(obj["openai/m1"]?["max_input_tokens"] as? Int, 4096)
@@ -645,8 +645,8 @@ final class CLISetupInstructionsTests: XCTestCase {
     func testFxSettingsMergeOwnsOnlyOurProvider() throws {
         let existing = #"{"provider":"gateway","models":{"gateway":"x/y"},"providers":{"other":{"base_url":"https://o/v1"},"mlx-serve":{"base_url":"stale"}}}"#
         let entries = [
-            AgentModelEntry(id: "org/m1", budget: .init(context: 32768, output: 16384), vision: false),
-            AgentModelEntry(id: "org/m2", budget: .init(context: 262144, output: 65536), vision: true),
+            AgentModelEntry(id: "org/m1", budget: .init(context: 32768, output: 16384, compactionReserve: 8192), vision: false),
+            AgentModelEntry(id: "org/m2", budget: .init(context: 262144, output: 65536, compactionReserve: 20000), vision: true),
         ]
         let json = try XCTUnwrap(AgentConfigs.fxSettingsJSON(
             existing: existing, baseURL: "http://127.0.0.1:11234", entries: entries))
@@ -693,8 +693,8 @@ final class CLISetupInstructionsTests: XCTestCase {
     /// its own key; xAI-named helper models are pinned to the launched one.
     func testGrokConfigDeclaresEveryModelAndPinsTheHelpers() {
         let entries = [
-            AgentModelEntry(id: "org/m1", budget: .init(context: 32768, output: 16384), vision: false),
-            AgentModelEntry(id: "org/m2", budget: .init(context: 262144, output: 65536), vision: true),
+            AgentModelEntry(id: "org/m1", budget: .init(context: 32768, output: 16384, compactionReserve: 8192), vision: false),
+            AgentModelEntry(id: "org/m2", budget: .init(context: 262144, output: 65536, compactionReserve: 20000), vision: true),
         ]
         let toml = AgentConfigs.grokConfigTOML(baseURL: "http://127.0.0.1:11234", model: "org/m2", budget: budget, entries: entries)
         for key in ["default", "session_summary", "image_description", "prompt_suggestion"] {

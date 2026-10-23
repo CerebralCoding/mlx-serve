@@ -1,0 +1,370 @@
+//! Who serves a pack, and the engine's `ModelConfig` for one a plugin serves: the registry's claimant parses the pack
+//! into `Parsed` and one adapter builds the generic config the engine reads from it. A pack whose type is not in the
+//! served set, that no plugin claims, whose plugin declines it, or that carries a drafter sidecar its plugin cannot
+//! feed (no `SpecHooks.trunk_weight`) stays on the legacy parse.
+
+const std = @import("std");
+const abi = @import("../../../abi/plugin.zig");
+const quant_abi = @import("../../../abi/quant.zig");
+const common = @import("../../../abi/common.zig");
+const sdk_plugin = @import("../../../sdk/plugin.zig");
+const registry = @import("../../../plugins/registry.zig");
+const served = @import("served.zig");
+const model = @import("../model.zig");
+const log = @import("../../../host/log.zig");
+const FsPackDir = @import("../../../host/registry/pack_dir.zig").FsPackDir;
+const dflash = @import("../spec/dflash/dflash.zig");
+const intree = @import("intree.zig");
+
+const ModelConfig = model.ModelConfig;
+
+/// A served pack's plugin and what its parse produced; owned by the `ModelConfig` it rides (`ModelConfig.deinit`).
+pub const Binding = struct {
+    table: *const abi.ModelTable,
+    parsed: abi.Parsed = .{},
+
+    pub fn destroy(b: *Binding, a: std.mem.Allocator) void {
+        b.table.free_parsed(&b.parsed);
+        a.destroy(b);
+    }
+};
+
+/// The registry's claimant of the pack, when its type is served; null otherwise (two claimants at one rank too).
+pub fn claimant(model_type: []const u8, config_json: []const u8, dir: *const abi.PackDir) ?*const abi.ModelTable {
+    return claimantIn(&registry.entries, model_type, config_json, dir);
+}
+
+fn claimantIn(list: []const sdk_plugin.Entry, model_type: []const u8, config_json: []const u8, dir: *const abi.PackDir) ?*const abi.ModelTable {
+    if (!served.serves(model_type)) return null;
+    var ranks: [64]abi.Claim = undefined;
+    if (list.len > ranks.len) return null;
+    const got = sdk_plugin.claimsOf(list, model_type, config_json, dir, &ranks);
+    const i = (common.pick(got) catch return null) orelse return null;
+    return list[i].model;
+}
+
+/// The table hands drafters (and the canvas loop) the trunk's embedding table and head.
+pub fn lendsTrunk(table: *const abi.ModelTable) bool {
+    const sp = table.spec orelse return false;
+    return sp.trunk_weight != null;
+}
+
+/// The served model binds a DFlash drafter or the Gemma assistant: the trunk lent and its layers captured. An MTP head
+/// needs the trunk alone (`plugin/head.zig`).
+pub fn servesDflash(table: *const abi.ModelTable, p: *const abi.Parsed) bool {
+    return lendsTrunk(table) and p.caps.dflash_capture;
+}
+
+/// The plugin's parse of the pack at `model_dir` (`config_json` its config.json), as the generic `ModelConfig` of its
+/// facts alone carrying its binding (`adapted`); null when the legacy path serves it.
+pub fn parseServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) !?ModelConfig {
+    const b = (try bindServed(io, a, model_dir, config_json)) orelse return null;
+    return adapted(b);
+}
+
+/// The generic `ModelConfig` of a binding's facts, owning it: for a type the legacy parse cannot read.
+pub fn adapted(b: *Binding) ModelConfig {
+    var cfg = modelConfig(&b.parsed);
+    applyLayout(&cfg, b.table, &b.parsed);
+    cfg.plugin = b;
+    return cfg;
+}
+
+/// The plugin's claim and parse of the pack at `model_dir` (caller owns the binding); null when the legacy path
+/// serves it, `error.PluginDeclinedNoLegacy` when that path is gone for the type. The engine's config of a served
+/// pack is the legacy parse with this binding attached.
+pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) !?*Binding {
+    if (try bindOrLegacy(io, a, model_dir, config_json)) |b| return b;
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const model_type = sdk_plugin.modelTypeOf(arena.allocator(), config_json) catch return null;
+    if (!served.legacyRemoved(model_type)) return null;
+    log.err("[plugin] {s}: its plugin does not serve this pack and the legacy forward is gone\n", .{model_type});
+    return error.PluginDeclinedNoLegacy;
+}
+
+/// `config_json` with the launch's `--config-overrides` merged in, as the legacy parse reads it; in `a`.
+pub fn withOverrides(a: std.mem.Allocator, config_json: []const u8) ![]const u8 {
+    const ov = model.getConfigOverrides() orelse return config_json;
+    return model.mergeConfigJson(a, config_json, ov);
+}
+
+fn bindOrLegacy(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, config_json: []const u8) !?*Binding {
+    switch (try resolve(io, a, model_dir, config_json)) {
+        .bound => |b| return b,
+        .legacy => |why| {
+            log.info("[plugin] {s}: {s}; the legacy path serves it\n", .{ std.fs.path.basename(model_dir), why });
+            return null;
+        },
+    }
+}
+
+/// Who serves a pack: its plugin's binding (caller owns it), or the legacy path and why (static text).
+pub const Outcome = union(enum) { bound: *Binding, legacy: []const u8 };
+
+pub fn resolve(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json: []const u8) !Outcome {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    // The plugin parses what the legacy parse reads: the overrides land in both.
+    const config_json = try withOverrides(arena.allocator(), raw_json);
+    const model_type = try sdk_plugin.modelTypeOf(arena.allocator(), config_json);
+    if (!served.serves(model_type)) return .{ .legacy = "type not served" };
+    var fs = FsPackDir.open(io, model_dir) catch return .{ .legacy = "pack dir unreadable" };
+    defer fs.close();
+    const dir = fs.packDir();
+    const table = claimant(model_type, config_json, &dir) orelse return .{ .legacy = "no single claimant" };
+    const b = try a.create(Binding);
+    b.* = .{ .table = table };
+    const v = table.parse(&dir, abi.Str.of(config_json), .{}, null, false, &b.parsed);
+    if (!v.isOk()) {
+        a.destroy(b);
+        return .{ .legacy = v.why.slice() };
+    }
+    // A drafter sidecar the plugin cannot serve stays with the legacy path while one exists; a type whose legacy
+    // forward is gone serves without drafters (the load skips the sidecar by name).
+    if (servesDflash(table, &b.parsed) or served.legacyRemoved(model_type)) {} else if (dflash.resolveInDirDrafter(io, a, model_dir)) |p| {
+        a.free(p);
+        table.free_parsed(&b.parsed);
+        a.destroy(b);
+        return .{ .legacy = "a drafter sidecar the plugin does not serve" };
+    }
+    // The legacy parse infers an embedding pack's pooling from its folder name, which `parse` never sees: an encoder
+    // serves under that config's pooling, a decoder only where its plugin serves the embedding batch.
+    if (!b.parsed.caps.embed and !served.servesDecoderEmbedding(model_type) and model.poolingFromDirName(std.fs.path.basename(model_dir), model_type) != null) {
+        b.destroy(a);
+        return .{ .legacy = "pooling from the folder name on a decoder" };
+    }
+    if (b.parsed.caps.block_diffusion and !lendsTrunk(table)) {
+        // The canvas loop's self-conditioning reads the trunk's embedding table.
+        b.destroy(a);
+        return .{ .legacy = "canvas model without trunk_weight" };
+    }
+    return .{ .bound = b };
+}
+
+/// What discovery reads of a served pack: the stub parse's shell and caps.
+pub const Stub = struct { shell: abi.Shell, caps: abi.Caps };
+
+/// The plugin's stub parse of the pack at `model_dir`; null when the legacy reading serves it.
+pub fn stubOf(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, raw_json: []const u8) ?Stub {
+    var arena = std.heap.ArenaAllocator.init(a);
+    defer arena.deinit();
+    const config_json = withOverrides(arena.allocator(), raw_json) catch return null;
+    const model_type = sdk_plugin.modelTypeOf(arena.allocator(), config_json) catch return null;
+    if (!served.serves(model_type)) return null;
+    var fs = FsPackDir.open(io, model_dir) catch return null;
+    defer fs.close();
+    const dir = fs.packDir();
+    const table = claimant(model_type, config_json, &dir) orelse return null;
+    var p: abi.Parsed = .{};
+    if (!table.parse(&dir, abi.Str.of(config_json), .{}, null, true, &p).isOk()) return null;
+    defer table.free_parsed(&p);
+    return .{ .shell = p.shell, .caps = p.caps };
+}
+
+fn optF32(v: f32) ?f32 {
+    return if (std.math.isNan(v)) null else v;
+}
+
+/// The engine's generic config of a parsed pack. Fields the forward alone reads (norm epsilon, rope schedule, tied
+/// head, attention scale) stay the plugin's and keep their defaults here; `contextCap` and the SSD namespace read
+/// the binding.
+pub fn modelConfig(p: *const abi.Parsed) ModelConfig {
+    const s = &p.shell;
+    var c: ModelConfig = .{
+        .model_type = s.model_type.slice(),
+        .weight_prefix = if (p.weights.prefix.len > 0) p.weights.prefix.slice() else "model",
+        .vocab_size = s.vocab_size,
+        .hidden_size = s.hidden_size,
+        .intermediate_size = s.intermediate_size,
+        .intermediate_size_declared = s.intermediate_size > 0,
+        .num_hidden_layers = s.num_hidden_layers,
+        .num_attention_heads = s.num_attention_heads,
+        .num_key_value_heads = s.num_key_value_heads,
+        .head_dim = s.head_dim,
+        .max_position_embeddings = std.math.cast(u32, s.max_position_embeddings) orelse std.math.maxInt(u32),
+        .num_experts_per_tok = s.num_experts_per_tok,
+        .moe_intermediate_size = s.moe_intermediate_size,
+        .bos_token_id = if (s.bos >= 0) std.math.cast(u32, s.bos) else null,
+        .gen_temperature = optF32(s.gen.temperature),
+        .gen_top_p = optF32(s.gen.top_p),
+        .gen_min_p = optF32(s.gen.min_p),
+        .gen_top_k = if (s.gen.top_k > 0) @intCast(s.gen.top_k) else null,
+        .gen_enable_thinking = switch (s.gen.enable_thinking) {
+            .unset => null,
+            .on => true,
+            .off => false,
+        },
+        // The generic model: every layer full attention, plain norms, no Gemma traits.
+        .has_sliding_window = false,
+        .norm_has_offset = false,
+        .scale_embeddings = p.spec.embed_scale > 0,
+        .has_pre_ff_norm = false,
+        .has_qk_norm = false,
+        .hidden_act = .silu,
+        .has_vision = p.caps.images,
+        .canvas_length = if (p.caps.block_diffusion) p.canvas.length else 0,
+        .diffusion_max_steps = p.canvas.max_steps,
+        .diffusion_t_min = p.canvas.t_min,
+        .diffusion_t_max = p.canvas.t_max,
+        .diffusion_entropy_bound = p.canvas.entropy_bound,
+        .diffusion_confidence_threshold = p.canvas.confidence_threshold,
+        .diffusion_stability_threshold = p.canvas.stability_threshold,
+        .diffusion_pad_token = p.canvas.pad_token,
+        .image_token_id = p.placeholder_ids.image,
+        .video_token_id = p.placeholder_ids.video,
+        .audio_token_id = p.placeholder_ids.audio,
+        // Recurrent layers: the slots get SSM entries, the prefix cache keeps checkpoints.
+        .has_hybrid_layers = p.cache.ssm_state.entries > 0,
+        .ssm_state_f32 = p.cache.ssm_state.dtype == .f32,
+        .pooling_mode = switch (p.embed.pooling) {
+            .unset => null,
+            .mean => .mean,
+            .cls => .cls,
+            .last_token => .last_token,
+        },
+    };
+    if (s.quant.bits > 0) {
+        c.quant_bits = s.quant.bits;
+        if (s.quant.group_size > 0) c.quant_group_size = s.quant.group_size;
+        c.quant_mode = switch (s.quant.mode) {
+            .none, .affine => .affine,
+            .nvfp4 => .nvfp4,
+            .mxfp4 => .mxfp4,
+            .mxfp8 => .mxfp8,
+            .gguf => .gguf,
+        };
+    }
+    for (s.eos[0..@min(s.eos_count, abi.max_eos)]) |e| c.addEosToken(e);
+    applySamplingDefaults(&c, p.chat.sampling_defaults);
+    return c;
+}
+
+/// The family's sampling defaults where the pack's generation_config left a knob null; a wild 1.0/1.0 signature the
+/// reference ignores resolves to its temperature (`applyFamilySamplingDefaults`, `applyDsv4ReferenceSampling`).
+fn applySamplingDefaults(c: *ModelConfig, d: abi.SamplingDefaults) void {
+    if (c.gen_top_k == null and d.top_k >= 0) c.gen_top_k = @intCast(d.top_k);
+    if (c.gen_top_p == null) c.gen_top_p = optF32(d.top_p);
+    const wild = (c.gen_temperature orelse 0) == 1.0 and (c.gen_top_p orelse 0) == 1.0;
+    if (wild) if (optF32(d.wild_temp_override)) |t| {
+        c.gen_temperature = t;
+    };
+}
+
+/// The per-layer facts the engine reads off the config (`isGlobalLayer`, the sliding window, KV sharing), from the
+/// plugin's cache layout: a model without the hook keeps every layer full attention.
+pub fn applyLayout(c: *ModelConfig, table: *const abi.ModelTable, p: *const abi.Parsed) void {
+    const layout = table.cache.layout orelse return;
+    var buf: [128]abi.LayerCache = undefined;
+    const n = layout(p, null, &buf, buf.len);
+    var window: u32 = 0;
+    for (buf[0..n], 0..) |l, i| {
+        if (l.kind == .sliding and (window == 0 or l.window < window)) window = l.window;
+        c.layer_is_global[i] = l.kind == .full;
+        if (l.kv_source >= 0) c.num_kv_shared_layers += 1;
+    }
+    if (window == 0) return;
+    c.has_sliding_window = true;
+    c.has_explicit_layer_types = true;
+    c.sliding_window = window;
+}
+
+// ── tests ──
+
+const testing = std.testing;
+const fixture = @import("../../../sdk/testing/fixture.zig");
+
+test "plugin claimant: a served type goes to its one claimant; an unserved type or two claimants to legacy" {
+    const T = struct {
+        fn mk(comptime name: []const u8, comptime types: []const []const u8) abi.ModelTable {
+            return .{ .name = .of(name), .claims = sdk_plugin.claimsByType(types), .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = undefined, .weights = undefined };
+        }
+    };
+    const a = comptime T.mk("a", &.{"llama"});
+    const twin = comptime T.mk("twin", &.{"llama"});
+    const other = comptime T.mk("other", &.{"not_served"});
+    const mem: fixture.MemDir = .{ .files = &.{} };
+    const dir = mem.packDir();
+    const one = [_]sdk_plugin.Entry{ .{ .plugin = .{ .name = "a", .kind = .model }, .model = &a }, .{ .plugin = .{ .name = "other", .kind = .model }, .model = &other } };
+    try testing.expectEqual(@as(?*const abi.ModelTable, &a), claimantIn(&one, "llama", "{}", &dir));
+    try testing.expectEqual(@as(?*const abi.ModelTable, null), claimantIn(&one, "not_served", "{}", &dir));
+    const two = [_]sdk_plugin.Entry{ .{ .plugin = .{ .name = "a", .kind = .model }, .model = &a }, .{ .plugin = .{ .name = "twin", .kind = .model }, .model = &twin } };
+    try testing.expectEqual(@as(?*const abi.ModelTable, null), claimantIn(&two, "llama", "{}", &dir));
+}
+
+test "plugin config: DFlash is served where the trunk is lent and layers captured; an MTP head needs neither caps" {
+    const T = struct {
+        fn weight(_: *anyopaque, _: abi.TrunkWeight, _: *quant_abi.Weight) callconv(.c) abi.Verdict {
+            return .ok;
+        }
+    };
+    const lent: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = undefined, .weights = undefined, .spec = &.{ .trunk_weight = &T.weight } };
+    var bare = lent;
+    bare.spec = null;
+    const capture: abi.Parsed = .{ .caps = .{ .dflash_capture = true } };
+    try testing.expect(servesDflash(&lent, &capture) and lendsTrunk(&lent));
+    try testing.expect(!servesDflash(&lent, &.{}) and !servesDflash(&bare, &capture) and !lendsTrunk(&bare));
+}
+
+test "plugin config: the cache layout sets the sliding window, the global layers and KV sharing; embed_scale the scaling" {
+    const T = struct {
+        fn layout(_: *const abi.Parsed, _: ?*const abi.LayerSpan, out: [*]abi.LayerCache, cap: u32) callconv(.c) u32 {
+            const ls = [_]abi.LayerCache{ .{ .kind = .sliding, .window = 512 }, .{ .kind = .full }, .{ .kind = .sliding, .window = 512, .kv_source = 0 }, .{ .kind = .full, .kv_source = 1 } };
+            const n = @min(cap, ls.len);
+            @memcpy(out[0..n], ls[0..n]);
+            return n;
+        }
+    };
+    const t: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &.{ .layout = &T.layout }, .weights = undefined };
+    const p: abi.Parsed = .{ .shell = .{ .num_hidden_layers = 4, .hidden_size = 64 }, .spec = .{ .embed_scale = 8 } };
+    var c = modelConfig(&p);
+    applyLayout(&c, &t, &p);
+    try testing.expect(c.has_sliding_window and c.scale_embeddings);
+    try testing.expectEqual(@as(u32, 512), c.sliding_window);
+    try testing.expectEqual(@as(u32, 2), c.num_kv_shared_layers);
+    for ([_]bool{ false, true, false, true }, 0..) |g, i| try testing.expectEqual(g, c.isGlobalLayer(@intCast(i)));
+    var plain = modelConfig(&.{});
+    applyLayout(&plain, &t, &.{ .shell = .{ .num_hidden_layers = 0 } });
+    try testing.expect(!plain.scale_embeddings);
+}
+
+test "plugin config: a served model's facts layer on the legacy config; an unset fact keeps the legacy arm" {
+    const t: abi.ModelTable = .{ .name = .of("t"), .claims = undefined, .parse = undefined, .free_parsed = undefined, .bill = undefined, .load = undefined, .unload = undefined, .forward = undefined, .cache = &.{}, .weights = undefined };
+    var b: Binding = .{ .table = &t };
+    // Legacy configs (a dense qwen3_5, MiMo, GLM-5.3): their arms answer while the plugin states nothing.
+    var c: ModelConfig = .{ .model_type = "qwen3_5" };
+    c.plugin = &b;
+    try testing.expect(c.rowExactArch() and !c.mtpReadsFinalNorm() and !c.isMoe() and !c.longCtxGated());
+    c.model_type = "mimo_v2";
+    try testing.expect(c.mtpReadsFinalNorm() and !c.rowExactArch());
+    c.model_type = "glm5_next";
+    try testing.expectEqual(@as(u32, 3), c.mtpDepth(0));
+    // A generic legacy config: the facts answer.
+    c.model_type = "llama";
+    try testing.expect(!c.rowExactArch() and !c.mtpReadsFinalNorm());
+    try testing.expectEqual(@as(u32, 0), c.mtpDepth(0));
+    b.parsed.caps = .{ .moe = true, .long_ctx = true, .exact_drafted = true };
+    b.parsed.spec = .{ .mtp_default_depth = 3, .head_reads_final_norm = true };
+    b.parsed.chat = .{ .thinking_default = .on_with_tools };
+    try testing.expect(c.isMoe() and c.longCtxGated() and c.rowExactArch() and c.mtpReadsFinalNorm());
+    try testing.expectEqual(@as(u32, 3), c.mtpDepth(0));
+    try testing.expectEqual(@as(u32, 5), c.mtpDepth(5));
+    try testing.expect(c.defaultEnableThinking(true) and !c.defaultEnableThinking(false));
+    c.gen_enable_thinking = false;
+    try testing.expect(!c.defaultEnableThinking(true));
+}
+
+test "plugin config: sampling defaults fill the knobs the pack left null; a wild signature takes the reference temperature" {
+    var p: abi.Parsed = .{ .shell = .{ .model_type = .of("qwen3") }, .chat = .{ .sampling_defaults = .{ .top_k = 64, .top_p = 0.95 } } };
+    const c = modelConfig(&p);
+    try testing.expectEqual(@as(?u32, 64), c.gen_top_k);
+    try testing.expectEqual(@as(?f32, 0.95), c.gen_top_p);
+    p.shell.gen = .{ .top_p = 0.8 };
+    try testing.expectEqual(@as(?f32, 0.8), modelConfig(&p).gen_top_p);
+    // No family facts: nothing is filled, whatever the display type says.
+    try testing.expectEqual(@as(?u32, null), modelConfig(&.{ .shell = .{ .model_type = .of("qwen3") } }).gen_top_k);
+    var wild: abi.Parsed = .{ .shell = .{ .gen = .{ .temperature = 1.0, .top_p = 1.0 } }, .chat = .{ .sampling_defaults = .{ .wild_temp_override = 0.6 } } };
+    try testing.expectEqual(@as(?f32, 0.6), modelConfig(&wild).gen_temperature);
+    wild.shell.gen.temperature = 0.7;
+    try testing.expectEqual(@as(?f32, 0.7), modelConfig(&wild).gen_temperature);
+}

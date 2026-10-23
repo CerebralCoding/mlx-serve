@@ -63,7 +63,9 @@ pub fn Decoder(comptime spec: anytype) type {
         pub fn forward(w: *const Weights, shared: *const block.Shared, g: *Graph, ids: Array, run: Run) !Out {
             if (run.mode == .batched_rows and !batches_decode) return error.BatchedRowsUnsupported;
             var c = run.ctx(g, shared);
-            var h = try Embed.forward(&w.embed, &c, ids);
+            var memo: block.Memo = .{ .g = g };
+            c.memo = &memo;
+            var h = try run.splice(g, try Embed.forward(&w.embed, &c, ids), ids);
             if (@hasDecl(Hooks, "afterEmbed")) h = try Hooks.afterEmbed(&w.extra, &c, h);
 
             var carried: ?Array = null;
@@ -87,6 +89,7 @@ pub fn Decoder(comptime spec: anytype) type {
                 if (carried) |old| g.drop(old);
                 carried = if (end.normed) |n| try g.keep(n) else null;
                 try run.capture(g, @intCast(i), h);
+                try run.cadence(i, w.layers.len, h);
             }
             c.g = g;
             var final = carried orelse try Norm.forward(&w.final_norm, &c, h);

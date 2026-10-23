@@ -2,6 +2,7 @@
 //! Owns glmMoeDecode, batchedExpertMm, moeDecodeGatherQmv, moeFp4Decode, moeAffine4Decode, moeCudaDecode, and 9 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
 const log = @import("../../../host/log.zig");
@@ -13,7 +14,6 @@ const glm5 = @import("../../../plugins/glm5_next/glm5_next.zig");
 const down_reduce = @import("down_reduce.zig");
 const gather_qmv = @import("gather_qmv.zig");
 const gather_qmv_rows = @import("gather_qmv_rows.zig");
-const envFlagCached = @import("../../../engines/mlx/env_transformer.zig").envFlagCached;
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
 const lastDim = @import("../../../engines/mlx/load/weights.zig").lastDim;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
@@ -455,19 +455,19 @@ var moe_batched_force_env: ?bool = null;
 pub fn useBatchedExpertDecode(self: *const Transformer) bool {
     return batchedExpertDecodePolicy(
         self.config.model_type,
-        envFlagCached(&moe_gather_force_env, "MLX_SERVE_MOE_GATHER_DECODE"),
-        envFlagCached(&moe_batched_force_env, "MLX_SERVE_MOE_BATCHED_DECODE"),
+        env.presentCached(&moe_gather_force_env, .MLX_SERVE_MOE_GATHER_DECODE),
+        env.presentCached(&moe_batched_force_env, .MLX_SERVE_MOE_BATCHED_DECODE),
     );
 }
 
 /// `MLX_SERVE_MOE_GATHER_DECODE=1` — force stock `gather_qmm` everywhere,
 /// the A/B control arm for any arch wiring the gather-qmv kernels in.
 pub fn gatherDecodeForcedStock() bool {
-    return envFlagCached(&moe_gather_force_env, "MLX_SERVE_MOE_GATHER_DECODE");
+    return env.presentCached(&moe_gather_force_env, .MLX_SERVE_MOE_GATHER_DECODE);
 }
 
 pub fn useGatherQmvDecode(self: *const Transformer, gate_qp: QuantParams, up_qp: QuantParams) bool {
-    if (envFlagCached(&moe_gather_force_env, "MLX_SERVE_MOE_GATHER_DECODE")) return false;
+    if (env.presentCached(&moe_gather_force_env, .MLX_SERVE_MOE_GATHER_DECODE)) return false;
     if (useBatchedExpertDecode(self)) return true; // explicit batched opt-in still tries it first
     if (gate_qp.mode == .gguf) return false; // raw ggml blocks: gatherExpertMm has their kernel
     if (self.config.hidden_act != .silu) return false;

@@ -22,6 +22,7 @@ const geom = @import("diffvae.zig");
 const na = @import("diffvae_kernel.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const status = @import("../../host/status.zig");
+const env = @import("../../env.zig");
 
 const S = mlx.mlx_stream;
 
@@ -70,16 +71,19 @@ var tile_budget_cached: ?u64 = null;
 /// (the A/B lever); otherwise it follows free memory.
 pub fn tileTokenBudget() u64 {
     if (tile_budget_cached) |v| return v;
-    const v: u64 = blk: {
-        if (std.c.getenv("MLX_SERVE_DIFFVAE_TILE_TOKENS")) |raw| {
-            if (std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 10)) |parsed| {
-                if (parsed > 0) break :blk parsed;
-            } else |_| {}
-        }
-        break :blk tileTokensForMemory(status.getAvailableMemBytes());
-    };
+    const v = tileTokenBudgetFor(status.getAvailableMemBytes());
     tile_budget_cached = v;
     return v;
+}
+
+/// `tileTokenBudget` for `available` bytes read by the caller.
+pub fn tileTokenBudgetFor(available: u64) u64 {
+    if (env.get(.MLX_SERVE_DIFFVAE_TILE_TOKENS)) |raw| {
+        if (std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 10)) |parsed| {
+            if (parsed > 0) return parsed;
+        } else |_| {}
+    }
+    return tileTokensForMemory(available);
 }
 
 /// SwiGLU token tile. Mathematically an identity — at the diffusion stage the

@@ -3,6 +3,8 @@
 //! element is frozen per `version` (its `size` is a check). Per-model values ride `Parsed`; hook tables hold functions.
 
 const Host = @import("host.zig").Host;
+const quant = @import("quant.zig");
+const Source = quant.Source;
 const std = @import("std");
 const common = @import("common.zig");
 
@@ -113,7 +115,10 @@ pub const Caps = packed struct(u64) {
     /// A pack another pack loads beside it (the ASR forced aligner).
     companion: bool = false,
     drafter: bool = false,
-    _: u39 = 0,
+    /// The model reads a Thunderbolt cluster's plan itself (`distributed.planFor`); a planned pack whose plugin does
+    /// not is loaded by the legacy path.
+    cluster_plan: bool = false,
+    _: u38 = 0,
 };
 
 pub const ThinkingDefault = enum(u8) { unset, off, on, on_with_tools };
@@ -208,6 +213,10 @@ pub const SpecFacts = extern struct {
     size: u32 = @sizeOf(SpecFacts),
     mtp_default_depth: u8 = 0,
     mtp_layout: MtpLayout = .none,
+    /// MTP heads, one per draft depth (MiMo: 3), each with its own history and each reading the trunk's hidden rows
+    /// (`hidden_in` stays the trunk's along the round); 0 or 1 = one head chained on its own output. A round's draft k
+    /// runs head k (`Forward.head`); a draft past the last head re-runs it and is never accepted.
+    mtp_heads: u32 = 0,
     head_module_owned: bool = false,
     head_reads_final_norm: bool = false,
     draft_vocab: u32 = 0,
@@ -216,6 +225,23 @@ pub const SpecFacts = extern struct {
     native_stages: u32 = 0,
     native_block: u32 = 0,
     policy: SpecPolicy = .{},
+    /// The trunk multiplies its embedding rows by this before the first layer (Gemma: sqrt(hidden)); 0 = unscaled.
+    /// A drafter that embeds through the trunk's table (`trunk_weight`) applies it itself.
+    embed_scale: f32 = 0,
+};
+
+/// A block-diffusion model's canvas loop (`Caps.block_diffusion`): the engine denoises `length` tokens per block with
+/// `.canvas` forwards and commits each block through a `.prefill` (the model's causal encoder pass).
+pub const CanvasFacts = extern struct {
+    size: u32 = @sizeOf(CanvasFacts),
+    length: u32 = 0,
+    max_steps: u32 = 48,
+    t_min: f32 = 0.4,
+    t_max: f32 = 0.8,
+    entropy_bound: f32 = 0.1,
+    confidence_threshold: f32 = 0.005,
+    stability_threshold: u32 = 1,
+    pad_token: u32 = 0,
 };
 
 /// Placeholder token ids a media item's rows replace; 0 = unset, never token 0.
@@ -230,6 +256,20 @@ pub const PlaceholderIds = extern struct {
     eoa: u32 = 0,
     vision_start: u32 = 0,
     vision_end: u32 = 0,
+};
+
+/// The model's interleaved M-RoPE spectrum, from which the engine builds a prompt chunk's angles off the prompt's
+/// position table (`Forward.mrope`).
+pub const MropeFacts = extern struct {
+    size: u32 = @sizeOf(MropeFacts),
+    /// The t/h/w frequency split; all zero = the model takes no M-RoPE table.
+    sections: [3]u32 = .{ 0, 0, 0 },
+    /// Rotated dims per head.
+    rope_dims: u32 = 0,
+    /// `rope_dims / 2` inverse frequencies (YaRN-scaled when the model scales), plugin-owned until `free_parsed`.
+    inv_freq: Span(f64) = .{},
+    /// YaRN's attention factor on the angles; 1 = none.
+    mscale: f64 = 1,
 };
 
 pub const Pooling = enum(u8) { unset, mean, cls, last_token };
@@ -260,6 +300,8 @@ pub const Parsed = extern struct {
     placeholder_ids: PlaceholderIds = .{},
     embed: EmbedFacts = .{},
     weights: WeightFacts = .{},
+    mrope: MropeFacts = .{},
+    canvas: CanvasFacts = .{},
     /// The plugin's own parsed config, read by its `bill` and `load`.
     private: ?*anyopaque = null,
 };
@@ -303,8 +345,12 @@ pub const LoadCtx = extern struct {
     stream: Stream = .{},
     /// The host table (P2 step 8); opaque until it lands.
     host: ?*const Host = null,
+    /// The pack's tensors as the engine loaded them (`sdk/weights/resident.zig`); null = the plugin reads its own.
+    weights: ?*const Source = null,
 };
 
+/// `.canvas`: a block-diffusion denoising step over `rows` canvas tokens at `positions[0]`, attending bidirectionally
+/// to the cache and the whole canvas; it reads the cache and never writes it (logits for every row).
 pub const Mode = enum(u8) { prefill, decode, verify, batched_rows, canvas };
 pub const Logits = enum(u8) { last_row, all_rows, none };
 
@@ -322,14 +368,47 @@ pub const Forward = extern struct {
     caches: Span(Handle) = .{},
     /// Layers whose hidden rows the forward publishes (DFlash); filled into `ForwardOut.captured`.
     capture_layers: Span(u32) = .{},
-    /// Media rows to splice at their placeholders, from `media_offset` on (chunked prefill resumes there).
+    /// Media rows `[n, hidden]` to splice at the placeholder ids (`Parsed.placeholder_ids`) in token order, from row
+    /// `media_offset` on (a chunked prefill resumes there).
     media: Array = .{},
     media_offset: u32 = 0,
-    /// The M-RoPE position table; null = 1-D positions.
+    /// A prompt chunk's M-RoPE angles, cos and sin stacked `[2, 1, 1, rows, rope_dims]` (built from `Parsed.mrope`);
+    /// null = 1-D positions, which then carry the slot's M-RoPE delta.
     mrope: Array = .{},
     /// How the forward reads and writes `caches`; null = a forward that keeps no state (an encoder).
     cache_ops: ?*const CacheOps = null,
+    /// The token ids as a device array `[slots, rows]` (a still-lazy sampled token); when set, `tokens` is empty.
+    ids: Array = .{},
+    /// A wide forward evaluates its residual after every this many layers and after the last (0 = never): the
+    /// engine's bound on a prompt chunk's transient memory.
+    eval_every: u32 = 0,
+    /// An MTP head's input: the trunk's hidden rows `[1, rows, hidden]` beside its token rows; a `.canvas` forward's
+    /// self-conditioning signal `[1, rows, hidden]` (null on the first denoising step).
+    hidden_in: Array = .{},
+    /// The engine reads nothing off the result before the next `forward_settle`: a host-side input the forward
+    /// needs (an n-gram lookup of a still-lazy token) may be deferred to it rather than synced inside the forward.
+    defer_host: bool = false,
+    /// A padded encoder batch's additive key mask `[slots, rows]` (0 = a real token, a large negative = padding);
+    /// empty = none. An encoder batch (`cache_ops` null) carries one `positions` entry per sequence.
+    key_mask: Array = .{},
+    /// An MTP head forward's head (`SpecFacts.mtp_heads`): its history is layer `head` of `caches[0]`. A history
+    /// append (`.none` without `want_hidden`) appends to every head.
+    head: u32 = 0,
+    /// A DFlash drafter is bound: projections and attention read the row-exact kernels wherever the model's weights
+    /// fit them, so a verify row reproduces serial decode bit for bit (`Caps.exact_drafted`).
+    row_exact: bool = false,
 };
+
+/// What a `defer_host` forward left owed (`ForwardOut.owed`), settled by `forward_settle`.
+pub const Owed = enum(u8) {
+    none,
+    /// A host-filled input of this forward's graph: settled before anything of the forward is evaluated.
+    input,
+    /// Host bookkeeping off the forward's own tokens only: the engine may settle it later (with the tokens it read).
+    history,
+};
+
+pub const Settle = enum(u8) { flush, discard };
 
 // ── Cache access ──
 
@@ -380,6 +459,14 @@ pub const CacheOps = extern struct {
     state: *const fn (cache: Handle, layer: u32, slot: StateSlot) callconv(.c) Array,
     /// Replaces the state with a new reference on `value`.
     set_state: *const fn (cache: Handle, layer: u32, slot: StateSlot, value: Array) callconv(.c) Verdict,
+    /// Layer `layer`'s `slot` over `caches[0..n]`, stacked on the batch axis (axis 1 for `.state_seq`): a new
+    /// reference the caller frees; a null array when any cache holds none yet. An engine that keeps a batch's
+    /// states merged across ticks hands its group's array, with no concat.
+    state_rows: *const fn (caches: [*]const Handle, n: u32, layer: u32, slot: StateSlot, s: Stream) callconv(.c) Array,
+    /// Replaces layer `layer`'s `slot` of `caches[0..n]` with the rows of `value` (the engine takes its own
+    /// reference). A merged group keeps `value` whole and splits a row out only when that cache is read alone or
+    /// leaves the group.
+    set_state_rows: *const fn (caches: [*]const Handle, n: u32, layer: u32, slot: StateSlot, value: Array, s: Stream) callconv(.c) Verdict,
 };
 
 /// The forward's results: every array is a new reference the host owns. `logits` is [R, vocab] with R the number
@@ -390,6 +477,8 @@ pub const ForwardOut = extern struct {
     hidden: Array = .{},
     /// Host-allocated, `capture_layers.len` entries.
     captured: ?[*]Array = null,
+    /// What each slot of a `defer_host` forward left owed (one value for every slot of the forward).
+    owed: Owed = .none,
 };
 
 // ── Hooks ──
@@ -432,9 +521,20 @@ pub const CacheHooks = extern struct {
     /// attention at the shell's geometry.
     layout: ?*const fn (p: *const Parsed, span: ?*const LayerSpan, out: [*]LayerCache, cap: u32) callconv(.c) u32 = null,
     aux: ?*const AuxHooks = null,
+    /// Module-owned conversation state (`Caps.owns_decode_state`): called before a prefill with the whole prompt and
+    /// its media rows (empty = none); returns the prompt tokens the model's own state already holds, from which the
+    /// engine prefills and which it reports as cached. 0 = none held: the plugin has reset that state for a cold
+    /// prefill.
+    resume_prompt: ?*const fn (m: *anyopaque, prompt: Span(u32), media_rows: Array) callconv(.c) u64 = null,
+    /// Bytes that module-owned state holds now (the cache budget's resident figures).
+    state_bytes: ?*const fn (m: *anyopaque) callconv(.c) u64 = null,
 };
 
-/// An MTP head's calls; `forward` takes the head's rows in `Forward.tokens` and their positions in `positions`.
+/// An MTP head's calls. `forward` takes the head's token rows (`ids` or `tokens`), the trunk's hidden rows in
+/// `hidden_in`, the head's own cache in `caches[0]` (through `cache_ops`) at `positions[0]`, and writes the head's
+/// normed output for the LAST row (`[1, 1, hidden]`, the vector the trunk's head reads) to `out.hidden`; the engine
+/// projects it. `logits = .last_row`: the engine reads that row (leading rows may append K/V only); `.none` with
+/// `want_hidden`: every row runs, the last one's output is read; `.none` without it: history only (K/V, no output).
 pub const HeadHooks = extern struct {
     size: u32 = @sizeOf(HeadHooks),
     load: *const fn (m: *anyopaque, ctx: *const LoadCtx) callconv(.c) Verdict,
@@ -457,9 +557,15 @@ pub const NativeDrafter = extern struct {
     verify: *const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict,
 };
 
+/// A trunk tensor a drafter reads beside the trunk's forward.
+pub const TrunkWeight = enum(u8) { embed, head };
+
 pub const SpecHooks = extern struct {
     size: u32 = @sizeOf(SpecHooks),
     head: ?*const HeadHooks = null,
+    /// The trunk's embedding table or LM head as loaded (borrowed until `unload`; a tied head is the table), for
+    /// drafters that read them (DFlash, the Gemma assistant, MTP heads). Null = the model serves no drafter.
+    trunk_weight: ?*const fn (m: *anyopaque, which: TrunkWeight, out: *quant.Weight) callconv(.c) Verdict = null,
     native_drafter: ?*const NativeDrafter = null,
     /// Writes the verify widths to warm into `out` (`cap` entries); returns the count.
     warmup_shapes: ?*const fn (p: *const Parsed, out: [*]u32, cap: u32) callconv(.c) u32 = null,
@@ -533,20 +639,26 @@ pub const ModelTable = extern struct {
     unload: *const fn (m: *anyopaque) callconv(.c) void,
     /// A mode the model does not declare is refused `unsupported`.
     forward: *const fn (m: *anyopaque, f: *const Forward, out: *ForwardOut) callconv(.c) Verdict,
-    /// Deferred post-sample work for `slot`.
-    forward_settle: ?*const fn (m: *anyopaque, slot: u32) callconv(.c) Verdict = null,
+    /// Settles what `slots` were left owed: `.flush` reads the tokens off the device once for every slot, or takes
+    /// `tokens` (one slot's rows, already read); `.discard` drops it (the forward is abandoned).
+    forward_settle: ?*const fn (m: *anyopaque, slots: Span(u32), how: Settle, tokens: Span(u32)) callconv(.c) Verdict = null,
+    /// A slot id the engine handed in `Forward.slots` is gone: per-slot state the plugin keeps for it is freed.
+    release_slot: ?*const fn (m: *anyopaque, slot: u32) callconv(.c) void = null,
     cache: *const CacheHooks,
     spec: ?*const SpecHooks = null,
     media: ?*const MediaHooks = null,
     embed: ?*const EmbedHooks = null,
     dist: ?*const DistHooks = null,
     weights: *const WeightHooks,
-    /// Per-request arm counters for `[spec-stats]`, in memory the plugin owns until the next call on `m`.
-    meters: ?*const fn (m: *anyopaque, out: *Str) callconv(.c) void = null,
+    /// `slot`'s arm counters for its request's summary lines (each a full log line), in memory the plugin owns until
+    /// the next call on `m`; the counters reset.
+    meters: ?*const fn (m: *anyopaque, slot: u32, out: *Str) callconv(.c) void = null,
 };
 
-/// The modes a model serves: prefill, decode and verify always; the rest as its caps declare.
+/// The modes a model serves: prefill, decode and verify always; the rest as its caps declare. An encoder (`embed`)
+/// serves prefill only, its result the hidden rows.
 pub fn declaresMode(caps: Caps, mode: Mode) bool {
+    if (caps.embed) return mode == .prefill;
     return switch (mode) {
         .prefill, .decode, .verify => true,
         .batched_rows => caps.batches_decode,
@@ -565,7 +677,7 @@ test "abi plugin: caps fit one word with the generic defaults" {
 }
 
 test "abi plugin: every struct opens with its size, set by default" {
-    inline for (.{ LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem }) |T| {
+    inline for (.{ LayerSpan, Quant, GenDefaults, Shell, NoThink, SamplingDefaults, ChatFacts, MarkerAlias, TokenizerFacts, SsmState, CacheFacts, SpecPolicy, SpecFacts, PlaceholderIds, EmbedFacts, WeightFacts, MropeFacts, CanvasFacts, Parsed, Shape, Bill, ForwardOut, KvView, LayerCache, CacheHooks, SpecHooks, EmbedHooks, WeightHooks, MediaItem }) |T| {
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
         const v: T = .{};
         try testing.expectEqual(@as(u32, @sizeOf(T)), v.size);
@@ -583,4 +695,5 @@ test "abi plugin: prefill, decode and verify are always declared; batched rows a
     try testing.expect(declaresMode(.{}, .verify) and !declaresMode(.{}, .batched_rows) and !declaresMode(.{}, .canvas));
     try testing.expect(declaresMode(.{ .batches_decode = true }, .batched_rows));
     try testing.expect(declaresMode(.{ .block_diffusion = true }, .canvas));
+    try testing.expect(declaresMode(.{ .embed = true }, .prefill) and !declaresMode(.{ .embed = true }, .decode));
 }

@@ -8,6 +8,7 @@
 //! the tool gate are refused by name.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const build_options = @import("build_options");
 const abi = @import("../../abi/engine.zig");
 const model_mod = @import("../mlx/model.zig");
@@ -73,11 +74,11 @@ pub fn Adapter(comptime B: type, comptime gpa: std.mem.Allocator) type {
 
         /// The pack's config as the host parses it (pooling and generation sidecars included).
         fn parse(model_dir: []const u8) !model_mod.ModelConfig {
-            return model_mod.parseConfig(io, gpa, model_dir);
+            return model_mod.parseConfigLegacy(io, gpa, model_dir);
         }
 
         /// Dense qwen3_5 and Qwen3 packs (`lm.archOf`).
-        fn probe(model_dir: abi.Str, _: abi.Str, out: *abi.Verdict) callconv(.c) bool {
+        pub fn probe(model_dir: abi.Str, _: abi.Str, out: *abi.Verdict) callconv(.c) bool {
             var cfg = parse(abi.items(u8, model_dir)) catch {
                 out.* = abi.Verdict.refuse(.unsupported, "no readable config.json in the pack");
                 return false;
@@ -495,7 +496,7 @@ test "ane adapter: bias, penalties and logprobs on the host rows; EOS from the c
 // ── against a real pack on the Neural Engine (`MLX_SERVE_TEST_ANE_MODEL`; skipped without it)
 
 fn realPack() ?[]const u8 {
-    const raw = std.c.getenv("MLX_SERVE_TEST_ANE_MODEL") orelse return null;
+    const raw = env.get(.MLX_SERVE_TEST_ANE_MODEL) orelse return null;
     const s = std.mem.sliceTo(raw, 0);
     return if (s.len == 0) null else s;
 }

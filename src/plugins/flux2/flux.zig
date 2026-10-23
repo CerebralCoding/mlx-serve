@@ -1,91 +1,38 @@
-//! Native FLUX.2-klein-4B text→image (Qwen3 text encoder + parallel-attn DiT +
-//! FlowMatchEuler sampler), ported from `mflux` (pure-MLX) to mlx-c FFI.
-//! VAE decoder lives in flux_vae.zig. See docs/native-mediagen/02-image-flux.md.
-//!
-//! mflux pre-quantized weights are affine 4-bit (U32 weight + bf16 scales +
-//! bf16 biases, group_size 64). We dequantize-free via mlx_quantized_matmul.
-//! Convs (VAE only) are bf16 in MLX OHWI layout already.
+//! FLUX.2 klein text to image, ported from mflux: the Qwen3 prompt encoder (layers 9/18/27 tapped), the
+//! double/single-stream DiT on the shared skeleton, FlowMatchEuler, and the VAE with its encoder (variation and
+//! edits). Weights are mflux's: affine-quantized linears (bits and group read off their geometry) and bf16 OHWI
+//! convs.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
+const ops = @import("../../mlx/ops.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const sse = @import("../../host/media_jobs/sse.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
 const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
+const qwen3 = @import("../../sdk/blocks/text_encoders/qwen3.zig");
+const rope_blk = @import("../../sdk/blocks/dit/rope.zig");
+const modulate_blk = @import("../../sdk/blocks/dit/modulate.zig");
+const timestep_blk = @import("../../sdk/blocks/dit/timestep.zig");
+const ln_blk = @import("../../sdk/blocks/norms/layer_norm_f32.zig");
+const gn_blk = @import("../../sdk/blocks/norms/group_norm.zig");
+const conv_blk = @import("../../sdk/blocks/vae/conv.zig");
+const resnet_blk = @import("../../sdk/blocks/vae/resnet.zig");
+const flow_match = @import("../../sdk/blocks/schedulers/flow_match.zig");
+const dit_base = @import("../../sdk/bases/dit.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
+const Graph = ops.Graph;
+const Array = ops.Array;
+const Resnet = resnet_blk.Resnet;
 
-// ── Low-level helpers ──
+/// The VAE's GroupNorm: 32 groups, f32 statistics, bf16 out.
+const vae_norm: resnet_blk.Norm = .{ .flat = .{ .eps = 1e-6, .out = .bfloat16 } };
 
-inline fn matmul(x: mlx.mlx_array, w_t: mlx.mlx_array, s: S) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_matmul(&o, x, w_t, s));
-    return o;
-}
-inline fn addA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&o, a, b, s));
-    return o;
-}
-inline fn mulA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_multiply(&o, a, b, s));
-    return o;
-}
-inline fn subA(a: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_subtract(&o, a, b, s));
-    return o;
-}
-inline fn reshape(x: mlx.mlx_array, shape: []const c_int, s: S) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_reshape(&o, x, shape.ptr, shape.len, s));
-    return o;
-}
-inline fn transpose(x: mlx.mlx_array, axes: []const c_int, s: S) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_transpose_axes(&o, x, axes.ptr, axes.len, s));
-    return o;
-}
-inline fn rms(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: S) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_fast_rms_norm(&o, x, w, eps, s));
-    return o;
-}
-inline fn astype(x: mlx.mlx_array, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_astype(&o, x, dt, s));
-    return o;
-}
-inline fn silu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    var sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sig);
-    try mlx.check(mlx.mlx_sigmoid(&sig, x, s));
-    return mulA(x, sig, s);
-}
-fn concat(arrs: []const mlx.mlx_array, axis: c_int, s: S) !mlx.mlx_array {
-    const vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(vec);
-    for (arrs) |a| _ = mlx.mlx_vector_array_append_value(vec, a);
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_concatenate_axis(&o, vec, axis, s));
-    return o;
-}
-/// Slice along `axis` of a 3-D [d0,d1,d2] array: [start,stop) on that axis.
-fn slice3(x: mlx.mlx_array, axis: usize, start: c_int, stop: c_int, s: S) !mlx.mlx_array {
-    const sh = mlx.getShape(x);
-    var lo = [_]c_int{ 0, 0, 0 };
-    var hi = [_]c_int{ sh[0], sh[1], sh[2] };
-    const st = [_]c_int{ 1, 1, 1 };
-    lo[axis] = start;
-    hi[axis] = stop;
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&o, x, &lo, 3, &hi, 3, &st, 3, s));
-    return o;
-}
+// ── Weight loading ──
 
 fn ownWeight(w: *const Weights, key: []const u8) !mlx.mlx_array {
     const a = w.get(key) orelse {
@@ -149,7 +96,7 @@ const QLinear = struct {
     add_bias: ?mlx.mlx_array = null, // optional additive bias (VAE attn)
     bits: u32 = 4,
     group_size: u32 = 64,
-    // Runtime adapters (non-owning; gen.zig's lora.Stack owns the arrays).
+    // Runtime adapters (non-owning; the plugin's lora.Stack owns the arrays).
     // Fixed-capacity so attach/forward never allocate.
     lora_refs: [lora_mod.MAX_LORAS]lora_mod.Ref = undefined,
     lora_count: u8 = 0,
@@ -183,29 +130,16 @@ const QLinear = struct {
         _ = mlx.mlx_array_free(self.biases);
         if (self.add_bias) |b| _ = mlx.mlx_array_free(b);
     }
-    fn forward(self: *const QLinear, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        var o = mlx.mlx_array_new();
-        if (self.w8) |*q| {
-            _ = mlx.mlx_array_free(o);
-            const xb = try astype(x, .bfloat16, s);
-            defer _ = mlx.mlx_array_free(xb);
-            o = try w8a8.forward(xb, q, s);
-        } else {
-            try mlx.check(mlx.mlx_quantized_matmul(&o, x, self.w, self.scales, self.biases, true, mlx.mlx_optional_int.some(@intCast(self.group_size)), mlx.mlx_optional_int.some(@intCast(self.bits)), "affine", s));
-        }
-        if (self.add_bias) |b| {
-            const r = try addA(o, b, s);
-            _ = mlx.mlx_array_free(o);
-            o = r;
-        }
-        if (self.lora_count > 0) {
-            const d = try lora_mod.deltaSum(x, self.lora_refs[0..self.lora_count], s);
-            defer _ = mlx.mlx_array_free(d);
-            const r = try addA(o, d, s);
-            _ = mlx.mlx_array_free(o);
-            o = r;
-        }
-        return o;
+    pub fn forward(self: *const QLinear, parent: *Graph, x: Array) !Array {
+        var g = parent.scope();
+        defer g.deinit();
+        var o = if (self.w8) |*q|
+            try g.adopt(try w8a8.forward(try g.astype(x, .bfloat16), q, g.s))
+        else
+            try g.qmm(x, self.w, self.scales, self.biases, @intCast(self.group_size), @intCast(self.bits));
+        if (self.add_bias) |b| o = try g.add(o, b);
+        if (self.lora_count > 0) o = try g.add(o, try g.adopt(try lora_mod.deltaSum(x, self.lora_refs[0..self.lora_count], g.s)));
+        return parent.keep(o);
     }
 
     /// Replace the packed weights with their int8 copy when the route takes this shape.
@@ -368,7 +302,6 @@ fn countIndexed(w: *const Weights, a: std.mem.Allocator, comptime fmt: []const u
     }
     return n;
 }
-
 // ── Qwen3 text encoder ──
 
 const TeLayer = struct {
@@ -398,6 +331,7 @@ const TeLayer = struct {
     }
 };
 
+
 pub const TextEncoder = struct {
     cfg: FluxConfig,
     allocator: std.mem.Allocator,
@@ -413,156 +347,48 @@ pub const TextEncoder = struct {
         _ = mlx.mlx_array_free(self.norm);
     }
 
-    /// Encode token ids [1, seq] (int32) with attention_mask [1, seq] → capture
-    /// raw hidden states at layers 9/18/27 → prompt_embeds [1, seq, 3*hidden].
-    pub fn encode(self: *TextEncoder, ids: []const i32, mask: []const i32) !mlx.mlx_array {
-        const s = self.s;
+    /// Token ids [seq] with their attention mask → the hidden states after layers 9, 18 and 27 side by side:
+    /// prompt_embeds [1, seq, 3·hidden].
+    pub fn encode(self: *TextEncoder, parent: *Graph, ids: []const i32, mask: []const i32) !Array {
+        var g = parent.scope();
+        defer g.deinit();
         const c = self.cfg;
+        if (self.layers.len < 27) return error.TooFewEncoderLayers;
         const seq: c_int = @intCast(ids.len);
-        const H: u32 = c.te_hidden;
-
-        // embed lookup
-        const id_shape = [_]c_int{seq};
-        const id_arr = mlx.mlx_array_new_data(ids.ptr, &id_shape, 1, .int32);
-        defer _ = mlx.mlx_array_free(id_arr);
-        var taken = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(taken);
-        try mlx.check(mlx.mlx_take_axis(&taken, self.embed_table, id_arr, 0, s));
-        var x = try reshape(taken, &[_]c_int{ 1, seq, @intCast(H) }, s);
-
-        // Build additive mask [1,1,seq,seq] = causal + padding (in f32).
-        const attn_mask = try self.buildMask(mask, seq);
-        defer _ = mlx.mlx_array_free(attn_mask);
-
-        // capture indices: list[0]=embed, list[k]=after layer k-1. Want 9,18,27.
+        const H: c_int = @intCast(c.te_hidden);
+        var x = try g.reshape(try g.take(self.embed_table, try g.fromSlice(i32, ids, &.{seq}), 0), &.{ 1, seq, H });
+        const mask_buf = try self.maskBuf(mask);
+        defer self.allocator.free(mask_buf);
+        const attn_mask = try g.fromSlice(f32, mask_buf, &.{ 1, 1, seq, seq });
+        const cfg: qwen3.Cfg = .{ .heads = @intCast(c.te_heads), .kv_heads = @intCast(c.te_kv), .head_dim = @intCast(c.te_head_dim), .eps = c.te_rms_eps };
+        const rope: qwen3.Rope = .{ .fast = .{ .theta = c.te_rope_theta, .attn_f32 = .bfloat16 } };
+        // Hidden-state list index k is the output of layer k-1 (index 0 = the embeddings).
         const want = [_]usize{ 9, 18, 27 };
-        var caps: [3]?mlx.mlx_array = .{ null, null, null };
-        errdefer for (caps) |cp| {
-            if (cp) |a| _ = mlx.mlx_array_free(a);
-        };
-
-        for (self.layers, 0..) |*layer, li| {
-            const nx = try self.layerForward(x, layer, attn_mask, seq, s);
-            _ = mlx.mlx_array_free(x);
+        var caps: [3]Array = undefined;
+        var captured = false;
+        for (self.layers, 1..) |*layer, idx| {
+            const nx = try qwen3.layerForward(&g, layer, cfg, rope, x, attn_mask);
+            if (!captured) g.drop(x);
             x = nx;
-            // list index after this layer is li+1
-            const idx = li + 1;
-            for (want, 0..) |wv, wi| {
-                if (wv == idx) {
-                    var cp = mlx.mlx_array_new();
-                    try mlx.check(mlx.mlx_array_set(&cp, x));
-                    caps[wi] = cp;
-                }
-            }
+            captured = false;
+            for (want, 0..) |wv, wi| if (wv == idx) {
+                caps[wi] = x;
+                captured = true;
+            };
         }
-        _ = mlx.mlx_array_free(x);
-
-        // stack [1,3,seq,H] → transpose [1,seq,3,H] → reshape [1,seq,3H]
-        const stacked = try concat(&[_]mlx.mlx_array{ caps[0].?, caps[1].?, caps[2].? }, 0, s); // [3, seq, H]
-        for (caps) |cp| _ = mlx.mlx_array_free(cp.?);
-        defer _ = mlx.mlx_array_free(stacked);
-        // stacked is [3, 1, seq, H] (each cap was [1,seq,H]); concat axis0 → [3,seq,H]? caps are [1,seq,H] → concat axis0 → [3,seq,H]
-        const st4 = try reshape(stacked, &[_]c_int{ 3, seq, @intCast(H) }, s);
-        defer _ = mlx.mlx_array_free(st4);
-        const tr = try transpose(st4, &[_]c_int{ 1, 0, 2 }, s); // [seq, 3, H]
-        defer _ = mlx.mlx_array_free(tr);
-        return reshape(tr, &[_]c_int{ 1, seq, @intCast(3 * H) }, s);
+        const stacked = try g.reshape(try g.concat(&caps, 0), &.{ 3, seq, H });
+        return parent.keep(try g.reshape(try g.transpose(stacked, &.{ 1, 0, 2 }), &.{ 1, seq, 3 * H }));
     }
 
-    fn buildMask(self: *TextEncoder, mask: []const i32, seq: c_int) !mlx.mlx_array {
-        const n: usize = @intCast(seq);
+    /// The additive [seq, seq] mask: causal, and padding keys masked (caller frees).
+    fn maskBuf(self: *TextEncoder, mask: []const i32) ![]f32 {
+        const n = mask.len;
         const buf = try self.allocator.alloc(f32, n * n);
-        defer self.allocator.free(buf);
         const neg = -std.math.inf(f32);
-        for (0..n) |i| {
-            for (0..n) |j| {
-                // causal: j>i → -inf; padding: mask[j]==0 → -inf
-                const causal_block = j > i;
-                const pad_block = mask[j] == 0;
-                buf[i * n + j] = if (causal_block or pad_block) neg else 0.0;
-            }
-        }
-        const shape = [_]c_int{ 1, 1, seq, seq };
-        const f = mlx.mlx_array_new_data(buf.ptr, &shape, 4, .float32);
-        return f;
-    }
-
-    fn layerForward(self: *TextEncoder, x: mlx.mlx_array, layer: *const TeLayer, mask: mlx.mlx_array, seq: c_int, s: S) !mlx.mlx_array {
-        const c = self.cfg;
-        const eps = c.te_rms_eps;
-        const heads: c_int = @intCast(c.te_heads);
-        const kv: c_int = @intCast(c.te_kv);
-        const hd: c_int = @intCast(c.te_head_dim);
-
-        const xn = try rms(x, layer.input_ln, eps, s);
-        defer _ = mlx.mlx_array_free(xn);
-        const q = try layer.q.forward(xn, s);
-        defer _ = mlx.mlx_array_free(q);
-        const k = try layer.k.forward(xn, s);
-        defer _ = mlx.mlx_array_free(k);
-        const v = try layer.v.forward(xn, s);
-        defer _ = mlx.mlx_array_free(v);
-        // reshape [1,seq,heads,hd], q/k norm over hd, transpose [1,heads,seq,hd]
-        const q4 = try reshape(q, &[_]c_int{ 1, seq, heads, hd }, s);
-        defer _ = mlx.mlx_array_free(q4);
-        const qn = try rms(q4, layer.q_norm, eps, s);
-        defer _ = mlx.mlx_array_free(qn);
-        const qt = try transpose(qn, &[_]c_int{ 0, 2, 1, 3 }, s);
-        defer _ = mlx.mlx_array_free(qt);
-        const k4 = try reshape(k, &[_]c_int{ 1, seq, kv, hd }, s);
-        defer _ = mlx.mlx_array_free(k4);
-        const kn = try rms(k4, layer.k_norm, eps, s);
-        defer _ = mlx.mlx_array_free(kn);
-        const kt = try transpose(kn, &[_]c_int{ 0, 2, 1, 3 }, s);
-        defer _ = mlx.mlx_array_free(kt);
-        const v4 = try reshape(v, &[_]c_int{ 1, seq, kv, hd }, s);
-        defer _ = mlx.mlx_array_free(v4);
-        const vt = try transpose(v4, &[_]c_int{ 0, 2, 1, 3 }, s);
-        defer _ = mlx.mlx_array_free(vt);
-        // RoPE (NeoX) θ 1e6
-        const base = mlx.mlx_optional_float.some(c.te_rope_theta);
-        var qr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(qr);
-        try mlx.check(mlx.mlx_fast_rope(&qr, qt, hd, false, base, 1.0, 0, .{ .ctx = null }, s));
-        var kr = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(kr);
-        try mlx.check(mlx.mlx_fast_rope(&kr, kt, hd, false, base, 1.0, 0, .{ .ctx = null }, s));
-        // SDPA in f32 with explicit mask
-        const qf = try astype(qr, .float32, s);
-        defer _ = mlx.mlx_array_free(qf);
-        const kf = try astype(kr, .float32, s);
-        defer _ = mlx.mlx_array_free(kf);
-        const vf = try astype(vt, .float32, s);
-        defer _ = mlx.mlx_array_free(vf);
-        const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(c.te_head_dim)));
-        var attn = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(attn);
-        const null_sink = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qf, kf, vf, scale, "array", mask, null_sink, false, s));
-        const attn_bf = try astype(attn, .bfloat16, s);
-        defer _ = mlx.mlx_array_free(attn_bf);
-        const at = try transpose(attn_bf, &[_]c_int{ 0, 2, 1, 3 }, s);
-        defer _ = mlx.mlx_array_free(at);
-        const af = try reshape(at, &[_]c_int{ 1, seq, heads * hd }, s);
-        defer _ = mlx.mlx_array_free(af);
-        const o = try layer.o.forward(af, s);
-        defer _ = mlx.mlx_array_free(o);
-        const h1 = try addA(x, o, s);
-        defer _ = mlx.mlx_array_free(h1);
-        // MLP
-        const hn = try rms(h1, layer.post_ln, eps, s);
-        defer _ = mlx.mlx_array_free(hn);
-        const g = try layer.gate.forward(hn, s);
-        defer _ = mlx.mlx_array_free(g);
-        const sg = try silu(g, s);
-        defer _ = mlx.mlx_array_free(sg);
-        const u = try layer.up.forward(hn, s);
-        defer _ = mlx.mlx_array_free(u);
-        const gu = try mulA(sg, u, s);
-        defer _ = mlx.mlx_array_free(gu);
-        const dn = try layer.down.forward(gu, s);
-        defer _ = mlx.mlx_array_free(dn);
-        return addA(h1, dn, s);
+        for (0..n) |i| for (0..n) |j| {
+            buf[i * n + j] = if (j > i or mask[j] == 0) neg else 0.0;
+        };
+        return buf;
     }
 };
 
@@ -640,51 +466,8 @@ pub fn loadTextEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir
 }
 
 
-// ════════════════════════════════════════════════════════════════════════
-// Flux2 DiT (parallel-attn): 5 double + 20 single blocks, shared modulation.
-// ════════════════════════════════════════════════════════════════════════
-
-inline fn meanLast(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_mean_axis(&o, x, -1, true, s));
-    return o;
-}
-/// LayerNorm with affine=false: (x-mean)/sqrt(var+eps) over last dim.
-fn layerNormNA(x: mlx.mlx_array, eps: f32, s: S) !mlx.mlx_array {
-    const xf = try astype(x, .float32, s);
-    defer _ = mlx.mlx_array_free(xf);
-    const m = try meanLast(xf, s);
-    defer _ = mlx.mlx_array_free(m);
-    const xc = try subA(xf, m, s);
-    defer _ = mlx.mlx_array_free(xc);
-    const sq = try mulA(xc, xc, s);
-    defer _ = mlx.mlx_array_free(sq);
-    const v = try meanLast(sq, s);
-    defer _ = mlx.mlx_array_free(v);
-    const epsa = mlx.mlx_array_new_float(eps);
-    defer _ = mlx.mlx_array_free(epsa);
-    var ve = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ve);
-    try mlx.check(mlx.mlx_add(&ve, v, epsa, s));
-    var rs = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rs);
-    try mlx.check(mlx.mlx_rsqrt(&rs, ve, s));
-    const out = try mulA(xc, rs, s);
-    defer _ = mlx.mlx_array_free(out);
-    return astype(out, .bfloat16, s);
-}
-
-/// modulated = (1+scale)*ln + shift   (all [1,seq,D] / [1,1,D] broadcast)
-fn modulate(ln: mlx.mlx_array, scale: mlx.mlx_array, shift: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const one = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(one);
-    var sp1 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sp1);
-    try mlx.check(mlx.mlx_add(&sp1, scale, one, s));
-    const m = try mulA(ln, sp1, s);
-    defer _ = mlx.mlx_array_free(m);
-    return addA(m, shift, s);
-}
+// ── DiT: double-stream blocks (text and image apart, joint attention), then single-stream blocks over the joint
+// sequence [text, image]; one modulation per stream kind, shared by every block ──
 
 const DoubleBlock = struct {
     q: QLinear, k: QLinear, v: QLinear, o: QLinear,
@@ -729,8 +512,8 @@ pub const Dit = struct {
         self.norm_out_lin.deinit(); self.proj_out.deinit();
     }
 
-    /// Build interleaved-RoPE cos/sin [seq,64] from ids [seq,4] (computed on CPU).
-    fn buildRope(self: *Dit, ids: []const i32, seq: usize) !struct { cos: mlx.mlx_array, sin: mlx.mlx_array } {
+    /// Interleaved-RoPE cos/sin [seq, 64] from position ids [seq, 4] (t, h, w, l), 16 frequencies per axis.
+    fn buildRope(self: *const Dit, g: *Graph, ids: []const i32, seq: usize) !struct { cos: Array, sin: Array } {
         const cosb = try self.allocator.alloc(f32, seq * 64);
         defer self.allocator.free(cosb);
         const sinb = try self.allocator.alloc(f32, seq * 64);
@@ -749,273 +532,200 @@ pub const Dit = struct {
             }
         }
         const shape = [_]c_int{ @intCast(seq), 64 };
-        const cf = mlx.mlx_array_new_data(cosb.ptr, &shape, 2, .float32);
-        const sf = mlx.mlx_array_new_data(sinb.ptr, &shape, 2, .float32);
-        return .{ .cos = cf, .sin = sf };
+        return .{ .cos = try g.fromSlice(f32, cosb, &shape), .sin = try g.fromSlice(f32, sinb, &shape) };
     }
 
-    /// apply interleaved RoPE to q [1,H,seq,128] using cos/sin [seq,64] (f32).
-    fn applyRope(self: *Dit, q: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, seq: c_int, heads: c_int) !mlx.mlx_array {
-        const s = self.s;
-        const qf = try astype(q, .float32, s);
-        defer _ = mlx.mlx_array_free(qf);
-        const q5 = try reshape(qf, &[_]c_int{ 1, heads, seq, 64, 2 }, s); // [.,64,2]
-        defer _ = mlx.mlx_array_free(q5);
-        // real/imag via slice on last axis
-        const real = try sliceLast2(q5, 0, s);
-        defer _ = mlx.mlx_array_free(real);
-        const imag = try sliceLast2(q5, 1, s);
-        defer _ = mlx.mlx_array_free(imag);
-        const cos_b = try reshape(cos, &[_]c_int{ 1, 1, seq, 64 }, s);
-        defer _ = mlx.mlx_array_free(cos_b);
-        const sin_b = try reshape(sin, &[_]c_int{ 1, 1, seq, 64 }, s);
-        defer _ = mlx.mlx_array_free(sin_b);
-        // out0 = real*cos - imag*sin ; out1 = imag*cos + real*sin
-        const rc = try mulA(real, cos_b, s); defer _ = mlx.mlx_array_free(rc);
-        const is_ = try mulA(imag, sin_b, s); defer _ = mlx.mlx_array_free(is_);
-        const out0 = try subA(rc, is_, s); defer _ = mlx.mlx_array_free(out0);
-        const ic = try mulA(imag, cos_b, s); defer _ = mlx.mlx_array_free(ic);
-        const rs2 = try mulA(real, sin_b, s); defer _ = mlx.mlx_array_free(rs2);
-        const out1 = try addA(ic, rs2, s); defer _ = mlx.mlx_array_free(out1);
-        // stack last axis: [.,64,1] each then concat → [.,64,2] → reshape [.,128]
-        const o0e = try reshape(out0, &[_]c_int{ 1, heads, seq, 64, 1 }, s); defer _ = mlx.mlx_array_free(o0e);
-        const o1e = try reshape(out1, &[_]c_int{ 1, heads, seq, 64, 1 }, s); defer _ = mlx.mlx_array_free(o1e);
-        const st = try concat(&[_]mlx.mlx_array{ o0e, o1e }, 4, s); defer _ = mlx.mlx_array_free(st);
-        const flat = try reshape(st, &[_]c_int{ 1, heads, seq, 128 }, s); defer _ = mlx.mlx_array_free(flat);
-        return astype(flat, .bfloat16, s);
-    }
-
-    /// Full DiT forward. latents [1,Ni,128], enc [1,Nt,7680], temb-driving timestep
-    /// scalar, img_ids/txt_ids slices. Returns noise [1,Ni,128].
-    pub fn forward(self: *Dit, latents: mlx.mlx_array, enc: mlx.mlx_array, timestep: f32, img_ids: []const i32, txt_ids: []const i32) !mlx.mlx_array {
-        const s = self.s;
+    /// The noise prediction [1, Ni, 128] for latents [1, Ni, 128] beside the prompt [1, Nt, joint] at `timestep`
+    /// (×1000 scale), with the position ids of both.
+    pub fn forward(self: *const Dit, parent: *Graph, latents: Array, enc: Array, timestep: f32, img_ids: []const i32, txt_ids: []const i32) !Array {
+        var g = parent.scope();
+        defer g.deinit();
         const c = self.cfg;
         const inner: c_int = @intCast(c.inner_dim);
-        const heads: c_int = @intCast(c.heads);
-        const hd: c_int = @intCast(c.head_dim);
-        const Nt: c_int = mlx.getShape(enc)[1];
-        const Ni: c_int = mlx.getShape(latents)[1];
-        const Nj = Nt + Ni;
-
-        // temb = time_guidance_embed(timestep)
-        const temb = try self.timeEmbed(timestep);
-        defer _ = mlx.mlx_array_free(temb);
-
-        // embed
-        var hs = try self.x_embedder.forward(latents, s); // [1,Ni,inner]
-        var ehs = try self.context_embedder.forward(enc, s); // [1,Nt,inner]
-
-        // rope for txt then img, concat
-        const tr = try self.buildRope(txt_ids, @intCast(Nt));
-        defer { _ = mlx.mlx_array_free(tr.cos); _ = mlx.mlx_array_free(tr.sin); }
-        const ir = try self.buildRope(img_ids, @intCast(Ni));
-        defer { _ = mlx.mlx_array_free(ir.cos); _ = mlx.mlx_array_free(ir.sin); }
-        const cos = try concat(&[_]mlx.mlx_array{ tr.cos, ir.cos }, 0, s); defer _ = mlx.mlx_array_free(cos);
-        const sin = try concat(&[_]mlx.mlx_array{ tr.sin, ir.sin }, 0, s); defer _ = mlx.mlx_array_free(sin);
-
-        // modulation params (Flux2Modulation applies silu(temb) before the linear)
-        const stemb = try silu(temb, s); defer _ = mlx.mlx_array_free(stemb);
-        const mi = try self.mod_img.forward(stemb, s); defer _ = mlx.mlx_array_free(mi); // [1,1,6*inner]
-        const mt = try self.mod_txt.forward(stemb, s); defer _ = mlx.mlx_array_free(mt);
-        const ms = try self.mod_single.forward(stemb, s); defer _ = mlx.mlx_array_free(ms); // [1,1,3*inner]
-
-        for (self.doubles) |*b| {
-            const r = try self.doubleBlock(hs, ehs, b, mi, mt, cos, sin, Nt, Ni, heads, hd, inner, s);
-            _ = mlx.mlx_array_free(hs); _ = mlx.mlx_array_free(ehs);
-            hs = r.img; ehs = r.txt;
-        }
-        // concat [text, image]
-        var joint = try concat(&[_]mlx.mlx_array{ ehs, hs }, 1, s);
-        _ = mlx.mlx_array_free(hs); _ = mlx.mlx_array_free(ehs);
-        for (self.singles) |*b| {
-            const nj = try self.singleBlock(joint, b, ms, cos, sin, Nj, heads, hd, inner, s);
-            _ = mlx.mlx_array_free(joint); joint = nj;
-        }
-        // slice off text
-        const img = try slice3(joint, 1, Nt, Nj, s);
-        _ = mlx.mlx_array_free(joint);
-        defer _ = mlx.mlx_array_free(img);
-        // norm_out (AdaLayerNormContinuous): linear(silu(temb)) → [scale,shift]
-        const stmb = try silu(temb, s); defer _ = mlx.mlx_array_free(stmb);
-        const so = try self.norm_out_lin.forward(stmb, s); defer _ = mlx.mlx_array_free(so); // [1,1,2*inner]
-        const scale = try slice3(so, 2, 0, inner, s); defer _ = mlx.mlx_array_free(scale);
-        const shift = try slice3(so, 2, inner, 2 * inner, s); defer _ = mlx.mlx_array_free(shift);
-        const ln = try layerNormNA(img, 1e-6, s); defer _ = mlx.mlx_array_free(ln);
-        const modded = try modulate(ln, scale, shift, s); defer _ = mlx.mlx_array_free(modded);
-        return self.proj_out.forward(modded, s); // [1,Ni,128]
-    }
-
-    fn timeEmbed(self: *Dit, t: f32) !mlx.mlx_array {
-        const s = self.s;
-        // sinusoidal(256), flip_sin_to_cos
-        var buf: [256]f32 = undefined;
-        const half = 128;
-        for (0..half) |i| {
-            const freq = std.math.exp(-std.math.log(f32, std.math.e, 10000.0) * @as(f32, @floatFromInt(i)) / @as(f32, half));
-            const arg = t * freq;
-            buf[i] = @sin(arg);
-            buf[half + i] = @cos(arg);
-        }
-        // flip: cat(emb[half:], emb[:half]) = [cos..., sin...]
-        var flipped: [256]f32 = undefined;
-        @memcpy(flipped[0..half], buf[half..256]);
-        @memcpy(flipped[half..256], buf[0..half]);
-        const shape = [_]c_int{ 1, 256 };
-        const te = mlx.mlx_array_new_data(&flipped, &shape, 2, .float32);
-        defer _ = mlx.mlx_array_free(te);
-        const te_bf = try astype(te, .bfloat16, s);
-        defer _ = mlx.mlx_array_free(te_bf);
-        const l1 = try self.t_lin1.forward(te_bf, s); defer _ = mlx.mlx_array_free(l1);
-        const a = try silu(l1, s); defer _ = mlx.mlx_array_free(a);
-        const t2 = try self.t_lin2.forward(a, s); defer _ = mlx.mlx_array_free(t2); // [1, inner]
-        return reshape(t2, &[_]c_int{ 1, 1, @intCast(self.cfg.inner_dim) }, s); // [1,1,inner]
-    }
-
-    fn attention(self: *Dit, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, seq: c_int, heads: c_int, hd: c_int, s: S) !mlx.mlx_array {
-        _ = self;
-        const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(hd)));
-        if (w8a8.enabled) if (try int8_attn.attention(q, k, v, scale, s)) |o| {
-            defer _ = mlx.mlx_array_free(o);
-            return reshape(o, &[_]c_int{ 1, seq, heads * hd }, s);
+        const nt = ops.shape(enc)[1];
+        const nj = nt + ops.shape(latents)[1];
+        const temb = try self.timeEmbed(&g, timestep);
+        const tr = try self.buildRope(&g, txt_ids, @intCast(nt));
+        const ir = try self.buildRope(&g, img_ids, @intCast(nj - nt));
+        const rope_sh = [_]c_int{ 1, 1, nj, 64 };
+        // Flux2Modulation applies silu(temb) before its linear.
+        const stemb = try g.silu(temb);
+        var ctx: StepCtx = .{
+            .nt = nt,
+            .nj = nj,
+            .inner = inner,
+            .heads = @intCast(c.heads),
+            .hd = @intCast(c.head_dim),
+            .mlp_h = @intFromFloat(@as(f32, @floatFromInt(inner)) * c.mlp_ratio),
+            .cos = try g.reshape(try g.concat(&.{ tr.cos, ir.cos }, 0), &rope_sh),
+            .sin = try g.reshape(try g.concat(&.{ tr.sin, ir.sin }, 0), &rope_sh),
+            .temb = temb,
         };
-        var attn = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(attn);
-        const null_a = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, q, k, v, scale, "", null_a, null_a, false, s));
-        const at = try transpose(attn, &[_]c_int{ 0, 2, 1, 3 }, s); defer _ = mlx.mlx_array_free(at);
-        return reshape(at, &[_]c_int{ 1, seq, heads * hd }, s);
+        try chunks(&g, try self.mod_img.forward(&g, stemb), inner, &ctx.mi);
+        try chunks(&g, try self.mod_txt.forward(&g, stemb), inner, &ctx.mt);
+        try chunks(&g, try self.mod_single.forward(&g, stemb), inner, &ctx.ms);
+        return parent.keep(try dit_base.Dit(Hooks).forward(&g, self, .{ .latents = latents, .enc = enc }, ctx, null));
     }
 
-    fn splitHeads(self: *Dit, x: mlx.mlx_array, seq: c_int, heads: c_int, hd: c_int, norm: mlx.mlx_array, s: S) !mlx.mlx_array {
-        _ = self;
-        const x4 = try reshape(x, &[_]c_int{ 1, seq, heads, hd }, s); defer _ = mlx.mlx_array_free(x4);
-        const xt = try transpose(x4, &[_]c_int{ 0, 2, 1, 3 }, s); defer _ = mlx.mlx_array_free(xt);
-        // q/k norm over hd in f32
-        const xf = try astype(xt, .float32, s); defer _ = mlx.mlx_array_free(xf);
-        const xn = try rms(xf, norm, 1e-5, s); defer _ = mlx.mlx_array_free(xn);
-        return astype(xn, .bfloat16, s);
-    }
-
-    fn doubleBlock(self: *Dit, hs: mlx.mlx_array, ehs: mlx.mlx_array, b: *const DoubleBlock, mi: mlx.mlx_array, mt: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, Nt: c_int, Ni: c_int, heads: c_int, hd: c_int, inner: c_int, s: S) !struct { img: mlx.mlx_array, txt: mlx.mlx_array } {
-        // unpack mod: img has 6 chunks [shift_msa,scale_msa,gate_msa,shift_mlp,scale_mlp,gate_mlp]
-        const im = try modChunks(mi, inner, 6, s); defer for (im) |x| { _ = mlx.mlx_array_free(x); };
-        const tm = try modChunks(mt, inner, 6, s); defer for (tm) |x| { _ = mlx.mlx_array_free(x); };
-        // norm + modulate
-        const nh = try layerNormNA(hs, 1e-6, s); defer _ = mlx.mlx_array_free(nh);
-        const nhm = try modulate(nh, im[1], im[0], s); defer _ = mlx.mlx_array_free(nhm);
-        const ne = try layerNormNA(ehs, 1e-6, s); defer _ = mlx.mlx_array_free(ne);
-        const nem = try modulate(ne, tm[1], tm[0], s); defer _ = mlx.mlx_array_free(nem);
-        // qkv for image
-        const q = try b.q.forward(nhm, s); defer _ = mlx.mlx_array_free(q);
-        const k = try b.k.forward(nhm, s); defer _ = mlx.mlx_array_free(k);
-        const v = try b.v.forward(nhm, s); defer _ = mlx.mlx_array_free(v);
-        const qh = try self.splitHeads(q, Ni, heads, hd, b.nq, s); defer _ = mlx.mlx_array_free(qh);
-        const kh = try self.splitHeads(k, Ni, heads, hd, b.nk, s); defer _ = mlx.mlx_array_free(kh);
-        const vh4 = try reshape(v, &[_]c_int{ 1, Ni, heads, hd }, s); defer _ = mlx.mlx_array_free(vh4);
-        const vh = try transpose(vh4, &[_]c_int{ 0, 2, 1, 3 }, s); defer _ = mlx.mlx_array_free(vh);
-        // qkv for text
-        const eq = try b.add_q.forward(nem, s); defer _ = mlx.mlx_array_free(eq);
-        const ek = try b.add_k.forward(nem, s); defer _ = mlx.mlx_array_free(ek);
-        const ev = try b.add_v.forward(nem, s); defer _ = mlx.mlx_array_free(ev);
-        const eqh = try self.splitHeads(eq, Nt, heads, hd, b.naq, s); defer _ = mlx.mlx_array_free(eqh);
-        const ekh = try self.splitHeads(ek, Nt, heads, hd, b.nak, s); defer _ = mlx.mlx_array_free(ekh);
-        const evh4 = try reshape(ev, &[_]c_int{ 1, Nt, heads, hd }, s); defer _ = mlx.mlx_array_free(evh4);
-        const evh = try transpose(evh4, &[_]c_int{ 0, 2, 1, 3 }, s); defer _ = mlx.mlx_array_free(evh);
-        // concat [text, image] on seq axis (axis 2)
-        const qj = try concat(&[_]mlx.mlx_array{ eqh, qh }, 2, s); defer _ = mlx.mlx_array_free(qj);
-        const kj = try concat(&[_]mlx.mlx_array{ ekh, kh }, 2, s); defer _ = mlx.mlx_array_free(kj);
-        const vj = try concat(&[_]mlx.mlx_array{ evh, vh }, 2, s); defer _ = mlx.mlx_array_free(vj);
-        const Nj = Nt + Ni;
-        const qr = try self.applyRope(qj, cos, sin, Nj, heads); defer _ = mlx.mlx_array_free(qr);
-        const kr = try self.applyRope(kj, cos, sin, Nj, heads); defer _ = mlx.mlx_array_free(kr);
-        const attn = try self.attention(qr, kr, vj, Nj, heads, hd, s); defer _ = mlx.mlx_array_free(attn);
-        // split back
-        const a_txt = try slice3(attn, 1, 0, Nt, s); defer _ = mlx.mlx_array_free(a_txt);
-        const a_img = try slice3(attn, 1, Nt, Nj, s); defer _ = mlx.mlx_array_free(a_img);
-        const ao_img = try b.o.forward(a_img, s); defer _ = mlx.mlx_array_free(ao_img);
-        const ao_txt = try b.add_o.forward(a_txt, s); defer _ = mlx.mlx_array_free(ao_txt);
-        // gated residual
-        const g_img = try mulA(im[2], ao_img, s); defer _ = mlx.mlx_array_free(g_img);
-        const hs1 = try addA(hs, g_img, s); defer _ = mlx.mlx_array_free(hs1);
-        const g_txt = try mulA(tm[2], ao_txt, s); defer _ = mlx.mlx_array_free(g_txt);
-        const ehs1 = try addA(ehs, g_txt, s); defer _ = mlx.mlx_array_free(ehs1);
-        // FF image
-        const nh2 = try layerNormNA(hs1, 1e-6, s); defer _ = mlx.mlx_array_free(nh2);
-        const nh2m = try modulate(nh2, im[4], im[3], s); defer _ = mlx.mlx_array_free(nh2m);
-        const ff_img = try self.feedForward(nh2m, &b.ff_in, &b.ff_out, s); defer _ = mlx.mlx_array_free(ff_img);
-        const gff_img = try mulA(im[5], ff_img, s); defer _ = mlx.mlx_array_free(gff_img);
-        const img_out = try addA(hs1, gff_img, s);
-        // FF text
-        const ne2 = try layerNormNA(ehs1, 1e-6, s); defer _ = mlx.mlx_array_free(ne2);
-        const ne2m = try modulate(ne2, tm[4], tm[3], s); defer _ = mlx.mlx_array_free(ne2m);
-        const ff_txt = try self.feedForward(ne2m, &b.ffc_in, &b.ffc_out, s); defer _ = mlx.mlx_array_free(ff_txt);
-        const gff_txt = try mulA(tm[5], ff_txt, s); defer _ = mlx.mlx_array_free(gff_txt);
-        const txt_out = try addA(ehs1, gff_txt, s);
-        return .{ .img = img_out, .txt = txt_out };
-    }
-
-    fn singleBlock(self: *Dit, hs: mlx.mlx_array, b: *const SingleBlock, ms: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, Nj: c_int, heads: c_int, hd: c_int, inner: c_int, s: S) !mlx.mlx_array {
-        const m = try modChunks(ms, inner, 3, s); defer for (m) |x| { _ = mlx.mlx_array_free(x); };
-        const nh = try layerNormNA(hs, 1e-6, s); defer _ = mlx.mlx_array_free(nh);
-        const nhm = try modulate(nh, m[1], m[0], s); defer _ = mlx.mlx_array_free(nhm);
-        const proj = try b.qkv_mlp.forward(nhm, s); defer _ = mlx.mlx_array_free(proj); // [1,Nj, 3*inner + 2*mlp]
-        const mlp_h: c_int = @intFromFloat(@as(f32, @floatFromInt(inner)) * self.cfg.mlp_ratio);
-        const qkv = try slice3(proj, 2, 0, 3 * inner, s); defer _ = mlx.mlx_array_free(qkv);
-        const mlp = try slice3(proj, 2, 3 * inner, 3 * inner + 2 * mlp_h, s); defer _ = mlx.mlx_array_free(mlp);
-        const q = try slice3(qkv, 2, 0, inner, s); defer _ = mlx.mlx_array_free(q);
-        const k = try slice3(qkv, 2, inner, 2 * inner, s); defer _ = mlx.mlx_array_free(k);
-        const v = try slice3(qkv, 2, 2 * inner, 3 * inner, s); defer _ = mlx.mlx_array_free(v);
-        const qh = try self.splitHeads(q, Nj, heads, hd, b.nq, s); defer _ = mlx.mlx_array_free(qh);
-        const kh = try self.splitHeads(k, Nj, heads, hd, b.nk, s); defer _ = mlx.mlx_array_free(kh);
-        const vh4 = try reshape(v, &[_]c_int{ 1, Nj, heads, hd }, s); defer _ = mlx.mlx_array_free(vh4);
-        const vh = try transpose(vh4, &[_]c_int{ 0, 2, 1, 3 }, s); defer _ = mlx.mlx_array_free(vh);
-        const qr = try self.applyRope(qh, cos, sin, Nj, heads); defer _ = mlx.mlx_array_free(qr);
-        const kr = try self.applyRope(kh, cos, sin, Nj, heads); defer _ = mlx.mlx_array_free(kr);
-        const attn = try self.attention(qr, kr, vh, Nj, heads, hd, s); defer _ = mlx.mlx_array_free(attn);
-        // SwiGLU on mlp: split 2 → silu(x1)*x2
-        const x1 = try slice3(mlp, 2, 0, mlp_h, s); defer _ = mlx.mlx_array_free(x1);
-        const x2 = try slice3(mlp, 2, mlp_h, 2 * mlp_h, s); defer _ = mlx.mlx_array_free(x2);
-        const sx1 = try silu(x1, s); defer _ = mlx.mlx_array_free(sx1);
-        const mlp_act = try mulA(sx1, x2, s); defer _ = mlx.mlx_array_free(mlp_act);
-        const cat = try concat(&[_]mlx.mlx_array{ attn, mlp_act }, 2, s); defer _ = mlx.mlx_array_free(cat);
-        const ao = try b.o.forward(cat, s); defer _ = mlx.mlx_array_free(ao);
-        const g = try mulA(m[2], ao, s); defer _ = mlx.mlx_array_free(g);
-        return addA(hs, g, s);
-    }
-
-    fn feedForward(self: *Dit, x: mlx.mlx_array, lin_in: *const QLinear, lin_out: *const QLinear, s: S) !mlx.mlx_array {
-        _ = self;
-        const proj = try lin_in.forward(x, s); defer _ = mlx.mlx_array_free(proj); // [.,2*inner_ff]
-        const sh = mlx.getShape(proj);
-        const half = @divExact(sh[2], 2);
-        const x1 = try slice3(proj, 2, 0, half, s); defer _ = mlx.mlx_array_free(x1);
-        const x2 = try slice3(proj, 2, half, 2 * half, s); defer _ = mlx.mlx_array_free(x2);
-        const sx1 = try silu(x1, s); defer _ = mlx.mlx_array_free(sx1);
-        const act = try mulA(sx1, x2, s); defer _ = mlx.mlx_array_free(act);
-        return lin_out.forward(act, s);
+    /// The time MLP over sinusoidal features (cos half first) → [1, 1, inner].
+    fn timeEmbed(self: *const Dit, parent: *Graph, t: f32) !Array {
+        var g = parent.scope();
+        defer g.deinit();
+        var feats: [256]f32 = undefined;
+        timestep_blk.sinusoid(f32, &feats, t, .cos_first);
+        const te = try g.astype(try g.fromSlice(f32, &feats, &.{ 1, 256 }), .bfloat16);
+        const t2 = try self.t_lin2.forward(&g, try g.silu(try self.t_lin1.forward(&g, te)));
+        return parent.keep(try g.reshape(t2, &.{ 1, 1, @intCast(self.cfg.inner_dim) }));
     }
 };
 
-/// Split a modulation output [1,1,n*inner] into n chunks of [1,1,inner].
-fn modChunks(mod: mlx.mlx_array, inner: c_int, n: usize, s: S) ![6]mlx.mlx_array {
-    var out: [6]mlx.mlx_array = .{ .{ .ctx = null }, .{ .ctx = null }, .{ .ctx = null }, .{ .ctx = null }, .{ .ctx = null }, .{ .ctx = null } };
-    for (0..n) |i| {
-        out[i] = try slice3(mod, 2, @intCast(@as(c_int, @intCast(i)) * inner), @intCast(@as(c_int, @intCast(i + 1)) * inner), s);
-    }
-    return out;
+/// One step's conditioning: the rope tables over [text, image], the three modulations split into their rows.
+const StepCtx = struct {
+    nt: c_int,
+    nj: c_int,
+    inner: c_int,
+    heads: c_int,
+    hd: c_int,
+    mlp_h: c_int,
+    cos: Array,
+    sin: Array,
+    temb: Array,
+    /// [shift, scale, gate] for attention then the MLP, each [1, 1, inner].
+    mi: [6]Array = undefined,
+    mt: [6]Array = undefined,
+    ms: [3]Array = undefined,
+};
+
+/// `mod` [1, 1, n·inner] → its n rows.
+fn chunks(g: *Graph, mod: Array, inner: c_int, out: []Array) !void {
+    for (out, 0..) |*o, i| o.* = try g.sliceAxis(mod, 2, @as(c_int, @intCast(i)) * inner, @as(c_int, @intCast(i + 1)) * inner);
 }
 
-/// Slice index `idx` (0 or 1) of the last axis of a [..,64,2] array → [..,64].
-fn sliceLast2(x: mlx.mlx_array, idx: c_int, s: S) !mlx.mlx_array {
-    const sh = mlx.getShape(x); // [1,H,seq,64,2]
-    var lo = [_]c_int{ 0, 0, 0, 0, idx };
-    var hi = [_]c_int{ sh[0], sh[1], sh[2], sh[3], idx + 1 };
-    const st = [_]c_int{ 1, 1, 1, 1, 1 };
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_slice(&o, x, &lo, 5, &hi, 5, &st, 5, s));
-    const sq = try reshape(o, &[_]c_int{ sh[0], sh[1], sh[2], sh[3] }, s);
-    _ = mlx.mlx_array_free(o);
-    return sq;
+/// The skeleton's hooks: the activation between blocks is the joint sequence [text, image].
+const Hooks = struct {
+    pub const Model = Dit;
+    pub const Ctx = StepCtx;
+    pub const Input = struct { latents: Array, enc: Array };
+
+    pub fn embed(parent: *Graph, m: *const Dit, in: Input, _: StepCtx) !Array {
+        var g = parent.scope();
+        defer g.deinit();
+        const hs = try m.x_embedder.forward(&g, in.latents);
+        const ehs = try m.context_embedder.forward(&g, in.enc);
+        return parent.keep(try g.concat(&.{ ehs, hs }, 1));
+    }
+
+    pub fn layers(m: *const Dit) usize {
+        return m.doubles.len + m.singles.len;
+    }
+
+    pub fn block(g: *Graph, m: *const Dit, i: usize, x: Array, ctx: StepCtx) !Array {
+        if (i < m.doubles.len) return doubleBlock(g, &m.doubles[i], x, ctx);
+        return singleBlock(g, &m.singles[i - m.doubles.len], x, ctx);
+    }
+
+    /// AdaLayerNormContinuous on the image span, then the projection out.
+    pub fn final(parent: *Graph, m: *const Dit, x: Array, ctx: StepCtx) !Array {
+        var g = parent.scope();
+        defer g.deinit();
+        const img = try g.sliceAxis(x, 1, ctx.nt, ctx.nj);
+        const so = try m.norm_out_lin.forward(&g, try g.silu(ctx.temb));
+        const scale = try g.sliceAxis(so, 2, 0, ctx.inner);
+        const shift = try g.sliceAxis(so, 2, ctx.inner, 2 * ctx.inner);
+        const modded = try modulated(&g, img, scale, shift);
+        return parent.keep(try m.proj_out.forward(&g, modded));
+    }
+};
+
+/// LayerNorm without affine (f32 statistics, bf16 out), then x·(scale + 1) + shift.
+fn modulated(g: *Graph, x: Array, scale: Array, shift: Array) !Array {
+    var c = g.scope();
+    defer c.deinit();
+    return g.keep(try modulate_blk.modulate(&c, try ln_blk.layerNormF32(&c, x, null, null, 1e-6, .bfloat16), scale, shift, .float32));
+}
+
+/// [1, seq, heads·hd] → [1, heads, seq, hd], RMS-normed over hd in f32, back to bf16.
+fn headsNormed(parent: *Graph, x: Array, seq: c_int, ctx: StepCtx, norm: Array) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    const xt = try g.transpose(try g.reshape(x, &.{ 1, seq, ctx.heads, ctx.hd }), &.{ 0, 2, 1, 3 });
+    return parent.keep(try g.astype(try g.rmsNorm(try g.astype(xt, .float32), norm, 1e-5), .bfloat16));
+}
+
+fn heads(g: *Graph, x: Array, seq: c_int, ctx: StepCtx) !Array {
+    var c = g.scope();
+    defer c.deinit();
+    return g.keep(try c.transpose(try c.reshape(x, &.{ 1, seq, ctx.heads, ctx.hd }), &.{ 0, 2, 1, 3 }));
+}
+
+/// Joint attention over [text, image] after RoPE → [1, Nj, heads·hd].
+fn attention(parent: *Graph, q: Array, k: Array, v: Array, ctx: StepCtx) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    const qr = try rope_blk.ropePairs(&g, q, ctx.cos, ctx.sin, .bfloat16);
+    const kr = try rope_blk.ropePairs(&g, k, ctx.cos, ctx.sin, .bfloat16);
+    const out_sh = [_]c_int{ 1, ctx.nj, ctx.heads * ctx.hd };
+    const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(ctx.hd)));
+    if (w8a8.enabled) if (try int8_attn.attention(qr, kr, v, scale, g.s)) |o|
+        return parent.keep(try g.reshape(try g.adopt(o), &out_sh));
+    const at = try g.transpose(try g.sdpa(qr, kr, v, scale, .none), &.{ 0, 2, 1, 3 });
+    return parent.keep(try g.reshape(at, &out_sh));
+}
+
+/// SwiGLU over the fused gate|up projection.
+fn feedForward(parent: *Graph, x: Array, lin_in: *const QLinear, lin_out: *const QLinear) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    const proj = try lin_in.forward(&g, x);
+    const half = @divExact(ops.shape(proj)[2], 2);
+    const act = try g.mul(try g.silu(try g.sliceAxis(proj, 2, 0, half)), try g.sliceAxis(proj, 2, half, 2 * half));
+    return parent.keep(try lin_out.forward(&g, act));
+}
+
+fn doubleBlock(parent: *Graph, b: *const DoubleBlock, x: Array, ctx: StepCtx) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    const ni = ctx.nj - ctx.nt;
+    const im = ctx.mi;
+    const tm = ctx.mt;
+    const ehs = try g.sliceAxis(x, 1, 0, ctx.nt);
+    const hs = try g.sliceAxis(x, 1, ctx.nt, ctx.nj);
+    const nhm = try modulated(&g, hs, im[1], im[0]);
+    const nem = try modulated(&g, ehs, tm[1], tm[0]);
+    const qh = try headsNormed(&g, try b.q.forward(&g, nhm), ni, ctx, b.nq);
+    const kh = try headsNormed(&g, try b.k.forward(&g, nhm), ni, ctx, b.nk);
+    const vh = try heads(&g, try b.v.forward(&g, nhm), ni, ctx);
+    const eqh = try headsNormed(&g, try b.add_q.forward(&g, nem), ctx.nt, ctx, b.naq);
+    const ekh = try headsNormed(&g, try b.add_k.forward(&g, nem), ctx.nt, ctx, b.nak);
+    const evh = try heads(&g, try b.add_v.forward(&g, nem), ctx.nt, ctx);
+    const attn = try attention(&g, try g.concat(&.{ eqh, qh }, 2), try g.concat(&.{ ekh, kh }, 2), try g.concat(&.{ evh, vh }, 2), ctx);
+    const ao_img = try b.o.forward(&g, try g.sliceAxis(attn, 1, ctx.nt, ctx.nj));
+    const ao_txt = try b.add_o.forward(&g, try g.sliceAxis(attn, 1, 0, ctx.nt));
+    const hs1 = try g.add(hs, try g.mul(im[2], ao_img));
+    const ehs1 = try g.add(ehs, try g.mul(tm[2], ao_txt));
+    const ff_img = try feedForward(&g, try modulated(&g, hs1, im[4], im[3]), &b.ff_in, &b.ff_out);
+    const img_out = try g.add(hs1, try g.mul(im[5], ff_img));
+    const ff_txt = try feedForward(&g, try modulated(&g, ehs1, tm[4], tm[3]), &b.ffc_in, &b.ffc_out);
+    const txt_out = try g.add(ehs1, try g.mul(tm[5], ff_txt));
+    return parent.keep(try g.concat(&.{ txt_out, img_out }, 1));
+}
+
+/// Parallel attention + SwiGLU from one fused projection.
+fn singleBlock(parent: *Graph, b: *const SingleBlock, x: Array, ctx: StepCtx) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    const m = ctx.ms;
+    const inner = ctx.inner;
+    const proj = try b.qkv_mlp.forward(&g, try modulated(&g, x, m[1], m[0]));
+    const qkv = try g.sliceAxis(proj, 2, 0, 3 * inner);
+    const mlp = try g.sliceAxis(proj, 2, 3 * inner, 3 * inner + 2 * ctx.mlp_h);
+    const qh = try headsNormed(&g, try g.sliceAxis(qkv, 2, 0, inner), ctx.nj, ctx, b.nq);
+    const kh = try headsNormed(&g, try g.sliceAxis(qkv, 2, inner, 2 * inner), ctx.nj, ctx, b.nk);
+    const vh = try heads(&g, try g.sliceAxis(qkv, 2, 2 * inner, 3 * inner), ctx.nj, ctx);
+    const attn = try attention(&g, qh, kh, vh, ctx);
+    const mlp_act = try g.mul(try g.silu(try g.sliceAxis(mlp, 2, 0, ctx.mlp_h)), try g.sliceAxis(mlp, 2, ctx.mlp_h, 2 * ctx.mlp_h));
+    const ao = try b.o.forward(&g, try g.concat(&.{ attn, mlp_act }, 2));
+    return parent.keep(try g.add(x, try g.mul(m[2], ao)));
 }
 
 pub fn loadDit(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []const u8) !Dit {
@@ -1141,127 +851,7 @@ fn loadDouble(w: *const Weights, a: std.mem.Allocator, pfx: []const u8) !DoubleB
     };
 }
 
-// Stage 2 oracle: DiT one forward → noise_step0.
-//   FLUX_TEST_MODEL, FLUX_LATENTS (latents_init f32), FLUX_PE, FLUX_IMGIDS, FLUX_TXTIDS, FLUX_NOISE0
-test "flux DiT reproduces noise_step0" {
-    const model_dir = std.mem.span(std.c.getenv("FLUX_TEST_MODEL") orelse return error.SkipZigTest);
-    const lat_p = std.mem.span(std.c.getenv("FLUX_LATENTS") orelse return error.SkipZigTest);
-    const pe_p = std.mem.span(std.c.getenv("FLUX_PE") orelse return error.SkipZigTest);
-    const ii_p = std.mem.span(std.c.getenv("FLUX_IMGIDS") orelse return error.SkipZigTest);
-    const ti_p = std.mem.span(std.c.getenv("FLUX_TXTIDS") orelse return error.SkipZigTest);
-    const n0_p = std.mem.span(std.c.getenv("FLUX_NOISE0") orelse return error.SkipZigTest);
-    const a = testing.allocator;
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const lat = try readF32(io, a, lat_p); defer a.free(lat);
-    const pe = try readF32(io, a, pe_p); defer a.free(pe);
-    const ii = try readI32(io, a, ii_p); defer a.free(ii);
-    const ti = try readI32(io, a, ti_p); defer a.free(ti);
-    const ref = try readF32(io, a, n0_p); defer a.free(ref);
-
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    var dit = try loadDit(io, a, s, model_dir); defer dit.deinit();
-
-    // upload latents [1,4096,128] and pe [1,512,7680] as bf16
-    const lat_sh = [_]c_int{ 1, 4096, 128 };
-    const lat_f = mlx.mlx_array_new_data(lat.ptr, &lat_sh, 3, .float32); defer _ = mlx.mlx_array_free(lat_f);
-    const lat_bf = try astype(lat_f, .bfloat16, s); defer _ = mlx.mlx_array_free(lat_bf);
-    const pe_sh = [_]c_int{ 1, 512, 7680 };
-    const pe_f = mlx.mlx_array_new_data(pe.ptr, &pe_sh, 3, .float32); defer _ = mlx.mlx_array_free(pe_f);
-    const pe_bf = try astype(pe_f, .bfloat16, s); defer _ = mlx.mlx_array_free(pe_bf);
-
-    const noise = try dit.forward(lat_bf, pe_bf, 1000.0, ii, ti);
-    defer _ = mlx.mlx_array_free(noise);
-    const nf = try astype(noise, .float32, s); defer _ = mlx.mlx_array_free(nf);
-    _ = mlx.mlx_array_eval(nf);
-    const n: usize = @intCast(mlx.mlx_array_size(nf));
-    const data = mlx.mlx_array_data_float32(nf) orelse return error.NoData;
-    try testing.expectEqual(ref.len, n);
-    var dot: f64 = 0; var na: f64 = 0; var nb: f64 = 0;
-    for (0..n) |i| { dot += @as(f64, data[i]) * ref[i]; na += @as(f64, data[i]) * data[i]; nb += @as(f64, ref[i]) * ref[i]; }
-    const corr = dot / (std.math.sqrt(na) * std.math.sqrt(nb));
-    std.debug.print("[flux-dit] n={d} corr={d:.6}\n", .{ n, corr });
-    try testing.expect(corr > 0.99);
-}
-
-
-// ════════════════════════════════════════════════════════════════════════
-// Flux2 VAE decoder: packed latents [1,128,64,64] → image [1,3,1024,1024].
-// Convs are bf16 OHWI; data flows NHWC inside each conv/groupnorm.
-// ════════════════════════════════════════════════════════════════════════
-
-/// conv2d on NHWC input with bf16 OHWI weight [out,kh,kw,in] + bias [out].
-fn conv2d(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, pad: c_int, s: S) !mlx.mlx_array {
-    // Materialize: mlx_conv2d silently miscomputes on strided/lazy-view inputs.
-    var xc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xc);
-    try mlx.check(mlx.mlx_contiguous(&xc, x, false, s));
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_conv2d(&o, xc, w, 1, 1, pad, pad, 1, 1, 1, s));
-    const r = try addA(o, bias, s);
-    _ = mlx.mlx_array_free(o);
-    return r;
-}
-
-/// PyTorch-compatible GroupNorm (32 groups) on NHWC [1,H,W,C], fp32, + affine.
-fn groupNorm(x: mlx.mlx_array, weight: mlx.mlx_array, bias: mlx.mlx_array, groups: c_int, s: S) !mlx.mlx_array {
-    const sh = mlx.getShape(x); // [1,H,W,C]
-    const H = sh[1];
-    const Wd = sh[2];
-    const C = sh[3];
-    const cg = @divExact(C, groups);
-    const xf = try astype(x, .float32, s); defer _ = mlx.mlx_array_free(xf);
-    // [1,H,W,C] -> [1, H*W, groups, cg] -> [1, groups, H*W, cg] -> [1, groups, H*W*cg]
-    const r1 = try reshape(xf, &[_]c_int{ 1, H * Wd, groups, cg }, s); defer _ = mlx.mlx_array_free(r1);
-    const t1 = try transpose(r1, &[_]c_int{ 0, 2, 1, 3 }, s); defer _ = mlx.mlx_array_free(t1);
-    const flat = try reshape(t1, &[_]c_int{ 1, groups, H * Wd * cg }, s); defer _ = mlx.mlx_array_free(flat);
-    var mean = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(mean);
-    try mlx.check(mlx.mlx_mean_axis(&mean, flat, -1, true, s));
-    const xc = try subA(flat, mean, s); defer _ = mlx.mlx_array_free(xc);
-    const sq = try mulA(xc, xc, s); defer _ = mlx.mlx_array_free(sq);
-    var v = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(v);
-    try mlx.check(mlx.mlx_mean_axis(&v, sq, -1, true, s));
-    const epsa = mlx.mlx_array_new_float(1e-6); defer _ = mlx.mlx_array_free(epsa);
-    var ve = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(ve);
-    try mlx.check(mlx.mlx_add(&ve, v, epsa, s));
-    var rsq = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(rsq);
-    try mlx.check(mlx.mlx_rsqrt(&rsq, ve, s));
-    const norm = try mulA(xc, rsq, s); defer _ = mlx.mlx_array_free(norm);
-    // back to NHWC
-    const b1 = try reshape(norm, &[_]c_int{ 1, groups, H * Wd, cg }, s); defer _ = mlx.mlx_array_free(b1);
-    const b2 = try transpose(b1, &[_]c_int{ 0, 2, 1, 3 }, s); defer _ = mlx.mlx_array_free(b2);
-    const b3 = try reshape(b2, &[_]c_int{ 1, H, Wd, C }, s); defer _ = mlx.mlx_array_free(b3);
-    // affine (weight/bias per channel, bf16)
-    const wf = try astype(weight, .float32, s); defer _ = mlx.mlx_array_free(wf);
-    const bf = try astype(bias, .float32, s); defer _ = mlx.mlx_array_free(bf);
-    const sc = try mulA(b3, wf, s); defer _ = mlx.mlx_array_free(sc);
-    const out = try addA(sc, bf, s); defer _ = mlx.mlx_array_free(out);
-    return astype(out, .bfloat16, s);
-}
-
-const Resnet = struct {
-    n1w: mlx.mlx_array, n1b: mlx.mlx_array, c1w: mlx.mlx_array, c1b: mlx.mlx_array,
-    n2w: mlx.mlx_array, n2b: mlx.mlx_array, c2w: mlx.mlx_array, c2b: mlx.mlx_array,
-    sw: ?mlx.mlx_array = null, sb: ?mlx.mlx_array = null, // conv_shortcut (1x1)
-    fn deinit(self: *Resnet) void {
-        inline for (.{ "n1w","n1b","c1w","c1b","n2w","n2b","c2w","c2b" }) |f| _ = mlx.mlx_array_free(@field(self, f));
-        if (self.sw) |x| _ = mlx.mlx_array_free(x);
-        if (self.sb) |x| _ = mlx.mlx_array_free(x);
-    }
-    fn forward(self: *const Resnet, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        const h0 = try groupNorm(x, self.n1w, self.n1b, 32, s); defer _ = mlx.mlx_array_free(h0);
-        const a0 = try silu(h0, s); defer _ = mlx.mlx_array_free(a0);
-        const c1 = try conv2d(a0, self.c1w, self.c1b, 1, s); defer _ = mlx.mlx_array_free(c1);
-        const h1 = try groupNorm(c1, self.n2w, self.n2b, 32, s); defer _ = mlx.mlx_array_free(h1);
-        const a1 = try silu(h1, s); defer _ = mlx.mlx_array_free(a1);
-        const c2 = try conv2d(a1, self.c2w, self.c2b, 1, s); defer _ = mlx.mlx_array_free(c2);
-        if (self.sw) |sw| {
-            const sc = try conv2d(x, sw, self.sb.?, 0, s); defer _ = mlx.mlx_array_free(sc);
-            return addA(c2, sc, s);
-        }
-        return addA(c2, x, s);
-    }
-};
+// ── VAE: packed latents [1, 128, h, w] ↔ pixels [1, 3, 16h, 16w]; channels-last inside, bf16 activations ──
 
 const VaeAttn = struct {
     gnw: mlx.mlx_array, gnb: mlx.mlx_array,
@@ -1270,25 +860,24 @@ const VaeAttn = struct {
         _ = mlx.mlx_array_free(self.gnw); _ = mlx.mlx_array_free(self.gnb);
         self.q.deinit(); self.k.deinit(); self.v.deinit(); self.o.deinit();
     }
-    fn forward(self: *const VaeAttn, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        const sh = mlx.getShape(x); const H = sh[1]; const Wd = sh[2]; const C = sh[3];
-        const normed = try groupNorm(x, self.gnw, self.gnb, 32, s); defer _ = mlx.mlx_array_free(normed);
-        const q = try self.q.forward(normed, s); defer _ = mlx.mlx_array_free(q);
-        const k = try self.k.forward(normed, s); defer _ = mlx.mlx_array_free(k);
-        const v = try self.v.forward(normed, s); defer _ = mlx.mlx_array_free(v);
-        // [1,H,W,C] -> [1, 1, H*W, C] (single head)
-        const qr = try reshape(q, &[_]c_int{ 1, 1, H * Wd, C }, s); defer _ = mlx.mlx_array_free(qr);
-        const kr = try reshape(k, &[_]c_int{ 1, 1, H * Wd, C }, s); defer _ = mlx.mlx_array_free(kr);
-        const vr = try reshape(v, &[_]c_int{ 1, 1, H * Wd, C }, s); defer _ = mlx.mlx_array_free(vr);
-        const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(C)));
-        var attn = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(attn);
-        const null_a = mlx.mlx_array{ .ctx = null };
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn, qr, kr, vr, scale, "", null_a, null_a, false, s));
-        const ar = try reshape(attn, &[_]c_int{ 1, H, Wd, C }, s); defer _ = mlx.mlx_array_free(ar);
-        const ao = try self.o.forward(ar, s); defer _ = mlx.mlx_array_free(ao);
-        return addA(x, ao, s);
-    }
 };
+
+/// Frees the arrays a loaded resnet owns.
+fn freeResnet(r: *Resnet) void {
+    inline for (.{ "n1w", "c1w", "c1b", "n2w", "c2w", "c2b" }) |f| _ = mlx.mlx_array_free(@field(r, f));
+    inline for (.{ "n1b", "n2b", "sw", "sb" }) |f| if (@field(r, f)) |x| {
+        _ = mlx.mlx_array_free(x);
+    };
+}
+
+/// The batch-norm statistics the latents are standardized by: mean and sqrt(var + 1e-4), f32 [1, 128, 1, 1].
+fn bnStats(parent: *Graph, mean: Array, variance: Array) !struct { mean: Array, std: Array } {
+    var g = parent.scope();
+    defer g.deinit();
+    const vsh = [_]c_int{ 1, 128, 1, 1 };
+    const sd = try g.sqrt(try g.add(try g.reshape(variance, &vsh), try g.scalar(1e-4, .float32)));
+    return .{ .mean = try parent.keep(try g.astype(try g.reshape(mean, &vsh), .float32)), .std = try parent.keep(try g.astype(sd, .float32)) };
+}
 
 pub const Vae = struct {
     allocator: std.mem.Allocator,
@@ -1304,87 +893,52 @@ pub const Vae = struct {
 
     pub fn deinit(self: *Vae) void {
         inline for (.{ "bn_mean","bn_var","pq_w","pq_b","conv_in_w","conv_in_b","norm_out_w","norm_out_b","conv_out_w","conv_out_b" }) |f| _ = mlx.mlx_array_free(@field(self, f));
-        self.mid_r0.deinit(); self.mid_attn.deinit(); self.mid_r1.deinit();
-        for (&self.up_resnets) |*blk| for (blk) |*r| r.deinit();
+        freeResnet(&self.mid_r0); self.mid_attn.deinit(); freeResnet(&self.mid_r1);
+        for (&self.up_resnets) |*blk| for (blk) |*r| freeResnet(r);
         for (0..3) |i| { _ = mlx.mlx_array_free(self.up_conv_w[i]); _ = mlx.mlx_array_free(self.up_conv_b[i]); }
     }
 
-    /// packed_latents [1,128,64,64] (NCHW) -> image [1,3,1024,1024] (NCHW, [-1,1]).
-    pub fn decode(self: *Vae, packed_in: mlx.mlx_array) !mlx.mlx_array {
-        const s = self.s;
-        // bn denorm: packed * sqrt(var+eps) + mean   (per-channel over 128)
-        const vsh = [_]c_int{ 1, 128, 1, 1 };
-        const bnm = try reshape(self.bn_mean, &vsh, s); defer _ = mlx.mlx_array_free(bnm);
-        const bnv = try reshape(self.bn_var, &vsh, s); defer _ = mlx.mlx_array_free(bnv);
-        const eps = mlx.mlx_array_new_float(1e-4); defer _ = mlx.mlx_array_free(eps);
-        var vpe = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(vpe);
-        try mlx.check(mlx.mlx_add(&vpe, bnv, eps, s));
-        var std_ = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(std_);
-        try mlx.check(mlx.mlx_sqrt(&std_, vpe, s));
-        const pf = try astype(packed_in, .float32, s); defer _ = mlx.mlx_array_free(pf);
-        const stdf = try astype(std_, .float32, s); defer _ = mlx.mlx_array_free(stdf);
-        const bnmf = try astype(bnm, .float32, s); defer _ = mlx.mlx_array_free(bnmf);
-        const scaled = try mulA(pf, stdf, s); defer _ = mlx.mlx_array_free(scaled);
-        const denorm = try addA(scaled, bnmf, s); defer _ = mlx.mlx_array_free(denorm);
-        // unpatchify [1,128,64,64] -> [1,32,128,128]
-        const up = try unpatchify(denorm, s); defer _ = mlx.mlx_array_free(up);
-        const up_bf = try astype(up, .bfloat16, s); defer _ = mlx.mlx_array_free(up_bf);
-        // post_quant_conv (1x1) in NHWC
-        const nhwc = try transpose(up_bf, &[_]c_int{ 0, 2, 3, 1 }, s); defer _ = mlx.mlx_array_free(nhwc);
-        var h = try conv2d(nhwc, self.pq_w, self.pq_b, 0, s);
-        // conv_in (3x3, 32->512)
-        {
-            const nh = try conv2d(h, self.conv_in_w, self.conv_in_b, 1, s);
-            _ = mlx.mlx_array_free(h); h = nh;
-        }
-        // mid block
-        { const nh = try self.mid_r0.forward(h, s); _ = mlx.mlx_array_free(h); h = nh; }
-        { const nh = try self.mid_attn.forward(h, s); _ = mlx.mlx_array_free(h); h = nh; }
-        { const nh = try self.mid_r1.forward(h, s); _ = mlx.mlx_array_free(h); h = nh; }
-        // up blocks (3 resnets each; upsample on blocks 0,1,2)
+    /// Packed latents [1, 128, h, w] (bn-normalized) → image [1, 3, 16h, 16w] in [-1, 1].
+    pub fn decode(self: *const Vae, parent: *Graph, packed_in: Array) !Array {
+        var g = parent.scope();
+        defer g.deinit();
+        const bn = try bnStats(&g, self.bn_mean, self.bn_var);
+        const denorm = try g.add(try g.mul(try g.astype(packed_in, .float32), bn.std), bn.mean);
+        const nhwc = try g.transpose(try g.astype(try unpatchify(&g, denorm), .bfloat16), &.{ 0, 2, 3, 1 });
+        var h = try conv_blk.conv2d(&g, nhwc, self.pq_w, self.pq_b, 1, 0, 1);
+        h = try conv_blk.conv2d(&g, h, self.conv_in_w, self.conv_in_b, 1, 1, 1);
+        h = try self.mid_r0.forward(&g, vae_norm, h);
+        h = try resnet_blk.midAttention(&g, vae_norm, h, self.mid_attn.gnw, self.mid_attn.gnb, &self.mid_attn);
+        h = try self.mid_r1.forward(&g, vae_norm, h);
         for (0..4) |bi| {
-            for (0..3) |ri| {
-                const nh = try self.up_resnets[bi][ri].forward(h, s);
-                _ = mlx.mlx_array_free(h); h = nh;
-            }
-            if (bi < 3) {
-                const us = try self.upsample(h, self.up_conv_w[bi], self.up_conv_b[bi], s);
-                _ = mlx.mlx_array_free(h); h = us;
-            }
+            for (&self.up_resnets[bi]) |*r| h = try r.forward(&g, vae_norm, h);
+            if (bi < 3) h = try conv_blk.upsample2x(&g, h, self.up_conv_w[bi], self.up_conv_b[bi]);
         }
-        // conv_norm_out + silu + conv_out
-        { const nh = try groupNorm(h, self.norm_out_w, self.norm_out_b, 32, s); _ = mlx.mlx_array_free(h); h = nh; }
-        { const nh = try silu(h, s); _ = mlx.mlx_array_free(h); h = nh; }
-        { const nh = try conv2d(h, self.conv_out_w, self.conv_out_b, 1, s); _ = mlx.mlx_array_free(h); h = nh; }
-        // NHWC -> NCHW (materialize: a lazy transpose reads back in source order)
-        const out = try transpose(h, &[_]c_int{ 0, 3, 1, 2 }, s);
-        _ = mlx.mlx_array_free(h);
-        defer _ = mlx.mlx_array_free(out);
-        var contig = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_contiguous(&contig, out, false, s));
-        return contig;
-    }
-
-    fn upsample(self: *Vae, x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
-        _ = self;
-        // x NHWC; nearest 2x on H,W via repeat, then conv3x3
-        var r1 = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(r1);
-        try mlx.check(mlx.mlx_repeat_axis(&r1, x, 2, 1, s));
-        var r2 = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(r2);
-        try mlx.check(mlx.mlx_repeat_axis(&r2, r1, 2, 2, s));
-        return conv2d(r2, w, b, 1, s);
+        h = try g.silu(try gn_blk.groupNormFlat(&g, h, self.norm_out_w, self.norm_out_b, 32, 1e-6, .bfloat16));
+        h = try conv_blk.conv2d(&g, h, self.conv_out_w, self.conv_out_b, 1, 1, 1);
+        // Materialized: a lazy transpose reads back in source order.
+        return parent.keep(try g.contiguous(try g.transpose(h, &.{ 0, 3, 1, 2 })));
     }
 };
 
-/// [1,128,64,64] -> [1,32,128,128]  (reshape [1,32,2,2,64,64], transpose, reshape)
-/// packed [1,128,gh,gw] → [1,32,gh·2,gw·2] (channel = c·4 + ph·2 + pw).
-fn unpatchify(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const sh = mlx.getShape(x);
-    const gh = sh[2];
-    const gw = sh[3];
-    const r1 = try reshape(x, &[_]c_int{ 1, 32, 2, 2, gh, gw }, s); defer _ = mlx.mlx_array_free(r1);
-    const t1 = try transpose(r1, &[_]c_int{ 0, 1, 4, 2, 5, 3 }, s); defer _ = mlx.mlx_array_free(t1);
-    return reshape(t1, &[_]c_int{ 1, 32, gh * 2, gw * 2 }, s);
+/// Packed [1, 128, h, w] → [1, 32, 2h, 2w] (packed channel = c·4 + ph·2 + pw).
+fn unpatchify(parent: *Graph, x: Array) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    const sh = ops.shape(x);
+    const r = try g.reshape(x, &.{ 1, 32, 2, 2, sh[2], sh[3] });
+    return parent.keep(try g.reshape(try g.transpose(r, &.{ 0, 1, 4, 2, 5, 3 }), &.{ 1, 32, sh[2] * 2, sh[3] * 2 }));
+}
+
+/// [1, 32, H, W] → packed [1, 128, H/2, W/2]; the exact inverse of `unpatchify`.
+fn patchify(parent: *Graph, x: Array) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    const sh = ops.shape(x);
+    const gh = @divExact(sh[2], 2);
+    const gw = @divExact(sh[3], 2);
+    const r = try g.reshape(x, &.{ 1, 32, gh, 2, gw, 2 });
+    return parent.keep(try g.reshape(try g.transpose(r, &.{ 0, 1, 3, 5, 2, 4 }), &.{ 1, 128, gh, gw }));
 }
 
 fn loadResnet(w: *const Weights, a: std.mem.Allocator, pfx: []const u8) !Resnet {
@@ -1450,45 +1004,8 @@ pub fn loadVae(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir: []cons
     return v;
 }
 
-/// Asymmetric (0,1,0,1) zero-pad + 3x3 stride-2 valid conv on NHWC
-/// (diffusers Downsample2D — the VAE encoder's spatial downsampler).
-fn conv2dDown(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const axes = [_]c_int{ 1, 2 };
-    const low = [_]c_int{ 0, 0 };
-    const high = [_]c_int{ 1, 1 };
-    const zero = mlx.mlx_array_new_float(0.0);
-    defer _ = mlx.mlx_array_free(zero);
-    var p = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(p);
-    try mlx.check(mlx.mlx_pad(&p, x, &axes, 2, &low, 2, &high, 2, zero, "constant", s));
-    var pc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(pc);
-    try mlx.check(mlx.mlx_contiguous(&pc, p, false, s));
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_conv2d(&o, pc, w, 2, 2, 0, 0, 1, 1, 1, s));
-    const r = try addA(o, bias, s);
-    _ = mlx.mlx_array_free(o);
-    return r;
-}
-
-/// Pixel-unshuffle NCHW [1,32,128,128] → packed [1,128,64,64]; exact inverse
-/// of `unpatchify` (packed channel = c*4 + ph*2 + pw).
-/// Pixel-unshuffle [1,32,H,W] → packed [1,128,H/2,W/2]; exact inverse of
-/// `unpatchify`.
-fn patchify(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const sh = mlx.getShape(x);
-    const gh = @divExact(sh[2], 2);
-    const gw = @divExact(sh[3], 2);
-    const r1 = try reshape(x, &[_]c_int{ 1, 32, gh, 2, gw, 2 }, s);
-    defer _ = mlx.mlx_array_free(r1);
-    const t1 = try transpose(r1, &[_]c_int{ 0, 1, 3, 5, 2, 4 }, s);
-    defer _ = mlx.mlx_array_free(t1);
-    return reshape(t1, &[_]c_int{ 1, 128, gh, gw }, s);
-}
-
-/// FLUX.2 VAE encoder — structural mirror of the decoder (down_blocks with
-/// stride-2 downsamplers instead of up_blocks). Feeds img2img: pixels →
-/// bn-normalized packed latents, the exact space `Vae.decode` reads.
+/// The VAE encoder (the decoder's mirror with stride-2 downsamplers): pixels → the bn-normalized packed latents
+/// `Vae.decode` reads. Feeds variation and edits.
 pub const VaeEncoder = struct {
     allocator: std.mem.Allocator,
     s: S,
@@ -1511,112 +1028,39 @@ pub const VaeEncoder = struct {
 
     pub fn deinit(self: *VaeEncoder) void {
         inline for (.{ "bn_mean", "bn_var", "conv_in_w", "conv_in_b", "norm_out_w", "norm_out_b", "conv_out_w", "conv_out_b", "quant_w", "quant_b" }) |f| _ = mlx.mlx_array_free(@field(self, f));
-        for (&self.down_resnets) |*blk| for (blk) |*r| r.deinit();
+        for (&self.down_resnets) |*blk| for (blk) |*r| freeResnet(r);
         for (0..3) |i| {
             _ = mlx.mlx_array_free(self.down_conv_w[i]);
             _ = mlx.mlx_array_free(self.down_conv_b[i]);
         }
-        self.mid_r0.deinit();
+        freeResnet(&self.mid_r0);
         self.mid_attn.deinit();
-        self.mid_r1.deinit();
+        freeResnet(&self.mid_r1);
     }
 
-    /// image [1,3,1024,1024] f32 [0,1] (NCHW) → packed latents [1,128,64,64]
-    /// f32, bn-NORMALIZED (the distribution mean; deterministic — no sampling).
-    pub fn encode(self: *VaeEncoder, img: mlx.mlx_array) !mlx.mlx_array {
-        const s = self.s;
-        // [0,1] → [-1,1], NCHW → NHWC bf16
-        const two = mlx.mlx_array_new_float(2.0);
-        defer _ = mlx.mlx_array_free(two);
-        const one = mlx.mlx_array_new_float(1.0);
-        defer _ = mlx.mlx_array_free(one);
-        const x2 = try mulA(img, two, s);
-        defer _ = mlx.mlx_array_free(x2);
-        const xm = try subA(x2, one, s);
-        defer _ = mlx.mlx_array_free(xm);
-        const nhwc = try transpose(xm, &[_]c_int{ 0, 2, 3, 1 }, s);
-        defer _ = mlx.mlx_array_free(nhwc);
-        const xbf = try astype(nhwc, .bfloat16, s);
-        defer _ = mlx.mlx_array_free(xbf);
-
-        var h = try conv2d(xbf, self.conv_in_w, self.conv_in_b, 1, s);
+    /// Image [1, 3, H, W] f32 in [0, 1] → packed latents [1, 128, H/16, W/16] f32, bn-normalized (the
+    /// distribution's mean: deterministic, no sampling).
+    pub fn encode(self: *const VaeEncoder, parent: *Graph, img: Array) !Array {
+        var g = parent.scope();
+        defer g.deinit();
+        const signed = try g.sub(try g.mul(img, try g.scalar(2.0, .float32)), try g.scalar(1.0, .float32));
+        var h = try g.astype(try g.transpose(signed, &.{ 0, 2, 3, 1 }), .bfloat16);
+        h = try conv_blk.conv2d(&g, h, self.conv_in_w, self.conv_in_b, 1, 1, 1);
         for (0..4) |bi| {
-            for (0..2) |ri| {
-                const nh = try self.down_resnets[bi][ri].forward(h, s);
-                _ = mlx.mlx_array_free(h);
-                h = nh;
-            }
-            if (bi < 3) {
-                const nh = try conv2dDown(h, self.down_conv_w[bi], self.down_conv_b[bi], s);
-                _ = mlx.mlx_array_free(h);
-                h = nh;
-            }
+            for (&self.down_resnets[bi]) |*r| h = try r.forward(&g, vae_norm, h);
+            if (bi < 3) h = try conv_blk.downsample2x(&g, h, self.down_conv_w[bi], self.down_conv_b[bi]);
         }
-        {
-            const nh = try self.mid_r0.forward(h, s);
-            _ = mlx.mlx_array_free(h);
-            h = nh;
-        }
-        {
-            const nh = try self.mid_attn.forward(h, s);
-            _ = mlx.mlx_array_free(h);
-            h = nh;
-        }
-        {
-            const nh = try self.mid_r1.forward(h, s);
-            _ = mlx.mlx_array_free(h);
-            h = nh;
-        }
-        const hn = try groupNorm(h, self.norm_out_w, self.norm_out_b, 32, s);
-        _ = mlx.mlx_array_free(h);
-        defer _ = mlx.mlx_array_free(hn);
-        const ha = try silu(hn, s);
-        defer _ = mlx.mlx_array_free(ha);
-        const co = try conv2d(ha, self.conv_out_w, self.conv_out_b, 1, s); // [1,128,128,64]
-        defer _ = mlx.mlx_array_free(co);
-        const qc = try conv2d(co, self.quant_w, self.quant_b, 0, s);
-        defer _ = mlx.mlx_array_free(qc);
-        // mean = first 32 channels (NHWC last axis); logvar discarded.
-        const qsh = mlx.getShape(qc);
-        const start = [_]c_int{ 0, 0, 0, 0 };
-        const stop = [_]c_int{ qsh[0], qsh[1], qsh[2], 32 };
-        const strides = [_]c_int{ 1, 1, 1, 1 };
-        var mean = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(mean);
-        try mlx.check(mlx.mlx_slice(&mean, qc, &start, 4, &stop, 4, &strides, 4, s));
-        var meanc = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(meanc);
-        try mlx.check(mlx.mlx_contiguous(&meanc, mean, false, s));
-        const nchw = try transpose(meanc, &[_]c_int{ 0, 3, 1, 2 }, s);
-        defer _ = mlx.mlx_array_free(nchw);
-        const nf = try astype(nchw, .float32, s);
-        defer _ = mlx.mlx_array_free(nf);
-        const packed_lat = try patchify(nf, s); // [1,128,64,64]
-        defer _ = mlx.mlx_array_free(packed_lat);
-        // bn normalize: (x - mean) / sqrt(var + eps)  (inverse of decode's denorm)
-        const vsh = [_]c_int{ 1, 128, 1, 1 };
-        const bnm = try reshape(self.bn_mean, &vsh, s);
-        defer _ = mlx.mlx_array_free(bnm);
-        const bnv = try reshape(self.bn_var, &vsh, s);
-        defer _ = mlx.mlx_array_free(bnv);
-        const eps = mlx.mlx_array_new_float(1e-4);
-        defer _ = mlx.mlx_array_free(eps);
-        var vpe = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(vpe);
-        try mlx.check(mlx.mlx_add(&vpe, bnv, eps, s));
-        var std_ = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(std_);
-        try mlx.check(mlx.mlx_sqrt(&std_, vpe, s));
-        const stdf = try astype(std_, .float32, s);
-        defer _ = mlx.mlx_array_free(stdf);
-        const bnmf = try astype(bnm, .float32, s);
-        defer _ = mlx.mlx_array_free(bnmf);
-        const centered = try subA(packed_lat, bnmf, s);
-        defer _ = mlx.mlx_array_free(centered);
-        var out = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(out);
-        try mlx.check(mlx.mlx_divide(&out, centered, stdf, s));
-        return out;
+        h = try self.mid_r0.forward(&g, vae_norm, h);
+        h = try resnet_blk.midAttention(&g, vae_norm, h, self.mid_attn.gnw, self.mid_attn.gnb, &self.mid_attn);
+        h = try self.mid_r1.forward(&g, vae_norm, h);
+        h = try g.silu(try gn_blk.groupNormFlat(&g, h, self.norm_out_w, self.norm_out_b, 32, 1e-6, .bfloat16));
+        h = try conv_blk.conv2d(&g, h, self.conv_out_w, self.conv_out_b, 1, 1, 1);
+        const qc = try conv_blk.conv2d(&g, h, self.quant_w, self.quant_b, 1, 0, 1);
+        // The mean is the first 32 channels; the log-variance is discarded.
+        const mean = try g.contiguous(try g.sliceAxis(qc, 3, 0, 32));
+        const packed_lat = try patchify(&g, try g.astype(try g.transpose(mean, &.{ 0, 3, 1, 2 }), .float32));
+        const bn = try bnStats(&g, self.bn_mean, self.bn_var);
+        return parent.keep(try g.div(try g.sub(packed_lat, bn.mean), bn.std));
     }
 };
 
@@ -1666,52 +1110,341 @@ pub fn loadVaeEncoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_dir:
     return v;
 }
 
-/// Conditioning rebalance: scale the prompt embeddings by a global `gain` and
-/// optional per-tap `weights` (len 3 — the encoder's captured layers 9/18/27,
-/// concatenated on the feature axis). Returns a NEW array in the input dtype.
-pub fn applyCondRebalance(enc: mlx.mlx_array, gain: f32, weights: ?[]const f32, s: S) !mlx.mlx_array {
-    const sh = mlx.getShape(enc); // [1,seq,3H]
-    const dt = mlx.mlx_array_dtype(enc);
-    var cur = blk: {
-        var c = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_array_set(&c, enc));
-        break :blk c;
-    };
+/// Conditioning rebalance: the prompt embeddings scaled by a global `gain` and per-tap `weights` (one per captured
+/// encoder layer, concatenated on the feature axis); same dtype out.
+pub fn applyCondRebalance(parent: *Graph, enc: Array, gain: f32, weights: ?[]const f32) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    const sh = ops.shape(enc);
+    const dt = ops.dtype(enc);
+    var cur = enc;
     if (weights) |w| {
-        if (w.len != 3) {
-            _ = mlx.mlx_array_free(cur);
-            return error.InvalidCondWeights;
+        if (w.len != 3) return error.InvalidCondWeights;
+        const r = try g.reshape(cur, &.{ sh[0], sh[1], 3, @divExact(sh[2], 3) });
+        cur = try g.reshape(try g.mul(r, try g.fromSlice(f32, w, &.{ 1, 1, 3, 1 })), &.{ sh[0], sh[1], sh[2] });
+    }
+    if (gain != 1.0) cur = try g.mul(cur, try g.scalar(gain, .float32));
+    if (ops.dtype(cur) != dt) cur = try g.astype(cur, dt);
+    return parent.keep(cur);
+}
+
+/// Real CFG: uncond + scale · (cond − uncond), the scale an f32 scalar.
+fn cfgBlend(parent: *Graph, cond: Array, uncond: Array, scale: f32) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    return parent.keep(try g.add(uncond, try g.mul(try g.sub(cond, uncond), try g.scalar(scale, .float32))));
+}
+
+
+// ── The text → image pipeline ──
+
+/// FLUX.2's FlowMatchEuler schedule: an empirical mu (linear in the step count below 4300 image tokens), the
+/// exponential shift over linspace(1, 1/n, n); timesteps on the ×1000 scale, sigmas ending at 0.
+fn computeSchedule(allocator: std.mem.Allocator, image_seq_len: u32, steps: u32) !struct { ts: []f32, sig: []f32 } {
+    const ts = try allocator.alloc(f32, steps);
+    errdefer allocator.free(ts);
+    const sig = try allocator.alloc(f32, steps + 1);
+    const isl: f64 = @floatFromInt(image_seq_len);
+    const m_200 = 0.00016927 * isl + 0.45666666;
+    const m_10 = 8.73809524e-05 * isl + 1.89833333;
+    const mu = if (isl > 4300) m_200 else flow_match.muLinear(@floatFromInt(steps), 200, m_200, 10, m_10);
+    const emu = std.math.exp(mu);
+    for (0..steps) |i| {
+        const shifted = flow_match.timeShiftExp(emu, flow_match.gridToInvN(i, steps));
+        sig[i] = @floatCast(shifted);
+        ts[i] = @floatCast(shifted * 1000.0);
+    }
+    sig[steps] = 0.0;
+    return .{ .ts = ts, .sig = sig };
+}
+
+fn buildLatentIds(allocator: std.mem.Allocator, lh: u32, lw: u32) ![]i32 {
+    return buildLatentIdsT(allocator, lh, lw, 0);
+}
+
+/// Position ids for an edit forward: the generated lh×lw grid at t=0
+/// followed by each reference grid (`ref_dims[i] = {rh, rw}`) at
+/// t=10·(i+1) — the official FLUX.2 multi-reference convention — each with
+/// its own 0-based h/w grid.
+fn buildEditIds(allocator: std.mem.Allocator, lh: u32, lw: u32, ref_dims: []const [2]u32) ![]i32 {
+    var total: usize = lh * lw;
+    for (ref_dims) |d| total += d[0] * d[1];
+    const out = try allocator.alloc(i32, total * 4);
+    errdefer allocator.free(out);
+    const gen_ids = try buildLatentIdsT(allocator, lh, lw, 0);
+    defer allocator.free(gen_ids);
+    @memcpy(out[0..gen_ids.len], gen_ids);
+    var off = gen_ids.len;
+    for (ref_dims, 1..) |d, i| {
+        const rids = try buildLatentIdsT(allocator, d[0], d[1], @intCast(10 * i));
+        defer allocator.free(rids);
+        @memcpy(out[off .. off + rids.len], rids);
+        off += rids.len;
+    }
+    return out;
+}
+
+/// Latent position ids (t,h,w,l) with an explicit time coordinate. Generated
+/// tokens use t=0; reference-image tokens use the official FLUX.2 edit
+/// convention t=10·(ref_index+1) with their own 0-based h/w grid.
+fn buildLatentIdsT(allocator: std.mem.Allocator, lh: u32, lw: u32, t: i32) ![]i32 {
+    const n = lh * lw;
+    const out = try allocator.alloc(i32, n * 4);
+    var idx: usize = 0;
+    for (0..lh) |h| for (0..lw) |wv| {
+        out[idx * 4 + 0] = t;
+        out[idx * 4 + 1] = @intCast(h);
+        out[idx * 4 + 2] = @intCast(wv);
+        out[idx * 4 + 3] = 0; // layer
+        idx += 1;
+    };
+    return out;
+}
+fn buildTextIds(allocator: std.mem.Allocator, seq: u32) ![]i32 {
+    const out = try allocator.alloc(i32, seq * 4);
+    for (0..seq) |i| {
+        out[i * 4 + 0] = 0;
+        out[i * 4 + 1] = 0;
+        out[i * 4 + 2] = 0;
+        out[i * 4 + 3] = @intCast(i);
+    }
+    return out;
+}
+
+/// Generate an image. Returns [1,3,H,W] f32 in [0,1] (owned mlx array).
+/// Per-request generation options beyond the core prompt/size/steps.
+pub const GenOpts = struct {
+    /// img2img: bn-normalized packed latents [1,128,64,64] f32 from
+    /// `VaeEncoder.encode`. Mixed with noise at the start sigma.
+    init_latents: ?mlx.mlx_array = null,
+    /// First schedule index to run (img2img skip; 0 = full schedule).
+    start_step: u32 = 0,
+    /// Reference-image editing (FLUX.2 in-context conditioning): CLEAN
+    /// bn-normalized packed latents [1,128,rh,rw] from `VaeEncoder.encode`,
+    /// concatenated on the token sequence with t=10·(i+1) position ids
+    /// (official multi-reference convention — "replace the face in image 1
+    /// with the face from image 2"). Never noised; generation starts from
+    /// pure noise and attends to them. Empty = no references.
+    ref_latents: []const mlx.mlx_array = &.{},
+    /// Conditioning rebalance: global gain + per-tap weights (len 3).
+    cond_gain: f32 = 1.0,
+    cond_weights: ?[]const f32 = null,
+    /// Classifier-free guidance (the UNDISTILLED "base" klein checkpoints —
+    /// distilled klein has guidance baked into the weights and takes neither
+    /// field: `guidance_scale` 1.0 skips the unconditional forward entirely,
+    /// byte-identical to the no-CFG path). `neg_enc` is the negative prompt's
+    /// text-encoder output, same fixed [1,FLUX_SEQ_LEN,hidden] shape as the
+    /// positive `enc` so both forwards share `img_ids`/`txt_ids`.
+    guidance_scale: f32 = 1.0,
+    neg_enc: ?mlx.mlx_array = null,
+};
+
+/// Stage 1 alone: the prompt encoded (and rebalanced), MATERIALIZED and owned by the caller. The eval matters: a
+/// low-memory host frees the text encoder right after this returns, and an unevaluated graph would pin its weights.
+pub fn encodePrompt(te: *TextEncoder, ids: []const i32, mask: []const i32, opts: GenOpts) !mlx.mlx_array {
+    var g = Graph.init(te.allocator, te.s);
+    defer g.deinit();
+    var enc = try te.encode(&g, ids, mask);
+    if (opts.cond_gain != 1.0 or opts.cond_weights != null) enc = try applyCondRebalance(&g, enc, opts.cond_gain, opts.cond_weights);
+    try ops.eval(enc);
+    return g.escape(enc);
+}
+
+/// One DiT forward → velocity [1, nlat, 128]; reference tokens ride after the latents and are sliced off.
+fn ditVelocity(parent: *Graph, dit: *const Dit, latents: Array, enc: Array, t: f32, img_ids: []const i32, txt_ids: []const i32, ref_tokens: ?Array, all_ids: ?[]i32, nlat: c_int) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    const r = ref_tokens orelse return parent.keep(try dit.forward(&g, latents, enc, t, img_ids, txt_ids));
+    const full = try dit.forward(&g, try g.concat(&.{ latents, r }, 1), enc, t, all_ids.?, txt_ids);
+    return parent.keep(try g.sliceAxis(full, 1, 0, nlat));
+}
+
+pub fn generateWithOpts(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32, mask: []const i32, seed: u64, steps: u32, height: u32, width: u32, opts: GenOpts, progress: ?sse.Progress) !mlx.mlx_array {
+    const enc = try encodePrompt(te, ids, mask, opts);
+    return generateFromCondWithOpts(dit, vae, enc, ids.len, seed, steps, height, width, opts, progress);
+}
+
+/// Packed latents [1, 128, h, w] → tokens [1, h·w, 128] in bf16.
+fn tokensOf(parent: *Graph, lat: Array) !Array {
+    var g = parent.scope();
+    defer g.deinit();
+    const sh = ops.shape(lat);
+    const t = try g.transpose(try g.reshape(lat, &.{ 1, 128, sh[2] * sh[3] }), &.{ 0, 2, 1 });
+    return parent.keep(try g.astype(try g.contiguous(t), .bfloat16));
+}
+
+/// Stages 2+ (latents → denoise → VAE decode) from a computed prompt encoding: image [1, 3, H, W] f32 in [0, 1],
+/// owned by the caller. Takes ownership of `enc_owned` AND `opts.neg_enc`. `prompt_len` drives the text position
+/// ids; the negative encoding shares the prompt's fixed padded length.
+pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, prompt_len: usize, seed: u64, steps: u32, height: u32, width: u32, opts: GenOpts, progress: ?sse.Progress) !mlx.mlx_array {
+    const a = dit.allocator;
+    var g = Graph.init(a, dit.s);
+    defer g.deinit();
+    const neg_enc = if (opts.neg_enc) |ne| try g.adopt(ne) else null;
+    const enc = try g.adopt(enc_owned);
+    const lh = height / 16;
+    const lw = width / 16;
+    const nlat = lh * lw;
+
+    // Noise [1, 128, lh, lw] from the seed, packed to tokens [1, nlat, 128].
+    const key = try g.call(mlx.mlx_random_key, .{seed});
+    const nsh = [_]c_int{ 1, 128, @intCast(lh), @intCast(lw) };
+    const noise = try g.astype(try g.call(mlx.mlx_random_normal, .{ &nsh, nsh.len, .float32, 0.0, 1.0, key }), .bfloat16);
+    var latents = try g.contiguous(try g.transpose(try g.reshape(noise, &.{ 1, 128, @intCast(nlat) }), &.{ 0, 2, 1 }));
+
+    const img_ids = try buildLatentIds(a, lh, lw);
+    defer a.free(img_ids);
+    const txt_ids = try buildTextIds(a, @intCast(prompt_len));
+    defer a.free(txt_ids);
+
+    // Edits: the CLEAN reference latents as tokens at t = 10·(i+1) (the official multi-reference convention), in
+    // every forward; only the generated span is stepped.
+    var ref_tokens: ?Array = null;
+    var all_ids: ?[]i32 = null;
+    defer if (all_ids) |ai| a.free(ai);
+    if (opts.ref_latents.len > 0) {
+        const ref_dims = try a.alloc([2]u32, opts.ref_latents.len);
+        defer a.free(ref_dims);
+        for (opts.ref_latents, 0..) |rl, ri| {
+            const rsh = ops.shape(rl);
+            ref_dims[ri] = .{ @intCast(rsh[2]), @intCast(rsh[3]) };
+            const rtok = try tokensOf(&g, rl);
+            ref_tokens = if (ref_tokens) |rt| try g.concat(&.{ rt, rtok }, 1) else rtok;
         }
-        const H = @divExact(sh[2], 3);
-        const r = try reshape(cur, &[_]c_int{ sh[0], sh[1], 3, H }, s);
-        _ = mlx.mlx_array_free(cur);
-        const wsh = [_]c_int{ 1, 1, 3, 1 };
-        const wa = mlx.mlx_array_new_data(w.ptr, &wsh, 4, .float32);
-        defer _ = mlx.mlx_array_free(wa);
-        const scaled = mulA(r, wa, s) catch |e| {
-            _ = mlx.mlx_array_free(r);
-            return e;
-        };
-        _ = mlx.mlx_array_free(r);
-        cur = try reshape(scaled, &[_]c_int{ sh[0], sh[1], sh[2] }, s);
-        _ = mlx.mlx_array_free(scaled);
+        all_ids = try buildEditIds(a, lh, lw, ref_dims);
     }
-    if (gain != 1.0) {
-        const ga = mlx.mlx_array_new_float(gain);
-        defer _ = mlx.mlx_array_free(ga);
-        const scaled = mulA(cur, ga, s) catch |e| {
-            _ = mlx.mlx_array_free(cur);
-            return e;
-        };
-        _ = mlx.mlx_array_free(cur);
-        cur = scaled;
+
+    const sched = try computeSchedule(a, nlat, steps);
+    defer {
+        a.free(sched.ts);
+        a.free(sched.sig);
     }
-    if (mlx.mlx_array_dtype(cur) != dt) {
-        const back = try astype(cur, dt, s);
-        _ = mlx.mlx_array_free(cur);
-        cur = back;
+    const start_step: u32 = @min(opts.start_step, steps - 1);
+
+    // Variation: x = (1-σ)·z0 + σ·noise at the start sigma (flow-match scale_noise).
+    if (opts.init_latents) |z0| {
+        const z_bf = try g.astype(try g.transpose(try g.reshape(z0, &.{ 1, 128, @intCast(nlat) }), &.{ 0, 2, 1 }), .bfloat16);
+        const sigma = sched.sig[start_step];
+        const mixed = try g.add(try g.mul(z_bf, try g.scalar(1.0 - sigma, .float32)), try g.mul(latents, try g.scalar(sigma, .float32)));
+        latents = try g.astype(mixed, .bfloat16);
     }
-    return cur;
+
+    const use_cfg = opts.guidance_scale != 1.0 and neg_enc != null;
+    const run_steps = steps - start_step;
+    for (start_step..steps) |t| {
+        if (progress) |p| if (p.boundary()) return error.Cancelled;
+        var sg = g.scope();
+        defer sg.deinit();
+        const cond = try ditVelocity(&sg, dit, latents, enc, sched.ts[t], img_ids, txt_ids, ref_tokens, all_ids, @intCast(nlat));
+        const v = if (use_cfg)
+            try cfgBlend(&sg, cond, try ditVelocity(&sg, dit, latents, neg_enc.?, sched.ts[t], img_ids, txt_ids, ref_tokens, all_ids, @intCast(nlat)), opts.guidance_scale)
+        else
+            cond;
+        const next = try g.keep(try flow_match.eulerStep(&sg, latents, v, sched.sig[t + 1] - sched.sig[t], .float32));
+        g.drop(latents);
+        latents = next;
+        try ops.eval(latents);
+        if (progress) |p| p.emit("Generating", @intCast(t + 1 - start_step), run_steps);
+    }
+    if (progress) |p| p.emit("Decoding image", steps, steps);
+
+    const packed_lat = try g.transpose(try g.reshape(latents, &.{ 1, @intCast(lh), @intCast(lw), 128 }), &.{ 0, 3, 1, 2 });
+    const decoded = try g.astype(try vae.decode(&g, packed_lat), .float32);
+    // clip(x/2 + 0.5, 0, 1)
+    const half = try g.scalar(0.5, .float32);
+    const shifted = try g.add(try g.mul(decoded, half), half);
+    const out = try g.minimum(try g.maximum(shifted, try g.scalar(0.0, .float32)), try g.scalar(1.0, .float32));
+    return g.escape(out);
+}
+
+
+// ── tests ──
+
+const testing = std.testing;
+
+fn astype(x: mlx.mlx_array, dt: mlx.mlx_dtype, s: S) !mlx.mlx_array {
+    var o = mlx.mlx_array_new();
+    try mlx.check(mlx.mlx_astype(&o, x, dt, s));
+    return o;
+}
+
+test "flux schedule: one step is the full sigma, finite" {
+    const sched = try computeSchedule(testing.allocator, 4096, 1);
+    defer testing.allocator.free(sched.ts);
+    defer testing.allocator.free(sched.sig);
+    try testing.expectEqual(@as(f32, 1.0), sched.sig[0]);
+    try testing.expectEqual(@as(f32, 0.0), sched.sig[1]);
+    try testing.expectEqual(@as(f32, 1000.0), sched.ts[0]);
+}
+
+fn readI32(io: std.Io, a: std.mem.Allocator, path: []const u8) ![]i32 {
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const bytes = try rs.interface.allocRemaining(a, .limited(64 * 1024 * 1024));
+    defer a.free(bytes);
+    const n = bytes.len / 4;
+    const out = try a.alloc(i32, n);
+    @memcpy(std.mem.sliceAsBytes(out), bytes[0 .. n * 4]);
+    return out;
+}
+fn readF32(io: std.Io, a: std.mem.Allocator, path: []const u8) ![]f32 {
+    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
+    defer f.close(io);
+    var rb: [4096]u8 = undefined;
+    var rs = f.reader(io, &rb);
+    const bytes = try rs.interface.allocRemaining(a, .limited(512 * 1024 * 1024));
+    defer a.free(bytes);
+    const n = bytes.len / 4;
+    const out = try a.alloc(f32, n);
+    @memcpy(std.mem.sliceAsBytes(out), bytes[0 .. n * 4]);
+    return out;
+}
+
+// Stage 2 oracle: DiT one forward → noise_step0.
+//   FLUX_TEST_MODEL, FLUX_LATENTS (latents_init f32), FLUX_PE, FLUX_IMGIDS, FLUX_TXTIDS, FLUX_NOISE0
+test "flux DiT reproduces noise_step0" {
+    const model_dir = std.mem.span(std.c.getenv("FLUX_TEST_MODEL") orelse return error.SkipZigTest);
+    const lat_p = std.mem.span(std.c.getenv("FLUX_LATENTS") orelse return error.SkipZigTest);
+    const pe_p = std.mem.span(std.c.getenv("FLUX_PE") orelse return error.SkipZigTest);
+    const ii_p = std.mem.span(std.c.getenv("FLUX_IMGIDS") orelse return error.SkipZigTest);
+    const ti_p = std.mem.span(std.c.getenv("FLUX_TXTIDS") orelse return error.SkipZigTest);
+    const n0_p = std.mem.span(std.c.getenv("FLUX_NOISE0") orelse return error.SkipZigTest);
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    const lat = try readF32(io, a, lat_p); defer a.free(lat);
+    const pe = try readF32(io, a, pe_p); defer a.free(pe);
+    const ii = try readI32(io, a, ii_p); defer a.free(ii);
+    const ti = try readI32(io, a, ti_p); defer a.free(ti);
+    const ref = try readF32(io, a, n0_p); defer a.free(ref);
+
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var dit = try loadDit(io, a, s, model_dir); defer dit.deinit();
+
+    // upload latents [1,4096,128] and pe [1,512,7680] as bf16
+    const lat_sh = [_]c_int{ 1, 4096, 128 };
+    const lat_f = mlx.mlx_array_new_data(lat.ptr, &lat_sh, 3, .float32); defer _ = mlx.mlx_array_free(lat_f);
+    const lat_bf = try astype(lat_f, .bfloat16, s); defer _ = mlx.mlx_array_free(lat_bf);
+    const pe_sh = [_]c_int{ 1, 512, 7680 };
+    const pe_f = mlx.mlx_array_new_data(pe.ptr, &pe_sh, 3, .float32); defer _ = mlx.mlx_array_free(pe_f);
+    const pe_bf = try astype(pe_f, .bfloat16, s); defer _ = mlx.mlx_array_free(pe_bf);
+
+    var tg = Graph.init(a, s);
+    defer tg.deinit();
+    const noise = tg.escape(try dit.forward(&tg, lat_bf, pe_bf, 1000.0, ii, ti));
+    defer _ = mlx.mlx_array_free(noise);
+    const nf = try astype(noise, .float32, s); defer _ = mlx.mlx_array_free(nf);
+    _ = mlx.mlx_array_eval(nf);
+    const n: usize = @intCast(mlx.mlx_array_size(nf));
+    const data = mlx.mlx_array_data_float32(nf) orelse return error.NoData;
+    try testing.expectEqual(ref.len, n);
+    var dot: f64 = 0; var na: f64 = 0; var nb: f64 = 0;
+    for (0..n) |i| { dot += @as(f64, data[i]) * ref[i]; na += @as(f64, data[i]) * data[i]; nb += @as(f64, ref[i]) * ref[i]; }
+    const corr = dot / (std.math.sqrt(na) * std.math.sqrt(nb));
+    std.debug.print("[flux-dit] n={d} corr={d:.6}\n", .{ n, corr });
+    try testing.expect(corr > 0.99);
 }
 
 // Stage 3 oracle: VAE decode packed_pre_vae -> decoded.
@@ -1729,7 +1462,9 @@ test "flux VAE reproduces decoded image" {
     var vae = try loadVae(io, a, s, model_dir); defer vae.deinit();
     const pk_sh = [_]c_int{ 1, 128, 64, 64 };
     const pk_f = mlx.mlx_array_new_data(pk.ptr, &pk_sh, 4, .float32); defer _ = mlx.mlx_array_free(pk_f);
-    const dec = try vae.decode(pk_f); defer _ = mlx.mlx_array_free(dec);
+    var tg = Graph.init(a, s);
+    defer tg.deinit();
+    const dec = try vae.decode(&tg, pk_f);
     const df = try astype(dec, .float32, s); defer _ = mlx.mlx_array_free(df);
     _ = mlx.mlx_array_eval(df);
     const n: usize = @intCast(mlx.mlx_array_size(df));
@@ -1769,12 +1504,14 @@ test "flux VAE encoder round-trips through the decoder" {
     const ish = [_]c_int{ 1, 3, @intCast(HW), @intCast(HW) };
     const img = mlx.mlx_array_new_data(img_buf.ptr, &ish, 4, .float32);
     defer _ = mlx.mlx_array_free(img);
-    const lat = try enc.encode(img);
+    var tg = Graph.init(a, s);
+    defer tg.deinit();
+    const lat = tg.escape(try enc.encode(&tg, img));
     defer _ = mlx.mlx_array_free(lat);
     const lsh = mlx.getShape(lat);
     try testing.expectEqual(@as(c_int, 128), lsh[1]);
     try testing.expectEqual(@as(c_int, 64), lsh[2]);
-    const dec = try vae.decode(lat); // [-1,1]
+    const dec = tg.escape(try vae.decode(&tg, lat)); // [-1,1]
     defer _ = mlx.mlx_array_free(dec);
     const df = try astype(dec, .float32, s);
     defer _ = mlx.mlx_array_free(df);
@@ -1828,13 +1565,15 @@ test "flux VAE encoder round-trips at a non-square size" {
     const ish = [_]c_int{ 1, 3, @intCast(H), @intCast(W) };
     const img = mlx.mlx_array_new_data(img_buf.ptr, &ish, 4, .float32);
     defer _ = mlx.mlx_array_free(img);
-    const lat = try enc.encode(img);
+    var tg = Graph.init(a, s);
+    defer tg.deinit();
+    const lat = tg.escape(try enc.encode(&tg, img));
     defer _ = mlx.mlx_array_free(lat);
     const lsh = mlx.getShape(lat);
     try testing.expectEqual(@as(c_int, 128), lsh[1]);
     try testing.expectEqual(@as(c_int, @intCast(H / 16)), lsh[2]);
     try testing.expectEqual(@as(c_int, @intCast(W / 16)), lsh[3]);
-    const dec = try vae.decode(lat); // [-1,1]
+    const dec = tg.escape(try vae.decode(&tg, lat)); // [-1,1]
     defer _ = mlx.mlx_array_free(dec);
     const df = try astype(dec, .float32, s);
     defer _ = mlx.mlx_array_free(df);
@@ -1951,7 +1690,9 @@ test "flux reference-image conditioning engages and changes the output" {
     const ish = [_]c_int{ 1, 3, @intCast(HW), @intCast(HW) };
     const img = mlx.mlx_array_new_data(buf.ptr, &ish, 4, .float32);
     defer _ = mlx.mlx_array_free(img);
-    const ref_lat = try venc.encode(img);
+    var tg = Graph.init(a, s);
+    defer tg.deinit();
+    const ref_lat = tg.escape(try venc.encode(&tg, img));
     defer _ = mlx.mlx_array_free(ref_lat);
 
     const base = try generateWithOpts(&te, &dit, &vae, &ids, &mask, 42, 2, 1024, 1024, .{}, null);
@@ -1979,64 +1720,48 @@ test "flux reference-image conditioning engages and changes the output" {
 }
 
 test "flux applyCondRebalance scales tap thirds and global gain" {
-    const s = mlx.mlx_default_gpu_stream_new();
+    const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
+    var g = Graph.init(testing.allocator, s);
+    defer g.deinit();
     // enc [1,2,6]: hidden H=2 per tap, 3 taps concatenated on the feature axis.
     const vals = [_]f32{ 1, 2, 3, 4, 5, 6, 10, 20, 30, 40, 50, 60 };
-    const sh = [_]c_int{ 1, 2, 6 };
-    const enc = mlx.mlx_array_new_data(&vals, &sh, 3, .float32);
-    defer _ = mlx.mlx_array_free(enc);
+    const enc = try g.fromSlice(f32, &vals, &.{ 1, 2, 6 });
     const w = [_]f32{ 2, 3, 4 };
-    const out = try applyCondRebalance(enc, 0.5, &w, s);
-    defer _ = mlx.mlx_array_free(out);
-    _ = mlx.mlx_array_eval(out);
+    const out = try applyCondRebalance(&g, enc, 0.5, &w);
+    try ops.eval(out);
     const d = mlx.mlx_array_data_float32(out) orelse return error.NoData;
     // Row 0: [1,2]*2*.5, [3,4]*3*.5, [5,6]*4*.5 = [1,2, 4.5,6, 10,12]
     const expect0 = [_]f32{ 1, 2, 4.5, 6, 10, 12 };
     for (expect0, 0..) |e, i| try testing.expectApproxEqAbs(e, d[i], 1e-5);
     // Gain-only path (weights null) multiplies everything.
-    const g = try applyCondRebalance(enc, 2.0, null, s);
-    defer _ = mlx.mlx_array_free(g);
-    _ = mlx.mlx_array_eval(g);
-    const gd = mlx.mlx_array_data_float32(g) orelse return error.NoData;
+    const gained = try applyCondRebalance(&g, enc, 2.0, null);
+    try ops.eval(gained);
+    const gd = mlx.mlx_array_data_float32(gained) orelse return error.NoData;
     try testing.expectApproxEqAbs(@as(f32, 2), gd[0], 1e-5);
     try testing.expectApproxEqAbs(@as(f32, 120), gd[11], 1e-5);
     // Wrong count is a hard error (3 taps for FLUX).
     const bad = [_]f32{ 1, 2 };
-    try testing.expectError(error.InvalidCondWeights, applyCondRebalance(enc, 1.0, &bad, s));
+    try testing.expectError(error.InvalidCondWeights, applyCondRebalance(&g, enc, 1.0, &bad));
 }
 
 test "flux CFG blend is uncond + guidance_scale * (cond - uncond)" {
-    const s = mlx.mlx_default_gpu_stream_new();
+    const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
+    var g = Graph.init(testing.allocator, s);
+    defer g.deinit();
     const cond_v = [_]f32{ 1, 2, 3, 4 };
     const uncond_v = [_]f32{ 0, 0, 1, 2 };
-    const sh = [_]c_int{ 1, 1, 4 };
-    const cond = mlx.mlx_array_new_data(&cond_v, &sh, 3, .float32);
-    defer _ = mlx.mlx_array_free(cond);
-    const uncond = mlx.mlx_array_new_data(&uncond_v, &sh, 3, .float32);
-    defer _ = mlx.mlx_array_free(uncond);
-    const guidance_scale: f32 = 3.5;
-
-    const diff = try subA(cond, uncond, s); defer _ = mlx.mlx_array_free(diff);
-    const scale_a = mlx.mlx_array_new_float(guidance_scale); defer _ = mlx.mlx_array_free(scale_a);
-    const scaled = try mulA(diff, scale_a, s); defer _ = mlx.mlx_array_free(scaled);
-    const blended = try addA(uncond, scaled, s); defer _ = mlx.mlx_array_free(blended);
-    _ = mlx.mlx_array_eval(blended);
+    const cond = try g.fromSlice(f32, &cond_v, &.{ 1, 1, 4 });
+    const uncond = try g.fromSlice(f32, &uncond_v, &.{ 1, 1, 4 });
+    const blended = try cfgBlend(&g, cond, uncond, 3.5);
+    try ops.eval(blended);
     const d = mlx.mlx_array_data_float32(blended) orelse return error.NoData;
-    // manual: uncond + 3.5*(cond-uncond)
-    for (cond_v, uncond_v, 0..) |c, u, i| {
-        const expect = u + guidance_scale * (c - u);
-        try testing.expectApproxEqAbs(expect, d[i], 1e-5);
-    }
-    // guidance_scale 1.0 collapses the blend to `cond` exactly — the
-    // mathematical identity `generateFromCondWithOpts` relies on to skip
-    // the unconditional forward entirely when CFG is off.
-    const scale_one = mlx.mlx_array_new_float(1.0); defer _ = mlx.mlx_array_free(scale_one);
-    const scaled_one = try mulA(diff, scale_one, s); defer _ = mlx.mlx_array_free(scaled_one);
-    const blended_one = try addA(uncond, scaled_one, s); defer _ = mlx.mlx_array_free(blended_one);
-    _ = mlx.mlx_array_eval(blended_one);
-    const d1 = mlx.mlx_array_data_float32(blended_one) orelse return error.NoData;
+    for (cond_v, uncond_v, 0..) |c, u, i| try testing.expectApproxEqAbs(u + 3.5 * (c - u), d[i], 1e-5);
+    // guidance_scale 1.0 collapses the blend to `cond`: the identity that lets CFG-off skip the second forward.
+    const one = try cfgBlend(&g, cond, uncond, 1.0);
+    try ops.eval(one);
+    const d1 = mlx.mlx_array_data_float32(one) orelse return error.NoData;
     for (cond_v, 0..) |c, i| try testing.expectApproxEqAbs(c, d1[i], 1e-5);
 }
 
@@ -2046,336 +1771,8 @@ test "flux GenOpts defaults keep CFG off (distilled klein pays no extra forward)
     try testing.expectEqual(@as(?mlx.mlx_array, null), opts.neg_enc);
 }
 
-// ════════════════════════════════════════════════════════════════════════
-// Full text→image pipeline.
-// ════════════════════════════════════════════════════════════════════════
-
-/// Empirical mu + sigma/timestep schedule (FlowMatchEuler, image_seq_len, steps).
-fn computeSchedule(allocator: std.mem.Allocator, image_seq_len: u32, steps: u32) !struct { ts: []f32, sig: []f32 } {
-    const ts = try allocator.alloc(f32, steps);
-    const sig = try allocator.alloc(f32, steps + 1);
-    const isl: f64 = @floatFromInt(image_seq_len);
-    const a1 = 8.73809524e-05; const b1 = 1.89833333;
-    const a2 = 0.00016927; const b2 = 0.45666666;
-    var mu: f64 = undefined;
-    if (isl > 4300) { mu = a2 * isl + b2; } else {
-        const m_200 = a2 * isl + b2;
-        const m_10 = a1 * isl + b1;
-        const a = (m_200 - m_10) / 190.0;
-        const b = m_200 - 200.0 * a;
-        mu = a * @as(f64, @floatFromInt(steps)) + b;
-    }
-    const emu = std.math.exp(mu);
-    for (0..steps) |i| {
-        const sl = 1.0 - (@as(f64, @floatFromInt(i)) * (1.0 - 1.0 / @as(f64, @floatFromInt(steps))) / @as(f64, @floatFromInt(steps - 1)));
-        const shifted = emu / (emu + (1.0 / sl - 1.0));
-        sig[i] = @floatCast(shifted);
-        ts[i] = @floatCast(shifted * 1000.0);
-    }
-    sig[steps] = 0.0;
-    return .{ .ts = ts, .sig = sig };
-}
-
-fn buildLatentIds(allocator: std.mem.Allocator, lh: u32, lw: u32) ![]i32 {
-    return buildLatentIdsT(allocator, lh, lw, 0);
-}
-
-/// Position ids for an edit forward: the generated lh×lw grid at t=0
-/// followed by each reference grid (`ref_dims[i] = {rh, rw}`) at
-/// t=10·(i+1) — the official FLUX.2 multi-reference convention — each with
-/// its own 0-based h/w grid.
-fn buildEditIds(allocator: std.mem.Allocator, lh: u32, lw: u32, ref_dims: []const [2]u32) ![]i32 {
-    var total: usize = lh * lw;
-    for (ref_dims) |d| total += d[0] * d[1];
-    const out = try allocator.alloc(i32, total * 4);
-    errdefer allocator.free(out);
-    const gen_ids = try buildLatentIdsT(allocator, lh, lw, 0);
-    defer allocator.free(gen_ids);
-    @memcpy(out[0..gen_ids.len], gen_ids);
-    var off = gen_ids.len;
-    for (ref_dims, 1..) |d, i| {
-        const rids = try buildLatentIdsT(allocator, d[0], d[1], @intCast(10 * i));
-        defer allocator.free(rids);
-        @memcpy(out[off .. off + rids.len], rids);
-        off += rids.len;
-    }
-    return out;
-}
-
-/// Latent position ids (t,h,w,l) with an explicit time coordinate. Generated
-/// tokens use t=0; reference-image tokens use the official FLUX.2 edit
-/// convention t=10·(ref_index+1) with their own 0-based h/w grid.
-fn buildLatentIdsT(allocator: std.mem.Allocator, lh: u32, lw: u32, t: i32) ![]i32 {
-    const n = lh * lw;
-    const out = try allocator.alloc(i32, n * 4);
-    var idx: usize = 0;
-    for (0..lh) |h| for (0..lw) |wv| {
-        out[idx * 4 + 0] = t;
-        out[idx * 4 + 1] = @intCast(h);
-        out[idx * 4 + 2] = @intCast(wv);
-        out[idx * 4 + 3] = 0; // layer
-        idx += 1;
-    };
-    return out;
-}
-fn buildTextIds(allocator: std.mem.Allocator, seq: u32) ![]i32 {
-    const out = try allocator.alloc(i32, seq * 4);
-    for (0..seq) |i| {
-        out[i * 4 + 0] = 0;
-        out[i * 4 + 1] = 0;
-        out[i * 4 + 2] = 0;
-        out[i * 4 + 3] = @intCast(i);
-    }
-    return out;
-}
-
-/// Generate an image. Returns [1,3,H,W] f32 in [0,1] (owned mlx array).
-/// Per-request generation options beyond the core prompt/size/steps.
-pub const GenOpts = struct {
-    /// img2img: bn-normalized packed latents [1,128,64,64] f32 from
-    /// `VaeEncoder.encode`. Mixed with noise at the start sigma.
-    init_latents: ?mlx.mlx_array = null,
-    /// First schedule index to run (img2img skip; 0 = full schedule).
-    start_step: u32 = 0,
-    /// Reference-image editing (FLUX.2 in-context conditioning): CLEAN
-    /// bn-normalized packed latents [1,128,rh,rw] from `VaeEncoder.encode`,
-    /// concatenated on the token sequence with t=10·(i+1) position ids
-    /// (official multi-reference convention — "replace the face in image 1
-    /// with the face from image 2"). Never noised; generation starts from
-    /// pure noise and attends to them. Empty = no references.
-    ref_latents: []const mlx.mlx_array = &.{},
-    /// Conditioning rebalance: global gain + per-tap weights (len 3).
-    cond_gain: f32 = 1.0,
-    cond_weights: ?[]const f32 = null,
-    /// Classifier-free guidance (the UNDISTILLED "base" klein checkpoints —
-    /// distilled klein has guidance baked into the weights and takes neither
-    /// field: `guidance_scale` 1.0 skips the unconditional forward entirely,
-    /// byte-identical to the no-CFG path). `neg_enc` is the negative prompt's
-    /// text-encoder output, same fixed [1,FLUX_SEQ_LEN,hidden] shape as the
-    /// positive `enc` so both forwards share `img_ids`/`txt_ids`.
-    guidance_scale: f32 = 1.0,
-    neg_enc: ?mlx.mlx_array = null,
-};
-
-pub fn generate(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32, mask: []const i32, seed: u64, steps: u32, height: u32, width: u32, progress: ?sse.Progress) !mlx.mlx_array {
-    return generateWithOpts(te, dit, vae, ids, mask, seed, steps, height, width, .{}, progress);
-}
-
-/// Stage 1 alone: encode the prompt (+ optional conditioning rebalance) and
-/// MATERIALIZE the result. The eval matters: mlx is lazy, and a low-memory
-/// host (the iPhone) frees the 1.7 GB text encoder right after this returns —
-/// an unevaluated graph would pin the encoder weights via refcounts and the
-/// free would reclaim nothing.
-pub fn encodePrompt(te: *TextEncoder, ids: []const i32, mask: []const i32, opts: GenOpts) !mlx.mlx_array {
-    var enc = try te.encode(ids, mask);
-    if (opts.cond_gain != 1.0 or opts.cond_weights != null) {
-        const re = try applyCondRebalance(enc, opts.cond_gain, opts.cond_weights, te.s);
-        _ = mlx.mlx_array_free(enc);
-        enc = re;
-    }
-    _ = mlx.mlx_array_eval(enc);
-    return enc;
-}
-
-/// One DiT forward → predicted velocity [1,nlat,128], slicing off any
-/// reference-editing tokens concatenated onto `latents`. Shared by the
-/// conditional and (CFG) unconditional passes — both read the same
-/// `img_ids`/`txt_ids`/`ref_tokens`, only `enc` differs.
-fn ditVelocity(dit: *Dit, latents: mlx.mlx_array, enc: mlx.mlx_array, t: f32, img_ids: []const i32, txt_ids: []const i32, ref_tokens: mlx.mlx_array, all_ids: ?[]i32, nlat: c_int, s: S) !mlx.mlx_array {
-    if (ref_tokens.ctx != null) {
-        const input = try concat(&[_]mlx.mlx_array{ latents, ref_tokens }, 1, s);
-        defer _ = mlx.mlx_array_free(input);
-        const full = try dit.forward(input, enc, t, all_ids.?, txt_ids);
-        defer _ = mlx.mlx_array_free(full);
-        return slice3(full, 1, 0, nlat, s);
-    }
-    return dit.forward(latents, enc, t, img_ids, txt_ids);
-}
-
-pub fn generateWithOpts(te: *TextEncoder, dit: *Dit, vae: *Vae, ids: []const i32, mask: []const i32, seed: u64, steps: u32, height: u32, width: u32, opts: GenOpts, progress: ?sse.Progress) !mlx.mlx_array {
-    const enc = try encodePrompt(te, ids, mask, opts);
-    return generateFromCondWithOpts(dit, vae, enc, ids.len, seed, steps, height, width, opts, progress);
-}
-
-/// Stages 2+ (latents init → denoise loop → VAE decode) from a pre-computed
-/// prompt encoding. Takes ownership of `enc_owned` AND `opts.neg_enc` (CFG).
-/// `prompt_len` = token count of the encoded prompt (drives the text position
-/// ids); the negative encoding shares the same fixed FLUX_SEQ_LEN padding, so
-/// it needs no position ids of its own.
-pub fn generateFromCondWithOpts(dit: *Dit, vae: *Vae, enc_owned: mlx.mlx_array, prompt_len: usize, seed: u64, steps: u32, height: u32, width: u32, opts: GenOpts, progress: ?sse.Progress) !mlx.mlx_array {
-    defer if (opts.neg_enc) |ne| {
-        _ = mlx.mlx_array_free(ne);
-    };
-    const s = dit.s;
-    const a = dit.allocator;
-    const lh = height / 16;
-    const lw = width / 16;
-    const nlat = lh * lw;
-
-    const enc = enc_owned;
-    defer _ = mlx.mlx_array_free(enc);
-
-    // 2. latents init: random.normal([1,128,lh,lw], key(seed)) → pack [1,nlat,128]
-    var key = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(key);
-    try mlx.check(mlx.mlx_random_key(&key, seed));
-    const nsh = [_]c_int{ 1, 128, @intCast(lh), @intCast(lw) };
-    var noise = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(noise);
-    try mlx.check(mlx.mlx_random_normal(&noise, &nsh, 4, .float32, 0.0, 1.0, key, s));
-    const noise_bf = try astype(noise, .bfloat16, s); defer _ = mlx.mlx_array_free(noise_bf);
-    // pack: [1,128,nlat] transpose [0,2,1]
-    const r = try reshape(noise_bf, &[_]c_int{ 1, 128, @intCast(nlat) }, s); defer _ = mlx.mlx_array_free(r);
-    var latents = try transpose(r, &[_]c_int{ 0, 2, 1 }, s); // [1,nlat,128]
-    { var c = mlx.mlx_array_new(); try mlx.check(mlx.mlx_contiguous(&c, latents, false, s)); _ = mlx.mlx_array_free(latents); latents = c; }
-    errdefer if (latents.ctx != null) {
-        _ = mlx.mlx_array_free(latents);
-    };
-
-    const img_ids = try buildLatentIds(a, lh, lw); defer a.free(img_ids);
-    const txt_ids = try buildTextIds(a, @intCast(prompt_len)); defer a.free(txt_ids);
-
-    // Reference-image editing: pack the CLEAN reference latents into tokens
-    // with t=10·(i+1) position ids (official FLUX.2 multi-reference
-    // convention). They ride along in every forward; only the generated span
-    // is Euler-stepped.
-    var ref_tokens: mlx.mlx_array = .{ .ctx = null };
-    defer if (ref_tokens.ctx != null) {
-        _ = mlx.mlx_array_free(ref_tokens);
-    };
-    var all_ids: ?[]i32 = null;
-    defer if (all_ids) |ai| a.free(ai);
-    if (opts.ref_latents.len > 0) {
-        const ref_dims = try a.alloc([2]u32, opts.ref_latents.len);
-        defer a.free(ref_dims);
-        for (opts.ref_latents, 0..) |rl, ri| {
-            const rsh = mlx.getShape(rl); // [1,128,rh,rw]
-            const rlh: u32 = @intCast(rsh[2]);
-            const rlw: u32 = @intCast(rsh[3]);
-            ref_dims[ri] = .{ rlh, rlw };
-            const rr = try reshape(rl, &[_]c_int{ 1, 128, @intCast(rlh * rlw) }, s);
-            defer _ = mlx.mlx_array_free(rr);
-            const rt = try transpose(rr, &[_]c_int{ 0, 2, 1 }, s);
-            defer _ = mlx.mlx_array_free(rt);
-            var rtc = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(rtc);
-            try mlx.check(mlx.mlx_contiguous(&rtc, rt, false, s));
-            const rtok = try astype(rtc, .bfloat16, s);
-            if (ref_tokens.ctx == null) {
-                ref_tokens = rtok;
-            } else {
-                const merged = try concat(&[_]mlx.mlx_array{ ref_tokens, rtok }, 1, s);
-                _ = mlx.mlx_array_free(ref_tokens);
-                _ = mlx.mlx_array_free(rtok);
-                ref_tokens = merged;
-            }
-        }
-        all_ids = try buildEditIds(a, lh, lw, ref_dims);
-    }
-
-    // 3. denoise loop
-    const sched = try computeSchedule(a, nlat, steps); defer { a.free(sched.ts); a.free(sched.sig); }
-    const start_step: u32 = @min(opts.start_step, steps - 1);
-
-    // img2img: x = (1-σ)·z0 + σ·noise at the start sigma (flow-match scale_noise).
-    if (opts.init_latents) |z0| {
-        const zr = try reshape(z0, &[_]c_int{ 1, 128, @intCast(nlat) }, s);
-        defer _ = mlx.mlx_array_free(zr);
-        const zt = try transpose(zr, &[_]c_int{ 0, 2, 1 }, s);
-        defer _ = mlx.mlx_array_free(zt);
-        const z_bf = try astype(zt, .bfloat16, s);
-        defer _ = mlx.mlx_array_free(z_bf);
-        const sigma = sched.sig[start_step];
-        const sa = mlx.mlx_array_new_float(sigma);
-        defer _ = mlx.mlx_array_free(sa);
-        const oma = mlx.mlx_array_new_float(1.0 - sigma);
-        defer _ = mlx.mlx_array_free(oma);
-        const zs = try mulA(z_bf, oma, s);
-        defer _ = mlx.mlx_array_free(zs);
-        const ns = try mulA(latents, sa, s);
-        defer _ = mlx.mlx_array_free(ns);
-        const mixed = try addA(zs, ns, s);
-        defer _ = mlx.mlx_array_free(mixed);
-        const nl = try astype(mixed, .bfloat16, s);
-        _ = mlx.mlx_array_free(latents);
-        latents = nl;
-    }
-
-    const use_cfg = opts.guidance_scale != 1.0 and opts.neg_enc != null;
-    const run_steps = steps - start_step;
-    for (start_step..steps) |t| {
-        if (progress) |p| if (p.boundary()) return error.Cancelled;
-        const nz_cond = try ditVelocity(dit, latents, enc, sched.ts[t], img_ids, txt_ids, ref_tokens, all_ids, @intCast(nlat), s);
-        const nz = if (use_cfg) blk: {
-            defer _ = mlx.mlx_array_free(nz_cond);
-            const nz_uncond = try ditVelocity(dit, latents, opts.neg_enc.?, sched.ts[t], img_ids, txt_ids, ref_tokens, all_ids, @intCast(nlat), s);
-            defer _ = mlx.mlx_array_free(nz_uncond);
-            // v = uncond + guidance_scale · (cond − uncond)
-            const diff = try subA(nz_cond, nz_uncond, s); defer _ = mlx.mlx_array_free(diff);
-            const scale_a = mlx.mlx_array_new_float(opts.guidance_scale); defer _ = mlx.mlx_array_free(scale_a);
-            const scaled = try mulA(diff, scale_a, s); defer _ = mlx.mlx_array_free(scaled);
-            break :blk try addA(nz_uncond, scaled, s);
-        } else nz_cond;
-        defer _ = mlx.mlx_array_free(nz);
-        const dt = sched.sig[t + 1] - sched.sig[t];
-        const dta = mlx.mlx_array_new_float(dt); defer _ = mlx.mlx_array_free(dta);
-        const step = try mulA(nz, dta, s); defer _ = mlx.mlx_array_free(step);
-        const nl = try addA(latents, step, s);
-        _ = mlx.mlx_array_free(latents); latents = nl;
-        _ = mlx.mlx_array_eval(latents);
-        if (progress) |p| p.emit("Generating", @intCast(t + 1 - start_step), run_steps);
-    }
-    if (progress) |p| p.emit("Decoding image", steps, steps);
-
-    // 4. unpack → [1,128,lh,lw], decode
-    const lr = try reshape(latents, &[_]c_int{ 1, @intCast(lh), @intCast(lw), 128 }, s); defer _ = mlx.mlx_array_free(lr);
-    _ = mlx.mlx_array_free(latents);
-    latents = .{ .ctx = null };
-    const packed_lat = try transpose(lr, &[_]c_int{ 0, 3, 1, 2 }, s); defer _ = mlx.mlx_array_free(packed_lat);
-    const decoded = try vae.decode(packed_lat); defer _ = mlx.mlx_array_free(decoded);
-    // denormalize: clip(x/2+0.5, 0, 1)
-    const half = mlx.mlx_array_new_float(0.5); defer _ = mlx.mlx_array_free(half);
-    const df = try astype(decoded, .float32, s); defer _ = mlx.mlx_array_free(df);
-    const scaled = try mulA(df, half, s); defer _ = mlx.mlx_array_free(scaled);
-    const shifted = try addA(scaled, half, s); defer _ = mlx.mlx_array_free(shifted);
-    const lo = mlx.mlx_array_new_float(0.0); defer _ = mlx.mlx_array_free(lo);
-    const hi = mlx.mlx_array_new_float(1.0); defer _ = mlx.mlx_array_free(hi);
-    var clo = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(clo);
-    try mlx.check(mlx.mlx_maximum(&clo, shifted, lo, s));
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_minimum(&out, clo, hi, s));
-    return out;
-}
-
-/// Write [1,3,H,W] f32 [0,1] as a binary PPM (P6) — viewable, no deps.
-pub fn writePpm(io: std.Io, allocator: std.mem.Allocator, img: mlx.mlx_array, path: []const u8, s: S) !void {
-    const cf = blk: { var c = mlx.mlx_array_new(); try mlx.check(mlx.mlx_contiguous(&c, img, false, s)); break :blk c; };
-    defer _ = mlx.mlx_array_free(cf);
-    _ = mlx.mlx_array_eval(cf);
-    const sh = mlx.getShape(cf); // [1,3,H,W]
-    const H: usize = @intCast(sh[2]); const W: usize = @intCast(sh[3]);
-    const d = mlx.mlx_array_data_float32(cf) orelse return error.NoData;
-    const hdr = try std.fmt.allocPrint(allocator, "P6\n{d} {d}\n255\n", .{ W, H });
-    defer allocator.free(hdr);
-    const body = try allocator.alloc(u8, W * H * 3);
-    defer allocator.free(body);
-    const plane = W * H;
-    for (0..H) |y| for (0..W) |x| {
-        const o = (y * W + x) * 3;
-        for (0..3) |c| {
-            const v = d[c * plane + y * W + x];
-            body[o + c] = @intFromFloat(std.math.clamp(v * 255.0, 0, 255));
-        }
-    };
-    const f = try std.Io.Dir.createFileAbsolute(io, path, .{});
-    defer f.close(io);
-    var wb: [4096]u8 = undefined;
-    var fw = f.writer(io, &wb);
-    try fw.interface.writeAll(hdr);
-    try fw.interface.writeAll(body);
-    try fw.interface.flush();
-}
-
 // End-to-end: full pipeline vs the reference image (and writes a PPM).
-//   FLUX_TEST_MODEL, FLUX_IDS, FLUX_MASK, FLUX_DECODED(decoded.raw), FLUX_PPM(out, optional)
+//   FLUX_TEST_MODEL, FLUX_IDS, FLUX_MASK, FLUX_DECODED(decoded.raw)
 test "flux end-to-end pipeline matches reference image" {
     const model_dir = std.mem.span(std.c.getenv("FLUX_TEST_MODEL") orelse return error.SkipZigTest);
     const ids_p = std.mem.span(std.c.getenv("FLUX_IDS") orelse return error.SkipZigTest);
@@ -2392,7 +1789,7 @@ test "flux end-to-end pipeline matches reference image" {
     var dit = try loadDit(io, a, s, model_dir); defer dit.deinit();
     var vae = try loadVae(io, a, s, model_dir); defer vae.deinit();
 
-    const img = try generate(&te, &dit, &vae, ids, mask, 42, 4, 1024, 1024, null); // [0,1]
+    const img = try generateWithOpts(&te, &dit, &vae, ids, mask, 42, 4, 1024, 1024, .{}, null); // [0,1]
     defer _ = mlx.mlx_array_free(img);
     _ = mlx.mlx_array_eval(img);
     const n: usize = @intCast(mlx.mlx_array_size(img));
@@ -2406,67 +1803,7 @@ test "flux end-to-end pipeline matches reference image" {
     }
     const corr = dot / (std.math.sqrt(na) * std.math.sqrt(nb));
     std.debug.print("[flux-e2e] n={d} corr={d:.5}\n", .{ n, corr });
-    if (std.c.getenv("FLUX_PPM")) |pp| try writePpm(io, a, img, std.mem.span(pp), s);
     try testing.expect(corr > 0.95);
-}
-
-// ── Tests ──
-
-test "hermetic conv2d sanity" {
-    const s = mlx.mlx_default_gpu_stream_new();
-    defer _ = mlx.mlx_stream_free(s);
-    // input [1,4,4,2] all ones, weight [3,3,3,2] all ones (out=3,kh=3,kw=3,in=2), pad=1
-    var inb: [1 * 4 * 4 * 2]f32 = undefined; @memset(&inb, 1.0);
-    const ish = [_]c_int{ 1, 4, 4, 2 };
-    const inp = mlx.mlx_array_new_data(&inb, &ish, 4, .float32); defer _ = mlx.mlx_array_free(inp);
-    var wb: [3 * 3 * 3 * 2]f32 = undefined; @memset(&wb, 1.0);
-    const wsh = [_]c_int{ 3, 3, 3, 2 };
-    const w = mlx.mlx_array_new_data(&wb, &wsh, 4, .float32); defer _ = mlx.mlx_array_free(w);
-    var o = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(o);
-    try mlx.check(mlx.mlx_conv2d(&o, inp, w, 1, 1, 1, 1, 1, 1, 1, s));
-    _ = mlx.mlx_array_eval(o);
-    const sh = mlx.getShape(o);
-    std.debug.print("[conv-sanity] out shape [{d},{d},{d},{d}]\n", .{ sh[0], sh[1], sh[2], sh[3] });
-    const d = mlx.mlx_array_data_float32(o).?;
-    // center pixel (1,1) channel0 = full 3x3x2 window of ones = 18; corner = 2x2x2=8
-    std.debug.print("[conv-sanity] center={d} corner={d}\n", .{ d[(1 * 4 + 1) * 3 + 0], d[0] });
-    try testing.expect(@abs(d[(1 * 4 + 1) * 3 + 0] - 18.0) < 0.01);
-    // bf16 variant
-    const in_bf = try astype(inp, .bfloat16, s); defer _ = mlx.mlx_array_free(in_bf);
-    const w_bf = try astype(w, .bfloat16, s); defer _ = mlx.mlx_array_free(w_bf);
-    var o2 = mlx.mlx_array_new(); defer _ = mlx.mlx_array_free(o2);
-    try mlx.check(mlx.mlx_conv2d(&o2, in_bf, w_bf, 1, 1, 1, 1, 1, 1, 1, s));
-    const o2f = try astype(o2, .float32, s); defer _ = mlx.mlx_array_free(o2f);
-    _ = mlx.mlx_array_eval(o2f);
-    const d2 = mlx.mlx_array_data_float32(o2f).?;
-    std.debug.print("[conv-sanity-bf16] center={d} corner={d}\n", .{ d2[(1 * 4 + 1) * 3 + 0], d2[0] });
-}
-
-const testing = std.testing;
-
-fn readI32(io: std.Io, a: std.mem.Allocator, path: []const u8) ![]i32 {
-    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer f.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = f.reader(io, &rb);
-    const bytes = try rs.interface.allocRemaining(a, .limited(64 * 1024 * 1024));
-    defer a.free(bytes);
-    const n = bytes.len / 4;
-    const out = try a.alloc(i32, n);
-    @memcpy(std.mem.sliceAsBytes(out), bytes[0 .. n * 4]);
-    return out;
-}
-fn readF32(io: std.Io, a: std.mem.Allocator, path: []const u8) ![]f32 {
-    const f = try std.Io.Dir.openFileAbsolute(io, path, .{});
-    defer f.close(io);
-    var rb: [4096]u8 = undefined;
-    var rs = f.reader(io, &rb);
-    const bytes = try rs.interface.allocRemaining(a, .limited(512 * 1024 * 1024));
-    defer a.free(bytes);
-    const n = bytes.len / 4;
-    const out = try a.alloc(f32, n);
-    @memcpy(std.mem.sliceAsBytes(out), bytes[0 .. n * 4]);
-    return out;
 }
 
 // Stage 1 oracle: text encoder prompt_embeds.
@@ -2490,7 +1827,9 @@ test "flux text encoder reproduces prompt_embeds" {
     var te = try loadTextEncoder(io, a, s, model_dir);
     defer te.deinit();
 
-    const pe = try te.encode(ids, mask);
+    var tg = Graph.init(a, s);
+    defer tg.deinit();
+    const pe = tg.escape(try te.encode(&tg, ids, mask));
     defer _ = mlx.mlx_array_free(pe);
     const pe_f = try astype(pe, .float32, s);
     defer _ = mlx.mlx_array_free(pe_f);
@@ -2672,7 +2011,9 @@ test "flux QLinear with inferred sub-4-bit geometry matches the dequantized refe
         ql.bits = geo.bits;
         ql.group_size = geo.group_size;
 
-        const got = try ql.forward(x, s);
+        var tg = Graph.init(testing.allocator, s);
+        defer tg.deinit();
+        const got = tg.escape(try ql.forward(&tg, x));
         defer _ = mlx.mlx_array_free(got);
 
         // Reference: x @ dequantize(w)ᵀ.
@@ -2727,7 +2068,9 @@ fn fluxProbe(io: std.Io, a: std.mem.Allocator, s: S, model_dir: []const u8, resi
     defer a.free(img_ids);
     const txt_ids = try buildTextIds(a, 64);
     defer a.free(txt_ids);
-    const out = try dit.forward(img, enc, 0.5, img_ids, txt_ids);
+    var tg = Graph.init(a, s);
+    defer tg.deinit();
+    const out = tg.escape(try dit.forward(&tg, img, enc, 0.5, img_ids, txt_ids));
     defer _ = mlx.mlx_array_free(out);
     const f = try astype(out, .float32, s);
     try mlx.check(mlx.mlx_array_eval(f));

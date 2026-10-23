@@ -1,5 +1,6 @@
-//! plugins/glm5_next/forward, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns glm_batched_logged, glmHeadMm, forwardGlm5With, glmSublayer, glmBranch, glmBranchSlots, and 11 more.
+//! GLM-5.3-Flash's legacy forward on the engine's `ForwardCtx` (prefill, decode, verify, the batched tick, the MTP
+//! head's round and DFlash capture). The table forward (`table_forward.zig`) is its copy over `CacheOps`; this one
+//! goes when glm5_next flips to its plugin.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -637,7 +638,7 @@ test "glm5_next fixture: one-shot and chunked prefill + decode vs mlx-vlm glm5_n
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
 
-    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var config = try model_mod.parseConfigLegacy(io, allocator, std.mem.span(model_dir));
     var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
@@ -717,7 +718,7 @@ test "glm5_next DFlash capture: the tapped layers' hyper-connection mean tracks 
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
 
-    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var config = try model_mod.parseConfigLegacy(io, allocator, std.mem.span(model_dir));
     var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
@@ -848,7 +849,7 @@ test "glm5_next verify windows of 2..16 rows track the same rows decoded one at 
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var config = try model_mod.parseConfigLegacy(io, allocator, std.mem.span(model_dir));
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
@@ -913,7 +914,7 @@ test "glm5_next batched decode: a three-slot tick tracks three serial decodes (G
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var config = try model_mod.parseConfigLegacy(io, allocator, std.mem.span(model_dir));
     var weights = try model_mod.loadModelWeights(io, allocator, std.mem.span(model_dir), &config, false);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
@@ -997,7 +998,7 @@ test "glm5_next: oMLX 0.7.1's layout (one fused conv1d, forget_gate.*) gives the
     const allocator = testing.allocator;
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
-    const config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    const config = try model_mod.parseConfigLegacy(io, allocator, std.mem.span(model_dir));
 
     const Logits = struct {
         fn of(io_: std.Io, alloc: std.mem.Allocator, cfg_in: model_mod.ModelConfig, dir: []const u8, omlx: bool, st: mlx.mlx_stream) ![]f32 {
@@ -1057,7 +1058,7 @@ test "glm5_next MTP fixture: the pack's mtp.0 layer drafts as mlx-vlm's drafter,
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
 
-    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
+    var config = try model_mod.parseConfigLegacy(io, allocator, std.mem.span(model_dir));
     var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);

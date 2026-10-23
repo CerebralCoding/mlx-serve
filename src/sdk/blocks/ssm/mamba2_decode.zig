@@ -32,10 +32,10 @@ fn stepFits(rows: c_int, state: c_int) bool {
 // grid (32, Dh, B*H), threadgroup (32, TGY, 1): one simdgroup per (b, h, d),
 // each lane owning Ds/32 state columns. B/C of the head's group are conv'd
 // once per threadgroup into shared memory.
-const STEP_SOURCE = kernelSource("kernels/ssm/mamba2_decode_step.metal");
+pub const STEP_SOURCE = kernelSource("kernels/ssm/mamba2_decode_step.metal");
 
 // grid (GS/4, NG, rows): one threadgroup per (row, group), 4 elements a thread.
-const GNORM_SOURCE = kernelSource("kernels/ssm/mamba2_decode_gnorm.metal");
+pub const GNORM_SOURCE = kernelSource("kernels/ssm/mamba2_decode_gnorm.metal");
 
 pub const Geometry = struct { batch: c_int, rows: c_int, heads: c_int, groups: c_int, head_dim: c_int, state: c_int, conv_kernel: c_int, proj: c_int };
 

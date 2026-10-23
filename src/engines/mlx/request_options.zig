@@ -2,12 +2,16 @@
 //! admitMtpForCtx; PldDefaults; requestPld; drafter/spec request modes, pickStreamMode
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const transformer_mod = @import("transformer.zig");
 const kv_quant_mod = @import("cache/kv_quant.zig");
 const generate_mod = @import("generate.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 const model_mod = @import("model.zig");
 const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
+const v41_plugin = @import("../../plugins/deepseek_v41/plugin.zig");
+const plugin_config = @import("plugin/config.zig");
+const plugin_driver = @import("plugin/driver.zig");
 const log = @import("../../host/log.zig");
 const model_registry_mod = @import("../../host/registry/registry.zig");
 const Transformer = transformer_mod.Transformer;
@@ -457,31 +461,21 @@ test "defaultEnableMtp: a loaded head drafts by default, MoE or not" {
 }
 
 test "native speculation: resolved opt-out gates capability and API defaults" {
-    const Env = struct {
-        extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-    };
-    const name = "MLX_SERVE_DSV4_DSPARK";
-    const saved = if (std.c.getenv(name)) |value|
-        try testing.allocator.dupeSentinel(u8, std.mem.span(value), 0)
-    else
-        null;
-    defer {
-        if (saved) |value| {
-            _ = Env.setenv(name, value, 1);
-            testing.allocator.free(value);
-        } else {
-            _ = Env.unsetenv(name);
-        }
-    }
-    var cfg = model_mod.ModelConfig{};
+    const saved = env.override(.MLX_SERVE_DSV4_DSPARK, null);
+    defer saved.restore();
+    // A served V4.1 whose module loaded three DSpark stages.
     var native: dsv41_mod.Dsv41Model = undefined;
     native.n_mtp = 3;
+    var served: v41_plugin.Model = undefined;
+    served.mdl = &native;
+    var binding: plugin_config.Binding = .{ .table = &v41_plugin.table };
+    binding.parsed.caps.owns_decode_state = true;
+    var bound: plugin_driver.Bound = .{ .table = &v41_plugin.table, .model = &served };
+    var cfg = model_mod.ModelConfig{ .plugin = &binding };
     var xfm: Transformer = undefined;
     xfm.config = cfg;
-    xfm.dsv4 = null;
-    xfm.dsv41 = &native;
     xfm.mlx_stream_ext = null;
+    xfm.plugin = &bound;
     xfm.dense_attn_proj = false;
     var lm: LoadedModel = undefined;
     lm.config = &cfg;
@@ -491,9 +485,9 @@ test "native speculation: resolved opt-out gates capability and API defaults" {
     lm.dflash = null;
     lm.drafter = null;
     lm.mtp_depth = 6;
-    for ([_]?[:0]const u8{ null, "1", "0" }) |env| {
-        try testing.expectEqual(@as(c_int, 0), if (env) |value| Env.setenv(name, value, 1) else Env.unsetenv(name));
-        const env_enabled = if (env) |value| value[0] != '0' else true;
+    for ([_]?[:0]const u8{ null, "1", "0" }) |raw| {
+        if (raw) |value| env.set(.MLX_SERVE_DSV4_DSPARK, value) else env.unset(.MLX_SERVE_DSV4_DSPARK);
+        const env_enabled = if (raw) |value| value[0] != '0' else true;
         for ([_]?bool{ null, true, false }) |setting| {
             cfg.mtp_override = setting;
             xfm.config.mtp_override = setting;

@@ -1,11 +1,11 @@
 //! MTP and DFlash traces and their env switches.
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const log = @import("../../../../host/log.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const mtp_mod = @import("../../../../sdk/spec/mtp/mtp.zig");
 const testing = std.testing;
 const Generator = @import("../../generate/generator.zig").Generator;
-const readEnvBool = @import("../../env_generate.zig").readEnvBool;
 
 
 /// Per-phase wall-time accumulator behind MLX_SERVE_MTP_TRACE=1. Pure
@@ -167,7 +167,7 @@ var dflash_sampled_drafts_cache: ?bool = null;
 pub fn dflashSampledDraftsEnabled() bool {
     if (dflash_sampled_drafts_cache) |v| return v;
     var on = false;
-    if (std.c.getenv("MLX_SERVE_DFLASH_SAMPLED_DRAFTS")) |p| {
+    if (env.get(.MLX_SERVE_DFLASH_SAMPLED_DRAFTS)) |p| {
         const val = std.mem.span(p);
         if (val.len > 0 and val[0] == '1') on = true;
     }
@@ -183,14 +183,14 @@ var dflash_selector_cache: ?bool = null;
 /// UNCORRECTED base logits (the v1 arm) — an A/B lever for measuring what
 /// the Markov chain is worth, never a default.
 pub fn dflashMarkovEnabled() bool {
-    const p = std.c.getenv("MLX_SERVE_DFLASH_MARKOV") orelse return true;
+    const p = env.get(.MLX_SERVE_DFLASH_MARKOV) orelse return true;
     return !std.mem.eql(u8, std.mem.span(p), "0");
 }
 
 pub fn dflashSelectorEnabled() bool {
     if (dflash_selector_cache) |v| return v;
     var on = true;
-    if (std.c.getenv("MLX_SERVE_DFLASH_SELECTOR")) |p| {
+    if (env.get(.MLX_SERVE_DFLASH_SELECTOR)) |p| {
         const val = std.mem.span(p);
         if (val.len > 0 and val[0] == '0') on = false;
     }
@@ -201,7 +201,7 @@ pub fn dflashSelectorEnabled() bool {
 var dflash_trace_cache: ?bool = null;
 pub fn dflashTraceEnabled() bool {
     if (dflash_trace_cache) |v| return v;
-    const on = readEnvBool("MLX_SERVE_DFLASH_TRACE");
+    const on = env.one(.MLX_SERVE_DFLASH_TRACE);
     dflash_trace_cache = on;
     return on;
 }
@@ -234,7 +234,7 @@ var mtp_adaptive_cache: ?bool = null;
 pub fn mtpAdaptiveEnabled() bool {
     if (mtp_adaptive_cache) |v| return v;
     var on = true;
-    if (std.c.getenv("MLX_SERVE_MTP_ADAPTIVE")) |p| {
+    if (env.get(.MLX_SERVE_MTP_ADAPTIVE)) |p| {
         const val = std.mem.span(p);
         if (val.len > 0 and val[0] == '0') on = false;
     }
@@ -252,7 +252,7 @@ pub fn mtpEvSeedEnabledFromEnv(raw: ?[]const u8) bool {
 
 pub fn mtpEvSeedEnabled() bool {
     if (mtp_ev_seed_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_EV_SEED")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_EV_SEED);
     const on = mtpEvSeedEnabledFromEnv(raw);
     mtp_ev_seed_cache = on;
     return on;
@@ -273,7 +273,7 @@ pub fn mtpEarlyDispatchEnabledFromEnv(raw: ?[]const u8) bool {
 
 pub fn mtpEarlyDispatchEnabled() bool {
     if (mtp_early_dispatch_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_EARLY_DISPATCH")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_EARLY_DISPATCH);
     const on = mtpEarlyDispatchEnabledFromEnv(raw);
     mtp_early_dispatch_cache = on;
     return on;
@@ -293,7 +293,7 @@ pub fn mtpPredraftEnabledFromEnv(raw: ?[]const u8) bool {
 
 pub fn mtpPredraftEnabled() bool {
     if (mtp_predraft_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_PREDRAFT")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_PREDRAFT);
     const on = mtpPredraftEnabledFromEnv(raw);
     mtp_predraft_cache = on;
     return on;
@@ -311,7 +311,7 @@ pub fn mtpTraceSub(self: *Generator, sub: MtpTrace.Sub, dur_ns: u64) void {
 var mtp_trace_cache: ?bool = null;
 pub fn mtpTraceEnabled() bool {
     if (mtp_trace_cache) |v| return v;
-    const on = readEnvBool("MLX_SERVE_MTP_TRACE");
+    const on = env.one(.MLX_SERVE_MTP_TRACE);
     mtp_trace_cache = on;
     return on;
 }

@@ -1,5 +1,5 @@
-//! plugins/glm5_next/load, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns loadMhcWeights, loadDsaWeightsAt.
+//! GLM-5.3-Flash's own tensors at load: each sublayer's hyper-connection (`attn_hc`/`ffn_hc`) and the sparse
+//! attention layer (latent projections, the absorbed per-head `embed_q`/`unembed_out`, the indexer).
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");

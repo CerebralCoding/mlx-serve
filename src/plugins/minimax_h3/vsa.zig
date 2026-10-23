@@ -368,11 +368,11 @@ pub fn attend(p: *const Plan, q: A, k: A, v: A, gate: A, scale: f32, s: S) !A {
 }
 
 /// Per-tile f32 mean of tiled x [1, H, n_tiles * TILE, 128] over its valid rows: [H, n_tiles, 128].
-const POOL_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa_pool.metal");
+pub const POOL_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa_pool.metal");
 
 /// Each row's output, token-major [S, H*128]: its dense or video attention row plus the gate term
 /// rounded to T first, as the op chain rounds it (`out + T(comp * gate)`).
-const ASSEMBLE_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa_assemble.metal");
+pub const ASSEMBLE_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa_assemble.metal");
 
 var pool_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var assemble_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -390,14 +390,14 @@ fn runKernel(sc: *Scope, k: mlx.mlx_fast_metal_kernel, ins: []const A, out_shape
     return sc.keep(outs[0]);
 }
 
-fn poolKernel(sc: *Scope, p: *const Plan, x: A) !A {
+pub fn poolKernel(sc: *Scope, p: *const Plan, x: A) !A {
     if (pool_kernel == null) pool_kernel = try h3_glue.makeKernel("msv_h3_vsa_pool", &.{ "x", "vbs", "meta" }, &.{"out"}, POOL_SOURCE, "");
     const h = mlx.getShape(x)[1];
     const nt: c_int = @intCast(p.geo.n_tiles);
     return runKernel(sc, pool_kernel.?, &.{ x, p.vbs, p.meta }, &.{ h, nt, 128 }, .float32, mlx.mlx_array_dtype(x), .{ 128, nt, h }, 128);
 }
 
-fn assembleKernel(sc: *Scope, p: *const Plan, dense: A, video: A, comp: A, gate: A) !A {
+pub fn assembleKernel(sc: *Scope, p: *const Plan, dense: A, video: A, comp: A, gate: A) !A {
     if (assemble_kernel == null) assemble_kernel = try h3_glue.makeKernel("msv_h3_vsa_assemble", &.{ "dense", "video", "comp", "gate", "out_src", "row_tile", "shape" }, &.{"out"}, ASSEMBLE_SOURCE, "");
     const h = mlx.getShape(dense)[1];
     const seq: c_int = @intCast(p.geo.seq);
@@ -453,10 +453,11 @@ fn gatherAttend(sc: *Scope, p: *const Plan, tiled: [3]A, sel: A, scale: f32) !A 
 // staged in threadgroup memory and consumed with 8x8 simdgroup MMAs and an f32 online softmax.
 // Only a ragged key tile's valid rows are scored; rows past a query tile's valid count are never
 // written (no reader looks at them).
-const KERNEL_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa.metal");
-const KERNEL_HEADER = kernelSource("plugins/minimax_h3/kernels/vsa_header.metal");
+pub const KERNEL_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa.metal");
+pub const KERNEL_HEADER = kernelSource("plugins/minimax_h3/kernels/vsa_header.metal");
 
-const NAX_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa_nax_entry.metal");
+pub const NAX_SOURCE = kernelSource("plugins/minimax_h3/kernels/vsa_nax_entry.metal");
+pub const NAX_HEADER = kernelSource("kernels/attention/nax_tiles.metal") ++ kernelSource("kernels/attention/nax_attention.metal") ++ kernelSource("plugins/minimax_h3/kernels/vsa_nax.metal");
 
 /// One compiled kernel and its launch config, cached per shape.
 const Launch = struct {
@@ -468,7 +469,7 @@ var launches: [2]Launch = .{ .{}, .{} };
 
 /// Both kernels write [1, H, n_video * TILE, 128] from 128-thread threadgroups: the simdgroup kernel
 /// one per (32-row slice, tile, head), the NAX kernel one per (64-row block, head).
-fn kernelAttend(sc: *Scope, p: *const Plan, tiled: [3]A, sel: A, scale: f32) !A {
+pub fn kernelAttend(sc: *Scope, p: *const Plan, tiled: [3]A, sel: A, scale: f32) !A {
     const sh = mlx.getShape(tiled[0]);
     const dt = mlx.mlx_array_dtype(tiled[0]);
     const nv: c_int = @intCast(p.geo.n_tiles - p.geo.n_prefix);
@@ -476,7 +477,7 @@ fn kernelAttend(sc: *Scope, p: *const Plan, tiled: [3]A, sel: A, scale: f32) !A 
     const l = &launches[@intFromBool(is_nax)];
     const ins = [_][*:0]const u8{ "q", "k", "v", "sel", "vbs", "meta", "scale" };
     if (l.handle == null) l.handle = if (is_nax)
-        try h3_glue.makeKernel("msv_h3_vsa_nax", &ins, &.{"out"}, NAX_SOURCE, kernelSource("kernels/attention/nax_tiles.metal") ++ kernelSource("kernels/attention/nax_attention.metal") ++ kernelSource("plugins/minimax_h3/kernels/vsa_nax.metal"))
+        try h3_glue.makeKernel("msv_h3_vsa_nax", &ins, &.{"out"}, NAX_SOURCE, NAX_HEADER)
     else
         try h3_glue.makeKernel("msv_h3_vsa", &ins, &.{"out"}, KERNEL_SOURCE, KERNEL_HEADER);
     if (l.key == null or l.key.?.h != sh[1] or l.key.?.nv != nv or l.key.?.dt != dt) {

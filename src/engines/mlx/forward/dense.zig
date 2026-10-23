@@ -499,15 +499,7 @@ pub fn forwardStandardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.
         defer _ = mlx.mlx_array_free(attn_flat);
         try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, cur_out_shape, 3, self.s));
 
-        var g_pre = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(g_pre);
-        if (fused_rows and lw.qkv.count == 4) try lw.qkv.part(&g_pre, qkv_all, 3, self.s);
-        const o_in = if (lw.ag_w != null) try self.attnOutGate(normed, attn_flat, lw, g_pre) else attn_flat;
-        defer if (lw.ag_w != null) {
-            _ = mlx.mlx_array_free(o_in);
-        };
-
-        const o_out = try self.qmatmul(o_in, lw.o_w, lw.o_s, lw.o_b);
+        const o_out = try self.qmatmul(attn_flat, lw.o_w, lw.o_s, lw.o_b);
         defer _ = mlx.mlx_array_free(o_out);
 
         // MLP with pre/post FF norms (Gemma 3/4 style) or simple residual (Llama style)
@@ -588,15 +580,6 @@ pub fn forwardStandardWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.
     if (self.embedding_mode or ctx.skip_lm_head) return final_normed;
     var logits = try self.lmHeadProject(final_normed);
     _ = mlx.mlx_array_free(final_normed);
-
-    // MuseGlimmer: pre-scale logits by output_multiplier BEFORE the softcap
-    // (reference: T * tanh(logits * mult / T)).
-    if (self.output_mult) |m| {
-        var scaled = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&scaled, logits, m, self.s));
-        _ = mlx.mlx_array_free(logits);
-        logits = scaled;
-    }
 
     // Gemma 4: logit softcapping — tanh(logits / cap) * cap
     if (self.softcap_scalar != null) {

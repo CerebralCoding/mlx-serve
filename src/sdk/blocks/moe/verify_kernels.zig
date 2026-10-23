@@ -2,13 +2,13 @@
 //! Owns VERIFY_EXPERT_REUSE_SOURCE, verify_expert_reuse_kernel, VERIFY_PAIRED_GU_HEADER, VERIFY_PAIRED_GU_SOURCE, verify_paired_gu_kernel, verify_paired_gu_config, and 31 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
 const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
 const verify_projection = @import("../linear/verify_projection.zig");
 const expectRowsByteEqual = @import("../../../engines/mlx/batched/row_axis_verify.zig").expectRowsByteEqual;
-const diagEnvOn = @import("../../../engines/mlx/env_transformer.zig").diagEnvOn;
 const MoeLayerWeights = @import("../../../engines/mlx/forward/layered.zig").MoeLayerWeights;
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
@@ -27,7 +27,7 @@ const swigluSigTable = @import("../mlp/fused_activations.zig").swigluSigTable;
 const gatherExpertMm = @import("experts.zig").gatherExpertMm;
 
 // Preserve MLX's affine qmv K reduction while sharing each packed word across a pair.
-const VERIFY_EXPERT_REUSE_SOURCE = kernelSource("kernels/moe/verify_expert_reuse.metal");
+pub const VERIFY_EXPERT_REUSE_SOURCE = kernelSource("kernels/moe/verify_expert_reuse.metal");
 
 var verify_expert_reuse_kernel: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -37,9 +37,9 @@ var verify_expert_reuse_kernel: ?mlx.mlx_fast_metal_kernel = null;
 // One 64-thread group owns eight gate/up output rows for one routed assignment.
 // The BF16 sigmoid lookup is the same table used by fusedSwiGLU; the JIT's
 // metal::exp rounding is not identical to MLX's metallib for every BF16 input.
-const VERIFY_PAIRED_GU_HEADER = kernelSource("kernels/moe/verify_paired_gu_header.metal");
+pub const VERIFY_PAIRED_GU_HEADER = kernelSource("kernels/moe/verify_paired_gu_header.metal");
 
-const VERIFY_PAIRED_GU_SOURCE = kernelSource("kernels/moe/verify_paired_gu.metal");
+pub const VERIFY_PAIRED_GU_SOURCE = kernelSource("kernels/moe/verify_paired_gu.metal");
 
 var verify_paired_gu_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var verify_paired_gu_config: ?mlx.mlx_fast_metal_kernel_config = null;
@@ -71,8 +71,7 @@ pub fn validatePairedGateUpPack(config: *const ModelConfig, layers_opt: ?[]MoeLa
             .moe => |value| value,
             else => return error.PairedGateUpNonMoeLayer,
         };
-        if (mw.switch_gate_bias.ctx != null or mw.switch_up_bias.ctx != null or
-            !pairedGateUpArrayMatches(mw.switch_gate_w, .uint32, weight_shape) or
+        if (!pairedGateUpArrayMatches(mw.switch_gate_w, .uint32, weight_shape) or
             !pairedGateUpArrayMatches(mw.switch_up_w, .uint32, weight_shape) or
             !pairedGateUpArrayMatches(mw.switch_gate_s, .bfloat16, groups) or
             !pairedGateUpArrayMatches(mw.switch_up_s, .bfloat16, groups) or
@@ -233,7 +232,7 @@ pub fn verifyExpertReuse(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, 
 }
 
 // Match the eight bf16 partial sums used by MLX col_reduce_small (top-k rows, hidden H).
-const VERIFY_EXPERT_REDUCE_SOURCE = kernelSource("kernels/moe/verify_expert_reduce.metal");
+pub const VERIFY_EXPERT_REDUCE_SOURCE = kernelSource("kernels/moe/verify_expert_reduce.metal");
 var verify_expert_reduce_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const ExpertReduceCfgs = QsaCfgCache([3]c_int, 1);
 var verify_expert_reduce_cfgs = ExpertReduceCfgs{};
@@ -312,7 +311,7 @@ fn expertReduceApply(s: mlx.mlx_stream, down: mlx.mlx_array, inverse: mlx.mlx_ar
 }
 
 // Preserve input order on ties so routing and the inverse permutation stay stable.
-const VERIFY_ROUTE_PACK_SOURCE = kernelSource("kernels/moe/verify_route_pack.metal");
+pub const VERIFY_ROUTE_PACK_SOURCE = kernelSource("kernels/moe/verify_route_pack.metal");
 var verify_route_pack_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var verify_route_pack_configs = QsaCfgCache(c_int, 1){};
 const VerifyRoutePack = struct {
@@ -371,9 +370,9 @@ pub fn verifyRoutePack(s: mlx.mlx_stream, ids: mlx.mlx_array, top_k: c_int) !?Ve
 // dispatches over 256-id blocks: per-block histograms, one scan to (expert,
 // block) offsets, and a scatter that ranks ties by position within the block.
 const PREFILL_ROUTE_BLOCK: c_int = 256;
-const PREFILL_ROUTE_HIST_SOURCE = kernelSource("kernels/moe/prefill_route_hist.metal");
-const PREFILL_ROUTE_SCAN_SOURCE = kernelSource("kernels/moe/prefill_route_scan.metal");
-const PREFILL_ROUTE_SCATTER_SOURCE = kernelSource("kernels/moe/prefill_route_scatter.metal");
+pub const PREFILL_ROUTE_HIST_SOURCE = kernelSource("kernels/moe/prefill_route_hist.metal");
+pub const PREFILL_ROUTE_SCAN_SOURCE = kernelSource("kernels/moe/prefill_route_scan.metal");
+pub const PREFILL_ROUTE_SCATTER_SOURCE = kernelSource("kernels/moe/prefill_route_scatter.metal");
 var prefill_route_kernels: [3]?mlx.mlx_fast_metal_kernel = .{ null, null, null };
 var prefill_route_configs = QsaCfgCache([3]c_int, 3){};
 
@@ -463,7 +462,7 @@ pub fn verifyIndexedExpertInput(s: mlx.mlx_stream, x: mlx.mlx_array, lhs: mlx.ml
 // ── tests ──
 
 test "verify MoE rows preserve every value with fewer graph operations" {
-    const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
+    const path = env.get(.MTP_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const allocator = testing.allocator;
     const stream = mlx.gpuStream();
@@ -677,7 +676,7 @@ test "prefill expert reduction is bit-identical to unsort multiply and sum" {
 
 test "prefill expert reduction µbench (MLX_SERVE_MOE_WSUM_UBENCH=1)" {
     // Bar: chained marginal GPU ms per call, stock take+multiply+sum vs the fused kernel, at an 8192-token chunk.
-    if (!diagEnvOn("MLX_SERVE_MOE_WSUM_UBENCH") or mlx.noGpuBackend()) return error.SkipZigTest;
+    if (!env.on(.MLX_SERVE_MOE_WSUM_UBENCH) or mlx.noGpuBackend()) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xBE7C);

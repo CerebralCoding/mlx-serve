@@ -29,6 +29,8 @@ const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const log = @import("../../host/log.zig");
 const h3 = @import("h3.zig");
+const geometry = @import("geometry.zig");
+pub const DecCfg = geometry.DecCfg;
 const preview = @import("../../host/media_jobs/preview.zig");
 
 const Weights = model_mod.Weights;
@@ -39,9 +41,9 @@ const S = mlx.mlx_stream;
 /// Frames folded into one VAE clip. Drives every temporal constant below.
 pub const CLIP_LENGTH: u32 = 17;
 /// Temporal compression (prod of the encoder's time_down factors).
-pub const VAE_RATIO_T: u32 = 4;
+pub const VAE_RATIO_T = geometry.VAE_RATIO_T;
 /// Spatial compression.
-pub const VAE_RATIO: u32 = 16;
+pub const VAE_RATIO = geometry.VAE_RATIO;
 pub const TOKEN_DROP: u32 = 3;
 /// Spatial tile extent, in PIXELS.
 pub const TILE_SIZE: u32 = 256;
@@ -61,37 +63,6 @@ else
 pub const IMAGENET_MEAN = [3]f32{ 0.485, 0.456, 0.406 };
 pub const IMAGENET_STD = [3]f32{ 0.229, 0.224, 0.225 };
 
-/// Decoder geometry (ViT3DDecoder defaults, confirmed against the checkpoint).
-pub const DecCfg = struct {
-    layers: u32 = 36,
-    heads: u32 = 32,
-    head_dim: u32 = 64,
-    in_channels: u32 = 24,
-    out_channels: u32 = 3,
-    patch_size: u32 = VAE_RATIO,
-    patch_size_t: u32 = VAE_RATIO_T,
-    rope_theta: f64 = 100.0,
-    rope_dim_ratio: f64 = 0.75,
-    num_register_tokens: u32 = 4,
-    eps: f32 = 1e-5,
-
-    pub fn dim(self: DecCfg) u32 {
-        return self.heads * self.head_dim;
-    }
-    /// RotaryEmbeddingND(dim_head * rope_dim_ratio) with n_dim=3: the inv_freq
-    /// arange step is 2*n_dim/dim, so the count is ceil(dim / (2*n_dim)).
-    pub fn ropeFreqs(self: DecCfg) u32 {
-        const rd: u32 = @intFromFloat(@as(f64, @floatFromInt(self.head_dim)) * self.rope_dim_ratio);
-        return (rd + 5) / 6;
-    }
-    /// Rotated width per head: 3 axes x freqs x 2 (split-half pairing).
-    pub fn rotDim(self: DecCfg) u32 {
-        return self.ropeFreqs() * 3 * 2;
-    }
-    pub fn outPatchDim(self: DecCfg) u32 {
-        return self.out_channels * self.patch_size_t * self.patch_size * self.patch_size;
-    }
-};
 
 // ── Temporal decode plan (pure arithmetic, hermetically tested) ─────────────
 

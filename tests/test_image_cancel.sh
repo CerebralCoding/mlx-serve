@@ -11,6 +11,7 @@
 #
 # Usage: FLUX_MODEL=<dir> ./tests/test_image_cancel.sh [port]
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11299}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -28,11 +29,7 @@ BASE="http://127.0.0.1:$PORT"
 SRV=$!
 CURL_PID=""
 trap 'kill $CURL_PID $SRV 2>/dev/null' EXIT
-for i in $(seq 1 60); do
-  curl -sf "$BASE/health" >/dev/null 2>&1 && break
-  kill -0 $SRV 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
-  sleep 1
-done
+srv_wait_health "$BASE" 60 1 "$SRV" || kill -0 "$SRV" 2>/dev/null || { echo "FAIL: server did not start"; tail -5 "$LOG"; exit 1; }
 
 curl -s -m 300 "$BASE/v1/load-model" -X POST -H 'Content-Type: application/json' \
   -d "{\"model\":\"$FLUX\"}" >/dev/null

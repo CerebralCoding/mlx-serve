@@ -20,7 +20,7 @@ pub fn applyModelSettings(config: *ModelConfig, chat_config: *ChatConfig, o: *mo
     config.mtp_greedy_tail_override = o.mtp_greedy_tail;
     config.int8_prefill_override = o.int8_prefill;
     config.lm_head_mxfp8_override = o.lm_head_mxfp8;
-    config.ane_override = o.ane;
+    config.ane_override = o.aneChoice();
     config.drafter_override = o.drafter;
     o.drafter = null;
     chat_config.chat_template_kwargs = o.chat_template_kwargs;

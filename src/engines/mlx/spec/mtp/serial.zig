@@ -1,5 +1,6 @@
 //! MTP serial-mode switching: pre-draft open, head detach, serial ticks and clocks.
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const mlx = @import("../../../../mlx/ffi.zig");
 const log = @import("../../../../host/log.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
@@ -31,7 +32,7 @@ pub fn mtpBatchCorrEnabledFromEnv(raw: ?[]const u8) bool {
 
 pub fn mtpBatchCorrEnabled() bool {
     if (mtp_batch_corr_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_BATCH_CORR")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_BATCH_CORR);
     const on = mtpBatchCorrEnabledFromEnv(raw);
     mtp_batch_corr_cache = on;
     return on;

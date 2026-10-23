@@ -8,6 +8,7 @@
 //! Parity: `dinov3 oracle` against transformers on a tiny random model (tests/dump_trellis2_fixtures.py).
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const scope_mod = @import("../../mlx/scope.zig");
@@ -273,7 +274,7 @@ test "dinov3 preprocess: a flat image keeps its value through the resize and is 
 
 test "dinov3 oracle: every token matches transformers' DINOv3ViTModel on a tiny random model (TRELLIS2_FIXTURES)" {
     const gpa = testing.allocator;
-    const fixtures = std.mem.span(std.c.getenv("TRELLIS2_FIXTURES") orelse return error.SkipZigTest);
+    const fixtures = std.mem.span(env.get(.TRELLIS2_FIXTURES) orelse return error.SkipZigTest);
     const io = std.Io.Threaded.global_single_threaded.io();
     const dir = try std.fmt.allocPrint(gpa, "{s}/dinov3_tiny", .{fixtures});
     defer gpa.free(dir);

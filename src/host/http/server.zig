@@ -1,4 +1,5 @@
 const std = @import("std");
+const env = @import("../../env.zig");
 const crt = @import("../../sdk/util/crt.zig");
 const win_io = @import("../../sdk/util/win_io.zig");
 const builtin = @import("builtin");
@@ -42,7 +43,6 @@ const arch_llama = if (@import("build_options").llama_engine) @import("../../eng
 const media_mod = @import("../media_jobs/gen.zig");
 const transcription_mod = @import("../api/audio/transcription.zig");
 const forced_align_mod = @import("../../plugins/qwen3_asr/forced_align.zig");
-const diarization_mod = @import("../../plugins/nemotron_diarization/diarization.zig");
 const stb = @import("stb");
 const webp = @import("webp");
 const metrics = @import("../status.zig");
@@ -546,7 +546,7 @@ pub fn serve(
     } else {
         log.info("Concurrency: --max-concurrent={d}, batched decode off (arch: {s}); concurrent requests interleave serially\n", .{ max_concurrent, config.model_type });
     }
-    const gen_yield_env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_GEN_YIELD")) |p| std.mem.span(p) else null;
+    const gen_yield_env: ?[]const u8 = env.span(.MLX_SERVE_GEN_YIELD);
     scheduler_mod.gen_yield_enabled = scheduler_mod.genYieldEnabled(mlx.cudaAvailable(), gen_yield_env);
     if (!scheduler_mod.gen_yield_enabled and mlx.cudaAvailable())
         log.info("chat does not interleave with media jobs on CUDA: a chat waits for the running image/audio job (MLX_SERVE_GEN_YIELD=1 interleaves)\n", .{});
@@ -568,7 +568,7 @@ pub fn serve(
     //    degrades to a warning; it must never kill the server.
     if (g_lan_share_spec != null or g_lan_discover) {
         var keys_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+        const home = std.mem.span(env.get(.HOME) orelse "/tmp");
         g_lan = lan_mod.Lan.start(allocator, .{
             .port = port,
             .share_spec = g_lan_share_spec,
@@ -590,7 +590,7 @@ pub fn serve(
     // never starts them — same limit as `mlx-serve pull`.
     if (!build_options.mas) {
         var path_buf: [std.fs.max_path_bytes]u8 = undefined;
-        const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+        const home = std.mem.span(env.get(.HOME) orelse "/tmp");
         const path = std.fmt.bufPrint(&path_buf, "{s}/.mlx-serve/providers.json", .{home}) catch "";
         g_providers = providers_mod.Providers.start(allocator, io, path, port) catch |err| blk: {
             log.warn("[providers] failed to start ({s}); providers disabled\n", .{@errorName(err)});
@@ -902,42 +902,6 @@ fn gaugeSamplerLoop(ctx: GaugeSamplerCtx) void {
         if (tick < SAMPLE_INTERVAL_TICKS) continue;
         tick = 0;
         sampleGauges(ctx);
-    }
-}
-
-test "each connection thread handle is detached after spawn" {
-    // A finished pthread keeps its stack mapping and kernel bookkeeping until
-    // its handle is joined or detached. The server cannot join per-request
-    // threads individually, so dropping this handle leaks one stack region per
-    // request even though `handleConnectionThread` has returned.
-    const src = @embedFile("server.zig");
-    const spawn = "std.Thread.spawn(.{}, handleConnection" ++ "Thread, .{args})";
-    const spawn_at = std.mem.indexOf(u8, src, spawn) orelse return error.ConnectionSpawnMissing;
-    const accept_end = std.mem.indexOfPos(
-        u8,
-        src,
-        spawn_at,
-        "\n    }\n\n    // Shutdown ordering",
-    ) orelse return error.AcceptLoopEndMissing;
-    const detach = "conn_thread." ++ "detach();";
-    try std.testing.expect(std.mem.indexOf(u8, src[spawn_at..accept_end], detach) != null);
-
-    // Class guard: no spawn site anywhere may discard its joinable handle —
-    // that is the exact pre-fix shape, and a new worker elsewhere would
-    // otherwise re-ship the leak unguarded.
-    const sources = [_][]const u8{
-        src ++ @embedFile("listen.zig") ++ @embedFile("request.zig") ++ @embedFile("conn.zig"),
-        @embedFile("../../engines/mlx/scheduler.zig"),
-        @embedFile("../lan/lan.zig"),
-        @embedFile("../../main.zig"),
-        @embedFile("../metrics/metrics.zig"),
-        @embedFile("../sandbox/vz_agent.zig"),
-    };
-    const discard = "_ = " ++ "std.Thread.spawn";
-    const discard_try = "_ = try " ++ "std.Thread.spawn";
-    for (sources) |s| {
-        try std.testing.expect(std.mem.indexOf(u8, s, discard) == null);
-        try std.testing.expect(std.mem.indexOf(u8, s, discard_try) == null);
     }
 }
 

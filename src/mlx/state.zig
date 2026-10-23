@@ -1,6 +1,7 @@
 //! MLX allocator cache limit
 
 const std = @import("std");
+const env = @import("../env.zig");
 const mlx = @import("ffi.zig");
 const log = @import("../host/log.zig");
 const metrics = @import("../host/status.zig");
@@ -47,11 +48,7 @@ pub fn mlxCacheLimitFromEnv(raw: ?[]const u8, total_ram: u64) u64 {
 /// Never RAISES a tighter existing cap: `scheduler.runGenRequests` drops the pool
 /// to 1 GB on small-RAM machines during media gen, and iOS boots at 384 MB.
 pub fn applyMlxCacheLimit() void {
-    const env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_CACHE_LIMIT")) |p|
-        std.mem.span(p)
-    else
-        null;
-    const cap = mlxCacheLimitFromEnv(env, metrics.getTotalMemBytes());
+    const cap = mlxCacheLimitFromEnv(env.span(.MLX_SERVE_CACHE_LIMIT), metrics.getTotalMemBytes());
     if (cap == 0) return;
     var prev: usize = 0;
     _ = mlx.mlx_set_cache_limit(&prev, @intCast(cap));

@@ -28,6 +28,7 @@
 //! (src/engines/mlx/generate.zig); deleting the feature is removing those two.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const mrope = @import("../../vision/mrope.zig");
@@ -262,7 +263,7 @@ test "Qwen4 mixed MTP profile requires its measured geometry and packs" {
 }
 
 test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" {
-    const path = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    const path = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend() or !transformer_mod.verifyQmmNaxAvailable()) return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -355,7 +356,7 @@ fn qwen4MixedModelPacksMatch(target: *const Transformer) bool {
 fn qwen4G17EnvEnabled() bool {
     if (qwen4_g17_env_cache) |v| return v;
     var on = true;
-    if (std.c.getenv("MLX_SERVE_MTP_QWEN4_PROFILE")) |p| {
+    if (env.get(.MLX_SERVE_MTP_QWEN4_PROFILE)) |p| {
         const val = std.mem.span(p);
         if (val.len > 0 and val[0] == '0') on = false;
     }
@@ -561,8 +562,6 @@ const MtpMlp = union(enum) {
         down: QLinear,
     },
     moe: transformer_mod.MoeMlpWeights,
-    /// Nemotron-H head: the trunk's own sigmoid-router ReLU^2 MoE block.
-    nemotron_moe: transformer_mod.NemotronMoeWeights,
 
     fn deinit(self: *MtpMlp) void {
         switch (self.*) {
@@ -587,18 +586,6 @@ const MtpMlp = union(enum) {
                 if (m.shared_expert_gate_b) |a| _ = mlx.mlx_array_free(a);
                 if (m.expert_bias) |a| _ = mlx.mlx_array_free(a);
             },
-            .nemotron_moe => |*nm| {
-                const arrs = [_]mlx.mlx_array{
-                    nm.router_w,     nm.router_s,     nm.router_b,     nm.expert_bias,
-                    nm.fc1_w,        nm.fc1_s,        nm.fc1_b,        nm.fc2_w,
-                    nm.fc2_s,        nm.fc2_b,        nm.fc1_latent_w, nm.fc1_latent_s,
-                    nm.fc1_latent_b, nm.fc2_latent_w, nm.fc2_latent_s, nm.fc2_latent_b,
-                };
-                for (arrs) |a| _ = mlx.mlx_array_free(a);
-                if (nm.shared) |sm| {
-                    for ([_]mlx.mlx_array{ sm.up_w, sm.up_s, sm.up_b, sm.down_w, sm.down_s, sm.down_b }) |a| _ = mlx.mlx_array_free(a);
-                }
-            },
         }
     }
 };
@@ -606,7 +593,7 @@ const MtpMlp = union(enum) {
 /// Which head shape the sidecar loaded as. Everything the shapes share reads
 /// the same fields; the few forks (attention gate, QK norms, MLP kind) key here
 /// or on `eh_proj`.
-pub const Layout = enum { qwen, hy3, nemotron };
+pub const Layout = enum { qwen, hy3 };
 
 pub const MtpModel = struct {
     allocator: std.mem.Allocator,
@@ -647,9 +634,6 @@ pub const MtpModel = struct {
     o: QLinear,
     mlp: MtpMlp,
     layout: Layout = .qwen,
-    /// Nemotron-H attention has no q/k RMSNorm; the norm handles are empty
-    /// placeholders and the forward skips them.
-    has_qk_norm: bool = true,
 
     /// Optional DRAFT-ONLY low-bit lm_head, requantized from the trunk's at
     /// bind time (MLX_SERVE_MTP_DRAFT_HEAD_BITS, default 3, 0 disables).
@@ -792,7 +776,7 @@ pub const MtpModel = struct {
                     },
                 )) return .generic;
             },
-            .moe, .nemotron_moe => return .generic,
+            .moe => return .generic,
         }
 
         const draft: ?*const QLinear = if (self.draft_head) |*q| q else null;
@@ -819,9 +803,8 @@ pub const MtpModel = struct {
     pub fn bind(self: *MtpModel, target: *Transformer) !void {
         const cfg = &target.config;
         if (self.eh_proj != null) {
-            // Hy3 / Nemotron-H heads: no attention output gate, sigmoid-router MoE.
-            const want_arch: []const u8 = if (self.layout == .nemotron) "nemotron_h" else "hy_v3";
-            if (!std.mem.eql(u8, cfg.model_type, want_arch)) return error.UnsupportedMtpArch;
+            // Hy3 heads: no attention output gate, sigmoid-router MoE.
+            if (!std.mem.eql(u8, cfg.model_type, "hy_v3")) return error.UnsupportedMtpArch;
             const en_shape = mlx.getShape(self.pre_fc_norm_emb);
             if (en_shape.len != 1 or en_shape[0] != @as(c_int, @intCast(cfg.hidden_size)))
                 return error.MtpTargetMismatch;
@@ -862,7 +845,7 @@ pub const MtpModel = struct {
     /// MLX_SERVE_MTP_DRAFT_HEAD_BITS: absent → 3 (default on)
     /// a supported bit width → that; anything else ("0", "off") → disabled.
     fn draftHeadBitsFromEnv() u32 {
-        const p = std.c.getenv("MLX_SERVE_MTP_DRAFT_HEAD_BITS") orelse return 3;
+        const p = env.get(.MLX_SERVE_MTP_DRAFT_HEAD_BITS) orelse return 3;
         const raw = std.mem.span(p);
         const v = std.fmt.parseInt(u32, raw, 10) catch return 0;
         return switch (v) {
@@ -871,7 +854,7 @@ pub const MtpModel = struct {
         };
     }
 
-    fn buildDraftHead(self: *MtpModel, target: *Transformer) !void {
+    pub fn buildDraftHead(self: anytype, target: *Transformer) !void {
         const bits = draftHeadBitsFromEnv();
         if (bits == 0) return;
         if (target.lm_head_s.ctx == null) return; // dense bf16 head — nothing to shrink
@@ -918,7 +901,7 @@ pub const MtpModel = struct {
     /// auto (on where the cost surface is generic; the calibrated G17 NAX
     /// surfaces keep the 3-bit draft head they were measured with).
     pub fn draftRerankMode() enum { auto, on, off } {
-        const p = std.c.getenv("MLX_SERVE_MTP_DRAFT_RERANK") orelse return .auto;
+        const p = env.get(.MLX_SERVE_MTP_DRAFT_RERANK) orelse return .auto;
         const raw = std.mem.span(p);
         if (std.mem.eql(u8, raw, "0")) return .off;
         if (std.mem.eql(u8, raw, "1")) return .on;
@@ -927,7 +910,7 @@ pub const MtpModel = struct {
 
     /// Build the coarse 2-bit rerank head (see the draft-rerank section
     /// below). Infallible by design: any refusal keeps the draft-head path.
-    fn maybeBuildDraftRerank(self: *MtpModel, target: *Transformer) void {
+    pub fn maybeBuildDraftRerank(self: anytype, target: *Transformer) void {
         const mode = draftRerankMode();
         if (mode == .off) return;
         if (sushi_pack.isRowScaledFp8(target.lm_head_w, target.lm_head_s)) return; // e4m3 head: no affine rows to gather
@@ -961,7 +944,7 @@ pub const MtpModel = struct {
     /// output. A shortlist-kernel failure permanently drops back to the
     /// trunk-head readout (this call included).
     pub fn draftSelect(
-        self: *MtpModel,
+        self: anytype,
         target: *Transformer,
         x: mlx.mlx_array,
         suppress_mask: ?mlx.mlx_array,
@@ -973,14 +956,14 @@ pub const MtpModel = struct {
         // this arm's own full readout answers, and it can still use the
         // low-bit draft head when one is resident.
         if (try rerankSelect(self.s, target, &self.rerank_coarse, &self.rerank_logged, x, suppress_mask)) |tok| return tok;
-        return self.draftFallbackArgmax(target, x, suppress_mask);
+        return MtpModel.draftFallbackArgmax(self, target, x, suppress_mask);
     }
 
     /// The exact re-scored top-32 shortlist for a SAMPLED draft, or null when
     /// the coarse head is gone (the caller proposes greedily instead). Same
     /// coarse readout as `draftSelect`; only the tail differs.
     pub fn draftShortlist(
-        self: *MtpModel,
+        self: anytype,
         target: *Transformer,
         x: mlx.mlx_array,
         suppress_mask: ?mlx.mlx_array,
@@ -1002,7 +985,7 @@ pub const MtpModel = struct {
     /// Rerank's failure fallback: full trunk-head readout + argmax, same
     /// [1,1] int32 shape as `draftSelect`.
     fn draftFallbackArgmax(
-        self: *const MtpModel,
+        self: anytype,
         target: *Transformer,
         x: mlx.mlx_array,
         suppress_mask: ?mlx.mlx_array,
@@ -1897,7 +1880,7 @@ pub const HEAD_QUANT_GROUP: u32 = 64;
 pub var head_quant_override: ?u32 = null;
 fn headQuantBits() u32 {
     if (head_quant_override) |v| return v;
-    const p = std.c.getenv("MLX_SERVE_MTP_HEAD_QUANT_BITS") orelse return DEFAULT_HEAD_QUANT_BITS;
+    const p = env.get(.MLX_SERVE_MTP_HEAD_QUANT_BITS) orelse return DEFAULT_HEAD_QUANT_BITS;
     const v = std.fmt.parseInt(u32, std.mem.sliceTo(p, 0), 10) catch return DEFAULT_HEAD_QUANT_BITS;
     return switch (v) {
         0, 2, 3, 4, 5, 6, 8 => v,
@@ -2244,14 +2227,8 @@ pub fn loadMtp(
         }
     };
 
-    // Nemotron-H layout: bare keys, `attn.*` + `moe.*` blocks, dense `eh_proj`;
-    // or the same head under TensorFold's `layers.0/1` names.
-    if (weights.get("attn.mixer.q_proj.weight") != null) {
-        return loadNemotronMtp(allocator, s, &weights, .sevren);
-    }
-    if (weights.get("layers.0.eh_proj.weight") != null and weights.get("layers.1.final_layernorm.weight") != null) {
-        return loadNemotronMtp(allocator, s, &weights, .tensorfold);
-    }
+    // A Nemotron-H head (sevren-ai's bare keys, TensorFold's `layers.0/1`) is the nemotron_h plugin's.
+    if (weights.get("attn.mixer.q_proj.weight") != null or weights.get("layers.0.eh_proj.weight") != null) return error.UnsupportedMtpArch;
     // Hy3 (hy_v3) layout: `mtp.eh_proj` + `mtp.layer.*` (full decoder layer,
     // sigmoid-router MoE). Detected by its distinctive projection name.
     if (weights.get(K.k(&kb, p, "eh_proj.weight")) != null) {
@@ -2397,7 +2374,6 @@ fn loadQwenMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *const 
                 for (moe_ws) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
                 if (mw.shared_expert_gate_w) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
             },
-            .nemotron_moe => unreachable, // loadNemotronMtp builds that head
         }
         _ = mlx.mlx_eval(eval_vec);
     }
@@ -2632,163 +2608,6 @@ fn loadHy3Mtp(
     return m;
 }
 
-/// Nemotron-H head (sevren-ai `mtp_head.safetensors`): x = eh_proj([enorm(emb),
-/// hnorm(h)]); x += attn(attn.norm(x)); x += moe(moe.norm(x)); final_norm(x)
-/// → the trunk's lm_head. Attention is the trunk's (RoPE, no QK norm, no
-/// output gate); the MoE is the trunk's `nemotronMoe`. `h` is the residual
-/// BEFORE the trunk's final norm.
-/// Tensor names of a Nemotron-H MTP head: sevren-ai's bare keys (dense
-/// `eh_proj`) or TensorFold's module names (4-bit `eh_proj`).
-const NemotronMtpNames = struct {
-    attn: []const u8,
-    moe: []const u8,
-    eh_proj: []const u8,
-    enorm: []const u8,
-    hnorm: []const u8,
-    final_norm: []const u8,
-
-    const sevren = NemotronMtpNames{ .attn = "attn.", .moe = "moe.", .eh_proj = "eh_proj", .enorm = "enorm", .hnorm = "hnorm", .final_norm = "final_norm" };
-    const tensorfold = NemotronMtpNames{ .attn = "layers.0.", .moe = "layers.1.", .eh_proj = "layers.0.eh_proj", .enorm = "layers.0.enorm.weight", .hnorm = "layers.0.hnorm.weight", .final_norm = "layers.1.final_layernorm.weight" };
-
-    fn key(buf: []u8, block: []const u8, rest: []const u8) []const u8 {
-        return std.fmt.bufPrint(buf, "{s}{s}", .{ block, rest }) catch unreachable;
-    }
-};
-
-fn loadNemotronMtp(allocator: std.mem.Allocator, s: mlx.mlx_stream, weights: *const Weights, names: NemotronMtpNames) !MtpModel {
-    const N = NemotronMtpNames;
-    var kb: [256]u8 = undefined;
-    // A LatentMoE head runs its experts in the latent, which `nemotronMoe` does whenever
-    // `fc1_latent_w` is set. One projection without the other is a truncated checkpoint.
-    const has_latent = weights.get(N.key(&kb, names.moe, "mixer.fc1_latent_proj.weight")) != null;
-    if (has_latent != (weights.get(N.key(&kb, names.moe, "mixer.fc2_latent_proj.weight")) != null)) return error.MissingMtpWeight;
-    const has_shared = weights.get(N.key(&kb, names.moe, "mixer.shared_experts.up_proj.weight")) != null;
-    // Every tensor lands in a local that frees itself on error; `m` below is
-    // built with no fallible call and takes them all over.
-    var fc1 = try loadMoeTriple(weights, N.key(&kb, names.moe, "mixer.switch_mlp.fc1"));
-    errdefer fc1.deinit();
-    var fc2 = try loadMoeTriple(weights, N.key(&kb, names.moe, "mixer.switch_mlp.fc2"));
-    errdefer fc2.deinit();
-    var router = try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.gate"), s);
-    errdefer router.deinit();
-    var shared_up: ?QLinear = if (has_shared) try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.shared_experts.up_proj"), s) else null;
-    errdefer if (shared_up) |*l| l.deinit();
-    var shared_down: ?QLinear = if (has_shared) try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.shared_experts.down_proj"), s) else null;
-    errdefer if (shared_down) |*l| l.deinit();
-    var lat1: ?QLinear = if (has_latent) try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.fc1_latent_proj"), s) else null;
-    errdefer if (lat1) |*l| l.deinit();
-    var lat2: ?QLinear = if (has_latent) try loadLinear(weights, allocator, N.key(&kb, names.moe, "mixer.fc2_latent_proj"), s) else null;
-    errdefer if (lat2) |*l| l.deinit();
-    // `[H, 2H]`: a bare dense key is pre-transposed for the plain-matmul arm,
-    // a `.weight` + `.scales` triple stays quantized.
-    var eh_proj: QLinear = if (weights.get(names.eh_proj) != null)
-        .{ .w = try ownAndTranspose2D(weights, names.eh_proj, s), .s = mlx.mlx_array_new(), .b = mlx.mlx_array_new() }
-    else
-        try loadLinear(weights, allocator, names.eh_proj, s);
-    errdefer eh_proj.deinit();
-    const enorm = try ownWeight(weights, names.enorm);
-    errdefer _ = mlx.mlx_array_free(enorm);
-    const hnorm = try ownWeight(weights, names.hnorm);
-    errdefer _ = mlx.mlx_array_free(hnorm);
-    const final_norm = try ownWeight(weights, names.final_norm);
-    errdefer _ = mlx.mlx_array_free(final_norm);
-    const input_norm = try ownWeight(weights, N.key(&kb, names.attn, "norm.weight"));
-    errdefer _ = mlx.mlx_array_free(input_norm);
-    const post_attn_norm = try ownWeight(weights, N.key(&kb, names.moe, "norm.weight"));
-    errdefer _ = mlx.mlx_array_free(post_attn_norm);
-    var q = try loadLinear(weights, allocator, N.key(&kb, names.attn, "mixer.q_proj"), s);
-    errdefer q.deinit();
-    var k = try loadLinear(weights, allocator, N.key(&kb, names.attn, "mixer.k_proj"), s);
-    errdefer k.deinit();
-    var v = try loadLinear(weights, allocator, N.key(&kb, names.attn, "mixer.v_proj"), s);
-    errdefer v.deinit();
-    var o = try loadLinear(weights, allocator, N.key(&kb, names.attn, "mixer.o_proj"), s);
-    errdefer o.deinit();
-    const expert_bias = try ownWeight(weights, N.key(&kb, names.moe, "mixer.gate.e_score_correction_bias"));
-    errdefer _ = mlx.mlx_array_free(expert_bias);
-
-    const shared: ?transformer_mod.SimpleMlpWeights = if (shared_up) |up| .{
-        .up_w = up.w,
-        .up_s = up.s,
-        .up_b = up.b,
-        .down_w = shared_down.?.w,
-        .down_s = shared_down.?.s,
-        .down_b = shared_down.?.b,
-    } else null;
-    var m = MtpModel{
-        .allocator = allocator,
-        .s = s,
-        .quant_bits = 0,
-        .quant_group_size = 0,
-        .fc = .{ .w = .{ .ctx = null }, .s = .{ .ctx = null }, .b = .{ .ctx = null } },
-        .eh_proj = eh_proj,
-        .pre_fc_norm_emb = enorm,
-        .pre_fc_norm_hidden = hnorm,
-        .final_norm = final_norm,
-        .input_norm = input_norm,
-        .post_attn_norm = post_attn_norm,
-        .q_norm = mlx.mlx_array_new(),
-        .k_norm = mlx.mlx_array_new(),
-        .q = q,
-        .k = k,
-        .v = v,
-        .o = o,
-        .layout = .nemotron,
-        .has_qk_norm = false,
-        .mlp = .{ .nemotron_moe = .{
-            .router_w = router.w,
-            .router_s = router.s,
-            .router_b = router.b,
-            .expert_bias = expert_bias,
-            .fc1_w = fc1.w,
-            .fc1_s = fc1.s,
-            .fc1_b = fc1.b,
-            .fc2_w = fc2.w,
-            .fc2_s = fc2.s,
-            .fc2_b = fc2.b,
-            .shared = shared,
-            .fc1_latent_w = if (lat1) |l| l.w else mlx.mlx_array_new(),
-            .fc1_latent_s = if (lat1) |l| l.s else mlx.mlx_array_new(),
-            .fc1_latent_b = if (lat1) |l| l.b else mlx.mlx_array_new(),
-            .fc2_latent_w = if (lat2) |l| l.w else mlx.mlx_array_new(),
-            .fc2_latent_s = if (lat2) |l| l.s else mlx.mlx_array_new(),
-            .fc2_latent_b = if (lat2) |l| l.b else mlx.mlx_array_new(),
-        } },
-    };
-
-    {
-        const en_shape = mlx.getShape(m.pre_fc_norm_emb);
-        const hidden: u32 = if (en_shape.len == 1) @intCast(en_shape[0]) else 0;
-        m.quant_bits = inferBits(&m.q, hidden) orelse 4;
-        m.quant_group_size = inferGroupSize(&m.q, m.quant_bits) orelse 64;
-        m.quant_mode = sidecarQuantMode(&m.q, hidden);
-    }
-    {
-        const eval_vec = mlx.mlx_vector_array_new();
-        defer _ = mlx.mlx_vector_array_free(eval_vec);
-        const nm = &m.mlp.nemotron_moe;
-        const base = [_]mlx.mlx_array{
-            m.eh_proj.?.w, m.pre_fc_norm_emb, m.pre_fc_norm_hidden, m.final_norm,
-            m.input_norm,  m.post_attn_norm,  m.q.w,                m.k.w,
-            m.v.w,         m.o.w,             nm.router_w,          nm.expert_bias,
-            nm.fc1_w,      nm.fc2_w,
-        };
-        for (base) |a| _ = mlx.mlx_vector_array_append_value(eval_vec, a);
-        if (nm.shared) |sm| {
-            _ = mlx.mlx_vector_array_append_value(eval_vec, sm.up_w);
-            _ = mlx.mlx_vector_array_append_value(eval_vec, sm.down_w);
-        }
-        if (nm.fc1_latent_w.ctx != null) {
-            _ = mlx.mlx_vector_array_append_value(eval_vec, nm.fc1_latent_w);
-            _ = mlx.mlx_vector_array_append_value(eval_vec, nm.fc2_latent_w);
-            log.info("[mtp] Nemotron-H head is LatentMoE\n", .{});
-        }
-        _ = mlx.mlx_eval(eval_vec);
-    }
-    log.info("[mtp] loaded Nemotron-H MTP head (attention + sigmoid-MoE; per-weight quant, fallback bits={d}/gs={d})\n", .{ m.quant_bits, m.quant_group_size });
-    return m;
-}
-
 // ── Forward ──
 
 /// The head is the layer after the trunk's last; a NoPE arch (Nemotron-H)
@@ -2924,7 +2743,7 @@ fn embedTargetTokens(
 /// Project the MTP post-norm hidden through the lm_head. Draft steps go
 /// through the low-bit draft-only head when one was built (verification
 /// never routes here — trunk logits come from the trunk forward).
-fn targetLmHead(self: *const MtpModel, target: *Transformer, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn targetLmHead(self: anytype, target: *Transformer, x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     if (self.draft_head) |*dh| {
         var out = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_quantized_matmul(
@@ -3083,9 +2902,9 @@ fn frontChain(self: *const MtpModel, target: *Transformer, id_arr: mlx.mlx_array
     try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, s));
     try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, s));
 
-    const q_normed = if (self.has_qk_norm) try rmsNormFn(queries, self.q_norm, eps, s) else try shareArr(queries);
+    const q_normed = try rmsNormFn(queries, self.q_norm, eps, s);
     defer _ = mlx.mlx_array_free(q_normed);
-    const k_normed = if (self.has_qk_norm) try rmsNormFn(k_r, self.k_norm, eps, s) else try shareArr(k_r);
+    const k_normed = try rmsNormFn(k_r, self.k_norm, eps, s);
     defer _ = mlx.mlx_array_free(k_normed);
 
     const perm = [_]c_int{ 0, 2, 1, 3 };
@@ -3170,7 +2989,6 @@ fn backChain(self: *const MtpModel, target: *Transformer, attn_out: mlx.mlx_arra
             break :blk try qLinearFwd(self, act, &d.down);
         },
         .moe => |*mw| try target.moeMLP(ff_normed, mw),
-        .nemotron_moe => |*nm| try transformer_mod.nemotronMoe(ff_normed, nm, &target.config, s),
     };
     defer _ = mlx.mlx_array_free(mlp_out);
 
@@ -3247,7 +3065,7 @@ var mtp_kv_only_env: ?bool = null;
 fn mtpKvOnlyEnabled() bool {
     if (mtp_kv_only_override) |v| return v;
     if (mtp_kv_only_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MTP_KV_ONLY");
+    const raw = env.get(.MLX_SERVE_MTP_KV_ONLY);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     mtp_kv_only_env = enabled;
     return enabled;
@@ -3295,7 +3113,7 @@ pub fn appendKvOnly(
     try mlx.check(mlx.mlx_reshape(&k_r, k_proj, &kv_shape, 4, s));
     try mlx.check(mlx.mlx_reshape(&v_r, v_proj, &kv_shape, 4, s));
 
-    const k_normed = if (self.has_qk_norm) try rmsNormFn(k_r, self.k_norm, eps, s) else try shareArr(k_r);
+    const k_normed = try rmsNormFn(k_r, self.k_norm, eps, s);
     defer _ = mlx.mlx_array_free(k_normed);
     const perm = [_]c_int{ 0, 2, 1, 3 };
     var k_t = mlx.mlx_array_new();
@@ -3920,80 +3738,6 @@ test "mtp: loadMtp detects the Hy3 layout (eh_proj + full decoder layer + sigmoi
     try testing.expectEqual(@as(c_int, 8), en_shape[0]);
 }
 
-test "mtp: loadMtp detects the Nemotron-H layout (bare keys, mtp_head.safetensors)" {
-    // sevren-ai's `mtp_head.safetensors`: bare keys (`eh_proj`, `enorm`,
-    // `attn.*`, `moe.*`), dense bf16 eh_proj/router, no QK norms. Toy bf16
-    // geometry pins discovery + layout; the math rides the generate.zig
-    // greedy-equivalence test and tests/test_mtp_equivalence.sh.
-    const allocator = testing.allocator;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    var path_buf: [512]u8 = undefined;
-    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
-    const dir_path = path_buf[0..root_len];
-    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp_head.safetensors", .{dir_path}, 0);
-    defer allocator.free(st_path);
-    {
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        const H = struct {
-            fn put(m: mlx.mlx_map_string_to_array, key: [*:0]const u8, shape: []const c_int, dt: mlx.mlx_dtype, st: mlx.mlx_stream) !void {
-                var total: usize = 1;
-                for (shape) |d| total *= @intCast(d);
-                const data = try std.testing.allocator.alloc(f32, total);
-                defer std.testing.allocator.free(data);
-                for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.1;
-                const f32_arr = mlx.mlx_array_new_data(data.ptr, shape.ptr, @intCast(shape.len), .float32);
-                defer _ = mlx.mlx_array_free(f32_arr);
-                var arr = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(arr);
-                try mlx.check(mlx.mlx_astype(&arr, f32_arr, dt, st));
-                try mlx.check(mlx.mlx_array_eval(arr));
-                _ = mlx.mlx_map_string_to_array_insert(m, key, arr);
-            }
-        };
-        // hidden 8, heads 2 x hd 4, kv 1, experts 4, expert inter 6, shared 12.
-        try H.put(map, "eh_proj", &.{ 8, 16 }, .bfloat16, s);
-        try H.put(map, "enorm", &.{8}, .bfloat16, s);
-        try H.put(map, "hnorm", &.{8}, .bfloat16, s);
-        try H.put(map, "final_norm", &.{8}, .bfloat16, s);
-        try H.put(map, "attn.norm.weight", &.{8}, .bfloat16, s);
-        try H.put(map, "attn.mixer.q_proj.weight", &.{ 8, 8 }, .bfloat16, s);
-        try H.put(map, "attn.mixer.k_proj.weight", &.{ 4, 8 }, .bfloat16, s);
-        try H.put(map, "attn.mixer.v_proj.weight", &.{ 4, 8 }, .bfloat16, s);
-        try H.put(map, "attn.mixer.o_proj.weight", &.{ 8, 8 }, .bfloat16, s);
-        try H.put(map, "moe.norm.weight", &.{8}, .bfloat16, s);
-        try H.put(map, "moe.mixer.gate.weight", &.{ 4, 8 }, .bfloat16, s);
-        try H.put(map, "moe.mixer.gate.e_score_correction_bias", &.{4}, .float32, s);
-        try H.put(map, "moe.mixer.switch_mlp.fc1.weight", &.{ 4, 6, 8 }, .bfloat16, s);
-        try H.put(map, "moe.mixer.switch_mlp.fc2.weight", &.{ 4, 8, 6 }, .bfloat16, s);
-        try H.put(map, "moe.mixer.shared_experts.up_proj.weight", &.{ 12, 8 }, .bfloat16, s);
-        try H.put(map, "moe.mixer.shared_experts.down_proj.weight", &.{ 8, 12 }, .bfloat16, s);
-        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
-    }
-
-    // Discovery: the bare `attn.mixer.q_proj.weight` marker at the new path.
-    try testing.expectEqualStrings("mtp_head.safetensors", resolveMtpSidecarInDir(io, allocator, tmp_dir.dir) orelse return error.SidecarNotFound);
-
-    var m = try loadMtp(io, allocator, s, dir_path);
-    defer m.deinit();
-    try testing.expectEqual(Layout.nemotron, m.layout);
-    try testing.expect(!m.has_qk_norm);
-    try testing.expect(m.eh_proj != null);
-    try testing.expect(m.eh_proj.?.s.ctx == null); // dense arm
-    try testing.expectEqualSlices(c_int, &.{ 16, 8 }, mlx.getShape(m.eh_proj.?.w)); // pre-transposed [2H, H]
-    try testing.expect(m.fc.w.ctx == null);
-    try testing.expect(m.mlp == .nemotron_moe);
-    try testing.expect(m.mlp.nemotron_moe.shared != null);
-    try testing.expectEqualSlices(c_int, &.{ 8, 4 }, mlx.getShape(m.mlp.nemotron_moe.router_w)); // [H, E]
-    try testing.expectEqual(mlx.mlx_dtype.float32, mlx.mlx_array_dtype(m.mlp.nemotron_moe.expert_bias));
-}
-
 /// Builds a head's weights in memory (evaluated, so a leaked handle pins a
 /// live buffer) with tensor `skip` left out; `skip == cases.len` keeps all.
 const HeadLoadLeakProbe = struct {
@@ -4057,75 +3801,6 @@ const HeadLoadLeakProbe = struct {
         }
     }
 };
-
-test "mtp: a Nemotron-H head missing any one tensor fails to load and frees what it loaded" {
-    const C = HeadLoadLeakProbe.Case;
-    const cases = [_]C{
-        .{ .key = "eh_proj", .shape = &.{ 8, 16 } },
-        .{ .key = "enorm", .shape = &.{8} },
-        .{ .key = "hnorm", .shape = &.{8} },
-        .{ .key = "final_norm", .shape = &.{8} },
-        .{ .key = "attn.norm.weight", .shape = &.{8} },
-        .{ .key = "attn.mixer.q_proj.weight", .shape = &.{ 8, 8 } },
-        .{ .key = "attn.mixer.k_proj.weight", .shape = &.{ 4, 8 } },
-        .{ .key = "attn.mixer.v_proj.weight", .shape = &.{ 4, 8 } },
-        .{ .key = "attn.mixer.o_proj.weight", .shape = &.{ 8, 8 } },
-        .{ .key = "moe.norm.weight", .shape = &.{8} },
-        .{ .key = "moe.mixer.gate.weight", .shape = &.{ 4, 8 } },
-        .{ .key = "moe.mixer.gate.e_score_correction_bias", .shape = &.{4}, .dt = .float32 },
-        .{ .key = "moe.mixer.switch_mlp.fc1.weight", .shape = &.{ 4, 6, 8 } },
-        .{ .key = "moe.mixer.switch_mlp.fc2.weight", .shape = &.{ 4, 8, 6 } },
-        .{ .key = "moe.mixer.shared_experts.up_proj.weight", .shape = &.{ 12, 8 } },
-        .{ .key = "moe.mixer.shared_experts.down_proj.weight", .shape = &.{ 8, 12 } },
-    };
-    const L = struct {
-        fn load(a: std.mem.Allocator, s: mlx.mlx_stream, w: *const Weights) anyerror!MtpModel {
-            return loadNemotronMtp(a, s, w, .sevren);
-        }
-    };
-    // Without the shared expert's up_proj the head is a valid no-shared-expert head.
-    try HeadLoadLeakProbe.expectNoLeak(&cases, L.load, "moe.mixer.shared_experts.up_proj.weight");
-}
-
-test "mtp: a latent Nemotron head loads, and one projection without the other is rejected" {
-    const C = HeadLoadLeakProbe.Case;
-    const cases = [_]C{
-        .{ .key = "eh_proj", .shape = &.{ 8, 16 } },
-        .{ .key = "enorm", .shape = &.{8} },
-        .{ .key = "hnorm", .shape = &.{8} },
-        .{ .key = "final_norm", .shape = &.{8} },
-        .{ .key = "attn.norm.weight", .shape = &.{8} },
-        .{ .key = "attn.mixer.q_proj.weight", .shape = &.{ 8, 8 } },
-        .{ .key = "attn.mixer.k_proj.weight", .shape = &.{ 4, 8 } },
-        .{ .key = "attn.mixer.v_proj.weight", .shape = &.{ 4, 8 } },
-        .{ .key = "attn.mixer.o_proj.weight", .shape = &.{ 8, 8 } },
-        .{ .key = "moe.norm.weight", .shape = &.{8} },
-        .{ .key = "moe.mixer.gate.weight", .shape = &.{ 4, 8 } },
-        .{ .key = "moe.mixer.gate.e_score_correction_bias", .shape = &.{4}, .dt = .float32 },
-        .{ .key = "moe.mixer.switch_mlp.fc1.weight", .shape = &.{ 4, 6, 4 } },
-        .{ .key = "moe.mixer.switch_mlp.fc2.weight", .shape = &.{ 4, 4, 6 } },
-        .{ .key = "moe.mixer.shared_experts.up_proj.weight", .shape = &.{ 12, 8 } },
-        .{ .key = "moe.mixer.shared_experts.down_proj.weight", .shape = &.{ 8, 12 } },
-        // The routed experts run in the latent (4); the projections map H 8 to it and back.
-        .{ .key = "moe.mixer.fc1_latent_proj.weight", .shape = &.{ 4, 8 } },
-        .{ .key = "moe.mixer.fc2_latent_proj.weight", .shape = &.{ 8, 4 } },
-    };
-    const L = struct {
-        fn load(a: std.mem.Allocator, s: mlx.mlx_stream, w: *const Weights) anyerror!MtpModel {
-            return loadNemotronMtp(a, s, w, .sevren);
-        }
-    };
-    // Either latent projection alone is a truncated checkpoint, so dropping one fails like any other tensor.
-    try HeadLoadLeakProbe.expectNoLeak(&cases, L.load, "moe.mixer.shared_experts.up_proj.weight");
-
-    const s = mlx.gpuStream();
-    var w = try HeadLoadLeakProbe.build(&cases, cases.len, s);
-    defer w.deinit();
-    var m = try L.load(testing.allocator, s, &w);
-    defer m.deinit();
-    const nm = &m.mlp.nemotron_moe;
-    try testing.expect(nm.fc1_latent_w.ctx != null and nm.fc2_latent_w.ctx != null);
-}
 
 test "mtp: a Hy3 head missing any one tensor fails to load and frees what it loaded" {
     const C = HeadLoadLeakProbe.Case;
@@ -4781,7 +4456,7 @@ test "loadMtp: MoE sidecar layout (language_model. prefix, switch_mlp experts)" 
     // MoE arm selected; router pre-transposed for the trunk's dense fallback
     // ([hidden, experts]); packed switch experts kept raw 3D.
     switch (m.mlp) {
-        .dense, .nemotron_moe => return error.TestUnexpectedResult,
+        .dense => return error.TestUnexpectedResult,
         .moe => |*mw| {
             const rs = mlx.getShape(mw.router_w);
             try testing.expectEqual(@as(c_int, 8), rs[0]);
@@ -6074,9 +5749,6 @@ test "mtp: draft rerank returns the exact argmax whenever it is inside the coars
     try testing.expect(decisive > 0);
 }
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
 test "mtp: the coarse rerank head drafts at its BUILT width, not the env's current one" {
     // The width a coarse head is READ at is a property of the BUILT weights.
     // `rerankCoarseBits()` is the env-backed BUILD default; re-reading it per
@@ -6103,8 +5775,8 @@ test "mtp: the coarse rerank head drafts at its BUILT width, not the env's curre
 
     // ...while the environment now says 2. Every draft below must still be
     // dispatched at 3.
-    _ = setenv("MLX_SERVE_MTP_DRAFT_HEAD_BITS", "2", 1);
-    defer _ = unsetenv("MLX_SERVE_MTP_DRAFT_HEAD_BITS");
+    env.set(.MLX_SERVE_MTP_DRAFT_HEAD_BITS, "2");
+    defer env.unset(.MLX_SERVE_MTP_DRAFT_HEAD_BITS);
     try testing.expectEqual(@as(u32, 2), rerankCoarseBits());
 
     var logged = false;
@@ -6480,68 +6152,6 @@ test "mtp: row-axis coarse logits equal each solo readout" {
             }
         }
     }
-}
-
-test "mtp: TensorFold's Nemotron-H head (`mtp-4bit.safetensors`, layers.0/1 names) loads as the Nemotron layout" {
-    const allocator = testing.allocator;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var tmp_dir = std.testing.tmpDir(.{});
-    defer tmp_dir.cleanup();
-    var path_buf: [512]u8 = undefined;
-    const root_len = try tmp_dir.dir.realPath(io, &path_buf);
-    const dir_path = path_buf[0..root_len];
-    const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp-4bit.safetensors", .{dir_path}, 0);
-    defer allocator.free(st_path);
-    {
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        const Entry = struct { key: [*:0]const u8, shape: []const c_int, dt: mlx.mlx_dtype = .bfloat16 };
-        const entries = [_]Entry{
-            .{ .key = "layers.0.eh_proj.weight", .shape = &.{ 8, 16 } },
-            .{ .key = "layers.0.enorm.weight", .shape = &.{8} },
-            .{ .key = "layers.0.hnorm.weight", .shape = &.{8} },
-            .{ .key = "layers.0.norm.weight", .shape = &.{8} },
-            .{ .key = "layers.0.mixer.q_proj.weight", .shape = &.{ 8, 8 } },
-            .{ .key = "layers.0.mixer.k_proj.weight", .shape = &.{ 4, 8 } },
-            .{ .key = "layers.0.mixer.v_proj.weight", .shape = &.{ 4, 8 } },
-            .{ .key = "layers.0.mixer.o_proj.weight", .shape = &.{ 8, 8 } },
-            .{ .key = "layers.1.norm.weight", .shape = &.{8} },
-            .{ .key = "layers.1.final_layernorm.weight", .shape = &.{8} },
-            .{ .key = "layers.1.mixer.gate.weight", .shape = &.{ 4, 8 } },
-            .{ .key = "layers.1.mixer.gate.e_score_correction_bias", .shape = &.{4}, .dt = .float32 },
-            .{ .key = "layers.1.mixer.switch_mlp.fc1.weight", .shape = &.{ 4, 6, 8 } },
-            .{ .key = "layers.1.mixer.switch_mlp.fc2.weight", .shape = &.{ 4, 8, 6 } },
-            .{ .key = "layers.1.mixer.shared_experts.up_proj.weight", .shape = &.{ 12, 8 } },
-            .{ .key = "layers.1.mixer.shared_experts.down_proj.weight", .shape = &.{ 8, 12 } },
-        };
-        for (entries) |e| {
-            var total: usize = 1;
-            for (e.shape) |d| total *= @intCast(d);
-            const data = try allocator.alloc(f32, total);
-            defer allocator.free(data);
-            for (data, 0..) |*x, i| x.* = @as(f32, @floatFromInt(i % 7)) * 0.1;
-            const f = mlx.mlx_array_new_data(data.ptr, e.shape.ptr, @intCast(e.shape.len), .float32);
-            defer _ = mlx.mlx_array_free(f);
-            var arr = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(arr);
-            try mlx.check(mlx.mlx_astype(&arr, f, e.dt, s));
-            try mlx.check(mlx.mlx_array_eval(arr));
-            _ = mlx.mlx_map_string_to_array_insert(map, e.key, arr);
-        }
-        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
-    }
-
-    try testing.expectEqualStrings("mtp-4bit.safetensors", resolveMtpSidecarInDir(io, allocator, tmp_dir.dir) orelse return error.SidecarNotFound);
-    var m = try loadMtp(io, allocator, s, dir_path);
-    defer m.deinit();
-    try testing.expectEqual(Layout.nemotron, m.layout);
-    try testing.expect(m.eh_proj != null);
-    try testing.expect(m.mlp == .nemotron_moe);
-    try testing.expect(m.mlp.nemotron_moe.shared != null);
-    try testing.expectEqualSlices(c_int, &.{ 8, 4 }, mlx.getShape(m.mlp.nemotron_moe.router_w));
 }
 
 test "draft rerank on a dense bf16 head: shortlisted rows re-score to the full readout's logits" {

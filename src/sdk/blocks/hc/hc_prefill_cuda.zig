@@ -4,6 +4,7 @@
 //! summed over the streams in order in bf16 (`col_reduce_small`) and scaled by bf16(1/hc). Every op
 //! is MLX's functor in the order of the compiled closures it replaces, so the outputs are bit-identical.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -32,7 +33,7 @@ pub fn enabled() bool {
         var on: ?bool = null;
     };
     if (Env.on == null) {
-        const raw = std.c.getenv("MLX_SERVE_HC_PREFILL_CUDA");
+        const raw = env.get(.MLX_SERVE_HC_PREFILL_CUDA);
         Env.on = raw == null or raw.?[0] != '0';
     }
     return Env.on.?;

@@ -1,6 +1,7 @@
 //! Loop-stop guard: the cut reason, the decision and the think-block recovery.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const log = @import("../log.zig");
 const Generator = generate_mod.Generator;
@@ -71,7 +72,7 @@ var loop_trim_env: ?bool = null;
 /// the model emitted. The cut itself is unaffected either way.
 pub fn loopTrimEnabled() bool {
     if (loop_trim_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_LOOP_TRIM");
+    const raw = env.get(.MLX_SERVE_LOOP_TRIM);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     loop_trim_env = enabled;
     return enabled;

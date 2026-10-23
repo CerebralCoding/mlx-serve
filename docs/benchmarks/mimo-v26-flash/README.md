@@ -1,7 +1,7 @@
 # MiMo-V2.6-Flash 1K–1M sweep: benchmark record
 
 This directory records mlx-serve serving MiMo-V2.6-Flash's streaming pack
-through the mlx-stream plugin (`lib/mlx-stream`, [plugins.md](../../plugins.md))
+through the mlx-stream plugin (`src/plugins/mimo_v2/stream/`, [plugins.md](../../plugins.md))
 across context: one request per context rung, from 1K to 1M prompt tokens, on
 server `746e7da9` (this host, `pr/mimo-host` at `2c041af6`, with mlx-stream
 at `8e7d186`, from the plugin's MiMo PR, since merged into its `main`), with the plugin's

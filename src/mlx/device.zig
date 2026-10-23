@@ -2,6 +2,7 @@
 //! Owns naxArchGeneration, DeviceGen, device_gen_cache, deviceGeneration, naxArchSupportedFrom, naxArchIsG17, and 11 more.
 
 const std = @import("std");
+const env = @import("../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("ffi.zig");
 const ane_offload = @import("../sdk/ane/offload.zig");
@@ -134,7 +135,7 @@ pub fn gpuArchitecture(buf: []u8) ?[]const u8 {
 
 pub fn computeNaxAvailable() bool {
     var force = false;
-    if (std.c.getenv("MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK")) |p| {
+    if (env.get(.MLX_SERVE_FORCE_GPU_FAMILY_FALLBACK)) |p| {
         const v = std.mem.span(p);
         force = v.len > 0 and v[0] == '1';
     }

@@ -21,17 +21,17 @@ const TILES_PER_GROUP: c_int = 16;
 /// Simdgroups a TAIL threadgroup loads its gathered key/value tiles with (the first alone computes).
 const TAIL_SG: c_int = 4;
 
-const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
+pub const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
 
 // The committed prefix's whole tiles [0, L), every window row seeing all of them.
-const PARTIAL = kernelSource("kernels/attention/lane_attn_partial.metal");
+pub const PARTIAL = kernelSource("kernels/attention/lane_attn_partial.metal");
 
 // One node's keys from the first tile the prefix did not fill, its path's rows
 // in depth order; chunk c0's walk continues from the state PARTIAL left there.
-const TAIL = kernelSource("kernels/attention/lane_attn_tail.metal");
+pub const TAIL = kernelSource("kernels/attention/lane_attn_tail.metal");
 
 // The prefix's finished chunks, then the node's own, in order.
-const MERGE = kernelSource("kernels/attention/lane_attn_merge.metal");
+pub const MERGE = kernelSource("kernels/attention/lane_attn_merge.metal");
 
 var partial_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var tail_kernel: ?mlx.mlx_fast_metal_kernel = null;

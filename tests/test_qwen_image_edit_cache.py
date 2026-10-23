@@ -9,7 +9,9 @@ Run after building: uv run tests/test_qwen_image_edit_cache.py --model <pack>
 Needs the vision tower in text_encoder/. Uses a private server, generated benign
 references, bounded requests and owned-process cleanup. Saves PNGs, SSE timings,
 sampled memory and a JSON report; visual inspection is still required.
-Use --transparent to check RGBA output; the default checks RGB output.
+Use --transparent to check RGBA output; the default checks RGB output. --guard-url refuses
+concurrent inference; --steps 0 checks 40-step normalization and cache dispatch, --steps 1
+the uncached fast path. Inspect the saved images before claiming quality parity.
 """
 
 import argparse
@@ -28,6 +30,8 @@ import time
 import urllib.request
 
 from PIL import Image, ImageChops, ImageDraw, ImageStat
+
+from lib.server import wait_health
 
 
 def save(path, value):
@@ -203,15 +207,10 @@ def main():
                 process = subprocess.Popen([str(args.binary.resolve()), "--serve", "--metrics", "--model-dir", str(folder),
                                             "--port", str(port)], stdout=log, stderr=subprocess.STDOUT, env=env)
                 try:
-                    for attempt in range(60):
-                        assert process.poll() is None, log_path.read_text()[-4000:]
-                        try:
-                            get_json(api + "/health", timeout=1)
-                            break
-                        except (OSError, ValueError):
-                            if attempt == 59:
-                                raise
-                            time.sleep(1)
+                    try:
+                        wait_health(api, 60, process)
+                    except RuntimeError:
+                        raise AssertionError(log_path.read_text()[-4000:])
                     loaded = get_json(api + "/v1/load-model", {"model": str(args.model.resolve())}, args.timeout)
                     assert loaded.get("error") is None, loaded
                     rows = get_json(api + "/v1/models")["data"]

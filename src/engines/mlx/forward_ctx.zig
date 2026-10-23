@@ -2,6 +2,7 @@
 //! Owns SpecTree, CaptureLayers, ForwardCtx.
 
 const mlx = @import("../../mlx/ffi.zig");
+const abi = @import("../../abi/plugin.zig");
 const row_attn = @import("../../sdk/blocks/attention/row_attn.zig");
 const PlePending = @import("../../plugins/qwen4_exp/ple.zig").PlePending;
 const QsaArmCounts = @import("../../plugins/qwen4_exp/qsa/arms.zig").QsaArmCounts;
@@ -186,4 +187,8 @@ pub const ForwardCtx = struct {
     /// still set reads zero rows.
     ple_defer: bool = false,
     ple_pending: ?PlePending = null,
+    /// A served model's id for this slot (`Forward.slots`), 0 until its first forward, and what its last `defer_host`
+    /// forward left owed (`plugin/settle.zig`).
+    plugin_slot: u32 = 0,
+    plugin_owed: abi.Owed = .none,
 };

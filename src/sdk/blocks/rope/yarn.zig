@@ -2,6 +2,7 @@
 //! Owns yarnActive, yarnScaleQK, yarnScaleRotated, yarnSpec, yarnMscale, computeYarnFreqs.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const mrope = @import("../../vision/mrope.zig");
 const ModelConfig = @import("../../../engines/mlx/model.zig").ModelConfig;
@@ -436,7 +437,7 @@ test "laguna yarn parity vs modeling_laguna.py (LAGUNA_FIXTURES)" {
     // modeling_laguna.py (tests/dump_laguna_fixtures.py, CPU fp32). Dormant in
     // normal CI; run with LAGUNA_FIXTURES=/tmp/laguna_fixtures.json. The
     // fixture's `yarn.freqs` = 1/inv_freq (the mlx_fast_rope denominator).
-    const path_z = std.c.getenv("LAGUNA_FIXTURES") orelse return error.SkipZigTest;
+    const path_z = env.get(.LAGUNA_FIXTURES) orelse return error.SkipZigTest;
     const path = std.mem.span(path_z);
     if (path.len == 0) return error.SkipZigTest;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -480,7 +481,6 @@ test "the YaRN mscale table never reaches a multiply in its load-time dtype" {
         @embedFile("yarn.zig") ++
         @embedFile("../attention/gated_full.zig") ++
         @embedFile("../attention/sinks.zig") ++
-        @embedFile("../../../plugins/laguna/attention.zig") ++
         @embedFile("qk_norm_rope.zig");
     // Needles are assembled at comptime: spelled whole, they would appear in
     // this test's own source and the scan would satisfy itself.

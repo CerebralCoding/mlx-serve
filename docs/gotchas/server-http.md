@@ -1324,10 +1324,8 @@ empty, the non-streaming request is fine, and nothing in the log looks wrong —
 even though a VL checkpoint is what surfaced it: any model whose template does
 not render the opener is in the class, text requests included.
 
-The guard is a source scan (`a stream never starts inside a think block because
-the REQUEST asked for thinking`) with the needle `++`-split so the test's own
-comment cannot satisfy it — the first version of this scan passed green against
-the broken build for exactly that reason. The integration bar is the
+The guard is a `scripts/lint_pins.txt` pin on `in_think_block = prompt_opened_think` in
+both stream files. The integration bar is the
 stream-vs-non-stream byte invariant rather than a phrasing check, because the
 broken build produced perfectly good prose; it just filed it under the wrong key.
 ## A KV bill that assumes every layer caches, at one width for K and V (2026-08-11)
@@ -1590,9 +1588,7 @@ while the buffers those headers point at stay put. A fourth modality that
 spells its buffer something other than `pixels`/`samples` fails to COMPILE in
 `mediaBuffer` rather than leaking quietly.
 
-Guards: the source scan "a request handler never owns its own media list —
-RequestMedia does" (no `std.ArrayList(chat_mod.{Image,Video,Audio}Data).empty`
-anywhere in server.zig, and at least two `RequestMedia.init(allocator)` sites),
+Guards: `scripts/lint_pins.txt` pins `RequestMedia.init(allocator)` in both chat handlers,
 plus the `std.testing.allocator` unit test "RequestMedia frees every decoded
 buffer it was handed" — gut the free in `MediaBag.deinit` and it reports 4
 leaked allocations.
@@ -2781,3 +2777,15 @@ pi on DeepSeek-V4.1 read its own screenshots (`read` of a 1280x800 PNG, ~3.3 MB 
 ### A 26k-token agent turn was refused on a 48 GB Mac with a 16 GB model resident (#932)
 
 Qwen3.8-27B 4-bit on a 48 GB MacBook: after a while every turn 400'd "requires ~3169MB GPU memory but only ~2675MB is available", and a restart let the same prompt through. The bill's free-RAM term counted free and file-backed pages only: #776 replaced `total − (wired + compressor + internal − purgeable)` with a sum of grantable classes and left purgeable out, so the anonymous caches a laptop's browsers mark discardable (macOS drops them before it compresses anything) read as taken. Fix: purgeable pages join the sum in `computeAvailableBytes` and the app meter's twin. Guard: `computeAvailableBytes sums the reclaimable classes…` (status.zig), `testPurgeablePagesCountAsGrantable`.
+
+### A client that hung up during a cold prefill left the GPU prefilling for a ghost
+
+Defect: Claude Code with a large MCP toolset sent a ~40K-token prompt, timed out waiting for the first token, disconnected and retried; abandoned prefills queued one behind another while `lsof` showed no client connected, and the server looked dead. Cause: the handler checked the peer socket only after a token arrived, so it sat blocked for the whole prefill and nothing cancelled the slot. Fix: SSE keepalives flow while a request waits for its first token (Anthropic `event: ping`, OpenAI `: keepalive`), each probe notices a gone peer, and the chunk loop aborts the prefill with `error.Cancelled`. Guard: `tests/test_disconnect_cancel.sh`.
+
+### Claude Code aborted a tool turn with "Content block not found"
+
+Defect: on a template-opened-think model (Qwen 3.5/3.6), `/v1/messages` streaming with thinking + tools leaked a raw `</think>` into text deltas, and on a tool-call turn the end-of-stream emission opened a thinking block at an index still held by the open text block, then closed a block that was never started. Cause: the tools branch recognized only think OPENERS present in the model's output, and the final flush assigned block indices without checking which were open. Fix: the think state seeds from the rendered prompt (`prompt_opened_think`), and the stream tracks which block is open (`text_block_open`, `thinking_block_open`), closing it before the next starts. Guard: `tests/test_messages_stream_thinking_tools.sh` (no tags in text deltas, every delta/stop names an open block, nothing open at message_stop).
+
+### A llama.cpp session reused across turns failed its second prefill on Qwen3 GGUFs
+
+Defect: the second turn of a chat (shared prefix, much larger suffix) answered 500: libllama logged `failed to find a memory slot for batch of size 512`, then `session_sync rc=-1` and `SessionSyncFailed`. Cause: one `llama_context` is reused across requests through `seq_rm` + decode, and on sliding-window layers the default (non-full) SWA cache never exposed the trimmed slots to later decodes. Fix: sessions are created with `swa_full = true` (lib/llama_shim), and `LlamaSeq.syncWithFallback` resets and retries once cold instead of failing the request. Guard: `tests/test_llama_persistent_session.sh`.

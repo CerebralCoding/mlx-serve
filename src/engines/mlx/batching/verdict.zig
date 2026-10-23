@@ -3,7 +3,6 @@
 const std = @import("std");
 const transformer_mod = @import("../transformer.zig");
 const model_mod = @import("../model.zig");
-const prefix_cache_mod = @import("../cache/prefix_cache.zig");
 const model_registry_mod = @import("../../../host/registry/registry.zig");
 const log = @import("../../../host/log.zig");
 const KVCache = transformer_mod.KVCache;
@@ -166,6 +165,7 @@ pub fn fillGroupPadWasteKvLens(
 /// flags are checked. MoE / hybrid / encoder have shape mismatches with
 /// `forwardBatchedDecode` and fall through to per-slot dispatch.
 pub fn modelBatchable(cfg: *const model_mod.ModelConfig) bool {
+    if (cfg.plugin) |b| return b.parsed.caps.batches_decode and b.parsed.cache.ssm_state.entries == 0;
     if (cfg.has_hybrid_layers) return false;
     if (cfg.full_attention_interval > 0) return false;
     if (cfg.is_encoder_only) return false;
@@ -311,9 +311,6 @@ test "modelBatchable: a PARSED deepseek_v4 config can never route to batched dec
     try testing.expectEqualStrings("deepseek_v4", cfg.model_type);
     try testing.expect(cfg.isMoe());
     try testing.expect(!modelBatchable(&cfg));
-    // Prefix-cache exclusion rides the same parsed config (module-owned
-    // decode state — see prefix_cache.shouldUse).
-    try testing.expect(!prefix_cache_mod.HotPrefixCache.shouldUse(&cfg, true));
 }
 
 test "batchedKvKeepCount: padding waste caps the group, and the long slots are the ones dropped" {

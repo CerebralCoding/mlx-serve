@@ -33,6 +33,8 @@ pub const blocks = struct {
     pub const decoder_attention = @import("blocks/decoder_attention.zig");
     pub const laguna_attention = @import("blocks/laguna_attention.zig");
     pub const extras = @import("blocks/extras.zig");
+    pub const decode_copies = @import("blocks/decode_copies.zig");
+    pub const trunk_weight = @import("blocks/trunk_weight.zig");
 };
 
 // ── tests ──
@@ -43,7 +45,5 @@ test {
     _ = @import("../../engines/mlx/kv/cache_ops.zig");
     _ = @import("proof/dense_test.zig");
     _ = @import("proof/layered_test.zig");
-    _ = @import("proof/hybrid_test.zig");
-    _ = @import("proof/encoder_test.zig");
     _ = @import("proof/attention_test.zig");
 }

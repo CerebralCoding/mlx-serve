@@ -1,19 +1,15 @@
 #!/bin/bash
-# DSpark (LiquidAI LFM2.5) integration test — env-gated on a local target
-# whose `drafter/` subdir holds the DSpark sidecar:
+# test_dspark_lfm2.sh — DSpark (LiquidAI LFM2.5, 2.6B dense hybrid and 8B-A1B lfm2_moe) on a target whose drafter/
+# holds the sidecar. [1] the sidecar is CLASSIFIED as DSpark (`dspark: markov head rank=`) and the hybrid trunk no
+# longer vetoes it (`[spec-wiring] ... dflash=true`); [2] rounds ENGAGE with accepts > 0; [3] greedy bytes equal a
+# --no-drafter boot on the RAW /v1/completions surface (a chat model's reasoning amplifies a near-tie flip), on an echo
+# prompt so partial-accept rounds (the conv-state rollback) still happen; [4] the Markov chain is LOAD-BEARING:
+# MLX_SERVE_DFLASH_MARKOV=0 roughly halves acceptance on a NOVEL prompt.
 #
-#   DSPARK_TEST_MODEL=~/.mlx-serve/models/mlx-community/LFM2.5-2.6B-8bit \
-#       ./tests/test_dspark_lfm2.sh
+#   DSPARK_TEST_MODEL=<target dir> ./tests/test_dspark_lfm2.sh   # DSPARK_TEST_PORT (11357); SKIPs without drafter/
 #
-# Pins the three things that made this port silently wrong before it was
-# right, none of which output shape can see:
-#   [1] the sidecar is CLASSIFIED as DSpark (split contract + markov head)
-#       and a HYBRID trunk no longer vetoes the assistant sidecar;
-#   [2] rounds ENGAGE (`mode=dflash`, accepts > 0) — engagement COUNTS;
-#   [3] greedy output on an echo prompt is byte-identical to a serial boot —
-#       which is what exercises the partial-accept conv-state rollback;
-#   [4] the Markov chain is LOAD-BEARING (`MLX_SERVE_DFLASH_MARKOV=0` halves
-#       acceptance on a novel prompt).
+# Hermetic twins: the split-contract, anchor_row_drafts and markov-head parse tests, dflashGateMinimum.
+
 set -euo pipefail
 
 MODEL="${DSPARK_TEST_MODEL:-}"

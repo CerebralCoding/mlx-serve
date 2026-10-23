@@ -10,8 +10,8 @@ const mlx = @import("../../../mlx/ffi.zig");
 const xfm = @import("../../../engines/mlx/transformer.zig");
 const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
 
-const ROWS: c_int = 4;
-const SGS: c_int = 2;
+pub const ROWS: c_int = 4;
+pub const SGS: c_int = 2;
 /// Widest token count worth sending here: a row re-reads its own experts, so
 /// past two rows MLX's sorted gather (one read per expert per row group) wins.
 pub const MAX_ROWS: c_int = 2;
@@ -21,23 +21,23 @@ pub const E2M1_HEADER = kernelSource("kernels/moe/moe_fp4_e2m1_header.metal");
 /// Group scale -> its value times 2^-8: e4m3 (NVFP4) by bit placement into a
 /// half, e8m0 (MXFP4) as MLX's `fp8_e8m0` reads it (the byte is a float
 /// exponent, 0 is 2^-127). With the e2m1 2^-14, one 2^22 multiply restores both.
-const NV_SCALE = kernelSource("kernels/moe/moe_fp4_nv_scale.metal");
-const MX_SCALE = kernelSource("kernels/moe/moe_fp4_mx_scale.metal");
+pub const NV_SCALE = kernelSource("kernels/moe/moe_fp4_nv_scale.metal");
+pub const MX_SCALE = kernelSource("kernels/moe/moe_fp4_mx_scale.metal");
 
 /// Nibbles j and j+4 of a word decode together: one shift puts them in the two halves of a
 /// half2, then the e2m1 bit placement serves both lanes.
 pub const E2M1X2_HEADER = kernelSource("kernels/moe/moe_fp4_e2m1x2_header.metal");
 
-const DOT16 = E2M1X2_HEADER ++ kernelSource("kernels/moe/moe_fp4_dot16.metal");
+pub const DOT16 = E2M1X2_HEADER ++ kernelSource("kernels/moe/moe_fp4_dot16.metal");
 
 // grid (32, N/ROWS, R*TOPK), threadgroup (32, SGS, 1): slot e is token e / TOPK's
 // e % TOPK-th expert. USCALE and CLAMP are the per-expert up scale and GLM's whole-number SwiGLU clamp. The e2m1 and scale decodes each scale by a power of two;
 // 2^22 folds both back once per row.
-const GATEUP_SOURCE = kernelSource("kernels/moe/moe_fp4_gateup.metal");
+pub const GATEUP_SOURCE = kernelSource("kernels/moe/moe_fp4_gateup.metal");
 
 // grid (32, H/ROWS, R), threadgroup (32, SGS, 1): every expert's down row for
 // token tok, weighted by its routing score, accumulated in the same registers.
-const DOWNRED_SOURCE = kernelSource("kernels/moe/moe_fp4_downred.metal");
+pub const DOWNRED_SOURCE = kernelSource("kernels/moe/moe_fp4_downred.metal");
 
 const Kernels = struct { gateup: ?mlx.mlx_fast_metal_kernel = null, downred: ?mlx.mlx_fast_metal_kernel = null };
 /// Indexed by format: nvfp4, mxfp4.

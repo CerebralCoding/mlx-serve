@@ -31,6 +31,11 @@ const model_mod = @import("../../engines/mlx/model.zig");
 
 const Weights = model_mod.Weights;
 const S = mlx.mlx_stream;
+const graph_call = @import("../../sdk/media/graph_call.zig").call;
+const ops = @import("../../mlx/ops.zig");
+const conv_blk = @import("../../sdk/blocks/vae/conv.zig");
+const gn_blk = @import("../../sdk/blocks/norms/group_norm.zig");
+const resnet_blk = @import("../../sdk/blocks/vae/resnet.zig");
 /// LayerNorm/GroupNorm eps for DINO + VAE (SD2.x VAE GroupNorm is 1e-6; DINOv2
 /// LayerNorm is 1e-6; the ImageProjModel's nn.LayerNorm uses the 1e-5 default).
 const PAINT_LN_EPS: f32 = 1e-6;
@@ -542,105 +547,28 @@ const VAE_GROUPS: c_int = 32;
 const VAE_GN_EPS: f32 = 1e-6;
 const VAE_MID_CH: u32 = 512; // block_out_channels last
 
+/// The VAE's norm: flat GroupNorm, f32 statistics and affine, f16 out.
+const VAE_NORM: resnet_blk.Norm = .{ .flat = .{ .groups = VAE_GROUPS, .eps = VAE_GN_EPS, .out = .float16 } };
+
 /// conv2d on NHWC input with fp16 OHWI weight [out,kh,kw,in] + bias [out].
 fn conv2d(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, pad: c_int, s: S) !mlx.mlx_array {
-    // Materialize: mlx_conv2d silently miscomputes on strided/lazy-view inputs.
-    var xc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xc);
-    try mlx.check(mlx.mlx_contiguous(&xc, x, false, s));
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_conv2d(&o, xc, w, 1, 1, pad, pad, 1, 1, 1, s));
-    const r = try addA(o, bias, s);
-    _ = mlx.mlx_array_free(o);
-    return r;
+    return graph_call(s, conv_blk.conv2d, .{ x, w, bias, 1, pad, 1 });
 }
 
-/// PyTorch-compatible GroupNorm on NHWC [1,H,W,C], fp32 internal, + affine,
-/// returns fp16.
+/// PyTorch-compatible GroupNorm on NHWC [1,H,W,C], fp32 internal, + affine, returns fp16.
 fn groupNorm(x: mlx.mlx_array, weight: mlx.mlx_array, bias: mlx.mlx_array, groups: c_int, eps: f32, s: S) !mlx.mlx_array {
-    const sh = mlx.getShape(x); // [1,H,W,C]
-    const H = sh[1];
-    const Wd = sh[2];
-    const C = sh[3];
-    const cg = @divExact(C, groups);
-    const xf = try astype(x, .float32, s);
-    defer _ = mlx.mlx_array_free(xf);
-    // [1,H,W,C] -> [1, H*W, groups, cg] -> [1, groups, H*W, cg] -> [1, groups, H*W*cg]
-    const r1 = try reshape(xf, &[_]c_int{ 1, H * Wd, groups, cg }, s);
-    defer _ = mlx.mlx_array_free(r1);
-    const t1 = try transpose(r1, &[_]c_int{ 0, 2, 1, 3 }, s);
-    defer _ = mlx.mlx_array_free(t1);
-    const flat = try reshape(t1, &[_]c_int{ 1, groups, H * Wd * cg }, s);
-    defer _ = mlx.mlx_array_free(flat);
-    var mean = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mean);
-    try mlx.check(mlx.mlx_mean_axis(&mean, flat, -1, true, s));
-    const xc = try subA(flat, mean, s);
-    defer _ = mlx.mlx_array_free(xc);
-    const sq = try mulA(xc, xc, s);
-    defer _ = mlx.mlx_array_free(sq);
-    var v = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v);
-    try mlx.check(mlx.mlx_mean_axis(&v, sq, -1, true, s));
-    const epsa = mlx.mlx_array_new_float(eps);
-    defer _ = mlx.mlx_array_free(epsa);
-    var ve = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ve);
-    try mlx.check(mlx.mlx_add(&ve, v, epsa, s));
-    var rsq = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rsq);
-    try mlx.check(mlx.mlx_rsqrt(&rsq, ve, s));
-    const norm = try mulA(xc, rsq, s);
-    defer _ = mlx.mlx_array_free(norm);
-    // back to NHWC
-    const b1 = try reshape(norm, &[_]c_int{ 1, groups, H * Wd, cg }, s);
-    defer _ = mlx.mlx_array_free(b1);
-    const b2 = try transpose(b1, &[_]c_int{ 0, 2, 1, 3 }, s);
-    defer _ = mlx.mlx_array_free(b2);
-    const b3 = try reshape(b2, &[_]c_int{ 1, H, Wd, C }, s);
-    defer _ = mlx.mlx_array_free(b3);
-    const wf = try astype(weight, .float32, s);
-    defer _ = mlx.mlx_array_free(wf);
-    const bf = try astype(bias, .float32, s);
-    defer _ = mlx.mlx_array_free(bf);
-    const sc = try mulA(b3, wf, s);
-    defer _ = mlx.mlx_array_free(sc);
-    const out = try addA(sc, bf, s);
-    defer _ = mlx.mlx_array_free(out);
-    return astype(out, .float16, s);
+    return graph_call(s, gn_blk.groupNormFlat, .{ x, weight, bias, groups, eps, .float16 });
 }
 
-/// Asymmetric (0,1,0,1) zero-pad + 3x3 stride-2 valid conv on NHWC (diffusers
-/// Downsample2D — pads RIGHT/BOTTOM only, so an odd input side downsamples one
-/// smaller than a symmetric pad would).
+/// diffusers Downsample2D: (0,1,0,1) zero pad, then a 3x3 stride-2 conv (an odd side downsamples one smaller than a
+/// symmetric pad would).
 fn conv2dDown(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const axes = [_]c_int{ 1, 2 };
-    const low = [_]c_int{ 0, 0 };
-    const high = [_]c_int{ 1, 1 };
-    const zero = mlx.mlx_array_new_float(0.0);
-    defer _ = mlx.mlx_array_free(zero);
-    var p = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(p);
-    try mlx.check(mlx.mlx_pad(&p, x, &axes, 2, &low, 2, &high, 2, zero, "constant", s));
-    var pc = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(pc);
-    try mlx.check(mlx.mlx_contiguous(&pc, p, false, s));
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_conv2d(&o, pc, w, 2, 2, 0, 0, 1, 1, 1, s));
-    const r = try addA(o, bias, s);
-    _ = mlx.mlx_array_free(o);
-    return r;
+    return graph_call(s, conv_blk.downsample2x, .{ x, w, bias });
 }
 
 /// Nearest 2x upsample (repeat) + 3x3 pad-1 conv (diffusers Upsample2D).
 fn upsampleConv(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
-    var r1 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(r1);
-    try mlx.check(mlx.mlx_repeat_axis(&r1, x, 2, 1, s));
-    var r2 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(r2);
-    try mlx.check(mlx.mlx_repeat_axis(&r2, r1, 2, 2, s));
-    return conv2d(r2, w, b, 1, s);
+    return graph_call(s, conv_blk.upsample2x, .{ x, w, b });
 }
 
 const Resnet = struct {
@@ -660,24 +588,11 @@ const Resnet = struct {
         if (self.sb) |x| _ = mlx.mlx_array_free(x);
     }
     fn forward(self: *const Resnet, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        const h0 = try groupNorm(x, self.n1w, self.n1b, VAE_GROUPS, VAE_GN_EPS, s);
-        defer _ = mlx.mlx_array_free(h0);
-        const a0 = try silu(h0, s);
-        defer _ = mlx.mlx_array_free(a0);
-        const c1 = try conv2d(a0, self.c1w, self.c1b, 1, s);
-        defer _ = mlx.mlx_array_free(c1);
-        const h1 = try groupNorm(c1, self.n2w, self.n2b, VAE_GROUPS, VAE_GN_EPS, s);
-        defer _ = mlx.mlx_array_free(h1);
-        const a1 = try silu(h1, s);
-        defer _ = mlx.mlx_array_free(a1);
-        const c2 = try conv2d(a1, self.c2w, self.c2b, 1, s);
-        defer _ = mlx.mlx_array_free(c2);
-        if (self.sw) |sw| {
-            const sc = try conv2d(x, sw, self.sb.?, 0, s);
-            defer _ = mlx.mlx_array_free(sc);
-            return addA(c2, sc, s);
-        }
-        return addA(c2, x, s);
+        return graph_call(s, block, .{ self, x });
+    }
+    fn block(g: *ops.Graph, self: *const Resnet, x: mlx.mlx_array) !mlx.mlx_array {
+        const r: resnet_blk.Resnet = .{ .n1w = self.n1w, .n1b = self.n1b, .c1w = self.c1w, .c1b = self.c1b, .n2w = self.n2w, .n2b = self.n2b, .c2w = self.c2w, .c2b = self.c2b, .sw = self.sw, .sb = self.sb };
+        return r.forward(g, VAE_NORM, x);
     }
 };
 
@@ -697,33 +612,17 @@ const VaeAttn = struct {
         self.o.deinit();
     }
     fn forward(self: *const VaeAttn, x: mlx.mlx_array, s: S) !mlx.mlx_array {
-        const sh = mlx.getShape(x);
-        const H = sh[1];
-        const Wd = sh[2];
-        const C = sh[3];
-        const normed = try groupNorm(x, self.gnw, self.gnb, VAE_GROUPS, VAE_GN_EPS, s);
-        defer _ = mlx.mlx_array_free(normed);
-        const q = try self.q.forward(normed, s);
-        defer _ = mlx.mlx_array_free(q);
-        const k = try self.k.forward(normed, s);
-        defer _ = mlx.mlx_array_free(k);
-        const v = try self.v.forward(normed, s);
-        defer _ = mlx.mlx_array_free(v);
-        // [1,H,W,C] -> [1, 1, H*W, C] (single head)
-        const qr = try reshape(q, &[_]c_int{ 1, 1, H * Wd, C }, s);
-        defer _ = mlx.mlx_array_free(qr);
-        const kr = try reshape(k, &[_]c_int{ 1, 1, H * Wd, C }, s);
-        defer _ = mlx.mlx_array_free(kr);
-        const vr = try reshape(v, &[_]c_int{ 1, 1, H * Wd, C }, s);
-        defer _ = mlx.mlx_array_free(vr);
-        const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(C)));
-        const attn = try sdpa(qr, kr, vr, scale, s);
-        defer _ = mlx.mlx_array_free(attn);
-        const ar = try reshape(attn, &[_]c_int{ 1, H, Wd, C }, s);
-        defer _ = mlx.mlx_array_free(ar);
-        const ao = try self.o.forward(ar, s);
-        defer _ = mlx.mlx_array_free(ao);
-        return addA(x, ao, s);
+        return graph_call(s, block, .{ self, x });
+    }
+    fn block(g: *ops.Graph, self: *const VaeAttn, x: mlx.mlx_array) !mlx.mlx_array {
+        const Proj = struct {
+            l: *const MixedLinear,
+            pub fn forward(p: @This(), gr: *ops.Graph, in: mlx.mlx_array) !mlx.mlx_array {
+                return gr.adopt(try p.l.forward(in, gr.s));
+            }
+        };
+        const proj = .{ .q = Proj{ .l = &self.q }, .k = Proj{ .l = &self.k }, .v = Proj{ .l = &self.v }, .o = Proj{ .l = &self.o } };
+        return resnet_blk.midAttention(g, VAE_NORM, x, self.gnw, self.gnb, proj);
     }
 };
 
@@ -1997,11 +1896,12 @@ pub const PaintEngine = struct {
     conditioner: PaintConditioner,
     unet: *punet.PaintUnet,
 
-    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*PaintEngine {
+    /// On the caller's stream (borrowed).
+    pub fn loadOn(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !*PaintEngine {
         const self = try allocator.create(PaintEngine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
-        self.s = mlx.mlx_default_gpu_stream_new();
+        self.s = s;
         self.cfg = try readConfigFile(io, allocator, model_dir);
         self.vae = try loadSdVae(allocator, self.cfg, model_dir, self.s);
         errdefer self.vae.deinit();
@@ -2361,4 +2261,90 @@ test "hy3d-paint refImageChw composites alpha on white and stretches" {
     const chw = try refImageChw(a, &rgba, 2, 2, 4);
     defer a.free(chw);
     for (chw) |v| try testing.expectApproxEqAbs(@as(f32, 1.0), v, 1e-6);
+}
+
+/// The SD2 VAE's layout at 32 channels throughout (one channel per norm group), seeded random, conv weights OHWI as
+/// the converter writes them.
+fn tinyVae(a: std.mem.Allocator) ![]u8 {
+    const T = @import("../../sdk/testing/tensors.zig").Tensors;
+    var t = T.init(a, 81);
+    const C = 32;
+    const conv = struct {
+        fn f(tt: *T, comptime name: []const u8, args: anytype, out: u64, in: u64, k: u64) !void {
+            try tt.rand(name ++ ".weight", args, &.{ out, k, k, in }, .F32, 0.8 / @sqrt(@as(f32, @floatFromInt(in * k * k))));
+            try tt.rand(name ++ ".bias", args, &.{out}, .F32, 0.05);
+        }
+    }.f;
+    const norm = struct {
+        fn f(tt: *T, comptime name: []const u8, args: anytype) !void {
+            try tt.rand(name ++ ".weight", args, &.{C}, .F32, 0.1);
+            try tt.rand(name ++ ".bias", args, &.{C}, .F32, 0.1);
+        }
+    }.f;
+    const resnet = struct {
+        fn f(tt: *T, comptime pfx: []const u8, args: anytype) !void {
+            try norm(tt, pfx ++ ".norm1", args);
+            try conv(tt, pfx ++ ".conv1", args, C, C, 3);
+            try norm(tt, pfx ++ ".norm2", args);
+            try conv(tt, pfx ++ ".conv2", args, C, C, 3);
+        }
+    }.f;
+    const attn = struct {
+        fn f(tt: *T, comptime pfx: []const u8) !void {
+            try norm(tt, pfx ++ ".group_norm", .{});
+            inline for (.{ "query", "key", "value", "proj_attn" }) |n| {
+                try tt.rand(pfx ++ "." ++ n ++ ".weight", .{}, &.{ C, C }, .F32, 0.18);
+                try tt.rand(pfx ++ "." ++ n ++ ".bias", .{}, &.{C}, .F32, 0.05);
+            }
+        }
+    }.f;
+    try conv(&t, "encoder.conv_in", .{}, C, 3, 3);
+    for (0..4) |b| for (0..2) |r| try resnet(&t, "encoder.down_blocks.{d}.resnets.{d}", .{ b, r });
+    for (0..3) |b| try conv(&t, "encoder.down_blocks.{d}.downsamplers.0.conv", .{b}, C, C, 3);
+    try resnet(&t, "encoder.mid_block.resnets.0", .{});
+    try attn(&t, "encoder.mid_block.attentions.0");
+    try resnet(&t, "encoder.mid_block.resnets.1", .{});
+    try norm(&t, "encoder.conv_norm_out", .{});
+    try conv(&t, "encoder.conv_out", .{}, 8, C, 3);
+    try conv(&t, "quant_conv", .{}, 8, 8, 1);
+    try conv(&t, "post_quant_conv", .{}, 4, 4, 1);
+    try conv(&t, "decoder.conv_in", .{}, C, 4, 3);
+    try resnet(&t, "decoder.mid_block.resnets.0", .{});
+    try attn(&t, "decoder.mid_block.attentions.0");
+    try resnet(&t, "decoder.mid_block.resnets.1", .{});
+    for (0..4) |b| for (0..3) |r| try resnet(&t, "decoder.up_blocks.{d}.resnets.{d}", .{ b, r });
+    for (0..3) |b| try conv(&t, "decoder.up_blocks.{d}.upsamplers.0.conv", .{b}, C, C, 3);
+    try norm(&t, "decoder.conv_norm_out", .{});
+    try conv(&t, "decoder.conv_out", .{}, 3, C, 3);
+    return t.bytes();
+}
+
+test "hy3d-paint: a tiny SD VAE's encode and decode are bit-equal to their golden run" {
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "vae.safetensors", .data = try tinyVae(a) });
+    const buf = try a.alloc(u8, std.fs.max_path_bytes);
+    const dir = buf[0..try tmp.dir.realPath(testing.io, buf)];
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var vae = try loadSdVae(testing.allocator, .{}, dir, s);
+    defer vae.deinit();
+    var key = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(key);
+    try mlx.check(mlx.mlx_random_key(&key, 5));
+    var img = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(img);
+    const lo = mlx.mlx_array_new_float(-1);
+    defer _ = mlx.mlx_array_free(lo);
+    const hi = mlx.mlx_array_new_float(1);
+    defer _ = mlx.mlx_array_free(hi);
+    try mlx.check(mlx.mlx_random_uniform(&img, lo, hi, &[_]c_int{ 1, 3, 64, 64 }, 4, .float32, key, s));
+    const z = try vae.encode(img);
+    defer _ = mlx.mlx_array_free(z);
+    const out = try vae.decode(z);
+    defer _ = mlx.mlx_array_free(out);
+    try @import("../../sdk/testing/golden.zig").expect("hunyuan3d_paint_vae", &.{ .{ .name = "latent", .array = z }, .{ .name = "image", .array = out } });
 }

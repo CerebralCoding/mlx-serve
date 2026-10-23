@@ -1720,7 +1720,7 @@ fn decChainEnabled() bool {
     return v;
 }
 /// Test hook: force the decode-chain arm on/off (null = re-read the env).
-fn decChainSetForTest(v: ?bool) void {
+pub fn decChainSetForTest(v: ?bool) void {
     dec_chain_state = v;
 }
 
@@ -1740,7 +1740,7 @@ fn moeGateUpEnabled() bool {
     return v;
 }
 /// Test hook: force the MoE gate+up arm on/off (null = re-read the env).
-fn moeGateUpSetForTest(v: ?bool) void {
+pub fn moeGateUpSetForTest(v: ?bool) void {
     moe_gateup_state = v;
 }
 
@@ -1760,7 +1760,7 @@ fn sinkSoftmaxEnabled() bool {
     return v;
 }
 /// Test hook: force the sink-softmax arm on/off (null = re-read the env).
-fn sinkSoftmaxSetForTest(v: ?bool) void {
+pub fn sinkSoftmaxSetForTest(v: ?bool) void {
     sink_softmax_state = v;
 }
 
@@ -1988,7 +1988,7 @@ fn clippedSwigluG(gate_in: mlx.mlx_array, up_in: mlx.mlx_array, limit: f32, s: m
 /// wrote T(acc), then the f32 clip chain with the sigmoid read from an exact
 /// bf16-indexed table of mlx_sigmoid values (the swigluSigTable rule — a
 /// metal::exp transcendental is a rounding apart from the metallib).
-const MOE_GATEUP_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/moe_gateup.metal");
+pub const MOE_GATEUP_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/moe_gateup.metal");
 
 var moe_gateup_obj: ?mlx.mlx_fast_metal_kernel = null;
 var moe_gateup_build_failed: bool = false;
@@ -2044,7 +2044,7 @@ var moe_gateup_cfg_key: MoeGateUpKey = std.mem.zeroes(MoeGateUpKey);
 /// with dsv4's clipped SwiGLU (f32 chain, sigmoid via an exact bf16-indexed
 /// table). Returns [1, TOPK, 1, N] bf16 (the composed `act` shape), or null
 /// to decline (kill switch, ineligible geometry, build failure).
-fn moeGateUpFused(m: *const Dsv4Model, xe: mlx.mlx_array, q_gate: *const Q, q_up: *const Q, ind: mlx.mlx_array, k: usize) !?mlx.mlx_array {
+pub fn moeGateUpFused(m: *const Dsv4Model, xe: mlx.mlx_array, q_gate: *const Q, q_up: *const Q, ind: mlx.mlx_array, k: usize) !?mlx.mlx_array {
     if (!moeGateUpEnabled() or !mlx.streamIsGpu(m.s)) return null;
     const bits = q_gate.qp.bits;
     const gs = q_gate.qp.group_size;
@@ -4819,7 +4819,7 @@ fn freqsFor(m: *Dsv4Model, comptime kind: enum { plain, yarn }, upto: usize, all
 
 /// GPU cos/sin rows for ONE position (uploaded from the host Freqs tables —
 /// bit-identical trig to ropeRow).
-const RopeRows = struct { cos: mlx.mlx_array, sin: mlx.mlx_array };
+pub const RopeRows = struct { cos: mlx.mlx_array, sin: mlx.mlx_array };
 
 fn gpuReshape(x: mlx.mlx_array, shape: []const c_int, s: mlx.mlx_stream) !mlx.mlx_array {
     var out = mlx.mlx_array_new();
@@ -4892,16 +4892,16 @@ fn gpuRms(x: mlx.mlx_array, w: mlx.mlx_array, eps: f32, s: mlx.mlx_stream) !mlx.
 /// y[t, j] = Σ_c pre[c]·stream[t, c, j] — ascending c, product rounded per
 /// step, matching the composed multiply+sum reduction. `out` (pre|post|combT
 /// pack) is written by the j==0 threadgroup only.
-const SINKHORN_Y_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/sinkhorn_y.metal");
+pub const SINKHORN_Y_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/sinkhorn_y.metal");
 
 /// hc_post in one dispatch: ns[t,c,j] = Σ_q combT[t,c,q]·stream[t,q,j] +
 /// post[t,c]·out[t,j], reading post/combT straight from the sinkhorn pack —
 /// replaces the per-sublayer slice/reshape/matmul/multiply/add tail.
-const HCPOST_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/hcpost.metal");
+pub const HCPOST_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/hcpost.metal");
 
-const SINKHORN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/sinkhorn.metal");
+pub const SINKHORN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/sinkhorn.metal");
 
-const SinkhornK = struct { kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config };
+pub const SinkhornK = struct { kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_config };
 
 /// Per-batch-size kernel config: output [tokens, pre|post|combT] — ALWAYS
 /// rank 2, tokens == 1 included. A rank-1 special case for decode made the
@@ -4932,7 +4932,7 @@ fn sinkhornCfgFor(m: *Dsv4Model, tokens: usize) !mlx.mlx_fast_metal_kernel_confi
     return c;
 }
 
-fn sinkhornCfg(hc: usize, iters: u32, tokens: usize) ?mlx.mlx_fast_metal_kernel_config {
+pub fn sinkhornCfg(hc: usize, iters: u32, tokens: usize) ?mlx.mlx_fast_metal_kernel_config {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     const pack: c_int = @intCast(2 * hc + hc * hc);
     const out_shape = [_]c_int{ @intCast(tokens), pack };
@@ -4950,7 +4950,7 @@ fn sinkhornCfg(hc: usize, iters: u32, tokens: usize) ?mlx.mlx_fast_metal_kernel_
     return cfg;
 }
 
-fn sinkhornYCfg(hc: usize, iters: u32, tokens: usize, d: usize) ?mlx.mlx_fast_metal_kernel_config {
+pub fn sinkhornYCfg(hc: usize, iters: u32, tokens: usize, d: usize) ?mlx.mlx_fast_metal_kernel_config {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     const pack: c_int = @intCast(2 * hc + hc * hc);
     const out_shape = [_]c_int{ @intCast(tokens), pack };
@@ -4982,7 +4982,7 @@ fn sinkhornYCfgFor(m: *Dsv4Model, tokens: usize) !mlx.mlx_fast_metal_kernel_conf
     return c;
 }
 
-fn hcPostCfg(hc: usize, tokens: usize, d: usize) ?mlx.mlx_fast_metal_kernel_config {
+pub fn hcPostCfg(hc: usize, tokens: usize, d: usize) ?mlx.mlx_fast_metal_kernel_config {
     const cfg = mlx.mlx_fast_metal_kernel_config_new();
     const ns_shape = [_]c_int{ @intCast(tokens), @intCast(hc), @intCast(d) };
     const tgz: c_int = @intCast(@min(d, 256));
@@ -5010,7 +5010,7 @@ fn hcPostCfgFor(m: *Dsv4Model, tokens: usize) !mlx.mlx_fast_metal_kernel_config 
     return c;
 }
 
-fn buildHcPostKernel(hc: usize, d: usize) ?SinkhornK {
+pub fn buildHcPostKernel(hc: usize, d: usize) ?SinkhornK {
     const input_names = [_][*:0]const u8{ "pk", "stream_in", "out_v" };
     const output_names = [_][*:0]const u8{"ns"};
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
@@ -5026,7 +5026,7 @@ fn buildHcPostKernel(hc: usize, d: usize) ?SinkhornK {
     return .{ .kernel = kernel, .cfg = cfg };
 }
 
-fn applyHcPost(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, pk: mlx.mlx_array, stream_g: mlx.mlx_array, out_g: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn applyHcPost(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, pk: mlx.mlx_array, stream_g: mlx.mlx_array, out_g: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const inputs_arr = [_]mlx.mlx_array{ pk, stream_g, out_g };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -5039,7 +5039,7 @@ fn applyHcPost(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, pk: 
     return out;
 }
 
-fn buildSinkhornYKernel(hc: usize, iters: u32, d: usize) ?SinkhornK {
+pub fn buildSinkhornYKernel(hc: usize, iters: u32, d: usize) ?SinkhornK {
     const input_names = [_][*:0]const u8{ "mixes", "ssq", "scale", "base", "consts", "stream_in" };
     const output_names = [_][*:0]const u8{ "out", "y" };
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
@@ -5057,7 +5057,7 @@ fn buildSinkhornYKernel(hc: usize, iters: u32, d: usize) ?SinkhornK {
 
 /// Apply the fused sinkhorn+collapse kernel: returns the packed
 /// [pre|post|combT] rows AND y [tokens, d] (both owned).
-fn applySinkhornY(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, mixes_g: mlx.mlx_array, ss_g: mlx.mlx_array, scale_g: mlx.mlx_array, base_g: mlx.mlx_array, consts_g: mlx.mlx_array, stream_g: mlx.mlx_array, s: mlx.mlx_stream) !struct { pk: mlx.mlx_array, y: mlx.mlx_array } {
+pub fn applySinkhornY(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, mixes_g: mlx.mlx_array, ss_g: mlx.mlx_array, scale_g: mlx.mlx_array, base_g: mlx.mlx_array, consts_g: mlx.mlx_array, stream_g: mlx.mlx_array, s: mlx.mlx_stream) !struct { pk: mlx.mlx_array, y: mlx.mlx_array } {
     const inputs_arr = [_]mlx.mlx_array{ mixes_g, ss_g, scale_g, base_g, consts_g, stream_g };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -5075,7 +5075,7 @@ fn applySinkhornY(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, m
 
 /// Build the fused Sinkhorn kernel + its decode (tokens=1) config. Owned by
 /// the caller; null when the Metal source fails to construct.
-fn buildSinkhornKernel(hc: usize, iters: u32) ?SinkhornK {
+pub fn buildSinkhornKernel(hc: usize, iters: u32) ?SinkhornK {
     const input_names = [_][*:0]const u8{ "mixes", "ssq", "scale", "base", "consts" };
     const output_names = [_][*:0]const u8{"out"};
     const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
@@ -5093,7 +5093,7 @@ fn buildSinkhornKernel(hc: usize, iters: u32) ?SinkhornK {
 
 /// Apply the fused kernel: returns packed [pre(hc) | post(hc) | combT(hc²)]
 /// per token ([pack] for the decode config, [tokens, pack] for batch configs).
-fn applySinkhorn(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, mixes_g: mlx.mlx_array, ss_g: mlx.mlx_array, scale_g: mlx.mlx_array, base_g: mlx.mlx_array, consts_g: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn applySinkhorn(sk: *const SinkhornK, cfg: mlx.mlx_fast_metal_kernel_config, mixes_g: mlx.mlx_array, ss_g: mlx.mlx_array, scale_g: mlx.mlx_array, base_g: mlx.mlx_array, consts_g: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const inputs_arr = [_]mlx.mlx_array{ mixes_g, ss_g, scale_g, base_g, consts_g };
     const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
     defer _ = mlx.mlx_vector_array_free(inputs_vec);
@@ -6598,7 +6598,7 @@ fn winStack(ext: mlx.mlx_array, off: usize, n_win: usize, r: usize, cd: usize, s
 /// sinkhorn-kernel precedent); the QAT sim's scale/grid exponents use
 /// frexp/ldexp bit arithmetic — EXACT, matching the host f64 semantics rather
 /// than the composed chain's f32 log2/ceil approximations.
-const EMIT_WIN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/emit_win.metal");
+pub const EMIT_WIN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/emit_win.metal");
 
 var emit_kernel_obj: ?mlx.mlx_fast_metal_kernel = null;
 var emit_kernel_build_failed: bool = false;
@@ -6836,7 +6836,7 @@ fn emitWindowsKernel(
 /// column dropped at the write — one threadgroup per head, tree reductions.
 /// exp/reduction-tree drift vs the composed mlx softmax is the sanctioned
 /// sinkhorn-kernel class (continuous path, decode-equivalence arbitrates).
-const SINK_SOFTMAX_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/sink_softmax.metal");
+pub const SINK_SOFTMAX_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/sink_softmax.metal");
 
 var sink_softmax_obj: ?mlx.mlx_fast_metal_kernel = null;
 var sink_softmax_build_failed: bool = false;
@@ -6871,7 +6871,7 @@ var sink_sm_cfg_next: usize = 0;
 /// row softmax → drop the sink, in ONE dispatch between the two attention
 /// GEMMs (the composed chain is 4 strictly-serial dispatches per layer).
 /// Returns probs [H, TK] f32, or null to decline.
-fn sinkSoftmaxKernel(m: *const Dsv4Model, scores0: mlx.mlx_array, sink: mlx.mlx_array, H: usize, TK: usize, scale: f32) !?mlx.mlx_array {
+pub fn sinkSoftmaxKernel(m: *const Dsv4Model, scores0: mlx.mlx_array, sink: mlx.mlx_array, H: usize, TK: usize, scale: f32) !?mlx.mlx_array {
     if (!sinkSoftmaxEnabled() or !mlx.streamIsGpu(m.s)) return null; // metal_kernel is GPU-only
     if (TK == 0 or H == 0 or H > 65535) return null;
     const kernel = sinkSoftmaxObj() orelse return null;
@@ -6931,7 +6931,7 @@ fn sinkSoftmaxKernel(m: *const Dsv4Model, scores0: mlx.mlx_array, sink: mlx.mlx_
     return out;
 }
 
-const DEC_CHAIN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/dec_chain.metal");
+pub const DEC_CHAIN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/dec_chain.metal");
 
 var dec_chain_obj: ?mlx.mlx_fast_metal_kernel = null;
 var dec_chain_build_failed: bool = false;
@@ -6985,7 +6985,7 @@ fn decChainCfg(key: DecChainKey) ?mlx.mlx_fast_metal_kernel_config {
 /// post: 0 = rope only, 1 = fp8 head sim + raw roped tail, 2 = Hadamard+fp4.
 /// Returns null to decline (kill switch, ineligible geometry, build failure)
 /// — the caller keeps the composed chain.
-fn decChainKernel(
+pub fn decChainKernel(
     m: *const Dsv4Model,
     x: mlx.mlx_array,
     H: usize,

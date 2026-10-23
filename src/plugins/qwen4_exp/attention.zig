@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/attention, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns qwen4AttnWith, qwen4AttnProjected.
+//! qwen4_exp's full-attention layer: gated q/k/v projection, the QSA indexer's mask or block picks, and the
+//! attention arm that reads them (dense, gathered, or the fused decode kernel).
 
 const mlx = @import("../../mlx/ffi.zig");
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;

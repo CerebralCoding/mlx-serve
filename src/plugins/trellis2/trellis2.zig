@@ -17,6 +17,11 @@ const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 const sparse = @import("sparse.zig");
+const graph_call = @import("../../sdk/media/graph_call.zig").call;
+const gelu_blk = @import("../../sdk/blocks/mlp/gelu.zig");
+const modulate_blk = @import("../../sdk/blocks/dit/modulate.zig");
+const timestep = @import("../../sdk/blocks/dit/timestep.zig");
+const flow_match = @import("../../sdk/blocks/schedulers/flow_match.zig");
 
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
@@ -104,10 +109,9 @@ fn takeAxis(sc: *Scope, x: A, ids: A, axis: c_int) !A {
 
 // ── Blocks ───────────────────────────────────────────────────────────────────
 
+/// The reference's gelu_approx, its constants in x's dtype and its own √(2/π) spelling.
 fn geluTanh(sc: *Scope, x: A) !A {
-    const x3 = try sc.mul(try sc.mul(x, x), x);
-    const inner = try sc.mulLike(try sc.add(x, try sc.mulLike(x3, 0.044715)), @sqrt(2.0 / std.math.pi));
-    return sc.mul(try sc.mulLike(x, 0.5), try sc.add(try sc.tanh(inner), try sc.scalarLike(x, 1)));
+    return sc.keep(try graph_call(sc.s, gelu_blk.geluTanh, .{ x, mlx.mlx_array_dtype(x), gelu_blk.SQRT_2_PI_LOW }));
 }
 
 fn layerNorm(sc: *Scope, x: A, w: A, b: A, eps: f32) !A {
@@ -264,13 +268,7 @@ pub const Dit = struct {
     /// `[1, 256]` sinusoid of `t` (cos then sin) through the two-layer time MLP.
     fn timeEmbedding(self: *const Dit, sc: *Scope, t: f32) !A {
         var buf: [TIME_FREQS]f32 = undefined;
-        const half = TIME_FREQS / 2;
-        for (0..half) |i| {
-            const freq = @exp(-@as(f32, @floatCast(@log(10000.0))) * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(half)));
-            const arg = t * freq;
-            buf[i] = @cos(arg);
-            buf[half + i] = @sin(arg);
-        }
+        timestep.sinusoid(f32, &buf, t, .cos_first);
         const e = try sc.fromF32(&buf, &.{ 1, TIME_FREQS });
         return self.t_fc2.forward(sc, try sc.silu(try self.t_fc0.forward(sc, e)));
     }
@@ -302,9 +300,8 @@ pub const Dit = struct {
         var parts: [6]A = undefined;
         for (&parts, 0..) |*p, i| p.* = try sc.slice(m, 1, @intCast(i * self.channels), @intCast((i + 1) * self.channels));
         const shift_msa, const scale_msa, const gate_msa, const shift_mlp, const scale_mlp, const gate_mlp = parts;
-        const one = try sc.scalarLike(m, 1);
 
-        var h = try modulate(sc, try layerNorm(sc, x_in, NONE, NONE, LN_EPS), shift_msa, scale_msa, one);
+        var h = try modulate(sc, try layerNorm(sc, x_in, NONE, NONE, LN_EPS), shift_msa, scale_msa);
         const qkv = try sc.reshape(try b.qkv.forward(sc, h), &.{ 1, l, 3, @intCast(self.heads), @intCast(self.head_dim) });
         const q = try sc.astype(try rope.apply(sc, try self.headNorm(sc, try sc.reshape(try sc.slice(qkv, 2, 0, 1), &.{ 1, l, @intCast(self.heads), @intCast(self.head_dim) }), b.self_q_gamma)), self.act);
         const k = try sc.astype(try rope.apply(sc, try self.headNorm(sc, try sc.reshape(try sc.slice(qkv, 2, 1, 2), &.{ 1, l, @intCast(self.heads), @intCast(self.head_dim) }), b.self_k_gamma)), self.act);
@@ -325,7 +322,7 @@ pub const Dit = struct {
         }
         x = try sc.add(x, cross);
 
-        h = try modulate(sc, try layerNorm(sc, x, NONE, NONE, LN_EPS), shift_mlp, scale_mlp, one);
+        h = try modulate(sc, try layerNorm(sc, x, NONE, NONE, LN_EPS), shift_mlp, scale_mlp);
         h = try b.fc2.forward(sc, try geluTanh(sc, try b.fc1.forward(sc, h)));
         _ = c;
         return sc.add(x, try sc.mul(h, gate_mlp));
@@ -368,9 +365,9 @@ pub const Dit = struct {
     }
 };
 
-/// `x * (1 + scale) + shift`, in the blocks' dtype and the reference's order.
-fn modulate(sc: *Scope, x: A, shift: A, scale: A, one: A) !A {
-    return sc.add(try sc.mul(x, try sc.add(one, scale)), shift);
+/// `x * (1 + scale) + shift`, the 1 in the modulation's dtype.
+fn modulate(sc: *Scope, x: A, shift: A, scale: A) !A {
+    return sc.keep(try graph_call(sc.s, modulate_blk.modulate, .{ x, scale, shift, mlx.mlx_array_dtype(scale) }));
 }
 
 pub const OpenedDit = struct {
@@ -607,10 +604,7 @@ pub const TEX_SAMPLER = SamplerCfg{ .steps = 12, .rescale_t = 3.0, .strength = 1
 /// `t_seq[i]` for i in 0..=steps: `linspace(1, 0)` warped by `rescale_t`.
 pub fn timeSchedule(out: []f64, rescale_t: f64) void {
     const steps = out.len - 1;
-    for (out, 0..) |*t, i| {
-        const lin = 1.0 - @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(steps));
-        t.* = rescale_t * lin / (1 + (rescale_t - 1) * lin);
-    }
+    for (out, 0..) |*t, i| t.* = flow_match.timeShift(f64, rescale_t, flow_match.gridToZero(f64, i, steps));
 }
 
 pub fn guidedAt(cfg: SamplerCfg, t: f64) bool {

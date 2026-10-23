@@ -4,10 +4,16 @@
 //! The app edits the file; the server owns applying it. A malformed file is
 //! logged and treated as empty: a settings typo must never stop a load.
 const std = @import("std");
+const env = @import("../../env.zig");
 const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
 const log = @import("../log.zig");
 const mtp_acceptance = @import("../../engines/mlx/spec/mtp_acceptance.zig");
 const generation = @import("../api/generation_settings.zig");
+const engine_pick = @import("engine_pick.zig");
+
+/// What can serve a model; the per-model `engine` setting (Model Settings' engine picker) and each
+/// `/v1/models` row's `engines` use these names. No setting leaves the choice to the server.
+pub const Engine = enum { mlx, ane, ds4, llama };
 
 pub const Override = struct {
     ctx_size: ?u32 = null,
@@ -21,6 +27,8 @@ pub const Override = struct {
     lm_head_mxfp8: ?bool = null,
     /// Serve this model on the Neural Engine (`arch/ane_lm.zig`) instead of the GPU.
     ane: ?bool = null,
+    /// The engine serving the model; outranks `ane` and, on a GGUF, `--engine`.
+    engine: ?Engine = null,
     /// Extra template variables as a JSON object (vLLM/llama.cpp
     /// `chat_template_kwargs`), e.g. `{"preserve_thinking": true}`. Owned.
     chat_template_kwargs: ?[]const u8 = null,
@@ -30,7 +38,25 @@ pub const Override = struct {
 
     pub fn isEmpty(o: Override) bool {
         return o.ctx_size == null and o.kv_quant == null and o.mtp == null and o.mtp_acceptance == null and
-            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.chat_template_kwargs == null and o.drafter == null;
+            o.mtp_greedy_tail == null and o.int8_prefill == null and o.lm_head_mxfp8 == null and o.ane == null and o.engine == null and o.chat_template_kwargs == null and o.drafter == null;
+    }
+
+    /// Whether the model runs on the Neural Engine: the engine setting's choice, else the `ane` switch.
+    pub fn aneChoice(o: Override) ?bool {
+        return switch (o.engine orelse return o.ane) {
+            .ane => true,
+            .mlx => false,
+            .ds4, .llama => o.ane,
+        };
+    }
+
+    /// The embedded engine the setting forces on a GGUF, if it names one.
+    pub fn ggufEngine(o: Override) ?engine_pick.Engine {
+        return switch (o.engine orelse return null) {
+            .ds4 => .ds4,
+            .llama => .llama,
+            .mlx, .ane => null,
+        };
     }
 
     pub fn deinit(o: *Override, alloc: std.mem.Allocator) void {
@@ -165,6 +191,9 @@ fn fromValue(alloc: std.mem.Allocator, v: std.json.Value) Override {
         .bool => |b| o.ane = b,
         else => {},
     };
+    if (obj.get("engine")) |e| if (e == .string) {
+        o.engine = std.meta.stringToEnum(Engine, e.string);
+    };
     if (obj.get("mtp_greedy_tail")) |g| switch (g) {
         .bool => |b| o.mtp_greedy_tail = b,
         else => {},
@@ -219,7 +248,7 @@ pub fn defaultPath(buf: []u8) []const u8 {
 
 /// `~/.mlx-serve/<name>`; "" when it does not fit `buf`.
 pub fn homeFile(buf: []u8, name: []const u8) []const u8 {
-    const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+    const home = std.mem.span(env.get(.HOME) orelse "/tmp");
     return std.fmt.bufPrint(buf, "{s}/.mlx-serve/{s}", .{ home, name }) catch "";
 }
 
@@ -313,6 +342,16 @@ pub const Cache = struct {
     }
 };
 
+/// The embedded engine `model_path`'s setting forces, read without the load log (main.zig's GGUF route).
+pub fn ggufEngineFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) ?engine_pick.Engine {
+    var buf: [std.fs.max_path_bytes]u8 = undefined;
+    var s = load(alloc, io, defaultPath(&buf));
+    defer s.deinit();
+    var o = s.lookup(alloc, model_path);
+    defer o.deinit(alloc);
+    return o.ggufEngine();
+}
+
 /// The one call load sites make: read the default file, look the model up, log
 /// a hit. The caller owns the result (`Override.deinit`).
 pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8) Override {
@@ -329,7 +368,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
             o.drafter = null;
         };
     };
-    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} lm_head_mxfp8={s} ane={s} drafter={s} kwargs={s}\n", .{
+    if (!o.isEmpty()) log.info("[model-settings] {s}: ctx={d} kv={s} mtp={s} accept={s} greedy_tail={s} int8={s} lm_head_mxfp8={s} ane={s} engine={s} drafter={s} kwargs={s}\n", .{
         model_path,
         o.ctx_size orelse 0,
         if (o.kv_quant) |k| k.wireName() else "default",
@@ -339,6 +378,7 @@ pub fn overrideFor(alloc: std.mem.Allocator, io: std.Io, model_path: []const u8)
         if (o.int8_prefill) |b| (if (b) "on" else "off") else "default",
         if (o.lm_head_mxfp8) |b| (if (b) "on" else "off") else "default",
         if (o.ane) |b| (if (b) "on" else "off") else "default",
+        if (o.engine) |e| @tagName(e) else "auto",
         o.drafter orelse "auto",
         o.chat_template_kwargs orelse "none",
     });
@@ -447,6 +487,26 @@ test "model_settings: ane is a boolean, anything else is unset" {
     try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/a").ane);
     try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").ane);
     try std.testing.expectEqual(@as(?bool, null), s.lookup(t, "/m/c").ane);
+}
+
+test "model_settings: engine names an engine; it outranks the ane switch and forces a GGUF's embedded engine" {
+    var s = try parse(std.testing.allocator,
+        \\{"/m/a": {"engine": "ane"}, "/m/b": {"engine": "mlx", "ane": true}, "/m/c": {"engine": "ds4"},
+        \\ "/m/d": {"engine": "llama", "ane": true}, "/m/e": {"engine": "auto"}, "/m/f": {"engine": 1}, "/m/g": {"ane": true}}
+    );
+    defer s.deinit();
+    const t = std.testing.allocator;
+    const a = s.lookup(t, "/m/a");
+    try std.testing.expectEqual(@as(?bool, true), a.aneChoice());
+    try std.testing.expectEqual(@as(?engine_pick.Engine, null), a.ggufEngine());
+    try std.testing.expectEqual(@as(?bool, false), s.lookup(t, "/m/b").aneChoice());
+    try std.testing.expectEqual(@as(?engine_pick.Engine, .ds4), s.lookup(t, "/m/c").ggufEngine());
+    try std.testing.expectEqual(@as(?bool, null), s.lookup(t, "/m/c").aneChoice());
+    try std.testing.expectEqual(@as(?engine_pick.Engine, .llama), s.lookup(t, "/m/d").ggufEngine());
+    try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/d").aneChoice());
+    try std.testing.expect(s.lookup(t, "/m/e").isEmpty());
+    try std.testing.expect(s.lookup(t, "/m/f").isEmpty());
+    try std.testing.expectEqual(@as(?bool, true), s.lookup(t, "/m/g").aneChoice());
 }
 
 test "model_settings: int8_prefill is a boolean, anything else is unset" {

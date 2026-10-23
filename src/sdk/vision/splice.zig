@@ -112,10 +112,10 @@ pub fn spliceVisionRows(h: mlx.mlx_array, token_ids: mlx.mlx_array, vision_emb: 
     defer _ = mlx.mlx_array_free(aligned);
     try mlx.check(mlx.mlx_take(&aligned, source_flat, indices_mod, s));
 
-    // Cast aligned to bf16 to match h
+    // Cast aligned to h's dtype: a mismatch promotes the whole residual (f32 on a Prism pack's f16 stream).
     var aligned_bf = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(aligned_bf);
-    try mlx.check(mlx.mlx_astype(&aligned_bf, aligned, .bfloat16, s));
+    try mlx.check(mlx.mlx_astype(&aligned_bf, aligned, mlx.mlx_array_dtype(h), s));
 
     // input_flat = h.flatten()
     var input_flat = mlx.mlx_array_new();
@@ -164,19 +164,16 @@ test "every generative forward arm splices vision embeddings" {
     // shapes, the token accounting and the encoder log line are all correct,
     // so it reads as a bad IMAGE rather than a missing splice.
     //
-    // The text-only encoder arms are exempt BY NAME: they serve /v1/embeddings, take no
+    // The text-only encoder arm is exempt BY NAME: they serve /v1/embeddings, take no
     // images, and have no image_token_id to splice at. Anything else added to
     // the dispatch is required to splice, so a new arch cannot inherit the hole.
     const src = @embedFile("../../plugins/glm5_next/forward.zig") ++
-        @embedFile("../../engines/mlx/forward/hybrid.zig") ++
         @embedFile("../../engines/mlx/forward/layered.zig") ++
         @embedFile("../../plugins/qwen4_exp/forward.zig") ++
         @embedFile("../../engines/mlx/dispatch.zig") ++
-        @embedFile("../../plugins/bert/forward.zig") ++
         @embedFile("../../engines/mlx/forward/dense.zig") ++
-        @embedFile("../../plugins/gemma3/encoder.zig") ++
-        @embedFile("../../plugins/embedding_gemma2/forward.zig");
-    const exempt = [_][]const u8{ "forwardBertWith", "forwardGemma3EncoderWith" };
+        @embedFile("../../plugins/gemma3/encoder.zig");
+    const exempt = [_][]const u8{"forwardGemma3EncoderWith"};
     const needle = "fn forward";
     var checked: usize = 0;
     var i: usize = 0;
@@ -376,4 +373,25 @@ test "spliceVisionRows: an unset placeholder id (0) never claims token 0" {
     const ptr = mlx.mlx_array_data_float32(f32arr).?;
     try std.testing.expectEqual(@as(f32, 0), ptr[0]); // token 0 untouched
     try std.testing.expectEqual(@as(f32, 50), ptr[4]); // audio row
+}
+
+test "spliceVisionRows: the residual keeps its own dtype (an f16 stream stays f16)" {
+    const s = mlx.mlx_default_gpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    for ([_]mlx.mlx_dtype{ .float16, .bfloat16 }) |dt| {
+        var h_data: [8]f32 = @splat(1);
+        var ve_data: [4]f32 = @splat(50);
+        const ve = mlx.mlx_array_new_data(&ve_data, &[_]c_int{ 1, 1, 4 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(ve);
+        const h32 = mlx.mlx_array_new_data(&h_data, &[_]c_int{ 1, 2, 4 }, 3, .float32);
+        defer _ = mlx.mlx_array_free(h32);
+        var h = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(&h, h32, dt, s));
+        const ids = [_]i32{ 9, 250 };
+        const tid = mlx.mlx_array_new_data(&ids, &[_]c_int{ 1, 2 }, 2, .int32);
+        defer _ = mlx.mlx_array_free(tid);
+        const spliced = try Transformer.spliceVisionRows(h, tid, ve, 250, 0, 0, 0, s);
+        defer _ = mlx.mlx_array_free(spliced);
+        try std.testing.expectEqual(dt, mlx.mlx_array_dtype(spliced));
+    }
 }

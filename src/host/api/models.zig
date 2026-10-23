@@ -16,12 +16,14 @@ const media_mod = @import("../media_jobs/gen.zig");
 const metrics = @import("../status.zig");
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
+const PluginEngine = @import("../media_jobs/plugin/engine.zig").Engine;
 const io_util = @import("../../sdk/util/io_util.zig");
 const lan_mod = @import("../lan/lan.zig");
 const nowSecs = io_util.nowSecs;
 const testing = std.testing;
 const http_server = @import("../http/server.zig");
 const request_model = @import("request_model.zig");
+const row_facts = @import("model_row_facts.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
 const configuredKvQuantFor = @import("../http/server.zig").configuredKvQuantFor;
@@ -59,7 +61,7 @@ fn modelEngineName(has_ds4: bool, has_llama: bool, has_ane: bool, mlx_gguf_serve
     return "mlx";
 }
 
-/// Would lib/mlx-serve-gguf claim this unloaded entry? Answered once per
+/// Would src/sdk/quant/gguf claim this unloaded entry? Answered once per
 /// entry: the header read behind `servablePath` is too slow for a poll.
 fn mlxGgufClaims(io: std.Io, entry: *LoadedModel) bool {
     if (entry.mlx_gguf_claim == null) {
@@ -163,7 +165,7 @@ pub fn loadedSupportsVideo(entry: *const LoadedModel, config: *const model_mod.M
 /// bytes_on_disk only. Returns an allocator-owned string; caller frees.
 /// Called from `handleModels` per registry entry. Registry mutex must be
 /// held by the caller (entry fields are read directly).
-fn renderModelEntry(
+pub fn renderModelEntry(
     allocator: std.mem.Allocator,
     io: std.Io,
     entry: *LoadedModel,
@@ -194,17 +196,14 @@ fn renderModelEntry(
             .has_alignment = config.forced_aligner != null,
             .has_reasoning = has_chat and model_discovery.templateSupportsThinking(chat_config.chat_template),
             .has_embedding = config.hasEmbeddingCapability(),
-            .has_image_engine = entry.image_engine != null,
-            .has_audio_engine = entry.audio_engine != null,
-            .has_music_backend = if (entry.audio_engine) |ae| switch (ae.backend) {
-                .music, .music3, .yue2 => true,
-                else => false,
-            } else false,
-            .has_sound_backend = if (entry.audio_engine) |ae| ae.backend == .sound else false,
-            .has_video_engine = entry.video_engine != null,
-            .has_mesh_engine = entry.mesh_engine != null,
-            .has_decision_engine = entry.decision_engine != null,
-            .has_diarization = entry.diarization_engine != null,
+            .has_image_engine = PluginEngine.serves(entry.media_plugin, media_mod.Modality.image),
+            .has_audio_engine = PluginEngine.serves(entry.media_plugin, media_mod.Modality.audio),
+            .has_music_backend = PluginEngine.servesRoute(entry.media_plugin, "music"),
+            .has_sound_backend = PluginEngine.servesRoute(entry.media_plugin, "sound"),
+            .has_video_engine = PluginEngine.serves(entry.media_plugin, media_mod.Modality.video),
+            .has_mesh_engine = PluginEngine.serves(entry.media_plugin, media_mod.Modality.mesh),
+            .has_decision_engine = PluginEngine.serves(entry.media_plugin, media_mod.Modality.decision),
+            .has_diarization = PluginEngine.serves(entry.media_plugin, media_mod.Modality.diarization),
         });
         defer caps.deinit(allocator);
 
@@ -220,6 +219,8 @@ fn renderModelEntry(
         // registry's arch hint (the pack's real model_type), never the stub
         // config's modality marker ("flux2" for every image backend).
         const arch_label: []const u8 = if (entry.arch_hint.len > 0) entry.arch_hint else config.model_type;
+        const facts = try row_facts.forEntry(allocator, io, entry, arch_label, if (has_chat) ctx_len else null, config.quant_mode == .gguf);
+        defer allocator.free(facts);
         const model_id_json = try jsonEscape(allocator, if (entry.id.len > 0) entry.id else config.model_type);
         defer allocator.free(model_id_json);
         const drafter_loaded = entry.hasDrafter();
@@ -256,7 +257,7 @@ fn renderModelEntry(
         defer allocator.free(embed_limit_str);
 
         return std.fmt.allocPrint(allocator,
-            \\{{"id":{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
+            \\{{"id":{s},"object":"model","created":{d},"owned_by":"mlx-serve","loaded":true,"state":"ready","bytes_resident":{d},"bytes_on_disk":{s},"context_length":{s},"max_model_len":{s},"batched_decode":{s},"capabilities":{s},"input_modalities":{s}{s},"meta":{{"architecture":"{s}","engine":"{s}","vocab_size":{d},"hidden_size":{d},"num_layers":{d},"quantization":{s},"context_length":{s},"model_max_tokens":{d},"embedding_max_length":{s},"is_moe":{s},"drafter_loaded":{s},"drafter_path":{s},"mtp_loaded":{s},"mtp_available":{s},"spec_exact":{s},"kv_quant":"{s}","gen_temperature":{s},"gen_top_p":{s},"gen_top_k":{s}}}}}
         , .{
             model_id_json,
             nowSecs(io),
@@ -271,6 +272,7 @@ fn renderModelEntry(
             if (batchVerdictFor(entry) == .ok) "true" else "false",
             caps.items,
             mods.items,
+            facts,
             arch_label,
             modelEngineName(entry.ds4_engine != null, entry.llama_engine != null, entry.ane != null, entry.config != null and entry.config.?.quant_mode == .gguf, entry.config, entry.path, entry.arch_hint),
             config.vocab_size,
@@ -346,9 +348,9 @@ fn renderModelEntry(
         if (media_modality) |m| {
             // The music backend advertises "music" beside "audio" on the stub
             // too (matches the ready-path readyCapsJson additive rule).
-            if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint).servesMusic())
+            if (m == .audio and media_mod.servesAudioRoute(io, entry.path, entry.arch_hint, .music))
                 break :blk try allocator.dupe(u8, ",\"capabilities\":[\"audio\",\"music\"]");
-            if (m == .audio and media_mod.audioBackendKindForType(entry.arch_hint) == .sound)
+            if (m == .audio and media_mod.servesAudioRoute(io, entry.path, entry.arch_hint, .sound))
                 break :blk try allocator.dupe(u8, ",\"capabilities\":[\"audio\",\"sound\"]");
             break :blk try std.fmt.allocPrint(allocator, ",\"capabilities\":[\"{s}\"]", .{m.capability()});
         }
@@ -382,6 +384,11 @@ fn renderModelEntry(
         break :blk try b.toOwnedSlice(allocator);
     };
     defer allocator.free(caps_part);
+
+    const stub_chat = media_modality == null and !is_encoder_stub and
+        (is_gguf_stub or (sm.found and !sm.has_transcription and !sm.is_aligner and sm.has_chat));
+    const facts = try row_facts.forEntry(allocator, io, entry, entry.arch_hint, if (stub_chat) (if (sm.found) sm.max_position_embeddings else 0) else null, mlxGgufClaims(io, entry));
+    defer allocator.free(facts);
 
     const mods_part: []const u8 = if (sm.found and sm.has_vision and sm.has_video)
         ",\"input_modalities\":[\"text\",\"image\",\"video\"]"
@@ -436,8 +443,8 @@ fn renderModelEntry(
     const id_json = try jsonEscape(allocator, entry.id);
     defer allocator.free(id_json);
     return std.fmt.allocPrint(allocator,
-        \\{{"id":{s},"object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
-    , .{ id_json, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, arch_part, engine_part, dims_part, bytes_on_disk_str });
+        \\{{"id":{s},"object":"model","created":0,"owned_by":"mlx-serve","loaded":false,"state":"{s}","bytes_resident":0,"bytes_on_disk":{s}{s}{s}{s}{s}{s},"meta":{{{s}{s}{s}"bytes_on_disk":{s}}}}}
+    , .{ id_json, state_str, bytes_on_disk_str, err_part, top_ctx_part, caps_part, mods_part, facts, arch_part, engine_part, dims_part, bytes_on_disk_str });
 }
 
 pub fn handleModels(
@@ -1001,6 +1008,49 @@ test "input_modalities renders resident video weights and native unloaded capabi
     try expect_modalities(a, io, entry, &.{ "text", "image", "video" });
 }
 
+test "an unloaded row carries its agent budget, media modality and engines" {
+    const a = testing.allocator;
+    const io = std.Io.Threaded.global_single_threaded.io();
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.createDirPath(io, "chat");
+    try tmp.dir.createDirPath(io, "image");
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat/config.json", .data = "{\"model_type\":\"llama\",\"max_position_embeddings\":24576}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "chat/chat_template.jinja", .data = "{{ messages }}" });
+    try tmp.dir.writeFile(io, .{ .sub_path = "image/config.json", .data = "{\"model_type\":\"flux2\"}" });
+    var root_buf: [512]u8 = undefined;
+    const root = root_buf[0..try tmp.dir.realPath(io, &root_buf)];
+    const chat_path = try std.fs.path.join(a, &.{ root, "chat" });
+    defer a.free(chat_path);
+    const image_path = try std.fs.path.join(a, &.{ root, "image" });
+    defer a.free(image_path);
+    const reg = try model_registry_mod.ModelRegistry.init(a, io, null, 1, 0, null);
+    defer reg.deinit();
+    const chat = try reg.registerStubWithArch("chat", chat_path, 0, "llama");
+    const image = try reg.registerStubWithArch("image", image_path, 0, "flux2");
+
+    const chat_json = try renderModelEntry(a, io, chat);
+    defer a.free(chat_json);
+    const cp = try std.json.parseFromSlice(std.json.Value, a, chat_json, .{});
+    defer cp.deinit();
+    const budget = cp.value.object.get("agent_budget").?.object;
+    try testing.expectEqual(@as(i64, 24576), budget.get("context").?.integer);
+    try testing.expectEqual(@as(i64, 12288), budget.get("output").?.integer);
+    try testing.expectEqual(@as(i64, 6144), budget.get("compaction_reserve").?.integer);
+    try testing.expect(cp.value.object.get("modality") == null);
+    try testing.expectEqualStrings("mlx", cp.value.object.get("engines").?.array.items[0].string);
+
+    const image_json = try renderModelEntry(a, io, image);
+    defer a.free(image_json);
+    const ip = try std.json.parseFromSlice(std.json.Value, a, image_json, .{});
+    defer ip.deinit();
+    try testing.expect(ip.value.object.get("agent_budget") == null);
+    try testing.expectEqualStrings("image", ip.value.object.get("modality").?.string);
+    const engines = ip.value.object.get("engines").?.array.items;
+    try testing.expectEqual(@as(usize, 1), engines.len);
+    try testing.expectEqualStrings("mlx", engines[0].string);
+}
+
 test "RADIO video availability follows loaded embedder weights" {
     var radio: radio_vision.RadioVision = undefined;
     radio.video_w = .{ .ctx = null };
@@ -1106,7 +1156,7 @@ test "modelEngineName: native dsv4 reports mlx, embedded engines report themselv
     try testing.expectEqualStrings("ds4", modelEngineName(true, false, false, false, null, "/m/DeepSeek-V4-Flash.gguf", ""));
     try testing.expectEqualStrings("llama", modelEngineName(false, true, false, false, null, "/m/qwen.gguf", ""));
     try testing.expectEqualStrings("ane", modelEngineName(false, false, true, false, null, "/m/Qwen3.8-27B-MLX-Serve-4bit", "qwen3_5"));
-    // A GGUF on the MLX path (lib/mlx-serve-gguf) is its own engine: the app
+    // A GGUF on the MLX path (src/sdk/quant/gguf) is its own engine: the app
     // reads "gguf" as llama.cpp.
     try testing.expectEqualStrings("mlx-gguf", modelEngineName(false, false, false, true, null, "/m/qwen.gguf", ""));
     // The MLX path's own engines, from a loaded model's config.

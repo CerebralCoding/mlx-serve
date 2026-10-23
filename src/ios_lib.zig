@@ -22,6 +22,7 @@
 //! loop), so call it from a dedicated thread and treat a return as shutdown.
 
 const std = @import("std");
+pub const env = @import("env.zig");
 const builtin = @import("builtin");
 const build_options = @import("build_options");
 
@@ -32,9 +33,9 @@ const build_options = @import("build_options");
 // engine panics (ds4/llama unavailable on iOS) are never reached at runtime
 // anyway; this only governs how an unexpected panic terminates.
 pub const panic = std.debug.simple_panic;
-// pub: lib/mlx-serve-gguf and lib/sushi reach mlx, log and io_util through their host root (`mlx_host`). iOS builds
+// pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) reaches mlx, log and io_util through its host root (`mlx_host`). iOS builds
 // no mlx-stream plugin (src/sdk/weights/streamed/stub.zig refuses its packs), so this root does not carry the plugin's names
-// of plugin_host.zig (sushi_exl3, dsa_nax), and plugin_host_check.zig does not check it; mtp_acceptance is the plugin
+// of plugin_host.zig (exl3, dsa_nax), and plugin_host_check.zig does not check it; mtp_acceptance is the plugin
 // SDK's too (`sdk.acceptance`), kept as main.zig has it, and nothing on iOS reads it.
 pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
@@ -100,7 +101,7 @@ fn run(models_dir: []const u8, host: []const u8, port: u16, ctx_size: u32, max_r
     // can't run MLX's kernels. CPU needs no metallib.
     var metal_avail: bool = false;
     try mlx.check(mlx.mlx_metal_is_available(&metal_avail));
-    const force_cpu = if (std.c.getenv("MLXSERVE_DEVICE")) |d| std.mem.eql(u8, std.mem.sliceTo(d, 0), "cpu") else false;
+    const force_cpu = if (env.get(.MLXSERVE_DEVICE)) |d| std.mem.eql(u8, std.mem.sliceTo(d, 0), "cpu") else false;
     log.info("[ios] Metal GPU available: {}, force_cpu: {}\n", .{ metal_avail, force_cpu });
     if (force_cpu) {
         const cpu_dev = mlx.mlx_device_new_type(.cpu, 0);

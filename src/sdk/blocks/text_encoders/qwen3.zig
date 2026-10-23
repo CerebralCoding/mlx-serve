@@ -31,12 +31,13 @@ pub const Rope = union(enum) {
 pub fn layerForward(parent: *Graph, w: anytype, cfg: Cfg, rope: Rope, x: Array, mask: ?Array) !Array {
     var g = parent.scope();
     defer g.deinit();
+    const b = ops.shape(x)[0];
     const seq = ops.shape(x)[1];
     const xn = try g.rmsNorm(x, w.input_ln, cfg.eps);
     const perm = [_]c_int{ 0, 2, 1, 3 };
-    const qt = try g.transpose(try g.rmsNorm(try g.reshape(try w.q.forward(&g, xn), &.{ 1, seq, cfg.heads, cfg.head_dim }), w.q_norm, cfg.eps), &perm);
-    const kt = try g.transpose(try g.rmsNorm(try g.reshape(try w.k.forward(&g, xn), &.{ 1, seq, cfg.kv_heads, cfg.head_dim }), w.k_norm, cfg.eps), &perm);
-    const vt = try g.transpose(try g.reshape(try w.v.forward(&g, xn), &.{ 1, seq, cfg.kv_heads, cfg.head_dim }), &perm);
+    const qt = try g.transpose(try g.rmsNorm(try g.reshape(try w.q.forward(&g, xn), &.{ b, seq, cfg.heads, cfg.head_dim }), w.q_norm, cfg.eps), &perm);
+    const kt = try g.transpose(try g.rmsNorm(try g.reshape(try w.k.forward(&g, xn), &.{ b, seq, cfg.kv_heads, cfg.head_dim }), w.k_norm, cfg.eps), &perm);
+    const vt = try g.transpose(try g.reshape(try w.v.forward(&g, xn), &.{ b, seq, cfg.kv_heads, cfg.head_dim }), &perm);
     const scale: f32 = 1.0 / std.math.sqrt(@as(f32, @floatFromInt(cfg.head_dim)));
     const m: ops.Mask = if (mask) |mm| .{ .array = mm } else .none;
     const attn = switch (rope) {
@@ -55,7 +56,7 @@ pub fn layerForward(parent: *Graph, w: anytype, cfg: Cfg, rope: Rope, x: Array, 
             m,
         ),
     };
-    const af = try g.reshape(try g.transpose(attn, &perm), &.{ 1, seq, cfg.heads * cfg.head_dim });
+    const af = try g.reshape(try g.transpose(attn, &perm), &.{ b, seq, cfg.heads * cfg.head_dim });
     const h1 = try g.add(x, try w.o.forward(&g, af));
     const hn = try g.rmsNorm(h1, w.post_ln, cfg.eps);
     const gu = try g.mul(try g.silu(try w.gate.forward(&g, hn)), try w.up.forward(&g, hn));

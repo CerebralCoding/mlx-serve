@@ -11,6 +11,7 @@
 # Hermetic counterparts: the unit tests in src/plugins/kev/kev.zig (KEV_TEST_MODEL + KEV_FIXTURES pin token ids and
 # probabilities) and the Kev discovery test in src/host/registry/discovery.zig.
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 
 PORT="${1:-11443}"
 MODEL="${KEV_MODEL:-$HOME/.mlx-serve/models/jaredpalmer/Kev-4B-MLX-Serve-8bit}"
@@ -36,8 +37,7 @@ MODEL_ID="jaredpalmer/Kev-4B"
 
 "$BIN" --serve --port "$PORT" --model-dir "$ROOT" --log-level info > "$LOG" 2>&1 &
 SRV=$!
-for _ in $(seq 1 60); do curl -s -f "localhost:$PORT/health" >/dev/null 2>&1 && break; sleep 1; done
-curl -s -f "localhost:$PORT/health" >/dev/null || { echo "FAIL: server not healthy"; tail -20 "$LOG"; exit 1; }
+srv_wait_health "localhost:$PORT" 60 1 || { echo "FAIL: server not healthy"; tail -20 "$LOG"; exit 1; }
 
 echo "=== discovery ==="
 MODELS="$(curl -s "localhost:$PORT/v1/models")"

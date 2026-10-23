@@ -40,6 +40,7 @@ const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
 const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
 const diffvae = @import("diffvae.zig");
 const diffvae_fwd = @import("diffvae_forward.zig");
+const config_fields = @import("../../sdk/media/config_fields.zig");
 
 const S = mlx.mlx_stream;
 
@@ -115,10 +116,10 @@ pub const LtxConfig = struct {
     }
 };
 
-/// Parse the fields of `config.json` that DIFFER across LTX releases. The
-/// geometry (48 blocks, 32x128 video / 32x64 audio, connector shape) is
-/// identical in 2.3 and 2.5 and stays as struct defaults — a pack that
-/// disagreed about those would need a new loader, not a new number.
+/// Parse the fields of `config.json` that DIFFER across LTX releases, and the
+/// geometry from an optional `transformer` section (diffusers' key names) and
+/// `connector` section: the released packs (48 blocks, 32x128 video / 32x64
+/// audio, 8 connector blocks) omit them and keep the struct defaults.
 pub fn parseLtxConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !LtxConfig {
     var cfg = LtxConfig{};
     var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_bytes, .{}) catch return cfg;
@@ -137,6 +138,12 @@ pub fn parseLtxConfig(allocator: std.mem.Allocator, json_bytes: []const u8) !Ltx
     if (root.get("use_keyframes_abs_pos_embedding")) |v| {
         if (v == .bool) cfg.keyframes_abs_pos = v.bool;
     }
+    try config_fields.fill(LtxConfig, .{
+        .{ "num_layers", "num_layers" },                         .{ "num_attention_heads", "num_heads" },
+        .{ "attention_head_dim", "head_dim" },                   .{ "audio_num_attention_heads", "audio_num_heads" },
+        .{ "audio_attention_head_dim", "audio_head_dim" },
+    }, try config_fields.section(root, "transformer"), &cfg);
+    try config_fields.fill(LtxConfig, .{.{ "num_blocks", "connector_num_blocks" }}, try config_fields.section(root, "connector"), &cfg);
     return cfg;
 }
 
@@ -166,7 +173,7 @@ pub fn loadLtxConfig(io: std.Io, allocator: std.mem.Allocator, model_dir: []cons
 pub const Component = struct {
     map: std.StringHashMap(mlx.mlx_array),
     allocator: std.mem.Allocator,
-    // Runtime LoRA (non-owning; gen.VideoEngine owns the Stack and
+    // Runtime LoRA (non-owning; the engine owns the Stack and
     // re-installs the pointer after every transformer swap). Checked by
     // dQLin only — the DiT projections are the modules video LoRAs target.
     // A Stack may hold several simultaneously-attached adapters; their
@@ -211,11 +218,11 @@ pub const Component = struct {
 };
 
 /// The transformer component: loaded, then its block linears to int8 where the route takes them.
-pub fn loadTransformer(allocator: std.mem.Allocator, path: [:0]const u8, load_s: S, s: S) !Component {
+pub fn loadTransformer(allocator: std.mem.Allocator, path: [:0]const u8, cfg: LtxConfig, load_s: S, s: S) !Component {
     var comp = try loadComponent(allocator, path, load_s);
     errdefer comp.deinit();
     if (w8a8.enabled) {
-        const n = try comp.w8.convert(allocator, &comp.map, .{ .base = "transformer.transformer_blocks.0.attn1.to_q", .in_features = (LtxConfig{}).videoDim() }, s);
+        const n = try comp.w8.convert(allocator, &comp.map, .{ .base = "transformer.transformer_blocks.0.attn1.to_q", .in_features = cfg.videoDim() }, s);
         log.info("[ltx] int8: {d} block linears\n", .{n});
     }
     return comp;
@@ -542,12 +549,14 @@ pub const VaeChoice = struct {
     conv: *const Component,
     diffusion: ?*const Component = null,
     seed: u64 = 0,
+    /// The DiffVAE's tokens per tile; 0 = `diffvae_fwd.tileTokenBudget()`.
+    tile_tokens: u64 = 0,
 
     /// `[1,128,F,H,W]` latent → `[1,3,F',H',W']` pixels in [-1,1]; both arms
     /// return the same shape and range, so callers are decoder-agnostic.
     pub fn decode(self: VaeChoice, alloc: std.mem.Allocator, latent_bcfhw: mlx.mlx_array, s: S) !mlx.mlx_array {
         if (self.diffusion) |d| {
-            return diffvae_fwd.decode(alloc, d, diffvae.production, latent_bcfhw, .{ .seed = self.seed }, s);
+            return diffvae_fwd.decode(alloc, d, diffvae.production, latent_bcfhw, .{ .seed = self.seed, .tile_tokens = self.tile_tokens }, s);
         }
         return vaeDecode(self.conv, latent_bcfhw, s);
     }
@@ -982,20 +991,21 @@ pub const ProjOut = struct {
     }
 };
 
-fn projOne(comp: *const Component, allocator: std.mem.Allocator, stacked: mlx.mlx_array, name: []const u8, dim: u32, s: S) !mlx.mlx_array {
-    const scale: f32 = @sqrt(@as(f32, @floatFromInt(dim)) / 3840.0);
-    const sa = mlx.mlx_array_new_float(scale);
-    defer _ = mlx.mlx_array_free(sa);
-    var scaled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(scaled);
-    try mlx.check(mlx.mlx_multiply(&scaled, stacked, sa, s));
-
+/// `hidden` = the text encoder's width; the output width is the projection's own.
+fn projOne(comp: *const Component, allocator: std.mem.Allocator, stacked: mlx.mlx_array, name: []const u8, hidden: u32, s: S) !mlx.mlx_array {
     const wk = try std.fmt.allocPrint(allocator, "connector.text_embedding_projection.{s}_aggregate_embed.weight", .{name});
     defer allocator.free(wk);
     const bk = try std.fmt.allocPrint(allocator, "connector.text_embedding_projection.{s}_aggregate_embed.bias", .{name});
     defer allocator.free(bk);
     const w = comp.get(wk) orelse return error.MissingConnectorWeight; // [dim, 188160]
     const b = comp.get(bk) orelse return error.MissingConnectorWeight; // [dim]
+    const dim: u32 = @intCast(mlx.getShape(w)[0]);
+    const scale: f32 = @sqrt(@as(f32, @floatFromInt(dim)) / @as(f32, @floatFromInt(hidden)));
+    const sa = mlx.mlx_array_new_float(scale);
+    defer _ = mlx.mlx_array_free(sa);
+    var scaled = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(scaled);
+    try mlx.check(mlx.mlx_multiply(&scaled, stacked, sa, s));
 
     // Transpose W → [188160, dim] and materialize (lazy transpose into matmul is
     // the pinned strided-array trap).
@@ -1014,7 +1024,8 @@ fn projOne(comp: *const Component, allocator: std.mem.Allocator, stacked: mlx.ml
     return out;
 }
 
-/// Run the projection front-half of the connector. `stack` is 49 arrays [1,T,3840].
+/// Run the projection front-half of the connector. `stack` is the encoder's states, 49 arrays [1,T,3840] on the
+/// released packs.
 pub fn connectorProject(comp: *const Component, allocator: std.mem.Allocator, stack: []const mlx.mlx_array, s: S) !ProjOut {
     const eps: f32 = 1e-6;
     const vec = mlx.mlx_vector_array_new();
@@ -1043,13 +1054,14 @@ pub fn connectorProject(comp: *const Component, allocator: std.mem.Allocator, st
     try mlx.check(mlx.mlx_multiply(&normed, enc, rs, s)); // [1,T,3840,49]
 
     const T: c_int = mlx.getShape(enc)[1];
+    const hidden: c_int = mlx.getShape(enc)[2];
     var stacked = mlx.mlx_array_new(); // [1,T,188160]
     defer _ = mlx.mlx_array_free(stacked);
-    try mlx.check(mlx.mlx_reshape(&stacked, normed, &[_]c_int{ 1, T, 188160 }, 3, s));
+    try mlx.check(mlx.mlx_reshape(&stacked, normed, &[_]c_int{ 1, T, hidden * @as(c_int, @intCast(stack.len)) }, 3, s));
 
-    const video = try projOne(comp, allocator, stacked, "video", 4096, s);
+    const video = try projOne(comp, allocator, stacked, "video", @intCast(hidden), s);
     errdefer _ = mlx.mlx_array_free(video);
-    const audio = try projOne(comp, allocator, stacked, "audio", 2048, s);
+    const audio = try projOne(comp, allocator, stacked, "audio", @intCast(hidden), s);
     return .{ .video = video, .audio = audio };
 }
 
@@ -1239,7 +1251,7 @@ fn connectorRope(allocator: std.mem.Allocator, T: u32, dim: u32, head_dim: u32, 
 /// Run one Embeddings1DConnector (8 blocks) on `input` [1,T,dim]. `n_valid` =
 /// number of valid (non-pad) tokens (left-padded → the last n_valid). `prefix` is
 /// e.g. "connector.video_embeddings_connector". Returns [1,T,dim].
-pub fn connectorTransform(comp: *const Component, allocator: std.mem.Allocator, input: mlx.mlx_array, n_valid: u32, dim: u32, head_dim: u32, prefix: []const u8, s: S) !mlx.mlx_array {
+pub fn connectorTransform(comp: *const Component, allocator: std.mem.Allocator, input: mlx.mlx_array, n_valid: u32, dim: u32, head_dim: u32, blocks: u32, prefix: []const u8, s: S) !mlx.mlx_array {
     const T: u32 = @intCast(mlx.getShape(input)[1]);
     const Ti: c_int = @intCast(T);
     const di: c_int = @intCast(dim);
@@ -1298,7 +1310,7 @@ pub fn connectorTransform(comp: *const Component, allocator: std.mem.Allocator, 
     const null_arr = mlx.mlx_array{ .ctx = null };
 
     var blk: u32 = 0;
-    while (blk < 8) : (blk += 1) {
+    while (blk < blocks) : (blk += 1) {
         // ── Attention ──
         const normed = try rmsAF(x, dim, 1e-6, s);
         defer _ = mlx.mlx_array_free(normed);
@@ -1628,12 +1640,13 @@ fn causalPadMask(allocator: std.mem.Allocator, ids: []const i32, pad_id: i32, s:
 /// scale.
 ///
 /// The prompt is LEFT-PADDED, which the standard forward has no notion of, so
-/// the mask rides in on `ForwardCtx.prefill_mask_add`. ONE forward, no
-/// chunking: the term is sized to the whole prompt.
+/// the mask rides in on `ForwardCtx.prefill_mask_add` (legacy parse: the served
+/// path takes no additive prefill mask). ONE forward, no chunking: the term is
+/// sized to the whole prompt.
 ///
 /// Caller owns the returned states and the slice.
 pub fn gemmaCapture4(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) ![]mlx.mlx_array {
-    var config = try model_mod.parseConfig(io, allocator, gemma_dir);
+    var config = try model_mod.parseConfigLegacy(io, allocator, gemma_dir);
     var weights = try model_mod.loadWeights(io, allocator, gemma_dir);
     defer weights.deinit();
     model_mod.resolveWeightPrefix(&config, &weights);
@@ -4186,11 +4199,11 @@ pub const TextEmbeds = struct {
 /// Full text-conditioning path: gemmaCapture (49 states) → connectorProject →
 /// connectorTransform (per modality). `ids` is the left-padded token sequence;
 /// pads are replaced by learnable registers inside connectorTransform.
-pub fn encodeTextLtx(connector: *const Component, io: std.Io, alloc: std.mem.Allocator, version: LtxVersion, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) !TextEmbeds {
+pub fn encodeTextLtx(connector: *const Component, io: std.Io, alloc: std.mem.Allocator, cfg: LtxConfig, gemma_dir: []const u8, ids: []const i32, pad_id: i32, s: S) !TextEmbeds {
     // The connector's aggregate projection is trained against ONE encoder's
     // 49-state stack, so the version picks the encoder — never a probe of
     // what happens to be in `gemma_dir`.
-    const states = switch (version) {
+    const states = switch (cfg.version) {
         .v23 => try gemmaCapture(io, alloc, gemma_dir, ids, pad_id, s),
         .v25 => try gemmaCapture4(io, alloc, gemma_dir, ids, pad_id, s),
     };
@@ -4204,9 +4217,9 @@ pub fn encodeTextLtx(connector: *const Component, io: std.Io, alloc: std.mem.All
     for (ids) |t| {
         if (t != pad_id) n_valid += 1;
     }
-    const video = try connectorTransform(connector, alloc, proj.video, n_valid, 4096, 128, "connector.video_embeddings_connector", s);
+    const video = try connectorTransform(connector, alloc, proj.video, n_valid, cfg.videoDim(), cfg.head_dim, cfg.connector_num_blocks, "connector.video_embeddings_connector", s);
     errdefer _ = mlx.mlx_array_free(video);
-    const audio = try connectorTransform(connector, alloc, proj.audio, n_valid, 2048, 64, "connector.audio_embeddings_connector", s);
+    const audio = try connectorTransform(connector, alloc, proj.audio, n_valid, cfg.audioDim(), cfg.audio_head_dim, cfg.connector_num_blocks, "connector.audio_embeddings_connector", s);
     return .{ .video = video, .audio = audio };
 }
 
@@ -4303,14 +4316,14 @@ pub fn generateVideoFrames(
 
     // ── text embeds (positive; negative only when CFG needs it) ──
     if (progress) |p| p.emit("Encoding prompt", 0, num_steps);
-    var pos = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, pos_ids, pad_id, s);
+    var pos = try encodeTextLtx(connector, io, alloc, cfg, gemma_dir, pos_ids, pad_id, s);
     defer pos.deinit();
     _ = mlx.mlx_array_eval(pos.video);
     _ = mlx.mlx_array_eval(pos.audio);
     var neg: ?TextEmbeds = null;
     defer if (neg) |*n| n.deinit();
     if (vp.needsUncond() or ap.needsUncond()) {
-        neg = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, neg_ids, pad_id, s);
+        neg = try encodeTextLtx(connector, io, alloc, cfg, gemma_dir, neg_ids, pad_id, s);
         _ = mlx.mlx_array_eval(neg.?.video);
         _ = mlx.mlx_array_eval(neg.?.audio);
     }
@@ -4641,14 +4654,14 @@ pub fn generateVideoFramesTwoStage(
 
     // ── text embeds (positive + negative — stage 1 always runs CFG) ──
     if (progress) |p| p.emit("Encoding prompt", 0, total);
-    var pos = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, pos_ids, pad_id, s);
+    var pos = try encodeTextLtx(connector, io, alloc, cfg, gemma_dir, pos_ids, pad_id, s);
     defer pos.deinit();
     _ = mlx.mlx_array_eval(pos.video);
     _ = mlx.mlx_array_eval(pos.audio);
     var neg: ?TextEmbeds = null;
     defer if (neg) |*n| n.deinit();
     if (vp.needsUncond() or ap.needsUncond()) {
-        neg = try encodeTextLtx(connector, io, alloc, cfg.version, gemma_dir, neg_ids, pad_id, s);
+        neg = try encodeTextLtx(connector, io, alloc, cfg, gemma_dir, neg_ids, pad_id, s);
         _ = mlx.mlx_array_eval(neg.?.video);
         _ = mlx.mlx_array_eval(neg.?.audio);
     }
@@ -5367,7 +5380,7 @@ test "ltx connectorTransform reproduces Embeddings1DConnector" {
             const ish = [_]c_int{ 1, @intCast(T), @intCast(dim) };
             const inarr = mlx.mlx_array_new_data(inbuf.ptr, &ish, 3, .float32);
             defer _ = mlx.mlx_array_free(inarr);
-            const out = try connectorTransform(c, a, inarr, nv, dim, hd, prefix, st);
+            const out = try connectorTransform(c, a, inarr, nv, dim, hd, 8, prefix, st);
             defer _ = mlx.mlx_array_free(out);
             var outf = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(outf);
@@ -6303,7 +6316,7 @@ test "ltx DiT encodeTextLtx reproduces PromptEncoder" {
     const ids = try readI32(io, allocator, idp);
     defer allocator.free(ids);
 
-    var emb = try encodeTextLtx(&comp, io, allocator, .v23, gdir, ids, 0, s);
+    var emb = try encodeTextLtx(&comp, io, allocator, .{}, gdir, ids, 0, s);
     defer emb.deinit();
     var vf = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(vf);
@@ -6705,7 +6718,7 @@ test "loadComponent releases every tensor on deinit (phantom-ref leak class)" {
 fn ltxProbe(allocator: std.mem.Allocator, s: S, path: [:0]const u8, resident: *usize) ![2]mlx.mlx_array {
     var before: usize = 0;
     _ = mlx.mlx_get_active_memory(&before);
-    var comp = try loadTransformer(allocator, path, mlx.weightLoadStream(), s);
+    var comp = try loadTransformer(allocator, path, .{}, mlx.weightLoadStream(), s);
     defer comp.deinit();
     const vlat = try w8a8.randn(&.{ 1, 192, 128 }, 1, .bfloat16, s);
     defer _ = mlx.mlx_array_free(vlat);

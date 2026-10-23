@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/qsa/gather, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns qsa_gather_env_cached, qsaGatherEnabled, QSA_GATHER_MIN_KV_DEFAULT, qsa_gather_min_kv_cached, qsaGatherMinKv, QSA_GATHER_MIN_KV_NAX, and 58 more.
+//! QSA prefill attention over the gathered blocks (`gatherQsa256`, the hd-256 kernel and its NAX twin), their
+//! floors, eligibility and transient bills.
 
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
@@ -174,7 +174,7 @@ pub const ATTN_QSA256_KERNEL_HEADER = ATTN256_KERNEL_HEADER ++ kernelSource("plu
 /// RATIO tokens each, INT_MAX past the row's count) followed by its own
 /// incomplete tail — O(budget) per token, never O(kv). Fragment math,
 /// staging and online softmax mirror msv_attn_p256.
-const ATTN_QSA256_KERNEL_SOURCE = kernelSource("plugins/qwen4_exp/kernels/attn_qsa256.metal");
+pub const ATTN_QSA256_KERNEL_SOURCE = kernelSource("plugins/qwen4_exp/kernels/attn_qsa256.metal");
 
 var attn_qsa256_kernel_cached: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -496,6 +496,9 @@ fn qsaNaxRunProbe() bool {
     return true;
 }
 
+pub const QSA_NAX_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_nax.metal");
+pub const QSA_NAX_HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_nax_header.metal");
+
 fn getQsaNaxKernel() !mlx.mlx_fast_metal_kernel {
     if (!verifyQmmNaxAvailable()) return error.NaxUnavailable;
     if (qsa_nax_kernel_cached) |kernel| return kernel;
@@ -509,8 +512,8 @@ fn getQsaNaxKernel() !mlx.mlx_fast_metal_kernel {
         "msv_qsa_nax_precise",
         in_vec,
         out_vec,
-        kernelSource("plugins/qwen4_exp/kernels/qsa_nax.metal"),
-        kernelSource("plugins/qwen4_exp/kernels/qsa_nax_header.metal"),
+        QSA_NAX_SOURCE,
+        QSA_NAX_HEADER,
         false,
         false,
     );

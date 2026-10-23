@@ -4,7 +4,7 @@
 #   scripts/levers.sh [repo-root]
 set -euo pipefail
 cd "${1:-$(dirname "$0")/..}"
-DIRS=(src lib/mlx-stream lib/sushi/src/exl3 lib/mlx-serve-gguf/src)
+DIRS=(src)
 echo "== MLX_SERVE_* names: read sites, mentions, files reading it"
 rows=$({
     grep -rnoE --include='*.zig' '"MLX_SERVE_[A-Z0-9_]+"' "${DIRS[@]}" | sed 's/^/R:/'

@@ -8,7 +8,7 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
-const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
+pub const HEADER = kernelSource("kernels/common/mpp_tensor_ops.metal");
 
 /// Keys per block: the K scale granularity and the attention kernel's step.
 const BK: c_int = 32;
@@ -22,20 +22,20 @@ const NSG: c_int = 4;
 /// adjacent columns as float4s and stores them as char4. CONTIG (MLX made x row-contiguous, < 2^32
 /// elements) loads them as vectors with 32-bit offsets, which per-row Q prep needs to stay at the
 /// bandwidth bound; otherwise scalar reads through x's strides.
-const QUANT_SOURCE = kernelSource("kernels/dit/int8_attn_quant.metal");
+pub const QUANT_SOURCE = kernelSource("kernels/dit/int8_attn_quant.metal");
 
 /// One simdgroup per (kv head, row) of v [1, KV, L, 128], over its per-channel |max| `vm`.
-const VPREP_SOURCE = kernelSource("kernels/dit/int8_attn_vprep.metal");
+pub const VPREP_SOURCE = kernelSource("kernels/dit/int8_attn_vprep.metal");
 
 /// One simdgroup per 16 query rows of one head. Element i of an SM x N tensor-op
 /// destination sits at column cb + (i&3) + 16*((i>>3)&(N/16-1)) and row
 /// rb + 8*slot, slot = ((i>>2)&1) + 2*(i >> (3 + log2(N/16))); S's destination
 /// and P's left operand share that layout, so P never leaves registers.
-const ATTN_SOURCE = kernelSource("kernels/dit/int8_attn.metal");
+pub const ATTN_SOURCE = kernelSource("kernels/dit/int8_attn.metal");
 
 /// Blocks (one simdgroup each) per threadgroup of `QUANT_SOURCE` when CONTIG; the strided arm
 /// keeps one, its long-K prep ran slower in wide threadgroups.
-const QUANT_SG: c_int = 8;
+pub const QUANT_SG: c_int = 8;
 var quant_kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
 var vprep_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var attn_kernel: ?mlx.mlx_fast_metal_kernel = null;

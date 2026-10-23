@@ -4,6 +4,7 @@ const std = @import("std");
 const http_server = @import("server.zig");
 
 const Conn = @import("conn.zig").Conn;
+const isRoute = @import("router.zig").isRoute;
 const queryDecoded = @import("../api/request_model.zig").queryDecoded;
 const pairValue = @import("../api/request_model.zig").pairValue;
 const percentDecoded = @import("../api/request_model.zig").percentDecoded;
@@ -135,7 +136,7 @@ pub fn cookieSafe(v: []const u8) bool {
 
 /// The still-encoded `api_key` of the login form's POST, or null when this is not that POST.
 pub fn loginFormKey(method: []const u8, path: []const u8, content_type: []const u8, body: []const u8) ?[]const u8 {
-    if (!std.mem.eql(u8, method, "POST") or !std.mem.eql(u8, path, "/")) return null;
+    if (!std.mem.eql(u8, method, "POST") or !isRoute(path, "/")) return null;
     if (!std.mem.startsWith(u8, content_type, "application/x-www-form-urlencoded")) return null;
     const v = pairValue(body, '&', "api_key") orelse return null;
     return if (cookieSafe(v)) v else null;
@@ -154,7 +155,7 @@ pub fn sendKeyCookie(stream: *Conn, encoded: []const u8) !void {
 /// A browser opening the page (`GET /` that accepts HTML) without the key gets
 /// the login form: a Basic prompt is easy to miss and never returns once cancelled.
 pub fn wantsLoginPage(method: []const u8, path: []const u8, raw_headers: []const u8) bool {
-    if (!std.mem.eql(u8, method, "GET") or !std.mem.eql(u8, path, "/")) return false;
+    if (!std.mem.eql(u8, method, "GET") or !isRoute(path, "/")) return false;
     const accept = findHeaderValueCI(raw_headers, "accept") orelse return false;
     return std.mem.indexOf(u8, accept, "text/html") != null;
 }

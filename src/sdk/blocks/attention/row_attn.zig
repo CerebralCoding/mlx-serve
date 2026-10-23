@@ -19,9 +19,9 @@ pub const MAX_ROWS = 16;
 // never copied. The window's rows sit at cache rows P .. P + W - 1 (P = L - W);
 // row w is at position P + depth[w] and its keys past P are the window rows
 // path[w][0 .. depth[w]] (a chain: depth w, path 0..w; a tree: its ancestors).
-const PARTIAL = kernelSource("kernels/attention/row_attn_partial.metal");
+pub const PARTIAL = kernelSource("kernels/attention/row_attn_partial.metal");
 
-const MERGE = kernelSource("kernels/attention/row_attn_merge.metal");
+pub const MERGE = kernelSource("kernels/attention/row_attn_merge.metal");
 
 var partial_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var merge_kernel: ?mlx.mlx_fast_metal_kernel = null;

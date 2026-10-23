@@ -7,6 +7,7 @@
 //! and `tokenize` return the full count and write at most `cap` ids (0: nothing to encode or a malformed request).
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const build_options = @import("build_options");
 const abi = @import("../../abi/engine.zig");
 const engine_pick = @import("../../host/registry/engine_pick.zig");
@@ -27,7 +28,7 @@ const bridge = if (build_options.ds4_engine) @import("bridge.zig") else @import(
 pub const table = Adapter(bridge, std.heap.smp_allocator).table;
 
 /// Today's probe: a GGUF whose header routes to ds4 (`engine_pick.preferredEngine`).
-fn probe(model_dir: abi.Str, _: abi.Str, out: *abi.Verdict) callconv(.c) bool {
+pub fn probe(model_dir: abi.Str, _: abi.Str, out: *abi.Verdict) callconv(.c) bool {
     const path = abi.items(u8, model_dir);
     var info = engine_pick.readFromFile(io, std.heap.smp_allocator, path) catch {
         out.* = abi.Verdict.refuse(.unsupported, "not a GGUF file: the ds4 engine opens one .gguf");
@@ -614,7 +615,7 @@ test "ds4 adapter: render maps the transcript onto ds4's template; tokenize and 
 // ── against a real GGUF (`MLX_SERVE_TEST_DS4_GGUF`; skipped without it)
 
 fn realGguf() ?[]const u8 {
-    const raw = std.c.getenv("MLX_SERVE_TEST_DS4_GGUF") orelse return null;
+    const raw = env.get(.MLX_SERVE_TEST_DS4_GGUF) orelse return null;
     const s = std.mem.sliceTo(raw, 0);
     return if (s.len == 0) null else s;
 }

@@ -9,10 +9,12 @@
 //! Transport is the system `curl` (TLS, HTTP/2, proxies for free — the same
 //! choice `cli.zig` made for Hugging Face).
 const std = @import("std");
+const env = @import("../../env.zig");
 const crt = @import("../../sdk/util/crt.zig");
 const os_mutex = @import("../../sdk/util/os_mutex.zig");
 const log = @import("../log.zig");
 const lan = @import("../lan/lan.zig");
+const agent_budget = @import("../launch/budget.zig");
 
 pub const Model = lan.PeerModel;
 pub const freeModels = lan.freePeerModels;
@@ -46,7 +48,7 @@ pub fn processEnv(name: []const u8) ?[]const u8 {
     if (name.len >= buf.len) return null;
     @memcpy(buf[0..name.len], name);
     buf[name.len] = 0;
-    const v = std.c.getenv(buf[0..name.len :0]) orelse return null;
+    const v = env.byName(buf[0..name.len :0].ptr) orelse return null;
     const s = std.mem.span(v);
     return if (s.len == 0) null else s;
 }
@@ -60,7 +62,7 @@ fn validName(name: []const u8) bool {
 /// Parse the config file. Invalid entries are skipped with a warning; a body
 /// that is not a JSON array (or `{"providers":[...]}`) is an error. Disabled
 /// entries are dropped here so nothing downstream asks about `enabled`.
-pub fn parseConfigs(alloc: std.mem.Allocator, body: []const u8, env: EnvLookup) ![]Config {
+pub fn parseConfigs(alloc: std.mem.Allocator, body: []const u8, lookup: EnvLookup) ![]Config {
     var parsed = std.json.parseFromSlice(std.json.Value, alloc, body, .{}) catch return error.BadProvidersJson;
     defer parsed.deinit();
     const list = switch (parsed.value) {
@@ -103,7 +105,7 @@ pub fn parseConfigs(alloc: std.mem.Allocator, body: []const u8, env: EnvLookup) 
         }
         var key: ?[]u8 = null;
         if (o.get("api_key_env")) |ev| if (ev == .string and ev.string.len > 0) {
-            if (env(ev.string)) |v| key = try alloc.dupe(u8, v);
+            if (lookup(ev.string)) |v| key = try alloc.dupe(u8, v);
         };
         if (key == null) if (o.get("api_key")) |kv| if (kv == .string and kv.string.len > 0) {
             key = try alloc.dupe(u8, kv.string);
@@ -150,6 +152,9 @@ fn appendEntry(alloc: std.mem.Allocator, out: *std.ArrayList(Model), id: []const
     try js.write("remote");
     try js.objectField("capabilities");
     try js.write(&[_][]const u8{"chat"});
+    var budget_buf: [256]u8 = undefined;
+    try js.objectField("agent_budget");
+    try js.print("{s}", .{agent_budget.json(&budget_buf, ctx_len orelse 0)});
     if (ctx_len) |n| {
         // Twinned at the top level and under meta like every local row (#188).
         try js.objectField("context_length");
@@ -169,9 +174,8 @@ fn appendEntry(alloc: std.mem.Allocator, out: *std.ArrayList(Model), id: []const
 }
 
 fn contextLengthOf(item: std.json.ObjectMap) ?u64 {
-    for ([_][]const u8{ "context_length", "max_model_len" }) |k| if (item.get(k)) |v| if (v == .integer and v.integer > 0) return @intCast(v.integer);
-    if (item.get("meta")) |m| if (m == .object) if (m.object.get("context_length")) |v| if (v == .integer and v.integer > 0) return @intCast(v.integer);
-    return null;
+    const n = agent_budget.advertisedContext(item);
+    return if (n > 0) n else null;
 }
 
 /// Parse a provider's `/v1/models` body into rows named `<id>@<provider>`.
@@ -820,6 +824,9 @@ test "providers: parseModels suffixes ids, badges the provider, twins context_le
     try t.expect(std.mem.indexOf(u8, rows[1].entry_json, "\"max_model_len\":200000") != null);
     try t.expect(std.mem.indexOf(u8, rows[1].entry_json, "\"meta\":{\"context_length\":200000}") != null);
     try t.expect(std.mem.indexOf(u8, rows[2].entry_json, "\"context_length\":94000") != null);
+    // The agent CLIs' budget rides each row like a local one's: the fallback where no context is known.
+    try t.expect(std.mem.indexOf(u8, rows[0].entry_json, "\"agent_budget\":{\"context\":32768,\"output\":8192,\"compaction_reserve\":8192,") != null);
+    try t.expect(std.mem.indexOf(u8, rows[1].entry_json, "\"agent_budget\":{\"context\":200000,\"output\":65536,\"compaction_reserve\":20000,\"too_small_for\":{}}") != null);
     try t.expectError(error.BadModelsJson, parseModels(a, "{\"error\":\"nope\"}", "x"));
     try t.expectError(error.BadModelsJson, parseModels(a, "<html>", "x"));
 }
@@ -957,7 +964,7 @@ test "providers: lookup / entryFor / appendEntries key on the @suffix; declared 
     defer buf.deinit(a);
     try buf.appendSlice(a, "{\"id\":\"local\"}");
     try p.appendEntries(a, &buf);
-    try t.expectEqualStrings("{\"id\":\"local\"},{\"id\":\"m1@box\",\"object\":\"model\",\"owned_by\":\"box\",\"provider\":\"box\",\"loaded\":false,\"state\":\"remote\",\"capabilities\":[\"chat\"]}", buf.items);
+    try t.expectEqualStrings("{\"id\":\"local\"},{\"id\":\"m1@box\",\"object\":\"model\",\"owned_by\":\"box\",\"provider\":\"box\",\"loaded\":false,\"state\":\"remote\",\"capabilities\":[\"chat\"],\"agent_budget\":{\"context\":32768,\"output\":8192,\"compaction_reserve\":8192,\"too_small_for\":{\"claude\":65536}}}", buf.items);
 
     const st = try p.statusJson(a);
     defer a.free(st);

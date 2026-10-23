@@ -2,6 +2,7 @@
 //! Owns SingleVerifyFeature, single_verify_test_features, mtp_verify_shared_rows_calls, mtp_verify_shared_gate_rows_calls, mtp_verify_gdn_rows_calls, mtp_verify_gdn_output_calls, and 36 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mtp_mod = @import("../../spec/mtp/mtp.zig");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -119,7 +120,7 @@ var verify_arch_read = false;
 pub var verify_group_rows: usize = 0;
 
 // MLX affine qmv-fast reduction, with one 3-bit weight read serving two rows.
-const MTP_COARSE_PAIRS_SOURCE = kernelSource("kernels/linear/mtp_coarse_pairs.metal");
+pub const MTP_COARSE_PAIRS_SOURCE = kernelSource("kernels/linear/mtp_coarse_pairs.metal");
 var mtp_coarse_pairs_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var mtp_coarse_pairs_cfgs = QsaCfgCache(c_int, 1){};
 
@@ -209,12 +210,12 @@ pub fn verifySharedHardware() bool {
 }
 
 // Same subchunk and shuffle reduction as Apple's MLX qmv_wide_impl (MIT).
-const VERIFY_WIDE_SOURCE = kernelSource("kernels/linear/verify_wide.metal");
+pub const VERIFY_WIDE_SOURCE = kernelSource("kernels/linear/verify_wide.metal");
 var verify_wide_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const VerifyWideKey = struct { m: c_int, n: c_int, k: c_int, nv: c_int };
 var verify_wide_configs = QsaCfgCache(VerifyWideKey, 1){};
 
-fn verifyWideProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, nv: c_int) !?mlx.mlx_array {
+pub fn verifyWideProjection(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, nv: c_int) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s) or !verifySharedHardware() or (nv != 4 and nv != 6 and nv != 8 and nv != 12)) return null;
     if (x.ctx == null or w.ctx == null or sc.ctx == null or bi.ctx == null) return null;
     if (mlx.mlx_array_dtype(x) != .bfloat16 or mlx.mlx_array_dtype(w) != .uint32 or mlx.mlx_array_dtype(sc) != .bfloat16 or mlx.mlx_array_dtype(bi) != .bfloat16) return null;
@@ -558,7 +559,7 @@ test "verify vocabulary projections preserve solo logits across request widths (
     if (mlx.noGpuBackend() or !verifySharedHardware()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0x5A4E);
-    const path = std.c.getenv("MTP_LMHEAD_TEST_FILE") orelse return error.SkipZigTest;
+    const path = env.get(.MTP_LMHEAD_TEST_FILE) orelse return error.SkipZigTest;
     var weights = try model_mod.loadWeightsSingleFile(testing.allocator, std.mem.span(path));
     defer weights.deinit();
     const w = weights.get("language_model.lm_head.weight") orelse return error.MissingLmHead;
@@ -651,7 +652,7 @@ test "the wide dense verify tile preserves the stock QMV reduction" {
 }
 
 test "MTP coarse pairs preserve row-kernel logits (MTP_LMHEAD_TEST_FILE)" {
-    const path = std.c.getenv("MTP_LMHEAD_TEST_FILE") orelse return error.SkipZigTest;
+    const path = env.get(.MTP_LMHEAD_TEST_FILE) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend() or !verifySharedHardware()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var weights = try model_mod.loadWeightsSingleFile(testing.allocator, std.mem.span(path));

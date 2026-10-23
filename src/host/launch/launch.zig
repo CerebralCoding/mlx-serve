@@ -11,33 +11,21 @@
 //! Flow: probe the server; if it's down, start the MLX Core app (`open -g -a`)
 //! and wait — no app installed means instructions, not a mystery. Then read
 //! `/v1/models`, derive each model's budget from its ADVERTISED context
-//! (AgentBudget's formula: output = clamp(ctx/2, 1024, 65536) — never a
+//! (`budget.zig`, the same numbers the rows' `agent_budget` serves — never a
 //! hardcoded window), write the agent's config, and exec it through a login
 //! shell (`loginShell`) so the user's PATH (nvm, Homebrew, ~/.local/bin) resolves.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const log = @import("../log.zig");
 const opencode2_plugin = @import("opencode2_plugin");
 const agent_skills = @import("agent_skills");
 
-pub const Budget = struct { context: u64, output: u64 };
-
-/// Mirrors Swift `AgentBudget.fallback` — used when the server advertises no
-/// context (older build, unloaded stub with no readable config).
-pub const FALLBACK_BUDGET = Budget{ .context = 32768, .output = 8192 };
-
-/// Mirrors Swift `AgentBudget.forServerContext`.
-pub fn budgetForContext(ctx: u64) Budget {
-    if (ctx == 0) return FALLBACK_BUDGET;
-    return .{ .context = ctx, .output = @min(65536, @max(1024, ctx / 2)) };
-}
-
-/// Room an agent keeps free before compacting, and what it keeps after: a
-/// quarter of the window, capped where pi's and opencode2's own 20000-token
-/// defaults (sized for 200k windows) take over.
-pub fn compactionReserve(ctx: u64) u64 {
-    return @min(20000, @max(1024, ctx / 4));
-}
+const budget_mod = @import("budget.zig");
+pub const Budget = budget_mod.Budget;
+pub const FALLBACK_BUDGET = budget_mod.FALLBACK_BUDGET;
+pub const budgetForContext = budget_mod.budgetForContext;
+pub const compactionReserve = budget_mod.compactionReserve;
 
 /// One chat-capable /v1/models row as declared to an agent CLI.
 pub const Entry = struct {
@@ -619,9 +607,8 @@ pub fn loginShellFor(shell_env: ?[]const u8, macos: bool, has_bash: bool) []cons
 }
 
 fn loginShell() []const u8 {
-    const env: ?[]const u8 = if (std.c.getenv("SHELL")) |p| std.mem.span(p) else null;
     const has_bash = std.c.access("/bin/bash", std.c.X_OK) == 0 or std.c.access("/usr/bin/bash", std.c.X_OK) == 0;
-    return loginShellFor(env, @import("builtin").os.tag == .macos, has_bash);
+    return loginShellFor(env.span(.SHELL), @import("builtin").os.tag == .macos, has_bash);
 }
 
 /// Run one command through the same login shell the real launch execs
@@ -729,23 +716,16 @@ fn appendModelValue(out: *std.ArrayList(u8), allocator: std.mem.Allocator, arg: 
     return out.appendSlice(allocator, arg);
 }
 
-/// The script body run through `<loginShell()> -l -c` (login shell = the user's
-/// real PATH). Configs are written by `writeConfigs` BEFORE this runs; the
-/// script only exports env and execs the agent — same split as the app's
-/// prepareConfig / scriptBody.
-/// Below this the agent's own fixed prompt leaves every turn compacting or
-/// truncated: Claude Code sends 40-70k before the first word (tool + MCP
-/// schemas, skills catalogue), opencode ~8k, pi ~2k.
 pub fn contextFloor(kind: AgentKind) u64 {
-    return switch (kind) {
-        .claude => 65536,
-        .opencode, .opencode2 => 32768,
-        else => 16384,
-    };
+    return budget_mod.contextFloor(@tagName(kind));
 }
 
 pub const OpenCodeLaunch = struct { config: []const u8, bin: []const u8 };
 
+/// The script body run through `<loginShell()> -l -c` (login shell = the user's
+/// real PATH). Configs are written by `writeConfigs` BEFORE this runs; the
+/// script only exports env and execs the agent — same split as the app's
+/// prepareConfig / scriptBody.
 pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []const u8, model: []const u8, budget: Budget, opencode_launch: ?OpenCodeLaunch, extras: []const []const u8) ![]u8 {
     var out = std.ArrayList(u8).empty;
     errdefer out.deinit(allocator);
@@ -896,7 +876,7 @@ pub fn scriptFor(allocator: std.mem.Allocator, kind: AgentKind, base_url: []cons
 // ── Server discovery / model pick ───────────────────────────────────────
 
 fn homeDir() []const u8 {
-    return std.mem.span(std.c.getenv("HOME") orelse return "/tmp");
+    return std.mem.span(env.get(.HOME) orelse return "/tmp");
 }
 
 fn curlGet(allocator: std.mem.Allocator, io: std.Io, url: []const u8) ![]u8 {
@@ -1047,7 +1027,7 @@ pub fn parseChatEntries(allocator: std.mem.Allocator, body: []const u8) !Models 
 // ── Config writes ───────────────────────────────────────────────────────
 
 fn userOpencodeCliPath(allocator: std.mem.Allocator) ![]u8 {
-    if (std.c.getenv("XDG_CONFIG_HOME")) |xdg| {
+    if (env.get(.XDG_CONFIG_HOME)) |xdg| {
         const dir = std.mem.span(xdg);
         if (dir.len > 0) return std.fmt.allocPrint(allocator, "{s}/opencode/cli.json", .{dir});
     }
@@ -1498,17 +1478,6 @@ pub fn cmdLaunch(allocator: std.mem.Allocator, io: std.Io, args: []const []const
 
 const t = std.testing;
 
-test "budgetForContext mirrors AgentBudget: ctx/2 clamped to [1024, 65536], 0 = fallback" {
-    // Thinking shares the response cap: a 24k window at ctx/4 gave pi 6144,
-    // which one xhigh design turn on Qwen3.8 spent entirely on thinking.
-    try t.expectEqual(FALLBACK_BUDGET, budgetForContext(0));
-    try t.expectEqual(Budget{ .context = 4096, .output = 2048 }, budgetForContext(4096));
-    try t.expectEqual(Budget{ .context = 2048, .output = 1024 }, budgetForContext(2048));
-    try t.expectEqual(Budget{ .context = 24576, .output = 12288 }, budgetForContext(24576));
-    try t.expectEqual(Budget{ .context = 90112, .output = 45056 }, budgetForContext(90112));
-    try t.expectEqual(Budget{ .context = 1048576, .output = 65536 }, budgetForContext(1048576));
-}
-
 test "omp models.yml: static per-model entries, no discovery, thinking level as reasoning_effort" {
     const entries = [_]Entry{
         .{ .id = "m1", .budget = .{ .context = 4096, .output = 1024 }, .vision = false, .loaded = true },
@@ -1608,16 +1577,6 @@ test "pi models.json sends the thinking level as reasoning_effort, off as none" 
     // pi offers xhigh/max only when the map names them, else clamps max to high.
     try t.expectEqualStrings("xhigh", levels.get("xhigh").?.string);
     try t.expectEqualStrings("max", levels.get("max").?.string);
-}
-
-test "compactionReserve: a quarter of the window, capped where the agents' own defaults take over" {
-    // pi keeps 20000 recent tokens and opencode2 reserves a 20000 buffer by
-    // default; both assume a 200k window. A 24k window compacted before its
-    // first reply (opencode2) or never (pi).
-    try t.expectEqual(@as(u64, 6144), compactionReserve(24576));
-    try t.expectEqual(@as(u64, 2048), compactionReserve(8192));
-    try t.expectEqual(@as(u64, 1024), compactionReserve(2048));
-    try t.expectEqual(@as(u64, 20000), compactionReserve(262144));
 }
 
 test "pi settings.json merge scales compaction to the window and keeps the rest" {

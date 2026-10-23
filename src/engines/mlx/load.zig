@@ -1,6 +1,7 @@
 //! MLX model load on the inference thread.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
@@ -21,6 +22,9 @@ const log = @import("../../host/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const status = @import("../../host/status.zig");
 const Transformer = transformer_mod.Transformer;
+const plugin_driver = @import("plugin/driver.zig");
+const distributed = @import("cluster/distributed.zig");
+const plugin_head = @import("plugin/head.zig");
 const DrafterModel = drafter_mod.DrafterModel;
 const dflash_mod = @import("spec/dflash/dflash.zig");
 const round_cost_mod = @import("spec/round_cost.zig");
@@ -187,15 +191,25 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Weights — first mlx call. Binds the stream on this thread.
     const weights_ptr = try sch.allocator.create(Weights);
     errdefer sch.allocator.destroy(weights_ptr);
-    weights_ptr.* = try model_mod.loadModelWeights(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision);
+    // A served plugin reads the pack's tensors itself (`plugin/driver.zig`): the entry's map holds only the vision
+    // tower, for the encoder below.
+    if (params.config.plugin != null) _ = plugin_driver.declinePlanned(sch.allocator, params.config, (try distributed.planFor(params.model_dir, params.config)) != null);
+    _ = plugin_driver.declineLossy(sch.allocator, params.config);
+    const served = params.config.plugin != null;
+    weights_ptr.* = if (served) Weights.init(sch.allocator) else try model_mod.loadModelWeights(sch.io, sch.allocator, params.model_dir, params.config, params.load_vision);
     errdefer weights_ptr.deinit();
-    model_mod.resolveWeightPrefix(params.config, weights_ptr);
-    try model_mod.narrowHadamardPackTables(params.config, weights_ptr, mlx.gpuStream());
+    if (!served) {
+        model_mod.resolveWeightPrefix(params.config, weights_ptr);
+        try model_mod.narrowHadamardPackTables(params.config, weights_ptr, mlx.gpuStream());
+    }
 
     // Transformer — owns the bulk of the GPU memory.
     const xfm_ptr = try sch.allocator.create(Transformer);
     errdefer sch.allocator.destroy(xfm_ptr);
-    xfm_ptr.* = try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
+    xfm_ptr.* = if (served)
+        try plugin_driver.loadWith(sch.io, sch.allocator, params.config, params.model_dir, mlx.gpuStream(), if (params.load_vision) weights_ptr else null)
+    else
+        try Transformer.init(sch.io, sch.allocator, params.config.*, weights_ptr);
     errdefer xfm_ptr.deinit();
 
     // Reserved-token suppression mask (never sample `<|fim_hole|>`-class
@@ -218,7 +232,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         try xfm_ptr.cache.reinit(params.config.num_hidden_layers, kv_quant_config);
     }
     Transformer.mtp_head_kv_quant_flag = params.mtp_head_kv_quant;
-    try xfm_ptr.qwen4MtpApplyKvQuant(kv_quant_config);
+    try xfm_ptr.qwen4Host().qwen4MtpApplyKvQuant(kv_quant_config);
 
     // Wire model weights into GPU memory (prevents paging, matches mlx-lm).
     // Policy in mlx.applyWiredPolicy; re-applied in runLoadRequest /
@@ -230,8 +244,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // stream — that's exactly the point of doing them here. Skipped entirely
     // when there's no GPU backend (iOS Simulator's CPU-only MLX): mlx_compile
     // is Metal kernel fusion and requests a GPU stream that doesn't exist; the
-    // runtime falls back to the uncompiled paths when compiled_* stays null.
-    if (!mlx.noGpuBackend()) {
+    // runtime falls back to the uncompiled paths when compiled_* stays null. A served shell forwards through its
+    // plugin, which compiles its own; nothing on the shell reads these.
+    if (!mlx.noGpuBackend() and !served) {
         if (params.config.hidden_act == .gelu_approx) {
             xfm_ptr.compileGelu();
             xfm_ptr.compileGeglu();
@@ -261,8 +276,8 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // per unique input shape, which thrashes if the prefill loop sees
     // many different chunk sizes. Tied to byte-equivalence pin in
     // tests/test_phase2_forward_equivalence.sh.
-    if (std.c.getenv("MLX_SERVE_COMPILE_FORWARD") != null) {
-        const raw = std.c.getenv("MLX_SERVE_COMPILE_FORWARD").?;
+    if (env.get(.MLX_SERVE_COMPILE_FORWARD) != null) {
+        const raw = env.get(.MLX_SERVE_COMPILE_FORWARD).?;
         const slice = std.mem.sliceTo(raw, 0);
         if (std.mem.eql(u8, slice, "1")) {
             xfm_ptr.compileForward();
@@ -332,9 +347,14 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         d.deinit();
         sch.allocator.destroy(d);
     };
-    const drafter_dir: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
+    const drafter_found: []const u8 = chosen_drafter orelse in_dir_drafter orelse "";
+    // A served model without the trunk's table and head (or layer capture) serves without its drafter.
+    const drafter_dir: []const u8 = if (served and drafter_found.len > 0 and !xfm_ptr.plugin.?.drafters) blk: {
+        log.warn("[plugin] {s}: the drafter at {s} needs the plugin's trunk_weight and layer capture: served without it\n", .{ xfm_ptr.plugin.?.table.name.slice(), drafter_found });
+        break :blk "";
+    } else drafter_found;
     if (drafter_dir.len > 0 and dflash_mod.probeIsDflash(sch.io, sch.allocator, drafter_dir)) {
-        const env_off = if (std.c.getenv("MLX_SERVE_DFLASH")) |v| v[0] == '0' else false;
+        const env_off = if (env.get(.MLX_SERVE_DFLASH)) |v| v[0] == '0' else false;
         if (env_off) {
             log.info("[dflash] sidecar at {s} skipped (MLX_SERVE_DFLASH=0)\n", .{drafter_dir});
         } else {
@@ -452,7 +472,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // the whole decode LOOP, so this is the only way to say how much of a
     // token is the model and how much is everything else. Resets the KV cache
     // afterwards so the probe cannot pollute real requests.
-    if (std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH")) |raw| {
+    if (env.get(.MLX_SERVE_DECODE_FWD_UBENCH)) |raw| {
         const n = std.fmt.parseInt(usize, std.mem.sliceTo(raw, 0), 10) catch 0;
         if (n > 0) {
             const io_u = @import("../../sdk/util/io_util.zig");
@@ -463,11 +483,11 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // MLX_SERVE_DECODE_FWD_UBENCH_KV=<tokens>: prefill that many
             // tokens first so the meter runs at a real context length.
             const rows: usize = blk: {
-                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_S") orelse break :blk 1;
+                const r = env.get(.MLX_SERVE_DECODE_FWD_UBENCH_S) orelse break :blk 1;
                 break :blk @max(1, std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 1);
             };
             const kv_pre: usize = blk: {
-                const r = std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_KV") orelse break :blk 0;
+                const r = env.get(.MLX_SERVE_DECODE_FWD_UBENCH_KV) orelse break :blk 0;
                 break :blk std.fmt.parseInt(usize, std.mem.sliceTo(r, 0), 10) catch 0;
             };
             const tok_slice = try sch.allocator.alloc(i32, @min(rows, 4096));
@@ -502,7 +522,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             for (tree_parents, 0..) |p, i| tree_depth[i] = if (p < 0) 0 else tree_depth[@intCast(p)] + 1;
             const spec_tree = generate_mod.Generator.specTreeFor(&tree_parents, &tree_depth, 8);
             defer spec_tree.deinit();
-            if (rows == 16 and std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH_TREE") != null) ctx.tree = &spec_tree;
+            if (rows == 16 and env.get(.MLX_SERVE_DECODE_FWD_UBENCH_TREE) != null) ctx.tree = &spec_tree;
             // Prefill widths: every forward starts from an empty cache (else each
             // one attends over the previous ones' rows) and skips the lm_head,
             // which a real intermediate chunk never evaluates.
@@ -520,7 +540,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
             // DIAGNOSTIC (MLX_SERVE_DECODE_GRAPH_DUMP=<path>): print the lazy
             // graph of ONE forward (every primitive with its shape) before it
             // is evaluated, to map which ops a decode step dispatches.
-            if (std.c.getenv("MLX_SERVE_DECODE_GRAPH_DUMP")) |path| {
+            if (env.get(.MLX_SERVE_DECODE_GRAPH_DUMP)) |path| {
                 const ti = mlx.mlx_array_new_data(tok, &tsh, 2, .int32);
                 defer _ = mlx.mlx_array_free(ti);
                 if (xfm_ptr.forwardWith(&ctx, ti)) |lg| {
@@ -623,7 +643,12 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // MiMo's heads and GLM's layer are in-checkpoint blocks of their own shape, read from the trunk's weights.
     var mimo_head: ?*mimo_mtp.Head = null;
     var glm_head: ?*glm_mtp.Head = null;
-    if (mtp_enabled and params.config.isMimo()) {
+    // A served model's head is its plugin's (`SpecHooks.head`), never a legacy arm reading the shell's config.
+    var plugin_mtp: ?*plugin_head.Head = null;
+    if (served) {
+        if (mtp_enabled) plugin_mtp = plugin_head.load(sch.io, sch.allocator, xfm_ptr, params.model_dir);
+        if (plugin_mtp) |h| mtp_cost_profile = h.profile;
+    } else if (mtp_enabled and params.config.isMimo()) {
         mimo_head = loadMimoHead(sch.allocator, params.config, weights_ptr, xfm_ptr) catch |err| blk: {
             log.warn("MiMo MTP heads failed to load ({s}) — MTP off.\n", .{@errorName(err)});
             break :blk null;
@@ -685,6 +710,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         h.deinit();
         sch.allocator.destroy(h);
     };
+    errdefer if (plugin_mtp) |h| plugin_head.destroy(h, sch.allocator);
 
     // The qwen4_exp in-checkpoint head's twin of the sidecar's own coarse
     // rerank build (inside `bind`, above): a `requantizeRows` of the whole
@@ -694,7 +720,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // Gated exactly like `entry.mtp`'s `.qwen4` arm below: `--no-mtp` never
     // drafts, so it never pays. One-shot, so the draft path's ask stays a
     // pure read; if this ever does not run, that ask still builds.
-    if (mtp_ptr == null and mtp_enabled) _ = xfm_ptr.qwen4BuildDraftRerank();
+    if (mtp_ptr == null and mtp_enabled) _ = xfm_ptr.qwen4Host().qwen4BuildDraftRerank();
 
     // ANE prefill-MLP offload (`--ane-prefill`, perf-plan-aug-17 P5): built
     // HERE because the mlx dequant must run on the inference thread (sole
@@ -702,7 +728,7 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     // pin (idempotent — the later pinAutoContext keeps this value), so the
     // compiled fixed-shape tile matches the width the forward will run.
     if (params.ane_prefill) {
-        const ane_force: ?[]const u8 = if (std.c.getenv("MLX_SERVE_ANE_FORCE")) |p| std.mem.span(p) else null;
+        const ane_force: ?[]const u8 = env.span(.MLX_SERVE_ANE_FORCE);
         if (!ane_mod.anePrefillAllowed(transformer_mod.verifyQmmNaxAvailable(), ane_force)) {
             // ANE prefill is M4-and-below: on NAX machines it measured a
             // loss (M5 Max, PR #223). `/props` ane stays absent, as off.
@@ -750,9 +776,9 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         };
         const warmup_ns: u64 = @intCast(warmup_start.untilNow(sch.io, .awake).nanoseconds);
         log.info("Warmup complete ({d} ms).\n", .{warmup_ns / std.time.ns_per_ms});
-        if (mtp_enabled and xfm_ptr.qwen4_mtp != null) {
+        if (mtp_enabled and xfm_ptr.qwen4Host().qwen4_mtp != null) {
             const cap = generate_mod.Generator.resolveMtpDepthCapForProfile(params.mtp_depth, mtp_cost_profile);
-            xfm_ptr.warmupSpecVerify(cap, params.kv_quant_config) catch |err| {
+            xfm_ptr.qwen4Host().warmupSpecVerify(cap, params.kv_quant_config) catch |err| {
                 log.warn("[spec-warmup] failed ({s}); the first round at each width pays its kernel compile inside the round.\n", .{@errorName(err)});
             };
         }
@@ -783,8 +809,10 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         generate_mod.MtpHeadRef{ .mimo = h }
     else if (glm_head) |h|
         generate_mod.MtpHeadRef{ .glm = h }
-    else if (mtp_enabled and xfm_ptr.qwen4_mtp != null)
-        generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr }
+    else if (plugin_mtp) |h|
+        generate_mod.MtpHeadRef{ .plugin = h }
+    else if (mtp_enabled and xfm_ptr.qwen4Host().qwen4_mtp != null)
+        generate_mod.MtpHeadRef{ .qwen4 = xfm_ptr.qwen4Host() }
     else
         null;
     // Resolve the auto (0) cap here so every downstream reader of

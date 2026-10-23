@@ -47,7 +47,7 @@ fn runBatchedDecodeTickInner(sch: *Scheduler, active: []*Slot) !void {
         for (active) |s| std.debug.assert(s.model.transformer.? == xfm_ptr);
     }
 
-    const observe_plain = Planner.enabled() and xfm_ptr.qwen4 != null and N <= Planner.MAX_ROWS;
+    const observe_plain = Planner.enabled() and xfm_ptr.qwen4Host().qwen4 != null and N <= Planner.MAX_ROWS;
     var price_watch = io_util.Stopwatch.init(active[0].io);
     var price_key: group_cost_mod.GroupShape = .{};
     var price_clean = observe_plain;

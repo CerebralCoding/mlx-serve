@@ -1,14 +1,12 @@
 //! Prefill chunking: chunk width, tail merge, SSM checkpoint cadence, vision chunking and allocator-cache clears.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const transformer_mod = @import("../transformer.zig");
 const model_mod = @import("../model.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
 const testing = std.testing;
 const generate_mod = @import("../generate.zig");
 const WIDE_PREFILL_CHUNK = @import("../generate.zig").WIDE_PREFILL_CHUNK;
-const readEnvUsize = @import("../env_generate.zig").readEnvUsize;
-const setenv = @import("../spec/dspark.zig").setenv;
-const unsetenv = @import("../spec/dspark.zig").unsetenv;
 
 
 /// `--prefill-chunk` for an embedded engine's u32 chunk (ds4): 0 = the engine's default.
@@ -24,7 +22,7 @@ pub fn mtpGreedyTailFor(override: ?bool) bool {
 
 /// The width `MLX_SERVE_PREFILL_CHUNK` asked for, or 0. A pinned width also turns the per-chunk adaptive width off.
 pub fn envPrefillChunk() usize {
-    return readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
+    return env.int(.MLX_SERVE_PREFILL_CHUNK, usize, 0);
 }
 
 /// Per-prefill state for the adaptive width; lives on `runPrefill`'s stack. The policy is
@@ -167,7 +165,7 @@ pub fn boundedPrefillChunk(base_chunk: usize, score_head_dim: u32, n_heads: u32,
 /// (checkAttentionMemory) models the SAME chunk the prefill will run with —
 /// the guard and the real prefill must not drift.
 pub fn effectivePrefillChunk(head_dim: u32, n_heads: u32, total_ctx: usize, sliding_band_arch: bool, is_moe: bool, long_ctx_gated: bool, pinned_chunk: usize) usize {
-    const env_chunk = readEnvUsize("MLX_SERVE_PREFILL_CHUNK", 0);
+    const env_chunk = env.int(.MLX_SERVE_PREFILL_CHUNK, usize, 0);
     if (env_chunk > 0) return env_chunk;
     // `pinned_chunk` is the machine-sized cap frozen at load
     // (`ModelConfig.pinned_prefill_chunk`, from `server.resolvePrefillChunk`):
@@ -396,7 +394,7 @@ pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool, has_vision: bool) 
 var vision_chunked_cached: ?bool = null;
 pub fn visionChunkedPrefillEnabled() bool {
     if (vision_chunked_cached) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_VISION_CHUNKED");
+    const raw = env.get(.MLX_SERVE_VISION_CHUNKED);
     const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     vision_chunked_cached = on;
     return on;
@@ -491,12 +489,12 @@ test "decodeShareCapped: the share cap narrows an explicit and an env width" {
     try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(explicit, 1024));
     try std.testing.expectEqual(@as(usize, 8192), decodeShareCapped(explicit, 0));
 
-    _ = setenv("MLX_SERVE_PREFILL_CHUNK", "8192", 1);
-    defer _ = unsetenv("MLX_SERVE_PREFILL_CHUNK");
+    env.set(.MLX_SERVE_PREFILL_CHUNK, "8192");
+    defer env.unset(.MLX_SERVE_PREFILL_CHUNK);
     generate_mod.prefill_chunk_explicit = false;
-    const env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
-    try std.testing.expectEqual(@as(usize, 8192), env);
-    try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(env, 1024));
+    const from_env = effectivePrefillChunk(128, 8, 1024, false, false, false, 2048);
+    try std.testing.expectEqual(@as(usize, 8192), from_env);
+    try std.testing.expectEqual(@as(usize, 1024), decodeShareCapped(from_env, 1024));
 }
 
 test "effectivePrefillChunk: the machine cap bounds every auto width, an explicit width passes" {

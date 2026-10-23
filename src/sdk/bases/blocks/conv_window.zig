@@ -1,6 +1,7 @@
 //! A causal depthwise convolution over the slot's cached window: the conv state (the last `kernel - 1` input rows)
-//! is read and replaced through `CacheOps`, never held by the block. Shared by the gated conv (LFM2) and Mamba2.
-//! copied_from: sdk/blocks/conv/conv1d_cache.zig (`conv1dWithCache` without the spec-capture stash).
+//! is read and replaced through `CacheOps`, never held by the block; a spec verify also leaves the whole input
+//! (`StateSlot.conv_input`). Shared by the gated conv (LFM2) and Mamba2.
+//! copied_from: sdk/blocks/conv/conv1d_cache.zig (`conv1dWithCache`).
 
 const mlx = @import("../../../mlx/ffi.zig");
 const ops = @import("../../../mlx/ops.zig");
@@ -29,6 +30,7 @@ pub fn conv(c: *Ctx, x: Array, w: Array, bias: Array, cdim: c_int, kernel: c_int
         checkpoint.compact_conv_state_copy_count += 1;
     }
     try kv.setState(c, .conv, tail);
+    if (c.capture_spec) try kv.setState(c, .conv_input, input);
 
     var out = if (mlx.cudaAvailable() and len == kernel)
         try g.adopt(try depthwise.depthwiseConvStep(input, w, cdim, kernel, g.s))

@@ -4,6 +4,7 @@
 const std = @import("std");
 const abi = @import("../../abi/quant.zig");
 const common = @import("../../abi/common.zig");
+const sushi_exl3 = @import("sushi_exl3");
 
 const Str = abi.Str;
 const Claim = abi.Claim;
@@ -98,6 +99,8 @@ pub const builtins = [_]Builtin{
     .{ .name = "mxfp8", .claims = &claimsMxfp8, .validate = &validateMlx },
     .{ .name = "nvfp4", .claims = &claimsNvfp4, .validate = &validateMlx },
     .{ .name = "hadamard", .claims = &claimsHadamard, .validate = &validateHadamard },
+    .{ .name = "exl3", .claims = &claimsExl3, .validate = &validateExl3 },
+    .{ .name = "gguf", .claims = &claimsGguf, .validate = &validateGguf },
 };
 
 /// The built-in format serving `block_json`: the highest claim wins, two at that rank are ambiguous.
@@ -196,6 +199,42 @@ fn validateHadamard(block_json: Str, config_json: Str, dir: *const abi.PackDir) 
     return if (hadamardBlock(sc.a(), config_json.slice()) != null) .ok else Verdict.refuse(.unsupported, "hadamard: modules without one shared rotation block");
 }
 
+/// Sushi's `expert_quant`: EXL3 (MCG, MUL1) and its STQ codebook family (a named codebook table).
+fn claimsExl3(block_json: Str, _: Str) callconv(.c) Claim {
+    var sc: Scratch = .{};
+    defer sc.arena.deinit();
+    const o = parseObject(sc.a(), block_json.slice()) orelse return .no;
+    return if (eqlField(o, "format", "exl3") or eqlField(o, "format", "stq")) .by_type else .no;
+}
+
+/// Sushi's own parse: a codebook, window or table this build does not decode, and a top-k past the reduce bank.
+fn validateExl3(block_json: Str, config_json: Str, _: *const abi.PackDir) callconv(.c) Verdict {
+    var sc: Scratch = .{};
+    defer sc.arena.deinit();
+    const root = expertQuantRoot(sc.a(), block_json.slice()) orelse return Verdict.refuse(.failed, "expert_quant block does not parse");
+    _ = sushi_exl3.parseExpertQuant(root) catch |e| return Verdict.named(.unsupported, @errorName(e));
+    const cfg = parseObject(sc.a(), config_json.slice()) orelse return .ok;
+    const text = if (cfg.get("text_config")) |t| (if (t == .object) t.object else cfg) else cfg;
+    const topk = uintField(cfg, "num_experts_per_tok") orelse uintField(text, "num_experts_per_tok") orelse return .ok;
+    sushi_exl3.admitTopK(topk) catch |e| return Verdict.named(.unsupported, @errorName(e));
+    return .ok;
+}
+
+/// `{"expert_quant": block}`: the root Sushi's parse reads.
+pub fn expertQuantRoot(a: std.mem.Allocator, block_json: []const u8) ?std.json.ObjectMap {
+    const wrapped = std.fmt.allocPrint(a, "{{\"expert_quant\":{s}}}", .{block_json}) catch return null;
+    return parseObject(a, wrapped);
+}
+
+/// A GGUF file's rebuilt config (`mode: gguf`); its tensor types were vetted when the file was found servable.
+fn claimsGguf(block_json: Str, _: Str) callconv(.c) Claim {
+    return if (mlxBlockOf(block_json, &.{"gguf"})) .by_type else .no;
+}
+
+fn validateGguf(_: Str, _: Str, _: *const abi.PackDir) callconv(.c) Verdict {
+    return .ok;
+}
+
 // ── JSON readers ──
 
 fn parseObject(a: std.mem.Allocator, json: []const u8) ?std.json.ObjectMap {
@@ -241,6 +280,33 @@ test "quant block: each fixture config's quantization block is claimed by one bu
     const served = [_]struct { file: []const u8, key: []const u8, format: []const u8 }{
         .{ .file = "nemotron_h_super_omni.json", .key = "quantization", .format = "affine" },
         .{ .file = "nemotron_h_super_omni.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "glm5_next-mlx-community-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "glm5_next-mlx-community-4bit.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "glm5_next-nvidia-fp4-local.json", .key = "quantization_config", .format = "nvfp4" },
+        .{ .file = "glm5_next-sushi-2.4bpw.json", .key = "quantization", .format = "affine" },
+        .{ .file = "glm5_next-sushi-2.4bpw.json", .key = "expert_quant", .format = "exl3" },
+        .{ .file = "bailing_hybrid-ling-3.0-flash-oq4e-mtp.json", .key = "quantization", .format = "affine" },
+        .{ .file = "bailing_hybrid-ling-3.0-flash-oq4e-mtp.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "bailing_hybrid-ling-3.0-tiny-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "bailing_hybrid-ling-3.0-tiny-4bit.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "qwen4_exp-iq-mlx-4.7bpw.json", .key = "quantization", .format = "affine" },
+        .{ .file = "qwen4_exp-iq-mlx-4.7bpw.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "qwen4_exp-nvidia-fp4.json", .key = "quantization_config", .format = "nvfp4" },
+        .{ .file = "diffusiongemma-26B-A4B-it-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "diffusiongemma-26B-A4B-it-4bit.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "embeddinggemma-300m-8bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "gemma-3-12b-it-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "gemma-3-1b-it-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "gemma-3-1b-it-4bit.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "gemma-3-4b-it-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "gemma-4-12b-it-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "gemma-4-12b-it-4bit.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "gemma-4-26b-a4b-it-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "gemma-4-26b-a4b-it-4bit.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "gemma-4-31b-it-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "gemma-4-31b-it-4bit.json", .key = "quantization_config", .format = "affine" },
+        .{ .file = "gemma-4-e4b-it-4bit.json", .key = "quantization", .format = "affine" },
+        .{ .file = "gemma-4-e4b-it-4bit.json", .key = "quantization_config", .format = "affine" },
     };
     var seen: usize = 0;
     for (registry.model_configs) |f| {
@@ -276,7 +342,9 @@ test "quant block: every shipped block shape has one claimant" {
     try expectClaimant("fp8", "{\"quant_method\":\"fp8\",\"weight_block_size\":[128,128]}", none);
     const prism = "{\"model_type\":\"prism_hadamard_qwen35\",\"modules\":[{\"path\":\"lm_head\",\"block\":1024}]}";
     try expectClaimant("hadamard", "{\"bits\":2,\"group_size\":128,\"mode\":\"affine\"}", prism);
-    try expectClaimant(null, "{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\",\"window\":14}", none);
+    try expectClaimant("exl3", "{\"format\":\"exl3\",\"k\":2.5,\"codebook\":\"mcg\",\"window\":14}", none);
+    try expectClaimant("exl3", "{\"format\":\"stq\",\"k\":2.5,\"codebook\":\"std1\",\"window\":15,\"codebook_table\":\"std1\",\"codebook_digest\":\"c5dba171\"}", none);
+    try expectClaimant("gguf", "{\"group_size\":32,\"bits\":4,\"mode\":\"gguf\"}", none);
     try expectClaimant(null, "{\"quant_method\":\"bitsandbytes\",\"load_in_4bit\":true}", none);
     try expectClaimant(null, "{\"group_size\":64}", none);
     try expectClaimant(null, "{", none);

@@ -1,5 +1,6 @@
 //! DSpark rounds: greedy copy and stochastic arms, the Markov-head policy.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const dsv4_mod = @import("../../../plugins/deepseek_v4/deepseek_v4.zig");
@@ -23,6 +24,8 @@ const mtpSerialOneToken = @import("mtp/serial.zig").mtpSerialOneToken;
 const probsAllPositions = @import("../sampling/spec_sampling.zig").probsAllPositions;
 const seedKey = @import("../sampling/lazy.zig").seedKey;
 const specDecodeUnsupported = @import("verify.zig").specDecodeUnsupported;
+const intree = @import("../plugin/intree.zig");
+const plugin_driver = @import("../plugin/driver.zig");
 
 
 /// Which DSpark accept rule (if any) the dsv4 chokepoint may arm for a
@@ -49,7 +52,7 @@ pub fn dsparkArmFor(sampling: SamplingParams, logprobs_n: u32, stoch_enabled: bo
 
 /// Shared by dispatch and /props; this disables drafting, not resident stages.
 pub fn dsparkEnabled() bool {
-    return if (std.c.getenv("MLX_SERVE_DSV4_DSPARK")) |v| v[0] != '0' else true;
+    return if (env.get(.MLX_SERVE_DSV4_DSPARK)) |v| v[0] != '0' else true;
 }
 
 /// Stochastic-DSpark kill switch — MLX_SERVE_DSV4_DSPARK_STOCH=0
@@ -62,7 +65,7 @@ pub fn dsparkStochEnabledFromEnv(raw: ?[]const u8) bool {
 
 pub fn dsparkStochEnabled() bool {
     if (dspark_stoch_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_STOCH")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_DSV4_DSPARK_STOCH);
     const on = dsparkStochEnabledFromEnv(raw);
     dspark_stoch_cache = on;
     return on;
@@ -70,7 +73,7 @@ pub fn dsparkStochEnabled() bool {
 
 /// `MLX_SERVE_DSV4_DSPARK_POLICY=0` verifies the whole block every stage round (the A/B arm of `dspark_pol`).
 pub fn dsparkPolicyEnabled() bool {
-    return if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_POLICY")) |v| v[0] != '0' else true;
+    return if (env.get(.MLX_SERVE_DSV4_DSPARK_POLICY)) |v| v[0] != '0' else true;
 }
 
 /// PLD draft+verify decode step. The draft comes from an n-gram lookup
@@ -120,19 +123,19 @@ pub fn nextDspark(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         const r = try mlx_stream.round(m, allocator, self.next_token_id, cap);
         return self.commitDsparkRound(allocator, .{ .tokens = r.tokens, .accepted = r.accepted, .next_token = r.next_token }, mlx_stream.position(m));
     }
-    if (self.xfm.dsv41) |mdl| {
+    if (intree.dsv41(self.xfm)) |mdl| {
         if (try self.dsparkCopyStep(allocator, mdl)) |res| return res;
         if (self.dspark_pol != null) return self.dsparkPolicyStep(allocator, mdl);
         return self.dsparkStep(allocator, dsv41_mod, mdl);
     }
-    return self.dsparkStep(allocator, dsv4_mod, self.xfm.dsv4.?);
+    return self.dsparkStep(allocator, dsv4_mod, intree.dsv4(self.xfm).?);
 }
 
 var dspark_copy_off_cache: ?bool = null;
 /// `MLX_SERVE_DSV4_DSPARK_COPY=0` drafts only from the stages (the A/B arm for copied continuations).
 pub fn dsparkCopyOff() bool {
     if (dspark_copy_off_cache) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_DSV4_DSPARK_COPY");
+    const raw = env.get(.MLX_SERVE_DSV4_DSPARK_COPY);
     const off = raw != null and raw.?[0] == '0';
     dspark_copy_off_cache = off;
     return off;
@@ -354,34 +357,27 @@ pub fn dsparkStochasticRound(self: *Generator, allocator: std.mem.Allocator, com
 // ── tests ──
 
 
-pub extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-pub extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-
 test "native speculation: shared DSpark environment policy" {
-    const name = "MLX_SERVE_DSV4_DSPARK";
-    const saved = if (std.c.getenv(name)) |value|
-        try testing.allocator.dupeSentinel(u8, std.mem.span(value), 0)
-    else
-        null;
-    defer {
-        if (saved) |value| {
-            _ = setenv(name, value, 1);
-            testing.allocator.free(value);
-        } else {
-            _ = unsetenv(name);
-        }
-    }
-    try testing.expectEqual(@as(c_int, 0), unsetenv(name));
+    const saved = env.override(.MLX_SERVE_DSV4_DSPARK, null);
+    defer saved.restore();
     try testing.expect(Generator.dsparkEnabled());
     for ([_][:0]const u8{ "", "1", "0", "0disabled" }) |value| {
-        try testing.expectEqual(@as(c_int, 0), setenv(name, value, 1));
+        env.set(.MLX_SERVE_DSV4_DSPARK, value);
         try testing.expectEqual(value.len == 0 or value[0] != '0', Generator.dsparkEnabled());
     }
 }
 
+/// The DSV4_MINI pack at `path` served as the scheduler loads it: its plugin behind the driver's shell, `cfg` the
+/// engine's parse (freed after the shell).
+fn servedMini(io: std.Io, a: std.mem.Allocator, path: []const u8, cfg: *model_mod.ModelConfig) !Transformer {
+    cfg.* = try model_mod.parseConfig(io, a, path);
+    errdefer cfg.deinit(a);
+    return plugin_driver.load(io, a, cfg, path, mlx.gpuStream());
+}
+
 test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)" {
     // DSpark is opt-in at load; the nextDspark arm below needs it armed.
-    _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
+    env.set(.MLX_SERVE_DSV4_DSPARK, "1");
     // The live corruption path (2026-07-31, log 166348-166361): the scheduler
     // decode tick dispatched on `slot.enable_pld` alone, so it called
     // `nextPld` on a generator whose init the dsv4 guard had already flipped
@@ -396,25 +392,12 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
     // Fabricate the mini with:
     //   python3 tests/dsv4_mlx_ref.py --fabricate /tmp/dsv4-mini
     //   DSV4_MINI=/tmp/dsv4-mini zig build test -Dtest-filter=DSV4_MINI
-    const path_z = std.c.getenv("DSV4_MINI") orelse return;
+    const path_z = env.get(.DSV4_MINI) orelse return;
     if (mlx.noGpuBackend()) return;
     const path = std.mem.span(path_z);
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
 
-    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
-    defer allocator.free(cfg_path);
-    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
-    file.close(io);
-    defer allocator.free(cfg_json);
-    const cfg = try model_mod.parseConfigFromJson(allocator, cfg_json);
-    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
-    defer allocator.free(shard_path);
-    var weights = try model_mod.loadWeightsSingleFile(allocator, shard_path);
-    defer weights.deinit();
 
     // Never read by the Generator (stored only) — see the field comment.
     var tok_dummy: Tokenizer = undefined;
@@ -432,7 +415,9 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
     // Serial baseline: the regular scheduler shape (skip_lazy_preforward).
     var serial: [want]u32 = undefined;
     {
-        var xfm = try Transformer.init(io, allocator, cfg, &weights);
+        var xfm_cfg: model_mod.ModelConfig = undefined;
+        var xfm = try servedMini(io, allocator, path, &xfm_cfg);
+        defer xfm_cfg.deinit(allocator);
         defer xfm.deinit();
         var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
             .skip_lazy_preforward = true,
@@ -452,7 +437,9 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
     // scheduler tick's exact live behavior before specTickMode grew the
     // generator-state conjunct.
     {
-        var xfm = try Transformer.init(io, allocator, cfg, &weights);
+        var xfm_cfg: model_mod.ModelConfig = undefined;
+        var xfm = try servedMini(io, allocator, path, &xfm_cfg);
+        defer xfm_cfg.deinit(allocator);
         defer xfm.deinit();
         var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
             .pld_enabled = true,
@@ -487,7 +474,9 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
     // this pins the GENERATOR wiring: engagement, step accounting, and the
     // shell-cache mirror).
     {
-        var xfm = try Transformer.init(io, allocator, cfg, &weights);
+        var xfm_cfg: model_mod.ModelConfig = undefined;
+        var xfm = try servedMini(io, allocator, path, &xfm_cfg);
+        defer xfm_cfg.deinit(allocator);
         defer xfm.deinit();
         var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 16, greedy, &.{}, .{
             .pld_enabled = true,
@@ -516,7 +505,7 @@ test "dsv4: nextPld on a chokepoint-disabled generator stays serial (DSV4_MINI)"
         // ENGAGEMENT: silent serial fallback is output-identical — count rounds.
         try testing.expect(gen.dspark_attempted >= 1);
         // Shell cache mirrors the module state exactly.
-        try testing.expectEqual(xfm.dsv4.?.dec_state.?.n, gen.ctx.cache.step);
+        try testing.expectEqual(intree.dsv4(&xfm).?.dec_state.?.n, gen.ctx.cache.step);
         // Sequence agreement: exact up to the sanctioned near-tie window.
         var first_div: usize = want;
         for (0..want) |k| {
@@ -578,26 +567,13 @@ test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit 
     // filtered target probs) onto dsv4's own draft stages. Engagement is
     // COUNTED (dspark_attempted) — a silent serial fallback emits perfectly
     // plausible tokens.
-    _ = setenv("MLX_SERVE_DSV4_DSPARK", "1", 1);
-    const path_z = std.c.getenv("DSV4_MINI") orelse return;
+    env.set(.MLX_SERVE_DSV4_DSPARK, "1");
+    const path_z = env.get(.DSV4_MINI) orelse return;
     if (mlx.noGpuBackend()) return;
     const path = std.mem.span(path_z);
     const allocator = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
 
-    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
-    defer allocator.free(cfg_path);
-    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
-    file.close(io);
-    defer allocator.free(cfg_json);
-    const cfg = try model_mod.parseConfigFromJson(allocator, cfg_json);
-    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
-    defer allocator.free(shard_path);
-    var weights = try model_mod.loadWeightsSingleFile(allocator, shard_path);
-    defer weights.deinit();
 
     // Never read by the Generator (stored only) — see the field comment.
     var tok_dummy: Tokenizer = undefined;
@@ -611,10 +587,12 @@ test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit 
     // so honor whatever env this test binary was LAUNCHED with and assert
     // the matching behavior — that makes the `MLX_SERVE_DSV4_DSPARK_STOCH=0`
     // run a real test of the fallback, not a skip.
-    const stoch_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_STOCH")) |p| std.mem.span(p) else null;
+    const stoch_raw: ?[]const u8 = env.span(.MLX_SERVE_DSV4_DSPARK_STOCH);
     const stoch_on = Generator.dsparkStochEnabledFromEnv(stoch_raw);
 
-    var xfm = try Transformer.init(io, allocator, cfg, &weights);
+    var xfm_cfg: model_mod.ModelConfig = undefined;
+    var xfm = try servedMini(io, allocator, path, &xfm_cfg);
+    defer xfm_cfg.deinit(allocator);
     defer xfm.deinit();
     var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, 64, sampled, &.{}, .{
         .pld_enabled = true,
@@ -638,7 +616,7 @@ test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit 
     try testing.expect(gen.dspark_enabled);
     try testing.expect(gen.dspark_stochastic);
 
-    const mdl = xfm.dsv4.?;
+    const mdl = intree.dsv4(&xfm).?;
     const want: usize = 10;
     var n: usize = 0;
     while (n < want) {
@@ -671,9 +649,11 @@ test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit 
     // row 0's filtered probs (the stochastic sibling of the greedy
     // confidence-gate test). The env is read at initModel, so this needs a
     // fresh Transformer; unset after — test order must not inherit the gate.
-    _ = setenv("MLX_SERVE_DSV4_DSPARK_CONF", "999999", 1);
-    defer _ = unsetenv("MLX_SERVE_DSV4_DSPARK_CONF");
-    var xfm2 = try Transformer.init(io, allocator, cfg, &weights);
+    env.set(.MLX_SERVE_DSV4_DSPARK_CONF, "999999");
+    defer env.unset(.MLX_SERVE_DSV4_DSPARK_CONF);
+    var xfm2_cfg: model_mod.ModelConfig = undefined;
+    var xfm2 = try servedMini(io, allocator, path, &xfm2_cfg);
+    defer xfm2_cfg.deinit(allocator);
     defer xfm2.deinit();
     var gen2 = try Generator.initWithOptions(io, allocator, &xfm2, &tok_dummy, &prompt, 64, sampled, &.{}, .{
         .pld_enabled = true,
@@ -694,7 +674,7 @@ test "dsv4: stochastic dspark engages at sampled temperature and keeps the exit 
     }
     try testing.expectEqual(@as(usize, 4), n2);
     try testing.expect(gen2.dspark_attempted >= 4);
-    try testing.expectEqual(xfm2.dsv4.?.dec_state.?.n, gen2.ctx.cache.step);
+    try testing.expectEqual(intree.dsv4(&xfm2).?.dec_state.?.n, gen2.ctx.cache.step);
     std.debug.print("dsv4 stochastic dspark (b==0 gate): {d} single-token rounds\n", .{n2});
 }
 

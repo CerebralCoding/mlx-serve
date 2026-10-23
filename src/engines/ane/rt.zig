@@ -8,6 +8,7 @@
 //! takes 64 bytes per channel.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const builtin = @import("builtin");
 
 pub const Io = extern struct {
@@ -255,8 +256,6 @@ test "tensor layout: MIL axes map onto (batch, plane, row, width) from the right
 extern fn msv_ane_cache_lineage(group: [*:0]const u8, variant: [*:0]const u8) void;
 extern fn msv_ane_cache_prune() void;
 extern fn msv_ane_cache_sweep() void;
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn unsetenv(name: [*:0]const u8) c_int;
 
 /// One cache entry of `gb` GiB (sparse) at `mtime`, tagged `group`/`variant` unless empty.
 fn testEntry(root: []const u8, name: []const u8, gb: i64, mtime: i64, lineage: []const u8) !void {
@@ -285,9 +284,9 @@ test "cache sweep: after a build, its group's entries it did not touch go; other
     _ = std.c.mkdir(root, 0o755);
     _ = std.c.mkdir(try std.fmt.bufPrintSentinel(&eb, "{s}/entries", .{root}, 0), 0o755);
     defer std.Io.Dir.cwd().deleteTree(testing.io, root) catch {};
-    _ = setenv("MLX_SERVE_ANE_CACHE_DIR", root, 1);
+    env.set(.MLX_SERVE_ANE_CACHE_DIR, root);
     defer {
-        _ = unsetenv("MLX_SERVE_ANE_CACHE_DIR");
+        env.unset(.MLX_SERVE_ANE_CACHE_DIR);
         msv_ane_cache_lineage("", "");
     }
     msv_ane_cache_lineage("lm:a", "v1");
@@ -316,11 +315,11 @@ test "cache prune: never the set being built; its group's other variants first, 
     try testEntry(root, "stale", 1, 4_000, "lm:a\nv0\n");
     try testEntry(root, "older", 1, 2_000, "");
     try testEntry(root, "newer", 1, 3_000, "");
-    _ = setenv("MLX_SERVE_ANE_CACHE_DIR", root, 1);
-    _ = setenv("MLX_SERVE_ANE_CACHE_CAP_GB", "3", 1);
+    env.set(.MLX_SERVE_ANE_CACHE_DIR, root);
+    env.set(.MLX_SERVE_ANE_CACHE_CAP_GB, "3");
     defer {
-        _ = unsetenv("MLX_SERVE_ANE_CACHE_DIR");
-        _ = unsetenv("MLX_SERVE_ANE_CACHE_CAP_GB");
+        env.unset(.MLX_SERVE_ANE_CACHE_DIR);
+        env.unset(.MLX_SERVE_ANE_CACHE_CAP_GB);
         msv_ane_cache_lineage("", "");
     }
     msv_ane_cache_lineage("lm:a", "v1");

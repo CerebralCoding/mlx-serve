@@ -1,48 +1,20 @@
 #!/bin/bash
-# ANE prefill offload guard (`--ane-prefill`, perf-plan-aug-17 P5 + v2 GDN).
+# test_ane_prefill.sh — ANE prefill offload (--ane-prefill) across six boots of one binary: the ready line
+# (`[ane] prefill offload ready: N/M mlp + G gdn layers`), per-seam engagement (`[ane] prefill offload engaged`, and
+# `[ane] gdn offload engaged` when gdn layers exist: a built program never dispatched is the dispatch-hole class),
+# MLX_SERVE_ANE_GDN=0 (MLP only), MLX_SERVE_ANE_MODE=row (channel is the default), the strictly opt-in off arm (zero
+# `[ane]` lines), banks (strictly fewer banks than covered layers, `units=1`; a tiny MLX_SERVE_ANE_BANK_MAX_BYTES gives
+# more banks at identical coverage), MLX_SERVE_ANE_DUAL=1 refused by name on single-ANE silicon, the orphan-staging
+# reap. Every arm asserts ZERO `eval failed` lines: a failed eval recomputes on the GPU, so only the RATE would move.
+# Rates are not compared.
 #
-# Contract pinned here:
-#   1. BUILD — with the flag on and the framework present, the load logs
-#      `[ane] prefill offload ready: N/M mlp + G gdn layers` (a machine
-#      without the private framework logs `[ane] unavailable` → SKIP).
-#   2. ENGAGEMENT — a prompt long enough to produce one full-width prefill
-#      chunk logs `[ane] prefill offload engaged` in the arm's OWN log, and
-#      the request completes with non-empty output + a sane prefill rate.
-#      PER-SEAM: when the ready line reports nonzero gdn layers, the gdn
-#      seam must log its own `[ane] gdn offload engaged` line (a built-but-
-#      never-dispatched program is the dispatch-hole class); zero gdn
-#      layers must show NO gdn engagement.
-#   3. GDN KILL LEVER — MLX_SERVE_ANE_GDN=0 builds `+ 0 gdn layers`, never
-#      logs gdn engagement, and the MLP seam still engages (the lever is
-#      MLP-only mode, not a global off).
-#   4. MODE LEVER (A1) — the DEFAULT is channel mode (`mode=channel` on the
-#      ready AND engagement lines; measured 2026-08-18: beats row at less
-#      than half the ANE bytes), and MLX_SERVE_ANE_MODE=row builds + engages
-#      the row split, with the request completing either way.
-#   5. OFF ARM — without the flag there are ZERO `[ane]` lines (the offload
-#      is strictly opt-in).
-#   5b. NO FAILED EVALS — every arm must log ZERO `[ane] ... eval failed`.
-#      A failed eval falls back to a GPU recompute for that chunk, so the
-#      request still answers correctly and only the RATE moves: the
-#      42-procedure bank whose symbol indices were wrong lost 200 of 210
-#      evals and read as "banks are 23% slower" (2026-08-20).
-#   6. BANKS — programs are PROCEDURE BANKS, so the ready line reports
-#      strictly FEWER banks than covered layers (the ~121-handle runtime
-#      limit is why; one handle per layer is what banks replace), and this
-#      machine reports `units=1`.
-#   7. SPLIT LADDER — a tiny MLX_SERVE_ANE_BANK_MAX_BYTES forces more banks
-#      and coverage must still be FULL: partitioning is a packaging
-#      decision, never a coverage one.
-#   8. DUAL SELF-DISABLE — MLX_SERVE_ANE_DUAL=1 on single-ANE silicon must
-#      say so by name and build units=1, never fail the boot.
+#   ./tests/test_ane_prefill.sh [/path/to/model] [port]   # default Qwen3.5-0.8B-MLX-4bit (ANE_PREFILL_MODEL)
 #
-# Rates are NOT compared here (one-run rates are variance; the adoption
-# numbers live in perf-plan-aug-17.md P5). Model default is the small
-# qwen3_5 dense checkpoint; ANE_PREFILL_MODEL overrides.
-#
-# Usage: ./tests/test_ane_prefill.sh [/path/to/model] [port]
+# SKIPs when the private framework is absent. Hermetic twins: unitCount / bankGroupLen / engineBillBytes /
+# aneShareRows / gateAllows in ane.zig, anePropsJson.
 
 set -u
+source "$(dirname "$0")/lib/server.sh"
 MODEL="${1:-${ANE_PREFILL_MODEL:-$HOME/.mlx-serve/models/mlx-community/Qwen3.5-0.8B-MLX-4bit}}"
 PORT="${2:-8098}"
 BASE="http://127.0.0.1:$PORT"
@@ -71,11 +43,7 @@ run_arm() {
         --prefix-cache-entries 0 ${MLX_SERVE_TEST_EXTRA_ARGS:-} > "$LOGFILE" 2>&1 &
     SRV=$!
     local up=0 i
-    for i in $(seq 1 120); do
-        if curl -s -f "$BASE/health" > /dev/null 2>&1; then up=1; break; fi
-        if ! kill -0 $SRV 2>/dev/null; then break; fi
-        sleep 1
-    done
+    srv_wait_health "$BASE" 120 1 "$SRV" && up=1
     if [ "$up" != "1" ]; then
         echo -e "  ${RED}FAIL${NC} server did not become healthy" >&2
         tail -20 "$LOGFILE" >&2

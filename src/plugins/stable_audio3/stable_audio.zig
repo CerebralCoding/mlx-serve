@@ -181,6 +181,7 @@ pub fn decodePlan(a: std.mem.Allocator, t: u32) ![]Window {
 }
 
 const ops = @import("../../mlx/ops.zig");
+const gelu = @import("../../sdk/blocks/mlp/gelu.zig");
 const Graph = ops.Graph;
 
 // ════════════════════════════════════════════════════════════════════════
@@ -243,10 +244,15 @@ pub const Engine = struct {
     dec_map: A,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Engine {
+        return loadOn(io, allocator, model_dir, mlx.mlx_default_gpu_stream_new());
+    }
+
+    /// `load` on stream `s` (the media table's `LoadCtx.stream`).
+    pub fn loadOn(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !*Engine {
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
-        self.s = mlx.mlx_default_gpu_stream_new();
+        self.s = s;
         self.cfg = try parseConfig(io, allocator, model_dir);
         self.owned = .init(allocator, self.s);
         errdefer self.owned.deinit();
@@ -694,13 +700,9 @@ fn unpatch(a: std.mem.Allocator, s: S, patches: A, samples: usize) ![]f32 {
     return a.dupe(f32, data[0..n]);
 }
 
-/// tanh-approximated GELU (Gemma's `gelu_pytorch_tanh`).
+/// tanh-approximated GELU (Gemma's `gelu_pytorch_tanh`), its constants in the operand's dtype.
 fn geluTanh(parent: *Graph, x: A) !A {
-    var g = parent.scope();
-    defer g.deinit();
-    const x3 = try g.mul(try g.mul(x, x), x);
-    const inner = try g.mulScalar(try g.add(x, try g.mulScalar(x3, 0.044715)), @sqrt(2.0 / std.math.pi));
-    return parent.keep(try g.mul(try g.mulScalar(x, 0.5), try g.addScalar(try g.tanh(inner), 1)));
+    return gelu.geluTanh(parent, x, ops.dtype(x), gelu.SQRT_2_PI_LOW);
 }
 
 /// Load one safetensors file, keeping only keys under `prefixes`, materialized.

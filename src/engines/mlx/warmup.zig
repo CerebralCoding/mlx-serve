@@ -2,6 +2,7 @@
 //! Owns warmup, SpecWarmSlot, specWarmIds, specWarmEvalFree, specWarmVerify, MAX_WARM_SEQ, and 5 more.
 
 const std = @import("std");
+const plugin_settle = @import("plugin/settle.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const KVQuantConfig = @import("cache/kv_quant.zig").KVQuantConfig;
 const log = @import("../../host/log.zig");
@@ -173,6 +174,7 @@ pub fn warmupSpecVerify(self: *Transformer, max_width: u32, kv_config: KVQuantCo
     defer {
         for (slots[0..n_slots]) |sl| {
             self.ssmGroupRelease(&sl.ctx) catch {};
+            plugin_settle.release(self, &sl.ctx);
             sl.deinit(self.allocator);
         }
         _ = mlx.mlx_clear_cache();

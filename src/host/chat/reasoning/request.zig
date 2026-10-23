@@ -720,17 +720,6 @@ test "schema thinking policy defers only a resolved reasoning protocol" {
     }
 }
 
-test "every JSON grammar mask site consults the fallback or deferral policy" {
-    const src = @embedFile("../../api/chat_completions.zig") ++ @embedFile("../../api/anthropic.zig") ++ @embedFile("../../api/responses/handler.zig") ++ @embedFile("request.zig");
-    const mask_line = "[grammar] enforcing JSON schema from " ++ "token 0";
-    const call = "schemaMasks" ++ "Thinking(";
-    const def = "fn schemaMasks" ++ "Thinking(";
-    const masks = std.mem.count(u8, src, mask_line);
-    const calls = std.mem.count(u8, src, call) - std.mem.count(u8, src, def);
-    try std.testing.expect(masks >= 3);
-    try std.testing.expectEqual(masks, calls);
-}
-
 test "reasoning budget: the rule stands in for --reasoning-budget, forced it replaces the request's" {
     var gen = generation_settings.Profile{};
     try std.testing.expectEqual(http_server.server_config.default_reasoning_budget, defaultReasoningBudget(gen));

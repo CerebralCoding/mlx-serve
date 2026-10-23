@@ -430,7 +430,7 @@ pub fn mtpBatchHeadPosition(pos_base: c_int, seq_offset: usize) c_int {
 pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraft, from: u32, to: u32) !void {
     if (gens.len == 0) return;
     std.debug.assert(gens.len == chains.len);
-    const xfm = gens[0].xfm;
+    const xfm = gens[0].xfm.qwen4Host();
     var any_mrope = false;
     var all_qwen4 = true;
     var one_sidecar = true;
@@ -438,7 +438,7 @@ pub fn mtpChainBuildBatchedActive(gens: []const *Generator, chains: []MtpPreDraf
         if (g.mtpMropeContext() != null) any_mrope = true;
         switch (g.mtp.?) {
             .qwen4 => one_sidecar = false,
-            .mimo, .glm => {
+            .mimo, .glm, .plugin => {
                 all_qwen4 = false;
                 one_sidecar = false;
             },

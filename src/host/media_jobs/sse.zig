@@ -22,6 +22,8 @@ pub const Progress = struct {
     /// the sink is an SSE stream. Cached-velocity H3 steps leave this unused.
     preview_cb: ?*const fn (ctx: *anyopaque, stage: []const u8, step: u32, total: u32, frame: preview.Encoded) void = null,
     preview_opts: preview.Opts = .{},
+    /// False when the caller's own `cancelled_cb` already gives chat its turn (a media plugin's table `boundary`).
+    yields: bool = true,
     pub fn emit(self: Progress, stage: []const u8, step: u32, total: u32) void {
         self.cb(self.ctx, stage, step, total);
     }
@@ -42,7 +44,7 @@ pub const Progress = struct {
     /// The per-step poll: gives chat its turn on the inference thread (when a
     /// scheduler hook is installed), then reports whether the client left.
     pub fn boundary(self: Progress) bool {
-        if (gen_yield) |y| y.step(y.ctx);
+        if (self.yields) if (gen_yield) |y| y.step(y.ctx);
         return self.cancelled();
     }
 };
@@ -507,6 +509,7 @@ test "preview SSE event carries JPEG b64 and is absent when the flag is off" {
         .preview = true,
     };
     const p = sctx.progress();
+    defer stream_conn = null; // the scheduler clears it in production; a stale one segfaults a later offload
     try std.testing.expect(p.wantsPreview());
     const jpg = [_]u8{ 0xFF, 0xD8, 0xFF, 0xD9 };
     p.emitPreview("Generating", 8, 30, .{ .jpeg = @constCast(&jpg), .w = 16, .h = 9 });

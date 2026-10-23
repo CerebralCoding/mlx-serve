@@ -12,6 +12,7 @@
 # Defaults: root = ~/.mlx-serve/models, port = 8095.
 
 set -e
+source "$(dirname "$0")/lib/server.sh"
 
 ROOT="${1:-$HOME/.mlx-serve/models}"
 PORT="${2:-8095}"
@@ -58,10 +59,7 @@ cleanup() {
 trap cleanup EXIT
 
 # Wait for server.
-for _ in $(seq 1 30); do
-    if curl -fs "$BASE/health" >/dev/null 2>&1; then break; fi
-    sleep 1
-done
+srv_wait_health "$BASE" 30 1 || true
 if ! curl -fs "$BASE/health" >/dev/null 2>&1; then
     echo -e "${RED}FAIL${NC} server did not start in 30s. Log:"
     tail -30 "$LOGFILE"

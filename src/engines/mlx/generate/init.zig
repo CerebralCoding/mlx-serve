@@ -1,6 +1,7 @@
 //! Generator.initWithOptions: the prompt prefill and every spec-decode arm's setup.
 const depth_bounds = @import("../spec/mtp_depth_bounds.zig");
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("../../../sdk/weights/streamed/glue.zig") else @import("../../../sdk/weights/streamed/stub.zig");
@@ -50,8 +51,6 @@ const mtpEvCosts = @import("../spec/mtp/ev_costs.zig").mtpEvCosts;
 const nextChunkEnd = @import("prefill_chunk.zig").nextChunkEnd;
 const pickLookupPromptSource = @import("../spec/pld.zig").pickLookupPromptSource;
 const promptLogprobs = @import("../sampling/logprobs.zig").promptLogprobs;
-const readEnvBool = @import("../env_generate.zig").readEnvBool;
-const readEnvUsize = @import("../env_generate.zig").readEnvUsize;
 const reservedPrefillTokens = @import("prefill_chunk.zig").reservedPrefillTokens;
 const resolveMtpDepthCapForProfile = @import("../spec/mtp/ev_plan.zig").resolveMtpDepthCapForProfile;
 const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
@@ -59,6 +58,7 @@ const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpoint
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
 const visionChunkedPrefillEnabled = @import("prefill_chunk.zig").visionChunkedPrefillEnabled;
+const intree = @import("../plugin/intree.zig");
 
 
 pub fn initWithOptions(
@@ -100,7 +100,7 @@ pub fn initWithOptions(
     var options = options_in;
     var dspark_active = false;
     var dspark_stochastic = false;
-    if ((xfm.dsv4 != null or xfm.dsv41 != null or xfm.mlx_stream_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
+    if ((intree.dsv4(xfm) != null or intree.dsv41(xfm) != null or xfm.mlx_stream_ext != null) and (options.pld_enabled or options.drafter_enabled or options.mtp_enabled or options.dflash_enabled)) {
         // DSpark lift: dsv4's OWN draft mode (block-parallel stages +
         // snapshot rollback inside deepseek_v4.zig) may engage when the
         // checkpoint ships stages and the request is CLEAN (no
@@ -113,7 +113,7 @@ pub fn initWithOptions(
         // MLX_SERVE_DSV4_DSPARK_STOCH=0. PLD / drafter / qwen-MTP
         // remain hard-off regardless: their verify forwards go through
         // machinery this arch cannot roll back.
-        const ds_block = if (xfm.dsv4) |d| d.ds_block else if (xfm.dsv41) |d| d.ds_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
+        const ds_block = if (intree.dsv4(xfm)) |d| d.ds_block else if (intree.dsv41(xfm)) |d| d.ds_block else mlx_stream.blockSize(xfm.mlx_stream_ext.?);
         const dspark_env_off = !dsparkEnabled();
         const arm = if (!options.mtp_enabled or xfm.config.mtp_override == false)
             DsparkArm.off
@@ -211,7 +211,7 @@ pub fn initWithOptions(
     // MLX_SERVE_PREFILL_TRACE=1 (which forces the trace line at info).
     // Phase 0 of plan 04 — gives us a decomposed view of where cold prefill
     // time goes (chunked-forward vs eval vs last-token-forward).
-    const trace_force: bool = generate_mod.prefill_trace_force or readEnvBool("MLX_SERVE_PREFILL_TRACE");
+    const trace_force: bool = generate_mod.prefill_trace_force or env.one(.MLX_SERVE_PREFILL_TRACE);
     const trace_enabled = log.isDebug() or trace_force;
     var prefill_sw = io_util.Stopwatch.init(io);
     var chunked_ns: u64 = 0;
@@ -403,7 +403,7 @@ pub fn initWithOptions(
         if (mtp_cache) |*mc| mc.activate();
         transformer_mod.reserveQsaHistoryWithHead(
             ctx.ssm_entries,
-            if (xfm.qwen4_mtp) |*m| &m.entry else null,
+            if (xfm.qwen4Host().qwen4_mtp) |*m| &m.entry else null,
             @intCast(reserved_tokens),
         );
 
@@ -611,7 +611,7 @@ pub fn initWithOptions(
                 if (mtp_active) {
                     mtp_cache.?.activate();
                 }
-                if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
+                if (mtp_active) xfm.qwen4Host().qwen4MtpMarkQsaLeftover(abs_end_for_cp2 -| mtp_position_base) catch |e| {
                     log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                 };
                 // Thin the interior, never the oldest (#330): drop-oldest survivors covered only
@@ -735,7 +735,7 @@ pub fn initWithOptions(
                 if (mtp_active) {
                     mtp_cache.?.activate();
                 }
-                if (mtp_active) xfm.qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
+                if (mtp_active) xfm.qwen4Host().qwen4MtpMarkQsaLeftover(final_abs -| mtp_position_base) catch |e| {
                     log.debug("[qwen4] MTP head leftover mark failed: {s}\n", .{@errorName(e)});
                 };
                 if (options.ssm_checkpoint_max > 0 and
@@ -950,7 +950,7 @@ pub fn initWithOptions(
         return gen;
     }
 
-    if (dspark_active) if (xfm.dsv41) |m41| {
+    if (dspark_active) if (intree.dsv41(xfm)) |m41| {
         m41.ds_want_conf = dsparkPolicyEnabled();
     };
     // Drafter / PLD-v2 / MTP path: sample synchronously and DO NOT
@@ -1007,13 +1007,13 @@ pub fn initWithOptions(
             .pld_enabled = pld_active,
             .dspark_enabled = dspark_active,
             .dspark_stochastic = dspark_stochastic,
-            .dspark_pol = if (dspark_active and xfm.dsv41 != null and dsparkPolicyEnabled()) .{} else null,
+            .dspark_pol = if (dspark_active and intree.dsv41(xfm) != null and dsparkPolicyEnabled()) .{} else null,
             .drafter = if (drafter_active) options.drafter else null,
             .drafter_block_size = options.drafter_block_size,
             .dflash = if (dflash_active) options.dflash else null,
             .dflash_ctx = dflash_ctx,
             .dflash_block_size = dflash_bs,
-            .dflash_pol = if (dflash_active and options.dflash_policy) .{ .pin_rows = @intCast(@min(readEnvUsize("MLX_SERVE_DFLASH_ROWS", 0), dflash_policy.MAX_ROWS)) } else null,
+            .dflash_pol = if (dflash_active and options.dflash_policy) .{ .pin_rows = @intCast(@min(env.int(.MLX_SERVE_DFLASH_ROWS, usize, 0), dflash_policy.MAX_ROWS)) } else null,
             .dflash_chooser = if (dflash_active and dflashChooserEnabled() and !options.dflash_policy)
                 round_cost.WidthChooser.init(@max(dflash_bs, 2) - 1, options.dflash.?.config.block_size -| 1)
             else

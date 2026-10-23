@@ -19,6 +19,7 @@
 //!   (the gated RMSNorm absorbs both through its epsilon).
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mil = @import("mil.zig");
 const pack_mod = @import("pack.zig");
 
@@ -1332,11 +1333,11 @@ test "head program: each lane's half of the vocabulary, the partials added befor
 
 test "dump: one lane program for the ANE runner (ANE_DUMP_DIR, ANE_DUMP_PACK, ANE_DUMP_FIRST/LAYERS, ANE_DUMP_CTXS, ANE_DUMP_LANE/LANES)" {
     // ANE_DUMP_CTXS: comma-separated contexts; ANE_DUMP_PACK: an MLX pack (else a tiny random one).
-    const dir = std.c.getenv("ANE_DUMP_DIR") orelse return error.SkipZigTest;
+    const dir = env.get(.ANE_DUMP_DIR) orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
-    const layers = std.fmt.parseInt(u32, std.mem.span(std.c.getenv("ANE_DUMP_LAYERS") orelse "2"), 10) catch 2;
-    const first = std.fmt.parseInt(u32, std.mem.span(std.c.getenv("ANE_DUMP_FIRST") orelse "0"), 10) catch 0;
+    const layers = std.fmt.parseInt(u32, std.mem.span(env.get(.ANE_DUMP_LAYERS) orelse "2"), 10) catch 2;
+    const first = std.fmt.parseInt(u32, std.mem.span(env.get(.ANE_DUMP_FIRST) orelse "0"), 10) catch 0;
     var arena = std.heap.ArenaAllocator.init(a);
     defer arena.deinit();
     var A = tiny;
@@ -1347,7 +1348,7 @@ test "dump: one lane program for the ANE runner (ANE_DUMP_DIR, ANE_DUMP_PACK, AN
     defer if (real) |r| r.close();
     var pk: *const Pack = undefined;
     var pfx: []const u8 = "model";
-    if (std.c.getenv("ANE_DUMP_PACK")) |pd| {
+    if (env.get(.ANE_DUMP_PACK)) |pd| {
         const dir_s = std.mem.span(pd);
         real = try Pack.open(io, a, dir_s);
         pk = real.?;
@@ -1370,10 +1371,10 @@ test "dump: one lane program for the ANE runner (ANE_DUMP_DIR, ANE_DUMP_PACK, AN
     var prog = try Program.init(a, A, pk, pfx, unitBytes(A, first, layers, 2));
     defer prog.deinit();
     var ctxs: std.ArrayList(u32) = .empty;
-    var it = std.mem.tokenizeScalar(u8, std.mem.span(std.c.getenv("ANE_DUMP_CTXS") orelse "256"), ',');
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(env.get(.ANE_DUMP_CTXS) orelse "256"), ',');
     while (it.next()) |c| try ctxs.append(arena.allocator(), try std.fmt.parseInt(u32, c, 10));
-    const lane: u1 = if (std.c.getenv("ANE_DUMP_LANE")) |l| @intCast(l[0] - '0') else 0;
-    prog.lanes = if (std.c.getenv("ANE_DUMP_LANES")) |l| l[0] - '0' else 2;
+    const lane: u1 = if (env.get(.ANE_DUMP_LANE)) |l| @intCast(l[0] - '0') else 0;
+    prog.lanes = if (env.get(.ANE_DUMP_LANES)) |l| l[0] - '0' else 2;
     _ = try buildUnit(&prog, first, layers, lane, ctxs.items, &.{}, arena.allocator());
     try prog.fill(8);
     const out = try prog.take();
@@ -1386,20 +1387,20 @@ test "dump: one lane program for the ANE runner (ANE_DUMP_DIR, ANE_DUMP_PACK, AN
 }
 
 test "dump: the shared prefill cores for the ANE runner (ANE_CORES_DIR, ANE_CORES_CTXS)" {
-    const dir = std.c.getenv("ANE_CORES_DIR") orelse return error.SkipZigTest;
+    const dir = env.get(.ANE_CORES_DIR) orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var A = tiny;
-    if (std.c.getenv("ANE_CORES_27B") != null) A = .{ .hidden = 5120, .ffn = 17408, .layers = 64, .vocab = 248320, .nk = 16, .nv = 48, .dk = 128, .dv = 128, .nh = 24, .nkv = 4, .hd = 256, .rot = 64, .rope_theta = 1e7, .eps = 1e-6, .full_interval = 4, .tie = false };
+    if (env.get(.ANE_CORES_27B) != null) A = .{ .hidden = 5120, .ffn = 17408, .layers = 64, .vocab = 248320, .nk = 16, .nv = 48, .dk = 128, .dv = 128, .nh = 24, .nkv = 4, .hd = 256, .rot = 64, .rope_theta = 1e7, .eps = 1e-6, .full_interval = 4, .tie = false };
     var ctxs: std.ArrayList(u32) = .empty;
     defer ctxs.deinit(a);
-    var it = std.mem.tokenizeScalar(u8, std.mem.span(std.c.getenv("ANE_CORES_CTXS") orelse ""), ',');
+    var it = std.mem.tokenizeScalar(u8, std.mem.span(env.get(.ANE_CORES_CTXS) orelse ""), ',');
     while (it.next()) |c| try ctxs.append(a, try std.fmt.parseInt(u32, c, 10));
     var blob = try Blob.init(std.heap.c_allocator, 1 << 20);
     defer blob.deinit();
     var g = try Builder.init(a, &blob);
     defer g.deinit();
-    if (std.c.getenv("ANE_CORES_NO_GDN") != null) {
+    if (env.get(.ANE_CORES_NO_GDN) != null) {
         var x: [1]Var = undefined;
         try g.begin("nop", &.{.{ .name = "x", .shape = Shape.of(&.{ 1, 64 }) }}, &x);
         try g.end(&.{try g.named(try g.mulS(x[0], 2), "y")});
@@ -1414,12 +1415,12 @@ test "dump: the shared prefill cores for the ANE runner (ANE_CORES_DIR, ANE_CORE
 }
 
 test "dump: head variants for the ANE runner (ANE_HEAD_DIR, ANE_HEAD_PARTS, ANE_HEAD_NOT)" {
-    const dir = std.c.getenv("ANE_HEAD_DIR") orelse return error.SkipZigTest;
+    const dir = env.get(.ANE_HEAD_DIR) orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     const A: Arch = .{ .hidden = 5120, .ffn = 17408, .layers = 64, .vocab = 248320, .nk = 16, .nv = 48, .dk = 128, .dv = 128, .nh = 24, .nkv = 4, .hd = 256, .rot = 64, .rope_theta = 1e7, .eps = 1e-6, .full_interval = 4, .tie = false };
-    const parts = std.fmt.parseInt(u32, std.mem.span(std.c.getenv("ANE_HEAD_PARTS") orelse "8"), 10) catch 8;
-    const transpose = std.c.getenv("ANE_HEAD_NOT") == null;
+    const parts = std.fmt.parseInt(u32, std.mem.span(env.get(.ANE_HEAD_PARTS) orelse "8"), 10) catch 8;
+    const transpose = env.get(.ANE_HEAD_NOT) == null;
     var blob = try Blob.init(std.heap.c_allocator, @as(usize, A.vocab) * A.hidden + (64 << 20));
     defer blob.deinit();
     var g = try Builder.init(a, &blob);

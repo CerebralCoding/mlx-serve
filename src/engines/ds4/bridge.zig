@@ -16,6 +16,7 @@
 // straight through.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const gguf_meta = @import("../../host/registry/engine_pick.zig");
 const ffi = @import("ffi.zig");
@@ -89,7 +90,6 @@ const kernel_entries = [_]KernelEntry{
     .{ .env_var = "DS4_METAL_QWEN4_VISION_SOURCE", .file_name = "qwen4_vision.metal", .source = metal_sources.qwen4_vision },
 };
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
 extern "c" fn mkdir(path: [*:0]const u8, mode: u16) c_int;
 /// `creat()` is the non-variadic 2-arg form of `open()`. Equivalent to
 /// `open(path, O_WRONLY|O_CREAT|O_TRUNC, mode)` and avoids the AArch64
@@ -138,7 +138,7 @@ fn hexEncode(bytes: []const u8, buf: []u8) []u8 {
 pub fn ensureMetalKernels(allocator: std.mem.Allocator) Error!void {
     if (kernels_extracted.load(.acquire)) return;
 
-    const home_z = std.c.getenv("HOME");
+    const home_z = env.get(.HOME);
     if (home_z == null) {
         log.err("[ds4] HOME not set; cannot stage Metal kernels\n", .{});
         return Error.KernelExtractionFailed;
@@ -199,7 +199,7 @@ pub fn ensureMetalKernels(allocator: std.mem.Allocator) Error!void {
         // group/other read bits at creat() time.
         _ = chmod(file_path.ptr, 0o644);
 
-        if (setenv(k.env_var.ptr, file_path.ptr, 1) != 0) {
+        if (!env.setForeign(k.env_var.ptr, file_path.ptr)) {
             log.err("[ds4] setenv {s} failed\n", .{k.env_var});
             return Error.KernelExtractionFailed;
         }

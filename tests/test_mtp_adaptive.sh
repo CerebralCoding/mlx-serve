@@ -1,18 +1,13 @@
 #!/bin/bash
-# Adaptive serial switch: past some context a speculative round costs more per token than the
-# plain step it replaces, so the server measures a plain token per KV bucket and stops
-# speculating when the planned round loses. Pins the INVARIANT, never the model's choice:
-#   [1] with the switch on, the long request's log slice carries `[mtp] adaptive:` or a
-#       measured `serial_cell=` > 0;
-#   [2] speculation still ENGAGES there (`mode=mtp` with attempts > 0);
-#   [3] a burst of short requests never emits `-> serial` (the MIN_KV floor);
-#   [4] `MLX_SERVE_MTP_ADAPTIVE_SERIAL=0` produces no `[mtp] adaptive:` line and no serial arm;
-#   [5] the off arm costs nothing (`serial_cell=0.00` is expected, not a failure);
-#   [6] a `--no-mtp` boot with persistence ON writes no round-cost table.
-# The ~40k-token prompt is generated in-script from a fixed seed; both boots see the same bytes.
-# `MLX_SERVE_ROUND_COST_PERSIST=0` keeps the user's table out of it.
+# test_mtp_adaptive.sh — the adaptive serial switch: past some context a speculative round costs more per token than
+# a plain step, so the server measures a plain token per KV bucket and stops speculating where the round loses. Two
+# boots of one checkpoint over a ~40k-token prompt generated in-script; MLX_SERVE_ROUND_COST_PERSIST=0.
 #
-# Usage: MTP_ADAPTIVE_MODEL=<model-dir> ./tests/test_mtp_adaptive.sh [port]
+#   MTP_ADAPTIVE_MODEL=<long-context MTP pack> ./tests/test_mtp_adaptive.sh [port]   # SKIPs without one
+#
+# Pins the invariant, never the model's choice: the switch line or a measured serial cell with the switch on,
+# speculation still engaging, no `-> serial` on a short-request burst, nothing at all with
+# MLX_SERVE_MTP_ADAPTIVE_SERIAL=0, and an empty round-cost dir after a --no-mtp boot.
 
 set -u
 PORT="${1:-11316}"

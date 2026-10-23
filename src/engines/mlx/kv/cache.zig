@@ -2,6 +2,7 @@
 //! Owns KVCacheEntry, newEmptyKVEntry, resetKVEntry, freeKVEntry, KVCache, KVCacheSnapshot, and 11 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const kv_quant = @import("../cache/kv_quant.zig");
 const KVQuantConfig = @import("../cache/kv_quant.zig").KVQuantConfig;
@@ -299,7 +300,7 @@ pub const KVCache = struct {
     pub fn kvReserveEnabled() bool {
         if (kv_reserve_cache) |v| return v;
         var on = true;
-        if (std.c.getenv("MLX_SERVE_KV_RESERVE")) |p| {
+        if (env.get(.MLX_SERVE_KV_RESERVE)) |p| {
             on = !std.mem.eql(u8, std.mem.span(p), "0");
         }
         kv_reserve_cache = on;
@@ -321,7 +322,7 @@ pub const KVCache = struct {
     fn kvGrowLinear() bool {
         if (kv_grow_linear_cache) |v| return v;
         var linear = false;
-        if (std.c.getenv("MLX_SERVE_KV_GROW")) |p| {
+        if (env.get(.MLX_SERVE_KV_GROW)) |p| {
             linear = std.mem.eql(u8, std.mem.span(p), "linear");
         }
         kv_grow_linear_cache = linear;
@@ -1253,8 +1254,6 @@ test "every sliding attention arm sizes its KV view from slidingViewFor, never t
     const src = @embedFile("cache.zig") ++
         @embedFile("../forward/dense.zig") ++
         @embedFile("../../../sdk/blocks/attention/sinks.zig") ++
-        @embedFile("../../../plugins/laguna/attention.zig") ++
-        @embedFile("../../../plugins/inkling/attention.zig") ++
         @embedFile("../../../plugins/gemma4/attention.zig");
     const needle = "const max_kv: u32 " ++ "= ";
     var i: usize = 0;
@@ -1270,9 +1269,9 @@ test "every sliding attention arm sizes its KV view from slidingViewFor, never t
         seen += 1;
         i = line_end;
     }
-    // forwardStandardWith, gemma4, laguna, inkling, gpt_oss — a rewrite that
-    // drops the binding entirely must not read as a pass.
-    try testing.expect(seen >= 5);
+    // forwardStandardWith, gemma4, the sink arm — a rewrite that drops the
+    // binding entirely must not read as a pass.
+    try testing.expect(seen >= 3);
     // The alias is only as good as what it is assigned from.
     try testing.expect(std.mem.indexOf(u8, src, "const sliding_span " ++ "= sliding.span;") != null);
 

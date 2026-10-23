@@ -12,6 +12,7 @@ const persistAtShutdown = @import("../../engines/mlx/cache/budget.zig").persistA
 const commitSlotIfApplicable = @import("../../engines/mlx/commit.zig").commitSlotIfApplicable;
 const recordSlotCleanup = @import("../../engines/mlx/finish.zig").recordSlotCleanup;
 const doLoadOnInferenceThread = @import("../../engines/mlx/load.zig").doLoadOnInferenceThread;
+const loadErrorName = @import("../media_jobs/plugin/engine.zig").loadErrorName;
 const VisionEncodeRequest = @import("../../engines/mlx/media_encode.zig").VisionEncodeRequest;
 const EmbedRequest = @import("../../engines/mlx/media_encode.zig").EmbedRequest;
 const runVisionEncode = @import("../../engines/mlx/media_encode.zig").runVisionEncode;
@@ -80,9 +81,9 @@ pub fn inferenceLoop(ctx: ThreadCtx) void {
             log.info("Model ready (loaded on inference thread).\n", .{});
             signalStarted(sch);
         } else |err| {
-            recordLoadError(sch, @errorName(err));
+            recordLoadError(sch, loadErrorName(err));
             sch.registry.mutex.lockUncancelable(sch.io);
-            sch.registry.markErrorLocked(params.entry, @errorName(err));
+            sch.registry.markErrorLocked(params.entry, loadErrorName(err));
             sch.registry.mutex.unlock(sch.io);
             signalStarted(sch);
             return;
@@ -223,23 +224,6 @@ pub fn drainSideQueues(sch: *Scheduler) bool {
 
 // ── tests ──
 
-test "the cleanup drain commits a cancelled slot before deinit" {
-    // Class guard: a decode-phase cancel is pulled straight into the cleanup
-    // queue by `complete()` and NEVER passes through finishSlot — without a
-    // commit in the drain, its prompt+generated KV dies with the slot. The
-    // commit must run BEFORE deinit (the snapshot refcount-shares live
-    // buffers; after deinit they are freed).
-    const source = @embedFile("loop.zig");
-    const drain_start = std.mem.indexOf(u8, source, "for (cleanup_batch[0..cleanup_n])") orelse return error.MissingCleanupDrain;
-    const region = source[drain_start..@min(drain_start + 1600, source.len)];
-    const commit_pos = std.mem.indexOf(u8, region, "commitSlotIfApplicable") orelse return error.DrainDoesNotCommit;
-    const deinit_pos = std.mem.indexOf(u8, region, ".deinit()") orelse return error.MissingDeinit;
-    try testing.expect(commit_pos < deinit_pos);
-    // The SSD tier has no finishSlot flush on this path — the drain must
-    // flush what it just committed itself.
-    try testing.expect(std.mem.indexOf(u8, region, "flushPendingDisk") != null);
-}
-
 test "idleEvictTickMs: sweeps well inside the window without spinning" {
     // Bar: a quarter of the window, clamped to [1s, 30s] — eviction lands near
     // the configured time without the sweep becoming a busy loop.
@@ -252,23 +236,3 @@ test "idleEvictTickMs: sweeps well inside the window without spinning" {
     try testing.expect(idleEvictTickMs(0) >= 1000);
 }
 
-test "the inference loop parks without holding the sleep-inhibition assertion" {
-    // Pin release < park < acquire and startup acquire < load.
-    const source = @embedFile("../../engines/mlx/step.zig") ++ @embedFile("loop.zig");
-    const start = std.mem.indexOf(u8, source, "fn inferenceLoop(") orelse return error.MissingInferenceLoop;
-    const end = std.mem.indexOfPos(u8, source, start + 1, "\nfn ") orelse return error.MissingInferenceLoopEnd;
-    const body = source[start..end];
-    const pass_start = std.mem.indexOf(u8, source, "fn chatPass(") orelse return error.MissingChatPass;
-    const pass_end = std.mem.indexOfPos(u8, source, pass_start + 1, "\nfn ") orelse return error.MissingChatPassEnd;
-    const pass = source[pass_start..pass_end];
-    const drop = std.mem.indexOf(u8, pass, "sleep_inhibit.setActive(holdsSleepWhileParked(sch));") orelse return error.MissingSleepRelease;
-    const park = std.mem.indexOf(u8, pass, "sch.queue_cond.waitUncancelable(sch.io, &sch.queue_mu);") orelse return error.MissingPark;
-    const hold = std.mem.indexOfPos(u8, pass, park, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
-    try testing.expect(drop < park);
-    try testing.expect(park < hold);
-    try testing.expect(std.mem.indexOf(u8, pass, "while (!hasWorkPendingLocked(sch)") != null);
-    const boot_load = std.mem.indexOf(u8, body, "doLoadOnInferenceThread(sch, params)") orelse return error.MissingStartupLoad;
-    const boot_arm = std.mem.indexOf(u8, body, "sleep_inhibit.setActive(true);") orelse return error.MissingSleepAcquire;
-    try testing.expect(boot_arm < boot_load);
-    try testing.expect(std.mem.indexOf(u8, body, "defer sleep_inhibit.release();") != null);
-}

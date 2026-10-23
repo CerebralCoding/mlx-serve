@@ -8,7 +8,7 @@ const log = @import("../../host/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
 const distributed = @import("../../engines/mlx/cluster/distributed.zig");
 const h3 = @import("h3.zig");
-const gen = @import("../../host/media_jobs/gen.zig");
+const config = @import("config.zig");
 
 const S = mlx.mlx_stream;
 
@@ -228,7 +228,7 @@ pub fn begin(pack_dir: []const u8, io: std.Io, model: *h3.Model, turbo: bool, us
     }
     // The worker reads every row's keys, so its step needs about what this Mac's would.
     const bcast_row: u64 = if (bcast) @as(u64, model.blocks.len) * model.cfg.hidden_size * 2 else 0;
-    const need_mib = gen.h3ActivationBytes(rows, bcast_row) >> 20;
+    const need_mib = config.activationBytes(rows, bcast_row) >> 20;
     const free_mib = @as(u64, @intCast(@max(p.worker.avail_mib, 0))) -| p.worker_resident_mib;
     if (need_mib > free_mib) return alone("{d}-row steps need {d} MiB on the worker, which has {d} MiB free", .{ rows, need_mib, free_mib });
     const kv_row: u64 = 2 * @as(u64, model.cfg.num_attention_heads) * model.cfg.attention_head_dim * 2;
@@ -258,7 +258,7 @@ pub fn serveWorker(allocator: std.mem.Allocator, io: std.Io, link: *const distri
     defer _ = mlx.mlx_stream_free(s);
     const dit = try std.fs.path.join(allocator, &.{ dir, "transformer.safetensors" });
     defer allocator.free(dit);
-    var model = try h3.loadDit(allocator, dit, .bfloat16, s);
+    var model = try h3.loadDit(allocator, dit, .{}, .bfloat16, s);
     defer model.deinit();
     if (model.cfg.hidden_size != hidden or model.blocks.len != blocks) return error.DistModelMismatch;
     try model.evalWeights();

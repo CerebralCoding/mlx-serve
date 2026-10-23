@@ -2,8 +2,9 @@
 
 const mlx = @import("../../mlx/ffi.zig");
 const gen_mod = @import("gen.zig");
-const diarization_mod = @import("../../plugins/nemotron_diarization/diarization.zig");
 const log = @import("../log.zig");
+const served = @import("plugin/served.zig");
+const plugin_engine = @import("plugin/engine.zig");
 
 const publishHotCacheResidency = @import("../../engines/mlx/cache/budget.zig").publishHotCacheResidency;
 const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
@@ -18,7 +19,7 @@ const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
 /// build the modality engine (its mlx ops bind to this thread's GPU stream from
 /// t0), install it on the entry, move the stub config/tok/chat_config over, and
 /// mark ready. The MLX/ds4/llama fields stay null; request handlers route
-/// through the matching `image_engine`/`audio_engine`/`video_engine` slot.
+/// through `media_plugin`.
 pub fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: gen_mod.Modality) !void {
     log.info("[gen] loading {s} engine: {s}\n", .{ @tagName(modality), params.model_dir });
     const entry = params.entry;
@@ -76,14 +77,12 @@ pub fn doLoadGenOnInferenceThread(sch: *Scheduler, params: anytype, modality: ge
     // its partial state, the slot stays null, and the stub config (still owned
     // by the caller, not yet installed below) is freed by the caller's
     // error path — so we must not touch `entry.config` before this succeeds.
-    switch (modality) {
-        .image => entry.image_engine = try gen_mod.ImageEngine.load(sch.io, sch.allocator, params.model_dir),
-        .audio => entry.audio_engine = try gen_mod.AudioEngine.load(sch.io, sch.allocator, params.model_dir),
-        .video => entry.video_engine = try gen_mod.VideoEngine.load(sch.io, sch.allocator, params.model_dir),
-        .mesh => entry.mesh_engine = try gen_mod.MeshEngine.load(sch.io, sch.allocator, params.model_dir),
-        .decision => entry.decision_engine = try gen_mod.DecisionEngine.load(sch.io, sch.allocator, params.model_dir),
-        .diarization => entry.diarization_engine = try diarization_mod.Engine.load(sch.io, sch.allocator, params.model_dir),
-    }
+    // Every media backend is a plugin: a pack none of them wins (two claim it at one rank) is refused by name.
+    const t = served.claimPath(sch.io, params.model_dir) orelse {
+        log.err("[gen] no media plugin claims the {s} pack at {s}\n", .{ @tagName(modality), params.model_dir });
+        return error.UnsupportedMediaPack;
+    };
+    entry.media_plugin = try plugin_engine.Engine.load(sch.io, sch.allocator, params.model_dir, t, mlx.mlx_default_gpu_stream_new());
 
     // Install stub CPU state (infallible from here, mirroring the ds4 path).
     entry.releaseRetainedCpuState();

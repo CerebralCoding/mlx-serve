@@ -33,11 +33,10 @@ pub const ProjRung = enum {
     norms, // + input/post-attention RMS-norms and both residual adds
     mlp, // + the layer's real MLP (MoE or dense) — a whole layer
     yarn_rope, // + laguna's REAL rope arguments (YaRN freqs on full layers)
-    real_attn, // same layer, but attention is the SHIPPED lagunaAttnWith
 };
 
 /// Whether a rung issues each projection immediately before its own
-/// dependent chain (how `lagunaAttnWith` builds the graph) or issues q/k/v
+/// dependent chain (how the attention arms build the graph) or issues q/k/v
 /// together and only then post-processes them.
 pub const ProjOrder = enum { interleaved, hoisted };
 
@@ -111,7 +110,7 @@ pub fn diagProjBench(self: *Transformer, iters: usize, ctx: *ForwardCtx) void {
     if (eligible == 0) return;
 
     log.info("[proj-bench] ladder over {d} dense-bf16 attention layers ({d:.2} GB/pass)\n", .{ eligible, bytes / 1.0e9 });
-    const rungs = [_]ProjRung{ .matmul_only, .reshape, .qk_norm, .transpose, .rope, .sdpa, .gate, .norms, .mlp, .yarn_rope, .real_attn };
+    const rungs = [_]ProjRung{ .matmul_only, .reshape, .qk_norm, .transpose, .rope, .sdpa, .gate, .norms, .mlp, .yarn_rope };
     const orders = [_]ProjOrder{ .interleaved, .hoisted };
     for (rungs) |rung| {
         var line: [2]f64 = .{ 0, 0 };
@@ -150,6 +149,7 @@ pub fn projRungOnce(
     order: ProjOrder,
     ctx: *ForwardCtx,
 ) !void {
+    _ = ctx;
     const cfg = &self.config;
     const hd: c_int = @intCast(cfg.head_dim);
     const kv_h: c_int = @intCast(cfg.num_key_value_heads);
@@ -220,7 +220,7 @@ pub fn projRungOnce(
             // shape, but produced by the same op the forward produces it
             // with.
             // At the `yarn_rope` rung the ladder switches to the exact
-            // RoPE arguments `lagunaAttnWith` uses: full layers take a
+            // RoPE arguments the laguna attention arm used: full layers take a
             // precomputed YaRN freqs ARRAY (and only the partial rotary
             // width), sliding layers the local base frequency.
             const l_full = cfg.isGlobalLayer(@intCast(li));
@@ -247,32 +247,6 @@ pub fn projRungOnce(
                 xin_l = n;
             } else {
                 try mlx.check(mlx.mlx_array_set(&xin_l, acc));
-            }
-
-            // Top rung: hand the SAME normed input to the shipped
-            // attention function. If this matches the reconstruction, the
-            // reconstruction is faithful and the cost is not in attention.
-            if (rung == .real_attn) {
-                var nomask = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(nomask);
-                const real_out = try self.lagunaAttnWith(ctx, xin_l, &fa, @intCast(li), 0, 1, 1, false, &nomask);
-                defer _ = mlx.mlx_array_free(real_out);
-                var ra = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&ra, acc, real_out, self.s));
-                _ = mlx.mlx_array_free(acc);
-                acc = ra;
-                const ffn2 = try self.rmsNorm(acc, lw.post_attn_norm);
-                defer _ = mlx.mlx_array_free(ffn2);
-                const mlp2 = switch (lw.mlp) {
-                    .moe => |*mw| try self.moeMLP(ffn2, mw),
-                    .dense => |*dw| try self.denseMLP(ffn2, dw),
-                };
-                defer _ = mlx.mlx_array_free(mlp2);
-                var s3 = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_add(&s3, acc, mlp2, self.s));
-                _ = mlx.mlx_array_free(acc);
-                acc = s3;
-                continue;
             }
 
             var tmp = mlx.mlx_array_new();

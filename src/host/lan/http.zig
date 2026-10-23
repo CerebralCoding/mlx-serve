@@ -13,6 +13,7 @@ const http_server = @import("../http/server.zig");
 const request_model = @import("../api/request_model.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
+const isRoute = @import("../http/router.zig").isRoute;
 const resolveRequestModelId = @import("../api/request_model.zig").resolveRequestModelId;
 const parseModelFromRequest = @import("../api/request_model.zig").parseModelFromRequest;
 const sendResponse = @import("../http/respond.zig").sendResponse;
@@ -146,7 +147,7 @@ fn proxiedBody(allocator: std.mem.Allocator, body: []const u8, raw: ?[]const u8,
 }
 
 pub fn handleProviderProxy(allocator: std.mem.Allocator, stream: *Conn, prov: *providers_mod.Providers, path: []const u8, body: []const u8, raw_model: ?[]const u8, full_id: []const u8) !void {
-    if (!std.mem.eql(u8, path, "/v1/chat/completions")) {
+    if (!isRoute(path, "/v1/chat/completions")) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Provider models are served on /v1/chat/completions only", 400);
         return;
     }

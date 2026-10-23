@@ -10,6 +10,7 @@ const DenseKVView = @import("../../../sdk/blocks/attention/kv_view.zig").DenseKV
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const Transformer = @import("../transformer.zig").Transformer;
+const plugin_driver = @import("../plugin/driver.zig");
 const MAX_BATCH_ROWS = @import("layered.zig").MAX_BATCH_ROWS;
 
 // ── Batched-decode forward pass ──
@@ -49,6 +50,7 @@ pub fn forwardBatchedDecode(
         layered.std_batched_logged = true;
         log.info("[batched] batched decode engaged (slots={d})\n", .{next_tokens.len});
     }
+    if (self.plugin) |b| return plugin_driver.forwardBatched(self, b, next_tokens, ctxs, rope_offsets, null);
 
     const cfg = &self.config;
     const h_count = cfg.num_attention_heads;
@@ -251,12 +253,7 @@ pub fn forwardBatchedDecode(
         defer _ = mlx.mlx_array_free(attn_flat);
         try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &cur_out_shape, 3, self.s));
 
-        const o_in = if (lw.ag_w != null) try self.attnOutGate(normed, attn_flat, lw, .{ .ctx = null }) else attn_flat;
-        defer if (lw.ag_w != null) {
-            _ = mlx.mlx_array_free(o_in);
-        };
-
-        const o_out = try self.qmatmul(o_in, lw.o_w, lw.o_s, lw.o_b);
+        const o_out = try self.qmatmul(attn_flat, lw.o_w, lw.o_s, lw.o_b);
         defer _ = mlx.mlx_array_free(o_out);
 
         // MLP path — mirrors forwardStandard exactly.
@@ -319,13 +316,6 @@ pub fn forwardBatchedDecode(
 
     var logits = try self.lmHeadProject(final_normed);
     _ = mlx.mlx_array_free(final_normed);
-
-    if (self.output_mult) |m| {
-        var scaled = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&scaled, logits, m, self.s));
-        _ = mlx.mlx_array_free(logits);
-        logits = scaled;
-    }
 
     if (self.softcap_scalar != null) {
         const capped = try self.applySoftcap(logits);

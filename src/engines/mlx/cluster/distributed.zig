@@ -2,6 +2,7 @@
 //! Thunderbolt 5, macOS 26.2+). Rank 0 is the server; every other rank is a
 //! worker that executes what rank 0 tells it, in lockstep.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../../mlx/ffi.zig");
 const crt = @import("../../../sdk/util/crt.zig");
@@ -162,9 +163,9 @@ pub const Link = struct {
         }
         var rank_buf: [16]u8 = undefined;
         var coord_buf: [128]u8 = undefined;
-        crt.setEnv("MLX_RANK", try std.fmt.bufPrintSentinel(&rank_buf, "{d}", .{cfg.rank}, 0));
-        crt.setEnv("MLX_JACCL_COORDINATOR", try std.fmt.bufPrintSentinel(&coord_buf, "{s}", .{cfg.coordinator}, 0));
-        crt.setEnv("MLX_IBV_DEVICES", path);
+        _ = env.setForeign("MLX_RANK", try std.fmt.bufPrintSentinel(&rank_buf, "{d}", .{cfg.rank}, 0));
+        _ = env.setForeign("MLX_JACCL_COORDINATOR", try std.fmt.bufPrintSentinel(&coord_buf, "{s}", .{cfg.coordinator}, 0));
+        _ = env.setForeign("MLX_IBV_DEVICES", path);
         log.info("[dist] joining as rank {d}/{d} via {s}, coordinator {s}\n", .{ cfg.rank, cfg.size, cfg.device, cfg.coordinator });
         // Rank 0 listens for the bell before the group forms, so rank 1 finds it once it does.
         const coord = try parseCoordinator(cfg.coordinator);
@@ -1129,7 +1130,7 @@ pub fn cmdWorker(io: std.Io, allocator: std.mem.Allocator, args: []const []const
     var home_root: ?[]u8 = null;
     defer if (home_root) |h| allocator.free(h);
     if (roots.items.len == 0) {
-        home_root = try @import("../../../host/cli/cli.zig").modelsRootPath(allocator, std.mem.span(std.c.getenv("HOME") orelse "/tmp"));
+        home_root = try @import("../../../host/cli/cli.zig").modelsRootPath(allocator, std.mem.span(env.get(.HOME) orelse "/tmp"));
         try roots.append(allocator, home_root.?);
     }
     try rest.appendSlice(allocator, &.{ "--rank", "1" });

@@ -4,6 +4,7 @@
 //! `MLX_SERVE_KERNEL_CONTRACT_OFFLINE` names a scratch directory (it needs the Metal device to generate sources).
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../../mlx/ffi.zig");
 const spec = @import("spec.zig");
@@ -132,7 +133,7 @@ fn functionName(source: []const u8) ?[]const u8 {
 // ── tests ──
 
 test "kernel contract offline: each record's M1/M2 limit is what the toolchain compiles" {
-    const dir = std.c.getenv("MLX_SERVE_KERNEL_CONTRACT_OFFLINE") orelse return error.SkipZigTest;
+    const dir = env.get(.MLX_SERVE_KERNEL_CONTRACT_OFFLINE) orelse return error.SkipZigTest;
     if (!builtin.os.tag.isDarwin() or mlx.noGpuBackend()) return error.SkipZigTest;
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();

@@ -1,6 +1,7 @@
 //! Prefill interleaving: decode share, boundary admission, SSD write-through, chunk width.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("transformer.zig");
 const generate_mod = @import("generate.zig");
@@ -33,7 +34,7 @@ const scheduler_mod = @import("scheduler.zig");
 var prefill_interleave_cached: ?bool = null;
 pub fn prefillInterleaveEnabled() bool {
     if (prefill_interleave_cached) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_PREFILL_INTERLEAVE");
+    const raw = env.get(.MLX_SERVE_PREFILL_INTERLEAVE);
     const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     prefill_interleave_cached = on;
     return on;
@@ -116,8 +117,8 @@ pub fn parseDecodeShare(text: []const u8) error{InvalidDecodeShare}!f32 {
 /// 90-120 s behind a 90k prefill (26.10.3 validation). `--prefill-decode-share 0` restores the old schedule.
 pub const DEFAULT_DECODE_SHARE: f32 = 0.25;
 
-pub fn resolveDecodeShare(flag: ?[]const u8, env: ?[]const u8) error{InvalidDecodeShare}!f32 {
-    const text = flag orelse env orelse return DEFAULT_DECODE_SHARE;
+pub fn resolveDecodeShare(flag: ?[]const u8, env_value: ?[]const u8) error{InvalidDecodeShare}!f32 {
+    const text = flag orelse env_value orelse return DEFAULT_DECODE_SHARE;
     return parseDecodeShare(text);
 }
 
@@ -237,8 +238,8 @@ pub fn emptySlotCache(slot: *Slot) void {
     if (slot.ssm_entries) |ents| prefix_cache_mod.HotPrefixCache.resetSsmEntries(ents);
     if (slot.model.transformer) |xf| {
         slot.cache.truncate(0, xf.s) catch {};
-        xf.resetQsaPooledRope();
-        xf.qwen4MtpResetOwned(slot.enable_mtp);
+        xf.qwen4Host().resetQsaPooledRope();
+        xf.qwen4Host().qwen4MtpResetOwned(slot.enable_mtp);
     }
     slot.moe_seq_offset = 0;
     slot.cached_tokens = 0;
@@ -419,7 +420,7 @@ pub fn writeThroughEnabledFromEnv(raw: ?[]const u8) bool {
 fn writeThroughEnabled() bool {
     if (write_through_env_cached) |v| return v;
     const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_SSD_WRITE_THROUGH") orelse break :blk writeThroughEnabledFromEnv(null);
+        const raw = env.get(.MLX_SERVE_SSD_WRITE_THROUGH) orelse break :blk writeThroughEnabledFromEnv(null);
         break :blk writeThroughEnabledFromEnv(std.mem.sliceTo(raw, 0));
     };
     write_through_env_cached = v;

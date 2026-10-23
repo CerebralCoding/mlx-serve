@@ -2,11 +2,12 @@
 //! `log.zig`, the MLX error latch in `mlx/ffi.zig`, a kernel cache it owns, the environment (until `src/env.zig`),
 //! `--metrics`' counters and the memory ceiling the caller supplies. Built-ins and outside plugins get the same table.
 //!
-//! `HostGpu` delegates to the shims compiled with lib/mlx-stream (`csrc/mlx_event_shim.cpp`, `mlx_alloc_shim.cpp` with
-//! its `mlx_launch_cache.inc` and `mimo_gpu_address.inc`, `q3_event_shim.mm`): the one implementation over MLX's
+//! `HostGpu` delegates to the shims compiled with mlx-stream (`sdk/weights/streamed/csrc/`: `mlx_event_shim.cpp`,
+//! `mlx_alloc_shim.cpp` with its `mlx_launch_cache.inc` and `mimo_gpu_address.inc`, `q3_event_shim.mm`): the one implementation over MLX's
 //! internals until P4 moves it here. A graph without them (Linux, Windows) refuses every call `unsupported`.
 
 const std = @import("std");
+const env = @import("../env.zig");
 const abi = @import("../abi/host.zig");
 const mlx = @import("../mlx/ffi.zig");
 const log = @import("log.zig");
@@ -198,7 +199,7 @@ fn lever(_: ?*anyopaque, name: abi.Str) callconv(.c) abi.Str {
     if (n.len >= buf.len) return .{};
     @memcpy(buf[0..n.len], n);
     buf[n.len] = 0;
-    const v = std.c.getenv(buf[0..n.len :0]) orelse return .{};
+    const v = env.byName(buf[0..n.len :0].ptr) orelse return .{};
     return abi.Str.of(std.mem.span(v));
 }
 
@@ -225,7 +226,7 @@ fn workingSetHeadroom(_: ?*anyopaque) u64 {
 
 // ── HostGpu ──
 
-/// The lib/mlx-stream shims, on the graphs that compile them.
+/// The mlx-stream shims, on the graphs that compile them.
 const shims: ?type = if (@import("build_options").mlx_stream) struct {
     pub extern "c" fn dsv41ev_create_metal(start: u64, object: *u64) i32;
     pub extern "c" fn dsv41ev_create_host(word: *i64, timeout_ns: i64) i32;
@@ -454,7 +455,7 @@ test "builtin host: levers read the environment (diagnostic semantics: unset or 
     const h = try sdk.Host.of(b.host());
     try testing.expectEqual(@as(?[]const u8, null), h.leverRaw("MLX_SERVE_HOST_TABLE_TEST_SURELY_UNSET"));
     try testing.expect(!h.leverOn("MLX_SERVE_HOST_TABLE_TEST_SURELY_UNSET"));
-    const home = std.mem.span(std.c.getenv("HOME") orelse return error.SkipZigTest);
+    const home = std.mem.span(env.get(.HOME) orelse return error.SkipZigTest);
     try testing.expectEqualStrings(home, h.leverRaw("HOME").?);
     try testing.expectEqual(@as(u64, 12345), h.memoryCeiling());
     ceiling = 7;

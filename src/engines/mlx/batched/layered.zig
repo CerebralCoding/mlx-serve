@@ -2,6 +2,7 @@
 //! Owns gdn_batched_logged, per_slot_attn_logged, gdn_batched_verify_rows_logged, row_axis_verify_logged, verify_fail_after_flush, MAX_BATCH_ROWS, and 5 more.
 
 const std = @import("std");
+const plugin_driver = @import("../plugin/driver.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
@@ -54,6 +55,7 @@ pub fn forwardMoeBatchedDecode(
     rope_offsets: []const u32,
     hidden_rows: ?*?[]mlx.mlx_array,
 ) ![]mlx.mlx_array {
+    if (self.plugin) |b| return plugin_driver.forwardBatched(self, b, next_tokens, ctxs, rope_offsets, hidden_rows);
     if (self.config.isGlm5()) return self.forwardGlmBatchedDecode(next_tokens, ctxs, hidden_rows);
     const N: c_int = @intCast(next_tokens.len);
     std.debug.assert(next_tokens.len == ctxs.len);
@@ -95,6 +97,7 @@ pub fn forwardMoeBatchedVerify(
         gdn_batched_verify_rows_logged = rows;
         log.info("[batched] gdn batched verify engaged (slots={d}, width={d})\n", .{ ctxs.len, width });
     }
+    if (self.plugin) |b| return plugin_driver.forwardBatchedVerify(self, b, token_arr, ctxs, rope_offsets, hidden_last, hidden_all);
     return self.forwardMoeBatchedRows(token_arr, ctxs, rope_offsets, true, hidden_last, hidden_all);
 }
 

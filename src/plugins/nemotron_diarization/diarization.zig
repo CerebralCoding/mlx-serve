@@ -245,6 +245,11 @@ pub const Engine = struct {
     dtype: mlx.mlx_dtype,
 
     pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Engine {
+        return loadOn(io, allocator, model_dir, mlx.mlx_default_gpu_stream_new());
+    }
+
+    /// `load` running on `s` (borrowed).
+    pub fn loadOn(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !*Engine {
         var dir = try std.Io.Dir.openDirAbsolute(io, model_dir, .{});
         defer dir.close(io);
         const cfg_bytes = try dir.readFileAlloc(io, "config.json", allocator, .limited(1 << 20));
@@ -256,7 +261,7 @@ pub const Engine = struct {
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
-        self.s = mlx.mlx_default_gpu_stream_new();
+        self.s = s;
         self.cfg = cfg;
         self.w = try model_mod.loadWeightsFile(allocator, model_dir, "model.safetensors");
         errdefer self.w.deinit();

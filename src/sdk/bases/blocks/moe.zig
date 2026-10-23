@@ -15,6 +15,7 @@ const block = @import("../block.zig");
 const linear = @import("linear.zig");
 const compiled = @import("compiled.zig");
 const QuantParams = @import("../../quant/params.zig").QuantParams;
+const quant_abi = @import("../../../abi/quant.zig");
 const model = @import("../../../engines/mlx/model.zig");
 const envFlagCached = @import("../../../engines/mlx/env_transformer.zig").envFlagCached;
 const routing = @import("../../blocks/moe/routing.zig");
@@ -65,6 +66,15 @@ pub const Router = union(enum) {
     logit_bias: Array,
 };
 
+/// Routed experts a quant format runs as one SwiGLU dispatch (`QuantTable.swiglu`, EXL3): its three banks as the
+/// format loaded them; the `Bank`s stay unbuilt.
+pub const FormatBanks = struct {
+    table: *const quant_abi.QuantTable,
+    gate: quant_abi.Weight,
+    up: quant_abi.Weight,
+    down: quant_abi.Weight,
+};
+
 /// The shared expert; `gate_logit` unset = always added.
 pub const SharedExpert = struct {
     gate: Linear,
@@ -100,6 +110,8 @@ pub const Moe = struct {
         clamp_limit: f32 = 0,
         /// The routing chain compiled (`compileRouting`); null = op by op.
         route_fn: compiled.Closure = .{ .ctx = null },
+        /// Set: the experts are the format's (`gate`/`up`/`down` unread).
+        format_banks: ?FormatBanks = null,
     };
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
@@ -188,7 +200,7 @@ fn geglu(w: *const Moe.Weights, parent: *Graph, gate: Array, up: Array) !Array {
     return parent.keep(try t.mul(try t.mul(gate, try t.sigmoid(gate)), up));
 }
 
-fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
+pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     var t = parent.scope();
     defer t.deinit();
     const g = &t;
@@ -227,7 +239,10 @@ fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     const ungated_a4: ?moe_affine4.Ungated = if (B * S != 1) null else ungatedA4(w, gq.group_size);
     const fp4_shared: ?moe_affine4.Shared = if (B * S == 1) if (shared_down) |sd| .{ .down = sd, .logit = r.gate_logit.? } else null else null;
     const cuda_fmt = if (mlx.cudaAvailable()) gather_qmv_rows.moeCudaFormat(B * S, gq.mode, uq.mode, dq.mode, true, false, w.up.expert_scale.ctx != null, w.clamp_limit > 0) else null;
-    if (moe_decode.moeFp4DecodeEligible(B * S, false, w.clamp, ops.dtype(x), gq.mode, uq.mode, dq.mode) and
+    if (w.format_banks) |fb| {
+        out = try formatSwiglu(w, &fb, g, x, r);
+        reduced = true;
+    } else if (moe_decode.moeFp4DecodeEligible(B * S, false, w.clamp, ops.dtype(x), gq.mode, uq.mode, dq.mode) and
         try fp4Decode(w, g, &out, x, r, fp4_shared))
     {
         reduced = true;
@@ -270,6 +285,16 @@ fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     const down = shared_down orelse try sharedDown(w, g, &se, x);
     const logit = r.gate_logit orelse try se.gate_logit.forward(g, x);
     return parent.keep(try g.add(sum, try g.mul(try g.sigmoid(logit), down)));
+}
+
+/// The format's routed SwiGLU over the top-k, weighted and summed (the engine's exl3 arm).
+fn formatSwiglu(w: *const Moe.Weights, fb: *const FormatBanks, g: *Graph, x: Array, r: Routed) !Array {
+    const swiglu = fb.table.swiglu orelse return error.QuantFormatHasNoSwiglu;
+    const limit = w.clamp orelse return error.QuantFormatClampUnsupported;
+    var y: quant_abi.Array = .{};
+    const v = swiglu(&fb.gate, &fb.up, &fb.down, .{ .ctx = x.ctx }, .{ .ctx = r.inds.ctx }, .{ .ctx = r.scores.ctx }, &.{ .limit = @intCast(limit) }, .{ .ctx = g.s.ctx }, &y);
+    if (!v.isOk()) return error.QuantFormatSwigluFailed;
+    return g.adopt(.{ .ctx = y.ctx });
 }
 
 fn sharedDown(w: *const Moe.Weights, parent: *Graph, se: *const SharedExpert, x: Array) !Array {

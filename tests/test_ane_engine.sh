@@ -1,16 +1,18 @@
 #!/usr/bin/env bash
-# The Neural Engine engine over HTTP (`src/engines/ane/lm.zig`). A dense qwen3_5 pack opted in per
-# model (`"ane": true` in model-settings.json) serves on the ANE: engine "ane" with the 64K ladder,
-# stream and non-stream deliver the same bytes, what it cannot serve is refused by name, a prompt
-# grows past the first context, a repeat restores a checkpoint. `--ane` on a pack the engine cannot
-# run serves it on the GPU by name, and no opt-in leaves a qwen3_5 pack on the GPU.
+# test_ane_engine.sh — the Neural Engine engine over HTTP (src/engines/ane/lm.zig). `"ane": true` in a scratch
+# model-settings.json serves a dense qwen3_5 pack on the ANE (`[ane] ready`, meta.engine ane, 64K context): stream ==
+# non-stream bytes; logprobs, forced tool calls and images are 400s naming the Neural Engine; a ~15K-token prompt
+# finds its needle across `context 4096 -> 16384` and its repeat restores a checkpoint. Without the setting the pack
+# stays on the GPU; `--ane` on a pack the engine cannot run serves it on the GPU by name.
 #
-# Scratch HOME (the real model-settings.json never applies); the compile cache stays the real one
-# (MLX_SERVE_ANE_CACHE_DIR), so only the first run on a Mac compiles. SKIPs without the packs or
-# the private framework.
+#   ./tests/test_ane_engine.sh [port]   # ANE_MODEL (Qwen3.5-0.8B), ANE_OTHER_MODEL (LFM2.5-2.6B)
 #
-# Usage: ./tests/test_ane_engine.sh [port]
+# Keeps the real compile cache (MLX_SERVE_ANE_CACHE_DIR): only a Mac's first run compiles. SKIPs without the packs or
+# the private framework. Hermetic twins: the ane engine unit tests, `aneServes`; pack-gated:
+# `ANE_TEST_PACK=<pack> zig build test -Dtest-filter="pack on the ANE"`.
+
 set -uo pipefail
+source "$(dirname "$0")/lib/server.sh"
 PORT="${1:-11386}"
 ROOT="$(cd "$(dirname "$0")/.." && pwd)"
 BIN="$ROOT/zig-out/bin/mlx-serve"
@@ -46,11 +48,7 @@ boot() { # boot <model> [flags...] — a cold ANE compile takes minutes, a cache
     : >"$LOG"
     HOME="$FAKE_HOME" "$BIN" --serve --model "$m" --host 127.0.0.1 --port "$PORT" --log-level debug --log-file off "$@" >"$LOG" 2>&1 &
     SRV=$!
-    for _ in $(seq 1 1200); do
-        curl -sf "http://127.0.0.1:$PORT/health" >/dev/null 2>&1 && return 0
-        kill -0 "$SRV" 2>/dev/null || break
-        sleep 0.5
-    done
+    srv_wait_health "http://127.0.0.1:$PORT" 1200 0.5 "$SRV" && return 0
     echo "FAIL: server never became healthy"; tail -5 "$LOG"; exit 1
 }
 meta() { # meta <field> — the default model row's meta.<field>, or a top-level field

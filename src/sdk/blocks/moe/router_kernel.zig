@@ -2,6 +2,7 @@
 //! Owns RouterMode, ROUTER_MAX_EXPERTS, moeRouterSource, ROUTER_SOURCES, ROUTER_NAMES, router_kernels, and 13 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -54,7 +55,7 @@ const moeRoutingChain = @import("routing.zig").moeRoutingChain;
 /// weight vector that the simdgroups sitting out the selection compute while it runs (the matmul it
 /// replaces is two dependent launches ahead of the router). It needs at least two simdgroups.
 /// `logit_bias` (kolibri1) selects on `logits + bias` and weights by `sigmoid(logits)`.
-const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2, softmax_gate = 3, logit_bias = 4 };
+pub const RouterMode = enum(u8) { softmax = 0, sigmoid_bias = 1, sigmoid_bias_grouped = 2, softmax_gate = 3, logit_bias = 4 };
 
 /// Largest expert count the kernel will stage in threadgroup memory. The
 /// sigmoid arm keeps two f32 planes (key + raw weight), so 2048 experts is
@@ -149,7 +150,7 @@ fn moeRouterSource(comptime mode: RouterMode) [:0]const u8 {
     });
 }
 
-const ROUTER_SOURCES = [5][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped), moeRouterSource(.softmax_gate), moeRouterSource(.logit_bias) };
+pub const ROUTER_SOURCES = [5][:0]const u8{ moeRouterSource(.softmax), moeRouterSource(.sigmoid_bias), moeRouterSource(.sigmoid_bias_grouped), moeRouterSource(.softmax_gate), moeRouterSource(.logit_bias) };
 const ROUTER_NAMES = [5][*:0]const u8{ "mlxserve_moe_router_softmax", "mlxserve_moe_router_sigmoid", "mlxserve_moe_router_sigmoid_grouped", "mlxserve_moe_router_softmax_gate", "mlxserve_moe_router_logit_bias" };
 var router_kernels: [5]?mlx.mlx_fast_metal_kernel = @splat(null);
 
@@ -187,7 +188,7 @@ fn getMoeRouterKernel(mode: RouterMode) !mlx.mlx_fast_metal_kernel {
 
 /// Threads per row. Selection needs a full simdgroup; phase 1 wants enough
 /// threads to cover the expert row without a long strided loop.
-fn moeRouterThreadGroup(num_experts: c_int) c_int {
+pub fn moeRouterThreadGroup(num_experts: c_int) c_int {
     const rounded = @divTrunc(num_experts + 31, 32) * 32;
     return @max(@as(c_int, 32), @min(@as(c_int, 256), rounded));
 }
@@ -238,7 +239,7 @@ var moe_router_engaged: bool = false;
 pub fn moeRouterFusedEnabled() bool {
     if (moe_router_fused_override) |v| return v;
     if (moe_router_fused_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MOE_ROUTER_FUSED");
+    const raw = env.get(.MLX_SERVE_MOE_ROUTER_FUSED);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     moe_router_fused_env = enabled;
     return enabled;

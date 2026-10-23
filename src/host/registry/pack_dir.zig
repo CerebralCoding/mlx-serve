@@ -12,10 +12,12 @@ pub const FsPackDir = struct {
     io: std.Io,
     root: std.Io.Dir,
 
-    /// An absolute path only: a relative or empty one is refused (openDirAbsolute asserts on it).
+    /// An absolute path only: a relative or empty one is refused (openDirAbsolute asserts on it). A GGUF picked by its
+    /// file (`--mlx-gguf`) is the pack of its folder.
     pub fn open(io: std.Io, abs_path: []const u8) !FsPackDir {
         if (abs_path.len == 0 or !std.fs.path.isAbsolute(abs_path)) return error.NotAbsolute;
-        return .{ .io = io, .root = try std.Io.Dir.openDirAbsolute(io, abs_path, .{}) };
+        const root = if (std.mem.endsWith(u8, abs_path, ".gguf")) std.fs.path.dirname(abs_path) orelse abs_path else abs_path;
+        return .{ .io = io, .root = try std.Io.Dir.openDirAbsolute(io, root, .{}) };
     }
 
     pub fn close(self: *FsPackDir) void {
@@ -30,9 +32,14 @@ pub const FsPackDir = struct {
         return @ptrCast(@alignCast(ctx.?));
     }
 
+    /// `rel` when it stays inside the pack: an absolute path would make `Dir` ignore the root.
+    fn inside(rel: Str) ?[]const u8 {
+        return if (std.fs.path.isAbsolute(rel.slice())) null else rel.slice();
+    }
+
     fn exists(ctx: ?*anyopaque, rel: Str) callconv(.c) bool {
         const self = of(ctx);
-        _ = self.root.statFile(self.io, rel.slice(), .{}) catch return false;
+        _ = self.root.statFile(self.io, inside(rel) orelse return false, .{}) catch return false;
         return true;
     }
 
@@ -41,14 +48,14 @@ pub const FsPackDir = struct {
         const size = fileBytes(ctx, rel);
         if (size == 0 and !exists(ctx, rel)) return Verdict.refuse(.failed, "no such file in the pack");
         if (size > cap) return Verdict.refuse(.too_large, "file larger than the read bound");
-        const got = self.root.readFile(self.io, rel.slice(), buf[0..cap]) catch return Verdict.refuse(.failed, "the file does not read");
+        const got = self.root.readFile(self.io, inside(rel) orelse return Verdict.refuse(.failed, "no such file in the pack"), buf[0..cap]) catch return Verdict.refuse(.failed, "the file does not read");
         len.* = got.len;
         return .ok;
     }
 
     fn header(ctx: ?*anyopaque, rel: Str, buf: [*]u8, cap: usize, len: *usize) callconv(.c) Verdict {
         const self = of(ctx);
-        var f = self.root.openFile(self.io, rel.slice(), .{}) catch return Verdict.refuse(.failed, "no such file in the pack");
+        var f = self.root.openFile(self.io, inside(rel) orelse return Verdict.refuse(.failed, "no such file in the pack"), .{}) catch return Verdict.refuse(.failed, "no such file in the pack");
         defer f.close(self.io);
         var rb: [4096]u8 = undefined;
         var rs = f.reader(self.io, &rb);
@@ -61,7 +68,8 @@ pub const FsPackDir = struct {
 
     fn list(ctx: ?*anyopaque, rel: Str, buf: [*]u8, cap: usize, len: *usize) callconv(.c) Verdict {
         const self = of(ctx);
-        var dir = self.root.openDir(self.io, if (rel.len == 0) "." else rel.slice(), .{ .iterate = true }) catch return Verdict.refuse(.failed, "no such folder in the pack");
+        const r = inside(rel) orelse return Verdict.refuse(.failed, "no such folder in the pack");
+        var dir = self.root.openDir(self.io, if (r.len == 0) "." else r, .{ .iterate = true }) catch return Verdict.refuse(.failed, "no such folder in the pack");
         defer dir.close(self.io);
         var n: usize = 0;
         var it = dir.iterate();
@@ -92,7 +100,7 @@ pub const FsPackDir = struct {
 
     fn fileBytes(ctx: ?*anyopaque, rel: Str) callconv(.c) u64 {
         const self = of(ctx);
-        const st = self.root.statFile(self.io, rel.slice(), .{}) catch return 0;
+        const st = self.root.statFile(self.io, inside(rel) orelse return 0, .{}) catch return 0;
         return if (st.kind == .file) @intCast(st.size) else 0;
     }
 };
@@ -135,4 +143,24 @@ test "pack dir: a folder on disk lists, sizes and reads like the in-memory pack"
     try testing.expectEqualStrings("w.safetensors", sub.next().?);
     try testing.expect(dir.entries("nope", &buf) == null);
     try testing.expectError(error.NotAbsolute, FsPackDir.open(testing.io, "rel"));
+}
+
+test "pack dir: an absolute path never reads outside the pack" {
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try tmp.dir.writeFile(testing.io, .{ .sub_path = "config.json", .data = "{}" });
+    var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+    const path = pbuf[0..try tmp.dir.realPath(testing.io, &pbuf)];
+    var fs = try FsPackDir.open(testing.io, "/");
+    defer fs.close();
+    const dir = fs.packDir();
+    var abs_buf: [std.fs.max_path_bytes]u8 = undefined;
+    const abs = try std.fmt.bufPrint(&abs_buf, "{s}/config.json", .{path});
+    var buf: [64]u8 = undefined;
+    var why: Verdict = .{};
+    try testing.expect(!dir.has(abs) and dir.fileBytes(abs) == 0);
+    try testing.expect(dir.readFile(abs, &buf, &why) == null and why.code == .failed);
+    var len: usize = 0;
+    try testing.expect(!dir.safetensors_header(dir.ctx, Str.of(abs), &buf, buf.len, &len).isOk());
+    try testing.expect(dir.entries(path, &buf) == null);
 }

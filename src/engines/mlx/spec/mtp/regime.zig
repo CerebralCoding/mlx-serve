@@ -1,6 +1,7 @@
 //! MTP regime gate: dry-extension, live costs, two-chunk regime choice.
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
 const testing = std.testing;
 const Generator = @import("../../generate/generator.zig").Generator;
@@ -93,7 +94,7 @@ pub fn mtpExtDryEnabledFromEnv(raw: ?[]const u8) bool {
 
 pub fn mtpExtDryEnabled() bool {
     if (mtp_ext_dry_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_EXT_DRY")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_EXT_DRY);
     const on = mtpExtDryEnabledFromEnv(raw);
     mtp_ext_dry_cache = on;
     return on;
@@ -295,7 +296,7 @@ pub fn mtpRegimeForceAt(r: *MtpRegime, round_idx: u32) ?bool {
 var mtp_regime_cache: ?bool = null;
 pub fn mtpRegimeGateEnabled() bool {
     if (mtp_regime_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_REGIME")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_REGIME);
     const on = mtpLiveCostEnabledFromEnv(raw);
     mtp_regime_cache = on;
     return on;
@@ -312,7 +313,7 @@ pub fn mtpLiveCostEnabledFromEnv(raw: ?[]const u8) bool {
 
 pub fn mtpLiveCostEnabled() bool {
     if (mtp_livecost_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_LIVECOST")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_LIVECOST);
     const on = mtpLiveCostEnabledFromEnv(raw);
     mtp_livecost_cache = on;
     return on;

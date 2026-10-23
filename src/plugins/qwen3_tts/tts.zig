@@ -31,6 +31,9 @@ const tokenizer_mod = @import("../../host/tokenizer/tokenizer.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const wav_mod = @import("../../sdk/media/wav.zig");
 const sse = @import("../../host/media_jobs/sse.zig");
+const ops = @import("../../mlx/ops.zig");
+const gelu_block = @import("../../sdk/blocks/mlp/gelu.zig");
+const snake_block = @import("../../sdk/blocks/vae/snake.zig");
 
 const Weights = model_mod.Weights;
 
@@ -2577,58 +2580,52 @@ pub const CodecConfig = struct {
     upsampling_ratios: [2]u32 = .{ 2, 2 },
 };
 
-/// gelu(x) = 0.5*x*(1+erf(x/√2)) (exact, matches nn.gelu).
-fn gelu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const inv_sqrt2 = mlx.mlx_array_new_float(0.7071067811865476);
-    defer _ = mlx.mlx_array_free(inv_sqrt2);
-    const half = mlx.mlx_array_new_float(0.5);
-    defer _ = mlx.mlx_array_free(half);
-    const one = mlx.mlx_array_new_float(1.0);
-    defer _ = mlx.mlx_array_free(one);
-    var scaled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(scaled);
-    try mlx.check(mlx.mlx_multiply(&scaled, x, inv_sqrt2, s));
-    var erf = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(erf);
-    try mlx.check(mlx.mlx_erf(&erf, scaled, s));
-    var one_plus = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(one_plus);
-    try mlx.check(mlx.mlx_add(&one_plus, erf, one, s));
-    var hx = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(hx);
-    try mlx.check(mlx.mlx_multiply(&hx, x, half, s));
-    return mulA(hx, one_plus, s);
+/// `speech_tokenizer/config.json`'s `decoder_config`; an omitted field keeps the published geometry.
+pub fn parseCodecConfig(allocator: std.mem.Allocator, json_text: []const u8) !CodecConfig {
+    var cfg = CodecConfig{};
+    var parsed = std.json.parseFromSlice(std.json.Value, allocator, json_text, .{}) catch return error.BadCodecConfig;
+    defer parsed.deinit();
+    if (parsed.value != .object) return error.BadCodecConfig;
+    const dv = parsed.value.object.get("decoder_config") orelse return cfg;
+    if (dv != .object) return error.BadCodecConfig;
+    const o = dv.object;
+    setU32(&cfg.codebook_dim, o, "codebook_dim");
+    setU32(&cfg.latent_dim, o, "latent_dim");
+    setU32(&cfg.decoder_dim, o, "decoder_dim");
+    setU32(&cfg.hidden, o, "hidden_size");
+    setU32(&cfg.layers, o, "num_hidden_layers");
+    setU32(&cfg.heads, o, "num_attention_heads");
+    setU32(&cfg.kv, o, "num_key_value_heads");
+    setU32(&cfg.head_dim, o, "head_dim");
+    setU32(&cfg.inter, o, "intermediate_size");
+    setF32(&cfg.rms_eps, o, "rms_norm_eps");
+    setF32(&cfg.rope_theta, o, "rope_theta");
+    setU32(&cfg.num_quant, o, "num_quantizers");
+    setU32(&cfg.num_sem, o, "num_semantic_quantizers");
+    cfg.rvq_codebook_dim = cfg.codebook_dim / 2;
+    if (o.get("upsample_rates")) |v| {
+        if (v != .array or v.array.items.len != cfg.upsample_rates.len) return error.BadCodecConfig;
+        for (v.array.items, &cfg.upsample_rates) |it, *dst| {
+            if (it != .integer or it.integer < 1 or it.integer > 64) return error.BadCodecConfig;
+            dst.* = @intCast(it.integer);
+        }
+    }
+    if (cfg.num_quant != 16 or cfg.num_sem != 1 or cfg.decoder_dim >> 4 == 0 or cfg.heads == 0 or cfg.kv == 0) return error.BadCodecConfig;
+    return cfg;
 }
 
-/// SnakeBeta(x) = x + (1/(exp(beta)+1e-9)) * sin(x*exp(alpha))^2. Channel-wise
-/// alpha/beta broadcast over the NLC last dim.
+/// Exact GELU (`nn.gelu`): sdk's `geluErf`.
+fn gelu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
+    var g = ops.Graph.init(std.heap.c_allocator, s);
+    defer g.deinit();
+    return g.escape(try gelu_block.geluErf(&g, x));
+}
+
+/// SnakeBeta with log-stored alpha/beta, channels last: sdk's `snakeBetaLog`.
 fn snakeBeta(x: mlx.mlx_array, alpha: mlx.mlx_array, beta: mlx.mlx_array, s: S) !mlx.mlx_array {
-    var ea = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(ea);
-    try mlx.check(mlx.mlx_exp(&ea, alpha, s));
-    var eb = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eb);
-    try mlx.check(mlx.mlx_exp(&eb, beta, s));
-    const eps = mlx.mlx_array_new_float(1e-9);
-    defer _ = mlx.mlx_array_free(eps);
-    var eb_eps = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(eb_eps);
-    try mlx.check(mlx.mlx_add(&eb_eps, eb, eps, s));
-    // sin(x*alpha)^2
-    var xa = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(xa);
-    try mlx.check(mlx.mlx_multiply(&xa, x, ea, s));
-    var sinxa = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sinxa);
-    try mlx.check(mlx.mlx_sin(&sinxa, xa, s));
-    var sin2 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sin2);
-    try mlx.check(mlx.mlx_multiply(&sin2, sinxa, sinxa, s));
-    // (1/(eb+eps)) * sin2
-    var inv = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(inv);
-    try mlx.check(mlx.mlx_divide(&inv, sin2, eb_eps, s));
-    return addA(x, inv, s);
+    var g = ops.Graph.init(std.heap.c_allocator, s);
+    defer g.deinit();
+    return g.escape(try snake_block.snakeBetaLog(&g, x, alpha, beta));
 }
 
 /// Causal Conv1d on NLC input: left-pad by `(k-1)*dil+1-stride`, then conv,
@@ -3136,7 +3133,17 @@ pub fn loadCodecDecoder(io: std.Io, allocator: std.mem.Allocator, s: S, model_di
     defer w.deinit();
 
     var d: CodecDecoder = undefined;
-    d.cfg = .{};
+    d.cfg = blk: {
+        const path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{dir});
+        defer allocator.free(path);
+        const f = std.Io.Dir.openFileAbsolute(io, path, .{}) catch break :blk CodecConfig{};
+        defer f.close(io);
+        var rb: [4096]u8 = undefined;
+        var rs = f.reader(io, &rb);
+        const txt = try rs.interface.allocRemaining(allocator, .limited(1024 * 1024));
+        defer allocator.free(txt);
+        break :blk try parseCodecConfig(allocator, txt);
+    };
     d.allocator = allocator;
     d.s = s;
 
@@ -4086,4 +4093,17 @@ test "cached predictor: greedy codes agree with full re-forward within band" {
     const agree = @as(f64, @floatFromInt(same)) / @as(f64, @floatFromInt(total));
     std.debug.print("[cp-cache] code agreement {d:.4} over {d} frames\n", .{ agree, n });
     try std.testing.expect(agree > 0.9);
+}
+test "parseCodecConfig: the published decoder_config is the default geometry; a broken one is a named error" {
+    const a = std.testing.allocator;
+    const published =
+        \\{"decoder_config":{"latent_dim":1024,"codebook_dim":512,"decoder_dim":1536,"hidden_size":512,"num_hidden_layers":8,
+        \\ "num_attention_heads":16,"num_key_value_heads":16,"head_dim":64,"intermediate_size":1024,"rms_norm_eps":1e-05,
+        \\ "rope_theta":10000,"codebook_size":2048,"num_quantizers":16,"num_semantic_quantizers":1,"upsample_rates":[8,5,4,3],
+        \\ "upsampling_ratios":[2,2]}}
+    ;
+    try std.testing.expectEqualDeep(CodecConfig{}, try parseCodecConfig(a, published));
+    try std.testing.expectEqualDeep(CodecConfig{}, try parseCodecConfig(a, "{}"));
+    try std.testing.expectError(error.BadCodecConfig, parseCodecConfig(a, "{\"decoder_config\":{\"upsample_rates\":[8,5]}}"));
+    try std.testing.expectError(error.BadCodecConfig, parseCodecConfig(a, "{\"decoder_config\":{\"num_quantizers\":8}}"));
 }

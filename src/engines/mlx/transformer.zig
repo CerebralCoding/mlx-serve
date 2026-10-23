@@ -1,8 +1,7 @@
 const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
 const builtin = @import("builtin");
-const dsv4_mod = @import("../../plugins/deepseek_v4/deepseek_v4.zig");
-const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
+const plugin_driver = @import("plugin/driver.zig");
 const mlx_stream_mod = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
 const qwen4_mod = @import("../../plugins/qwen4_exp/qwen4_exp.zig");
 const distributed_mod = @import("cluster/distributed.zig");
@@ -23,7 +22,6 @@ const lane_attn = @import("../../sdk/blocks/attention/lane_attn.zig");
 const simd_qmm = @import("../../sdk/blocks/qmm/simd_qmm.zig");
 const row_attn = @import("../../sdk/blocks/attention/row_attn.zig");
 const mlx_gguf = @import("../../sdk/quant/gguf/claim.zig");
-const sushi_exl3 = @import("sushi_exl3");
 const sushi_pack = @import("../../sdk/quant/exl3/sushi_pack.zig");
 const qmv_nax2 = @import("../../sdk/blocks/qmm/qmv_nax2.zig");
 const gather_qmm_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
@@ -331,8 +329,6 @@ pub const applyQsaHistoryAt = @import("../../plugins/qwen4_exp/qsa/checkpoint.zi
 pub const sliceQsaHistoryOntoCheckpoint = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig").sliceQsaHistoryOntoCheckpoint;
 // engines/mlx/prompt_cache.zig
 pub const PrefillCache = @import("prompt_cache.zig").PrefillCache;
-// plugins/bert/weights.zig
-const BertLayerWeights = @import("../../plugins/bert/weights.zig").BertLayerWeights;
 // engines/mlx/layer_weights.zig
 const LayerWeights = @import("layer_weights.zig").LayerWeights;
 pub const QW = @import("layer_weights.zig").QW;
@@ -340,24 +336,13 @@ pub const QW = @import("layer_weights.zig").QW;
 pub const DsaWeights = @import("../../plugins/glm5_next/weights.zig").DsaWeights;
 // plugins/qwen4_exp/weights.zig
 const HcWeights = @import("../../plugins/qwen4_exp/weights.zig").HcWeights;
-// plugins/diffusion_gemma/weights.zig
-const SelfCondWeights = @import("../../plugins/diffusion_gemma/weights.zig").SelfCondWeights;
 // sdk/blocks/mlp/dense.zig
-pub const SimpleMlpWeights = @import("../../sdk/blocks/mlp/dense.zig").SimpleMlpWeights;
 // engines/mlx/ane_prefill.zig
 const AneChanRest = @import("ane_prefill.zig").AneChanRest;
 // sdk/blocks/moe/weights.zig
 pub const MoeMlpWeights = @import("../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
-// engines/mlx/forward/hybrid.zig
-const HybridLayerWeights = @import("forward/hybrid.zig").HybridLayerWeights;
 // engines/mlx/forward/layered.zig
 const MoeLayerWeights = @import("forward/layered.zig").MoeLayerWeights;
-// plugins/lfm2/gated_conv.zig
-pub const GatedConvStep = @import("../../plugins/lfm2/gated_conv.zig").GatedConvStep;
-pub const fusedGatedConvStep = @import("../../plugins/lfm2/gated_conv.zig").fusedGatedConvStep;
-// plugins/nemotron_h/moe.zig
-pub const NemotronMoeWeights = @import("../../plugins/nemotron_h/moe.zig").NemotronMoeWeights;
-pub const nemotronMoe = @import("../../plugins/nemotron_h/moe.zig").nemotronMoe;
 // sdk/quant/params.zig
 pub const QuantParams = @import("../../sdk/quant/params.zig").QuantParams;
 const BitsCache = @import("../../sdk/quant/params.zig").BitsCache;
@@ -666,15 +651,8 @@ pub const Transformer = struct {
     v_norm_weight: ?mlx.mlx_array, // ones(head_dim) for param-free RMS norm
     v_norm_weight_global: ?mlx.mlx_array, // ones(global_head_dim)
 
-    // DiffusionGemma: self-conditioning module weights (decoder-only) and a
-    // ones(hidden_size) vector for its scale-free post_norm + the router-style
-    // param-free norms in the diffusion decoder path. Null for other archs.
-    self_cond: ?SelfCondWeights = null,
+    // ones(hidden_size) for the weight-less RMS norms (MuseGlimmer's normed embeddings, qwen4_exp).
     ones_hidden: ?mlx.mlx_array = null,
-
-    // MuseGlimmer: bf16 output_multiplier scalar applied to logits BEFORE the
-    // tanh softcap (reference: T * tanh(logits * mult / T)). Null elsewhere.
-    output_mult: ?mlx.mlx_array = null,
 
     // Proportional RoPE frequencies for global/full attention layers (Gemma 4)
     rope_freqs_global: ?mlx.mlx_array,
@@ -694,16 +672,10 @@ pub const Transformer = struct {
     // by directly.
     yarn_mscale_cast: DtypeCastCache = .{},
 
-    // DeepSeek-V4-Flash (deepseek_v4): whole arch lives in its own module
-    // (src/plugins/deepseek_v4/deepseek_v4.zig — new attention family + Sinkhorn hyper-connections;
-    // diffusion.zig precedent). Non-null ⇒ every standard field below is empty
-    // and the forward dispatches to the module. v0 decode = full re-forward.
-    dsv4: ?*dsv4_mod.Dsv4Model = null,
-    /// DeepSeek-V4.1 (deepseek_v41): its own module (src/plugins/deepseek_v41/deepseek_v41.zig)
-    /// in the same shell, request state on the module.
-    dsv41: ?*dsv41_mod.Dsv41Model = null,
     /// An mlx-stream pack (`arch/mlx_stream.zig`: DeepSeek-V4.1's EXL3 repack or MiMo-V2.6-Flash): the plugin's module.
     mlx_stream_ext: ?*mlx_stream_mod.Model = null,
+    /// A pack served through its plugin's table (`engines/mlx/plugin/driver.zig`): every forward goes there.
+    plugin: ?*plugin_driver.Bound = null,
 
     // Qwen3.8-Flash-Next (qwen4_exp): the n-gram hash + mmapped table are
     // module-owned (serial, spec-off); the trunk itself rides moe_layers
@@ -735,17 +707,6 @@ pub const Transformer = struct {
     /// Whose per-request state the head currently holds (`qwen4MtpActivate`).
     qwen4_mtp_owner: ?*Qwen4MtpState = null,
 
-    // BERT encoder-only (null for decoder models)
-    bert_layers: ?[]BertLayerWeights,
-    bert_pos_w: mlx.mlx_array,
-    bert_pos_s: mlx.mlx_array,
-    bert_pos_b: mlx.mlx_array,
-    bert_toktype_w: mlx.mlx_array,
-    bert_toktype_s: mlx.mlx_array,
-    bert_toktype_b: mlx.mlx_array,
-    bert_emb_norm_w: mlx.mlx_array,
-    bert_emb_norm_b: mlx.mlx_array,
-
     // MoE-specific (null/empty for standard models)
     moe_layers: ?[]MoeLayerWeights,
     /// Construction-validated q4/g64 S=4 routed gate/up verifier lane.
@@ -772,9 +733,7 @@ pub const Transformer = struct {
     // Single-threaded: generation runs on one thread per Transformer.
     capture_hidden: ?*mlx.mlx_array = null,
 
-    // Hybrid layers (LFM2, Nemotron-H)
-    hybrid_layers: ?[]HybridLayerWeights,
-    embedding_norm: ?mlx.mlx_array, // LFM2: RMS norm on embeddings
+    embedding_norm: ?mlx.mlx_array, // Inkling: RMS norm on embeddings
 
     // Prompt cache for prefix reuse across requests
     prompt_cache: ?PrefillCache,
@@ -839,9 +798,6 @@ pub const Transformer = struct {
     mtp_oqe_affine_trunk: bool = false,
 
     // ── methods split out by meaning (P1); aliases keep `x.method(...)` call syntax ──
-    // sdk/blocks/ssm/mamba2.zig
-    pub const mamba2Mixer = @import("../../sdk/blocks/ssm/mamba2.zig").mamba2Mixer;
-    pub const mamba2GroupNorm = @import("../../sdk/blocks/ssm/mamba2.zig").mamba2GroupNorm;
     // plugins/qwen4_exp/mtp.zig
     pub const loadQwen4Mtp = @import("../../plugins/qwen4_exp/mtp.zig").loadQwen4Mtp;
     pub const Qwen4MtpState = @import("../../plugins/qwen4_exp/mtp.zig").Qwen4MtpState;
@@ -917,12 +873,12 @@ pub const Transformer = struct {
     pub const pleEmbedding = @import("../../plugins/qwen4_exp/ple.zig").pleEmbedding;
     pub const pleEmbeddingGpu = @import("../../plugins/qwen4_exp/ple.zig").pleEmbeddingGpu;
     pub const pleClaimSpecCapture = @import("../../plugins/qwen4_exp/ple.zig").pleClaimSpecCapture;
-    pub const flushDeferredPle = @import("../../plugins/qwen4_exp/ple.zig").flushDeferredPle;
-    pub const flushDeferredPleGroup = @import("../../plugins/qwen4_exp/ple.zig").flushDeferredPleGroup;
-    pub const settleDeferredPle = @import("../../plugins/qwen4_exp/ple.zig").settleDeferredPle;
-    pub const deferredPleOnGpu = @import("../../plugins/qwen4_exp/ple.zig").deferredPleOnGpu;
+    pub const flushDeferredPle = @import("plugin/settle.zig").flush;
+    pub const flushDeferredPleGroup = @import("plugin/settle.zig").flushGroup;
+    pub const settleDeferredPle = @import("plugin/settle.zig").settleWith;
+    pub const deferredPleOnGpu = @import("plugin/settle.zig").historyOwed;
     const releasePlePending = @import("../../plugins/qwen4_exp/ple.zig").releasePlePending;
-    pub const discardDeferredPle = @import("../../plugins/qwen4_exp/ple.zig").discardDeferredPle;
+    pub const discardDeferredPle = @import("plugin/settle.zig").discard;
     pub const pleGatherBf16 = @import("../../plugins/qwen4_exp/ple.zig").pleGatherBf16;
     pub const pleSettleFromArray = @import("../../plugins/qwen4_exp/ple.zig").pleSettleFromArray;
     pub const pleEvalIds = @import("../../plugins/qwen4_exp/ple.zig").pleEvalIds;
@@ -940,6 +896,7 @@ pub const Transformer = struct {
     pub const ssmBindBatched = @import("ssm/group.zig").ssmBindBatched;
     // plugins/qwen4_exp/qsa/pooled.zig
     pub const resetQsaPooledRope = @import("../../plugins/qwen4_exp/qsa/pooled.zig").resetQsaPooledRope;
+    pub const qwen4Host = @import("plugin/intree.zig").host;
     pub const markQsaPooledRopeStale = @import("../../plugins/qwen4_exp/qsa/pooled.zig").markQsaPooledRopeStale;
     // sdk/blocks/attention/batched.zig
     pub const BATCHED_PER_SLOT_ATTN_MIN_KV = @import("../../sdk/blocks/attention/batched.zig").BATCHED_PER_SLOT_ATTN_MIN_KV;
@@ -960,7 +917,6 @@ pub const Transformer = struct {
     pub const gdnProjGpu = @import("../../sdk/blocks/gdn/gated_delta_net.zig").gdnProjGpu;
     pub const gdnProjArrays = @import("../../sdk/blocks/gdn/gated_delta_net.zig").gdnProjArrays;
     // sdk/blocks/mlp/dense.zig
-    pub const simpleMLP = @import("../../sdk/blocks/mlp/dense.zig").simpleMLP;
     pub const residualTail = @import("../../sdk/blocks/mlp/dense.zig").residualTail;
     pub const standardMlp = @import("../../sdk/blocks/mlp/dense.zig").standardMlp;
     pub const rowGroupServes = @import("../../sdk/blocks/mlp/dense.zig").rowGroupServes;
@@ -981,12 +937,8 @@ pub const Transformer = struct {
     pub const buildAnePrefill = @import("ane_prefill.zig").buildAnePrefill;
     pub const aneBuildMlpRest = @import("ane_prefill.zig").aneBuildMlpRest;
     pub const aneBuildGdnRest = @import("ane_prefill.zig").aneBuildGdnRest;
-    // engines/mlx/forward/hybrid.zig
-    pub const forwardHybridWith = @import("forward/hybrid.zig").forwardHybridWith;
     // engines/mlx/forward/layered.zig
     pub const forwardMoeWith = @import("forward/layered.zig").forwardMoeWith;
-    // plugins/lfm2/gated_conv.zig
-    pub const gatedConv = @import("../../plugins/lfm2/gated_conv.zig").gatedConv;
     // engines/mlx/spec/mtp_nax_profile.zig
     pub const mtpNaxProfileEnabledForTrunk = @import("spec/mtp_nax_profile.zig").mtpNaxProfileEnabledForTrunk;
     pub const mtpNaxProfileEnabled = @import("spec/mtp_nax_profile.zig").mtpNaxProfileEnabled;
@@ -1072,8 +1024,6 @@ pub const Transformer = struct {
     pub const spliceVisionEmbeddings = @import("../../sdk/vision/splice.zig").spliceVisionEmbeddings;
     pub const spliceVisionRows = @import("../../sdk/vision/splice.zig").spliceVisionRows;
     pub const applyVisionEmbeddingsWith = @import("../../sdk/vision/splice.zig").applyVisionEmbeddingsWith;
-    // sdk/blocks/attention/gates.zig
-    pub const attnOutGate = @import("../../sdk/blocks/attention/gates.zig").attnOutGate;
     // sdk/blocks/mlp/activations.zig
     pub const gelu = @import("../../sdk/blocks/mlp/activations.zig").gelu;
     pub const geluUncompiled = @import("../../sdk/blocks/mlp/activations.zig").geluUncompiled;
@@ -1084,14 +1034,13 @@ pub const Transformer = struct {
     pub const geluTanhTable = @import("../../sdk/blocks/mlp/activations.zig").geluTanhTable;
     pub const fusedGeluTanhMul = @import("../../sdk/blocks/mlp/activations.zig").fusedGeluTanhMul;
     pub const computeGeglu = @import("../../sdk/blocks/mlp/activations.zig").computeGeglu;
-    pub const computeGptOssSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").computeGptOssSwiGLU;
+    pub const computeClampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").computeClampedSwiGLU;
     pub const applySoftcap = @import("../../sdk/blocks/mlp/activations.zig").applySoftcap;
     pub const swiglu = @import("../../sdk/blocks/mlp/activations.zig").swiglu;
     // sdk/blocks/conv/conv1d_cache.zig
     pub const conv1dWithCache = @import("../../sdk/blocks/conv/conv1d_cache.zig").conv1dWithCache;
     // sdk/blocks/moe/experts.zig
     pub const scaleExperts = @import("../../sdk/blocks/moe/experts.zig").scaleExperts;
-    pub const addExpertBias = @import("../../sdk/blocks/moe/experts.zig").addExpertBias;
     // engines/mlx/eval_cadence.zig
     pub const EVAL_EVERY_N_LAYERS = @import("eval_cadence.zig").EVAL_EVERY_N_LAYERS;
     pub const PREFILL_EVAL_CADENCE_DEFAULT = @import("eval_cadence.zig").PREFILL_EVAL_CADENCE_DEFAULT;
@@ -1150,9 +1099,6 @@ pub const Transformer = struct {
     pub const forwardWithCapture = @import("capture.zig").forwardWithCapture;
     pub const forwardWithCaptureAll = @import("capture.zig").forwardWithCaptureAll;
     pub const captureHidden = @import("capture.zig").captureHidden;
-    // plugins/bert/forward.zig
-    pub const bertEmbedding = @import("../../plugins/bert/forward.zig").bertEmbedding;
-    pub const forwardBertWith = @import("../../plugins/bert/forward.zig").forwardBertWith;
     // plugins/gemma4/ple.zig
     pub const computePLEInput = @import("../../plugins/gemma4/ple.zig").computePLEInput;
     pub const pleProject = @import("../../plugins/gemma4/ple.zig").pleProject;
@@ -1203,11 +1149,7 @@ pub const Transformer = struct {
     pub const gemma4MoeLayerTail = @import("../../plugins/gemma4/moe_tail.zig").gemma4MoeLayerTail;
     // engines/mlx/diag/profile.zig
     pub const debugTraceHead = @import("diag/profile.zig").debugTraceHead;
-    // plugins/diffusion_gemma/forward.zig
-    pub const diffusionDecoderAttn = @import("../../plugins/diffusion_gemma/forward.zig").diffusionDecoderAttn;
-    pub const forwardDiffusionDecoder = @import("../../plugins/diffusion_gemma/forward.zig").forwardDiffusionDecoder;
-    // sdk/blocks/attention/hybrid_attn.zig
-    pub const hybridAttnWith = @import("../../sdk/blocks/attention/hybrid_attn.zig").hybridAttnWith;
+    pub const forwardDiffusionDecoder = @import("plugin/driver.zig").diffusionDecoder;
     // engines/mlx/forward/encoder_head.zig
     pub const forwardEmbedding = @import("forward/encoder_head.zig").forwardEmbedding;
     pub const forwardEmbeddingMasked = @import("forward/encoder_head.zig").forwardEmbeddingMasked;
@@ -1216,9 +1158,6 @@ pub const Transformer = struct {
     pub const denseHead = @import("forward/encoder_head.zig").denseHead;
     // plugins/gemma3/encoder.zig
     pub const forwardGemma3EncoderWith = @import("../../plugins/gemma3/encoder.zig").forwardGemma3EncoderWith;
-    // plugins/embedding_gemma2/forward.zig
-    pub const projectionOnlyPle = @import("../../plugins/embedding_gemma2/forward.zig").projectionOnlyPle;
-    pub const forwardEmbeddingGemma2With = @import("../../plugins/embedding_gemma2/forward.zig").forwardEmbeddingGemma2With;
     // sdk/blocks/rope/mrope.zig
     pub const buildMropeCosSin = @import("../../sdk/blocks/rope/mrope.zig").buildMropeCosSin;
     pub const MropeCosSin = @import("../../sdk/blocks/rope/mrope.zig").MropeCosSin;
@@ -1250,12 +1189,6 @@ pub const Transformer = struct {
     pub const sinkAttnSlots = @import("../../sdk/blocks/attention/sinks.zig").sinkAttnSlots;
     pub const sinkAttnCore = @import("../../sdk/blocks/attention/sinks.zig").sinkAttnCore;
     pub const sinkAttnOut = @import("../../sdk/blocks/attention/sinks.zig").sinkAttnOut;
-    // plugins/laguna/attention.zig
-    pub const lagunaAttnWith = @import("../../plugins/laguna/attention.zig").lagunaAttnWith;
-    // plugins/inkling/attention.zig
-    pub const inklingConvSlot = @import("../../plugins/inkling/attention.zig").inklingConvSlot;
-    const InklingAttnOut = @import("../../plugins/inkling/attention.zig").InklingAttnOut;
-    pub const inklingAttnWith = @import("../../plugins/inkling/attention.zig").inklingAttnWith;
     // plugins/gemma4/attention.zig
     pub const gemma4MoeAttnWith = @import("../../plugins/gemma4/attention.zig").gemma4MoeAttnWith;
     // engines/mlx/verify/joined_rows.zig
@@ -1265,9 +1198,6 @@ pub const Transformer = struct {
     pub const attnVerifyRows = @import("verify/joined_rows.zig").attnVerifyRows;
     pub const GdnVerifyInputs = @import("verify/joined_rows.zig").GdnVerifyInputs;
     pub const gdnVerifyRows = @import("verify/joined_rows.zig").gdnVerifyRows;
-    // plugins/inkling/moe.zig
-    pub const inklingExpertsApply = @import("../../plugins/inkling/moe.zig").inklingExpertsApply;
-    pub const inklingMoeMlp = @import("../../plugins/inkling/moe.zig").inklingMoeMlp;
     // sdk/blocks/moe/moe.zig
     pub const moeRouterLogits = @import("../../sdk/blocks/moe/moe.zig").moeRouterLogits;
     pub const moeSharedDown = @import("../../sdk/blocks/moe/moe.zig").moeSharedDown;
@@ -1311,18 +1241,13 @@ pub const Transformer = struct {
             self.allocator.free(rests);
             self.ane_chan = null;
         }
-        if (self.dsv4) |mdl| {
-            mdl.deinit();
-            self.allocator.destroy(mdl);
-            self.dsv4 = null;
-        }
-        if (self.dsv41) |mdl| {
-            mdl.deinit();
-            self.dsv41 = null;
-        }
         if (self.mlx_stream_ext) |m| {
             mlx_stream_mod.close(m);
             self.mlx_stream_ext = null;
+        }
+        if (self.plugin) |b| {
+            plugin_driver.unbind(b, self.allocator);
+            self.plugin = null;
         }
         if (self.rht) |reg| {
             reg.deinit();
@@ -1347,7 +1272,6 @@ pub const Transformer = struct {
         if (self.gdn_k_scale) |k| _ = mlx.mlx_array_free(k);
         if (self.grouped_norm_ones) |o| _ = mlx.mlx_array_free(o);
         if (self.ones_hidden) |o| _ = mlx.mlx_array_free(o);
-        if (self.output_mult) |m| _ = mlx.mlx_array_free(m);
         if (self.rope_freqs_yarn) |f| _ = mlx.mlx_array_free(f);
         if (self.rope_freqs_global) |f| _ = mlx.mlx_array_free(f);
         if (self.yarn_mscale) |m| _ = mlx.mlx_array_free(m);
@@ -1427,9 +1351,6 @@ pub const Transformer = struct {
             self.allocator.destroy(st);
             self.qwen4 = null;
         }
-        // Hybrid layers own no arrays of their own — their weights are tracked
-        // by `moe_owned_bf16`/`ssm_entries` above — but the slice itself is ours.
-        if (self.hybrid_layers) |hl| self.allocator.free(hl);
         if (self.moe_owned_bf16) |arrs| {
             for (arrs) |a| _ = mlx.mlx_array_free(a);
             self.allocator.free(arrs);
@@ -1488,7 +1409,6 @@ test {
     _ = @import("../../sdk/blocks/linear/verify_qmm_nax.zig");
     _ = @import("../../sdk/blocks/attention/sdpa.zig");
     _ = @import("../../sdk/blocks/attention/attn256.zig");
-    _ = @import("../../sdk/blocks/ssm/mamba2.zig");
     _ = @import("../../sdk/blocks/norms/residual_norm.zig");
     _ = @import("../../plugins/qwen4_exp/qsa/gather.zig");
     _ = @import("../../plugins/qwen4_exp/qsa/select.zig");
@@ -1517,19 +1437,14 @@ test {
     _ = @import("../../sdk/blocks/attention/batched.zig");
     _ = @import("../../plugins/qwen4_exp/qsa/checkpoint.zig");
     _ = @import("prompt_cache.zig");
-    _ = @import("../../plugins/bert/weights.zig");
     _ = @import("layer_weights.zig");
     _ = @import("../../plugins/glm5_next/weights.zig");
     _ = @import("../../plugins/qwen4_exp/weights.zig");
     _ = @import("../../sdk/blocks/gdn/gated_delta_net.zig");
-    _ = @import("../../plugins/diffusion_gemma/weights.zig");
     _ = @import("../../sdk/blocks/mlp/dense.zig");
     _ = @import("ane_prefill.zig");
     _ = @import("../../sdk/blocks/moe/weights.zig");
-    _ = @import("forward/hybrid.zig");
     _ = @import("forward/layered.zig");
-    _ = @import("../../plugins/lfm2/gated_conv.zig");
-    _ = @import("../../plugins/nemotron_h/moe.zig");
     _ = @import("../../sdk/quant/params.zig");
     _ = @import("spec/mtp_nax_profile.zig");
     _ = @import("../../sdk/blocks/attention/kv_quant_attn.zig");
@@ -1556,7 +1471,6 @@ test {
     _ = @import("spec/trunk_hooks.zig");
     _ = @import("warmup.zig");
     _ = @import("capture.zig");
-    _ = @import("../../plugins/bert/forward.zig");
     _ = @import("../../plugins/gemma4/ple.zig");
     _ = @import("forward/dense.zig");
     _ = @import("batched/dense.zig");
@@ -1567,18 +1481,15 @@ test {
     _ = @import("../../plugins/qwen4_exp/attention.zig");
     _ = @import("../../plugins/gemma4/moe_tail.zig");
     _ = @import("diag/profile.zig");
-    _ = @import("../../plugins/diffusion_gemma/forward.zig");
-    _ = @import("../../sdk/blocks/attention/hybrid_attn.zig");
     _ = @import("forward/encoder_head.zig");
     _ = @import("../../plugins/gemma3/encoder.zig");
-    _ = @import("../../plugins/embedding_gemma2/forward.zig");
     _ = @import("../../sdk/blocks/rope/mrope.zig");
     _ = @import("../../sdk/blocks/rope/yarn.zig");
     _ = @import("../../sdk/blocks/attention/gated_full.zig");
     _ = @import("../../sdk/blocks/attention/mla.zig");
     _ = @import("../../sdk/blocks/attention/proj.zig");
     _ = @import("../../sdk/blocks/attention/sinks.zig");
-    _ = @import("../../plugins/laguna/attention.zig");
+    _ = @import("../../plugins/laguna/ubench_test.zig");
     _ = @import("../../plugins/inkling/attention.zig");
     _ = @import("../../plugins/gemma4/attention.zig");
     _ = @import("verify/joined_rows.zig");
@@ -1591,7 +1502,6 @@ test {
     _ = @import("../../plugins/glm5_next/load.zig");
     _ = @import("../../plugins/qwen4_exp/load.zig");
     _ = @import("load/layers_layered.zig");
-    _ = @import("load/layers_hybrid.zig");
     _ = @import("../../sdk/blocks/kda/gate.zig");
     _ = @import("../../sdk/blocks/moe/router_kernel.zig");
     _ = @import("../../mlx/dtype.zig");
@@ -1614,10 +1524,7 @@ test {
     _ = @import("../../plugins/hy_v3/load.zig");
     _ = @import("../../plugins/laguna/load.zig");
     _ = @import("../../plugins/bailing_hybrid/load.zig");
-    _ = @import("../../plugins/bert/load.zig");
-    _ = @import("../../plugins/deepseek_v4/bridge.zig");
     _ = @import("modules/mlx_stream.zig");
-    _ = @import("../../plugins/deepseek_v41/bridge.zig");
     _ = @import("modules/shell.zig");
     _ = @import("../../plugins/mimo_v2/attention.zig");
     _ = @import("../../plugins/flint/fixtures.zig");

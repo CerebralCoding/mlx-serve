@@ -10,6 +10,7 @@ const attn256 = @import("../../blocks/attention/attn256.zig");
 
 const Array = ops.Array;
 const Graph = ops.Graph;
+const Ctx = @import("../block.zig").Ctx;
 
 pub const View = struct {
     /// Tail rows the cache hands back (`window + q_len - 1`); 0 = the whole cache.
@@ -57,6 +58,20 @@ pub fn bandMask(parent: *Graph, q_len: c_int, kv_len: c_int, window: c_int) !Arr
     const too_far = try g.call(mlx.mlx_greater_equal, .{ try g.sub(rows, cols), try g.adopt(mlx.mlx_array_new_int(window)) });
     const band = try g.where(too_far, try negInf(g), try g.scalar(0, .bfloat16));
     return parent.keep(try g.add(causal, try g.reshape(band, &.{ 1, 1, q_len, kv_len })));
+}
+
+/// `bandMask`, built once per forward.
+pub fn bandOnce(c: *const Ctx, q_len: c_int, kv_len: c_int, window: c_int) !Array {
+    const key: @import("../block.zig").Memo.Key = .{ .what = .band, .n = .{ q_len, kv_len, window, 0, 0, 0, 0 } };
+    if (c.recall(key)) |m| return m;
+    return c.remember(key, try bandMask(c.g, q_len, kv_len, window));
+}
+
+/// `decodeMask`, built once per forward.
+pub fn decodeOnce(c: *const Ctx, kv_len: c_int, window: c_int) !Array {
+    const key: @import("../block.zig").Memo.Key = .{ .what = .decode_mask, .n = .{ kv_len, window, 0, 0, 0, 0, 0 } };
+    if (c.recall(key)) |m| return m;
+    return c.remember(key, try decodeMask(c.g, kv_len, window));
 }
 
 /// One decode row over `kv_len` keys: the oldest `kv_len - window` masked.

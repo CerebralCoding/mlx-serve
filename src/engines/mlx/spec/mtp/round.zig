@@ -1,6 +1,7 @@
 //! The MTP round: begin, chain, verify, group accept.
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const mlx = @import("../../../../mlx/ffi.zig");
 const transformer_mod = @import("../../transformer.zig");
 const tokenizer_mod = @import("../../../../host/tokenizer/tokenizer.zig");
@@ -479,7 +480,7 @@ pub fn mtpRoundVerify(self: *Generator, st: *MtpRoundState) !void {
     // DIAGNOSTIC (MLX_SERVE_MTP_TRACE_SYNC=1): drain the GPU before the
     // verify build so the `sync` lap shows the pending lazy work (draft
     // chain, rollback, commit) and `verify` the forward alone.
-    if (tracing and std.c.getenv("MLX_SERVE_MTP_TRACE_SYNC") != null) {
+    if (tracing and env.get(.MLX_SERVE_MTP_TRACE_SYNC) != null) {
         var sync_watch = io_util.Stopwatch.init(self.timer.io);
         try mlx.check(mlx.mlx_array_eval(st.verify_input));
         self.mtp_trace.add(.sync, sync_watch.read());
@@ -551,7 +552,7 @@ pub fn mtpGroupVerify(gens: []const *Generator, states: []const *MtpRoundState) 
         ctxs[i] = &gen.ctx;
     }
     var rollback: [MTP_GROUP_ROWS_MAX]Transformer.VerifyRollback = undefined;
-    const retain_rollback = n > 1 and xfm.qwen4 != null;
+    const retain_rollback = n > 1 and xfm.qwen4Host().qwen4 != null;
     for (gens, states) |gen, st| st.verify_ctx = &gen.ctx;
     var row_ns: [MTP_GROUP_ROWS_MAX]u64 = undefined;
     var tracing_any = false;
@@ -840,304 +841,6 @@ test "mtpChainLogConf: sums clamped log-confidences; NaN can never pass a gate" 
     try testing.expect(!(nan_chain >= @log(@as(f32, 0.05))));
 }
 
-// Hermetic Nemotron-H MTP round loop: a tiny hybrid trunk (Mamba2 +
-// attention + MoE-with-shared-expert) on disk beside a bare-key head file. The
-// bar is the spec-decode contract on THIS trunk family — greedy MTP emits
-// exactly the serial greedy stream at whatever accepted counts the rounds
-// produce, through the hybrid path's pre-norm hidden capture, the fused-window
-// per-row SSM capture and the capture-based rollback.
-test "mtp: nextMtp on a Nemotron-H trunk emits the serial stream, greedy and seeded" {
-    if (mlx.noGpuBackend()) return;
-    const allocator = testing.allocator;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-
-    var tmp = std.testing.tmpDir(.{});
-    defer tmp.cleanup();
-    var dir_buf: [512]u8 = undefined;
-    const dir_path = dir_buf[0..try tmp.dir.realPath(io, &dir_buf)];
-
-    const H: usize = 64;
-    const V: usize = 16;
-    const MH: usize = 4; // mamba heads x hd 16 = d_inner 64
-    const MHD: usize = 16;
-    const NG: usize = 2;
-    const DS: usize = 32; // state % 32 == 0: the fused decode window serves the verify rows, as live
-    const KC: usize = 4;
-    const CD = MH * MHD + 2 * NG * DS; // 192
-    const AH: usize = 2; // attention heads x hd 32
-    const AHD: usize = 32;
-    const E: usize = 4;
-    const I: usize = 64;
-    const SI: usize = 128;
-
-    const Fx = dflash_mod.TinyFix;
-    const W = struct {
-        // 4-bit/gs64 affine `<key>.weight/.scales/.biases` from a seeded f32 tensor of any rank.
-        fn quant(map: mlx.mlx_map_string_to_array, alloc: std.mem.Allocator, key: []const u8, shape: []const c_int, seed: usize, st: mlx.mlx_stream) !void {
-            var n: usize = 1;
-            for (shape) |d| n *= @intCast(d);
-            const host = try alloc.alloc(f32, n);
-            defer alloc.free(host);
-            var prng = std.Random.DefaultPrng.init(@intCast(seed));
-            const r = prng.random();
-            for (host) |*v| v.* = (r.float(f32) - 0.5) * 0.4;
-            const f32w = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), .float32);
-            defer _ = mlx.mlx_array_free(f32w);
-            // bf16 in, bf16 scales out: the row kernels' geometry, as a real pack.
-            var f = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(f);
-            try mlx.check(mlx.mlx_astype(&f, f32w, .bfloat16, st));
-            var triple = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(triple);
-            try mlx.check(mlx.mlx_quantize(&triple, f, mlx.mlx_optional_int.some(64), mlx.mlx_optional_int.some(4), "affine", .{}, st));
-            for ([_][]const u8{ ".weight", ".scales", ".biases" }, 0..) |suf, i| {
-                var arr = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(arr);
-                try mlx.check(mlx.mlx_vector_array_get(&arr, triple, i));
-                try mlx.check(mlx.mlx_array_eval(arr));
-                const full = try std.fmt.allocPrintSentinel(alloc, "{s}{s}", .{ key, suf }, 0);
-                defer alloc.free(full);
-                _ = mlx.mlx_map_string_to_array_insert(map, full.ptr, arr);
-            }
-        }
-        // Dense bf16 tensor of any rank (the conv1d weight is [C, K, 1]).
-        fn bf16(map: mlx.mlx_map_string_to_array, alloc: std.mem.Allocator, key: []const u8, shape: []const c_int, seed: usize, st: mlx.mlx_stream) !void {
-            var n: usize = 1;
-            for (shape) |d| n *= @intCast(d);
-            const host = try alloc.alloc(f32, n);
-            defer alloc.free(host);
-            var prng = std.Random.DefaultPrng.init(@intCast(seed));
-            const r = prng.random();
-            for (host) |*v| v.* = (r.float(f32) - 0.5) * 0.6;
-            const f = mlx.mlx_array_new_data(host.ptr, shape.ptr, @intCast(shape.len), .float32);
-            defer _ = mlx.mlx_array_free(f);
-            var arr = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(arr);
-            try mlx.check(mlx.mlx_astype(&arr, f, .bfloat16, st));
-            try mlx.check(mlx.mlx_array_eval(arr));
-            const full = try std.fmt.allocPrintSentinel(alloc, "{s}", .{key}, 0);
-            defer alloc.free(full);
-            _ = mlx.mlx_map_string_to_array_insert(map, full.ptr, arr);
-        }
-        fn f32Arr(map: mlx.mlx_map_string_to_array, alloc: std.mem.Allocator, key: []const u8, n: usize, seed: usize) !void {
-            const host = try alloc.alloc(f32, n);
-            defer alloc.free(host);
-            var prng = std.Random.DefaultPrng.init(@intCast(seed));
-            const r = prng.random();
-            for (host) |*v| v.* = (r.float(f32) - 0.5) * 0.2;
-            const shape = [_]c_int{@intCast(n)};
-            const arr = mlx.mlx_array_new_data(host.ptr, &shape, 1, .float32);
-            defer _ = mlx.mlx_array_free(arr);
-            const full = try std.fmt.allocPrintSentinel(alloc, "{s}", .{key}, 0);
-            defer alloc.free(full);
-            _ = mlx.mlx_map_string_to_array_insert(map, full.ptr, arr);
-        }
-    };
-
-    // Trunk: backbone.* keys, layers [mamba, attention, moe], quantized MoE banks.
-    {
-        const cfg =
-            \\{
-            \\  "model_type": "nemotron_h",
-            \\  "hidden_size": 64, "num_hidden_layers": 3, "vocab_size": 16,
-            \\  "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32,
-            \\  "layers_block_type": ["mamba", "attention", "moe"],
-            \\  "mamba_num_heads": 4, "mamba_head_dim": 16, "n_groups": 2, "ssm_state_size": 32,
-            \\  "conv_kernel": 4, "expand": 1,
-            \\  "n_routed_experts": 4, "num_experts_per_tok": 2, "moe_intermediate_size": 64,
-            \\  "moe_shared_expert_intermediate_size": 128, "n_group": 1, "topk_group": 1,
-            \\  "norm_topk_prob": true, "routed_scaling_factor": 2.5,
-            \\  "layer_norm_epsilon": 1e-5, "rope_theta": 10000.0, "tie_word_embeddings": false,
-            \\  "quantization": {"group_size": 64, "bits": 4}
-            \\}
-        ;
-        try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = cfg });
-        const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/model.safetensors", .{dir_path}, 0);
-        defer allocator.free(st_path);
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try Fx.putW(map, "backbone.embeddings.weight", V, H, 1, s);
-        try Fx.putW(map, "lm_head.weight", V, H, 2, s);
-        try Fx.putNorm(map, "backbone.norm_f.weight", H, s);
-        try Fx.putNorm(map, "backbone.layers.0.norm.weight", H, s);
-        try Fx.putW(map, "backbone.layers.0.mixer.in_proj.weight", MH * MHD + CD + MH, H, 3, s);
-        try W.bf16(map, allocator, "backbone.layers.0.mixer.conv1d.weight", &.{ CD, KC, 1 }, 4, s);
-        try Fx.putNorm(map, "backbone.layers.0.mixer.conv1d.bias", CD, s);
-        try Fx.putNorm(map, "backbone.layers.0.mixer.A_log", MH, s);
-        try Fx.putNorm(map, "backbone.layers.0.mixer.D", MH, s);
-        try Fx.putNorm(map, "backbone.layers.0.mixer.dt_bias", MH, s);
-        try Fx.putNorm(map, "backbone.layers.0.mixer.norm.weight", MH * MHD, s);
-        try Fx.putW(map, "backbone.layers.0.mixer.out_proj.weight", H, MH * MHD, 5, s);
-        try Fx.putNorm(map, "backbone.layers.1.norm.weight", H, s);
-        try Fx.putW(map, "backbone.layers.1.mixer.q_proj.weight", AH * AHD, H, 6, s);
-        try Fx.putW(map, "backbone.layers.1.mixer.k_proj.weight", AHD, H, 7, s);
-        try Fx.putW(map, "backbone.layers.1.mixer.v_proj.weight", AHD, H, 8, s);
-        try Fx.putW(map, "backbone.layers.1.mixer.o_proj.weight", H, AH * AHD, 9, s);
-        try Fx.putNorm(map, "backbone.layers.2.norm.weight", H, s);
-        try Fx.putW(map, "backbone.layers.2.mixer.gate.weight", E, H, 10, s);
-        try W.f32Arr(map, allocator, "backbone.layers.2.mixer.gate.e_score_correction_bias", E, 11);
-        try W.quant(map, allocator, "backbone.layers.2.mixer.switch_mlp.fc1", &.{ E, I, H }, 12, s);
-        try W.quant(map, allocator, "backbone.layers.2.mixer.switch_mlp.fc2", &.{ E, H, I }, 13, s);
-        try W.quant(map, allocator, "backbone.layers.2.mixer.shared_experts.up_proj", &.{ SI, H }, 14, s);
-        try W.quant(map, allocator, "backbone.layers.2.mixer.shared_experts.down_proj", &.{ H, SI }, 15, s);
-        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
-    }
-    // Head: the sevren-ai bare-key layout in the trunk dir.
-    {
-        const st_path = try std.fmt.allocPrintSentinel(allocator, "{s}/mtp_head.safetensors", .{dir_path}, 0);
-        defer allocator.free(st_path);
-        const map = mlx.mlx_map_string_to_array_new();
-        defer _ = mlx.mlx_map_string_to_array_free(map);
-        const meta = mlx.mlx_map_string_to_string_new();
-        defer _ = mlx.mlx_map_string_to_string_free(meta);
-        try Fx.putW(map, "eh_proj", H, 2 * H, 21, s);
-        try Fx.putNorm(map, "enorm", H, s);
-        try Fx.putNorm(map, "hnorm", H, s);
-        try Fx.putNorm(map, "final_norm", H, s);
-        try Fx.putNorm(map, "attn.norm.weight", H, s);
-        try Fx.putW(map, "attn.mixer.q_proj.weight", AH * AHD, H, 22, s);
-        try Fx.putW(map, "attn.mixer.k_proj.weight", AHD, H, 23, s);
-        try Fx.putW(map, "attn.mixer.v_proj.weight", AHD, H, 24, s);
-        try Fx.putW(map, "attn.mixer.o_proj.weight", H, AH * AHD, 25, s);
-        try Fx.putNorm(map, "moe.norm.weight", H, s);
-        try Fx.putW(map, "moe.mixer.gate.weight", E, H, 26, s);
-        try W.f32Arr(map, allocator, "moe.mixer.gate.e_score_correction_bias", E, 27);
-        try W.quant(map, allocator, "moe.mixer.switch_mlp.fc1", &.{ E, I, H }, 28, s);
-        try W.quant(map, allocator, "moe.mixer.switch_mlp.fc2", &.{ E, H, I }, 29, s);
-        try W.quant(map, allocator, "moe.mixer.shared_experts.up_proj", &.{ SI, H }, 30, s);
-        try W.quant(map, allocator, "moe.mixer.shared_experts.down_proj", &.{ H, SI }, 31, s);
-        try mlx.check(mlx.mlx_save_safetensors(st_path.ptr, map, meta));
-    }
-
-    var config = try model_mod.parseConfig(io, allocator, dir_path);
-    var weights = try model_mod.loadWeights(io, allocator, dir_path);
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    try testing.expect(mtp_mod.hasMtpHead(io, allocator, dir_path));
-    // Exact mode is on only while a DFlash drafter is bound; this pins its MTP rounds.
-    config.dflash_bound = true;
-
-    var tok_dummy: Tokenizer = undefined; // never read by the Generator
-    const prompt = [_]u32{ 3, 7, 1, 12, 5, 9, 4, 2, 11, 6, 14, 8 };
-    const greedy = SamplingParams{ .temperature = 0.0 };
-    const want: usize = 16;
-
-    // Greedy, and a seeded sampler: a draft is kept only when the serial
-    // sampler draws it at that position, so both streams are the serial one.
-    for ([_]SamplingParams{ greedy, .{ .temperature = 1.0, .seed = 7 } }) |sp| {
-        var serial: [want]u32 = undefined;
-        {
-            var xfm = try Transformer.init(io, allocator, config, &weights);
-            defer xfm.deinit();
-            var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), sp, &.{}, .{
-                .skip_lazy_preforward = true,
-            });
-            defer gen.deinit(allocator);
-            var n: usize = 0;
-            while (n < want) {
-                const t = (try gen.next(allocator)) orelse break;
-                serial[n] = t;
-                n += 1;
-            }
-            try testing.expectEqual(want, n);
-        }
-
-        {
-            var xfm = try Transformer.init(io, allocator, config, &weights);
-            defer xfm.deinit();
-            var head = try mtp_mod.loadMtp(io, allocator, s, dir_path);
-            defer head.deinit();
-            try testing.expectEqual(mtp_mod.Layout.nemotron, head.layout);
-            try head.bind(&xfm);
-
-            var gen = try Generator.initWithOptions(io, allocator, &xfm, &tok_dummy, &prompt, @intCast(want), sp, &.{}, .{
-                .mtp_enabled = true,
-                .mtp = .{ .qwen = &head },
-                .model_has_mtp = true,
-                .mtp_depth = 2,
-            });
-            defer gen.deinit(allocator);
-
-            var got = std.ArrayList(u32).empty;
-            defer got.deinit(allocator);
-            while (true) {
-                const rounds_before = gen.mtp_attempted + gen.mtp_lookup_rounds;
-                const res = (try gen.nextMtp(allocator)) orelse break;
-                defer allocator.free(res.tokens);
-                try got.appendSlice(allocator, res.tokens);
-                // Every emitted token passes through a real spec round, head or lookup (no silent fallback).
-                try testing.expect(gen.mtp_attempted + gen.mtp_lookup_rounds != rounds_before);
-            }
-            try testing.expect(gen.mtp_attempted > 0);
-            try testing.expect(!gen.spec_disabled_runtime);
-            try testing.expectEqual(want, got.items.len);
-            for (serial, got.items) |a, b| try testing.expectEqual(a, b);
-        }
-    }
-
-    // Bar: the head's attention is NoPE like the trunk's, so a history row's
-    // cached key is the same at position 0 and position 1.
-    {
-        var xfm = try Transformer.init(io, allocator, config, &weights);
-        defer xfm.deinit();
-        var head = try mtp_mod.loadMtp(io, allocator, s, dir_path);
-        defer head.deinit();
-        try head.bind(&xfm);
-        var rows: [2 * H]f32 = undefined;
-        for (&rows, 0..) |*v, i| v.* = @sin(0.37 * @as(f32, @floatFromInt(i)) + 0.2);
-        const kv_w = AHD; // one kv head
-        const Keys = struct {
-            // Cached keys `[2, kv_w]` after appending rows in `order`.
-            fn run(hd: *const mtp_mod.MtpModel, x: *Transformer, all: *const [2 * H]f32, order: [2]usize, out: *[2 * kv_w]f32, st: mlx.mlx_stream) !void {
-                var hist: [2 * H]f32 = undefined;
-                for (order, 0..) |r, j| @memcpy(hist[j * H .. (j + 1) * H], all[r * H .. (r + 1) * H]);
-                const ids = [2]i32{ 5, 9 };
-                const hist_ids = [2]i32{ ids[order[0]], ids[order[1]] };
-                var cache = try KVCache.init(std.testing.allocator, 1);
-                defer cache.deinit();
-                const h_f = mlx.mlx_array_new_data(&hist, &[_]c_int{ 1, 2, @intCast(H) }, 3, .float32);
-                defer _ = mlx.mlx_array_free(h_f);
-                var h_bf = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(h_bf);
-                try mlx.check(mlx.mlx_astype(&h_bf, h_f, .bfloat16, st));
-                const id_h = mlx.mlx_array_new_data(&hist_ids, &[_]c_int{2}, 1, .int32);
-                defer _ = mlx.mlx_array_free(id_h);
-                try mtp_mod.appendKvOnly(hd, x, &cache, id_h, h_bf, 0, null);
-                var view = try cache.denseView(0, st);
-                defer view.deinit();
-                var kf = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(kf);
-                try mlx.check(mlx.mlx_astype(&kf, view.k, .float32, st));
-                var kc = mlx.mlx_array_new();
-                defer _ = mlx.mlx_array_free(kc);
-                try mlx.check(mlx.mlx_contiguous(&kc, kf, false, st));
-                try mlx.check(mlx.mlx_array_eval(kc));
-                const p = mlx.mlx_array_data_float32(kc) orelse return error.NoData;
-                @memcpy(out, p[0 .. 2 * kv_w]);
-            }
-        };
-        var fwd: [2 * kv_w]f32 = undefined;
-        var rev: [2 * kv_w]f32 = undefined;
-        try Keys.run(&head, &xfm, &rows, .{ 0, 1 }, &fwd, s);
-        try Keys.run(&head, &xfm, &rows, .{ 1, 0 }, &rev, s);
-        // Row 0's key: position 0 in `fwd`, position 1 in `rev`.
-        var max_ref: f32 = 0;
-        var max_err: f32 = 0;
-        for (fwd[0..kv_w], rev[kv_w..]) |a, b| {
-            max_ref = @max(max_ref, @abs(a));
-            max_err = @max(max_err, @abs(a - b));
-        }
-        if (!(max_ref > 0.01)) return error.RefTooSmall;
-        if (max_err > 1e-2 * max_ref) {
-            std.debug.print("MTP head key moved with its position: max_err={d:.6} max_ref={d:.6}\n", .{ max_err, max_ref });
-            return error.HeadAttentionIsPositional;
-        }
-    }
-}
-
 test "qwen4: the coarse rerank head is READY before any draft has run" {
     // The head is a full `requantizeRows` of the trunk lm_head plus a
     // synchronous eval of its ~240 MB. Built lazily it landed inside the
@@ -1362,7 +1065,7 @@ test "batched MTP state includes the last row activated by round begin" {
 }
 
 test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
-    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    const model_dir = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     // Group builders keep the merged history step; the solo arm must draft the same way.
     chain_mod.mtp_padded_head_override = false;
@@ -1507,7 +1210,7 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
 }
 
 test "acceptance failure restores every unfinished row after verify returns" {
-    const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+    const model_dir = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1770,7 +1473,7 @@ const L11PlainReplay = struct {
 };
 
 test "plain to prime resumes the same MTP history and next draft as legacy hidden capture" {
-    const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
+    const path = env.get(.MTP_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -1868,7 +1571,7 @@ test "cold grouped MTP head seeds the solo position and preserves valid origins"
 }
 
 test "cold grouped MTP rounds detach and resume exactly like solo heads" {
-    const path = std.c.getenv("MTP_TEST_MODEL") orelse return error.SkipZigTest;
+    const path = env.get(.MTP_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     // Group builders keep the merged history step; the solo arm must draft the same way.
     chain_mod.mtp_padded_head_override = false;

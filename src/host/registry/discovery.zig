@@ -19,6 +19,9 @@ const gguf_meta = @import("engine_pick.zig");
 // dflash.zig's mlx FFI out of this filesystem-only module.
 const dflash = @import("../../engines/mlx/spec/dflash/dflash.zig");
 const mtp = @import("../../sdk/spec/mtp/mtp.zig");
+const served_media = @import("../media_jobs/plugin/served.zig");
+const modality = @import("modality.zig");
+const served_plugin = @import("../../engines/mlx/plugin/config.zig");
 
 /// Architecture allow-list for discovery. Must stay in sync with the
 /// `model_type` branches in `model.zig:parseConfigFromJson`. Discovery
@@ -86,25 +89,7 @@ const supported_model_types = [_][]const u8{
 /// delegates here, so discovery, register-by-path and the load guard agree.
 /// App twin: `DownloadManager.requiredMediaMarker` (keep in sync).
 pub fn requiredMediaMarker(model_type: []const u8) ?[]const u8 {
-    // LTX: distinguishes the real bundle from any other "AudioVideo" config
-    // and proves the text path can load.
-    if (std.mem.eql(u8, model_type, "AudioVideo")) return "connector.safetensors";
-    // MiniMax-H3: our converted layout always writes this next to config.json.
-    if (std.mem.eql(u8, model_type, "minimax_h3")) return "transformer.safetensors";
-    // MiniMax Music 3: the converter writes the vocoder LAST of the five files.
-    if (std.mem.eql(u8, model_type, "minimax_music3")) return "vocoder.safetensors";
-    // ACE-Step: the text encoder is a subdir a partial pull can miss.
-    if (std.mem.eql(u8, model_type, "acestep")) return "text_encoder/model.safetensors";
-    // Stable Audio 3: same, for its T5Gemma subdir.
-    if (std.mem.eql(u8, model_type, "stable_audio3")) return "t5gemma-b-b-ul2/model.safetensors";
-    // YuE2: the upstream repo has no decoder; only a pack with the folded-in VAE can run.
-    if (std.mem.eql(u8, model_type, "yue2")) return "vae.safetensors";
-    // MOSS-Image: no root config.json, so model_index.json lands first; every pack names its VAE weights so.
-    if (std.mem.eql(u8, model_type, "moss_image")) return "vae/diffusion_pytorch_model.safetensors";
-    // TRELLIS.2: pipeline.json names the pack, so a pull lands its weights first; the SS decoder sorts last of them.
-    if (std.mem.eql(u8, model_type, "trellis2")) return "microsoft/TRELLIS-image-large/ckpts/ss_dec_conv3d_16l8_fp16.safetensors";
-    // Pixal3D ships its decoders in its own ckpts/; the texture decoder sorts last.
-    if (std.mem.eql(u8, model_type, "pixal3d")) return "ckpts/tex_dec_next_dc_f16c32_fp16.safetensors";
+    if (served_media.byName(model_type)) |t| return if (t.required_file.len == 0) null else t.required_file.slice();
     return null;
 }
 
@@ -115,28 +100,7 @@ pub fn isTranscriptionCompanion(model_type: []const u8) bool {
 }
 
 pub fn isMediaModelType(model_type: []const u8) bool {
-    return std.mem.startsWith(u8, model_type, "flux2") or
-        std.mem.startsWith(u8, model_type, "krea") or
-        std.mem.startsWith(u8, model_type, "mage_flow") or
-        std.mem.eql(u8, model_type, "mageflow") or
-        std.mem.startsWith(u8, model_type, "qwen_image") or
-        std.mem.eql(u8, model_type, "moss_image") or
-        std.mem.eql(u8, model_type, "trellis2") or
-        std.mem.eql(u8, model_type, "pixal3d") or
-        std.mem.eql(u8, model_type, "qwen3_tts") or
-        std.mem.eql(u8, model_type, "acestep") or
-        std.mem.eql(u8, model_type, "kokoro") or
-        std.mem.eql(u8, model_type, "AudioVideo") or
-        std.mem.eql(u8, model_type, "minimax_h3") or
-        std.mem.eql(u8, model_type, "minimax_music3") or
-        std.mem.eql(u8, model_type, "stable_audio3") or
-        std.mem.eql(u8, model_type, "yue2") or
-        std.mem.eql(u8, model_type, "laya") or
-        std.mem.eql(u8, model_type, "kev") or
-        std.mem.eql(u8, model_type, "clef") or
-        std.mem.eql(u8, model_type, "d1") or
-        std.mem.eql(u8, model_type, "nemotron_diarization") or
-        std.mem.startsWith(u8, model_type, "hunyuan3d");
+    return modality.fromType(model_type) != null;
 }
 
 fn isSupportedModelType(model_type: []const u8) bool {
@@ -184,36 +148,15 @@ const ConfigPeek = union(enum) {
 fn peekConfig(io: std.Io, allocator: std.mem.Allocator, dir: std.Io.Dir, entry_name: []const u8) ConfigPeek {
     var sub = dir.openDir(io, entry_name, .{}) catch return .missing_or_unparseable;
     defer sub.close(io);
+    if (served_media.claimTypeIn(io, sub, allocator)) |mt| return .{ .supported = mt };
     if (peekClefPack(io, sub)) return .{ .supported = allocator.dupe(u8, "clef") catch return .missing_or_unparseable };
     // A Kev pack carries its base model's config.json (qwen3_5): the marker must win before it is read.
     if (peekKevPack(io, sub)) return .{ .supported = allocator.dupe(u8, "kev") catch return .missing_or_unparseable };
     var file = sub.openFile(io, "config.json", .{}) catch {
-        // No root config.json: a MageFlow diffusers repo carries only
-        // model_index.json (`_class_name`=="MageFlowPipeline"). Classify it so
-        // `list` + the registry treat it like any other image model. Mirrors
-        // gen.peekModelType's fallback (kept in sync — the routing side must agree).
-        if (peekMageFlowIndex(io, allocator, sub))
-            return .{ .supported = allocator.dupe(u8, "mage_flow") catch return .missing_or_unparseable };
-        // …and an mflux FLUX.2 conversion may carry nothing at all (the only
-        // MLX build of klein 9B ships no config.json). Same fallback, keyed on
-        // the DiT's own weight names.
-        if (peekMfluxFlux2(io, allocator, sub))
-            return .{ .supported = allocator.dupe(u8, "flux2-klein") catch return .missing_or_unparseable };
+        // No root config.json (configless image and 3D packs are their plugins' claims, above).
         // A Laya decision checkpoint ships encoder/config.json + rl_agent_config.json.
         if (peekLayaCheckpoint(io, sub))
             return .{ .supported = allocator.dupe(u8, "laya") catch return .missing_or_unparseable };
-        // …and an mlx-community-style Qwen-Image-2.1 repo: no root
-        // config.json, model_index.json's `_class_name` its only marker
-        // (the 2.0 family's "QwenImagePipeline" is a different architecture).
-        if (peekQwenImage21Index(io, allocator, sub))
-            return .{ .supported = allocator.dupe(u8, "qwen_image21") catch return .missing_or_unparseable };
-        if (peekMossImageIndex(io, allocator, sub))
-            return .{ .supported = allocator.dupe(u8, "moss_image") catch return .missing_or_unparseable };
-        // …and a TRELLIS.2 pack: pipeline.json's `name`, no root config.json; Pixal3D keeps that name.
-        if (peekPixal3dPipeline(io, allocator, sub))
-            return .{ .supported = allocator.dupe(u8, "pixal3d") catch return .missing_or_unparseable };
-        if (peekTrellis2Pipeline(io, allocator, sub))
-            return .{ .supported = allocator.dupe(u8, "trellis2") catch return .missing_or_unparseable };
         // …and a Stable Audio 3 repo: stable-audio-tools' model_config.json.
         if (peekStableAudio3Config(io, allocator, sub))
             return .{ .supported = allocator.dupe(u8, "stable_audio3") catch return .missing_or_unparseable };
@@ -332,81 +275,6 @@ pub fn peekMageFlowIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.D
     if (parsed.value.object.get("_mage_flow_version") != null) return true;
     const cn = parsed.value.object.get("_class_name") orelse return false;
     return cn == .string and std.mem.eql(u8, cn.string, "MageFlowPipeline");
-}
-
-/// True when `sub/model_index.json` names the Qwen-Image-2.1 pipeline. The 2.0
-/// family spells "QwenImagePipeline" — a different architecture, never matched.
-/// Same signature as gen.isQwenImage21Repo, over an already-open Dir.
-pub fn peekQwenImage21Index(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
-    return modelIndexClassIs(io, allocator, sub, "QwenImage21Pipeline");
-}
-
-/// True when `sub/model_index.json` names the MOSS-Image pipeline (the release's
-/// diffusers tree, as published and as the mlx-community mirror ships it).
-pub fn peekMossImageIndex(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
-    return modelIndexClassIs(io, allocator, sub, "MOSSImagePipeline");
-}
-
-/// True when `sub/pipeline.json` names the TRELLIS.2 image-to-3D pipeline (microsoft/TRELLIS.2-4B as published,
-/// and the MLX packs that keep its layout). Twin of gen.isTrellis2Pack, which delegates here.
-pub fn peekTrellis2Pipeline(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
-    return trellisPipelineKind(io, allocator, sub) == .trellis2;
-}
-
-/// True for TencentARC/Pixal3D's layout: TRELLIS.2's pipeline.json (same `name`) over flows whose own config reads
-/// `"image_attn_mode": "proj"`. Twin of gen.isPixal3dPack, which delegates here.
-pub fn peekPixal3dPipeline(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) bool {
-    return trellisPipelineKind(io, allocator, sub) == .pixal3d;
-}
-
-const TrellisKind = enum { trellis2, pixal3d };
-
-fn trellisPipelineKind(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir) ?TrellisKind {
-    const pipe = readJsonIn(io, allocator, sub, "pipeline.json") orelse return null;
-    defer pipe.deinit();
-    const name = jsonPath(pipe.value, &.{"name"}) orelse return null;
-    if (name != .string or !std.mem.eql(u8, name.string, "Trellis2ImageTo3DPipeline")) return null;
-    const ss = jsonPath(pipe.value, &.{ "args", "models", "sparse_structure_flow_model" }) orelse return .trellis2;
-    if (ss != .string) return .trellis2;
-    var buf: [512]u8 = undefined;
-    const cfg_path = std.fmt.bufPrint(&buf, "{s}.json", .{ss.string}) catch return .trellis2;
-    const cfg = readJsonIn(io, allocator, sub, cfg_path) orelse return .trellis2;
-    defer cfg.deinit();
-    const mode = jsonPath(cfg.value, &.{ "args", "image_attn_mode" }) orelse return .trellis2;
-    return if (mode == .string and std.mem.eql(u8, mode.string, "proj")) .pixal3d else .trellis2;
-}
-
-fn readJsonIn(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, path: []const u8) ?std.json.Parsed(std.json.Value) {
-    var file = sub.openFile(io, path, .{}) catch return null;
-    defer file.close(io);
-    var rbuf: [4096]u8 = undefined;
-    var rs = file.reader(io, &rbuf);
-    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return null;
-    defer allocator.free(bytes);
-    return std.json.parseFromSlice(std.json.Value, allocator, bytes, .{ .allocate = .alloc_always }) catch null;
-}
-
-fn jsonPath(v: std.json.Value, keys: []const []const u8) ?std.json.Value {
-    var cur = v;
-    for (keys) |k| {
-        if (cur != .object) return null;
-        cur = cur.object.get(k) orelse return null;
-    }
-    return cur;
-}
-
-fn modelIndexClassIs(io: std.Io, allocator: std.mem.Allocator, sub: std.Io.Dir, class_name: []const u8) bool {
-    var file = sub.openFile(io, "model_index.json", .{}) catch return false;
-    defer file.close(io);
-    var rbuf: [4096]u8 = undefined;
-    var rs = file.reader(io, &rbuf);
-    const bytes = rs.interface.allocRemaining(allocator, .limited(1 * 1024 * 1024)) catch return false;
-    defer allocator.free(bytes);
-    var parsed = std.json.parseFromSlice(std.json.Value, allocator, bytes, .{}) catch return false;
-    defer parsed.deinit();
-    if (parsed.value != .object) return false;
-    const cn = parsed.value.object.get("_class_name") orelse return false;
-    return cn == .string and std.mem.eql(u8, cn.string, class_name);
 }
 
 /// True when `sub/model_config.json` is a stable-audio-tools inpainting
@@ -1115,13 +983,8 @@ fn tryAddModel(
         // returns false below, via `.missing_or_unparseable`.
         const has_config = if (sub.statFile(io, "config.json", .{})) |st| st.kind == .file else |_| false;
         if (!has_config and
-            !peekMageFlowIndex(io, allocator, sub) and
-            !peekMfluxFlux2(io, allocator, sub) and
+            served_media.claimIn(io, sub) == null and
             !peekLayaCheckpoint(io, sub) and
-            !peekQwenImage21Index(io, allocator, sub) and
-            !peekMossImageIndex(io, allocator, sub) and
-            !peekTrellis2Pipeline(io, allocator, sub) and
-            !peekPixal3dPipeline(io, allocator, sub) and
             !peekStableAudio3Config(io, allocator, sub)) return false;
 
         // Filter by supported model_type AND quantization scheme. Catches:
@@ -1480,6 +1343,18 @@ pub fn parseStubMeta(allocator: std.mem.Allocator, config_json: []const u8, has_
     return meta;
 }
 
+/// A served pack's facts come from its plugin's stub parse, not this file's reading of config.json.
+fn applyServedStub(meta: *StubMeta, st: served_plugin.Stub) void {
+    meta.vocab_size = st.shell.vocab_size;
+    meta.hidden_size = st.shell.hidden_size;
+    meta.num_hidden_layers = st.shell.num_hidden_layers;
+    meta.max_position_embeddings = std.math.cast(u32, st.shell.max_position_embeddings) orelse std.math.maxInt(u32);
+    meta.quant_bits = st.shell.quant.bits;
+    meta.is_moe = st.caps.moe;
+    meta.has_vision = st.caps.images;
+    meta.has_video = st.caps.video;
+}
+
 /// Read `StubMeta` for the model directory at `abs_path` (config.json + a
 /// chat-template-presence check). Best-effort: any I/O / parse failure yields
 /// `.found=false`. Called per unloaded entry from `/v1/models` — cheap (small
@@ -1503,6 +1378,7 @@ pub fn readStubMeta(io: std.Io, allocator: std.mem.Allocator, abs_path: []const 
 
     const sniff = sniffChatTemplate(io, allocator, dir);
     var meta = parseStubMeta(allocator, bytes, sniff.present);
+    if (served_plugin.stubOf(io, allocator, trimmed, bytes)) |st| applyServedStub(&meta, st);
     meta.has_thinking = meta.has_chat and sniff.thinking;
     meta.has_mtp = mtp.dirAdvertisesMtp(io, allocator, dir);
     // A sentence-transformers pooling sidecar marks embedding capability even

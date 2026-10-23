@@ -26,6 +26,7 @@
 //!         --out src/fixtures/tool_traffic.jsonl
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const testing = std.testing;
 const chat = @import("chat.zig");
 
@@ -71,7 +72,7 @@ test "tool traffic replay: captured agent traffic survives parse + schema coerci
     // 4,911 records, ~31 s in Debug: `zig build test -Dslow-tests` runs it.
     if (!@import("build_options").slow_tests) return error.SkipZigTest;
     g_fail_count = 0;
-    dump_soft = std.c.getenv("REPLAY_DUMP_SOFT") != null;
+    dump_soft = env.get(.REPLAY_DUMP_SOFT) != null;
     var line_it = std.mem.splitScalar(u8, fixture, '\n');
     var idx: usize = 0;
     var records: usize = 0;

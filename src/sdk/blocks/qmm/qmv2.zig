@@ -7,14 +7,15 @@
 //! picks its geometry per GPU generation. Decoding once for every row follows
 //! @sudoingX's CUDA small-batch PTQ1_0 kernels (PrismML-Eng/llama.cpp#218).
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
 /// Codes (j, j+8) of `u` as exact half2 integers, minus `o`.
-const DECODE = kernelSource("kernels/qmm/qmv2_decode.metal");
+pub const DECODE = kernelSource("kernels/qmm/qmv2_decode.metal");
 
-const SOURCE = kernelSource("kernels/qmm/qmv2.metal");
+pub const SOURCE = kernelSource("kernels/qmm/qmv2.metal");
 
 var kernel_cache: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -24,7 +25,7 @@ var cfg_cache: std.AutoHashMapUnmanaged(CfgKey, mlx.mlx_fast_metal_kernel_config
 var env_enabled: ?bool = null;
 fn enabled() bool {
     if (env_enabled) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_QMV_H2");
+    const raw = env.get(.MLX_SERVE_QMV_H2);
     env_enabled = raw == null or raw.?[0] != '0';
     return env_enabled.?;
 }
@@ -106,7 +107,7 @@ fn launch(k: mlx.mlx_fast_metal_kernel, inputs: []const mlx.mlx_array, x: mlx.ml
 /// decode ONCE and serve every row; R weight rows per simdgroup, G simdgroups
 /// per threadgroup. Codes stay half2 and x its own width (half2 for f16, float2
 /// for bf16), widened at the FMA, so the math is f32 FMAs over exact inputs.
-const ROWS_SOURCE = kernelSource("kernels/qmm/qmv2_rows.metal");
+pub const ROWS_SOURCE = kernelSource("kernels/qmm/qmv2_rows.metal");
 
 pub const MAX_ROWS = 8;
 
@@ -248,7 +249,7 @@ pub fn qmvRowsAt(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.
 /// every fragment multiplies all rows, so 8 rows cost what 1 does. Partials
 /// per 128-group are scaled in f32. RB 8-row weight blocks per simdgroup,
 /// SGS simdgroups, K split SPLIT ways (f32 partials summed by the caller).
-const MMA_SOURCE = kernelSource("kernels/qmm/qmv2_mma.metal");
+pub const MMA_SOURCE = kernelSource("kernels/qmm/qmv2_mma.metal");
 
 pub const MMA_MAX_ROWS = 16;
 /// 8-row weight blocks per simdgroup (rb), simdgroups (sgs), K splits (split).

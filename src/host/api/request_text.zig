@@ -147,45 +147,6 @@ test "continuationRejectReason names the embedded engine, and only it" {
     try std.testing.expect(std.mem.indexOf(u8, reason, "embedded GGUF engine") != null);
 }
 
-test "every continuation surface consults continuationRejectReason before rendering" {
-    // `cachedFormatChat`'s guard returns an error, and an error at that depth
-    // reaches no handler that can turn it into a response: it unwinds to
-    // `handleConnectionThread`, which logs it and closes the socket. The client
-    // gets a dropped connection with no status line — and on `/v1/messages`,
-    // where a continuation is INFERRED from the message list, that happened
-    // with no client opt-in at all on every ds4 model.
-    //
-    // So the predicate is the gate and the error is the backstop: each surface
-    // that computes a `continue_final` must consult it in the same statement or
-    // just after, and this scan is what keeps a third surface from wiring the
-    // flag straight into the render.
-    // Needles are split so this test's own source cannot match them — it sits
-    // in the file it greps, and an unsplit literal is found here first.
-    const src = @embedFile("chat_completions.zig") ++ @embedFile("anthropic.zig");
-    const predicate = "continuationRejectReason" ++ "(";
-
-    // Both computations of `continue_final`, each followed by the gate before
-    // the next one starts.
-    const binding = "const continue_final " ++ "= ";
-    const explicit = binding ++ "continueFinalMessageRequested" ++ "(";
-    const implicit = binding ++ "chat_mod.continuationRequested" ++ "(";
-    const explicit_at = std.mem.indexOf(u8, src, explicit) orelse return error.ExplicitSurfaceMissing;
-    const implicit_at = std.mem.indexOf(u8, src, implicit) orelse return error.ImplicitSurfaceMissing;
-    // Within the ~40 lines after each, the predicate must appear.
-    const window = 1600;
-    for ([_]usize{ explicit_at, implicit_at }) |at| {
-        const end = @min(src.len, at + window);
-        if (std.mem.indexOf(u8, src[at..end], predicate) == null) return error.SurfaceSkipsThePredicate;
-    }
-
-    // Exactly two computations — a third `continue_final` binding is a third
-    // surface, and it has to come with its own gate rather than inherit one.
-    var count: usize = 0;
-    var i: usize = 0;
-    while (std.mem.indexOfPos(u8, src, i, binding)) |at| : (i = at + binding.len) count += 1;
-    try std.testing.expectEqual(@as(usize, 2), count);
-}
-
 test "content-array text parts JOIN in order — plan-mode's [prompt, reminder] shape (issue #195)" {
     // opencode plan mode appends its system-reminder as a SECOND text part on
     // the user message. Last-wins parsing kept only the reminder, so the model

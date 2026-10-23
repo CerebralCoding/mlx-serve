@@ -2,6 +2,7 @@
 //! Owns SWIGLU_SOURCE, SWIGLU_CLAMP_SOURCE, swiglu_sig_tables, sigmoidTableFor, swigluSigTable, swiglu_engaged, and 27 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -9,7 +10,7 @@ const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
 const bf16Scalar = @import("../../../engines/mlx/load/weights.zig").bf16Scalar;
 const scalarOf = @import("../../../engines/mlx/load/weights.zig").scalarOf;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
-const fusedGeluPleProj = @import("../../../plugins/gemma4/ple.zig").fusedGeluPleProj;
+const fusedGeluPleProj = @import("../../../plugins/gemma4/gelu_ple.zig").fusedGeluPleProj;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const attn256MaxDiff = @import("../attention/attn256.zig").attn256MaxDiff;
 const gdnParityRand = @import("../gdn/decode_fused.zig").gdnParityRand;
@@ -52,19 +53,19 @@ const gptOssSwiGLU = @import("activations.zig").gptOssSwiGLU;
 // in the hot loop, 128 KB resident. The two multiplies need no such care: a
 // bf16/f16 product is exact in float, so one rounding is one rounding on any
 // compiler.
-const SWIGLU_SOURCE = kernelSource("kernels/mlp/swiglu.metal");
+pub const SWIGLU_SOURCE = kernelSource("kernels/mlp/swiglu.metal");
 
 // SWIGLU_SOURCE behind the clamps of a `swiglu_limit` (GLM-5-Next): mlx Minimum on the gate,
 // Clip on the up branch (exact in the tensor dtype), then the same chain.
-const SWIGLU_CLAMP_SOURCE = kernelSource("kernels/mlp/swiglu_clamp.metal");
+pub const SWIGLU_CLAMP_SOURCE = kernelSource("kernels/mlp/swiglu_clamp.metal");
 
-/// `mlx_sigmoid` tabulated over every 16-bit float pattern, indexed [bf16, f16].
-var swiglu_sig_tables: [2]?mlx.mlx_array = @splat(null);
+/// `mlx_sigmoid` tabulated over every 16-bit float pattern, indexed [CPU, GPU][bf16, f16]: the devices round apart.
+var swiglu_sig_tables: [2][2]?mlx.mlx_array = @splat(@splat(null));
 
 /// MLX's sigmoid of every 16-bit pattern of `dt` (bf16 or f16), for kernels
 /// that must reproduce the op's rounding bit for bit.
 pub fn sigmoidTableFor(s: mlx.mlx_stream, dt: mlx.mlx_dtype) !mlx.mlx_array {
-    return if (dt == .bfloat16) @import("../hc/hc_prefill.zig").sigmoidTable(s) else swigluSigTable(s, dt, std.heap.c_allocator);
+    return swigluSigTable(s, dt, std.heap.c_allocator);
 }
 
 pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.Allocator) !mlx.mlx_array {
@@ -73,7 +74,8 @@ pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.A
         .float16 => 1,
         else => return error.UnsupportedSwigluDtype,
     };
-    if (swiglu_sig_tables[slot]) |t| return t;
+    const cached = &swiglu_sig_tables[@intFromBool(mlx.streamIsGpu(s))][slot];
+    if (cached.*) |t| return t;
 
     const vals = try all16BitPatterns(s, dt, allocator);
     defer _ = mlx.mlx_array_free(vals);
@@ -82,7 +84,7 @@ pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.A
     try mlx.check(mlx.mlx_sigmoid(&table, vals, s));
     // Materialize now: the table outlives every graph that reads it.
     try mlx.check(mlx.mlx_array_eval(table));
-    swiglu_sig_tables[slot] = table;
+    cached.* = table;
     return table;
 }
 
@@ -93,7 +95,7 @@ var swiglu_fused_env: ?bool = null;
 pub fn swigluFusedEnabled() bool {
     if (swiglu_fused_override) |v| return v;
     if (swiglu_fused_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_SWIGLU_FUSED");
+    const raw = env.get(.MLX_SERVE_SWIGLU_FUSED);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     swiglu_fused_env = enabled;
     return enabled;
@@ -101,7 +103,7 @@ pub fn swigluFusedEnabled() bool {
 
 /// `table[gate] * up`: an activation that is unary in x, tabulated over every
 /// 16-bit pattern by running MLX's own op chain once, then one multiply.
-const TABLE_MUL_SOURCE = kernelSource("kernels/mlp/table_mul.metal");
+pub const TABLE_MUL_SOURCE = kernelSource("kernels/mlp/table_mul.metal");
 
 /// `x * c -> erf -> 1 + -> x * -> * half`, five ops in the activation dtype.
 pub fn geluErfChain(x: mlx.mlx_array, one: mlx.mlx_array, half: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -275,7 +277,7 @@ pub fn tableGateMul(s: mlx.mlx_stream, kind: GateMulKind, gate: mlx.mlx_array, u
 /// second kernel.
 // SWIGLU_SOURCE over a joined gate|up projection row (gate the first F
 // columns): the two halves are read in place instead of copied out.
-const SWIGLU_JOINED_SOURCE = kernelSource("kernels/mlp/swiglu_joined.metal");
+pub const SWIGLU_JOINED_SOURCE = kernelSource("kernels/mlp/swiglu_joined.metal");
 var swiglu_joined_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var swiglu_joined_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var swiglu_joined_key: GateMulCfgKey = std.mem.zeroes(GateMulCfgKey);
@@ -367,6 +369,7 @@ pub fn fusedGeluErfMul(s: mlx.mlx_stream, gate: mlx.mlx_array, up: mlx.mlx_array
 }
 
 // ── tests ──
+
 
 test "fused SwiGLU is bit-identical to the sigmoid+multiply+multiply chain" {
     // The reason this kernel exists instead of extending mlx_compile to the
@@ -792,4 +795,34 @@ test "gpt_oss clamped SwiGLU matches the reference formula (f64 oracle)" {
         const want: f64 = gd * sig * (ud + 1.0);
         try t.expectApproxEqAbs(want, @as(f64, got[i]), 1e-4);
     }
+}
+
+test "the SwiGLU sigmoid table is MLX's sigmoid on the device that asks for it" {
+    // CPU and GPU sigmoids round differently; a table cached from one device served the other, so a model's
+    // output on one stream depended on which stream had asked first.
+    const cpu = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(cpu);
+    const gpu = mlx.gpuStream();
+    defer _ = mlx.mlx_stream_free(gpu);
+    for ([_]mlx.mlx_stream{ cpu, gpu, cpu }) |s| for ([_]mlx.mlx_dtype{ .bfloat16, .float16 }) |dt| {
+        const vals = try all16BitPatterns(s, dt, testing.allocator);
+        defer _ = mlx.mlx_array_free(vals);
+        var want = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(want);
+        try mlx.check(mlx.mlx_sigmoid(&want, vals, s));
+        try mlx.check(mlx.mlx_array_eval(want));
+        // Compared as bits: the NaN patterns are part of the table.
+        var g = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(g);
+        try mlx.check(mlx.mlx_view(&g, try swigluSigTable(s, dt, testing.allocator), .uint16, cpu));
+        var w = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(w);
+        try mlx.check(mlx.mlx_view(&w, want, .uint16, cpu));
+        var eq = mlx.mlx_array_new();
+        defer _ = mlx.mlx_array_free(eq);
+        try mlx.check(mlx.mlx_array_equal(&eq, g, w, false, cpu));
+        var same = false;
+        try mlx.check(mlx.mlx_array_item_bool(&same, eq));
+        try testing.expect(same);
+    };
 }

@@ -1,11 +1,12 @@
 // SPDX-License-Identifier: Apache-2.0
 // Ported from oMLX (jundot/omlx) omlx/patches/m5_gather_qmm_nax.py @ d6b2b92.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
-const Plan = struct { sched: enum { seg, db }, bm: c_int, bk: c_int, gx: c_int, pad: c_int };
+pub const Plan = struct { sched: enum { seg, db }, bm: c_int, bk: c_int, gx: c_int, pad: c_int };
 /// `mx`: an FP4 bank (uint8 scales, no biases: e8m0 per 32 for MXFP4, e4m3 per 16 for NVFP4) instead of affine.
 const CanaryKey = struct { plan: Plan, bits: u32, group: u32, align_n: bool, align_k: bool, mx: bool };
 const MmKey = struct { rows: c_int, n: c_int, k: c_int, max_tiles: c_int, plan: Plan, bits: u32, group: u32, mx: bool, mapped: bool = false, paired: bool = false, limit: u32 = 0 };
@@ -24,7 +25,7 @@ var paired_engaged_logged = false;
 /// seg tiles were measured against mlx 0.32.2, whose sorted kernel masked whole row blocks;
 /// 0.32.3 schedules row tiles itself and the plain db 96-row tile-on-x layout is the one
 /// that still beats it. The paired gate/up kernel keeps seg 128.
-fn plan(rows: c_int, experts: c_int, k: c_int, n: c_int, paired: bool) Plan {
+pub fn plan(rows: c_int, experts: c_int, k: c_int, n: c_int, paired: bool) Plan {
     if (@rem(k, 64) != 0 or @rem(n, 64) != 0) return .{ .sched = .seg, .bm = 64, .bk = 64, .gx = 0, .pad = 0 };
     const per_expert = @divTrunc(rows, @max(experts, 1));
     if (per_expert < 36 or (k < 1024 and per_expert < 120)) return .{ .sched = .db, .bm = 64, .bk = 64, .gx = 0, .pad = 0 };
@@ -704,6 +705,8 @@ fn randomBank(experts: c_int, n: c_int, k: c_int, bits: u32, group: u32, mx: boo
 
 test "segmented NAX sorted gather matches stock across Flash Next and quantization shapes" {
     try requireNax();
+    // Real Flash Next / MiMo bank shapes peak past 40 GB of Metal memory: `-Dslow-tests` only.
+    if (!@import("build_options").slow_tests) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const cases = [_]struct { rows: c_int, experts: c_int, n: c_int, k: c_int, bits: u32, group: u32 }{
         .{ .rows = 81920, .experts = 512, .n = 640, .k = 2560, .bits = 4, .group = 64 },
@@ -724,6 +727,8 @@ test "segmented NAX sorted gather matches stock across Flash Next and quantizati
 
 test "segmented NAX sorted gather matches stock bit for bit on FP4 banks (MXFP4 MiMo shapes, NVFP4 Flash Next shapes)" {
     try requireNax();
+    // Real Flash Next / MiMo bank shapes peak past 40 GB of Metal memory: `-Dslow-tests` only.
+    if (!@import("build_options").slow_tests) return error.SkipZigTest;
     const s = mlx.gpuStream();
     // 65536 rows = an 8192-token top-8 chunk, past the 32768-row offset the stock kernel once overflowed.
     const cases = [_]struct { rows: c_int, experts: c_int, n: c_int, k: c_int, group: u32 }{
@@ -900,7 +905,7 @@ fn benchPortGateUp(c: BenchArm) anyerror!mlx.mlx_array {
 
 /// `=sweep` times every tile configuration instead of the planner's.
 fn benchPlans(buf: *[32]Plan, rows: c_int, experts: c_int, k: c_int, n: c_int, paired: bool) []const Plan {
-    const raw = std.c.getenv("MLX_SERVE_GQMM_UBENCH") orelse return buf[0..0];
+    const raw = env.get(.MLX_SERVE_GQMM_UBENCH) orelse return buf[0..0];
     if (!std.mem.eql(u8, std.mem.sliceTo(raw, 0), "sweep")) {
         buf[0] = plan(rows, experts, k, n, paired);
         return buf[0..1];
@@ -919,7 +924,7 @@ fn benchPlans(buf: *[32]Plan, rows: c_int, experts: c_int, k: c_int, n: c_int, p
 }
 
 test "segmented NAX sorted gather µbench vs stock at 8192-token chunks (MLX_SERVE_GQMM_UBENCH=1|sweep)" {
-    if (std.c.getenv("MLX_SERVE_GQMM_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MLX_SERVE_GQMM_UBENCH) == null) return error.SkipZigTest;
     try requireNax();
     errdefer dropOwnLatch();
     const s = mlx.gpuStream();

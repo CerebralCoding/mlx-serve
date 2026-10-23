@@ -91,6 +91,17 @@ pub const QuantTable = extern struct {
     moe: *const fn (bank: *const Weight, x: Array, lhs: Array, rhs: Array, sorted: bool, s: Stream, out: *Array) callconv(.c) Verdict,
     /// Registers the format's kernels with the kernel contract (P2 step 6).
     register_kernels: ?*const fn (host: ?*const Host) callconv(.c) Verdict = null,
+    /// Routed SwiGLU experts in one dispatch, for a format whose kernels fuse the three projections (EXL3): `x`
+    /// [B, S, D] through the banks' experts `inds` [B, S, K], weighted by `scores`. Null: compose `moe` per projection.
+    swiglu: ?*const fn (gate: *const Weight, up: *const Weight, down: *const Weight, x: Array, inds: Array, scores: Array, opts: *const Swiglu, s: Stream, out: *Array) callconv(.c) Verdict = null,
+};
+
+pub const Swiglu = extern struct {
+    size: u32 = @sizeOf(Swiglu),
+    /// > 0: the SwiGLU's clamp (GLM's `swiglu_limit`).
+    limit: i32 = 0,
+    /// Spec-verify rows: the decode chain at any width.
+    verify_rows: bool = false,
 };
 
 // ── tests ──
@@ -100,6 +111,6 @@ const testing = std.testing;
 test "abi quant: every struct opens with its size" {
     const w: Weight = .{};
     try testing.expectEqual(@as(u32, @sizeOf(Weight)), w.size);
-    inline for (.{ Source, Weight, LoadCtx, QuantTable }) |T|
+    inline for (.{ Source, Weight, LoadCtx, QuantTable, Swiglu }) |T|
         try testing.expectEqual(@as(usize, 0), @offsetOf(T, "size"));
 }

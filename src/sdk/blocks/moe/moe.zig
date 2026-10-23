@@ -3,7 +3,7 @@
 
 const distributed_mod = @import("../../../engines/mlx/cluster/distributed.zig");
 const mlx = @import("../../../mlx/ffi.zig");
-const sushi_exl3 = @import("sushi_exl3");
+const exl3 = @import("../../quant/exl3/format.zig");
 const gather_qmm_nax = @import("gather_qmm_nax.zig");
 const log = @import("../../../host/log.zig");
 const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
@@ -56,7 +56,7 @@ pub fn moeRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const M
         try mlx.check(mlx.mlx_matmul(&out, x32, mw.router_w, self.s));
         return out;
     }
-    var logits = if (mw.router_scale) |rs| blk: {
+    const logits = if (mw.router_scale) |rs| blk: {
         var normed = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(normed);
         try mlx.check(mlx.mlx_fast_rms_norm(&normed, router_x, rs, cfg.rms_norm_eps, self.s));
@@ -66,13 +66,6 @@ pub fn moeRouterLogits(self: *Transformer, router_x: mlx.mlx_array, mw: *const M
         const qp = self.quantParamsHinted(mw.router_w, mw.router_s, lastDim(router_x));
         break :blk try qmatmulBits(router_x, mw.router_w, mw.router_s, mw.router_b, qp.bits, qp.group_size, qp.mode, self.s);
     };
-    errdefer _ = mlx.mlx_array_free(logits);
-    if (mw.router_bias.ctx != null) {
-        var biased = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_add(&biased, logits, mw.router_bias, self.s));
-        _ = mlx.mlx_array_free(logits);
-        logits = biased;
-    }
     return logits;
 }
 
@@ -206,7 +199,7 @@ pub fn moeVerifyRows(self: *Transformer, inputs: []const mlx.mlx_array, mw: *con
         inputs.len < 2 or inputs.len > 8 or self.config.hidden_size < 32 or self.config.num_experts_per_tok >= 32 or
         mw.shared_ungated or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared or
         self.config.num_experts == 0 or self.config.num_experts_per_tok == 0 or
-        mw.expert_bias != null or mw.router_scale != null or mw.per_expert_scale != null or mw.router_bias.ctx != null)
+        mw.expert_bias != null or mw.router_scale != null or mw.per_expert_scale != null)
     {
         return self.moeVerifyRowsSolo(inputs, mw);
     }
@@ -449,17 +442,13 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
     }
 
     if (cfg.exl3) |spec| {
-        const bank: sushi_exl3.Bank = .{
+        const bank: exl3.Bank = .{
             .gate = .{ .trellis = mw.switch_gate_w, .suh = mw.switch_gate_s, .svh = mw.switch_gate_b },
             .up = .{ .trellis = mw.switch_up_w, .suh = mw.switch_up_s, .svh = mw.switch_up_b },
             .down = .{ .trellis = mw.switch_down_w, .suh = mw.switch_down_s, .svh = mw.switch_down_b },
         };
-        const dec: sushi_exl3.format.Decode = .{ .codebook = spec.codebook, .window = spec.window };
         const clamp = swigluClampLimit(cfg) orelse return error.Exl3SwigluLimitUnsupported;
-        const y = if (clamp > 0)
-            try sushi_exl3.moeClamped(self.s, expert_x, bank, inds, norm_scores, dec, @intCast(clamp))
-        else
-            try sushi_exl3.moe(self.s, expert_x, bank, inds, norm_scores, dec, skip_shared and router_override != null);
+        const y = try exl3.routed(self.s, expert_x, bank, inds, norm_scores, spec, .{ .limit = @intCast(clamp), .verify_rows = skip_shared and router_override != null });
         if (skip_shared) return y;
         if (mw.shared_ungated) return self.moeAddUngatedShared(y, expert_x, mw);
         if (mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return y;
@@ -496,18 +485,9 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
     const inds_shape = mlx.getShape(inds);
     const K = inds_shape[inds_shape.len - 1];
     const total_inds: c_int = B * S * K;
-    // Per-expert ADDITIVE biases (gpt_oss) force the sorted path. The three
-    // decode fast paths below are all fused kernels that compute
-    // `act(gate) * up` straight out of gather_qmm with nowhere to add a
-    // per-expert bias term, and `moeDecodeGatherQmv` additionally bakes in
-    // the standard SwiGLU. Engaging any of them here would silently drop
-    // both the biases and the clamp. The sorted path's argsort costs
-    // essentially nothing at decode width (N = K = 4 here).
-    const has_expert_bias = mw.switch_gate_bias.ctx != null or
-        mw.switch_up_bias.ctx != null or
-        mw.switch_down_bias.ctx != null;
+    // A per-expert gate scale forces the sorted path (the fused decode kernels have nowhere to apply it).
     const has_gate_scale = mw.gate_expert_scale.ctx != null;
-    const do_sort = B * S > 1 or total_inds >= 64 or has_expert_bias or has_gate_scale;
+    const do_sort = B * S > 1 or total_inds >= 64 or has_gate_scale;
     const no_idx = mlx.mlx_array{ .ctx = null };
 
     var down_out = mlx.mlx_array_new();
@@ -520,16 +500,16 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
     var shared_fused = false;
     var cost_arm: u8 = 4;
 
-    const cuda_fmt = if (mlx.cudaAvailable()) moeCudaFormat(B * S, gate_qp.mode, up_qp.mode, down_qp.mode, cfg.hidden_act == .silu, has_expert_bias, mw.up_expert_scale.ctx != null, cfg.swiglu_clamp or cfg.swiglu_limit > 0.0) else null;
+    const cuda_fmt = if (mlx.cudaAvailable()) moeCudaFormat(B * S, gate_qp.mode, up_qp.mode, down_qp.mode, cfg.hidden_act == .silu, false, mw.up_expert_scale.ctx != null, cfg.swiglu_clamp or cfg.swiglu_limit > 0.0) else null;
     const ungated_a4: ?moe_affine4.Ungated = if (skip_shared or B * S != 1) null else self.ungatedSharedA4(mw, gate_qp.group_size);
     const fp4_shared: ?moe_affine4.Shared = if (B * S == 1) if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null else null;
-    if (moeFp4DecodeEligible(B * S, has_expert_bias, swigluClampLimit(&self.config), mlx.mlx_array_dtype(expert_x), gate_qp.mode, up_qp.mode, down_qp.mode) and
+    if (moeFp4DecodeEligible(B * S, false, swigluClampLimit(&self.config), mlx.mlx_array_dtype(expert_x), gate_qp.mode, up_qp.mode, down_qp.mode) and
         try self.moeFp4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.mode, gate_qp.group_size, fp4_shared))
     {
         moe_reduced = true;
         shared_fused = fp4_shared != null;
         cost_arm = 1;
-    } else if (B * S == 1 and !has_expert_bias and (swigluClampLimit(&self.config) orelse 1) == 0 and cfg.hidden_act == .silu and
+    } else if (B * S == 1 and (swigluClampLimit(&self.config) orelse 1) == 0 and cfg.hidden_act == .silu and
         gate_qp.mode == .affine and up_qp.mode == .affine and down_qp.mode == .affine and
         gate_qp.bits == 4 and up_qp.bits == 4 and down_qp.bits == 4 and gate_qp.group_size == up_qp.group_size and gate_qp.group_size == down_qp.group_size and
         try self.moeAffine4Decode(&down_out, expert_x, inds, norm_scores, mw, gate_qp.group_size, if (shared_down) |sd| .{ .down = sd, .logit = routed.gate_logit } else null, ungated_a4))
@@ -537,7 +517,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
         moe_reduced = true;
         shared_fused = shared_down != null or ungated_a4 != null;
         cost_arm = 1;
-    } else if (moeDecodeDispatchArm(B, S, K, has_expert_bias, (swigluClampLimit(&self.config) orelse 1) != 0) == .rows and
+    } else if (moeDecodeDispatchArm(B, S, K, false, (swigluClampLimit(&self.config) orelse 1) != 0) == .rows and
         useGatherQmvDecode(self, gate_qp, up_qp) and mw.switch_gate_s.ctx != null and mw.switch_up_s.ctx != null and mw.switch_down_s.ctx != null and
         try self.moeDecodeGatherQmvRows(&down_out, expert_x, inds, norm_scores, &moe_reduced, mw, gate_qp, up_qp, down_qp, D, K, B, S))
     {
@@ -632,7 +612,6 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             try mlx.check(mlx.mlx_astype(&row_map, lhs_idx, .uint32, self.s));
             const clamp = swigluClampLimit(cfg);
             if (self.compiled_geglu == null and swigluFusedEnabled() and cfg.hidden_act == .silu and clamp != null and
-                mw.switch_gate_bias.ctx == null and mw.switch_up_bias.ctx == null and
                 mw.gate_expert_scale.ctx == null and mw.up_expert_scale.ctx == null and
                 gate_qp.bits == up_qp.bits and gate_qp.group_size == up_qp.group_size)
             {
@@ -660,7 +639,7 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
         }
         if (fused_act == null and mapped_gate == null and input_view == null and mlx.cudaAvailable() and
             cfg.hidden_act == .silu and !cfg.swiglu_clamp and cfg.swiglu_limit == 0.0 and self.compiled_geglu == null and
-            mw.switch_gate_bias.ctx == null and mw.switch_up_bias.ctx == null and mw.up_expert_scale.ctx == null and
+            mw.up_expert_scale.ctx == null and
             gate_qp.mode == up_qp.mode and (gate_qp.mode == .nvfp4 or gate_qp.mode == .mxfp8))
         {
             var row_map = mlx.mlx_array_new();
@@ -700,7 +679,6 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             var gate_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(gate_out);
             try mlx.check(mlx.mlx_squeeze(&gate_out, gate_out_3d, self.s));
-            try self.addExpertBias(&gate_out, mw.switch_gate_bias, sorted_inds);
             try self.scaleExperts(&gate_out, mw.gate_expert_scale, sorted_inds);
 
             const use_mapped_up = mapped_up != null;
@@ -711,12 +689,10 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
             var up_out = mlx.mlx_array_new();
             defer _ = mlx.mlx_array_free(up_out);
             try mlx.check(mlx.mlx_squeeze(&up_out, up_out_3d, self.s));
-            try self.addExpertBias(&up_out, mw.switch_up_bias, sorted_inds);
             try self.scaleExperts(&up_out, mw.up_expert_scale, sorted_inds);
 
-            // gpt_oss swaps the activation itself, not just its inputs.
             break :blk if (cfg.swiglu_limit > 0.0)
-                try self.computeGptOssSwiGLU(gate_out, up_out)
+                try self.computeClampedSwiGLU(gate_out, up_out)
             else
                 try self.computeGeglu(gate_out, up_out);
         };
@@ -747,9 +723,6 @@ pub fn moeMLP2WithRouter(self: *Transformer, router_x: mlx.mlx_array, expert_x_i
         var down_squeezed = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(down_squeezed);
         try mlx.check(mlx.mlx_squeeze(&down_squeezed, down_3d, self.s)); // [N, hidden]
-        // Still in SORTED order here, which is the order `sorted_inds`
-        // indexes — the bias must be added before the inverse permutation.
-        try self.addExpertBias(&down_squeezed, mw.switch_down_bias, sorted_inds);
 
         const verify_reduce = self.verifyFeatureEnabled(.down_reduce, skip_shared, B, S);
         const fused_sum = if (verify_reduce)

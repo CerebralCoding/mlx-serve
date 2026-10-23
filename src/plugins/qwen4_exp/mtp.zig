@@ -1,12 +1,12 @@
-//! plugins/qwen4_exp/mtp, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns qsa_index_score_graphs, qsa_index_select_graphs, qwen4_mtp_head_graphs, mtp_verify_moe_group_graphs, mtp_verify_moe_group_last_ops, mtp_head_force_batched_override, and 47 more.
+//! qwen4_exp's MTP head (`Qwen4Mtp`, `Qwen4MtpState` swapped onto the module): its load, forward over the pre-mixer
+//! stream, QSA layer, history capture and rollback, the draft rerank, and the head-graph meters.
 
 const std = @import("std");
 const qwen4_mod = @import("qwen4_exp.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const mrope = @import("../../sdk/vision/mrope.zig");
-const sushi_exl3 = @import("sushi_exl3");
+const exl3 = @import("../../sdk/quant/exl3/format.zig");
 const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
 const KVQuantConfig = @import("../../engines/mlx/cache/kv_quant.zig").KVQuantConfig;
 const model_mod = @import("../../engines/mlx/model.zig");
@@ -622,7 +622,7 @@ pub fn mtpHeadForceBatched() bool {
 
 pub fn mtpMoeRows(self: *Transformer, x: mlx.mlx_array, mw: *const MoeMlpWeights) !mlx.mlx_array {
     // EXL3 head rows ride the decode chain only.
-    if (self.config.exl3 != null and sushi_exl3.kernels.usesPrefillArm(sushi_exl3.kernels.rowsOfShape(mlx.getShape(x))))
+    if (self.config.exl3 != null and exl3.kernels.usesPrefillArm(exl3.kernels.rowsOfShape(mlx.getShape(x))))
         return error.Exl3MtpRowsExceedDecode;
     if (mw.shared_ungated or mw.shared_expert_gate_w == null or qwen4Standin().moe_shared) return self.moeMLP(x, mw);
     var routed = mw.*;

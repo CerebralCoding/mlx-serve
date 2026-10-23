@@ -1,11 +1,11 @@
 //! Runtime spec gates: warmups, per-draft rate, DFlash and yield gates, re-enable, yielding to company.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const model_mod = @import("../model.zig");
 const log = @import("../../../host/log.zig");
 const pld_index = @import("pld_index.zig");
 const testing = std.testing;
 const Generator = @import("../generate/generator.zig").Generator;
-const readEnvUsize = @import("../env_generate.zig").readEnvUsize;
 
 /// Number of attempts before the runtime gate considers disabling.
 /// Below this we trust the prompt-time gate.
@@ -19,7 +19,7 @@ pub const RUNTIME_GATE_WARMUP: u64 = 5;
 /// Read the warmup threshold for this call. Env-overridable so we can A/B
 /// without rebuilding. Anything outside `[1, 64]` falls back to the default.
 pub fn runtimeGateWarmup() u64 {
-    const n = readEnvUsize("SPEC_GATE_WARMUP", @intCast(RUNTIME_GATE_WARMUP));
+    const n = env.int(.SPEC_GATE_WARMUP, usize, @intCast(RUNTIME_GATE_WARMUP));
     if (n < 1 or n > 64) return RUNTIME_GATE_WARMUP;
     return @intCast(n);
 }
@@ -83,7 +83,7 @@ pub const DFLASH_MOE_GATE_MIN_ACCEPTED_PER_ROUND: f32 = 1.8;
 var dflash_chooser_cache: ?bool = null;
 pub fn dflashChooserEnabled() bool {
     if (dflash_chooser_cache) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_DFLASH_CHOOSER");
+    const raw = env.get(.MLX_SERVE_DFLASH_CHOOSER);
     const on = raw != null and std.mem.eql(u8, std.mem.span(raw.?), "1");
     dflash_chooser_cache = on;
     return on;
@@ -94,12 +94,12 @@ pub fn dflashChooserEnabled() bool {
 /// `MLX_SERVE_DFLASH_POLICY=0` restores the fixed block and the sticky yield gate.
 pub fn dflashPolicyFor(config: *const model_mod.ModelConfig) bool {
     if (!config.isGlm5()) return false;
-    const raw = std.c.getenv("MLX_SERVE_DFLASH_POLICY") orelse return true;
+    const raw = env.get(.MLX_SERVE_DFLASH_POLICY) orelse return true;
     return !std.mem.eql(u8, std.mem.span(raw), "0");
 }
 
 pub fn dflashGateWarmup() u64 {
-    const n = readEnvUsize("DFLASH_GATE_WARMUP", @intCast(DFLASH_GATE_WARMUP));
+    const n = env.int(.DFLASH_GATE_WARMUP, usize, @intCast(DFLASH_GATE_WARMUP));
     if (n < 1 or n > 64) return DFLASH_GATE_WARMUP;
     return @intCast(n);
 }
@@ -141,7 +141,7 @@ pub const YIELD_GATE_MIN_YIELD: f32 = 0.25;
 /// when the Laguna mscale promotion was fixed, which makes the same
 /// absolute tax a ~3x larger share. 32 was calibrated before that.
 pub fn yieldGateWarmup() u64 {
-    const n = readEnvUsize("SPEC_YIELD_WARMUP", @intCast(YIELD_GATE_WARMUP));
+    const n = env.int(.SPEC_YIELD_WARMUP, usize, @intCast(YIELD_GATE_WARMUP));
     if (n < 1 or n > 256) return YIELD_GATE_WARMUP;
     return @intCast(n);
 }

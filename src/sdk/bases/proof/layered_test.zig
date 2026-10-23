@@ -24,6 +24,8 @@ const Gdn = struct {
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
         const sl = fixture.slotOf(c);
+        w.xfm.spec_capture_ssm = c.capture_spec;
+        defer w.xfm.spec_capture_ssm = false;
         return c.g.adopt(try w.xfm.gatedDeltaNet(x, w.la, &sl.ssm[c.layer], c.layer, 1, c.rows, c.wide()));
     }
 };

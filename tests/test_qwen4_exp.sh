@@ -1,13 +1,18 @@
 #!/usr/bin/env bash
-# Qwen3.8-Flash-Next (qwen4_exp) live end-to-end on the converted pack.
-# Boots the pack, then: architecture advertised, a short greedy answer, a tool
-# call + round-trip, streaming delta cleanliness, and a prompt past the QSA
-# budget (2048 tokens) — asserted through the server's own
-# `[qsa] sparse attention engaged` line, since a dense fallback answers
-# plausibly too. [7] sends an image (tower + M-RoPE engagement lines) and
-# SKIPs when the pack ships no `model-vision.safetensors`. [11] reboots
-# `--no-vision` (tower absent, text works, media 400s by name). SKIPs without the pack.
-#   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_exp.sh [port]
+# test_qwen4_exp.sh — Qwen3.8-Flash-Next (qwen4_exp) live end to end on a converted pack (--max-concurrent 4
+# --prefix-cache-entries 0, 38 checks): architecture + n-gram-table boot line, greedy answer, tool call + round trip,
+# clean streaming, a prompt past the 2048-token QSA budget (`[qsa] sparse attention engaged`, `[qsa-fused] engaged`,
+# a needle), [5b] the same under MTP depth 3 (`[sdpa-split] masked arm engaged`), the MTP head (`mode=mtp`, greedy ==
+# serial, acceptance >= 0.5/round), [7] an image on house.jpeg (tower + `M-RoPE: 1 images` lines; SKIPs without
+# model-vision.safetensors), [7b] the image turn under MTP (tie-aware == serial), [8][9] two concurrent requests
+# through `[batched] gdn batched decode engaged (slots=2)` each == its serial answer (400 tokens, then ~3k prompts),
+# [10] an MTP request beside a plain one, [11] a --no-vision reboot (no tower line, lower active_bytes, image 400).
+#
+#   QWEN4_MODEL=<pack dir> ./tests/test_qwen4_exp.sh [port]   # SKIPs without the pack
+#
+# Tie-aware = a divergence only at a near-tie (top-2 gap <= 0.15 nats), on lead-STRIPPED text. Hermetic twins: the
+# qwen4 GDN fused-path and batched decode tests, `ssm checkpoint carries the qwen4_exp aux state`, DiskTier hybrid.
+
 set -u
 MODEL="${QWEN4_MODEL:-$HOME/.mlx-serve/models/ddalcu/Qwen3.8-Flash-Next-MLX-Serve-4bit}"
 PORT="${1:-11411}"

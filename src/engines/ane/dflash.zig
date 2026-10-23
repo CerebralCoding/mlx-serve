@@ -13,6 +13,7 @@
 //! (fc -> RMSNorm).
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const log = @import("../../host/log.zig");
 const mil = @import("mil.zig");
 const pack_mod = @import("pack.zig");
@@ -316,7 +317,7 @@ pub fn build(prog: *Program) !void {
         var x = v[3];
         var dl: std.ArrayList(Var) = .empty;
         defer dl.deinit(prog.allocator);
-        if (std.c.getenv("ANE_DRAFT_DEBUG") != null) {
+        if (env.get(.ANE_DRAFT_DEBUG) != null) {
             debug_outs = &dl;
             debug_alloc = prog.allocator;
         }
@@ -842,8 +843,8 @@ test "drafter program: draft and ctx64 over one weight blob, every ring and new-
 }
 
 test "dump: the drafter program for the ANE runner (ANE_DRAFT_DIR, ANE_DRAFT_PACK = a drafter dir)" {
-    const dir = std.c.getenv("ANE_DRAFT_DIR") orelse return error.SkipZigTest;
-    const src = std.c.getenv("ANE_DRAFT_PACK") orelse return error.SkipZigTest;
+    const dir = env.get(.ANE_DRAFT_DIR) orelse return error.SkipZigTest;
+    const src = env.get(.ANE_DRAFT_PACK) orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = testing.io;
     var arena = std.heap.ArenaAllocator.init(a);

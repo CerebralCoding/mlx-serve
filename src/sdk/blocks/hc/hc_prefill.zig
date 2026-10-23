@@ -1,10 +1,10 @@
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
 
 var kernels: [2]?mlx.mlx_fast_metal_kernel = .{ null, null };
-var sigmoid_table: ?mlx.mlx_array = null;
 var announced = false;
 
 // Include the final remainder that the chunker may merge into an 8192-token chunk.
@@ -14,7 +14,7 @@ var enabled_env: ?bool = null;
 
 pub fn enabled() bool {
     if (enabled_env) |on| return on;
-    const raw = std.c.getenv("MLX_SERVE_HC_PREFILL");
+    const raw = env.get(.MLX_SERVE_HC_PREFILL);
     const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     enabled_env = on;
     return on;
@@ -109,16 +109,7 @@ pub fn norm(s: mlx.mlx_stream, x: mlx.mlx_array, w: mlx.mlx_array, iw: mlx.mlx_a
 
 // Use MLX sigmoid for every BF16 bit pattern, including rounding-boundary inputs.
 pub fn sigmoidTable(s: mlx.mlx_stream) !mlx.mlx_array {
-    if (sigmoid_table) |table| return table;
-    var bits: [65536]u16 = undefined;
-    for (&bits, 0..) |*v, i| v.* = @intCast(i);
-    const x = mlx.mlx_array_new_data(&bits, &[_]c_int{65536}, 1, .bfloat16);
-    defer _ = mlx.mlx_array_free(x);
-    var table = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(table);
-    try mlx.check(mlx.mlx_sigmoid(&table, x, s));
-    sigmoid_table = table;
-    return table;
+    return @import("../mlp/fused_activations.zig").sigmoidTableFor(s, .bfloat16);
 }
 
 pub fn mix(s: mlx.mlx_stream, up: mlx.mlx_array, normalized: mlx.mlx_array, batch: c_int, seq: c_int) !?mlx.mlx_array {

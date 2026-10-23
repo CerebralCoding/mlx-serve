@@ -1,11 +1,11 @@
-//! plugins/qwen4_exp/ple, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns verify_fault_after_ple_row, claimPleSpecCapture, plePrevAfterAccept, fillPleSpecTokens, PlePending, advancePlePrev, and 27 more.
+//! The n-gram PLE layer: the host gather or GPU kernel into a deferred leaf (`ple_defer`, `flushDeferredPle`), the
+//! gated value injection and its dilated causal conv, the per-slot history, and the spec capture and rollback.
 
 const std = @import("std");
 const qwen4_mod = @import("qwen4_exp.zig");
 const ple_gpu = @import("ple_gpu.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const sushi_exl3 = @import("sushi_exl3");
+const exl3 = @import("../../sdk/quant/exl3/format.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const log = @import("../../host/log.zig");
 const io_util_mod = @import("../../sdk/util/io_util.zig");
@@ -96,7 +96,7 @@ pub fn advancePlePrev(entry: *SSMCacheEntry, prev: [8]u32, ids: []const u32, ctx
 /// routing on the host (the EXL3 prefill GEMM, past `DECODE_ROWS_MAX` rows)
 /// would evaluate it empty: those widths gather eagerly.
 pub fn pleDeferrable(cfg: *const ModelConfig, rows: usize) bool {
-    return cfg.exl3 == null or rows <= sushi_exl3.kernels.DECODE_ROWS_MAX;
+    return cfg.exl3 == null or rows <= exl3.kernels.DECODE_ROWS_MAX;
 }
 
 /// Host-side n-gram gather: `[B, S, ple_embed_dim]` bf16 for this chunk's

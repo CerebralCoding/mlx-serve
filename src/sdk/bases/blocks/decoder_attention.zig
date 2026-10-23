@@ -12,7 +12,8 @@ const ops = @import("../../../mlx/ops.zig");
 const block = @import("../block.zig");
 const kv = @import("../kv.zig");
 const linear = @import("linear.zig");
-const attention = @import("attention.zig");
+const slot_reads = @import("slot_reads.zig");
+const qk_rope = @import("qk_rope.zig");
 const sliding = @import("sliding.zig");
 const attn256 = @import("../../blocks/attention/attn256.zig");
 const sdpa = @import("../../blocks/attention/sdpa.zig");
@@ -28,10 +29,24 @@ const Graph = ops.Graph;
 const Ctx = block.Ctx;
 const Linear = linear.Linear;
 const Joined = linear.Joined;
-pub const Geo = attention.Geo;
 
 const perm = [_]c_int{ 0, 2, 1, 3 };
-const MAX_SLOTS = attention.MAX_SLOTS;
+const MAX_SLOTS = slot_reads.MAX_SLOTS;
+
+/// One head geometry and its rotary embedding.
+pub const Geo = struct {
+    heads: c_int,
+    kv_heads: c_int,
+    head_dim: c_int,
+    scale: f32,
+    rope_dims: c_int,
+    rope_base: f32,
+    rope_scale: f32,
+    /// No rotary position on this layer (NoPE).
+    nope: bool = false,
+    /// A frequency table (llama3 / proportional RoPE) in place of `rope_base`; null = none.
+    freqs: Array = .{},
+};
 
 pub const Gate = enum { none, channel, head };
 
@@ -45,6 +60,21 @@ pub const Options = struct {
     /// `sigmoid(gate(x))` multiplies the attention output before o_proj.
     gate: Gate = .none,
 };
+
+/// Whether a step reads its keys through the sliding band: a sliding layer, unless `fit_causal` and a prefill whose
+/// keys all fit the window (the band is then plain causal).
+pub fn banded(window: u32, fit_causal: bool, wide: bool, total_kv: c_int) bool {
+    return window > 0 and !(fit_causal and wide and total_kv <= window);
+}
+
+test "decoder attention: a fitting prefill reads causal only where the layer asks for it" {
+    try std.testing.expect(!banded(0, false, true, 32));
+    try std.testing.expect(banded(1024, false, true, 32));
+    try std.testing.expect(!banded(1024, true, true, 32));
+    try std.testing.expect(!banded(1024, true, true, 1024));
+    try std.testing.expect(banded(1024, true, true, 1025));
+    try std.testing.expect(banded(1024, true, false, 32));
+}
 
 pub fn DecoderAttention(comptime opts: Options) type {
     return struct {
@@ -63,9 +93,14 @@ pub fn DecoderAttention(comptime opts: Options) type {
             /// Keys a sliding layer attends; 0 = every key (a global layer).
             window: u32 = 0,
             kv_source: ?u32 = null,
+            /// A sliding layer whose keys all fit its window prefills as plain causal: the kernel and reduction order
+            /// mlx-lm takes for short prompts, which Gemma 4's MoE forward keeps so near-tie routes do not flip.
+            fit_causal: bool = false,
             v_norm: Array = .{},
             k_eq_v: bool = false,
             out_gate: Linear = .{},
+            /// The model's angle rows for the fused hd-256 decode step; null = built per call.
+            angles: ?*qk_rope.AngleCache = null,
         };
 
         fn shared(w: *const Weights) ?u32 {
@@ -89,6 +124,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
 
         pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
             if (c.mode == .batched_rows) return batchedForward(w, c, x);
+            if (c.caches.len == 0) return embedBatchForward(w, c, x);
             const g = c.g;
             const geo = &w.geo;
             const s = c.rows;
@@ -106,22 +142,35 @@ pub fn DecoderAttention(comptime opts: Options) type {
                 own_k = if (fused_rows) try w.qkv.part(g, all, 1) else try w.k.forward(g, x);
                 own_v = if (kev) own_k else if (fused_rows) try w.qkv.part(g, all, 2) else try w.v.forward(g, x);
             }
-            // The legacy decode step at hd 256 runs one fused norm+RoPE kernel this block does not carry.
+            const window = windowOf(w);
+            // A decode step at hd 256: one kernel norms, transposes and ropes q and k (and norms v).
+            var fused: ?[3]Array = null;
             const has_vn = opts.value_norm and w.v_norm.ctx != null;
+            const kv_shape = [_]c_int{ 1, s, geo.kv_heads, geo.head_dim };
             if (src == null and !kev and !geo.nope and s == 1 and geo.head_dim == 256 and (w.q_norm.ctx != null) == (w.k_norm.ctx != null) and
                 (w.q_norm.ctx != null or !has_vn) and qk_norm_rope.qkNormRopeFusedEnabled())
-                return error.FusedQkNormRope256NotPorted;
+            blk: {
+                const family: usize = if (window > 0) 0 else 1;
+                const ang = qk_rope.angles(c, w.angles, family, geo.rope_dims, base(geo), geo.freqs, offset, 1, 1.0, geo.rope_scale) catch break :blk;
+                const v_r: Array = if (has_vn) try g.reshape(own_v, &kv_shape) else .{};
+                const v_norm: Array = if (has_vn) w.v_norm else .{};
+                fused = try qk_rope.fused256(g, q_r, try g.reshape(own_k, &kv_shape), v_r, w.q_norm, w.k_norm, v_norm, ang, c.shared.eps_arr, geo.heads, geo.kv_heads, 1, geo.rope_dims);
+            }
 
-            const q_n = if (w.q_norm.ctx != null) try g.rmsNorm(q_r, w.q_norm, c.shared.eps) else q_r;
-            const q_rope = try ropeAt(g, try g.transpose(q_n, &perm), geo, offset);
+            const q_rope = if (fused) |f| f[0] else blk: {
+                const q_n = if (w.q_norm.ctx != null) try g.rmsNorm(q_r, w.q_norm, c.shared.eps) else q_r;
+                break :blk try ropeAt(g, try g.transpose(q_n, &perm), geo, offset);
+            };
 
-            const window = windowOf(w);
             const total_kv = offset + s;
             const sv = sliding.view(window, geo.head_dim, false, total_kv, s);
             var view: abi.KvView = if (src) |l|
                 try kv.view(c, c.cache(), l)
             else blk: {
-                const kvs = try ownKv(w, c, 1, own_k, own_v, Roper{ .geo = geo, .offset = offset });
+                const kvs = if (fused) |f|
+                    [2]Array{ f[1], if (f[2].ctx != null) f[2] else try g.transpose(try g.reshape(own_v, &kv_shape), &perm) }
+                else
+                    try ownKv(w, c, 1, own_k, own_v, Roper{ .geo = geo, .offset = offset });
                 break :blk try kv.append(c, kvs[0], kvs[1], if (window > 0) sv.span else 0);
             };
             defer kv.release(c, &view);
@@ -130,23 +179,23 @@ pub fn DecoderAttention(comptime opts: Options) type {
             // The mode and mask the dense arms and the packed kernels share.
             var mode: [:0]const u8 = if (c.wide()) "causal" else "";
             var mask: Array = .{};
-            if (window > 0) {
+            if (banded(window, w.fit_causal, c.wide(), total_kv)) {
                 const w_c: c_int = @intCast(window);
                 if (c.wide()) {
                     mode = "array";
-                    if (!sv.band_in_kernel) mask = try sliding.bandMask(g, s, sv.kv_len, w_c);
+                    if (!sv.band_in_kernel) mask = try sliding.bandOnce(c, s, sv.kv_len, w_c);
                 } else {
                     const held: c_int = @intCast((try c.cacheOps()).len(c.cache(), src orelse c.layer));
                     if (held > w_c) {
                         mode = "array";
-                        mask = try sliding.decodeMask(g, @min(total_kv, w_c), w_c);
+                        mask = try sliding.decodeOnce(c, @min(total_kv, w_c), w_c);
                     }
                 }
             }
 
             var out: ?Array = null;
             if (view.packed_reads and kvq.kvAttnFusedEligible(&dv, s)) {
-                if (std.mem.eql(u8, mode, "array") and mask.ctx == null) mask = try sliding.bandMask(g, s, sv.kv_len, @intCast(window));
+                if (std.mem.eql(u8, mode, "array") and mask.ctx == null) mask = try sliding.bandOnce(c, s, sv.kv_len, @intCast(window));
                 out = try own(g, try kvq.qkvAttnDecodeKernel(g.s, q_rope, &dv, geo.scale, mode, mask));
                 if (out != null) kvq.logKvAttnFusedEngaged(&dv, q_rope, s);
             } else if (view.packed_reads and kvq.kvAttnVerifyEligible(&dv, s)) {
@@ -160,7 +209,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
                 } else if (std.mem.eql(u8, mode, "array")) {
                     if (c.wide()) out = try own(g, try attn256.fusedSdpa256Prefill(g.s, q_rope, dv.k, dv.v, geo.scale, @intCast(window)));
                     if (out == null) {
-                        if (mask.ctx == null) mask = try sliding.bandMask(g, s, sv.kv_len, @intCast(window));
+                        if (mask.ctx == null) mask = try sliding.bandOnce(c, s, sv.kv_len, @intCast(window));
                         out = try sdpaRaw(g, q_rope, dv.k, dv.v, geo.scale, "array", mask, false);
                     }
                 } else {
@@ -170,6 +219,32 @@ pub fn DecoderAttention(comptime opts: Options) type {
             const flat = try g.mergeHeads(out.?);
             const g_pre: Array = if (opts.gate != .none and fused_rows and w.qkv.widths[3] != 0) try w.qkv.part(g, all, 3) else .{};
             return w.o.forward(g, try outGate(w, g, x, flat, g_pre));
+        }
+
+        /// A decoder embedder's padded batch `[N, S]` (no cache, every sequence from position 0): causal over its own
+        /// rows, as the dense forward ran it through a fresh cache. Padding is on the right, behind every real row's
+        /// causal reach, so the key mask is not read.
+        fn embedBatchForward(w: *const Weights, c: *Ctx, x: Array) !Array {
+            if (shared(w) != null or windowOf(w) > 0 or (opts.value_norm and w.k_eq_v)) return error.EmbedBatchUnsupported;
+            const g = c.g;
+            const geo = &w.geo;
+            const n = c.slots;
+            const s = c.rows;
+            const fused_rows = w.qkv.built() and n * s <= FUSED_ROWS_MAX_M;
+            const all: Array = if (fused_rows) try w.qkv.lin.forward(g, x) else .{};
+            const q = if (fused_rows) try w.qkv.part(g, all, 0) else try w.q.forward(g, x);
+            const own_k = if (fused_rows) try w.qkv.part(g, all, 1) else try w.k.forward(g, x);
+            const own_v = if (fused_rows) try w.qkv.part(g, all, 2) else try w.v.forward(g, x);
+            const q_r = try g.reshape(q, &.{ n, s, geo.heads, geo.head_dim });
+            const q_n = if (w.q_norm.ctx != null) try g.rmsNorm(q_r, w.q_norm, c.shared.eps) else q_r;
+            const q_rope = try ropeAt(g, try g.transpose(q_n, &perm), geo, 0);
+            const kvs = try ownKv(w, c, n, own_k, own_v, Roper{ .geo = geo, .offset = 0 });
+            var out: ?Array = if (s == 1) try sdpaRaw(g, q_rope, kvs[0], kvs[1], geo.scale, "", .{}, false) else null;
+            if (out == null) out = try own(g, try attn256.fusedSdpa256Prefill(g.s, q_rope, kvs[0], kvs[1], geo.scale, 0));
+            if (out == null) out = try own(g, try sdpa.splitCausalSdpa(g.s, q_rope, kvs[0], kvs[1], geo.scale));
+            if (out == null) out = try sdpaRaw(g, q_rope, kvs[0], kvs[1], geo.scale, "causal", .{}, sdpa.sdpaForceFused(q_rope, kvs[0]));
+            const g_pre: Array = if (opts.gate != .none and fused_rows and w.qkv.widths[3] != 0) try w.qkv.part(g, all, 3) else .{};
+            return w.o.forward(g, try outGate(w, g, x, try g.mergeHeads(out.?), g_pre));
         }
 
         /// N one-row slots: projections at width N, each slot roped at its own position, keys appended per slot
@@ -208,9 +283,9 @@ pub fn DecoderAttention(comptime opts: Options) type {
                 packed_reads[i] = views[i].packed_reads;
             }
             const attn = if (batched.batchedAttnPerSlot(dense[0..got]))
-                try attention.perSlot(g, q_rope, dense[0..got], packed_reads[0..got], s, geo.scale)
+                try slot_reads.perSlot(g, q_rope, dense[0..got], packed_reads[0..got], s, geo.scale)
             else
-                try attention.stacked(g, q_rope, dense[0..got], s, geo.scale);
+                try slot_reads.stacked(g, q_rope, dense[0..got], s, geo.scale);
             return w.o.forward(g, try outGate(w, g, x, try g.mergeHeads(attn), .{}));
         }
 

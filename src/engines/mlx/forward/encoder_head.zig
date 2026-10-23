@@ -4,6 +4,7 @@
 const mlx = @import("../../../mlx/ffi.zig");
 const transposeBf16Weight = @import("../load/weights.zig").transposeBf16Weight;
 const Transformer = @import("../transformer.zig").Transformer;
+const plugin_driver = @import("../plugin/driver.zig");
 
 /// Forward pass that returns hidden states (after final_norm, before lm_head).
 /// Output shape: [1, seq_len, hidden_size]. Caller must free.
@@ -28,6 +29,7 @@ pub fn forwardEmbeddingMasked(self: *Transformer, token_ids: mlx.mlx_array, key_
 /// (EmbeddingGemma dense.0/dense.1, EmbeddingGemma 2's embedding_projection
 /// as the lone dense.0), applied between pool and normalize.
 pub fn hasEmbedProjection(self: *const Transformer) bool {
+    if (self.plugin) |b| if (b.table.embed) |e| return e.project != null;
     return self.dense0_w.ctx != null;
 }
 
@@ -35,6 +37,7 @@ pub fn hasEmbedProjection(self: *const Transformer) bool {
 /// (identity activations, no layer bias — EmbeddingGemma's config).
 /// Input is cast to bf16 for the quantized matmuls. Caller frees.
 pub fn embedProjection(self: *const Transformer, pooled: mlx.mlx_array) !mlx.mlx_array {
+    if (self.plugin) |b| return plugin_driver.embedProject(b, pooled);
     var x = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(x);
     try mlx.check(mlx.mlx_astype(&x, pooled, .bfloat16, self.s));

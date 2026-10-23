@@ -287,9 +287,13 @@ def r_raw_mlx_c(f, ctx):
                 yield i, f"{n} raw mlx-c reference{'s' if n > 1 else ''}"
 
 
+# The guest agent is its own binary (its own module root, the VM's environment), so it cannot reach src/env.zig.
+ENV_EXEMPT = {"src/env.zig", "src/host/sandbox/vz_agent.zig"}
+
+
 def env_lines(f):
-    """(line index, is a read) for every line outside src/env.zig touching the environment or an MLX_SERVE_ name."""
-    if f.path == "src/env.zig":
+    """(line index, is a read) for every line outside ENV_EXEMPT touching the environment or an MLX_SERVE_ name."""
+    if f.path in ENV_EXEMPT:
         return
     for i, c in enumerate(f.code):
         named = not f.multiline[i] and any("MLX_SERVE_" in s for s in f.strs[i])

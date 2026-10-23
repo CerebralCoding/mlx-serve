@@ -1,6 +1,7 @@
 //! MTP draft depth and proposal policy (greedy tail, draft temperature, depth decisions).
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const mlx = @import("../../../../mlx/ffi.zig");
 const transformer_mod = @import("../../transformer.zig");
 const model_mod = @import("../../model.zig");
@@ -55,7 +56,7 @@ var mtp_draft_proposal_cache: ?DraftProposal = null;
 pub fn mtpDraftProposalEnv() DraftProposal {
     if (mtp_draft_proposal_cache) |v| return v;
     var mode: DraftProposal = .per_request;
-    if (std.c.getenv("MLX_SERVE_MTP_DRAFT_GREEDY")) |p| {
+    if (env.get(.MLX_SERVE_MTP_DRAFT_GREEDY)) |p| {
         const val = std.mem.span(p);
         if (val.len > 0 and val[0] == '0') mode = .sampled;
         if (val.len > 0 and val[0] == '1') mode = .greedy;
@@ -110,7 +111,7 @@ var mtp_draft_temp_env: ??f32 = null;
 pub fn mtpDraftTempEnv() ?f32 {
     if (mtp_draft_temp_env) |v| return v;
     var parsed: ?f32 = null;
-    if (std.c.getenv("MLX_SERVE_MTP_DRAFT_TEMP")) |p| {
+    if (env.get(.MLX_SERVE_MTP_DRAFT_TEMP)) |p| {
         if (std.fmt.parseFloat(f32, std.mem.span(p)) catch null) |v| {
             if (v > 0.01 and v <= 4.0) parsed = v;
         }

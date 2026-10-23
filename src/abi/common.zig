@@ -34,6 +34,11 @@ pub const Verdict = extern struct {
     pub fn refuse(code: Code, comptime why: []const u8) Verdict {
         return .{ .code = code, .why = Str.of(why) };
     }
+    /// A refusal whose text is chosen at run time (an `@errorName`, an entry of a static table). `why` must be static
+    /// or live as long as the plugin: the host reads it after the call returns.
+    pub fn named(code: Code, why: []const u8) Verdict {
+        return .{ .code = code, .why = Str.of(why) };
+    }
     pub fn isOk(self: Verdict) bool {
         return self.code == .ok;
     }
@@ -144,6 +149,8 @@ test "abi common: a refusal names its reason; ok is the default" {
     const v = Verdict.refuse(.too_large, "prompt past the window");
     try testing.expect(!v.isOk() and v.code == .too_large);
     try testing.expectEqualStrings("prompt past the window", v.why.slice());
+    const n = Verdict.named(.failed, @errorName(error.MissingWeight));
+    try testing.expect(n.code == .failed and std.mem.eql(u8, "MissingWeight", n.why.slice()));
 }
 
 test "abi common: a marker claim beats a type claim; two claims at the top rank are ambiguous" {

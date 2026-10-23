@@ -38,15 +38,16 @@ pub const CpuState = struct {
 /// is registered AFTER the successful init so a downstream failure doesn't
 /// call deinit on uninitialized memory. `ModelConfig.deinit` frees the config's
 /// one owned field; `allocator.destroy` alone would leak it.
-pub fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, gguf_ctx_size: u32) !CpuState {
+/// `gguf_engine` (the model's engine setting) forces a GGUF's embedded engine over its header and src/sdk/quant/gguf.
+pub fn preloadCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, gguf_ctx_size: u32, gguf_engine: ?gguf_meta.Engine) !CpuState {
     // GGUF first — mirrors `--model` routing in main.zig, where isGgufPath
     // is checked before any config.json read ("GGUF files bypass the MLX
     // dispatch entirely"). The embedded engine owns the real tokenizer +
     // chat template, so the CPU state is a stub, like the media path below.
-    const mlx_gguf_path = mlx_gguf.servablePath(io, allocator, model_dir);
+    const mlx_gguf_path = if (gguf_engine == null) mlx_gguf.servablePath(io, allocator, model_dir) else null;
     defer if (mlx_gguf_path) |p| allocator.free(p);
     if (mlx_gguf_path == null and model_discovery.isGgufModelPath(io, model_dir)) {
-        return preloadGgufCpuState(allocator, io, model_dir, gguf_ctx_size);
+        return preloadGgufCpuState(allocator, io, model_dir, gguf_ctx_size, gguf_engine);
     }
 
     // Media model (image/audio/video): the engine owns the real tokenizer +
@@ -106,14 +107,14 @@ pub fn freeCpuState(allocator: std.mem.Allocator, s: *CpuState) void {
 /// engine from its header metadata (the issue #15 rule in gguf_meta.zig;
 /// unreadable metadata defaults to llama with a log line, mirroring
 /// main.zig's chooseGgufEngine), and build the stub CPU state.
-fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, ctx_size: u32) !CpuState {
+fn preloadGgufCpuState(allocator: std.mem.Allocator, io: std.Io, model_dir: []const u8, ctx_size: u32, forced: ?gguf_meta.Engine) !CpuState {
     const gguf_path = model_discovery.resolveGgufFile(io, allocator, model_dir) catch |err| {
         model_discovery.logResolveGgufError(model_dir, err);
         return err;
     };
     errdefer allocator.free(gguf_path);
 
-    const engine: gguf_meta.Engine = blk: {
+    const engine: gguf_meta.Engine = forced orelse blk: {
         var info = gguf_meta.readFromFile(io, allocator, gguf_path) catch |err| {
             log.warn("[gguf] route: metadata read failed ({s}); defaulting to llama\n", .{@errorName(err)});
             break :blk .llama;

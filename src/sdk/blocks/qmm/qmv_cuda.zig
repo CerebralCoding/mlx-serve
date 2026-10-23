@@ -4,6 +4,7 @@
 //! slice load contiguously); the dot product is the same under that k permutation as long as
 //! A and B use it alike. Story and measurements: docs/CUDA.md.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -22,9 +23,9 @@ const SOURCE = kernelSource("kernels/qmm/qmv_cuda.cu");
 
 /// Measured on sm_120 (RTX 5060 Ti); every other device keeps MLX's own kernels unless
 /// `MLX_SERVE_CUDA_QMV_TC=1`. `=0` turns it off everywhere. The bf16/f16 mma needs sm_80.
-pub fn defaultOn(major: usize, minor: usize, env: ?[]const u8) bool {
+pub fn defaultOn(major: usize, minor: usize, raw: ?[]const u8) bool {
     if (major < 8) return false;
-    if (env) |e| if (e.len > 0) return !std.mem.eql(u8, e, "0");
+    if (raw) |e| if (e.len > 0) return !std.mem.eql(u8, e, "0");
     return major == 12 and minor == 0;
 }
 
@@ -32,8 +33,7 @@ var enabled_cache: ?bool = null;
 
 fn enabled() bool {
     if (enabled_cache) |v| return v;
-    const env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_CUDA_QMV_TC")) |p| std.mem.span(p) else null;
-    const v = mlx.cudaAvailable() and defaultOn(mlx.cudaComputeCapability(.major), mlx.cudaComputeCapability(.minor), env);
+    const v = mlx.cudaAvailable() and defaultOn(mlx.cudaComputeCapability(.major), mlx.cudaComputeCapability(.minor), env.span(.MLX_SERVE_CUDA_QMV_TC));
     enabled_cache = v;
     return v;
 }

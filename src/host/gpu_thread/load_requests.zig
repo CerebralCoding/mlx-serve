@@ -14,6 +14,7 @@ const aneBuild = @import("../../engines/ane/adapter.zig").aneBuild;
 const moveHotCacheViewOff = @import("../../engines/mlx/cache/budget.zig").moveHotCacheViewOff;
 const publishHotCacheResidency = @import("../../engines/mlx/cache/budget.zig").publishHotCacheResidency;
 const doLoadOnInferenceThread = @import("../../engines/mlx/load.zig").doLoadOnInferenceThread;
+const loadErrorName = @import("../media_jobs/plugin/engine.zig").loadErrorName;
 const Scheduler = @import("../../engines/mlx/scheduler.zig").Scheduler;
 const LoadRequest = @import("requests.zig").LoadRequest;
 const UnloadRequest = @import("requests.zig").UnloadRequest;
@@ -140,7 +141,7 @@ fn readyLoadRequest(sch: *Scheduler, req: *LoadRequest) void {
 /// Mark the entry and signal the waiter (conn thread frees pre-parsed CPU state — ownership stays
 /// on req on the failure path).
 fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror) void {
-    log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, @errorName(err) });
+    log.err("[registry] load failed for model id={s}: {s}\n", .{ req.entry.id, loadErrorName(err) });
     sch.registry.mutex.lockUncancelable(sch.io);
     if (err == error.InsufficientMemory) {
         // A memory-preflight refusal is transient, not a property of the
@@ -151,10 +152,10 @@ fn failLoadRequest(sch: *Scheduler, req: *LoadRequest, err: anyerror) void {
     } else {
         // markErrorLocked dupes the error name onto the entry; the
         // conn thread reads it back from the entry, not from req.
-        sch.registry.markErrorLocked(req.entry, @errorName(err));
+        sch.registry.markErrorLocked(req.entry, loadErrorName(err));
     }
     sch.registry.mutex.unlock(sch.io);
-    finishLoadRequest(sch, req, @errorName(err));
+    finishLoadRequest(sch, req, loadErrorName(err));
 }
 
 fn finishLoadRequest(sch: *Scheduler, req: *LoadRequest, err_name: ?[]const u8) void {

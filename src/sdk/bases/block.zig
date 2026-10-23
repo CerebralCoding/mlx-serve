@@ -37,6 +37,20 @@ pub const Shared = struct {
     }
 };
 
+/// What one forward builds once and its layers share (masks, angle rows, casts): the same bits as building each per
+/// layer. The arrays live in the forward's graph `g`; past `cap` entries nothing more is kept.
+pub const Memo = struct {
+    g: *Graph,
+    keys: [cap]Key = undefined,
+    vals: [cap]Array = undefined,
+    n: usize = 0,
+
+    const cap = 16;
+    pub const What = enum(u8) { band, decode_mask, angles, cast };
+    /// What was built and every value it was built from.
+    pub const Key = struct { what: What, n: [7]i64 = @splat(0) };
+};
+
 /// One forward as a block sees it. `g` is the current layer's graph: arrays made in it die with the layer unless
 /// the base keeps them.
 pub const Ctx = struct {
@@ -58,6 +72,13 @@ pub const Ctx = struct {
     /// A prompt chunk's M-RoPE `cos`/`sin` rows, roped by in place of `positions`; null = 1-D positions (which
     /// carry the slot's M-RoPE delta).
     mrope: ?[2]Array = null,
+    /// A speculative verify: recurrent mixers leave each row's state for the partial-accept rollback
+    /// (`StateSlot.conv_input`, `.state_seq`) and skip the fused steps that do not produce it.
+    capture_spec: bool = false,
+    /// The forward's shared builds; null = every layer builds its own.
+    memo: ?*Memo = null,
+    /// The row-exact lane the projections take (`blocks/row_exact.zig`): a bound drafter on a covered model.
+    row_exact: @import("blocks/row_exact.zig").Lane = .off,
 
     pub fn stream(c: *const Ctx) ops.Stream {
         return c.g.s;
@@ -75,6 +96,28 @@ pub const Ctx = struct {
     }
     pub fn cacheOps(c: *const Ctx) !*const abi.CacheOps {
         return c.cache_ops orelse error.NoCacheOps;
+    }
+    /// `key`'s array if this forward built it already.
+    pub fn recall(c: *const Ctx, key: Memo.Key) ?Array {
+        const m = c.memo orelse return null;
+        for (m.keys[0..m.n], m.vals[0..m.n]) |k, v| if (std.meta.eql(k, key)) return v;
+        return null;
+    }
+    /// `x`, built for `key`, kept for the rest of the forward.
+    pub fn remember(c: *const Ctx, key: Memo.Key, x: Array) !Array {
+        const m = c.memo orelse return x;
+        if (m.n == Memo.cap) return x;
+        const kept = try m.g.keep(x);
+        m.keys[m.n] = key;
+        m.vals[m.n] = kept;
+        m.n += 1;
+        return kept;
+    }
+    /// `x` as `dt`, cast once per forward.
+    pub fn castOnce(c: *const Ctx, x: Array, dt: ops.Dtype) !Array {
+        const key: Memo.Key = .{ .what = .cast, .n = .{ @intCast(@intFromPtr(x.ctx)), @intFromEnum(dt), 0, 0, 0, 0, 0 } };
+        if (c.recall(key)) |m| return m;
+        return c.remember(key, try c.g.astype(x, dt));
     }
 };
 
@@ -220,4 +263,31 @@ test "bases block: batched rows hold only when every block serves them; Either c
     try testing.expect(!E.supports_batched_rows and E.kind == .mixer);
     try testing.expectEqual(@as(?[]const u8, null), comptime reason(E, &.{.mixer}));
     try testing.expect(Either(Good, Good).supports_batched_rows);
+}
+
+test "bases block: a forward's memo builds once and keeps it past the layer's graph; without one every call builds" {
+    const mlx = @import("../../mlx/ffi.zig");
+    var g = Graph.init(testing.allocator, mlx.mlx_default_cpu_stream_new());
+    defer g.deinit();
+    var shared = Shared.init(1e-6, 1e-6);
+    defer shared.deinit();
+    const x = try g.fromSlice(f32, &.{ 1, 2, 3 }, &.{3});
+    var memo: Memo = .{ .g = &g };
+    var c: Ctx = .{ .g = &g, .mode = .decode, .rows = 1, .positions = &.{0}, .shared = &shared, .memo = &memo };
+    var first: Array = undefined;
+    {
+        var lg = g.scope();
+        defer lg.deinit();
+        c.g = &lg;
+        first = try c.castOnce(x, .bfloat16);
+    }
+    var lg = g.scope();
+    defer lg.deinit();
+    c.g = &lg;
+    try testing.expectEqual(first.ctx, (try c.castOnce(x, .bfloat16)).ctx);
+    try testing.expect((try c.castOnce(x, .float16)).ctx != first.ctx);
+    try testing.expectEqual(@as(usize, 2), memo.n);
+    try ops.eval(first);
+    c.memo = null;
+    try testing.expect((try c.castOnce(x, .bfloat16)).ctx != (try c.castOnce(x, .bfloat16)).ctx);
 }

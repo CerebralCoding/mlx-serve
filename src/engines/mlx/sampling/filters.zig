@@ -1,5 +1,6 @@
 //! Sampling filters: ranks, top-k / top-p / min-p, penalties, argmax.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const tokenizer_mod = @import("../../../host/tokenizer/tokenizer.zig");
@@ -1121,7 +1122,7 @@ test "filterTopKTopP is byte-identical to the two-pass composition" {
 
 test "repeat penalty shapes every sampling path, not only the logprobs one" {
     // Bar: a penalty changes greedy output with or without logprobs, the same way, and under a grammar.
-    const path = std.c.getenv("LOGPROBS_TEST_MODEL") orelse return error.SkipZigTest;
+    const path = env.get(.LOGPROBS_TEST_MODEL) orelse return error.SkipZigTest;
     if (mlx.noGpuBackend()) return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

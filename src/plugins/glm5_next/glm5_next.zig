@@ -190,7 +190,7 @@ fn collapseOps(s: mlx.mlx_stream, stream: mlx.mlx_array, m: mlx.mlx_array, scale
 
 // One token, after oMLX `decode_kernels.py` `hc_pre_fused` (Apache-2.0, see NOTICE): the
 // only dispatch between two sublayers. HC_PRE_NT threadgroups each take a K-slice of all the
-// mixes; the last to finish (a device counter nothing resets: NT divides 2^32) reduces them,
+// mixes; the last to arrive on its row's word of the dispatch's zeroed counter reduces them,
 // collapses and norms, then writes the post/comb gates. The sublayer's expand is left to the
 // next `hcPre`, which rebuilds each stream element from (y, post, comb, h) as `expand` does.
 const HC_PRE_TPG: c_int = 1024;
@@ -211,8 +211,6 @@ const HC_MATERIALIZE_SOURCE = HC_DEFER_HVAL ++ kernelSource("plugins/glm5_next/k
 var hc_pre_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var hc_pre_defer_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var hc_materialize_kernel: ?mlx.mlx_fast_metal_kernel = null;
-/// `hcPre`'s arrival counter (word 0): every dispatch increments it, nothing resets it.
-var hc_pre_counter: ?mlx.mlx_array = null;
 
 /// A sublayer's expand not applied yet: the stream is `expand(y, h)` under post/comb.
 pub const Deferred = struct {
@@ -311,16 +309,12 @@ pub fn hcPre(s: mlx.mlx_stream, x: ?mlx.mlx_array, deferred: ?*const Deferred, f
         try hcKernel(&hc_pre_defer_kernel, "glm5_hc_pre_defer", &.{ "y", "post_in", "comb_in", "h_in", "fn", "scale", "base", "nw", "eps", "counter" }, &.{ "normed", "post", "comb", "parts", "h" }, HC_PRE_DEFER_SOURCE)
     else
         try hcKernel(&hc_pre_kernel, "glm5_hc_pre", &.{ "x", "fn", "scale", "base", "nw", "eps", "counter" }, &.{ "normed", "post", "comb", "parts" }, HC_PRE_SOURCE);
-    const counter = hc_pre_counter orelse blk: {
-        var z = mlx.mlx_array_new();
-        errdefer _ = mlx.mlx_array_free(z);
-        // One word per row; a counter of 8 or more words also keeps the input out of the
-        // read-only constant address space.
-        try mlx.check(mlx.mlx_zeros(&z, &[_]c_int{HC_PRE_MAX_ROWS}, 1, .uint32, s));
-        try mlx.check(mlx.mlx_array_eval(z));
-        hc_pre_counter = z;
-        break :blk z;
-    };
+    // Each dispatch its own counter, zeroed on the host (no dispatch): MLX never sees the kernel write it, so one
+    // shared by two dispatches with no data path between them (a batched tick's row groups) mixed their arrivals.
+    // One word per row; 8 or more words also keep the input out of the read-only constant address space.
+    const zero_words: [HC_PRE_MAX_ROWS]u32 = @splat(0);
+    const counter = mlx.mlx_array_new_data(&zero_words, &[_]c_int{HC_PRE_MAX_ROWS}, 1, .uint32);
+    defer _ = mlx.mlx_array_free(counter);
     const ev = [2]f32{ norm_eps, rms_eps };
     const eps = mlx.mlx_array_new_data(&ev, &[_]c_int{2}, 1, .float32);
     defer _ = mlx.mlx_array_free(eps);
@@ -1877,6 +1871,86 @@ test "glm5 hcPre over R rows equals R one-row dispatches, up to the widest verif
             try testing.expectEqualSlices(f32, want, got[off .. off + @as(usize, @intCast(d))]);
             const poff: usize = @intCast(r * HC);
             try testing.expectEqualSlices(f32, want_post, got_post[poff .. poff + HC]);
+        }
+    }
+}
+
+// Bar: dispatches with no data path between them (a batched tick's row groups, slots' prefills) each equal their
+// own dispatch evaluated alone.
+test "glm5 independent hcPre dispatches in one evaluation equal each evaluated alone" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    mlx.installErrorHandler();
+    const had_error = mlx.errorPending();
+    errdefer mlx.dropLatchedErrorUnless(had_error);
+    const s = mlx.gpuStream();
+    if (!mlx.streamIsGpu(s)) return error.SkipZigTest;
+    const alloc = testing.allocator;
+    var prng = std.Random.DefaultPrng.init(34);
+    const rand = prng.random();
+    const d: c_int = 1024;
+    const wv = try alloc.alloc(f32, @intCast(HC * d * MIX));
+    defer alloc.free(wv);
+    for (wv) |*x| x.* = 0.02 * rand.floatNorm(f32);
+    var nv: [1024]f32 = undefined;
+    for (&nv) |*x| x.* = 1.0 + 0.1 * rand.floatNorm(f32);
+    var bv: [MIX]f32 = undefined;
+    for (&bv) |*x| x.* = 0.5 * rand.floatNorm(f32);
+    const scv = [3]f32{ 0.8, 1.1, 0.9 };
+    var nw = mlx.mlx_array_new();
+    defer _ = mlx.mlx_array_free(nw);
+    const nf = mlx.mlx_array_new_data(&nv, &[_]c_int{d}, 1, .float32);
+    defer _ = mlx.mlx_array_free(nf);
+    try mlx.check(mlx.mlx_astype(&nw, nf, .bfloat16, s));
+    const fn_rows = mlx.mlx_array_new_data(wv.ptr, &[_]c_int{ MIX, HC * d }, 2, .float32);
+    defer _ = mlx.mlx_array_free(fn_rows);
+    const base = mlx.mlx_array_new_data(&bv, &[_]c_int{MIX}, 1, .float32);
+    defer _ = mlx.mlx_array_free(base);
+    const scale = mlx.mlx_array_new_data(&scv, &[_]c_int{3}, 1, .float32);
+    defer _ = mlx.mlx_array_free(scale);
+
+    const G = 8;
+    const rows = [G]c_int{ 8, 2, 8, 2, 8, 2, 8, 2 };
+    var streams: [G]mlx.mlx_array = undefined;
+    var made: usize = 0;
+    defer for (streams[0..made]) |a| {
+        _ = mlx.mlx_array_free(a);
+    };
+    for (&streams, rows) |*st, r| {
+        const sv = try alloc.alloc(f32, @intCast(r * HC * d));
+        defer alloc.free(sv);
+        for (sv) |*x| x.* = rand.floatNorm(f32);
+        const f = mlx.mlx_array_new_data(sv.ptr, &[_]c_int{ 1, r, HC, d }, 4, .float32);
+        defer _ = mlx.mlx_array_free(f);
+        st.* = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_astype(st, f, .bfloat16, s));
+        try mlx.check(mlx.mlx_array_eval(st.*));
+        made += 1;
+    }
+    var alone: [G][]f32 = undefined;
+    var n_alone: usize = 0;
+    defer for (alone[0..n_alone]) |a| alloc.free(a);
+    for (streams) |st| {
+        var pre = try hcPre(s, st, null, fn_rows, scale, base, nw, 20, 1e-6, 1e-5, 1e-5);
+        defer pre.deinit();
+        alone[n_alone] = try readF32(pre.normed, s, alloc);
+        n_alone += 1;
+    }
+    for (0..20) |_| {
+        var pres: [G]Pre = undefined;
+        var n_pre: usize = 0;
+        defer for (pres[0..n_pre]) |*p| p.deinit();
+        const vec = mlx.mlx_vector_array_new();
+        defer _ = mlx.mlx_vector_array_free(vec);
+        for (streams) |st| {
+            pres[n_pre] = try hcPre(s, st, null, fn_rows, scale, base, nw, 20, 1e-6, 1e-5, 1e-5);
+            _ = mlx.mlx_vector_array_append_value(vec, pres[n_pre].normed);
+            n_pre += 1;
+        }
+        try mlx.check(mlx.mlx_eval(vec));
+        for (pres, alone) |p, want| {
+            const got = try readF32(p.normed, s, alloc);
+            defer alloc.free(got);
+            try testing.expectEqualSlices(f32, want, got);
         }
     }
 }

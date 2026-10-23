@@ -1,6 +1,7 @@
 //! GPU working set, wired limit floor; static/current GPU ceiling
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
@@ -150,7 +151,7 @@ pub fn staticGpuMemoryCeiling() u64 {
 /// Diagnostic: `MLX_SERVE_GPU_CEILING_MB=N` stands in for the working-set limit in every bill
 /// (absent or 0 = the machine's). It bounds the guards' arithmetic, not what Metal will grant.
 pub fn applyGpuCeilingEnv() void {
-    const raw = std.c.getenv("MLX_SERVE_GPU_CEILING_MB") orelse return;
+    const raw = env.get(.MLX_SERVE_GPU_CEILING_MB) orelse return;
     const mb = std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 10) catch return;
     if (mb == 0) return;
     static_ceiling_override = mb << 20;

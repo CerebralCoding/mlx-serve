@@ -1,6 +1,7 @@
 //! MTP EV round planning: depth caps, cost sources, depth policy.
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const transformer_mod = @import("../../transformer.zig");
 const log = @import("../../../../host/log.zig");
 const io_util = @import("../../../../sdk/util/io_util.zig");
@@ -38,7 +39,7 @@ pub fn persistRoundCost(self: *Generator) void {
 var mtp_cost_table_cache: ?bool = null;
 pub fn mtpCostTableEnabled() bool {
     if (mtp_cost_table_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_COST_TABLE")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_COST_TABLE);
     const on = mtpLiveCostEnabledFromEnv(raw);
     mtp_cost_table_cache = on;
     return on;
@@ -318,7 +319,7 @@ pub fn mtpDepthPolicyFromEnv(raw: ?[]const u8) MtpDepthPolicy {
 var mtp_depth_policy_cache: ?MtpDepthPolicy = null;
 pub fn mtpDepthPolicy() MtpDepthPolicy {
     if (mtp_depth_policy_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_DEPTH_POLICY")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_DEPTH_POLICY);
     const v = mtpDepthPolicyFromEnv(raw);
     mtp_depth_policy_cache = v;
     return v;

@@ -4,6 +4,7 @@
 //! which serves these gathers on the composed chain), and the activation and weighted sum use MLX's
 //! own functors in the chain's order, so a decode row reproduces the chain's rounding sites.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -34,7 +35,7 @@ pub var override: ?bool = null;
 pub fn enabled() bool {
     if (override) |v| return v;
     if (env_enabled) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MOE_CUDA");
+    const raw = env.get(.MLX_SERVE_MOE_CUDA);
     env_enabled = raw == null or raw.?[0] != '0';
     return env_enabled.?;
 }

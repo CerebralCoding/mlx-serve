@@ -15,10 +15,10 @@ var kernel: ?mlx.mlx_fast_metal_kernel = null;
 var launchable: ?bool = null;
 var engaged = false;
 
-const Plan = struct { ntg: c_int, rows: c_int };
+pub const Plan = struct { ntg: c_int, rows: c_int };
 
 /// Threadgroups (one per core) and value rows per threadgroup for `h * dv` rows, or null.
-fn planFor(h: c_int, dv: c_int, cores: c_int) ?Plan {
+pub fn planFor(h: c_int, dv: c_int, cores: c_int) ?Plan {
     const total = h * dv;
     if (cores < 1 or total > cores * MAX_ROWS) return null;
     const ntg = @min(cores, @divTrunc(total, 2));

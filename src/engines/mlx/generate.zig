@@ -149,7 +149,6 @@ pub const all_source = @embedFile("generate.zig") ++
     @embedFile("spec/dflash.zig") ++
     @embedFile("generate/prefill_chunk.zig") ++
     @embedFile("spec/stats_log.zig") ++
-    @embedFile("env_generate.zig") ++
     @embedFile("spec/mtp_head_ref.zig") ++
     @embedFile("grammar/constraint.zig") ++
     @embedFile("sampling/logprobs.zig") ++
@@ -198,7 +197,6 @@ test {
     _ = @import("spec/dflash.zig");
     _ = @import("generate/prefill_chunk.zig");
     _ = @import("spec/stats_log.zig");
-    _ = @import("env_generate.zig");
     _ = @import("spec/mtp_head_ref.zig");
     _ = @import("grammar/constraint.zig");
     _ = @import("sampling/logprobs.zig");

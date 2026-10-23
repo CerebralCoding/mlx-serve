@@ -63,7 +63,7 @@ pub fn apply(kernel: mlx.mlx_fast_metal_kernel, cfg: mlx.mlx_fast_metal_kernel_c
 // (x1*cos, x2*sin, subtract, x1*sin, x2*cos, add), each product rounded to T. Pair p couples
 // elements p and p+HALF, so the partner lane is HALF/4 away; the tail past 2*HALF passes through.
 // v is only transposed. Output [1, H, S, 128] for q, k and v.
-const QKV_SOURCE = kernelSource("plugins/minimax_h3/kernels/qkv_prep.metal");
+pub const QKV_SOURCE = kernelSource("plugins/minimax_h3/kernels/qkv_prep.metal");
 
 var qkv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const QkvKey = struct { h: c_int, half: c_int, seq: c_int, dt: mlx.mlx_dtype };
@@ -126,8 +126,8 @@ pub fn qkvPrep(qkv: mlx.mlx_array, q_w: mlx.mlx_array, k_w: mlx.mlx_array, cos: 
 //
 // y [S, 2F] = gate | up; out = silu(gate) * up, with silu = x * sigmoid(x) rounded like the chain's
 // sigmoid -> multiply -> multiply (each result rounded to T). `sigm` is MLX's own expression.
-const SWIGLU_HEADER = kernelSource("plugins/minimax_h3/kernels/swiglu_header.metal");
-const SWIGLU_SOURCE = kernelSource("plugins/minimax_h3/kernels/swiglu.metal");
+pub const SWIGLU_HEADER = kernelSource("plugins/minimax_h3/kernels/swiglu_header.metal");
+pub const SWIGLU_SOURCE = kernelSource("plugins/minimax_h3/kernels/swiglu.metal");
 
 var swiglu_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const SwigluKey = struct { rows: c_int, f: c_int, dt: mlx.mlx_dtype };

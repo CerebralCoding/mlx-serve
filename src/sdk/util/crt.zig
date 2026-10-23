@@ -2,6 +2,7 @@
 //! file descriptors, sleep and a monotonic clock. std.c on POSIX; on Windows the CRT's
 //! `_open` family (std.c's file calls take a HANDLE there) and kernel32.
 const std = @import("std");
+const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const is_windows = builtin.os.tag == .windows;
 
@@ -92,14 +93,6 @@ pub fn pread(fd: c_int, buf: [*]u8, len: usize, off: i64) isize {
     return got;
 }
 
-extern "c" fn setenv(name: [*:0]const u8, value: [*:0]const u8, overwrite: c_int) c_int;
-extern "c" fn _putenv_s(name: [*:0]const u8, value: [*:0]const u8) c_int;
-
-/// Sets (overwrites) an environment variable for this process.
-pub fn setEnv(name: [*:0]const u8, value: [*:0]const u8) void {
-    _ = if (is_windows) _putenv_s(name, value) else setenv(name, value, 1);
-}
-
 /// The HOME to default to: Windows has none, and every `~/.mlx-serve` path reads it.
 pub fn homeFallback(home: ?[]const u8, profile: ?[]const u8) ?[]const u8 {
     return if (home == null) profile else null;
@@ -108,10 +101,9 @@ pub fn homeFallback(home: ?[]const u8, profile: ?[]const u8) ?[]const u8 {
 /// Windows: HOME = USERPROFILE when unset, before anything reads it.
 pub fn exportHomeDefault() void {
     if (!is_windows) return;
-    const home = std.c.getenv("HOME");
-    const profile = std.c.getenv("USERPROFILE");
-    if (homeFallback(if (home) |h| std.mem.span(h) else null, if (profile) |p| std.mem.span(p) else null) != null)
-        setEnv("HOME", profile.?);
+    const profile = env.get(.USERPROFILE);
+    if (homeFallback(env.span(.HOME), if (profile) |p| std.mem.span(p) else null) != null)
+        env.set(.HOME, profile.?);
 }
 
 extern "kernel32" fn Sleep(ms: u32) callconv(.winapi) void;

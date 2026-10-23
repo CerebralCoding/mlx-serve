@@ -42,7 +42,11 @@ pub const ops: abi.CacheOps = .{
     .append_rows = appendRows,
     .state = state,
     .set_state = setState,
+    .state_rows = Rows.stateRows,
+    .set_state_rows = Rows.setStateRows,
 };
+
+const Rows = @import("../util/state_rows.zig").Rows(state, setState);
 
 fn of(h: abi.Handle) *TestCache {
     return @ptrCast(@alignCast(h.?));
@@ -277,6 +281,31 @@ pub fn expectConforms(o: *const abi.CacheOps, h1: abi.Handle, h2: abi.Handle) !v
     try testing.expect(o.state(h2, 1, .conv).ctx == null);
     try testing.expect(o.set_state(h1, 1, .ssm, ab(k1)).isOk());
     try expectSame(s, o.state(h1, 1, .ssm), k1);
+
+    // State rows: null until every cache holds one, then stacked on the batch axis (axis 1 for a state sequence),
+    // and a stacked write hands each cache its row.
+    try testing.expect(o.state_rows(&hs, 2, 1, .conv, as).ctx == null);
+    for ([_]abi.StateSlot{ .conv, .state_seq }) |slot| {
+        const ax: usize = if (slot == .state_seq) 1 else 0;
+        var sh = [_]c_int{ 3, 1, 4 };
+        sh[ax] = 2;
+        const stacked = try iota(s, 500, &sh);
+        defer _ = mlx.mlx_array_free(stacked);
+        try testing.expect(o.set_state_rows(&hs, 2, 0, slot, ab(stacked), as).isOk());
+        for (hs, 0..) |h, i| {
+            var start = [_]c_int{ 0, 0, 0 };
+            var stop = sh;
+            start[ax] = @intCast(i);
+            stop[ax] = @intCast(i + 1);
+            var row = mlx.mlx_array_new();
+            defer _ = mlx.mlx_array_free(row);
+            try mlx.check(mlx.mlx_slice(&row, stacked, &start, 3, &stop, 3, &[_]c_int{ 1, 1, 1 }, 3, s));
+            try expectSame(s, o.state(h, 0, slot), row);
+        }
+        const back = o.state_rows(&hs, 2, 0, slot, as);
+        defer _ = mlx.mlx_array_free(mx(back));
+        try expectSame(s, back, stacked);
+    }
 }
 
 // ── tests ──

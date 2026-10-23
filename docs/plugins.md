@@ -24,9 +24,9 @@ every plugin. A plugin reads only the declarations those roots re-export for it:
 
 | Declaration | What | Used by |
 |---|---|---|
-| `mlx_host.mlx` | the mlx-c FFI (`src/mlx/ffi.zig`), with our error latch | mlx-serve-gguf, sushi, mlx-stream |
-| `mlx_host.log` | leveled logging and the log file | sushi, mlx-stream |
-| `mlx_host.io_util` | timers and the I/O helpers | sushi |
+| `mlx_host.mlx` | the mlx-c FFI (`src/mlx/ffi.zig`), with our error latch | the in-tree EXL3 module (`sushi_exl3`), mlx-stream |
+| `mlx_host.log` | leveled logging and the log file | `sushi_exl3`, mlx-stream |
+| `mlx_host.io_util` | timers and the I/O helpers | `sushi_exl3` |
 | `mlx_host.mtp_acceptance` | the draft acceptance modes the host serves | mlx-stream |
 
 - There is one instance of each per binary. Plugin and host share MLX handles, the error latch and the log file.
@@ -46,8 +46,8 @@ The deeper the seam, the less of our stack the model gets for free. Use the shal
 
 | Seam | The plugin supplies | The host keeps | Example |
 |---|---|---|---|
-| Format | detection, the JSON a model directory would hold, the tensor map, kernels for its encodings | the arch, KV cache, batching, spec decode, prefix cache | mlx-serve-gguf |
-| Weight encoding | config parse and load checks, the matmul over its weights | the arch and everything above it | EXL3 (from sushi) |
+| Format | detection, the JSON a model directory would hold, the tensor map, kernels for its encodings | the arch, KV cache, batching, spec decode, prefix cache | GGUF (`src/sdk/quant/gguf/`) |
+| Weight encoding | config parse and load checks, the matmul over its weights | the arch and everything above it | EXL3 (`src/sdk/quant/exl3/`, from sushi) |
 | Arch | a model's forward, its kernels and decode state, its weight loading and memory bill | HTTP, the template, tool calls, sampling, stops, scheduling, admission | mlx-stream (DeepSeek-V4.1's EXL3 repack, MiMo-V2.6-Flash, GLM-5.3) |
 
 Not a seam: **opaque engines.** ds4 and llama.cpp keep their bridges (`src/engines/ds4/bridge.zig`, `src/engines/llama/bridge.zig`).
@@ -93,21 +93,17 @@ A seam is added with its first consumer and generalized with its second.
 
 The plugin's `build.zig` builds against an mlx-serve checkout (`-Dmlx-serve=../mlx-serve`). A three-line
 `standalone/mlx_host.zig` re-exports the host's `src/mlx/ffi.zig` (plus `log.zig` and `io_util.zig` if it uses them).
-mlx-serve-gguf works exactly this way:
-
-- `zig build test-core`: the format reader and reference dequant, with no MLX and no GPU.
-- `zig build test`: the kernels on the GPU, through the host's MLX and its staged `lib/mlx`.
-
 To serve, build mlx-serve with `-D<name>-dir=$PWD`. No slim host and no fork are needed. mlx-stream's `build.zig`
 drives the host's own build instead (`zig build test` runs the host's `mlx-stream-test` step, `zig build conformance`
 its `mlx-stream-conformance` step).
 
-## Example: mlx-serve-gguf (format seam)
+## Example: GGUF (format seam)
 
-`lib/mlx-serve-gguf` serves GGUF files as they are on the regular MLX path. The file stands in for a model directory.
+`src/sdk/quant/gguf/` (formerly the mlx-serve-gguf repo) serves GGUF files as they are on the regular MLX path. The
+file stands in for a model directory.
 
-- **Module.** `src/root.zig` exports the reader (`gguf`), the metadata-to-HF translation (`meta`), `weights` and
-  `kernels`. It reads `mlx_host.mlx` only.
+- **Module.** `root.zig` exports the reader (`gguf`), the metadata-to-HF translation (`meta`), `weights` and
+  `kernels`, over `src/mlx/ffi.zig`; `format.zig` is its quant table.
 - **Glue.** `src/sdk/quant/gguf/claim.zig` holds four entry points:
   - `servablePath` takes a `.gguf` only when its arch, tokenizer, tensor types and tensor names are all known.
     Anything else stays with llama.cpp or ds4.
@@ -124,27 +120,30 @@ its `mlx-stream-conformance` step).
 ## Example: EXL3 experts from sushi (weight-encoding seam)
 
 [sushi](https://github.com/beamivalice/sushi) is a fork of mlx-serve that added EXL3 routed experts. Only the EXL3
-code came in, as a plugin: the submodule `lib/sushi` (our fork's `exl3-module` branch), module `sushi_exl3`, reaching
-`mlx`, `log` and `io_util` through `mlx_host`. The rest of the fork stayed out.
+code came in: Sushi 1.3.0's `src/exl3` in `src/sdk/quant/exl3/sushi/`, module `sushi_exl3`, reaching `mlx`, `log`
+and `io_util` through `mlx_host`; `src/sdk/quant/exl3/format.zig` is its quant table. The rest of the fork stayed out.
 
 - **Parse.** `parseExpertQuant(quantization_config.expert_quant)` gives `ModelConfig.exl3` (rate, codebook, window),
   then `admitTopK`.
 - **Load.** `checkExl3Bank` asks `trellisAdmitted` for each bank's geometry and refuses by name.
-- **Forward.** `moe(s, x, bank, inds, scores, dec, verify_rows)` replaces the routed-expert matmul in qwen4_exp's MoE
-  layer.
+- **Forward.** `exl3.routed(s, x, bank, inds, scores, spec, opts)` replaces the routed-expert matmul in qwen4_exp's
+  MoE layer.
 - **Free from the host.** The whole qwen4_exp trunk, MTP and batching.
 
-mlx-stream reads the same format with its own decoder and kernels, pinned to DeepSeek-V4.1's shapes. The two do not
-share code: each serves a different arch, and their kernels are tuned to it.
+mlx-stream reads the same format with its own decoder and kernels, pinned to DeepSeek-V4.1's shapes
+(`src/sdk/quant/exl3/stream/`). The two do not share kernels: each serves a different arch, and its kernels are tuned
+to it. mlx-stream's GLM-5.3 reaches sushi's decode through the format (`mlx_host.exl3`).
 
 ## Example: mlx-stream (arch seam)
 
-[mlx-stream](https://github.com/davidtai/mlx-stream) (the `lib/mlx-stream` submodule from our fork `ddalcu/mlx-stream`) serves
+[mlx-stream](https://github.com/davidtai/mlx-stream) (absorbed from our fork `ddalcu/mlx-stream`, module `mlx_stream`) serves
 DeepSeek-V4.1's EXL3 streaming repack (`experts.bin` beside the trunk) and, as its second arch, MiMo-V2.6-Flash's
 prepared MXFP4 pack (the release's experts in `experts.bin`, its config declaring `expert_streaming`) and, as its third,
 GLM-5.3 (`glm_moe_dsa`, the trunk beside an `experts.bin` bank). It owns the model: the arch, its Metal
 kernels, its EXL3, the SSD expert streamer (lookahead reads, event gates), DSpark with typical acceptance, the prefix
-resume of one conversation, its weight loading past the page cache and its memory bill. Its `sdk` module (`sdk/`)
+resume of one conversation, its weight loading past the page cache and its memory bill. Its archs live in
+`src/plugins/<model>/stream/`, its EXL3 lanes in `src/sdk/quant/exl3/stream/`, its streamer and shims in
+`src/sdk/weights/streamed/`, its roots in `src/mlx_stream*.zig`. Its `sdk` module (`src/sdk/weights/streamed/sdk/`)
 holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/plugins/deepseek_v41/deepseek_v41.zig`).
 
 - **Dispatch.** `parseConfig` marks a `deepseek_v41` directory with `experts.bin` (`ModelConfig.dsv41_stream`), a
@@ -173,8 +172,8 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/plugin
   forward, `prefillsWholePrompt`; no host warm-up), the scheduler's bill and `begin`, the generator's lane, the
   server's context and prompt bill. GLM-5.3's module closes on the inference thread at shutdown (it synchronizes its
   stream as it frees), and the hot prefix cache stays off for it.
-- **Build.** The `lib/mlx-stream` submodule, or `-Dmlx-stream-dir=/abs/path`: two modules (`sdk`, `mlx_stream`), its
-  C sources against the staged MLX, its suite in `zig build test`, its conformance suite (a CPU-lane binary of its
+- **Build.** In-tree: two modules (`sdk`, `mlx_stream`), its C sources against the staged MLX, its suite in
+  `zig build test` (`zig build mlx-stream-test`), its conformance suite (a CPU-lane binary of its
   own, which checks the plugin against the linked MLX) as `zig build mlx-stream-conformance`. macOS only; the
   Linux and iOS graphs build `src/sdk/weights/streamed/stub.zig`, which refuses these packs by name.
 
@@ -205,6 +204,6 @@ holds the arch contract's types. MLX-format V4.1 packs stay in-tree (`src/plugin
 
 ## Status
 
-- On main: the format seam (mlx-serve-gguf); the weight-encoding seam (EXL3 from sushi).
-- With DeepSeek-V4.1: the arch seam (mlx-stream, `lib/mlx-stream` at `ddalcu/mlx-stream` `main`, a fork of `davidtai/mlx-stream`), its
-  suite in `zig build test`. mlx-serve-gguf's suite runs only in its own repository today.
+- On main: the format seam (GGUF, in-tree); the weight-encoding seam (EXL3 from sushi, in-tree).
+- With DeepSeek-V4.1: the arch seam (mlx-stream, absorbed from `ddalcu/mlx-stream`, a fork of `davidtai/mlx-stream`),
+  its suite in `zig build test`.

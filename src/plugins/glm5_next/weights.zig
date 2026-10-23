@@ -1,5 +1,5 @@
-//! plugins/glm5_next/weights, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns DsaWeights, MhcWeights.
+//! GLM-5.3-Flash's layer weight types: the sparse attention layer's (`DsaWeights`) and a sublayer's
+//! hyper-connection (`MhcWeights`).
 
 const mlx = @import("../../mlx/ffi.zig");
 const QW = @import("../../engines/mlx/layer_weights.zig").QW;

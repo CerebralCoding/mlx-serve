@@ -1,3 +1,33 @@
 # Class-guard pins for `zig build lint` (scripts/lint.py, rule pin-unmatched): a source-scan test becomes one line here.
 # Format, one pin per line, TAB-separated: <file glob from the repo root> <TAB> <needle> <TAB> <rule it guards>
 # A pin passes when at least one file matching the glob contains the needle (a plain substring). `#` lines are comments.
+src/host/api/chat_stream.zig	in_think_block = prompt_opened_think	a stream seeds its think state from the rendered prompt, never the request flag
+src/host/api/anthropic_stream.zig	in_think_block = prompt_opened_think	a stream seeds its think state from the rendered prompt, never the request flag
+src/host/api/chat_stream.zig	.content = vis_token_text }, null, null, null, .{ .logprobs_json = try lps.take() });	every streaming content emitter drains the logprobs collector
+src/host/api/chat_completions.zig	if (continue_final) if (continuationRejectReason(	every continuation surface consults continuationRejectReason before rendering
+src/host/api/anthropic.zig	continuationRejectReason(lm.ds4_engine != null) == null	every continuation surface consults continuationRejectReason before rendering
+src/host/api/chat_completions.zig	switch (schemaMasksThinking(	every JSON grammar mask site consults the schema-mask thinking policy
+src/host/api/anthropic.zig	switch (schemaMasksThinking(	every JSON grammar mask site consults the schema-mask thinking policy
+src/host/api/responses/handler.zig	switch (schemaMasksThinking(	every JSON grammar mask site consults the schema-mask thinking policy
+src/host/api/chat_stream.zig	prompt_opened_think, &think_scan)	the streaming think gate scans with a persistent ThinkScan cursor
+src/host/api/anthropic_stream.zig	prompt_opened_think, &think_scan)	the streaming think gate scans with a persistent ThinkScan cursor
+src/host/api/chat_completions.zig	"finish_reason":"{s}"{s}	finish_reason carries finish_details beside it (chat non-stream)
+src/host/api/completions.zig	"finish_reason":"{s}"{s}	finish_reason carries finish_details beside it (completions)
+src/host/http/sse.zig	"finish_reason":{s}{s}	finish_reason carries finish_details beside it (chat SSE chunk)
+src/host/http/router.zig	if (!routeExists(path)) {	the route-existence 404 is answered before the model is resolved
+src/host/http/server.zig	conn_thread.detach();	every connection thread is detached after spawn
+src/host/api/chat_completions.zig	RequestMedia.init(allocator)	request media is owned by RequestMedia, never a handler-local list
+src/host/api/anthropic.zig	RequestMedia.init(allocator)	request media is owned by RequestMedia, never a handler-local list
+src/engines/mlx/*.zig	sleep_inhibit.setActive(holdsSleepWhileParked(sch));	the inference loop drops the sleep assertion before it parks
+src/engines/mlx/scheduler.zig	coldLoadDrafterDir(self.no_drafter, self.primary_model_dir, self.drafter_dir, entry.path)	the cold-load LoadRequest re-applies the retained launch settings
+src/engines/mlx/load.zig	clamped_prefix_mem,	HotPrefixCache.initWithMem takes the clamped budget, never the raw launch flag
+src/engines/mlx/load.zig	loadRequirementBytes(weights_bytes))) / gb	a preflight refusal quotes the requirement it compared
+src/host/media_jobs/load.zig	loadRequirementBytes(bill.ram))) / gb	a preflight refusal quotes the requirement it compared
+src/engines/mlx/forward/dense.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/engines/mlx/forward/layered.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/engines/mlx/forward/hybrid.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/plugins/bert/forward.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/plugins/gemma3/encoder.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/plugins/embedding_gemma2/forward.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/plugins/glm5_next/forward.zig	DtypeTrace.begin(	every forward path arms a dtype trace
+src/plugins/qwen4_exp/forward.zig	DtypeTrace.begin(	every forward path arms a dtype trace

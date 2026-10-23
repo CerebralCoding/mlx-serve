@@ -13,6 +13,29 @@ const metal = @import("metal.zig");
 const areas = .{
     @import("controls.zig"),
     @import("../../blocks/norms/contract.zig"),
+    @import("../../blocks/rope/contract.zig"),
+    @import("../../blocks/ssm/contract.zig"),
+    @import("../../blocks/hc/contract.zig"),
+    @import("../../blocks/gdn/contract.zig"),
+    @import("../../blocks/kda/contract.zig"),
+    @import("../../blocks/attention/contract.zig"),
+    @import("../../blocks/qmm/contract.zig"),
+    @import("../../../engines/mlx/sampling/contract.zig"),
+    @import("../../../engines/mlx/spec/contract.zig"),
+    @import("../../../plugins/gemma4/contract.zig"),
+    @import("../../../plugins/qwen4_exp/contract.zig"),
+    @import("../../../plugins/minimax_h3/contract.zig"),
+    @import("../../../plugins/ltx/contract.zig"),
+    @import("../../quant/gguf/contract.zig"),
+    @import("../../quant/exl3/contract.zig"),
+    @import("../../blocks/mlp/contract.zig"),
+    @import("../../quant/contract.zig"),
+    @import("../../blocks/dit/contract.zig"),
+    @import("../../blocks/linear/contract.zig"),
+    @import("../../blocks/moe/contract.zig"),
+    @import("../../../plugins/qwen_image/contract.zig"),
+    @import("../../../plugins/deepseek_v4/contract.zig"),
+    @import("../../../plugins/deepseek_v41/contract.zig"),
 };
 
 /// The registrations of every area: each kernel's test instance (owned here) and its hooks.
@@ -128,7 +151,11 @@ test "kernel contract gates 1-4: every registered kernel passes, every planted c
 }
 
 test {
+    // Each area's own tests (its drift guards) run only when a test references its file.
+    inline for (areas) |area| _ = area;
     _ = @import("spec.zig");
     _ = @import("limits.zig");
     _ = @import("offline.zig");
+    _ = @import("host.zig");
+    _ = @import("hostq.zig");
 }

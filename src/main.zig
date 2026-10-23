@@ -1,19 +1,21 @@
 const depth_bounds = @import("engines/mlx/spec/mtp_depth_bounds.zig");
 const std = @import("std");
+pub const env = @import("env.zig");
 const crt = @import("sdk/util/crt.zig");
 const build_options = @import("build_options");
-// pub: lib/mlx-serve-gguf and lib/sushi reach these through their host root.
+// pub: Sushi's EXL3 module (src/sdk/quant/exl3/sushi) and mlx-stream reach these through their host root.
 pub const mlx = @import("mlx/ffi.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
 const mlx_gguf = @import("sdk/quant/gguf/claim.zig");
 const model_mod = @import("engines/mlx/model.zig");
 const tokenizer_mod = @import("host/tokenizer/tokenizer.zig");
 const transformer_mod = @import("engines/mlx/transformer.zig");
+const plugin_driver = @import("engines/mlx/plugin/driver.zig");
 const round_cost_mod = @import("engines/mlx/spec/round_cost.zig");
 const generate_mod = @import("engines/mlx/generate.zig");
 pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
-/// Sushi's EXL3 routed experts, for the plugins that reach them through their host root (`mlx_host`).
-pub const sushi_exl3 = @import("sushi_exl3");
+/// The EXL3 quant format, for the plugins that reach it through their host root (`mlx_host`).
+pub const exl3 = @import("sdk/quant/exl3/format.zig");
 pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");
 comptime {
     // The plugins' host surface: plugin_host.zig's list, every name re-exported here.
@@ -86,7 +88,7 @@ const DEFAULT_MODEL_DIR = ""; // pass --model <path> to specify
 // parsing, read by the ds4 serve + offline open paths. Module-level to avoid
 // threading it through runDs4Serve's already-long parameter list.
 var ds4_ssd_streaming: bool = false;
-// --mlx-gguf: opt-in, experimental. Lets lib/mlx-serve-gguf claim the GGUFs it
+// --mlx-gguf: opt-in, experimental. Lets src/sdk/quant/gguf claim the GGUFs it
 // supports; off, every .gguf goes to ds4 or llama.cpp as before.
 var mlx_gguf_enabled: bool = false;
 // Auto-load the ds4 MTP draft head (beside the model) for speculative decode.
@@ -149,6 +151,9 @@ fn printUsage(io: std.Io) void {
         \\                      hermes, aider, zcode); starts the MLX-Serve app if the
         \\                      server is down. `mlx-serve launch <agent> -h` for
         \\                      options
+        \\  plugin new|check|install
+        \\                      Outside plugins (dylibs built with the plugin kit):
+        \\                      `mlx-serve plugin` for usage
         \\
         \\Options:
         \\  --model <dir>       Path to MLX model directory
@@ -221,6 +226,8 @@ fn printUsage(io: std.Io) void {
         \\                        26B-A4B=4, 31B=8); DFlash uses its config's
         \\                        block_size (an explicit value only clamps
         \\                        it DOWN). Pass to override.
+        \\  --no-plugins        Load no outside plugin (~/.mlx-serve/plugins/) even when
+        \\                        plugins.json has "enabled": true.
         \\  --no-drafter        Never load a speculative-decoding drafter, including
         \\                      one shipped inside the checkpoint (drafter/ subdir)
         \\  --no-mtp            Disable the Qwen native MTP head (auto-loaded
@@ -438,8 +445,10 @@ fn printUsage(io: std.Io) void {
         \\                        Override when auto-detection is wrong
         \\                        (e.g. an unusual ds4 quant whose metadata
         \\                        layout differs).
+        \\                        A model's own `engine` setting (Model
+        \\                        Settings) outranks this flag.
         \\  --mlx-gguf          EXPERIMENTAL: serve supported .gguf files on MLX
-        \\                        itself (lib/mlx-serve-gguf) instead of
+        \\                        itself (src/sdk/quant/gguf) instead of
         \\                        llama.cpp. Files it cannot serve fall back to
         \\                        the embedded engines. --engine ds4|llama
         \\                        still wins.
@@ -526,6 +535,7 @@ fn printUsage(io: std.Io) void {
 
 pub fn main(init: std.process.Init) !void {
     crt.exportHomeDefault();
+    env.init();
     // Referenced, or the linker strips the unreferenced section.
     if (@import("builtin").os.tag == .macos) std.mem.doNotOptimizeAway(&info_plist);
     const allocator = init.gpa;
@@ -620,6 +630,9 @@ pub fn main(init: std.process.Init) !void {
         } else if (std.mem.eql(u8, cmd, "dist-probe")) {
             @import("engines/mlx/cluster/distributed.zig").cmdProbe(io, args[2..]) catch std.process.exit(1);
             return;
+        } else if (std.mem.eql(u8, cmd, "plugin")) {
+            @import("host/plugins/cli.zig").cmdPlugin(allocator, io, args[2..]) catch std.process.exit(1);
+            return;
         } else if (std.mem.eql(u8, cmd, "launch")) {
             if (args.len < 3) {
                 log.err("usage: mlx-serve launch <agent> — supported: {s}\n", .{launch_mod.AgentKind.names});
@@ -628,7 +641,7 @@ pub fn main(init: std.process.Init) !void {
             try launch_mod.cmdLaunch(allocator, io, args[2..]);
             return;
         } else {
-            log.err("unknown command '{s}' (expected run, pull, list, launch, serve, worker, or dist-probe)\n", .{cmd});
+            log.err("unknown command '{s}' (expected run, pull, list, launch, serve, plugin, worker, or dist-probe)\n", .{cmd});
             std.process.exit(1);
         }
     }
@@ -646,6 +659,7 @@ pub fn main(init: std.process.Init) !void {
     // `--log-file <path|off>`. null = default (`~/.mlx-serve/logs/mlx-serve-<port>.log`).
     var log_file_arg: ?[]const u8 = null;
     var serve_mode = false;
+    var no_plugins = false; // --no-plugins: outside plugins stay unloaded whatever plugins.json says
     var stream_mode = false;
     var prompt: ?[]const u8 = null;
     var max_tokens: u32 = 100;
@@ -677,8 +691,8 @@ pub fn main(init: std.process.Init) !void {
     var enable_mtp = true; // Qwen native MTP head (auto when sidecar present; --no-mtp to disable)
     var mtp_forced = false;
     var mtp_head_kv_quant = false;
-    var mtp_typical_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TYPICAL")) |v| std.mem.span(v) else null;
-    var mtp_tokenv3_raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_TOKENV3")) |v| std.mem.span(v) else null;
+    var mtp_typical_raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_TYPICAL);
+    var mtp_tokenv3_raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_TOKENV3);
     // Plan 04 Phase 1: pre-fault weights and pre-compile kernels at boot.
     // Default ON in serve mode — small boot-time cost, big cold-prefill win.
     // --no-warmup-eager opts out for benchmarking / minimal-footprint deployments.
@@ -855,14 +869,12 @@ pub fn main(init: std.process.Init) !void {
             // the process table is world-readable, argv with it. Same
             // borrow-for-the-process lifetime as --api-key; empty/unset
             // leaves the server open, exactly like an empty --api-key.
-            // getenv needs a null-terminated name; args[i] is a plain
+            // byName needs a null-terminated name; args[i] is a plain
             // slice, so print a `:0` copy (process-lifetime, like the argv
-            // borrow --api-key uses). std.c.getenv is how every other env
-            // read in this codebase works. An unset var leaves the server
-            // open, exactly like an empty --api-key.
+            // borrow --api-key uses).
             const name = std.fmt.allocPrintSentinel(allocator, "{s}", .{args[i]}, 0) catch null;
             if (name) |name_z| {
-                if (std.c.getenv(name_z.ptr)) |value| {
+                if (env.byName(name_z.ptr)) |value| {
                     const key = std.mem.span(value);
                     if (key.len > 0) server_mod.g_api_key = key;
                 }
@@ -879,6 +891,8 @@ pub fn main(init: std.process.Init) !void {
             server_mod.g_lan_discover = true;
         } else if (std.mem.eql(u8, args[i], "--no-drafter")) {
             no_drafter = true;
+        } else if (std.mem.eql(u8, args[i], "--no-plugins")) {
+            no_plugins = true;
         } else if (std.mem.eql(u8, args[i], "--no-mtp")) {
             enable_mtp = false;
         } else if (std.mem.eql(u8, args[i], "--mtp")) {
@@ -931,7 +945,7 @@ pub fn main(init: std.process.Init) !void {
             // DSpark (DeepSeek-V4 draft stages) is OPT-IN: the stages cost
             // ~11 GB resident, so the default leaves them lazy and serves
             // serial. deepseek_v4.initModel reads the env at model load.
-            crt.setEnv("MLX_SERVE_DSV4_DSPARK", "1");
+            env.set(.MLX_SERVE_DSV4_DSPARK, "1");
             // Same flag, embedded engine: arm ds4's DSpark runtime when a
             // DSpark support GGUF sits beside a served .gguf model.
             ds4_dspark = true;
@@ -1189,7 +1203,7 @@ pub fn main(init: std.process.Init) !void {
     if (ane_media.share == null) ane_media.share = ane_mod.explicitShareEnv();
     ane_mod.media_offload = ane_media;
 
-    const decode_share_env: ?[]const u8 = if (std.c.getenv("MLX_SERVE_PREFILL_DECODE_SHARE")) |r| std.mem.sliceTo(r, 0) else null;
+    const decode_share_env: ?[]const u8 = env.span(.MLX_SERVE_PREFILL_DECODE_SHARE);
     scheduler_mod.prefill_decode_share = scheduler_mod.resolveDecodeShare(decode_share_flag, decode_share_env) catch {
         log.err("--prefill-decode-share / MLX_SERVE_PREFILL_DECODE_SHARE: expected a number >= 0 (above 0.9 clamps to 0.9), got '{s}'\n", .{decode_share_flag orelse decode_share_env.?});
         std.process.exit(1);
@@ -1205,7 +1219,7 @@ pub fn main(init: std.process.Init) !void {
         log.err("--mtp-min-depth {d} is above --mtp-max-depth {d}\n", .{ depth_bounds.active.min, depth_bounds.active.max });
         std.process.exit(1);
     };
-    if (std.c.getenv("MLX_SERVE_MTP_FORCE_DEPTH") != null) log.warn("MLX_SERVE_MTP_FORCE_DEPTH no longer does anything: pin a depth with --mtp-min-depth n --mtp-max-depth n\n", .{});
+    if (env.get(.MLX_SERVE_MTP_FORCE_DEPTH) != null) log.warn("MLX_SERVE_MTP_FORCE_DEPTH no longer does anything: pin a depth with --mtp-min-depth n --mtp-max-depth n\n", .{});
 
     // Subcommand plumbing: `run <model>` supplies the model dir + serve
     // mode; `run`/`serve` default the discovery root to ~/.mlx-serve/models
@@ -1227,7 +1241,7 @@ pub fn main(init: std.process.Init) !void {
         .serve_mode = serve_mode,
         .has_explicit_model = model_dir.len > 0,
     })) {
-        const home = std.mem.span(std.c.getenv("HOME") orelse "/tmp");
+        const home = std.mem.span(env.get(.HOME) orelse "/tmp");
         default_models_root_storage = try cli_mod.modelsRootPath(allocator, home);
         models_root = default_models_root_storage;
     }
@@ -1249,7 +1263,7 @@ pub fn main(init: std.process.Init) !void {
         var log_path_buf: [1024]u8 = undefined;
         const chosen: ?[]const u8 = if (log_file_arg) |a|
             (if (std.mem.eql(u8, a, "off") or std.mem.eql(u8, a, "none")) null else a)
-        else if (std.c.getenv("HOME")) |h|
+        else if (env.get(.HOME)) |h|
             log.defaultLogPath(&log_path_buf, std.mem.span(h), port) catch null
         else
             null;
@@ -1262,6 +1276,9 @@ pub fn main(init: std.process.Init) !void {
         }
     }
     defer log.closeFile();
+
+    // Outside plugins, before discovery reads any pack: once, on the main thread, when plugins.json switches them on.
+    if (serve_mode) @import("host/plugins/loader.zig").loadAtStartup(io, allocator, &@import("plugins/registry.zig").entries, no_plugins, @import("mlx_stamp").bytes);
 
     // Plan 05 Phase 1: model discovery. When --model-dir is passed, scan
     // the directory for subdirectories containing config.json. The
@@ -1360,11 +1377,13 @@ pub fn main(init: std.process.Init) !void {
     if (mlx_gguf_enabled and !mlx.metalKernelsAvailable())
         log.warn("[gguf] --mlx-gguf needs Metal kernels; GGUFs go to llama.cpp/ds4 on this backend\n", .{});
     mlx_gguf.enabled = mlx_gguf_enabled and engine_override == null and mlx.metalKernelsAvailable();
-    const mlx_gguf_path = mlx_gguf.servablePath(io, allocator, model_dir);
+    // The model's engine setting outranks `--engine`, as every per-model setting outranks its flag.
+    const gguf_setting = model_settings_mod.ggufEngineFor(allocator, io, model_dir);
+    const mlx_gguf_path = if (gguf_setting == null) mlx_gguf.servablePath(io, allocator, model_dir) else null;
     defer if (mlx_gguf_path) |p| allocator.free(p);
-    if (mlx_gguf_path != null) log.info("[gguf] engine: mlx (lib/mlx-serve-gguf)\n", .{});
+    if (mlx_gguf_path != null) log.info("[gguf] engine: mlx (src/sdk/quant/gguf)\n", .{});
     if (mlx_gguf_path == null and isGgufPath(io, model_dir)) {
-        const chosen = chooseGgufEngine(io, allocator, model_dir, engine_override);
+        const chosen = chooseGgufEngine(io, allocator, model_dir, gguf_setting orelse engine_override);
         if (serve_mode) {
             switch (chosen) {
                 .ds4 => try runDs4Serve(io, allocator, model_dir, host, port, ctx_size, timeout, reasoning_budget, if (temp_explicit) temperature else null, top_p_flag, top_k_flag, max_resident_models, max_resident_mem, max_resident_mem_explicit, idle_evict_secs),
@@ -1676,12 +1695,20 @@ pub fn main(init: std.process.Init) !void {
         // ── Offline single-prompt mode. mlx ops run on this thread, no
         //    scheduler. The same load path as pre-A1.
         log.info("Loading weights...\n", .{});
-        var weights = try model_mod.loadModelWeights(io, allocator, model_dir, config, load_vision);
+        // A served model loads through its plugin, as the serve path does (`engines/mlx/load.zig`).
+        _ = plugin_driver.declineLossy(allocator, config);
+        const served = config.plugin != null;
+        var weights = if (served) model_mod.Weights.init(allocator) else try model_mod.loadModelWeights(io, allocator, model_dir, config, load_vision);
         defer weights.deinit();
-        model_mod.resolveWeightPrefix(config, &weights);
-        try model_mod.narrowHadamardPackTables(config, &weights, mlx.gpuStream());
+        if (!served) {
+            model_mod.resolveWeightPrefix(config, &weights);
+            try model_mod.narrowHadamardPackTables(config, &weights, mlx.gpuStream());
+        }
 
-        var xfm = try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
+        var xfm = if (served)
+            try plugin_driver.loadWith(io, allocator, config, model_dir, mlx.gpuStream(), if (load_vision) &weights else null)
+        else
+            try transformer_mod.Transformer.init(io, allocator, config.*, &weights);
         defer xfm.deinit();
 
         xfm.round_cost.layout = round_cost_mod.layoutFor(config);
@@ -1721,8 +1748,10 @@ pub fn main(init: std.process.Init) !void {
         // file or in-checkpoint tensors in the trunk shards).
         var mtp_head: ?mtp_mod.MtpModel = null;
         defer if (mtp_head) |*h| h.deinit();
-        if (enable_mtp) mtp_graft.ensure(allocator, io, model_dir, config);
-        if (enable_mtp and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
+        if (enable_mtp and !served) mtp_graft.ensure(allocator, io, model_dir, config);
+        // A served model's head is its plugin's (`SpecHooks.head`), served by the scheduler path only.
+        if (served and enable_mtp) log.info("[mtp] offline mode runs a served model without its MTP head\n", .{});
+        if (!served and enable_mtp and mtp_mod.hasMtpHead(io, allocator, model_dir)) {
             // A failed load (e.g. a sidecar layout we can't bind yet) only
             // disables the head — mirrors the serve path's graceful degrade.
             if (mtp_mod.loadMtp(io, allocator, xfm.s, model_dir)) |loaded| {
@@ -1831,7 +1860,7 @@ const logResolveGgufError = model_discovery.logResolveGgufError;
 
 /// Decide which embedded engine serves a `.gguf` file (or dir containing one).
 ///
-/// Priority: explicit `--engine` override wins. Otherwise we read the file's
+/// Priority: an explicit override (the model's engine setting, else `--engine`) wins. Otherwise we read the file's
 /// GGUF metadata (cheap, header-only) and route on `general.architecture`:
 /// `deepseek4` + the antirez-style MLA key, or a ds4-only arch (V4.1, Qwen3.8
 /// Flash Next, GLM 5.x) → ds4; everything else → llama.cpp.
@@ -1848,7 +1877,7 @@ fn chooseGgufEngine(
     override: ?gguf_meta.Engine,
 ) gguf_meta.Engine {
     if (override) |e| {
-        log.info("[gguf] engine: {s} (forced via --engine)\n", .{@tagName(e)});
+        log.info("[gguf] engine: {s} (forced by the model's engine setting or --engine)\n", .{@tagName(e)});
         return e;
     }
     const gguf_path = resolveGgufFile(io, allocator, path) catch |err| {

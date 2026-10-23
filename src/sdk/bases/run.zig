@@ -2,6 +2,7 @@
 //! the logits rows, layer capture, and the model table's `forward` over any base (`tableForward`).
 
 const std = @import("std");
+const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const abi = @import("../../abi/plugin.zig");
 const block = @import("block.zig");
@@ -9,6 +10,8 @@ const block = @import("block.zig");
 const Array = ops.Array;
 const Graph = ops.Graph;
 const Ctx = block.Ctx;
+const spliceVisionRows = @import("../vision/splice.zig").spliceVisionRows;
+const row_exact = @import("blocks/row_exact.zig");
 
 /// One forward's arguments.
 pub const Run = struct {
@@ -28,9 +31,30 @@ pub const Run = struct {
     captured: []Array = &.{},
     /// An encoder batch's additive key mask; null = none.
     mask: Array = .{},
+    /// Evaluate the residual after every this many layers and after the last (0 = never; `Forward.eval_every`).
+    eval_every: u32 = 0,
+    /// `Ctx.capture_spec`.
+    capture_spec: bool = false,
+    /// `Ctx.row_exact`.
+    row_exact: row_exact.Lane = .off,
+    /// `Ctx.mrope`: the chunk's M-RoPE cos/sin (`Forward.mrope`).
+    mrope: ?[2]Array = null,
+    /// Media rows spliced after the embedding at the placeholder ids, from row `media_offset` (`Forward.media`).
+    media: Array = .{},
+    media_offset: u32 = 0,
+    placeholders: abi.PlaceholderIds = .{},
 
     pub fn ctx(r: *const Run, g: *Graph, shared: *const block.Shared) Ctx {
-        return .{ .g = g, .mode = r.mode, .rows = r.rows, .slots = r.slots, .positions = r.positions, .caches = r.caches, .cache_ops = r.cache_ops, .shared = shared, .mask = r.mask };
+        return .{ .g = g, .mode = r.mode, .rows = r.rows, .slots = r.slots, .positions = r.positions, .caches = r.caches, .cache_ops = r.cache_ops, .shared = shared, .mask = r.mask, .capture_spec = r.capture_spec, .mrope = r.mrope, .row_exact = r.row_exact };
+    }
+
+    /// The embedded rows `h` with the media rows at their placeholders (a prompt chunk only, as the engine splices).
+    pub fn splice(r: *const Run, g: *Graph, h: Array, ids: Array) !Array {
+        const p = r.placeholders;
+        if (r.media.ctx == null or r.rows <= 1 or p.image | p.audio | p.video == 0) return h;
+        var own = mlx.mlx_array_new();
+        try mlx.check(mlx.mlx_array_set(&own, h));
+        return g.adopt(try spliceVisionRows(own, ids, r.media, p.image, p.audio, p.video, r.media_offset, g.s));
     }
 
     /// Publishes `h`, layer `layer`'s output, where it was asked for.
@@ -38,6 +62,19 @@ pub const Run = struct {
         for (r.capture_layers, 0..) |id, k| if (id == layer) {
             r.captured[k] = try g.keep(h);
         };
+    }
+
+    /// Evaluates `h`, layer `layer` of `n`'s output, at the forward's eval cadence, with every slot's conv state: a
+    /// conv state is a copy off the chunk, outside the residual's graph, and left lazy it holds the whole chunk.
+    pub fn cadence(r: *const Run, layer: usize, n: usize, h: Array) !void {
+        if (r.eval_every == 0 or ((layer + 1) % r.eval_every != 0 and layer + 1 != n)) return;
+        const vec = mlx.mlx_vector_array_new_value(h);
+        defer _ = mlx.mlx_vector_array_free(vec);
+        if (r.cache_ops) |co| for (r.caches) |cache| for (0..n) |l| {
+            const st = co.state(cache, @intCast(l), .conv);
+            if (st.ctx != null) _ = mlx.mlx_vector_array_append_value(vec, .{ .ctx = st.ctx });
+        };
+        try mlx.check(mlx.mlx_eval(vec));
     }
 
     /// The head over every row (a row's logits must not depend on how many rows ride with it), then the rows asked for.
@@ -70,6 +107,10 @@ pub fn Model(comptime Base: type) type {
         shared: block.Shared,
         a: std.mem.Allocator,
         s: ops.Stream,
+        /// The placeholder ids media rows splice at (`Parsed.placeholder_ids`).
+        placeholders: abi.PlaceholderIds = .{},
+        /// The lane `Forward.row_exact` turns on; `off` = the weights are outside the row kernels.
+        row_exact: row_exact.Lane = .off,
 
         pub fn of(m: *anyopaque) *@This() {
             return @ptrCast(@alignCast(m));
@@ -90,22 +131,42 @@ pub fn declares(comptime Base: type, mode: abi.Mode) bool {
 /// hands every result out as a new reference.
 pub fn tableForward(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.ForwardOut) abi.Verdict {
     if (!declares(Base, f.mode)) return abi.Verdict.refuse(.unsupported, "forward mode not declared");
-    const slots: usize = if (f.mode == .batched_rows) f.caches.len else 1;
-    const tokens = f.tokens.slice();
-    if (f.rows == 0 or tokens.len != slots * f.rows or f.positions.len < slots) return abi.Verdict.refuse(.failed, "tokens, rows and positions disagree");
+    // An encoder batch (no cache) carries one position per sequence.
+    const slots: usize = if (f.mode == .batched_rows) f.caches.len else if (f.cache_ops == null) @max(1, f.positions.len) else 1;
+    const n_ids: usize = if (f.ids.ctx != null) idCount(f.ids) else f.tokens.len;
+    if (f.rows == 0 or n_ids != slots * f.rows or f.positions.len < slots) return abi.Verdict.refuse(.failed, "tokens, rows and positions disagree");
     if (f.mode == .decode and f.rows != 1) return abi.Verdict.refuse(.failed, "a decode step is one row");
     run(Base, m, f, out, slots) catch |e| return failed(e);
     return .ok;
 }
 
+fn idCount(ids: abi.Array) usize {
+    var n: usize = 1;
+    for (ops.shape(.{ .ctx = ids.ctx })) |d| n *= @intCast(d);
+    return n;
+}
+
+/// `[slots, rows]` ids owned by `g`: the engine's device array as it is (a lazy sampled token stays lazy), else the
+/// host tokens.
+fn tokenIds(g: *Graph, a: std.mem.Allocator, f: *const abi.Forward, slots: usize) !Array {
+    const sh = [_]c_int{ @intCast(slots), @intCast(f.rows) };
+    if (f.ids.ctx != null) return g.reshape(.{ .ctx = f.ids.ctx }, &sh);
+    const tokens = f.tokens.slice();
+    const buf = try a.alloc(i32, tokens.len);
+    defer a.free(buf);
+    for (tokens, buf) |t, *i| i.* = @intCast(t);
+    return g.fromSlice(i32, buf, &sh);
+}
+
+/// Half `i` (0 cos, 1 sin) of the stacked `[2, ...]` M-RoPE angles.
+fn mropeHalf(g: *Graph, x: Array, i: c_int) !Array {
+    return g.reshape(try g.sliceAxis(x, 0, i, i + 1), ops.shape(x)[1..]);
+}
+
 fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.ForwardOut, slots: usize) !void {
     var g = Graph.init(m.a, m.s);
     defer g.deinit();
-    const tokens = f.tokens.slice();
-    const ids_buf = try m.a.alloc(i32, tokens.len);
-    defer m.a.free(ids_buf);
-    for (tokens, ids_buf) |t, *i| i.* = @intCast(t);
-    const ids = try g.fromSlice(i32, ids_buf, &.{ @intCast(slots), @intCast(f.rows) });
+    const ids = try tokenIds(&g, m.a, f, slots);
     const caps = f.capture_layers.slice();
     const captured = try m.a.alloc(Array, caps.len);
     defer m.a.free(captured);
@@ -121,6 +182,15 @@ fn run(comptime Base: type, m: *Model(Base), f: *const abi.Forward, out: *abi.Fo
         .want_hidden = f.want_hidden,
         .capture_layers = caps,
         .captured = captured,
+        .eval_every = if (f.rows > 1) f.eval_every else 0,
+        // Verify rows roll back on a partial accept; a batched decode step (one row) never does.
+        .capture_spec = f.mode == .verify or (f.mode == .batched_rows and f.rows > 1),
+        .mrope = if (f.mrope.ctx != null) .{ try mropeHalf(&g, .{ .ctx = f.mrope.ctx }, 0), try mropeHalf(&g, .{ .ctx = f.mrope.ctx }, 1) } else null,
+        .media = .{ .ctx = f.media.ctx },
+        .mask = if (f.key_mask.ctx != null) try g.reshape(.{ .ctx = f.key_mask.ctx }, &.{ @intCast(slots), 1, 1, @intCast(f.rows) }) else .{},
+        .media_offset = f.media_offset,
+        .placeholders = m.placeholders,
+        .row_exact = if (f.row_exact) m.row_exact else .off,
     };
     const res = try Base.forward(&m.weights, &m.shared, &g, ids, r);
     if (caps.len > 0) {

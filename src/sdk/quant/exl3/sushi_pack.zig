@@ -358,17 +358,31 @@ fn dequantFp8Trunk(config: *const ModelConfig, weights: *Weights, s: mlx.mlx_str
     for (0..config.num_hidden_layers) |i| {
         const li: u32 = @intCast(i);
         const base = try std.fmt.bufPrint(&buf, "{s}.layers.{d}", .{ config.weight_prefix, li });
-        try splitFusedQkv(config, weights, base, li, s);
+        try splitFusedQkv(weights, base, qkvRows(config, li), s);
         if (li < config.first_k_dense_replace) try decodeDenseMlp(weights, base, s);
     }
     // The MTP heads are stored the same way and attend in a sliding layer's geometry.
-    const swa = config.firstSlidingLayer() orelse return;
+    try adaptMimoHeads(weights, qkvRows(config, config.firstSlidingLayer() orelse return), s);
+}
+
+fn qkvRows(config: *const ModelConfig, li: u32) [3]u64 {
+    return .{
+        @as(u64, config.layerNumHeads(li)) * config.layerHeadDim(li),
+        @as(u64, config.layerKVHeads(li)) * config.layerHeadDim(li),
+        @as(u64, config.layerKVHeads(li)) * config.layerVHeadDim(li),
+    };
+}
+
+/// MiMo's MTP heads (`model.mtp.layers.{k}`) as the trunk's loader leaves them, for a loader holding them apart:
+/// `qkv` the q/k/v rows of a sliding layer.
+pub fn adaptMimoHeads(weights: *Weights, qkv: [3]u64, s: mlx.mlx_stream) !void {
+    var buf: [160]u8 = undefined;
     var k: u32 = 0;
     while (true) : (k += 1) {
         const base = try std.fmt.bufPrint(&buf, "model.mtp.layers.{d}", .{k});
         var probe: [200]u8 = undefined;
         if (weights.get(try std.fmt.bufPrint(&probe, "{s}.eh_proj.weight", .{base})) == null) break;
-        try splitFusedQkv(config, weights, base, swa, s);
+        try splitFusedQkv(weights, base, qkv, s);
         try decodeDenseMlp(weights, base, s);
     }
 }
@@ -397,7 +411,7 @@ fn decodeDenseMlp(weights: *Weights, base: []const u8, s: mlx.mlx_stream) !void 
 
 /// A part of the fused QKV stays e4m3 as stored: its `.weight` holds the code rows and its `.scales`
 /// one f32 scale row per code row (the source's tile scale, repeated), which is what `fp8Linear` reads.
-fn splitFusedQkv(config: *const ModelConfig, weights: *Weights, base: []const u8, li: u32, s: mlx.mlx_stream) !void {
+fn splitFusedQkv(weights: *Weights, base: []const u8, rows_qkv: [3]u64, s: mlx.mlx_stream) !void {
     var k1: [200]u8 = undefined;
     var k2: [200]u8 = undefined;
     const wk = try std.fmt.bufPrint(&k1, "{s}.self_attn.qkv_proj.weight", .{base});
@@ -407,9 +421,7 @@ fn splitFusedQkv(config: *const ModelConfig, weights: *Weights, base: []const u8
     const scales = takeKey(weights, sk) orelse return error.MissingFp8Scale;
     defer _ = mlx.mlx_array_free(scales);
 
-    const q: u64 = @as(u64, config.layerNumHeads(li)) * config.layerHeadDim(li);
-    const k: u64 = @as(u64, config.layerKVHeads(li)) * config.layerHeadDim(li);
-    const v: u64 = @as(u64, config.layerKVHeads(li)) * config.layerVHeadDim(li);
+    const q, const k, const v = rows_qkv;
     const sh = mlx.getShape(codes);
     if (sh.len != 2 or @as(u64, @intCast(sh[0])) != q + k + v) return error.InvalidQkvGeometry;
     const tp = try solveQkvTp(q, k, v, @intCast(mlx.getShape(scales)[0]));
@@ -503,8 +515,8 @@ pub fn fp8Linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.m
 // e4m3 GEMV ported from sushi's fp8_block.zig (beamivalice/sushi, MIT): each simdgroup owns NR
 // weight rows for all M input rows, lanes stride a row in 16-byte chunks, products sum in f32.
 // The e4m3 decode is bit-exact: the code's low 7 bits as a half, times 256.
-const GEMV_HEADER = kernelSource("kernels/quant/sushi_gemv_header.metal");
-const GEMV_SOURCE = kernelSource("kernels/quant/sushi_gemv.metal");
+pub const GEMV_HEADER = kernelSource("kernels/quant/sushi_gemv_header.metal");
+pub const GEMV_SOURCE = kernelSource("kernels/quant/sushi_gemv.metal");
 const GEMV_MAX_ROWS = 8;
 const GemvKey = struct { m: c_int, n: c_int, k: c_int, dt: mlx.mlx_dtype };
 var gemv_kernel: ?mlx.mlx_fast_metal_kernel = null;

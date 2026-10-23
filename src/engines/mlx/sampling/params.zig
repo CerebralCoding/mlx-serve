@@ -1,5 +1,6 @@
 //! SamplingParams and the reserved-token suppress mask.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const tokenizer_mod = @import("../../../host/tokenizer/tokenizer.zig");
@@ -116,7 +117,7 @@ pub fn fillSuppressMask(buf: []bool, ids: []const u32, defined_vocab: usize) voi
 /// so a silent no-op is visible (the silent-fallback class).
 /// `MLX_SERVE_SUPPRESS_RESERVED=0`: reserved specials and padding rows sample like any other id.
 pub fn suppressionDisabled() bool {
-    const v = std.c.getenv("MLX_SERVE_SUPPRESS_RESERVED") orelse return false;
+    const v = env.get(.MLX_SERVE_SUPPRESS_RESERVED) orelse return false;
     return v[0] == '0';
 }
 

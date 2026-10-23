@@ -1,4 +1,4 @@
-//! The streaming packs on mlx-stream (`lib/mlx-stream`): DeepSeek-V4.1's EXL3 repack (`ModelConfig.dsv41_stream`),
+//! The streaming packs on mlx-stream (module `mlx_stream`, rooted at `src/mlx_stream.zig`): DeepSeek-V4.1's EXL3 repack (`ModelConfig.dsv41_stream`),
 //! MiMo-V2.6-Flash's prepared MXFP4 pack (`ModelConfig.mimo_stream`), GLM-5.3's pack (`ModelConfig.glm_stream`) and
 //! GLM-5.3-Flash's NVFP4 pack (`ModelConfig.glm5_stream`).
 //! The plugin owns each arch, its kernels and the expert streamer, and loads its own weights; the host parses the

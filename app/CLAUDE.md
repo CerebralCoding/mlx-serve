@@ -21,7 +21,7 @@ Compressed rules. Full war stories: `../docs/gotchas/app.md`. Full service contr
 | `Models/{ChatModels,AgentModels,ServerOptions}.swift` | `ChatMessage`, `SerializedToolCall`, launch flags (`toCLIArgs`) |
 | `Services/APIClient.swift` | HTTP + SSE streaming client; accumulates tool-call deltas, emits on `finish_reason` (incl. "length") |
 | `Services/AgentPrompt.swift` | System prompt, 10 tools, `SkillManager`; env-specific facts ride `executionEnvironmentSection`, never the base prompt |
-| `Services/AgentBudget.swift` | Derives context/output budgets for agent CLI configs from server `meta.context_length` — NEVER hardcode |
+| `Services/AgentBudget.swift` | Agent CLI budgets as each chat row's `agent_budget` serves them (context, output, compaction reserve, `too_small_for`) — NEVER derive or hardcode; `fallback` only for an older server's row |
 | `Services/AgentEngine.swift` | Shared agent logic: history, tool exec (`normalizeWriteFileArgs`), repetition tracking, `AgentRetryBudget` (consecutive, resets on real tool round) |
 | `Services/ToolExecutor.swift` | Tool handlers (shell, file, search, browse, webSearch, saveMemory) |
 | `Services/ChatTurnEngine.swift` | MULTI-TURN: one turn PER SESSION concurrently (`TurnLedger`, token-gated cleanup; chat window + Quick Launcher share it; Tasks/Telegram own instances); `composerState(for:)` (idle/generatingHere — no busyElsewhere), `stop(sessionId:)`, `stopIfOrphaned` per-turn sweep |

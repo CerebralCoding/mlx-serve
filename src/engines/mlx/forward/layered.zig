@@ -2,10 +2,10 @@
 //! Owns MoeLayerWeights, forwardMoeWith.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const profile = @import("../diag/profile.zig");
 const MhcWeights = @import("../../../plugins/glm5_next/weights.zig").MhcWeights;
-const inklingSconvCore = @import("../../../plugins/inkling/attention.zig").inklingSconvCore;
 const HcWeights = @import("../../../plugins/qwen4_exp/weights.zig").HcWeights;
 const PleWeights = @import("../../../plugins/qwen4_exp/weights.zig").PleWeights;
 const LinearAttnWeights = @import("../../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
@@ -24,7 +24,13 @@ const ForwardCtx = @import("../forward_ctx.zig").ForwardCtx;
 const slidingViewFor = @import("../kv/sliding.zig").slidingViewFor;
 const FullAttnWeights = @import("../layer_weights.zig").FullAttnWeights;
 const Transformer = @import("../transformer.zig").Transformer;
-const HybridMlpWeights = @import("hybrid.zig").HybridMlpWeights;
+const MoeMlpWeights = @import("../../../sdk/blocks/moe/weights.zig").MoeMlpWeights;
+
+/// A layer's MLP: dense, or a routed MoE.
+pub const HybridMlpWeights = union(enum) {
+    dense: DenseMlpWeights,
+    moe: MoeMlpWeights,
+};
 
 pub const MoeLayerWeights = struct {
     input_norm: mlx.mlx_array,
@@ -41,18 +47,6 @@ pub const MoeLayerWeights = struct {
     post_ff_norm_1: ?mlx.mlx_array = null,
     post_ff_norm_2: ?mlx.mlx_array = null,
     layer_scalar: ?mlx.mlx_array = null,
-    // DiffusionGemma: the causal ENCODER pass multiplies the layer output by
-    // its own scalar (model.encoder.language_model.layers.N.layer_scalar) —
-    // the only untied encoder text params. The bidirectional decoder pass
-    // uses `layer_scalar` above. Null for every other arch.
-    encoder_layer_scalar: ?mlx.mlx_array = null,
-    // Inkling: the post-attention / post-MLP short-convolution taps
-    // ({attn,mlp}_sconv.weight [hidden, k, 1]) and the dense bottom-layer
-    // output scale (mlp.global_scale, f32 [1], dense layers only). Null for
-    // every other arch.
-    attn_sconv_w: ?mlx.mlx_array = null,
-    mlp_sconv_w: ?mlx.mlx_array = null,
-    mlp_global_scale: ?mlx.mlx_array = null,
     // qwen4_exp: the two gated residual reads/writes around the block and
     // the n-gram PLE on its one layer. Null for every other arch.
     hc_attn: ?HcWeights = null,
@@ -69,13 +63,9 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     const offset = ctx.moe_seq_offset.*;
     const cfg = &self.config;
     const is_gemma4 = cfg.isGemma4Layers();
-    const is_kolibri = std.mem.eql(u8, cfg.model_type, "kolibri1");
-    // kolibri1 and flint run laguna's attention arm (no gate, NoPE on full layers; flint adds sinks).
-    const is_laguna = is_kolibri or std.mem.eql(u8, cfg.model_type, "laguna") or std.mem.eql(u8, cfg.model_type, "flint");
-    const is_inkling = cfg.isInkling();
     const is_mla = cfg.isMla();
-    // gpt_oss and MiMo share the sink attention arm (per-layer geometry).
-    const is_sink_attn = std.mem.eql(u8, cfg.model_type, "gpt_oss") or cfg.isMimo();
+    // MiMo's sink attention arm (per-layer geometry).
+    const is_sink_attn = cfg.isMimo();
 
     // PLD spec-decode: thread the per-position SSM capture flag down to the
     // GatedDeltaNet layers (which don't take the ctx). Reset on exit so it
@@ -93,15 +83,6 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     {
         errdefer _ = mlx.mlx_array_free(h);
 
-        // Inkling: RMS norm on the embeddings (model.llm.embed_norm).
-        if (is_inkling) {
-            if (self.embedding_norm) |en| {
-                const normed_emb = try self.rmsNorm(h, en);
-                _ = mlx.mlx_array_free(h);
-                h = normed_emb;
-            }
-        }
-
         // Splice vision embeddings at image_token_id positions (prefill only)
         h = try self.applyVisionEmbeddingsWith(ctx, h, token_ids);
     }
@@ -110,7 +91,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     const batch: c_int = x_shape[0];
     const seq_len: c_int = x_shape[1];
     const is_prefill = seq_len > 1;
-    const prof = prof_on and (seq_len == 1 or std.c.getenv("MLX_SERVE_DECODE_FWD_UBENCH") != null);
+    const prof = prof_on and (seq_len == 1 or env.get(.MLX_SERVE_DECODE_FWD_UBENCH) != null);
     if (prof) {
         try mlx.check(mlx.mlx_array_eval(h));
         profile.decode_prof.embed_ns += pclk.lap();
@@ -128,7 +109,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), self.actDtype());
     defer endMropeChunk(ctx);
 
-    // Precompute sliding window masks (Gemma 4 + Laguna + gpt_oss sliding
+    // Precompute sliding window masks (Gemma 4 + MiMo sliding
     // layers). An arch whose attention arm reads these masks MUST appear
     // in this gate — a missing arm here hands that arm an empty mask
     // handle, and its decode branch then attends over the whole history
@@ -138,22 +119,21 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     var local_decode_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(local_decode_mask);
 
-    if ((is_gemma4 or is_laguna or is_sink_attn) and cfg.has_sliding_window) {
+    if ((is_gemma4 or is_sink_attn) and cfg.has_sliding_window) {
         const sw: c_int = @intCast(cfg.sliding_window);
         const total_kv: c_int = @as(c_int, @intCast(offset)) + seq_len;
         const sliding = slidingViewFor(cfg, total_kv, seq_len);
         if (is_prefill) {
             // Skipped when the fused hd-256 kernel band-masks in-kernel
             // (the mask itself is chunk x kv_len — GBs at long ctx);
-            // gemma4MoeAttnWith/lagunaAttnWith lazily build it if a call
+            // gemma4MoeAttnWith lazily builds it if a call
             // declines. Built at the TRIMMED length, which is what the
             // attn fns hand SDPA.
             if (!sliding.band_in_kernel) {
                 local_prefill_mask = try self.createSlidingWindowMask(seq_len, sliding.kv_len, sw);
             }
         }
-        // Laguna's decode view is already the window (`slidingViewFor`), so it needs no mask.
-        if (!is_prefill and total_kv > sw and !is_laguna) {
+        if (!is_prefill and total_kv > sw) {
             const local_kv_len: c_int = @min(total_kv, sw);
             local_decode_mask = try self.createSlidingWindowDecodeMask(local_kv_len, sw);
         }
@@ -190,30 +170,13 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
         carried_normed = null;
         defer _ = mlx.mlx_array_free(normed);
 
-        // Inkling: the attention call also advances the k/v short-conv
-        // states; they join the tail's attn/mlp states in ONE concatenated
-        // conv_state write at the end of the layer.
-        var ink_k_state: mlx.mlx_array = .{ .ctx = null };
-        var ink_v_state: mlx.mlx_array = .{ .ctx = null };
-        errdefer {
-            if (ink_k_state.ctx != null) _ = mlx.mlx_array_free(ink_k_state);
-            if (ink_v_state.ctx != null) _ = mlx.mlx_array_free(ink_v_state);
-        }
-
         // Attention: linear (GatedDeltaNet) or full
         const attn_out = switch (lw.attn) {
             .linear => |la| try self.gatedDeltaNet(normed, &la, &ctx.ssm_entries.?[layer_idx], layer_idx, batch, seq_len, is_prefill),
-            .full => |fa| if (is_inkling) blk: {
-                const r = try self.inklingAttnWith(ctx, normed, &fa, &ctx.ssm_entries.?[layer_idx], li, @intCast(offset), batch, seq_len, is_prefill);
-                ink_k_state = r.k_state;
-                ink_v_state = r.v_state;
-                break :blk r.out;
-            } else if (is_mla)
+            .full => |fa| if (is_mla)
                 try self.mlaAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill)
             else if (is_sink_attn)
                 try self.sinkAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
-            else if (is_laguna)
-                try self.lagunaAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask)
             else if (is_gemma4)
                 try self.gemma4MoeAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
             else
@@ -227,101 +190,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
 
         if (is_gemma4) {
             const next_norm = if (layer_idx + 1 == n_layers) self.final_norm else ml[layer_idx + 1].input_norm;
-            h = try self.gemma4MoeLayerTail(h, attn_out, lw, ctx.use_encoder_scalars, next_norm, &carried_normed, !is_prefill);
-        } else if (is_kolibri) {
-            // Sandwich norms: post_attn on the attention output, pre_ff on
-            // the residual before the MoE, post_ff on the MoE output.
-            const attn_n = try self.rmsNorm(attn_out, lw.post_attn_norm);
-            defer _ = mlx.mlx_array_free(attn_n);
-            var h_mid = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&h_mid, h, attn_n, self.s));
-            _ = mlx.mlx_array_free(h);
-            h = h_mid;
-
-            const ff_normed = try self.rmsNorm(h, lw.pre_ff_norm.?);
-            defer _ = mlx.mlx_array_free(ff_normed);
-            const mlp_out = try self.moeMLP(ff_normed, &lw.mlp.moe);
-            defer _ = mlx.mlx_array_free(mlp_out);
-            const mlp_n = try self.rmsNorm(mlp_out, lw.post_ff_norm.?);
-            defer _ = mlx.mlx_array_free(mlp_n);
-
-            var h_next = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&h_next, h, mlp_n, self.s));
-            _ = mlx.mlx_array_free(h);
-            h = h_next;
-        } else if (is_inkling) {
-            // Inkling layer tail (inkling_mlx/layers.py):
-            //   h = residual + attn_sconv(attn_out)
-            //   h = h + mlp_sconv(mlp(mlp_norm(h)))      [dense × global_scale]
-            // then ONE concatenated conv_state write [k | v | attn | mlp].
-            const ssm = &ctx.ssm_entries.?[layer_idx];
-            const hidden_c: c_int = @intCast(cfg.hidden_size);
-            const kv_dim: c_int = @intCast(cfg.num_key_value_heads * cfg.head_dim);
-
-            const a_prev = try self.inklingConvSlot(ssm, 2 * kv_dim, hidden_c);
-            defer if (a_prev) |p| {
-                _ = mlx.mlx_array_free(p);
-            };
-            const asc = try inklingSconvCore(self.s, attn_out, lw.attn_sconv_w.?, a_prev);
-            defer _ = mlx.mlx_array_free(asc.out);
-            errdefer _ = mlx.mlx_array_free(asc.new_state);
-
-            var h_new = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&h_new, h, asc.out, self.s));
-            _ = mlx.mlx_array_free(h);
-            h = h_new;
-
-            const ff_normed = try self.rmsNorm(h, lw.post_attn_norm);
-            defer _ = mlx.mlx_array_free(ff_normed);
-            const mlp_out = switch (lw.mlp) {
-                .moe => |*mw| try self.inklingMoeMlp(ff_normed, mw),
-                .dense => |*dw| blk: {
-                    const y = try self.denseMLP(ff_normed, dw);
-                    // Learned scalar output gain, multiplied in the
-                    // CHECKPOINT's stored dtype (bf16 [1] on the shipped
-                    // builds — no promotion; a hypothetical f32 [1] would
-                    // widen the stream exactly like the reference).
-                    if (lw.mlp_global_scale) |gsc| {
-                        var scaled = mlx.mlx_array_new();
-                        try mlx.check(mlx.mlx_multiply(&scaled, y, gsc, self.s));
-                        _ = mlx.mlx_array_free(y);
-                        break :blk scaled;
-                    }
-                    break :blk y;
-                },
-            };
-            defer _ = mlx.mlx_array_free(mlp_out);
-
-            const m_prev = try self.inklingConvSlot(ssm, 2 * kv_dim + hidden_c, hidden_c);
-            defer if (m_prev) |p| {
-                _ = mlx.mlx_array_free(p);
-            };
-            const msc = try inklingSconvCore(self.s, mlp_out, lw.mlp_sconv_w.?, m_prev);
-            defer _ = mlx.mlx_array_free(msc.out);
-            errdefer _ = mlx.mlx_array_free(msc.new_state);
-
-            var h_next = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_add(&h_next, h, msc.out, self.s));
-            _ = mlx.mlx_array_free(h);
-            h = h_next;
-
-            // Assemble the layer's conv_state [B, K-1, 2·kv + 2·hidden].
-            {
-                const arr = [_]mlx.mlx_array{ ink_k_state, ink_v_state, asc.new_state, msc.new_state };
-                const vec = mlx.mlx_vector_array_new_data(&arr, 4);
-                defer _ = mlx.mlx_vector_array_free(vec);
-                var new_state = mlx.mlx_array_new();
-                try mlx.check(mlx.mlx_concatenate_axis(&new_state, vec, 2, self.s));
-                if (ssm.conv_state.ctx != null) _ = mlx.mlx_array_free(ssm.conv_state);
-                ssm.conv_state = new_state;
-                ssm.initialized = true;
-            }
-            _ = mlx.mlx_array_free(ink_k_state);
-            ink_k_state = .{ .ctx = null };
-            _ = mlx.mlx_array_free(ink_v_state);
-            ink_v_state = .{ .ctx = null };
-            _ = mlx.mlx_array_free(asc.new_state);
-            _ = mlx.mlx_array_free(msc.new_state);
+            h = try self.gemma4MoeLayerTail(h, attn_out, lw, next_norm, &carried_normed, !is_prefill);
         } else {
             // Qwen3.5: simple residual + post_attn_norm before MLP. The two
             // are strictly serial (the norm waits on the add, the MLP waits
@@ -407,20 +276,9 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     ctx.moe_seq_offset.* += @intCast(seq_len);
     dt.end(h);
 
-    var final_normed = if (carried_normed) |c| c else try self.rmsNorm(h, self.final_norm);
+    const final_normed = if (carried_normed) |c| c else try self.rmsNorm(h, self.final_norm);
     carried_normed = null;
     _ = mlx.mlx_array_free(h);
-
-    // Inkling muP logit scaling: hidden ÷ logits_mup_width_multiplier
-    // before the unembed projection (0-dim scalar — no dtype promotion).
-    if (is_inkling and cfg.logits_mup_width_multiplier != 1.0) {
-        const inv_mup = mlx.mlx_array_new_float(1.0 / cfg.logits_mup_width_multiplier);
-        defer _ = mlx.mlx_array_free(inv_mup);
-        var mup_scaled = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&mup_scaled, final_normed, inv_mup, self.s));
-        _ = mlx.mlx_array_free(final_normed);
-        final_normed = mup_scaled;
-    }
 
     // Speculative-decoding capture: slice the post-final-norm hidden
     // at the LAST position only. Used by PLD verify-fusion and the
@@ -454,20 +312,6 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     }
     var logits = try self.lmHeadProject(final_normed);
     _ = mlx.mlx_array_free(final_normed);
-
-    // Inkling: slice the padded vocab rows off (201024 → 200058) so
-    // sampling never sees the padding logits.
-    if (is_inkling and cfg.unpadded_vocab_size > 0 and cfg.unpadded_vocab_size < cfg.vocab_size) {
-        const l_shape = mlx.getShape(logits);
-        const uv: c_int = @intCast(cfg.unpadded_vocab_size);
-        var sliced = mlx.mlx_array_new();
-        const start = [_]c_int{ 0, 0, 0 };
-        const stop = [_]c_int{ l_shape[0], l_shape[1], uv };
-        const strides = [_]c_int{ 1, 1, 1 };
-        try mlx.check(mlx.mlx_slice(&sliced, logits, &start, 3, &stop, 3, &strides, 3, self.s));
-        _ = mlx.mlx_array_free(logits);
-        logits = sliced;
-    }
 
     // Gemma 4: logit softcapping — tanh(logits / cap) * cap
     if (self.softcap_scalar != null) {

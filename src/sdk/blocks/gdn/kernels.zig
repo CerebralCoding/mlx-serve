@@ -2,6 +2,7 @@
 //! Owns gdnKernelSource, GdnOpsResult, gdnRecurOps, GDN_CUDA_HEADER, gdnCudaSource, getGdnCudaKernel, and 41 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const gdn_decode = @import("decode.zig");
@@ -46,7 +47,7 @@ const gdnGateChain = @import("gate.zig").gdnGateChain;
 //     accept, which keeps `state_out` via the normal flow), so the last row was
 //     a redundant global write + forced the engine's final state to be a slice
 //     VIEW pinning the whole [T,...] capture buffer across rounds.
-fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:0]const u8 {
+pub fn gdnKernelSource(comptime vectorized: bool, comptime capture_seq: bool) [:0]const u8 {
     const g_setup = if (vectorized)
         "auto g_ = g + (b_idx * T * Hv + hv_idx) * Dk;"
     else
@@ -413,7 +414,7 @@ var gdn_blocked_env_cached: ?bool = null;
 pub fn gdnBlockedEnabled() bool {
     if (gdn_blocked_override) |v| return v;
     if (gdn_blocked_env_cached) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_GDN_BLOCKED");
+    const raw = env.get(.MLX_SERVE_GDN_BLOCKED);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     gdn_blocked_env_cached = enabled;
     return enabled;
@@ -474,7 +475,7 @@ var gdn_block_t_cached: ?u32 = null;
 pub fn gdnBlockT() u32 {
     if (gdn_block_t_cached) |v| return v;
     const v: u32 = blk: {
-        const raw = std.c.getenv("MLX_SERVE_GDN_BLOCK_T") orelse break :blk 32;
+        const raw = env.get(.MLX_SERVE_GDN_BLOCK_T) orelse break :blk 32;
         const parsed = std.fmt.parseInt(u32, std.mem.sliceTo(raw, 0), 10) catch break :blk 32;
         for (GDN_BLOCKED_TBS) |cand| {
             if (cand == parsed) break :blk parsed;
@@ -558,7 +559,7 @@ pub fn gdnPipelinedFor(raw: ?[]const u8, model_type: []const u8, nax: bool) bool
 pub fn gdnPipelinedEnabled(model_type: []const u8) bool {
     if (gdn_pipelined_override) |v| return v;
     if (gdn_pipelined_env == null) {
-        const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_GDN_PIPELINED")) |r| std.mem.sliceTo(r, 0) else null;
+        const raw: ?[]const u8 = env.span(.MLX_SERVE_GDN_PIPELINED);
         gdn_pipelined_env = raw;
     }
     return gdnPipelinedFor(gdn_pipelined_env.?, model_type, naxAvailable());
@@ -1247,7 +1248,7 @@ fn gdnHostRef(
 const GdnRunOut = struct { y: mlx.mlx_array, state: mlx.mlx_array };
 
 /// Run the GDN recurrence on one route and return BOTH outputs.
-fn gdnRunYState(route: GdnRoute, tb_requested: u32, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dk: c_int, Dv: c_int, s: mlx.mlx_stream) !GdnRunOut {
+pub fn gdnRunYState(route: GdnRoute, tb_requested: u32, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, g: mlx.mlx_array, beta: mlx.mlx_array, state_in: mlx.mlx_array, B: c_int, T: c_int, Hk: c_int, Hv: c_int, Dk: c_int, Dv: c_int, s: mlx.mlx_stream) !GdnRunOut {
     // Mirror the production route exactly: dtypes read off the arrays, block
     // size clamped to what the staging budget allows at that width.
     const in_dtype = mlx.mlx_array_dtype(q);
@@ -1657,7 +1658,7 @@ test "GDN µbench: sequential kernel vs bare qmm at 27B shapes (attribution; MLX
     // kernel's sequential-over-T cost and (b) qmm row-count effects, at the
     // real Qwen3.6-27B geometry. Run with:
     //   MLX_SERVE_GDN_UBENCH=1 zig build test -Doptimize=ReleaseFast -Dtest-filter="GDN µbench"
-    if (std.c.getenv("MLX_SERVE_GDN_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MLX_SERVE_GDN_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();

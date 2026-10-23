@@ -7,7 +7,7 @@ const metrics_mod = @import("../../../host/metrics/metrics.zig");
 const model_registry_mod = @import("../../../host/registry/registry.zig");
 const log = @import("../../../host/log.zig");
 const io_util = @import("../../../sdk/util/io_util.zig");
-const dsv41_mod = @import("../../../plugins/deepseek_v41/deepseek_v41.zig");
+const plugin_driver = @import("../plugin/driver.zig");
 const ModelRegistry = model_registry_mod.ModelRegistry;
 const LoadedModel = model_registry_mod.LoadedModel;
 const testing = std.testing;
@@ -67,9 +67,7 @@ fn moduleStateBytes(sch: *Scheduler) u64 {
         const entry = entry_ptr.*;
         if (entry.state != .ready) continue;
         const t = entry.transformer orelse continue;
-        if (t.dsv41) |m| if (m.dec_state) |*st| {
-            bytes += dsv41_mod.stateBytes(st);
-        };
+        bytes += plugin_driver.stateBytes(t);
     }
     return bytes;
 }

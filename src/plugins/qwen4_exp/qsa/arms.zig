@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/qsa/arms, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns OneShotBits, QsaArm, qsaWidthBucket, QsaDeclineReason, QsaDecline, QsaArmCounts, and 6 more.
+//! Which QSA attention arm served each full-attention call (`QsaArm`, `QsaArmCounts`, decline reasons): the
+//! per-request `[qsa-arms]` meter.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -123,6 +123,12 @@ pub const QsaArmCounts = struct {
             1 => .verify_gather,
             else => .prefill_gather,
         });
+    }
+    pub fn add(self: *QsaArmCounts, o: QsaArmCounts) void {
+        self.mask +|= o.mask;
+        self.decode +|= o.decode;
+        self.verify +|= o.verify;
+        self.prefill +|= o.prefill;
     }
     pub fn total(self: QsaArmCounts) u32 {
         return self.mask +| self.decode +| self.verify +| self.prefill;

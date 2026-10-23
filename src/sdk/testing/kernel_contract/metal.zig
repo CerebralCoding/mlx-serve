@@ -24,9 +24,9 @@ pub const Out = struct { shape: [4]c_int = @splat(0), ndim: usize, dtype: mlx.ml
 pub const Geometry = struct {
     grid: [3]c_int,
     tg: [3]c_int,
-    outs: [4]Out = undefined,
+    outs: [6]Out = undefined,
     n_outs: usize = 0,
-    targs: [12]TArg = undefined,
+    targs: [20]TArg = undefined,
     n_targs: usize = 0,
     poison: f32 = std.math.nan(f32),
     /// Outputs (bit i: output i) this dispatch never writes by design: left out of the output bytes.
@@ -69,6 +69,8 @@ pub const Launch = struct {
     outputs: []const [*:0]const u8,
     source: [:0]const u8,
     header: [:0]const u8 = "",
+    /// MLX's `ensure_row_contiguous`: false passes a strided input as it is (the kernel reads its strides).
+    contiguous: bool = true,
     atomic_outputs: bool = false,
     /// Threadgroup bytes its source declares, at its largest instantiation.
     tg_bytes: u32,
@@ -99,6 +101,9 @@ pub const Launch = struct {
     }
 };
 
+/// What a bool output starts as: a byte that is neither false nor true.
+const BOOL_POISON: f32 = 0xaa;
+
 /// Guard bytes on each side of every input buffer, and their pattern.
 const GUARD = 64;
 const PATTERN: u8 = 0xa5;
@@ -120,6 +125,9 @@ fn store(dt: mlx.mlx_dtype, dst: []u8, v: f64) !void {
         .bfloat16 => std.mem.writeInt(u16, dst[0..2], spec.toBf16(@floatCast(v)), .little),
         .int32 => std.mem.writeInt(i32, dst[0..4], @intFromFloat(v), .little),
         .uint32 => std.mem.writeInt(u32, dst[0..4], @intFromFloat(v), .little),
+        .uint16 => std.mem.writeInt(u16, dst[0..2], @intFromFloat(v), .little),
+        .uint8 => dst[0] = @intFromFloat(v),
+        .int8 => dst[0] = @bitCast(@as(i8, @intFromFloat(v))),
         else => return error.UnsupportedInputDtype,
     }
 }
@@ -188,23 +196,33 @@ pub const Rig = struct {
     /// rig until the next reset. An input under 8 elements MLX passes by value, so it gets no guards.
     pub fn input(r: *Rig, dt: mlx.mlx_dtype, shape: []const c_int, values: []const f64) !mlx.mlx_array {
         const item = itemSize(dt);
-        const g = if (values.len < 8) 0 else GUARD / item;
-        const n = values.len + 2 * g;
+        const raw = try r.a.alloc(u8, values.len * item);
+        defer r.a.free(raw);
+        for (values, 0..) |v, i| try store(dt, raw[i * item ..][0..item], v);
+        return r.inputRaw(dt, shape, raw);
+    }
+
+    /// `input` from the elements' little-endian bytes (packed tables, 64-bit params no f64 holds).
+    pub fn inputRaw(r: *Rig, dt: mlx.mlx_dtype, shape: []const c_int, raw: []const u8) !mlx.mlx_array {
+        const item = itemSize(dt);
+        const len = raw.len / item;
+        const g = if (len < 8) 0 else GUARD / item;
+        const n = len + 2 * g;
         const host = try r.a.alloc(u8, n * item);
         defer r.a.free(host);
         @memset(host, PATTERN);
-        for (values, 0..) |v, i| try store(dt, host[(g + i) * item ..][0..item], v);
+        @memcpy(host[g * item ..][0..raw.len], raw);
         const parent = mlx.mlx_array_new_data(host.ptr, &[_]c_int{@intCast(n)}, 1, dt);
         errdefer _ = mlx.mlx_array_free(parent);
         try mlx.check(mlx.mlx_array_eval(parent));
         var flat = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(flat);
-        try mlx.check(mlx.mlx_slice(&flat, parent, &[_]c_int{@intCast(g)}, 1, &[_]c_int{@intCast(g + values.len)}, 1, &[_]c_int{1}, 1, r.stream()));
+        try mlx.check(mlx.mlx_slice(&flat, parent, &[_]c_int{@intCast(g)}, 1, &[_]c_int{@intCast(g + len)}, 1, &[_]c_int{1}, 1, r.stream()));
         var view = mlx.mlx_array_new();
         errdefer _ = mlx.mlx_array_free(view);
         try mlx.check(mlx.mlx_reshape(&view, flat, shape.ptr, shape.len, r.stream()));
         try mlx.check(mlx.mlx_array_eval(view));
-        try r.ins.append(r.a, .{ .parent = parent, .view = view, .len = values.len });
+        try r.ins.append(r.a, .{ .parent = parent, .view = view, .len = len });
         return view;
     }
 
@@ -224,7 +242,7 @@ pub const Rig = struct {
         defer _ = mlx.mlx_vector_string_free(in_vec);
         const out_vec = mlx.mlx_vector_string_new_data(l.outputs.ptr, l.outputs.len);
         defer _ = mlx.mlx_vector_string_free(out_vec);
-        const k = mlx.mlx_fast_metal_kernel_new(name.ptr, in_vec, out_vec, l.source.ptr, l.header.ptr, true, l.atomic_outputs);
+        const k = mlx.mlx_fast_metal_kernel_new(name.ptr, in_vec, out_vec, l.source.ptr, l.header.ptr, l.contiguous, l.atomic_outputs);
         if (k.ctx == null) return error.MetalKernelCompileFailed;
         try r.kernels.append(r.a, .{ .l = l, .k = k });
         return k;
@@ -236,7 +254,13 @@ pub const Rig = struct {
         const k = try r.kernelFor(l);
         const cfg = mlx.mlx_fast_metal_kernel_config_new();
         defer _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-        for (g.outs[0..g.n_outs]) |o| try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &o.shape, o.ndim, o.dtype));
+        // A bool output is bound as bytes so its poison can be neither 0 nor 1 (`spec.read` then says unwritten).
+        var bools: usize = 0;
+        for (g.outs[0..g.n_outs]) |o| {
+            if (o.dtype == .bool_) bools += 1;
+            try mlx.check(mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &o.shape, o.ndim, if (o.dtype == .bool_) .uint8 else o.dtype));
+        }
+        if (bools != 0 and bools != g.n_outs) return error.MixedBoolOutputs;
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_grid(cfg, g.grid[0], g.grid[1], g.grid[2]));
         try mlx.check(mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, g.tg[0], g.tg[1], g.tg[2]));
         for (g.targs[0..g.n_targs]) |t| try mlx.check(switch (t.v) {
@@ -244,7 +268,7 @@ pub const Rig = struct {
             .flag => |v| mlx.mlx_fast_metal_kernel_config_add_template_arg_bool(cfg, t.name, v),
             .dtype => |v| mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, t.name, v),
         });
-        try mlx.check(mlx_fast_metal_kernel_config_set_init_value(cfg, g.poison));
+        try mlx.check(mlx_fast_metal_kernel_config_set_init_value(cfg, if (bools > 0) BOOL_POISON else g.poison));
         if (r.capture != null) try mlx.check(mlx.mlx_fast_metal_kernel_config_set_verbose(cfg, true));
         const v = mlx.mlx_vector_array_new_data(args.ptr, args.len);
         defer _ = mlx.mlx_vector_array_free(v);

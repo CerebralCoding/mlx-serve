@@ -1,6 +1,7 @@
 //! The conformance suite: what every plugin table holds, run on each registered plugin and template in `zig build
-//! test` (from the generated registry). MLX-free by construction for claims and parse (the build checks each
-//! `config.zig`'s imports); `expectExactness` runs a plugin's declared exactness contracts on an engine serving it.
+//! test` (from the generated registry) and on an outside plugin's dylib (`mlx-serve plugin check`, a `Subject` from
+//! its manifest). MLX-free by construction for claims and parse (the build checks each `config.zig`'s imports);
+//! `expectExactness` runs a plugin's declared exactness contracts on an engine serving it.
 
 const std = @import("std");
 const common = @import("../../abi/common.zig");
@@ -11,7 +12,10 @@ const engine_abi = @import("../../abi/engine.zig");
 const exactness = @import("../../abi/exactness_test.zig");
 const sdk_plugin = @import("../plugin.zig");
 const fixture = @import("fixture.zig");
+const test_cache = @import("cache_ops.zig");
 const mlx = @import("../../mlx/ffi.zig");
+const Resident = @import("../weights/resident.zig").Resident;
+const loadWeights = @import("../../engines/mlx/model.zig").loadWeights;
 
 const testing = std.testing;
 const Allocator = std.mem.Allocator;
@@ -27,80 +31,128 @@ pub fn expectRegistry(comptime R: type) !void {
     try expectOneClaimant(&R.entries, &R.model_configs);
 }
 
+/// A plugin as the suite sees it: a built-in from its root (`subjectOf`) or an outside one from its dylib's manifest.
+pub const Subject = struct {
+    name: []const u8,
+    /// The `model_type`s it declares.
+    claims: []const []const u8 = &.{},
+    table: Table,
+    fixture: fixture.Fixture,
+
+    pub const Table = union(sdk_plugin.Kind) {
+        model: *const model_abi.ModelTable,
+        media: *const media_abi.MediaTable,
+        quant: *const quant_abi.QuantTable,
+    };
+};
+
+/// Plugin root `M` as a subject; its fixture is built in `a`.
+pub fn subjectOf(comptime M: type, a: Allocator) !Subject {
+    return .{
+        .name = M.plugin.name,
+        .claims = M.plugin.claims,
+        .table = @unionInit(Subject.Table, @tagName(M.plugin.kind), &M.table),
+        .fixture = try M.conformanceFixture(a),
+    };
+}
+
 pub fn expectPlugin(comptime M: type) !void {
-    switch (comptime M.plugin.kind) {
-        .model => try expectModel(M),
-        .media => try expectMedia(M),
-        .quant => try expectQuant(M),
+    if (@import("media_pack.zig").ramShort(M)) return;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    try expectSubject(testing.io, arena.allocator(), try subjectOf(M, arena.allocator()));
+}
+
+/// The suite on one subject; `a` should be an arena (the suite frees nothing it allocates in it).
+pub fn expectSubject(io: std.Io, a: Allocator, s: Subject) !void {
+    switch (s.table) {
+        .model => |t| try expectModel(io, a, s, t),
+        .media => |t| try expectMedia(io, a, s, t),
+        .quant => |t| try expectQuant(s, t),
     }
 }
 
-fn fail(comptime M: type, comptime what: []const u8, why: Str) error{Conformance} {
-    std.debug.print("conformance: plugin {s}: " ++ what ++ " ({s})\n", .{ M.plugin.name, why.slice() });
+fn fail(name: []const u8, comptime what: []const u8, why: Str) error{Conformance} {
+    std.debug.print("conformance: plugin {s}: " ++ what ++ " ({s})\n", .{ name, why.slice() });
     return error.Conformance;
 }
 
-fn expectOk(comptime M: type, comptime what: []const u8, v: Verdict) !void {
-    if (!v.isOk()) return fail(M, what, v.why);
+fn expectOk(name: []const u8, comptime what: []const u8, v: Verdict) !void {
+    if (!v.isOk()) return fail(name, what, v.why);
 }
 
-fn expectHead(comptime M: type, comptime T: type, version: u32) !void {
-    const t = &M.table;
-    if (t.size != @sizeOf(T) or t.version != version) return fail(M, "table size or version is not this ABI's", .{});
-    if (!std.mem.eql(u8, t.name.slice(), M.plugin.name)) return fail(M, "table name differs from its declaration", t.name);
+fn expectHead(s: Subject, comptime T: type, version: u32, t: *const T) !void {
+    if (t.size != @sizeOf(T) or t.version != version) return fail(s.name, "table size or version is not this ABI's", .{});
+    if (!std.mem.eql(u8, t.name.slice(), s.name)) return fail(s.name, "table name differs from its declaration", t.name);
 }
 
-/// A plugin's fixture staged on disk (MLX loads by path) and as a `PackDir` over the same files.
+/// A plugin's fixture staged on disk under `$TMPDIR` (MLX loads by path) and as a `PackDir` over the same files.
 const Staged = struct {
-    tmp: testing.TmpDir,
+    io: std.Io,
     path: []const u8,
     dir: common.PackDir,
 
-    fn init(a: Allocator, fx: fixture.Fixture) !Staged {
-        var tmp = testing.tmpDir(.{});
-        errdefer tmp.cleanup();
+    fn init(io: std.Io, a: Allocator, fx: fixture.Fixture) !Staged {
+        var rnd: [8]u8 = undefined;
+        io.random(&rnd);
+        const base = std.mem.trimEnd(u8, if (std.c.getenv("TMPDIR")) |t| std.mem.span(t) else "/tmp", "/");
+        const path = try std.fmt.allocPrint(a, "{s}/mlx-serve-conformance-{x}", .{ base, std.mem.readInt(u64, &rnd, .little) });
+        var dir = try std.Io.Dir.cwd().createDirPathOpen(io, path, .{});
+        defer dir.close(io);
+        errdefer std.Io.Dir.cwd().deleteTree(io, path) catch {};
         for (fx.files) |f| {
-            if (std.fs.path.dirname(f.name)) |d| try tmp.dir.createDirPath(testing.io, d);
-            try tmp.dir.writeFile(testing.io, .{ .sub_path = f.name, .data = f.bytes });
+            if (std.fs.path.dirname(f.name)) |d| try dir.createDirPath(io, d);
+            try dir.writeFile(io, .{ .sub_path = f.name, .data = f.bytes });
         }
-        const buf = try a.alloc(u8, std.fs.max_path_bytes);
         const mem = try a.create(fixture.MemDir);
         mem.* = .{ .files = fx.files };
-        return .{ .tmp = tmp, .path = buf[0..try tmp.dir.realPath(testing.io, buf)], .dir = mem.packDir() };
+        return .{ .io = io, .path = path, .dir = mem.packDir() };
     }
     fn deinit(self: *Staged) void {
-        self.tmp.cleanup();
+        std.Io.Dir.cwd().deleteTree(self.io, self.path) catch {};
     }
 };
 
-/// A model plugin's fixture, parsed (full) and loaded on the CPU stream. For plugin tests and the suite.
-pub fn Pack(comptime M: type) type {
-    return struct {
-        staged: Staged,
-        stream: mlx.mlx_stream,
-        parsed: model_abi.Parsed = .{},
-        model: *anyopaque = undefined,
+/// A model plugin's fixture, parsed (full) and loaded on the CPU stream. For the suite and plugin tests (`Pack`).
+pub const Loaded = struct {
+    name: []const u8,
+    table: *const model_abi.ModelTable,
+    staged: Staged,
+    stream: mlx.mlx_stream,
+    parsed: model_abi.Parsed = .{},
+    model: *anyopaque = undefined,
 
-        pub fn open(a: Allocator) !@This() {
-            const fx = try M.conformanceFixture(a);
-            const cfg = fx.file("config.json") orelse return error.FixtureWithoutConfig;
-            var self: @This() = .{ .staged = try Staged.init(a, fx), .stream = mlx.mlx_default_cpu_stream_new() };
-            errdefer {
-                _ = mlx.mlx_stream_free(self.stream);
-                self.staged.deinit();
-            }
-            try expectOk(M, "parse of its fixture", M.table.parse(&self.staged.dir, .of(cfg), .{}, null, false, &self.parsed));
-            errdefer M.table.free_parsed(&self.parsed);
-            var why: Verdict = .{};
-            self.model = M.table.load(&.{ .model_dir = .of(self.staged.path), .dir = &self.staged.dir, .parsed = &self.parsed, .stream = .{ .ctx = self.stream.ctx } }, &why) orelse
-                return fail(M, "load of its fixture", why.why);
-            return self;
-        }
-        pub fn close(self: *@This()) void {
-            M.table.unload(self.model);
-            M.table.free_parsed(&self.parsed);
+    pub fn open(io: std.Io, a: Allocator, name: []const u8, table: *const model_abi.ModelTable, fx: fixture.Fixture) !Loaded {
+        const cfg = fx.file("config.json") orelse return error.FixtureWithoutConfig;
+        var self: Loaded = .{ .name = name, .table = table, .staged = try Staged.init(io, a, fx), .stream = mlx.mlx_default_cpu_stream_new() };
+        errdefer {
             _ = mlx.mlx_stream_free(self.stream);
             self.staged.deinit();
+        }
+        try expectOk(name, "parse of its fixture", table.parse(&self.staged.dir, .of(cfg), .{}, null, false, &self.parsed));
+        errdefer table.free_parsed(&self.parsed);
+        // The engine's loader reads the fixture's tensors, as it does for a served pack.
+        var weights = Resident.adopt(try loadWeights(io, std.heap.c_allocator, self.staged.path));
+        defer weights.deinit();
+        const src = weights.source();
+        var why: Verdict = .{};
+        self.model = table.load(&.{ .model_dir = .of(self.staged.path), .dir = &self.staged.dir, .parsed = &self.parsed, .stream = .{ .ctx = self.stream.ctx }, .weights = &src }, &why) orelse
+            return fail(name, "load of its fixture", why.why);
+        return self;
+    }
+    pub fn close(self: *Loaded) void {
+        self.table.unload(self.model);
+        self.table.free_parsed(&self.parsed);
+        _ = mlx.mlx_stream_free(self.stream);
+        self.staged.deinit();
+    }
+};
+
+/// Plugin root `M`'s fixture, loaded (`Loaded`).
+pub fn Pack(comptime M: type) type {
+    return struct {
+        pub fn open(a: Allocator) !Loaded {
+            return Loaded.open(testing.io, a, M.plugin.name, &M.table, try M.conformanceFixture(a));
         }
     };
 }
@@ -122,13 +174,10 @@ pub fn consumeF32(a: Allocator, arr: Array) ![]f32 {
 
 // ── model ──
 
-fn expectModel(comptime M: type) !void {
-    const t = &M.table;
-    try expectHead(M, model_abi.ModelTable, model_abi.version);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const fx = try M.conformanceFixture(a);
+fn expectModel(io: std.Io, a: Allocator, s: Subject, t: *const model_abi.ModelTable) !void {
+    const name = s.name;
+    try expectHead(s, model_abi.ModelTable, model_abi.version, t);
+    const fx = s.fixture;
     const cfg = fx.file("config.json") orelse return error.FixtureWithoutConfig;
     const mem: fixture.MemDir = .{ .files = fx.files };
     const dir = mem.packDir();
@@ -136,31 +185,31 @@ fn expectModel(comptime M: type) !void {
     const empty = none.packDir();
 
     // Claims: its fixture and every declared type, never a stranger.
-    if (t.claims(.of(try sdk_plugin.modelTypeOf(a, cfg)), .of(cfg), &dir) == .no) return fail(M, "does not claim its own fixture", .{});
-    for (M.plugin.claims) |mt| if (t.claims(.of(mt), .of(cfg), &dir) == .no) return fail(M, "does not claim a declared model_type", .of(mt));
-    if (t.claims(.of("conformance_stranger"), .of("{}"), &empty) != .no) return fail(M, "claims a stranger's pack", .{});
+    if (t.claims(.of(try sdk_plugin.modelTypeOf(a, cfg)), .of(cfg), &dir) == .no) return fail(name, "does not claim its own fixture", .{});
+    for (s.claims) |mt| if (t.claims(.of(mt), .of(cfg), &dir) == .no) return fail(name, "does not claim a declared model_type", .of(mt));
+    if (t.claims(.of("conformance_stranger"), .of("{}"), &empty) != .no) return fail(name, "claims a stranger's pack", .{});
 
     // Stub parse (discovery): sized structs, a sane shell; a broken config is refused by name with nothing to free.
     var stub: model_abi.Parsed = .{};
-    try expectOk(M, "stub parse of its fixture", t.parse(&dir, .of(cfg), .{}, null, true, &stub));
+    try expectOk(name, "stub parse of its fixture", t.parse(&dir, .of(cfg), .{}, null, true, &stub));
     defer t.free_parsed(&stub);
-    try expectParsed(M, &stub);
+    try expectParsed(name, &stub);
     var bad: model_abi.Parsed = .{};
     const v = t.parse(&dir, .of("{"), .{}, null, true, &bad);
-    if (v.isOk() or v.why.len == 0 or bad.private != null) return fail(M, "a broken config.json is not refused by name", .{});
+    if (v.isOk() or v.why.len == 0 or bad.private != null) return fail(name, "a broken config.json is not refused by name", .{});
 
-    var pack = try Pack(M).open(a);
+    var pack = try Loaded.open(io, a, name, t, fx);
     defer pack.close();
-    try expectParsed(M, &pack.parsed);
+    try expectParsed(name, &pack.parsed);
 
     // Cache layout: one sized entry per layer; it decides whether the bill may price KV.
     const n_layers = pack.parsed.shell.num_hidden_layers;
     const layers = try a.alloc(model_abi.LayerCache, n_layers + 1);
     const n = if (t.cache.layout) |f| f(&pack.parsed, null, layers.ptr, @intCast(layers.len)) else n_layers;
-    if (n != n_layers) return fail(M, "cache layout length is not num_hidden_layers", .{});
+    if (n != n_layers) return fail(name, "cache layout length is not num_hidden_layers", .{});
     var attention: u32 = if (t.cache.layout == null) n else 0;
     if (t.cache.layout != null) for (layers[0..n]) |l| {
-        if (l.size != @sizeOf(model_abi.LayerCache)) return fail(M, "a cache layout entry has another size", .{});
+        if (l.size != @sizeOf(model_abi.LayerCache)) return fail(name, "a cache layout entry has another size", .{});
         if (l.kind == .full or l.kind == .sliding) attention += 1;
     };
 
@@ -170,25 +219,27 @@ fn expectModel(comptime M: type) !void {
     const shape: model_abi.Shape = .{ .context = 4096 };
     t.bill(&pack.parsed, &shape, &b1);
     t.bill(&pack.parsed, &shape, &b2);
-    if (b1.size != @sizeOf(model_abi.Bill)) return fail(M, "bill has another size", .{});
-    inline for (@typeInfo(model_abi.Bill).@"struct".field_names) |f| if (@field(b1, f) != @field(b2, f)) return fail(M, "bill is not deterministic: " ++ f, .{});
-    if (attention == 0 and b1.kv_per_token != 0) return fail(M, "bills KV with no attention layer", .{});
+    if (b1.size != @sizeOf(model_abi.Bill)) return fail(name, "bill has another size", .{});
+    inline for (@typeInfo(model_abi.Bill).@"struct".field_names) |f| if (@field(b1, f) != @field(b2, f)) return fail(name, "bill is not deterministic: " ++ f, .{});
+    if (attention == 0 and b1.kv_per_token != 0) return fail(name, "bills KV with no attention layer", .{});
 
-    inline for (@typeInfo(model_abi.Mode).@"enum".field_names) |f| try expectForward(M, a, &pack, @field(model_abi.Mode, f));
+    inline for (@typeInfo(model_abi.Mode).@"enum".field_names) |f| try expectForward(a, &pack, @field(model_abi.Mode, f));
 }
 
-fn expectParsed(comptime M: type, p: *const model_abi.Parsed) !void {
-    inline for (.{ "shell", "chat", "tokenizer", "cache", "spec", "placeholder_ids", "embed", "weights" }) |name| {
-        if (@field(p, name).size != @sizeOf(@TypeOf(@field(p, name)))) return fail(M, "parsed " ++ name ++ " has another size", .{});
+fn expectParsed(name: []const u8, p: *const model_abi.Parsed) !void {
+    inline for (.{ "shell", "chat", "tokenizer", "cache", "spec", "placeholder_ids", "embed", "weights" }) |field| {
+        if (@field(p, field).size != @sizeOf(@TypeOf(@field(p, field)))) return fail(name, "parsed " ++ field ++ " has another size", .{});
     }
-    if (p.size != @sizeOf(model_abi.Parsed)) return fail(M, "parsed has another size", .{});
+    if (p.size != @sizeOf(model_abi.Parsed)) return fail(name, "parsed has another size", .{});
     const s = p.shell;
-    if (s.vocab_size == 0 or s.hidden_size == 0 or s.num_hidden_layers == 0) return fail(M, "shell lacks its dimensions", .{});
-    if (s.eos_count > model_abi.max_eos or p.tokenizer.extra_eos_count > model_abi.max_eos) return fail(M, "an eos count past its array", .{});
+    if (s.vocab_size == 0 or s.hidden_size == 0 or s.num_hidden_layers == 0) return fail(name, "shell lacks its dimensions", .{});
+    if (s.eos_count > model_abi.max_eos or p.tokenizer.extra_eos_count > model_abi.max_eos) return fail(name, "an eos count past its array", .{});
 }
 
-/// One forward per mode: a declared mode returns [R, vocab] finite logits, an undeclared one is refused `unsupported`.
-fn expectForward(comptime M: type, a: Allocator, pack: *Pack(M), mode: model_abi.Mode) !void {
+/// One forward per mode: a declared mode returns [R, vocab] finite logits (an encoder: its hidden rows), an
+/// undeclared one is refused `unsupported`.
+fn expectForward(a: Allocator, pack: *Loaded, mode: model_abi.Mode) !void {
+    const name = pack.name;
     const vocab = pack.parsed.shell.vocab_size;
     const slots: u32, const rows: u32, const logits: model_abi.Logits = switch (mode) {
         .prefill => .{ 1, 4, .last_row },
@@ -203,23 +254,45 @@ fn expectForward(comptime M: type, a: Allocator, pack: *Pack(M), mode: model_abi
     for (slot_ids, 0..) |*s, i| s.* = @intCast(i);
     const positions = try a.alloc(u32, slots);
     @memset(positions, 0);
+    // Each slot reads and writes a plain cache through `cache_ops`, as the engine's slots do.
+    const caches = try a.alloc(test_cache.TestCache, slots);
+    const handles = try a.alloc(model_abi.Handle, slots);
+    for (caches, handles) |*c, *h| {
+        c.* = try test_cache.TestCache.init(a, pack.parsed.shell.num_hidden_layers);
+        h.* = c.handle();
+    }
+    defer for (caches) |*c| c.deinit();
     var out: model_abi.ForwardOut = .{};
-    const v = M.table.forward(pack.model, &.{ .mode = mode, .logits = logits, .rows = rows, .tokens = .of(tokens), .slots = .of(slot_ids), .positions = .of(positions) }, &out);
+    const v = pack.table.forward(pack.model, &.{ .mode = mode, .logits = logits, .rows = rows, .tokens = .of(tokens), .slots = .of(slot_ids), .positions = .of(positions), .caches = .of(handles), .cache_ops = &test_cache.ops }, &out);
     if (!model_abi.declaresMode(pack.parsed.caps, mode)) {
-        if (v.code != .unsupported or out.logits.ctx != null) return fail(M, "an undeclared forward mode is not refused unsupported", .{});
+        if (v.code != .unsupported or out.logits.ctx != null) return fail(name, "an undeclared forward mode is not refused unsupported", .{});
         return;
     }
-    try expectOk(M, "forward in a declared mode", v);
+    try expectOk(name, "forward in a declared mode", v);
+    if (pack.parsed.caps.embed) return expectHidden(name, a, out, slots, rows, pack.parsed.shell.hidden_size);
     if (out.hidden.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.hidden.ctx });
     const x: mlx.mlx_array = .{ .ctx = out.logits.ctx };
-    if (x.ctx == null) return fail(M, "forward returned no logits", .{});
+    if (x.ctx == null) return fail(name, "forward returned no logits", .{});
     const want_rows = if (logits == .last_row) slots else slots * rows;
     const shape = mlx.mlx_array_shape(x);
     if (mlx.mlx_array_ndim(x) != 2 or shape[0] != want_rows or shape[1] != vocab) {
         _ = mlx.mlx_array_free(x);
-        return fail(M, "logits are not [rows, vocab]", .of(@tagName(mode)));
+        return fail(name, "logits are not [rows, vocab]", .of(@tagName(mode)));
     }
-    for (try consumeF32(a, out.logits)) |l| if (!std.math.isFinite(l)) return fail(M, "non-finite logits", .of(@tagName(mode)));
+    for (try consumeF32(a, out.logits)) |l| if (!std.math.isFinite(l)) return fail(name, "non-finite logits", .of(@tagName(mode)));
+}
+
+/// An encoder's prefill: finite hidden rows `[slots, rows, hidden]` (logits, if any, are freed unread).
+fn expectHidden(name: []const u8, a: Allocator, out: model_abi.ForwardOut, slots: u32, rows: u32, hidden: u32) !void {
+    if (out.logits.ctx != null) _ = mlx.mlx_array_free(.{ .ctx = out.logits.ctx });
+    const x: mlx.mlx_array = .{ .ctx = out.hidden.ctx };
+    if (x.ctx == null) return fail(name, "an encoder forward returned no hidden rows", .{});
+    const shape = mlx.mlx_array_shape(x);
+    if (mlx.mlx_array_ndim(x) != 3 or shape[0] != slots or shape[1] != rows or shape[2] != hidden) {
+        _ = mlx.mlx_array_free(x);
+        return fail(name, "hidden rows are not [slots, rows, hidden]", .{});
+    }
+    for (try consumeF32(a, out.hidden)) |h| if (!std.math.isFinite(h)) return fail(name, "non-finite hidden rows", .{});
 }
 
 /// The exactness contracts a plugin declares in its caps (drafted == plain, resumed == cold, concurrent == solo), on
@@ -251,65 +324,76 @@ const Recorder = struct {
     }
 };
 
-fn expectMedia(comptime M: type) !void {
-    const t = &M.table;
-    try expectHead(M, media_abi.MediaTable, media_abi.version);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const a = arena.allocator();
-    const fx = try M.conformanceFixture(a);
-    var staged = try Staged.init(a, fx);
+fn expectMedia(io: std.Io, a: Allocator, subject: Subject, t: *const media_abi.MediaTable) !void {
+    const name = subject.name;
+    try expectHead(subject, media_abi.MediaTable, media_abi.version, t);
+    const fx = subject.fixture;
+    var staged = try Staged.init(io, a, fx);
     defer staged.deinit();
     const dir = &staged.dir;
     const none: fixture.MemDir = .{ .files = &.{} };
     const empty = none.packDir();
 
     const mt = if (fx.file("config.json")) |cfg| try sdk_plugin.modelTypeOf(a, cfg) else "";
-    if (t.claims(.of(mt), dir) == .no) return fail(M, "does not claim its own fixture", .{});
-    if (t.claims(.of("conformance_stranger"), &empty) != .no) return fail(M, "claims a stranger's pack", .{});
-    if (t.required_file.len == 0 or !dir.has(t.required_file.slice())) return fail(M, "its fixture lacks the required file", t.required_file);
+    if (t.claims(.of(mt), dir) == .no) return fail(name, "does not claim its own fixture", .{});
+    if (t.claims(.of("conformance_stranger"), &empty) != .no) return fail(name, "claims a stranger's pack", .{});
+    if (t.required_file.len != 0 and !dir.has(t.required_file.slice())) return fail(name, "its fixture lacks the required file", t.required_file);
 
     var caps: media_abi.MediaCaps = .{};
     t.caps(dir, &caps);
-    if (caps.size != @sizeOf(media_abi.MediaCaps) or caps.routes.size != @sizeOf(media_abi.Routes)) return fail(M, "caps have another size", .{});
+    if (caps.size != @sizeOf(media_abi.MediaCaps) or caps.routes.size != @sizeOf(media_abi.Routes)) return fail(name, "caps have another size", .{});
     const machine: media_abi.Machine = .{};
-    if (t.bill_load(dir, &machine) == 0) return fail(M, "bills a load at zero bytes", .{});
-    if (t.bill_request(dir, &machine, .of(fx.body)) != t.bill_request(dir, &machine, .of(fx.body))) return fail(M, "request bill is not deterministic", .{});
+    if (t.bill_load(dir, &machine) == 0) return fail(name, "bills a load at zero bytes", .{});
+    if (t.bill_request(dir, &machine, .of(fx.body)) != t.bill_request(dir, &machine, .of(fx.body))) return fail(name, "request bill is not deterministic", .{});
 
     const s = mlx.mlx_default_cpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     var why: Verdict = .{};
-    const e = t.load(&.{ .model_dir = .of(staged.path), .dir = dir, .stream = .{ .ctx = s.ctx } }, &why) orelse return fail(M, "load of its fixture", why.why);
+    const e = t.load(&.{ .model_dir = .of(staged.path), .dir = dir, .stream = .{ .ctx = s.ctx } }, &why) orelse return fail(name, "load of its fixture", why.why);
     defer t.unload(e);
-    if (t.set_loras) |f| try expectOk(M, "clearing the LoRA stack", f(e, .{}));
+    if (t.set_loras) |f| try expectOk(name, "clearing the LoRA stack", f(e, .{}));
 
-    const req: media_abi.Request = .{ .body = .of(fx.body) };
+    var msg_buf: [512]u8 = undefined;
+    var msg_len: usize = 0;
+    const inputs = try a.alloc(Str, fx.inputs.len);
+    for (inputs, fx.inputs) |*i, x| i.* = .of(x);
+    const req: media_abi.Request = .{ .body = .of(fx.body), .inputs = .of(inputs), .model_id = .of(name), .message = .{ .ptr = &msg_buf, .cap = msg_buf.len, .len = &msg_len }, .dir = dir };
     var rec: Recorder = .{};
-    try expectOk(M, "a job on its fixture", t.step(e, &req, &rec.progress()));
-    if (rec.reports == 0 or rec.boundaries == 0) return fail(M, "a job never reports progress or yields at a boundary", .{});
+    try expectOk(name, "a job on its fixture", t.step(e, &req, &rec.progress()));
+    if (rec.reports == 0 or rec.boundaries == 0) return fail(name, "a job never reports progress or yields at a boundary", .{});
     var bytes: Str = .{};
-    try expectOk(M, "encode", t.encode(e, &bytes));
-    if (bytes.len == 0) return fail(M, "encode returned no bytes", .{});
+    try expectOk(name, "encode", t.encode(e, &bytes));
+    if (bytes.len == 0) return fail(name, "encode returned no bytes", .{});
+
+    if (t.step_batch) |batch| {
+        const reqs = [_]media_abi.Request{ req, req };
+        var out: [2]Verdict = undefined;
+        var results: [2]Str = undefined;
+        var brec: Recorder = .{};
+        batch(e, .of(&reqs), &out, &results, &brec.progress());
+        for (out, results) |bv, r| {
+            try expectOk(name, "a merged job on its fixture", bv);
+            if (r.len == 0) return fail(name, "a merged job returned no bytes", .{});
+        }
+    }
 
     var gone: Recorder = .{ .leave = true };
     const v = t.step(e, &req, &gone.progress());
-    if (v.isOk() or v.why.len == 0) return fail(M, "a job whose client left is not stopped by name", .{});
+    if (v.isOk() or v.why.len == 0) return fail(name, "a job whose client left is not stopped by name", .{});
 }
 
 // ── quant ──
 
-fn expectQuant(comptime M: type) !void {
-    const t = &M.table;
-    try expectHead(M, quant_abi.QuantTable, quant_abi.version);
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
-    const fx = try M.conformanceFixture(arena.allocator());
+fn expectQuant(s: Subject, t: *const quant_abi.QuantTable) !void {
+    const name = s.name;
+    try expectHead(s, quant_abi.QuantTable, quant_abi.version, t);
+    const fx = s.fixture;
     const mem: fixture.MemDir = .{ .files = fx.files };
     const dir = mem.packDir();
     const config = fx.file("config.json") orelse "{}";
-    if (t.claims(.of(fx.block), .of(config)) == .no) return fail(M, "does not claim its own block", .of(fx.block));
-    if (t.claims(.of("{}"), .of("{}")) != .no) return fail(M, "claims an empty block", .{});
-    try expectOk(M, "validate of its own block", t.validate(.of(fx.block), .of(config), &dir));
+    if (t.claims(.of(fx.block), .of(config)) == .no) return fail(name, "does not claim its own block", .of(fx.block));
+    if (t.claims(.of("{}"), .of("{}")) != .no) return fail(name, "claims an empty block", .{});
+    try expectOk(name, "validate of its own block", t.validate(.of(fx.block), .of(config), &dir));
 }
 
 // ── claims across plugins ──

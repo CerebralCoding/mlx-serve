@@ -2,8 +2,8 @@
 //! (YaRN-scaled where the pack asks, M-RoPE rows on an image chunk), causal attention over the slot's KV cache and a
 //! sigmoid output gate. Decode rows take the fused norm+RoPE kernels (hd 128 and 256), prompt chunks the hd-256
 //! prefill kernel; batched rows rope each slot at its own position and read per slot or padded.
-//! copied_from: sdk/blocks/attention/gated_full.zig (`gatedFullAttnProjected` without the qwen4 QSA, spec-tree,
-//! row-exact and grouped-verify arms), sdk/blocks/attention/proj.zig (`attnProj`), sdk/blocks/rope/mrope.zig
+//! copied_from: sdk/blocks/attention/gated_full.zig (`gatedFullAttnProjected` without the qwen4 QSA, spec-tree
+//! and grouped-verify arms), sdk/blocks/attention/proj.zig (`attnProj`), sdk/blocks/rope/mrope.zig
 //! (`applyMrope`), sdk/blocks/rope/yarn.zig (`yarnScaleQK`).
 
 const mlx = @import("../../../mlx/ffi.zig");
@@ -13,7 +13,8 @@ const abi = @import("../../../abi/plugin.zig");
 const block = @import("../block.zig");
 const kv = @import("../kv.zig");
 const linear = @import("linear.zig");
-const attention = @import("attention.zig");
+const row_exact = @import("row_exact.zig");
+const slot_reads = @import("slot_reads.zig");
 const qk_rope = @import("qk_rope.zig");
 const attn256 = @import("../../blocks/attention/attn256.zig");
 const sdpa = @import("../../blocks/attention/sdpa.zig");
@@ -25,7 +26,6 @@ const qk_norm_rope = @import("../../blocks/rope/qk_norm_rope.zig");
 const residual_norm = @import("../../blocks/norms/residual_norm.zig");
 const decode_fused = @import("../../blocks/gdn/decode_fused.zig");
 const DenseKVView = @import("../../blocks/attention/kv_view.zig").DenseKVView;
-const FUSED_ROWS_MAX_M = @import("../../blocks/linear/fused_rows.zig").FUSED_ROWS_MAX_M;
 
 const Array = ops.Array;
 const Graph = ops.Graph;
@@ -42,9 +42,14 @@ pub const Proj = struct {
     dq: Linear = .{},
 
     pub fn forward(p: *const Proj, g: *Graph, x: Array, decode: bool) !Array {
+        return p.onLane(.off, g, x, decode);
+    }
+
+    /// `forward`, the projection on the row-exact `lane` (the side copy keeps its own kernel, as the engine's).
+    pub fn onLane(p: *const Proj, lane: row_exact.Lane, g: *Graph, x: Array, decode: bool) !Array {
         if (decode and p.dq.w.ctx != null and (p.lin.s.ctx == null or dq.attnDqRequantEnabled()) and dq.decodeAttnQuantEnabled())
             return p.dq.forward(g, x);
-        return p.lin.forward(g, x);
+        return row_exact.linear(lane, g, &p.lin, x);
     }
 };
 
@@ -128,13 +133,13 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
     const rd = geo.rope_dims;
     const decode_shape = b == 1 and s == 1;
 
-    const joined = w.qkv.built() and b * s <= FUSED_ROWS_MAX_M;
-    const all: Array = if (joined) try w.qkv.lin.forward(g, x) else .{};
+    const joined = w.qkv.built() and row_exact.groupServes(c.row_exact, b * s);
+    const all: Array = if (joined) try row_exact.linear(c.row_exact, g, &w.qkv.lin, x) else .{};
     if (joined and !decode_fused.attn_qkv_joined_engaged) {
         decode_fused.attn_qkv_joined_engaged = true;
         log.info("[attn] joined q|k|v engaged: rows={d}\n", .{b * s});
     }
-    const q_proj = if (joined) try w.qkv.part(g, all, 0) else try w.q.forward(g, x, decode_shape);
+    const q_proj = if (joined) try w.qkv.part(g, all, 0) else try w.q.onLane(c.row_exact, g, x, decode_shape);
     var queries: Array = undefined;
     var gate: Array = .{ .ctx = null };
     if (geo.output_gate) {
@@ -145,8 +150,8 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
     } else {
         queries = try g.reshape(q_proj, &.{ b, s, h, hd });
     }
-    const k_proj = if (joined) try w.qkv.part(g, all, 1) else try w.k.forward(g, x, decode_shape);
-    const v_proj = if (joined) try w.qkv.part(g, all, 2) else try w.v.forward(g, x, decode_shape);
+    const k_proj = if (joined) try w.qkv.part(g, all, 1) else try w.k.onLane(c.row_exact, g, x, decode_shape);
+    const v_proj = if (joined) try w.qkv.part(g, all, 2) else try w.v.onLane(c.row_exact, g, x, decode_shape);
     const k_r = try g.reshape(k_proj, &.{ b, s, kvh, hd });
     const v_r = try g.reshape(v_proj, &.{ b, s, kvh, hd });
     const v_t = try g.transpose(v_r, &perm);
@@ -158,7 +163,7 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
     var k_rope: Array = undefined;
     const fusable = b == 1 and c.mrope == null and w.q_norm.ctx != null and w.k_norm.ctx != null and qk_norm_rope.qkNormRopeFusedEnabled();
     if (fusable and s == 1 and hd == 128) blk: {
-        const ang = qk_rope.angles(g, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, 1, 1.0, 1.0) catch break :blk;
+        const ang = qk_rope.angles(c, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, 1, 1.0, 1.0) catch break :blk;
         const ms: ?Array = if (geo.yarn()) geo.yarn_mscale else null;
         const pair = (qk_norm_rope.fusedQkNormRope(g.s, queries, k_r, w.q_norm, w.k_norm, ang, ms, c.shared.eps_arr, h, kvh, rd) catch null) orelse break :blk;
         q_rope = g.adopt(pair[0]) catch |e| {
@@ -169,7 +174,7 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
     }
     // The hd-256 kernel serves decode and verify widths; YaRN's factor rides the angle rows.
     if (q_rope == null and fusable and hd == 256 and s <= 32) blk: {
-        const ang = qk_rope.angles(g, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, s, mscale, 1.0) catch break :blk;
+        const ang = qk_rope.angles(c, w.angles, family, rd, geo.base(), geo.yarn_freqs, off, s, mscale, 1.0) catch break :blk;
         const none = Array{ .ctx = null };
         const r = (try qk_rope.fused256(g, queries, k_r, none, w.q_norm, w.k_norm, none, ang, c.shared.eps_arr, h, kvh, s, rd)) orelse break :blk;
         q_rope = r[0];
@@ -182,8 +187,8 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
             q_rope = try applyMrope(g, q_t, m[0], m[1], rd);
             k_rope = try applyMrope(g, k_t, m[0], m[1], rd);
         } else if (is_batched) {
-            if (c.positions.len > attention.MAX_SLOTS) return error.TooManySlots;
-            var off_buf: [attention.MAX_SLOTS]i32 = undefined;
+            if (c.positions.len > slot_reads.MAX_SLOTS) return error.TooManySlots;
+            var off_buf: [slot_reads.MAX_SLOTS]i32 = undefined;
             for (c.positions, 0..) |p, i| off_buf[i] = @intCast(p);
             const offsets = try g.fromSlice(i32, off_buf[0..c.positions.len], &.{b});
             q_rope = try g.call(mlx.mlx_fast_rope_dynamic, .{ q_t, rd, false, geo.base(), 1.0, offsets, geo.yarn_freqs });
@@ -204,7 +209,7 @@ fn mix(w: *const GatedAttention.Weights, c: *Ctx, x: Array) !Array {
     const q = q_rope.?;
 
     const out = if (is_batched) try batchedRead(c, q, k_rope, v_t, s, geo.scale) else try soloRead(c, q, k_rope, v_t, s, geo.scale);
-    return tail(w, g, out, gate, b, s, decode_shape);
+    return tail(w, c.row_exact, g, out, gate, b, s, decode_shape);
 }
 
 fn soloRead(c: *Ctx, q: Array, k: Array, v: Array, s: c_int, scale: f32) !Array {
@@ -222,6 +227,8 @@ fn soloRead(c: *Ctx, q: Array, k: Array, v: Array, s: c_int, scale: f32) !Array 
         out = try own(g, try kvq.qkvAttnVerifyKernel(g.s, q, &dv, scale, mode));
     }
     if (out) |o| return o;
+    if (try row_exact.attendFixed(c.row_exact, g, q, dv.k, dv.v, scale, s)) |o| return o;
+    if (try row_exact.attend(c.row_exact, g, q, dv.k, dv.v, scale, s)) |o| return o;
     if (c.wide()) {
         if (try own(g, try attn256.fusedSdpa256Prefill(g.s, q, dv.k, dv.v, scale, 0))) |o| return o;
         if (try own(g, try sdpa.splitCausalSdpa(g.s, q, dv.k, dv.v, scale))) |o| return o;
@@ -232,9 +239,9 @@ fn soloRead(c: *Ctx, q: Array, k: Array, v: Array, s: c_int, scale: f32) !Array 
 
 fn batchedRead(c: *Ctx, q: Array, k: Array, v: Array, s: c_int, scale: f32) !Array {
     try kv.appendRows(c, k, v, 0);
-    var views: [attention.MAX_SLOTS]abi.KvView = undefined;
-    var dense: [attention.MAX_SLOTS]DenseKVView = undefined;
-    var packed_reads: [attention.MAX_SLOTS]bool = undefined;
+    var views: [slot_reads.MAX_SLOTS]abi.KvView = undefined;
+    var dense: [slot_reads.MAX_SLOTS]DenseKVView = undefined;
+    var packed_reads: [slot_reads.MAX_SLOTS]bool = undefined;
     var got: usize = 0;
     defer for (views[0..got]) |*vw| kv.release(c, vw);
     for (c.caches, 0..) |hdl, i| {
@@ -243,12 +250,12 @@ fn batchedRead(c: *Ctx, q: Array, k: Array, v: Array, s: c_int, scale: f32) !Arr
         dense[i] = kv.dense(views[i]);
         packed_reads[i] = views[i].packed_reads;
     }
-    if (batched.batchedAttnPerSlot(dense[0..got])) return attention.perSlot(c.g, q, dense[0..got], packed_reads[0..got], s, scale);
-    return attention.stacked(c.g, q, dense[0..got], s, scale);
+    if (batched.batchedAttnPerSlot(dense[0..got])) return slot_reads.perSlot(c.g, q, dense[0..got], packed_reads[0..got], s, scale);
+    return slot_reads.stacked(c.g, q, dense[0..got], s, scale);
 }
 
 /// `[B, H, S, D]` back to `[B, S, H*D]` through the sigmoid output gate, then the out projection.
-fn tail(w: *const GatedAttention.Weights, parent: *Graph, attn: Array, gate: Array, b: c_int, s: c_int, decode_shape: bool) !Array {
+fn tail(w: *const GatedAttention.Weights, lane: row_exact.Lane, parent: *Graph, attn: Array, gate: Array, b: c_int, s: c_int, decode_shape: bool) !Array {
     var t = parent.scope();
     defer t.deinit();
     const g = &t;
@@ -256,10 +263,10 @@ fn tail(w: *const GatedAttention.Weights, parent: *Graph, attn: Array, gate: Arr
     const attn_t = try g.transpose(attn, &perm);
     if (w.geo.output_gate and b * s <= residual_norm.add_norm_max_rows) {
         if (try own(g, try gates.stridedSigmoidGateMul(g.s, attn_t, gate))) |gated|
-            return parent.keep(try w.o.forward(g, try g.reshape(gated, &flat), decode_shape));
+            return parent.keep(try w.o.onLane(lane, g, try g.reshape(gated, &flat), decode_shape));
     }
-    if (w.geo.output_gate) return parent.keep(try w.o.forward(g, try g.reshape(try g.mul(attn_t, try g.sigmoid(gate)), &flat), decode_shape));
-    return parent.keep(try w.o.forward(g, try g.reshape(attn_t, &flat), decode_shape));
+    if (w.geo.output_gate) return parent.keep(try w.o.onLane(lane, g, try g.reshape(try g.mul(attn_t, try g.sigmoid(gate)), &flat), decode_shape));
+    return parent.keep(try w.o.onLane(lane, g, try g.reshape(attn_t, &flat), decode_shape));
 }
 
 /// Interleaved M-RoPE on `[B, H, S, D]` from per-token `cos`/`sin` rows over the first `rd` dims.

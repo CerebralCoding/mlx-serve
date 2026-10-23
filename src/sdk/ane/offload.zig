@@ -27,6 +27,7 @@
 //! (1/16 .. x16) down-conv wrap.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const builtin = @import("builtin");
 const log = @import("../../host/log.zig");
 const mlx = @import("../../mlx/ffi.zig");
@@ -229,7 +230,7 @@ pub var media_offload: MediaOffload = .{};
 
 /// MLX_SERVE_ANE_SPLIT parsed; null when unset or outside (0, 1].
 pub fn explicitShareEnv() ?f32 {
-    const raw = std.c.getenv("MLX_SERVE_ANE_SPLIT") orelse return null;
+    const raw = env.get(.MLX_SERVE_ANE_SPLIT) orelse return null;
     const v = std.fmt.parseFloat(f32, std.mem.sliceTo(raw, 0)) catch return null;
     if (!(v > 0) or v > 1) return null;
     return v;
@@ -550,7 +551,7 @@ pub fn anePrefillAllowed(nax_available: bool, force_env: ?[]const u8) bool {
 /// GDN input-projection offload beside the MLP one (v2). MLX_SERVE_ANE_GDN=0
 /// keeps `--ane-prefill` MLP-only — the attribution lever for A/Bs.
 pub fn gdnEnabled() bool {
-    const raw = std.c.getenv("MLX_SERVE_ANE_GDN") orelse return true;
+    const raw = env.get(.MLX_SERVE_ANE_GDN) orelse return true;
     return !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
 }
 
@@ -568,7 +569,7 @@ pub fn gdnEnabled() bool {
 pub const Mode = enum { row, channel };
 
 pub fn splitMode() Mode {
-    const raw = std.c.getenv("MLX_SERVE_ANE_MODE") orelse return .channel;
+    const raw = env.get(.MLX_SERVE_ANE_MODE) orelse return .channel;
     if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "row")) return .row;
     return .channel;
 }
@@ -577,7 +578,7 @@ pub fn splitMode() Mode {
 /// concurrently. Default ON where it was measured (M3 Ultra), off elsewhere
 /// (unmeasurable on single-ANE silicon; private API on top of private API).
 pub fn dualEnabled() bool {
-    return dualEnabledFrom(if (std.c.getenv("MLX_SERVE_ANE_DUAL")) |p| std.mem.sliceTo(p, 0) else null, chipBrand());
+    return dualEnabledFrom(env.span(.MLX_SERVE_ANE_DUAL), chipBrand());
 }
 
 /// MLX_SERVE_ANE_DUAL=1 forces it on, =0 off; unset = the chip default.
@@ -595,7 +596,7 @@ pub fn dualEnabledFrom(raw: ?[]const u8, chip: []const u8) bool {
 /// mode is silently wrong numbers, and the copy is ~1.7 ms on the 27B
 /// against a ~20 ms eval. Flip it once dual is proven.
 pub fn dualShareInput() bool {
-    const raw = std.c.getenv("MLX_SERVE_ANE_DUAL_SHARE_INPUT") orelse return false;
+    const raw = env.get(.MLX_SERVE_ANE_DUAL_SHARE_INPUT) orelse return false;
     return std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
 }
 
@@ -734,7 +735,7 @@ pub const BUILD_DISK_FLOOR_BYTES: u64 = 1 << 30;
 pub const DEFAULT_BANK_MAX_BYTES: u64 = 2 * 1024 * 1024 * 1024;
 
 pub fn bankMaxBytes() u64 {
-    const raw = std.c.getenv("MLX_SERVE_ANE_BANK_MAX_BYTES") orelse return DEFAULT_BANK_MAX_BYTES;
+    const raw = env.get(.MLX_SERVE_ANE_BANK_MAX_BYTES) orelse return DEFAULT_BANK_MAX_BYTES;
     const v = std.fmt.parseInt(u64, std.mem.sliceTo(raw, 0), 10) catch return DEFAULT_BANK_MAX_BYTES;
     return if (v == 0) DEFAULT_BANK_MAX_BYTES else v;
 }

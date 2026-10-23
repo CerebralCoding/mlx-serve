@@ -87,9 +87,10 @@ let supportedModelTypes: Set<String> = [
 /// so they must pass the architecture gate (not show "Unsupported
 /// architecture" in the Downloaded tab) while still being excluded from
 /// chat-model pickers (`LocalModel.isChatPickable` checks this separately).
-/// Mirrors `model_discovery.isMediaModelType` (Zig).
+/// Mirrors the server's `modality.fromType` (src/host/registry/modality.zig) for
+/// rows no server has classified: a Discover search hit, a download on disk.
 private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "qwen_image", "moss_image", "hunyuan3d"]
-// Mirrors `gen.media_model_types` on the server. Drift here is not cosmetic:
+// Mirrors `modality.media_model_types` on the server. Drift here is not cosmetic:
 // a media model missing from this list fails the ARCHITECTURE gate outright,
 // so the browser draws it a red "Unsupported" — which is what happened to
 // `minimax_music3` on the same screen that offers to download it, and to bare
@@ -100,9 +101,8 @@ private let mediaModelTypePrefixes: [String] = ["flux2", "krea", "mage_flow", "q
 // architecture" are different decisions, and it was getting both. Exclusion
 // from pickers is `isChatPickable`'s job, which reads this same list. #228.
 //
-// `MediaModalityParityTests` reads `media_model_types` out of src/host/media_jobs/gen.zig and
-// asserts this agrees. Zig already pinned its own two copies against each
-// other; nothing pinned Swift, which is why this drifted unnoticed.
+// `MediaModalityParityTests` reads `media_model_types` out of src/host/registry/modality.zig and
+// asserts this agrees; the server's own discovery and dispatch read that one list.
 private let mediaModelTypeExactValues: Set<String> = [
     "qwen3_tts", "AudioVideo", "acestep", "minimax_h3", "minimax_music3", "kokoro", "mageflow", "laya", "kev",
     "stable_audio3", "clef", "d1", "yue2", "nemotron_diarization", "trellis2", "pixal3d",
@@ -141,7 +141,7 @@ func discoverableMediaModelType(_ modelType: String) -> Bool {
 /// Use button that only knew "audio" would drop a music model on the Voice
 /// tab. `CustomMediaModels.musicFamily` is the existing discriminator; this is
 /// the same split, minus the running-server requirement (a browser row is a
-/// filesystem `LocalModel` with no capabilities).
+/// filesystem `LocalModel` with no capabilities; a server row names it as `modality`).
 enum MediaModality: CaseIterable {
     case image, voice, music, sound, video, mesh
 

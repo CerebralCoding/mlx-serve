@@ -62,6 +62,7 @@ pub fn Encoder(comptime spec: anytype) type {
                 h = try g.keep(m);
                 g.drop(old);
                 try run.capture(g, @intCast(i), h);
+                try run.cadence(i, w.layers.len, h);
             }
             return .{ .hidden = h };
         }

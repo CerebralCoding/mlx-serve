@@ -1,4 +1,5 @@
-//! appendRadioVideoRun; radioMediaTokens; RADIO video builder
+//! The RADIO tower's media glue: its placeholder token runs (`radioMediaTokens`, `appendRadioVideoRun`) and the
+//! video frame decode.
 
 const std = @import("std");
 const chat_mod = @import("../../host/chat/chat.zig");

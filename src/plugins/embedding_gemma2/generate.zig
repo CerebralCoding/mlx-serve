@@ -1,4 +1,5 @@
-//! EmbeddingGemma 2 embedding tests over the tiny fixture (text, image, video).
+//! EmbeddingGemma 2 embedding tests over the tiny fixture (text, image, video): the served model (the plugin through
+//! the engine's driver) and the image tower against the transformers reference.
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
@@ -7,6 +8,11 @@ const Transformer = transformer_mod.Transformer;
 const testing = std.testing;
 const computeEmbeddingsBatch = @import("../../engines/mlx/embed/pooling.zig").computeEmbeddingsBatch;
 const computeEmbeddingsBatchWith = @import("../../engines/mlx/embed/pooling.zig").computeEmbeddingsBatchWith;
+const plugin_driver = @import("../../engines/mlx/plugin/driver.zig");
+const Resident = @import("../../sdk/weights/resident.zig").Resident;
+const FsPackDir = @import("../../host/registry/pack_dir.zig").FsPackDir;
+const abi = @import("../../abi/plugin.zig");
+const encoder = @import("../gemma4/bidirectional.zig");
 
 
 // ── tests ──
@@ -27,8 +33,11 @@ fn rowCosine(a: []const f32, b: []const f32) f64 {
 /// The tiny EmbeddingGemma 2 checkpoint (`tests/dump_embeddinggemma2_fixtures.py tiny`) written to a temp dir and loaded.
 const Eg2Tiny = struct {
     tmp: std.testing.TmpDir,
+    allocator: std.mem.Allocator,
     config: model_mod.ModelConfig,
     weights: model_mod.Weights,
+    path_buf: [512]u8 = undefined,
+    path_len: usize = 0,
 
     fn open(allocator: std.mem.Allocator, io: std.Io) !Eg2Tiny {
         return openWith(allocator, io, false);
@@ -44,17 +53,29 @@ const Eg2Tiny = struct {
         errdefer tmp.cleanup();
         try tmp.dir.writeFile(io, .{ .sub_path = "config.json", .data = @embedFile("../../fixtures/embedding_gemma2_tiny_config.json") });
         try tmp.dir.writeFile(io, .{ .sub_path = "model.safetensors", .data = @embedFile("../../fixtures/embedding_gemma2_tiny.safetensors") });
-        var path_buf: [512]u8 = undefined;
-        const path = path_buf[0..try tmp.dir.realPath(io, &path_buf)];
-        var config = try model_mod.parseConfig(io, allocator, path);
-        var weights = if (vision) try model_mod.loadWeightsWithVision(io, allocator, path) else try model_mod.loadWeights(io, allocator, path);
-        errdefer weights.deinit();
-        model_mod.resolveWeightPrefix(&config, &weights);
-        return .{ .tmp = tmp, .config = config, .weights = weights };
+        var fx: Eg2Tiny = .{ .tmp = tmp, .allocator = allocator, .config = undefined, .weights = undefined };
+        fx.path_len = try tmp.dir.realPath(io, &fx.path_buf);
+        fx.config = try model_mod.parseConfig(io, allocator, fx.path());
+        errdefer fx.config.deinit(allocator);
+        fx.weights = if (vision) try model_mod.loadWeightsWithVision(io, allocator, fx.path()) else try model_mod.loadWeights(io, allocator, fx.path());
+        errdefer fx.weights.deinit();
+        model_mod.resolveWeightPrefix(&fx.config, &fx.weights);
+        return fx;
+    }
+
+    fn path(self: *const Eg2Tiny) []const u8 {
+        return self.path_buf[0..self.path_len];
+    }
+
+    /// The served model: the plugin's load and forward behind the engine's shell.
+    fn served(self: *Eg2Tiny, io: std.Io) !Transformer {
+        try testing.expect(self.config.plugin != null);
+        return plugin_driver.load(io, self.allocator, &self.config, self.path(), mlx.gpuStream());
     }
 
     fn deinit(self: *Eg2Tiny) void {
         self.weights.deinit();
+        self.config.deinit(self.allocator);
         self.tmp.cleanup();
     }
 };
@@ -69,7 +90,7 @@ test "EmbeddingGemma 2: forward and pooled embeddings match the transformers ref
 
     var fx = try Eg2Tiny.open(allocator, io);
     defer fx.deinit();
-    var xfm = try Transformer.init(io, allocator, fx.config, &fx.weights);
+    var xfm = try fx.served(io);
     defer xfm.deinit();
 
     const Expected = struct {
@@ -98,12 +119,13 @@ test "EmbeddingGemma 2: forward and pooled embeddings match the transformers ref
 
     // A shipped pack's head is bf16, and normalizing its bf16 output leaves the norm off 1: the projection
     // hands the normalization f32.
-    const head_f32 = xfm.dense0_w;
+    const head = &@as(*encoder.Loaded, @ptrCast(@alignCast(xfm.plugin.?.model))).base.weights.projection.?.first.w;
+    const head_f32 = head.*;
     var head_bf16 = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(head_bf16);
     try mlx.check(mlx.mlx_astype(&head_bf16, head_f32, .bfloat16, xfm.s));
-    xfm.dense0_w = head_bf16;
-    defer xfm.dense0_w = head_f32;
+    head.* = head_bf16;
+    defer head.* = head_f32;
     const bf16_head = try computeEmbeddingsBatch(allocator, &xfm, want.sequences);
     defer {
         for (bf16_head) |r| allocator.free(r);
@@ -323,7 +345,7 @@ test "EmbeddingGemma 2: image, video and mixed prompts embed like the reference"
 
     var fx = try Eg2Tiny.openWithVision(allocator, io);
     defer fx.deinit();
-    var xfm = try Transformer.init(io, allocator, fx.config, &fx.weights);
+    var xfm = try fx.served(io);
     defer xfm.deinit();
     var enc = try vision_mod.VisionEncoder.init(allocator, fx.config, &fx.weights);
     defer enc.deinit();
@@ -415,9 +437,6 @@ test "EmbeddingGemma 2: a checkpoint missing its head or per-layer-input weights
     // and a layer without its input block or scalar would crash the first forward.
     const io = std.Io.Threaded.global_single_threaded.io();
     if (mlx.noGpuBackend()) return;
-    // init leaks its partial layer slice on an error return; an arena takes it.
-    var arena = std.heap.ArenaAllocator.init(testing.allocator);
-    defer arena.deinit();
     for ([_][]const u8{
         "language_model.embedding_projection.weight",
         "language_model.ple.per_layer_model_projection.weight",
@@ -428,6 +447,16 @@ test "EmbeddingGemma 2: a checkpoint missing its head or per-layer-input weights
         var fx = try Eg2Tiny.open(testing.allocator, io);
         defer fx.deinit();
         fx.weights.remove(name);
-        try testing.expectError(error.MissingWeight, Transformer.init(io, arena.allocator(), fx.config, &fx.weights));
+        var res = Resident.adopt(fx.weights);
+        defer res.deinit();
+        fx.weights = model_mod.Weights.init(testing.allocator);
+        const src = res.source();
+        var fs = try FsPackDir.open(io, fx.path());
+        defer fs.close();
+        const dir = fs.packDir();
+        const b = fx.config.plugin.?;
+        var why: abi.Verdict = .{};
+        try testing.expect(b.table.load(&.{ .model_dir = .of(fx.path()), .dir = &dir, .parsed = &b.parsed, .stream = .{ .ctx = mlx.gpuStream().ctx }, .weights = &src }, &why) == null);
+        try testing.expectEqualStrings("MissingWeight", why.why.slice());
     }
 }

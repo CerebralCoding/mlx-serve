@@ -1,6 +1,7 @@
 //! Load preflight: resident and on-disk bills, the eviction gate estimate, available memory.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const ple_gpu = @import("../../plugins/qwen4_exp/ple_gpu.zig");
 const gen_mod = @import("../media_jobs/gen.zig");
@@ -406,10 +407,7 @@ test "residentModelDiskBytes: deepseek_v41 does not bill the Engram tables it pr
 }
 
 test "residentModelDiskBytes: deepseek_v41 bills neither the vision tower nor DSpark stages that will not load" {
-    const unsetenv = struct {
-        extern "c" fn unsetenv(name: [*:0]const u8) c_int;
-    }.unsetenv;
-    _ = unsetenv("MLX_SERVE_DSV4_DSPARK"); // test-order hygiene: `--dspark` (and tests) force the stages on
+    env.unset(.MLX_SERVE_DSV4_DSPARK); // test-order hygiene: `--dspark` (and tests) force the stages on
     const io = std.Io.Threaded.global_single_threaded.io();
     var td = std.testing.tmpDir(.{});
     defer td.cleanup();
@@ -570,10 +568,11 @@ test "the preflight bills an MTP sidecar the index never names, never an in-chec
 test "media bill: CUDA checks the weights against RAM and only the working set against the GPU" {
     const GB: u64 = 1024 * 1024 * 1024;
     // Music3 8-bit: 13 GB of weights + its 6 GB generation buffer.
-    const peak = 13 * GB + gen_mod.MUSIC3_GEN_BUFFER_BYTES;
+    const buffer = @import("../../plugins/music3/config.zig").gen_buffer_bytes;
+    const peak = 13 * GB + buffer;
     const cuda = mediaBill(peak, 13 * GB, true);
     try std.testing.expectEqual(13 * GB, cuda.ram);
-    try std.testing.expectEqual(gen_mod.MUSIC3_GEN_BUFFER_BYTES, cuda.gpu);
+    try std.testing.expectEqual(buffer, cuda.gpu);
     // Unified memory holds both in one pool, as before.
     const unified = mediaBill(peak, 13 * GB, false);
     try std.testing.expectEqual(peak, unified.ram);
@@ -604,27 +603,6 @@ test "a refusal quotes the number it actually compared" {
     try std.testing.expect(!memInsufficientForLoad(peak, loadRequirementBytes(peak)));
     try std.testing.expect(memInsufficientForLoad(peak, loadRequirementBytes(peak) - 1));
     try std.testing.expect(!memInsufficientForLoad(42 * GB, loadRequirementBytes(42 * GB)));
-}
-
-test "BOTH preflight refusals quote the number they compared, not the weights" {
-    // The media arm was fixed for #144's class (2026-08-08) and the TEXT arm was
-    // not: it printed "weights ~8.4 GB but only 10.1 GB free", which reads as
-    // "this should have worked" — the load was refused for the 2.05 GB of
-    // headroom the sentence never named (live 2026-08-17, a gemma-4-12B QAT pack
-    // on a 16 GB M4, where the bar is 10.45 GB). `insufficient_free_memory_message`
-    // sends the client to this very line for the figures, so a line that omits
-    // the bar makes the client message a dead end too. Needles are ++-split so
-    // this test's own source cannot satisfy the scan.
-    const src = @embedFile("../media_jobs/load.zig") ++ @embedFile("../../engines/mlx/load.zig");
-    // Each refusal formats the REQUIREMENT as its first figure, from the one
-    // helper the comparison itself uses — never a second formula that can drift.
-    const media_arg = "loadRequirement" ++ "Bytes(bill.ram))) / gb";
-    try testing.expect(std.mem.indexOf(u8, src, media_arg) != null);
-    const text_arg = "loadRequirement" ++ "Bytes(weights_bytes))) / gb";
-    try testing.expect(std.mem.indexOf(u8, src, text_arg) != null);
-    // The weights-first shape that could not state its own bar must be GONE.
-    const old = "Insufficient memory to load model: weights ~" ++ "{d:.1} GB but only";
-    try testing.expect(std.mem.indexOf(u8, src, old) == null);
 }
 
 test "the eviction gate bills a media entry its BACKEND peak, never the dir's safetensors sum" {

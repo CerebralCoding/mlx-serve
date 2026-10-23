@@ -1,5 +1,6 @@
 //! DFlash block-drafter rounds: verify, copy, plain/pipelined policy rounds, parked taps.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const mlx = @import("../../../mlx/ffi.zig");
 const transformer_mod = @import("../transformer.zig");
 const tokenizer_mod = @import("../../../host/tokenizer/tokenizer.zig");
@@ -13,6 +14,7 @@ const dflash_policy = @import("dflash/policy.zig");
 const Transformer = transformer_mod.Transformer;
 const Tokenizer = tokenizer_mod.Tokenizer;
 const dflash_mod = @import("dflash/dflash.zig");
+const plugin_driver = @import("../plugin/driver.zig");
 const lilicorr_mod = @import("dflash/lilicorr.zig");
 const testing = std.testing;
 const CommittedArgmax = @import("verify.zig").CommittedArgmax;
@@ -201,13 +203,13 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     // On the moe/GDN path positions come from moe_seq_offset (cache.step
     // is a bookkeeping counter the model never reads there — same rule as
     // nextMtp); the standard path keeps cache.step as the anchor.
-    const moe_path = self.xfm.moe_layers != null;
+    const moe_path = self.xfm.moe_layers != null or plugin_driver.positionsOf(self.xfm) == .gdn;
     // A hybrid trunk (LFM2 DSpark) positions from moe_seq_offset too, but
     // its cache.step IS genuine (every token passes the attention layers),
     // so it keeps the truncate and only needs the offset + conv-state
     // rollback. Deciding the two independently is what keeps a partial
     // accept from either mis-positioning or double-counting.
-    const hybrid_path = self.xfm.hybrid_layers != null;
+    const hybrid_path = plugin_driver.positionsOf(self.xfm) == .hybrid;
     const anchor_pos: usize = if (moe_path or hybrid_path) self.ctx.moe_seq_offset.* else self.ctx.cache.step;
     const kv_step_snap = self.ctx.cache.step;
     // A drafted round reads the whole context: whatever the plain rounds parked joins it first.
@@ -537,8 +539,8 @@ pub fn dflashVerify(self: *Generator, allocator: std.mem.Allocator, r: VerifyIn)
     const s = xfm.s;
     const model = self.dflash.?;
     const dctx = &self.dflash_ctx.?;
-    const moe_path = xfm.moe_layers != null;
-    const hybrid_path = xfm.hybrid_layers != null;
+    const moe_path = xfm.moe_layers != null or plugin_driver.positionsOf(xfm) == .gdn;
+    const hybrid_path = plugin_driver.positionsOf(xfm) == .hybrid;
     const t1 = r.t1;
     const m = r.m;
     const m_draft = r.m_draft;
@@ -844,7 +846,7 @@ var dflash_copy_off_cache: ?bool = null;
 /// `MLX_SERVE_DFLASH_COPY=0` drafts only from the assistant (the A/B arm for copied continuations).
 pub fn dflashCopyOff() bool {
     if (dflash_copy_off_cache) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_DFLASH_COPY");
+    const raw = env.get(.MLX_SERVE_DFLASH_COPY);
     const off = raw != null and raw.?[0] == '0';
     dflash_copy_off_cache = off;
     return off;

@@ -1,5 +1,6 @@
 //! Adaptive MTP serial switching: price window, votes, probes, head release.
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const log = @import("../../../../host/log.zig");
 const round_cost = @import("../round_cost.zig");
 const testing = std.testing;
@@ -10,8 +11,6 @@ const MTP_ADAPTIVE_PROBE_TOKENS = @import("regime.zig").MTP_ADAPTIVE_PROBE_TOKEN
 const MtpHeadRef = @import("../mtp_head_ref.zig").MtpHeadRef;
 const mtpCostTableEnabled = @import("ev_plan.zig").mtpCostTableEnabled;
 const mtpRoundOff0 = @import("chain.zig").mtpRoundOff0;
-const readEnvFloat = @import("../../env_generate.zig").readEnvFloat;
-const readEnvUsize = @import("../../env_generate.zig").readEnvUsize;
 
 pub const MTP_ADAPTIVE_PROBE_WARM: u32 = 2;
 /// KV below which the switch does not exist: no vote, no probe. Rounds lose to serial from
@@ -257,7 +256,7 @@ pub fn mtpAdaptiveSerialEnabledFromEnv(raw: ?[]const u8) bool {
 
 pub fn mtpAdaptiveSerialEnabled() bool {
     if (mtp_adaptive_serial_cache) |v| return v;
-    const raw: ?[]const u8 = if (std.c.getenv("MLX_SERVE_MTP_ADAPTIVE_SERIAL")) |p| std.mem.span(p) else null;
+    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_ADAPTIVE_SERIAL);
     const on = mtpAdaptiveSerialEnabledFromEnv(raw);
     mtp_adaptive_serial_cache = on;
     return on;
@@ -266,7 +265,7 @@ pub fn mtpAdaptiveSerialEnabled() bool {
 var mtp_adaptive_margin_cache: ?f32 = null;
 pub fn mtpAdaptiveMargin() f32 {
     if (mtp_adaptive_margin_cache) |v| return v;
-    const v = readEnvFloat("MLX_SERVE_MTP_ADAPTIVE_MARGIN", MTP_ADAPTIVE_MARGIN);
+    const v = env.float(.MLX_SERVE_MTP_ADAPTIVE_MARGIN, MTP_ADAPTIVE_MARGIN);
     mtp_adaptive_margin_cache = v;
     return v;
 }
@@ -275,7 +274,7 @@ var mtp_reentry_tokens_cache: ?u32 = null;
 /// `MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS`: 0 / unset = crossing-only; a bare `1` selects 512.
 pub fn mtpAdaptiveReentryTokens() u32 {
     if (mtp_reentry_tokens_cache) |v| return v;
-    const n = readEnvUsize("MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS", MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
+    const n = env.int(.MLX_SERVE_MTP_ADAPTIVE_REENTRY_TOKENS, usize, MtpAdaptive.REDECIDE_SERIAL_TOKENS_DEFAULT);
     const v: u32 = if (n == 1) MtpAdaptive.REDECIDE_SERIAL_TOKENS_ON else @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
     mtp_reentry_tokens_cache = v;
     return v;
@@ -284,7 +283,7 @@ pub fn mtpAdaptiveReentryTokens() u32 {
 var mtp_adaptive_min_kv_cache: ?u32 = null;
 pub fn mtpAdaptiveMinKv() u32 {
     if (mtp_adaptive_min_kv_cache) |v| return v;
-    const n = readEnvUsize("MLX_SERVE_MTP_ADAPTIVE_MIN_KV", MTP_ADAPTIVE_MIN_KV);
+    const n = env.int(.MLX_SERVE_MTP_ADAPTIVE_MIN_KV, usize, MTP_ADAPTIVE_MIN_KV);
     const v: u32 = @intCast(@min(n, @as(usize, std.math.maxInt(u32))));
     mtp_adaptive_min_kv_cache = v;
     return v;
@@ -293,7 +292,7 @@ pub fn mtpAdaptiveMinKv() u32 {
 var mtp_adaptive_confirm_cache: ?u32 = null;
 pub fn mtpAdaptiveConfirm() u32 {
     if (mtp_adaptive_confirm_cache) |v| return v;
-    const n = readEnvUsize("MLX_SERVE_MTP_ADAPTIVE_CONFIRM", MTP_ADAPTIVE_CONFIRM);
+    const n = env.int(.MLX_SERVE_MTP_ADAPTIVE_CONFIRM, usize, MTP_ADAPTIVE_CONFIRM);
     const v: u32 = @intCast(@max(@as(usize, 1), @min(n, 64)));
     mtp_adaptive_confirm_cache = v;
     return v;
@@ -312,7 +311,7 @@ pub fn mtpHeadDriftNow(self: *const Generator) ?i64 {
     if (self.mtp_cache == null) return null;
     const mc = &self.mtp_cache.?;
     return switch (mc.*) {
-        .qwen, .mimo, .glm => 0,
+        .qwen, .mimo, .glm, .plugin => 0,
         .qwen4 => |r| blk: {
             r.t.qwen4MtpActivate(r.st);
             const m = &(r.t.qwen4_mtp orelse break :blk 0);
@@ -413,7 +412,7 @@ pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
         }
         // Nothing to decide with: teach the bucket a serial token, once.
         const idle = self.mtp_serial_left == 0 and self.mtp_serial_exit == .none;
-        const useful = mtpSerialProbeUseful(window_ms_tok) and mtpSerialProbeEarned(self.xfm.qwen4_mtp != null, self.mtp_low_accept);
+        const useful = mtpSerialProbeUseful(window_ms_tok) and mtpSerialProbeEarned(self.xfm.qwen4Host().qwen4_mtp != null, self.mtp_low_accept);
         if (mtpSerialProbeArm(t, b, self.spec_cost_solo, idle, self.mtpAdaptiveHeadMayResume(), useful)) |own| {
             self.mtp_serial_left = MTP_ADAPTIVE_PROBE_TOKENS;
             log.info(

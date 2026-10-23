@@ -1,5 +1,5 @@
 //! sdk/blocks/moe/experts, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns scaleExperts, addExpertBias, gatherExpertMm.
+//! Owns scaleExperts, gatherExpertMm.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
@@ -14,14 +14,8 @@ const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf1
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
 const verifyQmmNaxAvailable = @import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
 
-/// Add a gpt_oss SwitchGLU per-expert bias to a gather_qmm result, in
-/// place. `bias` is the stacked [num_experts, out] bank; `sel` is the
-/// per-slot expert index the matmul was gathered with, so row i of the
-/// output gets `bias[sel[i]]`. No-op when the arch has no such bias.
-///
-/// `sel` MUST be the same index vector the matmul used, in the same order:
-/// on the sorted path that is `sorted_inds`, and the result is still in
-/// sorted order until the inverse permutation runs.
+/// Scale a gather_qmm result by a per-expert scale, in place. `sel` MUST be the index vector the matmul used, in
+/// its order (`sorted_inds` on the sorted path).
 pub fn scaleExperts(self: *const Transformer, out: *mlx.mlx_array, scale: mlx.mlx_array, sel: mlx.mlx_array) !void {
     if (scale.ctx == null) return;
     var picked = mlx.mlx_array_new();
@@ -34,17 +28,6 @@ pub fn scaleExperts(self: *const Transformer, out: *mlx.mlx_array, scale: mlx.ml
     try mlx.check(mlx.mlx_multiply(&scaled, out.*, col, self.s));
     _ = mlx.mlx_array_free(out.*);
     out.* = scaled;
-}
-
-pub fn addExpertBias(self: *const Transformer, out: *mlx.mlx_array, bias: mlx.mlx_array, sel: mlx.mlx_array) !void {
-    if (bias.ctx == null) return;
-    var rows = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rows);
-    try mlx.check(mlx.mlx_take_axis(&rows, bias, sel, 0, self.s));
-    var summed = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_add(&summed, out.*, rows, self.s));
-    _ = mlx.mlx_array_free(out.*);
-    out.* = summed;
 }
 
 /// Gathered matmul for MoE expert dispatch — handles both quantized and dense bf16.

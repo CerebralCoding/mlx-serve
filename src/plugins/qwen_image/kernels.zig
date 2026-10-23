@@ -5,7 +5,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
 
-const rope_source = kernelSource("plugins/qwen_image/kernels/rope.metal");
+pub const rope_source = kernelSource("plugins/qwen_image/kernels/rope.metal");
 
 /// x [1,L,heads,head_dim], FP32 tables [1,L,1,head_dim/2,1].
 /// Returns a new array in output_dtype (normalization may promote x to FP32).

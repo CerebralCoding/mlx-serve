@@ -11,7 +11,7 @@ const restore_dump = @import("cache/restore_dump.zig");
 const kv_disk_cache = @import("cache/ssd/disk_tier.zig");
 const log = @import("../../host/log.zig");
 const io_util = @import("../../sdk/util/io_util.zig");
-const dsv41_mod = @import("../../plugins/deepseek_v41/deepseek_v41.zig");
+const plugin_driver = @import("plugin/driver.zig");
 const mlx_stream = if (@import("build_options").mlx_stream) @import("../../sdk/weights/streamed/glue.zig") else @import("../../sdk/weights/streamed/stub.zig");
 const Transformer = transformer_mod.Transformer;
 const KVCache = transformer_mod.KVCache;
@@ -45,6 +45,7 @@ const specInitWiring = @import("spec/wiring.zig").specInitWiring;
 const publishLiveKvResidency = @import("step.zig").publishLiveKvResidency;
 const runPrefillDiffusion = @import("../../plugins/diffusion_gemma/scheduler_arm.zig").runPrefillDiffusion;
 const scheduler_mod = @import("scheduler.zig");
+const intree = @import("plugin/intree.zig");
 
 pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // Mark the phase for the whole of prefill, and clear both signals on EVERY
@@ -117,7 +118,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     const owns_module_state = slot.model.transformer != null and
         slot.model.transformer.?.moduleSpecWiring();
     const has_native_draft = slot.model.transformer != null and
-        (slot.model.transformer.?.dsv4 != null or slot.model.transformer.?.dsv41 != null or slot.model.transformer.?.mlx_stream_ext != null);
+        (intree.dsv4(slot.model.transformer.?) != null or intree.dsv41(slot.model.transformer.?) != null or slot.model.transformer.?.mlx_stream_ext != null);
     const module_spec_rollback = slot.model.transformer != null and
         slot.model.transformer.?.moduleStateSpecRollback();
     const wiring = specInitWiring(
@@ -174,8 +175,8 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
     // because the conn thread holds a refcount on slot.model.
     const xfm_ptr: *Transformer = slot.model.transformer.?;
     // DeepSeek-V4.1 keeps its own state: a prompt that extends its last one resumes there.
-    const resumed: u64 = if (xfm_ptr.dsv41) |mdl|
-        try dsv41_mod.resumePrompt(mdl, slot.full_prompt, slot.vision_embeddings)
+    const resumed: u64 = if (plugin_driver.resumePrompt(xfm_ptr, slot.full_prompt, slot.vision_embeddings)) |n|
+        n
     else if (xfm_ptr.mlx_stream_ext) |m|
         try mlx_stream.begin(m, slot.full_prompt, slot.max_tokens, mlx_stream.contextLength(&xfm_ptr.config))
     else

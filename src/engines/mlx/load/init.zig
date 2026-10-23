@@ -2,6 +2,7 @@
 //! Owns init.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const qwen4_mod = @import("../../../plugins/qwen4_exp/qwen4_exp.zig");
 const distributed_mod = @import("../cluster/distributed.zig");
 const ple_gpu = @import("../../../plugins/qwen4_exp/ple_gpu.zig");
@@ -14,10 +15,6 @@ const ModelConfig = @import("../model.zig").ModelConfig;
 const Weights = @import("../model.zig").Weights;
 const fused_rows = @import("../../../sdk/blocks/linear/fused_rows.zig");
 const transformer = @import("../transformer.zig");
-const initBert = @import("../../../plugins/bert/load.zig").initBert;
-const initDsv4 = @import("../../../plugins/deepseek_v4/bridge.zig").initDsv4;
-const initDsv41 = @import("../../../plugins/deepseek_v41/bridge.zig").initDsv41;
-const SelfCondWeights = @import("../../../plugins/diffusion_gemma/weights.zig").SelfCondWeights;
 const qwen4DecodeLadderStride = @import("../../../plugins/qwen4_exp/forward.zig").qwen4DecodeLadderStride;
 const loadHcWeights = @import("../../../plugins/qwen4_exp/load.zig").loadHcWeights;
 const Qwen4Mtp = @import("../../../plugins/qwen4_exp/mtp.zig").Qwen4Mtp;
@@ -44,7 +41,6 @@ const firstNonTernaryBias = @import("../../../sdk/quant/ternary.zig").firstNonTe
 const firstRowExactMiss = @import("../../../sdk/quant/ternary.zig").firstRowExactMiss;
 const ternaryKernelCandidate = @import("../../../sdk/quant/ternary.zig").ternaryKernelCandidate;
 const decodeAsyncLadderStride = @import("../eval_cadence.zig").decodeAsyncLadderStride;
-const HybridLayerWeights = @import("../forward/hybrid.zig").HybridLayerWeights;
 const MoeLayerWeights = @import("../forward/layered.zig").MoeLayerWeights;
 const KVCache = @import("../kv/cache.zig").KVCache;
 const LayerWeights = @import("../layer_weights.zig").LayerWeights;
@@ -55,7 +51,6 @@ const mtpNaxUniformAffineTrunkFrom = @import("../spec/mtp_nax_profile.zig").mtpN
 const SSMCacheEntry = @import("../ssm/entry.zig").SSMCacheEntry;
 const Transformer = @import("../transformer.zig").Transformer;
 const initStandardLayers = @import("layers_dense.zig").initStandardLayers;
-const initHybridLayers = @import("layers_hybrid.zig").initHybridLayers;
 const initMoeLayers = @import("layers_layered.zig").initMoeLayers;
 const addOne = @import("weights.zig").addOne;
 const appendFullAttnWeights = @import("weights.zig").appendFullAttnWeights;
@@ -65,10 +60,8 @@ const appendStructArrays = @import("weights.zig").appendStructArrays;
 const bf16Scalar = @import("weights.zig").bf16Scalar;
 const floatDtypeTable = @import("weights.zig").floatDtypeTable;
 const getNamedWeight = @import("weights.zig").getNamedWeight;
-const getQuantTriple = @import("weights.zig").getQuantTriple;
 const getWeightFmt = @import("weights.zig").getWeightFmt;
 const getWeightFmtOpt = @import("weights.zig").getWeightFmtOpt;
-const requireNamedWeight = @import("weights.zig").requireNamedWeight;
 const structFields = @import("weights.zig").structFields;
 
 pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weights: *Weights) !Transformer {
@@ -87,29 +80,22 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
 
     var name_buf: [256]u8 = undefined;
 
-    // BERT encoders get their own weight layout + forward; bidirectional
-    // decoder archs (EmbeddingGemma) load through the standard arm and
-    // dispatch to forwardGemma3EncoderWith.
-    if (config.is_encoder_only and !config.use_bidirectional_attention) return initBert(io, allocator, config, weights, &name_buf, s);
-    if (std.mem.eql(u8, config.model_type, "deepseek_v4")) return initDsv4(allocator, config, weights, s);
+    // Bidirectional decoder archs (EmbeddingGemma) load through the standard arm and dispatch to
+    // forwardGemma3EncoderWith. LFM2, Nemotron-H and DeepSeek-V4/V4.1's MLX packs run on their plugins only.
+    if (config.has_hybrid_layers or std.mem.eql(u8, config.model_type, "deepseek_v4") or (config.isDsv41() and !config.dsv41_stream)) {
+        log.err("[load] {s}: its plugin does not serve this pack and the legacy forward is gone\n", .{config.model_type});
+        return error.PluginDeclinedNoLegacy;
+    }
     if (config.mimo_stream) return initMlxStream(io, allocator, config, s);
     if (config.glm_stream) return initMlxStream(io, allocator, config, s);
     if (config.glm5_stream) return initMlxStream(io, allocator, config, s);
-    if (config.isDsv41()) return initDsv41(io, allocator, config, weights, s);
+    if (config.dsv41_stream) return initMlxStream(io, allocator, config, s);
 
     // Embeddings: the table's own name is the checkpoint's, not a family
     // trait — one lookup table, three call sites (weight/scales/biases)
     // that must agree.
-    const is_nemotron = std.mem.eql(u8, config.model_type, "nemotron_h");
-    const is_inkling = std.mem.eql(u8, config.model_type, "inkling_mm_model");
-    const emb_base: []const u8 = if (is_nemotron)
-        "embeddings"
-    else if (is_inkling)
-        "embed"
-    else if (std.mem.eql(u8, config.model_type, "bailing_hybrid"))
+    const emb_base: []const u8 = if (std.mem.eql(u8, config.model_type, "bailing_hybrid"))
         "word_embeddings"
-    else if (std.mem.eql(u8, config.model_type, "spark2_5"))
-        "embedding"
     else
         "embed_tokens";
     const emb_w = getNamedWeight(weights, &name_buf, prefix, emb_base, "weight") orelse {
@@ -152,28 +138,14 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     else
         null;
 
-    // Final norm: LFM2 uses "embedding_norm", Nemotron-H uses "norm_f", others use "norm"
-    const is_lfm2 = std.mem.eql(u8, config.model_type, "lfm2");
     var final_norm: mlx.mlx_array = undefined;
     if (!config.has_final_norm) {
         final_norm = mlx.mlx_array_new(); // placeholder, unused
-    } else if (is_lfm2) {
-        final_norm = try getWeightFmt(weights, &name_buf, "{s}.embedding_norm.weight", prefix);
-    } else if (is_nemotron) {
-        final_norm = try getWeightFmt(weights, &name_buf, "{s}.norm_f.weight", prefix);
     } else {
         const final_norm_raw = try getWeightFmt(weights, &name_buf, "{s}.norm.weight", prefix);
-        const fold_final = config.norm_has_offset and !config.final_norm_plain;
-        if (fold_final) {
+        if (config.norm_has_offset) {
             final_norm = try addOne(final_norm_raw, s);
             try mlx.check(mlx.mlx_array_eval(final_norm));
-        } else if (config.norm_has_offset) {
-            // final_norm_plain (muse_glimmer): the final norm is plain-scale
-            // (ones-init) while the layer norms fold +1. owns_norms will
-            // free final_norm at deinit, so take our own +1 handle instead
-            // of aliasing the weights map's.
-            final_norm = mlx.mlx_array_new();
-            _ = mlx.mlx_array_set(&final_norm, final_norm_raw);
         } else {
             final_norm = final_norm_raw;
         }
@@ -189,16 +161,11 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
 
     {
         // A nested decoder's head is a sibling of model/backbone.
-        const lm_prefix = if (std.mem.eql(u8, prefix, "language_model.model") or
-            (is_nemotron and std.mem.eql(u8, prefix, "language_model.backbone")))
+        const lm_prefix = if (std.mem.eql(u8, prefix, "language_model.model"))
             "language_model"
         else
             prefix;
-        // Inkling: the untied head is "{prefix}.unembed" (quantized).
-        const maybe_lm_w = if (is_inkling)
-            getWeightFmtOpt(weights, &name_buf, "{s}.unembed.weight", lm_prefix)
-        else
-            getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.weight", lm_prefix);
+        const maybe_lm_w = getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.weight", lm_prefix);
         if (maybe_lm_w) |w| {
             lm_head_w = w;
             // Dense bf16: no scales/biases → null-ctx; lmHeadProject() then
@@ -208,21 +175,16 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
             const head_dense = floatDtypeTable(mlx.mlx_array_dtype(w));
             lm_head_s = if (head_dense)
                 mlx.mlx_array_new()
-            else if (is_inkling)
-                try getWeightFmt(weights, &name_buf, "{s}.unembed.scales", lm_prefix)
             else
                 try getWeightFmt(weights, &name_buf, "{s}.lm_head.scales", lm_prefix);
             lm_head_b = if (head_dense)
                 mlx.mlx_array_new()
             else if (bias_mandatory)
-                (if (is_inkling)
-                    try getWeightFmt(weights, &name_buf, "{s}.unembed.biases", lm_prefix)
-                else
-                    try getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix))
+                try getWeightFmt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix)
             else
                 getWeightFmtOpt(weights, &name_buf, "{s}.lm_head.biases", lm_prefix) orelse mlx.mlx_array_new();
             owns_lm_head = !config.tie_word_embeddings;
-            head_key = std.fmt.bufPrint(&head_key_buf, "{s}.{s}.weight", .{ lm_prefix, if (is_inkling) "unembed" else "lm_head" }) catch null;
+            head_key = std.fmt.bufPrint(&head_key_buf, "{s}.lm_head.weight", .{lm_prefix}) catch null;
         } else if (weights.get("lm_head.weight")) |w| {
             lm_head_w = w;
             head_key = "lm_head.weight";
@@ -251,19 +213,12 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     // EmbeddingGemma sentence-transformers projection head: folded into
     // the main safetensors as root-level dense.0/dense.1 by the
     // mlx-community conversion. Optional — absent on every other model.
-    var dense0_w: mlx.mlx_array = weights.get("dense.0.weight") orelse .{};
-    var dense0_s: mlx.mlx_array = weights.get("dense.0.scales") orelse .{};
-    var dense0_b: mlx.mlx_array = weights.get("dense.0.biases") orelse .{};
+    const dense0_w: mlx.mlx_array = weights.get("dense.0.weight") orelse .{};
+    const dense0_s: mlx.mlx_array = weights.get("dense.0.scales") orelse .{};
+    const dense0_b: mlx.mlx_array = weights.get("dense.0.biases") orelse .{};
     const dense1_w: mlx.mlx_array = weights.get("dense.1.weight") orelse .{};
     const dense1_s: mlx.mlx_array = weights.get("dense.1.scales") orelse .{};
     const dense1_b: mlx.mlx_array = weights.get("dense.1.biases") orelse .{};
-    // EmbeddingGemma 2 projects once: its `embedding_projection` is the whole head.
-    if (config.isEmbeddingGemma2()) {
-        const head = try getQuantTriple(weights, &name_buf, prefix, "embedding_projection", bias_mandatory);
-        dense0_w = head.w;
-        dense0_s = head.s;
-        dense0_b = head.b;
-    }
 
     // Cache for KV (standard models use all entries, MoE only uses full-attn layers)
     const cache = try KVCache.init(allocator, config.num_hidden_layers);
@@ -275,15 +230,9 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     var layers: []LayerWeights = &.{};
     var moe_layers: ?[]MoeLayerWeights = null;
     var ssm_entries: ?[]SSMCacheEntry = null;
-    var hybrid_layers: ?[]HybridLayerWeights = null;
     var moe_owned_bf16: ?[]mlx.mlx_array = null;
 
-    if (config.has_hybrid_layers) {
-        const hl = try initHybridLayers(allocator, config, weights, &name_buf, s);
-        hybrid_layers = hl.hybrid_layers;
-        ssm_entries = hl.ssm_entries;
-        moe_owned_bf16 = hl.owned_bf16; // reuse the same deinit-tracked owned list
-    } else if (config.isMoe() or config.full_attention_interval > 0) {
+    if (config.isMoe() or config.full_attention_interval > 0) {
         const ml = try initMoeLayers(allocator, config, weights, &name_buf, s);
         moe_layers = ml.moe_layers;
         moe_owned_bf16 = ml.owned_bf16;
@@ -294,10 +243,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         // hybrid and force a cold prefill on EVERY request: no checkpoint
         // can ever exist, so every lookup is a "hybrid miss" (caught live
         // by llmprobe cache-hit-reported on Qwen3-Coder, 2026-06-10).
-        // Inkling keeps them: its four per-layer short-convolutions carry
-        // position-dependent state in ssm_entries[i].conv_state, which
-        // must checkpoint with prefixes exactly like SSM state. Predicate
-        // shared with the scheduler's per-slot allocation.
+        // Predicate shared with the scheduler's per-slot allocation.
         if (config.needsSsmEntries()) {
             ssm_entries = ml.ssm_entries;
         } else {
@@ -322,9 +268,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     // LFM2: load embedding norm
     var embedding_norm_w: ?mlx.mlx_array = null;
     if (config.has_embedding_norm) {
-        // LFM2 names it embedding_norm, Inkling embed_norm.
-        embedding_norm_w = getWeightFmtOpt(weights, &name_buf, "{s}.embedding_norm.weight", prefix) orelse
-            getWeightFmtOpt(weights, &name_buf, "{s}.embed_norm.weight", prefix);
+        embedding_norm_w = getWeightFmtOpt(weights, &name_buf, "{s}.embedding_norm.weight", prefix);
     }
 
     // Gemma 4: load PLE global weights
@@ -336,15 +280,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
     var ple_proj_b_g = mlx.mlx_array_new();
     var ple_proj_norm = mlx.mlx_array_new();
     var ple_proj_quantized = false;
-    if (config.isEmbeddingGemma2()) {
-        // Per-layer inputs from the embeddings alone: a projection and its norm under `ple.`, no table.
-        const proj = try getQuantTriple(weights, &name_buf, prefix, "ple.per_layer_model_projection", bias_mandatory);
-        ple_proj_w_g = proj.w;
-        ple_proj_s_g = proj.s;
-        ple_proj_b_g = proj.b;
-        ple_proj_quantized = proj.s.ctx != null;
-        ple_proj_norm = try requireNamedWeight(weights, &name_buf, prefix, "ple.per_layer_projection_norm", "weight");
-    } else if (config.hidden_size_per_layer_input > 0) {
+    if (config.hidden_size_per_layer_input > 0) {
         ple_emb_w = try getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.weight", prefix);
         // Dense bf16: no scales/biases → null-ctx; dequantTake takes its dense path.
         ple_emb_s = if (config.quant_bits == 0) mlx.mlx_array_new() else try getWeightFmt(weights, &name_buf, "{s}.embed_tokens_per_layer.scales", prefix);
@@ -373,12 +309,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         softcap_scalar = bf16Scalar(config.final_logit_softcapping, s);
     }
 
-    // MuseGlimmer: logits scale applied before the softcap.
-    var output_mult: ?mlx.mlx_array = null;
-    if (config.output_multiplier > 0) {
-        output_mult = bf16Scalar(config.output_multiplier, s);
-    }
-
     // Gemma 4: v_norm weights (parameter-free: ones vectors)
     var v_norm_weight: ?mlx.mlx_array = null;
     var v_norm_weight_global: ?mlx.mlx_array = null;
@@ -395,34 +325,8 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         }
     }
 
-    // DiffusionGemma: self-conditioning module (the only diffusion-specific
-    // decoder weights) + a hidden-sized ones vector for its scale-free
-    // post_norm (the canvas embeddings pass through it even with a zero
-    // conditioning signal — i.e. they are always RMS-normalized pre-layer-0).
-    var self_cond: ?SelfCondWeights = null;
     var ones_hidden: ?mlx.mlx_array = null;
-    // MuseGlimmer's normed embeddings share the diffusion path's
-    // ones(hidden_size) vector for their weight-less RMS norm.
-    if (config.normed_embeddings or config.isQwen4()) {
-        const one_val = bf16Scalar(1.0, s);
-        defer _ = mlx.mlx_array_free(one_val);
-        const h_shape = [_]c_int{@intCast(config.hidden_size)};
-        ones_hidden = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_full(&ones_hidden.?, &h_shape, 1, one_val, .bfloat16, s));
-    }
-    if (config.isDiffusion()) {
-        self_cond = .{
-            .pre_norm = try getWeightFmt(weights, &name_buf, "{s}.self_conditioning.pre_norm.weight", prefix),
-            .gate_w = try getWeightFmt(weights, &name_buf, "{s}.self_conditioning.gate_proj.weight", prefix),
-            .gate_s = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.gate_proj.scales", prefix) orelse mlx.mlx_array_new(),
-            .gate_b = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.gate_proj.biases", prefix) orelse mlx.mlx_array_new(),
-            .up_w = try getWeightFmt(weights, &name_buf, "{s}.self_conditioning.up_proj.weight", prefix),
-            .up_s = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.up_proj.scales", prefix) orelse mlx.mlx_array_new(),
-            .up_b = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.up_proj.biases", prefix) orelse mlx.mlx_array_new(),
-            .down_w = try getWeightFmt(weights, &name_buf, "{s}.self_conditioning.down_proj.weight", prefix),
-            .down_s = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.down_proj.scales", prefix) orelse mlx.mlx_array_new(),
-            .down_b = getWeightFmtOpt(weights, &name_buf, "{s}.self_conditioning.down_proj.biases", prefix) orelse mlx.mlx_array_new(),
-        };
+    if (config.isQwen4()) {
         const one_val = bf16Scalar(1.0, s);
         defer _ = mlx.mlx_array_free(one_val);
         const h_shape = [_]c_int{@intCast(config.hidden_size)};
@@ -582,12 +486,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
             if (dense0_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, dense0_b);
             if (dense1_s.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, dense1_s);
             if (dense1_b.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, dense1_b);
-        }
-        if (config.isEmbeddingGemma2()) {
-            _ = mlx.mlx_vector_array_append_value(all_vec, ple_proj_w_g);
-            if (ple_proj_s_g.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, ple_proj_s_g);
-            if (ple_proj_b_g.ctx != null) _ = mlx.mlx_vector_array_append_value(all_vec, ple_proj_b_g);
-            _ = mlx.mlx_vector_array_append_value(all_vec, ple_proj_norm);
         }
 
         if (moe_layers) |ml| {
@@ -776,7 +674,7 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         config.quant_mode == .affine and
         mtpNaxOqeAffineTrunkFrom(&config, moe_layers);
     const verify_paired_gu_installed = blk: {
-        const raw = std.c.getenv("MLX_SERVE_MOE_VERIFY_PAIRED_GU") orelse break :blk false;
+        const raw = env.get(.MLX_SERVE_MOE_VERIFY_PAIRED_GU) orelse break :blk false;
         if (raw[0] == '0') break :blk false;
         // A pack or chip outside the contract declines like every other
         // shape-gated kernel; only a matching pack that disagrees with
@@ -827,10 +725,10 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .owns_lm_head = owns_lm_head,
         .owns_norms = config.norm_has_offset,
         .decode_async_ladder = decodeAsyncLadderStride(
-            if (std.c.getenv("MLX_SERVE_DECODE_ASYNC_LADDER")) |v| std.mem.span(v) else null,
+            env.span(.MLX_SERVE_DECODE_ASYNC_LADDER),
         ),
         .decode_async_ladder_qwen4 = qwen4DecodeLadderStride(
-            if (std.c.getenv("MLX_SERVE_DECODE_ASYNC_LADDER")) |v| std.mem.span(v) else null,
+            env.span(.MLX_SERVE_DECODE_ASYNC_LADDER),
         ),
         .gelu_coeff = if (need_gelu) bf16Scalar(0.7978845608028654, s) else null,
         .gelu_inner = if (need_gelu) bf16Scalar(0.044715, s) else null,
@@ -849,24 +747,13 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .ple_proj_norm = ple_proj_norm,
         .ple_proj_quantized = ple_proj_quantized,
         .softcap_scalar = softcap_scalar,
-        .output_mult = output_mult,
         .v_norm_weight = v_norm_weight,
         .v_norm_weight_global = v_norm_weight_global,
-        .self_cond = self_cond,
         .ones_hidden = ones_hidden,
         .rope_freqs_global = rope_freqs_global,
         .rope_freqs_yarn = rope_freqs_yarn,
         .yarn_mscale = yarn_mscale,
         .yarn_inv_freq = yarn_inv_freq,
-        .bert_layers = null,
-        .bert_pos_w = mlx.mlx_array_new(),
-        .bert_pos_s = mlx.mlx_array_new(),
-        .bert_pos_b = mlx.mlx_array_new(),
-        .bert_toktype_w = mlx.mlx_array_new(),
-        .bert_toktype_s = mlx.mlx_array_new(),
-        .bert_toktype_b = mlx.mlx_array_new(),
-        .bert_emb_norm_w = mlx.mlx_array_new(),
-        .bert_emb_norm_b = mlx.mlx_array_new(),
         .moe_layers = moe_layers,
         .verify_paired_gu_installed = verify_paired_gu_installed,
         .ssm_entries = ssm_entries,
@@ -875,7 +762,6 @@ pub fn init(io: std.Io, allocator: std.mem.Allocator, config: ModelConfig, weigh
         .rht = rht_registry,
         .ternary_2bit = ternary_2bit,
         .int8_cache = int8_cache,
-        .hybrid_layers = hybrid_layers,
         .embedding_norm = embedding_norm_w,
         .prompt_cache = null,
         .bits_cache = bits_cache,

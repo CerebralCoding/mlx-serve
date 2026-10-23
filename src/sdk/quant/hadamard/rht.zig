@@ -15,7 +15,7 @@ pub const SIGNS_SUFFIX = ".signs";
 /// One 128-thread group per `block`-wide stripe, element `(sg*P + p)*32 + lane`
 /// (P = J/4): lane bits butterfly via `simd_shuffle_xor`, p bits in registers,
 /// the two simdgroup bits through one threadgroup exchange.
-const KERNEL_SOURCE = kernelSource("kernels/quant/hadamard_block.metal");
+pub const KERNEL_SOURCE = kernelSource("kernels/quant/hadamard_block.metal");
 
 var kernel_cache: ?mlx.mlx_fast_metal_kernel = null;
 
@@ -119,7 +119,7 @@ fn transformComposed(x: mlx.mlx_array, signs: mlx.mlx_array, block: c_int, inver
 /// `rot = H(signs * normed)`. One 128-thread group per 1024 block; each group
 /// re-reads the whole row for the sum of squares instead of syncing with the
 /// others. Rounds through T exactly where the composed ops would.
-const NORM_ROTATE_SOURCE = kernelSource("kernels/quant/norm_rotate.metal");
+pub const NORM_ROTATE_SOURCE = kernelSource("kernels/quant/norm_rotate.metal");
 
 var norm_rotate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 

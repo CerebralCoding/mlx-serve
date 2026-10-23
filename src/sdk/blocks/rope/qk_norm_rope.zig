@@ -2,6 +2,7 @@
 //! Owns QkAngleSlot, qk_fused_kernel, qk_fused_engaged, qk_fused_override, qk_fused_env, qkNormRopeFusedEnabled, and 18 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -40,7 +41,7 @@ var qk_fused_env: ?bool = null;
 pub fn qkNormRopeFusedEnabled() bool {
     if (qk_fused_override) |v| return v;
     if (qk_fused_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_QK_NORM_ROPE_FUSED");
+    const raw = env.get(.MLX_SERVE_QK_NORM_ROPE_FUSED);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     qk_fused_env = enabled;
     return enabled;
@@ -55,7 +56,7 @@ pub fn qkNormRopeFusedEnabled() bool {
 // apart), f32 arithmetic, one T rounding — then the optional mscale multiply
 // reproduces the composed path's separate broadcast multiply (one more T
 // rounding, table value 1.0 on the pass-through tail).
-const QK_NORM_ROPE_SOURCE = kernelSource("kernels/rope/qk_norm_rope.metal");
+pub const QK_NORM_ROPE_SOURCE = kernelSource("kernels/rope/qk_norm_rope.metal");
 
 fn getQkNormRopeKernel() !mlx.mlx_fast_metal_kernel {
     if (qk_fused_kernel) |k| return k;
@@ -247,7 +248,7 @@ pub fn ropeAngleRows(
 // gate 16 -> 32 in 033f622).
 // Bit-identity with the composed chain is the acceptance bar; same kill
 // switch as the 128 kernel (MLX_SERVE_QK_NORM_ROPE_FUSED=0).
-const QK_NORM_ROPE_256_SOURCE = kernelSource("kernels/rope/qk_norm_rope_256.metal");
+pub const QK_NORM_ROPE_256_SOURCE = kernelSource("kernels/rope/qk_norm_rope_256.metal");
 
 var qk256_fused_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qk256_fused_engaged: bool = false;

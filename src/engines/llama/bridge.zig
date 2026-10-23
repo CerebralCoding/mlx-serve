@@ -9,6 +9,7 @@
 // engine for that architecture) and every other `.gguf` here.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const ffi = @import("ffi.zig");
 const log = @import("../../host/log.zig");
 
@@ -470,7 +471,7 @@ pub const LlamaSeq = struct {
 fn testModelPath() ?[]const u8 {
     // libc getenv (same idiom as src/engines/mlx/generate.zig / src/engines/ds4/bridge.zig); the
     // returned pointer is owned by the environment, so no free is needed.
-    const raw = std.c.getenv("LLAMA_TEST_MODEL") orelse return null;
+    const raw = env.get(.LLAMA_TEST_MODEL) orelse return null;
     const slice = std.mem.sliceTo(raw, 0);
     return if (slice.len == 0) null else slice;
 }

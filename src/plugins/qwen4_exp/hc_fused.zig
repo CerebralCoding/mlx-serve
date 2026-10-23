@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/hc_fused, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns hc_fused_eps, hc_fused_eps_val, hc_fused_env, hcFusedEnabled, HcFusedOut, HcPending, and 5 more.
+//! Hyper-connection reads and writes fused into custom kernels (the deferred write folded into the next read, the
+//! prefill-width pending write), with their kill switches.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");

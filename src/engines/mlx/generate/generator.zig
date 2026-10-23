@@ -1,6 +1,7 @@
 //! The Generator: per-request decode state (fields), init/deinit and the step mover; its methods live
 //! in the generate/, spec/, grammar/ and sampling/ files and are aliased here.
 const depth_bounds = @import("../spec/mtp_depth_bounds.zig");
+const plugin_settle = @import("../plugin/settle.zig");
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");
 const keyed_sample = @import("../sampling/keyed_sample.zig");
@@ -566,6 +567,7 @@ pub const Generator = struct {
     pub fn deinit(self: *Generator, allocator: std.mem.Allocator) void {
         // A GPU-arm PLE settle still owed dies with the slot's history (the finish settled it first when the cache kept it).
         self.xfm.discardDeferredPle(&self.ctx);
+        plugin_settle.release(self.xfm, &self.ctx);
         for (&self.ssm_lag) |*lag| lag.deinit(self.xfm.allocator);
         if (group_planner.enabled() and self.mtp_planner_owned) log.info("[mtp-planner-stats] tokens={d} plain={d} prime={d} spec={d} probes={d} max_gap_ms={d:.2} recovery={d}\n", .{ self.completion_tokens, self.mtp_planner_plain_ticks, self.mtp_planner_prime_ticks, self.mtp_planner_spec_rounds, self.mtp_planner_probes, self.mtp_planner_max_gap_ms, self.mtp_planner_recovery.rounds });
         if (self.last_logprob) |*lp| {

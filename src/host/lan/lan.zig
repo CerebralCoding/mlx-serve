@@ -26,6 +26,7 @@ const std = @import("std");
 const crt = @import("../../sdk/util/crt.zig");
 const os_mutex = @import("../../sdk/util/os_mutex.zig");
 const log = @import("../log.zig");
+const agent_budget = @import("../launch/budget.zig");
 
 pub const SERVICE_TYPE = "_mlxserve._tcp";
 
@@ -254,6 +255,7 @@ pub fn parsePeerModels(alloc: std.mem.Allocator, body: []const u8, peer: []const
         try item.object.put(arena, "lan_peer", .{ .string = peer });
         // A peer's alias resolves only on that peer.
         _ = item.object.orderedRemove("alias");
+        try agent_budget.stampRow(arena, &item.object);
         const entry_json = try std.json.Stringify.valueAlloc(alloc, item.*, .{});
         errdefer alloc.free(entry_json);
         try out.append(alloc, .{ .id = bare, .entry_json = entry_json });
@@ -1416,6 +1418,9 @@ test "lan: parsePeerModels rewrites ids, adds lan_peer, keeps meta" {
     try t.expect(std.mem.indexOf(u8, models[0].entry_json, "\"id\":\"gemma-4-e4b-it-4bit@Studio\"") != null);
     try t.expect(std.mem.indexOf(u8, models[0].entry_json, "\"lan_peer\":\"Studio\"") != null);
     try t.expect(std.mem.indexOf(u8, models[0].entry_json, "\"context_length\":94000") != null);
+    // A peer on an older build sent no agent budget: the mirror carries the one its context implies.
+    try t.expect(std.mem.indexOf(u8, models[0].entry_json, "\"agent_budget\":{\"context\":94000,\"output\":47000,\"compaction_reserve\":20000,\"too_small_for\":{}}") != null);
+    try t.expect(std.mem.indexOf(u8, models[1].entry_json, "agent_budget") == null);
     try t.expect(std.mem.indexOf(u8, models[1].entry_json, "\"id\":\"flux2-klein-4bit@Studio\"") != null);
     // The peer's alias resolves only on the peer, so the mirror does not list it.
     try t.expect(std.mem.indexOf(u8, models[1].entry_json, "alias") == null);

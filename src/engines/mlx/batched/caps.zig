@@ -11,12 +11,20 @@ const Transformer = @import("../transformer.zig").Transformer;
 /// Does a slot of this trunk carry per-layer recurrent state (GDN, PLE window)
 /// the batched path merges? MiMo's attention + MoE trunk carries none.
 pub fn hasRecurrentLayers(self: *const Transformer) bool {
+    if (self.plugin) |b| return b.positions != .kv_step;
     const ml = self.moe_layers orelse return false;
     for (ml) |*lw| if (lw.is_linear or lw.ple != null) return true;
     return false;
 }
 
 pub fn batchedGdnReady(self: *const Transformer, ctxs: []const *ForwardCtx) bool {
+    if (self.plugin) |b| {
+        for (ctxs) |c| {
+            const entries = c.ssm_entries orelse return b.positions == .kv_step;
+            for (entries, 0..) |*e, i| if (b.recurrentAt(i) and !e.initialized) return false;
+        }
+        return true;
+    }
     const ml = self.moe_layers orelse return false;
     if (!self.hasRecurrentLayers()) return true;
     for (ctxs) |c| {
@@ -45,10 +53,11 @@ pub fn supportsBatchedGdnDecode(self: *const Transformer) bool {
     // --max-concurrent clamp so the two cannot disagree about whether
     // this model batches.
     if (!self.config.supportsBatchedGdnDecode()) return false;
+    if (self.plugin != null) return true;
     // Built-state question: this path reads `moe_layers` and the GDN
     // ssm entries, so the trunk must actually be that shape.
     if (self.moe_layers == null) return false;
-    if (self.hybrid_layers != null or self.dsv4 != null or self.dsv41 != null or self.mlx_stream_ext != null) return false;
+    if (self.mlx_stream_ext != null) return false;
     // Every layer must be one of the two shapes this path handles.
     for (self.moe_layers.?) |*lw| {
         switch (lw.mlp) {

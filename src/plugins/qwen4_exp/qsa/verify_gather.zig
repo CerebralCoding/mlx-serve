@@ -1,5 +1,4 @@
-//! plugins/qwen4_exp/qsa/verify_gather, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns qsa_verify_gather_env_cached, qsaVerifyGatherEnabled, QSA_VERIFY_GATHER_MIN_KV_DENSE, QSA_VERIFY_GATHER_MIN_KV_QUANT, qsa_verify_gather_min_kv_env, qsa_verify_gather_min_kv_env_read, and 10 more.
+//! QSA attention at verify widths (S 2..15) over gathered rows (`qsaVerifyGatherAttn`) and its floors per KV scheme.
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");

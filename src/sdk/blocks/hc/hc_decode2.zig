@@ -6,6 +6,7 @@
 //! threadgroup. Rounding sites are the three-kernel path's (xn, silu, up, gate, mix); only the
 //! f32 accumulation order differs.
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -24,15 +25,15 @@ const ROWS_TG: c_int = 8 * RPS;
 /// Up columns a threadgroup owns, one per simdgroup.
 const COLS_TG: c_int = 16;
 
-const ND_SOURCE = kernelSource("kernels/hc/hc_decode2_nd.metal");
+pub const ND_SOURCE = kernelSource("kernels/hc/hc_decode2_nd.metal");
 
-const U2_SOURCE = kernelSource("kernels/hc/hc_decode2_u2.metal");
+pub const U2_SOURCE = kernelSource("kernels/hc/hc_decode2_u2.metal");
 
 /// The up/mix launch for 1..16 rows at hc 4, 8-bit. Lanes split
 /// [part:2][stream:2][column:1], so one lane holds one stream's slice of a weight row in registers (16-byte loads issued
 /// before any math) and every row's activations are applied to it; the activations (the stream partials summed, then
 /// silu) are staged once per threadgroup. Rounding sites are U2_SOURCE's; only the f32 summation order differs.
-const U2V_SOURCE = kernelSource("kernels/hc/hc_decode2_u2v.metal");
+pub const U2V_SOURCE = kernelSource("kernels/hc/hc_decode2_u2v.metal");
 
 var env_enabled: ?bool = null;
 pub var override: ?bool = null;
@@ -46,7 +47,7 @@ pub var served_vec: u64 = 0;
 pub fn enabled() bool {
     if (override) |v| return v;
     if (env_enabled) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_HC_DECODE2");
+    const raw = env.get(.MLX_SERVE_HC_DECODE2);
     env_enabled = raw == null or raw.?[0] != '0';
     return env_enabled.?;
 }
@@ -57,7 +58,7 @@ pub var rows_override: ?c_int = null;
 pub fn maxRows() c_int {
     if (rows_override) |v| return v;
     if (env_rows) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_HC_DECODE2_ROWS");
+    const raw = env.get(.MLX_SERVE_HC_DECODE2_ROWS);
     const parsed = if (raw) |r| std.fmt.parseInt(c_int, std.mem.span(r), 10) catch 16 else 16;
     env_rows = std.math.clamp(parsed, 1, 16);
     return env_rows.?;

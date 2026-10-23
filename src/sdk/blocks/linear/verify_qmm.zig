@@ -2,6 +2,7 @@
 //! Owns vqmmAccLines, vqmmColumnLoad, vqmmColumnChain, verifyQmmSource, verifyQmmMsgSource, vqmmMsgBn, and 63 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -208,7 +209,7 @@ fn vqmmMsgBn(m: c_int) c_int {
     return if (m <= 6) 4 else 2;
 }
 
-const VQMM_MSG_SOURCES = blk: {
+pub const VQMM_MSG_SOURCES = blk: {
     @setEvalBranchQuota(20_000_000);
     break :blk [6][:0]const u8{
         verifyQmmMsgSource(2, 4), verifyQmmMsgSource(3, 4), verifyQmmMsgSource(4, 4),
@@ -267,7 +268,7 @@ fn verifyQmmCrossrowSource(comptime m: usize) [:0]const u8 {
     }
 }
 
-const VQMM_XR_SOURCES = blk: {
+pub const VQMM_XR_SOURCES = blk: {
     @setEvalBranchQuota(20_000_000);
     break :blk [2][:0]const u8{ verifyQmmCrossrowSource(8), verifyQmmCrossrowSource(9) };
 };
@@ -299,7 +300,7 @@ fn getVerifyQmmCrossrowKernel(m: c_int) !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-fn runVerifyQmmCrossrow(
+pub fn runVerifyQmmCrossrow(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
     w: mlx.mlx_array,
@@ -364,7 +365,7 @@ fn vqmmBnOverride() c_int {
     if (vqmm_bn_test_override) |v| return v;
     if (vqmm_bn_override_cache) |v| return v;
     var v: c_int = 0;
-    if (std.c.getenv("MLX_SERVE_VQMM_BN")) |p| {
+    if (env.get(.MLX_SERVE_VQMM_BN)) |p| {
         const parsed = std.fmt.parseInt(c_int, std.mem.span(p), 10) catch 0;
         for (VQMM_BN_CHOICES) |c| {
             if (c == parsed) v = parsed;
@@ -399,7 +400,7 @@ var vqmm_kparts_override_cache: ?c_int = null;
 fn vqmmKParts(N: c_int) c_int {
     const forced = vqmm_kparts_override_cache orelse blk: {
         var v: c_int = 0;
-        if (std.c.getenv("MLX_SERVE_VQMM_KPARTS")) |p| {
+        if (env.get(.MLX_SERVE_VQMM_KPARTS)) |p| {
             const parsed = std.fmt.parseInt(c_int, std.mem.span(p), 10) catch 0;
             if (parsed >= 1 and parsed <= 8) v = parsed;
         }
@@ -417,7 +418,7 @@ pub fn vqmmBnFor(m: c_int, N: c_int) c_int {
     return if (@mod(N, want) == 0) want else 0;
 }
 
-fn vqmmSourceIdx(m: c_int, bn: c_int) usize {
+pub fn vqmmSourceIdx(m: c_int, bn: c_int) usize {
     const mi: usize = @intCast(m - 2);
     const bi: usize = switch (bn) {
         2 => 0,
@@ -429,7 +430,7 @@ fn vqmmSourceIdx(m: c_int, bn: c_int) usize {
 
 const VQMM_N_KERNELS = 6 * VQMM_BN_CHOICES.len;
 
-const VQMM_SOURCES = blk: {
+pub const VQMM_SOURCES = blk: {
     // 18 tiles x a four-width unpack ladder is a lot of comptime string work.
     @setEvalBranchQuota(20_000_000);
     var out: [VQMM_N_KERNELS][:0]const u8 = undefined;
@@ -542,7 +543,7 @@ pub fn verifyQmmEnabled() bool {
     if (verify_qmm_override) |v| return v;
     if (verify_qmm_enabled_cache) |v| return v;
     var on = true;
-    if (std.c.getenv("MLX_SERVE_VERIFY_QMM")) |p| {
+    if (env.get(.MLX_SERVE_VERIFY_QMM)) |p| {
         const val = std.mem.span(p);
         if (val.len > 0 and val[0] == '0') on = false;
     }
@@ -564,7 +565,7 @@ fn crossrowEnvEnabled() bool {
     if (vqmm_crossrow_override) |v| return v;
     if (vqmm_crossrow_env_cached) |v| return v;
     const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_VERIFY_QMM_CROSSROW") orelse break :blk false;
+        const raw = env.get(.MLX_SERVE_VERIFY_QMM_CROSSROW) orelse break :blk false;
         break :blk std.mem.eql(u8, std.mem.sliceTo(raw, 0), "1");
     };
     vqmm_crossrow_env_cached = v;
@@ -639,7 +640,7 @@ var vqmm_mixed_plain_env_cache: ?u8 = null;
 fn mixedPlainEnvMode() u8 {
     if (vqmm_mixed_plain_env_cache) |v| return v;
     var mode: u8 = 2;
-    if (std.c.getenv("MLX_SERVE_VERIFY_QMM_MIXED_PLAIN")) |p| {
+    if (env.get(.MLX_SERVE_VERIFY_QMM_MIXED_PLAIN)) |p| {
         const val = std.mem.span(p);
         if (val.len > 0 and val[0] == '0') mode = 0;
         if (val.len > 0 and val[0] == '1') mode = 1;
@@ -855,7 +856,7 @@ var vqmm_splitk_cfgs = KernelCfgCache(VqmmSplitkKey, 1, 64){};
 
 const VQMM_MSG_NSG: c_int = 8; // simdgroups per threadgroup (their sweep winner)
 
-fn runVerifyQmmMsg(
+pub fn runVerifyQmmMsg(
     s: mlx.mlx_stream,
     x: mlx.mlx_array,
     w: mlx.mlx_array,
@@ -1112,7 +1113,7 @@ fn expectVerifyQmmNoWorseThanStock(
     const cos_stock = dot_s / (@sqrt(ns) * @sqrt(nt));
     const cos_kern = dot_k / (@sqrt(nk) * @sqrt(nt));
 
-    if (std.c.getenv("MLX_SERVE_VQMM_PARITY_DEBUG") != null) {
+    if (env.get(.MLX_SERVE_VQMM_PARITY_DEBUG) != null) {
         std.debug.print(
             "[vqmm-parity] {s:>16}: n={d} max {d:.5}/{d:.5} rms {d:.6}/{d:.6} (ratio {d:.3}) cos {d:.7}/{d:.7}\n",
             .{ label, count, stock_max, kern_max, rms_stock, rms_kern, if (rms_stock > 0) rms_kern / rms_stock else 0, cos_stock, cos_kern },
@@ -1977,7 +1978,7 @@ test "NAX host scaffolding: zero-pad to 16 rows + slice-back are exact (runs off
 }
 
 test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)" {
-    if (std.c.getenv("MLX_SERVE_VQMM_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MLX_SERVE_VQMM_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();
@@ -2118,7 +2119,7 @@ test "verifyQmm µbench: kernel vs stock per 27B shape (MLX_SERVE_VQMM_UBENCH=1)
 }
 
 test "verifyQmm Flash Next shapes µbench: stock vs plain vs NAX per width (MLX_SERVE_VQMM_FN_UBENCH=1)" {
-    if (std.c.getenv("MLX_SERVE_VQMM_FN_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MLX_SERVE_VQMM_FN_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(0xF1A5);
@@ -2203,7 +2204,7 @@ test "verifyQmm Flash Next shapes µbench: stock vs plain vs NAX per width (MLX_
 }
 
 test "verifyQmm mixed-width NAX µbench (MLX_SERVE_VQMM_MIXED_UBENCH=1)" {
-    if (std.c.getenv("MLX_SERVE_VQMM_MIXED_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MLX_SERVE_VQMM_MIXED_UBENCH) == null) return error.SkipZigTest;
     if (!verifyQmmNaxAvailable()) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;

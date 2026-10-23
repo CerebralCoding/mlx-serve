@@ -5,6 +5,8 @@ const log = @import("../log.zig");
 const scheduler_mod = @import("../../engines/mlx/scheduler.zig");
 const model_registry_mod = @import("../registry/registry.zig");
 const media_mod = @import("gen.zig");
+const plugin_http = @import("plugin/http.zig");
+const PluginEngine = @import("plugin/engine.zig").Engine;
 const http_server = @import("../http/server.zig");
 
 const Conn = @import("../http/conn.zig").Conn;
@@ -19,27 +21,15 @@ const GenJob = struct {
     body: []const u8,
     lm: *model_registry_mod.LoadedModel,
     route: media_mod.GenRoute,
-    /// `.decisions`: the body, parsed and validated before queueing.
-    decision: ?*const media_mod.DecisionRequest = null,
 };
 
 /// Inference-thread entry point for a gen job. Dispatches on the engine slot
 /// and writes the full HTTP/SSE response to the (parked) connection.
 fn genJobRun(ctx: *anyopaque) void {
     const job: *GenJob = @ptrCast(@alignCast(ctx));
-    const result = switch (job.route) {
-        .image => if (job.lm.image_engine) |e| media_mod.handleImage(job.allocator, job.conn, job.body, e) else error.WrongModality,
-        .speech => if (job.lm.audio_engine) |e| media_mod.handleAudio(job.allocator, job.conn, job.body, e) else error.WrongModality,
-        .music => if (job.lm.audio_engine) |e| media_mod.handleMusic(job.allocator, job.conn, job.body, e) else error.WrongModality,
-        .sound => if (job.lm.audio_engine) |e| media_mod.handleSound(job.allocator, job.conn, job.body, e) else error.WrongModality,
-        .video => if (job.lm.video_engine) |e| media_mod.handleVideo(job.conn.io, job.allocator, job.conn, job.body, e) else error.WrongModality,
-        .mesh => if (job.lm.mesh_engine) |e| media_mod.handleMesh(job.allocator, job.conn, job.body, e) else error.WrongModality,
-        .decisions => {
-            genJobRunMany(&.{ctx});
-            return;
-        },
-    };
-    result catch |err| {
+    if (job.route == .decisions) return genJobRunMany(&.{ctx});
+    const p = job.lm.media_plugin orelse return;
+    plugin_http.handle(job.allocator, job.conn, job.body, p, job.route, job.lm.id) catch |err| {
         log.warn("[gen] {s} job failed: {s}\n", .{ @tagName(job.route), @errorName(err) });
     };
 }
@@ -48,13 +38,13 @@ fn genJobRun(ctx: *anyopaque) void {
 /// model (`GenRequest.merge`): they are answered in one pass.
 fn genJobRunMany(ctxs: []const *anyopaque) void {
     const first: *GenJob = @ptrCast(@alignCast(ctxs[0]));
-    const e = first.lm.decision_engine orelse return;
-    var buf: [scheduler_mod.MAX_MERGED_WEIGHT]media_mod.DecisionJob = undefined;
-    for (ctxs, buf[0..ctxs.len]) |c, *d| {
+    const p = first.lm.media_plugin orelse return;
+    var queued: [scheduler_mod.MAX_MERGED_WEIGHT]plugin_http.Queued = undefined;
+    for (ctxs, queued[0..ctxs.len]) |c, *q| {
         const job: *GenJob = @ptrCast(@alignCast(c));
-        d.* = .{ .allocator = job.allocator, .conn = job.conn, .req = job.decision.? };
+        q.* = .{ .allocator = job.allocator, .conn = job.conn, .body = job.body };
     }
-    media_mod.handleDecisions(e, first.lm.id, buf[0..ctxs.len]);
+    plugin_http.handleMany(p, first.lm.id, queued[0..ctxs.len]);
 }
 
 /// Dispatch a media-generation request to the inference thread. `lm` is the
@@ -66,30 +56,15 @@ pub fn handleGen(allocator: std.mem.Allocator, stream: *Conn, body: []const u8, 
         try sendErrorResponse(allocator, stream, "503 Service Unavailable", "internal_error", "Scheduler not ready", 503);
         return;
     };
-    const ok = switch (route.modality()) {
-        .image => lm.image_engine != null,
-        .audio => lm.audio_engine != null,
-        .video => lm.video_engine != null,
-        .mesh => lm.mesh_engine != null,
-        .decision => lm.decision_engine != null,
-        .diarization => lm.diarization_engine != null,
-    };
-    if (!ok) {
+    if (!PluginEngine.serves(lm.media_plugin, route.modality())) {
         try sendErrorResponse(allocator, stream, "400 Bad Request", "invalid_request_error", "Target model does not support this modality. Load the matching image/audio/video/3D/decision model and target it by id.", 400);
         return;
     }
-    var decision: ?media_mod.DecisionRequest = null;
-    defer if (decision) |*d| d.deinit(allocator);
-    if (route == .decisions) {
-        decision = try media_mod.prepareDecisions(allocator, stream, body, lm.decision_engine.?) orelse return;
-    }
-    var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route, .decision = if (decision) |*d| d else null };
+    var job = GenJob{ .allocator = allocator, .conn = stream, .body = body, .lm = lm, .route = route };
     var req = scheduler_mod.GenRequest{ .ctx = &job, .run = genJobRun, .model = lm, .decision = route == .decisions };
-    if (lm.mesh_engine) |e| req.peak_bytes = media_mod.meshRequestPeakBytes(body, e.backend);
-    if (decision) |*d| req.merge = .{
-        .run_many = genJobRunMany,
-        .weight = @max(1, d.count()),
-        .window_us = lm.decision_engine.?.batch_window_us,
+    if (lm.media_plugin) |p| req.peak_bytes = p.requestPeak(body);
+    if (route == .decisions) if (lm.media_plugin) |p| {
+        req.merge = .{ .run_many = genJobRunMany, .weight = plugin_http.questionCount(body), .window_us = p.batch_window_us };
     };
     scheduler.runGeneration(&req) catch |err| switch (err) {
         error.Shutdown => {

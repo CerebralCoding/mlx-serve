@@ -13,6 +13,8 @@ pub const fixture = @import("testing/fixture.zig");
 pub const tensors = @import("testing/tensors.zig");
 /// A fixture's byte-level `tokenizer.json`.
 pub const byte_tokenizer = @import("testing/byte_tokenizer.zig");
+/// A fixture's tiny qwen3_5 trunk (config + weights).
+pub const tiny_qwen35 = @import("testing/tiny_qwen35.zig");
 
 test {
     _ = plugin;

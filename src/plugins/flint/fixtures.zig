@@ -1,5 +1,4 @@
-//! plugins/flint/fixtures, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns tests only.
+//! plugins/flint/fixtures: the served Flint (this plugin behind the driver) against rec_mlx's model. Owns tests only.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
@@ -8,6 +7,7 @@ const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const testing = @import("../../engines/mlx/kv/cache.zig").testing;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
+const driver = @import("../../engines/mlx/plugin/driver.zig");
 const qwen4CompareRows = @import("../../sdk/testing/parity.zig").qwen4CompareRows;
 const qwen4ReadF32 = @import("../../sdk/testing/parity.zig").qwen4ReadF32;
 const mimoDecidedMisses = @import("../mimo_v2/attention.zig").mimoDecidedMisses;
@@ -25,10 +25,8 @@ test "flint fixture: one-shot and chunked prefill + decode vs rec_mlx's model (F
     const io = std.Io.Threaded.global_single_threaded.io();
 
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try driver.load(io, allocator, &config, std.mem.span(model_dir), s);
     defer xfm.deinit();
 
     var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
@@ -90,10 +88,8 @@ test "flint batched decode: a slot in a two-slot tick tracks rec_mlx's model as 
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try driver.load(io, allocator, &config, std.mem.span(model_dir), s);
     defer xfm.deinit();
     try testing.expect(xfm.supportsBatchedGdnDecode());
 

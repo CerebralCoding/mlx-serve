@@ -8,6 +8,16 @@ const mlx = @import("../../mlx/ffi.zig");
 
 const testing = std.testing;
 
+/// Whether this machine has less RAM than plugin root `M`'s fixture job needs (`pub const test_min_ram_gib`); says so
+/// by name when it does, so the caller skips.
+pub fn ramShort(comptime M: type) bool {
+    if (!@hasDecl(M, "test_min_ram_gib")) return false;
+    const ram = std.process.totalSystemMemory() catch return false;
+    if (ram >= @as(u64, M.test_min_ram_gib) << 30) return false;
+    std.debug.print("skip: {s}'s fixture job needs {d} GiB of RAM, this machine has {d}\n", .{ M.plugin.name, M.test_min_ram_gib, ram >> 30 });
+    return true;
+}
+
 pub fn MediaPack(comptime M: type) type {
     return struct {
         tmp: testing.TmpDir,
@@ -18,6 +28,7 @@ pub fn MediaPack(comptime M: type) type {
 
         /// `a` must outlive the pack (an arena).
         pub fn open(a: std.mem.Allocator) !@This() {
+            if (ramShort(M)) return error.SkipZigTest;
             const fx = try M.conformanceFixture(a);
             var tmp = testing.tmpDir(.{});
             errdefer tmp.cleanup();
@@ -45,7 +56,14 @@ pub fn MediaPack(comptime M: type) type {
         }
 
         /// One job on `body`; the encoded result (owned by the plugin until its next job), or the refusal.
-        pub fn run(self: *@This(), body: []const u8) !union(enum) { ok: []const u8, refused: media_abi.Verdict } {
+        pub fn run(self: *@This(), body: []const u8) !Outcome {
+            return self.runInputs(body, &.{});
+        }
+
+        pub const Outcome = union(enum) { ok: []const u8, refused: media_abi.Verdict };
+
+        /// A job with uploads (`media.Request.inputs`).
+        pub fn runInputs(self: *@This(), body: []const u8, inputs: []const media_abi.Str) !Outcome {
             const Quiet = struct {
                 fn report(_: ?*anyopaque, _: media_abi.Str, _: u32, _: u32) callconv(.c) void {}
                 fn boundary(_: ?*anyopaque) callconv(.c) bool {
@@ -53,7 +71,8 @@ pub fn MediaPack(comptime M: type) type {
                 }
             };
             const progress: media_abi.Progress = .{ .ctx = null, .report = Quiet.report, .boundary = Quiet.boundary };
-            const req: media_abi.Request = .{ .body = .of(body) };
+            const dir = self.mem.packDir();
+            const req: media_abi.Request = .{ .body = .of(body), .inputs = .{ .ptr = inputs.ptr, .len = inputs.len }, .dir = &dir };
             const v = M.table.step(self.engine, &req, &progress);
             if (!v.isOk()) return .{ .refused = v };
             var out: media_abi.Str = .{};

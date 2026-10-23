@@ -1,5 +1,5 @@
-//! plugins/qwen4_exp/qsa/indexer, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns qsaInstallRing, qsaAppendKeys, qsaAppendPooled, qsaScoreCols, qsaScoreBank, qsaScoreOperand, and 13 more.
+//! The QSA indexer: key append into the ring and pooled blocks, the block score sheet, and the mask or block picks
+//! each attention arm reads (`qsaMask`, `qsaMaskFromQk`).
 
 const std = @import("std");
 const mlx = @import("../../../mlx/ffi.zig");

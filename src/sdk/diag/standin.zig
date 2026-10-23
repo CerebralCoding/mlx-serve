@@ -2,6 +2,7 @@
 //! Owns Standin, standin_cached, qwen4_standin_override, qwen4Standin, standin_ones, standinOnes, and 1 more.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 
 // Self-contained monotonic lap timer (Zig 0.17 has no std.time.Timer;
@@ -16,7 +17,7 @@ pub fn qwen4Standin() Standin {
     if (qwen4_standin_override) |v| return v;
     if (standin_cached) |v| return v;
     var v = Standin{};
-    if (std.c.getenv("QWEN4_STANDIN")) |raw| {
+    if (env.get(.QWEN4_STANDIN)) |raw| {
         var it = std.mem.splitScalar(u8, std.mem.sliceTo(raw, 0), ',');
         while (it.next()) |tok| {
             if (std.mem.eql(u8, tok, "gdn")) v.gdn = true;

@@ -155,17 +155,11 @@ pub fn computeGeglu(self: *const Transformer, gate: mlx.mlx_array, up: mlx.mlx_a
     return result;
 }
 
-/// gpt_oss clamped SwiGLU, dispatched instead of `computeGeglu` when the
-/// config declares a `swiglu_limit`. Kept OUT of `computeGeglu` on purpose:
-/// that helper's two fast paths (`compiled_geglu`, `fusedSwiGLU`) both bake
-/// in `silu(gate)*up`, and `fusedSwiGLU`'s exactness argument rests on a
-/// sigmoid lookup table built for that exact expression. Routing a
-/// different activation through them would be silently wrong rather than
-/// slow, so the dispatch happens one level up.
-pub fn computeGptOssSwiGLU(self: *const Transformer, gate: mlx.mlx_array, up: mlx.mlx_array) !mlx.mlx_array {
-    if (self.config.swiglu_clamp) return (try fusedClampedSwiGLU(self.s, gate, up, self.config.swiglu_limit)) orelse
+/// The clamped SwiGLU a `swiglu_limit` declares, dispatched instead of `computeGeglu`'s silu fast paths (their
+/// sigmoid table is built for `silu(gate)*up` alone).
+pub fn computeClampedSwiGLU(self: *const Transformer, gate: mlx.mlx_array, up: mlx.mlx_array) !mlx.mlx_array {
+    return (try fusedClampedSwiGLU(self.s, gate, up, self.config.swiglu_limit)) orelse
         clampedSwiGLU(self.s, gate, up, self.config.swiglu_limit);
-    return gptOssSwiGLU(self.s, gate, up, self.config.swiglu_limit, self.config.swiglu_alpha);
 }
 
 /// Fused logit softcap: tanh(x/cap) * cap in a single compiled kernel.

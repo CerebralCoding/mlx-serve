@@ -9,6 +9,7 @@
 //! reshuffling the existing layout.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const marching_cubes = @import("marching_cubes.zig");
 
 const MAGIC: u32 = 0x46546C67; // "glTF"
@@ -537,7 +538,7 @@ test "glb: write textured swift fixture" {
     // GLB reader (checkerboard albedo on a unit quad). Run via:
     //   GLB_TEXTURED_FIXTURE_OUT=app/Tests/MLXCoreTests/Fixtures/hy3d_textured_quad.glb \
     //     zig build test -Doptimize=ReleaseFast -Dtest-filter="textured swift fixture"
-    const out_path = std.mem.span(std.c.getenv("GLB_TEXTURED_FIXTURE_OUT") orelse return error.SkipZigTest);
+    const out_path = std.mem.span(env.get(.GLB_TEXTURED_FIXTURE_OUT) orelse return error.SkipZigTest);
     const a = testing.allocator;
     const png = @import("../media/png.zig");
     var rgb: [8 * 8 * 3]u8 = undefined;
@@ -576,7 +577,7 @@ test "glb: write textured swift fixture" {
 }
 
 test "glb: write swift fixture" {
-    const out_path = std.mem.span(std.c.getenv("GLB_FIXTURE_OUT") orelse return error.SkipZigTest);
+    const out_path = std.mem.span(env.get(.GLB_FIXTURE_OUT) orelse return error.SkipZigTest);
     const a = testing.allocator;
     const np: usize = 64;
     const grid = try a.alloc(f32, np * np * np);

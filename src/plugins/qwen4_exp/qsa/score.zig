@@ -1,5 +1,4 @@
-//! plugins/qwen4_exp/qsa/score, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns QsaScoreLayout, qsa_score_probe_flip_override, qsa_score_fused_env, qsa_score_layout_override, qsa_score_tf32_override, qsa_score_tf32_env, and 54 more.
+//! The QSA block score sheet: the fused NAX kernel (`msv_qsa_score`), its layouts and arms, and the composed chain.
 
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
@@ -136,20 +135,20 @@ pub fn qsaPooledRowContiguous(pooled: mlx.mlx_array) bool {
     return st[2] == 1 and st[1] == 128;
 }
 
-fn qsaScoreLayoutFor(rows: c_int) QsaScoreLayout {
+pub fn qsaScoreLayoutFor(rows: c_int) QsaScoreLayout {
     if (qsa_score_layout_override) |v| return v;
     return if (rows >= 128) .h4 else .base;
 }
 
-fn qsaScoreNsg(layout: QsaScoreLayout) c_int {
+pub fn qsaScoreNsg(layout: QsaScoreLayout) c_int {
     return if (layout == .h4) 8 else 4;
 }
 
-fn qsaScoreRowsPerTg(layout: QsaScoreLayout, nsg: c_int) c_int {
+pub fn qsaScoreRowsPerTg(layout: QsaScoreLayout, nsg: c_int) c_int {
     return nsg * (if (layout == .h4) @as(c_int, 16) else 4);
 }
 
-fn qsaScoreNsh(nslab: u32, ngrp: u32, layout: QsaScoreLayout) u32 {
+pub fn qsaScoreNsh(nslab: u32, ngrp: u32, layout: QsaScoreLayout) u32 {
     const slabs_per: u32 = if (layout == .h4) 32 else 1;
     var nsh: u32 = @max(@as(u32, 1), nslab / slabs_per);
     const min_nsh: u32 = @max(@as(u32, 1), (256 + ngrp - 1) / ngrp);
@@ -163,7 +162,7 @@ pub const QSA_SCORE_KERNEL_HEADER = kernelSource("plugins/qwen4_exp/kernels/qsa_
 // The lane -> (row, col) map (`fm`/`fn`) is the matmul2d cooperative-fragment layout,
 // hand-derived from the SDK; every A, B and C fragment must use it. K stays 8 ascending
 // 16-deep `op.run` calls: that is the stock tf32 GEMM's order and the bit-identity contract.
-const QSA_SCORE_KERNEL_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_score.metal");
+pub const QSA_SCORE_KERNEL_SOURCE = kernelSource("plugins/qwen4_exp/kernels/qsa_score.metal");
 
 const QsaScoreCfgKey = struct { nsg: c_int, rows: c_int, nb: c_int, layout: u8 };
 var qsa_score_cfgs = QsaCfgCache(QsaScoreCfgKey, 1){};

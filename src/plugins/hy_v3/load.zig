@@ -1,5 +1,5 @@
-//! plugins/hy_v3/load, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns hy3ExpertContainer, expertContainerAt.
+//! Hunyuan 3's expert container name for the engine's layered loader: `mlp.experts` (ox-ox) or `mlp.switch_mlp`
+//! (mlx-lm), whichever the checkpoint holds.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");

@@ -1,193 +1,14 @@
-//! plugins/inkling/attention, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns inklingConvSlot, InklingAttnOut, inklingAttnWith, InklingSconvOut, inklingSconvCore, inklingRelBias, and 3 more.
+//! Inkling's attention block and its helpers (the short conv, the relative bias, the mask, the log-scaling), with the
+//! dense MLP and the vocab-trimming head. Reference: inkling_mlx/attention.py.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const testing = @import("../../engines/mlx/kv/cache.zig").testing;
-const slidingViewFor = @import("../../engines/mlx/kv/sliding.zig").slidingViewFor;
-const FullAttnWeights = @import("../../engines/mlx/layer_weights.zig").FullAttnWeights;
-const SSMCacheEntry = @import("../../engines/mlx/ssm/entry.zig").SSMCacheEntry;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCopy;
 const jsonF64 = @import("../../sdk/testing/parity.zig").jsonF64;
 const jsonToMlxArray = @import("../../sdk/testing/parity.zig").jsonToMlxArray;
 const maxAbsDiffF32 = @import("../../sdk/testing/parity.zig").maxAbsDiffF32;
 const inklingRouterChain = @import("moe.zig").inklingRouterChain;
-
-// ── Inkling attention (no RoPE: rel-logits bias + k/v short conv) ──
-// Reference: inkling_mlx/attention.py. Per-head q/k RMSNorm with scale
-// 1/head_dim; hybrid sliding(512)/global; the additive mask carries BOTH
-// the hidden-state-conditioned relative-position bias and the
-// causal/sliding constraint; log-scaling on global layers past n_floor
-// (exact no-op below — skipped entirely). k/v projections pass through
-// depthwise causal short-convolutions whose kernel-1 f32 tails ride the
-// per-slot ssm entry (slots 0 and 1 of the layer's concatenated
-// conv_state; the layer tail owns slots 2/3 and the state reassembly).
-
-/// Slice one conv slot [B, K-1, dim] out of the layer's concatenated
-/// conv_state, or null when the entry is uninitialized (sequence start).
-pub fn inklingConvSlot(self: *Transformer, ssm: *const SSMCacheEntry, chan_off: c_int, chan_dim: c_int) !?mlx.mlx_array {
-    if (!ssm.initialized or ssm.conv_state.ctx == null) return null;
-    const st_shape = mlx.getShape(ssm.conv_state);
-    var out = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(out);
-    const start = [_]c_int{ 0, 0, chan_off };
-    const stop = [_]c_int{ st_shape[0], st_shape[1], chan_off + chan_dim };
-    const strides = [_]c_int{ 1, 1, 1 };
-    try mlx.check(mlx.mlx_slice(&out, ssm.conv_state, &start, 3, &stop, 3, &strides, 3, self.s));
-    return out;
-}
-
-pub const InklingAttnOut = struct { out: mlx.mlx_array, k_state: mlx.mlx_array, v_state: mlx.mlx_array };
-
-pub fn inklingAttnWith(
-    self: *Transformer,
-    ctx: *ForwardCtx,
-    x: mlx.mlx_array,
-    fa: *const FullAttnWeights,
-    ssm: *const SSMCacheEntry,
-    layer: u32,
-    offset: c_int,
-    batch: c_int,
-    seq_len: c_int,
-    is_prefill: bool,
-) !InklingAttnOut {
-    const cache = ctx.cache;
-    const cfg = &self.config;
-    const h_count: c_int = @intCast(cfg.num_attention_heads);
-    const kv_h: c_int = @intCast(cfg.num_key_value_heads);
-    const hd: c_int = @intCast(cfg.head_dim);
-    const kv_dim: c_int = kv_h * hd;
-    const d_rel: c_int = @intCast(cfg.inkling_d_rel);
-    // 1/head_dim via the shared 1/sqrt(query_pre_attn_scalar) convention.
-    const attn_scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(cfg.query_pre_attn_scalar)));
-    const is_global = cfg.isGlobalLayer(layer);
-    const decode_hint = batch == 1 and !is_prefill;
-
-    // Projections (no biases in any shipped config).
-    const q_proj = try self.attnProj(x, fa.q_w, fa.q_s, fa.q_b, decode_hint, layer);
-    defer _ = mlx.mlx_array_free(q_proj);
-    const k_proj = try self.attnProj(x, fa.k_w, fa.k_s, fa.k_b, decode_hint, layer);
-    defer _ = mlx.mlx_array_free(k_proj);
-    const v_proj = try self.attnProj(x, fa.v_w, fa.v_s, fa.v_b, decode_hint, layer);
-    defer _ = mlx.mlx_array_free(v_proj);
-    const rel_out = try self.attnProj(x, fa.rel_w, fa.rel_s, fa.rel_b, decode_hint, layer);
-    defer _ = mlx.mlx_array_free(rel_out);
-
-    // k/v short convolutions (f32 compute, conv slots 0 and 1).
-    const k_prev = try self.inklingConvSlot(ssm, 0, kv_dim);
-    defer if (k_prev) |p| {
-        _ = mlx.mlx_array_free(p);
-    };
-    const v_prev = try self.inklingConvSlot(ssm, kv_dim, kv_dim);
-    defer if (v_prev) |p| {
-        _ = mlx.mlx_array_free(p);
-    };
-    const ks = try inklingSconvCore(self.s, k_proj, fa.k_sconv_w, k_prev);
-    defer _ = mlx.mlx_array_free(ks.out);
-    errdefer _ = mlx.mlx_array_free(ks.new_state);
-    const vs = try inklingSconvCore(self.s, v_proj, fa.v_sconv_w, v_prev);
-    defer _ = mlx.mlx_array_free(vs.out);
-    errdefer _ = mlx.mlx_array_free(vs.new_state);
-
-    // Per-head RMSNorm on q/k, then [B,S,H,D] → [B,H,S,D].
-    const q_shape = [_]c_int{ batch, seq_len, h_count, hd };
-    const kv_shape = [_]c_int{ batch, seq_len, kv_h, hd };
-    const perm = [_]c_int{ 0, 2, 1, 3 };
-    var q_r = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q_r);
-    try mlx.check(mlx.mlx_reshape(&q_r, q_proj, &q_shape, 4, self.s));
-    const q_normed = try self.rmsNorm(q_r, fa.q_norm);
-    defer _ = mlx.mlx_array_free(q_normed);
-    var q_t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q_t);
-    try mlx.check(mlx.mlx_transpose_axes(&q_t, q_normed, &perm, 4, self.s));
-
-    var k_r = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k_r);
-    try mlx.check(mlx.mlx_reshape(&k_r, ks.out, &kv_shape, 4, self.s));
-    const k_normed = try self.rmsNorm(k_r, fa.k_norm);
-    defer _ = mlx.mlx_array_free(k_normed);
-    var k_t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(k_t);
-    try mlx.check(mlx.mlx_transpose_axes(&k_t, k_normed, &perm, 4, self.s));
-
-    var v_r = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v_r);
-    try mlx.check(mlx.mlx_reshape(&v_r, vs.out, &kv_shape, 4, self.s));
-    var v_t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(v_t);
-    try mlx.check(mlx.mlx_transpose_axes(&v_t, v_r, &perm, 4, self.s));
-
-    // KV cache: sliding layers read only the tail their queries reach.
-    // Nothing else here changes — inklingRelBias and inklingCombineMask
-    // already take `kv_len` off the view and `kv_start = total_kv - kv_len`,
-    // so they are correct for any trim; they simply never got one. Inkling
-    // is serial, so the width that matters is the prefill chunk.
-    const total_kv: c_int = offset + seq_len;
-    const sliding = slidingViewFor(cfg, total_kv, seq_len);
-    const max_kv: u32 = if (is_global) 0 else sliding.span;
-    var kv_view = try cache.update(layer, k_t, v_t, self.s, max_kv);
-    defer kv_view.deinit();
-    const kv_len: c_int = mlx.getShape(kv_view.k)[2];
-    const kv_start: c_int = total_kv - kv_len;
-
-    // Relative-logits bias + causal/sliding constraint as ONE additive mask.
-    const rel_shape = [_]c_int{ batch, seq_len, h_count, d_rel };
-    var rel_r = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(rel_r);
-    try mlx.check(mlx.mlx_reshape(&rel_r, rel_out, &rel_shape, 4, self.s));
-    const bias = try inklingRelBias(self.s, rel_r, fa.rel_proj, offset, kv_len, kv_start);
-    defer _ = mlx.mlx_array_free(bias);
-    const window: ?c_int = if (!is_global and cfg.has_sliding_window) @intCast(cfg.sliding_window) else null;
-    var mask = try inklingCombineMask(self.s, bias, offset, kv_len, kv_start, window);
-    defer _ = mlx.mlx_array_free(mask);
-
-    // Log-scaling (global layers only): tau = 1 + alpha·ln(max((pos+1)/n_floor, 1))
-    // multiplies q AND the mask per query position. Exact no-op while the
-    // whole chunk sits at or below the floor — skip the ops entirely.
-    var q_final = q_t;
-    var q_scaled = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(q_scaled);
-    if (is_global and cfg.inkling_log_n_floor > 0 and total_kv > @as(c_int, @intCast(cfg.inkling_log_n_floor))) {
-        const tau = try inklingLogScaleTau(self.s, offset, seq_len, cfg.inkling_log_n_floor, cfg.inkling_log_alpha);
-        defer _ = mlx.mlx_array_free(tau);
-        // q: [B,H,S,D] × tau [1,1,S,1] (f32; cast back to q dtype)
-        var q32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(q32);
-        try mlx.check(mlx.mlx_astype(&q32, q_t, .float32, self.s));
-        var qs32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(qs32);
-        try mlx.check(mlx.mlx_multiply(&qs32, q32, tau, self.s));
-        try mlx.check(mlx.mlx_astype(&q_scaled, qs32, mlx.mlx_array_dtype(q_t), self.s));
-        q_final = q_scaled;
-        var m_scaled = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_multiply(&m_scaled, mask, tau, self.s));
-        _ = mlx.mlx_array_free(mask);
-        mask = m_scaled;
-    }
-
-    // SDPA with the additive mask, in the query's dtype (reference casts).
-    var mask_cast = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(mask_cast);
-    try mlx.check(mlx.mlx_astype(&mask_cast, mask, mlx.mlx_array_dtype(q_final), self.s));
-    var attn_out = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(attn_out);
-    try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_final, kv_view.k, kv_view.v, attn_scale, "", mask_cast, .{ .ctx = null }, false, self.s));
-
-    // [B,H,S,D] → [B,S,H*D] → o_proj
-    var attn_t = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(attn_t);
-    try mlx.check(mlx.mlx_transpose_axes(&attn_t, attn_out, &perm, 4, self.s));
-    const flat_shape = [_]c_int{ batch, seq_len, h_count * hd };
-    var attn_flat = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(attn_flat);
-    try mlx.check(mlx.mlx_reshape(&attn_flat, attn_t, &flat_shape, 3, self.s));
-
-    const out = try self.attnProj(attn_flat, fa.o_w, fa.o_s, fa.o_b, decode_hint, layer);
-    return .{ .out = out, .k_state = ks.new_state, .v_state = vs.new_state };
-}
 
 // ── Inkling (inkling_mm_model) forward helpers ──
 // Reference: the checkpoint's bundled inkling_mlx/ package (Apache-2.0,
@@ -427,6 +248,185 @@ fn inklingLogScaleTau(s: mlx.mlx_stream, q_start: c_int, lq: c_int, n_floor: u32
     try mlx.check(mlx.mlx_reshape(&out, tau_flat, &[_]c_int{ 1, 1, lq, 1 }, 4, s));
     return out;
 }
+
+// ── the plugin's block ──
+
+const ops = @import("../../mlx/ops.zig");
+const block = @import("../../sdk/bases/block.zig");
+const kv = @import("../../sdk/bases/kv.zig");
+const band = @import("../../sdk/bases/blocks/sliding.zig");
+const sdpaSinks = @import("../../sdk/bases/blocks/decoder_attention.zig").sdpaSinks;
+const Linear = @import("../../sdk/bases/blocks/linear.zig").Linear;
+const dq = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
+
+const Graph = ops.Graph;
+const Array = ops.Array;
+const Ctx = block.Ctx;
+
+/// `[1, S, C]` through a short conv behind `prev` (null = zeros): the output and the new window, owned by `g`.
+fn sconv(g: *Graph, x: Array, w: Array, prev: ?Array) ![2]Array {
+    const r = try inklingSconvCore(g.s, x, w, prev);
+    const out = g.adopt(r.out) catch |e| {
+        _ = mlx.mlx_array_free(r.new_state);
+        return e;
+    };
+    return .{ out, try g.adopt(r.new_state) };
+}
+
+/// Inkling's attention with its output short conv (`attn_sconv`): q/k/v/relative-state projections, causal short
+/// convs on k and v, per-head q/k RMSNorm, no RoPE; the hidden-conditioned relative bias and the causal (or band)
+/// constraint as one additive mask, log-scaled with q on a global layer past `log_floor`. The layer's conv state
+/// `[k | v | attn | mlp]` (f32) is the slot's `.conv`: this block writes the first three windows and carries the
+/// MLP's, which `Mlp` replaces.
+pub const Attention = struct {
+    pub const kind: block.Kind = .mixer;
+    pub const supports_batched_rows = false;
+    pub const Weights = struct {
+        q: Linear,
+        k: Linear,
+        v: Linear,
+        o: Linear,
+        rel: Linear,
+        q_norm: Array,
+        k_norm: Array,
+        /// `[d_rel, extent]`.
+        rel_proj: Array,
+        k_sconv: Array,
+        v_sconv: Array,
+        /// The output's short conv `[hidden, kernel, 1]`.
+        out_sconv: Array,
+        heads: c_int,
+        kv_heads: c_int,
+        head_dim: c_int,
+        d_rel: c_int,
+        /// 0 = a global layer.
+        window: u32,
+        /// Log-scaling past this many positions on a global layer; 0 = off.
+        log_floor: u32,
+        log_alpha: f32,
+        /// q, k, v, rel, o decode-only side copies (`--decode-attn-quant`); a null `w` keeps the weight.
+        dq: [5]Linear = @splat(.{}),
+    };
+
+    pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
+        const g = c.g;
+        const s = c.rows;
+        const hd = w.head_dim;
+        const kv_dim = w.kv_heads * hd;
+        const offset: c_int = @intCast(c.offset());
+        const total: c_int = offset + s;
+        // A solo one-row step reads the side copies, as the legacy `attnProj`.
+        const step = c.slots == 1 and c.rows == 1 and dq.decodeAttnQuantEnabled();
+        var lins = [_]Linear{ w.q, w.k, w.v, w.rel, w.o };
+        if (step) for (&lins, w.dq) |*l, d| {
+            if (d.w.ctx != null and (l.s.ctx == null or dq.attnDqRequantEnabled())) l.* = d;
+        };
+        const q_proj = try lins[0].forward(g, x);
+        const k_proj = try lins[1].forward(g, x);
+        const v_proj = try lins[2].forward(g, x);
+        const rel_out = try lins[3].forward(g, x);
+
+        const st = try kv.state(c, .conv);
+        const width: c_int = if (st) |a| ops.shape(a)[2] else 0;
+        const window = struct {
+            fn at(gr: *Graph, a: ?Array, from: c_int, n: c_int) !?Array {
+                return if (a) |x_| try gr.sliceAxis(x_, 2, from, from + n) else null;
+            }
+        }.at;
+        const ks = try sconv(g, k_proj, w.k_sconv, try window(g, st, 0, kv_dim));
+        const vs = try sconv(g, v_proj, w.v_sconv, try window(g, st, kv_dim, kv_dim));
+
+        const perm = [_]c_int{ 0, 2, 1, 3 };
+        const q = try g.transpose(try g.rmsNorm(try g.reshape(q_proj, &.{ 1, s, w.heads, hd }), w.q_norm, c.shared.eps), &perm);
+        const k = try g.transpose(try g.rmsNorm(try g.reshape(ks[0], &.{ 1, s, w.kv_heads, hd }), w.k_norm, c.shared.eps), &perm);
+        const v = try g.transpose(try g.reshape(vs[0], &.{ 1, s, w.kv_heads, hd }), &perm);
+
+        const sv = band.view(w.window, hd, false, total, s);
+        var view = try kv.append(c, k, v, if (w.window > 0) sv.span else 0);
+        defer kv.release(c, &view);
+        const dv = kv.dense(view);
+        const kv_len = ops.shape(dv.k)[2];
+        const kv_start = total - kv_len;
+
+        const rel = try g.reshape(rel_out, &.{ 1, s, w.heads, w.d_rel });
+        const bias = try g.adopt(try inklingRelBias(g.s, rel, w.rel_proj, offset, kv_len, kv_start));
+        var mask = try g.adopt(try inklingCombineMask(g.s, bias, offset, kv_len, kv_start, if (w.window > 0) @intCast(w.window) else null));
+        var qf = q;
+        if (w.window == 0 and w.log_floor > 0 and total > @as(c_int, @intCast(w.log_floor))) {
+            const tau = try g.adopt(try inklingLogScaleTau(g.s, offset, s, w.log_floor, w.log_alpha));
+            qf = try g.astype(try g.mul(try g.astype(q, .float32), tau), ops.dtype(q));
+            mask = try g.mul(mask, tau);
+        }
+        const scale: f32 = 1.0 / @sqrt(@as(f32, @floatFromInt(hd * hd)));
+        const attn = try sdpaSinks(g, qf, dv.k, dv.v, scale, "", try g.astype(mask, ops.dtype(qf)), .{}, false);
+        const flat = try g.reshape(try g.transpose(attn, &perm), &.{ 1, s, w.heads * hd });
+        const out = try lins[4].forward(g, flat);
+
+        const hidden = ops.shape(out)[2];
+        const as = try sconv(g, out, w.out_sconv, try window(g, st, 2 * kv_dim, hidden));
+        var parts = [_]Array{ ks[1], vs[1], as[1], undefined };
+        const n: usize = if (width > 2 * kv_dim + hidden) 4 else 3;
+        if (n == 4) parts[3] = try g.sliceAxis(st.?, 2, 2 * kv_dim + hidden, width);
+        try kv.setState(c, .conv, try g.concat(parts[0..n], 2));
+        return as[0];
+    }
+};
+
+/// The MLP slot: the dense SwiGLU times its learned gain (`mlp.global_scale`, in the stored dtype) below
+/// `dense_mlp_idx`, the routed experts above, then the output's short conv (`mlp_sconv`), whose window replaces the
+/// last columns of the layer's conv state.
+pub const Mlp = struct {
+    pub const kind: block.Kind = .mlp;
+    pub const supports_batched_rows = false;
+    pub const Weights = struct {
+        body: union(enum) {
+            dense: struct { mlp: GatedMlp.Weights, gain: Array = .{} },
+            moe: moe_block.Moe.Weights,
+        },
+        out_sconv: Array,
+        /// Columns of the conv state before this window (`Config.mlpStateOffset`).
+        state_offset: c_int,
+    };
+
+    pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
+        const g = c.g;
+        const y = switch (w.body) {
+            .dense => |*d| blk: {
+                const m = try GatedMlp.forward(&d.mlp, c, x);
+                break :blk if (d.gain.ctx != null) try g.mul(m, d.gain) else m;
+            },
+            .moe => |*m| try moe_block.Moe.forward(m, c, x),
+        };
+        // The attention block wrote this layer's state; its MLP window is there once a forward has run.
+        const st = (try kv.state(c, .conv)) orelse return error.InklingStateMissing;
+        const width = ops.shape(st)[2];
+        const prev: ?Array = if (width > w.state_offset) try g.sliceAxis(st, 2, w.state_offset, width) else null;
+        const ms = try sconv(g, y, w.out_sconv, prev);
+        try kv.setState(c, .conv, try g.concat(&.{ try g.sliceAxis(st, 2, 0, w.state_offset), ms[1] }, 2));
+        return ms[0];
+    }
+};
+
+const GatedMlp = @import("../../sdk/bases/blocks/mlp.zig").GatedMlp;
+const moe_block = @import("moe.zig");
+
+/// Head: the LM head, then the padded vocab's real rows (`unpadded_vocab_size`).
+pub const Head = struct {
+    pub const kind: block.Kind = .head;
+    pub const supports_batched_rows = true;
+    pub const Weights = struct {
+        lin: Linear,
+        /// Logit columns kept; 0 = all.
+        vocab: c_int = 0,
+    };
+
+    pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
+        const logits = try head.project(c.g, &w.lin, x);
+        return if (w.vocab > 0 and w.vocab < ops.shape(logits)[2]) c.g.sliceAxis(logits, 2, 0, w.vocab) else logits;
+    }
+};
+
+const head = @import("../../sdk/bases/blocks/head.zig");
 
 // ── tests ──
 

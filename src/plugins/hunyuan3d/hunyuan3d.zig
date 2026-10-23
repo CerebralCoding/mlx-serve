@@ -44,6 +44,9 @@ const glb = @import("../../sdk/mesh/glb.zig");
 
 const Weights = model_mod.Weights;
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
+const graph_call = @import("../../sdk/media/graph_call.zig").call;
+const gelu_blk = @import("../../sdk/blocks/mlp/gelu.zig");
+const timestep = @import("../../sdk/blocks/dit/timestep.zig");
 const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
 const S = mlx.mlx_stream;
 
@@ -133,22 +136,7 @@ fn scalarF(v: f32) mlx.mlx_array {
 /// Exact (erf) GELU — every GELU in this model (t_embedder, DiT FFN experts,
 /// DINO MLP, VAE MLP) is torch's default approximate="none".
 fn geluErf(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const inv_sqrt2 = scalarF(0.7071067811865476);
-    defer _ = mlx.mlx_array_free(inv_sqrt2);
-    const xs = try mulA(x, inv_sqrt2, s);
-    defer _ = mlx.mlx_array_free(xs);
-    var e = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(e);
-    try mlx.check(mlx.mlx_erf(&e, xs, s));
-    const one = scalarF(1.0);
-    defer _ = mlx.mlx_array_free(one);
-    const opt = try addA(e, one, s);
-    defer _ = mlx.mlx_array_free(opt);
-    const half = scalarF(0.5);
-    defer _ = mlx.mlx_array_free(half);
-    const hx = try mulA(x, half, s);
-    defer _ = mlx.mlx_array_free(hx);
-    return mulA(hx, opt, s);
+    return graph_call(s, gelu_blk.geluErf, .{x});
 }
 /// SDPA without mask: q/k/v [B,H,L,hd].
 fn sdpa(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: S) !mlx.mlx_array {
@@ -1280,16 +1268,9 @@ pub const Dit = struct {
 /// emb = [sin(t·f_0..), cos(t·f_0..)] — SIN FIRST, computed in f32 (bf16/f16
 /// sincos of tiny σ args is a parity killer).
 pub fn timestepEmbed(allocator: std.mem.Allocator, t: f32, dim: u32) !mlx.mlx_array {
-    const half = dim / 2;
     const buf = try allocator.alloc(f32, dim);
     defer allocator.free(buf);
-    const ln1e4: f64 = std.math.log(f64, std.math.e, 10000.0);
-    for (0..half) |i| {
-        const f = std.math.exp(-ln1e4 * @as(f64, @floatFromInt(i)) / @as(f64, @floatFromInt(half)));
-        const ang = @as(f64, t) * f;
-        buf[i] = @floatCast(@sin(ang));
-        buf[half + i] = @floatCast(@cos(ang));
-    }
+    timestep.sinusoid(f64, buf, t, .sin_first);
     const sh = [_]c_int{ 1, @intCast(dim) };
     return mlx.mlx_array_new_data(buf.ptr, &sh, 2, .float32);
 }
@@ -2159,11 +2140,12 @@ pub const Engine = struct {
     dit: Dit,
     vae: VaeDecoder,
 
-    pub fn load(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8) !*Engine {
+    /// On the caller's stream (borrowed).
+    pub fn loadOn(io: std.Io, allocator: std.mem.Allocator, model_dir: []const u8, s: S) !*Engine {
         const self = try allocator.create(Engine);
         errdefer allocator.destroy(self);
         self.allocator = allocator;
-        self.s = mlx.mlx_default_gpu_stream_new();
+        self.s = s;
         self.cfg = try readConfigFile(io, allocator, model_dir);
         self.dino = try loadDino(allocator, self.cfg, model_dir, self.s);
         errdefer self.dino.deinit();

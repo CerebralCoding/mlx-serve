@@ -73,17 +73,6 @@ pub fn rawEmbedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx
 pub fn embedding(self: *const Transformer, token_ids: mlx.mlx_array) !mlx.mlx_array {
     const raw = try self.rawEmbedding(token_ids);
 
-    // MuseGlimmer: weight-less RMS norm on the looked-up embeddings (the
-    // reference's MuseGlimmerTextNormedEmbedding — deliberately NOT folded
-    // into the table). Mutually exclusive with emb_scale by construction
-    // (scale_embeddings is false whenever normed_embeddings is set).
-    if (self.config.normed_embeddings) {
-        defer _ = mlx.mlx_array_free(raw);
-        var normed = mlx.mlx_array_new();
-        try mlx.check(mlx.mlx_fast_rms_norm(&normed, raw, self.ones_hidden.?, self.config.rms_norm_eps, self.s));
-        return normed;
-    }
-
     if (self.emb_scale) |scale| {
         defer _ = mlx.mlx_array_free(raw);
         var scaled = mlx.mlx_array_new();

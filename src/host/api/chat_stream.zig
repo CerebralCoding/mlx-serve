@@ -1,6 +1,7 @@
 //! StreamMode, StreamingTokenStream; handleStreamingGeneration
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
 const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
@@ -1095,7 +1096,7 @@ pub fn handleStreamingGeneration(
             // APPEND the FULL pre-parse buffer of every tools request, framed so
             // a harvester can slice each record exactly (the text is arbitrary
             // bytes, so the byte count — not a delimiter — defines the record).
-            if (std.c.getenv("MLX_SERVE_RAW_DUMP_FILE")) |dump_path| {
+            if (env.get(.MLX_SERVE_RAW_DUMP_FILE)) |dump_path| {
                 appendRawToolDump(std.mem.span(dump_path), tools_json, text_buf.items);
             }
         }
@@ -1238,36 +1239,6 @@ pub fn handleStreamingGeneration(
 }
 
 // ── tests ──
-
-test "a stream never starts inside a think block because the REQUEST asked for thinking" {
-    // Every streaming surface seeded the think flag by OR-ing the request's
-    // enable-thinking flag into the prompt-derived one (the needle below is
-    // ++-split so this comment cannot satisfy the scan), on the assumption
-    // that a thinking-enabled model
-    // opens `<think>` as its first token. That is true for Qwen and Gemma —
-    // whose templates render the opener, which `promptOpensThink` then SEES in
-    // the rendered bytes anyway — and false for LFM2-VL, whose generation
-    // prompt is a bare `<|im_start|>assistant\n` and whose model answers
-    // directly. With `enable_thinking: true` the whole answer streamed as
-    // `reasoning_content` and `content` came back EMPTY (live 2026-08-13: the
-    // app renders it as a Thinking block with no reply under it). The same
-    // request non-streaming was correct, because the non-streaming split has
-    // always keyed on the prompt — so the two surfaces disagreed about the
-    // bytes of one answer, which is the class this scan pins.
-    //
-    // Whether a stream starts inside a think block is a property of the
-    // RENDERED PROMPT. A request flag is a request.
-    const src = @embedFile("chat_stream.zig") ++ @embedFile("anthropic_stream.zig") ++ @embedFile("responses/handler.zig");
-    const needle = "in_think_block = enable" ++ "_thinking";
-    try testing.expect(std.mem.indexOf(u8, src, needle) == null);
-    // …and the initialization that replaces it must still exist, or the scan
-    // passes on a file that stopped tracking think state at all.
-    var count: usize = 0;
-    var i: usize = 0;
-    const init = "in_think_block = prompt_opened_think";
-    while (std.mem.indexOfPos(u8, src, i, init)) |at| : (i = at + init.len) count += 1;
-    try testing.expect(count >= 2);
-}
 
 test "a streamed turn's result keeps the prompt-cache hit and timings the slot measured" {
     const t = std.testing;

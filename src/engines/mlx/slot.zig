@@ -431,7 +431,7 @@ pub const Slot = struct {
             self.allocator.destroy(runner);
             self.diffusion = null;
         }
-        if (self.model.transformer) |xfm| xfm.markQsaPooledRopeStale();
+        if (self.model.transformer) |xfm| xfm.qwen4Host().markQsaPooledRopeStale();
         if (self.legacy_gen) |*gen| {
             gen.deinit(self.allocator);
         }

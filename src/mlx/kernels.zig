@@ -7,6 +7,7 @@
 //! is one whole file: edit a kernel, restart. Pieces and templates assembled in Zig need a rebuild.
 
 const std = @import("std");
+const env = @import("../env.zig");
 const crt = @import("../sdk/util/crt.zig");
 const log = @import("../host/log.zig");
 
@@ -70,7 +71,7 @@ var env_read = false;
 pub fn resolve(text: [*:0]const u8) [*:0]const u8 {
     if (!env_read) {
         env_read = true;
-        if (std.c.getenv("MLX_SERVE_KERNEL_DIR")) |dir| overrides = .{ .root = std.mem.span(dir) };
+        if (env.get(.MLX_SERVE_KERNEL_DIR)) |dir| overrides = .{ .root = std.mem.span(dir) };
     }
     return if (overrides) |*o| o.get(text) else text;
 }

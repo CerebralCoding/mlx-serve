@@ -13,6 +13,7 @@
 //! plan and CLAUDE.md "M-RoPE" notes.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 
 /// Full patch grid of one image BEFORE spatial merge: h = H/patch, w = W/patch,
 /// t = temporal frames (1 for a still image). The number of LLM image-pad tokens
@@ -758,7 +759,7 @@ test "qwen4 yarn parity vs HF and vLLM (QWEN4_YARN_FIXTURES)" {
     //
     //     QWEN4_YARN_FIXTURES=/tmp/qwen4_yarn.json \
     //         zig build test -Dtest-filter="qwen4 yarn parity"
-    const path_z = std.c.getenv("QWEN4_YARN_FIXTURES") orelse return error.SkipZigTest;
+    const path_z = env.get(.QWEN4_YARN_FIXTURES) orelse return error.SkipZigTest;
     const path = std.mem.span(path_z);
     if (path.len == 0) return error.SkipZigTest;
     const io = std.Io.Threaded.global_single_threaded.io();

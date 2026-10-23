@@ -118,9 +118,7 @@ fn MediaBag(comptime T: type) type {
 /// Ownership is by PROVENANCE: a list only ever comes from `openImages` /
 /// `openVideos` / `openAudio`, and is owned from its first append — so a `try`
 /// between the decode and the message append cannot leak either, and a new
-/// early return cannot leak by omission. That is the property the source scan
-/// "a request handler never owns its own media list" keeps: a handler may not
-/// declare a media list of its own.
+/// early return cannot leak by omission: a handler never declares a media list of its own.
 pub const RequestMedia = struct {
     allocator: std.mem.Allocator,
     image_bag: MediaBag(chat_mod.ImageData) = .{},

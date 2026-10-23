@@ -2,7 +2,7 @@
 //! Owns sinkAttnWith, sinkCacheUpdate, sinkAttnSlots, sinkAttnCore, sinkAttnOut, mimoDecodeCopies.
 
 const mlx = @import("../../../mlx/ffi.zig");
-const dec_attn = @import("../../../plugins/mimo_v2/dec_attn.zig");
+const dec_attn = @import("dec_attn.zig");
 const sliding_mod = @import("../../../engines/mlx/kv/sliding.zig");
 const MAX_BATCH_ROWS = @import("../../../engines/mlx/batched/layered.zig").MAX_BATCH_ROWS;
 const ForwardCtx = @import("../../../engines/mlx/forward_ctx.zig").ForwardCtx;

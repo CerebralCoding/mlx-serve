@@ -1,6 +1,7 @@
 //! MTP draft chain state: history stash, pre-drafts, prompt lookup, lazy pre-draft, padded head history.
 const depth_bounds = @import("../mtp_depth_bounds.zig");
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const mlx = @import("../../../../mlx/ffi.zig");
 const transformer_mod = @import("../../transformer.zig");
 const tokenizer_mod = @import("../../../../host/tokenizer/tokenizer.zig");
@@ -270,7 +271,7 @@ pub fn mtpLookupEnabled() bool {
     };
     if (mtp_lookup_override) |v| return v;
     if (Cache.v) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MTP_LOOKUP");
+    const raw = env.get(.MLX_SERVE_MTP_LOOKUP);
     Cache.v = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     return Cache.v.?;
 }
@@ -499,7 +500,7 @@ pub fn mtpLazyPredraftEnabled() bool {
     if (!mtpPredraftEnabled()) return false;
     if (mtp_lazy_predraft_override) |v| return v;
     if (mtp_lazy_predraft_cache) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MTP_LAZY_PREDRAFT");
+    const raw = env.get(.MLX_SERVE_MTP_LAZY_PREDRAFT);
     mtp_lazy_predraft_cache = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     return mtp_lazy_predraft_cache.?;
 }
@@ -616,7 +617,7 @@ var mtp_padded_head_cache: ?bool = null;
 pub fn mtpPaddedHeadEnabled() bool {
     if (mtp_padded_head_override) |v| return v;
     if (mtp_padded_head_cache) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MTP_PADDED_HEAD");
+    const raw = env.get(.MLX_SERVE_MTP_PADDED_HEAD);
     mtp_padded_head_cache = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     return mtp_padded_head_cache.?;
 }
@@ -822,7 +823,7 @@ const LazyRig = struct {
     tok: Tokenizer,
 
     fn load(a: std.mem.Allocator, io: std.Io) !*LazyRig {
-        const model_dir = std.c.getenv("QWEN4_TEST_MODEL") orelse return error.SkipZigTest;
+        const model_dir = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
         if (mlx.noGpuBackend()) return error.SkipZigTest;
         const rig = try a.create(LazyRig);
         errdefer a.destroy(rig);

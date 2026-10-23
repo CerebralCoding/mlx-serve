@@ -47,6 +47,7 @@
 //! (`Load::eval_gpu` is Not Implemented — the lora.zig/model.zig precedent).
 
 const std = @import("std");
+const env = @import("../../../../env.zig");
 const builtin = @import("builtin");
 const mlx = @import("../../../../mlx/ffi.zig");
 const kv_quant = @import("../kv_quant.zig");
@@ -3640,7 +3641,7 @@ pub fn modelFingerprintWithLayout(
 
 /// Default persistence root: `~/.mlx-serve/kv-cache`.
 pub fn defaultBaseDir(allocator: std.mem.Allocator) ![]u8 {
-    const home = std.mem.span(std.c.getenv("HOME") orelse return error.NoHome);
+    const home = std.mem.span(env.get(.HOME) orelse return error.NoHome);
     return std.fmt.allocPrint(allocator, "{s}/.mlx-serve/kv-cache", .{home});
 }
 
@@ -3675,7 +3676,7 @@ pub fn chunkShareEnabled() bool {
     if (chunk_share_override) |v| return v;
     if (chunk_share_env_cached) |v| return v;
     const v = blk: {
-        const raw = std.c.getenv("MLX_SERVE_SSD_CHUNK_SHARE") orelse break :blk true;
+        const raw = env.get(.MLX_SERVE_SSD_CHUNK_SHARE) orelse break :blk true;
         break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
     };
     chunk_share_env_cached = v;

@@ -8,6 +8,7 @@ const ModelRegistry = model_registry_mod.ModelRegistry;
 const testing = std.testing;
 
 const Conn = @import("conn.zig").Conn;
+const isRoute = @import("router.zig").isRoute;
 const readRequest = @import("request.zig").readRequest;
 const loadProgressBody = @import("../api/models.zig").loadProgressBody;
 const sendResponse = @import("respond.zig").sendResponse;
@@ -138,8 +139,8 @@ pub const StartupResponder = struct {
         _ = words.next();
         const raw_path = words.next() orelse return;
         const path = if (std.mem.indexOfScalar(u8, raw_path, '?')) |q| raw_path[0..q] else raw_path;
-        if (std.mem.eql(u8, path, "/health")) return sendResponse(conn, "503 Service Unavailable", "application/json", "{\"status\":\"loading\"}");
-        if (std.mem.eql(u8, path, "/v1/load-progress") and peerIsLoopback(conn)) {
+        if (isRoute(path, "/health")) return sendResponse(conn, "503 Service Unavailable", "application/json", "{\"status\":\"loading\"}");
+        if (isRoute(path, "/v1/load-progress") and peerIsLoopback(conn)) {
             const body = try loadProgressBody(self.allocator, self.io, self.registry);
             defer self.allocator.free(body);
             return sendResponse(conn, "200 OK", "application/json", body);

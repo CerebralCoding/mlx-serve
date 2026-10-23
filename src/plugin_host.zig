@@ -5,7 +5,9 @@
 pub const mlx = @import("mlx/ffi.zig");
 pub const log = @import("host/log.zig");
 pub const io_util = @import("sdk/util/io_util.zig");
+/// The process environment (`src/env.zig`): every variable a plugin reads is registered there.
+pub const env = @import("env.zig");
 pub const mtp_acceptance = @import("engines/mlx/spec/mtp_acceptance.zig");
-/// Sushi's EXL3 routed experts (`lib/sushi/src/exl3`): a plugin's EXL3 bank multiplies through them.
-pub const sushi_exl3 = @import("sushi_exl3");
+/// The EXL3 quant format (`src/sdk/quant/exl3/format.zig`): a plugin's EXL3 bank multiplies through it.
+pub const exl3 = @import("sdk/quant/exl3/format.zig");
 pub const dsa_nax = @import("plugins/glm5_next/dsa_nax.zig");

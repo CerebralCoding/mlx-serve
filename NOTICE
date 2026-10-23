@@ -302,6 +302,11 @@ and associated regression tests in `src/engines/mlx/generate.zig` and `src/engin
 are adapted from Sushi commit 09e6d4792e6178b864b809299d53dbd05cd054cd.
 The e4m3 GEMV in `src/sdk/quant/exl3/sushi_pack.zig` is adapted from `src/fp8_block.zig` of
 Sushi v1.2.3 (commit 2c602b9e).
+`src/sdk/quant/exl3/sushi/` is Sushi v1.3.0's `src/exl3` (commit 8e4c0af1): the EXL3 and STQ
+decoders, kernels, codebook tables and test fixtures, with its Metal kernel text moved into
+`kernels/*.metal`. It re-implements turboderp/exllamav3's EXL3 format (MIT) from that reference:
+the 16x16 trellis packing, the MCG and MUL1 decodes, the tensor-core permutation and the suh/svh
+Hadamard. No exllamav3 code is shipped.
 
 --------------------------------------------------------------------------------
 mlx-stream
@@ -309,11 +314,34 @@ https://github.com/davidtai/mlx-stream
 Copyright (c) 2026 David Tai
 Licensed under the MIT License (the permission and warranty terms in LICENSE).
 
-`lib/mlx-stream`, built into the macOS server: DeepSeek-V4.1's EXL3 streaming
-repack (its arch, Metal kernels, EXL3 decoder and SSD expert streamer) and
-MiMo-V2.6-Flash's prepared MXFP4 pack (its arch, kernels and MTP draft lane). Its own
-NOTICE lists the material it incorporates (MLX's steel headers, ExLlamaV3's
-EXL3 format).
+Absorbed from mlx-stream (commit fcb4011 of our fork ddalcu/mlx-stream), built into
+the macOS server: the streamed packs' archs (`src/plugins/{deepseek_v41,glm5_next,
+glm_moe_dsa,mimo_v2}/stream/`), the DeepSeek-V4.1 EXL3 decoder and its pinned Metal
+kernels (`src/sdk/quant/exl3/stream/`), the SSD expert streamer, its plugin SDK and C
+shims (`src/sdk/weights/streamed/`, `src/mlx_stream*.zig`), its scripts
+(`scripts/mlx_stream/`) and docs (`docs/mlx-stream/`). The DeepSeek-V4.1 streaming
+runtime it was ported from (the packed expert record and manifest formats, the
+streamed-bank layout and the routed-expert EXL3 Metal kernels) is David Tai's earlier
+Python work, its parity oracle, MIT. It incorporates:
+- MLX (https://github.com/ml-explore/mlx, Copyright (c) 2023-2025 Apple Inc., MIT):
+  the kernel texts under `src/sdk/quant/exl3/stream/kernels/exl3/` inline MLX's steel
+  headers, each section marked with its MLX source path and copyright line;
+  `src/sdk/weights/streamed/csrc/mlx_{event,alloc}_shim.cpp` compile against the
+  staged MLX and mlx-c private headers.
+- ExLlamaV3 (https://github.com/turboderp-org/exllamav3, Copyright (c) turboderp,
+  MIT): the EXL3 format it reads follows exllamav3 v1.4.2 (codebook.cuh,
+  exl3_dq.cuh, pack.cu, hadamard.cu, quantize.py); `src/sdk/quant/exl3/stream/
+  {quant,kernels}.zig` cite the lines they reproduce. No exllamav3 code is shipped.
+- DeepSeek-V4.1-Flash (https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash,
+  Copyright (c) 2023 DeepSeek, MIT): the release's `inference/model.py` is the
+  reference for the `deepseek_v41` arch. The fixtures
+  `src/sdk/weights/streamed/fixtures/dsv41_{official_engram,independent_dequant}.json`
+  and `scripts/mlx_stream/dump_dsv41_reference_fixtures.py` use its official Engram
+  CPU forward and FP8/FP4 decoding at revision 2cba9e42aa026125f3ed06c6d98c1db82f7ca027
+  (loaded externally, not vendored; the fixtures hold synthetic inputs, the official
+  hash tables and expected rows). They are adapted from Sushi's DeepSeek-V4.1 consumer
+  fixtures (MIT, Copyright (c) 2026 Theinruj Toranavikrai, Copyright (c) 2026 David
+  Dalcu). No model weights are included.
 
 --------------------------------------------------------------------------------
 h3.c-ane (Apple Neural Engine port of h3.c)
@@ -461,6 +489,12 @@ Copyright (c) 2023-2026 The ggml authors
 
 Prebuilt release staged into `lib/llama` by `scripts/fetch-llama.sh` and linked
 into the mlx-serve binary as the generic GGUF engine. Unmodified.
+
+`src/sdk/quant/gguf/` (formerly the mlx-serve-gguf module): `iq_tables.zig` and
+`metal/tables/*.h` are generated from ggml/src/ggml-common.h by
+`scripts/gguf/gen_tables.py`, `quants.zig` is a port of the reference dequantization
+in ggml/src/ggml-quants.c, and `fixtures/*.bin` hold ggml's own dequant output
+(`scripts/gguf/gen_fixtures.c`).
 
 --------------------------------------------------------------------------------
 ds4.c

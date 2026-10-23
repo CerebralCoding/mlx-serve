@@ -1,6 +1,7 @@
 //! Jinja chat template rendering, the template probes, and the fallback message shaping.
 
 const std = @import("std");
+const env = @import("../../env.zig");
 const jinja_c = @import("jinja_c");
 const log = @import("../log.zig");
 const testing = std.testing;
@@ -638,7 +639,7 @@ test "renderChatTemplate: REAL MiniCPM5 chat_template.jinja multi-turn tool hist
     // text. Single-turn requests never enter the branch, which is why the
     // MiniCPM5 V3 parser corpus (all single-turn) never caught it.
     // Same wrong-family prompt-format class as the Hy3 str.format test above.
-    const dir = std.c.getenv("MINICPM5_MODEL_DIR") orelse return error.SkipZigTest;
+    const dir = env.get(.MINICPM5_MODEL_DIR) orelse return error.SkipZigTest;
     const allocator = testing.allocator;
     const path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{std.mem.span(dir)});
     defer allocator.free(path);
@@ -734,7 +735,7 @@ test "renderChatTemplate: REAL Hy3 chat_template.jinja renders without fallback 
     // pins: no silent fallback (family tokens present), template-opened think
     // (thinking on), closed think (thinking off), tool-call args rendered via
     // arguments.items(), tool_response wrapping for role:"tool".
-    const dir = std.c.getenv("HY3_MODEL_DIR") orelse return error.SkipZigTest;
+    const dir = env.get(.HY3_MODEL_DIR) orelse return error.SkipZigTest;
     const allocator = testing.allocator;
     const path = try std.fmt.allocPrint(allocator, "{s}/chat_template.jinja", .{std.mem.span(dir)});
     defer allocator.free(path);
@@ -1887,7 +1888,7 @@ test "mid-system: stock Qwen notes preserve tool rounds without rewriting histor
 }
 
 test "mid-system: real Qwen pack loaded through ChatConfig preserves tool-round prefixes" {
-    const dir = std.c.getenv("QWEN_MID_SYSTEM_MODEL_DIR") orelse return error.SkipZigTest;
+    const dir = env.get(.QWEN_MID_SYSTEM_MODEL_DIR) orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try loadChatConfig(io, a, std.mem.span(dir));

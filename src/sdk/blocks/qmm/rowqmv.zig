@@ -19,7 +19,7 @@ pub const HEADER = kernelSource("kernels/qmm/rowqmv_header.metal");
 
 /// One simdgroup per input row, each over BLK blocks of RPS output rows; the
 /// row count is a launch dimension only.
-const QMV_SOURCE = kernelSource("kernels/qmm/rowqmv_qmv.metal");
+pub const QMV_SOURCE = kernelSource("kernels/qmm/rowqmv_qmv.metal");
 
 var qmv_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const CfgKey = struct { rows: c_int, n: c_int, k: c_int, bits: u32, gs: u32, relu2: bool };
@@ -114,10 +114,10 @@ pub fn qmvAct(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx
 /// p / TOPK's slot p % TOPK and reads expert IDS[p]; simdgroup g of
 /// threadgroup (b, p) takes the expert's output rows RPS (SG b + g) ..
 /// fc1 applies mlx-lm's relu2 on its bf16 output: bf16(max(bf16(sum), 0)^2).
-const EXPERT_UP_SOURCE = kernelSource("kernels/qmm/rowqmv_expert_up.metal");
+pub const EXPERT_UP_SOURCE = kernelSource("kernels/qmm/rowqmv_expert_up.metal");
 
 /// fc2 over each pair's own activation row.
-const EXPERT_DOWN_SOURCE = kernelSource("kernels/qmm/rowqmv_expert_down.metal");
+pub const EXPERT_DOWN_SOURCE = kernelSource("kernels/qmm/rowqmv_expert_down.metal");
 
 const EXPERT_SG = 2;
 var up_kernel: ?mlx.mlx_fast_metal_kernel = null;
@@ -144,7 +144,7 @@ fn expertConfig(key: ExpertKey) !mlx.mlx_fast_metal_kernel_config {
     return config;
 }
 
-fn expertLaunch(up: bool, x: mlx.mlx_array, ids: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, pairs: c_int, topk: c_int, q: [2]u32, s: mlx.mlx_stream) !mlx.mlx_array {
+pub fn expertLaunch(up: bool, x: mlx.mlx_array, ids: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, pairs: c_int, topk: c_int, q: [2]u32, s: mlx.mlx_stream) !mlx.mlx_array {
     const kslot = if (up) &up_kernel else &down_kernel;
     if (kslot.* == null) kslot.* = try newKernel(if (up) "msv_rowqmv_expert_up" else "msv_rowqmv_expert_down", &.{ "x", "ids", "w", "scales", "biases" }, &.{"y"}, if (up) EXPERT_UP_SOURCE else EXPERT_DOWN_SOURCE);
     const ws = mlx.getShape(w);
@@ -185,7 +185,7 @@ pub fn experts(x: mlx.mlx_array, ids: mlx.mlx_array, topk: c_int, fc1: [3]mlx.ml
 /// simdgroups per expert; simdgroup g sums its D / SG inputs (lane l takes 4
 /// consecutive inputs at a time, 128 apart), then the simdgroup sums add in
 /// order. The row count is a runtime value, so a row's bits never depend on it.
-const ROUTER_SOURCE = kernelSource("kernels/qmm/rowqmv_router.metal");
+pub const ROUTER_SOURCE = kernelSource("kernels/qmm/rowqmv_router.metal");
 
 const ROUTER_SG = 8;
 var router_kernel: ?mlx.mlx_fast_metal_kernel = null;

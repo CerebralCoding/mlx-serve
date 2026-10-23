@@ -26,6 +26,11 @@ const log = @import("../../host/log.zig");
 const hy3d = @import("hunyuan3d.zig");
 
 const S = mlx.mlx_stream;
+const graph_call = @import("../../sdk/media/graph_call.zig").call;
+const conv_blk = @import("../../sdk/blocks/vae/conv.zig");
+const gn_blk = @import("../../sdk/blocks/norms/group_norm.zig");
+const gelu_blk = @import("../../sdk/blocks/mlp/gelu.zig");
+const timestep = @import("../../sdk/blocks/dit/timestep.zig");
 const MixedLinear = hy3d.MixedLinear;
 
 // ════════════════════════════════════════════════════════════════════════
@@ -35,14 +40,8 @@ const MixedLinear = hy3d.MixedLinear;
 /// diffusers Timesteps(dim, flip_sin_to_cos=true, downscale_freq_shift=0):
 /// half = dim/2; freq_i = exp(-ln(10000)·i/half); output [cos(t·f) | sin(t·f)].
 pub fn timestepEmbed(allocator: std.mem.Allocator, t: f32, dim: u32) ![]f32 {
-    const half = dim / 2;
     const out = try allocator.alloc(f32, dim);
-    for (0..half) |i| {
-        const freq = std.math.exp(-std.math.log(f32, std.math.e, 10000.0) * @as(f32, @floatFromInt(i)) / @as(f32, @floatFromInt(half)));
-        const arg = t * freq;
-        out[i] = std.math.cos(arg); // flip_sin_to_cos → cos half FIRST
-        out[half + i] = std.math.sin(arg);
-    }
+    timestep.sinusoid(f32, out, t, .cos_first); // flip_sin_to_cos: the cos half FIRST
     return out;
 }
 
@@ -380,22 +379,7 @@ fn silu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
 }
 /// Exact (erf) GELU — diffusers GEGLU uses F.gelu approximate="none".
 fn geluErf(x: mlx.mlx_array, s: S) !mlx.mlx_array {
-    const inv_sqrt2 = mlx.mlx_array_new_float(0.7071067811865476);
-    defer rel(inv_sqrt2);
-    const xs = try mulA(x, inv_sqrt2, s);
-    defer rel(xs);
-    var e = mlx.mlx_array_new();
-    defer rel(e);
-    try mlx.check(mlx.mlx_erf(&e, xs, s));
-    const one = mlx.mlx_array_new_float(1.0);
-    defer rel(one);
-    const opt = try addA(e, one, s);
-    defer rel(opt);
-    const half = mlx.mlx_array_new_float(0.5);
-    defer rel(half);
-    const hx = try mulA(x, half, s);
-    defer rel(hx);
-    return mulA(hx, opt, s);
+    return graph_call(s, gelu_blk.geluErf, .{x});
 }
 fn sdpa(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, s: S) !mlx.mlx_array {
     var o = mlx.mlx_array_new();
@@ -436,65 +420,11 @@ fn padLastDim(x: mlx.mlx_array, extra: c_int, s: S) !mlx.mlx_array {
 fn conv2d(x: mlx.mlx_array, w: mlx.mlx_array, bias: mlx.mlx_array, stride: c_int, pad: c_int, s: S) !mlx.mlx_array {
     const xf = try astype(x, .float16, s);
     defer rel(xf);
-    const xc = try contig(xf, s);
-    defer rel(xc);
-    var o = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_conv2d(&o, xc, w, stride, stride, pad, pad, 1, 1, 1, s));
-    const r = try addA(o, bias, s);
-    rel(o);
-    return r;
+    return graph_call(s, conv_blk.conv2d, .{ xf, w, bias, stride, pad, 1 });
 }
 /// PyTorch GroupNorm on NHWC [B,H,W,C], computed in f32, affine params per-channel.
 fn groupNorm(x: mlx.mlx_array, weight: mlx.mlx_array, bias: mlx.mlx_array, groups: c_int, eps: f32, s: S) !mlx.mlx_array {
-    const sh = mlx.getShape(x);
-    const B = sh[0];
-    const H = sh[1];
-    const Wd = sh[2];
-    const C = sh[3];
-    const cg = @divExact(C, groups);
-    const xf = try astype(x, .float32, s);
-    defer rel(xf);
-    const r1 = try reshape(xf, &[_]c_int{ B, H * Wd, groups, cg }, s);
-    defer rel(r1);
-    const t1 = try transpose(r1, &[_]c_int{ 0, 2, 1, 3 }, s);
-    defer rel(t1);
-    const flat = try reshape(t1, &[_]c_int{ B, groups, H * Wd * cg }, s);
-    defer rel(flat);
-    var mean = mlx.mlx_array_new();
-    defer rel(mean);
-    try mlx.check(mlx.mlx_mean_axis(&mean, flat, -1, true, s));
-    const xc = try subA(flat, mean, s);
-    defer rel(xc);
-    const sq = try mulA(xc, xc, s);
-    defer rel(sq);
-    var v = mlx.mlx_array_new();
-    defer rel(v);
-    try mlx.check(mlx.mlx_mean_axis(&v, sq, -1, true, s));
-    const epsa = mlx.mlx_array_new_float(eps);
-    defer rel(epsa);
-    var ve = mlx.mlx_array_new();
-    defer rel(ve);
-    try mlx.check(mlx.mlx_add(&ve, v, epsa, s));
-    var rsq = mlx.mlx_array_new();
-    defer rel(rsq);
-    try mlx.check(mlx.mlx_rsqrt(&rsq, ve, s));
-    const norm = try mulA(xc, rsq, s);
-    defer rel(norm);
-    const b1 = try reshape(norm, &[_]c_int{ B, groups, H * Wd, cg }, s);
-    defer rel(b1);
-    const b2 = try transpose(b1, &[_]c_int{ 0, 2, 1, 3 }, s);
-    defer rel(b2);
-    const b3 = try reshape(b2, &[_]c_int{ B, H, Wd, C }, s);
-    defer rel(b3);
-    const wf = try astype(weight, .float32, s);
-    defer rel(wf);
-    const bf = try astype(bias, .float32, s);
-    defer rel(bf);
-    const sc = try mulA(b3, wf, s);
-    defer rel(sc);
-    const out = try addA(sc, bf, s);
-    defer rel(out);
-    return astype(out, .float16, s);
+    return graph_call(s, gn_blk.groupNormFlat, .{ x, weight, bias, groups, eps, .float16 });
 }
 /// LayerNorm (weight+bias, eps 1e-5) via the fast kernel (upcasts internally).
 fn layerNorm(x: mlx.mlx_array, w: mlx.mlx_array, b: mlx.mlx_array, s: S) !mlx.mlx_array {
@@ -1985,4 +1915,37 @@ test "hy3d-paint-unet: full forward runs end-to-end (shape + finite)" {
         mean_abs += @abs(d[i]);
     }
     std.debug.print("[hy3d-paint-unet] fwd-smoke OK: v[12,4,64,64] finite, mean|v|={d:.4}\n", .{mean_abs / @as(f64, @floatFromInt(n))});
+}
+
+test "hy3d-paint-unet: the UNet's norm, conv, gelu and timestep blocks are bit-equal to their golden run" {
+    const s = mlx.mlx_default_cpu_stream_new();
+    defer _ = mlx.mlx_stream_free(s);
+    var arrs: [5]mlx.mlx_array = undefined;
+    const shapes = [5][]const c_int{ &.{ 2, 8, 8, 64 }, &.{64}, &.{64}, &.{ 64, 3, 3, 64 }, &.{64} };
+    for (&arrs, shapes, 0..) |*o, sh, i| {
+        var k = mlx.mlx_array_new();
+        defer rel(k);
+        try mlx.check(mlx.mlx_random_key(&k, 9 + i));
+        var r = mlx.mlx_array_new();
+        defer rel(r);
+        try mlx.check(mlx.mlx_random_normal(&r, sh.ptr, sh.len, .float32, 0, if (i == 3) 0.05 else 1, k, s));
+        o.* = try astype(r, .float16, s);
+    }
+    defer for (arrs) |x| rel(x);
+    const gn = try groupNorm(arrs[0], arrs[1], arrs[2], 32, 1e-5, s);
+    defer rel(gn);
+    const c1 = try conv2d(gn, arrs[3], arrs[4], 1, 1, s);
+    defer rel(c1);
+    const c2 = try conv2d(c1, arrs[3], arrs[4], 2, 1, s);
+    defer rel(c2);
+    const ge = try geluErf(c2, s);
+    defer rel(ge);
+    const emb = try timestepEmbed(testing.allocator, 999, 320);
+    defer testing.allocator.free(emb);
+    const te = mlx.mlx_array_new_data(emb.ptr, &[_]c_int{320}, 1, .float32);
+    defer rel(te);
+    try @import("../../sdk/testing/golden.zig").expect("hunyuan3d_paint_unet_blocks", &.{
+        .{ .name = "group_norm", .array = gn }, .{ .name = "conv", .array = c1 }, .{ .name = "conv_s2", .array = c2 },
+        .{ .name = "gelu", .array = ge }, .{ .name = "timestep", .array = te },
+    });
 }

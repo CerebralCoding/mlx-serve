@@ -1,7 +1,8 @@
 //! sdk/blocks/attention/gates, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns attnOutGate, ATTN_GATE_SOURCE, attn_gate_kernel, attn_gate_engaged, attn_gate_fused_override, attn_gate_fused_env, and 18 more.
+//! Owns ATTN_GATE_SOURCE, attn_gate_kernel, attn_gate_engaged, attn_gate_fused_override, attn_gate_fused_env, and 18 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -16,43 +17,6 @@ const swigluFusedEnabled = @import("../mlp/fused_activations.zig").swigluFusedEn
 const swigluSigTable = @import("../mlp/fused_activations.zig").swigluSigTable;
 const ShapeKey = @import("../moe/router_kernel.zig").ShapeKey;
 const attn256MaxDiff = @import("attn256.zig").attn256MaxDiff;
-
-/// Sigmoid attention output gate read off the same post-input-norm hidden
-/// the QKV projections read. muse: one gate per channel; spark2_5
-/// (`attn_gate_headwise`): one gate per head, broadcast over head_dim.
-/// Returns a new array.
-/// `g_pre` is the gate projection when the fused row matmul already
-/// produced it (null-ctx otherwise).
-pub fn attnOutGate(self: *const Transformer, normed: mlx.mlx_array, attn_flat: mlx.mlx_array, lw: *const LayerWeights, g_pre: mlx.mlx_array) !mlx.mlx_array {
-    const g_raw = if (g_pre.ctx != null) g_pre else try self.qmatmul(normed, lw.ag_w.?, lw.ag_s, lw.ag_b);
-    defer if (g_pre.ctx == null) {
-        _ = mlx.mlx_array_free(g_raw);
-    };
-    if (try fusedSigmoidGateMul(self.s, attn_flat, g_raw, if (self.config.attn_gate_headwise) @intCast(self.config.num_attention_heads) else 0)) |y| return y;
-    var g_sig = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g_sig);
-    try mlx.check(mlx.mlx_sigmoid(&g_sig, g_raw, self.s));
-    var gated = mlx.mlx_array_new();
-    if (!self.config.attn_gate_headwise) {
-        try mlx.check(mlx.mlx_multiply(&gated, attn_flat, g_sig, self.s));
-        return gated;
-    }
-    const shape = mlx.getShape(attn_flat);
-    const heads: c_int = @intCast(self.config.num_attention_heads);
-    const per_head = [_]c_int{ shape[0], shape[1], heads, @divExact(shape[2], heads) };
-    const g_shape = [_]c_int{ shape[0], shape[1], heads, 1 };
-    var a4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(a4);
-    try mlx.check(mlx.mlx_reshape(&a4, attn_flat, &per_head, 4, self.s));
-    var g4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(g4);
-    try mlx.check(mlx.mlx_reshape(&g4, g_sig, &g_shape, 4, self.s));
-    var gated4 = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(gated4);
-    try mlx.check(mlx.mlx_multiply(&gated4, a4, g4, self.s));
-    try mlx.check(mlx.mlx_reshape(&gated, gated4, shape.ptr, 3, self.s));
-    return gated;
-}
 
 // ── Fused per-head attention output gate ──
 //
@@ -83,7 +47,7 @@ pub fn attnOutGate(self: *const Transformer, normed: mlx.mlx_array, attn_flat: m
 // the whole device, and it measured 2.3% SLOWER than the four-dispatch chain
 // on three consecutive pairs. Recomputing softplus once per element is ~10 ALU
 // ops against a value that is in cache — far cheaper than serializing.
-const ATTN_GATE_SOURCE = kernelSource("kernels/attention/attn_gate.metal");
+pub const ATTN_GATE_SOURCE = kernelSource("kernels/attention/attn_gate.metal");
 
 var attn_gate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var attn_gate_engaged: bool = false;
@@ -93,7 +57,7 @@ var attn_gate_fused_env: ?bool = null;
 fn attnGateFusedEnabled() bool {
     if (attn_gate_fused_override) |v| return v;
     if (attn_gate_fused_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_ATTN_GATE_FUSED");
+    const raw = env.get(.MLX_SERVE_ATTN_GATE_FUSED);
     const enabled = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
     attn_gate_fused_env = enabled;
     return enabled;
@@ -182,7 +146,7 @@ pub fn fusedAttnGate(
 /// `x * sigmoid(g)`: the sigmoid from the per-dtype table (mlx_sigmoid's own
 /// values), one multiply. With GROUP > 1 each gate value covers GROUP
 /// consecutive x elements (Spark's per-head gate).
-const SIGMOID_GATE_MUL_SOURCE = kernelSource("kernels/attention/sigmoid_gate_mul.metal");
+pub const SIGMOID_GATE_MUL_SOURCE = kernelSource("kernels/attention/sigmoid_gate_mul.metal");
 
 var sig_gate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 const SigGateCfgKey = struct { shape: ShapeKey, group: c_int, dtype: mlx.mlx_dtype };
@@ -197,7 +161,7 @@ var sig_gate_engaged: bool = false;
 // `x * sigmoid(gate)` over two equal-shape 4-D views read through their own
 // strides (a transposed attention output, a split q|gate projection), written
 // contiguous [B, S, H, D]; sigmoid from MLX's own table, so bit-equal to the pair.
-const STRIDED_SIGMOID_GATE_MUL_SOURCE = kernelSource("kernels/attention/strided_sigmoid_gate_mul.metal");
+pub const STRIDED_SIGMOID_GATE_MUL_SOURCE = kernelSource("kernels/attention/strided_sigmoid_gate_mul.metal");
 
 var strided_sig_gate_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var strided_sig_gate_cfg: ?mlx.mlx_fast_metal_kernel_config = null;

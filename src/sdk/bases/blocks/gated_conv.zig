@@ -1,13 +1,13 @@
 //! LFM2's gated short convolution: `out(C * conv(B * x))` over the slot's conv window, one fused dispatch at a
-//! decode step once the window exists. copied_from: plugins/lfm2/gated_conv.zig (`gatedConv` without the spec
-//! capture, which keeps the composed ops).
+//! decode step once the window exists (a spec verify keeps the composed ops, which leave the conv input).
+//! copied_from: plugins/lfm2/gated_conv.zig (`gatedConv`).
 
 const ops = @import("../../../mlx/ops.zig");
 const block = @import("../block.zig");
 const kv = @import("../kv.zig");
 const Linear = @import("linear.zig").Linear;
 const conv_window = @import("conv_window.zig");
-const fusedGatedConvStep = @import("../../../plugins/lfm2/gated_conv.zig").fusedGatedConvStep;
+const fusedGatedConvStep = @import("../../blocks/conv/gated_conv_step.zig").fusedGatedConvStep;
 
 const Array = ops.Array;
 const Ctx = block.Ctx;
@@ -30,7 +30,7 @@ pub const GatedConv = struct {
         const g = c.g;
         const h = w.hidden;
         const proj = try w.in_proj.forward(g, x);
-        if (c.rows == 1) if (try kv.state(c, .conv)) |state| {
+        if (c.rows == 1 and !c.capture_spec) if (try kv.state(c, .conv)) |state| {
             if (try fusedGatedConvStep(g.s, proj, state, w.conv, h, w.kernel)) |r| {
                 const gated = g.adopt(r.gated) catch |e| {
                     _ = @import("../../../mlx/ffi.zig").mlx_array_free(r.state);

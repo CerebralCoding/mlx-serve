@@ -2,6 +2,7 @@
 //! Owns gatherQmvSource, GQMV_BODY_AFFINE, GQMV_BODY_NVFP4, GQMV_AFFINE_HEADER, GQMV_NVFP4_HEADER, gatherQmvGateUpSource, and 28 more.
 
 const std = @import("std");
+const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -9,7 +10,6 @@ const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
 const moe_fp4 = @import("moe_fp4.zig");
 const fused_activations = @import("../mlp/fused_activations.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
-const envFlagCached = @import("../../../engines/mlx/env_transformer.zig").envFlagCached;
 const testing = @import("../../../engines/mlx/kv/cache.zig").testing;
 const testRandWeightBf16 = @import("../../testing/parity.zig").testRandWeightBf16;
 const testReadF32 = @import("../../testing/parity.zig").testReadF32;
@@ -115,7 +115,7 @@ pub const GQMV_GATEUP_BODY_AFFINE = kernelSource("kernels/moe/gqmv_gateup_body_a
 
 pub const GQMV_GATEUP_BODY_NVFP4 = kernelSource("kernels/moe/gqmv_gateup_body_nvfp4.metal");
 
-const GQMV_GATEUP_SOURCES = [2][:0]const u8{ gatherQmvGateUpSource(false), gatherQmvGateUpSource(true) };
+pub const GQMV_GATEUP_SOURCES = [2][:0]const u8{ gatherQmvGateUpSource(false), gatherQmvGateUpSource(true) };
 const GQMV_GATEUP_NAMES = [2][*:0]const u8{ "mlxserve_moe_gather_qmv_gateup", "mlxserve_moe_gather_qmv_gateup_nvfp4" };
 var gqmv_gateup_kernels: [2]?mlx.mlx_fast_metal_kernel = @splat(null);
 
@@ -167,7 +167,7 @@ var gqmv_gateup_env: ?bool = null;
 pub fn gatherQmvGateUpEnabled() bool {
     if (transformer.gqmv_gateup_override) |v| return v;
     if (gqmv_gateup_env) |v| return v;
-    const raw = std.c.getenv("MLX_SERVE_MOE_GATEUP_FUSED");
+    const raw = env.get(.MLX_SERVE_MOE_GATEUP_FUSED);
     const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
     gqmv_gateup_env = enabled;
     return enabled;
@@ -193,7 +193,7 @@ pub fn gatherQmvGateUp(
     limit: u32,
 ) !?mlx.mlx_array {
     if (!gatherQmvGateUpEnabled()) return null;
-    if (!mlx.streamIsGpu(s) or envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsGpu(s) or env.presentCached(&gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -275,7 +275,7 @@ pub fn gatherQmvGateUp(
 }
 
 // Indexed [nvfp4][x_per_expert].
-const GQMV_SOURCES = [2][2][:0]const u8{
+pub const GQMV_SOURCES = [2][2][:0]const u8{
     .{ gatherQmvSource(false, false), gatherQmvSource(false, true) },
     .{ gatherQmvSource(true, false), gatherQmvSource(true, true) },
 };
@@ -370,7 +370,7 @@ pub fn gatherQmvAct(
     x_per_expert: bool,
     act_relu2: bool,
 ) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or envFlagCached(&gqmv_disabled_env, "MLX_SERVE_MOE_GATHER_QMV_OFF")) return null;
+    if (!mlx.streamIsGpu(s) or env.presentCached(&gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return null;
     // Two dequant arithmetics, one kernel shape. Any other mode (mxfp4/mxfp8,
     // whose scales are e8m0 over different group sizes) falls back — running a
     // bank through the wrong dequant is silently wrong, not a crash.
@@ -864,14 +864,14 @@ test "MoE decode gather µbench (MLX_SERVE_MOE_GATHER_UBENCH=1)" {
     // compare against the pip-MLX Python sim (single gather ~133us, 47-layer
     // MoE ~7.5ms). If this is far slower, the gap is our MLX build/runtime;
     // if it matches, the gap is the live server context (stream/alloc/pipeline).
-    if (std.c.getenv("MLX_SERVE_MOE_GATHER_UBENCH") == null) return error.SkipZigTest;
+    if (env.get(.MLX_SERVE_MOE_GATHER_UBENCH) == null) return error.SkipZigTest;
     const io_util = @import("../../util/io_util.zig");
     const tio = testing.io;
     const s = mlx.gpuStream();
     const allocator = testing.allocator;
     // Trace mode: run the gather and qmv sections in long sustained bursts so an
     // Instruments Metal System Trace shows a clean, comparable GPU timeline.
-    const gather_trace = std.c.getenv("MLX_SERVE_MOE_GATHER_TRACE") != null;
+    const gather_trace = env.get(.MLX_SERVE_MOE_GATHER_TRACE) != null;
     const E: c_int = 256;
     const N: c_int = 1024; // moe_intermediate (gate/up out)
     const K: c_int = 3072; // hidden
