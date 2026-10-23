@@ -3,7 +3,7 @@
 //! dense global first layer, sliding layers with sinks under an 8-row band, a global MoE layer, the router under both
 //! of its names and one layer without a selection bias, served by the table bit-equal to the legacy `forwardMoeWith`
 //! at every step (prefill chunks past the window and the fused prefill width, decode, speculative verify), and
-//! `parse` equal to the engine's parse. The legacy forward's values are replayed from `fixtures/*.tape`.
+//! `parse` equal to the engine's parse. The deleted legacy forward's values are replayed from `fixtures/*.tape`.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -11,7 +11,6 @@ const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
-const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const proof = @import("../lfm2/proof.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
@@ -95,15 +94,9 @@ const wide_steps = [_]proof.Step{
     .{ .mode = .decode, .ids = &.{64} },
 };
 
-/// The legacy forward is the oracle, recorded to `fixtures/` (`MLX_SERVE_PROOF_RECORD=<repo root>`), until it is
-/// deleted; then the proofs replay the recording.
-pub const frozen = true;
-
-/// `p` served by the table against the tape `fixtures/<seed>.tape` (or the legacy forward, recording it).
+/// `p` served by the table against the tape `fixtures/<seed>.tape`, recorded from the deleted legacy forward.
 pub fn openCase(p: *fixture.Pack, json: []const u8, comptime legacy_config: bool, comptime seed: u64) !both.Both {
-    const name = std.fmt.comptimePrint("fixtures/{x}.tape", .{seed});
-    if (frozen) return both.Both.replay(&mimo.table, p, json, legacy_config, @embedFile(name));
-    return both.Both.openAs(&mimo.table, p, json, legacy_config, .{ .legacy = "src/plugins/mimo_v2/" ++ name });
+    return both.Both.replay(&mimo.table, p, json, legacy_config, @embedFile(std.fmt.comptimePrint("fixtures/{x}.tape", .{seed})));
 }
 
 fn case(comptime quantized: bool, comptime seed: u64) !void {
@@ -123,16 +116,14 @@ fn case(comptime quantized: bool, comptime seed: u64) !void {
     try b.expectDone();
 }
 
-/// One slot: its KV cache and position, read through `ctx` by the legacy forward or as `slot` by the table.
+/// One slot of the table: its KV cache and position.
 const Side = struct {
     kv: KVCache,
     off: usize = 0,
-    ctx: ForwardCtx = undefined,
     slot: cache_ops.Slot = undefined,
 
     fn init(s: *Side) !void {
         s.* = .{ .kv = try KVCache.init(testing.allocator, LAYERS) };
-        s.ctx = .{ .cache = &s.kv, .moe_seq_offset = &s.off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
         s.slot = .{ .kv = &s.kv };
     }
 
@@ -157,7 +148,7 @@ fn tableLogits(g: *ops.Graph, m: *anyopaque, f: abi.Forward) !mlx.mlx_array {
 }
 
 /// Two slots of different lengths (one past the window) prefilled on their own, then batched decode ticks and a
-/// batched verify: the table's batched rows bit-equal to the legacy `forwardMoeBatchedRows`.
+/// batched verify: the table's batched rows bit-equal to the recorded legacy `forwardMoeBatchedRows`.
 fn batchedCase(comptime quantized: bool, comptime seed: u64) !void {
     const a = testing.allocator;
     var p = fixture.Pack.init(seed);
@@ -166,22 +157,19 @@ fn batchedCase(comptime quantized: bool, comptime seed: u64) !void {
     var b = try openCase(&p, configJson(quantized), false, seed);
     defer b.close();
     const m = b.xfm.plugin.?.model;
-    // [0]: the legacy forward's slots (when it is loaded), [1]: the table's.
-    var sides: [2][2]Side = undefined;
-    for (&sides) |*pair| for (pair) |*sd| try sd.init();
-    defer for (&sides) |*pair| for (pair) |*sd| sd.deinit();
+    var sides: [2]Side = undefined;
+    for (&sides) |*sd| try sd.init();
+    defer for (&sides) |*sd| sd.deinit();
     const prompts = [2][]const i32{ &.{ 3, 17, 42, 99, 7, 250, 1, 8, 66, 31, 120, 5, 77 }, &.{ 9, 33, 77, 140, 2, 18 } };
     for (0..2) |i| {
         const pr = prompts[i];
         var g = ops.Graph.init(a, b.xfm.s);
         defer g.deinit();
-        const ids = try fixture.tokens(&g, pr);
-        const want: ?mlx.mlx_array = if (b.lg) |lg| try fixture.rows2(&g, try g.adopt(try lg.xfm.forwardWith(&sides[0][i].ctx, ids))) else null;
         var host: [32]u32 = undefined;
         for (pr, 0..) |id, k| host[k] = @intCast(id);
-        const handles = [_]abi.Handle{sides[1][i].slot.handle()};
+        const handles = [_]abi.Handle{sides[i].slot.handle()};
         const got = try tableLogits(&g, m, .{ .mode = .prefill, .rows = @intCast(pr.len), .tokens = .of(host[0..pr.len]), .positions = .of(&.{0}), .caches = .of(&handles) });
-        try b.check(got, want, false);
+        try b.check(got, null, false);
     }
     const ticks = [_][2][]const i32{
         .{ &.{88}, &.{12} },
@@ -193,24 +181,15 @@ fn batchedCase(comptime quantized: bool, comptime seed: u64) !void {
         var g = ops.Graph.init(a, b.xfm.s);
         defer g.deinit();
         const w = tk[0].len;
-        var flat: [8]i32 = undefined;
         var host: [8]u32 = undefined;
         for (0..2) |i| for (tk[i], 0..) |id, k| {
-            flat[i * w + k] = id;
             host[i * w + k] = @intCast(id);
         };
-        const offs = [_]u32{ @intCast(sides[1][0].off), @intCast(sides[1][1].off) };
-        const want: ?mlx.mlx_array = if (b.lg) |lg| blk: {
-            const ids = try g.fromSlice(i32, flat[0 .. 2 * w], &.{ 2, @intCast(w) });
-            const ctxs = [_]*ForwardCtx{ &sides[0][0].ctx, &sides[0][1].ctx };
-            break :blk try fixture.rows2(&g, try g.adopt(try lg.xfm.forwardMoeBatchedRows(ids, &ctxs, &offs, w > 1, null, null)));
-        } else null;
-        const handles = [_]abi.Handle{ sides[1][0].slot.handle(), sides[1][1].slot.handle() };
+        const offs = [_]u32{ @intCast(sides[0].off), @intCast(sides[1].off) };
+        const handles = [_]abi.Handle{ sides[0].slot.handle(), sides[1].slot.handle() };
         const got = try tableLogits(&g, m, .{ .mode = .batched_rows, .rows = @intCast(w), .tokens = .of(host[0 .. 2 * w]), .positions = .of(&offs), .caches = .of(&handles) });
-        try b.check(try g.reshape(got, &.{ @intCast(2 * w), VOCAB }), want, false);
-        for (&sides) |*pair| for (pair) |*sd| {
-            sd.off += w;
-        };
+        try b.check(try g.reshape(got, &.{ @intCast(2 * w), VOCAB }), null, false);
+        for (&sides) |*sd| sd.off += w;
     }
     try b.expectDone();
 }
@@ -232,24 +211,20 @@ fn ringCase(comptime seed: u64) !void {
         .{ .mode = .verify, .ids = &.{ 5, 61, 200 } },
         .{ .mode = .decode, .ids = &.{64} },
     };
-    // Logits only, as the legacy forward and the table step on caches of their own.
-    var sides: [2]Side = undefined;
-    for (&sides) |*sd| try sd.init();
-    defer for (&sides) |*sd| sd.deinit();
+    // Logits only.
+    var side: Side = undefined;
+    try side.init();
+    defer side.deinit();
     const host = try testing.allocator.alloc(u32, long.len);
     defer testing.allocator.free(host);
     for (seq) |st| {
         var g = ops.Graph.init(testing.allocator, b.xfm.s);
         defer g.deinit();
-        const want: ?mlx.mlx_array = if (b.lg) |lg| blk: {
-            sides[0].ctx.spec_verify = st.mode == .verify;
-            break :blk try fixture.rows2(&g, try g.adopt(try lg.xfm.forwardWith(&sides[0].ctx, try fixture.tokens(&g, st.ids))));
-        } else null;
         for (st.ids, host[0..st.ids.len]) |id, *h| h.* = @intCast(id);
-        const handles = [_]abi.Handle{sides[1].slot.handle()};
-        const got = try tableLogits(&g, b.xfm.plugin.?.model, .{ .mode = st.mode, .rows = @intCast(st.ids.len), .tokens = .of(host[0..st.ids.len]), .positions = .of(&.{@intCast(sides[1].off)}), .caches = .of(&handles) });
-        try b.check(got, want, false);
-        sides[1].off += st.ids.len;
+        const handles = [_]abi.Handle{side.slot.handle()};
+        const got = try tableLogits(&g, b.xfm.plugin.?.model, .{ .mode = st.mode, .rows = @intCast(st.ids.len), .tokens = .of(host[0..st.ids.len]), .positions = .of(&.{@intCast(side.off)}), .caches = .of(&handles) });
+        try b.check(got, null, false);
+        side.off += st.ids.len;
     }
     try b.expectDone();
 }

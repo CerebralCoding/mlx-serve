@@ -77,6 +77,8 @@ pub const legacy_removed = [_][]const u8{
     "nemotron_h",
     "nemotron_h_puzzle",
     "nemotron_h_omni",
+    "mimo_v2",
+    "mimo_v2_flash",
 };
 
 pub fn legacyRemoved(model_type: []const u8) bool {

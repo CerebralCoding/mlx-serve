@@ -9,10 +9,11 @@ mlx-lm's layout (`tests/convert_mimo_v2.py`, mlx-community's mxfp4-q8 packs).
 - `sink_attention.zig`: MiMo's attention block (copied from the engine's sink arm).
 - `config.zig`: MLX-free claim + parse (+ `layout`: global layers full KV at their own KV heads, sliding layers a
   ring of window + 2048 rows; K 192 / V 128).
-- `proof_test.zig`: bit-equal to the legacy `forwardMoeWith` and `forwardMoeBatchedRows` (harness `../lfm2/proof.zig`).
-- `mtp_head.zig` (+ `mtp_head_test.zig`): the MTP heads behind `SpecHooks.head`, bit-equal to the legacy heads.
-- `mtp.zig`, `mtp_load.zig`, `attention.zig`, `dec_attn.zig`: legacy (the 3 MTP heads, model-gated tests, the
-  split-K kernel's names now in `sdk/blocks/attention/dec_attn.zig`).
+- `proof_test.zig`: bit-equal to the deleted legacy `forwardMoeWith` and `forwardMoeBatchedRows`, replayed from
+  `fixtures/*.tape` (`both.Both.replay`).
+- `mtp_head.zig` (+ `mtp_head_test.zig`): the MTP heads behind `SpecHooks.head`, bit-equal to the recorded legacy heads.
+- `fixtures.zig`: the served MiMo against `modeling_mimo_v2.py` (model-gated).
+- `dec_attn.zig`: the split-K kernel's names (`sdk/blocks/attention/dec_attn.zig`) for gpt_oss.
 
 ## Facts the table declares
 - Batched decode and batched verify rows (the engine batches MiMo: no per-slot recurrent state), prefix cache on,
@@ -53,16 +54,12 @@ mlx-lm's layout (`tests/convert_mimo_v2.py`, mlx-community's mxfp4-q8 packs).
 
 ## Served
 
-In `served.zig` (`mimo_v2`, `mimo_v2_flash`); the shell runs on the legacy parse's `ModelConfig`. Proof
-(`mtp_head_test.zig` servedCase, 4-bit and bf16): steps, greedy and layered batched decode bit-equal to legacy; the
-engine's head calls (history, a `.none` opening, `.mixed`/`.logits` drafts, a partial-accept truncate and a reopen)
-bit-equal to the `.mimo` arm; a pinned-depth MTP round loop with equal tokens and accepted counts.
-Sushi packs too (`sushi_test.zig`: the Twin steps, and the served steps, greedy, batched decode and MTP head calls
-on a pack with e4m3 QKV, e4m3 MLPs and EXL3 banks). mlx-stream packs keep their own module (`load/init.zig`
-`initMlxStream`). Legacy MiMo arms to delete once nothing else reads them: `isMimo` in `forward/layered.zig` and `load/layers_layered.zig`, `mimoDecodeCopies` in `sdk/blocks/attention/sinks.zig`,
-this folder's `mtp.zig`/`mtp_load.zig` with the `.mimo` arms of `MtpHeadRef`/`MtpCacheRef` and `load.zig`'s
-`loadMimoHead`, `attention.zig`. The config parse and `round.zig`/`round_finish.zig`'s `isMimo` rollback stay (the
-served shell's config keys them).
+In `served.zig` (`mimo_v2`, `mimo_v2_flash`), the legacy forward deleted (`legacy_removed`); the shell runs on the
+legacy parse's `ModelConfig`. Proofs replay tapes recorded from the legacy forward: steps, greedy and layered batched
+decode; the engine's head calls (history, a `.none` opening, `.mixed`/`.logits` drafts, a partial-accept truncate and
+a reopen); a pinned-depth MTP round loop with its tokens and accepted counts. Sushi packs too (`sushi_test.zig`: e4m3
+QKV, e4m3 MLPs, EXL3 banks). mlx-stream packs keep their own module (`load/init.zig` `initMlxStream`). The config parse
+and `round.zig`/`round_finish.zig`'s `isMimo` rollback stay (the served shell's config keys them).
 
 ## Fixtures
 - `conformanceFixture`: a dense global and an MoE sliding layer with sinks, width 64, head 32 / V 16, f32. Proof

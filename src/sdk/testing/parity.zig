@@ -1,5 +1,5 @@
 //! sdk/testing/parity, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns hostF32, rmsVsTruth, testReadF32, jsonF64, jsonToMlxArray, maxAbsDiffF32, and 12 more.
+//! Owns hostF32, rmsVsTruth, testReadF32, jsonF64, jsonToMlxArray, maxAbsDiffF32, decidedMisses, and 12 more.
 
 const std = @import("std");
 const env = @import("../../env.zig");
@@ -76,6 +76,31 @@ pub fn maxAbsDiff(a: []const f32, b: []const f32) f32 {
     var m: f32 = 0;
     for (a, b) |x, y| m = @max(m, @abs(x - y));
     return m;
+}
+
+/// A bf16 forward against an fp32 reference carries up to ~0.5 of logit error on a tiny model, so only a row whose
+/// reference top-2 margin clears that decides its argmax.
+const DECIDED_MARGIN: f32 = 0.5;
+
+/// Rows whose argmax differs from the reference where its margin decides it;
+/// near-tied flips are printed, never counted.
+pub fn decidedMisses(ours: []const f32, ref: []const f32, rows: usize, v: usize) usize {
+    var misses: usize = 0;
+    for (0..rows) |i| {
+        const o = ours[i * v ..][0..v];
+        const r = ref[i * v ..][0..v];
+        const io_ = std.mem.indexOfMax(f32, o);
+        const ir = std.mem.indexOfMax(f32, r);
+        if (io_ == ir) continue;
+        var second: f32 = -std.math.inf(f32);
+        for (r, 0..) |x, j| {
+            if (j != ir) second = @max(second, x);
+        }
+        const gap = r[ir] - second;
+        if (gap >= DECIDED_MARGIN) misses += 1;
+        std.debug.print("[fixture] row {d}: argmax {d} vs reference {d} (reference margin {d:.3}{s})\n", .{ i, io_, ir, gap, if (gap >= DECIDED_MARGIN) "" else ", a near tie" });
+    }
+    return misses;
 }
 
 // ── tests ──

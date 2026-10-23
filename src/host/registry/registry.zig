@@ -419,7 +419,7 @@ pub const LoadedModel = struct {
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
-            // The Qwen sidecar and the MiMo heads are separately allocated; an
+            // The Qwen sidecar and the GLM head are separately allocated; an
             // in-trunk head would be owned by the Transformer and freed with
             // it — destroying it here would double-free the whole model.
             switch (h) {
@@ -428,10 +428,6 @@ pub const LoadedModel = struct {
                     self.allocator.destroy(q);
                 },
                 .qwen4 => {}, // in-trunk head, owned by the Transformer
-                .mimo => |m| {
-                    m.deinit();
-                    self.allocator.destroy(m);
-                },
                 .glm => |m| {
                     m.deinit();
                     self.allocator.destroy(m);
@@ -590,7 +586,7 @@ pub const LoadedModel = struct {
         }
         self.gen_busy = false;
         if (self.mtp) |h| {
-            // The Qwen sidecar and the MiMo heads are separately allocated; an
+            // The Qwen sidecar and the GLM head are separately allocated; an
             // in-trunk head would be owned by the Transformer and freed with
             // it — destroying it here would double-free the whole model.
             switch (h) {
@@ -599,10 +595,6 @@ pub const LoadedModel = struct {
                     self.allocator.destroy(q);
                 },
                 .qwen4 => {}, // in-trunk head, owned by the Transformer
-                .mimo => |m| {
-                    m.deinit();
-                    self.allocator.destroy(m);
-                },
                 .glm => |m| {
                     m.deinit();
                     self.allocator.destroy(m);

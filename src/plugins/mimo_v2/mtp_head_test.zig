@@ -1,8 +1,8 @@
 //! Parity proof for MiMo-V2's MTP heads behind `SpecHooks.head`: three heads in a 4-bit and a bf16 pack, run by the
-//! plugin over the head cache's recurrent entries and by the legacy `mimo_mtp.Head` on its `State` through history
-//! appends past the window, round openings, draft steps 1..3 (the last past the final head), a re-opening below the
-//! committed rows, bit-equal at every step, the engine's history length (KV layer 0) the legacy `State.step()`. The
-//! legacy heads' values are replayed from `fixtures/*.tape`.
+//! plugin over the head cache's recurrent entries against the deleted legacy `mimo_mtp.Head` (replayed from
+//! `fixtures/*.tape`) through history appends past the window, round openings, draft steps 1..3 (the last past the
+//! final head), a re-opening below the committed rows, bit-equal at every step, the engine's history length (KV layer
+//! 0) the legacy `State.step()`.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -12,14 +12,12 @@ const cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
 const PluginRef = @import("../../engines/mlx/spec/mtp_head_ref.zig").MtpCacheRef.PluginRef;
 const FsPackDir = @import("../../host/registry/pack_dir.zig").FsPackDir;
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
-const legacy = @import("mtp.zig");
 const mimo = @import("plugin.zig");
 const trunk = @import("proof_test.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
 const plugin_head = @import("../../engines/mlx/plugin/head.zig");
 const MtpHeadRef = @import("../../engines/mlx/spec/mtp_head_ref.zig").MtpHeadRef;
 const mtpRun = @import("../../engines/mlx/plugin/proof_mtp.zig").mtpRun;
-const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 
 const testing = std.testing;
 const H: c_int = 256;
@@ -86,14 +84,6 @@ fn headCase(comptime quantized: bool, comptime seed: u64) !void {
     const parsed = &b.cfg.plugin.?.parsed;
     try testing.expectEqual(@as(u32, 3), parsed.spec.mtp_heads);
     const s = b.xfm.s;
-    // The legacy heads, when the legacy forward is loaded (recording).
-    var lh: ?legacy.Head = if (b.lg) |lg| (try legacy.Head.load(a, s, &lg.config, &lg.weights)).? else null;
-    defer if (lh) |*h| h.deinit();
-    const st: ?*legacy.State = if (lh) |*h| try h.newState(a) else null;
-    defer if (st) |x| {
-        x.deinit();
-        a.destroy(x);
-    };
 
     var fs = try FsPackDir.open(io, b.dir);
     defer fs.close();
@@ -134,7 +124,6 @@ fn headCase(comptime quantized: bool, comptime seed: u64) !void {
         defer g.deinit();
         switch (call) {
             .truncate => |len| {
-                if (st) |x| try x.truncate(s, len);
                 try ref.kv.truncate(len, s);
                 continue;
             },
@@ -142,7 +131,6 @@ fn headCase(comptime quantized: bool, comptime seed: u64) !void {
         }
         var f: abi.Forward = .{ .mode = .decode, .rows = 1, .tokens = .{}, .caches = .of(&handles), .cache_ops = &cache_ops.ops, .positions = .of(&.{0}) };
         var pos: [1]u32 = undefined;
-        var want: ?mlx.mlx_array = null;
         switch (call) {
             .history, .open => |c| {
                 const n: c_int = @intCast(c.ids.len);
@@ -154,12 +142,9 @@ fn headCase(comptime quantized: bool, comptime seed: u64) !void {
                 f.ids = .{ .ctx = ids.ctx };
                 f.positions = .of(&pos);
                 f.hidden_in = .{ .ctx = hid.ctx };
-                if (call == .history) {
-                    if (lh) |*h| try h.appendHistory(&b.lg.?.xfm, st.?, c.ids, hid, c.p0);
-                } else {
+                if (call == .open) {
                     f.want_hidden = true;
                     f.logits = .last_row;
-                    if (lh) |*h| want = try g.adopt(try h.draftStep(&b.lg.?.xfm, st.?, 0, null, c.ids, hid, c.p0));
                     // A round's chained steps read the trunk's last hidden row.
                     if (trunk_hidden.ctx != null) _ = mlx.mlx_array_free(trunk_hidden);
                     trunk_hidden = mlx.mlx_array_new();
@@ -175,7 +160,6 @@ fn headCase(comptime quantized: bool, comptime seed: u64) !void {
                 f.want_hidden = true;
                 f.logits = .last_row;
                 f.head = @intCast(@min(d.step, 2));
-                if (lh) |*h| want = try g.adopt(try h.draftStep(&b.lg.?.xfm, st.?, d.step, id, &.{}, null, 0));
             },
             .truncate => unreachable,
         }
@@ -186,19 +170,18 @@ fn headCase(comptime quantized: bool, comptime seed: u64) !void {
             return error.PluginForward;
         }
         if (call == .open or call == .draft) {
-            try b.check(try g.adopt(.{ .ctx = out.hidden.ctx }), want, false);
+            try b.check(try g.adopt(.{ .ctx = out.hidden.ctx }), null, false);
         } else try testing.expect(out.hidden.ctx == null);
         // The engine's history length is the legacy `State.step()`.
         const len: [1]u32 = .{@intCast(ref.kv.step)};
-        const want_len: ?mlx.mlx_array = if (st) |x| try g.fromSlice(u32, &.{@intCast(x.step())}, &.{1}) else null;
-        try b.check(try g.fromSlice(u32, &len, &.{1}), want_len, true);
+        try b.check(try g.fromSlice(u32, &len, &.{1}), null, true);
     }
     try b.expectDone();
 }
 
 /// Served: the driver's shell on the legacy config, its steps, greedy and batched decode; the engine's head calls
-/// (`MtpHeadRef.plugin`) against the legacy heads (`.mimo`) bit-equal; a pinned-depth MTP round loop, tokens and
-/// accepted counts equal.
+/// (`MtpHeadRef.plugin`) against the recorded legacy heads (`.mimo`) bit-equal; a pinned-depth MTP round loop, tokens
+/// and accepted counts equal.
 fn servedCase(comptime quantized: bool, comptime seed: u64) !void {
     const a = testing.allocator;
     var p = fixture.Pack.init(seed);
@@ -222,68 +205,45 @@ fn servedCase(comptime quantized: bool, comptime seed: u64) !void {
 pub fn expectServedHeads(b: *both.Both, seed: u64) !void {
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
-    // The legacy heads (`.mimo`) on the legacy shell, when it is loaded (recording).
-    var lh: ?legacy.Head = if (b.lg) |lg| (try legacy.Head.load(a, lg.xfm.s, &lg.config, &lg.weights)).? else null;
-    defer if (lh) |*h| h.deinit();
-    if (lh) |*h| h.bindRerank(&b.lg.?.xfm);
     const served = plugin_head.load(io, a, &b.xfm, b.dir) orelse return error.TestHeadNotLoaded;
     defer plugin_head.destroy(served, a);
-    var heads_buf: [2]MtpHeadRef = undefined;
-    var xs_buf: [2]*Transformer = undefined;
-    var n: usize = 0;
-    if (lh) |*h| {
-        heads_buf[0] = .{ .mimo = h };
-        xs_buf[0] = &b.lg.?.xfm;
-        n = 1;
-    }
-    heads_buf[n] = .{ .plugin = served };
-    xs_buf[n] = &b.xfm;
-    n += 1;
-    const heads = heads_buf[0..n];
-    const xs = xs_buf[0..n];
-    if (n == 2) try testing.expectEqual(heads[0].maxDepth(), heads[1].maxDepth());
+    const h: MtpHeadRef = .{ .plugin = served };
+    const x = &b.xfm;
     {
         // The engine's head calls: a history append, an opening that wants nothing, an opening with two chained
         // drafts (the readout's input under `.mixed`, the trunk head's logits under `.logits`), a partial accept.
-        var caches: [2]@import("../../engines/mlx/spec/mtp_head_ref.zig").MtpCacheRef = undefined;
-        for (heads, caches[0..n]) |h, *cr| cr.* = try h.makeCache(a);
-        defer for (caches[0..n]) |*cr| cr.deinit();
+        var cr = try h.makeCache(a);
+        defer cr.deinit();
         var g = ops.Graph.init(a, b.xfm.s);
         defer g.deinit();
         const hist = try rows(&g, 6, seed + 1);
         const open = try rows(&g, 1, seed + 2);
         const quiet = try rows(&g, 2, seed + 3);
         const again = try rows(&g, 1, seed + 4);
-        var outs: [2][10]mlx.mlx_array = undefined;
-        for (heads, xs, caches[0..n], 0..) |h, x, *cr, k| {
-            // The rows waiting for their tokens are never persisted: the head history rebuilds from the tail.
-            try testing.expect(cr.kv() == null);
-            try h.appendHistory(x, cr, &.{ 3, 17, 42, 99, 7, 250 }, hist, 0, null, a);
-            try testing.expectEqual(@as(usize, 6), cr.step());
-            // An opening that wants nothing appends history.
-            const q = try h.forward(x, cr, try g.fromSlice(i32, &.{ 1, 8 }, &.{2}), quiet, 6, .none, null, &.{ 1, 8 });
-            const o0 = try h.forward(x, cr, try g.fromSlice(i32, &.{66}, &.{1}), open, 8, .mixed, null, &.{66});
-            const o1 = try h.forward(x, cr, try g.fromSlice(i32, &.{31}, &.{1}), o0.hidden_next, 9, .logits, null, null);
-            const o2 = try h.forward(x, cr, try g.fromSlice(i32, &.{120}, &.{1}), o1.hidden_next, 10, .mixed, null, null);
-            // A partial accept: one draft kept, the round rolled back, a new opening on the committed rows.
-            try cr.truncate(9, x.s);
-            const o3 = try h.forward(x, cr, try g.fromSlice(i32, &.{5}, &.{1}), again, 9, .mixed, null, &.{5});
-            const o4 = try h.forward(x, cr, try g.fromSlice(i32, &.{77}, &.{1}), o3.hidden_next, 10, .mixed, null, null);
-            _ = try g.adopt(q.hidden_next);
-            outs[k] = .{ try g.adopt(o0.rerank_x), try g.adopt(o1.logits), try g.adopt(o2.rerank_x), try g.adopt(o3.rerank_x), try g.adopt(o4.rerank_x), try g.adopt(o0.hidden_next), try g.adopt(o1.hidden_next), try g.adopt(o2.hidden_next), try g.adopt(o3.hidden_next), try g.adopt(o4.hidden_next) };
-        }
-        for (outs[n - 1], 0..) |got, i| try b.check(got, if (n == 2) outs[0][i] else null, false);
+        // The rows waiting for their tokens are never persisted: the head history rebuilds from the tail.
+        try testing.expect(cr.kv() == null);
+        try h.appendHistory(x, &cr, &.{ 3, 17, 42, 99, 7, 250 }, hist, 0, null, a);
+        try testing.expectEqual(@as(usize, 6), cr.step());
+        // An opening that wants nothing appends history.
+        const q = try h.forward(x, &cr, try g.fromSlice(i32, &.{ 1, 8 }, &.{2}), quiet, 6, .none, null, &.{ 1, 8 });
+        const o0 = try h.forward(x, &cr, try g.fromSlice(i32, &.{66}, &.{1}), open, 8, .mixed, null, &.{66});
+        const o1 = try h.forward(x, &cr, try g.fromSlice(i32, &.{31}, &.{1}), o0.hidden_next, 9, .logits, null, null);
+        const o2 = try h.forward(x, &cr, try g.fromSlice(i32, &.{120}, &.{1}), o1.hidden_next, 10, .mixed, null, null);
+        // A partial accept: one draft kept, the round rolled back, a new opening on the committed rows.
+        try cr.truncate(9, x.s);
+        const o3 = try h.forward(x, &cr, try g.fromSlice(i32, &.{5}, &.{1}), again, 9, .mixed, null, &.{5});
+        const o4 = try h.forward(x, &cr, try g.fromSlice(i32, &.{77}, &.{1}), o3.hidden_next, 10, .mixed, null, null);
+        _ = try g.adopt(q.hidden_next);
+        const outs = [_]mlx.mlx_array{ try g.adopt(o0.rerank_x), try g.adopt(o1.logits), try g.adopt(o2.rerank_x), try g.adopt(o3.rerank_x), try g.adopt(o4.rerank_x), try g.adopt(o0.hidden_next), try g.adopt(o1.hidden_next), try g.adopt(o2.hidden_next), try g.adopt(o3.hidden_next), try g.adopt(o4.hidden_next) };
+        for (outs) |got| try b.check(got, null, false);
     }
-    var tokens: [2][16]u32 = undefined;
-    var accepted: [2]std.ArrayList(u32) = .{ .empty, .empty };
-    defer for (&accepted) |*l| l.deinit(a);
-    for (heads, xs, 0..) |h, x, k| try mtpRun(x, h, &tokens[k], &accepted[k]);
+    var tokens: [16]u32 = undefined;
+    var accepted: std.ArrayList(u32) = .empty;
+    defer accepted.deinit(a);
+    try mtpRun(x, h, &tokens, &accepted);
     var g = ops.Graph.init(a, b.xfm.s);
     defer g.deinit();
-    for ([_][]const u32{ &tokens[n - 1], accepted[n - 1].items }, 0..) |got, i| {
-        const want: ?[]const u32 = if (n == 2) (if (i == 0) &tokens[0] else accepted[0].items) else null;
-        try b.check(try g.fromSlice(u32, got, &.{@intCast(got.len)}), if (want) |w| try g.fromSlice(u32, w, &.{@intCast(w.len)}) else null, true);
-    }
+    for ([_][]const u32{ &tokens, accepted.items }) |got| try b.check(try g.fromSlice(u32, got, &.{@intCast(got.len)}), null, true);
 }
 
 // ── tests ──
