@@ -120,7 +120,7 @@ pub const fusedSdpa256Masked = @import("../../sdk/blocks/attention/attn256.zig")
 pub const ResidualNormOpts = @import("../../sdk/blocks/norms/residual_norm.zig").ResidualNormOpts;
 pub const AddNormResult = @import("../../sdk/blocks/norms/residual_norm.zig").AddNormResult;
 pub const fusedResidualNorm = @import("../../sdk/blocks/norms/residual_norm.zig").fusedResidualNorm;
-pub const fusedAddRmsNormUngated = @import("../../sdk/blocks/norms/residual_norm.zig").fusedAddRmsNormUngated;
+pub const fusedAddRmsNorm = @import("../../sdk/blocks/norms/residual_norm.zig").fusedAddRmsNorm;
 // plugins/qwen4_exp/qsa/gather.zig
 pub const qsaGatherEnabled = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaGatherEnabled;
 pub const QSA_GATHER_MIN_KV_DEFAULT = @import("../../plugins/qwen4_exp/qsa/gather.zig").QSA_GATHER_MIN_KV_DEFAULT;
@@ -383,7 +383,6 @@ pub const qwen4Standin = @import("../../sdk/diag/standin.zig").qwen4Standin;
 // engines/mlx/env_transformer.zig
 pub const diagEnvValueOn = @import("env_transformer.zig").diagEnvValueOn;
 // sdk/blocks/linear/fused_rows.zig
-const FusedQkv = @import("../../sdk/blocks/linear/fused_rows.zig").FusedQkv;
 // sdk/blocks/attention/decode_attn_quant.zig
 const AttnDqCopy = @import("../../sdk/blocks/attention/decode_attn_quant.zig").AttnDqCopy;
 pub const DECODE_ATTN_QUANT_DEFAULT = @import("../../sdk/blocks/attention/decode_attn_quant.zig").DECODE_ATTN_QUANT_DEFAULT;
@@ -567,9 +566,6 @@ pub const Transformer = struct {
     rms_eps_arr: mlx.mlx_array = .{ .ctx = null },
     /// `postNormEps()` as a 0-dim f32 array (Gemma post-norms), same reason.
     post_eps_arr: mlx.mlx_array = .{ .ctx = null },
-    /// Concatenated q/k/v weights, built lazily per layer on first use (see
-    /// buildFusedQkv). Additive memory, so opt-in via MLX_SERVE_FUSED_QKV=1.
-    qkv_fused: ?[]?FusedQkv = null,
     /// ANE prefill-MLP engine (`--ane-prefill`, perf-plan-aug-17 P5). Owned;
     /// null unless the flag is on AND the arch/machine passed the build
     /// gates in `buildAnePrefill`. Read only by `denseMLPMaybeAne`.
@@ -1175,7 +1171,6 @@ pub const Transformer = struct {
     // sdk/blocks/attention/mla.zig
     pub const mlaAttnWith = @import("../../sdk/blocks/attention/mla.zig").mlaAttnWith;
     // sdk/blocks/attention/proj.zig
-    pub const fusedQkvFor = @import("../../sdk/blocks/attention/proj.zig").fusedQkvFor;
     pub const qkAngleFor = @import("../../sdk/blocks/attention/proj.zig").qkAngleFor;
     pub const qkAngleRowsFor = @import("../../sdk/blocks/attention/proj.zig").qkAngleRowsFor;
     pub const attnDqFor = @import("../../sdk/blocks/attention/proj.zig").attnDqFor;
@@ -1288,15 +1283,6 @@ pub const Transformer = struct {
         _ = mlx.mlx_array_free(self.one);
         if (self.rms_eps_arr.ctx != null) _ = mlx.mlx_array_free(self.rms_eps_arr);
         if (self.post_eps_arr.ctx != null) _ = mlx.mlx_array_free(self.post_eps_arr);
-        if (self.qkv_fused) |slots| {
-            for (slots) |maybe| if (maybe) |f| {
-                _ = mlx.mlx_array_free(f.w);
-                if (f.base.ctx != null) _ = mlx.mlx_array_free(f.base);
-                if (f.s.ctx != null) _ = mlx.mlx_array_free(f.s);
-                if (f.b.ctx != null) _ = mlx.mlx_array_free(f.b);
-            };
-            self.allocator.free(slots);
-        }
         {
             var it = self.attn_dq.valueIterator();
             while (it.next()) |maybe| if (maybe.*) |copy| {

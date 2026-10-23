@@ -33,17 +33,6 @@ pub const RESIDUAL_NORM_SOURCE = kernelSource("kernels/norms/residual_norm.metal
 
 var residual_norm_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var residual_norm_engaged: bool = false;
-pub var add_rmsnorm_override: ?bool = null;
-var add_rmsnorm_env: ?bool = null;
-
-fn addRmsNormFusedEnabled() bool {
-    if (add_rmsnorm_override) |v| return v;
-    if (add_rmsnorm_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_ADD_RMSNORM_FUSED);
-    const enabled = raw != null and std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "1");
-    add_rmsnorm_env = enabled;
-    return enabled;
-}
 
 fn getResidualNormKernel() !mlx.mlx_fast_metal_kernel {
     if (residual_norm_kernel) |k| return k;
@@ -215,26 +204,11 @@ pub fn fusedResidualNorm(s: mlx.mlx_stream, a: mlx.mlx_array, b1: mlx.mlx_array,
     return .{ .sum = outs[0], .normed = outs[1], .normed2 = outs[2] };
 }
 
-/// `sum = a + b` and `normed = rms_norm(sum, w, eps)` in one dispatch.
-/// Null → caller keeps the two ops. This wrapper carries the laguna lever
-/// (opt-in — measured ~1% negative there, a bandwidth regime where one saved
-/// 4 KB read doesn't pay for leaving the metallib norm kernel).
+/// `sum = a + b` and `normed = rms_norm(sum, w, eps)` in one dispatch, bit-identical to the composed pair; null →
+/// the caller keeps the two ops. Pays only where a frame loop is per-NODE CPU-bound (Qwen3-TTS); on a decoder layer it
+/// measured ~1% negative (one saved 4 KB read does not pay for leaving the metallib norm kernel). `eps_arr` is a 0-dim
+/// f32 scalar.
 pub fn fusedAddRmsNorm(
-    s: mlx.mlx_stream,
-    a: mlx.mlx_array,
-    b: mlx.mlx_array,
-    w: mlx.mlx_array,
-    eps_arr: mlx.mlx_array,
-) !?AddNormResult {
-    if (!addRmsNormFusedEnabled()) return null;
-    return fusedAddRmsNormUngated(s, a, b, w, eps_arr);
-}
-
-/// The kernel minus the laguna env gate — for callers with their OWN lever
-/// whose regime differs (tts.zig's frame loop is per-NODE CPU-bound, where
-/// one node replacing two is the point). Bit-identical to the composed pair;
-/// `eps_arr` must be a 0-dim f32 scalar.
-pub fn fusedAddRmsNormUngated(
     s: mlx.mlx_stream,
     a: mlx.mlx_array,
     b: mlx.mlx_array,
@@ -544,8 +518,6 @@ test "fused residual+RMSNorm is bit-identical to mlx_add + mlx_fast_rms_norm" {
     const allocator = testing.allocator;
     var prng = std.Random.DefaultPrng.init(0x0DDBA11);
     const rnd = prng.random();
-    add_rmsnorm_override = true;
-    defer add_rmsnorm_override = null;
 
     const EPS: f32 = 1e-6;
     const eps_arr = mlx.mlx_array_new_float(EPS);
@@ -611,8 +583,6 @@ test "fused residual+RMSNorm is bit-identical to mlx_add + mlx_fast_rms_norm" {
 
 test "fused residual+RMSNorm declines what it cannot reproduce" {
     const s = mlx.gpuStream();
-    add_rmsnorm_override = true;
-    defer add_rmsnorm_override = null;
     // mlx_array_new_data COPIES shape-worth of bytes — the buffer must really
     // hold 8192 floats (a 16-float buffer here "passed" by overreading the
     // stack until a layout shift put the guard page in range).

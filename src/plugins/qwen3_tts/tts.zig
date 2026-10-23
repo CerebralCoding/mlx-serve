@@ -570,7 +570,7 @@ fn ttsAddRmsEnabled() bool {
 /// (bit-identical), the composed pair otherwise. Caller frees both fields.
 fn addRmsNorm(x: mlx.mlx_array, o: mlx.mlx_array, norm_w: mlx.mlx_array, d: QwenDims, s: S) !transformer_mod.AddNormResult {
     if (!d.plain_kernels and ttsAddRmsEnabled() and d.eps_arr.ctx != null) {
-        if (try transformer_mod.fusedAddRmsNormUngated(s, x, o, norm_w, d.eps_arr)) |r| return r;
+        if (try transformer_mod.fusedAddRmsNorm(s, x, o, norm_w, d.eps_arr)) |r| return r;
     }
     const sum = try addA(x, o, s);
     errdefer _ = mlx.mlx_array_free(sum);

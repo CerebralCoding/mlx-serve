@@ -1,5 +1,5 @@
 //! sdk/blocks/attention/proj, split out of engines/mlx/transformer.zig (P1, moves only).
-//! Owns fusedQkvFor, qkAngleFor, qkAngleRowsFor, attnDqFor, attnProj, attnProjBias.
+//! Owns qkAngleFor, qkAngleRowsFor, attnDqFor, attnProj, attnProjBias.
 
 const mlx = @import("../../../mlx/ffi.zig");
 const log = @import("../../../host/log.zig");
@@ -8,9 +8,6 @@ const fused_rows = @import("../linear/fused_rows.zig");
 const FullAttnWeights = @import("../../../engines/mlx/layer_weights.zig").FullAttnWeights;
 const lastDim = @import("../../../engines/mlx/load/weights.zig").lastDim;
 const Transformer = @import("../../../engines/mlx/transformer.zig").Transformer;
-const FusedQkv = @import("../linear/fused_rows.zig").FusedQkv;
-const buildFusedQkv = @import("../linear/fused_rows.zig").buildFusedQkv;
-const fusedQkvEnabled = @import("../linear/fused_rows.zig").fusedQkvEnabled;
 const qmatmulBits = @import("../linear/qmatmul.zig").qmatmulBits;
 const ropeAngleRows = @import("../rope/qk_norm_rope.zig").ropeAngleRows;
 const AttnDqCopy = @import("decode_attn_quant.zig").AttnDqCopy;
@@ -29,37 +26,6 @@ const denseFromAffine8 = @import("decode_attn_quant.zig").denseFromAffine8;
 // before RoPE (qwen3 pattern); softplus per-head output gate before o_proj.
 // Mirrors gemma4MoeAttnWith's sliding-mask plumbing (head_dim 128 → no
 // fused hd-256 kernel). Reference: modeling_laguna.py LagunaAttention.
-/// Concatenated q/k/v for `layer`, built on first use. Null when the fusion
-/// is off or the weights cannot be joined — the caller keeps three matmuls.
-pub fn fusedQkvFor(self: *Transformer, fa: *const FullAttnWeights, layer: u32) !?*const FusedQkv {
-    if (!fusedQkvEnabled()) return null;
-    if (self.rht != null) return null; // a fused copy would bypass the per-weight rotation
-    if (self.qkv_fused == null) {
-        const slots = try self.allocator.alloc(?FusedQkv, self.config.num_hidden_layers);
-        @memset(slots, null);
-        self.qkv_fused = slots;
-    }
-    const slots = self.qkv_fused.?;
-    if (layer >= slots.len) return null;
-    if (slots[layer]) |*f| return f;
-    const in_dim = lastDim(fa.q_w);
-    const built = try buildFusedQkv(
-        self.s,
-        fa,
-        self.quantParamsHinted(fa.q_w, fa.q_s, in_dim),
-        self.quantParamsHinted(fa.k_w, fa.k_s, in_dim),
-        self.quantParamsHinted(fa.v_w, fa.v_s, in_dim),
-    );
-    if (built) |f| {
-        slots[layer] = f;
-        if (!fused_rows.fused_qkv_engaged) {
-            fused_rows.fused_qkv_engaged = true;
-            log.info("[attn] fused QKV projection engaged: q={d} k={d} v={d}\n", .{ f.q_out, f.k_out, f.v_out });
-        }
-        return &slots[layer].?;
-    }
-    return null;
-}
 
 /// The angle row for `offset` in the given rope family, rebuilt when the
 /// offset moves (per decode token: 38-of-40 layers hit the cache).
