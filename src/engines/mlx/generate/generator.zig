@@ -21,7 +21,6 @@ const pld_index = @import("../spec/pld_index.zig");
 const mtp_lookup = @import("../spec/mtp_lookup.zig");
 const drafter_mod = @import("../../../plugins/gemma4/assistant_drafter.zig");
 const mtp_mod = @import("../../../sdk/spec/mtp/mtp.zig");
-const mimo_mtp = @import("../../../plugins/mimo_v2/mtp.zig");
 const glm_mtp = @import("../../../plugins/glm5_next/mtp.zig");
 const mtp_acceptance = @import("../spec/mtp_acceptance.zig");
 const round_cost = @import("../spec/round_cost.zig");

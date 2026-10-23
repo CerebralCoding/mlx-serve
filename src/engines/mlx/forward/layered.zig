@@ -63,8 +63,6 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     const cfg = &self.config;
     const is_gemma4 = cfg.isGemma4Layers();
     const is_mla = cfg.isMla();
-    // MiMo's sink attention arm (per-layer geometry).
-    const is_sink_attn = cfg.isMimo();
 
     // PLD spec-decode: thread the per-position SSM capture flag down to the
     // GatedDeltaNet layers (which don't take the ctx). Reset on exit so it
@@ -108,7 +106,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     try self.beginMropeChunk(ctx, @intCast(offset), @intCast(seq_len), self.actDtype());
     defer endMropeChunk(ctx);
 
-    // Precompute sliding window masks (Gemma 4 + MiMo sliding
+    // Precompute sliding window masks (Gemma 4 sliding
     // layers). An arch whose attention arm reads these masks MUST appear
     // in this gate — a missing arm here hands that arm an empty mask
     // handle, and its decode branch then attends over the whole history
@@ -118,7 +116,7 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
     var local_decode_mask = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(local_decode_mask);
 
-    if ((is_gemma4 or is_sink_attn) and cfg.has_sliding_window) {
+    if (is_gemma4 and cfg.has_sliding_window) {
         const sw: c_int = @intCast(cfg.sliding_window);
         const total_kv: c_int = @as(c_int, @intCast(offset)) + seq_len;
         const sliding = slidingViewFor(cfg, total_kv, seq_len);
@@ -174,8 +172,6 @@ pub fn forwardMoeWith(self: *Transformer, ctx: *ForwardCtx, token_ids: mlx.mlx_a
             .linear => |la| try self.gatedDeltaNet(normed, &la, &ctx.ssm_entries.?[layer_idx], layer_idx, batch, seq_len, is_prefill),
             .full => |fa| if (is_mla)
                 try self.mlaAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill)
-            else if (is_sink_attn)
-                try self.sinkAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
             else if (is_gemma4)
                 try self.gemma4MoeAttnWith(ctx, normed, &fa, li, @intCast(offset), batch, seq_len, is_prefill, &local_prefill_mask, local_decode_mask)
             else

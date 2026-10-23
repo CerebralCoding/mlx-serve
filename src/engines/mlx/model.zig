@@ -1770,7 +1770,7 @@ pub const ModelConfig = struct {
 
 /// A MiMo pack prepared for mlx-stream declares its expert bank (`"expert_streaming": {...}`); the plugin's own parse
 /// checks the declaration at load. An upstream MiMo checkpoint declares none and stays on the resident arch.
-fn declaresExpertStreaming(allocator: std.mem.Allocator, content: []const u8) bool {
+pub fn declaresExpertStreaming(allocator: std.mem.Allocator, content: []const u8) bool {
     const parsed = std.json.parseFromSlice(std.json.Value, allocator, content, .{}) catch return false;
     defer parsed.deinit();
     if (parsed.value != .object) return false;

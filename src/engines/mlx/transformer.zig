@@ -504,7 +504,6 @@ const moe_affine4 = @import("../../plugins/qwen4_exp/moe_affine4.zig");
 const glm5 = @import("../../plugins/glm5_next/glm5_next.zig");
 const glm_mtp = @import("../../plugins/glm5_next/mtp.zig");
 const kda_recurrence = @import("../../sdk/blocks/kda/recurrence.zig");
-const dec_attn = @import("../../plugins/mimo_v2/dec_attn.zig");
 const Weights = model_mod.Weights;
 
 pub const Transformer = struct {
@@ -1163,12 +1162,6 @@ pub const Transformer = struct {
     pub const attnDqFor = @import("../../sdk/blocks/attention/proj.zig").attnDqFor;
     pub const attnProj = @import("../../sdk/blocks/attention/proj.zig").attnProj;
     pub const attnProjBias = @import("../../sdk/blocks/attention/proj.zig").attnProjBias;
-    // sdk/blocks/attention/sinks.zig
-    pub const sinkAttnWith = @import("../../sdk/blocks/attention/sinks.zig").sinkAttnWith;
-    pub const sinkCacheUpdate = @import("../../sdk/blocks/attention/sinks.zig").sinkCacheUpdate;
-    pub const sinkAttnSlots = @import("../../sdk/blocks/attention/sinks.zig").sinkAttnSlots;
-    pub const sinkAttnCore = @import("../../sdk/blocks/attention/sinks.zig").sinkAttnCore;
-    pub const sinkAttnOut = @import("../../sdk/blocks/attention/sinks.zig").sinkAttnOut;
     // plugins/gemma4/attention.zig
     pub const gemma4MoeAttnWith = @import("../../plugins/gemma4/attention.zig").gemma4MoeAttnWith;
     // engines/mlx/verify/joined_rows.zig
@@ -1458,7 +1451,6 @@ test {
     _ = @import("../../sdk/blocks/attention/gated_full.zig");
     _ = @import("../../sdk/blocks/attention/mla.zig");
     _ = @import("../../sdk/blocks/attention/proj.zig");
-    _ = @import("../../sdk/blocks/attention/sinks.zig");
     _ = @import("../../plugins/laguna/ubench_test.zig");
     _ = @import("../../plugins/inkling/attention.zig");
     _ = @import("../../plugins/gemma4/attention.zig");
@@ -1492,10 +1484,9 @@ test {
     _ = @import("../../sdk/blocks/moe/verify_kernels.zig");
     _ = @import("../../sdk/quant/exl3.zig");
     _ = @import("../../plugins/hy_v3/load.zig");
-    _ = @import("../../plugins/laguna/load.zig");
     _ = @import("../../plugins/bailing_hybrid/load.zig");
     _ = @import("modules/mlx_stream.zig");
     _ = @import("modules/shell.zig");
-    _ = @import("../../plugins/mimo_v2/attention.zig");
+    _ = @import("../../plugins/mimo_v2/fixtures.zig");
     _ = @import("../../plugins/flint/fixtures.zig");
 }

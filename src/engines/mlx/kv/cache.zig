@@ -1253,7 +1253,6 @@ test "every sliding attention arm sizes its KV view from slidingViewFor, never t
     // satisfy the scan.
     const src = @embedFile("cache.zig") ++
         @embedFile("../forward/dense.zig") ++
-        @embedFile("../../../sdk/blocks/attention/sinks.zig") ++
         @embedFile("../../../plugins/gemma4/attention.zig");
     const needle = "const max_kv: u32 " ++ "= ";
     var i: usize = 0;
@@ -1269,9 +1268,9 @@ test "every sliding attention arm sizes its KV view from slidingViewFor, never t
         seen += 1;
         i = line_end;
     }
-    // forwardStandardWith, gemma4, the sink arm — a rewrite that drops the
-    // binding entirely must not read as a pass.
-    try testing.expect(seen >= 3);
+    // forwardStandardWith and gemma4: a rewrite that drops the binding
+    // entirely must not read as a pass.
+    try testing.expect(seen >= 2);
     // The alias is only as good as what it is assigned from.
     try testing.expect(std.mem.indexOf(u8, src, "const sliding_span " ++ "= sliding.span;") != null);
 

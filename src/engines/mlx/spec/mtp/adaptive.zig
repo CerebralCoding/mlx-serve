@@ -310,7 +310,7 @@ pub fn mtpHeadDriftNow(self: *const Generator) ?i64 {
     if (self.mtp_cache == null) return null;
     const mc = &self.mtp_cache.?;
     return switch (mc.*) {
-        .qwen, .mimo, .glm, .plugin => 0,
+        .qwen, .glm, .plugin => 0,
         .qwen4 => |r| blk: {
             r.t.qwen4MtpActivate(r.st);
             const m = &(r.t.qwen4_mtp orelse break :blk 0);

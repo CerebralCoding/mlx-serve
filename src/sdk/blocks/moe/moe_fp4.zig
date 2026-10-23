@@ -9,6 +9,7 @@ const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const xfm = @import("../../../engines/mlx/transformer.zig");
 const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
+const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
 
 pub const ROWS: c_int = 4;
 pub const SGS: c_int = 2;
@@ -39,9 +40,15 @@ pub const GATEUP_SOURCE = kernelSource("kernels/moe/moe_fp4_gateup.metal");
 // token tok, weighted by its routing score, accumulated in the same registers.
 pub const DOWNRED_SOURCE = kernelSource("kernels/moe/moe_fp4_downred.metal");
 
+/// Routes each pair's weight reads to its slot bank (`decodeBanks`).
+pub const BANKS_HEADER = kernelSource("kernels/moe/moe_fp4_banks_header.metal");
+
 const Kernels = struct { gateup: ?mlx.mlx_fast_metal_kernel = null, downred: ?mlx.mlx_fast_metal_kernel = null };
-/// Indexed by format: nvfp4, mxfp4.
+/// Indexed by format: nvfp4, mxfp4; `banked` the slot-bank builds.
 var kernels: [2]Kernels = .{ .{}, .{} };
+var banked: [2]Kernels = .{ .{}, .{} };
+/// Dispatches over several slot banks (the streamed proofs' engagement count).
+pub var banked_dispatches: u32 = 0;
 var engaged = false;
 
 fn makeKernel(name: [*:0]const u8, ins: []const [*:0]const u8, source: [*:0]const u8, header: [*:0]const u8) !mlx.mlx_fast_metal_kernel {
@@ -86,7 +93,26 @@ pub const Scales = struct { gate: ?mlx.mlx_array = null, up: ?mlx.mlx_array = nu
 /// table. `views` (of the same banks) are what the kernels bind; `scales` [E] in
 /// x's dtype multiply each expert's gate (before the SiLU) and up (before the clamp); `shared` (one token only)
 /// adds the gated shared expert in the epilogue. Null outside the kernels' set.
-pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: Bank, views: ?moe_affine4.Views, scales: Scales, shared: ?moe_affine4.Shared, inds: mlx.mlx_array, scores: mlx.mlx_array, sigtab: mlx.mlx_array, mode: @import("../../../engines/mlx/model.zig").QuantMode, group_size: u32) !?mlx.mlx_array {
+pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: Bank, views: ?moe_affine4.Views, scales: Scales, shared: ?moe_affine4.Shared, inds: mlx.mlx_array, scores: mlx.mlx_array, sigtab: mlx.mlx_array, mode: QuantMode, group_size: u32) !?mlx.mlx_array {
+    const b = if (views) |v| [3]Bank{ .{ .w = v.gate.w, .s = v.gate.s }, .{ .w = v.up.w, .s = v.up.s }, .{ .w = v.down.w, .s = v.down.s } } else [3]Bank{ gate, up, down };
+    return run(s, x, .{ gate, up, down }, &.{b}, null, scales, shared, inds, scores, sigtab, mode, group_size);
+}
+
+/// `decode` over a streamed bank's slot banks (`sdk/weights/streamed.zig`): `banks` (1 to 3, each gate, up, down),
+/// pair e in bank `kinds[e]` (u32, `inds`' shape) at row `inds[e]`. One bank is `decode`; more run `decode`'s bodies
+/// with each weight read routed by `kinds` (`BANKS_HEADER`), so every pair's sums, and the k-sum's order, are the
+/// one-bank kernel's. The per-expert scales index by expert, which slot rows are not: refused by name.
+pub fn decodeBanks(s: mlx.mlx_stream, x: mlx.mlx_array, banks: []const [3]Bank, kinds: mlx.mlx_array, scales: Scales, shared: ?moe_affine4.Shared, inds: mlx.mlx_array, scores: mlx.mlx_array, sigtab: mlx.mlx_array, mode: QuantMode, group_size: u32) !?mlx.mlx_array {
+    if (banks.len == 0 or banks.len > 3) return error.StreamedBankCount;
+    if (banks.len > 1 and (scales.gate != null or scales.up != null)) return error.StreamedExpertScales;
+    return run(s, x, banks[0], banks, if (banks.len > 1) kinds else null, scales, shared, inds, scores, sigtab, mode, group_size);
+}
+
+/// The two dispatches over `bind` (one bank, or the slot banks with `kinds`); `geo` is a bank of the geometry.
+fn run(s: mlx.mlx_stream, x: mlx.mlx_array, geo: [3]Bank, bind: []const [3]Bank, kinds: ?mlx.mlx_array, scales: Scales, shared: ?moe_affine4.Shared, inds: mlx.mlx_array, scores: mlx.mlx_array, sigtab: mlx.mlx_array, mode: QuantMode, group_size: u32) !?mlx.mlx_array {
+    const gate = geo[0];
+    const up = geo[1];
+    const down = geo[2];
     if (!mlx.streamIsGpu(s)) return null;
     const ki: usize = switch (mode) {
         .nvfp4 => if (group_size == 16) 0 else return null,
@@ -116,28 +142,53 @@ pub fn decode(s: mlx.mlx_stream, x: mlx.mlx_array, gate: Bank, up: Bank, down: B
     }
 
     const full_header = [2][:0]const u8{ E2M1_HEADER ++ NV_SCALE ++ DOT16, E2M1_HEADER ++ MX_SCALE ++ DOT16 };
-    if (kernels[ki].gateup == null) {
-        const names = [2][*:0]const u8{ "mlxserve_moe_fp4_gateup_nv", "mlxserve_moe_fp4_gateup_mx" };
-        const ins = [_][*:0]const u8{ "x", "wg_q", "g_scales", "wu_q", "u_scales", "inds", "sigtab", "gsc", "usc" };
-        kernels[ki].gateup = try makeKernel(names[ki], &ins, GATEUP_SOURCE, full_header[ki].ptr);
+    const banks_header = [2][:0]const u8{ full_header[0] ++ BANKS_HEADER, full_header[1] ++ BANKS_HEADER };
+    const set = if (kinds != null) &banked[ki] else &kernels[ki];
+    if (set.gateup == null) {
+        const names = [2][2][*:0]const u8{ .{ "mlxserve_moe_fp4_gateup_nv", "mlxserve_moe_fp4_gateup_mx" }, .{ "mlxserve_moe_fp4_gateup_nv_banks", "mlxserve_moe_fp4_gateup_mx_banks" } };
+        const one = [_][*:0]const u8{ "x", "wg_q", "g_scales", "wu_q", "u_scales", "inds", "sigtab", "gsc", "usc" };
+        const several = [_][*:0]const u8{ "x", "wg_q0", "g_scales0", "wg_q1", "g_scales1", "wg_q2", "g_scales2", "wu_q0", "u_scales0", "wu_q1", "u_scales1", "wu_q2", "u_scales2", "inds", "kinds", "sigtab", "gsc", "usc" };
+        set.gateup = if (kinds == null)
+            try makeKernel(names[0][ki], &one, GATEUP_SOURCE, full_header[ki].ptr)
+        else
+            try makeKernel(names[1][ki], &several, GATEUP_SOURCE, banks_header[ki].ptr);
     }
-    if (kernels[ki].downred == null) {
-        const names = [2][*:0]const u8{ "mlxserve_moe_fp4_downred_nv", "mlxserve_moe_fp4_downred_mx" };
-        const ins = [_][*:0]const u8{ "act", "wd_q", "d_scales", "inds", "scores", "sdown", "glog" };
-        kernels[ki].downred = try makeKernel(names[ki], &ins, DOWNRED_SOURCE, full_header[ki].ptr);
+    if (set.downred == null) {
+        const names = [2][2][*:0]const u8{ .{ "mlxserve_moe_fp4_downred_nv", "mlxserve_moe_fp4_downred_mx" }, .{ "mlxserve_moe_fp4_downred_nv_banks", "mlxserve_moe_fp4_downred_mx_banks" } };
+        const one = [_][*:0]const u8{ "act", "wd_q", "d_scales", "inds", "scores", "sdown", "glog" };
+        const several = [_][*:0]const u8{ "act", "wd_q0", "d_scales0", "wd_q1", "d_scales1", "wd_q2", "d_scales2", "inds", "kinds", "scores", "sdown", "glog" };
+        set.downred = if (kinds == null)
+            try makeKernel(names[0][ki], &one, DOWNRED_SOURCE, full_header[ki].ptr)
+        else
+            try makeKernel(names[1][ki], &several, DOWNRED_SOURCE, banks_header[ki].ptr);
     }
     const gs: c_int = @intCast(group_size);
-    const b = if (views) |v| [3]Bank{ .{ .w = v.gate.w, .s = v.gate.s }, .{ .w = v.up.w, .s = v.up.s }, .{ .w = v.down.w, .s = v.down.s } } else [3]Bank{ gate, up, down };
     // Unused operands bind any array of the right type; the template flag keeps them unread.
     const gsc = scales.gate orelse scores;
     const usc = scales.up orelse scores;
-    const act = try apply(kernels[ki].gateup.?, &.{ x, b[0].w, b[0].s, b[1].w, b[1].s, inds, sigtab, gsc, usc }, &.{ rows * topk, inter }, dt, .{ 32, @divExact(inter, rows_per_sg), rows * topk }, rows_per_sg, &.{ .{ "K", hidden }, .{ "N", inter }, .{ "GS", gs }, .{ "TOPK", topk }, .{ "GSCALE", @intFromBool(scales.gate != null) }, .{ "USCALE", @intFromBool(scales.up != null) }, .{ "CLAMP", @intCast(scales.clamp) } }, s);
+    // Per projection, each bank's words and scales (a missing bank binds the first's; `kinds` never reads it).
+    var w: [3][6]mlx.mlx_array = undefined;
+    for (0..3) |p| for (0..3) |i| {
+        const bk = bind[if (i < bind.len) i else 0][p];
+        w[p][2 * i] = bk.w;
+        w[p][2 * i + 1] = bk.s;
+    };
+    const gu_tmpl = [_]struct { [*:0]const u8, c_int }{ .{ "K", hidden }, .{ "N", inter }, .{ "GS", gs }, .{ "TOPK", topk }, .{ "GSCALE", @intFromBool(scales.gate != null) }, .{ "USCALE", @intFromBool(scales.up != null) }, .{ "CLAMP", @intCast(scales.clamp) } };
+    if (kinds != null) banked_dispatches +%= 1;
+    const act = if (kinds) |k|
+        try apply(set.gateup.?, &(.{x} ++ w[0] ++ w[1] ++ .{ inds, k, sigtab, gsc, usc }), &.{ rows * topk, inter }, dt, .{ 32, @divExact(inter, rows_per_sg), rows * topk }, rows_per_sg, &gu_tmpl, s)
+    else
+        try apply(set.gateup.?, &.{ x, w[0][0], w[0][1], w[1][0], w[1][1], inds, sigtab, gsc, usc }, &.{ rows * topk, inter }, dt, .{ 32, @divExact(inter, rows_per_sg), rows * topk }, rows_per_sg, &gu_tmpl, s);
     defer _ = mlx.mlx_array_free(act);
     const sh = shared orelse moe_affine4.Shared{ .down = scores, .logit = scores };
-    const y = try apply(kernels[ki].downred.?, &.{ act, b[2].w, b[2].s, inds, scores, sh.down, sh.logit }, &.{ rows, hidden }, dt, .{ 32, @divExact(hidden, rows_per_sg), rows }, rows_per_sg, &.{ .{ "I", inter }, .{ "H", hidden }, .{ "GS", gs }, .{ "TOPK", topk }, .{ "SHARED", @intFromBool(shared != null) } }, s);
+    const dr_tmpl = [_]struct { [*:0]const u8, c_int }{ .{ "I", inter }, .{ "H", hidden }, .{ "GS", gs }, .{ "TOPK", topk }, .{ "SHARED", @intFromBool(shared != null) } };
+    const y = if (kinds) |k|
+        try apply(set.downred.?, &(.{act} ++ w[2] ++ .{ inds, k, scores, sh.down, sh.logit }), &.{ rows, hidden }, dt, .{ 32, @divExact(hidden, rows_per_sg), rows }, rows_per_sg, &dr_tmpl, s)
+    else
+        try apply(set.downred.?, &.{ act, w[2][0], w[2][1], inds, scores, sh.down, sh.logit }, &.{ rows, hidden }, dt, .{ 32, @divExact(hidden, rows_per_sg), rows }, rows_per_sg, &dr_tmpl, s);
     if (!engaged) {
         engaged = true;
-        @import("../../../host/log.zig").info("[moe] fp4 decode kernels engaged: {s} rows={d} topk={d} inter={d} hidden={d} gate_scale={} shared={} views={}\n", .{ @tagName(mode), rows, topk, inter, hidden, scales.gate != null, shared != null, views != null });
+        @import("../../../host/log.zig").info("[moe] fp4 decode kernels engaged: {s} rows={d} topk={d} inter={d} hidden={d} gate_scale={} shared={} banks={d}\n", .{ @tagName(mode), rows, topk, inter, hidden, scales.gate != null, shared != null, bind.len });
     }
     return y;
 }
@@ -536,5 +587,83 @@ test "moe fp4 decode: one-expert bank views and the fused shared expert match fp
         const rel = @sqrt(se / st);
         std.debug.print("[moe-fp4] {s} views+shared: rel rms err vs fp32 truth {d:.5}\n", .{ f.name, rel });
         try testing.expect(rel < 0.02);
+    }
+}
+
+test "moe fp4 decode: experts spread over three slot banks give the one-bank kernel's output bit for bit (mxfp4, nvfp4; one and two tokens, the fused shared expert)" {
+    if (mlx.noGpuBackend()) return error.SkipZigTest;
+    const s = mlx.gpuStream();
+    var prng = std.Random.DefaultPrng.init(0xBA4C5);
+    const rnd = prng.random();
+    const E: c_int = 16;
+    const I: c_int = 640;
+    const H: c_int = 1536;
+    const TOPK: c_int = 8;
+    // Slot bank b holds `slot_of[b]`'s experts, at rows in that order.
+    const slot_of = [3][]const u32{ &.{ 9, 2, 14, 0, 7 }, &.{ 3, 11, 5, 12, 1, 15 }, &.{ 6, 13, 4, 10, 8 } };
+    const Fmt = struct { name: [:0]const u8, gs: c_int, mode: QuantMode };
+    for ([_]Fmt{ .{ .name = "mxfp4", .gs = 32, .mode = .mxfp4 }, .{ .name = "nvfp4", .gs = 16, .mode = .nvfp4 } }) |f| {
+        var whole: [3]Bank = undefined;
+        const shapes = [3][3]c_int{ .{ E, I, H }, .{ E, I, H }, .{ E, H, I } };
+        for (&whole, shapes) |*b, sh| {
+            const w = try randBf16(rnd, &sh, 0.2, s);
+            defer _ = mlx.mlx_array_free(w);
+            const q = try quant(w, f.gs, f.name, s);
+            _ = mlx.mlx_array_free(q.deq);
+            b.* = q.b;
+        }
+        defer for (whole) |b| {
+            _ = mlx.mlx_array_free(b.w);
+            _ = mlx.mlx_array_free(b.s);
+        };
+        var slots: [3][3]Bank = undefined;
+        for (&slots, slot_of) |*bank, ids| {
+            const sel = mlx.mlx_array_new_data(ids.ptr, &[_]c_int{@intCast(ids.len)}, 1, .uint32);
+            defer _ = mlx.mlx_array_free(sel);
+            for (bank, whole) |*p, wb| {
+                p.* = .{ .w = mlx.mlx_array_new(), .s = mlx.mlx_array_new() };
+                try mlx.check(mlx.mlx_take_axis(&p.w, wb.w, sel, 0, s));
+                try mlx.check(mlx.mlx_take_axis(&p.s, wb.s, sel, 0, s));
+                try mlx.check(mlx.mlx_array_eval(p.w));
+                try mlx.check(mlx.mlx_array_eval(p.s));
+            }
+        }
+        defer for (slots) |bank| for (bank) |p| {
+            _ = mlx.mlx_array_free(p.w);
+            _ = mlx.mlx_array_free(p.s);
+        };
+        const sigtab = try xfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+        for ([_]c_int{ 1, 2 }) |R| {
+            const n: usize = @intCast(R * TOPK);
+            const experts = [16]u32{ 3, 0, 15, 7, 9, 1, 12, 5, 14, 2, 6, 11, 0, 8, 13, 10 };
+            var kind: [16]u32 = undefined;
+            var at: [16]u32 = undefined;
+            for (experts[0..n], kind[0..n], at[0..n]) |e, *k, *r| for (slot_of, 0..) |ids, b| if (std.mem.indexOfScalar(u32, ids, e)) |i| {
+                k.* = @intCast(b);
+                r.* = @intCast(i);
+            };
+            const inds = mlx.mlx_array_new_data(&experts, &[_]c_int{ R, TOPK }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(inds);
+            const rows = mlx.mlx_array_new_data(&at, &[_]c_int{ R, TOPK }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(rows);
+            const kinds = mlx.mlx_array_new_data(&kind, &[_]c_int{ R, TOPK }, 2, .uint32);
+            defer _ = mlx.mlx_array_free(kinds);
+            const x = try randBf16(rnd, &.{ R, H }, 2.0, s);
+            defer _ = mlx.mlx_array_free(x);
+            const scores = try randBf16(rnd, &.{ R, TOPK }, 0.5, s);
+            defer _ = mlx.mlx_array_free(scores);
+            const sdown = try randBf16(rnd, &.{H}, 1.0, s);
+            defer _ = mlx.mlx_array_free(sdown);
+            const logit = try randBf16(rnd, &.{1}, 1.0, s);
+            defer _ = mlx.mlx_array_free(logit);
+            for ([_]?moe_affine4.Shared{ null, .{ .down = sdown, .logit = logit } }) |shared| {
+                if (shared != null and R != 1) continue;
+                const want = (try decode(s, x, whole[0], whole[1], whole[2], null, .{}, shared, inds, scores, sigtab, f.mode, @intCast(f.gs))) orelse return error.KernelDeclined;
+                defer _ = mlx.mlx_array_free(want);
+                const got = (try decodeBanks(s, x, &slots, kinds, .{}, shared, rows, scores, sigtab, f.mode, @intCast(f.gs))) orelse return error.KernelDeclined;
+                defer _ = mlx.mlx_array_free(got);
+                try testing.expectEqual(@as(f32, 0), try xfm.maxAbsDiffF32(want, got, s));
+            }
+        }
     }
 }

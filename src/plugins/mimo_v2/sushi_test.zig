@@ -2,13 +2,14 @@
 //! `qkv_proj` with its 128x128 tile scales over four tensor-parallel slabs, an e4m3 dense first MLP, EXL3 routed
 //! experts under `expert_quant`, a bf16 rest) loaded by the engine's loader (`sushi_pack.adapt` splits the QKV into
 //! row-scaled e4m3 parts and decodes the MLP), served by the table bit-equal to the legacy forward at every step, and
-//! through the driver on the legacy config: steps, greedy and batched decode.
+//! through the driver on the legacy config: steps, greedy and batched decode. The legacy forward's values are replayed
+//! from `fixtures/*.tape`.
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const exl3 = @import("../../sdk/quant/exl3/format.zig");
-const proof = @import("../lfm2/proof.zig");
+const trunk = @import("proof_test.zig");
 const both = @import("../../engines/mlx/plugin/both.zig");
 const mimo = @import("plugin.zig");
 const heads_test = @import("mtp_head_test.zig");
@@ -138,9 +139,10 @@ test "mimo_v2 Sushi pack: e4m3 QKV parts, the decoded dense MLP and EXL3 experts
     var p = fixture.Pack.init(0x5a51);
     defer p.deinit();
     try writePack(&p);
-    var t = try proof.Twin(mimo).open(&p, config_json, &.{});
-    defer t.close();
-    try t.expectSteps(&proof.steps);
+    var b = try trunk.openCase(&p, config_json, true, 0x5a51);
+    defer b.close();
+    try b.expectSteps(&both.steps);
+    try b.expectDone();
 }
 
 test "mimo_v2 Sushi served: steps, greedy and batched decode through the driver on the legacy config, the MTP heads too" {
@@ -150,10 +152,11 @@ test "mimo_v2 Sushi served: steps, greedy and batched decode through the driver 
     try writePack(&p);
     try writeHeads(&p);
     const json = "{\"num_nextn_predict_layers\":3," ++ config_json[1..];
-    var b = try both.Both.openOnLegacyConfig(&mimo.table, &p, json);
+    var b = try trunk.openCase(&p, json, true, 0x5a52);
     defer b.close();
     try b.expectSteps(&both.long_steps);
     try b.expectGreedy();
     try b.expectBatched(.layered);
     try heads_test.expectServedHeads(&b, 0x5a53);
+    try b.expectDone();
 }

@@ -1,74 +1,20 @@
-//! The legacy MiMo forward's model-gated tests (ring vs full buffer, batched decode and the fixture oracle against
-//! modeling_mimo_v2.py) and their decided-miss count (`mimoDecidedMisses`).
+//! plugins/mimo_v2/fixtures: the served MiMo (this plugin behind the driver) against modeling_mimo_v2.py's logits on a
+//! tiny random MiMo stored like the release (`tests/dump_mimo_v2_fixtures.py`, packed by `tests/convert_mimo_v2.py`).
+//! Owns tests only; model-gated (`MIMO_V2_MODEL`, `MIMO_V2_FIXTURE`).
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
-const dec_attn = @import("dec_attn.zig");
-const sliding = @import("../../engines/mlx/kv/sliding.zig");
 const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
 const testing = @import("../../engines/mlx/kv/cache.zig").testing;
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
-const mimoDecodeCopies = @import("../../sdk/blocks/attention/sinks.zig").mimoDecodeCopies;
+const driver = @import("../../engines/mlx/plugin/driver.zig");
 const qwen4CompareRows = @import("../../sdk/testing/parity.zig").qwen4CompareRows;
 const qwen4ReadF32 = @import("../../sdk/testing/parity.zig").qwen4ReadF32;
-const qsaArraysAllEqual = @import("../qwen4_exp/qsa/select.zig").qsaArraysAllEqual;
+const mimoDecidedMisses = @import("../../sdk/testing/parity.zig").decidedMisses;
 
 // ── tests ──
-
-test "mimo_v2 sliding ring: a chunked prefill past the kept rows, then decode, matches the full-buffer cache bit for bit (MIMO_V2_MODEL)" {
-    const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend()) return error.SkipZigTest;
-    const allocator = testing.allocator;
-    const s = mlx.gpuStream();
-    const io = std.Io.Threaded.global_single_threaded.io();
-    var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
-    defer xfm.deinit();
-    try testing.expect(config.slidingRing());
-
-    const n_prompt: usize = 3 * config.slidingKeepRows();
-    const ids = try allocator.alloc(i32, n_prompt + 24);
-    defer allocator.free(ids);
-    for (ids, 0..) |*id, i| id.* = @intCast((i * 7919 + 13) % config.vocab_size);
-    const chunk: usize = 1000;
-
-    var logits: [2]std.ArrayList(mlx.mlx_array) = .{ .empty, .empty };
-    defer for (&logits) |*l| {
-        for (l.items) |a| _ = mlx.mlx_array_free(a);
-        l.deinit(allocator);
-    };
-    var ring_rows: usize = 0;
-    for ([_]bool{ true, false }, 0..) |ring_off, arm| {
-        sliding.sliding_ring_off_for_test = ring_off;
-        defer sliding.sliding_ring_off_for_test = false;
-        var cache = try KVCache.init(allocator, config.num_hidden_layers);
-        defer cache.deinit();
-        var off: usize = 0;
-        var ctx: ForwardCtx = .{ .cache = &cache, .moe_seq_offset = &off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
-        var at: usize = 0;
-        while (at < ids.len) {
-            const n = if (at < n_prompt) @min(chunk, n_prompt - at) else 1;
-            const arr = mlx.mlx_array_new_data(ids[at..].ptr, &[_]c_int{ 1, @intCast(n) }, 2, .int32);
-            defer _ = mlx.mlx_array_free(arr);
-            const out = try xfm.forwardWith(&ctx, arr);
-            try mlx.check(mlx.mlx_array_eval(out));
-            try logits[arm].append(allocator, out);
-            at += n;
-        }
-        if (!ring_off) {
-            for (cache.entries, 0..) |e, li| {
-                if (!config.isGlobalLayer(@intCast(li))) ring_rows = @max(ring_rows, KVCache.bufferCapacity(e.keys));
-            }
-        }
-    }
-    try testing.expect(ring_rows < n_prompt);
-    for (logits[0].items, logits[1].items) |a, b| try testing.expect(try qsaArraysAllEqual(a, b, s));
-}
 
 test "mimo_v2 batched decode: a slot in a two-slot tick tracks the fp32 reference as well as serial decode does (MIMO_V2_MODEL, MIMO_V2_FIXTURE)" {
     const model_dir = std.c.getenv("MIMO_V2_MODEL") orelse return error.SkipZigTest;
@@ -78,12 +24,9 @@ test "mimo_v2 batched decode: a slot in a two-slot tick tracks the fp32 referenc
     const s = mlx.gpuStream();
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try driver.load(io, allocator, &config, std.mem.span(model_dir), s);
     defer xfm.deinit();
-    try testing.expect(xfm.supportsBatchedGdnDecode());
 
     var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
     defer fx.deinit();
@@ -135,8 +78,7 @@ test "mimo_v2 batched decode: a slot in a two-slot tick tracks the fp32 referenc
         defer _ = mlx.mlx_array_free(lb);
         const ctxs = [_]*ForwardCtx{ &slots[2].ctx, &slots[3].ctx };
         const offs = [_]u32{ @intCast(slots[2].off), @intCast(slots[3].off) };
-        try testing.expect(xfm.batchedGdnReady(&ctxs));
-        const out = try xfm.forwardMoeBatchedDecode(&.{ @intCast(ta), @intCast(tb) }, &ctxs, &offs, null);
+        const out = try xfm.forwardBatchedDecode(&.{ @intCast(ta), @intCast(tb) }, &ctxs, &offs);
         defer {
             for (out) |o| _ = mlx.mlx_array_free(o);
             allocator.free(out);
@@ -157,31 +99,6 @@ test "mimo_v2 batched decode: a slot in a two-slot tick tracks the fp32 referenc
     try testing.expect(cos_batched > cos_serial - 0.001 and misses == 0);
 }
 
-/// A bf16 forward against the fp32 reference carries up to ~0.5 of logit error on
-/// the tiny MiMo, so only a row whose reference top-2 margin clears that decides its argmax.
-const MIMO_DECIDED_MARGIN: f32 = 0.5;
-
-/// Rows whose argmax differs from the reference where its margin decides it;
-/// near-tied flips are printed, never counted.
-pub fn mimoDecidedMisses(ours: []const f32, ref: []const f32, rows: usize, v: usize) usize {
-    var misses: usize = 0;
-    for (0..rows) |i| {
-        const o = ours[i * v ..][0..v];
-        const r = ref[i * v ..][0..v];
-        const io_ = std.mem.indexOfMax(f32, o);
-        const ir = std.mem.indexOfMax(f32, r);
-        if (io_ == ir) continue;
-        var second: f32 = -std.math.inf(f32);
-        for (r, 0..) |x, j| {
-            if (j != ir) second = @max(second, x);
-        }
-        const gap = r[ir] - second;
-        if (gap >= MIMO_DECIDED_MARGIN) misses += 1;
-        std.debug.print("[mimo fixture] row {d}: argmax {d} vs reference {d} (reference margin {d:.3}{s})\n", .{ i, io_, ir, gap, if (gap >= MIMO_DECIDED_MARGIN) "" else ", a near tie" });
-    }
-    return misses;
-}
-
 test "mimo_v2 fixture: one-shot and chunked prefill + decode vs modeling_mimo_v2.py (MIMO_V2_MODEL, MIMO_V2_FIXTURE)" {
     // A tiny random MiMo stored like the release (tests/dump_mimo_v2_fixtures.py), packed by
     // tests/convert_mimo_v2.py --bits 16; logits from the checkpoint's own code in f32.
@@ -193,10 +110,8 @@ test "mimo_v2 fixture: one-shot and chunked prefill + decode vs modeling_mimo_v2
     const io = std.Io.Threaded.global_single_threaded.io();
 
     var config = try model_mod.parseConfig(io, allocator, std.mem.span(model_dir));
-    var weights = try model_mod.loadWeights(io, allocator, std.mem.span(model_dir));
-    defer weights.deinit();
-    model_mod.resolveWeightPrefix(&config, &weights);
-    var xfm = try Transformer.init(io, allocator, config, &weights);
+    defer config.deinit(allocator);
+    var xfm = try driver.load(io, allocator, &config, std.mem.span(model_dir), s);
     defer xfm.deinit();
 
     var fx = try model_mod.loadWeightsSingleFile(allocator, std.mem.span(fixture_path));
@@ -253,13 +168,4 @@ test "mimo_v2 fixture: one-shot and chunked prefill + decode vs modeling_mimo_v2
     }
     std.debug.print("[mimo fixture] chunked prefill + {d} decode steps: min cos {d:.5}, argmax {d}/{d}\n", .{ T - t_pre, worst, agree, T - t_pre });
     try testing.expect(worst > 0.995 and agree == @as(usize, @intCast(T - t_pre)));
-}
-
-test "mimo decode copies: a short prompt chunk prefills dense, a verify window reads the copies" {
-    try testing.expect(!mimoDecodeCopies(true, 1, true, false, 5));
-    try testing.expect(mimoDecodeCopies(true, 1, true, true, 5));
-    try testing.expect(!mimoDecodeCopies(true, 1, true, true, dec_attn.MAX_ROWS + 1));
-    try testing.expect(mimoDecodeCopies(true, 1, false, false, 1));
-    try testing.expect(!mimoDecodeCopies(false, 1, true, true, 5));
-    try testing.expect(!mimoDecodeCopies(true, 2, false, false, 1));
 }

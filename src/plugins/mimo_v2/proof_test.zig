@@ -3,7 +3,7 @@
 //! dense global first layer, sliding layers with sinks under an 8-row band, a global MoE layer, the router under both
 //! of its names and one layer without a selection bias, served by the table bit-equal to the legacy `forwardMoeWith`
 //! at every step (prefill chunks past the window and the fused prefill width, decode, speculative verify), and
-//! `parse` equal to the engine's parse.
+//! `parse` equal to the engine's parse. The deleted legacy forward's values are replayed from `fixtures/*.tape`.
 
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
@@ -11,24 +11,24 @@ const mlx = @import("../../mlx/ffi.zig");
 const ops = @import("../../mlx/ops.zig");
 const cache_ops = @import("../../engines/mlx/kv/cache_ops.zig");
 const KVCache = @import("../../engines/mlx/kv/cache.zig").KVCache;
-const ForwardCtx = @import("../../engines/mlx/forward_ctx.zig").ForwardCtx;
 const fixture = @import("../../sdk/bases/proof/fixture.zig");
 const proof = @import("../lfm2/proof.zig");
+const both = @import("../../engines/mlx/plugin/both.zig");
 const mimo = @import("plugin.zig");
 const config = @import("config.zig");
 
 const testing = std.testing;
 
-const H: c_int = 256;
+pub const H: c_int = 256;
 const HEADS: c_int = 8;
 const KV_GLOBAL: c_int = 1;
 const KV_SWA: c_int = 2;
 const HD: c_int = 192;
 const VD: c_int = 128;
 const INTER: c_int = 512;
-const VOCAB: c_int = 256;
-const EXPERTS: c_int = 8;
-const MOE_INTER: c_int = 128;
+pub const VOCAB: c_int = 256;
+pub const EXPERTS: c_int = 8;
+pub const MOE_INTER: c_int = 128;
 const LAYERS = 4;
 /// 0 = global, 1 = sliding.
 const pattern = [LAYERS]u8{ 0, 1, 1, 0 };
@@ -94,44 +94,46 @@ const wide_steps = [_]proof.Step{
     .{ .mode = .decode, .ids = &.{64} },
 };
 
-fn case(comptime quantized: bool, seed: u64) !void {
+/// `p` served by the table against the tape `fixtures/<seed>.tape`, recorded from the deleted legacy forward.
+pub fn openCase(p: *fixture.Pack, json: []const u8, comptime legacy_config: bool, comptime seed: u64) !both.Both {
+    return both.Both.replay(&mimo.table, p, json, legacy_config, @embedFile(std.fmt.comptimePrint("fixtures/{x}.tape", .{seed})));
+}
+
+fn case(comptime quantized: bool, comptime seed: u64) !void {
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     try writePack(&p, quantized);
-    var t = try proof.Twin(mimo).open(&p, configJson(quantized), &.{});
-    defer t.close();
-    try t.expectSteps(&(proof.steps ++ wide_steps));
+    var b = try openCase(&p, configJson(quantized), false, seed);
+    defer b.close();
+    try b.expectSteps(&(proof.steps ++ wide_steps));
     // A drafter reads the trunk's table and head as loaded, with their geometry.
     for ([_]abi.TrunkWeight{ .embed, .head }) |which| {
         var w: @import("../../abi/quant.zig").Weight = .{};
-        try testing.expect(mimo.table.spec.?.trunk_weight.?(t.m, which, &w).isOk());
+        try testing.expect(mimo.table.spec.?.trunk_weight.?(b.xfm.plugin.?.model, which, &w).isOk());
         try testing.expect(w.w.ctx != null and (w.scales.ctx != null) == quantized);
         try testing.expectEqual(@as(u8, if (quantized) 4 else 0), w.bits);
     }
+    try b.expectDone();
 }
 
-/// One slot on each side: the legacy KV cache and position, the table's KV cache behind `cache_ops`.
-const Side = struct {
-    legacy: KVCache,
+/// One slot of the table: its KV cache and position.
+pub const Side = struct {
+    kv: KVCache,
     off: usize = 0,
-    ctx: ForwardCtx = undefined,
-    table: KVCache,
     slot: cache_ops.Slot = undefined,
 
-    fn init(s: *Side) !void {
-        s.* = .{ .legacy = try KVCache.init(testing.allocator, LAYERS), .table = try KVCache.init(testing.allocator, LAYERS) };
-        s.ctx = .{ .cache = &s.legacy, .moe_seq_offset = &s.off, .ssm_entries = null, .capture_hidden = null, .vision_embeddings = null };
-        s.slot = .{ .kv = &s.table };
+    pub fn init(s: *Side) !void {
+        s.* = .{ .kv = try KVCache.init(testing.allocator, LAYERS) };
+        s.slot = .{ .kv = &s.kv };
     }
 
-    fn deinit(s: *Side) void {
-        s.legacy.deinit();
-        s.table.deinit();
+    pub fn deinit(s: *Side) void {
+        s.kv.deinit();
     }
 };
 
 /// The table's logits for one forward, owned by `g`.
-fn tableLogits(g: *ops.Graph, m: *anyopaque, f: abi.Forward) !mlx.mlx_array {
+pub fn tableLogits(g: *ops.Graph, m: *anyopaque, f: abi.Forward) !mlx.mlx_array {
     var out: abi.ForwardOut = .{};
     var fw = f;
     fw.logits = .all_rows;
@@ -146,29 +148,28 @@ fn tableLogits(g: *ops.Graph, m: *anyopaque, f: abi.Forward) !mlx.mlx_array {
 }
 
 /// Two slots of different lengths (one past the window) prefilled on their own, then batched decode ticks and a
-/// batched verify: the table's batched rows bit-equal to the legacy `forwardMoeBatchedRows`.
-fn batchedCase(comptime quantized: bool, seed: u64) !void {
+/// batched verify: the table's batched rows bit-equal to the recorded legacy `forwardMoeBatchedRows`.
+fn batchedCase(comptime quantized: bool, comptime seed: u64) !void {
     const a = testing.allocator;
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     try writePack(&p, quantized);
-    var t = try proof.Twin(mimo).open(&p, configJson(quantized), &.{});
-    defer t.close();
-    const xfm = &t.lg.xfm;
+    var b = try openCase(&p, configJson(quantized), false, seed);
+    defer b.close();
+    const m = b.xfm.plugin.?.model;
     var sides: [2]Side = undefined;
-    for (&sides) |*s| try s.init();
-    defer for (&sides) |*s| s.deinit();
+    for (&sides) |*sd| try sd.init();
+    defer for (&sides) |*sd| sd.deinit();
     const prompts = [2][]const i32{ &.{ 3, 17, 42, 99, 7, 250, 1, 8, 66, 31, 120, 5, 77 }, &.{ 9, 33, 77, 140, 2, 18 } };
-    for (&sides, prompts) |*s, pr| {
-        var g = ops.Graph.init(a, xfm.s);
+    for (0..2) |i| {
+        const pr = prompts[i];
+        var g = ops.Graph.init(a, b.xfm.s);
         defer g.deinit();
-        const ids = try fixture.tokens(&g, pr);
-        const want = try fixture.rows2(&g, try g.adopt(try xfm.forwardWith(&s.ctx, ids)));
         var host: [32]u32 = undefined;
         for (pr, 0..) |id, k| host[k] = @intCast(id);
-        const handles = [_]abi.Handle{s.slot.handle()};
-        const got = try tableLogits(&g, t.m, .{ .mode = .prefill, .rows = @intCast(pr.len), .tokens = .of(host[0..pr.len]), .positions = .of(&.{0}), .caches = .of(&handles) });
-        try ops.expectBitEqual(got, want);
+        const handles = [_]abi.Handle{sides[i].slot.handle()};
+        const got = try tableLogits(&g, m, .{ .mode = .prefill, .rows = @intCast(pr.len), .tokens = .of(host[0..pr.len]), .positions = .of(&.{0}), .caches = .of(&handles) });
+        try b.check(got, null, false);
     }
     const ticks = [_][2][]const i32{
         .{ &.{88}, &.{12} },
@@ -177,34 +178,30 @@ fn batchedCase(comptime quantized: bool, seed: u64) !void {
         .{ &.{7}, &.{21} },
     };
     for (ticks) |tk| {
-        var g = ops.Graph.init(a, xfm.s);
+        var g = ops.Graph.init(a, b.xfm.s);
         defer g.deinit();
         const w = tk[0].len;
-        var flat: [8]i32 = undefined;
         var host: [8]u32 = undefined;
         for (0..2) |i| for (tk[i], 0..) |id, k| {
-            flat[i * w + k] = id;
             host[i * w + k] = @intCast(id);
         };
-        const ids = try g.fromSlice(i32, flat[0 .. 2 * w], &.{ 2, @intCast(w) });
-        const ctxs = [_]*ForwardCtx{ &sides[0].ctx, &sides[1].ctx };
         const offs = [_]u32{ @intCast(sides[0].off), @intCast(sides[1].off) };
-        const want = try fixture.rows2(&g, try g.adopt(try xfm.forwardMoeBatchedRows(ids, &ctxs, &offs, w > 1, null, null)));
         const handles = [_]abi.Handle{ sides[0].slot.handle(), sides[1].slot.handle() };
-        const got = try tableLogits(&g, t.m, .{ .mode = .batched_rows, .rows = @intCast(w), .tokens = .of(host[0 .. 2 * w]), .positions = .of(&offs), .caches = .of(&handles) });
-        try ops.expectBitEqual(try g.reshape(got, &.{ @intCast(2 * w), VOCAB }), want);
-        for (&sides) |*s| s.off += w;
+        const got = try tableLogits(&g, m, .{ .mode = .batched_rows, .rows = @intCast(w), .tokens = .of(host[0 .. 2 * w]), .positions = .of(&offs), .caches = .of(&handles) });
+        try b.check(try g.reshape(got, &.{ @intCast(2 * w), VOCAB }), null, false);
+        for (&sides) |*sd| sd.off += w;
     }
+    try b.expectDone();
 }
 
 /// Prompt chunks past the ring (window + 2048 rows), then decode and a verify: the sliding layers' rings trim on both
 /// sides.
-fn ringCase(seed: u64) !void {
+fn ringCase(comptime seed: u64) !void {
     var p = fixture.Pack.init(seed);
     defer p.deinit();
     try writePack(&p, true);
-    var t = try proof.Twin(mimo).open(&p, configJson(true), &.{});
-    defer t.close();
+    var b = try openCase(&p, configJson(true), false, seed);
+    defer b.close();
     var long: [2 * 1100]i32 = undefined;
     for (&long, 0..) |*id, i| id.* = @intCast((i * 7919 + 13) % VOCAB);
     const seq = [_]proof.Step{
@@ -214,7 +211,22 @@ fn ringCase(seed: u64) !void {
         .{ .mode = .verify, .ids = &.{ 5, 61, 200 } },
         .{ .mode = .decode, .ids = &.{64} },
     };
-    try t.expectSteps(&seq);
+    // Logits only.
+    var side: Side = undefined;
+    try side.init();
+    defer side.deinit();
+    const host = try testing.allocator.alloc(u32, long.len);
+    defer testing.allocator.free(host);
+    for (seq) |st| {
+        var g = ops.Graph.init(testing.allocator, b.xfm.s);
+        defer g.deinit();
+        for (st.ids, host[0..st.ids.len]) |id, *h| h.* = @intCast(id);
+        const handles = [_]abi.Handle{side.slot.handle()};
+        const got = try tableLogits(&g, b.xfm.plugin.?.model, .{ .mode = st.mode, .rows = @intCast(st.ids.len), .tokens = .of(host[0..st.ids.len]), .positions = .of(&.{@intCast(side.off)}), .caches = .of(&handles) });
+        try b.check(got, null, false);
+        side.off += st.ids.len;
+    }
+    try b.expectDone();
 }
 
 fn expectParse(json: []const u8) !void {
@@ -261,6 +273,9 @@ test "mimo_v2 plugin: a bf16 pack (decode and short verify read the attention si
 
 test "mimo_v2 plugin: batched rows (decode ticks and a verify, slots of different lengths) are bit-equal to forwardMoeBatchedRows" {
     try batchedCase(true, 0x3132);
+}
+
+test "mimo_v2 plugin: bf16 batched rows are too" {
     try batchedCase(false, 0x3133);
 }
 

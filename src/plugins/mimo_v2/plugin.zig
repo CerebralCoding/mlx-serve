@@ -297,4 +297,5 @@ test {
     _ = @import("proof_test.zig");
     _ = @import("mtp_head_test.zig");
     _ = @import("sushi_test.zig");
+    _ = @import("streamed_test.zig");
 }

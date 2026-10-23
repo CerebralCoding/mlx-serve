@@ -65,6 +65,7 @@ pub const dsv41_streamed = @import("plugins/deepseek_v41/stream/streamed.zig");
 /// test module's `plugins/<model>/stream/dupes_test.zig` to compare against the resident arch.
 pub const dupes = if (@import("builtin").is_test) struct {
     pub const deepseek_v41 = @import("plugins/deepseek_v41/stream/dupes.zig");
+    pub const mimo_v2 = @import("plugins/mimo_v2/stream/dupes.zig");
 } else struct {};
 /// The context a construction bills when the model sets none (`ctx_size`): the standard request.
 pub const default_context: u64 = @import("plugins/deepseek_v41/stream/bill.zig").fill_prompt_tokens;
