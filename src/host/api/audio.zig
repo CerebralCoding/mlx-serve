@@ -192,7 +192,7 @@ fn transcribeClip(allocator: std.mem.Allocator, stream: *Conn, lm: *LoadedModel,
         return null;
     }
     const max_tokens = clampMaxTokens(TRANSCRIPTION_MAX_TOKENS, prompt_ids.len, effective_ctx);
-    if (!try checkAttentionMemory(allocator, stream, prompt_ids, max_tokens, config, false, null, lm, generate_mod.visionPrefillUnchunked(true), false, mm.bytes(config))) return null;
+    if (!try checkAttentionMemory(allocator, stream, prompt_ids, max_tokens, config, false, null, lm, false, false, mm.bytes(config))) return null;
 
     // Ownership of the soft tokens moves to the slot. The reference decodes plainly: no thinking, no drafts.
     const slot_ve = mm.embeddings;

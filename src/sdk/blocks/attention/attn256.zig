@@ -79,16 +79,10 @@ fn getAttn256Kernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-var fused256_env_cached: ?bool = null;
 var fused256_causal_env_cached: ?Fused256CausalMode = null;
 
 pub fn fused256Enabled() bool {
-    if (transformer.fused256_override) |v| return v;
-    if (fused256_env_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_FUSED_256);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    fused256_env_cached = enabled;
-    return enabled;
+    return transformer.fused256_override orelse true;
 }
 
 /// Plain-CAUSAL dispatch mode. Default `.all` since the kv-chunk dispatch

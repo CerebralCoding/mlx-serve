@@ -409,15 +409,9 @@ pub fn getGdnKernelSeq(vector_gate: bool) !mlx.mlx_fast_metal_kernel {
 
 /// Test seam: forces the blocked-prefill route on/off without the environment.
 pub var gdn_blocked_override: ?bool = null;
-var gdn_blocked_env_cached: ?bool = null;
 
 pub fn gdnBlockedEnabled() bool {
-    if (gdn_blocked_override) |v| return v;
-    if (gdn_blocked_env_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_GDN_BLOCKED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gdn_blocked_env_cached = enabled;
-    return enabled;
+    return gdn_blocked_override orelse true;
 }
 
 /// Prefill-width floor for the blocked kernel (mirrors oMLX's OMLX_GDN_MIN_T

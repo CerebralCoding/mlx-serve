@@ -162,15 +162,9 @@ var gateup_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gateup_cfg_key: GateUpCfgKey = std.mem.zeroes(GateUpCfgKey);
 var gqmv_gateup_engaged: bool = false;
 
-var gqmv_gateup_env: ?bool = null;
 
 pub fn gatherQmvGateUpEnabled() bool {
-    if (transformer.gqmv_gateup_override) |v| return v;
-    if (gqmv_gateup_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_MOE_GATEUP_FUSED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gqmv_gateup_env = enabled;
-    return enabled;
+    return transformer.gqmv_gateup_override orelse true;
 }
 
 /// One kernel for `silu(gather(gate) @ x) * (gather(up) @ x)` at decode width.

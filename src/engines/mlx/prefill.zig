@@ -22,7 +22,6 @@ const testing = std.testing;
 const runPrefillDs4 = @import("../ds4/adapter.zig").runPrefillDs4;
 const runPrefillLlama = @import("../llama/adapter.zig").runPrefillLlama;
 const publishHotCacheResidency = @import("cache/budget.zig").publishHotCacheResidency;
-const prefillInterleaveEnabled = @import("prefill_interleave.zig").prefillInterleaveEnabled;
 const prefillDecodeShare = @import("prefill_interleave.zig").prefillDecodeShare;
 const InterleaveCtx = @import("prefill_interleave.zig").InterleaveCtx;
 const companyPrefillChunk = @import("prefill_interleave.zig").companyPrefillChunk;
@@ -317,7 +316,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
                 .seq = slot.full_prompt.len,
                 .max_tokens = slot.max_tokens,
                 .kv_cfg = slot.cache.config,
-                .unchunked = generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+                .unchunked = false,
                 .warm_matched = hot_matched,
                 .warm_capacity = slot.cache.residentCapacityTokens(),
                 .warm_will_donate = hot_checked_out,
@@ -382,7 +381,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             slot.full_prompt.len,
             slot.max_tokens,
             slot.cache.config,
-            generate_mod.visionPrefillUnchunked(slot.vision_embeddings != null),
+            false,
             hot_matched,
             slot.cache.residentCapacityTokens(),
             hot_checked_out,
@@ -492,10 +491,7 @@ pub fn runPrefill(sch: *Scheduler, slot: *Slot) !void {
             .cancelled_checkpoint_sink = &slot.cancelled_prefill,
             .prefill_progress = if (observe) &sch.inflight_prefill_tokens else null,
             .prefill_expected = if (observe) &sch.inflight_prefill_expected else null,
-            .interleave_hook = if (prefillInterleaveEnabled())
-                .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb }
-            else
-                null,
+            .interleave_hook = .{ .ctx = &interleave_ctx, .call = interleaveDecodeTickCb },
             .write_through_hook = if (writeThroughArmed(slot, prefill_tokens.len))
                 .{ .ctx = &write_through_ctx, .call = prefillWriteThroughCb }
             else
@@ -578,18 +574,6 @@ test "runPrefill clears restored spec-cache ownership BEFORE Generator.initWithO
     const mtp = std.mem.indexOf(u8, body, "mtp_restored = null") orelse return error.MissingMtpClear;
     try testing.expect(dfl < call);
     try testing.expect(mtp < call);
-}
-
-test "runPrefill wires the interleave hook and bills its decode ticks out of prefill_ns" {
-    const src = @embedFile("prefill.zig") ++ @embedFile("step.zig");
-    // The hook is wired at the ONE Generator construction site, env-gated.
-    const wire = ".interleave" ++ "_hook = if (prefillInterleaveEnabled())";
-    try testing.expect(std.mem.indexOf(u8, src, wire) != null);
-    // Interleaved decode time is charged to the DECODING slots (they got the
-    // tokens), so the prefilling slot's prefill_ns must exclude it or
-    // prefill_tps under-reports on every interleaved prefill.
-    const bill = "slot.prefill_ns = prefill_sw.read() -| slot.prefill_" ++ "interleaved_ns;";
-    try testing.expect(std.mem.indexOf(u8, src, bill) != null);
 }
 
 test "sumInflightGeneratedTokens sums active slots, excludes finished/cancelled/errored" {

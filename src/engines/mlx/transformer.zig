@@ -248,7 +248,6 @@ pub const SlidingView = @import("../../sdk/blocks/attention/kv_view.zig").Slidin
 // engines/mlx/kv/sliding.zig
 pub const SLIDING_TRIM_UNBOUNDED = @import("kv/sliding.zig").SLIDING_TRIM_UNBOUNDED;
 pub const slidingTailSpan = @import("kv/sliding.zig").slidingTailSpan;
-pub const slidingBlockTrimEnabled = @import("kv/sliding.zig").slidingBlockTrimEnabled;
 pub const slidingViewFor = @import("kv/sliding.zig").slidingViewFor;
 // plugins/qwen4_exp/ple.zig
 pub const claimPleSpecCapture = @import("../../plugins/qwen4_exp/ple.zig").claimPleSpecCapture;

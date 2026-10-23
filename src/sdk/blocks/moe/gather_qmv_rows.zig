@@ -72,17 +72,11 @@ var gateup_rows_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var gateup_rows_cfg_key: GateUpRowsCfgKey = std.mem.zeroes(GateUpRowsCfgKey);
 var gqmv_gateup_rows_engaged: bool = false;
 
-var moe_rows_fused_env: ?bool = null;
 pub var moe_rows_fused_layers: u32 = 0;
 pub var moe_sorted_layers: u32 = 0;
 
 pub fn moeRowsFusedEnabled() bool {
-    if (transformer.moe_rows_fused_override) |v| return v;
-    if (moe_rows_fused_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_MOE_ROWS_FUSED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    moe_rows_fused_env = enabled;
-    return enabled;
+    return transformer.moe_rows_fused_override orelse true;
 }
 
 pub var moe_verify_rows_override: ?bool = null; // test seam

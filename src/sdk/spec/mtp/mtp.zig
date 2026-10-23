@@ -3055,7 +3055,6 @@ pub fn forward(
 /// three-axis table. Once decoding moves past that table, generated text uses
 /// the scalar `absolute + delta` fast-RoPE path.
 pub var mtp_kv_only_override: ?bool = null; // test seam
-var mtp_kv_only_env: ?bool = null;
 
 /// KV-only history rows ship ON (mlxfast-challenge lastHiddenWithKVOnlyHistory
 /// class): a committed-history row's layer OUTPUT has no consumer — only its
@@ -3063,12 +3062,7 @@ var mtp_kv_only_env: ?bool = null;
 /// whole post-attention half are dead work for every row but the last.
 /// MLX_SERVE_MTP_KV_ONLY=0 restores the full-forward history path.
 fn mtpKvOnlyEnabled() bool {
-    if (mtp_kv_only_override) |v| return v;
-    if (mtp_kv_only_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_MTP_KV_ONLY);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    mtp_kv_only_env = enabled;
-    return enabled;
+    return mtp_kv_only_override orelse true;
 }
 
 /// Append `hidden`/`id_arr` rows to the head's cache through the K/V-only

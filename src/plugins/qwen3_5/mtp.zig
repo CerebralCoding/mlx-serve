@@ -128,16 +128,7 @@ const Kv = struct {
     }
 };
 
-var kv_only_env: ?bool = null;
 
-/// `MLX_SERVE_MTP_KV_ONLY`: the merged history + draft forward flushes its leading rows K/V-only (the arm's switch).
-fn kvOnlyEnabled() bool {
-    if (kv_only_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_MTP_KV_ONLY);
-    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    kv_only_env = on;
-    return on;
-}
 
 fn rmsNorm(x: Array, w: Array, eps: f32, s: mlx.mlx_stream) !Array {
     var out = mlx.mlx_array_new();
@@ -306,7 +297,7 @@ fn forwardRows(h: *const Head, kv: Kv, ids: Array, hidden: Array, off: c_int, wa
     const c = h.c;
     const n: c_int = mlx.getShape(hidden)[1];
     const hs: c_int = @intCast(c.hidden_size);
-    if (want_logits and n > 1 and kvOnlyEnabled()) {
+    if (want_logits and n > 1) {
         const ids_head = try sliceRows(ids, 0, n - 1, s);
         defer _ = mlx.mlx_array_free(ids_head);
         const ids_last = try sliceRows(ids, n - 1, n, s);

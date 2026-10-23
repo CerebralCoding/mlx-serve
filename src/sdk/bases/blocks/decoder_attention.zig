@@ -163,7 +163,7 @@ pub fn DecoderAttention(comptime opts: Options) type {
             };
 
             const total_kv = offset + s;
-            const sv = sliding.view(window, geo.head_dim, false, total_kv, s);
+            const sv = sliding.view(window, geo.head_dim, total_kv, s);
             var view: abi.KvView = if (src) |l|
                 try kv.view(c, c.cache(), l)
             else blk: {

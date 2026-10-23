@@ -27,21 +27,7 @@ const scheduler_mod = @import("scheduler.zig");
 /// the per-slot Generator via `Generator.initWithOptions(.{ .ctx = slot.ctx,
 /// .skip_lazy_preforward = true_for_regular, ... })`, and store it on the
 /// slot. After return, the slot is ready for decode ticks.
-/// Kill switch for prefill-side interleaving (MLX_SERVE_PREFILL_INTERLEAVE=0
-/// restores whole-prefill-then-decode scheduling). Default ON: the hook
-/// no-ops when nothing is decoding, so an idle or single-stream server never
-/// pays for it.
-var prefill_interleave_cached: ?bool = null;
-pub fn prefillInterleaveEnabled() bool {
-    if (prefill_interleave_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_PREFILL_INTERLEAVE);
-    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    prefill_interleave_cached = on;
-    return on;
-}
-
 pub fn prefillDecodeShare() f32 {
-    if (!prefillInterleaveEnabled()) return 0;
     return scheduler_mod.prefill_decode_share;
 }
 

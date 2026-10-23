@@ -57,7 +57,6 @@ const sampleTokenLazy = @import("../sampling/lazy.zig").sampleTokenLazy;
 const shouldCheckpointSsmPrefill = @import("prefill_chunk.zig").shouldCheckpointSsmPrefill;
 const ssmCapturePos = @import("prefill_chunk.zig").ssmCapturePos;
 const ssmSnapshotBackoff = @import("prefill_chunk.zig").ssmSnapshotBackoff;
-const visionChunkedPrefillEnabled = @import("prefill_chunk.zig").visionChunkedPrefillEnabled;
 const intree = @import("../plugin/intree.zig");
 
 
@@ -235,7 +234,6 @@ pub fn initWithOptions(
     const want_ssm_cp = shouldCheckpointSsmPrefill(
         options.ssm_checkpoint_stride,
         ctx.ssm_entries != null and ctx.ssm_entries.?.len > 0,
-        has_vision,
     );
     // The snapshot backoff: a checkpoint AT the prompt end is
     // unreachable next turn.
@@ -342,9 +340,7 @@ pub fn initWithOptions(
     var final_start: usize = if (xfm.prefillsWholePrompt()) 0 else prompt_ids.len - 1;
     // Chunked vision prefill (issue #197): placeholder rows consumed by
     // completed chunks, fed to ctx.vision_splice_offset per forward
-    // (chunk loop AND final-span forward). Stays 0 on the kill-switch arm
-    // so that path is byte-identical to the old whole-prompt behavior.
-    const vision_chunked = has_vision and visionChunkedPrefillEnabled();
+    // (chunk loop AND final-span forward).
     var vision_rows_consumed: usize = options.vision_rows_before;
     var adapt_state: AdaptiveWidthState = .{
         .width_min = @intCast(PREFILL_CHUNK),
@@ -356,18 +352,13 @@ pub fn initWithOptions(
         const snapshot_backoff = ssmSnapshotBackoff(want_state_cp, prefix_len, ssm_cp_offset > 0);
         const loop_end = prefix_len - snapshot_backoff;
         final_start = loop_end;
-        // Vision prompts chunk like text (issue #197) — the splice offset
-        // below keeps the row scatter chunk-exact. Kill switch restores
-        // the whole-prompt forward.
-        const default_chunk = if (has_vision and !vision_chunked) loop_end else PREFILL_CHUNK;
         // Per-chunk adaptive width: the first chunk runs the admitted width; every boundary
         // after it re-asks the same estimator. `cap_adapt` is the widest this arch forwards
         // for this prompt, never wider than `ssm_cp_stride`.
-        const adapt_chunked = !(has_vision and !vision_chunked);
         // The scaled tail-merge bound reads the arch predicate, never `chunk_width_hook != null`
         // (installed process-wide).
-        const width_is_adaptive = adapt_chunked and options.adaptive_chunk_width;
-        const cap_adapt: u32 = if (!adapt_chunked) 0 else @intCast(effectivePrefillChunk(
+        const width_is_adaptive = options.adaptive_chunk_width;
+        const cap_adapt: u32 = @intCast(effectivePrefillChunk(
             xfm.config.prefillScoreHeadDim(),
             xfm.config.num_attention_heads,
             total_ctx_for_chunk,
@@ -376,9 +367,9 @@ pub fn initWithOptions(
             xfm.config.longCtxGated(),
             0,
         ));
-        adapt_state.width_min = @intCast(default_chunk);
-        adapt_state.width_max = @intCast(default_chunk);
-        var cur_chunk: usize = default_chunk;
+        adapt_state.width_min = @intCast(PREFILL_CHUNK);
+        adapt_state.width_max = @intCast(PREFILL_CHUNK);
+        var cur_chunk: usize = PREFILL_CHUNK;
         // Last-window MTP history: chunks entirely before the window skip
         // the full-hidden capture AND the head forward (see
         // mtp.SUGGESTED_HISTORY_WINDOW). 0 = capture every chunk.
@@ -396,7 +387,7 @@ pub fn initWithOptions(
             &xfm.config,
             total_ctx_for_chunk,
             max_tokens,
-            default_chunk,
+            PREFILL_CHUNK,
         );
         ctx.cache.reserve(@intCast(reserved_tokens));
         // The arch's own per-request buffers reserve at the same length.
@@ -631,7 +622,7 @@ pub fn initWithOptions(
                 }
             }
 
-            if (vision_chunked) {
+            if (has_vision) {
                 vision_rows_consumed += countSpliceRows(
                     ids_i32[pos..end],
                     xfm.config.image_token_id,
@@ -654,7 +645,7 @@ pub fn initWithOptions(
             var pending_widen: u32 = 0;
             var widen_confirm: ?*const fn (*anyopaque, usize, u32) bool = null;
             var widen_ctx: ?*anyopaque = null;
-            if (adapt_chunked and pos < loop_end) {
+            if (pos < loop_end) {
                 if (options.chunk_width_hook) |hk| {
                     const next_w = hk.call(hk.ctx, ssm_cp_offset + pos, @intCast(cur_chunk), cap_adapt, &adapt_state);
                     if (next_w != 0 and next_w != cur_chunk) {
@@ -768,7 +759,7 @@ pub fn initWithOptions(
     // silent-no-op class; tests grep for it per arm.
     if (has_vision) {
         ctx.vision_splice_offset = vision_rows_consumed;
-        if (vision_chunked and n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
+        if (has_vision and n_chunks > 1) log.debug("[vision] chunked prefill: {d} chunks, {d} placeholder rows consumed\n", .{ n_chunks, vision_rows_consumed });
     }
 
     // Process the final span — the last token, plus (under SSM

@@ -106,14 +106,8 @@ fn getQkvDecKernel() !mlx.mlx_fast_metal_kernel {
 }
 
 pub var qkv_dec_override: ?bool = null; // test seam
-var qkv_dec_env: ?bool = null;
 fn qkvDecKernelEnabled() bool {
-    if (qkv_dec_override) |v| return v;
-    if (qkv_dec_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_KV_ATTN_KERNEL);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    qkv_dec_env = enabled;
-    return enabled;
+    return qkv_dec_override orelse true;
 }
 
 const QkvDecCfgKey = struct {
@@ -759,14 +753,6 @@ pub fn qkvAttnMppKernel(s: mlx.mlx_stream, q_in: mlx.mlx_array, view: *const Den
 
 // ── Fused quant-attention gate (docs/kv-quant-perf.md Phase 1) ──
 
-var kv_attn_fused_env: ?bool = null;
-fn kvAttnFusedEnvEnabled() bool {
-    if (kv_attn_fused_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_KV_ATTN_FUSED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    kv_attn_fused_env = enabled;
-    return enabled;
-}
 
 /// Per-LAYER kv-length floor: below this the packed read cannot pay for the
 /// kernel's split-KV merge ops (~11 dispatches/layer) — Laguna's 512-window
@@ -803,7 +789,7 @@ fn kvAttnFusedMinTk() c_int {
 /// the dense view now, like prefill always has. A forced per-request
 /// `kv_attn_mode:"fused"` gets the dense read at those widths too.
 pub fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {
-    if (!(view.has_quant_triple and t_q == 1 and kvAttnFusedEnvEnabled())) return false;
+    if (!(view.has_quant_triple and t_q == 1)) return false;
     const ks = mlx.getShape(view.k_triple_q);
     if (ks.len < 4) return false;
     return ks[2] >= kvAttnFusedMinTk();
@@ -815,7 +801,7 @@ pub fn kvAttnFusedEligible(view: *const DenseKVView, t_q: c_int) bool {
 /// G17 defaults dense; MLX_SERVE_KV_ATTN_VERIFY=1 forces the kernel and =0
 /// kills the whole width class on every machine.
 pub fn kvAttnVerifyEligible(view: *const DenseKVView, t_q: c_int) bool {
-    if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_VERIFY_MAX_TQ and kvAttnFusedEnvEnabled() and qkvVerifyEnvAllows())) return false;
+    if (!(view.has_quant_triple and t_q >= 2 and t_q <= QKV_VERIFY_MAX_TQ and qkvVerifyEnvAllows())) return false;
     const ks = mlx.getShape(view.k_triple_q);
     if (ks.len < 4) return false;
     return ks[2] >= kvAttnFusedMinTk();

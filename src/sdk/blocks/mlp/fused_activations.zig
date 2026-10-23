@@ -90,15 +90,9 @@ pub fn swigluSigTable(s: mlx.mlx_stream, dt: mlx.mlx_dtype, allocator: std.mem.A
 
 var swiglu_engaged: bool = false;
 pub var swiglu_fused_override: ?bool = null;
-var swiglu_fused_env: ?bool = null;
 
 pub fn swigluFusedEnabled() bool {
-    if (swiglu_fused_override) |v| return v;
-    if (swiglu_fused_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_SWIGLU_FUSED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    swiglu_fused_env = enabled;
-    return enabled;
+    return swiglu_fused_override orelse true;
 }
 
 /// `table[gate] * up`: an activation that is unary in x, tabulated over every

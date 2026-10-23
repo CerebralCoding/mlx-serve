@@ -20,7 +20,6 @@ const holdsSleepWhileParked = @import("cache/budget.zig").holdsSleepWhileParked;
 const runDecodeTick = @import("decode.zig").runDecodeTick;
 const finishSlot = @import("finish.zig").finishSlot;
 const runPrefill = @import("prefill.zig").runPrefill;
-const prefillInterleaveEnabled = @import("prefill_interleave.zig").prefillInterleaveEnabled;
 const prefillDecodeShare = @import("prefill_interleave.zig").prefillDecodeShare;
 const specYieldTick = @import("prefill_interleave.zig").specYieldTick;
 const orderByTail = @import("prefill_interleave.zig").orderByTail;
@@ -233,7 +232,7 @@ pub fn chatPass(sch: *Scheduler, mode: ChatPassMode) ChatPassResult {
             // no chunk-boundary yield, so without this every slot's first
             // token waits for the LAST slot's prefill (the TTFT
             // staircase collapse).
-            if (pi > 0 and prefillInterleaveEnabled()) _ = interleaveDecodeTick(sch);
+            if (pi > 0) _ = interleaveDecodeTick(sch);
             switch (prefillAdmitted(sch, slot)) {
                 .held => {
                     // Back to the head of `pending`, in order; the decode tick below runs first.

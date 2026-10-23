@@ -376,36 +376,10 @@ pub fn reservedPrefillTokens(
     return @max(prompt, transformer_mod.KVCache.reservedTokens(seq, max_tokens, chunk, config.max_position_embeddings));
 }
 
-/// SSM checkpoints exist to feed prefix-cache reuse, and image-bearing
-/// prompts are excluded from prefix reuse (equal placeholder IDs do not imply
-/// equal images) — so vision prefills skip checkpointing even now that they
-/// chunk (the splice scatter itself is chunk-safe via vision_splice_offset).
-/// A vision prompt checkpoints like text once it chunks like text (#197):
+/// A prompt checkpoints SSM state at its chunk boundaries, a vision prompt included (it chunks like text, #197):
 /// without a checkpoint a hybrid's image turn is a guaranteed hot-cache miss.
-pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool, has_vision: bool) bool {
-    return stride > 0 and has_ssm and (!has_vision or visionChunkedPrefillEnabled());
-}
-
-/// Chunked vision prefill (issue #197). Default ON: the splice resumes its
-/// row index across chunk boundaries via `ForwardCtx.vision_splice_offset`,
-/// so an image-bearing prompt prefills under the same chunk-bounded memory
-/// envelope as text. MLX_SERVE_VISION_CHUNKED=0 restores the whole-prompt
-/// single forward (and the memory guard's full-width bill with it).
-var vision_chunked_cached: ?bool = null;
-pub fn visionChunkedPrefillEnabled() bool {
-    if (vision_chunked_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_VISION_CHUNKED);
-    const on = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    vision_chunked_cached = on;
-    return on;
-}
-
-/// What the memory guard should bill a prefill at: full width only for a
-/// vision prompt with chunking killed. The guard and this loop must agree or
-/// admission either over-refuses (bills seq for a chunked prefill) or
-/// under-bills (uncatchable Metal OOM).
-pub fn visionPrefillUnchunked(has_vision: bool) bool {
-    return has_vision and !visionChunkedPrefillEnabled();
+pub fn shouldCheckpointSsmPrefill(stride: u32, has_ssm: bool) bool {
+    return stride > 0 and has_ssm;
 }
 
 /// Placeholder tokens (vision + audio soft tokens) in `ids` — the number of
@@ -1010,29 +984,14 @@ test "effectiveSsmCheckpointStride: checkpointing never sub-divides the prefill 
     try testing.expectEqual(@as(usize, 2), prefillChunkCount(8238, 4096, true, effectiveSsmCheckpointStride(256, PREFILL_CHUNK), 0, false, false));
 }
 
-test "vision prefill checkpoints SSM state only when it chunks like text" {
+test "a vision prefill checkpoints SSM state like text" {
     const prefix_len: usize = 1587;
     const checkpoint_stride: u32 = 256;
-
-    // Chunked vision (the default) checkpoints like text — a hybrid's image
-    // turn is otherwise a guaranteed hot-cache miss (no checkpoint <= match).
-    vision_chunked_cached = true;
-    defer vision_chunked_cached = null;
-    try testing.expect(shouldCheckpointSsmPrefill(checkpoint_stride, true, true));
-    // The whole-prompt kill-switch arm has no chunk boundaries to snapshot at.
-    vision_chunked_cached = false;
-    const vision_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, true);
-    try testing.expect(!vision_checkpoints);
-    try testing.expectEqual(
-        prefix_len,
-        nextChunkEnd(0, prefix_len, prefix_len, vision_checkpoints, @intCast(checkpoint_stride), 0, false, false),
-    );
-
-    const text_checkpoints = shouldCheckpointSsmPrefill(checkpoint_stride, true, false);
-    try testing.expect(text_checkpoints);
+    try testing.expect(shouldCheckpointSsmPrefill(checkpoint_stride, true));
+    try testing.expect(!shouldCheckpointSsmPrefill(0, true));
     try testing.expectEqual(
         @as(usize, checkpoint_stride),
-        nextChunkEnd(0, prefix_len, prefix_len, text_checkpoints, @intCast(checkpoint_stride), 0, false, false),
+        nextChunkEnd(0, prefix_len, prefix_len, true, @intCast(checkpoint_stride), 0, false, false),
     );
 }
 

@@ -130,7 +130,7 @@ pub fn LagunaAttention(comptime opts: Options) type {
             const s = c.rows;
             const window = w.window;
             const total: c_int = @as(c_int, @intCast(c.offset())) + s;
-            const sv = sliding.view(window, geo.head_dim, w.ring > 0, total, s);
+            const sv = sliding.view(window, geo.head_dim, total, s);
             var view = try append(w, c, c.cache(), k, v, if (window > 0) sv.span else 0);
             defer kv.release(c, &view);
             const dv = kv.dense(view);
@@ -171,7 +171,7 @@ pub fn LagunaAttention(comptime opts: Options) type {
             for (c.caches, 0..) |h, i| {
                 const at: c_int = @intCast(i);
                 const offset: c_int = @intCast(o.len(h, c.layer));
-                const sv = sliding.view(w.window, geo.head_dim, w.ring > 0, offset + s, s);
+                const sv = sliding.view(w.window, geo.head_dim, offset + s, s);
                 var view = try append(w, c, h, try g.sliceAxis(k, 0, at, at + 1), try g.sliceAxis(v, 0, at, at + 1), if (w.window > 0) sv.span else 0);
                 defer kv.release(c, &view);
                 outs[i] = try core(w, c, try g.sliceAxis(q, 0, at, at + 1), kv.dense(view), offset, sv.kv_len);

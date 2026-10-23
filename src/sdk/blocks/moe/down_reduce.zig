@@ -98,15 +98,9 @@ var downred_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
 var downred_cfg_key: DownRedCfgKey = std.mem.zeroes(DownRedCfgKey);
 pub var downred_engaged: bool = false;
 
-var downred_env: ?bool = null;
 
 fn downReduceFusedEnabled() bool {
-    if (transformer.downred_override) |v| return v;
-    if (downred_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_MOE_DOWN_REDUCE_FUSED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    downred_env = enabled;
-    return enabled;
+    return transformer.downred_override orelse true;
 }
 
 /// Fused down-projection + router weighting + K-reduction at decode width.

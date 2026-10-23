@@ -55,7 +55,7 @@ pub const SinkAttention = struct {
         const v = try g.transpose(try g.reshape(try w.v.forward(g, x), &kv_shape), &perm);
 
         const total = offset + s;
-        const sv = sliding.view(w.window, geo.head_dim, false, total, s);
+        const sv = sliding.view(w.window, geo.head_dim, total, s);
         var view = try kv.append(c, k, v, if (w.window > 0) sv.span else 0);
         defer kv.release(c, &view);
         const dv = kv.dense(view);

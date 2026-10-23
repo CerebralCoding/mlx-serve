@@ -36,15 +36,9 @@ pub const QkAngleSlot = struct {
 var qk_fused_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var qk_fused_engaged: bool = false;
 pub var qk_fused_override: ?bool = null;
-var qk_fused_env: ?bool = null;
 
 pub fn qkNormRopeFusedEnabled() bool {
-    if (qk_fused_override) |v| return v;
-    if (qk_fused_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_QK_NORM_ROPE_FUSED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    qk_fused_env = enabled;
-    return enabled;
+    return qk_fused_override orelse true;
 }
 
 // The RMS half mirrors `rms_single_row` at axis 128 / N_READS 4 / one

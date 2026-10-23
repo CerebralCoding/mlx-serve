@@ -60,29 +60,17 @@ const GDN_PREWORK_SOURCE = kernelSource("kernels/gdn/gdn_prework.metal");
 var gdn_prework_kernel: ?mlx.mlx_fast_metal_kernel = null;
 var gdn_prework_engaged: bool = false;
 pub var gdn_prework_override: ?bool = null; // test seam
-var gdn_prework_env: ?bool = null;
 
 fn gdnPreworkEnabled() bool {
-    if (gdn_prework_override) |v| return v;
-    if (gdn_prework_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_GDN_PREWORK);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gdn_prework_env = enabled;
-    return enabled;
+    return gdn_prework_override orelse true;
 }
 
 pub var gdn_decode_fused_override: ?bool = null; // test seam
-var gdn_decode_fused_env: ?bool = null;
 
 /// The decode-width GDN fusions (prework at S < 3, in-kernel gate/beta, the
 /// norm-gate epilogue). Off = the pre-fusion decode path, op for op.
 pub fn gdnDecodeFusedEnabled() bool {
-    if (gdn_decode_fused_override) |v| return v;
-    if (gdn_decode_fused_env) |v| return v;
-    const raw = env.get(.MLX_SERVE_GDN_DECODE_FUSED);
-    const enabled = raw == null or !std.mem.eql(u8, std.mem.sliceTo(raw.?, 0), "0");
-    gdn_decode_fused_env = enabled;
-    return enabled;
+    return gdn_decode_fused_override orelse true;
 }
 
 var gdn_decode_recur_env: ?bool = null;
