@@ -19,16 +19,16 @@ const config = @import("config.zig");
 
 const testing = std.testing;
 
-const H: c_int = 256;
+pub const H: c_int = 256;
 const HEADS: c_int = 8;
 const KV_GLOBAL: c_int = 1;
 const KV_SWA: c_int = 2;
 const HD: c_int = 192;
 const VD: c_int = 128;
 const INTER: c_int = 512;
-const VOCAB: c_int = 256;
-const EXPERTS: c_int = 8;
-const MOE_INTER: c_int = 128;
+pub const VOCAB: c_int = 256;
+pub const EXPERTS: c_int = 8;
+pub const MOE_INTER: c_int = 128;
 const LAYERS = 4;
 /// 0 = global, 1 = sliding.
 const pattern = [LAYERS]u8{ 0, 1, 1, 0 };
@@ -117,23 +117,23 @@ fn case(comptime quantized: bool, comptime seed: u64) !void {
 }
 
 /// One slot of the table: its KV cache and position.
-const Side = struct {
+pub const Side = struct {
     kv: KVCache,
     off: usize = 0,
     slot: cache_ops.Slot = undefined,
 
-    fn init(s: *Side) !void {
+    pub fn init(s: *Side) !void {
         s.* = .{ .kv = try KVCache.init(testing.allocator, LAYERS) };
         s.slot = .{ .kv = &s.kv };
     }
 
-    fn deinit(s: *Side) void {
+    pub fn deinit(s: *Side) void {
         s.kv.deinit();
     }
 };
 
 /// The table's logits for one forward, owned by `g`.
-fn tableLogits(g: *ops.Graph, m: *anyopaque, f: abi.Forward) !mlx.mlx_array {
+pub fn tableLogits(g: *ops.Graph, m: *anyopaque, f: abi.Forward) !mlx.mlx_array {
     var out: abi.ForwardOut = .{};
     var fw = f;
     fw.logits = .all_rows;
