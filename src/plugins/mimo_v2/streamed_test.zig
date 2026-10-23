@@ -184,3 +184,137 @@ test "mimo_v2 streamed: the resident's experts through the Routed hook from an e
     try parity(8);
     try parity(32);
 }
+
+/// One expert projection of `bank` (model layer 0) dequantized to f32 `[out, in]`, owned by `g`.
+fn dequant(g: *ops.Graph, bank: *const Bank, e: u32, proj: usize) !mlx.mlx_array {
+    var parts: [2]mlx.mlx_array = undefined;
+    for (&parts, 0..) |*o, ci| {
+        const seg = bank.geo.segments[proj * 2 + ci];
+        const shape = [_]c_int{ @intCast(seg.shape[0]), @intCast(seg.shape[1]) };
+        o.* = try g.adopt(mlx.mlx_array_new_data(bank.bytes[bank.geo.recordOffset(0, e) + seg.offset ..].ptr, &shape, 2, if (seg.dtype == .U32) .uint32 else .uint8));
+    }
+    return g.call(mlx.mlx_dequantize, .{ parts[0], parts[1], mlx.mlx_array{}, mlx.mlx_optional_int.some(32), mlx.mlx_optional_int.some(4), "mxfp4", mlx.mlx_array{}, mlx.mlx_optional_dtype{ .value = .float32, .has_value = true } });
+}
+
+/// Rel RMS error of `got` against `truth`.
+fn relRms(got: []const f32, truth: []const f64) f64 {
+    var se: f64 = 0;
+    var st: f64 = 0;
+    for (got, truth) |v, t| {
+        se += (v - t) * (v - t);
+        st += t * t;
+    }
+    return @sqrt(se / st);
+}
+
+test "mimo_v2 streamed experts at the release's 4096 / 2048: the hook's decode MoE (the resident's kernels) and the stream module's, each against fp32 truth" {
+    if (!build_options.mlx_stream or mlx.noGpuBackend()) return error.SkipZigTest;
+    var arena = std.heap.ArenaAllocator.init(testing.allocator);
+    defer arena.deinit();
+    const a = arena.allocator();
+    const io = testing.io;
+    const H = 4096;
+    const I = 2048;
+    const E = 8;
+    const K = 8;
+    const geo = try Bank.Geometry.init(H, I, E, 0, 1);
+    const bank: Bank = .{ .geo = geo, .bytes = try a.alloc(u8, geo.total_bytes) };
+    var rnd = std.Random.DefaultPrng.init(0x4096);
+    for (0..E) |e| for (geo.segments) |seg| {
+        const at = bank.bytes[geo.recordOffset(0, @intCast(e)) + seg.offset ..][0..seg.length];
+        for (at) |*b| b.* = if (seg.dtype == .U32) rnd.random().int(u8) else @as(u8, 119) + rnd.random().int(u1);
+    };
+    var tmp = testing.tmpDir(.{});
+    defer tmp.cleanup();
+    try stream.dsv41_streamed.writeBank(a, io, tmp.dir, geo, bank.bytes, "synthetic/mimo-release", "0000000000000000000000000000000000000000");
+    var buf: [512]u8 = undefined;
+    const s = fixture.stream();
+    var sw = try streamed.Streamed.open(testing.allocator, io, buf[0..try tmp.dir.realPath(io, &buf)], s, .{});
+    defer sw.close();
+    const src = sw.src.mxfp4;
+    const qp: @import("../../sdk/quant/params.zig").QuantParams = .{ .bits = 4, .group_size = 32, .mode = .mxfp4 };
+    const w: moe.Moe.Weights = .{
+        .router = .{},
+        .route = .softmax,
+        .gate = .{ .w = .{}, .qp = qp },
+        .up = .{ .w = .{}, .qp = qp },
+        .down = .{ .w = .{}, .qp = qp },
+        .top_k = K,
+        .experts = E,
+        .streamed = .{ .routed = sw.routedSource(), .layer = 0 },
+    };
+
+    // One token and two (the fp4 decode kernels), four (the hook's sorted gathers; the stream's union texts).
+    for ([_]usize{ 1, 2, 4 }) |n| {
+        var g = ops.Graph.init(testing.allocator, s);
+        defer g.deinit();
+        const xs = try a.alloc(f32, n * H);
+        for (xs) |*v| v.* = 0.05 * rnd.random().floatNorm(f32);
+        const ids = try a.alloc(u32, n * K);
+        const ids16 = try a.alloc(u16, n * K);
+        const wts = try a.alloc(f32, n * K);
+        for (0..n) |t| {
+            var perm: [E]u32 = .{ 0, 1, 2, 3, 4, 5, 6, 7 };
+            rnd.random().shuffle(u32, &perm);
+            var sum: f32 = 0;
+            for (0..K) |k| {
+                ids[t * K + k] = perm[k];
+                ids16[t * K + k] = @intCast(perm[k]);
+                wts[t * K + k] = 0.1 + rnd.random().float(f32);
+                sum += wts[t * K + k];
+            }
+            for (wts[t * K ..][0..K]) |*v| v.* /= sum;
+        }
+        const nc: c_int = @intCast(n);
+        const x = try g.astype(try g.fromSlice(f32, xs, &.{ nc, H }), .bfloat16);
+        const wf = try g.fromSlice(f32, wts, &.{ nc, K });
+
+        // The hook: the resident's arm on the slot banks (its routing weights in the activation dtype).
+        const hook_y = try g.astype(try moe.routedSum(&w, &g, try g.reshape(x, &.{ 1, nc, H }), try g.fromSlice(u32, ids, &.{ 1, nc, K }), try g.astype(try g.reshape(wf, &.{ 1, nc, K }), .bfloat16)), .float32);
+        try mlx.check(mlx.mlx_array_eval(hook_y));
+        try src.settle();
+        const hooked = try a.dupe(f32, (mlx.mlx_array_data_float32(hook_y) orelse return error.NoData)[0 .. n * H]);
+
+        // The stream module's served decode MoE on the same slots.
+        const sy = try stream.dupes.mimo_v2.decodeSum(src, 0, x, ids16, wf);
+        const sf = try g.astype(sy, .float32);
+        try mlx.check(mlx.mlx_array_eval(sf));
+        const streamed_y = try a.dupe(f32, (mlx.mlx_array_data_float32(sf) orelse return error.NoData)[0 .. n * H]);
+        src.g.reset();
+        try src.settle();
+
+        // fp32 truth: each expert dequantized, silu(gate x) * up x, down, weighted in f64 on the host.
+        const truth = try a.alloc(f64, n * H);
+        @memset(truth, 0);
+        const xf = try g.astype(x, .float32);
+        for (0..E) |e| {
+            var eg = ops.Graph.init(testing.allocator, s);
+            defer eg.deinit();
+            const tr = struct {
+                fn f(gg: *ops.Graph, m: mlx.mlx_array) !mlx.mlx_array {
+                    return gg.call(mlx.mlx_transpose, .{m});
+                }
+            }.f;
+            const gt = try eg.matmul(xf, try tr(&eg, try dequant(&eg, &bank, @intCast(e), 0)));
+            const up = try eg.matmul(xf, try tr(&eg, try dequant(&eg, &bank, @intCast(e), 1)));
+            const act = try eg.mul(try eg.mul(gt, try eg.sigmoid(gt)), up);
+            const dn = try eg.matmul(act, try tr(&eg, try dequant(&eg, &bank, @intCast(e), 2)));
+            try mlx.check(mlx.mlx_array_eval(dn));
+            const d = (mlx.mlx_array_data_float32(dn) orelse return error.NoData)[0 .. n * H];
+            for (0..n) |t| for (0..K) |k| if (ids[t * K + k] == e) {
+                for (0..H) |j| truth[t * H + j] += @as(f64, wts[t * K + k]) * d[t * H + j];
+            };
+        }
+        var max_diff: f32 = 0;
+        var differ: usize = 0;
+        for (hooked, streamed_y) |h, v| {
+            max_diff = @max(max_diff, @abs(h - v));
+            differ += @intFromBool(h != v);
+        }
+        const e_hook = relRms(hooked, truth);
+        const e_stream = relRms(streamed_y, truth);
+        std.debug.print("mimo_v2 experts at 4096/2048, {d} token(s): rel rms vs fp32 truth, hook {e:.3}, stream {e:.3}; hook vs stream {d}/{d} differ, max {e:.3}\n", .{ n, e_hook, e_stream, differ, hooked.len, max_diff });
+        // Both are bf16-output paths of one function: each within bf16's class of the truth.
+        try testing.expect(e_hook < 1e-2 and e_stream < 1e-2);
+    }
+}

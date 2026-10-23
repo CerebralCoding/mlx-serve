@@ -226,7 +226,25 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     const shared_down: ?Array = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x) else null;
     // The group-limited chain hands its weights back in f32; they land in the activation dtype.
     if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
+    const y = try routedExperts(w, g, x, r, shared_down);
+    if (y.shared_fused) return parent.keep(y.sum);
+    const se = w.shared orelse return parent.keep(y.sum);
+    if (!se.gated()) return parent.keep(try g.add(y.sum, try sharedDown(w, g, &se, x)));
+    const down = shared_down orelse try sharedDown(w, g, &se, x);
+    const logit = r.gate_logit orelse try se.gate_logit.forward(g, x);
+    return parent.keep(try g.add(y.sum, try g.mul(try g.sigmoid(logit), down)));
+}
 
+/// The routed experts' weighted sum `[B, S, D]` for routes `inds` and their weights `scores` (in `x`'s dtype), no
+/// shared expert: `mlp`'s arms, as the Routed hook's contract reads them.
+pub fn routedSum(w: *const Moe.Weights, parent: *Graph, x: Array, inds: Array, scores: Array) !Array {
+    var t = parent.scope();
+    defer t.deinit();
+    return parent.keep((try routedExperts(w, &t, x, .{ .inds = inds, .scores = scores }, null)).sum);
+}
+
+/// The routed experts' sum; `shared_fused` when the kernel added the shared expert (`shared_down`) itself.
+fn routedExperts(w: *const Moe.Weights, g: *Graph, x: Array, r: Routed, shared_down: ?Array) !struct { sum: Array, shared_fused: bool } {
     const xs = ops.shape(x);
     const B = xs[0];
     const S = xs[1];
@@ -289,13 +307,7 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
         out = try g.call(mlx.mlx_squeeze, .{try expertMm(g, act, &w.down, .{ .ctx = null }, r.inds, false)});
     }
 
-    const sum = if (reduced) out else try g.sum(try g.mul(out, try g.expandDims(r.scores, -1)), -2, false);
-    if (shared_fused) return parent.keep(sum);
-    const se = w.shared orelse return parent.keep(sum);
-    if (!se.gated()) return parent.keep(try g.add(sum, try sharedDown(w, g, &se, x)));
-    const down = shared_down orelse try sharedDown(w, g, &se, x);
-    const logit = r.gate_logit orelse try se.gate_logit.forward(g, x);
-    return parent.keep(try g.add(sum, try g.mul(try g.sigmoid(logit), down)));
+    return .{ .sum = if (reduced) out else try g.sum(try g.mul(out, try g.expandDims(r.scores, -1)), -2, false), .shared_fused = shared_fused };
 }
 
 /// The format's routed SwiGLU over the top-k, weighted and summed (the engine's exl3 arm).
