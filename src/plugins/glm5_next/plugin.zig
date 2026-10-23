@@ -97,6 +97,7 @@ fn batched(m: *host.Model, ops: *const abi.CacheOps, f: *const abi.Forward, out:
         defer _ = mlx.mlx_array_free(ids);
         const st: fwd.Step = .{
             .slots = .{ .ops = ops, .caches = f.caches.slice()[start..end], .positions = f.positions.slice()[start..end] },
+            .moe = m.moe.layers,
             .batched = true,
         };
         const hidden = try fwd.hidden(&m.xfm, &st, ids);

@@ -114,6 +114,10 @@ pub const Moe = struct {
         format_banks: ?FormatBanks = null,
         /// Set: the experts are a streamed bank's (`gate`/`up`/`down` give its quant params only).
         streamed: ?Streamed = null,
+        /// ModelOpt NVFP4: each expert's up x down global scale `[E]`, multiplied into its routing weight.
+        route_scale: Array = .{ .ctx = null },
+        /// A model's own kernel for the routed and shared experts together; tried before the block's arms.
+        fused: ?Fused = null,
     };
 
     pub fn forward(w: *const Weights, c: *Ctx, x: Array) !Array {
@@ -123,6 +127,14 @@ pub const Moe = struct {
 
 /// Routed experts streamed from an SSD bank (`sdk/weights/streamed.zig`): model layer `layer`'s through `routed`.
 pub const Streamed = struct { routed: routed.Routed, layer: u32 };
+
+/// A model's one-kernel MoE at up to `rows` rows (GLM's `moeDecode`): the routed sum plus the shared expert in `x`'s
+/// shape, or null to take the block's arms. `limit` is the model's SwiGLU limit as its kernel reads it.
+pub const Fused = struct {
+    rows: c_int,
+    limit: f32 = 0,
+    run: *const fn (f: *const Fused, w: *const Moe.Weights, s: ops.Stream, x: Array, inds: Array, scores: Array) anyerror!?Array,
+};
 
 // ── routing ──
 
@@ -225,6 +237,11 @@ pub fn mlp(w: *const Moe.Weights, parent: *Graph, x: Array) !Array {
     const shared_down: ?Array = if (r.gate_logit != null) try sharedDown(w, g, &w.shared.?, x) else null;
     // The group-limited chain hands its weights back in f32; they land in the activation dtype.
     if (ops.dtype(r.scores) != ops.dtype(x)) r.scores = try g.astype(r.scores, ops.dtype(x));
+    if (w.route_scale.ctx != null) r.scores = try g.mul(r.scores, try g.call(mlx.mlx_take, .{ w.route_scale, r.inds }));
+    if (w.fused) |*f| {
+        const xs = ops.shape(x);
+        if (xs[0] * xs[1] <= f.rows) if (try f.run(f, w, g.s, x, r.inds, r.scores)) |y| return parent.keep(try g.adopt(y));
+    }
     const y = try routedExperts(w, g, x, r, shared_down);
     if (y.shared_fused) return parent.keep(y.sum);
     const se = w.shared orelse return parent.keep(y.sum);

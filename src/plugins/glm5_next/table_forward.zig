@@ -17,6 +17,8 @@ const LinearAttnWeights = @import("../../sdk/blocks/gdn/gated_delta_net.zig").Li
 const axisView = @import("../../mlx/array.zig").axisView;
 const concatAxis1 = @import("../../mlx/array.zig").concatAxis1;
 const DsaWeights = @import("weights.zig").DsaWeights;
+const glm_moe = @import("moe.zig");
+const MoeWeights = @import("../../sdk/bases/blocks/moe.zig").Moe.Weights;
 
 const Array = mlx.mlx_array;
 const Slots = slots_mod.Slots;
@@ -27,6 +29,8 @@ pub const MOE_DECODE_BATCH_MAX = legacy.MOE_DECODE_BATCH_MAX;
 /// One forward's inputs beyond the token ids.
 pub const Step = struct {
     slots: Slots,
+    /// Every layer's MoE as the shared block reads it (`moe.Table`).
+    moe: []const ?MoeWeights,
     /// A batched tick: `ids` holds one next token per slot as rows of one window.
     batched: bool = false,
     /// Per-row KDA state capture (a speculative verify).
@@ -140,21 +144,21 @@ fn sublayer(xfm: *Transformer, st: *const Step, stream: *Array, deferred: *?glm5
 }
 
 fn branch(xfm: *Transformer, st: *const Step, normed: Array, lw: *const MoeLayerWeights, attn: bool, li: usize, batch: c_int, seq_len: c_int, is_prefill: bool) !Array {
-    if (st.batched) return branchSlots(xfm, st.slots, normed, lw, attn, li);
+    if (st.batched) return branchSlots(xfm, st.slots, st.moe, normed, lw, attn, li);
     return if (attn) switch (lw.attn) {
         .linear => |*la| try slots_mod.kda(xfm, st.slots, 0, normed, la, li, batch, seq_len, is_prefill),
         .full => |*fa| try dsaAttn(xfm, st.slots, 0, normed, &fa.dsa.?, @intCast(li), batch, seq_len),
     } else switch (lw.mlp) {
-        .moe => |*mw| try xfm.moeMLP(normed, mw),
+        .moe => try glm_moe.forward(&st.moe[li].?, xfm.s, normed),
         .dense => |*dw| try xfm.denseMLP(normed, dw),
     };
 }
 
 /// One batched tick's branch: `normed` `[1, N, H]` holds N slots' next-token rows. The MLP and the projections read
 /// their weights once for all N rows; a slot's own state (its KDA recurrence, its DSA cache) is advanced by its call.
-fn branchSlots(xfm: *Transformer, sl: Slots, normed: Array, lw: *const MoeLayerWeights, attn: bool, li: usize) !Array {
+fn branchSlots(xfm: *Transformer, sl: Slots, moe_ws: []const ?MoeWeights, normed: Array, lw: *const MoeLayerWeights, attn: bool, li: usize) !Array {
     if (!attn) return switch (lw.mlp) {
-        .moe => |*mw| try xfm.moeMLP(normed, mw),
+        .moe => try glm_moe.forward(&moe_ws[li].?, xfm.s, normed),
         .dense => |*dw| try xfm.denseMLP(normed, dw),
     };
     switch (lw.attn) {

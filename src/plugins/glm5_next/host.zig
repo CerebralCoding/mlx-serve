@@ -14,6 +14,7 @@ const Layout = @import("../../sdk/quant/native.zig").Layout;
 const config = @import("config.zig");
 const glm_mtp = @import("mtp.zig");
 const toModelConfig = @import("model_config.zig").toModelConfig;
+const glm_moe = @import("moe.zig");
 
 const gpa = std.heap.c_allocator;
 
@@ -21,8 +22,12 @@ pub const Model = struct {
     weights: model.Weights,
     xfm: Transformer,
     caps: abi.Caps,
+    /// Every layer's MoE as the shared block reads it, borrowed from `xfm`.
+    moe: glm_moe.Table = .{ .layers = &.{} },
     /// The MTP head (GLM's `mtp.0`), once `HeadHooks.load` found one.
     head: ?*glm_mtp.Head = null,
+    /// The head's MoE as the shared block reads it.
+    head_moe: ?glm_moe.MoeWeights = null,
 };
 
 /// The map the driver already loaded, adopted; else the pack read from disk.
@@ -47,6 +52,7 @@ fn build(ctx: *const abi.LoadCtx) !*Model {
         if (m.xfm.moe_layers != null) m.xfm.compileMoeRouting();
         if (cfg.linear_num_key_heads > 0) m.xfm.compileGdnGate();
     }
+    m.moe = try glm_moe.build(gpa, &m.xfm);
     m.caps = ctx.parsed.caps;
     return m;
 }
@@ -66,10 +72,12 @@ pub fn load(comptime name: []const u8, ctx: *const abi.LoadCtx, out: *abi.Verdic
 
 pub fn unload(mp: *anyopaque) callconv(.c) void {
     const m: *Model = @ptrCast(@alignCast(mp));
+    if (m.head_moe) |*w| glm_moe.free(w);
     if (m.head) |h| {
         h.deinit();
         gpa.destroy(h);
     }
+    m.moe.deinit(gpa);
     m.xfm.deinit();
     m.weights.deinit();
     gpa.destroy(m);
@@ -184,6 +192,7 @@ fn one(comptime fwd: type, m: *Model, ops: *const abi.CacheOps, f: *const abi.Fo
     };
     var st: fwd.Step = .{
         .slots = .{ .ops = ops, .caches = f.caches.slice(), .positions = f.positions.slice() },
+        .moe = m.moe.layers,
         // A verify's rows capture their recurrent states for a partial accept's rollback.
         .capture = f.mode == .verify,
         .capture_ids = f.capture_layers.slice(),

@@ -11,6 +11,7 @@ const mlx = @import("../../mlx/ffi.zig");
 const host = @import("host.zig");
 const glm_mtp = @import("mtp.zig");
 const table_forward = @import("table_forward.zig");
+const glm_moe = @import("moe.zig");
 const Slots = @import("slots.zig").Slots;
 
 const Array = mlx.mlx_array;
@@ -27,6 +28,11 @@ fn load(mp: *anyopaque, _: *const abi.LoadCtx) callconv(.c) Verdict {
         return Verdict.refuse(.failed, "out of memory");
     };
     p.* = h;
+    m.head_moe = glm_moe.weightsOf(&m.xfm, &p.moe) catch |e| {
+        p.deinit();
+        gpa.destroy(p);
+        return Verdict.named(.failed, @errorName(e));
+    };
     m.head = p;
     return .ok;
 }
@@ -79,7 +85,7 @@ fn step(m: *host.Model, h: *const glm_mtp.Head, ops: *const abi.CacheOps, f: *co
     try mlx.check(mlx.mlx_add(&x1, x, attn, s));
     const m_in = try rms(h, x1, h.post_norm);
     defer _ = mlx.mlx_array_free(m_in);
-    const mlp = try xfm.moeMLP(m_in, &h.moe);
+    const mlp = try glm_moe.forward(&m.head_moe.?, s, m_in);
     defer _ = mlx.mlx_array_free(mlp);
     var y = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(y);

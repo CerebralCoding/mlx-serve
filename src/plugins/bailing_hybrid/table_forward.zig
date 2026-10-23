@@ -5,6 +5,8 @@
 
 const mlx = @import("../../mlx/ffi.zig");
 const slots_mod = @import("../glm5_next/slots.zig");
+const glm_moe = @import("../glm5_next/moe.zig");
+const MoeWeights = @import("../../sdk/bases/blocks/moe.zig").Moe.Weights;
 const mla = @import("mla.zig");
 const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 
@@ -12,6 +14,8 @@ const Array = mlx.mlx_array;
 
 pub const Step = struct {
     slots: slots_mod.Slots,
+    /// Every layer's MoE as the shared block reads it (`glm5_next/moe.zig`).
+    moe: []const ?MoeWeights,
     capture: bool = false,
     capture_ids: []const u32 = &.{},
     capture_out: []Array = &.{},
@@ -74,7 +78,7 @@ pub fn hidden(xfm: *Transformer, st: *const Step, token_ids: Array) !Array {
             ff_normed = try xfm.rmsNorm(h, lw.post_attn_norm);
         }
         const mlp_out = switch (lw.mlp) {
-            .moe => |*mw| try xfm.moeMLP(ff_normed, mw),
+            .moe => try glm_moe.forward(&st.moe[layer_idx].?, xfm.s, ff_normed),
             .dense => |*dw| try xfm.denseMLPMaybeAne(ff_normed, dw, layer_idx, is_prefill, seq_len),
         };
         defer _ = mlx.mlx_array_free(mlp_out);

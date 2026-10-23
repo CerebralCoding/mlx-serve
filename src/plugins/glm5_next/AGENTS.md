@@ -10,7 +10,10 @@ config readers, load (`host.zig`), slot access (`slots.zig`) and fixture writer.
   any Gemma/BERT/sliding key (`foreign_keys`), `glm_moe_dsa`.
 - Load (`host.zig`): the engine's layered `Transformer` built as `engines/mlx/load.zig` builds it (prefix probe,
   `Transformer.init`, compiled MoE routing + GDN gate on a GPU), adopting the driver's loaded map (`intree.takeWeights`)
-  or reading the pack from disk. Its helpers (projections, KDA, MoE, embedding, head) serve the forward.
+  or reading the pack from disk. Its helpers (projections, KDA, embedding, head) serve the forward.
+- MoE (`moe.zig`, Ling's too, the MTP head's): the shared `sdk/bases/blocks/moe.zig` block over the load's arrays;
+  GLM's one-kernel decode (`glm5.moeDecode`, affine, up to 16 rows) is the block's `fused` arm, ModelOpt's per-expert
+  up x down scale its `route_scale`, Sushi's EXL3 banks its `format_banks`.
 - Forward (`table_forward.zig`, a copy of `forward.zig`'s): the [B,S,4,D] stream through KDA / DSA sublayers inside
   mHC; KV and recurrent state only through `CacheOps` (`slots.zig` hands `gatedDeltaNet` a temporary entry and writes
   conv, ssm and a verify's per-row capture back); positions from `Forward.positions`; captures = the stream MEAN;
