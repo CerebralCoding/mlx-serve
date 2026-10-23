@@ -220,7 +220,6 @@ pub fn LagunaAttention(comptime opts: Options) type {
             const g = &sc;
             const geo = &w.geo;
             const logits = try w.gate.forward(g, x);
-            if (try gates.fusedAttnGate(g.s, flat, logits, geo.heads, geo.head_dim)) |y| return parent.keep(try g.adopt(y));
             const sp = try g.call(mlx.mlx_logaddexp, .{ try g.scalar(0, .float32), try g.astype(logits, .float32) });
             const sh = ops.shape(flat);
             const gate4 = try g.reshape(try g.astype(sp, .bfloat16), &.{ sh[0], sh[1], geo.heads, 1 });

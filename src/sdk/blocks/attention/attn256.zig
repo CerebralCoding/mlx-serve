@@ -79,7 +79,6 @@ fn getAttn256Kernel() !mlx.mlx_fast_metal_kernel {
     return kernel;
 }
 
-var fused256_causal_env_cached: ?Fused256CausalMode = null;
 
 pub fn fused256Enabled() bool {
     return transformer.fused256_override orelse true;
@@ -121,17 +120,9 @@ pub const FUSED256_DEFAULT_DISPATCH_BUDGET: i64 = 250_000_000;
 
 /// Test seam: forces the budget without the environment.
 pub var fused256_budget_override: ?i64 = null;
-var fused256_budget_env_cached: ?i64 = null;
 
 pub fn fused256DispatchBudget() i64 {
-    if (fused256_budget_override) |v| return v;
-    if (fused256_budget_env_cached) |v| return v;
-    const v: i64 = blk: {
-        const raw = env.get(.MLX_SERVE_FUSED_256_BUDGET) orelse break :blk FUSED256_DEFAULT_DISPATCH_BUDGET;
-        break :blk std.fmt.parseInt(i64, std.mem.sliceTo(raw, 0), 10) catch FUSED256_DEFAULT_DISPATCH_BUDGET;
-    };
-    fused256_budget_env_cached = v;
-    return v;
+    return fused256_budget_override orelse FUSED256_DEFAULT_DISPATCH_BUDGET;
 }
 
 /// kv-axis chunk length for the budgeted causal dispatch: the largest
@@ -153,15 +144,7 @@ pub var fused256_last_dispatch_count: u32 = 0;
 
 pub fn fused256CausalMode() Fused256CausalMode {
     if (transformer.fused256_override) |v| return if (v) .all else .off;
-    if (!fused256Enabled()) return .off;
-    if (fused256_causal_env_cached) |v| return v;
-    const mode: Fused256CausalMode = blk: {
-        const raw = env.get(.MLX_SERVE_FUSED_256_CAUSAL) orelse break :blk .all;
-        if (std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0")) break :blk .off;
-        break :blk .all;
-    };
-    fused256_causal_env_cached = mode;
-    return mode;
+    return if (fused256Enabled()) .all else .off;
 }
 
 /// ONE predicate consumed by the three prefill OOM guards AND the dispatch
@@ -241,21 +224,13 @@ pub fn attn256Base16Aligned(a: mlx.mlx_array) bool {
     return @intFromPtr(p) % 16 == 0;
 }
 
-var qsa_fused_env_cached: ?bool = null;
 pub var qsa_fused_override: ?bool = null;
 
 /// MLX_SERVE_QSA_FUSED=0 restores the stock array-mask sdpa (the unfused
 /// hd-256 fallback on every silicon: `use_fallback` has no fused arm for an
 /// array mask at hd 256).
 pub fn qsaFusedEnabled() bool {
-    if (qsa_fused_override) |v| return v;
-    if (qsa_fused_env_cached) |v| return v;
-    const v = blk: {
-        const raw = env.get(.MLX_SERVE_QSA_FUSED) orelse break :blk true;
-        break :blk !std.mem.eql(u8, std.mem.sliceTo(raw, 0), "0");
-    };
-    qsa_fused_env_cached = v;
-    return v;
+    return qsa_fused_override orelse true;
 }
 
 var qsa_fused_logged = false;
@@ -281,7 +256,7 @@ pub fn fusedSdpa256Masked(
     const out = try fusedSdpa256Impl(s, q, k, v, scale, 0, mask, null);
     if (out != null and !qsa_fused_logged) {
         qsa_fused_logged = true;
-        log.info("[qsa-fused] engaged: msv_attn_p256 mask arm qL={d} kL={d} Hq={d} Hkv={d} (MLX_SERVE_QSA_FUSED=0 restores stock sdpa)\n", .{ qs[2], ks[2], qs[1], ks[1] });
+        log.info("[qsa-fused] engaged: msv_attn_p256 mask arm qL={d} kL={d} Hq={d} Hkv={d}\n", .{ qs[2], ks[2], qs[1], ks[1] });
     }
     return out;
 }

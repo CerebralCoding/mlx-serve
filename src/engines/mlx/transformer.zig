@@ -98,7 +98,6 @@ pub const naxMinMFrom = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").na
 pub const verifyQmmNaxEnabledForMFrom = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxEnabledForMFrom;
 pub const verifyQmmNaxEnabledForM = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxEnabledForM;
 // sdk/blocks/attention/sdpa.zig
-pub const naxSdpaPreferredFrom = @import("../../sdk/blocks/attention/sdpa.zig").naxSdpaPreferredFrom;
 pub const naxSdpaPreferred = @import("../../sdk/blocks/attention/sdpa.zig").naxSdpaPreferred;
 pub const sdpaForceFusedFor = @import("../../sdk/blocks/attention/sdpa.zig").sdpaForceFusedFor;
 pub const sdpaForceFused = @import("../../sdk/blocks/attention/sdpa.zig").sdpaForceFused;
