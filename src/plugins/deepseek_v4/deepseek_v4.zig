@@ -732,7 +732,10 @@ pub const Dsv4Model = struct {
     /// Confidence LOGIT below which a drafted position is not submitted for
     /// verification (see `dsparkConfThreshold`). Tests move it to ±inf to pin
     /// the open/shut ends.
-    ds_conf_thr: f32 = 0,
+    /// Confidence gate on the raw logit (antirez's `--dspark-confidence` as a sigmoid probability, converted). OPEN by
+    /// default, measured: our verify is fixed-cost dominated (≈ 70 ms + ~12 ms·C), so a narrower block pays almost the
+    /// same and commits less (no gate 30.7 tok/s, 0.5 → 29.9, 0.9 → 25.3).
+    ds_conf_thr: f32 = -std.math.inf(f32),
     /// Per-round cost audit, armed by `MLX_SERVE_DSPARK_PROFILE` at load.
     ds_prof: ?DsparkProfile = null,
     /// Scratch laps written by the last `extendChunk` (profiling only): the
@@ -1032,7 +1035,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
     // GPU streams only: the CPU stream is the host-reference/test path, whose
     // numerics the python oracle models with dequantized operands (and whose
     // decode-equivalence gate is strict BECAUSE both sides hit one gemm).
-    if (woAQmmEnabled() and mlx.streamIsGpu(s)) {
+    if (mlx.streamIsGpu(s)) {
         wo_a_q3 = try a.alloc(Q3, dw.layers.len);
         for (wo_a_q3, dw.layers) |*q3, *ly| {
             q3.* = .{
@@ -1122,7 +1125,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
     // lazy-decode GPU embed table (bf16; host embed_f32 = f32 of the same
     // bf16 values, so the two lookup paths feed bit-identical rows)
     var embed_g: ?mlx.mlx_array = null;
-    if (mlx.streamIsGpu(s) and lazyDecodeEnabled()) {
+    if (mlx.streamIsGpu(s)) {
         var eb = mlx.mlx_array_new();
         try mlx.check(mlx.mlx_astype(&eb, embed_deq, .bfloat16, s));
         try mlx.check(mlx.mlx_array_eval(eb));
@@ -1142,18 +1145,15 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
         try mlx.check(mlx.mlx_array_eval(arr));
         break :blk arr;
     };
-    const sink_env_off = if (std.c.getenv("MLX_SERVE_DSV4_SINKHORN")) |v| v[0] == '0' else false;
-    const sink_k = if (mlx.streamIsGpu(s) and !sink_env_off)
+    const sink_k = if (mlx.streamIsGpu(s))
         buildSinkhornKernel(hc, cfg.dsv4_hc_sinkhorn_iters)
     else
         null;
-    const sink_y_env_off = if (std.c.getenv("MLX_SERVE_DSV4_SINKY")) |v| v[0] == '0' else false;
-    const sink_y_k = if (sink_k != null and !sink_y_env_off)
+    const sink_y_k = if (sink_k != null)
         buildSinkhornYKernel(hc, cfg.dsv4_hc_sinkhorn_iters, dim)
     else
         null;
-    const hc_post_env_off = if (std.c.getenv("MLX_SERVE_DSV4_HCPOST")) |v| v[0] == '0' else false;
-    const hc_post_k = if (sink_y_k != null and !hc_post_env_off)
+    const hc_post_k = if (sink_y_k != null)
         buildHcPostKernel(hc, dim)
     else
         null;
@@ -1268,31 +1268,8 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
         .ds_conf_proj_t = if (dspark_on) try transposedF32(dw.dspark.?.conf_proj, s) else null,
         .ds_hc_head_base = if (dspark_on) try toHostF32(a, dw.dspark.?.hc_head_base, hc, s) else &.{},
         .ds_hc_head_scale = if (dspark_on) try toHostF32(a, dw.dspark.?.hc_head_scale, 1, s) else &.{},
-        .ds_conf_thr = dsparkConfThreshold(),
         .ds_prof = if (dspark_on and std.c.getenv("MLX_SERVE_DSPARK_PROFILE") != null) DsparkProfile{} else null,
     };
-}
-
-/// Confidence gate, in the reference implementation's own units: the env var
-/// is a SIGMOID probability (antirez's `--dspark-confidence`), compared here
-/// against the raw logit, so it converts once at load. 0 disables the gate
-/// (every position submitted), 1 shuts it.
-///
-/// DEFAULT OFF — measured, not inherited. The head IS informative (position 0
-/// scores +5.08 mean on accepted rounds vs +0.02 on rejected), but our
-/// batched forward is FIXED-COST dominated: verify(C) ≈ 70 ms + ~12 ms·C, so
-/// a narrower block pays almost the same and commits less. Live: no gate 30.7
-/// tok/s, 0.5 → 29.9, 0.9 (the reference default) → 25.3. The reference's
-/// engine has a far cheaper per-forward floor, which is what makes the same
-/// threshold pay there. Port, measure, let the number pick the default.
-pub fn dsparkConfThreshold() f32 {
-    var p: f32 = 0;
-    if (std.c.getenv("MLX_SERVE_DSV4_DSPARK_CONF")) |v| {
-        p = std.fmt.parseFloat(f32, std.mem.span(v)) catch 0;
-    }
-    if (p <= 0) return -std.math.inf(f32);
-    if (p >= 1) return std.math.inf(f32);
-    return @log(p / (1 - p));
 }
 
 /// Gated-pooling compression (prefill): x [s, dim] -> [s/ratio, head_dim].
@@ -1609,40 +1586,9 @@ fn sqrtSoftplus(x: f64) f64 {
     return @sqrt(sp);
 }
 
-/// GPU MoE routing kill switch (`MLX_SERVE_DSV4_MOE_ROUTE_GPU=0` → the host
-/// routing sync via routeToken). Cached: read once per process.
-var moe_route_gpu_state: ?bool = null;
 var moe_route_gpu_logged: bool = false;
-fn moeRouteGpuEnabled() bool {
-    if (moe_route_gpu_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_MOE_ROUTE_GPU")) |e| e[0] != '0' else true;
-    moe_route_gpu_state = v;
-    return v;
-}
 
-/// Deferred compressor-row sync kill switch
-/// (`MLX_SERVE_DSV4_COMP_DEFER=0` → every position syncs in-layer, the
-/// pre-deferral behavior). Cached: read once per process.
-var comp_defer_state: ?bool = null;
-fn compDeferEnabled() bool {
-    if (comp_defer_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_COMP_DEFER")) |e| e[0] != '0' else true;
-    comp_defer_state = v;
-    return v;
-}
-
-/// wo_a served quantized (`MLX_SERVE_DSV4_WO_QMM=0` → the bf16 wo_a_deq
-/// slabs, the pre-quantized behavior). LOAD-time decision: the enabled path
-/// never builds the 2.9 GB of dequantized operands. Cached once per process.
-var wo_qmm_state: ?bool = null;
 var wo_qmm_logged: bool = false;
-fn woAQmmEnabled() bool {
-    if (wo_qmm_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_WO_QMM")) |e| e[0] != '0' else true;
-    wo_qmm_state = v;
-    return v;
-}
-
 /// Reshape one member of a wo_a quantized triple [og*ol, X] → [og, ol, X]
 /// (contiguous row-major → pure view, no copy).
 fn reshapeQ3(arr: mlx.mlx_array, og: c_int, ol: c_int, s: mlx.mlx_stream) !mlx.mlx_array {
@@ -1673,21 +1619,11 @@ fn woAMatmul(m: *const Dsv4Model, li: usize, ob: mlx.mlx_array) !mlx.mlx_array {
     return try gpuOp2(mlx.mlx_matmul, ob, m.wo_a_deq[li], m.s);
 }
 
-/// GPU window emission kill switch (`MLX_SERVE_DSV4_GPU_EMIT=0` → host
-/// emission with the in-layer blocking sync, the pre-GPU behavior). Cached.
-var gpu_emit_state: ?bool = null;
 var gpu_emit_logged: bool = false;
-fn gpuEmitEnabled() bool {
-    if (gpu_emit_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_GPU_EMIT")) |e| e[0] != '0' else true;
-    gpu_emit_state = v;
-    return v;
-}
-
 /// GPU emission serves GPU streams only: the CPU stream is the host
 /// reference/test path whose strict gates assume host emission.
 fn gpuEmitActive(m: *const Dsv4Model) bool {
-    return gpuEmitEnabled() and mlx.streamIsGpu(m.s);
+    return mlx.streamIsGpu(m.s);
 }
 
 /// Fused window-emission kernel kill switch (`MLX_SERVE_DSV4_EMIT_KERNEL=0`
@@ -1698,12 +1634,9 @@ var emit_kernel_logged: bool = false;
 /// decline is output-identical to the fallback, house rule).
 var emit_kernel_hits: usize = 0;
 fn emitKernelEnabled() bool {
-    if (emit_kernel_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_EMIT_KERNEL")) |e| e[0] != '0' else true;
-    emit_kernel_state = v;
-    return v;
+    return emit_kernel_state orelse true;
 }
-/// Test hook: force the fused-emission arm on/off (null = re-read the env).
+/// Test hook: force the fused-emission arm on/off (null = default on).
 fn emitKernelSetForTest(v: ?bool) void {
     emit_kernel_state = v;
 }
@@ -1714,54 +1647,11 @@ var dec_chain_state: ?bool = null;
 var dec_chain_logged: bool = false;
 var dec_chain_hits: usize = 0;
 fn decChainEnabled() bool {
-    if (dec_chain_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_DEC_CHAIN")) |e| e[0] != '0' else true;
-    dec_chain_state = v;
-    return v;
+    return dec_chain_state orelse true;
 }
-/// Test hook: force the decode-chain arm on/off (null = re-read the env).
+/// Test hook: force the decode-chain arm on/off (null = default on).
 pub fn decChainSetForTest(v: ?bool) void {
     dec_chain_state = v;
-}
-
-/// Fused MoE gate+up gather — OPT-IN (`MLX_SERVE_DSV4_MOE_GATEUP=1`): the
-/// same-boot A/B on the real 2-bit gs64 trunk measured it ~2.5% SLOWER than
-/// the two stock gather_qmm dispatches + clippedSwigluG (29.6 → 28.9 tok/s,
-/// 2026-08-01) — the house "stock gather wins where O(bank) doesn't dominate
-/// the expert math" outcome, re-measured here because MLX's 2/3-bit kernels
-/// are its slowest. Kept behind the switch for future geometries. Cached.
-var moe_gateup_state: ?bool = null;
-var moe_gateup_logged: bool = false;
-var moe_gateup_hits: usize = 0;
-fn moeGateUpEnabled() bool {
-    if (moe_gateup_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_MOE_GATEUP")) |e| e[0] == '1' else false;
-    moe_gateup_state = v;
-    return v;
-}
-/// Test hook: force the MoE gate+up arm on/off (null = re-read the env).
-pub fn moeGateUpSetForTest(v: ?bool) void {
-    moe_gateup_state = v;
-}
-
-/// Fused sink-softmax — OPT-IN (`MLX_SERVE_DSV4_SINK_SOFTMAX=1`): the
-/// same-boot A/B measured it NEUTRAL-to-slightly-negative (~29.6 vs ~29.8
-/// tok/s composed, 2026-08-01) — the composed 4-dispatch chain is already
-/// overlapped by the GPU (the fusedAttnGate on-chain-but-overlapped class),
-/// and the kernel is not bit-identical (softmax reduction tree). A
-/// byte-changing lever with no measured win stays off. Cached.
-var sink_softmax_state: ?bool = null;
-var sink_softmax_logged: bool = false;
-var sink_softmax_hits: usize = 0;
-fn sinkSoftmaxEnabled() bool {
-    if (sink_softmax_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_SINK_SOFTMAX")) |e| e[0] == '1' else false;
-    sink_softmax_state = v;
-    return v;
-}
-/// Test hook: force the sink-softmax arm on/off (null = re-read the env).
-pub fn sinkSoftmaxSetForTest(v: ?bool) void {
-    sink_softmax_state = v;
 }
 
 /// comp_in decode-side int8 requant engagement counter — the serving arm is
@@ -1793,17 +1683,7 @@ fn compInProj(m: *const Dsv4Model, h: *const HostLayer, li: usize, x_g: mlx.mlx_
     return try gpuOp2(mlx.mlx_matmul, x_g, h.comp_in_t.?, m.s);
 }
 
-/// Lazy pipelined decode kill switch (`MLX_SERVE_DSV4_LAZY_DECODE=0` → the
-/// synchronous decodeStep with per-token host logits). Cached.
-var lazy_decode_state: ?bool = null;
 var lazy_decode_logged: bool = false;
-fn lazyDecodeEnabled() bool {
-    if (lazy_decode_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_LAZY_DECODE")) |e| e[0] != '0' else true;
-    lazy_decode_state = v;
-    return v;
-}
-
 /// Per-token/per-chunk phase trace (`MLX_SERVE_DSV4_TRACE=1`): decode logs
 /// pos, build/head/defer/comp µs + the gap since the previous step returned;
 /// extendChunk logs C, layers/comp/defer/head ms. Wall-clock only, no extra
@@ -1980,135 +1860,6 @@ fn clippedSwigluG(gate_in: mlx.mlx_array, up_in: mlx.mlx_array, limit: f32, s: m
     try mlx.check(mlx.mlx_multiply(&act32, silu, u_cl, s));
     var act = mlx.mlx_array_new();
     try mlx.check(mlx.mlx_astype(&act, act32, .bfloat16, s));
-    return act;
-}
-
-/// The transformer.zig `gatherQmvGateUp` body with dsv4's clipped SwiGLU
-/// tail: accumulators round to T exactly where the composed gather_qmm pair
-/// wrote T(acc), then the f32 clip chain with the sigmoid read from an exact
-/// bf16-indexed table of mlx_sigmoid values (the swigluSigTable rule — a
-/// metal::exp transcendental is a rounding apart from the metallib).
-pub const MOE_GATEUP_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/moe_gateup.metal");
-
-var moe_gateup_obj: ?mlx.mlx_fast_metal_kernel = null;
-var moe_gateup_build_failed: bool = false;
-fn moeGateUpObj() ?mlx.mlx_fast_metal_kernel {
-    if (moe_gateup_build_failed) return null;
-    if (moe_gateup_obj) |kk| return kk;
-    const input_names = [_][*:0]const u8{ "x", "wg_q", "g_scales", "g_biases", "wu_q", "u_scales", "u_biases", "inds", "sigtab", "consts" };
-    const output_names = [_][*:0]const u8{"y"};
-    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
-    defer _ = mlx.mlx_vector_string_free(in_vec);
-    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
-    defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_moe_gateup", in_vec, out_vec, MOE_GATEUP_KERNEL_SOURCE, "", true, false);
-    if (kernel.ctx == null) {
-        moe_gateup_build_failed = true;
-        log.warn("dsv4: fused MoE gate+up kernel failed to build — composed gathers fallback\n", .{});
-        return null;
-    }
-    moe_gateup_obj = kernel;
-    return kernel;
-}
-
-/// f32 sigmoid over every bf16-representable input, computed ONCE by
-/// mlx_sigmoid itself (256 KB) so the kernel's activation cannot disagree
-/// with the composed chain's transcendental. Never freed: process-lifetime.
-var moe_sigtab: ?mlx.mlx_array = null;
-fn moeSigTableF32(s: mlx.mlx_stream) !mlx.mlx_array {
-    if (moe_sigtab) |t| return t;
-    const vals = try std.heap.c_allocator.alloc(f32, 65536);
-    defer std.heap.c_allocator.free(vals);
-    for (vals, 0..) |*v, i| {
-        const bits: u32 = @as(u32, @intCast(i)) << 16; // bf16 → f32 is exact widening
-        v.* = @bitCast(bits);
-    }
-    const shape = [_]c_int{65536};
-    const raw = uploadF32(vals, &shape);
-    defer _ = mlx.mlx_array_free(raw);
-    var sig = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(sig);
-    try mlx.check(mlx.mlx_sigmoid(&sig, raw, s));
-    try mlx.check(mlx.mlx_array_eval(sig));
-    moe_sigtab = sig;
-    return sig;
-}
-
-const MoeGateUpKey = struct { topk: u32, n: u32, ks: u32, bits: u32, gs: u32 };
-var moe_gateup_cfg: ?mlx.mlx_fast_metal_kernel_config = null;
-var moe_gateup_cfg_key: MoeGateUpKey = std.mem.zeroes(MoeGateUpKey);
-
-/// Fused decode gate+up gather + clipped SwiGLU: both expert dot products in
-/// one simdgroup (x loaded once, dequant chains interleaved), activation
-/// applied before the write — the transformer.zig `gatherQmvGateUp` pattern
-/// with dsv4's clipped SwiGLU (f32 chain, sigmoid via an exact bf16-indexed
-/// table). Returns [1, TOPK, 1, N] bf16 (the composed `act` shape), or null
-/// to decline (kill switch, ineligible geometry, build failure).
-pub fn moeGateUpFused(m: *const Dsv4Model, xe: mlx.mlx_array, q_gate: *const Q, q_up: *const Q, ind: mlx.mlx_array, k: usize) !?mlx.mlx_array {
-    if (!moeGateUpEnabled() or !mlx.streamIsGpu(m.s)) return null;
-    const bits = q_gate.qp.bits;
-    const gs = q_gate.qp.group_size;
-    // eligibility is the kernel's own conditions, never a model list
-    if (bits != 2 and bits != 4 and bits != 8) return null;
-    if (gs % (32 / bits) != 0) return null;
-    if (q_up.qp.bits != bits or q_up.qp.group_size != gs) return null;
-    if (q_gate.b.ctx == null or q_up.b.ctx == null) return null;
-    if (mlx.mlx_array_dtype(xe) != .bfloat16) return null; // sigtab is bf16-indexed
-    const idt = mlx.mlx_array_dtype(ind);
-    if (idt != .int32 and idt != .uint32) return null;
-    if (mlx.mlx_array_ndim(q_gate.w) != 3 or mlx.mlx_array_ndim(q_up.w) != 3) return null;
-    const wsh = mlx.mlx_array_shape(q_gate.w);
-    const ush = mlx.mlx_array_shape(q_up.w);
-    for (0..3) |i| if (wsh[i] != ush[i]) return null;
-    const N: usize = @intCast(wsh[1]);
-    const K: usize = @intCast(@divExact(@as(u32, @intCast(wsh[2])) * 32, bits));
-    if (K % gs != 0 or N % 8 != 0) return null;
-    const kernel = moeGateUpObj() orelse return null;
-    const key = MoeGateUpKey{ .topk = @intCast(k), .n = @intCast(N), .ks = @intCast(K), .bits = bits, .gs = gs };
-    if (moe_gateup_cfg == null or !std.meta.eql(moe_gateup_cfg_key, key)) {
-        if (moe_gateup_cfg) |c| _ = mlx.mlx_fast_metal_kernel_config_free(c);
-        moe_gateup_cfg = null;
-        const cfg = mlx.mlx_fast_metal_kernel_config_new();
-        const y_shape = [_]c_int{ @intCast(k), @intCast(N) };
-        if (mlx.mlx_fast_metal_kernel_config_add_output_arg(cfg, &y_shape, 2, .bfloat16) != 0 or
-            mlx.mlx_fast_metal_kernel_config_set_grid(cfg, 32, @intCast(N), @intCast(k)) != 0 or
-            mlx.mlx_fast_metal_kernel_config_set_thread_group(cfg, 32, 8, 1) != 0 or
-            mlx.mlx_fast_metal_kernel_config_add_template_arg_dtype(cfg, "T", .bfloat16) != 0 or
-            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "GS", @intCast(gs)) != 0 or
-            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "BITS", @intCast(bits)) != 0 or
-            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "KS", @intCast(K)) != 0 or
-            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(cfg, "NS", @intCast(N)) != 0)
-        {
-            _ = mlx.mlx_fast_metal_kernel_config_free(cfg);
-            return null;
-        }
-        moe_gateup_cfg = cfg;
-        moe_gateup_cfg_key = key;
-    }
-    const sigtab = try moeSigTableF32(m.s);
-    const lim_arr = [_]f32{m.swiglu_limit};
-    const lshape = [_]c_int{1};
-    const lim_g = uploadF32(&lim_arr, &lshape);
-    defer _ = mlx.mlx_array_free(lim_g);
-    const inputs_arr = [_]mlx.mlx_array{ xe, q_gate.w, q_gate.s, q_gate.b, q_up.w, q_up.s, q_up.b, ind, sigtab, lim_g };
-    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
-    defer _ = mlx.mlx_vector_array_free(inputs_vec);
-    var outputs_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, moe_gateup_cfg.?, m.s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
-    var y = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(y);
-    try mlx.check(mlx.mlx_vector_array_get(&y, outputs_vec, 0));
-    const act_shape = [_]c_int{ 1, @intCast(k), 1, @intCast(N) };
-    var act = mlx.mlx_array_new();
-    errdefer _ = mlx.mlx_array_free(act);
-    try mlx.check(mlx.mlx_reshape(&act, y, &act_shape, 4, m.s));
-    moe_gateup_hits += 1;
-    if (!moe_gateup_logged) {
-        moe_gateup_logged = true;
-        log.info("dsv4: fused MoE gate+up kernel engaged (topk={d} inter={d} bits={d} gs={d})\n", .{ k, N, bits, gs });
-    }
     return act;
 }
 
@@ -3237,70 +2988,6 @@ test "dsv4: a chunk only stalls for layers whose window closes inside it" {
     try testing.expect(!chunkCrossesBoundary(0, 3, 4));
     try testing.expect(!chunkCrossesBoundary(4, 3, 4)); // 5,6,7 -> closes at 8
     try testing.expect(chunkCrossesBoundary(4, 4, 4));
-}
-
-test "dsv4: deferring a chunk's compressor read changes nothing (DSV4_MINI)" {
-    // The deferral is a PIPELINE decision, never a numeric one: the same host
-    // pushes run, just after the layer loop instead of inside it. Logits and
-    // the state both sides leave behind must be bit-identical — and this runs
-    // a chunk that closes a window on the ratio-4 layers while closing none
-    // on the ratio-16 ones, so both arms of the predicate fire in one chunk.
-    const path_z = std.c.getenv("DSV4_MINI") orelse return;
-    const path = std.mem.span(path_z);
-    const allocator = testing.allocator;
-
-    const io = std.Io.Threaded.global_single_threaded.io();
-    const cfg_path = try std.fmt.allocPrint(allocator, "{s}/config.json", .{path});
-    defer allocator.free(cfg_path);
-    const file = try std.Io.Dir.openFileAbsolute(io, cfg_path, .{});
-    var rb: [4096]u8 = undefined;
-    var rs = file.reader(io, &rb);
-    const cfg_json = try rs.interface.allocRemaining(allocator, .limited(1 << 20));
-    file.close(io);
-    defer allocator.free(cfg_json);
-    const cfg = try model.parseConfigFromJson(allocator, cfg_json);
-    const shard_path = try std.fmt.allocPrint(allocator, "{s}/model-mini.safetensors", .{path});
-    defer allocator.free(shard_path);
-    var weights = try model.loadWeightsSingleFile(allocator, shard_path);
-    defer weights.deinit();
-
-    const saved = comp_defer_state;
-    defer comp_defer_state = saved;
-
-    for ([_]bool{ false, true }) |use_gpu| {
-        if (use_gpu and mlx.noGpuBackend()) continue;
-        const dw = try loadDsv4Weights(allocator, &cfg, &weights);
-        const s = if (use_gpu) mlx.gpuStream() else mlx.mlx_default_cpu_stream_new();
-        defer _ = mlx.mlx_stream_free(s);
-        var mdl = try initModel(allocator, &cfg, dw, s);
-        defer mdl.deinit();
-
-        var rng = std.Random.DefaultPrng.init(31337);
-        var ids: [16]u32 = undefined;
-        for (&ids) |*v| v.* = rng.random().uintLessThan(u32, @intCast(mdl.vocab));
-
-        var out: [2][]f32 = undefined;
-        for ([_]bool{ true, false }, 0..) |defer_on, arm| {
-            comp_defer_state = defer_on;
-            var st = try initDecodeState(&mdl, allocator);
-            defer deinitDecodeState(&st);
-            {
-                const pl = try prefillIntoState(&mdl, allocator, &st, ids[0..6]);
-                allocator.free(pl);
-            }
-            {
-                const cl = try extendState(&mdl, allocator, &st, ids[6..12]);
-                allocator.free(cl);
-            }
-            // the tail decode proves the STATE both arms left, not just logits
-            const l = try decodeStep(&mdl, allocator, &st, ids[12]);
-            out[arm] = l;
-        }
-        defer for (out) |l| allocator.free(l);
-        for (out[0]) |v| try testing.expect(std.math.isFinite(v));
-        try testing.expectEqualSlices(f32, out[1], out[0]);
-        std.debug.print("dsv4 compressor deferral (gpu={}): bit-identical vs in-layer\n", .{use_gpu});
-    }
 }
 
 test "dsv4: the sinkhorn config cache keys on the token count it bakes" {
@@ -5275,14 +4962,12 @@ fn moeGpuImpl(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, x_g: mlx
     const scores_g = try gpuOp2(mlx.mlx_matmul, x_g, h.gate_w_t, m.s);
     defer _ = mlx.mlx_array_free(scores_g);
 
-    const ind_shape = [_]c_int{ @intCast(seq), @intCast(k) };
-    const wshape = [_]c_int{ @intCast(seq), @intCast(k), 1, 1 };
     var ind = mlx.mlx_array_new(); // [C, k] int32
     defer _ = mlx.mlx_array_free(ind);
     var w_arr = mlx.mlx_array_new(); // [C, k, 1, 1] f32 route weights
     defer _ = mlx.mlx_array_free(w_arr);
 
-    if (moeRouteGpuEnabled() or id_arr != null) {
+    {
         if (!moe_route_gpu_logged) {
             moe_route_gpu_logged = true;
             log.info("dsv4: GPU MoE routing engaged\n", .{});
@@ -5291,23 +4976,6 @@ fn moeGpuImpl(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, x_g: mlx
         defer rg.deinit();
         try mlx.check(mlx.mlx_array_set(&ind, rg.ind));
         try mlx.check(mlx.mlx_array_set(&w_arr, rg.w));
-    } else {
-        const scores = try toHostF32(alloc, scores_g, seq * E, m.s); // routing sync
-        defer alloc.free(scores);
-        for (scores) |*v| v.* = @floatCast(sqrtSoftplus(v.*));
-        const indices = try alloc.alloc(i32, seq * k);
-        defer alloc.free(indices);
-        const wts = try alloc.alloc(f32, seq * k);
-        defer alloc.free(wts);
-        for (0..seq) |t| {
-            routeToken(m, h, scores[t * E ..][0..E], ids[t], indices[t * k ..][0..k], wts[t * k ..][0..k]);
-        }
-        const up = mlx.mlx_array_new_data(indices.ptr, &ind_shape, 2, .int32);
-        defer _ = mlx.mlx_array_free(up);
-        try mlx.check(mlx.mlx_array_set(&ind, up));
-        const wu = uploadF32(wts, &wshape);
-        defer _ = mlx.mlx_array_free(wu);
-        try mlx.check(mlx.mlx_array_set(&w_arr, wu));
     }
 
     var down32 = mlx.mlx_array_new();
@@ -5375,13 +5043,9 @@ fn moeGpuImpl(m: *const Dsv4Model, alloc: std.mem.Allocator, li: usize, x_g: mlx
         var xe = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(xe);
         try mlx.check(mlx.mlx_astype(&xe, xr, .bfloat16, m.s));
-        const topk: usize = @intCast(mlx.mlx_array_shape(ind)[1]);
         var act = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(act);
-        if (try moeGateUpFused(m, xe, &ly.experts_w1, &ly.experts_w3, ind, topk)) |fused| {
-            defer _ = mlx.mlx_array_free(fused);
-            try mlx.check(mlx.mlx_array_set(&act, fused));
-        } else {
+        {
             const gate_arr = try gatherQmmE(&ly.experts_w1, xe, ind, m.s);
             defer _ = mlx.mlx_array_free(gate_arr);
             const up_arr = try gatherQmmE(&ly.experts_w3, xe, ind, m.s);
@@ -5546,7 +5210,7 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
                 try emitWindowsGpu(m, &h.idx_comp.?, &ls.idx_comp.?, &ls.idx_gpu, comp_in, 2 * cdd, pos, 1, 4, true, fr, alloc);
             errdefer _ = mlx.mlx_array_free(comp_in);
             try deferred.append(alloc, .{ .li = li, .arr = comp_in });
-        } else if (boundary_attn or boundary_idx or !compDeferEnabled()) {
+        } else if (boundary_attn or boundary_idx) {
             defer _ = mlx.mlx_array_free(comp_in);
             var cclk: DsparkClock = if (dsv4TraceEnabled()) DsparkClock.init() else undefined;
             const row = try toHostF32(alloc, comp_in, h.comp_in_w, m.s);
@@ -5674,10 +5338,7 @@ fn attentionDecodeGpu(m: *const Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4De
     const scale_f: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(hd))));
     var probs_real = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(probs_real);
-    if (try sinkSoftmaxKernel(m, scores0, h.sink_gpu, nh, tk, scale_f)) |fused| {
-        defer _ = mlx.mlx_array_free(fused);
-        try mlx.check(mlx.mlx_array_set(&probs_real, fused));
-    } else {
+    {
         const scale_arr = mlx.mlx_array_new_float(scale_f);
         defer _ = mlx.mlx_array_free(scale_arr);
         const scaled = try gpuOp2(mlx.mlx_multiply, scores0, scale_arr, m.s);
@@ -5946,7 +5607,7 @@ pub fn decodeStepLazy(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeStat
     }
     // boundary prefetch: the NEXT token blocks on a full drain before its
     // emission build — drain the OLDER rows now, leaving only this token's.
-    if (drainPrefetchEnabled() and st.pending.items.len > 0 and posClosesAnyWindow(m, pos + 1))
+    if (st.pending.items.len > 0 and posClosesAnyWindow(m, pos + 1))
         try drainPendingBefore(m, st, pos);
     const logits = try headLogitsLazyGpu(m, stream_g);
     if (tracing) {
@@ -5961,8 +5622,8 @@ pub fn decodeStepLazy(m: *Dsv4Model, gpa: std.mem.Allocator, st: *Dsv4DecodeStat
 /// Everything `decodeStepLazy` requires: GPU stream + GPU emission + GPU MoE
 /// routing (device hash lookup), the GPU embed table, and DSpark off.
 pub fn lazyDecodeReady(m: *const Dsv4Model, st: *const Dsv4DecodeState) bool {
-    return lazyDecodeEnabled() and m.embed_g != null and st.dspark == null and
-        moeRouteGpuEnabled() and gpuEmitActive(m);
+    return m.embed_g != null and st.dspark == null and
+        gpuEmitActive(m);
 }
 
 /// Drain the non-boundary compressor rows deferred by `attentionDecodeGpu`:
@@ -6065,16 +5726,6 @@ pub fn drainPending(m: *const Dsv4Model, st: *Dsv4DecodeState) !void {
         _ = mlx.mlx_array_free(p.arr);
     }
     st.pending.clearRetainingCapacity();
-}
-
-/// Boundary-prefetch kill switch (`MLX_SERVE_DSV4_DRAIN_PREFETCH=0` → the
-/// boundary token drains everything itself, the pre-prefetch behavior).
-var drain_prefetch_state: ?bool = null;
-fn drainPrefetchEnabled() bool {
-    if (drain_prefetch_state) |v| return v;
-    const v = if (std.c.getenv("MLX_SERVE_DSV4_DRAIN_PREFETCH")) |e| e[0] != '0' else true;
-    drain_prefetch_state = v;
-    return v;
 }
 
 /// Partial drain of pending rows with pos < `before` (kept entries stay in
@@ -6826,111 +6477,6 @@ fn emitWindowsKernel(
     return true;
 }
 
-/// Fused decode attention-chain tail: per-head [RMS →] rope tail →
-/// [fp8-head-sim | Hadamard+fp4] in ONE dispatch, replacing the composed
-/// ~15-25-op chains around the decode qmvs (q / kv / indexer-q / o-inverse).
-/// post: 0 = rope only, 1 = fp8 head sim + raw roped tail, 2 = Hadamard+fp4.
-/// Returns null to decline (kill switch, ineligible geometry, build failure)
-/// — the caller keeps the composed chain.
-/// Row softmax with the sink folded into the max and the denominator, sink
-/// column dropped at the write — one threadgroup per head, tree reductions.
-/// exp/reduction-tree drift vs the composed mlx softmax is the sanctioned
-/// sinkhorn-kernel class (continuous path, decode-equivalence arbitrates).
-pub const SINK_SOFTMAX_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/sink_softmax.metal");
-
-var sink_softmax_obj: ?mlx.mlx_fast_metal_kernel = null;
-var sink_softmax_build_failed: bool = false;
-fn sinkSoftmaxObj() ?mlx.mlx_fast_metal_kernel {
-    if (sink_softmax_build_failed) return null;
-    if (sink_softmax_obj) |kk| return kk;
-    const input_names = [_][*:0]const u8{ "scores", "sink", "consts", "tk_size" };
-    const output_names = [_][*:0]const u8{"y"};
-    const in_vec = mlx.mlx_vector_string_new_data(&input_names, input_names.len);
-    defer _ = mlx.mlx_vector_string_free(in_vec);
-    const out_vec = mlx.mlx_vector_string_new_data(&output_names, output_names.len);
-    defer _ = mlx.mlx_vector_string_free(out_vec);
-    const kernel = mlx.mlx_fast_metal_kernel_new("dsv4_sink_softmax", in_vec, out_vec, SINK_SOFTMAX_KERNEL_SOURCE, "", true, false);
-    if (kernel.ctx == null) {
-        sink_softmax_build_failed = true;
-        log.warn("dsv4: fused sink-softmax kernel failed to build — composed chain fallback\n", .{});
-        return null;
-    }
-    sink_softmax_obj = kernel;
-    return kernel;
-}
-
-const SinkSmKey = struct { h: u32, tk: u32 };
-const SinkSmSlot = struct { key: SinkSmKey, cfg: mlx.mlx_fast_metal_kernel_config };
-/// tk differs per ratio class within one token (~4 live values at steady
-/// state) and grows during the ramp — an 8-slot rotating table keeps the
-/// steady-state configs cached without unbounded growth.
-var sink_sm_cfg_cache: [8]?SinkSmSlot = @splat(null);
-var sink_sm_cfg_next: usize = 0;
-
-/// Fused decode sink-softmax: scale → sink column in the denominator →
-/// row softmax → drop the sink, in ONE dispatch between the two attention
-/// GEMMs (the composed chain is 4 strictly-serial dispatches per layer).
-/// Returns probs [H, TK] f32, or null to decline.
-pub fn sinkSoftmaxKernel(m: *const Dsv4Model, scores0: mlx.mlx_array, sink: mlx.mlx_array, H: usize, TK: usize, scale: f32) !?mlx.mlx_array {
-    if (!sinkSoftmaxEnabled() or !mlx.streamIsGpu(m.s)) return null; // metal_kernel is GPU-only
-    if (TK == 0 or H == 0 or H > 65535) return null;
-    const kernel = sinkSoftmaxObj() orelse return null;
-    const tg: usize = @min(256, std.math.ceilPowerOfTwoAssert(usize, @max(TK, 2)));
-    const key = SinkSmKey{ .h = @intCast(H), .tk = @intCast(TK) };
-    var cfg: mlx.mlx_fast_metal_kernel_config = undefined;
-    var cached = false;
-    for (&sink_sm_cfg_cache) |*slot| {
-        if (slot.*) |sl| {
-            if (std.meta.eql(sl.key, key)) {
-                cfg = sl.cfg;
-                cached = true;
-                break;
-            }
-        }
-    }
-    if (!cached) {
-        const built = mlx.mlx_fast_metal_kernel_config_new();
-        const y_shape = [_]c_int{ @intCast(H), @intCast(TK) };
-        if (mlx.mlx_fast_metal_kernel_config_add_output_arg(built, &y_shape, 2, .float32) != 0 or
-            mlx.mlx_fast_metal_kernel_config_set_grid(built, @intCast(tg), @intCast(H), 1) != 0 or
-            mlx.mlx_fast_metal_kernel_config_set_thread_group(built, @intCast(tg), 1, 1) != 0 or
-            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(built, "H", @intCast(H)) != 0 or
-            mlx.mlx_fast_metal_kernel_config_add_template_arg_int(built, "TG", @intCast(tg)) != 0)
-        {
-            _ = mlx.mlx_fast_metal_kernel_config_free(built);
-            return null;
-        }
-        // rotate a slot (frees the evicted config — never one in flight:
-        // apply consumes the config synchronously at graph-build time)
-        if (sink_sm_cfg_cache[sink_sm_cfg_next]) |old| _ = mlx.mlx_fast_metal_kernel_config_free(old.cfg);
-        sink_sm_cfg_cache[sink_sm_cfg_next] = .{ .key = key, .cfg = built };
-        sink_sm_cfg_next = (sink_sm_cfg_next + 1) % sink_sm_cfg_cache.len;
-        cfg = built;
-    }
-    const consts = [_]f32{scale};
-    const cshape = [_]c_int{1};
-    const consts_g = uploadF32(&consts, &cshape);
-    defer _ = mlx.mlx_array_free(consts_g);
-    const tk_val = [_]i32{@intCast(TK)};
-    const tk_g = mlx.mlx_array_new_data(&tk_val, &cshape, 1, .int32);
-    defer _ = mlx.mlx_array_free(tk_g);
-    const inputs_arr = [_]mlx.mlx_array{ scores0, sink, consts_g, tk_g };
-    const inputs_vec = mlx.mlx_vector_array_new_data(&inputs_arr, inputs_arr.len);
-    defer _ = mlx.mlx_vector_array_free(inputs_vec);
-    var outputs_vec = mlx.mlx_vector_array_new();
-    defer _ = mlx.mlx_vector_array_free(outputs_vec);
-    try mlx.check(mlx.mlx_fast_metal_kernel_apply(&outputs_vec, kernel, inputs_vec, cfg, m.s));
-    if (mlx.mlx_vector_array_size(outputs_vec) != 1) return error.MetalKernelBadOutputCount;
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_vector_array_get(&out, outputs_vec, 0));
-    sink_softmax_hits += 1;
-    if (!sink_softmax_logged) {
-        sink_softmax_logged = true;
-        log.info("dsv4: fused sink-softmax kernel engaged\n", .{});
-    }
-    return out;
-}
-
 pub const DEC_CHAIN_KERNEL_SOURCE = kernelSource("plugins/deepseek_v4/kernels/dec_chain.metal");
 
 var dec_chain_obj: ?mlx.mlx_fast_metal_kernel = null;
@@ -7328,7 +6874,7 @@ fn attentionBatch(m: *Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4DecodeState,
                 try emitWindowsGpu(m, &h.idx_comp.?, &ls.idx_comp.?, &ls.idx_gpu, comp_in, 2 * cdd, base, C, 4, true, fr, alloc);
             errdefer _ = mlx.mlx_array_free(comp_in);
             try deferred.append(alloc, .{ .li = li, .arr = comp_in });
-        } else if (closes or !compDeferEnabled()) {
+        } else if (closes) {
             defer _ = mlx.mlx_array_free(comp_in);
             var sclk: DsparkClock = if (m.ds_prof != null) DsparkClock.init() else undefined;
             var cclk: DsparkClock = if (dsv4TraceEnabled()) DsparkClock.init() else undefined;
@@ -7634,25 +7180,10 @@ fn attentionBatch(m: *Dsv4Model, alloc: std.mem.Allocator, st: *Dsv4DecodeState,
 /// (C·(window+idx_topk)·head_dim f32 ≈ 670 MB at 512 on the real geometry).
 const PREFILL_SUB: usize = 512;
 
-/// Prefill sub-chunk size, env-tunable for A/B (`MLX_SERVE_DSV4_PREFILL_SUB`;
-/// default `PREFILL_SUB`). Bigger chunks raise the per-expert M of the
-/// sorted MoE gather (small-M qmm efficiency) at the cost of larger
-/// attention-gather transients. Cached once per process.
-var prefill_sub_state: ?usize = null;
-/// Pub: server.zig's prefill memory guard bills the SUB-chunk this arch
-/// actually forwards (dsv4PrefillMemoryNeeded), and it must read the same
-/// env-overridable value the engine runs — billing a stale constant while
-/// MLX_SERVE_DSV4_PREFILL_SUB raises the real width under-bills into an
-/// uncatchable Metal OOM.
+/// Prefill sub-chunk size. Bigger chunks raise the per-expert M of the sorted MoE gather (small-M qmm efficiency)
+/// at the cost of larger attention-gather transients; the prefill memory guard bills this same width.
 pub fn prefillSub() usize {
-    if (prefill_sub_state) |v| return v;
-    var v: usize = PREFILL_SUB;
-    if (std.c.getenv("MLX_SERVE_DSV4_PREFILL_SUB")) |e| {
-        const parsed = std.fmt.parseInt(usize, std.mem.span(e), 10) catch PREFILL_SUB;
-        if (parsed > 0) v = parsed;
-    }
-    prefill_sub_state = v;
-    return v;
+    return PREFILL_SUB;
 }
 
 /// Prefill transients (the [C, tk, hd] gathers) never repeat a shape across
@@ -9390,148 +8921,6 @@ test "dsv4: fused decode-chain kernel matches the composed q/kv/idx/o chains (GP
     }
 }
 
-test "dsv4: fused MoE gate+up kernel is no worse than the composed gathers (GPU)" {
-    if (mlx.noGpuBackend()) return;
-    const s = mlx.gpuStream();
-    defer _ = mlx.mlx_stream_free(s);
-    const alloc = testing.allocator;
-    const E: usize = 8;
-    const N: usize = 32;
-    const K: usize = 128;
-    const k: usize = 6;
-    const Case = struct { bits: u32, gs: u32, limit: f32 };
-    const cases = [_]Case{
-        .{ .bits = 2, .gs = 64, .limit = 10.0 }, // real trunk experts
-        .{ .bits = 8, .gs = 32, .limit = 1.0 }, // mini shape, clip engaged
-        .{ .bits = 4, .gs = 32, .limit = 10.0 },
-    };
-    var rng = std.Random.DefaultPrng.init(31);
-    for (cases) |tc| {
-        var m: Dsv4Model = undefined;
-        m.s = s;
-        m.swiglu_limit = tc.limit;
-
-        var banks: [2]Q = undefined;
-        var deq_host: [2][]f32 = .{ &.{}, &.{} };
-        defer for (deq_host) |dh| alloc.free(dh);
-        for (0..2) |bi| {
-            const wf = try alloc.alloc(f32, E * N * K);
-            defer alloc.free(wf);
-            for (wf) |*v| v.* = (rng.random().float(f32) - 0.5) * 0.6;
-            const wshape = [_]c_int{ @intCast(E), @intCast(N), @intCast(K) };
-            const w32 = uploadF32(wf, &wshape);
-            defer _ = mlx.mlx_array_free(w32);
-            var wb = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(wb);
-            try mlx.check(mlx.mlx_astype(&wb, w32, .bfloat16, s));
-            var qv = mlx.mlx_vector_array_new();
-            defer _ = mlx.mlx_vector_array_free(qv);
-            const empty = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(empty);
-            try mlx.check(mlx.mlx_quantize(&qv, wb, mlx.mlx_optional_int.some(@intCast(tc.gs)), mlx.mlx_optional_int.some(@intCast(tc.bits)), "affine", empty, s));
-            var wq = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(&wq, qv, 0));
-            var sc = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(&sc, qv, 1));
-            var bs = mlx.mlx_array_new();
-            try mlx.check(mlx.mlx_vector_array_get(&bs, qv, 2));
-            banks[bi] = .{ .w = wq, .s = sc, .b = bs, .qp = .{ .bits = tc.bits, .group_size = tc.gs } };
-            // dequant ground-truth operand (widened to f32 for the host read)
-            var deq = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(deq);
-            try mlx.check(mlx.mlx_dequantize(&deq, wq, sc, bs, mlx.mlx_optional_int.some(@intCast(tc.gs)), mlx.mlx_optional_int.some(@intCast(tc.bits)), "affine", empty, mlx.mlx_optional_dtype{}, s));
-            var deq32 = mlx.mlx_array_new();
-            defer _ = mlx.mlx_array_free(deq32);
-            try mlx.check(mlx.mlx_astype(&deq32, deq, .float32, s));
-            deq_host[bi] = try toHostF32(alloc, deq32, E * N * K, s);
-        }
-        defer for (&banks) |*b| {
-            _ = mlx.mlx_array_free(b.w);
-            _ = mlx.mlx_array_free(b.s);
-            _ = mlx.mlx_array_free(b.b);
-        };
-
-        const xf = try alloc.alloc(f32, K);
-        defer alloc.free(xf);
-        for (xf) |*v| v.* = (rng.random().float(f32) - 0.5) * 3.0;
-        const xshape = [_]c_int{ 1, 1, 1, @intCast(K) };
-        const x32 = uploadF32(xf, &xshape);
-        defer _ = mlx.mlx_array_free(x32);
-        var xe = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(xe);
-        try mlx.check(mlx.mlx_astype(&xe, x32, .bfloat16, s));
-        // x as the kernel sees it (bf16-rounded), for the f64 ground truth
-        const xh = try toHostF32(alloc, xe, K, s);
-        defer alloc.free(xh);
-
-        const inds = [_]i32{ 0, 3, 3, 7, 1, 0 }; // duplicates included
-        const ishape = [_]c_int{ 1, @intCast(k) };
-        const ind = mlx.mlx_array_new_data(&inds, &ishape, 2, .int32);
-        defer _ = mlx.mlx_array_free(ind);
-
-        // composed reference chain (the decode branch verbatim)
-        const gate_arr = try gatherQmmE(&banks[0], xe, ind, s);
-        defer _ = mlx.mlx_array_free(gate_arr);
-        const up_arr = try gatherQmmE(&banks[1], xe, ind, s);
-        defer _ = mlx.mlx_array_free(up_arr);
-        const act_c = try clippedSwigluG(gate_arr, up_arr, tc.limit, s);
-        defer _ = mlx.mlx_array_free(act_c);
-        // the fused arm must reproduce the composed act SHAPE exactly — the
-        // down gather consumes it as its x operand
-        try mlx.check(mlx.mlx_array_eval(act_c));
-        {
-            const nd = mlx.mlx_array_ndim(act_c);
-            const sh = mlx.mlx_array_shape(act_c);
-            const want_sh = [_]c_int{ 1, @intCast(k), 1, @intCast(N) };
-            try testing.expectEqual(@as(usize, 4), nd);
-            for (0..4) |i| try testing.expectEqual(want_sh[i], sh[i]);
-        }
-
-        moeGateUpSetForTest(true);
-        const hits0 = moe_gateup_hits;
-        const act_f = (try moeGateUpFused(&m, xe, &banks[0], &banks[1], ind, k)) orelse {
-            moeGateUpSetForTest(null);
-            std.debug.print("moe gate+up DECLINED bits={d} gs={d}\n", .{ tc.bits, tc.gs });
-            try testing.expect(false);
-            unreachable;
-        };
-        defer _ = mlx.mlx_array_free(act_f);
-        moeGateUpSetForTest(null);
-        try testing.expect(moe_gateup_hits > hits0);
-
-        const got_c = try toHostF32(alloc, act_c, k * N, s);
-        defer alloc.free(got_c);
-        const got_f = try toHostF32(alloc, act_f, k * N, s);
-        defer alloc.free(got_f);
-
-        // f64 ground truth from the dequantized banks + bf16-rounded x
-        var err_c: f64 = 0;
-        var err_f: f64 = 0;
-        for (0..k) |e| {
-            const eid: usize = @intCast(inds[e]);
-            for (0..N) |n| {
-                var g: f64 = 0;
-                var u: f64 = 0;
-                for (0..K) |j| {
-                    g += @as(f64, xh[j]) * deq_host[0][(eid * N + n) * K + j];
-                    u += @as(f64, xh[j]) * deq_host[1][(eid * N + n) * K + j];
-                }
-                const gc = @min(g, @as(f64, tc.limit));
-                const uc = std.math.clamp(u, -@as(f64, tc.limit), @as(f64, tc.limit));
-                const truth = (gc / (1.0 + @exp(-gc))) * uc;
-                const i = e * N + n;
-                try testing.expect(std.math.isFinite(got_c[i]));
-                try testing.expect(std.math.isFinite(got_f[i]));
-                err_c = @max(err_c, @abs(@as(f64, got_c[i]) - truth));
-                err_f = @max(err_f, @abs(@as(f64, got_f[i]) - truth));
-            }
-        }
-        std.debug.print("dsv4 moe gate+up bits={d}: err composed={e:.3} fused={e:.3}\n", .{ tc.bits, err_c, err_f });
-        // no-worse-than-reference (house rule: never kernel-vs-kernel exact)
-        try testing.expect(err_f <= err_c * 1.25 + 1e-3);
-    }
-}
-
 test "dsv4: gs-128 expert pack resolves per-weight and qmm matches the dequant reference" {
     if (mlx.noGpuBackend()) return;
     const s = mlx.gpuStream();
@@ -9618,7 +9007,6 @@ test "dsv4: boundary prefetch drains older pending rows a token early (DSV4_MINI
     // boundary token's blocking drain shrinks to the latest token's rows.
     const path_z = std.c.getenv("DSV4_MINI") orelse return;
     if (mlx.noGpuBackend()) return;
-    if (!drainPrefetchEnabled()) return; // fallback-arm runs assert nothing here
     const path = std.mem.span(path_z);
     const allocator = testing.allocator;
 
@@ -9678,74 +9066,6 @@ test "dsv4: boundary prefetch drains older pending rows a token early (DSV4_MINI
     }
     try drainPending(&mdl, &st);
     try testing.expectEqual(@as(usize, 0), st.pending.items.len);
-}
-
-test "dsv4: fused sink-softmax kernel matches the composed scale/concat/softmax/slice (GPU)" {
-    if (mlx.noGpuBackend()) return;
-    const s = mlx.gpuStream();
-    defer _ = mlx.mlx_stream_free(s);
-    const alloc = testing.allocator;
-    const Case = struct { nh: usize, tk: usize };
-    const cases = [_]Case{
-        .{ .nh = 64, .tk = 640 }, // real steady state (window 128 + top-512)
-        .{ .nh = 64, .tk = 128 }, // ratio-128 layer / pure sliding
-        .{ .nh = 4, .tk = 7 }, // mini early-ramp shape
-    };
-    var rng = std.Random.DefaultPrng.init(53);
-    for (cases) |tc| {
-        var m: Dsv4Model = undefined;
-        m.s = s;
-        const hd: usize = 512;
-        const scale: f32 = @floatCast(1.0 / @sqrt(@as(f64, @floatFromInt(hd))));
-        const sc_h = try alloc.alloc(f32, tc.nh * tc.tk);
-        defer alloc.free(sc_h);
-        for (sc_h) |*v| v.* = (rng.random().float(f32) - 0.5) * 40.0;
-        const sshape = [_]c_int{ @intCast(tc.nh), @intCast(tc.tk) };
-        const scores0 = uploadF32(sc_h, &sshape);
-        defer _ = mlx.mlx_array_free(scores0);
-        const sink_h = try alloc.alloc(f32, tc.nh);
-        defer alloc.free(sink_h);
-        for (sink_h) |*v| v.* = (rng.random().float(f32) - 0.5) * 6.0;
-        const kshape = [_]c_int{ @intCast(tc.nh), 1 };
-        const sink_g = uploadF32(sink_h, &kshape);
-        defer _ = mlx.mlx_array_free(sink_g);
-
-        // composed reference: the attentionDecodeGpu chain verbatim
-        const scale_arr = mlx.mlx_array_new_float(scale);
-        defer _ = mlx.mlx_array_free(scale_arr);
-        const scaled = try gpuOp2(mlx.mlx_multiply, scores0, scale_arr, s);
-        defer _ = mlx.mlx_array_free(scaled);
-        const with_sink = try gpuConcat2(scaled, sink_g, 1, s);
-        defer _ = mlx.mlx_array_free(with_sink);
-        var probs = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(probs);
-        try mlx.check(mlx.mlx_softmax_axis(&probs, with_sink, -1, true, s));
-        const want_arr = try gpuSliceCols(probs, tc.nh, 0, tc.tk, s);
-        defer _ = mlx.mlx_array_free(want_arr);
-
-        sinkSoftmaxSetForTest(true);
-        const hits0 = sink_softmax_hits;
-        const got_arr = (try sinkSoftmaxKernel(&m, scores0, sink_g, tc.nh, tc.tk, scale)) orelse {
-            sinkSoftmaxSetForTest(null);
-            std.debug.print("sink-softmax DECLINED nh={d} tk={d}\n", .{ tc.nh, tc.tk });
-            try testing.expect(false);
-            unreachable;
-        };
-        defer _ = mlx.mlx_array_free(got_arr);
-        sinkSoftmaxSetForTest(null);
-        try testing.expect(sink_softmax_hits > hits0);
-
-        const want = try toHostF32(alloc, want_arr, tc.nh * tc.tk, s);
-        defer alloc.free(want);
-        const got = try toHostF32(alloc, got_arr, tc.nh * tc.tk, s);
-        defer alloc.free(got);
-        for (want, got, 0..) |w, g, i| {
-            if (!(@abs(w - g) <= 1e-5)) {
-                std.debug.print("sink-softmax mismatch nh={d} tk={d} i={d}: composed={e} kernel={e}\n", .{ tc.nh, tc.tk, i, w, g });
-                try testing.expect(false);
-            }
-        }
-    }
 }
 
 test "dsv4: comp_in decode requant rides --decode-attn-quant (DSV4_MINI)" {

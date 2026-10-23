@@ -1353,7 +1353,6 @@ pub fn init(gpa: std.mem.Allocator, cfg: *const ModelConfig, w: *model.Weights, 
         };
         m.n_mtp = n_stages;
         m.ds_block = cfg.dsv4_dspark_block_size;
-        m.ds_conf_thr = dsv4.dsparkConfThreshold();
     }
     if (!worker) if (cfg.pack_dir) |dir| try initEngram(m, w, dir);
     {
