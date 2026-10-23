@@ -13,6 +13,11 @@ mlx-lm's layout (`tests/convert_mimo_v2.py`, mlx-community's mxfp4-q8 packs).
   `fixtures/*.tape` (`both.Both.replay`).
 - `mtp_head.zig` (+ `mtp_head_test.zig`): the MTP heads behind `SpecHooks.head`, bit-equal to the recorded legacy heads.
 - `fixtures.zig`: the served MiMo against `modeling_mimo_v2.py` (model-gated).
+- `streamed_test.zig`: the experts read from an `experts.bin` (the stream packs' MXFP4 bank) through the MoE block's
+  `Routed` hook (`moe.Moe.Weights.streamed`), bit-equal to the in-memory banks (served logits and the block alone,
+  evictions included); at the release's 4096 / 2048 the hook's decode MoE against the stream module's own
+  (`stream/dupes.zig`) and fp32 truth: rounding apart, the stream closer (it combines in f32, the block's routing
+  weights are bf16).
 - `dec_attn.zig`: the split-K kernel's names (`sdk/blocks/attention/dec_attn.zig`) for gpt_oss.
 
 ## Facts the table declares

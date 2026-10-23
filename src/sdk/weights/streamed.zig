@@ -1,8 +1,8 @@
 //! The streamed weight source: routed experts read from an SSD bank (`experts.bin` + `expert-manifest.json`) into slot
 //! rows, for a trunk whose MoE reads them through `Routed`. The streamer is mlx-stream's (`streamed/expert/`,
-//! `streamed/sdk_ext/expert/`, the read pool in `streamed/csrc/`; module `mlx_stream`). Banks: DeepSeek-V4.1's MXFP4
-//! experts and its EXL3 repack (`plugins/deepseek_v41/stream/streamed.zig`). Without mlx-stream, or without a bank,
-//! opening refuses by name.
+//! `streamed/sdk_ext/expert/`, the read pool in `streamed/csrc/`; module `mlx_stream`). Banks: the MXFP4 record bank
+//! (MiMo's and DeepSeek-V4.1's experts) and DeepSeek-V4.1's EXL3 repack (`plugins/deepseek_v41/stream/streamed.zig`).
+//! Without mlx-stream, or without a bank, opening refuses by name.
 
 const std = @import("std");
 const build_options = @import("build_options");
