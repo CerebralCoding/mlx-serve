@@ -2437,7 +2437,7 @@ fn toySwiglu(seed: u64, s: S) !SwiGLU {
 }
 
 test "krea SwiGLU: an adapter on the fused int8 gate/up equals the same adapter on the separate projections" {
-    if (!@import("../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const prev = w8a8.enabled;
     defer w8a8.enabled = prev;
     w8a8.enabled = true;
@@ -2576,7 +2576,7 @@ fn kreaProbe(io: std.Io, a: std.mem.Allocator, s: S, model_dir: []const u8, resi
 // The lossy int8 route against the same pack's packed forward (no reference fixture
 // needed). KREA_TEST_MODEL.
 test "krea DiT: the w8a8 route stays within its bar of the packed forward" {
-    if (!@import("../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const model_dir = std.mem.span(std.c.getenv("KREA_TEST_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

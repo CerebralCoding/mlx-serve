@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
 const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const chat_mod = @import("../chat/chat.zig");
@@ -969,7 +969,7 @@ fn handleNonStreamingGeneration(
     cache_key: u64,
     mrope: MropeData,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?kv_quant.KVQuantConfig,
     kv_attn_explicit: ?bool,
     /// Iteration 1: tokenize_ns from the parent handleChatCompletions, so
     /// the non-streaming chat response carries `timings.tokenize_ms`.

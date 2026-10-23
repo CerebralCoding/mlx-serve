@@ -6,6 +6,10 @@ const kev = @import("../kev/kev.zig");
 const model = @import("../../engines/mlx/model.zig");
 const tokenizer = @import("../../host/tokenizer/tokenizer.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
+const cache_mod = @import("../../engines/mlx/kv/cache.zig");
+const entry_mod = @import("../../engines/mlx/ssm/entry.zig");
+const history = @import("../qwen4_exp/qsa/history.zig");
+const params = @import("../../sdk/quant/params.zig");
 const chat = @import("../../host/chat/chat.zig");
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const mrope = @import("../../sdk/vision/mrope.zig");
@@ -725,15 +729,15 @@ pub const Engine = struct {
             for (0..3) |axis| @memcpy(positions[axis * ids.len ..][0..ids.len], ri.pos[axis]);
             delta = ri.delta;
         }
-        var cache = try transformer.KVCache.init(a, self.config.num_hidden_layers);
+        var cache = try cache_mod.KVCache.init(a, self.config.num_hidden_layers);
         defer cache.deinit();
-        const entries = try a.alloc(transformer.SSMCacheEntry, self.config.num_hidden_layers);
+        const entries = try a.alloc(entry_mod.SSMCacheEntry, self.config.num_hidden_layers);
         for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
         defer {
             for (entries) |*e| {
                 free(e.conv_state);
                 free(e.ssm_state);
-                transformer.ssmFreeQsaState(e);
+                history.ssmFreeQsaState(e);
             }
             a.free(entries);
         }
@@ -764,7 +768,7 @@ pub const Engine = struct {
         if (self.xfm.lm_head_s.ctx == null) return w;
         const scales = try o.own(try laya.take(self.xfm.lm_head_s, index, 0, o.s));
         const biases = if (self.xfm.lm_head_b.ctx != null) try o.own(try laya.take(self.xfm.lm_head_b, index, 0, o.s)) else A{};
-        const qp = transformer.computeQuantParams(&self.config, self.xfm.lm_head_w, self.xfm.lm_head_s, self.config.hidden_size);
+        const qp = params.computeQuantParams(&self.config, self.xfm.lm_head_w, self.xfm.lm_head_s, self.config.hidden_size);
         var out = mlx.mlx_array_new();
         errdefer free(out);
         try mlx.check(mlx.mlx_dequantize(&out, w, scales, biases, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), .{}, .{ .value = .bfloat16, .has_value = true }, o.s));

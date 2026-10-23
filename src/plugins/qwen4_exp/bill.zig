@@ -4,6 +4,9 @@
 const std = @import("std");
 const abi = @import("../../abi/plugin.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const gather_mod = @import("qsa/gather.zig");
+const score_mod = @import("qsa/score.zig");
+const attn256 = @import("../../sdk/blocks/attention/attn256.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const qconfig = @import("config.zig");
 const toModelConfig = @import("model_config.zig").toModelConfig;
@@ -26,8 +29,8 @@ pub fn qsaMaskBytes(config: *const model_mod.ModelConfig, fwd: u64, kv: u64) u64
     if (config.indexer_budget == 0) return 0;
     // Prefill widths gather by block index (row-chunked score sheet, no
     // [S, kv] mask); decode/verify widths still build the dense mask.
-    if (fwd >= transformer_mod.FUSED256_MIN_Q_LEN and transformer_mod.qsaGatherEnabled())
-        return transformer_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio, config.indexer_head_dim);
+    if (fwd >= attn256.FUSED256_MIN_Q_LEN and gather_mod.qsaGatherEnabled())
+        return score_mod.qsaPrefillTransientBytes(config.indexer_n_heads, fwd, kv, config.indexer_compress_ratio, config.indexer_head_dim);
     return QSA_MASK_BYTES_PER_KEY * fwd * kv * 5 / 4;
 }
 
@@ -116,12 +119,12 @@ test "qsaMaskBytes: a qwen4_exp twin bills the QSA mask and steps a rung the qwe
     const gathered_composed = qsaMaskBytes(&q4, 4096, 250_000);
     try t.expect(gathered_composed > 0);
     try t.expect(gathered_composed < 4 * 4096 * 250_000);
-    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_composed);
+    try t.expectEqual(score_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_composed);
     transformer_mod.vqmm_nax_probe_override = null;
     transformer_mod.qsa_score_fused_override = true;
     const gathered_fused = qsaMaskBytes(&q4, 4096, 250_000);
-    try t.expectEqual(transformer_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_fused);
-    if (transformer_mod.qsaScoreFusedActive()) {
+    try t.expectEqual(score_mod.qsaPrefillTransientBytes(4, 4096, 250_000, 4, 128), gathered_fused);
+    if (score_mod.qsaScoreFusedActive()) {
         try t.expect(gathered_fused < gathered_composed);
     }
     transformer_mod.qsa_score_fused_override = false;

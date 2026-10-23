@@ -260,17 +260,17 @@ pub var global_scheduler: ?*scheduler_mod.Scheduler = null;
 /// The boot's parsed `--kv-quant`, published by `serve()` before `Scheduler.init` so a
 /// load-time bill sees it (the scheduler does not exist yet during the load; asking it billed
 /// the SSD-first session at bf16, ~8.6 GB of idle allowance lost at 786k).
-pub var configured_kv_quant: ?transformer_mod.KVQuantConfig = null;
+pub var configured_kv_quant: ?kv_quant_mod.KVQuantConfig = null;
 
 /// The process-wide kv-quant config at any point: the scheduler's once it exists, the boot's
 /// published value during the load, dense when no flag was given.
-fn configuredKvQuant() transformer_mod.KVQuantConfig {
+fn configuredKvQuant() kv_quant_mod.KVQuantConfig {
     if (global_scheduler) |sch| return sch.kv_quant_config;
-    return configured_kv_quant orelse transformer_mod.KVQuantConfig.dense;
+    return configured_kv_quant orelse kv_quant_mod.KVQuantConfig.dense;
 }
 
 /// The width THIS model stores at: its `model-settings.json` override, else the process default.
-pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) transformer_mod.KVQuantConfig {
+pub fn configuredKvQuantFor(config: *const model_mod.ModelConfig) kv_quant_mod.KVQuantConfig {
     return config.kv_quant_override orelse configuredKvQuant();
 }
 

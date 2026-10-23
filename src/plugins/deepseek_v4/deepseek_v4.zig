@@ -29,10 +29,12 @@ const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const model = @import("../../engines/mlx/model.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
+const decode_attn_quant = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
+const params_mod = @import("../../sdk/quant/params.zig");
 const log = @import("../../host/log.zig");
 
 const ModelConfig = model.ModelConfig;
-const QuantParams = transformer.QuantParams;
+const QuantParams = params_mod.QuantParams;
 
 /// Quantized linear: non-owning handles into the Weights map + solved params.
 pub const Q = struct {
@@ -160,7 +162,7 @@ fn getQ(cfg: *const ModelConfig, w: *const model.Weights, buf: *NameBuf, in_dim:
     const wt = try getReq(w, buf, base ++ ".weight", args);
     const sc = try getReq(w, buf, base ++ ".scales", args);
     const bs = try getReq(w, buf, base ++ ".biases", args);
-    return .{ .w = wt, .s = sc, .b = bs, .qp = transformer.computeQuantParams(cfg, wt, sc, in_dim) };
+    return .{ .w = wt, .s = sc, .b = bs, .qp = params_mod.computeQuantParams(cfg, wt, sc, in_dim) };
 }
 
 fn getCompressor(w: *const model.Weights, buf: *NameBuf, comptime pfx: []const u8, args: anytype) !CompressorW {
@@ -1063,7 +1065,7 @@ pub fn initModel(gpa: std.mem.Allocator, cfg: *const ModelConfig, dw: Dsv4Weight
     // only — the CPU stream is the host-reference/test path whose strict
     // gates assume the dense operand.
     var comp_in_q: []?CompInQ = &.{};
-    if (transformer.decodeAttnQuantExplicit() and mlx.streamIsGpu(s)) {
+    if (decode_attn_quant.decodeAttnQuantExplicit() and mlx.streamIsGpu(s)) {
         comp_in_q = try a.alloc(?CompInQ, dw.layers.len);
         var q_bytes: usize = 0;
         for (comp_in_q, hl) |*slot, *h| {
@@ -1642,7 +1644,7 @@ pub fn decChainSetForTest(v: ?bool) void {
 
 /// comp_in decode-side int8 requant engagement counter — the serving arm is
 /// gated by the user-facing `--decode-attn-quant` config flag
-/// (`transformer.decodeAttnQuantEnabled`), same contract as the laguna
+/// (`decode_attn_quant.decodeAttnQuantEnabled`), same contract as the laguna
 /// attention side copies: decode/verify widths only, prefill keeps dense.
 var comp_in_q_hits: usize = 0;
 var comp_in_q_logged: bool = false;
@@ -8949,7 +8951,7 @@ test "dsv4: gs-128 expert pack resolves per-weight and qmm matches the dequant r
         defer _ = mlx.mlx_array_free(bs);
         try mlx.check(mlx.mlx_vector_array_get(&bs, qv, 2));
 
-        const qp = transformer.computeQuantParams(&cfg, wq, sc, @intCast(K));
+        const qp = params_mod.computeQuantParams(&cfg, wq, sc, @intCast(K));
         try testing.expectEqual(bits, qp.bits);
         try testing.expectEqual(@as(u32, 128), qp.group_size);
 

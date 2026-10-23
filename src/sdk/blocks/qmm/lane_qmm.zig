@@ -460,7 +460,7 @@ fn randBf16(shape: []const c_int, scale: f32, seed: u64, s: mlx.mlx_stream) !mlx
 }
 
 test "lane_qmm: prompt-width calls on a tiled weight leave the plan caches at their lane-width size" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     defer release(0);
     const wf = try randBf16(&.{ 256, 1024 }, 0.02, 300, s);
@@ -493,7 +493,7 @@ test "lane_qmm: prompt-width calls on a tiled weight leave the plan caches at th
 }
 
 test "lane_qmm: every row of an R-row call equals its one-row call bit for bit up to 128 rows, at 4, 5, 6 and 8 bits, tiled in place or not, and the product is the fp32 one" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     errdefer {
         var buf: [512]u8 = undefined;
@@ -641,7 +641,7 @@ fn rowsOf(a: mlx.mlx_array, r0: c_int, rows: c_int, s: mlx.mlx_stream) !mlx.mlx_
 }
 
 test "lane_qmm: past 128 rows a weight tiled in place gives MLX's qmm bits at 4, 5, 6 and 8 bits, whole and for every row view" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     defer release(0);
     // A joined GDN in-projection in miniature (32-column tiles, views of 48 rows
@@ -705,7 +705,7 @@ test "lane_qmm: past 128 rows a weight tiled in place gives MLX's qmm bits at 4,
 }
 
 test "lane_qmm: releasing one model's tiled weights keeps another's" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const a = try quantized(256, 512, 500, s);
     defer for (a) |h| {

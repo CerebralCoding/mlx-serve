@@ -340,7 +340,7 @@ fn qmmImpl(
     s: mlx.mlx_stream,
 ) !?mlx.mlx_array {
     if (bits != 2 or group_size != GS or bi.ctx == null or !mlx.streamIsGpu(s)) return null;
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return null;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .float16 and dt != .bfloat16) return null;
     const xs = mlx.getShape(x);
@@ -415,7 +415,7 @@ fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s: mlx
 // NaN/Inf, and the shape/dtype contract preserved.
 /// The route runs only on a NAX GPU; elsewhere it declines by design.
 fn requireNax() !void {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
 }
 
 /// A kernel failure is its test's: name it and drop its latch, or the next test inherits it.

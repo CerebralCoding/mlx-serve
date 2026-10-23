@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
 const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const chat_mod = @import("../chat/chat.zig");
@@ -870,7 +870,7 @@ fn handleAnthropicNonStreaming(
     mrope: MropeData,
     cache_key: u64,
     /// Wave 1.A: per-request KV-quant override.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?kv_quant.KVQuantConfig,
     kv_attn_explicit: ?bool,
     /// Iteration 1 instrumentation: nanoseconds of render+tokenize measured
     /// by the parent handleAnthropicMessages. Threaded through so the

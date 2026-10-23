@@ -20,11 +20,13 @@ const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const cache_mod = @import("../../engines/mlx/kv/cache.zig");
+const params_mod = @import("../../sdk/quant/params.zig");
 
 const Weights = model_mod.Weights;
 const ModelConfig = model_mod.ModelConfig;
 const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
+const KVCache = cache_mod.KVCache;
 
 /// `model_type` strings that identify a Gemma 4 assistant drafter
 /// checkpoint. `gemma4_assistant` is the original per-target flavor
@@ -537,7 +539,7 @@ fn ownWeightDense(w: *const Weights, key: []const u8, in_dim: u32, s: mlx.mlx_st
         log.err("[drafter] non-affine quantized drafter checkpoint not supported ({s})\n", .{key});
         return error.UnsupportedDrafterQuant;
     }
-    const qp = transformer_mod.affineParamsFromGeometry(raw, scales, in_dim) orelse {
+    const qp = params_mod.affineParamsFromGeometry(raw, scales, in_dim) orelse {
         log.err("[drafter] unsupported quantized geometry for {s} (in_dim={d})\n", .{ key, in_dim });
         return error.UnsupportedDrafterQuant;
     };
@@ -875,7 +877,7 @@ fn embedTableRow(
         try mlx.check(mlx.mlx_take_axis(&tb, emb_b, id_arr, 0, s));
     }
 
-    const emb_qp = transformer_mod.computeQuantParams(config, emb_w, emb_s, config.hidden_size);
+    const emb_qp = params_mod.computeQuantParams(config, emb_w, emb_s, config.hidden_size);
     var dequant = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dequant);
     try mlx.check(mlx.mlx_dequantize(

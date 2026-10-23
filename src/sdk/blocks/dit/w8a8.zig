@@ -36,7 +36,7 @@ pub var nax_override: ?bool = null;
 
 /// Whether the int8 kernels can run here: the matrix unit they are written for.
 pub fn nax() bool {
-    return nax_override orelse @import("../../../engines/mlx/transformer.zig").naxAvailable();
+    return nax_override orelse @import("../../../mlx/device.zig").naxAvailable();
 }
 
 /// Whether this linear can take the route: NAX present, K a multiple of the
@@ -254,8 +254,8 @@ pub const Overlay = struct {
     pub fn convert(self: *Overlay, a: std.mem.Allocator, weights: *std.StringHashMap(mlx.mlx_array), probe: Probe, s: mlx.mlx_stream) !u32 {
         var kb: [2][600]u8 = undefined;
         const pw = weights.get(try std.fmt.bufPrint(&kb[0], "{s}.weight", .{probe.base})) orelse return 0;
-        const params: ?@import("../../../engines/mlx/transformer.zig").QuantParams = if (weights.get(try std.fmt.bufPrint(&kb[1], "{s}.scales", .{probe.base}))) |sc|
-            @import("../../../engines/mlx/transformer.zig").affineParamsFromGeometry(pw, sc, probe.in_features) orelse return 0
+        const params: ?@import("../../quant/params.zig").QuantParams = if (weights.get(try std.fmt.bufPrint(&kb[1], "{s}.scales", .{probe.base}))) |sc|
+            @import("../../quant/params.zig").affineParamsFromGeometry(pw, sc, probe.in_features) orelse return 0
         else
             null;
         var todo: std.ArrayList([]u8) = .empty;
@@ -276,7 +276,7 @@ pub const Overlay = struct {
         return n;
     }
 
-    fn convertOne(self: *Overlay, a: std.mem.Allocator, weights: *std.StringHashMap(mlx.mlx_array), base: []const u8, params: ?@import("../../../engines/mlx/transformer.zig").QuantParams, s: mlx.mlx_stream) !bool {
+    fn convertOne(self: *Overlay, a: std.mem.Allocator, weights: *std.StringHashMap(mlx.mlx_array), base: []const u8, params: ?@import("../../quant/params.zig").QuantParams, s: mlx.mlx_stream) !bool {
         var kb: [3][600]u8 = undefined;
         const keys = [3][]const u8{
             try std.fmt.bufPrint(&kb[0], "{s}.weight", .{base}),
@@ -766,7 +766,7 @@ fn outlierInput(rows: c_int, k: c_int, seed: u64, s: mlx.mlx_stream) !mlx.mlx_ar
 }
 
 test "w8a8 quantize kernel equals the rotate-then-quantize reference" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const m: c_int = 37;
@@ -823,7 +823,7 @@ fn linearError(m: c_int, k: c_int, n: c_int, s: mlx.mlx_stream) !f32 {
 }
 
 test "w8a8 linear matches the dense matmul, edge tiles included" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     // M and N off both tile shapes (tall below 8192 rows, wide above) so the guarded edge store runs.
@@ -832,14 +832,14 @@ test "w8a8 linear matches the dense matmul, edge tiles included" {
 }
 
 test "w8a8 serves any row count: no floor, so a released original is never needed" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     for ([_]c_int{ 1, 3, 19 }) |m| try testing.expect(try linearError(m, 512, 128, s) < 0.02);
 }
 
 test "w8a8 sibling projections share one quantization" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const x = try outlierInput(256, 512, 4, s);
@@ -884,7 +884,7 @@ fn denseRef(x: mlx.mlx_array, w: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_arra
 }
 
 test "w8a8 interleaved gate/up GEMM equals silu(gate) * up" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const x = try outlierInput(300, 512, 6, s);
@@ -921,7 +921,7 @@ test "w8a8 interleaved gate/up GEMM equals silu(gate) * up" {
 }
 
 test "w8a8 concatenated projections equal each projection" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const x = try outlierInput(260, 256, 9, s);
@@ -949,7 +949,7 @@ test "w8a8 concatenated projections equal each projection" {
 }
 
 test "w8a8 stacked parts are views of the fused weight and forward like standalone ones" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const x = try outlierInput(300, 256, 12, s);
@@ -977,7 +977,7 @@ test "w8a8 stacked parts are views of the fused weight and forward like standalo
 }
 
 test "w8a8 pair projections equal the two standalone projections" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const x = try outlierInput(300, 512, 15, s);
@@ -1076,7 +1076,7 @@ fn putPacked(a: std.mem.Allocator, map: *std.StringHashMap(mlx.mlx_array), base:
 }
 
 test "w8a8 overlay converts the pack's own (bits, group), dense weights as they are, and frees what it replaced" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     enabled = true;
     defer enabled = false;
     const a = testing.allocator;
@@ -1128,7 +1128,7 @@ test "w8a8 overlay converts the pack's own (bits, group), dense weights as they 
 }
 
 test "w8a8 takeLinear takes a packed or a dense linear and leaves an off-route one alone" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     enabled = true;
     defer enabled = false;
     const s = mlx.mlx_default_gpu_stream_new();
@@ -1158,7 +1158,7 @@ test "w8a8 takeLinear takes a packed or a dense linear and leaves an off-route o
 }
 
 test "w8a8 serves f16 activations as they are: right answer, one quantization for sibling projections" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const xb = try outlierInput(64, 512, 2, s);

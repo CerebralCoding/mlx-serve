@@ -234,7 +234,7 @@ pub const Geometry = struct {
 pub const Arm = enum { nax, simd, gather };
 
 fn nax() bool {
-    return @import("../../engines/mlx/transformer.zig").verifyQmmNaxAvailable();
+    return @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable();
 }
 
 /// A geometry's index maps on the device, built once per generation.
@@ -709,7 +709,7 @@ test "h3 vsa kernel: a head width the kernels cannot read runs the gather arm en
 
 test "h3 vsa kernel: ubench against dense attention at a 720p clip's packed shape" {
     // Under the server's 8 GB buffer-pool cap: without it the multi-GB temporaries price low.
-    if (!@import("../../engines/mlx/transformer.zig").diagEnvValueOn(std.c.getenv("H3_VSA_UBENCH"))) return error.SkipZigTest;
+    if (!@import("../../engines/mlx/env_transformer.zig").diagEnvValueOn(std.c.getenv("H3_VSA_UBENCH"))) return error.SkipZigTest;
     var prev_limit: usize = 0;
     try mlx.check(mlx.mlx_set_cache_limit(&prev_limit, 8 << 30));
     defer _ = mlx.mlx_set_cache_limit(&prev_limit, prev_limit);

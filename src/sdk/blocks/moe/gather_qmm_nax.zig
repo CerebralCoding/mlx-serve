@@ -526,7 +526,7 @@ pub fn sortedGateUp(x: mlx.mlx_array, row_map: mlx.mlx_array, w: mlx.mlx_array, 
 
 fn requireNax() !void {
     mlx.installErrorHandler();
-    if (mlx.noGpuBackend() or !@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
 }
 
 /// A kernel failure is its test's: name it and drop its latch, or the next test inherits it.
@@ -839,7 +839,7 @@ test "segmented NAX sorted gather row map and paired SwiGLU match composed proje
         // A swiglu_limit of 1 clamps these magnitudes: the epilogue equals the clamp ops on the split gathers.
         const clamped = (try sortedGateUp(x, row_map, gw, gs, gb, uw, us, ub, ids, sigtab, 1, case.bits, case.group, case.mx, true, s)) orelse return error.KernelDeclinedTestShape;
         defer _ = mlx.mlx_array_free(clamped);
-        const clamp_ref = try @import("../../../engines/mlx/transformer.zig").clampedSwiGLU(s, plain_g, plain_u, 1.0);
+        const clamp_ref = try @import("../mlp/activations.zig").clampedSwiGLU(s, plain_g, plain_u, 1.0);
         defer _ = mlx.mlx_array_free(clamp_ref);
         try expectBitEqual(clamp_ref, clamped, s);
     }

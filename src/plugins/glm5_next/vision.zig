@@ -19,6 +19,10 @@ const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
+const weights_mod = @import("../../engines/mlx/load/weights.zig");
+const activations = @import("../../sdk/blocks/mlp/activations.zig");
+const fused_activations = @import("../../sdk/blocks/mlp/fused_activations.zig");
+const params_mod = @import("../../sdk/quant/params.zig");
 const log = @import("../../host/log.zig");
 
 /// OPENAI_CLIP_MEAN / OPENAI_CLIP_STD, the processor's normalization.
@@ -141,7 +145,7 @@ pub const Lin = struct {
     scales: mlx.mlx_array = .{ .ctx = null },
     biases: mlx.mlx_array = .{ .ctx = null },
     bias: mlx.mlx_array = .{ .ctx = null },
-    qp: ?transformer.QuantParams = null,
+    qp: ?params_mod.QuantParams = null,
 };
 
 const Block = struct {
@@ -381,8 +385,8 @@ pub const GlmVision = struct {
         defer _ = mlx.mlx_array_free(g);
         const u = try linear(x, up, self.s);
         defer _ = mlx.mlx_array_free(u);
-        const act = (try transformer.fusedClampedSwiGLU(self.s, g, u, self.limit)) orelse
-            try transformer.clampedSwiGLU(self.s, g, u, self.limit);
+        const act = (try fused_activations.fusedClampedSwiGLU(self.s, g, u, self.limit)) orelse
+            try activations.clampedSwiGLU(self.s, g, u, self.limit);
         defer _ = mlx.mlx_array_free(act);
         return linear(act, down, self.s);
     }
@@ -497,11 +501,11 @@ pub fn rope2d(x: mlx.mlx_array, cos: mlx.mlx_array, sin: mlx.mlx_array, s: mlx.m
 /// Exact `gelu`: `x * (1 + erf(x / sqrt(2))) / 2`.
 pub fn geluErf(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const dt = mlx.mlx_array_dtype(x);
-    const inv_sqrt2 = try transformer.scalarOf(0.7071067811865476, dt, s);
+    const inv_sqrt2 = try weights_mod.scalarOf(0.7071067811865476, dt, s);
     defer _ = mlx.mlx_array_free(inv_sqrt2);
-    const one = try transformer.scalarOf(1.0, dt, s);
+    const one = try weights_mod.scalarOf(1.0, dt, s);
     defer _ = mlx.mlx_array_free(one);
-    const half = try transformer.scalarOf(0.5, dt, s);
+    const half = try weights_mod.scalarOf(0.5, dt, s);
     defer _ = mlx.mlx_array_free(half);
     var t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(t);
@@ -548,7 +552,7 @@ const NameCtx = struct {
         if (self.get(fmt ++ ".scales", args)) |sc| {
             l.scales = sc;
             l.biases = self.get(fmt ++ ".biases", args) orelse .{ .ctx = null };
-            l.qp = transformer.quantParamsFromGeometry(l.w, sc, l.biases.ctx != null, in_dim) orelse {
+            l.qp = params_mod.quantParamsFromGeometry(l.w, sc, l.biases.ctx != null, in_dim) orelse {
                 log.warn("GLM VISION: unreadable quantization on {s}" ++ fmt ++ "\n", .{self.prefix} ++ args);
                 return error.InvalidVisionWeights;
             };

@@ -800,7 +800,7 @@ fn tileHeight(shape: Shape) usize {
 }
 
 fn naxAvailable() bool {
-    return @import("../../engines/mlx/transformer.zig").verifyQmmNaxAvailable();
+    return @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable();
 }
 
 fn headWidth(shape: Shape) usize {

@@ -20,7 +20,7 @@ var engaged = false;
 pub fn linear(x: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, s: mlx.mlx_stream) !?mlx.mlx_array {
     if (!mlx.streamIsGpu(s)) return null;
     // Measured on M4 (g16) and the M5 Ultra (g17); other generations keep MLX's kernel until someone measures them.
-    const g = @import("../../../engines/mlx/transformer.zig").deviceGeneration();
+    const g = @import("../../../mlx/device.zig").deviceGeneration();
     if ((g.gen != 16 and g.gen != 17) or g.phone) return null;
     const dt = mlx.mlx_array_dtype(x);
     if (dt != .bfloat16 and dt != .float16) return null;

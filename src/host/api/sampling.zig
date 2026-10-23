@@ -2,7 +2,8 @@
 //! clamps, requestEosSlice; clampMaxTokens, optSamplingRecJson; repeat penalty, kv_quant override
 
 const std = @import("std");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const kv_quant_mod = @import("../../engines/mlx/cache/kv_quant.zig");
+const cache = @import("../../engines/mlx/kv/cache.zig");
 const generation_settings = @import("generation_settings.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const log = @import("../log.zig");
@@ -239,9 +240,9 @@ fn parseJsonFloat(root: std.json.ObjectMap, key: []const u8, default: f32, min: 
 /// `4`, `8`. Returns null when the field is absent or unrecognized (the
 /// caller falls back to the process-level `--kv-quant` default carried on
 /// the scheduler). Returns `KVQuantConfig.dense` for "off"/0.
-pub fn parseKvQuantOverride(root: std.json.ObjectMap) ?transformer_mod.KVQuantConfig {
+pub fn parseKvQuantOverride(root: std.json.ObjectMap) ?kv_quant_mod.KVQuantConfig {
     const v = root.get("kv_quant") orelse return null;
-    return transformer_mod.KVQuantConfig.fromJsonValue(v);
+    return kv_quant_mod.KVQuantConfig.fromJsonValue(v);
 }
 
 // ── Vision Processing ──
@@ -433,7 +434,7 @@ test "the max_tokens squeeze warning is silent for the auto budget, loud for a r
 test "an omitted max_tokens reserves the LAUNCH default, not the whole window" {
     const t = std.testing;
     // The admission reservation reads the resolved budget, so the flag reaches it.
-    const KVCache = transformer_mod.KVCache;
+    const KVCache = cache.KVCache;
     const ctx: u64 = 786_432;
     const seq: u64 = 400_000; // past RESERVE_MIN_TOKENS
     const chunk: u64 = 4096;

@@ -2084,7 +2084,7 @@ fn fluxProbe(io: std.Io, a: std.mem.Allocator, s: S, model_dir: []const u8, resi
 
 // The lossy int8 route against the same pack's packed forward. FLUX_TEST_MODEL.
 test "FLUX DiT: the w8a8 route stays within its bar of the packed forward" {
-    if (!@import("../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const model_dir = std.mem.span(std.c.getenv("FLUX_TEST_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

@@ -30,7 +30,8 @@ const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const device = @import("../../mlx/device.zig");
+const params_mod = @import("../../sdk/quant/params.zig");
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
 const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
 const wav_mod = @import("../../sdk/media/wav.zig");
@@ -816,7 +817,7 @@ fn lin(w: *const Weights, a: std.mem.Allocator, x: mlx.mlx_array, prefix: []cons
     if (w.get(sk)) |scales| {
         const wq = try getW(w, wk);
         const qb = try getW(w, bk);
-        const qp = transformer_mod.affineParamsFromGeometry(wq, scales, in_features) orelse {
+        const qp = params_mod.affineParamsFromGeometry(wq, scales, in_features) orelse {
             log.err("[music3] unsolvable quant geometry for {s}\n", .{prefix});
             return error.BadQuantGeometry;
         };
@@ -904,7 +905,7 @@ fn resolveQLin(w: *const Weights, a: std.mem.Allocator, prefix: []const u8, in_f
     if (w.get(sk)) |scales| {
         q.sc = scales;
         q.bi = try getW(w, bk);
-        const qp = transformer_mod.affineParamsFromGeometry(q.w, scales, in_features) orelse {
+        const qp = params_mod.affineParamsFromGeometry(q.w, scales, in_features) orelse {
             log.err("[music3] unsolvable quant geometry for {s}\n", .{prefix});
             return error.BadQuantGeometry;
         };
@@ -1229,7 +1230,7 @@ fn buildPrunedHead(cfg: Cfg, lm_w: *const Weights, s: S) !?PrunedHead {
     const wq = lm_w.get("lm_head.weight") orelse return null;
     const sc = lm_w.get("lm_head.scales") orelse return null;
     const bi = lm_w.get("lm_head.biases") orelse return null;
-    const qp = transformer_mod.affineParamsFromGeometry(wq, sc, cfg.lm_hidden) orelse return null;
+    const qp = params_mod.affineParamsFromGeometry(wq, sc, cfg.lm_hidden) orelse return null;
     const lo: c_int = CODE_OFFSET;
     const hi: c_int = CODE_OFFSET + @as(c_int, @intCast(cfg.semantic_vocab));
     const pw = try pruneHeadRows(wq, lo, hi, AUDIO_END, s);
@@ -3147,7 +3148,7 @@ fn dit3Probe(io: std.Io, a: std.mem.Allocator, resident: *usize) !mlx.mlx_array 
 
 // The lossy int8 route against the same pack's packed forward. MUSIC3_TEST_MODEL.
 test "music3 DiT: the w8a8 route stays within its bar of the packed forward" {
-    if (!transformer_mod.naxAvailable()) return error.SkipZigTest;
+    if (!device.naxAvailable()) return error.SkipZigTest;
     _ = std.c.getenv("MUSIC3_TEST_MODEL") orelse return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

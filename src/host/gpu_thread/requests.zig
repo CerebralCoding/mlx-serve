@@ -1,7 +1,7 @@
 //! Load, media-gen and unload work items posted to the inference thread, and media-job merging.
 
 const std = @import("std");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
 const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const chat_mod = @import("../chat/chat.zig");
@@ -77,7 +77,7 @@ pub const LoadRequest = struct {
     warmup_eager: bool = true,
     draft_block_size: u32 = 4,
     draft_block_size_explicit: bool = false,
-    kv_quant_config: transformer_mod.KVQuantConfig = transformer_mod.KVQuantConfig.dense,
+    kv_quant_config: kv_quant.KVQuantConfig = kv_quant.KVQuantConfig.dense,
     prefix_cache_capacity: u32 = 1,
     prefix_cache_ram_enabled: bool = true,
     prefix_cache_mem_bytes: u64 = 0,

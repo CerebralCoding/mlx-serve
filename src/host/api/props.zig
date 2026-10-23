@@ -3,7 +3,7 @@
 const std = @import("std");
 const env = @import("../../env.zig");
 const mlx = @import("../../mlx/ffi.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const decode_attn_quant_mod = @import("../../sdk/blocks/attention/decode_attn_quant.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const mtp_acceptance_mod = @import("../../engines/mlx/spec/mtp_acceptance.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
@@ -170,7 +170,7 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .engine = "mlx",
         .kv_quant = if (lm.llama_engine != null) @tagName(http_server.llama_settings.kv_quant) else if (kv.isQuant()) (if (kv.bits == 4) "4" else "8") else "off",
         .kv_attn_mode = http_server.server_config.kv_attn_mode,
-        .decode_attn_quant = transformer_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
+        .decode_attn_quant = decode_attn_quant_mod.decodeAttnQuantEnabled() and (if (lm.transformer) |x| x.dense_attn_proj else false),
         .prefill_chunk = generate_mod.prefill_chunk_override,
         .mtp_loaded = lm.mtp != null or (if (lm.transformer) |x| x.dsparkStages() > 0 else false),
         .mtp_default_on = defaultEnableMtp(lm.mtp != null, dsv4DraftStages(lm)),

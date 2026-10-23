@@ -3327,7 +3327,7 @@ fn aceProbe(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, resident: *
 
 // The lossy int8 route against the same pack's packed forward. ACESTEP_TEST_MODEL.
 test "ACE-Step DiT: the w8a8 route stays within its bar of the packed forward" {
-    if (!@import("../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const model_dir = std.mem.span(std.c.getenv("ACESTEP_TEST_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

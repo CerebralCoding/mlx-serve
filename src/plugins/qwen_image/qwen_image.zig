@@ -3176,7 +3176,7 @@ fn qwenProbe(io: std.Io, a: std.mem.Allocator, s: S, dir: []const u8, cfg: DitCo
 // The lossy int8 route against the same pack's packed forward (no reference fixture
 // needed). QWEN_IMAGE_TEST_MODEL.
 test "QwenImage DiT: the w8a8 route stays within its bar of the packed forward" {
-    if (!@import("../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("QWEN_IMAGE_TEST_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
@@ -3202,7 +3202,7 @@ test "QwenImage DiT: the w8a8 route stays within its bar of the packed forward" 
 }
 
 test "QwenImage block: an adapter on the fused int8 gate/proj equals the same adapter on the separate projections" {
-    if (!@import("../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const prev = w8a8.enabled;
     defer w8a8.enabled = prev;
     w8a8.enabled = true;

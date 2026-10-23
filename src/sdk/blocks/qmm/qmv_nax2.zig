@@ -42,7 +42,7 @@ pub fn narrowMaxRows() c_int {
 pub var nax_override: ?bool = null;
 
 fn naxHere() bool {
-    return nax_override orelse @import("../../../engines/mlx/transformer.zig").naxAvailable();
+    return nax_override orelse @import("../../../mlx/device.zig").naxAvailable();
 }
 
 /// `#include` for the tensor-op primitives; the JIT compiles at Metal 4 on a
@@ -260,7 +260,7 @@ fn errVsTruth(got: mlx.mlx_array, truth: []const f32, m: usize, n: usize, s: mlx
 /// The kernel is Metal 4 tensor ops: off a tensor unit it compiles and
 /// answers garbage, so a GPU dispatch is only a test where the hardware is.
 fn skipWithoutNax() !void {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
 }
 
 fn parityAgainstStock(widths: []const c_int) !void {

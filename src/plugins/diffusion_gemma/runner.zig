@@ -31,9 +31,10 @@ const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");
 
 const Transformer = transformer_mod.Transformer;
-const ForwardCtx = transformer_mod.ForwardCtx;
+const ForwardCtx = forward_ctx.ForwardCtx;
 
 /// Variable canvas sizing (mlx-vlm): a short completion shouldn't pay for a
 /// full 256-token canvas. The canvas is min(model_canvas, max(remaining,

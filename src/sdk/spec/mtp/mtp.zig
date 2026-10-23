@@ -34,13 +34,22 @@ const mlx = @import("../../../mlx/ffi.zig");
 const mrope = @import("../../vision/mrope.zig");
 const model_mod = @import("../../../engines/mlx/model.zig");
 const transformer_mod = @import("../../../engines/mlx/transformer.zig");
+const kv_quant = @import("../../../engines/mlx/cache/kv_quant.zig");
+const cache_mod = @import("../../../engines/mlx/kv/cache.zig");
+const attn256 = @import("../../blocks/attention/attn256.zig");
+const sdpa_mod = @import("../../blocks/attention/sdpa.zig");
+const verify_projection = @import("../../blocks/linear/verify_projection.zig");
+const verify_qmm = @import("../../blocks/linear/verify_qmm.zig");
+const verify_qmm_nax = @import("../../blocks/linear/verify_qmm_nax.zig");
+const weights_mod = @import("../../blocks/moe/weights.zig");
+const params_mod = @import("../../quant/params.zig");
 const log = @import("../../../host/log.zig");
 const io_util_mod = @import("../../util/io_util.zig");
 const ane_mod = @import("../../ane/offload.zig");
 const sushi_pack = @import("../../quant/exl3/sushi_pack.zig");
 
 const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
+const KVCache = cache_mod.KVCache;
 const Weights = model_mod.Weights;
 
 /// Default draft depth (tokens drafted per round). Flipped 1 -> 3 after the
@@ -264,7 +273,7 @@ test "Qwen4 mixed MTP profile requires its measured geometry and packs" {
 
 test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" {
     const path = env.get(.QWEN4_TEST_MODEL) orelse return error.SkipZigTest;
-    if (mlx.noGpuBackend() or !transformer_mod.verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !verify_qmm_nax.verifyQmmNaxAvailable()) return error.SkipZigTest;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();
     var config = try model_mod.parseConfig(io, a, std.mem.span(path));
@@ -277,12 +286,12 @@ test "Qwen4 mixed MTP profile validates the live checkpoint (QWEN4_TEST_MODEL)" 
     const old_kv_flag = Transformer.mtp_head_kv_quant_flag;
     defer Transformer.mtp_head_kv_quant_flag = old_kv_flag;
     Transformer.mtp_head_kv_quant_flag = true;
-    try xfm.cache.reinit(config.num_hidden_layers, transformer_mod.KVQuantConfig.affine(8));
-    try xfm.qwen4MtpApplyKvQuant(transformer_mod.KVQuantConfig.affine(8));
+    try xfm.cache.reinit(config.num_hidden_layers, kv_quant.KVQuantConfig.affine(8));
+    try xfm.qwen4MtpApplyKvQuant(kv_quant.KVQuantConfig.affine(8));
     try testing.expect(xfm.qwen4BuildDraftRerank());
     try testing.expectEqual(MtpCostProfile.g17_nax_qwen4_mixed_4_8_gs64, qwen4G17CostProfile(&xfm));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, transformer_mod.KVQuantConfig.dense));
-    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, transformer_mod.KVQuantConfig.affine(4)));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, kv_quant.KVQuantConfig.dense));
+    try testing.expectEqual(MtpCostProfile.generic, qwen4G17CostProfileForKv(&xfm, kv_quant.KVQuantConfig.affine(4)));
     const old_bias = xfm.qwen4_mtp.?.fc_emb_b;
     defer xfm.qwen4_mtp.?.fc_emb_b = old_bias;
     xfm.qwen4_mtp.?.fc_emb_b = .{};
@@ -359,7 +368,7 @@ pub fn qwen4G17CostProfile(target: *const Transformer) MtpCostProfile {
 
 /// Mixed-pack prices use the request's actual KV format, including a slot
 /// override. The original all-4-bit classifier retains its existing scope.
-pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.KVQuantConfig) MtpCostProfile {
+pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: kv_quant.KVQuantConfig) MtpCostProfile {
     const head = if (target.qwen4_mtp) |*h| h else return .generic;
     const cfg = &target.config;
     const geometry = Qwen4MixedGeometry{
@@ -377,7 +386,7 @@ pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.
         .head_kv_group = head.cache.config.group_size,
     };
     const rerank_ready = if (head.rerank) |r| r.bits == 3 and r.group_size == 64 and r.rows == 248320 else false;
-    const mixed = qwen4MixedCostProfileForFingerprint(geometry, std.meta.eql(geometry, Qwen4MixedGeometry{}) and qwen4MixedModelPacksMatch(target), rerank_ready, mlx.streamIsGpu(target.s) and transformer_mod.verifyQmmNaxAvailable());
+    const mixed = qwen4MixedCostProfileForFingerprint(geometry, std.meta.eql(geometry, Qwen4MixedGeometry{}) and qwen4MixedModelPacksMatch(target), rerank_ready, mlx.streamIsGpu(target.s) and verify_qmm_nax.verifyQmmNaxAvailable());
     if (mixed != .generic) {
         if (!qwen4_mixed_profile_logged) {
             qwen4_mixed_profile_logged = true;
@@ -394,7 +403,7 @@ pub fn qwen4G17CostProfileForKv(target: *const Transformer, kv: transformer_mod.
         cfg.quant_bits,
         cfg.quant_group_size,
         packs,
-        transformer_mod.verifyQmmNaxAvailable(),
+        verify_qmm_nax.verifyQmmNaxAvailable(),
     );
     if (profile != .generic and !qwen4_g17_profile_logged) {
         qwen4_g17_profile_logged = true;
@@ -460,7 +469,7 @@ fn fcMatchesHidden(fc: *const QLinear, hidden_size: u32) bool {
     const h: c_int = @intCast(hidden_size);
     if (fc.s.ctx == null) return shape[0] == h * 2 and shape[1] == h;
     if (shape[0] != h) return false;
-    return transformer_mod.quantParamsFromGeometry(fc.w, fc.s, fc.b.ctx != null, hidden_size * 2) != null;
+    return params_mod.quantParamsFromGeometry(fc.w, fc.s, fc.b.ctx != null, hidden_size * 2) != null;
 }
 
 fn m5NaxQLinearMatches(q: *const QLinear, in_dim: u32, out_dim: u32, bits: u32, group_size: u32) bool {
@@ -476,7 +485,7 @@ fn m5NaxQLinearMatches(q: *const QLinear, in_dim: u32, out_dim: u32, bits: u32, 
     if (w_shape.len != 2 or s_shape.len != 2 or b_shape.len != 2) return false;
     if (w_shape[0] != out or s_shape[0] != out or b_shape[0] != out) return false;
     if (s_shape[1] != b_shape[1]) return false;
-    const qp = transformer_mod.affineParamsFromGeometry(q.w, q.s, in_dim) orelse return false;
+    const qp = params_mod.affineParamsFromGeometry(q.w, q.s, in_dim) orelse return false;
     return qp.bits == bits and qp.group_size == group_size and qp.mode == .affine;
 }
 
@@ -543,7 +552,7 @@ const MtpMlp = union(enum) {
         up: QLinear,
         down: QLinear,
     },
-    moe: transformer_mod.MoeMlpWeights,
+    moe: weights_mod.MoeMlpWeights,
 
     fn deinit(self: *MtpMlp) void {
         switch (self.*) {
@@ -588,7 +597,7 @@ pub const MtpModel = struct {
     quant_group_size: u32,
     /// Quant MODE the sidecar's packed weights are in. A sidecar file carries
     /// no config, so this is solved from geometry at load
-    /// (`transformer_mod.quantParamsFromGeometry`) and handed to every
+    /// (`params_mod.quantParamsFromGeometry`) and handed to every
     /// `mlx_quantized_matmul` — passing "affine" over fp8 scales throws.
     quant_mode: model_mod.QuantMode = .affine,
 
@@ -994,7 +1003,7 @@ pub fn buildRerankCoarse(s: mlx.mlx_stream, target: *Transformer, bits: u32) ?Re
     if (w_shape.len != 2 or w_shape[0] < TOP32_MIN_ROWS) return null;
     // A dense bf16 head ([V, H], 16 bits) always reads more than the coarse copy.
     const dense = target.lm_head_s.ctx == null;
-    const head_qp: transformer_mod.QuantParams = if (dense) .{ .bits = 16, .group_size = 0, .mode = .affine } else headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
+    const head_qp: params_mod.QuantParams = if (dense) .{ .bits = 16, .group_size = 0, .mode = .affine } else headQuantParams(&target.config, target.lm_head_w, target.lm_head_s);
     if (bits >= head_qp.bits) return null; // no byte saving over the head we already read
 
     var rc = requantizeRows(
@@ -1296,8 +1305,8 @@ fn rerankCoarseRows(s: mlx.mlx_stream, x: mlx.mlx_array, rc: *const RerankCoarse
     const shape = mlx.getShape(x);
     if (shape.len < 2 or shape.len > 3 or shape[0] < 1 or shape[0] > 32) return error.MtpRerankBatchTooWide;
     if (shape.len == 3 and shape[1] != 1) return error.MtpRerankInputShape;
-    if (try transformer_mod.mtpCoarsePairs(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
-    if (try @import("../../../engines/mlx/transformer.zig").msvQmvRows(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
+    if (try verify_projection.mtpCoarsePairs(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
+    if (try @import("../../blocks/linear/qmv_rows.zig").msvQmvRows(s, x, rc.q.w, rc.q.s, rc.q.b, rc.bits, rc.group_size)) |out| return out;
     const n: usize = @intCast(shape[0]);
     var parts: [32]mlx.mlx_array = @splat(.{ .ctx = null });
     defer for (parts[0..n]) |p| {
@@ -2039,7 +2048,7 @@ fn inferBits(q: *const QLinear, hidden: u32) ?u32 {
 /// modes still resolve individually in `qLinearFwd`; this is only the fallback
 /// for geometry that will not solve.
 fn sidecarQuantMode(q: *const QLinear, hidden: u32) model_mod.QuantMode {
-    const qp = transformer_mod.quantParamsFromGeometry(q.w, q.s, q.b.ctx != null, hidden) orelse return .affine;
+    const qp = params_mod.quantParamsFromGeometry(q.w, q.s, q.b.ctx != null, hidden) orelse return .affine;
     return qp.mode;
 }
 
@@ -2562,7 +2571,7 @@ fn qLinearFwd(self: *const MtpModel, x: mlx.mlx_array, lin: *const QLinear) !mlx
     const x_shape = mlx.getShape(x);
     if (x_shape.len > 0 and x_shape[x_shape.len - 1] > 0) {
         const in_dim: u32 = @intCast(x_shape[x_shape.len - 1]);
-        if (transformer_mod.quantParamsFromGeometry(lin.w, lin.s, lin.b.ctx != null, in_dim)) |qp| {
+        if (params_mod.quantParamsFromGeometry(lin.w, lin.s, lin.b.ctx != null, in_dim)) |qp| {
             bits = qp.bits;
             group = qp.group_size;
             mode = qp.mode;
@@ -2575,7 +2584,7 @@ fn qLinearFwd(self: *const MtpModel, x: mlx.mlx_array, lin: *const QLinear) !mlx
     // The verify lanes are affine-only kernels (they unpack affine
     // scales/biases); fp modes fall straight through to stock.
     if (mode == .affine) {
-        if (try transformer_mod.verifyQmm(self.s, x, lin.w, lin.s, lin.b, bits, group)) |vy| {
+        if (try verify_qmm.verifyQmm(self.s, x, lin.w, lin.s, lin.b, bits, group)) |vy| {
             _ = mlx.mlx_array_free(out);
             return vy;
         }
@@ -2636,7 +2645,7 @@ fn embedTargetTokens(
     // an 8-bit table as 4-bit crashes (`scales/biases shape mismatch`). Mirrors
     // `Transformer.embedding` → `quantParamsHinted`. Uniform-4-bit checkpoints
     // (ddalcu, MTPLX) resolve to the same 4/gs64/affine, so they're unchanged.
-    const emb_qp = transformer_mod.computeQuantParams(&target.config, target.emb_w, target.emb_s, target.config.hidden_size);
+    const emb_qp = params_mod.computeQuantParams(&target.config, target.emb_w, target.emb_s, target.config.hidden_size);
     var dequant = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(dequant);
     try mlx.check(mlx.mlx_dequantize(
@@ -2686,8 +2695,8 @@ pub fn targetLmHead(self: anytype, target: *Transformer, x: mlx.mlx_array, s: ml
 /// exact per-geometry affine solve (the head's bits routinely differ from
 /// the trunk global on mixed checkpoints — hy_v3 ships an 8-bit head over a
 /// 2-bit trunk).
-fn headQuantParams(config: *const model_mod.ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array) transformer_mod.QuantParams {
-    return transformer_mod.computeQuantParams(config, w, sc, config.hidden_size);
+fn headQuantParams(config: *const model_mod.ModelConfig, w: mlx.mlx_array, sc: mlx.mlx_array) params_mod.QuantParams {
+    return params_mod.computeQuantParams(config, w, sc, config.hidden_size);
 }
 
 /// Outputs of the pre-rope half of the MTP layer. All arrays owned.
@@ -3156,7 +3165,7 @@ pub fn forwardWithMrope(
     // flash kernel first — same dispatch the trunk's prefill uses.
     var fused_done = false;
     if (seq_len > 1) {
-        if (try transformer_mod.fusedSdpa256Prefill(s, q_rope, kv_view.k, kv_view.v, attn_scale, 0)) |fused| {
+        if (try attn256.fusedSdpa256Prefill(s, q_rope, kv_view.k, kv_view.v, attn_scale, 0)) |fused| {
             _ = mlx.mlx_array_free(attn_out);
             attn_out = fused;
             fused_done = true;
@@ -3164,7 +3173,7 @@ pub fn forwardWithMrope(
     }
     if (!fused_done) {
         const mask_mode: [*:0]const u8 = if (seq_len > 1) "causal" else "";
-        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, seq_len > 1 and transformer_mod.sdpaForceFused(q_rope, kv_view.k), s));
+        try mlx.check(mlx.mlx_fast_scaled_dot_product_attention(&attn_out, q_rope, kv_view.k, kv_view.v, attn_scale, mask_mode, none_mask, .{ .ctx = null }, seq_len > 1 and sdpa_mod.sdpaForceFused(q_rope, kv_view.k), s));
     }
 
     const post = try backChain(self, target, attn_out, front.gate, front.x, seq_len);
@@ -5381,7 +5390,7 @@ test "mtp: dense bf16 head trunk is requantized at load (4b/g64); indivisible wi
         // q packed to 4-bit g64: uint32 codes, geometry re-solves.
         try testing.expect(m.q.s.ctx != null);
         try testing.expectEqual(mlx.mlx_dtype.uint32, mlx.mlx_array_dtype(m.q.w));
-        const qp = transformer_mod.affineParamsFromGeometry(m.q.w, m.q.s, 64) orelse return error.NoGeometry;
+        const qp = params_mod.affineParamsFromGeometry(m.q.w, m.q.s, 64) orelse return error.NoGeometry;
         try testing.expectEqual(@as(u32, 4), qp.bits);
         try testing.expectEqual(@as(u32, 64), qp.group_size);
         try testing.expect(m.mlp == .dense);

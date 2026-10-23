@@ -2,7 +2,7 @@
 
 const std = @import("std");
 const mlx = @import("../../mlx/ffi.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const kv_quant = @import("../../engines/mlx/cache/kv_quant.zig");
 const tokenizer_mod = @import("../tokenizer/tokenizer.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const log = @import("../log.zig");
@@ -56,7 +56,7 @@ pub fn nonStreamingViaScheduler(
     /// `/v1/completions` echo: score the prompt's own tokens too (`GenerationResult.prompt_logprobs`).
     prompt_logprobs: bool,
     /// Wave 1.A: per-request KV-quant override; null = inherit scheduler default.
-    kv_quant_override: ?transformer_mod.KVQuantConfig,
+    kv_quant_override: ?kv_quant.KVQuantConfig,
     kv_attn_explicit: ?bool,
     /// When non-null, the peer socket is probed on idle wakeups during the
     /// wait — a vanished client cancels the slot (aborting its prefill)

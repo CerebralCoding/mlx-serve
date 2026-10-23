@@ -16,6 +16,8 @@ const Weights = model_mod.Weights;
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const glm_vision = @import("../glm5_next/vision.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
+const activations = @import("../../sdk/blocks/mlp/activations.zig");
+const params = @import("../../sdk/quant/params.zig");
 const log = @import("../../host/log.zig");
 
 const ModelConfig = model_mod.ModelConfig;
@@ -412,7 +414,7 @@ fn loadProjectorLinear(weights: *const Weights, base: []const u8, in_dim: u32) !
         const scale_shape = mlx.getShape(scales);
         if (mlx.mlx_array_dtype(linear.w) != .uint32 or scale_shape.len != 2 or scale_shape[0] != shape[0]) return error.InvalidVisionWeights;
         if (linear.biases.ctx != null and !std.mem.eql(c_int, scale_shape, mlx.getShape(linear.biases))) return error.InvalidVisionWeights;
-        linear.qp = transformer.quantParamsFromGeometry(linear.w, scales, linear.biases.ctx != null, in_dim) orelse return error.InvalidVisionWeights;
+        linear.qp = params.quantParamsFromGeometry(linear.w, scales, linear.biases.ctx != null, in_dim) orelse return error.InvalidVisionWeights;
         if (linear.qp.?.mode == .affine and linear.biases.ctx == null) return error.InvalidVisionWeights;
     } else if (shape[1] != in_dim or mlx.mlx_array_dtype(linear.w) == .uint32) {
         return error.InvalidVisionWeights;
@@ -931,7 +933,7 @@ pub const RadioVision = struct {
         try mlx.check(mlx.mlx_fast_rms_norm(&normed, x, self.proj_norm, PROJECTOR_EPS, self.s));
         const up = try glm_vision.linear(normed, self.proj_fc1, self.s);
         defer _ = mlx.mlx_array_free(up);
-        const act = try transformer.reluSquaredOp(up, self.s);
+        const act = try activations.reluSquaredOp(up, self.s);
         defer _ = mlx.mlx_array_free(act);
         return glm_vision.linear(act, self.proj_fc2, self.s);
     }

@@ -8,6 +8,10 @@ const mlx = @import("../../mlx/ffi.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const tokenizer_mod = @import("../../host/tokenizer/tokenizer.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");
+const cache_mod = @import("../../engines/mlx/kv/cache.zig");
+const entry = @import("../../engines/mlx/ssm/entry.zig");
+const history = @import("../qwen4_exp/qsa/history.zig");
 
 const S = mlx.mlx_stream;
 const A = mlx.mlx_array;
@@ -433,15 +437,15 @@ pub fn scoreBranches(
     ctx: anytype,
     comptime emit: fn (@TypeOf(ctx), usize, A) anyerror!void,
 ) !void {
-    var cache = try transformer_mod.KVCache.init(a, layers);
+    var cache = try cache_mod.KVCache.init(a, layers);
     defer cache.deinit();
-    const entries = try a.alloc(transformer_mod.SSMCacheEntry, layers);
+    const entries = try a.alloc(entry.SSMCacheEntry, layers);
     for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
     defer {
         for (entries) |*e| {
             free(e.conv_state);
             free(e.ssm_state);
-            transformer_mod.ssmFreeQsaState(e);
+            history.ssmFreeQsaState(e);
         }
         a.free(entries);
     }
@@ -457,17 +461,17 @@ pub fn scoreBranches(
     free(h_state);
     var kv_snap = try cache.snapshot();
     defer kv_snap.deinit();
-    const ssm_snaps = try a.alloc(transformer_mod.SSMCacheEntrySnapshot, entries.len);
-    for (entries, ssm_snaps) |*e, *sn| sn.* = transformer_mod.ssmSnapshot(e);
+    const ssm_snaps = try a.alloc(entry.SSMCacheEntrySnapshot, entries.len);
+    for (entries, ssm_snaps) |*e, *sn| sn.* = entry.ssmSnapshot(e);
     defer {
-        for (ssm_snaps) |*sn| transformer_mod.ssmSnapshotDeinit(sn);
+        for (ssm_snaps) |*sn| entry.ssmSnapshotDeinit(sn);
         a.free(ssm_snaps);
     }
     const state_offset = offset;
 
     for (branches, 0..) |ids, i| {
         try cache.restore(&kv_snap);
-        for (entries, ssm_snaps) |*e, *sn| try transformer_mod.ssmRestore(e, sn);
+        for (entries, ssm_snaps) |*e, *sn| try entry.ssmRestore(e, sn);
         offset = state_offset;
         const h = try forwardIds(xfm, &fwd, ids);
         defer free(h);
@@ -475,7 +479,7 @@ pub fn scoreBranches(
     }
 }
 
-fn forwardIds(xfm: *transformer_mod.Transformer, ctx: *transformer_mod.ForwardCtx, ids: []const u32) !A {
+fn forwardIds(xfm: *transformer_mod.Transformer, ctx: *forward_ctx.ForwardCtx, ids: []const u32) !A {
     const shape = [_]c_int{ 1, @intCast(ids.len) };
     const arr = mlx.mlx_array_new_data(ids.ptr, &shape, 2, .uint32);
     defer free(arr);
@@ -1148,15 +1152,15 @@ fn rowReadouts(engine: *Engine, a: std.mem.Allocator, state_ids: []const u32, b:
     const s = engine.stream;
     const row = try std.mem.concat(a, u32, &.{ state_ids, b.ids });
     defer a.free(row);
-    var cache = try transformer_mod.KVCache.init(a, engine.config.num_hidden_layers);
+    var cache = try cache_mod.KVCache.init(a, engine.config.num_hidden_layers);
     defer cache.deinit();
-    const entries = try a.alloc(transformer_mod.SSMCacheEntry, engine.config.num_hidden_layers);
+    const entries = try a.alloc(entry.SSMCacheEntry, engine.config.num_hidden_layers);
     for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
     defer {
         for (entries) |*e| {
             free(e.conv_state);
             free(e.ssm_state);
-            transformer_mod.ssmFreeQsaState(e);
+            history.ssmFreeQsaState(e);
         }
         a.free(entries);
     }

@@ -19,6 +19,8 @@ const Weights = model_mod.Weights;
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const glm_vision = @import("../glm5_next/vision.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
+const weights_mod = @import("../../engines/mlx/load/weights.zig");
+const params = @import("../../sdk/quant/params.zig");
 const log = @import("../../host/log.zig");
 const chat_mod = @import("../../host/chat/chat.zig");
 
@@ -534,13 +536,13 @@ fn appendBlock(allocator: std.mem.Allocator, list: *std.ArrayList(mlx.mlx_array)
 /// `gelu_pytorch_tanh`: `0.5 x (1 + tanh(sqrt(2/pi) (x + 0.044715 x^3)))`.
 fn geluTanh(x: mlx.mlx_array, s: mlx.mlx_stream) !mlx.mlx_array {
     const dt = mlx.mlx_array_dtype(x);
-    const k = try transformer.scalarOf(0.7978845608028654, dt, s);
+    const k = try weights_mod.scalarOf(0.7978845608028654, dt, s);
     defer _ = mlx.mlx_array_free(k);
-    const c = try transformer.scalarOf(0.044715, dt, s);
+    const c = try weights_mod.scalarOf(0.044715, dt, s);
     defer _ = mlx.mlx_array_free(c);
-    const one = try transformer.scalarOf(1.0, dt, s);
+    const one = try weights_mod.scalarOf(1.0, dt, s);
     defer _ = mlx.mlx_array_free(one);
-    const half = try transformer.scalarOf(0.5, dt, s);
+    const half = try weights_mod.scalarOf(0.5, dt, s);
     defer _ = mlx.mlx_array_free(half);
     var t = mlx.mlx_array_new();
     defer _ = mlx.mlx_array_free(t);
@@ -585,7 +587,7 @@ const NameCtx = struct {
             return out;
         };
         const biases = self.get(name ++ ".biases", .{}) orelse mlx.mlx_array{ .ctx = null };
-        const qp = transformer.quantParamsFromGeometry(w, scales, biases.ctx != null, hidden) orelse return error.InvalidVisionWeights;
+        const qp = params.quantParamsFromGeometry(w, scales, biases.ctx != null, hidden) orelse return error.InvalidVisionWeights;
         try mlx.check(mlx.mlx_dequantize(&out, w, scales, biases, mlx.mlx_optional_int.some(@intCast(qp.group_size)), mlx.mlx_optional_int.some(@intCast(qp.bits)), qp.mode.cstr(), .{}, .{ .value = .bfloat16, .has_value = true }, s));
         return out;
     }
@@ -595,7 +597,7 @@ const NameCtx = struct {
         if (self.get(fmt ++ ".scales", args)) |sc| {
             l.scales = sc;
             l.biases = self.get(fmt ++ ".biases", args) orelse .{ .ctx = null };
-            l.qp = transformer.quantParamsFromGeometry(l.w, sc, l.biases.ctx != null, in_dim) orelse {
+            l.qp = params.quantParamsFromGeometry(l.w, sc, l.biases.ctx != null, in_dim) orelse {
                 log.warn("MINICPM VISION: unreadable quantization on " ++ fmt ++ "\n", args);
                 return error.InvalidVisionWeights;
             };

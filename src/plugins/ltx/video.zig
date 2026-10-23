@@ -35,6 +35,8 @@ const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");
+const params_mod = @import("../../sdk/quant/params.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
 const w8a8 = @import("../../sdk/blocks/dit/w8a8.zig");
 const int8_attn = @import("../../sdk/blocks/dit/int8_attn.zig");
@@ -1452,8 +1454,8 @@ const GemmaCfg = struct {
 /// pack died at the first matmul with a shapes-incompatible MLX error, which
 /// reads like a corrupt file rather than an engine that never asked).
 /// `in_dim` is the contraction size — the last axis of the activation.
-fn quantGeom(w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: u32) !transformer_mod.QuantParams {
-    return transformer_mod.affineParamsFromGeometry(w, sc, in_dim) orelse error.UnsupportedQuantGeometry;
+fn quantGeom(w: mlx.mlx_array, sc: mlx.mlx_array, in_dim: u32) !params_mod.QuantParams {
+    return params_mod.affineParamsFromGeometry(w, sc, in_dim) orelse error.UnsupportedQuantGeometry;
 }
 
 /// Contraction size of `x` (its last axis).
@@ -1679,7 +1681,7 @@ pub fn gemmaCapture4(io: std.Io, allocator: std.mem.Allocator, gemma_dir: []cons
     defer _ = mlx.mlx_array_free(mask);
 
     for (states[1..]) |*st| st.* = mlx.mlx_array_new();
-    var cl = transformer_mod.CaptureLayers{ .ids = cap_ids, .out = states[1..] };
+    var cl = forward_ctx.CaptureLayers{ .ids = cap_ids, .out = states[1..] };
     done = states.len;
     {
         var ctx = xfm.defaultCtx();
@@ -6726,7 +6728,7 @@ fn ltxProbe(allocator: std.mem.Allocator, s: S, path: [:0]const u8, resident: *u
 
 // The lossy int8 route against the same pack's packed forward. LTX_TEST_MODEL.
 test "LTX DiT: the w8a8 route stays within its bar of the packed forward" {
-    if (!@import("../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const dir = std.mem.span(std.c.getenv("LTX_TEST_MODEL") orelse return error.SkipZigTest);
     const a = testing.allocator;
     const s = mlx.mlx_default_gpu_stream_new();

@@ -26,6 +26,9 @@ const sse = @import("../../host/media_jobs/sse.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const tok_mod = @import("../../host/tokenizer/tokenizer.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const cache_mod = @import("../../engines/mlx/kv/cache.zig");
+const entry = @import("../../engines/mlx/ssm/entry.zig");
+const history = @import("../qwen4_exp/qsa/history.zig");
 const scope_mod = @import("../../mlx/scope.zig");
 const ops = @import("../../mlx/ops.zig");
 const lora_mod = @import("../../sdk/weights/lora.zig");
@@ -261,15 +264,15 @@ const TextEncoder = struct {
     fn encode(self: *TextEncoder, ids: []const u32) !A {
         const a = self.allocator;
         const layers = self.config.num_hidden_layers;
-        var cache = try transformer_mod.KVCache.init(a, layers);
+        var cache = try cache_mod.KVCache.init(a, layers);
         defer cache.deinit();
-        const entries = try a.alloc(transformer_mod.SSMCacheEntry, layers);
+        const entries = try a.alloc(entry.SSMCacheEntry, layers);
         for (entries) |*e| e.* = .{ .conv_state = mlx.mlx_array_new(), .ssm_state = mlx.mlx_array_new(), .initialized = false };
         defer {
             for (entries) |*e| {
                 _ = mlx.mlx_array_free(e.conv_state);
                 _ = mlx.mlx_array_free(e.ssm_state);
-                transformer_mod.ssmFreeQsaState(e);
+                history.ssmFreeQsaState(e);
             }
             a.free(entries);
         }

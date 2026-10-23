@@ -29,7 +29,10 @@ const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const tokenizer_mod = @import("../../host/tokenizer/tokenizer.zig");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const array_mod = @import("../../mlx/array.zig");
+const fused_activations = @import("../../sdk/blocks/mlp/fused_activations.zig");
+const residual_norm = @import("../../sdk/blocks/norms/residual_norm.zig");
+const qk_norm_rope = @import("../../sdk/blocks/rope/qk_norm_rope.zig");
 const wav_mod = @import("../../sdk/media/wav.zig");
 const sse = @import("../../host/media_jobs/sse.zig");
 const ops = @import("../../mlx/ops.zig");
@@ -207,7 +210,7 @@ inline fn silu(x: mlx.mlx_array, s: S) !mlx.mlx_array {
 /// its sigmoid is a full 16-bit table; declines f32 and odd shapes), keeping
 /// the 3-dispatch chain as the fallback.
 inline fn swiglu(gate: mlx.mlx_array, up: mlx.mlx_array, s: S) !mlx.mlx_array {
-    if (try transformer_mod.fusedSwiGLU(s, gate, up)) |fused| return fused;
+    if (try fused_activations.fusedSwiGLU(s, gate, up)) |fused| return fused;
     return swigluPlain(gate, up, s);
 }
 
@@ -523,9 +526,9 @@ const QwenDims = struct {
 
 /// Residual add + post-norm: ONE node when the fused kernel takes it
 /// (bit-identical), the composed pair otherwise. Caller frees both fields.
-fn addRmsNorm(x: mlx.mlx_array, o: mlx.mlx_array, norm_w: mlx.mlx_array, d: QwenDims, s: S) !transformer_mod.AddNormResult {
+fn addRmsNorm(x: mlx.mlx_array, o: mlx.mlx_array, norm_w: mlx.mlx_array, d: QwenDims, s: S) !residual_norm.AddNormResult {
     if (!d.plain_kernels and d.eps_arr.ctx != null) {
-        if (try transformer_mod.fusedAddRmsNorm(s, x, o, norm_w, d.eps_arr)) |r| return r;
+        if (try residual_norm.fusedAddRmsNorm(s, x, o, norm_w, d.eps_arr)) |r| return r;
     }
     const sum = try addA(x, o, s);
     errdefer _ = mlx.mlx_array_free(sum);
@@ -696,7 +699,7 @@ fn qwenLayerCached(x: mlx.mlx_array, layer: *const QwenLayer, d: QwenDims, lc: *
     defer _ = mlx.mlx_array_free(kr);
     var fused_done = false;
     if (fused_qk) |fq| {
-        if (try transformer_mod.fusedQkNormRope(s, q, k, layer.q_norm, layer.k_norm, fq.angles, null, fq.eps_arr, heads, kv, hd)) |pair| {
+        if (try qk_norm_rope.fusedQkNormRope(s, q, k, layer.q_norm, layer.k_norm, fq.angles, null, fq.eps_arr, heads, kv, hd)) |pair| {
             _ = mlx.mlx_array_free(qr);
             _ = mlx.mlx_array_free(kr);
             qr = pair[0];
@@ -787,8 +790,8 @@ fn qwenStackCached(x_in: mlx.mlx_array, layers: []const QwenLayer, final_norm: m
         _ = mlx.mlx_array_free(fq.angles);
         _ = mlx.mlx_array_free(fq.eps_arr);
     };
-    if (L == 1 and d.head_dim == 128 and transformer_mod.qkNormRopeFusedWanted()) {
-        const angles = try transformer_mod.ropeAngleRow(s, 128, mlx.mlx_optional_float.some(d.theta), .{ .ctx = null }, @intCast(cache.offset), std.heap.c_allocator);
+    if (L == 1 and d.head_dim == 128 and qk_norm_rope.qkNormRopeFusedWanted()) {
+        const angles = try qk_norm_rope.ropeAngleRow(s, 128, mlx.mlx_optional_float.some(d.theta), .{ .ctx = null }, @intCast(cache.offset), std.heap.c_allocator);
         // MUST be a 0-dim scalar: metal_kernel binds it `constant float&`
         // (a [1] array binds `constant float*` and the kernel source fails to
         // COMPILE at dispatch — one request kills the server).
@@ -2370,7 +2373,7 @@ fn resolveSpeakerEmbedding(enc: *SpeakerEncoder, cache: *SpkEmbCache, ref: []con
     // Cache a materialized owned buffer, never a view of per-request tensors
     // (the slice-born-view class), and eval it so the cached array holds its
     // result — not the whole lazy ECAPA graph — and hits truly skip compute.
-    const owned = try transformer_mod.materializedOwnedCopy(enc.s, raw);
+    const owned = try array_mod.materializedOwnedCopy(enc.s, raw);
     errdefer _ = mlx.mlx_array_free(owned);
     try mlx.check(mlx.mlx_array_eval(owned));
     cache.put(hash, owned); // ownership → cache

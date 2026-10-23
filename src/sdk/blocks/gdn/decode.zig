@@ -62,7 +62,7 @@ const NT: c_int = 256; // 4 dv rows per simdgroup
 /// same, so the rows are bit-identical either way). Other GPUs cap this
 /// kernel's threadgroup below 1024 and keep K1's 256.
 fn seqNt() c_int {
-    return if (@import("../../../engines/mlx/transformer.zig").naxAvailable()) 1024 else NT;
+    return if (@import("../../../mlx/device.zig").naxAvailable()) 1024 else NT;
 }
 
 var k1_cache: ?mlx.mlx_fast_metal_kernel = null;

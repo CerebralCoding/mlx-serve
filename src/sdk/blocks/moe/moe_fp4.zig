@@ -7,7 +7,8 @@
 const std = @import("std");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
-const xfm = @import("../../../engines/mlx/transformer.zig");
+const fused_activations = @import("../mlp/fused_activations.zig");
+const parity = @import("../../testing/parity.zig");
 const moe_affine4 = @import("../../../plugins/qwen4_exp/moe_affine4.zig");
 const QuantMode = @import("../../../engines/mlx/model.zig").QuantMode;
 
@@ -345,7 +346,7 @@ fn fp4DecodeCase(I: c_int) !void {
         defer _ = mlx.mlx_array_free(inds);
         const scores = try randBf16(rnd, &.{ R, TOPK }, 0.5, s);
         defer _ = mlx.mlx_array_free(scores);
-        const sigtab = try xfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+        const sigtab = try fused_activations.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
         // A gate scale multiplies expert e's gate output, so the truth scales its gate rows.
         const gsc = try randBf16(rnd, &.{E}, 1.0, s);
         defer _ = mlx.mlx_array_free(gsc);
@@ -459,7 +460,7 @@ test "moe fp4 decode: a clamped SwiGLU with per-expert gate and up scales matche
         defer _ = mlx.mlx_array_free(inds);
         const scores = try randBf16(rnd, &.{ R, TOPK }, 0.5, s);
         defer _ = mlx.mlx_array_free(scores);
-        const sigtab = try xfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+        const sigtab = try fused_activations.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
 
         const ours = (try decode(s, x, banks[0], banks[1], banks[2], null, .{ .gate = gsc, .up = usc, .clamp = CLAMP }, null, inds, scores, sigtab, f.mode, @intCast(f.gs))) orelse return error.KernelDeclined;
         defer _ = mlx.mlx_array_free(ours);
@@ -543,7 +544,7 @@ test "moe fp4 decode: one-expert bank views and the fused shared expert match fp
         defer _ = mlx.mlx_array_free(sdown);
         const logit = try randBf16(rnd, &.{1}, 1.0, s);
         defer _ = mlx.mlx_array_free(logit);
-        const sigtab = try xfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+        const sigtab = try fused_activations.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
 
         const plain = (try decode(s, x, banks[0], banks[1], banks[2], null, .{}, null, inds, scores, sigtab, f.mode, @intCast(f.gs))) orelse return error.KernelDeclined;
         defer _ = mlx.mlx_array_free(plain);
@@ -552,7 +553,7 @@ test "moe fp4 decode: one-expert bank views and the fused shared expert match fp
         const fused = (try decode(s, x, banks[0], banks[1], banks[2], views, .{}, .{ .down = sdown, .logit = logit }, inds, scores, sigtab, f.mode, @intCast(f.gs))) orelse return error.KernelDeclined;
         defer _ = mlx.mlx_array_free(fused);
         // Views bind the same bytes: the output is bit-identical.
-        try testing.expectEqual(@as(f32, 0), try xfm.maxAbsDiffF32(plain, viewed, s));
+        try testing.expectEqual(@as(f32, 0), try parity.maxAbsDiffF32(plain, viewed, s));
 
         var f32o = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(f32o);
@@ -632,7 +633,7 @@ test "moe fp4 decode: experts spread over three slot banks give the one-bank ker
             _ = mlx.mlx_array_free(p.w);
             _ = mlx.mlx_array_free(p.s);
         };
-        const sigtab = try xfm.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
+        const sigtab = try fused_activations.swigluSigTable(s, .bfloat16, std.heap.c_allocator);
         for ([_]c_int{ 1, 2 }) |R| {
             const n: usize = @intCast(R * TOPK);
             const experts = [16]u32{ 3, 0, 15, 7, 9, 1, 12, 5, 14, 2, 6, 11, 0, 8, 13, 10 };
@@ -662,7 +663,7 @@ test "moe fp4 decode: experts spread over three slot banks give the one-bank ker
                 defer _ = mlx.mlx_array_free(want);
                 const got = (try decodeBanks(s, x, &slots, kinds, .{}, shared, rows, scores, sigtab, f.mode, @intCast(f.gs))) orelse return error.KernelDeclined;
                 defer _ = mlx.mlx_array_free(got);
-                try testing.expectEqual(@as(f32, 0), try xfm.maxAbsDiffF32(want, got, s));
+                try testing.expectEqual(@as(f32, 0), try parity.maxAbsDiffF32(want, got, s));
             }
         }
     }

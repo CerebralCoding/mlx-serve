@@ -15,6 +15,10 @@ const kernelSource = @import("../../mlx/kernels.zig").source;
 const mlx = @import("../../mlx/ffi.zig");
 const model = @import("../../engines/mlx/model.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
+const embedding = @import("../../sdk/blocks/embedding.zig");
+const verify_qmm_nax = @import("../../sdk/blocks/linear/verify_qmm_nax.zig");
+const gather_qmv = @import("../../sdk/blocks/moe/gather_qmv.zig");
+const params = @import("../../sdk/quant/params.zig");
 const gather_nax = @import("../../sdk/blocks/moe/gather_qmm_nax.zig");
 const log = @import("../../host/log.zig");
 const engram = @import("engram.zig");
@@ -26,7 +30,7 @@ const streamed = @import("../../sdk/weights/streamed.zig");
 const A = mlx.mlx_array;
 const S = mlx.mlx_stream;
 const ModelConfig = model.ModelConfig;
-pub const QuantParams = transformer.QuantParams;
+pub const QuantParams = params.QuantParams;
 const none: A = .{ .ctx = null };
 
 /// Rows one attention span handles: the compressed rows each query gathers
@@ -255,7 +259,7 @@ pub const Lin = struct {
     /// Rows `ids` of the table, dequantized to `dt`.
     fn rows(self: *const Lin, sc: *Scope, ids: A, dt: mlx.mlx_dtype) !A {
         if (self.s.ctx == null) return sc.astype(try sc.take(self.w, ids, 0), dt);
-        return sc.keep(try transformer.gatherQuantizedRows(sc.s, self.w, self.s, self.b, ids, self.qp.group_size, self.qp.bits, self.qp.mode, none, .{ .value = dt, .has_value = true }));
+        return sc.keep(try embedding.gatherQuantizedRows(sc.s, self.w, self.s, self.b, ids, self.qp.group_size, self.qp.bits, self.qp.mode, none, .{ .value = dt, .has_value = true }));
     }
 };
 
@@ -606,7 +610,7 @@ fn getLin(w: *const model.Weights, in_dim: usize, comptime base: []const u8, arg
     const wt = try getW(w, base ++ ".weight", args);
     const sc = getOpt(w, base ++ ".scales", args) orelse return .{ .w = wt };
     const bi = getOpt(w, base ++ ".biases", args) orelse none;
-    const qp = transformer.quantParamsFromGeometry(wt, sc, bi.ctx != null, @intCast(in_dim)) orelse {
+    const qp = params.quantParamsFromGeometry(wt, sc, bi.ctx != null, @intCast(in_dim)) orelse {
         var buf: NameBuf = undefined;
         log.err("deepseek_v41: {s} has a quantized layout this build does not read\n", .{std.fmt.bufPrint(&buf, base, args) catch base});
         return error.Dsv41QuantGeometry;
@@ -1098,7 +1102,7 @@ pub const HC_NORM_SOURCE = kernelSource("plugins/deepseek_v41/kernels/hc_norm.me
 /// a lane's x chunk is prescaled by 2^-(BITS i) so a packed value is masked,
 /// never shifted, and each group adds scale * sum(x q) + bias * sum(x).
 /// MX: mxfp8 rows (BITS 8, GS 32: e4m3 bytes, an e8m0 exponent a group, `bi` unread).
-pub const MOE_HEADER = transformer.GQMV_AFFINE_HEADER ++ mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/moe_header.metal");
+pub const MOE_HEADER = gather_qmv.GQMV_AFFINE_HEADER ++ mxfp8_qmv.HEADER ++ kernelSource("plugins/deepseek_v41/kernels/moe_header.metal");
 
 /// One token's routed gate+up (the fused bank: expert e's up rows sit N rows
 /// after its gate rows) and, as slot TOPK, the shared expert's; RPS rows a
@@ -2805,7 +2809,7 @@ fn slotPrefill(sc: *Scope, m: *const Dsv41Model, sl: *const Slots, x: A, wts: A,
 /// A sorted gather of `b` for rows `idx` (one run per expert) on the NAX port where it serves the bank
 /// (affine 2..8-bit, bf16 rows), else MLX's; `row_map` reads `x`'s rows in place instead of a `take`.
 fn sortedBank(sc: *Scope, x: A, row_map: ?A, b: *const Bank, idx: A) !A {
-    if (transformer.verifyQmmNaxAvailable() and b.s.ctx != null and (b.qp.mode == .affine or b.qp.mode.isFp4())) {
+    if (verify_qmm_nax.verifyQmmNaxAvailable() and b.s.ctx != null and (b.qp.mode == .affine or b.qp.mode.isFp4())) {
         const nax = if (row_map) |map|
             try gather_nax.sortedGatherMapped(x, map, b.w, b.s, b.b, idx, b.qp.bits, b.qp.group_size, b.qp.mode.isFp4(), true, sc.s)
         else
@@ -4985,7 +4989,7 @@ test "dsv41 ffn prefill: the sorted-gather MoE with its activation and combine k
             ec += (b - r) * (b - r);
             tt += r * r;
         }
-        std.debug.print("bits {d}: prefill-truth {e:.2}, composed-truth {e:.2} (rel rms), nax {any}\n", .{ bits, @sqrt(ef / tt), @sqrt(ec / tt), transformer.verifyQmmNaxAvailable() });
+        std.debug.print("bits {d}: prefill-truth {e:.2}, composed-truth {e:.2} (rel rms), nax {any}\n", .{ bits, @sqrt(ef / tt), @sqrt(ec / tt), verify_qmm_nax.verifyQmmNaxAvailable() });
         try testing.expect(@sqrt(ef / tt) < 1e-2);
         try testing.expect(@sqrt(ef) <= 1.25 * @sqrt(ec) + 1e-4 * @sqrt(tt));
     }
@@ -6248,7 +6252,7 @@ test "dsv41 oMLX layouts: each linear's mode, bits and group come off its own ge
         var sc = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(sc);
         try mlx.check(mlx.mlx_zeros(&sc, c.sc.ptr, c.sc.len, if (c.fp) .uint8 else .bfloat16, s));
-        const qp = transformer.quantParamsFromGeometry(w, sc, !c.fp, c.in).?;
+        const qp = params.quantParamsFromGeometry(w, sc, !c.fp, c.in).?;
         try testing.expectEqual(c.bits, qp.bits);
         try testing.expectEqual(c.group, qp.group_size);
         try testing.expectEqual(c.mode, qp.mode);

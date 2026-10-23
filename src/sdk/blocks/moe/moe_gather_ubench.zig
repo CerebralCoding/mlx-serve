@@ -9,6 +9,9 @@ const env = @import("../../../env.zig");
 const kernelSource = @import("../../../mlx/kernels.zig").source;
 const mlx = @import("../../../mlx/ffi.zig");
 const xfm = @import("../../../engines/mlx/transformer.zig");
+const down_reduce = @import("down_reduce.zig");
+const gather_qmv = @import("gather_qmv.zig");
+const gather_qmv_rows = @import("gather_qmv_rows.zig");
 const io_util = @import("../../util/io_util.zig");
 
 const E: c_int = 512;
@@ -159,12 +162,12 @@ fn stockDownReduce(in: *const Inputs, inds: mlx.mlx_array) !mlx.mlx_array {
 fn call(in: *const Inputs, arm: Arm, i: usize) !mlx.mlx_array {
     const inds = in.inds[i % CALLS_SMALL];
     switch (arm) {
-        .gateup => return (try xfm.gatherQmvGateUp(in.s, in.x, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, 0)) orelse error.GateUpDeclined,
-        .downred => return (try xfm.gatherQmvDownReduce(in.s, in.x_down, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse error.DownReduceDeclined,
+        .gateup => return (try gather_qmv.gatherQmvGateUp(in.s, in.x, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, 0)) orelse error.GateUpDeclined,
+        .downred => return (try down_reduce.gatherQmvDownReduce(in.s, in.x_down, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse error.DownReduceDeclined,
         .pair => {
-            const act = (try xfm.gatherQmvGateUp(in.s, in.x, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, 0)) orelse return error.GateUpDeclined;
+            const act = (try gather_qmv.gatherQmvGateUp(in.s, in.x, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, 0)) orelse return error.GateUpDeclined;
             defer _ = mlx.mlx_array_free(act);
-            return (try xfm.gatherQmvDownReduce(in.s, act, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse error.DownReduceDeclined;
+            return (try down_reduce.gatherQmvDownReduce(in.s, act, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse error.DownReduceDeclined;
         },
         .stock_gateup => return stockGateUp(in, inds),
         .stock_downred => return stockDownReduce(in, inds),
@@ -320,12 +323,12 @@ const RowsArm = enum { gateup, downred, pair, decode_pair_x_rows };
 fn rowsCall(in: *const RowsIn, arm: RowsArm, i: usize) !mlx.mlx_array {
     const inds = in.inds[i % CALLS_SMALL];
     switch (arm) {
-        .gateup => return (try xfm.gatherQmvGateUpRows(in.s, in.x, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, null)) orelse error.GateUpRowsDeclined,
-        .downred => return (try xfm.gatherQmvDownReduceRows(in.s, in.x_act, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse error.DownRowsDeclined,
+        .gateup => return (try gather_qmv_rows.gatherQmvGateUpRows(in.s, in.x, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, null)) orelse error.GateUpRowsDeclined,
+        .downred => return (try down_reduce.gatherQmvDownReduceRows(in.s, in.x_act, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse error.DownRowsDeclined,
         .pair => {
-            const act = (try xfm.gatherQmvGateUpRows(in.s, in.x, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, null)) orelse return error.GateUpRowsDeclined;
+            const act = (try gather_qmv_rows.gatherQmvGateUpRows(in.s, in.x, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, null)) orelse return error.GateUpRowsDeclined;
             defer _ = mlx.mlx_array_free(act);
-            return (try xfm.gatherQmvDownReduceRows(in.s, act, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse error.DownRowsDeclined;
+            return (try down_reduce.gatherQmvDownReduceRows(in.s, act, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse error.DownRowsDeclined;
         },
         // The same S tokens through the one-token decode kernels, one pair per row, as a solo verify would
         // run them without the rows arm. Each row's own [1, TOPK] expert vector is a slice of the table.
@@ -352,9 +355,9 @@ fn rowsCall(in: *const RowsIn, arm: RowsArm, i: usize) !mlx.mlx_array {
                 var s1 = mlx.mlx_array_new();
                 defer _ = mlx.mlx_array_free(s1);
                 try mlx.check(mlx.mlx_reshape(&s1, sr, &[_]c_int{TOPK}, 1, in.s));
-                const act = (try xfm.gatherQmvGateUp(in.s, x1, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, ind1, BITS, GS, .affine, 0)) orelse return error.GateUpDeclined;
+                const act = (try gather_qmv.gatherQmvGateUp(in.s, x1, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, ind1, BITS, GS, .affine, 0)) orelse return error.GateUpDeclined;
                 defer _ = mlx.mlx_array_free(act);
-                const d = (try xfm.gatherQmvDownReduce(in.s, act, in.down.w, in.down.sc, in.down.bi, ind1, s1, BITS, GS, .affine)) orelse return error.DownReduceDeclined;
+                const d = (try down_reduce.gatherQmvDownReduce(in.s, act, in.down.w, in.down.sc, in.down.bi, ind1, s1, BITS, GS, .affine)) orelse return error.DownReduceDeclined;
                 if (r == 0) {
                     _ = mlx.mlx_array_free(acc);
                     acc = d;
@@ -429,17 +432,17 @@ fn chainBatch(in: *const RowsIn, n: usize, mode: ChainMode) !void {
             .ops => try mlx.check(mlx.mlx_array_set(&out, xk)),
             .gateup => {
                 _ = mlx.mlx_array_free(out);
-                out = (try xfm.gatherQmvGateUpRows(in.s, xk, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, null)) orelse return error.GateUpRowsDeclined;
+                out = (try gather_qmv_rows.gatherQmvGateUpRows(in.s, xk, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, null)) orelse return error.GateUpRowsDeclined;
             },
             .downred => {
                 _ = mlx.mlx_array_free(out);
-                out = (try xfm.gatherQmvDownReduceRows(in.s, xk, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse return error.DownRowsDeclined;
+                out = (try down_reduce.gatherQmvDownReduceRows(in.s, xk, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse return error.DownRowsDeclined;
             },
             .pair => {
-                const act = (try xfm.gatherQmvGateUpRows(in.s, xk, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, null)) orelse return error.GateUpRowsDeclined;
+                const act = (try gather_qmv_rows.gatherQmvGateUpRows(in.s, xk, in.gate.w, in.gate.sc, in.gate.bi, in.up.w, in.up.sc, in.up.bi, inds, BITS, GS, .affine, null)) orelse return error.GateUpRowsDeclined;
                 defer _ = mlx.mlx_array_free(act);
                 _ = mlx.mlx_array_free(out);
-                out = (try xfm.gatherQmvDownReduceRows(in.s, act, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse return error.DownRowsDeclined;
+                out = (try down_reduce.gatherQmvDownReduceRows(in.s, act, in.down.w, in.down.sc, in.down.bi, inds, in.scores, BITS, GS, .affine)) orelse return error.DownRowsDeclined;
             },
         }
         _ = mlx.mlx_array_free(prev);

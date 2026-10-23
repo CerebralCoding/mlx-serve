@@ -11,10 +11,17 @@ const mlx = @import("../../mlx/ffi.zig");
 const log = @import("../../host/log.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const forward_ctx = @import("../../engines/mlx/forward_ctx.zig");
+const cache_mod = @import("../../engines/mlx/kv/cache.zig");
+const layer_weights = @import("../../engines/mlx/layer_weights.zig");
+const load_weights = @import("../../engines/mlx/load/weights.zig");
+const load_mod = @import("load.zig");
+const glm_weights = @import("weights.zig");
+const moe_weights = @import("../../sdk/blocks/moe/weights.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
 
 const Transformer = transformer_mod.Transformer;
-const KVCache = transformer_mod.KVCache;
+const KVCache = cache_mod.KVCache;
 const ModelConfig = model_mod.ModelConfig;
 const Weights = model_mod.Weights;
 
@@ -29,9 +36,9 @@ pub const Head = struct {
     norm: mlx.mlx_array,
     input_norm: mlx.mlx_array,
     post_norm: mlx.mlx_array,
-    eh_proj: transformer_mod.QW,
-    dsa: transformer_mod.DsaWeights,
-    moe: transformer_mod.MoeMlpWeights,
+    eh_proj: layer_weights.QW,
+    dsa: glm_weights.DsaWeights,
+    moe: moe_weights.MoeMlpWeights,
     rerank_coarse: ?mtp_mod.RerankCoarse = null,
     rerank_logged: bool = false,
     ev_seed_accept: ?[mtp_mod.MAX_DEPTH]f32 = null,
@@ -57,16 +64,16 @@ pub const Head = struct {
             .s = s,
             .allocator = allocator,
             .eps = config.rms_norm_eps,
-            .enorm = try transformer_mod.getWeightAt(weights, &name_buf, base, "enorm.weight"),
-            .hnorm = try transformer_mod.getWeightAt(weights, &name_buf, base, "hnorm.weight"),
-            .norm = try transformer_mod.getWeightAt(weights, &name_buf, base, "norm.weight"),
-            .input_norm = try transformer_mod.getWeightAt(weights, &name_buf, block, "input_layernorm.weight"),
-            .post_norm = try transformer_mod.getWeightAt(weights, &name_buf, block, "post_attention_layernorm.weight"),
-            .eh_proj = try transformer_mod.loadQWAt(weights, &name_buf, base, "eh_proj"),
-            .dsa = try transformer_mod.loadDsaWeightsAt(weights, &name_buf, block, &owned, allocator, s),
-            .moe = try transformer_mod.loadRoutedMoeAt(weights, &name_buf, block, true, config, &owned, allocator, s),
+            .enorm = try load_weights.getWeightAt(weights, &name_buf, base, "enorm.weight"),
+            .hnorm = try load_weights.getWeightAt(weights, &name_buf, base, "hnorm.weight"),
+            .norm = try load_weights.getWeightAt(weights, &name_buf, base, "norm.weight"),
+            .input_norm = try load_weights.getWeightAt(weights, &name_buf, block, "input_layernorm.weight"),
+            .post_norm = try load_weights.getWeightAt(weights, &name_buf, block, "post_attention_layernorm.weight"),
+            .eh_proj = try load_weights.loadQWAt(weights, &name_buf, base, "eh_proj"),
+            .dsa = try load_mod.loadDsaWeightsAt(weights, &name_buf, block, &owned, allocator, s),
+            .moe = try load_weights.loadRoutedMoeAt(weights, &name_buf, block, true, config, &owned, allocator, s),
         };
-        try transformer_mod.maybeTransposeForBf16(&head.eh_proj.w, head.eh_proj.s, &owned, allocator, s);
+        try load_weights.maybeTransposeForBf16(&head.eh_proj.w, head.eh_proj.s, &owned, allocator, s);
         head.owned = owned;
         // Resident at load, so the load gate and admission see the expert banks.
         try mlx.evalFields(head);
@@ -154,7 +161,7 @@ pub const Head = struct {
         const a_in = try self.rmsNorm(x, self.input_norm);
         defer _ = mlx.mlx_array_free(a_in);
         var seq_offset: usize = 0;
-        var ctx = transformer_mod.ForwardCtx{
+        var ctx = forward_ctx.ForwardCtx{
             .cache = cache,
             .moe_seq_offset = &seq_offset,
             .ssm_entries = null,

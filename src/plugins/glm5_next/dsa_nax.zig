@@ -216,7 +216,7 @@ fn hostF32(a: mlx.mlx_array, s: mlx.mlx_stream, alloc: std.mem.Allocator) ![]f32
 }
 
 test "dsa sparse latent attention with a roped part equals the latent attention over the joined rows" {
-    if (mlx.noGpuBackend() or !@import("../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !@import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
     const had_error = mlx.errorPending();
     errdefer mlx.dropLatchedErrorUnless(had_error);
     // The second shape's 4 index slots are bound as a constant array.

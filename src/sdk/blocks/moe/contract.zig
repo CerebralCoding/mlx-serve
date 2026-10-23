@@ -32,6 +32,7 @@ const dr = @import("down_reduce.zig");
 const fa = @import("../mlp/fused_activations.zig");
 const activations = @import("../mlp/activations.zig");
 const transformer = @import("../../../engines/mlx/transformer.zig");
+const device_mod = @import("../../../mlx/device.zig");
 const moe_fp4 = @import("moe_fp4.zig");
 const rk = @import("router_kernel.zig");
 const routing = @import("routing.zig");
@@ -2373,7 +2374,7 @@ const GqmmNax = struct {
     }
 
     pub fn prepare(self: *GqmmNax, shape: Shape, fill: spec.Fill, seed: u64) !bool {
-        if (!transformer.naxAvailable()) return error.NaxOnly;
+        if (!device_mod.naxAvailable()) return error.NaxOnly;
         if (self.geometry(shape) == null) return false;
         const a = self.rig.a;
         self.shape = shape;
@@ -2970,7 +2971,7 @@ test "kernel contract moe: each verify launch is its wrapper's bytes, the prefil
 }
 
 test "kernel contract moe: the NAX scan chained into each NAX gather launch is the wrapper's bytes" {
-    if (mlx.noGpuBackend() or !transformer.naxAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !device_mod.naxAvailable()) return error.SkipZigTest;
     const a = std.testing.allocator;
     const Case = struct { kind: NaxKind, f: Fmt = .affine, bits: u32 = 4, gs: usize = 64, shape: Shape };
     const cases = [_]Case{

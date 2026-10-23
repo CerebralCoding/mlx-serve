@@ -6389,7 +6389,7 @@ test "minimax h3 live: the SwiGLU fallback reads every row of a [S, 28672] fc1 o
 }
 
 test "minimax h3: DiT block linears under w8a8 stay within their bar of the packed block" {
-    if (!@import("../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     // The same toy fixture as below; its qkv and fc1 take the route (K = 256), out and fc2 do not.
     const a = testing.allocator;
     const s = mlx.gpuStream();

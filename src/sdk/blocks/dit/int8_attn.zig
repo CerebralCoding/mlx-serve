@@ -301,28 +301,28 @@ fn attnError(h: c_int, kv: c_int, lq: c_int, l: c_int, seed: u64, s: mlx.mlx_str
 }
 
 test "int8 attention equals sdpa within quantization error (GQA, ragged length)" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     try testing.expect(try attnError(8, 2, 333, 333, 21, s) < 0.03);
 }
 
 test "int8 attention equals sdpa within quantization error (MHA, whole blocks)" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     try testing.expect(try attnError(4, 4, 512, 512, 31, s) < 0.03);
 }
 
 test "int8 attention equals sdpa within quantization error (fewer queries than keys)" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     try testing.expect(try attnError(4, 4, 200, 517, 41, s) < 0.03);
 }
 
 test "int8 attention heads: a batch of f16 rows equals sdpa row for row, in sdpa's layout and dtype" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.mlx_default_gpu_stream_new();
     defer _ = mlx.mlx_stream_free(s);
     const parts = [_]mlx.mlx_array{ try randn(&.{ 2, 4, 300, 128 }, 51, s), try randn(&.{ 2, 4, 257, 128 }, 52, s), try randn(&.{ 2, 4, 257, 128 }, 53, s) };

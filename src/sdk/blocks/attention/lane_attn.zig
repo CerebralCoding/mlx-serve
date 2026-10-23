@@ -266,7 +266,7 @@ fn maxAbsDiff(a: mlx.mlx_array, b: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 }
 
 test "lane_attn: every window row equals the one-row step at its position, and matches MLX's sdpa" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     // Qwen3.8-27B: 24 query heads over 4 kv heads, head dim 256; cache views
     // longer than the keys. A short prefix (one partial tile), one where the
@@ -318,7 +318,7 @@ test "lane_attn: every window row equals the one-row step at its position, and m
 }
 
 test "lane_attn: a tree node equals the one-row step over its own path's keys" {
-    if (!@import("../../../engines/mlx/transformer.zig").naxAvailable()) return error.SkipZigTest;
+    if (!@import("../../../mlx/device.zig").naxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     const H: c_int = 24;
     const HKV: c_int = 4;

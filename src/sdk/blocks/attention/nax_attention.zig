@@ -55,7 +55,7 @@ fn passEdges(out: *[MAX_PASSES + 1]c_int, groups: c_int, nk: c_int, window: c_in
 /// with a contiguous head dim), `sinks` [H] or null: [B, H, L, 128] in q's dtype.
 /// Null off NAX and outside this shape.
 pub fn attention(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, window: c_int, sinks: ?mlx.mlx_array) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !@import("../../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return null;
+    if (!mlx.streamIsGpu(s) or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return null;
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
@@ -217,7 +217,7 @@ pub fn attention256Int8(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v
 }
 
 pub fn attention256Int8Impl(s: mlx.mlx_stream, q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or !@import("../../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return null;
+    if (!mlx.streamIsGpu(s) or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return null;
     if (mlx.mlx_array_ndim(q) != 4 or mlx.mlx_array_ndim(k) != 4 or mlx.mlx_array_ndim(v) != 4) return null;
     const qs = mlx.getShape(q);
     const ks = mlx.getShape(k);
@@ -348,7 +348,7 @@ fn truth(q: mlx.mlx_array, k: mlx.mlx_array, v: mlx.mlx_array, scale: f32, windo
 }
 
 test "nax attention q/k 192 (MiMo) or 128 (Flint), v 128: causal, windowed and sunk prefill track fp32 attention" {
-    if (mlx.noGpuBackend() or !@import("../../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(192128);
     const rnd = prng.random();
@@ -387,7 +387,7 @@ test "nax attention q/k 192 (MiMo) or 128 (Flint), v 128: causal, windowed and s
 }
 
 test "nax attention 192/128: key-range passes reproduce one dispatch bit for bit" {
-    if (mlx.noGpuBackend() or !@import("../../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(192129);
     const rnd = prng.random();
@@ -436,7 +436,7 @@ fn relRms(a: mlx.mlx_array, ref: mlx.mlx_array, s: mlx.mlx_stream) !f32 {
 }
 
 test "nax attention 256 int8 QK: causal prefill tracks fp32 attention, tails and offset keys included" {
-    if (mlx.noGpuBackend() or !@import("../../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(256008);
     const rnd = prng.random();
@@ -480,7 +480,7 @@ test "nax attention 256 int8 QK: off unless MLX_SERVE_INT8_QK is set and not 0; 
     try testing.expect(!int8QkEnabledFrom("0"));
     try testing.expect(!int8QkEnabledFrom(""));
     try testing.expect(int8QkEnabledFrom("1"));
-    if (mlx.noGpuBackend() or !@import("../../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return;
+    if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return;
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(256009);
     const rnd = prng.random();
@@ -566,7 +566,7 @@ fn quantHash(p: [2]mlx.mlx_array, s: mlx.mlx_stream) !u64 {
 }
 
 test "int8 Q/K quantizers: codes and scales of both attention kernels are pinned bit for bit" {
-    if (mlx.noGpuBackend() or !@import("../../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (mlx.noGpuBackend() or !@import("../linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return error.SkipZigTest;
     const int8_attn = @import("../dit/int8_attn.zig");
     const s = mlx.gpuStream();
     var prng = std.Random.DefaultPrng.init(8128256);

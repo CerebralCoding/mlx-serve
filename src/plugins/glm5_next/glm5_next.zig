@@ -449,7 +449,7 @@ fn scalarI(v: i32) mlx.mlx_array {
 
 /// `dsa_nax.indexerScores` where the device has NAX.
 fn indexerScoresNax(s: mlx.mlx_stream, q_idx: mlx.mlx_array, w: mlx.mlx_array, pk: mlx.mlx_array, q_start: c_int, kpool: c_int) !?mlx.mlx_array {
-    if (!@import("../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return null;
+    if (!@import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return null;
     return dsa.indexerScores(s, q_idx, w, pk, q_start, kpool);
 }
 
@@ -1093,7 +1093,7 @@ pub fn sparseLatentAttention(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: ml
 
 /// `sparseLatentAttention` on the tensor units (`dsa_nax.sparseLatent`) where the device has NAX.
 pub fn sparseLatentNax(s: mlx.mlx_stream, q_abs: mlx.mlx_array, latent: mlx.mlx_array, idx: mlx.mlx_array, scale: f32) !?mlx.mlx_array {
-    if (!@import("../../engines/mlx/transformer.zig").verifyQmmNaxAvailable()) return null;
+    if (!@import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable()) return null;
     return dsa.sparseLatent(s, q_abs, latent, idx, scale);
 }
 

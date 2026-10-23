@@ -3,7 +3,9 @@
 //! until `Bill.prefill_bytes` carries max_tokens and the warm prefix.
 
 const std = @import("std");
-const transformer_mod = @import("../../engines/mlx/transformer.zig");
+const cache_mod = @import("../../engines/mlx/kv/cache.zig");
+const prefill_dq_gemm = @import("../../sdk/blocks/linear/prefill_dq_gemm.zig");
+const verify_qmm_nax = @import("../../sdk/blocks/linear/verify_qmm_nax.zig");
 const generate_mod = @import("../../engines/mlx/generate.zig");
 const model_mod = @import("../../engines/mlx/model.zig");
 const http_server = @import("../../host/http/server.zig");
@@ -33,12 +35,12 @@ pub fn glm5PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, m
     // Generation growth is billed to the KV reserve's headroom, as the drafter term is: an omitted
     // max_tokens is the rest of the window (1M here), and pricing that answer's KV refused a
     // 431-token prompt at 43 GB beside 36 GB free.
-    const output = @min(max_tokens, transformer_mod.KVCache.RESERVE_GEN_HEADROOM, if (ctx > 0) ctx -| seq else max_tokens);
+    const output = @min(max_tokens, cache_mod.KVCache.RESERVE_GEN_HEADROOM, if (ctx > 0) ctx -| seq else max_tokens);
     const end = seq +| output;
     const kv_tok = kvBytesPerTokenAtBits(config.kvBytesPerToken(), kv_bits);
     const view_tok: u64 = if (kv_bits < 16) glm5DequantWidth(config) else 0;
     const fwd = @min(chunk, @max(seq -| warm.matched_tokens, 1));
-    const nax = transformer_mod.verifyQmmNaxAvailable();
+    const nax = verify_qmm_nax.verifyQmmNaxAvailable();
 
     // Prompt KV, the f32 KDA checkpoints, the live state with two lag snapshots and a capture.
     const resident = seq *| kv_tok +| retainedSsmCheckpointBytes(config, seq, warm.matched_tokens, chunk) +|
@@ -46,7 +48,7 @@ pub fn glm5PrefillMemoryNeeded(config: *const model_mod.ModelConfig, seq: u64, m
 
     const mlp: u64 = 8 * fwd * @max(@as(u64, config.hidden_size), prefillFfnWidth(config)) * 2;
     const envelope = @max(3 * mlp, mlp + fwd * prefillStreamBytesPerToken(config));
-    const dq_weights = if (fwd >= transformer_mod.prefillDqGemmMinRows(config.quant_bits)) prefillDequantWeightBytes(config) else 0;
+    const dq_weights = if (fwd >= prefill_dq_gemm.prefillDqGemmMinRows(config.quant_bits)) prefillDequantWeightBytes(config) else 0;
     // Generated tokens decode one row at a time and never build the score sheet: prompt pools only.
     const pools = seq / @max(@as(u64, config.dsa_index_kpool), 1);
     const indexed = nax and config.dsa_index_head_dim == 128 and config.hadamard_block == 0;
@@ -112,7 +114,7 @@ test "GLM bill: decode growth is billed to the generation headroom, never the au
     defer saved.restore();
     var glm = glm5TestConfig();
     glm.ctx_override = 1 << 20;
-    const headroom = transformer_mod.KVCache.RESERVE_GEN_HEADROOM;
+    const headroom = cache_mod.KVCache.RESERVE_GEN_HEADROOM;
     const kv_tok = glm.kvBytesPerToken();
     // A client that sets no max_tokens gets the rest of the window: that answer is billed like one of
     // `headroom` tokens, so a short prompt's bill does not depend on the window it was pegged to.
@@ -132,7 +134,7 @@ test "GLM bill: a prompt token costs its KV, one layer's grow copy and its index
     defer saved.restore();
     var glm = glm5TestConfig();
     const kv_tok = glm.kvBytesPerToken();
-    const per_pool: u64 = GLM5_INDEXER_BYTES_PER_POOL + if (transformer_mod.verifyQmmNaxAvailable()) @as(u64, 0) else 12 * 32;
+    const per_pool: u64 = GLM5_INDEXER_BYTES_PER_POOL + if (verify_qmm_nax.verifyQmmNaxAvailable()) @as(u64, 0) else 12 * 32;
     const a = glm5PrefillMemoryNeeded(&glm, 100_100, 64, 16, 4096, .{});
     const b = glm5PrefillMemoryNeeded(&glm, 144_100, 64, 16, 4096, .{});
     // 44,000 more prompt tokens: their KV, a 1/11 share for the one DSA layer that grows, 11,000 pools.
@@ -168,7 +170,7 @@ test "GLM bill: warm credit requires donation and never erases checkpoints" {
 
 test "GLM bill: covers the measured peaks without doubling them" {
     const t = std.testing;
-    if (!transformer_mod.verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (!verify_qmm_nax.verifyQmmNaxAvailable()) return error.SkipZigTest;
     const saved = GlmBillGlobals.pin();
     defer saved.restore();
     var glm = glm5TestConfig();
@@ -197,7 +199,7 @@ test "GLM bill: covers the measured peaks without doubling them" {
 
 test "GLM bill: the 96 GB Q8 prompts stay under their admitted ceilings" {
     const t = std.testing;
-    if (!transformer_mod.verifyQmmNaxAvailable()) return error.SkipZigTest;
+    if (!verify_qmm_nax.verifyQmmNaxAvailable()) return error.SkipZigTest;
     const saved = GlmBillGlobals.pin();
     defer saved.restore();
     var glm = glm5TestConfig();

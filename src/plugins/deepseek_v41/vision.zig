@@ -24,6 +24,7 @@ const Weights = model_mod.Weights;
 const qwen_vision = @import("../../sdk/vision/qwen_vision.zig");
 const glm_vision = @import("../glm5_next/vision.zig");
 const transformer = @import("../../engines/mlx/transformer.zig");
+const params = @import("../../sdk/quant/params.zig");
 const log = @import("../../host/log.zig");
 
 const Lin = glm_vision.Lin;
@@ -473,7 +474,7 @@ const NameCtx = struct {
         if (self.get(fmt ++ ".scales", args)) |sc| {
             l.scales = sc;
             l.biases = self.get(fmt ++ ".biases", args) orelse .{ .ctx = null };
-            l.qp = transformer.quantParamsFromGeometry(l.w, sc, l.biases.ctx != null, in_dim) orelse {
+            l.qp = params.quantParamsFromGeometry(l.w, sc, l.biases.ctx != null, in_dim) orelse {
                 log.warn("DEEPSEEK VISION: unreadable quantization on " ++ fmt ++ "\n", args);
                 return error.InvalidVisionWeights;
             };
