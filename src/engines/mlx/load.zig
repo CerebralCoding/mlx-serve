@@ -9,7 +9,6 @@ const gen_mod = @import("../../host/media_jobs/gen.zig");
 const drafter_mod = @import("../../plugins/gemma4/assistant_drafter.zig");
 const mtp_graft = @import("../../plugins/prism_hadamard_qwen35/mtp_graft.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
-const mimo_mtp = @import("../../plugins/mimo_v2/mtp.zig");
 const glm_mtp = @import("../../plugins/glm5_next/mtp.zig");
 const ane_mod = @import("../../sdk/ane/offload.zig");
 const model_mod = @import("model.zig");
@@ -55,7 +54,6 @@ const drafterResidentBytes = @import("../../host/registry/preflight.zig").drafte
 const preflightVerdict = @import("../../host/registry/preflight.zig").preflightVerdict;
 const loadRequirementBytes = @import("../../host/registry/preflight.zig").loadRequirementBytes;
 const loadGlmHead = @import("../../plugins/glm5_next/mtp_load.zig").loadGlmHead;
-const loadMimoHead = @import("../../plugins/mimo_v2/mtp_load.zig").loadMimoHead;
 const scheduler_mod = @import("scheduler.zig");
 
 /// Phase A1 → Plan 05: do the full model load on the inference thread.
@@ -640,19 +638,13 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     var mtp_ptr: ?*mtp_mod.MtpModel = null;
     var mtp_cost_profile: mtp_mod.MtpCostProfile = .generic;
     if (mtp_enabled) mtp_graft.ensure(sch.allocator, sch.io, params.model_dir, params.config);
-    // MiMo's heads and GLM's layer are in-checkpoint blocks of their own shape, read from the trunk's weights.
-    var mimo_head: ?*mimo_mtp.Head = null;
+    // GLM's layer is an in-checkpoint block of its own shape, read from the trunk's weights.
     var glm_head: ?*glm_mtp.Head = null;
     // A served model's head is its plugin's (`SpecHooks.head`), never a legacy arm reading the shell's config.
     var plugin_mtp: ?*plugin_head.Head = null;
     if (served) {
         if (mtp_enabled) plugin_mtp = plugin_head.load(sch.io, sch.allocator, xfm_ptr, params.model_dir);
         if (plugin_mtp) |h| mtp_cost_profile = h.profile;
-    } else if (mtp_enabled and params.config.isMimo()) {
-        mimo_head = loadMimoHead(sch.allocator, params.config, weights_ptr, xfm_ptr) catch |err| blk: {
-            log.warn("MiMo MTP heads failed to load ({s}) — MTP off.\n", .{@errorName(err)});
-            break :blk null;
-        };
     } else if (mtp_enabled and params.config.isGlm5()) {
         glm_head = loadGlmHead(sch.allocator, params.config, weights_ptr, xfm_ptr) catch |err| blk: {
             log.warn("GLM MTP head failed to load ({s}) — MTP off.\n", .{@errorName(err)});
@@ -699,10 +691,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
         );
     }
     errdefer if (mtp_ptr) |h| {
-        h.deinit();
-        sch.allocator.destroy(h);
-    };
-    errdefer if (mimo_head) |h| {
         h.deinit();
         sch.allocator.destroy(h);
     };
@@ -805,8 +793,6 @@ pub fn doLoadOnInferenceThread(sch: *Scheduler, params: anytype) !void {
     entry.drafter_block_size = sch.drafter_block_size;
     entry.mtp = if (mtp_ptr) |h|
         generate_mod.MtpHeadRef{ .qwen = h }
-    else if (mimo_head) |h|
-        generate_mod.MtpHeadRef{ .mimo = h }
     else if (glm_head) |h|
         generate_mod.MtpHeadRef{ .glm = h }
     else if (plugin_mtp) |h|

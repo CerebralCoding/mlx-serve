@@ -2,7 +2,7 @@
 
 Owns `laguna` (poolside Laguna S 2.1, 117.6B-A8.5B coder). Served (see "Served"). `config.zig` and `family.zig` are
 the attention-MoE family's shared parse and load: `flint` and `kolibri1` reuse them from their own folders.
-`load.zig` is the router-name probe MiMo's legacy load still reads; `ubench_test.zig` an env-gated GEMV bench.
+`ubench_test.zig` is an env-gated GEMV bench.
 
 - Forward: `Decoder(TableEmbed, RmsNorm, DecodeCopies(LagunaAttention(.softplus_gate)), family.Mlp, AddNorm, LmHead)`.
   `Mlp` is a dense `GatedMlp` on `mlp_only_layers` (found by `mlp.switch_mlp.gate_proj.weight` presence, as the

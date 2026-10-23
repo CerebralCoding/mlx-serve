@@ -480,11 +480,10 @@ test "the YaRN mscale table never reaches a multiply in its load-time dtype" {
         @embedFile("../../../engines/mlx/load/init.zig") ++
         @embedFile("yarn.zig") ++
         @embedFile("../attention/gated_full.zig") ++
-        @embedFile("../attention/sinks.zig") ++
         @embedFile("qk_norm_rope.zig");
     // Needles are assembled at comptime: spelled whole, they would appear in
     // this test's own source and the scan would satisfy itself.
-    const routed = "constTableAs(" ++ "ms_f32,";
+    const routed = "constTableAs(" ++ "self.yarn_mscale.?,";
     const raw_table = "yarn_" ++ "mscale";
     const raw_local = "ms_" ++ "f32";
     const mul = "mlx_" ++ "multiply(";

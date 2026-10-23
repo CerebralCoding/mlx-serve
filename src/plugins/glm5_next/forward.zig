@@ -29,7 +29,7 @@ const materializedOwnedCopy = @import("../../mlx/array.zig").materializedOwnedCo
 const LinearAttnWeights = @import("../../sdk/blocks/gdn/gated_delta_net.zig").LinearAttnWeights;
 const qwen4CompareRows = @import("../../sdk/testing/parity.zig").qwen4CompareRows;
 const qwen4ReadF32 = @import("../../sdk/testing/parity.zig").qwen4ReadF32;
-const mimoDecidedMisses = @import("../mimo_v2/attention.zig").mimoDecidedMisses;
+const mimoDecidedMisses = @import("../../sdk/testing/parity.zig").decidedMisses;
 const Qwen4TestSlot = @import("../qwen4_exp/forward.zig").Qwen4TestSlot;
 const DsaWeights = @import("weights.zig").DsaWeights;
 

@@ -45,7 +45,6 @@ const gen_sse = @import("../../host/media_jobs/sse.zig");
 const drafter_mod = @import("../../plugins/gemma4/assistant_drafter.zig");
 const mtp_graft = @import("../../plugins/prism_hadamard_qwen35/mtp_graft.zig");
 const mtp_mod = @import("../../sdk/spec/mtp/mtp.zig");
-const mimo_mtp = @import("../../plugins/mimo_v2/mtp.zig");
 const glm_mtp = @import("../../plugins/glm5_next/mtp.zig");
 const ane_mod = @import("../../sdk/ane/offload.zig");
 const diffusion_mod = @import("../../plugins/diffusion_gemma/runner.zig");
@@ -177,7 +176,6 @@ test {
     _ = @import("../../host/registry/preflight.zig");
     _ = @import("../../plugins/diffusion_gemma/scheduler_arm.zig");
     _ = @import("../../plugins/glm5_next/mtp_load.zig");
-    _ = @import("../../plugins/mimo_v2/mtp_load.zig");
 }
 
 /// Set by `server.installPrefillAdmission`: does a request of this shape fit in GPU memory

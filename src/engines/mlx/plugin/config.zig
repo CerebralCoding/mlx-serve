@@ -79,6 +79,8 @@ pub fn bindServed(io: std.Io, a: std.mem.Allocator, model_dir: []const u8, confi
     defer arena.deinit();
     const model_type = sdk_plugin.modelTypeOf(arena.allocator(), config_json) catch return null;
     if (!served.legacyRemoved(model_type)) return null;
+    // An mlx-stream pack is its stream module's, never a legacy forward's.
+    if (model.declaresExpertStreaming(a, config_json)) return null;
     log.err("[plugin] {s}: its plugin does not serve this pack and the legacy forward is gone\n", .{model_type});
     return error.PluginDeclinedNoLegacy;
 }

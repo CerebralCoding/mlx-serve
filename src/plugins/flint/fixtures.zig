@@ -10,7 +10,7 @@ const Transformer = @import("../../engines/mlx/transformer.zig").Transformer;
 const driver = @import("../../engines/mlx/plugin/driver.zig");
 const qwen4CompareRows = @import("../../sdk/testing/parity.zig").qwen4CompareRows;
 const qwen4ReadF32 = @import("../../sdk/testing/parity.zig").qwen4ReadF32;
-const mimoDecidedMisses = @import("../mimo_v2/attention.zig").mimoDecidedMisses;
+const mimoDecidedMisses = @import("../../sdk/testing/parity.zig").decidedMisses;
 
 // ── tests ──
 
