@@ -643,7 +643,7 @@ fn streamedRouted(w: *const Moe.Weights, st: *const Streamed, g: *Graph, x: Arra
             down_reduce.gatherQmvDownReduceRowsEligible(model.HiddenAct.silu, gq, uq, dq, D));
     if (one_bank_kernels) return error.StreamedArmUnsupported;
     if (B * S > 1 or B * S * K >= 64) return sortedSlots(w, g, x, r, &sl, B, S, D, K);
-    if ((useGatherQmv(w) and (gq.mode == .affine or gq.mode == .nvfp4)) or batchedForced()) return error.StreamedArmUnsupported;
+    if (useGatherQmv(w) and (gq.mode == .affine or gq.mode == .nvfp4)) return error.StreamedArmUnsupported;
     return unsortedSlots(w, g, x, &sl, B, S, D, K);
 }
 
