@@ -187,7 +187,7 @@ pub fn gatherQmvGateUp(
     limit: u32,
 ) !?mlx.mlx_array {
     if (!gatherQmvGateUpEnabled()) return null;
-    if (!mlx.streamIsGpu(s) or env.presentCached(&gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return null;
+    if (!mlx.streamIsGpu(s)) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -325,7 +325,6 @@ const GqmvCfgSlot = struct {
 };
 var gqmv_cfg_cache: [2]GqmvCfgSlot = .{ .{}, .{} };
 
-pub var gqmv_disabled_env: ?bool = null;
 pub var gqmv_engaged: bool = false;
 pub var decode_ladder_engaged: bool = false;
 
@@ -364,7 +363,7 @@ pub fn gatherQmvAct(
     x_per_expert: bool,
     act_relu2: bool,
 ) !?mlx.mlx_array {
-    if (!mlx.streamIsGpu(s) or env.presentCached(&gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return null;
+    if (!mlx.streamIsGpu(s)) return null;
     // Two dequant arithmetics, one kernel shape. Any other mode (mxfp4/mxfp8,
     // whose scales are e8m0 over different group sizes) falls back — running a
     // bank through the wrong dequant is silently wrong, not a crash.

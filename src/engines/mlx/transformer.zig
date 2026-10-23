@@ -365,7 +365,6 @@ pub const clampedSwiGLU = @import("../../sdk/blocks/mlp/activations.zig").clampe
 pub const dispatchProbeCount = @import("diag/profile.zig").dispatchProbeCount;
 pub const decodeProfReport = @import("diag/profile.zig").decodeProfReport;
 // sdk/blocks/moe/decode.zig
-pub const gatherDecodeForcedStock = @import("../../sdk/blocks/moe/decode.zig").gatherDecodeForcedStock;
 // sdk/blocks/attention/masks.zig
 pub const encoderBandMask = @import("../../sdk/blocks/attention/masks.zig").encoderBandMask;
 // sdk/quant/mxfp8.zig
@@ -1209,7 +1208,6 @@ pub const Transformer = struct {
     pub const moeMLP2WithRouter = @import("../../sdk/blocks/moe/moe.zig").moeMLP2WithRouter;
     // sdk/blocks/moe/decode.zig
     pub const glmMoeDecode = @import("../../sdk/blocks/moe/decode.zig").glmMoeDecode;
-    pub const batchedExpertMm = @import("../../sdk/blocks/moe/decode.zig").batchedExpertMm;
     pub const moeDecodeGatherQmv = @import("../../sdk/blocks/moe/decode.zig").moeDecodeGatherQmv;
     pub const moeFp4Decode = @import("../../sdk/blocks/moe/decode.zig").moeFp4Decode;
     pub const moeAffine4Decode = @import("../../sdk/blocks/moe/decode.zig").moeAffine4Decode;

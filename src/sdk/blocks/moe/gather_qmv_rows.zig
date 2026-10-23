@@ -80,23 +80,12 @@ pub fn moeRowsFusedEnabled() bool {
 }
 
 pub var moe_verify_rows_override: ?bool = null; // test seam
-var moe_verify_rows_cached: ?bool = null;
 pub var moe_verify_rows_logged: bool = false;
 
-/// Single-slot verify widths (B == 1, 2 <= S <= 8) through the rows arm, on by
-/// default (M4 Max Flash Next S=2 26.9 -> 23.5 ms); MLX_SERVE_MOE_VERIFY_ROWS=0 keeps the sorted path.
+/// Single-slot verify widths (B == 1, 2 <= S <= 8) through the rows arm (M4 Max Flash Next S=2 26.9 -> 23.5 ms);
+/// the test seam false keeps the sorted path.
 fn moeVerifyRowsEnabled() bool {
-    if (moe_verify_rows_override) |v| return v;
-    if (moe_verify_rows_cached) |v| return v;
-    const raw = env.get(.MLX_SERVE_MOE_VERIFY_ROWS);
-    const on = moeVerifyRowsFor(if (raw) |r| std.mem.sliceTo(r, 0) else null);
-    moe_verify_rows_cached = on;
-    return on;
-}
-
-fn moeVerifyRowsFor(raw: ?[]const u8) bool {
-    if (raw) |e| return !std.mem.eql(u8, e, "0");
-    return true;
+    return moe_verify_rows_override orelse true;
 }
 
 /// The CUDA fused MoE decode's format for these banks, or null where it declines: one fp mode on
@@ -152,7 +141,7 @@ pub fn gatherQmvGateUpRows(
     if (!gatherQmvGateUpEnabled()) return null;
     if (!moeRowsFusedEnabled()) return null;
     if (gate_scale != null and mode != .nvfp4) return null;
-    if (!mlx.streamIsGpu(s) or env.presentCached(&gather_qmv_mod.gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return null;
+    if (!mlx.streamIsGpu(s)) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -317,9 +306,6 @@ test "moe decode dispatch: single-slot verify widths take the rows arm when enab
     moe_verify_rows_override = false;
     try std.testing.expectEqual(MoeDecodeDispatchArm.sorted, moeDecodeDispatchArm(1, 4, K, false, false));
 
-    try std.testing.expect(moeVerifyRowsFor(null));
-    try std.testing.expect(!moeVerifyRowsFor("0"));
-    try std.testing.expect(moeVerifyRowsFor("1"));
 }
 
 test "gatherQmvGateUpRows accepts N=8 K=10" {

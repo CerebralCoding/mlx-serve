@@ -121,7 +121,7 @@ pub fn gatherQmvDownReduce(
     mode: QuantMode,
 ) !?mlx.mlx_array {
     if (!downReduceFusedEnabled()) return null;
-    if (!mlx.streamIsGpu(s) or env.presentCached(&gather_qmv.gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return null;
+    if (!mlx.streamIsGpu(s)) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,
@@ -248,7 +248,6 @@ var downred_rows_engaged: bool = false;
 pub fn gatherQmvDownReduceRowsEligible(hidden_act: anytype, gate_qp: anytype, up_qp: anytype, down_qp: anytype, N: c_int) bool {
     if (!downReduceFusedEnabled()) return false;
     if (!moeRowsFusedEnabled()) return false;
-    if (env.presentCached(&gather_qmv.gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return false;
     if (hidden_act != .silu) return false;
     if (gate_qp.bits != up_qp.bits or gate_qp.group_size != up_qp.group_size or gate_qp.mode != up_qp.mode) return false;
     switch (down_qp.mode) {
@@ -282,7 +281,7 @@ pub fn gatherQmvDownReduceRows(
 ) !?mlx.mlx_array {
     if (!downReduceFusedEnabled()) return null;
     if (!moeRowsFusedEnabled()) return null;
-    if (!mlx.streamIsGpu(s) or env.presentCached(&gather_qmv.gqmv_disabled_env, .MLX_SERVE_MOE_GATHER_QMV_OFF)) return null;
+    if (!mlx.streamIsGpu(s)) return null;
     const nvfp4 = switch (mode) {
         .affine => false,
         .nvfp4 => true,

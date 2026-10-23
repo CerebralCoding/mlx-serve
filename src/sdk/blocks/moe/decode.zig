@@ -64,29 +64,6 @@ pub fn glmMoeDecode(self: *Transformer, x: mlx.mlx_array, inds: mlx.mlx_array, s
     return out;
 }
 
-/// Decode-width expert projection via take + batched quantized_matmul,
-/// dodging our libmlx's serialized gather_qmm. `x_bc` is the [K,1,in] input
-/// (per-expert broadcast); `inds_flat` is the [K] selected-expert index
-/// vector. Returns [K,1,out]. Caller owns the result.
-pub fn batchedExpertMm(self: *Transformer, x_bc: mlx.mlx_array, w: mlx.mlx_array, sc: mlx.mlx_array, bi: mlx.mlx_array, inds_flat: mlx.mlx_array, bits: u32, group_size: u32, mode: QuantMode) !mlx.mlx_array {
-    var w_k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(w_k);
-    try mlx.check(mlx.mlx_take_axis(&w_k, w, inds_flat, 0, self.s));
-    var sc_k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(sc_k);
-    try mlx.check(mlx.mlx_take_axis(&sc_k, sc, inds_flat, 0, self.s));
-    var bi_k = mlx.mlx_array_new();
-    defer _ = mlx.mlx_array_free(bi_k);
-    var bi_arg = mlx.mlx_array{ .ctx = null };
-    if (bi.ctx != null) {
-        try mlx.check(mlx.mlx_take_axis(&bi_k, bi, inds_flat, 0, self.s));
-        bi_arg = bi_k;
-    }
-    var out = mlx.mlx_array_new();
-    try mlx.check(mlx.mlx_quantized_matmul(&out, x_bc, w_k, sc_k, bi_arg, true, mlx.mlx_optional_int.some(@intCast(group_size)), mlx.mlx_optional_int.some(@intCast(bits)), mode.cstr(), self.s));
-    return out; // [K, 1, out]
-}
-
 /// Decode-width MoE expert compute through the in-place gather-qmv kernel
 /// (`gatherQmv`), which indexes the expert bank directly instead of
 /// materializing the top-K experts. On success writes [B,S,K,hidden] into
@@ -418,57 +395,7 @@ pub fn moeMLP2(self: *Transformer, router_x: mlx.mlx_array, expert_x_in: mlx.mlx
     return self.moeMLP2WithRouter(router_x, expert_x_in, mw, null, false);
 }
 
-// MoE decode expert compute: our self-built libmlx serializes `gather_qmm` at
-// decode width (~10× vs a batched `quantized_matmul`; plain qmv overlaps fine —
-// verified by the MoE gather µbench). So at S==1 we CAN compute the top-K experts
-// as `take(experts) + broadcast(x) + batched quantized_matmul` (batchedExpertMm)
-// instead of one gather_qmm. Numerically the same per-expert matmul; not bit-
-// identical to the gather kernel (different reduction order, qmv-vs-qmm class).
-//
-// But this is a per-arch VALIDATED opt-in, NOT default-on-for-all-MoE. The
-// take-materialization (extracting the top-K experts from the bank every token)
-// only pays off where the serialized gather dominates — Laguna 2-bit large
-// experts: 17→48 tok/s. On small-expert MoEs the materialization overhead is a
-// NET LOSS: gemma4-26B-A4B measured 114→85 and Qwen3.6-MoE regressed too when
-// this path was briefly default-on (the 26.7.10 bench). Same class as the
-// "eligibility predicate silently adopts every matching shape" kernel rule.
-//
-// Policy (pure, unit-tested by `batchedExpertDecodePolicy` test):
-//   - MLX_SERVE_MOE_GATHER_DECODE=1  → hard force gather (beats everything).
-//   - MLX_SERVE_MOE_BATCHED_DECODE=1 → hard force batched (for A/B on any arch).
-//   - otherwise                      → stock gather, on every arch.
-//
-// The laguna default opted INTO the batched path on a 17→48 tok/s measurement
-// taken while the YaRN mscale f32 promotion inflated the whole forward ~3x.
-// Re-measured on the fixed tree it loses on both Laguna models (see the
-// `batchedExpertDecodePolicy` test for the numbers), so no arch opts in by
-// default any more. Both alternatives stay one env var away.
-fn batchedExpertDecodePolicy(model_type: []const u8, gather_force: bool, batched_force: bool) bool {
-    _ = model_type;
-    if (gather_force) return false;
-    return batched_force;
-}
-
-var moe_gather_force_env: ?bool = null;
-var moe_batched_force_env: ?bool = null;
-
-pub fn useBatchedExpertDecode(self: *const Transformer) bool {
-    return batchedExpertDecodePolicy(
-        self.config.model_type,
-        env.presentCached(&moe_gather_force_env, .MLX_SERVE_MOE_GATHER_DECODE),
-        env.presentCached(&moe_batched_force_env, .MLX_SERVE_MOE_BATCHED_DECODE),
-    );
-}
-
-/// `MLX_SERVE_MOE_GATHER_DECODE=1` — force stock `gather_qmm` everywhere,
-/// the A/B control arm for any arch wiring the gather-qmv kernels in.
-pub fn gatherDecodeForcedStock() bool {
-    return env.presentCached(&moe_gather_force_env, .MLX_SERVE_MOE_GATHER_DECODE);
-}
-
 pub fn useGatherQmvDecode(self: *const Transformer, gate_qp: QuantParams, up_qp: QuantParams) bool {
-    if (env.presentCached(&moe_gather_force_env, .MLX_SERVE_MOE_GATHER_DECODE)) return false;
-    if (useBatchedExpertDecode(self)) return true; // explicit batched opt-in still tries it first
     if (gate_qp.mode == .gguf) return false; // raw ggml blocks: gatherExpertMm has their kernel
     if (self.config.hidden_act != .silu) return false;
     // The fused kernel bakes in silu(gate)*up, clamped at a whole-number limit; others stay composed.
@@ -487,42 +414,6 @@ pub fn moeFp4DecodeEligible(rows: c_int, has_expert_bias: bool, clamp: ?u32, act
 }
 
 // ── tests ──
-
-test "batchedExpertDecodePolicy: stock gather is the default on EVERY arch" {
-    // History, and why the laguna opt-in was retired.
-    //
-    // The batchedExpertMm decode path (take + batched quantized_matmul) and
-    // then `gatherQmv` both exist to dodge our self-built libmlx's decode
-    // `gather_qmm`, whose cost is O(EXPERT BANK SIZE) rather than O(work).
-    // Laguna opted in by default on a measured 17→48 tok/s.
-    //
-    // That measurement was taken on a forward pass inflated ~3x by the YaRN
-    // mscale f32 promotion. With the promotion fixed the expert math is a much
-    // larger share of a much cheaper token, the O(bank) addressing term is a
-    // correspondingly smaller one, and MLX's better-tuned `gather_qmv_fast`
-    // tile wins — the SAME reasoning that already explained why gemma4-26B-A4B
-    // loses with gatherQmv. Re-measured on the fixed tree, alternating boots,
-    // 512-token window, serial:
-    //
-    //   Laguna XS  gatherQmv 13.296 ms/tok   stock 13.113   stock +1.4%
-    //   Laguna S   gatherQmv 17.02  ms/tok   stock 15.45    stock +9.2%
-    //   (batched take+qmm on XS: 14.839 — worst of the three)
-    //
-    // Both models, every round, no overlap. So there is no arch left whose
-    // default should be anything but stock gather. Both kernels stay reachable
-    // by env for A/B — the finding is about the DEFAULT, and the next arch
-    // with a genuinely bank-dominated decode can be measured back in.
-    try testing.expect(!batchedExpertDecodePolicy("laguna", false, false));
-    try testing.expect(!batchedExpertDecodePolicy("gemma4_text", false, false));
-    try testing.expect(!batchedExpertDecodePolicy("qwen3_5_moe", false, false));
-    try testing.expect(!batchedExpertDecodePolicy("hy_v3", false, false));
-    // MLX_SERVE_MOE_BATCHED_DECODE forces it on for any arch (experimentation A/B).
-    try testing.expect(batchedExpertDecodePolicy("gemma4_text", false, true));
-    try testing.expect(batchedExpertDecodePolicy("laguna", false, true));
-    // MLX_SERVE_MOE_GATHER_DECODE is the hard override: still beats the force.
-    try testing.expect(!batchedExpertDecodePolicy("laguna", true, false));
-    try testing.expect(!batchedExpertDecodePolicy("gemma4_text", true, true));
-}
 
 test "moe fp4 decode: expert biases or a clamp no kernel serves keep the composed chain" {
     var cfg: ModelConfig = undefined;
