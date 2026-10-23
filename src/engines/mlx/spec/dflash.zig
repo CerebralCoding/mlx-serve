@@ -26,9 +26,6 @@ const MTP_EV_EMA_BETA = @import("mtp/depth.zig").MTP_EV_EMA_BETA;
 const SamplingParams = @import("../sampling/params.zig").SamplingParams;
 const capAcceptedForTokenBudget = @import("verify.zig").capAcceptedForTokenBudget;
 const dflashGateWarmup = @import("gates.zig").dflashGateWarmup;
-const dflashMarkovEnabled = @import("mtp/trace.zig").dflashMarkovEnabled;
-const dflashSampledDraftsEnabled = @import("mtp/trace.zig").dflashSampledDraftsEnabled;
-const dflashSelectorEnabled = @import("mtp/trace.zig").dflashSelectorEnabled;
 const dflashTraceEnabled = @import("mtp/trace.zig").dflashTraceEnabled;
 const dflashTreeNodes = @import("dflash_tree.zig").dflashTreeNodes;
 const filteredProbsBlock = @import("../sampling/spec_sampling.zig").filteredProbsBlock;
@@ -248,13 +245,13 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
     // accept through min(1, p/q) with q read off the traced path —
     // exact by construction. `MLX_SERVE_DFLASH_SELECTOR=0` forces the v1
     // arms for A/Bs.
-    const use_selector = model.selector != null and dflashSelectorEnabled();
+    const use_selector = model.selector != null;
     // DSpark: the block's base logits are position-parallel, but each
     // position's draft is picked from logits CORRECTED by the token
     // drafted at the previous one (the Markov bigram bias). Chaining it
     // is what the head is for — dropping it drafts every position from
     // an uncorrected distribution the sidecar was never trained to emit.
-    const use_markov = model.markov != null and dflashMarkovEnabled();
+    const use_markov = model.markov != null;
     const tree_round = use_selector and !use_markov and (serial or !stochastic) and xfm.specTreeSupported() and self.dflash_pol == null;
     // A continuation the context backs long enough to fill the tree is
     // verified as the round's chain, with no assistant forward.
@@ -357,7 +354,6 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         const strides = [_]c_int{ 1, 1, 1 };
         try mlx.check(mlx.mlx_slice(&draft_logits, draft_logits_all, &start, 3, &stop, 3, &strides, 3, s));
     }
-    const sample_drafts = stochastic and !use_selector and !use_markov and dflashSampledDraftsEnabled();
     if (tree_round) {
         return try self.dflashTreeRound(allocator, model, dctx, blk_hidden, draft_logits, t1, m, anchor_pos, kv_step_snap, serial, &.{});
     }
@@ -471,21 +467,6 @@ pub fn nextDflash(self: *Generator, allocator: std.mem.Allocator) !?DrafterStepR
         const host_arr = mlx.mlx_array_new_data(ids_i32.ptr, &row_shape, 2, .int32);
         defer _ = mlx.mlx_array_free(host_arr);
         try mlx.check(mlx.mlx_array_set(&draft_ids, host_arr));
-    } else if (sample_drafts) {
-        draft_q = try filteredProbsBlock(draft_logits, self.sampling, s);
-        var logq = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(logq);
-        try mlx.check(mlx.mlx_log(&logq, draft_q, s));
-        const null_key = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(null_key);
-        var sampled = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(sampled);
-        try mlx.check(mlx.mlx_random_categorical(&sampled, logq, -1, null_key, s));
-        var as_i32 = mlx.mlx_array_new();
-        defer _ = mlx.mlx_array_free(as_i32);
-        try mlx.check(mlx.mlx_astype(&as_i32, sampled, .int32, s));
-        const row_shape = [_]c_int{ 1, @as(c_int, @intCast(m)) };
-        try mlx.check(mlx.mlx_reshape(&draft_ids, as_i32, &row_shape, 2, s));
     } else {
         var draft_amax = mlx.mlx_array_new();
         defer _ = mlx.mlx_array_free(draft_amax);

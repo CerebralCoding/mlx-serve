@@ -91,7 +91,6 @@ pub const naxAvailable = @import("../../mlx/device.zig").naxAvailable;
 pub const verifyQmmNaxAvailable = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxAvailable;
 pub const verifyQmmTile = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmTile;
 pub const verifyQmmNaxEnabled = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxEnabled;
-pub const naxMinMFrom = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").naxMinMFrom;
 pub const verifyQmmNaxEnabledForMFrom = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxEnabledForMFrom;
 pub const verifyQmmNaxEnabledForM = @import("../../sdk/blocks/linear/verify_qmm_nax.zig").verifyQmmNaxEnabledForM;
 // sdk/blocks/attention/sdpa.zig
@@ -130,7 +129,6 @@ pub const qsaBatchedGatherEnabled = @import("../../plugins/qwen4_exp/qsa/gather.
 pub const qsaBatchedGatherOn = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaBatchedGatherOn;
 pub const qsaBatchedGatherFloor = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaBatchedGatherFloor;
 pub const qsaHistoryShareEnabled = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaHistoryShareEnabled;
-pub const qsaNaxEnabledFrom = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxEnabledFrom;
 pub const qsaNaxEnabled = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxEnabled;
 pub const qsaNaxEligibleFrom = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxEligibleFrom;
 pub const qsaNaxEligible = @import("../../plugins/qwen4_exp/qsa/gather.zig").qsaNaxEligible;
@@ -908,9 +906,7 @@ pub const Transformer = struct {
     pub const denseMLP = @import("../../sdk/blocks/mlp/dense.zig").denseMLP;
     // engines/mlx/ane_prefill.zig
     pub const denseMLPMaybeAne = @import("ane_prefill.zig").denseMLPMaybeAne;
-    pub const denseMLPAneSplit = @import("ane_prefill.zig").denseMLPAneSplit;
     pub const gdnProjMaybeAne = @import("ane_prefill.zig").gdnProjMaybeAne;
-    pub const gdnProjAneSplit = @import("ane_prefill.zig").gdnProjAneSplit;
     pub const anePackPlane = @import("ane_prefill.zig").anePackPlane;
     pub const aneReadPlane = @import("ane_prefill.zig").aneReadPlane;
     pub const denseMLPAneChannel = @import("ane_prefill.zig").denseMLPAneChannel;

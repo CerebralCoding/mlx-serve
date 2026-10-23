@@ -627,7 +627,7 @@ pub const Generator = struct {
             // A forced-depth run never consulted the EV plan, so its surface
             // is not one the controller chose — publishing it would hand a
             // later ordinary request a diagnostic's numbers.
-            if (mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpPinnedDepth() == null and
+            if (mtpPinnedDepth() == null and
                 !self.spec_disabled_runtime and self.mtp_attempted >= 8 and
                 (!group_planner.enabled() or !self.mtp_planner_owned))
             {
@@ -866,7 +866,6 @@ pub const Generator = struct {
     pub const dflashAcceptChoose = @import("../spec/mtp/observe.zig").dflashAcceptChoose;
     pub const specObserveRound = @import("../spec/mtp/observe.zig").specObserveRound;
     pub const persistRoundCost = @import("../spec/mtp/ev_plan.zig").persistRoundCost;
-    const mtpCostTableEnabled = @import("../spec/mtp/ev_plan.zig").mtpCostTableEnabled;
     pub const mtpKvLen = @import("../spec/mtp/ev_plan.zig").mtpKvLen;
     pub const mtpEvMarginalCost = @import("../spec/mtp/ev_plan.zig").mtpEvMarginalCost;
     pub const MtpRoundPlan = @import("../spec/mtp/ev_plan.zig").MtpRoundPlan;
@@ -888,7 +887,6 @@ pub const Generator = struct {
     pub const MtpDepthPolicy = @import("../spec/mtp/ev_plan.zig").MtpDepthPolicy;
     pub const MTP_ACCEPT_MAX_KV = @import("../spec/mtp/ev_plan.zig").MTP_ACCEPT_MAX_KV;
     pub const mtpDepthPolicyFor = @import("../spec/mtp/ev_plan.zig").mtpDepthPolicyFor;
-    pub const mtpDepthPolicyFromEnv = @import("../spec/mtp/ev_plan.zig").mtpDepthPolicyFromEnv;
     pub const mtpDepthPolicy = @import("../spec/mtp/ev_plan.zig").mtpDepthPolicy;
     pub const mtpBasePlan = @import("../spec/mtp/ev_plan.zig").mtpBasePlan;
     pub const dflashAcceptWidth = @import("../spec/mtp/ev_plan.zig").dflashAcceptWidth;
@@ -898,17 +896,8 @@ pub const Generator = struct {
     pub const MtpTrace = @import("../spec/mtp/trace.zig").MtpTrace;
     pub const SubLap = @import("../spec/mtp/trace.zig").SubLap;
     pub const DflashTrace = @import("../spec/mtp/trace.zig").DflashTrace;
-    const dflashSampledDraftsEnabled = @import("../spec/mtp/trace.zig").dflashSampledDraftsEnabled;
-    const dflashMarkovEnabled = @import("../spec/mtp/trace.zig").dflashMarkovEnabled;
-    const dflashSelectorEnabled = @import("../spec/mtp/trace.zig").dflashSelectorEnabled;
     const dflashTraceEnabled = @import("../spec/mtp/trace.zig").dflashTraceEnabled;
     pub const dflashTraceRoundEnd = @import("../spec/mtp/trace.zig").dflashTraceRoundEnd;
-    pub const mtpAdaptiveEnabled = @import("../spec/mtp/trace.zig").mtpAdaptiveEnabled;
-    pub const mtpEvSeedEnabledFromEnv = @import("../spec/mtp/trace.zig").mtpEvSeedEnabledFromEnv;
-    const mtpEvSeedEnabled = @import("../spec/mtp/trace.zig").mtpEvSeedEnabled;
-    pub const mtpEarlyDispatchEnabledFromEnv = @import("../spec/mtp/trace.zig").mtpEarlyDispatchEnabledFromEnv;
-    const mtpEarlyDispatchEnabled = @import("../spec/mtp/trace.zig").mtpEarlyDispatchEnabled;
-    pub const mtpPredraftEnabledFromEnv = @import("../spec/mtp/trace.zig").mtpPredraftEnabledFromEnv;
     const mtpPredraftEnabled = @import("../spec/mtp/trace.zig").mtpPredraftEnabled;
     pub const mtpTraceOn = @import("../spec/mtp/trace.zig").mtpTraceOn;
     pub const mtpTraceSub = @import("../spec/mtp/trace.zig").mtpTraceSub;
@@ -923,8 +912,6 @@ pub const Generator = struct {
     pub const MTP_EXT_SYNC_BUDGET = @import("../spec/mtp/regime.zig").MTP_EXT_SYNC_BUDGET;
     pub const mtpExtDryThresholdFor = @import("../spec/mtp/regime.zig").mtpExtDryThresholdFor;
     pub const mtpExtDryAllows = @import("../spec/mtp/regime.zig").mtpExtDryAllows;
-    pub const mtpExtDryEnabledFromEnv = @import("../spec/mtp/regime.zig").mtpExtDryEnabledFromEnv;
-    const mtpExtDryEnabled = @import("../spec/mtp/regime.zig").mtpExtDryEnabled;
     pub const MTP_EV_COST_BETA = @import("../spec/mtp/regime.zig").MTP_EV_COST_BETA;
     pub const mtpEmaMs = @import("../spec/mtp/regime.zig").mtpEmaMs;
     pub const MtpRegime = @import("../spec/mtp/regime.zig").MtpRegime;
@@ -941,9 +928,6 @@ pub const Generator = struct {
     pub const mtpRegimeExplorePeriod = @import("../spec/mtp/regime.zig").mtpRegimeExplorePeriod;
     pub const mtpRegimeForce = @import("../spec/mtp/regime.zig").mtpRegimeForce;
     const mtpRegimeForceAt = @import("../spec/mtp/regime.zig").mtpRegimeForceAt;
-    const mtpRegimeGateEnabled = @import("../spec/mtp/regime.zig").mtpRegimeGateEnabled;
-    pub const mtpLiveCostEnabledFromEnv = @import("../spec/mtp/regime.zig").mtpLiveCostEnabledFromEnv;
-    const mtpLiveCostEnabled = @import("../spec/mtp/regime.zig").mtpLiveCostEnabled;
     pub const mtpPinnedDepth = @import("../spec/mtp/regime.zig").mtpPinnedDepth;
     pub const mtpPlanInBounds = @import("../spec/mtp/regime.zig").mtpPlanInBounds;
     pub const MTP_ADAPTIVE_MARGIN = @import("../spec/mtp/regime.zig").MTP_ADAPTIVE_MARGIN;

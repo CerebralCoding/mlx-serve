@@ -27,9 +27,7 @@ const cachedScalarInt = @import("verify_qmm.zig").cachedScalarInt;
 const mixedNaxShapeEnabled = @import("verify_qmm.zig").mixedNaxShapeEnabled;
 const mixedPlainEnabled = @import("verify_qmm.zig").mixedPlainEnabled;
 const verifyQmmEnabled = @import("verify_qmm.zig").verifyQmmEnabled;
-const naxLaneEnvEnabled = @import("verify_qmm_nax.zig").naxLaneEnvEnabled;
 const naxMinMForBits = @import("verify_qmm_nax.zig").naxMinMForBits;
-const naxMixedBitsEnvEnabled = @import("verify_qmm_nax.zig").naxMixedBitsEnvEnabled;
 const verifyQmmNaxAvailable = @import("verify_qmm_nax.zig").verifyQmmNaxAvailable;
 
 pub const SingleVerifyFeature = enum { routing, down_reduce };

@@ -507,28 +507,7 @@ test "MTP EV seed round-trips on the qwen4 head; a fresh or absent head reads nu
     try testing.expectEqualSlices(f32, &zeros, &again.accept);
 }
 
-test "MTP EV seed defaults on and explicit zero disables" {
-    try testing.expect(Generator.mtpEvSeedEnabledFromEnv(null));
-    try testing.expect(Generator.mtpEvSeedEnabledFromEnv(""));
-    try testing.expect(Generator.mtpEvSeedEnabledFromEnv("1"));
-    try testing.expect(!Generator.mtpEvSeedEnabledFromEnv("0"));
-    try testing.expect(!Generator.mtpEvSeedEnabledFromEnv("0-disabled"));
-}
-
-test "MTP early dispatch defaults on and explicit zero disables" {
-    try testing.expect(Generator.mtpEarlyDispatchEnabledFromEnv(null));
-    try testing.expect(Generator.mtpEarlyDispatchEnabledFromEnv(""));
-    try testing.expect(Generator.mtpEarlyDispatchEnabledFromEnv("1"));
-    try testing.expect(!Generator.mtpEarlyDispatchEnabledFromEnv("0"));
-    try testing.expect(!Generator.mtpEarlyDispatchEnabledFromEnv("0-disabled"));
-}
-
-test "MTP cross-round pre-draft defaults on and explicit zero disables" {
-    try testing.expect(Generator.mtpPredraftEnabledFromEnv(null));
-    try testing.expect(Generator.mtpPredraftEnabledFromEnv(""));
-    try testing.expect(Generator.mtpPredraftEnabledFromEnv("1"));
-    try testing.expect(!Generator.mtpPredraftEnabledFromEnv("0"));
-    try testing.expect(!Generator.mtpPredraftEnabledFromEnv("0-disabled"));
+test "MTP cross-round pre-draft bills its own trace phase" {
     // The tail-side pre-draft bills its own trace phase; the round total
     // stays the honest sum of all phases.
     var t = Generator.MtpTrace{};

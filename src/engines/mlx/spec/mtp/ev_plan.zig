@@ -19,8 +19,6 @@ const MTP_EV_TAU_MAX = @import("depth.zig").MTP_EV_TAU_MAX;
 const MTP_EV_TAU_MIN = @import("depth.zig").MTP_EV_TAU_MIN;
 const MtpEvCosts = @import("ev_costs.zig").MtpEvCosts;
 const init = @import("../../generate/generator.zig").Generator.init;
-const mtpAdaptiveEnabled = @import("trace.zig").mtpAdaptiveEnabled;
-const mtpLiveCostEnabledFromEnv = @import("regime.zig").mtpLiveCostEnabledFromEnv;
 
 
 /// Write the model's round-cost table to disk when this request folded
@@ -31,18 +29,6 @@ pub fn persistRoundCost(self: *Generator) void {
     if (folded == t.stored_at) return;
     round_cost.storeCached(self.timer.io, self.xfm.round_cost_key_buf[0..self.xfm.round_cost_key_len], t);
     t.stored_at = folded;
-}
-
-/// Round-cost table kill switch — MLX_SERVE_MTP_COST_TABLE=0 keeps the
-/// table OBSERVING (its `[spec-stats]` fields stay comparable across an
-/// A/B) but the plan reads only the fitted prior and no width trial runs.
-var mtp_cost_table_cache: ?bool = null;
-pub fn mtpCostTableEnabled() bool {
-    if (mtp_cost_table_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_COST_TABLE);
-    const on = mtpLiveCostEnabledFromEnv(raw);
-    mtp_cost_table_cache = on;
-    return on;
 }
 
 /// KV length the next verify forward reads.
@@ -102,7 +88,7 @@ pub fn mtpDepthCapForProfile(configured: u32, adaptive: bool, profile: mtp_mod.M
 /// The cap with no per-silicon row applied: explicit wins, else the
 /// adaptive default (fixed mode keeps DEFAULT_DEPTH).
 pub fn mtpDepthCapFree(configured: u32) u32 {
-    const free = if (configured != 0) @min(mtp_mod.MAX_DEPTH, @max(1, configured)) else if (mtpAdaptiveEnabled()) MTP_ADAPTIVE_DEFAULT_CAP else mtp_mod.DEFAULT_DEPTH;
+    const free = if (configured != 0) @min(mtp_mod.MAX_DEPTH, @max(1, configured)) else MTP_ADAPTIVE_DEFAULT_CAP;
     return depth_bounds.liftCap(free, depth_bounds.active, mtp_mod.MAX_DEPTH);
 }
 
@@ -145,7 +131,7 @@ pub fn mtpDepthCapResolved(
 }
 
 pub fn resolveMtpDepthCapForProfile(configured: u32, profile: mtp_mod.MtpCostProfile) u32 {
-    return mtpDepthCapForProfile(configured, mtpAdaptiveEnabled(), profile);
+    return mtpDepthCapForProfile(configured, true, profile);
 }
 
 /// Legacy q8 boolean selector retained for source compatibility.
@@ -300,7 +286,7 @@ pub const MtpCostSource = struct {
 /// How the base depth is chosen. `.accept`: expected tokens come from the acceptance EMAs
 /// (every round refreshes every index it drafted) and the table prices round TIME only, in
 /// ONE chunk, so no round reads confidences mid-round. `.legacy`: the table's realized
-/// tokens where measured, plus the confidence-gated chunk B (MLX_SERVE_MTP_DEPTH_POLICY=legacy).
+/// tokens where measured, plus the confidence-gated chunk B.
 pub const MtpDepthPolicy = enum { accept, legacy };
 /// `.accept` serves KV lengths below this. It was fitted where a round is CPU-build bound and
 /// the chunk-A confidence read costs its whole wait; from here up the verify forward dominates,
@@ -312,17 +298,10 @@ pub fn mtpDepthPolicyFor(configured: MtpDepthPolicy, kv_len: u32) MtpDepthPolicy
     return if (kv_len >= MTP_ACCEPT_MAX_KV) .legacy else configured;
 }
 
-pub fn mtpDepthPolicyFromEnv(raw: ?[]const u8) MtpDepthPolicy {
-    return if (std.mem.eql(u8, raw orelse "", "legacy")) .legacy else .accept;
-}
-
-var mtp_depth_policy_cache: ?MtpDepthPolicy = null;
+/// Test seam: forces the configured policy (past `MTP_ACCEPT_MAX_KV` it is legacy either way).
+pub var mtp_depth_policy_override: ?MtpDepthPolicy = null;
 pub fn mtpDepthPolicy() MtpDepthPolicy {
-    if (mtp_depth_policy_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_DEPTH_POLICY);
-    const v = mtpDepthPolicyFromEnv(raw);
-    mtp_depth_policy_cache = v;
-    return v;
+    return mtp_depth_policy_override orelse .accept;
 }
 
 pub fn mtpBasePlan(policy: MtpDepthPolicy, a: []const f32, cap: u32, src_in: MtpCostSource, m_lo_max: u32) MtpRoundPlan {
@@ -1003,15 +982,15 @@ test "MTP depth bounds: an EV plan outside min..max is clamped, one inside is un
 
 test "MTP depth bounds: both policies keep table-priced plans inside min..max" {
     const before = depth_bounds.active;
-    const policy_before = mtp_depth_policy_cache;
+    const policy_before = mtp_depth_policy_override;
     defer {
         depth_bounds.active = before;
-        mtp_depth_policy_cache = policy_before;
+        mtp_depth_policy_override = policy_before;
     }
     var xfm: Transformer = undefined;
     var prompt: [1000]u32 = @splat(0);
     for ([_]Generator.MtpDepthPolicy{ .accept, .legacy }) |policy| {
-        mtp_depth_policy_cache = policy;
+        mtp_depth_policy_override = policy;
         depth_bounds.active = .{};
         var gen = mtpBoundsPlanFixture(&xfm, &prompt, 6);
         try testing.expectEqual(@as(u32, if (policy == .accept) 4 else 3), gen.mtpRoundPlan().m_lo);

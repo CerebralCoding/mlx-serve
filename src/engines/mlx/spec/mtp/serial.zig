@@ -17,7 +17,6 @@ const mtpAdaptiveSerialEnabled = @import("adaptive.zig").mtpAdaptiveSerialEnable
 const mtpChainBuildBatched = @import("chain_build.zig").mtpChainBuildBatched;
 const mtpChainDispatch = @import("chain_build.zig").mtpChainDispatch;
 const mtpChainDispatchBatched = @import("chain_build.zig").mtpChainDispatchBatched;
-const mtpCostTableEnabled = @import("ev_plan.zig").mtpCostTableEnabled;
 const mtpPredraftEnabled = @import("trace.zig").mtpPredraftEnabled;
 const mtpTraceEnabled = @import("trace.zig").mtpTraceEnabled;
 
@@ -179,7 +178,7 @@ pub fn mtpAdaptiveModelOk(self: *const Generator) bool {
 /// Will anyone read a serial cell for this model? Gated on the model, not the request: a
 /// per-request `enable_mtp:false` on a calibrated checkpoint is the cleanest serial sample.
 pub fn serialCellWanted(self: *const Generator) bool {
-    if (!mtpAdaptiveSerialEnabled() or !mtpCostTableEnabled()) return false;
+    if (!mtpAdaptiveSerialEnabled()) return false;
     if (!self.mtpAdaptiveModelOk()) return false;
     // Not `xfm.qwen4_mtp != null`: the weights load with the trunk even under `--no-mtp`.
     if (!self.model_has_mtp) return false;

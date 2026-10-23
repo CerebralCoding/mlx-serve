@@ -16,23 +16,18 @@ const MTP_EXT_DRY_ROUNDS = @import("regime.zig").MTP_EXT_DRY_ROUNDS;
 const MtpCostSource = @import("ev_plan.zig").MtpCostSource;
 const MtpRoundPlan = @import("ev_plan.zig").MtpRoundPlan;
 const MtpTrace = @import("trace.zig").MtpTrace;
-const mtpAdaptiveEnabled = @import("trace.zig").mtpAdaptiveEnabled;
 const mtpBasePlan = @import("ev_plan.zig").mtpBasePlan;
-const mtpCostTableEnabled = @import("ev_plan.zig").mtpCostTableEnabled;
 const mtpDepthPolicy = @import("ev_plan.zig").mtpDepthPolicy;
 const mtpDepthPolicyFor = @import("ev_plan.zig").mtpDepthPolicyFor;
 const mtpEvExpectedTokens = @import("ev_plan.zig").mtpEvExpectedTokens;
 const mtpEvObserve = @import("ev_plan.zig").mtpEvObserve;
 const mtpEvTestGenerator = @import("ev_plan.zig").mtpEvTestGenerator;
 const mtpExtDryAllows = @import("regime.zig").mtpExtDryAllows;
-const mtpExtDryEnabled = @import("regime.zig").mtpExtDryEnabled;
 const mtpExtDryThresholdFor = @import("regime.zig").mtpExtDryThresholdFor;
-const mtpLiveCostEnabled = @import("regime.zig").mtpLiveCostEnabled;
 const mtpPinnedDepth = @import("regime.zig").mtpPinnedDepth;
 const mtpPlanInBounds = @import("regime.zig").mtpPlanInBounds;
 const mtpRegimeExplorePeriod = @import("regime.zig").mtpRegimeExplorePeriod;
 const mtpRegimeForce = @import("regime.zig").mtpRegimeForce;
-const mtpRegimeGateEnabled = @import("regime.zig").mtpRegimeGateEnabled;
 const mtpTraceEnabled = @import("trace.zig").mtpTraceEnabled;
 
 
@@ -87,7 +82,7 @@ pub fn mtpRoundPlanTraced(self: *Generator) MtpRoundPlan {
     const kv_len = self.mtpKvLen();
     const t = &self.xfm.round_cost;
     const b = self.mtpAdaptiveBucket(kv_len);
-    const src = MtpCostSource.init(self.mtp_ev_costs, kv_len, if (mtpCostTableEnabled()) t else null);
+    const src = MtpCostSource.init(self.mtp_ev_costs, kv_len, t);
     const serial_step: []const u8 = if (!disabled_before and self.spec_disabled_runtime)
         "switch"
     else if (self.mtp_serial_left > serial_left_before)
@@ -138,14 +133,14 @@ pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
     const cap_free: u32 = @min(@max(cap_row, self.mtp_depth_free), if (self.mtp) |h| h.maxDepth() else mtp_mod.MAX_DEPTH);
     var cap: u32 = cap_row;
     const kv_len = self.mtpKvLen();
-    if (!mtpAdaptiveEnabled() or self.mtp_ev_rounds < MTP_EV_WARMUP_ROUNDS) {
+    if (self.mtp_ev_rounds < MTP_EV_WARMUP_ROUNDS) {
         const d = depth_bounds.clampWidth(self.mtp_depth_current, depth_bounds.floorFor(depth_bounds.active, cap), cap);
         self.mtp_ev_m_lo_prev = d;
         // Independent of the depth controller's kill switch and warmup.
         _ = self.mtpAdaptiveSerialStep(d, kv_len);
         return .{ .m_lo = d, .m_hi = d, .tau_ln = 0.0 };
     }
-    const src = MtpCostSource.init(self.mtp_ev_costs, kv_len, if (mtpCostTableEnabled()) &self.xfm.round_cost else null);
+    const src = MtpCostSource.init(self.mtp_ev_costs, kv_len, &self.xfm.round_cost);
     if (src.fromTable() and !self.xfm.round_cost.first_use_logged) {
         self.xfm.round_cost.first_use_logged = true;
         var buf: [256]u8 = undefined;
@@ -167,17 +162,14 @@ pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
     self.mtp_ev_m_lo_prev = plan.m_lo;
     // Live-cost lever: shorten dry exploration bursts when the MEASURED
     // chunk-A sync is an expensive fraction of the round (mtpExtDryThresholdFor).
-    const dry_threshold = if (mtpLiveCostEnabled())
-        mtpExtDryThresholdFor(self.mtp_ev_sync_ms, self.mtp_ev_round_ms)
-    else
-        MTP_EXT_DRY_ROUNDS;
-    if (plan.m_hi > plan.m_lo and mtpExtDryEnabled() and
+    const dry_threshold = mtpExtDryThresholdFor(self.mtp_ev_sync_ms, self.mtp_ev_round_ms);
+    if (plan.m_hi > plan.m_lo and
         !mtpExtDryAllows(&self.mtp_ext_dry_streak, &self.mtp_ext_cooldown, dry_threshold))
     {
         plan.m_hi = plan.m_lo;
         plan.tau_ln = 0.0;
     }
-    if (plan.m_hi > plan.m_lo and mtpRegimeGateEnabled()) {
+    if (plan.m_hi > plan.m_lo) {
         const force = mtpRegimeForce(&self.mtp_regime, self.mtp_ev_rounds);
         const worse = self.mtp_regime.sched_verdict;
         if (worse != null and worse != self.mtp_regime_verdict) {
@@ -195,7 +187,7 @@ pub fn mtpRoundPlanInner(self: *Generator) MtpRoundPlan {
     // next (`mtpWidthTrialTarget`), one 2-round block per period. Never
     // inside a regime trial block (that block is the regime's own
     // measurement), and only while solo.
-    if (mtpCostTableEnabled() and self.spec_cost_solo and self.mtp_ev_rounds >= self.mtp_regime.trial_end) {
+    if (self.spec_cost_solo and self.mtp_ev_rounds >= self.mtp_regime.trial_end) {
         const base_settled = self.mtp_m_lo_streak >= 2;
         if (mtpWidthTrialTarget(&self.xfm.round_cost, kv_len, plan, cap_free, base_settled)) |target| {
             // A next width nobody has timed is priced from the prior: learn it now, not a period from now.

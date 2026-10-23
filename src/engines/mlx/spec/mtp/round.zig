@@ -37,15 +37,11 @@ const deinit = @import("../../generate/generator.zig").Generator.deinit;
 const groupProbsBlock = @import("../../sampling/spec_sampling.zig").groupProbsBlock;
 const groupProbsRow = @import("../../sampling/spec_sampling.zig").groupProbsRow;
 const isEosId = @import("../../generate/stops.zig").isEosId;
-const mtpAdaptiveEnabled = @import("trace.zig").mtpAdaptiveEnabled;
 const mtpAdaptiveReentryTokens = @import("adaptive.zig").mtpAdaptiveReentryTokens;
 const mtpAdaptiveSerialEnabled = @import("adaptive.zig").mtpAdaptiveSerialEnabled;
 const mtpBatchCorrEnabled = @import("serial.zig").mtpBatchCorrEnabled;
 const mtpChainDispatch = @import("chain_build.zig").mtpChainDispatch;
-const mtpEarlyDispatchEnabled = @import("trace.zig").mtpEarlyDispatchEnabled;
 const mtpEmaMs = @import("regime.zig").mtpEmaMs;
-const mtpEvSeedEnabled = @import("trace.zig").mtpEvSeedEnabled;
-const mtpLiveCostEnabled = @import("regime.zig").mtpLiveCostEnabled;
 const mtpPinnedDepth = @import("regime.zig").mtpPinnedDepth;
 const mtpTraceEnabled = @import("trace.zig").mtpTraceEnabled;
 const readChainConfidence = @import("../../sampling/spec_sampling.zig").readChainConfidence;
@@ -64,7 +60,6 @@ pub const MtpRoundState = struct {
     chain: MtpPreDraft,
     tracing: bool,
     ph: io_util.Stopwatch,
-    livecost: bool,
     round_watch: io_util.Stopwatch,
     kv_step_snap: usize,
     kv_snap: ?transformer_mod.KVCacheSnapshot,
@@ -160,7 +155,6 @@ pub const MtpRoundOpen = struct {
     chain: MtpPreDraft,
     tracing: bool,
     ph: io_util.Stopwatch,
-    livecost: bool,
     round_watch: io_util.Stopwatch,
 };
 
@@ -256,7 +250,7 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
     // exactly n and the controller never plans, so a seed must not be
     // applied (nor, at deinit, published).
     if (self.mtp_ev_rounds == 0 and self.mtp_attempted == 0 and
-        mtpAdaptiveEnabled() and mtpEvSeedEnabled() and mtpPinnedDepth() == null and
+        mtpPinnedDepth() == null and
         (!group_planner.enabled() or !self.mtp_planner_owned))
     {
         if (head.evSeed()) |seed| {
@@ -275,7 +269,6 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
     }
     // Always-on round wall-clock for the live-cost round EMA (the
     // denominator of the sync fraction). Read at both commit exits.
-    const livecost = mtpLiveCostEnabled();
     const round_watch = io_util.Stopwatch.init(self.timer.io);
 
     // ── Phase 0/1: acquire this round's draft chain ──
@@ -313,17 +306,16 @@ pub fn mtpRoundBegin(self: *Generator, allocator: std.mem.Allocator) !MtpRoundBe
                 .chain = c,
                 .tracing = tracing,
                 .ph = ph,
-                .livecost = livecost,
                 .round_watch = round_watch,
             } };
         }
         const chain_lap = SubLap.start(tracing, self.timer.io);
         try self.mtpChainBuild(&c, 0, plan_now.m_lo);
-        if (mtpEarlyDispatchEnabled()) try mtpChainDispatch(&c, 0, plan_now.m_lo);
+        try mtpChainDispatch(&c, 0, plan_now.m_lo);
         chain_lap.stop(&self.mtp_trace, .chain);
         break :blk c;
     };
-    return .{ .verify = try self.mtpRoundAfterChain(allocator, chain, tracing, ph, livecost, round_watch) };
+    return .{ .verify = try self.mtpRoundAfterChain(allocator, chain, tracing, ph, round_watch) };
 }
 
 pub fn mtpRoundContinue(self: *Generator, allocator: std.mem.Allocator, open: MtpRoundOpen) !MtpRoundState {
@@ -336,7 +328,7 @@ pub fn mtpRoundContinue(self: *Generator, allocator: std.mem.Allocator, open: Mt
         };
         chain_lap.stop(&self.mtp_trace, .chain);
     }
-    return self.mtpRoundAfterChain(allocator, chain, open.tracing, open.ph, open.livecost, open.round_watch);
+    return self.mtpRoundAfterChain(allocator, chain, open.tracing, open.ph, open.round_watch);
 }
 
 pub fn mtpRoundAfterChain(
@@ -345,7 +337,6 @@ pub fn mtpRoundAfterChain(
     chain_in: MtpPreDraft,
     tracing: bool,
     ph_in: io_util.Stopwatch,
-    livecost: bool,
     round_watch: io_util.Stopwatch,
 ) !MtpRoundState {
     var chain = chain_in;
@@ -375,7 +366,7 @@ pub fn mtpRoundAfterChain(
         const sync_ns = sync_watch.read();
         // Live sync-cost EMA: measured only on considered rounds, so it
         // holds the true per-sync cost (not the suppressed-round average).
-        if (livecost) self.mtp_ev_sync_ms = mtpEmaMs(self.mtp_ev_sync_ms, sync_ns);
+        self.mtp_ev_sync_ms = mtpEmaMs(self.mtp_ev_sync_ms, sync_ns);
         if (tracing) {
             self.mtp_trace.add(.sync, sync_ns);
             ph.reset();
@@ -385,7 +376,7 @@ pub fn mtpRoundAfterChain(
             self.mtp_ext_rounds += 1;
             self.mtp_ext_dry_streak = 0;
             try self.mtpChainBuild(&chain, m_lo, m_max);
-            if (mtpEarlyDispatchEnabled()) try mtpChainDispatch(&chain, m_lo, m_max);
+            try mtpChainDispatch(&chain, m_lo, m_max);
         } else {
             // Considered but the gate didn't clear — feeds the
             // dry-spell policy (mtpExtDryAllows).
@@ -452,7 +443,6 @@ pub fn mtpRoundAfterChain(
         .chain = chain,
         .tracing = tracing,
         .ph = ph,
-        .livecost = livecost,
         .round_watch = round_watch,
         .kv_step_snap = kv_step_snap,
         .kv_snap = kv_snap,
@@ -1018,7 +1008,6 @@ test "MTP continuation releases its owned chain when drafting fails" {
         .chain = chain,
         .tracing = false,
         .ph = undefined,
-        .livecost = false,
         .round_watch = undefined,
     };
     try testing.expectError(error.NoMtpHead, gen.mtpRoundContinue(allocator, open));
@@ -1070,16 +1059,16 @@ test "Generator rounds preserve acceptance and next-round stashes at N=2/4" {
     // Group builders keep the merged history step; the solo arm must draft the same way.
     chain_mod.mtp_padded_head_override = false;
     defer chain_mod.mtp_padded_head_override = null;
-    const predraft = trace_mod.mtp_predraft_cache;
+    const predraft = trace_mod.mtp_predraft_override;
     const forced = depth_bounds.active;
     const planner = group_planner.enabled_override;
     defer {
-        trace_mod.mtp_predraft_cache = predraft;
+        trace_mod.mtp_predraft_override = predraft;
         depth_bounds.active = forced;
         group_planner.enabled_override = planner;
     }
     // Observe the completed-round stash before any successor consumes it.
-    trace_mod.mtp_predraft_cache = false;
+    trace_mod.mtp_predraft_override = false;
     group_planner.enabled_override = true;
     const a = testing.allocator;
     const io = std.Io.Threaded.global_single_threaded.io();

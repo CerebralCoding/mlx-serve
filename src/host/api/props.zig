@@ -177,7 +177,7 @@ pub fn mlxPropsSettings(lm: *LoadedModel) PropsSettings {
         .mtp_acceptance = config.mtpAcceptance(generate_mod.mtp_acceptance_default),
         .mtp_greedy_tail = generate_mod.mtpGreedyTailFor(config.mtp_greedy_tail_override),
         .mtp_depth = lm.mtp_depth,
-        .mtp_adaptive = generate_mod.Generator.mtpAdaptiveEnabled(),
+        .mtp_adaptive = true,
         .native_speculation = if (native) |m| .{
             .lane = mlx_stream.laneName(m),
             .block_size = mlx_stream.blockSize(m),

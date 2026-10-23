@@ -149,55 +149,6 @@ pub const DflashTrace = struct {
     }
 };
 
-/// Sampled DFlash drafts — DEFAULT OFF, measured negative.
-/// `MLX_SERVE_DFLASH_SAMPLED_DRAFTS=1` draws each draft from the
-/// request's own filtered distribution and accepts through the full
-/// Leviathan ratio; off keeps the argmax draft and its one-hot q.
-///
-/// The theory said this should help: a greedy draft's acceptance is
-/// p(argmax q), which a flattened target row deflates, while a matched
-/// proposal accepts at 1 − TV(p, q). Measured on Muse 4-bit at temp 0.7
-/// (3 reps x 4 prompts, same-boot serial reference), it is a LOSS —
-/// 52.4 tok/s / 54.5% per-draft against 55.5 / 57.7% greedy. This
-/// assistant's ARGMAX tracks the trunk well while its distribution SHAPE
-/// does not, so a one-hot proposal is the better proposal and sampling
-/// spends the round's budget landing on tokens the trunk would not pick.
-/// Greedy requests never reach this either way.
-var dflash_sampled_drafts_cache: ?bool = null;
-pub fn dflashSampledDraftsEnabled() bool {
-    if (dflash_sampled_drafts_cache) |v| return v;
-    var on = false;
-    if (env.get(.MLX_SERVE_DFLASH_SAMPLED_DRAFTS)) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '1') on = true;
-    }
-    dflash_sampled_drafts_cache = on;
-    return on;
-}
-
-/// `MLX_SERVE_DFLASH_SELECTOR`: default ON when the sidecar ships a
-/// selector (DFlash2). "0" forces the v1 draft arms (argmax / block
-/// sampling) for A/Bs — the conv layers stay, they are the checkpoint.
-var dflash_selector_cache: ?bool = null;
-/// `MLX_SERVE_DFLASH_MARKOV=0` drafts a DSpark sidecar's block from its
-/// UNCORRECTED base logits (the v1 arm) — an A/B lever for measuring what
-/// the Markov chain is worth, never a default.
-pub fn dflashMarkovEnabled() bool {
-    const p = env.get(.MLX_SERVE_DFLASH_MARKOV) orelse return true;
-    return !std.mem.eql(u8, std.mem.span(p), "0");
-}
-
-pub fn dflashSelectorEnabled() bool {
-    if (dflash_selector_cache) |v| return v;
-    var on = true;
-    if (env.get(.MLX_SERVE_DFLASH_SELECTOR)) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') on = false;
-    }
-    dflash_selector_cache = on;
-    return on;
-}
-
 var dflash_trace_cache: ?bool = null;
 pub fn dflashTraceEnabled() bool {
     if (dflash_trace_cache) |v| return v;
@@ -227,76 +178,12 @@ pub fn dflashTraceRoundEnd(self: *Generator, accepted: u32) void {
     t.reset();
 }
 
-/// Adaptive (EV) controller gate — DEFAULT ON. MLX_SERVE_MTP_ADAPTIVE=0
-/// reverts to the fixed-depth windowed controller for same-boot A/Bs.
-var mtp_adaptive_cache: ?bool = null;
-
-pub fn mtpAdaptiveEnabled() bool {
-    if (mtp_adaptive_cache) |v| return v;
-    var on = true;
-    if (env.get(.MLX_SERVE_MTP_ADAPTIVE)) |p| {
-        const val = std.mem.span(p);
-        if (val.len > 0 and val[0] == '0') on = false;
-    }
-    mtp_adaptive_cache = on;
-    return on;
-}
-
-/// Cross-request EV seeding gate — default ON; set
-/// MLX_SERVE_MTP_EV_SEED=0 to keep request planning independent.
-var mtp_ev_seed_cache: ?bool = null;
-pub fn mtpEvSeedEnabledFromEnv(raw: ?[]const u8) bool {
-    const value = raw orelse return true;
-    return value.len == 0 or value[0] != '0';
-}
-
-pub fn mtpEvSeedEnabled() bool {
-    if (mtp_ev_seed_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_EV_SEED);
-    const on = mtpEvSeedEnabledFromEnv(raw);
-    mtp_ev_seed_cache = on;
-    return on;
-}
-
-/// Early draft-chain dispatch (round pipelining) — DEFAULT ON. Fires the
-/// draft-chain graph at the GPU as soon as Phase 1 finishes building it,
-/// so the head chain runs while the CPU builds the verify/accept graphs
-/// (~2 ms the GPU used to spend idle each round). Dispatch timing only —
-/// lazy sampling ops bind their PRNG key at graph BUILD time, so values
-/// are identical. MLX_SERVE_MTP_EARLY_DISPATCH=0 restores the serial
-/// round shape for same-boot A/Bs.
-var mtp_early_dispatch_cache: ?bool = null;
-pub fn mtpEarlyDispatchEnabledFromEnv(raw: ?[]const u8) bool {
-    const value = raw orelse return true;
-    return value.len == 0 or value[0] != '0';
-}
-
-pub fn mtpEarlyDispatchEnabled() bool {
-    if (mtp_early_dispatch_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_EARLY_DISPATCH);
-    const on = mtpEarlyDispatchEnabledFromEnv(raw);
-    mtp_early_dispatch_cache = on;
-    return on;
-}
-
-/// Cross-round pre-draft (round pipelining) — DEFAULT ON. Builds and
-/// dispatches the next round's chunk-A draft chain at the current
-/// round's tail (see mtpMaybePreDraft) so the GPU drafts while the CPU
-/// does emit/SSE bookkeeping. MLX_SERVE_MTP_PREDRAFT=0 reverts to
-/// head-of-round drafting for same-boot A/Bs (combine with
-/// MLX_SERVE_MTP_EARLY_DISPATCH=0 for the fully serial round shape).
-pub var mtp_predraft_cache: ?bool = null;
-pub fn mtpPredraftEnabledFromEnv(raw: ?[]const u8) bool {
-    const value = raw orelse return true;
-    return value.len == 0 or value[0] != '0';
-}
-
+/// Cross-round pre-draft (round pipelining): the next round's chunk-A draft chain is built and dispatched at the
+/// current round's tail (see mtpMaybePreDraft) so the GPU drafts while the CPU does emit/SSE bookkeeping. Test seam:
+/// false observes a completed round before any successor consumes it.
+pub var mtp_predraft_override: ?bool = null;
 pub fn mtpPredraftEnabled() bool {
-    if (mtp_predraft_cache) |v| return v;
-    const raw: ?[]const u8 = env.span(.MLX_SERVE_MTP_PREDRAFT);
-    const on = mtpPredraftEnabledFromEnv(raw);
-    mtp_predraft_cache = on;
-    return on;
+    return mtp_predraft_override orelse true;
 }
 
 pub fn mtpTraceOn() bool {

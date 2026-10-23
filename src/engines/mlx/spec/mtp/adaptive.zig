@@ -9,7 +9,6 @@ const MTP_ADAPTIVE_CONFIRM = @import("regime.zig").MTP_ADAPTIVE_CONFIRM;
 const MTP_ADAPTIVE_MARGIN = @import("regime.zig").MTP_ADAPTIVE_MARGIN;
 const MTP_ADAPTIVE_PROBE_TOKENS = @import("regime.zig").MTP_ADAPTIVE_PROBE_TOKENS;
 const MtpHeadRef = @import("../mtp_head_ref.zig").MtpHeadRef;
-const mtpCostTableEnabled = @import("ev_plan.zig").mtpCostTableEnabled;
 const mtpRoundOff0 = @import("chain.zig").mtpRoundOff0;
 
 pub const MTP_ADAPTIVE_PROBE_WARM: u32 = 2;
@@ -384,7 +383,7 @@ pub fn mtpSerialProbeEarned(module_head: bool, low_streak: u32) bool {
 
 pub fn mtpAdaptiveSerialStep(self: *Generator, m_lo: u32, kv_len: u32) bool {
     // Read after the plan (m_lo is the width it prices) and before the width trial.
-    if (mtpAdaptiveSerialEnabled() and mtpCostTableEnabled() and
+    if (mtpAdaptiveSerialEnabled() and
         self.mtpAdaptiveArchEligible() and
         mtpAdaptiveKvEligible(kv_len, mtpAdaptiveMinKv()))
     {
